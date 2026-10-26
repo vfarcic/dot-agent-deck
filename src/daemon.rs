@@ -2172,7 +2172,11 @@ where
     // PRD #1666 part 3, round 5-wake (plan rev 2 §6): the wrapper's report of
     // how the command it ran exited, on its final event, for the notices its
     // generation's exit owes. The same generation checks as the turn edge;
-    // the registry keeps it only for that generation's wrapper.
+    // the registry keeps it only for a wrapped generation, and the hook socket
+    // only from that generation's own child
+    // ([`keep_wrapper_report_from_own_child`]). That is not an authenticated
+    // wrapper identity: a same-user process is inside the accepted trust
+    // boundary (`crate::hook_provenance`).
     if !unproven
         && !event.is_daemon_synthetic()
         && let Some(ended) = event
@@ -2838,6 +2842,45 @@ fn strip_question_metadata(event: &mut AgentEvent) {
     event
         .metadata
         .remove(crate::event::QUESTION_RESOLVED_METADATA_KEY);
+}
+
+/// PRD #1666 part 3, round 5-wake (plan rev 2 §6): keep the wrapper's report
+/// of how the command it ran exited
+/// ([`crate::event::WRAPPER_CHILD_EXIT_METADATA_KEY`]) only on a frame the
+/// generation's own child sent: the process the deck started in the pane,
+/// which is the wrapper. What runs below it inherits the pane, the generation
+/// and the hook capability, so without this a `dot-agent-deck wrap` nested
+/// inside the agent, reporting its own child's exit first, would be the
+/// generation's first report and win over the outer wrapper's. Its report is
+/// dropped, and the capture keeps the outer wrapper's, or the deck's own
+/// status. `peer` is the connecting process as the hook socket accepted it.
+///
+/// This tells the deck's child from its descendants. It does not authenticate
+/// the report: a process running as the deck's user can still impersonate the
+/// wrapper, which is inside the accepted trust boundary
+/// (`crate::hook_provenance`), and the report only chooses a notice's words.
+fn keep_wrapper_report_from_own_child(
+    event: &mut AgentEvent,
+    peer: Option<AcceptedPeer>,
+    attested_agent: Option<&str>,
+    registry: &AgentPtyRegistry,
+) {
+    if !event
+        .metadata
+        .contains_key(crate::event::WRAPPER_CHILD_EXIT_METADATA_KEY)
+    {
+        return;
+    }
+    let own_child = event
+        .agent_id
+        .as_deref()
+        .or(attested_agent)
+        .and_then(|generation| registry.child_pid(generation));
+    if own_child.is_none() || peer.map(|peer| peer.pid) != own_child {
+        event
+            .metadata
+            .remove(crate::event::WRAPPER_CHILD_EXIT_METADATA_KEY);
+    }
 }
 
 /// PRD #1631: an event the daemon itself ingests about the question
@@ -7127,8 +7170,15 @@ async fn run_hook_loop_with_limits(
                                     // reply would otherwise read and dispatch
                                     // more lines outside both bounds.
                                     let ack = signal.ack;
+                                    let mut signal = *signal;
+                                    keep_wrapper_report_from_own_child(
+                                        &mut signal.event,
+                                        peer_pid,
+                                        attested_agent.as_deref(),
+                                        &pty_registry,
+                                    );
                                     let Some(held) = handle_question_signal(
-                                        *signal,
+                                        signal,
                                         attested_agent.clone(),
                                         unproven,
                                         &state,
@@ -7332,6 +7382,12 @@ async fn run_hook_loop_with_limits(
                             // Issue #714: normalise the quota-block keys, and hand
                             // a Codex event's rollout and turn to the tailer.
                             admit_producer_event(&mut event);
+                            keep_wrapper_report_from_own_child(
+                                &mut event,
+                                peer_pid,
+                                attested_agent.as_deref(),
+                                &pty_registry,
+                            );
                             // PRD #1666 S6: a prompt that is the deck's own
                             // message is acknowledged and labelled here, for the
                             // agent the token attests, before anything reads it.
@@ -9445,6 +9501,131 @@ mod hook_ingestion_tests {
         // Await the aborted task so it drops its `registry` Arc clone before
         // we tear the registry down — strictly sequences cleanup instead of
         // racing `shutdown_all` against the still-live loop task.
+        let _ = handle.await;
+        registry.shutdown_all();
+    }
+
+    /// Scenario: PRD #1666 part 3, round 5-wake. A wrapped generation's final event names how the wrapper's command exited. The report is kept when the deck's own child sent it, and dropped when anything else did: a `dot-agent-deck wrap` nested below it (another pid with the same pane, generation and token), a connection whose sender cannot be read, or a generation the registry does not hold.
+    #[spec("inbox/status/032")]
+    #[test]
+    fn status_032_only_the_decks_own_child_reports_its_commands_exit() {
+        let pane = "wrapper-report";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let generation = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("sleep 30"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn");
+        let child = registry.child_pid(&generation).expect("child pid");
+        let peer = |pid| {
+            Some(AcceptedPeer {
+                pid,
+                started: None,
+                same_user: Some(true),
+            })
+        };
+        let kept = |peer, agent: &str| {
+            let mut event =
+                super::quota_admission_tests::quota_frame(crate::event::EventType::Idle);
+            event.pane_id = Some(pane.to_string());
+            event.agent_id = Some(agent.to_string());
+            event.metadata.insert(
+                crate::event::WRAPPER_CHILD_EXIT_METADATA_KEY.to_string(),
+                "5".to_string(),
+            );
+            keep_wrapper_report_from_own_child(&mut event, peer, None, &registry);
+            event
+                .metadata
+                .contains_key(crate::event::WRAPPER_CHILD_EXIT_METADATA_KEY)
+        };
+        assert!(kept(peer(child), &generation), "the deck's own child");
+        assert!(!kept(peer(child + 1), &generation), "a nested wrapper");
+        assert!(!kept(None, &generation), "an unreadable sender");
+        assert!(
+            !kept(peer(child), "another-generation"),
+            "another generation"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Scenario: PRD #1666 part 3, round 5-wake. Through the real hook socket, a process that is not the deck's child (as a `dot-agent-deck wrap` nested inside the agent is) sends the wrapped generation's final event, attested by the generation's own token and naming its command's exit. The event itself is applied, so the pane learns its agent type, but its exit report is not recorded for the generation, leaving that to the deck's own wrapper.
+    #[spec("inbox/status/032")]
+    #[tokio::test]
+    async fn status_032_a_nested_wrappers_exit_report_is_dropped_at_the_socket() {
+        let pane = "nested-wrapper";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let generation = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("sleep 30"),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    pane.to_string(),
+                )]),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn");
+        assert_eq!(registry.wrapper_report_for_test(&generation), None);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod tempdir");
+        let sock = dir.path().join("hook.sock");
+        let listener =
+            IpcListener::from_tokio_listener(UnixListener::bind(&sock).expect("bind hook socket"));
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state.write().await.register_pane(pane.to_string());
+        let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        let handle = tokio::spawn({
+            let registry = registry.clone();
+            let state = state.clone();
+            let wtr = crate::issue_dispatch_run::new_worktree_registry();
+            async move {
+                run_hook_loop(
+                    listener,
+                    state,
+                    event_tx,
+                    registry,
+                    Arc::new(Notify::new()),
+                    wtr,
+                )
+                .await
+            }
+        });
+        let event = serde_json::json!({
+            "session_id": "nested-sess",
+            "agent_type": "codex",
+            "event_type": "idle",
+            "timestamp": "2026-10-26T12:00:00Z",
+            "pane_id": pane,
+            "agent_id": generation,
+            "metadata": { "wrapper_child_exit": "7" },
+            "token": registry.hook_token_of(&generation).expect("capability"),
+        });
+        let mut stream = UnixStream::connect(&sock).await.expect("connect");
+        stream
+            .write_all(format!("{event}\n").as_bytes())
+            .await
+            .expect("write hook line");
+        stream.flush().await.unwrap();
+        // The event's agent type reaching the registry is what says the
+        // event itself was ingested.
+        let mut applied = false;
+        for _ in 0..80 {
+            if registry.agent_records()[0].agent_type == Some(AgentType::Codex) {
+                applied = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(applied, "the event itself was ingested");
+        assert_eq!(
+            registry.wrapper_report_for_test(&generation),
+            None,
+            "a report from below the deck's child is not the generation's"
+        );
+        handle.abort();
         let _ = handle.await;
         registry.shutdown_all();
     }

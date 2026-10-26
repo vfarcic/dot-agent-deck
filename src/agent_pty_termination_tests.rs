@@ -202,3 +202,111 @@ async fn status_032_removal_is_replaced_or_closed() {
     assert_eq!(closed, Termination::Closed);
     registry.shutdown_all();
 }
+
+/// Lift `agent` out of the registry as a respawn does before it terminates
+/// the old child: its record counted as respawning, under a real
+/// [`RespawnTicket`]. The lifted generation is returned with its child still
+/// running, so its own reader stays quiet while the test captures for it.
+fn lift_for_respawn<'a>(
+    registry: &'a AgentPtyRegistry,
+    agent: &str,
+) -> (RespawnTicket<'a>, RunningAgent) {
+    let mut inner = registry.inner.lock();
+    let lifted = inner.agents.remove(agent).expect("registered");
+    let record = AgentPtyRegistry::cleanup_record(agent, &lifted);
+    inner.respawning_members.insert(agent.to_string(), record);
+    inner.respawns_in_flight += 1;
+    drop(inner);
+    (
+        RespawnTicket {
+            registry,
+            agent_id: agent.to_string(),
+        },
+        lifted,
+    )
+}
+
+/// What the removed generation `agent` on `pane` captures, while `settle`
+/// runs beside the capture on another thread.
+fn capture_removed(
+    registry: &AgentPtyRegistry,
+    agent: &str,
+    pane: &str,
+    settle: impl FnOnce() + Send,
+) -> Termination {
+    std::thread::scope(|scope| {
+        let capture =
+            scope.spawn(|| registry.capture_termination(agent, Some(pane), false, ReadEnd::Eof));
+        settle();
+        capture.join().expect("capture")
+    })
+}
+
+/// Scenario: A respawn removes a generation and publishes its successor in time, publishes it only after the capture's bound, or ends without one, after or before the removed generation's capture starts. Only the published successor reads as replaced; a replacement still pending at the bound, or one that failed, reads as the pane having ended, in words that say neither replaced nor closed.
+#[spec("inbox/status/032")]
+#[test]
+fn status_032_a_replacement_counts_only_once_its_successor_is_published() {
+    let registry = Arc::new(AgentPtyRegistry::new());
+    let pane = "termination-pending-pane";
+    let ended = |termination: &Termination| {
+        assert_eq!(termination.wire(), PaneTermination::Unknown);
+        assert_eq!(
+            serde_json::to_value(termination.wire()).unwrap(),
+            serde_json::json!({ "kind": "unknown" })
+        );
+        assert_eq!(
+            termination.wire().words(),
+            crate::inbox_display::TERMINATION_UNKNOWN
+        );
+    };
+
+    // In time: the successor is published, then the respawn returns.
+    let first = spawn_on(&registry, pane, "sleep 30");
+    let (ticket, mut lifted) = lift_for_respawn(&registry, &first);
+    let termination = capture_removed(&registry, &first, pane, || {
+        std::thread::sleep(Duration::from_millis(50));
+        spawn_on(&registry, pane, "sleep 30");
+        drop(ticket);
+    });
+    assert_eq!(termination, Termination::Replaced);
+    let _ = lifted.child.kill();
+    let successor = registry.pane_current_agent_id(pane).expect("successor");
+
+    // Delayed: nothing is published by the bound, and the replacement then
+    // succeeds. The capture had already said only that the pane ended.
+    let (ticket, mut lifted) = lift_for_respawn(&registry, &successor);
+    let termination = capture_removed(&registry, &successor, pane, || {});
+    assert_eq!(termination, Termination::ReplacementPending);
+    ended(&termination);
+    spawn_on(&registry, pane, "sleep 30");
+    drop(ticket);
+    let _ = lifted.child.kill();
+    let late = registry
+        .pane_current_agent_id(pane)
+        .expect("late successor");
+
+    // Failed while the capture waits: the respawn returns, its pane empty.
+    let (ticket, mut lifted) = lift_for_respawn(&registry, &late);
+    let termination = capture_removed(&registry, &late, pane, || {
+        std::thread::sleep(Duration::from_millis(50));
+        drop(ticket);
+    });
+    assert_eq!(termination, Termination::ReplacementFailed);
+    ended(&termination);
+    let _ = lifted.child.kill();
+
+    // Failed before the capture starts: the ticket is gone, and its record
+    // still tells the failure from a close, once.
+    let again = spawn_on(&registry, pane, "sleep 30");
+    let (ticket, mut lifted) = lift_for_respawn(&registry, &again);
+    drop(ticket);
+    let termination = capture_removed(&registry, &again, pane, || {});
+    assert_eq!(termination, Termination::ReplacementFailed);
+    assert_eq!(
+        capture_removed(&registry, &again, pane, || {}),
+        Termination::Closed,
+        "the record is read once"
+    );
+    let _ = lifted.child.kill();
+    registry.shutdown_all();
+}

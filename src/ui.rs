@@ -15879,6 +15879,16 @@ fn deck_attention_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+/// The columns of a `row_width` tab strip kept free of tabs for `attention`:
+/// the item and its two-column gap, at most half the row, so neither the tabs
+/// nor the item can crowd the other off it.
+fn deck_attention_reserve(attention: &str, row_width: u16) -> u16 {
+    let wanted = u16::try_from(Span::raw(attention).width())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
+    wanted.min(row_width / 2)
+}
+
 /// Draw `attention` on the tab strip's row `area`, two columns after `after`
 /// (where the tabs end), clipped at the row's end.
 fn draw_deck_attention(buf: &mut ratatui::buffer::Buffer, area: Rect, after: u16, attention: &str) {
@@ -16071,6 +16081,96 @@ mod deck_attention_tests {
             .map(|span| span.content.to_string())
             .collect();
         assert!(!plain.contains('✉'), "{plain}");
+    }
+
+    /// Draw one whole Dashboard frame at `width` columns with `labels` as its
+    /// tabs and `attention` held, through `compute_frame_layout` and
+    /// `render_frame`; return the strip's row and every tab's header rect.
+    fn crowded_strip(labels: &[&str], attention: &str, width: u16) -> (String, Vec<(usize, Rect)>) {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let ctrl = EmbeddedPaneController::for_render_seam_without_panes();
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+        ui.deck_attention = Some(attention.to_string());
+        let state = AppState::default();
+        let tab_view = ActiveTabView::Dashboard {
+            exclude_pane_ids: vec![],
+            zoomed: false,
+        };
+        let tab_bar = TabBarInfo {
+            show: true,
+            labels: labels.iter().map(|label| label.to_string()).collect(),
+            active_index: 0,
+            orchestration_statuses: vec![],
+        };
+        let area = Rect::new(0, 0, width, 24);
+        let layout = compute_frame_layout(
+            area,
+            &tab_view,
+            &tab_bar,
+            &[],
+            PaneLayout::Stacked,
+            None,
+            bottom_bar_rows(&ui, width, 24),
+        );
+        let filtered = filter_sessions(&state, &ui);
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).expect("TestBackend");
+        terminal
+            .draw(|frame| {
+                render_frame(
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    true,
+                    &ctrl,
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
+                    Utc::now(),
+                );
+            })
+            .expect("draw");
+        let buf = terminal.backend().buffer();
+        let row = (0..width)
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect();
+        (row, ui.tab_header_rects.clone())
+    }
+
+    /// Scenario: an 80-column deck with the Dashboard and three orchestration
+    /// tabs of 20-column names, whose labels alone fill the strip's row, holds
+    /// its orchestrator. The whole frame is drawn: every tab stays on the row
+    /// and the attention item still shows after them, not hidden off its end.
+    #[test]
+    fn deck_attention_keeps_its_room_when_the_tabs_crowd_the_row() {
+        let attention = format!("✉ captain: {WAKE_HOLD_POSSIBLE_DRAFT} · 1 other held");
+        let labels = [
+            "Dashboard",
+            "release-train-alpha1",
+            "release-train-bravo2",
+            "release-train-delta3",
+        ];
+        let (row, headers) = crowded_strip(&labels, &attention, 80);
+        assert!(row.contains("✉ captain: waiting"), "{row}");
+        assert_eq!(
+            headers.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3],
+            "every tab keeps a header on the row: {row}"
+        );
+        let tabs_end = headers.last().map_or(0, |(_, rect)| rect.x + rect.width);
+        assert!(
+            row.chars()
+                .skip(usize::from(tabs_end))
+                .collect::<String>()
+                .contains('✉'),
+            "the item follows the tabs: {row}"
+        );
+        // A short item takes only its own width, leaving the tabs the rest.
+        let (row, _) = crowded_strip(&labels, "✉ 2 held", 80);
+        assert!(row.contains("✉ 2 held"), "{row}");
     }
 }
 
@@ -16449,21 +16549,29 @@ fn render_frame(
             .iter()
             .map(|statuses| statuses.as_deref())
             .collect();
+        // PRD #1666 part 3, round 5-wake (Q6): the attention item follows
+        // the tabs on their row, clipped at its end. Its room is reserved
+        // before the tabs are fitted, so a crowded strip narrows its labels
+        // instead of pushing the item off the row.
+        let attention = ui.deck_attention.as_deref();
+        let tabs_rect = Rect {
+            width: tab_bar_rect.width
+                - attention.map_or(0, |text| deck_attention_reserve(text, tab_bar_rect.width)),
+            ..tab_bar_rect
+        };
         let strip = render_tab_strip(
             frame,
-            tab_bar_rect,
+            tabs_rect,
             &tab_bar.labels,
             &closeable,
             tab_bar.active_index,
             &orchestration_statuses,
         );
-        // PRD #1666 part 3, round 5-wake (Q6): the attention item follows
-        // the tabs on their row, clipped at its end.
         let after_tabs = strip
             .headers
             .last()
             .map_or(tab_bar_rect.x, |(_, rect)| rect.x + rect.width);
-        if let Some(attention) = ui.deck_attention.as_deref() {
+        if let Some(attention) = attention {
             draw_deck_attention(frame.buffer_mut(), tab_bar_rect, after_tabs, attention);
         }
         ui.deck_attention_in_tab_bar = true;

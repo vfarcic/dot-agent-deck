@@ -126,7 +126,9 @@ pub enum PaneTermination {
     Replaced,
     /// The generation was removed and nothing holds its pane.
     Closed,
-    /// A kind a newer deck names that this build does not know.
+    /// The pane ended and the deck cannot say how: a respawn removed the
+    /// generation without a successor confirmed, or a newer deck names a
+    /// kind this build does not know.
     #[serde(other)]
     Unknown,
 }

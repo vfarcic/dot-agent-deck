@@ -2497,13 +2497,12 @@ function withDeliveryNotice(agents: AgentSession[], payload: unknown): AgentSess
  * stream — the agent's stall and hold as they stand now, both carried whole —
  * or `undefined` for any other payload. Flattened and snake_case, as the
  * daemon's `BroadcastMsg` is: `wake_update: true` marks it, and `state` stays
- * the message's own. A payload whose `state` reads `wake_update` is taken as
- * one too.
+ * the message's own.
  */
 function wakeUpdateOf(payload: unknown): { agentId: string; paneId?: string; wakeStalled: boolean; wakeHold?: WakeHold } | undefined {
   if (!payload || typeof payload !== "object") return undefined;
   const notice = payload as Record<string, unknown>;
-  if (notice.kind !== "inbox" || (notice.wake_update !== true && notice.state !== "wake_update")) return undefined;
+  if (notice.kind !== "inbox" || notice.wake_update !== true) return undefined;
   // Bound to the generation it names: a notice naming none could be a
   // predecessor's, so it changes nothing.
   if (typeof notice.agent_id !== "string" || !notice.agent_id) return undefined;
@@ -4105,6 +4104,21 @@ export class TauriDeckBridge implements DeckBridge {
   }
 
   /**
+   * PRD #1666 part 3, round 5-wake: apply a wake update stamped with a
+   * connected deck other than the selected one to that deck's agents
+   * ({@link withWakeUpdate}), and publish the fleet when it changed one.
+   */
+  private foldOtherDeckWakeUpdate(payload: unknown, onFleet: (fleet: DeckFleet) => void): void {
+    const deck = (payload as { deck?: unknown }).deck;
+    const stamped = typeof deck === "string" ? this.fleet.get(deck) : undefined;
+    if (typeof deck !== "string" || stamped === undefined) return;
+    const agents = withWakeUpdate(stamped.agents, payload);
+    if (agents === stamped.agents) return;
+    this.fleet.set(deck, { ...stamped, agents });
+    onFleet(this.fleetView());
+  }
+
+  /**
    * Point the evidence ring and the handoff rail at `deckId` (PRD #742 M8).
    *
    * Called wherever {@link selectedDeckId} is learnt or re-learnt — `connect()`
@@ -4879,7 +4893,14 @@ export class TauriDeckBridge implements DeckBridge {
       // event from a deck the screen is not on is dropped rather than folded
       // into another machine's drawer. An UNSTAMPED payload is kept — a fixture
       // sends none, and an older crate sent none either.
-      if (!this.isSelectedDeckEvent(event.payload)) return;
+      if (!this.isSelectedDeckEvent(event.payload)) {
+        // PRD #1666 part 3, round 5-wake: except a wake update, folded into
+        // the deck it is stamped with, because the agent dashboard's attention
+        // counts every connected deck. Only the agent's hold and stall move;
+        // the drawer and the rail stay the deck screen's.
+        this.foldOtherDeckWakeUpdate(event.payload, onFleet);
+        return;
+      }
       // Recorded BEFORE the guards below, exactly as it was when the guard was
       // `!latest`: an event that lands before the first snapshot still belongs
       // in the ring, and dropping it would lose the drawer's earliest entries.
