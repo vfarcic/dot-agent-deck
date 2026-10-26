@@ -189,9 +189,14 @@ impl RunUsage {
     }
 
     /// An event of the run: a Claude Code event names its session and
-    /// working directory, a Codex event its rollout. Reads nothing.
+    /// working directory, a Codex event its rollout. Reads nothing. An event
+    /// the deck made itself for the pane's card names no session of the
+    /// agent's and is passed over.
     pub fn observe(&self, event: &AgentEvent) {
         let inner = &self.inner;
+        if deck_made(event) {
+            return;
+        }
         match inner.source {
             UsageSource::ClaudeTranscript if event.agent_type == AgentType::ClaudeCode => {
                 let id = event.session_id.as_str();
@@ -410,6 +415,16 @@ impl RunUsage {
             }
         }
     }
+}
+
+/// Whether `event` is one the deck made for a pane's card rather than one
+/// the agent reported: it is filed under the pane's placeholder key, not a
+/// session of the agent's ([`crate::state::placeholder_session_id`]).
+fn deck_made(event: &AgentEvent) -> bool {
+    event
+        .pane_id
+        .as_deref()
+        .is_some_and(|pane| event.session_id == crate::state::placeholder_session_id(pane))
 }
 
 impl Readers {
@@ -988,6 +1003,22 @@ mod tests {
         append(&config.path().join("projects/-w/s-0.jsonl"), &[COST_STATE]);
         let run = exported(&usage.finish("run17", EndReason::Exited, None));
         assert_eq!(run["deck.tokens.unavailable_reason"], text("incomplete"));
+    }
+
+    /// The card-surface events the deck makes for a pane, filed under its
+    /// placeholder key, name no session of the agent's: they add no session
+    /// a run would otherwise count as not read.
+    #[test]
+    fn the_decks_own_card_events_name_no_session() {
+        let config = tempfile::tempdir().unwrap();
+        let usage = RunUsage::new(&AgentType::ClaudeCode, claude_dirs(config.path()), 0);
+        let mut card = claude_event(&crate::state::placeholder_session_id("p"), "/w");
+        card.pane_id = Some("p".to_string());
+        usage.observe(&card);
+        usage.observe(&claude_event("s-1", "/w"));
+        append(&config.path().join("projects/-w/s-1.jsonl"), &[COST_STATE]);
+        let run = exported(&usage.finish("run18", EndReason::Exited, None));
+        assert_eq!(run["gen_ai.usage.input_tokens"], int(350));
     }
 
     /// Noting a session reads nothing and does not wait for a poll that is
