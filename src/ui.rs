@@ -3196,6 +3196,18 @@ fn surface_orchestration_config_drift(ui: &mut UiState, tab: Option<&Tab>, warni
     ui.session_warnings.push(warning);
 }
 
+/// PRD #91: tell the user what the startup hook install came to. The status
+/// line says it as the dashboard appears; what the user has to fix also joins
+/// `session_warnings`, printed on exit, because the status line expires after
+/// [`STATUS_MESSAGE_TTL`].
+fn surface_startup_hook_note(ui: &mut UiState, note: Option<crate::hooks_refresh::StartupNote>) {
+    let Some(note) = note else {
+        return;
+    };
+    ui.status_message = Some((note.status, std::time::Instant::now()));
+    ui.session_warnings.extend(note.warnings);
+}
+
 /// Issue #1199: the status-line summary shown when the New Agent form loads a
 /// project config that still declares `[[modes]]`. Short enough for one status
 /// row; the full text, naming the file, goes to `session_warnings`.
@@ -12493,6 +12505,7 @@ pub fn run_tui(
     pane: Arc<dyn PaneController>,
     config: DashboardConfig,
     keybindings: KeybindingConfig,
+    startup_hooks: Option<crate::hooks_refresh::StartupNote>,
 ) -> std::io::Result<()> {
     let terminal_modes = TerminalModes::default();
     let hook_terminal_modes = terminal_modes.clone();
@@ -12615,6 +12628,7 @@ pub fn run_tui(
 
     let mut tick: u64 = 0;
     let mut ui = UiState::new(config, keybindings);
+    surface_startup_hook_note(&mut ui, startup_hooks);
     // PRD #196: restore the persisted global last-command so the new-pane form
     // can seed from it from the very first spawn of the session. Loaded
     // UNCONDITIONALLY — independent of the snapshot-restore gate below (which only
@@ -41536,6 +41550,42 @@ mod tests {
             Some("No pane linked to agent s0")
         );
         insta::assert_snapshot!(glossary_status_row(&state, &mut ui), @" COMMAND  No pane linked to agent s0");
+    }
+
+    /// Scenario: Start the dashboard after a startup hook install that changed
+    /// Claude Code's hooks: the status line reads "Installed or repaired the
+    /// deck's hooks for Claude Code." and nothing is kept for the exit report.
+    /// Start it after one that could not update them: the status line gives
+    /// the reason, and the exit report keeps it with the fix.
+    #[spec("dashboard/status-message/008")]
+    #[test]
+    fn status_message_008_the_startup_hook_install_is_on_the_status_line() {
+        use crate::event::AgentType;
+        use crate::hooks_refresh::{STARTUP_FIX, startup_note};
+        use tokio::sync::RwLock;
+        let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+
+        let mut ui = default_ui();
+        surface_startup_hook_note(&mut ui, None);
+        assert_eq!(glossary_status_text(&ui), None);
+
+        surface_startup_hook_note(&mut ui, startup_note(&[AgentType::ClaudeCode], &[]));
+        assert!(ui.session_warnings.is_empty());
+        insta::assert_snapshot!(glossary_status_row(&state, &mut ui), @" COMMAND  Installed or repaired the deck's hooks for Claude Code.");
+
+        let mut ui = default_ui();
+        let why = "~/.claude/settings.json is not valid JSON (left unchanged)".to_string();
+        surface_startup_hook_note(
+            &mut ui,
+            startup_note(&[], &[(AgentType::ClaudeCode, vec![why])]),
+        );
+        let line = "Claude Code's hooks could not be updated: ~/.claude/settings.json is not valid JSON (left unchanged).";
+        assert_eq!(glossary_status_text(&ui), Some(line));
+        assert_eq!(
+            ui.session_warnings,
+            vec![line.to_string(), STARTUP_FIX.to_string()]
+        );
+        insta::assert_snapshot!(glossary_status_row(&state, &mut ui), @" COMMAND  Claude Code's hooks could not be updated: ~/.claude/settings.json is not valid JSON (left");
     }
 
     /// Drive `Action::Focus` (Enter) on the one card of `snapshot` against `pc`.

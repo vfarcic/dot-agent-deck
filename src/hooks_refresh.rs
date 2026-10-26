@@ -111,6 +111,99 @@ pub fn refresh() -> RefreshReport {
     )
 }
 
+/// What the TUI's startup install came to, for the note the TUI shows as it
+/// starts (PRD #91): `status` for its status line, and `warnings` for what it
+/// prints when it exits, which outlasts the status line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupNote {
+    pub status: String,
+    pub warnings: Vec<String>,
+}
+
+/// Run every agent's startup install, as the TUI does when it starts, and say
+/// what the user should hear about it: `None` when it changed nothing and
+/// nothing failed.
+///
+/// Runs each agent's [`refresh_install`](crate::agent_registry::AgentSpec::refresh_install),
+/// which is its startup install reporting what it could not do, so a settings
+/// file the install refused to overwrite is named rather than only logged.
+pub fn startup_install() -> Option<StartupNote> {
+    use crate::agent_registry::ALL;
+    let mut changed = Vec::new();
+    let mut failed = Vec::new();
+    for spec in ALL {
+        let (attempt, wrote) = crate::agent_hook_config::noting_auto_install_changes(|| {
+            match (spec.refresh_install, spec.startup_auto_install) {
+                (Some(install), _) => install(),
+                (None, Some(install)) => {
+                    install();
+                    InstallAttempt::Absent
+                }
+                (None, None) => InstallAttempt::Absent,
+            }
+        });
+        match attempt {
+            InstallAttempt::Ran { failed: why } if !why.is_empty() => {
+                failed.push((spec.agent_type.clone(), why));
+            }
+            _ if wrote => changed.push(spec.agent_type.clone()),
+            _ => {}
+        }
+    }
+    startup_note(&changed, &failed)
+}
+
+/// The note for a startup install that changed the hooks of the `changed`
+/// agents and could not update those in `failed`, with why. A failure is what
+/// the status line leads with, since it is the one the user has to act on.
+pub(crate) fn startup_note(
+    changed: &[AgentType],
+    failed: &[(AgentType, Vec<String>)],
+) -> Option<StartupNote> {
+    if let Some((agent, why)) = failed.first() {
+        let first = could_not_update(agent, why);
+        let status = match failed.len() {
+            1 => first,
+            n => format!("{first} (+{} more, printed on exit)", n - 1),
+        };
+        let mut warnings: Vec<String> = failed
+            .iter()
+            .map(|(agent, why)| could_not_update(agent, why))
+            .collect();
+        warnings.push(STARTUP_FIX.to_string());
+        return Some(StartupNote { status, warnings });
+    }
+    if changed.is_empty() {
+        return None;
+    }
+    let labels: Vec<&str> = changed
+        .iter()
+        .map(crate::hook_binary::agent_display_name)
+        .collect();
+    Some(StartupNote {
+        status: format!(
+            "Installed or repaired the deck's hooks for {}.",
+            and_list(&labels)
+        ),
+        warnings: Vec::new(),
+    })
+}
+
+/// What a report says about an agent whose hooks the install could not
+/// update, and `why`.
+fn could_not_update(agent: &AgentType, why: &[String]) -> String {
+    let label = crate::hook_binary::agent_display_name(agent);
+    let why = crate::untrusted_text::display_line(
+        why.join("; ").trim_end_matches('.'),
+        MAX_SHOWN_REASON_BYTES,
+    );
+    format!("{label}'s hooks could not be updated: {why}.")
+}
+
+/// What follows the startup install's failures when the TUI exits.
+pub const STARTUP_FIX: &str =
+    "Fix what it names, then start the deck again or run `dot-agent-deck hooks refresh`.";
+
 /// The most bytes of a configured path a report repeats.
 const MAX_SHOWN_BINARY_BYTES: usize = 512;
 
@@ -150,13 +243,7 @@ pub(crate) fn report(
         // A failed install says so even when the config still names this
         // copy: what it names is not what the install meant to write.
         if !failed.is_empty() {
-            let why = crate::untrusted_text::display_line(
-                failed.join("; ").trim_end_matches('.'),
-                MAX_SHOWN_REASON_BYTES,
-            );
-            notes.push(text(format!(
-                "{label}'s hooks could not be updated: {why}."
-            )));
+            notes.push(text(could_not_update(&agent, &failed)));
             attention.push(agent);
             continue;
         }
@@ -299,6 +386,54 @@ mod tests {
                     .map(|(_, version)| version.to_string())
             },
         )
+    }
+
+    /// Scenario: the TUI's startup install changed nothing and nothing failed,
+    /// so there is no note; when it changed Claude Code's and Codex's hooks,
+    /// the status line names both and nothing is printed on exit.
+    #[test]
+    fn a_startup_install_that_changed_hooks_names_the_agents() {
+        assert_eq!(startup_note(&[], &[]), None);
+        assert_eq!(
+            startup_note(&[AgentType::ClaudeCode, AgentType::Codex], &[]),
+            Some(StartupNote {
+                status: "Installed or repaired the deck's hooks for Claude Code and Codex.".into(),
+                warnings: Vec::new(),
+            })
+        );
+    }
+
+    /// Scenario: the startup install could not update Claude Code's hooks
+    /// because its settings file is not valid JSON, and could not write
+    /// OpenCode's plugin. The status line leads with the first reason, counts
+    /// the rest, and the exit report names each with the fix; a failure wins
+    /// over another agent's change.
+    #[test]
+    fn a_startup_install_that_failed_says_why_and_what_to_do() {
+        let malformed = "/home/u/.claude/settings.json is not valid JSON (left unchanged): \
+                         expected `,` or `}` at line 3 column 5";
+        let note = startup_note(
+            &[AgentType::Codex],
+            &[
+                (AgentType::ClaudeCode, vec![malformed.to_string()]),
+                (AgentType::OpenCode, vec!["/p: denied.".to_string()]),
+            ],
+        )
+        .expect("a failure is always a note");
+        let claude = format!("Claude Code's hooks could not be updated: {malformed}.");
+        assert_eq!(note.status, format!("{claude} (+1 more, printed on exit)"));
+        assert_eq!(
+            note.warnings,
+            vec![
+                claude,
+                "OpenCode's hooks could not be updated: /p: denied.".to_string(),
+                STARTUP_FIX.to_string(),
+            ]
+        );
+        let one = startup_note(&[], &[(AgentType::Devin, vec!["no\u{1b}[2J".to_string()])])
+            .expect("a failure is always a note");
+        assert!(!one.status.contains('\u{1b}'), "{:?}", one.status);
+        assert!(!one.status.contains("more"), "{:?}", one.status);
     }
 
     /// Scenario: after the startup install, Claude Code's and Codex's hooks

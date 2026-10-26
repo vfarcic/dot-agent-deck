@@ -1874,6 +1874,32 @@ pub(crate) fn auto_install_kept_entry(
     })
 }
 
+thread_local! {
+    /// How many changes [`log_auto_install_change`] has logged on this thread
+    /// inside [`noting_auto_install_changes`], or `None` outside one.
+    static CHANGES_NOTED: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f`, and say whether it changed an agent's config, by whether it logged
+/// a change through [`log_auto_install_change`] on this thread (PRD #91: the
+/// TUI's note that its startup install changed the hooks). Every automatic
+/// install logs its changes there, so this needs nothing from the installers.
+/// A change made inside a nested call counts for the outer one too.
+pub(crate) fn noting_auto_install_changes<R>(f: impl FnOnce() -> R) -> (R, bool) {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let inner = CHANGES_NOTED.with(|c| c.get()).unwrap_or(0);
+            CHANGES_NOTED.with(|c| c.set(self.0.map(|outer| outer + inner)));
+        }
+    }
+    let restore = Restore(CHANGES_NOTED.with(|c| c.replace(Some(0))));
+    let result = f();
+    let changed = CHANGES_NOTED.with(|c| c.get()).is_some_and(|n| n > 0);
+    drop(restore);
+    (result, changed)
+}
+
 /// Log an automatic install that actually changed an agent's config (PRD
 /// #1487). A no-op logs nothing at info: what this records is that the deck
 /// rewrote somebody else's file, which is exactly what went unnoticed when test
@@ -1884,6 +1910,7 @@ pub(crate) fn log_auto_install_change(
     binary: &str,
     trigger: &str,
 ) {
+    CHANGES_NOTED.with(|c| c.set(c.get().map(|n| n + 1)));
     tracing::info!(
         agent,
         destination = %destination.display(),
@@ -1925,6 +1952,25 @@ mod tests {
         // call, and `mkfifo` only reads through it.
         let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
         assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+    }
+
+    /// PRD #91: a logged change is noted only inside the scope that made it,
+    /// a scope that changed nothing says so, and an inner scope's change
+    /// counts for the scope around it.
+    #[test]
+    fn noting_auto_install_changes_sees_only_the_changes_made_inside_it() {
+        let log = || log_auto_install_change("codex", Path::new("/h/hooks.json"), "/b", "test");
+        log();
+        assert_eq!(noting_auto_install_changes(|| ()), ((), false));
+        assert_eq!(noting_auto_install_changes(log), ((), true));
+        let (inner, outer) = noting_auto_install_changes(|| noting_auto_install_changes(log).1);
+        assert!(inner && outer);
+        let (inner, outer) = noting_auto_install_changes(|| {
+            log();
+            noting_auto_install_changes(|| ()).1
+        });
+        assert!(!inner && outer);
+        assert_eq!(CHANGES_NOTED.with(|c| c.get()), None);
     }
 
     /// `f` on a thread of its own, failing rather than hanging when it does
