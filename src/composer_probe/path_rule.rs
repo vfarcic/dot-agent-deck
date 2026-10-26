@@ -22,8 +22,8 @@
 //!   there; an allow-listed directory reached through another filesystem
 //!   refuses too (core §6.1).
 //! - be owned by root or the user;
-//! - have a POSIX ACL that is absent or one [`acl_grants`] can read, and no
-//!   NFSv4 or rich ACL. A directory with no ACL reads `ENODATA` on a
+//! - have a POSIX ACL that is absent or one [`acl_grants`] reads as a whole,
+//!   valid ACL, and no NFSv4 or rich ACL. A directory with no ACL reads `ENODATA` on a
 //!   filesystem with POSIX ACLs; `ENOTSUP` is unexpected on these and
 //!   refuses.
 //! - and either (a) have no group or other write bit and no ACL write grant,
@@ -171,7 +171,7 @@ pub enum Cause {
     AclWrite,
     /// The POSIX ACL can't be read on a filesystem that should have it.
     AclUnsupported,
-    /// The POSIX ACL attribute isn't one the rule can read.
+    /// The POSIX ACL attribute isn't a whole, valid ACL ([`acl_grants`]).
     AclMalformed,
     /// An NFSv4 or rich ACL is present.
     ForeignAcl { name: &'static str },
@@ -248,35 +248,73 @@ const ACL_MASK: u16 = 0x10;
 const ACL_OTHER: u16 = 0x20;
 const ACL_WRITE: u16 = 0x02;
 const ACL_EXECUTE: u16 = 0x01;
+/// Read, write and execute: every permission bit an entry may carry.
+const ACL_PERMISSIONS: u16 = 0o7;
+/// The id an entry without one carries, and no named entry may.
+const ACL_UNDEFINED_ID: u32 = u32::MAX;
+
+/// Where [`acl_grants`] is in an ACL's entries, which come in the kernel's
+/// order: the owner, named users, the owning group, named groups, the mask,
+/// others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AclAt {
+    Start,
+    Users,
+    Groups,
+    Masked,
+    Done,
+}
 
 /// Read `system.posix_acl_access`'s value: a little-endian version 2 header,
 /// then entries of tag, permissions and id. A named user or group entry, or
 /// the mask, carrying write or execute grants it. The owner, owning-group
 /// and other entries are the mode bits, which the rule reads directly; the
 /// owning group's effective rights are capped by the mask, which is read
-/// here. `None` for anything else, which refuses.
+/// here.
+///
+/// `None`, which refuses, unless the value is a whole ACL as the kernel
+/// validates one: the version-2 header and whole entries after it; one owner
+/// entry first, then named users, one owning-group entry, named groups, a
+/// mask (required when there is a named entry, and at most one) and one
+/// other entry last; no tag outside those six; permissions within read,
+/// write and execute; an id on each named entry and on no other; and no
+/// named user or group twice. That makes the value's length its entry count.
 pub fn acl_grants(value: &[u8]) -> Option<AclGrants> {
     let (header, entries) = value.split_first_chunk::<4>()?;
-    if u32::from_le_bytes(*header) != ACL_XATTR_VERSION
-        || entries.is_empty()
-        || !entries.len().is_multiple_of(8)
-    {
+    if u32::from_le_bytes(*header) != ACL_XATTR_VERSION || !entries.len().is_multiple_of(8) {
         return None;
     }
     let mut grants = AclGrants::default();
+    let mut named = std::collections::BTreeSet::new();
+    let mut at = AclAt::Start;
     for entry in entries.as_chunks::<8>().0 {
         let tag = u16::from_le_bytes([entry[0], entry[1]]);
         let perm = u16::from_le_bytes([entry[2], entry[3]]);
-        match tag {
-            ACL_USER | ACL_GROUP | ACL_MASK => {
-                grants.write |= perm & ACL_WRITE != 0;
-                grants.execute |= perm & ACL_EXECUTE != 0;
-            }
-            ACL_USER_OBJ | ACL_GROUP_OBJ | ACL_OTHER => {}
+        let id = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
+        if perm & !ACL_PERMISSIONS != 0 {
+            return None;
+        }
+        let is_named = tag == ACL_USER || tag == ACL_GROUP;
+        if is_named == (id == ACL_UNDEFINED_ID) {
+            return None;
+        }
+        at = match (at, tag) {
+            (AclAt::Start, ACL_USER_OBJ) | (AclAt::Users, ACL_USER) => AclAt::Users,
+            (AclAt::Users, ACL_GROUP_OBJ) | (AclAt::Groups, ACL_GROUP) => AclAt::Groups,
+            (AclAt::Groups, ACL_MASK) => AclAt::Masked,
+            (AclAt::Masked, ACL_OTHER) => AclAt::Done,
+            (AclAt::Groups, ACL_OTHER) if named.is_empty() => AclAt::Done,
             _ => return None,
+        };
+        if is_named && !named.insert((tag, id)) {
+            return None;
+        }
+        if tag != ACL_USER_OBJ && tag != ACL_GROUP_OBJ && tag != ACL_OTHER {
+            grants.write |= perm & ACL_WRITE != 0;
+            grants.execute |= perm & ACL_EXECUTE != 0;
         }
     }
-    Some(grants)
+    (at == AclAt::Done).then_some(grants)
 }
 
 /// How a directory passed.

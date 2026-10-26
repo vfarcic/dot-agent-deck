@@ -255,15 +255,29 @@ const MASK: u16 = 0x10;
 const OTHER_ENTRY: u16 = 0x20;
 const UNDEFINED_ID: u32 = u32::MAX;
 
-/// An ACL on a 0755 node, with one named entry and a mask.
+/// An ACL on a 0755 node, with one named entry (`USER` or `GROUP`, for
+/// [`OTHER`]) and a mask, in the kernel's order.
 fn acl_with(tag: u16, perm: u16, mask: u16) -> Vec<u8> {
-    acl(&[
-        (USER_OBJ, 7, UNDEFINED_ID),
-        (tag, perm, OTHER),
-        (GROUP_OBJ, 5, UNDEFINED_ID),
-        (MASK, mask, UNDEFINED_ID),
-        (OTHER_ENTRY, 5, UNDEFINED_ID),
-    ])
+    let named = (tag, perm, OTHER);
+    let mut entries = vec![(USER_OBJ, 7, UNDEFINED_ID)];
+    if tag == USER {
+        entries.push(named);
+    }
+    entries.push((GROUP_OBJ, 5, UNDEFINED_ID));
+    if tag == GROUP {
+        entries.push(named);
+    }
+    entries.extend([(MASK, mask, UNDEFINED_ID), (OTHER_ENTRY, 5, UNDEFINED_ID)]);
+    acl(&entries)
+}
+
+/// The three entries every ACL has, carrying these permissions.
+fn base_acl(user: u16, group: u16, other: u16) -> [(u16, u16, u32); 3] {
+    [
+        (USER_OBJ, user, UNDEFINED_ID),
+        (GROUP_OBJ, group, UNDEFINED_ID),
+        (OTHER_ENTRY, other, UNDEFINED_ID),
+    ]
 }
 
 fn check(tree: &Tree, path: &str, uid: u32) -> Result<usize, Refusal> {
@@ -669,39 +683,219 @@ fn probe_005_acls_refuse_write_grants_and_what_cant_be_read() {
     );
 }
 
-/// Scenario: Read raw `system.posix_acl_access` values: only named user and group entries and the mask grant anything, write and execute are told apart, and the owner, owning-group and other entries grant nothing (they are the mode bits).
+/// Scenario: Read raw `system.posix_acl_access` values that are whole, valid ACLs: only named user and group entries and the mask grant anything, write and execute are told apart, the owner, owning-group and other entries grant nothing (they are the mode bits), a mask with no named entry is read, and several named users and groups, out of id order and one id as both a user and a group, are read together.
 #[spec("inbox/probe/005")]
 #[test]
 fn probe_005_acl_values_read_as_grants() {
     let none = AclGrants::default();
-    assert_eq!(
-        acl_grants(&acl(&[
-            (USER_OBJ, 7, UNDEFINED_ID),
-            (GROUP_OBJ, 7, UNDEFINED_ID),
-            (OTHER_ENTRY, 7, UNDEFINED_ID),
-        ])),
-        Some(none)
-    );
-    for tag in [USER, GROUP, MASK] {
+    let write = AclGrants {
+        write: true,
+        execute: false,
+    };
+    let execute = AclGrants {
+        write: false,
+        execute: true,
+    };
+    assert_eq!(acl_grants(&acl(&base_acl(7, 7, 7))), Some(none));
+    for (perm, grants) in [(2, write), (1, execute), (4, none)] {
+        let [user, group, other] = base_acl(7, 7, 7);
         assert_eq!(
-            acl_grants(&acl(&[(tag, 2, 5)])),
-            Some(AclGrants {
-                write: true,
-                execute: false
-            })
+            acl_grants(&acl(&[user, group, (MASK, perm, UNDEFINED_ID), other])),
+            Some(grants),
+            "a mask of {perm}"
         );
-        assert_eq!(
-            acl_grants(&acl(&[(tag, 1, 5)])),
-            Some(AclGrants {
-                write: false,
-                execute: true
-            })
-        );
-        assert_eq!(acl_grants(&acl(&[(tag, 4, 5)])), Some(none));
+        for tag in [USER, GROUP] {
+            assert_eq!(
+                acl_grants(&acl_with(tag, perm, 4)),
+                Some(grants),
+                "{tag:#x} with {perm}"
+            );
+        }
     }
-    assert_eq!(acl_grants(&[]), None);
-    assert_eq!(acl_grants(&[2, 0, 0, 0]), None);
-    assert_eq!(acl_grants(&acl(&[(0x40, 0, 0)])), None);
+    let many = acl(&[
+        (USER_OBJ, 6, UNDEFINED_ID),
+        (USER, 4, OTHER),
+        (USER, 4, ROOT),
+        (USER, 1, ME),
+        (GROUP_OBJ, 4, UNDEFINED_ID),
+        (GROUP, 4, OTHER),
+        (GROUP, 2, ME),
+        (MASK, 4, UNDEFINED_ID),
+        (OTHER_ENTRY, 4, UNDEFINED_ID),
+    ]);
+    assert_eq!(
+        acl_grants(&many),
+        Some(AclGrants {
+            write: true,
+            execute: true
+        })
+    );
+}
+
+/// A valid ACL with every kind of entry: owner, a named user, owning group,
+/// a named group, the mask and others, none granting write.
+const VALID_ACL: [(u16, u16, u32); 6] = [
+    (USER_OBJ, 7, UNDEFINED_ID),
+    (USER, 5, OTHER),
+    (GROUP_OBJ, 5, UNDEFINED_ID),
+    (GROUP, 5, OTHER),
+    (MASK, 5, UNDEFINED_ID),
+    (OTHER_ENTRY, 5, UNDEFINED_ID),
+];
+
+/// [`VALID_ACL`], edited.
+fn edited(edit: impl FnOnce(&mut Vec<(u16, u16, u32)>)) -> Vec<u8> {
+    let mut entries = VALID_ACL.to_vec();
+    edit(&mut entries);
+    acl(&entries)
+}
+
+/// Scenario: Put ACL values that aren't a whole, valid ACL on an otherwise passing 0755 directory, and on the export in a 0700 directory: too short for a header, a header alone, version 1 or 3, an entry cut short or a stray byte after the last, an entry after the others entry, a lone others entry, a tag outside the six, permission bits outside read, write and execute (on a named entry and on others), a named user or group with no id, an owner, owning-group, mask or others entry with one, a missing owner, owning-group, others or (with named entries) mask entry, a second owner, owning-group, mask or others entry, the same named user or group twice, and entries out of the kernel's order. Each reads as no ACL and refuses as malformed where it is; the valid ACL they were made from passes in both places.
+#[spec("inbox/probe/005")]
+#[test]
+fn probe_005_malformed_acls_refuse() {
+    let wrong_version = |version: u8| {
+        let mut value = acl(&VALID_ACL);
+        value[0] = version;
+        value
+    };
+    let mut cases: Vec<(String, Vec<u8>)> = vec![
+        ("no bytes".into(), vec![]),
+        ("shorter than its header".into(), vec![2, 0]),
+        ("a header alone".into(), acl(&[])),
+        ("version 1".into(), wrong_version(1)),
+        ("version 3".into(), wrong_version(3)),
+        ("an entry cut short".into(), {
+            let mut value = acl(&VALID_ACL);
+            value.pop();
+            value
+        }),
+        ("a stray byte after the last entry".into(), {
+            let mut value = acl(&VALID_ACL);
+            value.push(0);
+            value
+        }),
+        (
+            "a named user after others".into(),
+            edited(|e| e.push((USER, 4, ME))),
+        ),
+        (
+            "a lone others entry".into(),
+            acl(&[(OTHER_ENTRY, 6, UNDEFINED_ID)]),
+        ),
+        (
+            "a named user with no id".into(),
+            edited(|e| e[1].2 = UNDEFINED_ID),
+        ),
+        (
+            "a named group with no id".into(),
+            edited(|e| e[3].2 = UNDEFINED_ID),
+        ),
+        (
+            "no owner".into(),
+            edited(|e| {
+                e.remove(0);
+            }),
+        ),
+        (
+            "no owning group".into(),
+            edited(|e| {
+                e.remove(2);
+            }),
+        ),
+        (
+            "no mask with named entries".into(),
+            edited(|e| {
+                e.remove(4);
+            }),
+        ),
+        (
+            "no others".into(),
+            edited(|e| {
+                e.remove(5);
+            }),
+        ),
+        ("two owners".into(), edited(|e| e.insert(0, e[0]))),
+        ("two owning groups".into(), edited(|e| e.insert(2, e[2]))),
+        ("two masks".into(), edited(|e| e.insert(4, e[4]))),
+        ("two others".into(), edited(|e| e.push(e[5]))),
+        (
+            "the same named user twice".into(),
+            edited(|e| e.insert(1, (USER, 4, OTHER))),
+        ),
+        (
+            "the same named group twice".into(),
+            edited(|e| e.insert(3, (GROUP, 4, OTHER))),
+        ),
+        ("the owning group first".into(), edited(|e| e.swap(0, 2))),
+        (
+            "a named user after the owning group".into(),
+            edited(|e| e.swap(1, 2)),
+        ),
+        (
+            "a named group before the owning group".into(),
+            edited(|e| e.swap(2, 3)),
+        ),
+        (
+            "the mask before a named group".into(),
+            edited(|e| e.swap(3, 4)),
+        ),
+        ("others before the mask".into(), edited(|e| e.swap(4, 5))),
+    ];
+    for tag in [0x00, 0x03, 0x40, 0x8000, 0xFFFF] {
+        cases.push((
+            format!("tag {tag:#x}"),
+            edited(|e| e.insert(1, (tag, 4, UNDEFINED_ID))),
+        ));
+    }
+    for perm in [0o10, 0x100, 0x8000, 0xFFFF] {
+        cases.push((
+            format!("permissions {perm:#x} on a named user"),
+            edited(|e| e[1].1 = perm),
+        ));
+        cases.push((
+            format!("permissions {perm:#x} on others"),
+            edited(|e| e[5].1 = perm),
+        ));
+    }
+    for (index, id) in [(0, ROOT), (2, ME), (4, ROOT), (5, OTHER)] {
+        cases.push((
+            format!("entry {index} carrying id {id}"),
+            edited(|e| e[index].2 = id),
+        ));
+    }
+
+    let base = || {
+        let mut tree = Tree::standard();
+        tree.dir("/home/me/d", ME, 0o755);
+        tree.file("/home/me/d/prompt.md", ME, 0o600);
+        tree.dir("/home/me/p", ME, 0o700);
+        tree.file("/home/me/p/prompt.md", ME, 0o600);
+        tree
+    };
+    let mut tree = base();
+    tree.set_xattr("/home/me/d", ACL, Some(acl(&VALID_ACL)));
+    tree.set_xattr("/home/me/p/prompt.md", ACL, Some(acl(&VALID_ACL)));
+    assert!(check(&tree, "/home/me/d/prompt.md", ME).is_ok());
+    assert!(check(&tree, "/home/me/p/prompt.md", ME).is_ok());
+
+    for (label, value) in cases {
+        assert_eq!(acl_grants(&value), None, "{label}");
+        let mut tree = base();
+        tree.set_xattr("/home/me/d", ACL, Some(value.clone()));
+        assert_eq!(
+            refused(&tree, "/home/me/d/prompt.md", ME),
+            refusal("/home/me/d", Cause::AclMalformed),
+            "{label} on the directory"
+        );
+        let mut tree = base();
+        tree.set_xattr("/home/me/p/prompt.md", ACL, Some(value));
+        assert_eq!(
+            refused(&tree, "/home/me/p/prompt.md", ME),
+            refusal("/home/me/p/prompt.md", Cause::AclMalformed),
+            "{label} on the export"
+        );
+    }
 }
 
 /// Scenario: Put the export's directory, a directory above it, `/` or the export alone on a filesystem outside the allow-list: NFS, CIFS, SMB2, 9p, FUSE, overlayfs, ZFS and Ceph. Each is refused at the first such component, an allow-listed directory reached through one included.
@@ -987,6 +1181,12 @@ fn probe_005_io_errors_refuse() {
 
 /// The real filesystem, through the Linux view, under a fresh directory in
 /// `/tmp`.
+///
+/// On a host whose `/` or `/tmp` is outside the allow-list (a container's
+/// overlayfs root, the RWX sandbox's among them), every real walk stops at
+/// that refusal: the tests then check only that refusal, the positives print
+/// `SKIP-POSITIVE`, and what the walk does on an allowed filesystem past `/`
+/// is covered there by the scripted cases above alone (and M47n, run apart).
 #[cfg(target_os = "linux")]
 mod real {
     use std::ffi::CString;
@@ -1110,7 +1310,7 @@ mod real {
         expect_pass(&dir.path().join("ln/prompt.md"), "the box\n");
     }
 
-    /// Scenario: On the real filesystem: a `CODEX_HOME` whose `editor` directory is 0775, as a umask of 002 makes it, holds at that directory with the `chmod g-w` remedy and passes once the bit is removed; a 0666 export in a 0755 directory, a FIFO, a file with a second hard link, a symlink in `/tmp`, a symlink loop, and an ACL granting another user write on a 0755 directory each refuse.
+    /// Scenario: On the real filesystem: a `CODEX_HOME` whose `editor` directory is 0775, as a umask of 002 makes it, holds at that directory with the `chmod g-w` remedy and passes once the bit is removed; a 0666 export in a 0755 directory, a FIFO, a file with a second hard link, a symlink in `/tmp`, a symlink loop, and an ACL on a 0755 directory whose named entry (for the user's own uid) carries write behind a read-and-execute mask each refuse, the last on the raw named write the mask hides.
     #[spec("inbox/probe/005")]
     #[test]
     fn probe_005_real_refusals_and_option_c() {
@@ -1174,7 +1374,6 @@ mod real {
         fs::create_dir(&acl_dir).unwrap();
         chmod(&acl_dir, 0o755);
         write(&acl_dir.join("prompt.md"), 0o600);
-        let name = CString::new(acl_dir.as_os_str().as_bytes()).unwrap();
         // A named entry for the user's own uid, which every user namespace
         // maps; the rule refuses any named write grant.
         let value = acl(&[
@@ -1184,6 +1383,26 @@ mod real {
             (MASK, 5, UNDEFINED_ID),
             (OTHER_ENTRY, 5, UNDEFINED_ID),
         ]);
+        let expected = match set_acl(&acl_dir, &value) {
+            Ok(()) => {
+                assert_eq!(
+                    fs::metadata(&acl_dir).unwrap().permissions().mode() & 0o777,
+                    0o755,
+                    "the mask kept the group bits read-only"
+                );
+                Cause::AclWrite
+            }
+            Err(error) => {
+                assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP), "{error}");
+                Cause::AclUnsupported
+            }
+        };
+        expect_refusal(&acl_dir.join("prompt.md"), &acl_dir, expected);
+    }
+
+    /// Set `path`'s POSIX access ACL to `value`.
+    fn set_acl(path: &Path, value: &[u8]) -> std::io::Result<()> {
+        let name = CString::new(path.as_os_str().as_bytes()).unwrap();
         // SAFETY: a NUL-terminated path and name, and a value of its length.
         let set = unsafe {
             libc::setxattr(
@@ -1194,19 +1413,136 @@ mod real {
                 0,
             )
         };
-        let expected = if set == 0 {
-            assert_eq!(
-                fs::metadata(&acl_dir).unwrap().permissions().mode() & 0o777,
-                0o755,
-                "the mask kept the group bits read-only"
-            );
-            Cause::AclWrite
+        if set == 0 {
+            Ok(())
         } else {
-            let error = std::io::Error::last_os_error();
-            assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP), "{error}");
-            Cause::AclUnsupported
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    /// The `nobody` account's uid, when it exists and isn't the user's.
+    fn nobody() -> Option<u32> {
+        // SAFETY: a NUL-terminated name; the entry is read at once, before any
+        // other `getpw*` call could overwrite it.
+        let entry = unsafe { libc::getpwnam(c"nobody".as_ptr()) };
+        // SAFETY: a non-null entry from `getpwnam`.
+        let found = (!entry.is_null()).then(|| unsafe { (*entry).pw_uid });
+        found.filter(|&found| found != uid())
+    }
+
+    /// Scenario: On the real filesystem, an ACL on a 0755 directory grants another existing account (`nobody`) read, write and execute behind a mask that lets it through, so that account can in effect write there: the directory's group bits show the mask (0775), and the export in it refuses at the directory as group-writable with the `chmod g-w` remedy. After `chmod g-w` the mask hides the grant (read back from the attribute) and it still refuses, on the raw named write; with the grant cut to read and execute it passes. An export given the same effective grant (0660 by its mask) in a 0755 directory refuses as writable. Where the filesystem has no POSIX ACLs or this user namespace doesn't map `nobody`, the test prints `SKIP-FOREIGN-ACL` and asserts nothing more; on a host whose `/` or `/tmp` is outside the allow-list, each walk is refused there instead.
+    #[spec("inbox/probe/005")]
+    #[test]
+    fn probe_005_a_real_acl_grant_to_another_account() {
+        let Some(nobody) = nobody() else {
+            eprintln!("SKIP-FOREIGN-ACL: no `nobody` account apart from this user");
+            return;
         };
-        expect_refusal(&acl_dir.join("prompt.md"), &acl_dir, expected);
+        let grant = |named: u16, mask: u16| {
+            acl(&[
+                (USER_OBJ, 7, UNDEFINED_ID),
+                (USER, named, nobody),
+                (GROUP_OBJ, 5, UNDEFINED_ID),
+                (MASK, mask, UNDEFINED_ID),
+                (OTHER_ENTRY, 5, UNDEFINED_ID),
+            ])
+        };
+        let dir = private_tmp();
+        let shared = dir.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        chmod(&shared, 0o755);
+        let export = shared.join("prompt.md");
+        write(&export, 0o600);
+        if let Err(error) = set_acl(&shared, &grant(7, 7)) {
+            assert!(
+                matches!(error.raw_os_error(), Some(libc::EOPNOTSUPP | libc::EINVAL)),
+                "{error}"
+            );
+            eprintln!("SKIP-FOREIGN-ACL: setting an ACL for uid {nobody}: {error}");
+            return;
+        }
+        assert_eq!(
+            fs::metadata(&shared).unwrap().permissions().mode() & 0o777,
+            0o775,
+            "the mask shows in the group bits"
+        );
+        expect_refusal(
+            &export,
+            &shared,
+            Cause::Writable {
+                mode: 0o775,
+                uid: uid(),
+            },
+        );
+        if host_refusal().is_none() {
+            let held = verify(&export).unwrap_err();
+            assert_eq!(held.remedy(uid()), Remedy::RemoveWrite { bits: 0o020 });
+        }
+
+        chmod(&shared, 0o755);
+        let fd = std::os::fd::OwnedFd::from(fs::File::open(&shared).unwrap());
+        assert_eq!(
+            LinuxFsView.xattr(&fd, "system.posix_acl_access").unwrap(),
+            Xattr::Present(grant(7, 5)),
+            "chmod masked the grant and kept it"
+        );
+        expect_refusal(&export, &shared, Cause::AclWrite);
+        set_acl(&shared, &grant(5, 5)).unwrap();
+        expect_pass(&export, "the box\n");
+
+        let granted = shared.join("granted.md");
+        write(&granted, 0o600);
+        set_acl(
+            &granted,
+            &acl(&[
+                (USER_OBJ, 6, UNDEFINED_ID),
+                (USER, 6, nobody),
+                (GROUP_OBJ, 0, UNDEFINED_ID),
+                (MASK, 6, UNDEFINED_ID),
+                (OTHER_ENTRY, 0, UNDEFINED_ID),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::metadata(&granted).unwrap().permissions().mode() & 0o777,
+            0o660
+        );
+        expect_refusal(&granted, &granted, Cause::FileWritable { mode: 0o660 });
+    }
+
+    const DESCRIPTOR_ZERO_CHILD: &str = "DAD_PROBE_005_DESCRIPTOR_ZERO_CHILD";
+
+    /// Scenario: The Linux view takes a descriptor of 0 as an open, not an error: the test runs itself again alone in a child process, which writes a 0600 export in a private directory under `/tmp`, closes its standard input so the first descriptor the walk opens (`/`) is 0, and checks the export passes and reads back (or, on a host whose `/` or `/tmp` is outside the allow-list, is refused there by its filesystem, not by a failed open).
+    #[spec("inbox/probe/005")]
+    #[test]
+    fn probe_005_descriptor_zero_is_an_open() {
+        if std::env::var_os(DESCRIPTOR_ZERO_CHILD).is_some() {
+            let dir = private_tmp();
+            let export = dir.path().join("prompt.md");
+            write(&export, 0o600);
+            // SAFETY: this process runs this test alone (below), and nothing
+            // in it reads standard input.
+            assert_eq!(unsafe { libc::close(0) }, 0);
+            // SAFETY: `fcntl` on a closed descriptor only fails.
+            assert_eq!(unsafe { libc::fcntl(0, libc::F_GETFD) }, -1, "0 is free");
+            expect_pass(&export, "the box\n");
+            println!("descriptor zero: checked");
+            return;
+        }
+        let name = "real::probe_005_descriptor_zero_is_an_open";
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(DESCRIPTOR_ZERO_CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        // libtest exits 0 when the filter matches nothing.
+        assert!(
+            stdout.contains("descriptor zero: checked"),
+            "{stdout}\n{stderr}"
+        );
     }
 
     /// Scenario: On the real filesystem, through the Linux view: a symlink as the export itself refuses even though its target would pass; a FIFO where a directory belongs refuses without blocking; an export and a directory on its path that the user can't open (mode 000) refuse naming the open's `EACCES` (not checked when running as root); and the view reads a 2,000-byte extended attribute whole, reports a missing one as absent, and reports one the filesystem doesn't support as unsupported.
