@@ -277,6 +277,15 @@ jobs:
       # not set it, so its output must not contain it; a seam that leaked into
       # every bundle would ship to users with nothing saying so.
       - run: "! grep -rl __dadDriver dist/"
+      # Issue #1708 — the Pi extension's type gate, which until then ran
+      # nowhere. It rides this job for the Node it already sets up; its Node
+      # suites run from the fast tier instead (the comment on `test`'s
+      # setup-node step). `--ignore-scripts`: tsc needs no install script, so
+      # none of the type packages' dependencies runs code on the runner.
+      - run: npm ci --ignore-scripts
+        working-directory: pi-extension
+      - run: npm run typecheck
+        working-directory: pi-extension
 
   # Issues #823 and #836 — the browser-level tier. `desktop-web` above runs ~296
   # vitest tests under `environment: "jsdom"`, and jsdom is a DOM implementation
