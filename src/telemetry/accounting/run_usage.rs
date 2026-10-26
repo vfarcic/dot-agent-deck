@@ -1117,4 +1117,467 @@ mod tests {
         drop(held);
         assert_eq!(lock(&usage.inner.inbox).claude.len(), 1);
     }
+
+    // --- the busy-deck benchmark (synthetic records, no agent's content) ---
+
+    mod busy_deck {
+        use super::*;
+        use std::io::BufWriter;
+        use std::time::{Duration, Instant};
+
+        /// A deterministic generator, so every run of the benchmark writes
+        /// the same bytes.
+        struct Rng(u64);
+
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                self.0 >> 33
+            }
+
+            /// A line length around `mean`: 0.2× to 1.8×, and one line in
+            /// 50 twelve times as long, as a large tool output is.
+            fn len(&mut self, mean: usize) -> usize {
+                if self.next().is_multiple_of(50) {
+                    mean * 12
+                } else {
+                    mean * (20 + (self.next() % 161) as usize) / 100
+                }
+            }
+        }
+
+        /// JSON string content: words with an escaped newline or quote now
+        /// and then, as tool output has. A backslash only ever opens a
+        /// two-byte escape, so [`Filler::text`] can cut it anywhere else.
+        struct Filler(String);
+
+        impl Filler {
+            fn new(rng: &mut Rng) -> Self {
+                let mut pool = String::with_capacity(1 << 20);
+                while pool.len() < 1 << 20 {
+                    match rng.next() % 12 {
+                        0 => pool.push_str("\\n"),
+                        1 => pool.push_str("\\\""),
+                        _ => {
+                            for _ in 0..(2 + rng.next() % 9) {
+                                pool.push((b'a' + (rng.next() % 26) as u8) as char);
+                            }
+                            pool.push(' ');
+                        }
+                    }
+                }
+                Filler(pool)
+            }
+
+            /// A run of the pool about `mean` bytes long ([`Rng::len`]).
+            fn text(&self, rng: &mut Rng, mean: usize) -> &str {
+                let pool = self.0.as_bytes();
+                let len = rng.len(mean).min(pool.len() / 2);
+                let mut start = (rng.next() as usize) % (pool.len() - len);
+                if start > 0 && pool[start - 1] == b'\\' {
+                    start += 1;
+                }
+                let mut end = start + len;
+                if pool[end - 1] == b'\\' {
+                    end -= 1;
+                }
+                &self.0[start..end]
+            }
+        }
+
+        #[derive(Clone, Copy, PartialEq)]
+        enum Kind {
+            Claude,
+            Codex,
+            Pi,
+            OpenCode,
+        }
+
+        /// One open run of the deck: its record and the stream of lines its
+        /// agent appends to it, shaped (kinds of line, share of lines the
+        /// reader deserialises, mean length of each) like the transcripts and
+        /// rollouts measured on the development machine.
+        struct Run {
+            kind: Kind,
+            path: PathBuf,
+            usage: RunUsage,
+            n: u64,
+            start_ms: i64,
+        }
+
+        impl Run {
+            fn next_line(&mut self, f: &Filler, rng: &mut Rng) -> String {
+                let n = self.n;
+                self.n += 1;
+                let at = chrono::DateTime::from_timestamp_millis(self.start_ms + n as i64)
+                    .unwrap()
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                match self.kind {
+                    // Two of every five lines a turn's record (4.9 KB on
+                    // average), the rest other records (1.75 KB).
+                    Kind::Claude => match n % 5 {
+                        0 => format!(
+                            r#"{{"type":"user","timestamp":"{at}","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_1","content":"{}"}}]}}}}"#,
+                            f.text(rng, 4900)
+                        ),
+                        1 => format!(
+                            r#"{{"type":"assistant","timestamp":"{at}","message":{{"model":"claude-haiku-5-5","stop_reason":"tool_use","usage":{{"input_tokens":3,"output_tokens":120,"cache_read_input_tokens":40000,"cache_creation_input_tokens":500}},"content":[{{"type":"text","text":"{}"}}]}}}}"#,
+                            f.text(rng, 4900)
+                        ),
+                        _ if n % 50 == 49 => cost_state(n, "0.5", self.start_ms),
+                        _ => format!(
+                            r#"{{"type":"progress","timestamp":"{at}","data":"{}"}}"#,
+                            f.text(rng, 1750)
+                        ),
+                    },
+                    // A turn of 48 lines: its start and context, five rounds
+                    // of eight items (6.5 KB on average) and a running total,
+                    // and its end.
+                    Kind::Codex => match n % 48 {
+                        0 => r#"{"timestamp":"t","type":"event_msg","payload":{"type":"task_started","turn_id":"u1"}}"#.to_string(),
+                        1 => r#"{"timestamp":"t","type":"turn_context","payload":{"turn_id":"u1","cwd":"/w","model":"gpt-5.4"}}"#.to_string(),
+                        47 => r#"{"timestamp":"t","type":"event_msg","payload":{"type":"task_complete","turn_id":"u1","last_agent_message":"done"}}"#.to_string(),
+                        i if (i - 2) % 9 == 8 => format!(
+                            r#"{{"timestamp":"t","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{n}00,"cached_input_tokens":{n}0,"cache_write_input_tokens":0,"output_tokens":{n},"reasoning_output_tokens":0,"total_tokens":{n}01}},"last_token_usage":{{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0,"total_tokens":2}},"model_context_window":272000}},"rate_limits":{{"limit_id":"codex","primary":{{"used_percent":12.0,"window_minutes":10080,"resets_at":1790000000}},"secondary":null,"plan_type":"prolite"}}}}}}"#
+                        ),
+                        _ => format!(
+                            r#"{{"timestamp":"t","type":"response_item","payload":{{"type":"function_call_output","call_id":"c1","output":"{}"}}}}"#,
+                            f.text(rng, 6500)
+                        ),
+                    },
+                    Kind::Pi if n.is_multiple_of(2) => {
+                        r#"{"v":1,"type":"turn_start","agent":"pi"}"#.to_string()
+                    }
+                    Kind::Pi => PI_REPLY.to_string(),
+                    Kind::OpenCode => format!(
+                        r#"{{"v":1,"type":"reply","agent":"opencode","id":"msg_{n}","model":"gpt-5.4-mini","input":100,"output":20,"cache_read":0,"cache_write":0,"cost_usd":0.001,"stop":"stop"}}"#
+                    ),
+                }
+            }
+
+            /// Append lines until the record has grown by `bytes`, or by
+            /// `lines` lines when `bytes` is 0; returns the bytes appended.
+            fn append(&mut self, f: &Filler, rng: &mut Rng, bytes: u64, lines: usize) -> u64 {
+                let file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path)
+                    .unwrap();
+                let mut out = BufWriter::new(file);
+                let (mut written, mut count) = (0u64, 0usize);
+                while (bytes > 0 && written < bytes) || (bytes == 0 && count < lines) {
+                    let line = self.next_line(f, rng);
+                    writeln!(out, "{line}").unwrap();
+                    written += line.len() as u64 + 1;
+                    count += 1;
+                }
+                out.flush().unwrap();
+                written
+            }
+        }
+
+        /// The deck: what each run's record holds before the first poll.
+        /// Two long Claude Code transcripts (16 MiB, about the longest of
+        /// the 692 on the development machine) and six of its median size,
+        /// two long Codex rollouts (9 MiB, about its longest of 230) and six
+        /// of its median size, four Pi and four OpenCode usage files.
+        const DECK: &[(Kind, u64)] = &[
+            (Kind::Claude, 16 << 20),
+            (Kind::Claude, 16 << 20),
+            (Kind::Claude, 1_650_000),
+            (Kind::Claude, 1_650_000),
+            (Kind::Claude, 1_650_000),
+            (Kind::Claude, 1_650_000),
+            (Kind::Claude, 1_650_000),
+            (Kind::Claude, 1_650_000),
+            (Kind::Codex, 9 << 20),
+            (Kind::Codex, 9 << 20),
+            (Kind::Codex, 1_530_000),
+            (Kind::Codex, 1_530_000),
+            (Kind::Codex, 1_530_000),
+            (Kind::Codex, 1_530_000),
+            (Kind::Codex, 1_530_000),
+            (Kind::Codex, 1_530_000),
+            (Kind::Pi, 0),
+            (Kind::Pi, 0),
+            (Kind::Pi, 0),
+            (Kind::Pi, 0),
+            (Kind::OpenCode, 0),
+            (Kind::OpenCode, 0),
+            (Kind::OpenCode, 0),
+            (Kind::OpenCode, 0),
+        ];
+
+        /// Lines one run appends between two polls in the steady state.
+        fn lines_per_tick(kind: Kind) -> usize {
+            match kind {
+                Kind::Claude => 3,
+                Kind::Codex => 5,
+                Kind::Pi => 2,
+                Kind::OpenCode => 1,
+            }
+        }
+
+        struct Dirs {
+            claude: PathBuf,
+            codex: PathBuf,
+            usage: PathBuf,
+        }
+
+        /// A fresh [`RunUsage`] for the `i`th run's record, which must be
+        /// there already.
+        fn open(dirs: &Dirs, i: usize, kind: Kind, path: &Path) -> RunUsage {
+            let started = crate::telemetry::now_unix_nanos();
+            match kind {
+                Kind::Claude => {
+                    let usage =
+                        RunUsage::new(&AgentType::ClaudeCode, claude_dirs(&dirs.claude), started);
+                    usage.observe(&claude_event(&format!("s-{i}"), &format!("/work/run-{i}")));
+                    usage
+                }
+                Kind::Codex => {
+                    let usage = RunUsage::new(&AgentType::Codex, codex_dirs(&dirs.codex), started);
+                    usage.observe(&codex_event(path));
+                    usage
+                }
+                Kind::Pi | Kind::OpenCode => {
+                    let agent = if kind == Kind::Pi {
+                        AgentType::Pi
+                    } else {
+                        AgentType::OpenCode
+                    };
+                    let name = path.file_name().unwrap().to_str().unwrap();
+                    RunUsage::new(&agent, usage_file_dirs(&dirs.usage, name), started)
+                }
+            }
+        }
+
+        fn record_path(dirs: &Dirs, i: usize, kind: Kind) -> PathBuf {
+            match kind {
+                Kind::Claude => dirs
+                    .claude
+                    .join(format!("projects/-work-run-{i}/s-{i}.jsonl")),
+                Kind::Codex => dirs
+                    .codex
+                    .join(format!("sessions/2026/10/26/rollout-{i}.jsonl")),
+                Kind::Pi | Kind::OpenCode => dirs.usage.join(format!("run{i}.usage.jsonl")),
+            }
+        }
+
+        fn backlogged(usage: &RunUsage) -> bool {
+            lock(&usage.inner.readers).backlogged()
+        }
+
+        fn us(d: Duration) -> f64 {
+            d.as_secs_f64() * 1e6
+        }
+
+        /// `name`: how many, median, 95th percentile, maximum and mean.
+        fn report(name: &str, durations: &mut [Duration]) {
+            durations.sort_unstable();
+            let q = |p: f64| us(durations[((durations.len() - 1) as f64 * p).round() as usize]);
+            let mean = durations.iter().map(|d| us(*d)).sum::<f64>() / durations.len() as f64;
+            println!(
+                "{name}: n {}, median {:.1} µs, p95 {:.1} µs, max {:.1} µs, mean {:.1} µs",
+                durations.len(),
+                q(0.5),
+                q(0.95),
+                q(1.0),
+                mean
+            );
+        }
+
+        fn load_average() -> String {
+            std::fs::read_to_string("/proc/loadavg")
+                .map(|s| s.split_whitespace().take(3).collect::<Vec<_>>().join(" / "))
+                .unwrap_or_else(|_| "unavailable".into())
+        }
+
+        /// The busy-deck half of the per-poll cost measurement (PRD #1858).
+        /// Not a `#[spec]` test, and a no-op unless
+        /// `DAD_ACCOUNTING_BENCH_BUSY_DECK` is set: then it writes the
+        /// [`DECK`] of synthetic records — nobody's content — into a scratch
+        /// directory and times, as the exporter's poll does it (every open
+        /// run's [`RunUsage::poll`] in turn on one thread): the first whole
+        /// poll of a deck whose records are all already there, and the polls
+        /// after it until no reader has a backlog; [`RunUsage::finish`] of
+        /// one long run of each kind, never polled and polled up to date;
+        /// whole polls with a few lines appended to every run before each;
+        /// and idle whole polls. Prints aggregates only. Run it in an
+        /// optimised build;
+        /// `docs/develop/telemetry.md` has the command.
+        #[test]
+        fn overhead_of_polling_a_busy_deck() {
+            if std::env::var_os("DAD_ACCOUNTING_BENCH_BUSY_DECK").is_none() {
+                return;
+            }
+            let scratch = crate::test_temp::tempdir().unwrap();
+            let dirs = Dirs {
+                claude: scratch.path().join("claude"),
+                codex: scratch.path().join("codex"),
+                usage: scratch.path().join("usage"),
+            };
+            std::fs::create_dir_all(&dirs.usage).unwrap();
+            let mut rng = Rng(1858);
+            let filler = Filler::new(&mut rng);
+            let start_ms = now_ms();
+            let mut runs: Vec<Run> = Vec::new();
+            let mut deck_bytes = 0;
+            for (i, &(kind, bytes)) in DECK.iter().enumerate() {
+                let path = record_path(&dirs, i, kind);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let mut run = Run {
+                    kind,
+                    usage: RunUsage::new(&AgentType::None, UsageDirs::default(), 0),
+                    path,
+                    n: 0,
+                    start_ms,
+                };
+                deck_bytes += run.append(&filler, &mut rng, bytes, 400);
+                runs.push(run);
+            }
+            println!("load average at start: {}", load_average());
+            println!(
+                "deck: {} open runs, {deck_bytes} bytes of records",
+                runs.len()
+            );
+
+            // The first poll of a deck whose records are already there, then
+            // the polls until every reader has caught up.
+            let (mut first, mut first_run, mut catch_up) = (Vec::new(), Vec::new(), Vec::new());
+            let mut catch_up_polls = 0;
+            for _ in 0..5 {
+                for (i, run) in runs.iter_mut().enumerate() {
+                    run.usage = open(&dirs, i, run.kind, &run.path);
+                }
+                let mut whole = Duration::ZERO;
+                for run in &runs {
+                    let started = Instant::now();
+                    run.usage.poll();
+                    let took = started.elapsed();
+                    first_run.push(took);
+                    whole += took;
+                }
+                first.push(whole);
+                let mut polls = 0;
+                while runs.iter().any(|r| backlogged(&r.usage)) {
+                    let started = Instant::now();
+                    for run in &runs {
+                        run.usage.poll();
+                    }
+                    catch_up.push(started.elapsed());
+                    polls += 1;
+                }
+                catch_up_polls = polls;
+            }
+            report("cold, first whole poll of the deck", &mut first);
+            report("cold, one run's first poll", &mut first_run);
+            report(
+                &format!(
+                    "cold, each whole poll after the first until caught up ({catch_up_polls} a time)"
+                ),
+                &mut catch_up,
+            );
+
+            // A final drain of one long run of each kind: never polled (its
+            // whole record a backlog), and polled up to date before a few
+            // more lines.
+            for i in [0, 8] {
+                let (mut cold, mut warm) = (Vec::new(), Vec::new());
+                for _ in 0..5 {
+                    let run = &mut runs[i];
+                    let usage = open(&dirs, i, run.kind, &run.path);
+                    let started = Instant::now();
+                    let export = usage.finish("bench", EndReason::Exited, None);
+                    cold.push(started.elapsed());
+                    assert!(!export.run.is_empty());
+                    let usage = open(&dirs, i, run.kind, &run.path);
+                    loop {
+                        usage.poll();
+                        if !backlogged(&usage) {
+                            break;
+                        }
+                    }
+                    let lines = lines_per_tick(run.kind);
+                    run.append(&filler, &mut rng, 0, lines);
+                    let started = Instant::now();
+                    usage.finish("bench", EndReason::Exited, None);
+                    warm.push(started.elapsed());
+                }
+                let size = std::fs::metadata(&runs[i].path).unwrap().len();
+                let name = if runs[i].kind == Kind::Claude {
+                    "Claude Code transcript"
+                } else {
+                    "Codex rollout"
+                };
+                report(
+                    &format!("final drain, {size}-byte {name} never polled"),
+                    &mut cold,
+                );
+                report(
+                    &format!("final drain, {size}-byte {name} polled up to date"),
+                    &mut warm,
+                );
+            }
+
+            // The steady state: a few lines appended to every run before each
+            // whole poll, then idle whole polls.
+            let (mut whole, mut per_run, mut idle) = (Vec::new(), Vec::new(), Vec::new());
+            let mut per_kind: Vec<(Kind, Vec<Duration>)> =
+                [Kind::Claude, Kind::Codex, Kind::Pi, Kind::OpenCode]
+                    .into_iter()
+                    .map(|k| (k, Vec::new()))
+                    .collect();
+            let mut appended = 0u64;
+            const TICKS: usize = 500;
+            for _ in 0..TICKS {
+                for run in &mut runs {
+                    let lines = lines_per_tick(run.kind);
+                    appended += run.append(&filler, &mut rng, 0, lines);
+                }
+                let mut tick = Duration::ZERO;
+                for run in &runs {
+                    let started = Instant::now();
+                    run.usage.poll();
+                    let took = started.elapsed();
+                    per_run.push(took);
+                    per_kind
+                        .iter_mut()
+                        .find(|(k, _)| *k == run.kind)
+                        .unwrap()
+                        .1
+                        .push(took);
+                    tick += took;
+                }
+                whole.push(tick);
+            }
+            for _ in 0..TICKS {
+                let started = Instant::now();
+                for run in &runs {
+                    run.usage.poll();
+                }
+                idle.push(started.elapsed());
+            }
+            println!(
+                "steady state: {} bytes appended per whole poll on average",
+                appended / TICKS as u64
+            );
+            report("steady state, whole poll of the deck", &mut whole);
+            report("steady state, one run's poll", &mut per_run);
+            for (kind, durations) in &mut per_kind {
+                let name = match kind {
+                    Kind::Claude => "Claude Code",
+                    Kind::Codex => "Codex",
+                    Kind::Pi => "Pi",
+                    Kind::OpenCode => "OpenCode",
+                };
+                report(&format!("steady state, one {name} run's poll"), durations);
+            }
+            report("idle, whole poll of the deck", &mut idle);
+            println!("load average at end: {}", load_average());
+        }
+    }
 }
