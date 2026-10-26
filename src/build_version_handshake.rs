@@ -501,13 +501,22 @@ async fn terminate_and_recover(
     if probe.response.supervised {
         match hand_back_to_service(endpoint, &probe.response, consented).await {
             HandBack::Recovered => return Ok(HandshakeOutcome::Recovered),
-            HandBack::OtherBuild => {
+            HandBack::OtherBuild(instance) => {
                 // The caller attaches without checking the build again, so the
                 // service's daemon of another build is stopped the way the old
                 // one would have been, and this TUI starts its own as before.
-                let fresh = probe_daemon(endpoint.path()).await?;
-                terminate_daemon_graceful(fresh.peer_pid, endpoint, TERMINATE_POLL_TIMEOUT, None)
+                // Only that process: the endpoint may have changed hands since.
+                if let Ok(fresh) = probe_daemon(endpoint.path()).await
+                    && fresh.response.instance_id == instance
+                {
+                    terminate_daemon_graceful(
+                        fresh.peer_pid,
+                        endpoint,
+                        TERMINATE_POLL_TIMEOUT,
+                        None,
+                    )
                     .await?;
+                }
                 return Ok(HandshakeOutcome::Recovered);
             }
             HandBack::Declined => {}
@@ -560,13 +569,13 @@ async fn terminate_and_recover(
 const HAND_BACK_TIMEOUT: Duration = crate::daemon_upgrade::VERIFY_TIMEOUT;
 
 /// How [`hand_back_to_service`] ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum HandBack {
     /// The service runs a daemon of this build, or nothing answers any more
     /// and the caller starts this build.
     Recovered,
-    /// The service runs a daemon of another build.
-    OtherBuild,
+    /// The service runs a daemon of another build, the process named here.
+    OtherBuild(Option<String>),
     /// The daemon that was probed is still the one running: it refused,
     /// predates the request, or named live work no one agreed to stop.
     Declined,
@@ -633,7 +642,7 @@ async fn wait_for_service(client: &DaemonClient, old: &AttachResponse) -> HandBa
                         "the service restarted its daemon on another build; stopping it so this \
                          build runs"
                     );
-                    HandBack::OtherBuild
+                    HandBack::OtherBuild(hello.instance_id)
                 };
             }
             Ok(Ok(Some(_))) => old_answering = true,
