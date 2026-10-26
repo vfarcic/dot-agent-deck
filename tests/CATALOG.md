@@ -10842,6 +10842,14 @@ The live history case (`doorbell_010_live_history_enter_recovers_the_doorbell`) 
 - **Does not assert:** recovery controls, voice actions or persistence beyond the daemon's lifetime.
 - **Platform coverage:** Unix PTY.
 
+##### inbox/status/032 — Termination notices report what happened to the pane command, without asserting that the agent exited.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_termination.rs`), real daemon and wrapper; Fast (`src/agent_pty_termination_tests.rs`, the real `pump_reader`/`capture_termination` with scripted reads and a wrapper role; `src/inbox_hub.rs`, the notice and broadcast).
+- **Agent:** Python pane commands, including forked and detached descendants; no real agent or credential.
+- **Asserts:** wrapped and unwrapped commands' exit zero and exit seven name that command and its code; terminal EOF while the command remains alive says the connection ended and whether the agent runs is unknown; close says closed; replacement says the message stayed with the previous agent and hands none to the successor; launcher exit with a descendant holding the terminal sends no notice; a detached descendant survives while the notice stops at the pane command. Notices never claim that the agent's process exited. An apostrophe in the fixture script's path exercises shell quoting.
+- **Fast half asserts:** an injected `Read::read` error ends the connection, naming the error, and keeps the bytes read before it; an `Interrupted` read is retried; a wrapper's report of its child's code wins over the wrapper's own conflicting status, which is used, as the deck's, when no numeric report arrives; a respawn reads as replaced and a close as closed; each kind's words reach the orchestrator's notice and the undeliverable broadcast carries the evidence, unknown when there is none; an unknown `termination.kind` or source decodes as unknown in the TUI's types and the desktop's events drawer.
+- **Does not assert:** a real wrapper whose exit status differs from its child's report (the public wrapper returns its child's code, so the e2e exits cannot tell the sources apart; the fast half supplies them separately).
+- **Platform coverage:** Unix PTY; Linux may report the terminal's last-slave close as EIO rather than a zero-length read.
+
 ##### inbox/status/033 — The overdue notice tells the orchestrator why the doorbell holds, as it stood when the notice was composed.
 - **Layer:** Fast (`src/inbox_hub.rs`), the real inbox with a zero overdue window.
 - **Agent:** none.

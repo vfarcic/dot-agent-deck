@@ -91,9 +91,92 @@ pub const NOTICE_MAX_DELIVER: &str =
 /// not shown: the card returns to the agent's own status.
 pub const NOTICE_DELIVERED_LATE: &str =
     "delivered after all: a deck message reported not delivered reached this agent";
-/// The card notice for a message whose agent exited while it was still owed.
+/// The card notice for a message whose agent's pane ended while it was still
+/// owed, when the deck can't say how ([`PaneTermination::Unknown`]). PRD #1666
+/// part 3, round 5-wake (plan rev 2 §6): the deck sees its own child and the
+/// pane's terminal, never the agent below them, so no notice says the agent
+/// exited.
 pub const NOTICE_AGENT_EXITED: &str =
-    "not delivered: this agent exited before a deck message reached it";
+    "not delivered: this agent's pane ended before a deck message reached it";
+/// The card notice when the command the deck started in the pane exited.
+pub const NOTICE_PANE_COMMAND_EXITED: &str = "not delivered: the command started in this agent's pane exited before a deck message reached it";
+/// The card notice when the deck's connection to the pane ended while the
+/// command it started there still ran, or its exit could not be read.
+pub const NOTICE_CONNECTION_ENDED: &str = "not delivered: the deck's connection to this agent's pane ended before a deck message reached it";
+
+/// PRD #1666 part 3, round 5-wake (plan rev 2 §6): what the deck observed
+/// ending an agent generation's pane, on the notice of a message that became
+/// undeliverable because of it (`agent_exited`). It names the process the deck
+/// saw — the command it started in the pane, or that command's report through
+/// the deck's wrapper — never the agent, which can be a descendant of either.
+/// Additive on the wire: absent from an older deck, ignored by an older client.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PaneTermination {
+    /// The command the deck started in the pane exited with `code`.
+    PaneCommandExited {
+        code: u32,
+        reported_by: TerminationSource,
+    },
+    /// The pane's output ended (`read_end`: `eof`, or the read error) while
+    /// the command the deck started there had not exited, as far as the deck
+    /// could tell in time.
+    ConnectionEnded { read_end: String },
+    /// The generation was removed and a successor holds its pane.
+    Replaced,
+    /// The generation was removed and nothing holds its pane.
+    Closed,
+    /// A kind a newer deck names that this build does not know.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Who reported [`PaneTermination::PaneCommandExited`]'s code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminationSource {
+    /// The deck's own wait on the process it started in the pane.
+    Deck,
+    /// The deck's wrapper, for the command it ran in the pane.
+    Wrapper,
+    /// A source a newer deck names.
+    #[serde(other)]
+    Unknown,
+}
+
+impl PaneTermination {
+    /// Why a message the generation never took became undeliverable, as the
+    /// orchestrator's notice and the desktop's events drawer say it (the
+    /// shared words fixture's `terminations`, with `{code}` filled in).
+    pub fn words(&self) -> String {
+        match self {
+            PaneTermination::PaneCommandExited { code, .. } => {
+                TERMINATION_PANE_COMMAND_EXITED.replace("{code}", &code.to_string())
+            }
+            PaneTermination::ConnectionEnded { .. } => TERMINATION_CONNECTION_ENDED.to_string(),
+            PaneTermination::Replaced => TERMINATION_REPLACED.to_string(),
+            PaneTermination::Closed => TERMINATION_CLOSED.to_string(),
+            PaneTermination::Unknown => TERMINATION_UNKNOWN.to_string(),
+        }
+    }
+
+    /// The exited generation's card notice.
+    pub fn card_notice(&self) -> &'static str {
+        match self {
+            PaneTermination::PaneCommandExited { .. } => NOTICE_PANE_COMMAND_EXITED,
+            PaneTermination::ConnectionEnded { .. } => NOTICE_CONNECTION_ENDED,
+            _ => NOTICE_AGENT_EXITED,
+        }
+    }
+}
+
+/// [`PaneTermination::words`], by kind.
+pub const TERMINATION_PANE_COMMAND_EXITED: &str =
+    "the command started in the agent's pane exited (code {code}) before taking this message";
+pub const TERMINATION_CONNECTION_ENDED: &str = "the deck's connection to the agent's pane ended before it took this message; whether the agent is still running is unknown";
+pub const TERMINATION_REPLACED: &str = "the agent's pane was replaced before it took this message; the message stays with the previous agent";
+pub const TERMINATION_CLOSED: &str = "the pane was closed before the agent took this message";
+pub const TERMINATION_UNKNOWN: &str = "the agent's pane ended before it took this message";
 
 /// PRD #1666 §6.2: the headline of a deck message that may or may not have
 /// reached the agent.
@@ -773,6 +856,86 @@ mod tests {
         assert_eq!(card(3, None).attention_words(), None);
     }
 
+    /// PRD #1666 part 3, round 5-wake (plan rev 2 §6, §8): `termination`
+    /// is additive and internally tagged; a kind or a source a newer deck
+    /// names reads as unknown, with the unknown words, rather than failing
+    /// the notice, and every kind's words and card notice stop at the pane.
+    #[test]
+    fn a_termination_decodes_across_versions() {
+        let decode = |value: serde_json::Value| -> PaneTermination {
+            serde_json::from_value(value).unwrap()
+        };
+        let exited = PaneTermination::PaneCommandExited {
+            code: 7,
+            reported_by: TerminationSource::Wrapper,
+        };
+        assert_eq!(
+            serde_json::to_value(&exited).unwrap(),
+            serde_json::json!({"kind": "pane_command_exited", "code": 7, "reported_by": "wrapper"})
+        );
+        assert_eq!(decode(serde_json::to_value(&exited).unwrap()), exited);
+        assert_eq!(
+            decode(serde_json::json!({"kind": "replaced"})),
+            PaneTermination::Replaced
+        );
+        assert_eq!(
+            decode(serde_json::json!({"kind": "meteor_strike", "crater": 3})),
+            PaneTermination::Unknown
+        );
+        assert_eq!(PaneTermination::Unknown.words(), TERMINATION_UNKNOWN);
+        assert_eq!(
+            decode(
+                serde_json::json!({"kind": "pane_command_exited", "code": 0, "reported_by": "telepathy"})
+            ),
+            PaneTermination::PaneCommandExited {
+                code: 0,
+                reported_by: TerminationSource::Unknown
+            }
+        );
+        let notice = |extra: serde_json::Value| -> crate::event::InboxNotice {
+            let mut value = serde_json::json!({
+                "pane_id": "p", "agent_id": "a", "message_id": "m-1", "subject": "s",
+                "from_label": "the orchestrator", "state": "undeliverable", "reason": "agent_exited",
+            });
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(value).unwrap()
+        };
+        let old = notice(serde_json::json!({}));
+        assert_eq!(old.termination, None, "an older deck sends none");
+        assert!(
+            serde_json::to_value(&old)
+                .unwrap()
+                .get("termination")
+                .is_none(),
+            "and none is sent when there is none"
+        );
+        assert_eq!(
+            notice(serde_json::json!({"termination": {"kind": "a_newer_kind"}})).termination,
+            Some(PaneTermination::Unknown)
+        );
+        for termination in [
+            exited.clone(),
+            PaneTermination::ConnectionEnded {
+                read_end: "eof".into(),
+            },
+            PaneTermination::Replaced,
+            PaneTermination::Closed,
+            PaneTermination::Unknown,
+        ] {
+            for text in [termination.words(), termination.card_notice().to_string()] {
+                assert!(!text.contains("agent exited"), "{text}");
+                assert!(!text.contains("agent's process"), "{text}");
+            }
+        }
+        assert_eq!(
+            exited.words(),
+            "the command started in the agent's pane exited (code 7) before taking this message"
+        );
+    }
+
     /// The words are the ones the desktop reads from the shared fixture.
     #[test]
     fn the_words_match_the_shared_fixture() {
@@ -867,7 +1030,25 @@ mod tests {
                 .replace("{n}", "3"),
             evidence_paused_text(3)
         );
-        for notice in [NOTICE_MAX_DELIVER, NOTICE_AGENT_EXITED] {
+        for (kind, termination) in [
+            ("pane_command_exited", TERMINATION_PANE_COMMAND_EXITED),
+            ("connection_ended", TERMINATION_CONNECTION_ENDED),
+            ("replaced", TERMINATION_REPLACED),
+            ("closed", TERMINATION_CLOSED),
+            ("unknown", TERMINATION_UNKNOWN),
+        ] {
+            assert_eq!(words["terminations"][kind], termination, "{kind}");
+        }
+        assert_eq!(
+            words["terminations"].as_object().map(|kinds| kinds.len()),
+            Some(5)
+        );
+        for notice in [
+            NOTICE_MAX_DELIVER,
+            NOTICE_AGENT_EXITED,
+            NOTICE_PANE_COMMAND_EXITED,
+            NOTICE_CONNECTION_ENDED,
+        ] {
             assert!(notice.starts_with(NOT_DELIVERED), "{notice}");
         }
     }

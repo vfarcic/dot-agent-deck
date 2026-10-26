@@ -12954,6 +12954,7 @@ mod tests {
             requeued: false,
             notices: Default::default(),
             provenance: None,
+            termination: None,
         });
         let value = serde_json::to_value(&msg).unwrap();
         assert_eq!(

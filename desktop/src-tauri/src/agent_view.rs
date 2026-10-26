@@ -621,6 +621,7 @@ mod tests {
             attention_update: true,
             requeued: false,
             provenance: None,
+            termination: None,
             notices: notices.clone(),
         }));
         assert_eq!(view.needs_fetch(now), Some(FetchReason::Inbox));

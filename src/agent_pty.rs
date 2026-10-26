@@ -2547,8 +2547,14 @@ pub enum ChildRole {
 /// ending a generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Termination {
-    /// The deck's own child (`role`) exited with `code`.
-    PaneCommandExited { code: u32, role: ChildRole },
+    /// The command the deck started in the pane exited with `code`: the
+    /// deck's own child (`role`), or, for a wrapper, the command it ran, as
+    /// it reported (`reported_by`).
+    PaneCommandExited {
+        code: u32,
+        role: ChildRole,
+        reported_by: crate::inbox_display::TerminationSource,
+    },
     /// The output stream ended and the child had not exited by the bound.
     ConnectionEnded { read_end: ReadEnd },
     /// The generation was removed and a successor holds its pane.
@@ -2560,22 +2566,68 @@ pub enum Termination {
 impl std::fmt::Display for Termination {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Termination::PaneCommandExited { code, role } => {
+            Termination::PaneCommandExited {
+                code,
+                role,
+                reported_by,
+            } => {
                 let role = match role {
                     ChildRole::Wrapper => "wrapper",
                     ChildRole::PaneCommand => "pane_command",
                 };
+                let reported_by = match reported_by {
+                    crate::inbox_display::TerminationSource::Wrapper => "wrapper",
+                    _ => "deck",
+                };
                 write!(
                     f,
-                    "pane_command_exited code={code} child={role} reported_by=deck"
+                    "pane_command_exited code={code} child={role} reported_by={reported_by}"
                 )
             }
-            Termination::ConnectionEnded { read_end } => match read_end {
-                ReadEnd::Eof => write!(f, "connection_ended read_end=eof"),
-                ReadEnd::Error(kind) => write!(f, "connection_ended read_end={kind:?}"),
-            },
+            Termination::ConnectionEnded { read_end } => {
+                write!(f, "connection_ended read_end={}", read_end.label())
+            }
             Termination::Replaced => write!(f, "replaced"),
             Termination::Closed => write!(f, "closed"),
+        }
+    }
+}
+
+impl Termination {
+    /// What the generation's notices carry ([`crate::event::InboxNotice::termination`]).
+    pub fn wire(&self) -> crate::inbox_display::PaneTermination {
+        use crate::inbox_display::PaneTermination;
+        match self {
+            Termination::PaneCommandExited {
+                code, reported_by, ..
+            } => PaneTermination::PaneCommandExited {
+                code: *code,
+                reported_by: *reported_by,
+            },
+            Termination::ConnectionEnded { read_end } => PaneTermination::ConnectionEnded {
+                read_end: read_end.label(),
+            },
+            Termination::Replaced => PaneTermination::Replaced,
+            Termination::Closed => PaneTermination::Closed,
+        }
+    }
+}
+
+impl ReadEnd {
+    /// `eof`, or the read error's kind in snake case (`broken_pipe`).
+    fn label(&self) -> String {
+        match self {
+            ReadEnd::Eof => "eof".to_string(),
+            ReadEnd::Error(kind) => {
+                let mut label = String::new();
+                for (i, c) in format!("{kind:?}").chars().enumerate() {
+                    if c.is_ascii_uppercase() && i > 0 {
+                        label.push('_');
+                    }
+                    label.push(c.to_ascii_lowercase());
+                }
+                label
+            }
         }
     }
 }
@@ -2738,6 +2790,27 @@ fn pump_reader(
             || registry.is_agent_still_registered(&agent_id),
         );
     }
+    // PRD #1666 part 3, round 5-wake (plan rev 2 §6): what the deck observed
+    // ending this generation, captured before the inbox is told, so the
+    // notices the exit owes say it. The deck observes its own child (the
+    // wrapper, and through it the command it ran, or the pane command) and
+    // the stream, never the agent below them.
+    let termination = registry.upgrade().map(|registry| {
+        let termination = registry.capture_termination(
+            &agent_id,
+            pane_id_env.as_deref(),
+            registered_at_eof,
+            read_end,
+        );
+        tracing::info!(
+            target: "pane_reader",
+            agent_id = %agent_id,
+            pane_id = pane_id_env.as_deref().unwrap_or("<none>"),
+            termination = %termination,
+            "pane reader ended"
+        );
+        termination
+    });
     // PRD #1666 S3: whatever the exit, messages bound to this agent can no
     // longer reach it. Deliberate closes included: the entry is gone by now, but
     // its messages are not.
@@ -2772,7 +2845,12 @@ fn pump_reader(
         } else {
             crate::inbox_hub::ExitKind::Removed
         };
-        let settled = registry.inbox().agent_exited_as(pane_id, &agent_id, kind);
+        let settled = registry.inbox().agent_exited_as(
+            pane_id,
+            &agent_id,
+            kind,
+            termination.as_ref().map(Termination::wire),
+        );
         exit_walked = settled.walked;
         if settled.walked {
             registry.retire_task_debt_exact(pane_id, &settled.ledgers);
@@ -2856,25 +2934,6 @@ fn pump_reader(
                 }
             }
         }
-    }
-    // PRD #1666 part 3, round 5-wake (plan rev 2 §6): what the deck observed
-    // ending this generation, captured and logged. The deck observes its own
-    // child (the wrapper, or the pane command) and the stream, never the
-    // agent below them.
-    if let Some(registry) = registry.upgrade() {
-        let termination = registry.capture_termination(
-            &agent_id,
-            pane_id_env.as_deref(),
-            registered_at_eof,
-            read_end,
-        );
-        tracing::info!(
-            target: "pane_reader",
-            agent_id = %agent_id,
-            pane_id = pane_id_env.as_deref().unwrap_or("<none>"),
-            termination = %termination,
-            "pane reader ended"
-        );
     }
 }
 
@@ -3001,6 +3060,11 @@ pub struct RunningAgent {
     pub bus: Arc<AgentBus>,
     /// PRD #1666 part 3, round 5-wake: what the deck started in the pane.
     pub child_role: ChildRole,
+    /// PRD #1666 part 3, round 5-wake (plan rev 2 §6): the wrapper's report
+    /// of how the command it ran in the pane exited
+    /// ([`crate::event::WRAPPER_CHILD_EXIT_METADATA_KEY`]), once it sent one.
+    /// Read only for a [`ChildRole::Wrapper`] child.
+    pub wrapper_child_exit: Option<String>,
     /// PRD #1666 part 3, round 5-wake (plan §1.3): the generation's
     /// input-mode evidence, from its wrapper's reports.
     pub input_mode: Arc<Mutex<crate::input_mode::InputModeStore>>,
@@ -6369,6 +6433,10 @@ pub struct AgentPtyRegistry {
     /// only once the test lets it — see [`Self::hold_exit_cleanup_for_test`].
     #[cfg(test)]
     exit_cleanup_holds: Mutex<HashMap<String, std::sync::mpsc::Receiver<()>>>,
+    /// PRD #1666 part 3, round 5-wake test seam: what each generation's
+    /// reader captured as its termination.
+    #[cfg(test)]
+    terminations: Mutex<HashMap<String, Termination>>,
     /// PRD #1666 §2.8 test seam: panes whose next published generation waits
     /// before handing the inbox over — see [`Self::hold_next_handover_for_test`].
     #[cfg(test)]
@@ -6428,6 +6496,12 @@ mod scanner_budget;
 #[cfg(all(test, unix))]
 #[path = "agent_pty_terminal_tests.rs"]
 mod terminal_tests;
+
+/// PRD #1666 part 3, round 5-wake (plan rev 2 §6): a generation's captured
+/// termination, through the real reader and capture.
+#[cfg(all(test, unix))]
+#[path = "agent_pty_termination_tests.rs"]
+mod termination_tests;
 
 /// PRD #1666 part 3, round 5: the synchronous pause in a respawn's
 /// replacement window, after the replacement's spawn returned and before the
@@ -8415,6 +8489,8 @@ impl AgentPtyRegistry {
             respawn_pause: Mutex::new(None),
             #[cfg(test)]
             exit_cleanup_holds: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            terminations: Mutex::new(HashMap::new()),
             #[cfg(test)]
             handover_holds: Mutex::new(HashMap::new()),
             #[cfg(test)]
@@ -10894,33 +10970,111 @@ impl AgentPtyRegistry {
         registered_at_eof: bool,
         read_end: ReadEnd,
     ) -> Termination {
+        let termination =
+            self.observe_termination(agent_id, pane_id_env, registered_at_eof, read_end);
+        #[cfg(test)]
+        self.terminations
+            .lock()
+            .unwrap()
+            .insert(agent_id.to_string(), termination.clone());
+        termination
+    }
+
+    /// [`Self::capture_termination`]'s observation. A generation the registry
+    /// still held when its stream ended is polled for up to
+    /// [`TERMINATION_WAIT`]: a wrapper's report of the command it ran wins
+    /// over the wrapper's own status, which is used, as the deck's, only when
+    /// no report came by the bound; a pane command's status is the deck's.
+    /// Neither by the bound is the connection ending. A generation removed
+    /// first was replaced when another holds its pane, and closed otherwise.
+    fn observe_termination(
+        &self,
+        agent_id: &str,
+        pane_id_env: Option<&str>,
+        registered_at_eof: bool,
+        read_end: ReadEnd,
+    ) -> Termination {
+        use crate::inbox_display::TerminationSource;
         if registered_at_eof {
             let deadline = Instant::now() + TERMINATION_WAIT;
+            let mut exited: Option<u32> = None;
             loop {
-                let status = {
+                let seen = {
                     let mut inner = self.inner.lock();
-                    inner
-                        .agents
-                        .get_mut(agent_id)
-                        .map(|agent| (agent.child.try_wait().ok().flatten(), agent.child_role))
+                    inner.agents.get_mut(agent_id).map(|agent| {
+                        let status = if exited.is_none() {
+                            agent.child.try_wait().ok().flatten()
+                        } else {
+                            None
+                        };
+                        (status, agent.child_role, agent.wrapper_child_exit.clone())
+                    })
                 };
-                match status {
-                    Some((Some(status), role)) => {
+                let Some((status, role, report)) = seen else {
+                    break;
+                };
+                if let Some(status) = status {
+                    exited = Some(status.exit_code());
+                }
+                let reported = report
+                    .as_deref()
+                    .and_then(|report| report.parse::<u32>().ok());
+                match (role, reported, exited) {
+                    (ChildRole::Wrapper, Some(code), _) => {
                         return Termination::PaneCommandExited {
-                            code: status.exit_code(),
+                            code,
                             role,
+                            reported_by: TerminationSource::Wrapper,
                         };
                     }
-                    Some((None, _)) if Instant::now() < deadline => {
+                    (ChildRole::PaneCommand, _, Some(code)) => {
+                        return Termination::PaneCommandExited {
+                            code,
+                            role,
+                            reported_by: TerminationSource::Deck,
+                        };
+                    }
+                    _ if Instant::now() < deadline => {
                         std::thread::sleep(Duration::from_millis(10));
                     }
-                    _ => return Termination::ConnectionEnded { read_end },
+                    (_, _, Some(code)) => {
+                        return Termination::PaneCommandExited {
+                            code,
+                            role,
+                            reported_by: TerminationSource::Deck,
+                        };
+                    }
+                    (_, _, None) => return Termination::ConnectionEnded { read_end },
                 }
             }
         }
-        match pane_id_env.and_then(|pane| self.pane_current_agent_id(pane)) {
-            Some(current) if current != agent_id => Termination::Replaced,
-            _ => Termination::Closed,
+        // A respawn lifts the generation out before it kills it, and counts it
+        // as respawning until its successor is published: whichever this EOF
+        // lands in, the pane is being replaced.
+        let deadline = Instant::now() + TERMINATION_WAIT;
+        loop {
+            let respawning = self.inner.lock().respawning_members.contains_key(agent_id);
+            match pane_id_env.and_then(|pane| self.pane_current_agent_id(pane)) {
+                Some(current) if current != agent_id => return Termination::Replaced,
+                _ if !respawning => return Termination::Closed,
+                _ if Instant::now() >= deadline => return Termination::Replaced,
+                _ => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    }
+
+    /// PRD #1666 part 3, round 5-wake (plan rev 2 §6): generation `agent_id`'s
+    /// wrapper on `pane_id_env` reported how the command it ran exited
+    /// (`ended`: the code, `signal:N`, or `unknown`). Kept for a wrapped
+    /// generation of that pane only, and only its first report.
+    pub(crate) fn note_wrapper_child_exit(&self, pane_id_env: &str, agent_id: &str, ended: &str) {
+        let mut inner = self.inner.lock();
+        if let Some(agent) = inner.agents.get_mut(agent_id)
+            && agent.pane_id_env.as_deref() == Some(pane_id_env)
+            && agent.child_role == ChildRole::Wrapper
+            && agent.wrapper_child_exit.is_none()
+        {
+            agent.wrapper_child_exit = Some(ended.to_string());
         }
     }
 
@@ -12094,6 +12248,7 @@ impl AgentPtyRegistry {
             pane_retired,
             bus,
             child_role,
+            wrapper_child_exit: None,
             input_mode: Arc::default(),
             ingress: crate::ingress_ledger::IngressLedger::new(),
             doorbell,
@@ -12860,6 +13015,8 @@ impl AgentPtyRegistry {
             // starts its own.
             doorbell: _,
             child_role: _,
+            // The replacement's wrapper reports its own child's exit.
+            wrapper_child_exit: _,
             // The replacement's evidence starts empty.
             input_mode: _,
             // PRD #745 M11: deliberately dropped rather than carried over. The
@@ -15601,6 +15758,7 @@ impl AgentPtyRegistry {
                 pane_retired,
                 bus: Arc::new(AgentBus::new()),
                 child_role: ChildRole::PaneCommand,
+                wrapper_child_exit: None,
                 input_mode: Arc::default(),
                 ingress: crate::ingress_ledger::IngressLedger::new(),
                 doorbell: Arc::new(crate::doorbell_generation::GenerationDoorbell::new(

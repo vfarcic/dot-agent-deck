@@ -67,6 +67,18 @@ export const INBOX_WORDS = {
   attentionOtherHeld: "other held",
   /** `attentionOtherHeld`'s count when no orchestrator is named. */
   attentionHeld: "held",
+  /**
+   * PRD #1666 part 3, round 5-wake: what ended an agent's pane before it took
+   * a message, by the daemon's `termination.kind`; `{code}` is the exit code.
+   * They name the command the deck started in the pane, never the agent.
+   */
+  terminations: {
+    pane_command_exited: "the command started in the agent's pane exited (code {code}) before taking this message",
+    connection_ended: "the deck's connection to the agent's pane ended before it took this message; whether the agent is still running is unknown",
+    replaced: "the agent's pane was replaced before it took this message; the message stays with the previous agent",
+    closed: "the pane was closed before the agent took this message",
+    unknown: "the agent's pane ended before it took this message",
+  },
   adapterTooOld: "this agent's deck integration is out of date; restart the agent to update it",
   cliTooOld: "the dot-agent-deck command this agent runs does not support this deck's integration: upgrade dot-agent-deck, then restart the agent",
   notArmed: "this agent's deck integration has not connected yet; its messages wait until it does",
@@ -239,6 +251,27 @@ export function inboxNotice(inbox: AgentInbox | undefined): string | undefined {
   if (hold !== undefined) return hold;
   if (inbox.receiptsDegraded !== undefined) return `${INBOX_WORDS.receiptsDegraded} (${inbox.receiptsDegraded})`;
   return undefined;
+}
+
+/**
+ * PRD #1666 part 3, round 5-wake: the words for a notice's `termination`, what
+ * ended the agent's pane before it took the message; a kind this build does
+ * not know, or none at all, reads as the pane having ended. The TUI's
+ * `PaneTermination::words` is the same.
+ */
+export function terminationText(termination: unknown): string {
+  const kind = typeof termination === "object" && termination !== null ? (termination as { kind?: unknown }).kind : undefined;
+  const code = typeof termination === "object" && termination !== null ? (termination as { code?: unknown }).code : undefined;
+  switch (kind) {
+    case "pane_command_exited":
+      return typeof code === "number" && Number.isInteger(code) && code >= 0
+        ? INBOX_WORDS.terminations.pane_command_exited.replace("{code}", String(code))
+        : INBOX_WORDS.terminations.unknown;
+    case "connection_ended": return INBOX_WORDS.terminations.connection_ended;
+    case "replaced": return INBOX_WORDS.terminations.replaced;
+    case "closed": return INBOX_WORDS.terminations.closed;
+    default: return INBOX_WORDS.terminations.unknown;
+  }
 }
 
 /** PRD #1666 §6.4: what a listed item's row explains. */

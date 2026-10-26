@@ -2169,6 +2169,20 @@ where
     {
         registry.note_prompt_report(pane_id, generation, report);
     }
+    // PRD #1666 part 3, round 5-wake (plan rev 2 §6): the wrapper's report of
+    // how the command it ran exited, on its final event, for the notices its
+    // generation's exit owes. The same generation checks as the turn edge;
+    // the registry keeps it only for that generation's wrapper.
+    if !unproven
+        && !event.is_daemon_synthetic()
+        && let Some(ended) = event
+            .metadata
+            .get(crate::event::WRAPPER_CHILD_EXIT_METADATA_KEY)
+        && let Some(pane_id) = event.pane_id.as_deref()
+        && let Some(generation) = event.agent_id.as_deref().or(attested_agent)
+    {
+        registry.note_wrapper_child_exit(pane_id, generation, ended);
+    }
     if !unproven
         && let Some(edge) = turn_edge
         && !event.is_daemon_synthetic()

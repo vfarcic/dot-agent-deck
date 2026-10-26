@@ -1,5 +1,5 @@
 import type { EvidenceItem, HandoffEdge, Verdict } from "../types";
-import { INBOX_WORDS } from "./inboxWords";
+import { INBOX_WORDS, terminationText } from "./inboxWords";
 
 /**
  * Cap on the in-memory live evidence ring. Hook events arrive for every tool
@@ -47,6 +47,8 @@ export interface DaemonInboxNotice {
   reason?: unknown;
   /** An offered job LEFT this pane; `state` is where the job went, not the pane's. */
   returned?: unknown;
+  /** With `reason` `agent_exited`: what ended the agent's pane (`{ kind, … }`). */
+  termination?: unknown;
 }
 
 /** Resolves the deck-side agent behind a hook event, when one is known. */
@@ -174,7 +176,7 @@ function mapInboxNotice(notice: DaemonInboxNotice, sequence: number, resolveAgen
   const paneId = text(notice.pane_id);
   const agent = resolveAgent?.(agentId, paneId);
   const subject = text(notice.subject) ?? "(no subject)";
-  const reason = state === "undeliverable" && notice.returned !== true ? reasonText(text(notice.reason)) : undefined;
+  const reason = state === "undeliverable" && notice.returned !== true ? reasonText(text(notice.reason), notice.termination) : undefined;
   return {
     id: `hook-${sequence}`,
     verdict: shown.verdict,
@@ -206,8 +208,13 @@ function nowClock(): string {
   return new Date().toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
-/** Why a message was not delivered, in words: `agent_exited` reads `agent exited`. */
-function reasonText(reason: string | undefined): string {
+/**
+ * Why a message was not delivered, in words: `max_deliver` reads `max deliver`;
+ * `agent_exited` reads as what ended the agent's pane (PRD #1666 part 3, round
+ * 5-wake), since the deck never sees the agent itself exit.
+ */
+function reasonText(reason: string | undefined, termination?: unknown): string {
+  if (reason === "agent_exited") return terminationText(termination);
   return reason ? reason.replaceAll("_", " ") : `${INBOX_WORDS.notDelivered} to the agent`;
 }
 

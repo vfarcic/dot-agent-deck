@@ -528,6 +528,11 @@ struct HubState {
     /// ([`InboxHub::set_typed_fallback`]); read by [`wake_of`], so the
     /// status's WAKE and the overdue notice agree.
     typed_refused: HashMap<AgentKey, &'static str>,
+    /// PRD #1666 part 3, round 5-wake (plan rev 2 §6): while
+    /// [`InboxHub::agent_exited_as`] settles a generation, the generation and
+    /// what the deck observed ending its pane, which that settlement's
+    /// notices and broadcasts carry.
+    exiting: Option<(AgentKey, crate::inbox_display::PaneTermination)>,
     /// PRD #1666 part 3, round 5-wake (plan §3.4′, §5.1 row 1): a generation
     /// whose doorbell is suspended on an attempt, with the reason its card
     /// shows at once (`uncertain_input`, or `dialog_during_ring`). Written
@@ -851,6 +856,7 @@ impl InboxHub {
                 owed_retry_at: None,
                 wake_stalled: HashMap::new(),
                 typed_refused: HashMap::new(),
+                exiting: None,
                 wake_suspension: HashMap::new(),
                 wake_hold: HashMap::new(),
                 live_agent: None,
@@ -2022,7 +2028,7 @@ impl InboxHub {
     /// is told — the notices this exit owes are held until the caller runs
     /// [`Self::post_owed_notices`].
     pub fn agent_exited(&self, pane_id: &str, agent_id: &str) -> Vec<DelegateLedger> {
-        self.agent_exited_as(pane_id, agent_id, ExitKind::Natural)
+        self.agent_exited_as(pane_id, agent_id, ExitKind::Natural, None)
             .ledgers
     }
 
@@ -2035,9 +2041,25 @@ impl InboxHub {
     /// the tasks it acknowledged (or that ran out of hand-overs) owe one
     /// "worker exited" notice naming them; a close or respawn owes none of
     /// the latter. Each walked task is closed, and its debt answered.
-    pub fn agent_exited_as(&self, pane_id: &str, agent_id: &str, kind: ExitKind) -> ExitSettlement {
+    ///
+    /// PRD #1666 part 3, round 5-wake (plan rev 2 §6): `termination` is what
+    /// the deck observed ending the generation's pane; the notices this exit
+    /// owes, its card notice and its broadcasts say it, and `None` reads as
+    /// [`crate::inbox_display::PaneTermination::Unknown`].
+    pub fn agent_exited_as(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        kind: ExitKind,
+        termination: Option<crate::inbox_display::PaneTermination>,
+    ) -> ExitSettlement {
         let mut st = self.lock();
         let now = Instant::now();
+        let key = (pane_id.to_string(), agent_id.to_string());
+        st.exiting = Some((
+            key.clone(),
+            termination.unwrap_or(crate::inbox_display::PaneTermination::Unknown),
+        ));
         let mut walked_debt = Vec::new();
         let walked = match st
             .guarded_section(|st, reports| walk_exited_tasks(st, reports, pane_id, agent_id, kind))
@@ -2052,7 +2074,6 @@ impl InboxHub {
             }
         };
         st.inbox.agent_exited(now, pane_id, agent_id);
-        let key = (pane_id.to_string(), agent_id.to_string());
         // PRD #1666 §2 T9: the generation's attempts are fenced and its
         // receipt spool goes, off the lock.
         if let Some(spool) = engine::exit(&mut st, &key, now) {
@@ -2089,6 +2110,7 @@ impl InboxHub {
             broadcast_wake(&st, pane_id, agent_id, &id);
         }
         drain_events(&mut st);
+        st.exiting = None;
         let mut ledgers = std::mem::take(&mut st.exited_ledgers);
         ledgers.append(&mut walked_debt);
         drop(st);
@@ -4585,10 +4607,10 @@ fn walk_exited_tasks(
                         TaskDelivery::Live => claim.withheld.push((
                             orchestrator,
                             UNDELIVERED_SUBJECT,
-                            compose_undeliverable_notice(
+                            compose_exited_notice(
                                 &id,
                                 &task.binding.role,
-                                UndeliverableReason::AgentExited,
+                                exiting_termination(st, pane_id, agent_id),
                             ),
                         )),
                         TaskDelivery::Acknowledged | TaskDelivery::Ended
@@ -4622,15 +4644,15 @@ fn walk_exited_tasks(
             continue;
         };
         match task.delivery {
-            TaskDelivery::Live => st.owed_notices.push((
-                orchestrator,
-                UNDELIVERED_SUBJECT,
-                compose_undeliverable_notice(
+            TaskDelivery::Live => {
+                let body = compose_exited_notice(
                     &id,
                     &task.binding.role,
-                    UndeliverableReason::AgentExited,
-                ),
-            )),
+                    exiting_termination(st, pane_id, agent_id),
+                );
+                st.owed_notices
+                    .push((orchestrator, UNDELIVERED_SUBJECT, body));
+            }
             TaskDelivery::Acknowledged | TaskDelivery::Ended if kind == ExitKind::Natural => {
                 match exited.iter_mut().find(|(to, _)| *to == orchestrator) {
                     Some((_, ids)) => ids.push(id),
@@ -4925,8 +4947,10 @@ fn consume_events(st: &mut HubState, events: Vec<InboxEvent>, verdicts: &TaskVer
                 requeued: false,
                 notices: InboxCardNotices::default(),
                 provenance: event.provenance.clone(),
+                termination: None,
             }));
         }
+        let termination = event_termination(st, &event).cloned();
         let Some(recipient) = event.recipient else {
             continue;
         };
@@ -4955,6 +4979,7 @@ fn consume_events(st: &mut HubState, events: Vec<InboxEvent>, verdicts: &TaskVer
             requeued: event.requeued,
             notices: InboxCardNotices::default(),
             provenance: event.provenance.clone(),
+            termination,
         }));
         if let Some(key) = refused {
             engine::broadcast_notices(st, &key, Instant::now());
@@ -5041,6 +5066,7 @@ fn broadcast_wake(st: &HubState, pane_id: &str, agent_id: &str, id: &str) {
         requeued: false,
         notices: InboxCardNotices::default(),
         provenance: None,
+        termination: None,
     }));
 }
 
@@ -5250,7 +5276,8 @@ fn owe_card_notice(st: &mut HubState, event: &InboxEvent) {
     }
     let detail = match event.undeliverable_reason {
         Some(UndeliverableReason::MaxDeliver) => NOTICE_MAX_DELIVER,
-        Some(UndeliverableReason::AgentExited) => NOTICE_AGENT_EXITED,
+        Some(UndeliverableReason::AgentExited) => event_termination(st, event)
+            .map_or(NOTICE_AGENT_EXITED, |termination| termination.card_notice()),
         _ => return,
     };
     let Some(recipient) = event.recipient.as_ref() else {
@@ -5329,6 +5356,8 @@ fn settle_delegate(st: &mut HubState, event: &InboxEvent, verdicts: &TaskVerdict
     if let Some(to) = watch.orchestrator {
         let body = if reason == UndeliverableReason::Cancelled {
             compose_cancelled_notice(id, &watch.role, handed)
+        } else if reason == UndeliverableReason::AgentExited {
+            compose_exited_notice(id, &watch.role, event_termination(st, event))
         } else {
             compose_undeliverable_notice(id, &watch.role, reason)
         };
@@ -5593,11 +5622,9 @@ pub fn compose_undeliverable_notice(
             "The deck will not deliver it again, but it may already have reached the worker, \
              which may be working on it; its work-done can still arrive.",
         ),
-        UndeliverableReason::AgentExited => (
-            "the worker it was addressed to exited before acknowledging it",
-            "It may have reached the worker before it exited, so some of the work may already \
-             be done.",
-        ),
+        UndeliverableReason::AgentExited => {
+            return compose_exited_notice(message_id, role, None);
+        }
         UndeliverableReason::InboxShut => (
             "the deck is shutting down",
             "It may already have reached the worker.",
@@ -5612,6 +5639,54 @@ pub fn compose_undeliverable_notice(
          {CHECK}",
         crate::state::quote_untrusted_role(role),
     )
+}
+
+/// PRD #1666 part 3, round 5-wake (plan rev 2 §6): the notice an orchestrator
+/// gets when a task it delegated became undeliverable because its worker's
+/// pane ended (`agent_exited`), saying what the deck observed end the pane
+/// (`None`: it can't say). It names the command the deck started in the pane,
+/// never the agent, which can run below it and outlive it.
+pub fn compose_exited_notice(
+    message_id: &str,
+    role: &str,
+    termination: Option<&crate::inbox_display::PaneTermination>,
+) -> String {
+    let why = termination.map_or_else(
+        || crate::inbox_display::TERMINATION_UNKNOWN.to_string(),
+        crate::inbox_display::PaneTermination::words,
+    );
+    format!(
+        "Task {message_id} to the worker in role {} is undeliverable: {why}. It may have \
+         reached the worker before then, so some of the work may already be done. Check the \
+         worker's pane before you re-delegate or reassign it, or notify the user.",
+        crate::state::quote_untrusted_role(role),
+    )
+}
+
+/// The termination [`InboxHub::agent_exited_as`] is settling for generation
+/// `(pane_id, agent_id)`, if it is that one.
+fn exiting_termination<'a>(
+    st: &'a HubState,
+    pane_id: &str,
+    agent_id: &str,
+) -> Option<&'a crate::inbox_display::PaneTermination> {
+    st.exiting
+        .as_ref()
+        .filter(|((pane, agent), _)| pane == pane_id && agent == agent_id)
+        .map(|(_, termination)| termination)
+}
+
+/// The termination an `agent_exited` event's message owes to its notices: the
+/// exiting generation's, when the event's recipient is that generation.
+fn event_termination<'a>(
+    st: &'a HubState,
+    event: &InboxEvent,
+) -> Option<&'a crate::inbox_display::PaneTermination> {
+    if event.undeliverable_reason != Some(UndeliverableReason::AgentExited) {
+        return None;
+    }
+    let recipient = event.recipient.as_ref()?;
+    exiting_termination(st, &recipient.pane_id, recipient.agent_id.as_deref()?)
 }
 
 /// PRD #1666 §6.4: the notice an orchestrator gets when the user cancelled a
@@ -7299,7 +7374,7 @@ mod tests {
         // refusal reads none, one with none reads doorbell.
         let hub = fresh();
         hub.set_typed_fallback("w", "wa", Some("unmeasured_release"));
-        hub.agent_exited_as("w", "wa", ExitKind::Natural);
+        hub.agent_exited_as("w", "wa", ExitKind::Natural, None);
         hub.post_direct(Recipient::bound("w", "wb"), content("for wb"))
             .unwrap();
         assert_eq!(hub.summary("w", "wb").wake, WakePath::Doorbell);
@@ -8684,6 +8759,76 @@ mod tests {
 
     /// Delegate `task` to worker pane `w` (agent `wa`) from orchestrator pane
     /// `o` (agent `oa`), with notices due at once.
+    /// Scenario: A worker's pane ends, by each kind of evidence and with none, before it takes a delegated task. The orchestrator's notice must say what the deck saw end the pane, never that the agent exited, and the task's undeliverable broadcast must carry the same evidence.
+    #[spec("inbox/status/032")]
+    #[test]
+    fn status_032_an_exit_notice_says_what_ended_the_pane() {
+        use crate::inbox_display::{PaneTermination, TerminationSource};
+        let cases = [
+            (
+                Some(PaneTermination::PaneCommandExited {
+                    code: 7,
+                    reported_by: TerminationSource::Wrapper,
+                }),
+                "undeliverable: the command started in the agent's pane exited (code 7) before taking this message.",
+            ),
+            (
+                Some(PaneTermination::ConnectionEnded {
+                    read_end: "eof".to_string(),
+                }),
+                "undeliverable: the deck's connection to the agent's pane ended before it took this message; whether the agent is still running is unknown.",
+            ),
+            (
+                Some(PaneTermination::Replaced),
+                "undeliverable: the agent's pane was replaced before it took this message; the message stays with the previous agent.",
+            ),
+            (
+                Some(PaneTermination::Closed),
+                "undeliverable: the pane was closed before the agent took this message.",
+            ),
+            (
+                None,
+                "undeliverable: the agent's pane ended before it took this message.",
+            ),
+        ];
+        for (termination, words) in cases {
+            let hub = hub();
+            let (tx, mut rx) = broadcast::channel(256);
+            hub.set_broadcast(tx);
+            let task = delegate(&hub, "TASK-WHOSE-PANE-ENDS");
+            hub.agent_exited_as("w", "wa", ExitKind::Natural, termination.clone());
+            hub.post_owed_notices();
+            let bodies: Vec<String> = hub
+                .list_with_bodies(Some("o"))
+                .into_iter()
+                .filter(|m| m.subject == UNDELIVERED_SUBJECT)
+                .filter_map(|m| m.text)
+                .collect();
+            assert_eq!(bodies.len(), 1, "{termination:?}: {bodies:?}");
+            assert!(bodies[0].contains(task.as_str()), "{}", bodies[0]);
+            assert!(bodies[0].contains(words), "{termination:?}: {}", bodies[0]);
+            assert!(
+                !bodies[0].contains(" exited before acknowledging"),
+                "{}",
+                bodies[0]
+            );
+            let mut carried = None;
+            while let Ok(msg) = rx.try_recv() {
+                if let BroadcastMsg::Inbox(notice) = msg
+                    && notice.message_id == task.as_str()
+                    && notice.reason == Some(UndeliverableReason::AgentExited)
+                {
+                    carried = Some(notice.termination);
+                }
+            }
+            assert_eq!(
+                carried,
+                Some(Some(termination.unwrap_or(PaneTermination::Unknown))),
+                "the task's undeliverable broadcast carries the evidence"
+            );
+        }
+    }
+
     fn delegate(hub: &InboxHub, task: &str) -> MessageId {
         hub.post_delegate(
             Recipient::bound("w", "wa"),
@@ -8865,8 +9010,7 @@ mod tests {
         assert_eq!(told.len(), 1, "{told:?}");
         let body = &told[0];
         assert!(
-            body.contains("may have reached the worker before it exited")
-                && body.contains(CHECK_FIRST),
+            body.contains("may have reached the worker before then") && body.contains(CHECK_FIRST),
             "{body}"
         );
         assert!(

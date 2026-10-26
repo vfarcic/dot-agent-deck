@@ -3208,6 +3208,13 @@ pub struct InboxNotice {
     /// names by id. Additive: a client that does not know it ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<crate::report_recovery::ReportProvenance>,
+    /// PRD #1666 part 3, round 5-wake (plan rev 2 §6): with `reason`
+    /// `agent_exited`, what the deck observed ending the generation's pane.
+    /// Additive: absent from an older deck, ignored by an older client, and a
+    /// kind this build does not know reads as
+    /// [`crate::inbox_display::PaneTermination::Unknown`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination: Option<crate::inbox_display::PaneTermination>,
     #[serde(flatten, default)]
     pub notices: crate::inbox_hub::InboxCardNotices,
 }

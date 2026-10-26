@@ -56,5 +56,12 @@
   "actionUnsupported": "this deck cannot Retry or Cancel deck messages: upgrade dot-agent-deck",
   "attentionTitle": "Deck messages",
   "attentionOtherHeld": "other held",
-  "attentionHeld": "held"
+  "attentionHeld": "held",
+  "terminations": {
+    "pane_command_exited": "the command started in the agent's pane exited (code {code}) before taking this message",
+    "connection_ended": "the deck's connection to the agent's pane ended before it took this message; whether the agent is still running is unknown",
+    "replaced": "the agent's pane was replaced before it took this message; the message stays with the previous agent",
+    "closed": "the pane was closed before the agent took this message",
+    "unknown": "the agent's pane ended before it took this message"
+  }
 }

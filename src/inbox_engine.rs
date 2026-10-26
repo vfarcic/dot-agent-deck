@@ -2101,6 +2101,7 @@ fn send_notices(st: &HubState, key: &AgentKey, notices: InboxCardNotices) {
         requeued: false,
         notices,
         provenance: None,
+        termination: None,
     }));
 }
 

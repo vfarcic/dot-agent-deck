@@ -20151,6 +20151,7 @@ mod tests {
             requeued: false,
             notices: Default::default(),
             provenance: None,
+            termination: None,
         }
     }
 

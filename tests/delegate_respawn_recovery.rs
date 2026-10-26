@@ -945,10 +945,17 @@ async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() 
 /// up" when it died before the task was posted, "undeliverable" when it died
 /// just after.
 fn dead_replacement_notices(text: &str) -> usize {
+    // PRD #1666 part 3, round 5-wake: the undeliverable notice names what
+    // ended the worker's pane, never the agent exiting.
     text.matches("delegated worker never came up").count()
-        + text
-            .matches("is undeliverable: the worker it was addressed to exited")
-            .count()
+        + [
+            "is undeliverable: the command started in the agent's pane exited",
+            "is undeliverable: the deck's connection to the agent's pane ended",
+            "is undeliverable: the agent's pane ended",
+        ]
+        .iter()
+        .map(|words| text.matches(words).count())
+        .sum::<usize>()
 }
 
 /// Issue #1114: how long `delegate/032` keeps the worker pane in the window
