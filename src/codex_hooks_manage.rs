@@ -1774,6 +1774,22 @@ pub(crate) fn trust_deck_hooks_for_within(
     binary_paths: &[String],
     hooks_list_timeout: Duration,
 ) -> std::io::Result<TrustOutcome> {
+    trust_deck_hooks(home, cwd, binary_paths, hooks_list_timeout, false)
+}
+
+/// [`trust_deck_hooks_for_within`], and with `recheck_hooks_json` publishing
+/// only the records whose position `hooks.json` still holds this install's
+/// command at when the write takes the lock ([`records_still_installed`]).
+/// The startup install asks for that, since its trust write runs on a thread
+/// of its own and its listing can be seconds old by then (issue #1665): an
+/// uninstall or another install may have changed `hooks.json` meanwhile.
+fn trust_deck_hooks(
+    home: &Path,
+    cwd: &Path,
+    binary_paths: &[String],
+    hooks_list_timeout: Duration,
+    recheck_hooks_json: bool,
+) -> std::io::Result<TrustOutcome> {
     let mut expected_commands: Vec<String> = Vec::new();
     for binary_path in binary_paths {
         let command = expected_hook_command(binary_path);
@@ -1832,6 +1848,17 @@ pub(crate) fn trust_deck_hooks_for_within(
         });
     }
     let _guard = INSTALL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let records = if recheck_hooks_json {
+        records_still_installed(records, home, &expected_commands)
+    } else {
+        records
+    };
+    if records.is_empty() {
+        tracing::debug!(
+            "codex: the deck's listed hooks are no longer in hooks.json, so no trust was recorded"
+        );
+        return Ok(TrustOutcome::NothingListed);
+    }
     let mut swept = 0;
     edit_trust_state(home, |state| {
         for (key, hash) in &records {
@@ -1866,6 +1893,58 @@ pub(crate) fn trust_deck_hooks_for_within(
         reports_prompts,
         turned_off,
     })
+}
+
+/// The `records` (trust key, hash) whose position `home`'s `hooks.json`, read
+/// now, still holds one of `expected_commands` at: none when the file is
+/// gone, and all of them when it cannot be read, which is no evidence either
+/// way. A position whose rule or handler carries no command it can compare is
+/// kept, as [`position_is_in_hooks_json`] keeps it.
+fn records_still_installed(
+    records: Vec<(String, String)>,
+    home: &Path,
+    expected_commands: &[String],
+) -> Vec<(String, String)> {
+    let root = match crate::agent_hook_config::read_json_config(&home.join("hooks.json")) {
+        Some(Some(root)) => root,
+        Some(None) => return Vec::new(),
+        None => return records,
+    };
+    records
+        .into_iter()
+        .filter(|(key, _)| {
+            split_trust_key(key).is_some_and(|(_, position)| {
+                position_is_in_hooks_json(&root, position)
+                    && command_at_position(&root, position)
+                        .is_none_or(|command| expected_commands.iter().any(|e| e == command))
+            })
+        })
+        .collect()
+}
+
+/// The command of the handler at `position` (`<event_snake>:<group_idx>:
+/// <handler_idx>`) in `hooks.json`, matching event names as
+/// [`position_is_in_hooks_json`] does; `None` when there is no such handler or
+/// it names no command.
+fn command_at_position<'a>(root: &'a Value, position: &str) -> Option<&'a str> {
+    let normalize = |name: &str| name.replace('_', "").to_ascii_lowercase();
+    let mut parts = position.splitn(3, ':');
+    let (event, group, handler) = (parts.next()?, parts.next()?, parts.next()?);
+    let (group, handler) = (group.parse::<usize>().ok()?, handler.parse::<usize>().ok()?);
+    root.get("hooks")?
+        .as_object()?
+        .iter()
+        .filter(|(name, _)| normalize(name) == normalize(event))
+        .find_map(|(_, rules)| {
+            rules
+                .as_array()?
+                .get(group)?
+                .get("hooks")?
+                .as_array()?
+                .get(handler)?
+                .get("command")?
+                .as_str()
+        })
 }
 
 /// The listed entries a trust write grants: those [`deck_owned_entries`] keeps
@@ -2426,7 +2505,13 @@ struct StartupInstall {
 impl StartupInstall {
     /// Record scoped trust for what was installed, and log what that came to.
     fn trust(&self) -> std::io::Result<TrustOutcome> {
-        let trusted = trust_deck_hooks_for(&self.home, &self.cwd, &self.binary_paths);
+        let trusted = trust_deck_hooks(
+            &self.home,
+            &self.cwd,
+            &self.binary_paths,
+            HOOKS_LIST_TIMEOUT,
+            true,
+        );
         report_startup_trust(&trusted, &self.cwd);
         trusted
     }
@@ -3886,6 +3971,61 @@ mod tests {
         assert!(
             !sent.contains(&"x".repeat(200)),
             "an id too large to echo must draw no reply at all"
+        );
+    }
+
+    /// Issue #1665: a trust write publishes only the listed records whose
+    /// position `hooks.json` still holds the deck's command at, since the
+    /// startup listing can be seconds old when it lands.
+    #[test]
+    fn a_trust_write_drops_records_hooks_json_no_longer_holds() {
+        let home = tempfile::tempdir().unwrap();
+        let ours = "/deck hook --agent codex".to_string();
+        let records = || {
+            vec![
+                (
+                    "/h/hooks.json:pre_tool_use:0:0".to_string(),
+                    "sha256:a".to_string(),
+                ),
+                ("/h/hooks.json:stop:0:0".to_string(), "sha256:b".to_string()),
+                (
+                    "/h/hooks.json:session_start:0:0".to_string(),
+                    "sha256:c".to_string(),
+                ),
+            ]
+        };
+        let expected = std::slice::from_ref(&ours);
+
+        assert!(
+            records_still_installed(records(), home.path(), expected).is_empty(),
+            "a hooks.json removed since the listing keeps nothing"
+        );
+
+        let rule =
+            |command: &str| json!([{ "hooks": [{ "type": "command", "command": command }] }]);
+        std::fs::write(
+            home.path().join("hooks.json"),
+            json!({ "hooks": {
+                "PreToolUse": rule(&ours),
+                "Stop": rule("/another-deck hook --agent codex"),
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            records_still_installed(records(), home.path(), expected),
+            vec![(
+                "/h/hooks.json:pre_tool_use:0:0".to_string(),
+                "sha256:a".to_string()
+            )],
+            "only the position still holding this install's command keeps its record"
+        );
+
+        std::fs::write(home.path().join("hooks.json"), "{ not json").unwrap();
+        assert_eq!(
+            records_still_installed(records(), home.path(), expected),
+            records(),
+            "an unreadable hooks.json is no evidence, so the listing stands"
         );
     }
 

@@ -14,7 +14,9 @@
 //!
 //! These tests start the real binary as `daemon serve`, the way
 //! `tests/e2e_daemon_hook_install.rs` does, with a `codex` stand-in first on
-//! `PATH`: 014's never answers, 015's answers the way a real Codex does.
+//! `PATH`: 014's never answers, 015's answers the way a real Codex does. 016
+//! starts the whole deck in a PTY against the silent stand-in, for the
+//! dashboard's first draw.
 
 mod common;
 
@@ -22,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+use common::TuiDeck;
 use serde_json::{Value, json};
 use spec::spec;
 
@@ -236,7 +239,8 @@ fn codex_hooks_014_an_unanswered_hooks_list_does_not_hold_the_daemon_bind() {
 /// Scenario: Start the real binary as `daemon serve` with the `codex-synthetic`
 /// stand-in first on `PATH`, answering `hooks/list` with the deck's hooks as
 /// the startup install wrote them. Once the daemon has bound, Codex's
-/// `config.toml` must come to trust exactly the deck's hook keys, so the trust
+/// `config.toml` must come to trust exactly the deck's hook keys, each with the
+/// hash the stand-in listed for it, so the trust
 /// write that no longer runs before the bind still completes.
 #[spec("codex/hooks/015")]
 #[test]
@@ -252,31 +256,50 @@ fn codex_hooks_015_the_startup_trust_write_still_lands_when_codex_answers() {
     );
     let bound = daemon.wait_for_bind();
     let config = daemon.codex_home.join("config.toml");
-    let mut expected: Vec<String> = DECK_HOOK_EVENTS
+    // Each key with the hash the stand-in listed for it: a record with a
+    // missing or wrong `trusted_hash` is one Codex refuses to run.
+    let mut expected: Vec<(String, String)> = DECK_HOOK_EVENTS
         .iter()
-        .map(|event_key| format!("{}/hooks.json:{event_key}:0:0", daemon.codex_home.display()))
+        .enumerate()
+        .map(|(index, event_key)| {
+            (
+                format!("{}/hooks.json:{event_key}:0:0", daemon.codex_home.display()),
+                format!("sha256:deck-{index}"),
+            )
+        })
         .collect();
     expected.sort();
-    let trusted_keys = || -> Vec<String> {
+    let trusted = || -> Vec<(String, String)> {
         let Ok(contents) = std::fs::read_to_string(&config) else {
             return Vec::new();
         };
         let Ok(root) = toml::from_str::<toml::Value>(&contents) else {
             return Vec::new();
         };
-        let mut keys: Vec<String> = root
+        let mut records: Vec<(String, String)> = root
             .get("hooks")
             .and_then(|hooks| hooks.get("state"))
             .and_then(toml::Value::as_table)
-            .map(|state| state.keys().cloned().collect())
+            .map(|state| {
+                state
+                    .iter()
+                    .map(|(key, record)| {
+                        let hash = record
+                            .get("trusted_hash")
+                            .and_then(toml::Value::as_str)
+                            .unwrap_or_default();
+                        (key.clone(), hash.to_string())
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
-        keys.sort();
-        keys
+        records.sort();
+        records
     };
     let landed = common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
-        trusted_keys() == expected
+        trusted() == expected
     });
-    let keys = trusted_keys();
+    let records = trusted();
     let log = daemon.log();
     daemon.stop();
 
@@ -286,7 +309,50 @@ fn codex_hooks_015_the_startup_trust_write_still_lands_when_codex_answers() {
     );
     assert!(
         landed,
-        "Codex's config.toml never came to trust exactly the deck's hook keys after the \
-         daemon bound.\nexpected: {expected:?}\nfound: {keys:?}\nlog:\n{log}"
+        "Codex's config.toml never came to trust exactly the deck's hook keys, with the \
+         listed hashes, after the daemon bound.\nexpected: {expected:?}\nfound: {records:?}\n\
+         log:\n{log}"
+    );
+}
+
+/// Scenario: Start the whole deck in a PTY, TUI and lazy-spawned daemon, with a
+/// `codex` stand-in first on `PATH` whose `app-server` reads every request and
+/// answers none. When the empty dashboard first paints, the deck's log must
+/// hold no Codex trust write that gave up on `hooks/list` — neither the TUI's
+/// nor the daemon's waited out the 5 s listing bound first — and the log must
+/// still come to hold one once that bound has run out.
+#[spec("codex/hooks/016")]
+#[test]
+fn codex_hooks_016_an_unanswered_hooks_list_does_not_hold_the_dashboard() {
+    let dir = common::race_safe_tempdir();
+    let codex_dir = dir.path().join("codex-bin");
+    std::fs::create_dir_all(&codex_dir).expect("create stand-in dir");
+    write_executable(&codex_dir.join("codex"), SILENT_CODEX);
+    let log_path = dir.path().join("deck.log");
+    let log = || std::fs::read_to_string(&log_path).unwrap_or_default();
+
+    let deck = TuiDeck::builder()
+        .with_env(
+            "PATH",
+            format!("{}:{}", codex_dir.display(), common::path_with_binary_dir()),
+        )
+        .with_env("DOT_AGENT_DECK_LOG", log_path.to_string_lossy())
+        .launch_with_fixture("minimal");
+
+    deck.wait_for_string("No active agents");
+    let log_at_paint = log();
+    assert!(
+        !log_at_paint.contains(TRUST_FAILED),
+        "the dashboard painted only after a Codex trust write gave up on `hooks/list`, so \
+         startup still waits out the listing bound (issue #1665).\nlog:\n{log_at_paint}"
+    );
+    // The stand-in was reached, and the trust write still ran and gave up:
+    // without this, a deck that never ran the install would pass the above.
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(20)), || {
+            log().contains(TRUST_FAILED)
+        }),
+        "no startup trust write reported its `hooks/list` timeout.\nlog:\n{}",
+        log()
     );
 }

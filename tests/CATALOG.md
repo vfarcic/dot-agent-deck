@@ -6817,14 +6817,21 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Layer:** L2 (`tests/e2e_codex_startup_trust.rs`: the REAL binary as a `daemon serve` subprocess against an isolated `HOME`, `CODEX_HOME` and sockets; no PTY, no TUI, no LLM).
 - **Agent:** none (a `codex` stand-in first on `PATH` whose `app-server` reads every request and answers none).
 - **Asserts:** the daemon binds its attach socket with `hooks.json` already installed; the log holds no trust-write failure at that point, and `daemon serve: pre-bind work done` precedes the `could not record scoped hook trust` line the trust write logs once the 5 s listing bound runs out. RED before the fix: the timeout line came first, because the trust write ran before the bind.
-- **Does not assert:** the TUI's startup, which runs the same installer (`auto_install_and_trust_at_startup`); a wall-clock bind time, which load would make flaky; why a real Codex does not answer under the harness.
+- **Does not assert:** the TUI's startup, which runs the same installer (`codex/hooks/016`); a wall-clock bind time, which load would make flaky; why a real Codex does not answer under the harness.
 - **Platform coverage:** mac+linux.
 
 ##### codex/hooks/015 — The startup trust write, no longer run before the daemon binds, still lands when Codex answers (issue #1665).
 - **Layer:** L2 (`tests/e2e_codex_startup_trust.rs`, as `codex/hooks/014`).
 - **Agent:** none (the `codex-synthetic` stand-in, answering `hooks/list` with the deck's eleven hooks as the startup install wrote them).
-- **Asserts:** after the daemon binds, Codex's `config.toml` comes to trust exactly the deck's hook keys.
+- **Asserts:** after the daemon binds, Codex's `config.toml` comes to trust exactly the deck's hook keys, each with the `trusted_hash` the stand-in listed for it.
 - **Does not assert:** ordering against a Codex launched before the trust lands (`codex/hooks/003` covers a launcher that waits for it); the wrapper's own trust write (`codex/trust/009`).
+- **Platform coverage:** mac+linux.
+
+##### codex/hooks/016 — A `codex app-server` that never answers `hooks/list` does not hold the dashboard's first paint (issue #1665).
+- **Layer:** L2 PTY-attached (`TuiDeck`, `tests/e2e_codex_startup_trust.rs`: the real TUI and its lazy-spawned daemon; no LLM).
+- **Agent:** none (the `codex/hooks/014` stand-in first on `PATH`).
+- **Asserts:** when `No active agents` first paints, the deck's log (TUI and daemon both append to it) holds no `could not record scoped hook trust` line; the log comes to hold one once the 5 s listing bound runs out, so the install did run. RED before the fix: the TUI's own startup install logged its timeout before `run_tui` drew.
+- **Does not assert:** a wall-clock paint time; what a Codex pane does before the trust lands.
 - **Platform coverage:** mac+linux.
 
 #### codex/live
