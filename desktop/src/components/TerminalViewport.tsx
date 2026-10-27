@@ -370,14 +370,19 @@ export function TerminalViewport({
     // as before. The TUI answers no queries at all, so this makes the desktop's
     // replay match it.
     //
-    // These are the reply sites of the installed xterm (6.0.0), and
-    // `TerminalViewport.replay.test.tsx` reads its source and fails on a site
-    // this list does not cover. Only queries are claimed: the window-ops
-    // handler claims the size reports and leaves title push and pop to xterm,
-    // and a colour sequence is claimed only when it asks for a colour. One
-    // that both sets and asks in a single sequence is claimed whole, so a
-    // replay of it skips the set; separate set and query sequences, which is
-    // what agents send, keep the set.
+    // These are the reply sites found by reading the installed xterm (6.0.0).
+    // `TerminalViewport.replay.test.tsx` counts the reply calls in the xterm
+    // source files and methods it names, so a change at one of those sites
+    // fails it and forces a review; a reply added in another file or under a
+    // new call spelling would not, so an xterm upgrade still needs its reply
+    // paths read again. Only queries are claimed: the window-ops handler
+    // claims the size reports and leaves title push and pop to xterm, and a
+    // colour sequence is claimed only when it asks for a colour. One that both
+    // sets and asks in a single sequence is claimed whole, so a replay of it
+    // skips the set and can leave the redrawn colours different from the
+    // original session's; a set in a sequence of its own, including one next
+    // to a query, still applies. Which form agents send has not been measured.
+    // `TerminalViewport.replayColour.test.tsx` pins both behaviours.
     const focusReported = (terminal as unknown as XtermInternals)._core?._inputHandler?.onRequestSendFocus?.(() => {
       if (focusReportsToDrop > 0) focusReportsToDrop -= 1;
     });
