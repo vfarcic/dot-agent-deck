@@ -108,10 +108,11 @@ pub struct Framing {
     private: Option<u8>,
     /// Whether the CSI being read has had any byte after `ESC [`.
     started: bool,
-    /// Every byte of the CSI since `ESC [` was kept as its private marker,
-    /// a parameter or an intermediate: no control, DEL or (on output)
-    /// skipped high byte came between. Only such a CSI can be a paste marker
-    /// or the epoch's frame marker, whose bytes are exact.
+    /// The `[` came straight after the ESC, and every byte of the CSI since
+    /// was kept as its private marker, a parameter or an intermediate: no
+    /// control, DEL or (on output) skipped high byte came between. Only such
+    /// a CSI can be a paste marker or the epoch's frame marker, whose bytes
+    /// are exact. Set at each ESC that opens an escape.
     literal: bool,
     /// The CSI is malformed, or the string's payload overflowed `buf`.
     malformed: bool,
@@ -252,9 +253,11 @@ pub struct Csi<'a> {
     pub params: &'a [u8],
     pub intermediates: &'a [u8],
     pub final_byte: u8,
-    /// Every byte between `ESC [` and the final byte was the private
-    /// marker, a parameter or an intermediate: no control, DEL or skipped
-    /// high byte came between. A marker whose spelling is exact needs it.
+    /// The `[` came straight after the ESC, and every byte between it and
+    /// the final byte was the private marker, a parameter or an
+    /// intermediate: no control, DEL or skipped high byte came anywhere
+    /// between the ESC and the final byte. A marker whose spelling is exact
+    /// needs it.
     pub literal: bool,
 }
 
@@ -410,7 +413,7 @@ impl Framing {
 
     fn ground(&mut self, byte: u8, emit: &mut dyn FnMut(Token<'_>)) {
         match byte {
-            ESC => self.state = State::Esc,
+            ESC => self.state = self.open_escape(),
             BEL => emit(self.token(Event::Bel(BelAt::Ground))),
             _ => emit(self.token(Event::Plain(byte))),
         }
@@ -428,16 +431,23 @@ impl Framing {
                     self.state = State::Ground;
                     return;
                 }
+                // `vte` stays in the escape across these, so a `[` after
+                // one still opens a CSI, but not a literal one.
                 BEL => {
+                    self.literal = false;
                     emit(self.token(Event::Bel(BelAt::Sequence)));
                     return;
                 }
                 ESC | CAN | SUB => {}
                 0x00..=0x1f | DEL => {
+                    self.literal = false;
                     emit(self.token(Event::Inside(byte)));
                     return;
                 }
-                0x80..=0xff => return,
+                0x80..=0xff => {
+                    self.literal = false;
+                    return;
+                }
                 _ => {}
             }
         }
@@ -448,7 +458,6 @@ impl Framing {
                 self.params_len = 0;
                 self.private = None;
                 self.started = false;
-                self.literal = true;
                 self.malformed = false;
                 State::Csi
             }
@@ -471,7 +480,7 @@ impl Framing {
             // The first ESC was the Escape key; this one opens a sequence.
             ESC => {
                 emit(self.token(Event::Abandoned));
-                State::Esc
+                self.open_escape()
             }
             CAN | SUB => {
                 emit(self.token(Event::Abandoned));
@@ -482,6 +491,13 @@ impl Framing {
                 State::Ground
             }
         };
+    }
+
+    /// The state an ESC that opens an escape enters: nothing has come
+    /// between it and the next byte yet.
+    fn open_escape(&mut self) -> State {
+        self.literal = true;
+        State::Esc
     }
 
     /// On output, after an ESC and an intermediate byte: more intermediates,
@@ -499,7 +515,7 @@ impl Framing {
             }
             ESC => {
                 emit(self.token(Event::Abandoned));
-                self.state = State::Esc;
+                self.state = self.open_escape();
             }
             0x00..=0x1f | DEL => emit(self.token(Event::Inside(byte))),
             // More intermediates, or a high byte, which `vte` skips.
@@ -544,7 +560,7 @@ impl Framing {
             }
             ESC => {
                 emit(self.token(Event::Abandoned));
-                self.state = State::Esc;
+                self.state = self.open_escape();
             }
             0x00..=0x1f | DEL => {
                 self.literal = false;
@@ -607,7 +623,7 @@ impl Framing {
                 self.dispatch_string(kind, Terminator::St, emit);
             } else {
                 emit(self.token(Event::Abandoned));
-                self.state = State::Esc;
+                self.state = self.open_escape();
                 self.escape(byte, emit);
             }
             return;

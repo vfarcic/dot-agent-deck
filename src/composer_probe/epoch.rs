@@ -194,11 +194,12 @@ impl ReportModes {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputNote {
     Query(QueryKind),
-    /// A1 §2.2's frame marker, the bytes `ESC [ ? 2026 h` exactly, as
-    /// crossterm spells a synchronized-update begin, outside any string or
-    /// paste. Any other spelling, a combined `?1049;2026h`, an empty or
-    /// sub-parameter, a leading zero, an intermediate or a control inside,
-    /// is no frame: it notes nothing for `B`, which holds rather than guess,
+    /// A1 §2.2's frame marker, the bytes `ESC [ ? 2026 h` exactly and
+    /// contiguously, as crossterm spells a synchronized-update begin,
+    /// outside any string or paste. Any other spelling, a combined
+    /// `?1049;2026h`, an empty or sub-parameter, a leading zero, an
+    /// intermediate, or a control or skipped byte inside or between the ESC
+    /// and the `[`, is no frame: it notes nothing for `B`, which holds rather than guess,
     /// while the report modes it carries are still noted as [`Self::Mode`].
     SyncBegin,
     /// `CSI ? <mode> h` or `l`, for each mode `vte` keeps.
@@ -243,9 +244,16 @@ pub(super) fn output_notes(token: &Token<'_>, modes: &[u32], out: &mut Vec<Outpu
     }
 }
 
-/// Whether a `CSI ? … h` is [`OutputNote::SyncBegin`]'s exact spelling.
+/// Whether a CSI is [`OutputNote::SyncBegin`]'s exact spelling, the bytes
+/// `ESC [ ? 2026 h` with nothing between them, outside a paste. It needs no
+/// guard from its caller.
 fn sync_begin(token: &Token<'_>, csi: &Csi<'_>) -> bool {
-    csi.params == b"2026" && csi.intermediates.is_empty() && csi.literal && !token.in_paste
+    csi.private == Some(b'?')
+        && csi.params == b"2026"
+        && csi.intermediates.is_empty()
+        && csi.final_byte == b'h'
+        && csi.literal
+        && !token.in_paste
 }
 
 /// A whole CPR or DA1 query.
@@ -539,5 +547,29 @@ mod tests {
         };
         assert_eq!(notes(false), [OutputNote::SyncBegin]);
         assert_eq!(notes(true), []);
+    }
+
+    /// Scenario: Ask the marker predicate itself, with no caller's guard in front of it, about literal `2026` CSIs with the `?` marker and `h`, with no or another private marker, and with another final byte. Only the first is the marker.
+    #[spec("inbox/probe/060")]
+    #[test]
+    fn probe_060_the_marker_predicate_needs_no_guard() {
+        let is_marker = |private, final_byte| {
+            let csi = Csi {
+                private,
+                params: b"2026",
+                intermediates: b"",
+                final_byte,
+                literal: true,
+            };
+            let token = Token {
+                event: Event::Csi(csi),
+                in_paste: false,
+            };
+            sync_begin(&token, &csi)
+        };
+        assert!(is_marker(Some(b'?'), b'h'));
+        assert!(!is_marker(None, b'h'), "no private marker");
+        assert!(!is_marker(Some(b'>'), b'h'), "another private marker");
+        assert!(!is_marker(Some(b'?'), b'l'), "another final byte");
     }
 }

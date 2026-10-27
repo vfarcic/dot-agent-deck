@@ -209,7 +209,7 @@ fn probe_045_the_output_hook_notes_whole_queries_only() {
 
 // ---- inbox/probe/060: B ----
 
-/// Scenario: On a profile whose CPR waits end at the next frame, emit a CPR query then `?2026h`, then the same query followed by each other spelling of a mode set (combined, extra, empty or sub-parameters, a leading zero, intermediates, a control or high byte inside, another private marker or final byte); a `?2026h` then a CPR query; each inside an OSC and a DCS string; and each split across pushes. Only the exact marker after the query ends `B`, a frame before it doesn't, and neither counts inside a string.
+/// Scenario: On a profile whose CPR waits end at the next frame, emit a CPR query then `?2026h`, then the same query followed by each other spelling of a mode set (combined, extra, empty or sub-parameters, a leading zero, intermediates, a control or high byte inside, or between the ESC and the `[`, another private marker or final byte); a `?2026h` then a CPR query; each inside an OSC and a DCS string; and each split across pushes. Only the exact marker after the query ends `B`, a fresh one after an interrupted escape included (whether it then reached an intermediate, a CSI, an OSC or ground), a frame before it doesn't, and neither counts inside a string.
 #[spec("inbox/probe/060")]
 #[test]
 fn probe_060_the_sync_begin_rule() {
@@ -246,6 +246,46 @@ fn probe_060_the_sync_begin_rule() {
         assert!(run(&[b"\x1b[6n", marker]), "{why}");
         assert!(run(&[&[b"\x1b[6n", marker].concat()]), "{why}, one push");
     }
+    // The exact bytes run from the ESC: a byte `vte` reports or skips
+    // between the ESC and its `[` leaves the CSI it then reads no marker.
+    let mut gaps: Vec<(Vec<u8>, String)> = (0x00..=0x1fu8)
+        .filter(|b| ![0x18, 0x1a, 0x1b].contains(b))
+        .chain([0x7f])
+        .chain(0x80..=0xff)
+        .map(|b| (vec![b], format!("{b:#04x} after the ESC")))
+        .collect();
+    gaps.push((b"\x07\x00\x7f\xc2".to_vec(), "several after the ESC".into()));
+    for (gap, why) in &gaps {
+        let marker = [&b"\x1b"[..], gap, b"[?2026h"].concat();
+        assert!(run(&[b"\x1b[6n", &marker]), "{why}");
+        assert!(
+            run(&[&[&b"\x1b[6n"[..], &marker].concat()]),
+            "{why}, one push"
+        );
+        for at in 1..marker.len() {
+            assert!(
+                run(&[b"\x1b[6n", &marker[..at], &marker[at..]]),
+                "{why}, split at {at}"
+            );
+        }
+    }
+    // A fresh ESC starts the exact bytes afresh, from each state one can
+    // arrive in after an interrupted escape.
+    for (between, why) in [
+        (&b""[..], "the escape"),
+        (b" ", "an escape's intermediate"),
+        (b"[", "a CSI"),
+        (b"]x", "an OSC"),
+        (b"[1m", "ground, after a whole CSI"),
+    ] {
+        let fresh = [&b"\x1b[6n\x1b\x07"[..], between, b"\x1b[?2026h"].concat();
+        for at in 0..=fresh.len() {
+            assert!(
+                !run(&[&fresh[..at], &fresh[at..]]),
+                "an interrupted escape, then {why}, then the exact marker, split at {at}"
+            );
+        }
+    }
     assert!(run(&[b"\x1b[?2026h\x1b[6n"]), "a frame before the query");
     assert!(
         run(&[b"\x1b[6n\x1b]0;[?2026h\x9b?2026h\x07"]),
@@ -270,7 +310,7 @@ fn probe_060_the_sync_begin_rule() {
     }
 }
 
-/// Scenario: On a profile whose CPR waits end at the next frame, emit a CPR query, then `?1004;2026h` and `?1000;1006;2026 h`, then a person's focus and SGR mouse reports. The combined forms end no wait, but the report modes they carry are still turned on, so the reports are exempt.
+/// Scenario: On a profile whose CPR waits end at the next frame, emit a CPR query, then `?1004;2026h` and `?1000;1006;2026 h`, then a person's focus and SGR mouse reports; then, on a fresh bus, a CPR query and `?1004;2026h` with a BEL between its ESC and `[`, and a focus report. The combined and interrupted forms end no wait, but the report modes they carry are still turned on, so the reports are exempt.
 #[spec("inbox/probe/060")]
 #[test]
 fn probe_060_a_combined_form_still_sets_report_modes() {
@@ -285,6 +325,15 @@ fn probe_060_a_combined_form_still_sets_report_modes() {
     );
     hook.on_output(b"\x1b[?2026h");
     assert!(!input.backlog(), "the exact marker: the control");
+
+    let input = Arc::new(GenerationInput::new(CprWaitEnd::SyncBegin));
+    let mut hook = OutputHook::new(Arc::clone(&input));
+    hook.on_output(b"\x1b[6n\x1b\x07[?1004;2026h");
+    assert!(input.backlog(), "a BEL between the ESC and the `[`");
+    assert!(
+        !moved(input.enqueue(Writer::Human, b"\x1b[I")),
+        "focus, after a BEL between the ESC and the `[`"
+    );
 }
 
 /// Scenario: Feed Codex's start-up probe prefix (a CPR, a DA1 and the OSC 10/11 colour queries, none answered), then its first frame. `B` holds after the prefix and is false after the frame, though the queries stay outstanding in the ledger.
