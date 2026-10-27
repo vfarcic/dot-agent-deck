@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.49.2] - 2026-10-27
+
+### Added
+
+- **Find an orchestration's orchestrator, and message it from outside**
+  An agent outside an orchestration, such as a standalone agent, a dispatched unit or an agent in another orchestration, can now find that orchestration's orchestrator and send it a message through the deck, instead of guessing which pane leads the team.
+  `dot-agent-deck roles` lists the live agents with their folder, orchestration, role and which one is each orchestration's orchestrator, as a table or with `--json`; `--folder` and `--orchestration` narrow the listing. `dot-agent-deck inbox send --folder <path>` or `--orchestration <name>` (or both) with `--text` or `--file` messages that orchestration's orchestrator. A folder reaches the orchestration in it or in its nearest parent folder, an address that matches several orchestrations is refused with the candidates listed, and a message never goes to a worker in the orchestrator's place. With `--folder` alone and no orchestration there, the one standalone agent there receives it, which is how an orchestrator answers a standalone agent. The recipient sees the pane the message came from, then the sender's folder, orchestration and role, a reply command the deck has checked reaches the sender, and the sender's text, all marked as untrusted. Each agent's sends count toward the same per-minute limit as its `inbox publish` and `inbox offer` messages. A worker still reports to its own orchestrator with `work-done`, and `inbox send` refuses one that addresses its own orchestration.
+  The TUI's orchestration sidebar now marks the orchestrator's card with an `ORCHESTRATOR` badge, as the desktop app already did, on a line of its own when the card is too narrow for it beside the agent's type and name. The orchestrator's startup instructions and the role library's worker prompts state the convention: agents message an orchestration's orchestrator, never another worker.
+  See [Messaging an orchestrator from outside](https://agent-deck.devopstoolkit.ai/docs/orchestration.md#messaging-an-orchestrator-from-outside).
+
+### Fixed
+
+- **Homebrew upgrades find a new release straight away, and the desktop app is upgraded before the CLI**
+  Upgrading a CLI installed with Homebrew now refreshes Homebrew's copy of the tap with `brew update` before it runs `brew upgrade`, for the stable and the beta formula alike. A release published a few hours earlier used to read as `Homebrew does not offer v<new> yet. Try again later.` because Homebrew had not looked at the tap since before the release. This applies to `dot-agent-deck upgrade`, the TUI's upgrade dialog and the desktop app's. If the CLI still reports the old version afterwards, the result gives the command to run, such as `/opt/homebrew/bin/brew update && /opt/homebrew/bin/brew upgrade dot-agent-deck`, with the same `brew` the upgrade used, and includes the error when `brew update` itself failed. A `brew update` that does not finish stops the upgrade instead of running `brew upgrade` beside it.
+  When the desktop app is behind too and can upgrade itself, **Upgrade** on the Dashboard's **Local daemon** section now leads with the app's upgrade, then offers the CLI's. Once the app is replaced, the dialog ends at **Relaunch**, and the relaunched app restarts an older daemon on this machine onto the new release. Before, it upgraded only the CLI, which left the old app talking to a newer daemon. `dot-agent-deck upgrade` and the TUI's upgrade dialog now offer the desktop app before the CLI as well, so all three ask in the same order.
+  See [What upgrading does for each install method](https://agent-deck.devopstoolkit.ai/docs/installation.md#what-upgrading-does-for-each-install-method) and [Upgrade the CLI and the daemon on this machine](https://agent-deck.devopstoolkit.ai/docs/desktop/daemons.md#upgrade-the-cli-and-the-daemon-on-this-machine).
+
+
+
 ## [0.49.1] - 2026-10-27
 
 ### Added
