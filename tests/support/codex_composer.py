@@ -37,18 +37,33 @@ Optional fixture knobs (unset by default):
   DOT_AGENT_DECK_TEST_COMPOSER_RELEASE overrides argv[3] in the header.
   DOT_AGENT_DECK_TEST_COMPOSER_REPORT=1 writes .spawn.json beside base:
     argv and the inherited VISUAL/EDITOR/CLAUDE_ENV_FILE (null means unset).
-  DOT_AGENT_DECK_TEST_COMPOSER_BASH_TOOL=1 enables the explicit Claude-style
-    tool-shell fixture: base.bash-tool.json is a nonempty JSON argv array;
-    Bash sources CLAUDE_ENV_FILE and execs it with stdio on the pane's tty.
-    base.bash-tool-result.json records its exit status. This opt-in models
-    Claude's sourcing, not Codex's tool environment policy, and leaves the
-    composer's own environment unchanged.
+  DOT_AGENT_DECK_TEST_COMPOSER_BASH_TOOL=1 enables a Claude-style tool shell,
+    sourcing CLAUDE_ENV_FILE before exec with stdio on the pane's tty.
+    This models Claude-style sourcing only, not Codex's environment policy,
+    and leaves the composer's own environment unchanged. Commands and env
+    scripts must be trusted test code; this is not filesystem confinement.
+    Use an isolated HOME/config/socket environment and leave BASH_ENV unset.
+
+Tool mailbox contract (one publisher, one composer per base; no crash recovery):
+  Publish {"id": "<unique nonempty id>", "argv": ["command", "..."]} by
+  writing base.bash-tool.json.tmp-<unique>, closing it, then renaming it to
+  base.bash-tool.json in the same directory. Never write the public name
+  directly or overwrite a pending request. The poller first renames it to
+  base.bash-tool.json.claimed-<pid>, then parses and removes that private file.
+  After a claim the publisher may queue one next request at the public name.
+  Results are closed temp files renamed to base.bash-tool-result.json:
+  {"id": "<request id>", "exit": <status>}. Check the id, then acknowledge by
+  removing that result; the poller claims no next request until it is absent.
+  Invalid JSON/shape returns {"id": null, "exit": null, "error": "invalid_request"};
+  a valid id is echoed even when argv is invalid. Failure to start Bash returns
+  error "exec_failed" with exit null. Acknowledge errors the same way.
 """
 import json
 import os
 import select
 import subprocess
 import sys
+import tempfile
 import termios
 import time
 import tty
@@ -86,21 +101,47 @@ DIALOGS = {
 def bash_tool():
     if os.environ.get('DOT_AGENT_DECK_TEST_COMPOSER_BASH_TOOL') != '1':
         return
+    result_path = base + '.bash-tool-result.json'
+    if os.path.exists(result_path):
+        return  # The publisher has not acknowledged the preceding result.
+    claimed = base + '.bash-tool.json.claimed-' + str(os.getpid())
     try:
-        with open(base + '.bash-tool.json') as request:
-            argv = json.load(request)
+        os.rename(base + '.bash-tool.json', claimed)
     except FileNotFoundError:
         return
-    if not isinstance(argv, list) or not argv or not all(isinstance(arg, str) for arg in argv):
-        raise ValueError('.bash-tool.json must be a nonempty string argv array')
-    os.remove(base + '.bash-tool.json')
-    result = subprocess.run([
-        'bash', '--noprofile', '--norc', '-c',
-        'if [[ -n ${CLAUDE_ENV_FILE:-} ]]; then source "$CLAUDE_ENV_FILE" || exit; fi; exec "$@"',
-        'composer-bash-tool', *argv,
-    ])
-    with open(base + '.bash-tool-result.json', 'w') as output:
-        json.dump({'exit': result.returncode}, output)
+    request_id = None
+    try:
+        try:
+            with open(claimed) as request:
+                command = json.load(request)
+            if not isinstance(command, dict):
+                raise ValueError('request must be an object')
+            if not isinstance(command.get('id'), str) or not command['id']:
+                raise ValueError('id must be a nonempty string')
+            request_id = command['id']
+            argv = command.get('argv')
+            if not isinstance(argv, list) or not argv or not all(isinstance(arg, str) for arg in argv):
+                raise ValueError('argv must be a nonempty string array')
+        except (ValueError, UnicodeError):
+            result = {'id': request_id, 'exit': None, 'error': 'invalid_request'}
+        else:
+            try:
+                completed = subprocess.run([
+                    'bash', '--noprofile', '--norc', '-c',
+                    'if [[ -n ${CLAUDE_ENV_FILE:-} ]]; then source "$CLAUDE_ENV_FILE" || exit; fi; exec "$@"',
+                    'composer-bash-tool', *argv,
+                ])
+                result = {'id': request_id, 'exit': completed.returncode}
+            except OSError:
+                result = {'id': request_id, 'exit': None, 'error': 'exec_failed'}
+    finally:
+        os.remove(claimed)
+    with tempfile.NamedTemporaryFile(mode='w', dir=os.path.dirname(result_path),
+                                     prefix=os.path.basename(result_path) + '.tmp-',
+                                     delete=False) as output:
+        temporary = output.name
+        json.dump(result, output)
+    os.replace(temporary, result_path)
 
 
 def flag(name):

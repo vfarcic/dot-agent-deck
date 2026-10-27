@@ -8719,6 +8719,17 @@ Live real-backend tests in `desktop/src-tauri/tests/voice_phrase_fixtures.rs`, n
 - **`voice_desktop_phrases_008_parameterless_steering_is_refused_by_the_production_pipeline`** — forces the original parameterless steering picks for "open docs" through the shipping handler over the New agent dialog and requires refusal in five samples per pick.
 - **`voice_desktop_phrases_009_contextual_and_whole_controls_are_refused_by_the_production_pipeline`** — forces picks through the shipping handler with real meaning votes: contextual and destructive negatives dispatch nothing, opening an existing agent neither opens nor starts a New agent form, mixed-content reading-on is refused, mixed-content dictation/reading-off/hush may dispatch their own reversible row with rates reported, and standalone positives dispatch in every sample.
 
+### Test harness composer controls
+
+#### harness/composer
+
+##### harness/composer/001 — Synthetic composer knobs preserve their defaults and atomically hand off trusted tool commands and acknowledged results.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_composer_knobs.rs` invoking `tests/support/composer_knob_checks.py`), three Python screens on private PTYs; no deck daemon.
+- **Agent:** none; no real agent or credential.
+- **Asserts:** unset and zero boolean knobs preserve the initial frame and leave optional files alone; spawn reports preserve literal argv and unset/empty/set editor values; release overrides render; Claude-style tool sourcing restores unset/empty/set editors through an oddly named env script while preserving literal arguments and tty stdio. Split temp-file writes remain unpublished across complete polling cycles; the parser opens a claimed file and results publish through a temp file. A request queued at the parse barrier survives its predecessor, runs once after result acknowledgement, and gets its own id/status. Invalid JSON or argv returns a defined error and the next valid command recovers.
+- **Does not assert:** crash/restart delivery, multiple publishers or consumers, filesystem confinement, Codex's tool environment policy, or production editor-probe behavior. The deterministic barriers instrument Python I/O in the check runner; the stand-ins gain no race-control knobs.
+- **Platform coverage:** mac+linux (Python stdlib PTYs and Bash).
+
 ### Test harness teardown (issue #1566)
 
 #### harness/teardown
