@@ -696,7 +696,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .agent-tabs .reader-open span { display: inline; }
 /* The bottom padding is 3vh plus the voice row (see `.voice-row`): the scrim
    still covers the window, and the reader inside it stops above the row. */
-.reader-overlay { position: fixed; inset: 0; z-index: 80; display: flex; justify-content: center; padding: 3vh 3vw calc(3vh + var(--voice-reserved)); background: rgb(var(--scrim-rgb) / .74); backdrop-filter: blur(2px); }
+.reader-overlay { position: fixed; inset: 0; z-index: 85; display: flex; justify-content: center; padding: 3vh 3vw calc(3vh + var(--voice-reserved)); background: rgb(var(--scrim-rgb) / .74); backdrop-filter: blur(2px); }
 .reader-panel { position: relative; width: min(1040px, 100%); display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--shell-line); border-radius: 12px; background: var(--shell-deep); box-shadow: 0 28px 70px rgb(var(--scrim-rgb) / .55); }
 .reader-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--shell-line); background: var(--shell-deep); }
 .reader-title { display: flex; align-items: center; gap: 9px; color: var(--shell-ink); }
@@ -1607,7 +1607,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    size — `.agent-grid`'s columns are a fixed template, and `ResizeObserver`
    fires on box size rather than position, so this costs no extra geometry
    report. `inset: 0` with no margin is what makes the box the window, which is
-   what the browser tier measures. Between `.reader-overlay` (80) and
+   what the browser tier measures. Between `.reader-overlay` (85) and
    `.dialog-backdrop` (100): a modal dialog still belongs on top of a pane. */
 .agent-pane-overlay { position: fixed; z-index: 90; inset: 0; margin: 0; display: flex; padding: 14px 14px calc(14px + var(--voice-reserved)); background: rgb(var(--scrim-rgb) / .74); }
 /* Every rule below is keyed off `data-presentation`, the seam M1 put on the
@@ -1692,7 +1692,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    width where the rail becomes a bottom bar the row sits on top of it, which is
    what `--bottom-rail-height` is for.
 
-   **z-index 95** — above `.agent-pane-overlay` (90) and `.reader-overlay` (80),
+   **z-index 95** — above `.agent-pane-overlay` (90) and `.reader-overlay` (85),
    below `.dialog-backdrop` (100) for the reason above. The row is opaque, so it
    is the pane's scrim that stops at its top edge rather than the pane's box: the
    overlay still covers the window, which is what a modal scrim should do, and
