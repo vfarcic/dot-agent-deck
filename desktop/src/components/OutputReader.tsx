@@ -4,6 +4,7 @@ import { statusLabel, type AgentSession } from "../types";
 import { getTerminal, stripAnsi, terminalSnapshotText } from "../lib/terminalRegistry";
 import { blockedReasonText } from "../lib/blockedReason";
 import { writeClipboardText } from "../lib/clipboard";
+import { OVERLAY_LAYER, useInertBackground } from "../hooks/useInertBackground";
 
 /** How often the reader re-snapshots the live terminal buffer while open. */
 const REFRESH_MS = 700;
@@ -40,6 +41,10 @@ export function OutputReader({ agent, onClose }: OutputReaderProps) {
   // without re-arming on every snapshot update.
   const transcriptRef = useRef(agent.transcript);
   transcriptRef.current = agent.transcript;
+  /* On the overlay stack (issue #1709), so the window behind is fenced as
+     `aria-modal` claims, and voice's "close" closes the reader rather than
+     reporting nothing to close, while a dialog drawn over it closes first. */
+  const panel = useInertBackground<HTMLDivElement>(true, OVERLAY_LAYER.reader, onClose);
 
   useEffect(() => {
     const snapshot = () => {
@@ -95,7 +100,7 @@ export function OutputReader({ agent, onClose }: OutputReaderProps) {
 
   return (
     <div className="reader-overlay" data-testid={`reader-${agent.id}`} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-      <div className="reader-panel" role="dialog" aria-modal="true" aria-label={`${agent.role} output reader`}>
+      <div ref={panel} tabIndex={-1} className="reader-panel" role="dialog" aria-modal="true" aria-label={`${agent.role} output reader`}>
         <header className="reader-head">
           <div className="reader-title">
             <BookOpenText size={15} aria-hidden="true" />
