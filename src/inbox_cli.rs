@@ -1353,7 +1353,7 @@ mod tests {
         }
     }
 
-    /// Scenario: Run plain and `--json` `inbox fetch` against stand-in decks: one that serves it, handing two messages with known caps; one whose stdout takes nothing, one that takes a prefix, one whose flush fails; one that revokes the attempt between its grant and the output; a silent deck, part 2's deck (receipts 1, no CLI) and a deck that never answers the fetch itself. Whole output commits both attempts and neither cap is in stdout, the JSON or stderr; zero bytes reports both not handed, a prefix or a failed flush possibly handed, and a revoke not handed with nothing printed; the gates send only the question, and a reply that never came after the fetch was sent says so in other words than one never asked for.
+    /// Scenario: Run plain and `--json` `inbox fetch` against stand-in decks: one that serves it, handing two messages with known caps; one whose stdout takes nothing, one that takes a prefix, one whose flush fails; one that includes a revoke in the successful grant's reply, so the client holds it before approval completes; a silent deck, part 2's deck (receipts 1, no CLI) and a deck that never answers the fetch itself. Whole output commits both attempts and neither cap is in stdout, the JSON or stderr; zero bytes reports both not handed, a prefix or a failed flush possibly handed, and a revoke not handed with nothing printed; the gates send only the question, and a reply that never came after the fetch was sent says so in other words than one never asked for.
     #[cfg(unix)]
     #[spec("inbox/cli/006")]
     #[test]
@@ -1496,8 +1496,14 @@ mod tests {
             assert!(reported[0].committed.is_empty(), "{what}");
         }
 
-        let revoke = format!(r#"{{"revoke":[{{"id":"{one}","a":1,"e":1}}]}}"#);
-        let (code, stdout, stderr, lines) = run(false, Some(serving(&[one], &[revoke])), whole());
+        let mut revoked = serving(&[one], &[]);
+        // Hold the revoke before approval returns, without depending on a later line arriving.
+        *revoked.last_mut().unwrap() = serde_json::json!({
+            "grant": {"q": 1, "ok": true},
+            "revoke": [{"id": one, "a": 1, "e": 1}]
+        })
+        .to_string();
+        let (code, stdout, stderr, lines) = run(false, Some(revoked), whole());
         assert_eq!(code, ExitCode::FAILURE);
         assert!(!stdout.contains("body of"), "{stdout}");
         assert!(stderr.contains(CLI_NOTHING_PRINTED), "{stderr}");
