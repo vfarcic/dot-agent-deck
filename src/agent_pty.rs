@@ -18002,13 +18002,15 @@ mod spawn_tests {
     /// published on a pane, however many have followed it. A history capped
     /// per pane let a late frame from a generation evicted by the cap fall back
     /// to the type-and-timestamp rule it exists to replace.
+    ///
+    /// Scenario: Publish 34 short-lived agents on one pane, closing each predecessor after its successor takes over. The newest generation is current and every earlier generation is still displaced after its record and PTY have been reaped.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_pane_remembers_every_generation_it_published() {
         use crate::event::GenerationVerdict;
         let registry = Arc::new(AgentPtyRegistry::new());
         let pane = "many-generations-pane-320";
-        let mut published = Vec::new();
+        let mut published: Vec<String> = Vec::new();
         for _ in 0..34 {
             let id = registry
                 .spawn_agent(SpawnOptions {
@@ -18024,6 +18026,16 @@ mod spawn_tests {
                     "generation {id} never exited"
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            // Keep the real publish/handover path, but release the exited
+            // predecessor's PTY before spawning again (#1884). Waiting for
+            // live_count() == 0 alone leaves every master open in the registry.
+            // The registry now retains at most two PTY records. The history
+            // assertions below also prove that reaping does not erase a verdict.
+            if let Some(previous) = published.last() {
+                registry
+                    .close_agent(previous)
+                    .expect("reap the exited predecessor and release its PTY");
             }
             published.push(id);
         }
