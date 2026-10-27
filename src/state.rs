@@ -8120,6 +8120,7 @@ impl AppState {
         self.stream_incarnation = incarnation;
         let stream = self.stream_incarnation.clone();
         let panes = self.drop_cards_replaced_by(&stream, None, None);
+        self.forget_replaced_role_placements(&panes);
         if !stream.is_unnamed() {
             for held in std::mem::take(&mut self.held_placeholders) {
                 if held.learned_from.same_process(&stream) {
@@ -8136,6 +8137,20 @@ impl AppState {
             }
         }
         panes
+    }
+
+    /// Issue #1913: forget where the render loop placed the role on each of
+    /// `panes`, whose cards a deck restart just dropped. That placement was the
+    /// replaced process's agent's; an agent the restarted deck runs under the
+    /// same pane id has not been placed here, and [`Self::card_unseen_agents`]
+    /// queues its orchestration's surface only when it reads it as unplaced.
+    /// The pane stays registered, for the successor's card.
+    fn forget_replaced_role_placements(&mut self, panes: &[String]) {
+        for pane_id in panes {
+            self.pane_role_map.remove(pane_id);
+            self.pane_cwd_map.remove(pane_id);
+            self.orchestrator_pane_ids.remove(pane_id);
+        }
     }
 
     /// PRD #1666 part 2 (G-fix7d): whether the deck is known to have replaced
