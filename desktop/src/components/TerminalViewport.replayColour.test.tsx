@@ -33,6 +33,9 @@ const FG_SET = "rgb:11/22/33";
 const BG_SET = "rgb:44/55/66";
 const FG_REPORT = osc("10;rgb:1111/2222/3333");
 const BG_REPORT = osc("11;rgb:4444/5555/6666");
+const INDEXED_SET_REPORT = osc("4;1;rgb:1111/2222/3333");
+// Indexed colour 1 as the viewport's theme sets it (`red: "#e5746f"`).
+const INDEXED_THEME_REPORT = osc("4;1;rgb:e5e5/7474/6f6f");
 
 /** Mounts a viewport whose backlog is `backlog`; `emit` appends live output. */
 function mountTerminal(backlog: string) {
@@ -125,10 +128,11 @@ describe("inbox/probe/038: colour sequence boundaries in a replayed history", ()
     expect(foreground, "the mixed sequence's set is skipped").not.toBe(FG_REPORT);
     sent.length = 0;
     await emit(osc("4;1;?"));
-    expect(sent, "the mixed indexed sequence's set is skipped").not.toEqual([osc("4;1;rgb:1111/2222/3333")]);
+    expect(sent, "the live indexed query has its one reply, the theme's colour").toEqual([INDEXED_THEME_REPORT]);
+    expect(sent[0], "the mixed indexed sequence's set is skipped").not.toBe(INDEXED_SET_REPORT);
   });
 
-  /** Scenario: after the replay, the agent sends one sequence that sets the foreground and asks for the background. The set applies and the background is answered, as without the replay filter. */
+  /** Scenario: after the replay, the agent sends one sequence that sets the foreground and asks for the background, and one that sets indexed colour 1 and asks for indexed colour 2. Each set applies and each query is answered, as without the replay filter. */
   it("inbox/probe/038: a live set and query in one sequence applies the set and answers", async () => {
     const { sent, parsed, emit, liveColours } = mountTerminal("");
     await parsed();
@@ -136,5 +140,12 @@ describe("inbox/probe/038: colour sequence boundaries in a replayed history", ()
     expect(sent).toHaveLength(1);
     expect(sent[0]).toMatch(/^\x1b\]11;rgb:[0-9a-f/]+\x1b\\$/);
     expect((await liveColours())[0]).toBe(FG_REPORT);
+    sent.length = 0;
+    await emit(osc(`4;1;${FG_SET};2;?`));
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatch(/^\x1b\]4;2;rgb:[0-9a-f/]+\x1b\\$/);
+    sent.length = 0;
+    await emit(osc("4;1;?"));
+    expect(sent, "the live mixed indexed sequence's set applies").toEqual([INDEXED_SET_REPORT]);
   });
 });

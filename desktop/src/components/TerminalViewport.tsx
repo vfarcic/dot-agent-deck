@@ -372,10 +372,12 @@ export function TerminalViewport({
     //
     // These are the reply sites found by reading the installed xterm (6.0.0).
     // `TerminalViewport.replay.test.tsx` counts the reply calls in the xterm
-    // source files and methods it names, so a change at one of those sites
-    // fails it and forces a review; a reply added in another file or under a
-    // new call spelling would not, so an xterm upgrade still needs its reply
-    // paths read again. Only queries are claimed: the window-ops handler
+    // source files and methods it names, so a change in the number of counted
+    // reply calls in one of those methods fails it and forces a review; a
+    // change that leaves those counts the same (a reply's condition or payload,
+    // or a reply added under an existing call), a reply added in another file
+    // and one under a new call spelling would not, so an xterm upgrade still
+    // needs its reply paths read again. Only queries are claimed: the window-ops handler
     // claims the size reports and leaves title push and pop to xterm, and a
     // colour sequence is claimed only when it asks for a colour. One that both
     // sets and asks in a single sequence is claimed whole, so a replay of it
