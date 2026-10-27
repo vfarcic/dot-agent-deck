@@ -73,11 +73,14 @@ tty.setraw(0, termios.TCSANOW)
 base, deck, version = sys.argv[1], sys.argv[2], sys.argv[3]
 version = os.environ.get('DOT_AGENT_DECK_TEST_COMPOSER_RELEASE', version)
 if os.environ.get('DOT_AGENT_DECK_TEST_COMPOSER_REPORT') == '1':
+    report = {'argv': sys.argv, 'env': {
+        name: os.environ.get(name)
+        for name in ('VISUAL', 'EDITOR', 'CLAUDE_ENV_FILE')
+    }}
+    if os.environ.get('DOT_AGENT_DECK_TEST_COMPOSER_REPORT_NAMES') == '1':
+        report['names'] = sorted(os.environ)
     with open(base + '.spawn.json', 'w') as output:
-        json.dump({'argv': sys.argv, 'env': {
-            name: os.environ.get(name)
-            for name in ('VISUAL', 'EDITOR', 'CLAUDE_ENV_FILE')
-        }, 'names': sorted(os.environ)}, output)
+        json.dump(report, output)
 # The generation's own session, the one `Deck::hook` names too: never
 # another pane's or a predecessor's.
 SESSION = '%s-session' % os.environ.get('DOT_AGENT_DECK_AGENT_ID', 'codex-composer-%d' % os.getpid())

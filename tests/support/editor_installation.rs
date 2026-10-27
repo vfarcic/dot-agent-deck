@@ -76,6 +76,7 @@ pub(crate) fn spawn(
     };
     let mut env = vec![
         json!(["DOT_AGENT_DECK_TEST_COMPOSER_REPORT", "1"]),
+        json!(["DOT_AGENT_DECK_TEST_COMPOSER_REPORT_NAMES", "1"]),
         json!(["DOT_AGENT_DECK_TEST_COMPOSER_BASH_TOOL", "1"]),
         json!(["DOT_AGENT_DECK_TEST_COMPOSER_RELEASE", release]),
         json!(["PATH", format!("{}:/usr/bin:/bin", bin.display())]),
