@@ -34,6 +34,11 @@ FIXTURE = "# H-FRX fixture; no inherited deck configuration\n"
 ENABLE = b"\x1b[?2004h"
 DISABLE = b"\x1b[?2004l"
 FRAME = b"\x1b[?2026h"
+EXPORT_FILE_BYTES = 16 * 1024 * 1024
+EXPORT_TOTAL_BYTES = 64 * 1024 * 1024
+EXPORT_FILE_COUNT = 4096
+EXPORT_LITERAL_COUNT = 100_000
+EXPORT_STREAM_COUNT = 1024
 VERSIONS = ("0.160.0", "0.164.0")
 ROWS = {
     "X1": {"status": "needs-implementation", "runs_per_setup": 50,
@@ -41,7 +46,8 @@ ROWS = {
                      "silent foreground stand-in driver (10 s after frontier)"]},
     "X2-arrival": {"status": "runnable-now", "runs_per_release": 100,
                    "label": "master-observed arrival interval; no elapsed-time bound"},
-    "X2-instrumented": {"status": "runnable-now", "runs_per_release": 100,
+    "X2-instrumented": {"status": "needs-implementation", "runs_per_release": 100,
+                        "needs": ["ordered, complete, cycle-bound syscall parser with integer timestamps"],
                         "label": "instrumented write-to-flush interval; tracing changes timing",
                         "frontier_column": "needs Q35-20a; unavailable until then"},
     "X3-gate": {"status": "needs-implementation", "calibration_only": True,
@@ -68,6 +74,7 @@ FIRST_FIELDS = ["platform", "generation", "duration_ns", "first_stop_ns", "cause
 CAUSES = {"NativeEditor", "CheckEditor", "ToolEditor", "ShapeEditor", "UnknownEditor",
           "UnarmedThenSpawnFailed", "Survivors", "UnknownReport", "DroppedObservation",
           "EditorUnconfirmed", "ScanDroppedAtCap"}
+POPULATION_FIELDS = {"setup", "release", "method", "containment", "harness_revision"}
 
 
 class Refusal(RuntimeError):
@@ -219,6 +226,7 @@ def plan():
             "policy": "Hold (X3 only: reviewed disposable e2e Authority seam)",
             "network": "unshare user+net; unavailable -> detection-only",
             "host_boundary": "network namespaces do not isolate host paths or host AF_UNIX",
+            "container_rows": "needs-implementation: create ownership by captured container ID before cleanup",
             "code_rows": "UNVERIFIED: no run-owned display",
             "claude_rows": "outside credential-free H-FRX; separate lane-2 authorization"}
 
@@ -234,7 +242,7 @@ class Children:
         self.root, self.env = root, env
         self.handles = {}
         self.processes = []
-        self.containers = []
+        self.cleanup_errors = []
         self.handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
         for sig in self.handlers:
             signal.signal(sig, self.interrupted)
@@ -276,65 +284,64 @@ class Children:
     def alive(self):
         return [pid for pid, fd in self.handles.items() if not selectors_ready(fd)]
 
-    def cleanup(self):
-        self.adopted()
-        self.send(signal.SIGTERM)
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline:
-            self.adopted()
-            self.send(signal.SIGTERM)
-            if not self.alive():
-                break
-            time.sleep(0.02)
-        self.adopted()
-        self.send(signal.SIGKILL)
-        deadline = time.monotonic() + 1
-        while time.monotonic() < deadline:
-            self.adopted()
-            self.send(signal.SIGKILL)
-            if not self.alive():
-                break
-            time.sleep(0.02)
-        survivors = self.alive()
-        for proc in self.processes:
-            proc.poll()
-        # Container names are generated here, never accepted from the operator.
-        for name in self.containers:
-            proc = self.spawn([str(self.root / "bin/podman"), "rm", "-f", name],
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            try:
-                proc.wait(timeout=3)
-                if proc.returncode:
-                    survivors.append(f"container:{name}")
-            except subprocess.TimeoutExpired:
-                self.send(signal.SIGKILL)
-                survivors.append(f"container:{name}")
-        self.adopted()
-        self.send(signal.SIGKILL)
-        survivors.extend(pid for pid in self.alive() if pid not in survivors)
-        for fd in self.handles.values():
-            os.close(fd)
-        while True:
-            try:
-                if os.waitpid(-1, os.WNOHANG)[0] == 0:
-                    break
-            except ChildProcessError:
-                break
-        for sig, handler in self.handlers.items():
-            signal.signal(sig, handler)
-        return survivors
+    def ignore_termination(self):
+        # Repeated TERM/INT requests must not unwind an in-progress cleanup.
+        for sig in self.handlers:
+            signal.signal(sig, signal.SIG_IGN)
 
-    def container(self, image, argv):
-        podman = str(self.root / "bin/podman")
-        probe = self.spawn([podman, "image", "exists", image], stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL)
-        if probe.wait(timeout=5) != 0:
-            raise Refusal("UNVERIFIED: image unavailable locally; pulls are forbidden")
-        name = "hfrx-" + hashlib.sha256(str(self.root).encode()).hexdigest()[:12]
-        name += f"-{len(self.containers)}"
-        self.containers.append(name)
-        return self.spawn([podman, "run", "--pull=never", "--network=none", "--name", name,
-                           "-i", image, *argv])
+    def cleanup(self):
+        self.ignore_termination()
+
+        def attempt(label, operation, fallback=None):
+            try:
+                return operation()
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                self.cleanup_errors.append(f"{label}: {type(error).__name__}")
+                return fallback
+
+        survivors = list(self.handles)
+        try:
+            for sig, seconds in ((signal.SIGTERM, 2), (signal.SIGKILL, 1)):
+                deadline = time.monotonic() + seconds
+                while True:
+                    attempt("adopt", self.adopted)
+                    for fd in list(self.handles.values()):
+                        def send_one(fd=fd):
+                            try:
+                                signal.pidfd_send_signal(fd, sig)
+                            except ProcessLookupError:
+                                pass
+                        attempt("signal", send_one)
+                    survivors = attempt("observe", self.alive, list(self.handles))
+                    if not survivors or time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.02)
+            for proc in self.processes:
+                attempt("poll", proc.poll)
+        finally:
+            for fd in self.handles.values():
+                attempt("close-pidfd", lambda fd=fd: os.close(fd))
+            self.handles.clear()
+            while True:
+                try:
+                    if os.waitpid(-1, os.WNOHANG)[0] == 0:
+                        break
+                except ChildProcessError:
+                    break
+                except OSError as error:
+                    self.cleanup_errors.append(f"reap: {type(error).__name__}")
+                    break
+            report = {"survivors": survivors, "errors": self.cleanup_errors}
+            # PID-qualified files keep inner and outer supervisor evidence apart.
+            artifact = self.root / f"cleanup-children-{os.getpid()}-{time.monotonic_ns()}.json"
+            try:
+                write_json(artifact, report)
+                if survivors or self.cleanup_errors:
+                    print(f"H-FRX cleanup UNVERIFIED: inspect {artifact}", file=sys.stderr)
+            finally:
+                for sig, handler in self.handlers.items():
+                    signal.signal(sig, handler)
+        return survivors
 
 
 def selectors_ready(fd):
@@ -412,31 +419,7 @@ def check_connects(files, root, port):
 
 
 def syscall_pairs(files):
-    pairs = []
-    for file in files:
-        tail, enable_time, editor_cycle = b"", None, False
-        for line in file.read_text().splitlines():
-            match = re.match(r"(\d+\.\d+)\s+(.*)", line)
-            if not match:
-                continue
-            at, call = float(match[1]), match[2]
-            write = re.match(r"write(v)?\([12],", call)
-            returned = re.search(r"\)\s+=\s+(\d+)\s*$", call)
-            if write and returned:
-                chunks = re.findall(r'"((?:\\.|[^"\\])*)"', call)
-                data = b"".join(decode_trace_string(chunk) for chunk in chunks)[:int(returned[1])]
-                if DISABLE in tail + data:
-                    editor_cycle = True
-                    enable_time = None
-                if editor_cycle and ENABLE in tail + data:
-                    enable_time = at
-                tail = (tail + data)[-7:]
-            if re.search(r"ioctl\(0, TCFLSH, (TCIFLUSH|0)\)\s+=\s+0", call) and enable_time is not None:
-                pairs.append({"pid": file.suffix[1:], "write_realtime": enable_time,
-                              "flush_realtime": at, "interval_ns": round((at - enable_time) * 1e9)})
-                enable_time = None
-                editor_cycle = False
-    return pairs
+    raise Refusal("UNVERIFIED: ordered, complete, cycle-bound trace parser needs implementation")
 
 
 def cross_clock_order(event_real_ns, syscall_real_ns):
@@ -461,9 +444,20 @@ def x1_summary(records):
     result = {key: 0 for key in ("runs", "unavailable", "missing_frontier", "late_frontier",
               "unknown_report", "qualified_windows", "foreign_bytes", "foreign_frame",
               "foreign_enable", "orphan_sighup", "orphan_sigcont")}
-    latency = []
+    latency, population = [], None
     for row in records:
+        if result["runs"] >= 100_000:
+            raise Refusal("X1 record cap reached")
+        group = row.get("population")
+        if not isinstance(group, dict) or set(group) != POPULATION_FIELDS or any(
+                not isinstance(value, str) or not 1 <= len(value) <= 128 for value in group.values()):
+            raise Refusal("X1 requires explicit setup/release/method/containment/harness_revision population")
+        if population is not None and group != population:
+            raise Refusal("X1 analyze populations separately")
+        population = group.copy()
         result["runs"] += 1
+        if type(row["available"]) is not bool:
+            raise Refusal("X1 availability must be boolean")
         if not row["available"]:
             result["unavailable"] += 1
             continue
@@ -486,6 +480,8 @@ def x1_summary(records):
         result["orphan_sigcont"] += bool(row["orphan_sigcont"])
         latency.append(row["frontier_latency_ns"])
     result["frontier_latency_ns"] = latency
+    result["population"] = population
+    result["qualified_population"] = "full silent post-frontier windows, including unknown helper reports"
     n = result["qualified_windows"]
     result["zero_in_n"] = (f"none in {n} for this setup, version and harness; "
                            f"rule-of-three upper bound approximately {min(1, 3 / n):.6g}"
@@ -503,7 +499,7 @@ def export_scrubbed(root, destination):
     patterns = [rb"\bsk-[A-Za-z0-9_-]{8,}", rb"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",
                 rb"(?i)bearer\s+[A-Za-z0-9._-]{12,}",
                 rb'(?i)(?:api[_-]?key|access[_-]?token|refresh[_-]?token)\s*[\"\x27]?\s*[:=]\s*[\"\x27]?[A-Za-z0-9._-]{8,}']
-    files = []
+    files, total = [], 0
     for path in root.rglob("*"):
         if path.is_symlink():
             if under(path, root / "bin"):
@@ -512,21 +508,46 @@ def export_scrubbed(root, destination):
         if not path.is_file():
             continue
         # No credentials should exist, but don't silently exclude one if they do.
-        if path.stat().st_size > 128 * 1024 * 1024:
+        if path.stat().st_size > EXPORT_FILE_BYTES:
             raise Refusal("export file too large; review locally")
-        data = path.read_bytes()
+        if len(files) >= EXPORT_FILE_COUNT:
+            raise Refusal("export aggregate file-count budget exceeded; review locally")
+        with path.open("rb") as source:
+            data = source.read(EXPORT_FILE_BYTES + 1)
+        total += len(data)
+        if len(data) > EXPORT_FILE_BYTES or total > EXPORT_TOTAL_BYTES:
+            raise Refusal("export aggregate byte budget exceeded; review locally")
         # strace -xx encodes even key-shaped ASCII. Scan decoded quoted strings
         # too, so the default trace format does not defeat the scrubber.
         decoded = []
-        for literal in re.findall(rb'"((?:\\.|[^"\\])*)"', data):
+        for index, match in enumerate(re.finditer(rb'"((?:\\.|[^"\\])*)"', data)):
+            if index >= EXPORT_LITERAL_COUNT:
+                raise Refusal("export decoded literal budget exceeded; review locally")
             try:
-                decoded.append(decode_trace_string(literal.decode("ascii")))
+                decoded.append(decode_trace_string(match[1].decode("ascii")))
             except (ValueError, SyntaxError, UnicodeDecodeError):
                 continue
-        scan = data + b"\n" + b"\n".join(decoded)
-        clean = re.sub(rb"(?<![A-Za-z0-9_-])" + FAKE_KEY.encode() + rb"(?![A-Za-z0-9_-])", b"FIXTURE", scan)
-        if any(re.search(pattern, clean) for pattern in patterns):
-            raise Refusal("export refused: key-shaped string (inspect locally; content withheld)")
+        streams = {}
+        for line in data.splitlines():
+            write = re.search(rb'\bwrite(?:v)?\((\d+),', line)
+            if not write:
+                continue
+            fd = write[1]
+            if fd not in streams:
+                if len(streams) >= EXPORT_STREAM_COUNT:
+                    raise Refusal("export decoded stream budget exceeded; review locally")
+                streams[fd] = bytearray()
+            for match in re.finditer(rb'"((?:\\.|[^"\\])*)"', line[write.end():]):
+                try:
+                    streams[fd].extend(decode_trace_string(match[1].decode("ascii")))
+                except (ValueError, SyntaxError, UnicodeDecodeError):
+                    raise Refusal("export undecodable write payload; review locally") from None
+        # Conservative per-file literal sequence, including across writes/fds.
+        # False positives are preferable to exporting a fragmented trace secret.
+        for scan in (data, b"\n".join(decoded), b"".join(decoded), *streams.values()):
+            clean = re.sub(rb"(?<![A-Za-z0-9_-])" + FAKE_KEY.encode() + rb"(?![A-Za-z0-9_-])", b"FIXTURE", scan)
+            if any(re.search(pattern, clean) for pattern in patterns):
+                raise Refusal("export refused: key-shaped string (inspect locally; content withheld)")
         files.append((path.relative_to(root), data))
     destination.mkdir(mode=0o700, parents=True)
     for relative, data in files:
@@ -540,29 +561,55 @@ def export_scrubbed(root, destination):
 def first_summary(records):
     """Offline observer contract check + KM; no per-episode history retained here."""
     totals, durations, causes, resolutions = 0, {}, {}, {}
-    platform = None
+    platform, generations, attribution, discarded, aggregates = None, set(), {}, {}, []
+
+    def integer(value):
+        return type(value) is int and 0 <= value <= 2**63 - 1
+
     for row in records:
         if totals >= 100_000:
             raise Refusal("M-FIRST record cap reached; split the observation period")
         if any(field not in row for field in FIRST_FIELDS):
             raise Refusal("M-FIRST missing required observer field")
-        if row["platform"] not in ("Linux", "macOS") or row["cause"] not in CAUSES | {None}:
+        if row["platform"] not in ("Linux", "macOS") or (
+                row["cause"] is not None and (not isinstance(row["cause"], str) or row["cause"] not in CAUSES)):
             raise Refusal("M-FIRST unknown platform/cause")
         if platform is not None and row["platform"] != platform:
             raise Refusal("M-FIRST analyze platforms separately")
         platform = row["platform"]
+        generation = row["generation"]
+        if not isinstance(generation, str) or not 1 <= len(generation) <= 128 or not generation.isprintable():
+            raise Refusal("M-FIRST invalid generation identity")
+        if generation in generations:
+            raise Refusal("M-FIRST duplicate generation identity")
+        generations.add(generation)
+        if not isinstance(row["attribution"], str) or row["attribution"] not in {"Owned", "NotOwned", "Unattributable", "Pending"}:
+            raise Refusal("M-FIRST unknown attribution")
+        discard = row["held_input_discarded_at_restart"]
+        if discard is not None and type(discard) is not bool:
+            raise Refusal("M-FIRST invalid restart discard state")
         duration, stop = row["duration_ns"], row["first_stop_ns"]
-        if duration < 0 or (stop is not None and not 0 <= stop <= duration):
+        if not integer(duration) or (stop is not None and (not integer(stop) or stop > duration)):
             raise Refusal("M-FIRST invalid duration")
         if (stop is None) != (row["cause"] is None):
             raise Refusal("M-FIRST censored/stopping cause mismatch")
         pending = row["pending_resolutions"]
-        if set(pending) != {"Armed", "Unarmed", "Tool", "ExitNoDecision"}:
+        if not isinstance(pending, dict) or set(pending) != {"Armed", "Unarmed", "Tool", "ExitNoDecision"}:
             raise Refusal("M-FIRST unknown Pending resolution")
-        if any(n < 0 for n in pending.values()) or sum(pending.values()) != row["pending_count"]:
+        if not integer(row["pending_count"]) or any(not integer(n) for n in pending.values()) or sum(pending.values()) != row["pending_count"]:
             raise Refusal("M-FIRST Pending resolution count mismatch")
-        if not 0 <= row["pending_median_ns"] <= row["pending_max_ns"]:
-            raise Refusal("M-FIRST invalid Pending duration aggregate")
+        mid, maximum, method = (row[name] for name in ("pending_median_ns", "pending_max_ns", "pending_median_method"))
+        if row["pending_count"] == 0:
+            if mid is not None or maximum is not None or method != "none":
+                raise Refusal("M-FIRST zero Pending episodes require null durations and method none")
+        elif (not integer(mid) or not integer(maximum) or not mid <= maximum <= duration
+              or not isinstance(method, str) or method not in {"exact", "fixture-exact"}):
+            raise Refusal("M-FIRST invalid Pending duration aggregate/method")
+        attribution[row["attribution"]] = attribution.get(row["attribution"], 0) + 1
+        discard_key = "unknown" if discard is None else str(discard).lower()
+        discarded[discard_key] = discarded.get(discard_key, 0) + 1
+        aggregates.append({name: row[name] for name in ("generation", "pending_count", "pending_median_ns",
+                                                       "pending_max_ns", "pending_median_method")})
         end = duration if stop is None else stop
         cell = durations.setdefault(end, [0, 0])
         cell[1 if stop is None else 0] += 1
@@ -578,6 +625,8 @@ def first_summary(records):
             median = at
         at_risk -= events + censored
     return {"generations": totals, "median_ns": median, "km": km, "causes": causes,
+            "platform": platform, "attribution": attribution,
+            "held_input_discarded_at_restart": discarded, "pending_aggregates": aggregates,
             "pending_resolutions": resolutions, "status": "observer data, not measured by H-FRX self-check"}
 
 
@@ -627,6 +676,8 @@ def config_text(port, root):
 
 
 def x2_sample(root, children, version, sample, method):
+    if method != "arrival":
+        raise Refusal("UNVERIFIED: cycle-bound instrumented method needs implementation")
     prefix = root / "raw" / f"{version}-{method}-{sample:03d}"
     notice = root / "editor-notice"
     notice.unlink(missing_ok=True)
@@ -640,15 +691,17 @@ def x2_sample(root, children, version, sample, method):
     import fcntl
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
 
-    def controlling_tty():
-        os.setsid()
-        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
-
     # No implicit shell, no print-mode shortcut, no inherited credential env.
+    # TTY setup runs after exec in a fresh Python interpreter, avoiding a
+    # Python preexec callback in the already-threaded provider supervisor.
+    argv = [str(root / "bin/python3"), str(script), "_pty", *argv]
     previous = children.env
     children.env = {**previous, "VISUAL": editor, "EDITOR": editor}
     try:
-        proc = children.spawn(argv, stdin=slave, stdout=slave, stderr=slave, preexec_fn=controlling_tty)
+        proc = children.spawn(argv, stdin=slave, stdout=slave, stderr=slave)
+    except BaseException:
+        os.close(master)
+        raise
     finally:
         children.env = previous
         os.close(slave)
@@ -704,6 +757,8 @@ def x2_sample(root, children, version, sample, method):
 
 
 def run_x2_inner(root, method, samples, network):
+    if method != "arrival":
+        raise Refusal("UNVERIFIED: cycle-bound instrumented method needs implementation")
     env = fixture_env(root)
     preflight(root, env, production_sockets({}))
     pins = pins_recheck(root)
@@ -730,11 +785,6 @@ def run_x2_inner(root, method, samples, network):
                 result["containment"] = network
                 result["endpoint_detection"] = "no unexpected connect found in retained trace"
                 result["frontier_to_flush"] = "needs-implementation: Q35-20a"
-                if method == "instrumented":
-                    result["syscall_pairs"] = syscall_pairs(traces)
-                    result["timing_label"] = ROWS["X2-instrumented"]["label"]
-                    if not result["syscall_pairs"]:
-                        result["status"] = "UNVERIFIED"
                 write_json(root / "raw" / f"{version}-{method}-{sample:03d}.json", result)
                 results.append(result)
                 if result["status"] != "observed":
@@ -744,18 +794,22 @@ def run_x2_inner(root, method, samples, network):
             rows = [row for row in results if row["release"] == version]
             summary[version] = {
                 "master_observed_arrival": distribution(row["arrival_interval_ns"] for row in rows),
-                "instrumented_write_to_flush": distribution(pair["interval_ns"] for row in rows
-                                                             for pair in row.get("syscall_pairs", []))}
+                "instrumented_write_to_flush": "needs-implementation: cycle-bound trace parser"}
         write_json(root / f"X2-{method}.json", {"results": results, "distribution": summary,
                    "host_boundary": plan()["host_boundary"], "policy": "Hold; Codex-only, no daemon"})
     finally:
-        if provider:
-            provider.shutdown()
-            provider.server_close()
-        write_json(root / f"cleanup-{method}.json", {"survivors": children.cleanup()})
+        children.ignore_termination()
+        try:
+            if provider:
+                provider.shutdown()
+                provider.server_close()
+        finally:
+            write_json(root / f"cleanup-{method}.json", {"survivors": children.cleanup()})
 
 
 def run_x2(args):
+    if args.method != "arrival":
+        raise Refusal("UNVERIFIED: cycle-bound instrumented method needs implementation")
     root = Path(args.root).absolute()
     preflight(root, fixture_env(root), production_sockets(os.environ))
     pins = pins_recheck(root)
@@ -773,13 +827,17 @@ def run_x2(args):
             if probe.wait(timeout=3) == 0:
                 network = "network-namespace"
         write_json(root / "run-authorization.json", {"reviewed_commit": args.reviewed_commit,
+                   "executing_script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                   "provenance": "reviewed_commit is operator attestation; digest is current script-file bytes at run entry",
                    "network": network, "host_boundary": plan()["host_boundary"]})
         argv = [str(root / "bin/python3"), str(Path(__file__).resolve()), "_x2",
                 str(root), args.method, str(args.samples), network]
         if network == "network-namespace":
             argv = [*prefix, *argv]
         proc = children.spawn(argv)
-        if proc.wait() != 0:
+        # Bounds the inner startup + series wait; outer Popen/kernel stalls and
+        # cleanup are not covered by this userspace timeout.
+        if proc.wait(timeout=10 + 36 * len(VERSIONS) * args.samples) != 0:
             raise Refusal("X2 child failed; retain artifacts, do not resume this run id")
     finally:
         write_json(root / "cleanup-supervisor.json", {"survivors": children.cleanup()})
@@ -787,6 +845,11 @@ def run_x2(args):
 
 def main():
     # Private modes are used by run-x2, never by dry-run/self-tests.
+    if len(sys.argv) > 2 and sys.argv[1] == "_pty":
+        import fcntl
+        os.setsid()
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+        os.execv(sys.argv[2], sys.argv[2:])
     if len(sys.argv) > 1 and sys.argv[1] == "_editor":
         root = Path(sys.argv[2])
         if root.is_absolute() and (root / "work/.dot-agent-deck.toml").read_text() == FIXTURE:

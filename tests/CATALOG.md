@@ -8730,6 +8730,15 @@ Live real-backend tests in `desktop/src-tauri/tests/voice_phrase_fixtures.rs`, n
 - **Does not assert:** crash/restart delivery, multiple publishers or consumers, filesystem confinement, Codex's tool environment policy, or production editor-probe behavior. The deterministic barriers instrument Python I/O in the check runner; the stand-ins gain no race-control knobs.
 - **Platform coverage:** mac+linux (Python stdlib PTYs and Bash).
 
+#### harness/hfrx
+
+##### harness/hfrx/001 — H-FRX offline safety checks refuse unsafe exports and retain cleanup and reducer evidence.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_hfrx_safety.rs` invoking `scripts/hfrx/test_hfrx.py`); fixture files, mocked launches, synthetic traces and one detached Python stand-in process tree.
+- **Agent:** none; no real agent, mock provider, namespace, container or deck daemon.
+- **Asserts:** preflight refusals, fragmented hex/plain secret detection before export destination creation, export resource limits, exact fixture-key exemption, unavailable container and instrumented methods, repeated-signal cleanup/error retention, PTY spawn-failure closure, post-exec TTY setup, source digest and inner wait timeout, X1 population separation, and M-FIRST validation/censoring/report retention. Missing Linux pidfd/subreaper support fails rather than skips. Self-check fixture storage uses a filesystem-metadata stand-in so overlay CI storage is acceptable; the actual disk preflight is tested with accepted/rejected mount metadata fixtures.
+- **Does not assert:** real-agent timing, namespace prevention, live network behavior, host filesystem isolation, instrumented cycle parsing, a whole-run hard deadline, future helper/frontier/observer integration, or release identity of executable pins. The process-tree control sleeps in lane 1, outside the fast tier.
+- **Platform coverage:** Linux only.
+
 ### Test harness teardown (issue #1566)
 
 #### harness/teardown
