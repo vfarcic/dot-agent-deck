@@ -3574,6 +3574,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** the terminal-attach command's incarnation forwarding, the voice reading start's row check (its settings gate precedes it), or the shown-terminal hook's incarnation key; arbitrary OS randomness collisions or a whole pid-space reuse within one clock tick; whether a replacement killed a detached child process; or compatibility with a previous-release binary.
 - **Platform coverage:** mac+linux.
 
+##### lifecycle/handshake/014 — After a deck restart whose orchestration reuses the pane ids of an orchestration tab the TUI shows, the restarted deck's orchestration gets a tab of its own (issue #1913).
+- **Layer:** unit/in-process (`ui::restart_surface_tests`, `src/ui_restart_surface_tests.rs`): a scripted daemon restarted at the same socket under a new process identity with the same build, the real `EmbeddedPaneController`, `TabManager` and the render loop's surface, pane-closure and restart-drop drains run in the run loop's order.
+- **Agent:** none (the restart fixture's scripted agent; no agent executable or credential).
+- **Asserts:** a tab built for the first process's orchestration goes with the restart notice once the stream reopens on the restarted process and resyncs from its listing, whether the old pane's reattach noticed the restart first or not, whether the old role held a card or not, and when the old slot holds no local pane at all; the restarted orchestration, listed in the same pane id under a new orchestration id, is then shown in its own tab (the Dashboard plus that tab), attached on the restarted process, with one card on the pane and its role placed.
+- **Does not assert:** the PTY-rendered tab bar (no L2 test drives a restart that reuses an orchestration's pane ids), an orchestration with more than one role, or compatibility with a previous-release binary.
+- **Platform coverage:** mac+linux.
+
 #### lifecycle/login-path
 
 ##### lifecycle/login-path/001 — A dashboard new-pane whose command is a bare binary living only in the user's login-shell PATH spawns successfully when the daemon was launched without that dir on PATH (PRD #170 M1.3).
