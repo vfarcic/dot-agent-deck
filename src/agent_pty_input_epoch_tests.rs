@@ -281,7 +281,8 @@ async fn probe_001_a_withdrawn_job_still_moved_the_epoch() {
     assert!(w.input.touched());
 }
 
-/// Scenario: Through the registry, type into a pane's agent, then deliver that agent's prompt report and turn edges; on a second pane deliver the hooks first and type after. The box is touched after the typing in both orders, and no hook changes the epoch.
+/// Scenario: Through the registry, type into a real `cat` pane's agent, then deliver that agent's prompt report and turn edges; on a second pane deliver the hooks first and type after. The box is touched after the typing in both orders, and no hook changes the epoch.
+#[cfg(unix)]
 #[spec("inbox/probe/002")]
 #[tokio::test]
 async fn probe_002_a_prompt_hook_never_empties_a_touched_box() {
@@ -291,7 +292,7 @@ async fn probe_002_a_prompt_hook_never_empties_a_touched_box() {
         ("probe-002-touch-first", false),
         ("probe-002-hooks-first", true),
     ] {
-        let id = registry.insert_test_agent_for_pane(Box::new(IdleTestChild), Some(pane));
+        let id = spawn_on(&registry, pane, "/bin/cat");
         let input = Arc::clone(registry.inner.lock().agents[&id].bus.input());
         let hooks = || {
             registry.note_prompt_report(pane, &id, PromptReport::User("typed"));
@@ -335,32 +336,6 @@ fn probe_060_each_profile_declares_how_b_ends() {
         bus.push(b"\x1b[?2026h\x1b[Hframe".to_vec());
         assert_eq!(!bus.input().backlog(), ends, "{label}: the frame");
     }
-}
-
-/// Scenario: Push a DA1 query through a generation's bus, then write a whole DA1 reply to its pane writer, and a second one. The first reply is exempt and leaves the epoch where it was; the second answers nothing and moves it.
-#[spec("inbox/probe/045")]
-#[tokio::test]
-async fn probe_045_the_bus_and_writer_share_the_generation_ledger() {
-    let registry = Arc::new(AgentPtyRegistry::new());
-    let id = registry.insert_test_agent_for_pane(Box::new(IdleTestChild), Some("probe-045"));
-    let bus = registry.inner.lock().agents[&id].bus.clone();
-    bus.push(b"\x1b[c".to_vec());
-    assert_eq!(bus.input().reply_class(QueryKind::Da1), (true, true));
-    let writer = registry.agent_writer(&id).unwrap();
-    writer
-        .lock()
-        .await
-        .write_user(b"\x1b[?62;22c")
-        .await
-        .unwrap();
-    assert!(!bus.input().touched(), "exempt");
-    writer
-        .lock()
-        .await
-        .write_user(b"\x1b[?62;22c")
-        .await
-        .unwrap();
-    assert_eq!(bus.input().epoch().epoch(), 1, "a duplicate touches");
 }
 
 /// Scenario: Close a generation through the registry after its output asked for a cursor position and it accepted a native Ctrl+G. Its ledger, `B` and hazard FIFO are dropped, it notes and numbers nothing afterwards, its FIFO never reads clear, and its epoch still counts what is written.
@@ -448,7 +423,7 @@ fn spawn_on(registry: &Arc<AgentPtyRegistry>, pane: &str, command: &str) -> Stri
         .expect("spawn on the pane")
 }
 
-/// Scenario: Restart a `cat` pane through the registry, and on another pane spawn a new agent over one whose process already exited, after each predecessor accepted a native Ctrl+G. Both predecessors' hazard FIFOs are dropped and they number nothing afterwards, while each successor starts with an empty FIFO of its own.
+/// Scenario: Restart a `cat` pane through the registry, and on another pane spawn a new agent over one whose process (`sh -c 'exit 0'`) already exited, after each predecessor accepted a native Ctrl+G. Both predecessors' hazard FIFOs are dropped and they number nothing afterwards, while each successor starts with an empty FIFO of its own.
 #[cfg(unix)]
 #[spec("inbox/probe/052")]
 #[tokio::test]
@@ -470,7 +445,7 @@ async fn probe_052_a_successor_retires_its_predecessor_input() {
     assert!(new.hazards_clear(now), "a fresh FIFO");
 
     let pane = "probe-052-exited";
-    let exited = spawn_on(&registry, pane, "/bin/true");
+    let exited = spawn_on(&registry, pane, "sh -c 'exit 0'");
     let old = input_of(&exited);
     assert_eq!(old.accept_native(now), Some(1));
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -502,6 +477,7 @@ async fn probe_045_a_spawned_generation_shares_one_input() {
     let id = spawn_on(&registry, "probe-045-spawned", "/bin/cat");
     let bus = registry.inner.lock().agents[&id].bus.clone();
     bus.push(b"\x1b[c".to_vec());
+    assert_eq!(bus.input().reply_class(QueryKind::Da1), (true, true));
     let writer = registry.agent_writer(&id).unwrap();
     writer
         .lock()
