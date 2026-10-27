@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use chrono::{TimeZone, Timelike, Utc};
 use dot_agent_deck::issue_dispatch::{
     ClaimIdentity, IssueClaimRecord, claim_host_id, parse_issue_claim_records,
 };
@@ -140,11 +141,15 @@ fn log(daemon: &common::DaemonProc) -> String {
     common::redact_credentials_for_output(&std::fs::read_to_string(path).unwrap_or_default())
 }
 
-fn schedule(name: &str, workspace: &Path) -> String {
+fn schedule(name: &str, workspace: &Path, now: chrono::DateTime<Utc>) -> String {
+    // Keep the hourly gap (and its valid 3h TTL), but put the next cron tick
+    // 29–30 minutes away, beyond DaemonProc's 300-second lifetime backstop.
+    // The daemon uses TZ=UTC so its Local clock matches this calculation.
+    let minute = (now.minute() + 30) % 60;
     format!(
         r#"[[scheduled_tasks]]
 name = "{name}"
-cron = "0 * * * *"
+cron = "{minute} * * * *"
 working_dir = {workspace}
 prompt = "TWO-DECK-CLAIM-{{{{issue_number}}}}"
 enabled = true
@@ -198,10 +203,11 @@ fn spawn_deck(
     std::fs::create_dir(&workspace).expect("create deck workspace");
     let starts = workspace.join("agent-starts");
     let daemon = common::spawn_daemon_serve_with_env(
-        Some(&schedule(name, &workspace)),
+        Some(&schedule(name, &workspace, Utc::now())),
         "0",
         &[
             ("PATH", path),
+            ("TZ", "UTC"),
             ("GITHUB_TOKEN", token),
             ("TWO_DECK_AGENT_STARTS", starts.to_str().unwrap()),
             ("GIT_AUTHOR_NAME", "Two Deck Test"),
@@ -214,10 +220,17 @@ fn spawn_deck(
 }
 
 fn fire_and_wait(daemon: &common::DaemonProc, name: &str, outcome: &str) {
-    let reply = daemon
-        .run_now(name)
-        .expect("RunNow over isolated attach socket");
-    assert!(reply.ok, "RunNow rejected: {:?}", reply.error);
+    let reply = daemon.run_now(name).unwrap_or_else(|error| {
+        panic!(
+            "RunNow {name} over isolated attach socket failed: {}",
+            common::redact_credentials_for_output(&error.to_string())
+        )
+    });
+    assert!(
+        reply.ok,
+        "RunNow {name} rejected: {}",
+        common::redact_credentials_for_output(&format!("{:?}", reply.error))
+    );
     assert!(
         daemon.wait_for_stderr_contains(outcome, common::load_scaled(Duration::from_secs(90))),
         "schedule {name} must report {outcome:?}; daemon log:\n{}",
@@ -227,9 +240,25 @@ fn fire_and_wait(daemon: &common::DaemonProc, name: &str, outcome: &str) {
 
 /// Scenario: Fire deck A against permanent live GitHub issue #2, then fire isolated deck B with a different schedule and claim gating enabled.
 /// A dispatches a local stand-in and writes its claim; B reports A as the claimant without spawning or writing a B record, and A's next fire skips its existing worktree.
+/// Check the fixture's cron at each minute boundary so scheduled ticks cannot race the manual fires during a daemon's bounded lifetime.
 #[spec("scheduler/dispatch/041")]
 #[test]
 fn dispatch_041_two_decks_gate_on_live_github_claim() {
+    for minute in 0..60 {
+        let now = Utc.with_ymd_and_hms(2026, 10, 27, 23, minute, 59).unwrap();
+        let config: toml::Value =
+            toml::from_str(&schedule(SCHEDULE_A, Path::new("/fixture"), now)).unwrap();
+        let cron = config["scheduled_tasks"][0]["cron"].as_str().unwrap();
+        let next = dot_agent_deck::scheduler::parse_cron(cron)
+            .unwrap()
+            .after(&now)
+            .next()
+            .unwrap();
+        assert!(
+            next > now + chrono::Duration::minutes(5),
+            "fixture cron {cron:?} can auto-fire at {next} during the daemon's 300-second lifetime after {now}"
+        );
+    }
     let preflight = github_preflight();
     skip_unless!(preflight.clone().map(|_| ()));
     let token = preflight.unwrap();
@@ -265,10 +294,6 @@ fn dispatch_041_two_decks_gate_on_live_github_claim() {
 
     let path = stand_in_path(scratch.path());
     let (a, workspace_a, starts_a) = spawn_deck(scratch.path(), SCHEDULE_A, &path, &token);
-    let (b, workspace_b, starts_b) = spawn_deck(scratch.path(), SCHEDULE_B, &path, &token);
-    assert_ne!(a.home, b.home);
-    assert_ne!(a.attach_socket, b.attach_socket);
-    assert_ne!(a.hook_socket, b.hook_socket);
 
     fire_and_wait(&a, SCHEDULE_A, "dispatched issue #2");
     let agents_a = a.agent_records();
@@ -311,6 +336,10 @@ fn dispatch_041_two_decks_gate_on_live_github_claim() {
     );
     let launches_a = std::fs::read_to_string(&starts_a).expect("A launch ledger");
 
+    let (b, workspace_b, starts_b) = spawn_deck(scratch.path(), SCHEDULE_B, &path, &token);
+    assert_ne!(a.home, b.home);
+    assert_ne!(a.attach_socket, b.attach_socket);
+    assert_ne!(a.hook_socket, b.hook_socket);
     fire_and_wait(&b, SCHEDULE_B, "claimed by");
     let b_log = log(&b);
     let claimant = format!(
@@ -369,7 +398,12 @@ fn dispatch_041_two_decks_gate_on_live_github_claim() {
         launches_a,
         "A's refire must not execute another stand-in"
     );
-    assert!(!log(&a).contains("claim_gating is OFF"));
-    assert!(!b_log.contains("claim_gating is OFF"));
+    for daemon in [&a, &b] {
+        let daemon_log = log(daemon);
+        assert!(
+            !daemon_log.contains("[scheduler] warning:"),
+            "claim-gated schedules must load without scheduler warnings; log:\n{daemon_log}"
+        );
+    }
     // DaemonProc drops by captured pid/process group; keep claims and labels.
 }
