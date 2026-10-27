@@ -599,7 +599,7 @@ fn idle_worker_026_response_clocks_start_after_deferred_pointer() {
     route::idle_clock(26);
 }
 
-/// Scenario: Supersede an unacknowledged task with a newer one. The newer task starts no idle clock until its own acknowledgement, then one bound idle notice reaches the orchestrator inbox.
+/// Scenario: Supersede an unacknowledged task with a newer one. The newer task starts no idle clock until its own acknowledgement; inbox samples completed within 250 ms of the acknowledgement request remain silent, then one bound idle notice reaches the orchestrator inbox.
 #[spec("scheduler/idle-worker/027")]
 #[test]
 fn idle_worker_027_queued_delegate_clocks_start_after_its_pointer() {

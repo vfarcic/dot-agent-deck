@@ -1,5 +1,61 @@
 # Changelog
 
+## [0.49.2] - 2026-10-27
+
+### Added
+
+- **Find an orchestration's orchestrator, and message it from outside**
+  An agent outside an orchestration, such as a standalone agent, a dispatched unit or an agent in another orchestration, can now find that orchestration's orchestrator and send it a message through the deck, instead of guessing which pane leads the team.
+  `dot-agent-deck roles` lists the live agents with their folder, orchestration, role and which one is each orchestration's orchestrator, as a table or with `--json`; `--folder` and `--orchestration` narrow the listing. `dot-agent-deck inbox send --folder <path>` or `--orchestration <name>` (or both) with `--text` or `--file` messages that orchestration's orchestrator. A folder reaches the orchestration in it or in its nearest parent folder, an address that matches several orchestrations is refused with the candidates listed, and a message never goes to a worker in the orchestrator's place. With `--folder` alone and no orchestration there, the one standalone agent there receives it, which is how an orchestrator answers a standalone agent. The recipient sees the pane the message came from, then the sender's folder, orchestration and role, a reply command the deck has checked reaches the sender, and the sender's text, all marked as untrusted. Each agent's sends count toward the same per-minute limit as its `inbox publish` and `inbox offer` messages. A worker still reports to its own orchestrator with `work-done`, and `inbox send` refuses one that addresses its own orchestration.
+  The TUI's orchestration sidebar now marks the orchestrator's card with an `ORCHESTRATOR` badge, as the desktop app already did, on a line of its own when the card is too narrow for it beside the agent's type and name. The orchestrator's startup instructions and the role library's worker prompts state the convention: agents message an orchestration's orchestrator, never another worker.
+  See [Messaging an orchestrator from outside](https://agent-deck.devopstoolkit.ai/docs/orchestration.md#messaging-an-orchestrator-from-outside).
+
+### Fixed
+
+- **Homebrew upgrades find a new release straight away, and the desktop app is upgraded before the CLI**
+  Upgrading a CLI installed with Homebrew now refreshes Homebrew's copy of the tap with `brew update` before it runs `brew upgrade`, for the stable and the beta formula alike. A release published a few hours earlier used to read as `Homebrew does not offer v<new> yet. Try again later.` because Homebrew had not looked at the tap since before the release. This applies to `dot-agent-deck upgrade`, the TUI's upgrade dialog and the desktop app's. If the CLI still reports the old version afterwards, the result gives the command to run, such as `/opt/homebrew/bin/brew update && /opt/homebrew/bin/brew upgrade dot-agent-deck`, with the same `brew` the upgrade used, and includes the error when `brew update` itself failed. A `brew update` that does not finish stops the upgrade instead of running `brew upgrade` beside it.
+  When the desktop app is behind too and can upgrade itself, **Upgrade** on the Dashboard's **Local daemon** section now leads with the app's upgrade, then offers the CLI's. Once the app is replaced, the dialog ends at **Relaunch**, and the relaunched app restarts an older daemon on this machine onto the new release. Before, it upgraded only the CLI, which left the old app talking to a newer daemon. `dot-agent-deck upgrade` and the TUI's upgrade dialog now offer the desktop app before the CLI as well, so all three ask in the same order.
+  See [What upgrading does for each install method](https://agent-deck.devopstoolkit.ai/docs/installation.md#what-upgrading-does-for-each-install-method) and [Upgrade the CLI and the daemon on this machine](https://agent-deck.devopstoolkit.ai/docs/desktop/daemons.md#upgrade-the-cli-and-the-daemon-on-this-machine).
+
+
+
+## [0.49.1] - 2026-10-27
+
+### Added
+
+- **Tokens, cost estimate and how each agent run ended, in its telemetry**
+  With telemetry export on, each agent run's `agent.run` span now says how many tokens the run used on which model, what that would cost at list price, how much of a Codex plan's allowance it took, and how it ended: completed, failed (with the kind of failure, such as `rate_limit`, and the provider's HTTP status), interrupted or unknown. A `deck.model_usage` event per model carries that model's tokens and cost estimate, and a command the deck does not recognise as an agent ends by its exit status, which the run now also carries as `deck.run.exit_code`.
+  The figures are the agents' own, for Claude Code, Codex, OpenCode and Pi, and every value says where it came from: reported by the agent, estimated, measured by the deck, or unavailable with the reason. A value that is not known is left out rather than sent as 0, so a subscription's cost of 0 is sent as unavailable (`subscription_zero`), and a cost is always an estimate, never a charge. Codex's allowance figures are its plan's, so runs that overlap in one window share them. Devin usage is unavailable: its reported token counts have not been verified against a signed-in session; missing values are not zero. Error messages, prompts and replies are never sent, and a model name is sent only when the deck recognises it as a known model's name. Exit Claude Code with `/exit` for its totals to be recorded. The TUI and the desktop app do not show these figures; they are in your backend.
+  See [What a run used and how it ended](https://agent-deck.devopstoolkit.ai/docs/telemetry.md#what-a-run-used-and-how-it-ended).
+- **The TUI Says When It Changed Your Agents' Hooks**
+  When the TUI starts, it installs or repairs the deck's hooks for every agent it finds. It now tells you when that changed something: the status line reads, for example, `Installed or repaired the deck's hooks for Claude Code and Codex.` for a few seconds, and says nothing when the hooks were already current.
+  When it cannot update an agent's hooks, for example because `~/.claude/settings.json` is not valid JSON, the deck leaves the file exactly as it was, and the status line gives the reason: `Claude Code's hooks could not be updated: <reason>.` The same line is printed when you quit the TUI. Fix what it names, then start the TUI again or run `dot-agent-deck hooks refresh`.
+  The desktop app runs the same install when it starts its daemon but does not show either note yet; run `dot-agent-deck hooks refresh` to check the hooks.
+  See [Installation → Agent hooks](https://agent-deck.devopstoolkit.ai/docs/installation.md#agent-hooks).
+
+### Fixed
+
+- **Checking Codex's hooks no longer sends telemetry under `codex-app-server`**
+  With telemetry export on and Codex installed, the deck's own check of Codex's hooks, which runs `codex app-server` briefly, passed your `OTEL_*` variables to it, so your backend received traces from a `codex-app-server` service you never ran. That check now runs without them. Codex sessions you or your agents start are unchanged.
+- **The deck no longer waits on a slow Codex when it starts**
+  On a machine with Codex installed, the deck sets up Codex's hooks every time it starts, and part of that asks Codex which hooks it has. When Codex was slow to answer, or never did, the deck waited up to 5 seconds before the dashboard appeared, and the desktop app waited as long to connect to a deck it had just started. The deck now starts without waiting for that answer. Codex's hooks are still installed at start, and recording that Codex may run them finishes in the background. A Codex you start in a deck pane is unaffected: the deck still records that before Codex launches.
+- **A worker's response time starts when it receives its task**
+  The `A delegated worker has not responded with work-done` report could reach the orchestrator early when the deck took a while to hand a task over, for example while it restarted a `clear = true` worker: that time was counted against the worker. Now the worker gets the whole `worker_response_timeout_minutes` from the moment it receives its task.
+  See [Idle Workers & Notifications](https://agent-deck.devopstoolkit.ai/docs/idle-workers-and-notifications.md).
+- **A Local Upgrade Keeps the Daemon Service Running**
+  When the daemon runs as the service `dot-agent-deck daemon install` sets up (a systemd user unit or a LaunchAgent, or one you wrote yourself), restarting it onto a new build from this machine no longer leaves that service stopped. The TUI's version check when it starts, and the desktop app's **Replace** for the daemon on this machine, now hand the daemon back to its service, and the service manager starts the new build, as it already did after a remote upgrade. Before, the service stayed stopped and the app ran a daemon of its own in its place until you started the service again by hand.
+  This needs the build installed at the service's path to be the app's version. When it is another one, such as a desktop app newer than the CLI it runs beside, the app starts its own daemon as before. See [Run the daemon as a service](https://agent-deck.devopstoolkit.ai/docs/daemon-service.md).
+- **The desktop app lets go of a closed agent's terminal output**
+  The desktop app kept up to a megabyte of terminal output for every agent it had ever shown, including agents that were closed and agents a daemon restart stopped, so its memory use grew until you reloaded the window. It now lets go of an agent's output once the agent's deck, while connected, no longer lists that agent. A deck that is not answering keeps its agents' output until it answers again.
+
+### Miscellaneous
+
+- **Homebrew Installs the Resource Collector on Linux**
+  On Linux, the Homebrew formula (`dot-agent-deck`, and the `dot-agent-deck-beta` pre-release formula) now installs `dot-agent-deck-collector`, the program that reports each run's CPU, memory and disk, next to `dot-agent-deck`, so you no longer download it by hand. `brew upgrade dot-agent-deck` (or `brew upgrade dot-agent-deck-beta`) adds it to an existing install and upgrades it with the deck from then on. The collector does nothing until you start it. On macOS the formula still installs only the deck, since the collector does not run there.
+  See [CPU, memory and disk per run](https://agent-deck.devopstoolkit.ai/docs/telemetry.md#cpu-memory-and-disk-per-run) for how to start it.
+
+
+
 ## [0.49.0] - 2026-10-26
 
 ### Changed

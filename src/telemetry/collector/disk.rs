@@ -419,8 +419,10 @@ fn before_open(_name: &OsStr) {
     });
 }
 
-/// Open directories and `*at` calls over them.
-mod fd {
+/// Open directories and `*at` calls over them. PRD #1858's usage readers
+/// open their files through [`fd::open_dir_no_symlinks`] and
+/// [`fd::open_beneath_at`] too, so the deck has one `openat2` wrapper.
+pub(crate) mod fd {
     use std::ffi::{CStr, CString};
     use std::io;
     use std::os::unix::ffi::OsStrExt;
@@ -515,6 +517,7 @@ mod fd {
                 name,
                 OPEN_DIR,
                 RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH | RESOLVE_NO_XDEV,
+                0,
             ) {
                 return Ok((Dir::from_fd(opened?)?, OpenedBy::Openat2));
             }
@@ -753,7 +756,7 @@ mod fd {
         {
             let whole = CString::new(path.as_os_str().as_bytes())
                 .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-            if let Some(opened) = openat2(libc::AT_FDCWD, &whole, flags, RESOLVE_NO_SYMLINKS) {
+            if let Some(opened) = openat2(libc::AT_FDCWD, &whole, flags, RESOLVE_NO_SYMLINKS, 0) {
                 return opened.map(Fd);
             }
         }
@@ -791,6 +794,80 @@ mod fd {
         Ok(dir)
     }
 
+    /// `path`, opened as a directory with no component of it followed when
+    /// it is a symlink ([`open_beneath`]), for the caller to keep.
+    pub fn open_dir_no_symlinks(path: &Path) -> io::Result<std::os::fd::OwnedFd> {
+        use std::os::fd::FromRawFd as _;
+        let fd = open_beneath(path, OPEN_DIR)?.into_raw();
+        // SAFETY: `fd` is an open descriptor that nothing else owns.
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// `rel`, a path of plain names, opened with `flags` (and `mode`, when
+    /// `flags` creates it) beneath the open directory `dir`, no component of
+    /// it followed when it is a symlink and none climbing out of `dir`. On
+    /// Linux `openat2` resolves it with `RESOLVE_BENEATH` and
+    /// `RESOLVE_NO_SYMLINKS` in one call; otherwise, or where `openat2` is
+    /// unavailable, it is opened one component at a time, each relative to
+    /// the one before it with `O_NOFOLLOW`, starting from `dir`. `flags`
+    /// should carry `O_NOFOLLOW` for the fallback's last component.
+    pub fn open_beneath_at(
+        dir: std::os::fd::BorrowedFd<'_>,
+        rel: &Path,
+        flags: libc::c_int,
+        mode: libc::mode_t,
+    ) -> io::Result<std::os::fd::OwnedFd> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        let mut names = Vec::new();
+        for component in rel.components() {
+            match component {
+                Component::Normal(name) => names.push(
+                    CString::new(name.as_bytes())
+                        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?,
+                ),
+                _ => return Err(io::Error::from(io::ErrorKind::InvalidInput)),
+            }
+        }
+        let Some((last, parents)) = names.split_last() else {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        };
+        #[cfg(target_os = "linux")]
+        {
+            let whole = CString::new(rel.as_os_str().as_bytes())
+                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+            if let Some(opened) = openat2(
+                dir.as_raw_fd(),
+                &whole,
+                flags,
+                RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH,
+                mode,
+            ) {
+                // SAFETY: `openat2` returned a descriptor nothing else owns.
+                return opened.map(|fd| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+            }
+        }
+        let mut parent: Option<Fd> = None;
+        for name in parents {
+            let at = parent.as_ref().map_or(dir.as_raw_fd(), |p| p.0);
+            // SAFETY: `name` is a NUL-terminated string and `at` is open.
+            parent = Some(Fd(check(unsafe {
+                libc::openat(at, name.as_ptr(), OPEN_PATH)
+            })?));
+        }
+        let at = parent.as_ref().map_or(dir.as_raw_fd(), |p| p.0);
+        // SAFETY: as above; `mode` is passed as `openat`'s variadic mode.
+        let fd = check(unsafe {
+            libc::openat(
+                at,
+                last.as_ptr(),
+                flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::c_uint::from(mode),
+            )
+        })?;
+        // SAFETY: `openat` returned a descriptor nothing else owns.
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+    }
+
     #[cfg(target_os = "linux")]
     const RESOLVE_NO_XDEV: u64 = 0x01;
     #[cfg(target_os = "linux")]
@@ -817,6 +894,7 @@ mod fd {
         name: &CStr,
         flags: libc::c_int,
         resolve: u64,
+        mode: libc::mode_t,
     ) -> Option<io::Result<libc::c_int>> {
         use std::sync::atomic::Ordering;
         #[cfg(test)]
@@ -835,7 +913,7 @@ mod fd {
         }
         let how = OpenHow {
             flags: flags as u64,
-            mode: 0,
+            mode: u64::from(mode),
             resolve,
         };
         // SAFETY: `name` is NUL-terminated and `how` is an `open_how` of the

@@ -138,6 +138,8 @@ pub mod login_shell;
 // PRD #1223 M2: what the daemon reports about itself to a new-agent form.
 pub mod new_agent_options;
 pub mod opencode_manage;
+// Issue #1947: finding and messaging an orchestration's orchestrator.
+pub mod orchestrator_address;
 pub mod orchestrator_context;
 pub mod orchestrator_ext;
 pub mod osc52;
@@ -170,6 +172,7 @@ pub mod remote_tunnel;
 pub mod repo_identity;
 pub mod report_recovery;
 pub mod retained_store;
+pub mod roles_cli;
 pub mod schedule_cli;
 // Issue #1635: upgrading this machine's CLI and desktop app in place.
 pub mod scheduler;

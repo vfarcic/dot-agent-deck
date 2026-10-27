@@ -354,6 +354,8 @@ pub enum Sender {
     Agent {
         pane_id: String,
         agent_id: String,
+        /// The sender's role, or [`crate::orchestrator_address::SENDER_ROLE`]
+        /// for a message sent with `inbox send`, which no configured role is.
         role: Option<String>,
         orchestration: Option<String>,
     },
@@ -1015,6 +1017,33 @@ impl Inbox {
         content: Content,
     ) -> Result<MessageId, PostError> {
         self.admit_direct(now, &to, &content)?;
+        Ok(self.insert_direct(now, to, content))
+    }
+
+    /// Issue #1947: [`Self::admit_direct`] for a message one agent sends
+    /// another directly (`dot-agent-deck inbox send`), which also counts
+    /// against the sender's per-agent quota, as a publish or an offer does.
+    pub fn admit_agent_direct(
+        &mut self,
+        now: Instant,
+        to: &Recipient,
+        content: &Content,
+    ) -> Result<(), PostError> {
+        self.check_rate(now, &content.from)?;
+        self.admit_direct(now, to, content)
+    }
+
+    /// Issue #1947: [`Self::post_direct`] for a message one agent sends
+    /// another directly: refused once the sender's quota is spent, and
+    /// counted against it when it goes in.
+    pub fn post_agent_direct(
+        &mut self,
+        now: Instant,
+        to: Recipient,
+        content: Content,
+    ) -> Result<MessageId, PostError> {
+        self.admit_agent_direct(now, &to, &content)?;
+        self.record_rate(now, &content.from);
         Ok(self.insert_direct(now, to, content))
     }
 
@@ -3401,6 +3430,57 @@ mod tests {
                 from_agent("2", "a2"),
                 &to,
             )
+            .unwrap();
+    }
+
+    /// Issue #1947: a message one agent sends another directly shares the
+    /// sender's quota with its publishes, is refused at admission once it is
+    /// spent, and a new generation of the sender has its own. The deck's own
+    /// direct posts stay unlimited.
+    #[test]
+    fn an_agent_direct_message_counts_against_the_senders_quota() {
+        let t0 = Instant::now();
+        let mut inbox = inbox_with(InboxLimits {
+            rate_per_minute: 2,
+            ..InboxLimits::default()
+        });
+        let to = Recipient::bound("3", "a3");
+        inbox
+            .publish(
+                t0,
+                scope(),
+                "t",
+                from_agent("2", "a2"),
+                std::slice::from_ref(&to),
+            )
+            .unwrap();
+        inbox
+            .post_agent_direct(t0, to.clone(), from_agent("2", "a2"))
+            .unwrap();
+        let limited = Err(PostError::RateLimited {
+            limit_per_minute: 2,
+        });
+        assert_eq!(
+            inbox.admit_agent_direct(t0, &to, &from_agent("2", "a2")),
+            limited
+        );
+        assert_eq!(
+            inbox
+                .post_agent_direct(t0, to.clone(), from_agent("2", "a2"))
+                .map(|_| ()),
+            limited
+        );
+        assert_eq!(inbox.list("3").len(), 2);
+        // The same pane's next agent is a new sender.
+        inbox
+            .post_agent_direct(t0, to.clone(), from_agent("2", "a2-next"))
+            .unwrap();
+        for _ in 0..3 {
+            inbox.post_direct(t0, to.clone(), from_deck()).unwrap();
+        }
+        inbox.tick(t0 + Duration::from_secs(60));
+        inbox
+            .post_agent_direct(t0 + Duration::from_secs(60), to, from_agent("2", "a2"))
             .unwrap();
     }
 

@@ -17666,19 +17666,16 @@ mod tests {
             .expect("spawn stand-in")
     }
 
-    /// PRD #1666 part 3 (#1939's diagnosis): the idle-worker clock starts at
-    /// the worker's acknowledgement (`scheduler/idle-worker/026`), so what a
-    /// dispatch does between taking the pane's locks and posting the task
-    /// (config, the task file, a `clear = true` restart) is not counted
-    /// against the worker. The dispatch is held there, at
-    /// `CLEAR_RESPAWNED_GATES`, for most of the timeout: the watch must hold
-    /// meanwhile, and once the task is acknowledged it is due a whole timeout
-    /// after that, which is when the notice arrives.
+    /// Scenario: A dispatch spends most of the response timeout preparing a task,
+    /// then the worker fetches and acknowledges it. The watch holds during
+    /// preparation and the orchestrator's notice arrives after at least a full
+    /// timeout from acknowledgement (`scheduler/idle-worker/026`, #1939).
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn the_idle_clock_starts_at_acknowledgement_not_at_dispatch() {
         const TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1_500);
         const HELD: std::time::Duration = std::time::Duration::from_millis(1_000);
+        const PROGRESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
         let registry = Arc::new(AgentPtyRegistry::new());
         let orch = stand_in_in(&registry, "ic-orch", None);
         let worker = stand_in_in(&registry, "ic-worker", None);
@@ -17715,7 +17712,10 @@ mod tests {
             None,
             None,
         ));
-        reached.await.expect("the dispatch reaches the gate");
+        tokio::time::timeout(PROGRESS_TIMEOUT, reached)
+            .await
+            .expect("the dispatch reaches the gate within the progress timeout")
+            .expect("the dispatch signals that it reached the gate");
         let clock = registry
             .delegation_idle_clock("ic-worker", seq)
             .expect("the record is live");
@@ -17725,7 +17725,10 @@ mod tests {
         );
         tokio::time::sleep(HELD).await;
         go.send(()).unwrap();
-        dispatch.await.unwrap();
+        tokio::time::timeout(PROGRESS_TIMEOUT, dispatch)
+            .await
+            .expect("the dispatch completes within the progress timeout after gate release")
+            .expect("the dispatch task succeeds");
 
         let before_ack = std::time::Instant::now();
         let taken = registry.inbox().test_hook_fetch("ic-worker", &worker, None);
@@ -17737,7 +17740,7 @@ mod tests {
             crate::inbox::AckHow::Explicit,
         );
         registry.inbox().test_hook_close(taken);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + PROGRESS_TIMEOUT;
         let clock = loop {
             let clock = registry
                 .delegation_idle_clock("ic-worker", seq)
@@ -17751,6 +17754,9 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         };
+        // Dispatch time is sampled before the queue ends, slightly overlapping
+        // the two intervals. Contention may conservatively delay the notice;
+        // the guarantee is at least a full timeout after acknowledgement.
         let due = clock.armed_at + TIMEOUT + clock.pointer_queued_for + clock.pointer_deferred;
         assert!(
             due >= before_ack + TIMEOUT,
@@ -17765,7 +17771,7 @@ mod tests {
                 .iter()
                 .any(|m| m.subject == "worker has not responded")
         };
-        let deadline = before_ack + TIMEOUT + std::time::Duration::from_secs(10);
+        let deadline = before_ack + TIMEOUT + PROGRESS_TIMEOUT;
         while !notified(&registry) {
             assert!(
                 std::time::Instant::now() < deadline,

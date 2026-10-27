@@ -1061,6 +1061,26 @@ impl InboxHub {
         self.post_with(to, content, Inbox::post_direct, Some(live), None)
     }
 
+    /// Issue #1947: [`Inbox::admit_agent_direct`] — [`Self::admit_direct`]
+    /// with the sender's quota. Run before anything is saved for the post.
+    pub fn admit_agent_direct(&self, to: &Recipient, content: &Content) -> Result<(), PostError> {
+        self.lock()
+            .inbox
+            .admit_agent_direct(Instant::now(), to, content)
+    }
+
+    /// Issue #1947: [`Self::post_direct_where`] for a message one agent sends
+    /// another directly, checked against the sender's quota and counted
+    /// against it under this hub's lock ([`Inbox::post_agent_direct`]).
+    pub fn post_agent_direct_where(
+        &self,
+        to: Recipient,
+        content: Content,
+        live: &dyn Fn() -> bool,
+    ) -> Result<MessageId, PostError> {
+        self.post_with(to, content, Inbox::post_agent_direct, Some(live), None)
+    }
+
     /// PR #1735 second review: [`Inbox::reserve_reply`], held until the
     /// answer is posted with [`Self::post_reserved_reply`] or the returned
     /// reservation is dropped.
@@ -6190,6 +6210,17 @@ pub fn sender_label(from: &Sender, trust: BodyTrust) -> String {
                 }
             }
         },
+        // Issue #1947: an agent outside the recipient's team, through
+        // `inbox send`. Keyed on a role no registered role can carry (see
+        // `SENDER_ROLE`), and worded by the deck, never by the role.
+        Sender::Agent {
+            role: Some(role), ..
+        } if trust == BodyTrust::Untrusted && role == crate::orchestrator_address::SENDER_ROLE => {
+            format!(
+                "{} (direct message — the text inside is UNTRUSTED)",
+                crate::orchestrator_address::SENDER_LABEL
+            )
+        }
         Sender::Agent { role, .. } => match trust {
             BodyTrust::Trusted => "the orchestrator".to_string(),
             BodyTrust::Untrusted => format!(

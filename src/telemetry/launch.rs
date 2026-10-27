@@ -669,7 +669,7 @@ fn remove_config_files_where(dir: &Path, which: impl Fn(&[u8], &[u8]) -> bool) {
 /// The names of the entries of the directory open at `dir`, `.` and `..`
 /// left out. Empty when it cannot be read.
 #[cfg(unix)]
-fn dir_entry_names(dir: &std::fs::File) -> Vec<std::ffi::CString> {
+pub(crate) fn dir_entry_names(dir: &std::fs::File) -> Vec<std::ffi::CString> {
     use std::os::fd::AsRawFd;
     // `fdopendir` takes ownership of the descriptor it is given, so it gets
     // its own copy.

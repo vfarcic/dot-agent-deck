@@ -3507,6 +3507,72 @@ impl DaemonClient {
         }
     }
 
+    /// Issue #1947 — send [`AttachRequest::AddressedMessage`] and return the
+    /// daemon's report. Refusals are in the report, not an error.
+    ///
+    /// Shaped like [`Self::close_agents`], for the same reasons: one
+    /// connection for the capability check and the request, connect-only, and
+    /// **a daemon that does not advertise
+    /// [`crate::daemon_protocol::CAP_ADDRESSED_MESSAGE`] is a HARD error
+    /// ([`CloseAgentsError::TooOld`])**, with nothing sent. An agent told its
+    /// message went nowhere can say so; one told nothing would believe it
+    /// arrived.
+    pub async fn addressed_message(
+        &self,
+        address: crate::orchestrator_address::MessageAddress,
+        caller: crate::daemon_protocol::CallerClaim,
+        body: String,
+    ) -> Result<crate::orchestrator_address::AddressedMessageReport, CloseAgentsError> {
+        let (mut rd, mut wr) = self
+            .connect()
+            .await
+            .map_err(CloseAgentsError::Unreachable)?;
+        let hello = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::Hello {
+                client_version: crate::daemon_protocol::PROTOCOL_VERSION,
+                client_build_version: None,
+                follow_on: true,
+            },
+        )
+        .await
+        .map_err(CloseAgentsError::Client)?;
+        if !hello.ok {
+            return Err(CloseAgentsError::Client(ClientError::Server(
+                hello
+                    .error
+                    .unwrap_or_else(|| "handshake failed before send".into()),
+            )));
+        }
+        let capabilities = DaemonCapabilities::from_hello(&hello);
+        if !capabilities.supports(crate::daemon_protocol::CAP_ADDRESSED_MESSAGE)
+            || !capabilities.supports(crate::daemon_protocol::CAP_HELLO_FOLLOW_ON)
+        {
+            return Err(CloseAgentsError::TooOld {
+                daemon_version: hello.daemon_version.or(hello.build_version),
+            });
+        }
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::AddressedMessage {
+                address,
+                caller,
+                body,
+            },
+        )
+        .await
+        .map_err(CloseAgentsError::Client)?;
+        match resp.addressed_message {
+            Some(report) => Ok(report),
+            None => Err(CloseAgentsError::Client(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "the daemon answered send with no report".into()),
+            ))),
+        }
+    }
+
     /// Stop agent `id`. On a gated handle the request goes only to a daemon
     /// admitted on its own connection (PRD #1666 part 2): agent ids are a
     /// per-daemon counter, so a replacement the client would refuse may hold an
@@ -5743,6 +5809,116 @@ mod tests {
             follow_on_bytes.load(Ordering::SeqCst),
             0,
             "advertised {advertised:?}: no follow-on bytes may follow the handshake"
+        );
+        drop(dir);
+    }
+
+    /// Issue #1947 — `inbox send` against a daemon that does not advertise
+    /// `addressed-message` (or `hello-follow-on`) is a HARD error, exit 2, and
+    /// nothing but the handshake reaches the socket: no frame follows the
+    /// Hello on its connection, and no other connection carries one.
+    #[cfg(unix)]
+    #[test]
+    fn addressed_message_is_refused_hard_by_a_daemon_that_does_not_advertise_it() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build older-daemon runtime");
+        runtime.block_on(async {
+            for advertised in [
+                None,
+                Some(&[crate::daemon_protocol::CAP_CLOSE_AGENTS][..]),
+                Some(&[crate::daemon_protocol::CAP_ADDRESSED_MESSAGE][..]),
+            ] {
+                addressed_message_withheld_inner(advertised).await;
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    async fn addressed_message_withheld_inner(advertised: Option<&'static [&'static str]>) {
+        let (dir, path, listener) = {
+            let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("older-daemon.sock");
+            let listener = bind_attach_listener(&path).expect("bind older daemon");
+            (dir, path, listener)
+        };
+        let other_requests = Arc::new(AtomicUsize::new(0));
+        let server_other_requests = other_requests.clone();
+        // Review 5: the client sends its request on the connection that
+        // carried the Hello, so the fake daemon keeps each connection open and
+        // reads every frame on it until the client hangs up, counting any
+        // frame after the Hello.
+        let server = tokio::spawn(async move {
+            while let Ok(Ok(mut stream)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+            {
+                let mut frames = 0usize;
+                while let Ok(Ok(Some((kind, payload)))) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), read_frame(&mut stream))
+                        .await
+                {
+                    frames += 1;
+                    let request: Option<serde_json::Value> = serde_json::from_slice(&payload).ok();
+                    let hello = frames == 1
+                        && kind == KIND_REQ
+                        && request
+                            .as_ref()
+                            .and_then(|r| r.get("op"))
+                            .and_then(|op| op.as_str())
+                            == Some("hello");
+                    let response = if hello {
+                        AttachResponse {
+                            capabilities: advertised
+                                .map(|list| list.iter().map(|cap| cap.to_string()).collect()),
+                            daemon_version: Some("0.40.2".to_string()),
+                            ..AttachResponse::hello(PROTOCOL_VERSION)
+                        }
+                    } else {
+                        server_other_requests.fetch_add(1, Ordering::SeqCst);
+                        AttachResponse::err(
+                            "malformed request: unknown variant `addressed-message`",
+                        )
+                    };
+                    if crate::daemon_protocol::write_resp(&mut stream, &response)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+        let client = DaemonClient::new(path);
+        let err = client
+            .addressed_message(
+                crate::orchestrator_address::MessageAddress {
+                    folder: Some("/w".to_string()),
+                    orchestration: None,
+                },
+                crate::daemon_protocol::CallerClaim {
+                    pane_id: "p".to_string(),
+                    token: "t".to_string(),
+                },
+                "hello".to_string(),
+            )
+            .await
+            .expect_err("an older daemon must be a hard error");
+        assert!(
+            matches!(&err, CloseAgentsError::TooOld { daemon_version } if daemon_version.as_deref() == Some("0.40.2")),
+            "advertised {advertised:?}: expected TooOld, got {err:?}"
+        );
+        assert_eq!(crate::roles_cli::client_error_output(&err).code, 2);
+        // Review 2: the fake daemon finishes reading every frame the client
+        // wrote before the count is read.
+        drop(client);
+        server.await.unwrap();
+        assert_eq!(
+            other_requests.load(Ordering::SeqCst),
+            0,
+            "advertised {advertised:?}: nothing but the handshake may be written"
         );
         drop(dir);
     }
