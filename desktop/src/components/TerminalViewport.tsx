@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
-import { Terminal } from "@xterm/xterm";
+import { Terminal, type IDisposable } from "@xterm/xterm";
 import type { SendResult, TerminalBuffer, TerminalFeed } from "../types";
 import { writeClipboardText } from "../lib/clipboard";
 import { osc52CopyText } from "../lib/osc52";
@@ -52,6 +52,47 @@ async function drainClipboardWrites(): Promise<void> {
   } finally {
     clipboardWriting = false;
   }
+}
+
+/**
+ * PRD #1666 part 3 (Q35-23) — what the replay's query handlers need to know
+ * about xterm 6.0.0's replies; the handlers themselves are in the terminal
+ * effect below.
+ *
+ * `CSI t` parameters that xterm answers with a report (`CSI 4`, `6` and `8 …
+ * t`: the window and cell sizes in pixels, the text area in characters). Its
+ * other window operations (title push and pop) reply nothing and stay xterm's.
+ */
+const WINDOW_REPORTS = new Set<number | number[]>([14, 16, 18]);
+/** OSC 4 (an indexed colour) and 10–12 (foreground, background, cursor). */
+const COLOUR_OSCS = [4, 10, 11, 12];
+const FOCUS_IN = "\x1b[I";
+const FOCUS_OUT = "\x1b[O";
+
+/**
+ * Whether xterm would answer this colour OSC with a report: the `?` slots it
+ * reads, the way `setOrReportIndexedColor` and `_setOrReportSpecialColor` read
+ * them. OSC 4 is `index;spec` pairs with an index from 0 to 255; OSC 10–12
+ * stack, each slot the next of foreground, background and cursor, so OSC 10
+ * reads three slots, 11 two and 12 one.
+ */
+function asksForColour(ident: number, data: string): boolean {
+  const slots = data.split(";");
+  if (ident !== 4) return slots.slice(0, 13 - ident).includes("?");
+  for (let i = 0; i + 1 < slots.length; i += 2) {
+    if (slots[i + 1] === "?" && /^\d+$/.test(slots[i]) && Number(slots[i]) <= 255) return true;
+  }
+  return false;
+}
+
+/**
+ * The one xterm internal the replay uses: the event its input handler fires
+ * when focus reporting is enabled, which xterm's own focus report listens to.
+ * Every step is optional so a moved name disables the focus guard rather than
+ * throwing.
+ */
+interface XtermInternals {
+  _core?: { _inputHandler?: { onRequestSendFocus?: (listener: () => void) => IDisposable } };
 }
 
 interface TerminalViewportProps {
@@ -300,12 +341,15 @@ export function TerminalViewport({
     //
     // Not gated on `readOnly`: copying out of a pane is reading it.
     let replaying = false;
+    // The focus guard of the replay's query handlers below.
+    let focusReportsToDrop = 0;
     const replay = (data: string | Uint8Array) => {
       terminal.write("", () => {
         replaying = true;
       });
       terminal.write(data, () => {
         replaying = false;
+        focusReportsToDrop = 0;
       });
     };
     replayRef.current = replay;
@@ -314,6 +358,58 @@ export function TerminalViewport({
       if (text !== undefined) copyInOrder(text);
       return true;
     });
+    // PRD #1666 part 3 (Q35-23) — history answers no terminal query.
+    //
+    // xterm answers every query it parses, and `onData` forwards the answer to
+    // the agent as if the user had typed it. A query the agent sent an hour ago
+    // (a cursor-position request, a colour or focus report) is still in the
+    // backlog, so every attach answered it again, into whatever the agent was
+    // reading at the time. While `replaying`, each handler below claims its
+    // sequence (returns `true`), so xterm's own handler, which is the one that
+    // replies, does not run; a live query returns `false` and xterm answers it
+    // as before. The TUI answers no queries at all, so this makes the desktop's
+    // replay match it.
+    //
+    // These are the reply sites of the installed xterm (6.0.0), and
+    // `TerminalViewport.replay.test.tsx` reads its source and fails on a site
+    // this list does not cover. Only queries are claimed: the window-ops
+    // handler claims the size reports and leaves title push and pop to xterm,
+    // and a colour sequence is claimed only when it asks for a colour. One
+    // that both sets and asks in a single sequence is claimed whole, so a
+    // replay of it skips the set; separate set and query sequences, which is
+    // what agents send, keep the set.
+    const focusReported = (terminal as unknown as XtermInternals)._core?._inputHandler?.onRequestSendFocus?.(() => {
+      if (focusReportsToDrop > 0) focusReportsToDrop -= 1;
+    });
+    const historical = () => replaying;
+    const replyHandlers = [
+      terminal.parser.registerCsiHandler({ final: "c" }, historical), // DA1
+      terminal.parser.registerCsiHandler({ prefix: ">", final: "c" }, historical), // DA2
+      terminal.parser.registerCsiHandler({ final: "n" }, historical), // DSR, CPR
+      terminal.parser.registerCsiHandler({ prefix: "?", final: "n" }, historical), // private CPR
+      terminal.parser.registerCsiHandler({ intermediates: "$", final: "p" }, historical), // DECRQM
+      terminal.parser.registerCsiHandler({ prefix: "?", intermediates: "$", final: "p" }, historical),
+      terminal.parser.registerDcsHandler({ intermediates: "$", final: "q" }, historical), // DECRQSS
+      terminal.parser.registerCsiHandler({ final: "t" }, (params) => replaying && WINDOW_REPORTS.has(params[0])),
+      ...COLOUR_OSCS.map((ident) =>
+        terminal.parser.registerOscHandler(ident, (data) => replaying && asksForColour(ident, data)),
+      ),
+      // Focus is the one reply a MODE sends rather than a query: enabling
+      // focus reporting (`CSI ? 1004 h`) makes xterm report the current focus
+      // at once, inside the same handler. The mode itself must still apply, so
+      // this handler lets xterm run and arms a guard for exactly that report:
+      // `onData` drops a focus report while it is armed, and xterm's
+      // `onRequestSendFocus`, which fires once per 1004 and whose listener
+      // above runs right after xterm's own reporting one, disarms it. It cannot
+      // outlast that synchronous report, so a `terminal.input` or a key later
+      // in the same parse is forwarded, focus-shaped or not. Where the event
+      // is not there to disarm it (an xterm that moved it), the guard is never
+      // armed, and the replay test fails on the moved site.
+      terminal.parser.registerCsiHandler({ prefix: "?", final: "h" }, (params) => {
+        focusReportsToDrop = replaying && focusReported ? params.filter((param) => param === 1004).length : 0;
+        return false;
+      }),
+    ];
     // Expose the instance so the Reader overlay can snapshot the resolved buffer.
     registerTerminal(deckId, agentId, terminal, incarnation);
     replay(transcriptRef.current);
@@ -323,6 +419,9 @@ export function TerminalViewport({
     const selectionKeeper = keepSelectionAcrossResize(terminal, host);
 
     const inputDisposable = terminal.onData((data) => {
+      // A historical `?1004h`'s focus report (see `focusReportsToDrop` above);
+      // nothing else is dropped here, whatever it looks like.
+      if (focusReportsToDrop > 0 && (data === FOCUS_IN || data === FOCUS_OUT)) return;
       if (!readOnlyRef.current) onInputRef.current(data);
     });
     // Issue #1403 — copy the selection with `Ctrl+Shift+C` / `Cmd+C`, and
@@ -455,6 +554,8 @@ export function TerminalViewport({
       applyGridRef.current = undefined;
       replayRef.current = undefined;
       clipboardRequests.dispose();
+      for (const handler of replyHandlers) handler.dispose();
+      focusReported?.dispose();
       window.cancelAnimationFrame(frame);
       observer.disconnect();
       inputDisposable.dispose();

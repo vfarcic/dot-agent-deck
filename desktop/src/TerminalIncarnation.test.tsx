@@ -17,6 +17,7 @@ const { writes, terminalInstances, FakeTerminal, FakeFitAddon } = vi.hoisted(() 
   const writes: string[] = [];
   const terminalInstances: FakeTerminal[] = [];
   const decoder = new TextDecoder();
+  const inertHandler = (): { dispose: () => void } => ({ dispose: () => {} });
   class FakeTerminal {
     options: Record<string, unknown>;
     textarea: HTMLTextAreaElement;
@@ -40,7 +41,7 @@ const { writes, terminalInstances, FakeTerminal, FakeFitAddon } = vi.hoisted(() 
       callback?.();
     }
     /* Issue #1705's OSC 52 handler; `TerminalViewport.clipboard.test.tsx` drives it through the real xterm. */
-    readonly parser = { registerOscHandler: (): { dispose: () => void } => ({ dispose: () => {} }) };
+    readonly parser = { registerOscHandler: inertHandler, registerCsiHandler: inertHandler, registerDcsHandler: inertHandler };
     reset(): void {}
     focus(): void {}
     resize(cols: number, rows: number): void { this.cols = cols; this.rows = rows; }
