@@ -299,7 +299,18 @@ class Children:
                 self.cleanup_errors.append(f"{label}: {type(error).__name__}")
                 return fallback
 
-        survivors = list(self.handles)
+        def reap():
+            for _ in range(4096):
+                try:
+                    if os.waitpid(-1, os.WNOHANG)[0] == 0:
+                        return False  # Live direct/adopted children remain.
+                except ChildProcessError:
+                    return True
+                if time.monotonic() >= deadline:
+                    return False
+            return False  # Reaping budget exhausted; closure remains unknown.
+
+        survivors, closure_verified = list(self.handles), False
         try:
             for sig, seconds in ((signal.SIGTERM, 2), (signal.SIGKILL, 1)):
                 deadline = time.monotonic() + seconds
@@ -312,36 +323,40 @@ class Children:
                             except ProcessLookupError:
                                 pass
                         attempt("signal", send_one)
+                    # Death can reparent a detached descendant after the scan
+                    # preceding KILL. Capture again before claiming closure.
+                    attempt("adopt-after-signal", self.adopted)
                     survivors = attempt("observe", self.alive, list(self.handles))
-                    if not survivors or time.monotonic() >= deadline:
+                    no_children = attempt("reap", reap, False)
+                    if not survivors and no_children:
+                        closure_verified = True
+                        break
+                    if time.monotonic() >= deadline:
                         break
                     time.sleep(0.02)
+                if closure_verified:
+                    break
             for proc in self.processes:
                 attempt("poll", proc.poll)
         finally:
             for fd in self.handles.values():
                 attempt("close-pidfd", lambda fd=fd: os.close(fd))
             self.handles.clear()
-            while True:
-                try:
-                    if os.waitpid(-1, os.WNOHANG)[0] == 0:
-                        break
-                except ChildProcessError:
-                    break
-                except OSError as error:
-                    self.cleanup_errors.append(f"reap: {type(error).__name__}")
-                    break
-            report = {"survivors": survivors, "errors": self.cleanup_errors}
+            no_children = attempt("final-reap", reap, False)
+            closure_verified = closure_verified and no_children and not self.cleanup_errors
+            report = {"survivors": [] if closure_verified else None,
+                      "survivors_status": "verified-empty" if closure_verified else "unknown",
+                      "captured_survivors": survivors, "errors": self.cleanup_errors}
             # PID-qualified files keep inner and outer supervisor evidence apart.
             artifact = self.root / f"cleanup-children-{os.getpid()}-{time.monotonic_ns()}.json"
             try:
                 write_json(artifact, report)
-                if survivors or self.cleanup_errors:
-                    print(f"H-FRX cleanup UNVERIFIED: inspect {artifact}", file=sys.stderr)
+                if not closure_verified:
+                    print(f"H-FRX cleanup UNVERIFIED: survivors unknown; inspect {artifact}", file=sys.stderr)
             finally:
                 for sig, handler in self.handlers.items():
                     signal.signal(sig, handler)
-        return survivors
+        return [] if closure_verified else None
 
 
 def selectors_ready(fd):
@@ -469,7 +484,12 @@ def x1_summary(records):
         if frontier != "taken":
             result[f"{frontier}_frontier"] += 1
             continue
-        if row["window_ns"] < 10_000_000_000 or not row["standin_silent"]:
+        window = row.get("window_ns")
+        if type(window) is not int or not 0 <= window <= 2**63 - 1:
+            raise Refusal("X1 window_ns must be a nonnegative signed-64-bit integer")
+        if any(type(row.get(field)) is not bool for field in ("standin_silent", "orphan_sighup", "orphan_sigcont")):
+            raise Refusal("X1 silence and orphan flags must be boolean")
+        if window < 10_000_000_000 or not row["standin_silent"]:
             raise Refusal("X1 requires a silent, full 10-second post-frontier observation")
         result["qualified_windows"] += 1
         data = row["post_frontier_bytes"]
@@ -493,8 +513,12 @@ def export_scrubbed(root, destination):
     """Scan first, then copy. No raw file is exported if scanning fails."""
     root, destination = Path(root).absolute(), Path(destination).absolute()
     preflight(root, fixture_env(root), production_sockets(os.environ))
+    # Reject symlink ancestry before resolving, including symlink/.. spellings
+    # and dangling links. Then apply location/containment rules to the target.
     check_root_location(destination)
-    if destination.exists() or under(destination.absolute(), root.absolute()):
+    destination = destination.resolve()
+    check_root_location(destination)
+    if destination.exists() or under(destination, root.resolve()):
         raise Refusal("export destination must be fresh and outside the run")
     patterns = [rb"\bsk-[A-Za-z0-9_-]{8,}", rb"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",
                 rb"(?i)bearer\s+[A-Za-z0-9._-]{12,}",
@@ -756,13 +780,15 @@ def x2_sample(root, children, version, sample, method):
             proc.wait(timeout=2)
 
 
-def run_x2_inner(root, method, samples, network):
+def run_x2_inner(root, method, samples, network, versions=VERSIONS):
     if method != "arrival":
         raise Refusal("UNVERIFIED: cycle-bound instrumented method needs implementation")
+    if not versions or any(version not in VERSIONS for version in versions):
+        raise Refusal("unsupported X2 release selection")
     env = fixture_env(root)
     preflight(root, env, production_sockets({}))
     pins = pins_recheck(root)
-    required = {"python3", "strace", *(f"codex-{version}" for version in VERSIONS)}
+    required = {"python3", "strace", *(f"codex-{version}" for version in versions)}
     if not required <= pins.keys():
         raise Refusal("missing required pins for X2")
     children = Children(root, env)
@@ -777,7 +803,7 @@ def run_x2_inner(root, method, samples, network):
         threading.Thread(target=provider.serve_forever, daemon=True).start()
         (root / "codex-home/config.toml").write_text(config_text(port, root))
         results = []
-        for version in VERSIONS:
+        for version in versions:
             for sample in range(samples):
                 result = x2_sample(root, children, version, sample, method)
                 traces = sorted((root / "raw").glob(f"{version}-{method}-{sample:03d}.trace.*"))
@@ -790,7 +816,7 @@ def run_x2_inner(root, method, samples, network):
                 if result["status"] != "observed":
                     raise Refusal("UNVERIFIED X2 cycle; stop series and inspect run-owned artifacts")
         summary = {}
-        for version in VERSIONS:
+        for version in versions:
             rows = [row for row in results if row["release"] == version]
             summary[version] = {
                 "master_observed_arrival": distribution(row["arrival_interval_ns"] for row in rows),
@@ -813,6 +839,7 @@ def run_x2(args):
     root = Path(args.root).absolute()
     preflight(root, fixture_env(root), production_sockets(os.environ))
     pins = pins_recheck(root)
+    versions = (args.release,) if args.release else VERSIONS
     # Require an immutable reviewed revision identifier, not an implied permission
     # from dry-run. The current task does NOT authorize invoking this command.
     if not re.fullmatch(r"[0-9a-f]{40}", args.reviewed_commit):
@@ -826,18 +853,22 @@ def run_x2(args):
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if probe.wait(timeout=3) == 0:
                 network = "network-namespace"
+        if args.require_namespace and network != "network-namespace":
+            raise Refusal("required network namespace unavailable; measurement was not started")
         write_json(root / "run-authorization.json", {"reviewed_commit": args.reviewed_commit,
                    "executing_script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                    "provenance": "reviewed_commit is operator attestation; digest is current script-file bytes at run entry",
-                   "network": network, "host_boundary": plan()["host_boundary"]})
+                   "network": network, "host_boundary": plan()["host_boundary"],
+                   "releases": list(versions), "samples_per_release": args.samples,
+                   "require_namespace": args.require_namespace})
         argv = [str(root / "bin/python3"), str(Path(__file__).resolve()), "_x2",
-                str(root), args.method, str(args.samples), network]
+                str(root), args.method, str(args.samples), network, *versions]
         if network == "network-namespace":
             argv = [*prefix, *argv]
         proc = children.spawn(argv)
         # Bounds the inner startup + series wait; outer Popen/kernel stalls and
         # cleanup are not covered by this userspace timeout.
-        if proc.wait(timeout=10 + 36 * len(VERSIONS) * args.samples) != 0:
+        if proc.wait(timeout=10 + 36 * len(versions) * args.samples) != 0:
             raise Refusal("X2 child failed; retain artifacts, do not resume this run id")
     finally:
         write_json(root / "cleanup-supervisor.json", {"survivors": children.cleanup()})
@@ -857,7 +888,8 @@ def main():
             return
         raise Refusal("invalid editor fixture")
     if len(sys.argv) > 1 and sys.argv[1] == "_x2":
-        run_x2_inner(Path(sys.argv[2]), sys.argv[3], int(sys.argv[4]), sys.argv[5])
+        run_x2_inner(Path(sys.argv[2]), sys.argv[3], int(sys.argv[4]), sys.argv[5],
+                     tuple(sys.argv[6:]) or VERSIONS)
         return
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -869,6 +901,9 @@ def main():
     run.add_argument("--root", required=True)
     run.add_argument("--method", choices=["arrival", "instrumented"], required=True)
     run.add_argument("--samples", type=int, choices=range(1, 101), default=100)
+    run.add_argument("--release", choices=VERSIONS, help="one release only; default is both releases")
+    run.add_argument("--require-namespace", action="store_true",
+                     help="refuse before measurement startup if the network namespace probe fails")
     run.add_argument("--reviewed-commit", required=True)
     export = sub.add_parser("export")
     export.add_argument("root", type=Path)

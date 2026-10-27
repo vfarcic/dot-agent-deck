@@ -89,12 +89,39 @@ class HfrxSafety(unittest.TestCase):
             h.prepare(self.root, {})
 
     def test_real_config_location_is_refused_before_creating_it(self):
+        """Scenario: Refuse fixture exports into agent config directories through dot components or symlinks before creating an export."""
         # This HOME is itself a fixture; the real HOME is never traversed.
         pretend_home = self.base / "pretend-home"
         with patch.dict(os.environ, {"HOME": str(pretend_home)}):
             with self.assertRaisesRegex(h.Refusal, "real agent configuration"):
                 h.prepare(pretend_home / ".codex/run", {})
         self.assertFalse(pretend_home.exists())
+        pretend_home.mkdir()
+        for name in (".codex", ".claude"):
+            config = pretend_home / name
+            config.mkdir()
+            detour = self.base / f"detour-{name}"
+            detour.mkdir()
+            link = self.base / f"link-{name}"
+            link.symlink_to(config, target_is_directory=True)
+            for index, parent in enumerate((config, detour / ".." / "pretend-home" / name,
+                                            link, link / "..")):
+                destination = parent / f"export-{index}"
+                with self.subTest(destination=destination), patch.dict(os.environ, {"HOME": str(pretend_home)}):
+                    with self.assertRaises(h.Refusal):
+                        h.export_scrubbed(self.root, destination)
+                    self.assertFalse(destination.resolve().exists())
+            dangling = self.base / f"dangling-{name}"
+            dangling.symlink_to(self.base / f"absent-{name}", target_is_directory=True)
+            with self.assertRaisesRegex(h.Refusal, "symlink"):
+                h.export_scrubbed(self.root, dangling / "export")
+        safe_detour = self.base / "safe-detour"
+        safe_detour.mkdir()
+        self.assertGreater(h.export_scrubbed(self.root, safe_detour / ".." / "safe-export"), 0)
+        self.assertTrue((self.base / "safe-export/environment.json").is_file())
+        with self.assertRaisesRegex(h.Refusal, "outside the run"):
+            h.export_scrubbed(self.root, self.base / "safe-detour/../run/export")
+        self.assertFalse((self.root / "export").exists())
 
     def test_tmpfs_root_refused_using_mount_metadata_standin(self):
         mounts = "1 0 0:1 / / rw - tmpfs tmpfs rw\n"
@@ -217,6 +244,7 @@ class HfrxSafety(unittest.TestCase):
         self.assertIn("captured container ID", h.plan()["container_rows"])
 
     def test_cleanup_ignores_repeated_signals_and_retains_errors(self):
+        """Scenario: Repeated stop signals do not interrupt cleanup, and failed adoption or an unsettled child set records survivors as unknown."""
         owner = h.Children(self.root, self.env)
         original_adopted = owner.adopted
 
@@ -233,10 +261,21 @@ class HfrxSafety(unittest.TestCase):
         self.assertEqual(report["errors"], [])
         owner = h.Children(self.root, self.env)
         with patch.object(owner, "adopted", side_effect=OSError("stand-in adoption failure")):
-            owner.cleanup()
+            self.assertIsNone(owner.cleanup(), "failed adoption must report survivors unknown")
         reports = [json.loads(path.read_text()) for path in self.root.glob(f"cleanup-children-{os.getpid()}-*.json")]
         self.assertEqual(len(reports), 2)
         self.assertTrue(any(report["errors"] for report in reports))
+        unknown, = [report for report in reports if report["errors"]]
+        self.assertIsNone(unknown["survivors"])
+        self.assertEqual(unknown["survivors_status"], "unknown")
+        owner = h.Children(self.root, self.env)
+        ticks = iter(range(0, 100, 4))
+        with patch.object(owner, "adopted"), patch.object(os, "waitpid", return_value=(0, 0)), \
+                patch.object(h.time, "monotonic", side_effect=lambda: next(ticks)):
+            self.assertIsNone(owner.cleanup(), "empty captured set cannot prove all descendants exited")
+        reports = [json.loads(path.read_text()) for path in self.root.glob(f"cleanup-children-{os.getpid()}-*.json")]
+        self.assertEqual(len(reports), 3)
+        self.assertEqual(sum(report["survivors_status"] == "unknown" for report in reports), 2)
 
     def test_spawn_failure_does_not_leak_pty_descriptors(self):
         owner = h.Children(self.root, self.env)
@@ -264,8 +303,9 @@ class HfrxSafety(unittest.TestCase):
             owner.cleanup()
 
     def test_supervisor_records_source_digest_and_bounds_inner_wait(self):
+        """Scenario: Record source provenance and bound the supervisor wait, then select a ten-sample single-release pilot and refuse an unavailable required namespace before measurement startup."""
         args = unittest.mock.Mock(root=str(self.root), method="arrival", samples=1,
-                                  reviewed_commit="a" * 40)
+                                  reviewed_commit="a" * 40, release=None, require_namespace=False)
         with patch.object(h, "Children") as children:
             owner = children.return_value
             owner.spawn.return_value.wait.return_value = 0
@@ -275,6 +315,47 @@ class HfrxSafety(unittest.TestCase):
         self.assertEqual(authorization["executing_script_sha256"],
                          hashlib.sha256(Path(h.__file__).read_bytes()).hexdigest())
         owner.spawn.return_value.wait.assert_called_once_with(timeout=82)
+        for probe_ok in (True, False):
+            for tools_present in (True, False):
+                root = self.base / f"pilot-{probe_ok}-{tools_present}"
+                h.prepare(root, {})
+                args = h.argparse.Namespace(root=str(root), method="arrival", samples=10,
+                                            reviewed_commit="a" * 40, release="0.164.0", require_namespace=True)
+                pins = dict.fromkeys(("unshare", "ip", "python3", "true")) if tools_present else {}
+                with self.subTest(probe_ok=probe_ok, tools_present=tools_present), \
+                        patch.object(h, "pins_recheck", return_value=pins), patch.object(h, "Children") as children:
+                    owner = children.return_value
+                    owner.cleanup.return_value = []
+                    owner.spawn.return_value.wait.return_value = 0 if probe_ok else 1
+                    if not (probe_ok and tools_present):
+                        with self.assertRaisesRegex(h.Refusal, "required network namespace"):
+                            h.run_x2(args)
+                        self.assertFalse((root / "run-authorization.json").exists())
+                        self.assertFalse((root / "codex-home/config.toml").exists())
+                        self.assertEqual(owner.spawn.call_count, int(tools_present))
+                    else:
+                        h.run_x2(args)
+                        authorization = json.loads((root / "run-authorization.json").read_text())
+                        self.assertEqual(authorization["releases"], ["0.164.0"])
+                        self.assertEqual(authorization["samples_per_release"], 10)
+                        self.assertTrue(authorization["require_namespace"])
+                        self.assertEqual(authorization["network"], "network-namespace")
+                        self.assertEqual(owner.spawn.call_args.args[0][-1], "0.164.0")
+                        self.assertEqual(owner.spawn.return_value.wait.call_args.kwargs["timeout"], 370)
+        # The inner subprocess must also respect the release selector. Its
+        # provider, thread and sample launches are stand-ins throughout.
+        with patch.object(h, "Children") as children, patch.object(h, "pins_recheck", return_value={
+                "python3": {}, "strace": {}, "codex-0.164.0": {}}), \
+                patch.object(h.http.server, "ThreadingHTTPServer") as server, \
+                patch.object(h.threading, "Thread"), patch.object(h, "check_connects"), \
+                patch.object(h, "x2_sample", side_effect=lambda root, owner, version, sample, method: {
+                    "status": "observed", "release": version, "arrival_interval_ns": sample}):
+            server.return_value.server_address = ("127.0.0.1", 8123)
+            children.return_value.cleanup.return_value = []
+            h.run_x2_inner(self.root, "arrival", 10, "detection-only", ("0.164.0",))
+        summary = json.loads((self.root / "X2-arrival.json").read_text())
+        self.assertEqual(len(summary["results"]), 10)
+        self.assertEqual(set(summary["distribution"]), {"0.164.0"})
 
     def test_post_exec_pty_setup_never_uses_a_python_preexec_callback(self):
         with patch.object(sys, "argv", ["hfrx", "_pty", "/standin-strace", "arg"]), \
@@ -303,13 +384,20 @@ class HfrxSafety(unittest.TestCase):
             owner.cleanup()
 
     def test_pidfd_cleanup_reaps_a_detached_standin_descendant(self):
+        """Scenario: Clean up detached Python descendants when the parent exits on TERM and when parent and child resist TERM until the final KILL phase."""
+        for resist_term in (False, True):
+            with self.subTest(resist_term=resist_term):
+                self.check_detached_standin_cleanup(resist_term)
+
+    def check_detached_standin_cleanup(self, resist_term):
         owner = h.Children(self.root, self.env)
         proc = None
         child_fd = None
         try:
             # This Python stand-in is the only process tree this test starts.
             # The detached child survives its parent, so cleanup must adopt it.
-            code = ("import os, time\n"
+            code = ("import os, signal, time\n"
+                    + ("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" if resist_term else "") +
                     "pid = os.fork()\n"
                     "if pid == 0:\n"
                     " os.setsid()\n"
@@ -325,7 +413,17 @@ class HfrxSafety(unittest.TestCase):
             child_pid = int(proc.stdout.readline())
             child_fd = os.pidfd_open(child_pid)
         finally:
-            survivors = owner.cleanup()
+            send_signal = h.signal.pidfd_send_signal
+
+            def signal_then_wait_for_parent(fd, sig):
+                send_signal(fd, sig)
+                if resist_term and proc is not None and sig == h.signal.SIGKILL and fd == owner.handles.get(proc.pid):
+                    # Deterministically put adoption after the final pre-KILL
+                    # scan and before cleanup observes the dead parent's pidfd.
+                    proc.wait(timeout=3)
+
+            with patch.object(h.signal, "pidfd_send_signal", side_effect=signal_then_wait_for_parent):
+                survivors = owner.cleanup()
             if proc is not None:
                 proc.stdout.close()
         try:
@@ -333,11 +431,16 @@ class HfrxSafety(unittest.TestCase):
             self.assertTrue(h.selectors_ready(child_fd), "detached stand-in survived cleanup")
         finally:
             if child_fd is not None:
+                # Failure cleanup signals this captured fixture identity only.
+                if not h.selectors_ready(child_fd):
+                    h.signal.pidfd_send_signal(child_fd, h.signal.SIGKILL)
+                    os.waitpid(child_pid, 0)
                 os.close(child_fd)
 
 
 class HfrxEvidence(unittest.TestCase):
     def test_x1_missing_frontier_is_not_a_no_writer_sample(self):
+        """Scenario: Count full post-frontier byte windows separately by population, refusing malformed duration and silence/orphan fields rather than qualifying them."""
         population = {name: "stand-in" for name in h.POPULATION_FIELDS}
         missing = {"population": population, "available": True, "frontier": "missing", "report": "none"}
         good = {"population": population, "available": True, "frontier": "taken", "report": "Clean",
@@ -359,6 +462,17 @@ class HfrxEvidence(unittest.TestCase):
         self.assertIn("including unknown", unknown["qualified_population"])
         with self.assertRaisesRegex(h.Refusal, "populations separately"):
             h.x1_summary([good, {**good, "population": {**population, "release": "other"}}])
+        for value in (float("nan"), float("inf"), 10_000_000_000.5, True, None, "10000000000", -1, 2**63):
+            with self.subTest(window_ns=value), self.assertRaises(h.Refusal):
+                h.x1_summary([{**good, "window_ns": value}])
+        for field in ("standin_silent", "orphan_sighup", "orphan_sigcont"):
+            for value in (0, 1, "false", [], None):
+                with self.subTest(field=field, value=value), self.assertRaises(h.Refusal):
+                    h.x1_summary([{**good, field: value}])
+        with self.assertRaisesRegex(h.Refusal, "full 10-second"):
+            h.x1_summary([{**good, "standin_silent": False}])
+        orphan = h.x1_summary([{**good, "orphan_sighup": True, "orphan_sigcont": True}])
+        self.assertEqual((orphan["orphan_sighup"], orphan["orphan_sigcont"]), (1, 1))
 
     def test_master_offsets_survive_chunk_splits_and_have_no_bound_label(self):
         raw, clocks = io.BytesIO(), io.StringIO()
