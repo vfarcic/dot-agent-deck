@@ -2625,7 +2625,9 @@ async fn write_held_reply<R, W>(
         return;
     };
     // Issue #1693: bounded like every other reply on the connection.
-    let written = write_hook_reply(writer, &format!("{json}\n"), write_timeout).await;
+    let written = write_hook_reply(writer, &format!("{json}\n"), write_timeout)
+        .await
+        .is_ok();
     let Some(delivery) = held.delivery else {
         return;
     };
@@ -5666,9 +5668,12 @@ async fn run_hook_loop_with_idle_timeout(
 /// its replies filled the socket's send buffer and parked the connection's
 /// task in `write_all` for good, holding its hook-pool slot. With the write
 /// bounded too, a peer that does not read loses its slot the way a peer that
-/// does not write already does. Returns `false` when the write failed or timed
-/// out; the caller then drops the connection.
-async fn write_hook_reply<W>(writer: &mut W, line: &str, deadline: Duration) -> bool
+/// does not write already does. On an error the caller drops the connection.
+async fn write_hook_reply<W>(
+    writer: &mut W,
+    line: &str,
+    deadline: Duration,
+) -> Result<(), ReplyWriteError>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
@@ -5677,11 +5682,11 @@ where
         writer.flush().await
     };
     match tokio::time::timeout(deadline, write).await {
-        Ok(Ok(())) => true,
+        Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => {
             // A client that hung up before its reply is ordinary.
             debug!(error = %e, "hook socket: reply write failed; dropping connection");
-            false
+            Err(ReplyWriteError::Failed)
         }
         Err(_elapsed) => {
             warn!(
@@ -5690,9 +5695,19 @@ where
                  the idle window — the peer kept the connection open while the daemon's \
                  replies filled its socket buffer, so it is stalled or misbehaving"
             );
-            false
+            Err(ReplyWriteError::TimedOut)
         }
     }
+}
+
+/// Why [`write_hook_reply`] gave up on a reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplyWriteError {
+    /// The write or flush failed, usually because the peer hung up.
+    Failed,
+    /// The write did not finish within the idle timeout: the peer is not
+    /// reading.
+    TimedOut,
 }
 
 /// [`run_hook_loop`] with every bound supplied — the seam the PRD #1631 hold
@@ -5935,8 +5950,9 @@ async fn run_hook_loop_with_limits(
                                         &refusal.caller_message(),
                                     ) {
                                         let line = format!("{json}\n");
-                                        if !write_hook_reply(&mut write_half, &line, idle_timeout)
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
                                             .await
+                                            .is_err()
                                         {
                                             break;
                                         }
@@ -5982,12 +5998,13 @@ async fn run_hook_loop_with_limits(
                                                 );
                                                 if let Ok(json) = serde_json::to_string(&refusal) {
                                                     let line = format!("{json}\n");
-                                                    if !write_hook_reply(
+                                                    if write_hook_reply(
                                                         &mut write_half,
                                                         &line,
                                                         idle_timeout,
                                                     )
-                                                    .await
+                                                        .await
+                                                        .is_err()
                                                     {
                                                         break;
                                                     }
@@ -6010,12 +6027,13 @@ async fn run_hook_loop_with_limits(
                                                     crate::event::SignalAck::refused(code, &message);
                                                 if let Ok(json) = serde_json::to_string(&refusal) {
                                                     let line = format!("{json}\n");
-                                                    if !write_hook_reply(
+                                                    if write_hook_reply(
                                                         &mut write_half,
                                                         &line,
                                                         idle_timeout,
                                                     )
-                                                    .await
+                                                        .await
+                                                        .is_err()
                                                     {
                                                         break;
                                                     }
@@ -6026,17 +6044,20 @@ async fn run_hook_loop_with_limits(
                                     }
                                     if let Some(json) = msg.provenance_ack_reply() {
                                         let line = format!("{json}\n");
-                                        // Issue #1693: bounded like every
-                                        // reply, but the dispatch still runs
-                                        // when it fails. This ack precedes the
+                                        // Issue #1693: this ack precedes the
                                         // work, and a CLI older than #1129
                                         // sends `dispatch` and hangs up without
-                                        // reading, so its write fails; the
-                                        // connection still ends at the next
-                                        // bounded read or write.
-                                        let _ =
-                                            write_hook_reply(&mut write_half, &line, idle_timeout)
-                                                .await;
+                                        // reading. Its write FAILS, and its
+                                        // dispatch must still run, so only a
+                                        // timeout — a peer holding the
+                                        // connection open without reading —
+                                        // drops the connection here.
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                            .await
+                                            == Err(ReplyWriteError::TimedOut)
+                                        {
+                                            break;
+                                        }
                                     }
                                     if matches!(
                                         provenance,
@@ -6086,7 +6107,9 @@ async fn run_hook_loop_with_limits(
                                     INBOX_UNATTESTED_MESSAGE,
                                 ) {
                                     let line = format!("{json}\n");
-                                    if !write_hook_reply(&mut write_half, &line, idle_timeout).await
+                                    if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                        .await
+                                        .is_err()
                                     {
                                         break;
                                     }
@@ -6108,7 +6131,9 @@ async fn run_hook_loop_with_limits(
                                     INBOX_WRONG_AGENT_MESSAGE,
                                 ) {
                                     let line = format!("{json}\n");
-                                    if !write_hook_reply(&mut write_half, &line, idle_timeout).await
+                                    if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                        .await
+                                        .is_err()
                                     {
                                         break;
                                     }
@@ -6146,8 +6171,9 @@ async fn run_hook_loop_with_limits(
                                     };
                                     if let Ok(json) = serde_json::to_string(&reply) {
                                         let line = format!("{json}\n");
-                                        if !write_hook_reply(&mut write_half, &line, idle_timeout)
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
                                             .await
+                                            .is_err()
                                         {
                                             break;
                                         }
@@ -6172,12 +6198,13 @@ async fn run_hook_loop_with_limits(
                                         );
                                         if let Ok(json) = serde_json::to_string(&reply) {
                                             let line = format!("{json}\n");
-                                            if !write_hook_reply(
+                                            if write_hook_reply(
                                                 &mut write_half,
                                                 &line,
                                                 idle_timeout,
                                             )
-                                            .await
+                                                .await
+                                                .is_err()
                                             {
                                                 break;
                                             }
@@ -6191,12 +6218,13 @@ async fn run_hook_loop_with_limits(
                                         let reply = crate::event::InboxWaitReply::not_in_deck();
                                         if let Ok(json) = serde_json::to_string(&reply) {
                                             let line = format!("{json}\n");
-                                            if !write_hook_reply(
+                                            if write_hook_reply(
                                                 &mut write_half,
                                                 &line,
                                                 idle_timeout,
                                             )
-                                            .await
+                                                .await
+                                                .is_err()
                                             {
                                                 break;
                                             }
@@ -6233,12 +6261,13 @@ async fn run_hook_loop_with_limits(
                                             );
                                             if let Ok(json) = serde_json::to_string(&reply) {
                                                 let line = format!("{json}\n");
-                                                if !write_hook_reply(
+                                                if write_hook_reply(
                                                     &mut write_half,
                                                     &line,
                                                     idle_timeout,
                                                 )
-                                                .await
+                                                    .await
+                                                    .is_err()
                                                 {
                                                     break;
                                                 }
@@ -6319,12 +6348,13 @@ async fn run_hook_loop_with_limits(
                                             ))
                                         {
                                             let line = format!("{json}\n");
-                                            if !write_hook_reply(
+                                            if write_hook_reply(
                                                 &mut write_half,
                                                 &line,
                                                 idle_timeout,
                                             )
-                                            .await
+                                                .await
+                                                .is_err()
                                             {
                                                 break;
                                             }
@@ -6356,8 +6386,9 @@ async fn run_hook_loop_with_limits(
                                     };
                                     if let Ok(json) = serde_json::to_string(&ack) {
                                         let line = format!("{json}\n");
-                                        if !write_hook_reply(&mut write_half, &line, idle_timeout)
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
                                             .await
+                                            .is_err()
                                         {
                                             break;
                                         }
@@ -6395,12 +6426,13 @@ async fn run_hook_loop_with_limits(
                                             );
                                             if let Ok(json) = serde_json::to_string(&reply) {
                                                 let line = format!("{json}\n");
-                                                if !write_hook_reply(
+                                                if write_hook_reply(
                                                     &mut write_half,
                                                     &line,
                                                     idle_timeout,
                                                 )
-                                                .await
+                                                    .await
+                                                    .is_err()
                                                 {
                                                     break;
                                                 }
@@ -6435,12 +6467,13 @@ async fn run_hook_loop_with_limits(
                                             );
                                             if let Ok(json) = serde_json::to_string(&reply) {
                                                 let line = format!("{json}\n");
-                                                if !write_hook_reply(
+                                                if write_hook_reply(
                                                     &mut write_half,
                                                     &line,
                                                     idle_timeout,
                                                 )
-                                                .await
+                                                    .await
+                                                    .is_err()
                                                 {
                                                     break;
                                                 }
@@ -6489,8 +6522,9 @@ async fn run_hook_loop_with_limits(
                                     };
                                     if let Ok(json) = serde_json::to_string(&reply) {
                                         let line = format!("{json}\n");
-                                        if !write_hook_reply(&mut write_half, &line, idle_timeout)
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
                                             .await
+                                            .is_err()
                                         {
                                             break;
                                         }
@@ -6544,8 +6578,9 @@ async fn run_hook_loop_with_limits(
                                     };
                                     if let Ok(json) = serde_json::to_string(&reply) {
                                         let line = format!("{json}\n");
-                                        if !write_hook_reply(&mut write_half, &line, idle_timeout)
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
                                             .await
+                                            .is_err()
                                         {
                                             break;
                                         }
@@ -6568,8 +6603,9 @@ async fn run_hook_loop_with_limits(
                                     };
                                     if let Ok(json) = json {
                                         let line = format!("{json}\n");
-                                        if !write_hook_reply(&mut write_half, &line, idle_timeout)
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
                                             .await
+                                            .is_err()
                                         {
                                             break;
                                         }
@@ -6605,12 +6641,13 @@ async fn run_hook_loop_with_limits(
                                             refusal.message(),
                                         ) {
                                             let line = format!("{json}\n");
-                                            if !write_hook_reply(
+                                            if write_hook_reply(
                                                 &mut write_half,
                                                 &line,
                                                 idle_timeout,
                                             )
-                                            .await
+                                                .await
+                                                .is_err()
                                             {
                                                 break;
                                             }
@@ -6656,8 +6693,9 @@ async fn run_hook_loop_with_limits(
                                     };
                                     if let Ok(json) = json {
                                         let line = format!("{json}\n");
-                                        if !write_hook_reply(&mut write_half, &line, idle_timeout)
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
                                             .await
+                                            .is_err()
                                         {
                                             break;
                                         }
@@ -6722,8 +6760,9 @@ async fn run_hook_loop_with_limits(
                                     // this a no-op.
                                     if let Ok(json) = serde_json::to_string(&resp) {
                                         let line = format!("{json}\n");
-                                        if !write_hook_reply(&mut write_half, &line, idle_timeout)
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
                                             .await
+                                            .is_err()
                                         {
                                             break;
                                         }
@@ -6757,8 +6796,9 @@ async fn run_hook_loop_with_limits(
                                     .await;
                                     if let Ok(json) = serde_json::to_string(&resp) {
                                         let line = format!("{json}\n");
-                                        if !write_hook_reply(&mut write_half, &line, idle_timeout)
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
                                             .await
+                                            .is_err()
                                         {
                                             break;
                                         }
@@ -6788,8 +6828,9 @@ async fn run_hook_loop_with_limits(
                                     .await;
                                     if let Ok(json) = serde_json::to_string(&resp) {
                                         let line = format!("{json}\n");
-                                        if !write_hook_reply(&mut write_half, &line, idle_timeout)
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
                                             .await
+                                            .is_err()
                                         {
                                             break;
                                         }
@@ -6990,8 +7031,9 @@ async fn run_hook_loop_with_limits(
                                     };
                                     if let Ok(json) = serde_json::to_string(&ack) {
                                         let line = format!("{json}\n");
-                                        if !write_hook_reply(&mut write_half, &line, idle_timeout)
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
                                             .await
+                                            .is_err()
                                         {
                                             break;
                                         }
@@ -7012,8 +7054,9 @@ async fn run_hook_loop_with_limits(
                                     };
                                     if let Ok(json) = serde_json::to_string(&reply) {
                                         let line = format!("{json}\n");
-                                        if !write_hook_reply(&mut write_half, &line, idle_timeout)
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
                                             .await
+                                            .is_err()
                                         {
                                             break;
                                         }
@@ -7048,8 +7091,9 @@ async fn run_hook_loop_with_limits(
                                     };
                                     if let Ok(json) = serde_json::to_string(&reply) {
                                         let line = format!("{json}\n");
-                                        if !write_hook_reply(&mut write_half, &line, idle_timeout)
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
                                             .await
+                                            .is_err()
                                         {
                                             break;
                                         }
@@ -7098,8 +7142,9 @@ async fn run_hook_loop_with_limits(
                                     };
                                     if let Ok(json) = serde_json::to_string(&ack) {
                                         let line = format!("{json}\n");
-                                        if !write_hook_reply(&mut write_half, &line, idle_timeout)
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
                                             .await
+                                            .is_err()
                                         {
                                             break;
                                         }
@@ -7138,8 +7183,9 @@ async fn run_hook_loop_with_limits(
                                     );
                                     if let Ok(json) = serde_json::to_string(&resp) {
                                         let line = format!("{json}\n");
-                                        if !write_hook_reply(&mut write_half, &line, idle_timeout)
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
                                             .await
+                                            .is_err()
                                         {
                                             break;
                                         }
@@ -7218,8 +7264,9 @@ async fn run_hook_loop_with_limits(
                                     );
                                     if let Ok(json) = serde_json::to_string(&resp) {
                                         let line = format!("{json}\n");
-                                        if !write_hook_reply(&mut write_half, &line, idle_timeout)
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
                                             .await
+                                            .is_err()
                                         {
                                             break;
                                         }
@@ -19473,6 +19520,7 @@ mod hook_pin_refresh_tests {
     }
 }
 
-#[cfg(test)]
+// Unix-only, like `hook_ingestion_tests`: it drives the loop over a Unix socket.
+#[cfg(all(test, unix))]
 #[path = "daemon_hook_reply_deadline_tests.rs"]
 mod hook_reply_deadline_tests;
