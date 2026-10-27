@@ -128,8 +128,24 @@ pub(crate) fn installed(spawn: &Spawn) -> PathBuf {
 
 pub(crate) fn tool(spawn: &Spawn, argv: &[String]) -> Value {
     let request = spawn.base.with_extension("bash-tool.json");
-    let staging = spawn.base.with_extension("bash-tool.staging");
-    std::fs::write(&staging, serde_json::to_vec(argv).unwrap()).unwrap();
-    std::fs::rename(staging, request).unwrap();
-    read_json(&spawn.base.with_extension("bash-tool-result.json"))
+    let staging = tempfile::Builder::new()
+        .prefix(&format!(
+            "{}.tmp-",
+            request.file_name().unwrap().to_str().unwrap()
+        ))
+        .tempfile_in(request.parent().unwrap())
+        .unwrap()
+        .into_temp_path();
+    let id = staging.file_name().unwrap().to_str().unwrap();
+    std::fs::write(
+        &staging,
+        serde_json::to_vec(&json!({"id": id, "argv": argv})).unwrap(),
+    )
+    .unwrap();
+    std::fs::rename(&staging, request).unwrap();
+    let result_path = spawn.base.with_extension("bash-tool-result.json");
+    let result = read_json(&result_path);
+    assert_eq!(result["id"], id, "the tool result echoes its request id");
+    std::fs::remove_file(result_path).unwrap();
+    result
 }
