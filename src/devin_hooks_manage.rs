@@ -617,20 +617,6 @@ pub fn uninstall_from(config_dir: &Path) -> io::Result<Vec<String>> {
     Ok(removed)
 }
 
-/// The DURABLE absolute path to pin into Devin's hook commands, or the
-/// resolver's refusal (PRD #381).
-///
-/// PRD #381's M2 list names six call sites and omits this one, but it is the
-/// same shape as the other six and writes a path Devin later executes — so
-/// "no remaining `current_exe()` feeding an external config write" is not
-/// satisfiable without it. It used to be `current_exe()` with a
-/// [`crate::platform::paths::DEFAULT_BINARY_NAME`] fallback, which is issue
-/// #536's bug in miniature: a bare command name in a file another program
-/// hands to a shell.
-fn durable_binary_path() -> Result<String, String> {
-    crate::platform::paths::durable_binary_path()
-}
-
 /// Startup entry: install the deck's Devin hooks into the user's Devin config,
 /// ONCE, command-agnostically. Wired as `DEVIN.startup_auto_install`, so the TUI
 /// runs it at launch like Claude's hooks and OpenCode's plugin — meaning Devin
@@ -679,7 +665,10 @@ fn startup_install() -> Option<Result<crate::hook_binary::HookPin, String>> {
 
 /// The automatic install into `config_dir`, from this copy's durable path.
 fn install_into(config_dir: &Path) -> Result<crate::hook_binary::HookPin, String> {
-    let binary_path = durable_binary_path()?;
+    // PRD #381: the shared resolver, never `current_exe()` with a bare-name
+    // fallback (issue #536's bug in miniature), and under the same trust
+    // policy as every other agent's pin (issue #732).
+    let binary_path = crate::platform::paths::durable_binary_path()?;
     let (changed, named) = auto_install_to(config_dir, &binary_path)
         .map_err(|e| format!("failed to write Devin hooks: {e}"))?;
     if changed {
@@ -736,7 +725,8 @@ fn configured_pins_in(config_dir: &Path) -> Option<Vec<crate::hook_binary::HookP
 pub fn install() -> Result<(), String> {
     let config_dir = devin_config_dir()
         .ok_or_else(|| "no Devin config dir resolves (HOME is unset)".to_string())?;
-    install_to(&config_dir, &durable_binary_path()?).map_err(|e| e.to_string())?;
+    install_to(&config_dir, &crate::platform::paths::durable_binary_path()?)
+        .map_err(|e| e.to_string())?;
 
     println!("Installed hooks: {}", DEVIN_HOOK_EVENTS.join(", "));
     println!("Settings file: {}", config_path(&config_dir).display());
@@ -1658,8 +1648,8 @@ mod tests {
     }
 
     /// The refusal reaches the caller rather than degrading to a bare name.
-    /// `durable_binary_path` is a thin wrapper, so this pins the one property
-    /// that matters at this site: its error type is propagated by `install`,
+    /// This site calls the shared resolver directly, so this pins the one
+    /// property that matters here: its error type is propagated by `install`,
     /// which returns `Result<(), String>`.
     #[test]
     fn a_refused_resolution_is_an_error_not_a_bare_command_name() {
