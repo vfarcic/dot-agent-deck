@@ -4504,6 +4504,24 @@ fn surface_one_orchestration(
     // every live role of its orchestration, some of them possibly in its tab
     // already. Those are dropped and the rest are placed below, which grows the
     // existing tab, rather than the whole surface being skipped.
+    //
+    // Issue #1913: a role whose pane id a tab holds through an attachment on
+    // another process than the surface's is a restart's stale placement, not
+    // this role's. The restart's drops take that attachment and its tab slot,
+    // so they land first: placed afterwards in this frame, the role would
+    // read as already shown and get no tab.
+    if surface.roles.iter().any(|role| {
+        tab_manager.tab_index_for_pane(&role.pane_id).is_some()
+            && embedded
+                .pane_incarnation(&role.pane_id)
+                .is_some_and(|attached_on| {
+                    !attached_on.is_unnamed()
+                        && !learned_from.is_unnamed()
+                        && !attached_on.same_process(learned_from)
+                })
+    }) {
+        process_restart_drops(state, embedded, tab_manager, ui);
+    }
     let owned = |tab_manager: &TabManager, role: &crate::event::OrchestrationSurfaceRole| {
         tab_manager.tab_index_for_pane(&role.pane_id).is_some()
     };
@@ -45830,3 +45848,8 @@ mod one_shot_protocol_gate_tests {
         assert_eq!(daemon.recorded(), vec!["0:list-agents".to_string()]);
     }
 }
+
+/// Issue #1913: a deck restart that reuses an orchestration tab's pane ids.
+#[cfg(all(test, unix))]
+#[path = "ui_restart_surface_tests.rs"]
+mod restart_surface_tests;
