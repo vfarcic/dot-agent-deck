@@ -2301,6 +2301,10 @@ fn pump_reader(
             &agent_id,
             registry.is_shutting_down(),
             || registry.is_agent_still_registered(&agent_id),
+            || {
+                let mut inner = registry.inner.lock();
+                inner.agents.get_mut(&agent_id)?.child.try_wait().ok()?
+            },
         );
     }
     // PRD #1666 S3: whatever the exit, messages bound to this agent can no

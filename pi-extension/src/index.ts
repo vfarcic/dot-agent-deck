@@ -68,6 +68,7 @@ import {
 	WATCHER_NOT_IN_DECK_EXIT,
 } from "./orchestrator.ts";
 import { createPiTelemetry } from "./telemetry.ts";
+import { appendUsageLine, usageFileLine, usageFilePath, usageTurnStartLine } from "./usage-file.ts";
 
 /**
  * The deck CLI this pane shells: the operator's absolute `DOT_AGENT_DECK_BIN`
@@ -1302,6 +1303,22 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 			await telemetry.shutdown();
 		});
 	}
+	// PRD #1858: each reply's usage, and each turn's start, appended to the
+	// file the deck reads this run's usage from, when the deck named one. An
+	// append that is not safe is skipped: the run's usage is then not
+	// recorded, and Pi carries on.
+	const usageFile = usageFilePath(process.env, process.platform);
+	if (usageFile !== undefined) {
+		pi.on("agent_start", () => {
+			appendUsageLine(usageFile, usageTurnStartLine());
+		});
+		pi.on("message_end", (event) => {
+			const line = usageFileLine(event);
+			if (line !== undefined) {
+				appendUsageLine(usageFile, line);
+			}
+		});
+	}
 	// --- M2.1: native delegate tool --------------------------------------
 	pi.registerTool({
 		name: "delegate",
@@ -1471,8 +1488,10 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 				await report("before_agent_start", event, ctx);
 			} finally {
 				// Once its own hook has run, a hand-over goes on to run or be refused.
+				// Pi 1.2.0+ starts a custom-message run with no `prompt`; narrowed
+				// by the field, not by `messageType`, which earlier Pi does not send.
 				if (instance.proc !== undefined) {
-					starting(instance.proc, instance, event.prompt);
+					starting(instance.proc, instance, "prompt" in event ? event.prompt : undefined);
 				}
 			}
 		}),

@@ -771,3 +771,343 @@ fn wire_restart_009_restart_installed_reads_a_confirmation_too_large_for_the_com
     assert_full_set(&stopping, &agents);
     daemon.assert_replaced();
 }
+
+/// Stands in for systemd running the unit `daemon install` writes:
+/// `Restart=on-failure`, so a non-zero exit runs `ExecStart` again and a clean
+/// exit ends the service. Each run gets `INVOCATION_ID` and a
+/// `SYSTEMD_EXEC_PID` naming the daemon's own pid, which is what the daemon
+/// reads as "systemd started me". The first run can carry a build-id override,
+/// the older build the service ran before the upgrade; later runs are the
+/// build installed at the unit's path. Arguments: binary, state directory,
+/// first run's build id (may be empty).
+const SUPERVISOR: &str = r#"#!/bin/sh
+bin=$1; state=$2; first_build=$3
+runs=0
+while [ "$runs" -lt 3 ]; do
+  runs=$((runs + 1))
+  if [ "$runs" -eq 1 ] && [ -n "$first_build" ]; then
+    DOT_AGENT_DECK_BUILD_ID_OVERRIDE=$first_build; export DOT_AGENT_DECK_BUILD_ID_OVERRIDE
+  else
+    unset DOT_AGENT_DECK_BUILD_ID_OVERRIDE
+  fi
+  INVOCATION_ID=dad-e2e-supervised sh -c 'SYSTEMD_EXEC_PID=$$; export SYSTEMD_EXEC_PID; exec "$0" daemon serve' "$bin" &
+  printf '%s\n' "$!" > "$state/service.pid.tmp"
+  mv "$state/service.pid.tmp" "$state/service.pid"
+  wait "$!"
+  status=$?
+  printf '%s\n' "$status" >> "$state/exits"
+  [ "$status" -eq 0 ] && exit 0
+done
+exit 1
+"#;
+
+/// A real `daemon serve` under [`SUPERVISOR`], issue #1760.
+struct SupervisedDaemon {
+    supervisor: Child,
+    binary: PathBuf,
+    attach: PathBuf,
+    runtime: tokio::runtime::Runtime,
+    dir: TempDir,
+}
+
+impl SupervisedDaemon {
+    fn spawn(first_build: Option<&str>) -> Self {
+        common::init_test_env();
+        let dir = common::harness_tempdir().expect("supervised fixture tempdir");
+        fs::create_dir_all(dir.path().join("home")).expect("create isolated home");
+        let binary = dir.path().join("installed-build");
+        retain_binary(&binary);
+        let script = dir.path().join("supervisor.sh");
+        fs::write(&script, SUPERVISOR).expect("write the stand-in supervisor");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).expect("supervisor mode");
+        let log = fs::File::create(dir.path().join("daemon.log")).expect("daemon log");
+        let attach = dir.path().join("attach.sock");
+        let mut command = Command::new(&script);
+        command
+            .arg(&binary)
+            .arg(dir.path())
+            .arg(first_build.unwrap_or_default())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log))
+            .process_group(0);
+        Self::daemon_env(&mut command, dir.path(), &attach);
+        let supervisor = command.spawn().expect("start the stand-in supervisor");
+        let fixture = Self {
+            supervisor,
+            binary,
+            attach,
+            runtime: tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("supervised client runtime"),
+            dir,
+        };
+        assert!(
+            common::wait_until(WAIT, || fixture.hello().is_some()),
+            "the supervised daemon never answered Hello"
+        );
+        fixture
+    }
+
+    /// What every daemon of this fixture runs with, the service's or a
+    /// client's: the same isolated endpoints, state and home.
+    fn daemon_env(command: &mut Command, dir: &Path, attach: &Path) {
+        let home = dir.join("home");
+        command
+            .current_dir(&home)
+            .env_clear()
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+            )
+            .env("TERM", "xterm-256color")
+            .env("DOT_AGENT_DECK_SOCKET", dir.join("hook.sock"))
+            .env("DOT_AGENT_DECK_ATTACH_SOCKET", attach)
+            .env("DOT_AGENT_DECK_STATE_DIR", dir.join("state"))
+            .env("DOT_AGENT_DECK_SCHEDULES", dir.join("schedules.toml"))
+            .env("DOT_AGENT_DECK_LOG", dir.join("deck.log"))
+            .env("DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS", "0")
+            .env("DOT_AGENT_DECK_EXIT_WHEN_ORPHANED", "1")
+            .env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "300");
+    }
+
+    fn hello(&self) -> Option<AttachResponse> {
+        self.runtime
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_millis(500),
+                    DaemonClient::new(self.attach.clone()).probe_running(),
+                )
+                .await
+            })
+            .ok()?
+            .ok()?
+    }
+
+    /// The pid of the daemon the service runs now.
+    fn service_pid(&self) -> i32 {
+        read_pid(&self.dir.path().join("service.pid")).expect("the supervisor records its daemon")
+    }
+
+    /// The pid of whatever daemon is listening at the endpoint.
+    fn serving_pid(&self) -> Option<i32> {
+        self.runtime.block_on(async {
+            let stream = dot_agent_deck::platform::ipc::IpcStream::connect(&self.attach)
+                .await
+                .ok()?;
+            dot_agent_deck::platform::peercred::peer_pid(&stream)
+                .ok()
+                .map(|pid| pid as i32)
+        })
+    }
+
+    fn exits(&self) -> String {
+        fs::read_to_string(self.dir.path().join("exits")).unwrap_or_default()
+    }
+
+    /// The local client's own daemon, unsupervised: what the desktop's
+    /// `spawn_local_daemon` starts, standing in for it here. Records its pid in
+    /// `client-spawned.pid`.
+    fn client_spawn(&self) -> Box<dyn Fn() -> Result<(), String> + Send + Sync> {
+        let binary = self.binary.clone();
+        let dir = self.dir.path().to_path_buf();
+        let attach = self.attach.clone();
+        Box::new(move || {
+            let mut command = Command::new(&binary);
+            command
+                .args(["daemon", "serve"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0);
+            Self::daemon_env(&mut command, &dir, &attach);
+            let child = command.spawn().map_err(|e| e.to_string())?;
+            fs::write(dir.join("client-spawned.pid"), child.id().to_string())
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn client_spawned(&self) -> Option<i32> {
+        read_pid(&self.dir.path().join("client-spawned.pid"))
+    }
+
+    /// What the user sees with `systemctl --user status`: the service is
+    /// still active, its daemon is a new process the service started after a
+    /// failure-status exit, and that daemon is the one serving the endpoint.
+    fn assert_back_under_its_service(&mut self, old_pid: i32) {
+        assert!(
+            common::wait_until(WAIT, || self
+                .serving_pid()
+                .is_some_and(|pid| pid != old_pid)),
+            "no new daemon is serving the endpoint"
+        );
+        assert!(
+            self.supervisor
+                .try_wait()
+                .expect("poll supervisor")
+                .is_none(),
+            "the service stopped: its daemon exited with {:?}, which Restart=on-failure does \
+             not restart, and the client's own daemon (pid {:?}) is serving in its place",
+            self.exits().trim(),
+            self.client_spawned()
+        );
+        let service_pid = self.service_pid();
+        assert_ne!(
+            service_pid, old_pid,
+            "the service never restarted its daemon"
+        );
+        assert_eq!(
+            self.serving_pid(),
+            Some(service_pid),
+            "the daemon serving the endpoint is not the one the service runs"
+        );
+        assert_eq!(
+            self.exits().trim(),
+            dot_agent_deck::daemon_restart::SUPERVISED_RESTART_EXIT.to_string(),
+            "the old daemon must hand back to the service with the failure status"
+        );
+        assert_eq!(
+            self.client_spawned(),
+            None,
+            "the client started an unsupervised daemon beside the service"
+        );
+    }
+}
+
+impl Drop for SupervisedDaemon {
+    fn drop(&mut self) {
+        let group = self.supervisor.id() as i32;
+        let service = read_pid(&self.dir.path().join("service.pid"));
+        for pid in [Some(group), service, self.client_spawned()]
+            .into_iter()
+            .flatten()
+        {
+            if common::process_running(pid) {
+                // SAFETY: the supervisor's group and the daemon pids this
+                // fixture recorded.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+        let _ = self.supervisor.wait();
+        if std::thread::panicking() {
+            eprintln!(
+                "supervised fixture log:\n{}\nexits: {}",
+                fs::read_to_string(self.dir.path().join("daemon.log")).unwrap_or_default(),
+                self.exits()
+            );
+        }
+    }
+}
+
+/// Scenario: Run an idle daemon under a stand-in for the `daemon install`
+/// service (systemd's `Restart=on-failure`) and replace it from this machine
+/// the way the desktop's Replace does. The service must still be running
+/// afterwards, with a new daemon it started serving the endpoint, and the
+/// client must not have started a daemon of its own (issue #1760).
+#[spec("lifecycle/wire-restart/010")]
+#[test]
+fn wire_restart_010_a_local_replace_hands_a_supervised_daemon_back_to_its_service() {
+    use dot_agent_deck::daemon_client::{Endpoint, LocalEndpoint};
+    use dot_agent_deck::daemon_upgrade::{
+        CLIENT_VERSION, NoDecider, NoInstall, UpgradeOutcome, UpgradePlan, WireDaemonPort,
+        upgrade_daemon,
+    };
+    let mut daemon = SupervisedDaemon::spawn(None);
+    let old_pid = daemon.service_pid();
+    let port = WireDaemonPort::new(
+        &Endpoint::Local(LocalEndpoint::at(daemon.attach.clone())),
+        daemon.runtime.handle().clone(),
+        daemon.client_spawn(),
+    )
+    .expect("a port for the local daemon");
+    let plan = UpgradePlan {
+        version: CLIENT_VERSION.into(),
+        successor: RestartSuccessor::ClientSpawns,
+    };
+    let outcome = upgrade_daemon(
+        "this machine",
+        &plan,
+        &NoInstall,
+        &port,
+        &NoDecider,
+        &mut |_| {},
+    );
+    assert!(
+        matches!(outcome, UpgradeOutcome::Restarted { .. }),
+        "{outcome:?}"
+    );
+    daemon.assert_back_under_its_service(old_pid);
+}
+
+/// Scenario: The control for 010: the same supervised daemon asked for the
+/// remote upgrade's restart onto its installed build hands back to the service,
+/// which starts the daemon again. It passes without the fix, so the stand-in
+/// supervisor and the daemon's detection of it are not what 010 catches.
+#[spec("lifecycle/wire-restart/010")]
+#[test]
+fn wire_restart_010_control_an_installed_restart_already_hands_back() {
+    let mut daemon = SupervisedDaemon::spawn(None);
+    let old_pid = daemon.service_pid();
+    let reply = daemon
+        .runtime
+        .block_on(
+            DaemonClient::new(daemon.attach.clone()).restart_daemon(RestartDaemonRequest {
+                confirm: None,
+                expected_version: Some(dot_agent_deck::daemon_upgrade::CLIENT_VERSION.into()),
+                successor: RestartSuccessor::Installed,
+            }),
+        )
+        .expect("restart request must yield a structured reply");
+    assert!(
+        matches!(
+            reply,
+            GatedQuery::Answered(RestartDaemonReply::Accepted { .. })
+        ),
+        "{reply:?}"
+    );
+    daemon.assert_back_under_its_service(old_pid);
+}
+
+/// Scenario: Run an idle daemon of an older build under a stand-in for the
+/// `daemon install` service, then launch this build's TUI against it. The
+/// launch-time version check restarts the daemon and the dashboard appears;
+/// the service must still be running, now on this build, with its own daemon
+/// serving the endpoint the TUI attached to (issue #1760).
+#[spec("lifecycle/wire-restart/011")]
+#[test]
+fn wire_restart_011_the_tui_version_check_hands_a_supervised_daemon_back_to_its_service() {
+    let mut daemon = SupervisedDaemon::spawn(Some("0.0.1-g0000old"));
+    let old_pid = daemon.service_pid();
+    assert_eq!(
+        daemon.hello().and_then(|h| h.build_version).as_deref(),
+        Some("0.0.1-g0000old")
+    );
+    let deck = common::TuiDeck::builder()
+        .with_env(
+            "DOT_AGENT_DECK_ATTACH_SOCKET",
+            daemon.attach.to_string_lossy().to_string(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_SOCKET",
+            daemon
+                .dir
+                .path()
+                .join("hook.sock")
+                .to_string_lossy()
+                .to_string(),
+        )
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active agents");
+    daemon.assert_back_under_its_service(old_pid);
+    assert_eq!(
+        daemon.hello().and_then(|h| h.build_version),
+        Some(dot_agent_deck::build_id::local_build_id()),
+        "the service's daemon must be this build"
+    );
+}

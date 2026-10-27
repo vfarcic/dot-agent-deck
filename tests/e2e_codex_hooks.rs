@@ -357,7 +357,12 @@ fn codex_hooks_001_real_interactive_turn_reaches_idle_without_exit() {
             std::env::split_paths(&path)
                 .filter(|dir| !common::is_deck_telemetry_shim_dir(dir))
                 .map(|dir| dir.join("codex"))
-                .find(|candidate| candidate.is_file())
+                // Not the deck's telemetry shim, which a deck pane's `PATH`
+                // can carry ahead of the real Codex: the shim would find the
+                // recorder below as `codex` and the recorder the shim again.
+                .find(|candidate| {
+                    candidate.is_file() && !dot_agent_deck::telemetry::shim::is_shim_file(candidate)
+                })
         })
         .expect("available Codex binary resolves on PATH");
     let launcher_dir = common::harness_tempdir().expect("real Codex launcher directory");
