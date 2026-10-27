@@ -512,7 +512,10 @@ jobs:
           sudo apt-get update -qq
           rc=0
           out=$(pnpm exec playwright install-deps --dry-run chromium webkit 2>&1) || rc=$?
-          mapfile -t pkgs < <(sed -n 's/^  \([^ ]\+\)$/\1/p' <<< "$out")
+          pkgs=()
+          while read -r pkg; do
+            pkgs+=("$pkg")
+          done < <(sed -n 's/^  \([^ ]\+\)$/\1/p' <<< "$out")
           if [ "${#pkgs[@]}" -eq 0 ]; then
             echo "$out"
             if [ "$rc" -eq 0 ]; then

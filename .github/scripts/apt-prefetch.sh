@@ -65,7 +65,11 @@ for attempt in $(seq 1 "$attempts"); do
     sudo sed -i '/azure\.archive\.ubuntu\.com/d' "$mirrors"
     echo "apt prefetch: dropped the Azure mirror; the remaining attempts use:"
     sed 's/^/  /' "$mirrors"
-    sudo apt-get update -qq
+    # A failed refresh leaves the indexes already fetched, which the next
+    # mirror serves the same files for, so it is no reason to stop retrying.
+    if ! sudo apt-get update -qq; then
+      echo "::warning::apt prefetch: apt-get update failed after the mirror change; retrying with the existing indexes."
+    fi
   fi
 done
 
