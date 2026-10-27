@@ -123,9 +123,16 @@ fn capture(deck: &TuiDeck, scenario: &str, ready: impl Fn(&str) -> bool) {
     );
 }
 
+/// What the status line says while the startup hook install's note (PRD #91)
+/// is up. Every launch here is a first start in a fresh HOME, so on a machine
+/// with an agent on `PATH` the deck installs its hooks and says so for a few
+/// seconds; that note is about the capture machine, not the docs.
+const STARTUP_HOOK_NOTES: [&str; 2] = ["the deck's hooks for", "hooks could not be updated"];
+
 /// [`capture`], except that it stops waiting and returns `false`, writing
 /// nothing, once `give_up` holds before `ready` does. `ready` is checked
 /// first, so a frame that is ready is written even as `give_up` turns true.
+/// A frame showing a [`STARTUP_HOOK_NOTES`] note is never ready.
 /// Returns `true` once the frame is written; the harness's timeout still
 /// panics with the final grid if neither ever holds.
 fn capture_unless(
@@ -135,7 +142,12 @@ fn capture_unless(
     give_up: impl Fn() -> bool,
 ) -> bool {
     let page = deck.capture_screen_when(scenario, |screen| {
-        if ready(&screen.contents()) {
+        let contents = screen.contents();
+        if ready(&contents)
+            && !STARTUP_HOOK_NOTES
+                .iter()
+                .any(|note| contents.contains(note))
+        {
             Some(Some(render_page(
                 screen,
                 &format!("{scenario} (TUI)"),
