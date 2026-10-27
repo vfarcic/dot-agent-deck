@@ -689,6 +689,9 @@ pub(crate) enum RestartPause {
     BeforeAccepting,
     /// `Accepted` is written; the successor is not latched yet.
     AfterAccepting,
+    /// An answer that accepts nothing — `NeedsConfirmation` or a refusal —
+    /// is written; the handler has not returned yet.
+    AfterAnswering,
 }
 
 /// One pause in the restart handler (test only): it signals `reached`, then

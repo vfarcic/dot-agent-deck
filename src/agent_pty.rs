@@ -5732,6 +5732,11 @@ pub struct AgentPtyRegistry {
     /// child is terminated — see [`Self::pause_next_respawn_for_test`].
     #[cfg(test)]
     respawn_pause: RespawnPause,
+    /// Issue #1950 test seam: replaces [`RESPAWN_SETTLE_TIMEOUT`] in
+    /// [`Self::freeze_admission`] — see
+    /// [`Self::shorten_respawn_settle_for_test`].
+    #[cfg(test)]
+    respawn_settle: Mutex<Option<Duration>>,
     /// PRD #1666 §2.8 test seam: generations whose exit the inbox hears of
     /// only once the test lets it — see [`Self::hold_exit_cleanup_for_test`].
     #[cfg(test)]
@@ -7756,6 +7761,8 @@ impl AgentPtyRegistry {
             respawns_settled: Notify::new(),
             #[cfg(test)]
             respawn_pause: Mutex::new(None),
+            #[cfg(test)]
+            respawn_settle: Mutex::new(None),
             #[cfg(test)]
             exit_cleanup_holds: Mutex::new(HashMap::new()),
             #[cfg(test)]
@@ -15989,7 +15996,23 @@ impl AgentPtyRegistry {
     /// at once with a message saying the daemon is restarting, rather than
     /// waiting on a decision that may take a client round trip.
     pub async fn freeze_admission(&self) -> Result<AdmissionFreeze<'_>, RespawnsInFlight> {
-        self.freeze_admission_within(RESPAWN_SETTLE_TIMEOUT).await
+        #[cfg(test)]
+        let settle = self
+            .respawn_settle
+            .lock()
+            .unwrap()
+            .unwrap_or(RESPAWN_SETTLE_TIMEOUT);
+        #[cfg(not(test))]
+        let settle = RESPAWN_SETTLE_TIMEOUT;
+        self.freeze_admission_within(settle).await
+    }
+
+    /// Issue #1950 test seam: bound [`Self::freeze_admission`]'s wait for
+    /// respawns in flight by `settle`, so a restart refused for a stuck
+    /// respawn answers without waiting out [`RESPAWN_SETTLE_TIMEOUT`].
+    #[cfg(test)]
+    pub(crate) fn shorten_respawn_settle_for_test(&self, settle: Duration) {
+        *self.respawn_settle.lock().unwrap() = Some(settle);
     }
 
     /// [`Self::freeze_admission`] with its wait for respawns in flight bounded
