@@ -206,6 +206,71 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** delivery on a logged-out host; that outcome is unverified, not a successful delivery check.
 - **Platform coverage:** mac+linux when authenticated.
 
+#### telemetry/usage
+
+##### telemetry/usage/001 — Codex rollout totals, allowance and final-turn termination reach the run.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_usage.rs`).
+- **Agent:** offline Codex stand-ins; no real agent or credentials.
+- **Asserts:** three ended runs export per-model and aggregate input/output/cache counts, provider provenance, unavailable cost, the Pro window and first/last allowance samples; completed, server-overloaded failure and interrupted endings retain provider termination.
+- **Does not assert:** a real Codex upgrade's rollout format, overlapping subscription attribution or hosted ingestion.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/usage/002 — OpenCode subscription zeros are unavailable costs with tokens preserved.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_usage.rs`).
+- **Agent:** offline OpenCode reply-file stand-in.
+- **Asserts:** run and model usage carry provider-reported tokens, cost unavailable with subscription_zero and no numeric cost, and a completed provider termination.
+- **Does not assert:** the real OpenCode plugin, duplicate reply replacement or interrupted replies.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/usage/003 — Pi exports tokens and a labelled cost estimate.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_usage.rs`).
+- **Agent:** offline Pi reply-file stand-in.
+- **Asserts:** run and model input include cache reads, output and cache counts match, cost is 4200 microusd with estimated provenance, quota is unavailable with no_channel, and termination is completed.
+- **Does not assert:** the real Pi extension or list-price correctness for an arbitrary provider.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/usage/004 — Arbitrary commands export no-channel usage and measured exit outcomes.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_usage.rs`).
+- **Agent:** shell commands exiting 0 and 3; no real agent.
+- **Asserts:** tokens, cost and quota are unavailable with no_channel and absent numeric values; one anonymous unavailable model event is exported; successful exit is completed, nonzero exit is failed with nonzero_exit, both measured.
+- **Does not assert:** signal termination, daemon shutdown or an unknown exit status.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/usage/005 — Claude final transcript exports model totals, estimates and API failure details.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_usage.rs`).
+- **Agent:** offline Claude transcript and session-hook stand-ins.
+- **Asserts:** completed and rate-limited runs export input including cache read/write, output, provider-reported tokens and estimated 12300 microusd cost per model and in aggregate; termination and last turn distinguish completed from failed, with rate_limit and HTTP 429 on failure.
+- **Does not assert:** resumed-session baseline subtraction or a killed Claude session without cost-state.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/usage/006 — Usage export excludes transcript content, paths and arbitrary model and error names.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_usage.rs`).
+- **Agent:** offline Claude, Codex, Pi and OpenCode with private transcript and model markers.
+- **Asserts:** prompt, reply, tool result, error message, cwd, unrecognized model and error-kind markers reach neither captured request bodies (including span attributes/events) nor telemetry-module logs; lowercase paths, slash/dot namespaces and a private family-prefixed name are excluded through Claude modelUsage and assistant message.model, Codex turn_context.model and Pi/OpenCode reply-file models. Positive controls retain run/event token counts, recognized Claude/GPT model names and failed termination, map the error kind to other and omit unrecognized model names.
+- **Does not assert:** an external agent's own telemetry, unrelated daemon log targets or protobuf encoding.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/usage/007 — Real interactive Haiku exports model usage and completed termination. [reel]
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_telemetry_export_live.rs`), developer machine only.
+- **Agent:** real interactive Claude Code on pinned Haiku, imported credentials and seeded trust.
+- **Asserts:** a directive inbox task visibly advances Thinking → Working/Bash → Idle and copies a unique fixture sentinel; normal Claude exit exports positive provider-reported input/output tokens, positive estimated cost and provider-reported completed termination, with a Haiku-family model usage event on agent.run.
+- **Does not assert:** billing, exact token counts or a different agent/model.
+- **Platform coverage:** mac+linux when authenticated.
+
+##### telemetry/usage/008 — A child started from a parent pane keeps its usage under its own run id.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_usage.rs`).
+- **Agent:** offline Pi parent and child; parent requests the child through the real attach socket from inside its process.
+- **Asserts:** inherited usage-file and OTEL resource environment do not combine the runs; receiver spans have different run ids and separate model/aggregate token counts and estimated costs, each with completed termination.
+- **Does not assert:** work-item rollups, real-agent tool invocation or orchestration role accounting.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/usage/009 — Spawns without an allocated usage channel discard an inherited usage-file path.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_usage.rs`).
+- **Agent:** offline Pi/OpenCode stand-ins with export disabled and a plain command with export enabled.
+- **Asserts:** when the daemon inherits DOT_AGENT_DECK_USAGE_FILE, a spawn without an allocated channel receives an absent or empty value and its attempted reply append leaves the parent's file unchanged.
+- **Does not assert:** real extension/plugin callbacks, the allocated-channel case (covered by 002/003/008) or hosted ingestion.
+- **Platform coverage:** mac+linux.
+
 ### Session pull requests
 
 #### session/pr
@@ -3210,6 +3275,20 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Agent:** three synthetic cat stand-ins, including two orchestration roles.
 - **Asserts:** a 600-agent confirmation whose hex form exceeds 128 KiB is read whole from stdin and answered as stale with the real three disclosed, leaving the daemon, agents and role map untouched; the disclosed set sent the same way is accepted and the daemon is replaced.
 - **Does not assert:** the laptop side choosing stdin over `--confirm-hex` or the ssh transport (`remote_daemon` unit tests own those); a remote whose ssh client drops stdin.
+- **Platform coverage:** linux+mac.
+
+##### lifecycle/wire-restart/010 — The desktop's local Replace hands a supervised daemon back to its service instead of stopping it (issue #1760).
+- **Layer:** L2 (lane 1, a real headless daemon under a stand-in for the `daemon install` service: a shell loop with systemd's `Restart=on-failure` semantics that sets `INVOCATION_ID` and `SYSTEMD_EXEC_PID`; the shared `upgrade_daemon` with the desktop's `WireDaemonPort` and `NoInstall`, its spawn a stand-in for `spawn_local_daemon`).
+- **Agent:** none.
+- **Asserts:** the Replace reports `Restarted`; the stand-in service is still running; the old daemon exited with `SUPERVISED_RESTART_EXIT`; the daemon listening at the endpoint is the new one the service started; the client started no daemon of its own. Control (same id): the remote upgrade's `Installed` restart sent straight to the same supervised daemon hands back the same way without the fix, so the stand-in and the daemon's detection of it are not what the main case catches.
+- **Does not assert:** real systemd or launchd (verified by hand against a transient `systemd-run --user` unit with `Restart=on-failure` on 2026-10-26); the fallback when the service's build is another version (`daemon_upgrade` unit test `a_supervised_daemon_is_handed_back_to_its_service_unless_it_refuses`); the desktop's UI.
+- **Platform coverage:** linux+mac.
+
+##### lifecycle/wire-restart/011 — The TUI's launch-time version check hands a supervised daemon of an older build back to its service (issue #1760).
+- **Layer:** L2 (lane 1, the real TUI in a PTY against a real headless daemon under the same stand-in service as 010, whose first run reports an older build id).
+- **Agent:** none.
+- **Asserts:** the dashboard appears; the stand-in service is still running; the old daemon exited with `SUPERVISED_RESTART_EXIT`; the daemon listening at the endpoint is the new one the service started, and it reports this build.
+- **Does not assert:** the consented restart with live agents; a service whose build is another version, which the TUI stops as before; real systemd (verified by hand as for 010).
 - **Platform coverage:** linux+mac.
 
 
@@ -8339,15 +8418,15 @@ Since PRD #1666 S5 the deck types nothing into the orchestrator: its idle, waiti
 - **Agent:** none.
 - **Asserts:** Leave a task Queued and then Fetched across two idle windows. No idle notice appears until the worker acknowledges it, after which the idle clock begins and one daemon notice reaches the orchestrator inbox.
 - **Test:** `idle_worker_026_response_clocks_start_after_deferred_pointer` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
-- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
+- **Does not assert:** silence during intervals missed by a delayed observer or exact daemon timer arithmetic; real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
-##### scheduler/idle-worker/027 — Supersede an unacknowledged task with a newer one. The newer task starts no idle clock until its own acknowledgement, then one bound idle notice reaches the orchestrator inbox.
+##### scheduler/idle-worker/027 — Supersede an unacknowledged task with a newer one. The newer task starts no idle clock until its own acknowledgement; inbox samples completed within 250 ms of the acknowledgement request remain silent, then one bound idle notice reaches the orchestrator inbox.
 - **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** Supersede an unacknowledged task with a newer one. The newer task starts no idle clock until its own acknowledgement, then one bound idle notice reaches the orchestrator inbox.
+- **Asserts:** Supersede an unacknowledged task with a newer one. The newer task starts no idle clock until its own acknowledgement; inbox samples completed within 250 ms of the acknowledgement request remain silent, then one bound idle notice reaches the orchestrator inbox.
 - **Test:** `idle_worker_027_queued_delegate_clocks_start_after_its_pointer` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
-- **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
+- **Does not assert:** silence during intervals missed by a delayed observer or exact daemon timer arithmetic; real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/idle-worker/028 — Acknowledge a task and report work-done before its idle timeout. The orchestrator receives the completion in its inbox and never a stale idle-worker notice.
@@ -9418,8 +9497,8 @@ The receipt spool (`src/inbox_receipt.rs`, PRD #1666 design v3.2 §3, §5): the 
 ##### inbox/protocol/005 — Live hook receivers are bounded at eight and freed by closing.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_protocol.rs`), nine receipt fetches (`inbox_receipt_fetch`, consumer `cli`) with a one-character budget, eight held open.
 - **Agent:** none (`cat` stand-in).
-- **Asserts:** each of eight held hooks is handed one message and none counts as an armed waiter; a ninth is refused `too_many_hooks`, handed nothing, and its message stays Queued; once one hook closes, a fresh fetch is admitted and handed that message (PRD #1666 part 3, H5, which retired the legacy per-agent waiter cap).
-- **Does not assert:** the deck-wide `MAX_INBOX_WAITERS` (`inbox_hub` unit tests).
+- **Asserts:** each of eight held hooks is handed one message and none counts as an armed waiter; the first hook's actual message is explicitly Acknowledged while its socket stays open; a ninth is still refused `too_many_hooks`, handed nothing, and its message stays Queued; once that settled hook closes, a fresh fetch is admitted and handed the ninth message (PRD #1666 part 3, H5, which retired the legacy per-agent waiter cap).
+- **Does not assert:** recovery of an unacknowledged message after its hook closes (inbox/attempts/017), or the deck-wide `MAX_INBOX_WAITERS` (`inbox_hub` unit tests).
 - **Platform coverage:** mac+linux.
 
 ##### inbox/protocol/006 — Idle waiters survive the hook read timeout.

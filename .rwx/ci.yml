@@ -213,6 +213,8 @@ tasks:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_INCREMENTAL: "0"
     run: |
+      # pi-extension/'s typecheck (issue #1708), as in ci.yml's `test` job.
+      (cd pi-extension && npm ci --ignore-scripts && npm run typecheck)
       cargo test-fast
       # Keep only the dependencies in the tool cache, as Swatinem/rust-cache
       # does on GitHub: the workspace crates rebuild every run anyway (fresh

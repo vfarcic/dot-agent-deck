@@ -1039,17 +1039,6 @@ fn list_hooks_in_within(
     list_hooks_with(Path::new("codex"), home, cwd, timeout)
 }
 
-/// The variables among `keys` that [`list_hooks_with`] keeps from `codex
-/// app-server`: every `OTEL_` one. The listing is the deck asking Codex a
-/// question, not a Codex run anyone wants to observe, and with the deck's own
-/// exporter settings Codex exported its own traces, as `codex-app-server`, to
-/// wherever the deck's go (issue #1665: an e2e deck's telemetry receiver read
-/// them as the deck's).
-fn telemetry_vars(keys: impl Iterator<Item = std::ffi::OsString>) -> Vec<std::ffi::OsString> {
-    keys.filter(|key| key.as_encoded_bytes().starts_with(b"OTEL_"))
-        .collect()
-}
-
 /// [`list_hooks_in_within`] with the `codex` program named, so a test can hand
 /// it a stand-in without rewriting this process's `PATH`.
 fn list_hooks_with(
@@ -1059,17 +1048,23 @@ fn list_hooks_with(
     timeout: Duration,
 ) -> std::io::Result<HooksListing> {
     let mut command = Command::new(codex);
-    command
+    // A listing is the deck's own probe, not a Codex session of the user's:
+    // Codex exports its own telemetry when an `OTEL_*` endpoint is in its
+    // environment, and this one would reach the user's backend as a
+    // `codex-app-server` service the user never ran.
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("OTEL_") {
+            command.env_remove(key);
+        }
+    }
+    let mut child = command
         .arg("app-server")
         .current_dir(cwd)
         .env("CODEX_HOME", home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    for key in telemetry_vars(std::env::vars_os().map(|(key, _)| key)) {
-        command.env_remove(key);
-    }
-    let mut child = command.spawn()?;
+        .stderr(Stdio::null())
+        .spawn()?;
 
     let requests = format!(
         "{}\n{}\n",
@@ -4026,31 +4021,6 @@ mod tests {
             records_still_installed(records(), home.path(), expected),
             records(),
             "an unreadable hooks.json is no evidence, so the listing stands"
-        );
-    }
-
-    /// Issue #1665: the `hooks/list` probe keeps every `OTEL_` variable from
-    /// `codex app-server`, and nothing else.
-    #[test]
-    fn the_hooks_list_probe_keeps_only_telemetry_variables_from_codex() {
-        let keys = [
-            "OTEL_EXPORTER_OTLP_ENDPOINT",
-            "OTEL_EXPORTER_OTLP_HEADERS",
-            "OTEL_SERVICE_NAME",
-            "PATH",
-            "CODEX_HOME",
-            "MY_OTEL_THING",
-            "otel_lowercase",
-        ]
-        .map(std::ffi::OsString::from);
-        assert_eq!(
-            telemetry_vars(keys.into_iter()),
-            [
-                "OTEL_EXPORTER_OTLP_ENDPOINT",
-                "OTEL_EXPORTER_OTLP_HEADERS",
-                "OTEL_SERVICE_NAME",
-            ]
-            .map(std::ffi::OsString::from)
         );
     }
 
