@@ -806,7 +806,7 @@ fn slow_connect(
     (IdentityLookups::PLATFORM.connect)(path, budget.saturating_sub(pause))
 }
 
-/// Scenario: A daemon reads each probe and then stays silent with the connection open, and every connect to it takes long enough to leave less than the silence window of the send's deadline. Each send ends at its deadline within the send timeout (plus scheduling slack) and records no verdict, so the next send probes the same daemon again; a send whose connect leaves the whole window records Unsupported (the control). And a daemon that does serve reports but answers its probe only after the deadline is recorded Unsupported: the window keeps the wrapper from judging too early, not from misjudging a slow live daemon.
+/// Scenario: A daemon reads each probe and stays silent with the connection open; slow connects leave less than the silence window, and a delayed identity lookup also exhausts the deadline before the probe can be written. Both paths end within the send timeout (plus scheduling slack), record no verdict and try again, with completed probes reaching the daemon; a send with the whole silence window records Unsupported (the control). A daemon that serves reports but answers its probe only after the deadline is also recorded Unsupported: the window prevents judging too early, not misjudging a slow live daemon.
 #[spec("inbox/doorbell/052")]
 #[test]
 fn doorbell_052_silence_after_a_slow_connect_is_asked_again() {
@@ -826,32 +826,68 @@ fn doorbell_052_silence_after_a_slow_connect_is_asked_again() {
         ..IdentityLookups::PLATFORM
     };
     let mut cache = VerdictCache::default();
+    let mut completed_probes = 0;
     for round in 1..=2 {
         let started = Instant::now();
         let sent = target(&silent).send(&fresh(round), &mut cache, &slow);
         let took = started.elapsed();
         let (outcome, identity, _) = sent.expect("connected");
         assert!(identity.is_some());
-        assert_eq!(
-            outcome,
-            Exchange::Ended { why: "deadline" },
-            "round {round}"
-        );
+        // Only 150 ms remains after slow_connect. On a loaded runner it
+        // can expire during identification or before the probe's write;
+        // exchange calls that probe_write_failed even without a socket error.
+        match outcome {
+            Exchange::Ended { why: "deadline" } => completed_probes += 1,
+            Exchange::Ended {
+                why: "probe_write_failed",
+            } => {}
+            other => panic!("round {round}: {other:?}"),
+        }
         assert!(took < MODE_SEND_TIMEOUT + SLACK, "round {round}: {took:?}");
         assert!(cache.is_empty(), "round {round}: no verdict recorded");
     }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while probes.load(std::sync::atomic::Ordering::SeqCst) < 2 && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
+
+    // Force that scheduling case on every platform. The peer stays open,
+    // isolating deadline exhaustion from a broken pipe or reset.
+    let starved = IdentityLookups {
+        connect: slow_connect,
+        started: |pid| {
+            std::thread::sleep(MODE_PROBE_SILENCE);
+            (IdentityLookups::PLATFORM.started)(pid)
+        },
+        ..IdentityLookups::PLATFORM
+    };
+    for round in 3..=4 {
+        let started = Instant::now();
+        let (outcome, identity, _) = target(&silent)
+            .send(&fresh(round), &mut cache, &starved)
+            .expect("connected");
+        assert!(identity.is_some());
+        assert_eq!(
+            outcome,
+            Exchange::Ended {
+                why: "probe_write_failed"
+            },
+            "round {round}"
+        );
+        assert!(started.elapsed() < MODE_SEND_TIMEOUT + SLACK);
+        assert!(cache.is_empty(), "round {round}: no verdict recorded");
     }
-    assert_eq!(
-        probes.load(std::sync::atomic::Ordering::SeqCst),
-        2,
-        "each send probed"
-    );
-    let sent = target(&silent).send(&fresh(3), &mut cache, &IdentityLookups::PLATFORM);
+
+    let sent = target(&silent).send(&fresh(5), &mut cache, &IdentityLookups::PLATFORM);
     let (outcome, _, _) = sent.expect("connected");
     assert_eq!(outcome, Exchange::Withheld { probed: true });
+    completed_probes += 1;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while probes.load(std::sync::atomic::Ordering::SeqCst) < completed_probes
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        probes.load(std::sync::atomic::Ordering::SeqCst) >= completed_probes,
+        "every completed probe reached the peer"
+    );
 
     let late = dir.path().join("late.sock");
     endpoint(&late, |mut conn| {
@@ -860,7 +896,7 @@ fn doorbell_052_silence_after_a_slow_connect_is_asked_again() {
         let _ = conn.write_all(format!("{SUPPORTED}\n").as_bytes());
     });
     let mut cache = VerdictCache::default();
-    let sent = target(&late).send(&fresh(4), &mut cache, &IdentityLookups::PLATFORM);
+    let sent = target(&late).send(&fresh(6), &mut cache, &IdentityLookups::PLATFORM);
     let (outcome, identity, _) = sent.expect("connected");
     assert_eq!(outcome, Exchange::Withheld { probed: true });
     assert_eq!(
