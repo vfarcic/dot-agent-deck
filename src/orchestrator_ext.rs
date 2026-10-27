@@ -47,8 +47,10 @@ pub const ENV_PI_AGENT_DIR: &str = "PI_CODING_AGENT_DIR";
 ///   - `orchestrator.ts`    — the pure logic `index.ts` imports via
 ///     `./orchestrator.ts`,
 ///   - `telemetry.ts`       — Pi's own OTLP export, inert unless the deck
-///     switches it on (PRD #1741), which `index.ts` imports, and
-///   - `index.ts`           — the Pi-API glue (default-export factory).
+///     switches it on (PRD #1741), which `index.ts` imports,
+///   - `usage-file.ts`      — the per-turn usage file writer (#1932), which
+///     `index.ts` imports and which itself imports `./orchestrator.ts`, and
+///   - `index.ts`          — the Pi-API glue (default-export factory).
 ///
 /// A `package.json` is intentionally **not** embedded: the subdirectory
 /// `index.ts` discovery layout does not require one: the extension's one
@@ -70,6 +72,10 @@ pub const EXTENSION_FILES: &[(&str, &str)] = &[
     (
         "telemetry.ts",
         include_str!("../pi-extension/src/telemetry.ts"),
+    ),
+    (
+        "usage-file.ts",
+        include_str!("../pi-extension/src/usage-file.ts"),
     ),
     ("index.ts", include_str!("../pi-extension/src/index.ts")),
 ];
@@ -1067,6 +1073,106 @@ mod tests {
             .expect("index.ts must be embedded");
         assert!(index.contains("export default function"));
         assert!(index.contains("./orchestrator.ts"));
+    }
+
+    /// The relative module specifiers (`./x`, `../x`) a source imports, in
+    /// the forms the extension can use: `from "…"` (imports and re-exports),
+    /// a bare `import "…"`, and `import("…")` / `require("…")`. A specifier
+    /// in a comment counts too, which errs towards demanding a file.
+    fn relative_imports(source: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        for lead in ["from ", "import ", "import(", "require("] {
+            for (at, _) in source.match_indices(lead) {
+                let rest = &source[at + lead.len()..];
+                let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+                    continue;
+                };
+                let Some(end) = rest[1..].find(quote) else {
+                    continue;
+                };
+                let spec = &rest[1..1 + end];
+                if spec.starts_with("./") || spec.starts_with("../") {
+                    found.push(spec.to_string());
+                }
+            }
+        }
+        found
+    }
+
+    /// Issue #1965: every file the materialized extension imports, followed
+    /// from `index.ts` transitively, is itself in [`EXTENSION_FILES`], flat
+    /// beside it and published before the file that imports it. v0.49.2
+    /// installed an `index.ts` importing `./usage-file.ts` without that file,
+    /// so every Pi agent failed to load the extension and exited at start.
+    #[test]
+    fn every_relative_import_of_the_extension_is_embedded() {
+        let position = |name: &str| EXTENSION_FILES.iter().position(|(n, _)| *n == name);
+        let source_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("pi-extension/src");
+        let mut problems = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut queue = vec!["index.ts".to_string()];
+        while let Some(file) = queue.pop() {
+            if !seen.insert(file.clone()) {
+                continue;
+            }
+            // A missing dependency is still followed, from the checkout, so
+            // one run names everything the install would lack.
+            let source = match position(&file) {
+                Some(i) => EXTENSION_FILES[i].1.to_string(),
+                None => std::fs::read_to_string(source_dir.join(&file)).unwrap_or_default(),
+            };
+            for spec in relative_imports(&source) {
+                let Some(name) = spec.strip_prefix("./").filter(|n| !n.contains('/')) else {
+                    problems.push(format!(
+                        "{file} imports {spec:?}, which is outside the flat extension directory"
+                    ));
+                    continue;
+                };
+                match (position(name), position(&file)) {
+                    (None, _) => problems.push(format!(
+                        "{file} imports {spec:?}, but {name} is not in EXTENSION_FILES"
+                    )),
+                    (Some(dep), Some(importer)) if dep >= importer => problems.push(format!(
+                        "{file} imports {spec:?}, but {name} is published after it"
+                    )),
+                    _ => {}
+                }
+                queue.push(name.to_string());
+            }
+        }
+        assert!(
+            problems.is_empty(),
+            "the materialized Pi extension would not load:\n  {}",
+            problems.join("\n  ")
+        );
+    }
+
+    /// The import scan reads every form the extension uses, so the test above
+    /// cannot pass for want of seeing an import.
+    #[test]
+    fn relative_imports_reads_each_import_form() {
+        let source = r#"
+            import { spawn } from "node:child_process";
+            import {
+                a,
+            } from "./multi.ts";
+            import type { T } from './typed.ts';
+            export { b } from "./reexport.ts";
+            import "./side-effect.js";
+            const c = await import("./dynamic.ts");
+            const d = require("../up.js");
+        "#;
+        assert_eq!(
+            relative_imports(source),
+            [
+                "./multi.ts",
+                "./typed.ts",
+                "./reexport.ts",
+                "./side-effect.js",
+                "./dynamic.ts",
+                "../up.js"
+            ]
+        );
     }
 
     fn embedded(name: &str) -> &'static str {
