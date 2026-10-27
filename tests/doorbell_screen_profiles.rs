@@ -198,7 +198,7 @@ fn latched(trace: &Trace) -> (AgentType, Version) {
     }
 }
 
-/// Scenario: Replay the recorded start-up of Codex 0.164.0, Codex 0.160.0 and Claude Code 2.1.310 through the release scanner at the PTY reader's recorded split, one byte at a time, and as one push. Each latches its own release every way.
+/// Scenario: Replay the recorded start-up of Codex 0.164.0, Codex 0.160.0 and Claude Code 2.1.310 and 2.1.312 through the release scanner at the PTY reader's recorded split, one byte at a time, and as one push. Each latches its own release every way.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_release_headers_latch_from_real_launches() {
@@ -232,6 +232,16 @@ fn doorbell_036_release_headers_latch_from_real_launches() {
             "claude-inbox/r5wake/claude-2.1.310-composer-24x80",
             AgentType::ClaudeCode,
             "2.1.310",
+        ),
+        (
+            "claude-inbox/r5wake/claude-2.1.312-start-50x200",
+            AgentType::ClaudeCode,
+            "2.1.312",
+        ),
+        (
+            "claude-inbox/r5wake/claude-2.1.312-composer-24x80",
+            AgentType::ClaudeCode,
+            "2.1.312",
         ),
         (
             "codex-inbox/r5wake/codex-0.164.0-deck-tester-fresh-46x130",
@@ -410,34 +420,53 @@ fn doorbell_036_codex_composer_over_real_frames() {
     }
 }
 
-/// Scenario: Read the recorded Claude Code 2.1.310 composer session at the empty composer, after the deck's line was written, at each read after its Enter, and after a clear. The profile sees the empty ready composer with its suggestion as placeholder, the exact line, the submitted line as a user message on its shaded row while it is drawn, and a cleared composer that is empty but shows no placeholder.
+/// Scenario: Read the recorded Claude Code 2.1.310 and 2.1.312 composer sessions at the empty composer, after the deck's line was written, at each read after its Enter, and after a clear. The profile sees the empty ready composer with its suggestion as placeholder, the exact line, the submitted line as a user message on its shaded row while it is drawn, and a cleared composer that is empty but shows no placeholder. Replay 2.1.312's compound-key capture too: marker insertion reveals the reviewer's retained two spaces, and blank Enter after non-ASCII deletion preserves the draft.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_claude_composer_over_real_frames() {
-    let trace = fixture("claude-inbox/r5wake/claude-2.1.310-composer-24x80");
-    let p = &CLAUDE_PROFILE;
-    let empty = trace.grid("empty");
-    assert!(p.empty_and_ready(&empty));
-    assert!(p.placeholder_empty(&empty));
-    let line = &trace.lines[0];
-    let typed = trace.grid("typed-01");
-    assert_eq!(holds(p, &typed, line), Some(ComposerText::Exact));
-    assert!(!(p.transcript_user_line)(&typed, line));
-    assert_eq!(strict_withdrawal(p, &typed, line), Ok(line.chars().count()));
-    let after_cr = trace.reads_between(trace.points["mark:cr-1"], trace.points["after-01"]);
-    assert!(
-        after_cr.iter().any(|g| (p.transcript_user_line)(g, line)),
-        "the submitted line is drawn as a user message"
-    );
-    let cleared = trace.grid("cleared-01");
+    for release in ["2.1.310", "2.1.312"] {
+        let trace = fixture(&format!(
+            "claude-inbox/r5wake/claude-{release}-composer-24x80"
+        ));
+        let p = &CLAUDE_PROFILE;
+        let empty = trace.grid("empty");
+        assert!(p.empty_and_ready(&empty));
+        assert!(p.placeholder_empty(&empty));
+        let line = &trace.lines[0];
+        let typed = trace.grid("typed-01");
+        assert_eq!(holds(p, &typed, line), Some(ComposerText::Exact));
+        assert!(!(p.transcript_user_line)(&typed, line));
+        assert_eq!(strict_withdrawal(p, &typed, line), Ok(line.chars().count()));
+        let after_cr = trace.reads_between(trace.points["mark:cr-1"], trace.points["after-01"]);
+        assert!(
+            after_cr.iter().any(|g| (p.transcript_user_line)(g, line)),
+            "the submitted line is drawn as a user message"
+        );
+        let cleared = trace.grid("cleared-01");
+        assert_eq!(
+            holds(p, &cleared, line),
+            Some(ComposerText::Empty { placeholder: false })
+        );
+        assert!(p.empty_and_ready(&cleared));
+        assert!(
+            !p.placeholder_empty(&cleared),
+            "a blank composer is not the placeholder"
+        );
+    }
+    let keys = fixture("claude-inbox/r5wake/claude-2.1.312-compound-keys-50x200");
+    for (point, expected) in [("reviewer-reveal", "X  Z"), ("end", "X   Z")] {
+        assert_eq!(
+            (CLAUDE_PROFILE.composer)(&keys.grid(point)).unwrap().text,
+            expected,
+            "{point}"
+        );
+    }
+    let before = keys.grid("blank-enter-before");
+    let after = keys.grid("blank-enter-after");
+    assert_eq!(before.cursor, after.cursor);
     assert_eq!(
-        holds(p, &cleared, line),
-        Some(ComposerText::Empty { placeholder: false })
-    );
-    assert!(p.empty_and_ready(&cleared));
-    assert!(
-        !p.placeholder_empty(&cleared),
-        "a blank composer is not the placeholder"
+        (CLAUDE_PROFILE.composer)(&before),
+        (CLAUDE_PROFILE.composer)(&after)
     );
 }
 
@@ -682,26 +711,30 @@ fn doorbell_036_dialog_markers_and_false_dialogs() {
     assert_eq!((CLAUDE_PROFILE.dialog)(&claude.grid("empty")), None);
 }
 
-/// Scenario: Parse a Claude Code frame and a Codex dialog frame at the width they were drawn at, at one column more and at one column fewer. The width witness holds at the drawn width only; and Claude Code's recorded resizes each start with its full-redraw marker.
+/// Scenario: Parse Claude Code 2.1.310 and 2.1.312 frames and a Codex dialog frame at the width they were drawn at, at one column more and at one column fewer. The width witness holds at the drawn width only; and both Claude releases' recorded resizes each start with the same full-redraw marker.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_width_witness_and_redraw_marker() {
-    let claude = fixture("claude-inbox/r5wake/claude-2.1.310-start-50x200");
-    let end = claude.points["end"];
-    let bytes = &claude.bytes[..end];
-    assert!(witness(&CLAUDE_PROFILE, bytes, claude.rows, claude.cols));
-    assert!(!witness(
-        &CLAUDE_PROFILE,
-        bytes,
-        claude.rows,
-        claude.cols + 1
-    ));
-    assert!(!witness(
-        &CLAUDE_PROFILE,
-        bytes,
-        claude.rows,
-        claude.cols - 1
-    ));
+    for release in ["2.1.310", "2.1.312"] {
+        let claude = fixture(&format!(
+            "claude-inbox/r5wake/claude-{release}-start-50x200"
+        ));
+        let end = claude.points["end"];
+        let bytes = &claude.bytes[..end];
+        assert!(witness(&CLAUDE_PROFILE, bytes, claude.rows, claude.cols));
+        assert!(!witness(
+            &CLAUDE_PROFILE,
+            bytes,
+            claude.rows,
+            claude.cols + 1
+        ));
+        assert!(!witness(
+            &CLAUDE_PROFILE,
+            bytes,
+            claude.rows,
+            claude.cols - 1
+        ));
+    }
     let update = fixture("codex-inbox/r5wake/codex-0.164.0-start-update-50x200");
     assert!(witness(
         &CODEX_PROFILE,
@@ -743,20 +776,24 @@ fn doorbell_036_width_witness_and_redraw_marker() {
     // Claude Code's recorded resizes and nudges: each edge's bytes carry its
     // full-redraw marker, and the frame after it is a witness at the width in
     // force and not two columns wider.
-    let layout = fixture("claude-inbox/r5wake/claude-2.1.310-layout-50x200");
-    for i in 1..=10 {
-        for kind in ["resize", "nudge"] {
-            let mark = layout.points[&format!("mark:{kind}-{i}")];
-            let shot = layout.points[&format!("{kind}-{i:02}")];
-            assert!(
-                find_marker(&layout.bytes[mark..shot], CLAUDE_PROFILE.redraw_marker).is_some(),
-                "{kind}-{i}: no redraw"
-            );
-            assert!(layout.witness_upto(&CLAUDE_PROFILE, shot), "{kind}-{i}");
-            assert!(
-                !layout.widened().witness_upto(&CLAUDE_PROFILE, shot),
-                "{kind}-{i}: witness at the wrong width"
-            );
+    for release in ["2.1.310", "2.1.312"] {
+        let layout = fixture(&format!(
+            "claude-inbox/r5wake/claude-{release}-layout-50x200"
+        ));
+        for i in 1..=10 {
+            for kind in ["resize", "nudge"] {
+                let mark = layout.points[&format!("mark:{kind}-{i}")];
+                let shot = layout.points[&format!("{kind}-{i:02}")];
+                assert!(
+                    find_marker(&layout.bytes[mark..shot], CLAUDE_PROFILE.redraw_marker).is_some(),
+                    "{kind}-{i}: no redraw"
+                );
+                assert!(layout.witness_upto(&CLAUDE_PROFILE, shot), "{kind}-{i}");
+                assert!(
+                    !layout.widened().witness_upto(&CLAUDE_PROFILE, shot),
+                    "{kind}-{i}: witness at the wrong width"
+                );
+            }
         }
     }
 }
@@ -1015,7 +1052,7 @@ fn doorbell_036_the_staged_head_reads_through_the_profile() {
     }
 }
 
-/// Scenario: Read recorded Claude Code 2.1.310 and Codex composer launches through the frame builder the doorbell's transaction reads: the empty composer, the composer holding a typed token-led line, the screen after that line was submitted, and the same screens as a state that is not Clean. The empty composer is empty and ready; the typed line is held exactly, cursor at its end, and is no user message; after its submit a frame shows it as a user message with the composer no longer holding it; a frame that is not Clean has no composer and no dialog, so nothing is decided on it.
+/// Scenario: Read recorded Claude Code 2.1.310 and 2.1.312 and Codex composer launches through the frame builder the doorbell's transaction reads: the empty composer, the composer holding a typed token-led line, the screen after that line was submitted, and the same screens as a state that is not Clean. The empty composer is empty and ready; the typed line is held exactly, cursor at its end, and is no user message; after its submit a frame shows it as a user message with the composer no longer holding it; a frame that is not Clean has no composer and no dialog, so nothing is decided on it.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_the_transaction_reads_real_frames_through_the_profile() {
@@ -1023,6 +1060,10 @@ fn doorbell_036_the_transaction_reads_real_frames_through_the_profile() {
     for (stem, profile) in [
         (
             "claude-inbox/r5wake/claude-2.1.310-composer-24x80",
+            &CLAUDE_PROFILE,
+        ),
+        (
+            "claude-inbox/r5wake/claude-2.1.312-composer-24x80",
             &CLAUDE_PROFILE,
         ),
         (

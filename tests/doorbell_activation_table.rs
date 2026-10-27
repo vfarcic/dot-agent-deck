@@ -785,7 +785,7 @@ fn doorbell_053_an_assumed_head_echo_completes_only_that_codex_record() {
     );
 }
 
-/// Scenario: Ask the table about each release the deck carries a record for, as it ships. Claude Code 2.1.310 is Go, unstaged; both Codex releases stage the line and are held as missing_measurement until their head echo is recorded; and every record has its parser cost verified.
+/// Scenario: Ask the table about each release the deck carries a record for, as it ships. Claude Code 2.1.310 and 2.1.312 are Go, unstaged, with their editor probes absent, while 2.1.311 remains unmeasured; both Codex releases stage the line and are held as missing_measurement until their head echo is recorded; and every record has its parser cost verified.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_the_shipped_records_verdicts() {
@@ -798,7 +798,7 @@ fn doorbell_053_the_shipped_records_verdicts() {
         );
         let verdict = exact_verdict(record);
         match (&record.agent, record.release.to_string().as_str()) {
-            (AgentType::ClaudeCode, "2.1.310") => assert!(
+            (AgentType::ClaudeCode, "2.1.310" | "2.1.312") => assert!(
                 matches!(verdict, Activation::Go { staged: false, .. }),
                 "{verdict:?}"
             ),
@@ -809,14 +809,25 @@ fn doorbell_053_the_shipped_records_verdicts() {
             other => panic!("a record this test does not know: {other:?}"),
         }
     }
+    for release in ["2.1.310", "2.1.312"] {
+        let record = RELEASE_RECORDS
+            .iter()
+            .find(|record| record.agent == CLAUDE && record.release == v(release))
+            .expect("measured Claude release record");
+        assert!(matches!(record.editor_probe, Measurement::Absent));
+        assert_eq!(
+            activation(
+                &RELEASE_RECORDS,
+                &CLAUDE,
+                &LatchedRelease::Known(v(release)),
+                &[]
+            ),
+            exact_verdict(record)
+        );
+    }
     assert_eq!(
-        activation(
-            &RELEASE_RECORDS,
-            &CLAUDE,
-            &LatchedRelease::Known(v("2.1.310")),
-            &[]
-        ),
-        exact_verdict(&RELEASE_RECORDS[2])
+        verdict(&RELEASE_RECORDS, &CLAUDE, "2.1.311"),
+        Activation::NoGo(NoGo::UnmeasuredRelease)
     );
 }
 

@@ -884,7 +884,7 @@ fn doorbell_010_live_kept_draft_stays_held() {
     }
 }
 
-/// Scenario: Complete a fallback-delivered control task in real interactive Claude Code 2.1.310, disable its next native waiter, and type exactly three spaces before posting another sentinel task. For five seconds the blank composer row and its three-column cursor offset stay exact, the input ledger gains no byte, the task stays queued with zero deliveries, and the card names the draft hold. Move to the end and clear the spaces; the original task must then be delivered once and write its sentinel once.
+/// Scenario: Complete a fallback-delivered control task in real interactive Claude Code 2.1.310 or 2.1.312, disable its next native waiter, and type exactly three spaces before posting another sentinel task. For five seconds the blank composer row and its three-column cursor offset stay exact, the input ledger gains no byte, the task stays queued with zero deliveries, and the card names the draft hold. Move to the end and clear the spaces; the original task must then be delivered once and write its sentinel once.
 #[spec("inbox/doorbell/010")]
 #[test]
 #[cfg(target_os = "linux")]
@@ -905,8 +905,10 @@ fn doorbell_010_live_spaces_only_draft_stays_held() {
         "spaces",
     );
     assert!(
-        claude.pane_grid().contains("Claude Code v2.1.310"),
-        "this measured-release regression requires Claude Code 2.1.310; {}",
+        ["Claude Code v2.1.310", "Claude Code v2.1.312"]
+            .iter()
+            .any(|banner| claude.pane_grid().contains(banner)),
+        "this measured-release regression requires Claude Code 2.1.310 or 2.1.312; {}",
         claude.evidence()
     );
     assert!(
@@ -1018,7 +1020,7 @@ fn doorbell_010_live_spaces_only_draft_stays_held() {
     );
 }
 
-/// Scenario: Complete a fallback-delivered control task in real interactive Claude Code 2.1.310, disable its next native waiter, type exactly three spaces and then press Left three times, so the composer row and cursor are exactly those of the empty composer again, before posting another sentinel task. For five seconds the row and cursor stay those of the empty composer, the input ledger gains no byte, the task stays queued with zero deliveries, and the card names the draft hold. Move to the end and clear the spaces; the original task must then be delivered once and write its sentinel once.
+/// Scenario: Complete a fallback-delivered control task in real interactive Claude Code 2.1.310 or 2.1.312, disable its next native waiter, type exactly three spaces and then press Left three times, so the composer row and cursor are exactly those of the empty composer again, before posting another sentinel task. For five seconds the row and cursor stay those of the empty composer, the input ledger gains no byte, the task stays queued with zero deliveries, and the card names the draft hold. Move to the end and clear the spaces; the original task must then be delivered once and write its sentinel once.
 #[spec("inbox/doorbell/010")]
 #[test]
 #[cfg(target_os = "linux")]
@@ -1039,8 +1041,10 @@ fn doorbell_010_live_spaces_moved_back_draft_stays_held() {
         "spaces-back",
     );
     assert!(
-        claude.pane_grid().contains("Claude Code v2.1.310"),
-        "this measured-release regression requires Claude Code 2.1.310; {}",
+        ["Claude Code v2.1.310", "Claude Code v2.1.312"]
+            .iter()
+            .any(|banner| claude.pane_grid().contains(banner)),
+        "this measured-release regression requires Claude Code 2.1.310 or 2.1.312; {}",
         claude.evidence()
     );
     assert!(
@@ -1155,7 +1159,7 @@ fn doorbell_010_live_spaces_moved_back_draft_stays_held() {
     );
 }
 
-/// Scenario: In real interactive Claude Code 2.1.310 with its native waiter armed, type two spaces, a non-ASCII character, Backspace and Ctrl+A, so the composer is blank with the cursor at its start, then press Enter, which submits nothing. Post a sentinel task that the native wake delivers, so the agent runs a whole turn of its own, then disable its next native waiter and post another. For five seconds the blanks stay, the input ledger gains no byte, the task stays queued with zero deliveries and the card names the draft hold. Move to the end and clear the spaces; the task must then be delivered once through the doorbell.
+/// Scenario: In real interactive Claude Code 2.1.310 or 2.1.312 with its native waiter armed, type two spaces, a non-ASCII character, Backspace and Ctrl+A, so the composer is blank with the cursor at its start, then press Enter, which submits nothing; post a sentinel task that the native wake delivers, so the agent runs a whole turn of its own, then disable its next native waiter and post another. For five seconds the blanks stay, the input ledger gains no byte, the task stays queued with zero deliveries and the card names the draft hold. Move to the end and clear the spaces; the task must then be delivered once through the doorbell.
 #[spec("inbox/doorbell/010")]
 #[test]
 #[cfg(target_os = "linux")]
@@ -1174,8 +1178,10 @@ fn doorbell_010_live_blanks_enter_and_an_unrelated_turn_stay_held() {
     )));
     claude.deck.wait_for_string("? for shortcuts");
     assert!(
-        claude.pane_grid().contains("Claude Code v2.1.310"),
-        "this measured-release regression requires Claude Code 2.1.310; {}",
+        ["Claude Code v2.1.310", "Claude Code v2.1.312"]
+            .iter()
+            .any(|banner| claude.pane_grid().contains(banner)),
+        "this measured-release regression requires Claude Code 2.1.310 or 2.1.312; {}",
         claude.evidence()
     );
     assert!(
@@ -1321,7 +1327,7 @@ fn doorbell_010_live_blanks_enter_and_an_unrelated_turn_stay_held() {
     );
 }
 
-/// Scenario: In real interactive Claude Code 2.1.310, complete a doorbell-delivered control task with native delivery disabled, then type the reviewer's sequence one key at a time: ab, Ctrl+J, two spaces, Home, Ctrl+U, Home, Backspace, Delete, Delete, Ctrl+U. Claude joins the second line to the first at that Ctrl+U, so two spaces stay in a composer that looks empty. Post a sentinel task: for five seconds the composer is unchanged, the input ledger gains no byte, the task stays queued with zero deliveries, no ring or pane write is logged, and the card names the draft hold. Then type x and press Ctrl+C once, the remedy the docs name; the task must be delivered once through the doorbell.
+/// Scenario: In real interactive Claude Code 2.1.310 or 2.1.312, complete a doorbell-delivered control task with native delivery disabled, then type the reviewer's sequence one key at a time: ab, Ctrl+J, two spaces, Home, Ctrl+U, Home, Backspace, Delete, Delete, Ctrl+U; Claude joins the second line to the first at that Ctrl+U, so two spaces stay in a composer that looks empty. Post a sentinel task: for five seconds the composer is unchanged, the input ledger gains no byte, the task stays queued with zero deliveries, no ring or pane write is logged, and the card names the draft hold; then type x and press Ctrl+C once, the remedy the docs name; the task must be delivered once through the doorbell.
 #[spec("inbox/doorbell/010")]
 #[test]
 #[cfg(target_os = "linux")]
@@ -1340,8 +1346,10 @@ fn doorbell_010_live_reviewer_sequence_stays_held_until_a_letter_and_ctrl_c() {
     )));
     claude.deck.wait_for_string("? for shortcuts");
     assert!(
-        claude.pane_grid().contains("Claude Code v2.1.310"),
-        "this measured-release regression requires Claude Code 2.1.310; {}",
+        ["Claude Code v2.1.310", "Claude Code v2.1.312"]
+            .iter()
+            .any(|banner| claude.pane_grid().contains(banner)),
+        "this measured-release regression requires Claude Code 2.1.310 or 2.1.312; {}",
         claude.evidence()
     );
     let claude = fallback_ready_with(claude, "reviewer-seq");

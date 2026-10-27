@@ -1069,7 +1069,7 @@ const CODEX_0160_DIALOGS: &[DialogKeys<'static>] = &[
 /// folder-trust dialog), and neither records `head_echo` yet, so both are
 /// `missing_measurement`. No release has its `editor_probe` measured yet, so
 /// the deck checks no input box on any of them.
-pub static RELEASE_RECORDS: [ReleaseRecord<'static>; 3] = [
+pub static RELEASE_RECORDS: [ReleaseRecord<'static>; 4] = [
     // Codex 0.164.0, the release current at measurement. Echo: the exact line
     // in the composer 30 of 30 (20 at 50 × 200, 10 at 24 × 80; ≤ 62 ms after
     // its one write). Submit: the transcript's user message 30 of 30 ≤ 418 ms
@@ -1158,6 +1158,36 @@ pub static RELEASE_RECORDS: [ReleaseRecord<'static>; 3] = [
         release_recogniser: Measurement::Verified(()),
         parser_cost: Measurement::Verified(()),
         // Nothing commits in any dialog, so the line is never staged.
+        head_echo: Measurement::Absent,
+        placeholder_empty: Measurement::Failed,
+        delete_key: Measurement::Verified(()),
+        transcript_echo: Measurement::Verified(()),
+        editor_probe: Measurement::Absent,
+    },
+    // Claude Code 2.1.312, pinned SHA-256 4f4178ce41d83e23341ebfbaecdbcf8ea6
+    // bf7baea0690025abe49eeec3a5d01d. M1/Q32 through the private lane-2 TUI
+    // harness: 30/30 exact echoes (<= 55 ms), exact blocked prompt hooks
+    // (<= 229 ms), and transcript user echoes (<= 137 ms), across 24x80 and
+    // 50x200. Ten fresh launches idle 20 s each with no post-ready dialog;
+    // the header stays at row 1, column 11. Ten resizes and ten nudges draw
+    // the measured marker and width witness (<= 44 ms / 38 ms); six deletes
+    // leave no placeholder. All nineteen Q32 sequences match 2.1.310.
+    // M1 uses xterm-256color without COLORTERM, as the original captures do.
+    // Real push replay at 50x200 and 80x300: all traces' added hold p99
+    // 64.8 us, max 235.5 us; this release's max scanner CPU 3.82 ms/gen.
+    ReleaseRecord {
+        agent: AgentType::ClaudeCode,
+        release: Version::new(2, 1, 312),
+        profile: "claude-code-2026-10",
+        ready_composer: Measurement::Verified(()),
+        echo: Measurement::Verified(()),
+        submit_route: Measurement::Verified(()),
+        layout: Measurement::Verified(()),
+        key_effects: Measurement::Verified(&[]),
+        first_modal: Measurement::Verified(FirstModal::NoneObserved { launches: 10 }),
+        input_mode: Measurement::Verified(()),
+        release_recogniser: Measurement::Verified(()),
+        parser_cost: Measurement::Verified(()),
         head_echo: Measurement::Absent,
         placeholder_empty: Measurement::Failed,
         delete_key: Measurement::Verified(()),
