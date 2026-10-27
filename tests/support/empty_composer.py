@@ -9,6 +9,17 @@ a full-width witness, a dim empty placeholder, and a submitted transcript.
 The input-mode reporter is Linux-only (SO_PEERCRED and /proc); the two
 composer-profile lane-1 tests are cfg(target_os = "linux") and are not
 compiled on other platforms. Missing python3 fails their explicit preflight.
+
+Optional fixture knobs (unset by default):
+  DOT_AGENT_DECK_TEST_COMPOSER_RELEASE appends " v<release>" to the ready
+    header; the default header is unchanged.
+  DOT_AGENT_DECK_TEST_COMPOSER_REPORT=1 writes .spawn.json beside base:
+    argv and the inherited VISUAL/EDITOR/CLAUDE_ENV_FILE (null means unset).
+  DOT_AGENT_DECK_TEST_COMPOSER_BASH_TOOL=1 enables the explicit Claude-style
+    tool-shell fixture: base.bash-tool.json is a nonempty JSON argv array;
+    Bash sources CLAUDE_ENV_FILE and execs it with stdio on the pane's tty.
+    base.bash-tool-result.json records its exit status. Sourcing leaves the
+    composer's own environment unchanged.
 """
 import collections
 import json
@@ -16,6 +27,7 @@ import os
 import select
 import socket
 import struct
+import subprocess
 import sys
 import termios
 import time
@@ -23,6 +35,13 @@ import tty
 
 tty.setraw(0, termios.TCSANOW)
 base = sys.argv[1]
+version = os.environ.get('DOT_AGENT_DECK_TEST_COMPOSER_RELEASE')
+if os.environ.get('DOT_AGENT_DECK_TEST_COMPOSER_REPORT') == '1':
+    with open(base + '.spawn.json', 'w') as output:
+        json.dump({'argv': sys.argv, 'env': {
+            name: os.environ.get(name)
+            for name in ('VISUAL', 'EDITOR', 'CLAUDE_ENV_FILE')
+        }}, output)
 with open(base + '.pid', 'w') as output:
     output.write(str(os.getpid()))
 capture = open(base + '.bytes', 'ab', buffering=0)
@@ -36,12 +55,33 @@ seq = 0
 capabilities = collections.OrderedDict()
 
 
+def bash_tool():
+    if os.environ.get('DOT_AGENT_DECK_TEST_COMPOSER_BASH_TOOL') != '1':
+        return
+    try:
+        with open(base + '.bash-tool.json') as request:
+            argv = json.load(request)
+    except FileNotFoundError:
+        return
+    if not isinstance(argv, list) or not argv or not all(isinstance(arg, str) for arg in argv):
+        raise ValueError('.bash-tool.json must be a nonempty string argv array')
+    os.remove(base + '.bash-tool.json')
+    result = subprocess.run([
+        'bash', '--noprofile', '--norc', '-c',
+        'if [[ -n ${CLAUDE_ENV_FILE:-} ]]; then source "$CLAUDE_ENV_FILE" || exit; fi; exec "$@"',
+        'composer-bash-tool', *argv,
+    ])
+    with open(base + '.bash-tool-result.json', 'w') as output:
+        json.dump({'exit': result.returncode}, output)
+
+
 def redraw():
     cols = os.get_terminal_size(0).columns
     # These fixed cells and attributes are the test profile's public fixture
     # contract, not a recogniser for any production agent.
     content = bytes(line) if line else b'\x1b[2m<empty>\x1b[22m'
-    frame = (b'\x1b[2J\x1b[HDOORBELL-STANDIN-READY\r\n'
+    header = b'DOORBELL-STANDIN-READY' + ((' v' + version).encode() if version is not None else b'')
+    frame = (b'\x1b[2J\x1b[H' + header + b'\r\n'
              + ('W' * cols).encode() + b'\r\n'
              + transcript.encode() + b'\r\n'
              + ('PROCESSED:' + str(revision)).encode() + b'\r\n'
@@ -104,6 +144,7 @@ redraw()
 next_report = 0
 geometry = os.get_terminal_size(0)
 while True:
+    bash_tool()
     if time.monotonic() >= next_report:
         mode_report()
         next_report = time.monotonic() + 1

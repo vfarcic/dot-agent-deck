@@ -32,6 +32,17 @@ at 24 x 80, so that frame has no width witness.
 It writes .pid, .bytes (every byte read), .inputs (each read with its
 CLOCK_MONOTONIC time), .dialog_bytes, .turns (each submitted line) and .hooks
 (what the prompt hook printed).
+
+Optional fixture knobs (unset by default):
+  DOT_AGENT_DECK_TEST_COMPOSER_RELEASE overrides argv[3] in the header.
+  DOT_AGENT_DECK_TEST_COMPOSER_REPORT=1 writes .spawn.json beside base:
+    argv and the inherited VISUAL/EDITOR/CLAUDE_ENV_FILE (null means unset).
+  DOT_AGENT_DECK_TEST_COMPOSER_BASH_TOOL=1 enables the explicit Claude-style
+    tool-shell fixture: base.bash-tool.json is a nonempty JSON argv array;
+    Bash sources CLAUDE_ENV_FILE and execs it with stdio on the pane's tty.
+    base.bash-tool-result.json records its exit status. This opt-in models
+    Claude's sourcing, not Codex's tool environment policy, and leaves the
+    composer's own environment unchanged.
 """
 import json
 import os
@@ -44,6 +55,13 @@ import tty
 
 tty.setraw(0, termios.TCSANOW)
 base, deck, version = sys.argv[1], sys.argv[2], sys.argv[3]
+version = os.environ.get('DOT_AGENT_DECK_TEST_COMPOSER_RELEASE', version)
+if os.environ.get('DOT_AGENT_DECK_TEST_COMPOSER_REPORT') == '1':
+    with open(base + '.spawn.json', 'w') as output:
+        json.dump({'argv': sys.argv, 'env': {
+            name: os.environ.get(name)
+            for name in ('VISUAL', 'EDITOR', 'CLAUDE_ENV_FILE')
+        }}, output)
 # The generation's own session, the one `Deck::hook` names too: never
 # another pane's or a predecessor's.
 SESSION = '%s-session' % os.environ.get('DOT_AGENT_DECK_AGENT_ID', 'codex-composer-%d' % os.getpid())
@@ -63,6 +81,26 @@ DIALOGS = {
     'hooks': ('Hooks need review', ['Trust and run these hooks', 'Review hooks', 'Disable these hooks']),
     'other': ('Something new', ['Continue', 'Quit']),
 }
+
+
+def bash_tool():
+    if os.environ.get('DOT_AGENT_DECK_TEST_COMPOSER_BASH_TOOL') != '1':
+        return
+    try:
+        with open(base + '.bash-tool.json') as request:
+            argv = json.load(request)
+    except FileNotFoundError:
+        return
+    if not isinstance(argv, list) or not argv or not all(isinstance(arg, str) for arg in argv):
+        raise ValueError('.bash-tool.json must be a nonempty string argv array')
+    os.remove(base + '.bash-tool.json')
+    result = subprocess.run([
+        'bash', '--noprofile', '--norc', '-c',
+        'if [[ -n ${CLAUDE_ENV_FILE:-} ]]; then source "$CLAUDE_ENV_FILE" || exit; fi; exec "$@"',
+        'composer-bash-tool', *argv,
+    ])
+    with open(base + '.bash-tool-result.json', 'w') as output:
+        json.dump({'exit': result.returncode}, output)
 
 
 def flag(name):
@@ -170,6 +208,7 @@ redraw()
 geometry = os.get_terminal_size(0)
 seen = (dialog_now(), text_of('.extra'), flag('.hidden'))
 while True:
+    bash_tool()
     current = os.get_terminal_size(0)
     state = (dialog_now(), text_of('.extra'), flag('.hidden'))
     if current != geometry or state != seen:

@@ -7,6 +7,16 @@ the empty composer between two full-width rules with its dim placeholder. Its
 terminal is raw. A submitted line becomes a user cell, and every submitted
 prompt runs the real `dot-agent-deck inbox fetch` (argv[2]) in the pane, as
 Claude Code's prompt hook hands the agent its mail. No model runs.
+
+Optional fixture knobs (unset by default):
+  DOT_AGENT_DECK_TEST_COMPOSER_RELEASE overrides argv[3] in the header.
+  DOT_AGENT_DECK_TEST_COMPOSER_REPORT=1 writes .spawn.json beside base:
+    argv and the inherited VISUAL/EDITOR/CLAUDE_ENV_FILE (null means unset).
+  DOT_AGENT_DECK_TEST_COMPOSER_BASH_TOOL=1 consumes base.bash-tool.json,
+    a nonempty JSON argv array, in a separate Bash shell that sources
+    CLAUDE_ENV_FILE before exec, like Claude's Bash tool. Stdio stays on
+    the pane's tty; base.bash-tool-result.json records its exit status.
+    Sourcing does not change the composer's own environment.
 """
 import json
 import os
@@ -19,12 +29,39 @@ import tty
 
 tty.setraw(0, termios.TCSANOW)
 base, deck, version = sys.argv[1], sys.argv[2], sys.argv[3]
+version = os.environ.get('DOT_AGENT_DECK_TEST_COMPOSER_RELEASE', version)
+if os.environ.get('DOT_AGENT_DECK_TEST_COMPOSER_REPORT') == '1':
+    with open(base + '.spawn.json', 'w') as output:
+        json.dump({'argv': sys.argv, 'env': {
+            name: os.environ.get(name)
+            for name in ('VISUAL', 'EDITOR', 'CLAUDE_ENV_FILE')
+        }}, output)
 with open(base + '.pid', 'w') as output:
     output.write(str(os.getpid()))
 capture = open(base + '.bytes', 'ab', buffering=0)
 turns = open(base + '.turns', 'a', buffering=1)
 composer = bytearray()
 transcript = []
+
+
+def bash_tool():
+    if os.environ.get('DOT_AGENT_DECK_TEST_COMPOSER_BASH_TOOL') != '1':
+        return
+    try:
+        with open(base + '.bash-tool.json') as request:
+            argv = json.load(request)
+    except FileNotFoundError:
+        return
+    if not isinstance(argv, list) or not argv or not all(isinstance(arg, str) for arg in argv):
+        raise ValueError('.bash-tool.json must be a nonempty string argv array')
+    os.remove(base + '.bash-tool.json')
+    result = subprocess.run([
+        'bash', '--noprofile', '--norc', '-c',
+        'if [[ -n ${CLAUDE_ENV_FILE:-} ]]; then source "$CLAUDE_ENV_FILE" || exit; fi; exec "$@"',
+        'composer-bash-tool', *argv,
+    ])
+    with open(base + '.bash-tool-result.json', 'w') as output:
+        json.dump({'exit': result.returncode}, output)
 
 
 def redraw():
@@ -47,6 +84,7 @@ redraw()
 geometry = os.get_terminal_size(0)
 escape = bytearray()
 while True:
+    bash_tool()
     current = os.get_terminal_size(0)
     if current != geometry:
         geometry = current
