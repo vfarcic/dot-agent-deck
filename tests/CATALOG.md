@@ -13364,6 +13364,13 @@ PRD #1666 part 3, round 5: where the deck keeps a worker's report, or a dispatch
 - **Does not assert:** absence of every instance artifact, or optimized-profile behavior separately from the no-`e2e` feature boundary. Shell exclusion is covered by `033`.
 - **Platform coverage:** spawn controls on Linux; production reader and permission control on all.
 
+##### inbox/probe/020 — The installed editor helper separates armed notice output from ordinary editor lifetime, exit status and terminal progress.
+
+- **Layer:** L2 lane 1 (`tests/e2e_editor_helper.rs`, Linux), the actual copied deck binary dispatched by its helper basename, with a Python supervisor, pipes, fixture PTYs and an unresponsive socket owned by the test process. No real agent or daemon.
+- **Agent:** none; a sentinel Python editor stands in for the user's editor, preserving its export argument and checking restored `VISUAL`/`EDITOR`.
+- **Asserts:** row T's exact fixed notice in a pipe and in raw master bytes with default OPOST/ONLCR and OPOST disabled; no trimming or escape removal. A stopped or prefilled output queue blocks the armed notice until SIGALRM even with SIGALRM inherited ignored and blocked; an armed background group with TOSTOP actually stops with SIGTTOU, remains stopped past the alarm, and receives the pending alarm after continuation. An ordinary eight-second edit outlives the armed deadline, creates its sentinel and returns 37; a signalled editor returns SIGTERM. Successful silent editors return 37 with no helper bytes on stopped/full output, and without a TOSTOP background stop. Terminal cases give the helper a fixture controlling terminal and fds 0–2 on its slave; the supervisor stays alive through capture. The unresponsive peer belongs to the process whose identity the instance records.
+- **Does not assert:** fault-injected `SpawnFailed` errno reports, `WaitUnknown`, the known post-editor `t0`/expired-deadline pause, no-poll/no-send tracing, short I/O/EINTR, the old diagnostic/alarm RED mutant, live descendant accounting/subreaper/ptrace/namespace behavior, the PositivelyTool branch, signal-mask restoration in the editor, foreground terminal signals, successful IPC outcomes, marker matching or daemon attribution. These remain Q35-12 acceptance work. There is no daemon E2 in this standalone fixture: the background test exercises suspension and continuation, not the Linux daemon's declared-Armed kill. It makes no whole-helper deadline claim across a job-control stop.
+
 ##### inbox/probe/033 — Editor installation occurs before a measured or unmeasured startup header.
 
 - **Layer:** L2 lane 1 (`tests/e2e_editor_installation.rs`).
