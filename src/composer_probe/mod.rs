@@ -61,10 +61,11 @@ pub enum InertCause {
 /// record with a verified `editor_probe` permits; a cause known from either
 /// input settles the generation as inert even while the other is pending.
 ///
-/// This is the observer's permission, not the ring's: it reads no field the
-/// ring's verdict reads, and the verdict reads nothing it does. The checks a
-/// later commit adds (the path, the keymap, the namespace, the liability cap)
-/// narrow `Armable` further.
+/// This is the observer's permission, not the ring's. Both look a record up
+/// by the same agent and release, but permission needs none of the ring's
+/// measurements, and the ring's activation doesn't read `editor_probe`. The
+/// checks a later commit adds (the path, the keymap, the namespace, the
+/// liability cap) narrow `Armable` further.
 pub fn permission(
     records: &[ReleaseRecord<'_>],
     agent: &AgentType,
