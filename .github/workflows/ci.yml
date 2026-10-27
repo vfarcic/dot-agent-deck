@@ -332,7 +332,7 @@ jobs:
     # On 2026-10-22 the apt downloads of `--with-deps` took 14–20 minutes (the
     # browser download stayed at seconds; see the install step), exhausting that
     # budget. Since issue #1934 the .debs are fetched in their own step, bounded
-    # at 20 minutes (three 5-minute attempts and the index fetches), and the
+    # at 15 minutes (three 3-minute attempts and the index fetches), and the
     # install that follows at 8; with 15 for the suite (observed 8–12) and the
     # rest for setup/reporting, separate step limits bound each part.
     timeout-minutes: 45
@@ -506,7 +506,7 @@ jobs:
       # what `--with-deps` would install (exiting 1 when that is anything),
       # and the arguments match the `apt-get install` it runs.
       - name: Fetch the .debs, bounding each attempt
-        timeout-minutes: 20
+        timeout-minutes: 15
         run: |
           set -euo pipefail
           sudo apt-get update -qq
@@ -615,7 +615,7 @@ jobs:
     # wedged window at a fraction of the 6-hour default. Re-tune from more
     # runs; do not raise it to paper over a hang.
     # Slow downloads on 2026-10-22 warranted 25 minutes for apt; since issue
-    # #1934 the apt step's attempts are bounded and it gets 20, with 10 for the
+    # #1934 the apt step's attempts are bounded and it gets 15, with 10 for the
     # suite and 15 for builds/setup/reporting (run 39821435797 used about 6
     # minutes outside the suite), the suite's own limit bounding a wedged window.
     timeout-minutes: 45
@@ -671,13 +671,16 @@ jobs:
       # that script records: on 2026-10-26 this step sat on an Azure mirror
       # serving a few kB/s until its 25-minute limit (run 40395729937). The
       # prefetch bounds each attempt and moves off that mirror after the first
-      # stalled one, so the install finds every .deb already downloaded. They
+      # stalled one, so the install finds every .deb already downloaded. Its
+      # first run on a runner did exactly that (run 40450743777: 78 of 80 MB
+      # from Azure in a 5-minute first attempt, the rest from
+      # archive.ubuntu.com in 1 s). They
       # are not cached the way `desktop-browser`'s are: that cache is evicted
       # by the repository's cache budget for hours at a time, so it cannot be
       # what keeps this step inside its limit, and another entry would add to
       # the pressure that evicts `main`'s Rust caches.
       - name: Install driver system dependencies
-        timeout-minutes: 20
+        timeout-minutes: 15
         run: |
           set -euo pipefail
           sudo apt-get update

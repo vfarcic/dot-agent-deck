@@ -14,10 +14,12 @@
 # index fetch and its other downloads are fast. apt's own timeout fires only
 # when no data arrives at all, so a trickle never trips it: `desktop-browser`
 # and `desktop-driver` sat on such a mirror until their 25-minute step limits,
-# where a healthy runner fetches the browser job's 142 MB in 5-8 s. apt reached the
-# list's next mirror only after two stalled tries of one file, minutes apart.
+# where a healthy runner fetches the browser job's 142 MB in 5-8 s (17-30
+# MB/s). apt reached the list's next mirror only after two stalled tries of
+# one file, minutes apart.
 #
-# So each attempt here gets APT_PREFETCH_ATTEMPT_LIMIT, and after the first one
+# So each attempt here gets APT_PREFETCH_ATTEMPT_LIMIT (3 minutes, enough for
+# 142 MB at 0.8 MB/s, a twentieth of the slowest healthy rate), and after the first one
 # that does not finish, the Azure mirror is dropped from the runner's mirror
 # list so the remaining attempts fetch from the next mirror in it
 # (archive.ubuntu.com on the images this was written against). Every attempt
@@ -33,7 +35,7 @@ if [ "$#" -eq 0 ]; then
 fi
 
 attempts=${APT_PREFETCH_ATTEMPTS:-3}
-limit=${APT_PREFETCH_ATTEMPT_LIMIT:-5m}
+limit=${APT_PREFETCH_ATTEMPT_LIMIT:-3m}
 mirrors=/etc/apt/apt-mirrors.txt
 
 if [ -r "$mirrors" ]; then
