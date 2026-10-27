@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  */
 const { terminals, FakeTerminal, FakeFitAddon } = vi.hoisted(() => {
   const terminals: FakeTerminal[] = [];
+  const inertHandler = (): { dispose: () => void } => ({ dispose: () => {} });
   /** Only the surface `TerminalViewport` actually touches. */
   class FakeTerminal {
     options: Record<string, unknown>;
@@ -44,8 +45,8 @@ const { terminals, FakeTerminal, FakeFitAddon } = vi.hoisted(() => {
     getSelection(): string { return this.selection; }
     hasSelection(): boolean { return this.selection !== ""; }
     clearSelection(): void { this.selection = ""; }
-    /* Issue #1705's OSC 52 handler; `TerminalViewport.clipboard.test.tsx` drives it through the real xterm. */
-    readonly parser = { registerOscHandler: (): { dispose: () => void } => ({ dispose: () => {} }) };
+    /* Issue #1705's OSC 52 handler and PRD #1666's replay query handlers; `TerminalViewport.clipboard.test.tsx` and `TerminalViewport.replay.test.tsx` drive them through the real xterm. */
+    readonly parser = { registerOscHandler: inertHandler, registerCsiHandler: inertHandler, registerDcsHandler: inertHandler };
     loadAddon(addon: { activate?: (terminal: FakeTerminal) => void }): void { addon.activate?.(this); }
     open(host: HTMLElement): void { this.host = host; host.appendChild(this.textarea); }
     write(_data?: unknown, callback?: () => void): void { callback?.(); }

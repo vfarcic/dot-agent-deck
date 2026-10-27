@@ -1,0 +1,3 @@
+## Opening a pane in the desktop app no longer types old terminal answers into the agent
+
+Agents ask the terminal questions as they run, such as where the cursor is, what the colours are or whether the window has focus, and the terminal answers by sending a short code into the agent's input. When the desktop app opened or reconnected a pane, it redrew the pane's earlier output and answered every question in it again, so the agent received answers to questions it had asked long before, as if you had typed them, sometimes into a prompt you were writing. Now redrawing a pane answers nothing, as in the TUI, while questions the agent asks after the pane is open are answered as before, and keys you type or paste while a pane is redrawing still reach the agent.
