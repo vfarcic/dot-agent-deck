@@ -289,6 +289,10 @@ pub struct HazardFifo {
     run: Duration,
     /// When `run` was last brought up to date, while running.
     mark: Option<Instant>,
+    /// The latest time any call has brought the clock to. A caller's
+    /// timestamp earlier than it, taken before a racing caller's, is read as
+    /// this one, so no interval is counted twice.
+    latest: Option<Instant>,
     paused: bool,
 }
 
@@ -303,15 +307,19 @@ impl Default for HazardFifo {
             exhausted: false,
             run: Duration::ZERO,
             mark: None,
+            latest: None,
             paused: false,
         }
     }
 }
 
 impl HazardFifo {
-    /// Bring the running clock up to `now` and let every `Quiet` entry that
-    /// has run past [`T_TRIGGER`] leave (D5).
-    fn advance(&mut self, now: Instant) {
+    /// Bring the running clock up to `now`, or to the latest time already
+    /// seen when `now` is earlier, and let every `Quiet` entry that has run
+    /// past [`T_TRIGGER`] leave (D5). The time it brought the clock to.
+    fn advance(&mut self, now: Instant) -> Instant {
+        let now = self.latest.map_or(now, |latest| latest.max(now));
+        self.latest = Some(now);
         if !self.paused {
             if let Some(mark) = self.mark {
                 self.run += now.saturating_duration_since(mark);
@@ -323,6 +331,7 @@ impl HazardFifo {
             EntryState::Latched => true,
             EntryState::Quiet { run_at_entry } => run - run_at_entry <= T_TRIGGER,
         });
+        now
     }
 
     /// A native candidate was physically accepted at `now`, with `B` as
@@ -378,7 +387,7 @@ impl HazardFifo {
     /// Whether any record of the generation is incomplete, as of `now`:
     /// while one is, the quiet clock stops (P-DQ, A2 §4.3).
     pub fn records_pending(&mut self, now: Instant, pending: bool) {
-        self.advance(now);
+        let now = self.advance(now);
         if pending != self.paused {
             self.paused = pending;
             self.mark = (!pending).then_some(now);

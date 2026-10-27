@@ -109,8 +109,9 @@ pub struct Framing {
     /// Whether the CSI being read has had any byte after `ESC [`.
     started: bool,
     /// Every byte of the CSI since `ESC [` was kept as its private marker,
-    /// a parameter or an intermediate: no control or DEL came between. Only
-    /// such a CSI can be a paste marker, whose bytes are exact.
+    /// a parameter or an intermediate: no control, DEL or (on output)
+    /// skipped high byte came between. Only such a CSI can be a paste marker
+    /// or the epoch's frame marker, whose bytes are exact.
     literal: bool,
     /// The CSI is malformed, or the string's payload overflowed `buf`.
     malformed: bool,
@@ -251,6 +252,10 @@ pub struct Csi<'a> {
     pub params: &'a [u8],
     pub intermediates: &'a [u8],
     pub final_byte: u8,
+    /// Every byte between `ESC [` and the final byte was the private
+    /// marker, a parameter or an intermediate: no control, DEL or skipped
+    /// high byte came between. A marker whose spelling is exact needs it.
+    pub literal: bool,
 }
 
 /// One `;`-separated parameter of a [`Csi`].
@@ -545,7 +550,7 @@ impl Framing {
                 self.literal = false;
                 emit(self.token(Event::Inside(byte)));
             }
-            _ if self.output => {}
+            _ if self.output => self.literal = false,
             _ => self.malformed = true,
         }
     }
@@ -588,6 +593,7 @@ impl Framing {
                     params,
                     intermediates,
                     final_byte,
+                    literal: self.literal,
                 }),
                 in_paste: self.paste,
             });

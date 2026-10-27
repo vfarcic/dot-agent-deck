@@ -209,7 +209,7 @@ fn probe_045_the_output_hook_notes_whole_queries_only() {
 
 // ---- inbox/probe/060: B ----
 
-/// Scenario: On a profile whose CPR waits end at the next frame, emit a CPR query then `?2026h`; a `?2026h` then a CPR query; each inside an OSC and a DCS string; and each split across pushes. A frame after the query ends `B`, a frame before it doesn't, and neither counts inside a string.
+/// Scenario: On a profile whose CPR waits end at the next frame, emit a CPR query then `?2026h`, then the same query followed by each other spelling of a mode set (combined, extra, empty or sub-parameters, a leading zero, intermediates, a control or high byte inside, another private marker or final byte); a `?2026h` then a CPR query; each inside an OSC and a DCS string; and each split across pushes. Only the exact marker after the query ends `B`, a frame before it doesn't, and neither counts inside a string.
 #[spec("inbox/probe/060")]
 #[test]
 fn probe_060_the_sync_begin_rule() {
@@ -223,9 +223,30 @@ fn probe_060_the_sync_begin_rule() {
     };
     assert!(run(&[b"\x1b[6n"]));
     assert!(!run(&[b"\x1b[6n", b"\x1b[?2026h"]));
-    assert!(!run(&[b"\x1b[?6n\x1b[?1;2026h"]), "2026 among other modes");
+    // A1 §2.2's marker is `ESC [ ? 2026 h` spelled exactly: any other
+    // spelling holds `B` rather than guessing it is a frame.
+    for (marker, why) in [
+        (&b"\x1b[?1;2026h"[..], "2026 among other modes"),
+        (b"\x1b[?1049;2026h", "A1's combined example"),
+        (b"\x1b[?2026;1h", "a mode after 2026"),
+        (b"\x1b[?2026;h", "an empty parameter after"),
+        (b"\x1b[?;2026h", "an empty parameter before"),
+        (b"\x1b[?2026:1h", "a sub-parameter"),
+        (b"\x1b[?02026h", "a leading zero"),
+        (b"\x1b[?2026 h", "an intermediate byte"),
+        (b"\x1b[?2026$h", "another intermediate byte"),
+        (b"\x1b[?2026\x07h", "a BEL inside the CSI"),
+        (b"\x1b[?2026\x7fh", "a DEL inside the CSI"),
+        (b"\x1b[?2026\xc2h", "a high byte `vte` skips"),
+        (b"\x1b[2026h", "no private marker"),
+        (b"\x1b[>2026h", "another private marker"),
+        (b"\x1b[?2026H", "another final byte"),
+        (b"\x1b[?2026l", "a reset is no frame"),
+    ] {
+        assert!(run(&[b"\x1b[6n", marker]), "{why}");
+        assert!(run(&[&[b"\x1b[6n", marker].concat()]), "{why}, one push");
+    }
     assert!(run(&[b"\x1b[?2026h\x1b[6n"]), "a frame before the query");
-    assert!(run(&[b"\x1b[6n\x1b[?2026l"]), "a reset is no frame");
     assert!(
         run(&[b"\x1b[6n\x1b]0;[?2026h\x9b?2026h\x07"]),
         "a frame inside an OSC"
@@ -247,6 +268,23 @@ fn probe_060_the_sync_begin_rule() {
             "query split at {at}"
         );
     }
+}
+
+/// Scenario: On a profile whose CPR waits end at the next frame, emit a CPR query, then `?1004;2026h` and `?1000;1006;2026 h`, then a person's focus and SGR mouse reports. The combined forms end no wait, but the report modes they carry are still turned on, so the reports are exempt.
+#[spec("inbox/probe/060")]
+#[test]
+fn probe_060_a_combined_form_still_sets_report_modes() {
+    let input = Arc::new(GenerationInput::new(CprWaitEnd::SyncBegin));
+    let mut hook = OutputHook::new(Arc::clone(&input));
+    hook.on_output(b"\x1b[6n\x1b[?1004;2026h\x1b[?1000;1006;2026 h");
+    assert!(input.backlog(), "no exact marker");
+    assert!(!moved(input.enqueue(Writer::Human, b"\x1b[I")), "focus");
+    assert!(
+        !moved(input.enqueue(Writer::Human, b"\x1b[<0;1;1M")),
+        "SGR mouse"
+    );
+    hook.on_output(b"\x1b[?2026h");
+    assert!(!input.backlog(), "the exact marker: the control");
 }
 
 /// Scenario: Feed Codex's start-up probe prefix (a CPR, a DA1 and the OSC 10/11 colour queries, none answered), then its first frame. `B` holds after the prefix and is false after the frame, though the queries stay outstanding in the ledger.
@@ -615,6 +653,40 @@ fn probe_052_quiet_clocks_pause_while_a_record_is_pending() {
     f.records_pending(resumed + ms(100), false);
     assert!(!f.clear(resumed + T_TRIGGER - ms(400)));
     assert!(f.clear(resumed + T_TRIGGER - ms(399)));
+}
+
+/// Scenario: Accept a quiet candidate, inspect the FIFO nine tenths of a quiet period later, then accept another with a delayed, earlier timestamp and inspect again at the same time; separately, pause the clock, resume it with a delayed timestamp from inside the pause, and inspect. A timestamp older than one already seen counts no time twice and none from inside the pause, so the first entry stays until its quiet period has run once.
+#[spec("inbox/probe/052")]
+#[test]
+fn probe_052_a_reordered_timestamp_counts_no_time_twice() {
+    let t0 = Instant::now();
+    let late = t0 + T_TRIGGER * 9 / 10;
+    let mut f = fifo_at(t0);
+    f.accept(t0, false);
+    assert_eq!(views(&mut f, late).len(), 1);
+    f.accept(t0, false);
+    assert_eq!(
+        views(&mut f, late).len(),
+        2,
+        "the first ran 0.9 T, not 1.8 T"
+    );
+    assert_eq!(views(&mut f, t0 + T_TRIGGER).len(), 2);
+    assert_eq!(
+        views(&mut f, t0 + T_TRIGGER + ms(1)),
+        [EntryView::Quiet {
+            seq: 2,
+            paused: false
+        }],
+        "the first leaves once its own period has run"
+    );
+
+    let mut f = fifo_at(t0);
+    f.accept(t0, false);
+    f.records_pending(t0 + ms(100), true);
+    f.records_pending(late, true);
+    f.records_pending(t0 + ms(200), false);
+    assert!(!f.clear(late + T_TRIGGER - ms(100)), "resumed at `late`");
+    assert!(f.clear(late + T_TRIGGER - ms(99)));
 }
 
 /// Scenario: A3's delayed-reader schedule, with A4's editor-eaten press beside it: `G1`'s invocation is pending when `G2` is written (parsed into the agent's queue, or eaten by the user's editor) with `B` false, and again with a CPR outstanding. `G2`'s entry is paused, never discarded; after the return it runs its quiet period, or its invocation pops it; latched, it stays until an acted-on Ctrl+G pops it. An editor-eaten entry older than the acted-on one is the one the acted-on invocation pops, and the acted-on entry then leaves under D5.

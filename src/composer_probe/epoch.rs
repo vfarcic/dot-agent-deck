@@ -35,7 +35,15 @@
 //! ticketed enqueue and inside the output lock at the output hook. Every
 //! method takes it, does its arithmetic and releases it, calling only the
 //! framing and ledger code of this module's siblings while it is held, none
-//! of which takes a lock.
+//! of which takes a lock. The output and ingress locks aren't ranked, so the
+//! checker sees neither of those edges: that neither is taken under this
+//! lock rests on that leaf code, and a change that adds a callback or a
+//! record's settlement here reviews those edges again.
+//!
+//! **What it costs today.** Nothing reads it to decide, but it isn't free: a
+//! person's op is read as a report and every op is tokenized under this
+//! lock, inside the ingress lock when ticketed, and an output push that
+//! carries notes waits for it while holding the output lock.
 
 use std::time::Instant;
 
@@ -186,7 +194,12 @@ impl ReportModes {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputNote {
     Query(QueryKind),
-    /// A whole `?2026h`.
+    /// A1 §2.2's frame marker, the bytes `ESC [ ? 2026 h` exactly, as
+    /// crossterm spells a synchronized-update begin, outside any string or
+    /// paste. Any other spelling, a combined `?1049;2026h`, an empty or
+    /// sub-parameter, a leading zero, an intermediate or a control inside,
+    /// is no frame: it notes nothing for `B`, which holds rather than guess,
+    /// while the report modes it carries are still noted as [`Self::Mode`].
     SyncBegin,
     /// `CSI ? <mode> h` or `l`, for each mode `vte` keeps.
     Mode {
@@ -202,13 +215,12 @@ pub(super) fn output_notes(token: &Token<'_>, modes: &[u32], out: &mut Vec<Outpu
     match token.event {
         Event::Csi(csi) if csi.private == Some(b'?') && matches!(csi.final_byte, b'h' | b'l') => {
             let on = csi.final_byte == b'h';
+            if on && sync_begin(token, &csi) {
+                out.push(OutputNote::SyncBegin);
+            }
             for &mode in modes {
-                match mode {
-                    2026 if on => out.push(OutputNote::SyncBegin),
-                    9 | 1000 | 1002 | 1003 | 1004 | 1005 | 1006 | 1015 => {
-                        out.push(OutputNote::Mode { mode, on })
-                    }
-                    _ => {}
+                if matches!(mode, 9 | 1000 | 1002 | 1003 | 1004 | 1005 | 1006 | 1015) {
+                    out.push(OutputNote::Mode { mode, on });
                 }
             }
         }
@@ -229,6 +241,11 @@ pub(super) fn output_notes(token: &Token<'_>, modes: &[u32], out: &mut Vec<Outpu
         Event::Escape(b'c') => out.push(OutputNote::Reset),
         _ => {}
     }
+}
+
+/// Whether a `CSI ? … h` is [`OutputNote::SyncBegin`]'s exact spelling.
+fn sync_begin(token: &Token<'_>, csi: &Csi<'_>) -> bool {
+    csi.params == b"2026" && csi.intermediates.is_empty() && csi.literal && !token.in_paste
 }
 
 /// A whole CPR or DA1 query.
@@ -306,12 +323,12 @@ impl GenerationInput {
     pub fn enqueue(&self, writer: Writer, bytes: &[u8]) -> Enqueued {
         let mut guard = self.state.lock_recovering();
         let state = &mut *guard;
-        let exempt = match (writer, whole_report(&state.framing, bytes)) {
-            (Writer::Human, Some(report)) => {
-                let exempt = state.modes.enabled(report)
-                    || QueryKind::answered_by(report).is_some_and(|k| state.ledger.exempts(k));
-                exempt.then_some(report)
-            }
+        // Only a person's op can be exempt, so no other is read as a report.
+        let exempt = match writer {
+            Writer::Human => whole_report(&state.framing, bytes).filter(|&report| {
+                state.modes.enabled(report)
+                    || QueryKind::answered_by(report).is_some_and(|k| state.ledger.exempts(k))
+            }),
             _ => None,
         };
         for &byte in bytes {
@@ -499,5 +516,28 @@ mod tests {
             read_empty: true,
             retired: false,
         }));
+    }
+
+    /// Scenario: Hand the output classifier the exact `?2026h` token read outside and inside a bracketed paste, which the output grammar never reports but the marker grammar excludes. Only the token outside a paste is a frame.
+    #[spec("inbox/probe/060")]
+    #[test]
+    fn probe_060_a_pasted_marker_is_no_frame() {
+        let notes = |in_paste| {
+            let token = Token {
+                event: Event::Csi(Csi {
+                    private: Some(b'?'),
+                    params: b"2026",
+                    intermediates: b"",
+                    final_byte: b'h',
+                    literal: true,
+                }),
+                in_paste,
+            };
+            let mut out = Vec::new();
+            output_notes(&token, &[2026], &mut out);
+            out
+        };
+        assert_eq!(notes(false), [OutputNote::SyncBegin]);
+        assert_eq!(notes(true), []);
     }
 }
