@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 use crate::event::{
     InboxAttemptCaps, InboxAttemptRef, InboxDelivery, InboxGrant, InboxMayHandOver,
-    InboxStreamControl, InboxWaitReply,
+    InboxOneShotSender, InboxStreamControl, InboxWaitReply,
 };
 use crate::inbox_receipt::{GenerationSpool, RevokeState};
 
@@ -93,6 +93,20 @@ impl std::fmt::Debug for OneShotBatch {
 pub enum Piece<'a> {
     Frame(&'a [u8]),
     Block(usize, &'a [u8]),
+    /// What goes between two blocks (a separator, a JSON array's comma):
+    /// held until the next block that passes its fence, and written just
+    /// before it only when an earlier block passed its fence too. A block the
+    /// fence refuses drops it, so the blocks written are joined as if the
+    /// refused ones had never been in the batch.
+    Joint(&'a [u8]),
+    /// What opens an output that means something only with a block in it (a
+    /// hook's JSON envelope and framing): held until the first block that
+    /// passes its fence and written just before it, so a batch whose every
+    /// block is refused writes none of it.
+    Open(&'a [u8]),
+    /// What closes an [`Piece::Open`]ed output: written only once a block
+    /// passed its fence.
+    Close(&'a [u8]),
 }
 
 /// What [`OneShotBatch::hand_over`] did: each block's [`Output`], in batch
@@ -185,7 +199,7 @@ impl OneShotBatch {
     }
 
     /// The pieces of a plain-text hand-over: `head`, then each block with
-    /// `separator` between two blocks.
+    /// `separator` between two blocks written.
     pub fn plain_pieces<'a>(&'a self, head: &'a str, separator: &'a str) -> Vec<Piece<'a>> {
         let mut pieces = Vec::new();
         if !head.is_empty() {
@@ -193,7 +207,7 @@ impl OneShotBatch {
         }
         for (i, block) in self.blocks.iter().enumerate() {
             if i > 0 {
-                pieces.push(Piece::Frame(separator.as_bytes()));
+                pieces.push(Piece::Joint(separator.as_bytes()));
             }
             pieces.push(Piece::Block(i, block.text.as_bytes()));
         }
@@ -264,9 +278,23 @@ impl OneShotBatch {
             }
         }
         let mut error = None;
+        let mut joint: Option<&[u8]> = None;
+        let mut opening: Vec<&[u8]> = Vec::new();
+        let mut passed_any = false;
         for piece in pieces {
             let (block, bytes) = match *piece {
                 Piece::Frame(bytes) => (None, bytes),
+                Piece::Joint(bytes) => {
+                    joint = Some(bytes);
+                    continue;
+                }
+                Piece::Open(bytes) if !passed_any => {
+                    opening.push(bytes);
+                    continue;
+                }
+                Piece::Open(bytes) => (None, bytes),
+                Piece::Close(_) if !passed_any => continue,
+                Piece::Close(bytes) => (None, bytes),
                 Piece::Block(i, bytes) => {
                     let Some(at) = self.blocks.get(i).map(|block| &block.at) else {
                         continue;
@@ -274,9 +302,30 @@ impl OneShotBatch {
                     if bytes.is_empty() {
                         continue;
                     }
+                    let first = progress[i].fenced.is_none();
                     let passed = *progress[i].fenced.get_or_insert_with(|| fence(at).is_ok());
                     if !passed {
+                        joint = None;
                         continue;
+                    }
+                    if first {
+                        let lead = if passed_any {
+                            joint.take().into_iter().collect()
+                        } else {
+                            joint = None;
+                            std::mem::take(&mut opening)
+                        };
+                        passed_any = true;
+                        // Written after the fence and before the block's
+                        // first byte: a lead that fails leaves the block
+                        // not handed.
+                        if let Some(failed) = lead
+                            .into_iter()
+                            .find_map(|bytes| write_counted(out, bytes).1)
+                        {
+                            error = Some(failed);
+                            break;
+                        }
                     }
                     (Some(i), bytes)
                 }
@@ -595,8 +644,8 @@ pub enum Frame {
 /// Read one line from the daemon, at most `max` bytes before its newline. A
 /// line is handed back only once its newline has been read: the bytes before
 /// an end of connection inside a line are dropped, never parsed, even when
-/// they would parse (`BufRead::read_line`, which today's legacy waiter uses,
-/// hands them back). That is what [`classify_frame`] relies on.
+/// they would parse (`BufRead::read_line`, which an older dot-agent-deck's
+/// waiter used, hands them back). That is what [`classify_frame`] relies on.
 pub fn read_frame<R: io::BufRead>(reader: &mut R, max: usize) -> Frame {
     let mut line = Vec::new();
     loop {
@@ -632,9 +681,9 @@ pub fn read_frame<R: io::BufRead>(reader: &mut R, max: usize) -> Frame {
 /// newline, and a receiver reading through [`read_frame`] drops a line
 /// without one unparsed. That holds only for such a receiver, so the daemon
 /// may use this only on a connection whose receiver declared the one-shot
-/// integration (part 2 §2.7, H3's waiter); today's legacy waiter reads with
-/// `read_line`, which would parse such a line, and is never classified this
-/// way. `accepted` is `None` when a timeout left the progress unknown.
+/// integration (part 2 §2.7, H3's waiter); an older dot-agent-deck's waiter
+/// read with `read_line`, which would parse such a line, and the deck no
+/// longer serves it (part 3, H5). `accepted` is `None` when a timeout left the progress unknown.
 pub fn classify_frame(frame: &[u8], accepted: Option<usize>, flushed: bool) -> Output {
     match accepted {
         Some(n) if n < frame.len() && frame.last() == Some(&b'\n') => Output::NotHanded,
@@ -684,6 +733,18 @@ impl Ran {
         self.outputs
             .iter()
             .any(|output| *output != Output::NotHanded)
+    }
+
+    /// Whether a hand-over that asks the agent to go on with its turn
+    /// (Codex's `Stop`) surely asked it: its whole output was written and
+    /// flushed, and carried a block. A batch whose blocks the fence all
+    /// refused wrote nothing ([`Piece::Open`]); one the fence refused in part
+    /// asked the agent to go on with the blocks that passed. `false` does not
+    /// prove the agent did not go on: a write that stopped at the trailing
+    /// newline, or a flush that failed after every byte was taken, can leave
+    /// a whole decision the agent reads (inbox/receipt/033).
+    pub fn continues_turn(&self) -> bool {
+        self.error.is_none() && self.outputs.contains(&Output::Written)
     }
 }
 
@@ -782,6 +843,20 @@ pub fn declared_hook_integration() -> Option<u32> {
     Some(crate::inbox_hub::HOOK_INTEGRATION)
 }
 
+/// The [`ENV_TEST_HOOK_INTEGRATION`] value that stands in for a
+/// dot-agent-deck from before the deck's messages (0.46 and earlier): its hook
+/// sends the agent's events with no `deck_build` / `deck_exe` stamp and never
+/// asks the deck for mail.
+pub const TEST_PRE_INBOX_HOOKS: &str = "pre-inbox";
+
+/// Whether this process stands in for a hook from before the deck's messages
+/// ([`TEST_PRE_INBOX_HOOKS`]). Always false without the `e2e` feature.
+pub fn stands_in_for_pre_inbox_hooks() -> bool {
+    cfg!(feature = "e2e")
+        && std::env::var(ENV_TEST_HOOK_INTEGRATION)
+            .is_ok_and(|raw| raw.trim() == TEST_PRE_INBOX_HOOKS)
+}
+
 /// The socket-wait budget of a one-shot's receipts question: the connect's
 /// wait for the deck to accept, writing the question and waiting for the
 /// answer ([`Connection::open_receipts_within`]). A deck that has not answered
@@ -827,9 +902,9 @@ static REPORTED_UNSUPPORTED: std::sync::atomic::AtomicBool =
 /// Say [`RECEIPTS_UNSUPPORTED`] on stderr, once per process, and remember it,
 /// so the hook exits with the status that shows its stderr to the user
 /// ([`reported_unsupported`]).
-pub fn report_unsupported() {
+pub fn report_unsupported(sender: InboxOneShotSender) {
     if !REPORTED_UNSUPPORTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        eprintln!("{RECEIPTS_UNSUPPORTED}");
+        eprintln!("{}", notice_for(RECEIPTS_UNSUPPORTED, sender));
     }
 }
 
@@ -854,9 +929,9 @@ static REPORTED_TIMED_OUT: std::sync::atomic::AtomicBool =
 /// Say [`RECEIPTS_TIMED_OUT`] on stderr, once per process, and remember it,
 /// so the hook exits with the status that shows its stderr to the user
 /// ([`reported_refusal`]).
-pub fn report_timed_out() {
+pub fn report_timed_out(sender: InboxOneShotSender) {
     if !REPORTED_TIMED_OUT.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        eprintln!("{RECEIPTS_TIMED_OUT}");
+        eprintln!("{}", notice_for(RECEIPTS_TIMED_OUT, sender));
     }
 }
 
@@ -878,9 +953,9 @@ static REPORTED_COMMIT_TIMED_OUT: std::sync::atomic::AtomicBool =
 
 /// Say [`RECEIPTS_COMMIT_TIMED_OUT`] on stderr, once per process, and
 /// remember it ([`reported_refusal`]).
-pub fn report_commit_timed_out() {
+pub fn report_commit_timed_out(sender: InboxOneShotSender) {
     if !REPORTED_COMMIT_TIMED_OUT.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        eprintln!("{RECEIPTS_COMMIT_TIMED_OUT}");
+        eprintln!("{}", notice_for(RECEIPTS_COMMIT_TIMED_OUT, sender));
     }
 }
 
@@ -926,9 +1001,9 @@ static REPORTED_COMMIT_UNSUPPORTED: std::sync::atomic::AtomicBool =
 
 /// Say [`RECEIPTS_COMMIT_UNSUPPORTED`] on stderr, once per process, and
 /// remember it ([`reported_refusal`]).
-pub fn report_commit_unsupported() {
+pub fn report_commit_unsupported(sender: InboxOneShotSender) {
     if !REPORTED_COMMIT_UNSUPPORTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        eprintln!("{RECEIPTS_COMMIT_UNSUPPORTED}");
+        eprintln!("{}", notice_for(RECEIPTS_COMMIT_UNSUPPORTED, sender));
     }
 }
 
@@ -957,6 +1032,24 @@ pub fn report_commit_connection_lost() {
 /// Whether this process said [`RECEIPTS_COMMIT_CONNECTION_LOST`].
 pub fn reported_commit_connection_lost() -> bool {
     REPORTED_COMMIT_CONNECTION_LOST.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The remedy Claude Code's notices give: its `hooks install` rewrites the
+/// waiter and the prompt hook together.
+const CLAUDE_REMEDY: &str = "run `dot-agent-deck hooks install --agent claude-code` with the build the daemon runs, which rewrites the waiter and the prompt hook together";
+
+/// The same remedy for Codex's hooks: its `hooks install` rewrites them and
+/// records their trust.
+const CODEX_REMEDY: &str = "run `dot-agent-deck hooks install --agent codex` with the build the daemon runs, which rewrites Codex's hooks and records their trust";
+
+/// PRD #1666 part 3 (H4): one of the notices above as `sender` says it: a
+/// notice naming Claude Code's `hooks install` names Codex's for Codex's
+/// hooks, and is otherwise the same text.
+pub fn notice_for(text: &str, sender: InboxOneShotSender) -> std::borrow::Cow<'_, str> {
+    match sender {
+        InboxOneShotSender::CodexHooks => text.replace(CLAUDE_REMEDY, CODEX_REMEDY).into(),
+        _ => text.into(),
+    }
 }
 
 /// Forget what this process said, so a test can tell which notice a later
@@ -1012,11 +1105,25 @@ pub fn reported_refusal() -> bool {
 }
 
 /// Whether `reply`, the deck's answer to an `inbox_receipts` question, says
-/// it serves the one-shot receipts this binary speaks.
-pub fn serves_receipts(reply: &InboxWaitReply) -> bool {
-    reply
+/// it serves the one-shot receipts this binary speaks to `sender`.
+///
+/// PRD #1666 part 3 (H4): `one_shot_receipts` [`crate::inbox_hub::ONE_SHOT_RECEIPTS`]
+/// is Claude Code's support: part 2's daemon answers it and serves the receipt
+/// verbs to Claude Code's waiter and prompt hook only, refusing the CLI and
+/// serving another agent's hook as Claude Code's. So Claude Code's senders go
+/// on with that alone, and every other sender only when the same answer also
+/// names it in [`InboxWaitReply::one_shot_senders`].
+pub fn serves_receipts(reply: &InboxWaitReply, sender: InboxOneShotSender) -> bool {
+    let receipts = reply
         .one_shot_receipts
-        .is_some_and(|served| served >= crate::inbox_hub::ONE_SHOT_RECEIPTS)
+        .is_some_and(|served| served >= crate::inbox_hub::ONE_SHOT_RECEIPTS);
+    match sender {
+        InboxOneShotSender::ClaudeWaiter | InboxOneShotSender::ClaudeHooks => receipts,
+        InboxOneShotSender::CodexHooks | InboxOneShotSender::Cli => {
+            receipts && reply.one_shot_senders.contains(&sender)
+        }
+        InboxOneShotSender::Unknown => false,
+    }
 }
 
 /// The `inbox_receipts` question for the agent `agent_id` in `pane_id`.
@@ -1127,13 +1234,22 @@ impl Connection {
     /// one: the deck that answers is the one the request reaches. An older
     /// daemon cannot decode the question and answers nothing, so it is never
     /// sent the request.
-    pub fn open_receipts(path: &Path, question: &str) -> Opened {
-        Connection::open_receipts_within(path, question, receipts_answer_wait())
+    ///
+    /// The answer has to serve `sender` ([`serves_receipts`]): part 2's deck
+    /// serves Claude Code's one-shots only, so it is [`Opened::Unsupported`]
+    /// for every other sender.
+    pub fn open_receipts(path: &Path, question: &str, sender: InboxOneShotSender) -> Opened {
+        Connection::open_receipts_within(path, question, sender, receipts_answer_wait())
     }
 
     /// [`Connection::open_receipts`] within `wait`, from now.
-    pub fn open_receipts_within(path: &Path, question: &str, wait: Duration) -> Opened {
-        Connection::open_receipts_by(path, question, Instant::now() + wait)
+    pub fn open_receipts_within(
+        path: &Path,
+        question: &str,
+        sender: InboxOneShotSender,
+        wait: Duration,
+    ) -> Opened {
+        Connection::open_receipts_by(path, question, sender, Instant::now() + wait)
     }
 
     /// [`Connection::open_receipts`] by `deadline`, a socket-wait budget
@@ -1143,7 +1259,12 @@ impl Connection {
     /// time, are all [`Opened::TimedOut`]. It cannot pre-empt `connect(2)`
     /// resolving the socket's path (a stalled filesystem); once that returns,
     /// a deadline already past sends nothing.
-    pub fn open_receipts_by(path: &Path, question: &str, deadline: Instant) -> Opened {
+    pub fn open_receipts_by(
+        path: &Path,
+        question: &str,
+        sender: InboxOneShotSender,
+        deadline: Instant,
+    ) -> Opened {
         let wait = deadline.saturating_duration_since(Instant::now());
         if wait.is_zero() {
             return Opened::TimedOut;
@@ -1183,7 +1304,7 @@ impl Connection {
             }
             return if reply.refused.is_some() {
                 Opened::Refused(Box::new(reply))
-            } else if serves_receipts(&reply) {
+            } else if serves_receipts(&reply, sender) {
                 Opened::Ready(connection)
             } else {
                 Opened::Unsupported
@@ -1288,6 +1409,13 @@ impl Connection {
     /// Whether the connection has ended.
     pub fn ended(&self) -> bool {
         self.ended
+    }
+
+    /// Whether the last line [`Self::send`] gave up on was partly written.
+    /// The deck may have read all of such a line but its newline: it reads
+    /// a final line with none at the end of a connection.
+    pub fn left_a_line_cut(&self) -> bool {
+        self.cut
     }
 
     /// Send one line within the time left before `deadline`, or fail with
@@ -1444,6 +1572,9 @@ pub(crate) mod tests {
 
     const PANE: &str = "2";
     const AGENT: &str = "agent-a";
+    /// The sender the gate's own tests ask for: Claude Code's, whose support
+    /// `one_shot_receipts` alone answers.
+    const CLAUDE: InboxOneShotSender = InboxOneShotSender::ClaudeHooks;
     const ID1: &str = "m-k3xzq2ab-0f3c9a71d2e4b850";
     const ID2: &str = "m-k3xzq2ab-1111111111111111";
     const ID3: &str = "m-k3xzq2ab-2222222222222222";
@@ -1832,8 +1963,8 @@ pub(crate) mod tests {
         assert_eq!(handed.outputs, vec![Output::Written, Output::NotHanded]);
         assert_eq!(
             String::from_utf8(out.written).unwrap(),
-            format!("{}{SEP}", batch.text(0).unwrap()),
-            "no byte of the refused block"
+            batch.text(0).unwrap(),
+            "no byte of the refused block, nor the separator before it"
         );
         deck.daemon.write_revoke(ID1, 1, 1).unwrap();
         let mut out = pipe(vec![]);
@@ -2450,6 +2581,72 @@ pub(crate) mod tests {
         (path, serve)
     }
 
+    /// Scenario: Read the receipts answer of part 2's deck (`one_shot_receipts` 1, no senders), of this deck (the four senders), and of a later deck that names a sender this build does not know, for each sender, and open a connection to each as Codex's hooks and as the CLI. Claude Code's waiter and hook are served by all three; Codex's hooks and the CLI only where the answer names them, so part 2's deck is `Unsupported` for them; an unknown name in the list is read, not a parse failure; Codex's notices name its own `hooks install`.
+    #[cfg(unix)]
+    #[spec("inbox/receipt/031")]
+    #[test]
+    fn receipt_031_the_gate_serves_each_sender_only_as_its_answer_names_it() {
+        use InboxOneShotSender::{ClaudeHooks, ClaudeWaiter, Cli, CodexHooks};
+        let part2: InboxWaitReply = serde_json::from_str(r#"{"one_shot_receipts":1}"#).unwrap();
+        let this = InboxWaitReply {
+            one_shot_receipts: Some(crate::inbox_hub::ONE_SHOT_RECEIPTS),
+            one_shot_senders: crate::inbox_hub::ONE_SHOT_SENDERS.to_vec(),
+            ..InboxWaitReply::default()
+        };
+        let later: InboxWaitReply = serde_json::from_str(
+            r#"{"one_shot_receipts":1,"one_shot_senders":["cli","a_later_agent_hooks"]}"#,
+        )
+        .expect("an unknown sender is read");
+        for sender in [ClaudeWaiter, ClaudeHooks] {
+            assert!(serves_receipts(&part2, sender), "{sender:?}");
+            assert!(serves_receipts(&this, sender), "{sender:?}");
+            assert!(serves_receipts(&later, sender), "{sender:?}");
+        }
+        for sender in [CodexHooks, Cli] {
+            assert!(
+                !serves_receipts(&part2, sender),
+                "{sender:?} at part 2's deck"
+            );
+            assert!(serves_receipts(&this, sender), "{sender:?}");
+        }
+        assert!(serves_receipts(&later, Cli));
+        assert!(!serves_receipts(&later, CodexHooks));
+        assert!(!serves_receipts(&InboxWaitReply::default(), Cli));
+        let dir = crate::test_temp::tempdir().unwrap();
+        let answer = |reply: &InboxWaitReply| Some(vec![serde_json::to_string(reply).unwrap()]);
+        let (path, deck) = stand_in_deck(
+            dir.path(),
+            vec![answer(&part2), answer(&part2), answer(&this), answer(&this)],
+        );
+        let wait = Duration::from_secs(2);
+        for (sender, ready) in [
+            (CodexHooks, false),
+            (Cli, false),
+            (CodexHooks, true),
+            (Cli, true),
+        ] {
+            let opened = Connection::open_receipts_within(&path, "{}", sender, wait);
+            assert_eq!(
+                matches!(opened, Opened::Ready(_)),
+                ready,
+                "{sender:?}: {opened:?}"
+            );
+            assert_eq!(matches!(opened, Opened::Unsupported), !ready, "{sender:?}");
+        }
+        drop(deck);
+        for notice in [
+            RECEIPTS_UNSUPPORTED,
+            RECEIPTS_TIMED_OUT,
+            RECEIPTS_COMMIT_TIMED_OUT,
+            RECEIPTS_COMMIT_UNSUPPORTED,
+        ] {
+            let codex = notice_for(notice, CodexHooks);
+            assert!(codex.contains("hooks install --agent codex"), "{codex}");
+            assert!(!codex.contains("claude-code"), "{codex}");
+            assert_eq!(notice_for(notice, ClaudeHooks), notice);
+        }
+    }
+
     /// Scenario: Point a one-shot's receipts question at a stand-in deck
     /// seven times, one connection each, answered in turn: that it serves
     /// receipts; nothing, as an older daemon answers a verb it cannot decode;
@@ -2488,7 +2685,7 @@ pub(crate) mod tests {
         let mut outcomes = Vec::new();
         for _ in 0..rounds {
             let started = Instant::now();
-            let opened = Connection::open_receipts_within(&path, &question, wait);
+            let opened = Connection::open_receipts_within(&path, &question, CLAUDE, wait);
             assert!(
                 started.elapsed() < wait + Duration::from_secs(2),
                 "the answer is waited for no longer than the wait"
@@ -2527,7 +2724,7 @@ pub(crate) mod tests {
         let question: serde_json::Value = serde_json::from_str(&question).unwrap();
         assert_eq!(question["message_type"], "inbox_receipts");
         assert!(matches!(
-            Connection::open_receipts_within(&dir.path().join("absent.sock"), "{}", wait),
+            Connection::open_receipts_within(&dir.path().join("absent.sock"), "{}", CLAUDE, wait),
             Opened::Unreachable
         ));
     }
@@ -2569,7 +2766,7 @@ pub(crate) mod tests {
         let path = listener.path.clone();
         let wait = Duration::from_millis(300);
         let (took, opened) = timed(wait, move || {
-            Connection::open_receipts_within(&path, "{}", wait)
+            Connection::open_receipts_within(&path, "{}", CLAUDE, wait)
         })
         .expect("the gate is still parked in connect(2)");
         assert!(took < wait + TOLERANCE, "the gate took {took:?}");
@@ -2599,7 +2796,7 @@ pub(crate) mod tests {
         let question = format!("{{\"pad\":\"{}\"}}", "x".repeat(16 << 20));
         let wait = Duration::from_millis(300);
         let (took, opened) = timed(wait, move || {
-            Connection::open_receipts_within(&path, &question, wait)
+            Connection::open_receipts_within(&path, &question, CLAUDE, wait)
         })
         .expect("the gate is still blocked writing its question");
         assert!(took < wait + TOLERANCE, "the gate took {took:?}");
@@ -2693,6 +2890,7 @@ pub(crate) mod tests {
                     pane_id: PANE,
                     agent_id: Some(AGENT),
                     token: "token-1",
+                    sender: CLAUDE,
                 },
                 vec![attempt],
                 &Pinned::Unpinned,
@@ -2767,7 +2965,7 @@ pub(crate) mod tests {
         });
         let wait = Duration::from_millis(300);
         let (took, opened) = timed(wait, move || {
-            Connection::open_receipts_within(&path, "{}", wait)
+            Connection::open_receipts_within(&path, "{}", CLAUDE, wait)
         })
         .expect("the gate is still reading keepalives");
         assert!(took < wait + TOLERANCE, "the gate took {took:?}");
@@ -2856,7 +3054,8 @@ pub(crate) mod tests {
         listener.set_nonblocking(true).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
         let question = receipts_question(PANE, Some(AGENT), "token-1").unwrap();
-        let opened = Connection::open_receipts_within(&path, &question, Duration::from_millis(300));
+        let opened =
+            Connection::open_receipts_within(&path, &question, CLAUDE, Duration::from_millis(300));
         assert!(matches!(opened, Opened::Foreign), "{opened:?}");
         assert!(
             matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
@@ -2909,13 +3108,13 @@ pub(crate) mod tests {
         );
         let question = receipts_question(PANE, Some(AGENT), "token-1").unwrap();
         let wait = Duration::from_millis(300);
-        let silent = Connection::open_receipts_within(&path, &question, wait);
+        let silent = Connection::open_receipts_within(&path, &question, CLAUDE, wait);
         assert!(matches!(silent, Opened::TimedOut), "{silent:?}");
         drop(silent);
-        let negative = Connection::open_receipts_within(&path, &question, wait);
+        let negative = Connection::open_receipts_within(&path, &question, CLAUDE, wait);
         assert!(matches!(negative, Opened::Unsupported), "{negative:?}");
         drop(negative);
-        let hung_up = Connection::open_receipts_within(&path, &question, wait);
+        let hung_up = Connection::open_receipts_within(&path, &question, CLAUDE, wait);
         assert!(matches!(hung_up, Opened::Lost), "{hung_up:?}");
         drop(hung_up);
         assert_eq!(deck.join().unwrap().len(), 3);
@@ -2923,7 +3122,7 @@ pub(crate) mod tests {
         let spent = dir.path().join("spent.sock");
         let listener = std::os::unix::net::UnixListener::bind(&spent).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let opened = Connection::open_receipts_by(&spent, &question, Instant::now());
+        let opened = Connection::open_receipts_by(&spent, &question, CLAUDE, Instant::now());
         assert!(matches!(opened, Opened::TimedOut), "{opened:?}");
         assert!(
             matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),

@@ -1,0 +1,16 @@
+---
+source: tests/render_inbox_attention.rs
+expression: rendered
+---
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+  ┌ Deck messages ───────────────────────────────────────────────────────────────────────────────┐  
+  │  Messages can't reach this agent: its connection to the deck was refused (the deck could not │  
+  │  identify the process that asked for them). Restart it from the deck; messages addressed to  │  
+  │  it are not handed to the restarted agent, so have them sent again.                          │  
+  │                                                                                              │  
+  │  [Close]                                                                                     │  
+  │  Esc to close                                                                                │  
+  └──────────────────────────────────────────────────────────────────────────────────────────────┘

@@ -33,16 +33,20 @@ The pure/glue split mirrors the Rust side's pure `agent_event_type_from_state` s
 
 ```bash
 cd pi-extension
-npm install     # installs tsx (the only dependency)
-npm test        # node --import tsx --test test/*.test.ts
+npm ci             # installs the dev dependencies below
+npm test           # node --import tsx --test test/*.test.ts
+npm run typecheck  # tsc --noEmit over src/ and test/
 ```
 
 The tests import only the import-free `src/orchestrator.ts`, so they need **no running `pi`** and none of the Pi packages installed.
 
 ## Dependencies
 
-- **`tsx`** (dev) — the only installed dependency; lets Node's built-in test runner execute the TypeScript tests.
-- **`@earendil-works/pi-coding-agent`** and **`typebox`** — imported by `src/index.ts` for types and tool schemas. These are **not** listed as dependencies here because Pi resolves them from its own installation when it loads the extension (via jiti). Optional local type-checking (`npm run typecheck`) therefore requires Pi installed alongside.
+All of them are dev dependencies, which `package-lock.json` pins; Pi installs none of them when it loads the extension.
+
+- **`tsx`** — lets Node's built-in test runner execute the TypeScript tests.
+- **`typescript`** and **`@types/node`** — `npm run typecheck`. CI runs it in `ci.yml`'s `test` job, which the required `build` check aggregates, and in `.rwx/ci.yml`'s task of the same name (issue #1708).
+- **`@earendil-works/pi-coding-agent`** and **`typebox`** — imported by `src/index.ts` for types and tool schemas, and installed here only so the typecheck can resolve them. At runtime Pi resolves both from its own installation when it loads the extension (via jiti). `typebox` is pinned to the version `@earendil-works/pi-coding-agent` itself pins, so the two share one copy.
 
 ## Pi extension API used (Pi 0.80.6)
 

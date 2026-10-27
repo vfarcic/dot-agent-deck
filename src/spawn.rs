@@ -618,6 +618,7 @@ fn register_dispatched_unit(
         crate::dispatch_return::DispatchCaller,
     )>,
     kind: crate::dispatched_units::UnitKind,
+    publication: Option<crate::agent_pty::InitialPublication>,
 ) -> Option<String> {
     let (origin, caller) = unit?;
     let (unit_pane_id, unit_agent_id) = {
@@ -649,7 +650,7 @@ fn register_dispatched_unit(
     // as its pane: a pane id is a recycled handle, and a predecessor's late EOF
     // would otherwise evict this route out from under the agent that now holds
     // the pane (PR #1081 review, Greptile finding 1).
-    registry.register_dispatch_return(&unit_pane_id, &unit_agent_id, caller);
+    registry.register_dispatch_return(&unit_pane_id, &unit_agent_id, &id, caller, publication);
     Some(id)
 }
 
@@ -665,6 +666,13 @@ async fn spawn_with_unit(
         crate::dispatch_return::DispatchCaller,
     )>,
 ) -> Result<SpawnHandle, SpawnError> {
+    // PRD #1666 part 3, round 5 (plan D7): a dispatch is the `Some(unit)`
+    // argument; every other caller started its orchestration directly.
+    let unit_origin = if unit.is_some() {
+        crate::hook_provenance::InstanceOrigin::Dispatched
+    } else {
+        crate::hook_provenance::InstanceOrigin::Direct
+    };
     // 1. mkdir -p the working_dir; fail loud via the notifier.
     let dir = Path::new(&req.working_dir);
     if let Err(e) = std::fs::create_dir_all(dir) {
@@ -724,6 +732,16 @@ async fn spawn_with_unit(
                 return Err(seed_refused(notifier, &req.task_name, &error));
             }
             let pane_id = next_pane_id(&req.task_name, None);
+            // PRD #1666 part 3, round 5 (plan D7): a dispatched single agent
+            // may attest from its reservation, before its unit is registered;
+            // its publication answers a terminal report in that window.
+            let publication = if unit.is_some() {
+                registry.install_initial_publication(crate::report_recovery::PublishKey::Pane(
+                    pane_id.clone(),
+                ))
+            } else {
+                None
+            };
             // PRD #127 C2: only pin the `-c` wrapper shell to a deterministic
             // `/bin/sh` when the command ACTUALLY needs shell-wrapping (it has
             // whitespace → a shell command line). A single bare word is exec'd
@@ -758,6 +776,7 @@ async fn spawn_with_unit(
                 // from the command exactly as before (issue #308).
                 agent_type.clone(),
                 shell,
+                unit_origin,
                 notifier,
             )?;
             // Issue #454: a single-agent spawn registers NOTHING in the
@@ -831,6 +850,7 @@ async fn spawn_with_unit(
                     pane_id: pane_id.clone(),
                     agent_id: id.clone(),
                 },
+                publication,
             );
             drop(publish_guard);
             // PRD #1666 S5: the prompt is the pane's first inbox message, posted
@@ -962,6 +982,15 @@ async fn spawn_with_unit(
             // orchestration in the same working dir are then two distinct
             // routing groups instead of one ambiguous `(name, cwd)` identity.
             let orchestration_id = crate::agent_pty::mint_orchestration_id();
+            // PRD #1666 part 3, round 5 (plan D7): the dispatched
+            // orchestration's roles may attest before its unit is registered.
+            let publication = if unit.is_some() {
+                registry.install_initial_publication(crate::report_recovery::PublishKey::Instance(
+                    orchestration_id.clone(),
+                ))
+            } else {
+                None
+            };
             // The same `Instance` identity `StartAgent` derives from the
             // membership these panes are spawned with, so a dispatched
             // orchestration and a `Ctrl+N` one are scoped by exactly the same
@@ -1043,6 +1072,7 @@ async fn spawn_with_unit(
                     // identically to the TUI path.
                     role.agent_type.clone(),
                     None,
+                    unit_origin,
                     notifier,
                 );
                 // Issue #600: an orchestration spawn is ALL-OR-NOTHING. This used
@@ -1311,6 +1341,7 @@ async fn spawn_with_unit(
                     terminal_pane_id: delivery_pane_id.clone(),
                     terminal_agent_id: delivery_agent_id.clone(),
                 },
+                publication,
             );
             drop(publish_guard);
             // PRD #1666 S5: posted to the orchestrator role's inbox, as above.
@@ -1563,6 +1594,9 @@ fn spawn_one(
     // The `SHELL` wrapper-choice override for a command line (see
     // [`pane_env`]); `None` leaves it to the daemon's default shell.
     shell: Option<String>,
+    // PRD #1666 part 3, round 5 (plan D7): `Dispatched` for a unit's pane,
+    // `Direct` otherwise; pinned on an orchestration role's generation.
+    origin: crate::hook_provenance::InstanceOrigin,
     notifier: &dyn Notifier,
 ) -> Result<String, SpawnError> {
     let mut env = pane_env(pane_id, false);
@@ -1577,6 +1611,7 @@ fn spawn_one(
         cols: 80,
         env,
         tab_membership: membership,
+        origin: Some(origin),
         // PRD #127 finding #4: tag the daemon-side registry entry with the
         // agent type inferred from the command (e.g. `claude` → `ClaudeCode`),
         // matching what `surface_spawned_pane` puts on the live card and what
@@ -4546,6 +4581,7 @@ mod tests {
                     spill_path: None,
                     id: None,
                     preface: None,
+                    provenance: None,
                 },
             )
             .unwrap();

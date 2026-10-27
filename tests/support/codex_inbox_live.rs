@@ -74,11 +74,22 @@ pub struct Codex {
 
 impl Codex {
     pub fn new(folder_dialog: bool) -> Self {
+        Self::with_hooks(folder_dialog, true)
+    }
+
+    /// [`Self::new`], with every one of the deck's Codex hooks switched off
+    /// in Codex's own trust records when `hooks_on` is false: Codex runs none
+    /// of them, and the deck, which leaves a switched-off hook off, cannot
+    /// turn them back on (PRD #1666 part 3, H4: the untrusted-hooks path).
+    pub fn with_hooks(folder_dialog: bool, hooks_on: bool) -> Self {
         let deck = common::TuiDeck::builder()
             .with_pty_size(180, 50)
             .with_imported_codex_credentials()
             .with_env("DOT_AGENT_DECK_LOG", "codex-inbox-live.log")
             .with_env("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "30000")
+            // A `dot-agent-deck` the model runs by name (the doorbell's
+            // `inbox fetch`) is the build under test, not one on the host.
+            .with_env("PATH", common::path_with_binary_dir())
             .launch_with_fixture("minimal");
         assert!(
             deck.wait_for_grid_string_within("No active agents", BUDGET),
@@ -86,6 +97,22 @@ impl Codex {
             deck.snapshot_grid()
         );
         prepare(&deck);
+        if !hooks_on {
+            let config_path = deck.home_dir().join(".codex/config.toml");
+            let mut config: toml::Value =
+                toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+            let state = config
+                .get_mut("hooks")
+                .and_then(|hooks| hooks.get_mut("state"))
+                .and_then(toml::Value::as_table_mut)
+                .expect("the deck recorded its hooks' trust");
+            for (_, entry) in state.iter_mut() {
+                if let Some(entry) = entry.as_table_mut() {
+                    entry.insert("enabled".to_string(), toml::Value::Boolean(false));
+                }
+            }
+            std::fs::write(config_path, toml::to_string(&config).unwrap()).unwrap();
+        }
         if folder_dialog {
             // The harness normally trusts this fixture. Remove only that
             // scratch project entry, preserving the hooks' trusted hashes.
@@ -194,6 +221,21 @@ impl Codex {
         )
         .unwrap_or_else(|why| panic!("Codex must act on {id}: {why}; {}", self.evidence()));
         inbox::state(&self.deck, &self.pane, id, "acknowledged");
+        // PRD #1666 part 3 (H4): settled by its receipt, whichever one-shot
+        // handed it over, never by an id-only ack.
+        let summary = inbox::listing(&self.deck, &self.pane)["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == id)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            summary["ack_how"],
+            "plugin_confirmed",
+            "{id} settled by its receipt: {summary}; {}",
+            self.evidence()
+        );
         assert!(
             common::wait_until(BUDGET, || self.record()["live"]["status"] == "Idle"),
             "Codex must finish its visible reply after writing the sentinel; {}",

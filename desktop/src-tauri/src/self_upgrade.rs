@@ -24,7 +24,8 @@
 //! - the copies whose privileged install did not finish and may still be
 //!   running as root, which are not started again until the app restarts;
 //! - the relaunch, offered only once the app bundle was actually replaced;
-//! - the camelCase DTOs the webview renders.
+//! - the camelCase DTOs the webview renders, every display string in them
+//!   through the desktop's safe-display policy ([`safe_display_text`]).
 //!
 //! The app is the copy that can raise a graphical privilege prompt, so it
 //! plans with `can_prompt_for_privilege`; when that prompt is dismissed or
@@ -38,12 +39,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use dot_agent_deck::self_upgrade::{
     CopyKind, Host, Installation, OtherCopy, Outcome, PlanAction, PlanLine, PlanOptions,
     ProvenanceCheck, ReleaseSource, Releases, SystemHost, UPDATE_RECHECK_INTERVAL, UpgradeError,
-    UpgradePlan, detect, discover, execute, plan,
+    UpgradePlan, agent_hooks, detect, discover, execute, plan,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State, Webview};
 
-use crate::dto::safe_message;
+use crate::dto::safe_display_text;
 
 /// Which of this machine's two copies a plan or a result is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,6 +185,11 @@ struct Inner {
     /// test can complete another upgrade at exactly that moment.
     #[cfg(test)]
     after_validate: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Where an upgrade downloads from and stages into, in place of this
+    /// build's releases and the user's state folder, so a test can run
+    /// [`desktop_self_upgrade_run`] against a fake release (issue #1840).
+    #[cfg(test)]
+    release: Mutex<Option<(ReleaseSource, std::path::PathBuf)>>,
 }
 
 /// The app's own copy, installed this session and waiting for a relaunch.
@@ -284,7 +290,7 @@ impl SelfUpgradeState {
             .ok_or_else(|| PLAN_GONE.to_string())?;
         let plan = checked.plan(copy).ok_or_else(|| NOT_CHECKED.to_string())?;
         if !plan.is_actionable() {
-            return Err(safe_message(plan.text()));
+            return Err(safe_display_text(plan.text()));
         }
         Ok(plan.clone())
     }
@@ -330,7 +336,7 @@ impl SelfUpgradeState {
         if let Some(notice) = outcome.app_relaunch_notice() {
             *lock(&self.inner.installed) = Some(Installed {
                 result: result.clone(),
-                notice: safe_message(notice),
+                notice: safe_display_text(notice),
             });
         }
     }
@@ -350,6 +356,18 @@ impl SelfUpgradeState {
                 copies.push(copy);
             }
         }
+    }
+
+    /// Where an upgrade downloads from, and the folder it stages in.
+    fn release(&self) -> (ReleaseSource, std::path::PathBuf) {
+        #[cfg(test)]
+        if let Some(release) = lock(&self.inner.release).clone() {
+            return release;
+        }
+        (
+            ReleaseSource::from_build(),
+            PlanOptions::default_staging_root(),
+        )
     }
 
     fn is_unfinished(&self, copy: SelfCopy) -> bool {
@@ -450,20 +468,25 @@ fn action_name(action: &PlanAction) -> &'static str {
 }
 
 /// The core's lines for the webview. A command keeps its exact text in
-/// `command`; only the display copy goes through [`safe_message`], which
-/// drops control characters and caps the length. The core builds no command
-/// with a control or formatting character in it; one that somehow has one is
-/// shown as prose and never offered for copying.
+/// `command`; only the display copy goes through [`safe_display_text`], which
+/// drops control and bidi formatting characters and caps the length. The core
+/// builds no command with a control or formatting character in it; one that
+/// somehow has one is shown as prose and never offered for copying.
+///
+/// Prose quotes paths the machine supplied — `Upgraded <path> to v…` — and a
+/// file name may carry a bidi override, which `safe_message`'s control filter
+/// lets through (issue #1839). The dialog's own sanitiser removes it too; this
+/// is so no reader of the DTO depends on that.
 fn line_dtos(items: Vec<PlanLine>) -> Vec<LineDto> {
     items
         .into_iter()
         .map(|item| match item {
             PlanLine::Text(text) => LineDto {
-                text: safe_message(text),
+                text: safe_display_text(text),
                 command: None,
             },
             PlanLine::Command(command) => LineDto {
-                text: safe_message(&command),
+                text: safe_display_text(&command),
                 command: (dot_agent_deck::untrusted_text::strip_control_and_bidi(&command, false)
                     == command)
                     .then_some(command),
@@ -480,7 +503,7 @@ fn provenance_dto(check: &ProvenanceCheck) -> ProvenanceDto {
         },
         ProvenanceCheck::Unavailable { reason } => ProvenanceDto {
             checked: false,
-            reason: Some(safe_message(reason)),
+            reason: Some(safe_display_text(reason)),
         },
     }
 }
@@ -489,12 +512,12 @@ pub(crate) fn plan_dto(copy: SelfCopy, plan: &UpgradePlan) -> PlanDto {
     PlanDto {
         copy,
         label: plan.label().to_string(),
-        headline: safe_message(plan.headline()),
-        current: safe_message(&plan.installation.version),
-        latest: safe_message(&plan.latest),
+        headline: safe_display_text(plan.headline()),
+        current: safe_display_text(&plan.installation.version),
+        latest: safe_display_text(&plan.latest),
         action: action_name(&plan.action),
         actionable: plan.is_actionable(),
-        confirm_question: plan.confirm_question().map(safe_message),
+        confirm_question: plan.confirm_question().map(safe_display_text),
         provenance: provenance_dto(&plan.provenance),
         lines: line_dtos(plan.items()),
     }
@@ -511,7 +534,7 @@ pub(crate) fn check_dto(
     installed: Option<&Installed>,
 ) -> CheckDto {
     let headline = (installed.is_none() && checked.app.action != PlanAction::UpToDate)
-        .then(|| safe_message(checked.app.headline()));
+        .then(|| safe_display_text(checked.app.headline()));
     let mut app = plan_dto(SelfCopy::App, &checked.app);
     if installed.is_some() {
         app.actionable = false;
@@ -519,7 +542,7 @@ pub(crate) fn check_dto(
     }
     CheckDto {
         check_id,
-        latest: safe_message(&checked.app.latest),
+        latest: safe_display_text(&checked.app.latest),
         update_available: headline.is_some(),
         notice: headline.or_else(|| installed.map(|installed| installed.notice.clone())),
         installed: installed.map(|installed| installed.result.clone()),
@@ -532,12 +555,16 @@ pub(crate) fn check_dto(
 /// What an upgrade of `copy` did, for the webview. Relaunch is offered when
 /// the app's own copy was installed: the `.dmg` swap, or the `.deb` installed
 /// behind the password prompt, which replaces the running app's files.
-pub(crate) fn outcome_dto(copy: SelfCopy, outcome: &Outcome) -> RunDto {
+/// `hooks` is what the core says about the agents' hooks after it
+/// ([`agent_hooks::after_upgrade`], PRD #1666 part 3 R-3), shown last.
+pub(crate) fn outcome_dto(copy: SelfCopy, outcome: &Outcome, hooks: Vec<PlanLine>) -> RunDto {
+    let mut lines = outcome.items();
+    lines.extend(hooks);
     RunDto {
         copy,
         ok: outcome.upgraded(),
         installed: outcome.installed(),
-        lines: line_dtos(outcome.items()),
+        lines: line_dtos(lines),
         relaunch: copy == SelfCopy::App && outcome.app_relaunch_notice().is_some(),
     }
 }
@@ -585,15 +612,15 @@ pub(crate) async fn desktop_self_upgrade_check(
         Ok::<_, String>((path, running, cli))
     })
     .await
-    .map_err(|e| safe_message(e.to_string()))?
-    .map_err(safe_message)?;
+    .map_err(|e| safe_display_text(e.to_string()))?
+    .map_err(safe_display_text)?;
     // Each copy is planned on its own channel: a stable CLI beside a
     // prerelease app is offered the newest stable release, and a CLI on the
     // beta formula the newest prerelease, the only kind its formula reaches.
     let releases = ReleaseSource::from_build()
         .releases_for(&running, cli.as_ref())
         .await
-        .map_err(|e| safe_message(e.to_string()))?;
+        .map_err(|e| safe_display_text(e.to_string()))?;
     let (check_id, checked) = tauri::async_runtime::spawn_blocking(move || {
         let host = SystemHost { path };
         let options = options(ProvenanceCheck::detect(&host));
@@ -603,7 +630,7 @@ pub(crate) async fn desktop_self_upgrade_check(
         )
     })
     .await
-    .map_err(|e| safe_message(e.to_string()))?;
+    .map_err(|e| safe_display_text(e.to_string()))?;
     Ok(installed_state.answer(check_id, &checked))
 }
 
@@ -611,9 +638,14 @@ pub(crate) async fn desktop_self_upgrade_check(
 /// dialog shows, so what runs is what the user read, whatever a later check
 /// found — after they pressed Upgrade. A failure is an `ok: false` result in
 /// the core's words, not an error: it is what the dialog shows.
+///
+/// Generic over the Tauri runtime and nothing else, so a test registers this
+/// command on [`tauri::test::MockRuntime`] and invokes it over IPC (issue
+/// #1840): the pin that an installed CLI's hooks are refreshed runs this body,
+/// not a copy of it.
 #[tauri::command]
-pub(crate) async fn desktop_self_upgrade_run(
-    webview: Webview,
+pub(crate) async fn desktop_self_upgrade_run<R: tauri::Runtime>(
+    webview: Webview<R>,
     state: State<'_, SelfUpgradeState>,
     copy: SelfCopy,
     check_id: u64,
@@ -629,18 +661,20 @@ pub(crate) async fn desktop_self_upgrade_run(
         let host = SystemHost {
             path: run_state.login_path(),
         };
-        handle.block_on(execute::execute(
-            &host,
-            &run_plan,
-            &ReleaseSource::from_build(),
-            &PlanOptions::default_staging_root(),
-        ))
+        let (source, staging_root) = run_state.release();
+        handle
+            .block_on(execute::execute(&host, &run_plan, &source, &staging_root))
+            .map(|outcome| {
+                // R-3: a CLI the upgrade installed refreshes the agents' hooks.
+                let hooks = agent_hooks::after_upgrade(&host, &run_plan, &outcome);
+                (outcome, hooks)
+            })
     })
     .await
-    .map_err(|e| safe_message(e.to_string()))?;
+    .map_err(|e| safe_display_text(e.to_string()))?;
     Ok(match result {
-        Ok(outcome) => {
-            let dto = outcome_dto(copy, &outcome);
+        Ok((outcome, hooks)) => {
+            let dto = outcome_dto(copy, &outcome, hooks);
             state.mark_installed(copy, &outcome, &dto);
             dto
         }
@@ -1215,6 +1249,7 @@ mod tests {
                 provenance: provenance(),
                 mount_left: None,
             },
+            Vec::new(),
         );
         assert!(replaced.ok);
         assert!(replaced.relaunch);
@@ -1229,8 +1264,8 @@ mod tests {
             version: LATEST.into(),
             provenance: provenance(),
         };
-        assert!(outcome_dto(SelfCopy::App, &deb).relaunch);
-        assert!(!outcome_dto(SelfCopy::Cli, &deb).relaunch);
+        assert!(outcome_dto(SelfCopy::App, &deb, Vec::new()).relaunch);
+        assert!(!outcome_dto(SelfCopy::Cli, &deb, Vec::new()).relaunch);
 
         let others = [
             Outcome::BrewNotUpgraded {
@@ -1256,11 +1291,11 @@ mod tests {
             },
         ];
         for outcome in &others {
-            let dto = outcome_dto(SelfCopy::App, outcome);
+            let dto = outcome_dto(SelfCopy::App, outcome, Vec::new());
             assert_eq!(dto.ok, outcome.upgraded());
             assert!(!dto.relaunch, "{outcome:?}");
         }
-        let staged = outcome_dto(SelfCopy::App, &others[3]);
+        let staged = outcome_dto(SelfCopy::App, &others[3], Vec::new());
         assert_eq!(
             commands(&staged.lines),
             vec!["sudo apt install /stage/x.deb"]
@@ -1280,14 +1315,14 @@ mod tests {
             version: LATEST.into(),
             provenance: provenance(),
         };
-        let dto = outcome_dto(SelfCopy::Cli, &staged);
+        let dto = outcome_dto(SelfCopy::Cli, &staged, Vec::new());
         assert!(dto.ok && !dto.installed);
         let not_brewed = Outcome::BrewNotUpgraded {
             formula: "dot-agent-deck",
             reported: Some(CURRENT.into()),
             offered: LATEST.into(),
         };
-        assert!(!outcome_dto(SelfCopy::Cli, &not_brewed).installed);
+        assert!(!outcome_dto(SelfCopy::Cli, &not_brewed, Vec::new()).installed);
         for installed in [
             Outcome::Replaced {
                 path: PathBuf::from("/home/u/.local/bin/dot-agent-deck"),
@@ -1305,7 +1340,7 @@ mod tests {
             },
         ] {
             assert!(
-                outcome_dto(SelfCopy::Cli, &installed).installed,
+                outcome_dto(SelfCopy::Cli, &installed, Vec::new()).installed,
                 "{installed:?}"
             );
         }
@@ -1324,6 +1359,7 @@ mod tests {
                 reported: Some(CURRENT.into()),
                 offered: LATEST.into(),
             },
+            Vec::new(),
         );
         assert!(!dto.ok);
         assert!(!dto.relaunch);
@@ -1432,13 +1468,13 @@ mod tests {
         state.mark_installed(
             SelfCopy::Cli,
             &replaced,
-            &outcome_dto(SelfCopy::Cli, &replaced),
+            &outcome_dto(SelfCopy::Cli, &replaced, Vec::new()),
         );
         assert!(!state.relaunch_ready());
         state.mark_installed(
             SelfCopy::App,
             &replaced,
-            &outcome_dto(SelfCopy::App, &replaced),
+            &outcome_dto(SelfCopy::App, &replaced, Vec::new()),
         );
         assert!(state.relaunch_ready());
     }
@@ -1499,7 +1535,7 @@ mod tests {
             version: LATEST.into(),
             provenance: provenance(),
         };
-        let result = outcome_dto(SelfCopy::App, &installed);
+        let result = outcome_dto(SelfCopy::App, &installed, Vec::new());
         assert!(result.ok && result.relaunch);
         state.mark_installed(SelfCopy::App, &installed, &result);
 
@@ -1540,7 +1576,7 @@ mod tests {
         assert_eq!(json["installed"]["relaunch"], true);
 
         // The CLI's own install is not the app's.
-        let cli_installed = outcome_dto(SelfCopy::Cli, &installed);
+        let cli_installed = outcome_dto(SelfCopy::Cli, &installed, Vec::new());
         assert!(cli_installed.ok && !cli_installed.relaunch);
     }
 
@@ -1585,6 +1621,7 @@ mod tests {
                 version: LATEST.into(),
                 provenance: provenance(),
             },
+            Vec::new(),
         );
         assert_eq!(commands(&dto.lines), vec![command.clone()]);
         assert!(command.ends_with(" /usr/local/bin/dot-agent-deck"));
@@ -1600,6 +1637,7 @@ mod tests {
                 version: LATEST.into(),
                 provenance: provenance(),
             },
+            Vec::new(),
         );
         assert!(commands(&dto.lines).is_empty());
         // And the core shows no command for such a path in the first place:
@@ -1621,6 +1659,7 @@ mod tests {
                 version: LATEST.into(),
                 provenance: provenance(),
             },
+            Vec::new(),
         );
         assert!(commands(&manual.lines).is_empty());
         assert!(
@@ -1765,7 +1804,7 @@ mod tests {
             completing.mark_installed(
                 SelfCopy::App,
                 &installed,
-                &outcome_dto(SelfCopy::App, &installed),
+                &outcome_dto(SelfCopy::App, &installed, Vec::new()),
             );
             drop(first);
         };
@@ -1840,5 +1879,441 @@ mod tests {
 
         state.mark_unfinished(SelfCopy::Cli, &unfinished(false));
         assert!(state.claim(SelfCopy::Cli, id).is_ok());
+    }
+
+    /// PRD #1666 part 3 (R-3): a CLI at a path no command can show faithfully
+    /// gets its hooks recovery from the core in words, after a staged download
+    /// and after an upgrade whose refresh did not answer. The app shows those
+    /// words as the core wrote them, as the TUI and the CLI do
+    /// (`the_clients_show_an_unshowable_paths_recovery_alike`), with nothing
+    /// to copy.
+    #[test]
+    fn self_upgrade_036_an_unshowable_cli_path_gets_the_hooks_recovery_in_words() {
+        let bad = PathBuf::from("/home/u/\u{202E}etats/dot-agent-deck");
+        let cli_plan = |action| UpgradePlan {
+            installation: Installation {
+                copy: CopyKind::Cli,
+                executable: bad.clone(),
+                version: CURRENT.into(),
+                platform: Some(Platform::LinuxAmd64),
+                method: dot_agent_deck::self_upgrade::InstallMethod::DownloadedWritable {
+                    binary: bad.clone(),
+                },
+                tools: Default::default(),
+            },
+            latest: LATEST.into(),
+            action,
+            provenance: ProvenanceCheck::Unavailable {
+                reason: "no gh".into(),
+            },
+            stable_switch: None,
+        };
+        let staged = (
+            cli_plan(PlanAction::StagedInstall {
+                target: bad.clone(),
+                asset: "dot-agent-deck-linux-amd64".into(),
+                pkexec: None,
+            }),
+            Outcome::Staged {
+                path: PathBuf::from("/stage/dot-agent-deck"),
+                command: None,
+                version: LATEST.into(),
+                provenance: provenance(),
+            },
+        );
+        let replaced = (
+            cli_plan(PlanAction::ReplaceBinary {
+                target: bad.clone(),
+                asset: "dot-agent-deck-linux-amd64".into(),
+            }),
+            Outcome::Replaced {
+                path: bad.clone(),
+                version: LATEST.into(),
+                provenance: provenance(),
+                synced: true,
+            },
+        );
+        for (run_plan, outcome) in [staged, replaced] {
+            let hooks = agent_hooks::after_upgrade(&Fake::linux(), &run_plan, &outcome);
+            let words: Vec<String> = hooks
+                .iter()
+                .map(|line| match line {
+                    PlanLine::Text(text) => text.clone(),
+                    PlanLine::Command(command) => panic!("a command {command:?}"),
+                })
+                .collect();
+            assert!(!words.is_empty());
+            let dto = outcome_dto(SelfCopy::Cli, &outcome, hooks);
+            assert!(commands(&dto.lines).is_empty(), "{:?}", dto.lines);
+            let texts = texts(&dto.lines);
+            let shown = &texts[texts.len() - words.len()..];
+            assert_eq!(shown, &words[..]);
+            assert!(
+                shown.iter().all(|text| !text.contains("etats")),
+                "{shown:?}"
+            );
+        }
+    }
+
+    /// PRD #1666 part 3 (R-3): what the core says about the agents' hooks
+    /// after a CLI upgrade follows the upgrade's own lines, and its command
+    /// is copyable exactly as the core built it.
+    #[test]
+    fn self_upgrade_035_the_hooks_lines_follow_the_cli_result() {
+        let command = "/home/u/.local/bin/dot-agent-deck hooks install --agent claude-code";
+        let installed = Outcome::Installed {
+            version: LATEST.into(),
+            provenance: provenance(),
+        };
+        let dto = outcome_dto(
+            SelfCopy::Cli,
+            &installed,
+            vec![
+                PlanLine::Text("Claude Code's hooks still run another copy, /opt/x.".into()),
+                PlanLine::Command(command.into()),
+            ],
+        );
+        assert!(dto.ok && dto.installed);
+        let texts = texts(&dto.lines);
+        assert_eq!(texts[0], format!("Installed v{LATEST}."));
+        assert_eq!(
+            texts[texts.len() - 2],
+            "Claude Code's hooks still run another copy, /opt/x."
+        );
+        assert_eq!(commands(&dto.lines), vec![command.to_string()]);
+    }
+
+    /// Issue #1839: a path carrying a bidi override reaches the webview's
+    /// prose without it — the result's `Upgraded <path>` line and a plan's
+    /// lines alike — so no reader of the DTO relies on the dialog's own
+    /// sanitiser. The rest of the path is still shown.
+    #[test]
+    fn self_upgrade_037_a_bidi_control_in_a_path_never_reaches_the_webview() {
+        let bad = PathBuf::from("/home/u/\u{202E}etats/dot-agent-deck");
+        let replaced = Outcome::Replaced {
+            path: bad.clone(),
+            version: LATEST.into(),
+            provenance: provenance(),
+            synced: true,
+        };
+        // The core's own words carry it, so the DTO is what removes it.
+        assert!(
+            replaced
+                .items()
+                .iter()
+                .any(|line| matches!(line, PlanLine::Text(text) if text.contains('\u{202E}')))
+        );
+        let result = outcome_dto(SelfCopy::Cli, &replaced, Vec::new());
+        assert_eq!(
+            texts(&result.lines)[0],
+            format!("Upgraded /home/u/etats/dot-agent-deck to v{LATEST}.")
+        );
+
+        let plan = UpgradePlan {
+            installation: Installation {
+                copy: CopyKind::Cli,
+                executable: bad.clone(),
+                version: CURRENT.into(),
+                platform: Some(Platform::LinuxAmd64),
+                method: dot_agent_deck::self_upgrade::InstallMethod::DownloadedWritable {
+                    binary: bad.clone(),
+                },
+                tools: Default::default(),
+            },
+            latest: LATEST.into(),
+            action: PlanAction::ReplaceBinary {
+                target: bad.clone(),
+                asset: "dot-agent-deck-linux-amd64".into(),
+            },
+            provenance: ProvenanceCheck::Unavailable {
+                reason: "no gh".into(),
+            },
+            stable_switch: None,
+        };
+        let shown = plan_dto(SelfCopy::Cli, &plan);
+        assert!(
+            texts(&shown.lines)
+                .iter()
+                .any(|text| text.contains("etats"))
+        );
+
+        for json in [
+            serde_json::to_string(&result).unwrap(),
+            serde_json::to_string(&shown).unwrap(),
+        ] {
+            assert!(
+                !json
+                    .chars()
+                    .any(dot_agent_deck::untrusted_text::is_bidi_format_char),
+                "{json}"
+            );
+        }
+    }
+
+    /// A release of `LATEST` as [`desktop_self_upgrade_run`] downloads it:
+    /// a CLI script that records every invocation's arguments to a log and
+    /// answers `--version` and `hooks refresh --json`, the checksum manifest
+    /// that lists it, and a server on loopback offering both under
+    /// `/download/v<LATEST>/` (the desktop's counterpart of the CLI's
+    /// `release_script_recording`, issue #1840).
+    #[cfg(unix)]
+    struct FakeRelease {
+        dir: tempfile::TempDir,
+        base: String,
+        /// Set on drop, so the server stops taking connections and its
+        /// thread ends with the fixture rather than with the test process.
+        stop: Arc<AtomicBool>,
+        server: Option<std::thread::JoinHandle<()>>,
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeRelease {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            // Wakes the blocked `accept`, which then sees `stop`.
+            let _ = std::net::TcpStream::connect(self.base.trim_start_matches("http://"));
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl FakeRelease {
+        /// What the release's `hooks refresh --json` reports.
+        const REFRESHED: &str = "Agent hooks refreshed by the fake release.";
+
+        fn start() -> Self {
+            use std::io::{BufRead, BufReader, Write};
+
+            let dir = tempfile::tempdir().expect("a folder for the fake release");
+            // Single-quoted for the shell, an apostrophe in the temp path
+            // included.
+            let log = format!(
+                "'{}'",
+                dir.path()
+                    .join("invocations.log")
+                    .to_str()
+                    .expect("a UTF-8 temp path")
+                    .replace('\'', r"'\''")
+            );
+            let asset = Platform::current()
+                .expect("a platform with release assets")
+                .cli_asset();
+            let script = format!(
+                "#!/bin/sh\necho \"$*\" >> {log}\nif [ \"$*\" = \"--version\" ]; then\n  echo 'dot-agent-deck {LATEST}'\n  exit 0\nfi\nif [ \"$*\" = \"hooks refresh --json\" ]; then\n  echo '{{\"ok\":true,\"lines\":[{{\"text\":\"{refreshed}\"}}]}}'\n  exit 0\nfi\nexit 64\n",
+                refreshed = Self::REFRESHED,
+            )
+            .into_bytes();
+            let script_path = dir.path().join(asset);
+            std::fs::write(&script_path, &script).unwrap();
+            let sha256 = dot_agent_deck::self_upgrade::verify::file_sha256(&script_path).unwrap();
+            let manifest = format!("{sha256}  {asset}\n").into_bytes();
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopped = stop.clone();
+            let server = std::thread::spawn(move || {
+                for mut stream in listener.incoming().flatten() {
+                    if stopped.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let mut request = String::new();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    if reader.read_line(&mut request).is_err() {
+                        continue;
+                    }
+                    loop {
+                        let mut header = String::new();
+                        match reader.read_line(&mut header) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) if header.trim().is_empty() => break,
+                            Ok(_) => {}
+                        }
+                    }
+                    let path = request.split_whitespace().nth(1).unwrap_or("/");
+                    let body = match path.strip_prefix(&format!("/download/v{LATEST}/")) {
+                        Some("checksums.txt") => Some(&manifest),
+                        Some(name) if name == asset => Some(&script),
+                        _ => None,
+                    };
+                    let (status, body) = match body {
+                        Some(body) => ("200 OK", body.as_slice()),
+                        None => ("404 Not Found", &[][..]),
+                    };
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(body);
+                }
+            });
+            Self {
+                dir,
+                base,
+                stop,
+                server: Some(server),
+            }
+        }
+
+        /// Every invocation of the release's CLI so far, one per line.
+        fn invocations(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.path().join("invocations.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
+        /// This app's state, its upgrades pointed at this release, with one
+        /// check (id 1) whose CLI plan, at `target`, is `action`.
+        fn state(&self, target: &Path, action: PlanAction) -> SelfUpgradeState {
+            let state = SelfUpgradeState::default();
+            let bin = target.parent().unwrap().as_os_str().to_os_string();
+            state.inner.login_path.set(Some(bin)).unwrap();
+            *lock(&state.inner.release) = Some((
+                ReleaseSource {
+                    api_url: format!("{}/api/latest", self.base),
+                    list_url: format!("{}/api/list", self.base),
+                    download_base: format!("{}/download", self.base),
+                },
+                self.dir.path().join("staging"),
+            ));
+            let cli = UpgradePlan {
+                installation: Installation {
+                    copy: CopyKind::Cli,
+                    executable: target.to_path_buf(),
+                    version: CURRENT.into(),
+                    platform: Platform::current(),
+                    method: dot_agent_deck::self_upgrade::InstallMethod::DownloadedWritable {
+                        binary: target.to_path_buf(),
+                    },
+                    tools: Default::default(),
+                },
+                latest: LATEST.into(),
+                action,
+                provenance: ProvenanceCheck::Unavailable {
+                    reason: "the GitHub CLI (`gh`) is not installed".into(),
+                },
+                stable_switch: None,
+            };
+            let app = checked_against(LATEST).app;
+            state.store(
+                1,
+                Checked {
+                    app,
+                    cli: Some(cli),
+                },
+            );
+            state
+        }
+    }
+
+    /// Upgrade the CLI as the dialog does: the real
+    /// [`desktop_self_upgrade_run`], registered on Tauri's mock runtime and
+    /// invoked over IPC from the main webview with check 1.
+    #[cfg(unix)]
+    fn run_over_ipc(state: SelfUpgradeState) -> serde_json::Value {
+        use tauri::ipc::{CallbackFn, InvokeBody};
+        use tauri::test::{INVOKE_KEY, get_ipc_response, mock_builder};
+        use tauri::webview::InvokeRequest;
+
+        let app = mock_builder()
+            .manage(state)
+            .invoke_handler(tauri::generate_handler![desktop_self_upgrade_run])
+            .build(crate::app_context())
+            .expect("a mock app");
+        let main = tauri::WebviewWindowBuilder::new(
+            &app,
+            crate::pr_browser::MAIN_WEBVIEW_LABEL,
+            tauri::WebviewUrl::default(),
+        )
+        .build()
+        .expect("the main webview");
+        get_ipc_response(
+            &main,
+            InvokeRequest {
+                cmd: "desktop_self_upgrade_run".into(),
+                callback: CallbackFn(0),
+                error: CallbackFn(1),
+                url: "tauri://localhost".parse().expect("the app origin"),
+                body: InvokeBody::Json(serde_json::json!({ "copy": "cli", "checkId": 1 })),
+                headers: Default::default(),
+                invoke_key: INVOKE_KEY.to_string(),
+            },
+        )
+        .expect("the command answers")
+        .deserialize::<serde_json::Value>()
+        .expect("a JSON answer")
+    }
+
+    /// Issue #1840 (PRD #1666 part 3, R-3, on the real entry point): Upgrade
+    /// on a CLI in a writable folder, through [`desktop_self_upgrade_run`]
+    /// itself, replaces it with the release, runs the installed copy's
+    /// `hooks refresh --json`, and shows its report last.
+    #[cfg(unix)]
+    #[test]
+    fn self_upgrade_038_the_run_command_refreshes_an_installed_clis_hooks() {
+        let release = FakeRelease::start();
+        let bin = release.dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let target = bin.join("dot-agent-deck");
+        let state = release.state(
+            &target,
+            PlanAction::ReplaceBinary {
+                target: target.clone(),
+                asset: Platform::current().unwrap().cli_asset().into(),
+            },
+        );
+
+        let answer = run_over_ipc(state);
+        assert_eq!(answer["ok"], true, "{answer}");
+        assert_eq!(answer["installed"], true, "{answer}");
+        assert!(
+            release
+                .invocations()
+                .contains(&"hooks refresh --json".to_string()),
+            "the installed copy was never asked to refresh: {:?}",
+            release.invocations()
+        );
+        let lines = answer["lines"].as_array().unwrap();
+        assert_eq!(
+            lines.last().unwrap()["text"],
+            FakeRelease::REFRESHED,
+            "{answer}"
+        );
+    }
+
+    /// Issue #1840: a download the user has still to install, through
+    /// [`desktop_self_upgrade_run`], refreshes nothing — the staged copy is
+    /// only asked its version — and says how to update the hooks once it is
+    /// installed.
+    #[cfg(unix)]
+    #[test]
+    fn self_upgrade_039_the_run_command_refreshes_nothing_after_a_staged_download() {
+        let release = FakeRelease::start();
+        let target = PathBuf::from("/usr/local/bin/dot-agent-deck");
+        let state = release.state(
+            &target,
+            PlanAction::StagedInstall {
+                target: target.clone(),
+                asset: Platform::current().unwrap().cli_asset().into(),
+                pkexec: None,
+            },
+        );
+
+        let answer = run_over_ipc(state);
+        assert_eq!(answer["ok"], true, "{answer}");
+        assert_eq!(answer["installed"], false, "{answer}");
+        assert_eq!(release.invocations(), vec!["--version".to_string()]);
+        let texts: Vec<&str> = answer["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|line| line["text"].as_str())
+            .collect();
+        assert!(texts.contains(&agent_hooks::NOT_INSTALLED), "{answer}");
     }
 }

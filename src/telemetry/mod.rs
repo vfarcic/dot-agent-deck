@@ -47,12 +47,17 @@
 //! shim that switches on Codex's and Devin's own telemetry runs there
 //! ([`shim::run_if_invoked`]).
 
-/// PRD #633's execution-accounting prototype, compiled for tests only: no
-/// product path calls it, and wiring it (and dropping this `cfg(test)`) is
-/// the follow-up PRD's first step.
-#[cfg(test)]
-mod accounting;
+/// PRD #1858: what each run consumed and how it ended, read from each
+/// agent's own usage record and exported on the run's span. The record's
+/// work-item and roll-up halves (PRD #633's prototype) are for #1860 and are
+/// exercised by its tests only, hence the `dead_code` allowance outside them.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod accounting;
 pub mod ci;
+/// PRD #1859: the core of `dot-agent-deck-collector`, a separate binary
+/// (`src/bin/dot-agent-deck-collector.rs`). Nothing in the deck calls it.
+#[cfg(unix)]
+pub mod collector;
 pub mod config;
 pub mod exporter;
 pub mod input;
@@ -108,6 +113,7 @@ fn start_from(
     registry: &crate::agent_pty::AgentPtyRegistry,
 ) -> Arc<Telemetry> {
     launch::remove_leftover_config_files(&config_dir);
+    exporter::remove_leftover_usage_files(&config_dir);
     let mut telemetry = Telemetry::start_in(env, config_dir.clone());
     #[cfg(unix)]
     if telemetry.is_enabled()
@@ -158,7 +164,38 @@ pub fn teardown_began(telemetry: Option<Arc<Telemetry>>, cause: &str) {
 /// run and add its identity to the agent's environment. `None` when telemetry
 /// is off or the pane has no id; drop the result to abandon the run when the
 /// spawn is refused, and pass it to [`commit_spawn`] once the agent started.
+///
+/// With no run prepared, [`shim::RUN_ID_ENV`] is set blank unless the spawn
+/// sets it itself, which every reader takes as unset: a daemon started inside
+/// another deck's agent would otherwise pass that agent's run id on next to
+/// this deck's own pane id, and a tool's spans would join the other run
+/// (#1902). That holds with telemetry off too, where the work does run under
+/// the other deck's agent: the agent's `DOT_AGENT_DECK_PANE_ID` is this deck's
+/// either way, so the pair would name a run and a pane that never belonged
+/// together.
 pub fn prepare_spawn(
+    telemetry: Option<Arc<Telemetry>>,
+    pane_id: Option<&str>,
+    agent_id: &str,
+    opts: &mut crate::agent_pty::SpawnOptions<'_>,
+    membership: Option<&crate::agent_pty::TabMembership>,
+) -> Option<PreparedRun> {
+    let run = prepare_run_for_spawn(telemetry, pane_id, agent_id, opts, membership);
+    if run.is_none() && !opts.env.iter().any(|(k, _)| k == shim::RUN_ID_ENV) {
+        opts.env.push((shim::RUN_ID_ENV.to_string(), String::new()));
+    }
+    if run.is_none() {
+        // PRD #1858: only a run's own usage file, which a prepared run sets,
+        // over one the daemon or the spawn inherited from another run.
+        opts.env.push((
+            accounting::usage_file::USAGE_FILE_ENV.to_string(),
+            String::new(),
+        ));
+    }
+    run
+}
+
+fn prepare_run_for_spawn(
     telemetry: Option<Arc<Telemetry>>,
     pane_id: Option<&str>,
     agent_id: &str,
@@ -190,24 +227,54 @@ pub fn commit_spawn(run: Option<PreparedRun>) {
 /// as `daemon_shutdown` while the daemon is shutting down, as `exited` when
 /// the agent is still registered (nothing removed it, so it went by itself),
 /// and as `closed` otherwise. `still_registered` is asked only when telemetry
-/// is on.
+/// is on, and `exit_status` (the agent's child's, once it has exited) only
+/// for an agent that went by itself: its child can close its terminal a
+/// moment before it exits, so it is asked again for up to
+/// [`EXIT_CODE_WAIT`].
 pub fn agent_exited(
     telemetry: Option<Arc<Telemetry>>,
     pane_id: Option<&str>,
     agent_id: &str,
     shutting_down: bool,
     still_registered: impl FnOnce() -> bool,
+    exit_status: impl Fn() -> Option<portable_pty::ExitStatus>,
 ) {
     let (Some(telemetry), Some(pane_id)) = (telemetry, pane_id) else {
         return;
     };
-    telemetry.end_run(
-        pane_id,
-        Some(agent_id),
-        end_reason(shutting_down, still_registered),
-        None,
-    );
+    let reason = end_reason(shutting_down, still_registered);
+    let code = (reason == EndReason::Exited)
+        .then(|| {
+            let deadline = std::time::Instant::now() + EXIT_CODE_WAIT;
+            loop {
+                if let Some(status) = exit_status() {
+                    break exit_code(&status);
+                }
+                if std::time::Instant::now() >= deadline {
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        })
+        .flatten();
+    telemetry.end_run(pane_id, Some(agent_id), reason, code);
 }
+
+/// The exit code of a child that exited with `status`, as the run carries
+/// it; `None` when a signal ended it, which `portable_pty` names only in its
+/// `Display`, or for a code past `i32`.
+fn exit_code(status: &portable_pty::ExitStatus) -> Option<i32> {
+    let signalled = status.to_string().starts_with("Terminated by");
+    if signalled {
+        None
+    } else {
+        i32::try_from(status.exit_code()).ok()
+    }
+}
+
+/// How long [`agent_exited`] waits for an agent's exit code after its
+/// terminal closed.
+pub const EXIT_CODE_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
 fn end_reason(shutting_down: bool, still_registered: impl FnOnce() -> bool) -> EndReason {
     if shutting_down {
@@ -259,6 +326,7 @@ pub const SPAN_NAMES: [&str; 4] = [
 pub const EVENT_STATUS_CHANGE: &str = "deck.status_change";
 pub const EVENT_INTERVENTION: &str = "deck.intervention";
 pub const EVENT_CI_CHANGE: &str = "deck.ci.change";
+pub use accounting::EVENT_MODEL_USAGE;
 
 /// Every attribute key the deck can put on a span, a span event, or the
 /// resource it builds itself. The closed set IS the allow-list: an attribute
@@ -308,6 +376,9 @@ pub enum AttrKey {
     CiChecksSkipped,
     CiRoundsCount,
     CiFailuresCount,
+    /// PRD #1858: a run's usage and termination, and one model's usage on a
+    /// `deck.model_usage` event ([`accounting::AccountingKey`]).
+    Accounting(accounting::AccountingKey),
 }
 
 impl AttrKey {
@@ -396,6 +467,7 @@ impl AttrKey {
             AttrKey::CiChecksSkipped => "deck.ci.checks.skipped",
             AttrKey::CiRoundsCount => "deck.ci.rounds.count",
             AttrKey::CiFailuresCount => "deck.ci.failures.count",
+            AttrKey::Accounting(key) => key.as_str(),
         }
     }
 
@@ -403,6 +475,9 @@ impl AttrKey {
     #[cfg(test)]
     pub fn is_allowed(key: &str) -> bool {
         AttrKey::ALL.iter().any(|k| k.as_str() == key)
+            || accounting::AccountingKey::ALL
+                .iter()
+                .any(|k| k.as_str() == key)
     }
 }
 
@@ -431,9 +506,14 @@ mod tests {
 
     #[test]
     fn the_seams_do_nothing_when_telemetry_is_off() {
-        agent_exited(None, Some("p1"), "a1", false, || {
-            panic!("registration is not asked with telemetry off")
-        });
+        agent_exited(
+            None,
+            Some("p1"),
+            "a1",
+            false,
+            || panic!("registration is not asked with telemetry off"),
+            || panic!("the exit status is not asked with telemetry off"),
+        );
         observe_pane_input(None, true, "p1", b"x");
         commit_spawn(None);
     }
@@ -479,6 +559,70 @@ mod tests {
             (disposition(libc::SIGTERM), disposition(libc::SIGINT)),
             before
         );
+    }
+
+    /// PRD #1858: a daemon that ends without reading its runs' usage files —
+    /// crashed, or killed — leaves them, and the next daemon to start on the
+    /// same state directory removes them before it has a run of its own.
+    ///
+    /// A plain test with a runtime of its own, entered, rather than an async
+    /// one: its file work then runs on the test's thread, outside any task.
+    #[cfg(unix)]
+    #[test]
+    fn a_crashed_daemons_usage_files_go_when_the_next_one_starts() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let (event_tx, _) = tokio::sync::broadcast::channel(8);
+        let registry = crate::agent_pty::AgentPtyRegistry::new();
+        let crashed = start_from(
+            &exporting_env(),
+            dir.path().to_path_buf(),
+            None,
+            &event_tx,
+            &registry,
+        );
+        let mut opts = crate::agent_pty::SpawnOptions {
+            agent_type: Some(crate::event::AgentType::Pi),
+            ..Default::default()
+        };
+        let run = prepare_spawn(
+            Some(Arc::clone(&crashed)),
+            Some("p1"),
+            "a1",
+            &mut opts,
+            None,
+        )
+        .expect("a prepared run");
+        let file = opts
+            .env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == accounting::usage_file::USAGE_FILE_ENV)
+            .map(|(_, v)| std::path::PathBuf::from(v))
+            .unwrap();
+        commit_spawn(Some(run));
+        assert!(file.is_file());
+        // The crash: the daemon never ends the run nor shuts down, and its
+        // process ends, which closes the descriptor holding its usage lease.
+        let lease = crashed.usage_lease_fd().expect("a usage lease");
+        std::mem::forget(crashed);
+        // SAFETY: the descriptor belongs to the leaked handle, which never
+        // closes it.
+        unsafe { libc::close(lease) };
+        let registry = crate::agent_pty::AgentPtyRegistry::new();
+        let next = start_from(
+            &exporting_env(),
+            dir.path().to_path_buf(),
+            None,
+            &event_tx,
+            &registry,
+        );
+        assert!(!file.exists(), "left over after a restart");
+        runtime.block_on(next.shutdown(std::time::Duration::from_millis(100)));
     }
 
     /// A Devin configuration a crashed or SIGKILLed daemon left behind is
@@ -584,6 +728,122 @@ mod tests {
                 .shutdown(std::time::Duration::from_millis(100))
                 .await;
         }
+    }
+
+    /// Issue #1902: a daemon that inherited another deck's run id hands each
+    /// agent it starts a run for that run's own id, shim or no shim, and a
+    /// blank one to an agent it starts no run for — telemetry off, or no pane
+    /// id — unless the spawn sets its own. The last value for a variable in
+    /// the spawn's environment is the one the agent gets.
+    #[tokio::test]
+    async fn an_agent_gets_its_own_run_id_and_never_an_inherited_one() {
+        const INHERITED: &str = "0123456789abcdef0123456789abcdef";
+        fn run_id(opts: &crate::agent_pty::SpawnOptions<'_>) -> Option<String> {
+            opts.env
+                .iter()
+                .rev()
+                .find(|(k, _)| k == shim::RUN_ID_ENV)
+                .map(|(_, v)| v.clone())
+        }
+        let daemon_env = |on: bool| {
+            let mut env = if on {
+                exporting_env()
+            } else {
+                config::EnvMap::new()
+            };
+            env.insert("PATH".into(), "/usr/bin".into());
+            env.insert(shim::RUN_ID_ENV.into(), INHERITED.into());
+            env
+        };
+        // Telemetry on: with the shim (Unix only writes one) and without it.
+        let decks: &[Option<&str>] = if cfg!(unix) {
+            &[Some("/opt/deck"), None]
+        } else {
+            &[None]
+        };
+        for &deck in decks {
+            let dir = tempfile::tempdir().unwrap();
+            let (event_tx, _) = tokio::sync::broadcast::channel(8);
+            let registry = crate::agent_pty::AgentPtyRegistry::new();
+            let telemetry = start_from(
+                &daemon_env(true),
+                dir.path().to_path_buf(),
+                deck,
+                &event_tx,
+                &registry,
+            );
+            assert_eq!(dir.path().join(shim::DIR_NAME).exists(), deck.is_some());
+            let mut ids = Vec::new();
+            for pane in ["p1", "p2"] {
+                let mut opts = crate::agent_pty::SpawnOptions {
+                    command: Some("codex"),
+                    env: crate::test_isolation::pin_unreachable_endpoints(Vec::new()),
+                    ..Default::default()
+                };
+                let run = prepare_spawn(registry.telemetry(), Some(pane), "a1", &mut opts, None)
+                    .unwrap_or_else(|| panic!("no run, shim {deck:?}"));
+                let id = run_id(&opts).unwrap();
+                assert!(launch::is_run_id(&id), "{id:?}, shim {deck:?}");
+                assert_ne!(id, INHERITED, "shim {deck:?}");
+                assert!(
+                    run.env
+                        .iter()
+                        .any(|(k, v)| k == shim::RUN_ID_ENV && *v == id),
+                    "the run's own id, shim {deck:?}"
+                );
+                assert_eq!(
+                    opts.env.iter().any(|(k, _)| k == "PATH"),
+                    deck.is_some(),
+                    "PATH changes only for the shim"
+                );
+                ids.push(id);
+            }
+            assert_ne!(ids[0], ids[1], "each spawn its own run");
+            // A spawn with no pane id gets no run, so no id either.
+            let mut opts = crate::agent_pty::SpawnOptions::default();
+            assert!(prepare_spawn(registry.telemetry(), None, "a1", &mut opts, None).is_none());
+            assert_eq!(run_id(&opts).as_deref(), Some(""));
+            telemetry
+                .shutdown(std::time::Duration::from_millis(100))
+                .await;
+        }
+        // Telemetry off: no run, and the inherited id is blanked rather than
+        // passed through; an id the spawn sets itself is kept as it is.
+        let dir = tempfile::tempdir().unwrap();
+        let (event_tx, _) = tokio::sync::broadcast::channel(8);
+        let registry = crate::agent_pty::AgentPtyRegistry::new();
+        let telemetry = start_from(
+            &daemon_env(false),
+            dir.path().to_path_buf(),
+            Some("/opt/deck"),
+            &event_tx,
+            &registry,
+        );
+        assert!(registry.telemetry().is_none());
+        let mut opts = crate::agent_pty::SpawnOptions::default();
+        assert!(prepare_spawn(registry.telemetry(), Some("p1"), "a1", &mut opts, None).is_none());
+        // PRD #1858: an inherited usage file is blanked the same way.
+        let usage_file = (
+            accounting::usage_file::USAGE_FILE_ENV.to_string(),
+            String::new(),
+        );
+        assert_eq!(
+            opts.env,
+            [
+                (shim::RUN_ID_ENV.to_string(), String::new()),
+                usage_file.clone()
+            ]
+        );
+        let own = [(shim::RUN_ID_ENV.to_string(), "mine".to_string())];
+        let mut opts = crate::agent_pty::SpawnOptions {
+            env: own.to_vec(),
+            ..Default::default()
+        };
+        assert!(prepare_spawn(registry.telemetry(), Some("p1"), "a1", &mut opts, None).is_none());
+        assert_eq!(opts.env, [own[0].clone(), usage_file]);
+        telemetry
+            .shutdown(std::time::Duration::from_millis(100))
+            .await;
     }
 
     fn exporting_registry() -> (Arc<Telemetry>, Arc<crate::agent_pty::AgentPtyRegistry>) {

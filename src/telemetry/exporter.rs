@@ -45,6 +45,7 @@
 //! client waits for: see [`Telemetry::shutdown`].
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -54,6 +55,10 @@ use tokio::time::Instant;
 
 use crate::event::BroadcastMsg;
 
+use super::accounting::locate::TrustedDir;
+use super::accounting::run_usage::{UsageDirs, UsageFile};
+use super::accounting::usage_file::USAGE_FILE_ENV;
+use super::accounting::{UsageSource, locate, usage_source};
 use super::config::{EnvMap, TelemetryConfig, redacted_endpoint};
 use super::input::{InputFilter, LONE_ESCAPE_WINDOW};
 use super::launch::LAUNCH_ENV_KEYS;
@@ -61,7 +66,7 @@ use super::propagation::{RunIdentity, agent_env};
 use super::resource::{ResourceAttribute, deck_resource, host_name};
 use super::run_context::{ProbeSettings, Probes};
 use super::span::{SpanRecord, new_run_id};
-use super::tracker::{EndReason, RunStart, RunTracker};
+use super::tracker::{EndReason, FinishingRun, RunStart, RunTracker};
 use super::{Protocol, now_unix_nanos, otlp};
 
 /// Spans per request, at most.
@@ -92,7 +97,265 @@ const STOP_CLIENT_WINDOW: Duration = crate::agent_pty::DAEMON_STOP_POLL_BUDGET;
 /// exiting, while the client samples only every 100 ms.
 pub const SHUTDOWN_HEADROOM: Duration = Duration::from_millis(500);
 /// Bytes of a successful answer read, at most, for its partial-success report.
-const MAX_RESPONSE_BODY: usize = 64 * 1024;
+pub const MAX_RESPONSE_BODY: usize = 64 * 1024;
+/// How often each open run's usage record is read (PRD #1858), as
+/// `codex_rollout_tail` reads a rollout. A run's end reads the rest.
+pub const USAGE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// The directory, under the per-run configuration directory, that holds the
+/// usage files the deck's Pi extension and OpenCode plugin append to.
+pub(crate) const USAGE_DIR: &str = "usage";
+/// How many tokens one attempt to take a usage lease tries
+/// ([`take_usage_lease`]).
+const LEASE_TOKENS: usize = 4;
+/// How long after an attempt to take a usage lease failed a later run's
+/// start tries again ([`LeaseSlot`]).
+const LEASE_RETRY_AFTER: Duration = Duration::from_secs(10);
+/// How old a lease file still being made is before a starting daemon's
+/// cleanup removes it ([`remove_leftover_usage_files`]).
+const ABANDONED_LEASE_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// The deck's usage directory, [`USAGE_DIR`] in `config_dir`, made if it is
+/// not there and opened as a [`TrustedDir`] when it is a directory of this
+/// user's — not a symlink — that no other user can enter: one with group or
+/// other permissions is narrowed to the owner first. `config_dir` itself is
+/// resolved once, as any trusted root is. `None` otherwise, and then no run
+/// gets a usage file; elsewhere than Unix no run gets one either.
+fn private_dir(config_dir: &Path) -> Option<TrustedDir> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(config_dir)
+            .ok()?;
+        let root = TrustedDir::open(config_dir)?;
+        root.make_dir(std::ffi::OsStr::new(USAGE_DIR), 0o700).ok()?;
+        let dir = root.subdir(Path::new(USAGE_DIR))?;
+        if dir.metadata().ok()?.permissions().mode() & 0o077 != 0 {
+            dir.set_mode(0o700).ok()?;
+            if dir.metadata().ok()?.permissions().mode() & 0o077 != 0 {
+                return None;
+            }
+        }
+        Some(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = config_dir;
+        None
+    }
+}
+
+/// Create run `run_id`'s usage file in `dir`, named for the daemon's lease
+/// `lease`: a new regular file only this user can read or write, so a name
+/// already there — a file, a symlink or a FIFO — is refused rather than
+/// reused. `None` when it cannot be made.
+fn new_usage_file(dir: TrustedDir, run_id: &str, lease: &str) -> Option<UsageFile> {
+    let name = locate::usage_file_name(run_id, lease)?;
+    #[cfg(unix)]
+    {
+        let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW;
+        drop(dir.open_raw(Path::new(&name), flags, 0o600).ok()?);
+    }
+    Some(UsageFile { dir, name })
+}
+
+/// This daemon's lease on its usage files (PRD #1858): a file in the usage
+/// directory, named by a token of its own, on which the daemon holds an
+/// exclusive `flock` for as long as it runs — the lock goes when its
+/// descriptor closes, a crash included. Its usage files carry the token
+/// ([`locate::usage_file_name`]), so a daemon that starts later removes them
+/// only once it can take the lock itself ([`remove_leftover_usage_files`]),
+/// which no process id decides.
+struct UsageLease {
+    token: String,
+    /// Holds the lock.
+    #[cfg(unix)]
+    _held: std::os::fd::OwnedFd,
+}
+
+/// A lease token: 16 bytes from the operating system's random source, as
+/// hexadecimal. `None` when that source fails: there is no fallback, as a
+/// token from a clock or a counter could be another daemon's.
+fn lease_token() -> Option<String> {
+    let mut token = [0u8; 16];
+    getrandom::fill(&mut token).ok()?;
+    Some(super::span::hex(&token))
+}
+
+/// Take a new lease in `dir`. Its file is made under the name of a lease
+/// being made ([`locate::lease_being_made`]), which cleanup does not take as
+/// a lease, locked, then renamed to the lease's own name only if no entry
+/// has that name ([`TrustedDir::rename_new`]), so a lease another daemon
+/// finds under its own name is already held and a held one is never
+/// replaced. A token whose file cannot be made, locked or renamed is given
+/// up for another, at most [`LEASE_TOKENS`] of them. `None` when none could
+/// be, or the random source fails, and then no run gets a usage file.
+#[cfg(unix)]
+fn take_usage_lease(dir: &TrustedDir) -> Option<UsageLease> {
+    take_usage_lease_with(dir, lease_token, |_| {})
+}
+
+/// [`take_usage_lease`], with its tokens from `token` and `made` called with
+/// each token between making its file and locking it: a test's seam.
+#[cfg(unix)]
+fn take_usage_lease_with(
+    dir: &TrustedDir,
+    mut token: impl FnMut() -> Option<String>,
+    mut made: impl FnMut(&str),
+) -> Option<UsageLease> {
+    use std::os::fd::AsRawFd as _;
+    let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    for _ in 0..LEASE_TOKENS {
+        let token = token()?;
+        let making = locate::lease_file_name(&token, false);
+        let lease = locate::lease_file_name(&token, true);
+        // A name that is there already is not this daemon's to remove.
+        let Ok(held) = dir.open_raw(Path::new(&making), flags, 0o600) else {
+            continue;
+        };
+        made(&token);
+        // SAFETY: `held` is an open descriptor.
+        let locked = unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+        if locked && dir.rename_new(making.as_ref(), lease.as_ref()).is_ok() {
+            return Some(UsageLease { token, _held: held });
+        }
+        dir.remove(making.as_ref());
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn take_usage_lease(_dir: &TrustedDir) -> Option<UsageLease> {
+    None
+}
+
+/// This daemon's usage lease, taken with its first usage file and then held
+/// for as long as the daemon runs. An attempt that failed is not final: a
+/// later run's start tries again, no sooner than [`LEASE_RETRY_AFTER`] after
+/// it, so a passing failure does not leave the daemon without usage files.
+#[derive(Default)]
+struct LeaseSlot(Mutex<LeaseState>);
+
+#[derive(Default)]
+enum LeaseState {
+    #[default]
+    Untried,
+    Failed(std::time::Instant),
+    Held(UsageLease),
+}
+
+impl LeaseSlot {
+    /// The lease's token, `take` called for a lease when there is none: the
+    /// first time, and again once [`LEASE_RETRY_AFTER`] has passed since it
+    /// last failed. `None` while there is no lease.
+    fn token(
+        &self,
+        now: std::time::Instant,
+        take: impl FnOnce() -> Option<UsageLease>,
+    ) -> Option<String> {
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        match &*state {
+            LeaseState::Held(lease) => return Some(lease.token.clone()),
+            LeaseState::Failed(at) if now.saturating_duration_since(*at) < LEASE_RETRY_AFTER => {
+                return None;
+            }
+            LeaseState::Untried | LeaseState::Failed(_) => {}
+        }
+        *state = take().map_or(LeaseState::Failed(now), LeaseState::Held);
+        match &*state {
+            LeaseState::Held(lease) => Some(lease.token.clone()),
+            LeaseState::Untried | LeaseState::Failed(_) => None,
+        }
+    }
+
+    /// The lease held, if any.
+    #[cfg(test)]
+    fn with_held<T>(&self, f: impl FnOnce(&UsageLease) -> T) -> Option<T> {
+        match &*self.0.lock().unwrap_or_else(|p| p.into_inner()) {
+            LeaseState::Held(lease) => Some(f(lease)),
+            LeaseState::Untried | LeaseState::Failed(_) => None,
+        }
+    }
+}
+
+/// Remove the usage files in the deck's usage directory under `config_dir`
+/// left by a daemon that ended without removing them (PRD #1858): called as
+/// a daemon starts, before it has a lease of its own. A file names the lease
+/// of the daemon that made it ([`UsageLease`]). For each lease file there,
+/// the lease's files and the lease file itself are removed only when its
+/// lock can be taken at once, so the daemon that held it has ended; a lease
+/// another daemon holds — on this machine, whatever process-id namespace it
+/// runs in — keeps its files. A usage file whose lease file is not there is
+/// kept. A lease file still being made ([`locate::lease_being_made`]) is not
+/// taken as authority to remove usage files: only that file itself is
+/// removed, once it is [`ABANDONED_LEASE_AGE`] old and its lock can be taken
+/// at once. A daemon makes, locks and renames one within a single call
+/// ([`take_usage_lease`]), so one that old and unlocked is eligible to go; it
+/// does not prove its maker ended, which may be paused between making and
+/// locking it, and a maker that then finds it gone takes another token. Where
+/// the rename falls back to a link, a removal of the old name that fails
+/// leaves both names on the held lease, and its usage files carry the token
+/// they share; the held lock keeps both. Every open
+/// and removal is made beneath the usage directory's descriptor, with no
+/// symlink followed. Elsewhere than Unix no run has a usage file, and nothing
+/// is removed.
+pub(crate) fn remove_leftover_usage_files(config_dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        let Some(dir) =
+            TrustedDir::open(config_dir).and_then(|root| root.subdir(Path::new(USAGE_DIR)))
+        else {
+            return;
+        };
+        let names = dir.entry_names(usize::MAX);
+        for lease_file in &names {
+            let name = lease_file.as_encoded_bytes();
+            // `None` for a lease file still being made.
+            let lease = locate::lease_of_file(name);
+            if lease.is_none() && locate::lease_being_made(name).is_none() {
+                continue;
+            }
+            let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+            let Ok(held) = dir.open_raw(Path::new(lease_file), flags, 0) else {
+                continue;
+            };
+            let Ok(meta) = held
+                .try_clone()
+                .map(std::fs::File::from)
+                .and_then(|file| file.metadata())
+            else {
+                continue;
+            };
+            let abandoned = || {
+                meta.modified()
+                    .ok()
+                    .and_then(|at| at.elapsed().ok())
+                    .is_some_and(|age| age >= ABANDONED_LEASE_AGE)
+            };
+            if !meta.is_file() || (lease.is_none() && !abandoned()) {
+                continue;
+            }
+            // SAFETY: `held` is an open descriptor.
+            if unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                continue;
+            }
+            for name in &names {
+                if lease.is_some()
+                    && locate::usage_file_lease(name.as_encoded_bytes()) == lease
+                    && dir.has_file(Path::new(name))
+                {
+                    dir.remove(name);
+                }
+            }
+            dir.remove(lease_file);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = config_dir;
+}
 
 enum ExportMsg {
     Span(Box<SpanRecord>),
@@ -215,6 +478,13 @@ struct Shared {
     /// Turned true as shutdown begins: an export in flight gives way to the
     /// final flush.
     stopping: watch::Sender<bool>,
+    /// The runtime ended runs are completed on ([`Shared::complete_later`]).
+    runtime: tokio::runtime::Handle,
+    /// This, for a run completed on another thread to queue its span.
+    me: std::sync::Weak<Shared>,
+    /// Batches of ended runs, one per [`Shared::complete_later`] call with
+    /// any, whose task has not ended yet: not runs.
+    finalizing: watch::Sender<usize>,
     /// Test seam: pauses the ingest task once inside its `escape_held`
     /// branch, after signalling the first half, until the second receives.
     #[cfg(test)]
@@ -254,6 +524,8 @@ pub struct Telemetry {
     /// The committed runs whose per-run agent configuration files the shim
     /// may write, removed as each run's agent ends ([`super::launch`]).
     run_files: Mutex<Vec<RunFiles>>,
+    /// This daemon's lease on its usage files, taken with the first one.
+    usage_lease: LeaseSlot,
 }
 
 /// A committed run whose agent may have per-run configuration files.
@@ -339,6 +611,7 @@ impl Telemetry {
             config_dir: None,
             shim_dir: None,
             run_files: Mutex::new(Vec::new()),
+            usage_lease: LeaseSlot::default(),
         }
     }
 
@@ -423,6 +696,7 @@ impl Telemetry {
             config_dir: Some(config_dir),
             shim_dir: None,
             run_files: Mutex::new(Vec::new()),
+            usage_lease: LeaseSlot::default(),
         }
     }
 
@@ -450,10 +724,9 @@ impl Telemetry {
     /// `spawn_env` is the spawn's own overlay and is applied over the daemon's
     /// environment captured by [`Self::start_in`]: a value set in either counts as
     /// the user's. `cwd` is used only to resolve the run's git context, off
-    /// this thread. With the shim installed, its directory
-    /// goes first on the agent's `PATH` — the spawn's own, else the daemon's —
-    /// and the run id beside it ([`super::shim::RUN_ID_ENV`]). `None` when
-    /// telemetry is off.
+    /// this thread. The run id goes in as [`super::shim::RUN_ID_ENV`], and with
+    /// the shim installed its directory goes first on the agent's `PATH` — the
+    /// spawn's own, else the daemon's. `None` when telemetry is off.
     pub fn prepare_run(
         self: &Arc<Self>,
         mut start: RunStart,
@@ -479,13 +752,25 @@ impl Telemetry {
             self.host.as_deref(),
         );
         env.extend(super::launch::extra_env(&start.agent, &base));
+        let usage_dirs = self.usage_dirs(&start, spawn_env);
+        // This run's own usage file, else none: over any value the spawn
+        // inherited, which names another run's file (a run started from
+        // inside another agent's pane, or by a daemon started in one).
+        let usage_file = usage_dirs
+            .usage_file
+            .as_ref()
+            .and_then(|f| f.dir.path().join(&f.name).to_str().map(str::to_string))
+            .unwrap_or_default();
+        env.push((USAGE_FILE_ENV.to_string(), usage_file));
+        // Whether or not the shim is installed: without it, an id the daemon
+        // inherited from another deck's agent would reach this one (#1902).
+        env.push((super::shim::RUN_ID_ENV.to_string(), start.run_id.clone()));
         if let Some(shim) = self.shim_dir.as_deref().and_then(Path::to_str)
             && let Some(path) = base.get("PATH")
         {
             // An empty `PATH` is the current directory, and stays so after
             // the shim: `<shim>:` ends in an empty entry.
             env.push(("PATH".to_string(), format!("{shim}:{path}")));
-            env.push((super::shim::RUN_ID_ENV.to_string(), start.run_id.clone()));
         }
         let prepared = PreparedRun {
             env,
@@ -497,11 +782,54 @@ impl Telemetry {
             committed: false,
         };
         if let Some(exporting) = &self.exporting {
-            exporting
-                .shared
-                .with_tracker(|t| t.prepare_run(start, now_unix_nanos()));
+            let run_id = start.run_id.clone();
+            exporting.shared.with_tracker(|t| {
+                t.prepare_run(start, now_unix_nanos());
+                t.set_usage_dirs(&run_id, usage_dirs);
+            });
         }
         Some(prepared)
+    }
+
+    /// Where `start`'s agent keeps its usage record (PRD #1858), from the
+    /// spawn's own environment, else the daemon's. A Pi or OpenCode run gets
+    /// a usage file of its own, under the per-run configuration directory,
+    /// when the deck exports traces and the directory can be made; nothing
+    /// else would read it.
+    fn usage_dirs(&self, start: &RunStart, spawn_env: &[(String, String)]) -> UsageDirs {
+        let var = |key: &str| {
+            spawn_env
+                .iter()
+                .rev()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| OsString::from(v))
+                .or_else(|| std::env::var_os(key))
+        };
+        let home = var("HOME");
+        let mut dirs = UsageDirs::default();
+        match usage_source(&start.agent) {
+            UsageSource::ClaudeTranscript => {
+                dirs.claude_config =
+                    locate::claude_config_dir(var("CLAUDE_CONFIG_DIR").as_deref(), home.as_deref());
+            }
+            UsageSource::CodexRollout => {
+                dirs.codex_home = locate::codex_home(var("CODEX_HOME").as_deref(), home.as_deref());
+            }
+            UsageSource::UsageFile if self.exporting.is_some() => {
+                dirs.usage_file =
+                    self.config_dir
+                        .as_deref()
+                        .and_then(private_dir)
+                        .and_then(|dir| {
+                            let lease = self
+                                .usage_lease
+                                .token(std::time::Instant::now(), || take_usage_lease(&dir))?;
+                            new_usage_file(dir, &start.run_id, &lease)
+                        });
+            }
+            UsageSource::UsageFile | UsageSource::NoChannel => {}
+        }
+        dirs
     }
 
     fn commit(&self, run: &PreparedRun) {
@@ -794,6 +1122,15 @@ impl Telemetry {
             .collect()
     }
 
+    /// The descriptor holding this daemon's usage lease, once it has one:
+    /// a test closes it to stand for the kernel closing it as a crashed
+    /// daemon's process ends.
+    #[cfg(all(test, unix))]
+    pub(crate) fn usage_lease_fd(&self) -> Option<std::os::fd::RawFd> {
+        use std::os::fd::AsRawFd as _;
+        self.usage_lease.with_held(|lease| lease._held.as_raw_fd())
+    }
+
     /// Run-context probes queued or running.
     #[cfg(test)]
     pub fn outstanding_probes(&self) -> usize {
@@ -804,13 +1141,85 @@ impl Telemetry {
 }
 
 impl Shared {
+    /// Run `f` on the tracker, then queue the spans it finished. A run that
+    /// ended with a usage record to read has it drained after the tracker is
+    /// let go, on a blocking thread ([`Self::complete_later`]); one with
+    /// nothing to read is among the spans queued here.
     fn with_tracker(&self, f: impl FnOnce(&mut RunTracker)) {
-        let finished = {
+        let (finished, finishing) = {
             let mut tracker = self.tracker.lock().unwrap_or_else(|p| p.into_inner());
             f(&mut tracker);
-            tracker.take_finished()
+            tracker.take_finished_deferred()
         };
         self.enqueue(finished);
+        self.complete_later(finishing);
+    }
+
+    /// Drain the usage record of each run in `finishing` and queue its span
+    /// once that is done ([`FinishingRun::complete`]), on a blocking thread,
+    /// so the caller — the ingest task, mostly — goes on with other runs'
+    /// events meanwhile. The batch is counted in [`Self::finalizing`] until
+    /// its task ends. A run whose drain panics still gives its span, its
+    /// usage incomplete ([`FinishingRun::complete`]), so one run's failure
+    /// does not take the others' spans with it.
+    fn complete_later(&self, finishing: Vec<FinishingRun>) {
+        if finishing.is_empty() {
+            return;
+        }
+        /// Counts the batch off however its task ends.
+        struct Done(std::sync::Weak<Shared>);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                if let Some(shared) = self.0.upgrade() {
+                    shared.finalizing.send_modify(|n| *n -= 1);
+                }
+            }
+        }
+        self.finalizing.send_modify(|n| *n += 1);
+        let me = self.me.clone();
+        self.runtime.spawn_blocking(move || {
+            let done = Done(me);
+            let spans: Vec<SpanRecord> =
+                finishing.into_iter().map(FinishingRun::complete).collect();
+            if let Some(shared) = done.0.upgrade() {
+                shared.enqueue(spans);
+            }
+        });
+    }
+
+    /// Resolves once no batch of ended runs ([`Self::complete_later`]) begun
+    /// before the call is still being completed. A batch's task ends having
+    /// handed its spans to [`Self::enqueue`], which drops what a full queue
+    /// has no room for, unless it panics outside the runs' drains — which
+    /// [`FinishingRun::complete`] catches — and then its spans are lost.
+    async fn finalized(&self) {
+        let _ = self.finalizing.subscribe().wait_for(|n| *n == 0).await;
+    }
+
+    /// Poll every open run's usage record (PRD #1858) on a blocking thread,
+    /// outside the tracker's lock, unless the last poll is still reading. No
+    /// thread is taken while no open run has a record to read.
+    fn poll_usage(&self, polling: &Arc<std::sync::atomic::AtomicBool>) {
+        use std::sync::atomic::Ordering;
+        if polling.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let runs = self
+            .tracker
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .usage_to_poll();
+        if runs.is_empty() {
+            polling.store(false, Ordering::Release);
+            return;
+        }
+        let polling = Arc::clone(polling);
+        tokio::task::spawn_blocking(move || {
+            for run in runs {
+                run.poll();
+            }
+            polling.store(false, Ordering::Release);
+        });
     }
 
     fn lock_filters(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<PaneInput>>> {
@@ -931,13 +1340,16 @@ fn start_exporting(
     tracker.set_held_input(Box::new(move |pane_id, run_id| {
         retire_input(&held, pane_id, run_id)
     }));
-    let shared = Arc::new(Shared {
+    let shared = Arc::new_cyclic(|me| Shared {
         tracker: Mutex::new(tracker),
         queue,
         dropped: Mutex::new(RateLimitedLog::new(ERROR_LOG_INTERVAL)),
         filters,
         escape_held: tokio::sync::Notify::new(),
         stopping,
+        runtime: tokio::runtime::Handle::current(),
+        me: me.clone(),
+        finalizing: watch::Sender::new(0),
         #[cfg(test)]
         timer_gate: Mutex::new(None),
         #[cfg(test)]
@@ -963,6 +1375,9 @@ const DRAIN_YIELD_EVERY: usize = 256;
 async fn run_ingest(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiver<Command>) {
     let mut events: Option<broadcast::Receiver<BroadcastMsg>> = None;
     let mut escape_due: Option<std::time::Instant> = None;
+    let mut usage_poll = tokio::time::interval(USAGE_POLL_INTERVAL);
+    usage_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let usage_polling = Arc::new(std::sync::atomic::AtomicBool::new(false));
     loop {
         tokio::select! {
             biased;
@@ -988,6 +1403,7 @@ async fn run_ingest(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiver<C
             () = sleep_until(escape_due) => {
                 escape_due = shared.settle_escapes(std::time::Instant::now());
             }
+            _ = usage_poll.tick() => shared.poll_usage(&usage_polling),
             msg = next_event(&mut events) => match msg {
                 Ok(msg) => shared.observe(&msg),
                 Err(broadcast::error::RecvError::Lagged(missed)) => {
@@ -1076,7 +1492,7 @@ async fn drain(shared: &Shared, events: &mut Option<broadcast::Receiver<Broadcas
 }
 
 /// Apply one command; `false` once the task is to stop.
-fn apply(shared: &Shared, command: Command) -> bool {
+fn apply(shared: &Arc<Shared>, command: Command) -> bool {
     match command {
         Command::Subscribe(_) => {}
         Command::Commit { run_id } => {
@@ -1103,22 +1519,51 @@ fn apply(shared: &Shared, command: Command) -> bool {
         Command::HumanInput { pane_id, run_id } => shared.take_input(&pane_id, &run_id),
         #[cfg(test)]
         Command::Barrier(ack) => {
-            let _ = ack.send(());
+            // Once the runs ended before it are completed too.
+            let shared = Arc::clone(shared);
+            tokio::spawn(async move {
+                shared.finalized().await;
+                let _ = ack.send(());
+            });
         }
         Command::Shutdown { ack } => {
             // A run's last key, a lone ESC still in its window, is counted as
             // the tracker ends the run.
-            let finished = {
+            let (mut finished, finishing) = {
                 let mut tracker = shared.tracker.lock().unwrap_or_else(|p| p.into_inner());
                 tracker.end_all(EndReason::DaemonShutdown, now_unix_nanos());
-                tracker.take_finished()
+                tracker.take_finished_deferred()
             };
             shared.lock_filters().clear();
-            // Queued by `shutdown`, which can wait for room; when it stopped
-            // waiting for these, as best it can.
-            if let Err(finished) = ack.send(finished) {
-                shared.enqueue(finished);
-            }
+            // The runs still open with a usage record to read are completed
+            // on a blocking thread, after every run ended before them has
+            // queued its span, so the final flush `shutdown` sends after
+            // these finds those in the queue. With none, no thread is taken.
+            let shared = Arc::clone(shared);
+            tokio::spawn(async move {
+                shared.finalized().await;
+                if !finishing.is_empty() {
+                    let completed = tokio::task::spawn_blocking(move || {
+                        finishing
+                            .into_iter()
+                            .map(FinishingRun::complete)
+                            .collect::<Vec<_>>()
+                    })
+                    .await
+                    .unwrap_or_else(|_| {
+                        tracing::warn!(
+                            "completing the runs open at shutdown failed; their spans are lost"
+                        );
+                        Vec::new()
+                    });
+                    finished.extend(completed);
+                }
+                // Queued by `shutdown`, which can wait for room; when it
+                // stopped waiting for these, as best it can.
+                if let Err(finished) = ack.send(finished) {
+                    shared.enqueue(finished);
+                }
+            });
             return false;
         }
     }
@@ -1277,14 +1722,14 @@ struct Sender {
 }
 
 /// Whether an HTTP status is a transient failure the OTLP specification
-/// retries.
-fn is_retryable_status(status: u16) -> bool {
+/// retries. Shared with PRD #1859's collector.
+pub fn is_retryable_status(status: u16) -> bool {
     matches!(status, 429 | 502 | 503 | 504)
 }
 
 /// A `Retry-After` given in seconds. The HTTP-date form is not honoured; the
 /// backoff applies instead.
-fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+pub fn retry_after(response: &reqwest::Response) -> Option<Duration> {
     response
         .headers()
         .get(reqwest::header::RETRY_AFTER)?
@@ -1305,7 +1750,7 @@ fn deadline_after(after: Duration) -> Instant {
 }
 
 /// `backoff` scaled by a random factor in `[0.5, 1]`.
-fn jittered(backoff: Duration) -> Duration {
+pub fn jittered(backoff: Duration) -> Duration {
     let mut bytes = [0u8; 4];
     let fraction = match getrandom::fill(&mut bytes) {
         Ok(()) => f64::from(u32::from_le_bytes(bytes)) / f64::from(u32::MAX),
@@ -1439,11 +1884,11 @@ impl Sender {
                 Ok(response) if response.status().is_success() => {
                     match self.partial_success(response).await {
                         Some(partial)
-                            if partial.rejected_spans > 0 || !partial.error_message.is_empty() =>
+                            if partial.rejected > 0 || !partial.error_message.is_empty() =>
                         {
                             break SendOutcome::PartiallyRejected {
                                 attempts,
-                                rejected: partial.rejected_spans,
+                                rejected: partial.rejected,
                             };
                         }
                         _ => break SendOutcome::Delivered { attempts },
@@ -1486,23 +1931,27 @@ impl Sender {
     /// What a successful answer reports the backend did not accept, from at
     /// most [`MAX_RESPONSE_BODY`] bytes of it, in the configured protocol's
     /// format. `None` when it reports nothing, or cannot be read.
-    async fn partial_success(
-        &self,
-        mut response: reqwest::Response,
-    ) -> Option<otlp::PartialSuccess> {
-        let mut body = Vec::new();
-        while body.len() < MAX_RESPONSE_BODY {
-            let Ok(Some(chunk)) = response.chunk().await else {
-                break;
-            };
-            let room = MAX_RESPONSE_BODY - body.len();
-            body.extend_from_slice(&chunk[..chunk.len().min(room)]);
-        }
+    async fn partial_success(&self, response: reqwest::Response) -> Option<otlp::PartialSuccess> {
+        let body = bounded_body(response, MAX_RESPONSE_BODY).await;
         match self.protocol {
             Protocol::HttpJson => otlp::decode_partial_success_json(&body),
             _ => otlp::decode_partial_success_protobuf(&body),
         }
     }
+}
+
+/// At most `max` bytes of `response`'s body; what could not be read is left
+/// out.
+async fn bounded_body(mut response: reqwest::Response, max: usize) -> Vec<u8> {
+    let mut body = Vec::new();
+    while body.len() < max {
+        let Ok(Some(chunk)) = response.chunk().await else {
+            break;
+        };
+        let room = max - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+    }
+    body
 }
 
 /// Await one export, so that a panic inside it costs that batch only: the
@@ -1896,8 +2345,8 @@ mod tests {
     }
 
     /// With the shim installed every agent's `PATH` starts with its directory
-    /// — in front of the spawn's own `PATH`, else the daemon's — and carries
-    /// its run id; without it neither is added.
+    /// — in front of the spawn's own `PATH`, else the daemon's; without it the
+    /// `PATH` is left alone. Every agent carries its run id either way (#1902).
     #[cfg(unix)]
     #[tokio::test]
     async fn the_shim_goes_first_on_every_agents_path() {
@@ -1937,7 +2386,333 @@ mod tests {
         );
         let run = plain.prepare_run(run_start("p3"), &[], None).unwrap();
         assert_eq!(get(&run.env, "PATH"), None, "no shim, no PATH");
-        assert_eq!(get(&run.env, super::super::shim::RUN_ID_ENV), None);
+        assert_eq!(
+            get(&run.env, super::super::shim::RUN_ID_ENV),
+            Some(run.run_id.as_str()),
+            "no shim, still the run id"
+        );
+    }
+
+    /// PRD #1858: a Pi or OpenCode run is handed a usage file of its own,
+    /// made new and only this user's, in a directory no other user can
+    /// enter, over one it inherited from the pane it was started from; a run
+    /// of another agent is handed an empty value over the inherited one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pi_or_opencode_run_gets_its_own_usage_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("state");
+        // A directory left open to others is narrowed before it is used.
+        std::fs::create_dir_all(dir.join(USAGE_DIR)).unwrap();
+        std::fs::set_permissions(dir.join(USAGE_DIR), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let telemetry = Arc::new(Telemetry::start_with(
+            &env(&ON),
+            Settings {
+                config_dir: Some(dir.clone()),
+                ..Settings::default()
+            },
+        ));
+        let inherited = vec![(
+            USAGE_FILE_ENV.to_string(),
+            "/parent.usage.jsonl".to_string(),
+        )];
+        let usage_dir = std::fs::canonicalize(dir.join(USAGE_DIR)).unwrap();
+        for agent in [AgentType::Pi, AgentType::OpenCode, AgentType::ClaudeCode] {
+            let start = RunStart {
+                agent: agent.clone(),
+                ..run_start("p1")
+            };
+            let run = telemetry.prepare_run(start, &inherited, None).unwrap();
+            let file = run
+                .env
+                .iter()
+                .rev()
+                .find(|(k, _)| k == USAGE_FILE_ENV)
+                .map(|(_, v)| v.clone());
+            if agent == AgentType::ClaudeCode {
+                assert_eq!(file.as_deref(), Some(""));
+                continue;
+            }
+            let file = PathBuf::from(file.unwrap());
+            let lease = &telemetry
+                .usage_lease
+                .with_held(|lease| lease.token.clone())
+                .unwrap();
+            assert_eq!(
+                file,
+                usage_dir.join(format!("{}-{lease}.usage.jsonl", run.run_id)),
+                "{agent:?}"
+            );
+            // The daemon's lease is there under its own name, and held.
+            let lease_file = usage_dir.join(format!("{lease}.lease"));
+            assert!(lease_held(&lease_file), "{agent:?}");
+            let meta = std::fs::symlink_metadata(&file).unwrap();
+            assert!(meta.is_file() && meta.len() == 0, "{agent:?}");
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600, "{agent:?}");
+            // A run whose agent never started leaves no file behind.
+            drop(run);
+            assert!(!file.exists(), "{agent:?}");
+        }
+        let mode = std::fs::metadata(dir.join(USAGE_DIR))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    /// PRD #1858: a usage directory that is a symlink, or another user's,
+    /// is not used: the run gets an empty value, never a path into it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unsafe_usage_directory_gives_no_usage_file() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("state");
+        std::fs::create_dir_all(&dir).unwrap();
+        let elsewhere = home.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, dir.join(USAGE_DIR)).unwrap();
+        let telemetry = Arc::new(Telemetry::start_with(
+            &env(&ON),
+            Settings {
+                config_dir: Some(dir.clone()),
+                ..Settings::default()
+            },
+        ));
+        let start = RunStart {
+            agent: AgentType::Pi,
+            ..run_start("p1")
+        };
+        let run = telemetry.prepare_run(start, &[], None).unwrap();
+        assert_eq!(get(&run.env, USAGE_FILE_ENV), Some(""));
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+    }
+
+    /// Whether another open file description holds `path`'s lock.
+    #[cfg(unix)]
+    fn lease_held(path: &Path) -> bool {
+        use std::os::fd::AsRawFd as _;
+        let file = std::fs::File::open(path).unwrap();
+        // SAFETY: `file` is open.
+        let free = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+        !free
+    }
+
+    /// PRD #1858: the usage files a daemon that ended without reading them
+    /// left are removed as the next daemon starts, with their lease, when
+    /// that lease's lock is free; a lease held through another open file
+    /// description — another daemon's, whichever process-id namespace it is
+    /// in, and whatever its process id is here — keeps its files. A file
+    /// with no lease file, or not named as the deck names them, is kept. A
+    /// lease file still being made is not a lease: it goes only once it is
+    /// [`ABANDONED_LEASE_AGE`] old and unlocked, and takes no usage file
+    /// with it.
+    #[cfg(unix)]
+    #[test]
+    fn leftover_usage_files_go_unless_their_lease_is_held() {
+        let home = tempfile::tempdir().unwrap();
+        let usage = home.path().join(USAGE_DIR);
+        std::fs::create_dir_all(&usage).unwrap();
+        let (ended, running, unleased) = (new_run_id(), new_run_id(), new_run_id());
+        let (abandoned, making, stuck) = (new_run_id(), new_run_id(), new_run_id());
+        let file = |lease: &str| format!("{}-{lease}.usage.jsonl", new_run_id());
+        let gone = [
+            file(&ended),
+            file(&ended),
+            format!("{ended}.lease"),
+            format!("{abandoned}.lease-new"),
+        ];
+        let kept = [
+            file(&running),
+            format!("{running}.lease"),
+            file(&unleased),
+            "notes.txt".to_string(),
+            "x.usage.jsonl".to_string(),
+            format!("x-{}.usage.jsonl", std::process::id()),
+            format!("{making}.lease-new"),
+            file(&making),
+            format!("{stuck}.lease-new"),
+            file(&abandoned),
+        ];
+        for name in gone.iter().chain(&kept) {
+            std::fs::write(usage.join(name), "{}").unwrap();
+        }
+        let old = std::time::SystemTime::now() - ABANDONED_LEASE_AGE - Duration::from_secs(60);
+        for lease in [&abandoned, &stuck] {
+            std::fs::File::options()
+                .write(true)
+                .open(usage.join(format!("{lease}.lease-new")))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        // Another daemon's lock on its lease, and on an old lease file it is
+        // still making: open file descriptions this cleanup does not share.
+        let held = lock(&usage.join(format!("{running}.lease")));
+        let _stuck = lock(&usage.join(format!("{stuck}.lease-new")));
+        remove_leftover_usage_files(home.path());
+        for name in &gone {
+            assert!(!usage.join(name).exists(), "left over: {name}");
+        }
+        for name in &kept {
+            assert!(usage.join(name).exists(), "removed: {name}");
+        }
+        // Once that daemon has ended, its files go too.
+        drop(held);
+        remove_leftover_usage_files(home.path());
+        assert!(!usage.join(&kept[0]).exists());
+        assert!(!usage.join(&kept[1]).exists());
+        assert!(usage.join(&kept[2]).exists());
+        remove_leftover_usage_files(&home.path().join("absent"));
+    }
+
+    /// An exclusive lock on `path` through an open file description of its
+    /// own, as another daemon holds its lease.
+    #[cfg(unix)]
+    fn lock(path: &Path) -> std::fs::File {
+        use std::os::fd::AsRawFd as _;
+        let file = std::fs::File::open(path).unwrap();
+        // SAFETY: `file` is open.
+        assert_eq!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        file
+    }
+
+    /// The usage directory under `home`, made, and opened as the daemon
+    /// opens it.
+    #[cfg(unix)]
+    fn usage_dir(home: &Path) -> TrustedDir {
+        private_dir(home).unwrap()
+    }
+
+    /// The inode of the entry `name` in `dir`.
+    #[cfg(unix)]
+    fn inode(dir: &Path, name: &str) -> u64 {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::symlink_metadata(dir.join(name)).unwrap().ino()
+    }
+
+    /// PRD #1858: a daemon whose lease file is made but not yet locked when
+    /// another daemon starts and cleans up — the order two daemons starting
+    /// together can take — still ends with a lease, and the cleanup removes
+    /// no file of a lease that is held. Then a daemon whose file went before
+    /// it locked it, as cleanup takes an abandoned one, takes another token
+    /// and still ends with a lease.
+    #[cfg(unix)]
+    #[test]
+    fn a_lease_being_made_survives_another_daemons_cleanup() {
+        use std::os::unix::fs::MetadataExt as _;
+        let home = tempfile::tempdir().unwrap();
+        let dir = usage_dir(home.path());
+        let usage = home.path().join(USAGE_DIR);
+        let running = new_run_id();
+        let live = format!("{}-{running}.usage.jsonl", new_run_id());
+        for name in [format!("{running}.lease"), live.clone()] {
+            std::fs::write(usage.join(name), "").unwrap();
+        }
+        let _running = lock(&usage.join(format!("{running}.lease")));
+
+        let mut paused = Vec::new();
+        let lease = take_usage_lease_with(&dir, lease_token, |token| {
+            paused.push(token.to_string());
+            remove_leftover_usage_files(home.path());
+        })
+        .expect("a lease");
+        assert_eq!(paused, std::slice::from_ref(&lease.token));
+        let name = format!("{}.lease", lease.token);
+        assert!(lease_held(&usage.join(&name)));
+        let held = std::fs::File::from(lease._held.try_clone().unwrap());
+        assert_eq!(held.metadata().unwrap().ino(), inode(&usage, &name));
+        assert!(!usage.join(format!("{}.lease-new", lease.token)).exists());
+        assert!(usage.join(&live).exists());
+        assert!(usage.join(format!("{running}.lease")).exists());
+        // Its own files outlive the next daemon's cleanup too.
+        let own = format!("{}-{}.usage.jsonl", new_run_id(), lease.token);
+        std::fs::write(usage.join(&own), "").unwrap();
+        remove_leftover_usage_files(home.path());
+        assert!(usage.join(&own).exists() && usage.join(&live).exists());
+
+        let mut first = true;
+        let again = take_usage_lease_with(&dir, lease_token, |token| {
+            if std::mem::take(&mut first) {
+                dir.remove(locate::lease_file_name(token, false).as_ref());
+            }
+        })
+        .expect("a lease under another token");
+        assert!(lease_held(&usage.join(format!("{}.lease", again.token))));
+    }
+
+    /// PRD #1858: a token that names a lease already held — two daemons
+    /// drawing the same one — never replaces that lease: the second daemon
+    /// gives the token up, leaves nothing of it behind, and takes the next.
+    /// With no other token it takes no lease at all, and neither does a
+    /// daemon whose random source fails.
+    #[cfg(unix)]
+    #[test]
+    fn a_repeated_token_never_replaces_a_held_lease() {
+        use std::os::unix::fs::MetadataExt as _;
+        let home = tempfile::tempdir().unwrap();
+        let dir = usage_dir(home.path());
+        let usage = home.path().join(USAGE_DIR);
+        let (same, next) = (new_run_id(), new_run_id());
+        let tokens = |tokens: Vec<String>| {
+            let mut tokens = tokens.into_iter();
+            move || tokens.next()
+        };
+        let first = take_usage_lease_with(&dir, tokens(vec![same.clone()]), |_| {}).unwrap();
+        let name = format!("{same}.lease");
+        let held = std::fs::File::from(first._held.try_clone().unwrap());
+        assert_eq!(held.metadata().unwrap().ino(), inode(&usage, &name));
+
+        let second =
+            take_usage_lease_with(&dir, tokens(vec![same.clone(), next.clone()]), |_| {}).unwrap();
+        assert_eq!(second.token, next);
+        assert_eq!(held.metadata().unwrap().ino(), inode(&usage, &name));
+        assert!(lease_held(&usage.join(&name)));
+        assert!(!usage.join(format!("{same}.lease-new")).exists());
+
+        assert!(take_usage_lease_with(&dir, tokens(vec![same.clone()]), |_| {}).is_none());
+        assert!(take_usage_lease_with(&dir, || None, |_| unreachable!()).is_none());
+        assert_eq!(held.metadata().unwrap().ino(), inode(&usage, &name));
+        let mut names: Vec<_> = std::fs::read_dir(&usage)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        let mut want = vec![name, format!("{next}.lease")];
+        want.sort();
+        assert_eq!(names, want);
+    }
+
+    /// PRD #1858: a daemon that could not take its usage lease tries again on
+    /// a later run's start once [`LEASE_RETRY_AFTER`] has passed, not before,
+    /// and keeps the lease it then takes.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_lease_is_taken_again_on_a_later_run() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = usage_dir(home.path());
+        let slot = LeaseSlot::default();
+        let start = std::time::Instant::now();
+        assert_eq!(slot.token(start, || None), None);
+        assert_eq!(
+            slot.token(start + LEASE_RETRY_AFTER / 2, || unreachable!()),
+            None
+        );
+        let later = start + LEASE_RETRY_AFTER;
+        let token = slot
+            .token(later, || take_usage_lease(&dir))
+            .expect("a lease");
+        assert!(lease_held(
+            &home.path().join(USAGE_DIR).join(format!("{token}.lease"))
+        ));
+        assert_eq!(
+            slot.token(later + LEASE_RETRY_AFTER, || unreachable!()),
+            Some(token)
+        );
     }
 
     /// The Devin configurations the shim writes for a run go when that run's
@@ -2446,6 +3221,278 @@ mod tests {
         for event in &run.events {
             assert!(event.time_unix_nanos <= end, "{} past {end}", event.name);
         }
+    }
+
+    /// PRD #1858: a run's final drain runs off the ingest task. While one
+    /// run's usage record is held up — a slow disk — the ingest task goes on
+    /// applying other runs' commands, the ended run's span waits for its
+    /// drain, and is queued, usage and all, once the drain is done.
+    #[tokio::test]
+    async fn a_slow_final_drain_does_not_hold_up_other_runs() {
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let shared = Arc::clone(&telemetry.exporting.as_ref().unwrap().shared);
+        begin(&telemetry, generation("p1", "a1"), &[]);
+        telemetry.settled().await;
+        let usage = shared.tracker.lock().unwrap().usage_to_poll();
+        assert_eq!(usage.len(), 1);
+        let held = usage[0].hold_readers();
+        telemetry.end_run("p1", Some("a1"), EndReason::Closed, None);
+        begin(&telemetry, generation("p2", "a2"), &[]);
+        eventually("the next run was applied", || {
+            shared.tracker.lock().unwrap().run_id("p2").is_some()
+        })
+        .await;
+        let ended = |spans: &[SpanRecord]| {
+            spans
+                .iter()
+                .filter(|s| s.name == SPAN_AGENT_RUN)
+                .filter(|s| attr(s, AttrKey::EndReason).is_some())
+                .count()
+        };
+        assert_eq!(ended(&captured(&mut rx)), 0, "queued before its drain");
+        drop(held);
+        telemetry.settled().await;
+        let spans = captured(&mut rx);
+        assert_eq!(ended(&spans), 1);
+        let run = spans
+            .iter()
+            .find(|s| s.name == SPAN_AGENT_RUN && attr(s, AttrKey::EndReason).is_some())
+            .unwrap();
+        assert!(
+            run.attributes.iter().any(|a| matches!(
+                a.key,
+                AttrKey::Accounting(crate::telemetry::accounting::AccountingKey::TokensProvenance)
+            )),
+            "the drain's usage is on the span"
+        );
+    }
+
+    /// PRD #1858: a run whose final drain panics — a bug in a reader — is
+    /// still sent, its usage incomplete, and the run ended with it in the
+    /// same batch is sent with its usage as read.
+    #[tokio::test]
+    async fn a_drain_that_panics_loses_no_span() {
+        use crate::telemetry::accounting::AccountingKey;
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let shared = Arc::clone(&telemetry.exporting.as_ref().unwrap().shared);
+        begin(&telemetry, generation("p1", "a1"), &[]);
+        begin(&telemetry, generation("p2", "a2"), &[]);
+        telemetry.settled().await;
+        let (failing, kept) = {
+            let tracker = shared.tracker.lock().unwrap();
+            tracker.usage_of("p1").unwrap().panic_in_finish();
+            (
+                tracker.run_id("p1").unwrap().to_string(),
+                tracker.run_id("p2").unwrap().to_string(),
+            )
+        };
+        let finishing = {
+            let mut tracker = shared.tracker.lock().unwrap();
+            tracker.end_all(EndReason::Closed, now_unix_nanos());
+            let (finished, finishing) = tracker.take_finished_deferred();
+            shared.enqueue(finished);
+            finishing
+        };
+        assert_eq!(finishing.len(), 2);
+        shared.complete_later(finishing);
+        telemetry.settled().await;
+        let spans = captured(&mut rx);
+        let run = |id: &str| {
+            spans
+                .iter()
+                .find(|s| {
+                    s.name == SPAN_AGENT_RUN
+                        && attr(s, AttrKey::EndReason).is_some()
+                        && attr(s, AttrKey::RunId) == Some(&AttrValue::Str(id.to_string()))
+                })
+                .unwrap_or_else(|| panic!("no span for {id}"))
+        };
+        let reason = |id: &str| {
+            attr(
+                run(id),
+                AttrKey::Accounting(AccountingKey::TokensUnavailableReason),
+            )
+            .cloned()
+        };
+        assert_eq!(
+            reason(&failing),
+            Some(AttrValue::Str("incomplete".to_string()))
+        );
+        assert_ne!(
+            reason(&kept),
+            Some(AttrValue::Str("incomplete".to_string()))
+        );
+        assert!(
+            attr(
+                run(&kept),
+                AttrKey::Accounting(AccountingKey::TokensProvenance)
+            )
+            .is_some()
+        );
+    }
+
+    /// A current-thread runtime whose only blocking thread is taken until
+    /// this is dropped: the thread is let go first, then the runtime, so an
+    /// assertion that fails inside it still lets the thread go.
+    struct BlockingThreadTaken {
+        _release: std::sync::mpsc::Sender<()>,
+        runtime: tokio::runtime::Runtime,
+    }
+
+    impl BlockingThreadTaken {
+        fn new() -> Self {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .max_blocking_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let (taken, is_taken) = std::sync::mpsc::channel();
+            runtime.spawn_blocking(move || {
+                let _ = taken.send(());
+                // Returns once the sender is dropped.
+                let _ = released.recv();
+            });
+            is_taken.recv().unwrap();
+            BlockingThreadTaken {
+                _release: release,
+                runtime,
+            }
+        }
+    }
+
+    /// A run of an arbitrary command, which the deck has no usage channel for.
+    fn command_run(pane: &str, agent_id: &str) -> RunStart {
+        RunStart {
+            agent: AgentType::None,
+            ..generation(pane, agent_id)
+        }
+    }
+
+    fn ended_runs(spans: &[SpanRecord]) -> Vec<&SpanRecord> {
+        spans
+            .iter()
+            .filter(|s| s.name == SPAN_AGENT_RUN && attr(s, AttrKey::EndReason).is_some())
+            .collect()
+    }
+
+    /// PRD #1858: a run the deck has no usage channel for — an arbitrary
+    /// command, Devin — is completed as it ends, on no blocking thread. With
+    /// the runtime's only one taken, two command runs end, the second after
+    /// its pull request's checks went pending, failing, pending and passing,
+    /// and both spans reach the sink with their unavailable usage, how they
+    /// ended, and the second's four CI changes, two rounds and one failure.
+    #[test]
+    fn a_run_with_nothing_to_read_takes_no_blocking_thread() {
+        use crate::telemetry::accounting::AccountingKey;
+        use crate::telemetry::tracker::tests::checks_report;
+        let taken = BlockingThreadTaken::new();
+        taken.runtime.block_on(async {
+            let (telemetry, mut rx) = capturing(ProbeSettings::default());
+            let (tx, events) = broadcast::channel(16);
+            telemetry.subscribe(events);
+            begin(&telemetry, command_run("p1", "a1"), &[]);
+            begin(&telemetry, command_run("p2", "a2"), &[]);
+            tx.send(of("p2", "a2", EventType::SessionStart)).unwrap();
+            for (revision, state, counts) in [
+                (1, "pending", (0, 0, 0)),
+                (2, "failing", (5, 1, 0)),
+                (3, "pending", (5, 0, 0)),
+                (4, "passing", (6, 0, 0)),
+            ] {
+                let mut report = checks_report("p2", 9, revision, state, counts);
+                report.agent_id = Some("a2".to_string());
+                tx.send(BroadcastMsg::Event(report)).unwrap();
+            }
+            telemetry.end_run("p1", Some("a1"), EndReason::Closed, None);
+            telemetry.end_run("p2", Some("a2"), EndReason::Exited, Some(0));
+            let mut spans = Vec::new();
+            eventually("both runs' spans were queued", || {
+                spans.extend(captured(&mut rx));
+                ended_runs(&spans).len() == 2
+            })
+            .await;
+            let run = |pane: &str| {
+                *ended_runs(&spans)
+                    .iter()
+                    .find(|s| attr(s, AttrKey::PaneId) == Some(&AttrValue::Str(pane.into())))
+                    .unwrap_or_else(|| panic!("no run span for {pane}"))
+            };
+            let text = |v: &str| Some(AttrValue::Str(v.to_string()));
+            let accounting = |pane: &str, key| attr(run(pane), AttrKey::Accounting(key)).cloned();
+            for (pane, ended) in [("p1", "interrupted"), ("p2", "completed")] {
+                for key in [
+                    AccountingKey::TokensUnavailableReason,
+                    AccountingKey::CostUnavailableReason,
+                    AccountingKey::QuotaUnavailableReason,
+                ] {
+                    assert_eq!(accounting(pane, key), text("no_channel"), "{pane} {key:?}");
+                }
+                assert_eq!(
+                    accounting(pane, AccountingKey::Termination),
+                    text(ended),
+                    "{pane}"
+                );
+                assert_eq!(
+                    accounting(pane, AccountingKey::TerminationProvenance),
+                    text("measured"),
+                    "{pane}"
+                );
+            }
+            let changes = run("p2")
+                .events
+                .iter()
+                .filter(|e| e.name == crate::telemetry::EVENT_CI_CHANGE)
+                .count();
+            assert_eq!(changes, 4);
+            assert_eq!(
+                attr(run("p2"), AttrKey::CiRoundsCount),
+                Some(&AttrValue::Int(2))
+            );
+            assert_eq!(
+                attr(run("p2"), AttrKey::CiFailuresCount),
+                Some(&AttrValue::Int(1))
+            );
+        });
+    }
+
+    /// PRD #1858: a shutdown with no open run to read the usage of takes no
+    /// blocking thread: with the runtime's only one taken, it ends the open
+    /// command run, queues its span and the final flush, and returns.
+    #[test]
+    fn a_shutdown_with_nothing_to_read_takes_no_blocking_thread() {
+        let taken = BlockingThreadTaken::new();
+        taken.runtime.block_on(async {
+            let (telemetry, mut rx) = capturing(ProbeSettings::default());
+            begin(&telemetry, command_run("p1", "a1"), &[]);
+            telemetry.settled().await;
+            let mut shutting = tokio::spawn({
+                let telemetry = Arc::clone(&telemetry);
+                async move { telemetry.shutdown(Duration::from_secs(60)).await }
+            });
+            let mut spans = Vec::new();
+            let mut flushed = false;
+            loop {
+                tokio::select! {
+                    msg = rx.recv() => match msg {
+                        Some(ExportMsg::Span(span)) => spans.push(*span),
+                        Some(ExportMsg::Flush { ack, .. }) => {
+                            let _ = ack.send(());
+                            flushed = true;
+                        }
+                        None => break,
+                    },
+                    _ = &mut shutting => break,
+                }
+            }
+            spans.extend(captured(&mut rx));
+            assert!(flushed, "the final flush was queued");
+            let reasons: Vec<_> = ended_runs(&spans)
+                .iter()
+                .filter_map(|s| attr(s, AttrKey::EndReason).cloned())
+                .collect();
+            assert_eq!(reasons, vec![AttrValue::Str("daemon_shutdown".into())]);
+        });
     }
 
     /// Threads 2 / 9: shutdown with the export queue full — a backend slow

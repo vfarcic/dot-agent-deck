@@ -353,6 +353,12 @@ impl IpcClient {
     }
 }
 
+impl AsRawFd for IpcClient {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
 impl std::io::Read for IpcClient {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.0.read(buf)

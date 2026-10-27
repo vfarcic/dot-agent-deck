@@ -1,0 +1,18 @@
+---
+source: tests/render_inbox_attention.rs
+expression: rendered
+---
+                                                                                                    
+                                                                                                    
+  ┌ Deck messages ───────────────────────────────────────────────────────────────────────────────┐  
+  │  Messages can't reach this agent: its connection to the deck was refused (the deck could not │  
+  │  identify the process that asked for them). Restart it from the deck; messages addressed to  │  
+  │  it are not handed to the restarted agent, so have them sent again.                          │  
+  │                                                                                              │  
+  │▸ the orchestrator · review 850                                                               │  
+  │    a deck message may or may not have reached this agent. Retry sends it again marked as a   │  
+  │    possible repeat; Cancel stops delivering it.                                              │  
+  │                                                                                              │  
+  │  [Retry r] [Cancel c] [Close]                                                                │  
+  │  r Retry · c Cancel · Esc to close                                                           │  
+  └──────────────────────────────────────────────────────────────────────────────────────────────┘

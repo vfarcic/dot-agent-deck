@@ -762,37 +762,32 @@ fn any_foreign_command_hook(root: &Value) -> bool {
 /// expected commands [`trust_deck_hooks_for`] compares against (issue #730) —
 /// the SAME values, so install and trust can never be about different binaries.
 pub fn auto_install() -> Option<Vec<String>> {
-    let home = codex_home()?;
+    try_auto_install_in(&codex_home()?)
+        .map_err(|e| tracing::warn!("auto-install: {e}"))
+        .ok()
+}
+
+/// [`auto_install`] into `home`, returning why it wrote nothing rather than
+/// logging it.
+fn try_auto_install_in(home: &Path) -> Result<Vec<String>, String> {
     // PRD #381: never `current_exe()` directly — a `target/debug` path written
     // here is gone the moment its worktree is pruned, and this write is silent
     // and automatic. A refusal writes nothing and warns; `hooks.json` is left
     // exactly as it was.
-    let binary_path = match crate::platform::paths::durable_binary_path() {
-        Ok(binary_path) => binary_path,
-        Err(e) => {
-            tracing::warn!("auto-install: {e}");
-            return None;
-        }
-    };
+    let binary_path = crate::platform::paths::durable_binary_path()?;
     // Automatic: another live durable install's entry is kept, and the trust
     // write is then about that install's command (PRD #1487).
-    match auto_install_to(&home, &binary_path) {
-        Ok((changed, named)) => {
-            if changed {
-                crate::agent_hook_config::log_auto_install_change(
-                    "codex",
-                    &home.join("hooks.json"),
-                    &named.join(", "),
-                    "codex auto-install",
-                );
-            }
-            Some(named)
-        }
-        Err(e) => {
-            tracing::warn!("auto-install: failed to write Codex hooks.json: {e}");
-            None
-        }
+    let (changed, named) = auto_install_to(home, &binary_path)
+        .map_err(|e| format!("failed to write Codex hooks.json: {e}"))?;
+    if changed {
+        crate::agent_hook_config::log_auto_install_change(
+            "codex",
+            &home.join("hooks.json"),
+            &named.join(", "),
+            "codex auto-install",
+        );
     }
+    Ok(named)
 }
 
 /// The exact hook command the deck writes for `binary_path` — what
@@ -887,9 +882,10 @@ const HOOKS_LIST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Codex's launch for about 50 s. Threading one deadline through
 /// `crate::wrap::codex_spawn_prep` is not done here. A task delegated to the
 /// pane meanwhile waits in its inbox until Codex is up to take it.
-/// The daemon's startup install and `hooks install` keep the shorter bound: the
-/// startup one sits before the daemon binds its sockets (issue #1665), and
-/// neither is about to launch Codex.
+/// The daemon's and the TUI's startup install and `hooks install` keep the
+/// shorter bound, since none of them is about to launch Codex. The startup one
+/// runs its trust write on a thread of its own, so even that bound no longer
+/// holds back the daemon's socket bind or the TUI's first draw (issue #1665).
 pub const SPAWN_HOOKS_LIST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One hook as Codex itself reports it from `hooks/list`. The deck never computes
@@ -1051,7 +1047,17 @@ fn list_hooks_with(
     cwd: &Path,
     timeout: Duration,
 ) -> std::io::Result<HooksListing> {
-    let mut child = Command::new(codex)
+    let mut command = Command::new(codex);
+    // A listing is the deck's own probe, not a Codex session of the user's:
+    // Codex exports its own telemetry when an `OTEL_*` endpoint is in its
+    // environment, and this one would reach the user's backend as a
+    // `codex-app-server` service the user never ran.
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("OTEL_") {
+            command.env_remove(key);
+        }
+    }
+    let mut child = command
         .arg("app-server")
         .current_dir(cwd)
         .env("CODEX_HOME", home)
@@ -1763,6 +1769,22 @@ pub(crate) fn trust_deck_hooks_for_within(
     binary_paths: &[String],
     hooks_list_timeout: Duration,
 ) -> std::io::Result<TrustOutcome> {
+    trust_deck_hooks(home, cwd, binary_paths, hooks_list_timeout, false)
+}
+
+/// [`trust_deck_hooks_for_within`], and with `recheck_hooks_json` publishing
+/// only the records whose position `hooks.json` still holds this install's
+/// command at when the write takes the lock ([`records_still_installed`]).
+/// The startup install asks for that, since its trust write runs on a thread
+/// of its own and its listing can be seconds old by then (issue #1665): an
+/// uninstall or another install may have changed `hooks.json` meanwhile.
+fn trust_deck_hooks(
+    home: &Path,
+    cwd: &Path,
+    binary_paths: &[String],
+    hooks_list_timeout: Duration,
+    recheck_hooks_json: bool,
+) -> std::io::Result<TrustOutcome> {
     let mut expected_commands: Vec<String> = Vec::new();
     for binary_path in binary_paths {
         let command = expected_hook_command(binary_path);
@@ -1821,6 +1843,17 @@ pub(crate) fn trust_deck_hooks_for_within(
         });
     }
     let _guard = INSTALL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let records = if recheck_hooks_json {
+        records_still_installed(records, home, &expected_commands)
+    } else {
+        records
+    };
+    if records.is_empty() {
+        tracing::debug!(
+            "codex: the deck's listed hooks are no longer in hooks.json, so no trust was recorded"
+        );
+        return Ok(TrustOutcome::NothingListed);
+    }
     let mut swept = 0;
     edit_trust_state(home, |state| {
         for (key, hash) in &records {
@@ -1855,6 +1888,58 @@ pub(crate) fn trust_deck_hooks_for_within(
         reports_prompts,
         turned_off,
     })
+}
+
+/// The `records` (trust key, hash) whose position `home`'s `hooks.json`, read
+/// now, still holds one of `expected_commands` at: none when the file is
+/// gone, and all of them when it cannot be read, which is no evidence either
+/// way. A position whose rule or handler carries no command it can compare is
+/// kept, as [`position_is_in_hooks_json`] keeps it.
+fn records_still_installed(
+    records: Vec<(String, String)>,
+    home: &Path,
+    expected_commands: &[String],
+) -> Vec<(String, String)> {
+    let root = match crate::agent_hook_config::read_json_config(&home.join("hooks.json")) {
+        Some(Some(root)) => root,
+        Some(None) => return Vec::new(),
+        None => return records,
+    };
+    records
+        .into_iter()
+        .filter(|(key, _)| {
+            split_trust_key(key).is_some_and(|(_, position)| {
+                position_is_in_hooks_json(&root, position)
+                    && command_at_position(&root, position)
+                        .is_none_or(|command| expected_commands.iter().any(|e| e == command))
+            })
+        })
+        .collect()
+}
+
+/// The command of the handler at `position` (`<event_snake>:<group_idx>:
+/// <handler_idx>`) in `hooks.json`, matching event names as
+/// [`position_is_in_hooks_json`] does; `None` when there is no such handler or
+/// it names no command.
+fn command_at_position<'a>(root: &'a Value, position: &str) -> Option<&'a str> {
+    let normalize = |name: &str| name.replace('_', "").to_ascii_lowercase();
+    let mut parts = position.splitn(3, ':');
+    let (event, group, handler) = (parts.next()?, parts.next()?, parts.next()?);
+    let (group, handler) = (group.parse::<usize>().ok()?, handler.parse::<usize>().ok()?);
+    root.get("hooks")?
+        .as_object()?
+        .iter()
+        .filter(|(name, _)| normalize(name) == normalize(event))
+        .find_map(|(_, rules)| {
+            rules
+                .as_array()?
+                .get(group)?
+                .get("hooks")?
+                .as_array()?
+                .get(handler)?
+                .get("command")?
+                .as_str()
+        })
 }
 
 /// The listed entries a trust write grants: those [`deck_owned_entries`] keeps
@@ -2320,6 +2405,8 @@ fn codex_present_on_path() -> bool {
     };
     std::env::split_paths(&path).any(|dir| {
         let candidate = dir.join("codex");
+        // Any error is absence here, not a failed inspection: a `codex` that
+        // cannot be inspected cannot be run from this `PATH` entry either.
         let Ok(meta) = std::fs::metadata(&candidate) else {
             return false;
         };
@@ -2353,24 +2440,133 @@ fn codex_present_on_path() -> bool {
 /// real home resolves (never a `/tmp` write), and any failure is logged, never
 /// fatal.
 ///
+/// Only the `hooks.json` install runs on the caller's thread; the trust write
+/// runs on a thread of its own and this returns without waiting for it (issue
+/// #1665). The trust write asks `codex app-server` for `hooks/list`, and a Codex
+/// that never answers held `daemon serve` for the whole [`HOOKS_LIST_TIMEOUT`]
+/// before it bound its sockets, and the TUI as long before it drew. Nothing here
+/// needs the trust result: the pins come from the install. A Codex the spawn seam
+/// recognises records its own trust before it launches ([`crate::wrap`], with
+/// the longer [`SPAWN_HOOKS_LIST_TIMEOUT`]), so what this trust write is for is a
+/// Codex started where the wrapper does not run, which no longer waits on it.
+///
 /// Returns what the hooks are pinned to afterwards (issue #1637). After a
 /// takeover that is the new copy, and the trust recorded here is for its
 /// command, so Codex may ask the user once to review the changed hooks.
 pub fn auto_install_and_trust_at_startup() -> Vec<crate::hook_binary::HookPin> {
+    match install_at_startup() {
+        Some(Ok(install)) => {
+            let pins = install.pins.clone();
+            install.trust_in_background();
+            pins
+        }
+        Some(Err(e)) => {
+            tracing::warn!("auto-install: {e}");
+            Vec::new()
+        }
+        None => Vec::new(),
+    }
+}
+
+/// [`auto_install_and_trust_at_startup`] for `hooks refresh` (PRD #1666 part
+/// 3, R-3): whether Codex is installed here, and what the install could not
+/// write, which the startup install only logs. Since part 3's H4 that
+/// includes a trust write that failed or recorded none of the deck's hooks
+/// ([`trust_failure`]): hooks Codex will not run are not ready. So, unlike the
+/// startup install, it waits for the trust write.
+pub fn refresh_install() -> crate::hooks_refresh::InstallAttempt {
+    let attempt = install_at_startup();
+    if let Some(Err(e)) = &attempt {
+        tracing::warn!("auto-install: {e}");
+    }
+    crate::hooks_refresh::InstallAttempt::of(attempt.map(|installed| {
+        installed.and_then(|install| match trust_failure(&install.trust()) {
+            Some(why) => Err(why),
+            None => Ok(install.pins),
+        })
+    }))
+}
+
+/// What [`install_at_startup`] installed: the pins, and what its trust write
+/// needs, captured on the caller's thread.
+#[derive(Clone)]
+struct StartupInstall {
+    home: PathBuf,
+    cwd: PathBuf,
+    binary_paths: Vec<String>,
+    pins: Vec<crate::hook_binary::HookPin>,
+}
+
+impl StartupInstall {
+    /// Record scoped trust for what was installed, and log what that came to.
+    fn trust(&self) -> std::io::Result<TrustOutcome> {
+        let trusted = trust_deck_hooks(
+            &self.home,
+            &self.cwd,
+            &self.binary_paths,
+            HOOKS_LIST_TIMEOUT,
+            true,
+        );
+        report_startup_trust(&trusted, &self.cwd);
+        trusted
+    }
+
+    /// [`Self::trust`] on a thread of its own (issue #1665). Where no thread
+    /// can be started, it runs here instead, as it did before.
+    fn trust_in_background(self) {
+        let fallback = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("codex-startup-trust".to_string())
+            .spawn(move || {
+                let _ = self.trust();
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(
+                "codex startup install: no thread for the trust write ({e}); running it now"
+            );
+            let _ = fallback.trust();
+        }
+    }
+}
+
+/// PRD #1666 part 3 (H4, round 2's U3): why a startup trust write leaves the
+/// deck's Codex hooks untrusted, in the words `hooks refresh` shows after
+/// "Codex's hooks could not be updated:", or `None` when it trusted them or
+/// cannot tell (`NothingListed`: Codex listed none of them as eligible, which
+/// an earlier matching trust record also explains).
+fn trust_failure(result: &std::io::Result<TrustOutcome>) -> Option<String> {
+    match result {
+        Ok(TrustOutcome::Trusted { .. } | TrustOutcome::NothingListed) => None,
+        Ok(TrustOutcome::Unrecognised { .. }) => Some(
+            "Codex listed the deck's hooks, but none with the command this update wrote, so none was recorded as trusted and Codex may not run them".to_string(),
+        ),
+        Err(e) => Some(format!(
+            "their trust could not be recorded in Codex's config ({e}), so Codex may not run them"
+        )),
+    }
+}
+
+/// [`auto_install_and_trust_at_startup`]'s install: `None` when Codex is not
+/// installed here, else what it installed or why it wrote nothing. The trust
+/// write is the caller's ([`StartupInstall::trust`]).
+fn install_at_startup() -> Option<Result<StartupInstall, String>> {
     if !codex_present_on_path() {
         tracing::debug!("codex startup install: skipped (codex not on PATH)");
-        return Vec::new();
+        return None;
     }
     let Some(home) = codex_home() else {
         tracing::debug!("codex startup install: skipped (no CODEX_HOME/HOME)");
-        return Vec::new();
+        return None;
     };
     // No durable path means nothing was installed, so there is no command to
     // trust and no entry of ours in the listing. Fail closed rather than falling
     // back to a wider predicate (issue #730).
-    let Some(binary_paths) = auto_install() else {
-        tracing::debug!("codex startup install: skipped trust (no durable binary path resolved)");
-        return Vec::new();
+    let binary_paths = match try_auto_install_in(&home) {
+        Ok(binary_paths) => binary_paths,
+        Err(e) => {
+            tracing::debug!("codex startup install: skipped trust (hook installation failed)");
+            return Some(Err(e));
+        }
     };
     let pins = binary_paths
         .iter()
@@ -2381,8 +2577,12 @@ pub fn auto_install_and_trust_at_startup() -> Vec<crate::hook_binary::HookPin> {
         })
         .collect();
     let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
-    report_startup_trust(&trust_deck_hooks_for(&home, &cwd, &binary_paths), &cwd);
-    pins
+    Some(Ok(StartupInstall {
+        home,
+        cwd,
+        binary_paths,
+        pins,
+    }))
 }
 
 /// What Codex's hooks are pinned to now, read back from the active
@@ -2455,6 +2655,36 @@ fn report_startup_trust(result: &std::io::Result<TrustOutcome>, cwd: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scenario (PRD #1666 part 3, round 2's U3): a startup trust write that
+    /// failed, or that recorded none of the deck's hooks because none listed
+    /// carried this install's command, is a failure `hooks refresh` reports,
+    /// in words that say Codex may not run the hooks; one that trusted them,
+    /// or found none eligible, is not.
+    #[test]
+    fn a_trust_write_that_leaves_the_hooks_untrusted_is_not_ready() {
+        assert_eq!(
+            trust_failure(&Ok(TrustOutcome::Trusted {
+                count: 3,
+                reports_prompts: true,
+                turned_off: Vec::new(),
+            })),
+            None
+        );
+        assert_eq!(trust_failure(&Ok(TrustOutcome::NothingListed)), None);
+        for failed in [
+            trust_failure(&Ok(TrustOutcome::Unrecognised { listed: 2 })),
+            trust_failure(&Err(std::io::Error::other("config.toml is read-only"))),
+        ] {
+            let why = failed.expect("a failure");
+            assert!(why.contains("Codex may not run them"), "{why}");
+            let attempt = crate::hooks_refresh::InstallAttempt::of::<()>(Some(Err(why)));
+            assert!(
+                matches!(attempt, crate::hooks_refresh::InstallAttempt::Ran { ref failed } if failed.len() == 1),
+                "{attempt:?}"
+            );
+        }
+    }
 
     /// Scenario (issue #1637): the daemon's pin refresh reads back every binary
     /// Codex's `hooks.json` pins, one per distinct binary across events and
@@ -3736,6 +3966,61 @@ mod tests {
         assert!(
             !sent.contains(&"x".repeat(200)),
             "an id too large to echo must draw no reply at all"
+        );
+    }
+
+    /// Issue #1665: a trust write publishes only the listed records whose
+    /// position `hooks.json` still holds the deck's command at, since the
+    /// startup listing can be seconds old when it lands.
+    #[test]
+    fn a_trust_write_drops_records_hooks_json_no_longer_holds() {
+        let home = tempfile::tempdir().unwrap();
+        let ours = "/deck hook --agent codex".to_string();
+        let records = || {
+            vec![
+                (
+                    "/h/hooks.json:pre_tool_use:0:0".to_string(),
+                    "sha256:a".to_string(),
+                ),
+                ("/h/hooks.json:stop:0:0".to_string(), "sha256:b".to_string()),
+                (
+                    "/h/hooks.json:session_start:0:0".to_string(),
+                    "sha256:c".to_string(),
+                ),
+            ]
+        };
+        let expected = std::slice::from_ref(&ours);
+
+        assert!(
+            records_still_installed(records(), home.path(), expected).is_empty(),
+            "a hooks.json removed since the listing keeps nothing"
+        );
+
+        let rule =
+            |command: &str| json!([{ "hooks": [{ "type": "command", "command": command }] }]);
+        std::fs::write(
+            home.path().join("hooks.json"),
+            json!({ "hooks": {
+                "PreToolUse": rule(&ours),
+                "Stop": rule("/another-deck hook --agent codex"),
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            records_still_installed(records(), home.path(), expected),
+            vec![(
+                "/h/hooks.json:pre_tool_use:0:0".to_string(),
+                "sha256:a".to_string()
+            )],
+            "only the position still holding this install's command keeps its record"
+        );
+
+        std::fs::write(home.path().join("hooks.json"), "{ not json").unwrap();
+        assert_eq!(
+            records_still_installed(records(), home.path(), expected),
+            records(),
+            "an unreadable hooks.json is no evidence, so the listing stands"
         );
     }
 

@@ -31,6 +31,7 @@
 //! [`execute`] creates per upgrade. `docs/develop/self-upgrade.md` describes
 //! the design and the trust boundary.
 
+pub mod agent_hooks;
 pub mod cli;
 pub mod detect;
 pub mod discover;

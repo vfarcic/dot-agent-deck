@@ -11,8 +11,10 @@
 //! This module is the retention half. It is deliberately pure data: no locks, no
 //! I/O and no registry access, so the eviction rules can be asserted directly
 //! rather than through PTYs. [`crate::agent_pty::AgentPtyRegistry`] owns one
-//! behind its own mutex, and [`crate::state::AppState::handle_work_done`]
-//! resolves through it.
+//! behind its own mutex (R2). Since PRD #1666 part 3, round 5, a terminal
+//! `work-done --done` is admitted against it (`install_terminal_claim`, which
+//! requires the route's unit generation to be the attested reporter) and its
+//! commit takes the route by unit id ([`DispatchReturns::take_for_unit`]).
 
 use std::collections::HashMap;
 
@@ -50,24 +52,19 @@ pub struct DispatchCaller {
 /// completion inside a dispatched orchestration can never match: the workers'
 /// panes are not keys.
 ///
-/// Entries are evicted on four transitions: the report is delivered
-/// ([`Self::take`]), either pane is deliberately closed ([`Self::evict_pane`],
-/// from `begin_pane_close`), and either pane's process dies on its own
-/// ([`Self::evict_exited`], from the PTY-EOF sweep).
+/// PRD #1666 part 3, round 5 (plan D7): an entry is removed by its UNIT side
+/// only — the unit's report is committed ([`Self::take_for_unit`]), the unit's
+/// pane is deliberately closed ([`Self::evict_pane`], from `begin_pane_close`),
+/// or the unit's current generation exits ([`Self::evict_exited`], from the
+/// PTY-EOF sweep) — and each of the last two records the unit's end. The
+/// CALLER side never removes it: a caller that is closed, exits or is
+/// replaced by a respawn marks it `orphaned` ([`Self::orphan_caller`],
+/// [`Self::orphan_caller_pane`]), and the unit's result then goes to
+/// recovery instead of being lost.
 ///
 /// **That is the set of transitions covered, not a claim that nothing can
-/// linger** (PRD #220 Phase 2 review, finding A5 — the earlier wording said "all
-/// three ways an entry can stop being deliverable", which was wider than the code
-/// has ever guaranteed). Two residuals are known and accepted, one per side of an
-/// entry. On the CALLER side: an agent replaced on a still-open pane — a respawn
-/// — leaves an entry whose recipient can no longer be written to, since delivery
-/// is identity-gated against the agent id captured at dispatch time. It is not
-/// leaked, only deferred: it goes when the unit completes (delivery is attempted,
-/// refused, and the entry evicted regardless) or when either pane finally closes
-/// or exits. The cost is one map entry held until then, and the report itself is
-/// lost either way, because the agent that asked for it is gone. The UNIT side's
-/// mirror image, and why it is the cheap direction to fail in, is on
-/// [`Self::evict_exited`].
+/// linger** (PRD #220 Phase 2 review, finding A5). The residual known and
+/// accepted is on the unit side, on [`Self::evict_exited`].
 #[derive(Debug, Default)]
 pub struct DispatchReturns {
     by_unit_pane: HashMap<String, RetainedReturn>,
@@ -78,9 +75,9 @@ pub struct DispatchReturns {
 ///
 /// The unit half exists so the EOF sweep can tell a dispatched unit's own exit
 /// from the exit of whatever ELSE has held its pane id (PR #1081 review, Greptile
-/// finding 1) — see [`DispatchReturns::evict_exited`], which is the only thing
-/// that reads it. Delivery does not: a terminal `work-done` carries a pane id and
-/// no agent identity, so [`DispatchReturns::take`] stays keyed by pane alone.
+/// finding 1) — see [`DispatchReturns::evict_exited`]. Since PRD #1666 part 3,
+/// round 5, a terminal report's admission reads it too: the route is claimed
+/// only by the attested generation it names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetainedReturn {
     /// The registry agent id occupying the unit's TERMINAL pane when the dispatch
@@ -91,6 +88,14 @@ pub struct RetainedReturn {
     pub unit_agent_id: String,
     /// Who its completion report goes to.
     pub caller: DispatchCaller,
+    /// PRD #1666 part 3, round 5 (plan D7): the dispatched unit's stable id,
+    /// which a respawn keeps and a retarget matches on.
+    pub unit_id: String,
+    /// PRD #1666 part 3, round 5 (plan D7): the caller is gone — closed,
+    /// exited, or replaced by a respawn — so its result goes to recovery.
+    /// The route is kept, not evicted, so the unit's end is still recorded;
+    /// it no longer gives anyone a place in the dispatch tree.
+    pub orphaned: bool,
 }
 
 /// PRD #1666 S11: one outstanding dispatch return as an edge of the dispatch
@@ -114,6 +119,7 @@ impl DispatchReturns {
     pub fn edges(&self) -> Vec<DispatchEdge> {
         self.by_unit_pane
             .iter()
+            .filter(|(_, retained)| !retained.orphaned)
             .map(|(unit, retained)| DispatchEdge {
                 unit_pane_id: unit.clone(),
                 unit_agent_id: retained.unit_agent_id.clone(),
@@ -137,6 +143,7 @@ impl DispatchReturns {
         &mut self,
         unit_pane_id: &str,
         unit_agent_id: &str,
+        unit_id: &str,
         caller: DispatchCaller,
     ) -> Option<RetainedReturn> {
         self.by_unit_pane.insert(
@@ -144,8 +151,99 @@ impl DispatchReturns {
             RetainedReturn {
                 unit_agent_id: unit_agent_id.to_string(),
                 caller,
+                unit_id: unit_id.to_string(),
+                orphaned: false,
             },
         )
+    }
+
+    /// PRD #1666 part 3, round 5: take the route of unit `unit_id` at
+    /// `unit_pane_id`, matched by the stable unit id and not by the pane alone.
+    pub fn take_for_unit(&mut self, unit_pane_id: &str, unit_id: &str) -> Option<RetainedReturn> {
+        if self
+            .by_unit_pane
+            .get(unit_pane_id)
+            .is_some_and(|route| route.unit_id == unit_id)
+        {
+            self.by_unit_pane.remove(unit_pane_id)
+        } else {
+            None
+        }
+    }
+
+    /// PRD #1666 part 3, round 5: take unit `unit_id`'s route, wherever its
+    /// terminal pane is.
+    pub fn take_unit(&mut self, unit_id: &str) -> Option<RetainedReturn> {
+        let pane = self
+            .by_unit_pane
+            .iter()
+            .find(|(_, route)| route.unit_id == unit_id)
+            .map(|(pane, _)| pane.clone())?;
+        self.by_unit_pane.remove(&pane)
+    }
+
+    /// PRD #1666 part 3, round 5: the route of unit `unit_id`, wherever its
+    /// terminal pane is.
+    pub fn route_of_unit(&self, unit_id: &str) -> Option<(&str, &RetainedReturn)> {
+        self.by_unit_pane
+            .iter()
+            .find(|(_, route)| route.unit_id == unit_id)
+            .map(|(pane, route)| (pane.as_str(), route))
+    }
+
+    /// PRD #1666 part 3, round 5 (plan D7): a respawn moved unit `unit_id`'s
+    /// terminal from `old_agent` to `new_agent`. Compare-and-set: only the
+    /// route whose unit id AND generation both match moves.
+    pub fn retarget(
+        &mut self,
+        unit_pane_id: &str,
+        unit_id: &str,
+        old_agent: &str,
+        new_agent: &str,
+    ) -> bool {
+        match self.by_unit_pane.get_mut(unit_pane_id) {
+            Some(route) if route.unit_id == unit_id && route.unit_agent_id == old_agent => {
+                route.unit_agent_id = new_agent.to_string();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// PRD #1666 part 3, round 5 (plan D7): the caller `(pane, agent)` is
+    /// gone. Its routes are kept, marked orphaned, so each unit's end is
+    /// still recorded and its result goes to recovery; answered as the edges
+    /// it no longer holds.
+    pub fn orphan_caller(&mut self, pane_id: &str, agent_id: &str) -> Vec<DispatchEdge> {
+        let mut orphaned = Vec::new();
+        for (unit, route) in &mut self.by_unit_pane {
+            if !route.orphaned
+                && route.caller.pane_id == pane_id
+                && route.caller.agent_id == agent_id
+            {
+                route.orphaned = true;
+                orphaned.push(DispatchEdge {
+                    unit_pane_id: unit.clone(),
+                    unit_agent_id: route.unit_agent_id.clone(),
+                    caller_pane_id: route.caller.pane_id.clone(),
+                    caller_agent_id: route.caller.agent_id.clone(),
+                });
+            }
+        }
+        orphaned
+    }
+
+    /// PRD #1666 part 3, round 5: orphan every route whose caller is
+    /// `pane_id`, whoever holds it — the caller half of a deliberate close.
+    pub fn orphan_caller_pane(&mut self, pane_id: &str) -> usize {
+        let mut count = 0;
+        for route in self.by_unit_pane.values_mut() {
+            if !route.orphaned && route.caller.pane_id == pane_id {
+                route.orphaned = true;
+                count += 1;
+            }
+        }
+        count
     }
 
     /// The route the unit at `unit_pane_id` still owes, without consuming it.
@@ -172,11 +270,12 @@ impl DispatchReturns {
     ///
     /// The DELIBERATE-close half of the lifecycle. [`Self::evict_exited`] is the
     /// natural-exit half, and the two differ in exactly one way — see there.
-    pub fn evict_pane(&mut self, pane_id: &str) -> usize {
-        let before = self.by_unit_pane.len();
-        self.by_unit_pane
-            .retain(|unit_pane, entry| unit_pane != pane_id && entry.caller.pane_id != pane_id);
-        before - self.by_unit_pane.len()
+    ///
+    /// PRD #1666 part 3, round 5 (plan D7): only the UNIT half is evicted now,
+    /// and it is returned, so the close records the unit's end in the same
+    /// section. The caller half is orphaned instead ([`Self::orphan_caller_pane`]).
+    pub fn evict_pane(&mut self, pane_id: &str) -> Vec<RetainedReturn> {
+        self.by_unit_pane.remove(pane_id).into_iter().collect()
     }
 
     /// PRD #220 Phase 2 review/audit (finding A3): the same eviction for a pane
@@ -214,25 +313,27 @@ impl DispatchReturns {
     /// that a completion stops being something nobody hears about.
     ///
     /// The residual left is the cheap direction: an entry whose `unit_agent_id`
-    /// will never be seen exiting lingers until the unit completes or either pane
+    /// will never be seen exiting lingers until the unit completes or its pane
     /// closes. Bounded memory, cleaned up by [`Self::evict_pane`] and by daemon
-    /// death. It does not widen who can be WRITTEN to — delivery is identity-gated
-    /// against the caller — but it does leave the entry answerable by whoever
-    /// holds the unit pane at completion, which is the pre-existing hook-socket
-    /// provenance question tracked as issue #1077 rather than anything this
-    /// eviction decides.
+    /// death. It does not widen who can claim it: a terminal report's
+    /// admission requires the attested reporter to be the generation the route
+    /// names (PRD #1666 part 3, round 5).
     ///
-    /// An in-place respawn does not reach here at all: `respawn_agent_for_pane`
-    /// removes the registry record before starting the replacement, so
-    /// `pump_reader`'s `is_agent_still_registered` gate is already `false` when the
-    /// predecessor's EOF lands.
-    pub fn evict_exited(&mut self, pane_id: &str, exited_agent_id: &str) -> usize {
-        let before = self.by_unit_pane.len();
-        self.by_unit_pane.retain(|unit_pane, entry| {
-            !(unit_pane == pane_id && entry.unit_agent_id == exited_agent_id)
-                && !(entry.caller.pane_id == pane_id && entry.caller.agent_id == exited_agent_id)
-        });
-        before - self.by_unit_pane.len()
+    /// An in-place respawn retargets the route to its successor
+    /// ([`Self::retarget`]), so the predecessor's late EOF no longer matches
+    /// it here.
+    ///
+    /// PRD #1666 part 3, round 5 (plan D7): only the UNIT half is evicted now,
+    /// matched by pane and the route's CURRENT generation, and it is returned
+    /// so the EOF records the unit's end in the same section. The caller half
+    /// is orphaned instead ([`Self::orphan_caller`]).
+    pub fn evict_exited(&mut self, pane_id: &str, exited_agent_id: &str) -> Vec<RetainedReturn> {
+        match self.by_unit_pane.get(pane_id) {
+            Some(route) if route.unit_agent_id == exited_agent_id => {
+                self.by_unit_pane.remove(pane_id).into_iter().collect()
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// How many units still owe a report. Observability and tests.
@@ -370,6 +471,13 @@ pub fn dispatch_reason(unit_name: &str) -> String {
 /// whether the dispatch started a unit. What stays in the daemon log alone is
 /// a result for a caller that has exited (nobody is left to tell; nothing is
 /// posted into whoever holds the pane now), or a notice the inbox refuses too.
+///
+/// PRD #1666 part 3, round 5 (plan §3.2, D13): with a `record`, the result was
+/// retained — as a file, or as a fallback body held in memory — and the post
+/// carries its provenance and enters the accepted-report ledger, so a caller
+/// that exits before acknowledging it leaves a recovery row. A refused post,
+/// or a caller that is gone, gives that row at once.
+#[allow(clippy::too_many_arguments)]
 pub fn post_dispatch_result(
     registry: &crate::agent_pty::AgentPtyRegistry,
     reservation: crate::inbox_hub::ReplyReservation,
@@ -378,6 +486,7 @@ pub fn post_dispatch_result(
     unit_name: &str,
     started: bool,
     message: &str,
+    record: Option<DispatchRecord>,
 ) {
     let subject = if started {
         "dispatch started"
@@ -385,7 +494,19 @@ pub fn post_dispatch_result(
         "dispatch failed"
     };
     let reason = dispatch_reason(unit_name);
-    let content = crate::inbox::Content::from_deck(reason.clone(), subject, message);
+    let mut text = message.to_string();
+    if record
+        .as_ref()
+        .is_some_and(|r| r.storage == crate::report_recovery::OutcomeStorage::Memory)
+    {
+        text.push_str(MEMORY_ONLY_NOTE);
+    }
+    let mut content = crate::inbox::Content::from_deck(reason.clone(), subject, text.clone());
+    let accepted = record.as_ref().map(|record| {
+        let entry = record.accepted(caller_pane_id, caller_agent_id, unit_name, &text, started);
+        content.provenance = Some(entry.provenance.clone());
+        entry
+    });
     let max_body = registry.inbox().limits().max_body_bytes;
     let notice = |error: &str| {
         crate::inbox::Content::from_deck(
@@ -394,12 +515,13 @@ pub fn post_dispatch_result(
             undelivered_result_notice(started, error, max_body),
         )
     };
-    match crate::inbox_hub::post_reserved_reply_or_notice_to_live(
+    match crate::inbox_hub::post_reserved_reply_or_notice_to_live_recorded(
         registry,
         reservation,
         crate::inbox::Recipient::bound(caller_pane_id, caller_agent_id),
         content,
         notice,
+        accepted.clone(),
     ) {
         Ok(id) => tracing::info!(
             pane_id = %caller_pane_id,
@@ -407,13 +529,289 @@ pub fn post_dispatch_result(
             started,
             "dispatch: result posted to the caller's inbox"
         ),
-        Err(error) => tracing::warn!(
-            pane_id = %caller_pane_id,
-            agent_id = %caller_agent_id,
-            %error,
-            "dispatch: the caller's inbox refused the result; nothing posted"
-        ),
+        Err(error) => {
+            tracing::warn!(
+                pane_id = %caller_pane_id,
+                agent_id = %caller_agent_id,
+                %error,
+                "dispatch: the caller's inbox refused the result; nothing posted"
+            );
+            if let Some(entry) = accepted {
+                let gone = registry.pane_current_agent_id(caller_pane_id).as_deref()
+                    != Some(caller_agent_id);
+                registry.inbox().set_aside(
+                    entry,
+                    if gone {
+                        crate::report_recovery::OutcomeCause::RecipientExited
+                    } else {
+                        crate::report_recovery::OutcomeCause::RecipientRefused
+                    },
+                );
+            }
+        }
     }
+}
+
+/// The deck line a result held only in memory carries (plan D10).
+pub const MEMORY_ONLY_NOTE: &str = "\n\nThe deck could not save this result to disk; it is held in memory until the deck restarts.";
+
+/// PRD #1666 part 3, round 5 (plan §3.2): where a dispatch's start or fail
+/// result was kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchRecord {
+    pub report_id: String,
+    pub unit_id: Option<String>,
+    pub storage: crate::report_recovery::OutcomeStorage,
+}
+
+impl DispatchRecord {
+    /// The accepted-report entry its post enters the ledger as.
+    fn accepted(
+        &self,
+        caller_pane_id: &str,
+        caller_agent_id: &str,
+        unit_name: &str,
+        text: &str,
+        started: bool,
+    ) -> crate::report_recovery::AcceptedReport {
+        use crate::report_recovery::{
+            AcceptedReport, DispatchPhase, OutcomeParty, OutcomePhase, OutcomeUnit,
+            ReportProvenance, cut_bytes, wire_text,
+        };
+        let party = OutcomeParty {
+            pane_id: caller_pane_id.to_string(),
+            agent_id: caller_agent_id.to_string(),
+            role: None,
+        };
+        AcceptedReport {
+            provenance: ReportProvenance::DispatchResult {
+                unit_id: self.unit_id.clone(),
+                phase: if started {
+                    DispatchPhase::Started
+                } else {
+                    DispatchPhase::Failed
+                },
+                report_id: Some(self.report_id.clone()),
+            },
+            phase: if started {
+                OutcomePhase::DispatchStarted
+            } else {
+                OutcomePhase::DispatchFailed
+            },
+            report_id: Some(self.report_id.clone()),
+            summary: cut_bytes(text, crate::report_recovery::MAX_SUMMARY_BYTES),
+            storage: self.storage,
+            label: wire_text(
+                &format!(
+                    "{}: {unit_name}",
+                    if started {
+                        "dispatch started"
+                    } else {
+                        "dispatch failed"
+                    }
+                ),
+                crate::report_recovery::MAX_LABEL_CHARS,
+            ),
+            original: party.clone(),
+            producer: party,
+            unit: self.unit_id.clone().map(|unit_id| OutcomeUnit {
+                unit_id,
+                name: wire_text(unit_name, crate::report_recovery::MAX_LABEL_CHARS),
+            }),
+            orchestration: None,
+            task_id: None,
+            handed: false,
+        }
+    }
+}
+
+/// PRD #1666 part 3, round 5 (plan §3.2): the room a dispatch reserved for
+/// its result in the retained store, before anything started.
+/// Dropped before the result is saved — the dispatch's caller could not be
+/// resolved, or its reply room refused — it gives its room back (a
+/// destructor's way: it never panics).
+pub struct ResultRoom {
+    store: std::sync::Arc<crate::retained_store::RetainedStore>,
+    reservation: Option<crate::retained_store::DispatchReservation>,
+}
+
+impl Drop for ResultRoom {
+    fn drop(&mut self) {
+        if let Some(reservation) = self.reservation.take() {
+            self.store.release_dispatch_in_drop(reservation);
+        }
+    }
+}
+
+/// Reserve the room a dispatch's result needs before anything starts, or
+/// answer the refusal's code and sentence (plan D10). `Ok(None)` when this
+/// daemon keeps no retained store, as a registry outside the daemon does.
+pub fn admit_dispatch_result(
+    registry: &crate::agent_pty::AgentPtyRegistry,
+) -> Result<Option<ResultRoom>, (&'static str, String)> {
+    use crate::retained_store::StoreRefusal;
+    let hub = registry.inbox();
+    let Some(store) = hub.retained_store() else {
+        return Ok(None);
+    };
+    const NOTHING: &str = "; nothing was started";
+    const CANNOT: &str = "the deck cannot keep this dispatch's result";
+    if hub.reports_torn() {
+        return Err(("deck_unavailable", degraded_dispatch_sentence()));
+    }
+    let dir = store.dir().display().to_string();
+    match store.reserve_dispatch() {
+        Ok(reservation) => Ok(Some(ResultRoom {
+            store,
+            reservation: Some(reservation),
+        })),
+        Err(StoreRefusal::Bytes { .. }) => Err((
+            "report_store_full",
+            format!("{CANNOT}: its saved-results store is full ({dir}){NOTHING}"),
+        )),
+        Err(StoreRefusal::Files { max, .. }) => Err((
+            "report_store_full",
+            format!(
+                "{CANNOT}: its saved-results store holds the most reports it keeps ({max} \
+                 files, {dir}){NOTHING}"
+            ),
+        )),
+        Err(StoreRefusal::Unusable { reason, .. }) => Err((
+            "report_save_failed",
+            format!(
+                "{CANNOT}: its saved-results directory cannot be used ({dir}: {reason}){NOTHING}"
+            ),
+        )),
+        Err(StoreRefusal::Unavailable) => Err(("deck_unavailable", degraded_dispatch_sentence())),
+        Err(StoreRefusal::Slots { in_flight, unsaved }) => {
+            if unsaved > 0 {
+                hub.retry_fallback_soon();
+            }
+            Err((
+                "dispatch_slots_full",
+                slots_sentence(in_flight, unsaved, &dir),
+            ))
+        }
+    }
+}
+
+/// D10's daemon-degraded `dispatch` refusal.
+pub fn degraded_dispatch_sentence() -> String {
+    "the deck cannot keep this dispatch's result: the deck daemon hit an internal error and has \
+     stopped recording results (its log has the details). Restart the deck daemon to dispatch \
+     again; a restart loses any result it holds only in memory; nothing was started"
+        .to_string()
+}
+
+/// D10's result-slots refusal, naming only the causes present.
+pub fn slots_sentence(in_flight: u32, unsaved: u32, dir: &str) -> String {
+    let mut causes = Vec::new();
+    if in_flight > 0 {
+        causes.push(format!(
+            "{in_flight} dispatches are still starting, the most it holds result room for; try \
+             again once one has started"
+        ));
+    }
+    if unsaved > 0 {
+        causes.push(format!(
+            "{unsaved} earlier results could not be saved to disk and are held in memory, which \
+             is full; free disk space or fix {dir}, and the deck saves them on its next retry. \
+             Restarting the deck would lose them"
+        ));
+    }
+    if causes.is_empty() {
+        causes.push("its result slots are taken".to_string());
+    }
+    format!(
+        "the deck cannot keep this dispatch's result: {}; nothing was started",
+        causes.join("; and ")
+    )
+}
+
+/// Save a dispatch's start or fail result (plan §3.2), off the runtime's
+/// worker threads: as a file under a fresh report id, or, when the file
+/// cannot be written, held in memory under the same id. `None` when no room
+/// was reserved for it (no retained store).
+#[allow(clippy::too_many_arguments)]
+pub async fn retain_dispatch_result(
+    registry: &std::sync::Arc<crate::agent_pty::AgentPtyRegistry>,
+    room: Option<ResultRoom>,
+    caller_pane_id: &str,
+    caller_agent_id: &str,
+    unit_name: &str,
+    result_text: &str,
+    started: bool,
+    unit_id: Option<String>,
+) -> Option<DispatchRecord> {
+    let mut room = room?;
+    let store = std::sync::Arc::clone(&room.store);
+    let reservation = room.reservation.take()?;
+    let report_id = crate::retained_store::mint_report_id();
+    let envelope = crate::retained_store::Envelope {
+        report_id: report_id.clone(),
+        kind: if started {
+            crate::retained_store::ArtifactKind::DispatchStarted
+        } else {
+            crate::retained_store::ArtifactKind::DispatchFailed
+        },
+        task_id: None,
+        unit_id: unit_id.clone(),
+        deck_id: registry.inbox().deck().to_string(),
+        run_id: store.run_id().to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        producer_agent_id: caller_agent_id.to_string(),
+        recipient_agent_id: caller_agent_id.to_string(),
+        instance: None,
+        producer_supplied: crate::retained_store::ProducerSupplied {
+            unit_name: Some(unit_name.to_string()),
+            role: None,
+            producer_pane_id: caller_pane_id.to_string(),
+            recipient_pane_id: caller_pane_id.to_string(),
+            orchestration: None,
+        },
+        truncated: Vec::new(),
+    };
+    let contents = crate::retained_store::compose_dispatch_result(&envelope, result_text);
+    let id = report_id.clone();
+    let store_for_save = std::sync::Arc::clone(&store);
+    let saved = tokio::task::spawn_blocking(move || {
+        let held = store_for_save.dispatch_result(
+            reservation,
+            &id,
+            &contents,
+            crate::retained_store::Now::current(),
+        );
+        (held, contents)
+    })
+    .await;
+    let storage = match saved {
+        Ok((Ok(()), _)) => crate::report_recovery::OutcomeStorage::Artifact,
+        Ok((Err(held), contents)) => {
+            tracing::warn!(
+                report_id = %report_id,
+                dir = %store.dir().display(),
+                "dispatch: the result could not be saved to disk; it is held in memory until the \
+                 deck restarts, and saving it is retried"
+            );
+            if registry
+                .inbox()
+                .hold_fallback(&report_id, contents, held, &store)
+            {
+                crate::report_recovery::OutcomeStorage::Memory
+            } else {
+                crate::report_recovery::OutcomeStorage::None
+            }
+        }
+        Err(join) => {
+            tracing::error!(%join, "dispatch: saving the result did not finish");
+            return None;
+        }
+    };
+    Some(DispatchRecord {
+        report_id,
+        unit_id,
+        storage,
+    })
 }
 
 /// How long the inbox's refusal may run in [`undelivered_result_notice`].
@@ -480,6 +878,7 @@ pub fn compose_completion_message(
         spill_path: full_report.map(std::path::Path::to_path_buf),
         id: None,
         preface: Some(preface),
+        provenance: None,
     }
 }
 
@@ -503,29 +902,19 @@ mod tests {
             returns.register(
                 "unit-pane",
                 "unit-agent",
+                "unit-1",
                 caller("caller-pane", "agent-7", "probe")
             ),
             None,
             "the first registration displaces nothing"
         );
-        assert_eq!(
-            returns.resolve("unit-pane").map(|entry| &entry.caller),
-            Some(&caller("caller-pane", "agent-7", "probe")),
-            "the unit's terminal pane must resolve to the pane that dispatched it"
-        );
-        assert_eq!(
-            returns
-                .resolve("unit-pane")
-                .map(|entry| entry.unit_agent_id.as_str()),
-            Some("unit-agent"),
-            "the unit's own identity is retained beside its pane, or a successor on that \
-             pane cannot be told from its predecessor"
-        );
+        let route = returns.resolve("unit-pane").expect("registered");
+        assert_eq!(route.caller, caller("caller-pane", "agent-7", "probe"));
+        assert_eq!(route.unit_agent_id, "unit-agent");
+        assert_eq!(route.unit_id, "unit-1");
+        assert!(!route.orphaned);
         assert_eq!(returns.len(), 1);
-        assert!(
-            returns.resolve("some-other-pane").is_none(),
-            "a pane nobody dispatched owes nobody a report"
-        );
+        assert!(returns.resolve("some-other-pane").is_none());
     }
 
     #[test]
@@ -534,83 +923,97 @@ mod tests {
         returns.register(
             "unit-pane",
             "unit-agent",
+            "unit-1",
             caller("caller-pane", "agent-7", "probe"),
         );
-
         assert_eq!(
             returns.take("unit-pane").map(|entry| entry.caller),
             Some(caller("caller-pane", "agent-7", "probe"))
         );
-        assert_eq!(
-            returns.take("unit-pane").map(|entry| entry.caller),
-            None,
-            "a second terminal work-done from the same pane must resolve to nothing; \
-             the report is delivered once and the refusal policy is terminal"
-        );
+        assert_eq!(returns.take("unit-pane").map(|entry| entry.caller), None);
         assert!(returns.is_empty());
     }
 
+    /// Scenario: A unit's route is registered on a pane. Taking the route for
+    /// another unit id on the same pane takes nothing; taking it for its own
+    /// unit id takes it, so a recycled pane's newer unit is never taken for an
+    /// older one.
+    #[spec::spec("orchestration/work-done/031")]
     #[test]
-    fn the_units_own_pane_closing_evicts_the_entry() {
+    fn work_done_031_take_for_unit_matches_the_unit_id_not_the_pane_alone() {
+        let mut returns = DispatchReturns::default();
+        returns.register("unit-pane", "unit-agent", "unit-2", caller("c", "1", "n"));
+        assert!(returns.take_for_unit("unit-pane", "unit-1").is_none());
+        assert_eq!(returns.len(), 1);
+        assert_eq!(
+            returns
+                .take_for_unit("unit-pane", "unit-2")
+                .map(|route| route.unit_id),
+            Some("unit-2".to_string())
+        );
+    }
+
+    /// PRD #1666 part 3, round 5 (plan D7): a deliberate close of a unit's
+    /// pane evicts and returns that unit's route, so the close records its end;
+    /// the caller's other units are untouched.
+    #[test]
+    fn the_units_own_pane_closing_evicts_and_returns_its_route() {
         let mut returns = DispatchReturns::default();
         returns.register(
             "unit-pane",
             "unit-agent",
+            "u1",
             caller("caller-pane", "agent-7", "probe"),
         );
         returns.register(
             "other-unit",
-            "other-unit-agent",
+            "other-agent",
+            "u2",
             caller("caller-pane", "agent-7", "second"),
         );
-
-        assert_eq!(returns.evict_pane("unit-pane"), 1);
-        assert_eq!(
-            returns.resolve("unit-pane"),
-            None,
-            "a closed unit tab will never complete, so nothing may keep waiting on it"
-        );
-        assert!(
-            returns.resolve("other-unit").is_some(),
-            "closing one unit must not cancel the caller's other outstanding unit"
-        );
+        let removed = returns.evict_pane("unit-pane");
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].unit_id, "u1");
+        assert!(returns.resolve("unit-pane").is_none());
+        assert!(returns.resolve("other-unit").is_some());
     }
 
+    /// PRD #1666 part 3, round 5 (plan D7): the caller going away ORPHANS its
+    /// routes rather than evicting them: each unit's end is still recorded,
+    /// and the orphaned routes leave the dispatch tree.
     #[test]
-    fn the_callers_pane_going_away_evicts_every_unit_it_dispatched() {
+    fn the_callers_pane_going_away_orphans_every_unit_it_dispatched() {
         let mut returns = DispatchReturns::default();
         returns.register(
             "unit-a",
             "unit-a-agent",
+            "a",
             caller("caller-pane", "agent-7", "a"),
         );
         returns.register(
             "unit-b",
             "unit-b-agent",
+            "b",
             caller("caller-pane", "agent-7", "b"),
         );
         returns.register(
             "unit-c",
             "unit-c-agent",
+            "c",
             caller("other-caller", "agent-9", "c"),
         );
-
-        assert_eq!(
-            returns.evict_pane("caller-pane"),
-            2,
-            "both units dispatched from the closing pane lose their recipient"
-        );
-        assert!(returns.resolve("unit-a").is_none());
-        assert!(returns.resolve("unit-b").is_none());
         assert!(
-            returns.resolve("unit-c").is_some(),
-            "another caller's outstanding unit is untouched"
+            returns.evict_pane("caller-pane").is_empty(),
+            "a caller's pane is no unit's"
         );
-        assert_eq!(
-            returns.evict_pane("a-pane-in-no-entry"),
-            0,
-            "an unrelated pane close evicts nothing"
-        );
+        assert_eq!(returns.orphan_caller_pane("caller-pane"), 2);
+        assert_eq!(returns.len(), 3, "orphaned, not evicted");
+        assert!(returns.resolve("unit-a").unwrap().orphaned);
+        assert!(returns.resolve("unit-b").unwrap().orphaned);
+        assert!(!returns.resolve("unit-c").unwrap().orphaned);
+        let edges = returns.edges();
+        assert_eq!(edges.len(), 1, "orphaned routes give no place in the tree");
+        assert_eq!(edges[0].unit_pane_id, "unit-c");
     }
 
     #[test]
@@ -619,166 +1022,125 @@ mod tests {
         returns.register(
             "unit-pane",
             "unit-agent-1",
+            "u1",
             caller("caller-a", "agent-1", "first"),
         );
-
         let displaced = returns.register(
             "unit-pane",
             "unit-agent-2",
+            "u2",
             caller("caller-b", "agent-2", "second"),
         );
         assert_eq!(
             displaced.map(|entry| entry.caller),
-            Some(caller("caller-a", "agent-1", "first")),
-            "the displaced entry is reported so the daemon can log the recycle"
+            Some(caller("caller-a", "agent-1", "first"))
         );
         assert_eq!(returns.len(), 1);
         assert_eq!(
             returns
                 .resolve("unit-pane")
                 .map(|entry| entry.caller.pane_id.as_str()),
-            Some("caller-b"),
-            "a pane id is a recycled handle; the newest dispatch owns it"
+            Some("caller-b")
         );
     }
 
-    /// PRD #220 Phase 2 review/audit (finding A3): a dispatched unit that exits
-    /// without ever signalling `work-done --done` used to leave its entry resident
-    /// for the daemon's lifetime — the EOF path swept delegations and walked past
-    /// this map.
+    /// A unit that exits stops owing a report: its route is evicted, matched by
+    /// pane and the route's current generation, and returned.
     #[test]
-    fn a_unit_whose_process_exits_stops_owing_a_report() {
+    fn a_unit_whose_process_exits_returns_its_route() {
         let mut returns = DispatchReturns::default();
         returns.register(
             "unit-pane",
             "the-units-own-agent",
+            "u1",
             caller("caller-pane", "agent-7", "probe"),
         );
         returns.register(
             "other-unit",
             "the-other-units-agent",
+            "u2",
             caller("caller-pane", "agent-7", "second"),
         );
-
-        assert_eq!(
-            returns.evict_exited("unit-pane", "the-units-own-agent"),
-            1,
-            "a unit that died will never complete, so nothing may keep waiting on it"
-        );
+        let removed = returns.evict_exited("unit-pane", "the-units-own-agent");
+        assert_eq!(removed.len(), 1);
         assert!(returns.resolve("unit-pane").is_none());
-        assert!(
-            returns.resolve("other-unit").is_some(),
-            "one unit dying must not cancel the caller's other outstanding unit"
-        );
+        assert!(returns.resolve("other-unit").is_some());
     }
 
-    /// The caller side of the same sweep: an agent that dispatched and then died
-    /// has no conversation left to be reported into.
+    /// The caller side of the same sweep orphans, identity-gated: only the
+    /// agent that dispatched releases its routes, and they stay recorded.
     #[test]
-    fn a_caller_whose_process_exits_releases_every_unit_it_dispatched() {
+    fn a_caller_whose_process_exits_orphans_its_units_and_only_its_own() {
         let mut returns = DispatchReturns::default();
         returns.register(
             "unit-a",
             "unit-a-agent",
+            "a",
             caller("caller-pane", "agent-7", "a"),
-        );
-        returns.register(
-            "unit-b",
-            "unit-b-agent",
-            caller("caller-pane", "agent-7", "b"),
         );
         returns.register(
             "unit-c",
             "unit-c-agent",
+            "c",
             caller("other-caller", "agent-9", "c"),
         );
-
-        assert_eq!(returns.evict_exited("caller-pane", "agent-7"), 2);
-        assert!(returns.resolve("unit-a").is_none());
-        assert!(returns.resolve("unit-b").is_none());
+        assert!(returns.evict_exited("caller-pane", "agent-7").is_empty());
         assert!(
-            returns.resolve("unit-c").is_some(),
-            "another caller's outstanding unit is untouched"
-        );
-        assert_eq!(
-            returns.evict_exited("a-pane-in-no-entry", "agent-7"),
-            0,
-            "an unrelated pane's exit evicts nothing"
-        );
-    }
-
-    /// The one behavioural difference from the deliberate-close sweep, and the
-    /// reason it exists: `pump_reader` sets `exited` before sweeping and
-    /// `spawn_agent` admits a successor onto a pane whose occupant is `exited`, so
-    /// a dead PREDECESSOR's late EOF can name a pane a live successor now holds.
-    /// Its own outstanding units must survive that.
-    #[test]
-    fn a_dead_predecessors_exit_cannot_cancel_its_successors_dispatches() {
-        let mut returns = DispatchReturns::default();
-        returns.register(
-            "unit-pane",
-            "unit-agent",
-            caller("caller-pane", "successor-agent", "live"),
-        );
-
-        assert_eq!(
-            returns.evict_exited("caller-pane", "predecessor-agent"),
-            0,
-            "the exiting agent is not the one that dispatched this unit, so the entry \
-             belongs to the pane's current occupant and must stand"
-        );
-        assert_eq!(
             returns
-                .resolve("unit-pane")
-                .map(|entry| entry.caller.agent_id.as_str()),
-            Some("successor-agent")
+                .orphan_caller("caller-pane", "some-earlier-occupant")
+                .is_empty()
         );
-        assert_eq!(
-            returns.evict_exited("caller-pane", "successor-agent"),
-            1,
-            "the agent that actually dispatched it exiting DOES release the entry"
-        );
+        assert_eq!(returns.orphan_caller("caller-pane", "agent-7").len(), 1);
+        assert!(returns.resolve("unit-a").unwrap().orphaned);
+        assert!(!returns.resolve("unit-c").unwrap().orphaned);
     }
 
-    /// The UNIT-side sibling of the test above, and the defect PR #1081's review
-    /// found in the gap between them (Greptile finding 1): the same late-EOF race
-    /// runs on the unit's pane, where a second dispatch onto a recycled pane id
-    /// registers the successor's route and the predecessor's EOF used to remove
-    /// it. That loss is invisible — the successor's terminal `work-done` finds no
-    /// retained caller and its completion report is dropped with nothing said.
+    /// A dead predecessor's late EOF cannot evict its successor's route on a
+    /// recycled unit pane (PR #1081 review, Greptile finding 1).
     #[test]
     fn a_dead_predecessors_exit_cannot_evict_its_successors_return_route() {
         let mut returns = DispatchReturns::default();
         returns.register(
             "unit-pane",
             "successor-unit-agent",
+            "u2",
             caller("caller-pane", "caller-agent", "live-unit"),
         );
-
-        assert_eq!(
-            returns.evict_exited("unit-pane", "predecessor-unit-agent"),
-            0,
-            "the agent that exited is not the unit this route was retained for, so a              pane id it merely used to hold must not cancel the live successor"
+        assert!(
+            returns
+                .evict_exited("unit-pane", "predecessor-unit-agent")
+                .is_empty()
         );
         assert_eq!(
             returns
-                .take("unit-pane")
-                .map(|entry| entry.caller.unit_name),
-            Some("live-unit".to_string()),
-            "the successor's own completion must still find the caller that dispatched              it, or its report is lost with nothing said"
-        );
-
-        returns.register(
-            "unit-pane",
-            "successor-unit-agent",
-            caller("caller-pane", "caller-agent", "live-unit"),
+                .resolve("unit-pane")
+                .map(|entry| entry.caller.unit_name.as_str()),
+            Some("live-unit")
         );
         assert_eq!(
-            returns.evict_exited("unit-pane", "successor-unit-agent"),
-            1,
-            "the unit that was actually dispatched exiting DOES release the entry —              the finding A3 sweep this gate must not disable"
+            returns
+                .evict_exited("unit-pane", "successor-unit-agent")
+                .len(),
+            1
         );
         assert!(returns.is_empty());
+    }
+
+    /// PRD #1666 part 3, round 5 (plan D7): the respawn's retarget is a
+    /// compare-and-set on the unit id and the generation.
+    #[test]
+    fn retarget_moves_only_the_route_of_that_unit_and_generation() {
+        let mut returns = DispatchReturns::default();
+        returns.register("unit-pane", "a", "u1", caller("c", "1", "n"));
+        assert!(!returns.retarget("unit-pane", "u1", "not-a", "b"));
+        assert!(!returns.retarget("unit-pane", "u9", "a", "b"));
+        assert!(returns.retarget("unit-pane", "u1", "a", "b"));
+        assert_eq!(returns.resolve("unit-pane").unwrap().unit_agent_id, "b");
+        assert!(
+            returns.evict_exited("unit-pane", "a").is_empty(),
+            "the old generation's EOF matches nothing"
+        );
+        assert_eq!(returns.evict_exited("unit-pane", "b").len(), 1);
     }
 
     #[test]
@@ -982,6 +1344,7 @@ mod tests {
             "probe-unit",
             true,
             "dispatched probe-unit",
+            None,
         );
         let listed = registry.inbox().list("full-caller");
         assert!(
@@ -1049,6 +1412,7 @@ mod tests {
             "probe-unit",
             true,
             "dispatched probe-unit",
+            None,
         );
         let subjects: Vec<String> = registry
             .inbox()
@@ -1111,6 +1475,7 @@ mod tests {
             "probe-unit",
             false,
             &failure,
+            None,
         );
         let posted = registry.inbox().list_with_bodies(Some("unsavable-caller"));
         registry.shutdown_all();
@@ -1173,6 +1538,7 @@ mod tests {
             "probe-unit",
             true,
             "dispatched probe-unit as a single agent in its own worktree",
+            None,
         );
         let posted = registry.inbox().list("limited-caller");
         registry.shutdown_all();
@@ -1222,6 +1588,7 @@ mod tests {
             "probe-unit",
             false,
             "could not dispatch probe-unit",
+            None,
         );
         let subjects: Vec<String> = registry
             .inbox()

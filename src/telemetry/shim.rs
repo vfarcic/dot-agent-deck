@@ -48,9 +48,12 @@ pub const PROGRAMS: [&str; 2] = ["codex", "devin"];
 /// The shim directory's name inside the deck's telemetry directory.
 pub const DIR_NAME: &str = "bin";
 
-/// The deck's run id, in the environment of an agent the deck started with
-/// the shim on `PATH`: what a Devin's per-run configuration is named for, so
-/// the daemon removes it when the run ends.
+/// The deck's run id, in the environment of every agent the deck started a
+/// run for, shim or not: what a Devin's per-run configuration is named for, so
+/// the daemon removes it when the run ends, and what a tool the agent runs
+/// joins its spans to the run by when `OTEL_RESOURCE_ATTRIBUTES` was removed
+/// on the way (issue #1893). Blank for an agent the deck started no run for,
+/// so one inherited from another deck's agent does not pass through (#1902).
 pub const RUN_ID_ENV: &str = "DOT_AGENT_DECK_TELEMETRY_RUN_ID";
 
 /// The programs already shimmed in this process tree, `:`-separated: set on
@@ -310,8 +313,16 @@ fn resolve(name: &str, path: Option<&OsStr>, dir: &Path) -> Option<PathBuf> {
         .find(|candidate| {
             std::fs::canonicalize(candidate).is_ok_and(|c| c.parent() != Some(shim.as_path()))
                 && is_executable_file(candidate)
-                && !head(candidate).is_some_and(|h| is_shim_script(&h))
+                && !is_shim_file(candidate)
         })
+}
+
+/// Whether the file at `path` reads as a shim script ([`is_shim_script`]),
+/// whichever deck and directory it names. A test that resolves the real agent
+/// from a `PATH` a deck put its shim directory on asks this too, or it runs
+/// the shim as the agent.
+pub fn is_shim_file(path: &Path) -> bool {
+    head(path).is_some_and(|h| is_shim_script(&h))
 }
 
 /// The first [`HEAD_LEN`] bytes of the file at `path`, or `None` when it

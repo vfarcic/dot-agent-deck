@@ -155,15 +155,25 @@ export function buildDelegateArgv(to: string | string[], task: string): string[]
 }
 
 /**
- * Build the argv for `dot-agent-deck work-done`. Pass `done: true` to also
- * signal that the entire orchestration is complete (orchestrator only).
+ * Build the argv for `dot-agent-deck work-done`. Pass the delegated task's
+ * `taskId` (PRD #1666 part 3: the task's instructions name it) so the deck
+ * marks that task complete; without one, the report is a note that completes
+ * no task. Pass `done: true` instead to signal that the entire orchestration is
+ * complete (orchestrator only); the two cannot be combined.
  *
- * @example buildWorkDoneArgv("added tests")
- *   → ["work-done", "--task", "added tests"]
+ * @example buildWorkDoneArgv("added tests", false, "m-abc-0123")
+ *   → ["work-done", "--task-id", "m-abc-0123", "--task", "added tests"]
  */
-export function buildWorkDoneArgv(summary: string, done = false): string[] {
+export function buildWorkDoneArgv(summary: string, done = false, taskId?: string): string[] {
 	requireNonBlank(summary, "work-done summary");
-	const argv = ["work-done", "--task", summary];
+	const argv = ["work-done"];
+	if (taskId !== undefined && taskId.trim() !== "") {
+		if (done) {
+			throw new Error("work-done takes a task id or done, not both");
+		}
+		argv.push("--task-id", taskId.trim());
+	}
+	argv.push("--task", summary);
 	if (done) {
 		argv.push("--done");
 	}

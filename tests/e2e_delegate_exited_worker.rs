@@ -299,7 +299,7 @@ fn delegate_049_a_delegate_to_a_worker_that_exited_on_its_own_is_not_reported_de
     );
 }
 
-/// Scenario: Complete a commissioned task, delegate again, then let the worker exit naturally and start a successor in the same pane. Its report reaches the orchestrator inbox as uncommissioned work and leaves the earlier commissioned report file intact.
+/// Scenario: Complete a commissioned task, delegate again, then let the worker exit naturally and start a successor in the same pane. Its report, which names no task, reaches the orchestrator inbox as a note that completes no task and leaves the earlier commissioned report file intact.
 #[spec("orchestration/work-done/015")]
 #[test]
 fn work_done_015_a_successor_in_an_exited_worker_s_pane_is_not_credited_with_its_task() {

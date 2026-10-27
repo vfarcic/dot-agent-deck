@@ -9,6 +9,9 @@ members = [
     "xtask/site",
     "xtask/spec",
 ]
+# The patched crossterm below is a path dependency inside the workspace root,
+# which cargo would otherwise make a member and lint as our own code.
+exclude = ["vendor/crossterm"]
 
 # Issue #451 — the minimum supported Rust toolchain, inherited by every member
 # through `rust-version.workspace = true`. Without it, a build on an older
@@ -36,6 +39,9 @@ name = "dot-agent-deck"
 version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
+# PRD #1859: `src/bin/dot-agent-deck-collector.rs` is this package's second
+# binary, so a bare `cargo run` needs telling which one is the deck.
+default-run = "dot-agent-deck"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -53,9 +59,12 @@ ratatui = "0.30"
 # hand, and re-read `ctrl_c0_byte`'s contract, before bumping it. (The
 # `keyevent_ctrl_c0_matches_crossterm_decoder` round-trip test catches an
 # encoder/decoder mismatch under `cargo test-fast`, but not a stale line
-# reference.) NOTE: ratatui 0.30 pulls crossterm 0.29 in via `ratatui-crossterm`;
-# the two coexist because 0.28/0.29 are semver-incompatible, and this pin binds
-# only OUR direct dependency — the one `src/ui.rs` reads events from.
+# reference.) ratatui 0.30 also depends on crossterm, through
+# `ratatui-crossterm`. Both requirements resolve to the one patched copy that
+# `[patch.crates-io]` below supplies, so a bump also means re-applying or
+# dropping that patch: a version the patch does not supply makes cargo use the
+# registry crate with only a warning, which `tests/vendored_crossterm.rs`
+# turns into a failure.
 crossterm = "=0.29.0"
 clap = { version = "4", features = ["derive"] }
 toml = "1.0"
@@ -108,6 +117,11 @@ getrandom = "0.4"
 # anything. Already in this workspace's lockfile (the desktop crate's graph
 # carries 0.10.9), so the version resolves to code the workspace builds today.
 sha2 = "0.11"
+# PRD #1859: the collector's body reader takes a response's chunks as reqwest
+# hands them over, as `bytes::Bytes`, so it can refuse one past its cap before
+# copying any of it. Already in the graph as reqwest's own dependency, so
+# naming it adds no new code to the build.
+bytes = "1"
 
 # Issue #250: `build.rs` validates an injected `DAD_VERSION` with the EXACT
 # parser `src/version.rs` uses (`semver::Version::parse`), so the set of
@@ -274,3 +288,12 @@ path = "examples/diff_config.rs"
 # at the dev profile's settings.
 [profile.dev.package.earshot]
 opt-level = 3
+
+# crossterm 0.29.0 with its Unix event source fixed to handle a whole readiness
+# batch: upstream stranded keys typed right after a terminal resize until the
+# next keystroke. Replaces the registry crate for every dependent, ratatui's
+# included. vendor/crossterm/VENDORED.md has the change, why no release or
+# feature avoids it, when to drop it, and what keeps it applied and audited
+# (`tests/vendored_crossterm.rs`, `scripts/audit-vendored-upstream.sh`).
+[patch.crates-io]
+crossterm = { path = "vendor/crossterm" }

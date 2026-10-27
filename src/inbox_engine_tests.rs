@@ -23,6 +23,7 @@ fn content(body: &str) -> Content {
         spill_path: None,
         id: None,
         preface: None,
+        provenance: None,
     }
 }
 
@@ -204,72 +205,46 @@ async fn until(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
-/// Scenario: One pane holds a message an `inbox fetch` took (legacy) and one an OpenCode receipt stream took. With the ack-wait elapsed, the legacy ack-wait redelivers only its own; the receipt-owned hand-out stays where its attempt model put it even with its own ack deadline run out, and a receipt receiver never takes the legacy-owned one back.
+/// Scenario: An OpenCode receipt stream is handed a message and keeps it. With the ack-wait run out many times over (ack-wait × max_deliver and more) and the clock ticking, nothing is handed out again: the store sets the hand-out no deadline, no further attempt is issued and it stays fetched. A message a hook receiver positively did not hand over returns to the queue at once, unmarked, and is handed out again as a first try, not a possible repeat.
 #[spec("inbox/boundary/001")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn boundary_001_legacy_ack_wait_touches_only_legacy_owned_assignments() {
+async fn boundary_001_no_ack_wait_redelivers_a_receipt_hand_out() {
     let hub = hub_with(Duration::from_secs(30), Duration::from_millis(50));
-    let legacy = hub
-        .post_direct(Recipient::bound("p", "a"), content("legacy"))
-        .unwrap();
-    let fetched = hub.fetch("p", "a", Consumer::FetchCli, None, None);
-    assert_eq!(fetched.len(), 1);
     let mut peer = Peer::open(&hub, "p", "a", InboxComponent::OpenCodePlugin, INTEGRATION).await;
     assert!(peer.next().await.registered.is_some());
-    let receipt = hub
-        .post_direct(Recipient::bound("p", "a"), content("receipt"))
+    let held = hub
+        .post_direct(Recipient::bound("p", "a"), content("held"))
         .unwrap();
     let handed = peer.handout().await;
-    assert_eq!(handed[0].id, receipt.as_str());
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    hub.tick();
-    assert_eq!(
-        state_of(&hub, "p", legacy.as_str()),
-        StateName::Queued,
-        "the legacy hand-out is redelivered"
-    );
-    assert_eq!(
-        state_of(&hub, "p", receipt.as_str()),
-        StateName::Fetched,
-        "the receipt-owned hand-out is not the ack-wait's"
-    );
-    assert_eq!(
-        hub.lock().inbox.owner_of(legacy.as_str(), "p", "a"),
-        Some(crate::inbox::AssignmentOwner::Legacy)
-    );
-    // A receipt receiver never takes the legacy-owned message back: it is
-    // not handed out, and no attempt is issued for it.
-    hub.dispatch_agent("p", "a");
-    assert_eq!(state_of(&hub, "p", legacy.as_str()), StateName::Queued);
-    let leaked = tokio::time::timeout(Duration::from_millis(300), async {
-        loop {
-            if peer
-                .next()
-                .await
-                .messages
-                .is_some_and(|m| m.iter().any(|d| d.id == legacy.as_str()))
-            {
-                return;
-            }
-        }
-    })
+    assert_eq!(handed[0].id, held.as_str());
+    let max_deliver = hub.lock().inbox.limits().max_deliver;
+    no_handout_while_ticking(
+        &hub,
+        &mut peer,
+        Duration::from_millis(50) * (max_deliver + 2),
+        "a possessed hand-out",
+    )
     .await;
-    assert!(
-        leaked.is_err(),
-        "a legacy-owned message reached the receipt stream"
-    );
-    assert!(
-        hub.lock().receipts.gens[&("p".to_string(), "a".to_string())]
-            .model
-            .delivery(legacy.as_str())
-            .is_none_or(|d| d.attempts.is_empty()),
-        "no attempt is issued for a legacy-owned message"
-    );
-    // Nor does the legacy ack-wait touch the receipt-owned hand-out, even
-    // with its deadline run out.
-    hub.run_out_ack_wait(receipt.as_str(), "p");
-    assert_eq!(state_of(&hub, "p", receipt.as_str()), StateName::Fetched);
+    assert_eq!(state_of(&hub, "p", held.as_str()), StateName::Fetched);
+    assert_eq!(hub.lock().inbox.next_deadline(), None);
+    assert_eq!(attempts_of(&hub, "p", "a", held.as_str()), 1);
     peer.close().await;
+
+    let back = hub
+        .post_direct(Recipient::bound("q", "b"), content("not handed"))
+        .unwrap();
+    let hook = hub.test_hook_fetch("q", "b", None);
+    assert_eq!(hook.ids(), vec![back.as_str().to_string()]);
+    hub.test_hook_not_handed(&hook);
+    hub.test_hook_close(hook);
+    assert_eq!(state_of(&hub, "q", back.as_str()), StateName::Queued);
+    let again = hub.test_hook_fetch("q", "b", None);
+    assert_eq!(again.ids(), vec![back.as_str().to_string()]);
+    assert!(
+        !attempt(&again.deliveries[0]).repeat,
+        "a hand-out positively not handed over is not a possible repeat"
+    );
+    hub.test_hook_close(again);
 }
 
 /// Scenario: A receipt stream is handed a message, its watcher publishes the `handed` and `committed` receipts into the spool, and the component reports the commit. The message settles, the attempt's evidence reservation is returned, and every spool file of that attempt is removed.
@@ -1548,10 +1523,10 @@ fn live_all() -> Vec<(String, String)> {
         .collect()
 }
 
-/// Scenario: A job is offered first to an OpenCode worker and then to a Claude worker. The OpenCode worker positively did not hand it over, so the job goes back to its pool and on to the Claude worker, whose hook takes it through the legacy fetch. The OpenCode worker's watcher then publishes a commit receipt for its own earlier attempt: the deck tells the offerer the job also reached the earlier holder, and the Claude worker's copy stays its own — not settled by that receipt — until its hook acknowledges it.
+/// Scenario: A job is offered first to an OpenCode worker and then to a Claude worker. The OpenCode worker positively did not hand it over, so the job goes back to its pool and on to the Claude worker, whose `inbox fetch` (a hook receiver) is handed it. The OpenCode worker's watcher then publishes a commit receipt for its own earlier attempt: the deck tells the offerer the job also reached the earlier holder, and the Claude worker's copy stays its own — not settled by that receipt — until the Claude worker acknowledges it.
 #[spec("inbox/boundary/026")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn boundary_026_an_offer_moved_from_opencode_to_a_legacy_fetch_worker_is_not_settled_by_a_late_receipt()
+async fn boundary_026_an_offer_moved_from_opencode_to_a_hook_worker_is_not_settled_by_a_late_receipt()
  {
     let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_secs(60));
     let mut oc = Peer::open(&hub, "oc", "a", InboxComponent::OpenCodePlugin, INTEGRATION).await;
@@ -1574,12 +1549,8 @@ async fn boundary_026_an_offer_moved_from_opencode_to_a_legacy_fetch_worker_is_n
         Some(Recipient::bound("claude", "c")),
         "the next holder is the Claude worker"
     );
-    let fetched = hub.fetch("claude", "c", Consumer::FetchCli, None, None);
-    assert_eq!(fetched.len(), 1);
-    assert_eq!(
-        hub.lock().inbox.owner_of(id.as_str(), "claude", "c"),
-        Some(crate::inbox::AssignmentOwner::Legacy)
-    );
+    let hook = hub.test_hook_fetch("claude", "c", None);
+    assert_eq!(hook.ids(), vec![id.as_str().to_string()]);
     publish_receipt(
         &hub,
         "oc",
@@ -1607,14 +1578,14 @@ async fn boundary_026_an_offer_moved_from_opencode_to_a_legacy_fetch_worker_is_n
         hub.ack(id.as_str(), "claude", "c", AckHow::Explicit),
         AckOutcome::Claimed { .. }
     ));
+    hub.test_hook_close(hook);
     oc.close().await;
 }
 
-/// Scenario: A job is offered first to a Claude worker, whose hook takes it through the legacy fetch and lets its ack-wait run out, and then to an OpenCode worker, whose receipt stream is handed it. The hook's late acknowledgement of its earlier copy settles nothing: the OpenCode worker's copy stays with its open attempt until the OpenCode worker commits it.
+/// Scenario: A job is offered first to a Claude worker, whose `inbox fetch` (a hook receiver) is handed it and positively does not hand it over, and then to an OpenCode worker, whose receipt stream is handed it. The Claude worker's late acknowledgement of its earlier copy settles nothing: the OpenCode worker's copy stays with its open attempt until the OpenCode worker commits it. A Claude worker that did claim the job, then released it or let the claim run out before it moved on to OpenCode, is answered `wrong_agent` when it acknowledges it again, and the OpenCode worker's own ack still claims it.
 #[spec("inbox/boundary/027")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn boundary_027_an_offer_moved_from_a_legacy_fetch_worker_to_opencode_is_not_settled_by_a_late_ack()
- {
+async fn boundary_027_an_offer_moved_from_a_hook_worker_to_opencode_is_not_settled_by_a_late_ack() {
     let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_secs(60));
     let mut oc = Peer::open(&hub, "oc", "a", InboxComponent::OpenCodePlugin, INTEGRATION).await;
     oc.next().await;
@@ -1623,12 +1594,13 @@ async fn boundary_027_an_offer_moved_from_a_legacy_fetch_worker_to_opencode_is_n
         (Recipient::bound("oc", "a"), "opencode-worker".to_string()),
     ];
     let id = offer_to(&hub, "mixed job", &candidates);
-    let fetched = hub.fetch("claude", "c", Consumer::FetchCli, None, None);
-    assert_eq!(fetched.len(), 1, "the Claude worker holds it first");
-    hub.run_out_ack_wait(id.as_str(), "claude");
+    let hook = hub.test_hook_fetch("claude", "c", None);
+    assert_eq!(hook.ids().len(), 1, "the Claude worker holds it first");
+    hub.test_hook_not_handed(&hook);
+    hub.test_hook_close(hook);
     assert!(
         hub.lock().inbox.unassigned_offers().contains(&id),
-        "and its ack-wait returns it to the pool"
+        "and positively not handed over, it returns to the pool"
     );
     assert_eq!(
         hub.assign_offer(&id, &candidates, &live_all),
@@ -1653,6 +1625,64 @@ async fn boundary_027_an_offer_moved_from_a_legacy_fetch_worker_to_opencode_is_n
     })
     .await;
     oc.close().await;
+
+    // A previous holder that did take the job, and gave it back by releasing
+    // it or by letting its claim run out, is not its holder either: its
+    // committed attempt is history, and its ack answers `wrong_agent`.
+    for expire in [false, true] {
+        let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_secs(60));
+        let mut oc = Peer::open(&hub, "oc", "a", InboxComponent::OpenCodePlugin, INTEGRATION).await;
+        oc.next().await;
+        let id = offer_to(&hub, "mixed job", &candidates);
+        let hook = hub.test_hook_fetch("claude", "c", None);
+        assert_eq!(hook.ids(), vec![id.as_str().to_string()]);
+        assert!(matches!(
+            hub.ack(id.as_str(), "claude", "c", AckHow::Explicit),
+            AckOutcome::Claimed { .. }
+        ));
+        hub.test_hook_close(hook);
+        if expire {
+            // The store's clock past any claim's longest allowed life.
+            let mut st = hub.lock();
+            st.inbox
+                .tick(Instant::now() + Duration::from_secs(2 * 24 * 60 * 60));
+            drain_events(&mut st);
+            drop(st);
+            hub.post_owed_notices();
+            assert!(
+                hub.lock().inbox.unassigned_offers().contains(&id),
+                "the Claude worker's claim ran out"
+            );
+        } else {
+            assert_eq!(
+                hub.release(id.as_str(), "claude", "c"),
+                ClaimOutcome::Released
+            );
+        }
+        assert_eq!(
+            hub.assign_offer(&id, &candidates, &live_all),
+            Some(Recipient::bound("oc", "a")),
+            "the next holder is OpenCode (expired: {expire})"
+        );
+        let handed = oc.handout().await;
+        assert_eq!(handed[0].id, id.as_str());
+        assert_eq!(
+            hub.ack(id.as_str(), "claude", "c", AckHow::Explicit),
+            AckOutcome::WrongAgent,
+            "the previous holder's ack is not the job's (expired: {expire})"
+        );
+        assert_eq!(state_of(&hub, "oc", id.as_str()), StateName::Fetched);
+        assert_eq!(attempts_of(&hub, "oc", "a", id.as_str()), 1);
+        assert!(
+            matches!(
+                hub.ack(id.as_str(), "oc", "a", AckHow::Explicit),
+                AckOutcome::Claimed { .. }
+            ),
+            "the current holder's ack claims it (expired: {expire})"
+        );
+        assert_eq!(state_of(&hub, "oc", id.as_str()), StateName::Claimed);
+        oc.close().await;
+    }
 }
 
 /// The current revision of `id` in `pane`/`agent`'s attempt model.
@@ -2158,6 +2188,100 @@ async fn a_superseded_uncertain_task_leaves_no_told_marker() {
         "the newer delegation retired the watch"
     );
     assert!(!marked(), "and the marker with it");
+    peer.close().await;
+}
+
+/// Issue #1816: on one long-lived generation, task after task goes
+/// uncertain and is superseded by the next; the record that its orchestrator
+/// was told goes with each watch, so it never holds more than the one live
+/// watch's id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn told_markers_stay_within_the_live_watches_over_many_tasks() {
+    let hub = hub_with(Duration::from_secs(30), Duration::from_secs(60));
+    let mut peer = Peer::open(&hub, "p", "a", InboxComponent::OpenCodePlugin, INTEGRATION).await;
+    peer.next().await;
+    let key = ("p".to_string(), "a".to_string());
+    let mut seq = 0;
+    for task in 0..4 {
+        let id = hub
+            .post_delegate(
+                Recipient::bound("p", "a"),
+                "coder",
+                Some(Recipient::bound("o", "oa")),
+                DelegateLedger::default(),
+                content(&format!("uncertain task {task}")),
+                &|| true,
+            )
+            .unwrap()
+            .0;
+        lapse_until_uncertain(&hub, &mut peer, id.as_str(), &mut seq).await;
+        until("the orchestrator to be told it is uncertain", || {
+            hub.tick();
+            hub.lock().receipts.gens[&key]
+                .uncertain_told
+                .contains(id.as_str())
+        })
+        .await;
+        let st = hub.lock();
+        assert_eq!(
+            st.receipts.gens[&key].uncertain_told.len(),
+            1,
+            "task {task}: only the live watch's marker is kept"
+        );
+        assert!(st.delegates.contains_key(id.as_str()));
+    }
+    peer.close().await;
+}
+
+/// Scenario: A long-lived OpenCode generation whose pane keeps two ended
+/// messages of history is handed six messages, each committed in turn. Its
+/// delivery model keeps the records of the two the inbox still lists, and a
+/// Cancel pressed on one of them is still answered as already delivered;
+/// the records of the four the inbox dropped are gone.
+#[spec("inbox/boundary/075")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_075_a_long_lived_generation_keeps_only_the_records_the_inbox_lists() {
+    use crate::daemon_protocol::InboxActionOutcome;
+    let limits = InboxLimits {
+        ack_wait: Duration::from_secs(60),
+        history_per_pane: 2,
+        ..InboxLimits::default()
+    };
+    let hub = Arc::new(InboxHub::new(deck(), limits, Duration::from_secs(30)));
+    let mut peer = Peer::open(&hub, "p", "a", InboxComponent::OpenCodePlugin, INTEGRATION).await;
+    peer.next().await;
+    let key = ("p".to_string(), "a".to_string());
+    let records = || hub.lock().receipts.gens[&key].model.ids();
+    let mut ids = Vec::new();
+    for n in 0..6 {
+        let id = hub
+            .post_direct(Recipient::bound("p", "a"), content(&format!("task {n}")))
+            .unwrap();
+        let handed = peer.handout().await;
+        assert_eq!(handed[0].id, id.as_str());
+        peer.send(serde_json::json!({"committed": [at(&handed[0])]}))
+            .await;
+        until("the commit to settle", || {
+            state_of(&hub, "p", id.as_str()) == StateName::Acknowledged
+        })
+        .await;
+        ids.push(id.as_str().to_string());
+        assert!(
+            records().len() <= 2,
+            "message {n}: the model holds {:?}",
+            records()
+        );
+    }
+    let mut kept = ids[4..].to_vec();
+    kept.sort();
+    assert_eq!(records(), kept, "the two the inbox still lists");
+    let revision = hub.lock().receipts.gens[&key]
+        .model
+        .delivery(&ids[5])
+        .unwrap()
+        .revision;
+    let cancel = hub.inbox_action("p", "a", &ids[5], revision, false, "tui-1");
+    assert_eq!(cancel.outcome, InboxActionOutcome::AlreadySettled);
     peer.close().await;
 }
 
@@ -2886,6 +3010,7 @@ async fn attempts_022_only_a_turn_that_ended_moves_the_turn_clock() {
         &mut hub.lock(),
         &key,
         InboxComponent::OpenCodeMini,
+        engine::Registrant::Integration,
         false,
         false,
         1,
@@ -3785,17 +3910,51 @@ fn open_once(hub: &Arc<InboxHub>, declared: Option<u32>) -> Peer {
 /// Claude's prompt hook's end of one connection to `p`/`a`: its fetch, for
 /// the doorbell that named `named`, declaring `declared`.
 fn open_hook(hub: &Arc<InboxHub>, named: Option<&str>, declared: Option<u32>) -> Peer {
+    open_hook_as(
+        hub,
+        InboxComponent::ClaudeHooks,
+        crate::event::InboxFetchConsumer::DoorbellHook,
+        named,
+        declared,
+    )
+}
+
+/// PRD #1666 part 3 (H4): [`open_hook`] for a hook of `component` fetching
+/// as `consumer`: Codex's prompt hook or `Stop`, or a model-run `inbox
+/// fetch` (`Cli`) served as the hook of the agent's component.
+fn open_hook_as(
+    hub: &Arc<InboxHub>,
+    component: InboxComponent,
+    consumer: crate::event::InboxFetchConsumer,
+    named: Option<&str>,
+    declared: Option<u32>,
+) -> Peer {
+    let budget =
+        (consumer != crate::event::InboxFetchConsumer::Cli).then(|| component.inline_budget());
+    open_hook_within(hub, component, consumer, named, declared, budget)
+}
+
+/// [`open_hook_as`] asking for `budget`, as the hook's own fetch names it.
+fn open_hook_within(
+    hub: &Arc<InboxHub>,
+    component: InboxComponent,
+    consumer: crate::event::InboxFetchConsumer,
+    named: Option<&str>,
+    declared: Option<u32>,
+    budget: Option<InboxBudget>,
+) -> Peer {
     let (client, server) = tokio::io::duplex(1 << 16);
     let (read, write) = tokio::io::split(server);
     let serve = tokio::spawn(serve_hook(
         Arc::clone(hub),
         "p".to_string(),
         "a".to_string(),
-        InboxComponent::ClaudeHooks,
+        component,
         HookFetch {
             named: named.map(str::to_string),
-            budget: Some(InboxComponent::ClaudeHooks.inline_budget()),
+            budget,
             hook_integration: declared,
+            consumer,
         },
         BufReader::new(read),
         write,
@@ -3819,6 +3978,41 @@ fn caps_file(hub: &InboxHub, id: &str, a: u32, e: u32) -> crate::inbox_receipt::
 fn integration_notice(hub: &InboxHub) -> (Option<IntegrationNotice>, Option<String>) {
     let notices = hub.summary("p", "a").notices;
     (notices.integration, notices.integration_command)
+}
+
+/// Scenario: Hook lines from a Claude Code agent and then a Codex agent arrive with no version stamp, as hooks from before the deck's messages send them. Each card names the hooks-too-old notice with that agent's own `hooks install` command, while the task waiting for it is not held from the doorbell; a stamped line from the same generation clears the notice, and a stamped line alone never raises one.
+#[spec("inbox/boundary/067")]
+#[test]
+fn boundary_067_unstamped_hook_lines_name_each_agents_fix_and_hold_nothing() {
+    use crate::event::AgentType;
+    let hub = hub_with(Duration::from_secs(30), Duration::from_secs(60));
+    let claude = "/opt/deck/dot-agent-deck hooks install --agent claude-code";
+    let codex = "/opt/deck/dot-agent-deck hooks install --agent codex";
+    hub.set_hooks_remedy(Some(claude.to_string()));
+    hub.set_agent_hooks_remedy(&AgentType::Codex, Some(codex.to_string()));
+    hub.post_direct(Recipient::bound("p", "a"), content("waits"))
+        .unwrap();
+
+    hub.observe_hook_stamp("p", "a", &AgentType::ClaudeCode, true);
+    assert_eq!(
+        integration_notice(&hub),
+        (None, None),
+        "a stamped line raises nothing"
+    );
+    for (agent, fix) in [(AgentType::ClaudeCode, claude), (AgentType::Codex, codex)] {
+        hub.observe_hook_stamp("p", "a", &agent, false);
+        assert_eq!(
+            integration_notice(&hub),
+            (Some(IntegrationNotice::HooksTooOld), Some(fix.to_string())),
+            "{agent:?}"
+        );
+        assert!(
+            !hub.doorbell_facts("p", "a").blocked,
+            "{agent:?}: the doorbell still offers the task"
+        );
+        hub.observe_hook_stamp("p", "a", &agent, true);
+        assert_eq!(integration_notice(&hub), (None, None), "{agent:?}");
+    }
 }
 
 /// Scenario: A Claude once-waiter that declares no one-shot integration, and one that declares less than the deck's, are each refused as hooks too old before anything is issued: the queued task stays queued with no attempt, and the agent's card names the hooks-too-old notice with the deck's own hooks install command. A Claude prompt hook's fetch is refused the same way. A waiter at the integration registers as the once-waiter slot with its approval window, and is handed the task with its opener naming attempt 1.1, without the attempt's caps, whose caps file the deck has written for the prompt hook; the notice is gone.
@@ -4244,6 +4438,225 @@ async fn boundary_057_a_hook_receiver_takes_only_what_its_fetch_asked_for() {
     })
     .await;
     assert_eq!(state_of(&hub, "p", later.as_str()), StateName::Queued);
+}
+
+/// Scenario: Codex's prompt hook and `Stop`, and a model-run `inbox fetch` in a Devin or an unknown agent's pane, each fetch as a hook receiver declaring no one-shot integration, or a lower one. Each is refused `hooks_too_old` with no batch, nothing is issued and the task stays queued; an agent's own hook puts the out-of-date notice on the card, and the fetch, which proves nothing about the agent's hooks, leaves the card as it was.
+#[spec("inbox/boundary/049")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_049_every_hook_receiver_below_the_floor_is_refused_before_issue() {
+    use crate::event::InboxFetchConsumer::{Cli, DoorbellHook, TurnEndHook};
+    for (component, consumer) in [
+        (InboxComponent::ClaudeHooks, DoorbellHook),
+        (InboxComponent::CodexHooks, DoorbellHook),
+        (InboxComponent::CodexHooks, TurnEndHook),
+        (InboxComponent::DevinHooks, Cli),
+        (InboxComponent::Other, Cli),
+    ] {
+        for declared in [None, Some(HOOK_INTEGRATION - 1)] {
+            let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_secs(60));
+            let id = hub
+                .post_direct(Recipient::bound("p", "a"), content("behind the floor"))
+                .unwrap();
+            let what = format!("{component:?} {consumer:?} {declared:?}");
+            let mut peer = open_hook_as(&hub, component, consumer, None, declared);
+            let reply = peer.next().await;
+            assert_eq!(reply.refused.as_deref(), Some("hooks_too_old"), "{what}");
+            assert!(reply.messages.is_none(), "{what}");
+            peer.close().await;
+            assert!(
+                hub.lock()
+                    .receipts
+                    .gens
+                    .get(&("p".to_string(), "a".to_string()))
+                    .and_then(|generation| generation.model.delivery(id.as_str()))
+                    .is_none_or(|delivery| delivery.attempts.is_empty()),
+                "{what}: nothing issued"
+            );
+            assert_eq!(
+                state_of(&hub, "p", id.as_str()),
+                StateName::Queued,
+                "{what}"
+            );
+            assert_eq!(
+                integration_notice(&hub).0,
+                (consumer != Cli).then_some(IntegrationNotice::HooksTooOld),
+                "{what}"
+            );
+        }
+    }
+}
+
+/// Scenario: A model-run `inbox fetch` is issued a task, writes it, publishes its committed receipt and dies before it can tell the deck, its connection closing. The deck's clock finds the receipt and settles the task: a receipt published after its connection is gone still counts.
+#[spec("inbox/boundary/050")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_050_a_fetch_that_dies_after_publishing_its_receipt_is_settled_late() {
+    let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_secs(60));
+    let id = hub
+        .post_direct(Recipient::bound("p", "a"), content("late receipt"))
+        .unwrap();
+    let mut fetch = open_hook_as(
+        &hub,
+        InboxComponent::CodexHooks,
+        crate::event::InboxFetchConsumer::Cli,
+        None,
+        Some(HOOK_INTEGRATION),
+    );
+    let batch = fetch.next().await.messages.expect("a batch");
+    assert_eq!(batch.len(), 1);
+    assert!(batch[0].text.contains(" delivery 1.1 from "));
+    publish_receipt(
+        &hub,
+        "p",
+        "a",
+        &batch[0],
+        crate::inbox_receipt::RecordStage::Committed,
+    );
+    fetch.close().await;
+    until("the clock to settle it from its receipt", || {
+        hub.tick();
+        state_of(&hub, "p", id.as_str()) == StateName::Acknowledged
+    })
+    .await;
+}
+
+/// Scenario: Codex hooks and model-run fetches are hook receivers. Two Codex hooks racing for one task: one is issued it and the other nothing. A task posted while a hook holds its batch is not pushed to it. A Pi stream's task is never handed to a fetch beside it. Empty fetches leave no receiver record, and a holding hook and fetch live side by side, never counted as armed waiters.
+#[spec("inbox/boundary/053")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_053_hook_receivers_are_request_bound_and_take_no_held_mail() {
+    use crate::event::InboxFetchConsumer::{Cli, DoorbellHook, TurnEndHook};
+    let key: AgentKey = ("p".into(), "a".into());
+    let receivers = |hub: &InboxHub| {
+        hub.lock()
+            .receipts
+            .gens
+            .get(&key)
+            .map_or(0, |generation| generation.model.receivers_held())
+    };
+    let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_secs(60));
+    // Empty registrations leave nothing behind.
+    for consumer in [DoorbellHook, TurnEndHook, Cli] {
+        let mut peer = open_hook_as(
+            &hub,
+            InboxComponent::CodexHooks,
+            consumer,
+            None,
+            Some(HOOK_INTEGRATION),
+        );
+        assert_eq!(peer.next().await.messages.map(|m| m.len()), Some(0));
+        peer.close().await;
+    }
+    assert_eq!(
+        receivers(&hub),
+        0,
+        "no receiver record outlives an empty fetch"
+    );
+    // Two hooks race for one task.
+    let id = hub
+        .post_direct(Recipient::bound("p", "a"), content("one task"))
+        .unwrap();
+    let mut first = open_hook_as(
+        &hub,
+        InboxComponent::CodexHooks,
+        TurnEndHook,
+        None,
+        Some(HOOK_INTEGRATION),
+    );
+    let mut second = open_hook_as(
+        &hub,
+        InboxComponent::CodexHooks,
+        Cli,
+        None,
+        Some(HOOK_INTEGRATION),
+    );
+    let (a, b) = (first.next().await, second.next().await);
+    let counts = (
+        a.messages.as_ref().map_or(0, Vec::len),
+        b.messages.as_ref().map_or(0, Vec::len),
+    );
+    assert!(counts == (1, 0) || counts == (0, 1), "{counts:?}");
+    let (mut holder, held) = if counts.0 == 1 {
+        second.close().await;
+        (first, a.messages.unwrap().remove(0))
+    } else {
+        first.close().await;
+        (second, b.messages.unwrap().remove(0))
+    };
+    assert_eq!(held.id, id.as_str());
+    // A task posted while it holds its batch is not pushed to it; a fetch
+    // beside it takes that one, and the two live at once.
+    let later = hub
+        .post_direct(
+            Recipient::bound("p", "a"),
+            content("posted during the print"),
+        )
+        .unwrap();
+    for _ in 0..5 {
+        hub.tick();
+        if let Ok(reply) = tokio::time::timeout(Duration::from_millis(30), holder.next()).await {
+            assert!(
+                reply.messages.is_none(),
+                "nothing is pushed to a hook: {reply:?}"
+            );
+        }
+    }
+    let mut beside = open_hook_as(
+        &hub,
+        InboxComponent::CodexHooks,
+        Cli,
+        None,
+        Some(HOOK_INTEGRATION),
+    );
+    let taken = beside.next().await.messages.expect("a batch");
+    assert_eq!(
+        taken.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+        vec![later.as_str()],
+        "it takes only what no receiver holds"
+    );
+    assert_eq!(hub.armed("p", "a"), 0, "no hook is an armed waiter");
+    assert_eq!(hub.doorbell_facts("p", "a").armed, 0);
+    for (peer, delivery) in [(&mut holder, &held), (&mut beside, &taken[0])] {
+        publish_receipt(
+            &hub,
+            "p",
+            "a",
+            delivery,
+            crate::inbox_receipt::RecordStage::Committed,
+        );
+        peer.send(serde_json::json!({"committed": [at(delivery)]}))
+            .await;
+    }
+    holder.close().await;
+    beside.close().await;
+    until("both to settle", || {
+        state_of(&hub, "p", id.as_str()) == StateName::Acknowledged
+            && state_of(&hub, "p", later.as_str()) == StateName::Acknowledged
+    })
+    .await;
+    assert_eq!(receivers(&hub), 0, "closed hooks are pruned");
+
+    // Beside a Pi stream, a fetch never takes the stream's task.
+    let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_secs(60));
+    let mut pi = Peer::open(&hub, "p", "a", InboxComponent::PiExtension, INTEGRATION).await;
+    pi.next().await;
+    let task = hub
+        .post_direct(Recipient::bound("p", "a"), content("the stream's"))
+        .unwrap();
+    let pushed = pi.handout().await;
+    assert_eq!(pushed[0].id, task.as_str());
+    let mut fetch = open_hook_as(
+        &hub,
+        InboxComponent::Other,
+        Cli,
+        None,
+        Some(HOOK_INTEGRATION),
+    );
+    assert_eq!(
+        fetch.next().await.messages.map(|m| m.len()),
+        Some(0),
+        "the stream's task is not diverted"
+    );
+    fetch.close().await;
+    pi.close().await;
 }
 
 /// Hold every caps-file write until the test lets it go: the returned
@@ -4959,4 +5372,471 @@ async fn boundary_064_a_failed_removal_is_tried_again_on_the_next_tick() {
         CapsLookup::Found(_)
     ));
     waiter.close().await;
+}
+
+/// The refusal code `pane`/`a`'s card names now.
+fn refusal_of(hub: &InboxHub, pane: &str) -> Option<String> {
+    hub.summary(pane, "a").notices.admission_refused
+}
+
+/// Scenario: The deck refuses a worker's own request for its messages: its card says nothing until a task delegated to it waits, then names the refusal, a client and the task's orchestrator are told, and an admitted request clears it. Each new refusal episode tells that orchestrator once, naming the task and the cause, never an orchestrator in the worker's own pane. The worker's exit clears the notice, and a refusal for a generation that no longer holds its pane is ignored.
+#[spec("inbox/boundary/065")]
+#[test]
+fn boundary_065_a_refused_request_marks_its_own_card_while_mail_waits() {
+    let hub = hub_with(Duration::from_secs(30), Duration::from_secs(60));
+    let (tx, mut rx) = broadcast::channel(256);
+    hub.set_broadcast(tx);
+    hub.admission_refused("p", "a", "inbox_peer_unidentified");
+    assert_eq!(refusal_of(&hub, "p"), None, "nothing waits for it");
+
+    let first = delegate_to(&hub, "p", "first task");
+    assert_eq!(
+        refusal_of(&hub, "p").as_deref(),
+        Some("inbox_peer_unidentified"),
+        "a task now waits"
+    );
+    let mut told = false;
+    while let Ok(message) = rx.try_recv() {
+        if let BroadcastMsg::Inbox(notice) = message
+            && notice.attention_update
+            && notice.notices.admission_refused.as_deref() == Some("inbox_peer_unidentified")
+        {
+            told = true;
+        }
+    }
+    assert!(told, "clients are told the card's notice");
+    assert_eq!(
+        orchestrator_notices(&hub).len(),
+        1,
+        "a task delegated into the open episode tells its orchestrator (inbox/boundary/066)"
+    );
+
+    hub.admission_admitted("p", "a");
+    assert_eq!(refusal_of(&hub, "p"), None, "an admitted request clears it");
+
+    for _ in 0..3 {
+        hub.admission_refused("p", "a", "inbox_nested_agent");
+    }
+    assert_eq!(refusal_of(&hub, "p").as_deref(), Some("inbox_nested_agent"));
+    let notices = orchestrator_notices(&hub);
+    assert_eq!(notices.len(), 2, "one notice per episode: {notices:?}");
+    let (subject, text) = &notices[1];
+    assert_eq!(subject, ADMISSION_REFUSED_SUBJECT);
+    assert!(text.contains(first.as_str()), "names the task: {text}");
+    assert!(
+        text.contains(crate::inbox_display::ADMISSION_CAUSE_NESTED),
+        "names the cause: {text}"
+    );
+
+    // An orchestrator in the refused worker's own pane is that agent itself.
+    hub.post_delegate(
+        Recipient::bound("q", "a"),
+        "self",
+        Some(Recipient::bound("q", "a")),
+        DelegateLedger::default(),
+        content("to itself"),
+        &|| true,
+    )
+    .unwrap();
+    hub.admission_refused("q", "a", "inbox_other_user");
+    assert_eq!(refusal_of(&hub, "q").as_deref(), Some("inbox_other_user"));
+    hub.post_owed_notices();
+    assert!(
+        hub.list_with_bodies(Some("q"))
+            .iter()
+            .all(|m| m.subject != ADMISSION_REFUSED_SUBJECT),
+        "no notice to the refused agent itself"
+    );
+
+    hub.agent_exited("p", "a");
+    assert!(
+        !hub.lock()
+            .admission_refused
+            .contains_key(&("p".into(), "a".into()))
+    );
+
+    hub.set_live_agent_check(Arc::new(|pane: &str, _: &str| pane != "gone"));
+    hub.admission_refused("gone", "a", "inbox_other_user");
+    assert!(
+        !hub.lock()
+            .admission_refused
+            .contains_key(&("gone".into(), "a".into())),
+        "a generation no longer in its pane records nothing"
+    );
+}
+
+/// The refusal notices posted to orchestrator pane `pane` so far.
+fn refusal_notices(hub: &InboxHub, pane: &str) -> Vec<String> {
+    hub.post_owed_notices();
+    hub.list_with_bodies(Some(pane))
+        .into_iter()
+        .filter(|m| m.subject == ADMISSION_REFUSED_SUBJECT)
+        .map(|m| m.text.clone().unwrap_or_default())
+        .collect()
+}
+
+/// Scenario: The deck refuses a worker's own request for its messages before anything is delegated to it, then an orchestrator delegates a task to it and is told once, naming the task and the cause, however often the refusal repeats or it delegates again. A second orchestrator delegating into the same refusal is told once too. Once a request is admitted, a new refusal tells the orchestrator whose task waits then, once.
+#[spec("inbox/boundary/066")]
+#[test]
+fn boundary_066_an_open_refusal_tells_each_orchestrator_that_delegates_into_it_once() {
+    let hub = hub_with(Duration::from_secs(30), Duration::from_secs(60));
+    hub.admission_refused("p", "a", "inbox_peer_unidentified");
+    assert!(
+        refusal_notices(&hub, "o").is_empty(),
+        "nothing delegated yet"
+    );
+
+    let first = delegate_to(&hub, "p", "first task");
+    let told = refusal_notices(&hub, "o");
+    assert_eq!(
+        told.len(),
+        1,
+        "the orchestrator is told when its task starts waiting: {told:?}"
+    );
+    assert!(told[0].contains(first.as_str()), "names the task: {told:?}");
+    assert!(
+        told[0].contains(crate::inbox_display::ADMISSION_CAUSE_UNIDENTIFIED),
+        "names the cause: {told:?}"
+    );
+    for _ in 0..3 {
+        hub.admission_refused("p", "a", "inbox_peer_unidentified");
+    }
+    delegate_to(&hub, "p", "second task");
+    hub.admission_refused("p", "a", "inbox_peer_unidentified");
+    assert_eq!(
+        refusal_notices(&hub, "o").len(),
+        1,
+        "once in the episode, however often it repeats or the orchestrator delegates again"
+    );
+
+    let third = hub
+        .post_delegate(
+            Recipient::bound("p", "a"),
+            "reviewer",
+            Some(Recipient::bound("o2", "ob")),
+            DelegateLedger::default(),
+            content("third task"),
+            &|| true,
+        )
+        .unwrap()
+        .0;
+    hub.admission_refused("p", "a", "inbox_peer_unidentified");
+    let other = refusal_notices(&hub, "o2");
+    assert_eq!(
+        other.len(),
+        1,
+        "the second orchestrator is told once: {other:?}"
+    );
+    assert!(other[0].contains(third.as_str()), "{other:?}");
+    assert_eq!(refusal_notices(&hub, "o").len(), 1);
+
+    hub.admission_admitted("p", "a");
+    hub.admission_refused("p", "a", "inbox_other_user");
+    hub.admission_refused("p", "a", "inbox_other_user");
+    assert_eq!(
+        refusal_notices(&hub, "o2").len(),
+        2,
+        "a new episode tells the orchestrator whose task waits, once"
+    );
+    assert_eq!(
+        refusal_notices(&hub, "o").len(),
+        1,
+        "its own task was superseded"
+    );
+}
+
+/// PRD #1666 part 3 (H4): a task headed `edge` whose body is `body`.
+fn edge_content(body: &str) -> Content {
+    Content {
+        subject: "edge".to_string(),
+        body: body.to_string(),
+        ..content("")
+    }
+}
+
+/// Codex's prompt hook's and its `Stop`'s hand-overs: each envelope, the
+/// consumer it fetches as, and the room it asks the deck for, as the hook
+/// itself computes it.
+fn codex_hand_overs() -> Vec<(
+    crate::inbox_prompt::Envelope,
+    crate::event::InboxFetchConsumer,
+    usize,
+)> {
+    use crate::event::InboxFetchConsumer::{DoorbellHook, TurnEndHook};
+    use crate::inbox_prompt::{Envelope, HookHandOver, one_shot_request};
+    let prompt = Envelope::Context {
+        hook_event_name: "UserPromptSubmit".to_string(),
+    };
+    [(prompt, DoorbellHook), (Envelope::Block, TurnEndHook)]
+        .into_iter()
+        .map(|(envelope, consumer)| {
+            let request = one_shot_request(
+                &HookHandOver {
+                    component: InboxComponent::CodexHooks,
+                    consumer,
+                    rung: None,
+                    envelope: &envelope,
+                    framing: AGENT_FRAMING,
+                },
+                "p".to_string(),
+                Some("a".to_string()),
+                "t".to_string(),
+            );
+            let room = request.max_json_bytes.expect("Codex's hooks count JSON");
+            (envelope, consumer, room)
+        })
+        .collect()
+}
+
+/// What a Codex hook fetching as `consumer` within `room` JSON bytes is handed
+/// of `c`, posted alone to `p`/`a`.
+async fn codex_fetch(
+    consumer: crate::event::InboxFetchConsumer,
+    room: usize,
+    c: Content,
+) -> Vec<crate::event::InboxDelivery> {
+    let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_secs(60));
+    hub.post_direct(Recipient::bound("p", "a"), c).unwrap();
+    let mut hook = open_hook_within(
+        &hub,
+        InboxComponent::CodexHooks,
+        consumer,
+        None,
+        Some(HOOK_INTEGRATION),
+        Some(InboxBudget::JsonBytes(room)),
+    );
+    let batch = hook.next().await.messages.expect("a batch");
+    hook.close().await;
+    batch
+}
+
+/// The line a Codex hook prints for `batch` in `envelope`, every block
+/// written.
+#[cfg(unix)]
+fn codex_line(
+    envelope: &crate::inbox_prompt::Envelope,
+    batch: Vec<crate::event::InboxDelivery>,
+) -> String {
+    let batch = crate::inbox_oneshot::OneShotBatch::new(batch);
+    let texts: Vec<&str> = (0..batch.len())
+        .map(|i| batch.text(i).unwrap_or_default())
+        .collect();
+    let parts = envelope.parts(AGENT_FRAMING, &texts);
+    let mut out = Vec::new();
+    let hand = batch.hand_over(&mut out, &parts.pieces(), |_| Ok(()));
+    assert!(hand.error.is_none());
+    String::from_utf8(out).unwrap()
+}
+
+/// Scenario: For Codex's prompt hook and its `Stop`, a task is posted whose block, with its attempt opener, measures exactly the room the hook asks the deck for, and tasks a few bytes either side of it. Each is fetched within that room and printed in the hook's JSON with its framing: every line, the separator before the block and the newline included, is at most Codex's 6000 bytes.
+#[cfg(unix)]
+#[spec("inbox/boundary/068")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_068_codexs_whole_line_stays_within_its_bytes_at_the_edge() {
+    let limit = InboxComponent::CodexHooks.inline_budget().limit();
+    for (envelope, consumer, room) in codex_hand_overs() {
+        let probe = codex_fetch(consumer, room, edge_content("x")).await;
+        let structure = crate::event::json_escaped_len(&probe[0].text) - 1;
+        let exact = room - structure;
+        for n in exact - 4..=exact + 4 {
+            let batch = codex_fetch(consumer, room, edge_content(&"x".repeat(n))).await;
+            let line = codex_line(&envelope, batch);
+            assert!(
+                line.len() <= limit,
+                "{consumer:?}, a body of {n} (exactly the room at {exact}): {} bytes",
+                line.len()
+            );
+        }
+    }
+}
+
+/// Scenario: Tasks whose bodies are heavy in quotes, backslashes or control characters, short enough in plain bytes to fit Codex's byte budget but not once JSON-escaped, go through the deck's full-body check. Each is saved to a file, and fetched by Codex's prompt hook or its `Stop` within the room each asks for, its block is either whole or names that file, never only how much did not fit. The longest quote-heavy body the check does not save renders whole in both hooks' room, even as a marked repeat with the longest attempt opener.
+#[cfg(unix)]
+#[spec("inbox/boundary/069")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_069_a_body_codexs_json_would_cut_is_saved_and_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let raw_room = InboxComponent::CodexHooks.inline_budget().limit() - AGENT_FRAMING.len();
+    for (what, unit, n) in [
+        ("quotes", "\"", 3_000),
+        ("backslashes", "\\", 3_000),
+        ("control characters", "\u{1}", 1_000),
+        ("a mix", "\"\\\u{1}\t", 600),
+    ] {
+        let body = format!("{}\nFINAL STEP: write the sentinel", unit.repeat(n));
+        assert!(body.len() < raw_room, "{what} fits in plain bytes");
+        let mut c = edge_content(&body);
+        assert!(body_needs_saving(&deck(), "p", &c), "{what}");
+        retain_full_body(&deck(), "p", &mut c, &[dir.path().to_path_buf()]).unwrap();
+        let path = c.spill_path.clone().expect("saved to a file");
+        for (_, consumer, room) in codex_hand_overs() {
+            let batch = codex_fetch(consumer, room, c.clone()).await;
+            let text = &batch[0].text;
+            assert!(
+                !text.contains("did not fit"),
+                "{what}, {consumer:?}: {text}"
+            );
+            assert!(
+                text.contains(&body) || text.contains(&path.display().to_string()),
+                "{what}, {consumer:?}: neither whole nor naming its file"
+            );
+        }
+    }
+
+    let saved = |n: usize| body_needs_saving(&deck(), "p", &edge_content(&"\"".repeat(n)));
+    let (mut kept, mut cut) = (0, 6_000);
+    assert!(!saved(kept) && saved(cut));
+    while cut - kept > 1 {
+        let mid = (kept + cut) / 2;
+        if saved(mid) {
+            cut = mid;
+        } else {
+            kept = mid;
+        }
+    }
+    let (hub, _state) = hub_with_spool(Duration::from_secs(30), Duration::from_secs(60));
+    let id = hub
+        .post_direct(Recipient::bound("p", "a"), edge_content(&"\"".repeat(kept)))
+        .unwrap();
+    let message = hub.lock().inbox.get(id.as_str(), "p").cloned().unwrap();
+    for (_, consumer, room) in codex_hand_overs() {
+        let block = render_marked(
+            &message,
+            Some(InboxBudget::JsonBytes(room).less(BLOCK_SEPARATOR)),
+            true,
+            Some((u32::MAX, u32::MAX)),
+        );
+        assert!(
+            block.text.contains(message.body.as_ref()),
+            "{consumer:?}: the longest unsaved body ({kept}) was cut"
+        );
+    }
+}
+
+/// Scenario: A message the deck never handed out — a direct task still queued, and a job offered to this agent that it has not been handed — is acknowledged with `ack <id>`. Each answer is unknown and nothing changes: the task stays queued with no hand-over counted and the offer stays assigned, not claimed. A task a receipt stream was handed is acknowledged, a second ack says it already was, another agent's ack is the wrong agent's, and a message that became undeliverable says so.
+#[spec("inbox/boundary/071")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_071_an_ack_of_a_message_never_handed_out_changes_nothing() {
+    let hub = hub_with(Duration::from_secs(30), Duration::from_secs(30));
+    let queued = hub
+        .post_direct(Recipient::bound("p", "a"), content("never handed out"))
+        .unwrap();
+    assert_eq!(
+        hub.ack(queued.as_str(), "p", "a", AckHow::Explicit),
+        AckOutcome::Unknown
+    );
+    let listed = |id: &MessageId| {
+        hub.list("p")
+            .into_iter()
+            .find(|m| m.id == *id)
+            .expect("the message is listed")
+    };
+    assert_eq!(listed(&queued).state, StateName::Queued);
+    assert_eq!(listed(&queued).deliveries, 0);
+    let offer = offer_to(
+        &hub,
+        "a job never handed out",
+        &[(Recipient::bound("p", "a"), "worker".to_string())],
+    );
+    assert_eq!(
+        hub.ack(offer.as_str(), "p", "a", AckHow::Explicit),
+        AckOutcome::Unknown
+    );
+    assert_eq!(listed(&offer).state, StateName::Queued);
+    // Controls: a hand-out is acknowledged once, and only by its agent.
+    let mut peer = Peer::open(&hub, "p", "a", InboxComponent::OpenCodePlugin, INTEGRATION).await;
+    assert!(peer.next().await.registered.is_some());
+    let handed = hub
+        .post_direct(Recipient::bound("p", "a"), content("handed out"))
+        .unwrap();
+    let mut ids = Vec::new();
+    while !ids.contains(&handed.as_str().to_string()) {
+        ids.extend(peer.handout().await.into_iter().map(|d| d.id));
+    }
+    assert_eq!(
+        hub.ack(handed.as_str(), "p", "b", AckHow::Explicit),
+        AckOutcome::WrongAgent
+    );
+    assert_eq!(
+        hub.ack(handed.as_str(), "p", "a", AckHow::Explicit),
+        AckOutcome::Acknowledged
+    );
+    assert_eq!(
+        hub.ack(handed.as_str(), "p", "a", AckHow::Explicit),
+        AckOutcome::AlreadyAcknowledged
+    );
+    let gone = hub
+        .post_direct(
+            Recipient::bound("p", "x"),
+            content("for an agent that left"),
+        )
+        .unwrap();
+    hub.agent_exited("p", "x");
+    assert_eq!(
+        hub.ack(gone.as_str(), "p", "x", AckHow::Explicit),
+        AckOutcome::Undeliverable
+    );
+    peer.close().await;
+}
+
+/// Scenario: Codex's, Devin's and an unknown component's once wait — which only a dot-agent-deck from before their hooks moved onto receipts sends — arms for an agent with a task waiting. Each is refused `unsupported` before anything arms: no waiter is counted, the task stays queued with no hand-over counted, and no attempt is issued for it.
+#[spec("inbox/boundary/072")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_072_a_once_wait_from_a_hook_component_is_refused() {
+    for component in [
+        InboxComponent::CodexHooks,
+        InboxComponent::DevinHooks,
+        InboxComponent::Other,
+    ] {
+        let hub = hub_with(Duration::from_secs(30), Duration::from_secs(30));
+        let id = hub
+            .post_direct(Recipient::bound("p", "a"), content("waiting"))
+            .unwrap();
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let (read, write) = tokio::io::split(server);
+        let serve = tokio::spawn(serve_waiter(
+            Arc::clone(&hub),
+            "p".to_string(),
+            "a".to_string(),
+            InboxWaitMode::Once,
+            component,
+            None,
+            ReceiptArm::default(),
+            BufReader::new(read),
+            write,
+            |_: &str| {},
+        ));
+        let mut lines = BufReader::new(client).lines();
+        let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("an answer in time")
+            .unwrap()
+            .expect("a line");
+        let reply: InboxWaitReply = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            reply.refused.as_deref(),
+            Some("unsupported"),
+            "{component:?}"
+        );
+        assert!(reply.messages.is_none(), "{component:?}");
+        tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .expect("the refusal ends the connection")
+            .unwrap();
+        assert_eq!(hub.armed("p", "a"), 0, "{component:?}");
+        let listed = hub.list("p").into_iter().find(|m| m.id == id).unwrap();
+        assert_eq!(
+            (listed.state, listed.deliveries),
+            (StateName::Queued, 0),
+            "{component:?}"
+        );
+        assert!(
+            hub.lock()
+                .receipts
+                .gens
+                .get(&("p".to_string(), "a".to_string()))
+                .is_none_or(|generation| generation.model.delivery(id.as_str()).is_none()),
+            "{component:?}: no attempt is issued"
+        );
+    }
 }

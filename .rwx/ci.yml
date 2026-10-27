@@ -213,6 +213,8 @@ tasks:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_INCREMENTAL: "0"
     run: |
+      # pi-extension/'s typecheck (issue #1708), as in ci.yml's `test` job.
+      (cd pi-extension && npm ci --ignore-scripts && npm run typecheck)
       cargo test-fast
       # Keep only the dependencies in the tool cache, as Swatinem/rust-cache
       # does on GitHub: the workspace crates rebuild every run anyway (fresh
@@ -347,7 +349,8 @@ tasks:
   - key: desktop-driver
     if: ${{ tasks.backend.values.rust == 'true' }}
     use: [system-packages, code, rust, pnpm]
-    tool-cache: ci-desktop-driver-v1
+    # v2: v1's cache held a deleted /etc/ssh/sshd_config, which fails openssh-server's postinst.
+    tool-cache: ci-desktop-driver-v2
     timeout: 30m
     env:
       TAURI_DRIVER_VERSION: 2.0.6
@@ -355,7 +358,12 @@ tasks:
     run: |
       sudo apt-get update
       # openssh-server and libnss-wrapper: fleet_001's far deck (issue #1356).
-      sudo apt-get install -y webkit2gtk-driver xvfb xclip xdotool openssh-server libnss-wrapper
+      # UCF_FORCE_CONFFMISS: a restored ci-desktop-driver-v1 tool cache can
+      # carry ucf's record of /etc/ssh/sshd_config without the file itself,
+      # and ucf then refuses to recreate the "deleted" file, which fails
+      # openssh-server's postinst (PR #1915's run 01a173dc7cf1, and three
+      # others on 2026-10-25). This makes ucf write it, as a clean install does.
+      sudo env UCF_FORCE_CONFFMISS=1 apt-get install -y webkit2gtk-driver xvfb xclip xdotool openssh-server libnss-wrapper
       cargo install tauri-driver --locked --version "$TAURI_DRIVER_VERSION"
       # `cargo install` puts it in Cargo's bin dir, which is not on PATH here.
       export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
@@ -387,6 +395,26 @@ tasks:
     run: |
       cargo install cargo-audit --locked
       cargo audit
+
+  # `security` skips the crates under vendor/, which have no registry source in
+  # Cargo.lock; this audits their upstream releases. The script has why, and
+  # what it does not check.
+  - key: security-vendored-upstream
+    if: ${{ tasks.backend.values.rust == 'true' }}
+    use: [code, rust]
+    tool-cache: ci-security-vendored-upstream-v1
+    run: |
+      cargo install cargo-audit --locked
+      scripts/audit-vendored-upstream.sh
+
+  # The patched crossterm's own test (vendor/crossterm/VENDORED.md), which
+  # `test` does not run: the crate is outside the workspace. `--locked` to the
+  # crate's own Cargo.lock, which pins the dev-dependencies the deck's lock
+  # does not carry.
+  - key: vendored-crossterm-test
+    if: ${{ tasks.backend.values.rust == 'true' }}
+    use: [code, rust]
+    run: cargo test --locked --manifest-path vendor/crossterm/Cargo.toml --lib event::source::unix::mio::tests
 
   # Nix, single-user: a task has no init system for the daemon.
   - key: nix-install

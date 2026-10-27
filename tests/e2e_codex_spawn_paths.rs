@@ -193,7 +193,12 @@ fn spawn_012_real_script_launched_codex_badges_before_first_prompt() {
         .and_then(|path| {
             std::env::split_paths(&path)
                 .map(|dir| dir.join("codex"))
-                .find(|candidate| candidate.is_file())
+                // Not the deck's telemetry shim, which a deck pane's `PATH`
+                // can carry ahead of the real Codex: this test launches the
+                // real program by absolute path, not the developer's shim.
+                .find(|candidate| {
+                    candidate.is_file() && !dot_agent_deck::telemetry::shim::is_shim_file(candidate)
+                })
         })
         .expect("available Codex binary resolves on PATH");
     let deck = TuiDeck::builder()

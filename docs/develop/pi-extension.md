@@ -89,7 +89,7 @@ The extension runs the deck's generated receiver (`src/inbox-receiver.js`), one 
 
 The gate and the doorbell each re-check, synchronously before they return, that the content may still pass: that is the fence described in [Agent messaging](agent-messaging.md#pi-one-receiver-per-process). The gate never returns undefined for our tag, which Pi would pass on to the model; everything it does not pass, it consumes. The receiver is handed only an absolute deck binary (`isAbsoluteOverride`), so `resolveDeckBin`'s bare-name fallback for an older deck never starts a watcher.
 
-What the extension no longer does: it sends no `hold`, `nack` or stdin acknowledgement, does not confirm acknowledgements with `dot-agent-deck ack --json`, does not re-send a hand-over that passed a gate (only the daemon repeats one, marked, through a new attempt; a submission no gate saw before a `/new`, resume or fork is submitted again to the successor), and does not call `get-seed`, which the daemon refuses for a Pi generation. A seed is the pane's first inbox message and arrives like any other.
+What the extension no longer does: it sends no `hold`, `nack` or stdin acknowledgement, does not confirm acknowledgements with `dot-agent-deck ack --json`, does not re-send a hand-over that passed a gate (only the daemon repeats one, marked, through a new attempt; a submission no gate saw before a `/new`, resume or fork is submitted again to the successor), and does not call `get-seed`, which the daemon withdrew for every caller (PRD #1666 part 3, H5). A seed is the pane's first inbox message and arrives like any other.
 
 ### Pi behaviour the receipt path relies on
 

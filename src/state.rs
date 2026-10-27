@@ -12,7 +12,7 @@ pub use crate::event::BackgroundWork;
 use crate::event::{
     AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal, EventType,
     GenerationVerdict, LiveTarget, OrchestrationSurface, OrchestrationSurfaceRole,
-    RestartRoleSignal, SpawnRoleSignal, WorkDoneSignal, Writable,
+    RestartRoleSignal, SpawnRoleSignal, Writable,
 };
 use crate::project_config::{
     DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES, OrchestrationRoleConfig, ProjectConfig,
@@ -384,6 +384,64 @@ struct UnprovenSession {
     /// reach this accounting with a journal already on it.
     journal_bytes: Option<usize>,
 }
+
+/// Issue #1800: add `record`, the deck's listing of an orchestration role on
+/// `pane_id`, to the surface in `surfaces` for its orchestration, opening one
+/// when it is that orchestration's first role — grouped by orchestration id and
+/// name, as the startup hydration partitions a listing into tabs. A membership
+/// with no orchestration id, or no cwd to build the tab in, adds nothing.
+fn add_listed_role_to_surface(
+    surfaces: &mut Vec<OrchestrationSurface>,
+    record: &crate::agent_pty::AgentRecord,
+    pane_id: &str,
+) {
+    let Some(crate::agent_pty::TabMembership::Orchestration {
+        name,
+        role_index,
+        role_name,
+        is_start_role,
+        orchestration_cwd,
+        display_title,
+        orchestration_id: Some(orchestration_id),
+    }) = &record.tab_membership
+    else {
+        return;
+    };
+    let Some(cwd) = orchestration_cwd.as_ref().or(record.cwd.as_ref()) else {
+        return;
+    };
+    let index = match surfaces.iter().position(|surface| {
+        surface.orchestration_id.as_deref() == Some(orchestration_id.as_str())
+            && surface.name == *name
+    }) {
+        Some(index) => index,
+        None => {
+            surfaces.push(OrchestrationSurface {
+                name: name.clone(),
+                cwd: cwd.clone(),
+                display_title: None,
+                orchestration_id: Some(orchestration_id.clone()),
+                roles: Vec::new(),
+                context_path: None,
+            });
+            surfaces.len() - 1
+        }
+    };
+    let surface = &mut surfaces[index];
+    if surface.display_title.is_none() {
+        surface.display_title = display_title.clone();
+    }
+    if surface.context_path.is_none() {
+        surface.context_path = record.orchestrator_context_path.clone();
+    }
+    surface.roles.push(OrchestrationSurfaceRole {
+        pane_id: pane_id.to_string(),
+        role_index: *role_index,
+        role_name: role_name.clone(),
+        is_start_role: *is_start_role,
+    });
+}
+
 /// The session key a pane's PLACEHOLDER card is filed under — the one
 /// [`AppState::insert_placeholder_session`] mints.
 ///
@@ -2380,14 +2438,30 @@ pub(crate) fn assert_inline_allowlist_agrees_with_explanation(text: &str, surfac
 /// adjacent to the primary instruction, because a worker that cannot write a
 /// file has to resolve it from this text alone. The shell forms stay deleted:
 /// the fallback is inline `--task`, never a heredoc.
-fn work_done_footer(role: &str) -> String {
+///
+/// PRD #1666 part 3, round 5 (plan D1, D10): with `task_id`, both commands
+/// name the task, and the footer says a report without it completes nothing.
+/// The id is a deck-minted message id, so it is safe on a command line.
+fn work_done_footer(role: &str, task_id: Option<&str>) -> String {
     let slug = role_path_slug(role);
     let bin = crate::platform::paths::binary_name();
+    let (task_arg, task_sentence) = match task_id {
+        Some(id) => (
+            format!(" --task-id {id}"),
+            format!(
+                "This task's id is `{id}`. Pass it with `--task-id` as shown, so the deck marks \
+                 this task complete: a work-done without it is delivered to your orchestrator as a \
+                 note that completes no task.\n\n"
+            ),
+        ),
+        None => (String::new(), String::new()),
+    };
     format!(
         "## When done\n\n\
+         {task_sentence}\
          Signal completion by running this command via Bash:\n\n\
          ```bash\n\
-         {bin} work-done --task-file '.dot-agent-deck/report-{slug}-<summary-slug>.md'\n\
+         {bin} work-done{task_arg} --task-file '.dot-agent-deck/report-{slug}-<summary-slug>.md'\n\
          ```\n\n\
          Write that report with your **file-writing tool**. Do not construct it with shell \
          redirection or a heredoc: a line of your own text can terminate the heredoc, and \
@@ -2407,7 +2481,7 @@ fn work_done_footer(role: &str) -> String {
          that is **a single line of plain text with no backticks, no `$`, no `\"`, no `\\` and no \
          `!`**:\n\n\
          ```bash\n\
-         {bin} work-done --task \"Brief summary of what you accomplished. Include file paths and outcomes.\"\n\
+         {bin} work-done{task_arg} --task \"Brief summary of what you accomplished. Include file paths and outcomes.\"\n\
          ```\n\n\
          Anything outside that allowlist is rewritten by your own shell before the deck \
          sees it: backticks and `$(…)` are executed and replaced by their output (usually empty), \
@@ -3197,282 +3271,9 @@ enum WorkDoneReportChannel {
     /// Solicited completion whose report never reached disk — no cwd recorded,
     /// the directory could not be created, or the write failed (issue #433).
     Unfiled,
-    /// The deck holds no outstanding delegation this completion could be
-    /// answering (issue #448). The canonical file is deliberately left untouched.
-    /// That is a fact about the deck's record, not about who tasked the worker
-    /// (issue #505) — see [`compose_work_done_message`].
-    Unsolicited,
-}
-
-/// PRD #220 M2.1: a dispatched unit has reached TERMINAL completion — resolve
-/// the caller that dispatched it and post the report to that caller's inbox.
-///
-/// Returns whether `signal.pane_id` was a dispatched unit's terminal pane at all,
-/// so the caller can tell "handled here" from "fall through to the ordinary
-/// path". It is `false` for every pane in a deck where nothing was dispatched,
-/// which is what leaves the rest of `handle_work_done` untouched.
-///
-/// Three properties this leans on rather than re-implements:
-///
-/// * **Addressing.** The recipient is the retained `(pane_id, agent_id)` pair, never a
-///   `(name, cwd)` tuple lookup — that tuple can never match, because a dispatched unit
-///   lives in a sibling worktree by construction, which is precisely why the return edge
-///   needed retention rather than a lookup.
-/// * **Identity.** Delivery is [`PendingDispatchReturn::deliver`], an inbox post bound to
-///   the retained caller generation, the binding the spawn acknowledgement's post uses
-///   too, so a caller pane that changed hands between the dispatch and the completion
-///   is REFUSED (`inbox_hub::post_to_live` refuses a pane whose agent is not the bound
-///   one).
-/// * **Delivery mode.** A message the caller takes as a turn, not a passive notice (PRD
-///   #220 decision A). The caller asked for this work and is waiting on it.
-///
-/// The entry is evicted as it is resolved, whatever the delivery's outcome,
-/// because NO OUTCOME IS RETRIED (PRD #220 Phase 2 review, finding A5): a refused
-/// post is not retried because a retry could only re-target whoever now occupies
-/// the pane. A pane that is simply GONE
-/// degrades to drop-and-log (PRD #220 decision B): there is deliberately no queue
-/// and no file-backed outbox here, because an outcome with no live recipient is a
-/// deck-wide attention question that belongs with issue #630.
-///
-/// Issue #544: this half only RESOLVES the return and composes the report; the
-/// post is [`PendingDispatchReturn::deliver`], which the daemon performs after
-/// releasing its `AppState` guard. `None` is the old `false` — not a dispatched unit's terminal
-/// completion.
-async fn prepare_dispatch_completion(
-    signal: &WorkDoneSignal,
-    registry: &AgentPtyRegistry,
-) -> Option<PendingDispatchReturn> {
-    // Only a TERMINAL completion returns. A dispatched unit reporting progress
-    // without `--done` has not finished, and its caller is owed one report, not a
-    // running commentary.
-    if !signal.done {
-        return None;
-    }
-    let crate::dispatch_return::RetainedReturn {
-        unit_agent_id,
-        caller,
-    } = registry.take_dispatch_return(&signal.pane_id)?;
-    // PRD #220 Phase 2 review (finding A4): the unit name is producer-supplied and
-    // rode into this line raw. Escaped and clamped through the module that already
-    // owns that treatment — a raw newline in a field value forges a whole log line,
-    // a CR overwrites the one being written, and a bidi override reorders whatever
-    // renders it; turning the subscriber's own ANSI styling off does none of that.
-    //
-    // The two pane ids and the agent id are daemon-minted and stay bare. The
-    // REPORT BODY is deliberately absent from this line, and from the warning
-    // `PendingDispatchReturn::deliver` emits when the caller's inbox refuses — those carry pane/agent ids and the outcome only, so a report that
-    // could not be delivered is not leaked into the log instead. That silence is
-    // the auditor's reasoned negative; do not "helpfully" add the body back.
-    tracing::info!(
-        unit_pane_id = %signal.pane_id,
-        unit = %crate::config_validation::escape_field_for_log(
-            &caller.unit_name,
-            crate::config_validation::MAX_QUOTED_VALUE_CHARS,
-        ),
-        caller_pane_id = %caller.pane_id,
-        caller_agent_id = %caller.agent_id,
-        report_chars = signal.task.chars().count(),
-        "dispatch: unit complete; returning its report to the pane that dispatched it"
-    );
-    // Issue #508: a report too long to inline is saved in full into the unit's
-    // own worktree — the directory it was already coordinating through — so the
-    // caller is handed a path to the rest instead of a promise that the unit
-    // still has it. The cwd is read from the agent the dispatch actually started
-    // (PR #1341 review): a pane id is a recycled handle, so resolving it here
-    // could name a successor's worktree. A record that is already gone is a
-    // failed save, said as such.
-    let full_report = if crate::state::report_exceeds_inline_bound(&signal.task) {
-        let unit_cwd = registry
-            .agent_record_any(&unit_agent_id)
-            .and_then(|record| record.cwd);
-        save_full_report_off_runtime(unit_cwd, "dispatch".to_string(), signal.task.clone()).await
-    } else {
-        None
-    };
-    let message = crate::dispatch_return::compose_completion_message(
-        &caller.unit_name,
-        &signal.task,
-        full_report.as_deref(),
-    );
-    Some(PendingDispatchReturn {
-        pane_id: caller.pane_id,
-        agent_id: caller.agent_id,
-        message,
-    })
-}
-
-/// Issue #544: a dispatched unit's completion report, resolved and composed
-/// under the `AppState` guard and posted after it — see
-/// [`prepare_dispatch_completion`].
-struct PendingDispatchReturn {
-    pane_id: String,
-    agent_id: String,
-    message: crate::inbox::Content,
-}
-
-impl PendingDispatchReturn {
-    /// PRD #1666 S5: post the report to the caller generation's inbox, into
-    /// the room `reservation` holds (PR #1735 fifth review, N3), so neither the
-    /// caller's backlog nor a full deck refuses it; a report the inbox refuses
-    /// itself is replaced by a short notice in the same room. A refusal of
-    /// both — only a caller that has gone — stays in the daemon log, with no
-    /// report text in it.
-    fn deliver(self, registry: &AgentPtyRegistry, reservation: crate::inbox_hub::ReplyReservation) {
-        let max_body = registry.inbox().limits().max_body_bytes;
-        let from = self.message.from.clone();
-        let notice = |error: &str| crate::inbox::Content {
-            from: from.clone(),
-            subject: "dispatch completed".to_string(),
-            body: undelivered_report_notice("A unit you dispatched has completed", error, max_body),
-            body_trust: crate::inbox::BodyTrust::Trusted,
-            spill_path: None,
-            id: None,
-            preface: None,
-        };
-        match crate::inbox_hub::post_reserved_reply_or_notice_to_live(
-            registry,
-            reservation,
-            crate::inbox::Recipient::bound(&self.pane_id, &self.agent_id),
-            self.message,
-            notice,
-        ) {
-            Ok(id) => tracing::info!(
-                pane_id = %self.pane_id,
-                message_id = %id,
-                "dispatch: completion report posted to the caller's inbox"
-            ),
-            Err(error) => warn!(
-                pane_id = %self.pane_id,
-                agent_id = %self.agent_id,
-                %error,
-                "dispatch: the caller's inbox refused the completion report; nothing posted"
-            ),
-        }
-    }
-}
-
-/// How much of the inbox's refusal [`undelivered_report_notice`] repeats.
-const MAX_REPORT_REFUSAL_CHARS: usize = 300;
-
-/// PR #1735 fifth review (N3): the body of the notice posted, in a report's
-/// reserved room, when the inbox refused the report itself: `head`, then that
-/// the report could not be delivered and why, cut to `max_body` bytes so the
-/// body limit cannot refuse it too. Composed by the deck alone — none of the
-/// report's text is in it.
-fn undelivered_report_notice(head: &str, error: &str, max_body: usize) -> String {
-    let refusal: String = error.chars().take(MAX_REPORT_REFUSAL_CHARS).collect();
-    let body = format!(
-        "{head} (dot-agent-deck daemon report, not a message from a person or an agent), but \
-         dot-agent-deck could not deliver its report to you: {refusal}."
-    );
-    let mut cut = body.len().min(max_body);
-    while !body.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    body[..cut].to_string()
-}
-
-/// Issue #544: the one inbox post a `work-done` owes, computed by
-/// [`AppState::prepare_work_done`] under the `AppState` guard and performed by
-/// [`Self::deliver`] after it is released. Since PRD #1666 S5 the post waits on
-/// nothing; the split keeps the guard's hold to the computation.
-#[must_use = "a work-done's feedback is only posted by `deliver`"]
-pub struct WorkDoneDelivery(WorkDoneWrite);
-
-enum WorkDoneWrite {
-    Nothing,
-    DispatchReturn(PendingDispatchReturn),
-    Feedback {
-        orch_pane_id: String,
-        role_name: String,
-        feedback: crate::inbox::Content,
-        expected_orchestrator_agent_id: String,
-    },
-}
-
-impl WorkDoneDelivery {
-    /// The pane the post goes to, or `None` when there is nothing to post.
-    pub fn target_pane_id(&self) -> Option<&str> {
-        match &self.0 {
-            WorkDoneWrite::Nothing => None,
-            WorkDoneWrite::DispatchReturn(pending) => Some(&pending.pane_id),
-            WorkDoneWrite::Feedback { orch_pane_id, .. } => Some(orch_pane_id),
-        }
-    }
-
-    /// PRD #1666 S5: post the report to the orchestrator generation it was
-    /// routed to, if there is one. Needs no `AppState`, and waits on nothing.
-    ///
-    /// PR #1735 fifth review (N3): the report goes into the room
-    /// `reservation` held from before the `work-done` was taken on
-    /// ([`InboxHub::reserve_reply`](crate::inbox_hub::InboxHub::reserve_reply)),
-    /// so an orchestrator's full inbox, or a deck that filled meanwhile, does
-    /// not refuse a completion the worker was told was accepted. A report the
-    /// inbox refuses itself is replaced by a short notice in the same room.
-    pub async fn deliver(
-        self,
-        registry: &AgentPtyRegistry,
-        reservation: crate::inbox_hub::ReplyReservation,
-    ) {
-        let (orch_pane_id, role_name, feedback, expected_orchestrator_agent_id) = match self.0 {
-            WorkDoneWrite::Nothing => return,
-            WorkDoneWrite::DispatchReturn(pending) => {
-                return pending.deliver(registry, reservation);
-            }
-            WorkDoneWrite::Feedback {
-                orch_pane_id,
-                role_name,
-                feedback,
-                expected_orchestrator_agent_id,
-            } => (
-                orch_pane_id,
-                role_name,
-                feedback,
-                expected_orchestrator_agent_id,
-            ),
-        };
-        let max_body = registry.inbox().limits().max_body_bytes;
-        let from = feedback.from.clone();
-        let subject = feedback.subject.clone();
-        // The notice keeps the report's sender and subject, which name the
-        // worker and its role, so it still answers the delegation; what the
-        // deck says goes in the preface, as a report's head does, and there is
-        // no worker text in it.
-        let notice = |error: &str| crate::inbox::Content {
-            from: from.clone(),
-            subject: subject.clone(),
-            body: String::new(),
-            body_trust: crate::inbox::BodyTrust::Untrusted,
-            spill_path: None,
-            id: None,
-            preface: Some(undelivered_report_notice(
-                "A worker has completed their task",
-                error,
-                max_body,
-            )),
-        };
-        match crate::inbox_hub::post_reserved_reply_or_notice_to_live(
-            registry,
-            reservation,
-            crate::inbox::Recipient::bound(&orch_pane_id, &expected_orchestrator_agent_id),
-            feedback,
-            notice,
-        ) {
-            Ok(id) => tracing::info!(
-                pane_id = %orch_pane_id,
-                role = %role_name,
-                message_id = %id,
-                "work-done: report posted to the orchestrator's inbox"
-            ),
-            Err(error) => warn!(
-                pane_id = %orch_pane_id,
-                role = %role_name,
-                expected_agent_id = %expected_orchestrator_agent_id,
-                %error,
-                "work-done: the orchestrator's inbox refused the report; nothing posted"
-            ),
-        }
-    }
+    /// PRD #1666 part 3, round 5 (plan D10): a report that names no task, so
+    /// the deck marked no task complete. Nothing is written to the role's file.
+    Note,
 }
 
 /// PRD #1666 S5: a worker's `work-done` report as an inbox message to its
@@ -3517,15 +3318,11 @@ fn compose_work_done_message(
              agent). Do NOT read that path: this task's report did not land there, so any file \
              at it is an EARLIER delegation's report or a partial write."
         ),
-        WorkDoneReportChannel::Unsolicited => format!(
-            "Worker {safe_role} reported completing a task, but the deck has no outstanding \
-             delegation to that worker on record (dot-agent-deck daemon report, not a message \
-             from a person or an agent). The deck cannot tell who tasked the worker: a person may \
-             have tasked it directly, or the deck may have lost its record of a delegation you \
-             sent. Treat what follows as information about what that worker did, and count it as \
-             one of your tasks coming back only if it matches a delegation you sent and are still \
-             waiting on. Nothing was written to {filed_at}, so an earlier delegation's report \
-             there is left intact."
+        WorkDoneReportChannel::Note => format!(
+            "Worker {safe_role} sent a note. This report names no task, so the deck marked no \
+             task complete (dot-agent-deck daemon report, not a message from a person or an \
+             agent). Treat what follows as information about what that worker did. Nothing was \
+             written to {filed_at}, so an earlier task's report there is left intact."
         ),
     };
     let (body, truncated) = inline_report_text(summary);
@@ -3576,6 +3373,113 @@ fn compose_work_done_message(
         spill_path,
         id: None,
         preface: Some(format!("{head}{tail}")),
+        provenance: None,
+    }
+}
+
+/// PRD #1666 part 3, round 5 (plan §2 step 4, D10): what a kept report is
+/// posted as, by what it reports.
+pub(crate) enum ReportPost {
+    /// Delegated task `task_id`, from a worker in `role`.
+    Task {
+        task_id: String,
+        role: String,
+        cwd: Option<String>,
+    },
+    /// A note that completes no task.
+    Note {
+        role: Option<String>,
+        cwd: Option<String>,
+    },
+    /// A dispatched unit's terminal report.
+    Terminal {
+        unit_name: String,
+        unit_cwd: Option<String>,
+    },
+}
+
+/// PRD #1666 part 3, round 5 (plan §2 step 4): compose the post a kept report
+/// is published as, with the convenience copies today's reports had: a task's
+/// report filed to `.dot-agent-deck/work-done-<role>.md`, and a report too
+/// long to inline saved whole beside it, or, for a dispatched unit, in its
+/// worktree. The deck's own copy is the retained file; these are copies.
+pub(crate) async fn compose_report_post(
+    post: ReportPost,
+    worker_pane: &str,
+    worker_agent: &str,
+    report: &str,
+) -> crate::inbox::Content {
+    match post {
+        ReportPost::Task { task_id, role, cwd } => {
+            let safe = sanitize_role_name(&role);
+            let channel = file_commissioned_report_off_runtime(
+                cwd.clone(),
+                safe.clone(),
+                role.clone(),
+                worker_pane.to_string(),
+                report.to_string(),
+            )
+            .await;
+            let full = if channel == WorkDoneReportChannel::Unfiled
+                && report_exceeds_inline_bound(report)
+            {
+                save_full_report_off_runtime(cwd, format!("work-done-{safe}"), report.to_string())
+                    .await
+            } else {
+                None
+            };
+            let mut content = compose_work_done_message(
+                worker_pane,
+                worker_agent,
+                &role,
+                &safe,
+                &channel,
+                report,
+                full.as_deref(),
+            );
+            content.subject = format!("{safe} completed task {task_id}");
+            if let Some(preface) = content.preface.as_mut() {
+                *preface = preface.replacen(
+                    "has completed their task",
+                    &format!("has completed task {task_id}"),
+                    1,
+                );
+            }
+            content
+        }
+        ReportPost::Note { role, cwd } => {
+            let role = role.unwrap_or_else(|| "worker".to_string());
+            let safe = sanitize_role_name(&role);
+            let full = if report_exceeds_inline_bound(report) {
+                save_full_report_off_runtime(cwd, format!("work-done-{safe}"), report.to_string())
+                    .await
+            } else {
+                None
+            };
+            let mut content = compose_work_done_message(
+                worker_pane,
+                worker_agent,
+                &role,
+                &safe,
+                &WorkDoneReportChannel::Note,
+                report,
+                full.as_deref(),
+            );
+            content.subject = format!("note from {safe}");
+            content
+        }
+        ReportPost::Terminal {
+            unit_name,
+            unit_cwd,
+        } => {
+            let full = if report_exceeds_inline_bound(report) {
+                save_full_report_off_runtime(unit_cwd, "dispatch".to_string(), report.to_string())
+                    .await
+            } else {
+                None
+            };
+            crate::dispatch_return::compose_completion_message(&unit_name, report, full.as_deref())
+        }
     }
 }
 
@@ -4048,7 +3952,17 @@ impl PointerQueueClock {
 
 impl Drop for PointerQueueClock {
     fn drop(&mut self) {
-        self.dequeue();
+        // PRD #1666 part 3, round 5 (C4b): the destructor form, which skips a
+        // poisoned tracker where `dequeue` would panic, for the reason
+        // `CommissionDispatchInFlight`'s `Drop` gives: this guard is armed on
+        // the delegate path, whose tracker-then-hub sections can poison the
+        // tracker, and a panic here during that unwind would abort the daemon.
+        if std::mem::take(&mut self.queued)
+            && let Some(seq) = self.delegation_seq
+        {
+            self.registry
+                .dequeue_delegation_pointer_write_in_drop(&self.worker_pane_id, seq);
+        }
     }
 }
 
@@ -4917,6 +4831,33 @@ pub(crate) fn compose_worker_exited_notice(worker_pane_id: &str) -> String {
     )))
 }
 
+/// PRD #1666 part 3, round 5 (plan D12 rule 4): [`compose_worker_exited_notice`]
+/// for the tasks the deck's task ledger says the exited worker still owed,
+/// naming each task id. Its exit released what it owed, so unlike the
+/// record-based report it does not tell the orchestrator to restart the role
+/// or supersede first. The ids are deck-minted message ids.
+pub(crate) fn compose_worker_exited_notice_for_tasks(
+    worker_pane_id: &str,
+    task_ids: &[String],
+) -> String {
+    let pane = pane_id_clause(worker_pane_id);
+    let tasks = task_ids
+        .iter()
+        .map(|id| escape_id_for_log(id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let noun = if task_ids.len() == 1 { "task" } else { "tasks" };
+    with_deck_command_word(compose_delegate_prompt(&format!(
+        "⚠ delegated worker exited without work-done (dot-agent-deck daemon report) - not a \
+         message from a person or an agent: the process behind {pane} ended and no work-done was \
+         ever received for {noun} {tasks}. If a work-done from that worker does arrive after this \
+         report, it was sent just before the process ended: trust it over this report. Otherwise \
+         check that pane's scrollback for what happened and decide how to proceed - if this \
+         needs the user, notify the user; otherwise re-delegate or reassign the {noun}. The \
+         daemon log names the role and how long it had been delegated."
+    )))
+}
+
 /// The single-line report the daemon posts to the ORCHESTRATOR's inbox (PRD
 /// #1666) when a `clear = true` delegate's replacement worker never became
 /// live — issue #584.
@@ -5088,12 +5029,17 @@ pub(crate) fn compose_respawn_failed_notice(worker_pane_id: &str) -> String {
 /// path is role-interpolated, via [`role_path_slug`]'s readable-slug-plus-digest
 /// form, so two workers sharing a cwd are not handed the same report path (see
 /// [`work_done_footer`] for the exact strength of that claim).
-pub fn compose_worker_task_file(prompt_template: Option<&str>, task: &str, role: &str) -> String {
+pub fn compose_worker_task_file(
+    prompt_template: Option<&str>,
+    task: &str,
+    role: &str,
+    task_id: Option<&str>,
+) -> String {
     let body = match prompt_template {
         Some(tpl) if !tpl.trim().is_empty() => format!("{tpl}\n\n## Task\n\n{task}"),
         _ => task.to_string(),
     };
-    format!("{}\n\n{}", body.trim_end(), work_done_footer(role))
+    format!("{}\n\n{}", body.trim_end(), work_done_footer(role, task_id))
 }
 
 /// Issue #1387: the `.dot-agent-deck.toml` of each directory a request resolves
@@ -5643,8 +5589,9 @@ fn write_delegate_task(
     task: &str,
     target_role: &str,
     pane_id: &str,
+    task_id: &str,
 ) -> String {
-    let content = compose_worker_task_file(prompt_template, task, target_role);
+    let content = compose_worker_task_file(prompt_template, task, target_role, Some(task_id));
     let Some(cwd) = cwd else {
         warn!(
             role = %target_role,
@@ -5752,6 +5699,7 @@ async fn dispatch_one_owned(
         &task,
         &target_role,
         &pane_id,
+        message_id.as_str(),
     );
     let orchestrator = orchestrator_agent_id
         .as_deref()
@@ -5779,6 +5727,7 @@ async fn dispatch_one_owned(
         spill_path: None,
         id: Some(message_id),
         preface: None,
+        provenance: None,
     };
     // PR #1735 fifth review (N8): a task the inbox would refuse is refused
     // before anything is retired or restarted for it, so the worker's older
@@ -6097,6 +6046,9 @@ async fn dispatch_one_owned(
     let ledger = crate::inbox_hub::DelegateLedger {
         commission_arm_id,
         delegation_seq,
+        instance: registry
+            .pane_orchestration(&pane_id)
+            .and_then(|orchestration| orchestration.instance_id),
     };
     // The liveness check above is separated from the post by the awaits in
     // between, so the post checks again, under the inbox's lock: a worker that
@@ -6117,7 +6069,11 @@ async fn dispatch_one_owned(
         spill,
         &still_live,
     ) {
-        Ok((id, ended)) => {
+        Ok(crate::inbox_hub::PostedDelegate {
+            id,
+            ended,
+            superseded,
+        }) => {
             tracing::info!(
                 role = %target_role,
                 pane_id = %pane_id,
@@ -6125,6 +6081,10 @@ async fn dispatch_one_owned(
                 message_id = %id,
                 "delegate: task posted to the worker's inbox"
             );
+            // PRD #1666 part 3, round 5 (plan D8): the tasks this one
+            // superseded are closed in the ledger; their own arms and records
+            // go too, exactly, and nothing of the new task's.
+            registry.retire_task_debt_exact(&pane_id, &superseded);
             // Issue #714 (review): a task handed to a worker whose quota block
             // is ALREADY reported owes the orchestrator its own blocked-worker
             // notice — the block's report covered only the delegation
@@ -6578,6 +6538,10 @@ fn card_inbox_of(event: &AgentEvent) -> Option<crate::inbox_display::CardInbox> 
         .metadata
         .get(crate::inbox_display::CARD_INBOX_COMMAND_METADATA_KEY)
         .cloned();
+    inbox.admission_refused = event
+        .metadata
+        .get(crate::inbox_display::CARD_INBOX_ADMISSION_METADATA_KEY)
+        .cloned();
     Some(inbox)
 }
 
@@ -6620,6 +6584,12 @@ fn set_card_inbox(session: &mut SessionState, inbox: crate::inbox_display::CardI
         metadata.insert(
             crate::inbox_display::CARD_INBOX_COMMAND_METADATA_KEY.to_string(),
             command.clone(),
+        );
+    }
+    if let Some(code) = &inbox.admission_refused {
+        metadata.insert(
+            crate::inbox_display::CARD_INBOX_ADMISSION_METADATA_KEY.to_string(),
+            code.clone(),
         );
     }
     session.recent_events.push_back(AgentEvent {
@@ -6854,6 +6824,7 @@ impl PaneInbox {
             integration_command: self.notices.integration_command.clone(),
             evidence_paused: self.notices.evidence_paused,
             receipts_degraded: self.notices.receipts_degraded.clone(),
+            admission_refused: self.notices.admission_refused.clone(),
         }
     }
 
@@ -8267,8 +8238,19 @@ impl AppState {
     /// card-surfacing start would have drawn it had the stream been open when it
     /// was broadcast. Without it an agent started while the stream was down —
     /// across a deck restart, or a lagged stream — had no card until the TUI
-    /// restarted. An orchestration role's record is left alone: its tab is
-    /// built from the deck's surface, not from a listing.
+    /// restarted.
+    ///
+    /// Issue #1800: an orchestration role's card belongs in its orchestration's
+    /// tab, which only the render loop can build. So when any role of an
+    /// orchestration has no card or was never placed in a tab here, the
+    /// orchestration's listed roles are grouped into the surface the deck
+    /// broadcast while the stream was down, and that surface is queued
+    /// ([`Self::queue_orchestration_surface`]) for the render loop to build the
+    /// tab, or place the roles its tab lacks, through the live surface path.
+    /// Each of its roles with no card is carded as above, since that path draws
+    /// no card for a live role. A role whose membership carries no
+    /// orchestration id, or whose surface does not validate, is left alone, as
+    /// that path builds no tab for it.
     ///
     /// G-fix7g: its pane is admitted as that start would have admitted it
     /// ([`Self::apply_event`]'s unmarked-start branch), so the agent's later
@@ -8279,45 +8261,89 @@ impl AppState {
         if self.agent_ownership.is_some() {
             return;
         }
+        let mut surfaces: Vec<OrchestrationSurface> = Vec::new();
+        let mut uncarded_roles = Vec::new();
         for record in records {
             let Some(pane_id) = record.pane_id_env.as_deref() else {
                 continue;
             };
-            if matches!(
-                record.tab_membership,
-                Some(crate::agent_pty::TabMembership::Orchestration { .. })
-            ) || self
+            let carded = self
                 .sessions
                 .values()
-                .any(|card| card.pane_id.as_deref() == Some(pane_id))
+                .any(|card| card.pane_id.as_deref() == Some(pane_id));
+            if let Some(crate::agent_pty::TabMembership::Orchestration { .. }) =
+                record.tab_membership
             {
+                add_listed_role_to_surface(&mut surfaces, record, pane_id);
+                if !carded {
+                    uncarded_roles.push((record, pane_id));
+                }
                 continue;
             }
-            self.seed_hydrated_session(
-                pane_id.to_string(),
-                record.cwd.clone(),
-                record.agent_type.clone(),
-                Some(record.id.clone()),
-                record.live.as_ref(),
-            );
-            let name = record
-                .display_name
-                .as_deref()
-                .and_then(crate::untrusted_text::sanitize_display_name);
-            if let Some(card) = self
-                .sessions
-                .get_mut(&placeholder_session_id(pane_id))
-                .filter(|card| card.display_name.is_none())
-            {
-                card.display_name = name;
+            if !carded {
+                self.card_unseen_agent(record, pane_id);
             }
-            if let Ok(seq) = record.id.parse::<u64>() {
-                self.pane_surfaced_agent_seq
-                    .entry(pane_id.to_string())
-                    .or_insert(seq);
-            }
-            self.managed_pane_ids.insert(pane_id.to_string());
         }
+        // Issue #1800: an orchestration is rebuilt when any of its roles has no
+        // card or was never placed in a tab here (the render loop records each
+        // role it places in `pane_role_map`, and `unregister_pane` forgets it).
+        // Its whole listed role set is queued: the render loop skips the roles
+        // its tab already holds and places the rest.
+        let mut surfaced = HashSet::new();
+        for mut surface in surfaces {
+            let unseen = surface.roles.iter().any(|role| {
+                !self.pane_role_map.contains_key(&role.pane_id)
+                    || uncarded_roles
+                        .iter()
+                        .any(|(_, pane_id)| *pane_id == role.pane_id)
+            });
+            if !unseen {
+                continue;
+            }
+            surface.roles.sort_by_key(|role| role.role_index);
+            if let Some(surface) = crate::agent_pty::validate_orchestration_surface(surface) {
+                surfaced.extend(surface.roles.iter().map(|role| role.pane_id.clone()));
+                self.queue_orchestration_surface(surface);
+            }
+        }
+        // The live surface path draws no card for a live role — the deck's
+        // card-surfacing start does, and a gap loses it too. Only a role whose
+        // orchestration was queued, so none is left as a flat dashboard card.
+        for (record, pane_id) in uncarded_roles {
+            if surfaced.contains(pane_id) {
+                self.card_unseen_agent(record, pane_id);
+            }
+        }
+    }
+
+    /// [`Self::card_unseen_agents`]' card for one agent: seeded from its
+    /// record, named, and its pane admitted as the deck's card-surfacing start
+    /// would have admitted it.
+    fn card_unseen_agent(&mut self, record: &crate::agent_pty::AgentRecord, pane_id: &str) {
+        self.seed_hydrated_session(
+            pane_id.to_string(),
+            record.cwd.clone(),
+            record.agent_type.clone(),
+            Some(record.id.clone()),
+            record.live.as_ref(),
+        );
+        let name = record
+            .display_name
+            .as_deref()
+            .and_then(crate::untrusted_text::sanitize_display_name);
+        if let Some(card) = self
+            .sessions
+            .get_mut(&placeholder_session_id(pane_id))
+            .filter(|card| card.display_name.is_none())
+        {
+            card.display_name = name;
+        }
+        if let Ok(seq) = record.id.parse::<u64>() {
+            self.pane_surfaced_agent_seq
+                .entry(pane_id.to_string())
+                .or_insert(seq);
+        }
+        self.managed_pane_ids.insert(pane_id.to_string());
     }
 
     /// PRD #120: record a daemon-spawned orchestration for the render loop to
@@ -9265,6 +9291,19 @@ impl AppState {
         };
         inbox.fold(notice);
         self.refresh_card_inbox(&notice.pane_id);
+    }
+
+    /// PRD #1666 part 3 (R-2): the refusal code of the request `pane_id`'s
+    /// agent made for its own messages, while messages wait for it, with the
+    /// agent generation it belongs to.
+    pub fn inbox_admission_refused(&self, pane_id: &str) -> Option<(Option<&str>, &str)> {
+        self.pane_inboxes.get(pane_id).and_then(|inbox| {
+            inbox
+                .notices
+                .admission_refused
+                .as_deref()
+                .map(|code| (inbox.agent_id.as_deref(), code))
+        })
     }
 
     /// PRD #1666 §6.4: the items `pane_id`'s card lists for the user to
@@ -11546,6 +11585,10 @@ pub async fn handle_spawn_role_with_state(
             orchestration_id: orchestration_id.clone(),
         }),
         agent_type: resolved.role_config.resolved_agent_type(),
+        // PRD #1666 part 3, round 5 (plan D7): a role added to a running
+        // instance takes the origin its instance was started with, from a
+        // record of it.
+        origin: registry.origin_of_instance(&resolved.identity.id),
         ..crate::agent_pty::SpawnOptions::default()
     });
 
@@ -11655,346 +11698,6 @@ pub async fn handle_spawn_role_with_state(
 }
 
 impl AppState {
-    /// Handle a worker's work-done signal: write the per-role summary file
-    /// and post the report to the orchestrator generation's inbox.
-    ///
-    /// PRD #93 round-5: the file write was already daemon-side (now that
-    /// the daemon owns `pane_cwd_map`); the new piece is that the daemon
-    /// also picks the orchestrator pane for the same orchestration and
-    /// posts the "Worker {role} has completed..." feedback to its inbox
-    /// (PRD #1666 S5), which outlives any number of detach/reattach cycles.
-    ///
-    /// `done: true` from the orchestrator pane itself signals the whole
-    /// orchestration is complete; we log and exit without writing back a
-    /// "completed" prompt to the orchestrator (it just issued it).
-    ///
-    /// Issue #544: a caller holding a lock on this `AppState` takes
-    /// [`Self::prepare_work_done`] under the lock and
-    /// [`WorkDoneDelivery::deliver`] after releasing it, as the daemon's hook
-    /// loop does.
-    ///
-    /// Room for the report is held first, as the daemon's hook loop holds it
-    /// (PR #1735 fifth review, N3); with none, nothing is taken on.
-    pub async fn handle_work_done(&self, signal: WorkDoneSignal, registry: &AgentPtyRegistry) {
-        let room = match registry.inbox().reserve_reply() {
-            Ok(room) => room,
-            Err(error) => {
-                warn!(%error, "work-done: the deck has no room for its report; nothing taken on");
-                return;
-            }
-        };
-        self.prepare_work_done(signal, registry)
-            .await
-            .deliver(registry, room)
-            .await;
-    }
-
-    /// Issue #544: everything [`Self::handle_work_done`] does except the inbox
-    /// post, which it returns. See [`WorkDoneDelivery`].
-    pub async fn prepare_work_done(
-        &self,
-        signal: WorkDoneSignal,
-        registry: &AgentPtyRegistry,
-    ) -> WorkDoneDelivery {
-        WorkDoneDelivery(self.prepare_work_done_write(signal, registry).await)
-    }
-
-    async fn prepare_work_done_write(
-        &self,
-        signal: WorkDoneSignal,
-        registry: &AgentPtyRegistry,
-    ) -> WorkDoneWrite {
-        // PRD #126: the worker answered, so one outstanding delegation is
-        // resolved. Retire FIRST — above every early return below — so an
-        // unknown pane, an orchestrator's own `--done`, or a missing
-        // orchestrator pane can never leave a record armed and produce a bogus
-        // idle prompt later. Dropping the retired record cancels its watch task
-        // immediately instead of leaving it asleep for the rest of the timeout.
-        // PRD #249 M3 review (finding B4), carried over to the inbox's
-        // undelivered-task notice that replaced the silent-worker watch:
-        // `work-done` is a CLI signal, not an `AgentEvent`, so a hookless
-        // worker that received its task and reported completion would
-        // otherwise still be reported, later, as possibly never having got it.
-        // Retired first, above every early return, for the same reason as the
-        // retire below.
-        //
-        // PRD #1666 S5: a worker reporting work-done has delegated tasks it has
-        // not acknowledged retired as superseded — so no undelivered notice is
-        // posted about a task the worker has answered. Which ones depends on
-        // whether it acknowledged a task since its previous work-done
-        // (delegate_021): if it did, only the tasks it fetched are retired and
-        // a newer task never fetched stays owed and watched, so a stale
-        // completion of an older task cannot switch the notice off for a newer
-        // one (PRD #249 round-6 review); if it did not, every unacknowledged task goes, a never-fetched
-        // one included. The worker chooses the branch by what it acknowledges
-        // and reports, so within its own pane a repeated work-done silently
-        // retires a newer task it never fetched, and acknowledging a task it
-        // does not complete keeps a later file-taken task queued (audit A2-3;
-        // see `InboxHub::retire_answered_delegates_to`).
-        registry
-            .inbox()
-            .retire_answered_delegates_to(&signal.pane_id);
-        // Issue #617 (finding 7): the orchestrator identity the retired delegation
-        // was ISSUED by — `(pane, registry agent id)` — carried down to the
-        // feedback write below so the report goes to the conversation that
-        // commissioned it or to nothing at all. `None` when nothing was
-        // outstanding, which is the unsolicited case; see the write itself for
-        // what that falls back to and why it is weaker.
-        let mut commissioning_orchestrator: Option<(String, String)> = None;
-        match registry.retire_outstanding_delegation(&signal.pane_id) {
-            crate::agent_pty::DelegationRetirement::Nothing => {}
-            // Issue #1080: the whole record goes, superseded generations
-            // included. A worker that has just answered is not silent, and any
-            // record left armed here fires later against work that is already
-            // done — see `AgentPtyRegistry::retire_outstanding_delegation` for
-            // the production trace that reversed PRD #126 M1 finding 6's
-            // oldest-first accounting, and for what that costs.
-            crate::agent_pty::DelegationRetirement::Retired {
-                delegation,
-                superseded_dropped,
-            } => {
-                commissioning_orchestrator = Some((
-                    delegation.orchestrator_pane_id.clone(),
-                    delegation.orchestrator_agent_id.clone(),
-                ));
-                tracing::debug!(
-                    pane_id = %signal.pane_id,
-                    role = %delegation.role,
-                    armed_seq = delegation.seq,
-                    superseded_dropped,
-                    "work-done: retired the outstanding delegation and cancelled its idle watch"
-                );
-            }
-        }
-        // Issue #448: did the orchestrator commission any of this? Retired here,
-        // above every early return, for the same reason as the two watches: an
-        // unknown pane or a missing orchestrator must not leave a commission
-        // standing that a later, genuinely unsolicited completion could spend.
-        //
-        // Deliberately NOT inferred from the `DelegationRetirement::Nothing` arm
-        // above — see [`record_delegation_commission`] and
-        // [`crate::agent_pty::WorkDoneProvenance`] for why that arm cannot tell
-        // "never delegated" from "delegated with the idle detector switched off".
-        let provenance = registry.retire_delegation_commission(&signal.pane_id);
-
-        let role_name = match self.pane_role_map.get(&signal.pane_id) {
-            Some(name) => name.clone(),
-            None => {
-                // PRD #220 M2.3: a dispatched `--single` unit is in NO role map —
-                // `pane_role_map` is populated only when orchestration roles spawn
-                // — so this is the branch its terminal completion arrives in, and
-                // before Phase 2 it was the end of the line for half the dispatch
-                // shapes. The dispatched unit's identity is the retained return
-                // entry itself, held daemon-side against its own delivery pane,
-                // which is what lets this route WITHOUT widening the admission
-                // gate below: a pane nobody dispatched still takes the warning.
-                if let Some(pending) = prepare_dispatch_completion(&signal, registry).await {
-                    return WorkDoneWrite::DispatchReturn(pending);
-                }
-                // Issue #1082: unknown to `pane_role_map` AND unclaimed by any
-                // retained dispatch return, so nothing upstream has matched this
-                // id against a daemon-minted one. The `signal.pane_id` sites
-                // ABOVE this point stay bare for the opposite reason: each is
-                // reachable only when a keyed registry lookup on that same
-                // string hit, which is itself the match.
-                warn!(
-                    pane_id = %escape_id_for_log(&signal.pane_id),
-                    "work-done from unknown pane"
-                );
-                return WorkDoneWrite::Nothing;
-            }
-        };
-
-        // Orchestrator's own `--done`: completion signal, no feedback to write.
-        if signal.done && self.orchestrator_pane_ids.contains(&signal.pane_id) {
-            // PRD #220 Phase 2 review (finding A4): `signal.task` is the WHOLE
-            // report and used to be logged verbatim at info. Two problems, and the
-            // size is the smaller one: it is agent-authored text that can carry
-            // newlines, CR, ESC, C1 and bidi characters straight into a
-            // line-oriented log, and on a dispatched orchestration it is the same
-            // body the return edge is about to deliver — so logging it here
-            // contradicted the deliberate silence `PendingDispatchReturn::deliver`
-            // keeps about undelivered reports. Its LENGTH is what an operator
-            // correlating a truncation actually needs; the text itself is in the
-            // caller's inbox.
-            tracing::info!(
-                pane_id = %signal.pane_id,
-                report_chars = signal.task.chars().count(),
-                "orchestration complete (orchestrator --done)"
-            );
-            // PRD #220 M2.1: ...and if this orchestration was DISPATCHED, that
-            // completion is also the one thing its caller has been waiting for.
-            // An ordinary orchestration has no retained entry here and is
-            // unchanged: logged, and no feedback written.
-            return prepare_dispatch_completion(&signal, registry)
-                .await
-                .map_or(WorkDoneWrite::Nothing, WorkDoneWrite::DispatchReturn);
-        }
-
-        // Write summary to .dot-agent-deck/work-done-{role}.md — and remember
-        // whether it landed, because the feedback below may only point at a file
-        // the deck actually wrote (issue #433, [`write_work_done_summary`]).
-        //
-        // Issue #448: an UNSOLICITED completion does not write at all. That path
-        // is keyed by role name alone and reused for every delegation to the role,
-        // so writing there would overwrite the last report the orchestrator DID
-        // commission with one it did not — the same stale-report-read-as-current
-        // failure #433 is about, arriving from the other direction. The report is
-        // inlined into the feedback instead, so nothing is lost.
-        let safe_name = sanitize_role_name(&role_name);
-        let channel = match provenance {
-            crate::agent_pty::WorkDoneProvenance::Solicited { remaining } => {
-                if remaining > 0 {
-                    tracing::debug!(
-                        pane_id = %signal.pane_id,
-                        role = %role_name,
-                        remaining_commissions = remaining,
-                        "work-done: credited to one of several outstanding delegations"
-                    );
-                }
-                file_commissioned_report_off_runtime(
-                    self.pane_cwd_map.get(&signal.pane_id).cloned(),
-                    safe_name.clone(),
-                    role_name.clone(),
-                    signal.pane_id.clone(),
-                    signal.task.clone(),
-                )
-                .await
-            }
-            crate::agent_pty::WorkDoneProvenance::Unsolicited => {
-                tracing::info!(
-                    pane_id = %signal.pane_id,
-                    role = %role_name,
-                    "work-done with no outstanding delegation: reporting it to the orchestrator as \
-                     unsolicited and leaving .dot-agent-deck/work-done-{}.md untouched",
-                    safe_name
-                );
-                WorkDoneReportChannel::Unsolicited
-            }
-        };
-
-        // Find the orchestrator pane in the same orchestration as the
-        // worker. We scope by `pane_orchestration_map` so a parallel
-        // orchestration tab's orchestrator pane doesn't receive a sibling
-        // tab's worker feedback.
-        //
-        // PRD #140 M2.2: the scope is [`OrchestrationIdentity`] equality —
-        // see [`Self::orchestrator_for_worker`], which owns the lookup so it
-        // is unit-testable without PTYs.
-        let Some(orch_pane_id) = self.orchestrator_for_worker(&signal.pane_id) else {
-            warn!(
-                pane_id = %signal.pane_id,
-                role = %role_name,
-                "work-done: no orchestrator pane found for this orchestration"
-            );
-            return WorkDoneWrite::Nothing;
-        };
-
-        // If the work-done came from the orchestrator itself (without
-        // --done), skip the feedback write — the orchestrator doesn't need
-        // to be reminded of its own work.
-        if signal.pane_id == orch_pane_id {
-            return WorkDoneWrite::Nothing;
-        }
-
-        // Issue #508: a report the inlined paths will cut short is saved in full
-        // first, beside the worker's other coordination files, so the text past
-        // the bound is recoverable and the feedback can say where. The Filed path
-        // needs no such copy — its file already holds the whole report.
-        // The Diverted path is the same: its file holds the whole report too.
-        let full_report = if matches!(
-            channel,
-            WorkDoneReportChannel::Unfiled | WorkDoneReportChannel::Unsolicited
-        ) && report_exceeds_inline_bound(&signal.task)
-        {
-            save_full_report_off_runtime(
-                self.pane_cwd_map.get(&signal.pane_id).cloned(),
-                format!("work-done-{safe_name}"),
-                signal.task.clone(),
-            )
-            .await
-        } else {
-            None
-        };
-        let worker_agent_id = registry
-            .pane_current_agent_id(&signal.pane_id)
-            .unwrap_or_default();
-        let feedback = compose_work_done_message(
-            &signal.pane_id,
-            &worker_agent_id,
-            &role_name,
-            &safe_name,
-            &channel,
-            &signal.task,
-            full_report.as_deref(),
-        );
-        // Issue #617 (finding 7): GUARDED. This used to be
-        // `write_to_pane_and_submit`, keyed by pane id and nothing else, so an
-        // orchestrator that was respawned or rebound between the routing lookup
-        // above and this write had a previous conversation's completion report
-        // typed into it and submitted — and a pane id is a recycled handle, so
-        // the new occupant need not even be part of this orchestration.
-        //
-        // The identity preferred is the one the delegation was COMMISSIONED by,
-        // and it is used only when its own orchestrator pane agrees with the pane
-        // `orchestrator_for_worker` just resolved: two different routes to "the
-        // orchestrator" must agree before one is used to authorize the other.
-        //
-        // Issue #617 (auditor finding 3): DISAGREEMENT REFUSES. It used to fall
-        // through to the weaker route, which fails OPEN in the one case the
-        // agreement rule exists for — the worker's `pane_orchestration_map` entry
-        // was re-homed between the delegate and this completion, so the pane the
-        // routing lookup just produced is not the pane that commissioned the work.
-        // The report still carries the `Filed` (solicited) head, so the fallback
-        // delivered a completion an orchestrator never asked for, presented as one
-        // it did, while the conversation that DID commission it got nothing.
-        // Dropping it costs a lost report in a case that is already a mis-route;
-        // delivering it costs a forged solicitation.
-        //
-        // The fallback — the pane's CURRENT live agent, resolved immediately
-        // before the call — is therefore reserved for the genuinely UNSOLICITED
-        // arm, where there is no commissioning delegation to name an identity at
-        // all. It is deliberately weaker: it does not prove the recipient is the
-        // conversation that asked for anything (nothing asked), but it does bind
-        // the write to a concrete agent, so the primitive's post-lock
-        // re-validation still refuses a pane that changes hands between here and
-        // the write. An orchestrator pane with no live agent yields no identity at
-        // all and the feedback is dropped into this log, which is the same outcome
-        // the unguarded write reached by failing.
-        let expected_orchestrator_agent_id = match commissioning_orchestrator {
-            Some((commissioned_pane, commissioned_agent)) if commissioned_pane == orch_pane_id => {
-                Some(commissioned_agent)
-            }
-            Some((commissioned_pane, _)) => {
-                warn!(
-                    pane_id = %signal.pane_id,
-                    role = %role_name,
-                    commissioned_orchestrator_pane = %commissioned_pane,
-                    routed_orchestrator_pane = %orch_pane_id,
-                    "work-done: the delegation was commissioned by a different orchestrator pane \
-                     than the one this completion routed to; nothing written"
-                );
-                return WorkDoneWrite::Nothing;
-            }
-            None => registry.pane_current_agent_id(&orch_pane_id),
-        };
-        let Some(expected_orchestrator_agent_id) = expected_orchestrator_agent_id else {
-            warn!(
-                pane_id = %orch_pane_id,
-                role = %role_name,
-                "work-done: the orchestrator pane has no live agent to authorize the feedback \
-                 write; nothing written"
-            );
-            return WorkDoneWrite::Nothing;
-        };
-        WorkDoneWrite::Feedback {
-            orch_pane_id,
-            role_name,
-            feedback,
-            expected_orchestrator_agent_id,
-        }
-    }
-
     /// PRD #284: does `event` carry enough evidence to supersede `session`'s
     /// generation on the pane they share?
     ///
@@ -15614,8 +15317,12 @@ mod tests {
 
     #[test]
     fn compose_worker_task_file_appends_work_done_footer() {
-        let content =
-            compose_worker_task_file(Some("You are coder."), "Implement the thing.", "coder");
+        let content = compose_worker_task_file(
+            Some("You are coder."),
+            "Implement the thing.",
+            "coder",
+            None,
+        );
         let bin = crate::platform::paths::binary_name();
         assert!(content.starts_with("You are coder.\n\n## Task\n\nImplement the thing."));
         assert!(
@@ -15741,7 +15448,7 @@ mod tests {
         // self-sufficient and agree with its own explanation.
         assert_inline_allowlist_agrees_with_explanation(&content, "worker work-done footer");
 
-        let no_template = compose_worker_task_file(None, "Implement the fallback.", "coder");
+        let no_template = compose_worker_task_file(None, "Implement the fallback.", "coder", None);
         assert!(no_template.starts_with("Implement the fallback.\n\n## When done"));
     }
 
@@ -15752,8 +15459,12 @@ mod tests {
     #[spec("orchestration/delegate/017")]
     #[test]
     fn delegate_017_work_done_footer_names_the_running_binary() {
-        let content =
-            compose_worker_task_file(Some("You are coder."), "Implement the thing.", "coder");
+        let content = compose_worker_task_file(
+            Some("You are coder."),
+            "Implement the thing.",
+            "coder",
+            None,
+        );
         let bin = crate::platform::paths::binary_name();
 
         assert_ne!(
@@ -15863,7 +15574,7 @@ mod tests {
 
     /// Extract the single-quoted `--task-file` path out of a generated footer.
     fn footer_suggested_path(role: &str) -> String {
-        work_done_footer(role)
+        work_done_footer(role, None)
             .split("work-done --task-file '")
             .nth(1)
             .and_then(|rest| rest.split('\'').next())
@@ -20407,6 +20118,7 @@ mod tests {
             attention_update: false,
             requeued: false,
             notices: Default::default(),
+            provenance: None,
         }
     }
 
@@ -21063,7 +20775,7 @@ mod tests {
     /// its fetch and its acknowledgement — 1, 1, 1, 0 — and ends delivered.
     #[test]
     fn a_stall_notice_for_a_message_the_summary_counted_counts_nothing() {
-        use crate::inbox::{AckHow, Consumer, Recipient};
+        use crate::inbox::{AckHow, Recipient};
         let hub = crate::inbox_hub::InboxHub::new(
             crate::inbox::DeckId::generate(),
             crate::inbox::InboxLimits::default(),
@@ -21084,12 +20796,13 @@ mod tests {
             "the stall notice for the queued message must not count it again"
         );
 
-        let taken = hub.fetch("pane-q", "agent-q", Consumer::FetchCli, None, None);
-        assert_eq!(taken.len(), 1);
+        let taken = hub.test_hook_fetch("pane-q", "agent-q", None);
+        assert_eq!(taken.deliveries.len(), 1);
         follow_notices(&mut state, &mut rx);
         assert_eq!((card(&state).pending, card(&state).stalled), (1, false));
 
         hub.ack(id.as_str(), "pane-q", "agent-q", AckHow::Explicit);
+        hub.test_hook_close(taken);
         follow_notices(&mut state, &mut rx);
         assert_eq!(card(&state).pending, 0, "no phantom message is left queued");
         assert!(card(&state).delivered);

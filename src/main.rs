@@ -200,8 +200,13 @@ enum Commands {
         #[arg(long = "task-file", value_name = "PATH")]
         task_file: Option<String>,
         /// Signal that the entire orchestration is complete (orchestrator only)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "task_id")]
         done: bool,
+        /// The id of the delegated task this report completes, as your task
+        /// names it. Without it, the report is a note to your orchestrator
+        /// that completes no task.
+        #[arg(long = "task-id", value_name = "ID")]
+        task_id: Option<String>,
     },
     /// Close dispatched units, one agent, or one orchestration.
     ///
@@ -314,14 +319,6 @@ enum Commands {
         #[arg(long = "turn-reply-failed")]
         turn_reply_failed: bool,
     },
-    /// Print the seed/prompt the daemon prepared for this pane, then clear it
-    /// (PRD #201). A compatibility alias: the daemon posts a pane's seed as its
-    /// first inbox message (PRD #1666 S5), and this verb takes it from the
-    /// inbox and prints it to stdout (empty output = no seed). A Pi generation
-    /// is refused (PRD #1666 G10); the bundled Pi extension no longer calls it.
-    /// Uses `DOT_AGENT_DECK_PANE_ID` to scope the request, exactly like
-    /// `agent-event`.
-    GetSeed,
     /// Report a question an agent is asking and wait for the deck's answer
     /// (PRD #1631). Run by the deck's OpenCode plugin and Pi extension, not by
     /// hand: prints one line — what the producer should answer the agent with —
@@ -903,6 +900,14 @@ enum HooksAction {
         #[arg(long, value_enum, default_value_t = CliAgent::ClaudeCode)]
         agent: CliAgent,
     },
+    /// Update every installed agent's hooks to this copy, as the deck does
+    /// when it starts, and say what they run now. Another live install the
+    /// hooks run is left in place, and the command to replace it is shown.
+    Refresh {
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1169,6 +1174,87 @@ fn ack_report(reply: &AckReply) -> (AckStream, String) {
 /// handler runs, and for `work-done` once the report is queued, before it is
 /// written into any pane. See `dot_agent_deck::event::SignalAck` for what
 /// stays invisible.
+/// PRD #1666 part 3, round 5 (plan D1, D10): `work-done`, sent only once the
+/// daemon confirms on the same connection that it serves task-scoped
+/// completion, and answered in the words of `work_done_text`.
+fn run_work_done(pane_id: String, report: String, done: bool, task_id: Option<String>) -> ExitCode {
+    use dot_agent_deck::event::{
+        DaemonMessage, HookCapabilitiesRequest, WorkDoneMode, WorkDoneTaskReply,
+        WorkDoneTaskRequest,
+    };
+    use dot_agent_deck::hook::Gated;
+    use dot_agent_deck::work_done_text as text;
+    let token = dot_agent_deck::hook_provenance::token_from_env();
+    let mode = match (&task_id, done) {
+        (Some(task_id), _) => WorkDoneMode::Task {
+            task_id: task_id.clone(),
+        },
+        (None, true) => WorkDoneMode::Terminal,
+        (None, false) => WorkDoneMode::Uncorrelated,
+    };
+    let question = DaemonMessage::HookCapabilities(HookCapabilitiesRequest {
+        pane_id: pane_id.clone(),
+        token: token.clone(),
+    });
+    let mutation = DaemonMessage::WorkDoneTask(WorkDoneTaskRequest {
+        pane_id,
+        token,
+        mode,
+        report,
+        timestamp: chrono::Utc::now(),
+    });
+    let (Ok(question), Ok(mutation)) = (
+        serde_json::to_string(&question),
+        serde_json::to_string(&mutation),
+    ) else {
+        eprintln!("Failed to serialize work-done signal");
+        return ExitCode::FAILURE;
+    };
+    let reply = match dot_agent_deck::hook::send_gated(
+        &question,
+        &mutation,
+        dot_agent_deck::hook::confirms_task_scoped_completion,
+    ) {
+        Gated::NotConfirmed {
+            refusal: Some((code, message)),
+            ..
+        } => {
+            // The code is the word the daemon also put in its own `warn!`
+            // line, as `dispatch`'s refusal carries it.
+            eprintln!("Error: the daemon did not accept this work-done report: {message} [{code}]");
+            return ExitCode::FAILURE;
+        }
+        Gated::NotConfirmed { why, .. } => {
+            eprintln!("{}", text::NOT_CONFIRMED);
+            eprintln!("({why})");
+            return ExitCode::FAILURE;
+        }
+        Gated::Unconfirmed(why) => {
+            eprintln!("{}", text::unconfirmed(task_id.as_deref(), done));
+            eprintln!("({why})");
+            return ExitCode::FAILURE;
+        }
+        Gated::Reply(line) => line,
+    };
+    let Ok(reply) = serde_json::from_str::<WorkDoneTaskReply>(reply.trim()) else {
+        eprintln!("{}", text::unconfirmed(task_id.as_deref(), done));
+        eprintln!("(the daemon's answer could not be read)");
+        return ExitCode::FAILURE;
+    };
+    let answer = text::cli_answer(&reply, task_id.as_deref(), done);
+    if let Some(line) = answer.stdout {
+        println!("{line}");
+    }
+    if let Some(line) = answer.stderr {
+        eprintln!("{line}");
+    }
+    if answer.success {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 fn send_signal_and_report_ack(json: &str, verb: &str, subject: &str) -> ExitCode {
     use dot_agent_deck::hook::SocketReply;
     match dot_agent_deck::hook::send_and_await_signal_ack(json) {
@@ -1459,6 +1545,25 @@ fn main() -> ExitCode {
                         }
                     }
                 }
+                HooksAction::Refresh { json } => {
+                    let report = dot_agent_deck::hooks_refresh::refresh();
+                    if json {
+                        match serde_json::to_string(&report) {
+                            Ok(line) => println!("{line}"),
+                            Err(e) => {
+                                eprintln!("Failed to write the hooks report: {e}");
+                                return ExitCode::FAILURE;
+                            }
+                        }
+                    } else {
+                        for line in report.render() {
+                            println!("{line}");
+                        }
+                    }
+                    if !report.ok {
+                        return ExitCode::FAILURE;
+                    }
+                }
                 HooksAction::Uninstall { agent } => {
                     let spec = agent_registry::spec(&agent.agent_type());
                     match spec.hook_uninstall {
@@ -1631,9 +1736,9 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            // `--list-targets` is a READ-ONLY daemon round-trip (the `get-seed`
-            // pattern): the daemon answers from the PANE's cwd and config, which is
-            // the same basis the dispatch itself resolves from. Computing it here
+            // `--list-targets` is a READ-ONLY daemon round-trip: the daemon
+            // answers from the PANE's cwd and config, which is the same basis
+            // the dispatch itself resolves from. Computing it here
             // from the CLI's own `current_dir()` diverged whenever the agent had
             // `cd`'d, and offered targets the dispatch could not start.
             //
@@ -1744,6 +1849,7 @@ fn main() -> ExitCode {
             task,
             task_file,
             done,
+            task_id,
         }) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
                 Ok(id) => id,
@@ -1761,22 +1867,7 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let signal = dot_agent_deck::event::WorkDoneSignal {
-                pane_id,
-                task,
-                done,
-                timestamp: chrono::Utc::now(),
-                token: dot_agent_deck::hook_provenance::token_from_env(),
-            };
-            let msg = dot_agent_deck::event::DaemonMessage::WorkDone(signal);
-            let json = match serde_json::to_string(&msg) {
-                Ok(j) => j,
-                Err(e) => {
-                    eprintln!("Failed to serialize work-done signal: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            send_signal_and_report_ack(&json, "work-done", "work-done report")
+            run_work_done(pane_id, task, done, task_id)
         }
         Some(Commands::Inbox { action }) => match action {
             InboxAction::Fetch {
@@ -1997,78 +2088,6 @@ fn main() -> ExitCode {
                 check,
                 yes,
             })
-        }
-        Some(Commands::GetSeed) => {
-            let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
-                Ok(id) => id,
-                Err(_) => {
-                    eprintln!(
-                        "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\nThis command should be run from within a dot-agent-deck managed pane."
-                    );
-                    return ExitCode::FAILURE;
-                }
-            };
-            // Issue #916: present our own registry agent id so the daemon can
-            // scope the take by identity instead of trusting the pane id alone.
-            // Optional for the same reason the `agent-event` verb's is — the
-            // daemon injects it at spawn, and a producer that never got one
-            // sends nothing rather than failing. An older daemon ignores the
-            // field; the take then falls back to the pane's live occupant.
-            //
-            // Round-2 audit (finding 6): the empty string is filtered out, so
-            // "could not say" and "said nothing" are the same case — which is
-            // what `GetSeedRequest::agent_id`'s own doc says `None` means. A
-            // bare `.ok()` yields `Some("")` for a variable that is present but
-            // empty, and on THIS verb the daemon's keyed lookup then finds no
-            // record at all and refuses the pull, costing the agent its opening
-            // task. The sibling verbs that read the same variable are left
-            // alone: their failure mode on an empty value is a different one
-            // (an event that loses its attribution, not a refused request), so
-            // widening this is a separate question rather than the same fix.
-            let agent_id = std::env::var(DOT_AGENT_DECK_AGENT_ID)
-                .ok()
-                .filter(|id| !id.is_empty());
-            // Ask the daemon (over the hook socket) for the seed it prepared
-            // for this pane. READ-ONLY request/response — the one hook-socket
-            // verb that reads a reply. A missing daemon / older daemon that
-            // doesn't answer → `None` → we print nothing and exit 0, so the
-            // extension no-sends and the daemon's PTY-injection safety net
-            // still delivers (graceful cross-version degradation, no
-            // PROTOCOL_VERSION dependency).
-            let req = dot_agent_deck::event::DaemonMessage::GetSeed(
-                dot_agent_deck::event::GetSeedRequest {
-                    pane_id,
-                    agent_id,
-                    token: dot_agent_deck::hook_provenance::token_from_env(),
-                },
-            );
-            let json = match serde_json::to_string(&req) {
-                Ok(j) => j,
-                Err(e) => {
-                    eprintln!("Failed to serialize get-seed request: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            match dot_agent_deck::hook::request_from_socket(&json) {
-                Some(line) if !line.trim().is_empty() => {
-                    match serde_json::from_str::<dot_agent_deck::event::GetSeedResponse>(&line) {
-                        Ok(resp) => {
-                            if let Some(seed) = resp.seed {
-                                // Print the seed verbatim (no trailing newline)
-                                // so the extension captures exactly the prepared
-                                // text. Empty seed → print nothing.
-                                print!("{seed}");
-                            }
-                            ExitCode::SUCCESS
-                        }
-                        // A reply we can't parse is treated as "no seed": print
-                        // nothing, exit 0 — the fallback still covers delivery.
-                        Err(_) => ExitCode::SUCCESS,
-                    }
-                }
-                // No reply (no daemon / older daemon / no seed) → no seed.
-                _ => ExitCode::SUCCESS,
-            }
         }
         Some(Commands::Orchestrator { cmd }) => match cmd {
             // PRD #201 M3.2: thin wrapper — wire real PATH-detection + the real
@@ -4612,10 +4631,12 @@ mod tests {
                 task,
                 task_file,
                 done,
+                task_id,
             }) => {
                 assert_eq!(task, None);
                 assert_eq!(task_file.as_deref(), Some("-"));
                 assert!(!done);
+                assert_eq!(task_id, None);
             }
             _ => panic!("expected `work-done`"),
         }

@@ -1,7 +1,7 @@
 //! PRD #1666 design v3.2 §13 step 4: the hub's receipt engine — one attempt
 //! model (`crate::inbox_attempts`) per agent generation, driving delivery for
-//! the receivers switched to the receipt policy, beside the legacy ack-wait
-//! the others keep.
+//! every receiver: since PRD #1666 part 3 (H5) the receipt policy is the only
+//! one.
 //!
 //! A child of [`super`] (the hub): every function here runs under the hub's
 //! lock on its [`HubState`], and none does file IO. Spool IO — the generation
@@ -9,13 +9,12 @@
 //! removal of reclaimed evidence — runs off the executor and outside the lock,
 //! in the hub methods that call in here.
 //!
-//! **One policy per assignment.** A message is handed to a receipt receiver
-//! only while its inbox copy is queued and not `Legacy`-owned; taking it makes
-//! the assignment `Receipt`-owned ([`crate::inbox::AssignmentOwner`]), which
-//! the legacy ack-wait and requeue then leave alone. The attempt model
-//! decides everything after that, and [`sync`] mirrors each of its decisions
-//! into the inbox: a settle acknowledges (or claims an offer), rule 3 queues
-//! the message again, an undeliverable verdict retires it.
+//! **One policy.** A message is handed to a receipt receiver only while its
+//! inbox copy is queued for the receiver's agent. The attempt model decides
+//! everything after that, and [`sync`] mirrors each of its decisions into the
+//! inbox: a settle acknowledges (or claims an offer), rule 3 queues the
+//! message again, an undeliverable verdict retires it. (PRD #1666 part 3, H5
+//! removed the legacy policy that once owned some assignments instead.)
 //!
 //! **The adapter floor (§11).** A generation's [`Floor`] holds what the deck
 //! knows of its integration: the capability probe's verdict, a registration
@@ -41,7 +40,7 @@ use crate::event::{
     InboxDelivery, InboxDeliveryAttempt, InboxGrant, InboxIssued, InboxNotice, InboxRebound,
     InboxRegistered, InboxStreamControl, InboxWaitReply,
 };
-use crate::inbox::{AckHow, AssignmentOwner, Consumer, MessageState, UndeliverableReason};
+use crate::inbox::{AckHow, Consumer, MessageState, UndeliverableReason};
 use crate::inbox_attempts::{
     AttemptModel, CommitTargetRefusal, Effect, HandOverRefusal, LapseCheck, Limits,
     MessageState as Delivery, ResumeAnswer, Rx, Slot, Stage, TurnView, UncertainReason,
@@ -112,15 +111,20 @@ pub(super) struct TurnClock {
 
 /// The receiver slot a component registers in (§4; part 2 §2.1): a stream
 /// for OpenCode and Pi, a once-waiter for Claude's `asyncRewake` waiter, a
-/// hook for Claude's prompt hook.
+/// hook for Claude's prompt hook and, since part 3's H4, for Codex's hooks and
+/// for a model-run `inbox fetch` in a Codex, Devin or other agent's pane. A
+/// hook is registered by its own fetch and is handed what that fetch asked
+/// for, once: no component's hook is a native wake.
 pub(super) fn slot_for(component: InboxComponent) -> Option<Slot> {
     match component {
         InboxComponent::OpenCodePlugin => Some(Slot::OpencodeTui),
         InboxComponent::OpenCodeMini => Some(Slot::OpencodeServer),
         InboxComponent::PiExtension => Some(Slot::Pi),
         InboxComponent::ClaudeWaiter => Some(Slot::OnceWaiter),
-        InboxComponent::ClaudeHooks => Some(Slot::Hook),
-        _ => None,
+        InboxComponent::ClaudeHooks
+        | InboxComponent::CodexHooks
+        | InboxComponent::DevinHooks
+        | InboxComponent::Other => Some(Slot::Hook),
     }
 }
 
@@ -155,6 +159,18 @@ pub(super) struct Floor {
     /// no [`super::HOOK_INTEGRATION`], or a lower one: the agent's hooks run
     /// an older dot-agent-deck.
     pub(super) hooks_too_old: bool,
+    /// PRD #1666 part 3 (H5): whose hooks [`Self::hooks_too_old`] refused, when
+    /// the deck knows: the card names that agent's own `hooks install`, and
+    /// none when it does not know the agent.
+    pub(super) hooks_too_old_agent: Option<crate::event::AgentType>,
+    /// PRD #1666 part 3 (R-3): the agent whose hook lines from this
+    /// generation carry no version stamp, so its hooks run a dot-agent-deck
+    /// from before the deck's messages, which never asks for them. A notice,
+    /// not a block: the doorbell still asks the model to run
+    /// `dot-agent-deck inbox fetch`, which hands the mail over without the
+    /// hooks. A stamped line from the generation clears it, as does a
+    /// registration.
+    pub(super) hooks_unstamped: Option<crate::event::AgentType>,
     /// The deck could not rewrite the generation's integration files as it
     /// started (`refresh_for_spawn`), so restarting does not update them:
     /// the notice in that integration's words.
@@ -167,7 +183,7 @@ impl Floor {
             Some(IntegrationNotice::CliTooOld)
         } else if let Some(notice) = self.refresh_failed.filter(|_| !self.registered) {
             Some(notice)
-        } else if self.hooks_too_old {
+        } else if self.hooks_too_old || self.hooks_unstamped.is_some() {
             Some(IntegrationNotice::HooksTooOld)
         } else if self.adapter_too_old {
             Some(IntegrationNotice::AdapterTooOld)
@@ -275,7 +291,7 @@ impl Evidence {
     }
 }
 
-/// One agent generation's receipt-owned delivery.
+/// One agent generation's delivery on receipts.
 pub(super) struct Gen {
     pub(super) model: AttemptModel,
     pub(super) spool: Option<Arc<GenerationSpool>>,
@@ -290,7 +306,11 @@ pub(super) struct Gen {
     /// the task's delegate watch remains. An id goes when the watch does
     /// ([`forget_uncertain`]): a delegation with `--supersede` that retires it
     /// ends the watch-based route, leaving a later commit only a retained
-    /// cancelled-task record to correct through, if the task has one.
+    /// cancelled-task record to correct through, if the task has one. An id
+    /// also goes when that correction is sent ([`delivered_after_all`]).
+    /// Issue #1816: an id is added only while its task has a delegate watch
+    /// and goes with it, so the set holds at most one id per live watch, not
+    /// one per task the generation was ever handed.
     pub(super) uncertain_told: HashSet<String>,
 }
 
@@ -515,6 +535,17 @@ pub(super) fn generation_mut<'a>(
     })
 }
 
+/// PRD #1666 part 3 (H4): who a receipt registration speaks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Registrant {
+    /// The agent's own integration — its stream, waiter or hook — which
+    /// proves that integration current, so it clears the floor's verdicts.
+    Integration,
+    /// A model-run `inbox fetch`: it proves nothing about the agent's hooks
+    /// or adapter, so the floor's verdicts and its readiness stand.
+    Cli,
+}
+
 /// T8: a receipt receiver registers for `key`. For a stream, the slot's
 /// previous incarnation is retired and its open attempts wait for this
 /// registration's resume answer; a once-waiter supersedes the previous one,
@@ -524,6 +555,7 @@ pub(super) fn register(
     st: &mut HubState,
     key: &AgentKey,
     component: InboxComponent,
+    registrant: Registrant,
     doorbell_only: bool,
     resumed: bool,
     conn_id: u64,
@@ -532,12 +564,16 @@ pub(super) fn register(
     now: Instant,
 ) -> Option<InboxWaitReply> {
     let slot = slot_for(component)?;
-    let floor = st.receipts.floors.entry(key.clone()).or_default();
-    floor.registered = true;
-    floor.adapter_too_old = false;
-    floor.hooks_too_old = false;
-    floor.cli_too_old = false;
-    floor.refresh_failed = None;
+    if registrant == Registrant::Integration {
+        let floor = st.receipts.floors.entry(key.clone()).or_default();
+        floor.registered = true;
+        floor.adapter_too_old = false;
+        floor.hooks_too_old = false;
+        floor.hooks_too_old_agent = None;
+        floor.hooks_unstamped = None;
+        floor.cli_too_old = false;
+        floor.refresh_failed = None;
+    }
     let grant_ttl = st.receipts.limits.grant_ttl();
     let generation = generation_mut(st, key, spool);
     let registration = generation.model.register(now, slot, resumed);
@@ -618,12 +654,37 @@ pub(super) fn refuse_adapter(st: &mut HubState, key: &AgentKey) {
 /// or a lower one. Nothing was registered or issued; the generation's mail
 /// waits queued, its doorbell stays silent and its card names the command
 /// that updates the hooks.
-pub(super) fn refuse_hooks(st: &mut HubState, key: &AgentKey) {
-    st.receipts
-        .floors
-        .entry(key.clone())
-        .or_default()
-        .hooks_too_old = true;
+pub(super) fn refuse_hooks(
+    st: &mut HubState,
+    key: &AgentKey,
+    agent: Option<crate::event::AgentType>,
+) {
+    let floor = st.receipts.floors.entry(key.clone()).or_default();
+    floor.hooks_too_old = true;
+    floor.hooks_too_old_agent = agent;
+}
+
+/// PRD #1666 part 3 (R-3): a hook line of `agent`'s from `key`'s
+/// generation, `stamped` when it carries the sending deck's version.
+/// Unstamped, the agent's hooks run a dot-agent-deck from before the deck's
+/// messages, and its card names the command that updates them; its mail is
+/// still offered by the doorbell ([`Floor::hooks_unstamped`]). Answers whether
+/// that changed the floor.
+pub(super) fn observe_hook_stamp(
+    st: &mut HubState,
+    key: &AgentKey,
+    agent: &crate::event::AgentType,
+    stamped: bool,
+) -> bool {
+    if stamped {
+        return st
+            .receipts
+            .floors
+            .get_mut(key)
+            .is_some_and(|floor| floor.hooks_unstamped.take().is_some());
+    }
+    let floor = st.receipts.floors.entry(key.clone()).or_default();
+    floor.hooks_unstamped.replace(agent.clone()).as_ref() != Some(agent)
 }
 
 /// The stream `rx` of `key` ended. It decides nothing at once (§4: a stream
@@ -655,12 +716,10 @@ pub(super) fn closed(st: &mut HubState, key: &AgentKey, rx: Rx, conn_id: u64, no
 }
 
 /// Whether `id`'s inbox copy for `key` is one this generation's receipt
-/// receiver may be handed now: queued, admitting the agent, not
-/// `Legacy`-owned.
+/// receiver may be handed now: queued and admitting the agent.
 fn takeable(st: &HubState, key: &AgentKey, id: &str) -> bool {
     st.inbox.get(id, &key.0).is_some_and(|m| {
         m.state == MessageState::Queued
-            && m.owner != Some(AssignmentOwner::Legacy)
             && m.recipient
                 .as_ref()
                 .is_some_and(|r| r.admits(&key.0, &key.1))
@@ -668,7 +727,7 @@ fn takeable(st: &HubState, key: &AgentKey, id: &str) -> bool {
 }
 
 /// The messages a hand-out to `key` may carry now, oldest first: scheduled
-/// repeats, then queued mail no legacy consumer owns.
+/// repeats, then queued mail.
 pub(super) fn candidates(st: &HubState, key: &AgentKey) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     if let Some(generation) = st.receipts.gens.get(key) {
@@ -679,7 +738,6 @@ pub(super) fn candidates(st: &HubState, key: &AgentKey) -> Vec<String> {
                 .is_some_and(|d| d.repeat_scheduled() && !d.state.is_terminal());
             let held = st.inbox.get(&id, &key.0).is_some_and(|m| {
                 !m.state.is_terminal()
-                    && m.owner == Some(AssignmentOwner::Receipt)
                     && m.recipient
                         .as_ref()
                         .is_some_and(|r| r.admits(&key.0, &key.1))
@@ -715,6 +773,10 @@ fn issue_to(
 ) -> Vec<InboxDelivery> {
     let mut out = Vec::new();
     let mut used = 0usize;
+    // Each block is printed after its separator, the first one too, so a
+    // block is rendered within the budget less that separator: a first block
+    // alone over the budget is cut to fit it whole.
+    let within = budget.map(|budget| budget.less(super::BLOCK_SEPARATOR));
     for id in ids.iter().take(crate::inbox_prompt::MAX_IDS) {
         let Some(message) = st.inbox.get(id, &key.0).cloned() else {
             continue;
@@ -735,7 +797,7 @@ fn issue_to(
             .then(|| generation.model.next_attempt(id))
             .flatten();
         let len = budget.map(|budget| {
-            let text = render_marked(&message, Some(budget), marked, next).text;
+            let text = render_marked(&message, within, marked, next).text;
             budget.measure(&text) + budget.measure(super::BLOCK_SEPARATOR)
         });
         if let (Some(budget), Some(len)) = (budget, len)
@@ -775,7 +837,7 @@ fn issue_to(
             st.inbox.count_receipt_repeat(id, &key.0, &key.1);
         }
         let attempt = one_shot.then_some((issued.a, issued.e));
-        let mut delivery = render_marked(&message, budget, issued.kind.marked(), attempt);
+        let mut delivery = render_marked(&message, within, issued.kind.marked(), attempt);
         used += len.unwrap_or(0);
         delivery.attempt = Some(InboxDeliveryAttempt {
             a: issued.a,
@@ -1064,10 +1126,12 @@ pub(super) fn deck_not_handed(
 /// `budget` is issued to it, each block naming its attempt, with the caps it
 /// publishes its receipts with. With `named`, nothing is issued unless that
 /// message is still waiting, decided under the same lock.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn hook_fetch(
     st: &mut HubState,
     key: &AgentKey,
     rx: Rx,
+    consumer: Consumer,
     named: Option<&str>,
     budget: Option<InboxBudget>,
     now: Instant,
@@ -1087,7 +1151,7 @@ pub(super) fn hook_fetch(
     {
         return Vec::new();
     }
-    let batch = issue_to(st, key, rx, &ids, budget, Consumer::DoorbellHook, true, now);
+    let batch = issue_to(st, key, rx, &ids, budget, consumer, true, now);
     apply(st, key, now, out);
     batch
 }
@@ -1370,7 +1434,7 @@ pub(super) enum ExplicitCommit {
     NoAttempt,
 }
 
-/// An explicit acknowledgement of a `Receipt`-owned message (`dot-agent-deck
+/// An explicit acknowledgement of a handed-out message (`dot-agent-deck
 /// ack <id>`): its agent says it has the message, which settles it — rule 1
 /// needs one committed attempt of the current assignment, the newest that
 /// may have reached the agent ([`AttemptModel::commit_target`]).
@@ -1590,6 +1654,7 @@ pub(super) fn exit(
     now: Instant,
 ) -> Option<Arc<GenerationSpool>> {
     st.receipts.floors.remove(key);
+    st.admission_refused.remove(key);
     forget_turns(st, key);
     let told = st.receipts.told.remove(key);
     let generation = st.receipts.gens.remove(key);
@@ -1708,8 +1773,50 @@ pub(super) fn apply(st: &mut HubState, key: &AgentKey, now: Instant, out: &mut O
         }
     }
     sync(st, key, now, &returned);
+    forget_spent(st, key);
     super::drain_events(st);
     broadcast_notices(st, key, now);
+}
+
+/// Issue #1816: drop `key`'s model records that have no use left. A record
+/// goes once the model has no further use for it ([`AttemptModel::spent`]:
+/// ended, every attempt's evidence reclaimed) and the inbox no longer holds a
+/// copy of its message that the pane could read it through: a user action or
+/// an `ack <id>` on a copy the inbox still lists finds the record it found
+/// before. Runs after [`sync`], so an ended state is mirrored into the inbox
+/// before its record can go.
+fn forget_spent(st: &mut HubState, key: &AgentKey) {
+    let Some(generation) = st.receipts.gens.get(key) else {
+        return;
+    };
+    let spent: Vec<String> = generation
+        .model
+        .ids()
+        .into_iter()
+        .filter(|id| generation.model.spent(id))
+        .collect();
+    if spent.is_empty() {
+        return;
+    }
+    // Every copy `Inbox::get` could answer for the pane, and any other
+    // message without a recipient: keeping a record too long is safe.
+    let held: HashSet<&str> = st
+        .inbox
+        .all()
+        .iter()
+        .filter(|m| m.recipient.as_ref().is_none_or(|r| r.pane_id == key.0))
+        .map(|m| m.id.as_str())
+        .collect();
+    let gone: Vec<String> = spent
+        .into_iter()
+        .filter(|id| !held.contains(id.as_str()))
+        .collect();
+    let Some(generation) = st.receipts.gens.get_mut(key) else {
+        return;
+    };
+    for id in &gone {
+        generation.model.forget(id);
+    }
 }
 
 /// Whether `key`'s receipts came through a receiver on `slot`.
@@ -1747,8 +1854,7 @@ fn sync(st: &mut HubState, key: &AgentKey, now: Instant, returned: &HashSet<Stri
                 Delivery::Settled
             )
         );
-        if message.owner != Some(AssignmentOwner::Receipt) || (message.state.is_terminal() && !late)
-        {
+        if message.state.is_terminal() && !late {
             continue;
         }
         let fetched = matches!(message.state, MessageState::Fetched { .. });
@@ -1897,8 +2003,26 @@ pub(super) fn notices(st: &HubState, key: &AgentKey, now: Instant) -> InboxCardN
         // Part 2 §2.7: composed by the deck from its own install path, never
         // from anything a hook sent.
         integration_command: (integration == Some(IntegrationNotice::HooksTooOld))
-            .then(|| st.hooks_remedy.clone())
+            .then(|| {
+                // R-3: the command for the agent whose hooks are unstamped;
+                // H5: a refused fetch names the agent whose hooks it came
+                // from, and no command when the deck does not know it.
+                let agent = st.receipts.floors.get(key).and_then(|floor| {
+                    if floor.hooks_too_old {
+                        floor.hooks_too_old_agent.clone()
+                    } else {
+                        floor.hooks_unstamped.clone()
+                    }
+                })?;
+                st.hooks_remedies.get(&agent).cloned()
+            })
             .flatten(),
+        // PRD #1666 part 3 (R-2): while messages wait for the agent.
+        admission_refused: st
+            .admission_refused
+            .get(key)
+            .filter(|_| super::has_waiting_mail(&st.inbox, &key.0, &key.1))
+            .map(|episode| episode.code.clone()),
         ..InboxCardNotices::default()
     };
     let Some(generation) = st.receipts.gens.get(key) else {
@@ -1975,6 +2099,7 @@ fn send_notices(st: &HubState, key: &AgentKey, notices: InboxCardNotices) {
         attention_update: true,
         requeued: false,
         notices,
+        provenance: None,
     }));
 }
 

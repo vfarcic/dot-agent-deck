@@ -56,7 +56,7 @@
       # not bump it by hand — the workflow derives the pin and the tag from one
       # input, so an out-of-band edit can only disagree with one of them.
       # release.yml still refuses to release when the pin disagrees with the tag.
-      version = "0.48.1";
+      version = "0.49.0";
 
       # `<version>-g<short-sha>`, the same shape build.rs composes out of git
       # metadata (build_version_resolve.rs:180-196).
@@ -117,6 +117,9 @@
       #     `include_str!`s every page it lists, and fails the build when one is
       #     missing. Only the manifest and the Markdown outside `docs/develop/` are
       #     taken: the images are not embedded and maintainer docs never are.
+      #   * `vendor/`, because Cargo.toml's `[patch.crates-io]` replaces
+      #     crossterm with the patched copy in `vendor/crossterm`, which the
+      #     binary compiles.
       #
       # `tests/` is left out on purpose: `doCheck = false`, so nothing compiles
       # it.
@@ -134,12 +137,19 @@
           ./examples
           ./xtask
           ./desktop/src-tauri
+          ./vendor
           (lib.fileset.difference
             (lib.fileset.fileFilter
               (file: file.hasExt "md" || file.name == "published.toml")
               ./docs)
             ./docs/develop)
         ];
+      };
+
+      # The patched crossterm alone, for the dependency-only build below.
+      vendoredCrossterm = lib.fileset.toSource {
+        root = ./vendor/crossterm;
+        fileset = ./vendor/crossterm;
       };
 
       # Built once here and reused by packages, checks and the overlay, so the
@@ -194,7 +204,23 @@
           # dependency graph, aws-lc-sys and its ~600 C files included. It is
           # keyed on Cargo.lock and Cargo.toml, so it survives every change to
           # our own code and gets rebuilt only when the dependency set moves.
-          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+          #
+          # Except `vendor/crossterm`: crane stubs every path crate, and that
+          # one is a dependency (Cargo.toml's `[patch.crates-io]`), so the stub
+          # left ratatui-crossterm compiling against an empty crossterm. The
+          # dummy source gets the real crate back, and this derivation is
+          # also rebuilt when that copy changes. It is copied from a source of
+          # its own, not from `src`, which would rebuild this derivation on
+          # every change to our code; and it goes in through `extraDummyScript`
+          # rather than a `dummySrc` of our own, which makes crane read the
+          # manifests out of a built derivation and fails `nix flake check
+          # --all-systems` for the systems this runner cannot build.
+          cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
+            extraDummyScript = ''
+              rm -rf $out/vendor/crossterm
+              cp -r --no-preserve=mode ${vendoredCrossterm} $out/vendor/crossterm
+            '';
+          });
         in
         craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;

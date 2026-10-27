@@ -90,7 +90,7 @@ if [ -z "$native" ] && [ -n "$webkit_libdir" ] && [ -x "$webkit_libdir/../bin/We
   native=$(cd "$webkit_libdir/../bin" && pwd)/WebKitWebDriver
 fi
 if [ -z "$native" ]; then
-  echo "driver-test: WebKitWebDriver not found (apt: webkit2gtk-driver; devbox: beside pkg-config's webkit2gtk-4.1)" >&2
+  echo "driver-test: WebKitWebDriver not found (apt: webkitgtk-webdriver, or webkit2gtk-driver on Ubuntu 24.04; devbox: beside pkg-config's webkit2gtk-4.1)" >&2
   exit 1
 fi
 export DAD_DRIVER_NATIVE_DRIVER=$native

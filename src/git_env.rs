@@ -32,6 +32,22 @@
 //! on `test` by a `#[cfg]`, so a fixture that builds its own repositories is a
 //! separate question — [`fixture_git`] below is what those should use, and
 //! issue #1121 is where that half is tracked.
+//!
+//! **The same builders switch off hooks and fsmonitor** (issue #1888). A
+//! dispatched agent can write its repository's shared `.git/config` and
+//! `.git/hooks/`, which every linked worktree shares, so without this a
+//! `post-checkout` hook it planted runs on the deck's next `git worktree add`,
+//! and a `core.fsmonitor` command it configured runs on the deck's next `git
+//! status`, both in the daemon's process and environment.
+//! [`NO_HOOKS_OR_FSMONITOR`] is the list, and every builder below puts it on
+//! the command line. The production calls are reads plus `fetch`, `pull
+//! --ff-only`, `worktree add`/`remove`/`prune` and `branch -D`, and none of
+//! them needs a hook: what they can fire is `post-checkout`, `post-merge` and
+//! `reference-transaction`, and Git LFS's copies of the first two only mark
+//! lockable files read-only (its content arrives through the smudge filter,
+//! which is configuration, not a hook). What the user loses is their own
+//! `post-checkout` that bootstraps a fresh worktree, which no longer runs when
+//! the deck creates one.
 
 use std::path::Path;
 use std::process::Command;
@@ -86,8 +102,47 @@ pub(crate) const AMBIENT_LOCATION_VARS: [&str; 8] = [
 /// module header on why a second copy of anything in this file is the defect.
 pub(crate) const GIT: &str = "git";
 
+/// `-c` overrides that keep the deck's own git commands from running a hook or
+/// an fsmonitor command that a repository's configuration or `hooks/`
+/// directory names (issue #1888). A `-c` outranks every configuration file,
+/// the repository's own included, so neither `core.hooksPath` in
+/// `.git/config` nor a script in `.git/hooks/` brings one back.
+///
+/// Git looks a hook up as `<core.hooksPath>/<name>`, and under `/dev/null` that
+/// is never a file on Linux or macOS. Git for Windows is not a target the deck
+/// ships for yet; there the path reads as `\dev\null\<name>` on the current
+/// drive, which is absent unless someone creates it, so this list is to be
+/// revisited before Windows ships.
+///
+/// The telemetry probe (`crate::telemetry::run_context`) builds on these
+/// builders and adds its own list on top, so this list is not repeated there.
+pub(crate) const NO_HOOKS_OR_FSMONITOR: [&str; 2] =
+    ["core.hooksPath=/dev/null", "core.fsmonitor=false"];
+
+/// `git` with the ambient location environment cleared and
+/// [`NO_HOOKS_OR_FSMONITOR`] on the command line — the one body both
+/// [`git_at`] and [`git_async`] are built from, so the two cannot drift. The
+/// `-c` pairs come first, so they precede whatever subcommand a caller adds.
+fn hardened() -> Command {
+    let mut cmd = scrubbed();
+    for config in NO_HOOKS_OR_FSMONITOR {
+        cmd.arg("-c").arg(config);
+    }
+    cmd
+}
+
+/// `git` with only the ambient location environment cleared.
+fn scrubbed() -> Command {
+    let mut cmd = Command::new(GIT);
+    for var in AMBIENT_LOCATION_VARS {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 /// `git`, to be run from inside `dir`, with the ambient location environment
-/// switched off so the answer depends on `dir` and nothing else.
+/// switched off so the answer depends on `dir` and nothing else, and with
+/// hooks and fsmonitor off ([`NO_HOOKS_OR_FSMONITOR`]).
 ///
 /// Every synchronous `git` invocation in [`crate::worktree_owner`]'s and
 /// [`crate::worktree_reclaim`]'s PRODUCTION code goes through here — checked
@@ -97,16 +152,13 @@ pub(crate) const GIT: &str = "git";
 /// immune to the same ambient override. Their test fixtures are outside that
 /// claim; see the module header.
 pub(crate) fn git_at(dir: &Path) -> Command {
-    let mut cmd = Command::new(GIT);
+    let mut cmd = hardened();
     cmd.current_dir(dir);
-    for var in AMBIENT_LOCATION_VARS {
-        cmd.env_remove(var);
-    }
     cmd
 }
 
-/// `git`, async, with the ambient location environment switched off — the
-/// [`git_at`] of the `tokio` sites.
+/// `git`, async, with the ambient location environment switched off and
+/// hooks and fsmonitor off — the [`git_at`] of the `tokio` sites.
 ///
 /// No `current_dir`: these callers pass the directory as `-C <dir>` in their
 /// argv, which the same variables outrank in exactly the same way (issue
@@ -114,14 +166,10 @@ pub(crate) fn git_at(dir: &Path) -> Command {
 /// `issue_dispatch_run` and `dispatch` use).
 ///
 /// Separate from [`git_at`] because `tokio::process::Command` and
-/// `std::process::Command` are unrelated types — but the variable list they
-/// clear is the single one above, which is the property that has to hold.
+/// `std::process::Command` are unrelated types — but it is converted from the
+/// same [`hardened`] command, which is the property that has to hold.
 pub(crate) fn git_async() -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new(GIT);
-    for var in AMBIENT_LOCATION_VARS {
-        cmd.env_remove(var);
-    }
-    cmd
+    hardened().into()
 }
 
 /// Test-only: `git`, to be run from inside `dir`, with the ambient git
@@ -142,7 +190,23 @@ pub(crate) fn git_async() -> tokio::process::Command {
 /// with [`git_at`].
 #[cfg(test)]
 pub(crate) fn fixture_git(dir: &Path, sandbox_root: &Path) -> Command {
-    let mut cmd = git_at(dir);
+    sandboxed(git_at(dir), sandbox_root)
+}
+
+/// Test-only: [`fixture_git`] WITHOUT [`NO_HOOKS_OR_FSMONITOR`], so the
+/// repository's hooks and fsmonitor run as they would for a plain `git`. For a
+/// control that proves a planted hook is armed before a test shows the deck's
+/// own commands do not run it; never for building a fixture.
+#[cfg(test)]
+pub(crate) fn fixture_git_with_hooks(dir: &Path, sandbox_root: &Path) -> Command {
+    let mut cmd = scrubbed();
+    cmd.current_dir(dir);
+    sandboxed(cmd, sandbox_root)
+}
+
+/// The configuration and identity half of [`fixture_git`].
+#[cfg(test)]
+fn sandboxed(mut cmd: Command, sandbox_root: &Path) -> Command {
     let absent = sandbox_root.join("no-such-gitconfig");
     cmd.env("GIT_CONFIG_GLOBAL", &absent)
         .env("GIT_CONFIG_SYSTEM", &absent)

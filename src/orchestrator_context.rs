@@ -205,7 +205,11 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          Wait for its work-done signal before delegating again to the same worker. \
          The daemon enforces this: a delegate to a worker that still owes a work-done is \
          refused, and the refusal names the worker and what to do. \
-         Delegating to different workers in parallel is fine.\n\n\
+         Delegating to different workers in parallel is fine. \
+         Each task the deck hands a worker names its task id, and the worker reports with it: \
+         a report that arrives as `<role> completed task <id>` completes that task. A report \
+         that names no task arrives as a note from the worker and completes nothing, so the \
+         worker still owes the work-done for its task.\n\n\
          To add information to a task a worker is still working on, mind which kind of worker \
          it is. A worker marked *starts fresh for every task* above is restarted by every \
          delegate it receives, `--supersede` included: its agent is replaced, the new agent \
@@ -214,10 +218,9 @@ pub fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
          cannot wait, `{bin} delegate --supersede` with the whole task restated together with \
          the addition, knowing the worker starts over. A worker without that mark keeps its \
          agent, so `{bin} delegate --supersede` reaches the running agent with its work intact: \
-         say in the task that it adds to the task the worker is doing. The deck counts the \
-         addition as a task of its own, so a worker that had already taken the original task \
-         owes a work-done for each: tell it to report both, or your next delegate to it is \
-         refused as busy. The marks show `.dot-agent-deck.toml` as it was when this orchestration \
+         say in the task that it adds to the task the worker is doing. The addition replaces \
+         the original task, so the worker owes one work-done, for both together: tell it to \
+         report the whole of its work in that one. The marks show `.dot-agent-deck.toml` as it was when this orchestration \
          started, and every delegate reads it again, so if it may have changed, check the role's \
          `clear` there before relying on a worker keeping its agent. A follow-up after a work-done is a new task too, so restate everything a \
          worker that starts fresh for every task needs: the files, the branch, and what its \

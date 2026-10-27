@@ -80,6 +80,8 @@ export type AgentInbox = {
   receiptsDegraded?: string;
   /** PRD #1666 §7: delivered messages whose evidence pauses hand-outs. */
   evidencePaused?: number;
+  /** PRD #1666 part 3 (R-2): the refusal code the deck gave the agent's own request for its waiting messages. */
+  admissionRefused?: string;
 };
 /**
  * PRD #1666 §6.4: one deck message an agent card lists for the user to decide

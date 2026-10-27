@@ -2167,7 +2167,9 @@ mod tests {
         assert!(!control.handed_to_supervisor());
 
         // ClientSpawns under a supervisor: the client starts its own build, so
-        // the daemon exits cleanly as before.
+        // the daemon exits cleanly as before. A client asks for it only when it
+        // does not know the daemon is supervised, or when the service's build
+        // was refused; otherwise it asks for Installed (issue #1760).
         let control = supervised(Supervisor::Systemd);
         control.mark_accepted(None);
         assert_eq!(control.take_successor_plan(), SuccessorPlan::Nothing);

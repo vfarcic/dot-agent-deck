@@ -293,6 +293,11 @@ pub struct AgentSpec {
     /// not installed), which leaves the pins the daemon already knows. `None`
     /// for an agent with no startup install step.
     pub configured_pins: Option<fn() -> Option<Vec<crate::hook_binary::HookPin>>>,
+    /// PRD #1666 part 3, R-3: [`Self::startup_auto_install`]'s own install,
+    /// run for `hooks refresh`, saying whether the agent is installed here and
+    /// what the install could not read or write, which the startup install
+    /// only logs. `None` exactly where `startup_auto_install` is.
+    pub refresh_install: Option<fn() -> crate::hooks_refresh::InstallAttempt>,
     /// PRD #1541: the keys that interrupt this agent's turn and edit its
     /// prompt, as measured against the versions [`PromptKeys`] names. `None`
     /// where they are unmeasured (Devin) or there is no agent to press them at
@@ -806,6 +811,7 @@ pub static CLAUDE_CODE: AgentSpec = AgentSpec {
     materialize: None,
     startup_auto_install: Some(crate::hooks_manage::auto_install),
     configured_pins: Some(crate::hooks_manage::configured_pins),
+    refresh_install: Some(crate::hooks_manage::refresh_install),
     // PRD #1541, measured on Claude Code 2.1.289: one ESC interrupts; one
     // Ctrl+U per WRAPPED row, and a single write of 64+ is ignored, so 32 per
     // write; an unbracketed write over 800 characters collapses to a paste.
@@ -885,6 +891,7 @@ pub static OPEN_CODE: AgentSpec = AgentSpec {
     materialize: None,
     startup_auto_install: Some(crate::opencode_manage::auto_install),
     configured_pins: Some(crate::opencode_manage::configured_pins),
+    refresh_install: Some(crate::opencode_manage::refresh_install),
     // PRD #1541, measured on OpenCode 1.18.34: ESC, ~300 ms, ESC interrupts;
     // one Ctrl+U per line; no paste collapse of an unbracketed write.
     prompt_keys: Some(PromptKeys {
@@ -923,6 +930,7 @@ pub static PI: AgentSpec = AgentSpec {
     // as Pi (`agent_pty::pi_spawn`, PRD #1666 G6; #210).
     startup_auto_install: None,
     configured_pins: None,
+    refresh_install: None,
     // PRD #1541, measured on Pi 0.87.1: one ESC interrupts; one Ctrl+U per
     // line; no paste collapse of an unbracketed write.
     prompt_keys: Some(PromptKeys {
@@ -975,6 +983,7 @@ pub static CODEX: AgentSpec = AgentSpec {
     // seam can't detect and which therefore got NO integration before.
     startup_auto_install: Some(crate::codex_hooks_manage::auto_install_and_trust_at_startup),
     configured_pins: Some(crate::codex_hooks_manage::configured_pins),
+    refresh_install: Some(crate::codex_hooks_manage::refresh_install),
     // PRD #1541, measured on Codex 0.160.0: one ESC interrupts; one Ctrl+U per
     // line; an unbracketed write over 1000 characters collapses to a paste.
     prompt_keys: Some(PromptKeys {
@@ -1201,6 +1210,7 @@ pub static DEVIN: AgentSpec = AgentSpec {
     materialize: None,
     startup_auto_install: Some(crate::devin_hooks_manage::auto_install),
     configured_pins: Some(crate::devin_hooks_manage::configured_pins),
+    refresh_install: Some(crate::devin_hooks_manage::refresh_install),
     // PRD #1541: unsupported, not measured — Devin was logged out on the box
     // the key table was measured on, so none of its keys could be verified.
     prompt_keys: None,
@@ -1229,6 +1239,7 @@ pub static NONE: AgentSpec = AgentSpec {
     materialize: None,
     startup_auto_install: None,
     configured_pins: None,
+    refresh_install: None,
     // Not an agent: there is nothing to press keys at.
     prompt_keys: None,
     doorbell_composer: None,
@@ -1485,6 +1496,13 @@ mod tests {
             assert_eq!(
                 spec.startup_auto_install.is_some(),
                 spec.configured_pins.is_some(),
+                "{:?}",
+                spec.agent_type
+            );
+            // PRD #1666 part 3, R-3: and `hooks refresh` runs it.
+            assert_eq!(
+                spec.startup_auto_install.is_some(),
+                spec.refresh_install.is_some(),
                 "{:?}",
                 spec.agent_type
             );

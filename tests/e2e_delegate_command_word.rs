@@ -173,8 +173,9 @@ async fn delegate_020_inner(bin_dir: &str, inherited_path: &str) {
     // whole instruction line this test parses, closing quote included.
     let complete = |body: &str| {
         body.lines().any(|l| {
-            l.split_once(" work-done --task-file '")
-                .is_some_and(|(_, rest)| rest.contains('\''))
+            l.contains(" work-done ")
+                && l.split_once(" --task-file '")
+                    .is_some_and(|(_, rest)| rest.contains('\''))
         })
     };
     if let Err(state) = common::wait_for_file_matching_async(
@@ -192,7 +193,7 @@ async fn delegate_020_inner(bin_dir: &str, inherited_path: &str) {
     // fenced block, with the one placeholder it is told to fill in.
     let line = body
         .lines()
-        .find(|l| l.contains(" work-done --task-file '"))
+        .find(|l| l.contains(" work-done ") && l.contains(" --task-file '"))
         .unwrap_or_else(|| panic!("no `work-done --task-file` line in the task file:\n{body}"))
         .replace("<summary-slug>", "delegate-020");
     // The report path is the single-quoted value AFTER `--task-file`: the

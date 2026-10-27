@@ -79,6 +79,17 @@ pub fn peer_uid_raw(fd: RawFd) -> std::io::Result<u32> {
     Ok(uid)
 }
 
+/// PRD #1666 part 3 (R-1): whether the process on the other end of `stream`
+/// runs as this process's user, as the kernel recorded it when the connection
+/// was made ([`peer_uid_raw`]); `None` when it cannot be read. The daemon's
+/// inbox admits a holder of a pane's capability on this, not on where the
+/// holder sits in the process table.
+pub fn peer_is_same_user(stream: &IpcStream) -> Option<bool> {
+    peer_uid_raw(stream.as_raw_fd())
+        .ok()
+        .map(|uid| uid == crate::platform::paths::current_uid())
+}
+
 /// Linux variant — `getsockopt(SOL_SOCKET, SO_PEERCRED)`.
 ///
 /// The PRD considered `std::os::unix::net::UnixStream::peer_cred()` and
