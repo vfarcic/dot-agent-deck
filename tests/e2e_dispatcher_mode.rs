@@ -769,16 +769,39 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
 /// confirm that its tab, worktree, context and generation-bound inbox delegation appear, using
 /// a normally opened orchestration as a control. Delegations from an unknown
 /// pane or to an unknown role must fail loudly. After the worker reports its
-/// first task done, a delegate to it and a nonexistent role must report partial
-/// delivery without inviting a duplicate retry.
+/// first task done using its delegation's task id, a delegate to it and a
+/// nonexistent role must report partial delivery without inviting a duplicate retry.
 #[spec("orchestration/dispatch/001")]
 #[test]
 fn orchestration_dispatch_001_tab_surfaces_with_role_cards() {
     const UNIT: &str = "team-probe";
 
+    // Task-scoped reports require the capability issued to the worker, even
+    // under the permissive policy used for the other impersonated signals.
+    // Let the fixture's cat stand-ins export their own capabilities.
+    use std::os::unix::fs::PermissionsExt as _;
+    let stand_ins = common::harness_tempdir().expect("stand-in command directory");
+    let cat = stand_ins.path().join("cat");
+    std::fs::write(
+        &cat,
+        format!(
+            "#!/bin/sh\n{}\n",
+            common::capability_export_command("exec /bin/cat")
+        ),
+    )
+    .expect("write capability-exporting cat stand-in");
+    std::fs::set_permissions(&cat, std::fs::Permissions::from_mode(0o700))
+        .expect("make cat stand-in executable");
     let deck = TuiDeck::builder()
         .impersonating_pane_signals()
-        .with_env("PATH", common::path_with_binary_dir())
+        .with_env(
+            "PATH",
+            format!(
+                "{}:{}",
+                stand_ins.path().display(),
+                common::path_with_binary_dir()
+            ),
+        )
         .launch_with_fixture("orch-deck");
     deck.wait_for_string("No active agents");
 
@@ -1076,10 +1099,41 @@ fn orchestration_dispatch_001_tab_surfaces_with_role_cards() {
     // The worker already received a delegation above. A second delegate is
     // refused while it still owes work-done (#580), so finish that first task
     // before exercising a different partial-delivery outcome.
+    let task_id = inbox_view::messages(deck.attach_socket_path(), &dispatched["worker"])
+        .into_iter()
+        .find(|message| {
+            message
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains("Dispatched delegation."))
+        })
+        .expect("the dispatched worker received its delegation above")
+        .id
+        .to_string();
+    let worker_agent = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|record| record.pane_id_env.as_deref() == Some(&dispatched["worker"]))
+        .expect("the dispatched worker has a live agent record")
+        .id;
+    let capability = tokio::runtime::Runtime::new()
+        .expect("capability reader runtime")
+        .block_on(common::recorded_hook_capability(
+            &expected_worktree,
+            &worker_agent,
+        ))
+        .expect("the dispatched worker exported its own capability");
     let done = std::process::Command::new(common::contained_deck_binary())
-        .args(["work-done", "--task", "Dispatched delegation complete."])
+        .args([
+            "work-done",
+            "--task-id",
+            &task_id,
+            "--task",
+            "Dispatched delegation complete.",
+        ])
         .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
         .env("DOT_AGENT_DECK_PANE_ID", &dispatched["worker"])
+        .env("DOT_AGENT_DECK_AGENT_ID", &worker_agent)
+        .env("DOT_AGENT_DECK_PANE_CAPABILITY", &capability)
         .output()
         .expect("the work-done CLI should run");
     assert!(
