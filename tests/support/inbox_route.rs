@@ -441,6 +441,8 @@ pub fn idle_clock(case: u8) {
     };
     let mut ack = inbox::request(&worker, "ack");
     ack["delivery_id"] = json!(active);
+    let ack_started = std::time::Instant::now();
+    let early_notice_deadline = ack_started + Duration::from_millis(250);
     inbox::hook(&daemon, ack);
     inbox::state(&daemon, &worker, &active, "acknowledged");
     if case == 28 {
@@ -453,7 +455,22 @@ pub fn idle_clock(case: u8) {
             "completion must cancel idle clock"
         );
     } else {
-        no_messages(&daemon, &orch, Duration::from_millis(250));
+        // The observer's ack/state round trips consume this interval too. A
+        // sample completed after the deadline cannot establish an early notice.
+        while std::time::Instant::now() < early_notice_deadline {
+            let sample = messages(&daemon, &orch);
+            let sampled_at = std::time::Instant::now();
+            if sampled_at >= early_notice_deadline {
+                break;
+            }
+            assert!(
+                sample.is_empty(),
+                "premature daemon message during post-acknowledgement silence \
+                 at {:?} after ack request (250ms deadline): {sample:?}",
+                sampled_at.duration_since(ack_started)
+            );
+            std::thread::sleep(Duration::from_millis(50).min(early_notice_deadline - sampled_at));
+        }
         notice(&daemon, &orch, "responded");
         count(&daemon, &orch, 1);
     }
