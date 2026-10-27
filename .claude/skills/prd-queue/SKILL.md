@@ -470,10 +470,11 @@ GATES — CLAUDE.md is the authority, this is the summary:
   (docs/develop/rwx.md): the helper already runs its cargo commands in an RWX
   sandbox, and any OTHER heavy cargo command you run (a filtered nextest or
   `cargo test-e2e` run, a build) goes through `rwx sandbox exec -- <command>`,
-  then `rwx sandbox stop`, so the compile leaves this shared machine.
-  `cargo test-e2e-live`, anything else that reaches a real agent, and
-  `cargo mutants` (the sandbox does not have it; do not raise its `--jobs`)
-  stay local.
+  then `rwx sandbox stop`, so the compile leaves this shared machine; if
+  `rwx whoami` fails, run it locally and say so in your report. Anything that
+  reaches a real agent (`cargo test-e2e-live`, or any command with the
+  `e2e-live` feature) and `cargo mutants` (the sandbox does not have it; do
+  not raise its `--jobs`) stay local.
 - The full matrix can also run on GitHub's runners, and it RELIEVES NOTHING
   above. ci.yml carries a bare `workflow_dispatch:`, so after a push
   `gh workflow run ci.yml --ref <branch>` runs it there (take the run id from
