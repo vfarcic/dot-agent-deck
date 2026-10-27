@@ -6547,6 +6547,9 @@ pub struct AgentPtyRegistry {
     /// reader captured as its termination.
     #[cfg(test)]
     terminations: Mutex<HashMap<String, Termination>>,
+    /// Test-only pauses before a generation's termination observation starts.
+    #[cfg(test)]
+    termination_holds: Mutex<HashMap<String, StdPause>>,
     /// PRD #1666 §2.8 test seam: panes whose next published generation waits
     /// before handing the inbox over — see [`Self::hold_next_handover_for_test`].
     #[cfg(test)]
@@ -8611,6 +8614,8 @@ impl AgentPtyRegistry {
             exit_cleanup_holds: Mutex::new(HashMap::new()),
             #[cfg(test)]
             terminations: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            termination_holds: Mutex::new(HashMap::new()),
             #[cfg(test)]
             handover_holds: Mutex::new(HashMap::new()),
             #[cfg(test)]
@@ -11118,6 +11123,14 @@ impl AgentPtyRegistry {
         registered_at_eof: bool,
         read_end: ReadEnd,
     ) -> Termination {
+        #[cfg(test)]
+        {
+            let hold = self.termination_holds.lock().unwrap().remove(agent_id);
+            if let Some((reached, release)) = hold {
+                let _ = reached.send(());
+                let _ = release.recv();
+            }
+        }
         let termination = self.observe_termination(agent_id, removal, registered_at_eof, read_end);
         #[cfg(test)]
         self.terminations

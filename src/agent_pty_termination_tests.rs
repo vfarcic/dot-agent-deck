@@ -180,16 +180,40 @@ fn status_032_without_a_report_the_wrappers_status_is_the_decks() {
     }
 }
 
-/// Scenario: One generation is respawned in its pane, another is closed, and a third is still running when the deck shuts down. The capture must say the first pane was replaced and the other two were closed.
+/// Scenario: One generation is respawned in its pane, with its termination observation held until the successor publishes, even when publication is delayed beyond the capture bound. Another generation is closed and the successor is still running when the deck shuts down; the captures must say replaced, closed, and closed respectively.
 #[spec("inbox/status/032")]
 #[tokio::test]
 async fn status_032_removal_is_replaced_or_closed() {
     let registry = Arc::new(AgentPtyRegistry::new());
     let replaced = spawn_on(&registry, "termination-respawn-pane", "sleep 30");
+    let (capture_reached_tx, capture_reached) = std::sync::mpsc::channel();
+    let (release_capture, capture_release_rx) = std::sync::mpsc::channel();
+    registry
+        .termination_holds
+        .lock()
+        .unwrap()
+        .insert(replaced.clone(), (capture_reached_tx, capture_release_rx));
+    let (publish_reached, release_publish) = registry.pause_next_publish_for_test();
+    let delayed_publication = std::thread::spawn(move || {
+        capture_reached
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the predecessor's reader reached its capture");
+        publish_reached
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the successor reached publication");
+        // Expose the original race without relying on a slow host: the
+        // predecessor's capture would expire while publication is held.
+        std::thread::sleep(TERMINATION_WAIT * 2);
+        release_publish.send(()).expect("release publication");
+    });
     let successor = registry
         .respawn_agent_for_pane("termination-respawn-pane", "sleep 30")
         .await
         .expect("respawn");
+    delayed_publication.join().expect("delayed publication");
+    release_capture
+        .send(())
+        .expect("release the capture after publication");
     assert_ne!(successor, replaced);
     let closed = spawn_on(&registry, "termination-close-pane", "sleep 30");
     registry.close_agent(&closed).expect("close");
