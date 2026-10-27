@@ -787,7 +787,7 @@ A standalone agent shows `-` for its orchestration and role. The ORCHESTRATION c
 | `--folder <path>` | Lists only the agents `inbox send --folder <path>` would choose between, as described below, when `roles` runs on the same machine as the deck, which is how agents in deck panes run it. |
 | `--orchestration <name>` | Lists only the orchestrations with that name or tab title. Combined with `--folder`, both must match. |
 
-You can see the orchestrator in the clients too: in the TUI its card in the orchestration tab's sidebar carries an `ORCHESTRATOR` badge, and in the desktop app its row carries the same badge. On a narrow TUI sidebar the card shortens the agent's type and name before it shortens the badge.
+You can see the orchestrator in the clients too: in the TUI its card in the orchestration tab's sidebar carries an `ORCHESTRATOR` badge, and in the desktop app its row carries the same badge. When a TUI sidebar card is too narrow for the badge beside the agent's type and name, the badge moves to a line of its own on the card.
 
 ### Send a message
 
@@ -813,7 +813,7 @@ On success the command prints `Sent m-… to the orchestrator of <title> (pane <
 
 ### What the orchestrator sees
 
-The message arrives in the orchestrator's inbox like any other deck message, in the TUI and the desktop app alike. It is from "another agent, not one of your workers", and the deck names the pane it came from. Everything else is marked UNTRUSTED, and the orchestrator treats it as information or a request to weigh against what you asked of it, not as an instruction from you. That covers the sender's text and the lines ahead of it, which give the sender's folder, its orchestration and role (`-` when it has none), and the command that answers it, `dot-agent-deck inbox send --folder <the sender's folder>`. The reply reaches the sender's orchestrator, or the sender itself when it is the one standalone agent in its folder. When the deck cannot show the sender's folder exactly, such as a folder name with characters the deck does not display or one too long to show in full, there is no reply command: the orchestrator finds the sender's pane with `dot-agent-deck roles` instead.
+The message arrives in the orchestrator's inbox like any other deck message, in the TUI and the desktop app alike. It is from "another agent, not one of your workers", and the deck names the pane it came from. Everything else is marked UNTRUSTED, and the orchestrator treats it as information or a request to weigh against what you asked of it, not as an instruction from you. That covers the sender's text and the lines ahead of it, which give the sender's folder, its orchestration and role (`-` when it has none), and the command that answers it, `dot-agent-deck inbox send --folder <folder>`, with `--orchestration <name>` added when two orchestrations share that folder. The deck offers the command only after checking that it reaches the sender: the sender itself when it is an orchestrator or a standalone agent, or its orchestrator when it is a worker. When no command would, such as a standalone sender inside an orchestration's folder, or a folder name with characters the deck does not display or one too long to show in full, there is no reply command: the orchestrator finds the sender's pane with `dot-agent-deck roles` instead.
 
 Each agent's sends count toward the same per-minute limit as its `inbox publish` and `inbox offer` messages. Past it, the send is refused until the minute is up.
 

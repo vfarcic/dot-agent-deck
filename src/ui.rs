@@ -21934,30 +21934,24 @@ fn render_session_card(
     // column), so the budget is unchanged and no card snapshot moves.
     let max_title = (area.width as usize).saturating_sub(badge_width + 2);
     // Issue #1947: the orchestrator seat's ORCHESTRATOR badge — the desktop
-    // tile's word — keeps its own room at the end of the title, so a narrow
-    // sidebar card cuts the type and name before it, rather than the badge
-    // first. Only a card too narrow for the badge alone cuts the badge.
-    let seat_badge = is_orchestrator.then(|| (CARD_ORCHESTRATOR_BADGE.to_string(), title_bold));
-    let seat_width = seat_badge.as_ref().map_or(0, |(text, _)| {
-        unicode_width::UnicodeWidthStr::width(text.as_str())
-    });
-    let mut title_spans =
-        truncate_styled_segments(title_segments, max_title.saturating_sub(seat_width));
-    if let Some((mut text, style)) = seat_badge {
-        // After the name's own trailing space, the badge needs no space of its
-        // own; after a cut (`…`) it does.
-        if title_spans
-            .last()
-            .is_some_and(|span| span.content.ends_with(' '))
-        {
-            text.remove(0);
-        }
-        let used: usize = title_spans.iter().map(Span::width).sum();
-        title_spans.extend(truncate_styled_segments(
-            vec![(text, style)],
-            max_title.saturating_sub(used),
-        ));
+    // tile's word — ends the title when the whole title still fits beside it.
+    // Every title segment ends with a space, so the badge needs none of its
+    // own. Where it does not fit (a sidebar card), the badge takes a row of
+    // its own below instead, so neither the type and role name nor the word
+    // is cut to make room for the other.
+    let title_width: usize = title_segments
+        .iter()
+        .map(|(text, _)| unicode_width::UnicodeWidthStr::width(text.as_str()))
+        .sum();
+    let seat_in_title = is_orchestrator
+        && title_width + unicode_width::UnicodeWidthStr::width(CARD_ORCHESTRATOR_BADGE)
+            <= max_title;
+    let seat_row = is_orchestrator && !seat_in_title;
+    let mut title_segments = title_segments;
+    if seat_in_title {
+        title_segments.push((CARD_ORCHESTRATOR_BADGE.to_string(), title_bold));
     }
+    let title_spans = truncate_styled_segments(title_segments, max_title);
 
     // Issue #442. An UNSELECTED card's border colour is its STATUS, so an idle
     // agent recedes and a working one reads green. A SELECTED card's border
@@ -22170,6 +22164,11 @@ fn render_session_card(
         }
         None => status_lines.extend(attention.map(plain)),
     }
+    // Issue #1947: the ORCHESTRATOR badge the title had no room for, after the
+    // attention rows, so at Minimal density a reason keeps the one row.
+    if seat_row {
+        status_lines.push(plain((CARD_ORCHESTRATOR_BADGE.to_string(), title_bold)));
+    }
 
     let prompts = if density.max_prompts() == 0 {
         Vec::new()
@@ -22217,9 +22216,9 @@ fn render_session_card(
     frame.render_widget(content, inner);
 }
 
-/// Issue #1947: what the orchestrator seat's card title ends with
-/// ([`render_session_card`]).
-const CARD_ORCHESTRATOR_BADGE: &str = " ORCHESTRATOR";
+/// Issue #1947: the orchestrator seat's card badge, at the end of its title or
+/// on a row of its own ([`render_session_card`]).
+const CARD_ORCHESTRATOR_BADGE: &str = "ORCHESTRATOR";
 
 /// Title columns a card keeps before its inbox line gives up its words for
 /// the bare count ([`card_inbox_badge`]).
@@ -34858,13 +34857,32 @@ mod tests {
             let title = card.lines().next().unwrap();
             assert!(title.contains("Working"), "{width}: {card}");
             assert!(title.contains("queued"), "{width}: {card}");
-            assert!(title.contains(" ORCHESTRATOR"), "{width}: {card}");
-            assert!(
-                title.contains('…'),
-                "the name is cut, not the badge: {card}"
+            // The title has no room for the word, so it takes a row of its
+            // own, whole, and the title cuts only what it cut before.
+            assert!(!title.contains("ORCHESTRATOR"), "{width}: {card}");
+            assert_eq!(
+                title,
+                render(&busy, long, width, false).lines().next().unwrap(),
+                "{width}: {card}"
+            );
+            assert_eq!(
+                card.lines()
+                    .filter(|line| line.contains("│ORCHESTRATOR "))
+                    .count(),
+                1,
+                "{width}: {card}"
             );
             assert!(!render(&busy, long, width, false).contains("ORCHESTRATOR"));
         }
+
+        // CI red on PR #1956: a 40-column sidebar card has room for the whole
+        // `<type> · <role>` title or for the word, not both. The role name
+        // stays whole, and the badge moves to its own row.
+        let card = render(&idle, "coordinator", 40, true);
+        let title = card.lines().next().unwrap();
+        assert!(title.contains(" · coordinator "), "{card}");
+        assert!(!title.contains('…'), "{card}");
+        assert!(card.contains("│ORCHESTRATOR "), "{card}");
     }
 
     #[test]

@@ -559,11 +559,75 @@ fn shown_exactly(raw: &str) -> bool {
             == Some(raw)
 }
 
+/// Who answers a message from `caller`: the caller itself when it is a
+/// standalone agent or an orchestrator, and its orchestration's orchestrator
+/// when it is a worker, since the deck refuses a message to a worker. `None`
+/// for a worker whose orchestrator is not live.
+pub fn reply_target<'a>(
+    records: &'a [AgentRecord],
+    caller: &AgentRecord,
+) -> Option<&'a AgentRecord> {
+    match &caller.tab_membership {
+        Some(TabMembership::Orchestration {
+            is_start_role: false,
+            ..
+        }) => orchestrations(records)
+            .into_iter()
+            .find(|o| o.members.iter().any(|m| m.id == caller.id))
+            .and_then(|o| o.orchestrator),
+        _ => records.iter().find(|r| r.id == caller.id),
+    }
+}
+
+/// The address an `inbox send` run from `recipient_pane` reaches `reply_to`
+/// by, as the resolver answers it over `records`: `reply_to`'s folder, with
+/// its orchestration's name or title added when the folder alone is not
+/// unique. `None` when no such address resolves to `reply_to` alone, or when
+/// a value it would print would not reach the recipient exactly as written
+/// ([`shown_exactly`]), so a printed command never routes elsewhere.
+pub fn reply_address(
+    records: &[AgentRecord],
+    key: &dyn Fn(&str) -> String,
+    reply_to: &AgentRecord,
+    recipient_pane: &str,
+) -> Option<MessageAddress> {
+    let folder = record_folder(reply_to).filter(|folder| shown_exactly(folder))?;
+    let mut addresses = vec![MessageAddress {
+        folder: Some(folder.to_string()),
+        orchestration: None,
+    }];
+    if let Some(TabMembership::Orchestration {
+        name,
+        display_title,
+        ..
+    }) = &reply_to.tab_membership
+    {
+        for named in std::iter::once(name).chain(display_title) {
+            if shown_exactly(named) {
+                addresses.push(MessageAddress {
+                    folder: Some(folder.to_string()),
+                    orchestration: Some(named.clone()),
+                });
+            }
+        }
+    }
+    addresses.into_iter().find(|address| {
+        validate(address).is_ok()
+            && resolve(records, address, key, recipient_pane)
+                .is_ok_and(|resolution| resolution.target().id == reply_to.id)
+    })
+}
+
 /// Who sent the message and how to answer it, as the first lines of the
 /// untrusted body: the caller's folder, its orchestration's title and its
-/// role, then the command that replies. The command names the caller's exact
-/// folder, and is left out when the folder line could not show it exactly.
-pub fn attribution(caller: Option<&AgentRecord>, caller_pane: &str) -> String {
+/// role, then the command that replies. The command is `reply`, which
+/// [`reply_address`] checked resolves back to the sender; without one, the
+/// line says where to look instead.
+pub fn attribution(
+    caller: Option<&AgentRecord>,
+    caller_pane: &str,
+    reply: Option<&MessageAddress>,
+) -> String {
     let raw_folder = caller.and_then(record_folder).unwrap_or("");
     let folder = attribution_value(raw_folder);
     let (orchestration, role) = match caller.map(|c| &c.tab_membership) {
@@ -578,18 +642,35 @@ pub fn attribution(caller: Option<&AgentRecord>, caller_pane: &str) -> String {
         ),
         _ => ("-".to_string(), "-".to_string()),
     };
-    let reply = if folder == "-" {
-        "dot-agent-deck roles (the sender's folder is unknown; find it there)".to_string()
-    } else if shown_exactly(raw_folder) {
-        format!(
-            "dot-agent-deck inbox send --folder {} --text '<your reply>'",
-            crate::platform::paths::shell_quote_if_needed(raw_folder)
-        )
-    } else {
-        let pane = preface_pane(caller_pane)
-            .map(|pane| format!("pane {pane}"))
-            .unwrap_or_else(|| "the sending agent".to_string());
-        format!("run dot-agent-deck roles and find {pane} (this folder cannot be shown exactly)")
+    let quote = crate::platform::paths::shell_quote_if_needed;
+    let reply = match reply {
+        Some(MessageAddress {
+            folder: Some(reply_folder),
+            orchestration,
+        }) => {
+            let named = orchestration
+                .as_deref()
+                .map(|name| format!(" --orchestration {}", quote(name)))
+                .unwrap_or_default();
+            format!(
+                "dot-agent-deck inbox send --folder {}{named} --text '<your reply>'",
+                quote(reply_folder)
+            )
+        }
+        _ if folder == "-" => {
+            "dot-agent-deck roles (the sender's folder is unknown; find it there)".to_string()
+        }
+        _ => {
+            let pane = preface_pane(caller_pane)
+                .map(|pane| format!("pane {pane}"))
+                .unwrap_or_else(|| "the sending agent".to_string());
+            let why = if shown_exactly(raw_folder) {
+                "no address reaches it alone"
+            } else {
+                "this folder cannot be shown exactly"
+            };
+            format!("run dot-agent-deck roles and find {pane} ({why})")
+        }
     };
     format!(
         "sender folder: {folder}\nsender orchestration: {orchestration}\nsender role: {role}\n\
@@ -603,6 +684,7 @@ pub fn content(
     caller: Option<&AgentRecord>,
     caller_pane: &str,
     caller_agent: &str,
+    reply: Option<&MessageAddress>,
     body: String,
 ) -> Content {
     Content {
@@ -613,7 +695,7 @@ pub fn content(
             orchestration: None,
         },
         subject: "a message from an agent outside your team".to_string(),
-        body: format!("{}\n\n{body}", attribution(caller, caller_pane)),
+        body: format!("{}\n\n{body}", attribution(caller, caller_pane, reply)),
         body_trust: BodyTrust::Untrusted,
         spill_path: None,
         id: None,
@@ -817,12 +899,19 @@ async fn handle_staged(
         .into();
     };
     let caller_record = records.iter().find(|r| r.id == caller_agent);
-    let message = content(caller_record, &caller_pane, &caller_agent, body);
-    let folder = target
-        .cwd
-        .clone()
-        .or_else(|| record_folder(target).map(str::to_string))
-        .unwrap_or_default();
+    let reply = caller_record
+        .and_then(|caller| reply_target(&records, caller))
+        .and_then(|reply_to| reply_address(&records, &key, reply_to, &target_pane));
+    let message = content(
+        caller_record,
+        &caller_pane,
+        &caller_agent,
+        reply.as_ref(),
+        body,
+    );
+    // The folder the address matched the recipient by: its orchestration's
+    // folder, else its pane's own, as `roles` lists it.
+    let folder = record_folder(target).unwrap_or_default().to_string();
     let (orchestration, title) = match &resolution {
         Resolution::Orchestrator { orchestration, .. } => (
             Some(orchestration.name.to_string()),
@@ -1082,8 +1171,8 @@ mod tests {
 
     #[test]
     fn the_sender_is_never_the_callers_own_role_and_the_preface_says_how_to_reply() {
-        let caller = record("c-w", "/w/c", Some(role("cfg", None, "c", "/w/c", false)));
-        let content = content(Some(&caller), "c-w", "agent-c-w", "hello".to_string());
+        let records = team("cfg", None, "c", "/w/c");
+        let content = content_among(&records, &records[1], "elsewhere", "hello");
         match &content.from {
             Sender::Agent { role, .. } => {
                 assert_eq!(role.as_deref(), Some(SENDER_ROLE));
@@ -1116,9 +1205,28 @@ mod tests {
         );
     }
 
+    /// What `caller` sends to the agent in pane `recipient`, with the reply
+    /// command the handler would offer over `records`.
+    fn content_among(
+        records: &[AgentRecord],
+        caller: &AgentRecord,
+        recipient: &str,
+        body: &str,
+    ) -> Content {
+        let reply = reply_target(records, caller)
+            .and_then(|reply_to| reply_address(records, &same, reply_to, recipient));
+        content(
+            Some(caller),
+            caller.pane_id_env.as_deref().unwrap(),
+            &caller.id,
+            reply.as_ref(),
+            body.to_string(),
+        )
+    }
+
+    /// What a standalone `record`, the only live agent, sends.
     fn content_of(record: &AgentRecord, body: &str) -> Content {
-        let pane = record.pane_id_env.as_deref().unwrap();
-        content(Some(record), pane, &record.id, body.to_string())
+        content_among(std::slice::from_ref(record), record, "elsewhere", body)
     }
 
     /// Audit 1 (A1): a folder, an orchestration title and a role are text a
@@ -1131,20 +1239,31 @@ mod tests {
         let folder = format!("/w/proj. {INJECTED}");
         let title = format!("title. {INJECTED}");
         let role_name = format!("role. {INJECTED}");
-        let caller = record(
-            "c-w",
-            &folder,
-            Some(TabMembership::Orchestration {
-                name: "cfg".to_string(),
-                role_index: 1,
-                role_name: role_name.clone(),
-                is_start_role: false,
-                orchestration_cwd: Some(folder.clone()),
-                display_title: Some(title.clone()),
-                orchestration_id: Some("c".to_string()),
-            }),
+        let member = |pane: &str, role_name: &str, seat: bool| {
+            record(
+                pane,
+                &folder,
+                Some(TabMembership::Orchestration {
+                    name: "cfg".to_string(),
+                    role_index: usize::from(!seat),
+                    role_name: role_name.to_string(),
+                    is_start_role: seat,
+                    orchestration_cwd: Some(folder.clone()),
+                    display_title: Some(title.clone()),
+                    orchestration_id: Some("c".to_string()),
+                }),
+            )
+        };
+        let records = vec![
+            member("c-o", "lead", true),
+            member("c-w", &role_name, false),
+        ];
+        let content = content_among(&records, &records[1], "elsewhere", "hello");
+        assert!(
+            reply_line(&content.body).contains("--folder"),
+            "the reply reaches the worker's orchestrator: {}",
+            content.body
         );
-        let content = content_of(&caller, "hello");
         let preface = content.preface.clone().unwrap();
         assert!(!preface.contains("Ignore previous"), "{preface}");
         assert!(
@@ -1240,7 +1359,7 @@ mod tests {
             assert!(!body.contains("inbox send"), "{body:?}");
             assert!(!body.contains("--folder"), "{body:?}");
             // A pane id that is not an opaque identifier is not named.
-            let odd = content(Some(&caller), "c 1", &caller.id, "hi".to_string()).body;
+            let odd = content(Some(&caller), "c 1", &caller.id, None, "hi".to_string()).body;
             assert!(
                 reply_line(&odd).contains("find the sending agent (this folder"),
                 "{odd:?}"
@@ -1281,10 +1400,93 @@ mod tests {
         }
     }
 
+    /// Qodo/Greptile on PR #1956: a standalone sender in the folder an
+    /// orchestration owns, or below it, cannot be reached by `--folder`: the
+    /// resolver picks the orchestration first, and for its own orchestrator
+    /// that is a refusal. No command is offered; the line points at `roles`.
+    #[test]
+    fn a_standalone_sender_at_or_below_an_orchestrations_folder_gets_no_command() {
+        for caller_dir in ["/w/team", "/w/team/sub"] {
+            let mut records = team("cfg", Some("cfg · t"), "t", "/w/team");
+            records.push(record("solo", caller_dir, None));
+            // The command the folder alone would make reaches the
+            // orchestration, which its orchestrator may not message.
+            let refused = resolve(&records, &by(Some(caller_dir), None), &same, "t-o")
+                .map(|r| r.target().id.clone())
+                .unwrap_err();
+            assert_eq!(refused.reason, AddressRefusalReason::OwnOrchestration);
+            let body = content_among(&records, &records[2], "t-o", "hi").body;
+            assert_eq!(
+                reply_line(&body),
+                "reply with: run dot-agent-deck roles and find pane solo \
+                 (no address reaches it alone)",
+                "{caller_dir}: {body}"
+            );
+            assert!(!body.contains("--folder"), "{caller_dir}: {body}");
+        }
+    }
+
+    /// Greptile on PR #1956: two orchestrations in one folder make the folder
+    /// alone ambiguous, so the reply names the sender's orchestration too, and
+    /// that address resolves to the sender.
+    #[test]
+    fn two_orchestrations_in_one_folder_reply_with_the_orchestration_too() {
+        let mut records = team("alpha", None, "a", "/w/shared");
+        records.extend(team("beta", None, "b", "/w/shared"));
+        let body = content_among(&records, &records[0], "b-o", "hi").body;
+        assert_eq!(
+            reply_line(&body),
+            "reply with: dot-agent-deck inbox send --folder /w/shared --orchestration alpha \
+             --text '<your reply>'",
+            "{body}"
+        );
+        assert_eq!(
+            target_of(&records, by(Some("/w/shared"), Some("alpha"))).unwrap(),
+            "a-o"
+        );
+        // A title is used when the name alone does not tell them apart.
+        let mut records = team("cfg", Some("first"), "a", "/w/shared");
+        records.extend(team("cfg", Some("second"), "b", "/w/shared"));
+        let body = content_among(&records, &records[0], "b-o", "hi").body;
+        assert!(
+            reply_line(&body).contains("--folder /w/shared --orchestration first "),
+            "{body}"
+        );
+        // And with nothing that tells them apart, no command at all.
+        let mut records = team("cfg", None, "a", "/w/shared");
+        records.extend(team("cfg", None, "b", "/w/shared"));
+        let body = content_among(&records, &records[0], "b-o", "hi").body;
+        assert!(!body.contains("--folder"), "{body}");
+        assert!(reply_line(&body).contains("find pane a-o"), "{body}");
+    }
+
+    /// Qodo on PR #1956: a worker cannot be messaged, so a worker's reply
+    /// goes to its own orchestrator, and to nobody when that is not live.
+    #[test]
+    fn a_workers_reply_reaches_its_orchestrator() {
+        let mut records = team("cfg", None, "w", "/w/team");
+        records.extend(team("other", None, "o", "/w/other"));
+        let body = content_among(&records, &records[1], "o-o", "hi").body;
+        let reply = reply_line(&body);
+        assert_eq!(
+            reply,
+            "reply with: dot-agent-deck inbox send --folder /w/team --text '<your reply>'"
+        );
+        assert_eq!(
+            target_of(&records, by(Some("/w/team"), None)).unwrap(),
+            "w-o"
+        );
+        assert_eq!(reply_target(&records, &records[1]).unwrap().id, "agent-w-o");
+        // With its orchestrator gone, nothing would answer the command.
+        records.remove(0);
+        let body = content_among(&records, &records[0], "o-o", "hi").body;
+        assert!(!body.contains("--folder"), "{body}");
+    }
+
     #[test]
     fn the_rendered_block_never_calls_an_outside_agent_a_worker_report() {
         let caller = record("c-w", "/w/c", Some(role("cfg", None, "c", "/w/c", false)));
-        let content = content(Some(&caller), "c-w", "agent-c-w", "hello".to_string());
+        let content = content(Some(&caller), "c-w", "agent-c-w", None, "hello".to_string());
         let label = crate::inbox_hub::sender_label(&content.from, content.body_trust);
         assert!(label.contains(SENDER_LABEL), "{label}");
         assert!(label.contains("UNTRUSTED"), "{label}");
@@ -1438,6 +1640,39 @@ mod tests {
         );
         assert!(!text.contains("worker report"), "{text}");
         assert!(!live.inbox("work").contains("SENTINEL_addr"));
+    }
+
+    /// Qodo on PR #1956: the Sent report names the folder the address
+    /// matched, the orchestration's, even when the orchestrator's own pane
+    /// works in another folder.
+    #[tokio::test]
+    async fn the_sent_report_names_the_orchestrations_folder_not_the_panes() {
+        let live = Live::new();
+        let team_dir = live.folder("team");
+        let pane_dir = live.folder("team/elsewhere");
+        let caller_dir = live.folder("caller");
+        live.spawn(
+            "orch",
+            &pane_dir,
+            Some(role("cfg", None, "t", &team_dir, true)),
+        );
+        let caller = live.spawn("caller", &caller_dir, None);
+        let report = handle_addressed_message(
+            by(Some(&team_dir), None),
+            live.claim("caller", &caller),
+            "hi".to_string(),
+            &live.registry,
+        )
+        .await;
+        match report {
+            AddressedMessageReport::Sent {
+                pane_id, folder, ..
+            } => {
+                assert_eq!(pane_id, "orch");
+                assert_eq!(folder, team_dir);
+            }
+            other => panic!("expected sent, got {other:?}"),
+        }
     }
 
     impl Live {

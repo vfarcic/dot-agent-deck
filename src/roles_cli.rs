@@ -61,11 +61,12 @@ pub struct RoleRow {
 
 impl RoleRow {
     pub fn of(record: &AgentRecord) -> Self {
-        let folder = record
-            .cwd
-            .clone()
-            .or_else(|| crate::orchestrator_address::record_folder(record).map(str::to_string))
-            .unwrap_or_default();
+        // The folder an address matches this agent by: a member's
+        // orchestration folder, which its own pane may have left, else the
+        // pane's own folder.
+        let folder = crate::orchestrator_address::record_folder(record)
+            .unwrap_or_default()
+            .to_string();
         let pane_id = record.pane_id_env.clone().unwrap_or_default();
         match &record.tab_membership {
             Some(TabMembership::Orchestration {
@@ -447,6 +448,37 @@ mod tests {
         assert!(json[2]["orchestration"].is_null());
         assert!(json[2]["role"].is_null());
         assert_eq!(json[2]["name"], "solo");
+    }
+
+    /// Qodo on PR #1956: a member whose pane moved out of its orchestration's
+    /// folder is listed by the orchestration's folder, the one `--folder`
+    /// reaches it by; a standalone agent keeps its own.
+    #[test]
+    fn a_member_is_listed_by_its_orchestrations_folder_not_its_panes() {
+        let mut records = records();
+        records[1].cwd = Some("/w/team/sub/elsewhere".to_string());
+        let rows: Vec<RoleRow> = records.iter().map(RoleRow::of).collect();
+        assert_eq!(rows[1].folder, "/w/team");
+        assert_eq!(rows[2].folder, "/w/solo");
+        let json = serde_json::to_value(&rows).unwrap();
+        assert_eq!(json[1]["folder"], "/w/team");
+        assert!(
+            render_table(&rows)
+                .lines()
+                .nth(2)
+                .unwrap()
+                .contains("/w/team ")
+        );
+        // And `--folder` with that folder lists it.
+        let address = MessageAddress {
+            folder: Some(rows[1].folder.clone()),
+            orchestration: None,
+        };
+        let listed: Vec<_> = filter(&records, &address, &HashMap::new())
+            .into_iter()
+            .filter_map(|r| r.pane_id_env.as_deref())
+            .collect();
+        assert_eq!(listed, ["p-o", "p-w"]);
     }
 
     #[test]
