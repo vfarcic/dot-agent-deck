@@ -601,8 +601,8 @@ fn newly_raised(last: &std::sync::Mutex<Vec<String>>, warnings: Vec<String>) -> 
 /// the feature rather than only on the variable, for the reason
 /// `effective_current_exe` is (`src/platform/paths.rs`): a build without the
 /// `e2e` feature — which is what a normally shipped release is — has no way to
-/// be told to report a host it is not on. The release profile is not the gate:
-/// `cargo build --release --features e2e` includes this seam.
+/// be told to report a host it is not on. `cargo build --release --features
+/// e2e` does not compile at all (the guard in `src/lib.rs`).
 #[cfg(feature = "e2e")]
 fn e2e_fixed_sample() -> Option<HostMetrics> {
     serde_json::from_str(&std::env::var("DOT_AGENT_DECK_E2E_HOST_SAMPLE").ok()?).ok()
