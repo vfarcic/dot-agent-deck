@@ -836,6 +836,8 @@ fn doorbell_052_silence_after_a_slow_connect_is_asked_again() {
         // Only 150 ms remains after slow_connect. On a loaded runner it
         // can expire during identification or before the probe's write;
         // exchange calls that probe_write_failed even without a socket error.
+        // If both rounds expire before writing, the scripted cut-off exchange
+        // test still covers silence with less than the full probe window.
         match outcome {
             Exchange::Ended { why: "deadline" } => completed_probes += 1,
             Exchange::Ended {
@@ -875,8 +877,13 @@ fn doorbell_052_silence_after_a_slow_connect_is_asked_again() {
     }
 
     let sent = target(&silent).send(&fresh(5), &mut cache, &IdentityLookups::PLATFORM);
-    let (outcome, _, _) = sent.expect("connected");
+    let (outcome, identity, _) = sent.expect("connected");
     assert_eq!(outcome, Exchange::Withheld { probed: true });
+    assert_eq!(
+        cache.get(identity.expect("identified")),
+        Some(Verdict::Unsupported),
+        "a full-budget silent daemon is recorded Unsupported"
+    );
     completed_probes += 1;
     let deadline = Instant::now() + Duration::from_secs(5);
     while probes.load(std::sync::atomic::Ordering::SeqCst) < completed_probes
