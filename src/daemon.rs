@@ -7005,6 +7005,18 @@ async fn run_hook_loop_with_limits(
                                         let _ = write_half.flush().await;
                                     }
                                 }
+                                DaemonMessage::ComposerInvocation(_) => {
+                                    // PRD #1666 part 3 (Q35): not served until
+                                    // the capability is (Q35-14b), and none of
+                                    // the request is read before then.
+                                    let reply =
+                                        crate::event::ComposerInvocationReply::unsupported();
+                                    if let Ok(json) = serde_json::to_string(&reply) {
+                                        let line = format!("{json}\n");
+                                        let _ = write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
+                                }
                                 DaemonMessage::InputMode(report) => {
                                     // PRD #1666 part 3, round 5-wake (plan
                                     // §1.3): the generation's input-mode
@@ -8013,6 +8025,7 @@ mod quota_admission_tests {
                 component: None,
                 wake_stalled: false,
                 wake_hold: None,
+                hold_detail: None,
                 notices: crate::inbox_hub::InboxCardNotices {
                     integration: Some(crate::inbox_display::IntegrationNotice::RefreshFailedPi),
                     ..Default::default()
@@ -20526,5 +20539,154 @@ mod hook_pin_refresh_tests {
             "an unchanged refresh broadcasts nothing"
         );
         assert!(state.read().await.hook_binaries.notices().is_empty());
+    }
+}
+
+/// PRD #1666 part 3 (Q35): the hook loop's `composer_invocation` arm, while
+/// the verb is declared and not served (`inbox/probe/016`).
+#[cfg(all(test, unix))]
+mod composer_invocation_tests {
+    use super::*;
+    use crate::event::{
+        ComposerDecision, ComposerInvocationReply, ComposerInvocationRequest,
+        HookCapabilitiesReply, HookCapabilitiesRequest,
+    };
+    use crate::state::AppState;
+    use spec::spec;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{UnixListener, UnixStream};
+
+    const PANE: &str = "composer-pane";
+
+    struct Deck {
+        _dir: tempfile::TempDir,
+        sock: std::path::PathBuf,
+        registry: Arc<AgentPtyRegistry>,
+        handle: tokio::task::JoinHandle<Result<(), DaemonError>>,
+    }
+
+    impl Deck {
+        async fn start(registry: Arc<AgentPtyRegistry>) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let sock = dir.path().join("hook.sock");
+            let listener = IpcListener::from_tokio_listener(
+                UnixListener::bind(&sock).expect("bind hook socket"),
+            );
+            let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+            let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+            let handle = tokio::spawn({
+                let registry = registry.clone();
+                let shutdown = Arc::new(Notify::new());
+                let wtr = crate::issue_dispatch_run::new_worktree_registry();
+                async move { run_hook_loop(listener, state, event_tx, registry, shutdown, wtr).await }
+            });
+            Self {
+                _dir: dir,
+                sock,
+                registry,
+                handle,
+            }
+        }
+
+        /// Write `message` on a fresh connection, close the write half, and
+        /// read every line the daemon answers until it closes.
+        async fn exchange(&self, message: &DaemonMessage) -> Vec<String> {
+            let mut stream = UnixStream::connect(&self.sock).await.expect("connect");
+            stream
+                .write_all(format!("{}\n", serde_json::to_string(message).unwrap()).as_bytes())
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+            let mut answer = String::new();
+            tokio::time::timeout(Duration::from_secs(10), stream.read_to_string(&mut answer))
+                .await
+                .expect("the daemon answers and closes")
+                .unwrap();
+            answer.lines().map(str::to_string).collect()
+        }
+
+        async fn stop(self) {
+            self.handle.abort();
+            let _ = self.handle.await;
+            self.registry.shutdown_all();
+        }
+    }
+
+    fn invocation(token: Option<&str>) -> DaemonMessage {
+        DaemonMessage::ComposerInvocation(ComposerInvocationRequest {
+            pane_id: PANE.to_string(),
+            token: token.map(str::to_string),
+            generation: 1,
+            decision: ComposerDecision::Armed,
+            claim: None,
+            seg_seen: Some(1),
+            argv: vec!["/tmp/claude-1000/prompt.md".to_string()],
+        })
+    }
+
+    /// Scenario: A helper with a token that attests the pane's agent sends a `composer_invocation` straight to the hook socket, skipping the capability check: the daemon answers exactly one line, refused `unsupported` with no outcome, so nothing reads as the deck's invocation or as no arm. The same request with no token is refused by the provenance gate, also with no outcome.
+    #[spec("inbox/probe/016")]
+    #[tokio::test]
+    async fn probe_016_the_daemon_answers_an_invocation_unsupported() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (_agent, token) = registry.reserve_spawn_for_test(Some(PANE));
+        let deck = Deck::start(registry).await;
+
+        let answered = deck.exchange(&invocation(Some(&token))).await;
+        assert_eq!(answered.len(), 1, "one line per message: {answered:?}");
+        let reply: ComposerInvocationReply = serde_json::from_str(&answered[0]).unwrap();
+        assert_eq!(reply, ComposerInvocationReply::unsupported());
+        assert_eq!(
+            reply.code.as_deref(),
+            Some(crate::event::COMPOSER_INVOCATION_UNSUPPORTED)
+        );
+
+        let unattested = deck.exchange(&invocation(None)).await;
+        assert_eq!(unattested.len(), 1, "{unattested:?}");
+        let refused: ComposerInvocationReply = serde_json::from_str(&unattested[0]).unwrap();
+        assert_eq!(refused.outcome, None, "{refused:?}");
+        assert!(refused.code.is_some(), "{refused:?}");
+        assert_ne!(
+            refused.code.as_deref(),
+            Some(crate::event::COMPOSER_INVOCATION_UNSUPPORTED),
+            "the gate refuses it before the arm"
+        );
+        deck.stop().await;
+    }
+
+    /// Scenario: A helper asks the daemon's hook socket which verbs it serves, as the shared sender does before an invocation: the answer names task-scoped completion and input-mode reports but not the composer probe, so the sender would withhold the invocation.
+    #[spec("inbox/probe/016")]
+    #[tokio::test]
+    async fn probe_016_the_daemon_withholds_the_composer_capability() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (_agent, token) = registry.reserve_spawn_for_test(Some(PANE));
+        let deck = Deck::start(registry).await;
+        let question = DaemonMessage::HookCapabilities(HookCapabilitiesRequest {
+            pane_id: PANE.to_string(),
+            token: Some(token),
+        });
+        let mut stream = UnixStream::connect(&deck.sock).await.expect("connect");
+        stream
+            .write_all(format!("{}\n", serde_json::to_string(&question).unwrap()).as_bytes())
+            .await
+            .unwrap();
+        let mut answer = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::io::BufReader::new(&mut stream).read_line(&mut answer),
+        )
+        .await
+        .expect("the daemon answers the question")
+        .unwrap();
+        let reply: HookCapabilitiesReply = serde_json::from_str(answer.trim()).unwrap();
+        assert_eq!(
+            reply.task_scoped_completion,
+            Some(crate::event::TASK_SCOPED_COMPLETION),
+            "control: the answer is the daemon's real one: {answer:?}"
+        );
+        assert_eq!(reply.composer_probe, None, "{answer:?}");
+        assert!(crate::hook::confirms_composer_probe(&answer).is_err());
+        drop(stream);
+        deck.stop().await;
     }
 }

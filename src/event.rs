@@ -1823,6 +1823,22 @@ pub enum DaemonMessage {
     /// its own prompt, as it did before.
     #[serde(rename = "question")]
     Question(Box<QuestionSignal>),
+    /// PRD #1666 part 3 (Q35): the deck's editor helper reports what it
+    /// decided for one editor invocation in an agent's pane, and asks whose
+    /// invocation the daemon finds it to be. Answered with one
+    /// [`ComposerInvocationReply`].
+    ///
+    /// **Withheld unless the daemon answered the same connection's
+    /// [`HookCapabilitiesRequest`] with [`COMPOSER_PROBE`]**
+    /// ([`crate::hook::send_composer_invocation`] holds the check), and no
+    /// daemon does yet: past the provenance gate, this build answers it
+    /// refused [`COMPOSER_INVOCATION_UNSUPPORTED`]. Additive on the unversioned hook
+    /// socket, so it does NOT move the attach `PROTOCOL_VERSION`. An older
+    /// daemon decodes it as neither a `DaemonMessage` nor an [`AgentEvent`]
+    /// (it carries none of an event's required fields), logs it as malformed
+    /// and answers nothing.
+    #[serde(rename = "composer_invocation")]
+    ComposerInvocation(ComposerInvocationRequest),
 }
 
 impl DaemonMessage {
@@ -1857,6 +1873,7 @@ impl DaemonMessage {
             DaemonMessage::InboxOffer(r) => &r.pane_id,
             DaemonMessage::InboxComplete(r) | DaemonMessage::InboxRelease(r) => &r.pane_id,
             DaemonMessage::Question(s) => &s.pane_id,
+            DaemonMessage::ComposerInvocation(r) => &r.pane_id,
         }
     }
 
@@ -1887,6 +1904,7 @@ impl DaemonMessage {
             DaemonMessage::InboxOffer(r) => r.token.as_deref(),
             DaemonMessage::InboxComplete(r) | DaemonMessage::InboxRelease(r) => r.token.as_deref(),
             DaemonMessage::Question(s) => s.token.as_deref(),
+            DaemonMessage::ComposerInvocation(r) => r.token.as_deref(),
         }
     }
 
@@ -1909,6 +1927,9 @@ impl DaemonMessage {
             | DaemonMessage::InboxComplete(_)
             | DaemonMessage::InboxRelease(_)
             | DaemonMessage::InputMode(_)
+            // An invocation speaks for one agent generation's pane, so it
+            // needs a token that attests an agent, as the inbox verbs do.
+            | DaemonMessage::ComposerInvocation(_)
             | DaemonMessage::Ack(_) => true,
             DaemonMessage::Delegate(_)
             | DaemonMessage::WorkDone(_)
@@ -1951,6 +1972,7 @@ impl DaemonMessage {
             | DaemonMessage::SpawnRole(_)
             | DaemonMessage::Ack(_)
             | DaemonMessage::InputMode(_)
+            | DaemonMessage::ComposerInvocation(_)
             | DaemonMessage::Question(_) => None,
         };
         claimed.filter(|id| !id.is_empty())
@@ -1984,6 +2006,7 @@ impl DaemonMessage {
             DaemonMessage::InboxComplete(_) => "inbox_complete",
             DaemonMessage::InboxRelease(_) => "inbox_release",
             DaemonMessage::Question(_) => "question",
+            DaemonMessage::ComposerInvocation(_) => "composer_invocation",
         }
     }
 
@@ -2031,11 +2054,13 @@ impl DaemonMessage {
             // A refused question names the refusal and confirms no verb, so
             // the sender withholds its mutation and says why.
             DaemonMessage::HookCapabilities(_) => serde_json::to_string(&HookCapabilitiesReply {
-                task_scoped_completion: None,
-                input_mode_report: None,
                 code: Some(reason.to_string()),
                 message: Some(message.to_string()),
+                ..Default::default()
             }),
+            DaemonMessage::ComposerInvocation(_) => {
+                serde_json::to_string(&ComposerInvocationReply::refused(reason, message))
+            }
             DaemonMessage::WorkDoneTask(_) => {
                 serde_json::to_string(&WorkDoneTaskReply::refused(reason, message))
             }
@@ -2120,6 +2145,7 @@ impl DaemonMessage {
             | DaemonMessage::GetSeed(_)
             | DaemonMessage::Ack(_)
             | DaemonMessage::Question(_)
+            | DaemonMessage::ComposerInvocation(_)
             | DaemonMessage::InboxWait(_)
             | DaemonMessage::InboxAnnounce(_)
             | DaemonMessage::InboxFetch(_)
@@ -3190,6 +3216,12 @@ pub struct InboxNotice {
     /// that does not know it ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake_hold: Option<crate::inbox_display::WakeHold>,
+    /// PRD #1666 part 3 (Q35, OQ1): with [`Self::wake_hold`] `cannot_check`,
+    /// why; sent and cleared with it, so a later hold never inherits an
+    /// earlier one's path. Additive: a client that does not know it ignores
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_detail: Option<crate::inbox_display::HoldDetail>,
     /// PRD #1666 §6.5: this notice carries the pane's whole card notices
     /// ([`Self::notices`]) and nothing else, as [`Self::wake_update`] carries
     /// the wake stall: a client replaces what it holds for the pane with
@@ -4278,11 +4310,145 @@ pub struct HookCapabilitiesReply {
     /// that answered this, on any connection to that identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_mode_report: Option<u32>,
+    /// PRD #1666 part 3 (Q35): this daemon answers
+    /// [`DaemonMessage::ComposerInvocation`] at this version
+    /// ([`COMPOSER_PROBE`]). The shared sender
+    /// ([`crate::hook::send_composer_invocation`]) sends one only on the
+    /// connection whose answer named it. No daemon names it yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer_probe: Option<u32>,
     /// On a refusal (the provenance gate), its stable code and sentence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+/// PRD #1666 part 3 (Q35): the version of
+/// [`DaemonMessage::ComposerInvocation`] this build speaks. A sender requires
+/// equality ([`HookCapabilitiesReply::composer_probe`]), never `>=`.
+pub const COMPOSER_PROBE: u32 = 1;
+
+/// PRD #1666 part 3 (Q35): the refusal code of a
+/// [`DaemonMessage::ComposerInvocation`] this daemon does not serve. The
+/// helper (Q35-12) is to read it as it reads an older daemon's silence: a
+/// failed exchange, never [`ComposerOutcome::Unarmed`].
+pub const COMPOSER_INVOCATION_UNSUPPORTED: &str = "unsupported";
+
+/// [`COMPOSER_INVOCATION_UNSUPPORTED`]'s message.
+pub const COMPOSER_INVOCATION_UNSUPPORTED_MESSAGE: &str =
+    "this daemon does not check agents' input boxes, so it decided nothing for this editor";
+
+/// PRD #1666 part 3 (Q35): one editor invocation the deck's helper reports.
+/// None of an [`AgentEvent`]'s required fields, so a daemon that does not
+/// know the verb cannot take it for one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerInvocationRequest {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// The agent generation whose arm the helper read.
+    pub generation: u64,
+    /// What the helper chose, after reading the arm.
+    pub decision: ComposerDecision,
+    /// Whose invocation the helper's own classifier found it to be: recorded,
+    /// never authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<ComposerClaim>,
+    /// The segment number the helper read with the arm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seg_seen: Option<u64>,
+    /// The arguments the agent invoked the editor with, the export path
+    /// among them; the daemon compares them with what it reads itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub argv: Vec<String>,
+}
+
+/// What the helper chose for an invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerDecision {
+    /// The arm was present: no editor opens.
+    Armed,
+    /// The arm was absent: the user's editor opens.
+    Unarmed,
+    /// A tool's invocation: the tool's editor opens.
+    Tool,
+    /// A decision a newer helper names; a daemon is to consume nothing for
+    /// it.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The helper's own class for an invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerClaim {
+    Owned,
+    Tool,
+    /// Also a class a newer helper names.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The daemon's own read of the agent's exported input box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportRead {
+    Empty,
+    NonEmpty,
+    Unreadable,
+    /// A read a newer daemon names: a helper is to read it as not empty.
+    #[serde(other)]
+    Unknown,
+}
+
+/// What the daemon decided for a [`ComposerInvocationRequest`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ComposerOutcome {
+    /// The deck's own invocation: its liability is consumed.
+    Mine { read: ExportRead },
+    /// As [`Self::Mine`], and the helper shows the deck's notice first.
+    MineWithNotice { read: ExportRead },
+    /// Not attributable to the deck: nothing consumed, no editor.
+    Uncertain,
+    /// No arm: the user's editor.
+    Unarmed,
+    /// An outcome a newer daemon names: a helper is to read it as
+    /// [`Self::Uncertain`].
+    #[serde(other)]
+    Unknown,
+}
+
+/// The answer to a [`ComposerInvocationRequest`]: an outcome, or a refusal's
+/// code and sentence.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerInvocationReply {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<ComposerOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl ComposerInvocationReply {
+    pub fn refused(code: &str, message: &str) -> Self {
+        ComposerInvocationReply {
+            outcome: None,
+            code: Some(code.to_string()),
+            message: Some(message.to_string()),
+        }
+    }
+
+    /// This build's answer to every invocation: not served.
+    pub fn unsupported() -> Self {
+        Self::refused(
+            COMPOSER_INVOCATION_UNSUPPORTED,
+            COMPOSER_INVOCATION_UNSUPPORTED_MESSAGE,
+        )
+    }
 }
 
 /// What a [`WorkDoneTaskRequest`] reports.

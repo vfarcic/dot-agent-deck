@@ -849,6 +849,18 @@ pub struct SessionSnapshot {
     /// from this snapshot refuses a replayed older aggregate afterwards.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_revision: Option<u64>,
+    /// PRD #1666 part 3 (Q35, R5 §10.1): the deck is holding what the user
+    /// typed into this pane while it checks the agent's input box. Additive
+    /// optional, the `blocked` precedent: an older reader ignores the key, so
+    /// no `PROTOCOL_VERSION` bump. No daemon sets it yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_held: Option<crate::inbox_display::InputHeld>,
+    /// PRD #1666 part 3 (Q35): the outcomes of this pane's recently held
+    /// answers that carried a client token, newest first, at most
+    /// [`crate::question::MAX_ANSWER_SETTLEMENTS`]. Additive, as
+    /// [`Self::input_held`] is; absent while empty. No daemon sets it yet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub answer_settlements: Vec<crate::question::AnswerSettlement>,
 }
 
 /// Issue #532: a pane's hook generation on the wire — see
@@ -1164,6 +1176,10 @@ impl SessionState {
             pull_request_revision: Some(self.pull_request_revision),
             background: held.and_then(|(background, _)| background.filter(|b| !b.is_empty())),
             background_revision: held.map(|(_, revision)| revision),
+            // PRD #1666 part 3 (Q35): declared on the wire, set by no daemon
+            // yet.
+            input_held: None,
+            answer_settlements: Vec::new(),
         }
     }
 
@@ -20279,6 +20295,7 @@ mod tests {
             returned: false,
             wake_stalled: false,
             wake_hold: None,
+            hold_detail: None,
             wake_update: false,
             attention_update: false,
             requeued: false,
@@ -20326,6 +20343,7 @@ mod tests {
                 component: None,
                 wake_stalled: false,
                 wake_hold: None,
+                hold_detail: None,
                 notices: Default::default(),
             },
         );
@@ -20375,6 +20393,7 @@ mod tests {
             component: None,
             wake_stalled: false,
             wake_hold: None,
+            hold_detail: None,
             notices: crate::inbox_hub::InboxCardNotices {
                 integration,
                 ..Default::default()
@@ -20491,6 +20510,7 @@ mod tests {
         let carried = crate::inbox_hub::InboxSummary {
             wake_stalled: true,
             wake_hold: None,
+            hold_detail: None,
             notices: notices.clone(),
             ..held_summary(1, None)
         };
@@ -20505,6 +20525,7 @@ mod tests {
                 wake_update: true,
                 wake_stalled: true,
                 wake_hold: None,
+                hold_detail: None,
                 ..inbox_notice("pane-q", "m-1", Queued)
             },
         ];
@@ -20827,6 +20848,7 @@ mod tests {
                 component: None,
                 wake_stalled: false,
                 wake_hold: None,
+                hold_detail: None,
                 notices: Default::default(),
             },
         );
@@ -20907,6 +20929,7 @@ mod tests {
                 component: None,
                 wake_stalled: true,
                 wake_hold: None,
+                hold_detail: None,
                 notices: Default::default(),
             },
         );
@@ -22351,6 +22374,8 @@ mod tests {
             pull_request_revision: None,
             background: None,
             background_revision: None,
+            answer_settlements: Vec::new(),
+            input_held: None,
         };
         let wire = serde_json::to_value(&snap).unwrap();
         assert_eq!(
@@ -22422,6 +22447,8 @@ mod tests {
             pull_request_revision: None,
             background: None,
             background_revision: None,
+            answer_settlements: Vec::new(),
+            input_held: None,
         };
         let hydrated = |resets_at_ms| {
             let mut state = AppState::default();

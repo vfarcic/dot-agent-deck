@@ -22267,6 +22267,8 @@ mod spawn_tests {
                 pull_request_revision: None,
                 background: None,
                 background_revision: None,
+                answer_settlements: Vec::new(),
+                input_held: None,
             }),
             spawned_at_ms: None,
             cli_name: None,

@@ -1439,6 +1439,8 @@ fn live_016_reconnected_card_reads_how_long_the_agent_has_been_quiet() {
             pull_request_revision: None,
             background: None,
             background_revision: None,
+            answer_settlements: Vec::new(),
+            input_held: None,
         };
         let mut state = AppState::default();
         state.register_pane("pane-reconnect".to_string());

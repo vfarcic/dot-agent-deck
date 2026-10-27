@@ -3112,6 +3112,9 @@ impl DaemonClient {
                 answers,
                 confirmed_always,
                 revision,
+                // PRD #1666 part 3 (Q35): sent once a daemon advertises
+                // `CAP_ANSWER_SETTLEMENT` (Q35-17).
+                client_token: None,
             },
         )
         .await?;

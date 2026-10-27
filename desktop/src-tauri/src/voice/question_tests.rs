@@ -48,6 +48,7 @@ fn permission(channel: AnswerChannel) -> PendingQuestion {
         channel,
         subagent_id: None,
         revision: None,
+        answer_queued: false,
     }
 }
 
@@ -95,6 +96,7 @@ fn form_question() -> PendingQuestion {
         channel: AnswerChannel::Held,
         subagent_id: None,
         revision: None,
+        answer_queued: false,
     }
 }
 

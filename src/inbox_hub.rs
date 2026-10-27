@@ -265,6 +265,11 @@ pub struct InboxSummary {
     /// [`crate::inbox_display::WakeHold::Unknown`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake_hold: Option<crate::inbox_display::WakeHold>,
+    /// PRD #1666 part 3 (Q35, OQ1): with [`Self::wake_hold`]
+    /// `cannot_check`, why. Absent from an older daemon's answer, and while
+    /// there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_detail: Option<crate::inbox_display::HoldDetail>,
     /// PRD #1666 §6.5: what the card lists and warns of beside its counts.
     /// Every field is additive and absent while empty.
     #[serde(flatten, default)]
@@ -2846,6 +2851,7 @@ fn summary_of(st: &HubState, pane_id: &str, agent_id: &str) -> InboxSummary {
         component: None,
         wake_stalled: st.wake_stalled.contains_key(&key),
         wake_hold: shown_hold(st, &key),
+        hold_detail: None,
         notices: engine::notices(st, &key, now),
     };
     let mut last_acked: Option<Instant> = None;
@@ -4942,6 +4948,7 @@ fn consume_events(st: &mut HubState, events: Vec<InboxEvent>, verdicts: &TaskVer
                 returned: true,
                 wake_stalled: false,
                 wake_hold: None,
+                hold_detail: None,
                 wake_update: false,
                 attention_update: false,
                 requeued: false,
@@ -4974,6 +4981,7 @@ fn consume_events(st: &mut HubState, events: Vec<InboxEvent>, verdicts: &TaskVer
             returned: false,
             wake_stalled: false,
             wake_hold: None,
+            hold_detail: None,
             wake_update: false,
             attention_update: false,
             requeued: event.requeued,
@@ -5061,6 +5069,7 @@ fn broadcast_wake(st: &HubState, pane_id: &str, agent_id: &str, id: &str) {
         returned: false,
         wake_stalled: stalled,
         wake_hold: hold,
+        hold_detail: None,
         wake_update: true,
         attention_update: false,
         requeued: false,

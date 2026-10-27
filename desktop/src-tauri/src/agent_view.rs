@@ -617,6 +617,7 @@ mod tests {
             returned: false,
             wake_stalled: false,
             wake_hold: None,
+            hold_detail: None,
             wake_update: false,
             attention_update: true,
             requeued: false,
@@ -637,6 +638,7 @@ mod tests {
             component: None,
             wake_stalled: false,
             wake_hold: None,
+            hold_detail: None,
             notices,
         });
         view.install(listing(vec![record("7", "pane-7"), spawned]), now);
@@ -862,6 +864,8 @@ mod tests {
             pull_request_revision: None,
             background: None,
             background_revision: None,
+            answer_settlements: Vec::new(),
+            input_held: None,
         });
 
         let mut view = AgentView::default();
@@ -911,6 +915,8 @@ mod tests {
             pull_request_revision: None,
             background: None,
             background_revision: None,
+            answer_settlements: Vec::new(),
+            input_held: None,
         });
 
         let mut view = AgentView::default();
@@ -957,6 +963,8 @@ mod tests {
             pull_request_revision: None,
             background: None,
             background_revision: None,
+            answer_settlements: Vec::new(),
+            input_held: None,
         });
 
         let mut view = AgentView::default();
@@ -1152,6 +1160,8 @@ mod tests {
             pull_request_revision: None,
             background: (!work.is_empty()).then_some(work),
             background_revision: Some(revision),
+            answer_settlements: Vec::new(),
+            input_held: None,
         });
         record
     }

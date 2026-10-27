@@ -688,6 +688,7 @@ fn permission_question() -> dot_agent_deck::question::PendingQuestion {
         channel: AnswerChannel::Keys,
         subagent_id: None,
         revision: Some(3),
+        answer_queued: false,
     }
 }
 

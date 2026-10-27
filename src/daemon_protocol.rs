@@ -769,6 +769,16 @@ pub const CAP_FOCUS_GAINED: &str = "focus-gained";
 /// `#[cfg]`-gated.
 pub const CAP_ANSWER_QUESTION: &str = "answer-question";
 
+/// Capability string for [`AttachRequest::AnswerQuestion`]'s `client_token`
+/// and the snapshot's [`crate::question::AnswerSettlement`]s (PRD #1666 part
+/// 3, Q35): this daemon settles a tokened answer it held into the snapshot.
+///
+/// Names a FEATURE, like [`CAP_AUTHORING_KIND`] names a field: an older daemon
+/// drops the token silently and never reports a settlement, so a client
+/// sends the token only to a daemon whose `Hello` reply names this. No daemon
+/// advertises it yet.
+pub const CAP_ANSWER_SETTLEMENT: &str = "answer-settlement";
+
 /// Capability string for [`AttachRequest::RecordOrchestratorContext`] (issue
 /// #1445).
 ///
@@ -2782,6 +2792,14 @@ pub enum AttachRequest {
         /// question the daemon stamped no revision on can still be named.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         revision: Option<u64>,
+        /// PRD #1666 part 3 (Q35): the client's own name for this answer, so
+        /// it can find the answer's outcome among the snapshot's
+        /// [`crate::question::AnswerSettlement`]s after its request timed
+        /// out. Sent only to a daemon advertising [`CAP_ANSWER_SETTLEMENT`];
+        /// an older daemon drops the unknown key (this enum does not deny
+        /// unknown fields). No client sends it yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_token: Option<u64>,
     },
     /// Issue #1445: "the orchestrator in `pane_id` has just been re-armed from
     /// `context_path`" — a TUI's compaction or `/clear` re-arm published a new
@@ -6711,6 +6729,9 @@ async fn handle_connection(
             answers,
             confirmed_always,
             revision,
+            // PRD #1666 part 3 (Q35): read once answers are held (Q35-17);
+            // until then a token names nothing this daemon settles.
+            client_token: _,
         } => {
             let resp = match answer_question_at(
                 &registry,
@@ -11276,6 +11297,8 @@ mod tests {
                 pull_request_revision: None,
                 background: None,
                 background_revision: None,
+                answer_settlements: Vec::new(),
+                input_held: None,
             };
             let json = serde_json::to_string(&snap).expect("SessionSnapshot serializes");
             let back: SessionSnapshot =
@@ -11321,6 +11344,8 @@ mod tests {
                 pull_request_revision: None,
                 background: None,
                 background_revision: None,
+                answer_settlements: Vec::new(),
+                input_held: None,
             }),
             spawned_at_ms: None,
             cli_name: None,
@@ -12949,6 +12974,7 @@ mod tests {
             returned: false,
             wake_stalled: false,
             wake_hold: None,
+            hold_detail: None,
             wake_update: false,
             attention_update: false,
             requeued: false,

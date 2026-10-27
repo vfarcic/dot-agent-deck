@@ -2667,6 +2667,53 @@ pub fn confirms_task_scoped_completion(line: &str) -> Result<(), Option<(String,
     Err(reply.code.zip(reply.message))
 }
 
+/// PRD #1666 part 3 (Q35): whether a capabilities answer confirms
+/// [`crate::event::COMPOSER_PROBE`], by equality. A refusal of the question
+/// comes back with its code and message.
+pub fn confirms_composer_probe(line: &str) -> Result<(), Option<(String, String)>> {
+    let Ok(reply) = serde_json::from_str::<crate::event::HookCapabilitiesReply>(line.trim()) else {
+        return Err(None);
+    };
+    if reply.composer_probe == Some(crate::event::COMPOSER_PROBE) {
+        return Ok(());
+    }
+    Err(reply.code.zip(reply.message))
+}
+
+/// PRD #1666 part 3 (Q35): send `request` to the daemon at `path` through
+/// [`send_gated_at`], so it goes only on a connection whose capabilities answer
+/// named [`crate::event::COMPOSER_PROBE`], with no reconnect; `wait`
+/// bounds the question and, separately, the request and its answer.
+pub fn send_composer_invocation(
+    path: &std::path::Path,
+    request: &crate::event::ComposerInvocationRequest,
+    wait: std::time::Duration,
+) -> Gated {
+    let question =
+        crate::event::DaemonMessage::HookCapabilities(crate::event::HookCapabilitiesRequest {
+            pane_id: request.pane_id.clone(),
+            token: request.token.clone(),
+        });
+    let mutation = crate::event::DaemonMessage::ComposerInvocation(request.clone());
+    let (Ok(question), Ok(mutation)) = (
+        serde_json::to_string(&question),
+        serde_json::to_string(&mutation),
+    ) else {
+        return Gated::NotConfirmed {
+            refusal: None,
+            why: "the request could not be encoded",
+        };
+    };
+    send_gated_at(
+        path,
+        &question,
+        &mutation,
+        confirms_composer_probe,
+        wait,
+        wait,
+    )
+}
+
 pub fn send_and_await_signal_ack(json: &str) -> SocketReply {
     request_from_socket_inner(json, Some(SIGNAL_ACK_TIMEOUT))
 }

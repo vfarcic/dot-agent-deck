@@ -107,6 +107,56 @@ pub struct PendingQuestion {
     /// daemon's stamped frame arrives. Additive optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<u64>,
+    /// PRD #1666 part 3 (Q35, OQ6): the daemon accepted an answer to this
+    /// question and holds it until it can write it, so a client shows it as
+    /// queued. Its outcome is an [`AnswerSettlement`] on the snapshot, never
+    /// this flag clearing. Additive: an older reader ignores it and a
+    /// newer one reads its absence as not queued. No daemon sets it yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub answer_queued: bool,
+}
+
+/// PRD #1666 part 3 (Q35): how many [`AnswerSettlement`]s a pane's snapshot
+/// keeps for one agent generation, newest first.
+pub const MAX_ANSWER_SETTLEMENTS: usize = 8;
+
+/// PRD #1666 part 3 (Q35): how long one [`AnswerSettlement`] stays on the
+/// snapshot after its answer settled.
+pub const ANSWER_SETTLEMENT_RETENTION: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// PRD #1666 part 3 (Q35): what became of an answer the daemon held, named by
+/// the `client_token` its request carried
+/// (`crate::daemon_protocol::AttachRequest::AnswerQuestion`), so a client
+/// whose own request timed out learns the outcome of its own answer and of no
+/// other. A request without a token settles no entry. No daemon writes one
+/// yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnswerSettlement {
+    pub question_id: String,
+    /// The question's revision ([`PendingQuestion::revision`]) the answer was
+    /// accepted against.
+    pub revision: u64,
+    pub client_token: u64,
+    pub outcome: SettlementOutcome,
+}
+
+/// What an [`AnswerSettlement`] reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettlementOutcome {
+    /// The whole answer was written to the agent.
+    Written,
+    /// Part of it was written before the write failed.
+    Partial,
+    /// A newer question replaced this one before the answer was written.
+    Superseded,
+    /// The agent generation ended before the answer was written.
+    Retired,
+    /// The write failed and nothing of it was written.
+    WriteFailed,
+    /// An outcome a newer daemon names: a client reads it as unconfirmed.
+    #[serde(other)]
+    Unknown,
 }
 
 /// The tool a permission or plan prompt asks about.
@@ -584,6 +634,7 @@ impl PendingQuestion {
             },
             subagent_id: clean_opt(self.subagent_id, MAX_LABEL_BYTES),
             revision: self.revision,
+            answer_queued: false,
         })
     }
 
@@ -1151,6 +1202,7 @@ pub fn claude_permission_request(
                     },
                     subagent_id: None,
                     revision: None,
+                    answer_queued: false,
                 },
                 hold: true,
             }
@@ -1176,6 +1228,7 @@ pub fn claude_permission_request(
                     channel: channel_for(tables, version, AnswerChannel::Keys),
                     subagent_id: None,
                     revision: None,
+                    answer_queued: false,
                 },
                 hold: false,
             }
@@ -1226,6 +1279,7 @@ pub fn claude_permission_request(
                     channel: AnswerChannel::Held,
                     subagent_id: None,
                     revision: None,
+                    answer_queued: false,
                 },
                 hold: true,
             }
@@ -1367,6 +1421,7 @@ pub fn codex_permission_request(
         channel: channel_for(tables, version, AnswerChannel::Keys),
         subagent_id: None,
         revision: None,
+        answer_queued: false,
     }
 }
 
@@ -1457,6 +1512,7 @@ pub fn codex_request_user_input(
         },
         subagent_id: None,
         revision: None,
+        answer_queued: false,
     })
 }
 
@@ -1502,6 +1558,7 @@ pub fn devin_permission_request(
         channel: channel_for(tables, version, AnswerChannel::Keys),
         subagent_id: None,
         revision: None,
+        answer_queued: false,
     }
 }
 
@@ -1568,6 +1625,7 @@ pub fn opencode_permission_asked(props: &Value, raised_at_ms: i64) -> Option<Pen
         channel: AnswerChannel::Held,
         subagent_id: None,
         revision: None,
+        answer_queued: false,
     })
 }
 
@@ -1651,6 +1709,7 @@ pub fn opencode_question_asked(props: &Value, raised_at_ms: i64) -> Option<Pendi
         },
         subagent_id: None,
         revision: None,
+        answer_queued: false,
     })
 }
 
@@ -1816,6 +1875,7 @@ pub fn pi_dialog(dialog: &PiDialog, raised_at_ms: i64) -> Option<PendingQuestion
         channel,
         subagent_id: None,
         revision: None,
+        answer_queued: false,
     })
 }
 
@@ -1953,6 +2013,7 @@ mod tests {
             channel,
             subagent_id: None,
             revision: None,
+            answer_queued: false,
         }
     }
 
@@ -1990,6 +2051,7 @@ mod tests {
             channel: AnswerChannel::Held,
             subagent_id: None,
             revision: None,
+            answer_queued: false,
         }
     }
 
@@ -3134,6 +3196,7 @@ mod tests {
             answers: vec![answer(0, &[1], None)],
             confirmed_always: true,
             revision: Some(41),
+            client_token: None,
         };
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["op"], "answer-question");
@@ -3168,6 +3231,7 @@ mod tests {
             answers: Vec::new(),
             confirmed_always: false,
             revision: None,
+            client_token: None,
         };
         assert!(
             serde_json::to_value(&unrevised)

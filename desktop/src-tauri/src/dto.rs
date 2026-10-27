@@ -4106,6 +4106,8 @@ mod tests {
                 pull_request_revision: None,
                 background: None,
                 background_revision: None,
+                answer_settlements: Vec::new(),
+                input_held: None,
             }),
             spawned_at_ms: None,
             // Issue #856: as the DAEMON reported it. The fixture agent is
@@ -4145,6 +4147,7 @@ mod tests {
             component: None,
             wake_stalled: false,
             wake_hold: None,
+            hold_detail: None,
             notices: Default::default(),
         });
         let value = serde_json::to_value(map_agent(record)).unwrap();

@@ -434,6 +434,15 @@ pub enum WakeHold {
     /// A dialog opened while the deck was typing, and may have received its
     /// keys: shown even with nothing waiting.
     DialogDuringRing,
+    /// PRD #1666 part 3 (Q35): the deck holds its notice until the agent
+    /// fetches its messages itself. Tolerant: an older client reads it as
+    /// [`WakeHold::Unknown`]. No deck sets it yet, and it has no words of
+    /// its own yet, so a client shows [`WAKE_STALLED`]'s.
+    NeedsFetch,
+    /// PRD #1666 part 3 (Q35): the deck can't check the agent's input box,
+    /// for the cause [`HoldDetail`] names beside it. Tolerant, unset and
+    /// without words of its own, as [`WakeHold::NeedsFetch`] is.
+    CannotCheck,
     /// A reason a newer deck names that this build does not know. A client
     /// shows it with [`WAKE_STALLED`]'s words; this build never sends it.
     #[serde(other)]
@@ -452,7 +461,7 @@ impl WakeHold {
             WakeHold::NotTaken => Some(WAKE_HOLD_NOT_TAKEN),
             WakeHold::UncertainInput => Some(WAKE_HOLD_UNCERTAIN_INPUT),
             WakeHold::DialogDuringRing => Some(WAKE_HOLD_DIALOG_DURING_RING),
-            WakeHold::Unknown => None,
+            WakeHold::NeedsFetch | WakeHold::CannotCheck | WakeHold::Unknown => None,
         }
     }
 
@@ -487,7 +496,7 @@ impl WakeHold {
             WakeHold::DialogDuringRing => Some(
                 "a dialog opened in the worker's pane while the deck was typing, and may have received the deck's keys",
             ),
-            WakeHold::Unknown => None,
+            WakeHold::NeedsFetch | WakeHold::CannotCheck | WakeHold::Unknown => None,
         }
     }
 
@@ -501,6 +510,8 @@ impl WakeHold {
             WakeHold::UncertainInput => 6,
             WakeHold::DialogDuringRing => 7,
             WakeHold::Unknown => 9,
+            WakeHold::NeedsFetch => 10,
+            WakeHold::CannotCheck => 11,
         }
     }
 
@@ -515,9 +526,104 @@ impl WakeHold {
             6 => Some(Some(WakeHold::UncertainInput)),
             7 => Some(Some(WakeHold::DialogDuringRing)),
             9 => Some(Some(WakeHold::Unknown)),
+            10 => Some(Some(WakeHold::NeedsFetch)),
+            11 => Some(Some(WakeHold::CannotCheck)),
             _ => None,
         }
     }
+}
+
+/// PRD #1666 part 3 (Q35, OQ1): why the deck can't check an agent's input
+/// box, carried beside [`WakeHold::CannotCheck`] and cleared with it. A typed
+/// cause, plus the refused path component and its filesystem's name as
+/// display text, for a client to escape and never run. Additive: an older
+/// client ignores it, and a cause this build does not know reads as
+/// [`HoldCause::Unknown`]. No deck sets it yet.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct HoldDetail {
+    pub cause: HoldCause,
+    /// The path component the check stopped at, at most
+    /// [`MAX_HOLD_DETAIL_CHARS`] characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_component: Option<String>,
+    /// That component's filesystem, at most [`MAX_HOLD_DETAIL_CHARS`]
+    /// characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filesystem: Option<String>,
+}
+
+/// The longest [`HoldDetail`] string kept, in characters.
+pub const MAX_HOLD_DETAIL_CHARS: usize = 256;
+
+impl HoldDetail {
+    /// `cause` with its strings cut to [`MAX_HOLD_DETAIL_CHARS`].
+    pub fn new(cause: HoldCause, path_component: Option<&str>, filesystem: Option<&str>) -> Self {
+        let bounded = |text: &str| text.chars().take(MAX_HOLD_DETAIL_CHARS).collect::<String>();
+        HoldDetail {
+            cause,
+            path_component: path_component.map(bounded),
+            filesystem: filesystem.map(bounded),
+        }
+    }
+}
+
+/// What a [`HoldDetail`] says stopped the check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HoldCause {
+    /// A component is on a filesystem the check doesn't trust.
+    Filesystem,
+    /// A directory the user owns can be written by others.
+    WritableDirectory,
+    /// A component is owned by neither the user nor root, or is another
+    /// user's inside a shared directory.
+    ForeignOwner,
+    /// An ACL grants write to others, or can't be read.
+    Acl,
+    /// The agent's exported file isn't one the check can trust.
+    ExportFile,
+    /// A read the check needs failed.
+    Io,
+    /// A cause a newer deck names: a client shows its generic words.
+    #[serde(other)]
+    Unknown,
+}
+
+/// PRD #1666 part 3 (Q35, R5 §10.1): the deck is holding what the user typed
+/// into an agent's pane while it checks the agent's input box. Bound to the
+/// agent generation it names. Additive: an older client ignores it, and its
+/// typing simply appears when the hold ends. No deck sets it yet.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InputHeld {
+    pub generation: u64,
+    pub cause: InputHeldCause,
+    /// Writes held.
+    pub held_ops: u32,
+    /// Bytes held.
+    pub held_bytes: u32,
+    /// When the hold began, in milliseconds since the Unix epoch.
+    pub since_ms: u64,
+}
+
+/// Why an [`InputHeld`] holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputHeldCause {
+    /// A check is running.
+    Checking,
+    /// The agent hasn't opened the deck's check.
+    CheckNotOpened,
+    /// The agent hasn't come back from the deck's check.
+    CheckNotReturned,
+    /// The agent didn't open the editor for the user's own Ctrl+G.
+    AfterYourCtrlG,
+    /// Too much typing is waiting; the rest is paused.
+    QueueFull,
+    /// The deck can't check this input box until the user presses Ctrl+G.
+    CheckBlocked,
+    /// A cause a newer deck names: a client shows its generic words.
+    #[serde(other)]
+    Unknown,
 }
 
 /// PRD #1666 §6.4: what one listed item asks the user to decide.

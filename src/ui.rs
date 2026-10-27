@@ -15988,6 +15988,7 @@ mod deck_attention_tests {
             component: None,
             wake_stalled: true,
             wake_hold: hold,
+            hold_detail: None,
             notices: Default::default(),
         }
     }

@@ -2979,6 +2979,8 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
         pull_request_revision: None,
         background: None,
         background_revision: None,
+        answer_settlements: Vec::new(),
+        input_held: None,
     };
 
     // Hydration seeds the card from the snapshot; agent_id is minted on it so
@@ -3136,6 +3138,8 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                         pull_request_revision: None,
                         background: None,
                         background_revision: None,
+                        answer_settlements: Vec::new(),
+                        input_held: None,
                     }),
                     spawned_at_ms: None,
                     cli_name: None,

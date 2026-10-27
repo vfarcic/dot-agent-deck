@@ -861,6 +861,7 @@ mod tests {
             component: None,
             wake_stalled: false,
             wake_hold: None,
+            hold_detail: None,
             notices: InboxCardNotices {
                 integration,
                 ..Default::default()
@@ -877,6 +878,7 @@ mod tests {
             returned: false,
             wake_stalled: false,
             wake_hold: None,
+            hold_detail: None,
             wake_update: false,
             attention_update: false,
             requeued: false,

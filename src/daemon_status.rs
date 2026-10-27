@@ -283,6 +283,8 @@ mod tests {
             pull_request_revision: None,
             background: None,
             background_revision: None,
+            answer_settlements: Vec::new(),
+            input_held: None,
         }
     }
 
@@ -483,6 +485,7 @@ mod tests {
             component: None,
             wake_stalled: false,
             wake_hold: None,
+            hold_detail: None,
             notices: Default::default(),
         };
         assert_eq!(inbox_cell(Some(&summary(2, 1, WakePath::Native))), "2q 1f");
