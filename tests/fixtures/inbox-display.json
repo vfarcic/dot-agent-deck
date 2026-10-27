@@ -13,7 +13,18 @@
     "cannot_type": "waiting for the agent to fetch it. Send it a prompt.",
     "not_taken": "waiting: the agent did not take the deck's Enter. Send it a prompt.",
     "uncertain_input": "waiting: the deck's notice may be in its input. Check it before Enter.",
-    "dialog_during_ring": "waiting: a dialog may have taken the deck's keys. Check its pane."
+    "dialog_during_ring": "waiting: a dialog may have taken the deck's keys. Check its pane.",
+    "needs_fetch": "waiting: ask the agent to run dot-agent-deck inbox fetch; reinstall the deck integration to restore automatic delivery",
+    "cannot_check": "waiting: the deck can't check this agent's input box. Check its pane."
+  },
+  "inputHeld": {
+    "checking": "input held: the deck is checking the input box; your typing will appear in a moment",
+    "check_not_opened": "input held: the agent hasn't opened the deck's check yet; your typing is kept until it does. Restarting the agent discards it.",
+    "check_not_returned": "input held: the agent hasn't come back from the deck's check; your typing is kept until it does. Restarting the agent discards it.",
+    "after_your_ctrl_g": "input held: the agent didn't open the editor for your Ctrl+G; your typing is kept. Restarting the agent discards it.",
+    "queue_full": "input held: too much typing is waiting; the rest is paused",
+    "check_blocked": "waiting: the deck can't check this input box until you press Ctrl+G",
+    "unknown": "input held: your typing is kept while the deck checks this input box"
   },
   "wakeHoldsAlone": {
     "uncertain_input": "The deck's notice may be in its input. Check it before pressing Enter.",

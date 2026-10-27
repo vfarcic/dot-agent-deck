@@ -774,7 +774,7 @@ fn inbox_hold_card(extra: serde_json::Value) -> String {
     buffer_to_text(&buffer)
 }
 
-/// Scenario: The daemon says why it holds the doorbell for an idle agent's one waiting message, whose wake has also stalled: a possible draft, a possible prompt, an unfinished paste, a release or input the deck can't type into, an Enter the agent did not take, the deck's line possibly left in the input, and a dialog that may have taken its keys. Each card shows the reason with the count on its notice row, in the words the desktop uses, and its status line keeps the count without the stall's "send it a prompt". With nothing waiting, the last two still warn in their own words, and the others say nothing. A reason a newer daemon names that this build does not know shows the stall's words, as does a summary from a daemon older than the field.
+/// Scenario: Render waiting messages with each doorbell hold, including needs-fetch and cannot-check, and show its shared reason on the notice row. Unknown holds use the generic stalled words; standalone input warnings remain visible with no messages.
 #[spec("inbox/status/030")]
 #[test]
 fn status_030_card_says_why_the_doorbell_holds() {
@@ -793,10 +793,15 @@ fn status_030_card_says_why_the_doorbell_holds() {
         "not_taken",
         "uncertain_input",
         "dialog_during_ring",
+        "needs_fetch",
+        "cannot_check",
     ] {
-        let rendered = inbox_hold_card(serde_json::json!({
-            "wake_stalled": true, "wake_hold": hold
-        }));
+        let extra = serde_json::json!({"wake_stalled": true, "wake_hold": hold});
+        let rendered = if matches!(hold, "needs_fetch" | "cannot_check") {
+            probe_card_updates(&[(serde_json::json!({}), extra)]).remove(0)
+        } else {
+            inbox_hold_card(extra)
+        };
         let line = format!("{glyph}1 {}", words["wakeHolds"][hold].as_str().unwrap());
         assert!(
             rendered.contains(&line),
@@ -840,6 +845,301 @@ fn status_030_card_says_why_the_doorbell_holds() {
             rendered.contains(&stalled_line),
             "{why} must say {stalled_line:?}:\n{rendered}"
         );
+    }
+}
+
+/// Feed real wire snapshots through one client's hydration path, preserving the
+/// same card between updates so clearing a field must clear its visible copy.
+fn probe_card_updates(updates: &[(serde_json::Value, serde_json::Value)]) -> Vec<String> {
+    let mut session = card_stats_session("/home/dev/api-svc");
+    session.status = SessionStatus::Idle;
+    let mut state = AppState::default();
+    state.register_pane("pane-card-stats".into());
+    state
+        .sessions
+        .insert(session.session_id.clone(), session.clone());
+    updates
+        .iter()
+        .map(|(live_extra, inbox_extra)| {
+            let mut live = serde_json::to_value(session.live_snapshot()).unwrap();
+            for (key, value) in live_extra.as_object().unwrap() {
+                live[key] = value.clone();
+            }
+            let mut inbox = serde_json::json!({
+                "queued": 1, "fetched": 0, "undeliverable": 0,
+                "wake": "doorbell", "component": null
+            });
+            for (key, value) in inbox_extra.as_object().unwrap() {
+                inbox[key] = value.clone();
+            }
+            let record = serde_json::from_value(serde_json::json!({
+                "id": "agent-card-stats", "pane_id_env": "pane-card-stats",
+                "live": live, "inbox": inbox
+            }))
+            .unwrap();
+            state.resync_after_event_gap(&[record]);
+            buffer_to_text(&render_card_to_buffer(
+                &state.sessions["sess-card-stats"],
+                Some("api-svc"),
+                Some(1),
+                CardDensityKind::Normal,
+                0,
+                render_now(),
+                false,
+                1800,
+                CardDensityKind::Normal.rendered_height(),
+            ))
+            .lines()
+            .map(|line| line.trim_matches(['│', ' ']))
+            .filter(|line| {
+                !line
+                    .chars()
+                    .all(|c| matches!(c, '─' | '┌' | '┐' | '└' | '┘'))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+        })
+        .collect()
+}
+
+/// Scenario: Hydrate each held-typing cause into an idle or thinking card with no pending mail, then clear it on that same card. Its shared explanation must appear while held and disappear on the next snapshot.
+#[spec("inbox/probe/017")]
+#[test]
+fn probe_017_held_typing_is_visible_and_clears() {
+    let words = inbox_display_words();
+    let mut missing = Vec::new();
+    let mut checking_line = String::new();
+    for (cause, expected) in words["inputHeld"].as_object().unwrap() {
+        for status in ["idle", "thinking"] {
+            let frames = probe_card_updates(&[
+                (
+                    serde_json::json!({"status": status, "input_held": {
+                        "generation": 9, "cause": cause, "held_ops": 2,
+                        "held_bytes": 7, "since_ms": 1
+                    }}),
+                    serde_json::json!({"queued": 0}),
+                ),
+                (
+                    serde_json::json!({"status": status}),
+                    serde_json::json!({"queued": 0}),
+                ),
+            ]);
+            let expected = expected.as_str().unwrap();
+            if !frames[0].contains(expected) {
+                missing.push(format!(
+                    "{cause}/{status} must show {expected:?}:\n{}",
+                    frames[0]
+                ));
+            }
+            if cause == "checking" && status == "idle" {
+                checking_line = frames[0]
+                    .lines()
+                    .find(|line| line.contains(expected))
+                    .unwrap_or("")
+                    .trim_matches(['│', ' '])
+                    .to_string();
+            }
+            assert!(
+                !frames[1].contains(expected),
+                "clearing {cause} kept its words"
+            );
+        }
+    }
+    assert!(missing.is_empty(), "{}", missing.join("\n"));
+    insta::assert_snapshot!(checking_line, @"input held: the deck is checking the input box; your typing will appear in a moment");
+}
+
+/// Scenario: Render both new holds and each cannot-check detail from a daemon snapshot, then replace the reason on the same card. Causes show distinct explanations and path remedies, while a stale detail never follows the new reason.
+#[spec("inbox/probe/017")]
+#[test]
+fn probe_017_hold_details_and_reason_replacement() {
+    let words = inbox_display_words();
+    let mut failures = Vec::new();
+    let mut causes_seen = std::collections::HashSet::new();
+    for cause in [
+        "filesystem",
+        "writable_directory",
+        "foreign_owner",
+        "acl",
+        "export_file",
+        "io",
+    ] {
+        let frames = probe_card_updates(&[
+            (
+                serde_json::json!({}),
+                serde_json::json!({"wake_hold": "cannot_check", "hold_detail": {
+                    "cause": cause, "path_component": "/safe/old-path", "filesystem": "overlayfs"
+                }}),
+            ),
+            (
+                serde_json::json!({}),
+                serde_json::json!({"wake_hold": "needs_fetch"}),
+            ),
+            (serde_json::json!({}), serde_json::json!({})),
+        ]);
+        let explanation = frames[0]
+            .lines()
+            .find(|line| line.contains("/safe/old-path"));
+        if let Some(explanation) = explanation {
+            causes_seen.insert(explanation.to_string());
+            if cause == "filesystem" {
+                for required in [
+                    "overlayfs",
+                    "TMPDIR",
+                    "CODEX_HOME",
+                    "ext4",
+                    "XFS",
+                    "Btrfs",
+                    "tmpfs",
+                    "APFS",
+                    "HFS+",
+                ] {
+                    if !frames[0].contains(required) {
+                        failures.push(format!("filesystem remedy misses {required}"));
+                    }
+                }
+            }
+            if cause == "writable_directory" && !frames[0].contains("chmod g-w") {
+                failures.push(
+                    "owned writable directory must name chmod g-w without interpolating a command"
+                        .into(),
+                );
+            }
+        } else {
+            failures.push(format!(
+                "{cause} must display the refused path:\n{}",
+                frames[0]
+            ));
+        }
+        if !frames[1].contains(words["wakeHolds"]["needs_fetch"].as_str().unwrap()) {
+            failures.push(format!(
+                "{cause} -> needs_fetch lost its words:\n{}",
+                frames[1]
+            ));
+        }
+        assert!(
+            !frames[1].contains("old-path"),
+            "new reason inherited {cause}'s path"
+        );
+        assert!(
+            !frames[2].contains("old-path"),
+            "cleared reason retained its path"
+        );
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert_eq!(
+        causes_seen.len(),
+        6,
+        "cannot-check causes need distinct explanations"
+    );
+}
+
+/// Scenario: Receive oversized path and wide-glyph filesystem text containing terminal controls, bidi overrides and shell punctuation through the wire. The card shows escaped text bounded to 256 source characters per field, with neither executable command markup nor the suffix beyond the bound.
+#[spec("inbox/probe/017")]
+#[test]
+fn probe_017_wire_details_are_bounded_and_escaped() {
+    let path = format!(
+        "/safe/\n\u{1b}\u{202e}$(touch sentinel);{}PATH_TAIL",
+        "é".repeat(270)
+    );
+    let filesystem = format!("fs-\n\u{1b}\u{202e}{}FS_TAIL", "界".repeat(270));
+    let frames = probe_card_updates(&[(
+        serde_json::json!({}),
+        serde_json::json!({
+            "wake_hold": "cannot_check", "hold_detail": {
+                "cause": "filesystem", "path_component": path, "filesystem": filesystem
+            }
+        }),
+    )]);
+    let rendered = &frames[0];
+    for prefix in [
+        "/safe/\\n\\u{1b}\\u{202e}$(touch sentinel);",
+        "fs-\\n\\u{1b}\\u{202e}",
+    ] {
+        assert!(
+            rendered.contains(prefix),
+            "wire detail must be visibly escaped, not dropped: {prefix:?}\n{rendered}"
+        );
+    }
+    for forbidden in ["PATH_TAIL", "FS_TAIL", "\u{1b}", "\u{202e}"] {
+        assert!(
+            !rendered.contains(forbidden),
+            "unsafe or unbounded detail {forbidden:?}:\n{rendered}"
+        );
+    }
+    // buffer_to_text includes the blank continuation cell after each double-width 界.
+    // Remove that cell padding before comparing source-character bounds.
+    let detail_text = rendered.replace("界 ", "界");
+    for raw in [&path, &filesystem] {
+        let escaped = |limit| {
+            dot_agent_deck::untrusted_text::escape_control_and_bidi(
+                &raw.chars().take(limit).collect::<String>(),
+            )
+        };
+        assert!(
+            detail_text.contains(&escaped(128)),
+            "the detail was dropped or prematurely cut:\n{rendered}"
+        );
+        assert!(
+            !detail_text.contains(&escaped(257)),
+            "a wire field displayed more than 256 source characters:\n{rendered}"
+        );
+    }
+    assert!(
+        !rendered.contains("chmod g-w /safe/"),
+        "path became a copy-paste command"
+    );
+}
+
+/// Scenario: A cannot-check snapshot has no detail, or a detail cause from a newer daemon. Each card shows a generic explanation without attributing an unfamiliar cause's path to that reason.
+#[spec("inbox/probe/017")]
+#[test]
+fn probe_017_missing_or_unknown_detail_is_generic() {
+    let words = inbox_display_words();
+    for detail in [
+        serde_json::Value::Null,
+        serde_json::json!({"cause": "future_cause", "path_component": "do-not-inherit"}),
+    ] {
+        let frames = probe_card_updates(&[(
+            serde_json::json!({}),
+            serde_json::json!({
+                "wake_hold": "cannot_check", "hold_detail": detail
+            }),
+        )]);
+        assert!(
+            frames[0].contains(words["wakeHolds"]["cannot_check"].as_str().unwrap()),
+            "missing/unknown detail needs generic words:\n{}",
+            frames[0]
+        );
+        assert!(!frames[0].contains("do-not-inherit"));
+    }
+}
+
+/// Scenario: A new hold has no words in this staged build and its stalled bit is false. The rendered card must still use the documented generic waiting-to-wake fallback; once the hold has words it must show those instead.
+#[spec("inbox/probe/017")]
+#[test]
+fn probe_017_wordless_holds_keep_the_generic_card_fallback() {
+    for hold in [
+        dot_agent_deck::inbox_display::WakeHold::NeedsFetch,
+        dot_agent_deck::inbox_display::WakeHold::CannotCheck,
+    ] {
+        let name = serde_json::to_value(hold).unwrap();
+        let rendered = probe_card_updates(&[(
+            serde_json::json!({}),
+            serde_json::json!({"wake_hold": name}),
+        )])
+        .remove(0);
+        if hold.words().is_none() {
+            assert!(
+                rendered.contains("waiting to wake: send it a prompt"),
+                "a wordless hold needs the generic fallback:\n{rendered}"
+            );
+        } else {
+            assert!(
+                rendered.contains(hold.words().unwrap()),
+                "hold words must reach the card:\n{rendered}"
+            );
+        }
     }
 }
 
