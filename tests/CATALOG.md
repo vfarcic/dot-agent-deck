@@ -9976,7 +9976,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/doorbell/031 — Selected-message and human-input fences at forced retry interleaves.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`, `tests/e2e_inbox_codex.rs`), real binary and daemon-owned PTY with exact input capture and vt100 replay.
 - **Agent:** none (raw Python stand-in; no agent executable or credential).
-- **Asserts:** with Idle unchanged and a second message still queued, settling the selected ID after decision, after pre-CR, after the inter-step delay or before final submit withholds the remaining bytes. Decision also covers Fetched without acknowledgement. Still-queued controls complete the real retry, parked at completion so later retries cannot race exact capture comparisons. Human frames are forced after decision, before payload and after payload before final CR; already-written bytes are allowed, and remaining automatic bytes must stop. A recognized stranded Codex composer covers its CR-only retry. Separate unreleased completion and writer-held barriers time out and each logical slot permits another submitted ring. Cleanup CR accounting remains in 007.
+- **Asserts:** with Idle unchanged and a second message still queued, settling the selected ID after decision, after pre-CR, after the inter-step delay or before final submit withholds the remaining bytes. Decision also covers Fetched without acknowledgement. Still-queued controls complete the real retry, parked at completion so later retries cannot race exact capture comparisons. Human frames are forced after decision, before payload and after payload before final CR; already-written bytes are allowed, and remaining automatic bytes must stop. A recognized stranded Codex composer covers its CR-only retry, with the six-second interleave budget starting at the reached fence after a separate load-scaled preparation wait; an unwind guard releases its fences from before arming. Separate unreleased completion and writer-held barriers time out and each logical slot permits another submitted ring. Cleanup CR accounting remains in 007.
 - **Does not assert:** a real editor's startup buffering, or settlement atomic with an already-enqueued PTY-thread write. E2E barriers use a configured single directory whose canonical target is checked under HOME; the harness supplies the isolated HOME and trusted filesystem, including marker leaves. These checks do not enforce no-symlink-escape confinement. Armed waits time out after eight seconds, and a test-only unwind guard clears busy slots; ordinary interleave fixtures share a six-second operation budget and release barriers on unwind. Between-step barriers retain the pane writer; completion barriers do not. Processes with fixture access can manipulate its files; these are not process-local barriers.
 - **Platform coverage:** mac+linux.
 
@@ -12016,11 +12016,11 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** recovery from SIGKILL of the entire host process.
 - **Cost:** none.
 
-##### inbox/opencode/006 — A held delivery is never repeated.
-- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), keepalive 300 ms
-- **Agent:** fake API withholding assistant-child events.
-- **Asserts:** a delivery without an assistant child stays fetched with one prompt across many keepalives, one possession snapshot answering each; the matching assistant turn then acknowledges it.
-- **Does not assert:** real agent cancellation behaviour.
+##### inbox/opencode/006 — A delivery with fresh possession is never repeated.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), load-scaled two-second keepalive and six-second possession TTL
+- **Agent:** fake API withholding assistant-child events and pulsing the real plugin's keepalive callback every 100 ms, independently of the daemon TTL.
+- **Asserts:** a delivery without an assistant child stays fetched with one prompt despite a one-second plugin scheduling stall; a repeat or loss of fetched state is reported before judging fixture history. Snapshots containing its held attempt span a full possession TTL with no TTL-expiring gap, measured on a monotonic clock with signed arithmetic, and the matching assistant turn then acknowledges it.
+- **Does not assert:** real agent cancellation behaviour or suppression after a genuine possession lapse; inbox/attempts/005 pins the allowed marked repeat after expiry and settlement by the original attempt's commit.
 - **Cost:** none.
 
 ##### inbox/opencode/024 — A prompt queued behind a long turn is possessed, not repeated.
