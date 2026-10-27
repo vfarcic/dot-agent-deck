@@ -2841,6 +2841,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** that the verb itself makes progress while the read hangs — it waits for the config, by design, since what the config says decides what it does; that the config is re-read on every delegate (`orchestration/delegate` and the `#704`/`#705` tests own that); the scheduler-fire, `dispatch` and `list-targets` paths, which read the config holding no `AppState` guard.
 - **Platform coverage:** mac+linux (Unix-domain socket, `mkfifo`).
 
+##### hooks/ingest/007 — A hook connection that never reads its replies loses its slot, so the connection cap cannot be wedged from the write side (issue #1693).
+- **Layer:** L1 (the real `run_hook_loop_with_limits` driven against a real Unix hook socket in-process, with one connection slot and a 300ms idle bound; no PTY, no deck binary, no agent).
+- **Agent:** none (one peer writing `work_done` lines with a malformed token, which the provenance gate refuses with a reply line, and one peer writing a `session_start`).
+- **Asserts:** while the only slot is held by a peer that keeps sending refused lines and never reads the refusals, a `session_start` written on a second connection is still applied, which needs the first connection's slot back; the first connection really is dropped — its writer's next write fails and its replies end in EOF — and the daemon answered some of its lines but not all of them. Before the fix the reply writes had no deadline, so once the replies filled the socket buffer the connection's task waited in `write_all` for good, holding its slot.
+- **Does not assert:** the production value of the bound (the idle timeout, 60s, which the reply writes share with the read); how many replies fit in the buffer, which is the kernel's; the reclaim's `warn!` wording; the held question's `held` confirmation, written after the connection has given its slot back.
+- **Platform coverage:** mac+linux (Unix-domain socket).
+
 #### hooks/install
 
 ##### hooks/install/001 — Launching the deck with `~/.claude/` present writes hook entries into `~/.claude/settings.json` idempotently.
