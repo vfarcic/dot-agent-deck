@@ -331,8 +331,10 @@ jobs:
     # raise it to paper over a hang.
     # On 2026-10-22 the apt downloads of `--with-deps` took 14–20 minutes (the
     # browser download stayed at seconds; see the install step), exhausting that
-    # budget, so allow 25 minutes for install, 15 for the suite (observed 8–12)
-    # and 5 for setup/reporting, with separate step limits bounding a hung suite.
+    # budget. Since issue #1934 the .debs are fetched in their own step, bounded
+    # at 15 minutes (three 3-minute attempts and the index fetches), and the
+    # install that follows at 8; with 15 for the suite (observed 8–12) and the
+    # rest for setup/reporting, separate step limits bound each part.
     timeout-minutes: 45
     defaults:
       run:
@@ -442,10 +444,11 @@ jobs:
       # `jobs:`, issue #1743): ~119 MB of a budget that `main` already nearly
       # fills. Each key covers one runner image version and one Playwright
       # version. A new image restores the previous image's entry by prefix and
-      # fetches only what changed. Rejected alternatives: a retry, because the
-      # slow attempts did not recover (one averaged 85 kB/s over 23 minutes, and
-      # in the three traced file by file the rate fell rather than rose), so a
-      # retry on the same runner would most likely repeat it; Playwright's
+      # fetches only what changed. Rejected alternatives: a retry from the same
+      # mirror, because the slow attempts did not recover (one averaged 85 kB/s
+      # over 23 minutes, and in the three traced file by file the rate fell
+      # rather than rose), so it would most likely repeat it — issue #1934's
+      # prefetch step below retries from the next mirror instead; Playwright's
       # container image, which would move the trust to that image and need
       # another pin kept in lockstep with `@playwright/test`. `.rwx/ci.yml`'s
       # copy of this job has no cache because it has not needed one: in the 57
@@ -491,8 +494,43 @@ jobs:
             fi
           done
           echo "Handed apt $kept cached .debs; dropped $dropped."
+      # Issue #1934 — the cache above does not always hold: it is saved only
+      # from `main`, and the repository's cache budget evicts it (on 2026-10-26
+      # it was gone from about 03:40 to 13:30 UTC, and again overnight), so a
+      # run in that window fetches all 142 MB from the mirror. Four attempts on
+      # 2026-10-26 did, from an Azure mirror serving a few kB/s, and timed out
+      # in the install step below at 25 minutes. This step fetches the same
+      # .debs with a limit per attempt and moves off that mirror after the
+      # first stalled one; `.github/scripts/apt-prefetch.sh` has the evidence.
+      # The package list is Playwright's own: `install-deps --dry-run` prints
+      # what `--with-deps` would install (exiting 1 when that is anything),
+      # and the arguments match the `apt-get install` it runs.
+      - name: Fetch the .debs, bounding each attempt
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          rc=0
+          out=$(pnpm exec playwright install-deps --dry-run chromium webkit 2>&1) || rc=$?
+          pkgs=()
+          while read -r pkg; do
+            pkgs+=("$pkg")
+          done < <(sed -n 's/^  \([^ ]\+\)$/\1/p' <<< "$out")
+          if [ "${#pkgs[@]}" -eq 0 ]; then
+            echo "$out"
+            if [ "$rc" -eq 0 ]; then
+              exit 0
+            fi
+            echo "::error::Read no package list from Playwright's install-deps --dry-run (exit $rc)."
+            exit 1
+          fi
+          echo "Playwright's dependencies to install: ${#pkgs[@]} packages."
+          ../.github/scripts/apt-prefetch.sh --no-install-recommends "${pkgs[@]}"
+      # The fetch above leaves apt nothing to download, so this installs from
+      # the archive cache and downloads only the browsers (9-12 s from the CDN
+      # in every measured run).
       - run: pnpm exec playwright install --with-deps chromium webkit
-        timeout-minutes: 25
+        timeout-minutes: 8
       # Rebuilt from what this run installed, so a package nothing installs any
       # more, a version Ubuntu has replaced or a dropped file is not saved
       # again. It runs on every ref, so a branch's run shows what `main` would
@@ -579,10 +617,11 @@ jobs:
     # suite 86s. The original 30-minute budget was four times that, capping a
     # wedged window at a fraction of the 6-hour default. Re-tune from more
     # runs; do not raise it to paper over a hang.
-    # Slow downloads on 2026-10-22 warrant 25 minutes for apt, 10 for the suite
-    # and 15 for builds/setup/reporting (run 39821435797 used about 6 minutes
-    # outside the suite), with the suite's own limit bounding a wedged window.
-    timeout-minutes: 50
+    # Slow downloads on 2026-10-22 warranted 25 minutes for apt; since issue
+    # #1934 the apt step's attempts are bounded and it gets 15, with 10 for the
+    # suite and 15 for builds/setup/reporting (run 39821435797 used about 6
+    # minutes outside the suite), the suite's own limit bounding a wedged window.
+    timeout-minutes: 45
     env:
       # The ONE place tauri-driver's version is written. renovate.json's
       # tauri-driver customManager bumps this line, and
@@ -629,9 +668,24 @@ jobs:
       # `/usr/bin/WebKitWebDriver`, where the suite step below points; checked
       # in `ubuntu:24.04` and `ubuntu:26.04` containers on 2026-10-25. The
       # other packages here have the same names on both.
+      #
+      # Issue #1934 — the .debs (80 MB) are fetched by
+      # `.github/scripts/apt-prefetch.sh` before the install, for the reason
+      # that script records: on 2026-10-26 this step sat on an Azure mirror
+      # serving a few kB/s until its 25-minute limit (run 40395729937). The
+      # prefetch bounds each attempt and moves off that mirror after the first
+      # stalled one, so the install finds every .deb already downloaded. Its
+      # first run on a runner did exactly that (run 40450743777: 78 of 80 MB
+      # from Azure in a 5-minute first attempt, the rest from
+      # archive.ubuntu.com in 1 s). They
+      # are not cached the way `desktop-browser`'s are: that cache is evicted
+      # by the repository's cache budget for hours at a time, so it cannot be
+      # what keeps this step inside its limit, and another entry would add to
+      # the pressure that evicts `main`'s Rust caches.
       - name: Install driver system dependencies
-        timeout-minutes: 25
+        timeout-minutes: 15
         run: |
+          set -euo pipefail
           sudo apt-get update
           # Read whole rather than with `grep -q`, whose early exit can fail
           # the pipeline under pipefail and pick the wrong name.
@@ -641,9 +695,11 @@ jobs:
             driver=webkit2gtk-driver
           fi
           echo "WebKitWebDriver package: $driver"
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+          pkgs=(libwebkit2gtk-4.1-dev libgtk-3-dev \
             libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev \
-            "$driver" xvfb xclip xdotool openssh-server libnss-wrapper
+            "$driver" xvfb xclip xdotool openssh-server libnss-wrapper)
+          .github/scripts/apt-prefetch.sh "${pkgs[@]}"
+          sudo apt-get install -y "${pkgs[@]}"
       # From crates.io source with its own lockfile, not a prebuilt binary:
       # tauri-driver publishes none, and a third-party build cache would be a
       # binary this job then executes on trust alone. rust-cache keeps
