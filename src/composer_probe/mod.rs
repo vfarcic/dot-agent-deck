@@ -8,14 +8,21 @@
 //! bracketed-paste tracker ([`paste_mode`]), the rule for trusting the
 //! file an agent exports ([`path_rule`]), the classifier of whose editor
 //! invocation it is ([`classifier`]), the arm page the daemon publishes
-//! to its editor helper ([`arm`]), and the permission to arm ([`permission`]).
-//! The daemon feeds the hook every byte an agent writes; nothing in it reads
-//! what the hook tracks yet, or calls the path rule, the classifier or the
-//! permission, or maps an arm page.
+//! to its editor helper ([`arm`]), the permission to arm ([`permission`]),
+//! and installation: the decision at each spawn ([`install`]) and the
+//! instance directory it installs from ([`instance`], Linux). The daemon
+//! feeds the hook every byte an agent writes and decides installation at
+//! every spawn, which installs nothing outside the `e2e` build's assumption
+//! until activation; nothing in it reads what the hook tracks yet, or calls
+//! the path rule, the classifier or the permission, or publishes to an arm
+//! page.
 
 pub mod arm;
 pub mod classifier;
 pub mod framing;
+pub mod install;
+#[cfg(target_os = "linux")]
+pub mod instance;
 pub mod paste_mode;
 pub mod path_rule;
 

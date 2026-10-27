@@ -682,25 +682,31 @@ pub fn parse_assumed_editor_probes(
 /// e2e stand-ins follow ([`crate::doorbell_screen::standin_editor_probe`]).
 /// It substitutes a record, never a release: a generation still needs its own
 /// header to latch one of them. A list with an unknown entry assumes nothing
-/// and is logged as `editor probe assumption refused`.
+/// and is logged as `editor probe assumption refused`. The daemon reads it
+/// once, at start (`crate::composer_probe::install::capture_assumption`).
 #[cfg(feature = "e2e")]
 pub fn assumed_editor_probes() -> Vec<(AgentType, Version, EditorProbe<'static>)> {
+    read_assumed_editor_probes().unwrap_or_else(|why| {
+        tracing::warn!(target: "doorbell", %why, "editor probe assumption refused");
+        Vec::new()
+    })
+}
+
+/// [`assumed_editor_probes`], with a refused list as its reason: the
+/// variable unset or empty is no assumption.
+#[cfg(feature = "e2e")]
+pub fn read_assumed_editor_probes()
+-> Result<Vec<(AgentType, Version, EditorProbe<'static>)>, String> {
     let Ok(list) = std::env::var(ASSUME_EDITOR_PROBE_ENV) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    match parse_assumed_editor_probes(&list, &RELEASE_RECORDS) {
-        Ok(entries) => entries
-            .into_iter()
-            .filter_map(|(agent, release)| {
-                let probe = crate::doorbell_screen::standin_editor_probe(&agent)?;
-                Some((agent, release, probe))
-            })
-            .collect(),
-        Err(why) => {
-            tracing::warn!(target: "doorbell", %why, "editor probe assumption refused");
-            Vec::new()
-        }
-    }
+    Ok(parse_assumed_editor_probes(&list, &RELEASE_RECORDS)?
+        .into_iter()
+        .filter_map(|(agent, release)| {
+            let probe = crate::doorbell_screen::standin_editor_probe(&agent)?;
+            Some((agent, release, probe))
+        })
+        .collect())
 }
 
 /// The production build reads no variable and assumes nothing.
