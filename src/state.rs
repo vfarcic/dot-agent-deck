@@ -3870,12 +3870,12 @@ fn arm_idle_worker_watch_for_delegation(
 /// seq-conditional take then settles — and `false` when the delegation was
 /// cancelled meanwhile.
 ///
-/// Those two marks do not cover the whole dispatch. Between the dispatch
-/// taking both locks (the dequeue) and the pointer write beginning, the record
-/// is neither queued nor in progress — for a `clear = true` delegation that is
-/// the respawn — so the due time is computed and
-/// may already have passed. That is deliberate: respawn time counts against
-/// the worker, as it did before #544, and the watch may report during it.
+/// The two marks cover the whole dispatch: the record goes from queued to in
+/// progress when the dispatch takes the pane's locks, so what it does before
+/// the post (config, the task file, a `clear = true` restart) holds the watch
+/// too, and `pointer_deferred` runs from there to the acknowledgement. The
+/// clock thus starts at the worker's acknowledgement (PRD #1666 part 3, #1939's
+/// diagnosis; before it, that preparation counted against the worker).
 async fn wait_out_pointer_deferral(
     registry: &AgentPtyRegistry,
     worker_pane_id: &str,
@@ -3910,6 +3910,11 @@ async fn wait_out_pointer_deferral(
 /// otherwise, so a dispatch that returns early, panics or is dropped while it
 /// waits for a lock never leaves the idle-worker watch holding forever.
 ///
+/// Taking the locks turns the mark into "in progress" (PRD #1666 part 3), held
+/// until the task is posted, when [`Self::posted`] hands the hold to the wait
+/// for its acknowledgement. A dispatch that ends without posting ends the hold
+/// on drop.
+///
 /// Built by `handle_delegate_with_state` right after the mark is set and moved
 /// into the spawned `dispatch_one_owned`, so the mark is never outside a guard:
 /// a panic before the spawn, or a spawned task dropped unpolled, still drops it.
@@ -3918,6 +3923,8 @@ struct PointerQueueClock {
     worker_pane_id: String,
     delegation_seq: Option<u64>,
     queued: bool,
+    /// When the dispatch took the pane's locks, until the task is posted.
+    dispatched: Option<std::time::Instant>,
 }
 
 impl PointerQueueClock {
@@ -3931,6 +3938,7 @@ impl PointerQueueClock {
             worker_pane_id,
             delegation_seq,
             queued: true,
+            dispatched: None,
         }
     }
 
@@ -3939,14 +3947,24 @@ impl PointerQueueClock {
         self.delegation_seq
     }
 
-    fn dequeue(&mut self) {
+    /// The dispatch holds the pane's locks: no longer queued, and in progress
+    /// until the task is posted and acknowledged.
+    fn dispatch(&mut self) {
         if !std::mem::take(&mut self.queued) {
             return;
         }
         if let Some(seq) = self.delegation_seq {
+            // Read before the queue ends, so the hold never starts after it.
+            self.dispatched = Some(std::time::Instant::now());
             self.registry
-                .dequeue_delegation_pointer_write(&self.worker_pane_id, seq);
+                .begin_delegation_pointer_write(&self.worker_pane_id, seq);
         }
+    }
+
+    /// The task is posted: the caller takes over the hold, measured from the
+    /// instant returned.
+    fn posted(&mut self) -> Option<std::time::Instant> {
+        self.dispatched.take()
     }
 }
 
@@ -3957,11 +3975,18 @@ impl Drop for PointerQueueClock {
         // `CommissionDispatchInFlight`'s `Drop` gives: this guard is armed on
         // the delegate path, whose tracker-then-hub sections can poison the
         // tracker, and a panic here during that unwind would abort the daemon.
-        if std::mem::take(&mut self.queued)
-            && let Some(seq) = self.delegation_seq
-        {
+        let Some(seq) = self.delegation_seq else {
+            return;
+        };
+        if std::mem::take(&mut self.queued) {
             self.registry
                 .dequeue_delegation_pointer_write_in_drop(&self.worker_pane_id, seq);
+        } else if let Some(dispatched) = self.dispatched.take() {
+            self.registry.finish_delegation_pointer_write_in_drop(
+                &self.worker_pane_id,
+                seq,
+                dispatched.elapsed(),
+            );
         }
     }
 }
@@ -5659,7 +5684,9 @@ async fn dispatch_one_owned(
     let _dispatch_order_guard = dispatch_order.lock().await;
     let dispatch_lock = registry.pane_dispatch_lock(&pane_id);
     let _dispatch_guard = dispatch_lock.lock().await;
-    pointer_queue.dequeue();
+    // The idle-worker clock is held from here until the task is acknowledged:
+    // a worker cannot answer a task that has not reached it.
+    pointer_queue.dispatch();
     let commission_armed = commission_in_flight.is_some();
     let commission_arm_id = commission_in_flight
         .as_ref()
@@ -6038,11 +6065,6 @@ async fn dispatch_one_owned(
         .await;
     }
     let worker = crate::inbox::Recipient::bound(&pane_id, &worker_agent_id);
-    // The idle-worker clock is held from the post until the task is
-    // acknowledged: a worker cannot answer a task that has not reached it.
-    if let Some(seq) = delegation_seq {
-        registry.begin_delegation_pointer_write(&pane_id, seq);
-    }
     let ledger = crate::inbox_hub::DelegateLedger {
         commission_arm_id,
         delegation_seq,
@@ -6092,31 +6114,26 @@ async fn dispatch_one_owned(
             if let Some(seq) = delegation_seq {
                 registry.report_published_block_to_new_delegation(&pane_id, seq, &worker_agent_id);
             }
-            if let Some(seq) = delegation_seq {
+            if let (Some(seq), Some(dispatched)) = (delegation_seq, pointer_queue.posted()) {
                 let registry = Arc::clone(&registry);
                 let pane_id = pane_id.clone();
-                let posted = std::time::Instant::now();
                 tokio::spawn(async move {
                     let held = match ended.await {
                         Ok(crate::inbox_hub::DelegateEnd::Acknowledged(at)) => {
-                            at.saturating_duration_since(posted)
+                            at.saturating_duration_since(dispatched)
                         }
-                        _ => posted.elapsed(),
+                        _ => dispatched.elapsed(),
                     };
                     registry.finish_delegation_pointer_write(&pane_id, seq, held);
                 });
             }
         }
+        // Each retires the idle-worker record; `pointer_queue` ends the hold
+        // on drop, a no-op by then.
         Err(crate::inbox_hub::PostRefusal::Stale(_)) => {
-            if let Some(seq) = delegation_seq {
-                registry.finish_delegation_pointer_write(&pane_id, seq, Default::default());
-            }
             no_live_worker(orchestrator, reservation);
         }
         Err(crate::inbox_hub::PostRefusal::Refused(error)) => {
-            if let Some(seq) = delegation_seq {
-                registry.finish_delegation_pointer_write(&pane_id, seq, Default::default());
-            }
             refuse(orchestrator, Some(reservation), &error);
         }
     }
@@ -17600,6 +17617,122 @@ mod tests {
                 ..crate::agent_pty::SpawnOptions::default()
             })
             .expect("spawn stand-in")
+    }
+
+    /// PRD #1666 part 3 (#1939's diagnosis): the idle-worker clock starts at
+    /// the worker's acknowledgement (`scheduler/idle-worker/026`), so what a
+    /// dispatch does between taking the pane's locks and posting the task
+    /// (config, the task file, a `clear = true` restart) is not counted
+    /// against the worker. The dispatch is held there, at
+    /// `CLEAR_RESPAWNED_GATES`, for most of the timeout: the watch must hold
+    /// meanwhile, and once the task is acknowledged it is due a whole timeout
+    /// after that, which is when the notice arrives.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_idle_clock_starts_at_acknowledgement_not_at_dispatch() {
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1_500);
+        const HELD: std::time::Duration = std::time::Duration::from_millis(1_000);
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let orch = stand_in_in(&registry, "ic-orch", None);
+        let worker = stand_in_in(&registry, "ic-worker", None);
+        let seq = arm_idle_worker_watch_for_delegation(
+            &registry,
+            "ic-worker",
+            "coder",
+            "ic-orch",
+            None,
+            Some(TIMEOUT),
+        )
+        .expect("the watch is armed");
+        let (reached_tx, reached) = tokio::sync::oneshot::channel();
+        let (go, go_rx) = tokio::sync::oneshot::channel();
+        CLEAR_RESPAWNED_GATES
+            .lock()
+            .unwrap()
+            .push(("ic-worker".to_string(), reached_tx, go_rx));
+        let (event_tx, _event_rx) = broadcast::channel(16);
+        let id = registry.inbox().mint_id();
+        let dispatch = tokio::spawn(dispatch_one_owned(
+            registry.clone(),
+            event_tx,
+            None,
+            "ic-orch".to_string(),
+            Some(orch.clone()),
+            "coder".to_string(),
+            "ic-worker".to_string(),
+            "the task".to_string(),
+            None,
+            id.clone(),
+            PointerQueueClock::new(registry.clone(), "ic-worker".to_string(), Some(seq)),
+            None,
+            None,
+            None,
+        ));
+        reached.await.expect("the dispatch reaches the gate");
+        let clock = registry
+            .delegation_idle_clock("ic-worker", seq)
+            .expect("the record is live");
+        assert!(
+            clock.pointer_queued || clock.pointer_in_progress,
+            "the watch must hold while the dispatch prepares the task: {clock:?}"
+        );
+        tokio::time::sleep(HELD).await;
+        go.send(()).unwrap();
+        dispatch.await.unwrap();
+
+        let before_ack = std::time::Instant::now();
+        let taken = registry.inbox().test_hook_fetch("ic-worker", &worker, None);
+        assert_eq!(taken.deliveries.len(), 1, "the task is taken");
+        registry.inbox().ack(
+            id.as_str(),
+            "ic-worker",
+            &worker,
+            crate::inbox::AckHow::Explicit,
+        );
+        registry.inbox().test_hook_close(taken);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let clock = loop {
+            let clock = registry
+                .delegation_idle_clock("ic-worker", seq)
+                .expect("the record is live");
+            if !clock.pointer_in_progress {
+                break clock;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the acknowledgement never ended the hold"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        let due = clock.armed_at + TIMEOUT + clock.pointer_queued_for + clock.pointer_deferred;
+        assert!(
+            due >= before_ack + TIMEOUT,
+            "the watch is due {:?} before a whole timeout after the acknowledgement: {clock:?}",
+            (before_ack + TIMEOUT).saturating_duration_since(due)
+        );
+
+        let notified = |registry: &AgentPtyRegistry| {
+            registry
+                .inbox()
+                .list("ic-orch")
+                .iter()
+                .any(|m| m.subject == "worker has not responded")
+        };
+        let deadline = before_ack + TIMEOUT + std::time::Duration::from_secs(10);
+        while !notified(&registry) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the idle-worker notice never arrived"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let early = (before_ack + TIMEOUT).saturating_duration_since(std::time::Instant::now());
+        assert!(
+            early.is_zero(),
+            "the idle-worker notice arrived {early:?} before a whole timeout after the \
+             acknowledgement"
+        );
+        registry.shutdown_all();
     }
 
     /// PR #1735 fifth review (N8): a newer delegation the worker's inbox
