@@ -36,6 +36,10 @@
 //! Nothing here reads a screen or a clock: it is a pure function of its inputs,
 //! so the doorbell can ask it at every admission and `inbox/doorbell/053`
 //! can enumerate it.
+//!
+//! A record's `editor_probe` is not one of its inputs. It belongs to the
+//! composer probe (`crate::composer_probe::permission`), which may check a
+//! release's input box only when it is verified; no rule above reads it.
 
 use std::time::Duration;
 
@@ -139,10 +143,90 @@ impl FirstModal {
     }
 }
 
+/// Where an agent writes the file its external-editor action exports, and
+/// how it hands that file to the editor (the argument rule): the shape an
+/// invocation must have to be the composer's own (Q35 core §2.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportShape {
+    /// Claude Code: a file under the validated `<TMPDIR>/claude-<uid>/`,
+    /// passed as the editor's last argument.
+    ClaudeTmpdir,
+    /// Codex: `<CODEX_HOME>/editor/.tmpXXXXXX.md`, passed as the editor's last
+    /// argument.
+    CodexEditorDir,
+}
+
+/// How an agent chooses the user's editor for its own external-editor
+/// action, which the deck's helper reproduces when the invocation is the
+/// user's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorSelection {
+    /// A truthy `VISUAL`, else a truthy `EDITOR`, else the first of `code`,
+    /// `vi` and `nano` on `PATH`, split on literal spaces (M22, M23).
+    ClaudeCode,
+    /// A set, non-empty `VISUAL`, else `EDITOR`, a set but empty one being an
+    /// error, split by shell-words rules (M34).
+    Codex,
+}
+
+/// The bracketed-paste mode writes an agent makes around one editor
+/// invocation: `ESC[?2004l` before it, `ESC[?2004h` after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PasteToggles {
+    pub disables: u8,
+    pub enables: u8,
+}
+
+/// A source an agent reads its key bindings from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeymapSource {
+    /// Claude Code's `keybindings.json`.
+    ClaudeKeybindings,
+    /// `$CODEX_HOME/config.toml`.
+    CodexConfig,
+    /// The selected profile's `$CODEX_HOME/<name>.config.toml`.
+    CodexProfile,
+    /// A trusted project's `.codex/config.toml`.
+    CodexProject,
+    /// A `-c key=value` on Codex's command line.
+    CodexOverride,
+}
+
+/// What one release's external-editor action was measured to do (Q35-11):
+/// the composer probe's record, kept in the release's [`ReleaseRecord`].
+///
+/// It is an observer capability only. The ring's verdict ([`exact_verdict`],
+/// [`activation`]) never reads it, so a missing one turns no ring off and a
+/// verified one turns no ring on; it decides only whether the deck may check
+/// the release's input box (`crate::composer_probe::permission`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditorProbe<'a> {
+    /// The export's location and argument rule.
+    pub export: ExportShape,
+    /// The user's-editor selection the helper reproduces.
+    pub selection: EditorSelection,
+    /// The `?2004` writes per invocation.
+    pub paste_toggles: PasteToggles,
+    /// Every source the release reads its key bindings from, in precedence
+    /// order.
+    pub keymap_sources: &'a [KeymapSource],
+    /// P-KB1 (Claude Code, M49b): the release loads its key bindings before
+    /// its first ready frame, so a file unchanged since spawn is the binding
+    /// it loaded. Codex has no such premise and leaves it absent.
+    pub keymap_loaded_at_start: Measurement<()>,
+    /// The candidate forms of the probe's key measured inert in a composer
+    /// holding text (M44e).
+    pub inert_candidates: &'a [&'a [u8]],
+    /// P-PASTE (M44e): with bracketed paste on, the release treats a pasted
+    /// `0x07` as text.
+    pub pasted_bel_is_text: Measurement<()>,
+}
+
 /// Everything measured for one release of one agent (plan §4.6).
 ///
 /// The required fields decide whether the release can be typed into at all;
-/// the capability fields only turn a capability off.
+/// the capability fields only turn a capability off; `editor_probe` belongs
+/// to the composer probe and not to the ring.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseRecord<'a> {
     pub agent: AgentType,
@@ -170,6 +254,8 @@ pub struct ReleaseRecord<'a> {
     pub placeholder_empty: Measurement<()>,
     pub delete_key: Measurement<()>,
     pub transcript_echo: Measurement<()>,
+    // Observer capability only: the verdict never reads it.
+    pub editor_probe: Measurement<EditorProbe<'a>>,
 }
 
 /// Why a generation is not typed into. [`NoGo::clause`] is the word the deck
@@ -548,6 +634,103 @@ pub fn with_assumed_codex_head_echo<'a>(
         .collect()
 }
 
+/// The variable the e2e build reads for [`assumed_editor_probes`].
+pub const ASSUME_EDITOR_PROBE_ENV: &str = "DOT_AGENT_DECK_E2E_ASSUME_EDITOR_PROBE";
+
+/// Parse a comma-separated list of exact `agent@release` entries (`claude`
+/// or `codex`, then a bare release) against `records`: an entry is known only
+/// when `records` has that agent's record for exactly that release. Any entry
+/// that is not known refuses the whole list, as does an entry named twice.
+/// The result names records that exist; it never carries a release a
+/// generation has not latched itself.
+pub fn parse_assumed_editor_probes(
+    list: &str,
+    records: &[ReleaseRecord<'_>],
+) -> Result<Vec<(AgentType, Version)>, String> {
+    if list.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut entries: Vec<(AgentType, Version)> = Vec::new();
+    for entry in list.split(',') {
+        let entry = entry.trim();
+        let unknown = || format!("not a recorded agent@release: {entry:?}");
+        let (agent, release) = entry.split_once('@').ok_or_else(unknown)?;
+        let agent = match agent {
+            "claude" => AgentType::ClaudeCode,
+            "codex" => AgentType::Codex,
+            _ => return Err(unknown()),
+        };
+        // A pre-release or build is refused here too: a record's release is
+        // bare, and two versions are equal only with equal metadata.
+        let release = Version::parse(release).map_err(|_| unknown())?;
+        if !records
+            .iter()
+            .any(|r| r.agent == agent && r.release == release)
+        {
+            return Err(unknown());
+        }
+        if entries.contains(&(agent.clone(), release.clone())) {
+            return Err(format!("named twice: {entry:?}"));
+        }
+        entries.push((agent, release));
+    }
+    Ok(entries)
+}
+
+/// PRD #1666 part 3, Q35-11: the recorded releases an e2e run asks the deck
+/// to treat as having a verified `editor_probe`, each with the record the
+/// e2e stand-ins follow ([`crate::doorbell_screen::standin_editor_probe`]).
+/// It substitutes a record, never a release: a generation still needs its own
+/// header to latch one of them. A list with an unknown entry assumes nothing
+/// and is logged as `editor probe assumption refused`.
+#[cfg(feature = "e2e")]
+pub fn assumed_editor_probes() -> Vec<(AgentType, Version, EditorProbe<'static>)> {
+    let Ok(list) = std::env::var(ASSUME_EDITOR_PROBE_ENV) else {
+        return Vec::new();
+    };
+    match parse_assumed_editor_probes(&list, &RELEASE_RECORDS) {
+        Ok(entries) => entries
+            .into_iter()
+            .filter_map(|(agent, release)| {
+                let probe = crate::doorbell_screen::standin_editor_probe(&agent)?;
+                Some((agent, release, probe))
+            })
+            .collect(),
+        Err(why) => {
+            tracing::warn!(target: "doorbell", %why, "editor probe assumption refused");
+            Vec::new()
+        }
+    }
+}
+
+/// The production build reads no variable and assumes nothing.
+#[cfg(not(feature = "e2e"))]
+pub fn assumed_editor_probes() -> Vec<(AgentType, Version, EditorProbe<'static>)> {
+    Vec::new()
+}
+
+/// `records` with `editor_probe` set to the assumed record on each record
+/// `assumed` names by agent and exact release. Every other field, and every
+/// record not named, is kept as it is, and no record is added, so a release
+/// without a record of its own stays without one.
+pub fn with_assumed_editor_probes<'a>(
+    records: Vec<ReleaseRecord<'a>>,
+    assumed: &[(AgentType, Version, EditorProbe<'a>)],
+) -> Vec<ReleaseRecord<'a>> {
+    records
+        .into_iter()
+        .map(|mut r| {
+            if let Some((_, _, probe)) = assumed
+                .iter()
+                .find(|(agent, release, _)| *agent == r.agent && *release == r.release)
+            {
+                r.editor_probe = Measurement::Verified(*probe);
+            }
+            r
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // The recorded measurements (M1, M2; 2026-10-24). Each record states its
 // sample counts and figures; the raw captures 036 replays are under
@@ -876,7 +1059,8 @@ const CODEX_0160_DIALOGS: &[DialogKeys<'static>] = &[
 /// Of the three, only Claude Code 2.1.310 is `Go`: both Codex releases stage
 /// the line (a digit of a message id answers their update dialog, `n` their
 /// folder-trust dialog), and neither records `head_echo` yet, so both are
-/// `missing_measurement`.
+/// `missing_measurement`. No release has its `editor_probe` measured yet, so
+/// the deck checks no input box on any of them.
 pub static RELEASE_RECORDS: [ReleaseRecord<'static>; 3] = [
     // Codex 0.164.0, the release current at measurement. Echo: the exact line
     // in the composer 30 of 30 (20 at 50 × 200, 10 at 24 × 80; ≤ 62 ms after
@@ -912,6 +1096,7 @@ pub static RELEASE_RECORDS: [ReleaseRecord<'static>; 3] = [
         placeholder_empty: Measurement::Verified(()),
         delete_key: Measurement::Verified(()),
         transcript_echo: Measurement::Verified(()),
+        editor_probe: Measurement::Absent,
     },
     // Codex 0.160.0, the minimum `scripts/box/require-codex-version.sh`
     // accepts and the incident's release, installed into a scratch npm prefix.
@@ -941,6 +1126,7 @@ pub static RELEASE_RECORDS: [ReleaseRecord<'static>; 3] = [
         placeholder_empty: Measurement::Verified(()),
         delete_key: Measurement::Verified(()),
         transcript_echo: Measurement::Verified(()),
+        editor_probe: Measurement::Absent,
     },
     // Claude Code 2.1.310. Echo 30 of 30 (≤ 27 ms); the hook saw the exact
     // prompt 30 of 30, ≤ 102 ms after the CR, and the transcript's user
@@ -968,5 +1154,6 @@ pub static RELEASE_RECORDS: [ReleaseRecord<'static>; 3] = [
         placeholder_empty: Measurement::Failed,
         delete_key: Measurement::Verified(()),
         transcript_echo: Measurement::Verified(()),
+        editor_probe: Measurement::Absent,
     },
 ];

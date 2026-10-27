@@ -3,10 +3,12 @@
 use std::time::Duration;
 
 use dot_agent_deck::doorbell_activation::{
-    Activation, DialogKeys, FirstModal, KeyEffect, LatchedRelease, Measurement, NoGo,
-    RELEASE_RECORDS, ReleaseRecord, SETTLE_CAP, activation, exact_verdict, first_stage_bytes,
-    parse_unrecorded_claude_releases, with_assumed_codex_head_echo, without_unrecorded_claude,
+    Activation, DialogKeys, EditorProbe, EditorSelection, ExportShape, FirstModal, KeyEffect,
+    KeymapSource, LatchedRelease, Measurement, NoGo, PasteToggles, RELEASE_RECORDS, ReleaseRecord,
+    SETTLE_CAP, activation, exact_verdict, first_stage_bytes, parse_unrecorded_claude_releases,
+    with_assumed_codex_head_echo, with_assumed_editor_probes, without_unrecorded_claude,
 };
+use dot_agent_deck::doorbell_generation::generation_activation;
 use dot_agent_deck::event::AgentType;
 use semver::Version;
 use spec::spec;
@@ -53,6 +55,7 @@ fn complete(agent: AgentType, release: &str, first_modal_secs: u64) -> ReleaseRe
         placeholder_empty: Measurement::Verified(()),
         delete_key: Measurement::Verified(()),
         transcript_echo: Measurement::Absent,
+        editor_probe: Measurement::Absent,
     }
 }
 
@@ -815,4 +818,217 @@ fn doorbell_053_the_shipped_records_verdicts() {
         ),
         exact_verdict(&RELEASE_RECORDS[2])
     );
+}
+
+/// A verified editor record, as a measurement of one release would give it.
+const PROBE: EditorProbe<'static> = EditorProbe {
+    export: ExportShape::CodexEditorDir,
+    selection: EditorSelection::Codex,
+    paste_toggles: PasteToggles {
+        disables: 1,
+        enables: 1,
+    },
+    keymap_sources: &[KeymapSource::CodexConfig],
+    keymap_loaded_at_start: Measurement::Absent,
+    inert_candidates: &[b"\x07"],
+    pasted_bel_is_text: Measurement::Verified(()),
+};
+
+/// Every state an editor record can be in.
+const EDITOR_STATES: [Measurement<EditorProbe<'static>>; 5] = [
+    Measurement::Absent,
+    Measurement::Unverified,
+    Measurement::Failed,
+    Measurement::Unraisable,
+    Measurement::Verified(PROBE),
+];
+
+/// Scenario: Give each kind of record the table decides (Go, Go and staged, each required measurement absent, unverified or unraisable, a committing first-stage key, a settle over the cap, a staged one without its head echo) every editor-record state, and ask the table and the production path that applies the e2e assumptions about its release. Each verdict is the one the record has with no editor record: a missing one turns no Go off, and a verified one turns no NoGo on.
+#[spec("inbox/doorbell/053")]
+#[test]
+fn doorbell_053_an_editor_record_decides_no_ring() {
+    const PAREN_COMMITS: &[DialogKeys<'static>] = &[DialogKeys {
+        dialog: "trust",
+        keys: &[(b'(', KeyEffect::Commits)],
+    }];
+    const DIGIT_COMMITS: &[DialogKeys<'static>] = &[DialogKeys {
+        dialog: "update",
+        keys: &[(b'1', KeyEffect::Commits)],
+    }];
+    let mut records = vec![
+        complete(CODEX, "0.164.0", 2),
+        ReleaseRecord {
+            key_effects: Measurement::Verified(DIGIT_COMMITS),
+            ..complete(CODEX, "0.164.0", 2)
+        },
+        ReleaseRecord {
+            key_effects: Measurement::Verified(DIGIT_COMMITS),
+            head_echo: Measurement::Absent,
+            ..complete(CODEX, "0.164.0", 2)
+        },
+        ReleaseRecord {
+            key_effects: Measurement::Verified(PAREN_COMMITS),
+            ..complete(CODEX, "0.164.0", 2)
+        },
+        complete(CODEX, "0.164.0", 21),
+        complete(CLAUDE, "2.1.310", 0),
+    ];
+    for field in 0..REQUIRED.len() {
+        for state in [State::Absent, State::Unverified, State::Unraisable] {
+            let mut record = complete(CODEX, "0.164.0", 2);
+            set(&mut record, field, state);
+            records.push(record);
+        }
+    }
+    let mut go = 0;
+    let mut held = 0;
+    for base in &records {
+        let release = LatchedRelease::Known(base.release.clone());
+        let want = exact_verdict(base);
+        match want {
+            Activation::NoGo(_) => held += 1,
+            _ => go += 1,
+        }
+        for editor in EDITOR_STATES {
+            let record = ReleaseRecord {
+                editor_probe: editor,
+                ..base.clone()
+            };
+            assert_eq!(exact_verdict(&record), want, "{editor:?}");
+            let one = std::slice::from_ref(&record);
+            assert_eq!(activation(one, &record.agent, &release, &[]), want);
+            assert_eq!(
+                generation_activation(one, Some(&record.agent), &release, &[]),
+                want,
+                "{editor:?}"
+            );
+        }
+    }
+    assert_eq!((go, held), (3, 3 + 3 * REQUIRED.len()));
+}
+
+/// Scenario: Enumerate small record tables (Codex and Claude Code records on a few releases, each complete, incomplete or absent, fast or slow) and, for each, every assignment of a verified or missing editor record to its records, then ask the table about every live release in range, inherited ones included. Every verdict equals the one with no editor record anywhere.
+#[spec("inbox/doorbell/053")]
+#[test]
+fn doorbell_053_editor_records_move_no_verdict_in_any_table() {
+    #[derive(Clone, Copy)]
+    enum R {
+        Absent,
+        Complete(u64),
+        Incomplete(u64),
+    }
+    let codex_releases = ["0.160.0", "0.163.0", "0.164.0"];
+    let claude_releases = ["2.1.300", "2.1.310"];
+    let states = [R::Absent, R::Complete(2), R::Complete(16), R::Incomplete(2)];
+    let live: Vec<(AgentType, &str)> = [
+        "0.159.0", "0.160.0", "0.161.0", "0.163.0", "0.164.0", "0.165.0", "0.168.0", "0.169.0",
+    ]
+    .iter()
+    .map(|r| (CODEX, *r))
+    .chain(
+        ["2.1.300", "2.1.305", "2.1.310"]
+            .iter()
+            .map(|r| (CLAUDE, *r)),
+    )
+    .collect();
+    let mut tables = 0;
+    let mut inherited = 0;
+    for table in 0..states.len().pow(5) {
+        let mut records = Vec::new();
+        let mut n = table;
+        for (agent, release) in codex_releases
+            .iter()
+            .map(|r| (CODEX, *r))
+            .chain(claude_releases.iter().map(|r| (CLAUDE, *r)))
+        {
+            match states[n % states.len()] {
+                R::Absent => {}
+                R::Complete(t) => records.push(complete(agent, release, t)),
+                R::Incomplete(t) => records.push(incomplete(agent, release, t)),
+            }
+            n /= states.len();
+        }
+        let intact: Vec<Activation<'_>> = live
+            .iter()
+            .map(|(agent, r)| verdict(&records, agent, r))
+            .collect();
+        inherited += intact
+            .iter()
+            .filter(|a| matches!(a, Activation::Inherited { .. }))
+            .count();
+        for mask in 1..(1u32 << records.len()) {
+            let with: Vec<ReleaseRecord<'_>> = records
+                .iter()
+                .enumerate()
+                .map(|(i, r)| ReleaseRecord {
+                    editor_probe: if mask & (1 << i) != 0 {
+                        Measurement::Verified(PROBE)
+                    } else {
+                        Measurement::Absent
+                    },
+                    ..r.clone()
+                })
+                .collect();
+            for ((agent, r), before) in live.iter().zip(&intact) {
+                assert_eq!(&verdict(&with, agent, r), before, "{r} mask {mask:#b}");
+            }
+        }
+        tables += 1;
+    }
+    assert_eq!(tables, 4usize.pow(5));
+    assert!(inherited > 0, "no table exercised inheritance");
+}
+
+/// Scenario: Ask about each record the deck ships, as shipped and with the e2e assumption giving every one of them a verified editor record. Every shipped record's editor record is absent; the assumption changes that field and nothing else, adds no record, and leaves every verdict, Claude Code 2.1.310's Go and both Codex releases' missing_measurement, as it was.
+#[spec("inbox/doorbell/053")]
+#[test]
+fn doorbell_053_the_editor_probe_assumption_moves_no_shipped_verdict() {
+    for record in &RELEASE_RECORDS {
+        assert_eq!(
+            record.editor_probe,
+            Measurement::Absent,
+            "{}",
+            record.release
+        );
+    }
+    let all: Vec<_> = RELEASE_RECORDS
+        .iter()
+        .map(|r| (r.agent.clone(), r.release.clone(), PROBE))
+        .chain(std::iter::once((CLAUDE, v("2.1.311"), PROBE)))
+        .collect();
+    let assumed = with_assumed_editor_probes(RELEASE_RECORDS.to_vec(), &all);
+    assert_eq!(assumed.len(), RELEASE_RECORDS.len(), "no record is added");
+    for (after, before) in assumed.iter().zip(&RELEASE_RECORDS) {
+        assert_eq!(after.editor_probe, Measurement::Verified(PROBE));
+        assert_eq!(
+            &ReleaseRecord {
+                editor_probe: Measurement::Absent,
+                ..after.clone()
+            },
+            before
+        );
+        assert_eq!(exact_verdict(after), exact_verdict(before));
+        let release = LatchedRelease::Known(before.release.clone());
+        assert_eq!(
+            generation_activation(&assumed, Some(&before.agent), &release, &[]),
+            generation_activation(&RELEASE_RECORDS, Some(&before.agent), &release, &[]),
+        );
+    }
+    assert_eq!(
+        no_go(&generation_activation(
+            &assumed,
+            Some(&CLAUDE),
+            &known("2.1.311"),
+            &[]
+        )),
+        Some(NoGo::UnmeasuredRelease)
+    );
+    // Naming one release changes only that record.
+    let one = with_assumed_editor_probes(RELEASE_RECORDS.to_vec(), &[(CODEX, v("0.160.0"), PROBE)]);
+    let verified: Vec<String> = one
+        .iter()
+        .filter(|r| r.editor_probe != Measurement::Absent)
+        .map(|r| format!("{:?}@{}", r.agent, r.release))
+        .collect();
+    assert_eq!(verified, ["Codex@0.160.0"]);
 }

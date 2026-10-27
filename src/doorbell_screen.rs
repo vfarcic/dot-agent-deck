@@ -953,6 +953,53 @@ pub static STANDIN_PROFILE: ScreenProfile = ScreenProfile {
     input: crate::composer_model::Semantics::ClaudeCode,
 };
 
+/// The `editor_probe` record the e2e stand-ins follow, for each agent they
+/// stand in for: what an e2e run's assumption
+/// ([`crate::doorbell_activation::assumed_editor_probes`]) gives a recorded
+/// release in place of a measurement. It measures nothing: the inert
+/// candidate forms are empty and P-PASTE is absent, so a stand-in is checked
+/// only in the plain composer. Claude Code's stand-in has P-KB1 by
+/// construction, since it reads no key bindings; Codex has no such premise.
+#[cfg(feature = "e2e")]
+pub fn standin_editor_probe(
+    agent: &crate::event::AgentType,
+) -> Option<crate::doorbell_activation::EditorProbe<'static>> {
+    use crate::doorbell_activation::{
+        EditorProbe, EditorSelection, ExportShape, KeymapSource, Measurement, PasteToggles,
+    };
+    use crate::event::AgentType;
+    const ONE_EACH: PasteToggles = PasteToggles {
+        disables: 1,
+        enables: 1,
+    };
+    match agent {
+        AgentType::ClaudeCode => Some(EditorProbe {
+            export: ExportShape::ClaudeTmpdir,
+            selection: EditorSelection::ClaudeCode,
+            paste_toggles: ONE_EACH,
+            keymap_sources: &[KeymapSource::ClaudeKeybindings],
+            keymap_loaded_at_start: Measurement::Verified(()),
+            inert_candidates: &[],
+            pasted_bel_is_text: Measurement::Absent,
+        }),
+        AgentType::Codex => Some(EditorProbe {
+            export: ExportShape::CodexEditorDir,
+            selection: EditorSelection::Codex,
+            paste_toggles: ONE_EACH,
+            keymap_sources: &[
+                KeymapSource::CodexConfig,
+                KeymapSource::CodexProfile,
+                KeymapSource::CodexProject,
+                KeymapSource::CodexOverride,
+            ],
+            keymap_loaded_at_start: Measurement::Absent,
+            inert_candidates: &[],
+            pasted_bel_is_text: Measurement::Absent,
+        }),
+        _ => None,
+    }
+}
+
 /// The stand-in's executable when a pane's spawn selects the stand-in
 /// profile: the selector says `standin`, the binary variable names an
 /// absolute path, and the pane's command names that path. Each variable is
