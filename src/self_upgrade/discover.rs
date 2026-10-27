@@ -25,6 +25,20 @@ pub enum OtherCopy {
     Found(Box<Installation>),
 }
 
+/// `running` and the `other` copy found beside it, in the order every client
+/// shows and offers them: the desktop app first, then the CLI (issue #1959).
+/// The app restarts the daemon on this machine only onto its own release, so
+/// an app left behind a CLI that was upgraded first ends up talking to a newer
+/// daemon; upgrading the app first keeps the three on one release.
+pub fn app_first<'a>(
+    running: &'a Installation,
+    other: Option<&'a Installation>,
+) -> Vec<&'a Installation> {
+    let mut copies: Vec<&Installation> = std::iter::once(running).chain(other).collect();
+    copies.sort_by_key(|copy| copy.copy != CopyKind::Desktop);
+    copies
+}
+
 /// Where the desktop app looks for a CLI after `PATH`.
 const WELL_KNOWN_CLI_DIRS: &[&str] = &[
     "/opt/homebrew/bin",
@@ -447,5 +461,30 @@ mod tests {
             plan(&found, &"0.46.0".into(), &options()).action,
             PlanAction::ReplaceBinary { .. }
         ));
+    }
+
+    /// Scenario: issue #1959. Whichever copy runs, the CLI or the desktop
+    /// app, the app's plan comes first, so `dot-agent-deck upgrade`, the TUI
+    /// and the desktop app all offer the app before the CLI; with no app
+    /// found, the CLI is planned alone.
+    #[test]
+    fn discover_012_every_client_puts_the_app_first() {
+        let cli = running_cli(Platform::LinuxAmd64);
+        let app = running(
+            CopyKind::Desktop,
+            "/usr/bin/agent-deck",
+            Platform::LinuxAmd64,
+            InstallMethod::DesktopDeb,
+        );
+        let kinds = |copies: Vec<&Installation>| copies.iter().map(|c| c.copy).collect::<Vec<_>>();
+        assert_eq!(
+            kinds(app_first(&cli, Some(&app))),
+            [CopyKind::Desktop, CopyKind::Cli]
+        );
+        assert_eq!(
+            kinds(app_first(&app, Some(&cli))),
+            [CopyKind::Desktop, CopyKind::Cli]
+        );
+        assert_eq!(kinds(app_first(&cli, None)), [CopyKind::Cli]);
     }
 }

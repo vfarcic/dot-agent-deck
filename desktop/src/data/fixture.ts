@@ -2387,7 +2387,7 @@ export function fixtureSelfUpgradeApi(search: string = window.location.search): 
       "Its checksum is checked against the release's checksum file, and that file's build provenance with `gh attestation verify`.",
     ]);
   const cli = fixtureSelfPlan("cli", "dot-agent-deck CLI", "brew-upgrade", [
-    "Installed with Homebrew (/opt/homebrew/Cellar/dot-agent-deck/0.46.0/bin/dot-agent-deck). Upgrading runs `brew upgrade dot-agent-deck`, which installs the formula's latest release.",
+    "Installed with Homebrew (/opt/homebrew/Cellar/dot-agent-deck/0.46.0/bin/dot-agent-deck). Upgrading runs `brew update`, which refreshes Homebrew's copy of the tap, then `brew upgrade dot-agent-deck`, which installs the formula's latest release.",
   ]);
   /* The app-wide notice is about the app alone (issue #1753). */
   const appBehind = mode === "1";

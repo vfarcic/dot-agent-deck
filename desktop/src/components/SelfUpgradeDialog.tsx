@@ -19,6 +19,8 @@ import {
 export interface SelfUpgradeClosed {
   /** Whether a copy is now installed: not a download whose install command the user has still to run (`SelfUpgradeResult.installed`). */
   installed: boolean;
+  /** Whether the app itself was replaced and waits for a relaunch (`SelfUpgradeResult.relaunch`). */
+  relaunch: boolean;
 }
 
 /** Why voice's "close" leaves the dialog up while a copy is upgrading (issue #1709). */
@@ -76,7 +78,7 @@ export function SelfUpgradeDialog({ check, api, copies, then, onClose, copyText 
   /* Closed once something ran, or with Close at the end; before anything
      ran, Cancel, Escape and a click outside close it having changed nothing —
      also over a plan that offers only Close (Qodo, PR #1769). */
-  const finished = (): SelfUpgradeClosed => ({ installed: shownResults.some((result) => result.installed) });
+  const finished = (): SelfUpgradeClosed => ({ installed: shownResults.some((result) => result.installed), relaunch });
   const close = () => onClose(finished());
 
   const upgrade = (plan: SelfUpgradePlan) => {
