@@ -5,6 +5,7 @@ import { AgentTile } from "./AgentTile";
 import { HandoffRail } from "./HandoffRail";
 import { mapDesktopSnapshot, TauriDeckBridge, type DesktopSnapshotDto } from "../lib/bridge";
 import { applyHandoffEvent } from "../lib/daemonEvents";
+import { INBOX_WORDS } from "../lib/inboxWords";
 import type { AgentSession, DeckFleet, HandoffEdge } from "../types";
 
 const listeners = new Map<string, (event: { payload: unknown }) => void>();
@@ -77,6 +78,8 @@ describe("inbox cards and handoff rail (S13)", () => {
     "not_taken",
     "uncertain_input",
     "dialog_during_ring",
+    "needs_fetch",
+    "cannot_check",
   ] as const)("shows why the doorbell holds (%s) on the agent card", (hold) => {
     const dto = snapshot(1, 0, true);
     Object.assign(dto.agents[0].inbox!, { wakeHold: hold });
@@ -84,6 +87,127 @@ describe("inbox cards and handoff rail (S13)", () => {
     const tile = screen.getByRole("article", { name: "Coder" });
     expect(tile).toHaveTextContent(`${words.glyph}1 ${words.wakeHolds[hold]}`);
     expect(tile).not.toHaveTextContent(words.wakeStalled);
+  });
+
+  /// Scenario: inbox/probe/018 — each held-typing cause arrives through the snapshot bridge with no waiting messages, while the agent is idle or thinking. The tile shows the shared words and clears them on the next snapshot of the same agent.
+  it.each(Object.entries(words.inputHeld).flatMap(([cause, text]) => ["idle", "thinking"].map((status) => [cause, status, text])))
+  ("inbox/probe/018: held typing %s while %s (%s)", (cause, status, text) => {
+    const dto = snapshot();
+    Object.assign(dto.agents[0], { status, inputHeld: { generation: 9, cause, heldOps: 2, heldBytes: 7, sinceMs: 1 } });
+    const view = render(card(mapDesktopSnapshot(dto).agents[0]));
+    expect(screen.getByRole("article", { name: "Coder" })).toHaveTextContent(text);
+    view.rerender(card(mapDesktopSnapshot(snapshot()).agents[0]));
+    expect(screen.getByRole("article", { name: "Coder" })).not.toHaveTextContent(text);
+  });
+
+  /// Scenario: inbox/probe/018 — a cannot-check detail names the refused path and its cause. Replacing the reason with needs-fetch and then clearing it removes the old path from the same tile.
+  it.each(["filesystem", "writable_directory", "foreign_owner", "acl", "export_file", "io"])
+  ("inbox/probe/018: displays and clears %s detail", (cause) => {
+    const dto = snapshot(1);
+    Object.assign(dto.agents[0].inbox!, { wakeHold: "cannot_check", holdDetail: {
+      cause, pathComponent: "/safe/old-path", filesystem: "overlayfs",
+    } });
+    const view = render(card(mapDesktopSnapshot(dto).agents[0]));
+    const tile = screen.getByRole("article", { name: "Coder" });
+    expect(tile).toHaveTextContent("/safe/old-path");
+    if (cause === "filesystem") {
+      for (const required of ["overlayfs", "TMPDIR", "CODEX_HOME", "ext4", "XFS", "Btrfs", "tmpfs", "APFS", "HFS+"]) {
+        expect(tile).toHaveTextContent(required);
+      }
+    }
+    if (cause === "writable_directory") expect(tile).toHaveTextContent("chmod g-w");
+    const next = snapshot(1);
+    Object.assign(next.agents[0].inbox!, { wakeHold: "needs_fetch" });
+    view.rerender(card(mapDesktopSnapshot(next).agents[0]));
+    expect(tile).toHaveTextContent(words.wakeHolds.needs_fetch);
+    expect(tile).not.toHaveTextContent("old-path");
+    view.rerender(card(mapDesktopSnapshot(snapshot()).agents[0]));
+    expect(tile).not.toHaveTextContent("old-path");
+    expect(tile).not.toHaveTextContent(words.wakeHolds.needs_fetch);
+  });
+
+  /// Scenario: inbox/probe/018 — missing and unfamiliar cannot-check details use generic words, including when the stalled bit is absent. No stale path is attributed to a cause this client does not understand.
+  it.each([undefined, { cause: "future_cause", pathComponent: "do-not-inherit" }])
+  ("inbox/probe/018: generic cannot-check detail %j", (holdDetail) => {
+    const dto = snapshot(1);
+    Object.assign(dto.agents[0].inbox!, { wakeHold: "cannot_check", holdDetail });
+    render(card(mapDesktopSnapshot(dto).agents[0]));
+    expect(screen.getByRole("article", { name: "Coder" })).toHaveTextContent(words.wakeHolds.cannot_check);
+    expect(screen.getByRole("article", { name: "Coder" })).not.toHaveTextContent("do-not-inherit");
+  });
+
+  /// Scenario: inbox/probe/018 — an older client receives a future hold without the stalled bit. Its card retains the generic waiting-to-wake fallback.
+  it("inbox/probe/018: an unrecognized wordless hold keeps the generic fallback", () => {
+    const dto = snapshot(1);
+    Object.assign(dto.agents[0].inbox!, { wakeHold: "future_hold" });
+    render(card(mapDesktopSnapshot(dto).agents[0]));
+    expect(screen.getByRole("article", { name: "Coder" })).toHaveTextContent(`${words.wakeStalled}: ${words.wakeStalledHint}`);
+  });
+
+  /// Scenario: inbox/probe/018 — a needs-fetch or cannot-check hold has no display words and no stalled bit. The real tile must still show the generic waiting-to-wake fallback, rather than queued or undefined.
+  it.each(["needs_fetch", "cannot_check"])("inbox/probe/018: wordless %s uses the generic fallback", (hold) => {
+    const table: Partial<Record<string, string>> = INBOX_WORDS.wakeHolds;
+    const saved = table[hold];
+    delete table[hold];
+    try {
+      const dto = snapshot(1);
+      Object.assign(dto.agents[0].inbox!, { wakeHold: hold });
+      render(card(mapDesktopSnapshot(dto).agents[0]));
+      expect(screen.getByRole("article", { name: "Coder" })).toHaveTextContent(`${words.wakeStalled}: ${words.wakeStalledHint}`);
+      expect(screen.getByRole("article", { name: "Coder" })).not.toHaveTextContent("undefined");
+    } finally {
+      if (saved === undefined) delete table[hold];
+      else table[hold] = saved;
+    }
+  });
+
+  /// Scenario: inbox/probe/018 — oversized path and filesystem strings arrive from the wire with controls, bidi and shell punctuation. The rendered diagnostic escapes the controls, bounds each field to 256 source characters and keeps the path out of command markup.
+  it("inbox/probe/018: bounds and escapes both wire detail strings", () => {
+    const dto = snapshot(1);
+    const pathComponent = `/safe/\n\u001b\u202e$(touch sentinel);${"é".repeat(270)}PATH_TAIL`;
+    const filesystem = `fs-\n\u001b\u202e${"界".repeat(270)}FS_TAIL`;
+    Object.assign(dto.agents[0].inbox!, { wakeHold: "cannot_check", holdDetail: {
+      cause: "filesystem", pathComponent, filesystem,
+    } });
+    render(card(mapDesktopSnapshot(dto).agents[0]));
+    const tile = screen.getByRole("article", { name: "Coder" });
+    expect(tile.textContent).toContain("/safe/\\n\\u{1b}\\u{202e}$(touch sentinel);");
+    expect(tile.textContent).toContain("fs-\\n\\u{1b}\\u{202e}");
+    for (const forbidden of ["PATH_TAIL", "FS_TAIL", "\u001b", "\u202e", "é".repeat(257), "界".repeat(257)]) {
+      expect(tile.textContent).not.toContain(forbidden);
+    }
+    for (const raw of [pathComponent, filesystem]) {
+      const escaped = (limit: number) => [...raw].slice(0, limit).join("")
+        .replaceAll("\n", "\\n").replaceAll("\u001b", "\\u{1b}").replaceAll("\u202e", "\\u{202e}");
+      expect(tile.textContent).toContain(escaped(128));
+      expect(tile.textContent).not.toContain(escaped(257));
+    }
+    expect(screen.getByTestId("inbox-notice-7").querySelector("code, pre, a[href^='javascript:']")).toBeNull();
+    expect(tile.textContent).not.toContain("chmod g-w /safe/");
+  });
+
+  /// Scenario: inbox/probe/018 — a wake notice replaces a snapshot's cannot-check detail with a new detail, then changes to needs-fetch without detail. The subscribed bridge and tile show the current explanation and discard the old path.
+  it("inbox/probe/018: streamed reason changes replace and clear the detail", async () => {
+    invoke.mockResolvedValue(snapshot(1));
+    const bridge = new TauriDeckBridge();
+    let fleet: DeckFleet = [];
+    try {
+      await bridge.subscribe((next) => { fleet = next; }, vi.fn());
+      fleet = await bridge.connect();
+      const view = render(card(fleet[0].agents[0], fleet[0].evidence));
+      for (const path of ["/safe/first-path", "/safe/second-path"]) {
+        listeners.get("desktop://daemon-event")?.({ payload: inbox("queued", {
+          wake_update: true, wake_hold: "cannot_check", hold_detail: { cause: "io", path_component: path },
+        }) });
+        view.rerender(card(fleet[0].agents[0], fleet[0].evidence));
+        expect(screen.getByRole("article", { name: "Coder" })).toHaveTextContent(path);
+        if (path.includes("second")) expect(screen.getByRole("article", { name: "Coder" })).not.toHaveTextContent("first-path");
+      }
+      listeners.get("desktop://daemon-event")?.({ payload: inbox("queued", { wake_update: true, wake_hold: "needs_fetch" }) });
+      view.rerender(card(fleet[0].agents[0], fleet[0].evidence));
+      expect(screen.getByRole("article", { name: "Coder" })).toHaveTextContent(words.wakeHolds.needs_fetch);
+      expect(screen.getByRole("article", { name: "Coder" })).not.toHaveTextContent("second-path");
+    } finally { await bridge.dispose(); }
   });
 
   /// Scenario: inbox/status/030 — with nothing waiting, the deck's line possibly left in the input and a dialog that may have taken its keys still warn on the tile, in the words the TUI uses; a release the deck can't type into says nothing then.

@@ -1,4 +1,4 @@
-import type { AgentInbox, AgentSession, InboxActionVerb, InboxAttentionItem } from "../types";
+import type { AgentInbox, AgentSession, HoldDetail, InboxActionVerb, InboxAttentionItem, InputHeldCause } from "../types";
 
 /**
  * The words both clients use for a message's journey through an agent's inbox
@@ -33,6 +33,54 @@ export const INBOX_WORDS = {
     not_taken: "waiting: the agent did not take the deck's Enter. Send it a prompt.",
     uncertain_input: "waiting: the deck's notice may be in its input. Check it before Enter.",
     dialog_during_ring: "waiting: a dialog may have taken the deck's keys. Check its pane.",
+    /** PRD #1666 part 3 (Q35, R4 §7.5): the deck holds its notice until the agent fetches its messages itself. */
+    needs_fetch: "waiting: ask the agent to run dot-agent-deck inbox fetch; reinstall the deck integration to restore automatic delivery",
+    /** PRD #1666 part 3 (Q35): the deck can't check the agent's input box, when no detail it understands says why. */
+    cannot_check: "waiting: the deck can't check this agent's input box. Check its pane.",
+  } as Partial<Record<string, string>>,
+  /**
+   * PRD #1666 part 3 (Q35): `cannot_check`'s words with a detail; `{cause}`
+   * is the cause's sentence (`holdCauses`), `{remedy}` its remedy.
+   */
+  cannotCheckDetail: "waiting: the deck can't check this agent's input box: {cause}. {remedy}",
+  /**
+   * What stopped the check, by the daemon's `HoldCause`: `{path}` is the
+   * quoted, escaped path component and `{filesystem}` its filesystem's name.
+   */
+  holdCauses: {
+    filesystem: "{path} is on {filesystem}, which the check doesn't support",
+    writable_directory: "others can write to {path}, a directory you own",
+    foreign_owner: "{path} belongs to another user",
+    acl: "an access control list on {path} lets others write to it, or can't be read",
+    export_file: "the agent's file {path} isn't one the check can trust",
+    io: "the deck couldn't read {path}",
+  } as Partial<Record<string, string>>,
+  /** `{path}` when the detail names none. */
+  holdPathUnnamed: "a path the deck didn't name",
+  /** `{filesystem}` when the detail names none. */
+  holdFilesystemUnnamed: "a filesystem the deck didn't name",
+  /**
+   * The remedies, as text and never as a command line: move the check to a
+   * directory that passes (core §6.3 with RV7's correction), remove others'
+   * write from a directory of the user's (CX-12 option C), or read it again.
+   */
+  holdRemedies: {
+    relocate: "Point TMPDIR (or CODEX_HOME) at a directory on ext4, XFS, Btrfs or tmpfs (Linux), or APFS or HFS+ (macOS), owned by you, with no group or other write permission on it or on any directory above it other than a sticky directory root owns, such as /tmp.",
+    remove_write: "Remove the write permission others have on that directory, with chmod g-w (and chmod o-w if others can write too) on it.",
+    reread: "Check that you can read it, or point TMPDIR (or CODEX_HOME) at another directory.",
+  },
+  /**
+   * PRD #1666 part 3 (Q35, core §7): why the deck holds what the user typed
+   * into the agent's pane, by the daemon's `InputHeldCause`.
+   */
+  inputHeld: {
+    checking: "input held: the deck is checking the input box; your typing will appear in a moment",
+    check_not_opened: "input held: the agent hasn't opened the deck's check yet; your typing is kept until it does. Restarting the agent discards it.",
+    check_not_returned: "input held: the agent hasn't come back from the deck's check; your typing is kept until it does. Restarting the agent discards it.",
+    after_your_ctrl_g: "input held: the agent didn't open the editor for your Ctrl+G; your typing is kept. Restarting the agent discards it.",
+    queue_full: "input held: too much typing is waiting; the rest is paused",
+    check_blocked: "waiting: the deck can't check this input box until you press Ctrl+G",
+    unknown: "input held: your typing is kept while the deck checks this input box",
   },
   /**
    * The two holds that warn even with nothing waiting, in the words they
@@ -137,9 +185,87 @@ const heldLongCount = (inbox: AgentInbox) => countOf(inbox, ["held_long"]);
  */
 function inboxHoldText(inbox: AgentInbox): string | undefined {
   const pending = inbox.queued + inbox.fetched;
-  if (inbox.wakeHold === undefined || inbox.wakeHold === "unknown") return undefined;
+  const words = holdWords(inbox);
+  if (inbox.wakeHold === undefined || words === undefined) return undefined;
   if (pending <= 0) return INBOX_WORDS.wakeHoldsAlone[inbox.wakeHold];
-  return `${INBOX_WORDS.glyph}${pending} ${INBOX_WORDS.wakeHolds[inbox.wakeHold]}`;
+  return `${INBOX_WORDS.glyph}${pending} ${words}`;
+}
+
+/**
+ * The hold's words: `cannot_check`'s with the cause, path and remedy its
+ * detail names, when this build knows the cause (`holdDetailWords`), and the
+ * hold's own words otherwise; nothing for a hold with no words, which keeps
+ * the stall's. The TUI's `CardInbox::hold_words` is the same.
+ */
+function holdWords(inbox: AgentInbox): string | undefined {
+  if (inbox.wakeHold === undefined || inbox.wakeHold === "unknown") return undefined;
+  if (inbox.wakeHold === "cannot_check" && inbox.holdDetail) {
+    const detailed = holdDetailWords(inbox.holdDetail);
+    if (detailed !== undefined) return detailed;
+  }
+  const table: Partial<Record<string, string>> = INBOX_WORDS.wakeHolds;
+  return Object.prototype.hasOwnProperty.call(table, inbox.wakeHold) ? table[inbox.wakeHold] : undefined;
+}
+
+/** The longest hold detail string shown, in characters: the daemon's `MAX_HOLD_DETAIL_CHARS`. */
+export const MAX_HOLD_DETAIL_CHARS = 256;
+
+/** Unicode bidi formatting characters, `is_bidi_format_char` in `src/untrusted_text.rs`. */
+const BIDI_FORMAT = /^[\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c]$/u;
+
+/**
+ * PRD #1666 part 3 (Q35): a hold detail string as the card shows it — its
+ * first 256 characters, with control characters and bidi formatting escaped
+ * so they show rather than act, as Rust's `escape_control_and_bidi` writes
+ * them (`\n`, `\u{1b}`, `\u{202e}`). Text, never markup or a command. The TUI's
+ * `hold_detail_display` is the same.
+ */
+export function holdDetailText(value: string): string {
+  return Array.from(value).slice(0, MAX_HOLD_DETAIL_CHARS).map((char) => {
+    const code = char.codePointAt(0) ?? 0;
+    if (char === "\t") return "\\t";
+    if (char === "\r") return "\\r";
+    if (char === "\n") return "\\n";
+    if (code < 0x20 || (code >= 0x7f && code <= 0x9f) || BIDI_FORMAT.test(char)) return `\\u{${code.toString(16)}}`;
+    return char;
+  }).join("");
+}
+
+/** `template` with each placeholder replaced by its value, in one pass, so a value is never read as a placeholder. */
+function fill(template: string, values: Record<string, string>): string {
+  return template.replace(/\{(\w+)\}/g, (whole, key: string) => (Object.prototype.hasOwnProperty.call(values, key) ? values[key] : whole));
+}
+
+/** The remedy for a hold cause, the TUI's `HoldCause::remedy`. */
+function holdRemedy(cause: HoldDetail["cause"]): string {
+  if (cause === "writable_directory") return INBOX_WORDS.holdRemedies.remove_write;
+  if (cause === "io") return INBOX_WORDS.holdRemedies.reread;
+  return INBOX_WORDS.holdRemedies.relocate;
+}
+
+/**
+ * PRD #1666 part 3 (Q35): `cannot_check`'s words with `detail`, or
+ * `undefined` for a cause this build does not know — which keeps the generic
+ * words and shows none of the detail's path. The TUI's `HoldDetail::words`.
+ */
+export function holdDetailWords(detail: HoldDetail): string | undefined {
+  const causes: Partial<Record<string, string>> = INBOX_WORDS.holdCauses;
+  const template = Object.prototype.hasOwnProperty.call(causes, detail.cause) ? causes[detail.cause] : undefined;
+  if (template === undefined) return undefined;
+  const cause = fill(template, {
+    path: detail.pathComponent === undefined ? INBOX_WORDS.holdPathUnnamed : `\u201c${holdDetailText(detail.pathComponent)}\u201d`,
+    filesystem: detail.filesystem === undefined ? INBOX_WORDS.holdFilesystemUnnamed : holdDetailText(detail.filesystem),
+  });
+  return fill(INBOX_WORDS.cannotCheckDetail, { cause, remedy: holdRemedy(detail.cause) });
+}
+
+/**
+ * PRD #1666 part 3 (Q35, core §7): the row saying the deck holds what the
+ * user typed into the agent's pane, and why, whatever else the card shows.
+ * The TUI's `CardInbox::input_held_text`.
+ */
+export function inputHeldText(cause: InputHeldCause | undefined): string | undefined {
+  return cause === undefined ? undefined : INBOX_WORDS.inputHeld[cause];
 }
 
 /**
@@ -153,9 +279,7 @@ export function inboxAttentionWords(inbox: AgentInbox | undefined): string | und
   if (inbox?.wakeHold === undefined) return undefined;
   const pending = inbox.queued + inbox.fetched;
   if (pending <= 0) return inbox.wakeHold === "unknown" ? undefined : INBOX_WORDS.wakeHoldsAlone[inbox.wakeHold];
-  return inbox.wakeHold === "unknown"
-    ? `${INBOX_WORDS.wakeStalled}: ${INBOX_WORDS.wakeStalledHint}`
-    : INBOX_WORDS.wakeHolds[inbox.wakeHold];
+  return holdWords(inbox) ?? `${INBOX_WORDS.wakeStalled}: ${INBOX_WORDS.wakeStalledHint}`;
 }
 
 /**
@@ -211,7 +335,7 @@ export function inboxBadge(inbox: AgentInbox | undefined): string | undefined {
   if (notStarted > 1) return `${INBOX_WORDS.glyph} ${notStarted} ${INBOX_WORDS.notStarted}`;
   const pending = inbox.queued + inbox.fetched;
   if (holdInNotice(inbox) && pending > 0) return `${INBOX_WORDS.glyph}${pending}`;
-  if (pending > 0 && (inbox.wakeStalled || inbox.wakeHold === "unknown")) {
+  if (pending > 0 && (inbox.wakeStalled || (inbox.wakeHold !== undefined && holdWords(inbox) === undefined))) {
     return `${INBOX_WORDS.glyph}${pending} ${INBOX_WORDS.wakeStalled}: ${INBOX_WORDS.wakeStalledHint}`;
   }
   if (pending > 0) return `${INBOX_WORDS.glyph}${pending} ${INBOX_WORDS.queued}`;

@@ -6,14 +6,17 @@
  *
  * Every sentence the user reads comes from Rust (`voice/question.rs`), except
  * the countdown's own called-off sentences below, which are about state only
- * the webview holds, and the options listed in a refusal to type or press a
- * key while the question waits ({@link questionOptionsToSay}).
+ * the webview holds, the options listed in a refusal to type or press a
+ * key while the question waits ({@link questionOptionsToSay}), and what a
+ * settlement says of an answer Rust reported unconfirmed
+ * ({@link settlementSentence}): the settlement reaches the webview on a later
+ * snapshot, after Rust's report is long written.
  */
 
 import { AGENT_GONE_AFTER_RESTART } from "./agentIdentity";
 import { sameIncarnation } from "./agentKey";
 import { agentSpokenName } from "./agentNames";
-import type { AgentSession } from "../types";
+import type { AgentSession, AnswerSettlement } from "../types";
 
 /** One option of a pending question, as the desktop crate projects it. Every text field is the agent's own, already scrubbed. */
 export type PendingQuestionOptionDto = {
@@ -51,6 +54,12 @@ export type PendingQuestionDto = {
   answerable: boolean;
   /** The daemon's revision of this question (audit A4): which registration of it an answer is bound to. */
   revision?: number;
+  /**
+   * PRD #1666 part 3 (Q35, OQ6): the daemon accepted an answer to this question
+   * and holds it until it can write it. Its outcome is a settlement, never this
+   * flag clearing.
+   */
+  answerQueued?: boolean;
 };
 
 /** One question's answer as the form holds it. */
@@ -122,6 +131,61 @@ export function questionOptionsToSay(question: PendingQuestionDto, form: Questio
     : question.questions.find((_, at) => !form.some((selection) => selection.questionIndex === at));
   if (!current) return "";
   return current.options.filter((option) => option.answerable).map((option) => option.screenNumbers ? `“${option.label}”` : `${option.index} “${option.label}”`).join(", ");
+}
+
+/** What a permission or plan prompt is about, in words: the tool's detail, else its name, else the question's prompt. Rust's `what`. */
+function what(question: PendingQuestionDto): string {
+  if (question.tool) return question.tool.detail ?? question.tool.name;
+  return question.questions[0]?.prompt ?? "";
+}
+
+/** The options `selection` chose. Rust's `chosen`. */
+function chosen(question: PendingQuestionDto, selection: QuestionSelectionDto): PendingQuestionOptionDto[] {
+  const asked = question.questions[selection.questionIndex];
+  if (!asked) return [];
+  return selection.optionIndices.flatMap((index) => asked.options.filter((option) => option.index === index).slice(0, 1));
+}
+
+/**
+ * PRD #1666 part 3 (Q35): what the row says once an answer was written —
+ * "Allowed: …", "Denied: …", "Always allowed: …", or "Answered: Colour → Red;
+ * Size → Large". Rust's `sent_line`, which says the same of an answer whose
+ * report came back; this says it of one a settlement confirmed later.
+ */
+export function sentLine(question: PendingQuestionDto, form: QuestionSelectionDto[]): string {
+  const single = question.questions.length === 1 && form.length === 1 && form[0].optionIndices.length === 1
+    ? chosen(question, form[0])[0]
+    : undefined;
+  if (single?.role === "allow_once") return `Allowed: ${what(question)}`;
+  if (single?.role === "deny") return `Denied: ${what(question)}`;
+  if (single?.role === "allow_always") return `Always allowed: ${single.scope ?? what(question)}`;
+  const pairs = form.flatMap((selection) => {
+    const asked = question.questions[selection.questionIndex];
+    if (!asked) return [];
+    const words = selection.text !== undefined
+      ? `\u201c${selection.text}\u201d`
+      : chosen(question, selection).map((option) => option.label).join(", ");
+    return [`${asked.header ?? asked.prompt} → ${words}`];
+  });
+  return `Answered: ${pairs.join("; ")}`;
+}
+
+/**
+ * PRD #1666 part 3 (Q35): what the row says when a settlement naming the
+ * panel's own token reports what became of an answer Rust reported
+ * unconfirmed. Only a whole write reads as answered; anything else says what
+ * did not happen. `undefined` for an outcome this build does not know, which
+ * leaves the unconfirmed words standing.
+ */
+export function settlementSentence(outcome: AnswerSettlement["outcome"], agent: string, question: PendingQuestionDto, form: QuestionSelectionDto[]): string | undefined {
+  switch (outcome) {
+    case "written": return sentLine(question, form);
+    case "partial": return `Only part of the answer reached ${agent} before writing it failed — check ${agent} before answering again.`;
+    case "superseded": return `A newer question replaced that one before the answer was written — nothing was sent.`;
+    case "retired": return `${agent} ended before the answer was written — nothing was sent.`;
+    case "write_failed": return `The deck could not write the answer to ${agent} — nothing was sent.`;
+    default: return undefined;
+  }
 }
 
 /** The countdown was running for a question that is no longer the one waiting. */

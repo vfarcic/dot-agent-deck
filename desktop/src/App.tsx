@@ -859,6 +859,10 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       /* PRD #1631 — the question the agent is waiting on, which voice answers
          from this pane, and only from this pane (decision 9). */
       question: paneShownAgent.pendingQuestion,
+      /* PRD #1666 part 3 (Q35) — why the deck holds what was typed into the
+         pane, beside a queued answer, and what became of held answers. */
+      ...(paneShownAgent.inputHeld ? { inputHeld: paneShownAgent.inputHeld } : {}),
+      ...(paneShownAgent.answerSettlements ? { answerSettlements: paneShownAgent.answerSettlements } : {}),
       /* Issue #1668 — sentences about that question name the agent as
          Reading does: an orchestration agent by its run's title too. */
       questionLabel: questionAgentName(paneShownAgent),

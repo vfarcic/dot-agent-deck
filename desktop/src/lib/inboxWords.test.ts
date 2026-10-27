@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AgentInbox, AgentSession, WakeHold } from "../types";
-import { deckAttentionText, inboxAttentionWords, INBOX_WORDS } from "./inboxWords";
+import { deckAttentionText, holdDetailText, holdDetailWords, inboxAttentionWords, inboxBadge, inboxNotice, inputHeldText, INBOX_WORDS, MAX_HOLD_DETAIL_CHARS } from "./inboxWords";
 
 function inbox(queued: number, wakeHold?: WakeHold): AgentInbox {
   return { queued, fetched: 0, undeliverable: 0, wake: "doorbell", ...(wakeHold ? { wakeHold } : {}) };
@@ -35,5 +35,47 @@ describe("deck attention words", () => {
     expect(inboxAttentionWords(inbox(0, "unknown"))).toBeUndefined();
     expect(inboxAttentionWords(inbox(3))).toBeUndefined();
     expect(inboxAttentionWords(undefined)).toBeUndefined();
+  });
+});
+
+// PRD #1666 part 3 (Q35): a cannot-check detail in words. The TUI's
+// `a_hold_detail_names_its_cause_path_and_remedy` pins the same strings.
+describe("cannot-check detail words", () => {
+  const relocate = "Point TMPDIR (or CODEX_HOME) at a directory on ext4, XFS, Btrfs or tmpfs (Linux), or APFS or HFS+ (macOS), owned by you, with no group or other write permission on it or on any directory above it other than a sticky directory root owns, such as /tmp.";
+
+  /// Scenario: Word a cannot-check detail for each kind of cause, with and without a path or filesystem, and an unknown cause; the sentences match the TUI's to the character.
+  it("names the cause, the path and the remedy as the TUI does", () => {
+    expect(holdDetailWords({ cause: "filesystem", pathComponent: "/mnt/nfs/tmp", filesystem: "nfs" }))
+      .toBe(`waiting: the deck can't check this agent's input box: \u201c/mnt/nfs/tmp\u201d is on nfs, which the check doesn't support. ${relocate}`);
+    expect(holdDetailWords({ cause: "writable_directory" }))
+      .toBe("waiting: the deck can't check this agent's input box: others can write to a path the deck didn't name, a directory you own. Remove the write permission others have on that directory, with chmod g-w (and chmod o-w if others can write too) on it.");
+    expect(holdDetailWords({ cause: "filesystem", pathComponent: "/x" }))
+      .toBe(`waiting: the deck can't check this agent's input box: \u201c/x\u201d is on a filesystem the deck didn't name, which the check doesn't support. ${relocate}`);
+    expect(holdDetailWords({ cause: "io", pathComponent: "/a" }))
+      .toBe("waiting: the deck can't check this agent's input box: the deck couldn't read \u201c/a\u201d. Check that you can read it, or point TMPDIR (or CODEX_HOME) at another directory.");
+    expect(holdDetailWords({ cause: "unknown", pathComponent: "/a" })).toBeUndefined();
+  });
+
+  /// Scenario: A detail whose path names a placeholder and carries controls and bidi characters is shown as it is, escaped as the TUI escapes it, and bounded to 256 characters.
+  it("shows the detail's text escaped and bounded, and never fills it", () => {
+    expect(holdDetailWords({ cause: "filesystem", pathComponent: "/a/{filesystem}\n\u202e", filesystem: "{path}\u001b" }))
+      .toContain("\u201c/a/{filesystem}\\n\\u{202e}\u201d is on {path}\\u{1b}, which");
+    expect(holdDetailText("a\tb\rc\u0000d\u0085e\u061cf\u2066g")).toBe("a\\tb\\rc\\u{0}d\\u{85}e\\u{61c}f\\u{2066}g");
+    expect(Array.from(holdDetailText("é".repeat(MAX_HOLD_DETAIL_CHARS + 10)))).toHaveLength(MAX_HOLD_DETAIL_CHARS);
+  });
+
+  /// Scenario: A cannot-check card with a detail it understands names the cause, one it does not keeps the generic words, a detail beside another hold says nothing, and a hold with no words keeps the stall's words on the badge.
+  it("puts the detail on the card's notice row", () => {
+    const base = { queued: 1, fetched: 0, undeliverable: 0, wake: "doorbell" };
+    expect(inboxNotice({ ...base, wakeHold: "cannot_check", holdDetail: { cause: "io", pathComponent: "/a" } }))
+      .toBe(`${INBOX_WORDS.glyph}1 ${holdDetailWords({ cause: "io", pathComponent: "/a" })}`);
+    expect(inboxNotice({ ...base, wakeHold: "cannot_check", holdDetail: { cause: "unknown", pathComponent: "/a" } }))
+      .toBe(`${INBOX_WORDS.glyph}1 ${INBOX_WORDS.wakeHolds.cannot_check}`);
+    expect(inboxNotice({ ...base, wakeHold: "needs_fetch", holdDetail: { cause: "io", pathComponent: "/a" } }))
+      .toBe(`${INBOX_WORDS.glyph}1 ${INBOX_WORDS.wakeHolds.needs_fetch}`);
+    expect(inboxBadge({ ...base, wakeHold: "unknown" })).toBe(`${INBOX_WORDS.glyph}1 ${INBOX_WORDS.wakeStalled}: ${INBOX_WORDS.wakeStalledHint}`);
+    expect(inboxBadge({ ...base, wakeHold: "cannot_check" })).toBe(`${INBOX_WORDS.glyph}1`);
+    expect(inputHeldText("queue_full")).toBe(INBOX_WORDS.inputHeld.queue_full);
+    expect(inputHeldText(undefined)).toBeUndefined();
   });
 });

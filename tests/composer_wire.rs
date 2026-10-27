@@ -25,9 +25,12 @@ use spec::spec;
 mod test_temp;
 
 /// v0.49.0's readers, field for field where this commit adds beside them:
-/// every required field, and every optional one at the same level. Nested
-/// values this commit does not touch are kept as JSON. No
-/// `deny_unknown_fields`, as v0.49.0 has none on any of them.
+/// every required field, and every optional one at the same level, the
+/// flattened card notices included. Copied from the `v0.49.0` tag's
+/// `src/daemon_protocol.rs`, `src/question.rs`, `src/state.rs`,
+/// `src/inbox_hub.rs` and `src/event.rs`. Nested values this commit does not
+/// touch are kept as JSON. No `deny_unknown_fields`, as v0.49.0 has none on
+/// any of them.
 #[allow(dead_code)]
 mod v049 {
     use serde::{Deserialize, Serialize};
@@ -116,6 +119,25 @@ mod v049 {
         pub component: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         pub wake_stalled: bool,
+        #[serde(flatten, default)]
+        pub notices: InboxCardNotices,
+    }
+
+    /// v0.49.0's card notices, flattened into its summary and its notice.
+    #[derive(Debug, Default, Serialize, Deserialize)]
+    pub struct InboxCardNotices {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub attention: Vec<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub integration: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub integration_command: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub receipts_degraded: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub evidence_paused: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub admission_refused: Option<String>,
     }
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -139,6 +161,10 @@ mod v049 {
         pub attention_update: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         pub requeued: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub provenance: Option<Value>,
+        #[serde(flatten, default)]
+        pub notices: InboxCardNotices,
     }
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -219,7 +245,10 @@ fn question_json() -> Value {
 }
 
 fn summary_json() -> Value {
-    json!({"queued": 1, "fetched": 0, "undeliverable": 0, "wake": "doorbell"})
+    json!({
+        "queued": 1, "fetched": 0, "undeliverable": 0, "wake": "doorbell",
+        "integration": "not_armed", "evidence_paused": 2,
+    })
 }
 
 fn notice_json() -> Value {
@@ -230,6 +259,8 @@ fn notice_json() -> Value {
         "from_label": "the orchestrator",
         "state": "queued",
         "wake_update": true,
+        "provenance": {"kind": "dispatch_result", "unit_id": "u-1", "phase": "ended"},
+        "receipts_degraded": "disk full",
     })
 }
 
@@ -294,6 +325,8 @@ fn probe_016_a_v049_reader_takes_every_new_value() {
         assert_eq!(wire["hold_detail"]["cause"], "filesystem");
         let old: v049::InboxSummary = serde_json::from_value(wire).unwrap();
         assert_eq!(old.queued, 1);
+        assert_eq!(old.notices.integration, Some(json!("not_armed")));
+        assert_eq!(old.notices.evidence_paused, Some(2));
 
         let mut notice: InboxNotice = serde_json::from_value(notice_json()).unwrap();
         notice.wake_hold = Some(hold);
@@ -303,6 +336,11 @@ fn probe_016_a_v049_reader_takes_every_new_value() {
         let old: v049::InboxNotice = serde_json::from_value(wire).unwrap();
         assert_eq!(old.message_id, "m");
         assert!(old.wake_update);
+        assert_eq!(
+            old.provenance,
+            Some(json!({"kind": "dispatch_result", "unit_id": "u-1", "phase": "ended"}))
+        );
+        assert_eq!(old.notices.receipts_degraded.as_deref(), Some("disk full"));
     }
 
     let capabilities = HookCapabilitiesReply {
@@ -361,6 +399,11 @@ fn probe_016_this_build_takes_v049_payloads() {
     let summary: InboxSummary =
         serde_json::from_value(serde_json::to_value(&old_summary).unwrap()).unwrap();
     assert_eq!(summary.hold_detail, None);
+    assert_eq!(
+        summary.notices.integration,
+        Some(dot_agent_deck::inbox_display::IntegrationNotice::NotArmed)
+    );
+    assert_eq!(summary.notices.evidence_paused, Some(2));
     assert!(
         serde_json::to_value(&summary)
             .unwrap()
@@ -371,6 +414,11 @@ fn probe_016_this_build_takes_v049_payloads() {
     let notice: InboxNotice =
         serde_json::from_value(serde_json::to_value(&old_notice).unwrap()).unwrap();
     assert_eq!(notice.hold_detail, None);
+    assert!(notice.provenance.is_some(), "{notice:?}");
+    assert_eq!(
+        notice.notices.receipts_degraded.as_deref(),
+        Some("disk full")
+    );
 
     let old_capabilities = v049::HookCapabilitiesReply {
         task_scoped_completion: Some(1),
@@ -531,8 +579,9 @@ fn probe_016_unknown_new_values_are_tolerated() {
             v049::WakeHoldBeforeQ35::Unknown,
             "a client built before this commit reads {spelling} as unknown"
         );
-        assert_eq!(hold.words(), None, "no words of its own yet");
-        assert_eq!(hold.notice_clause(), None);
+        // Q35-10 gave both their words; neither warns with nothing waiting.
+        assert!(hold.words().is_some(), "{spelling} has its words");
+        assert!(hold.notice_clause().is_some(), "{spelling} has its clause");
         assert_eq!(hold.alone_words(), None);
         let card = CardInbox {
             pending: 1,
@@ -608,7 +657,7 @@ fn probe_016_unknown_new_values_are_tolerated() {
     );
 }
 
-/// Scenario: A hold detail's path component and filesystem name longer than the bound are cut to it, and shorter ones are kept whole.
+/// Scenario: A hold detail's path component and filesystem name longer than the bound are cut to it, whether built here or read off the wire, and shorter ones are kept whole.
 #[spec("inbox/probe/016")]
 #[test]
 fn probe_016_hold_detail_strings_are_bounded() {
@@ -620,6 +669,11 @@ fn probe_016_hold_detail_strings_are_bounded() {
             Some(MAX_HOLD_DETAIL_CHARS)
         );
     }
+    let wire: HoldDetail = serde_json::from_value(json!({
+        "cause": "io", "path_component": long, "filesystem": long
+    }))
+    .unwrap();
+    assert_eq!(wire, detail, "read off the wire, bounded the same");
     let exact = "x".repeat(MAX_HOLD_DETAIL_CHARS);
     assert_eq!(
         HoldDetail::new(HoldCause::Io, Some(&exact), None).path_component,

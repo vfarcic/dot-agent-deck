@@ -75,6 +75,11 @@ export type AgentInbox = {
    * waiting messages; `unknown` for a reason a newer deck names.
    */
   wakeHold?: WakeHold;
+  /**
+   * PRD #1666 part 3 (Q35): why the deck can't check the agent's input box,
+   * beside `wakeHold: "cannot_check"` and replaced with it.
+   */
+  holdDetail?: HoldDetail;
   /** PRD #1666 §6.5: the deck messages waiting on the user's Retry or Cancel. */
   attention?: InboxAttentionItem[];
   /** PRD #1666 §11: why the agent's integration takes no deck messages yet. */
@@ -97,7 +102,42 @@ export type WakeHold =
   | "not_taken"
   | "uncertain_input"
   | "dialog_during_ring"
+  | "needs_fetch"
+  | "cannot_check"
   | "unknown";
+/**
+ * PRD #1666 part 3 (Q35): the daemon's `HoldDetail` — what stopped the check
+ * of an agent's input box. `pathComponent` and `filesystem` are display text
+ * from the daemon, shown escaped and never run; `unknown` for a cause a newer
+ * deck names.
+ */
+export type HoldDetail = {
+  cause: HoldCause;
+  pathComponent?: string;
+  filesystem?: string;
+};
+/** PRD #1666 part 3 (Q35): the daemon's `HoldCause` wire values. */
+export type HoldCause = "filesystem" | "writable_directory" | "foreign_owner" | "acl" | "export_file" | "io" | "unknown";
+/** PRD #1666 part 3 (Q35, core §7): the daemon's `InputHeldCause` wire values. */
+export type InputHeldCause =
+  | "checking"
+  | "check_not_opened"
+  | "check_not_returned"
+  | "after_your_ctrl_g"
+  | "queue_full"
+  | "check_blocked"
+  | "unknown";
+/**
+ * PRD #1666 part 3 (Q35): what became of an answer the daemon held, named by
+ * the client token its request carried; `unknown` for an outcome a newer deck
+ * names, which confirms nothing.
+ */
+export type AnswerSettlement = {
+  questionId: string;
+  revision: number;
+  clientToken: number;
+  outcome: "written" | "partial" | "superseded" | "retired" | "write_failed" | "unknown";
+};
 /**
  * PRD #1666 §6.4: one deck message an agent card lists for the user to decide
  * on. `revision` is what Retry and Cancel compare on, so a second client
@@ -997,6 +1037,18 @@ export interface AgentSession {
    * crate; render it through `displayText` like any other free-form string.
    */
   pendingQuestion?: import("./lib/voiceQuestion").PendingQuestionDto;
+  /**
+   * HONEST. PRD #1666 part 3 (Q35): the deck holds what the user typed into
+   * this agent's pane, and why (`SessionSnapshot.input_held`). Absent while it
+   * holds nothing, and from a daemon predating the field.
+   */
+  inputHeld?: InputHeldCause;
+  /**
+   * HONEST. PRD #1666 part 3 (Q35): the outcomes of this agent's recently held
+   * answers that carried a client token (`SessionSnapshot.answer_settlements`).
+   * The voice panel reads only the one naming its own token.
+   */
+  answerSettlements?: AnswerSettlement[];
   /**
    * HONEST. PRD #1401 — the pull request the daemon found for the branch this
    * agent works on (`SessionSnapshot.pull_request`), shown as the tile's badge.

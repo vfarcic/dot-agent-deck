@@ -22697,6 +22697,16 @@ fn render_session_card(
         ));
     }
 
+    // PRD #1666 part 3 (Q35, core §7): the deck holds what the user typed
+    // into this pane, and says why, whether or not messages wait — the
+    // desktop tile's held-input row.
+    if !is_placeholder && let Some(held) = session.input_held_notice() {
+        attention.push((
+            held.to_string(),
+            Style::default().fg(palette::status_color(&SessionStatus::Blocked)),
+        ));
+    }
+
     // PRD #1666 §6.5: what the deck says about this agent's deck messages
     // beyond the inbox badge — an integration that takes nothing yet, paused
     // hand-outs, an uncertain delivery, held_long attention, failed receipt

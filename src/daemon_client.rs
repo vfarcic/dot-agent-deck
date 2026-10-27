@@ -3090,13 +3090,42 @@ impl DaemonClient {
         answers: Vec<crate::question::QuestionAnswer>,
         confirmed_always: bool,
     ) -> Result<AnswerReport, ClientError> {
-        if !self
-            .capabilities()
-            .await?
-            .supports(crate::daemon_protocol::CAP_ANSWER_QUESTION)
-        {
+        self.answer_question_with_token_while(
+            still_wanted,
+            agent_id,
+            question_id,
+            revision,
+            answers,
+            confirmed_always,
+            None,
+        )
+        .await
+    }
+
+    /// PRD #1666 part 3 (Q35): [`Self::answer_question_while`], naming the
+    /// answer by `client_token`, so a client whose own request timed out can
+    /// read what became of it from the snapshot's
+    /// [`crate::question::AnswerSettlement`] naming that token. The token is
+    /// sent only to a daemon that advertises
+    /// [`crate::daemon_protocol::CAP_ANSWER_SETTLEMENT`]; an older one is
+    /// sent the same request without it, and reports no settlement.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn answer_question_with_token_while(
+        &self,
+        still_wanted: impl Fn() -> bool,
+        agent_id: &str,
+        question_id: &str,
+        revision: Option<u64>,
+        answers: Vec<crate::question::QuestionAnswer>,
+        confirmed_always: bool,
+        client_token: Option<u64>,
+    ) -> Result<AnswerReport, ClientError> {
+        let capabilities = self.capabilities().await?;
+        if !capabilities.supports(crate::daemon_protocol::CAP_ANSWER_QUESTION) {
             return Ok(AnswerReport::Withheld);
         }
+        let client_token = client_token
+            .filter(|_| capabilities.supports(crate::daemon_protocol::CAP_ANSWER_SETTLEMENT));
         // Admitted first, then `still_wanted`: the wait for the gate's `Hello`
         // is part of the window a cancelled answer must still be dropped in.
         let (mut rd, mut wr) = self.admitted_connect().await?;
@@ -3112,9 +3141,7 @@ impl DaemonClient {
                 answers,
                 confirmed_always,
                 revision,
-                // PRD #1666 part 3 (Q35): sent once a daemon advertises
-                // `CAP_ANSWER_SETTLEMENT` (Q35-17).
-                client_token: None,
+                client_token,
             },
         )
         .await?;

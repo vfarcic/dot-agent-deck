@@ -1214,6 +1214,13 @@ impl SessionState {
         self.card_inbox().and_then(|inbox| inbox.notice_text())
     }
 
+    /// PRD #1666 part 3 (Q35, core §7): the row saying the deck holds what
+    /// the user typed into this agent's pane
+    /// ([`crate::inbox_display::CardInbox::input_held_text`]).
+    pub fn input_held_notice(&self) -> Option<&'static str> {
+        self.card_inbox().and_then(|inbox| inbox.input_held_text())
+    }
+
     /// PRD #1666 §2.8: the deck's notice explaining this card's Error — a
     /// message it could not deliver — while the card is in Error because of it.
     /// The notice is the `delivery_notice` the daemon's report event carried;
@@ -6580,6 +6587,14 @@ fn card_inbox_of(event: &AgentEvent) -> Option<crate::inbox_display::CardInbox> 
         .metadata
         .get(crate::inbox_display::CARD_INBOX_ADMISSION_METADATA_KEY)
         .cloned();
+    inbox.hold_detail = event
+        .metadata
+        .get(crate::inbox_display::CARD_INBOX_HOLD_DETAIL_METADATA_KEY)
+        .and_then(|json| serde_json::from_str(json).ok());
+    inbox.input_held = event
+        .metadata
+        .get(crate::inbox_display::CARD_INBOX_INPUT_HELD_METADATA_KEY)
+        .and_then(|cause| serde_json::from_value(serde_json::Value::String(cause.clone())).ok());
     Some(inbox)
 }
 
@@ -6628,6 +6643,25 @@ fn set_card_inbox(session: &mut SessionState, inbox: crate::inbox_display::CardI
         metadata.insert(
             crate::inbox_display::CARD_INBOX_ADMISSION_METADATA_KEY.to_string(),
             code.clone(),
+        );
+    }
+    if let Some(json) = inbox
+        .hold_detail
+        .as_ref()
+        .and_then(|detail| serde_json::to_string(detail).ok())
+    {
+        metadata.insert(
+            crate::inbox_display::CARD_INBOX_HOLD_DETAIL_METADATA_KEY.to_string(),
+            json,
+        );
+    }
+    if let Some(serde_json::Value::String(cause)) = inbox
+        .input_held
+        .and_then(|cause| serde_json::to_value(cause).ok())
+    {
+        metadata.insert(
+            crate::inbox_display::CARD_INBOX_INPUT_HELD_METADATA_KEY.to_string(),
+            cause,
         );
     }
     session.recent_events.push_back(AgentEvent {
@@ -6711,6 +6745,15 @@ struct PaneInbox {
     /// the waiting messages, from the summary and from every wake update,
     /// which carries it whole.
     hold: Option<crate::inbox_display::WakeHold>,
+    /// PRD #1666 part 3 (Q35): why the deck can't check the agent's input
+    /// box, carried and replaced with [`Self::hold`], so a later hold never
+    /// keeps an earlier one's path.
+    hold_detail: Option<crate::inbox_display::HoldDetail>,
+    /// PRD #1666 part 3 (Q35): why the deck holds what the user typed into
+    /// the pane, from the daemon's last snapshot of the agent
+    /// ([`AppState::take_inbox_snapshot`]); a new account of the pane starts
+    /// without it.
+    input_held: Option<crate::inbox_display::InputHeldCause>,
     /// PRD #1666 §6.5: the items waiting on the user and the card's notices,
     /// from the summary and from each attention notice, which carries them
     /// whole.
@@ -6761,6 +6804,8 @@ impl PaneInbox {
             delivered: summary.last_acked_at.is_some(),
             stalled: summary.wake_stalled,
             hold: summary.wake_hold,
+            hold_detail: summary.hold_detail.clone(),
+            input_held: None,
             notices: summary.notices.clone(),
         }
     }
@@ -6821,6 +6866,7 @@ impl PaneInbox {
             // 5-wake: it carries the hold too, as it stands.
             self.stalled = notice.wake_stalled;
             self.hold = notice.wake_hold;
+            self.hold_detail = notice.hold_detail.clone();
         } else {
             // PRD #1666 S11: an offered job that left this pane is settled here
             // without having been delivered; `state` is the job's, not the pane's.
@@ -6862,6 +6908,8 @@ impl PaneInbox {
             delivered: self.delivered,
             stalled: self.stalled,
             hold: self.hold,
+            hold_detail: self.hold_detail.clone(),
+            input_held: self.input_held,
             uncertain: count(AttentionKind::uncertain),
             out_of_attempts: count(|kind| kind == AttentionKind::OutOfAttempts),
             not_started: count(|kind| kind == AttentionKind::NotStarted),
@@ -9268,7 +9316,21 @@ impl AppState {
                 continue;
             };
             match record.inbox.as_ref() {
-                Some(summary) => self.apply_inbox_summary(pane_id, &record.id, summary),
+                Some(summary) => {
+                    // PRD #1666 part 3 (Q35): the record's held typing rides
+                    // the pane's new account, so the card shows it and a
+                    // snapshot without it clears it.
+                    let input_held = record
+                        .live
+                        .as_ref()
+                        .and_then(|snap| snap.input_held.as_ref())
+                        .map(|held| held.cause);
+                    let next = PaneInbox {
+                        input_held,
+                        ..PaneInbox::from_summary(&record.id, summary)
+                    };
+                    self.take_pane_inbox(pane_id, next);
+                }
                 None => {
                     if !self.managed_pane_ids.contains(pane_id)
                         && self.pane_inboxes.get(pane_id).is_some_and(|inbox| {
@@ -9296,7 +9358,12 @@ impl AppState {
         agent_id: &str,
         summary: &crate::inbox_hub::InboxSummary,
     ) {
-        let next = PaneInbox::from_summary(agent_id, summary);
+        self.take_pane_inbox(pane_id, PaneInbox::from_summary(agent_id, summary));
+    }
+
+    /// `next` as `pane_id`'s account, retiring the one it replaces
+    /// ([`PaneInbox::retire`]), and drawn on its card.
+    fn take_pane_inbox(&mut self, pane_id: &str, next: PaneInbox) {
         self.pane_inboxes
             .entry(pane_id.to_string())
             .or_default()
