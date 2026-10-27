@@ -30,7 +30,8 @@ Tool mailbox contract (one publisher, one composer per base; no crash recovery):
   {"id": "<request id>", "exit": <status>}. Check the id, then acknowledge by
   removing that result; the poller claims no next request until it is absent.
   Invalid JSON/shape returns {"id": null, "exit": null, "error": "invalid_request"};
-  a valid id is echoed even when argv is invalid. Failure to start Bash returns
+  a valid id is echoed even when argv is invalid, including NUL-bearing or
+  OS-unencodable strings. Failure to start Bash returns
   error "exec_failed" with exit null. Acknowledge errors the same way.
 """
 import json
@@ -84,6 +85,8 @@ def bash_tool():
             argv = command.get('argv')
             if not isinstance(argv, list) or not argv or not all(isinstance(arg, str) for arg in argv):
                 raise ValueError('argv must be a nonempty string array')
+            if any(b'\0' in os.fsencode(arg) for arg in argv):
+                raise ValueError('argv must not contain NUL bytes')
         except (ValueError, UnicodeError):
             result = {'id': request_id, 'exit': None, 'error': 'invalid_request'}
         else:

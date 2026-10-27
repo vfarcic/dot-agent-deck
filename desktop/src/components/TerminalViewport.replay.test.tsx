@@ -206,7 +206,7 @@ describe("inbox/probe/038: desktop history never answers an old terminal query",
     expect(sent).toEqual([`${E}]10;rgb:1111/2222/3333${ST}`]);
   });
 
-  /** Scenario: count the named data-emission and dispatch sites per method in the installed browser xterm source against the query families exercised above and the known human-input sites. A change at a counted site fails until reviewed; a reply added elsewhere is not detected. */
+  /** Scenario: count the named data-emission and dispatch sites per method in the installed browser xterm source against the query families exercised above and the known human-input sites. A change to the per-method counts fails until reviewed; a reply added elsewhere is not detected. */
   it("inbox/probe/038: installed xterm's counted reply sites are unchanged", () => {
     const require = createRequire(import.meta.url);
     const root = dirname(require.resolve("@xterm/xterm/package.json"));

@@ -25,7 +25,7 @@ PREFIX = 'DOT_AGENT_DECK_TEST_COMPOSER_'
 # (old code) or after claim (fixed code). Loop ticks prove an unpublished write
 # has been polled past. The public-path guard also catches read-before-claim.
 BOOTSTRAP = r"""
-import builtins, json, os, runpy, select, sys, time
+import builtins, contextlib, json, os, runpy, select, sys, time
 script = sys.argv.pop(1)
 base = sys.argv[1]
 original_open, original_load, original_select = builtins.open, json.load, select.select
@@ -47,11 +47,23 @@ def paused_load(stream, *args, **kwargs):
             assert time.monotonic() < deadline, 'parent did not release parser'
             time.sleep(0.005)
     return original_load(stream, *args, **kwargs)
+@contextlib.contextmanager
+def tick_output(path):
+    with original_open(path, 'w') as output:
+        if tick == 1 and os.environ.get('PAUSE_TICK') == '1':
+            with original_open(base + '.tick-ready', 'w') as ready:
+                ready.write('ready')
+            deadline = time.monotonic() + 10
+            while not os.path.exists(base + '.tick-go'):
+                assert time.monotonic() < deadline, 'parent did not release tick writer'
+                time.sleep(0.005)
+        yield output
 def tick_select(*args, **kwargs):
     global tick
     tick += 1
-    with original_open(base + '.tick', 'w') as output:
+    with tick_output(base + '.tick.tmp') as output:
         output.write(str(tick))
+    os.replace(base + '.tick.tmp', base + '.tick')
     return original_select(*args, **kwargs)
 builtins.open, json.load, select.select = checked_open, paused_load, tick_select
 runpy.run_path(script, run_name='__main__')
@@ -108,7 +120,19 @@ class Composer:
             return None
 
     def ready(self):
-        self.wait(lambda: self.path('.pid').exists() and self.output, 'initial frame')
+        frame_end = {
+            'claude_composer.py': b'\x1b[26;3H',
+            'codex_composer.py': b'\x1b[?2026l',
+            'empty_composer.py': b'COMPOSER: \x1b[2m<empty>\x1b[22m',
+        }[self.base.name]
+        previous, stable_since = None, time.monotonic()
+        def complete_stable_frame():
+            nonlocal previous, stable_since
+            if self.output != previous:
+                previous, stable_since = self.output, time.monotonic()
+            return (self.path('.pid').exists() and self.output.endswith(frame_end)
+                    and time.monotonic() - stable_since >= 0.025)
+        self.wait(complete_stable_frame, 'complete stable initial frame')
         return self.output
 
     def cycle(self):
@@ -116,9 +140,10 @@ class Composer:
             try:
                 return int(self.path('.tick').read_text())
             except (FileNotFoundError, ValueError):
-                return 0
-        before = tick()
-        self.wait(lambda: tick() > before + 1, 'two complete polling cycles')
+                return None
+        before = self.wait(tick, 'first complete polling tick')
+        self.wait(lambda: (current := tick()) is not None and current > before + 1,
+                  'two complete polling cycles')
 
     def publish(self, request):
         pending = self.path('.bash-tool.json')
@@ -266,12 +291,14 @@ class ComposerKnobs(unittest.TestCase):
                 self.assertEqual(counts.read_text().splitlines(), ['A', 'B'])
 
     def test_malformed_claim_returns_error_and_next_command_recovers(self):
-        """Scenario: publish invalid JSON or argv; receive a defined error, acknowledge it, then successfully run another command."""
+        """Scenario: publish invalid JSON, empty argv, NUL-bearing argv or unencodable argv; receive a defined error with the request id preserved, acknowledge it, then successfully run another command."""
         for fixture in FIXTURES:
-            with self.subTest(fixture=fixture):
-                composer = self.start(fixture, {PREFIX + 'BASH_TOOL': '1'}, instrument=True)
-                for content, identifier in (('{"id":', None),
-                                             (json.dumps({'id': 'bad', 'argv': []}), 'bad')):
+            for content, identifier in (('{"id":', None),
+                                         (json.dumps({'id': 'bad', 'argv': []}), 'bad'),
+                                         (json.dumps({'id': 'bad-nul', 'argv': ['/bin/true', '\x00']}), 'bad-nul'),
+                                         (json.dumps({'id': 'bad-encoding', 'argv': ['/bin/true', '\ud800']}), 'bad-encoding')):
+                with self.subTest(fixture=fixture, identifier=identifier):
+                    composer = self.start(fixture, {PREFIX + 'BASH_TOOL': '1'}, instrument=True)
                     temporary = composer.path('.bash-tool.json.tmp-malformed')
                     temporary.write_text(content)
                     temporary.replace(composer.path('.bash-tool.json'))
@@ -279,8 +306,22 @@ class ComposerKnobs(unittest.TestCase):
                     self.assertIsNone(result['exit'])
                     self.assertEqual(result['error'], 'invalid_request')
                     composer.acknowledge()
-                composer.publish({'id': 'recovered', 'argv': ['/bin/true']})
-                self.assertEqual(composer.result('recovered'), {'id': 'recovered', 'exit': 0})
+                    composer.publish({'id': 'recovered', 'argv': ['/bin/true']})
+                    self.assertEqual(composer.result('recovered'), {'id': 'recovered', 'exit': 0})
+
+    def test_poll_ticks_publish_complete_counters(self):
+        """Scenario: pause each composer's tick writer after opening its output; readers see no published counter until it is complete, then witness newer polls."""
+        for fixture in FIXTURES:
+            with self.subTest(fixture=fixture):
+                composer = self.start(fixture, {'PAUSE_TICK': '1'}, instrument=True)
+                composer.wait(lambda: composer.path('.tick-ready').exists(), 'tick writer barrier')
+                published = composer.path('.tick')
+                try:
+                    if published.exists():
+                        self.assertRegex(published.read_text(), r'^[1-9][0-9]*$', 'published tick must be complete')
+                finally:
+                    composer.path('.tick-go').touch()
+                composer.cycle()
 
 
 if __name__ == '__main__':
