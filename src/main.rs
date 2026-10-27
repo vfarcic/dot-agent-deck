@@ -4049,9 +4049,12 @@ async fn run_daemon_restart_cli(force: bool) -> ExitCode {
 /// Every agent's hook auto-install runs before this, in the `DaemonCmd::Serve`
 /// arm (issue #1157), so an agent this daemon starts with no TUI attached —
 /// a scheduled task, a dispatched unit, a restored pane — finds hooks naming
-/// a live deck. The OpenCode plugin is also rewritten before each OpenCode
-/// agent starts (PRD #1666 §11), which covers OpenCode set up, or its plugin
-/// gone stale, after this daemon started (PRD #190, `hooks/install/023`).
+/// a live deck. The OpenCode plugin's install also runs again before each
+/// OpenCode agent starts (PRD #1666 §11), so a plugin missing, or pinned to a
+/// deleted copy, because OpenCode was set up or a copy removed after this
+/// daemon started is repaired before the agent loads it (PRD #190,
+/// `hooks/install/023`). A pin to another live, durable install is kept by the
+/// same rules as at startup.
 #[tokio::main]
 async fn run_daemon_serve_cli(
     hook_binaries: dot_agent_deck::hook_binary::HookBinaryState,

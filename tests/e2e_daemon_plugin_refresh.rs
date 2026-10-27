@@ -5,8 +5,8 @@
 //! OpenCode was set up, after the daemon started.
 //!
 //! `daemon serve` installs the plugin when it starts (issue #1157,
-//! `hooks/install/009`), and the daemon rewrites it again before every OpenCode
-//! agent it starts (PRD #1666 §11). `inbox/boundary/025` covers that per-start
+//! `hooks/install/009`), and runs that install again before every OpenCode
+//! agent it starts (PRD #1666 §11), keeping a pin to another live install. `inbox/boundary/025` covers that per-start
 //! rewrite for the template, around a pin the deck keeps; this file covers the
 //! pin itself on the path PRD #190 names: a scheduled task firing on a daemon
 //! no TUI has touched, after the plugin was left pointing at a copy of the deck
