@@ -1280,10 +1280,17 @@ mod tests {
     /// Scenario: a command that started a descendant and then waits on it is
     /// run through the cancellable path with a 60 s bound, and the client
     /// cancels it once both are running. The call returns "cancelled" within
-    /// `STOP_GRACE` of the cancellation, and the command, its descendant and
-    /// its whole process group are gone.
+    /// `STOP_GRACE` of the cancellation, the shell is reaped, and its descendant
+    /// has exited. On Linux, repeat in an isolated subreaper that leaves the
+    /// exited descendant unreaped until after these checks.
     #[test]
     fn host_009_a_cancelled_command_is_stopped_with_its_group() {
+        #[cfg(target_os = "linux")]
+        if is_reexec_child() {
+            // SAFETY: only this test runs in this re-exec'd process; becoming
+            // a subreaper changes no other test's orphan adoption or reaping.
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        }
         let dir = tempfile::tempdir().unwrap();
         let command_pid = dir.path().join("command.pid");
         let descendant_pid = dir.path().join("descendant.pid");
@@ -1313,6 +1320,24 @@ mod tests {
         );
         let returned_at = Instant::now();
         let (command, descendant) = canceller.join().unwrap();
+        #[cfg(target_os = "linux")]
+        let _delayed_reaper = is_reexec_child().then(|| {
+            struct AdoptedDescendant(i32);
+            impl Drop for AdoptedDescendant {
+                fn drop(&mut self) {
+                    // Reap only after the lifecycle assertions, including on
+                    // panic. Kill a surviving fixture child before waiting.
+                    // SAFETY: this pid belongs to our adopted fixture child.
+                    unsafe {
+                        if !exited(self.0) {
+                            libc::kill(self.0, libc::SIGKILL);
+                        }
+                        libc::waitpid(self.0, std::ptr::null_mut(), 0);
+                    }
+                }
+            }
+            AdoptedDescendant(descendant)
+        });
         let descendant_died = eventually(|| exited(descendant));
         if !descendant_died {
             // SAFETY: the pid was just read from the descendant itself.
@@ -1329,17 +1354,22 @@ mod tests {
             returned_at.duration_since(fired_at)
         );
         assert!(reaped(command), "the cancelled command was not reaped");
+        // The fixture's group contains just the shell and this descendant.
+        // A zombie has exited but still makes kill(-pgid, 0) succeed until
+        // its parent reaps it, so group existence cannot prove it is running.
         assert!(
             descendant_died,
             "the descendant outlived its cancelled command"
         );
-        // SAFETY: signal 0 to the command's group checks only that the group
-        // exists; nothing is sent.
-        let group_left = unsafe { libc::kill(-command, 0) } == 0;
-        assert!(
-            !group_left,
-            "something in the command's group is still running"
-        );
+        #[cfg(target_os = "linux")]
+        if is_reexec_child() {
+            assert!(
+                !reaped(descendant),
+                "the delayed-reaper regression must retain the exited descendant"
+            );
+        } else {
+            reexec("self_upgrade::tests::host_009_a_cancelled_command_is_stopped_with_its_group");
+        }
     }
 
     /// Scenario: something else in the process reaps the command first, as
