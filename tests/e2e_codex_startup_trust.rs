@@ -337,6 +337,9 @@ fn codex_hooks_016_an_unanswered_hooks_list_does_not_hold_the_dashboard() {
             format!("{}:{}", codex_dir.display(), common::path_with_binary_dir()),
         )
         .with_env("DOT_AGENT_DECK_LOG", log_path.to_string_lossy())
+        // The startup install is what is under test, so the harness must not
+        // run `hooks refresh` first: that one waits for the trust write.
+        .keeping_the_startup_hook_install()
         .launch_with_fixture("minimal");
 
     deck.wait_for_string("No active agents");

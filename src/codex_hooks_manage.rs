@@ -2327,7 +2327,9 @@ fn edit_trust_state(home: &Path, edit: impl FnOnce(&mut toml_edit::Table)) -> st
     if updated == existing {
         return Ok(());
     }
-    crate::agent_hook_config::write_atomic(home, &path, updated.as_bytes())
+    crate::agent_hook_config::write_atomic(home, &path, updated.as_bytes())?;
+    crate::agent_hook_config::note_config_change();
+    Ok(())
 }
 
 /// Insert or refresh one `[hooks.state."<key>"] { trusted_hash }` record.
@@ -2483,6 +2485,25 @@ pub fn refresh_install() -> crate::hooks_refresh::InstallAttempt {
         installed.and_then(|install| match trust_failure(&install.trust()) {
             Some(why) => Err(why),
             None => Ok(install.pins),
+        })
+    }))
+}
+
+/// [`refresh_install`] for the TUI's startup note (PRD #91): what the
+/// `hooks.json` install wrote or could not write, with the trust write left
+/// on its own thread as [`auto_install_and_trust_at_startup`] leaves it, so
+/// the TUI does not wait for it before it draws (issue #1665). A trust write
+/// that fails is in the log, and `hooks refresh` reports it.
+pub fn startup_install() -> crate::hooks_refresh::InstallAttempt {
+    let attempt = install_at_startup();
+    if let Some(Err(e)) = &attempt {
+        tracing::warn!("auto-install: {e}");
+    }
+    crate::hooks_refresh::InstallAttempt::of(attempt.map(|installed| {
+        installed.map(|install| {
+            let pins = install.pins.clone();
+            install.trust_in_background();
+            pins
         })
     }))
 }
@@ -2747,6 +2768,23 @@ mod tests {
             })
             .expect("record trust");
         }
+    }
+
+    /// PRD #91 (Greptile on PR #1925): a trust write that changes
+    /// `config.toml` counts as a change inside a counting scope, as the TUI's
+    /// startup install runs it when no thread can be started for it; the same
+    /// record written again is not.
+    #[test]
+    fn a_trust_write_counts_as_a_change_only_when_it_writes() {
+        let home = tempfile::tempdir().unwrap();
+        let trust = || {
+            edit_trust_state(home.path(), |state| {
+                upsert_trust_record(state, "/h/hooks.json:pre_tool_use:0:0", "sha256:a")
+            })
+            .unwrap()
+        };
+        assert!(crate::agent_hook_config::noting_auto_install_changes(trust).1);
+        assert!(!crate::agent_hook_config::noting_auto_install_changes(trust).1);
     }
 
     /// Scenario: Start eight separate processes at once against one fresh Codex

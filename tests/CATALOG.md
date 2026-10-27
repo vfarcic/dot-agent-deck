@@ -830,6 +830,13 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** the orchestration refusal that reopens the form (covered by `orchestration/identity/009`).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/status-message/008 — The startup hook install's note is on the status line, and a failure is kept for the exit report (PRD #91).
+- **Layer:** L1 (in-module `src/ui.rs` test: builds the note with `hooks_refresh::startup_note`, puts it on the `UiState` as `run_tui` does at start, then draws the full frame with `render_frame` into a ratatui `TestBackend` and inline-`insta`-snapshots the bottom status row).
+- **Agent:** none.
+- **Asserts:** no note leaves the status line empty; an install that changed Claude Code's hooks reads ` COMMAND  Installed or repaired the deck's hooks for Claude Code.` and keeps nothing for exit; one that could not update them shows `Claude Code's hooks could not be updated: <reason>.` and keeps that line and the fix in `session_warnings`, which the TUI prints on exit.
+- **Does not assert:** that the real startup runs the install before the daemon (`hooks/install/021`); the exit flush itself (`flush_session_warnings` unit tests).
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/rename
 
 ##### dashboard/rename/001 — `r` on the selected card opens a rename input pre-filled with the current name.
@@ -3006,6 +3013,20 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Agent:** none.
 - **Asserts:** with no Claude Code or OpenCode folder the report is ok and says no installed agent was found; an OpenCode XDG root under a `~/.config` that cannot be searched (no legacy `~/.opencode`), and a `~/.claude` symlink into a folder that cannot be searched, each give a non-zero exit, `ok: false`, `<agent>'s hooks could not be updated…` and that agent's `hooks install` command, and no `No installed agent` line.
 - **Does not assert:** Codex or Devin, which count as installed by an executable on `PATH` rather than by a config folder, and whose install creates and reports on that folder itself; a root run, which prints `SKIP:` because root ignores the directory modes.
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/021 — The TUI says when its startup install changed an agent's hooks, and says nothing when they were already current (PRD #91).
+- **Layer:** L2 PTY e2e (`tests/e2e_hook_binary_path.rs`), the real `target/debug` deck with an isolated HOME holding only `~/.claude/` and a durable `~/.local/bin/dot-agent-deck`.
+- **Agent:** none; no agent is on `PATH`.
+- **Asserts:** the first launch shows `Installed or repaired the deck's hooks for Claude Code.` and the settings then hold the deck's rules, which is only possible because the TUI installs before it lazy-spawns the daemon (the daemon's own install would otherwise get there first); a second launch over the now-current hooks shows no note and leaves the settings byte for byte.
+- **Does not assert:** the other agents' installers, which report a change through the same log call; the desktop app, which shows no such note (documented gap).
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/022 — The TUI says why it left a malformed `settings.json` alone instead of overwriting it (PRD #91).
+- **Layer:** L2 PTY e2e (`tests/e2e_hook_binary_path.rs`), the same isolated HOME with a `~/.claude/settings.json` that has a trailing comma.
+- **Agent:** none.
+- **Asserts:** the status line shows `Claude Code's hooks could not be updated:` with `is not valid JSON` in the reason and no install note; the settings file is left byte for byte.
+- **Does not assert:** the exit report (`dashboard/status-message/008` covers what it keeps); an unreadable or unwritable file, which reaches the note through the same failure list (`hooks/install/019` covers them for `hooks refresh`).
 - **Platform coverage:** mac+linux.
 
 #### hooks/stale

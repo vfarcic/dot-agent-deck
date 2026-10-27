@@ -2731,6 +2731,29 @@ async fn run_tui_session() -> ExitCode {
     // #577) — see `launch_project_dir`.
     dot_agent_deck::features::init_and_watch(&launch_project_dir());
 
+    // Install hooks/plugins for detected agents (best-effort), driven from the
+    // agent registry: each spec's OWN startup install, in `ALL` order (PRD #20
+    // M2 / R20-010), so a future agent reusing `NativeHooks`/`Plugin` runs its
+    // own installer. Codex starts its scoped, hash-pinned trust write here too
+    // (PRD #20 §4.2.1), on a thread of its own that this does not wait for
+    // (issue #1665); Pi materializes at spawn time and has no startup install.
+    //
+    // PRD #91: BEFORE the daemon is bootstrapped, because a lazy-spawned
+    // daemon runs the same installs before it binds and would leave nothing
+    // for this one to change, so the TUI could never say that it changed the
+    // hooks. Whatever it changed or could not change is the note `run_tui`
+    // shows as it starts. The daemon's own pass then finds nothing to do.
+    // On a blocking thread, since the installers read and write files and run
+    // the agents' CLIs (Qodo on PR #1925).
+    let mut startup_hooks = UnshownStartupNote(
+        tokio::task::spawn_blocking(dot_agent_deck::hooks_refresh::startup_install)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("startup hook install did not finish: {e}");
+                None
+            }),
+    );
+
     let state = Arc::new(RwLock::new(AppState::default()));
     // PRD #741 M2: the TUI always talks to the daemon on this machine, so it
     // names it as one. `attach_path` stays the same value it always was — the
@@ -2903,34 +2926,20 @@ async fn run_tui_session() -> ExitCode {
     // the alt-screen, so loading here keeps the warnings ahead of it.
     let keybindings = dot_agent_deck::keybindings::KeybindingConfig::load();
 
-    // Auto-install hooks/plugins for detected agents (silent, best-effort).
-    // PRD #20 M2 / R20-010: driven from the agent registry — iterate the shipped
-    // agents and run each spec's OWN startup auto-install action. Order is stable
-    // (`ALL` order). Dispatching per-spec (rather than mapping the reusable
-    // `IntegrationStrategy` enum to a hardcoded incumbent) means a future agent
-    // reusing `NativeHooks`/`Plugin` runs ITS OWN installer, not Claude's or
-    // OpenCode's. Claude installs native hooks and OpenCode its plugin at
-    // startup; Codex installs its native `hooks.json` AND records scoped,
-    // hash-pinned trust for it here too (PRD #20 §4.2.1 — command-agnostic, so a
-    // launcher like `devbox run codex-big` that the spawn seam can't detect is
-    // still covered); Pi (`Extension`) materializes at spawn-time (see
-    // `agent_pty`), so its `startup_auto_install` is `None` and it is skipped.
-    {
-        use dot_agent_deck::agent_registry::ALL;
-        for spec in ALL {
-            if let Some(install) = spec.startup_auto_install {
-                install();
-            }
-        }
-    }
-
     let pane_controller: Arc<dyn PaneController> = Arc::new(
         EmbeddedPaneController::new(attach_path.clone(), tokio::runtime::Handle::current())
             .with_protocol_gate(),
     );
     let tui_state = state.clone();
+    let startup_note = startup_hooks.0.take();
     let tui_result = tokio::task::spawn_blocking(move || {
-        run_tui(tui_state, pane_controller, config, keybindings)
+        run_tui(
+            tui_state,
+            pane_controller,
+            config,
+            keybindings,
+            startup_note,
+        )
     })
     .await;
 
@@ -2946,6 +2955,20 @@ async fn run_tui_session() -> ExitCode {
         eprintln!("TUI error: {e}");
     }
     ExitCode::SUCCESS
+}
+
+/// PRD #91: the startup hook install's note until `run_tui` takes it. A launch
+/// that returns before the TUI opens (a failed bootstrap or handshake) drops
+/// it here instead, and what the user has to fix goes to stderr, as the TUI
+/// would have printed it on exit (Qodo on PR #1925).
+struct UnshownStartupNote(Option<dot_agent_deck::hooks_refresh::StartupNote>);
+
+impl Drop for UnshownStartupNote {
+    fn drop(&mut self) {
+        for warning in self.0.take().map(|note| note.warnings).unwrap_or_default() {
+            eprintln!("{warning}");
+        }
+    }
 }
 
 /// PRD #76 M2.17: spawn the TUI's event subscriber — see
