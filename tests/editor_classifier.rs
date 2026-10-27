@@ -571,7 +571,11 @@ mod real {
         }
     }
 
+    /// Under the target directory, where the copies can be executed. Cargo
+    /// creates it when it builds, but a test run from a nextest archive (CI's
+    /// e2e shards) extracts `target/` without it, so it is created here.
     fn tempdir() -> tempfile::TempDir {
+        fs::create_dir_all(env!("CARGO_TARGET_TMPDIR")).unwrap();
         tempfile::Builder::new()
             .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
             .unwrap()

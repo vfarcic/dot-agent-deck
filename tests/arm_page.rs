@@ -488,6 +488,9 @@ mod processes {
             serve(Path::new(&path));
             return;
         }
+        // Cargo creates this directory when it builds, but a test run from a
+        // nextest archive (CI's e2e shards) extracts `target/` without it.
+        std::fs::create_dir_all(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let dir = tempfile::Builder::new()
             .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
             .unwrap();
