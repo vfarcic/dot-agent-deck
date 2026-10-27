@@ -830,6 +830,13 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** the orchestration refusal that reopens the form (covered by `orchestration/identity/009`).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/status-message/008 — The startup hook install's note is on the status line, and a failure is kept for the exit report (PRD #91).
+- **Layer:** L1 (in-module `src/ui.rs` test: builds the note with `hooks_refresh::startup_note`, puts it on the `UiState` as `run_tui` does at start, then draws the full frame with `render_frame` into a ratatui `TestBackend` and inline-`insta`-snapshots the bottom status row).
+- **Agent:** none.
+- **Asserts:** no note leaves the status line empty; an install that changed Claude Code's hooks reads ` COMMAND  Installed or repaired the deck's hooks for Claude Code.` and keeps nothing for exit; one that could not update them shows `Claude Code's hooks could not be updated: <reason>.` and keeps that line and the fix in `session_warnings`, which the TUI prints on exit.
+- **Does not assert:** that the real startup runs the install before the daemon (`hooks/install/021`); the exit flush itself (`flush_session_warnings` unit tests).
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/rename
 
 ##### dashboard/rename/001 — `r` on the selected card opens a rename input pre-filled with the current name.
@@ -3006,6 +3013,20 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Agent:** none.
 - **Asserts:** with no Claude Code or OpenCode folder the report is ok and says no installed agent was found; an OpenCode XDG root under a `~/.config` that cannot be searched (no legacy `~/.opencode`), and a `~/.claude` symlink into a folder that cannot be searched, each give a non-zero exit, `ok: false`, `<agent>'s hooks could not be updated…` and that agent's `hooks install` command, and no `No installed agent` line.
 - **Does not assert:** Codex or Devin, which count as installed by an executable on `PATH` rather than by a config folder, and whose install creates and reports on that folder itself; a root run, which prints `SKIP:` because root ignores the directory modes.
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/021 — The TUI says when its startup install changed an agent's hooks, and says nothing when they were already current (PRD #91).
+- **Layer:** L2 PTY e2e (`tests/e2e_hook_binary_path.rs`), the real `target/debug` deck with an isolated HOME holding only `~/.claude/` and a durable `~/.local/bin/dot-agent-deck`.
+- **Agent:** none; no agent is on `PATH`.
+- **Asserts:** the first launch shows `Installed or repaired the deck's hooks for Claude Code.` and the settings then hold the deck's rules, which is only possible because the TUI installs before it lazy-spawns the daemon (the daemon's own install would otherwise get there first); a second launch over the now-current hooks shows no note and leaves the settings byte for byte.
+- **Does not assert:** the other agents' installers, which report a change through the same log call; the desktop app, which shows no such note (documented gap).
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/022 — The TUI says why it left a malformed `settings.json` alone instead of overwriting it (PRD #91).
+- **Layer:** L2 PTY e2e (`tests/e2e_hook_binary_path.rs`), the same isolated HOME with a `~/.claude/settings.json` that has a trailing comma.
+- **Agent:** none.
+- **Asserts:** the status line shows `Claude Code's hooks could not be updated:` with `is not valid JSON` in the reason and no install note; the settings file is left byte for byte.
+- **Does not assert:** the exit report (`dashboard/status-message/008` covers what it keeps); an unreadable or unwritable file, which reaches the note through the same failure list (`hooks/install/019` covers them for `hooks refresh`).
 - **Platform coverage:** mac+linux.
 
 #### hooks/stale
@@ -6939,6 +6960,27 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** that Codex asks the user to re-trust the deck's hooks once the set changes, which is inferred from its trust model and not run here; scoped trust of the new rule (`codex_hooks_safety`).
 - **Platform coverage:** mac+linux.
 
+##### codex/hooks/014 — A `codex app-server` that never answers `hooks/list` does not hold the daemon's socket bind (issue #1665).
+- **Layer:** L2 (`tests/e2e_codex_startup_trust.rs`: the REAL binary as a `daemon serve` subprocess against an isolated `HOME`, `CODEX_HOME` and sockets; no PTY, no TUI, no LLM).
+- **Agent:** none (a `codex` stand-in first on `PATH` whose `app-server` reads every request and answers none).
+- **Asserts:** the daemon binds its attach socket with `hooks.json` already installed; the log holds no trust-write failure at that point, and `daemon serve: pre-bind work done` precedes the `could not record scoped hook trust` line the trust write logs once the 5 s listing bound runs out. RED before the fix: the timeout line came first, because the trust write ran before the bind.
+- **Does not assert:** the TUI's startup, which runs the same installer (`codex/hooks/016`); a wall-clock bind time, which load would make flaky; why a real Codex does not answer under the harness.
+- **Platform coverage:** mac+linux.
+
+##### codex/hooks/015 — The startup trust write, no longer run before the daemon binds, still lands when Codex answers (issue #1665).
+- **Layer:** L2 (`tests/e2e_codex_startup_trust.rs`, as `codex/hooks/014`).
+- **Agent:** none (the `codex-synthetic` stand-in, answering `hooks/list` with the deck's eleven hooks as the startup install wrote them).
+- **Asserts:** after the daemon binds, Codex's `config.toml` comes to trust exactly the deck's hook keys, each with the `trusted_hash` the stand-in listed for it.
+- **Does not assert:** ordering against a Codex launched before the trust lands (`codex/hooks/003` covers a launcher that waits for it); the wrapper's own trust write (`codex/trust/009`).
+- **Platform coverage:** mac+linux.
+
+##### codex/hooks/016 — A `codex app-server` that never answers `hooks/list` does not hold the dashboard's first paint (issue #1665).
+- **Layer:** L2 PTY-attached (`TuiDeck`, `tests/e2e_codex_startup_trust.rs`: the real TUI and its lazy-spawned daemon; no LLM).
+- **Agent:** none (the `codex/hooks/014` stand-in first on `PATH`).
+- **Asserts:** when `No active agents` first paints, the deck's log (TUI and daemon both append to it) holds no `could not record scoped hook trust` line; the log comes to hold one once the 5 s listing bound runs out, so the install did run. RED before the fix: the TUI's own startup install logged its timeout before `run_tui` drew.
+- **Does not assert:** a wall-clock paint time; what a Codex pane does before the trust lands.
+- **Platform coverage:** mac+linux.
+
 #### codex/live
 
 ##### codex/live/001 — A real interactive cheap-model Codex run launched through the normal new-pane flow works visibly and reports live status (PRD #20, rule 4 / finding 16). [reel]
@@ -10002,7 +10044,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/doorbell/031 — Selected-message and human-input fences at forced retry interleaves.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`, `tests/e2e_inbox_codex.rs`), real binary and daemon-owned PTY with exact input capture and vt100 replay.
 - **Agent:** none (raw Python stand-in; no agent executable or credential).
-- **Asserts:** with Idle unchanged and a second message still queued, settling the selected ID after decision, after pre-CR, after the inter-step delay or before final submit withholds the remaining bytes. Decision also covers Fetched without acknowledgement. Still-queued controls complete the real retry, parked at completion so later retries cannot race exact capture comparisons. Human frames are forced after decision, before payload and after payload before final CR; already-written bytes are allowed, and remaining automatic bytes must stop. A recognized stranded Codex composer covers its CR-only retry. Separate unreleased completion and writer-held barriers time out and each logical slot permits another submitted ring. Cleanup CR accounting remains in 007.
+- **Asserts:** with Idle unchanged and a second message still queued, settling the selected ID after decision, after pre-CR, after the inter-step delay or before final submit withholds the remaining bytes. Decision also covers Fetched without acknowledgement. Still-queued controls complete the real retry, parked at completion so later retries cannot race exact capture comparisons. Human frames are forced after decision, before payload and after payload before final CR; already-written bytes are allowed, and remaining automatic bytes must stop. A recognized stranded Codex composer covers its CR-only retry, with the six-second interleave budget starting at the reached fence after a separate load-scaled preparation wait; an unwind guard releases its fences from before arming. Separate unreleased completion and writer-held barriers time out and each logical slot permits another submitted ring. Cleanup CR accounting remains in 007.
 - **Does not assert:** a real editor's startup buffering, or settlement atomic with an already-enqueued PTY-thread write. E2E barriers use a configured single directory whose canonical target is checked under HOME; the harness supplies the isolated HOME and trusted filesystem, including marker leaves. These checks do not enforce no-symlink-escape confinement. Armed waits time out after eight seconds, and a test-only unwind guard clears busy slots; ordinary interleave fixtures share a six-second operation budget and release barriers on unwind. Between-step barriers retain the pane writer; completion barriers do not. Processes with fixture access can manipulate its files; these are not process-local barriers.
 - **Platform coverage:** mac+linux.
 
@@ -12042,11 +12084,11 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** recovery from SIGKILL of the entire host process.
 - **Cost:** none.
 
-##### inbox/opencode/006 — A held delivery is never repeated.
-- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), keepalive 300 ms
-- **Agent:** fake API withholding assistant-child events.
-- **Asserts:** a delivery without an assistant child stays fetched with one prompt across many keepalives, one possession snapshot answering each; the matching assistant turn then acknowledges it.
-- **Does not assert:** real agent cancellation behaviour.
+##### inbox/opencode/006 — A delivery with fresh possession is never repeated.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), load-scaled two-second keepalive and six-second possession TTL
+- **Agent:** fake API withholding assistant-child events and pulsing the real plugin's keepalive callback every 100 ms, independently of the daemon TTL.
+- **Asserts:** a delivery without an assistant child stays fetched with one prompt despite a one-second plugin scheduling stall; a repeat or loss of fetched state is reported before judging fixture history. Snapshots containing its held attempt span a full possession TTL with no TTL-expiring gap, measured on a monotonic clock with signed arithmetic, and the matching assistant turn then acknowledges it.
+- **Does not assert:** real agent cancellation behaviour or suppression after a genuine possession lapse; inbox/attempts/005 pins the allowed marked repeat after expiry and settlement by the original attempt's commit.
 - **Cost:** none.
 
 ##### inbox/opencode/024 — A prompt queued behind a long turn is possessed, not repeated.

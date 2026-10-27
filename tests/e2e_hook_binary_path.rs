@@ -10,6 +10,10 @@
 //! The file is shared because the seeding, launching and JSON-walking fixtures
 //! are exactly the ones those defects need.
 //!
+//! It also carries `hooks/install/021` and `022` (PRD #91): the note the TUI
+//! shows when that same startup install changed the hooks or could not update
+//! them, which needs the same seeded HOME.
+//!
 //! Every test here drives the real `dot-agent-deck` binary through the PTY
 //! harness, which under `cargo test-e2e` genuinely IS a `target/debug`
 //! artifact. For the two durability tests that is precisely what makes them the
@@ -630,4 +634,105 @@ fn install_006_startup_consolidates_deck_pins_and_keeps_user_handler_indices() {
     }
 
     assert_no_problems(&problems);
+}
+
+/// A HOME with only `~/.claude/` seeded and a durable executable at
+/// `~/.local/bin/dot-agent-deck`, and a PATH with no agent on it, so Claude
+/// Code is the one agent the startup install finds (PRD #91).
+fn seed_claude_only_home(home: &Path) -> &'static str {
+    std::fs::create_dir_all(home.join(".claude")).expect("seed ~/.claude");
+    write_executable(
+        &home.join(".local").join("bin").join("dot-agent-deck"),
+        STUB_BODY,
+    );
+    "/usr/bin:/bin"
+}
+
+/// [`launch_with_home`] in a terminal wide enough for the startup note's whole
+/// line, waiting for the first painted dashboard.
+fn launch_wide_with_home(home: &Path, path_value: &str) -> TuiDeck {
+    let deck = TuiDeck::builder()
+        .launching_the_cargo_artifact()
+        .with_pty_size(220, 30)
+        .with_env("HOME", home.to_str().expect("HOME path is UTF-8"))
+        .with_env(
+            "XDG_CONFIG_HOME",
+            home.join(".config")
+                .to_str()
+                .expect("XDG config path is UTF-8"),
+        )
+        .with_env("PATH", path_value)
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active agents");
+    deck
+}
+
+/// The status line the TUI shows when its startup install changed hooks.
+const CHANGED_NOTE: &str = "Installed or repaired the deck's hooks for Claude Code.";
+
+/// Scenario: Launch the real deck into a HOME where Claude Code is installed
+/// but has none of the deck's hooks. The deck installs them, and the status
+/// line says "Installed or repaired the deck's hooks for Claude Code." as the
+/// dashboard appears. Launching again over the now-current hooks shows no note.
+#[spec("hooks/install/021")]
+#[test]
+fn install_021_the_tui_says_when_its_startup_install_changed_hooks() {
+    let sandbox = harness_tempdir().expect("harness tempdir for the isolated HOME");
+    let home = sandbox.path().join("home");
+    let path_value = seed_claude_only_home(&home);
+
+    let first = launch_wide_with_home(&home, path_value);
+    first.wait_for_string(CHANGED_NOTE);
+    let settings = home.join(".claude").join("settings.json");
+    assert!(
+        !deck_commands(&settings, CLAUDE_SUFFIX).is_empty(),
+        "the note claims an install, so ~/.claude/settings.json must hold the deck's rules"
+    );
+    drop(first);
+
+    let before = std::fs::read(&settings).expect("read the installed settings");
+    let second = launch_wide_with_home(&home, path_value);
+    let grid = second.snapshot_grid();
+    assert!(
+        !grid.contains("hooks for Claude Code") && !grid.contains("could not be updated"),
+        "hooks that were already current must not be announced again:\n{grid}"
+    );
+    assert_eq!(
+        std::fs::read(&settings).expect("read the settings again"),
+        before,
+        "a start over current hooks must leave the settings file as it was"
+    );
+}
+
+/// Scenario: Launch the real deck into a HOME whose `~/.claude/settings.json`
+/// is not valid JSON (a trailing comma). The deck leaves the file byte for
+/// byte as it was, installs nothing, and the status line says
+/// "Claude Code's hooks could not be updated: … is not valid JSON …" instead
+/// of announcing an install.
+#[spec("hooks/install/022")]
+#[test]
+fn install_022_the_tui_says_why_it_left_a_malformed_settings_file_alone() {
+    let sandbox = harness_tempdir().expect("harness tempdir for the isolated HOME");
+    let home = sandbox.path().join("home");
+    let path_value = seed_claude_only_home(&home);
+    let settings = home.join(".claude").join("settings.json");
+    let malformed = b"{\n  \"model\": \"opus\",\n  \"env\": {\"KEEP\": \"me\"},\n}\n";
+    std::fs::write(&settings, malformed).expect("seed the malformed settings");
+
+    let deck = launch_wide_with_home(&home, path_value);
+    deck.wait_for_string("Claude Code's hooks could not be updated:");
+    let grid = deck.snapshot_grid();
+    assert!(
+        grid.contains("is not valid JSON"),
+        "the note must give the specific reason, not only that something failed:\n{grid}"
+    );
+    assert!(
+        !grid.contains(CHANGED_NOTE),
+        "a refused install must not be announced as an install:\n{grid}"
+    );
+    assert_eq!(
+        std::fs::read(&settings).expect("read the settings back"),
+        malformed,
+        "the malformed settings file must be left byte for byte as it was"
+    );
 }

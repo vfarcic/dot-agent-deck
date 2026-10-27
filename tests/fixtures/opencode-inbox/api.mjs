@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import cp from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import { pathToFileURL } from 'node:url';
+import { performance } from 'node:perf_hooks';
 import { Worker, workerData, parentPort } from 'node:worker_threads';
 
 const [pluginPath, base, scenario] = process.argv.slice(2);
@@ -13,8 +14,8 @@ if(config.worker && !workerData) {
   worker.on('error',error=>{console.error(error);process.exit(1);});
   await new Promise(resolve=>worker.on('exit',resolve));process.exit(0);
 }
-// `t` (wall-clock ms) lets a failing test say how far apart two events were.
-const log = (kind, data = {}) => fs.appendFileSync(base + '.events', JSON.stringify({kind, t: Date.now(), ...data}) + '\n');
+// Keep wall time for diagnostics; elapsed-time assertions use monotonic ms.
+const log = (kind, data = {}) => fs.appendFileSync(base + '.events', JSON.stringify({kind, t: Date.now(), monotonicMs: Math.trunc(performance.now()), ...data}) + '\n');
 const handlers = new Map();
 const emit = (type, properties) => {
   for (const fn of handlers.get(type) ?? []) fn({type, properties});
@@ -26,6 +27,7 @@ const realSpawn = cp.spawn;
 // With `firstWatcherDelaysPublish`, only the first watcher inherits the
 // publish delay knob: a later one publishes at once.
 let watchers = 0;
+let stalledSnapshot = false;
 cp.spawn = (...args) => {
   if (config.firstWatcherDelaysPublish && args[1]?.[1] === 'wait' && watchers++ > 0) {
     const env = {...process.env};
@@ -38,10 +40,31 @@ cp.spawn = (...args) => {
   const write = child.stdin?.write.bind(child.stdin);
   child.rawWrite = write;
   if (write) child.stdin.write = (bytes, ...rest) => {
+    const snapshot = JSON.parse(bytes.toString()).possess;
+    if (!stalledSnapshot && config.snapshotStallMs && snapshot?.seq >= 3 && snapshot.held.length) {
+      stalledSnapshot = true;
+      // Place a held snapshot between keepalives, then block the plugin's
+      // event loop to reproduce a scheduling gap independently of its TTL.
+      setTimeout(() => {
+        log('stdin', {text: bytes.toString()});
+        write(bytes, ...rest);
+        const until = performance.now() + config.snapshotStallMs;
+        while (performance.now() < until) {}
+        log('stalled', {ms: config.snapshotStallMs});
+      }, 100);
+      return true;
+    }
     log('stdin', {text: bytes.toString()});
     return write(bytes, ...rest);
   };
   child.stdout?.on?.('data', (bytes) => log('stdout', {pid: child.pid, text: bytes.toString()}));
+  // Exercise the generated plugin's snapshot callback at a controlled cadence
+  // independent of the real watcher's keepalive (which sets the daemon TTL).
+  if (config.snapshotEveryMs) {
+    const timer = setInterval(() => child.stdout.emit('data', '{"keepalive":true}\n'), config.snapshotEveryMs);
+    timer.unref();
+    child.on('exit', () => clearInterval(timer));
+  }
   child.on('exit', (code, signal) => log('exit', {pid: child.pid, code, signal}));
   return child;
 };
@@ -139,7 +162,7 @@ const timer=setInterval(async ()=>{
     // plugin, as a component that reports a stage before registration would.
     if(control.rawStdin) {const text=JSON.stringify(control.rawStdin)+'\n';spawned[spawned.length-1]?.rawWrite?.(text);log('raw-stdin',{text});}
     // PRD #1666 §4: a stalled event loop (a dead adapter, while it lasts).
-    if(control.stall) {const until=Date.now()+control.stall;while(Date.now()<until){} log('stalled',{ms:control.stall});}
+    if(control.stall) {const until=performance.now()+control.stall;while(performance.now()<until){} log('stalled',{ms:control.stall});}
     // PRD #1666 §4: OpenCode re-running the server plugin in the same module, as
     // it does when it disposes an instance: the new instance knows nothing.
     if(control.reload && config.server) {
