@@ -5699,6 +5699,53 @@ without depending on the config struct API.
 - **Does not assert:** that a scheduled (no-pane) single spawn still uses `default_command` — `scheduler/dispatch/004` pins that path, which does not go through `dispatch`; the precedence order itself (`dispatch::tests::a_single_unit_runs_its_dispatchers_command_as_its_dispatchers_agent`, `…_falls_back_to_default_then_claude`); that the registry keeps the configured command rather than the wrapped exec line (`agent_pty::spawn_tests::configured_launch_of_reports_the_configured_command_and_its_agent`); a real agent or a real `devbox run`.
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]`; the stand-ins are POSIX shell).
 
+#### orchestration/roles
+
+##### orchestration/roles/001 — Discover orchestrators and workers across folders through the roles CLI.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_orchestrator_address.rs`, `orchestration_roles_001_lists_seats_and_filters`).
+- **Agent:** none; identity-recording Python probes emit synthetic Claude SessionStart hooks and wait in cat.
+- **Asserts:** text headers and seat markers, standalone dashes, JSON keys and values, folder filtering and its intersection with the orchestration name across two same-named teams in distinct folders.
+- **Does not assert:** real-agent decisions or old-daemon compatibility.
+
+##### orchestration/roles/002 — The live orchestration sidebar marks the orchestrator seat.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_orchestrator_address.rs`, `orchestration_roles_002_sidebar_marks_only_orchestrator`).
+- **Agent:** none; identity-recording Python probes standing in for interactive agents.
+- **Asserts:** at 220 and 120 terminal columns with the default sidebar width, a long start-role name, Working status and a queued inbox badge, the live orchestrator card carries the full ORCHESTRATOR word and the worker card does not.
+- **Does not assert:** desktop rendering or pane-border titles.
+
+#### orchestration/address
+
+##### orchestration/address/001 — Send outside text by folder to the owning orchestrator alone.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_orchestrator_address.rs`, `orchestration_address_001_folder_delivers_untrusted_only_to_orchestrator`).
+- **Agent:** none; attested identity-recording probes in two same-named orchestrations and one standalone caller.
+- **Asserts:** successful CLI output, retained target inbox content and no sentinel in the other agents' inboxes; the trusted preface names the caller pane and says sender details and reply command are inside the untrusted text below, without exposing the caller folder; that folder and the reply command appear inside the frame before the sentinel.
+- **Does not assert:** an LLM consuming the message, file/stdin body input or nearest-ancestor resolution.
+
+##### orchestration/address/002 — Ambiguous orchestration names refuse with candidates; folder and name intersect.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_orchestrator_address.rs`, `orchestration_address_002_ambiguity_intersection_and_unknown_address`).
+- **Agent:** none; attested identity-recording Python probes.
+- **Asserts:** exit 1 and refused/ambiguous diagnostics with each orchestrator pane, title, config name and folder; no ambiguous delivery; successful narrowing to one folder; refusals for unknown name and folder.
+- **Does not assert:** dead orchestrator handling or transport capability negotiation.
+
+##### orchestration/address/003 — Own-team sends direct workers to work-done and orchestrators to delegate; an unattested shell cannot send.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_orchestrator_address.rs`, `orchestration_address_003_worker_and_unattested_shell_are_refused`).
+- **Agent:** none; identity-recording Python probes with daemon-minted pane claims.
+- **Asserts:** a worker sending to its own team is refused with work-done guidance and its orchestrator with delegate guidance; a plain shell is refused; rejected text reaches no tested inbox.
+- **Does not assert:** forged-token cases or cross-platform peer credential handling.
+
+##### orchestration/address/004 — One standalone agent receives a folder-addressed reply; two are ambiguous.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_orchestrator_address.rs`, `orchestration_address_004_standalone_fallback_and_ambiguity`).
+- **Agent:** none; identity-recording Python probes, with the caller in a separate dispatched folder.
+- **Asserts:** fallback delivery and success output naming the standalone recipient, then ambiguous refusal listing both pane ids after another standalone agent opens in that folder.
+- **Does not assert:** nearest-ancestor preference or a real orchestrator deciding to reply.
+
+##### orchestration/address/005 — Real interactive Haiku discovers and messages an outside orchestrator, which records and acknowledges the data. [reel]
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_orchestrator_address_live.rs`, `orchestration_address_005_real_haiku_discovers_and_messages_orchestrator`).
+- **Fixture:** `tests/fixtures/orchestrator-address`; trust is pre-seeded in the isolated HOME and the built binary is on PATH.
+- **Agent:** REAL Claude Code Haiku (`claude-haiku-4-5-20251001`), interactive standalone caller, orchestrator and waiting worker; Bash, Read and Write allowed. Runtime-skipped without CLI/credentials unless strict real-e2e enforcement is enabled.
+- **Asserts:** the recipient visibly announces readiness and completes its startup turn before the runtime marker is chosen; no sentinel exists before the directive; native Bash tool events from the caller's pane and agent record roles and inbox send commands; the recipient's retained untrusted inbox body contains that marker attributed to the expected caller pane and agent; the caller visibly acknowledges sending; the real orchestrator writes `address_received_1947_7b91.txt` containing the exact runtime marker and visibly acknowledges receipt in its pane.
+- **Does not assert:** agent model parity, reply delivery or concurrent real-agent routing isolation.
+
 #### orchestration/route
 
 ##### orchestration/route/001 — Two tabs of the SAME orchestration opened in the SAME directory are separate routing groups: each orchestrator's delegate reaches only its own worker and each worker's work-done reaches only its own orchestrator, with no cross-delivery in either direction (PRD #140 M5.1). [reel]

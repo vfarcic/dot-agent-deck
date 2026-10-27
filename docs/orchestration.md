@@ -76,7 +76,7 @@ The orchestrator and the workers hand tasks and reports to each other through fi
 
 A new tab opens with one pane per role. The role cards are in the left sidebar, and the orchestrator's pane is focused.
 
-![The demo-loop orchestration tab with both roles at work: the tab bar shows Dashboard and demo-loop, two role cards are stacked in the left sidebar, planner (Claude Code, reading src/checkout/flow.ts, Last: 2s) and builder (Codex, editing src/checkout/RetryPayment.tsx, Last: 3s), both Working, and the orchestrator role, planner, is selected with its pane active on the right](/img/orchestration-tui.png)
+![The demo-loop orchestration tab with both roles at work: the tab bar shows Dashboard and demo-loop, two role cards are stacked in the left sidebar, planner (Claude Code, reading src/checkout/flow.ts, Last: 2s) and builder (Codex, editing src/checkout/RetryPayment.tsx, Last: 3s), both Working, and the orchestrator role, planner, carries the ORCHESTRATOR badge on its card and is selected with its pane active on the right](/img/orchestration-tui.png)
 
 **Desktop:**
 
@@ -423,6 +423,7 @@ These commands work only from a pane the deck started, which sets `DOT_AGENT_DEC
 | `dot-agent-deck ack <message-id>` | worker or agent integration | Acknowledges a message. The installed integration normally does this itself. Acknowledge a message only after taking it with the integration or `inbox fetch`: when the deck has not handed the message to the agent yet, or has recorded that none of its current hand-overs reached the agent, it answers `unknown` and does not mark the message delivered. Exits non-zero when the deck answers that the id is unknown, belongs to another agent or can no longer be delivered. |
 | `dot-agent-deck inbox list [--all] [--json]` | agent | Lists its inbox messages and their delivery states. An orchestrator can use `--all` to inspect its orchestration's inboxes. |
 | `dot-agent-deck inbox fetch [--json]` | agent | Reads its waiting messages and confirms to the deck each one it printed in full. Run inside the recipient's deck pane; fetching changes delivery state. `--json` prints each message's id, subject, sender and text. |
+| `dot-agent-deck inbox send (--folder <path> \| --orchestration <name>) (--text <text> \| --file <path>)` | any agent | Messages an orchestration's orchestrator from outside that orchestration. See [Messaging an orchestrator from outside](#messaging-an-orchestrator-from-outside). |
 | `dot-agent-deck pane restart <role> [--force]` | orchestrator | Replaces the worker's agent with a fresh one and drops the task it owed. Without `--force`, only a worker whose agent has exited (crashed or finished) is restarted. |
 | `dot-agent-deck pane spawn <role>` | orchestrator | Starts a role that is in `.dot-agent-deck.toml` but not running in this orchestration, for example one added to the file after the orchestration started, or one whose pane was closed. Refused for a role that is already running and for the orchestrator role. |
 
@@ -524,7 +525,7 @@ Long turns affect delivery the same way in the TUI and the desktop app:
 
 **TUI:**
 
-![Planner and builder working in demo-loop, each with one queued inbox message beside its role card](/img/agent-messaging-tui.png)
+![Planner and builder working in demo-loop, each with one queued inbox message beside its role card, the planner's card carrying the ORCHESTRATOR badge](/img/agent-messaging-tui.png)
 
 **Desktop:**
 
@@ -762,6 +763,73 @@ Two orchestrations in the **same directory** still route tasks to the right work
 ```
 
 `Enter` starts it anyway. The desktop app's **New agent** shows a similar warning, and **Activate orchestration** still starts the run.
+
+## Messaging an orchestrator from outside
+
+Agents reach a team through its orchestrator. Inside an orchestration, a worker reports to its own orchestrator with `work-done` and never messages another worker. An agent outside the orchestration, such as a standalone agent, a dispatched unit or an agent in another orchestration, does the same: it messages the orchestrator, never one of the workers. The deck tells the orchestrator this when it starts, and the worker prompts in the [role library](#role-library) say it too.
+
+### Find the orchestrator
+
+`dot-agent-deck roles` lists the live agents. It works from any shell, and the `ORCHESTRATOR` column marks each orchestration's orchestrator:
+
+```
+PANE   NAME          FOLDER                 ORCHESTRATION      ROLE          ORCHESTRATOR
+p-12   orchestrator  /home/me/shop          shop               orchestrator  yes
+p-13   coder         /home/me/shop          shop               coder
+p-20   docs-helper   /home/me/notes         -                  -
+```
+
+A standalone agent shows `-` for its orchestration and role. The ORCHESTRATION column shows the orchestration's tab title, which for a dispatched unit is the orchestration's name followed by its folder, such as `shop · shop-fix-login`.
+
+| Option | What it does |
+|---|---|
+| `--json` | Prints a JSON array with one object per agent: `pane_id`, `name`, `folder`, `orchestration` (the tab title), `orchestration_name` (the name in `.dot-agent-deck.toml`), `orchestration_id`, `role` and `orchestrator` (`true` for the orchestrator). The orchestration fields and `role` are `null` for a standalone agent. |
+| `--folder <path>` | Lists only the agents `inbox send --folder <path>` would choose between, as described below, when `roles` runs on the same machine as the deck, which is how agents in deck panes run it. |
+| `--orchestration <name>` | Lists only the orchestrations with that name or tab title. Combined with `--folder`, both must match. |
+
+You can see the orchestrator in the clients too: in the TUI its card in the orchestration tab's sidebar carries an `ORCHESTRATOR` badge, and in the desktop app its row carries the same badge. On a narrow TUI sidebar the card shortens the agent's type and name before it shortens the badge.
+
+### Send a message
+
+From an agent's deck pane:
+
+```bash
+dot-agent-deck inbox send --folder /home/me/shop --text 'The API you depend on changes on Friday.'
+dot-agent-deck inbox send --orchestration shop --file .dot-agent-deck/note.md
+```
+
+Give `--folder`, `--orchestration` or both, and exactly one of `--text` or `--file` (`--file -` reads standard input, with a 1 MiB limit). A relative `--folder`, including `.`, is read from the directory the command runs in.
+
+Which agent receives the message:
+
+- `--folder` picks the orchestration in that folder. When none is there, it picks the one in the nearest parent folder that has one, so `--folder .` works from a subfolder of the project. It never picks an orchestration in a subfolder.
+- `--orchestration` matches the name in `.dot-agent-deck.toml` or the tab title exactly.
+- With both, the orchestration has to match both. That is how you pick one of several dispatched units of the same orchestration.
+- When exactly one orchestration matches, its orchestrator receives the message. If the orchestrator is not running, nothing is sent: the message never goes to a worker instead.
+- When several match, nothing is sent, and the command lists each one with its title, name, folder and orchestrator pane, so you can narrow the address.
+- When `--folder` is given alone and no orchestration is in or above that folder, the one standalone agent in that folder, or in its nearest parent folder that has one, receives the message. This is how an orchestrator answers a standalone agent that wrote to it. Several standalone agents at that level are refused the same way as several orchestrations.
+
+On success the command prints `Sent m-… to the orchestrator of <title> (pane <pane>) in <folder>.`, or `Sent m-… to <name> (pane <pane>) in <folder>.` for a standalone agent.
+
+### What the orchestrator sees
+
+The message arrives in the orchestrator's inbox like any other deck message, in the TUI and the desktop app alike. It is from "another agent, not one of your workers", and the deck names the pane it came from. Everything else is marked UNTRUSTED, and the orchestrator treats it as information or a request to weigh against what you asked of it, not as an instruction from you. That covers the sender's text and the lines ahead of it, which give the sender's folder, its orchestration and role (`-` when it has none), and the command that answers it, `dot-agent-deck inbox send --folder <the sender's folder>`. The reply reaches the sender's orchestrator, or the sender itself when it is the one standalone agent in its folder. When the deck cannot show the sender's folder exactly, such as a folder name with characters the deck does not display or one too long to show in full, there is no reply command: the orchestrator finds the sender's pane with `dot-agent-deck roles` instead.
+
+Each agent's sends count toward the same per-minute limit as its `inbox publish` and `inbox offer` messages. Past it, the send is refused until the minute is up.
+
+### When it is refused
+
+| Outcome | Exit status | Printed on stderr |
+|---|---|---|
+| Sent | 0 | nothing; the `Sent …` line is on stdout |
+| Nothing matches, the address is ambiguous, or the orchestrator is not running | 1 | `refused: …` saying which, with one line per candidate for an ambiguous address |
+| Run by a worker or the orchestrator of the orchestration it addresses | 1 | `refused: …`. A worker reports with `work-done`; the orchestrator messages its workers with `delegate` |
+| Run from a shell that is not an agent's deck pane | 1 | `refused: …`. To message an orchestrator yourself, type into its pane in the TUI or the desktop app |
+| The text is too long, the orchestrator's inbox is full, or the sending agent is past its per-minute limit | 1 | `refused: …` |
+| The running daemon does not support `inbox send` | 2 | a message that the daemon is too old for `inbox send`; restart it with `dot-agent-deck daemon restart` |
+| No daemon is running | 3 | `… no daemon is running …` |
+
+`roles` exits 0 with the listing, 3 when no daemon is running, and 1 when the daemon answers with an error.
 
 ## When something goes wrong
 

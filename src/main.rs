@@ -266,6 +266,26 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// List the live agents with their folder, orchestration and role, and
+    /// which one is each orchestration's orchestrator — the agent to message
+    /// with `inbox send`.
+    ///
+    /// --folder and --orchestration select what `inbox send` would address
+    /// with the same flags (all the agents of each matching orchestration)
+    /// when run on the same machine as the deck, which is how agents in deck
+    /// panes run it, and combine as an intersection.
+    Roles {
+        /// Print a JSON array instead of the table.
+        #[arg(long)]
+        json: bool,
+        /// Only the orchestrations in this folder or, when none is, its
+        /// nearest parent folder that has one.
+        #[arg(long, value_name = "PATH")]
+        folder: Option<String>,
+        /// Only the orchestrations with this config name or title.
+        #[arg(long, value_name = "NAME")]
+        orchestration: Option<String>,
+    },
     /// Acknowledge a message the deck delivered to you (`m-…`). Exits non-zero
     /// only when the deck says it holds no such message for you; any other
     /// failure to acknowledge is harmless, and the task goes on.
@@ -861,6 +881,28 @@ enum InboxAction {
         /// offered to another, e.g. `30m`, `1h30m`, `90s`.
         #[arg(long, value_name = "DURATION")]
         claim_ttl: Option<String>,
+    },
+    /// Message an orchestration's orchestrator from outside it, by folder,
+    /// orchestration name, or both. With a folder alone that holds no
+    /// orchestration, the one standalone agent there is messaged instead,
+    /// which is how an orchestrator answers a standalone agent. Your text
+    /// arrives as UNTRUSTED data, with the deck naming your pane and how to
+    /// reply. A worker reports to its own orchestrator with `work-done`.
+    ///
+    /// Exit status: 0 sent; 1 refused (nothing matched, the address was
+    /// ambiguous, or the orchestrator is not live); 2 the running daemon is
+    /// too old for `inbox send`; 3 no daemon is running.
+    #[command(group(clap::ArgGroup::new("address").required(true).multiple(true).args(["folder", "orchestration"])))]
+    Send {
+        /// The orchestration in this folder or, when none is, in its nearest
+        /// parent folder that has one.
+        #[arg(long, value_name = "PATH")]
+        folder: Option<String>,
+        /// The orchestration with this config name or title.
+        #[arg(long, value_name = "NAME")]
+        orchestration: Option<String>,
+        #[command(flatten)]
+        body: InboxBody,
     },
     /// Report a job you were offered as done.
     Complete {
@@ -1906,6 +1948,11 @@ fn main() -> ExitCode {
                 body,
                 claim_ttl,
             } => dot_agent_deck::inbox_cli::offer(&pool, body.text, body.file, claim_ttl),
+            InboxAction::Send {
+                folder,
+                orchestration,
+                body,
+            } => run_inbox_send_cli(folder, orchestration, body),
             InboxAction::Complete { id } => dot_agent_deck::inbox_cli::settle(&id, true),
             InboxAction::Release { id } => dot_agent_deck::inbox_cli::settle(&id, false),
         },
@@ -2036,6 +2083,11 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        Some(Commands::Roles {
+            json,
+            folder,
+            orchestration,
+        }) => run_roles_cli(json, folder, orchestration),
         Some(Commands::Close {
             units,
             unit_ids,
@@ -3791,6 +3843,68 @@ async fn run_close_cli(args: dot_agent_deck::close_cli::CloseArgs) -> ExitCode {
     print!("{}", output.stdout);
     eprint!("{}", output.stderr);
     ExitCode::from(output.code)
+}
+
+/// `--folder`, made absolute against this shell's cwd and left otherwise as
+/// spelled: the daemon canonicalises it.
+fn absolute_address(
+    folder: Option<String>,
+    orchestration: Option<String>,
+) -> dot_agent_deck::orchestrator_address::MessageAddress {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    dot_agent_deck::orchestrator_address::MessageAddress {
+        folder: folder.map(|f| dot_agent_deck::roles_cli::absolute_folder(&f, &cwd)),
+        orchestration,
+    }
+}
+
+fn print_cli_output(output: dot_agent_deck::roles_cli::CliOutput) -> ExitCode {
+    print!("{}", output.stdout);
+    eprint!("{}", output.stderr);
+    ExitCode::from(output.code)
+}
+
+/// `dot-agent-deck roles` — issue #1947. See [`dot_agent_deck::roles_cli`].
+#[tokio::main]
+async fn run_roles_cli(
+    json: bool,
+    folder: Option<String>,
+    orchestration: Option<String>,
+) -> ExitCode {
+    let client = DaemonClient::new(client_attach_socket_path());
+    let address = absolute_address(folder, orchestration);
+    print_cli_output(dot_agent_deck::roles_cli::run_roles(&client, json, &address).await)
+}
+
+/// `dot-agent-deck inbox send` — issue #1947. Connect-only, like `close`:
+/// messaging an orchestrator on a daemon this call just started would reach
+/// nobody.
+#[tokio::main]
+async fn run_inbox_send_cli(
+    folder: Option<String>,
+    orchestration: Option<String>,
+    body: InboxBody,
+) -> ExitCode {
+    let identity = match dot_agent_deck::close_cli::ambient_identity() {
+        Ok(identity) => identity,
+        Err(message) => {
+            let message = message
+                .replace("run `close`", "run `inbox send`")
+                .replace("Nothing was closed.", "Nothing was sent.");
+            eprintln!("{message}");
+            return ExitCode::from(dot_agent_deck::close_cli::EXIT_REFUSED);
+        }
+    };
+    let text = match dot_agent_deck::roles_cli::read_body(body.text, body.file, std::io::stdin()) {
+        Ok(text) => text,
+        Err(why) => {
+            eprintln!("refused: {why}; nothing was sent.");
+            return ExitCode::from(dot_agent_deck::close_cli::EXIT_REFUSED);
+        }
+    };
+    let client = DaemonClient::new(client_attach_socket_path());
+    let address = absolute_address(folder, orchestration);
+    print_cli_output(dot_agent_deck::roles_cli::run_send(&client, &identity, address, text).await)
 }
 
 #[tokio::main]

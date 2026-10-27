@@ -1124,6 +1124,14 @@ pub const CAP_HELLO_FOLLOW_ON: &str = "hello-follow-on";
 /// bump. Advertised on every platform.
 pub const CAP_DECK_OUTCOMES: &str = "deck-outcomes";
 
+/// Capability string for [`AttachRequest::AddressedMessage`] (issue #1947):
+/// message an orchestration's orchestrator, or a folder's one standalone
+/// agent, by folder and/or orchestration name. Held by
+/// [`crate::daemon_client::DaemonClient::addressed_message`], which refuses to
+/// send the request to a daemon that does not advertise it, so no
+/// [`PROTOCOL_VERSION`] bump. Advertised on every platform.
+pub const CAP_ADDRESSED_MESSAGE: &str = "addressed-message";
+
 /// The longest [`FinalReply::text`] the daemon stores or sends, in bytes. A
 /// longer reply is cut to its longest valid UTF-8 prefix within the bound
 /// ([`clamp_turn_reply`]). Reading speaks a summary of the reply, so the head
@@ -1304,6 +1312,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_CLOSE_AGENTS,
     CAP_HELLO_FOLLOW_ON,
     CAP_DECK_OUTCOMES,
+    CAP_ADDRESSED_MESSAGE,
 ];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
@@ -1326,6 +1335,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_CLOSE_AGENTS,
     CAP_HELLO_FOLLOW_ON,
     CAP_DECK_OUTCOMES,
+    CAP_ADDRESSED_MESSAGE,
 ];
 
 // ---------------------------------------------------------------------------
@@ -2262,6 +2272,19 @@ pub enum AttachRequest {
         /// Resolve and report, stop nothing.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         dry_run: bool,
+    },
+    /// Issue #1947: message an orchestration's orchestrator (or a folder's
+    /// one standalone agent) by address — `dot-agent-deck inbox send`.
+    /// Resolved and refused daemon-side by `crate::orchestrator_address`; the
+    /// caller must be an attested agent pane. Answered with
+    /// [`AttachResponse::addressed_message`].
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_ADDRESSED_MESSAGE`]** on
+    /// the connection that carries it, so no [`PROTOCOL_VERSION`] bump.
+    AddressedMessage {
+        address: crate::orchestrator_address::MessageAddress,
+        caller: CallerClaim,
+        body: String,
     },
     AttachStream {
         id: String,
@@ -3952,6 +3975,11 @@ pub struct AttachResponse {
     /// optional, and its request is capability-gated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deck_outcomes: Option<crate::report_recovery::DeckOutcomes>,
+    /// Issue #1947: the answer to [`AttachRequest::AddressedMessage`]. `None` on
+    /// every other response. A refusal is a report on an `ok` response.
+    /// Additive and optional, and its request is capability-gated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub addressed_message: Option<crate::orchestrator_address::AddressedMessageReport>,
 }
 
 /// PRD #1487: this daemon process's identity for [`AttachResponse::instance_id`]
@@ -6586,6 +6614,23 @@ async fn handle_connection(
             .await;
             let resp = AttachResponse {
                 close_report: Some(report),
+                ..AttachResponse::ok()
+            };
+            write_resp(&mut stream, &resp).await?
+        }
+        AttachRequest::AddressedMessage {
+            address,
+            caller,
+            body,
+        } => {
+            // Issue #1947: resolve, authorize and post, or refuse — see
+            // `crate::orchestrator_address`.
+            let report = crate::orchestrator_address::handle_addressed_message(
+                address, caller, body, &registry,
+            )
+            .await;
+            let resp = AttachResponse {
+                addressed_message: Some(report),
                 ..AttachResponse::ok()
             };
             write_resp(&mut stream, &resp).await?
