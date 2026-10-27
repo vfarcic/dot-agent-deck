@@ -363,8 +363,9 @@ mod processes {
     use std::io::{BufRead as _, BufReader, Write as _};
     use std::os::fd::AsRawFd as _;
     use std::path::Path;
-    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+    use std::process::{Child, ChildStdin, Command, Stdio};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::mpsc::{Receiver, RecvTimeoutError};
     use std::time::Duration;
 
     use dot_agent_deck::composer_probe::arm::{ArmRead, ArmReader, Publisher, WriterAt, word};
@@ -442,11 +443,17 @@ mod processes {
         println!("{ANSWER}done");
     }
 
+    /// The longest the parent waits for one answer. The child's longest
+    /// command, the stress, gives itself ten seconds.
+    const ANSWER_WAIT: Duration = Duration::from_secs(60);
+
     /// The parent's end of the child.
     struct Server {
         child: Child,
         stdin: Option<ChildStdin>,
-        stdout: BufReader<ChildStdout>,
+        /// The child's answers, read off its stdout by a thread of their own
+        /// so that a wait for one can give up.
+        answers: Receiver<String>,
     }
 
     impl Server {
@@ -459,17 +466,21 @@ mod processes {
 
         /// The child's next answer, past libtest's own output.
         fn answer(&mut self) -> String {
-            loop {
-                let mut line = String::new();
-                assert_ne!(
-                    self.stdout.read_line(&mut line).unwrap(),
-                    0,
-                    "the child ended"
-                );
-                if let Some((_, answer)) = line.trim_end().split_once(ANSWER) {
-                    return answer.to_owned();
-                }
+            match self.answers.recv_timeout(ANSWER_WAIT) {
+                Ok(answer) => answer,
+                Err(RecvTimeoutError::Disconnected) => panic!("the child ended"),
+                Err(RecvTimeoutError::Timeout) => panic!("no answer in {ANSWER_WAIT:?}"),
             }
+        }
+    }
+
+    /// Stops the stress writer when dropped, so a panic while the child
+    /// answers ends the writer too rather than leaving the scope joining it.
+    struct StopOnDrop<'a>(&'a AtomicBool);
+
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
         }
     }
 
@@ -519,9 +530,21 @@ mod processes {
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let (sender, answers) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in stdout.lines() {
+                let Ok(line) = line else { return };
+                if let Some((_, answer)) = line.trim_end().split_once(ANSWER)
+                    && sender.send(answer.to_owned()).is_err()
+                {
+                    return;
+                }
+            }
+        });
         let mut server = Server {
             stdin: child.stdin.take(),
-            stdout: BufReader::new(child.stdout.take().unwrap()),
+            answers,
             child,
         };
 
@@ -544,8 +567,9 @@ mod processes {
         let stop = AtomicBool::new(false);
         let answer = std::thread::scope(|scope| {
             let writer = scope.spawn(|| stress_publish(&mut publisher, &stop));
+            let stopping = StopOnDrop(&stop);
             let answer = server.ask("stress 20000 100 10");
-            stop.store(true, Ordering::Relaxed);
+            drop(stopping);
             let published = writer.join().unwrap();
             eprintln!("published {published}: {answer}");
             answer

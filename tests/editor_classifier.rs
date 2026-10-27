@@ -554,8 +554,9 @@ mod real {
     use std::fs;
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::process::CommandExt as _;
     use std::path::{Path, PathBuf};
-    use std::process::{Child, Command};
+    use std::process::{Child, Command, Stdio};
 
     use dot_agent_deck::composer_probe::classifier::{
         Class, FileId, Identity, ProcView as _, classify,
@@ -581,19 +582,15 @@ mod real {
             .unwrap()
     }
 
-    /// A `sleep` that runs as `sleep` under any name. uutils' multi-call
-    /// binary picks its program from its own file name, so where `/bin/sleep`
-    /// is that, GNU's copy is used; [`Copy::running`] catches a host with
-    /// neither.
-    fn sleep() -> &'static str {
-        ["/usr/bin/gnusleep", "/bin/sleep"]
-            .into_iter()
-            .find(|path| Path::new(path).exists())
-            .unwrap()
-    }
+    /// Set in a copy of this test binary started as a sleeper: the copy runs
+    /// [`probe_006_real_processes_classify`], which sleeps instead.
+    const SLEEPER: &str = "DAD_CLASSIFIER_SLEEPER";
 
-    /// `sleep`, copied to `name` in a fresh directory under the target
+    /// A sleeper, copied to `name` in a fresh directory under the target
     /// directory, or in a directory of the test's, started for a minute.
+    /// It is this test binary rather than the host's `sleep`: uutils' and
+    /// BusyBox's multi-call binaries pick their program from their own file
+    /// name, so a renamed copy of one exits at once.
     struct Copy {
         _dir: Option<tempfile::TempDir>,
         path: PathBuf,
@@ -610,12 +607,25 @@ mod real {
 
         fn start_in(dir: &Path, name: impl AsRef<OsStr>) -> Copy {
             let path = dir.join(name.as_ref());
-            fs::copy(sleep(), &path).unwrap();
+            fs::copy(std::env::current_exe().unwrap(), &path).unwrap();
             // Another test thread forking while the copy was open for writing
             // holds it open until its child execs: `ETXTBSY` until then.
             let mut tries = 0;
             let child = loop {
-                match Command::new(&path).arg("60").spawn() {
+                // libtest reads its arguments as UTF-8, `argv[0]` too, and
+                // the classifier reads `comm` and `exe`, not `argv`.
+                let spawned = Command::new(&path)
+                    .arg0("sleeper")
+                    .args([
+                        "--exact",
+                        "real::probe_006_real_processes_classify",
+                        "--test-threads=1",
+                    ])
+                    .env(SLEEPER, "1")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn();
+                match spawned {
                     Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && tries < 100 => {
                         tries += 1;
                         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -660,7 +670,7 @@ mod real {
         }
     }
 
-    /// Scenario: Read real processes through the Linux view: this test process's parent, start ticks, executable and its link match what the process and its parent report; a child started from a copy of `sleep` named `a) b (c 1 2` reads this process as its parent, a start at or after this process's, and the copy's inode and path, and after the copy is deleted its link reads `(deleted)` with the same inode; once the child is reaped, its stat fails. A copy whose name holds a newline among parentheses and digits reads this process as its parent too, while one whose name isn't UTF-8 has a stat that doesn't read, and classifies `Unknown`. The view reads a directory's `(dev, ino)` as `stat` does.
+    /// Scenario: Read real processes through the Linux view: this test process's parent, start ticks, executable and its link match what the process and its parent report; a child started from a copy of a sleeper named `a) b (c 1 2` reads this process as its parent, a start at or after this process's, and the copy's inode and path, and after the copy is deleted its link reads `(deleted)` with the same inode; once the child is reaped, its stat fails. A copy whose name holds a newline among parentheses and digits reads this process as its parent too, while one whose name isn't UTF-8 has a stat that doesn't read, and classifies `Unknown`. The view reads a directory's `(dev, ino)` as `stat` does.
     #[spec("inbox/probe/006")]
     #[test]
     fn probe_006_the_linux_view_reads_proc() {
@@ -714,7 +724,7 @@ mod real {
         assert!(view.file(&dir.path().join("missing")).is_err());
     }
 
-    /// Scenario: A real family record gone stale. With this test process standing in as the agent and a `versions` directory of the test's recorded as its install root, a copy of `sleep` named `2.1.311` started from that directory is `Unknown` (in the family), while a copy named `git` elsewhere is a tool. Once `versions` is renamed `versions-moved`, the `2.1.311` copy, its path now outside the recorded root, and the `git` copy are both `Unknown`. Renamed back, `git` is a tool again.
+    /// Scenario: A real family record gone stale. With this test process standing in as the agent and a `versions` directory of the test's recorded as its install root, a copy of a sleeper named `2.1.311` started from that directory is `Unknown` (in the family), while a copy named `git` elsewhere is a tool. Once `versions` is renamed `versions-moved`, the `2.1.311` copy, its path now outside the recorded root, and the `git` copy are both `Unknown`. Renamed back, `git` is a tool again.
     #[spec("inbox/probe/006")]
     #[test]
     fn probe_006_a_real_moved_install_root_is_unknown() {
@@ -750,10 +760,14 @@ mod real {
         assert!(updated.running() && git.running());
     }
 
-    /// Scenario: Classify real processes, with this test process standing in as the agent: itself is `Owned`; a child running a copy of `sleep` named `git` is a tool; a copy named `claude`, or named as this test binary, is `Unknown`; and with no identity, `Unknown`.
+    /// Scenario: Classify real processes, with this test process standing in as the agent (and, in a copy started as a sleeper, sleeping instead): itself is `Owned`; a child running a copy of a sleeper named `git` is a tool; a copy named `claude`, or named as this test binary, is `Unknown`; and with no identity, `Unknown`.
     #[spec("inbox/probe/006")]
     #[test]
     fn probe_006_real_processes_classify() {
+        if std::env::var_os(SLEEPER).is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            return;
+        }
         let me = me();
         let mut view = LinuxProcView;
         assert_eq!(classify(&mut view, Some(&me), me.pid), Class::Owned);
