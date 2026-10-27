@@ -356,8 +356,8 @@ pub async fn run(
             return false;
         }
     };
-    let plans: Vec<UpgradePlan> = std::iter::once(&running)
-        .chain(other.as_ref())
+    let plans: Vec<UpgradePlan> = discover::app_first(&running, other.as_ref())
+        .into_iter()
         .map(|copy| plan::plan(copy, &releases, options))
         .collect();
 

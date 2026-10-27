@@ -23,6 +23,14 @@ export function restartAfterCli(daemon: UpgradeTarget): string {
   return `After the CLI, Agent Deck restarts the daemon on this machine${versions} the version that came with this app. If agents or orchestration roles are running on it, you are shown each one and asked first; Keep current daemon leaves them running.`;
 }
 
+/** What the dialog says when the app itself is behind too, or was upgraded and waits for a relaunch (issue #1959). */
+export const APP_BEFORE_CLI = "Agent Deck itself is behind too, so it comes first, then the CLI, to keep the app, the CLI and the daemon on one release. Once Agent Deck is upgraded, relaunch it: it then restarts an older daemon here, asking first if agents run.";
+
+/** Whether the Local daemon section's Upgrade leads with the app: it is behind, or installed and waiting for a relaunch. */
+export function appFirst(check: SelfUpgradeCheck): boolean {
+  return check.updateAvailable || check.installed !== null;
+}
+
 /**
  * Issue #1753 — **Upgrade** on the Dashboard's Local daemon section, which
  * covers both things on this machine that can fall behind the app: the
@@ -42,6 +50,12 @@ export function restartAfterCli(daemon: UpgradeTarget): string {
  *    so); otherwise — a CLI that could not be upgraded from here, a failed
  *    upgrade, or a download whose install command is still to run — it asks
  *    first, as Upgrade on its own does.
+ *
+ * Issue #1959 — when the app itself is behind, or was upgraded and still runs
+ * the old build, the first dialog covers the app as well, app first, and says
+ * why ({@link APP_BEFORE_CLI}). An app that was replaced ends the flow at its
+ * Relaunch: the daemon is restarted by the relaunched app, onto the new
+ * release, not here onto the build this app still runs.
  */
 export function LocalUpgradeFlow({ daemon, cli, runtime, onClose }: LocalUpgradeRequest & {
   runtime: Pick<DeckRuntimeState, "upgradeDaemon" | "decideUpgrade">;
@@ -49,14 +63,15 @@ export function LocalUpgradeFlow({ daemon, cli, runtime, onClose }: LocalUpgrade
 }) {
   const [step, setStep] = useState<{ step: "cli" } | { step: "daemon"; autoStart: boolean }>(cli ? { step: "cli" } : { step: "daemon", autoStart: false });
   if (step.step === "cli" && cli) {
+    const withApp = appFirst(cli.check);
     return (
       <SelfUpgradeDialog
         check={cli.check}
         api={cli.api}
-        copies={["cli"]}
-        then={daemon ? restartAfterCli(daemon) : CLI_LEAVES_DAEMON}
+        copies={withApp ? ["app", "cli"] : ["cli"]}
+        then={withApp ? APP_BEFORE_CLI : daemon ? restartAfterCli(daemon) : CLI_LEAVES_DAEMON}
         onClose={(closed) => {
-          if (closed && daemon) setStep({ step: "daemon", autoStart: closed.installed });
+          if (closed && daemon && !closed.relaunch) setStep({ step: "daemon", autoStart: closed.installed });
           else onClose();
         }}
       />

@@ -712,7 +712,7 @@ impl UpgradePlan {
                 lines.push(PlanLine::Command(command.clone()));
             }
             (_, PlanAction::BrewUpgrade { formula, .. }) => lines.push(text(format!(
-                "Installed with Homebrew ({exe}). Upgrading runs `brew upgrade {}`, which installs the formula's latest release.",
+                "Installed with Homebrew ({exe}). Upgrading runs `brew update`, which refreshes Homebrew's copy of the tap, then `brew upgrade {}`, which installs the formula's latest release.",
                 formula.name()
             ))),
             (InstallMethod::Homebrew { formula, .. }, PlanAction::NotifyOnly) => {

@@ -260,11 +260,14 @@ pub enum Outcome {
     },
     /// `brew upgrade` ran, but the Homebrew binary does not report `offered`:
     /// it reports `reported`, or nothing. The usual reason is that the tap
-    /// does not carry the GitHub release yet. Not an upgrade.
+    /// does not carry the GitHub release yet, or that refreshing it with
+    /// `brew update` failed: `refresh_failed` is that failure's detail. Not
+    /// an upgrade.
     BrewNotUpgraded {
         formula: &'static str,
         reported: Option<String>,
         offered: String,
+        refresh_failed: Option<String>,
     },
     /// The verified file is at `path`; the user runs `command` to install it.
     /// `command` is `None` when it could not be shown safely
@@ -376,13 +379,29 @@ impl Outcome {
                 formula,
                 reported: Some(reported),
                 offered,
-            } => vec![text(format!(
-                "`brew upgrade {formula}` finished, but {CLI_BINARY} still reports v{reported}, not v{offered}: Homebrew does not offer v{offered} yet. Try again later."
-            ))],
+                refresh_failed,
+            } => {
+                let finished = format!(
+                    "`brew upgrade {formula}` finished, but {CLI_BINARY} still reports v{reported}, not v{offered}"
+                );
+                let why = match refresh_failed {
+                    Some(detail) => format!(
+                        "{finished}. Homebrew's copy of the tap may predate v{offered}, and refreshing it failed: {detail}. Refresh it, then upgrade again:"
+                    ),
+                    None => format!(
+                        "{finished}: Homebrew's tap does not carry v{offered} yet, even after `brew update`. Once it does, refresh it and upgrade again:"
+                    ),
+                };
+                vec![
+                    text(why),
+                    PlanLine::Command(format!("brew update && brew upgrade {formula}")),
+                ]
+            }
             Self::BrewNotUpgraded {
                 formula,
                 reported: None,
                 offered,
+                ..
             } => vec![text(format!(
                 "`brew upgrade {formula}` finished, but the upgraded {CLI_BINARY} did not report its version, so it is not known to run v{offered}. Check with `{CLI_BINARY} --version`."
             ))],
@@ -461,6 +480,20 @@ pub async fn execute(
         | PlanAction::ShowCommand { .. }
         | PlanAction::ManualDownload { .. } => Err(UpgradeError::NotActionable(plan.text())),
         PlanAction::BrewUpgrade { brew, formula } => {
+            // Refresh the taps first (issue #1959): `brew upgrade` refreshes
+            // them only when it has not done so recently, and never with
+            // `HOMEBREW_NO_AUTO_UPDATE` set, so a release published hours
+            // ago would read as one Homebrew does not offer. A refresh that
+            // fails (offline, another tap that cannot be fetched) does not
+            // stop the upgrade, which may still reach the release; the
+            // result names it when the copy did not move.
+            let refresh_failed =
+                match run_checked(host, brew, &[OsStr::new("update")], INSTALL_TIMEOUT) {
+                    Ok(_) => None,
+                    Err(e) if host.cancelled() => return Err(e),
+                    Err(UpgradeError::CommandFailed { detail, .. }) => Some(detail),
+                    Err(e) => return Err(e),
+                };
             run_checked(
                 host,
                 brew,
@@ -484,6 +517,7 @@ pub async fn execute(
                     formula: formula.name(),
                     reported,
                     offered: version.to_string(),
+                    refresh_failed,
                 })
             }
         }
@@ -2198,6 +2232,7 @@ mod tests {
     fn brew_upgrade_reporting(reported: Option<&str>) -> Result<Outcome, UpgradeError> {
         let mut host = FakeHost::new()
             .exe("/opt/homebrew/bin/brew")
+            .answer("/opt/homebrew/bin/brew update", ok(""))
             .answer("/opt/homebrew/bin/brew upgrade dot-agent-deck", ok(""));
         if let Some(version) = reported {
             host = host.deck("/opt/homebrew/bin/dot-agent-deck", version);
@@ -2230,7 +2265,8 @@ mod tests {
         assert_eq!(
             behind.lines(),
             [
-                "`brew upgrade dot-agent-deck` finished, but dot-agent-deck still reports v0.46.0, not v0.47.0: Homebrew does not offer v0.47.0 yet. Try again later."
+                "`brew upgrade dot-agent-deck` finished, but dot-agent-deck still reports v0.46.0, not v0.47.0: Homebrew's tap does not carry v0.47.0 yet, even after `brew update`. Once it does, refresh it and upgrade again:",
+                "  brew update && brew upgrade dot-agent-deck",
             ]
         );
         assert_eq!(behind.tui_restart_line("0.47.0"), None);
@@ -2241,6 +2277,147 @@ mod tests {
             silent.lines(),
             [
                 "`brew upgrade dot-agent-deck` finished, but the upgraded dot-agent-deck did not report its version, so it is not known to run v0.47.0. Check with `dot-agent-deck --version`."
+            ]
+        );
+    }
+
+    /// Run a `brew upgrade` plan for `formula` from `from` to `to` on a
+    /// machine whose local copy of the tap predates `to` (issue #1959): its
+    /// `brew upgrade` installs `to` only once `brew update` has refreshed the
+    /// tap, and `brew update` answers with `update`.
+    // Used only by Unix-gated tests: native Windows is unsupported (#164).
+    #[cfg(unix)]
+    fn brew_upgrade_from_a_stale_tap(
+        formula: crate::self_upgrade::HomebrewFormula,
+        from: &str,
+        to: &str,
+        update: CommandOutput,
+    ) -> (Result<Outcome, UpgradeError>, Vec<String>) {
+        use std::sync::{Arc, Mutex};
+        let installed = Arc::new(Mutex::new(from.to_string()));
+        let refreshed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (brew_installed, deck_installed) = (installed.clone(), installed);
+        let (name, to_owned) = (formula.name(), to.to_string());
+        let host = FakeHost::new()
+            .exe("/opt/homebrew/bin/brew")
+            .exe("/opt/homebrew/bin/dot-agent-deck")
+            .handle("/opt/homebrew/bin/brew", move |args| {
+                match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+                    ["update"] => {
+                        if update.success {
+                            refreshed.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        update.clone()
+                    }
+                    ["upgrade", upgraded] if upgraded == name => {
+                        if refreshed.load(std::sync::atomic::Ordering::SeqCst) {
+                            *brew_installed.lock().unwrap() = to_owned.clone();
+                        }
+                        ok("")
+                    }
+                    _ => fail("unexpected brew command"),
+                }
+            })
+            .handle("/opt/homebrew/bin/dot-agent-deck", move |args| {
+                assert_eq!(args, ["--version"]);
+                ok(&format!(
+                    "dot-agent-deck {}\n",
+                    deck_installed.lock().unwrap()
+                ))
+            });
+        let mut found = copy_at(
+            from,
+            InstallMethod::Homebrew {
+                formula,
+                prefix: PathBuf::from("/opt/homebrew"),
+            },
+        );
+        found.tools.brew = Some(PathBuf::from("/opt/homebrew/bin/brew"));
+        let options = plan::PlanOptions {
+            staging_root: PathBuf::from("/stage"),
+            can_prompt_for_privilege: false,
+            provenance: ProvenanceCheck::Unavailable {
+                reason: verify::GH_NOT_INSTALLED.into(),
+            },
+        };
+        let plan = plan::plan(&found, &to.into(), &options);
+        assert!(matches!(plan.action, PlanAction::BrewUpgrade { .. }));
+        let source = ReleaseSource {
+            api_url: String::new(),
+            list_url: String::new(),
+            download_base: String::new(),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let outcome = runtime.block_on(execute(&host, &plan, &source, Path::new("/stage")));
+        (outcome, host.ran())
+    }
+
+    /// Scenario: issue #1959. A Homebrew install whose local copy of the tap
+    /// predates the release, for the stable and the beta formula: the upgrade
+    /// refreshes the tap with `brew update` before `brew upgrade`, so it
+    /// reaches the release instead of reporting that Homebrew does not offer
+    /// it yet.
+    // Unix paths the fake host answers for: native Windows is unsupported (#164).
+    #[cfg(unix)]
+    #[test]
+    fn execute_038_a_brew_upgrade_refreshes_a_stale_tap_first() {
+        use crate::self_upgrade::HomebrewFormula;
+        for (formula, from, to) in [
+            (HomebrewFormula::Stable, "0.49.0", "0.49.1"),
+            (HomebrewFormula::Beta, "0.50.0-beta.0", "0.50.0-beta.1"),
+        ] {
+            let (outcome, ran) = brew_upgrade_from_a_stale_tap(formula, from, to, ok(""));
+            let outcome = outcome.unwrap();
+            assert!(outcome.upgraded(), "{formula:?}: {outcome:?}");
+            assert_eq!(
+                outcome.lines(),
+                [format!(
+                    "`brew upgrade {}` finished; it now reports v{to}.",
+                    formula.name()
+                )]
+            );
+            assert_eq!(
+                ran,
+                [
+                    "/opt/homebrew/bin/brew update".to_string(),
+                    format!("/opt/homebrew/bin/brew upgrade {}", formula.name()),
+                    "/opt/homebrew/bin/dot-agent-deck --version".to_string(),
+                ],
+                "{formula:?}"
+            );
+        }
+    }
+
+    /// Scenario: issue #1959. `brew update` fails (offline, or another tap
+    /// cannot be fetched): the upgrade still runs `brew upgrade`, and when the
+    /// copy did not move, the message names `brew update` and the refresh's
+    /// error instead of telling the user to wait.
+    // Unix paths the fake host answers for: native Windows is unsupported (#164).
+    #[cfg(unix)]
+    #[test]
+    fn execute_039_a_failed_tap_refresh_still_upgrades_and_names_brew_update() {
+        let (outcome, ran) = brew_upgrade_from_a_stale_tap(
+            crate::self_upgrade::HomebrewFormula::Stable,
+            "0.49.0",
+            "0.49.1",
+            fail("Error: Failed to download https://github.com/vfarcic/homebrew-tap"),
+        );
+        let outcome = outcome.unwrap();
+        assert!(!outcome.upgraded(), "{outcome:?}");
+        assert_eq!(
+            ran[..2],
+            [
+                "/opt/homebrew/bin/brew update",
+                "/opt/homebrew/bin/brew upgrade dot-agent-deck"
+            ]
+        );
+        assert_eq!(
+            outcome.lines(),
+            [
+                "`brew upgrade dot-agent-deck` finished, but dot-agent-deck still reports v0.49.0, not v0.49.1. Homebrew's copy of the tap may predate v0.49.1, and refreshing it failed: Error: Failed to download https://github.com/vfarcic/homebrew-tap. Refresh it, then upgrade again:",
+                "  brew update && brew upgrade dot-agent-deck",
             ]
         );
     }

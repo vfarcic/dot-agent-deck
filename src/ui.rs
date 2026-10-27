@@ -6705,9 +6705,8 @@ fn open_upgrade_dialog(ui: &mut UiState) {
     let message = match (check, badge) {
         (Some(check), Some(badge)) if badge.offers_upgrade => {
             let mut dialog = crate::upgrade_dialog::UpgradeDialog::new(check.plans.clone());
-            if let Some(installed) = installed {
-                // The first plan is always this TUI's own copy.
-                dialog = dialog.with_installed(0, installed);
+            if let (Some(installed), Some(tui)) = (installed, check.this_tui()) {
+                dialog = dialog.with_installed(tui, installed);
             }
             ui.upgrade_dialog = Some(dialog);
             ui.mode = UiMode::Upgrade;
@@ -6715,9 +6714,8 @@ fn open_upgrade_dialog(ui: &mut UiState) {
         }
         (_, Some(restart)) => restart.text.trim().to_string(),
         (Some(check), None) => check
-            .plans
-            .first()
-            .map_or_else(String::new, |plan| plan.headline()),
+            .this_tui()
+            .map_or_else(String::new, |tui| check.plans[tui].headline()),
         (None, None) => "No newer release has been found.".to_string(),
     };
     // A version from the release check reaches the bar, so it is filtered as
@@ -6782,8 +6780,8 @@ fn sync_upgrade_state(ui: &mut UiState, snapshot: &AppState, state: &SharedState
 /// is this TUI's own copy.
 fn upgrade_job(ui: &UiState, index: usize) -> Option<(crate::self_upgrade::UpgradePlan, bool)> {
     let plan = ui.upgrade_dialog.as_ref()?.plans().get(index)?.clone();
-    // The first plan is always this TUI's own copy (`upgrade_dialog::check`).
-    Some((plan, index == 0))
+    let this_tui = crate::upgrade_dialog::is_this_tui(&plan);
+    Some((plan, this_tui))
 }
 
 /// Issue #1635: hand a finished upgrade's result to its dialog, and start the
