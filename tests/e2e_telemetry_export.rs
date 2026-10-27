@@ -552,7 +552,10 @@ fn private_content_stays_out_of_exports(protocol: &str) {
         &agent,
         &private_cwd,
         format!(
-            "/bin/sh -c 'env > telemetry-private.env; while :; do cat private.txt; sleep 0.1; done' standin {COMMAND_SECRET}"
+            // Written aside and renamed into place, so the read below never
+            // sees `env` half-written (a run read the secret's line but not
+            // `PWD`'s yet).
+            "/bin/sh -c 'env > telemetry-private.env.tmp && mv telemetry-private.env.tmp telemetry-private.env; while :; do cat private.txt; sleep 0.1; done' standin {COMMAND_SECRET}"
         ),
     );
     common::wait_for_file_contains(&private_cwd.join("telemetry-private.env"), ENV_SECRET);

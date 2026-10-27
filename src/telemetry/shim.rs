@@ -313,8 +313,16 @@ fn resolve(name: &str, path: Option<&OsStr>, dir: &Path) -> Option<PathBuf> {
         .find(|candidate| {
             std::fs::canonicalize(candidate).is_ok_and(|c| c.parent() != Some(shim.as_path()))
                 && is_executable_file(candidate)
-                && !head(candidate).is_some_and(|h| is_shim_script(&h))
+                && !is_shim_file(candidate)
         })
+}
+
+/// Whether the file at `path` reads as a shim script ([`is_shim_script`]),
+/// whichever deck and directory it names. A test that resolves the real agent
+/// from a `PATH` a deck put its shim directory on asks this too, or it runs
+/// the shim as the agent.
+pub fn is_shim_file(path: &Path) -> bool {
+    head(path).is_some_and(|h| is_shim_script(&h))
 }
 
 /// The first [`HEAD_LEN`] bytes of the file at `path`, or `None` when it
