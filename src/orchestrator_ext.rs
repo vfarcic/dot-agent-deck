@@ -1800,8 +1800,9 @@ mod tests {
 
     /// Issue #1949: the extension's `typebox` must be the copy Pi loads, so
     /// its typecheck and tests run against Pi's runtime `typebox`. Checks that
-    /// `@earendil-works/pi-coding-agent` still depends on `typebox`, and that
-    /// every `typebox` in `package_lock` is the version `package_json` pins.
+    /// every `typebox` in `package_lock` is the version `package_json` pins,
+    /// and that `@earendil-works/pi-coding-agent` declares exactly that
+    /// version rather than a range.
     /// renovate.json disables independent `typebox` updates in pi-extension,
     /// so this is what makes a `pi-coding-agent` bump carry ours along.
     fn typebox_lockstep(
@@ -1815,17 +1816,16 @@ mod tests {
         let packages = package_lock["packages"]
             .as_object()
             .ok_or("pi-extension/package-lock.json has no `packages` map")?;
-        if packages
+        let Some(declared) = packages
             .get(PI)
             .and_then(|pi| pi["dependencies"].get("typebox"))
-            .is_none()
-        {
+        else {
             return Err(format!(
                 "`{PI}` in package-lock.json no longer depends on `typebox`, so there is \
                  no Pi version to keep the extension's `typebox` in step with: revisit \
                  the pin and renovate.json's typebox rule"
             ));
-        }
+        };
         let copies: Vec<(&String, &str)> = packages
             .iter()
             .filter(|(path, _)| path.ends_with("node_modules/typebox"))
@@ -1848,6 +1848,15 @@ mod tests {
                 drifted.join(", ")
             ));
         }
+        // A range here would let another install of the same Pi release
+        // resolve a `typebox` this lockfile never saw.
+        if declared.as_str() != Some(pin) {
+            return Err(format!(
+                "`{PI}` declares `typebox` {declared}, but pi-extension/package.json \
+                 pins {pin}: the pin must be exactly the version Pi declares, and a \
+                 range there means there is no single version to pin against"
+            ));
+        }
         Ok(())
     }
 
@@ -1864,7 +1873,7 @@ mod tests {
         }
     }
 
-    /// Scenario: Feeds the typebox lockstep check synthetic package.json and lockfile pairs: one copy at the pinned version passes, while a pin bumped alone (#1942's shape), a Pi bump that left ours behind, a range instead of an exact pin, and a Pi that no longer depends on `typebox` each fail.
+    /// Scenario: Feeds the typebox lockstep check synthetic package.json and lockfile pairs: one copy at the pinned version passes, while a pin bumped alone (#1942's shape), a Pi bump that left ours behind, a range instead of an exact pin, a Pi that declares a range, and a Pi that no longer depends on `typebox` each fail.
     #[test]
     fn typebox_lockstep_refuses_a_copy_pi_does_not_load() {
         use serde_json::json;
@@ -1908,6 +1917,10 @@ mod tests {
         assert!(typebox_lockstep(&package("1.3.27"), &pi_moved).is_err());
 
         assert!(typebox_lockstep(&package("^1.3.27"), &one_copy).is_err());
+
+        let pi_ranged = lock(Some("^1.3.27"), &[("node_modules/typebox", "1.3.27")]);
+        let err = typebox_lockstep(&package("1.3.27"), &pi_ranged).unwrap_err();
+        assert!(err.contains("declares `typebox` \"^1.3.27\""), "{err}");
 
         let pi_dropped = lock(None, &[("node_modules/typebox", "1.3.27")]);
         let err = typebox_lockstep(&package("1.3.27"), &pi_dropped).unwrap_err();
