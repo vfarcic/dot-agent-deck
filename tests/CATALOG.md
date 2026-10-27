@@ -13152,6 +13152,30 @@ PRD #1666 part 3, round 5: where the deck keeps a worker's report, or a dispatch
 - **Does not assert:** a host crash, whose effect on unsynced data and links is the filesystem's.
 - **Platform coverage:** mac+linux.
 
+##### inbox/probe/012 — Disabled editor-helper installation preserves the spawn's editor environment and positional arguments.
+
+- **Layer:** L2 lane 1 (`tests/e2e_editor_installation.rs`).
+- **Agent:** Python stand-ins named Claude, Codex, OpenCode, Pi and wrapper; no real agent or credential.
+- **Asserts:** without an assumption, unset, exported-empty and nonempty VISUAL/EDITOR reach each stand-in unchanged, no CLAUDE_ENV_FILE is injected, and the complete argv equals the fixture's original executable and three positional arguments.
+- **Does not assert:** a separate production-feature build with the assumption set or absence of every instance artifact. Those broader plan controls remain owed; shell exclusion is covered by `033`.
+- **Platform coverage:** Linux.
+
+##### inbox/probe/033 — Editor installation occurs before a measured or unmeasured startup header.
+
+- **Layer:** L2 lane 1 (`tests/e2e_editor_installation.rs`).
+- **Agent:** Python Claude/Codex stand-ins, declared launcher and undeclared wrapper, no real agent.
+- **Asserts:** the real assumption environment reader enables a private owner-read/execute helper at spawn for each command class and all three original editor states; an unmeasured post-spawn release still gets installation; Claude-style installs have a tool environment file; Codex supplies set overrides only for exported values and never an exclude override. A shell that execs the fixture is excluded, and malformed, duplicate, unknown and metadata-suffixed assumption lists report refusal before serving an attach endpoint.
+- **Does not assert:** permission projection, generation identity publication, or the later helper's dispatch and editor behavior.
+- **Platform coverage:** Linux.
+
+##### inbox/probe/034 — Claude-style Bash tools recover the original editor state and then source the user's preset.
+
+- **Layer:** L2 lane 1 (`tests/e2e_editor_installation.rs`).
+- **Agent:** the Claude Python stand-in's explicit Bash-tool fixture; no real agent.
+- **Asserts:** installed environment files restore unset, exported-empty and nonempty VISUAL/EDITOR in a child tool; a preset with spaces, an apostrophe and a semicolon in its path runs after restoration and can override or unset those variables. A real git commit from the synthetic Bash tool opens the user's sentinel editor exactly once with no probe arm.
+- **Does not assert:** Codex's tool policy, real Claude's sourcing behavior, helper dispatch, or a nested agent.
+- **Platform coverage:** Linux.
+
 ## Desktop native driver scenarios
 
 These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner, and run in CI's advisory `desktop-driver` job. `docs/develop/desktop-gui.md` ("The driver tier") describes the harness.
