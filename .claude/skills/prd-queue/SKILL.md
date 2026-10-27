@@ -466,6 +466,14 @@ GATES — CLAUDE.md is the authority, this is the summary:
   rather than reproducing it. Say this explicitly in the unit, because an agent
   reading an older PRD will otherwise run the full tier for tens of minutes on
   its own initiative.
+- When `DAD_REMOTE_EXEC=rwx` is set in your environment
+  (docs/develop/rwx.md): the helper already runs its cargo commands in an RWX
+  sandbox, and any OTHER heavy cargo command you run (a filtered nextest or
+  `cargo test-e2e` run, a build) goes through `rwx sandbox exec -- <command>`,
+  then `rwx sandbox stop`, so the compile leaves this shared machine.
+  `cargo test-e2e-live`, anything else that reaches a real agent, and
+  `cargo mutants` (the sandbox does not have it; do not raise its `--jobs`)
+  stay local.
 - The full matrix can also run on GitHub's runners, and it RELIEVES NOTHING
   above. ci.yml carries a bare `workflow_dispatch:`, so after a push
   `gh workflow run ci.yml --ref <branch>` runs it there (take the run id from
