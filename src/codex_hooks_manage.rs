@@ -2489,6 +2489,25 @@ pub fn refresh_install() -> crate::hooks_refresh::InstallAttempt {
     }))
 }
 
+/// [`refresh_install`] for the TUI's startup note (PRD #91): what the
+/// `hooks.json` install wrote or could not write, with the trust write left
+/// on its own thread as [`auto_install_and_trust_at_startup`] leaves it, so
+/// the TUI does not wait for it before it draws (issue #1665). A trust write
+/// that fails is in the log, and `hooks refresh` reports it.
+pub fn startup_install() -> crate::hooks_refresh::InstallAttempt {
+    let attempt = install_at_startup();
+    if let Some(Err(e)) = &attempt {
+        tracing::warn!("auto-install: {e}");
+    }
+    crate::hooks_refresh::InstallAttempt::of(attempt.map(|installed| {
+        installed.map(|install| {
+            let pins = install.pins.clone();
+            install.trust_in_background();
+            pins
+        })
+    }))
+}
+
 /// What [`install_at_startup`] installed: the pins, and what its trust write
 /// needs, captured on the caller's thread.
 #[derive(Clone)]
@@ -2752,7 +2771,8 @@ mod tests {
     }
 
     /// PRD #91 (Greptile on PR #1925): a trust write that changes
-    /// `config.toml` is a change the TUI's startup note counts; the same
+    /// `config.toml` counts as a change inside a counting scope, as the TUI's
+    /// startup install runs it when no thread can be started for it; the same
     /// record written again is not.
     #[test]
     fn a_trust_write_counts_as_a_change_only_when_it_writes() {

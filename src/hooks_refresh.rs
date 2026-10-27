@@ -127,6 +127,8 @@ pub struct StartupNote {
 /// Runs each agent's [`refresh_install`](crate::agent_registry::AgentSpec::refresh_install),
 /// which is its startup install reporting what it could not do, so a settings
 /// file the install refused to overwrite is named rather than only logged.
+/// Codex's is [`crate::codex_hooks_manage::startup_install`] instead, which
+/// does not wait for its trust write.
 pub fn startup_install() -> Option<StartupNote> {
     use crate::agent_registry::ALL;
     let mut changed = Vec::new();
@@ -134,6 +136,12 @@ pub fn startup_install() -> Option<StartupNote> {
     for spec in ALL {
         let (attempt, wrote) = crate::agent_hook_config::noting_auto_install_changes(|| {
             match (spec.refresh_install, spec.startup_auto_install) {
+                // Codex's trust write stays on its own thread, as at every
+                // other startup (issue #1665): the TUI draws without waiting
+                // for it, and a failed one is logged rather than noted.
+                (Some(_), _) if spec.agent_type == AgentType::Codex => {
+                    crate::codex_hooks_manage::startup_install()
+                }
                 (Some(install), _) => install(),
                 (None, Some(install)) => {
                     install();

@@ -2734,8 +2734,9 @@ async fn run_tui_session() -> ExitCode {
     // Install hooks/plugins for detected agents (best-effort), driven from the
     // agent registry: each spec's OWN startup install, in `ALL` order (PRD #20
     // M2 / R20-010), so a future agent reusing `NativeHooks`/`Plugin` runs its
-    // own installer. Codex records its scoped, hash-pinned trust here too (PRD
-    // #20 §4.2.1); Pi materializes at spawn time and has no startup install.
+    // own installer. Codex starts its scoped, hash-pinned trust write here too
+    // (PRD #20 §4.2.1), on a thread of its own that this does not wait for
+    // (issue #1665); Pi materializes at spawn time and has no startup install.
     //
     // PRD #91: BEFORE the daemon is bootstrapped, because a lazy-spawned
     // daemon runs the same installs before it binds and would leave nothing
