@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use dot_agent_deck::keybindings::{Action as KbAction, KeybindingConfig};
 use dot_agent_deck::self_upgrade::detect::Tools;
+use dot_agent_deck::self_upgrade::discover;
 use dot_agent_deck::self_upgrade::plan::MAX_SHOWN_PATH_CHARS;
 use dot_agent_deck::self_upgrade::{
     CopyKind, HomebrewFormula, InstallMethod, Installation, Outcome, PlanOptions, Platform,
@@ -208,18 +209,24 @@ fn skipped() -> Provenance {
     }
 }
 
-/// Scenario: Open the upgrade dialog on two plans the core made — this TUI's CLI, downloaded into a folder the user can write, and the desktop app installed from its `.deb` — and draw it. The dialog must show both plans in the core's own words, with the CLI's saying that upgrading leaves the running daemon alone, ask about the CLI first, and have Cancel selected so that Enter alone changes nothing.
+/// Scenario: Open the upgrade dialog on two plans the core made, in the order every client offers them — the desktop app installed from its `.deb`, then this TUI's CLI, downloaded into a folder the user can write — and draw it. The dialog must show both plans in the core's own words, with the CLI's saying that upgrading leaves the running daemon alone, ask about the app first (issue #1959), and have Cancel selected so that Enter alone changes nothing.
 #[spec("upgrade/upgrade-dialog/001")]
 #[test]
 fn upgrade_dialog_001_in_place_plan_with_other_copy_defaults_to_cancel() {
     let cli = writable_cli();
     let desktop = deb_desktop();
-    let mut dialog = UpgradeDialog::new(vec![cli.clone(), desktop.clone()]);
+    let plans: Vec<UpgradePlan> =
+        discover::app_first(&cli.installation, Some(&desktop.installation))
+            .into_iter()
+            .map(plan_for)
+            .collect();
+    assert_eq!(plans, [desktop.clone(), cli.clone()], "the app comes first");
+    let mut dialog = UpgradeDialog::new(plans);
 
     assert_eq!(
         dialog.phase(),
         Phase::Confirm(0),
-        "the TUI's own copy is asked about first"
+        "the desktop app is asked about first"
     );
     assert_eq!(
         dialog.selected(),
@@ -251,12 +258,12 @@ fn upgrade_dialog_001_in_place_plan_with_other_copy_defaults_to_cancel() {
         flat.contains("Build provenance will NOT be checked"),
         "the plan must say before confirming that provenance is not checked\n{text}"
     );
-    let question = cli
+    let question = desktop
         .confirm_question()
-        .expect("an in-place plan is actionable");
+        .expect("a `.deb` plan is actionable");
     assert_eq!(
         question,
-        format!("Upgrade dot-agent-deck CLI to v{LATEST}?")
+        format!("Upgrade Agent Deck (desktop app) to v{LATEST}?")
     );
     assert!(flat.contains(&question), "{text}");
     assert!(
@@ -265,7 +272,7 @@ fn upgrade_dialog_001_in_place_plan_with_other_copy_defaults_to_cancel() {
     );
     assert!(text.contains("  Upgrade"), "{text}");
     assert!(
-        !flat.contains("Upgrade Agent Deck (desktop app) to"),
+        !flat.contains("Upgrade dot-agent-deck CLI to"),
         "one copy is asked about at a time\n{text}"
     );
     insta::assert_snapshot!(text);

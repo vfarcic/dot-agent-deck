@@ -101,6 +101,21 @@ describe("Upgrade on the Local daemon section while the app is behind (issue #19
     await waitFor(() => expect(deck.upgradeDaemon).toHaveBeenCalledWith("local", expect.any(Function)));
   });
 
+  /** Scenario: The app is behind but cannot be upgraded from here (an app folder you cannot write), and the daemon is older: the Local daemon section's dialog covers the CLI alone, as when the app is current, and says the daemon restart follows. */
+  it("local_upgrade_015 an app this app cannot upgrade leaves the CLI and the daemon as before", async () => {
+    const manual: SelfUpgradePlan = { ...appPlan, action: "manual-download", actionable: false, confirmQuestion: null };
+    const api = { check: vi.fn(), run: vi.fn(async () => brewed), relaunch: vi.fn() };
+    const deck = runtime();
+    render(<LocalUpgradeFlow daemon={daemon} cli={{ check: { ...check, app: manual }, api }} runtime={deck} onClose={vi.fn()} />);
+    expect(screen.queryByTestId("self-upgrade-plan-app")).not.toBeInTheDocument();
+    expect(screen.getByTestId("self-upgrade-then")).toHaveTextContent("After the CLI, Agent Deck restarts the daemon on this machine");
+    fireEvent.click(screen.getByTestId("self-upgrade-start"));
+    expect(api.run).toHaveBeenCalledWith("cli", 4);
+    await screen.findByTestId("self-upgrade-result-cli");
+    fireEvent.click(screen.getByTestId("self-upgrade-close"));
+    await waitFor(() => expect(deck.upgradeDaemon).toHaveBeenCalledWith("local", expect.any(Function)));
+  });
+
   /** Scenario: The app was upgraded earlier and waits for a relaunch, and the CLI is behind: the dialog shows the app's result with Relaunch first, offers the CLI, and still leaves the daemon to the relaunched app. */
   it("local_upgrade_014 an app waiting for a relaunch still comes first", async () => {
     const waiting: SelfUpgradeCheck = { ...check, updateAvailable: false, installed: swapped };

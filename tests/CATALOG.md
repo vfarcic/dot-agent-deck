@@ -6373,11 +6373,11 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 
 #### upgrade/upgrade-dialog
 
-##### upgrade/upgrade-dialog/001 — The TUI's upgrade dialog shows both copies' plans in the core's words and asks about this TUI's copy first, defaulting to Cancel.
-- **Layer:** L1 (`upgrade_dialog::UpgradeDialog` + ratatui `TestBackend` + `insta`), plans built by `self_upgrade::plan::plan` from faked installs.
+##### upgrade/upgrade-dialog/001 — The TUI's upgrade dialog shows both copies' plans in the core's words and asks about the desktop app first, defaulting to Cancel.
+- **Layer:** L1 (`upgrade_dialog::UpgradeDialog` + ratatui `TestBackend` + `insta`), plans built by `self_upgrade::plan::plan` from faked installs and ordered by `self_upgrade::discover::app_first`, the order `upgrade_dialog::check` and `dot-agent-deck upgrade` use (issue #1959).
 - **Agent:** none.
-- **Asserts:** every line of the in-place CLI plan and of the desktop `.deb` plan appears; the CLI's section says upgrading does not restart the daemon on this machine and what the TUI's next start does, and the app's has no such line (issue #1753); the provenance line says it will NOT be checked; the question is `Upgrade dot-agent-deck CLI to v<new>?` with `> Cancel` selected; the desktop app is not asked about yet.
-- **Does not assert:** the spawned binary's badge and key (`upgrade/tui-upgrade/001`), executing an upgrade.
+- **Asserts:** the app's plan comes before the CLI's; every line of the in-place CLI plan and of the desktop `.deb` plan appears; the CLI's section says upgrading does not restart the daemon on this machine and what the TUI's next start does, and the app's has no such line (issue #1753); the provenance line says it will NOT be checked; the question is `Upgrade Agent Deck (desktop app) to v<new>?` with `> Cancel` selected; the CLI is not asked about yet.
+- **Does not assert:** the spawned binary's badge and key (`upgrade/tui-upgrade/001`), `upgrade_dialog::check` itself (it reads this machine; `upgrade_dialog::tests::the_app_comes_first_and_this_tui_is_found_by_its_copy` covers the badge and this TUI's copy found by kind), executing an upgrade.
 - **Platform coverage:** mac+linux+windows.
 
 ##### upgrade/upgrade-dialog/002 — A Nix copy is notify-only: the dialog offers only Close and never starts an upgrade.

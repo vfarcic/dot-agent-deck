@@ -26,9 +26,14 @@ export function restartAfterCli(daemon: UpgradeTarget): string {
 /** What the dialog says when the app itself is behind too, or was upgraded and waits for a relaunch (issue #1959). */
 export const APP_BEFORE_CLI = "Agent Deck itself is behind too, so it comes first, then the CLI, to keep the app, the CLI and the daemon on one release. Once Agent Deck is upgraded, relaunch it: it then restarts an older daemon here, asking first if agents run.";
 
-/** Whether the Local daemon section's Upgrade leads with the app: it is behind, or installed and waiting for a relaunch. */
+/**
+ * Whether the Local daemon section's Upgrade leads with the app: it is behind
+ * and this app can upgrade it, or it is installed and waiting for a relaunch.
+ * An app it cannot upgrade (a folder you cannot write, an unsigned app) is
+ * left to the banner's dialog, which says what to do instead.
+ */
 export function appFirst(check: SelfUpgradeCheck): boolean {
-  return check.updateAvailable || check.installed !== null;
+  return check.installed !== null || (check.updateAvailable && check.app.actionable);
 }
 
 /**

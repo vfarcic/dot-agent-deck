@@ -870,14 +870,19 @@ pub(crate) fn run_checked(
     if output.success {
         Ok(output)
     } else {
-        let detail = match output.stderr.trim() {
-            "" => match output.code {
-                Some(code) => format!("exit {code}"),
-                None => "killed by a signal".to_string(),
-            },
-            stderr => stderr.to_string(),
-        };
+        let detail = failure_detail(&output);
         Err(UpgradeError::CommandFailed { command, detail })
+    }
+}
+
+/// How a command that exited unsuccessfully failed: its stderr, or its exit.
+pub(crate) fn failure_detail(output: &CommandOutput) -> String {
+    match output.stderr.trim() {
+        "" => match output.code {
+            Some(code) => format!("exit {code}"),
+            None => "killed by a signal".to_string(),
+        },
+        stderr => stderr.to_string(),
     }
 }
 

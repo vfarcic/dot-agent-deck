@@ -1100,6 +1100,7 @@ mod tests {
             },
         );
         let behind = Outcome::BrewNotUpgraded {
+            brew: "/opt/homebrew/bin/brew".into(),
             formula: "dot-agent-deck",
             reported: Some("0.46.0".into()),
             offered: "0.47.0".into(),
