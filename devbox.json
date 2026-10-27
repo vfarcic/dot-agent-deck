@@ -37,8 +37,8 @@
       "export PATH=\"$HOME/.local/bin:$PATH\"",
       "[ -n \"$DAD_DEV_BIN\" ] && export PATH=\"$DAD_DEV_BIN:$PATH\" || true",
       "[ -n \"$USE_VALS\" ] && [ -z \"$GOOGLE_APPLICATION_CREDENTIALS\" ] && [ -f \"$HOME/.config/gcloud/dot-agent-deck-secrets.json\" ] && export GOOGLE_APPLICATION_CREDENTIALS=\"$HOME/.config/gcloud/dot-agent-deck-secrets.json\" || true",
-      "[ -n \"$USE_VALS\" ] && eval \"$(vals env -export -f .env.vals.yaml)\" || true",
-      "[ -n \"$HONEYCOMB_INGEST_KEY\" ] && [ -z \"$OTEL_EXPORTER_OTLP_HEADERS\" ] && export OTEL_EXPORTER_OTLP_HEADERS=\"x-honeycomb-team=$HONEYCOMB_INGEST_KEY\" || true",
+      "[ -n \"$USE_VALS\" ] && { _dad_otel_endpoint=\"$OTEL_EXPORTER_OTLP_ENDPOINT\"; eval \"$(vals env -export -f .env.vals.yaml)\"; [ -n \"$_dad_otel_endpoint\" ] && export OTEL_EXPORTER_OTLP_ENDPOINT=\"$_dad_otel_endpoint\"; unset _dad_otel_endpoint; } || true",
+      "[ -n \"$HONEYCOMB_INGEST_KEY\" ] && case \"$OTEL_EXPORTER_OTLP_ENDPOINT\" in https://api.honeycomb.io|https://api.honeycomb.io/*|https://api.eu1.honeycomb.io|https://api.eu1.honeycomb.io/*) [ -z \"$OTEL_EXPORTER_OTLP_HEADERS\" ] && export OTEL_EXPORTER_OTLP_HEADERS=\"x-honeycomb-team=$HONEYCOMB_INGEST_KEY\" ;; *) [ \"$OTEL_EXPORTER_OTLP_HEADERS\" = \"x-honeycomb-team=$HONEYCOMB_INGEST_KEY\" ] && unset OTEL_EXPORTER_OTLP_HEADERS ;; esac || true",
       "[ -f .env ] && source .env || true"
     ],
     "scripts": {
