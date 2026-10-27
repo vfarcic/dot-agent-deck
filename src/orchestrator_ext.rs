@@ -1077,14 +1077,30 @@ mod tests {
 
     /// The relative module specifiers (`./x`, `../x`) a source imports, in
     /// the forms the extension can use: `from "…"` (imports and re-exports),
-    /// a bare `import "…"`, and `import("…")` / `require("…")`. A specifier
-    /// in a comment counts too, which errs towards demanding a file.
+    /// a bare `import "…"`, and `import("…")` / `require("…")`, with any
+    /// whitespace around the `(` and any of the three quote kinds. A specifier
+    /// in a comment counts too, which errs towards demanding a file, and so
+    /// does an interpolated template, whose `${…}` names no embedded file.
     fn relative_imports(source: &str) -> Vec<String> {
         let mut found = Vec::new();
-        for lead in ["from ", "import ", "import(", "require("] {
-            for (at, _) in source.match_indices(lead) {
-                let rest = &source[at + lead.len()..];
-                let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+        for keyword in ["from", "import", "require"] {
+            for (at, _) in source.match_indices(keyword) {
+                let inside_a_word = source[..at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$' || c == '.');
+                if inside_a_word {
+                    continue;
+                }
+                let mut rest = source[at + keyword.len()..].trim_start();
+                if let Some(call) = rest.strip_prefix('(') {
+                    rest = call.trim_start();
+                }
+                let Some(quote) = rest
+                    .chars()
+                    .next()
+                    .filter(|c| matches!(c, '"' | '\'' | '`'))
+                else {
                     continue;
                 };
                 let Some(end) = rest[1..].find(quote) else {
@@ -1161,6 +1177,13 @@ mod tests {
             import "./side-effect.js";
             const c = await import("./dynamic.ts");
             const d = require("../up.js");
+            import { e } from  "./spaced.ts";
+            const f = await import ( `./templated.ts` );
+            const g = require(
+                "./wrapped.js"
+            );
+            const h = Array.from("./not-an-import");
+            const reimport = "./not-a-keyword";
         "#;
         assert_eq!(
             relative_imports(source),
@@ -1168,9 +1191,12 @@ mod tests {
                 "./multi.ts",
                 "./typed.ts",
                 "./reexport.ts",
+                "./spaced.ts",
                 "./side-effect.js",
                 "./dynamic.ts",
-                "../up.js"
+                "./templated.ts",
+                "../up.js",
+                "./wrapped.js"
             ]
         );
     }
