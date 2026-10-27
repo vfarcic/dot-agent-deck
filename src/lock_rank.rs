@@ -1,6 +1,6 @@
 //! PRD #1666 part 3, round 5 (plan D6): the daemon's ranked runtime locks.
 //!
-//! Five `std::sync::Mutex`es are taken in a fixed order, outermost first:
+//! These `std::sync::Mutex`es are taken in a fixed order, outermost first:
 //!
 //! | rank | lock |
 //! | --- | --- |
@@ -9,6 +9,7 @@
 //! | [`R3`] | the inbox hub's state |
 //! | [`R4`] | the registry's record table (`inner`) |
 //! | [`R5`] | the retained-report store |
+//! | [`R6`] | a generation's input epoch (PRD #1666 part 3, Q35-06), with no ranked lock taken under it |
 //! | [`LEAF`] | the registry's dispatched units, taken with none of the above held |
 //!
 //! A thread holding rank *n* may take only a rank above *n*. `AppState`'s
@@ -73,6 +74,10 @@ pub const R3: u8 = 3;
 pub const R4: u8 = 4;
 /// The retained-report store.
 pub const R5: u8 = 5;
+/// A generation's input epoch (`crate::composer_probe::epoch`): it may be
+/// taken while any of [`R1`]–[`R5`] is held, and no ranked lock may be taken
+/// under it.
+pub const R6: u8 = 6;
 /// The registry's dispatched units: taken with no other ranked lock held, and
 /// nothing ranked is taken under it.
 pub const LEAF: u8 = u8::MAX;

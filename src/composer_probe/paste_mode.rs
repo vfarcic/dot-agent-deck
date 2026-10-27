@@ -5,10 +5,14 @@
 //! [`OutputHook::on_output`] is handed every byte a generation writes, under
 //! the output lock and before the bytes are published to any reader (C1's
 //! I-2 and the output half of I-3); its one call site is
-//! `AgentBus::push_timed`. Today it feeds only [`PasteModeTracker`], and
-//! nothing reads the tracker yet: the hook changes no byte that is published,
-//! kept or replayed, and no decision. It is not free: it is one more pass
-//! over the bytes while the output lock is held, before they are published.
+//! `AgentBus::push_timed`. It feeds [`PasteModeTracker`] and, from the same
+//! pass over the bytes, hands the generation's input epoch the queries,
+//! `?2026h` and report modes it saw (Q35-06, `super::epoch::OutputNote`),
+//! taking the epoch's lock once for a push that has any. No decision reads
+//! the tracker or those notes yet: the hook changes no byte that is
+//! published, kept or replayed, and no decision. It is not free: it is one
+//! more pass over the bytes while the output lock is held, before they are
+//! published.
 //!
 //! The tracker is separate from the ring's `ReplayModes` on purpose (plan PA
 //! U3-01): it reads the output through [`Framing::output`], which reads
@@ -38,7 +42,11 @@
 //!
 //! [`MAX_SEQUENCE_BYTES`]: super::framing::MAX_SEQUENCE_BYTES
 
-use super::framing::{Csi, Event, Framing};
+use std::sync::Arc;
+use std::time::Instant;
+
+use super::epoch::{GenerationInput, OutputNote, output_notes};
+use super::framing::{Csi, Event, Framing, Token};
 
 /// DEC private mode 2004: bracketed paste.
 const BRACKETED_PASTE: u32 = 2004;
@@ -50,12 +58,26 @@ const VTE_MAX_PARAMS: usize = 32;
 #[derive(Debug, Clone, Default)]
 pub struct OutputHook {
     paste_mode: PasteModeTracker,
+    input: Arc<GenerationInput>,
 }
 
 impl OutputHook {
+    /// A hook that notes what it reads into `input`, the generation's epoch.
+    pub fn new(input: Arc<GenerationInput>) -> Self {
+        Self {
+            paste_mode: PasteModeTracker::default(),
+            input,
+        }
+    }
+
     /// Read the next bytes the agent wrote.
     pub fn on_output(&mut self, bytes: &[u8]) {
-        self.paste_mode.feed(bytes);
+        let mut notes: Vec<OutputNote> = Vec::new();
+        self.paste_mode
+            .feed_observing(bytes, |token, modes| output_notes(token, modes, &mut notes));
+        if !notes.is_empty() {
+            self.input.on_output(&notes, Instant::now());
+        }
     }
 
     /// The agent's bracketed-paste mode, as far as its output says.
@@ -84,18 +106,35 @@ impl Default for PasteModeTracker {
 impl PasteModeTracker {
     /// Read the next bytes of the output, in order, however they were split.
     pub fn feed(&mut self, bytes: &[u8]) {
+        self.feed_observing(bytes, |_, _| {});
+    }
+
+    /// [`Self::feed`], handing `observe` every token and, for a `CSI ? … h`
+    /// or `l`, the whole parameter values `vte` keeps (empty otherwise).
+    pub(super) fn feed_observing(
+        &mut self,
+        bytes: &[u8],
+        mut observe: impl FnMut(&Token<'_>, &[u32]),
+    ) {
         let Self { framing, on } = self;
         for &byte in bytes {
-            framing.feed(byte, |token| match token.event {
-                Event::Csi(csi)
-                    if csi.private == Some(b'?')
-                        && matches!(csi.final_byte, b'h' | b'l')
-                        && names_bracketed_paste(&csi) =>
-                {
-                    *on = csi.final_byte == b'h';
+            framing.feed(byte, |token| {
+                let modes = match token.event {
+                    Event::Csi(csi)
+                        if csi.private == Some(b'?') && matches!(csi.final_byte, b'h' | b'l') =>
+                    {
+                        kept_modes(&csi)
+                    }
+                    _ => Vec::new(),
+                };
+                match token.event {
+                    Event::Csi(csi) if modes.contains(&BRACKETED_PASTE) => {
+                        *on = csi.final_byte == b'h';
+                    }
+                    Event::Escape(b'c') => *on = false,
+                    _ => {}
                 }
-                Event::Escape(b'c') => *on = false,
-                _ => {}
+                observe(&token, &modes);
             });
         }
     }
@@ -106,21 +145,25 @@ impl PasteModeTracker {
     }
 }
 
-/// Whether a parameter `vte` keeps is exactly 2004, with no sub-parameter.
-fn names_bracketed_paste(csi: &Csi<'_>) -> bool {
+/// The parameters `vte` keeps that are one whole value, with no
+/// sub-parameter, in order.
+fn kept_modes(csi: &Csi<'_>) -> Vec<u32> {
+    let mut modes = Vec::new();
     let mut kept = 0;
     for param in csi.params() {
         let room = VTE_MAX_PARAMS - kept;
         if room == 0 {
-            return false;
+            break;
         }
         let mut values = param.subparams().take(room);
         let first = values.next().flatten();
         let more = values.count();
-        if first == Some(BRACKETED_PASTE) && more == 0 {
-            return true;
+        if more == 0
+            && let Some(mode) = first
+        {
+            modes.push(mode);
         }
         kept += 1 + more;
     }
-    false
+    modes
 }

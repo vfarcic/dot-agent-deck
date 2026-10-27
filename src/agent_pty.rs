@@ -2018,6 +2018,10 @@ pub struct AgentBus {
     /// clear (`inbox/doorbell/034`).
     #[cfg(test)]
     between_resize_and_clear: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// PRD #1666 part 3 (Q35-06): the generation's input epoch, which the
+    /// output hook notes into and the generation's PTY writer moves. Kept
+    /// here, outside `state`, so taking it never takes the output lock.
+    input: Arc<crate::composer_probe::epoch::GenerationInput>,
 }
 
 /// What one [`AgentBus::push`] cost under the output lock (plan §9.1). Read
@@ -2061,7 +2065,8 @@ struct AgentBusState {
     /// read off its start-up header by a scanner fed every byte of the window.
     release: crate::release_scanner::ReleaseCapture,
     /// PRD #1666 part 3 (Q35-02): core's output hook, fed every byte under this
-    /// lock before it is published. Nothing reads it yet.
+    /// lock before it is published. Nothing reads it yet, nor the input
+    /// epoch it notes into (Q35-06).
     output_hook: crate::composer_probe::paste_mode::OutputHook,
 }
 
@@ -2115,6 +2120,12 @@ impl AgentBus {
         cols: u16,
     ) -> Self {
         let (tx, _rx0) = broadcast::channel(BROADCAST_CAPACITY);
+        let input = Arc::new(crate::composer_probe::epoch::GenerationInput::new(
+            profile.map_or(
+                crate::composer_probe::query_ledger::CprWaitEnd::Counted,
+                |p| p.cpr_wait_end,
+            ),
+        ));
         Self {
             tx,
             state: Mutex::new(AgentBusState {
@@ -2123,12 +2134,19 @@ impl AgentBus {
                 ring_start_modes: ReplayModes::default(),
                 evidence: crate::evidence_state::EvidenceState::new(profile, rows, cols),
                 release: crate::release_scanner::ReleaseCapture::start(rows, cols),
-                output_hook: Default::default(),
+                output_hook: crate::composer_probe::paste_mode::OutputHook::new(Arc::clone(&input)),
             }),
             label: String::new(),
             #[cfg(test)]
             between_resize_and_clear: Mutex::new(None),
+            input,
         }
+    }
+
+    /// PRD #1666 part 3 (Q35-06): the generation's input epoch, for its PTY
+    /// writer.
+    fn input(&self) -> &Arc<crate::composer_probe::epoch::GenerationInput> {
+        &self.input
     }
 
     /// [`Self::profiled`] with no release scanner: what the budget
@@ -4565,6 +4583,7 @@ impl PaneWriter {
         state: Arc<Mutex<PaneInputState>>,
         retired: Arc<AtomicBool>,
         doorbell: Option<Arc<crate::doorbell_generation::GenerationDoorbell>>,
+        input: Arc<crate::composer_probe::epoch::GenerationInput>,
     ) -> Self {
         let pty = PtyWriterThread::spawn(
             inner,
@@ -4574,6 +4593,7 @@ impl PaneWriter {
                 retired: retired.clone(),
                 doorbell,
             },
+            input,
         );
         Self {
             pty,
@@ -4967,6 +4987,28 @@ struct PtyJob {
 }
 
 impl PtyOp {
+    /// PRD #1666 part 3 (Q35-06, I-1): who writes the job's bytes as the
+    /// input epoch reads it, and the bytes, or `None` for a job that carries
+    /// none. Exhaustive over both enums with no `_` arm, so a new op or byte
+    /// source has to say what it does to the epoch.
+    fn epoch_writer(&self) -> Option<(crate::composer_probe::epoch::Writer, &[u8])> {
+        use crate::composer_probe::epoch::Writer;
+        let writer = |source: ByteSource| match source {
+            ByteSource::Deck => Writer::UnnamedDeck,
+            ByteSource::User => Writer::Human,
+            ByteSource::Answer => Writer::Answer,
+        };
+        match self {
+            PtyOp::Write(buf, source) | PtyOp::WriteAll(buf, source, _) => {
+                Some((writer(*source), buf))
+            }
+            PtyOp::Answer(buf, _) => Some((writer(ByteSource::Answer), buf)),
+            PtyOp::Flush => None,
+            #[cfg(test)]
+            PtyOp::Surrender(_) => None,
+        }
+    }
+
     /// How many bytes the job hands the PTY.
     fn len(&self) -> usize {
         match self {
@@ -5068,11 +5110,18 @@ impl Drop for WithdrawUnlessAnswered<'_> {
 struct PtyWriterThread {
     jobs: std::sync::mpsc::Sender<PtyJob>,
     in_flight: Arc<PtyInFlight>,
+    /// PRD #1666 part 3 (Q35-06): the generation's input epoch, moved at the
+    /// enqueue below, before a job reaches the thread.
+    input: Arc<crate::composer_probe::epoch::GenerationInput>,
 }
 
 impl PtyWriterThread {
-    fn spawn(inner: Box<dyn std::io::Write + Send>, recorder: InputRecorder) -> Self {
-        Self::spawn_reporting_to(inner, recorder, Arc::default())
+    fn spawn(
+        inner: Box<dyn std::io::Write + Send>,
+        recorder: InputRecorder,
+        input: Arc<crate::composer_probe::epoch::GenerationInput>,
+    ) -> Self {
+        Self::spawn_reporting_to(inner, recorder, Arc::default(), input)
     }
 
     /// [`Self::spawn`], counting its jobs in `in_flight` — kept across a writer
@@ -5081,6 +5130,7 @@ impl PtyWriterThread {
         mut inner: Box<dyn std::io::Write + Send>,
         recorder: InputRecorder,
         in_flight: Arc<PtyInFlight>,
+        input: Arc<crate::composer_probe::epoch::GenerationInput>,
     ) -> Self {
         let (jobs, queue) = std::sync::mpsc::channel::<PtyJob>();
         let thread_in_flight = in_flight.clone();
@@ -5180,7 +5230,11 @@ impl PtyWriterThread {
                 }
             })
             .expect("spawn an agent's PTY writer thread");
-        Self { jobs, in_flight }
+        Self {
+            jobs,
+            in_flight,
+            input,
+        }
     }
 
     fn gone() -> std::io::Error {
@@ -5234,6 +5288,13 @@ impl PtyWriterThread {
             let handle = ticket
                 .as_ref()
                 .map(crate::ingress_ledger::JobTicket::handle);
+            // PRD #1666 part 3 (Q35-06): the epoch moves before the job is
+            // sent, so the thread can't start a job whose move isn't visible.
+            // Under the ledger's lock on the ticketed branch (ledger, then
+            // the epoch's leaf lock), alone on the other.
+            if let Some((writer, bytes)) = op.epoch_writer() {
+                self.input.enqueue(writer, bytes);
+            }
             let job = PtyJob {
                 op,
                 state: state.clone(),
@@ -6593,6 +6654,12 @@ mod replacement_tests;
 #[cfg(all(test, unix))]
 #[path = "agent_pty_report_tests.rs"]
 mod report_tests;
+
+/// PRD #1666 part 3 (Q35-06): the input epoch on the real writer, output hook
+/// and retirement paths.
+#[cfg(test)]
+#[path = "agent_pty_input_epoch_tests.rs"]
+mod input_epoch_tests;
 
 /// PRD #1666 part 3, round 5-wake (plan §1.1, §3.4′): the doorbell's ring on
 /// the real writer, and the re-projection publisher.
@@ -12273,6 +12340,9 @@ impl AgentPtyRegistry {
                     // PRD #1666 part 3, round 5-wake: the retired generation's
                     // ledger and doorbell cell.
                     agent.ingress.close();
+                    // PRD #1666 part 3 (Q35-06): and its input epoch's
+                    // structures.
+                    agent.bus.input().retire();
                     agent.doorbell.retire();
                     agent
                         .bus
@@ -12422,6 +12492,7 @@ impl AgentPtyRegistry {
             self.pane_input.clone(),
             pane_retired.clone(),
             Some(Arc::clone(&doorbell)),
+            Arc::clone(bus.input()),
         );
         let agent = RunningAgent {
             child,
@@ -12793,6 +12864,8 @@ impl AgentPtyRegistry {
             // PRD #1666 part 3, round 5-wake: the retired generation's ledger
             // and doorbell cell.
             agent.ingress.close();
+            // PRD #1666 part 3 (Q35-06): and its input epoch's structures.
+            agent.bus.input().retire();
             agent.doorbell.retire();
             agent
                 .bus
@@ -13107,6 +13180,8 @@ impl AgentPtyRegistry {
             // PRD #1666 part 3, round 5-wake: the retired generation's ledger
             // and doorbell cell.
             removed.ingress.close();
+            // PRD #1666 part 3 (Q35-06): and its input epoch's structures.
+            removed.bus.input().retire();
             removed.doorbell.retire();
             removed
                 .bus
@@ -15850,7 +15925,8 @@ impl AgentPtyRegistry {
             .expect("the displaced writer's thread is running");
         let (displaced, recorder) = rx.await.expect("the displaced writer comes back");
         let in_flight = guard.pty.in_flight.clone();
-        guard.pty = PtyWriterThread::spawn_reporting_to(inner, recorder, in_flight);
+        let input = guard.pty.input.clone();
+        guard.pty = PtyWriterThread::spawn_reporting_to(inner, recorder, in_flight, input);
         displaced
     }
 
@@ -15947,12 +16023,14 @@ impl AgentPtyRegistry {
         inner.next_id += 1;
         let id = format!("test-agent-{}", inner.next_id);
         let pane_retired = Arc::new(AtomicBool::new(false));
+        let bus = Arc::new(AgentBus::new());
         let pane_writer = PaneWriter::new(
             writer,
             None,
             self.pane_input.clone(),
             pane_retired.clone(),
             None,
+            Arc::clone(bus.input()),
         );
         inner.agents.insert(
             id.clone(),
@@ -15969,7 +16047,7 @@ impl AgentPtyRegistry {
                 master,
                 writer: Arc::new(AsyncMutex::new(pane_writer)),
                 pane_retired,
-                bus: Arc::new(AgentBus::new()),
+                bus,
                 child_role: ChildRole::PaneCommand,
                 child_started: None,
                 wrapper_child_exit: None,
@@ -27957,6 +28035,7 @@ mod spawn_tests {
                 retired: Arc::new(AtomicBool::new(false)),
                 doorbell: None,
             },
+            Arc::default(),
         ));
         let first = {
             let pty = pty.clone();
@@ -28147,6 +28226,7 @@ mod spawn_tests {
             Arc::new(Mutex::new(PaneInputState::default())),
             Arc::new(AtomicBool::new(false)),
             None,
+            Arc::default(),
         );
         (writer, open, entering, taken)
     }
@@ -28163,10 +28243,12 @@ mod spawn_tests {
         let human = std::thread::spawn({
             let pty_jobs = writer.pty.jobs.clone();
             let in_flight = Arc::clone(&writer.pty.in_flight);
+            let input = Arc::clone(&writer.pty.input);
             move || {
                 let thread = PtyWriterThread {
                     jobs: pty_jobs,
                     in_flight,
+                    input,
                 };
                 thread.run_blocking(PtyOp::WriteAll(b"human".to_vec(), ByteSource::User, true))
             }
@@ -28225,10 +28307,12 @@ mod spawn_tests {
         let human = std::thread::spawn({
             let pty_jobs = writer.pty.jobs.clone();
             let in_flight = Arc::clone(&writer.pty.in_flight);
+            let input = Arc::clone(&writer.pty.input);
             move || {
                 let thread = PtyWriterThread {
                     jobs: pty_jobs,
                     in_flight,
+                    input,
                 };
                 thread.run_blocking(PtyOp::WriteAll(b"human".to_vec(), ByteSource::User, true))
             }
@@ -28267,6 +28351,7 @@ mod spawn_tests {
             state.clone(),
             retired.clone(),
             None,
+            Arc::default(),
         );
         writer.write_all(b"typed").expect("write to sink");
         assert!(state.lock().unwrap().tracks_pane(PANE), "the control");

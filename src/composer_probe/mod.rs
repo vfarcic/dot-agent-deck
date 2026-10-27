@@ -8,16 +8,21 @@
 //! bracketed-paste tracker ([`paste_mode`]), the rule for trusting the
 //! file an agent exports ([`path_rule`]), the classifier of whose editor
 //! invocation it is ([`classifier`]), the arm page the daemon publishes
-//! to its editor helper ([`arm`]), and the permission to arm ([`permission`]).
-//! The daemon feeds the hook every byte an agent writes; nothing in it reads
-//! what the hook tracks yet, or calls the path rule, the classifier or the
-//! permission, or maps an arm page.
+//! to its editor helper ([`arm`]), the permission to arm ([`permission`]),
+//! and the input epoch with the query ledger, `B` and the native hazard FIFO
+//! kept beside it ([`epoch`], [`query_ledger`]). The daemon feeds the hook
+//! every byte an agent writes, and moves the epoch at the PTY writer's
+//! enqueue; nothing in it reads what the hook or the epoch tracks yet, or
+//! calls the path rule, the classifier or the permission, or maps an arm
+//! page.
 
 pub mod arm;
 pub mod classifier;
+pub mod epoch;
 pub mod framing;
 pub mod paste_mode;
 pub mod path_rule;
+pub mod query_ledger;
 
 use crate::doorbell_activation::{LatchedRelease, Measurement, ReleaseRecord};
 use crate::event::AgentType;

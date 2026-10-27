@@ -262,6 +262,10 @@ pub struct ScreenProfile {
     /// How the agent's input box edits, which the input model follows
     /// ([`crate::composer_model::Semantics`]).
     pub input: crate::composer_model::Semantics,
+    /// How the agent ends a wait for a cursor position report, which decides
+    /// when the generation's `B` turns false (PRD #1666 part 3, Q35-06; A2
+    /// §4.2).
+    pub cpr_wait_end: crate::composer_probe::query_ledger::CprWaitEnd,
 }
 
 impl ScreenProfile {
@@ -634,6 +638,9 @@ pub static CODEX_PROFILE: ScreenProfile = ScreenProfile {
     width_witness: codex_width_witness,
     min_cols: 80,
     input: crate::composer_model::Semantics::Codex,
+    // P-WE: every production CPR wait in `codex-rs/tui` ends before the next
+    // `?2026h` its own control flow writes (M-WE checks it on the binaries).
+    cpr_wait_end: crate::composer_probe::query_ledger::CprWaitEnd::SyncBegin,
 };
 
 // ---------------------------------------------------------------------------
@@ -817,6 +824,7 @@ pub static CLAUDE_PROFILE: ScreenProfile = ScreenProfile {
     width_witness: claude_width_witness,
     min_cols: 80,
     input: crate::composer_model::Semantics::ClaudeCode,
+    cpr_wait_end: crate::composer_probe::query_ledger::CprWaitEnd::Counted,
 };
 
 // ---------------------------------------------------------------------------
@@ -951,6 +959,7 @@ pub static STANDIN_PROFILE: ScreenProfile = ScreenProfile {
     width_witness: standin_width_witness,
     min_cols: 40,
     input: crate::composer_model::Semantics::ClaudeCode,
+    cpr_wait_end: crate::composer_probe::query_ledger::CprWaitEnd::Counted,
 };
 
 /// The `editor_probe` record the e2e stand-ins follow, for each agent they

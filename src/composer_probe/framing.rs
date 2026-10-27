@@ -716,6 +716,13 @@ impl Token<'_> {
             _ => None,
         }
     }
+
+    /// The report this token is, whole or completed across ops, if any, with
+    /// each parameter in range. Whether it was read inside a paste is
+    /// [`Self::in_paste`]'s to say.
+    pub fn report(&self) -> Option<Report> {
+        report_of(self)
+    }
 }
 
 /// Kitty's `CSI key[:shifted[:base]] ; mods[:event] ; text u`: any of the
