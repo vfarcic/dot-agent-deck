@@ -1840,11 +1840,14 @@ fn spawn_with_dir(
     // child.
     cmd.env_remove(crate::inbox_receipt::ENV_INBOX_SPOOL);
     // PRD #1666 part 3 (Q35-13): the editor helper's variables, on the same
-    // rule. Only an installed spawn's own overlay sets them, so one left in
-    // the daemon's environment never points a child's helper at another
-    // daemon's instance or generation.
-    for var in crate::composer_probe::install::HELPER_ENV {
-        cmd.env_remove(var);
+    // rule: every inherited name under the reserved prefix, the three the
+    // helper reads among them. Only an installed spawn's own overlay sets
+    // them, so one left in the daemon's environment never points a child's
+    // helper at another daemon's instance or generation.
+    for (var, _) in std::env::vars_os() {
+        if crate::composer_probe::install::helper_reserved(&var) {
+            cmd.env_remove(var);
+        }
     }
     // The receipt watcher's test knobs, likewise: one left in the daemon's
     // environment never reaches an agent's watcher unless the spawn sets it.

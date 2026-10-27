@@ -243,7 +243,8 @@ mod page {
         ///
         /// When `ptr` is non-null and 8-byte aligned and `len` is at least
         /// [`WORDS_BYTES`], `ptr` is valid for reads of `len` bytes for
-        /// `'a`, and every access to the two words, in any process, is
+        /// `'a`, and every access to each of the three words (word 0,
+        /// `seg_seq` and `native_seq` at offset 16), in any process, is
         /// atomic. Nothing is read through `ptr` otherwise.
         pub unsafe fn at(ptr: *const u8, len: usize) -> Result<Self, PageError> {
             // SAFETY: the caller's contract is `words`'s.

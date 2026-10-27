@@ -54,6 +54,66 @@ fn probe_012_disabled_installation_preserves_spawn_environment_and_arguments() {
     }
 }
 
+/// Scenario: Start the real daemon with installation disabled, a runtime directory of its own, and stale helper variables in its own environment, then start synthetic Claude, Codex, OpenCode, Pi, wrapper, launcher and shell commands. No instance directory appears under the state or runtime directory at startup or after the spawns, no command inherits a variable under the helper's reserved prefix, and each keeps its own editor values and argv.
+#[spec("inbox/probe/012")]
+#[test]
+fn probe_012_a_disabled_spawn_makes_no_files_and_inherits_no_helper_variable() {
+    let runtime = common::race_safe_tempdir();
+    let runtime_dir = runtime.path().to_str().unwrap().to_string();
+    let daemon = common::spawn_daemon_serve_with_env(
+        None,
+        "0",
+        &[
+            ("XDG_RUNTIME_DIR", runtime_dir.as_str()),
+            ("DOT_AGENT_DECK_EDITOR_GEN", "stale-generation"),
+            ("DOT_AGENT_DECK_EDITOR_USER_VISUAL", "stale-visual"),
+            ("DOT_AGENT_DECK_EDITOR_FUTURE", "stale"),
+        ],
+    );
+    let state = daemon.home.parent().unwrap().join("state");
+    let no_instance = |when: &str| {
+        assert!(!state.join("editor").exists(), "{when}: no state root");
+        assert!(
+            !runtime.path().join("dot-agent-deck/editor").exists(),
+            "{when}: no runtime root"
+        );
+    };
+    no_instance("startup");
+    let original = Some("user-editor --literal");
+    for kind in [
+        "claude", "codex", "opencode", "pi", "wrapper", "launcher", "shell",
+    ] {
+        let spawned = spawn(&daemon, kind, kind, "2.1.310", original, None, false);
+        for name in ["VISUAL", "EDITOR"] {
+            assert_eq!(
+                spawned.report["env"][name],
+                json!(original),
+                "{kind}: {name}"
+            );
+        }
+        assert_eq!(
+            spawned.report["env"]["CLAUDE_ENV_FILE"],
+            Value::Null,
+            "{kind}"
+        );
+        assert_eq!(
+            spawned.report["argv"], spawned.original_argv,
+            "{kind}: argv"
+        );
+        let names = spawned.report["names"].as_array().unwrap();
+        assert!(
+            names.contains(&json!("DOT_AGENT_DECK_TEST_COMPOSER_RELEASE")),
+            "{kind}: the report lists the environment's names"
+        );
+        let reserved: Vec<_> = names
+            .iter()
+            .filter(|n| n.as_str().unwrap().starts_with("DOT_AGENT_DECK_EDITOR_"))
+            .collect();
+        assert!(reserved.is_empty(), "{kind}: inherited {reserved:?}");
+    }
+    no_instance("after the spawns");
+}
+
 /// Scenario: Enable installation for exact Claude and Codex releases, then start direct stand-ins whose headers report measured or unmeasured releases, plus declared and undeclared wrappers. Each command receives a private helper before producing its header, including the unmeasured release; the user's original editor state does not decide installation.
 #[spec("inbox/probe/033")]
 #[test]
@@ -112,6 +172,39 @@ fn probe_033_installation_precedes_the_header_for_direct_and_wrapper_commands() 
             }
         }
     }
+}
+
+/// Scenario: Enable installation with the daemon's state directory below a directory its group can write, and a private runtime directory. The state directory's root is passed over, so a started Claude stand-in gets a private helper under the runtime directory instead, and nothing is made below the group-writable directory.
+#[spec("inbox/probe/033")]
+#[test]
+fn probe_033_a_state_root_another_user_could_change_is_passed_over() {
+    let sandbox = common::race_safe_tempdir();
+    let shared = sandbox.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o770)).unwrap();
+    let runtime = sandbox.path().join("runtime");
+    std::fs::create_dir(&runtime).unwrap();
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let state = shared.join("state");
+    let daemon = common::spawn_daemon_serve_with_env(
+        None,
+        "0",
+        &[
+            (ASSUME, ENTRIES),
+            ("DOT_AGENT_DECK_STATE_DIR", state.to_str().unwrap()),
+            ("XDG_RUNTIME_DIR", runtime.to_str().unwrap()),
+        ],
+    );
+    let spawned = spawn(&daemon, "claude", "claude", "2.1.310", None, None, false);
+    let helper = installed(&spawned);
+    assert!(
+        helper.starts_with(runtime.join("dot-agent-deck/editor")),
+        "the helper is under the runtime root: {helper:?}"
+    );
+    assert!(
+        !state.join("editor").exists(),
+        "nothing under the state root"
+    );
 }
 
 /// Scenario: Enable the editor-probe assumption and start a shell command that subsequently execs the Claude screen fixture. Its child retains the user's editor values, because shell panes are excluded from installation before any agent is learned.

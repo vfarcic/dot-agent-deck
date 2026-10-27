@@ -5,7 +5,8 @@
 //! **The layout.** `<root>/<pid>-<start ticks>/`, 0700, made fresh by one
 //! daemon and never reused ([`Instance::create`]), where `<root>` is
 //! `<state_dir>/editor` or, when that path holds a character an agent can't
-//! split, `$XDG_RUNTIME_DIR/dot-agent-deck/editor` ([`choose_root`]):
+//! split or passes through a directory another user could change,
+//! `$XDG_RUNTIME_DIR/dot-agent-deck/editor` ([`candidate_roots`]):
 //! - `daemon`, 0400: the daemon's pid, start ticks, boot id and a random
 //!   nonce, written once ([`DaemonId`]);
 //! - `dot-agent-deck-editor`, 0500: the private copy of the daemon's own
@@ -17,27 +18,44 @@
 //!   ([`InstanceReader::kind`]); `gen-G`, 0400, its identity, written only
 //!   once the deck may arm it ([`Instance::write_identity`]).
 //!
+//! **The path** ([`open_root`]). The root is reached from `/` one component
+//! at a time, each opened through its parent's descriptor without following
+//! a link, and each trusted before the next is opened: an ancestor is
+//! root's or this user's and can't be written by its group or others unless
+//! it is sticky; the root is this user's and can't be written by them at
+//! all. A symlink or `..` anywhere on the way refuses. So no other user can
+//! rename or replace any directory the helper's absolute path passes
+//! through, and the path the agent runs resolves to the copy made here.
+//!
 //! Every file is created through the instance directory's descriptor,
 //! exclusively and without following a link, so nothing already there is
 //! reused or written through. A file that exists is an error, never
 //! overwritten.
 //!
 //! **Retention** (R3 §8). Creating an instance removes another daemon's
-//! directory only when that daemon is gone (its pid absent or started at
-//! another time) **and** a scan of every process of this user, through its
+//! directory only when it is identified as an instance ([`identify`]: this
+//! user's directory, 0700, holding this user's 0400 `daemon` record that
+//! names the directory, each opened through the validated root's descriptor
+//! without following a link) **and** that daemon is gone (its pid absent or
+//! started at another time; a start that can't be read keeps it, see
+//! [`liveness`]) **and** a scan of every process of this user, through its
 //! `/proc/<pid>/environ` and `/proc/<pid>/maps`, found none naming the
-//! directory, **and** every entry the scan reached was readable. Anything
-//! less keeps it: a process of this user whose entries can't be read keeps
-//! every directory, so on a host with such a process nothing is removed
-//! ([`removable`]). Files stay after their generation retires; the daemon
-//! only unmaps the arm page.
+//! directory, **and** every entry the scan reached was readable, its owner
+//! included. Anything less keeps it: a process of this user whose entries
+//! can't be read keeps every directory, so on a host with such a process
+//! nothing is removed ([`removable`]). Removal works beneath the directory
+//! identified, and only while its name still leads to it
+//! ([`remove_identified`]); the `daemon` record goes last, so a removal that
+//! fails partway leaves a directory that is still identified. A directory
+//! that isn't identified, a partly made instance among them, is never
+//! removed. Files stay after their generation retires; the daemon only
+//! unmaps the arm page.
 
 use std::ffi::{CStr, CString, OsString};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 
@@ -76,15 +94,23 @@ pub fn splittable(path: &Path) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || b".-_/".contains(b))
 }
 
-/// The first of `<state_dir>/editor` and `<runtime_dir>/dot-agent-deck/editor`
-/// whose path is [`splittable`], both taken as absolute.
+/// The first of [`candidate_roots`].
 pub fn choose_root(state_dir: &Path, runtime_dir: Option<&Path>) -> Result<PathBuf, SetupError> {
+    candidate_roots(state_dir, runtime_dir)
+        .into_iter()
+        .next()
+        .ok_or(SetupError::PathCharacters)
+}
+
+/// `<state_dir>/editor` and `<runtime_dir>/dot-agent-deck/editor`, in that
+/// order, those whose path is absolute and [`splittable`].
+pub fn candidate_roots(state_dir: &Path, runtime_dir: Option<&Path>) -> Vec<PathBuf> {
     let state = state_dir.join("editor");
     let runtime = runtime_dir.map(|r| r.join("dot-agent-deck").join("editor"));
     std::iter::once(state)
         .chain(runtime)
-        .find(|root| root.is_absolute() && splittable(root))
-        .ok_or(SetupError::PathCharacters)
+        .filter(|root| root.is_absolute() && splittable(root))
+        .collect()
 }
 
 /// Whether `name` can name a generation's files: 1–64 of `[A-Za-z0-9_-]`.
@@ -141,7 +167,8 @@ impl DaemonId {
         })
     }
 
-    fn encode(&self) -> String {
+    /// The `daemon` file's contents.
+    pub fn encode(&self) -> String {
         format!(
             "pid={}\nstart={}\nboot={}\nnonce={}\n",
             self.pid, self.start, self.boot, self.nonce
@@ -258,38 +285,31 @@ pub struct Instance {
 impl Instance {
     /// Make `daemon`'s instance directory under `root`, after removing what
     /// retention allows of other daemons' ([`sweep`]): the directories down
-    /// to `root` (made 0700 where missing, and each this user's and not
-    /// writable by group or others), the instance directory itself (which
-    /// mustn't exist), `daemon`, `inv/`, and the helper, copied from
-    /// `source` and checked against it byte for byte before it is renamed
-    /// into place without replacing anything. Any failure leaves what it made
-    /// for retention to remove once this daemon is gone.
+    /// to `root` (made 0700 where missing, each trusted as [`open_root`]
+    /// says), the instance directory itself (which mustn't exist), `daemon`,
+    /// `inv/`, and the helper, copied from `source` and checked against it
+    /// byte for byte before it is renamed into place without replacing
+    /// anything. A failure once `daemon` is written leaves what it made for
+    /// retention to remove once this daemon is gone; one before it leaves a
+    /// directory retention never identifies, so it stays.
     pub fn create(
         root: &Path,
         daemon: DaemonId,
         source: &mut File,
     ) -> Result<Instance, SetupError> {
-        if !root.is_absolute() || !splittable(root) {
+        if !splittable(root) {
             return Err(SetupError::PathCharacters);
         }
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(root)?;
-        if let Some(parent) = root.parent() {
-            trusted_dir(&open_dir_path(parent)?)?;
-        }
-        let root_fd = open_dir_path(root)?;
-        trusted_dir(&root_fd)?;
+        let root_fd = walk_root(root, true)?;
         let name = instance_name(daemon.pid, daemon.start);
-        let swept = sweep(root, &name);
+        let swept = sweep_root(root_fd.as_fd(), root, &name, may_be_alive, scan_proc);
         let name_c = cstring(&name);
         mkdir_at(root_fd.as_fd(), &name_c, 0o700).map_err(|e| match e.raw_os_error() {
             Some(libc::EEXIST) => SetupError::InstanceExists,
             _ => e.into(),
         })?;
         let dir_fd = open_dir_at(root_fd.as_fd(), &name_c)?;
-        trusted_dir(&dir_fd)?;
+        trusted_dir(&dir_fd, true)?;
         let dir = root.join(&name);
         create_file_at(dir_fd.as_fd(), &cstring(DAEMON_FILE), 0o400)?
             .write_all(daemon.encode().as_bytes())?;
@@ -550,8 +570,10 @@ impl InstanceReader {
 pub struct Sweep {
     /// The directories removed.
     pub removed: Vec<String>,
-    /// Entries kept: a live daemon's, one a process names, one whose name
-    /// isn't an instance's, or every one when the scan failed.
+    /// Directories kept: a live daemon's, one a process names, one that
+    /// isn't identified as an instance ([`identify`]), or every one when the
+    /// scan failed. The caller's own and anything not a directory aren't
+    /// counted.
     pub kept: usize,
     /// Why the scan kept everything, if it did.
     pub scan_error: Option<ScanError>,
@@ -604,74 +626,274 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 /// Remove what [`removable`] allows under `root`, keeping `own`, with this
-/// host's processes as the scan ([`scan_proc`]).
+/// host's liveness ([`may_be_alive`]) and processes as the scan
+/// ([`scan_proc`]).
 pub fn sweep(root: &Path, own: &str) -> Sweep {
-    let alive = |pid, start| crate::platform::proc::process_start_of(pid) == Some(start);
-    sweep_with(root, own, alive, scan_proc)
+    sweep_with(root, own, may_be_alive, scan_proc)
 }
 
-/// [`sweep`], with liveness and the scan given.
+/// [`sweep`], with liveness and the scan given. A root [`open_root`]
+/// refuses is left alone.
 pub fn sweep_with(
     root: &Path,
     own: &str,
     alive: impl Fn(u32, u64) -> bool,
     scan: impl FnOnce(&mut dyn FnMut(&[u8])) -> Result<(), ScanError>,
 ) -> Sweep {
+    match open_root(root) {
+        Ok(root_fd) => sweep_root(root_fd.as_fd(), root, own, alive, scan),
+        Err(_) => Sweep::default(),
+    }
+}
+
+/// [`sweep_with`] beneath `root_fd`, a root already opened and trusted;
+/// `root` is its path, which only the scan's matching uses.
+pub fn sweep_root(
+    root_fd: BorrowedFd<'_>,
+    root: &Path,
+    own: &str,
+    alive: impl Fn(u32, u64) -> bool,
+    scan: impl FnOnce(&mut dyn FnMut(&[u8])) -> Result<(), ScanError>,
+) -> Sweep {
     let mut sweep = Sweep::default();
-    let Ok(entries) = std::fs::read_dir(root) else {
+    let Ok(names) = names_at(root_fd) else {
         return sweep;
     };
-    let candidates: Vec<(String, Vec<u8>)> = entries
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|name| name != own)
-        .map(|name| {
-            let path = root.join(&name).into_os_string().into_vec();
-            (name, path)
+    // SAFETY: `getuid` has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    let mut directories = 0;
+    let mut identified = Vec::new();
+    for name in names {
+        let Ok(name) = name.into_string() else {
+            continue;
+        };
+        if name == own || !stat_at(root_fd, &cstring_of(&name)).is_ok_and(|st| is_dir(&st)) {
+            continue;
+        }
+        directories += 1;
+        identified.extend(identify(root_fd, &name, uid));
+    }
+    let candidates: Vec<(String, Vec<u8>)> = identified
+        .iter()
+        .map(|id| {
+            let path = root.join(&id.name).into_os_string().into_vec();
+            (id.name.clone(), path)
         })
         .collect();
     match removable(&candidates, alive, scan) {
         Ok(names) => {
-            sweep.kept = candidates.len() - names.len();
-            for name in names {
-                // `remove_dir_all` works beneath the directory's descriptor
-                // and never follows a link out of it.
-                match std::fs::remove_dir_all(root.join(&name)) {
+            sweep.kept = directories - names.len();
+            for id in identified.into_iter().filter(|id| names.contains(&id.name)) {
+                let name = id.name.clone();
+                match remove_identified(root_fd, id) {
                     Ok(()) => sweep.removed.push(name),
                     Err(_) => sweep.failed += 1,
                 }
             }
         }
         Err(error) => {
-            sweep.kept = candidates.len();
+            sweep.kept = directories;
             sweep.scan_error = Some(error);
         }
     }
     sweep
 }
 
-/// Visit the environment and maps of every process of this user. A process
-/// that is gone by the time it is read is skipped; any other failure to read
-/// one is [`ScanError::Unreadable`]. Ownership is the real uid in
-/// `/proc/<pid>/status`, not the owner of `/proc/<pid>`, which reads as root
-/// for a process that made itself non-dumpable.
-pub fn scan_proc(visit: &mut dyn FnMut(&[u8])) -> Result<(), ScanError> {
-    // SAFETY: `getuid` has no preconditions.
-    let uid = unsafe { libc::getuid() };
-    let entries = std::fs::read_dir("/proc").map_err(|_| ScanError::Unreadable)?;
-    for entry in entries {
-        let entry = entry.map_err(|_| ScanError::Unreadable)?;
-        let name = entry.file_name();
-        if !name.as_bytes().iter().all(u8::is_ascii_digit) {
+/// A directory [`identify`] found to be an instance, held open.
+#[derive(Debug)]
+pub struct Identified {
+    name: String,
+    dir: OwnedFd,
+    id: FileId,
+    daemon: DaemonId,
+}
+
+impl Identified {
+    /// Its name in the root.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Its `daemon` record.
+    pub fn daemon(&self) -> &DaemonId {
+        &self.daemon
+    }
+}
+
+/// `name` in `root` when it is an instance directory of `uid`'s: a
+/// directory, not a link, `uid`'s and 0700, the same one before and after it
+/// is opened, holding `daemon`, a regular file, `uid`'s and 0400, whose
+/// record names `name`'s pid and start. `None` for anything else.
+pub fn identify(root: BorrowedFd<'_>, name: &str, uid: u32) -> Option<Identified> {
+    let (pid, start) = parse_instance_name(name)?;
+    let name_c = CString::new(name).ok()?;
+    let before = stat_at(root, &name_c).ok()?;
+    let dir = open_dir_at(root, &name_c).ok()?;
+    let after = stat_fd(dir.as_fd()).ok()?;
+    if stat_id(&before) != stat_id(&after) || !private(&after, uid, libc::S_IFDIR, 0o700) {
+        return None;
+    }
+    let record = File::from(
+        openat(
+            dir.as_fd(),
+            &cstring(DAEMON_FILE),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            0,
+        )
+        .ok()?,
+    );
+    if !private(&stat_fd(record.as_fd()).ok()?, uid, libc::S_IFREG, 0o400) {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    // A longer record is cut short, which no record decodes from.
+    record.take(READ_MAX).read_to_end(&mut bytes).ok()?;
+    let daemon = DaemonId::decode(&bytes).filter(|d| (d.pid, d.start) == (pid, start))?;
+    Some(Identified {
+        name: name.to_string(),
+        id: stat_id(&after),
+        dir,
+        daemon,
+    })
+}
+
+/// Remove `identified` from `root`: everything beneath the directory it
+/// holds open, its `daemon` record last, then the directory, each step
+/// refused unless `identified`'s name in `root` still leads to that
+/// directory. Nothing is followed out of it.
+pub fn remove_identified(root: BorrowedFd<'_>, identified: Identified) -> io::Result<()> {
+    let name = cstring_of(&identified.name);
+    let still_there = || -> io::Result<()> {
+        if stat_id(&stat_at(root, &name)?) != identified.id {
+            return Err(io::Error::other("replaced since it was identified"));
+        }
+        Ok(())
+    };
+    still_there()?;
+    remove_beneath(identified.dir.as_fd(), Some(DAEMON_FILE), REMOVE_DEPTH)?;
+    still_there()?;
+    unlink_at(identified.dir.as_fd(), &cstring(DAEMON_FILE), 0)?;
+    still_there()?;
+    unlink_at(root, &name, libc::AT_REMOVEDIR)
+}
+
+/// How deep [`remove_beneath`] goes before it refuses.
+const REMOVE_DEPTH: usize = 32;
+
+/// Remove everything in `dir` but `keep`, never following a link, a
+/// directory only once it is the one its name led to when it was read.
+fn remove_beneath(dir: BorrowedFd<'_>, keep: Option<&str>, depth: usize) -> io::Result<()> {
+    for name in names_at(dir)? {
+        if keep.is_some_and(|k| name.as_bytes() == k.as_bytes()) {
             continue;
         }
-        let dir = entry.path();
+        let name = CString::new(name.into_vec())
+            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+        let st = stat_at(dir, &name)?;
+        if !is_dir(&st) {
+            unlink_at(dir, &name, 0)?;
+            continue;
+        }
+        if depth == 0 {
+            return Err(io::Error::from_raw_os_error(libc::ELOOP));
+        }
+        let child = openat(
+            dir,
+            &name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+            0,
+        )?;
+        if stat_id(&stat_fd(child.as_fd())?) != stat_id(&st) {
+            return Err(io::Error::other("replaced while being removed"));
+        }
+        remove_beneath(child.as_fd(), None, depth - 1)?;
+        unlink_at(dir, &name, libc::AT_REMOVEDIR)?;
+    }
+    Ok(())
+}
+
+/// Whether a daemon recorded as `pid` started at `start` still runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    /// `pid` runs and started at `start`.
+    Alive,
+    /// No process `pid`, or one that started at another time.
+    Gone,
+    /// `pid`'s start couldn't be read: retention takes it as alive.
+    Unknown,
+}
+
+/// Whether retention takes the daemon `pid`, started at `start`, as alive:
+/// unless it is [`Liveness::Gone`], an unknown start included.
+pub fn may_be_alive(pid: u32, start: u64) -> bool {
+    liveness(pid, start) != Liveness::Gone
+}
+
+/// [`Liveness`] from this host's `/proc/<pid>/stat`.
+pub fn liveness(pid: u32, start: u64) -> Liveness {
+    liveness_from(std::fs::read(format!("/proc/{pid}/stat")), start)
+}
+
+/// [`Liveness`] from a read of a process's `stat`: absent is gone, a start
+/// field read is compared, and anything else (an error other than absence,
+/// a field that isn't there or isn't a number) is unknown.
+pub fn liveness_from(stat: io::Result<Vec<u8>>, start: u64) -> Liveness {
+    let stat = match stat {
+        Ok(stat) => stat,
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
+            return Liveness::Gone;
+        }
+        Err(_) => return Liveness::Unknown,
+    };
+    // After `comm`'s closing parenthesis the fields run from 3 (`state`), so
+    // field 22 (`starttime`) is the 20th. `comm` can hold any byte.
+    let Some(close) = stat.iter().rposition(|b| *b == b')') else {
+        return Liveness::Unknown;
+    };
+    let field = stat[close + 1..]
+        .split(u8::is_ascii_whitespace)
+        .filter(|f| !f.is_empty())
+        .nth(19);
+    match field.and_then(ascii_number::<u64>) {
+        Some(found) if found == start => Liveness::Alive,
+        Some(_) => Liveness::Gone,
+        None => Liveness::Unknown,
+    }
+}
+
+/// Visit the environment and maps of every process of this user
+/// ([`scan_processes`] over every pid in `/proc`).
+pub fn scan_proc(visit: &mut dyn FnMut(&[u8])) -> Result<(), ScanError> {
+    let entries = std::fs::read_dir("/proc").map_err(|_| ScanError::Unreadable)?;
+    let mut pids = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|_| ScanError::Unreadable)?;
+        if let Some(pid) = ascii_number(entry.file_name().as_bytes()) {
+            pids.push(pid);
+        }
+    }
+    scan_processes(pids, visit)
+}
+
+/// Visit the environment and maps of each of `pids` that is this user's. A
+/// process that is gone by the time it is read is skipped; any other
+/// failure to read one, its owner included, is [`ScanError::Unreadable`].
+/// Ownership is the real uid in `/proc/<pid>/status` ([`owned_by`]), not the
+/// owner of `/proc/<pid>`, which reads as root for a process that made
+/// itself non-dumpable.
+pub fn scan_processes(
+    pids: impl IntoIterator<Item = u32>,
+    visit: &mut dyn FnMut(&[u8]),
+) -> Result<(), ScanError> {
+    // SAFETY: `getuid` has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    for pid in pids {
+        let dir = PathBuf::from(format!("/proc/{pid}"));
         let status = match proc_read(&dir.join("status"))? {
             Some(status) => status,
             None => continue,
         };
-        if status_uid(&status) != Some(uid) {
+        if !owned_by(&status, uid)? {
             continue;
         }
         for file in ["environ", "maps"] {
@@ -692,11 +914,29 @@ fn proc_read(path: &Path) -> Result<Option<Vec<u8>>, ScanError> {
     }
 }
 
-/// The real uid on a `status` file's `Uid:` line.
-fn status_uid(status: &[u8]) -> Option<u32> {
-    let text = std::str::from_utf8(status).ok()?;
-    let line = text.lines().find_map(|l| l.strip_prefix("Uid:"))?;
-    line.split_whitespace().next()?.parse().ok()
+/// Whether a `status` file's process is `uid`'s; an owner that can't be read
+/// is [`ScanError::Unreadable`], never another user's.
+pub fn owned_by(status: &[u8], uid: u32) -> Result<bool, ScanError> {
+    status_uid(status)
+        .map(|owner| owner == uid)
+        .ok_or(ScanError::Unreadable)
+}
+
+/// The real uid on a `status` file's `Uid:` line, read as bytes, so a
+/// process name that isn't UTF-8 doesn't hide it.
+pub fn status_uid(status: &[u8]) -> Option<u32> {
+    let line = status
+        .split(|b| *b == b'\n')
+        .find_map(|l| l.strip_prefix(b"Uid:"))?;
+    let real = line
+        .split(u8::is_ascii_whitespace)
+        .find(|f| !f.is_empty())?;
+    ascii_number(real)
+}
+
+/// A decimal number of ASCII digits with nothing else around it.
+fn ascii_number<T: std::str::FromStr>(bytes: &[u8]) -> Option<T> {
+    number(std::str::from_utf8(bytes).ok()?)
 }
 
 /// Copy `source` to the helper's temporary name, check the copy reads as
@@ -750,16 +990,68 @@ fn file_id(metadata: &std::fs::Metadata) -> FileId {
     }
 }
 
-/// A directory this user owns that its group and others can't write.
-fn trusted_dir(fd: &OwnedFd) -> Result<(), SetupError> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = File::from(fd.try_clone()?).metadata()?;
+/// Whether `fd` is a directory no other user can change. The root and an
+/// instance directory (`own`) are this user's and can't be written by its
+/// group or others. An ancestor is root's or this user's, and can't be
+/// written by its group or others unless it is sticky, where only an
+/// entry's owner can rename or remove it.
+fn trusted_dir(fd: &OwnedFd, own: bool) -> Result<(), SetupError> {
+    let st = stat_fd(fd.as_fd())?;
     // SAFETY: `getuid` has no preconditions.
     let uid = unsafe { libc::getuid() };
-    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o022 != 0 {
+    let owner_ok = st.st_uid == uid || (!own && st.st_uid == 0);
+    let shared = st.st_mode & 0o022 != 0;
+    let sticky = st.st_mode & libc::S_ISVTX != 0;
+    if !is_dir(&st) || !owner_ok || (shared && (own || !sticky)) {
         return Err(SetupError::UntrustedDirectory);
     }
     Ok(())
+}
+
+/// The trusted root at `root`, which must exist ([`walk_root`]).
+pub fn open_root(root: &Path) -> Result<OwnedFd, SetupError> {
+    walk_root(root, false)
+}
+
+/// Open `root` from `/` one component at a time, each through its parent's
+/// descriptor without following a link and trusted ([`trusted_dir`]) before
+/// the next is opened, making a missing one 0700 when `create`. A path that
+/// isn't absolute or holds `.` or `..` is [`SetupError::PathCharacters`];
+/// a symlink, a non-directory or an untrusted directory on the way is
+/// [`SetupError::UntrustedDirectory`].
+fn walk_root(root: &Path, create: bool) -> Result<OwnedFd, SetupError> {
+    use std::path::Component;
+    let mut components = root.components();
+    if components.next() != Some(Component::RootDir) {
+        return Err(SetupError::PathCharacters);
+    }
+    let names = components
+        .map(|c| match c {
+            Component::Normal(name) => Ok(name),
+            _ => Err(SetupError::PathCharacters),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // SAFETY: `AT_FDCWD` is a valid directory argument for `openat`.
+    let cwd = unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) };
+    let mut dir = open_dir_at(cwd, c"/")?;
+    trusted_dir(&dir, names.is_empty())?;
+    for (i, name) in names.iter().enumerate() {
+        let name = CString::new(name.as_bytes()).map_err(|_| SetupError::PathCharacters)?;
+        let next = match open_dir_at(dir.as_fd(), &name) {
+            Err(SetupError::Io(Some(libc::ENOENT))) if create => {
+                match mkdir_at(dir.as_fd(), &name, 0o700) {
+                    Ok(()) => {}
+                    Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
+                    Err(e) => return Err(e.into()),
+                }
+                open_dir_at(dir.as_fd(), &name)?
+            }
+            other => other?,
+        };
+        trusted_dir(&next, i + 1 == names.len())?;
+        dir = next;
+    }
+    Ok(dir)
 }
 
 /// The directory at `path`, its last component not followed.
@@ -828,6 +1120,109 @@ fn openat(dir: BorrowedFd<'_>, name: &CStr, flags: i32, mode: u32) -> io::Result
     }
     // SAFETY: a descriptor `openat` just returned, owned by nothing else.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// `name` in `dir`, not followed.
+fn stat_at(dir: BorrowedFd<'_>, name: &CStr) -> io::Result<libc::stat> {
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: a valid descriptor, a NUL-terminated name and room for the
+    // result, which is read only once the call succeeds.
+    if unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            st.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fstatat` filled it.
+    Ok(unsafe { st.assume_init() })
+}
+
+/// What `fd` is open on.
+fn stat_fd(fd: BorrowedFd<'_>) -> io::Result<libc::stat> {
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: a valid descriptor and room for the result, which is read only
+    // once the call succeeds.
+    if unsafe { libc::fstat(fd.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fstat` filled it.
+    Ok(unsafe { st.assume_init() })
+}
+
+fn stat_id(st: &libc::stat) -> FileId {
+    FileId {
+        dev: st.st_dev,
+        ino: st.st_ino,
+    }
+}
+
+fn is_dir(st: &libc::stat) -> bool {
+    st.st_mode & libc::S_IFMT == libc::S_IFDIR
+}
+
+/// Whether `st` is of type `kind`, `uid`'s, with permissions exactly `mode`.
+fn private(st: &libc::stat, uid: u32, kind: libc::mode_t, mode: libc::mode_t) -> bool {
+    st.st_mode & libc::S_IFMT == kind && st.st_uid == uid && st.st_mode & 0o7777 == mode
+}
+
+/// The names in `dir` but `.` and `..`, read through a duplicate of its
+/// descriptor.
+fn names_at(dir: BorrowedFd<'_>) -> io::Result<Vec<OsString>> {
+    let dup = dir.try_clone_to_owned()?;
+    // SAFETY: a descriptor of a directory, owned by the stream from here,
+    // which `closedir` below closes.
+    let stream = unsafe { libc::fdopendir(dup.as_raw_fd()) };
+    if stream.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    std::mem::forget(dup);
+    // `fdopendir` shares the offset with the descriptor it was given, which
+    // a descriptor duplicated from one already read may have moved.
+    // SAFETY: the stream just opened.
+    unsafe { libc::rewinddir(stream) };
+    let mut names = Vec::new();
+    loop {
+        // SAFETY: the stream is open; `errno` is cleared first so the end of
+        // the directory is told from a failure.
+        let entry = unsafe {
+            *libc::__errno_location() = 0;
+            libc::readdir(stream)
+        };
+        if entry.is_null() {
+            // SAFETY: as above.
+            let errno = unsafe { *libc::__errno_location() };
+            // SAFETY: the stream, closed once.
+            unsafe { libc::closedir(stream) };
+            if errno != 0 {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
+            return Ok(names);
+        }
+        // SAFETY: `readdir` returned an entry, whose name is NUL-terminated
+        // and valid until the next call on the stream.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name != c"." && name != c".." {
+            names.push(OsString::from_vec(name.to_bytes().to_vec()));
+        }
+    }
+}
+
+fn unlink_at(dir: BorrowedFd<'_>, name: &CStr, flags: i32) -> io::Result<()> {
+    // SAFETY: a valid descriptor and NUL-terminated name.
+    if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), flags) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// A name read from a directory or given by a caller, which holds no NUL.
+fn cstring_of(name: &str) -> CString {
+    CString::new(name).unwrap_or_default()
 }
 
 fn fchmod(file: &File, mode: u32) -> io::Result<()> {

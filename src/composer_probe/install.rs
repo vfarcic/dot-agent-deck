@@ -46,8 +46,9 @@ pub enum SetupError {
     /// Every root's path holds a character outside `[A-Za-z0-9._/-]`, so an
     /// agent splitting `VISUAL` on spaces couldn't run the helper there.
     PathCharacters,
-    /// A directory on the way down isn't this user's, can be written by its
-    /// group or others, or isn't a directory (a symlink among them).
+    /// A directory on the way down from `/` is one another user could
+    /// change (see [`super::instance::open_root`]), or isn't a directory (a
+    /// symlink among them).
     UntrustedDirectory,
     /// The instance directory already exists: one is never reused.
     InstanceExists,
@@ -235,6 +236,15 @@ pub const SAVED_EDITOR_ENV: &str = "DOT_AGENT_DECK_EDITOR_USER_EDITOR";
 /// The helper's variables, which every spawn's child starts without, so one
 /// left in the daemon's environment never names another daemon's instance.
 pub const HELPER_ENV: [&str; 3] = [GENERATION_ENV, SAVED_VISUAL_ENV, SAVED_EDITOR_ENV];
+/// The prefix reserved for the helper's variables: a spawn's child inherits
+/// none from the daemon, whatever the rest of the name (see [`HELPER_ENV`]).
+pub const HELPER_ENV_PREFIX: &str = "DOT_AGENT_DECK_EDITOR_";
+
+/// Whether `name` is reserved for the helper ([`HELPER_ENV_PREFIX`]).
+pub fn helper_reserved(name: &std::ffi::OsStr) -> bool {
+    name.as_encoded_bytes()
+        .starts_with(HELPER_ENV_PREFIX.as_bytes())
+}
 
 /// The editor settings a spawn would have had without installation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -452,15 +462,30 @@ pub fn install(
 /// The daemon's instance, made by the first installed spawn.
 #[cfg(target_os = "linux")]
 fn daemon_instance() -> Result<&'static Instance, SetupError> {
-    use super::instance::{DaemonId, choose_root};
+    use super::instance::{DaemonId, candidate_roots};
     static INSTANCE: OnceLock<Result<Instance, SetupError>> = OnceLock::new();
     INSTANCE
         .get_or_init(|| {
             let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
-            let root = choose_root(&crate::config::state_dir(), runtime.as_deref())?;
+            let roots = candidate_roots(&crate::config::state_dir(), runtime.as_deref());
             let mut exe = std::fs::File::open("/proc/self/exe")?;
             let size = exe.metadata().map(|m| m.len()).unwrap_or_default();
-            let instance = Instance::create(&root, DaemonId::this_process()?, &mut exe)?;
+            let daemon = DaemonId::this_process()?;
+            // A root whose path another user could change is passed over for
+            // the next; any other failure is the instance's.
+            let mut created = Err(SetupError::PathCharacters);
+            for root in roots {
+                created = Instance::create(&root, daemon.clone(), &mut exe);
+                if !matches!(created, Err(SetupError::UntrustedDirectory)) {
+                    break;
+                }
+                tracing::info!(
+                    target: "composer_probe",
+                    root = %root.display(),
+                    "editor helper root passed over: its path isn't trusted"
+                );
+            }
+            let instance = created?;
             let swept = instance.swept();
             tracing::info!(
                 target: "composer_probe",

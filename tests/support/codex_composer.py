@@ -77,7 +77,7 @@ if os.environ.get('DOT_AGENT_DECK_TEST_COMPOSER_REPORT') == '1':
         json.dump({'argv': sys.argv, 'env': {
             name: os.environ.get(name)
             for name in ('VISUAL', 'EDITOR', 'CLAUDE_ENV_FILE')
-        }}, output)
+        }, 'names': sorted(os.environ)}, output)
 # The generation's own session, the one `Deck::hook` names too: never
 # another pane's or a predecessor's.
 SESSION = '%s-session' % os.environ.get('DOT_AGENT_DECK_AGENT_ID', 'codex-composer-%d' % os.getpid())

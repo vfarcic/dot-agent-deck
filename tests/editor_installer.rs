@@ -10,6 +10,7 @@
 
 use std::ffi::OsString;
 use std::fs::{File, Permissions};
+use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -23,9 +24,11 @@ use dot_agent_deck::composer_probe::install::{
     with_args,
 };
 use dot_agent_deck::composer_probe::instance::{
-    DAEMON_FILE, DaemonId, HELPER_NAME, INV_DIR, Instance, InstanceReader, Kind, PAGE_BYTES,
-    READ_MAX, ScanError, Sweep, choose_root, decode_identity, encode_identity, generation_name_ok,
-    instance_name, parse_instance_name, removable, same_contents, splittable, sweep, sweep_with,
+    DAEMON_FILE, DaemonId, HELPER_NAME, INV_DIR, Instance, InstanceReader, Kind, Liveness,
+    PAGE_BYTES, READ_MAX, ScanError, Sweep, candidate_roots, choose_root, decode_identity,
+    encode_identity, generation_name_ok, identify, instance_name, liveness, liveness_from,
+    may_be_alive, open_root, owned_by, parse_instance_name, removable, remove_identified,
+    same_contents, scan_processes, splittable, status_uid, sweep, sweep_root, sweep_with,
 };
 use dot_agent_deck::doorbell_activation::{
     EditorProbe, EditorSelection, ExportShape, Measurement, PasteToggles,
@@ -41,18 +44,24 @@ fn mode(path: &Path) -> u32 {
     std::fs::symlink_metadata(path).unwrap().mode() & 0o7777
 }
 
-/// A temporary directory whose path an agent can split, on disk.
+/// A temporary directory whose path an agent can split, in the system's
+/// temporary directory: every directory above it must be one no other user
+/// can change, which a checkout made under a group-writable umask isn't.
 fn tempdir() -> tempfile::TempDir {
-    std::fs::create_dir_all(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let dir = tempfile::Builder::new()
         .prefix("installer")
         .rand_bytes(8)
-        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .tempdir_in(std::env::temp_dir())
         .unwrap();
     assert!(splittable(dir.path()), "{}", dir.path().display());
     // Whatever the umask made it, so a case's parent is refused only when the
     // case means it to be.
     std::fs::set_permissions(dir.path(), Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        open_root(dir.path()).is_ok(),
+        "{} passes through a directory another user could change: point TMPDIR at one that doesn't",
+        dir.path().display()
+    );
     dir
 }
 
@@ -80,6 +89,32 @@ fn source(dir: &Path) -> File {
 fn instance(dir: &Path) -> Instance {
     let root = dir.join("state").join("editor");
     Instance::create(&root, daemon_id(4_000_000, 7), &mut source(dir)).unwrap()
+}
+
+/// `path`, made if missing and set to 0700, so a root under it is trusted.
+fn private_dir(path: &Path) -> PathBuf {
+    std::fs::create_dir_all(path).unwrap();
+    std::fs::set_permissions(path, Permissions::from_mode(0o700)).unwrap();
+    path.to_path_buf()
+}
+
+/// What an instance's `daemon` file holds for `pid` and `start`.
+fn daemon_record(pid: u32, start: u64) -> String {
+    format!(
+        "pid={pid}\nstart={start}\nboot=0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0\nnonce=00112233445566778899aabbccddeeff\n"
+    )
+}
+
+/// A directory under `root` laid out as `pid`'s instance: 0700, its 0400
+/// `daemon` record naming it, and `inv/7/marker`.
+fn fake_instance(root: &Path, pid: u32, start: u64) -> PathBuf {
+    let dir = root.join(instance_name(pid, start));
+    std::fs::create_dir_all(dir.join("inv/7")).unwrap();
+    std::fs::write(dir.join("inv/7/marker"), b"x").unwrap();
+    std::fs::write(dir.join(DAEMON_FILE), daemon_record(pid, start)).unwrap();
+    std::fs::set_permissions(dir.join(DAEMON_FILE), Permissions::from_mode(0o400)).unwrap();
+    std::fs::set_permissions(&dir, Permissions::from_mode(0o700)).unwrap();
+    dir
 }
 
 fn originals(visual: Option<&str>, editor: Option<&str>, preset: Option<&str>) -> Originals {
@@ -477,7 +512,7 @@ fn probe_065_each_setup_failure_refuses() {
     let target = base.join("target");
     std::fs::create_dir(&target).unwrap();
     std::os::unix::fs::symlink(&target, base.join("link")).unwrap();
-    // The last root's parent, `/`, is another user's.
+    // The last root, `/usr`, is another user's.
     for root in [
         open.join("editor"),
         shared_root,
@@ -902,8 +937,7 @@ fn probe_065_retention_removes_only_what_nothing_uses() {
 #[test]
 fn probe_065_a_sweep_keeps_what_a_process_names() {
     let dir = tempdir();
-    let root = dir.path().join("editor");
-    std::fs::create_dir(&root).unwrap();
+    let root = private_dir(&dir.path().join("editor"));
     let me = std::process::id();
     let my_start = dot_agent_deck::platform::proc::process_start_of(me).unwrap();
     let mut gone = Vec::new();
@@ -917,10 +951,12 @@ fn probe_065_a_sweep_keeps_what_a_process_names() {
     let live = instance_name(me, my_start);
     let target = dir.path().join("elsewhere");
     std::fs::create_dir(&target).unwrap();
-    for name in [&live, &gone[0], &gone[1], &"not-an-instance".to_string()] {
-        std::fs::create_dir(root.join(name)).unwrap();
-        std::fs::write(root.join(name).join("file"), b"x").unwrap();
+    for name in [&live, &gone[0], &gone[1]] {
+        let (pid, start) = parse_instance_name(name).unwrap();
+        fake_instance(&root, pid, start);
     }
+    std::fs::create_dir(root.join("not-an-instance")).unwrap();
+    std::fs::write(root.join("not-an-instance").join("file"), b"x").unwrap();
     std::os::unix::fs::symlink(&target, root.join("999999-1")).unwrap();
     let named = root.join(&gone[1]);
     let mut user = Command::new("sleep")
@@ -948,15 +984,22 @@ fn probe_065_a_sweep_keeps_what_a_process_names() {
     assert!(std::fs::symlink_metadata(root.join("999999-1")).is_ok());
     assert!(target.exists());
     assert_eq!(sweep(&dir.path().join("missing"), "x"), Default::default());
+    assert!(
+        !dir.path().join("missing").exists(),
+        "a sweep makes no root"
+    );
 }
 
-/// Scenario: Sweep a real root with liveness and the scan given: a gone daemon's directory with files in it that nothing names is removed whole, one the scan names is kept, as are a live daemon's, the caller's own and a name that isn't an instance's, and a symlink named like a gone daemon's isn't followed or counted; a failed scan removes nothing and says why.
+/// Scenario: Sweep a real root with liveness and the scan given: a gone daemon's instance with files in it that nothing names is removed whole, one the scan names is kept, as are a live daemon's, the caller's own, a numeric directory holding no daemon record and a name that isn't an instance's, and a symlink named like a gone daemon's isn't followed or counted; a failed scan removes nothing and says why.
 #[spec("inbox/probe/065")]
 #[test]
 fn probe_065_a_sweep_removes_whole_directories_and_follows_no_link() {
     let dir = tempdir();
-    let root = dir.path().join("editor");
-    for name in ["1-1", "2-2", "3-3", "4-4", "junk"] {
+    let root = private_dir(&dir.path().join("editor"));
+    for n in 1..=4 {
+        fake_instance(&root, n, u64::from(n));
+    }
+    for name in ["6-6", "junk"] {
         std::fs::create_dir_all(root.join(name).join("inv/7")).unwrap();
         std::fs::write(root.join(name).join("inv/7/marker"), b"x").unwrap();
     }
@@ -968,18 +1011,171 @@ fn probe_065_a_sweep_removes_whole_directories_and_follows_no_link() {
     let alive = |pid: u32, _| pid == 3;
     let failed = sweep_with(&root, "4-4", alive, |_| Err(ScanError::Unreadable));
     assert_eq!(failed.scan_error, Some(ScanError::Unreadable));
-    assert_eq!((failed.removed.len(), failed.kept), (0, 4));
+    assert_eq!((failed.removed.len(), failed.kept), (0, 5));
     let swept = sweep_with(&root, "4-4", alive, |visit| {
         visit(&named);
         Ok(())
     });
     assert_eq!(swept.removed, ["1-1"], "{swept:?}");
-    assert_eq!((swept.kept, swept.failed, swept.scan_error), (3, 0, None));
+    assert_eq!((swept.kept, swept.failed, swept.scan_error), (4, 0, None));
     assert!(!root.join("1-1").exists());
-    for kept in ["2-2", "3-3", "4-4", "junk"] {
+    for kept in ["2-2", "3-3", "4-4", "6-6", "junk"] {
         assert!(root.join(kept).join("inv/7/marker").exists(), "{kept}");
     }
     assert!(target.join("keep").exists());
+}
+
+/// Scenario: Sweep a root of gone daemons' directories, every one unnamed by any process, where only one is laid out as its instance. The others are kept whole: one with no daemon record, one whose record names another daemon, one whose record is malformed, one whose directory others can read, one whose record is writable, one whose record is a symlink to a good record, and one whose record is a directory.
+#[spec("inbox/probe/065")]
+#[test]
+fn probe_065_a_sweep_removes_only_directories_it_identifies() {
+    let dir = tempdir();
+    let root = private_dir(&dir.path().join("editor"));
+    fake_instance(&root, 1, 1);
+    let unidentified = ["2-2", "3-3", "4-4", "5-5", "6-6", "7-7", "8-8"];
+    for name in unidentified {
+        std::fs::create_dir_all(root.join(name).join("inv/7")).unwrap();
+        std::fs::write(root.join(name).join("inv/7/marker"), b"x").unwrap();
+        std::fs::set_permissions(root.join(name), Permissions::from_mode(0o700)).unwrap();
+    }
+    let record = |name: &str, text: &str, mode: u32| {
+        let path = root.join(name).join(DAEMON_FILE);
+        std::fs::write(&path, text).unwrap();
+        std::fs::set_permissions(&path, Permissions::from_mode(mode)).unwrap();
+    };
+    record("3-3", &daemon_record(9, 9), 0o400);
+    record("4-4", "pid=4\nstart=4\n", 0o400);
+    record("5-5", &daemon_record(5, 5), 0o400);
+    std::fs::set_permissions(root.join("5-5"), Permissions::from_mode(0o750)).unwrap();
+    record("6-6", &daemon_record(6, 6), 0o600);
+    std::fs::write(dir.path().join("good"), daemon_record(7, 7)).unwrap();
+    std::fs::set_permissions(dir.path().join("good"), Permissions::from_mode(0o400)).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("good"), root.join("7-7").join(DAEMON_FILE))
+        .unwrap();
+    std::fs::create_dir(root.join("8-8").join(DAEMON_FILE)).unwrap();
+    let swept = sweep_with(&root, "own", |_, _| false, |_| Ok(()));
+    assert_eq!(swept.removed, ["1-1"], "{swept:?}");
+    assert_eq!((swept.kept, swept.failed), (unidentified.len(), 0));
+    for name in unidentified {
+        assert!(root.join(name).join("inv/7/marker").exists(), "{name}");
+    }
+}
+
+/// Scenario: Make instance roots below a directory others can write, below a directory its group can write, through a symlink partway down, and through a `..`; each refuses, and nothing is made below the refused directory. A root below a directory this user can't write refuses with that failure. A root below a sticky directory others can write, which only its owners can rename entries in, is accepted.
+#[spec("inbox/probe/065")]
+#[test]
+fn probe_065_every_ancestor_of_the_root_is_trusted() {
+    let dir = tempdir();
+    let base = dir.path();
+    let ancestor = |name: &str, mode: u32| {
+        let path = base.join(name);
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, Permissions::from_mode(mode)).unwrap();
+        private_dir(&path.join("victim"))
+    };
+    let open = ancestor("open", 0o777);
+    let group = ancestor("group", 0o770);
+    let sticky = ancestor("sticky", 0o1777);
+    let real = private_dir(&base.join("real"));
+    std::os::unix::fs::symlink(&real, base.join("hop")).unwrap();
+    for (root, error) in [
+        (open.join("state/editor"), SetupError::UntrustedDirectory),
+        (group.join("state/editor"), SetupError::UntrustedDirectory),
+        (
+            base.join("hop/state/editor"),
+            SetupError::UntrustedDirectory,
+        ),
+        (
+            base.join("real/../dotdot/editor"),
+            SetupError::PathCharacters,
+        ),
+    ] {
+        assert_eq!(
+            Instance::create(&root, daemon_id(4_000_000, 7), &mut source(base)).err(),
+            Some(error),
+            "{}",
+            root.display()
+        );
+    }
+    assert!(!open.join("state").exists() && !group.join("state").exists());
+    assert!(!real.join("state").exists() && !base.join("dotdot").exists());
+    // A trusted directory this user can't write: the root can't be made there,
+    // and the failure is the one that stopped it.
+    let closed = private_dir(&base.join("closed"));
+    std::fs::set_permissions(&closed, Permissions::from_mode(0o500)).unwrap();
+    let refused = Instance::create(
+        &closed.join("state/editor"),
+        daemon_id(4_000_000, 7),
+        &mut source(base),
+    )
+    .err();
+    std::fs::set_permissions(&closed, Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(refused, Some(SetupError::Io(Some(libc::EACCES))));
+    let instance = Instance::create(
+        &sticky.join("state/editor"),
+        daemon_id(4_000_000, 7),
+        &mut source(base),
+    )
+    .unwrap();
+    assert!(instance.helper().starts_with(&sticky));
+}
+
+/// Scenario: Run a process of this user whose name holds a byte that isn't UTF-8, its environment naming a gone daemon's instance, and sweep with a scan of that process's real `/proc` entries: the instance is kept, because the process's owner is read from its status as bytes. Once the process exits, the same sweep removes the instance.
+#[spec("inbox/probe/065")]
+#[test]
+fn probe_065_a_process_whose_name_is_not_utf8_keeps_its_instance() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tempdir();
+    let root = private_dir(&dir.path().join("editor"));
+    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+    let start = dot_agent_deck::platform::proc::process_start_of(child.id()).unwrap();
+    let gone = fake_instance(&root, child.id(), start);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    // The process's name is its executable's basename: a script, so the shell
+    // running it keeps the name and starts no child that would also name it.
+    let script = dir.path().join(std::ffi::OsStr::from_bytes(b"na\xffme"));
+    std::fs::write(&script, "#!/bin/sh\nread line\n").unwrap();
+    std::fs::set_permissions(&script, Permissions::from_mode(0o700)).unwrap();
+    let mut user = Command::new(&script)
+        .env("VISUAL", gone.join(HELPER_NAME))
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let status = format!("/proc/{}/status", user.id());
+    assert!(
+        (0..200).any(|_| {
+            let named =
+                std::fs::read(&status).is_ok_and(|s| s.windows(5).any(|w| w == b"na\xffme"));
+            if !named {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            named
+        }),
+        "the process's status names it with the byte"
+    );
+    // The scan reads that process alone, so another process of this host's
+    // that can't be read doesn't decide the outcome.
+    let pid = user.id();
+    let result = sweep_with(
+        &root,
+        "own-0",
+        |_, _| false,
+        |visit| scan_processes([pid], visit),
+    );
+    user.kill().unwrap();
+    user.wait().unwrap();
+    assert_eq!(result.scan_error, None, "{result:?}");
+    assert!(result.removed.is_empty(), "{result:?}");
+    assert!(gone.join(DAEMON_FILE).exists());
+    // Gone, its instance named by nothing, it is removed.
+    let swept = sweep_with(
+        &root,
+        "own-0",
+        |_, _| false,
+        |visit| scan_processes([pid], visit),
+    );
+    assert_eq!(swept.removed.len(), 1, "{swept:?}");
 }
 
 /// Scenario: Make an instance in a root already holding a directory that isn't an instance's, and read what the sweep at creation reports: it was kept, nothing was removed, and no scan was needed. Install a generation, find its arm page among this process's mappings, drop the installation, and find it no longer mapped while its file stays.
@@ -1044,14 +1240,13 @@ fn probe_065_the_reader_reads_files_up_to_its_bound() {
     assert_eq!(reader.identity("3"), None);
 }
 
-/// Scenario: Sweep a root in which a gone daemon's directory holds a directory its owner can't write: the removal fails, the directory stays, and the sweep counts the failure rather than a removal.
+/// Scenario: Sweep a root in which a gone daemon's directory holds a directory its owner can't write: the removal fails, the directory stays, and the sweep counts the failure rather than a removal. A gone daemon's directory nested forty levels deep is refused the same way and keeps its record, while one nested twenty deep is removed whole.
 #[spec("inbox/probe/065")]
 #[test]
 fn probe_065_a_removal_that_fails_is_counted() {
     let dir = tempdir();
-    let root = dir.path().join("editor");
-    let locked = root.join("1-1").join("inv");
-    std::fs::create_dir_all(&locked).unwrap();
+    let root = private_dir(&dir.path().join("editor"));
+    let locked = fake_instance(&root, 1, 1).join("inv");
     std::fs::write(locked.join("marker"), b"x").unwrap();
     std::fs::set_permissions(&locked, Permissions::from_mode(0o500)).unwrap();
     let swept = sweep_with(&root, "own", |_, _| false, |_| Ok(()));
@@ -1064,4 +1259,132 @@ fn probe_065_a_removal_that_fails_is_counted() {
         }
     );
     assert!(locked.join("marker").exists());
+
+    // A tree deeper than the removal goes is refused, and its record stays;
+    // one within it is removed whole.
+    let deep = fake_instance(&root, 2, 2);
+    let shallow = fake_instance(&root, 3, 3);
+    let nest = |top: &Path, levels: usize| {
+        let mut path = top.join("inv");
+        for _ in 0..levels {
+            path.push("d");
+        }
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("leaf"), b"x").unwrap();
+    };
+    nest(&deep, 40);
+    nest(&shallow, 20);
+    let swept = sweep_with(&root, "own", |pid, _| pid == 1, |_| Ok(()));
+    assert_eq!((swept.removed, swept.failed), (vec!["3-3".to_string()], 1));
+    assert!(deep.join(DAEMON_FILE).exists() && !shallow.exists());
+}
+
+/// Scenario: Identify a real instance through its root's descriptor and remove it; the same instance seen as another user's isn't identified. Identify one, swap another instance in under its name, and the removal refuses, leaving both whole. Open a root, move it aside and put another root at its path: the sweep through the descriptor removes the moved root's gone instance and leaves the one now at the path alone.
+#[spec("inbox/probe/065")]
+#[test]
+fn probe_065_identification_is_bound_to_the_owner_and_the_inode() {
+    let dir = tempdir();
+    let root = private_dir(&dir.path().join("editor"));
+    let root_fd = open_root(&root).unwrap();
+    // SAFETY: `getuid` has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    fake_instance(&root, 1, 1);
+    assert!(identify(root_fd.as_fd(), "1-1", uid.wrapping_add(1)).is_none());
+    assert!(identify(root_fd.as_fd(), "1-2", uid).is_none());
+    let found = identify(root_fd.as_fd(), "1-1", uid).unwrap();
+    assert_eq!((found.name(), found.daemon().pid), ("1-1", 1));
+    remove_identified(root_fd.as_fd(), found).unwrap();
+    assert!(!root.join("1-1").exists());
+
+    fake_instance(&root, 2, 2);
+    let found = identify(root_fd.as_fd(), "2-2", uid).unwrap();
+    std::fs::rename(root.join("2-2"), dir.path().join("moved")).unwrap();
+    let other = fake_instance(&root, 2, 2);
+    assert!(remove_identified(root_fd.as_fd(), found).is_err());
+    assert!(other.join("inv/7/marker").exists());
+    assert!(dir.path().join("moved/inv/7/marker").exists());
+
+    let held = private_dir(&dir.path().join("held"));
+    let held_fd = open_root(&held).unwrap();
+    fake_instance(&held, 3, 3);
+    std::fs::rename(&held, dir.path().join("held-aside")).unwrap();
+    private_dir(&held);
+    let replacement = fake_instance(&held, 4, 4);
+    let swept = sweep_root(held_fd.as_fd(), &held, "own", |_, _| false, |_| Ok(()));
+    assert_eq!(swept.removed, ["3-3"], "{swept:?}");
+    assert!(!dir.path().join("held-aside/3-3").exists());
+    assert!(replacement.join(DAEMON_FILE).exists());
+}
+
+/// Scenario: Read a recorded daemon's liveness from `stat` reads: absent is gone, the recorded start is alive, another start is gone, and a read refused, a truncated line or a start that isn't a number is unknown, which retention keeps; a name holding spaces, parentheses or bytes that aren't UTF-8 doesn't move the start. This process reads as alive, a child that has exited as gone.
+#[spec("inbox/probe/065")]
+#[test]
+fn probe_065_a_start_that_cannot_be_read_counts_as_alive() {
+    let stat = |comm: &[u8], start: &str| {
+        let mut line = b"42 (".to_vec();
+        line.extend_from_slice(comm);
+        line.extend_from_slice(b") S 1 42 42 0 -1 4194560 1 0 0 0 0 0 0 0 20 0 1 0 ");
+        line.extend_from_slice(start.as_bytes());
+        line.extend_from_slice(b" 1 2 3\n");
+        Ok(line)
+    };
+    let err = |errno| Err(std::io::Error::from_raw_os_error(errno));
+    assert_eq!(liveness_from(err(libc::ENOENT), 7), Liveness::Gone);
+    assert_eq!(liveness_from(err(libc::ESRCH), 7), Liveness::Gone);
+    assert_eq!(liveness_from(err(libc::EACCES), 7), Liveness::Unknown);
+    assert_eq!(liveness_from(err(libc::EIO), 7), Liveness::Unknown);
+    assert_eq!(liveness_from(stat(b"deck", "7"), 7), Liveness::Alive);
+    assert_eq!(liveness_from(stat(b"deck", "8"), 7), Liveness::Gone);
+    assert_eq!(liveness_from(stat(b"a) (b \xff", "7"), 7), Liveness::Alive);
+    assert_eq!(liveness_from(stat(b"deck", "x7"), 7), Liveness::Unknown);
+    assert_eq!(
+        liveness_from(Ok(b"42 (deck) S 1 42".to_vec()), 7),
+        Liveness::Unknown
+    );
+    assert_eq!(
+        liveness_from(Ok(b"42 deck S".to_vec()), 7),
+        Liveness::Unknown
+    );
+    let me = std::process::id();
+    let start = dot_agent_deck::platform::proc::process_start_of(me).unwrap();
+    assert_eq!(liveness(me, start), Liveness::Alive);
+    assert_eq!(liveness(me, start + 1), Liveness::Gone);
+    let mut child = Command::new("true").spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    assert_eq!(liveness(pid, 1), Liveness::Gone);
+    // Retention's reading of the same facts.
+    assert!(may_be_alive(me, start));
+    assert!(!may_be_alive(me, start + 1));
+    assert!(!may_be_alive(pid, 1));
+}
+
+/// Scenario: Read a process's owner from `status` bytes: a name that isn't UTF-8 still yields the real uid on the `Uid:` line, which is this user's or another's; a status with no `Uid:` line, or one that isn't a number, is an unreadable owner, which keeps every instance rather than skipping the process.
+#[spec("inbox/probe/065")]
+#[test]
+fn probe_065_an_owner_that_cannot_be_read_fails_the_scan() {
+    let status = b"Name:\tna\xffme\nUmask:\t0002\nState:\tS (sleeping)\nUid:\t1000\t1001\t1000\t1000\nGid:\t5\n";
+    assert_eq!(status_uid(status), Some(1000));
+    assert_eq!(owned_by(status, 1000), Ok(true));
+    assert_eq!(owned_by(status, 1001), Ok(false));
+    for bad in [
+        &b"Name:\tx\nGid:\t5\n"[..],
+        b"Name:\tx\nUid:\tabc\t1\n",
+        b"Name:\tx\nUid:\t\n",
+        b"",
+    ] {
+        assert_eq!(status_uid(bad), None, "{bad:?}");
+        assert_eq!(owned_by(bad, 1000), Err(ScanError::Unreadable), "{bad:?}");
+    }
+    assert_eq!(
+        candidate_roots(Path::new("/s"), Some(Path::new("/r"))),
+        [
+            PathBuf::from("/s/editor"),
+            PathBuf::from("/r/dot-agent-deck/editor")
+        ]
+    );
+    assert_eq!(
+        candidate_roots(Path::new("/a b"), Some(Path::new("/r"))),
+        [PathBuf::from("/r/dot-agent-deck/editor")]
+    );
 }

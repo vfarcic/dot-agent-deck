@@ -42,7 +42,8 @@ pub(crate) fn spawn(
 ) -> Spawn {
     let bin = daemon.home.join(format!("bin-{name}"));
     std::fs::create_dir(&bin).unwrap();
-    let executable = bin.join(kind);
+    // A launcher runs Claude's executable below an assignment.
+    let executable = bin.join(if kind == "launcher" { "claude" } else { kind });
     let script = if kind == "codex" {
         include_str!("codex_composer.py")
     } else {
@@ -65,13 +66,13 @@ pub(crate) fn spawn(
         quote(&base),
         quote(common::contained_deck_binary())
     );
-    let command = if kind == "shell" {
-        format!(
+    let command = match kind {
+        "shell" => format!(
             "/bin/bash --noprofile --norc -c {}",
             quote(Path::new(&format!("exec {direct}")))
-        )
-    } else {
-        direct
+        ),
+        "launcher" => format!("DOT_AGENT_DECK_TEST_LAUNCHER=1 {direct}"),
+        _ => direct,
     };
     let mut env = vec![
         json!(["DOT_AGENT_DECK_TEST_COMPOSER_REPORT", "1"]),

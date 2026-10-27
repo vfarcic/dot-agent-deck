@@ -693,12 +693,14 @@ pub fn assumed_editor_probes() -> Vec<(AgentType, Version, EditorProbe<'static>)
 }
 
 /// [`assumed_editor_probes`], with a refused list as its reason: the
-/// variable unset or empty is no assumption.
+/// variable unset or empty is no assumption; set but not UTF-8 is refused.
 #[cfg(feature = "e2e")]
 pub fn read_assumed_editor_probes()
 -> Result<Vec<(AgentType, Version, EditorProbe<'static>)>, String> {
-    let Ok(list) = std::env::var(ASSUME_EDITOR_PROBE_ENV) else {
-        return Ok(Vec::new());
+    let list = match std::env::var(ASSUME_EDITOR_PROBE_ENV) {
+        Ok(list) => list,
+        Err(std::env::VarError::NotPresent) => return Ok(Vec::new()),
+        Err(std::env::VarError::NotUnicode(_)) => return Err("not UTF-8".to_string()),
     };
     Ok(parse_assumed_editor_probes(&list, &RELEASE_RECORDS)?
         .into_iter()

@@ -52,7 +52,7 @@ if os.environ.get('DOT_AGENT_DECK_TEST_COMPOSER_REPORT') == '1':
         json.dump({'argv': sys.argv, 'env': {
             name: os.environ.get(name)
             for name in ('VISUAL', 'EDITOR', 'CLAUDE_ENV_FILE')
-        }}, output)
+        }, 'names': sorted(os.environ)}, output)
 with open(base + '.pid', 'w') as output:
     output.write(str(os.getpid()))
 capture = open(base + '.bytes', 'ab', buffering=0)

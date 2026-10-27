@@ -20,6 +20,11 @@ const CHILD: &str = "DAD_EDITOR_ASSUMPTION_CHILD";
 /// Rerun `name` in a child with the assumption variable set to `value`, or
 /// unset for `None`, telling it what to expect.
 fn in_child(name: &str, value: Option<&str>, expect: &str) {
+    in_child_os(name, value.map(std::ffi::OsStr::new), expect);
+}
+
+/// [`in_child`], for a value that needn't be UTF-8.
+fn in_child_os(name: &str, value: Option<&std::ffi::OsStr>, expect: &str) {
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     command
         .args(["--exact", name, "--nocapture", "--test-threads=1"])
@@ -114,4 +119,25 @@ fn probe_066_an_invalid_assumption_is_refused_by_the_reader() {
     ] {
         in_child(name, Some(list), "refused");
     }
+}
+
+/// Scenario: In a child process, set the variable to bytes that aren't UTF-8. The real reader refuses the list, saying so, rather than reading it as unset, and the startup capture assumes nothing, so no class rolls out.
+#[spec("inbox/probe/066")]
+#[cfg(unix)]
+#[test]
+fn probe_066_an_assumption_that_is_not_utf8_is_refused() {
+    use std::os::unix::ffi::OsStrExt;
+    let name = "probe_066_an_assumption_that_is_not_utf8_is_refused";
+    if std::env::var_os(CHILD).is_some() {
+        assert_eq!(read_assumed_editor_probes(), Err("not UTF-8".to_string()));
+        assert!(capture_assumption().is_empty());
+        assert!(assumed_classes(captured_assumption()).is_empty());
+        println!("checked-in-child");
+        return;
+    }
+    in_child_os(
+        name,
+        Some(std::ffi::OsStr::from_bytes(b"claude@2.1.310\xff")),
+        "refused",
+    );
 }
