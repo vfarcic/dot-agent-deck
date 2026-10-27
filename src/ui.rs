@@ -4477,6 +4477,76 @@ fn adopt_context_path_into_owning_tab(
     }
 }
 
+/// Issue #1913: retire each tab slot that holds one of `surface`'s role pane
+/// ids for an agent a deck restart replaced, so the surface's role is placed
+/// rather than read as already shown. The surface must come from a named
+/// process the deck has not replaced; a late one from a replaced process is no
+/// newer than what the tabs hold.
+///
+/// - A slot whose local pane is still attached on a process the deck replaced
+///   is that pane lost to the restart, recorded as its reattach would record
+///   it, and [`process_restart_drops`] drops it now — attachment, slot, tab
+///   once empty — and names its agent in the restart notice, whether or not a
+///   card of the old agent was dropped with it.
+/// - A slot with no local pane under its id at all (a lost pane a card's
+///   focus dropped, whose own attach did not follow) in a tab that is not this
+///   surface's orchestration is forgotten from that tab, as a closed pane's.
+///   In this surface's own tab it is left for the surface to fill.
+fn retire_slots_a_restart_left(
+    state: &SharedState,
+    embedded: &EmbeddedPaneController,
+    tab_manager: &mut TabManager,
+    ui: &mut UiState,
+    surface: &OrchestrationSurface,
+    learned_from: &crate::daemon_client::Incarnation,
+) {
+    if learned_from.is_unnamed() || state.blocking_read().process_replaced(learned_from) {
+        return;
+    }
+    let mut lost = false;
+    let mut unheld: Vec<String> = Vec::new();
+    for role in &surface.roles {
+        let Some(tab_index) = tab_manager.tab_index_for_pane(&role.pane_id) else {
+            continue;
+        };
+        if !embedded.holds_pane(&role.pane_id) {
+            if !tab_manager.orchestration_tab_is(
+                tab_index,
+                &surface.cwd,
+                &surface.name,
+                surface.orchestration_id.as_deref(),
+            ) {
+                unheld.push(role.pane_id.clone());
+            }
+            continue;
+        }
+        if let Some(attached_on) = embedded.pane_incarnation(&role.pane_id)
+            && !attached_on.same_process(learned_from)
+            && state.blocking_read().process_replaced(&attached_on)
+        {
+            lost |= embedded.mark_lost_to_restart(&role.pane_id, &attached_on);
+        }
+    }
+    if lost {
+        process_restart_drops(state, embedded, tab_manager, ui);
+    }
+    for pane_id in unheld {
+        let Some(outcome) = tab_manager.forget_externally_closed_pane(&pane_id) else {
+            continue;
+        };
+        if outcome.tab_removed {
+            let mut st = state.blocking_write();
+            for dead in &outcome.dead_slot_pane_ids {
+                st.remove_sessions_for_pane(dead);
+            }
+        }
+        if ui.mode == UiMode::PaneInput && outcome.tab_removed && outcome.was_active {
+            ui.mode = UiMode::Normal;
+        }
+        ui.mark_session_dirty();
+    }
+}
+
 /// Build one live orchestration tab from a daemon [`OrchestrationSurface`].
 /// Idempotent on the role pane ids, so a duplicate broadcast (or a race with a
 /// reconnect that already hydrated the tab) doesn't double-build.
@@ -4505,23 +4575,9 @@ fn surface_one_orchestration(
     // already. Those are dropped and the rest are placed below, which grows the
     // existing tab, rather than the whole surface being skipped.
     //
-    // Issue #1913: a role whose pane id a tab holds through an attachment on
-    // another process than the surface's is a restart's stale placement, not
-    // this role's. The restart's drops take that attachment and its tab slot,
-    // so they land first: placed afterwards in this frame, the role would
-    // read as already shown and get no tab.
-    if surface.roles.iter().any(|role| {
-        tab_manager.tab_index_for_pane(&role.pane_id).is_some()
-            && embedded
-                .pane_incarnation(&role.pane_id)
-                .is_some_and(|attached_on| {
-                    !attached_on.is_unnamed()
-                        && !learned_from.is_unnamed()
-                        && !attached_on.same_process(learned_from)
-                })
-    }) {
-        process_restart_drops(state, embedded, tab_manager, ui);
-    }
+    // Issue #1913: a slot a deck restart left under one of these pane ids is
+    // not this role's, and goes before the ownership check below.
+    retire_slots_a_restart_left(state, embedded, tab_manager, ui, &surface, learned_from);
     let owned = |tab_manager: &TabManager, role: &crate::event::OrchestrationSurfaceRole| {
         tab_manager.tab_index_for_pane(&role.pane_id).is_some()
     };

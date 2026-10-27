@@ -28,6 +28,20 @@ fn listed(cwd: &str, orchestration_id: &str) -> Vec<crate::agent_pty::AgentRecor
     .unwrap()
 }
 
+/// How the TUI stands when the restarted deck's listing arrives.
+#[derive(Clone, Copy, Debug)]
+enum Before {
+    /// Only the reopened stream has told it of the restart.
+    StreamNoticed,
+    /// The old pane's reattach met the restarted deck first.
+    ReattachNoticed,
+    /// The old role had no card for the restart to drop.
+    OldRoleUncarded,
+    /// The old slot's local pane was already dropped, and nothing attached
+    /// in its place.
+    SlotUnheld,
+}
+
 /// One render-loop frame's drains, in the run loop's order.
 fn frame(
     state: &SharedState,
@@ -40,7 +54,7 @@ fn frame(
     process_restart_drops(state, pc.as_ref(), tabs, ui);
 }
 
-/// Scenario: The TUI shows an orchestration in its own tab when the deck restarts and the restarted deck runs an orchestration whose orchestrator reuses the old one's pane id. The event stream reopens on the restarted deck and resyncs from its listing, with or without the old pane's reattach having noticed the restart first. The old tab goes with the restart notice, and the restarted deck's orchestration gets a tab of its own, attached on the restarted deck, rather than a flat card on the Dashboard (issue #1913).
+/// Scenario: The TUI shows an orchestration in its own tab when the deck restarts and the restarted deck runs an orchestration whose orchestrator reuses the old one's pane id. The event stream reopens on the restarted deck and resyncs from its listing: with or without the old pane's reattach having noticed the restart first, with the old role holding no card, or with the old slot holding no local pane. The old tab goes, with the restart notice, and the restarted deck's orchestration gets a tab of its own, attached on the restarted deck, rather than a flat card on the Dashboard (issue #1913).
 // The restart fixture is a Unix-socket daemon.
 #[cfg(unix)]
 #[spec("lifecycle/handshake/014")]
@@ -51,7 +65,12 @@ fn handshake_014_a_restart_reusing_an_orchestrations_pane_ids_gets_its_own_tab()
         .enable_all()
         .build()
         .unwrap();
-    for reattach_noticed in [false, true] {
+    for case in [
+        Before::StreamNoticed,
+        Before::ReattachNoticed,
+        Before::OldRoleUncarded,
+        Before::SlotUnheld,
+    ] {
         let daemon = runtime.block_on(async { RestartingDaemon::spawn("a") });
         let controller = Arc::new(
             EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone())
@@ -86,8 +105,20 @@ fn handshake_014_a_restart_reusing_an_orchestrations_pane_ids_gets_its_own_tab()
         // same pane id; the event subscriber resubscribes as it does after a
         // gap.
         daemon.restart_as("b");
-        if reattach_noticed {
-            controller.mark_pane_lost_for_test("pane-1", PaneLostReason::DeckRestarted);
+        match case {
+            Before::StreamNoticed => {}
+            Before::ReattachNoticed => {
+                controller.mark_pane_lost_for_test("pane-1", PaneLostReason::DeckRestarted);
+            }
+            Before::OldRoleUncarded => {
+                state
+                    .blocking_write()
+                    .sessions
+                    .retain(|_, card| card.pane_id.as_deref() != Some("pane-1"));
+            }
+            Before::SlotUnheld => {
+                assert!(pc.forget_pane("pane-1"), "no local pane to drop");
+            }
         }
         {
             let records = listed(&cwd, "run-2");
@@ -100,11 +131,7 @@ fn handshake_014_a_restart_reusing_an_orchestrations_pane_ids_gets_its_own_tab()
         frame(&state, &pc, &mut tabs, &mut ui);
         frame(&state, &pc, &mut tabs, &mut ui);
 
-        let case = if reattach_noticed {
-            "reattach noticed the restart"
-        } else {
-            "the stream noticed the restart"
-        };
+        let case = format!("{case:?}");
         assert!(
             ui.restart_notice.is_some(),
             "{case}: the restart notice was not shown"
