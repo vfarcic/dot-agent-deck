@@ -53,6 +53,21 @@ fn captured(registry: &AgentPtyRegistry, agent_id: &str) -> Termination {
     }
 }
 
+/// Hold `agent` before its bounded termination observation starts.
+fn hold_capture(
+    registry: &AgentPtyRegistry,
+    agent: &str,
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (reached_tx, reached) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    registry
+        .termination_holds
+        .lock()
+        .unwrap()
+        .insert(agent.to_string(), (reached_tx, release_rx));
+    (reached, release)
+}
+
 /// Run the real reader over `steps` for a generation the registry holds
 /// with its child still running, and return the bytes it published and what
 /// it captured.
@@ -235,17 +250,33 @@ async fn status_032_removal_is_replaced_or_closed() {
     assert_eq!(shut_down, Termination::Closed, "the shutdown closed it");
 }
 
-/// Scenario: A respawn replaces a pane with a command that exits at once. The removed generation's capture must still say it was replaced, however soon the successor ended.
+/// Scenario: A respawn replaces a pane with a command that exits at once, holding the predecessor's termination observation until the successor publishes even when publication is delayed beyond the capture bound. The removed generation's capture must still say it was replaced, however soon the successor ended.
 #[spec("inbox/status/032")]
 #[tokio::test]
 async fn status_032_a_successor_that_exits_at_once_still_replaced_its_predecessor() {
     let registry = Arc::new(AgentPtyRegistry::new());
     let pane = "termination-brief-successor-pane";
     let replaced = spawn_on(&registry, pane, "sleep 30");
+    let (capture_reached, release_capture) = hold_capture(&registry, &replaced);
+    let (publish_reached, release_publish) = registry.pause_next_publish_for_test();
+    let delayed_publication = std::thread::spawn(move || {
+        capture_reached
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the predecessor's reader reached its capture");
+        publish_reached
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the successor reached publication");
+        std::thread::sleep(TERMINATION_WAIT * 2);
+        release_publish.send(()).expect("release publication");
+    });
     let successor = registry
         .respawn_agent_for_pane(pane, "exit 7")
         .await
         .expect("respawn");
+    delayed_publication.join().expect("delayed publication");
+    release_capture
+        .send(())
+        .expect("release the capture after publication");
     let (replaced, successor) = tokio::task::spawn_blocking({
         let registry = Arc::clone(&registry);
         move || {
@@ -344,7 +375,7 @@ fn capture_removed(
     registry: &AgentPtyRegistry,
     agent: &str,
     lifted: &RunningAgent,
-    settle: impl FnOnce() + Send,
+    settle: impl FnOnce(),
 ) -> Termination {
     let removal = Arc::clone(&lifted.removal);
     std::thread::scope(|scope| {
@@ -360,7 +391,7 @@ fn capture_now(registry: &AgentPtyRegistry, agent: &str, lifted: &RunningAgent) 
     capture_removed(registry, agent, lifted, || {})
 }
 
-/// Scenario: A respawn removes a generation and publishes its successor in time, publishes it only after the capture's bound, or ends without one, after or before the removed generation's capture starts. Only the published successor reads as replaced; a replacement still pending at the bound, or one that failed, reads as the pane having ended, in words that say neither replaced nor closed. Lifted children are killed and reaped even if an assertion fails.
+/// Scenario: A respawn removes a generation and publishes its successor before its held observation starts despite a delay beyond the capture bound, publishes it only after an unheld capture's bound, or fails after capture is called but held or before capture is called. Only the published successor reads as replaced; a replacement still pending at the bound, or one that failed, reads as the pane having ended, in words that say neither replaced nor closed. Lifted children are killed and reaped even if an assertion fails.
 #[spec("inbox/status/032")]
 #[test]
 fn status_032_a_replacement_counts_only_once_its_successor_is_published() {
@@ -378,12 +409,19 @@ fn status_032_a_replacement_counts_only_once_its_successor_is_published() {
         );
     };
 
-    // In time: the successor is published, then the respawn returns.
+    // Published before observation: hold the capture across a slow spawn.
     let first = spawn_on(&registry, pane, "cat");
     let (ticket, lifted) = lift_for_respawn(&registry, &first);
+    let (capture_reached, release_capture) = hold_capture(&registry, &first);
     let termination = capture_removed(&registry, &first, &lifted, || {
-        std::thread::sleep(Duration::from_millis(50));
+        capture_reached
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the predecessor reached its capture");
+        std::thread::sleep(TERMINATION_WAIT * 2);
         publish_successor(&registry, &ticket, pane, "cat");
+        release_capture
+            .send(())
+            .expect("release the capture after publication");
     });
     assert_eq!(termination, Termination::Replaced);
     drop(ticket);
@@ -408,11 +446,17 @@ fn status_032_a_replacement_counts_only_once_its_successor_is_published() {
         .pane_current_agent_id(pane)
         .expect("late successor");
 
-    // Failed while the capture waits: the respawn returns, publishing nothing.
+    // Failed while the capture is held: the respawn returns, publishing nothing.
     let (ticket, lifted) = lift_for_respawn(&registry, &late);
+    let (capture_reached, release_capture) = hold_capture(&registry, &late);
     let termination = capture_removed(&registry, &late, &lifted, || {
-        std::thread::sleep(Duration::from_millis(50));
+        capture_reached
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the failed replacement's predecessor reached its capture");
         drop(ticket);
+        release_capture
+            .send(())
+            .expect("release the capture after failure");
     });
     assert_eq!(termination, Termination::ReplacementFailed);
     ended(&termination);
