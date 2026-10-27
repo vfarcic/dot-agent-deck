@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use super::{
     DEFAULT_BINARY_NAME, ResolutionArm, TrustedWriters, durable_binary_resolution_judged,
-    untrusted_writer,
+    is_private_group, untrusted_writer,
 };
 
 fn name() -> String {
@@ -396,4 +396,67 @@ fn the_current_writers_trust_this_user_and_gid_zero() {
     let writers = TrustedWriters::current();
     assert_eq!(writers.uid, me());
     assert!(writers.groups.contains(&0));
+}
+
+/// The private-group decision itself, on supplied account records, so a
+/// mistake in it cannot hide behind the box's own groups. Accepted: the
+/// Debian/Ubuntu shape. Refused: every way another account can be in the group.
+#[test]
+fn the_private_group_decision_accepts_only_a_group_of_one() {
+    let alice = b"alice".as_slice();
+    let uid = 1000;
+    // (case, group name, supplementary members, primary-group uids, private?)
+    type Case<'a> = (&'a str, &'a [u8], &'a [&'a [u8]], &'a [u32], bool);
+    let cases: &[Case] = &[
+        (
+            "named after the user, nobody else",
+            b"alice",
+            &[],
+            &[1000],
+            true,
+        ),
+        (
+            "the user listed as its own member",
+            b"alice",
+            &[b"alice"],
+            &[1000],
+            true,
+        ),
+        (
+            "root's primary group is it too",
+            b"alice",
+            &[],
+            &[1000, 0],
+            true,
+        ),
+        (
+            "a shared primary group (staff, users)",
+            b"staff",
+            &[],
+            &[1000],
+            false,
+        ),
+        (
+            "another supplementary member",
+            b"alice",
+            &[b"alice", b"www-data"],
+            &[1000],
+            false,
+        ),
+        (
+            "another account's primary group",
+            b"alice",
+            &[],
+            &[1000, 1001],
+            false,
+        ),
+    ];
+    for (case, group, members, primary_uids, expected) in cases {
+        let members: Vec<Vec<u8>> = members.iter().map(|m| m.to_vec()).collect();
+        assert_eq!(
+            is_private_group(alice, uid, group, &members, primary_uids),
+            *expected,
+            "{case}"
+        );
+    }
 }

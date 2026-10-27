@@ -14,7 +14,7 @@
 **Trusted groups** (`TrustedWriters`) are the groups whose every member is already a trusted writer:
 
 - gid 0 (`root` on Linux, `wheel` on macOS), whose membership only root arranges;
-- the user's **private group**: their primary group, named after them, with no supplementary member but them. This is the Debian/Ubuntu default, where `umask 002` makes `~/.local/bin`, `~/.cargo/bin` and the binaries `cargo install` copies there `0775`;
+- the user's **private group**: their primary group, named after them, with no other account in it (`is_private_group`). This is the Debian/Ubuntu default, where `umask 002` makes `~/.local/bin`, `~/.cargo/bin` and the binaries `cargo install` copies there `0775`. "No other account" is read from the group's member list *and* from a `getpwent` scan for accounts whose primary group it is, because `getgrgid`'s member list omits those;
 - on macOS, `admin`, whose members stock macOS lets `sudo` to root. Homebrew makes its prefix and kegs group-writable by it, and `/Applications` is `root:admin 0775`.
 
 Every other group is untrusted, however few members it has. A shared primary group (`staff` on macOS, `users` on some Linux distributions) is exactly the other-account writer the policy exists to refuse. A lookup that fails trusts fewer groups, never more.
@@ -29,7 +29,7 @@ Every other group is untrusted, however few members it has. A shared primary gro
 | 2b, the first match on `$PATH` | skipped; the walk continues to the next entry |
 | 3, the running binary as a last resort | **refused**: nothing is written |
 
-Every candidate that existed but was skipped for trust is named, with its reason, in the step-3 warning and in the refusal, so an install the deck passed over is not a silent mystery. The refusal ends with what to do: `chmod go-w` on what it names, or install to `~/.local/bin`.
+Every candidate that existed but was skipped for trust is named, with its reason, in the refusal and in a warning whenever a later candidate is pinned instead, so an install the deck passed over is not a silent mystery. The refusal ends with what to do: `chmod go-w` on what it names, or install to `~/.local/bin`.
 
 ## Options considered
 
@@ -60,7 +60,7 @@ Under this policy it resolves, unchanged, on both a CI runner and a development 
 ## What it does not cover
 
 - **ACLs.** Only mode bits are read. An ACL that grants another account write is not seen.
-- **Primary-group members.** `getgrgid`'s member list omits accounts whose *primary* group a group is, so an account root has given the user's private group as its primary one is not seen. Only root can arrange that.
+- **Accounts a directory service does not enumerate.** The scan for accounts whose primary group is the user's private group sees what `getpwent` enumerates: local accounts, and directory accounts only where enumeration is on (it is off by default in SSSD). A directory account given the user's private group as its primary one is not seen.
 - **The window between check and use is narrowed, not closed.** After resolution, only the user and root can change what the pin names; both could already run code as the user.
 - **Windows.** There is no cheap equivalent, so nothing is refused there.
 

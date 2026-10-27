@@ -490,8 +490,9 @@ pub fn binary_name() -> String {
 /// and writable by no one else, a sticky directory and a group the user alone
 /// is in excepted ([`TrustedWriters`]). A candidate failing that at step 1,
 /// 1b, 2a or 2b is skipped and resolution continues; step 3 failing it is a
-/// refusal. The candidates skipped this way are named in the step-3 warning
-/// and in the refusal, so an install the deck passed over is not a mystery.
+/// refusal. The candidates skipped this way are named in the refusal, and in a
+/// warning whenever another candidate is pinned instead, so an install the
+/// deck passed over is not a mystery.
 ///
 /// `current_exe()` failing outright is a refusal too, **never** a fallback to
 /// [`DEFAULT_BINARY_NAME`] (issue #536). A bare `dot-agent-deck` in a file
@@ -635,20 +636,38 @@ fn durable_binary_resolution_judged(
     path_value: Option<&std::ffi::OsStr>,
     writers: &TrustedWriters,
 ) -> Result<Resolved, String> {
-    let resolved = |path: String, arm: ResolutionArm| Ok(Resolved { path, arm });
     let name = durable_binary_file_name();
     let installed = home.join(".local").join("bin").join(&name);
     // Issue #732: every candidate that existed but failed the trust policy,
-    // with why, so the last-resort warning and the refusal can name them.
-    let mut passed_over: Vec<(PathBuf, String)> = Vec::new();
-    let mut trusted = |candidate: &Path| match untrusted_writer(candidate, writers) {
+    // with why, so whichever answer comes back can name them. A `RefCell`
+    // because the check that records them and the arms that report them are
+    // two closures alive at once.
+    let passed_over: std::cell::RefCell<Vec<(PathBuf, String)>> = Default::default();
+    let trusted = |candidate: &Path| match untrusted_writer(candidate, writers) {
         None => true,
         Some(reason) => {
+            let mut passed_over = passed_over.borrow_mut();
             if !passed_over.iter().any(|(path, _)| path == candidate) {
                 passed_over.push((candidate.to_path_buf(), reason));
             }
             false
         }
+    };
+    // Not silent when a candidate was passed over: the pin then names a
+    // different copy than the one the user may expect, possibly an older one
+    // later on `$PATH`. The last resort logs its own warning, which carries the
+    // same note.
+    let resolved = |path: String, arm: ResolutionArm| {
+        let passed_over = passed_over.borrow();
+        if arm != ResolutionArm::LastResort && !passed_over.is_empty() {
+            tracing::warn!(
+                "pinning `{path}` into agent hook config instead of a copy the trust policy \
+                 refused.{} {}",
+                passed_over_note(&passed_over, Some(Path::new(&path))),
+                trust_repair_advice(&installed)
+            );
+        }
+        Ok(Resolved { path, arm })
     };
 
     let exe = match current_exe {
@@ -725,7 +744,7 @@ fn durable_binary_resolution_judged(
     }
 
     if let Some(path_value) = path_value
-        && let Some(found) = first_durable_path_match(path_value, &name, &mut trusted)
+        && let Some(found) = first_durable_path_match(path_value, &name, &trusted)
         && let Some(path) = durable_path_string(&found)
     {
         return resolved(path, ResolutionArm::Install);
@@ -778,7 +797,7 @@ fn durable_binary_resolution_judged(
             "refusing to write `{}` into agent hook config: {reason}, and every hook would run \
              it as you, so it must be a file only you and root can change.{} {}",
             absolute.display(),
-            passed_over_note(&passed_over, Some(&absolute)),
+            passed_over_note(&passed_over.borrow(), Some(&absolute)),
             trust_repair_advice(&installed)
         ));
     }
@@ -790,7 +809,7 @@ fn durable_binary_resolution_judged(
              dot-agent-deck (neither `{}` nor any absolute `$PATH` entry holds one the deck can \
              use), so it will stop working if that file is removed.{} {}",
             installed.display(),
-            passed_over_note(&passed_over, None),
+            passed_over_note(&passed_over.borrow(), None),
             repair_advice(&installed)
         );
         return resolved(path, ResolutionArm::LastResort);
@@ -803,7 +822,7 @@ fn durable_binary_resolution_judged(
         absolute.display(),
         rejection_reason(&absolute),
         installed.display(),
-        passed_over_note(&passed_over, None),
+        passed_over_note(&passed_over.borrow(), None),
         repair_advice(&installed)
     ))
 }
@@ -1450,13 +1469,14 @@ fn is_executable_file(candidate: &std::path::Path) -> bool {
 /// - **gid 0** — `root` on Linux, `wheel` on macOS — whose membership only root
 ///   arranges.
 /// - **the user's private group**: the user's primary group, named after the
-///   user, with no supplementary member but the user. This is what every
-///   Debian/Ubuntu account gets, under a `umask 002` that makes `~/.local/bin`,
-///   `~/.cargo/bin` and the binaries `cargo install` copies there
-///   group-writable; refusing it would refuse the default Linux layout.
-///   `getgrgid`'s member list omits accounts whose *primary* group it is, so an
-///   account root has given this group as its primary one is not seen —
-///   only root can arrange that.
+///   user, with no other account in it ([`is_private_group`]). This is what
+///   every Debian/Ubuntu account gets, under a `umask 002` that makes
+///   `~/.local/bin`, `~/.cargo/bin` and the binaries `cargo install` copies
+///   there group-writable; refusing it would refuse the default Linux layout.
+///   "No other account" is read from the group's member list and from a scan
+///   of the accounts whose primary group it is, which sees every account the
+///   account database enumerates; one a directory service does not enumerate
+///   is not seen.
 /// - **`admin`, on macOS**, whose members stock macOS lets `sudo` to root.
 ///   Homebrew makes its prefix (`/opt/homebrew/bin`, `/usr/local/bin` on
 ///   Intel) and its kegs group-writable by it, and `/Applications` is too.
@@ -1657,13 +1677,74 @@ fn group_label(gid: u32) -> String {
 }
 
 /// The user's private group (see [`TrustedWriters`]): `uid`'s primary gid, when
-/// that group carries the user's own name and no supplementary member but the
-/// user. `None` when it does not, or when either lookup fails.
+/// [`is_private_group`] says so. `None` when it does not, or when a lookup
+/// fails.
 #[cfg(unix)]
 fn private_group(uid: u32) -> Option<u32> {
     let (user, gid) = user_record(uid)?;
     let (group, members) = group_record(gid)?;
-    (group == user && members.iter().all(|member| *member == user)).then_some(gid)
+    // The cheap checks first: most groups fail on the name, and the account
+    // scan is then never run.
+    if !is_private_group(&user, uid, &group, &members, &[]) {
+        return None;
+    }
+    is_private_group(
+        &user,
+        uid,
+        &group,
+        &members,
+        &accounts_with_primary_group(gid),
+    )
+    .then_some(gid)
+}
+
+/// Whether a group is the private group of the account `user` (`uid`): it
+/// carries the account's name, no supplementary member (`supplementary`, from
+/// `getgrgid`) but the account, and no account but it and root has it as a
+/// primary group (`primary_uids`). The last term is there because `getgrgid`'s
+/// member list omits accounts whose *primary* group it is, so a group can look
+/// private from the member list alone while another account writes as it.
+/// Pure, so the decision is testable without the box's account database.
+fn is_private_group(
+    user: &[u8],
+    uid: u32,
+    group: &[u8],
+    supplementary: &[Vec<u8>],
+    primary_uids: &[u32],
+) -> bool {
+    group == user
+        && supplementary.iter().all(|member| member.as_slice() == user)
+        && primary_uids.iter().all(|&other| other == uid || other == 0)
+}
+
+/// The uid of every account the account database enumerates whose primary
+/// group is `gid`. An account a directory service does not enumerate (LDAP or
+/// SSSD with enumeration off, the usual default) is not seen.
+#[cfg(unix)]
+fn accounts_with_primary_group(gid: u32) -> Vec<u32> {
+    // `getpwent` walks one process-wide cursor, so this crate's callers take
+    // turns on it; nothing else in the crate enumerates accounts.
+    static ENUMERATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _turn = ENUMERATION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut uids = Vec::new();
+    // SAFETY: `setpwent`/`endpwent` take no arguments. Each non-null record
+    // `getpwent` returns is valid until the next call, and is read before it.
+    unsafe {
+        libc::setpwent();
+        loop {
+            let entry = libc::getpwent();
+            if entry.is_null() {
+                break;
+            }
+            if (*entry).pw_gid == gid {
+                uids.push((*entry).pw_uid);
+            }
+        }
+        libc::endpwent();
+    }
+    uids
 }
 
 /// Run one `get*_r` lookup with a buffer that grows on `ERANGE`. `call` returns
