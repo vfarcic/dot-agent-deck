@@ -6738,10 +6738,11 @@ struct PointerWrite {
     queued: bool,
     /// How long the dispatch was queued, from arm time until it dequeued.
     queued_for: Duration,
-    /// The write has begun and not yet returned.
+    /// The dispatch holds the pane's locks and its task is not acknowledged.
     in_progress: bool,
-    /// How long the posted task waited for the worker to acknowledge it
-    /// (PRD #1666; before it, how long a typed pointer waited for a draft).
+    /// How long from the dispatch taking the pane's locks to the worker's
+    /// acknowledgement (PRD #1666 part 3; before it, from the post, and
+    /// before PRD #1666, how long a typed pointer waited for a draft).
     deferred: Duration,
 }
 
@@ -6767,11 +6768,12 @@ pub struct DelegationIdleClock {
     /// How long the dispatch was queued before it went on towards its write.
     /// The idle clock runs that much later.
     pub pointer_queued_for: Duration,
-    /// The task is posted and the worker has not acknowledged it yet, so how
-    /// long it waited is not known yet.
+    /// The dispatch holds the pane's locks, and the worker has not
+    /// acknowledged its task yet, so how long it waited is not known yet.
     pub pointer_in_progress: bool,
-    /// How long the posted task waited for the worker's acknowledgement. The
-    /// idle clock runs that much later.
+    /// How long from the dispatch taking the pane's locks to the worker's
+    /// acknowledgement. The idle clock runs that much later, so it starts at
+    /// the acknowledgement.
     pub pointer_deferred: Duration,
 }
 
@@ -8161,10 +8163,11 @@ impl AgentPtyRegistry {
         }
     }
 
-    /// Issue #544: the delegation `seq` on `worker_pane_id` is about to post
-    /// its task, which the worker then has to acknowledge. Until
-    /// [`Self::finish_delegation_pointer_write`], the idle-worker watch holds
-    /// its report. A no-op if the record is gone or a newer one replaced it.
+    /// Issue #544: the dispatch of delegation `seq` on `worker_pane_id` holds
+    /// the pane's locks and goes on to post its task, which the worker then
+    /// has to acknowledge. Until [`Self::finish_delegation_pointer_write`],
+    /// the idle-worker watch holds its report. A no-op if the record is gone
+    /// or a newer one replaced it.
     pub fn begin_delegation_pointer_write(&self, worker_pane_id: &str, seq: u64) {
         let mut tracker = self.delegations.lock();
         if let Some(record) = tracker.records.get_mut(worker_pane_id)
@@ -8176,8 +8179,9 @@ impl AgentPtyRegistry {
         }
     }
 
-    /// Issue #544: the post [`Self::begin_delegation_pointer_write`] announced
-    /// has ended — acknowledged after `deferred`, or refused (zero).
+    /// Issue #544: the dispatch [`Self::begin_delegation_pointer_write`]
+    /// announced has ended — its task acknowledged `deferred` after the
+    /// dispatch began, or never posted.
     pub fn finish_delegation_pointer_write(
         &self,
         worker_pane_id: &str,
@@ -8185,6 +8189,31 @@ impl AgentPtyRegistry {
         deferred: Duration,
     ) {
         let mut tracker = self.delegations.lock();
+        Self::finish_pointer_locked(&mut tracker, worker_pane_id, seq, deferred);
+    }
+
+    /// [`Self::finish_delegation_pointer_write`] for a destructor, as
+    /// [`Self::dequeue_delegation_pointer_write_in_drop`] is.
+    pub(crate) fn finish_delegation_pointer_write_in_drop(
+        &self,
+        worker_pane_id: &str,
+        seq: u64,
+        deferred: Duration,
+    ) {
+        if let Some(mut tracker) = self
+            .delegations
+            .lock_in_drop(crate::lock_rank::OnPoison::Skip)
+        {
+            Self::finish_pointer_locked(&mut tracker, worker_pane_id, seq, deferred);
+        }
+    }
+
+    fn finish_pointer_locked(
+        tracker: &mut DelegationTracker,
+        worker_pane_id: &str,
+        seq: u64,
+        deferred: Duration,
+    ) {
         if let Some(record) = tracker.records.get_mut(worker_pane_id)
             && record.seq == seq
         {
