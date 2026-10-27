@@ -1,6 +1,15 @@
 //! `inbox/doorbell/053`: the composer probe's permission to arm, from a
 //! release's `editor_probe` record, and the e2e assumption that stands in for
 //! one (`src/composer_probe/mod.rs`, `src/doorbell_activation.rs`).
+#[cfg(all(not(feature = "e2e"), target_os = "linux"))]
+mod common;
+#[cfg(all(not(feature = "e2e"), target_os = "linux"))]
+#[path = "support/inbox_doorbell.rs"]
+mod inbox;
+#[cfg(all(not(feature = "e2e"), target_os = "linux"))]
+#[path = "support/editor_installation.rs"]
+mod installation;
+
 use dot_agent_deck::composer_probe::{Binding, InertCause, Permission, permission};
 use dot_agent_deck::doorbell_activation::{
     EditorProbe, EditorSelection, ExportShape, KeymapSource, LatchedRelease, Measurement,
@@ -155,6 +164,86 @@ fn doorbell_053_no_shipped_release_is_armable() {
                 record.release
             );
         }
+    }
+}
+
+/// Scenario: Run this test again in separate subprocesses of a build without the e2e feature, with valid and malformed editor-probe assumption variables set. The production reader ignores both values and leaves every shipped release unable to arm; on Linux, the actual production daemon also starts synthetic commands whose original editor environment and complete argv must survive unchanged.
+#[spec("inbox/probe/012")]
+#[test]
+#[cfg(not(feature = "e2e"))]
+fn probe_012_production_reader_ignores_set_editor_assumption() {
+    const ASSUME: &str = "DOT_AGENT_DECK_E2E_ASSUME_EDITOR_PROBE";
+    const CHILD: &str = "DOT_AGENT_DECK_PRODUCTION_READER_CHILD";
+    if let Some(expected) = std::env::var_os(CHILD) {
+        assert_eq!(std::env::var_os(ASSUME), Some(expected));
+        assert!(
+            assumed_editor_probes().is_empty(),
+            "a set e2e variable must not supply production editor records"
+        );
+        for record in &RELEASE_RECORDS {
+            let header = LatchedRelease::Known(record.release.clone());
+            assert_eq!(
+                permission(
+                    &RELEASE_RECORDS,
+                    &record.agent,
+                    Some(&header),
+                    Binding::Bound
+                ),
+                Permission::Inert(InertCause::NoEditorRecord),
+                "{:?} {} must remain inert in the production build",
+                record.agent,
+                record.release
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use serde_json::{Value, json};
+            let value = std::env::var(ASSUME).unwrap();
+            let daemon = common::spawn_daemon_serve_with_env(None, "0", &[(ASSUME, &value)]);
+            for kind in ["claude", "codex", "opencode", "pi", "wrapper"] {
+                for (state, original) in [
+                    ("unset", None),
+                    ("empty", Some("")),
+                    ("set", Some("user-editor --literal")),
+                ] {
+                    let name = format!("production-{kind}-{state}");
+                    let release = if kind == "codex" {
+                        "0.164.0"
+                    } else {
+                        "2.1.310"
+                    };
+                    let spawned =
+                        installation::spawn(&daemon, &name, kind, release, original, None, false);
+                    assert_eq!(spawned.report["env"]["VISUAL"], json!(original), "{name}");
+                    assert_eq!(spawned.report["env"]["EDITOR"], json!(original), "{name}");
+                    assert_eq!(
+                        spawned.report["env"]["CLAUDE_ENV_FILE"],
+                        Value::Null,
+                        "{name}"
+                    );
+                    assert_eq!(spawned.report["argv"], spawned.original_argv, "{name}");
+                }
+            }
+        }
+        return;
+    }
+    for value in ["claude@2.1.310,codex@0.164.0", "broken"] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "probe_012_production_reader_ignores_set_editor_assumption",
+                "--nocapture",
+            ])
+            .env(ASSUME, value)
+            .env(CHILD, value)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "production reader with {value:?}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 

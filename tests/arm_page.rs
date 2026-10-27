@@ -65,12 +65,15 @@ fn count_for(k: u64) -> u32 {
     (k as u32).wrapping_mul(0x9e37_79b9)
 }
 
-/// Scenario: Publish to a page in this process and read it back: a new, zeroed page reads count 0 and `seg_seq` 0, which is absent; a count above 2¹⁶ with a `seg_seq` above 2³², the largest count with the largest `seg_seq`, and count 0 with a later `seg_seq` each read back unchanged, word 0 holding the count in its high half and an even `seq` in its low half, at offsets 0 and 8; a count above zero is present, and count 0 absent. The platform has lock-free 64-bit atomics, so the page is available.
+/// Scenario: Check that the shared ABI reserves three aligned 64-bit words, then publish to a page in this process and read it back. A zeroed page is absent; wide and maximum counts and segment numbers read back unchanged, and a positive count is present.
 #[spec("inbox/probe/007")]
 #[test]
 fn probe_007_a_publication_reads_back_whole() {
     assert_eq!(availability(), Ok(()));
-    assert_eq!(WORDS_BYTES, 16);
+    assert_eq!(
+        WORDS_BYTES, 24,
+        "the arm ABI must reserve word 0, seg_seq and native_seq"
+    );
     assert_eq!(halves(word(0x1_0001, 6)), (0x1_0001, 6));
 
     let page = Page::new(0, 0);
@@ -226,11 +229,25 @@ fn probe_007_a_reader_paused_mid_read_starts_over() {
     }
 }
 
-/// Scenario: A page that can't be read: no mapping (a null pointer), `MAP_FAILED`, a page one byte off 8-byte alignment, and one shorter than the two words. Each reads as present, with its reason, and a publisher won't take a null, misaligned or short page; 16 aligned bytes read.
+/// Scenario: Reject null, failed and misaligned mappings, and every length shorter than the three-word ABI, including an old 16-byte page. Each unreadable page is present, both reader and publisher reject short pages, and 24 aligned bytes read.
 #[spec("inbox/probe/007")]
 #[test]
 fn probe_007_a_page_that_cannot_be_read_is_present() {
     let page = Page::new(0, 0);
+    let mut short_failures = Vec::new();
+    for len in 0..24 {
+        // SAFETY: the allocation covers 24 bytes and all accesses are atomic;
+        // the supplied length must be checked before any word is accessed.
+        unsafe {
+            let read = ArmReader::read_at(page.ptr(), len);
+            let publish_error = Publisher::at(page.ptr(), len).err();
+            if read != ArmRead::Unread(Unread::Page(PageError::Short))
+                || publish_error != Some(PageError::Short)
+            {
+                short_failures.push((len, read, publish_error));
+            }
+        }
+    }
     let map_failed = usize::MAX as *mut u8;
     // SAFETY: none of these is read, as `at` checks before it reads.
     let reads = unsafe {
@@ -269,13 +286,17 @@ fn probe_007_a_page_that_cannot_be_read_is_present() {
             Some(PageError::Short)
         );
         assert_eq!(
-            ArmReader::read_at(page.ptr(), WORDS_BYTES),
+            ArmReader::read_at(page.ptr(), 24),
             ArmRead::Read {
                 count: 0,
                 seg_seq: 0
             }
         );
     }
+    assert!(
+        short_failures.is_empty(),
+        "reader and publisher must refuse every page without native_seq: {short_failures:?}"
+    );
 }
 
 /// What a stress reader saw.
