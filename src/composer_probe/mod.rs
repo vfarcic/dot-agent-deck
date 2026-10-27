@@ -9,17 +9,24 @@
 //! file an agent exports ([`path_rule`]), the classifier of whose editor
 //! invocation it is ([`classifier`]), the arm page the daemon publishes
 //! to its editor helper ([`arm`]), the permission to arm ([`permission`]),
-//! and the input epoch with the query ledger, `B` and the native hazard FIFO
-//! kept beside it ([`epoch`], [`query_ledger`]). The daemon feeds the hook
-//! every byte an agent writes, and moves the epoch at the PTY writer's
-//! enqueue; nothing in it reads what the hook or the epoch tracks yet, or
-//! calls the path rule, the classifier or the permission, or maps an arm
+//! the input epoch with the query ledger, `B` and the native hazard FIFO
+//! kept beside it ([`epoch`], [`query_ledger`]), and installation: the
+//! decision at each spawn ([`install`]) and the instance directory it
+//! installs from ([`instance`], Linux). The daemon feeds the hook every byte
+//! an agent writes, moves the epoch at the PTY writer's enqueue, and decides
+//! installation at every spawn, which installs nothing outside the `e2e`
+//! build's assumption until activation; nothing in it reads what the hook or
+//! the epoch tracks yet, or calls the path rule, the classifier or the
+//! permission, or publishes to an arm
 //! page.
 
 pub mod arm;
 pub mod classifier;
 pub mod epoch;
 pub mod framing;
+pub mod install;
+#[cfg(target_os = "linux")]
+pub mod instance;
 pub mod paste_mode;
 pub mod path_rule;
 pub mod query_ledger;

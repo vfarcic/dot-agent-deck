@@ -282,7 +282,7 @@ fn detect_from_tokens(tokens: &[String], budget: usize) -> Option<AgentType> {
 /// quoted run is preserved so a quoted executable path stays one token). This is
 /// a deliberately small shell-word splitter — enough for agent detection
 /// ([`AgentType::from_command`]), not a full POSIX parser.
-fn tokenize_command(cmd: &str) -> Vec<String> {
+pub(crate) fn tokenize_command(cmd: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut cur = String::new();
     let mut started = false;

@@ -1839,6 +1839,13 @@ fn spawn_with_dir(
     // reads. Only `spawn_agent`'s overlay, this daemon's own value, reaches a
     // child.
     cmd.env_remove(crate::inbox_receipt::ENV_INBOX_SPOOL);
+    // PRD #1666 part 3 (Q35-13): the editor helper's variables, on the same
+    // rule. Only an installed spawn's own overlay sets them, so one left in
+    // the daemon's environment never points a child's helper at another
+    // daemon's instance or generation.
+    for var in crate::composer_probe::install::HELPER_ENV {
+        cmd.env_remove(var);
+    }
     // The receipt watcher's test knobs, likewise: one left in the daemon's
     // environment never reaches an agent's watcher unless the spawn sets it.
     for knob in crate::inbox_watcher::TEST_KNOBS {
@@ -3482,6 +3489,11 @@ pub struct RunningAgent {
     /// token attests with, moved here from its reservation when it is
     /// published. Never on the wire.
     pub attest_facts: crate::hook_provenance::AttestFacts,
+    /// PRD #1666 part 3 (Q35-13): this generation's editor-helper
+    /// installation, `None` when it wasn't installed. Held for the
+    /// generation's life; dropping it unmaps the arm page, and the instance
+    /// files stay.
+    pub composer_install: Option<crate::composer_probe::install::Installation>,
 }
 
 /// Issue #714: the source of [`RunningAgent::quota_block`] epochs. Only
@@ -12193,6 +12205,59 @@ impl AgentPtyRegistry {
         } else {
             None
         };
+        // PRD #1666 part 3 (Q35-13, plan §1.2): installation eligibility,
+        // decided before the spawn from the command class and the rollout,
+        // never from a release. After the captures above, so `spawn_env` and
+        // `spawn_command` stay what the caller asked for and a respawn's new
+        // generation is decided afresh. Off the executor: the first installed
+        // spawn copies the daemon's binary into its instance.
+        let composer_install = crate::inbox_hub::off_the_executor(|| {
+            crate::composer_probe::install::at_spawn(
+                opts.command,
+                opts.agent_type.as_ref(),
+                &preallocated_id,
+                &opts.env,
+            )
+        });
+        let composer_install = match composer_install {
+            Ok(installation) => {
+                tracing::info!(
+                    target: "composer_probe",
+                    agent_id = %preallocated_id,
+                    class = ?installation.class(),
+                    "editor helper installed"
+                );
+                Some(installation)
+            }
+            Err(crate::composer_probe::install::NotInstalled::HelperSetup(cause)) => {
+                tracing::warn!(
+                    target: "composer_probe",
+                    agent_id = %preallocated_id,
+                    ?cause,
+                    "editor helper not installed: setup failed"
+                );
+                None
+            }
+            Err(why) => {
+                tracing::debug!(
+                    target: "composer_probe",
+                    agent_id = %preallocated_id,
+                    ?why,
+                    "editor helper not installed"
+                );
+                None
+            }
+        };
+        let installed_command = composer_install
+            .as_ref()
+            .and_then(|installation| installation.command(opts.command));
+        if let Some(installation) = &composer_install {
+            installation.apply_env(&mut opts.env);
+        }
+        let opts = SpawnOptions {
+            command: installed_command.as_deref().or(opts.command),
+            ..opts
+        };
         let guard = PtyGuard::new(spawn_with_dir(opts, dir)?);
         // PRD #1666 part 3, round 5-wake: before anything can reap the child,
         // so the pid is still its own, and outside the registry lock.
@@ -12548,6 +12613,7 @@ impl AgentPtyRegistry {
             // PRD #1666 part 3, round 5: moved from the reservation, under
             // the lock that publishes the record.
             attest_facts,
+            composer_install,
         };
 
         // Use the id we pre-allocated above (before spawn) and injected
@@ -13278,6 +13344,10 @@ impl AgentPtyRegistry {
             // as the same orchestration seat. Its `unit` is set when the
             // replacement is published, never copied.
             attest_facts: previous_facts,
+            // PRD #1666 part 3 (Q35-13): the replacement is a new generation,
+            // installed or not at its own spawn; the old one's page is unmapped
+            // with it.
+            composer_install: _,
             // Issue #454: the OLD record is being removed outright, so its
             // handover flag has nothing left to disown. The fresh generation
             // starts `false` and takes the pane over in `spawn_agent`.
@@ -16095,6 +16165,7 @@ impl AgentPtyRegistry {
                 quota_block: None,
                 authoring_kind: None,
                 attest_facts: crate::hook_provenance::AttestFacts::default(),
+                composer_install: None,
             },
         );
         id

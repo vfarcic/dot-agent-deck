@@ -3928,6 +3928,11 @@ async fn run_daemon_serve_cli(
     // inherits the launching TUI's directory and the two agree on the file by
     // construction.
     dot_agent_deck::features::init_and_watch(&launch_project_dir());
+    // PRD #1666 part 3 (Q35-13): the e2e editor-probe assumption is read once,
+    // here, before any endpoint is served; a list it refuses is logged now
+    // and assumes nothing for this daemon's life. A production build reads no
+    // variable.
+    dot_agent_deck::composer_probe::install::capture_assumption();
     let mut initial = AppState::default();
     initial.hook_binaries = hook_binaries;
     let state = Arc::new(RwLock::new(initial));
