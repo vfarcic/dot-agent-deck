@@ -7,13 +7,14 @@
 //! the framing tokenizer ([`framing`]), the output hook with its
 //! bracketed-paste tracker ([`paste_mode`]), the rule for trusting the
 //! file an agent exports ([`path_rule`]), the classifier of whose editor
-//! invocation it is ([`classifier`]), the arm page the daemon publishes
-//! to its editor helper ([`arm`]), the permission to arm ([`permission`]),
-//! the input epoch with the query ledger, `B` and the native hazard FIFO
-//! kept beside it ([`epoch`], [`query_ledger`]), a generation's invocation
-//! records, what each settles and its writer scope ([`record`]), the
-//! segments each check or held Ctrl+G opens and what releases and completes
-//! them ([`segments`]), and installation: the
+//! invocation it is ([`classifier`]), the daemon's own attribution of an
+//! invocation and its read of the export ([`attest`], Linux), the arm page
+//! the daemon publishes to its editor helper ([`arm`]), the permission to
+//! arm ([`permission`]), the input epoch with the query ledger, `B` and the
+//! native hazard FIFO kept beside it ([`epoch`], [`query_ledger`]), a
+//! generation's invocation records, what each settles and its writer scope
+//! ([`record`]), the segments each check or held Ctrl+G opens and what
+//! releases and completes them ([`segments`]), and installation: the
 //! decision at each spawn ([`install`]) and the instance directory it
 //! installs from ([`instance`], Linux), and the editor helper an installed
 //! agent runs as its editor ([`helper`], Linux), which the binary dispatches
@@ -21,11 +22,13 @@
 //! moves the epoch at the PTY writer's enqueue, and decides installation at
 //! every spawn, which installs nothing outside the `e2e` build's assumption
 //! until activation; nothing in the daemon reads what the hook or the epoch
-//! tracks yet, or calls the path rule, the classifier or the permission, or
-//! keeps an invocation record or a segment, or publishes to an arm page, and
-//! it refuses every helper invocation as unsupported.
+//! tracks yet, or calls the path rule, the classifier, the attestation or
+//! the permission, or keeps an invocation record or a segment, or publishes
+//! to an arm page, and it refuses every helper invocation as unsupported.
 
 pub mod arm;
+#[cfg(target_os = "linux")]
+pub mod attest;
 pub mod classifier;
 pub mod epoch;
 pub mod framing;
