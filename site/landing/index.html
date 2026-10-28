@@ -284,11 +284,11 @@
     <section class="telemetry" aria-labelledby="telemetry-title">
       <div class="telemetryInner">
         <h2 id="telemetry-title" class="sectionTitle">Know what every run did</h2>
-        <p class="telemetryIntro">Point the deck at the OpenTelemetry backend of your choice, hosted or your own, and it sends a record of every agent run: which agent ran, in which role, how long it worked, when you stepped in, what kinds of shell commands it ran, how long its pull request’s CI took, how many tokens it used on which model and what they would cost at list price, and how it ended. Over weeks and across machines, that tells you which agent or model finishes a kind of task with the least help from you, and how much of a run went to tests and CI.</p>
+        <p class="telemetryIntro">Point the deck at the OpenTelemetry backend of your choice, hosted or your own, and it sends a record of every agent run: which agent ran, in which role, how long it worked, when you stepped in, what kinds of shell commands it ran, how long its pull request’s CI took, how it ended, and, for the agents that report them, how many tokens it used on which model and what they would cost at list price. Over weeks and across machines, that tells you which agent or model finishes a kind of task with the least help from you, and how much of a run went to tests and CI.</p>
         <ul class="telemetryList">
           <li><span class="check" aria-hidden="true">✓</span><span><strong>Off until you turn it on.</strong> With no backend configured, the deck sends nothing. Once on, it works the same whether you use the terminal UI, the desktop app or both.</span></li>
           <li><span class="check" aria-hidden="true">✓</span><span><strong>Metadata only.</strong> Prompts, file contents, agent output and your API key are never part of the deck’s record. Each agent’s own telemetry, which the deck can switch on and tie to the same run, follows that agent’s settings.</span></li>
-          <li><span class="check" aria-hidden="true">✓</span><span><strong>CPU, memory and disk per run,</strong> on Linux, from an optional collector you run beside the deck.</span></li>
+          <li><span class="check" aria-hidden="true">✓</span><span><strong>CPU and memory per run, disk per worktree,</strong> on Linux, from an optional collector you run beside the deck.</span></li>
         </ul>
         <p class="clientLink"><a href="https://github.com/vfarcic/dot-agent-deck/blob/main/docs/telemetry.md">Read about telemetry →</a></p>
       </div>
@@ -429,6 +429,10 @@
     var poster = document.getElementById('video-poster');
     if (poster) {
       poster.addEventListener('click', function (event) {
+        // A modified click keeps its usual meaning: a new tab or window.
+        if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) {
+          return;
+        }
         event.preventDefault();
         var player = document.createElement('iframe');
         player.src = poster.getAttribute('data-embed');
