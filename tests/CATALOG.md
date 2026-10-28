@@ -10100,6 +10100,10 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Platform coverage:** mac+linux.
 - **Cost:** half a second, the time the hook gives the push to land before the clear.
 
+#### inbox/probe
+
+- **inbox/probe/038** — vitest `inbox/probe/038: …` in `desktop/src/components/TerminalViewport.replay.test.tsx` and `desktop/src/components/TerminalViewport.replayColour.test.tsx` (desktop linkage by test title, as in `question/desktop`; Rust `#[spec]` discovery does not scan TypeScript). **Layer:** desktop component integration, real browser `@xterm/xterm` parser and asynchronous WriteBuffer in jsdom; only the GPU and layout addons are stubbed. **Agent:** none. **Asserts:** each historical DA1, DA2, DSR, normal/private CPR, ANSI/private DECRQM, DECRQSS, window pixel/cell/character report, OSC 4/10/11/12 colour query and focus enable produces no input, while each same query live has its normal single reply; text following each history query is rendered. A large replay paused by an asynchronous parser handler forwards a real key, paste and Shift+Enter in order during that yield, focus-shaped `terminal.input` calls later in the same synchronous parse survive, and input after replay survives. Mixed `?1004;2004h` and repeated focus enables preserve paste mode and later real focus changes. Live queries directly before and after consecutive transcript/backlog replays on generation replacement answer, history does not, and a disposed/remounted pane behaves the same. Replayed window-title push/pop and colour changes still work. Colour boundaries (the second file): back-to-back sets and queries in one buffer, a query before a set, stacked query slots (including one reached through an empty slot, and a BEL-terminated OSC 4 pair list) and a stacked set each behave as above; a set and a query in one sequence, special or indexed, is skipped whole in history, its set included (the disclosed limit, pinned, with the later live indexed query asserted to give its one theme-colour reply), while live it sets and answers. The installed dependency's direct `triggerDataEvent` sites in `InputHandler.ts` and `CoreBrowserTerminal.ts`, the named focus/window/colour event dispatch sites in `InputHandler.ts` and the exercised query families are counted per method, so a change in the number of counted reply calls in a named method requires review and coverage; a change that leaves those counts the same (a reply's condition or payload, or a reply added under an existing dispatch), a reply added in another file and one through another call spelling are not detected. **Does not assert:** real webview rendering, a real agent's reaction to a late attach (M46), C1's future live CPR policy, unsupported XTVERSION (installed xterm 6.0.0 has no such reply site), wall-clock throughput, or other xterm terminal-name emulations' DA reply contents. The yield is forced through the real parser's promise path rather than relying on a machine taking more than 12 ms. **Platform coverage:** jsdom on Node; no OS-specific GUI.
+
 #### inbox/boundary
 
 ##### inbox/boundary/001 — No ack-wait redelivers a receipt hand-out.
@@ -13109,6 +13113,32 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 - **Asserts:** the native child has nonzero dimensions matching the overlay frame; OCR of the composed X display inside that frame finds the real PR title; Back, Open in browser and Close are visible and usable; Close and Escape from both the toolbar and focused GitHub page remove the overlay and native view; the system-browser handoff receives the real PR URL. The same checks run from the agent pane and the overview row as a control.
 - **Does not assert:** macOS WKWebView or Windows WebView2 placement; GitHub login or cookie persistence; real-agent work. The system browser is replaced by a URL recorder, while the embedded GitHub page is real.
 - **Platform coverage:** Verified on Linux WebKitGTK only, under Xvfb at 96 DPI; macOS WKWebView is not covered and the reported macOS blank/unclosable page was not reproduced here. In addition to the driver tier's prerequisites, this local scenario needs authenticated `gh`, network access to GitHub and PR #1601, Tesseract (`DAD_DRIVER_TESSERACT` or PATH), `/usr/bin/python3` with PyGObject/Gdk 3, and `xdotool` (`DAD_DRIVER_XDOTOOL` or PATH). Nix WebKitGTK also needs its `glib-networking` modules supplied in `GIO_EXTRA_MODULES` for HTTPS. From the repository root, run `DAD_DRIVER_REAL_GITHUB=1 bash desktop/scripts/driver-test.sh` to build and run the driver suite including this scenario; use `--no-build` only with an existing driver-seam-enabled embedded bundle. Evidence, including passing runs, is saved under the gitignored `desktop/driver-results/pull-request-live-<pid>/`.
+
+## Test Case Catalog (continued: tool-operation completion)
+
+##### telemetry/otlp/021 — A normally ended operation has no forced-closure marker.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_operation_end.rs`); real hook CLI and local OTLP/JSON receiver.
+- **Agent:** none; a `cat` stand-in receives synthetic Claude hooks.
+- **Asserts:** matching Bash start/end hooks export the shell operation before run end, omit the `deck.operation.end` attribute entirely, leave the card Working without Error, and closing the pane retains exactly that operation unchanged.
+- **Does not assert:** real-agent hook emission, desktop rendering, or Error end events.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/022 — An operation left open at run end identifies forced closure.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_operation_end.rs`), local OTLP/JSON receiver.
+- **Agent:** none; a `cat` stand-in.
+- **Asserts:** closing a pane with an open shell call exports an operation with `deck.operation.end=run_end` and the run's end timestamp.
+- **Does not assert:** natural exit or daemon shutdown individually, or real-agent execution.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/023 — The open-operation cap identifies the operation it closes.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_operation_end.rs`), local OTLP/JSON receiver.
+- **Agent:** none; a `cat` stand-in.
+- **Asserts:** one more call than the cap exports the oldest call before run end with `deck.operation.end=cap`; its late end leaves the remaining calls for run-end closure.
+- **Does not assert:** sustained overload or real parallel agent calls.
+- **Platform coverage:** mac+linux.
 
 ## Test Case Catalog — Telemetry identity
 
