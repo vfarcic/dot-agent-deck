@@ -13113,3 +13113,85 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 - **Asserts:** the native child has nonzero dimensions matching the overlay frame; OCR of the composed X display inside that frame finds the real PR title; Back, Open in browser and Close are visible and usable; Close and Escape from both the toolbar and focused GitHub page remove the overlay and native view; the system-browser handoff receives the real PR URL. The same checks run from the agent pane and the overview row as a control.
 - **Does not assert:** macOS WKWebView or Windows WebView2 placement; GitHub login or cookie persistence; real-agent work. The system browser is replaced by a URL recorder, while the embedded GitHub page is real.
 - **Platform coverage:** Verified on Linux WebKitGTK only, under Xvfb at 96 DPI; macOS WKWebView is not covered and the reported macOS blank/unclosable page was not reproduced here. In addition to the driver tier's prerequisites, this local scenario needs authenticated `gh`, network access to GitHub and PR #1601, Tesseract (`DAD_DRIVER_TESSERACT` or PATH), `/usr/bin/python3` with PyGObject/Gdk 3, and `xdotool` (`DAD_DRIVER_XDOTOOL` or PATH). Nix WebKitGTK also needs its `glib-networking` modules supplied in `GIO_EXTRA_MODULES` for HTTPS. From the repository root, run `DAD_DRIVER_REAL_GITHUB=1 bash desktop/scripts/driver-test.sh` to build and run the driver suite including this scenario; use `--no-build` only with an existing driver-seam-enabled embedded bundle. Evidence, including passing runs, is saved under the gitignored `desktop/driver-results/pull-request-live-<pid>/`.
+
+## Test Case Catalog — Intervention kinds
+
+##### telemetry/otlp/028 — Typed steering is a text intervention.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_telemetry_intervention_kinds.rs`, `telemetry_otlp_028_text_intervention`); real binary, attached TUI and isolated OTLP HTTP/JSON receiver.
+- **Agent:** raw-input shell/cat stand-in; no model or credential.
+- **Asserts:** printable steering, Backspace and Enter reach the raw stand-in; one burst exports kind text and count 1; the private sentinel stays absent from OTLP bodies.
+- **Does not assert:** real-agent prompt rendering, mouse input, unbracketed-paste detection, or burst separation after five seconds.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/029 — Bracketed paste is a paste intervention.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_telemetry_intervention_kinds.rs`, `telemetry_otlp_029_paste_intervention`); real binary, attached TUI and isolated OTLP HTTP/JSON receiver.
+- **Agent:** raw-input shell/cat stand-in; no model or credential.
+- **Asserts:** bracketed-paste bytes reach the stand-in intact; the run exports kind paste and count 1 without its content.
+- **Does not assert:** real-agent prompt rendering, mouse input, unbracketed-paste detection, or burst separation after five seconds.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/030 — Cursor, Alt and mouse navigation is classified separately.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_telemetry_intervention_kinds.rs`, `telemetry_otlp_030_navigation_intervention`); real binary, attached TUI and isolated OTLP HTTP/JSON receiver.
+- **Agent:** raw-input shell/cat stand-in; no model or credential.
+- **Asserts:** cursor keys and an Alt chord reach the stand-in through the TUI; a separate run receives mouse reports through an attach stream; each exports kind navigate and count 1.
+- **Does not assert:** real-agent prompt rendering, mouse routing through TUI chrome, unbracketed-paste detection, or burst separation after five seconds.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/031 — Ctrl+C and Escape are interrupt interventions.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_telemetry_intervention_kinds.rs`, `telemetry_otlp_031_interrupt_intervention`); real binary, attached TUI and isolated OTLP HTTP/JSON receiver.
+- **Agent:** raw-input shell/cat stand-in; no model or credential.
+- **Asserts:** separate stand-in runs receive Ctrl+C and lone Escape through the TUI, and double Escape through an attach stream that preserves both bytes; each exports one interrupt, including a lone Escape flushed at run closure.
+- **Does not assert:** real-agent prompt rendering, mouse input, unbracketed-paste detection, or burst separation after five seconds.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/032 — Typing into a prompt is an answer intervention.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_telemetry_intervention_kinds.rs`, `telemetry_otlp_032_typed_answer_intervention`); real binary, attached TUI and isolated OTLP HTTP/JSON receiver.
+- **Agent:** raw-input shell/cat stand-in; no model or credential.
+- **Asserts:** permission-request and plain waiting-for-input hooks precede private typed answers in separate runs; each exports one answer without its content.
+- **Does not assert:** real-agent prompt rendering, mouse input, unbracketed-paste detection, or burst separation after five seconds.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/033 — A held-channel deck answer counts as a human intervention.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_telemetry_intervention_kinds.rs`, `telemetry_otlp_033_deck_held_answer_intervention`); real binary, attached TUI and isolated OTLP HTTP/JSON receiver.
+- **Agent:** raw-input shell/cat stand-in; no model or credential.
+- **Asserts:** a held synthetic permission hook receives an answer submitted through the question client API; no answer keys enter the pane, and its run exports one answer intervention.
+- **Does not assert:** real-agent prompt rendering, mouse input, unbracketed-paste detection, or burst separation after five seconds.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/034 — Interrupt upgrades the existing text burst.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_telemetry_intervention_kinds.rs`, `telemetry_otlp_034_interrupt_upgrades_text_burst`); real binary, attached TUI and isolated OTLP HTTP/JSON receiver.
+- **Agent:** raw-input shell/cat stand-in; no model or credential.
+- **Asserts:** private text followed by Ctrl+C in the same burst exports one interrupt and count 1 without its content.
+- **Does not assert:** real-agent prompt rendering, mouse input, unbracketed-paste detection, or burst separation after five seconds.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/035 — Automatic inbox doorbells do not count as interventions.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_telemetry_intervention_kinds.rs`, `telemetry_otlp_035_deck_doorbell_is_not_intervention`); real binary, attached TUI and isolated OTLP HTTP/JSON receiver.
+- **Agent:** raw-input shell/cat stand-in; no model or credential.
+- **Asserts:** a posted inbox task produces a doorbell received by the stand-in, with zero exported intervention events and count 0; the task sentinel stays private.
+- **Does not assert:** real-agent prompt rendering, mouse input, unbracketed-paste detection, or burst separation after five seconds.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/036 — Claude idle-prompt notifications do not turn steering into answers.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_telemetry_intervention_kinds.rs`, `telemetry_otlp_036_idle_notification_is_text`); real binary, attached TUI and isolated OTLP HTTP/JSON receiver.
+- **Agent:** raw-input shell/cat stand-in; no model or credential.
+- **Asserts:** a waiting-for-input event marked idle_prompt precedes private typed steering; the run exports text and count 1 without the sentinel.
+- **Does not assert:** real-agent prompt rendering, mouse input, unbracketed-paste detection, or burst separation after five seconds.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/037 — Mixed bursts use interrupt, answer, paste, text, navigate precedence.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_telemetry_intervention_kinds.rs`, `telemetry_otlp_037_kind_precedence_and_question_escape`); real binary, attached TUI and isolated OTLP HTTP/JSON receiver.
+- **Agent:** raw-input shell/cat stand-in; no model or credential.
+- **Asserts:** navigation plus text exports text, text plus bracketed paste exports paste, paste while a permission question is pending exports answer, and Escape while that question is pending exports interrupt; each run counts one burst and keeps its content private.
+- **Does not assert:** real-agent prompt rendering, mouse input, unbracketed-paste detection, or burst separation after five seconds.
+- **Platform coverage:** mac+linux.
