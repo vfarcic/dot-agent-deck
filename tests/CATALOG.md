@@ -11080,7 +11080,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/claude/040 — A prompt's receipt work shares one deadline.
 - **Layer:** Fast (`src/inbox_prompt.rs`), `commit_attempts_by` and `fetch_with_receipts` with one deadline against stand-in sockets that serve receipts.
 - **Agent:** none.
-- **Asserts:** against a prompt deck both phases complete, each asking `inbox_receipts` first on its own connection; against one that waits 1.3 s before each answer, the commit and the fetch together are done within the shared 1.5 s plus 2 s (four budgets in turn would take over 5 s), the commit `Sent` and the fetch, with the budget spent, taking nothing.
+- **Asserts:** against a prompt deck both phases complete, each asking `inbox_receipts` first on its own connection; against a deck that promptly answers the capability query and records the commit but gates its acknowledgement until the client's shared 1.5 s expires, the commit is `Sent`, both phases finish within that wait plus 2 s, and the fetch using the expired deadline takes nothing and opens no new connection (the listen queue stays empty).
 - **Does not assert:** the hook's status send or its own grant, output and spool work, which the budget does not cover.
 - **Platform coverage:** mac+linux.
 
