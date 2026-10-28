@@ -50,11 +50,12 @@
 //! types nothing into the pane.
 //!
 //! **Input, prompt changes and deck answers are applied in the order the deck
-//! accepted them**, which is the caller's job, not the tracker's: the tracker
+//! recorded them**, which is the caller's job, not the tracker's: the tracker
 //! applies each in the order it is handed them, reads the prompt as the cards
 //! show it then, and never moves a run's last input backward, so a burst's
 //! time can only grow. [`super::exporter`] hands each pane's input over before
-//! the first event broadcast after it was written.
+//! the first event broadcast after telemetry was told about it, just after
+//! the pane accepted it.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -338,7 +339,7 @@ impl ActiveRun {
     /// See [`RunTracker::observe_run_input`]. Input while the agent waits on
     /// a prompt is an answer, unless it interrupts. Input handed over with a
     /// time before the run's last input counts at that last time: the order
-    /// it was handed over in is the order the deck accepted it.
+    /// it was handed over in is the order the deck recorded it in.
     fn human_input(&mut self, now: u64, kind: InterventionKind) {
         let kind = if self.prompt_open() {
             kind.max(InterventionKind::Answer)
@@ -779,8 +780,8 @@ impl RunTracker {
     /// be reported here. Keystrokes less than [`INTERVENTION_COALESCE_NANOS`]
     /// apart count as one intervention, of the strongest `kind` among them.
     /// Input is read in the order it is reported in, against the run's cards
-    /// as they stand then: report it before the first event the deck accepted
-    /// after it, and after every event before.
+    /// as they stand then: report it before the first event the deck
+    /// broadcast after it, and after every event before.
     pub fn observe_run_input(
         &mut self,
         pane_id: &str,
