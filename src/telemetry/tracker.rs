@@ -108,6 +108,9 @@ pub const MAX_OPEN_OPERATIONS: usize = 64;
 /// naming one of them ends nothing unless that call is still open.
 pub const MAX_SEEN_CALL_IDS: usize = 256;
 
+/// The questions one run remembers the deck answers by typing, newest kept.
+pub const MAX_TYPED_QUESTIONS: usize = 16;
+
 /// The event metadata key carrying the agent's id for one tool call, which
 /// pairs a call's end with its start when several run at once.
 const TOOL_CALL_ID_METADATA_KEY: &str = "tool_use_id";
@@ -338,6 +341,11 @@ struct ActiveRun {
     /// The call ids this run's shell starts and ends named, at most
     /// [`MAX_SEEN_CALL_IDS`], oldest first.
     seen_call_ids: VecDeque<String>,
+    /// The ids of the questions this run's agent asked that the deck answers
+    /// by typing keys into the pane, at most [`MAX_TYPED_QUESTIONS`], oldest
+    /// first: those keys are the person's input already, so the deck's
+    /// "answered" event for one of them is not counted again.
+    typed_questions: VecDeque<String>,
     /// The pull request whose checks the run's card holds now, whose CI state
     /// it shares with every other run holding it ([`RunTracker::ci`]).
     ci_pr: Option<PrKey>,
@@ -567,6 +575,24 @@ impl ActiveRun {
                 *attribute = Attribute::str(AttrKey::InterventionKind, kind.as_str());
             }
         }
+    }
+
+    /// Remember whether the deck answers `question` by typing keys into the
+    /// pane ([`crate::question::AnswerChannel::Keys`]): the latest
+    /// registration of an id says.
+    fn note_question(&mut self, question: &crate::question::PendingQuestion) {
+        self.typed_questions.retain(|id| *id != question.id);
+        if question.channel == crate::question::AnswerChannel::Keys {
+            if self.typed_questions.len() >= MAX_TYPED_QUESTIONS {
+                self.typed_questions.pop_front();
+            }
+            self.typed_questions.push_back(question.id.clone());
+        }
+    }
+
+    /// Whether the deck answered question `id` by typing keys into the pane.
+    fn answer_was_typed(&self, id: Option<&str>) -> bool {
+        id.is_some_and(|id| self.typed_questions.iter().any(|typed| typed == id))
     }
 
     /// Whether the run's pane's card shows the agent waiting on a question
@@ -845,6 +871,7 @@ impl RunTracker {
                 operations: Vec::new(),
                 operations_count: 0,
                 seen_call_ids: VecDeque::new(),
+                typed_questions: VecDeque::new(),
                 ci_pr: None,
                 ci_seen: None,
                 ci_pending_since: None,
@@ -1009,13 +1036,18 @@ impl RunTracker {
             EventType::PermissionRequest => run.idle_wait = false,
             _ => {}
         }
+        if let Some(question) = event.question() {
+            run.note_question(&question);
+        }
         // The daemon answered a question for a person in the deck's question
-        // UI. The answer is theirs, whether or not the deck typed it, and
-        // counts from when the daemon accepted it: the daemon makes this event
-        // and stamps it then, on the clock input is timed by.
+        // UI. The answer is theirs, and counts from when the daemon accepted
+        // it: the daemon makes this event and stamps it then, on the clock
+        // input is timed by. An answer the deck typed into the pane counted
+        // as those keys were written, so its event is not counted again.
         if event
             .metadata
             .contains_key(crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY)
+            && !run.answer_was_typed(event.resolved_question_id())
         {
             let accepted = event
                 .timestamp
@@ -2485,6 +2517,85 @@ pub(crate) mod tests {
         tracker.begin_run(start("p1"), 0);
         tracker.observe_event(&released, 10);
         assert_eq!(kinds_at_end(&mut tracker, "p1", 20), (vec![], 0));
+    }
+
+    /// The deck's "answered" event for a question it answers by typing keys
+    /// into the pane is not counted again: the keys counted as they were
+    /// written, however long before the event. A held question's answer types
+    /// nothing, so its event is the one count.
+    #[test]
+    fn a_deck_answer_counts_once_on_either_channel() {
+        let second = 1_000_000_000;
+        let asking = |channel: &str| {
+            let mut e = event("p1", EventType::PermissionRequest);
+            e.set_question(
+                &serde_json::from_value(serde_json::json!({
+                    "id": "q1",
+                    "kind": "permission",
+                    "questions": [{"prompt": "Allow?", "options": [
+                        {"index": 1, "label": "Yes", "role": "allow_once"},
+                        {"index": 2, "label": "No", "role": "deny"},
+                    ]}],
+                    "raised_at_ms": 1,
+                    "channel": channel,
+                }))
+                .unwrap(),
+            );
+            assert!(e.question().is_some(), "the fixture is a question");
+            e
+        };
+        let answered = || {
+            let mut e = event("p1", EventType::Thinking);
+            e.metadata.insert(
+                crate::event::QUESTION_RESOLVED_METADATA_KEY.into(),
+                "q1".into(),
+            );
+            e.metadata.insert(
+                crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY.into(),
+                crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_VALUE.into(),
+            );
+            e.timestamp = chrono::DateTime::from_timestamp_nanos(10 * second as i64);
+            e
+        };
+
+        // The deck typed the answer's last key more than the coalescing
+        // window before it broadcast the event.
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.observe_event(&event("p1", EventType::SessionStart), 1);
+        tracker.observe_event(&asking("keys"), 2);
+        tracker.observe_human_input("p1", 3 * second, InterventionKind::Text);
+        tracker.observe_event(&answered(), 10 * second);
+        assert_eq!(
+            kinds_at_end(&mut tracker, "p1", 20 * second),
+            (vec!["answer".to_string()], 1),
+            "keys channel"
+        );
+
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.observe_event(&event("p1", EventType::SessionStart), 1);
+        tracker.observe_event(&asking("held"), 2);
+        tracker.observe_event(&answered(), 10 * second);
+        assert_eq!(
+            kinds_at_end(&mut tracker, "p1", 20 * second),
+            (vec!["answer".to_string()], 1),
+            "held channel"
+        );
+
+        // A question asked again under its id on the held channel is answered
+        // without typing, whatever channel it was on before.
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.observe_event(&event("p1", EventType::SessionStart), 1);
+        tracker.observe_event(&asking("keys"), 2);
+        tracker.observe_event(&asking("held"), 3);
+        tracker.observe_event(&answered(), 10 * second);
+        assert_eq!(
+            kinds_at_end(&mut tracker, "p1", 20 * second),
+            (vec!["answer".to_string()], 1),
+            "re-asked on the held channel"
+        );
     }
 
     #[test]

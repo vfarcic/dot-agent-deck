@@ -410,10 +410,10 @@ enum Command {
     },
 }
 
-/// A test seam pausing a task at one point: signal the first half, then wait
-/// for the second.
+/// A test seam pausing a task at one point: signal the first half, then await
+/// the second, which suspends the task without blocking the thread it runs on.
 #[cfg(test)]
-type Gate = (oneshot::Sender<()>, std::sync::mpsc::Receiver<()>);
+type Gate = (oneshot::Sender<()>, oneshot::Receiver<()>);
 
 /// A run's input filter, from its commit until the tracker ends the run,
 /// with the generation it is for.
@@ -699,17 +699,22 @@ struct Shared {
     /// See [`Telemetry::set_dispatch_lookup`].
     dispatch_lookup: OnceLock<DispatchLookup>,
     /// Test seam: pauses the ingest task once inside its `escape_held`
-    /// branch, after signalling the first half, until the second receives.
+    /// branch, after signalling the first half, until the second resolves.
     #[cfg(test)]
     timer_gate: Mutex<Option<Gate>>,
     /// Test seam: pauses the ingest task once as it is about to wait out a
     /// lone `ESC` before an event ([`Shared::observe_in_order`]).
     #[cfg(test)]
     wait_gate: Mutex<Option<Gate>>,
-    /// Test seam: pauses the ingest task once the command queue first polls
-    /// empty, before the other branches are polled.
+    /// Test seam: pauses the ingest task once the command queue is first
+    /// found empty, before any branch is polled ([`pause_at_command_gate`]).
     #[cfg(test)]
     command_gate: Mutex<Option<Gate>>,
+    /// The ingest task resumed from [`Self::command_gate`]: the queue was
+    /// empty when it paused, so the other branches are polled before it is
+    /// again.
+    #[cfg(test)]
+    command_gate_resumed: std::sync::atomic::AtomicBool,
 }
 
 struct Exporting {
@@ -1694,9 +1699,11 @@ impl Shared {
         {
             let due = due.min(now + LONE_ESCAPE_WINDOW);
             #[cfg(test)]
-            if let Some((entered, resume)) = self.wait_gate.lock().unwrap().take() {
+            let gate = self.wait_gate.lock().unwrap().take();
+            #[cfg(test)]
+            if let Some((entered, resume)) = gate {
                 let _ = entered.send(());
-                let _ = resume.recv();
+                let _ = resume.await;
             }
             tokio::time::sleep_until(Instant::from_std(due)).await;
         }
@@ -1773,6 +1780,8 @@ fn start_exporting(
         wait_gate: Mutex::new(None),
         #[cfg(test)]
         command_gate: Mutex::new(settings.command_gate),
+        #[cfg(test)]
+        command_gate_resumed: std::sync::atomic::AtomicBool::new(false),
     });
     let (commands, rx) = mpsc::unbounded_channel();
     let ingest = tokio::spawn(run_ingest(Arc::clone(&shared), rx));
@@ -1802,6 +1811,8 @@ async fn run_ingest(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiver<C
     usage_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let usage_polling = Arc::new(std::sync::atomic::AtomicBool::new(false));
     loop {
+        #[cfg(test)]
+        pause_at_command_gate(&shared, &commands).await;
         tokio::select! {
             biased;
             command = next_command(&shared, &mut commands) => {
@@ -1822,9 +1833,11 @@ async fn run_ingest(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiver<C
             }
             () = shared.escape_held.notified() => {
                 #[cfg(test)]
-                if let Some((entered, resume)) = shared.timer_gate.lock().unwrap().take() {
+                let gate = shared.timer_gate.lock().unwrap().take();
+                #[cfg(test)]
+                if let Some((entered, resume)) = gate {
                     let _ = entered.send(());
-                    let _ = resume.recv();
+                    let _ = resume.await;
                 }
                 drain(&shared, &mut events, &mut read).await;
                 escape_due = shared.settle_escapes(std::time::Instant::now(), read);
@@ -1860,24 +1873,39 @@ async fn next_command(
     commands.recv().await
 }
 
-/// [`mpsc::UnboundedReceiver::recv`], paused once at [`Shared::command_gate`]
-/// the first time it finds the queue empty.
+/// [`mpsc::UnboundedReceiver::recv`], which once resumed from
+/// [`Shared::command_gate`] first yields, so the other branches are polled
+/// before the queue, as when it was polled empty.
 #[cfg(test)]
 async fn next_command(
     shared: &Shared,
     commands: &mut mpsc::UnboundedReceiver<Command>,
 ) -> Option<Command> {
-    std::future::poll_fn(|cx| {
-        let polled = commands.poll_recv(cx);
-        if polled.is_pending()
-            && let Some((entered, resume)) = shared.command_gate.lock().unwrap().take()
-        {
-            let _ = entered.send(());
-            let _ = resume.recv();
-        }
-        polled
-    })
-    .await
+    if shared
+        .command_gate_resumed
+        .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        tokio::task::yield_now().await;
+    }
+    commands.recv().await
+}
+
+/// Test seam: pause the ingest task at [`Shared::command_gate`] the first
+/// time the command queue is found empty, before any branch is polled, by
+/// awaiting its second half rather than blocking the thread.
+#[cfg(test)]
+async fn pause_at_command_gate(shared: &Shared, commands: &mpsc::UnboundedReceiver<Command>) {
+    if !commands.is_empty() {
+        return;
+    }
+    let Some((entered, resume)) = shared.command_gate.lock().unwrap().take() else {
+        return;
+    };
+    let _ = entered.send(());
+    let _ = resume.await;
+    shared
+        .command_gate_resumed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 async fn sleep_until(due: Option<std::time::Instant>) {
@@ -3637,7 +3665,7 @@ mod tests {
         // An Escape on another pane takes the task into its timer branch,
         // where it waits.
         let (entered, picked) = oneshot::channel();
-        let (resume, paused) = std::sync::mpsc::channel();
+        let (resume, paused) = oneshot::channel();
         *shared.timer_gate.lock().unwrap() = Some((entered, paused));
         telemetry.observe_client_input("p0", b"\x1b");
         picked.await.unwrap();
@@ -3719,7 +3747,7 @@ mod tests {
             // An Escape on another pane holds the ingest task in its timer
             // branch while the key is written and the status broadcast.
             let (entered, picked) = oneshot::channel();
-            let (resume, paused) = std::sync::mpsc::channel();
+            let (resume, paused) = oneshot::channel();
             *shared.timer_gate.lock().unwrap() = Some((entered, paused));
             telemetry.observe_client_input("p0", b"\x1b");
             picked.await.unwrap();
@@ -3736,6 +3764,39 @@ mod tests {
                 "{before:?} then {after:?}"
             );
         }
+    }
+
+    /// The receiver handed to [`Telemetry::subscribe`] already has a prompt
+    /// opening waiting on it, which the ingest task reads first and numbers
+    /// from 0; input is written after it and before the prompt closes, all of
+    /// it applied in one pass. The input is an answer: the input clock starts
+    /// after the waiting messages, where the ingest task's numbering of the
+    /// next one does, so the input is counted after the prompt opened and
+    /// before it closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn input_after_messages_waiting_at_subscribe_is_placed_among_them() {
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        begin(&telemetry, generation("p0", "other"), &[]);
+        begin(&telemetry, generation("p1", "a1"), &[]);
+        let (tx, events) = broadcast::channel(16);
+        tx.send(of("p1", "a1", EventType::SessionStart)).unwrap();
+        tx.send(of("p1", "a1", EventType::PermissionRequest))
+            .unwrap();
+        telemetry.settled().await;
+
+        let resume = hold_ingest(&telemetry, "p0").await;
+        telemetry.subscribe(events);
+        telemetry.observe_client_input("p1", b"y");
+        tx.send(of("p1", "a1", EventType::Thinking)).unwrap();
+        resume.send(()).unwrap();
+
+        telemetry.settled().await;
+        telemetry.end_run("p1", Some("a1"), EndReason::Exited, None);
+        telemetry.settled().await;
+        assert_eq!(
+            intervention_kinds(&captured(&mut rx)),
+            vec![AttrValue::Str("answer".into())]
+        );
     }
 
     /// A paste whose end marker never comes is read as ended once
@@ -3791,10 +3852,10 @@ mod tests {
 
     /// Holds the ingest task in its timer branch, by an Escape on `pane`,
     /// until the returned sender is sent to; returns once it is held.
-    async fn hold_ingest(telemetry: &Telemetry, pane: &str) -> std::sync::mpsc::Sender<()> {
+    async fn hold_ingest(telemetry: &Telemetry, pane: &str) -> oneshot::Sender<()> {
         let shared = &telemetry.exporting.as_ref().unwrap().shared;
         let (entered, picked) = oneshot::channel();
-        let (resume, paused) = std::sync::mpsc::channel();
+        let (resume, paused) = oneshot::channel();
         *shared.timer_gate.lock().unwrap() = Some((entered, paused));
         telemetry.observe_client_input(pane, b"\x1b");
         picked.await.unwrap();
@@ -4030,7 +4091,7 @@ mod tests {
         }
         tx.send(answered).unwrap();
         let (entered, waiting) = oneshot::channel();
-        let (go, paused) = std::sync::mpsc::channel();
+        let (go, paused) = oneshot::channel();
         *shared.wait_gate.lock().unwrap() = Some((entered, paused));
         resume.send(()).unwrap();
         waiting.await.unwrap();
@@ -4641,7 +4702,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_dispatched_run_closed_before_ingest_keeps_its_name() {
         let (entered, polled_empty) = oneshot::channel();
-        let (resume, paused) = std::sync::mpsc::channel();
+        let (resume, paused) = oneshot::channel();
         let (sink, mut rx) = mpsc::channel(QUEUE_CAPACITY);
         let telemetry = Arc::new(Telemetry::start_with(
             &env(&ON),
@@ -4929,7 +4990,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_escape_whose_wake_beats_its_runs_commit_still_settles() {
         let (entered, polled_empty) = oneshot::channel();
-        let (resume, paused) = std::sync::mpsc::channel();
+        let (resume, paused) = oneshot::channel();
         let (sink, mut rx) = mpsc::channel(QUEUE_CAPACITY);
         let telemetry = Arc::new(Telemetry::start_with(
             &env(&ON),
