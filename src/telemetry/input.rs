@@ -19,8 +19,9 @@
 //! filter settles it as a person's with [`InputFilter::settle_lone_escape`]
 //! once [`LONE_ESCAPE_WINDOW`] has passed with nothing after it, or when the
 //! run ends. When a write follows sooner, [`InputFilter::decide_held`] says
-//! what it made of the `ESC`, apart from the rest of that write, so the key
-//! can be counted when the `ESC` was written.
+//! what it made of the `ESC`, with the rest of that key's bytes and apart from
+//! what follows the key, so the key can be counted once, when the `ESC` was
+//! written.
 //!
 //! **What the input was is told apart the same way** ([`InterventionKind`]),
 //! from the bytes alone and never by keeping them: a key that interrupts, a
@@ -192,22 +193,42 @@ impl InputFilter {
     }
 
     /// Feed the start of one accepted write, as [`Self::classify`] would,
-    /// only until the sequence held from an earlier write is decided: what it
-    /// turned out to be — the Escape key before another `ESC`, Alt with a
-    /// key, a key's sequence — and how many bytes of `bytes` that took.
-    /// `None` when it was a terminal report, when it is still incomplete once
-    /// `bytes` run out, or when nothing was held, which takes no bytes.
+    /// only until the sequence held from an earlier write is decided and
+    /// ended: what it turned out to be — the Escape key before another `ESC`,
+    /// Alt with a key, a key's sequence — and how many bytes of `bytes` that
+    /// took. A decided key's own remaining bytes are taken with it — an SS3
+    /// key's final byte, the rest of an Alt chord's character, an X10 mouse
+    /// report's payload, a bracketed paste up to its end marker — so the key
+    /// is one input, not one plus its tail; what follows the key is not taken.
+    /// The `ESC` after an Escape key is not the Escape key's: it starts a
+    /// sequence of its own, held again. A key whose bytes `bytes` runs out
+    /// inside stays held, and the write that completes it classifies the rest
+    /// as its own. `None` when it was a terminal report, when it is still
+    /// undecided once `bytes` run out, or when nothing was held, which takes
+    /// no bytes.
     pub fn decide_held(&mut self, bytes: &[u8]) -> (Option<InterventionKind>, usize) {
         let mut taken = 0;
+        let mut kind = None;
         while self.state != State::Ground
             && let Some(&b) = bytes.get(taken)
+            && (kind.is_none() || self.continues_with(b))
         {
             taken += 1;
-            if let Some(kind) = self.step(b) {
-                return (Some(kind), taken);
-            }
+            kind = kind.max(self.step(b));
         }
-        (None, taken)
+        (kind, taken)
+    }
+
+    /// Whether `b` belongs to the key already decided and still in progress,
+    /// rather than starting what comes after it.
+    fn continues_with(&self, b: u8) -> bool {
+        match self.state {
+            State::Ss3 => (0x40..=0x7e).contains(&b),
+            State::AltChar(_) => (0x80..=0xbf).contains(&b),
+            State::X10Mouse(_) | State::Paste(_) => true,
+            // Not after a decision, or (an `ESC`) a new sequence.
+            State::Ground | State::Esc | State::Csi(_) | State::Osc(_) | State::OscEsc(_) => false,
+        }
     }
 
     fn step(&mut self, b: u8) -> Option<InterventionKind> {
@@ -572,7 +593,8 @@ mod tests {
     }
 
     /// A held lone `ESC` is decided by the first bytes of the next write, and
-    /// only those are taken: the rest is classified on its own.
+    /// only those are taken, with the rest of the key they decide: what
+    /// follows the key is classified on its own.
     #[test]
     fn a_held_escape_is_decided_by_the_bytes_that_follow_it() {
         use InterventionKind::{Interrupt, Navigate, Paste, Text};
@@ -584,7 +606,7 @@ mod tests {
             (b"\r", Some(Text), 1, false),
             (b"[A", Some(Navigate), 2, false),
             (b"[Iabc", None, 2, false),
-            (b"[200~pasted", Some(Paste), 5, false),
+            (b"[200~pasted", Some(Paste), 11, false),
             // Still incomplete: decided by a later write.
             (b"[1;", None, 3, false),
             (b"", None, 0, true),
@@ -599,6 +621,63 @@ mod tests {
         let mut filter = InputFilter::new();
         assert_eq!(filter.decide_held(b"abc"), (None, 0), "nothing held");
         assert!(filter.feed(b"abc"));
+    }
+
+    /// A key a held `ESC` begins is taken whole by the write that decides it
+    /// — an SS3 key's final byte, the rest of an Alt chord's character, an
+    /// X10 mouse report's payload, a paste through its end marker — and
+    /// nothing after it is: a key that follows is classified on its own. A
+    /// key the write ends inside stays held, and the next write completes it.
+    #[test]
+    fn a_decided_key_takes_its_own_bytes_and_no_more() {
+        use InterventionKind::{Interrupt, Navigate, Paste, Text};
+        let cases: [(&[u8], InterventionKind, usize, Option<InterventionKind>); 12] = [
+            (b"OA", Navigate, 2, None),
+            (b"OAz", Navigate, 2, Some(Text)),
+            (b"OA\x03", Navigate, 2, Some(Interrupt)),
+            // Not an SS3 final byte: the key ended at `O`.
+            (b"O\x03", Navigate, 1, Some(Interrupt)),
+            ("\u{e9}z".as_bytes(), Navigate, 2, Some(Text)),
+            ("\u{20ac}z".as_bytes(), Navigate, 3, Some(Text)),
+            ("\u{1f600}z".as_bytes(), Navigate, 4, Some(Text)),
+            // A lead byte with no continuation: the key ended at it.
+            (b"\xc3z", Navigate, 1, Some(Text)),
+            (b"[Mabc", Navigate, 5, None),
+            (b"[M`\x03\x7fz", Navigate, 5, Some(Text)),
+            (b"[200~a\x03\x1b[201~z", Paste, 13, Some(Text)),
+            // The ESC after the paste is not the paste's: it is held anew.
+            (b"[200~a\x1b[201~\x1b", Paste, 12, None),
+        ];
+        for (next, kind, taken, after) in cases {
+            let mut filter = InputFilter::new();
+            assert!(!filter.feed(b"\x1b"));
+            assert_eq!(filter.decide_held(next), (Some(kind), taken), "{next:?}");
+            assert_eq!(filter.classify(&next[taken..]), after, "{next:?}");
+            let lone = next.ends_with(b"~\x1b");
+            assert_eq!(filter.holds_lone_escape(), lone, "{next:?}");
+            assert_eq!(filter.is_holding(), lone, "{next:?}");
+        }
+
+        // Split inside the key: the deciding write takes what it has, the
+        // filter stays inside the key, and the next write completes it.
+        for (next, kind, at) in [
+            (&b"OA"[..], Navigate, 1),
+            ("\u{20ac}".as_bytes(), Navigate, 2),
+            (b"[Mabc", Navigate, 3),
+            (b"[200~a\x1b[201~", Paste, 8),
+        ] {
+            let mut filter = InputFilter::new();
+            assert!(!filter.feed(b"\x1b"));
+            assert_eq!(
+                filter.decide_held(&next[..at]),
+                (Some(kind), at),
+                "{next:?}"
+            );
+            assert!(filter.is_holding(), "{next:?} split at {at}");
+            assert!(!filter.holds_lone_escape(), "{next:?} split at {at}");
+            assert_eq!(filter.classify(&next[at..]), Some(kind), "{next:?}");
+            assert!(!filter.is_holding(), "{next:?} completed");
+        }
     }
 
     /// The kind of one whole frame, a lone `ESC` left held settled as the

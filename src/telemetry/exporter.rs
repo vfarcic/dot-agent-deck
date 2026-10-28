@@ -457,10 +457,12 @@ impl PaneInput {
     /// the human input it settles, oldest first, and whether it left a lone
     /// `ESC` held. Input a held lone `ESC` turns into — the Escape key, once
     /// its window has passed or another `ESC` follows it, or the key whose
-    /// sequence it begins — keeps the time and position that `ESC` was
-    /// written at; the rest of the write has `now` and `position`. A
-    /// sequence the write leaves incomplete counts when a later write
-    /// completes it.
+    /// sequence it begins, with every byte of that key the write holds —
+    /// keeps the time and position that `ESC` was written at, as one input;
+    /// what follows the key has `now` and `position`. A sequence the write
+    /// leaves incomplete counts when a later write completes it, at that
+    /// write's time and position: an undecided one there alone, and the rest
+    /// of a decided key there as well as at the `ESC`'s.
     fn write(
         &mut self,
         bytes: &[u8],
@@ -4105,6 +4107,157 @@ mod tests {
             timed(input.write(b"5A", 4, 7, soon).0),
             vec![(4, Navigate, 7)]
         );
+    }
+
+    /// The keys a held `ESC` can begin with bytes of their own after the one
+    /// that decides it: an SS3 cursor key, Alt with a multibyte character, an
+    /// X10 mouse report. With how many bytes after the `ESC` decide each.
+    const KEYS_WITH_TAILS: [(&[u8], usize); 3] =
+        [(b"OA", 1), ("\u{e9}".as_bytes(), 1), (b"[Mabc", 2)];
+
+    /// A held `ESC`, then the rest of its key and a `z` in two writes split
+    /// at every byte. The key counts once, at the `ESC`'s time and position,
+    /// when the deciding write holds all of it; the `z` counts at the time of
+    /// the write it is in. A key split after it is decided completes in the
+    /// next write and counts there too, and one split before it is decided
+    /// counts there alone, as the docs say.
+    #[test]
+    fn a_decided_key_counts_its_own_bytes_once() {
+        use InterventionKind::{Navigate, Text};
+        for (key, decided) in KEYS_WITH_TAILS {
+            let mut rest = key.to_vec();
+            rest.push(b'z');
+            let pressed = std::time::Instant::now();
+            let soon = pressed + LONE_ESCAPE_WINDOW / 4;
+            let sooner = pressed + LONE_ESCAPE_WINDOW / 2;
+            for at in 0..=rest.len() {
+                let mut input = PaneInput {
+                    run_id: "r1".into(),
+                    agent_id: None,
+                    ended: false,
+                    filter: InputFilter::new(),
+                    escape: None,
+                    paste: None,
+                    pending: Vec::new(),
+                };
+                let timed = |human: Vec<Written>| -> Vec<_> {
+                    human.iter().map(|w| (w.at, w.kind, w.position)).collect()
+                };
+                assert!(input.write(b"\x1b", 1, 3, pressed).0.is_empty());
+                let first = timed(input.write(&rest[..at], 2, 5, soon).0);
+                let second = timed(input.write(&rest[at..], 4, 7, sooner).0);
+                let (want_first, want_second) = if at == 0 {
+                    (vec![], vec![(1, Navigate, 3), (4, Text, 7)])
+                } else if at < decided {
+                    (vec![], vec![(4, Text, 7)])
+                } else if at <= key.len() {
+                    (vec![(1, Navigate, 3)], vec![(4, Text, 7)])
+                } else {
+                    (vec![(1, Navigate, 3), (2, Text, 5)], vec![])
+                };
+                assert_eq!(first, want_first, "{key:?} split at {at}: first write");
+                assert_eq!(second, want_second, "{key:?} split at {at}: second write");
+                assert!(!input.filter.is_holding(), "{key:?} split at {at}");
+            }
+        }
+    }
+
+    /// An `ESC` at 1 s, the rest of its key at 1.01 s and a `z` at 6.005 s:
+    /// the key is one navigation from 1 s, so the `z`, more than the
+    /// coalescing window after it, starts an intervention of its own. Counted
+    /// again at 1.01 s, the key would pull the `z` into its burst as text.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_key_after_a_decided_one_starts_its_own_intervention() {
+        let second = 1_000_000_000;
+        let ms = 1_000_000;
+        for (key, _) in KEYS_WITH_TAILS {
+            let (telemetry, mut rx) = capturing(ProbeSettings::default());
+            begin(&telemetry, generation("p0", "other"), &[]);
+            begin(&telemetry, generation("p1", "a1"), &[]);
+            telemetry.settled().await;
+            let zero = now_unix_nanos() - 20 * second;
+
+            // Held, so the ESC's window cannot pass on the ingest task's clock.
+            let resume = hold_ingest(&telemetry, "p0").await;
+            let pressed = std::time::Instant::now();
+            telemetry.observe_client_input_at("p1", b"\x1b", zero + second, pressed);
+            telemetry.observe_client_input_at(
+                "p1",
+                key,
+                zero + 1010 * ms,
+                pressed + LONE_ESCAPE_WINDOW / 10,
+            );
+            telemetry.observe_client_input_at(
+                "p1",
+                b"z",
+                zero + 6005 * ms,
+                pressed + Duration::from_millis(6005),
+            );
+            resume.send(()).unwrap();
+
+            telemetry.settled().await;
+            telemetry.end_run("p1", Some("a1"), EndReason::Exited, None);
+            telemetry.settled().await;
+            assert_eq!(
+                timed_kinds(&captured(&mut rx)),
+                vec![
+                    (zero + second, AttrValue::Str("navigate".into())),
+                    (zero + 6005 * ms, AttrValue::Str("text".into())),
+                ],
+                "{key:?}"
+            );
+        }
+    }
+
+    /// An `ESC` at 1 s, a permission prompt broadcast, then the rest of its
+    /// key at 1.01 s: the key was pressed before the prompt opened, so it is
+    /// navigation, not an answer. A `z` typed after the prompt, at 7 s, is
+    /// the answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_key_decided_after_a_prompt_keeps_the_kind_it_had_before_it() {
+        let second = 1_000_000_000;
+        let ms = 1_000_000;
+        for (key, _) in KEYS_WITH_TAILS {
+            let (telemetry, mut rx) = capturing(ProbeSettings::default());
+            let (tx, events) = broadcast::channel(16);
+            telemetry.subscribe(events);
+            begin(&telemetry, generation("p0", "other"), &[]);
+            begin(&telemetry, generation("p1", "a1"), &[]);
+            tx.send(of("p1", "a1", EventType::SessionStart)).unwrap();
+            telemetry.settled().await;
+            let zero = now_unix_nanos() - 20 * second;
+
+            let resume = hold_ingest(&telemetry, "p0").await;
+            let pressed = std::time::Instant::now();
+            telemetry.observe_client_input_at("p1", b"\x1b", zero + second, pressed);
+            tx.send(of("p1", "a1", EventType::PermissionRequest))
+                .unwrap();
+            telemetry.observe_client_input_at(
+                "p1",
+                key,
+                zero + 1010 * ms,
+                pressed + LONE_ESCAPE_WINDOW / 10,
+            );
+            telemetry.observe_client_input_at(
+                "p1",
+                b"z",
+                zero + 7 * second,
+                pressed + Duration::from_secs(7),
+            );
+            resume.send(()).unwrap();
+
+            telemetry.settled().await;
+            telemetry.end_run("p1", Some("a1"), EndReason::Exited, None);
+            telemetry.settled().await;
+            assert_eq!(
+                timed_kinds(&captured(&mut rx)),
+                vec![
+                    (zero + second, AttrValue::Str("navigate".into())),
+                    (zero + 7 * second, AttrValue::Str("answer".into())),
+                ],
+                "{key:?}"
+            );
+        }
     }
 
     /// Messages already waiting on the ingest task's receiver when the clock
