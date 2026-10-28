@@ -53,17 +53,20 @@ fn the_video_loads_no_player_until_the_visitor_asks() {
     );
 }
 
-/// The telemetry section links the page its claims come from, as GitHub
-/// renders it, and words its privacy claim as being about the deck's record.
+/// Telemetry is the story's fifth step, and its privacy claim is about the
+/// deck's own record, not the agents' own telemetry.
 #[test]
-fn the_telemetry_section_links_its_source_page() {
+fn telemetry_is_a_step_of_the_story() {
     let html = landing_html();
-    let start = html
-        .find("<section class=\"telemetry\"")
-        .expect("the landing page lost its telemetry section");
-    let section = &html[start..start + html[start..].find("</section>").unwrap()];
-    assert!(section.contains(
-        "<a href=\"https://github.com/vfarcic/dot-agent-deck/blob/main/docs/telemetry.md\">"
-    ));
-    assert!(section.contains("never part of the deck’s record"));
+    let story_start = html
+        .find("<section class=\"story\"")
+        .expect("the landing page lost its story");
+    let story = &html[story_start..story_start + html[story_start..].find("</section>").unwrap()];
+    let step = story
+        .find("<span class=\"storyStep\">05</span>")
+        .map(|at| &story[at..])
+        .expect("the story lost its telemetry step");
+    assert!(step.contains("<h3>Know what every run did</h3>"));
+    assert!(step.contains("never part of it"));
+    assert!(step.contains("The deck’s record is metadata only"));
 }
