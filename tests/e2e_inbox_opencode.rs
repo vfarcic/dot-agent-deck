@@ -776,8 +776,9 @@ fn opencode_006_a_held_delivery_is_never_repeated() {
 const OLD_MAY_WRITE: &str = "inboxWrite(child, { may: { q: id, ...ref } })";
 
 /// #1940's stall: one task is prompted and left without an assistant child,
-/// then the plugin's event loop blocks just past the possession TTL while it
-/// still holds the task, long enough for the deck to hand out an automatic
+/// then, from the first snapshot holding it after that prompt (the fixture
+/// waits for the prompt), the plugin's event loop blocks just past the
+/// possession TTL while it still holds the task, long enough for the deck to hand out an automatic
 /// repeat and short enough that the watcher keeps its stream. Returns the
 /// task id once the repeat's `not_handed` (or its prompt) is in.
 fn stalled_repeat(config: Value) -> (OpenCode, String) {
@@ -865,7 +866,7 @@ fn opencode_057_a_stalled_plugin_still_holding_a_task_is_not_prompted_again() {
     }
 }
 
-/// Scenario: After the same stall and refused repeat, the person aborts the unanswered turn: its session goes idle, so the plugin drops the task. The deck then prompts it once more, marked as a possible repeat, and the matching assistant turn acknowledges it, so a held task is never stranded by the refusal.
+/// Scenario: After the same stall and refused repeat, the person aborts the unanswered turn: its session goes idle, so the plugin drops the task. The deck then prompts it once more, marked as a possible repeat, and the matching assistant turn acknowledges it, so after this one refusal the lost task still reaches OpenCode.
 #[spec("inbox/opencode/058")]
 #[test]
 fn opencode_058_a_task_lost_after_a_refused_repeat_is_prompted_again_marked() {

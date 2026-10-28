@@ -127,8 +127,9 @@ inboxBinary(() => (isAbsoluteOverride(deckBin, process.platform) ? deckBin : und
  * process that already runs the extension. 3: `pending` is handed over one
  * admitted attempt at a time (`admitting`). 4: a hold is re-checked when the
  * approval a held-back-by sent attempt went out under lapses (`armLapse`).
+ * 5: each `may` carries the receiver's possession on its own line (#1940).
  */
-export const INBOX_VERSION = 4;
+export const INBOX_VERSION = 5;
 /**
  * The oldest version whose state a replacement carries: 2 is the first
  * receipt-stream version, and 1 never shipped, so a receiver older than 2 is

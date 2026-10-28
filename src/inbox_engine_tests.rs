@@ -5841,7 +5841,7 @@ async fn boundary_072_a_once_wait_from_a_hook_component_is_refused() {
     }
 }
 
-/// Scenario: On an OpenCode and on a Pi receiver alike, a message's first hand-out is held, the receiver's snapshots stop past the possession TTL and the deck hands out the automatic repeat; the receiver still holds the first. When it reports that possession on the same line as its final check for the repeat, the check is refused `held_earlier`. When it reported it on an earlier line that went stale before the check, as a receiver from before this change does, the repeat is approved: the residual. When it reports on the check's line that it dropped the first, the repeat is approved.
+/// Scenario: On an OpenCode and on a Pi receiver alike, the receiver holds a message's first hand-out while its snapshots stop past the possession TTL, and the deck hands out the automatic repeat. Reporting that possession on the same line as the repeat's final check gets it refused `held_earlier`. Reporting it on an earlier line gone stale before the check (a receiver from before this change: the residual), or reporting on the check's line that it dropped the first, gets the repeat approved.
 #[spec("inbox/boundary/076")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn boundary_076_possession_reported_with_the_check_is_fresh_at_the_check() {
