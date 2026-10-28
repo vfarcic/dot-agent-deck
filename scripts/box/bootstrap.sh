@@ -9,12 +9,14 @@
 #   bash bootstrap.sh                        # the box itself
 #   bash bootstrap.sh --repo URL [--dir D]   # also clone URL (default dir ~/code/<name>) and devbox install it
 #   bash bootstrap.sh --use-vals             # also export USE_VALS=true, so devbox loads .env.vals.yaml
+#   bash bootstrap.sh --relay                # also export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 (the local relay)
 #
 # Layers, each assuming the one before:
 #   1. apt: docker (Docker's repo), auditd, build-essential, nodejs/npm (runtime for npm-distributed agents)
 #   2. system: sysctl tuning, 8 GB swap, linger, the mem-sampler timer
 #   3. nix + devbox, then `devbox global` from devbox-global.json
-#   4. PATH (and, with --use-vals, USE_VALS) for non-interactive shells and systemd --user,
+#   4. PATH (and, with --use-vals, USE_VALS; with --relay, OTEL_EXPORTER_OTLP_ENDPOINT)
+#      for non-interactive shells and systemd --user,
 #      so the deck daemon finds every agent and every agent inherits the same environment
 #   5. agents (claude, opencode, codex, pi, devin), sem, dot-agent-deck, `hooks install`
 #   6. the optional repo
@@ -31,6 +33,21 @@
 # successor of an in-app daemon restart: its agents see the change only once it
 # is stopped and a new one is started from a fresh login (`dot-agent-deck
 # connect` from your machine does that), not from a shell opened before the run.
+#
+# --relay is for a box whose operator runs a local OpenTelemetry relay: a
+# collector listening on 127.0.0.1:4318 that forwards to Honeycomb with its own
+# key. It makes the relay the endpoint that every shell reading ~/.bashrc, and
+# every agent the deck starts, inherits by default; devbox.json's init_hook
+# keeps an endpoint the shell already has, so a vals shell inherits the relay
+# instead of the endpoint .env.vals.yaml names. A later setting still wins: an
+# OTEL_EXPORTER_OTLP_ENDPOINT in the repository's .env (the init_hook sources it
+# last) or an export further down ~/.bashrc. It neither installs nor checks the
+# relay; that is the box's own setup. It works with or without --use-vals, and
+# it sticks and reaches a running daemon exactly as --use-vals does, through its
+# own marked block. Turning it off (delete the block and re-run) drops the
+# endpoint from ~/.bashrc and environment.d, and unsets it in the running
+# systemd --user manager only while its value there is still the relay address
+# above; an endpoint with any other value is left alone.
 
 set -euo pipefail
 
@@ -38,12 +55,15 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_URL=""
 REPO_DIR=""
 USE_VALS_FLAG=0
+RELAY_FLAG=0
+RELAY_ENDPOINT=http://127.0.0.1:4318
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo) REPO_URL="${2:?}"; shift 2 ;;
     --dir)  REPO_DIR="${2:?}"; shift 2 ;;
     --use-vals) USE_VALS_FLAG=1; shift ;;
+    --relay)    RELAY_FLAG=1; shift ;;
     -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "bootstrap.sh: unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -140,40 +160,116 @@ step "PATH for interactive, non-interactive and systemd --user processes"
 # The deck daemon is started over a non-interactive ssh session and every agent
 # inherits its PATH. Ubuntu's .bashrc returns early for non-interactive shells,
 # so this block goes at the TOP of it, before that guard.
-PATH_BLOCK="$(cat <<'EOF'
-# >>> dad-box PATH (scripts/box/bootstrap.sh) >>>
+# Every block is found by these exact lines and nothing else.
+PATH_OPEN='# >>> dad-box PATH (scripts/box/bootstrap.sh) >>>'
+PATH_CLOSE='# <<< dad-box PATH <<<'
+VALS_OPEN='# >>> dad-box USE_VALS (scripts/box/bootstrap.sh --use-vals) >>>'
+VALS_CLOSE='# <<< dad-box USE_VALS <<<'
+RELAY_OPEN='# >>> dad-box RELAY (scripts/box/bootstrap.sh --relay) >>>'
+RELAY_CLOSE='# <<< dad-box RELAY <<<'
+PATH_BLOCK="$PATH_OPEN
+$(cat <<'EOF'
 for d in /nix/var/nix/profiles/default/bin "$HOME/.local/share/devbox/global/default/.devbox/nix/profile/default/bin" "$HOME/.opencode/bin" "$HOME/.local/bin"; do
   case ":$PATH:" in *":$d:"*) ;; *) [ -d "$d" ] && PATH="$d:$PATH" ;; esac
 done
 export PATH
-# <<< dad-box PATH <<<
 EOF
-)"
+)
+$PATH_CLOSE"
 touch "$HOME/.bashrc"
-if ! grep -qF '# >>> dad-box PATH' "$HOME/.bashrc"; then
-  { printf '%s\n\n' "$PATH_BLOCK"; cat "$HOME/.bashrc"; } > "$HOME/.bashrc.dad-box" && mv "$HOME/.bashrc.dad-box" "$HOME/.bashrc"
+# The option blocks below are found by their markers, everything from an
+# opening marker to its close is replaced, and they are written back after the
+# PATH block's close, so check every marker before this layer writes anything,
+# whichever flags were given. A block left open, a stray close, a close of
+# another kind or a second PATH block stops the run here, because skipping to
+# the end of the file would drop whatever follows the marker. So does a line
+# that starts like a marker (in any case, with spaces or tabs around its `#` and
+# arrows) but is not exactly one of the six above, trailing whitespace or a CRLF
+# ending included, since the rewrite would read it as ordinary text.
+if ! awk -v file="$HOME/.bashrc" \
+    -v po="$PATH_OPEN" -v pc="$PATH_CLOSE" -v vo="$VALS_OPEN" -v vc="$VALS_CLOSE" -v ro="$RELAY_OPEN" -v rc="$RELAY_CLOSE" '
+  function fail(msg) { print "bootstrap.sh: " file ": " msg > "/dev/stderr"; bad = 1; exit 1 }
+  BEGIN {
+    kind[po] = "PATH"; kind[vo] = "USE_VALS"; kind[ro] = "RELAY"; opens[po] = opens[vo] = opens[ro] = 1
+    kind[pc] = "PATH"; kind[vc] = "USE_VALS"; kind[rc] = "RELAY"
+  }
+  tolower($0) ~ /^[ \t]*#[ \t]*(>>>|<<<)[ \t]*dad-box/ {
+    if (!($0 in kind)) {
+      why = ""; if ($0 ~ /[ \t\r]$/) why = " (it ends in whitespace or a carriage return)"
+      shown = $0; gsub(/\r/, "\\r", shown)
+      fail("line " NR " looks like a dad-box marker but is not one this script writes" why ": " shown)
+    }
+    k = kind[$0]
+    if ($0 in opens) {
+      if (open != "") fail("the dad-box " open " block opened on line " at " has no closing marker before line " NR)
+      if (k == "PATH" && path_at) fail("line " NR " opens a second dad-box PATH block; the first opened on line " path_at)
+      if (k == "PATH") path_at = NR
+      open = k; at = NR; next
+    }
+    if (open == "") fail("line " NR " closes a dad-box " k " block that no marker opened")
+    if (k != open) fail("the dad-box " open " block opened on line " at " is closed by a dad-box " k " marker on line " NR)
+    open = ""
+  }
+  END {
+    if (bad) exit 1
+    if (open != "") fail("the dad-box " open " block opened on line " at " has no closing marker")
+  }
+' "$HOME/.bashrc"; then
+  echo "bootstrap.sh: left $HOME/.bashrc unchanged; fix or delete that block by hand, then re-run" >&2
+  exit 1
+fi
+if ! grep -qxF "$PATH_OPEN" "$HOME/.bashrc"; then
+  # A copy that fails part-way is removed and ~/.bashrc is left as it was.
+  if ! { printf '%s\n\n' "$PATH_BLOCK" && cat "$HOME/.bashrc"; } > "$HOME/.bashrc.dad-box"; then
+    rm -f "$HOME/.bashrc.dad-box"
+    echo "bootstrap.sh: could not add the dad-box PATH block to $HOME/.bashrc and left it unchanged; fix the cause above, then re-run" >&2
+    exit 1
+  fi
+  mv "$HOME/.bashrc.dad-box" "$HOME/.bashrc"
 fi
 # USE_VALS gets the same placement for the same reason: the daemon's environment
 # is every agent's, and devbox.json's init_hook loads .env.vals.yaml only when
-# it is set. The block sits right after the PATH block and is rewritten in place.
-if [ "$USE_VALS_FLAG" = 1 ] || grep -qF '# >>> dad-box USE_VALS' "$HOME/.bashrc"; then
+# it is set. So does OTEL_EXPORTER_OTLP_ENDPOINT with --relay: the init_hook
+# keeps an endpoint the shell already has, so a vals shell inherits the local
+# relay rather than the direct endpoint unless a later setting overrides it
+# (the repository's .env, or an export further down ~/.bashrc). Each sits in its
+# own marked block right after the PATH block, and they are rewritten in place.
+OPTION_BLOCKS=()
+if [ "$USE_VALS_FLAG" = 1 ] || grep -qxF "$VALS_OPEN" "$HOME/.bashrc"; then
   USE_VALS_FLAG=1
-  VALS_BLOCK="$(cat <<'EOF'
-# >>> dad-box USE_VALS (scripts/box/bootstrap.sh --use-vals) >>>
+  OPTION_BLOCKS+=("$VALS_OPEN
 export USE_VALS=true
-# <<< dad-box USE_VALS <<<
-EOF
-)"
-  # Drops any earlier copy of the block and the blank lines around it, then
-  # writes it back after the PATH block, so a re-run leaves the file unchanged.
-  awk -v block="$VALS_BLOCK" '
-    /^# >>> dad-box USE_VALS/ { skip = 1; next }
-    skip { if (/^# <<< dad-box USE_VALS/) skip = 0; next }
+$VALS_CLOSE")
+fi
+if [ "$RELAY_FLAG" = 1 ] || grep -qxF "$RELAY_OPEN" "$HOME/.bashrc"; then
+  RELAY_FLAG=1
+  OPTION_BLOCKS+=("$RELAY_OPEN
+export OTEL_EXPORTER_OTLP_ENDPOINT=$RELAY_ENDPOINT
+$RELAY_CLOSE")
+fi
+if [ ${#OPTION_BLOCKS[@]} -gt 0 ]; then
+  # Drops any earlier copy of the blocks and the blank lines around them, then
+  # writes them back after the PATH block, so a re-run leaves the file unchanged.
+  # The markers were checked at the top of this layer, so every opening marker
+  # here has its own close and there is exactly one PATH close to write after.
+  # A rewrite that fails part-way leaves the blocks in ~/.bashrc as they were
+  # and removes its partial copy; a PATH block this run added just above stays,
+  # so the file is not always byte-identical.
+  if ! awk -v block="$(printf '%s\n\n' "${OPTION_BLOCKS[@]}")" \
+      -v pc="$PATH_CLOSE" -v vo="$VALS_OPEN" -v vc="$VALS_CLOSE" -v ro="$RELAY_OPEN" -v rc="$RELAY_CLOSE" '
+    $0 == vo || $0 == ro { open = 1; next }
+    $0 == vc || $0 == rc { open = 0; next }
+    open { next }
     gap && /^$/ { next }
     gap { print ""; gap = 0 }
     { print }
-    /^# <<< dad-box PATH/ { print ""; print block; gap = 1 }
-  ' "$HOME/.bashrc" > "$HOME/.bashrc.dad-box" && mv "$HOME/.bashrc.dad-box" "$HOME/.bashrc"
+    $0 == pc { print ""; print block; gap = 1 }
+  ' "$HOME/.bashrc" > "$HOME/.bashrc.dad-box"; then
+    rm -f "$HOME/.bashrc.dad-box"
+    echo "bootstrap.sh: could not rewrite the dad-box blocks in $HOME/.bashrc and left them as they were (a dad-box PATH block added by this run stays); fix the cause above, then re-run" >&2
+    exit 1
+  fi
+  mv "$HOME/.bashrc.dad-box" "$HOME/.bashrc"
 fi
 # shellcheck disable=SC2016  # written literally, expanded by the interactive shell
 grep -qF 'devbox global shellenv' "$HOME/.bashrc" || \
@@ -186,6 +282,7 @@ cat > "$HOME/.config/environment.d/999-dad-box.conf" <<'EOF'
 PATH=${HOME}/.local/bin:${HOME}/.opencode/bin:${HOME}/.local/share/devbox/global/default/.devbox/nix/profile/default/bin:/nix/var/nix/profiles/default/bin:${PATH}
 EOF
 [ "$USE_VALS_FLAG" = 1 ] && echo 'USE_VALS=true' >> "$HOME/.config/environment.d/999-dad-box.conf"
+[ "$RELAY_FLAG" = 1 ] && echo "OTEL_EXPORTER_OTLP_ENDPOINT=$RELAY_ENDPOINT" >> "$HOME/.config/environment.d/999-dad-box.conf"
 # The user manager reads environment.d only when it starts, and linger started
 # it before this file existed: apply the same PATH to the running manager too.
 systemctl --user set-environment "PATH=$HOME/.local/bin:$HOME/.opencode/bin:$HOME/.local/share/devbox/global/default/.devbox/nix/profile/default/bin:/nix/var/nix/profiles/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" || echo "  warning: could not update the running systemd --user manager (applies at next login)"
@@ -194,8 +291,15 @@ if [ "$USE_VALS_FLAG" = 1 ]; then
 else
   systemctl --user unset-environment USE_VALS || true
 fi
+if [ "$RELAY_FLAG" = 1 ]; then
+  systemctl --user set-environment "OTEL_EXPORTER_OTLP_ENDPOINT=$RELAY_ENDPOINT" || echo "  warning: could not set OTEL_EXPORTER_OTLP_ENDPOINT in the running systemd --user manager (applies at next login)"
+elif [ "$(systemctl --user show-environment 2>/dev/null | sed -n 's/^OTEL_EXPORTER_OTLP_ENDPOINT=//p')" = "$RELAY_ENDPOINT" ]; then
+  # Off: clear only the value this script writes, never an endpoint the
+  # operator set in the manager some other way.
+  systemctl --user unset-environment OTEL_EXPORTER_OTLP_ENDPOINT || true
+fi
 # shellcheck source=/dev/null
-eval "$(sed -n '/# >>> dad-box PATH/,/# <<< dad-box PATH/p' "$HOME/.bashrc")"
+eval "$(awk -v po="$PATH_OPEN" -v pc="$PATH_CLOSE" '$0 == po { on = 1 } on { print } $0 == pc { on = 0 }' "$HOME/.bashrc")"
 
 # -------- 5. agents and the deck --------------------------------------------
 
@@ -278,6 +382,9 @@ check gh       'gh auth status'                               'gh auth login && 
 [ "$todo" -eq 0 ] && echo "  nothing — every agent is logged in"
 if [ "$USE_VALS_FLAG" = 1 ] && pgrep -u "$ME" -f 'dot-agent-deck daemon serve' >/dev/null; then
   echo; echo "Note: a deck daemon is already running; its agents get USE_VALS only after it is stopped and started from a fresh login (an in-app restart keeps the old environment)."
+fi
+if [ "$RELAY_FLAG" = 1 ] && pgrep -u "$ME" -f 'dot-agent-deck daemon serve' >/dev/null; then
+  echo; echo "Note: a deck daemon is already running; its agents send through the relay only after it is stopped and started from a fresh login (an in-app restart keeps the old environment)."
 fi
 if ! id -nG | tr ' ' '\n' | grep -qx docker; then
   echo; echo "Note: log out and back in (or reconnect) for the docker group to apply."

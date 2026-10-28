@@ -914,7 +914,48 @@ export class Deck {
       await stopChild(this.daemon);
     }
     await this.far?.close();
+    await this.reapSandboxProcesses();
     if (failure === undefined) rmSync(this.sandbox, { recursive: true, force: true });
+  }
+
+  /**
+   * Every process still running with this sandbox in its environment. The
+   * daemon's drain stops the agents it spawned, but not what they spawned in
+   * turn: with `SHELL` unset, as on CI, `bash --noprofile --norc` runs under
+   * `/bin/sh -c`, puts itself in its own process group as an interactive shell
+   * does, and so is outside the group the drain signals. `sh` exiting hangs it
+   * up, and it writes `~/.bash_history` into the sandbox on its way out —
+   * measured 2ms after the stop, and late enough on a loaded runner to land
+   * inside `close()`'s `rmSync`, which then failed with ENOTEMPTY (terminal_001).
+   * Matched on the sandbox's own path, which nothing outside this sandbox names.
+   */
+  private sandboxProcesses(): number[] {
+    const marker = `=${this.sandbox}/`;
+    const pids: number[] = [];
+    for (const entry of readdirSync("/proc")) {
+      if (!/^\d+$/.test(entry)) continue;
+      try {
+        if (readFileSync(join("/proc", entry, "environ"), "utf8").includes(marker)) pids.push(Number(entry));
+      } catch {
+        // Gone already, or not ours to read.
+      }
+    }
+    return pids;
+  }
+
+  /** Kill what {@link sandboxProcesses} finds, and wait until nothing is left writing into the sandbox. */
+  private async reapSandboxProcesses(): Promise<void> {
+    await waitFor("every process started under the sandbox to exit", async () => {
+      const left = this.sandboxProcesses();
+      for (const pid of left) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // ESRCH: it exited between the scan and the kill.
+        }
+      }
+      return left.length === 0;
+    });
   }
 
   private async preserve(name: string, failure: unknown): Promise<void> {
