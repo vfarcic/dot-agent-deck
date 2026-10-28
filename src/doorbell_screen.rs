@@ -760,18 +760,23 @@ fn claude_dialog(grid: &Grid) -> Option<Dialog> {
         .then_some(Dialog::Unrecognised)
 }
 
+/// The backgrounds Claude Code paints a transcript user row with: colour 237,
+/// or under `COLORTERM=truecolor` its RGB value (55, 55, 55), measured on
+/// 2.1.310 and 2.1.312.
+const CLAUDE_USER_BG: [vt100::Color; 2] = [vt100::Color::Idx(237), vt100::Color::Rgb(55, 55, 55)];
+
 /// A user message in Claude Code's transcript: `❯` at column 0 on a row
-/// painted background colour 237, its text from column 2 with continuation
-/// rows on the same background.
+/// painted a [`CLAUDE_USER_BG`] background, its text from column 2 with
+/// continuation rows on the same background.
 fn claude_transcript_user_line(grid: &Grid, line: &str) -> bool {
-    let user_bg = vt100::Color::Idx(237);
     (0..grid.rows).any(|r| {
-        if !grid
+        let Some(user_bg) = grid
             .cell(r, 0)
-            .is_some_and(|c| c.text == "❯" && c.bg == user_bg)
-        {
+            .filter(|c| c.text == "❯" && CLAUDE_USER_BG.contains(&c.bg))
+            .map(|c| c.bg)
+        else {
             return false;
-        }
+        };
         let mut text = grid.text_from(r, CLAUDE_INDENT);
         let mut row = r + 1;
         while row < grid.rows && grid.cell(row, 0).is_some_and(|c| c.bg == user_bg) {
@@ -1245,6 +1250,69 @@ pub fn profile_for_agent(
         crate::event::AgentType::Codex => Some(&CODEX_PROFILE),
         crate::event::AgentType::ClaudeCode => Some(&CLAUDE_PROFILE),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod claude_tests {
+    use super::*;
+
+    const LINE: &str = "alpha beta";
+
+    /// A transcript row: `marker` then `first` on background `bg`, and `rest`
+    /// on the row under it on background `cont_bg`.
+    fn echo(marker: &str, bg: &str, first: &str, cont_bg: &str, rest: &str) -> Grid {
+        let bytes = format!(
+            "\x1b[2J\x1b[3;1H\x1b[{bg}m{marker} {first}\x1b[0m\x1b[4;1H\x1b[{cont_bg}m{rest}\x1b[0m"
+        );
+        Grid::parse(bytes.as_bytes(), 24, 80)
+    }
+
+    const RGB: &str = "48;2;55;55;55";
+    const IDX: &str = "48;5;237";
+
+    #[test]
+    fn the_user_row_is_read_on_either_measured_background() {
+        for bg in [RGB, IDX] {
+            let grid = echo("❯", bg, "alpha", bg, "beta");
+            assert!(claude_transcript_user_line(&grid, LINE), "{bg}");
+        }
+    }
+
+    #[test]
+    fn no_other_background_is_a_user_row() {
+        for bg in [
+            "48;2;55;55;56",
+            "48;2;56;55;55",
+            "48;2;55;56;55",
+            "48;2;0;0;0",
+            "48;5;236",
+            "49",
+        ] {
+            let grid = echo("❯", bg, "alpha", bg, "beta");
+            assert!(!claude_transcript_user_line(&grid, LINE), "{bg}");
+        }
+    }
+
+    #[test]
+    fn the_continuation_keeps_the_user_rows_background() {
+        for (bg, cont_bg) in [(RGB, "48;2;55;55;56"), (RGB, IDX), (IDX, RGB), (RGB, "49")] {
+            let grid = echo("❯", bg, "alpha", cont_bg, "beta");
+            assert!(
+                !claude_transcript_user_line(&grid, LINE),
+                "{bg} / {cont_bg}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_quote_a_partial_line_or_a_missing_marker_is_no_user_row() {
+        let quote = echo("●", "49", "alpha", "49", "beta");
+        assert!(!claude_transcript_user_line(&quote, LINE));
+        let partial = echo("❯", RGB, "alpha", RGB, "bet");
+        assert!(!claude_transcript_user_line(&partial, LINE));
+        let no_marker = echo(" ", RGB, "alpha", RGB, "beta");
+        assert!(!claude_transcript_user_line(&no_marker, LINE));
     }
 }
 

@@ -1052,11 +1052,13 @@ fn doorbell_036_the_staged_head_reads_through_the_profile() {
     }
 }
 
-/// Scenario: Read recorded Claude Code 2.1.310 and 2.1.312 and Codex composer launches through the frame builder the doorbell's transaction reads: the empty composer, the composer holding a typed token-led line, the screen after that line was submitted, and the same screens as a state that is not Clean. The empty composer is empty and ready; the typed line is held exactly, cursor at its end, and is no user message; after its submit a frame shows it as a user message with the composer no longer holding it; a frame that is not Clean has no composer and no dialog, so nothing is decided on it.
+/// Scenario: Replay recorded Claude Code 2.1.310 and 2.1.312 composers in indexed and truecolor modes, and the Codex composer, through the frame builder and transaction without a prompt hook. The empty composer admits one line and one Enter, the typed line is held exactly, and its transcript echo confirms Submitted; dirty screens carry no composer or dialog. Both Claude truecolor captures wrap the user message onto a shaded continuation row.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_the_transaction_reads_real_frames_through_the_profile() {
     use dot_agent_deck::doorbell_screen::frame;
+    use dot_agent_deck::doorbell_txn::Outcome;
+    let mut failures = Vec::new();
     for (stem, profile) in [
         (
             "claude-inbox/r5wake/claude-2.1.310-composer-24x80",
@@ -1064,6 +1066,14 @@ fn doorbell_036_the_transaction_reads_real_frames_through_the_profile() {
         ),
         (
             "claude-inbox/r5wake/claude-2.1.312-composer-24x80",
+            &CLAUDE_PROFILE,
+        ),
+        (
+            "claude-inbox/r5wake/claude-2.1.310-truecolor-composer-24x80",
+            &CLAUDE_PROFILE,
+        ),
+        (
+            "claude-inbox/r5wake/claude-2.1.312-truecolor-composer-24x80",
             &CLAUDE_PROFILE,
         ),
         (
@@ -1084,13 +1094,28 @@ fn doorbell_036_the_transaction_reads_real_frames_through_the_profile() {
             typed.user_cells.is_empty(),
             "{stem}: the composer is no user cell"
         );
-        let submitted = trace
-            .reads_between(trace.points["mark:cr-1"], trace.points["after-01"])
+        let after = trace.reads_between(trace.points["mark:cr-1"], trace.points["after-01"]);
+        // These measurements deliberately block the prompt hook, which later
+        // restores the draft. Replay through the first empty post-Enter frame
+        // and hold it: the transient transcript must suffice without that hook.
+        let echo_end = after
+            .iter()
+            .position(|grid| frame(profile, grid, 1, true, Some(line)).empty_and_ready())
+            .expect("an empty composer after Enter");
+        let outcome = replay_transaction(&trace, profile, &after[..=echo_end]);
+        eprintln!("{stem}: no-hook transaction = {outcome:?}");
+        if outcome != Outcome::Submitted {
+            failures.push(format!("{stem}: expected Submitted, got {outcome:?}"));
+        }
+        let submitted = after
             .iter()
             .map(|grid| frame(profile, grid, 3, true, Some(line)))
             .find(|f| f.user_cells == vec![line.clone()]);
-        let submitted = submitted.unwrap_or_else(|| panic!("{stem}: the line as a user message"));
-        assert!(!submitted.holds_exactly(line));
+        if let Some(submitted) = submitted {
+            assert!(!submitted.holds_exactly(line));
+        } else {
+            failures.push(format!("{stem}: no frame shows the line as a user message"));
+        }
         let dirty = frame(profile, &trace.grid("typed-01"), 4, false, Some(line));
         assert!(!dirty.clean);
         assert!(dirty.composer.is_none() && dirty.dialog.is_none());
@@ -1098,5 +1123,242 @@ fn doorbell_036_the_transaction_reads_real_frames_through_the_profile() {
             dirty.text.contains("dot-agent-deck: message"),
             "text is still read"
         );
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Drive the production transaction with captured frames and a clock advanced
+/// to its wakeups. No hook evidence is fabricated; the writer records exactly
+/// the line and Enter, and the profile must supply the submit evidence.
+fn replay_transaction(
+    trace: &Trace,
+    profile: &ScreenProfile,
+    after: &[Grid],
+) -> dot_agent_deck::doorbell_txn::Outcome {
+    use dot_agent_deck::doorbell_screen::frame;
+    use dot_agent_deck::doorbell_txn::{
+        Action, Admission, AttemptCounter, AttemptRing, Caps, Event, Job, LatchCell, Seam,
+        SeamRead, TOKEN_ALPHABET, admit,
+    };
+    use dot_agent_deck::inbox::MessageId;
+    use std::collections::VecDeque;
+    use std::time::Instant;
+
+    struct At(SeamRead);
+    impl Seam for At {
+        fn read(&mut self) -> Option<SeamRead> {
+            Some(self.0.clone())
+        }
+    }
+    let line = &trace.lines[0];
+    let id = MessageId::parse(
+        line.split("message ")
+            .nth(1)
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    let empty = frame(profile, &trace.grid("empty"), 1, true, Some(line));
+    let typed = frame(profile, &trace.grid("typed-01"), 1, true, Some(line));
+    let admission = Admission {
+        activation: Ok(()),
+        mode: Ok(()),
+        ledger_idle: true,
+        watermark: 0,
+        job_mark: 0,
+        frame: empty.clone(),
+        nudge_in_flight: false,
+        settling: false,
+        submit_route: true,
+        still_admitted: true,
+    };
+    let cell = LatchCell::default();
+    let counter = AttemptCounter::default();
+    let ring = AttemptRing::default();
+    let mut draws = line.as_bytes()[1..7]
+        .iter()
+        .map(|letter| TOKEN_ALPHABET.iter().position(|b| b == letter).unwrap() as u8)
+        .cycle();
+    let start = Instant::now();
+    let mut txn = admit(
+        &admission,
+        &counter,
+        &ring,
+        &cell,
+        || draws.next().unwrap(),
+        &id,
+        Caps {
+            delete_key: false,
+            placeholder: false,
+            hook_route: false,
+            transcript_route: true,
+            staged_head: None,
+        },
+        start,
+    )
+    .unwrap();
+    assert_eq!(txn.line(), line);
+    let mut seam = At(SeamRead {
+        watermark: 0,
+        job_mark: 0,
+        frame: empty,
+        mode: Ok(()),
+        open: true,
+    });
+    let mut actions = txn.start(&mut seam, start);
+    let mut events = VecDeque::new();
+    let mut writes = Vec::new();
+    let mut now = start;
+    for _ in 0..1000 {
+        let mut wake = None;
+        for action in actions {
+            match action {
+                Action::Enqueue(job, claim) => {
+                    assert!(claim.start());
+                    let accepted = match &job {
+                        Job::Line(text) => text.len(),
+                        Job::Cr => 1,
+                        Job::Deletes(_) => panic!("unexpected cleanup write: {job:?}"),
+                    };
+                    events.push_back(Event::JobStarted);
+                    events.push_back(Event::JobEnded { accepted, ok: true });
+                    if matches!(job, Job::Line(_)) {
+                        events.push_back(Event::Frame(typed.clone()));
+                    } else {
+                        events.extend(
+                            after.iter().map(|grid| {
+                                Event::Frame(frame(profile, grid, 1, true, Some(line)))
+                            }),
+                        );
+                    }
+                    writes.push(job);
+                }
+                Action::WakeAt(next) => wake = Some(next),
+                Action::Release(outcome) => {
+                    assert_eq!(writes, vec![Job::Line(line.clone()), Job::Cr]);
+                    return outcome;
+                }
+                Action::Reproject => {}
+            }
+        }
+        let event = events.pop_front().unwrap_or_else(|| {
+            now = wake.unwrap_or(txn.deadline());
+            Event::Tick
+        });
+        if let Event::Frame(view) = &event {
+            seam.0.frame = view.clone();
+        }
+        actions = txn.on(event, &mut seam, now);
+    }
+    panic!("transaction did not release");
+}
+
+/// Scenario: Replay each release's captured truecolor user echo with its background changed to indexed 237 as a positive control, then replay near-miss RGB backgrounds, assistant quotes, partial lines, a missing user marker, and a composer still holding the line. None of the negative screens confirms Submitted, even with an empty composer, and the still-held composer refuses a submit even when the indexed control supplies a recognised transcript row. Mutating only a continuation row also refuses the echo.
+#[spec("inbox/doorbell/047")]
+#[test]
+fn doorbell_047_claude_truecolor_transcript_controls() {
+    use dot_agent_deck::doorbell_screen::frame;
+    use dot_agent_deck::doorbell_txn::{Cause, Outcome};
+    use vt100::Color;
+
+    for release in ["2.1.310", "2.1.312"] {
+        let trace = fixture(&format!(
+            "claude-inbox/r5wake/claude-{release}-truecolor-composer-24x80"
+        ));
+        let line = &trace.lines[0];
+        let echo = trace
+            .reads_between(trace.points["mark:cr-1"], trace.points["after-01"])
+            .into_iter()
+            .find(|grid| {
+                grid.cells
+                    .iter()
+                    .any(|row| row[0].text == "❯" && row[0].bg == Color::Rgb(55, 55, 55))
+            })
+            .expect("captured RGB user row");
+        let user_row = echo
+            .cells
+            .iter()
+            .position(|row| row[0].text == "❯" && row[0].bg == Color::Rgb(55, 55, 55))
+            .unwrap();
+        assert_eq!(echo.cells[user_row + 1][0].bg, Color::Rgb(55, 55, 55));
+        assert!(frame(&CLAUDE_PROFILE, &echo, 1, true, Some(line)).empty_and_ready());
+
+        let recolor = |grid: &mut Grid, color| {
+            for row in &mut grid.cells[user_row..=user_row + 1] {
+                for cell in row {
+                    if cell.bg == Color::Rgb(55, 55, 55) {
+                        cell.bg = color;
+                    }
+                }
+            }
+        };
+        let mut indexed = echo.clone();
+        recolor(&mut indexed, Color::Idx(237));
+        assert_eq!(
+            replay_transaction(&trace, &CLAUDE_PROFILE, std::slice::from_ref(&indexed)),
+            Outcome::Submitted,
+            "{release}: indexed-237 control"
+        );
+        eprintln!("{release}: indexed-237 control = Submitted");
+        let mut negatives = Vec::new();
+        for color in [
+            Color::Rgb(55, 55, 56),
+            Color::Rgb(56, 55, 55),
+            Color::Rgb(55, 56, 55),
+            Color::Rgb(0, 0, 0),
+            Color::Rgb(255, 255, 255),
+        ] {
+            let mut other = echo.clone();
+            recolor(&mut other, color);
+            negatives.push((format!("other background {color:?}"), other));
+        }
+        let mut quote = echo.clone();
+        recolor(&mut quote, Color::Default);
+        quote.cells[user_row][0].text = "●".into();
+        negatives.push(("assistant quote".into(), quote));
+
+        let mut partial = echo.clone();
+        let last = partial.cells[user_row + 1]
+            .iter_mut()
+            .rfind(|cell| !cell.text.trim().is_empty())
+            .unwrap();
+        assert_eq!(last.text, "h");
+        last.text = " ".into();
+        negatives.push(("partial line".into(), partial));
+
+        let mut no_marker = echo.clone();
+        no_marker.cells[user_row][0].text = " ".into();
+        negatives.push(("RGB row without the marker".into(), no_marker));
+
+        let mut continuation = echo.clone();
+        for cell in &mut continuation.cells[user_row + 1] {
+            cell.bg = Color::Rgb(55, 55, 56);
+        }
+        negatives.push(("wrong continuation background".into(), continuation));
+
+        // The indexed variant makes this refusal load-bearing before the RGB
+        // recogniser lands: it already supplies recognised transcript evidence.
+        for (name, mut held) in [("RGB", echo.clone()), ("indexed", indexed)] {
+            let typed = trace.grid("typed-01");
+            for row in user_row + 2..held.rows as usize {
+                held.cells[row] = typed.cells[row].clone();
+                held.wrapped[row] = typed.wrapped[row];
+            }
+            held.cursor = typed.cursor;
+            assert!(frame(&CLAUDE_PROFILE, &held, 1, true, Some(line)).holds_exactly(line));
+            negatives.push((format!("{name} composer still holds the line"), held));
+        }
+        for (name, grid) in negatives {
+            let outcome = replay_transaction(&trace, &CLAUDE_PROFILE, &[grid]);
+            let expected = if name.contains("composer still holds") {
+                Outcome::Unresolved(Cause::WithdrawalRefused)
+            } else {
+                Outcome::Unresolved(Cause::NoSubmitEvidence)
+            };
+            assert_eq!(outcome, expected, "{release}: {name}");
+            eprintln!("{release}: {name} = {outcome:?}");
+        }
     }
 }

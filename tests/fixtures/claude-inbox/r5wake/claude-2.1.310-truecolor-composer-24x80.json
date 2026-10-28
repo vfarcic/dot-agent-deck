@@ -1,0 +1,49 @@
+{
+  "source_run": "sanitized-first-truecolor-trial",
+  "argv0": "claude",
+  "rows": 24,
+  "cols": 80,
+  "read_lens": [
+    13,
+    6,
+    24,
+    21,
+    33,
+    24,
+    20,
+    1154,
+    21,
+    483,
+    20,
+    928,
+    20,
+    868
+  ],
+  "points": {
+    "empty": 1316,
+    "mark:trial-1": 1316,
+    "typed-01": 1799,
+    "mark:cr-1": 1799,
+    "after-01": 3635
+  },
+  "edges": [],
+  "lines": [
+    "(mivivm) dot-agent-deck: message m-q65abcde-0000000000000001 waiting, run: dot-agent-deck inbox fetch"
+  ],
+  "sanitization": {
+    "description": "First trial only; inspected printable text and OSC titles; replaced the disposable workdir with a fixed fixture label padded to the same byte length. The notification is an existing synthetic measurement prompt; no hook payload, settings, environment, process id or result log is promoted.",
+    "workdir_replacements": 1,
+    "raw_trace_sha256": "d890bf7503f3dfe2a18cbed90745628e374e6a99ef5380e17b34208f9d2509c1",
+    "sanitized_trace_sha256": "65007b06a9c3bdafffc01ba06c13f0254d1b6a7a11930260870b75d92930da8b",
+    "executable_sha256": "b73676430af12f97316a798b8371f81d640f90a58bdcb8f3ce56a835bb47df56",
+    "recorded_env": {
+      "TERM": "xterm-256color",
+      "COLORTERM": "truecolor",
+      "LANG": "C.UTF-8"
+    },
+    "retained_byte_range": [
+      0,
+      3635
+    ]
+  }
+}
