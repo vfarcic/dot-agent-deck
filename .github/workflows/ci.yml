@@ -277,6 +277,15 @@ jobs:
       # not set it, so its output must not contain it; a seam that leaked into
       # every bundle would ship to users with nothing saying so.
       - run: "! grep -rl __dadDriver dist/"
+      # Issue #1981 M10: the JUnit report, kept on green runs as well as red
+      # ones. Attempt-named for the reason spelled out on `build-macos`.
+      - name: Preserve this attempt's vitest results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: vitest-attempt-${{ github.run_attempt }}
+          path: desktop/junit/vitest.xml
+          if-no-files-found: warn
 
   # Issues #823 and #836 — the browser-level tier. `desktop-web` above runs ~296
   # vitest tests under `environment: "jsdom"`, and jsdom is a DOM implementation
@@ -583,6 +592,15 @@ jobs:
           # `?fixture=1` scenarios — so this is tidiness rather than a leak, but
           # nobody opens a failure trace from a PR that closed two months ago.
           retention-days: 7
+      # Issue #1981 M10: the JUnit report, kept on green runs as well as red
+      # ones. Attempt-named for the reason spelled out on `build-macos`.
+      - name: Preserve this attempt's browser test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: playwright-junit-attempt-${{ github.run_attempt }}
+          path: desktop/junit/playwright.xml
+          if-no-files-found: warn
 
   # Issue #953 — the driver rung, the one above `desktop-browser` on the ladder.
   # That job drives the built web bundle with fixture data; this one drives the
@@ -742,6 +760,15 @@ jobs:
           # Synthetic content — a sandbox daemon and a bash shell — so this is
           # tidiness rather than a leak.
           retention-days: 7
+      # Issue #1981 M10: the JUnit report, kept on green runs as well as red
+      # ones. Attempt-named for the reason spelled out on `build-macos`.
+      - name: Preserve this attempt's driver test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: desktop-driver-junit-attempt-${{ github.run_attempt }}
+          path: desktop/junit/driver.xml
+          if-no-files-found: warn
 
   # The Linux build, split for wall clock. Until the split, one `build` job ran
   # fmt, clippy, the release build, the fast tier and linkage-check one after

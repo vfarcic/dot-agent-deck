@@ -328,6 +328,12 @@ tasks:
       pnpm test
       pnpm build
       ! grep -rl __dadDriver dist/
+    outputs:
+      test-results:
+        - path: desktop/junit/vitest.xml
+          options:
+            language: JavaScript
+            framework: Vitest
 
   # desktop/: the Playwright suite in Chromium and WebKit (`desktop-browser`).
   - key: desktop-browser
@@ -343,6 +349,12 @@ tasks:
       pnpm exec playwright install --with-deps chromium webkit
       pnpm test:browser:types
       pnpm test:browser
+    outputs:
+      test-results:
+        - path: desktop/junit/playwright.xml
+          options:
+            language: JavaScript
+            framework: Playwright
 
   # The desktop app driven through WebKitWebDriver under Xvfb
   # (`desktop-driver`).
@@ -375,6 +387,11 @@ tasks:
       VITE_DAD_DRIVER_SEAM=1 pnpm tauri build --debug --no-bundle
       DAD_DRIVER_NATIVE_DRIVER=/usr/bin/WebKitWebDriver \
         xvfb-run -a -s "-screen 0 1920x1080x24 -dpi 96" pnpm test:driver
+    # No `options`: Captain names no framework for node:test, so it infers the
+    # parser from the JUnit file.
+    outputs:
+      test-results:
+        - path: desktop/junit/driver.xml
 
   # Type-checks the workspace for Windows from Linux (`windows-cross-check`).
   - key: windows-cross-check

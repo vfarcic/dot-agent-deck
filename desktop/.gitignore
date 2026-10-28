@@ -15,3 +15,8 @@ blob-report/
 # Driver tier (`pnpm test:driver`, issue #953): a failing scenario's screenshot,
 # page text, terminal text and logs. CI uploads it on failure.
 driver-results/
+
+# JUnit reports (issue #1981 M10): `junit/vitest.xml` and `junit/playwright.xml`
+# under CI, `junit/driver.xml` from every `pnpm test:driver`. CI uploads them
+# on every run.
+junit/

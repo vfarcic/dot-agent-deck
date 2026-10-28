@@ -95,8 +95,15 @@ export default defineConfig({
   // runs yet — the same reason `e2e-deterministic` was added advisory. Raising
   // it is a deliberate act once the job has a run history to argue from.
   workers: process.env.CI ? 1 : undefined,
+  // The JUnit report is what both CI backends keep as the run's test results
+  // (issue #1981 M10), on green runs as well as red ones.
   reporter: process.env.CI
-    ? [["github"], ["html", { open: "never" }], ["list"]]
+    ? [
+        ["github"],
+        ["html", { open: "never" }],
+        ["list"],
+        ["junit", { outputFile: "junit/playwright.xml" }],
+      ]
     : [["list"]],
   use: {
     baseURL: `http://127.0.0.1:${PORT}`,

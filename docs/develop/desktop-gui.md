@@ -2012,6 +2012,8 @@ env PATH="/usr/bin:/bin:$PATH" pnpm test:browser
 
 **Where it runs.** The `desktop-browser` job in `.github/workflows/ci.yml`, on every PR, under the same `changes` gate as `desktop-web`. It is **advisory**: the ruleset requires `build`, `build-macos`, `build-windows`, `security` and `e2e-deterministic` (`CLAUDE.md` rule 8 has the command that reads them back), and this job was new enough that its stability on a GitHub runner is unmeasured — the same reason `e2e-deterministic` was added advisory. Making it required needs a run history plus a deliberate `scripts/apply-branch-protection.sh` change, which is a repository-administration act rather than something a PR does.
 
+**JUnit reports (issue #1981 M10).** Under CI, all three desktop tiers write a JUnit report to `desktop/junit/` (gitignored): `vitest.xml` from `pnpm test`, `playwright.xml` from `pnpm test:browser`, and `driver.xml` from `pnpm test:driver`, which writes it locally too. GitHub Actions uploads each one on every run, green or red, as `vitest-attempt-<n>`, `playwright-junit-attempt-<n>` and `desktop-driver-junit-attempt-<n>`; RWX collects them as the `desktop-web`, `desktop-browser` and `desktop-driver` tasks' `test-results`.
+
 **Its relationship to the palette guards.** They are not redundant and neither replaces the other. `xtask/linkage-check/src/desktop_palette.rs` reads the stylesheet as text — no hard-coded colour outside the palette, the three `:root` blocks agreeing — and runs in the **required** `build` job. This tier resolves colours in an engine and runs in an advisory one. PRD #743's 399-declaration comparison in `chrome-headless-shell` was a one-off measurement rather than a checked-in gate, and nothing here reimplements it.
 
 ## The driver tier
