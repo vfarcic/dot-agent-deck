@@ -2424,41 +2424,64 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn a_line_after_a_cut_one_is_read_whole() {
-        let (mut connection, mut deck) = connection_pair();
-        let long = format!("{{\"may\":\"{}\"}}", "x".repeat(4 << 20));
-        let cut = connection.send(&long, Instant::now() + Duration::from_millis(200));
-        assert_eq!(
-            cut.map_err(|error| error.kind()),
-            Err(io::ErrorKind::TimedOut),
-            "precondition: the deck reads nothing, so the long line is cut"
-        );
-        let reader = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            io::Read::read_to_end(&mut deck, &mut bytes).unwrap();
-            bytes
+        // Each step that can block runs on a worker, and the test names the
+        // one it is stuck in rather than hanging until the runner's timeout.
+        // A run that times out leaves its worker (and the deck's reader
+        // thread) stuck until the test process exits.
+        let (stage_tx, stage_rx) = std::sync::mpsc::channel::<&'static str>();
+        let worker = std::thread::spawn(move || {
+            let (mut connection, mut deck) = connection_pair();
+            let long = format!("{{\"may\":\"{}\"}}", "x".repeat(4 << 20));
+            stage_tx.send("sending the long line").unwrap();
+            let cut = connection.send(&long, Instant::now() + Duration::from_millis(200));
+            assert_eq!(
+                cut.map_err(|error| error.kind()),
+                Err(io::ErrorKind::TimedOut),
+                "precondition: the deck reads nothing, so the long line is cut"
+            );
+            let reader = std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                io::Read::read_to_end(&mut deck, &mut bytes).unwrap();
+                bytes
+            });
+            let report = control_line(&InboxStreamControl {
+                not_handed: vec![at(ID1, 1, 1)],
+                ..InboxStreamControl::default()
+            });
+            stage_tx.send("sending the report").unwrap();
+            connection
+                .send(&report, Instant::now() + Duration::from_secs(5))
+                .expect("the report is sent");
+            stage_tx.send("finishing the connection").unwrap();
+            connection.finish();
+            stage_tx
+                .send("waiting for the deck's end to see EOF")
+                .unwrap();
+            let bytes = reader.join().unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            let controls: Vec<InboxStreamControl> = text
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
+            assert_eq!(
+                controls
+                    .iter()
+                    .map(|c| c.not_handed.clone())
+                    .collect::<Vec<_>>(),
+                vec![vec![at(ID1, 1, 1)]],
+                "the report is read as a line of its own"
+            );
         });
-        let report = control_line(&InboxStreamControl {
-            not_handed: vec![at(ID1, 1, 1)],
-            ..InboxStreamControl::default()
-        });
-        connection
-            .send(&report, Instant::now() + Duration::from_secs(5))
-            .expect("the report is sent");
-        connection.finish();
-        let bytes = reader.join().unwrap();
-        let text = String::from_utf8_lossy(&bytes);
-        let controls: Vec<InboxStreamControl> = text
-            .lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect();
-        assert_eq!(
-            controls
-                .iter()
-                .map(|c| c.not_handed.clone())
-                .collect::<Vec<_>>(),
-            vec![vec![at(ID1, 1, 1)]],
-            "the report is read as a line of its own"
-        );
+        let mut stage = "starting";
+        let give_up = Instant::now() + Duration::from_secs(60);
+        while !worker.is_finished() {
+            while let Ok(next) = stage_rx.try_recv() {
+                stage = next;
+            }
+            assert!(Instant::now() < give_up, "blocked for 60 s while {stage}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        worker.join().unwrap();
     }
 
     /// Scenario: Read the deck's once line through the one-shot's reader:
