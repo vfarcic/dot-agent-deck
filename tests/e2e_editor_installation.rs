@@ -207,6 +207,77 @@ fn probe_033_a_state_root_another_user_could_change_is_passed_over() {
     );
 }
 
+/// Scenario: Enable installation with the daemon's state directory below a directory its group can write, and no runtime directory installation may use: one set empty, one that is a symlink to a private directory, and one its group can write. In each, a started Claude stand-in keeps the user's editor value, uninstalled, and no helper root is made below the state root, the runtime path or the link's target. (Q35-13 review, auditor U3-03.)
+#[spec("inbox/probe/033")]
+#[test]
+fn probe_033_a_refused_state_root_without_a_trusted_runtime_installs_nothing() {
+    for case in ["empty", "symlink", "shared"] {
+        let sandbox = common::race_safe_tempdir();
+        let shared = sandbox.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let state = shared.join("state");
+        let real = sandbox.path().join("runtime-real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime = sandbox.path().join("runtime");
+        match case {
+            "symlink" => std::os::unix::fs::symlink(&real, &runtime).unwrap(),
+            "shared" => {
+                std::fs::create_dir(&runtime).unwrap();
+                std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o770)).unwrap();
+            }
+            _ => {}
+        }
+        let runtime_value = if case == "empty" {
+            String::new()
+        } else {
+            runtime.to_str().unwrap().to_string()
+        };
+        let daemon = common::spawn_daemon_serve_with_env(
+            None,
+            "0",
+            &[
+                (ASSUME, ENTRIES),
+                ("DOT_AGENT_DECK_STATE_DIR", state.to_str().unwrap()),
+                ("XDG_RUNTIME_DIR", &runtime_value),
+            ],
+        );
+        let spawned = spawn(
+            &daemon,
+            "claude",
+            "claude",
+            "2.1.310",
+            Some("user-editor --literal"),
+            None,
+            false,
+        );
+        assert_eq!(
+            spawned.report["env"]["VISUAL"],
+            json!("user-editor --literal"),
+            "{case}: an ordinary uninstalled spawn"
+        );
+        assert_eq!(
+            spawned.report["env"]["CLAUDE_ENV_FILE"],
+            Value::Null,
+            "{case}: no environment file"
+        );
+        // The daemon keeps other state under `<runtime>/dot-agent-deck`; the
+        // helper's root is `editor` below it.
+        for refused in [
+            state.join("editor"),
+            real.join("dot-agent-deck/editor"),
+            runtime.join("dot-agent-deck/editor"),
+        ] {
+            assert!(
+                !refused.exists(),
+                "{case}: nothing made under {}",
+                refused.display()
+            );
+        }
+    }
+}
+
 /// Scenario: Enable the editor-probe assumption and start a shell command that subsequently execs the Claude screen fixture. Its child retains the user's editor values, because shell panes are excluded from installation before any agent is learned.
 #[spec("inbox/probe/033")]
 #[test]

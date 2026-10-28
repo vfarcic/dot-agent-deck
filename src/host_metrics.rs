@@ -602,7 +602,8 @@ fn newly_raised(last: &std::sync::Mutex<Vec<String>>, warnings: Vec<String>) -> 
 /// `effective_current_exe` is (`src/platform/paths.rs`): a build without the
 /// `e2e` feature — which is what a normally shipped release is — has no way to
 /// be told to report a host it is not on. `cargo build --release --features
-/// e2e` does not compile at all (the guard in `src/lib.rs`).
+/// e2e` does not compile while debug assertions are off, as they are by
+/// default in the release profile (the guard in `src/lib.rs`).
 #[cfg(feature = "e2e")]
 fn e2e_fixed_sample() -> Option<HostMetrics> {
     serde_json::from_str(&std::env::var("DOT_AGENT_DECK_E2E_HOST_SAMPLE").ok()?).ok()

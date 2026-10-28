@@ -12,18 +12,22 @@
 //! the input epoch with the query ledger, `B` and the native hazard FIFO
 //! kept beside it ([`epoch`], [`query_ledger`]), and installation: the
 //! decision at each spawn ([`install`]) and the instance directory it
-//! installs from ([`instance`], Linux). The daemon feeds the hook every byte
-//! an agent writes, moves the epoch at the PTY writer's enqueue, and decides
-//! installation at every spawn, which installs nothing outside the `e2e`
-//! build's assumption until activation; nothing in it reads what the hook or
-//! the epoch tracks yet, or calls the path rule, the classifier or the
-//! permission, or publishes to an arm
-//! page.
+//! installs from ([`instance`], Linux), and the editor helper an installed
+//! agent runs as its editor ([`helper`], Linux), which the binary dispatches
+//! to by its name. The daemon feeds the hook every byte an agent writes,
+//! moves the epoch at the PTY writer's enqueue, and decides installation at
+//! every spawn, which installs nothing outside the `e2e` build's assumption
+//! until activation; nothing in the daemon reads what the hook or the epoch
+//! tracks yet, or calls the path rule, the classifier or the permission, or
+//! publishes to an arm page, and it refuses every helper invocation as
+//! unsupported.
 
 pub mod arm;
 pub mod classifier;
 pub mod epoch;
 pub mod framing;
+#[cfg(target_os = "linux")]
+pub mod helper;
 pub mod install;
 #[cfg(target_os = "linux")]
 pub mod instance;

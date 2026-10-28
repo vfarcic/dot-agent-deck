@@ -1502,8 +1502,13 @@ fn is_retired_delivery_id(id: &str) -> bool {
 }
 
 fn main() -> ExitCode {
-    // PRD #1741: the telemetry PATH shim, first, so the agent's arguments it
-    // carries are never read as the deck's.
+    // PRD #1666 part 3 (Q35-12): invoked as an agent's editor through the
+    // daemon's private helper copy, the binary is the editor helper, before
+    // anything else runs, so the helper stays single-threaded.
+    #[cfg(target_os = "linux")]
+    dot_agent_deck::composer_probe::helper::run_if_invoked();
+    // PRD #1741: the telemetry PATH shim, first among the commands, so the
+    // agent's arguments it carries are never read as the deck's.
     if let Some(code) = dot_agent_deck::telemetry::shim::run_if_invoked() {
         return code;
     }

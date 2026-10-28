@@ -4317,6 +4317,14 @@ pub struct HookCapabilitiesReply {
     /// connection whose answer named it. No daemon names it yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub composer_probe: Option<u32>,
+    /// PRD #1666 part 3 (Q35-12, amendment 3 §3.2): this daemon takes a
+    /// drain frontier when a helper reports a [`EditorReport::EditorDone`]
+    /// with a [`EditorTree::Clean`] tree, and acknowledges it with an
+    /// [`EditorFrontierAck`] on the same connection, at this version
+    /// ([`EDITOR_FRONTIER`]). A helper waits for that acknowledgement only
+    /// when the answer named it. No daemon names it yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_frontier: Option<u32>,
     /// On a refusal (the provenance gate), its stable code and sentence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
@@ -4328,6 +4336,63 @@ pub struct HookCapabilitiesReply {
 /// [`DaemonMessage::ComposerInvocation`] this build speaks. A sender requires
 /// equality ([`HookCapabilitiesReply::composer_probe`]), never `>=`.
 pub const COMPOSER_PROBE: u32 = 1;
+
+/// PRD #1666 part 3 (Q35-12): the version of the post-editor report and its
+/// acknowledgement this build speaks ([`HookCapabilitiesReply::editor_frontier`]).
+pub const EDITOR_FRONTIER: u32 = 1;
+
+/// PRD #1666 part 3 (Q35-12; amendment 3 §3.2, amendment 6 §2.3): what the
+/// editor helper reports after its editor phase, as one line on the
+/// connection that carried its [`ComposerInvocationRequest`] and on no other.
+/// It isn't a [`DaemonMessage`]: a daemon reads it only on a connection whose
+/// invocation it answered, and a helper sends it only where that exchange
+/// succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "report", rename_all = "snake_case")]
+pub enum EditorReport {
+    /// The editor ran and was reaped; `tree` is what the helper's reap loop
+    /// found of its descendants.
+    EditorDone { tree: EditorTree },
+    /// No editor ran: starting it failed with `errno`, or no editor was
+    /// configured (`errno` absent).
+    SpawnFailed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        errno: Option<i32>,
+    },
+    /// A report a newer helper names; a daemon is to read it as no report.
+    #[serde(other)]
+    Unknown,
+}
+
+/// What the helper's reap loop found once its editor was reaped (amendment 4
+/// §7.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditorTree {
+    /// `waitpid(-1, WNOHANG | __WALL)` found no child of the helper.
+    Clean,
+    /// It found a live child: a descendant of the editor reparented to the
+    /// helper.
+    Survivors,
+    /// Neither, within the loop's budget, or the helper couldn't make itself
+    /// the editor's subreaper.
+    Unknown,
+}
+
+/// The daemon's acknowledgement of an [`EditorReport::EditorDone`] with a
+/// clean tree. The helper waits for it for liveness only, and reads any line
+/// as one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "frontier", rename_all = "snake_case")]
+pub enum EditorFrontierAck {
+    /// The frontier was taken.
+    Taken,
+    /// It wasn't taken in time; the daemon keeps the request.
+    Late,
+    /// An acknowledgement a newer daemon names.
+    #[serde(other)]
+    Unknown,
+}
 
 /// PRD #1666 part 3 (Q35): the refusal code of a
 /// [`DaemonMessage::ComposerInvocation`] this daemon does not serve. The
@@ -4358,6 +4423,10 @@ pub struct ComposerInvocationRequest {
     /// The segment number the helper read with the arm.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seg_seen: Option<u64>,
+    /// The native candidate number the helper read with the arm (amendment
+    /// 2 §4.4), from the same publication as `seg_seen`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_seen: Option<u64>,
     /// The arguments the agent invoked the editor with, the export path
     /// among them; the daemon compares them with what it reads itself.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

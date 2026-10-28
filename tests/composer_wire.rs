@@ -705,6 +705,7 @@ fn request() -> ComposerInvocationRequest {
         decision: ComposerDecision::Armed,
         claim: Some(ComposerClaim::Owned),
         seg_seen: Some(5),
+        native_seen: Some(9),
         argv: vec!["/tmp/claude-1000/x.md".into()],
     }
 }

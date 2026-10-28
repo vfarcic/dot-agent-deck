@@ -1388,3 +1388,72 @@ fn probe_065_an_owner_that_cannot_be_read_fails_the_scan() {
         [PathBuf::from("/r/dot-agent-deck/editor")]
     );
 }
+
+/// Scenario: Write a gone daemon's record whose first bytes, up to the reader's bound, are a well-formed record with a long nonce, followed by more bytes: the directory is not identified, and a sweep keeps it. The same record cut to exactly the bound is identified. (Q35-13 review U3, both reviewers.)
+#[spec("inbox/probe/065")]
+#[test]
+fn probe_065_an_oversized_daemon_record_is_refused_not_cut() {
+    let dir = tempdir();
+    let root = private_dir(&dir.path().join("editor"));
+    let root_fd = open_root(&root).unwrap();
+    // SAFETY: `getuid` has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    let record = |extra: &str| {
+        let head = "pid=5\nstart=5\nboot=0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0\nnonce=";
+        let nonce = "a".repeat(READ_MAX as usize - head.len() - 1);
+        format!("{head}{nonce}\n{extra}")
+    };
+    let instance = fake_instance(&root, 5, 5);
+    let write = |text: &str| {
+        let path = instance.join(DAEMON_FILE);
+        std::fs::set_permissions(&path, Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&path, text).unwrap();
+        std::fs::set_permissions(&path, Permissions::from_mode(0o400)).unwrap();
+    };
+    assert_eq!(record("").len() as u64, READ_MAX);
+    write(&record(""));
+    assert!(identify(root_fd.as_fd(), "5-5", uid).is_some());
+    write(&record("trailing"));
+    assert!(identify(root_fd.as_fd(), "5-5", uid).is_none());
+    let swept = sweep_with(&root, "own", |_, _| false, |_| Ok(()));
+    assert!(swept.removed.is_empty(), "{swept:?}");
+    assert!(instance.join(DAEMON_FILE).exists());
+}
+
+/// Scenario: Remove an identified instance from a root this user can traverse but not write: everything beneath it and its record go, the final `rmdir` fails, and what is left is an empty directory that is no longer identified, as the removal's documentation now says. A root path with a `.` component opens as the path without it, and one with `..` refuses. (Q35-13 review U3, both reviewers.)
+#[spec("inbox/probe/065")]
+#[test]
+fn probe_065_a_final_rmdir_failure_leaves_an_unidentified_directory() {
+    let dir = tempdir();
+    let root = private_dir(&dir.path().join("editor"));
+    let root_fd = open_root(&root).unwrap();
+    // SAFETY: `getuid` has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    let instance = fake_instance(&root, 6, 6);
+    let found = identify(root_fd.as_fd(), "6-6", uid).unwrap();
+    std::fs::set_permissions(&root, Permissions::from_mode(0o500)).unwrap();
+    let removed = remove_identified(root_fd.as_fd(), found);
+    std::fs::set_permissions(&root, Permissions::from_mode(0o700)).unwrap();
+    assert!(removed.is_err());
+    assert!(instance.is_dir());
+    assert_eq!(std::fs::read_dir(&instance).unwrap().count(), 0);
+    assert!(identify(root_fd.as_fd(), "6-6", uid).is_none());
+
+    let dotted = PathBuf::from(format!("{}/./editor", dir.path().display()));
+    let same = open_root(&dotted)
+        .unwrap()
+        .as_fd()
+        .try_clone_to_owned()
+        .unwrap();
+    let ids = |fd: &std::os::fd::OwnedFd| {
+        let file = File::from(fd.try_clone().unwrap());
+        let meta = file.metadata().unwrap();
+        (meta.dev(), meta.ino())
+    };
+    assert_eq!(ids(&same), ids(&root_fd));
+    let parent = PathBuf::from(format!("{}/editor/../editor", dir.path().display()));
+    assert!(matches!(
+        open_root(&parent),
+        Err(SetupError::PathCharacters)
+    ));
+}

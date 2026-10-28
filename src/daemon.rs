@@ -20831,6 +20831,7 @@ mod composer_invocation_tests {
             decision: ComposerDecision::Armed,
             claim: None,
             seg_seen: Some(1),
+            native_seen: None,
             argv: vec!["/tmp/claude-1000/prompt.md".to_string()],
         })
     }

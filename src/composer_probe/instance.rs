@@ -44,9 +44,14 @@
 //! included. Anything less keeps it: a process of this user whose entries
 //! can't be read keeps every directory, so on a host with such a process
 //! nothing is removed ([`removable`]). Removal works beneath the directory
-//! identified, and only while its name still leads to it
-//! ([`remove_identified`]); the `daemon` record goes last, so a removal that
-//! fails partway leaves a directory that is still identified. A directory
+//! identified, through the descriptor it was identified by
+//! ([`remove_identified`]). Whether its name still leads to it is checked
+//! before the recursive pass and around the final unlinks, not before each
+//! unlink inside the pass, so a rename by this user during the pass isn't
+//! excluded. The `daemon` record is unlinked after everything else beneath
+//! the directory: a removal that fails before that leaves a directory that is
+//! still identified, while one whose final `rmdir` fails leaves an empty
+//! directory that isn't, and that retention then never removes. A directory
 //! that isn't identified, a partly made instance among them, is never
 //! removed. Files stay after their generation retires; the daemon only
 //! unmaps the arm page.
@@ -408,6 +413,14 @@ impl Instance {
     }
 }
 
+/// A setup error as the I/O error it came from, for a reader.
+fn setup_io(error: SetupError) -> io::Error {
+    match error {
+        SetupError::Io(Some(errno)) => io::Error::from_raw_os_error(errno),
+        _ => io::Error::from_raw_os_error(libc::EINVAL),
+    }
+}
+
 /// An `EEXIST` as [`SetupError::GenerationExists`].
 fn exists_is_generation(error: io::Error) -> SetupError {
     match error.raw_os_error() {
@@ -537,6 +550,60 @@ impl InstanceReader {
                 .find(|agent| encode_kind(*agent).as_bytes() == bytes)
                 .map(Kind::Agent),
         }
+    }
+
+    /// `arm-G`, opened read-only: `None` when it doesn't exist, an error for
+    /// anything else that keeps it from being opened, or for one that isn't
+    /// a regular file. The helper (Q35-12) maps what it gets.
+    pub fn arm(&self, generation: &str) -> io::Result<Option<File>> {
+        let name = generation_file("arm", generation)
+            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+        let fd = match openat(
+            self.dir_fd.as_fd(),
+            &name,
+            libc::O_RDONLY | libc::O_NOFOLLOW,
+            0,
+        ) {
+            Ok(fd) => fd,
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let file = File::from(fd);
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        Ok(Some(file))
+    }
+
+    /// Create the empty marker `name` in `inv/G/`, 0600, exclusively and
+    /// without following a link (core §2.3). The name is the caller's
+    /// ([`super::helper::marker_name`]); one holding a `/` refuses.
+    pub fn create_marker(&self, generation: &str, name: &str) -> io::Result<()> {
+        let inv = self.inv(generation)?;
+        if name.contains('/') {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        create_file_at(inv.as_fd(), &cstring_of(name), 0o600).map(drop)
+    }
+
+    /// Whether the daemon has renamed marker `name` in `inv/G/` to
+    /// `<name>.seen` (core §2.3's handshake).
+    pub fn marker_seen(&self, generation: &str, name: &str) -> bool {
+        let Ok(inv) = self.inv(generation) else {
+            return false;
+        };
+        CString::new(format!("{name}.seen"))
+            .ok()
+            .is_some_and(|seen| stat_at(inv.as_fd(), &seen).is_ok())
+    }
+
+    /// `inv/G/`, not followed.
+    fn inv(&self, generation: &str) -> io::Result<OwnedFd> {
+        if !generation_name_ok(generation) {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        let inv = open_dir_at(self.dir_fd.as_fd(), &cstring(INV_DIR)).map_err(setup_io)?;
+        open_dir_at(inv.as_fd(), &cstring(generation)).map_err(setup_io)
     }
 
     /// A file's contents, `None` when it doesn't exist; an error for one
@@ -746,8 +813,12 @@ pub fn identify(root: BorrowedFd<'_>, name: &str, uid: u32) -> Option<Identified
         return None;
     }
     let mut bytes = Vec::new();
-    // A longer record is cut short, which no record decodes from.
-    record.take(READ_MAX).read_to_end(&mut bytes).ok()?;
+    // One byte past the limit is read so that a longer record is refused,
+    // rather than decoded from a prefix that happens to be well formed.
+    record.take(READ_MAX + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > READ_MAX {
+        return None;
+    }
     let daemon = DaemonId::decode(&bytes).filter(|d| (d.pid, d.start) == (pid, start))?;
     Some(Identified {
         name: name.to_string(),
@@ -758,9 +829,12 @@ pub fn identify(root: BorrowedFd<'_>, name: &str, uid: u32) -> Option<Identified
 }
 
 /// Remove `identified` from `root`: everything beneath the directory it
-/// holds open, its `daemon` record last, then the directory, each step
-/// refused unless `identified`'s name in `root` still leads to that
-/// directory. Nothing is followed out of it.
+/// holds open, its `daemon` record after the rest, then the directory.
+/// Whether `identified`'s name in `root` still leads to that directory is
+/// checked before the recursive pass, before the record's unlink and before
+/// the final `rmdir`, not before each unlink inside the pass. Nothing is
+/// followed out of it. A failure of the final `rmdir` leaves an empty
+/// directory that [`identify`] no longer recognises.
 pub fn remove_identified(root: BorrowedFd<'_>, identified: Identified) -> io::Result<()> {
     let name = cstring_of(&identified.name);
     let still_there = || -> io::Result<()> {
@@ -1016,7 +1090,9 @@ pub fn open_root(root: &Path) -> Result<OwnedFd, SetupError> {
 /// Open `root` from `/` one component at a time, each through its parent's
 /// descriptor without following a link and trusted ([`trusted_dir`]) before
 /// the next is opened, making a missing one 0700 when `create`. A path that
-/// isn't absolute or holds `.` or `..` is [`SetupError::PathCharacters`];
+/// isn't absolute or holds `..` is [`SetupError::PathCharacters`]; a `.`
+/// after the first component is dropped by [`Path::components`]'s
+/// normalization, so it walks as if it weren't there;
 /// a symlink, a non-directory or an untrusted directory on the way is
 /// [`SetupError::UntrustedDirectory`].
 fn walk_root(root: &Path, create: bool) -> Result<OwnedFd, SetupError> {
