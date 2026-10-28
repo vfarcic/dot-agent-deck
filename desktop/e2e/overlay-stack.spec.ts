@@ -241,6 +241,41 @@ test.describe("a confirmation on the dashboard (issue #1709)", () => {
   });
 });
 
+test.describe("an agent's output Reader (issue #1709)", () => {
+  /**
+   * Scenario: on the deck press an agent's Reader button. The Reader is drawn
+   * on top and the deck behind it is inert; Ctrl+K and Open settings bring
+   * Settings up over the Reader, where it takes input; "close this" closes
+   * Settings and leaves the Reader, and "close this" again closes the Reader
+   * and leaves the deck live.
+   */
+  test("close closes Settings over the Reader, then the Reader", async ({ page }) => {
+    await load(page, "connected", ["close this", "voice off", "close this", "voice off"]);
+    await enterDeck(page);
+    const openPlanner = page.getByRole("button", { name: "Open Planner agent" });
+    await page.locator('[data-testid^="reader-open-"]').first().click();
+    const reader = page.getByRole("dialog", { name: /output reader$/ });
+    await expect(reader).toBeVisible();
+    expect(await drawnOnTop(reader.getByRole("button", { name: "Close reader" })), "the Reader is drawn on top").toBe(true);
+    expect(await inert(openPlanner), "the deck behind the Reader is fenced").toBe(true);
+
+    await settingsFromCommandMenu(page);
+    expect(await inert(settings(page)), "Settings opened over the Reader takes input").toBe(false);
+    expect(await drawnOnTop(settings(page).getByRole("button", { name: "Close settings" })), "Settings is drawn over the Reader").toBe(true);
+
+    const trigger = page.getByTestId("voice-trigger");
+    await pressVoice(page);
+    await expect(trigger).toHaveAttribute("aria-pressed", "false");
+    await expect(settings(page)).toHaveCount(0);
+    await expect(reader).toBeVisible();
+
+    await pressVoice(page);
+    await expect(trigger).toHaveAttribute("aria-pressed", "false");
+    await expect(reader).toHaveCount(0);
+    expect(await inert(openPlanner)).toBe(false);
+  });
+});
+
 test.describe("sheets, the agent pane and the pull request page", () => {
   /**
    * Scenario: Qodo's earlier case. On the dashboard open Settings, then the

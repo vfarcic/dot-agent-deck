@@ -15,16 +15,14 @@
  * can show both.
  *
  * **Not every dialog here is fenced, and saying so is the honest version of
- * "a repo-wide convention".** `OutputReader` declares `aria-modal="true"` over
- * the same mounted background and calls nothing here, so the claim is as untrue
- * for it as it was for the pane. `ConfirmDialog`, `UpgradeDialog` and
- * `SelfUpgradeDialog` are on the stack (issue #1709), with their own way out
- * as `close`, so voice's "close" dismisses them and no longer reaches past one
- * to the overlay beneath it.
+ * "a repo-wide convention".** `ConfirmDialog`, `UpgradeDialog`,
+ * `SelfUpgradeDialog` and `OutputReader` are on the stack (issue #1709), with
+ * their own way out as `close`, so voice's "close" dismisses them and no longer
+ * reaches past one to the overlay beneath it.
  * `SettingsSheet` and `ConfigurationPanels`'s four sheets are on the stack
  * through {@link useOverlaySheet} (PR #1680 review), and fence only while
- * raised over the agent pane or the pull request browser; otherwise they fence
- * nothing, as before. PRD #1401's
+ * raised over the agent pane, the pull request browser or the output reader;
+ * otherwise they fence nothing, as before. PRD #1401's
  * pull request browser is the third caller, and the first that opens over
  * another: it comes up over a still-mounted pane, so only the topmost open
  * caller fences (see `stack` below) and the pane beneath it is background like
@@ -182,6 +180,8 @@ export function insideVoicePeer(element: Element): boolean {
 export const OVERLAY_LAYER = {
   /** `.sheet-backdrop`: Settings and the configuration sheets, when not raised. */
   sheet: 80,
+  /** `.reader-overlay`: an agent's output reader, above a sheet so that a sheet opened over it is raised, as over the pane. */
+  reader: 85,
   /** `.agent-pane-overlay`. */
   pane: 90,
   /** `.pr-browser-overlay`. */
@@ -327,9 +327,9 @@ export function useInertBackground<T extends HTMLElement>(open: boolean, layer: 
 /**
  * PR #1680 review (Qodo) — Settings and the configuration sheets on the stack.
  *
- * A sheet is drawn at {@link OVERLAY_LAYER}'s `sheet`, beneath the agent's pane
- * and the pull request browser, and fences nothing — what it did before it was
- * on the stack — unless it opened over one of THOSE: the overlays a sheet is
+ * A sheet is drawn at {@link OVERLAY_LAYER}'s `sheet`, beneath the agent's pane,
+ * the pull request browser and the output reader, and fences nothing — what it
+ * did before it was on the stack — unless it opened over one of THOSE: the overlays a sheet is
  * otherwise painted under. Then it is what the user just asked for, so it is
  * `raised`: drawn above them (`.sheet-backdrop.is-raised`) and fencing them,
  * since it would otherwise be inert under their fence.
@@ -356,10 +356,10 @@ export function useOverlaySheet<T extends HTMLElement>(open: boolean, close: () 
 }
 
 /**
- * Whether one of the overlays a sheet is painted under (the pane, the pull
- * request browser) was already up when `sheet` opened. A sheet not yet on the
- * stack (`opened` 0, or no entry yet: the render that opens it) counts
- * everything up now.
+ * Whether one of the overlays a sheet is painted under (the output reader,
+ * the pane, the pull request browser) was already up when `sheet` opened. A
+ * sheet not yet on the stack (`opened` 0, or no entry yet: the render that
+ * opens it) counts everything up now.
  */
 function opensOverPaneOrPage(sheet: Fenced | null): boolean {
   const opened = sheet?.opened ?? 0;
