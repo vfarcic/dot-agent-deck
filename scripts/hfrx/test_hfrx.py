@@ -278,18 +278,27 @@ class HfrxSafety(unittest.TestCase):
         self.assertEqual(sum(report["survivors_status"] == "unknown" for report in reports), 2)
 
     def test_spawn_failure_does_not_leak_pty_descriptors(self):
+        """Scenario: Mock both releases' launches to check literal arguments and close PTYs on failure, then retain backend mode for observed and unfinished synthetic editor cycles."""
         owner = h.Children(self.root, self.env)
         try:
-            for failure in (OSError, h.StopRequested):
+            for version, failure in ((version, failure) for version in h.VERSIONS
+                                     for failure in (OSError, h.StopRequested)):
                 master, slave = h.pty.openpty()
                 try:
-                    with self.subTest(failure=failure), \
+                    with self.subTest(version=version, failure=failure), \
                             patch.object(h.pty, "openpty", return_value=(master, slave)), \
                             patch.object(owner, "spawn", side_effect=failure("stand-in spawn failure")) as spawn:
                         with self.assertRaisesRegex(failure, "stand-in spawn failure"):
-                            h.x2_sample(self.root, owner, "0.160.0", 0, "arrival")
+                            h.x2_sample(self.root, owner, version, 0, "arrival")
                         self.assertNotIn("preexec_fn", spawn.call_args.kwargs)
-                        self.assertEqual(spawn.call_args.args[0][2], "_pty")
+                        prefix = self.root / "raw" / f"{version}-arrival-000"
+                        expected = [str(self.root / "bin/python3"), str(Path(h.__file__).resolve()), "_pty",
+                                    str(self.root / "bin/strace"), "-f", "-ff", "-ttt", "-xx", "-s", "65536",
+                                    "-e", "trace=connect", "-o", str(prefix) + ".trace",
+                                    str(self.root / "bin" / f"codex-{version}"), "--no-alt-screen"]
+                        if version == "0.164.0":
+                            expected.append("--no-daemon")
+                        self.assertEqual(spawn.call_args.args[0], expected)
                     for fd in (master, slave):
                         with self.assertRaises(OSError):
                             os.fstat(fd)
@@ -301,9 +310,31 @@ class HfrxSafety(unittest.TestCase):
                             pass
         finally:
             owner.cleanup()
+        # Drive the real capture/result path with synthetic terminal bytes;
+        # no executable, provider or namespace is launched.
+        for version in h.VERSIONS:
+            for observed in (False, True):
+                chunks = iter((h.FRAME, h.DISABLE + h.ENABLE + h.FRAME))
+
+                def read_chunk(fd, size):
+                    (self.root / "editor-notice").write_text("synthetic editor returned")
+                    return next(chunks)
+
+                with self.subTest(version=version, observed=observed), \
+                        patch.object(h, "Children") as children, \
+                        patch.object(h.selectors, "DefaultSelector"), \
+                        patch.object(os, "read", side_effect=read_chunk), patch.object(os, "write"), \
+                        patch.object(h.signal, "pidfd_send_signal"):
+                    owner = children.return_value
+                    owner.env = self.env
+                    owner.spawn.return_value.poll.return_value = None if observed else 0
+                    result = h.x2_sample(self.root, owner, version, int(observed), "arrival")
+                self.assertEqual(result["status"], "observed" if observed else "UNVERIFIED")
+                self.assertEqual(result["backend_mode"], "embedded-explicit-no-daemon"
+                                 if version == "0.164.0" else "default")
 
     def test_supervisor_records_source_digest_and_bounds_inner_wait(self):
-        """Scenario: Record source provenance and bound the supervisor wait, then select a ten-sample single-release pilot and refuse an unavailable required namespace before measurement startup."""
+        """Scenario: Record source provenance and per-release backend modes while bounding the supervisor wait, then select a ten-sample single-release pilot and refuse an unavailable required namespace before measurement startup."""
         args = unittest.mock.Mock(root=str(self.root), method="arrival", samples=1,
                                   reviewed_commit="a" * 40, release=None, require_namespace=False)
         with patch.object(h, "Children") as children:
@@ -314,6 +345,8 @@ class HfrxSafety(unittest.TestCase):
         authorization = json.loads((self.root / "run-authorization.json").read_text())
         self.assertEqual(authorization["executing_script_sha256"],
                          hashlib.sha256(Path(h.__file__).read_bytes()).hexdigest())
+        self.assertEqual(authorization["backend_modes"], {
+            "0.160.0": "default", "0.164.0": "embedded-explicit-no-daemon"})
         owner.spawn.return_value.wait.assert_called_once_with(timeout=82)
         for probe_ok in (True, False):
             for tools_present in (True, False):
@@ -337,6 +370,8 @@ class HfrxSafety(unittest.TestCase):
                         h.run_x2(args)
                         authorization = json.loads((root / "run-authorization.json").read_text())
                         self.assertEqual(authorization["releases"], ["0.164.0"])
+                        self.assertEqual(authorization["backend_modes"], {
+                            "0.164.0": "embedded-explicit-no-daemon"})
                         self.assertEqual(authorization["samples_per_release"], 10)
                         self.assertTrue(authorization["require_namespace"])
                         self.assertEqual(authorization["network"], "network-namespace")

@@ -2,7 +2,7 @@
 
 use spec::spec;
 
-/// Scenario: Run the H-FRX offline safety checks with fixture files, synthetic traces and detached Python stand-in process trees. Refuse unsafe export paths and secrets, exercise cleanup after final-KILL adoption, and check strict reducer types and single-release pilot selection without starting an agent, mock provider, namespace, container or deck daemon.
+/// Scenario: Run the H-FRX offline safety checks with fixture files, synthetic traces and detached Python stand-in process trees. Refuse unsafe export paths and secrets, exercise cleanup after final-KILL adoption, and check strict reducer types, release-specific launch arguments and backend metadata, and single-release pilot selection without starting an agent, mock provider, namespace, container or deck daemon.
 #[spec("harness/hfrx/001")]
 #[test]
 fn hfrx_001_offline_safety_controls() {
