@@ -99,7 +99,7 @@ A run starts when the deck starts an agent in a pane and ends when the agent exi
 | `service.name` | `dot-agent-deck`, or `OTEL_SERVICE_NAME` |
 | `service.version` | The deck's version |
 | `host.name` | The machine's hostname. Tells several machines apart in one backend. |
-| `deck.telemetry.schema_version` | `2`. It changes when the meaning of an attribute on this page changes, so you can keep data recorded before and after apart. A new attribute does not change it. |
+| `deck.telemetry.schema_version` | `3`. It changes when the meaning of an attribute on this page changes, so you can keep data recorded before and after apart. A new attribute does not change it. `3` is when `deck.intervention.kind` started saying what you did instead of always `input`, and `deck.interventions.count` started including voice answers the deck passes to the agent without typing them. |
 | your own | Every pair from `OTEL_RESOURCE_ATTRIBUTES`. Your pairs cannot replace the four above; set `OTEL_SERVICE_NAME` to rename the service. |
 
 ### `agent.run`
@@ -129,10 +129,16 @@ Events on the `agent.run` span:
 | Event | Attributes | When |
 | --- | --- | --- |
 | `deck.status_change` | `deck.status.from`, `deck.status.to` | The agent's status changed. The first status of a run has only `deck.status.to`. |
-| `deck.intervention` | `deck.intervention.kind` (`input`) | You typed into the agent's pane from either client, or answered its question by voice in the desktop app. Keystrokes less than about five seconds apart count as one intervention. Input the deck sends on its own, such as a delegated task, a message or a scheduled prompt, is not counted, and neither are the replies your terminal sends without you, such as answers to the agent's questions about the cursor position or colours. |
+| `deck.intervention` | `deck.intervention.kind`: `interrupt`, `answer`, `paste`, `text` or `navigate` | You stepped in: you typed into the agent's pane from either client, or answered its question by voice in the desktop app. Keystrokes less than about five seconds apart count as one intervention, and its kind is the strongest of what you did in it, in this order: `interrupt` is Ctrl+C or Escape; `answer` is input while the agent's card shows **Needs Input**, or an answer you gave by voice in the desktop app, now counted also when the deck passes it to the agent without typing anything into the pane; `paste` is a paste; `text` is typing, Enter or Backspace; `navigate` is only moving around, such as arrow keys, mouse clicks or scrolling in the pane, and other Alt or Ctrl shortcuts. So pressing Escape at a permission prompt is an `interrupt`, and typing a correction after scrolling is `text`. Only the kind is sent, never what you typed or pasted. Input the deck sends on its own, such as a delegated task, a message or a scheduled prompt, is not counted, and neither are the replies your terminal sends without you, such as answers to the agent's questions about the cursor position or colours. |
 | `deck.ci.change` | `deck.ci.from`, `deck.ci.to`, `deck.pr.number` | The overall result of the pull request's checks changed: `pending`, `passing` or `failing`. The first one for a pull request has only `deck.ci.to`. |
 
 A run with many changes keeps its first 1024 events; the two counts keep counting after that.
+
+What the kind cannot tell apart:
+
+- **A paste** counts as `paste` only when the agent has asked your terminal to mark pastes (bracketed paste). Otherwise it arrives exactly like fast typing and counts as `text`. Voice dictation into a pane counts as `text` too.
+- **An answer you type** counts as `answer` only while the card shows **Needs Input**, so it follows what each agent reports: see the **Needs Input** rows in [Session management](session-management.md#which-agents-report-which-status). A question the agent asked in its reply text, with no prompt, is answered with `text`. Claude Code's reminder that it is waiting for your next prompt, which arrives after a turn ends, is not a question: what you type after it counts by what you typed.
+- **Mouse clicks and scrolling** count as `navigate` when the client sends them to the agent, which depends on whether the agent asked for the mouse. Scrolling back through the client's own history of the pane is not counted.
 
 A run also says what it used and how it ended, with one more event per model: [What a run used and how it ended](#what-a-run-used-and-how-it-ended).
 

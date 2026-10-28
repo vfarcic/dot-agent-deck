@@ -19,6 +19,10 @@
 //! filter settles it as a person's with [`InputFilter::settle_lone_escape`]
 //! once [`LONE_ESCAPE_WINDOW`] has passed with nothing after it, or when the
 //! run ends.
+//!
+//! **What the input was is told apart the same way** ([`InterventionKind`]),
+//! from the bytes alone and never by keeping them: a key that interrupts, a
+//! bracketed paste, text, or a key that only moves around.
 
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
@@ -36,6 +40,37 @@ pub const MAX_OSC_BODY: usize = 1024;
 /// later than this is counted as a person's input.
 pub const LONE_ESCAPE_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// What a person's input was, as `deck.intervention.kind` names it. Ordered
+/// by precedence: the strongest kind seen in a burst of input is the burst's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum InterventionKind {
+    /// Only cursor keys, mouse reports, Alt chords and other shortcuts.
+    Navigate,
+    /// Printable characters, Enter, Backspace, Tab, Delete.
+    Text,
+    /// A bracketed paste.
+    Paste,
+    /// Input while the agent waits on a question or permission prompt, or an
+    /// answer given in the deck's own question UI. Never from the bytes alone.
+    Answer,
+    /// Ctrl+C, or the Escape key.
+    Interrupt,
+}
+
+impl InterventionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Navigate => "navigate",
+            Self::Text => "text",
+            Self::Paste => "paste",
+            Self::Answer => "answer",
+            Self::Interrupt => "interrupt",
+        }
+    }
+}
+
+const CTRL_C: u8 = 0x03;
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 enum State {
     /// Between sequences.
@@ -49,6 +84,9 @@ enum State {
     Osc(usize),
     /// Inside an OSC, after an `ESC` that may begin its `ESC \` terminator.
     OscEsc(usize),
+    /// After `ESC O`, already counted: a cursor key in application mode
+    /// (`ESC O A`) ends with the next byte.
+    Ss3,
 }
 
 /// The per-run streaming filter. See the module docs.
@@ -62,15 +100,22 @@ impl InputFilter {
         Self::default()
     }
 
-    /// Feed one accepted write. `true` when it contains, or completes,
-    /// anything a person did. An incomplete sequence at the end of `bytes` is
-    /// held and decided by the next write.
-    pub fn feed(&mut self, bytes: &[u8]) -> bool {
-        let mut human = false;
+    /// Feed one accepted write: the strongest kind of what it contains, or
+    /// completes, that a person did, `None` when it is only terminal reports.
+    /// An incomplete sequence at the end of `bytes` is held and decided by the
+    /// next write.
+    pub fn classify(&mut self, bytes: &[u8]) -> Option<InterventionKind> {
+        let mut kind = None;
         for &b in bytes {
-            human |= self.step(b);
+            kind = kind.max(self.step(b));
         }
-        human
+        kind
+    }
+
+    /// [`Self::classify`], as whether anything a person did is in it.
+    #[cfg(test)]
+    pub fn feed(&mut self, bytes: &[u8]) -> bool {
+        self.classify(bytes).is_some()
     }
 
     /// Whether a sequence is being held.
@@ -85,8 +130,9 @@ impl InputFilter {
         self.state == State::Esc
     }
 
-    /// Read a held lone `ESC` as the Escape key: `true`, and the filter is
-    /// back between sequences. `false`, and nothing changes, when something
+    /// Read a held lone `ESC` as the Escape key — an
+    /// [`InterventionKind::Interrupt`]: `true`, and the filter is back between
+    /// sequences. `false`, and nothing changes, when something
     /// else (or nothing) is held.
     pub fn settle_lone_escape(&mut self) -> bool {
         if self.holds_lone_escape() {
@@ -97,70 +143,130 @@ impl InputFilter {
         }
     }
 
-    fn step(&mut self, b: u8) -> bool {
+    fn step(&mut self, b: u8) -> Option<InterventionKind> {
+        use InterventionKind::{Interrupt, Navigate, Paste, Text};
         match std::mem::take(&mut self.state) {
-            State::Ground => {
-                if b == ESC {
-                    self.state = State::Esc;
-                    false
-                } else {
-                    true
-                }
-            }
+            State::Ground => ground_kind(b).or_else(|| {
+                self.state = State::Esc;
+                None
+            }),
             State::Esc => match b {
                 b'[' => {
                     self.state = State::Csi(Vec::new());
-                    false
+                    None
                 }
                 b']' => {
                     self.state = State::Osc(0);
-                    false
+                    None
+                }
+                b'O' => {
+                    self.state = State::Ss3;
+                    Some(Navigate)
                 }
                 // A second ESC: the first was the Escape key; the second may
                 // start a report.
                 ESC => {
                     self.state = State::Esc;
-                    true
+                    Some(Interrupt)
                 }
+                // Alt+Enter: a newline.
+                b'\r' | b'\n' => Some(Text),
                 // Alt+key and the like.
-                _ => true,
+                _ => Some(Navigate),
             },
             State::Csi(mut params) => {
                 if (0x40..=0x7e).contains(&b) {
-                    !is_csi_report(&params, b)
+                    if is_csi_report(&params, b) {
+                        None
+                    } else {
+                        Some(match (params.as_slice(), b) {
+                            (b"200", b'~') => Paste,
+                            // Delete.
+                            (b"3", b'~') => Text,
+                            (_, b'u') => csi_u_kind(&params),
+                            _ => Navigate,
+                        })
+                    }
                 } else if params.len() >= MAX_CSI_PARAMS {
-                    true
+                    Some(Navigate)
                 } else {
                     params.push(b);
                     self.state = State::Csi(params);
-                    false
+                    None
                 }
             }
             State::Osc(len) => {
                 if b == BEL {
-                    false
+                    None
                 } else if len >= MAX_OSC_BODY {
-                    true
+                    Some(Navigate)
                 } else {
                     self.state = if b == ESC {
                         State::OscEsc(len + 1)
                     } else {
                         State::Osc(len + 1)
                     };
-                    false
+                    None
                 }
             }
             State::OscEsc(len) => {
                 if b == b'\\' {
-                    false
+                    None
                 } else if len >= MAX_OSC_BODY {
-                    true
+                    Some(Navigate)
                 } else {
                     self.state = State::Osc(len + 1);
-                    false
+                    None
+                }
+            }
+            State::Ss3 => {
+                if (0x40..=0x7e).contains(&b) {
+                    Some(Navigate)
+                } else {
+                    self.step(b)
                 }
             }
         }
+    }
+}
+
+/// The kind of one byte between sequences; `None` for the `ESC` that starts
+/// one.
+fn ground_kind(b: u8) -> Option<InterventionKind> {
+    match b {
+        ESC => None,
+        CTRL_C => Some(InterventionKind::Interrupt),
+        b'\r' | b'\n' | b'\t' | 0x08 | 0x7f => Some(InterventionKind::Text),
+        // Other control keys: shortcuts, not text.
+        0x00..=0x1f => Some(InterventionKind::Navigate),
+        // Printable, UTF-8 included.
+        _ => Some(InterventionKind::Text),
+    }
+}
+
+/// The kind of a key a terminal speaking the kitty keyboard protocol sent as
+/// `ESC [ <code>[:…][;<modifiers>[:…]] u` — Shift+Enter's `ESC[13;2u`, for one.
+fn csi_u_kind(params: &[u8]) -> InterventionKind {
+    let mut fields = params.split(|&b| b == b';');
+    let number = |field: Option<&[u8]>| -> Option<u32> {
+        let field = field?.split(|&b| b == b':').next()?;
+        std::str::from_utf8(field).ok()?.parse().ok()
+    };
+    let code = number(fields.next());
+    // The modifiers are sent plus one: 1 is none; bit 2 is Alt, bit 4 Ctrl.
+    let modifiers = number(fields.next()).unwrap_or(1).saturating_sub(1);
+    let ctrl = modifiers & 4 != 0;
+    let alt = modifiers & 2 != 0;
+    match code {
+        Some(27) => InterventionKind::Interrupt,
+        Some(c) if ctrl && (c == u32::from(b'c') || c == u32::from(b'C')) => {
+            InterventionKind::Interrupt
+        }
+        Some(13 | 9 | 8 | 127) => InterventionKind::Text,
+        Some(c) if !ctrl && !alt && char::from_u32(c).is_some_and(|c| !c.is_control()) => {
+            InterventionKind::Text
+        }
+        _ => InterventionKind::Navigate,
     }
 }
 
@@ -319,6 +425,77 @@ mod tests {
         assert!(!filter.settle_lone_escape());
         assert!(filter.is_holding());
         assert!(!filter.feed(b"80R"), "the report completes as a report");
+    }
+
+    /// The kind of one whole frame, a lone `ESC` left held settled as the
+    /// Escape key.
+    fn kind_of(bytes: &[u8]) -> Option<InterventionKind> {
+        let mut filter = InputFilter::new();
+        let kind = filter.classify(bytes);
+        if filter.settle_lone_escape() {
+            return kind.max(Some(InterventionKind::Interrupt));
+        }
+        kind
+    }
+
+    #[test]
+    fn each_frame_has_the_kind_of_what_a_person_did() {
+        use InterventionKind::*;
+        for (frame, expected) in [
+            (&b"hello"[..], Some(Text)),
+            (b"\r", Some(Text)),
+            (b"\x7f", Some(Text)),
+            (b"\t", Some(Text)),
+            (b"\x1b[3~", Some(Text)),
+            ("ü".as_bytes(), Some(Text)),
+            // Shift+Enter in the kitty keyboard protocol, and Alt+Enter.
+            (b"\x1b[13;2u", Some(Text)),
+            (b"\x1b\r", Some(Text)),
+            (b"\x1b[97u", Some(Text)),
+            (b"\x1b[200~text\x1b[201~", Some(Paste)),
+            (b"\x03", Some(Interrupt)),
+            (b"\x1b", Some(Interrupt)),
+            (b"\x1b\x1b", Some(Interrupt)),
+            (b"\x1b[27u", Some(Interrupt)),
+            (b"\x1b[99;5u", Some(Interrupt)),
+            (b"text\x03", Some(Interrupt)),
+            (b"\x1b[A", Some(Navigate)),
+            (b"\x1b[1;5D", Some(Navigate)),
+            (b"\x1bOA", Some(Navigate)),
+            (b"\x1bx", Some(Navigate)),
+            (b"\x1b[<0;10;5M", Some(Navigate)),
+            (b"\x1b[5~", Some(Navigate)),
+            (b"\x1b[97;3u", Some(Navigate)),
+            (b"\x01", Some(Navigate)),
+            (b"\x1b[Ax", Some(Text)),
+            (b"\x1b[I", None),
+            (b"\x1b[24;80R", None),
+        ] {
+            assert_eq!(kind_of(frame), expected, "{frame:?}");
+        }
+    }
+
+    /// A kind is the same whether its sequence arrives whole or split.
+    #[test]
+    fn a_split_sequence_keeps_its_kind() {
+        for frame in [
+            &b"\x1b[200~x\x1b[201~"[..],
+            b"\x1b[A",
+            b"\x1bOB",
+            b"\x1b[13;2u",
+            b"\x1b[<0;10;5M",
+        ] {
+            let whole = kind_of(frame);
+            for at in 0..=frame.len() {
+                let mut filter = InputFilter::new();
+                let mut kind = filter.classify(&frame[..at]);
+                kind = kind.max(filter.classify(&frame[at..]));
+                if filter.settle_lone_escape() {
+                    kind = kind.max(Some(InterventionKind::Interrupt));
+                }
+                assert_eq!(kind, whole, "{frame:?} split at {at}");
+            }
+        }
     }
 
     #[test]

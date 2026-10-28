@@ -60,7 +60,7 @@ use super::accounting::run_usage::{UsageDirs, UsageFile};
 use super::accounting::usage_file::USAGE_FILE_ENV;
 use super::accounting::{UsageSource, locate, usage_source};
 use super::config::{EnvMap, TelemetryConfig, redacted_endpoint};
-use super::input::{InputFilter, LONE_ESCAPE_WINDOW};
+use super::input::{InputFilter, InterventionKind, LONE_ESCAPE_WINDOW};
 use super::launch::LAUNCH_ENV_KEYS;
 use super::propagation::{RunIdentity, agent_env};
 use super::resource::{ResourceAttribute, deck_resource, host_name};
@@ -416,23 +416,23 @@ struct PaneInput {
     /// window, and wall-clock, for the intervention it may become.
     escape: Option<(std::time::Instant, u64)>,
     /// When the human input the filter accepted and the tracker has not
-    /// counted yet was written, oldest first. Taken, once, by whichever comes
-    /// first: the [`Command::HumanInput`] sent with the first of them, or the
-    /// run ending.
-    pending: Vec<u64>,
+    /// counted yet was written, and what it was, oldest first. Taken, once,
+    /// by whichever comes first: the [`Command::HumanInput`] sent with the
+    /// first of them, or the run ending.
+    pending: Vec<(u64, InterventionKind)>,
 }
 
 impl PaneInput {
     /// Everything this run's input still owes the tracker, oldest first:
     /// what is pending, then a held lone `ESC` when `settle` says it is the
     /// Escape key now.
-    fn take_held(&mut self, settle: bool) -> Vec<u64> {
+    fn take_held(&mut self, settle: bool) -> Vec<(u64, InterventionKind)> {
         let mut held = std::mem::take(&mut self.pending);
         if settle
             && let Some((_, written)) = self.escape.take()
             && self.filter.settle_lone_escape()
         {
-            held.push(written);
+            held.push((written, InterventionKind::Interrupt));
         }
         held
     }
@@ -448,7 +448,7 @@ fn lock_filters(filters: &Filters) -> std::sync::MutexGuard<'_, HashMap<String, 
 /// when the input it accepted and the tracker has not counted yet was written,
 /// with a lone `ESC` it still held last — the Escape key, since nothing can
 /// follow it now. Called by the tracker, with the tracker locked.
-fn retire_input(filters: &Filters, pane_id: &str, run_id: &str) -> Vec<u64> {
+fn retire_input(filters: &Filters, pane_id: &str, run_id: &str) -> Vec<(u64, InterventionKind)> {
     let mut filters = lock_filters(filters);
     let Some(inputs) = filters.get_mut(pane_id) else {
         return Vec::new();
@@ -867,8 +867,9 @@ impl Telemetry {
     }
 
     /// An attached client wrote `bytes` into `pane_id`. Counted as a human
-    /// intervention unless it is only terminal reports, including a report
-    /// split across writes ([`super::input::InputFilter`]). A lone `ESC` — the
+    /// intervention, of the kind its bytes say, unless it is only terminal
+    /// reports, including a report split across writes
+    /// ([`super::input::InputFilter`]). A lone `ESC` — the
     /// Escape key — is counted, at the time it was written, once
     /// [`LONE_ESCAPE_WINDOW`] passes without the rest of a report, or when the
     /// run ends. Input the deck injects itself (a delegated task, an inbox
@@ -909,11 +910,11 @@ impl Telemetry {
             {
                 input.escape = None;
                 if input.filter.settle_lone_escape() {
-                    human.push(written);
+                    human.push((written, InterventionKind::Interrupt));
                 }
             }
-            if input.filter.feed(bytes) {
-                human.push(now);
+            if let Some(kind) = input.filter.classify(bytes) {
+                human.push((now, kind));
             }
             // A non-empty write leaving a lone ESC held ended with it.
             if !input.filter.holds_lone_escape() {
@@ -1236,8 +1237,8 @@ impl Shared {
                 .and_then(|inputs| inputs.iter_mut().find(|input| input.run_id == run_id))
                 .map(|input| input.take_held(false))
                 .unwrap_or_default();
-            for written in held {
-                t.observe_run_input(pane_id, run_id, written);
+            for (written, kind) in held {
+                t.observe_run_input(pane_id, run_id, written, kind);
             }
         });
     }
@@ -1271,8 +1272,8 @@ impl Shared {
                     }
                     let due = since + LONE_ESCAPE_WINDOW;
                     if at >= due {
-                        for written in input.take_held(true) {
-                            t.observe_run_input(pane_id, &input.run_id, written);
+                        for (written, kind) in input.take_held(true) {
+                            t.observe_run_input(pane_id, &input.run_id, written, kind);
                         }
                     } else {
                         next_due = Some(next_due.map_or(due, |d| d.min(due)));

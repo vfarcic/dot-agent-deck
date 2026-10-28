@@ -415,7 +415,7 @@ fn telemetry_otlp_002_exports_run_and_status_intervals() {
             assert_eq!(attribute(resource, "service.name"), "dot-agent-deck");
             assert!(!attribute(resource, "service.version").is_empty());
             assert!(!attribute(resource, "host.name").is_empty());
-            assert_eq!(attribute(resource, "deck.telemetry.schema_version"), "2");
+            assert_eq!(attribute(resource, "deck.telemetry.schema_version"), "3");
         }
     }
 }
