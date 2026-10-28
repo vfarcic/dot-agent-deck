@@ -217,6 +217,93 @@ describe("answering an agent's question by voice", () => {
     expect(screen.getByTestId("voice-report")).not.toHaveTextContent(SENT.sentence);
   });
 
+  /// Scenario: inbox/probe/018 (Q35-10 review) — the answer is on its way and the user presses Cancel, whose request never reaches the app; the send then times out unconfirmed and a snapshot settles the answer as written. Whether the cancel's failure arrives before the unconfirmed result, between it and the settlement, or after the settlement, the row ends saying the answer was written and that the cancel could not stop it.
+  it.each(["before_unconfirmed", "before_settlement", "after_settlement"] as const)
+  ("inbox/probe/018: a cancel failing %s keeps both the settlement and the cancel's failure", async (when) => {
+    const voice = microphone();
+    let deliver: ((outcome: AnswerOutcomeDto) => void) | undefined;
+    let failCancel: ((cause: Error) => void) | undefined;
+    const { rt, sendVoiceAnswer, cancelVoiceAnswer } = runtime(voice, () => new Promise<AnswerOutcomeDto>((resolve) => { deliver = resolve; }));
+    cancelVoiceAnswer.mockImplementationOnce(() => new Promise((_, reject) => { failCancel = reject; }));
+    const view = render(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={composerPane()} selectedDeckId="local" />);
+    await turnOnVoice();
+    await speak(voice, "yes");
+    await waitOut(VOICE_DICTATION_SEND_MS);
+    expect(sendVoiceAnswer).toHaveBeenCalledTimes(1);
+    const token = Number(sendVoiceAnswer.mock.calls[0][3]);
+    fireEvent.click(screen.getByTestId("voice-question-cancel"));
+    await flush();
+    expect(cancelVoiceAnswer).toHaveBeenCalledTimes(1);
+    const fail = async () => { failCancel?.(new Error("ipc down")); await flush(); };
+
+    if (when === "before_unconfirmed") await fail();
+    deliver?.(UNCONFIRMED);
+    await flush();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(UNCONFIRMED.sentence);
+    if (when === "before_settlement") {
+      await fail();
+      expect(screen.getByTestId("voice-report")).toHaveTextContent(`${UNCONFIRMED.sentence} ${QUESTION_CANCEL_FAILED}`);
+    }
+    const settled = composerPane({ answerSettlements: [{ questionId: "q-1", revision: 7, clientToken: token, outcome: "written" }] });
+    view.rerender(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={settled} selectedDeckId="local" />);
+    await flush();
+    if (when === "after_settlement") {
+      expect(screen.getByTestId("voice-report")).toHaveTextContent(/Allowed: touch x/);
+      await fail();
+    }
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/Allowed: touch x/);
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(QUESTION_CANCEL_FAILED);
+    expect(screen.getByTestId("voice-report")).not.toHaveTextContent(UNCONFIRMED.sentence);
+    view.unmount();
+  });
+
+  /// Scenario: inbox/probe/018 (Q35-10 review) — the answer is on its way when a snapshot already carries its own token's written settlement; only then does the send time out unconfirmed, and no further snapshot arrives. The row reports the settlement at once rather than the unconfirmed warning.
+  it("inbox/probe/018: a settlement that arrives before the send times out is reported when it does", async () => {
+    const voice = microphone();
+    let deliver: ((outcome: AnswerOutcomeDto) => void) | undefined;
+    const { rt, sendVoiceAnswer } = runtime(voice, () => new Promise<AnswerOutcomeDto>((resolve) => { deliver = resolve; }));
+    const view = render(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={composerPane()} selectedDeckId="local" />);
+    await turnOnVoice();
+    await speak(voice, "yes");
+    await waitOut(VOICE_DICTATION_SEND_MS);
+    expect(sendVoiceAnswer).toHaveBeenCalledTimes(1);
+    const token = Number(sendVoiceAnswer.mock.calls[0][3]);
+    const settled = composerPane({ answerSettlements: [{ questionId: "q-1", revision: 7, clientToken: token, outcome: "written" }] });
+    view.rerender(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={settled} selectedDeckId="local" />);
+    await flush();
+    deliver?.(UNCONFIRMED);
+    await flush();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/Allowed: touch x/);
+    expect(screen.getByTestId("voice-report")).not.toHaveTextContent(UNCONFIRMED.sentence);
+    view.unmount();
+  });
+
+  /// Scenario: inbox/probe/018 (Q35-10 review) — an answer to an agent with no spawn time times out unconfirmed; then the deck restarts and its new process lists an agent under the same ids, whose snapshot carries a written settlement with this panel's own token, question and revision. The warning stays, since that settlement is another process's; from the same process, the same settlement replaces it (control).
+  it.each(["restarted", "same_process"] as const)("inbox/probe/018: a settlement from %s with no spawn time", async (control) => {
+    const voice = microphone();
+    const { rt, sendVoiceAnswer } = runtime(voice, () => UNCONFIRMED);
+    const before = Object.assign(composerPane(), { spawnedAtMs: undefined, incarnation: "p1" });
+    const view = render(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={before} selectedDeckId="local" />);
+    await turnOnVoice();
+    await speak(voice, "yes");
+    await waitOut(VOICE_DICTATION_SEND_MS);
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(UNCONFIRMED.sentence);
+    const token = Number(sendVoiceAnswer.mock.calls[0][3]);
+    const next = Object.assign(composerPane({ answerSettlements: [{ questionId: "q-1", revision: 7, clientToken: token, outcome: "written" }] }), {
+      spawnedAtMs: undefined,
+      incarnation: control === "restarted" ? "p2" : "p1",
+    });
+    view.rerender(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={next} selectedDeckId="local" />);
+    await flush();
+    if (control === "restarted") {
+      expect(screen.getByTestId("voice-report")).toHaveTextContent(UNCONFIRMED.sentence);
+      expect(screen.getByTestId("voice-report")).not.toHaveTextContent(/Allowed: touch x/);
+    } else {
+      expect(screen.getByTestId("voice-report")).toHaveTextContent(/Allowed: touch x/);
+    }
+    view.unmount();
+  });
+
   /**
    * Scenario (question/desktop/005): with a permission prompt on screen, the
    * user says "always". The panel shows a confirmation naming what "always"

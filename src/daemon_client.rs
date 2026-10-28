@@ -8681,6 +8681,99 @@ start = true
             );
         });
     }
+
+    /// Scenario: the client answers a question naming the answer by token 42,
+    /// once against a daemon that advertises `answer-question` and
+    /// `answer-settlement` and once against one that advertises only
+    /// `answer-question`. The first daemon receives the request with
+    /// `client_token: 42`; the second receives the same request with no
+    /// `client_token` key at all, and both report the answer as answered.
+    #[cfg(unix)]
+    #[spec("question/answer/025")]
+    #[test]
+    fn question_answer_025_the_answer_token_is_sent_only_with_answer_settlement() {
+        use crate::daemon_protocol::{CAP_ANSWER_QUESTION, CAP_ANSWER_SETTLEMENT};
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        runtime.block_on(async {
+            for (advertised, expected) in [
+                (
+                    &[CAP_ANSWER_QUESTION, CAP_ANSWER_SETTLEMENT][..],
+                    Some(serde_json::json!(42)),
+                ),
+                (&[CAP_ANSWER_QUESTION][..], None),
+            ] {
+                let (dir, path, listener) = {
+                    let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("answer-daemon.sock");
+                    let listener = bind_attach_listener(&path).expect("bind answer daemon");
+                    (dir, path, listener)
+                };
+                let answers = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+                let recorded = answers.clone();
+                let server = tokio::spawn(async move {
+                    while let Ok(Ok(mut stream)) = tokio::time::timeout(
+                        std::time::Duration::from_millis(500),
+                        listener.accept(),
+                    )
+                    .await
+                    {
+                        let Some((KIND_REQ, payload)) = read_frame(&mut stream).await.unwrap()
+                        else {
+                            continue;
+                        };
+                        let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                        let response = if request["op"] == "hello" {
+                            AttachResponse {
+                                capabilities: Some(
+                                    advertised.iter().map(|c| c.to_string()).collect(),
+                                ),
+                                ..AttachResponse::hello(PROTOCOL_VERSION)
+                            }
+                        } else {
+                            recorded.lock().unwrap().push(request);
+                            AttachResponse::ok()
+                        };
+                        crate::daemon_protocol::write_resp(&mut stream, &response)
+                            .await
+                            .unwrap();
+                    }
+                });
+                let client = DaemonClient::new(path);
+                let report = client
+                    .answer_question_with_token_while(
+                        || true,
+                        "1",
+                        "q-1",
+                        Some(7),
+                        Vec::new(),
+                        false,
+                        Some(42),
+                    )
+                    .await
+                    .expect("the answer reaches the daemon");
+                assert_eq!(report, AnswerReport::Answered, "advertised {advertised:?}");
+                drop(client);
+                server.await.unwrap();
+                let answers = answers.lock().unwrap();
+                assert_eq!(answers.len(), 1, "advertised {advertised:?}: {answers:?}");
+                let request = answers[0].as_object().expect("a request object");
+                assert_eq!(request["op"], "answer-question");
+                assert_eq!(request["question_id"], "q-1");
+                assert_eq!(request["revision"], 7);
+                assert_eq!(
+                    request.get("client_token").cloned(),
+                    expected,
+                    "advertised {advertised:?}"
+                );
+                drop(dir);
+            }
+        });
+    }
 }
 
 /// PRD #1666 part 2 (`lifecycle/handshake/011`): a scripted daemon for the
