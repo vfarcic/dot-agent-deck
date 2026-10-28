@@ -37,12 +37,13 @@
 //! ([`otlp::encode_json`]) and posted with the `reqwest` client the crate
 //! already depends on. The `opentelemetry` SDK crates would add `prost`,
 //! `opentelemetry-proto` and the SDK runtime to a build that has none of them,
-//! for a producer that emits four span names.
+//! for a producer that emits six span names.
 //!
 //! The module is self-contained: the daemon and the agent spawn path each reach
 //! it through one call per lifecycle point — [`start_for_daemon`] and
-//! [`teardown_began`], [`prepare_spawn`] and [`commit_spawn`], [`agent_exited`] and
-//! [`observe_pane_input`] — so what telemetry does at each of them is decided
+//! [`teardown_began`], [`prepare_spawn`] and [`commit_spawn`], [`agent_exited`],
+//! [`observe_pane_input`] and [`observe_delegate_posted`] — so what telemetry
+//! does at each of them is decided
 //! here, not at the call site. The deck's entrypoint has one more: the `PATH`
 //! shim that switches on Codex's and Devin's own telemetry runs there
 //! ([`shim::run_if_invoked`]).
@@ -60,6 +61,8 @@ pub mod ci;
 pub mod collector;
 pub mod config;
 pub mod exporter;
+pub mod handoff;
+pub mod health;
 pub mod input;
 pub mod launch;
 pub mod operation;
@@ -351,6 +354,30 @@ pub fn observe_pane_input(
     }
 }
 
+/// What the delegate path knows once it posted a task to a worker's inbox
+/// ([`observe_delegate_posted`]): ids and the worker's role, nothing of the
+/// task itself.
+#[derive(Debug, Clone, Copy)]
+pub struct DelegatePosted<'a> {
+    /// The task's inbox message id, the id a scoped report names.
+    pub message_id: &'a str,
+    pub orchestrator_pane: &'a str,
+    pub orchestrator_agent_id: Option<&'a str>,
+    pub worker_pane: &'a str,
+    pub worker_agent_id: &'a str,
+    /// The worker's role.
+    pub role: &'a str,
+}
+
+/// Issue #1981 M7: the delegate path posted a task to a worker's inbox, which
+/// opens its `agent.handoff` ([`handoff`]). Nothing happens when telemetry is
+/// off.
+pub fn observe_delegate_posted(telemetry: Option<Arc<Telemetry>>, posted: &DelegatePosted<'_>) {
+    if let Some(telemetry) = telemetry {
+        telemetry.observe_delegate_posted(posted);
+    }
+}
+
 /// `deck.telemetry.schema_version`: bumped whenever the attribute set changes
 /// in a way that makes data recorded before and after it incomparable.
 pub const SCHEMA_VERSION: &str = "3";
@@ -363,14 +390,21 @@ pub const SPAN_AGENT_RUN: &str = "agent.run";
 pub const SPAN_AGENT_STATUS: &str = "agent.status";
 pub const SPAN_AGENT_OPERATION: &str = "agent.operation";
 pub const SPAN_AGENT_CI: &str = "agent.ci";
+/// Issue #1981 M7: one delegated task, from its post to the orchestrator
+/// reading its report ([`handoff`]).
+pub const SPAN_AGENT_HANDOFF: &str = "agent.handoff";
+/// Issue #1981 M8: the daemon's own health over one interval ([`health`]).
+pub const SPAN_DAEMON_HEALTH: &str = "daemon.health";
 
 /// Every span name, for the tests that check what reaches a payload.
 #[cfg(test)]
-pub const SPAN_NAMES: [&str; 4] = [
+pub const SPAN_NAMES: [&str; 6] = [
     SPAN_AGENT_RUN,
     SPAN_AGENT_STATUS,
     SPAN_AGENT_OPERATION,
     SPAN_AGENT_CI,
+    SPAN_AGENT_HANDOFF,
+    SPAN_DAEMON_HEALTH,
 ];
 
 /// The span event names the deck emits on `agent.run`.
@@ -378,6 +412,11 @@ pub const EVENT_STATUS_CHANGE: &str = "deck.status_change";
 pub const EVENT_INTERVENTION: &str = "deck.intervention";
 pub const EVENT_CI_CHANGE: &str = "deck.ci.change";
 pub use accounting::EVENT_MODEL_USAGE;
+
+/// The span events the deck emits on `agent.handoff`: the worker took the
+/// task, and its report reached the orchestrator's inbox.
+pub const EVENT_HANDOFF_TAKEN: &str = "deck.handoff.taken";
+pub const EVENT_HANDOFF_REPORTED: &str = "deck.handoff.reported";
 
 /// Every attribute key the deck can put on a span, a span event, or the
 /// resource it builds itself. The closed set IS the allow-list: an attribute
@@ -431,6 +470,22 @@ pub enum AttrKey {
     CiFailuresCount,
     AgentSource,
     DispatchName,
+    /// Issue #1981 M7: an `agent.handoff`'s task id, the worker's run, how
+    /// it ended and, when its task never reached the worker, why; and the
+    /// reports an orchestrator run received that named no task.
+    HandoffId,
+    HandoffWorkerRunId,
+    HandoffOutcome,
+    HandoffUndeliverableReason,
+    HandoffsUncorrelatedCount,
+    /// Issue #1981 M8: what a `daemon.health` span measures.
+    DaemonMemoryRss,
+    DaemonRunsOpen,
+    HookLatencyCount,
+    HookLatencyP50,
+    HookLatencyP95,
+    HookLatencyMax,
+    SpansDropped,
     /// PRD #1858: a run's usage and termination, and one model's usage on a
     /// `deck.model_usage` event ([`accounting::AccountingKey`]).
     Accounting(accounting::AccountingKey),
@@ -482,6 +537,18 @@ impl AttrKey {
         AttrKey::CiFailuresCount,
         AttrKey::AgentSource,
         AttrKey::DispatchName,
+        AttrKey::HandoffId,
+        AttrKey::HandoffWorkerRunId,
+        AttrKey::HandoffOutcome,
+        AttrKey::HandoffUndeliverableReason,
+        AttrKey::HandoffsUncorrelatedCount,
+        AttrKey::DaemonMemoryRss,
+        AttrKey::DaemonRunsOpen,
+        AttrKey::HookLatencyCount,
+        AttrKey::HookLatencyP50,
+        AttrKey::HookLatencyP95,
+        AttrKey::HookLatencyMax,
+        AttrKey::SpansDropped,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -528,6 +595,18 @@ impl AttrKey {
             AttrKey::CiFailuresCount => "deck.ci.failures.count",
             AttrKey::AgentSource => "deck.agent.source",
             AttrKey::DispatchName => "deck.dispatch.name",
+            AttrKey::HandoffId => "deck.handoff.id",
+            AttrKey::HandoffWorkerRunId => "deck.handoff.worker.run.id",
+            AttrKey::HandoffOutcome => "deck.handoff.outcome",
+            AttrKey::HandoffUndeliverableReason => "deck.handoff.undeliverable.reason",
+            AttrKey::HandoffsUncorrelatedCount => "deck.handoffs.uncorrelated.count",
+            AttrKey::DaemonMemoryRss => "deck.daemon.memory.rss",
+            AttrKey::DaemonRunsOpen => "deck.daemon.runs.open",
+            AttrKey::HookLatencyCount => "deck.daemon.hook_latency.count",
+            AttrKey::HookLatencyP50 => "deck.daemon.hook_latency.p50_ms",
+            AttrKey::HookLatencyP95 => "deck.daemon.hook_latency.p95_ms",
+            AttrKey::HookLatencyMax => "deck.daemon.hook_latency.max_ms",
+            AttrKey::SpansDropped => "deck.telemetry.spans.dropped",
             AttrKey::Accounting(key) => key.as_str(),
         }
     }

@@ -2941,7 +2941,13 @@ fn notify_orchestrator_of_quota_block(
 ///   these values are copied into the arm queue before anything else looks at
 ///   them;
 /// * the daemon-authored background-work aggregate (`background`,
-///   `background_revision`, issue #1678) is stripped from every producer frame.
+///   `background_revision`, issue #1678) is stripped from every producer frame;
+/// * `received_by_deck_at_ns` (issue #1981 M8,
+///   [`crate::event::RECEIVED_BY_DECK_AT_METADATA_KEY`]) is set to now, over
+///   any copy the producer sent: it marks the event as a producer's for
+///   telemetry's hook latency. Every producer ingress admits here — the hook
+///   socket's raw events and its `question` messages — so no event the daemon
+///   builds itself carries it.
 fn admit_producer_event(event: &mut AgentEvent) {
     use crate::quota_block::{
         QUOTA_BLOCKED_LIFTED_METADATA_KEY, QUOTA_BLOCKED_METADATA_KEYS,
@@ -2968,6 +2974,18 @@ fn admit_producer_event(event: &mut AgentEvent) {
     event
         .metadata
         .remove(crate::event::QUESTION_RELEASED_BY_DECK_METADATA_KEY);
+    // Issue #1981 M8: when the daemon received the event, over any copy the
+    // producer sent, so telemetry counts hook latency for producers' events
+    // alone and no producer can forge or skew it.
+    event
+        .metadata
+        .remove(crate::event::RECEIVED_BY_DECK_AT_METADATA_KEY);
+    if let Some(now) = chrono::Utc::now().timestamp_nanos_opt() {
+        event.metadata.insert(
+            crate::event::RECEIVED_BY_DECK_AT_METADATA_KEY.to_string(),
+            now.to_string(),
+        );
+    }
     if event
         .metadata
         .contains_key(crate::event::QUESTION_METADATA_KEY)
@@ -3347,7 +3365,9 @@ async fn poll_codex_rollouts(
 /// other failure. An `Error` carries no provider text, like the Claude Code
 /// `StopFailure` it gives parity with: the card shows the status, and the
 /// message stays in the rollout it came from.
-fn codex_rollout_failure_event(failure: crate::codex_rollout_tail::CodexTurnFailure) -> AgentEvent {
+pub(crate) fn codex_rollout_failure_event(
+    failure: crate::codex_rollout_tail::CodexTurnFailure,
+) -> AgentEvent {
     use crate::quota_block::{
         QUOTA_BLOCKED_DETAIL_METADATA_KEY, QUOTA_BLOCKED_KIND_METADATA_KEY,
         QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY, QUOTA_BLOCKED_SOURCE_CODEX_ROLLOUT,
@@ -7769,6 +7789,65 @@ mod quota_admission_tests {
         }
     }
 
+    /// Issue #1981 M8 (PR #2010 review): every event admitted from a producer
+    /// carries the daemon's receipt stamp, set when it was admitted and over
+    /// any copy the producer sent, so a producer can neither forge one nor
+    /// skew the latency read from it. The event the daemon ingests after
+    /// typing part of an answer is the daemon's own and carries none, so
+    /// telemetry does not count it as an agent's hook.
+    #[test]
+    fn the_receipt_stamp_is_the_daemons_alone() {
+        use crate::event::RECEIVED_BY_DECK_AT_METADATA_KEY;
+        let stamp = |event: &AgentEvent| {
+            event
+                .metadata
+                .get(RECEIVED_BY_DECK_AT_METADATA_KEY)
+                .map(|v| v.parse::<i64>().expect("a stamp is Unix nanoseconds"))
+        };
+        let question: crate::question::PendingQuestion =
+            serde_json::from_value(serde_json::json!({
+                "id": "q1",
+                "kind": "permission",
+                "questions": [{"prompt": "Allow?", "options": [
+                    {"index": 1, "label": "Yes", "role": "allow_once"},
+                    {"index": 2, "label": "No", "role": "deny"},
+                ]}],
+                "raised_at_ms": 1,
+                "channel": "unsupported",
+            }))
+            .unwrap();
+        let made = deck_keyboard_only_event(
+            "s".to_string(),
+            AgentType::ClaudeCode,
+            Some("pane-1".to_string()),
+            Some("1".to_string()),
+            &question,
+        );
+        assert_eq!(stamp(&made), None, "{:?}", made.metadata);
+        let before = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+        let mut plain = quota_frame(crate::event::EventType::Thinking);
+        admit_producer_event(&mut plain);
+        // A copy claiming the epoch would read as decades of latency, and one
+        // far ahead as none.
+        let mut forged = [0, i64::MAX].map(|claimed| {
+            let mut forged = quota_frame(crate::event::EventType::Unknown);
+            forged.metadata.insert(
+                RECEIVED_BY_DECK_AT_METADATA_KEY.to_string(),
+                claimed.to_string(),
+            );
+            admit_producer_event(&mut forged);
+            forged
+        });
+        let after = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+        for admitted in std::iter::once(&mut plain).chain(forged.iter_mut()) {
+            let at = stamp(admitted).expect("an admitted event is stamped");
+            assert!(
+                (before..=after).contains(&at),
+                "{at} not in {before}..={after}"
+            );
+        }
+    }
+
     /// Scenario: Post a `quota_blocked` event on the hook socket as a producer
     /// would, with a forged daemon source marker, an unknown kind and an
     /// out-of-range reset, and a `thinking` event carrying quota-reason keys.
@@ -7879,6 +7958,13 @@ mod quota_admission_tests {
             ],
         );
         admit_producer_event(&mut smuggled);
+        // Issue #1981 M8: admission adds the daemon's receipt stamp.
+        assert!(
+            smuggled
+                .metadata
+                .remove(crate::event::RECEIVED_BY_DECK_AT_METADATA_KEY)
+                .is_some()
+        );
         assert_eq!(
             smuggled.metadata.keys().collect::<Vec<_>>(),
             vec!["other"],
@@ -7916,13 +8002,14 @@ mod quota_admission_tests {
                 "t".to_string(),
             ),
         ];
+        // Each count includes the daemon's receipt stamp (issue #1981 M8).
         let mut claude = with(crate::event::EventType::Thinking, &codex_keys);
         admit_producer_event(&mut claude);
-        assert_eq!(claude.metadata.len(), 1, "{:?}", claude.metadata);
+        assert_eq!(claude.metadata.len(), 2, "{:?}", claude.metadata);
         let mut codex = with(crate::event::EventType::Thinking, &codex_keys);
         codex.agent_type = AgentType::Codex;
         admit_producer_event(&mut codex);
-        assert_eq!(codex.metadata.len(), 3, "{:?}", codex.metadata);
+        assert_eq!(codex.metadata.len(), 4, "{:?}", codex.metadata);
         // Issue #1354: a thread-spawned Codex subagent's hooks carry the
         // parent's session and the subagent's own rollout and turn, so they
         // lose both keys rather than re-arm the parent's watch.
@@ -7933,7 +8020,7 @@ mod quota_admission_tests {
             "a7c1".to_string(),
         );
         admit_producer_event(&mut subagent);
-        assert_eq!(subagent.metadata.len(), 2, "{:?}", subagent.metadata);
+        assert_eq!(subagent.metadata.len(), 3, "{:?}", subagent.metadata);
         assert!(subagent.is_from_subagent());
     }
 

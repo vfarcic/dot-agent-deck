@@ -67,6 +67,7 @@ use crate::state::{AppState, SessionStatus};
 use super::accounting::AccountingKey;
 use super::accounting::run_usage::{RunUsage, UsageDirs};
 use super::ci::{CiEffect, CiState, PrCi};
+use super::handoff::{Change, Handoffs, Posted, RunRef};
 use super::input::InterventionKind;
 use super::operation::{Description, describe_tool, is_shell_tool};
 use super::run_context::RunContext;
@@ -88,7 +89,14 @@ pub const INTERVENTION_COALESCE_NANOS: u64 = 5_000_000_000;
 pub const MAX_EVENTS_PER_RUN: usize = 1024;
 
 /// Events held for a prepared run until it is committed. Its agent has only
-/// just started, so this is far more than the window ever sees.
+/// just started, so this is far more than the window ever sees. The same
+/// number separately caps the run's held posts and its held notices about
+/// them: a 257th post opens at once in a trace of its own with no parent
+/// ([`RunTracker::place_post`]), and a 257th notice is applied at once, which
+/// puts it in the early buffer to be replayed as its post opens
+/// ([`RunTracker::hold_notice`]). That takes 257 posts, or 257 notices (an
+/// ordinary task produces about five, so about 52 tasks), before telemetry
+/// applies the run's `Commit`, which is not a realistic workload.
 pub const MAX_PENDING_EVENTS: usize = 256;
 
 /// How long a replaced run waits for its own generation's end before it is
@@ -266,9 +274,26 @@ struct PendingRun {
     /// Its agent already ended, before the run was committed: how and when,
     /// applied by [`RunTracker::commit_run`] once the run opens.
     ended: Option<(EndReason, Option<i32>, u64)>,
+    /// Issue #1981 M7: tasks this run's agent delegated before the run
+    /// opened, the inbox notices about them seen since, and the reports
+    /// naming no task its agent received, in the order seen, each with how
+    /// many of `events` were held before it, so
+    /// [`RunTracker::commit_run`] applies each in its place among them
+    /// ([`RunTracker::place_post`], [`RunTracker::observe_inbox`]).
+    handoffs: Vec<(usize, HeldHandoff)>,
     /// The dispatched unit it belongs to, when known before it opens
     /// ([`RunTracker::begin_dispatch`]).
     dispatch_name: Option<String>,
+}
+
+/// What a prepared run holds of its hand-offs: see [`PendingRun::handoffs`].
+enum HeldHandoff {
+    Post(Posted),
+    /// An inbox change about a held post, and when it was seen.
+    Notice(Change, u64),
+    /// Reports naming no task that reached this run's agent, counted on the
+    /// run once it opens ([`RunTracker::observe_inbox`]).
+    Uncorrelated(u64),
 }
 
 /// A run's own card state, dropped with the run. Tests count the live ones
@@ -369,6 +394,9 @@ struct ActiveRun {
     /// The agent the run's hooks last named, kept once the card that named it
     /// is gone ([`resolved_agent`]).
     learned_agent: Option<AgentType>,
+    /// Issue #1981 M7: reports this run's agent received that named no task
+    /// (`deck.handoffs.uncorrelated.count`).
+    uncorrelated_reports: u64,
 }
 
 /// A pull request, told apart from another repository's of the same number by
@@ -513,6 +541,54 @@ pub struct RunGeneration {
 }
 
 impl PendingRun {
+    fn held_posts(&self) -> usize {
+        self.handoffs
+            .iter()
+            .filter(|(_, held)| matches!(held, HeldHandoff::Post(_)))
+            .count()
+    }
+
+    fn held_notices(&self) -> usize {
+        self.handoffs
+            .iter()
+            .filter(|(_, held)| matches!(held, HeldHandoff::Notice(..)))
+            .count()
+    }
+
+    /// Count a report naming no task, after the events held so far: one
+    /// arriving with no event held since the last adds to its count, so there
+    /// is at most one more entry than events held ([`MAX_PENDING_EVENTS`]).
+    fn hold_uncorrelated(&mut self) {
+        let before = self.events.len();
+        match self.handoffs.last_mut() {
+            Some((at, HeldHandoff::Uncorrelated(count))) if *at == before => *count += 1,
+            _ => self.handoffs.push((before, HeldHandoff::Uncorrelated(1))),
+        }
+    }
+
+    fn holds_post(&self, task: &str) -> bool {
+        self.handoffs
+            .iter()
+            .any(|(_, held)| matches!(held, HeldHandoff::Post(p) if p.message_id == task))
+    }
+
+    /// Whether `change` concerns a post held here: the task itself, its
+    /// report, or that report's own changes. `early_report` names the task
+    /// of a report the hand-offs hold for a post not seen yet.
+    fn concerns(&self, change: &Change, early_report: &dyn Fn(&str) -> Option<String>) -> bool {
+        match change {
+            Change::Report { task, .. } => self.holds_post(task),
+            Change::Uncorrelated { .. } => false,
+            other => other.message_id().is_some_and(|id| {
+                self.holds_post(id)
+                    || self.handoffs.iter().any(|(_, held)| {
+                        matches!(held, HeldHandoff::Notice(Change::Report { report, .. }, _) if report == id)
+                    })
+                    || early_report(id).is_some_and(|task| self.holds_post(&task))
+            }),
+        }
+    }
+
     /// The run will not open: remove the usage file made for it.
     fn forget(self) {
         if let Some(file) = self.usage_dirs.usage_file {
@@ -644,6 +720,8 @@ pub struct RunTracker {
     /// oldest first, at most [`MAX_DISPATCHED_ORCHESTRATIONS`].
     dispatched_orchestrations: VecDeque<(String, String)>,
     held_input: Option<HeldInput>,
+    /// Issue #1981 M7: the delegated tasks whose `agent.handoff` is open.
+    handoffs: Handoffs,
     /// Test witness: the [`ShadowCards`] alive.
     #[cfg(test)]
     shadow_states: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -697,6 +775,7 @@ impl RunTracker {
                 events: Vec::new(),
                 usage_dirs: UsageDirs::default(),
                 ended: None,
+                handoffs: Vec::new(),
                 dispatch_name,
             });
     }
@@ -786,10 +865,49 @@ impl RunTracker {
         }
     }
 
-    /// The agent of the prepared run `run_id` did not start: forget the run.
+    /// The agent of the prepared run `run_id` did not start: forget the run,
+    /// after opening the hand-offs of any task held for it.
     pub fn abort_run(&mut self, run_id: &str) {
+        self.release_posts(run_id);
         if let Some(pending) = self.pending.remove(run_id) {
             pending.forget();
+        }
+    }
+
+    /// Issue #1981 M7: open the hand-off of each task held for the prepared
+    /// run `run_id`, which will not open, and apply the notices held about
+    /// them, in the order seen: while the run is still known, so each keeps
+    /// its run id, though there is no run span to parent it.
+    fn release_posts(&mut self, run_id: &str) {
+        let held = self
+            .pending
+            .get_mut(run_id)
+            .map(|p| std::mem::take(&mut p.handoffs))
+            .unwrap_or_default();
+        for (_, held) in held {
+            self.apply_held(run_id, held);
+        }
+    }
+
+    /// Apply `held`, held for the prepared run `run_id`.
+    fn apply_held(&mut self, run_id: &str, held: HeldHandoff) {
+        match held {
+            HeldHandoff::Post(posted) => self.delegate_posted(posted),
+            HeldHandoff::Notice(change, at) => self.apply_change(change, at),
+            HeldHandoff::Uncorrelated(count) => self.count_uncorrelated(run_id, count),
+        }
+    }
+
+    /// Add `count` reports naming no task to the run `run_id`, open or
+    /// replaced; a run that did not open or has ended is not counted on.
+    fn count_uncorrelated(&mut self, run_id: &str, count: u64) {
+        if let Some(run) = self
+            .runs
+            .values_mut()
+            .chain(self.replaced.iter_mut().map(|r| &mut r.run))
+            .find(|run| run.start_info.run_id == run_id)
+        {
+            run.uncorrelated_reports += count;
         }
     }
 
@@ -807,8 +925,19 @@ impl RunTracker {
             run.context = pending.context;
             run.dispatch_name = pending.dispatch_name;
         }
-        for (event, at) in pending.events {
+        // Each task posted, and each notice about one, in its place among
+        // the events: one posted before a close is opened in the run before
+        // the close ends it, and a report that arrived after the close finds
+        // the hand-off already ended.
+        let mut handoffs = pending.handoffs.into_iter().peekable();
+        for (index, (event, at)) in pending.events.into_iter().enumerate() {
+            while let Some((_, held)) = handoffs.next_if(|(before, _)| *before <= index) {
+                self.apply_held(run_id, held);
+            }
             self.observe_kept(event, at);
+        }
+        for (_, held) in handoffs {
+            self.apply_held(run_id, held);
         }
         if let Some((reason, exit_code, at)) = pending.ended {
             self.end_run(&pane_id, reason, exit_code, at);
@@ -880,6 +1009,7 @@ impl RunTracker {
                 usage: Some(usage),
                 dispatch_name: None,
                 learned_agent: None,
+                uncorrelated_reports: 0,
             },
         );
     }
@@ -1471,6 +1601,12 @@ impl RunTracker {
         }
         let usage = run.usage.take();
         let run_id = run.start_info.run_id.clone();
+        self.handoffs.run_ended(
+            &run_id,
+            reason == EndReason::DaemonShutdown,
+            now,
+            &mut self.finished,
+        );
         let span = run_span(run, reason, exit_code, now);
         match usage {
             // A run with nothing to read is completed here, its span queued
@@ -1539,6 +1675,10 @@ impl RunTracker {
     /// shutdown. A replaced run still waiting for its own end ends as
     /// [`EndReason::Unknown`], at the time it was replaced.
     pub fn end_all(&mut self, reason: EndReason, now: u64) {
+        let prepared: Vec<String> = self.pending.keys().cloned().collect();
+        for run_id in prepared {
+            self.release_posts(&run_id);
+        }
         for (_, pending) in self.pending.drain() {
             pending.forget();
         }
@@ -1549,6 +1689,148 @@ impl RunTracker {
         for pane in panes {
             self.end_run(&pane, reason, None, now);
         }
+        self.handoffs.end_all(now, &mut self.finished);
+    }
+
+    /// Issue #1981 M8: the runs open (replaced ones still waiting for their
+    /// end included) and prepared — one per agent PTY the deck started.
+    pub fn open_runs(&self) -> usize {
+        self.runs.len() + self.replaced.len() + self.pending.len()
+    }
+
+    /// Issue #1981 M7: the delegate path posted a task: open its hand-off
+    /// ([`super::handoff`]).
+    pub fn delegate_posted(&mut self, posted: Posted) {
+        let orchestrator = run_ref(
+            &self.runs,
+            &self.replaced,
+            &self.pending,
+            &posted.orchestrator_pane,
+            posted.orchestrator_agent_id.as_deref(),
+        );
+        let worker = run_ref(
+            &self.runs,
+            &self.replaced,
+            &self.pending,
+            &posted.worker_pane,
+            Some(&posted.worker_agent_id),
+        )
+        .map(|run| run.run_id);
+        let (runs, replaced, pending) = (&self.runs, &self.replaced, &self.pending);
+        let run_of = |pane: &str, agent: &str| run_ref(runs, replaced, pending, pane, Some(agent));
+        self.handoffs
+            .posted(posted, orchestrator, worker, &run_of, &mut self.finished);
+    }
+
+    /// Issue #1981 M7: the delegate path posted a task, and its place on the
+    /// broadcast has come: open its hand-off now, or, while its
+    /// orchestrator's run is prepared and not opened yet, hold it with that
+    /// run's events, after the ones held so far, for
+    /// [`Self::commit_run`] to open in that place. Opened now, the hand-off
+    /// would miss the run's trace; opened after the events held, it would
+    /// miss a run they end. Past [`MAX_PENDING_EVENTS`] posts held for one
+    /// run, a post opens at once, in a trace of its own with no parent: that
+    /// takes as many posts from one orchestrator before telemetry applies
+    /// its run's `Commit`, which no real workload comes near.
+    pub fn place_post(&mut self, posted: Posted) {
+        let prepared = run_ref(
+            &self.runs,
+            &self.replaced,
+            &self.pending,
+            &posted.orchestrator_pane,
+            posted.orchestrator_agent_id.as_deref(),
+        )
+        .filter(|run| run.span.is_none())
+        .and_then(|run| self.pending.get_mut(&run.run_id))
+        .filter(|pending| pending.held_posts() < MAX_PENDING_EVENTS);
+        match prepared {
+            Some(pending) => {
+                let before = pending.events.len();
+                pending.handoffs.push((before, HeldHandoff::Post(posted)));
+            }
+            None => self.delegate_posted(posted),
+        }
+    }
+
+    /// Issue #1981 M7: apply one inbox state change from the daemon's
+    /// broadcast to the hand-off it concerns, or count a report that names
+    /// no task on the run of the agent it reached: that agent's generation
+    /// on its pane, whether its run is open, replaced and waiting for its
+    /// end, or prepared ([`run_ref`]). A prepared run holds the count after
+    /// the events held so far, for [`Self::commit_run`] to add in that
+    /// place. A report for a generation whose run has ended is counted on
+    /// no run, never on the generation that replaced it.
+    pub fn observe_inbox(&mut self, notice: &crate::event::InboxNotice, now: u64) {
+        let Some(change) = Change::of(notice) else {
+            return;
+        };
+        if let Change::Uncorrelated { pane, agent } = &change {
+            let run = run_ref(
+                &self.runs,
+                &self.replaced,
+                &self.pending,
+                pane,
+                agent.as_deref(),
+            );
+            match run {
+                Some(run) if run.span.is_some() => self.count_uncorrelated(&run.run_id, 1),
+                Some(run) => {
+                    if let Some(pending) = self.pending.get_mut(&run.run_id) {
+                        pending.hold_uncorrelated();
+                    }
+                }
+                None => {}
+            }
+            return;
+        }
+        if !self.hold_notice(&change, now) {
+            self.apply_change(change, now);
+        }
+    }
+
+    /// Issue #1981 M7 review: hold `change`, seen at `now`, in the prepared
+    /// run holding the post it concerns, after the events held so far, for
+    /// [`Self::commit_run`] to apply in that place: applied before the run
+    /// opens, the post would replay it ahead of a close held before it.
+    /// Whether it was held. Past [`MAX_PENDING_EVENTS`] notices held for one
+    /// run, a notice is applied at once, and replayed as the post opens.
+    fn hold_notice(&mut self, change: &Change, now: u64) -> bool {
+        let handoffs = &self.handoffs;
+        let early_report = |id: &str| handoffs.early_report_task(id).map(str::to_string);
+        let Some(pending) = self
+            .pending
+            .values_mut()
+            .find(|pending| pending.concerns(change, &early_report))
+            .filter(|pending| pending.held_notices() < MAX_PENDING_EVENTS)
+        else {
+            return false;
+        };
+        let before = pending.events.len();
+        pending
+            .handoffs
+            .push((before, HeldHandoff::Notice(change.clone(), now)));
+        true
+    }
+
+    /// Apply `change`, seen at `now`, to the hand-offs.
+    fn apply_change(&mut self, change: Change, now: u64) {
+        let (runs, replaced, pending) = (&self.runs, &self.replaced, &self.pending);
+        let run_of = |pane: &str, agent: &str| run_ref(runs, replaced, pending, pane, Some(agent));
+        self.handoffs
+            .apply(change, now, &run_of, &mut self.finished);
+    }
+
+    /// Issue #1981 M7: end every hand-off past its age bound at `now`, and
+    /// forget the held notices past theirs, with no inbox change needed to
+    /// notice ([`super::handoff::Handoffs::expire`]).
+    pub fn expire_handoffs(&mut self, now: u64) {
+        self.handoffs.expire(now, &mut self.finished);
+    }
+
+    /// Hand-offs open now, and notices held for a post not seen yet.
+    #[cfg(test)]
+    pub fn handoffs_held(&self) -> (usize, usize) {
+        (self.handoffs.open_count(), self.handoffs.early_count())
     }
 
     /// Runs open (replaced ones still waiting for their end included) and
@@ -2023,6 +2305,14 @@ fn run_span(run: ActiveRun, reason: EndReason, exit_code: Option<i32>, now: u64)
         AttrKey::CiFailuresCount,
         saturating_i64(run.ci_failures),
     ));
+    // On an orchestrator's run always, and on another only when it has one.
+    let orchestrator = start.orchestration.as_ref().is_some_and(|o| o.orchestrator);
+    if orchestrator || run.uncorrelated_reports > 0 {
+        attributes.push(Attribute::int(
+            AttrKey::HandoffsUncorrelatedCount,
+            saturating_i64(run.uncorrelated_reports),
+        ));
+    }
     let end = now.max(run.start);
     SpanRecord {
         trace_id: run.trace_id,
@@ -2034,6 +2324,55 @@ fn run_span(run: ActiveRun, reason: EndReason, exit_code: Option<i32>, now: u64)
         attributes,
         events: run.events,
     }
+}
+
+/// The run of agent `agent_id` on `pane_id`: the one open there, else one
+/// replaced and waiting for its end, else one prepared. An unknown agent id
+/// matches the run open on the pane.
+fn run_ref(
+    runs: &HashMap<String, ActiveRun>,
+    replaced: &[ReplacedRun],
+    pending: &HashMap<String, PendingRun>,
+    pane_id: &str,
+    agent_id: Option<&str>,
+) -> Option<RunRef> {
+    let same = |ours: Option<&str>| match (ours, agent_id) {
+        (Some(ours), Some(theirs)) => ours == theirs,
+        _ => true,
+    };
+    let active = runs
+        .get(pane_id)
+        .filter(|run| same(run.start_info.agent_id.as_deref()))
+        .or_else(|| {
+            replaced.iter().map(|r| &r.run).find(|run| {
+                run.start_info.pane_id == pane_id
+                    && agent_id.is_some()
+                    && run.start_info.agent_id.as_deref() == agent_id
+            })
+        });
+    if let Some(run) = active {
+        return Some(RunRef {
+            run_id: run.start_info.run_id.clone(),
+            span: Some((run.trace_id, run.span_id)),
+            orchestration_id: run
+                .start_info
+                .orchestration
+                .as_ref()
+                .and_then(|o| o.id.clone()),
+        });
+    }
+    pending
+        .values()
+        .find(|p| {
+            p.start.pane_id == pane_id
+                && agent_id.is_some()
+                && p.start.agent_id.as_deref() == agent_id
+        })
+        .map(|p| RunRef {
+            run_id: p.start.run_id.clone(),
+            span: None,
+            orchestration_id: p.start.orchestration.as_ref().and_then(|o| o.id.clone()),
+        })
 }
 
 fn saturating_i64(value: u64) -> i64 {
