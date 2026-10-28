@@ -1048,6 +1048,14 @@ fn list_hooks_with(
     timeout: Duration,
 ) -> std::io::Result<HooksListing> {
     let mut command = Command::new(codex);
+    // Issue #2002: this probe gets no `wrap::CODEX_EMBEDDED_ARGS`, because it
+    // is outside the wrapper's direct-launch seam and is not a pane session.
+    // `codex app-server` on stdio serves this one connection itself; choosing a
+    // shared background server is what Codex's interactive startup does, which
+    // the pair is there to stop. The probe asks for `hooks/list` only, starts
+    // no thread or turn, so runs none of the deck's hooks, and is killed once
+    // it answers or the wait runs out.
+    //
     // A listing is the deck's own probe, not a Codex session of the user's:
     // Codex exports its own telemetry when an `OTEL_*` endpoint is in its
     // environment, and this one would reach the user's backend as a

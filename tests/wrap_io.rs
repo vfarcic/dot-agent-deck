@@ -6,7 +6,7 @@ mod common;
 
 use std::fs::File;
 use std::io::{Read as _, Write as _};
-use std::os::fd::FromRawFd as _;
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::net::UnixListener;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -127,6 +127,32 @@ fn read_pty(mut master: File) -> Vec<u8> {
     observed
 }
 
+fn read_pty_line(master: &mut File) -> Vec<u8> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut observed = Vec::new();
+    loop {
+        let mut descriptor = libc::pollfd {
+            fd: master.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        // SAFETY: `descriptor` points to one initialized pollfd containing a
+        // live descriptor owned by `master`, and poll does not retain it.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, remaining.as_millis() as i32) };
+        if ready < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        assert!(ready > 0, "waiting for PTY stderr line: {observed:?}");
+        let mut byte = [0];
+        master.read_exact(&mut byte).expect("read PTY stderr byte");
+        observed.push(byte[0]);
+        if byte[0] == b'\n' {
+            return observed;
+        }
+    }
+}
+
 fn run_with_stderr_redirected() -> (bool, Vec<u8>, Vec<u8>) {
     let fixture = common::harness_tempdir().expect("create stderr-only redirect fixture");
     let stderr_path = fixture.path().join("stderr.log");
@@ -243,9 +269,7 @@ fn collect_wrapper_events(listener: &UnixListener, expected: usize) -> Vec<Agent
     events
 }
 
-/// Scenario: Run `dot-agent-deck wrap` with redirected non-interactive streams.
-/// Wholly non-interactive streams remain separate and byte-exact, while stderr-only
-/// and stdout-only redirects preserve each unaffected descriptor's TTY identity.
+/// Scenario: Run the real wrapper with independent redirected and terminal descriptors, then launch synthetic direct Codex on both pipe and PTY paths, reading its terminal stderr while it waits for input. Streams and input must retain their routing, Codex must receive its embedded pair once, and a non-Codex agent must keep its arguments unchanged.
 #[spec("codex/wrap/003")]
 #[test]
 fn codex_wrap_003_each_descriptor_preserves_its_original_semantics() {
@@ -358,6 +382,155 @@ fn codex_wrap_003_each_descriptor_preserves_its_original_semantics() {
         ),
         "wrapping must preserve every descriptor independently: non-interactive streams stay separate and byte-exact, stderr-only redirection reaches only stderr, and stdout-only redirection leaves stdin/stderr attached to their TTY"
     );
+    assert_embedded_streams();
+}
+
+fn assert_embedded_streams() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = common::harness_tempdir().expect("embedded stream fixture");
+    for name in ["codex", "plain-probe"] {
+        let program = fixture.path().join(name);
+        std::fs::write(&program, include_str!("fixtures/codex-embedded.py")).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let home = fixture.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let mut failures = Vec::new();
+    for tty in [false, true] {
+        for (label, program, agent, original, expected_mode) in [
+            (
+                "direct Codex",
+                "codex",
+                "codex",
+                vec!["--model", "mini-fixture", "prompt with spaces"],
+                "EMBEDDED_SUCCESS",
+            ),
+            (
+                "already-prefixed control",
+                "codex",
+                "codex",
+                vec![
+                    "-c",
+                    "shell_environment_policy.set={}",
+                    "--model",
+                    "mini-fixture",
+                ],
+                "EMBEDDED_SUCCESS",
+            ),
+            (
+                "non-Codex control",
+                "plain-probe",
+                "opencode",
+                vec!["--model", "unchanged model", "prompt with spaces"],
+                "SHARED_SELECTION",
+            ),
+        ] {
+            let record = fixture.path().join("args.jsonl");
+            std::fs::write(&record, "").unwrap();
+            let (mut master, slave) = open_pty();
+            let mut command = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
+            command
+                .args(["wrap", "--agent", agent, "--"])
+                .arg(fixture.path().join(program))
+                .args(&original)
+                .env_clear()
+                .envs(common::config_containment_env())
+                .env("HOME", &home)
+                .env("CODEX_HOME", home.join(".codex"))
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", fixture.path().display()),
+                )
+                .env("OTEL_SDK_DISABLED", "true")
+                .env("CODEX_ARGS_RECORD", &record)
+                .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
+                .env(
+                    "DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS",
+                    common::WRAP_TEST_MAX_LIFETIME_SECS,
+                )
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped());
+            // One terminal descriptor selects the real PTY branch while
+            // stdout and stdin stay independently routed through pipes.
+            command.stderr(if tty {
+                Stdio::from(slave)
+            } else {
+                drop(slave);
+                Stdio::piped()
+            });
+            let mut child = command.spawn().expect("spawn embedded stream probe");
+            // Command retains its configured slave descriptor after spawn;
+            // close that copy before waiting for the outer master's EOF.
+            drop(command);
+            // Consume terminal stderr while the probe is still waiting for
+            // input. This avoids depending on unread PTY output surviving the
+            // final slave close, which made the macOS assertion see no bytes.
+            let mut terminal_stderr = if tty {
+                read_pty_line(&mut master)
+            } else {
+                Vec::new()
+            };
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"byte\0input\n")
+                .unwrap();
+            let output = child
+                .wait_with_output()
+                .expect("wait for embedded stream probe");
+            let stderr = if tty {
+                terminal_stderr.extend(read_pty(master));
+                // Terminal output passes through two line disciplines; CR
+                // expansion is terminal semantics, not a routing failure.
+                terminal_stderr
+                    .into_iter()
+                    .filter(|byte| *byte != b'\r')
+                    .collect()
+            } else {
+                drop(master);
+                output.stderr
+            };
+            assert!(output.status.success(), "{label}, tty={tty}: {stderr:?}");
+            assert_eq!(
+                stderr, b"STDERR_SENTINEL\n",
+                "{label}, tty={tty}: stderr routing"
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                stdout.ends_with("\nINPUT_SUCCESS:byte\0input\n"),
+                "{label}, tty={tty}: byte-exact input routing: {stdout:?}"
+            );
+            let args: Vec<Vec<String>> = std::fs::read_to_string(&record)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(args.len(), 1, "one child per wrapper");
+            let args = &args[0];
+            let want: Vec<String> = if label == "direct Codex" {
+                [
+                    vec!["-c", "shell_environment_policy.set={}"],
+                    original.clone(),
+                ]
+                .concat()
+                .into_iter()
+                .map(String::from)
+                .collect()
+            } else {
+                original.into_iter().map(String::from).collect()
+            };
+            if args != &want || stdout != format!("{expected_mode}\nINPUT_SUCCESS:byte\0input\n") {
+                failures.push(format!("{label}, tty={tty}: expected prepended embedded pair and preserved streams; argv={args:?}, want={want:?}, stdout={stdout:?}"));
+            } else {
+                eprintln!(
+                    "PASS {label}, tty={tty}: argv unchanged, input/stdout/stderr routed correctly"
+                );
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// Scenario: Start two overlapping standalone wrappers with the same Codex identity and no pane environment ID. Their emitted lifecycle events must carry two distinct session IDs so one terminal cannot overwrite the other's card or status.

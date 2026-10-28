@@ -940,6 +940,53 @@ fn program_is_codex(program: &str) -> bool {
         == Some("codex")
 }
 
+/// Issue #2002: the two arguments that start a direct Codex in embedded mode.
+///
+/// Without them a Codex can attach to a shared background app-server that
+/// another pane started, and that server runs the deck's hooks with the
+/// starter pane's identity, so two Codex panes report as one. A CLI config
+/// override of this key excludes implicit server discovery, reuse and
+/// auto-start (checked against Codex 0.156.0, 0.160.0 and 0.164.0 source; the
+/// guarantee rests on that exclusion rule of Codex's), and an empty `set`
+/// table merges into the user's own `config.toml` policy without removing an
+/// entry. 0.155.0, the checked compatibility control, also accepts it, which
+/// `--no-daemon` (0.156.0 and later) does not. A server that is already
+/// running is left running; a new direct deck session no longer selects it.
+///
+/// They go FIRST: within Codex's CLI layer a later override at the same path
+/// replaces an earlier one, so in front of the user's own `-c` arguments the
+/// empty table cannot erase them.
+pub(crate) const CODEX_EMBEDDED_ARGS: [&str; 2] = ["-c", "shell_environment_policy.set={}"];
+
+/// Whether `args` already open with [`CODEX_EMBEDDED_ARGS`].
+pub(crate) fn opens_with_codex_embedded_args<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> bool {
+    args.len() >= CODEX_EMBEDDED_ARGS.len()
+        && args
+            .iter()
+            .zip(CODEX_EMBEDDED_ARGS)
+            .all(|(arg, want)| arg.as_ref() == want)
+}
+
+/// The arguments the wrapper starts `program` with (issue #2002): a direct
+/// Codex (by basename, [`program_is_codex`]) gets [`CODEX_EMBEDDED_ARGS`] in
+/// front of `args` unless they already open with them, so a command that
+/// carries the pair itself is not given a second one. Every other program —
+/// a launcher declared as Codex included, where the pair would reach
+/// `devbox` or a shell rather than Codex — gets `args` unchanged.
+#[cfg(unix)]
+fn launch_args<'a>(program: &str, args: &'a [String]) -> std::borrow::Cow<'a, [String]> {
+    if !program_is_codex(program) || opens_with_codex_embedded_args(args) {
+        return std::borrow::Cow::Borrowed(args);
+    }
+    std::borrow::Cow::Owned(
+        CODEX_EMBEDDED_ARGS
+            .iter()
+            .map(|arg| arg.to_string())
+            .chain(args.iter().cloned())
+            .collect(),
+    )
+}
+
 /// The outcome of [`codex_spawn_prep`]: the vetted `CODEX_HOME` (resolved ONCE) to
 /// PIN on the spawned child so the home the deck installed into and trusted is
 /// exactly the home Codex loads.
@@ -2546,10 +2593,12 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
         unsafe { libc::isatty(libc::STDERR_FILENO) == 1 },
     ];
 
+    // Issue #2002: decided once, so both paths start the same argv.
+    let args = launch_args(program, args);
     if tty.iter().any(|&t| t) {
-        run_wrap_pty(program, args, &emitter, pinned_home.as_deref(), tty)
+        run_wrap_pty(program, &args, &emitter, pinned_home.as_deref(), tty)
     } else {
-        run_wrap_pipe(program, args, &emitter, pinned_home.as_deref())
+        run_wrap_pipe(program, &args, &emitter, pinned_home.as_deref())
     }
 }
 
@@ -3136,6 +3185,28 @@ fn spawn_pipe_tee<R: Read + Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #2002: only a direct Codex gets the embedded pair, once, in front.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_direct_codex_gets_the_embedded_pair_once() {
+        let own = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let user = own(&["--model", "m", "a b"]);
+        let embedded = own(&[
+            CODEX_EMBEDDED_ARGS[0],
+            CODEX_EMBEDDED_ARGS[1],
+            "--model",
+            "m",
+            "a b",
+        ]);
+        for program in ["codex", "/opt/bin/codex"] {
+            assert_eq!(*launch_args(program, &user), embedded[..], "{program}");
+            assert_eq!(*launch_args(program, &embedded), embedded[..], "{program}");
+        }
+        for program in ["devbox", "/bin/sh", "codex-big", "opencode"] {
+            assert_eq!(*launch_args(program, &user), user[..], "{program}");
+        }
+    }
 
     // Pure-data pattern-detection tests — plain `#[test]` unit tests (no
     // `#[spec]` / CATALOG reproducer needed: these assert a pure function, not

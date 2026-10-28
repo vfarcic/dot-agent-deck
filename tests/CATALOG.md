@@ -6738,9 +6738,9 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 ##### codex/wrap/003 — Wrapped commands preserve each standard descriptor's independent TTY or redirection semantics (PRD #20, final review finding 11).
 - **Layer:** L1/fast real-binary subprocess integration with controlled pseudo-terminals and files; no TUI or LLM.
-- **Agent:** deterministic shell probes wrapped as Codex.
-- **Asserts:** wholly non-interactive stdout/stderr remain separate and binary stdin remains byte-exact through EOF; redirecting only stderr sends child stderr to that file rather than merged PTY stdout; redirecting only stdout leaves child stdin and stderr attached to TTYs.
-- **Does not assert:** interactive resize, ordinary input, or Ctrl+C behavior (`codex/wrap/002`).
+- **Agent:** deterministic shell probes, a synthetic direct Codex executable, and a non-Codex agent control.
+- **Asserts:** wholly non-interactive stdout/stderr remain separate and binary stdin remains byte-exact through EOF; redirecting only stderr sends child stderr to that file rather than merged PTY stdout; redirecting only stdout leaves child stdin and stderr attached to TTYs. Both the pipe and PTY paths prepend `-c shell_environment_policy.set={}` to direct Codex argv, preserve model/prompt arguments and input/output routing, avoid duplicating an existing prefix, and leave a non-Codex agent's argv unchanged.
+- **Does not assert:** real Codex config merging or daemon exclusion; interactive resize or Ctrl+C behavior (`codex/wrap/002`).
 - **Platform coverage:** mac+linux.
 
 ##### codex/wrap/004 — Catchable termination signals tear down and reap wrapped children on PTY and pipe paths (PRD #20, final review finding 12).
@@ -6840,24 +6840,24 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 #### codex/spawn
 
 ##### codex/spawn/001 — Plain restored Codex panes launch through the Wrapper strategy (PRD #20, blocker 3).
-- **Layer:** L2 synthetic PTY-attached restore with PATH recorder stubs.
-- **Agent:** synthetic Codex recorder.
-- **Asserts:** restoring persisted bare `codex` executes exactly `dot-agent-deck wrap --agent codex -- codex` and never the bare recorder.
-- **Does not assert:** mode or orchestration paths (002–003).
+- **Layer:** L2 synthetic PTY-attached restore through the real wrapper; lane 1.
+- **Agent:** synthetic Codex argv oracle with an isolated config home.
+- **Asserts:** restoring persisted bare `codex` crosses the wrapper once, receives the prepended embedded pair, visibly emits `EMBEDDED_SUCCESS`, and accepts pane input. An already-prefixed restore receives the pair once; config.toml bytes remain unchanged.
+- **Does not assert:** real Codex config merging or daemon exclusion; orchestration paths (003).
 - **Platform coverage:** mac+linux.
 
 ##### codex/spawn/003 — Orchestration role Codex commands launch through the Wrapper strategy (PRD #20, blocker 3).
-- **Layer:** L2 synthetic PTY-attached new-pane orchestration flow with PATH recorder stubs.
-- **Agent:** synthetic Codex recorder as the start role.
-- **Asserts:** selecting an orchestration whose start-role command is bare `codex` launches the role through the wrapper exactly once.
-- **Does not assert:** scheduler role spawning (`scheduler/spawn/006`) or respawn.
+- **Layer:** L2 synthetic PTY-attached new-pane orchestration flow through the real wrapper; lane 1.
+- **Agent:** synthetic Codex argv oracle as the start role.
+- **Asserts:** selecting an orchestration whose start-role command is bare `codex` crosses the wrapper once, receives the prepended embedded pair, visibly emits `EMBEDDED_SUCCESS`, accepts pane input, and leaves config.toml bytes unchanged.
+- **Does not assert:** real Codex config merging or daemon exclusion; scheduler role spawning (`scheduler/spawn/006`) or respawn.
 - **Platform coverage:** mac+linux.
 
 ##### codex/spawn/005 — Respawning an existing pane as Codex launches through the Wrapper strategy (PRD #20, blocker 3).
-- **Layer:** fast PTY registry integration (`AgentPtyRegistry::respawn_agent_for_pane` with PATH recorder stubs).
-- **Agent:** synthetic Codex recorder.
-- **Asserts:** replacing an existing pane process with bare command `codex` executes exactly `dot-agent-deck wrap --agent codex -- codex`.
-- **Does not assert:** delegate routing that chooses respawn; it pins the respawn spawn boundary itself.
+- **Layer:** fast PTY registry integration (`AgentPtyRegistry::respawn_agent_for_pane`) through the real wrapper.
+- **Agent:** synthetic Codex argv oracle.
+- **Asserts:** respawning an existing pane with an already-prefixed Codex command and then bare `codex` crosses the wrapper once per spawn and supplies the embedded pair exactly once to each child.
+- **Does not assert:** real Codex config merging or daemon exclusion; delegate routing that chooses respawn; rendered pane output (covered by 001 and 013).
 - **Platform coverage:** mac+linux.
 
 ##### codex/spawn/006 — An explicit Codex identity wraps a non-inferable custom launcher and remains the pane identity (PRD #20, R20-009).
@@ -6882,10 +6882,10 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Platform coverage:** mac+linux.
 
 ##### codex/spawn/009 — A config-declared Codex orchestration role wraps and badges a non-inferable launcher before the first task.
-- **Layer:** L2 synthetic PTY-attached new-pane orchestration flow with PATH recorder stubs.
+- **Layer:** L2 synthetic PTY-attached new-pane orchestration flow through the real wrapper; lane 1.
 - **Agent:** synthetic `devbox run codex-big` launcher declared as Codex by the start role.
-- **Asserts:** the role executes exactly once as `dot-agent-deck wrap --agent codex -- devbox run codex-big`, and its visible card reads `Codex` at spawn without any delegated task or synthesized hook event.
-- **Does not assert:** `clear = true` re-create precedence (`codex/spawn/010`) or a real Codex process (`codex/spawn/012`).
+- **Asserts:** the role crosses the real wrapper exactly once as `dot-agent-deck wrap --agent codex -- devbox run codex-big`; devbox receives exactly `run`, `codex-big` without Codex options. The fixture launcher selects embedded mode for its inner synthetic Codex, the pane visibly emits launcher and embedded success, accepts input, and its card reads `Codex` before a task or synthesized hook.
+- **Does not assert:** that a Codex declaration can configure an opaque launcher's inner argv; real Codex merging or daemon exclusion; `clear = true` re-create precedence (`codex/spawn/010`) or a real Codex process (`codex/spawn/012`).
 - **Platform coverage:** mac+linux.
 
 ##### codex/spawn/010 — A current config declaration outranks command derivation across spawn and missing-record re-create without admitting learned identity into the exec line.
@@ -6904,10 +6904,10 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Cost note:** one minimal mini-model availability probe; the launched interactive agent receives no prompt.
 
 ##### codex/spawn/013 — A plain new-pane Codex command launches through the Wrapper strategy exactly once (issue #533).
-- **Layer:** L2 synthetic PTY-attached new-pane flow (no mode) with PATH recorder stubs.
-- **Agent:** synthetic Codex recorder.
-- **Asserts:** submitting the Ctrl+N form with no mode and Command bare `codex` executes exactly `dot-agent-deck wrap --agent codex -- codex` — the wrapper once, never bare Codex and never a second wrapper. Issue #533 moved this path's rewrite from the TUI to the daemon's spawn boundary, which this pins from the outside.
-- **Does not assert:** which deck binary the daemon names as the wrapper (the recorder is injected through `DOT_AGENT_DECK_WRAP_BIN`; renamed-build resolution is unit-tested in `src/wrap.rs`); a real Codex process (`codex/live/001`).
+- **Layer:** L2 synthetic PTY-attached new-pane flow (no mode) through the real wrapper and real telemetry shim; lane 1.
+- **Agent:** synthetic Codex argv oracle at a recognized npm-shaped launcher path, rejecting `--no-daemon` as an older release would.
+- **Asserts:** submitting Ctrl+N crosses the wrapper once and prepends `-c shell_environment_policy.set={}` with telemetry off, exporter additions on, a user exporter configured, and an absolute Codex executable. The pane visibly emits `EMBEDDED_SUCCESS` and accepts input; whole-table and nested user `set` overrides follow the prepended pair unchanged, as do model and spaced prompt arguments; fixture config.toml bytes stay identical.
+- **Does not assert:** Codex's own recursive config merging, implicit daemon exclusion, or environment inheritance; the fixture checks argv and visible synthetic output. Those runtime claims still need the isolated real-Codex lane-2 verification; renamed wrapper-build resolution remains unit-tested in `src/wrap.rs`.
 - **Platform coverage:** mac+linux.
 
 ##### codex/spawn/014 — A Codex command that begins with an environment assignment or a shell compound starts under the wrapper (issue #1685).
