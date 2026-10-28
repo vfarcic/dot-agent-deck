@@ -155,7 +155,7 @@ pub enum Attribution {
     Owned,
     NotOwned(NotOwned),
     /// The reads may describe another process: the helper exited during
-    /// them, or its time namespace isn't the daemon's.
+    /// them, or its or `A`'s time namespace isn't the daemon's.
     Unattributable,
 }
 

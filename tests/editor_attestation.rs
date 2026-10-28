@@ -13,10 +13,11 @@ use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Instant;
 
 use dot_agent_deck::composer_probe::attest::{
     Agent, Attested, Export, ExportFs, Kernel, Pinned, ReadOp, Revoked, Sighting, Unpinned,
-    attribute, pin, read_export,
+    attribute, decode_peer_pidfd, pin, read_export,
 };
 use dot_agent_deck::composer_probe::classifier::{Class, FileId, Identity, ProcStat, ProcView};
 use dot_agent_deck::composer_probe::install::ProbeAgent;
@@ -24,7 +25,10 @@ use dot_agent_deck::composer_probe::instance::Kind;
 use dot_agent_deck::composer_probe::path_rule::{
     Cause, Entry, FsView, Kind as NodeKind, Stat, Xattr,
 };
-use dot_agent_deck::composer_probe::record::{Attribution, NotOwned};
+use dot_agent_deck::composer_probe::query_ledger::HazardFifo;
+use dot_agent_deck::composer_probe::record::{
+    Attribution, Channel, Completion, EcPolicy, NotOwned, Observation, RecordKey, Records,
+};
 use dot_agent_deck::event::ExportRead;
 use spec::spec;
 
@@ -34,7 +38,11 @@ mod test_temp;
 const ENOENT: i32 = 2;
 const ESRCH: i32 = 3;
 const EIO: i32 = 5;
+const EBADF: i32 = 9;
 const EACCES: i32 = 13;
+const EINVAL: i32 = 22;
+const ENOTSOCK: i32 = 88;
+const ENOPROTOOPT: i32 = 92;
 
 const ME: u32 = 1000;
 
@@ -502,11 +510,50 @@ fn reparent_helper(procs: &mut Procs) {
     procs.get_mut(&H).unwrap().ppid = 1;
 }
 
+/// `A` `exec`s and the helper exits, during the same read.
+fn exec_a_exit_helper(procs: &mut Procs) {
+    exec_a(procs);
+    exit_helper(procs);
+}
+
+/// `A` `exec`s and exits, during the same read.
+fn exec_a_exit_a(procs: &mut Procs) {
+    exec_a(procs);
+    exit_a(procs);
+}
+
+/// The completion an IPC record of `H` takes from an attestation's
+/// attribution (`Records::observe`, A2 §3.1).
+fn completion_of(attested: &Attested) -> Completion {
+    const G: u64 = 7;
+    let t = Instant::now();
+    let key = RecordKey {
+        pid: H,
+        start: H_START,
+    };
+    let mut records = Records::new(G, EcPolicy::Hold, t);
+    let observation = Observation {
+        generation: G,
+        key,
+        channel: Channel::Ipc,
+        attribution: attested.attribution,
+        claim: None,
+        decision: None,
+        seg_seen: None,
+        native_seen: None,
+        birth_floor: t,
+    };
+    records
+        .observe(&mut HazardFifo::default(), &observation, t)
+        .expect("observe");
+    records.get(key).expect("the record").completion
+}
+
 // ---------------------------------------------------------------------------
 // The cases.
 // ---------------------------------------------------------------------------
 
-/// Scenario: The daemon pins a scripted helper from its pidfd and from its pid, with and without the start ticks a scan read. A pidfd that won't open or whose pid won't read, a stat that fails, start ticks that differ from the scan's, and a process that exited while it was read each refuse the identity, and no process is pinned.
+/// Scenario: The daemon pins a scripted helper from a peer's pidfd and from its pid, with and without the start ticks a scan read. A pidfd that won't open or whose pid won't read, a stat that fails, start ticks that differ from the scan's, and a process that exited while it was read each refuse the identity, and no process is pinned.
 #[spec("inbox/probe/068")]
 #[test]
 fn probe_068_a_process_is_pinned_by_its_pidfd_then_its_start() {
@@ -537,7 +584,7 @@ fn probe_068_a_process_is_pinned_by_its_pidfd_then_its_start() {
     .unwrap();
     assert_eq!(unseen.start(), H_START);
     let fd = by_pid.into_pidfd();
-    let by_pidfd = pin(&mut sys, Sighting::Pidfd(fd)).unwrap();
+    let by_pidfd = pin(&mut sys, Sighting::Peer(Ok(Some(fd)))).unwrap();
     assert_eq!((by_pidfd.pid, by_pidfd.start()), (H, H_START));
 
     let refused = |sys: &mut Sys, sighting| pin(sys, sighting).map(|p| p.pid).unwrap_err();
@@ -604,12 +651,84 @@ fn probe_068_a_process_is_pinned_by_its_pidfd_then_its_start() {
         start: H_START,
     };
     assert_eq!(
-        refused(&mut sys, Sighting::Pidfd(fd)),
+        refused(&mut sys, Sighting::Peer(Ok(Some(fd)))),
         Unpinned::Pidfd(Some(ESRCH))
     );
 }
 
-/// Scenario: Scripted helpers are attributed for IPC requests and scans: one whose parent is `A` with Claude's or Codex's export shape is `Owned`; a tool shell's is `NotOwned(Tool)`, a nested agent's or one with no identity file is `NotOwned(Unknown)`; an export outside the shape, an argv the request doesn't name, a learned generation or an unreadable cmdline is `NotOwned(Shape)`. A parent that can't be pinned or a helper reparented is `NotOwned(Unknown)`, and a helper that exits or lives in another time namespace is `Unattributable`.
+/// Scenario: A scripted helper connects, exits, and its pid is taken by a new helper below `A` with the same export before the daemon opens anything. With no peer pidfd from the socket, the IPC request is refused as an identity refusal and nothing is attributed; the connection's own pidfd reads as exited; and only a pid opened afresh, the refused fallback, would have named the newcomer, which attributes as `Owned`. `SO_PEERPIDFD`'s result is decoded with `ENOPROTOOPT` as no option and every other error as an error.
+#[spec("inbox/probe/068")]
+#[test]
+fn probe_068_an_ipc_peer_is_named_by_its_pidfd_only() {
+    let id = identity();
+    let claude = agent(Some(&id), CLAUDE_KIND);
+    let mut sys = world(A, CLAUDE_EXPORT);
+    // The pidfd `SO_PEERPIDFD` would have given at the connection.
+    let at_connect = Fd {
+        pid: H,
+        start: H_START,
+    };
+    assert_eq!(
+        pin(&mut sys, Sighting::Peer(Ok(Some(at_connect))))
+            .unwrap()
+            .start(),
+        H_START,
+        "the positive: the connection's own pidfd pins the peer"
+    );
+
+    // The peer exits and its pid is reused before any open.
+    sys.change(|p| p.get_mut(&H).unwrap().start = H_START + 7);
+    let refused = |sys: &mut Sys, sighting| pin(sys, sighting).map(|p| p.pid).unwrap_err();
+    assert_eq!(
+        refused(&mut sys, Sighting::Peer(Ok(None))),
+        Unpinned::NoPeerPidfd
+    );
+    assert_eq!(
+        refused(&mut sys, Sighting::Peer(err(EINVAL))),
+        Unpinned::Pidfd(Some(EINVAL))
+    );
+    assert_eq!(
+        refused(&mut sys, Sighting::Peer(Ok(Some(at_connect)))),
+        Unpinned::Pidfd(Some(ESRCH)),
+        "the connection's pidfd names the peer that exited"
+    );
+    // What a fallback to `SO_PEERCRED`'s pid would have pinned: the
+    // newcomer, attributed as `A`'s.
+    let newcomer = pin(
+        &mut sys,
+        Sighting::Pid {
+            pid: H,
+            start: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(newcomer.start(), H_START + 7);
+    assert_eq!(
+        attribute(
+            &mut sys,
+            &claude,
+            &newcomer,
+            Some(request(CLAUDE_EXPORT).as_slice())
+        )
+        .attribution(),
+        Attribution::Owned
+    );
+
+    // The option's result, decoded.
+    assert_eq!(decode_peer_pidfd(Ok(7)).unwrap(), Some(7));
+    assert_eq!(decode_peer_pidfd(err::<i32>(ENOPROTOOPT)).unwrap(), None);
+    for errno in [EINVAL, EBADF, ENOTSOCK, EACCES] {
+        assert_eq!(
+            decode_peer_pidfd(err::<i32>(errno))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(errno)
+        );
+    }
+    assert!(decode_peer_pidfd(Err::<i32, _>(io::Error::other("no errno"))).is_err());
+}
+
+/// Scenario: Scripted helpers are attributed for IPC requests and scans: one whose parent is `A` with Claude's or Codex's export shape is `Owned`; a tool shell's is `NotOwned(Tool)`, a nested agent's or one with no identity file is `NotOwned(Unknown)`; an export outside the shape, an argv the request doesn't name, a learned generation or an unreadable cmdline is `NotOwned(Shape)`. A parent that can't be pinned or a helper reparented is `NotOwned(Unknown)`, including one that exits during the last read of the helper's stat; a helper that exits, also during that last read, a helper or `A` in another time namespace than the daemon's, and a tool's helper whose `A` can't be pinned or exits before its poll, are `Unattributable`.
 #[spec("inbox/probe/068")]
 #[test]
 fn probe_068_the_attribution_steps() {
@@ -735,6 +854,31 @@ fn probe_068_the_attribution_steps() {
         sys.on(At::Cmdline, change);
         assert_eq!(attribution_of(&mut sys, &claude, CLAUDE_EXPORT), expected);
     }
+    // At the last validation reads: the helper's stat is read once to pin
+    // it and once by step 4; `A`'s once to pin it and twice by the
+    // classification. The polls come after them.
+    for (at, change, expected) in [
+        (None, None, Attribution::Owned),
+        (
+            Some(At::Stat(H, 2)),
+            Some(exit_helper as Change),
+            Attribution::Unattributable,
+        ),
+        (Some(At::Stat(A, 3)), Some(exit_a), UNKNOWN),
+    ] {
+        let mut sys = world(A, CLAUDE_EXPORT);
+        if let (Some(at), Some(change)) = (at, change) {
+            sys.on(at, change);
+        }
+        assert_eq!(
+            attribution_of(&mut sys, &claude, CLAUDE_EXPORT),
+            expected,
+            "{at:?}"
+        );
+        let world = sys.0.borrow();
+        assert!(world.changes.is_empty(), "the change fired");
+        assert_eq!((world.stats[&H], world.stats[&A]), (2, 3));
+    }
 
     // The time namespace.
     let mut sys = world(A, CLAUDE_EXPORT);
@@ -743,14 +887,65 @@ fn probe_068_the_attribution_steps() {
         attribution_of(&mut sys, &claude, CLAUDE_EXPORT),
         Attribution::Unattributable
     );
-    for (daemon, helper, expected) in [
-        (Err(Some(ENOENT)), Err(ENOENT), Attribution::Owned),
-        (Ok(TIME_NS), Err(ENOENT), Attribution::Unattributable),
-        (Err(Some(ENOENT)), Ok(TIME_NS), Attribution::Unattributable),
-        (Err(Some(EACCES)), Err(EACCES), Attribution::Unattributable),
+    // The daemon's, the helper's and `A`'s, each as read.
+    const OTHER_NS: FileId = FileId { dev: 4, ino: 1 };
+    for (daemon, helper, a_ns, expected) in [
+        (Ok(TIME_NS), Ok(TIME_NS), Ok(TIME_NS), Attribution::Owned),
+        (
+            Err(Some(ENOENT)),
+            Err(ENOENT),
+            Err(ENOENT),
+            Attribution::Owned,
+        ),
+        (
+            Ok(TIME_NS),
+            Err(ENOENT),
+            Ok(TIME_NS),
+            Attribution::Unattributable,
+        ),
+        (
+            Err(Some(ENOENT)),
+            Ok(TIME_NS),
+            Err(ENOENT),
+            Attribution::Unattributable,
+        ),
+        (
+            Err(Some(EACCES)),
+            Err(EACCES),
+            Err(EACCES),
+            Attribution::Unattributable,
+        ),
+        // `A` and the helper diverge: either one apart is enough.
+        (
+            Ok(TIME_NS),
+            Ok(TIME_NS),
+            Ok(OTHER_NS),
+            Attribution::Unattributable,
+        ),
+        (
+            Ok(TIME_NS),
+            Ok(OTHER_NS),
+            Ok(TIME_NS),
+            Attribution::Unattributable,
+        ),
+        (
+            Err(Some(ENOENT)),
+            Err(ENOENT),
+            Ok(TIME_NS),
+            Attribution::Unattributable,
+        ),
+        (
+            Ok(TIME_NS),
+            Ok(TIME_NS),
+            Err(EACCES),
+            Attribution::Unattributable,
+        ),
     ] {
         let mut sys = world(A, CLAUDE_EXPORT);
-        sys.change(move |p| p.get_mut(&H).unwrap().ns = helper);
+        sys.change(move |p| {
+            p.get_mut(&H).unwrap().ns = helper;
+            p.get_mut(&A).unwrap().ns = a_ns;
+        });
         let a = Agent {
             time_ns: daemon,
             ..agent(Some(&id), CLAUDE_KIND)
@@ -758,9 +953,43 @@ fn probe_068_the_attribution_steps() {
         assert_eq!(
             attribution_of(&mut sys, &a, CLAUDE_EXPORT),
             expected,
-            "{daemon:?} {helper:?}"
+            "{daemon:?} {helper:?} {a_ns:?}"
         );
     }
+    // `A` isn't `Q`: a tool's helper. `A` is pinned by `gen-G`'s pid and
+    // start for its namespace; one that diverges, or an `A` that can't be
+    // pinned, is `Unattributable`. With no `gen-G` there is no `A` to read.
+    let tool = Attribution::NotOwned(NotOwned::Tool);
+    let mut sys = world(SHELL, CLAUDE_EXPORT);
+    assert_eq!(attribution_of(&mut sys, &claude, CLAUDE_EXPORT), tool);
+    let mut sys = world(SHELL, CLAUDE_EXPORT);
+    sys.change(|p| p.get_mut(&A).unwrap().ns = Ok(OTHER_NS));
+    assert_eq!(
+        attribution_of(&mut sys, &claude, CLAUDE_EXPORT),
+        Attribution::Unattributable
+    );
+    let mut sys = world(SHELL, CLAUDE_EXPORT);
+    sys.change(|p| p.get_mut(&A).unwrap().start = A_START + 1);
+    assert_eq!(
+        attribution_of(&mut sys, &claude, CLAUDE_EXPORT),
+        Attribution::Unattributable,
+        "`A`'s pid names another process"
+    );
+    // `A` exits after it was pinned, at the helper's last stat read: the
+    // namespace read before the poll may be another process's.
+    let mut sys = world(SHELL, CLAUDE_EXPORT);
+    sys.on(At::Stat(H, 2), exit_a);
+    assert_eq!(
+        attribution_of(&mut sys, &claude, CLAUDE_EXPORT),
+        Attribution::Unattributable
+    );
+    assert!(sys.0.borrow().changes.is_empty(), "the change fired");
+    let mut sys = world(A, CLAUDE_EXPORT);
+    sys.change(|p| p.get_mut(&A).unwrap().ns = Ok(OTHER_NS));
+    assert_eq!(
+        attribution_of(&mut sys, &agent(None, CLAUDE_KIND), CLAUDE_EXPORT),
+        UNKNOWN
+    );
 }
 
 /// Scenario: The daemon reads an `Owned` invocation's export through the path rule's checked descriptor: Claude's and Codex's empty exports read `Empty`, a non-zero size or a byte read reads `NonEmpty`, a group-writable directory refuses, and a failed size or read is unreadable. A tool's invocation is returned as it was, with no file touched.
@@ -911,13 +1140,13 @@ fn probe_068_revalidation_between_the_first_classification_and_the_read() {
     }
 }
 
-/// Scenario: During the export's read, a scripted `A` exits, is reparented or `exec`s, or the helper exits or is reparented; and during the second classification `A` exits. Each is caught after the read, by the pins, the stats or the second classification, revoking the attribution and discarding the read; the unchanged control reads the export as `Owned`.
+/// Scenario: During the export's read, a scripted `A` exits, is reparented or `exec`s, or the helper exits or is reparented, alone or with `A`'s `exec` at the same time; during the second classification `A` exits; and at the last reads of each stat the helper or `A` exits. Each is caught after the read, by the pins, the stats or the second classification, revoking the attribution and discarding the read, with a helper's exit `Unattributable` (its record waits for completion) even when `A`'s class changed too (whose record otherwise needs none); the unchanged control reads the export as `Owned`.
 #[spec("inbox/probe/068")]
 #[test]
 fn probe_068_revalidation_between_the_read_and_the_second_classification() {
     let id = identity();
     let claude = agent(Some(&id), CLAUDE_KIND);
-    let cases: [(Option<Change>, Attested); 6] = [
+    let cases: [(Option<Change>, Attested); 8] = [
         (None, owned(Export::Empty)),
         (Some(exit_a), revoked(UNKNOWN, Revoked::AgentExited)),
         (Some(reparent_a), revoked(UNKNOWN, Revoked::AgentChanged)),
@@ -933,6 +1162,12 @@ fn probe_068_revalidation_between_the_read_and_the_second_classification() {
             Some(exec_a),
             revoked(UNKNOWN, Revoked::Class(Class::Unknown)),
         ),
+        // The pins come before the class.
+        (
+            Some(exec_a_exit_helper),
+            revoked(Attribution::Unattributable, Revoked::HelperExited),
+        ),
+        (Some(exec_a_exit_a), revoked(UNKNOWN, Revoked::AgentExited)),
     ];
     for (change, expected) in cases {
         let mut sys = world(A, CLAUDE_EXPORT);
@@ -942,6 +1177,24 @@ fn probe_068_revalidation_between_the_read_and_the_second_classification() {
         }
         assert_eq!(attest(&mut sys, &mut fs, &claude, CLAUDE_EXPORT), expected);
         assert!(sys.fs_calls().contains(&"size"));
+    }
+
+    // The completion each takes: the class change alone needs none, the
+    // helper's exit, with or without it, waits.
+    let attest_with = |change: Change| {
+        let mut sys = world(A, CLAUDE_EXPORT);
+        let mut fs = Fs::new(&sys);
+        sys.on(At::Size, change);
+        attest(&mut sys, &mut fs, &claude, CLAUDE_EXPORT)
+    };
+    for (change, completion) in [
+        (exec_a as Change, Completion::NotRequired),
+        (exit_helper, Completion::Pending),
+        (exec_a_exit_helper, Completion::Pending),
+    ] {
+        let attested = attest_with(change);
+        assert_eq!(attested.export, None);
+        assert_eq!(completion_of(&attested), completion, "{attested:?}");
     }
 
     // `A` exits between the second classification's two samples: they
@@ -955,23 +1208,73 @@ fn probe_068_revalidation_between_the_read_and_the_second_classification() {
         attest(&mut sys, &mut fs, &claude, CLAUDE_EXPORT),
         revoked(UNKNOWN, Revoked::AgentExited)
     );
-    assert_eq!(sys.0.borrow().stats[&A], 6, "the exit came where scripted");
+    assert_eq!(sys.0.borrow().stats[&A], 7, "the exit came where scripted");
+
+    // At the last reads of the helper's and `A`'s stats, after the read:
+    // the helper's 4th (pin, step 4, before the read, after it) and `A`'s
+    // 7th. The polls come after them. And before the read, at the 3rd and
+    // the 4th.
+    for (at, change, expected) in [
+        (None, None, owned(Export::Empty)),
+        (
+            Some(At::Stat(H, 4)),
+            Some(exit_helper as Change),
+            revoked(Attribution::Unattributable, Revoked::HelperExited),
+        ),
+        (
+            Some(At::Stat(A, 7)),
+            Some(exit_a),
+            revoked(UNKNOWN, Revoked::AgentExited),
+        ),
+        (
+            Some(At::Stat(H, 3)),
+            Some(exit_helper),
+            revoked(Attribution::Unattributable, Revoked::HelperExited),
+        ),
+        (
+            Some(At::Stat(A, 4)),
+            Some(exit_a),
+            revoked(UNKNOWN, Revoked::AgentExited),
+        ),
+    ] {
+        let mut sys = world(A, CLAUDE_EXPORT);
+        let mut fs = Fs::new(&sys);
+        if let (Some(at), Some(change)) = (at, change) {
+            sys.on(at, change);
+        }
+        assert_eq!(
+            attest(&mut sys, &mut fs, &claude, CLAUDE_EXPORT),
+            expected,
+            "{at:?}"
+        );
+        assert!(sys.0.borrow().changes.is_empty(), "the change fired");
+    }
 }
 
-/// The running kernel's major and minor release.
-fn kernel_release() -> (u32, u32) {
-    // SAFETY: `utsname` is plain data, so all-zero is a valid value.
-    let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
-    // SAFETY: a writable `utsname`.
-    assert_eq!(unsafe { libc::uname(&mut uts) }, 0);
-    // SAFETY: `uname` NUL-terminates `release`.
-    let release = unsafe { std::ffi::CStr::from_ptr(uts.release.as_ptr()) }.to_string_lossy();
-    let mut parts = release.split(|c: char| !c.is_ascii_digit());
-    let mut next = || parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-    (next(), next())
+/// `getsockopt(SO_PEERPIDFD)` on `stream`, read raw: the pidfd, or the
+/// errno.
+fn raw_peer_pidfd(stream: &std::os::unix::net::UnixStream) -> Result<std::os::fd::OwnedFd, i32> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let mut fd: libc::c_int = -1;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `fd` and `len` are valid for writes of an int and its length.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERPIDFD,
+            (&mut fd as *mut libc::c_int).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error().raw_os_error().unwrap_or(0));
+    }
+    // SAFETY: the kernel just installed this descriptor for us.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
 }
 
-/// Scenario: Through the Linux views, this test process is pinned by its pid and, on Linux 6.5 and later, by a socket pair's `SO_PEERPIDFD`; it reads its own executable, argv and time namespace, a pid above Linux's limit opens no pidfd, and a child's pidfd reports the child's exit. An empty real file and one with bytes, opened as descriptors, read their sizes and first byte through them.
+/// Scenario: Through the Linux views, this test process is pinned by its pid and, where the socket gives one, by a socket pair's `SO_PEERPIDFD`, and is refused as a peer where it doesn't; it reads its own executable, argv and time namespace, a pid above Linux's limit opens no pidfd, and a child's pidfd reports the child's exit. An empty real file and one with bytes, opened as descriptors, read their sizes and first byte through them.
 #[spec("inbox/probe/068")]
 #[test]
 fn probe_068_the_linux_views() {
@@ -991,19 +1294,26 @@ fn probe_068_the_linux_views() {
     )
     .unwrap();
     assert_eq!(by_pid.pid, me);
+    // The feature is what the option returns, not the kernel's version:
+    // read raw first, and `peer_pidfd` must agree with it.
     let (a, _b) = UnixStream::pair().unwrap();
-    match peer_pidfd(&a).unwrap() {
-        Some(pidfd) => {
-            let by_pidfd = pin(&mut kernel, Sighting::Pidfd(pidfd)).unwrap();
+    match (raw_peer_pidfd(&a), peer_pidfd(&a).unwrap()) {
+        (Ok(_), Some(pidfd)) => {
+            let by_pidfd = pin(&mut kernel, Sighting::Peer(Ok(Some(pidfd)))).unwrap();
             assert_eq!((by_pidfd.pid, by_pidfd.stat), (me, by_pid.stat));
         }
-        None => {
+        (raw, got) => {
             assert!(
-                kernel_release() < (6, 5),
-                "SO_PEERPIDFD is Linux 6.5's, and this is {:?}",
-                kernel_release()
+                matches!((&raw, &got), (Err(ENOPROTOOPT), None)),
+                "the raw option gave {raw:?}, `peer_pidfd` {got:?}"
             );
-            eprintln!("SKIP-PEERPIDFD: this kernel has no SO_PEERPIDFD");
+            assert_eq!(
+                pin(&mut kernel, Sighting::Peer(Ok(None)))
+                    .map(|p| p.pid)
+                    .unwrap_err(),
+                Unpinned::NoPeerPidfd
+            );
+            eprintln!("SKIP-PEERPIDFD: this socket gives no SO_PEERPIDFD; IPC peers are refused");
         }
     }
     let exe = std::env::current_exe().unwrap();

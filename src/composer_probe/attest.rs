@@ -4,12 +4,24 @@
 //! like the helper it attributes.
 //!
 //! **Identity, refused rather than invented** ([`pin`]). A process is named
-//! by a pidfd opened first, from `SO_PEERPIDFD` ([`peer_pidfd`]) or from an
-//! observed pid, and then by the start ticks read after it. A pidfd that
-//! doesn't open, a stat that doesn't read, start ticks other than the ones
-//! the sighting read, or a process that exited while it was read make no
-//! [`Pinned`] process: the caller records the identity refusal and makes no
-//! record (`Records::refused_identity`).
+//! by a pidfd and then by the start ticks read after it, and the pidfd is
+//! polled after that read. A pidfd that doesn't open, a stat that doesn't
+//! read, start ticks other than the ones the sighting read, or a process
+//! that exited before the poll make no [`Pinned`] process: the caller
+//! records the identity refusal and makes no record
+//! (`Records::refused_identity`).
+//!
+//! **An IPC peer is named by `SO_PEERPIDFD` or not at all** ([`peer_pidfd`],
+//! [`Sighting::Peer`]; Q81). The kernel takes that pidfd for the process
+//! that connected, so a peer that exited since reads as exited. A pid from
+//! `SO_PEERCRED`, opened later, can name another process: the peer exits,
+//! its pid is reused, the new process can pass every check, and nothing the
+//! daemon reads binds it back to the connection. So where the socket
+//! gives no peer pidfd (Linux before 6.5, such as Ubuntu 22.04's 5.15), an
+//! IPC request is an identity refusal (`record_refused`, its claim kept)
+//! and the editor-probe IPC path gives no authority. The pidfd and start
+//! pairing still pins a process the daemon observed itself: a scan's or a
+//! marker's pid with the start ticks read with it, or the helper's parent.
 //!
 //! **The attribution, computed once per record while the helper is alive**
 //! ([`attribute`]), from the daemon's own reads, never from the helper's
@@ -26,11 +38,17 @@
 //!    must have the agent's export shape (the helper's own rule,
 //!    [`super::helper::export_shaped`]), and an IPC request's argv must equal
 //!    it, else `NotOwned(Shape)`.
-//! 4. Check the pins again: a helper that exited, or whose time namespace
-//!    isn't the daemon's, is `Unattributable` (the reads may describe
-//!    another process, or its birth floor can't be compared); a helper whose
-//!    stat changed (it was reparented away from `Q`), or a `Q` that exited,
-//!    is `NotOwned(Unknown)`.
+//! 4. Read the helper's and `A`'s time namespaces and the helper's stat,
+//!    then poll the pins, so these last reads are the pinned processes'. A
+//!    helper that exited before the poll, or a helper or `A` whose time
+//!    namespace isn't the daemon's, is `Unattributable` (the reads may
+//!    describe another process, or a birth floor can't be compared); a
+//!    helper whose stat changed (it was reparented away from `Q`), or a `Q`
+//!    that exited, is `NotOwned(Unknown)`. `A` is `Q` when `Q` is `A`, and
+//!    is otherwise pinned by `gen-G`'s pid and start; an `A` that can't be
+//!    pinned can't have its namespace compared, which is `Unattributable`
+//!    too. With no `gen-G` there is no `A` to read, and nothing is `Owned`.
+//!    All of them reading `ENOENT` is a kernel without time namespaces.
 //!
 //! **The read** ([`read_export`]), only for an `Owned` invocation, and with
 //! `Q` (which is `A`) and the helper held by their pidfds from before the
@@ -39,22 +57,29 @@
 //! every check made on the opened descriptor, and read through it, never
 //! reopened by path: empty when its size is 0 and a one-byte read returns
 //! nothing (R3 §4.1). After the read `Q` is classified again, and then the
-//! pins are checked again and the helper's and `Q`'s stats must read as
-//! they did, so an exit during the read or the second classification is
-//! caught: a second class that isn't `Owned`, as the first was, or a failed
-//! check revokes the attribution and discards the read ([`Revoked`]). The
-//! classifier's sampling limit stands (its module doc): a change undone
-//! between the reads, or an `exec` of the same executable, leaves equal
-//! reads.
+//! helper's and `Q`'s stats are read again, and must read as they did, and
+//! both pins are polled after them, so an exit before that poll is caught.
+//! A failed check revokes the attribution and discards the read
+//! ([`Revoked`]), and is decided before the second class: a helper that
+//! exited is `Unattributable` whatever `Q` became. Only with both pins
+//! passing does a second class that isn't `Owned`, as the first was, revoke
+//! as the class. The classifier's sampling limit stands (its module doc): a
+//! change undone between the reads, or an `exec` of the same executable,
+//! leaves equal reads, and an exit after the last poll is not seen here.
 //!
-//! **Locks.** Nothing here takes a lock or touches generation state: every
-//! `/proc` and filesystem read runs with no lock held, the seam lock and the
-//! generation's input lock included. The caller (Q35-14b) reads `gen-G`
-//! (`InstanceReader::identity`) and attests off the lock, then takes the
-//! input lock once to apply what it got (`GenerationInput::record_observe`
-//! or `record_refused`). A generation retired in between refuses that step
-//! as stale, so an attestation outliving its generation changes nothing;
-//! dropping it closes its pidfds.
+//! **What the caller owes (Q35-14b's obligations, not shown here).** This
+//! module takes no lock and touches no generation state, but it can't make
+//! its callers hold none: that every `/proc` and filesystem read here runs
+//! with no lock held, the seam lock and the generation's input lock
+//! included, is to be shown at Q35-14b's call sites. There the caller reads
+//! `gen-G` (`InstanceReader::identity`) and attests off the lock, then
+//! takes the input lock once to apply what it got
+//! (`GenerationInput::record_observe` or `record_refused`), where a
+//! generation retired in between refuses the step as stale. The caller
+//! also passes the same helper pin and the same `Agent` (one `gen-G` read)
+//! to [`attribute`] and [`read_export`]: the API doesn't tie them together
+//! or hold the helper's pin for it. Dropping an attestation closes its
+//! pidfds.
 //!
 //! **What this is not, yet.** Nothing in the daemon calls it: the handler,
 //! the drain and the scans that do are Q35-14b's, which also turns the time
@@ -116,10 +141,13 @@ fn errno(error: io::Error) -> Option<i32> {
 /// How the daemon came to a process.
 #[derive(Debug)]
 pub enum Sighting<P> {
-    /// The peer's pidfd, from `SO_PEERPIDFD`.
-    Pidfd(P),
-    /// A pid: a peer's from `SO_PEERCRED`, a scan's or a marker's, with the
-    /// start ticks the sighting read with it, if it read them.
+    /// An IPC peer, by what `SO_PEERPIDFD` gave ([`peer_pidfd`]): its
+    /// pidfd, `None` where the socket gives none, or the error. Only a
+    /// pidfd pins: never a pid from `SO_PEERCRED` (the module doc).
+    Peer(io::Result<Option<P>>),
+    /// A process the daemon observed itself: a scan's or a marker's pid
+    /// with the start ticks read with it, or the helper's parent from its
+    /// pinned stat. Never an IPC peer's pid.
     Pid { pid: u32, start: Option<u64> },
 }
 
@@ -152,8 +180,12 @@ impl<P> Pinned<P> {
 /// Why a sighting names no process: the identity refusal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unpinned {
-    /// The pidfd didn't open, or its pid didn't read.
+    /// The pidfd didn't open, or its pid didn't read, or `SO_PEERPIDFD`
+    /// failed.
     Pidfd(Option<i32>),
+    /// The socket gave no peer pidfd: an IPC request without one gets no
+    /// identity.
+    NoPeerPidfd,
     /// The stat didn't read.
     Stat(Option<i32>),
     /// The start ticks differ from the ones the sighting read.
@@ -170,7 +202,10 @@ pub fn pin<K: Kernel>(
     sighting: Sighting<K::Pidfd>,
 ) -> Result<Pinned<K::Pidfd>, Unpinned> {
     let (pid, pidfd, seen) = match sighting {
-        Sighting::Pidfd(pidfd) => {
+        Sighting::Peer(peer) => {
+            let pidfd = peer
+                .map_err(|e| Unpinned::Pidfd(errno(e)))?
+                .ok_or(Unpinned::NoPeerPidfd)?;
             let pid = kernel
                 .pidfd_pid(&pidfd)
                 .map_err(|e| Unpinned::Pidfd(errno(e)))?;
@@ -210,11 +245,11 @@ pub struct Agent<'a> {
     pub time_ns: Result<FileId, Option<i32>>,
 }
 
-/// Whether a helper's time namespace, as read, is the daemon's: the same
+/// Whether a process's time namespace, as read, is the daemon's: the same
 /// namespace, or a kernel with none (both read `ENOENT`).
-fn same_time_ns(daemon: Result<FileId, Option<i32>>, helper: Result<FileId, Option<i32>>) -> bool {
-    match (daemon, helper) {
-        (Ok(daemon), Ok(helper)) => daemon == helper,
+fn same_time_ns(daemon: Result<FileId, Option<i32>>, other: Result<FileId, Option<i32>>) -> bool {
+    match (daemon, other) {
+        (Ok(daemon), Ok(other)) => daemon == other,
         (Err(Some(ENOENT)), Err(Some(ENOENT))) => true,
         _ => false,
     }
@@ -291,12 +326,46 @@ pub fn attribute<K: Kernel>(
         .cmdline(helper.pid)
         .ok()
         .and_then(|argv| shaped_export(agent, argv.get(1..).unwrap_or_default(), request));
-    // Step 4.
+    // Step 4: `A`, for its time namespace: `Q` when `Q` is `A`, otherwise
+    // pinned by `gen-G`'s pid and start. `None` inside: it didn't pin.
+    let other_a;
+    let a = match agent.identity {
+        None => None,
+        Some(id) if (q.pid, q.start()) == (id.pid, id.start) => Some(Some(&q)),
+        Some(id) => {
+            other_a = pin(
+                kernel,
+                Sighting::Pid {
+                    pid: id.pid,
+                    start: Some(id.start),
+                },
+            )
+            .ok();
+            Some(other_a.as_ref())
+        }
+    };
+    // The last reads, then the polls: an exit before them is seen.
     let helper_ns = kernel.time_ns(helper.pid).map_err(errno);
-    let attribution = if !alive(kernel, helper) || !same_time_ns(agent.time_ns, helper_ns) {
+    let a_ns = a.map(|a| a.map(|a| kernel.time_ns(a.pid).map_err(errno)));
+    let helper_stat = kernel.stat(helper.pid).ok();
+    let helper_alive = alive(kernel, helper);
+    let q_alive = alive(kernel, &q);
+    let a_same = match a {
+        None => true,
+        Some(None) => false,
+        Some(Some(a)) => {
+            alive(kernel, a)
+                && a_ns
+                    .flatten()
+                    .is_some_and(|ns| same_time_ns(agent.time_ns, ns))
+        }
+    };
+    let attribution = if !helper_alive || !same_time_ns(agent.time_ns, helper_ns) {
         Attribution::Unattributable
-    } else if !alive(kernel, &q) || kernel.stat(helper.pid).ok() != Some(helper.stat) {
+    } else if !q_alive || helper_stat != Some(helper.stat) {
         Attribution::NotOwned(NotOwned::Unknown)
+    } else if !a_same {
+        Attribution::Unattributable
     } else {
         match (class, &export) {
             (Class::Owned, Some(_)) => Attribution::Owned,
@@ -390,7 +459,8 @@ pub struct Attested {
 /// around it (R3 §4.1, R6 §6.2, R35CODE4-U3-01). Anything not `Owned` is
 /// returned as it is, with no read. A revoked attribution is
 /// `Unattributable` when the helper exited, `NotOwned(Unknown)` otherwise,
-/// and its read is discarded. `Q`'s pin is held to the end and dropped here.
+/// and its read is discarded; the pins are checked on every path, before a
+/// changed class is. `Q`'s pin is held to the end and dropped here.
 pub fn read_export<K: Kernel, F: ExportFs>(
     kernel: &mut K,
     fs: &mut F,
@@ -421,11 +491,11 @@ pub fn read_export<K: Kernel, F: ExportFs>(
     let export = read_through(fs, path, agent.uid);
     // The class acted on is `Owned`: an `Owned` attribution had it first.
     let again = classifier::classify(kernel, agent.identity, q.pid);
-    if again != Class::Owned {
-        return revoke(Revoked::Class(again));
-    }
     if let Some(why) = check_pins(kernel, helper, q) {
         return revoke(why);
+    }
+    if again != Class::Owned {
+        return revoke(Revoked::Class(again));
     }
     Attested {
         attribution: Attribution::Owned,
@@ -434,23 +504,26 @@ pub fn read_export<K: Kernel, F: ExportFs>(
     }
 }
 
-/// Both pins live, and both stats as pinned: the helper still `Q`'s child,
-/// `Q` still where it was.
+/// Both stats as pinned (the helper still `Q`'s child, `Q` still where it
+/// was), and both pins live when polled after those reads. An exit comes
+/// first: a stat may fail because its process exited.
 fn check_pins<K: Kernel>(
     kernel: &mut K,
     helper: &Pinned<K::Pidfd>,
     q: &Pinned<K::Pidfd>,
 ) -> Option<Revoked> {
+    let helper_stat = kernel.stat(helper.pid).ok();
+    let q_stat = kernel.stat(q.pid).ok();
     if !alive(kernel, helper) {
         return Some(Revoked::HelperExited);
     }
     if !alive(kernel, q) {
         return Some(Revoked::AgentExited);
     }
-    if kernel.stat(helper.pid).ok() != Some(helper.stat) {
+    if helper_stat != Some(helper.stat) {
         return Some(Revoked::HelperChanged);
     }
-    if kernel.stat(q.pid).ok() != Some(q.stat) {
+    if q_stat != Some(q.stat) {
         return Some(Revoked::AgentChanged);
     }
     None
@@ -489,9 +562,20 @@ fn read_through<F: ExportFs>(fs: &mut F, path: &Path, uid: u32) -> Export {
 // The Linux views.
 // ---------------------------------------------------------------------------
 
-/// The peer's pidfd from `SO_PEERPIDFD` (Linux 6.5 and later), or `None` on
-/// a kernel without it (`ENOPROTOOPT`), where the caller falls back to
-/// `SO_PEERCRED`'s pid.
+/// What `getsockopt(SO_PEERPIDFD)` returned, decoded: the pidfd, `None`
+/// when the option isn't there (`ENOPROTOOPT`), or the error. The feature
+/// is read from this result, not from the kernel's version.
+pub fn decode_peer_pidfd<P>(got: io::Result<P>) -> io::Result<Option<P>> {
+    match got {
+        Ok(pidfd) => Ok(Some(pidfd)),
+        Err(error) if error.raw_os_error() == Some(libc::ENOPROTOOPT) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// The peer's pidfd from `SO_PEERPIDFD` (Linux 6.5 and later), for
+/// [`Sighting::Peer`]. `None` (no option) refuses the peer's identity, as
+/// an error does: there is no fallback to `SO_PEERCRED`'s pid.
 pub fn peer_pidfd(stream: &UnixStream) -> io::Result<Option<OwnedFd>> {
     let mut fd: libc::c_int = -1;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
@@ -505,15 +589,12 @@ pub fn peer_pidfd(stream: &UnixStream) -> io::Result<Option<OwnedFd>> {
             &mut len,
         )
     };
-    if rc != 0 {
-        let error = io::Error::last_os_error();
-        return match error.raw_os_error() {
-            Some(libc::ENOPROTOOPT) => Ok(None),
-            _ => Err(error),
-        };
-    }
-    // SAFETY: the kernel just installed this descriptor for us.
-    Ok(Some(unsafe { OwnedFd::from_raw_fd(fd as RawFd) }))
+    decode_peer_pidfd(if rc != 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        // SAFETY: the kernel just installed this descriptor for us.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+    })
 }
 
 /// The real processes: `/proc` through the classifier's Linux view, and
