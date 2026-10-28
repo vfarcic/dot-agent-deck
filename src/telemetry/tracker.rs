@@ -44,11 +44,17 @@
 //! **An intervention says what the person did** (`deck.intervention.kind`):
 //! the strongest kind of input in its burst, from the bytes
 //! ([`super::input::InterventionKind`]), raised to an answer when the run's own
-//! cards show the agent waiting on a question or a permission prompt when the
-//! input was written — not when the tracker counts it, which can be after a
-//! status the input itself caused ([`MAX_PROMPT_CHANGES`]). An answer the
-//! deck's question UI gave is one too, counted when the daemon's event saying
-//! so arrives, since a held question's answer types nothing into the pane.
+//! cards show the agent waiting on a question or a permission prompt as the
+//! tracker applies it. An answer the deck's question UI gave is one too, at the
+//! time the daemon stamped its event saying so, since a held question's answer
+//! types nothing into the pane.
+//!
+//! **Input, prompt changes and deck answers are applied in the order the deck
+//! accepted them**, which is the caller's job, not the tracker's: the tracker
+//! applies each in the order it is handed them, reads the prompt as the cards
+//! show it then, and never moves a run's last input backward, so a burst's
+//! time can only grow. [`super::exporter`] hands each pane's input over before
+//! the first event broadcast after it was written.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -98,15 +104,6 @@ pub const MAX_OPEN_OPERATIONS: usize = 64;
 /// The tool call ids one run remembers having seen, newest kept: an end
 /// naming one of them ends nothing unless that call is still open.
 pub const MAX_SEEN_CALL_IDS: usize = 256;
-
-/// Changes to whether a prompt is open that one run remembers, newest kept,
-/// so input is read against the prompt in force when it was written rather
-/// than when the tracker counts it. Input is usually counted within moments
-/// of being written, and a prompt opens and closes at a person's pace, so this
-/// usually covers that delay many times over; an ingest task starved for long
-/// enough can still fall further behind. Input older than every change kept is
-/// read against the oldest state kept.
-pub const MAX_PROMPT_CHANGES: usize = 64;
 
 /// The event metadata key carrying the agent's id for one tool call, which
 /// pairs a call's end with its start when several run at once.
@@ -304,12 +301,6 @@ struct ActiveRun {
     /// Claude Code's `idle_prompt`, after every ended turn. Input then is not
     /// an answer.
     idle_wait: bool,
-    /// Whether a prompt was open ([`Self::prompt_open_now`]) before the
-    /// oldest change in `prompt_changes`.
-    prompt_before: bool,
-    /// When a prompt opened or closed, and which, oldest first; at most
-    /// [`MAX_PROMPT_CHANGES`].
-    prompt_changes: VecDeque<(u64, bool)>,
     operations: Vec<OpenOperation>,
     operations_count: u64,
     /// The call ids this run's shell starts and ends named, at most
@@ -344,15 +335,17 @@ impl ActiveRun {
         }
     }
 
-    /// See [`RunTracker::observe_run_input`]. Input while the agent waited
-    /// on a prompt when it was written, at `now`, is an answer, unless it
-    /// interrupts.
+    /// See [`RunTracker::observe_run_input`]. Input while the agent waits on
+    /// a prompt is an answer, unless it interrupts. Input handed over with a
+    /// time before the run's last input counts at that last time: the order
+    /// it was handed over in is the order the deck accepted it.
     fn human_input(&mut self, now: u64, kind: InterventionKind) {
-        let kind = if self.prompt_open_at(now) {
+        let kind = if self.prompt_open() {
             kind.max(InterventionKind::Answer)
         } else {
             kind
         };
+        let now = self.last_human_input.map_or(now, |last| now.max(last));
         let new_burst = self
             .last_human_input
             .is_none_or(|last| now.saturating_sub(last) > INTERVENTION_COALESCE_NANOS);
@@ -376,48 +369,10 @@ impl ActiveRun {
         }
     }
 
-    /// Whether a prompt was open at `at`: by the last change kept at or
-    /// before it, or the state before every change kept.
-    fn prompt_open_at(&self, at: u64) -> bool {
-        self.prompt_changes
-            .iter()
-            .rev()
-            .find(|(changed, _)| *changed <= at)
-            .map_or(self.prompt_before, |(_, open)| *open)
-    }
-
-    /// Record whether a prompt is open now, when that changed: at `at`, when
-    /// the event saying so was stamped, unless that is earlier than the last
-    /// change kept — an event delivered out of order, or a producer clock
-    /// behind — and then at `now`, when the tracker applies it. A change is
-    /// never placed before one already kept, which would close the interval
-    /// that held input written since.
-    fn note_prompt(&mut self, at: u64, now: u64) {
-        let open = self.prompt_open_now();
-        let last = self
-            .prompt_changes
-            .back()
-            .map_or(self.prompt_before, |(_, open)| *open);
-        if open == last {
-            return;
-        }
-        // Times only move forward, so the search above finds the latest.
-        let at = match self.prompt_changes.back() {
-            Some(&(last, _)) if at < last => now.max(last),
-            _ => at,
-        };
-        if self.prompt_changes.len() >= MAX_PROMPT_CHANGES
-            && let Some((_, oldest)) = self.prompt_changes.pop_front()
-        {
-            self.prompt_before = oldest;
-        }
-        self.prompt_changes.push_back((at, open));
-    }
-
     /// Whether the run's pane's card shows the agent waiting on a question
     /// or a permission prompt: a pending question, or a wait that is not
     /// [`Self::idle_wait`].
-    fn prompt_open_now(&self) -> bool {
+    fn prompt_open(&self) -> bool {
         let pane_id = self.start_info.pane_id.as_str();
         self.cards
             .sessions
@@ -574,8 +529,6 @@ impl RunTracker {
                 last_human_input: None,
                 burst: None,
                 idle_wait: false,
-                prompt_before: false,
-                prompt_changes: VecDeque::new(),
                 operations: Vec::new(),
                 operations_count: 0,
                 seen_call_ids: VecDeque::new(),
@@ -733,22 +686,20 @@ impl RunTracker {
             EventType::PermissionRequest => run.idle_wait = false,
             _ => {}
         }
-        // When it happened: when the producer stamped it, unless that is later
-        // than now. An event the tracker applies only after input written
-        // since still came first.
-        let happened = event
-            .timestamp
-            .timestamp_nanos_opt()
-            .and_then(|t| u64::try_from(t).ok())
-            .map_or(now, |t| t.min(now));
-        run.note_prompt(happened, now);
         // The daemon answered a question for a person in the deck's question
-        // UI. The answer is theirs, whether or not the deck typed it.
+        // UI. The answer is theirs, whether or not the deck typed it, and
+        // counts from when the daemon accepted it: the daemon makes this event
+        // and stamps it then, on the clock input is timed by.
         if event
             .metadata
             .contains_key(crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY)
         {
-            run.human_input(now, InterventionKind::Answer);
+            let accepted = event
+                .timestamp
+                .timestamp_nanos_opt()
+                .and_then(|t| u64::try_from(t).ok())
+                .map_or(now, |t| t.min(now));
+            run.human_input(accepted, InterventionKind::Answer);
         }
         if event.event_type == EventType::PullRequest
             && let Some(pr) = card_pull_request(&run.cards, event)
@@ -812,11 +763,24 @@ impl RunTracker {
         }
     }
 
+    /// Whether `run_id` is open on `pane_id`, or replaced and waiting for its
+    /// end: whether [`Self::observe_run_input`] would count input for it.
+    pub fn takes_input(&self, pane_id: &str, run_id: &str) -> bool {
+        self.run_id(pane_id) == Some(run_id)
+            || self
+                .replaced
+                .iter()
+                .any(|r| r.run.start_info.pane_id == pane_id && r.run.start_info.run_id == run_id)
+    }
+
     /// Input from a person at an attached client reached `pane_id`, while the
     /// run open on it, or replaced and waiting for its end, is `run_id`. Input
     /// the deck injects itself (a delegated task, an inbox delivery) must not
     /// be reported here. Keystrokes less than [`INTERVENTION_COALESCE_NANOS`]
     /// apart count as one intervention, of the strongest `kind` among them.
+    /// Input is read in the order it is reported in, against the run's cards
+    /// as they stand then: report it before the first event the deck accepted
+    /// after it, and after every event before.
     pub fn observe_run_input(
         &mut self,
         pane_id: &str,
@@ -1677,24 +1641,24 @@ pub(crate) mod tests {
         }
     }
 
-    /// Input is read against the prompt in force when it was written, not
-    /// when it is counted: a status that lands in between — often one the
-    /// input itself caused — changes nothing, in either direction.
+    /// Input is read against the prompt as the cards show it when the tracker
+    /// applies it, which is the order it is handed over in: a status applied
+    /// after it — often one the input itself caused — changes nothing, in
+    /// either direction.
     #[test]
-    fn input_is_read_against_the_prompt_when_it_was_written() {
+    fn input_is_read_against_the_prompt_in_the_order_it_is_applied() {
         for (before, after, expected) in [
-            // Answered, and the agent went back to work before the tracker
-            // took the keystroke.
+            // Answered, and the agent went back to work.
             (EventType::PermissionRequest, EventType::Thinking, "answer"),
-            // Typed, and a prompt opened before the tracker took it.
+            // Typed, and a prompt opened after.
             (EventType::Thinking, EventType::PermissionRequest, "text"),
         ] {
             let mut tracker = RunTracker::new();
             tracker.begin_run(start("p1"), 0);
             tracker.observe_event(&event("p1", EventType::SessionStart), 1);
             tracker.observe_event(&event("p1", before.clone()), 2);
-            tracker.observe_event(&event("p1", after.clone()), 4);
             tracker.observe_human_input("p1", 3, InterventionKind::Text);
+            tracker.observe_event(&event("p1", after.clone()), 4);
             assert_eq!(
                 kinds_at_end(&mut tracker, "p1", 5),
                 (vec![expected.to_string()], 1),
@@ -1703,83 +1667,89 @@ pub(crate) mod tests {
         }
     }
 
-    /// An event the tracker applies after input written since, but which the
-    /// producer stamped before it, came first.
+    /// What an event's producer stamped on it plays no part in reading the
+    /// prompt: a prompt that opens again with a stamp behind the ones before
+    /// it is open for the input applied after it.
     #[test]
-    fn a_prompt_applied_late_counts_from_when_it_was_stamped() {
+    fn a_producer_stamp_does_not_place_a_prompt() {
         let mut tracker = RunTracker::new();
         tracker.begin_run(start("p1"), 0);
         tracker.observe_event(&event("p1", EventType::SessionStart), 1);
-        let mut prompt = event("p1", EventType::PermissionRequest);
-        prompt.timestamp = chrono::DateTime::from_timestamp_nanos(2);
-        tracker.observe_event(&prompt, 10);
-        tracker.observe_human_input("p1", 5, InterventionKind::Text);
+        for (event_type, stamped, applied) in [
+            (EventType::PermissionRequest, 100, 100),
+            (EventType::Thinking, 101, 101),
+            (EventType::PermissionRequest, 99, 110),
+        ] {
+            let mut e = event("p1", event_type);
+            e.timestamp = chrono::DateTime::from_timestamp_nanos(stamped);
+            tracker.observe_event(&e, applied);
+        }
+        tracker.observe_human_input("p1", 103, InterventionKind::Text);
         assert_eq!(
-            kinds_at_end(&mut tracker, "p1", 20),
+            kinds_at_end(&mut tracker, "p1", 120),
             (vec!["answer".to_string()], 1)
         );
     }
 
-    /// A status stamped before the last prompt change kept — delivered out
-    /// of order, or from a producer clock that fell behind — is placed when
-    /// the tracker applies it, not before that change: input written while
-    /// the prompt was open, and taken only after, is still an answer.
+    /// Input handed over with a time before the run's last input counts at
+    /// that last time, in the burst it joins: the last input never moves
+    /// backward, so later input is measured from it.
     #[test]
-    fn a_status_stamped_before_the_last_change_does_not_erase_the_prompt() {
-        for (case, close_stamp) in [
-            // Delivered after the prompt, though stamped just before it.
-            ("out of order", 99),
-            // The producer's clock fell well behind between the two.
-            ("lagging clock", 40),
-        ] {
-            let mut tracker = RunTracker::new();
-            tracker.begin_run(start("p1"), 0);
-            tracker.observe_event(&event("p1", EventType::SessionStart), 1);
-            let mut prompt = event("p1", EventType::PermissionRequest);
-            prompt.timestamp = chrono::DateTime::from_timestamp_nanos(100);
-            tracker.observe_event(&prompt, 100);
-            // Written at 101; the ingest task has not taken it yet.
-            let mut thinking = event("p1", EventType::Thinking);
-            thinking.timestamp = chrono::DateTime::from_timestamp_nanos(close_stamp);
-            tracker.observe_event(&thinking, 102);
-            let run = &tracker.runs["p1"];
-            assert_eq!(
-                run.prompt_changes,
-                VecDeque::from([(100, true), (102, false)]),
-                "{case}"
-            );
-            tracker.observe_human_input("p1", 101, InterventionKind::Text);
-            assert_eq!(
-                kinds_at_end(&mut tracker, "p1", 110),
-                (vec!["answer".to_string()], 1),
-                "{case}"
-            );
-        }
-    }
-
-    /// The changes kept are bounded; input older than every one kept is
-    /// read against the oldest state kept.
-    #[test]
-    fn the_prompt_changes_kept_are_bounded() {
+    fn the_last_input_never_moves_backward() {
+        let second = 1_000_000_000;
         let mut tracker = RunTracker::new();
         tracker.begin_run(start("p1"), 0);
-        tracker.observe_event(&event("p1", EventType::SessionStart), 1);
-        let flips = MAX_PROMPT_CHANGES as u64 + 3;
-        for i in 0..flips {
-            let kind = if i % 2 == 0 {
-                EventType::PermissionRequest
-            } else {
-                EventType::Thinking
-            };
-            tracker.observe_event(&event("p1", kind), 10 + i);
-        }
-        let run = &tracker.runs["p1"];
-        assert_eq!(run.prompt_changes.len(), MAX_PROMPT_CHANGES);
-        // Three flips fell out, the last of them a prompt opening.
-        assert!(run.prompt_before);
-        assert!(run.prompt_open_at(0));
-        assert!(run.prompt_open_at(10 + flips - 1));
-        assert!(!run.prompt_open_at(10 + flips - 2));
+        tracker.observe_human_input("p1", 11 * second, InterventionKind::Navigate);
+        tracker.observe_human_input("p1", second, InterventionKind::Text);
+        assert_eq!(tracker.runs["p1"].last_human_input, Some(11 * second));
+        tracker.observe_human_input("p1", 12 * second, InterventionKind::Navigate);
+        tracker.end_run("p1", EndReason::Closed, None, 20 * second);
+        let spans = tracker.take_finished();
+        let run = run_span_of(&spans);
+        let interventions: Vec<_> = run
+            .events
+            .iter()
+            .filter(|e| e.name == EVENT_INTERVENTION)
+            .map(|e| (e.time_unix_nanos, e.attributes[0].value.clone()))
+            .collect();
+        assert_eq!(
+            interventions,
+            vec![(11 * second, AttrValue::Str("text".into()))]
+        );
+    }
+
+    /// The deck's answer counts from when the daemon stamped its event, which
+    /// is when it accepted the answer, not from when the tracker applies it.
+    #[test]
+    fn a_deck_answer_counts_from_its_stamp() {
+        let second = 1_000_000_000;
+        let mut answered = event("p1", EventType::Thinking);
+        answered.metadata.insert(
+            crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY.into(),
+            crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_VALUE.into(),
+        );
+        answered.timestamp = chrono::DateTime::from_timestamp_nanos(11 * second as i64);
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.observe_human_input("p1", second, InterventionKind::Text);
+        tracker.observe_event(&answered, 15 * second);
+        tracker.observe_human_input("p1", 12 * second, InterventionKind::Text);
+        tracker.end_run("p1", EndReason::Closed, None, 20 * second);
+        let spans = tracker.take_finished();
+        let run = run_span_of(&spans);
+        let interventions: Vec<_> = run
+            .events
+            .iter()
+            .filter(|e| e.name == EVENT_INTERVENTION)
+            .map(|e| (e.time_unix_nanos, e.attributes[0].value.clone()))
+            .collect();
+        assert_eq!(
+            interventions,
+            vec![
+                (second, AttrValue::Str("text".into())),
+                (11 * second, AttrValue::Str("answer".into())),
+            ]
+        );
     }
 
     /// The deck's own "answered" event is an answer: a held question's answer

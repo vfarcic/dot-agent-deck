@@ -23,6 +23,12 @@
 //! - human input waits with the run it was typed into, not only on the queue:
 //!   the command is a reminder to count it, and a run ended first — by its
 //!   pane's close broadcast, say — counts it as it ends;
+//! - human input is counted in the order the deck accepted it against the
+//!   events: each write notes how far the daemon's broadcast had got when the
+//!   pane accepted it ([`BroadcastClock`]), and the task counts it before the
+//!   first event broadcast after that once the tracker has opened its run, so
+//!   it is read against the prompt the cards showed when it was written
+//!   rather than when the task takes it;
 //! - a run whose spawn is refused is forgotten when its [`PreparedRun`] is
 //!   dropped uncommitted.
 //!
@@ -413,32 +419,120 @@ struct PaneInput {
     ended: bool,
     filter: InputFilter,
     /// When the lone `ESC` the filter holds arrived — monotonic, for the
-    /// window, and wall-clock, for the intervention it may become.
-    escape: Option<(std::time::Instant, u64)>,
+    /// window, and wall-clock and on the broadcast, for the intervention it
+    /// may become.
+    escape: Option<(std::time::Instant, u64, u64)>,
     /// When the last write that left the filter inside a bracketed paste
     /// arrived, monotonic: the paste is read as ended once
     /// [`PASTE_IDLE_WINDOW`] passes with no write after it.
     paste: Option<std::time::Instant>,
-    /// When the human input the filter accepted and the tracker has not
-    /// counted yet was written, and what it was, oldest first. Taken, once,
-    /// by whichever comes first: the [`Command::HumanInput`] sent with the
+    /// The human input the filter accepted and the tracker has not counted
+    /// yet, oldest first. Taken, once, by whichever comes first: the first
+    /// event broadcast after it, the [`Command::HumanInput`] sent with the
     /// first of them, or the run ending.
-    pending: Vec<(u64, InterventionKind)>,
+    pending: Vec<Written>,
+}
+
+/// Human input a run's filter accepted.
+#[derive(Clone, Copy, Debug)]
+struct Written {
+    /// When, on the wall clock.
+    at: u64,
+    kind: InterventionKind,
+    /// How many messages the daemon had broadcast when the pane accepted it
+    /// ([`BroadcastClock::position`]): it came before every message from that
+    /// one on.
+    position: u64,
 }
 
 impl PaneInput {
     /// Everything this run's input still owes the tracker, oldest first:
     /// what is pending, then a held lone `ESC` when `settle` says it is the
     /// Escape key now.
-    fn take_held(&mut self, settle: bool) -> Vec<(u64, InterventionKind)> {
+    fn take_held(&mut self, settle: bool) -> Vec<Written> {
         let mut held = std::mem::take(&mut self.pending);
         if settle
-            && let Some((_, written)) = self.escape.take()
+            && let Some((_, at, position)) = self.escape.take()
             && self.filter.settle_lone_escape()
         {
-            held.push((written, InterventionKind::Interrupt));
+            held.push(Written {
+                at,
+                kind: InterventionKind::Interrupt,
+                position,
+            });
         }
         held
+    }
+
+    /// The pending input written before the daemon broadcast its message
+    /// `position`, oldest first, and the position of the last that stays.
+    fn take_through(&mut self, position: u64) -> (Vec<Written>, Option<u64>) {
+        let due = self.pending.partition_point(|w| w.position <= position);
+        let taken = self.pending.drain(..due).collect();
+        (taken, self.pending.last().map(|w| w.position))
+    }
+}
+
+/// How far the daemon's broadcast has got: the number of messages it has
+/// sent since the ingest task's receiver was made, which numbers each message
+/// that receiver reads. Read where a pane accepts human input, so the ingest
+/// task can count that input between the events broadcast before it and the
+/// ones after, on the order the daemon published them in.
+///
+/// It is a receiver of its own that reads nothing until it falls
+/// [`CLOCK_CATCH_UP_AT`] behind: the broadcast does not number its messages,
+/// but a receiver knows how many it has not read.
+#[derive(Default)]
+struct BroadcastClock {
+    rx: Option<broadcast::Receiver<BroadcastMsg>>,
+    /// Messages sent before `rx`'s next one.
+    base: u64,
+}
+
+/// Messages [`BroadcastClock`] lets the broadcast get ahead of it before it
+/// reads them, which bounds the messages it keeps alive.
+const CLOCK_CATCH_UP_AT: usize = 256;
+
+impl BroadcastClock {
+    /// A clock numbering messages from `events`' next one, which has read
+    /// nothing yet.
+    fn numbering(events: &broadcast::Receiver<BroadcastMsg>) -> Self {
+        loop {
+            let sent = events.len();
+            let rx = events.resubscribe();
+            // Nothing was sent in between, so `rx` starts where `sent` ends.
+            if events.len() == sent {
+                return Self {
+                    rx: Some(rx),
+                    base: sent as u64,
+                };
+            }
+        }
+    }
+
+    fn position(&self) -> u64 {
+        self.base + self.rx.as_ref().map_or(0, |rx| rx.len() as u64)
+    }
+
+    /// Read what the clock is behind by, once that is [`CLOCK_CATCH_UP_AT`]
+    /// or more, so it does not hold the messages up.
+    fn catch_up(&mut self) {
+        let Some(rx) = &mut self.rx else {
+            return;
+        };
+        let mut left = rx.len();
+        if left < CLOCK_CATCH_UP_AT {
+            return;
+        }
+        while left > 0 {
+            let read = match rx.try_recv() {
+                Ok(_) => 1,
+                Err(broadcast::error::TryRecvError::Lagged(missed)) => missed,
+                Err(_) => break,
+            };
+            self.base += read;
+            left = left.saturating_sub(usize::try_from(read).unwrap_or(usize::MAX));
+        }
     }
 }
 
@@ -464,7 +558,11 @@ fn retire_input(filters: &Filters, pane_id: &str, run_id: &str) -> Vec<(u64, Int
     if inputs.is_empty() {
         filters.remove(pane_id);
     }
-    input.take_held(true)
+    input
+        .take_held(true)
+        .into_iter()
+        .map(|w| (w.at, w.kind))
+        .collect()
 }
 
 /// What the spawn path, the reader threads and the ingest task share.
@@ -477,6 +575,9 @@ struct Shared {
     /// lone `ESC` is counted however the run ends. Locked after the tracker,
     /// never before it.
     filters: Arc<Filters>,
+    /// Where the broadcast stands, for input to note as it is written. Locked
+    /// after the filters, never before them.
+    clock: Mutex<BroadcastClock>,
     /// Wakes the ingest task to time a lone `ESC` that a write left held.
     escape_held: tokio::sync::Notify,
     /// Turned true as shutdown begins: an export in flight gives way to the
@@ -908,14 +1009,21 @@ impl Telemetry {
             else {
                 return;
             };
+            // Read under the filters' lock, so the run's input is noted in
+            // the order of the broadcast.
+            let position = shared.lock_clock().position();
             // A lone ESC whose window has passed was the Escape key, whatever
             // follows it now.
-            if let Some((since, written)) = input.escape
+            if let Some((since, written, position)) = input.escape
                 && at.saturating_duration_since(since) >= LONE_ESCAPE_WINDOW
             {
                 input.escape = None;
                 if input.filter.settle_lone_escape() {
-                    human.push((written, InterventionKind::Interrupt));
+                    human.push(Written {
+                        at: written,
+                        kind: InterventionKind::Interrupt,
+                        position,
+                    });
                 }
             }
             // A paste with no input for its window lost its end marker.
@@ -926,7 +1034,11 @@ impl Telemetry {
                 input.filter.end_paste();
             }
             if let Some(kind) = input.filter.classify(bytes) {
-                human.push((now, kind));
+                human.push(Written {
+                    at: now,
+                    kind,
+                    position,
+                });
             }
             if !input.filter.in_paste() {
                 input.paste = None;
@@ -937,7 +1049,7 @@ impl Telemetry {
             if !input.filter.holds_lone_escape() {
                 input.escape = None;
             } else if !bytes.is_empty() {
-                input.escape = Some((at, now));
+                input.escape = Some((at, now, position));
                 held = true;
             }
             // The input waits with its run; the first of it since the tracker
@@ -1001,6 +1113,7 @@ impl Telemetry {
     /// happens when not exporting, so an off deck spawns nothing.
     pub fn subscribe(&self, rx: broadcast::Receiver<BroadcastMsg>) {
         if let Some(exporting) = &self.exporting {
+            *exporting.shared.lock_clock() = BroadcastClock::numbering(&rx);
             let _ = exporting.commands.send(Command::Subscribe(rx));
         }
     }
@@ -1244,26 +1357,73 @@ impl Shared {
         lock_filters(&self.filters)
     }
 
+    fn lock_clock(&self) -> std::sync::MutexGuard<'_, BroadcastClock> {
+        self.clock.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Count the human input waiting with `run_id` on `pane_id`, if the run
-    /// has not ended and taken it already.
-    fn take_input(&self, pane_id: &str, run_id: &str) {
+    /// has not ended and taken it already: what was written before broadcast
+    /// message `through`, or all of it with `None`. Returns the broadcast
+    /// position the last input left waiting was written at.
+    fn take_input(&self, pane_id: &str, run_id: &str, through: Option<u64>) -> Option<u64> {
+        let mut left = None;
         self.with_tracker(|t| {
             let held = self
                 .lock_filters()
                 .get_mut(pane_id)
                 .and_then(|inputs| inputs.iter_mut().find(|input| input.run_id == run_id))
-                .map(|input| input.take_held(false))
-                .unwrap_or_default();
-            for (written, kind) in held {
-                t.observe_run_input(pane_id, run_id, written, kind);
+                .map(|input| match through {
+                    Some(position) => input.take_through(position),
+                    None => (input.take_held(false), None),
+                });
+            let Some((held, rest)) = held else {
+                return;
+            };
+            left = rest;
+            for w in held {
+                t.observe_run_input(pane_id, run_id, w.at, w.kind);
             }
         });
+        left
+    }
+
+    /// Count the input written before broadcast message `position` on
+    /// `pane_id`, or on every pane with `None`, into each run the tracker
+    /// takes input for, so it is read before that message is applied.
+    fn take_input_before(&self, t: &mut RunTracker, pane_id: Option<&str>, position: u64) {
+        let mut due = Vec::new();
+        {
+            let mut filters = self.lock_filters();
+            for (pane, inputs) in filters.iter_mut() {
+                if pane_id.is_some_and(|p| p != pane) {
+                    continue;
+                }
+                for input in inputs.iter_mut() {
+                    if input
+                        .pending
+                        .first()
+                        .is_some_and(|w| w.position <= position)
+                        && t.takes_input(pane, &input.run_id)
+                    {
+                        let (taken, _) = input.take_through(position);
+                        due.push((pane.clone(), input.run_id.clone(), taken));
+                    }
+                }
+            }
+        }
+        for (pane, run_id, taken) in due {
+            for w in taken {
+                t.observe_run_input(&pane, &run_id, w.at, w.kind);
+            }
+        }
     }
 
     /// Count every held lone `ESC` whose window has passed by `at` as human
     /// input at the time it was written, straight into its run, after any
     /// input still waiting with that run. Returns when the next one still
-    /// held is due.
+    /// held is due. One written after broadcast message `read`, the first the
+    /// ingest task has not applied, is due now and left for the next call, so
+    /// it is counted after the events broadcast before it.
     ///
     /// Any write after the ESC settles it on the writer's side instead. The
     /// tracker stays locked throughout, so no run ends between a filter
@@ -1275,22 +1435,24 @@ impl Shared {
     /// Commit wakes the task again, because the wake the write sent can be
     /// taken by the task before the Commit is — `biased` orders the branches
     /// it polls, not a command's arrival against a wake.
-    fn settle_escapes(&self, at: std::time::Instant) -> Option<std::time::Instant> {
+    fn settle_escapes(&self, at: std::time::Instant, read: u64) -> Option<std::time::Instant> {
         let mut next_due: Option<std::time::Instant> = None;
         self.with_tracker(|t| {
             let mut filters = self.lock_filters();
             for (pane_id, inputs) in filters.iter_mut() {
                 for input in inputs.iter_mut() {
-                    let Some((since, _)) = input.escape else {
+                    let Some((since, _, position)) = input.escape else {
                         continue;
                     };
                     if t.run_id(pane_id) != Some(input.run_id.as_str()) {
                         continue;
                     }
                     let due = since + LONE_ESCAPE_WINDOW;
-                    if at >= due {
-                        for (written, kind) in input.take_held(true) {
-                            t.observe_run_input(pane_id, &input.run_id, written, kind);
+                    if at >= due && position > read {
+                        next_due = Some(at);
+                    } else if at >= due {
+                        for w in input.take_held(true) {
+                            t.observe_run_input(pane_id, &input.run_id, w.at, w.kind);
                         }
                     } else {
                         next_due = Some(next_due.map_or(due, |d| d.min(due)));
@@ -1314,10 +1476,17 @@ impl Shared {
         }
     }
 
-    fn observe(&self, msg: &BroadcastMsg) {
+    /// Apply broadcast message `position`, after the input written before
+    /// the daemon broadcast it.
+    fn observe(&self, msg: &BroadcastMsg, position: u64) {
         if let BroadcastMsg::Event(event) = msg {
-            self.with_tracker(|t| t.observe_event(event, now_unix_nanos()));
+            self.with_tracker(|t| {
+                // An event naming no pane can be applied to any.
+                self.take_input_before(t, event.pane_id.as_deref(), position);
+                t.observe_event(event, now_unix_nanos());
+            });
         }
+        self.lock_clock().catch_up();
     }
 
     fn enqueue(&self, spans: Vec<SpanRecord>) {
@@ -1363,6 +1532,7 @@ fn start_exporting(
         queue,
         dropped: Mutex::new(RateLimitedLog::new(ERROR_LOG_INTERVAL)),
         filters,
+        clock: Mutex::default(),
         escape_held: tokio::sync::Notify::new(),
         stopping,
         runtime: tokio::runtime::Handle::current(),
@@ -1388,10 +1558,14 @@ fn start_exporting(
 const DRAIN_YIELD_EVERY: usize = 256;
 
 /// The ingest task: apply broadcast events as they come, each command after
-/// every event broadcast before it, and a held lone `ESC` as the Escape key
+/// every event broadcast before it, human input between the events broadcast
+/// before and after it was written, and a held lone `ESC` as the Escape key
 /// once its window has passed.
 async fn run_ingest(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiver<Command>) {
     let mut events: Option<broadcast::Receiver<BroadcastMsg>> = None;
+    // The broadcast messages `events` has passed, read or missed: the number
+    // of the next one, as [`BroadcastClock`] counts.
+    let mut read: u64 = 0;
     let mut escape_due: Option<std::time::Instant> = None;
     let mut usage_poll = tokio::time::interval(USAGE_POLL_INTERVAL);
     usage_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1403,9 +1577,14 @@ async fn run_ingest(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiver<C
                 let Some(command) = command else { break };
                 if let Command::Subscribe(rx) = command {
                     events = Some(rx);
+                    read = 0;
                     continue;
                 }
-                drain(&shared, &mut events).await;
+                drain(&shared, &mut events, &mut read).await;
+                if let Command::HumanInput { pane_id, run_id } = &command {
+                    take_input(&shared, &mut events, &mut read, pane_id, run_id).await;
+                    continue;
+                }
                 if !apply(&shared, command) {
                     break;
                 }
@@ -1416,16 +1595,22 @@ async fn run_ingest(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiver<C
                     let _ = entered.send(());
                     let _ = resume.recv();
                 }
-                escape_due = shared.settle_escapes(std::time::Instant::now());
+                drain(&shared, &mut events, &mut read).await;
+                escape_due = shared.settle_escapes(std::time::Instant::now(), read);
             }
             () = sleep_until(escape_due) => {
-                escape_due = shared.settle_escapes(std::time::Instant::now());
+                drain(&shared, &mut events, &mut read).await;
+                escape_due = shared.settle_escapes(std::time::Instant::now(), read);
             }
             _ = usage_poll.tick() => shared.poll_usage(&usage_polling),
             msg = next_event(&mut events) => match msg {
-                Ok(msg) => shared.observe(&msg),
+                Ok(msg) => {
+                    shared.observe(&msg, read);
+                    read += 1;
+                }
                 Err(broadcast::error::RecvError::Lagged(missed)) => {
                     tracing::debug!(missed, "telemetry: broadcast subscriber lagged");
+                    read += missed;
                 }
                 Err(broadcast::error::RecvError::Closed) => events = None,
             },
@@ -1481,23 +1666,38 @@ async fn next_event(
 /// starts, not the ones published while it runs, so a producer that never
 /// stops cannot hold a command back. Yields to the runtime every
 /// [`DRAIN_YIELD_EVERY`] events.
-async fn drain(shared: &Shared, events: &mut Option<broadcast::Receiver<BroadcastMsg>>) {
+async fn drain(
+    shared: &Shared,
+    events: &mut Option<broadcast::Receiver<BroadcastMsg>>,
+    read: &mut u64,
+) {
+    // The messages between this receiver and the sender's tail right now.
+    let waiting = events.as_ref().map_or(0, |rx| rx.len() as u64);
+    drain_to(shared, events, read, *read + waiting).await;
+}
+
+/// Apply the broadcast up to, not including, message `to`, or as far as it
+/// has been sent. Yields to the runtime every [`DRAIN_YIELD_EVERY`] events.
+async fn drain_to(
+    shared: &Shared,
+    events: &mut Option<broadcast::Receiver<BroadcastMsg>>,
+    read: &mut u64,
+    to: u64,
+) {
     let Some(rx) = events else {
         return;
     };
-    // The messages between this receiver and the sender's tail right now.
-    let mut left = rx.len();
     let mut since_yield = 0usize;
-    while left > 0 {
+    while *read < to {
         match rx.try_recv() {
             Ok(msg) => {
-                left -= 1;
-                shared.observe(&msg);
+                shared.observe(&msg, *read);
+                *read += 1;
             }
             // The receiver skipped `missed` of them, which it will not see.
             Err(broadcast::error::TryRecvError::Lagged(missed)) => {
                 tracing::debug!(missed, "telemetry: broadcast subscriber lagged");
-                left = left.saturating_sub(usize::try_from(missed).unwrap_or(usize::MAX));
+                *read += missed;
             }
             Err(_) => break,
         }
@@ -1505,6 +1705,26 @@ async fn drain(shared: &Shared, events: &mut Option<broadcast::Receiver<Broadcas
         if since_yield >= DRAIN_YIELD_EVERY {
             since_yield = 0;
             tokio::task::yield_now().await;
+        }
+    }
+}
+
+/// Count the human input waiting with `run_id` on `pane_id`, each after the
+/// events broadcast before it was written: input written since the drain
+/// before this began waits for the broadcast to be applied up to it. Input
+/// the broadcast cannot be applied up to — it closed — is counted as it is.
+async fn take_input(
+    shared: &Shared,
+    events: &mut Option<broadcast::Receiver<BroadcastMsg>>,
+    read: &mut u64,
+    pane_id: &str,
+    run_id: &str,
+) {
+    while let Some(written) = shared.take_input(pane_id, run_id, Some(*read)) {
+        drain_to(shared, events, read, written).await;
+        if *read < written {
+            shared.take_input(pane_id, run_id, None);
+            break;
         }
     }
 }
@@ -1534,7 +1754,8 @@ fn apply(shared: &Arc<Shared>, command: Command) -> bool {
                 shared.forget_ended_input(&pane_id, &run_id);
             }
         }
-        Command::HumanInput { pane_id, run_id } => shared.take_input(&pane_id, &run_id),
+        // Counted by `run_ingest`, in order with the broadcast.
+        Command::HumanInput { .. } => {}
         #[cfg(test)]
         Command::Barrier(ack) => {
             // Once the runs ended before it are completed too.
@@ -3314,6 +3535,121 @@ mod tests {
                 "{gap:?}"
             );
         }
+    }
+
+    /// The intervention events on `spans`' run span: when, and of what kind.
+    fn timed_kinds(spans: &[SpanRecord]) -> Vec<(u64, AttrValue)> {
+        let run = spans.iter().find(|s| s.name == SPAN_AGENT_RUN).unwrap();
+        run.events
+            .iter()
+            .filter(|e| e.name == crate::telemetry::EVENT_INTERVENTION)
+            .map(|e| {
+                let kind = e
+                    .attributes
+                    .iter()
+                    .find(|a| a.key == AttrKey::InterventionKind);
+                (e.time_unix_nanos, kind.unwrap().value.clone())
+            })
+            .collect()
+    }
+
+    /// Holds the ingest task in its timer branch, by an Escape on `pane`,
+    /// until the returned sender is sent to; returns once it is held.
+    async fn hold_ingest(telemetry: &Telemetry, pane: &str) -> std::sync::mpsc::Sender<()> {
+        let shared = &telemetry.exporting.as_ref().unwrap().shared;
+        let (entered, picked) = oneshot::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        *shared.timer_gate.lock().unwrap() = Some((entered, paused));
+        telemetry.observe_client_input(pane, b"\x1b");
+        picked.await.unwrap();
+        resume
+    }
+
+    /// A prompt opens, closes, and opens again with a producer stamp behind
+    /// both; the person types after it is broadcast, and the ingest task
+    /// applies it in the same pass as the keystroke. The keystroke came after
+    /// the prompt opened, on the order the deck accepted them in, so it is an
+    /// answer, whatever the producer stamped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_prompt_reopened_with_an_older_stamp_is_open_for_input_after_it() {
+        let stamped = |event_type, seconds_ago: i64| {
+            let mut msg = of("p1", "a1", event_type);
+            if let BroadcastMsg::Event(e) = &mut msg {
+                e.timestamp = chrono::Utc::now() - chrono::Duration::seconds(seconds_ago);
+            }
+            msg
+        };
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("p0", "other"), &[]);
+        begin(&telemetry, generation("p1", "a1"), &[]);
+        tx.send(stamped(EventType::SessionStart, 0)).unwrap();
+        tx.send(stamped(EventType::PermissionRequest, 0)).unwrap();
+        tx.send(stamped(EventType::Thinking, 0)).unwrap();
+        telemetry.settled().await;
+
+        let resume = hold_ingest(&telemetry, "p0").await;
+        tx.send(stamped(EventType::PermissionRequest, 60)).unwrap();
+        telemetry.observe_client_input("p1", b"y");
+        resume.send(()).unwrap();
+
+        telemetry.settled().await;
+        telemetry.end_run("p1", Some("a1"), EndReason::Exited, None);
+        telemetry.settled().await;
+        assert_eq!(
+            intervention_kinds(&captured(&mut rx)),
+            vec![AttrValue::Str("answer".into())]
+        );
+    }
+
+    /// Text written at 1 s is still waiting when the deck's answer, accepted
+    /// at 11 s, is applied in the same pass: the text counts first, at 1 s,
+    /// and the answer at 11 s, as two interventions. Input at 12 s joins the
+    /// answer's burst rather than starting one, since the last input never
+    /// moves back to 1 s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn input_waiting_when_a_deck_answer_is_applied_counts_before_it() {
+        let second = 1_000_000_000;
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("p0", "other"), &[]);
+        begin(&telemetry, generation("p1", "a1"), &[]);
+        tx.send(of("p1", "a1", EventType::SessionStart)).unwrap();
+        telemetry.settled().await;
+        let zero = now_unix_nanos() - 20 * second;
+
+        let resume = hold_ingest(&telemetry, "p0").await;
+        telemetry.observe_client_input_at("p1", b"x", zero + second, std::time::Instant::now());
+        let mut answered = of("p1", "a1", EventType::Thinking);
+        if let BroadcastMsg::Event(e) = &mut answered {
+            e.metadata.insert(
+                crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY.into(),
+                crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_VALUE.into(),
+            );
+            e.timestamp = chrono::DateTime::from_timestamp_nanos((zero + 11 * second) as i64);
+        }
+        tx.send(answered).unwrap();
+        resume.send(()).unwrap();
+        telemetry.settled().await;
+        telemetry.observe_client_input_at(
+            "p1",
+            b"z",
+            zero + 12 * second,
+            std::time::Instant::now(),
+        );
+
+        telemetry.settled().await;
+        telemetry.end_run("p1", Some("a1"), EndReason::Exited, None);
+        telemetry.settled().await;
+        assert_eq!(
+            timed_kinds(&captured(&mut rx)),
+            vec![
+                (zero + second, AttrValue::Str("text".into())),
+                (zero + 11 * second, AttrValue::Str("answer".into())),
+            ]
+        );
     }
 
     /// Threads 4 / 10: a run's end is stamped when the ingest task applies
