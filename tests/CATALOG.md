@@ -13162,3 +13162,37 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 - **Asserts:** one more call than the cap exports the oldest call before run end with `deck.operation.end=cap`; its late end leaves the remaining calls for run-end closure.
 - **Does not assert:** sustained overload or real parallel agent calls.
 - **Platform coverage:** mac+linux.
+
+## Test Case Catalog — Telemetry identity
+
+##### telemetry/otlp/024 — Child spans and deck events carry their run's agent and orchestration identity.
+
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_span_identity.rs`).
+- **Agent:** declared Pi shell/cat stand-in; synthetic hooks, offline usage reply and fake gh rollups.
+- **Asserts:** agent.operation, agent.status, agent.ci and deck.status_change, deck.intervention, deck.ci.change, deck.model_usage exist and carry the run's deck.agent, deck.role and deck.orchestration.id.
+- **Does not assert:** real-agent hook production, provider telemetry or unscoped affected_checks spans.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/025 — Two runs observing one PR export its CI history once.
+
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_span_identity.rs`).
+- **Agent:** two shell/cat stand-ins in one worktree with offline gh rollups.
+- **Asserts:** both runs observe pending → failing → pending → passing and retain two observed rounds and one failure each; the receiver gets two CI intervals and four change events in total.
+- **Does not assert:** deduplication across daemons, different repositories with the same PR number or ownership handoff while checks are pending.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/026 — Unknown launchers learn agent identity from hooks while declared identity stays authoritative.
+
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_span_identity.rs`).
+- **Agent:** unknown shell/cat launchers and a declared Pi stand-in with synthetic Claude hooks.
+- **Asserts:** hook-learned Claude run identity and source=hook, declared Pi identity and source=spawn despite conflicting hooks, resolved identities on post-hook operation/thinking/working spans, and deck.agent=none with source absent for a silent unknown run.
+- **Does not assert:** real-agent detection or retrospective relabelling of child spans exported before identifying hooks.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/027 — A dispatched run exports its registry unit name without exporting its branch.
+
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_span_identity.rs`).
+- **Agent:** declared Pi shell/cat caller and dispatched single unit.
+- **Asserts:** the real dispatch CLI starts a unit in its worktree; the completed run carries deck.dispatch.name equal to the requested unit and exported spans exclude its branch name.
+- **Does not assert:** dispatched orchestration workers, registry recovery after daemon restart or full branch/content privacy (telemetry/otlp/004).
+- **Platform coverage:** mac+linux.
