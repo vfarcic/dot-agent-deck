@@ -257,8 +257,9 @@ pub(super) fn output_notes(token: &Token<'_>, modes: &[u32], out: &mut Vec<Outpu
 
 /// Whether a CSI is [`OutputNote::SyncBegin`]'s exact spelling, the bytes
 /// `ESC [ ? 2026 h` with nothing between them, outside a paste. It needs no
-/// guard from its caller.
-fn sync_begin(token: &Token<'_>, csi: &Csi<'_>) -> bool {
+/// guard from its caller. The segments' E1F and EC read it as it is
+/// (`super::segments::return_marker`).
+pub(super) fn sync_begin(token: &Token<'_>, csi: &Csi<'_>) -> bool {
     csi.private == Some(b'?')
         && csi.params == b"2026"
         && csi.intermediates.is_empty()

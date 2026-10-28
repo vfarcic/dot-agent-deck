@@ -738,6 +738,11 @@ impl Records {
         self.records.iter().find(|r| r.key == key).copied()
     }
 
+    /// The records, in the order they were made.
+    pub fn iter(&self) -> impl Iterator<Item = &Record> {
+        self.records.iter()
+    }
+
     pub fn len(&self) -> usize {
         self.records.len()
     }
