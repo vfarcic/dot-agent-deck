@@ -18,7 +18,7 @@
     "test:watch": "vitest",
     "test:browser": "playwright test",
     "test:browser:types": "tsc -p tsconfig.e2e.json",
-    "test:driver": "mkdir -p junit && node --test --test-concurrency=1 --test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination=junit/driver.xml \"driver/**/*.test.ts\"",
+    "test:driver": "mkdir -p junit && node --test --test-concurrency=1 --test-reporter=spec --test-reporter-destination=stdout --test-reporter=./scripts/junit-reporter.mjs --test-reporter-destination=junit/driver.xml \"driver/**/*.test.ts\"",
     "test:driver:types": "tsc -p tsconfig.driver.json",
     "tauri": "tauri"
   },

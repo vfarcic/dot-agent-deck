@@ -328,12 +328,13 @@ tasks:
       pnpm test
       pnpm build
       ! grep -rl __dadDriver dist/
+    # No `options`, here or on the two desktop tasks below: naming the Vitest
+    # or Playwright framework makes Captain read the file with that framework's
+    # JSON parser, which finds no tests in a JUnit XML file. Without it Captain
+    # infers the JUnit parser from the file.
     outputs:
       test-results:
         - path: desktop/junit/vitest.xml
-          options:
-            language: JavaScript
-            framework: Vitest
 
   # desktop/: the Playwright suite in Chromium and WebKit (`desktop-browser`).
   - key: desktop-browser
@@ -352,9 +353,6 @@ tasks:
     outputs:
       test-results:
         - path: desktop/junit/playwright.xml
-          options:
-            language: JavaScript
-            framework: Playwright
 
   # The desktop app driven through WebKitWebDriver under Xvfb
   # (`desktop-driver`).
@@ -388,7 +386,9 @@ tasks:
       DAD_DRIVER_NATIVE_DRIVER=/usr/bin/WebKitWebDriver \
         xvfb-run -a -s "-screen 0 1920x1080x24 -dpi 96" pnpm test:driver
     # No `options`: Captain names no framework for node:test, so it infers the
-    # parser from the JUnit file.
+    # parser from the JUnit file. That parser ignores a case outside a
+    # `<testsuite>`, which is why `test:driver` writes this file through
+    # desktop/scripts/junit-reporter.mjs rather than node's own junit reporter.
     outputs:
       test-results:
         - path: desktop/junit/driver.xml
