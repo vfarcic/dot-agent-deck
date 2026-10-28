@@ -9106,7 +9106,7 @@ The pure state model of a deck message's delivery attempts (`src/inbox_attempts.
 - **Layer:** L1 unit (src/inbox_attempts.rs).
 - **Agent:** none.
 - **Asserts:** the default possession TTL is 90 seconds (three 30-second keepalives); stale and replayed snapshots are dropped; an attempt above the watermark is held by issue grace, an omitted one at or below it is not; fresh snapshots that keep omitting an attempt end its grace at the TTL; a receiver paused past the TTL lapses its attempt into one marked repeat, and after recovery the first commit settles and revokes the repeat; a later snapshot with a lower watermark does not revive issue grace (the watermark is monotone at admission).
-- **Does not assert:** the watcher's keepalive timer or the snapshot wire.
+- **Does not assert:** the watcher's keepalive timer or the snapshot wire; the repeat's final check while the first attempt is still held, which is refused (inbox/attempts/038).
 - **Platform coverage:** mac+linux+windows.
 
 ##### inbox/attempts/006 — The watermark is a contiguous observed prefix.
@@ -9331,6 +9331,27 @@ The pure state model of a deck message's delivery attempts (`src/inbox_attempts.
 - **Agent:** none.
 - **Asserts:** after a settled record is dropped, a record created for the same id starts its assignment above the dropped one's, so the old `(a, e)`'s commit answers `Unknown` and leaves the new message attempting; its own attempt's commit settles it; any record created afterwards also starts above the dropped assignment (issue #1816).
 - **Does not assert:** the inbox accepting the reused id, which needs its dedup window and history to have let the old one go.
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/038 — An automatic repeat is refused while an earlier attempt is held.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** on an OpenCode TUI, an OpenCode server and a Pi receiver alike, an attempt still held when its receiver stalls past the TTL gets an automatic repeat, and once a fresh snapshot lists both the repeat's final check is refused `HeldEarlier` while the first is approved; the refusal leaves the repeat issued; the receiver's `NotHanded` for the repeat keeps the message attempting with no repeat scheduled; the first attempt's commit settles it with no revoke and no witness violation (#1940, PRD #1666 Q57).
+- **Does not assert:** the control line or the receiver's answer (inbox/boundary/076, inbox/opencode/057).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/039 — The guard does not hold back a lapse, a Retry or a stale report.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** the automatic repeat is approved when the receiver's snapshot omits the earlier attempt; when the snapshot listing it went stale before the check (the residual for a receiver that does not report possession with its check), while the same stale history with the earlier attempt reported at the check's instant is refused and with it omitted is approved; for a Retry the user chose on held-long; when the earlier attempt awaits its resume answer and only the retired incarnation's snapshot lists it; only the later of two automatic repeats is refused; another receiver listing an attempt that is not its own proves nothing, while the owner's own fresh snapshot refuses.
+- **Does not assert:** the engine applying a co-reported snapshot before the check (inbox/boundary/076).
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/attempts/040 — Refused repeats spend the budget and recover by commit or Retry.
+- **Layer:** L1 unit (src/inbox_attempts.rs).
+- **Agent:** none.
+- **Asserts:** two refused automatic repeats followed by the loss of the first attempt end `Uncertain(Lapsed)` with three attempts and both automatic repeats counted; a Retry is then issued and approved, and the first attempt's late commit settles the message and revokes the Retry. With an attempt cap of two, the loss ends `Uncertain(OutOfAttempts)`, Retry answers `RetryLimit`, and the late commit still settles. A receiver replaced between the refusal and its `NotHanded` has that report refused as a retired incarnation's, the repeat fenced on an `unknown` resume answer and the message attempting through the retained first attempt, whose commit settles it with no witness violation; one that dies with no successor has both attempts fenced, nothing settled, and the last automatic repeat goes to the next receiver, approved, and settles on its commit.
+- **Does not assert:** a real receiver's resume answers; the default cap of six attempts (the cap case uses a limit of two).
 - **Platform coverage:** mac+linux+windows.
 
 #### inbox/receipt
@@ -10958,6 +10979,13 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** a record kept while an attempt still holds evidence (inbox/attempts/036); the `uncertain_told` bound (`told_markers_stay_within_the_live_watches_over_many_tasks`, unannotated).
 - **Platform coverage:** mac+linux.
 
+##### inbox/boundary/076 — Possession reported with the final check is fresh at the check.
+- **Layer:** fast unit (`src/inbox_engine_tests.rs`), the hub's own entry points with a receipt stream over an in-memory duplex and a 100 ms keepalive.
+- **Agent:** none.
+- **Asserts:** on an OpenCode and on a Pi receiver alike, after the first hand-out was held and its snapshots stopped past the TTL so the deck handed out the automatic repeat: a `possess` holding both on the same control line as the repeat's `may` is answered `ok:false`, `held_earlier`; the same `possess` sent on its own line two TTLs before the `may` is answered `ok:true` (the residual for a receiver from before PRD #1666 Q57); a `possess` holding only the repeat on the `may`'s line is answered `ok:true`.
+- **Does not assert:** the generated receiver writing that line (inbox/opencode/057).
+- **Platform coverage:** mac+linux.
+
 ##### inbox/status/001 — Human daemon status shows each agent's pending inbox counts and wake path.
 - **Layer:** Unit (`tests/inbox_status.rs`), pure status projection and table rendering.
 - **Agent:** none.
@@ -12477,7 +12505,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), load-scaled two-second keepalive and six-second possession TTL
 - **Agent:** fake API withholding assistant-child events and pulsing the real plugin's keepalive callback every 100 ms, independently of the daemon TTL.
 - **Asserts:** a delivery without an assistant child stays fetched with one prompt despite a one-second plugin scheduling stall; a repeat or loss of fetched state is reported before judging fixture history. Snapshots containing its held attempt span a full possession TTL with no TTL-expiring gap, measured on a monotonic clock with signed arithmetic, and the matching assistant turn then acknowledges it.
-- **Does not assert:** real agent cancellation behaviour or suppression after a genuine possession lapse; inbox/attempts/005 pins the allowed marked repeat after expiry and settlement by the original attempt's commit.
+- **Does not assert:** real agent cancellation behaviour, or a stall past the possession TTL: inbox/opencode/057 pins that the automatic repeat it brings is refused while the plugin still holds the task, and inbox/opencode/058 that it is prompted once the plugin loses it.
 - **Cost:** none.
 
 ##### inbox/opencode/024 — A prompt queued behind a long turn is possessed, not repeated.
@@ -12714,6 +12742,20 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Asserts:** an approved callback is inside its OpenCode call when a revoke of its attempt arrives and is answered `already_handed`; OpenCode then refuses the call before accepting it (4xx), and nothing is reported `not_handed`; a revoke sent again is answered `already_handed`, never `revoked_ack`. The same holds for two more attempts whose session goes idle while the call is in flight (the idle handler's `inSession`/`lost` loop, driven directly), once after the revoke and once before it.
 - **Does not assert:** a real watcher process, the plugin's `session.idle` event wiring (the loop is called directly), the conservative bound past 4096 remembered answers, or the deck's handling of the attempt (inbox/attempts/018).
 - **Platform coverage:** mac+linux.
+- **Cost:** none.
+
+##### inbox/opencode/057 — A stalled plugin still holding a task is not prompted again.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), load-scaled 300 ms keepalive.
+- **Agent:** fake API around the generated TUI plugin, whose event loop it blocks for ten thirds of a keepalive, starting a third of one after a held snapshot.
+- **Asserts:** the deck hands out an automatic repeat during the stall while the watcher keeps its stream; the plugin's final check for it is answered `ok:false`, `held_earlier`; for the current plugin that check's control line carries a `possess` listing the first attempt, and for the receiver as installed before PRD #1666 Q57 (the generated plugin with its one `may` write restored) it carries none; no second prompt follows within two seconds, the task stays fetched, and the matching assistant turn acknowledges it with one prompt in all (#1940).
+- **Does not assert:** a check read more than a TTL after a separate snapshot (inbox/attempts/039, inbox/boundary/076); a real OpenCode; Pi's extension.
+- **Cost:** none.
+
+##### inbox/opencode/058 — A task lost after a refused repeat is prompted again, marked.
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), the stall of inbox/opencode/057.
+- **Agent:** fake API around the generated TUI plugin.
+- **Asserts:** after the automatic repeat was refused, the session going idle with the first attempt unanswered drops it from the plugin's snapshots; the deck then prompts the task a second time, marked as a possible repeat, and the matching assistant turn acknowledges it.
+- **Does not assert:** real cancellation behaviour; the budget once both automatic repeats are spent (inbox/attempts/040).
 - **Cost:** none.
 
 ##### inbox/opencode/007 — The server inbox arms only for main-thread mini launches.

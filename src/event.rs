@@ -3734,7 +3734,8 @@ pub struct InboxMayHandOver {
 pub struct InboxGrant {
     pub q: u64,
     pub ok: bool,
-    /// Why not (`committed`, `revoked`, `wrong_receiver`, `unknown`).
+    /// Why not (`committed`, `revoked`, `wrong_receiver`, `unknown`, and from
+    /// PRD #1666 Q57 `held_earlier`). The deck's receiver acts on `ok` alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal: Option<String>,
 }
@@ -4157,6 +4158,9 @@ pub struct InboxStreamControl {
     /// them ignores them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub possess: Option<InboxPossess>,
+    /// PRD #1666 Q57: the deck's receiver sends its `possess` on the same line, which
+    /// the daemon applies first, so the check is decided on what it held when
+    /// it asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub may: Option<InboxMayHandOver>,
     /// PRD #1666 §3: attempts the component handed to the agent, their

@@ -45,13 +45,14 @@ cp.spawn = (...args) => {
       stalledSnapshot = true;
       // Place a held snapshot between keepalives, then block the plugin's
       // event loop to reproduce a scheduling gap independently of its TTL.
+      // `snapshotStallDelayMs` sets where between two keepalives it lands.
       setTimeout(() => {
         log('stdin', {text: bytes.toString()});
         write(bytes, ...rest);
         const until = performance.now() + config.snapshotStallMs;
         while (performance.now() < until) {}
         log('stalled', {ms: config.snapshotStallMs});
-      }, 100);
+      }, config.snapshotStallDelayMs ?? 100);
       return true;
     }
     log('stdin', {text: bytes.toString()});

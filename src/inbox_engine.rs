@@ -1055,7 +1055,7 @@ pub(super) fn release(
         let approved = linked
             && generation
                 .model
-                .may_hand_over(&delivery.id, a, e, rx)
+                .may_hand_over(now, &delivery.id, a, e, rx)
                 .is_ok();
         if approved && *write == CapsWrite::Written {
             // The caps stay in the deck and the caps file: the waiter reads
@@ -1307,6 +1307,7 @@ fn refusal_code(refusal: HandOverRefusal) -> &'static str {
         HandOverRefusal::WrongReceiver => "wrong_receiver",
         HandOverRefusal::Committed => "committed",
         HandOverRefusal::Revoked => "revoked",
+        HandOverRefusal::HeldEarlier => "held_earlier",
     }
 }
 
@@ -1392,7 +1393,10 @@ pub(super) fn control(
         }
     }
     let grant = control.may.as_ref().map(|may| {
-        match generation.model.may_hand_over(&may.id, may.a, may.e, rx) {
+        match generation
+            .model
+            .may_hand_over(now, &may.id, may.a, may.e, rx)
+        {
             Ok(_) => InboxGrant {
                 q: may.q,
                 ok: true,
