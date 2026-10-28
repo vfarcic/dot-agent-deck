@@ -564,6 +564,7 @@ fn daemon_instance() -> Result<&'static Instance, SetupError> {
                 removed = swept.removed.len(),
                 kept = swept.kept,
                 scan_error = ?swept.scan_error,
+                unknown = swept.unknown,
                 "editor helper instance created"
             );
             Ok(instance)

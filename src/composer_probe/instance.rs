@@ -41,9 +41,11 @@
 //! [`liveness`]) **and** a scan of every process of this user, through its
 //! `/proc/<pid>/environ` and `/proc/<pid>/maps`, found none naming the
 //! directory, **and** every entry the scan reached was readable, its owner
-//! included. Anything less keeps it: a process of this user whose entries
-//! can't be read keeps every directory, so on a host with such a process
-//! nothing is removed ([`removable`]). Removal works beneath the directory
+//! included, **and** none of a live process read empty. Anything less keeps
+//! it: a process of this user whose entries can't be read keeps every
+//! directory, so on a host with such a process nothing is removed
+//! ([`removable`]), and so does one whose entry reads empty while it lives,
+//! as a process's `environ` does while its exec is under way (Q82). Removal works beneath the directory
 //! identified, through the descriptor it was identified by
 //! ([`remove_identified`]). Whether its name still leads to it is checked
 //! before the recursive pass and around the final unlinks, not before each
@@ -683,11 +685,14 @@ pub struct Sweep {
     pub removed: Vec<String>,
     /// Directories kept: a live daemon's, one a process names, one that
     /// isn't identified as an instance ([`identify`]), or every one when the
-    /// scan failed. The caller's own and anything not a directory aren't
-    /// counted.
+    /// scan failed or saw an empty entry. The caller's own and anything not a
+    /// directory aren't counted.
     pub kept: usize,
     /// Why the scan kept everything, if it did.
     pub scan_error: Option<ScanError>,
+    /// Entries of live processes that read empty. Such an entry could name
+    /// any directory, so while there is one no gone daemon's is removed.
+    pub unknown: usize,
     /// Removals that failed.
     pub failed: usize,
 }
@@ -703,12 +708,23 @@ pub enum ScanError {
 /// bytes) retention removes: those whose name is an instance's, whose
 /// daemon isn't `alive`, and that no process in `scan` names. `scan` calls
 /// its visitor with each process's environment and maps; its error keeps
-/// every candidate. `scan` isn't called when no daemon is gone.
+/// every candidate. An empty entry is a live process's that showed nothing
+/// ([`scan_processes`]), which could name any candidate, so it keeps every
+/// one. `scan` isn't called when no daemon is gone.
 pub fn removable(
     candidates: &[(String, Vec<u8>)],
     alive: impl Fn(u32, u64) -> bool,
     scan: impl FnOnce(&mut dyn FnMut(&[u8])) -> Result<(), ScanError>,
 ) -> Result<Vec<String>, ScanError> {
+    removable_counted(candidates, alive, scan).map(|(names, _)| names)
+}
+
+/// [`removable`], with how many empty entries the scan visited.
+fn removable_counted(
+    candidates: &[(String, Vec<u8>)],
+    alive: impl Fn(u32, u64) -> bool,
+    scan: impl FnOnce(&mut dyn FnMut(&[u8])) -> Result<(), ScanError>,
+) -> Result<(Vec<String>, usize), ScanError> {
     let mut gone: Vec<(&str, &[u8], bool)> = candidates
         .iter()
         .filter(|(name, _)| {
@@ -717,18 +733,21 @@ pub fn removable(
         .map(|(name, path)| (name.as_str(), path.as_slice(), false))
         .collect();
     if gone.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
+    let mut unknown = 0;
     scan(&mut |bytes| {
+        unknown += usize::from(bytes.is_empty());
         for (_, path, named) in gone.iter_mut() {
-            *named |= contains(bytes, path);
+            *named |= bytes.is_empty() || contains(bytes, path);
         }
     })?;
-    Ok(gone
+    let names = gone
         .into_iter()
         .filter(|(_, _, named)| !named)
         .map(|(name, _, _)| name.to_string())
-        .collect())
+        .collect();
+    Ok((names, unknown))
 }
 
 /// Whether `haystack` holds `needle`.
@@ -791,9 +810,10 @@ pub fn sweep_root(
             (id.name.clone(), path)
         })
         .collect();
-    match removable(&candidates, alive, scan) {
-        Ok(names) => {
+    match removable_counted(&candidates, alive, scan) {
+        Ok((names, unknown)) => {
             sweep.kept = directories - names.len();
+            sweep.unknown = unknown;
             for id in identified.into_iter().filter(|id| names.contains(&id.name)) {
                 let name = id.name.clone();
                 match remove_identified(root_fd, id) {
@@ -998,15 +1018,28 @@ pub fn scan_proc(visit: &mut dyn FnMut(&[u8])) -> Result<(), ScanError> {
 /// failure to read one, its owner included, is [`ScanError::Unreadable`].
 /// Ownership is the real uid in `/proc/<pid>/status` ([`owned_by`]), not the
 /// owner of `/proc/<pid>`, which reads as root for a process that made
-/// itself non-dumpable.
+/// itself non-dumpable. An entry that reads empty is visited as empty when
+/// its process still lives afterwards, and skipped when it is gone or has
+/// exited: a process shows an empty `environ` while its exec is under way,
+/// before the new image's environment is set up, so the read says nothing
+/// about what it names ([`removable`] keeps everything for it).
 pub fn scan_processes(
+    pids: impl IntoIterator<Item = u32>,
+    visit: &mut dyn FnMut(&[u8]),
+) -> Result<(), ScanError> {
+    scan_processes_in(Path::new("/proc"), pids, visit)
+}
+
+/// [`scan_processes`], with `proc` in place of `/proc`.
+pub fn scan_processes_in(
+    proc: &Path,
     pids: impl IntoIterator<Item = u32>,
     visit: &mut dyn FnMut(&[u8]),
 ) -> Result<(), ScanError> {
     // SAFETY: `getuid` has no preconditions.
     let uid = unsafe { libc::getuid() };
     for pid in pids {
-        let dir = PathBuf::from(format!("/proc/{pid}"));
+        let dir = proc.join(pid.to_string());
         let status = match proc_read(&dir.join("status"))? {
             Some(status) => status,
             None => continue,
@@ -1014,13 +1047,33 @@ pub fn scan_processes(
         if !owned_by(&status, uid)? {
             continue;
         }
+        let mut empty = 0;
         for file in ["environ", "maps"] {
-            if let Some(bytes) = proc_read(&dir.join(file))? {
-                visit(&bytes);
+            match proc_read(&dir.join(file))? {
+                Some(bytes) if bytes.is_empty() => empty += 1,
+                Some(bytes) => visit(&bytes),
+                None => {}
+            }
+        }
+        // Read after the entries, so a process that exited before they were
+        // read is seen as exited.
+        if empty > 0 && proc_read(&dir.join("status"))?.is_some_and(|s| !exited(&s)) {
+            for _ in 0..empty {
+                visit(&[]);
             }
         }
     }
     Ok(())
+}
+
+/// Whether a `status` file's process has exited: its `State:` is `Z`
+/// (zombie) or `X` (dead). A state that can't be read is taken as live.
+fn exited(status: &[u8]) -> bool {
+    status
+        .split(|b| *b == b'\n')
+        .find_map(|l| l.strip_prefix(b"State:"))
+        .and_then(|line| line.split(u8::is_ascii_whitespace).find(|f| !f.is_empty()))
+        .is_some_and(|state| state == b"Z" || state == b"X")
 }
 
 /// A `/proc` file, `None` when its process is gone.

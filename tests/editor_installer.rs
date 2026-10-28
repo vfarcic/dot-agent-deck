@@ -28,7 +28,8 @@ use dot_agent_deck::composer_probe::instance::{
     PAGE_BYTES, READ_MAX, ScanError, Sweep, candidate_roots, choose_root, decode_identity,
     encode_identity, generation_name_ok, identify, instance_name, liveness, liveness_from,
     may_be_alive, open_root, owned_by, parse_instance_name, removable, remove_identified,
-    same_contents, scan_processes, splittable, status_uid, sweep, sweep_root, sweep_with,
+    same_contents, scan_processes, scan_processes_in, splittable, status_uid, sweep, sweep_root,
+    sweep_with,
 };
 use dot_agent_deck::doorbell_activation::{
     EditorProbe, EditorSelection, ExportShape, Measurement, PasteToggles,
@@ -1084,10 +1085,17 @@ fn probe_065_a_sweep_keeps_what_a_process_names() {
     user.wait().unwrap();
     let left = |name: &str| root.join(name).exists();
     match result.scan_error {
-        None => {
+        None if result.unknown == 0 => {
             assert_eq!(result.removed, [gone[0].clone()], "{result:?}");
             assert!(!left(&gone[0]));
             assert_eq!(result.kept, 3, "{result:?}");
+        }
+        None => {
+            eprintln!(
+                "SKIP-REMOVAL: a live process of this user showed an empty entry ({result:?})"
+            );
+            assert!(result.removed.is_empty());
+            assert!(left(&gone[0]));
         }
         Some(error) => {
             eprintln!("SKIP-REMOVAL: a process of this user can't be read ({error:?})");
@@ -1291,6 +1299,68 @@ fn probe_065_a_process_whose_name_is_not_utf8_keeps_its_instance() {
         |visit| scan_processes([pid], visit),
     );
     assert_eq!(swept.removed.len(), 1, "{swept:?}");
+}
+
+/// Scenario: Sweep a gone daemon's instance with a scripted `/proc` holding one process of this user. While it lives, an empty `environ`, or an empty `maps`, keeps the instance and is counted as unknown, with no scan error; a zombie with both empty doesn't keep it, and a live process whose environment is there but doesn't name the instance doesn't either.
+#[spec("inbox/probe/065")]
+#[test]
+fn probe_065_an_empty_entry_of_a_live_process_keeps_every_instance() {
+    let dir = tempdir();
+    let root = private_dir(&dir.path().join("editor"));
+    let proc = dir.path().join("proc");
+    let uid = unsafe { libc::getuid() };
+    // Process 7, this user's, in `state`, with these entries.
+    let process = |state: &str, environ: &[u8], maps: &[u8]| {
+        let pid = proc.join("7");
+        std::fs::create_dir_all(&pid).unwrap();
+        let mut status = b"Name:\tna\xffme\n".to_vec();
+        status.extend(format!("State:\t{state}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n").bytes());
+        std::fs::write(pid.join("status"), status).unwrap();
+        std::fs::write(pid.join("environ"), environ).unwrap();
+        std::fs::write(pid.join("maps"), maps).unwrap();
+    };
+    let swept = || {
+        sweep_with(
+            &root,
+            "own-0",
+            |_, _| false,
+            |visit| scan_processes_in(&proc, [7], visit),
+        )
+    };
+    let other = b"HOME=/h\0VISUAL=/elsewhere/dot-agent-deck-editor\0".as_slice();
+    let maps = b"7f00-7f01 r-xp 0 08:01 5 /usr/bin/sh\n".as_slice();
+    let gone = fake_instance(&root, 1, 1);
+    for (environ, entry) in [(b"".as_slice(), maps), (other, b"".as_slice())] {
+        process("R (running)", environ, entry);
+        let result = swept();
+        assert_eq!(result.scan_error, None, "{result:?}");
+        assert!(result.removed.is_empty(), "{result:?}");
+        assert_eq!((result.kept, result.unknown), (1, 1), "{result:?}");
+        assert!(gone.join(DAEMON_FILE).exists());
+    }
+    // Exited, its entries read empty and it keeps nothing.
+    process("Z (zombie)", b"", b"");
+    let result = swept();
+    assert_eq!(result.removed, ["1-1"], "{result:?}");
+    assert_eq!((result.kept, result.unknown), (0, 0), "{result:?}");
+    // Live, its environment there and naming another path, it keeps nothing.
+    let gone = fake_instance(&root, 1, 1);
+    process("S (sleeping)", other, maps);
+    let result = swept();
+    assert_eq!(result.removed, ["1-1"], "{result:?}");
+    assert_eq!((result.kept, result.unknown), (0, 0), "{result:?}");
+    assert!(!gone.exists());
+    // The decision alone: an empty entry keeps every gone daemon's directory.
+    let all = candidates(&["10-1", "11-1"]);
+    let kept = removable(
+        &all,
+        |_, _| false,
+        |visit| {
+            visit(b"");
+            Ok(())
+        },
+    );
+    assert_eq!(kept, Ok(vec![]));
 }
 
 /// Scenario: Make an instance in a root already holding a directory that isn't an instance's, and read what the sweep at creation reports: it was kept, nothing was removed, and no scan was needed. Install a generation, find its arm page among this process's mappings, drop the installation, and find it no longer mapped while its file stays.
