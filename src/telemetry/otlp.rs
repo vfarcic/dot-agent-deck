@@ -304,6 +304,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::event::{AgentType, EventType};
     use crate::telemetry::config::{EnvMap, TelemetryConfig};
+    use crate::telemetry::input::InterventionKind;
     use crate::telemetry::resource::deck_resource;
     use crate::telemetry::run_context::RunContext;
     use crate::telemetry::span::Attribute;
@@ -506,7 +507,7 @@ pub(crate) mod tests {
         let mut tracker = RunTracker::new();
         tracker.begin_run(start("p1"), 10);
         tracker.observe_event(&event("p1", EventType::ToolStart), 20);
-        tracker.observe_human_input("p1", 25);
+        tracker.observe_human_input("p1", 25, InterventionKind::Text);
         tracker.end_run("p1", EndReason::Exited, Some(-1), 30);
         let spans = tracker.take_finished();
         let resource = deck_resource("dot-agent-deck", Some("host-a"), &[]);
@@ -690,7 +691,7 @@ pub(crate) mod tests {
                 t += 1;
             }
         }
-        tracker.observe_human_input("pane-1", t);
+        tracker.observe_human_input("pane-1", t, InterventionKind::Text);
         tracker.end_run("pane-1", EndReason::Exited, Some(1), t + 1);
         tracker.end_all(EndReason::DaemonShutdown, t + 2);
         let spans = tracker.take_finished();

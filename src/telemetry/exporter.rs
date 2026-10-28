@@ -23,6 +23,25 @@
 //! - human input waits with the run it was typed into, not only on the queue:
 //!   the command is a reminder to count it, and a run ended first — by its
 //!   pane's close broadcast, say — counts it as it ends;
+//! - human input is counted in the order telemetry was told about it against
+//!   the events: each write notes how far the daemon's broadcast had got when
+//!   telemetry is told about it, just after the pane accepted it
+//!   ([`BroadcastClock`]), and the task counts it before the first event
+//!   broadcast after that once the tracker has opened its run, so it is read
+//!   against the prompt the cards showed then rather than when the task takes
+//!   it. A lone `ESC` takes part too: an event on its pane, or naming no
+//!   pane, broadcast after it waits out its window, and what the `ESC`
+//!   turns out to be — the Escape key, or the key whose sequence it begins
+//!   when the next write completes that sequence — keeps the `ESC`'s place,
+//!   so it counts before that event;
+//! - a delegated task's post (issue #1981 M7) keeps its place the same way:
+//!   it notes the broadcast's position as telemetry is told about it, waits
+//!   in [`Shared::posts`], and is applied before the first message broadcast
+//!   after that, so a pane closed after the post does not end the
+//!   orchestrator's run before the post is applied. While that run is
+//!   prepared and not opened yet, the post is held with the run's own held
+//!   events instead, in the same place, and opened in it as the run opens
+//!   ([`RunTracker::place_post`]);
 //! - a run whose spawn is refused is forgotten when its [`PreparedRun`] is
 //!   dropped uncommitted.
 //!
@@ -60,13 +79,13 @@ use super::accounting::run_usage::{UsageDirs, UsageFile};
 use super::accounting::usage_file::USAGE_FILE_ENV;
 use super::accounting::{UsageSource, locate, usage_source};
 use super::config::{EnvMap, TelemetryConfig, redacted_endpoint};
-use super::input::{InputFilter, LONE_ESCAPE_WINDOW};
+use super::input::{InputFilter, InterventionKind, LONE_ESCAPE_WINDOW, PASTE_IDLE_WINDOW};
 use super::launch::LAUNCH_ENV_KEYS;
 use super::propagation::{RunIdentity, agent_env};
 use super::resource::{ResourceAttribute, deck_resource, host_name};
 use super::run_context::{ProbeSettings, Probes};
 use super::span::{SpanRecord, new_run_id};
-use super::tracker::{EndReason, FinishingRun, RunStart, RunTracker};
+use super::tracker::{EndReason, FinishingRun, RunGeneration, RunStart, RunTracker};
 use super::{Protocol, now_unix_nanos, otlp};
 
 /// Spans per request, at most.
@@ -388,6 +407,14 @@ enum Command {
         pane_id: String,
         run_id: String,
     },
+    /// Issue #1981 M7: the delegate path posted task `seq`, which waits in
+    /// [`Shared::posts`] with its broadcast position: a reminder to apply
+    /// it, and none posted after it, between the broadcast messages it was
+    /// posted between, if no message after it does first
+    /// ([`super::handoff`]).
+    DelegatePosted {
+        seq: u64,
+    },
     /// Acknowledged once everything sent before it, broadcast included, is
     /// applied.
     #[cfg(test)]
@@ -399,10 +426,10 @@ enum Command {
     },
 }
 
-/// A test seam pausing a task at one point: signal the first half, then wait
-/// for the second.
+/// A test seam pausing a task at one point: signal the first half, then await
+/// the second, which suspends the task without blocking the thread it runs on.
 #[cfg(test)]
-type Gate = (oneshot::Sender<()>, std::sync::mpsc::Receiver<()>);
+type Gate = (oneshot::Sender<()>, oneshot::Receiver<()>);
 
 /// A run's input filter, from its commit until the tracker ends the run,
 /// with the generation it is for.
@@ -413,32 +440,245 @@ struct PaneInput {
     ended: bool,
     filter: InputFilter,
     /// When the lone `ESC` the filter holds arrived — monotonic, for the
-    /// window, and wall-clock, for the intervention it may become.
-    escape: Option<(std::time::Instant, u64)>,
-    /// When the human input the filter accepted and the tracker has not
-    /// counted yet was written, oldest first. Taken, once, by whichever comes
-    /// first: the [`Command::HumanInput`] sent with the first of them, or the
-    /// run ending.
-    pending: Vec<u64>,
+    /// window, and wall-clock and on the broadcast, for the intervention it
+    /// may become.
+    escape: Option<(std::time::Instant, u64, u64)>,
+    /// When the last write that left the filter inside a bracketed paste
+    /// arrived, monotonic: the paste is read as ended once
+    /// [`PASTE_IDLE_WINDOW`] passes with no write after it.
+    paste: Option<std::time::Instant>,
+    /// The human input the filter accepted and the tracker has not counted
+    /// yet, oldest first. Taken, once, by whichever comes first: the first
+    /// event broadcast after it, the [`Command::HumanInput`] sent with the
+    /// first of them, or the run ending.
+    pending: Vec<Written>,
+}
+
+/// Human input a run's filter accepted.
+#[derive(Clone, Copy, Debug)]
+struct Written {
+    /// When, on the wall clock.
+    at: u64,
+    kind: InterventionKind,
+    /// How many messages the daemon had broadcast when telemetry was told
+    /// about it, just after the pane accepted it
+    /// ([`BroadcastClock::position`]): it is counted before every message
+    /// from that one on.
+    position: u64,
 }
 
 impl PaneInput {
+    /// Feed one accepted write, `now` on the wall clock and `at` on the
+    /// monotonic one, that telemetry was told about at broadcast `position`:
+    /// the human input it settles, oldest first, and whether it left a lone
+    /// `ESC` held. Input a held lone `ESC` turns into — the Escape key, once
+    /// its window has passed or another `ESC` follows it, or the key whose
+    /// sequence it begins, with every byte of that key the write holds —
+    /// keeps the time and position that `ESC` was written at, as one input;
+    /// what follows the key has `now` and `position`. A sequence the write
+    /// leaves undecided counts once, when a later write decides it, at that
+    /// write's time and position. The rest of a key already decided does not
+    /// count again in the write that completes it, except a bracketed paste's,
+    /// which is paste written then.
+    fn write(
+        &mut self,
+        bytes: &[u8],
+        now: u64,
+        position: u64,
+        at: std::time::Instant,
+    ) -> (Vec<Written>, bool) {
+        let mut human = Vec::with_capacity(2);
+        let mut rest = bytes;
+        if let Some((since, written, escaped)) = self.escape {
+            let kind = if at.saturating_duration_since(since) >= LONE_ESCAPE_WINDOW {
+                // Its window has passed: the Escape key, whatever follows.
+                self.escape = None;
+                self.filter
+                    .settle_lone_escape()
+                    .then_some(InterventionKind::Interrupt)
+            } else {
+                let (kind, taken) = self.filter.decide_held(bytes);
+                rest = &bytes[taken..];
+                kind
+            };
+            if let Some(kind) = kind {
+                human.push(Written {
+                    at: written,
+                    kind,
+                    position: escaped,
+                });
+            }
+        }
+        // A paste with no input for its window lost its end marker.
+        if self
+            .paste
+            .is_some_and(|since| at.saturating_duration_since(since) >= PASTE_IDLE_WINDOW)
+        {
+            self.filter.end_paste();
+        }
+        if let Some(kind) = self.filter.classify(rest) {
+            human.push(Written {
+                at: now,
+                kind,
+                position,
+            });
+        }
+        if !self.filter.in_paste() {
+            self.paste = None;
+        } else if !bytes.is_empty() {
+            self.paste = Some(at);
+        }
+        // A non-empty write leaving a lone ESC held ended with it.
+        let mut held = false;
+        if !self.filter.holds_lone_escape() {
+            self.escape = None;
+        } else if !bytes.is_empty() {
+            self.escape = Some((at, now, position));
+            held = true;
+        }
+        (human, held)
+    }
+
     /// Everything this run's input still owes the tracker, oldest first:
     /// what is pending, then a held lone `ESC` when `settle` says it is the
     /// Escape key now.
-    fn take_held(&mut self, settle: bool) -> Vec<u64> {
+    fn take_held(&mut self, settle: bool) -> Vec<Written> {
         let mut held = std::mem::take(&mut self.pending);
         if settle
-            && let Some((_, written)) = self.escape.take()
+            && let Some((_, at, position)) = self.escape.take()
             && self.filter.settle_lone_escape()
         {
-            held.push(written);
+            held.push(Written {
+                at,
+                kind: InterventionKind::Interrupt,
+                position,
+            });
         }
         held
+    }
+
+    /// The pending input written before the daemon broadcast its message
+    /// `position`, oldest first, and the position of the last that stays.
+    fn take_through(&mut self, position: u64) -> (Vec<Written>, Option<u64>) {
+        let due = self.pending.partition_point(|w| w.position <= position);
+        let taken = self.pending.drain(..due).collect();
+        (taken, self.pending.last().map(|w| w.position))
+    }
+
+    /// Whether input written before broadcast message `position` is still
+    /// held: pending, or a lone `ESC`.
+    fn owes_before(&self, position: u64) -> bool {
+        self.pending.first().is_some_and(|w| w.position <= position)
+            || self.escape.is_some_and(|(_, _, at)| at <= position)
+    }
+
+    /// [`Self::take_through`], then a lone `ESC` written before broadcast
+    /// message `position` as the Escape key when its window has passed by
+    /// `now`. Everything pending was written before a held `ESC`: a later
+    /// write would have settled it.
+    fn take_before(&mut self, position: u64, now: std::time::Instant) -> Vec<Written> {
+        let (mut taken, _) = self.take_through(position);
+        if self.escape.is_some_and(|(since, _, at)| {
+            at <= position && now.saturating_duration_since(since) >= LONE_ESCAPE_WINDOW
+        }) {
+            taken.extend(self.take_held(true));
+        }
+        taken
+    }
+}
+
+/// How far the daemon's broadcast has got: the number of messages it has
+/// sent since the ingest task's receiver was made, which numbers each message
+/// that receiver reads. Read as telemetry is told about human input, just
+/// after the pane accepted it, so the ingest task can count that input
+/// between the events broadcast before it and the ones after, on the order
+/// the daemon published them in.
+///
+/// It is a receiver of its own that reads nothing until it falls
+/// [`CLOCK_CATCH_UP_AT`] behind: the broadcast does not number its messages,
+/// but a receiver knows how many it has not read.
+#[derive(Default)]
+struct BroadcastClock {
+    rx: Option<broadcast::Receiver<BroadcastMsg>>,
+    /// Messages sent before `rx`'s next one.
+    base: u64,
+}
+
+/// Issue #1981 M7: delegated tasks posted and not applied yet
+/// ([`Shared::posts`]).
+#[derive(Default)]
+struct WaitingPosts {
+    /// The number the next post is given: posts are numbered in the order
+    /// they join `queue`, which is broadcast order.
+    next_seq: u64,
+    /// Oldest first, each with its number and how many messages the daemon
+    /// had broadcast when telemetry was told about it
+    /// ([`BroadcastClock::position`]): applied before every message from
+    /// that one on.
+    queue: std::collections::VecDeque<WaitingPost>,
+}
+
+struct WaitingPost {
+    seq: u64,
+    position: u64,
+    posted: super::handoff::Posted,
+}
+
+/// How far behind the broadcast [`BroadcastClock`] falls before it reads
+/// what it is behind by. A trigger, not a bound on what it keeps alive: it
+/// catches up only when the ingest task applies a message, so while that
+/// task is stalled it can hold as many as the broadcast's ring keeps.
+const CLOCK_CATCH_UP_AT: usize = 256;
+
+impl BroadcastClock {
+    /// A clock numbering messages from `events`' next one, which has read
+    /// nothing yet.
+    fn numbering(events: &broadcast::Receiver<BroadcastMsg>) -> Self {
+        loop {
+            let sent = events.len();
+            let rx = events.resubscribe();
+            // Nothing was sent in between, so `rx` starts where `sent` ends.
+            if events.len() == sent {
+                return Self {
+                    rx: Some(rx),
+                    base: sent as u64,
+                };
+            }
+        }
+    }
+
+    fn position(&self) -> u64 {
+        self.base + self.rx.as_ref().map_or(0, |rx| rx.len() as u64)
+    }
+
+    /// Read what the clock is behind by, once that is [`CLOCK_CATCH_UP_AT`]
+    /// or more, so it does not keep the messages alive longer than it must.
+    fn catch_up(&mut self) {
+        let Some(rx) = &mut self.rx else {
+            return;
+        };
+        let mut left = rx.len();
+        if left < CLOCK_CATCH_UP_AT {
+            return;
+        }
+        while left > 0 {
+            let read = match rx.try_recv() {
+                Ok(_) => 1,
+                Err(broadcast::error::TryRecvError::Lagged(missed)) => missed,
+                Err(_) => break,
+            };
+            self.base += read;
+            left = left.saturating_sub(usize::try_from(read).unwrap_or(usize::MAX));
+        }
     }
 }
 
 type Filters = Mutex<HashMap<String, Vec<PaneInput>>>;
+
+/// The name of the dispatched unit an open run's generation belongs to, from
+/// the deck's record of dispatched units, or `None` when it belongs to none.
+/// See [`Telemetry::set_dispatch_lookup`].
+pub type DispatchLookup = Box<dyn Fn(&RunGeneration) -> Option<String> + Send + Sync>;
 
 fn lock_filters(filters: &Filters) -> std::sync::MutexGuard<'_, HashMap<String, Vec<PaneInput>>> {
     filters.lock().unwrap_or_else(|p| p.into_inner())
@@ -448,7 +688,7 @@ fn lock_filters(filters: &Filters) -> std::sync::MutexGuard<'_, HashMap<String, 
 /// when the input it accepted and the tracker has not counted yet was written,
 /// with a lone `ESC` it still held last — the Escape key, since nothing can
 /// follow it now. Called by the tracker, with the tracker locked.
-fn retire_input(filters: &Filters, pane_id: &str, run_id: &str) -> Vec<u64> {
+fn retire_input(filters: &Filters, pane_id: &str, run_id: &str) -> Vec<(u64, InterventionKind)> {
     let mut filters = lock_filters(filters);
     let Some(inputs) = filters.get_mut(pane_id) else {
         return Vec::new();
@@ -460,7 +700,11 @@ fn retire_input(filters: &Filters, pane_id: &str, run_id: &str) -> Vec<u64> {
     if inputs.is_empty() {
         filters.remove(pane_id);
     }
-    input.take_held(true)
+    input
+        .take_held(true)
+        .into_iter()
+        .map(|w| (w.at, w.kind))
+        .collect()
 }
 
 /// What the spawn path, the reader threads and the ingest task share.
@@ -468,11 +712,25 @@ struct Shared {
     tracker: Mutex<RunTracker>,
     queue: mpsc::Sender<ExportMsg>,
     dropped: Mutex<RateLimitedLog>,
+    /// Issue #1981 M8: every span the queue refused since the exporter
+    /// started (`deck.telemetry.spans.dropped`). Unlike [`Self::dropped`],
+    /// which counts only between warnings, never reset.
+    dropped_total: std::sync::atomic::AtomicU64,
+    /// Issue #1981 M8: how often a `daemon.health` span is sent, when it is
+    /// ([`super::health`]), and the hook latencies of the interval open now.
+    health_interval: Option<Duration>,
+    health: Mutex<super::health::Window>,
     /// Each run's input filter, by pane, the newest generation last. The
     /// tracker retires one as it ends that run ([`retire_input`]), so a held
     /// lone `ESC` is counted however the run ends. Locked after the tracker,
     /// never before it.
     filters: Arc<Filters>,
+    /// Where the broadcast stands, for input to note as it is written. Locked
+    /// after the filters and the posts, never before them.
+    clock: Mutex<BroadcastClock>,
+    /// Issue #1981 M7: delegated tasks posted and not applied yet, oldest
+    /// first. Locked after the tracker, never before it.
+    posts: Mutex<WaitingPosts>,
     /// Wakes the ingest task to time a lone `ESC` that a write left held.
     escape_held: tokio::sync::Notify,
     /// Turned true as shutdown begins: an export in flight gives way to the
@@ -485,14 +743,25 @@ struct Shared {
     /// Batches of ended runs, one per [`Shared::complete_later`] call with
     /// any, whose task has not ended yet: not runs.
     finalizing: watch::Sender<usize>,
+    /// See [`Telemetry::set_dispatch_lookup`].
+    dispatch_lookup: OnceLock<DispatchLookup>,
     /// Test seam: pauses the ingest task once inside its `escape_held`
-    /// branch, after signalling the first half, until the second receives.
+    /// branch, after signalling the first half, until the second resolves.
     #[cfg(test)]
     timer_gate: Mutex<Option<Gate>>,
-    /// Test seam: pauses the ingest task once the command queue first polls
-    /// empty, before the other branches are polled.
+    /// Test seam: pauses the ingest task once as it is about to wait out a
+    /// lone `ESC` before an event ([`Shared::observe_in_order`]).
+    #[cfg(test)]
+    wait_gate: Mutex<Option<Gate>>,
+    /// Test seam: pauses the ingest task once the command queue is first
+    /// found empty, before any branch is polled ([`pause_at_command_gate`]).
     #[cfg(test)]
     command_gate: Mutex<Option<Gate>>,
+    /// The ingest task resumed from [`Self::command_gate`]: the queue was
+    /// empty when it paused, so the other branches are polled before it is
+    /// again.
+    #[cfg(test)]
+    command_gate_resumed: std::sync::atomic::AtomicBool,
 }
 
 struct Exporting {
@@ -575,6 +844,38 @@ impl Drop for PreparedRun {
     }
 }
 
+/// A unit being spawned: see [`Telemetry::begin_dispatch`]. Dropping it ends
+/// the naming of runs by the unit's worktree.
+pub struct DispatchNaming {
+    telemetry: Arc<Telemetry>,
+    name: String,
+    token: u64,
+}
+
+impl DispatchNaming {
+    /// The spawn started the generations `agents`, by pane and agent id, and,
+    /// for an orchestration, the instance `orchestration_id`: name their runs
+    /// that are not named yet — one whose agent started outside the worktree
+    /// — and every role the instance starts later.
+    pub fn spawned(self, agents: &[(String, String)], orchestration_id: Option<&str>) {
+        if let Some(exporting) = &self.telemetry.exporting {
+            exporting
+                .shared
+                .with_tracker(|t| t.name_dispatched(&self.name, agents, orchestration_id));
+        }
+    }
+}
+
+impl Drop for DispatchNaming {
+    fn drop(&mut self) {
+        if let Some(exporting) = &self.telemetry.exporting {
+            exporting
+                .shared
+                .with_tracker(|t| t.end_dispatch(self.token));
+        }
+    }
+}
+
 /// Where the daemon writes per-run agent configuration files: under its state
 /// directory.
 pub fn default_config_dir() -> PathBuf {
@@ -597,6 +898,9 @@ struct Settings {
     /// [`Shared::command_gate`].
     #[cfg(test)]
     command_gate: Option<Gate>,
+    /// Issue #1981 M8: send a `daemon.health` span this often; none when
+    /// unset. Only the daemon's start sets it ([`Telemetry::start_in`]).
+    health_interval: Option<Duration>,
 }
 
 impl Telemetry {
@@ -637,7 +941,11 @@ impl Telemetry {
     /// the current tokio runtime, with per-run agent configuration files
     /// written into `config_dir`.
     pub fn start_in(env: &EnvMap, config_dir: PathBuf) -> Self {
-        Self::start_with_dir(env, config_dir, Settings::default())
+        let settings = Settings {
+            health_interval: Some(super::health::interval(env)),
+            ..Settings::default()
+        };
+        Self::start_with_dir(env, config_dir, settings)
     }
 
     fn start_with_dir(env: &EnvMap, config_dir: PathBuf, settings: Settings) -> Self {
@@ -704,6 +1012,38 @@ impl Telemetry {
     /// first on the `PATH` of every agent from now on.
     pub fn set_shim_dir(&mut self, dir: PathBuf) {
         self.shim_dir = Some(dir);
+    }
+
+    /// Name each open run's dispatched unit with `lookup`, asked with the
+    /// tracker let go, as each poll of the runs' usage comes round: for a run
+    /// [`Self::begin_dispatch`] did not name from its start, such as a
+    /// restarted single unit's. The first lookup set stays. Nothing happens
+    /// when not exporting.
+    pub fn set_dispatch_lookup(&self, lookup: DispatchLookup) {
+        if let Some(exporting) = &self.exporting {
+            let _ = exporting.shared.dispatch_lookup.set(lookup);
+        }
+    }
+
+    /// A unit named `name` is about to be spawned in `worktree`: each run
+    /// prepared in it until the returned [`DispatchNaming`] is dropped is
+    /// named after the unit as it is prepared, so it has the name however
+    /// soon its agent exits or its pane closes. Call
+    /// [`DispatchNaming::spawned`] once the spawn says which generations it
+    /// started. `None` when not exporting.
+    pub fn begin_dispatch(self: &Arc<Self>, name: &str, worktree: &Path) -> Option<DispatchNaming> {
+        let exporting = self.exporting.as_ref()?;
+        let token = exporting
+            .shared
+            .tracker
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .begin_dispatch(name, worktree);
+        Some(DispatchNaming {
+            telemetry: Arc::clone(self),
+            name: name.to_string(),
+            token,
+        })
     }
 
     /// Whether telemetry is configured at all (export or propagation).
@@ -784,7 +1124,7 @@ impl Telemetry {
         if let Some(exporting) = &self.exporting {
             let run_id = start.run_id.clone();
             exporting.shared.with_tracker(|t| {
-                t.prepare_run(start, now_unix_nanos());
+                t.prepare_run_in(start, now_unix_nanos(), prepared.cwd.as_deref());
                 t.set_usage_dirs(&run_id, usage_dirs);
             });
         }
@@ -847,6 +1187,7 @@ impl Telemetry {
                     ended: false,
                     filter: InputFilter::new(),
                     escape: None,
+                    paste: None,
                     pending: Vec::new(),
                 });
             // Sent before the filters are unlocked, so no notice of input to
@@ -867,11 +1208,15 @@ impl Telemetry {
     }
 
     /// An attached client wrote `bytes` into `pane_id`. Counted as a human
-    /// intervention unless it is only terminal reports, including a report
-    /// split across writes ([`super::input::InputFilter`]). A lone `ESC` — the
-    /// Escape key — is counted, at the time it was written, once
-    /// [`LONE_ESCAPE_WINDOW`] passes without the rest of a report, or when the
-    /// run ends. Input the deck injects itself (a delegated task, an inbox
+    /// intervention, of the kind its bytes say, unless it is only terminal
+    /// reports, including a report split across writes
+    /// ([`super::input::InputFilter`]). A lone `ESC` — the
+    /// Escape key — is counted once [`LONE_ESCAPE_WINDOW`] passes without the
+    /// rest of a report, when another `ESC` follows it, or when the run ends;
+    /// it counts at the time and broadcast position it was written at, not
+    /// those of the write that decided it, and so does the key whose sequence
+    /// it begins when the next write completes that sequence. Input the deck
+    /// injects itself (a delegated task, an inbox
     /// delivery) must not be passed here.
     pub fn observe_client_input(&self, pane_id: &str, bytes: &[u8]) {
         self.observe_client_input_at(pane_id, bytes, now_unix_nanos(), std::time::Instant::now());
@@ -890,9 +1235,7 @@ impl Telemetry {
             return;
         };
         let shared = &exporting.shared;
-        let mut human = Vec::with_capacity(2);
-        let mut held = false;
-        {
+        let held = {
             let mut filters = shared.lock_filters();
             // No open run on this pane: nothing to count it against.
             let Some(input) = filters
@@ -902,26 +1245,17 @@ impl Telemetry {
             else {
                 return;
             };
-            // A lone ESC whose window has passed was the Escape key, whatever
-            // follows it now.
-            if let Some((since, written)) = input.escape
-                && at.saturating_duration_since(since) >= LONE_ESCAPE_WINDOW
-            {
-                input.escape = None;
-                if input.filter.settle_lone_escape() {
-                    human.push(written);
-                }
-            }
-            if input.filter.feed(bytes) {
-                human.push(now);
-            }
-            // A non-empty write leaving a lone ESC held ended with it.
-            if !input.filter.holds_lone_escape() {
-                input.escape = None;
-            } else if !bytes.is_empty() {
-                input.escape = Some((at, now));
-                held = true;
-            }
+            // Read under the filters' lock, so the run's input is noted in
+            // the order of the broadcast. This is when telemetry is told
+            // about the write, not when the PTY accepted it: the pane has
+            // already handed the bytes to the agent, so an agent fast enough
+            // to read the key and fire a hook before this line has that hook
+            // broadcast first, and the key is counted after its own response
+            // — against a prompt it already closed, say. Placing it by the
+            // PTY's acceptance would take a position read at the write
+            // itself, in the pane's writer.
+            let position = shared.lock_clock().position();
+            let (human, held) = input.write(bytes, now, position, at);
             // The input waits with its run; the first of it since the tracker
             // last took the run's input sends the reminder to take it.
             let wake = input.pending.is_empty() && !human.is_empty();
@@ -933,7 +1267,8 @@ impl Telemetry {
                     run_id: input.run_id.clone(),
                 });
             }
-        }
+            held
+        };
         if held {
             shared.escape_held.notify_one();
         }
@@ -979,10 +1314,35 @@ impl Telemetry {
         });
     }
 
+    /// Issue #1981 M7: the delegate path posted `posted`'s task: open its
+    /// `agent.handoff`, stamped now, between the broadcast messages sent
+    /// before and after this call. Nothing happens when not exporting.
+    pub fn observe_delegate_posted(&self, posted: &super::DelegatePosted<'_>) {
+        let Some(exporting) = &self.exporting else {
+            return;
+        };
+        let shared = &exporting.shared;
+        let seq = {
+            // Read under the posts' lock, so the queue is in broadcast order.
+            let mut posts = shared.lock_posts();
+            let position = shared.lock_clock().position();
+            let seq = posts.next_seq;
+            posts.next_seq += 1;
+            posts.queue.push_back(WaitingPost {
+                seq,
+                position,
+                posted: super::handoff::Posted::of(posted, now_unix_nanos()),
+            });
+            seq
+        };
+        let _ = exporting.commands.send(Command::DelegatePosted { seq });
+    }
+
     /// Feed the daemon's broadcast to the tracker until it closes. Nothing
     /// happens when not exporting, so an off deck spawns nothing.
     pub fn subscribe(&self, rx: broadcast::Receiver<BroadcastMsg>) {
         if let Some(exporting) = &self.exporting {
+            *exporting.shared.lock_clock() = BroadcastClock::numbering(&rx);
             let _ = exporting.commands.send(Command::Subscribe(rx));
         }
     }
@@ -1222,30 +1582,149 @@ impl Shared {
         });
     }
 
+    /// Name the dispatched unit of every open run that has none yet, by the
+    /// lookup [`Telemetry::set_dispatch_lookup`] set. The lookup is asked with
+    /// the tracker let go, so it may take the deck's own locks; only the
+    /// ingest task opens and ends runs, so a run it names is still the one it
+    /// was asked about, or has ended and is not named.
+    fn name_dispatched_runs(&self) {
+        let Some(lookup) = self.dispatch_lookup.get() else {
+            return;
+        };
+        let runs = self
+            .tracker
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .runs_without_dispatch();
+        let named: Vec<(String, String)> = runs
+            .into_iter()
+            .filter_map(|run| lookup(&run).map(|name| (run.run_id, name)))
+            .collect();
+        if !named.is_empty() {
+            self.with_tracker(|t| {
+                for (run_id, name) in &named {
+                    t.set_dispatch_name(run_id, name);
+                }
+            });
+        }
+    }
+
     fn lock_filters(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<PaneInput>>> {
         lock_filters(&self.filters)
     }
 
+    fn lock_clock(&self) -> std::sync::MutexGuard<'_, BroadcastClock> {
+        self.clock.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn lock_posts(&self) -> std::sync::MutexGuard<'_, WaitingPosts> {
+        self.posts.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Issue #1981 M7: place each task posted before broadcast message
+    /// `position`, or every one with `None`, and numbered `seq` or earlier,
+    /// or any with `None`, oldest first ([`RunTracker::place_post`]): its
+    /// hand-off opens now, or, while its orchestrator's run is prepared and
+    /// not opened yet, is held with that run's events in the same place.
+    /// Returns the position of the first post within `seq` written after
+    /// `position`.
+    fn take_posts_before(
+        &self,
+        t: &mut RunTracker,
+        position: Option<u64>,
+        seq: Option<u64>,
+    ) -> Option<u64> {
+        let mut posts = self.lock_posts();
+        // Numbers and positions both rise along the queue, so what is taken
+        // is always a prefix of it.
+        while let Some(first) = posts.queue.front() {
+            if seq.is_some_and(|s| first.seq > s) {
+                return None;
+            }
+            if position.is_some_and(|p| first.position > p) {
+                return Some(first.position);
+            }
+            if let Some(first) = posts.queue.pop_front() {
+                t.place_post(first.posted);
+            }
+        }
+        None
+    }
+
+    /// [`Self::take_posts_before`], with the tracker locked for it.
+    fn take_posts(&self, through: Option<u64>, seq: u64) -> Option<u64> {
+        let mut left = None;
+        self.with_tracker(|t| left = self.take_posts_before(t, through, Some(seq)));
+        left
+    }
+
     /// Count the human input waiting with `run_id` on `pane_id`, if the run
-    /// has not ended and taken it already.
-    fn take_input(&self, pane_id: &str, run_id: &str) {
+    /// has not ended and taken it already: what was written before broadcast
+    /// message `through`, or all of it with `None`. Returns the broadcast
+    /// position the last input left waiting was written at.
+    fn take_input(&self, pane_id: &str, run_id: &str, through: Option<u64>) -> Option<u64> {
+        let mut left = None;
         self.with_tracker(|t| {
             let held = self
                 .lock_filters()
                 .get_mut(pane_id)
                 .and_then(|inputs| inputs.iter_mut().find(|input| input.run_id == run_id))
-                .map(|input| input.take_held(false))
-                .unwrap_or_default();
-            for written in held {
-                t.observe_run_input(pane_id, run_id, written);
+                .map(|input| match through {
+                    Some(position) => input.take_through(position),
+                    None => (input.take_held(false), None),
+                });
+            let Some((held, rest)) = held else {
+                return;
+            };
+            left = rest;
+            for w in held {
+                t.observe_run_input(pane_id, run_id, w.at, w.kind);
             }
         });
+        left
+    }
+
+    /// Count the input written before broadcast message `position` on
+    /// `pane_id`, or on every pane with `None`, into each run the tracker
+    /// takes input for, so it is read before that message is applied: what
+    /// is pending, then a lone `ESC` whose window has passed by `now`.
+    /// [`Self::escape_due_before`] says how long to wait for one still in its
+    /// window first.
+    fn take_input_before(
+        &self,
+        t: &mut RunTracker,
+        pane_id: Option<&str>,
+        position: u64,
+        now: std::time::Instant,
+    ) {
+        let mut due = Vec::new();
+        {
+            let mut filters = self.lock_filters();
+            for (pane, inputs) in filters.iter_mut() {
+                if pane_id.is_some_and(|p| p != pane) {
+                    continue;
+                }
+                for input in inputs.iter_mut() {
+                    if input.owes_before(position) && t.takes_input(pane, &input.run_id) {
+                        let taken = input.take_before(position, now);
+                        due.push((pane.clone(), input.run_id.clone(), taken));
+                    }
+                }
+            }
+        }
+        for (pane, run_id, taken) in due {
+            for w in taken {
+                t.observe_run_input(&pane, &run_id, w.at, w.kind);
+            }
+        }
     }
 
     /// Count every held lone `ESC` whose window has passed by `at` as human
     /// input at the time it was written, straight into its run, after any
     /// input still waiting with that run. Returns when the next one still
-    /// held is due.
+    /// held is due. One written after broadcast message `read`, the first the
+    /// ingest task has not applied, is due now and left for the next call, so
+    /// it is counted after the events broadcast before it.
     ///
     /// Any write after the ESC settles it on the writer's side instead. The
     /// tracker stays locked throughout, so no run ends between a filter
@@ -1257,22 +1736,24 @@ impl Shared {
     /// Commit wakes the task again, because the wake the write sent can be
     /// taken by the task before the Commit is — `biased` orders the branches
     /// it polls, not a command's arrival against a wake.
-    fn settle_escapes(&self, at: std::time::Instant) -> Option<std::time::Instant> {
+    fn settle_escapes(&self, at: std::time::Instant, read: u64) -> Option<std::time::Instant> {
         let mut next_due: Option<std::time::Instant> = None;
         self.with_tracker(|t| {
             let mut filters = self.lock_filters();
             for (pane_id, inputs) in filters.iter_mut() {
                 for input in inputs.iter_mut() {
-                    let Some((since, _)) = input.escape else {
+                    let Some((since, _, position)) = input.escape else {
                         continue;
                     };
                     if t.run_id(pane_id) != Some(input.run_id.as_str()) {
                         continue;
                     }
                     let due = since + LONE_ESCAPE_WINDOW;
-                    if at >= due {
-                        for written in input.take_held(true) {
-                            t.observe_run_input(pane_id, &input.run_id, written);
+                    if at >= due && position > read {
+                        next_due = Some(at);
+                    } else if at >= due {
+                        for w in input.take_held(true) {
+                            t.observe_run_input(pane_id, &input.run_id, w.at, w.kind);
                         }
                     } else {
                         next_due = Some(next_due.map_or(due, |d| d.min(due)));
@@ -1296,10 +1777,130 @@ impl Shared {
         }
     }
 
-    fn observe(&self, msg: &BroadcastMsg) {
+    /// When the last lone `ESC` written before broadcast message `position`
+    /// on `pane_id`, or on any pane with `None`, into a run the tracker takes
+    /// input for, leaves its window, if one is still in it at `now`: until
+    /// then nobody can say whether it is the Escape key, and it has to be
+    /// counted before that message is applied if it is.
+    fn escape_due_before(
+        &self,
+        pane_id: Option<&str>,
+        position: u64,
+        now: std::time::Instant,
+    ) -> Option<std::time::Instant> {
+        let t = self.tracker.lock().unwrap_or_else(|p| p.into_inner());
+        let filters = self.lock_filters();
+        filters
+            .iter()
+            .filter(|(pane, _)| pane_id.is_none_or(|p| p == pane.as_str()))
+            .flat_map(|(pane, inputs)| inputs.iter().map(move |input| (pane, input)))
+            .filter_map(|(pane, input)| {
+                let (since, _, at) = input.escape?;
+                let due = since + LONE_ESCAPE_WINDOW;
+                (at <= position && due > now && t.takes_input(pane, &input.run_id)).then_some(due)
+            })
+            .max()
+    }
+
+    /// Apply broadcast message `position`, after the input written before
+    /// the daemon broadcast it. A lone `ESC` written before it is waited out
+    /// first, so the Escape key counts in its place rather than after the
+    /// message: until [`LONE_ESCAPE_WINDOW`] has passed since it was written,
+    /// and never longer than that window from now, and only for events on its
+    /// pane or naming no pane. A write that decides the `ESC` during the wait
+    /// leaves what it decided in the `ESC`'s place, so that is counted before
+    /// the message too. An `ESC` whose window has still not passed by then
+    /// stays held, and counts after the message if it is the Escape key.
+    async fn observe_in_order(&self, msg: &BroadcastMsg, position: u64) {
+        let now = std::time::Instant::now();
         if let BroadcastMsg::Event(event) = msg {
-            self.with_tracker(|t| t.observe_event(event, now_unix_nanos()));
+            self.record_hook_latency(event);
         }
+        if let BroadcastMsg::Event(event) = msg
+            && let Some(due) = self.escape_due_before(event.pane_id.as_deref(), position, now)
+        {
+            let due = due.min(now + LONE_ESCAPE_WINDOW);
+            #[cfg(test)]
+            let gate = self.wait_gate.lock().unwrap().take();
+            #[cfg(test)]
+            if let Some((entered, resume)) = gate {
+                let _ = entered.send(());
+                let _ = resume.await;
+            }
+            tokio::time::sleep_until(Instant::from_std(due)).await;
+        }
+        self.observe(msg, position, std::time::Instant::now());
+    }
+
+    /// Apply broadcast message `position`, after the input written before
+    /// the daemon broadcast it, a lone `ESC` among it once its window has
+    /// passed by `now`.
+    fn observe(&self, msg: &BroadcastMsg, position: u64, now: std::time::Instant) {
+        match msg {
+            BroadcastMsg::Event(event) => self.with_tracker(|t| {
+                self.take_posts_before(t, Some(position), None);
+                // An event naming no pane can be applied to any.
+                self.take_input_before(t, event.pane_id.as_deref(), position, now);
+                t.observe_event(event, now_unix_nanos());
+            }),
+            BroadcastMsg::Inbox(notice) => self.with_tracker(|t| {
+                self.take_posts_before(t, Some(position), None);
+                t.observe_inbox(notice, now_unix_nanos());
+            }),
+            _ => {
+                if !self.lock_posts().queue.is_empty() {
+                    self.with_tracker(|t| {
+                        self.take_posts_before(t, Some(position), None);
+                    });
+                }
+            }
+        }
+        self.lock_clock().catch_up();
+    }
+
+    /// Issue #1981 M8: count how long `event` took from its hook's stamp to
+    /// the daemon receiving it ([`super::health`]), when the daemon admitted
+    /// it from a producer: only those carry the daemon's receipt stamp
+    /// ([`crate::event::RECEIVED_BY_DECK_AT_METADATA_KEY`]), so no event the
+    /// daemon builds itself is counted, whatever its type.
+    fn record_hook_latency(&self, event: &crate::event::AgentEvent) {
+        if self.health_interval.is_none() {
+            return;
+        }
+        let Some(received) = event
+            .metadata
+            .get(crate::event::RECEIVED_BY_DECK_AT_METADATA_KEY)
+            .and_then(|v| v.parse::<u64>().ok())
+        else {
+            return;
+        };
+        let Some(stamped) = event
+            .timestamp
+            .timestamp_nanos_opt()
+            .and_then(|n| u64::try_from(n).ok())
+        else {
+            return;
+        };
+        self.lock_health().record(stamped, received);
+    }
+
+    fn lock_health(&self) -> std::sync::MutexGuard<'_, super::health::Window> {
+        self.health.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Issue #1981 M8: end the health interval at `now`, the daemon's
+    /// resident memory then being `rss`, and queue its `daemon.health` span.
+    fn sample_health(&self, now: u64, rss: Option<u64>) {
+        let runs_open = self
+            .tracker
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .open_runs();
+        let dropped = self
+            .dropped_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let span = self.lock_health().close(now, runs_open, rss, dropped);
+        self.enqueue(vec![span]);
     }
 
     fn enqueue(&self, spans: Vec<SpanRecord>) {
@@ -1309,6 +1910,8 @@ impl Shared {
                 .try_send(ExportMsg::Span(Box::new(span)))
                 .is_err()
             {
+                self.dropped_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut log = self.dropped.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(suppressed) = log.record(std::time::Instant::now()) {
                     tracing::warn!(
@@ -1334,6 +1937,7 @@ fn start_exporting(
     };
     #[cfg(not(test))]
     let queue = spawn_exporter(config, host, settings.retry, stop)?;
+    let health_interval = settings.health_interval;
     let filters: Arc<Filters> = Arc::default();
     let mut tracker = RunTracker::new();
     let held = Arc::clone(&filters);
@@ -1344,16 +1948,26 @@ fn start_exporting(
         tracker: Mutex::new(tracker),
         queue,
         dropped: Mutex::new(RateLimitedLog::new(ERROR_LOG_INTERVAL)),
+        dropped_total: std::sync::atomic::AtomicU64::new(0),
+        health_interval,
+        health: Mutex::new(super::health::Window::new(now_unix_nanos())),
         filters,
+        clock: Mutex::default(),
+        posts: Mutex::default(),
         escape_held: tokio::sync::Notify::new(),
         stopping,
         runtime: tokio::runtime::Handle::current(),
         me: me.clone(),
         finalizing: watch::Sender::new(0),
+        dispatch_lookup: OnceLock::new(),
         #[cfg(test)]
         timer_gate: Mutex::new(None),
         #[cfg(test)]
+        wait_gate: Mutex::new(None),
+        #[cfg(test)]
         command_gate: Mutex::new(settings.command_gate),
+        #[cfg(test)]
+        command_gate_resumed: std::sync::atomic::AtomicBool::new(false),
     });
     let (commands, rx) = mpsc::unbounded_channel();
     let ingest = tokio::spawn(run_ingest(Arc::clone(&shared), rx));
@@ -1370,44 +1984,89 @@ fn start_exporting(
 const DRAIN_YIELD_EVERY: usize = 256;
 
 /// The ingest task: apply broadcast events as they come, each command after
-/// every event broadcast before it, and a held lone `ESC` as the Escape key
+/// every event broadcast before it, human input between the events broadcast
+/// before and after it was written, and a held lone `ESC` as the Escape key
 /// once its window has passed.
 async fn run_ingest(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiver<Command>) {
     let mut events: Option<broadcast::Receiver<BroadcastMsg>> = None;
+    // The broadcast messages `events` has passed, read or missed: the number
+    // of the next one, as [`BroadcastClock`] counts.
+    let mut read: u64 = 0;
     let mut escape_due: Option<std::time::Instant> = None;
     let mut usage_poll = tokio::time::interval(USAGE_POLL_INTERVAL);
     usage_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let usage_polling = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // `interval_at`: a plain interval's first tick is immediate, which would
+    // send an empty first interval at once.
+    let mut health = shared.health_interval.map(|every| {
+        let mut tick = tokio::time::interval_at(Instant::now() + every, every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick
+    });
     loop {
+        #[cfg(test)]
+        pause_at_command_gate(&shared, &commands).await;
         tokio::select! {
             biased;
             command = next_command(&shared, &mut commands) => {
                 let Some(command) = command else { break };
                 if let Command::Subscribe(rx) = command {
                     events = Some(rx);
+                    read = 0;
                     continue;
                 }
-                drain(&shared, &mut events).await;
+                drain(&shared, &mut events, &mut read).await;
+                if let Command::HumanInput { pane_id, run_id } = &command {
+                    take_input(&shared, &mut events, &mut read, pane_id, run_id).await;
+                    continue;
+                }
+                if let Command::DelegatePosted { seq } = command {
+                    take_posts(&shared, &mut events, &mut read, seq).await;
+                    continue;
+                }
                 if !apply(&shared, command) {
                     break;
                 }
             }
             () = shared.escape_held.notified() => {
                 #[cfg(test)]
-                if let Some((entered, resume)) = shared.timer_gate.lock().unwrap().take() {
+                let gate = shared.timer_gate.lock().unwrap().take();
+                #[cfg(test)]
+                if let Some((entered, resume)) = gate {
                     let _ = entered.send(());
-                    let _ = resume.recv();
+                    let _ = resume.await;
                 }
-                escape_due = shared.settle_escapes(std::time::Instant::now());
+                drain(&shared, &mut events, &mut read).await;
+                escape_due = shared.settle_escapes(std::time::Instant::now(), read);
             }
             () = sleep_until(escape_due) => {
-                escape_due = shared.settle_escapes(std::time::Instant::now());
+                drain(&shared, &mut events, &mut read).await;
+                escape_due = shared.settle_escapes(std::time::Instant::now(), read);
             }
-            _ = usage_poll.tick() => shared.poll_usage(&usage_polling),
+            _ = usage_poll.tick() => {
+                shared.poll_usage(&usage_polling);
+                shared.name_dispatched_runs();
+                // Issue #1981 M7: a hand-off past its age bound ends then,
+                // not when the next inbox change or post happens to come.
+                shared.with_tracker(|t| t.expire_handoffs(now_unix_nanos()));
+            }
+            () = next_tick(&mut health) => {
+                drain(&shared, &mut events, &mut read).await;
+                // The interval ends now; the memory read off this worker
+                // after it is that end's. No event is read meanwhile, and no
+                // lock is held across the read.
+                let now = now_unix_nanos();
+                let rss = super::health::rss_bytes().await;
+                shared.sample_health(now, rss);
+            }
             msg = next_event(&mut events) => match msg {
-                Ok(msg) => shared.observe(&msg),
+                Ok(msg) => {
+                    shared.observe_in_order(&msg, read).await;
+                    read += 1;
+                }
                 Err(broadcast::error::RecvError::Lagged(missed)) => {
                     tracing::debug!(missed, "telemetry: broadcast subscriber lagged");
+                    read += missed;
                 }
                 Err(broadcast::error::RecvError::Closed) => events = None,
             },
@@ -1423,24 +2082,48 @@ async fn next_command(
     commands.recv().await
 }
 
-/// [`mpsc::UnboundedReceiver::recv`], paused once at [`Shared::command_gate`]
-/// the first time it finds the queue empty.
+/// [`mpsc::UnboundedReceiver::recv`], which once resumed from
+/// [`Shared::command_gate`] first yields, so the other branches are polled
+/// before the queue, as when it was polled empty.
 #[cfg(test)]
 async fn next_command(
     shared: &Shared,
     commands: &mut mpsc::UnboundedReceiver<Command>,
 ) -> Option<Command> {
-    std::future::poll_fn(|cx| {
-        let polled = commands.poll_recv(cx);
-        if polled.is_pending()
-            && let Some((entered, resume)) = shared.command_gate.lock().unwrap().take()
-        {
-            let _ = entered.send(());
-            let _ = resume.recv();
+    if shared
+        .command_gate_resumed
+        .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        tokio::task::yield_now().await;
+    }
+    commands.recv().await
+}
+
+/// Test seam: pause the ingest task at [`Shared::command_gate`] the first
+/// time the command queue is found empty, before any branch is polled, by
+/// awaiting its second half rather than blocking the thread.
+#[cfg(test)]
+async fn pause_at_command_gate(shared: &Shared, commands: &mpsc::UnboundedReceiver<Command>) {
+    if !commands.is_empty() {
+        return;
+    }
+    let Some((entered, resume)) = shared.command_gate.lock().unwrap().take() else {
+        return;
+    };
+    let _ = entered.send(());
+    let _ = resume.await;
+    shared
+        .command_gate_resumed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+async fn next_tick(tick: &mut Option<tokio::time::Interval>) {
+    match tick {
+        Some(tick) => {
+            tick.tick().await;
         }
-        polled
-    })
-    .await
+        None => std::future::pending().await,
+    }
 }
 
 async fn sleep_until(due: Option<std::time::Instant>) {
@@ -1463,23 +2146,40 @@ async fn next_event(
 /// starts, not the ones published while it runs, so a producer that never
 /// stops cannot hold a command back. Yields to the runtime every
 /// [`DRAIN_YIELD_EVERY`] events.
-async fn drain(shared: &Shared, events: &mut Option<broadcast::Receiver<BroadcastMsg>>) {
+async fn drain(
+    shared: &Shared,
+    events: &mut Option<broadcast::Receiver<BroadcastMsg>>,
+    read: &mut u64,
+) {
+    // The messages between this receiver and the sender's tail right now.
+    let waiting = events.as_ref().map_or(0, |rx| rx.len() as u64);
+    drain_to(shared, events, read, *read + waiting).await;
+}
+
+/// Apply the broadcast up to, not including, message `to`, or as far as it
+/// has been sent. Yields to the runtime every [`DRAIN_YIELD_EVERY`] events,
+/// and waits out a lone `ESC` held before an event on its pane
+/// ([`Shared::observe_in_order`]).
+async fn drain_to(
+    shared: &Shared,
+    events: &mut Option<broadcast::Receiver<BroadcastMsg>>,
+    read: &mut u64,
+    to: u64,
+) {
     let Some(rx) = events else {
         return;
     };
-    // The messages between this receiver and the sender's tail right now.
-    let mut left = rx.len();
     let mut since_yield = 0usize;
-    while left > 0 {
+    while *read < to {
         match rx.try_recv() {
             Ok(msg) => {
-                left -= 1;
-                shared.observe(&msg);
+                shared.observe_in_order(&msg, *read).await;
+                *read += 1;
             }
             // The receiver skipped `missed` of them, which it will not see.
             Err(broadcast::error::TryRecvError::Lagged(missed)) => {
                 tracing::debug!(missed, "telemetry: broadcast subscriber lagged");
-                left = left.saturating_sub(usize::try_from(missed).unwrap_or(usize::MAX));
+                *read += missed;
             }
             Err(_) => break,
         }
@@ -1487,6 +2187,46 @@ async fn drain(shared: &Shared, events: &mut Option<broadcast::Receiver<Broadcas
         if since_yield >= DRAIN_YIELD_EVERY {
             since_yield = 0;
             tokio::task::yield_now().await;
+        }
+    }
+}
+
+/// Count the human input waiting with `run_id` on `pane_id`, each after the
+/// events broadcast before it was written: input written since the drain
+/// before this began waits for the broadcast to be applied up to it. Input
+/// the broadcast cannot be applied up to — it closed — is counted as it is.
+async fn take_input(
+    shared: &Shared,
+    events: &mut Option<broadcast::Receiver<BroadcastMsg>>,
+    read: &mut u64,
+    pane_id: &str,
+    run_id: &str,
+) {
+    while let Some(written) = shared.take_input(pane_id, run_id, Some(*read)) {
+        drain_to(shared, events, read, written).await;
+        if *read < written {
+            shared.take_input(pane_id, run_id, None);
+            break;
+        }
+    }
+}
+
+/// Place task `seq`, if it still waits, and any posted before it, each
+/// after the broadcast messages sent before it was posted, as [`take_input`]
+/// counts input; never one posted after it, whose own reminder may be queued
+/// behind the commit of its orchestrator's run. Posts the broadcast cannot be
+/// applied up to — it closed — are placed as they are.
+async fn take_posts(
+    shared: &Shared,
+    events: &mut Option<broadcast::Receiver<BroadcastMsg>>,
+    read: &mut u64,
+    seq: u64,
+) {
+    while let Some(posted) = shared.take_posts(Some(*read), seq) {
+        drain_to(shared, events, read, posted).await;
+        if *read < posted {
+            shared.take_posts(None, seq);
+            break;
         }
     }
 }
@@ -1516,7 +2256,8 @@ fn apply(shared: &Arc<Shared>, command: Command) -> bool {
                 shared.forget_ended_input(&pane_id, &run_id);
             }
         }
-        Command::HumanInput { pane_id, run_id } => shared.take_input(&pane_id, &run_id),
+        // Counted and applied by `run_ingest`, in order with the broadcast.
+        Command::HumanInput { .. } | Command::DelegatePosted { .. } => {}
         #[cfg(test)]
         Command::Barrier(ack) => {
             // Once the runs ended before it are completed too.
@@ -1531,6 +2272,9 @@ fn apply(shared: &Arc<Shared>, command: Command) -> bool {
             // the tracker ends the run.
             let (mut finished, finishing) = {
                 let mut tracker = shared.tracker.lock().unwrap_or_else(|p| p.into_inner());
+                // A task posted as shutdown began is opened, to end with the
+                // rest, as is one held for a run not opened yet.
+                shared.take_posts_before(&mut tracker, None, None);
                 tracker.end_all(EndReason::DaemonShutdown, now_unix_nanos());
                 tracker.take_finished_deferred()
             };
@@ -3162,7 +3906,7 @@ mod tests {
         // An Escape on another pane takes the task into its timer branch,
         // where it waits.
         let (entered, picked) = oneshot::channel();
-        let (resume, paused) = std::sync::mpsc::channel();
+        let (resume, paused) = oneshot::channel();
         *shared.timer_gate.lock().unwrap() = Some((entered, paused));
         telemetry.observe_client_input("p0", b"\x1b");
         picked.await.unwrap();
@@ -3187,6 +3931,825 @@ mod tests {
         let (count, times) = interventions(&captured(&mut rx));
         assert_eq!(count, Some(AttrValue::Int(2)));
         assert_eq!(times, vec![written, written + 6_000_000_000]);
+    }
+
+    /// The kinds of the intervention events on `spans`' run span.
+    fn intervention_kinds(spans: &[SpanRecord]) -> Vec<AttrValue> {
+        let run = spans.iter().find(|s| s.name == SPAN_AGENT_RUN).unwrap();
+        run.events
+            .iter()
+            .filter(|e| e.name == crate::telemetry::EVENT_INTERVENTION)
+            .filter_map(|e| {
+                e.attributes
+                    .iter()
+                    .find(|a| a.key == AttrKey::InterventionKind)
+                    .map(|a| a.value.clone())
+            })
+            .collect()
+    }
+
+    /// Input is written, then a status change is broadcast and applied before
+    /// the ingest task takes the input: the input's kind follows the prompt
+    /// in force when it was written, in both directions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_status_applied_before_the_input_is_taken_does_not_change_its_kind() {
+        // Stamped when sent, as a producer stamps them.
+        let now = |agent: &str, event_type| {
+            let mut msg = of("p1", agent, event_type);
+            if let BroadcastMsg::Event(e) = &mut msg {
+                e.timestamp = chrono::Utc::now();
+            }
+            msg
+        };
+        for (agent, before, after, expected) in [
+            (
+                "a1",
+                EventType::PermissionRequest,
+                EventType::Thinking,
+                "answer",
+            ),
+            (
+                "a2",
+                EventType::Thinking,
+                EventType::PermissionRequest,
+                "text",
+            ),
+        ] {
+            let (telemetry, mut rx) = capturing(ProbeSettings::default());
+            let shared = Arc::clone(&telemetry.exporting.as_ref().unwrap().shared);
+            let (tx, events) = broadcast::channel(16);
+            telemetry.subscribe(events);
+            begin(&telemetry, generation("p0", "other"), &[]);
+            begin(&telemetry, generation("p1", agent), &[]);
+            tx.send(now(agent, EventType::SessionStart)).unwrap();
+            tx.send(now(agent, before.clone())).unwrap();
+            telemetry.settled().await;
+
+            // An Escape on another pane holds the ingest task in its timer
+            // branch while the key is written and the status broadcast.
+            let (entered, picked) = oneshot::channel();
+            let (resume, paused) = oneshot::channel();
+            *shared.timer_gate.lock().unwrap() = Some((entered, paused));
+            telemetry.observe_client_input("p0", b"\x1b");
+            picked.await.unwrap();
+            telemetry.observe_client_input("p1", b"y");
+            tx.send(now(agent, after.clone())).unwrap();
+            resume.send(()).unwrap();
+
+            telemetry.settled().await;
+            telemetry.end_run("p1", Some(agent), EndReason::Exited, None);
+            telemetry.settled().await;
+            assert_eq!(
+                intervention_kinds(&captured(&mut rx)),
+                vec![AttrValue::Str(expected.into())],
+                "{before:?} then {after:?}"
+            );
+        }
+    }
+
+    /// The receiver handed to [`Telemetry::subscribe`] already has a prompt
+    /// opening waiting on it, which the ingest task reads first and numbers
+    /// from 0; input is written after it and before the prompt closes, all of
+    /// it applied in one pass. The input is an answer: the input clock starts
+    /// after the waiting messages, where the ingest task's numbering of the
+    /// next one does, so the input is counted after the prompt opened and
+    /// before it closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn input_after_messages_waiting_at_subscribe_is_placed_among_them() {
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        begin(&telemetry, generation("p0", "other"), &[]);
+        begin(&telemetry, generation("p1", "a1"), &[]);
+        let (tx, events) = broadcast::channel(16);
+        tx.send(of("p1", "a1", EventType::SessionStart)).unwrap();
+        tx.send(of("p1", "a1", EventType::PermissionRequest))
+            .unwrap();
+        telemetry.settled().await;
+
+        let resume = hold_ingest(&telemetry, "p0").await;
+        telemetry.subscribe(events);
+        telemetry.observe_client_input("p1", b"y");
+        tx.send(of("p1", "a1", EventType::Thinking)).unwrap();
+        resume.send(()).unwrap();
+
+        telemetry.settled().await;
+        telemetry.end_run("p1", Some("a1"), EndReason::Exited, None);
+        telemetry.settled().await;
+        assert_eq!(
+            intervention_kinds(&captured(&mut rx)),
+            vec![AttrValue::Str("answer".into())]
+        );
+    }
+
+    /// A paste whose end marker never comes is read as ended once
+    /// [`PASTE_IDLE_WINDOW`] passes with no input: what follows is its own
+    /// kind. Writes that keep coming within the window keep the paste going,
+    /// however long it runs in all.
+    #[tokio::test]
+    async fn a_paste_with_no_input_for_its_window_is_read_as_ended() {
+        for (agent, gap, expected) in [
+            ("a1", PASTE_IDLE_WINDOW, ["paste", "text", "interrupt"]),
+            (
+                "a2",
+                PASTE_IDLE_WINDOW - Duration::from_millis(1),
+                ["paste", "paste", "paste"],
+            ),
+        ] {
+            let (telemetry, mut rx) = capturing(ProbeSettings::default());
+            begin(&telemetry, generation("p1", agent), &[]);
+            telemetry.settled().await;
+            let at = std::time::Instant::now();
+            // Written in separate bursts, so each write's kind is its own.
+            let written = now_unix_nanos();
+            let apart = 2 * crate::telemetry::tracker::INTERVENTION_COALESCE_NANOS;
+            telemetry.observe_client_input_at("p1", b"\x1b[200~abc", written, at);
+            telemetry.observe_client_input_at("p1", b"def", written + apart, at + gap);
+            telemetry.observe_client_input_at("p1", b"\x03", written + 2 * apart, at + 2 * gap);
+            telemetry.settled().await;
+            telemetry.end_run("p1", Some(agent), EndReason::Exited, None);
+            telemetry.settled().await;
+            assert_eq!(
+                intervention_kinds(&captured(&mut rx)),
+                expected.map(|kind| AttrValue::Str(kind.into())),
+                "{gap:?}"
+            );
+        }
+    }
+
+    /// The intervention events on `spans`' run span: when, and of what kind.
+    fn timed_kinds(spans: &[SpanRecord]) -> Vec<(u64, AttrValue)> {
+        let run = spans.iter().find(|s| s.name == SPAN_AGENT_RUN).unwrap();
+        run.events
+            .iter()
+            .filter(|e| e.name == crate::telemetry::EVENT_INTERVENTION)
+            .map(|e| {
+                let kind = e
+                    .attributes
+                    .iter()
+                    .find(|a| a.key == AttrKey::InterventionKind);
+                (e.time_unix_nanos, kind.unwrap().value.clone())
+            })
+            .collect()
+    }
+
+    /// Holds the ingest task in its timer branch, by an Escape on `pane`,
+    /// until the returned sender is sent to; returns once it is held.
+    async fn hold_ingest(telemetry: &Telemetry, pane: &str) -> oneshot::Sender<()> {
+        let shared = &telemetry.exporting.as_ref().unwrap().shared;
+        let (entered, picked) = oneshot::channel();
+        let (resume, paused) = oneshot::channel();
+        *shared.timer_gate.lock().unwrap() = Some((entered, paused));
+        telemetry.observe_client_input(pane, b"\x1b");
+        picked.await.unwrap();
+        resume
+    }
+
+    /// A prompt opens, closes, and opens again with a producer stamp behind
+    /// both; the person types after it is broadcast, and the ingest task
+    /// applies it in the same pass as the keystroke. The keystroke came after
+    /// the prompt opened, on the order the deck recorded them in, so it is an
+    /// answer, whatever the producer stamped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_prompt_reopened_with_an_older_stamp_is_open_for_input_after_it() {
+        let stamped = |event_type, seconds_ago: i64| {
+            let mut msg = of("p1", "a1", event_type);
+            if let BroadcastMsg::Event(e) = &mut msg {
+                e.timestamp = chrono::Utc::now() - chrono::Duration::seconds(seconds_ago);
+            }
+            msg
+        };
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("p0", "other"), &[]);
+        begin(&telemetry, generation("p1", "a1"), &[]);
+        tx.send(stamped(EventType::SessionStart, 0)).unwrap();
+        tx.send(stamped(EventType::PermissionRequest, 0)).unwrap();
+        tx.send(stamped(EventType::Thinking, 0)).unwrap();
+        telemetry.settled().await;
+
+        let resume = hold_ingest(&telemetry, "p0").await;
+        tx.send(stamped(EventType::PermissionRequest, 60)).unwrap();
+        telemetry.observe_client_input("p1", b"y");
+        resume.send(()).unwrap();
+
+        telemetry.settled().await;
+        telemetry.end_run("p1", Some("a1"), EndReason::Exited, None);
+        telemetry.settled().await;
+        assert_eq!(
+            intervention_kinds(&captured(&mut rx)),
+            vec![AttrValue::Str("answer".into())]
+        );
+    }
+
+    /// Text written at 1 s is still waiting when the deck's answer, accepted
+    /// at 11 s, is applied in the same pass: the text counts first, at 1 s,
+    /// and the answer at 11 s, as two interventions. Input at 12 s joins the
+    /// answer's burst rather than starting one, since the last input never
+    /// moves back to 1 s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn input_waiting_when_a_deck_answer_is_applied_counts_before_it() {
+        let second = 1_000_000_000;
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("p0", "other"), &[]);
+        begin(&telemetry, generation("p1", "a1"), &[]);
+        tx.send(of("p1", "a1", EventType::SessionStart)).unwrap();
+        telemetry.settled().await;
+        let zero = now_unix_nanos() - 20 * second;
+
+        let resume = hold_ingest(&telemetry, "p0").await;
+        telemetry.observe_client_input_at("p1", b"x", zero + second, std::time::Instant::now());
+        let mut answered = of("p1", "a1", EventType::Thinking);
+        if let BroadcastMsg::Event(e) = &mut answered {
+            e.metadata.insert(
+                crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY.into(),
+                crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_VALUE.into(),
+            );
+            e.timestamp = chrono::DateTime::from_timestamp_nanos((zero + 11 * second) as i64);
+        }
+        tx.send(answered).unwrap();
+        resume.send(()).unwrap();
+        telemetry.settled().await;
+        telemetry.observe_client_input_at(
+            "p1",
+            b"z",
+            zero + 12 * second,
+            std::time::Instant::now(),
+        );
+
+        telemetry.settled().await;
+        telemetry.end_run("p1", Some("a1"), EndReason::Exited, None);
+        telemetry.settled().await;
+        assert_eq!(
+            timed_kinds(&captured(&mut rx)),
+            vec![
+                (zero + second, AttrValue::Str("text".into())),
+                (zero + 11 * second, AttrValue::Str("answer".into())),
+            ]
+        );
+    }
+
+    /// An Escape pressed at 1 s is still held when the deck's answer,
+    /// accepted at 11 s, is applied, with its window over (`expired`) or
+    /// still running: it counts first, as an interrupt at 1 s, and the answer
+    /// at 11 s, as two interventions, rather than one interrupt at 11 s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_escape_held_when_a_deck_answer_is_applied_counts_before_it() {
+        let second = 1_000_000_000;
+        for expired in [true, false] {
+            let (telemetry, mut rx) = capturing(ProbeSettings::default());
+            let (tx, events) = broadcast::channel(16);
+            telemetry.subscribe(events);
+            begin(&telemetry, generation("p0", "other"), &[]);
+            begin(&telemetry, generation("p1", "a1"), &[]);
+            tx.send(of("p1", "a1", EventType::SessionStart)).unwrap();
+            telemetry.settled().await;
+            let zero = now_unix_nanos() - 20 * second;
+
+            let resume = hold_ingest(&telemetry, "p0").await;
+            let pressed = if expired {
+                std::time::Instant::now() - LONE_ESCAPE_WINDOW
+            } else {
+                std::time::Instant::now()
+            };
+            telemetry.observe_client_input_at("p1", b"\x1b", zero + second, pressed);
+            let mut answered = of("p1", "a1", EventType::Thinking);
+            if let BroadcastMsg::Event(e) = &mut answered {
+                e.metadata.insert(
+                    crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY.into(),
+                    crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_VALUE.into(),
+                );
+                e.timestamp = chrono::DateTime::from_timestamp_nanos((zero + 11 * second) as i64);
+            }
+            tx.send(answered).unwrap();
+            resume.send(()).unwrap();
+
+            telemetry.settled().await;
+            telemetry.end_run("p1", Some("a1"), EndReason::Exited, None);
+            telemetry.settled().await;
+            assert_eq!(
+                timed_kinds(&captured(&mut rx)),
+                vec![
+                    (zero + second, AttrValue::Str("interrupt".into())),
+                    (zero + 11 * second, AttrValue::Str("answer".into())),
+                ],
+                "expired: {expired}"
+            );
+        }
+    }
+
+    /// An Escape pressed at 1 s is still held when a permission prompt
+    /// broadcast after it is applied, with its window over or still running:
+    /// the run records the interrupt before the status change the prompt
+    /// made, at 1 s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_escape_held_when_a_prompt_opens_counts_before_it() {
+        let second = 1_000_000_000;
+        for expired in [true, false] {
+            let (telemetry, mut rx) = capturing(ProbeSettings::default());
+            let (tx, events) = broadcast::channel(16);
+            telemetry.subscribe(events);
+            begin(&telemetry, generation("p0", "other"), &[]);
+            begin(&telemetry, generation("p1", "a1"), &[]);
+            tx.send(of("p1", "a1", EventType::SessionStart)).unwrap();
+            telemetry.settled().await;
+            let zero = now_unix_nanos() - 20 * second;
+
+            let resume = hold_ingest(&telemetry, "p0").await;
+            let pressed = if expired {
+                std::time::Instant::now() - LONE_ESCAPE_WINDOW
+            } else {
+                std::time::Instant::now()
+            };
+            telemetry.observe_client_input_at("p1", b"\x1b", zero + second, pressed);
+            tx.send(of("p1", "a1", EventType::PermissionRequest))
+                .unwrap();
+            resume.send(()).unwrap();
+
+            telemetry.settled().await;
+            telemetry.end_run("p1", Some("a1"), EndReason::Exited, None);
+            telemetry.settled().await;
+            let spans = captured(&mut rx);
+            assert_eq!(
+                timed_kinds(&spans),
+                vec![(zero + second, AttrValue::Str("interrupt".into()))],
+                "expired: {expired}"
+            );
+            let run = spans.iter().find(|s| s.name == SPAN_AGENT_RUN).unwrap();
+            let names: Vec<_> = run
+                .events
+                .iter()
+                .map(|e| e.name)
+                .filter(|&name| {
+                    name == crate::telemetry::EVENT_STATUS_CHANGE
+                        || name == crate::telemetry::EVENT_INTERVENTION
+                })
+                .collect();
+            assert_eq!(
+                names,
+                vec![
+                    crate::telemetry::EVENT_STATUS_CHANGE,
+                    crate::telemetry::EVENT_INTERVENTION,
+                    crate::telemetry::EVENT_STATUS_CHANGE,
+                ],
+                "expired: {expired}"
+            );
+        }
+    }
+
+    /// Text typed at 1 s, then an Escape at 5.99 s still held when the deck's
+    /// answer, accepted at 6.01 s, is applied; a second Escape at 6.02 s,
+    /// written while the ingest task waits out the first one's window,
+    /// decides the first as the Escape key. The first counts where it was
+    /// pressed, before the answer: one interrupt from 1 s, rather than the
+    /// text at 1 s and an interrupt at 6.01 s that the answer overtook.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_escape_decided_during_the_wait_for_it_counts_before_the_event() {
+        let second = 1_000_000_000;
+        let ms = 1_000_000;
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("p0", "other"), &[]);
+        begin(&telemetry, generation("p1", "a1"), &[]);
+        tx.send(of("p1", "a1", EventType::SessionStart)).unwrap();
+        telemetry.settled().await;
+        let zero = now_unix_nanos() - 20 * second;
+        let shared = &telemetry.exporting.as_ref().unwrap().shared;
+
+        let resume = hold_ingest(&telemetry, "p0").await;
+        let pressed = std::time::Instant::now();
+        telemetry.observe_client_input_at("p1", b"a", zero + second, pressed);
+        telemetry.observe_client_input_at("p1", b"\x1b", zero + 5990 * ms, pressed);
+        let mut answered = of("p1", "a1", EventType::Thinking);
+        if let BroadcastMsg::Event(e) = &mut answered {
+            e.metadata.insert(
+                crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY.into(),
+                crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_VALUE.into(),
+            );
+            e.timestamp = chrono::DateTime::from_timestamp_nanos((zero + 6010 * ms) as i64);
+        }
+        tx.send(answered).unwrap();
+        let (entered, waiting) = oneshot::channel();
+        let (go, paused) = oneshot::channel();
+        *shared.wait_gate.lock().unwrap() = Some((entered, paused));
+        resume.send(()).unwrap();
+        waiting.await.unwrap();
+        telemetry.observe_client_input_at(
+            "p1",
+            b"\x1b",
+            zero + 6020 * ms,
+            pressed + LONE_ESCAPE_WINDOW / 2,
+        );
+        go.send(()).unwrap();
+
+        telemetry.settled().await;
+        telemetry.end_run("p1", Some("a1"), EndReason::Exited, None);
+        telemetry.settled().await;
+        assert_eq!(
+            timed_kinds(&captured(&mut rx)),
+            vec![(zero + second, AttrValue::Str("interrupt".into()))]
+        );
+    }
+
+    /// A lone `ESC` that a later write decides — as the Escape key, by
+    /// another `ESC` or by its window passing, or as the start of a key's
+    /// sequence — counts at the time and broadcast position it was written
+    /// at; the rest of that write counts at its own. A sequence the next
+    /// write leaves undecided counts when a later write decides it.
+    #[test]
+    fn a_decided_escape_keeps_the_time_and_position_it_was_written_at() {
+        use InterventionKind::{Interrupt, Navigate, Text};
+        let pane_input = || PaneInput {
+            run_id: "r1".into(),
+            agent_id: None,
+            ended: false,
+            filter: InputFilter::new(),
+            escape: None,
+            paste: None,
+            pending: Vec::new(),
+        };
+        let timed = |human: Vec<Written>| -> Vec<_> {
+            human.iter().map(|w| (w.at, w.kind, w.position)).collect()
+        };
+        let pressed = std::time::Instant::now();
+        let soon = pressed + LONE_ESCAPE_WINDOW / 2;
+        let late = pressed + LONE_ESCAPE_WINDOW;
+        let cases: [(&[u8], _, Vec<_>, bool); 8] = [
+            (b"\x1b", soon, vec![(1, Interrupt, 3)], true),
+            (
+                b"\x1bab",
+                soon,
+                vec![(1, Interrupt, 3), (2, Text, 5)],
+                false,
+            ),
+            (b"x", soon, vec![(1, Navigate, 3)], false),
+            (b"\r", soon, vec![(1, Text, 3)], false),
+            (b"[Ahi", soon, vec![(1, Navigate, 3), (2, Text, 5)], false),
+            (b"[I", soon, vec![], false),
+            (b"x", late, vec![(1, Interrupt, 3), (2, Text, 5)], false),
+            (b"\x1b", late, vec![(1, Interrupt, 3)], true),
+        ];
+        for (next, at, expected, held) in cases {
+            let mut input = pane_input();
+            assert_eq!(input.write(b"\x1b", 1, 3, pressed).0.len(), 0);
+            let (human, still) = input.write(next, 2, 5, at);
+            assert_eq!(timed(human), expected, "{next:?}");
+            assert_eq!(still, held, "{next:?}");
+            let escape = input
+                .escape
+                .map(|(_, written, position)| (written, position));
+            assert_eq!(escape, held.then_some((2, 5)), "{next:?}");
+        }
+
+        let mut input = pane_input();
+        input.write(b"\x1b", 1, 3, pressed);
+        assert_eq!(timed(input.write(b"[1;", 2, 5, soon).0), vec![]);
+        assert_eq!(
+            timed(input.write(b"5A", 4, 7, soon).0),
+            vec![(4, Navigate, 7)]
+        );
+    }
+
+    /// The keys a held `ESC` can begin with bytes of their own after the one
+    /// that decides it: an SS3 cursor key, Alt with a multibyte character, an
+    /// X10 mouse report. With how many bytes after the `ESC` decide each.
+    const KEYS_WITH_TAILS: [(&[u8], usize); 3] =
+        [(b"OA", 1), ("\u{e9}".as_bytes(), 1), (b"[Mabc", 2)];
+
+    /// A held `ESC`, then the rest of its key, alone or with a `z` after it,
+    /// in two writes split at every byte. A key the first write decides
+    /// counts once, at the `ESC`'s time and position, wherever the split
+    /// falls inside it: the second write adds nothing for the rest of it. The
+    /// `z` counts at the time of the write it is in. A key split before it is
+    /// decided counts once, when the second write decides it, as the docs say.
+    #[test]
+    fn a_decided_key_counts_its_own_bytes_once() {
+        use InterventionKind::{Navigate, Text};
+        for ((key, decided), with_z) in KEYS_WITH_TAILS
+            .into_iter()
+            .flat_map(|key| [(key, false), (key, true)])
+        {
+            let mut rest = key.to_vec();
+            if with_z {
+                rest.push(b'z');
+            }
+            let z = |at, position| with_z.then_some((at, Text, position));
+            let pressed = std::time::Instant::now();
+            let soon = pressed + LONE_ESCAPE_WINDOW / 4;
+            let sooner = pressed + LONE_ESCAPE_WINDOW / 2;
+            for at in 0..=rest.len() {
+                let mut input = PaneInput {
+                    run_id: "r1".into(),
+                    agent_id: None,
+                    ended: false,
+                    filter: InputFilter::new(),
+                    escape: None,
+                    paste: None,
+                    pending: Vec::new(),
+                };
+                let timed = |human: Vec<Written>| -> Vec<_> {
+                    human.iter().map(|w| (w.at, w.kind, w.position)).collect()
+                };
+                assert!(input.write(b"\x1b", 1, 3, pressed).0.is_empty());
+                let first = timed(input.write(&rest[..at], 2, 5, soon).0);
+                let second = timed(input.write(&rest[at..], 4, 7, sooner).0);
+                let (want_first, want_second) = if at == 0 {
+                    (vec![], [Some((1, Navigate, 3)), z(4, 7)].to_vec())
+                } else if at < decided {
+                    let kind = if with_z { Text } else { Navigate };
+                    (vec![], vec![Some((4, kind, 7))])
+                } else if at <= key.len() {
+                    (vec![Some((1, Navigate, 3))], vec![z(4, 7)])
+                } else {
+                    (vec![Some((1, Navigate, 3)), z(2, 5)], vec![])
+                };
+                let want_first: Vec<_> = want_first.into_iter().flatten().collect();
+                let want_second: Vec<_> = want_second.into_iter().flatten().collect();
+                let what = format!("{rest:?} split at {at}");
+                assert_eq!(first, want_first, "{what}: first write");
+                assert_eq!(second, want_second, "{what}: second write");
+                assert!(!input.filter.is_holding(), "{what}");
+            }
+        }
+    }
+
+    /// An `ESC` at 1 s, the rest of its key at 1.01 s and a `z` at 6.005 s:
+    /// the key is one navigation from 1 s, so the `z`, more than the
+    /// coalescing window after it, starts an intervention of its own. Counted
+    /// again at 1.01 s, the key would pull the `z` into its burst as text.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_key_after_a_decided_one_starts_its_own_intervention() {
+        let second = 1_000_000_000;
+        let ms = 1_000_000;
+        for (key, _) in KEYS_WITH_TAILS {
+            let (telemetry, mut rx) = capturing(ProbeSettings::default());
+            begin(&telemetry, generation("p0", "other"), &[]);
+            begin(&telemetry, generation("p1", "a1"), &[]);
+            telemetry.settled().await;
+            let zero = now_unix_nanos() - 20 * second;
+
+            // Held, so the ESC's window cannot pass on the ingest task's clock.
+            let resume = hold_ingest(&telemetry, "p0").await;
+            let pressed = std::time::Instant::now();
+            telemetry.observe_client_input_at("p1", b"\x1b", zero + second, pressed);
+            telemetry.observe_client_input_at(
+                "p1",
+                key,
+                zero + 1010 * ms,
+                pressed + LONE_ESCAPE_WINDOW / 10,
+            );
+            telemetry.observe_client_input_at(
+                "p1",
+                b"z",
+                zero + 6005 * ms,
+                pressed + Duration::from_millis(6005),
+            );
+            resume.send(()).unwrap();
+
+            telemetry.settled().await;
+            telemetry.end_run("p1", Some("a1"), EndReason::Exited, None);
+            telemetry.settled().await;
+            assert_eq!(
+                timed_kinds(&captured(&mut rx)),
+                vec![
+                    (zero + second, AttrValue::Str("navigate".into())),
+                    (zero + 6005 * ms, AttrValue::Str("text".into())),
+                ],
+                "{key:?}"
+            );
+        }
+    }
+
+    /// An `ESC` at 1 s, a permission prompt broadcast, then the rest of its
+    /// key at 1.01 s: the key was pressed before the prompt opened, so it is
+    /// navigation, not an answer. A `z` typed after the prompt, at 7 s, is
+    /// the answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_key_decided_after_a_prompt_keeps_the_kind_it_had_before_it() {
+        let second = 1_000_000_000;
+        let ms = 1_000_000;
+        for (key, _) in KEYS_WITH_TAILS {
+            let (telemetry, mut rx) = capturing(ProbeSettings::default());
+            let (tx, events) = broadcast::channel(16);
+            telemetry.subscribe(events);
+            begin(&telemetry, generation("p0", "other"), &[]);
+            begin(&telemetry, generation("p1", "a1"), &[]);
+            tx.send(of("p1", "a1", EventType::SessionStart)).unwrap();
+            telemetry.settled().await;
+            let zero = now_unix_nanos() - 20 * second;
+
+            let resume = hold_ingest(&telemetry, "p0").await;
+            let pressed = std::time::Instant::now();
+            telemetry.observe_client_input_at("p1", b"\x1b", zero + second, pressed);
+            tx.send(of("p1", "a1", EventType::PermissionRequest))
+                .unwrap();
+            telemetry.observe_client_input_at(
+                "p1",
+                key,
+                zero + 1010 * ms,
+                pressed + LONE_ESCAPE_WINDOW / 10,
+            );
+            telemetry.observe_client_input_at(
+                "p1",
+                b"z",
+                zero + 7 * second,
+                pressed + Duration::from_secs(7),
+            );
+            resume.send(()).unwrap();
+
+            telemetry.settled().await;
+            telemetry.end_run("p1", Some("a1"), EndReason::Exited, None);
+            telemetry.settled().await;
+            assert_eq!(
+                timed_kinds(&captured(&mut rx)),
+                vec![
+                    (zero + second, AttrValue::Str("navigate".into())),
+                    (zero + 7 * second, AttrValue::Str("answer".into())),
+                ],
+                "{key:?}"
+            );
+        }
+    }
+
+    /// An `ESC` at 1 s, its key's deciding bytes at 1.005 s, a permission
+    /// prompt broadcast, then the rest of the key at 1.01 s: the key was
+    /// counted, as navigation, before the prompt opened, and the rest of it
+    /// is not input of its own, so it does not answer the prompt. A `z` typed
+    /// after the prompt, at 7 s, is the answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_key_split_around_a_prompt_keeps_the_kind_it_had_before_it() {
+        let second = 1_000_000_000;
+        let ms = 1_000_000;
+        for (key, decided) in KEYS_WITH_TAILS {
+            let (telemetry, mut rx) = capturing(ProbeSettings::default());
+            let (tx, events) = broadcast::channel(16);
+            telemetry.subscribe(events);
+            begin(&telemetry, generation("p0", "other"), &[]);
+            begin(&telemetry, generation("p1", "a1"), &[]);
+            tx.send(of("p1", "a1", EventType::SessionStart)).unwrap();
+            telemetry.settled().await;
+            let zero = now_unix_nanos() - 20 * second;
+
+            let resume = hold_ingest(&telemetry, "p0").await;
+            let pressed = std::time::Instant::now();
+            telemetry.observe_client_input_at("p1", b"\x1b", zero + second, pressed);
+            telemetry.observe_client_input_at(
+                "p1",
+                &key[..decided],
+                zero + 1005 * ms,
+                pressed + LONE_ESCAPE_WINDOW / 20,
+            );
+            tx.send(of("p1", "a1", EventType::PermissionRequest))
+                .unwrap();
+            telemetry.observe_client_input_at(
+                "p1",
+                &key[decided..],
+                zero + 1010 * ms,
+                pressed + LONE_ESCAPE_WINDOW / 10,
+            );
+            telemetry.observe_client_input_at(
+                "p1",
+                b"z",
+                zero + 7 * second,
+                pressed + Duration::from_secs(7),
+            );
+            resume.send(()).unwrap();
+
+            telemetry.settled().await;
+            telemetry.end_run("p1", Some("a1"), EndReason::Exited, None);
+            telemetry.settled().await;
+            assert_eq!(
+                timed_kinds(&captured(&mut rx)),
+                vec![
+                    (zero + second, AttrValue::Str("navigate".into())),
+                    (zero + 7 * second, AttrValue::Str("answer".into())),
+                ],
+                "{key:?}"
+            );
+        }
+    }
+
+    /// Messages already waiting on the ingest task's receiver when the clock
+    /// is made are before it: input written then counts after all of them.
+    #[test]
+    fn the_clock_numbers_messages_queued_before_it() {
+        let (tx, events) = broadcast::channel(16);
+        for _ in 0..3 {
+            tx.send(of("p1", "a1", EventType::Thinking)).unwrap();
+        }
+        let clock = BroadcastClock::numbering(&events);
+        assert_eq!(clock.position(), 3);
+        tx.send(of("p1", "a1", EventType::Thinking)).unwrap();
+        // The ingest task numbers what it reads from 0: the fourth message,
+        // number 3, is the first after input written at position 3.
+        assert_eq!(clock.position(), 4);
+        assert_eq!(events.len() as u64, clock.position());
+    }
+
+    /// Messages a small ring overwrote before the clock read them still
+    /// count, as the ingest task counts the ones it missed, before and after
+    /// the clock catches up.
+    #[test]
+    fn the_clock_counts_messages_a_small_ring_dropped() {
+        let (tx, mut events) = broadcast::channel(4);
+        let mut clock = BroadcastClock::numbering(&events);
+        for _ in 0..10 {
+            tx.send(of("p1", "a1", EventType::Thinking)).unwrap();
+        }
+        assert_eq!(clock.position(), 10);
+        let mut read = 0;
+        while let Ok(n) = match events.try_recv() {
+            Ok(_) => Ok(1),
+            Err(broadcast::error::TryRecvError::Lagged(missed)) => Ok(missed),
+            Err(e) => Err(e),
+        } {
+            read += n;
+        }
+        assert_eq!(read, clock.position(), "the ingest task's count");
+
+        for _ in 0..CLOCK_CATCH_UP_AT {
+            tx.send(of("p1", "a1", EventType::Thinking)).unwrap();
+        }
+        let behind = 10 + CLOCK_CATCH_UP_AT as u64;
+        assert_eq!(clock.position(), behind);
+        clock.catch_up();
+        assert_eq!(clock.position(), behind);
+        assert_eq!(clock.base, behind, "read through the overwritten ones");
+    }
+
+    /// The clock reads nothing until it is [`CLOCK_CATCH_UP_AT`] behind, then
+    /// reads all of it, and its position moves with neither.
+    #[test]
+    fn the_clock_catches_up_at_its_trigger_without_moving() {
+        let (tx, events) = broadcast::channel(1024);
+        let mut clock = BroadcastClock::numbering(&events);
+        for _ in 0..CLOCK_CATCH_UP_AT - 1 {
+            tx.send(of("p1", "a1", EventType::Thinking)).unwrap();
+        }
+        clock.catch_up();
+        assert_eq!(clock.base, 0, "not behind enough to read");
+        assert_eq!(clock.position(), CLOCK_CATCH_UP_AT as u64 - 1);
+        tx.send(of("p1", "a1", EventType::Thinking)).unwrap();
+        clock.catch_up();
+        assert_eq!(clock.base, CLOCK_CATCH_UP_AT as u64);
+        assert_eq!(clock.rx.as_ref().unwrap().len(), 0);
+        assert_eq!(clock.position(), CLOCK_CATCH_UP_AT as u64);
+        tx.send(of("p1", "a1", EventType::Thinking)).unwrap();
+        assert_eq!(clock.position(), CLOCK_CATCH_UP_AT as u64 + 1);
+    }
+
+    /// With the ingest task held and hundreds of messages on another pane
+    /// either side, text typed at 1 s, before a permission prompt is
+    /// broadcast, and a key typed at 11 s, after it, with the clock catching
+    /// up in between, are read against the prompt as it stood before each:
+    /// text, then an answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn input_either_side_of_a_clock_catch_up_is_read_against_the_prompt_before_it() {
+        let second = 1_000_000_000;
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let (tx, events) = broadcast::channel(1024);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("p0", "other"), &[]);
+        begin(&telemetry, generation("p1", "a1"), &[]);
+        tx.send(of("p1", "a1", EventType::SessionStart)).unwrap();
+        telemetry.settled().await;
+        let zero = now_unix_nanos() - 20 * second;
+        let shared = &telemetry.exporting.as_ref().unwrap().shared;
+        let filler = |n: usize| {
+            for _ in 0..n {
+                tx.send(of("p2", "a2", EventType::Thinking)).unwrap();
+            }
+        };
+
+        let resume = hold_ingest(&telemetry, "p0").await;
+        filler(CLOCK_CATCH_UP_AT - 56);
+        let now = std::time::Instant::now();
+        telemetry.observe_client_input_at("p1", b"a", zero + second, now);
+        tx.send(of("p1", "a1", EventType::PermissionRequest))
+            .unwrap();
+        filler(100);
+        {
+            let mut clock = shared.lock_clock();
+            let before = clock.position();
+            clock.catch_up();
+            assert_eq!(clock.position(), before);
+            assert_eq!(clock.rx.as_ref().unwrap().len(), 0, "caught up");
+        }
+        telemetry.observe_client_input_at("p1", b"b", zero + 11 * second, now);
+        resume.send(()).unwrap();
+
+        telemetry.settled().await;
+        telemetry.end_run("p1", Some("a1"), EndReason::Exited, None);
+        telemetry.settled().await;
+        assert_eq!(
+            timed_kinds(&captured(&mut rx)),
+            vec![
+                (zero + second, AttrValue::Str("text".into())),
+                (zero + 11 * second, AttrValue::Str("answer".into())),
+            ]
+        );
     }
 
     /// Threads 4 / 10: a run's end is stamped when the ingest task applies
@@ -3367,6 +4930,65 @@ mod tests {
             agent: AgentType::None,
             ..generation(pane, agent_id)
         }
+    }
+
+    /// Issue #1981 M6: a dispatched unit's run is named as it is prepared,
+    /// so the name survives the run ending before anything else could name
+    /// it. With the ingest task paused, the run is prepared in the unit's
+    /// worktree and committed, its pane's close is broadcast, and the spawn
+    /// ends without saying which generations it started — as when the close
+    /// also removed the unit from the deck's record. Resumed, the ingest task
+    /// takes the close before the commit, and the run still ends named; a run
+    /// prepared outside the worktree does not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dispatched_run_closed_before_ingest_keeps_its_name() {
+        let (entered, polled_empty) = oneshot::channel();
+        let (resume, paused) = oneshot::channel();
+        let (sink, mut rx) = mpsc::channel(QUEUE_CAPACITY);
+        let telemetry = Arc::new(Telemetry::start_with(
+            &env(&ON),
+            Settings {
+                sink: Some(sink),
+                command_gate: Some((entered, paused)),
+                ..Settings::default()
+            },
+        ));
+        polled_empty.await.unwrap();
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        let naming = telemetry
+            .begin_dispatch("My Unit: exact", Path::new("/w/my-unit"))
+            .unwrap();
+        for (pane, agent, cwd) in [("p1", "a1", "/w/my-unit"), ("p2", "a2", "/w/other")] {
+            telemetry
+                .prepare_run(command_run(pane, agent), &[], Some(PathBuf::from(cwd)))
+                .unwrap()
+                .commit();
+            tx.send(pane_closed(pane, agent)).unwrap();
+        }
+        drop(naming);
+        resume.send(()).unwrap();
+        let mut spans = Vec::new();
+        eventually("both runs' spans were queued", || {
+            spans.extend(captured(&mut rx));
+            ended_runs(&spans).len() == 2
+        })
+        .await;
+        let run = |pane: &str| {
+            *ended_runs(&spans)
+                .iter()
+                .find(|s| attr(s, AttrKey::PaneId) == Some(&AttrValue::Str(pane.into())))
+                .unwrap_or_else(|| panic!("no run span for {pane}"))
+        };
+        assert_eq!(
+            attr(run("p1"), AttrKey::EndReason),
+            Some(&AttrValue::Str("closed".into()))
+        );
+        assert_eq!(
+            attr(run("p1"), AttrKey::DispatchName),
+            Some(&AttrValue::Str("My Unit: exact".into()))
+        );
+        assert_eq!(attr(run("p2"), AttrKey::DispatchName), None);
     }
 
     fn ended_runs(spans: &[SpanRecord]) -> Vec<&SpanRecord> {
@@ -3609,7 +5231,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_escape_whose_wake_beats_its_runs_commit_still_settles() {
         let (entered, polled_empty) = oneshot::channel();
-        let (resume, paused) = std::sync::mpsc::channel();
+        let (resume, paused) = oneshot::channel();
         let (sink, mut rx) = mpsc::channel(QUEUE_CAPACITY);
         let telemetry = Arc::new(Telemetry::start_with(
             &env(&ON),
@@ -3664,21 +5286,22 @@ mod tests {
     }
 
     /// N2: Escape followed by another key. Inside the window the two are one
-    /// sequence (Alt+key); past it the Escape counts at its own time, and the
-    /// key joins its burst or starts a new one by the usual rule.
+    /// sequence (Alt+key), pressed when the Escape was; past it the Escape
+    /// counts at its own time, and the key joins its burst or starts a new
+    /// one by the usual rule.
     #[tokio::test]
     async fn the_escape_key_then_another_key_counts_by_when_each_was_pressed() {
         let (telemetry, mut rx) = capturing(ProbeSettings::default());
         let second = 1_000_000_000u64;
-        let cases: [(Duration, i64, usize); 3] = [
-            // Alt+a: one intervention, at the second write.
-            (Duration::from_millis(10), 1, 1),
+        let cases: [(Duration, i64); 3] = [
+            // Alt+a: one intervention, at the Escape that began it.
+            (Duration::from_millis(10), 1),
             // Past the window, inside a burst: one, at the Escape.
-            (Duration::from_secs(1), 1, 0),
+            (Duration::from_secs(1), 1),
             // Past a burst: two.
-            (Duration::from_secs(6), 2, 0),
+            (Duration::from_secs(6), 2),
         ];
-        for (i, (later, count, first_at)) in cases.into_iter().enumerate() {
+        for (i, (later, count)) in cases.into_iter().enumerate() {
             let agent = format!("a{i}");
             begin(&telemetry, generation("p1", &agent), &[]);
             let t0 = 100 * second;
@@ -3690,7 +5313,7 @@ mod tests {
             telemetry.settled().await;
             let (got, times) = interventions(&captured(&mut rx));
             assert_eq!(got, Some(AttrValue::Int(count)), "{later:?}");
-            assert_eq!(times[0], [t0, t1][first_at], "{later:?}");
+            assert_eq!(times[0], t0, "{later:?}");
             if count == 2 {
                 assert_eq!(times, vec![t0, t1]);
             }
@@ -4966,5 +6589,975 @@ mod tests {
             );
         }
         let _ = Attribute::str(AttrKey::RunId, "");
+    }
+
+    fn health_attr(span: &SpanRecord, key: AttrKey) -> Option<i64> {
+        match attr(span, key)? {
+            AttrValue::Int(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    fn some_span() -> SpanRecord {
+        SpanRecord {
+            trace_id: [1; 16],
+            span_id: [1; 8],
+            parent_span_id: None,
+            name: SPAN_AGENT_RUN,
+            start_unix_nanos: 1,
+            end_unix_nanos: 2,
+            attributes: Vec::new(),
+            events: Vec::new(),
+        }
+    }
+
+    /// Issue #1981 M8: `deck.telemetry.spans.dropped` is every span the
+    /// queue refused since the start, the health spans it refused included,
+    /// and is not reset between warnings or between samples.
+    #[tokio::test]
+    async fn dropped_spans_are_counted_exactly_across_health_samples() {
+        let (sink, mut rx) = mpsc::channel(2);
+        let telemetry = Telemetry::start_with(
+            &env(&ON),
+            Settings {
+                sink: Some(sink),
+                ..Settings::default()
+            },
+        );
+        let shared = &telemetry.exporting.as_ref().unwrap().shared;
+        // Two fit; three are refused.
+        shared.enqueue((0..5).map(|_| some_span()).collect());
+        // A health span sampled now says three, and is refused itself.
+        shared.sample_health(now_unix_nanos(), None);
+        let held = captured(&mut rx);
+        assert_eq!(held.len(), 2);
+        assert!(held.iter().all(|s| s.name == SPAN_AGENT_RUN));
+        // Room again: two samples in a row, each counting the refused one.
+        shared.sample_health(now_unix_nanos(), None);
+        shared.sample_health(now_unix_nanos(), None);
+        // The queue is full again: this sample is refused.
+        shared.sample_health(now_unix_nanos(), None);
+        let samples = captured(&mut rx);
+        let dropped: Vec<_> = samples
+            .iter()
+            .map(|s| {
+                assert_eq!(s.name, crate::telemetry::SPAN_DAEMON_HEALTH);
+                health_attr(s, AttrKey::SpansDropped)
+            })
+            .collect();
+        assert_eq!(dropped, vec![Some(4), Some(4)]);
+        shared.sample_health(now_unix_nanos(), None);
+        let next = captured(&mut rx);
+        assert_eq!(next.len(), 1);
+        assert_eq!(health_attr(&next[0], AttrKey::SpansDropped), Some(5));
+        // The interval of each sample starts where the last one ended.
+        assert_eq!(samples[1].start_unix_nanos, samples[0].end_unix_nanos);
+    }
+
+    /// Issue #1981 M8: the ingest task sends `daemon.health` on its interval,
+    /// counting the open runs and the latency of the hook events an agent
+    /// produced, never of one the daemon made itself.
+    #[tokio::test]
+    async fn health_is_sampled_on_its_interval_from_producer_events_only() {
+        let (sink, mut rx) = mpsc::channel(QUEUE_CAPACITY);
+        let telemetry = Arc::new(Telemetry::start_with(
+            &env(&ON),
+            Settings {
+                sink: Some(sink),
+                health_interval: Some(Duration::from_millis(50)),
+                ..Settings::default()
+            },
+        ));
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("p1", "a1"), &[]);
+        let mut produced = event("p1", EventType::Thinking);
+        produced.agent_id = Some("a1".into());
+        produced.timestamp = chrono::Utc::now() - chrono::Duration::milliseconds(1500);
+        tx.send(BroadcastMsg::Event(received_after(produced, 1500)))
+            .unwrap();
+        // The daemon's own: a shell's busy state.
+        tx.send(of("p1", "a1", EventType::ShellBusy)).unwrap();
+        telemetry.settled().await;
+        let applied = now_unix_nanos();
+        let mut health = Vec::new();
+        // Once an interval opened after the events were applied has been
+        // sent, the one they fell in has been too.
+        eventually("an interval after the events", || {
+            health.extend(
+                captured(&mut rx)
+                    .into_iter()
+                    .filter(|s| s.name == crate::telemetry::SPAN_DAEMON_HEALTH),
+            );
+            health.iter().any(|s| s.start_unix_nanos >= applied)
+        })
+        .await;
+        let count: i64 = health
+            .iter()
+            .map(|s| health_attr(s, AttrKey::HookLatencyCount).unwrap())
+            .sum();
+        assert_eq!(count, 1, "{health:?}");
+        let sampled = health
+            .iter()
+            .find(|s| health_attr(s, AttrKey::HookLatencyCount) == Some(1))
+            .unwrap();
+        assert!(health_attr(sampled, AttrKey::HookLatencyP50).unwrap() >= 1500);
+        assert!(
+            health
+                .iter()
+                .all(|s| health_attr(s, AttrKey::DaemonRunsOpen) == Some(1))
+        ); // The memory read off the ingest task's worker reaches each sample.
+        #[cfg(target_os = "linux")]
+        assert!(
+            health
+                .iter()
+                .all(|s| health_attr(s, AttrKey::DaemonMemoryRss).is_some_and(|b| b > 0)),
+            "{health:?}"
+        );
+    }
+
+    /// Issue #1981 M8: `event` as the daemon admits it from a producer,
+    /// received `ms` milliseconds after its hook stamped it
+    /// (`crate::daemon::admit_producer_event`).
+    fn received_after(mut event: AgentEvent, ms: i64) -> AgentEvent {
+        let at = event.timestamp + chrono::Duration::milliseconds(ms);
+        event.metadata.insert(
+            crate::event::RECEIVED_BY_DECK_AT_METADATA_KEY.to_string(),
+            at.timestamp_nanos_opt().unwrap().to_string(),
+        );
+        event
+    }
+
+    /// Issue #1981 M8 (PR #2010 review): hook latency counts only the events
+    /// the daemon admitted from a producer, measured to when the daemon
+    /// received each. The events the daemon builds itself carry no receipt
+    /// stamp and are not counted, whatever their type: the question it turns
+    /// keyboard-only after typing part of an answer, a Codex turn's failure
+    /// read from its rollout, and a shell's busy state.
+    #[tokio::test]
+    async fn only_events_admitted_from_a_producer_are_hook_latency_samples() {
+        let (sink, mut rx) = mpsc::channel(QUEUE_CAPACITY);
+        let telemetry = Arc::new(Telemetry::start_with(
+            &env(&ON),
+            Settings {
+                sink: Some(sink),
+                // Sampled by hand below, not by the interval.
+                health_interval: Some(Duration::from_secs(3600)),
+                ..Settings::default()
+            },
+        ));
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("p1", "a1"), &[]);
+        // Stamped by its hook a minute ago and received 1.5 s later: the
+        // sample is the 1.5 s, not the minute until the broadcast was read.
+        let mut produced = event("p1", EventType::Thinking);
+        produced.agent_id = Some("a1".into());
+        produced.timestamp = chrono::Utc::now() - chrono::Duration::seconds(60);
+        tx.send(BroadcastMsg::Event(received_after(produced, 1500)))
+            .unwrap();
+        let question: crate::question::PendingQuestion =
+            serde_json::from_value(serde_json::json!({
+                "id": "q1",
+                "kind": "permission",
+                "questions": [{"prompt": "Allow?", "options": [
+                    {"index": 1, "label": "Yes", "role": "allow_once"},
+                    {"index": 2, "label": "No", "role": "deny"},
+                ]}],
+                "raised_at_ms": 1,
+                "channel": "unsupported",
+                "revision": 2,
+            }))
+            .unwrap();
+        let mut keyboard_only = crate::daemon::deck_keyboard_only_event(
+            "p1-session".into(),
+            AgentType::ClaudeCode,
+            Some("p1".into()),
+            Some("a1".into()),
+            &question,
+        );
+        keyboard_only.timestamp = chrono::Utc::now() - chrono::Duration::milliseconds(9000);
+        tx.send(BroadcastMsg::Event(keyboard_only)).unwrap();
+        let mut rollout_error = crate::daemon::codex_rollout_failure_event(
+            crate::codex_rollout_tail::CodexTurnFailure {
+                pane_id: "p1".into(),
+                agent_id: "a1".into(),
+                session_id: "p1-session".into(),
+                turn_id: "t1".into(),
+                outcome: crate::quota_signals::FailureOutcome::Error,
+                message: None,
+            },
+        );
+        assert_eq!(rollout_error.event_type, EventType::Error, "precondition");
+        rollout_error.timestamp = chrono::Utc::now() - chrono::Duration::milliseconds(9000);
+        tx.send(BroadcastMsg::Event(rollout_error)).unwrap();
+        tx.send(of("p1", "a1", EventType::ShellBusy)).unwrap();
+        telemetry.settled().await;
+        let shared = &telemetry.exporting.as_ref().unwrap().shared;
+        shared.sample_health(now_unix_nanos(), None);
+        let health: Vec<_> = captured(&mut rx)
+            .into_iter()
+            .filter(|s| s.name == crate::telemetry::SPAN_DAEMON_HEALTH)
+            .collect();
+        assert_eq!(health.len(), 1, "{health:?}");
+        assert_eq!(health_attr(&health[0], AttrKey::HookLatencyCount), Some(1));
+        assert_eq!(health_attr(&health[0], AttrKey::HookLatencyMax), Some(1500));
+        assert_eq!(health_attr(&health[0], AttrKey::HookLatencyP50), Some(1500));
+    }
+
+    /// Issue #1981 M8: an event carrying no receipt stamp, or one that is not
+    /// a number, is no hook latency sample, whatever its type or age.
+    #[tokio::test]
+    async fn an_event_without_a_readable_receipt_stamp_is_no_hook_latency_sample() {
+        let (sink, mut rx) = mpsc::channel(QUEUE_CAPACITY);
+        let telemetry = Arc::new(Telemetry::start_with(
+            &env(&ON),
+            Settings {
+                sink: Some(sink),
+                health_interval: Some(Duration::from_secs(3600)),
+                ..Settings::default()
+            },
+        ));
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("p1", "a1"), &[]);
+        let mut unstamped = event("p1", EventType::Thinking);
+        unstamped.agent_id = Some("a1".into());
+        tx.send(BroadcastMsg::Event(unstamped.clone())).unwrap();
+        unstamped.metadata.insert(
+            crate::event::RECEIVED_BY_DECK_AT_METADATA_KEY.to_string(),
+            "soon".to_string(),
+        );
+        tx.send(BroadcastMsg::Event(unstamped)).unwrap();
+        telemetry.settled().await;
+        let shared = &telemetry.exporting.as_ref().unwrap().shared;
+        shared.sample_health(now_unix_nanos(), None);
+        let health: Vec<_> = captured(&mut rx)
+            .into_iter()
+            .filter(|s| s.name == crate::telemetry::SPAN_DAEMON_HEALTH)
+            .collect();
+        assert_eq!(health.len(), 1, "{health:?}");
+        assert_eq!(health_attr(&health[0], AttrKey::HookLatencyCount), Some(0));
+    }
+
+    /// Issue #1981 M7 review: a post keeps its place on the broadcast. With
+    /// the ingest task paused, a task is posted and then the orchestrator's
+    /// pane-close is broadcast; resumed, the post is applied before the
+    /// close, so the hand-off is the orchestrator run's child and ends
+    /// `unknown` at that run's end rather than parentless and open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_post_is_applied_before_a_pane_close_broadcast_after_it() {
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("orch", "oa"), &[]);
+        begin(&telemetry, generation("work", "wa"), &[]);
+        telemetry.settled().await;
+        let shared = &telemetry.exporting.as_ref().unwrap().shared;
+        let (entered, polled_empty) = oneshot::channel();
+        let (resume, paused) = oneshot::channel();
+        *shared.command_gate.lock().unwrap() = Some((entered, paused));
+        // A barrier brings the task round to the gate, unless its usage poll
+        // already did, with the barrier queued behind it.
+        let nudge = {
+            let telemetry = Arc::clone(&telemetry);
+            tokio::spawn(async move { telemetry.settled().await })
+        };
+        polled_empty.await.unwrap();
+        crate::telemetry::observe_delegate_posted(
+            Some(Arc::clone(&telemetry)),
+            &crate::telemetry::DelegatePosted {
+                message_id: "m-t",
+                orchestrator_pane: "orch",
+                orchestrator_agent_id: Some("oa"),
+                worker_pane: "work",
+                worker_agent_id: "wa",
+                role: "coder",
+            },
+        );
+        tx.send(pane_closed("orch", "oa")).unwrap();
+        resume.send(()).unwrap();
+        nudge.await.unwrap();
+        telemetry.settled().await;
+        let spans = captured(&mut rx);
+        let handoffs: Vec<_> = spans
+            .iter()
+            .filter(|s| s.name == crate::telemetry::SPAN_AGENT_HANDOFF)
+            .collect();
+        assert_eq!(handoffs.len(), 1, "{spans:?}");
+        let handoff = handoffs[0];
+        let run = ended_runs(&spans)
+            .into_iter()
+            .find(|s| attr(s, AttrKey::PaneId) == Some(&AttrValue::Str("orch".into())))
+            .expect("the orchestrator's run ended");
+        assert_eq!(handoff.trace_id, run.trace_id);
+        assert_eq!(handoff.parent_span_id, Some(run.span_id));
+        assert_eq!(attr(handoff, AttrKey::RunId), attr(run, AttrKey::RunId));
+        assert_eq!(
+            attr(handoff, AttrKey::HandoffOutcome),
+            Some(&AttrValue::Str("unknown".into()))
+        );
+        assert_eq!(handoff.end_unix_nanos, run.end_unix_nanos);
+    }
+
+    /// Issue #1981 M7 review: the ingest task ends a hand-off past its age
+    /// bound on its own timer, with no inbox change or post to prompt it,
+    /// at the moment the bound was reached.
+    #[tokio::test]
+    async fn the_ingest_timer_ends_a_handoff_past_its_age_bound() {
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        begin(&telemetry, generation("orch", "oa"), &[]);
+        telemetry.settled().await;
+        let posted_at = now_unix_nanos() - crate::telemetry::handoff::MAX_HANDOFF_AGE_NANOS - 1;
+        let shared = &telemetry.exporting.as_ref().unwrap().shared;
+        shared.with_tracker(|t| {
+            t.delegate_posted(crate::telemetry::handoff::Posted {
+                message_id: "m-old".into(),
+                orchestrator_pane: "orch".into(),
+                orchestrator_agent_id: Some("oa".into()),
+                worker_pane: "work".into(),
+                worker_agent_id: "wa".into(),
+                role: "coder".into(),
+                at: posted_at,
+            });
+        });
+        let mut handoffs = Vec::new();
+        eventually("the timer ended the hand-off", || {
+            handoffs.extend(
+                captured(&mut rx)
+                    .into_iter()
+                    .filter(|s| s.name == crate::telemetry::SPAN_AGENT_HANDOFF),
+            );
+            !handoffs.is_empty()
+        })
+        .await;
+        assert_eq!(
+            attr(&handoffs[0], AttrKey::HandoffOutcome),
+            Some(&AttrValue::Str("unknown".into()))
+        );
+        assert_eq!(
+            handoffs[0].end_unix_nanos,
+            posted_at + crate::telemetry::handoff::MAX_HANDOFF_AGE_NANOS
+        );
+    }
+
+    /// Pause the ingest task at its command gate, so what is sent next is
+    /// queued and broadcast without being applied. The sender resumes it; the
+    /// handle is the barrier that brought it round, done once it is through.
+    async fn pause_ingest(
+        telemetry: &Arc<Telemetry>,
+    ) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+        let shared = &telemetry.exporting.as_ref().unwrap().shared;
+        let (entered, polled_empty) = oneshot::channel();
+        let (resume, paused) = oneshot::channel();
+        *shared.command_gate.lock().unwrap() = Some((entered, paused));
+        // A barrier brings the task round to the gate, unless its usage poll
+        // already did, with the barrier queued behind it.
+        let nudge = {
+            let telemetry = Arc::clone(telemetry);
+            tokio::spawn(async move { telemetry.settled().await })
+        };
+        polled_empty.await.unwrap();
+        (resume, nudge)
+    }
+
+    /// The delegate path posting task `message_id` from the orchestrator
+    /// `orch`/`agent` to the worker `work`/`wa`.
+    fn post_task(telemetry: &Arc<Telemetry>, message_id: &str, orch: &str, agent: &str) {
+        crate::telemetry::observe_delegate_posted(
+            Some(Arc::clone(telemetry)),
+            &crate::telemetry::DelegatePosted {
+                message_id,
+                orchestrator_pane: orch,
+                orchestrator_agent_id: Some(agent),
+                worker_pane: "work",
+                worker_agent_id: "wa",
+                role: "coder",
+            },
+        );
+    }
+
+    fn open_handoffs(telemetry: &Telemetry) -> usize {
+        let mut open = 0;
+        let shared = &telemetry.exporting.as_ref().unwrap().shared;
+        shared.with_tracker(|t| open = t.handoffs_held().0);
+        open
+    }
+
+    fn handoff_spans(spans: &[SpanRecord]) -> Vec<&SpanRecord> {
+        spans
+            .iter()
+            .filter(|s| s.name == crate::telemetry::SPAN_AGENT_HANDOFF)
+            .collect()
+    }
+
+    fn handoff<'a>(spans: &'a [SpanRecord], message_id: &str) -> &'a SpanRecord {
+        handoff_spans(spans)
+            .into_iter()
+            .find(|s| attr(s, AttrKey::HandoffId) == Some(&AttrValue::Str(message_id.into())))
+            .unwrap_or_else(|| panic!("no hand-off for {message_id}: {spans:?}"))
+    }
+
+    fn run_on<'a>(spans: &'a [SpanRecord], pane: &str) -> &'a SpanRecord {
+        ended_runs(spans)
+            .into_iter()
+            .find(|s| attr(s, AttrKey::PaneId) == Some(&AttrValue::Str(pane.into())))
+            .unwrap_or_else(|| panic!("no run ended on {pane}: {spans:?}"))
+    }
+
+    /// `handoff` is in `run`'s trace, as its child, naming it.
+    fn assert_child_of(handoff: &SpanRecord, run: &SpanRecord) {
+        assert_eq!(handoff.trace_id, run.trace_id, "{handoff:?}");
+        assert_eq!(handoff.parent_span_id, Some(run.span_id), "{handoff:?}");
+        assert_eq!(attr(handoff, AttrKey::RunId), attr(run, AttrKey::RunId));
+    }
+
+    /// Issue #1981 M7 review (the reviewer's
+    /// `review_prepared_post_survives_later_close`): the orchestrator's run
+    /// is prepared and its commit queued when it posts a task, and its pane's
+    /// close is broadcast after the post. Applied as the run opens, the post
+    /// keeps its place before the close, so the hand-off is the run's child
+    /// and ends `unknown` with it rather than parentless.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_post_against_a_prepared_run_is_applied_before_a_later_close() {
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("work", "wa"), &[]);
+        telemetry.settled().await;
+        let (resume, nudge) = pause_ingest(&telemetry).await;
+        let orch = telemetry
+            .prepare_run(generation("orch", "oa"), &[], None)
+            .unwrap();
+        orch.commit();
+        post_task(&telemetry, "m-o", "orch", "oa");
+        tx.send(pane_closed("orch", "oa")).unwrap();
+        resume.send(()).unwrap();
+        nudge.await.unwrap();
+        telemetry.settled().await;
+        let spans = captured(&mut rx);
+        assert_eq!(handoff_spans(&spans).len(), 1, "{spans:?}");
+        let handoff = handoff(&spans, "m-o");
+        let run = run_on(&spans, "orch");
+        assert_child_of(handoff, run);
+        assert_eq!(
+            attr(handoff, AttrKey::HandoffOutcome),
+            Some(&AttrValue::Str("unknown".into()))
+        );
+        assert_eq!(handoff.end_unix_nanos, run.end_unix_nanos);
+    }
+
+    /// Issue #1981 M7 review (the reviewer's
+    /// `review_one_post_reminder_does_not_steal_later_prepared_post`): with
+    /// A's run open, A posts, B's run is prepared and its commit queued, then
+    /// B posts, with nothing broadcast in between. A's reminder places A's
+    /// post only, so B's is placed after B's run opens, in B's trace.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_post_reminder_does_not_take_a_later_post_against_a_prepared_run() {
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let (_tx, events) = broadcast::channel::<BroadcastMsg>(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("orch-a", "oa"), &[]);
+        begin(&telemetry, generation("work", "wa"), &[]);
+        telemetry.settled().await;
+        let (resume, nudge) = pause_ingest(&telemetry).await;
+        post_task(&telemetry, "m-a", "orch-a", "oa");
+        let b = telemetry
+            .prepare_run(generation("orch-b", "ob"), &[], None)
+            .unwrap();
+        b.commit();
+        post_task(&telemetry, "m-b", "orch-b", "ob");
+        resume.send(()).unwrap();
+        nudge.await.unwrap();
+        telemetry.shutdown(Duration::from_secs(2)).await;
+        let spans = captured(&mut rx);
+        assert_eq!(handoff_spans(&spans).len(), 2, "{spans:?}");
+        assert_child_of(handoff(&spans, "m-a"), run_on(&spans, "orch-a"));
+        assert_child_of(handoff(&spans, "m-b"), run_on(&spans, "orch-b"));
+    }
+
+    /// Issue #1981 M7 review: a post placed while its orchestrator's run is
+    /// prepared — by a broadcast message on another pane, with no close —
+    /// waits in that run and is opened as the run opens, as its child; the
+    /// run's later close ends it `unknown`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_post_held_for_a_prepared_run_keeps_the_run_as_parent() {
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("work", "wa"), &[]);
+        telemetry.settled().await;
+        let (resume, nudge) = pause_ingest(&telemetry).await;
+        let orch = telemetry
+            .prepare_run(generation("orch", "oa"), &[], None)
+            .unwrap();
+        orch.commit();
+        post_task(&telemetry, "m-o", "orch", "oa");
+        tx.send(of("work", "wa", EventType::SessionStart)).unwrap();
+        resume.send(()).unwrap();
+        nudge.await.unwrap();
+        telemetry.settled().await;
+        assert_eq!(open_handoffs(&telemetry), 1);
+        tx.send(pane_closed("orch", "oa")).unwrap();
+        telemetry.settled().await;
+        let spans = captured(&mut rx);
+        let handoff = handoff(&spans, "m-o");
+        let run = run_on(&spans, "orch");
+        assert_child_of(handoff, run);
+        assert_eq!(
+            attr(handoff, AttrKey::HandoffOutcome),
+            Some(&AttrValue::Str("unknown".into()))
+        );
+    }
+
+    /// Issue #1981 M7 review: tasks posted from two orchestrators whose runs
+    /// are both prepared, interleaved, each run's close broadcast after
+    /// every post: each hand-off opens in its own orchestrator's run, before
+    /// that run's close ends it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn posts_against_two_prepared_runs_each_open_in_their_own_run() {
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("work", "wa"), &[]);
+        telemetry.settled().await;
+        let (resume, nudge) = pause_ingest(&telemetry).await;
+        let one = telemetry
+            .prepare_run(generation("orch-1", "o1"), &[], None)
+            .unwrap();
+        one.commit();
+        post_task(&telemetry, "m-1a", "orch-1", "o1");
+        let two = telemetry
+            .prepare_run(generation("orch-2", "o2"), &[], None)
+            .unwrap();
+        two.commit();
+        post_task(&telemetry, "m-2a", "orch-2", "o2");
+        post_task(&telemetry, "m-1b", "orch-1", "o1");
+        post_task(&telemetry, "m-2b", "orch-2", "o2");
+        tx.send(pane_closed("orch-1", "o1")).unwrap();
+        tx.send(pane_closed("orch-2", "o2")).unwrap();
+        resume.send(()).unwrap();
+        nudge.await.unwrap();
+        telemetry.settled().await;
+        let spans = captured(&mut rx);
+        assert_eq!(handoff_spans(&spans).len(), 4, "{spans:?}");
+        for (id, pane) in [
+            ("m-1a", "orch-1"),
+            ("m-1b", "orch-1"),
+            ("m-2a", "orch-2"),
+            ("m-2b", "orch-2"),
+        ] {
+            let handoff = handoff(&spans, id);
+            let run = run_on(&spans, pane);
+            assert_child_of(handoff, run);
+            assert_eq!(
+                attr(handoff, AttrKey::HandoffOutcome),
+                Some(&AttrValue::Str("unknown".into())),
+                "{id}"
+            );
+            assert_eq!(handoff.end_unix_nanos, run.end_unix_nanos, "{id}");
+        }
+    }
+
+    /// Issue #1981 M7 review: the daemon shuts down while a post waits in
+    /// its orchestrator's run, prepared and never opened. The hand-off is
+    /// not lost: it ends `daemon_shutdown`, naming the run, with no run span
+    /// to parent it.
+    #[tokio::test]
+    async fn shutdown_ends_a_post_waiting_on_a_prepared_run() {
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let (_tx, events) = broadcast::channel::<BroadcastMsg>(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("work", "wa"), &[]);
+        let orch = telemetry
+            .prepare_run(generation("orch", "oa"), &[], None)
+            .unwrap();
+        post_task(&telemetry, "m-o", "orch", "oa");
+        telemetry.settled().await;
+        assert_eq!(
+            open_handoffs(&telemetry),
+            0,
+            "the post waits in the prepared run"
+        );
+        telemetry.shutdown(Duration::from_secs(2)).await;
+        let spans = captured(&mut rx);
+        assert_eq!(handoff_spans(&spans).len(), 1, "{spans:?}");
+        let handoff = handoff(&spans, "m-o");
+        assert_eq!(
+            attr(handoff, AttrKey::HandoffOutcome),
+            Some(&AttrValue::Str("daemon_shutdown".into()))
+        );
+        assert_eq!(
+            attr(handoff, AttrKey::RunId),
+            Some(&AttrValue::Str(orch.run_id.clone()))
+        );
+        assert_eq!(handoff.parent_span_id, None);
+        drop(orch);
+    }
+
+    /// An inbox change to message `id` in `pane`'s inbox, as broadcast.
+    fn inbox(pane: &str, id: &str, state: crate::inbox::StateName) -> BroadcastMsg {
+        BroadcastMsg::Inbox(crate::event::InboxNotice {
+            pane_id: pane.into(),
+            agent_id: None,
+            message_id: id.into(),
+            subject: String::new(),
+            from_label: String::new(),
+            state,
+            reason: None,
+            returned: false,
+            wake_stalled: false,
+            wake_update: false,
+            wake_hold: None,
+            hold_detail: None,
+            attention_update: false,
+            requeued: false,
+            provenance: None,
+            termination: None,
+            notices: Default::default(),
+        })
+    }
+
+    /// Report `report` naming task `task`, queued in `orch`'s inbox by the
+    /// worker `work`/`wa`.
+    fn report_for(orch: &str, report: &str, task: &str) -> BroadcastMsg {
+        let BroadcastMsg::Inbox(mut notice) = inbox(orch, report, crate::inbox::StateName::Queued)
+        else {
+            unreachable!()
+        };
+        notice.provenance = Some(crate::report_recovery::ReportProvenance::Task {
+            task_id: task.into(),
+            report_id: "r".into(),
+            producer: crate::report_recovery::Producer {
+                pane_id: "work".into(),
+                agent_id: "wa".into(),
+                role: Some("coder".into()),
+            },
+        });
+        BroadcastMsg::Inbox(notice)
+    }
+
+    /// With the ingest task paused, the orchestrator's run is prepared and
+    /// its commit queued, task `m-o` is posted, and `before` then the
+    /// orchestrator's pane-close then `after` are broadcast. The spans once
+    /// it resumes.
+    async fn around_a_held_close(
+        before: Vec<BroadcastMsg>,
+        after: Vec<BroadcastMsg>,
+    ) -> Vec<SpanRecord> {
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("work", "wa"), &[]);
+        telemetry.settled().await;
+        let (resume, nudge) = pause_ingest(&telemetry).await;
+        let orch = telemetry
+            .prepare_run(generation("orch", "oa"), &[], None)
+            .unwrap();
+        orch.commit();
+        post_task(&telemetry, "m-o", "orch", "oa");
+        for msg in before {
+            tx.send(msg).unwrap();
+        }
+        tx.send(pane_closed("orch", "oa")).unwrap();
+        for msg in after {
+            tx.send(msg).unwrap();
+        }
+        resume.send(()).unwrap();
+        nudge.await.unwrap();
+        telemetry.settled().await;
+        captured(&mut rx)
+    }
+
+    /// PR #2010 review: with the ingest task paused, the orchestrator's run
+    /// is prepared and its commit queued, and a report naming no task then
+    /// reaches the orchestrator, before its pane-close. Resumed, the report
+    /// is counted on the run, in its place before the close.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_report_naming_no_task_before_a_queued_commit_counts_on_the_run() {
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("work", "wa"), &[]);
+        telemetry.settled().await;
+        let (resume, nudge) = pause_ingest(&telemetry).await;
+        let orch = telemetry
+            .prepare_run(generation("orch", "oa"), &[], None)
+            .unwrap();
+        orch.commit();
+        let BroadcastMsg::Inbox(mut notice) = inbox("orch", "m-n", crate::inbox::StateName::Queued)
+        else {
+            unreachable!()
+        };
+        notice.agent_id = Some("oa".into());
+        notice.provenance = Some(crate::report_recovery::ReportProvenance::Uncorrelated {
+            report_id: "r".into(),
+            producer: crate::report_recovery::Producer {
+                pane_id: "work".into(),
+                agent_id: "wa".into(),
+                role: None,
+            },
+        });
+        tx.send(BroadcastMsg::Inbox(notice)).unwrap();
+        tx.send(pane_closed("orch", "oa")).unwrap();
+        resume.send(()).unwrap();
+        nudge.await.unwrap();
+        telemetry.settled().await;
+        let spans = captured(&mut rx);
+        assert_eq!(
+            attr(run_on(&spans, "orch"), AttrKey::HandoffsUncorrelatedCount),
+            Some(&AttrValue::Int(1)),
+            "{spans:?}"
+        );
+    }
+
+    fn event_names(span: &SpanRecord) -> Vec<&'static str> {
+        span.events.iter().map(|e| e.name).collect()
+    }
+
+    /// Issue #1981 M7 review (the reviewer's
+    /// `review_prepared_post_ignores_report_after_orchestrator_close`): a
+    /// task posted while its orchestrator's run is prepared, the run's
+    /// pane-close, then the worker's report naming the task, all applied as
+    /// the run opens. The report came after the run ended, so the hand-off
+    /// ends `unknown` with the run, with no report event.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_report_after_a_prepared_runs_held_close_finds_the_handoff_ended() {
+        let spans = around_a_held_close(vec![], vec![report_for("orch", "m-r", "m-o")]).await;
+        assert_eq!(handoff_spans(&spans).len(), 1, "{spans:?}");
+        let handoff = handoff(&spans, "m-o");
+        let run = run_on(&spans, "orch");
+        assert_child_of(handoff, run);
+        assert_eq!(
+            attr(handoff, AttrKey::HandoffOutcome),
+            Some(&AttrValue::Str("unknown".into()))
+        );
+        assert_eq!(handoff.end_unix_nanos, run.end_unix_nanos);
+        assert_eq!(event_names(handoff), Vec::<&str>::new());
+    }
+
+    /// Issue #1981 M7 review: `notice`, about task `m-o`, broadcast after the
+    /// prepared orchestrator run's held close, is applied after that close:
+    /// the hand-off ends `unknown` with the run, with nothing taken and no
+    /// other outcome.
+    async fn assert_a_task_notice_after_a_held_close_finds_the_handoff_ended(notice: BroadcastMsg) {
+        let spans = around_a_held_close(vec![], vec![notice]).await;
+        assert_eq!(handoff_spans(&spans).len(), 1, "{spans:?}");
+        let handoff = handoff(&spans, "m-o");
+        let run = run_on(&spans, "orch");
+        assert_child_of(handoff, run);
+        assert_eq!(
+            attr(handoff, AttrKey::HandoffOutcome),
+            Some(&AttrValue::Str("unknown".into()))
+        );
+        assert_eq!(handoff.end_unix_nanos, run.end_unix_nanos);
+        assert_eq!(event_names(handoff), Vec::<&str>::new());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fetch_after_a_prepared_runs_held_close_finds_the_handoff_ended() {
+        assert_a_task_notice_after_a_held_close_finds_the_handoff_ended(inbox(
+            "work",
+            "m-o",
+            crate::inbox::StateName::Fetched,
+        ))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_acknowledgement_after_a_prepared_runs_held_close_finds_the_handoff_ended() {
+        assert_a_task_notice_after_a_held_close_finds_the_handoff_ended(inbox(
+            "work",
+            "m-o",
+            crate::inbox::StateName::Acknowledged,
+        ))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_undeliverable_after_a_prepared_runs_held_close_finds_the_handoff_ended() {
+        let BroadcastMsg::Inbox(mut notice) =
+            inbox("work", "m-o", crate::inbox::StateName::Undeliverable)
+        else {
+            unreachable!()
+        };
+        notice.reason = Some(crate::inbox::UndeliverableReason::AgentExited);
+        assert_a_task_notice_after_a_held_close_finds_the_handoff_ended(BroadcastMsg::Inbox(
+            notice,
+        ))
+        .await;
+    }
+
+    /// Issue #1981 M7 review: the worker's report on a task held for a
+    /// prepared orchestrator run arrives before the run's held close: the
+    /// run had not ended, so the hand-off ends `reported`, with the report's
+    /// event, at the run's end; the orchestrator's acknowledgement after the
+    /// close does not move that end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_report_before_a_prepared_runs_held_close_ends_the_handoff_reported() {
+        use crate::inbox::StateName;
+        let spans = around_a_held_close(
+            vec![
+                inbox("work", "m-o", StateName::Acknowledged),
+                report_for("orch", "m-r", "m-o"),
+            ],
+            vec![inbox("orch", "m-r", StateName::Acknowledged)],
+        )
+        .await;
+        assert_eq!(handoff_spans(&spans).len(), 1, "{spans:?}");
+        let handoff = handoff(&spans, "m-o");
+        let run = run_on(&spans, "orch");
+        assert_child_of(handoff, run);
+        assert_eq!(
+            attr(handoff, AttrKey::HandoffOutcome),
+            Some(&AttrValue::Str("reported".into()))
+        );
+        assert_eq!(handoff.end_unix_nanos, run.end_unix_nanos);
+        assert_eq!(
+            event_names(handoff),
+            vec![
+                crate::telemetry::EVENT_HANDOFF_TAKEN,
+                crate::telemetry::EVENT_HANDOFF_REPORTED
+            ]
+        );
+        assert!(
+            handoff
+                .events
+                .iter()
+                .all(|e| e.time_unix_nanos <= run.end_unix_nanos),
+            "{handoff:?}"
+        );
+    }
+
+    /// Issue #1981 M7 review: a report that overtakes its task's post, then
+    /// the post held for its prepared orchestrator run, the run's close, and
+    /// the orchestrator acknowledging the report: the acknowledgement came
+    /// after the close, so the hand-off ends `reported` at the run's end,
+    /// not at the acknowledgement.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_acknowledgement_after_a_held_close_of_a_report_that_overtook_its_post_stays_after_it()
+     {
+        use crate::inbox::StateName;
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("work", "wa"), &[]);
+        telemetry.settled().await;
+        let (resume, nudge) = pause_ingest(&telemetry).await;
+        let orch = telemetry
+            .prepare_run(generation("orch", "oa"), &[], None)
+            .unwrap();
+        orch.commit();
+        tx.send(report_for("orch", "m-r", "m-o")).unwrap();
+        post_task(&telemetry, "m-o", "orch", "oa");
+        tx.send(pane_closed("orch", "oa")).unwrap();
+        tx.send(inbox("orch", "m-r", StateName::Acknowledged))
+            .unwrap();
+        resume.send(()).unwrap();
+        nudge.await.unwrap();
+        telemetry.settled().await;
+        let spans = captured(&mut rx);
+        assert_eq!(handoff_spans(&spans).len(), 1, "{spans:?}");
+        let handoff = handoff(&spans, "m-o");
+        let run = run_on(&spans, "orch");
+        assert_child_of(handoff, run);
+        assert_eq!(
+            attr(handoff, AttrKey::HandoffOutcome),
+            Some(&AttrValue::Str("reported".into()))
+        );
+        assert_eq!(handoff.end_unix_nanos, run.end_unix_nanos);
+    }
+
+    /// Issue #1981 M7: the delegate seam and the inbox's broadcast make one
+    /// `agent.handoff` through the whole exporter, in the orchestrator's
+    /// trace, carrying none of the task's text.
+    #[tokio::test]
+    async fn a_posted_task_becomes_a_handoff_through_the_broadcast() {
+        use crate::inbox::StateName;
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("orch", "oa"), &[]);
+        begin(&telemetry, generation("work", "wa"), &[]);
+        let notice = |pane: &str, id: &str, state| crate::event::InboxNotice {
+            pane_id: pane.into(),
+            agent_id: None,
+            message_id: id.into(),
+            subject: "SENTINEL-subject".into(),
+            from_label: "SENTINEL-label".into(),
+            state,
+            reason: None,
+            returned: false,
+            wake_stalled: false,
+            wake_update: false,
+            wake_hold: None,
+            hold_detail: None,
+            attention_update: false,
+            requeued: false,
+            provenance: None,
+            termination: None,
+            notices: Default::default(),
+        };
+        // The worker takes the task before telemetry hears of the post.
+        tx.send(BroadcastMsg::Inbox(notice(
+            "work",
+            "m-t",
+            StateName::Acknowledged,
+        )))
+        .unwrap();
+        crate::telemetry::observe_delegate_posted(
+            Some(Arc::clone(&telemetry)),
+            &crate::telemetry::DelegatePosted {
+                message_id: "m-t",
+                orchestrator_pane: "orch",
+                orchestrator_agent_id: Some("oa"),
+                worker_pane: "work",
+                worker_agent_id: "wa",
+                role: "coder",
+            },
+        );
+        let mut report = notice("orch", "m-r", StateName::Queued);
+        report.provenance = Some(crate::report_recovery::ReportProvenance::Task {
+            task_id: "m-t".into(),
+            report_id: "r".into(),
+            producer: crate::report_recovery::Producer {
+                pane_id: "work".into(),
+                agent_id: "wa".into(),
+                role: Some("coder".into()),
+            },
+        });
+        tx.send(BroadcastMsg::Inbox(report)).unwrap();
+        tx.send(BroadcastMsg::Inbox(notice(
+            "orch",
+            "m-r",
+            StateName::Acknowledged,
+        )))
+        .unwrap();
+        telemetry.settled().await;
+        let spans = captured(&mut rx);
+        let handoffs: Vec<_> = spans
+            .iter()
+            .filter(|s| s.name == crate::telemetry::SPAN_AGENT_HANDOFF)
+            .collect();
+        assert_eq!(handoffs.len(), 1, "{spans:?}");
+        let handoff = handoffs[0];
+        assert_eq!(
+            attr(handoff, AttrKey::HandoffOutcome),
+            Some(&AttrValue::Str("reported".into()))
+        );
+        assert_eq!(
+            handoff.events.iter().map(|e| e.name).collect::<Vec<_>>(),
+            vec![
+                crate::telemetry::EVENT_HANDOFF_TAKEN,
+                crate::telemetry::EVENT_HANDOFF_REPORTED
+            ]
+        );
+        telemetry.end_run("orch", Some("oa"), EndReason::Exited, None);
+        telemetry.settled().await;
+        let spans = captured(&mut rx);
+        let run = spans.iter().find(|s| s.name == SPAN_AGENT_RUN).unwrap();
+        assert_eq!(handoff.trace_id, run.trace_id);
+        assert_eq!(handoff.parent_span_id, Some(run.span_id));
+        assert!(!format!("{handoff:?}").contains("SENTINEL"));
     }
 }

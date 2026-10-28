@@ -10,7 +10,7 @@ Be precise about what that local defence is, because the obvious stronger descri
 
 What the far side can establish is therefore the whole of the boundary, and it stops short of identity. A completed attach-protocol `Hello` proves something is listening and speaks this wire. It does not prove that something is the deck's daemon. An attacker **already running as the remote login user** can bind a `0o600` socket of their own at the resolved path, answer the handshake, and replace the binary the resolver itself runs from. Against that actor nothing here adds a refusal.
 
-Nothing available on a DAC-only POSIX host closes it either, which is why the obvious fix is not simply pending. That argument is in [What in-band authentication would and would not buy](#what-in-band-authentication-would-and-would-not-buy) below, and the decision is tracked in [#1189](https://github.com/vfarcic/dot-agent-deck/issues/1189).
+Nothing available on a DAC-only POSIX host closes it either, which is why the obvious fix is not simply pending. That argument is in [What in-band authentication would and would not buy](#what-in-band-authentication-would-and-would-not-buy) below, and [#1189](https://github.com/vfarcic/dot-agent-deck/issues/1189) records the decision to accept it (2026-10-28).
 
 The same shape is recorded for a sibling boundary in [hook-socket provenance](hook-provenance.md), and for the same structural reason: a secret the legitimate party must be able to read is readable by anyone running as that party.
 
@@ -102,7 +102,7 @@ The snippet is executed as a program under every `sh` the machine has by `remote
 
 ## What in-band authentication would and would not buy
 
-This is the second fix #1174 offered, and the only one that would make a forwarded endpoint self-describing. It was not taken, for a reason about the threat model rather than about size — recorded here so it does not have to be re-derived, and open for revisiting at [#1189](https://github.com/vfarcic/dot-agent-deck/issues/1189).
+This is the second fix #1174 offered, and the only one that would make a forwarded endpoint self-describing. It was not taken, for a reason about the threat model rather than about size — recorded here so it does not have to be re-derived. [#1189](https://github.com/vfarcic/dot-agent-deck/issues/1189) accepted the residue on 2026-10-28; reopen it if a secret the login user cannot read becomes available.
 
 **The wire is not the obstacle.** Two rungs of CLAUDE.md rule 18's graded path both avoid a `PROTOCOL_VERSION` bump: additive optional fields on `Hello` (the protocol's own written policy in `src/daemon_protocol.rs`), or a new `AttachRequest` variant gated on a capability every sender withholds until the daemon advertises it, with the check in the client library. Either is cheap.
 
@@ -114,7 +114,7 @@ What would actually bind against a same-uid attacker is a secret that uid cannot
 
 ## What stays open
 
-- **Same-uid impersonation on the remote host**, as above. [#1189](https://github.com/vfarcic/dot-agent-deck/issues/1189).
+- **Same-uid impersonation on the remote host**, as above, accepted rather than pending ([#1189](https://github.com/vfarcic/dot-agent-deck/issues/1189)).
 - **Hosts running an older build**, which fall through to the filesystem rungs and gain none of the three checks.
 - **The `DOT_AGENT_DECK_ATTACH_SOCKET` and `XDG_RUNTIME_DIR` fallback rungs are still printed with no test at all** when the resolver is unavailable. That is unchanged behaviour, not a new gap, and it is bounded by the same "older build" case above.
 - **The resolver checks one candidate**, the one `attach_socket_path()` resolves. It does not itself try a legacy spelling, so the stale-inode detection above stays latent until it has a second candidate to fall to.

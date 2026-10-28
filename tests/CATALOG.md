@@ -441,6 +441,29 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** how `statusCheckRollup` becomes the CI result (`session/pr/001` and the `pull_request` unit tests).
 - **Platform coverage:** mac+linux+windows.
 
+#### dashboard/prompt
+
+##### dashboard/prompt/001 — A turn the agent's harness submits itself does not replace the card's prompt (issue #1993).
+- **Layer:** L1 (`AppState::apply_event` + ratatui `TestBackend`).
+- **Agent:** none (synthetic Claude Code prompt events).
+- **Asserts:** after the prompt `fix the login bug` and then Claude Code's `<task-notification>` turn for a finished background command, the snapshot's `last_user_prompt` (the desktop's Last prompt column) and `first_prompts` hold only the typed prompt, and the card's `Prmt:` line reads it at Normal and Spacious density with no part of the notification.
+- **Does not assert:** that the hook reports or truncates the turn (a real Claude Code is not run; the test supplies the full notification directly, and `injected_prompt`'s unit tests cover a cut one); OpenCode's synthetic turns (covered by the `opencode_manage::injected_turn_tests` unit tests).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/prompt/002 — Prompts the user types after a harness turn still reach the card (issue #1993).
+- **Layer:** L1 (`AppState::apply_event` + ratatui `TestBackend`).
+- **Agent:** none (synthetic Claude Code prompt events).
+- **Asserts:** a slash command (`/review 42`) typed after a `<task-notification>` turn becomes `last_user_prompt` and the card's `Prmt:` line; an ordinary prompt typed after a card's first event was a `<task-notification>` is its `last_user_prompt` and its only `first_prompts` entry.
+- **Does not assert:** deck messages, which are labelled and kept out of `last_user_prompt` separately (`inbox/status/009`, `inbox/claude/009`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/prompt/003 — A card restored with an injected turn as its last prompt does not show it (issue #1993).
+- **Layer:** L1 (`AppState` + ratatui `TestBackend`).
+- **Agent:** none (synthetic Claude Code session).
+- **Asserts:** a card whose `last_user_prompt` is a `<task-notification>` turn, as a snapshot from an older daemon can carry, and which has no prompt event of its own, renders no part of the notification on its `Prmt:` line.
+- **Does not assert:** the desktop's Last prompt column for that card, which shows the older daemon's value as it is.
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/stats
 
 ##### dashboard/stats/001 — A narrow stats bar keeps the `tools` total and spends no width on a per-agent-type breakdown.
@@ -3041,6 +3064,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Agent:** none.
 - **Asserts:** the status line shows `Claude Code's hooks could not be updated:` with `is not valid JSON` in the reason and no install note; the settings file is left byte for byte.
 - **Does not assert:** the exit report (`dashboard/status-message/008` covers what it keeps); an unreadable or unwritable file, which reaches the note through the same failure list (`hooks/install/019` covers them for `hooks refresh`).
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/023 — An OpenCode agent a headless daemon starts from a scheduled task loads a plugin pinned to the daemon, even when OpenCode was set up after the daemon started (PRD #190).
+- **Layer:** L2 headless e2e (`tests/e2e_daemon_plugin_refresh.rs`), the real `daemon serve` from `common::spawn_daemon_serve` with a durable `~/.local/bin/dot-agent-deck` in an isolated HOME; no TUI is started.
+- **Agent:** none; a stand-in `opencode` script, run as a scheduled task's command through `RunNow`, records each plugin's `BINARY_PATH` the moment it starts.
+- **Asserts:** with no OpenCode folder at daemon start, no plugin is written; after both layouts (`~/.config/opencode`, `~/.opencode`) are created holding a plugin pinned to a deleted copy of the deck, the scheduled OpenCode agent finds both plugins pinned to the daemon's `~/.local/bin/dot-agent-deck` as it starts.
+- **Does not assert:** a plugin folder the deck cannot write, and the card notice that follows (`inbox/boundary/025`); a plugin pinned to another live install, which is kept (`inbox/boundary/025`); the plugin template's integration level (`inbox/boundary/025`); the daemon's startup install (`hooks/install/009`); Claude Code's hooks, which the daemon installs only when it starts (decision on issue #190); a real OpenCode.
 - **Platform coverage:** mac+linux.
 
 #### hooks/stale
@@ -6708,9 +6738,9 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 ##### codex/wrap/003 — Wrapped commands preserve each standard descriptor's independent TTY or redirection semantics (PRD #20, final review finding 11).
 - **Layer:** L1/fast real-binary subprocess integration with controlled pseudo-terminals and files; no TUI or LLM.
-- **Agent:** deterministic shell probes wrapped as Codex.
-- **Asserts:** wholly non-interactive stdout/stderr remain separate and binary stdin remains byte-exact through EOF; redirecting only stderr sends child stderr to that file rather than merged PTY stdout; redirecting only stdout leaves child stdin and stderr attached to TTYs.
-- **Does not assert:** interactive resize, ordinary input, or Ctrl+C behavior (`codex/wrap/002`).
+- **Agent:** deterministic shell probes, a synthetic direct Codex executable, and a non-Codex agent control.
+- **Asserts:** wholly non-interactive stdout/stderr remain separate and binary stdin remains byte-exact through EOF; redirecting only stderr sends child stderr to that file rather than merged PTY stdout; redirecting only stdout leaves child stdin and stderr attached to TTYs. Both the pipe and PTY paths prepend `-c shell_environment_policy.set={}` to direct Codex argv, preserve model/prompt arguments and input/output routing, avoid duplicating an existing prefix, and leave a non-Codex agent's argv unchanged.
+- **Does not assert:** real Codex config merging or daemon exclusion; interactive resize or Ctrl+C behavior (`codex/wrap/002`).
 - **Platform coverage:** mac+linux.
 
 ##### codex/wrap/004 — Catchable termination signals tear down and reap wrapped children on PTY and pipe paths (PRD #20, final review finding 12).
@@ -6810,24 +6840,24 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 #### codex/spawn
 
 ##### codex/spawn/001 — Plain restored Codex panes launch through the Wrapper strategy (PRD #20, blocker 3).
-- **Layer:** L2 synthetic PTY-attached restore with PATH recorder stubs.
-- **Agent:** synthetic Codex recorder.
-- **Asserts:** restoring persisted bare `codex` executes exactly `dot-agent-deck wrap --agent codex -- codex` and never the bare recorder.
-- **Does not assert:** mode or orchestration paths (002–003).
+- **Layer:** L2 synthetic PTY-attached restore through the real wrapper; lane 1.
+- **Agent:** synthetic Codex argv oracle with an isolated config home.
+- **Asserts:** restoring persisted bare `codex` crosses the wrapper once, receives the prepended embedded pair, visibly emits `EMBEDDED_SUCCESS`, and accepts pane input. An already-prefixed restore receives the pair once; config.toml bytes remain unchanged.
+- **Does not assert:** real Codex config merging or daemon exclusion; orchestration paths (003).
 - **Platform coverage:** mac+linux.
 
 ##### codex/spawn/003 — Orchestration role Codex commands launch through the Wrapper strategy (PRD #20, blocker 3).
-- **Layer:** L2 synthetic PTY-attached new-pane orchestration flow with PATH recorder stubs.
-- **Agent:** synthetic Codex recorder as the start role.
-- **Asserts:** selecting an orchestration whose start-role command is bare `codex` launches the role through the wrapper exactly once.
-- **Does not assert:** scheduler role spawning (`scheduler/spawn/006`) or respawn.
+- **Layer:** L2 synthetic PTY-attached new-pane orchestration flow through the real wrapper; lane 1.
+- **Agent:** synthetic Codex argv oracle as the start role.
+- **Asserts:** selecting an orchestration whose start-role command is bare `codex` crosses the wrapper once, receives the prepended embedded pair, visibly emits `EMBEDDED_SUCCESS`, accepts pane input, and leaves config.toml bytes unchanged.
+- **Does not assert:** real Codex config merging or daemon exclusion; scheduler role spawning (`scheduler/spawn/006`) or respawn.
 - **Platform coverage:** mac+linux.
 
 ##### codex/spawn/005 — Respawning an existing pane as Codex launches through the Wrapper strategy (PRD #20, blocker 3).
-- **Layer:** fast PTY registry integration (`AgentPtyRegistry::respawn_agent_for_pane` with PATH recorder stubs).
-- **Agent:** synthetic Codex recorder.
-- **Asserts:** replacing an existing pane process with bare command `codex` executes exactly `dot-agent-deck wrap --agent codex -- codex`.
-- **Does not assert:** delegate routing that chooses respawn; it pins the respawn spawn boundary itself.
+- **Layer:** fast PTY registry integration (`AgentPtyRegistry::respawn_agent_for_pane`) through the real wrapper.
+- **Agent:** synthetic Codex argv oracle.
+- **Asserts:** respawning an existing pane with an already-prefixed Codex command and then bare `codex` crosses the wrapper once per spawn and supplies the embedded pair exactly once to each child.
+- **Does not assert:** real Codex config merging or daemon exclusion; delegate routing that chooses respawn; rendered pane output (covered by 001 and 013).
 - **Platform coverage:** mac+linux.
 
 ##### codex/spawn/006 — An explicit Codex identity wraps a non-inferable custom launcher and remains the pane identity (PRD #20, R20-009).
@@ -6852,10 +6882,10 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Platform coverage:** mac+linux.
 
 ##### codex/spawn/009 — A config-declared Codex orchestration role wraps and badges a non-inferable launcher before the first task.
-- **Layer:** L2 synthetic PTY-attached new-pane orchestration flow with PATH recorder stubs.
+- **Layer:** L2 synthetic PTY-attached new-pane orchestration flow through the real wrapper; lane 1.
 - **Agent:** synthetic `devbox run codex-big` launcher declared as Codex by the start role.
-- **Asserts:** the role executes exactly once as `dot-agent-deck wrap --agent codex -- devbox run codex-big`, and its visible card reads `Codex` at spawn without any delegated task or synthesized hook event.
-- **Does not assert:** `clear = true` re-create precedence (`codex/spawn/010`) or a real Codex process (`codex/spawn/012`).
+- **Asserts:** the role crosses the real wrapper exactly once as `dot-agent-deck wrap --agent codex -- devbox run codex-big`; devbox receives exactly `run`, `codex-big` without Codex options. The fixture launcher selects embedded mode for its inner synthetic Codex, the pane visibly emits launcher and embedded success, accepts input, and its card reads `Codex` before a task or synthesized hook.
+- **Does not assert:** that a Codex declaration can configure an opaque launcher's inner argv; real Codex merging or daemon exclusion; `clear = true` re-create precedence (`codex/spawn/010`) or a real Codex process (`codex/spawn/012`).
 - **Platform coverage:** mac+linux.
 
 ##### codex/spawn/010 — A current config declaration outranks command derivation across spawn and missing-record re-create without admitting learned identity into the exec line.
@@ -6874,10 +6904,10 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Cost note:** one minimal mini-model availability probe; the launched interactive agent receives no prompt.
 
 ##### codex/spawn/013 — A plain new-pane Codex command launches through the Wrapper strategy exactly once (issue #533).
-- **Layer:** L2 synthetic PTY-attached new-pane flow (no mode) with PATH recorder stubs.
-- **Agent:** synthetic Codex recorder.
-- **Asserts:** submitting the Ctrl+N form with no mode and Command bare `codex` executes exactly `dot-agent-deck wrap --agent codex -- codex` — the wrapper once, never bare Codex and never a second wrapper. Issue #533 moved this path's rewrite from the TUI to the daemon's spawn boundary, which this pins from the outside.
-- **Does not assert:** which deck binary the daemon names as the wrapper (the recorder is injected through `DOT_AGENT_DECK_WRAP_BIN`; renamed-build resolution is unit-tested in `src/wrap.rs`); a real Codex process (`codex/live/001`).
+- **Layer:** L2 synthetic PTY-attached new-pane flow (no mode) through the real wrapper and real telemetry shim; lane 1.
+- **Agent:** synthetic Codex argv oracle at a recognized npm-shaped launcher path, rejecting `--no-daemon` as an older release would.
+- **Asserts:** submitting Ctrl+N crosses the wrapper once and prepends `-c shell_environment_policy.set={}` with telemetry off, exporter additions on, a user exporter configured, and an absolute Codex executable. The pane visibly emits `EMBEDDED_SUCCESS` and accepts input; whole-table and nested user `set` overrides follow the prepended pair unchanged, as do model and spaced prompt arguments; fixture config.toml bytes stay identical.
+- **Does not assert:** Codex's own recursive config merging, implicit daemon exclusion, or environment inheritance; the fixture checks argv and visible synthetic output. Those runtime claims still need the isolated real-Codex lane-2 verification; renamed wrapper-build resolution remains unit-tested in `src/wrap.rs`.
 - **Platform coverage:** mac+linux.
 
 ##### codex/spawn/014 — A Codex command that begins with an environment assignment or a shell compound starts under the wrapper (issue #1685).
@@ -8024,11 +8054,11 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Note:** the fix is in current code, so this is GREEN as a regression guard, not RED-first; it pins that the primary (worktree-exists) signal short-circuits the secondary (open-PR) check, which `scheduler/dispatch/002` cannot catch because it never forces the PR check to error.
 - **Platform coverage:** mac+linux.
 
-##### scheduler/dispatch/013 — A fired `issue_dispatch` task against an ORCHESTRATION repo drives the GENUINE `gh` → clone → per-issue worktree → real-agent path against LIVE GitHub, and the dispatched orchestration must surface LIVE as an orchestration TAB (with its orchestrator + worker role panes) on the already-attached TUI — the real-scenario multi-agent showcase (CLAUDE.md rule 4) a `cat`/stub stand-in can never prove (PRD #120). RED until the daemon live-surfaces a dispatched orchestration tab.
+##### scheduler/dispatch/013 — A fired `issue_dispatch` task against an ORCHESTRATION repo drives the GENUINE `gh` → clone → per-issue worktree → real-agent path against LIVE GitHub, and the dispatched orchestration must surface LIVE as an orchestration TAB (with its orchestrator + worker role panes) on the already-attached TUI — the real-scenario multi-agent showcase (CLAUDE.md rule 4) a `cat`/stub stand-in can never prove (PRD #120).
 - **Layer:** L2 PTY (the real `dot-agent-deck` binary in an isolated PTY via the `TuiDeck` harness, asserted on the rendered vt100 grid — same harness as `scheduler/dispatch/011`). REAL seams, no stand-ins: REAL `gh` on the normal PATH (no `gh` stub) really enumerates/PR-checks/clones against live GitHub, with `GITHUB_TOKEN` threaded through the scrubbed deck env so the daemon's `gh` inherits auth; the clone's `[[orchestrations]]` resolves to two FULLY INTERACTIVE `claude` role panes pinned to Haiku (`claude-haiku-4-5-20251001`, `--allowedTools Bash`, no `-p`); the freshly-built `dot-agent-deck` binary's dir is prepended to the deck→daemon→agents PATH (`with_env("PATH", …)` wins over the harness scrub) so the orchestrator's `dot-agent-deck delegate --to worker` resolves. The dispatch behavior is ungated, so the env carries no `DOT_AGENT_DECK_EXPERIMENTAL`; the fire is driven by `RunNow` over the attach socket.
 - **Fixture:** the permanent public repo `vfarcic/dot-agent-deck-tests` — a committed `DISPATCH_E2E_SENTINEL.md`, a `.dot-agent-deck.toml` with `[[orchestrations]] name = "issue-work"` (roles `orchestrator` (start) + `worker`, both Haiku `claude`; the orchestrator's `prompt_template` delegates the task to the worker), and a PERMANENT open issue #1 labelled `agent-dispatch-test`. The schedule filters on that label with `max_per_run = 1`, so ONLY issue #1 is enumerated (deterministic). Both role panes share the per-issue worktree cwd (pre-trusted in the per-test HOME so claude's first-run gates clear with no keystroke). Clone + worktree live under a `common::harness_tempdir()` removed on drop.
 - **Agent:** REAL Claude Code (Haiku) ×2 role panes, cheap interactive turns (<$0.05/run). Flaky-tolerant lane-2 tier (real LLM + real network) — run once, not looped (rule 4). Runtime-skipped (Decision 26) when the `claude` CLI/credentials or `GITHUB_TOKEN` are absent.
-- **Asserts:** after the fire the daemon registers BOTH of the dispatched orchestration's role agents, each under its own ROLE NAME — `orchestrator` and `worker` (precondition — proves the live clone + worktree + spawn happened). Until `orchestration/dispatch/002` this looked for the shared schedule name `github-issues` on a role pane, which is what a dispatched role's `display_name` used to be; role panes now carry their role name (matching the interactive `Ctrl+n` path), and requiring both names is strictly stronger — one shared name could be satisfied by a single spawned pane. The dispatched ORCHESTRATION then surfaces LIVE as an orchestration TAB labelled `issue-work` (the fixture's `[[orchestrations]] name`) in the attached TUI's tab strip, with no reconnect/relaunch — RED today, because `spawn::spawn`'s orchestration branch does not call `surface_spawned_pane` and orchestration tabs are rebuilt only at hydration, so the role panes appear only as flat dashboard cards and no `issue-work` tab paints live. Best-effort (once GREEN, logged not gated): switching to the orchestration tab, the worker (delegated to by the orchestrator) lists the cloned repo's files including the committed sentinel `DISPATCH_E2E_SENTINEL.md`; and the fixture repo has no pushed `agent/issue-1` branch afterward (NO REMOTE WRITES).
+- **Asserts:** after the fire the daemon registers both dispatched orchestration role agents under their role names, `orchestrator` and `worker` (precondition proving the live clone, worktree and spawn happened). Since `orchestration/dispatch/002`, role panes carry their role names, matching the interactive `Ctrl+n` path, rather than the shared schedule name `github-issues`. The dispatched orchestration then surfaces live as an `issue-work` tab (the fixture's orchestration name) in the attached TUI without reconnecting. Without the live orchestration surface, role panes would appear as flat dashboard cards until hydration. Best-effort, logged without gating: switch to the tab and observe the worker listing files including `DISPATCH_E2E_SENTINEL.md`. Agents are instructed not to push or open PRs, and the test best-effort probes for a pushed `agent/issue-1` branch. The deck itself makes best-effort claim writes, provisioning/adding `agent-deck/claimed` and creating/editing a claim comment when permitted. With a read-only token those writes were denied, the claim-failure notice appeared and dispatch succeeded (PRD #421 M2.4, verified 2026-10-27).
 - **Does not assert:** the delegation chain / sentinel as a hard gate (logged best-effort — too LLM/timing-dependent); exact agent phrasing; the clone/worktree/branch derivation or skip/dedup/cap/cleanup logic (covered by the headless `scheduler/dispatch/001-009` and the deterministic-stub `scheduler/dispatch/011-012`); the single-agent live-surfacing path (covered by `scheduler/dispatch/011`).
 - **Platform coverage:** mac+linux.
 
@@ -11488,7 +11518,7 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 ##### inbox/claude/040 — A prompt's receipt work shares one deadline.
 - **Layer:** Fast (`src/inbox_prompt.rs`), `commit_attempts_by` and `fetch_with_receipts` with one deadline against stand-in sockets that serve receipts.
 - **Agent:** none.
-- **Asserts:** against a prompt deck both phases complete, each asking `inbox_receipts` first on its own connection; against one that waits 1.3 s before each answer, the commit and the fetch together are done within the shared 1.5 s plus 2 s (four budgets in turn would take over 5 s), the commit `Sent` and the fetch, with the budget spent, taking nothing.
+- **Asserts:** against a prompt deck both phases complete, each asking `inbox_receipts` first on its own connection; against a deck that promptly answers the capability query and records the commit but gates its acknowledgement until the client's shared 1.5 s expires, the commit is `Sent`, both phases finish within that wait plus 2 s, and the fetch using the expired deadline takes nothing and opens no new connection (the listen queue stays empty).
 - **Does not assert:** the hook's status send or its own grant, output and spool work, which the budget does not cover.
 - **Platform coverage:** mac+linux.
 
@@ -13551,6 +13581,14 @@ PRD #1666 part 3, round 5: where the deck keeps a worker's report, or a dispatch
 - **Does not assert:** a real daemon's handling of the report or the marker (Q35-14b), the frontier itself (Q35-20a), descendant accounting through ptrace, namespaces or `CLONE_PARENT` (UNVERIFIED pending E-PIN and its process-case rows), the armed path's own bound (`inbox/probe/020`), or any kernel premise: the seams observe the helper's own calls, not the kernel's. The trace shows when each call started, so a call checked just before `t0 + 1 s` and descheduled before it starts could still start just after it; the pauses test the points they hold, not every instruction boundary.
 - **Platform coverage:** Linux.
 
+##### scheduler/dispatch/041 — Two isolated decks honor a live GitHub claim before spawning a duplicate agent.
+
+- **Layer:** L2 synthetic agents with live GitHub, lane 2 (`tests/e2e_issue_dispatch_two_decks.rs`), two real headless daemon processes with separate HOME, state, sockets and logs.
+- **Agent:** local `cat` stand-ins shadow the fixture orchestration's Claude commands; no real model runs.
+- **Asserts:** with claim gating enabled, deck A dispatches permanent issue #2 of `vfarcic/dot-agent-deck-tests`, filtered by its dedicated `agent-dispatch-two-deck-test` label and `max_per_run = 1`; live GitHub readbacks show `agent-deck/claimed` and a trusted-author claim matching A's actual account id, machine digest and task through production claim parsing. A must create that record during this run or edit the same comment id with a changed body; an unchanged old claim cannot satisfy the assertion. Readbacks use the captured `GITHUB_TOKEN` with scrubbed environment, isolated HOME/config and github.com pinned. Deck B uses a distinct schedule and skips with a claimed-by reason naming that record's task, machine digest and account, creates no worktree, executes no agent and writes no own B record. A's next fire skips its existing worktree without adding an agent.
+- **Does not assert:** half-TTL refresh (covered by `scheduler/dispatch/036`), strictly increasing GitHub `updated_at`, real-agent work, simultaneous claim races, PTY rendering or cross-host execution. Fixture caveat: serialize invocations sharing the fixture, including concurrent invocations on one host. Immediate reruns require the same account and host; a record from another host or account remains foreign until its TTL elapses. Stable schedule names let same-account consecutive runs on one host reclaim without removing the permanent claim label or comments. The configured claim TTL is 3 hours. Unrelated, invalid or expired foreign claim records are not counted as A's own record.
+- **Platform coverage:** mac+linux; requires `gh` and `GITHUB_TOKEN`. Missing prerequisites use the shared runtime SKIP policy and fail with `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`.
+
 ## Desktop native driver scenarios
 
 These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[spec]` scanner, and run in CI's advisory `desktop-driver` job. `docs/develop/desktop-gui.md` ("The driver tier") describes the harness.
@@ -13576,3 +13614,187 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 - **Asserts:** the native child has nonzero dimensions matching the overlay frame; OCR of the composed X display inside that frame finds the real PR title; Back, Open in browser and Close are visible and usable; Close and Escape from both the toolbar and focused GitHub page remove the overlay and native view; the system-browser handoff receives the real PR URL. The same checks run from the agent pane and the overview row as a control.
 - **Does not assert:** macOS WKWebView or Windows WebView2 placement; GitHub login or cookie persistence; real-agent work. The system browser is replaced by a URL recorder, while the embedded GitHub page is real.
 - **Platform coverage:** Verified on Linux WebKitGTK only, under Xvfb at 96 DPI; macOS WKWebView is not covered and the reported macOS blank/unclosable page was not reproduced here. In addition to the driver tier's prerequisites, this local scenario needs authenticated `gh`, network access to GitHub and PR #1601, Tesseract (`DAD_DRIVER_TESSERACT` or PATH), `/usr/bin/python3` with PyGObject/Gdk 3, and `xdotool` (`DAD_DRIVER_XDOTOOL` or PATH). Nix WebKitGTK also needs its `glib-networking` modules supplied in `GIO_EXTRA_MODULES` for HTTPS. From the repository root, run `DAD_DRIVER_REAL_GITHUB=1 bash desktop/scripts/driver-test.sh` to build and run the driver suite including this scenario; use `--no-build` only with an existing driver-seam-enabled embedded bundle. Evidence, including passing runs, is saved under the gitignored `desktop/driver-results/pull-request-live-<pid>/`.
+
+## Test Case Catalog (continued: tool-operation completion)
+
+##### telemetry/otlp/021 — A normally ended operation has no forced-closure marker.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_operation_end.rs`); real hook CLI and local OTLP/JSON receiver.
+- **Agent:** none; a `cat` stand-in receives synthetic Claude hooks.
+- **Asserts:** matching Bash start/end hooks export the shell operation before run end, omit the `deck.operation.end` attribute entirely, leave the card Working without Error, and closing the pane retains exactly that operation unchanged.
+- **Does not assert:** real-agent hook emission, desktop rendering, or Error end events.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/022 — An operation left open at run end identifies forced closure.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_operation_end.rs`), local OTLP/JSON receiver.
+- **Agent:** none; a `cat` stand-in.
+- **Asserts:** closing a pane with an open shell call exports an operation with `deck.operation.end=run_end` and the run's end timestamp.
+- **Does not assert:** natural exit or daemon shutdown individually, or real-agent execution.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/023 — The open-operation cap identifies the operation it closes.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_operation_end.rs`), local OTLP/JSON receiver.
+- **Agent:** none; a `cat` stand-in.
+- **Asserts:** one more call than the cap exports the oldest call before run end with `deck.operation.end=cap`; its late end leaves the remaining calls for run-end closure.
+- **Does not assert:** sustained overload or real parallel agent calls.
+- **Platform coverage:** mac+linux.
+
+## Test Case Catalog — Telemetry identity
+
+##### telemetry/otlp/024 — Child spans and deck events carry their run's agent and orchestration identity.
+
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_span_identity.rs`).
+- **Agent:** declared Pi shell/cat stand-in; synthetic hooks, offline usage reply and fake gh rollups.
+- **Asserts:** agent.operation, agent.status, agent.ci and deck.status_change, deck.intervention, deck.ci.change, deck.model_usage exist and carry the run's deck.agent, deck.role and deck.orchestration.id.
+- **Does not assert:** real-agent hook production, provider telemetry or unscoped affected_checks spans.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/025 — Two runs observing one PR export its CI history once.
+
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_span_identity.rs`).
+- **Agent:** two shell/cat stand-ins in one worktree with offline gh rollups.
+- **Asserts:** both runs observe pending → failing → pending → passing and retain two observed rounds and one failure each; the receiver gets two CI intervals and four change events in total.
+- **Does not assert:** deduplication across daemons, different repositories with the same PR number or ownership handoff while checks are pending.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/026 — Unknown launchers learn agent identity from hooks while declared identity stays authoritative.
+
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_span_identity.rs`).
+- **Agent:** unknown shell/cat launchers and a declared Pi stand-in with synthetic Claude hooks.
+- **Asserts:** hook-learned Claude run identity and source=hook, declared Pi identity and source=spawn despite conflicting hooks, resolved identities on post-hook operation/thinking/working spans, and deck.agent=none with source absent for a silent unknown run.
+- **Does not assert:** real-agent detection or retrospective relabelling of child spans exported before identifying hooks.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/027 — A dispatched run exports its registry unit name without exporting its branch.
+
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_span_identity.rs`).
+- **Agent:** declared Pi shell/cat caller and dispatched single unit.
+- **Asserts:** the real dispatch CLI starts a unit in its worktree; the completed run carries deck.dispatch.name equal to the requested unit and exported spans exclude its branch name.
+- **Does not assert:** dispatched orchestration workers, registry recovery after daemon restart or full branch/content privacy (telemetry/otlp/004).
+- **Platform coverage:** mac+linux.
+
+## Test Case Catalog — Intervention kinds
+
+##### telemetry/otlp/028 — Typed steering is a text intervention.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_telemetry_intervention_kinds.rs`, `telemetry_otlp_028_text_intervention`); real binary, attached TUI and isolated OTLP HTTP/JSON receiver.
+- **Agent:** raw-input shell/cat stand-in; no model or credential.
+- **Asserts:** printable steering, Backspace and Enter reach the raw stand-in; one burst exports kind text and count 1; the private sentinel stays absent from OTLP bodies.
+- **Does not assert:** real-agent prompt rendering, mouse input, unbracketed-paste detection, or burst separation after five seconds.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/029 — Bracketed paste is a paste intervention.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_telemetry_intervention_kinds.rs`, `telemetry_otlp_029_paste_intervention`); real binary, attached TUI and isolated OTLP HTTP/JSON receiver.
+- **Agent:** raw-input shell/cat stand-in; no model or credential.
+- **Asserts:** bracketed-paste bytes reach the stand-in intact; the run exports kind paste and count 1 without its content.
+- **Does not assert:** real-agent prompt rendering, mouse input, unbracketed-paste detection, or burst separation after five seconds.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/030 — Cursor, Alt and mouse navigation is classified separately.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_telemetry_intervention_kinds.rs`, `telemetry_otlp_030_navigation_intervention`); real binary, attached TUI and isolated OTLP HTTP/JSON receiver.
+- **Agent:** raw-input shell/cat stand-in; no model or credential.
+- **Asserts:** cursor keys and an Alt chord reach the stand-in through the TUI; a separate run receives mouse reports through an attach stream; each exports kind navigate and count 1.
+- **Does not assert:** real-agent prompt rendering, mouse routing through TUI chrome, unbracketed-paste detection, or burst separation after five seconds.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/031 — Ctrl+C and Escape are interrupt interventions.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_telemetry_intervention_kinds.rs`, `telemetry_otlp_031_interrupt_intervention`); real binary, attached TUI and isolated OTLP HTTP/JSON receiver.
+- **Agent:** raw-input shell/cat stand-in; no model or credential.
+- **Asserts:** separate stand-in runs receive Ctrl+C and lone Escape through the TUI, and double Escape through an attach stream that preserves both bytes; each exports one interrupt, including a lone Escape flushed at run closure.
+- **Does not assert:** real-agent prompt rendering, mouse input, unbracketed-paste detection, or burst separation after five seconds.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/032 — Typing into a prompt is an answer intervention.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_telemetry_intervention_kinds.rs`, `telemetry_otlp_032_typed_answer_intervention`); real binary, attached TUI and isolated OTLP HTTP/JSON receiver.
+- **Agent:** raw-input shell/cat stand-in; no model or credential.
+- **Asserts:** permission-request and plain waiting-for-input hooks precede private typed answers in separate runs; each exports one answer without its content.
+- **Does not assert:** real-agent prompt rendering, mouse input, unbracketed-paste detection, or burst separation after five seconds.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/033 — A held-channel deck answer counts as a human intervention.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_telemetry_intervention_kinds.rs`, `telemetry_otlp_033_deck_held_answer_intervention`); real binary, attached TUI and isolated OTLP HTTP/JSON receiver.
+- **Agent:** raw-input shell/cat stand-in; no model or credential.
+- **Asserts:** a held synthetic permission hook receives an answer submitted through the question client API; no answer keys enter the pane, and its run exports one answer intervention.
+- **Does not assert:** real-agent prompt rendering, mouse input, unbracketed-paste detection, or burst separation after five seconds.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/034 — Interrupt upgrades the existing text burst.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_telemetry_intervention_kinds.rs`, `telemetry_otlp_034_interrupt_upgrades_text_burst`); real binary, attached TUI and isolated OTLP HTTP/JSON receiver.
+- **Agent:** raw-input shell/cat stand-in; no model or credential.
+- **Asserts:** private text followed by Ctrl+C in the same burst exports one interrupt and count 1 without its content.
+- **Does not assert:** real-agent prompt rendering, mouse input, unbracketed-paste detection, or burst separation after five seconds.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/035 — Automatic inbox doorbells do not count as interventions.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_telemetry_intervention_kinds.rs`, `telemetry_otlp_035_deck_doorbell_is_not_intervention`); real binary, attached TUI and isolated OTLP HTTP/JSON receiver.
+- **Agent:** raw-input shell/cat stand-in; no model or credential.
+- **Asserts:** a posted inbox task produces a doorbell received by the stand-in, with zero exported intervention events and count 0; the task sentinel stays private.
+- **Does not assert:** real-agent prompt rendering, mouse input, unbracketed-paste detection, or burst separation after five seconds.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/036 — Claude idle-prompt notifications do not turn steering into answers.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_telemetry_intervention_kinds.rs`, `telemetry_otlp_036_idle_notification_is_text`); real binary, attached TUI and isolated OTLP HTTP/JSON receiver.
+- **Agent:** raw-input shell/cat stand-in; no model or credential.
+- **Asserts:** a waiting-for-input event marked idle_prompt precedes private typed steering; the run exports text and count 1 without the sentinel.
+- **Does not assert:** real-agent prompt rendering, mouse input, unbracketed-paste detection, or burst separation after five seconds.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/037 — Mixed bursts use interrupt, answer, paste, text, navigate precedence.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_telemetry_intervention_kinds.rs`, `telemetry_otlp_037_kind_precedence_and_question_escape`); real binary, attached TUI and isolated OTLP HTTP/JSON receiver.
+- **Agent:** raw-input shell/cat stand-in; no model or credential.
+- **Asserts:** navigation plus text exports text, text plus bracketed paste exports paste, paste while a permission question is pending exports answer, and Escape while that question is pending exports interrupt; each run counts one burst and keeps its content private.
+- **Does not assert:** real-agent prompt rendering, mouse input, unbracketed-paste detection, or burst separation after five seconds.
+- **Platform coverage:** mac+linux.
+
+## Test Case Catalog — Telemetry handoffs and daemon health
+
+##### telemetry/otlp/038 — A delegated task ends its handoff when the orchestrator acknowledges its report.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_handoff.rs`); local OTLP/JSON receiver and real delegate, work-done, fetch and ack CLI calls.
+- **Agent:** two Python PTY stand-ins; no real agent or credential.
+- **Asserts:** one delegated task exports one agent.handoff after report acknowledgement, remains unexported while its report is queued or merely fetched, has one taken and one reported event in timestamp order, carries the orchestrator run/pane/trace/parent, worker run id, worker role and orchestration id, ends reported, survives subsequent run closure without duplication and excludes private task/report sentinels from captured raw JSON bodies.
+- **Does not assert:** natural orchestrator exit before acknowledgement, worker respawn identity refresh, superseding, daemon shutdown, bounded-map eviction or privacy of external agent SDKs.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/039 — An unread task whose worker exits exports an undeliverable handoff.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_handoff.rs`); real delegate CLI and local OTLP/JSON receiver.
+- **Agent:** two Python PTY stand-ins; the test terminates its own worker PID before task fetch.
+- **Asserts:** the inbox marks the posted task undeliverable, one agent.handoff exports outcome=undeliverable with the agent_exited enum reason, orchestrator parent/trace and worker role, no reported event, no duplicate at orchestrator closure and no private task text in raw JSON bodies.
+- **Does not assert:** deliberate StopAgent cancellation, absent target roles that were never posted, delivery retry exhaustion, or other undeliverable reasons.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/040 — Work-done without a task id increments the orchestrator's uncorrelated count.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_handoff.rs`); real work-done and inbox-fetch CLI calls and local OTLP/JSON receiver.
+- **Agent:** two Python PTY stand-ins with no commissioned task.
+- **Asserts:** a real note reaches the orchestrator, its completed agent.run has deck.handoffs.uncorrelated.count=1, no agent.handoff is invented, and the private report sentinel is absent from captured raw JSON bodies.
+- **Does not assert:** report retry deduplication, several uncorrelated notes, or a report sent while a commissioned task is outstanding.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/041 — Periodic daemon health exports memory, open runs, hook latency summaries and span drops.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_daemon_health.rs`); local OTLP/JSON receiver and shortened health interval.
+- **Agent:** two Python PTY stand-ins; no real agent or credential.
+- **Asserts:** distinct daemon.health intervals arrive while the daemon is running, open runs change from two to one after a stop, Linux RSS is positive, hook count exists, empty intervals omit p50/p95/max and sampled intervals have ordered finite measurements and the drop counter is zero under small load.
+- **Does not assert:** exact RSS, non-Linux memory availability, exact 60-second production timing, queue overflow or lost-span counter increments.
+- **Platform coverage:** mac+linux; RSS assertion Linux only.
+
+##### telemetry/otlp/042 — Hook latency samples producer events, excludes daemon events and resets each interval.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_daemon_health.rs`); real hook socket, daemon-authored pane-close broadcast and local OTLP/JSON receiver.
+- **Agent:** one Python PTY stand-in with exactly one timestamped producer hook; no real agent.
+- **Asserts:** a producer Thinking hook is observed, a real stop produces an observed daemon-synthetic SessionEnd, health intervals spanning the actions count one sample in total, its single-sample p50/p95/max retain at least 1.4 seconds of the injected 1.5-second age, and a later quiet interval resets count to zero and omits latency quantiles.
+- **Does not assert:** exact delivery latency, multi-sample percentile algorithms, every synthetic event variant, queue overflow, OTLP logs or attach latency.
+- **Platform coverage:** mac+linux.

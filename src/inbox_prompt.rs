@@ -1840,13 +1840,7 @@ mod tests {
         assert_eq!(sent["message_type"], "inbox_committed");
     }
 
-    /// Scenario: One prompt both commits a waiter's block and fetches for a
-    /// doorbell, sharing one receipts deadline, at a stand-in deck that
-    /// serves receipts and waits `delay` before each of its answers. A prompt
-    /// deck answering at once gets both done, each on its own connection that
-    /// is asked first; a slow one, whose every answer comes just inside a
-    /// budget, has the whole phase done within the one shared wait plus two
-    /// seconds, where four budgets one after another would take four delays.
+    /// Scenario: A prompt commits a waiter's block and fetches for a doorbell using one receipts deadline. A stand-in deck answering promptly completes both phases on separate connections, each asking about receipts first. A second deck answers the capability query promptly and records the commit, but holds its acknowledgement behind a test gate until the shared budget expires; the following fetch returns no task and opens no new connection.
     #[cfg(unix)]
     #[spec("inbox/claude/040")]
     #[test]
@@ -1875,10 +1869,9 @@ mod tests {
                 "token-1".to_string(),
             )
         };
-        // A deck serving every connection until stopped: it waits `delay`,
-        // says it serves receipts, reads the request, waits `delay` and
-        // answers it. Joined, it gives each connection's lines in order.
-        let deck = |name: &str, delay: Duration| {
+        // The prompt control answers every connection until stopped. Joined,
+        // it gives each connection's lines in order.
+        let prompt_deck = |name: &str| {
             let dir = crate::test_temp::tempdir().unwrap();
             let path = dir.path().join(name);
             let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
@@ -1900,7 +1893,6 @@ mod tests {
                         for answer in [r#"{"one_shot_receipts":1}"#, r#"{"messages":[]}"#] {
                             let Some(Ok(line)) = lines.next() else { break };
                             got.push(line);
-                            std::thread::sleep(delay);
                             if writeln!(writer, "{answer}").is_err() {
                                 break;
                             }
@@ -1934,7 +1926,7 @@ mod tests {
         };
         let wait = Duration::from_millis(1500);
 
-        let (_dir, path, stop, prompt) = deck("prompt.sock", Duration::ZERO);
+        let (_dir, path, stop, prompt) = prompt_deck("prompt.sock");
         let receipts_by = Instant::now() + wait;
         let committed =
             commit_attempts_by(&path, who, vec![attempt()], &Pinned::Unpinned, receipts_by);
@@ -1953,26 +1945,57 @@ mod tests {
             "each phase asks on its own connection, first"
         );
 
-        // Each answer inside a budget of its own; two of them past the
-        // shared one.
-        let delay = Duration::from_millis(1300);
-        let (_dir, path, stop, slow) = deck("slow.sock", delay);
-        let (took, (committed, fetched)) = timed(4 * delay, move || {
+        // Admit the commit promptly, then withhold only its acknowledgement.
+        // The gate stays closed until the client finishes both phases, so no
+        // successful handshake has to fit inside the old last 200 ms (#1960).
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("gated.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let (record, recorded) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let gated = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(wait + TOLERANCE)).unwrap();
+            let mut writer = socket.try_clone().unwrap();
+            let mut lines = std::io::BufReader::new(socket).lines();
+            let question = lines.next().unwrap().unwrap();
+            writeln!(writer, r#"{{"one_shot_receipts":1}}"#).unwrap();
+            let commit = lines.next().unwrap().unwrap();
+            record.send(vec![question, commit]).unwrap();
+            if gate.recv().is_ok() {
+                // The client has already spent its budget and may have closed.
+                let _ = writeln!(writer, r#"{{"messages":[]}}"#);
+            }
+            listener
+        });
+        let (took, (committed, fetched, expired)) = timed(2 * wait, move || {
             let receipts_by = Instant::now() + wait;
             let committed =
                 commit_attempts_by(&path, who, vec![attempt()], &Pinned::Unpinned, receipts_by);
             let fetched = fetch_with_receipts(&path, fetch(), CLAUDE, receipts_by).is_some();
-            (committed, fetched)
+            (committed, fetched, Instant::now() >= receipts_by)
         })
         .expect("the prompt's receipt work is still waiting");
+        // Release and join before asserting, including on an unexpected result.
+        release.send(()).unwrap();
+        let listener = gated.join().unwrap();
+        let seen = recorded.recv_timeout(TOLERANCE).unwrap();
+        assert_eq!(verbs(&seen), ["inbox_receipts", "inbox_committed"]);
+        assert!(expired, "the commit must exhaust the shared deadline");
         assert!(
             took < wait + TOLERANCE,
             "the prompt's receipt work took {took:?}, past one shared {wait:?}"
         );
         assert_eq!(committed, Committed::Sent, "the commit was written in time");
         assert!(!fetched, "the fetch, with the budget spent, takes nothing");
-        stop.store(true, Ordering::SeqCst);
-        drop(slow.join());
+        // Inspect the listen queue after the client has returned, rather than
+        // racing a server thread's connection counter against its stop flag.
+        listener.set_nonblocking(true).unwrap();
+        match listener.accept() {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("checking the fetch connection: {error}"),
+            Ok(_) => panic!("the fetch with the expired deadline opened a new connection"),
+        }
     }
 
     /// Scenario: A prompt's doorbell fetch gives up four ways: at a stand-in

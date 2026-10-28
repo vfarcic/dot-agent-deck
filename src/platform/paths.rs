@@ -483,11 +483,16 @@ pub fn binary_name() -> String {
 ///    without being vouched for.
 /// 4. Otherwise **refuse**: return `Err`, and the caller writes nothing at all.
 ///
-/// A 2a or 2b candidate must additionally be owner-writable only
-/// ([`write_mode_is_owner_only`]); one the group or the world can rewrite is
-/// skipped and the walk continues. That check is scoped to 2a and 2b, and
-/// deliberately does not extend to owners, ancestor directories or symlink
-/// targets — see issue #732.
+/// **Every path this returns must be one only you and root can change**
+/// (issue #732, [`untrusted_writer`]). The file it names, every directory the
+/// kernel walks to reach it, and every symlink on the way — the link's own
+/// directories and its target's — must be owned by the current user or root,
+/// and writable by no one else, a sticky directory and a group the user alone
+/// is in excepted ([`TrustedWriters`]). A candidate failing that at step 1,
+/// 1b, 2a or 2b is skipped and resolution continues; step 3 failing it is a
+/// refusal. The candidates skipped this way are named in the refusal, and in a
+/// warning whenever another candidate is pinned instead, so an install the
+/// deck passed over is not a mystery.
 ///
 /// `current_exe()` failing outright is a refusal too, **never** a fallback to
 /// [`DEFAULT_BINARY_NAME`] (issue #536). A bare `dot-agent-deck` in a file
@@ -533,7 +538,11 @@ pub fn binary_name() -> String {
 /// through to 2a, and gets the durable **symlink** path written. That is the
 /// desired outcome — canonicalizing 2a would resolve it straight back to the
 /// artifact and defeat the fix. It is also what lets the e2e harness point a
-/// sandbox `~/.local/bin` at the binary under test.
+/// sandbox `~/.local/bin` at the binary under test. Issue #732 kept this half
+/// and settled the other: the *spelling* written is the link, judged for
+/// durability by its name, while *trust* is judged through it, because
+/// whoever can rewrite the target runs code at every hook just as surely as
+/// whoever can rewrite the link.
 ///
 /// **"Exists and is executable" is the whole gate — a candidate is never
 /// executed** (PRD #381 Open Question 5, decided deliberately). This does a
@@ -614,9 +623,52 @@ pub fn durable_binary_resolution_with(
     home: &Path,
     path_value: Option<&std::ffi::OsStr>,
 ) -> Result<Resolved, String> {
-    let resolved = |path: String, arm: ResolutionArm| Ok(Resolved { path, arm });
+    durable_binary_resolution_judged(current_exe, home, path_value, &TrustedWriters::current())
+}
+
+/// [`durable_binary_resolution_with`] with the fourth input, who counts as a
+/// trusted writer, injected too — so a test can name a group the fixture's
+/// files belong to as untrusted without depending on the box's umask or group
+/// layout.
+fn durable_binary_resolution_judged(
+    current_exe: std::io::Result<PathBuf>,
+    home: &Path,
+    path_value: Option<&std::ffi::OsStr>,
+    writers: &TrustedWriters,
+) -> Result<Resolved, String> {
     let name = durable_binary_file_name();
     let installed = home.join(".local").join("bin").join(&name);
+    // Issue #732: every candidate that existed but failed the trust policy,
+    // with why, so whichever answer comes back can name them. A `RefCell`
+    // because the check that records them and the arms that report them are
+    // two closures alive at once.
+    let passed_over: std::cell::RefCell<Vec<(PathBuf, String)>> = Default::default();
+    let trusted = |candidate: &Path| match untrusted_writer(candidate, writers) {
+        None => true,
+        Some(reason) => {
+            let mut passed_over = passed_over.borrow_mut();
+            if !passed_over.iter().any(|(path, _)| path == candidate) {
+                passed_over.push((candidate.to_path_buf(), reason));
+            }
+            false
+        }
+    };
+    // Not silent when a candidate was passed over: the pin then names a
+    // different copy than the one the user may expect, possibly an older one
+    // later on `$PATH`. The last resort logs its own warning, which carries the
+    // same note.
+    let resolved = |path: String, arm: ResolutionArm| {
+        let passed_over = passed_over.borrow();
+        if arm != ResolutionArm::LastResort && !passed_over.is_empty() {
+            tracing::warn!(
+                "pinning `{path}` into agent hook config instead of a copy the trust policy \
+                 refused.{} {}",
+                passed_over_note(&passed_over, Some(Path::new(&path))),
+                trust_repair_advice(&installed)
+            );
+        }
+        Ok(Resolved { path, arm })
+    };
 
     let exe = match current_exe {
         Ok(exe) => exe,
@@ -646,6 +698,7 @@ pub fn durable_binary_resolution_with(
     if !is_build_artifact_path(&absolute)
         && is_installed_location(&absolute, home, path_value)
         && is_executable_file(&absolute)
+        && trusted(&absolute)
         && let Some(path) = durable_path_string(&absolute)
     {
         return resolved(path, ResolutionArm::Running);
@@ -673,8 +726,8 @@ pub fn durable_binary_resolution_with(
         for candidate in std::iter::once(installed.clone()).chain(path_candidates) {
             if !is_build_artifact_path(&candidate)
                 && is_executable_file(&candidate)
-                && write_mode_is_owner_only(&candidate)
                 && std::fs::canonicalize(&candidate).is_ok_and(|c| c == running)
+                && trusted(&candidate)
                 && let Some(path) = durable_path_string(&candidate)
             {
                 return resolved(path, ResolutionArm::Running);
@@ -682,18 +735,16 @@ pub fn durable_binary_resolution_with(
         }
     }
 
-    // `write_mode_is_owner_only` is step 2a's and 2b's, never step 1's — see
-    // that function, and issue #732 for the checks deliberately left out of it.
     if !is_build_artifact_path(&installed)
         && is_executable_file(&installed)
-        && write_mode_is_owner_only(&installed)
+        && trusted(&installed)
         && let Some(path) = durable_path_string(&installed)
     {
         return resolved(path, ResolutionArm::Install);
     }
 
     if let Some(path_value) = path_value
-        && let Some(found) = first_durable_path_match(path_value, &name)
+        && let Some(found) = first_durable_path_match(path_value, &name, &trusted)
         && let Some(path) = durable_path_string(&found)
     {
         return resolved(path, ResolutionArm::Install);
@@ -735,17 +786,30 @@ pub fn durable_binary_resolution_with(
             absolute.display()
         ));
     }
-    if !is_build_artifact_path(&absolute)
-        && is_executable_file(&absolute)
-        && let Some(path) = durable_path_string(&absolute)
-    {
+    // Issue #732: the last resort is held to the same trust policy as every
+    // other step, and here failing it is a refusal rather than a skip. The
+    // binary the user is running is no exemption: they started it once, while
+    // a pin runs it at every hook from now on, so a path another account can
+    // rewrite would turn one launch into a standing foothold.
+    let last_resort = !is_build_artifact_path(&absolute) && is_executable_file(&absolute);
+    if last_resort && let Some(reason) = untrusted_writer(&absolute, writers) {
+        return Err(format!(
+            "refusing to write `{}` into agent hook config: {reason}, and every hook would run \
+             it as you, so it must be a file only you and root can change.{} {}",
+            absolute.display(),
+            passed_over_note(&passed_over.borrow(), Some(&absolute)),
+            trust_repair_advice(&installed)
+        ));
+    }
+    if last_resort && let Some(path) = durable_path_string(&absolute) {
         // Not silent: "silently" is half of what issue #1140 is about, and this
         // is the one branch that persists a path the resolver cannot vouch for.
         tracing::warn!(
             "pinning `{path}` into agent hook config as a last resort: it is not an installed \
-             dot-agent-deck (neither `{}` nor any absolute `$PATH` entry contains one), so it \
-             will stop working if that file is removed. {}",
+             dot-agent-deck (neither `{}` nor any absolute `$PATH` entry holds one the deck can \
+             use), so it will stop working if that file is removed.{} {}",
             installed.display(),
+            passed_over_note(&passed_over.borrow(), None),
             repair_advice(&installed)
         );
         return resolved(path, ResolutionArm::LastResort);
@@ -754,12 +818,43 @@ pub fn durable_binary_resolution_with(
     Err(format!(
         "refusing to write `{}` into agent hook config: {}. No durable dot-agent-deck was found \
          at `{}` or on `$PATH`, and a hook command pointing at a path that will not exist is \
-         worse than no hook at all. {}",
+         worse than no hook at all.{} {}",
         absolute.display(),
         rejection_reason(&absolute),
         installed.display(),
+        passed_over_note(&passed_over.borrow(), None),
         repair_advice(&installed)
     ))
+}
+
+/// The sentence naming the candidates the trust policy passed over (issue
+/// #732), leaving out `except` — the path a message already names — or nothing
+/// when none remain. Leads with a space so it can sit between two sentences of
+/// a message.
+fn passed_over_note(passed_over: &[(PathBuf, String)], except: Option<&Path>) -> String {
+    let named: Vec<String> = passed_over
+        .iter()
+        .filter(|(path, _)| Some(path.as_path()) != except)
+        .map(|(path, reason)| format!("`{}` ({reason})", path.display()))
+        .collect();
+    if named.is_empty() {
+        return String::new();
+    }
+    format!(
+        " Passed over because someone other than you or root can change them: {}.",
+        named.join("; ")
+    )
+}
+
+/// The actionable half of a trust refusal (issue #732): what to fix, and the
+/// install that sidesteps it.
+fn trust_repair_advice(installed: &Path) -> String {
+    format!(
+        "Make the file and every directory above it owned by you or root and writable by no one \
+         else (`chmod go-w`), or install the deck to `{}` — then run `dot-agent-deck hooks \
+         install`.",
+        installed.display()
+    )
 }
 
 /// The file the running binary canonically is (issue #1637): what takeover
@@ -945,11 +1040,8 @@ fn is_default_target_layout(path: &Path) -> bool {
 /// This is the definition [`durable_binary_path`]'s steps 2a and 2b already
 /// search by, lifted out so step 1 can be held to it as well (issue #1140). It
 /// asks about the **location only**. It does not re-check the executable bit —
-/// step 1's own conjunction does that — and it deliberately does not check the
-/// write mode, because [`write_mode_is_owner_only`] is scoped to 2a and 2b for
-/// the reason recorded there: applying it to the binary the user is already
-/// running turns a loose mode on a legitimate install prefix into a refusal,
-/// which is issue #732's question and not this one's.
+/// step 1's own conjunction does that — nor who can write there, which is
+/// [`untrusted_writer`]'s question (issue #732), asked by step 1 beside this.
 ///
 /// Directories are compared **lexically** — [`std::path::absolute`] on both
 /// sides, never `canonicalize`. Resolving symlinks here would undo the property
@@ -957,11 +1049,8 @@ fn is_default_target_layout(path: &Path) -> bool {
 /// durable *name*, which is the whole reason 2a is not canonicalized either).
 /// Lexical comparison errs toward `false`, which is the harmless direction: a
 /// `$PATH` entry spelled through a symlinked directory does not match here, and
-/// the resolver falls through to 2b, which walks `$PATH` for that same name.
-/// Not necessarily to the same answer, note — 2b applies
-/// [`write_mode_is_owner_only`], which step 1 deliberately does not — so what
-/// the fall-through buys is a path resolved under 2b's rules rather than a
-/// guarantee of the same string.
+/// the resolver falls through to 2b, which walks `$PATH` for that same name
+/// under the same trust policy.
 fn is_installed_location(exe: &Path, home: &Path, path_value: Option<&std::ffi::OsStr>) -> bool {
     let Some(parent) = exe.parent() else {
         return false;
@@ -1005,16 +1094,20 @@ fn lexical_absolute(path: &Path) -> PathBuf {
 /// build-artifact candidate (which is exactly what this whole resolver
 /// refuses, and `$PATH` entries pointing into `target/debug` are routine on a
 /// developer's machine) are both **skipped** and the walk continues. A
-/// candidate the group or the world can rewrite ([`write_mode_is_owner_only`],
-/// and issue #732 for its deliberate limits) is skipped the same way.
-fn first_durable_path_match(path: &std::ffi::OsStr, name: &str) -> Option<PathBuf> {
+/// candidate `trusted` refuses — the resolver passes the issue #732 policy,
+/// [`untrusted_writer`] — is skipped the same way.
+fn first_durable_path_match(
+    path: &std::ffi::OsStr,
+    name: &str,
+    mut trusted: impl FnMut(&Path) -> bool,
+) -> Option<PathBuf> {
     std::env::split_paths(path)
         .filter(|dir| !is_untrustworthy_path_entry(dir))
         .map(|dir| dir.join(name))
         .find(|candidate| {
             !is_build_artifact_path(candidate)
                 && is_executable_file(candidate)
-                && write_mode_is_owner_only(candidate)
+                && trusted(candidate)
         })
 }
 
@@ -1367,51 +1460,407 @@ fn is_executable_file(candidate: &std::path::Path) -> bool {
     }
 }
 
-/// Whether write access to `candidate` is held by its owner alone — neither
-/// group- nor other-writable. A candidate failing this is skipped by
-/// resolution steps 2a and 2b, which move on to the next candidate or refuse
-/// (PRD #381 audit, HIGH — **partially** accepted).
+/// Who may be able to change a path [`durable_binary_path`] pins without that
+/// path being refused (issue #732): the current user, root, and the groups
+/// whose write permission is tolerated.
 ///
-/// **Scope, deliberately narrow; the rest is [issue #732].** Only the
-/// candidate's own mode is consulted. Owner checks, ancestor-directory
-/// writability, and canonical-symlink-target validation are NOT done here and
-/// must not be added without the design decision #732 exists to make: the
-/// failure mode is a **hard refusal to install**, so a false positive breaks a
-/// legitimate user outright, and `/usr/local/bin` is group-writable by `admin`
-/// on stock macOS.
+/// A group is a trusted writer only when every account in it is already one:
 ///
-/// Three consequences of that scope worth stating rather than discovering:
+/// - **gid 0** — `root` on Linux, `wheel` on macOS — whose membership only root
+///   arranges.
+/// - **the user's private group**: the user's primary group, named after the
+///   user, with no other account in it ([`is_private_group`]). This is what
+///   every Debian/Ubuntu account gets, under a `umask 002` that makes
+///   `~/.local/bin`, `~/.cargo/bin` and the binaries `cargo install` copies
+///   there group-writable; refusing it would refuse the default Linux layout.
+///   "No other account" is read from the group's member list and from a scan
+///   of the accounts whose primary group it is, which sees every account the
+///   account database enumerates; one a directory service does not enumerate
+///   is not seen.
+/// - **`admin`, on macOS**, whose members stock macOS lets `sudo` to root.
+///   Homebrew makes its prefix (`/opt/homebrew/bin`, `/usr/local/bin` on
+///   Intel) and its kegs group-writable by it, and `/Applications` is too.
 ///
-/// - **A symlink is exempt, not judged.** `symlink_metadata` is used so the
-///   mode read is the candidate's OWN, and a symlink's own mode is `0777` on
-///   every Unix this ships for — it says nothing about anything. Reading
-///   *through* it to the target's mode would be canonical-target validation,
-///   which is #732's, and it would also defeat step 2a's whole point: the
-///   stable `~/.local/bin` name the user controls is the durable thing, not
-///   whatever it currently points at.
-/// - **Step 1 (`current_exe()`) is not checked.** Refusing to install from the
-///   binary the user is *already running* converts a loose mode on a
-///   legitimate install prefix into a refusal, which is the failure #732 has
-///   to weigh first.
-/// - **A stat failure counts as untrusted.** Callers reach this only after
-///   [`is_executable_file`] has already stat'd the candidate successfully, so
-///   a failure here means it changed underneath us; skipping to the next
-///   candidate is free and correct.
-fn write_mode_is_owner_only(candidate: &std::path::Path) -> bool {
+/// Every other group is not, however few members it has: a shared primary
+/// group (`staff` on macOS, `users` on some Linux distributions) is exactly
+/// the other-account writer this policy exists to refuse.
+#[derive(Clone, Debug)]
+#[cfg_attr(not(unix), allow(dead_code))]
+struct TrustedWriters {
+    uid: u32,
+    groups: Vec<u32>,
+}
+
+impl TrustedWriters {
+    /// The writers this process trusts: its effective user, root, and the
+    /// groups described on the type. A lookup that fails trusts fewer groups,
+    /// never more.
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        match std::fs::symlink_metadata(candidate) {
-            Ok(meta) if meta.file_type().is_symlink() => true,
-            Ok(meta) => meta.permissions().mode() & 0o022 == 0,
-            Err(_) => false,
+    fn current() -> Self {
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        let mut groups = vec![0];
+        if let Some(gid) = private_group(uid) {
+            groups.push(gid);
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(gid) = group_id_named(c"admin") {
+            groups.push(gid);
+        }
+        Self { uid, groups }
+    }
+
+    /// Off Unix nothing is judged ([`untrusted_writer`]), so the value is
+    /// never consulted.
+    #[cfg(not(unix))]
+    fn current() -> Self {
+        Self {
+            uid: 0,
+            groups: Vec::new(),
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = candidate;
-        true
+}
+
+/// Why `path` is one someone other than a [`TrustedWriters`] writer could
+/// change, or `None` when only trusted writers can (issue #732).
+///
+/// The path is resolved the way the kernel resolves it at `exec` time, one
+/// component at a time, following every symlink (at most 40, as Linux does),
+/// and every entry consulted on the way is judged:
+///
+/// - every entry — directory, symlink, and the final file — must be **owned**
+///   by the user or root. An account that plants a file chooses its mode, but
+///   not its owner, so this is the check that stops a plant;
+/// - every directory, `/` included, and the final file must be writable by no
+///   one else: not by the world, and not by a group unless that group is
+///   trusted. A writable directory is what lets an account *replace* an entry
+///   the user owns, which the owner check alone cannot see. A **sticky**
+///   directory is the exception — `/tmp`, `/var/tmp`, Nix's `/nix/store` —
+///   because there only an entry's own owner can rename or remove it, and that
+///   owner is checked in turn;
+/// - a symlink's own mode is not judged: it is `0777` on Linux and nothing
+///   consults it. Its *directory* is what decides who can retarget it, and
+///   that directory has already been judged on the way in.
+///
+/// A component that cannot be read is untrusted: the resolver skips such a
+/// candidate for the next, which costs nothing when the candidate is fine.
+/// Mode bits only — an ACL granting another account write is not seen.
+///
+/// Off Unix there is no cheap equivalent, so nothing is refused.
+#[cfg(unix)]
+fn untrusted_writer(path: &Path, writers: &TrustedWriters) -> Option<String> {
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
+    use std::os::unix::fs::MetadataExt as _;
+    use std::path::Component;
+
+    const MAX_SYMLINK_HOPS: usize = 40;
+
+    fn push_components(pending: &mut VecDeque<OsString>, path: &Path) {
+        let parts: Vec<OsString> = path
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(name) => Some(name.to_os_string()),
+                Component::ParentDir => Some(OsString::from("..")),
+                Component::RootDir | Component::CurDir | Component::Prefix(_) => None,
+            })
+            .collect();
+        for part in parts.into_iter().rev() {
+            pending.push_front(part);
+        }
     }
+
+    if !path.is_absolute() {
+        return Some(format!("`{}` is not an absolute path", path.display()));
+    }
+    let root = PathBuf::from("/");
+    let judge = |entry: &Path, meta: &std::fs::Metadata, judge_mode: bool| {
+        if meta.uid() != writers.uid && meta.uid() != 0 {
+            return Some(format!(
+                "`{}` belongs to another account (uid {})",
+                entry.display(),
+                meta.uid()
+            ));
+        }
+        if !judge_mode {
+            return None;
+        }
+        let mode = meta.mode();
+        let sticky_dir = meta.is_dir() && mode & 0o1000 != 0;
+        if sticky_dir {
+            None
+        } else if mode & 0o002 != 0 {
+            Some(format!(
+                "`{}` is writable by every account",
+                entry.display()
+            ))
+        } else if mode & 0o020 != 0 && !writers.groups.contains(&meta.gid()) {
+            Some(format!(
+                "`{}` is writable by group {}, which is not known to hold only you and root",
+                entry.display(),
+                group_label(meta.gid())
+            ))
+        } else {
+            None
+        }
+    };
+
+    let mut current = root.clone();
+    match std::fs::metadata(&root) {
+        Ok(meta) => {
+            if let Some(reason) = judge(&root, &meta, true) {
+                return Some(reason);
+            }
+        }
+        Err(e) => return Some(format!("`/` cannot be read ({e})")),
+    }
+    let mut pending = VecDeque::new();
+    push_components(&mut pending, path);
+    let mut hops = 0;
+    while let Some(name) = pending.pop_front() {
+        if name == ".." {
+            // `current` holds no symlink, so its lexical parent is its real one.
+            current.pop();
+            continue;
+        }
+        let entry = current.join(&name);
+        let meta = match std::fs::symlink_metadata(&entry) {
+            Ok(meta) => meta,
+            Err(e) => return Some(format!("`{}` cannot be read ({e})", entry.display())),
+        };
+        if meta.file_type().is_symlink() {
+            if let Some(reason) = judge(&entry, &meta, false) {
+                return Some(reason);
+            }
+            hops += 1;
+            if hops > MAX_SYMLINK_HOPS {
+                return Some(format!(
+                    "`{}` goes through too many symlinks",
+                    path.display()
+                ));
+            }
+            let target = match std::fs::read_link(&entry) {
+                Ok(target) => target,
+                Err(e) => return Some(format!("`{}` cannot be read ({e})", entry.display())),
+            };
+            if target.is_absolute() {
+                current = root.clone();
+            }
+            push_components(&mut pending, &target);
+            continue;
+        }
+        if let Some(reason) = judge(&entry, &meta, true) {
+            return Some(reason);
+        }
+        if pending.is_empty() {
+            return None;
+        }
+        if !meta.is_dir() {
+            return Some(format!("`{}` is not a directory", entry.display()));
+        }
+        current = entry;
+    }
+    Some(format!("`{}` does not name a file", path.display()))
+}
+
+#[cfg(not(unix))]
+fn untrusted_writer(_path: &Path, _writers: &TrustedWriters) -> Option<String> {
+    None
+}
+
+/// `gid`'s name for a message, or the number when it has none.
+#[cfg(unix)]
+fn group_label(gid: u32) -> String {
+    group_record(gid)
+        .map(|(name, _)| format!("`{}`", String::from_utf8_lossy(&name)))
+        .unwrap_or_else(|| gid.to_string())
+}
+
+/// The user's private group (see [`TrustedWriters`]): `uid`'s primary gid, when
+/// [`is_private_group`] says so. `None` when it does not, or when a lookup
+/// fails.
+#[cfg(unix)]
+fn private_group(uid: u32) -> Option<u32> {
+    let (user, gid) = user_record(uid)?;
+    let (group, members) = group_record(gid)?;
+    // The cheap checks first: most groups fail on the name, and the account
+    // scan is then never run.
+    if !is_private_group(&user, uid, &group, &members, &[]) {
+        return None;
+    }
+    is_private_group(
+        &user,
+        uid,
+        &group,
+        &members,
+        &accounts_with_primary_group(gid),
+    )
+    .then_some(gid)
+}
+
+/// Whether a group is the private group of the account `user` (`uid`): it
+/// carries the account's name, no supplementary member (`supplementary`, from
+/// `getgrgid`) but the account, and no account but it and root has it as a
+/// primary group (`primary_uids`). The last term is there because `getgrgid`'s
+/// member list omits accounts whose *primary* group it is, so a group can look
+/// private from the member list alone while another account writes as it.
+/// Pure, so the decision is testable without the box's account database.
+fn is_private_group(
+    user: &[u8],
+    uid: u32,
+    group: &[u8],
+    supplementary: &[Vec<u8>],
+    primary_uids: &[u32],
+) -> bool {
+    group == user
+        && supplementary.iter().all(|member| member.as_slice() == user)
+        && primary_uids.iter().all(|&other| other == uid || other == 0)
+}
+
+/// The uid of every account the account database enumerates whose primary
+/// group is `gid`. An account a directory service does not enumerate (LDAP or
+/// SSSD with enumeration off, the usual default) is not seen.
+#[cfg(unix)]
+fn accounts_with_primary_group(gid: u32) -> Vec<u32> {
+    // `getpwent` walks one process-wide cursor, so this crate's callers take
+    // turns on it; nothing else in the crate enumerates accounts.
+    static ENUMERATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _turn = ENUMERATION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut uids = Vec::new();
+    // SAFETY: `setpwent`/`endpwent` take no arguments. Each non-null record
+    // `getpwent` returns is valid until the next call, and is read before it.
+    unsafe {
+        libc::setpwent();
+        loop {
+            let entry = libc::getpwent();
+            if entry.is_null() {
+                break;
+            }
+            if (*entry).pw_gid == gid {
+                uids.push((*entry).pw_uid);
+            }
+        }
+        libc::endpwent();
+    }
+    uids
+}
+
+/// Run one `get*_r` lookup with a buffer that grows on `ERANGE`. `call` returns
+/// the lookup's own error number as `Err`, `Ok(None)` for "no such entry".
+#[cfg(unix)]
+fn reentrant_lookup<T>(
+    mut call: impl FnMut(&mut [libc::c_char]) -> Result<Option<T>, libc::c_int>,
+) -> Option<T> {
+    let mut size = 1024;
+    loop {
+        let mut buf = vec![0 as libc::c_char; size];
+        match call(&mut buf) {
+            Ok(found) => return found,
+            Err(libc::ERANGE) if size < 1 << 20 => size *= 4,
+            Err(_) => return None,
+        }
+    }
+}
+
+/// `uid`'s login name and primary gid.
+#[cfg(unix)]
+fn user_record(uid: u32) -> Option<(Vec<u8>, u32)> {
+    reentrant_lookup(|buf| {
+        let mut record = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: `record` and `buf` are writable for the sizes passed, and
+        // `found` is a valid out-pointer; all three outlive the call.
+        let rc = unsafe {
+            libc::getpwuid_r(
+                uid,
+                record.as_mut_ptr(),
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut found,
+            )
+        };
+        if rc != 0 {
+            return Err(rc);
+        }
+        if found.is_null() {
+            return Ok(None);
+        }
+        // SAFETY: a non-null `found` means the call filled `record`, whose
+        // `pw_name` points into `buf`, still alive here.
+        let record = unsafe { record.assume_init() };
+        let name = unsafe { std::ffi::CStr::from_ptr(record.pw_name) };
+        Ok(Some((name.to_bytes().to_vec(), record.pw_gid)))
+    })
+}
+
+/// `gid`'s name and supplementary members.
+#[cfg(unix)]
+fn group_record(gid: u32) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
+    reentrant_lookup(|buf| {
+        let mut record = std::mem::MaybeUninit::<libc::group>::uninit();
+        let mut found: *mut libc::group = std::ptr::null_mut();
+        // SAFETY: as in `user_record`.
+        let rc = unsafe {
+            libc::getgrgid_r(
+                gid,
+                record.as_mut_ptr(),
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut found,
+            )
+        };
+        if rc != 0 {
+            return Err(rc);
+        }
+        if found.is_null() {
+            return Ok(None);
+        }
+        // SAFETY: a non-null `found` means the call filled `record`; `gr_name`
+        // and the NULL-terminated `gr_mem` array point into `buf`.
+        let record = unsafe { record.assume_init() };
+        let name = unsafe { std::ffi::CStr::from_ptr(record.gr_name) }
+            .to_bytes()
+            .to_vec();
+        let mut members = Vec::new();
+        let mut cursor = record.gr_mem;
+        // SAFETY: `gr_mem` is a NULL-terminated array of C strings in `buf`.
+        unsafe {
+            while !cursor.is_null() && !(*cursor).is_null() {
+                members.push(std::ffi::CStr::from_ptr(*cursor).to_bytes().to_vec());
+                cursor = cursor.add(1);
+            }
+        }
+        Ok(Some((name, members)))
+    })
+}
+
+/// The gid of the group called `name`.
+#[cfg(target_os = "macos")]
+fn group_id_named(name: &std::ffi::CStr) -> Option<u32> {
+    reentrant_lookup(|buf| {
+        let mut record = std::mem::MaybeUninit::<libc::group>::uninit();
+        let mut found: *mut libc::group = std::ptr::null_mut();
+        // SAFETY: as in `user_record`; `name` is a valid C string.
+        let rc = unsafe {
+            libc::getgrnam_r(
+                name.as_ptr(),
+                record.as_mut_ptr(),
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut found,
+            )
+        };
+        if rc != 0 {
+            return Err(rc);
+        }
+        if found.is_null() {
+            return Ok(None);
+        }
+        // SAFETY: a non-null `found` means the call filled `record`.
+        Ok(Some(unsafe { record.assume_init() }.gr_gid))
+    })
 }
 
 /// Whether a deck-owned pin **already sitting in an agent's configuration** —
@@ -1446,10 +1895,12 @@ fn write_mode_is_owner_only(candidate: &std::path::Path) -> bool {
 /// all: there is no reading under which such a value is a path the deck should
 /// keep.
 ///
-/// Note this is deliberately NOT [`write_mode_is_owner_only`]'s question. That
-/// check picks between candidates the resolver is free to reject; this one
-/// decides whether to overwrite a value the user may have put there on
-/// purpose, so it stays at "is this a usable absolute executable".
+/// Note this is deliberately NOT [`untrusted_writer`]'s question (issue #732).
+/// That check picks between candidates the resolver is free to reject; this
+/// one decides whether to overwrite a value the user may have put there on
+/// purpose, so it stays at "is this a usable absolute executable". The trust
+/// policy governs what the deck writes; it does not re-judge a pin already in
+/// an agent's config.
 pub(crate) fn pin_is_repairable(pin: &str) -> bool {
     let path = Path::new(pin);
     // Bare or relative: #536's own shape, and cwd-dependent by construction.
@@ -2270,6 +2721,10 @@ fn state_dir_platform_root() -> PathBuf {
         None => home_dir().join("AppData/Local/dot-agent-deck"),
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "paths_trust_tests.rs"]
+mod trust_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4793,46 +5248,6 @@ mod tests {
         );
     }
 
-    /// PRD #381 audit, HIGH (the accepted half). A step-2a candidate the group
-    /// can rewrite is not a path worth pinning into four agents' persistent
-    /// configuration, so resolution steps over it and continues. See
-    /// [`write_mode_is_owner_only`] for what is deliberately NOT checked here
-    /// (owners, ancestor directories, symlink targets — issue #732).
-    #[cfg(unix)]
-    #[test]
-    fn durable_binary_path_skips_a_group_writable_installed_candidate() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
-        let home = dir.path().join("home");
-        std::fs::create_dir_all(&home).expect("create home");
-        let name = format!("{DEFAULT_BINARY_NAME}{}", std::env::consts::EXE_SUFFIX);
-
-        let artifact_dir = dir.path().join("checkout").join("target").join("debug");
-        write_stub_executable(&artifact_dir.join(&name));
-
-        let loose = home.join(".local").join("bin").join(&name);
-        write_stub_executable(&loose);
-        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o775))
-            .expect("chmod the group-writable candidate");
-
-        let tight_dir = dir.path().join("opt").join("bin");
-        write_stub_executable(&tight_dir.join(&name));
-        let path_value = std::env::join_paths([tight_dir.clone()]).expect("join synthetic PATH");
-
-        let resolved = durable_binary_path_with(
-            Ok(artifact_dir.join(&name)),
-            &home,
-            Some(path_value.as_os_str()),
-        );
-
-        assert_eq!(
-            assert_durable(&resolved),
-            tight_dir.join(&name).to_str().expect("path is UTF-8"),
-            "a group-writable ~/.local/bin candidate must be skipped"
-        );
-    }
-
     /// The same rule on step 2b: a world-writable `$PATH` candidate is skipped
     /// and the walk continues to a later owner-only one, rather than the first
     /// executable hit winning.
@@ -4874,12 +5289,12 @@ mod tests {
         );
     }
 
-    /// A symlink candidate is exempt from the write-mode check rather than
-    /// judged by it: its own mode is `0777` on every Unix this ships for, and
-    /// reading through it to the target's mode is the canonical-target
-    /// validation issue #732 owns. Step 2a's whole point is that the stable
-    /// `~/.local/bin` name is the durable thing — this pins that the F4 check
-    /// did not quietly undo it.
+    /// A symlink candidate is judged THROUGH, and written AS, the link: issue
+    /// #732 validates the target's owner and directories, but the spelling
+    /// written stays the stable `~/.local/bin` name, which is step 2a's whole
+    /// point. A target inside a cargo build tree is not refused for being one —
+    /// durability is the name's, trust is the target's. The trust half's own
+    /// cases are in `paths_trust_tests.rs`.
     #[cfg(unix)]
     #[test]
     fn durable_binary_path_still_accepts_a_symlinked_installed_candidate() {
@@ -4903,7 +5318,7 @@ mod tests {
             assert_durable(&resolved),
             link.to_str().expect("link path is UTF-8"),
             "the symlink spelling is the durable answer and must survive the \
-             write-mode check"
+             trust check on its target"
         );
     }
 

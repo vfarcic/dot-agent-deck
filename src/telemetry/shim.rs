@@ -247,9 +247,23 @@ fn plan(
         }
         _ => Vec::new(),
     };
+    // Issue #2002: the wrapper's embedded-mode pair stays first, in front of
+    // these additions as well as the user's own arguments.
+    let mut args = args;
+    let rest = args.split_off(
+        if name == "codex" && crate::wrap::opens_with_codex_embedded_args(&args) {
+            crate::wrap::CODEX_EMBEDDED_ARGS.len()
+        } else {
+            0
+        },
+    );
     Ok(Plan {
         program,
-        args: added.into_iter().map(OsString::from).chain(args).collect(),
+        args: args
+            .into_iter()
+            .chain(added.into_iter().map(OsString::from))
+            .chain(rest)
+            .collect(),
     })
 }
 
@@ -682,6 +696,35 @@ mod tests {
         assert_eq!(args[2], "-c");
         assert!(args[3].starts_with("otel.metrics_exporter="), "{args:?}");
         assert_eq!(args[4..], ["exec", "--model", "m"]);
+    }
+
+    /// Issue #2002: the wrapper's embedded-mode pair stays in front of the
+    /// exporters; the same arguments anywhere else get no such treatment.
+    #[test]
+    fn codex_keeps_the_embedded_pair_in_front_of_its_exporters() {
+        let f = fixture();
+        let [c, set] = crate::wrap::CODEX_EMBEDDED_ARGS;
+        let strs = |plan: Plan| -> Vec<String> {
+            plan.args
+                .iter()
+                .map(|a| a.to_str().unwrap().to_string())
+                .collect()
+        };
+        let args = strs(
+            f.plan("codex", &[c, set, "--model", "m"], &f.env(&[]))
+                .unwrap(),
+        );
+        assert_eq!(args[..2], [c, set]);
+        assert!(args[3].starts_with("otel.trace_exporter="), "{args:?}");
+        assert!(args[5].starts_with("otel.metrics_exporter="), "{args:?}");
+        assert_eq!(args[6..], ["--model", "m"]);
+
+        let args = strs(
+            f.plan("codex", &["--model", "m", c, set], &f.env(&[]))
+                .unwrap(),
+        );
+        assert!(args[1].starts_with("otel.trace_exporter="), "{args:?}");
+        assert_eq!(args[4..], ["--model", "m", c, set]);
     }
 
     /// Every way the decision declines runs the program with its own

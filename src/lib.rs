@@ -123,6 +123,7 @@ pub mod inbox_spills;
 pub mod inbox_watcher;
 pub mod ingress_ledger;
 pub mod init;
+pub mod injected_prompt;
 // PRD #1666 part 3 round 5-wake: a wrapper's samples of its agent's line discipline.
 pub mod input_mode;
 pub mod issue_dispatch;

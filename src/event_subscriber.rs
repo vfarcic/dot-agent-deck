@@ -416,6 +416,8 @@ async fn subscribe_with_snapshot(
             // is bound to the process that opened the stream, and is taken
             // only when it names that process too; any other listing is a
             // snapshot that could not be read, and the resync is tried again.
+            // Issue #1825: so is any listing for an unnamed stream, which no
+            // listing can be shown to share a process with.
             let sub = client.subscribe_events().await.map_err(|e| match e {
                 ClientError::ProtocolMismatch { daemon, local } => {
                     ResyncFailure::Protocol(ProtocolRefusal { daemon, local })
@@ -427,8 +429,16 @@ async fn subscribe_with_snapshot(
                 _ => client.clone(),
             };
             match tokio::time::timeout(RESYNC_LIST_TIMEOUT, lister.list_agents_detailed()).await {
-                Ok(Ok(listing)) if listing.incarnation.as_ref() == sub.incarnation() => {
+                Ok(Ok(listing))
+                    if sub
+                        .incarnation()
+                        .zip(listing.incarnation.as_ref())
+                        .is_some_and(|(stream, listed)| stream.same_process(listed)) =>
+                {
                     Ok((sub, listing.records))
+                }
+                Ok(Ok(_)) if sub.incarnation().is_none_or(|i| i.is_unnamed()) => {
+                    Err(ResyncFailure::Snapshot(ClientError::DaemonUnnamed))
                 }
                 Ok(Ok(_)) => Err(ResyncFailure::Snapshot(ClientError::DaemonRestarted)),
                 Ok(Err(ClientError::ProtocolMismatch { daemon, local })) => {
@@ -536,8 +546,9 @@ mod tests {
     /// not. A `SubscribeEventsWithSnapshot` (issue #1555) opens its receiver and
     /// reads the snapshot at one instant, so nothing reaches it that the
     /// snapshot includes: it carries `after_snapshot` alone. `ordered` is
-    /// whether this daemon advertises that request; one that does not is a
-    /// daemon from before it.
+    /// whether this daemon advertises that request; one that does not stands
+    /// in for a daemon from before it. Every `Hello` names one process
+    /// ([`ScriptedDaemon::hello`]).
     struct ScriptedDaemon {
         first_stream: Vec<AgentEvent>,
         queued: Vec<AgentEvent>,
@@ -577,6 +588,21 @@ mod tests {
                 first_notices: Vec::new(),
                 inboxes: Vec::new(),
             }
+        }
+
+        /// The `Hello` reply: every capability, the ordered subscription's
+        /// only where `ordered`, and the process [`SCRIPTED_PROCESS`] named,
+        /// so a gated client's stream and its listing share one (issue #1825).
+        fn hello(&self) -> AttachResponse {
+            let mut resp = AttachResponse::hello(PROTOCOL_VERSION).with_capabilities();
+            if !self.ordered
+                && let Some(capabilities) = resp.capabilities.as_mut()
+            {
+                capabilities
+                    .retain(|c| c != crate::daemon_protocol::CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT);
+            }
+            resp.instance_id = Some(SCRIPTED_PROCESS.into());
+            resp
         }
 
         /// The listing reply, or `None` for a scripted refusal.
@@ -629,6 +655,9 @@ mod tests {
         }
     }
 
+    /// The daemon process a [`ScriptedDaemon`] names on every `Hello`.
+    const SCRIPTED_PROCESS: &str = "scripted";
+
     struct Counters {
         subscriptions: AtomicUsize,
         lists: AtomicUsize,
@@ -644,6 +673,13 @@ mod tests {
         }
     }
 
+    async fn read_request(rd: &mut tokio::net::unix::OwnedReadHalf) -> Option<AttachRequest> {
+        let Ok(Some((KIND_REQ, payload))) = read_frame(rd).await else {
+            return None;
+        };
+        Some(serde_json::from_slice(&payload).expect("a request the daemon can read"))
+    }
+
     async fn serve(
         listener: tokio::net::UnixListener,
         script: Arc<ScriptedDaemon>,
@@ -657,20 +693,20 @@ mod tests {
             let n = Arc::clone(&n);
             tokio::spawn(async move {
                 let (mut rd, mut wr) = stream.into_split();
-                let Ok(Some((KIND_REQ, payload))) = read_frame(&mut rd).await else {
+                let Some(mut request) = read_request(&mut rd).await else {
                     return;
                 };
-                let request: AttachRequest =
-                    serde_json::from_slice(&payload).expect("a request the daemon can read");
+                if let AttachRequest::Hello { .. } = request {
+                    let resp = serde_json::to_vec(&script.hello()).unwrap();
+                    write_frame(&mut wr, KIND_RESP, &resp).await.unwrap();
+                    // A gated client sends its one request on the connection
+                    // its `Hello` was checked on; an ungated one hangs up.
+                    let Some(follow_on) = read_request(&mut rd).await else {
+                        return;
+                    };
+                    request = follow_on;
+                }
                 match request {
-                    AttachRequest::Hello { .. } => {
-                        let mut resp = AttachResponse::hello(PROTOCOL_VERSION);
-                        if script.ordered {
-                            resp = resp.with_capabilities();
-                        }
-                        let resp = serde_json::to_vec(&resp).unwrap();
-                        write_frame(&mut wr, KIND_RESP, &resp).await.unwrap();
-                    }
                     AttachRequest::SubscribeEvents => {
                         let ok = serde_json::to_vec(&AttachResponse::ok()).unwrap();
                         write_frame(&mut wr, KIND_RESP, &ok).await.unwrap();
@@ -777,7 +813,10 @@ mod tests {
             break_on_event: None,
             applied: None,
         };
-        let subscriber = tokio::spawn(run(DaemonClient::new(socket), Arc::clone(&state), config));
+        // Gated, as `main.rs` spawns it: an ungated client learns no process,
+        // and the fallback takes no listing for an unnamed stream (issue #1825).
+        let client = DaemonClient::new(socket).with_protocol_gate();
+        let subscriber = tokio::spawn(run(client, Arc::clone(&state), config));
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut seen = tui_view(&state).await;
@@ -1757,7 +1796,7 @@ mod tests {
         }
     }
 
-    /// Scenario: a TUI resynchronizes against a deck that predates the ordered subscribe-with-snapshot request, so it subscribes and then lists on a second connection; the deck restarts as the same build between the two. From a stream on the named process `a`, the restarted process is sent no listing and the resync fails; from a stream on a deck that named no process, the restarted deck's listing names `b` and is not taken either. With no restart, the listing is taken in both cases (control).
+    /// Scenario: a TUI resynchronizes against a deck that predates the ordered subscribe-with-snapshot request, so it subscribes and then lists on a second connection; the deck restarts as the same build between the two. From a stream on the named process `a`, the restarted process is sent no listing and the resync fails; from a stream on a deck that named no process, the restarted deck's listing names `b` and is not taken either. With no restart, the listing from the named process `a` is taken (control); the unnamed deck's own listing is not, since nothing shows it comes from the stream's process (issue #1825).
     #[spec("lifecycle/handshake/013")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn handshake_013_a_fallback_snapshot_comes_from_the_streams_own_process() {
@@ -1784,13 +1823,14 @@ mod tests {
                 match answer {
                     Ok((sub, records)) => {
                         assert!(!restarted, "{case}: another process's listing was taken");
+                        assert_eq!(first, "a", "{case}: an unnamed stream's listing was taken");
                         let process = sub.incarnation().and_then(|i| i.as_deref());
-                        assert_eq!(process, (first == "a").then_some("a"), "{case}");
+                        assert_eq!(process, Some("a"), "{case}");
                         assert_eq!(records.len(), 1, "{case}");
                     }
                     Err(ResyncFailure::Snapshot(_)) => {
                         assert!(
-                            restarted,
+                            restarted || first != "a",
                             "{case}: the stream's own process's listing was refused"
                         );
                     }
