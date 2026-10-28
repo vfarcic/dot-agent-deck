@@ -17,6 +17,6 @@ blob-report/
 driver-results/
 
 # JUnit reports (issue #1981 M10): `junit/vitest.xml` and `junit/playwright.xml`
-# under CI, `junit/driver.xml` from every `pnpm test:driver`. CI uploads them
-# on every run.
+# under CI, `junit/driver.xml` from every `pnpm test:driver`. CI uploads the
+# reports that exist, on passing and failing test runs.
 junit/
