@@ -1858,20 +1858,22 @@ impl Shared {
         self.lock_clock().catch_up();
     }
 
-    /// Issue #1981 M8: `event` was read off the broadcast now: count how long
-    /// it took from its hook's stamp, when an agent's hook produced it
-    /// ([`super::health`]). The question the daemon turns keyboard-only after
-    /// typing part of its answer is the daemon's own, though
-    /// [`crate::event::AgentEvent::is_daemon_synthetic`] does not say so.
+    /// Issue #1981 M8: count how long `event` took from its hook's stamp to
+    /// the daemon receiving it ([`super::health`]), when the daemon admitted
+    /// it from a producer: only those carry the daemon's receipt stamp
+    /// ([`crate::event::RECEIVED_BY_DECK_AT_METADATA_KEY`]), so no event the
+    /// daemon builds itself is counted, whatever its type.
     fn record_hook_latency(&self, event: &crate::event::AgentEvent) {
-        if self.health_interval.is_none()
-            || event.is_daemon_synthetic()
-            || event
-                .metadata
-                .contains_key(crate::event::QUESTION_KEYBOARD_ONLY_BY_DECK_METADATA_KEY)
-        {
+        if self.health_interval.is_none() {
             return;
         }
+        let Some(received) = event
+            .metadata
+            .get(crate::event::RECEIVED_BY_DECK_AT_METADATA_KEY)
+            .and_then(|v| v.parse::<u64>().ok())
+        else {
+            return;
+        };
         let Some(stamped) = event
             .timestamp
             .timestamp_nanos_opt()
@@ -1879,7 +1881,7 @@ impl Shared {
         else {
             return;
         };
-        self.lock_health().record(stamped, now_unix_nanos());
+        self.lock_health().record(stamped, received);
     }
 
     fn lock_health(&self) -> std::sync::MutexGuard<'_, super::health::Window> {
@@ -6672,7 +6674,8 @@ mod tests {
         let mut produced = event("p1", EventType::Thinking);
         produced.agent_id = Some("a1".into());
         produced.timestamp = chrono::Utc::now() - chrono::Duration::milliseconds(1500);
-        tx.send(BroadcastMsg::Event(produced)).unwrap();
+        tx.send(BroadcastMsg::Event(received_after(produced, 1500)))
+            .unwrap();
         // The daemon's own: a shell's busy state.
         tx.send(of("p1", "a1", EventType::ShellBusy)).unwrap();
         telemetry.settled().await;
@@ -6713,12 +6716,26 @@ mod tests {
         );
     }
 
-    /// Greptile review on PR #2010: the question the daemon turns
-    /// keyboard-only after typing part of its answer is broadcast as an
-    /// `unknown` event stamped by the daemon. It is not an agent's hook, so
-    /// only the agent's own event counts toward the interval's hook latency.
+    /// Issue #1981 M8: `event` as the daemon admits it from a producer,
+    /// received `ms` milliseconds after its hook stamped it
+    /// (`crate::daemon::admit_producer_event`).
+    fn received_after(mut event: AgentEvent, ms: i64) -> AgentEvent {
+        let at = event.timestamp + chrono::Duration::milliseconds(ms);
+        event.metadata.insert(
+            crate::event::RECEIVED_BY_DECK_AT_METADATA_KEY.to_string(),
+            at.timestamp_nanos_opt().unwrap().to_string(),
+        );
+        event
+    }
+
+    /// Issue #1981 M8 (PR #2010 review): hook latency counts only the events
+    /// the daemon admitted from a producer, measured to when the daemon
+    /// received each. The events the daemon builds itself carry no receipt
+    /// stamp and are not counted, whatever their type: the question it turns
+    /// keyboard-only after typing part of an answer, a Codex turn's failure
+    /// read from its rollout, and a shell's busy state.
     #[tokio::test]
-    async fn a_question_the_deck_made_keyboard_only_is_no_hook_latency_sample() {
+    async fn only_events_admitted_from_a_producer_are_hook_latency_samples() {
         let (sink, mut rx) = mpsc::channel(QUEUE_CAPACITY);
         let telemetry = Arc::new(Telemetry::start_with(
             &env(&ON),
@@ -6732,10 +6749,13 @@ mod tests {
         let (tx, events) = broadcast::channel(16);
         telemetry.subscribe(events);
         begin(&telemetry, generation("p1", "a1"), &[]);
+        // Stamped by its hook a minute ago and received 1.5 s later: the
+        // sample is the 1.5 s, not the minute until the broadcast was read.
         let mut produced = event("p1", EventType::Thinking);
         produced.agent_id = Some("a1".into());
-        produced.timestamp = chrono::Utc::now() - chrono::Duration::milliseconds(1500);
-        tx.send(BroadcastMsg::Event(produced)).unwrap();
+        produced.timestamp = chrono::Utc::now() - chrono::Duration::seconds(60);
+        tx.send(BroadcastMsg::Event(received_after(produced, 1500)))
+            .unwrap();
         let question: crate::question::PendingQuestion =
             serde_json::from_value(serde_json::json!({
                 "id": "q1",
@@ -6751,13 +6771,27 @@ mod tests {
             .unwrap();
         let mut keyboard_only = crate::daemon::deck_keyboard_only_event(
             "p1-session".into(),
-            crate::event::AgentType::ClaudeCode,
+            AgentType::ClaudeCode,
             Some("p1".into()),
             Some("a1".into()),
             &question,
         );
         keyboard_only.timestamp = chrono::Utc::now() - chrono::Duration::milliseconds(9000);
         tx.send(BroadcastMsg::Event(keyboard_only)).unwrap();
+        let mut rollout_error = crate::daemon::codex_rollout_failure_event(
+            crate::codex_rollout_tail::CodexTurnFailure {
+                pane_id: "p1".into(),
+                agent_id: "a1".into(),
+                session_id: "p1-session".into(),
+                turn_id: "t1".into(),
+                outcome: crate::quota_signals::FailureOutcome::Error,
+                message: None,
+            },
+        );
+        assert_eq!(rollout_error.event_type, EventType::Error, "precondition");
+        rollout_error.timestamp = chrono::Utc::now() - chrono::Duration::milliseconds(9000);
+        tx.send(BroadcastMsg::Event(rollout_error)).unwrap();
+        tx.send(of("p1", "a1", EventType::ShellBusy)).unwrap();
         telemetry.settled().await;
         let shared = &telemetry.exporting.as_ref().unwrap().shared;
         shared.sample_health(now_unix_nanos(), None);
@@ -6767,8 +6801,43 @@ mod tests {
             .collect();
         assert_eq!(health.len(), 1, "{health:?}");
         assert_eq!(health_attr(&health[0], AttrKey::HookLatencyCount), Some(1));
-        let max = health_attr(&health[0], AttrKey::HookLatencyMax).unwrap();
-        assert!((1500..9000).contains(&max), "{max}");
+        assert_eq!(health_attr(&health[0], AttrKey::HookLatencyMax), Some(1500));
+        assert_eq!(health_attr(&health[0], AttrKey::HookLatencyP50), Some(1500));
+    }
+
+    /// Issue #1981 M8: an event carrying no receipt stamp, or one that is not
+    /// a number, is no hook latency sample, whatever its type or age.
+    #[tokio::test]
+    async fn an_event_without_a_readable_receipt_stamp_is_no_hook_latency_sample() {
+        let (sink, mut rx) = mpsc::channel(QUEUE_CAPACITY);
+        let telemetry = Arc::new(Telemetry::start_with(
+            &env(&ON),
+            Settings {
+                sink: Some(sink),
+                health_interval: Some(Duration::from_secs(3600)),
+                ..Settings::default()
+            },
+        ));
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("p1", "a1"), &[]);
+        let mut unstamped = event("p1", EventType::Thinking);
+        unstamped.agent_id = Some("a1".into());
+        tx.send(BroadcastMsg::Event(unstamped.clone())).unwrap();
+        unstamped.metadata.insert(
+            crate::event::RECEIVED_BY_DECK_AT_METADATA_KEY.to_string(),
+            "soon".to_string(),
+        );
+        tx.send(BroadcastMsg::Event(unstamped)).unwrap();
+        telemetry.settled().await;
+        let shared = &telemetry.exporting.as_ref().unwrap().shared;
+        shared.sample_health(now_unix_nanos(), None);
+        let health: Vec<_> = captured(&mut rx)
+            .into_iter()
+            .filter(|s| s.name == crate::telemetry::SPAN_DAEMON_HEALTH)
+            .collect();
+        assert_eq!(health.len(), 1, "{health:?}");
+        assert_eq!(health_attr(&health[0], AttrKey::HookLatencyCount), Some(0));
     }
 
     /// Issue #1981 M7 review: a post keeps its place on the broadcast. With
