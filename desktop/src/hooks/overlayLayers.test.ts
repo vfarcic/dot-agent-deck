@@ -26,12 +26,19 @@ describe("the overlay layers", () => {
   /** Scenario: each layer the stack orders overlays by is the z-index its backdrop is painted at. */
   it.each([
     [".sheet-backdrop", OVERLAY_LAYER.sheet],
+    [".reader-overlay", OVERLAY_LAYER.reader],
     [".agent-pane-overlay", OVERLAY_LAYER.pane],
     [".pr-browser-overlay", OVERLAY_LAYER.pullRequest],
     [".sheet-backdrop.is-raised", OVERLAY_LAYER.raisedSheet],
     [".dialog-backdrop", OVERLAY_LAYER.dialog],
   ])("paints %s at its layer", (selector, layer) => {
     expect(zIndex(selector)).toBe(layer);
+  });
+
+  /** Scenario: the output reader is drawn above a sheet that is not raised and beneath the pane, so a sheet opened over it is raised (issue #1709). */
+  it("draws the reader between a sheet and the pane", () => {
+    expect(OVERLAY_LAYER.reader).toBeGreaterThan(OVERLAY_LAYER.sheet);
+    expect(OVERLAY_LAYER.pane).toBeGreaterThan(OVERLAY_LAYER.reader);
   });
 
   /** Scenario: a raised sheet is drawn above the pane and the browser, and beneath every dialog. */

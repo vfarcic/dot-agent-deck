@@ -1328,6 +1328,35 @@ impl EmbeddedPaneController {
         notice_identity_refusal(&self.close_warnings, error)
     }
 
+    /// Issue #1913: record that `pane_id`'s agent was lost to a deck restart,
+    /// as its reattach does once it meets the restarted deck, when the pane is
+    /// still attached on `replaced` — a process the caller knows the deck
+    /// replaced. Answers whether it was recorded.
+    pub(crate) fn mark_lost_to_restart(&self, pane_id: &str, replaced: &Incarnation) -> bool {
+        let panes = self.panes.lock().unwrap();
+        let Some(pane) = panes.get(pane_id) else {
+            return false;
+        };
+        let attached_on_replaced = pane
+            .backend
+            .attached
+            .lock()
+            .unwrap()
+            .incarnation
+            .as_ref()
+            .is_some_and(|attached_on| attached_on.same_process(replaced));
+        if attached_on_replaced {
+            *pane.backend.lost.lock().unwrap() = Some(PaneLostReason::DeckRestarted);
+        }
+        attached_on_replaced
+    }
+
+    /// Issue #1913: whether this controller holds a local pane under
+    /// `pane_id` at all, attached or not.
+    pub(crate) fn holds_pane(&self, pane_id: &str) -> bool {
+        self.panes.lock().unwrap().contains_key(pane_id)
+    }
+
     /// Test-only: record that `pane_id`'s agent was lost for `reason`, as
     /// the pane's reattach does, without waiting out a reattach.
     #[cfg(all(test, unix))]
