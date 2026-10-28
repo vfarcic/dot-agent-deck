@@ -28,6 +28,9 @@ const realSpawn = cp.spawn;
 // publish delay knob: a later one publishes at once.
 let watchers = 0;
 let stalledSnapshot = false;
+// Set once OpenCode is first prompted: the stall below waits for it, so the
+// task it reproduces is held after its prompt began, not still queued.
+let prompted = false;
 cp.spawn = (...args) => {
   if (config.firstWatcherDelaysPublish && args[1]?.[1] === 'wait' && watchers++ > 0) {
     const env = {...process.env};
@@ -41,17 +44,19 @@ cp.spawn = (...args) => {
   child.rawWrite = write;
   if (write) child.stdin.write = (bytes, ...rest) => {
     const snapshot = JSON.parse(bytes.toString()).possess;
-    if (!stalledSnapshot && config.snapshotStallMs && snapshot?.seq >= 3 && snapshot.held.length) {
+    if (!stalledSnapshot && config.snapshotStallMs && prompted && snapshot?.held.length) {
       stalledSnapshot = true;
-      // Place a held snapshot between keepalives, then block the plugin's
-      // event loop to reproduce a scheduling gap independently of its TTL.
+      // Place the first held snapshot after the first prompt between
+      // keepalives, then block the plugin's event loop to reproduce a
+      // scheduling gap independently of its TTL.
+      // `snapshotStallDelayMs` sets where between two keepalives it lands.
       setTimeout(() => {
         log('stdin', {text: bytes.toString()});
         write(bytes, ...rest);
         const until = performance.now() + config.snapshotStallMs;
         while (performance.now() < until) {}
         log('stalled', {ms: config.snapshotStallMs});
-      }, 100);
+      }, config.snapshotStallDelayMs ?? 100);
       return true;
     }
     log('stdin', {text: bytes.toString()});
@@ -87,6 +92,7 @@ const api = {
   async list() {return {data:Object.values(sessions)};},
   async promptAsync(request) {
     log('prompt', {request: config.server && request.path ? {sessionID:request.path.id,...request.body} : request, raw:request});
+    prompted = true;
     if (config.reject) return {error:{message:'fixture rejects'}};
     // PRD #1666 §4: the first `throwAfterPrompt` calls are taken and then fail,
     // as a lost connection does after OpenCode accepted the prompt.
