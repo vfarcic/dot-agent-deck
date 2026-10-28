@@ -10,7 +10,9 @@
 //! invocation it is ([`classifier`]), the arm page the daemon publishes
 //! to its editor helper ([`arm`]), the permission to arm ([`permission`]),
 //! the input epoch with the query ledger, `B` and the native hazard FIFO
-//! kept beside it ([`epoch`], [`query_ledger`]), and installation: the
+//! kept beside it ([`epoch`], [`query_ledger`]), a generation's invocation
+//! records, what each settles and its writer scope ([`record`]), and
+//! installation: the
 //! decision at each spawn ([`install`]) and the instance directory it
 //! installs from ([`instance`], Linux), and the editor helper an installed
 //! agent runs as its editor ([`helper`], Linux), which the binary dispatches
@@ -19,8 +21,8 @@
 //! every spawn, which installs nothing outside the `e2e` build's assumption
 //! until activation; nothing in the daemon reads what the hook or the epoch
 //! tracks yet, or calls the path rule, the classifier or the permission, or
-//! publishes to an arm page, and it refuses every helper invocation as
-//! unsupported.
+//! keeps an invocation record, or publishes to an arm page, and it refuses
+//! every helper invocation as unsupported.
 
 pub mod arm;
 pub mod classifier;
@@ -34,6 +36,7 @@ pub mod instance;
 pub mod paste_mode;
 pub mod path_rule;
 pub mod query_ledger;
+pub mod record;
 
 use crate::doorbell_activation::{LatchedRelease, Measurement, ReleaseRecord};
 use crate::event::AgentType;

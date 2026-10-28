@@ -34,11 +34,18 @@
 //! table when a generation retires, inside the ingress ledger's lock at a
 //! ticketed enqueue and inside the output lock at the output hook. Every
 //! method takes it, does its arithmetic and releases it, calling only the
-//! framing and ledger code of this module's siblings while it is held, none
-//! of which takes a lock. The output and ingress locks aren't ranked, so the
-//! checker sees neither of those edges: that neither is taken under this
-//! lock rests on that leaf code, and a change that adds a callback or a
-//! record's settlement here reviews those edges again.
+//! framing, ledger and record code of this module's siblings while it is
+//! held, none of which takes a lock, does I/O or calls back out. The output
+//! and ingress locks aren't ranked, so the checker sees neither of those
+//! edges: that neither is taken under this lock rests on that leaf code, and
+//! a change that adds a callback here reviews those edges again.
+//!
+//! **The invocation records** ([`super::record::Records`], Q35-07) live under
+//! the same lock once attached ([`GenerationInput::attach_records`]), so a
+//! record's transition, its hazard pop and the quiet clock's pause or resume
+//! are one critical section, ordered against the output hook's latch and the
+//! tracker's candidates by the lock alone. No production caller attaches them
+//! yet (Q35-14b does).
 //!
 //! **What it costs today.** Nothing reads it to decide, but it isn't free: a
 //! person's op is read as a report and every op is tokenized under this
@@ -51,6 +58,10 @@ use super::framing::{Csi, Event, Framing, Report, Str, StringKind, Token, whole_
 use super::query_ledger::{
     Backlog, CprWaitEnd, EntryView, HazardFifo, HazardPop, Pop, QueryHistory, QueryKind,
     QueryLedger,
+};
+use super::record::{
+    self, Channel, Decision, Drained, ExitFact, FirstStop, FrontierOutcome, Hold, Record,
+    RecordKey, Recorded, Records, Refusal, Reported, Route, WriterScope,
 };
 use crate::lock_rank::{R6, RankedMutex};
 
@@ -291,6 +302,8 @@ struct State {
     ledger: QueryLedger,
     backlog: Backlog,
     hazards: HazardFifo,
+    /// The generation's invocation records, once attached.
+    records: Option<Records>,
     retired: bool,
 }
 
@@ -319,6 +332,7 @@ impl GenerationInput {
                 ledger: QueryLedger::default(),
                 backlog: Backlog::new(cpr_wait_end),
                 hazards: HazardFifo::default(),
+                records: None,
                 retired: false,
             }),
         }
@@ -485,15 +499,167 @@ impl GenerationInput {
         self.state.lock_recovering().epoch.touched()
     }
 
-    /// The generation left its pane: the ledger, `B` and the hazard FIFO are
-    /// dropped, nothing is noted or accepted any more, and no observation
-    /// applies. A successor starts with its own.
+    /// Attach the generation's invocation records (Q35-07). Once: a second
+    /// table, or one after retirement, is refused.
+    pub fn attach_records(&self, records: Records) -> bool {
+        let mut state = self.state.lock_recovering();
+        if state.retired || state.records.is_some() {
+            return false;
+        }
+        state.records = Some(records);
+        true
+    }
+
+    /// Run `step` on the records and the hazard FIFO in one critical
+    /// section, so a record's transition, its pop and the quiet clock's
+    /// pause or resume are one event against the output hook's latch and the
+    /// tracker's candidates (Q35-07's condition (b)). Private: each step is
+    /// a method of [`Records`], which takes no lock, calls nothing outside
+    /// its module and the FIFO, and does no I/O.
+    fn with_records<T>(
+        &self,
+        step: impl FnOnce(&mut Records, &mut HazardFifo) -> Result<T, Refusal>,
+    ) -> Result<T, Refusal> {
+        let mut guard = self.state.lock_recovering();
+        let state = &mut *guard;
+        match (state.retired, state.records.as_mut()) {
+            (false, Some(records)) => step(records, &mut state.hazards),
+            _ => Err(Refusal::Stale),
+        }
+    }
+
+    /// See [`Records::observe`].
+    pub fn record_observe(
+        &self,
+        obs: &record::Observation,
+        now: Instant,
+    ) -> Result<Recorded, Refusal> {
+        self.with_records(|r, fifo| r.observe(fifo, obs, now))
+    }
+
+    /// See [`Records::refused_identity`].
+    pub fn record_refused(
+        &self,
+        generation: u64,
+        channel: Channel,
+        decision: Option<Decision>,
+        now: Instant,
+    ) -> Result<(), Refusal> {
+        self.with_records(|r, _| r.refused_identity(generation, channel, decision, now))
+    }
+
+    /// See [`Records::report`].
+    pub fn record_report(
+        &self,
+        generation: u64,
+        key: RecordKey,
+        report: record::Report,
+        now: Instant,
+    ) -> Result<Reported, Refusal> {
+        self.with_records(|r, fifo| r.report(fifo, generation, key, report, now))
+    }
+
+    /// See [`Records::frontier`].
+    pub fn record_frontier(
+        &self,
+        generation: u64,
+        key: RecordKey,
+        outcome: FrontierOutcome,
+    ) -> Result<bool, Refusal> {
+        self.with_records(|r, _| r.frontier(generation, key, outcome))
+    }
+
+    /// See [`Records::exit`].
+    pub fn record_exit(
+        &self,
+        generation: u64,
+        key: RecordKey,
+        at: Instant,
+        now: Instant,
+    ) -> Result<(), Refusal> {
+        self.with_records(|r, fifo| r.exit(fifo, generation, key, at, now))
+    }
+
+    /// See [`Records::drained`].
+    pub fn record_drained(
+        &self,
+        generation: u64,
+        key: RecordKey,
+        now: Instant,
+    ) -> Result<Drained, Refusal> {
+        self.with_records(|r, fifo| r.drained(fifo, generation, key, now))
+    }
+
+    /// See [`Records::match_segment`].
+    pub fn record_match(&self, generation: u64, key: RecordKey, seg: u64) -> Result<(), Refusal> {
+        self.with_records(|r, _| r.match_segment(generation, key, seg))
+    }
+
+    /// See [`Records::complete`].
+    pub fn record_complete(
+        &self,
+        generation: u64,
+        key: RecordKey,
+        route: Route,
+        at: Instant,
+        now: Instant,
+    ) -> Result<(), Refusal> {
+        self.with_records(|r, fifo| r.complete(fifo, generation, key, route, at, now))
+    }
+
+    /// See [`Records::prune`].
+    pub fn record_prune(
+        &self,
+        generation: u64,
+        key: RecordKey,
+        markers_deleted: bool,
+        now: Instant,
+    ) -> Result<Option<ExitFact>, Refusal> {
+        self.with_records(|r, fifo| r.prune(fifo, generation, key, markers_deleted, now))
+    }
+
+    /// See [`Records::raise`].
+    pub fn liability_raise(&self, generation: u64, stamp: Instant) -> Result<u32, Refusal> {
+        self.with_records(|r, _| r.raise(generation, stamp))
+    }
+
+    /// See [`Records::lower`].
+    pub fn liability_lower(&self, generation: u64, stamp: Instant) -> Result<u32, Refusal> {
+        self.with_records(|r, _| r.lower(generation, stamp))
+    }
+
+    /// A copy of one record.
+    pub fn record(&self, key: RecordKey) -> Option<Record> {
+        self.with_records(|r, _| Ok(r.get(key))).ok().flatten()
+    }
+
+    /// The writer scope, `None` with no records attached or once retired.
+    pub fn writer_scope(&self) -> Option<WriterScope> {
+        self.with_records(|r, _| Ok(r.scope())).ok()
+    }
+
+    /// See [`Records::admits`]; [`Hold::Retired`] with no records attached
+    /// or once retired.
+    pub fn records_admit(&self) -> Result<(), Hold> {
+        self.with_records(|r, _| Ok(r.admits()))
+            .unwrap_or(Err(Hold::Retired))
+    }
+
+    /// See [`Records::first_stop`].
+    pub fn first_stop(&self, now: Instant) -> Option<FirstStop> {
+        self.with_records(|r, _| Ok(r.first_stop(now))).ok()
+    }
+
+    /// The generation left its pane: the ledger, `B`, the hazard FIFO and the
+    /// invocation records are dropped, nothing is noted or accepted any more,
+    /// and no observation applies. A successor starts with its own.
     pub fn retire(&self) {
         let mut state = self.state.lock_recovering();
         state.retired = true;
         state.ledger = QueryLedger::default();
         state.backlog = Backlog::new(CprWaitEnd::Counted);
         state.hazards = HazardFifo::default();
+        state.records = None;
     }
 }
 
