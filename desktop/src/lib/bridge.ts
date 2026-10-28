@@ -50,6 +50,10 @@ import type { HandoffEdge,
   NewAgentOrchestrations,
   PromptKeys,
   RuntimeMode,
+  AnswerSettlement,
+  HoldCause,
+  HoldDetail,
+  InputHeldCause,
   TerminalChunk,
   WakeHold,
   WorkflowStage,
@@ -378,6 +382,8 @@ export interface DesktopAgentDto {
     wakeStalled?: boolean;
     /** PRD #1666 part 3, round 5-wake: why the deck holds the doorbell, the daemon's wire value. */
     wakeHold?: string;
+    /** PRD #1666 part 3 (Q35): beside `wakeHold: "cannot_check"`, why; its strings are the daemon's, bounded by the crate. */
+    holdDetail?: { cause: string; pathComponent?: string; filesystem?: string };
     /** PRD #1666 §6.5: deck messages waiting on the user's Retry or Cancel. */
     attention?: Array<{ messageId: string; revision: number; kind: string; fromLabel: string; subject: string; taskId?: string }>;
     integration?: string;
@@ -400,6 +406,17 @@ export interface DesktopAgentDto {
    * and from a daemon that predates the field.
    */
   pendingQuestion?: PendingQuestionDto;
+  /**
+   * PRD #1666 part 3 (Q35): the deck holds what the user typed into this
+   * agent's pane (`SessionSnapshot.input_held`). Absent while it holds
+   * nothing, and from a daemon predating the field.
+   */
+  inputHeld?: { generation: number; cause: string; heldOps: number; heldBytes: number; sinceMs: number };
+  /**
+   * PRD #1666 part 3 (Q35): the outcomes of this agent's recently held answers
+   * that carried a client token (`SessionSnapshot.answer_settlements`).
+   */
+  answerSettlements?: Array<{ questionId: string; revision: number; clientToken: number; outcome: string }>;
   /**
    * PRD #1401 — the pull request this agent's work produced, copied through
    * from `SessionSnapshot.pull_request`. Absent when the daemon knows of no PR
@@ -2421,6 +2438,7 @@ function inboxFromDto(inbox: NonNullable<DesktopAgentDto["inbox"]>): AgentInbox 
     ...(typeof inbox.wakeHold === "string"
       ? { wakeHold: WAKE_HOLDS.has(inbox.wakeHold) ? inbox.wakeHold as WakeHold : "unknown" as const }
       : {}),
+    ...withHoldDetail(holdDetailOf(inbox.holdDetail, "pathComponent")),
     ...(attention.length > 0 ? { attention } : {}),
     ...(integration ? { integration } : {}),
     ...(integration && typeof inbox.integrationCommand === "string" ? { integrationCommand: displayText(inbox.integrationCommand, DISPLAY_LIMITS.prompt) } : {}),
@@ -2441,7 +2459,60 @@ const WAKE_HOLDS = new Set([
   "not_taken",
   "uncertain_input",
   "dialog_during_ring",
+  "needs_fetch",
+  "cannot_check",
 ]);
+/** PRD #1666 part 3 (Q35): the hold causes this build names; any other reads as `unknown`. */
+const HOLD_CAUSES = new Set(["filesystem", "writable_directory", "foreign_owner", "acl", "export_file", "io"]);
+/** PRD #1666 part 3 (Q35): the held-input causes this build names; any other reads as `unknown`. */
+const INPUT_HELD_CAUSES = new Set(["checking", "check_not_opened", "check_not_returned", "after_your_ctrl_g", "queue_full", "check_blocked"]);
+/** PRD #1666 part 3 (Q35): the settlement outcomes this build names; any other reads as `unknown`. */
+const SETTLEMENT_OUTCOMES = new Set(["written", "partial", "superseded", "retired", "write_failed"]);
+
+/**
+ * PRD #1666 part 3 (Q35): a hold detail as the snapshot (`pathComponent`) or a
+ * streamed wake update (`path_component`) carries it, or `undefined` for
+ * anything that is not one. Its strings are kept as the daemon sent them —
+ * escaped and bounded where they are shown (`holdDetailText`), so a control
+ * character shows rather than disappears.
+ */
+function holdDetailOf(value: unknown, pathKey: "pathComponent" | "path_component"): HoldDetail | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const detail = value as Record<string, unknown>;
+  if (typeof detail.cause !== "string") return undefined;
+  const path = detail[pathKey];
+  return {
+    cause: HOLD_CAUSES.has(detail.cause) ? detail.cause as HoldCause : "unknown",
+    ...(typeof path === "string" ? { pathComponent: path } : {}),
+    ...(typeof detail.filesystem === "string" ? { filesystem: detail.filesystem } : {}),
+  };
+}
+
+function withHoldDetail(detail: HoldDetail | undefined): { holdDetail?: HoldDetail } {
+  return detail ? { holdDetail: detail } : {};
+}
+
+/** PRD #1666 part 3 (Q35): the held-input cause a snapshot names, or `undefined` for none. */
+function inputHeldFromDto(held: DesktopAgentDto["inputHeld"]): InputHeldCause | undefined {
+  if (!held || typeof held !== "object" || typeof held.cause !== "string") return undefined;
+  return INPUT_HELD_CAUSES.has(held.cause) ? held.cause as InputHeldCause : "unknown";
+}
+
+/** PRD #1666 part 3 (Q35): the settlements a snapshot carries, each checked; an unknown outcome reads as `unknown`. */
+function answerSettlementsFromDto(settlements: DesktopAgentDto["answerSettlements"]): AnswerSettlement[] {
+  if (!Array.isArray(settlements)) return [];
+  return settlements.flatMap((settlement) => {
+    if (!settlement || typeof settlement !== "object") return [];
+    const { questionId, revision, clientToken, outcome } = settlement;
+    if (typeof questionId !== "string" || !Number.isSafeInteger(revision) || !Number.isSafeInteger(clientToken) || typeof outcome !== "string") return [];
+    return [{
+      questionId,
+      revision,
+      clientToken,
+      outcome: SETTLEMENT_OUTCOMES.has(outcome) ? outcome as AnswerSettlement["outcome"] : "unknown",
+    }];
+  });
+}
 
 /** PRD #1666 §6.5: the listed items the crate sent, an unknown kind dropped. */
 function attentionFromDto(items: NonNullable<NonNullable<DesktopAgentDto["inbox"]>["attention"]>): InboxAttentionItem[] {
@@ -2499,7 +2570,7 @@ function withDeliveryNotice(agents: AgentSession[], payload: unknown): AgentSess
  * daemon's `BroadcastMsg` is: `wake_update: true` marks it, and `state` stays
  * the message's own.
  */
-function wakeUpdateOf(payload: unknown): { agentId: string; paneId?: string; wakeStalled: boolean; wakeHold?: WakeHold } | undefined {
+function wakeUpdateOf(payload: unknown): { agentId: string; paneId?: string; wakeStalled: boolean; wakeHold?: WakeHold; holdDetail?: HoldDetail } | undefined {
   if (!payload || typeof payload !== "object") return undefined;
   const notice = payload as Record<string, unknown>;
   if (notice.kind !== "inbox" || notice.wake_update !== true) return undefined;
@@ -2514,6 +2585,7 @@ function wakeUpdateOf(payload: unknown): { agentId: string; paneId?: string; wak
     ...(typeof notice.pane_id === "string" ? { paneId: notice.pane_id } : {}),
     wakeStalled: notice.wake_stalled === true,
     ...(hold ? { wakeHold: hold } : {}),
+    ...withHoldDetail(holdDetailOf(notice.hold_detail, "path_component")),
   };
 }
 
@@ -2530,11 +2602,18 @@ function withWakeUpdate(agents: AgentSession[], payload: unknown): AgentSession[
   const index = agents.findIndex((agent) => agent.id === found.agentId && (found.paneId === undefined || agent.paneId === found.paneId));
   const inbox = index === -1 ? undefined : agents[index].inbox;
   if (!inbox) return agents;
-  const { wakeStalled: _stalled, wakeHold: _hold, ...rest } = inbox;
+  // PRD #1666 part 3 (Q35): the detail is replaced with the hold, so a later
+  // hold never keeps an earlier one's path.
+  const { wakeStalled: _stalled, wakeHold: _hold, holdDetail: _detail, ...rest } = inbox;
   const next = agents.slice();
   next[index] = {
     ...next[index],
-    inbox: { ...rest, ...(found.wakeStalled ? { wakeStalled: true } : {}), ...(found.wakeHold ? { wakeHold: found.wakeHold } : {}) },
+    inbox: {
+      ...rest,
+      ...(found.wakeStalled ? { wakeStalled: true } : {}),
+      ...(found.wakeHold ? { wakeHold: found.wakeHold } : {}),
+      ...withHoldDetail(found.holdDetail),
+    },
   };
   return next;
 }
@@ -2571,6 +2650,8 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
   const role = roleFromAgent(agent, index);
   const orchestration = agent.tab.kind === "orchestration" ? agent.tab : undefined;
   const pullRequest = pullRequestFromDto(agent.pullRequest);
+  const inputHeld = inputHeldFromDto(agent.inputHeld);
+  const answerSettlements = answerSettlementsFromDto(agent.answerSettlements);
   return {
     id: agent.id,
     daemonId,
@@ -2633,6 +2714,8 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
       ? { deliveryNotice: displayText(agent.deliveryNotice, DISPLAY_LIMITS.prompt) }
       : {}),
     ...(agent.pendingQuestion ? { pendingQuestion: agent.pendingQuestion } : {}),
+    ...(inputHeld ? { inputHeld } : {}),
+    ...(answerSettlements.length > 0 ? { answerSettlements } : {}),
     // PRD #1401 — the badge. Checked, not copied: see `pullRequestFromDto`.
     ...(pullRequest ? { pullRequest } : {}),
     ...(background ? { background } : {}),

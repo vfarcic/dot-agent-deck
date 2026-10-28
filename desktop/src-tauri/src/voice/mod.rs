@@ -676,6 +676,8 @@ pub mod test_support {
             inbox: None,
             delivery_notice: None,
             pending_question: None,
+            input_held: None,
+            answer_settlements: Vec::new(),
             tab: DesktopTab::Dashboard,
             pull_request: None,
             incarnation: Default::default(),

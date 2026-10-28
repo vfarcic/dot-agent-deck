@@ -3912,6 +3912,10 @@ async fn desktop_voice_answer_question<R: tauri::Runtime>(
     if !voice::lease::is_valid_lease(&lease) {
         return Err("the answer sent with that utterance is not one this app offers".to_string());
     }
+    // PRD #1666 part 3 (Q35): the lease names the answer to the daemon too, so
+    // a snapshot's settlement naming it tells the panel what became of its own
+    // answer when this request times out.
+    let client_token = lease.parse::<u64>().ok();
     let lease = state.voice_answer_leases.begin(&lease);
     let agent = voice_agent_name(&agent);
     // PRD #1666 part 2 (G-fix6): the question of the agent that process
@@ -3957,13 +3961,14 @@ async fn desktop_voice_answer_question<R: tauri::Runtime>(
         let client = daemon
             .client
             .bound_to(Incarnation::from(incarnation.clone()));
-        let sent = client.answer_question_while(
+        let sent = client.answer_question_with_token_while(
             still_wanted,
             &agent_id,
             &question_id,
             revision,
             answers,
             confirmed_always,
+            client_token,
         );
         match tokio::time::timeout(VOICE_ANSWER_TIMEOUT, sent).await {
             Ok(Err(

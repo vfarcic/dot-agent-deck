@@ -32,7 +32,7 @@ import type {
 } from "../types";
 import { terminalInputState, type AgentRecordFreshness, type NoTerminalState } from "../lib/terminalInput";
 import { blockedReasonText } from "../lib/blockedReason";
-import { attentionReason, inboxActionText, inboxBadge, inboxNotice, INBOX_WORDS } from "../lib/inboxWords";
+import { attentionReason, inboxActionText, inboxBadge, inboxNotice, inputHeldText, INBOX_WORDS } from "../lib/inboxWords";
 import { displayBackgroundWork, displayUptime } from "../lib/displayText";
 import { OVERVIEW_CLOCK_TICK_MS } from "./AgentOverview";
 import { OutputReader } from "./OutputReader";
@@ -437,6 +437,7 @@ export function AgentTile({
   const tileStatusLabel = agent.daemonStatus === "error" ? "error" : statusLabel(agent.status);
   const badge = inboxBadge(agent.inbox);
   const inboxNoticeRow = inboxNotice(agent.inbox);
+  const inputHeldRow = inputHeldText(agent.inputHeld);
   const attention = agent.inbox?.attention ?? [];
 
   return (
@@ -539,6 +540,11 @@ export function AgentTile({
             {/* PRD #1666 §6.5: what the deck says about this agent's deck
                 messages beyond the badge — the TUI card's notice row — and the
                 messages waiting on the user's Retry or Cancel. */}
+            {/* PRD #1666 part 3 (Q35, core §7): the deck holds what the user
+                typed into this pane, and says why — the TUI card's row. */}
+            {inputHeldRow && !held && (
+              <p className="agent-inbox-notice" data-testid={`input-held-${agent.id}`}>{inputHeldRow}</p>
+            )}
             {inboxNoticeRow && !held && (
               <p className="agent-inbox-notice" data-testid={`inbox-notice-${agent.id}`}>{inboxNoticeRow}</p>
             )}
