@@ -114,13 +114,23 @@ impl Fixture {
     }
 }
 
-/// Give `path` a group no [`no_group_trusted`] writer is in. Its group is the
-/// user's primary one already, which is not gid 0 unless the test runs as
-/// root — and root can hand it to `nogroup`.
+/// Give `path` a group no [`no_group_trusted`] writer is in, which means any
+/// group but gid 0. On Linux a new entry already has the creator's primary
+/// group, which is gid 0 only when the test runs as root. On macOS it takes
+/// its directory's group, `wheel` (gid 0) under `/var/tmp`, so a non-root run
+/// hands it to its own primary group; root hands it to `nogroup`.
 fn untrusted_group(path: &Path) {
     if gid_of(path) == 0 {
-        std::os::unix::fs::chown(path, None, Some(65534)).expect("chgrp as root");
+        // SAFETY: `getegid` has no preconditions and cannot fail.
+        let gid = if me() == 0 {
+            65534
+        } else {
+            unsafe { libc::getegid() }
+        };
+        std::os::unix::fs::chown(path, None, Some(gid))
+            .unwrap_or_else(|e| panic!("chgrp {gid} {}: {e}", path.display()));
     }
+    assert_ne!(gid_of(path), 0, "{} still has gid 0", path.display());
 }
 
 fn gid_of(path: &Path) -> u32 {
