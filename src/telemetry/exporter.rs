@@ -23,6 +23,17 @@
 //! - human input waits with the run it was typed into, not only on the queue:
 //!   the command is a reminder to count it, and a run ended first — by its
 //!   pane's close broadcast, say — counts it as it ends;
+//! - human input is counted in the order telemetry was told about it against
+//!   the events: each write notes how far the daemon's broadcast had got when
+//!   telemetry is told about it, just after the pane accepted it
+//!   ([`BroadcastClock`]), and the task counts it before the first event
+//!   broadcast after that once the tracker has opened its run, so it is read
+//!   against the prompt the cards showed then rather than when the task takes
+//!   it. A lone `ESC` takes part too: an event on its pane, or naming no
+//!   pane, broadcast after it waits out its window, and what the `ESC`
+//!   turns out to be — the Escape key, or the key whose sequence it begins
+//!   when the next write completes that sequence — keeps the `ESC`'s place,
+//!   so it counts before that event;
 //! - a run whose spawn is refused is forgotten when its [`PreparedRun`] is
 //!   dropped uncommitted.
 //!
@@ -60,7 +71,7 @@ use super::accounting::run_usage::{UsageDirs, UsageFile};
 use super::accounting::usage_file::USAGE_FILE_ENV;
 use super::accounting::{UsageSource, locate, usage_source};
 use super::config::{EnvMap, TelemetryConfig, redacted_endpoint};
-use super::input::{InputFilter, LONE_ESCAPE_WINDOW};
+use super::input::{InputFilter, InterventionKind, LONE_ESCAPE_WINDOW, PASTE_IDLE_WINDOW};
 use super::launch::LAUNCH_ENV_KEYS;
 use super::propagation::{RunIdentity, agent_env};
 use super::resource::{ResourceAttribute, deck_resource, host_name};
@@ -399,10 +410,10 @@ enum Command {
     },
 }
 
-/// A test seam pausing a task at one point: signal the first half, then wait
-/// for the second.
+/// A test seam pausing a task at one point: signal the first half, then await
+/// the second, which suspends the task without blocking the thread it runs on.
 #[cfg(test)]
-type Gate = (oneshot::Sender<()>, std::sync::mpsc::Receiver<()>);
+type Gate = (oneshot::Sender<()>, oneshot::Receiver<()>);
 
 /// A run's input filter, from its commit until the tracker ends the run,
 /// with the generation it is for.
@@ -413,28 +424,216 @@ struct PaneInput {
     ended: bool,
     filter: InputFilter,
     /// When the lone `ESC` the filter holds arrived — monotonic, for the
-    /// window, and wall-clock, for the intervention it may become.
-    escape: Option<(std::time::Instant, u64)>,
-    /// When the human input the filter accepted and the tracker has not
-    /// counted yet was written, oldest first. Taken, once, by whichever comes
-    /// first: the [`Command::HumanInput`] sent with the first of them, or the
-    /// run ending.
-    pending: Vec<u64>,
+    /// window, and wall-clock and on the broadcast, for the intervention it
+    /// may become.
+    escape: Option<(std::time::Instant, u64, u64)>,
+    /// When the last write that left the filter inside a bracketed paste
+    /// arrived, monotonic: the paste is read as ended once
+    /// [`PASTE_IDLE_WINDOW`] passes with no write after it.
+    paste: Option<std::time::Instant>,
+    /// The human input the filter accepted and the tracker has not counted
+    /// yet, oldest first. Taken, once, by whichever comes first: the first
+    /// event broadcast after it, the [`Command::HumanInput`] sent with the
+    /// first of them, or the run ending.
+    pending: Vec<Written>,
+}
+
+/// Human input a run's filter accepted.
+#[derive(Clone, Copy, Debug)]
+struct Written {
+    /// When, on the wall clock.
+    at: u64,
+    kind: InterventionKind,
+    /// How many messages the daemon had broadcast when telemetry was told
+    /// about it, just after the pane accepted it
+    /// ([`BroadcastClock::position`]): it is counted before every message
+    /// from that one on.
+    position: u64,
 }
 
 impl PaneInput {
+    /// Feed one accepted write, `now` on the wall clock and `at` on the
+    /// monotonic one, that telemetry was told about at broadcast `position`:
+    /// the human input it settles, oldest first, and whether it left a lone
+    /// `ESC` held. Input a held lone `ESC` turns into — the Escape key, once
+    /// its window has passed or another `ESC` follows it, or the key whose
+    /// sequence it begins, with every byte of that key the write holds —
+    /// keeps the time and position that `ESC` was written at, as one input;
+    /// what follows the key has `now` and `position`. A sequence the write
+    /// leaves undecided counts once, when a later write decides it, at that
+    /// write's time and position. The rest of a key already decided does not
+    /// count again in the write that completes it, except a bracketed paste's,
+    /// which is paste written then.
+    fn write(
+        &mut self,
+        bytes: &[u8],
+        now: u64,
+        position: u64,
+        at: std::time::Instant,
+    ) -> (Vec<Written>, bool) {
+        let mut human = Vec::with_capacity(2);
+        let mut rest = bytes;
+        if let Some((since, written, escaped)) = self.escape {
+            let kind = if at.saturating_duration_since(since) >= LONE_ESCAPE_WINDOW {
+                // Its window has passed: the Escape key, whatever follows.
+                self.escape = None;
+                self.filter
+                    .settle_lone_escape()
+                    .then_some(InterventionKind::Interrupt)
+            } else {
+                let (kind, taken) = self.filter.decide_held(bytes);
+                rest = &bytes[taken..];
+                kind
+            };
+            if let Some(kind) = kind {
+                human.push(Written {
+                    at: written,
+                    kind,
+                    position: escaped,
+                });
+            }
+        }
+        // A paste with no input for its window lost its end marker.
+        if self
+            .paste
+            .is_some_and(|since| at.saturating_duration_since(since) >= PASTE_IDLE_WINDOW)
+        {
+            self.filter.end_paste();
+        }
+        if let Some(kind) = self.filter.classify(rest) {
+            human.push(Written {
+                at: now,
+                kind,
+                position,
+            });
+        }
+        if !self.filter.in_paste() {
+            self.paste = None;
+        } else if !bytes.is_empty() {
+            self.paste = Some(at);
+        }
+        // A non-empty write leaving a lone ESC held ended with it.
+        let mut held = false;
+        if !self.filter.holds_lone_escape() {
+            self.escape = None;
+        } else if !bytes.is_empty() {
+            self.escape = Some((at, now, position));
+            held = true;
+        }
+        (human, held)
+    }
+
     /// Everything this run's input still owes the tracker, oldest first:
     /// what is pending, then a held lone `ESC` when `settle` says it is the
     /// Escape key now.
-    fn take_held(&mut self, settle: bool) -> Vec<u64> {
+    fn take_held(&mut self, settle: bool) -> Vec<Written> {
         let mut held = std::mem::take(&mut self.pending);
         if settle
-            && let Some((_, written)) = self.escape.take()
+            && let Some((_, at, position)) = self.escape.take()
             && self.filter.settle_lone_escape()
         {
-            held.push(written);
+            held.push(Written {
+                at,
+                kind: InterventionKind::Interrupt,
+                position,
+            });
         }
         held
+    }
+
+    /// The pending input written before the daemon broadcast its message
+    /// `position`, oldest first, and the position of the last that stays.
+    fn take_through(&mut self, position: u64) -> (Vec<Written>, Option<u64>) {
+        let due = self.pending.partition_point(|w| w.position <= position);
+        let taken = self.pending.drain(..due).collect();
+        (taken, self.pending.last().map(|w| w.position))
+    }
+
+    /// Whether input written before broadcast message `position` is still
+    /// held: pending, or a lone `ESC`.
+    fn owes_before(&self, position: u64) -> bool {
+        self.pending.first().is_some_and(|w| w.position <= position)
+            || self.escape.is_some_and(|(_, _, at)| at <= position)
+    }
+
+    /// [`Self::take_through`], then a lone `ESC` written before broadcast
+    /// message `position` as the Escape key when its window has passed by
+    /// `now`. Everything pending was written before a held `ESC`: a later
+    /// write would have settled it.
+    fn take_before(&mut self, position: u64, now: std::time::Instant) -> Vec<Written> {
+        let (mut taken, _) = self.take_through(position);
+        if self.escape.is_some_and(|(since, _, at)| {
+            at <= position && now.saturating_duration_since(since) >= LONE_ESCAPE_WINDOW
+        }) {
+            taken.extend(self.take_held(true));
+        }
+        taken
+    }
+}
+
+/// How far the daemon's broadcast has got: the number of messages it has
+/// sent since the ingest task's receiver was made, which numbers each message
+/// that receiver reads. Read as telemetry is told about human input, just
+/// after the pane accepted it, so the ingest task can count that input
+/// between the events broadcast before it and the ones after, on the order
+/// the daemon published them in.
+///
+/// It is a receiver of its own that reads nothing until it falls
+/// [`CLOCK_CATCH_UP_AT`] behind: the broadcast does not number its messages,
+/// but a receiver knows how many it has not read.
+#[derive(Default)]
+struct BroadcastClock {
+    rx: Option<broadcast::Receiver<BroadcastMsg>>,
+    /// Messages sent before `rx`'s next one.
+    base: u64,
+}
+
+/// How far behind the broadcast [`BroadcastClock`] falls before it reads
+/// what it is behind by. A trigger, not a bound on what it keeps alive: it
+/// catches up only when the ingest task applies a message, so while that
+/// task is stalled it can hold as many as the broadcast's ring keeps.
+const CLOCK_CATCH_UP_AT: usize = 256;
+
+impl BroadcastClock {
+    /// A clock numbering messages from `events`' next one, which has read
+    /// nothing yet.
+    fn numbering(events: &broadcast::Receiver<BroadcastMsg>) -> Self {
+        loop {
+            let sent = events.len();
+            let rx = events.resubscribe();
+            // Nothing was sent in between, so `rx` starts where `sent` ends.
+            if events.len() == sent {
+                return Self {
+                    rx: Some(rx),
+                    base: sent as u64,
+                };
+            }
+        }
+    }
+
+    fn position(&self) -> u64 {
+        self.base + self.rx.as_ref().map_or(0, |rx| rx.len() as u64)
+    }
+
+    /// Read what the clock is behind by, once that is [`CLOCK_CATCH_UP_AT`]
+    /// or more, so it does not keep the messages alive longer than it must.
+    fn catch_up(&mut self) {
+        let Some(rx) = &mut self.rx else {
+            return;
+        };
+        let mut left = rx.len();
+        if left < CLOCK_CATCH_UP_AT {
+            return;
+        }
+        while left > 0 {
+            let read = match rx.try_recv() {
+                Ok(_) => 1,
+                Err(broadcast::error::TryRecvError::Lagged(missed)) => missed,
+                Err(_) => break,
+            };
+            self.base += read;
+            left = left.saturating_sub(usize::try_from(read).unwrap_or(usize::MAX));
+        }
     }
 }
 
@@ -453,7 +652,7 @@ fn lock_filters(filters: &Filters) -> std::sync::MutexGuard<'_, HashMap<String, 
 /// when the input it accepted and the tracker has not counted yet was written,
 /// with a lone `ESC` it still held last — the Escape key, since nothing can
 /// follow it now. Called by the tracker, with the tracker locked.
-fn retire_input(filters: &Filters, pane_id: &str, run_id: &str) -> Vec<u64> {
+fn retire_input(filters: &Filters, pane_id: &str, run_id: &str) -> Vec<(u64, InterventionKind)> {
     let mut filters = lock_filters(filters);
     let Some(inputs) = filters.get_mut(pane_id) else {
         return Vec::new();
@@ -465,7 +664,11 @@ fn retire_input(filters: &Filters, pane_id: &str, run_id: &str) -> Vec<u64> {
     if inputs.is_empty() {
         filters.remove(pane_id);
     }
-    input.take_held(true)
+    input
+        .take_held(true)
+        .into_iter()
+        .map(|w| (w.at, w.kind))
+        .collect()
 }
 
 /// What the spawn path, the reader threads and the ingest task share.
@@ -478,6 +681,9 @@ struct Shared {
     /// lone `ESC` is counted however the run ends. Locked after the tracker,
     /// never before it.
     filters: Arc<Filters>,
+    /// Where the broadcast stands, for input to note as it is written. Locked
+    /// after the filters, never before them.
+    clock: Mutex<BroadcastClock>,
     /// Wakes the ingest task to time a lone `ESC` that a write left held.
     escape_held: tokio::sync::Notify,
     /// Turned true as shutdown begins: an export in flight gives way to the
@@ -493,13 +699,22 @@ struct Shared {
     /// See [`Telemetry::set_dispatch_lookup`].
     dispatch_lookup: OnceLock<DispatchLookup>,
     /// Test seam: pauses the ingest task once inside its `escape_held`
-    /// branch, after signalling the first half, until the second receives.
+    /// branch, after signalling the first half, until the second resolves.
     #[cfg(test)]
     timer_gate: Mutex<Option<Gate>>,
-    /// Test seam: pauses the ingest task once the command queue first polls
-    /// empty, before the other branches are polled.
+    /// Test seam: pauses the ingest task once as it is about to wait out a
+    /// lone `ESC` before an event ([`Shared::observe_in_order`]).
+    #[cfg(test)]
+    wait_gate: Mutex<Option<Gate>>,
+    /// Test seam: pauses the ingest task once the command queue is first
+    /// found empty, before any branch is polled ([`pause_at_command_gate`]).
     #[cfg(test)]
     command_gate: Mutex<Option<Gate>>,
+    /// The ingest task resumed from [`Self::command_gate`]: the queue was
+    /// empty when it paused, so the other branches are polled before it is
+    /// again.
+    #[cfg(test)]
+    command_gate_resumed: std::sync::atomic::AtomicBool,
 }
 
 struct Exporting {
@@ -918,6 +1133,7 @@ impl Telemetry {
                     ended: false,
                     filter: InputFilter::new(),
                     escape: None,
+                    paste: None,
                     pending: Vec::new(),
                 });
             // Sent before the filters are unlocked, so no notice of input to
@@ -938,11 +1154,15 @@ impl Telemetry {
     }
 
     /// An attached client wrote `bytes` into `pane_id`. Counted as a human
-    /// intervention unless it is only terminal reports, including a report
-    /// split across writes ([`super::input::InputFilter`]). A lone `ESC` — the
-    /// Escape key — is counted, at the time it was written, once
-    /// [`LONE_ESCAPE_WINDOW`] passes without the rest of a report, or when the
-    /// run ends. Input the deck injects itself (a delegated task, an inbox
+    /// intervention, of the kind its bytes say, unless it is only terminal
+    /// reports, including a report split across writes
+    /// ([`super::input::InputFilter`]). A lone `ESC` — the
+    /// Escape key — is counted once [`LONE_ESCAPE_WINDOW`] passes without the
+    /// rest of a report, when another `ESC` follows it, or when the run ends;
+    /// it counts at the time and broadcast position it was written at, not
+    /// those of the write that decided it, and so does the key whose sequence
+    /// it begins when the next write completes that sequence. Input the deck
+    /// injects itself (a delegated task, an inbox
     /// delivery) must not be passed here.
     pub fn observe_client_input(&self, pane_id: &str, bytes: &[u8]) {
         self.observe_client_input_at(pane_id, bytes, now_unix_nanos(), std::time::Instant::now());
@@ -961,9 +1181,7 @@ impl Telemetry {
             return;
         };
         let shared = &exporting.shared;
-        let mut human = Vec::with_capacity(2);
-        let mut held = false;
-        {
+        let held = {
             let mut filters = shared.lock_filters();
             // No open run on this pane: nothing to count it against.
             let Some(input) = filters
@@ -973,26 +1191,17 @@ impl Telemetry {
             else {
                 return;
             };
-            // A lone ESC whose window has passed was the Escape key, whatever
-            // follows it now.
-            if let Some((since, written)) = input.escape
-                && at.saturating_duration_since(since) >= LONE_ESCAPE_WINDOW
-            {
-                input.escape = None;
-                if input.filter.settle_lone_escape() {
-                    human.push(written);
-                }
-            }
-            if input.filter.feed(bytes) {
-                human.push(now);
-            }
-            // A non-empty write leaving a lone ESC held ended with it.
-            if !input.filter.holds_lone_escape() {
-                input.escape = None;
-            } else if !bytes.is_empty() {
-                input.escape = Some((at, now));
-                held = true;
-            }
+            // Read under the filters' lock, so the run's input is noted in
+            // the order of the broadcast. This is when telemetry is told
+            // about the write, not when the PTY accepted it: the pane has
+            // already handed the bytes to the agent, so an agent fast enough
+            // to read the key and fire a hook before this line has that hook
+            // broadcast first, and the key is counted after its own response
+            // — against a prompt it already closed, say. Placing it by the
+            // PTY's acceptance would take a position read at the write
+            // itself, in the pane's writer.
+            let position = shared.lock_clock().position();
+            let (human, held) = input.write(bytes, now, position, at);
             // The input waits with its run; the first of it since the tracker
             // last took the run's input sends the reminder to take it.
             let wake = input.pending.is_empty() && !human.is_empty();
@@ -1004,7 +1213,8 @@ impl Telemetry {
                     run_id: input.run_id.clone(),
                 });
             }
-        }
+            held
+        };
         if held {
             shared.escape_held.notify_one();
         }
@@ -1054,6 +1264,7 @@ impl Telemetry {
     /// happens when not exporting, so an off deck spawns nothing.
     pub fn subscribe(&self, rx: broadcast::Receiver<BroadcastMsg>) {
         if let Some(exporting) = &self.exporting {
+            *exporting.shared.lock_clock() = BroadcastClock::numbering(&rx);
             let _ = exporting.commands.send(Command::Subscribe(rx));
         }
     }
@@ -1324,26 +1535,77 @@ impl Shared {
         lock_filters(&self.filters)
     }
 
+    fn lock_clock(&self) -> std::sync::MutexGuard<'_, BroadcastClock> {
+        self.clock.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Count the human input waiting with `run_id` on `pane_id`, if the run
-    /// has not ended and taken it already.
-    fn take_input(&self, pane_id: &str, run_id: &str) {
+    /// has not ended and taken it already: what was written before broadcast
+    /// message `through`, or all of it with `None`. Returns the broadcast
+    /// position the last input left waiting was written at.
+    fn take_input(&self, pane_id: &str, run_id: &str, through: Option<u64>) -> Option<u64> {
+        let mut left = None;
         self.with_tracker(|t| {
             let held = self
                 .lock_filters()
                 .get_mut(pane_id)
                 .and_then(|inputs| inputs.iter_mut().find(|input| input.run_id == run_id))
-                .map(|input| input.take_held(false))
-                .unwrap_or_default();
-            for written in held {
-                t.observe_run_input(pane_id, run_id, written);
+                .map(|input| match through {
+                    Some(position) => input.take_through(position),
+                    None => (input.take_held(false), None),
+                });
+            let Some((held, rest)) = held else {
+                return;
+            };
+            left = rest;
+            for w in held {
+                t.observe_run_input(pane_id, run_id, w.at, w.kind);
             }
         });
+        left
+    }
+
+    /// Count the input written before broadcast message `position` on
+    /// `pane_id`, or on every pane with `None`, into each run the tracker
+    /// takes input for, so it is read before that message is applied: what
+    /// is pending, then a lone `ESC` whose window has passed by `now`.
+    /// [`Self::escape_due_before`] says how long to wait for one still in its
+    /// window first.
+    fn take_input_before(
+        &self,
+        t: &mut RunTracker,
+        pane_id: Option<&str>,
+        position: u64,
+        now: std::time::Instant,
+    ) {
+        let mut due = Vec::new();
+        {
+            let mut filters = self.lock_filters();
+            for (pane, inputs) in filters.iter_mut() {
+                if pane_id.is_some_and(|p| p != pane) {
+                    continue;
+                }
+                for input in inputs.iter_mut() {
+                    if input.owes_before(position) && t.takes_input(pane, &input.run_id) {
+                        let taken = input.take_before(position, now);
+                        due.push((pane.clone(), input.run_id.clone(), taken));
+                    }
+                }
+            }
+        }
+        for (pane, run_id, taken) in due {
+            for w in taken {
+                t.observe_run_input(&pane, &run_id, w.at, w.kind);
+            }
+        }
     }
 
     /// Count every held lone `ESC` whose window has passed by `at` as human
     /// input at the time it was written, straight into its run, after any
     /// input still waiting with that run. Returns when the next one still
-    /// held is due.
+    /// held is due. One written after broadcast message `read`, the first the
+    /// ingest task has not applied, is due now and left for the next call, so
+    /// it is counted after the events broadcast before it.
     ///
     /// Any write after the ESC settles it on the writer's side instead. The
     /// tracker stays locked throughout, so no run ends between a filter
@@ -1355,22 +1617,24 @@ impl Shared {
     /// Commit wakes the task again, because the wake the write sent can be
     /// taken by the task before the Commit is — `biased` orders the branches
     /// it polls, not a command's arrival against a wake.
-    fn settle_escapes(&self, at: std::time::Instant) -> Option<std::time::Instant> {
+    fn settle_escapes(&self, at: std::time::Instant, read: u64) -> Option<std::time::Instant> {
         let mut next_due: Option<std::time::Instant> = None;
         self.with_tracker(|t| {
             let mut filters = self.lock_filters();
             for (pane_id, inputs) in filters.iter_mut() {
                 for input in inputs.iter_mut() {
-                    let Some((since, _)) = input.escape else {
+                    let Some((since, _, position)) = input.escape else {
                         continue;
                     };
                     if t.run_id(pane_id) != Some(input.run_id.as_str()) {
                         continue;
                     }
                     let due = since + LONE_ESCAPE_WINDOW;
-                    if at >= due {
-                        for written in input.take_held(true) {
-                            t.observe_run_input(pane_id, &input.run_id, written);
+                    if at >= due && position > read {
+                        next_due = Some(at);
+                    } else if at >= due {
+                        for w in input.take_held(true) {
+                            t.observe_run_input(pane_id, &input.run_id, w.at, w.kind);
                         }
                     } else {
                         next_due = Some(next_due.map_or(due, |d| d.min(due)));
@@ -1394,10 +1658,70 @@ impl Shared {
         }
     }
 
-    fn observe(&self, msg: &BroadcastMsg) {
-        if let BroadcastMsg::Event(event) = msg {
-            self.with_tracker(|t| t.observe_event(event, now_unix_nanos()));
+    /// When the last lone `ESC` written before broadcast message `position`
+    /// on `pane_id`, or on any pane with `None`, into a run the tracker takes
+    /// input for, leaves its window, if one is still in it at `now`: until
+    /// then nobody can say whether it is the Escape key, and it has to be
+    /// counted before that message is applied if it is.
+    fn escape_due_before(
+        &self,
+        pane_id: Option<&str>,
+        position: u64,
+        now: std::time::Instant,
+    ) -> Option<std::time::Instant> {
+        let t = self.tracker.lock().unwrap_or_else(|p| p.into_inner());
+        let filters = self.lock_filters();
+        filters
+            .iter()
+            .filter(|(pane, _)| pane_id.is_none_or(|p| p == pane.as_str()))
+            .flat_map(|(pane, inputs)| inputs.iter().map(move |input| (pane, input)))
+            .filter_map(|(pane, input)| {
+                let (since, _, at) = input.escape?;
+                let due = since + LONE_ESCAPE_WINDOW;
+                (at <= position && due > now && t.takes_input(pane, &input.run_id)).then_some(due)
+            })
+            .max()
+    }
+
+    /// Apply broadcast message `position`, after the input written before
+    /// the daemon broadcast it. A lone `ESC` written before it is waited out
+    /// first, so the Escape key counts in its place rather than after the
+    /// message: until [`LONE_ESCAPE_WINDOW`] has passed since it was written,
+    /// and never longer than that window from now, and only for events on its
+    /// pane or naming no pane. A write that decides the `ESC` during the wait
+    /// leaves what it decided in the `ESC`'s place, so that is counted before
+    /// the message too. An `ESC` whose window has still not passed by then
+    /// stays held, and counts after the message if it is the Escape key.
+    async fn observe_in_order(&self, msg: &BroadcastMsg, position: u64) {
+        let now = std::time::Instant::now();
+        if let BroadcastMsg::Event(event) = msg
+            && let Some(due) = self.escape_due_before(event.pane_id.as_deref(), position, now)
+        {
+            let due = due.min(now + LONE_ESCAPE_WINDOW);
+            #[cfg(test)]
+            let gate = self.wait_gate.lock().unwrap().take();
+            #[cfg(test)]
+            if let Some((entered, resume)) = gate {
+                let _ = entered.send(());
+                let _ = resume.await;
+            }
+            tokio::time::sleep_until(Instant::from_std(due)).await;
         }
+        self.observe(msg, position, std::time::Instant::now());
+    }
+
+    /// Apply broadcast message `position`, after the input written before
+    /// the daemon broadcast it, a lone `ESC` among it once its window has
+    /// passed by `now`.
+    fn observe(&self, msg: &BroadcastMsg, position: u64, now: std::time::Instant) {
+        if let BroadcastMsg::Event(event) = msg {
+            self.with_tracker(|t| {
+                // An event naming no pane can be applied to any.
+                self.take_input_before(t, event.pane_id.as_deref(), position, now);
+                t.observe_event(event, now_unix_nanos());
+            });
+        }
+        self.lock_clock().catch_up();
     }
 
     fn enqueue(&self, spans: Vec<SpanRecord>) {
@@ -1443,6 +1767,7 @@ fn start_exporting(
         queue,
         dropped: Mutex::new(RateLimitedLog::new(ERROR_LOG_INTERVAL)),
         filters,
+        clock: Mutex::default(),
         escape_held: tokio::sync::Notify::new(),
         stopping,
         runtime: tokio::runtime::Handle::current(),
@@ -1452,7 +1777,11 @@ fn start_exporting(
         #[cfg(test)]
         timer_gate: Mutex::new(None),
         #[cfg(test)]
+        wait_gate: Mutex::new(None),
+        #[cfg(test)]
         command_gate: Mutex::new(settings.command_gate),
+        #[cfg(test)]
+        command_gate_resumed: std::sync::atomic::AtomicBool::new(false),
     });
     let (commands, rx) = mpsc::unbounded_channel();
     let ingest = tokio::spawn(run_ingest(Arc::clone(&shared), rx));
@@ -1469,47 +1798,66 @@ fn start_exporting(
 const DRAIN_YIELD_EVERY: usize = 256;
 
 /// The ingest task: apply broadcast events as they come, each command after
-/// every event broadcast before it, and a held lone `ESC` as the Escape key
+/// every event broadcast before it, human input between the events broadcast
+/// before and after it was written, and a held lone `ESC` as the Escape key
 /// once its window has passed.
 async fn run_ingest(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiver<Command>) {
     let mut events: Option<broadcast::Receiver<BroadcastMsg>> = None;
+    // The broadcast messages `events` has passed, read or missed: the number
+    // of the next one, as [`BroadcastClock`] counts.
+    let mut read: u64 = 0;
     let mut escape_due: Option<std::time::Instant> = None;
     let mut usage_poll = tokio::time::interval(USAGE_POLL_INTERVAL);
     usage_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let usage_polling = Arc::new(std::sync::atomic::AtomicBool::new(false));
     loop {
+        #[cfg(test)]
+        pause_at_command_gate(&shared, &commands).await;
         tokio::select! {
             biased;
             command = next_command(&shared, &mut commands) => {
                 let Some(command) = command else { break };
                 if let Command::Subscribe(rx) = command {
                     events = Some(rx);
+                    read = 0;
                     continue;
                 }
-                drain(&shared, &mut events).await;
+                drain(&shared, &mut events, &mut read).await;
+                if let Command::HumanInput { pane_id, run_id } = &command {
+                    take_input(&shared, &mut events, &mut read, pane_id, run_id).await;
+                    continue;
+                }
                 if !apply(&shared, command) {
                     break;
                 }
             }
             () = shared.escape_held.notified() => {
                 #[cfg(test)]
-                if let Some((entered, resume)) = shared.timer_gate.lock().unwrap().take() {
+                let gate = shared.timer_gate.lock().unwrap().take();
+                #[cfg(test)]
+                if let Some((entered, resume)) = gate {
                     let _ = entered.send(());
-                    let _ = resume.recv();
+                    let _ = resume.await;
                 }
-                escape_due = shared.settle_escapes(std::time::Instant::now());
+                drain(&shared, &mut events, &mut read).await;
+                escape_due = shared.settle_escapes(std::time::Instant::now(), read);
             }
             () = sleep_until(escape_due) => {
-                escape_due = shared.settle_escapes(std::time::Instant::now());
+                drain(&shared, &mut events, &mut read).await;
+                escape_due = shared.settle_escapes(std::time::Instant::now(), read);
             }
             _ = usage_poll.tick() => {
                 shared.poll_usage(&usage_polling);
                 shared.name_dispatched_runs();
             }
             msg = next_event(&mut events) => match msg {
-                Ok(msg) => shared.observe(&msg),
+                Ok(msg) => {
+                    shared.observe_in_order(&msg, read).await;
+                    read += 1;
+                }
                 Err(broadcast::error::RecvError::Lagged(missed)) => {
                     tracing::debug!(missed, "telemetry: broadcast subscriber lagged");
+                    read += missed;
                 }
                 Err(broadcast::error::RecvError::Closed) => events = None,
             },
@@ -1525,24 +1873,39 @@ async fn next_command(
     commands.recv().await
 }
 
-/// [`mpsc::UnboundedReceiver::recv`], paused once at [`Shared::command_gate`]
-/// the first time it finds the queue empty.
+/// [`mpsc::UnboundedReceiver::recv`], which once resumed from
+/// [`Shared::command_gate`] first yields, so the other branches are polled
+/// before the queue, as when it was polled empty.
 #[cfg(test)]
 async fn next_command(
     shared: &Shared,
     commands: &mut mpsc::UnboundedReceiver<Command>,
 ) -> Option<Command> {
-    std::future::poll_fn(|cx| {
-        let polled = commands.poll_recv(cx);
-        if polled.is_pending()
-            && let Some((entered, resume)) = shared.command_gate.lock().unwrap().take()
-        {
-            let _ = entered.send(());
-            let _ = resume.recv();
-        }
-        polled
-    })
-    .await
+    if shared
+        .command_gate_resumed
+        .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        tokio::task::yield_now().await;
+    }
+    commands.recv().await
+}
+
+/// Test seam: pause the ingest task at [`Shared::command_gate`] the first
+/// time the command queue is found empty, before any branch is polled, by
+/// awaiting its second half rather than blocking the thread.
+#[cfg(test)]
+async fn pause_at_command_gate(shared: &Shared, commands: &mpsc::UnboundedReceiver<Command>) {
+    if !commands.is_empty() {
+        return;
+    }
+    let Some((entered, resume)) = shared.command_gate.lock().unwrap().take() else {
+        return;
+    };
+    let _ = entered.send(());
+    let _ = resume.await;
+    shared
+        .command_gate_resumed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 async fn sleep_until(due: Option<std::time::Instant>) {
@@ -1565,23 +1928,40 @@ async fn next_event(
 /// starts, not the ones published while it runs, so a producer that never
 /// stops cannot hold a command back. Yields to the runtime every
 /// [`DRAIN_YIELD_EVERY`] events.
-async fn drain(shared: &Shared, events: &mut Option<broadcast::Receiver<BroadcastMsg>>) {
+async fn drain(
+    shared: &Shared,
+    events: &mut Option<broadcast::Receiver<BroadcastMsg>>,
+    read: &mut u64,
+) {
+    // The messages between this receiver and the sender's tail right now.
+    let waiting = events.as_ref().map_or(0, |rx| rx.len() as u64);
+    drain_to(shared, events, read, *read + waiting).await;
+}
+
+/// Apply the broadcast up to, not including, message `to`, or as far as it
+/// has been sent. Yields to the runtime every [`DRAIN_YIELD_EVERY`] events,
+/// and waits out a lone `ESC` held before an event on its pane
+/// ([`Shared::observe_in_order`]).
+async fn drain_to(
+    shared: &Shared,
+    events: &mut Option<broadcast::Receiver<BroadcastMsg>>,
+    read: &mut u64,
+    to: u64,
+) {
     let Some(rx) = events else {
         return;
     };
-    // The messages between this receiver and the sender's tail right now.
-    let mut left = rx.len();
     let mut since_yield = 0usize;
-    while left > 0 {
+    while *read < to {
         match rx.try_recv() {
             Ok(msg) => {
-                left -= 1;
-                shared.observe(&msg);
+                shared.observe_in_order(&msg, *read).await;
+                *read += 1;
             }
             // The receiver skipped `missed` of them, which it will not see.
             Err(broadcast::error::TryRecvError::Lagged(missed)) => {
                 tracing::debug!(missed, "telemetry: broadcast subscriber lagged");
-                left = left.saturating_sub(usize::try_from(missed).unwrap_or(usize::MAX));
+                *read += missed;
             }
             Err(_) => break,
         }
@@ -1589,6 +1969,26 @@ async fn drain(shared: &Shared, events: &mut Option<broadcast::Receiver<Broadcas
         if since_yield >= DRAIN_YIELD_EVERY {
             since_yield = 0;
             tokio::task::yield_now().await;
+        }
+    }
+}
+
+/// Count the human input waiting with `run_id` on `pane_id`, each after the
+/// events broadcast before it was written: input written since the drain
+/// before this began waits for the broadcast to be applied up to it. Input
+/// the broadcast cannot be applied up to — it closed — is counted as it is.
+async fn take_input(
+    shared: &Shared,
+    events: &mut Option<broadcast::Receiver<BroadcastMsg>>,
+    read: &mut u64,
+    pane_id: &str,
+    run_id: &str,
+) {
+    while let Some(written) = shared.take_input(pane_id, run_id, Some(*read)) {
+        drain_to(shared, events, read, written).await;
+        if *read < written {
+            shared.take_input(pane_id, run_id, None);
+            break;
         }
     }
 }
@@ -1618,7 +2018,8 @@ fn apply(shared: &Arc<Shared>, command: Command) -> bool {
                 shared.forget_ended_input(&pane_id, &run_id);
             }
         }
-        Command::HumanInput { pane_id, run_id } => shared.take_input(&pane_id, &run_id),
+        // Counted by `run_ingest`, in order with the broadcast.
+        Command::HumanInput { .. } => {}
         #[cfg(test)]
         Command::Barrier(ack) => {
             // Once the runs ended before it are completed too.
@@ -3264,7 +3665,7 @@ mod tests {
         // An Escape on another pane takes the task into its timer branch,
         // where it waits.
         let (entered, picked) = oneshot::channel();
-        let (resume, paused) = std::sync::mpsc::channel();
+        let (resume, paused) = oneshot::channel();
         *shared.timer_gate.lock().unwrap() = Some((entered, paused));
         telemetry.observe_client_input("p0", b"\x1b");
         picked.await.unwrap();
@@ -3289,6 +3690,825 @@ mod tests {
         let (count, times) = interventions(&captured(&mut rx));
         assert_eq!(count, Some(AttrValue::Int(2)));
         assert_eq!(times, vec![written, written + 6_000_000_000]);
+    }
+
+    /// The kinds of the intervention events on `spans`' run span.
+    fn intervention_kinds(spans: &[SpanRecord]) -> Vec<AttrValue> {
+        let run = spans.iter().find(|s| s.name == SPAN_AGENT_RUN).unwrap();
+        run.events
+            .iter()
+            .filter(|e| e.name == crate::telemetry::EVENT_INTERVENTION)
+            .filter_map(|e| {
+                e.attributes
+                    .iter()
+                    .find(|a| a.key == AttrKey::InterventionKind)
+                    .map(|a| a.value.clone())
+            })
+            .collect()
+    }
+
+    /// Input is written, then a status change is broadcast and applied before
+    /// the ingest task takes the input: the input's kind follows the prompt
+    /// in force when it was written, in both directions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_status_applied_before_the_input_is_taken_does_not_change_its_kind() {
+        // Stamped when sent, as a producer stamps them.
+        let now = |agent: &str, event_type| {
+            let mut msg = of("p1", agent, event_type);
+            if let BroadcastMsg::Event(e) = &mut msg {
+                e.timestamp = chrono::Utc::now();
+            }
+            msg
+        };
+        for (agent, before, after, expected) in [
+            (
+                "a1",
+                EventType::PermissionRequest,
+                EventType::Thinking,
+                "answer",
+            ),
+            (
+                "a2",
+                EventType::Thinking,
+                EventType::PermissionRequest,
+                "text",
+            ),
+        ] {
+            let (telemetry, mut rx) = capturing(ProbeSettings::default());
+            let shared = Arc::clone(&telemetry.exporting.as_ref().unwrap().shared);
+            let (tx, events) = broadcast::channel(16);
+            telemetry.subscribe(events);
+            begin(&telemetry, generation("p0", "other"), &[]);
+            begin(&telemetry, generation("p1", agent), &[]);
+            tx.send(now(agent, EventType::SessionStart)).unwrap();
+            tx.send(now(agent, before.clone())).unwrap();
+            telemetry.settled().await;
+
+            // An Escape on another pane holds the ingest task in its timer
+            // branch while the key is written and the status broadcast.
+            let (entered, picked) = oneshot::channel();
+            let (resume, paused) = oneshot::channel();
+            *shared.timer_gate.lock().unwrap() = Some((entered, paused));
+            telemetry.observe_client_input("p0", b"\x1b");
+            picked.await.unwrap();
+            telemetry.observe_client_input("p1", b"y");
+            tx.send(now(agent, after.clone())).unwrap();
+            resume.send(()).unwrap();
+
+            telemetry.settled().await;
+            telemetry.end_run("p1", Some(agent), EndReason::Exited, None);
+            telemetry.settled().await;
+            assert_eq!(
+                intervention_kinds(&captured(&mut rx)),
+                vec![AttrValue::Str(expected.into())],
+                "{before:?} then {after:?}"
+            );
+        }
+    }
+
+    /// The receiver handed to [`Telemetry::subscribe`] already has a prompt
+    /// opening waiting on it, which the ingest task reads first and numbers
+    /// from 0; input is written after it and before the prompt closes, all of
+    /// it applied in one pass. The input is an answer: the input clock starts
+    /// after the waiting messages, where the ingest task's numbering of the
+    /// next one does, so the input is counted after the prompt opened and
+    /// before it closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn input_after_messages_waiting_at_subscribe_is_placed_among_them() {
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        begin(&telemetry, generation("p0", "other"), &[]);
+        begin(&telemetry, generation("p1", "a1"), &[]);
+        let (tx, events) = broadcast::channel(16);
+        tx.send(of("p1", "a1", EventType::SessionStart)).unwrap();
+        tx.send(of("p1", "a1", EventType::PermissionRequest))
+            .unwrap();
+        telemetry.settled().await;
+
+        let resume = hold_ingest(&telemetry, "p0").await;
+        telemetry.subscribe(events);
+        telemetry.observe_client_input("p1", b"y");
+        tx.send(of("p1", "a1", EventType::Thinking)).unwrap();
+        resume.send(()).unwrap();
+
+        telemetry.settled().await;
+        telemetry.end_run("p1", Some("a1"), EndReason::Exited, None);
+        telemetry.settled().await;
+        assert_eq!(
+            intervention_kinds(&captured(&mut rx)),
+            vec![AttrValue::Str("answer".into())]
+        );
+    }
+
+    /// A paste whose end marker never comes is read as ended once
+    /// [`PASTE_IDLE_WINDOW`] passes with no input: what follows is its own
+    /// kind. Writes that keep coming within the window keep the paste going,
+    /// however long it runs in all.
+    #[tokio::test]
+    async fn a_paste_with_no_input_for_its_window_is_read_as_ended() {
+        for (agent, gap, expected) in [
+            ("a1", PASTE_IDLE_WINDOW, ["paste", "text", "interrupt"]),
+            (
+                "a2",
+                PASTE_IDLE_WINDOW - Duration::from_millis(1),
+                ["paste", "paste", "paste"],
+            ),
+        ] {
+            let (telemetry, mut rx) = capturing(ProbeSettings::default());
+            begin(&telemetry, generation("p1", agent), &[]);
+            telemetry.settled().await;
+            let at = std::time::Instant::now();
+            // Written in separate bursts, so each write's kind is its own.
+            let written = now_unix_nanos();
+            let apart = 2 * crate::telemetry::tracker::INTERVENTION_COALESCE_NANOS;
+            telemetry.observe_client_input_at("p1", b"\x1b[200~abc", written, at);
+            telemetry.observe_client_input_at("p1", b"def", written + apart, at + gap);
+            telemetry.observe_client_input_at("p1", b"\x03", written + 2 * apart, at + 2 * gap);
+            telemetry.settled().await;
+            telemetry.end_run("p1", Some(agent), EndReason::Exited, None);
+            telemetry.settled().await;
+            assert_eq!(
+                intervention_kinds(&captured(&mut rx)),
+                expected.map(|kind| AttrValue::Str(kind.into())),
+                "{gap:?}"
+            );
+        }
+    }
+
+    /// The intervention events on `spans`' run span: when, and of what kind.
+    fn timed_kinds(spans: &[SpanRecord]) -> Vec<(u64, AttrValue)> {
+        let run = spans.iter().find(|s| s.name == SPAN_AGENT_RUN).unwrap();
+        run.events
+            .iter()
+            .filter(|e| e.name == crate::telemetry::EVENT_INTERVENTION)
+            .map(|e| {
+                let kind = e
+                    .attributes
+                    .iter()
+                    .find(|a| a.key == AttrKey::InterventionKind);
+                (e.time_unix_nanos, kind.unwrap().value.clone())
+            })
+            .collect()
+    }
+
+    /// Holds the ingest task in its timer branch, by an Escape on `pane`,
+    /// until the returned sender is sent to; returns once it is held.
+    async fn hold_ingest(telemetry: &Telemetry, pane: &str) -> oneshot::Sender<()> {
+        let shared = &telemetry.exporting.as_ref().unwrap().shared;
+        let (entered, picked) = oneshot::channel();
+        let (resume, paused) = oneshot::channel();
+        *shared.timer_gate.lock().unwrap() = Some((entered, paused));
+        telemetry.observe_client_input(pane, b"\x1b");
+        picked.await.unwrap();
+        resume
+    }
+
+    /// A prompt opens, closes, and opens again with a producer stamp behind
+    /// both; the person types after it is broadcast, and the ingest task
+    /// applies it in the same pass as the keystroke. The keystroke came after
+    /// the prompt opened, on the order the deck recorded them in, so it is an
+    /// answer, whatever the producer stamped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_prompt_reopened_with_an_older_stamp_is_open_for_input_after_it() {
+        let stamped = |event_type, seconds_ago: i64| {
+            let mut msg = of("p1", "a1", event_type);
+            if let BroadcastMsg::Event(e) = &mut msg {
+                e.timestamp = chrono::Utc::now() - chrono::Duration::seconds(seconds_ago);
+            }
+            msg
+        };
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("p0", "other"), &[]);
+        begin(&telemetry, generation("p1", "a1"), &[]);
+        tx.send(stamped(EventType::SessionStart, 0)).unwrap();
+        tx.send(stamped(EventType::PermissionRequest, 0)).unwrap();
+        tx.send(stamped(EventType::Thinking, 0)).unwrap();
+        telemetry.settled().await;
+
+        let resume = hold_ingest(&telemetry, "p0").await;
+        tx.send(stamped(EventType::PermissionRequest, 60)).unwrap();
+        telemetry.observe_client_input("p1", b"y");
+        resume.send(()).unwrap();
+
+        telemetry.settled().await;
+        telemetry.end_run("p1", Some("a1"), EndReason::Exited, None);
+        telemetry.settled().await;
+        assert_eq!(
+            intervention_kinds(&captured(&mut rx)),
+            vec![AttrValue::Str("answer".into())]
+        );
+    }
+
+    /// Text written at 1 s is still waiting when the deck's answer, accepted
+    /// at 11 s, is applied in the same pass: the text counts first, at 1 s,
+    /// and the answer at 11 s, as two interventions. Input at 12 s joins the
+    /// answer's burst rather than starting one, since the last input never
+    /// moves back to 1 s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn input_waiting_when_a_deck_answer_is_applied_counts_before_it() {
+        let second = 1_000_000_000;
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("p0", "other"), &[]);
+        begin(&telemetry, generation("p1", "a1"), &[]);
+        tx.send(of("p1", "a1", EventType::SessionStart)).unwrap();
+        telemetry.settled().await;
+        let zero = now_unix_nanos() - 20 * second;
+
+        let resume = hold_ingest(&telemetry, "p0").await;
+        telemetry.observe_client_input_at("p1", b"x", zero + second, std::time::Instant::now());
+        let mut answered = of("p1", "a1", EventType::Thinking);
+        if let BroadcastMsg::Event(e) = &mut answered {
+            e.metadata.insert(
+                crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY.into(),
+                crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_VALUE.into(),
+            );
+            e.timestamp = chrono::DateTime::from_timestamp_nanos((zero + 11 * second) as i64);
+        }
+        tx.send(answered).unwrap();
+        resume.send(()).unwrap();
+        telemetry.settled().await;
+        telemetry.observe_client_input_at(
+            "p1",
+            b"z",
+            zero + 12 * second,
+            std::time::Instant::now(),
+        );
+
+        telemetry.settled().await;
+        telemetry.end_run("p1", Some("a1"), EndReason::Exited, None);
+        telemetry.settled().await;
+        assert_eq!(
+            timed_kinds(&captured(&mut rx)),
+            vec![
+                (zero + second, AttrValue::Str("text".into())),
+                (zero + 11 * second, AttrValue::Str("answer".into())),
+            ]
+        );
+    }
+
+    /// An Escape pressed at 1 s is still held when the deck's answer,
+    /// accepted at 11 s, is applied, with its window over (`expired`) or
+    /// still running: it counts first, as an interrupt at 1 s, and the answer
+    /// at 11 s, as two interventions, rather than one interrupt at 11 s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_escape_held_when_a_deck_answer_is_applied_counts_before_it() {
+        let second = 1_000_000_000;
+        for expired in [true, false] {
+            let (telemetry, mut rx) = capturing(ProbeSettings::default());
+            let (tx, events) = broadcast::channel(16);
+            telemetry.subscribe(events);
+            begin(&telemetry, generation("p0", "other"), &[]);
+            begin(&telemetry, generation("p1", "a1"), &[]);
+            tx.send(of("p1", "a1", EventType::SessionStart)).unwrap();
+            telemetry.settled().await;
+            let zero = now_unix_nanos() - 20 * second;
+
+            let resume = hold_ingest(&telemetry, "p0").await;
+            let pressed = if expired {
+                std::time::Instant::now() - LONE_ESCAPE_WINDOW
+            } else {
+                std::time::Instant::now()
+            };
+            telemetry.observe_client_input_at("p1", b"\x1b", zero + second, pressed);
+            let mut answered = of("p1", "a1", EventType::Thinking);
+            if let BroadcastMsg::Event(e) = &mut answered {
+                e.metadata.insert(
+                    crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY.into(),
+                    crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_VALUE.into(),
+                );
+                e.timestamp = chrono::DateTime::from_timestamp_nanos((zero + 11 * second) as i64);
+            }
+            tx.send(answered).unwrap();
+            resume.send(()).unwrap();
+
+            telemetry.settled().await;
+            telemetry.end_run("p1", Some("a1"), EndReason::Exited, None);
+            telemetry.settled().await;
+            assert_eq!(
+                timed_kinds(&captured(&mut rx)),
+                vec![
+                    (zero + second, AttrValue::Str("interrupt".into())),
+                    (zero + 11 * second, AttrValue::Str("answer".into())),
+                ],
+                "expired: {expired}"
+            );
+        }
+    }
+
+    /// An Escape pressed at 1 s is still held when a permission prompt
+    /// broadcast after it is applied, with its window over or still running:
+    /// the run records the interrupt before the status change the prompt
+    /// made, at 1 s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_escape_held_when_a_prompt_opens_counts_before_it() {
+        let second = 1_000_000_000;
+        for expired in [true, false] {
+            let (telemetry, mut rx) = capturing(ProbeSettings::default());
+            let (tx, events) = broadcast::channel(16);
+            telemetry.subscribe(events);
+            begin(&telemetry, generation("p0", "other"), &[]);
+            begin(&telemetry, generation("p1", "a1"), &[]);
+            tx.send(of("p1", "a1", EventType::SessionStart)).unwrap();
+            telemetry.settled().await;
+            let zero = now_unix_nanos() - 20 * second;
+
+            let resume = hold_ingest(&telemetry, "p0").await;
+            let pressed = if expired {
+                std::time::Instant::now() - LONE_ESCAPE_WINDOW
+            } else {
+                std::time::Instant::now()
+            };
+            telemetry.observe_client_input_at("p1", b"\x1b", zero + second, pressed);
+            tx.send(of("p1", "a1", EventType::PermissionRequest))
+                .unwrap();
+            resume.send(()).unwrap();
+
+            telemetry.settled().await;
+            telemetry.end_run("p1", Some("a1"), EndReason::Exited, None);
+            telemetry.settled().await;
+            let spans = captured(&mut rx);
+            assert_eq!(
+                timed_kinds(&spans),
+                vec![(zero + second, AttrValue::Str("interrupt".into()))],
+                "expired: {expired}"
+            );
+            let run = spans.iter().find(|s| s.name == SPAN_AGENT_RUN).unwrap();
+            let names: Vec<_> = run
+                .events
+                .iter()
+                .map(|e| e.name)
+                .filter(|&name| {
+                    name == crate::telemetry::EVENT_STATUS_CHANGE
+                        || name == crate::telemetry::EVENT_INTERVENTION
+                })
+                .collect();
+            assert_eq!(
+                names,
+                vec![
+                    crate::telemetry::EVENT_STATUS_CHANGE,
+                    crate::telemetry::EVENT_INTERVENTION,
+                    crate::telemetry::EVENT_STATUS_CHANGE,
+                ],
+                "expired: {expired}"
+            );
+        }
+    }
+
+    /// Text typed at 1 s, then an Escape at 5.99 s still held when the deck's
+    /// answer, accepted at 6.01 s, is applied; a second Escape at 6.02 s,
+    /// written while the ingest task waits out the first one's window,
+    /// decides the first as the Escape key. The first counts where it was
+    /// pressed, before the answer: one interrupt from 1 s, rather than the
+    /// text at 1 s and an interrupt at 6.01 s that the answer overtook.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_escape_decided_during_the_wait_for_it_counts_before_the_event() {
+        let second = 1_000_000_000;
+        let ms = 1_000_000;
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("p0", "other"), &[]);
+        begin(&telemetry, generation("p1", "a1"), &[]);
+        tx.send(of("p1", "a1", EventType::SessionStart)).unwrap();
+        telemetry.settled().await;
+        let zero = now_unix_nanos() - 20 * second;
+        let shared = &telemetry.exporting.as_ref().unwrap().shared;
+
+        let resume = hold_ingest(&telemetry, "p0").await;
+        let pressed = std::time::Instant::now();
+        telemetry.observe_client_input_at("p1", b"a", zero + second, pressed);
+        telemetry.observe_client_input_at("p1", b"\x1b", zero + 5990 * ms, pressed);
+        let mut answered = of("p1", "a1", EventType::Thinking);
+        if let BroadcastMsg::Event(e) = &mut answered {
+            e.metadata.insert(
+                crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY.into(),
+                crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_VALUE.into(),
+            );
+            e.timestamp = chrono::DateTime::from_timestamp_nanos((zero + 6010 * ms) as i64);
+        }
+        tx.send(answered).unwrap();
+        let (entered, waiting) = oneshot::channel();
+        let (go, paused) = oneshot::channel();
+        *shared.wait_gate.lock().unwrap() = Some((entered, paused));
+        resume.send(()).unwrap();
+        waiting.await.unwrap();
+        telemetry.observe_client_input_at(
+            "p1",
+            b"\x1b",
+            zero + 6020 * ms,
+            pressed + LONE_ESCAPE_WINDOW / 2,
+        );
+        go.send(()).unwrap();
+
+        telemetry.settled().await;
+        telemetry.end_run("p1", Some("a1"), EndReason::Exited, None);
+        telemetry.settled().await;
+        assert_eq!(
+            timed_kinds(&captured(&mut rx)),
+            vec![(zero + second, AttrValue::Str("interrupt".into()))]
+        );
+    }
+
+    /// A lone `ESC` that a later write decides — as the Escape key, by
+    /// another `ESC` or by its window passing, or as the start of a key's
+    /// sequence — counts at the time and broadcast position it was written
+    /// at; the rest of that write counts at its own. A sequence the next
+    /// write leaves undecided counts when a later write decides it.
+    #[test]
+    fn a_decided_escape_keeps_the_time_and_position_it_was_written_at() {
+        use InterventionKind::{Interrupt, Navigate, Text};
+        let pane_input = || PaneInput {
+            run_id: "r1".into(),
+            agent_id: None,
+            ended: false,
+            filter: InputFilter::new(),
+            escape: None,
+            paste: None,
+            pending: Vec::new(),
+        };
+        let timed = |human: Vec<Written>| -> Vec<_> {
+            human.iter().map(|w| (w.at, w.kind, w.position)).collect()
+        };
+        let pressed = std::time::Instant::now();
+        let soon = pressed + LONE_ESCAPE_WINDOW / 2;
+        let late = pressed + LONE_ESCAPE_WINDOW;
+        let cases: [(&[u8], _, Vec<_>, bool); 8] = [
+            (b"\x1b", soon, vec![(1, Interrupt, 3)], true),
+            (
+                b"\x1bab",
+                soon,
+                vec![(1, Interrupt, 3), (2, Text, 5)],
+                false,
+            ),
+            (b"x", soon, vec![(1, Navigate, 3)], false),
+            (b"\r", soon, vec![(1, Text, 3)], false),
+            (b"[Ahi", soon, vec![(1, Navigate, 3), (2, Text, 5)], false),
+            (b"[I", soon, vec![], false),
+            (b"x", late, vec![(1, Interrupt, 3), (2, Text, 5)], false),
+            (b"\x1b", late, vec![(1, Interrupt, 3)], true),
+        ];
+        for (next, at, expected, held) in cases {
+            let mut input = pane_input();
+            assert_eq!(input.write(b"\x1b", 1, 3, pressed).0.len(), 0);
+            let (human, still) = input.write(next, 2, 5, at);
+            assert_eq!(timed(human), expected, "{next:?}");
+            assert_eq!(still, held, "{next:?}");
+            let escape = input
+                .escape
+                .map(|(_, written, position)| (written, position));
+            assert_eq!(escape, held.then_some((2, 5)), "{next:?}");
+        }
+
+        let mut input = pane_input();
+        input.write(b"\x1b", 1, 3, pressed);
+        assert_eq!(timed(input.write(b"[1;", 2, 5, soon).0), vec![]);
+        assert_eq!(
+            timed(input.write(b"5A", 4, 7, soon).0),
+            vec![(4, Navigate, 7)]
+        );
+    }
+
+    /// The keys a held `ESC` can begin with bytes of their own after the one
+    /// that decides it: an SS3 cursor key, Alt with a multibyte character, an
+    /// X10 mouse report. With how many bytes after the `ESC` decide each.
+    const KEYS_WITH_TAILS: [(&[u8], usize); 3] =
+        [(b"OA", 1), ("\u{e9}".as_bytes(), 1), (b"[Mabc", 2)];
+
+    /// A held `ESC`, then the rest of its key, alone or with a `z` after it,
+    /// in two writes split at every byte. A key the first write decides
+    /// counts once, at the `ESC`'s time and position, wherever the split
+    /// falls inside it: the second write adds nothing for the rest of it. The
+    /// `z` counts at the time of the write it is in. A key split before it is
+    /// decided counts once, when the second write decides it, as the docs say.
+    #[test]
+    fn a_decided_key_counts_its_own_bytes_once() {
+        use InterventionKind::{Navigate, Text};
+        for ((key, decided), with_z) in KEYS_WITH_TAILS
+            .into_iter()
+            .flat_map(|key| [(key, false), (key, true)])
+        {
+            let mut rest = key.to_vec();
+            if with_z {
+                rest.push(b'z');
+            }
+            let z = |at, position| with_z.then_some((at, Text, position));
+            let pressed = std::time::Instant::now();
+            let soon = pressed + LONE_ESCAPE_WINDOW / 4;
+            let sooner = pressed + LONE_ESCAPE_WINDOW / 2;
+            for at in 0..=rest.len() {
+                let mut input = PaneInput {
+                    run_id: "r1".into(),
+                    agent_id: None,
+                    ended: false,
+                    filter: InputFilter::new(),
+                    escape: None,
+                    paste: None,
+                    pending: Vec::new(),
+                };
+                let timed = |human: Vec<Written>| -> Vec<_> {
+                    human.iter().map(|w| (w.at, w.kind, w.position)).collect()
+                };
+                assert!(input.write(b"\x1b", 1, 3, pressed).0.is_empty());
+                let first = timed(input.write(&rest[..at], 2, 5, soon).0);
+                let second = timed(input.write(&rest[at..], 4, 7, sooner).0);
+                let (want_first, want_second) = if at == 0 {
+                    (vec![], [Some((1, Navigate, 3)), z(4, 7)].to_vec())
+                } else if at < decided {
+                    let kind = if with_z { Text } else { Navigate };
+                    (vec![], vec![Some((4, kind, 7))])
+                } else if at <= key.len() {
+                    (vec![Some((1, Navigate, 3))], vec![z(4, 7)])
+                } else {
+                    (vec![Some((1, Navigate, 3)), z(2, 5)], vec![])
+                };
+                let want_first: Vec<_> = want_first.into_iter().flatten().collect();
+                let want_second: Vec<_> = want_second.into_iter().flatten().collect();
+                let what = format!("{rest:?} split at {at}");
+                assert_eq!(first, want_first, "{what}: first write");
+                assert_eq!(second, want_second, "{what}: second write");
+                assert!(!input.filter.is_holding(), "{what}");
+            }
+        }
+    }
+
+    /// An `ESC` at 1 s, the rest of its key at 1.01 s and a `z` at 6.005 s:
+    /// the key is one navigation from 1 s, so the `z`, more than the
+    /// coalescing window after it, starts an intervention of its own. Counted
+    /// again at 1.01 s, the key would pull the `z` into its burst as text.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_key_after_a_decided_one_starts_its_own_intervention() {
+        let second = 1_000_000_000;
+        let ms = 1_000_000;
+        for (key, _) in KEYS_WITH_TAILS {
+            let (telemetry, mut rx) = capturing(ProbeSettings::default());
+            begin(&telemetry, generation("p0", "other"), &[]);
+            begin(&telemetry, generation("p1", "a1"), &[]);
+            telemetry.settled().await;
+            let zero = now_unix_nanos() - 20 * second;
+
+            // Held, so the ESC's window cannot pass on the ingest task's clock.
+            let resume = hold_ingest(&telemetry, "p0").await;
+            let pressed = std::time::Instant::now();
+            telemetry.observe_client_input_at("p1", b"\x1b", zero + second, pressed);
+            telemetry.observe_client_input_at(
+                "p1",
+                key,
+                zero + 1010 * ms,
+                pressed + LONE_ESCAPE_WINDOW / 10,
+            );
+            telemetry.observe_client_input_at(
+                "p1",
+                b"z",
+                zero + 6005 * ms,
+                pressed + Duration::from_millis(6005),
+            );
+            resume.send(()).unwrap();
+
+            telemetry.settled().await;
+            telemetry.end_run("p1", Some("a1"), EndReason::Exited, None);
+            telemetry.settled().await;
+            assert_eq!(
+                timed_kinds(&captured(&mut rx)),
+                vec![
+                    (zero + second, AttrValue::Str("navigate".into())),
+                    (zero + 6005 * ms, AttrValue::Str("text".into())),
+                ],
+                "{key:?}"
+            );
+        }
+    }
+
+    /// An `ESC` at 1 s, a permission prompt broadcast, then the rest of its
+    /// key at 1.01 s: the key was pressed before the prompt opened, so it is
+    /// navigation, not an answer. A `z` typed after the prompt, at 7 s, is
+    /// the answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_key_decided_after_a_prompt_keeps_the_kind_it_had_before_it() {
+        let second = 1_000_000_000;
+        let ms = 1_000_000;
+        for (key, _) in KEYS_WITH_TAILS {
+            let (telemetry, mut rx) = capturing(ProbeSettings::default());
+            let (tx, events) = broadcast::channel(16);
+            telemetry.subscribe(events);
+            begin(&telemetry, generation("p0", "other"), &[]);
+            begin(&telemetry, generation("p1", "a1"), &[]);
+            tx.send(of("p1", "a1", EventType::SessionStart)).unwrap();
+            telemetry.settled().await;
+            let zero = now_unix_nanos() - 20 * second;
+
+            let resume = hold_ingest(&telemetry, "p0").await;
+            let pressed = std::time::Instant::now();
+            telemetry.observe_client_input_at("p1", b"\x1b", zero + second, pressed);
+            tx.send(of("p1", "a1", EventType::PermissionRequest))
+                .unwrap();
+            telemetry.observe_client_input_at(
+                "p1",
+                key,
+                zero + 1010 * ms,
+                pressed + LONE_ESCAPE_WINDOW / 10,
+            );
+            telemetry.observe_client_input_at(
+                "p1",
+                b"z",
+                zero + 7 * second,
+                pressed + Duration::from_secs(7),
+            );
+            resume.send(()).unwrap();
+
+            telemetry.settled().await;
+            telemetry.end_run("p1", Some("a1"), EndReason::Exited, None);
+            telemetry.settled().await;
+            assert_eq!(
+                timed_kinds(&captured(&mut rx)),
+                vec![
+                    (zero + second, AttrValue::Str("navigate".into())),
+                    (zero + 7 * second, AttrValue::Str("answer".into())),
+                ],
+                "{key:?}"
+            );
+        }
+    }
+
+    /// An `ESC` at 1 s, its key's deciding bytes at 1.005 s, a permission
+    /// prompt broadcast, then the rest of the key at 1.01 s: the key was
+    /// counted, as navigation, before the prompt opened, and the rest of it
+    /// is not input of its own, so it does not answer the prompt. A `z` typed
+    /// after the prompt, at 7 s, is the answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_key_split_around_a_prompt_keeps_the_kind_it_had_before_it() {
+        let second = 1_000_000_000;
+        let ms = 1_000_000;
+        for (key, decided) in KEYS_WITH_TAILS {
+            let (telemetry, mut rx) = capturing(ProbeSettings::default());
+            let (tx, events) = broadcast::channel(16);
+            telemetry.subscribe(events);
+            begin(&telemetry, generation("p0", "other"), &[]);
+            begin(&telemetry, generation("p1", "a1"), &[]);
+            tx.send(of("p1", "a1", EventType::SessionStart)).unwrap();
+            telemetry.settled().await;
+            let zero = now_unix_nanos() - 20 * second;
+
+            let resume = hold_ingest(&telemetry, "p0").await;
+            let pressed = std::time::Instant::now();
+            telemetry.observe_client_input_at("p1", b"\x1b", zero + second, pressed);
+            telemetry.observe_client_input_at(
+                "p1",
+                &key[..decided],
+                zero + 1005 * ms,
+                pressed + LONE_ESCAPE_WINDOW / 20,
+            );
+            tx.send(of("p1", "a1", EventType::PermissionRequest))
+                .unwrap();
+            telemetry.observe_client_input_at(
+                "p1",
+                &key[decided..],
+                zero + 1010 * ms,
+                pressed + LONE_ESCAPE_WINDOW / 10,
+            );
+            telemetry.observe_client_input_at(
+                "p1",
+                b"z",
+                zero + 7 * second,
+                pressed + Duration::from_secs(7),
+            );
+            resume.send(()).unwrap();
+
+            telemetry.settled().await;
+            telemetry.end_run("p1", Some("a1"), EndReason::Exited, None);
+            telemetry.settled().await;
+            assert_eq!(
+                timed_kinds(&captured(&mut rx)),
+                vec![
+                    (zero + second, AttrValue::Str("navigate".into())),
+                    (zero + 7 * second, AttrValue::Str("answer".into())),
+                ],
+                "{key:?}"
+            );
+        }
+    }
+
+    /// Messages already waiting on the ingest task's receiver when the clock
+    /// is made are before it: input written then counts after all of them.
+    #[test]
+    fn the_clock_numbers_messages_queued_before_it() {
+        let (tx, events) = broadcast::channel(16);
+        for _ in 0..3 {
+            tx.send(of("p1", "a1", EventType::Thinking)).unwrap();
+        }
+        let clock = BroadcastClock::numbering(&events);
+        assert_eq!(clock.position(), 3);
+        tx.send(of("p1", "a1", EventType::Thinking)).unwrap();
+        // The ingest task numbers what it reads from 0: the fourth message,
+        // number 3, is the first after input written at position 3.
+        assert_eq!(clock.position(), 4);
+        assert_eq!(events.len() as u64, clock.position());
+    }
+
+    /// Messages a small ring overwrote before the clock read them still
+    /// count, as the ingest task counts the ones it missed, before and after
+    /// the clock catches up.
+    #[test]
+    fn the_clock_counts_messages_a_small_ring_dropped() {
+        let (tx, mut events) = broadcast::channel(4);
+        let mut clock = BroadcastClock::numbering(&events);
+        for _ in 0..10 {
+            tx.send(of("p1", "a1", EventType::Thinking)).unwrap();
+        }
+        assert_eq!(clock.position(), 10);
+        let mut read = 0;
+        while let Ok(n) = match events.try_recv() {
+            Ok(_) => Ok(1),
+            Err(broadcast::error::TryRecvError::Lagged(missed)) => Ok(missed),
+            Err(e) => Err(e),
+        } {
+            read += n;
+        }
+        assert_eq!(read, clock.position(), "the ingest task's count");
+
+        for _ in 0..CLOCK_CATCH_UP_AT {
+            tx.send(of("p1", "a1", EventType::Thinking)).unwrap();
+        }
+        let behind = 10 + CLOCK_CATCH_UP_AT as u64;
+        assert_eq!(clock.position(), behind);
+        clock.catch_up();
+        assert_eq!(clock.position(), behind);
+        assert_eq!(clock.base, behind, "read through the overwritten ones");
+    }
+
+    /// The clock reads nothing until it is [`CLOCK_CATCH_UP_AT`] behind, then
+    /// reads all of it, and its position moves with neither.
+    #[test]
+    fn the_clock_catches_up_at_its_trigger_without_moving() {
+        let (tx, events) = broadcast::channel(1024);
+        let mut clock = BroadcastClock::numbering(&events);
+        for _ in 0..CLOCK_CATCH_UP_AT - 1 {
+            tx.send(of("p1", "a1", EventType::Thinking)).unwrap();
+        }
+        clock.catch_up();
+        assert_eq!(clock.base, 0, "not behind enough to read");
+        assert_eq!(clock.position(), CLOCK_CATCH_UP_AT as u64 - 1);
+        tx.send(of("p1", "a1", EventType::Thinking)).unwrap();
+        clock.catch_up();
+        assert_eq!(clock.base, CLOCK_CATCH_UP_AT as u64);
+        assert_eq!(clock.rx.as_ref().unwrap().len(), 0);
+        assert_eq!(clock.position(), CLOCK_CATCH_UP_AT as u64);
+        tx.send(of("p1", "a1", EventType::Thinking)).unwrap();
+        assert_eq!(clock.position(), CLOCK_CATCH_UP_AT as u64 + 1);
+    }
+
+    /// With the ingest task held and hundreds of messages on another pane
+    /// either side, text typed at 1 s, before a permission prompt is
+    /// broadcast, and a key typed at 11 s, after it, with the clock catching
+    /// up in between, are read against the prompt as it stood before each:
+    /// text, then an answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn input_either_side_of_a_clock_catch_up_is_read_against_the_prompt_before_it() {
+        let second = 1_000_000_000;
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let (tx, events) = broadcast::channel(1024);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("p0", "other"), &[]);
+        begin(&telemetry, generation("p1", "a1"), &[]);
+        tx.send(of("p1", "a1", EventType::SessionStart)).unwrap();
+        telemetry.settled().await;
+        let zero = now_unix_nanos() - 20 * second;
+        let shared = &telemetry.exporting.as_ref().unwrap().shared;
+        let filler = |n: usize| {
+            for _ in 0..n {
+                tx.send(of("p2", "a2", EventType::Thinking)).unwrap();
+            }
+        };
+
+        let resume = hold_ingest(&telemetry, "p0").await;
+        filler(CLOCK_CATCH_UP_AT - 56);
+        let now = std::time::Instant::now();
+        telemetry.observe_client_input_at("p1", b"a", zero + second, now);
+        tx.send(of("p1", "a1", EventType::PermissionRequest))
+            .unwrap();
+        filler(100);
+        {
+            let mut clock = shared.lock_clock();
+            let before = clock.position();
+            clock.catch_up();
+            assert_eq!(clock.position(), before);
+            assert_eq!(clock.rx.as_ref().unwrap().len(), 0, "caught up");
+        }
+        telemetry.observe_client_input_at("p1", b"b", zero + 11 * second, now);
+        resume.send(()).unwrap();
+
+        telemetry.settled().await;
+        telemetry.end_run("p1", Some("a1"), EndReason::Exited, None);
+        telemetry.settled().await;
+        assert_eq!(
+            timed_kinds(&captured(&mut rx)),
+            vec![
+                (zero + second, AttrValue::Str("text".into())),
+                (zero + 11 * second, AttrValue::Str("answer".into())),
+            ]
+        );
     }
 
     /// Threads 4 / 10: a run's end is stamped when the ingest task applies
@@ -3482,7 +4702,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_dispatched_run_closed_before_ingest_keeps_its_name() {
         let (entered, polled_empty) = oneshot::channel();
-        let (resume, paused) = std::sync::mpsc::channel();
+        let (resume, paused) = oneshot::channel();
         let (sink, mut rx) = mpsc::channel(QUEUE_CAPACITY);
         let telemetry = Arc::new(Telemetry::start_with(
             &env(&ON),
@@ -3770,7 +4990,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_escape_whose_wake_beats_its_runs_commit_still_settles() {
         let (entered, polled_empty) = oneshot::channel();
-        let (resume, paused) = std::sync::mpsc::channel();
+        let (resume, paused) = oneshot::channel();
         let (sink, mut rx) = mpsc::channel(QUEUE_CAPACITY);
         let telemetry = Arc::new(Telemetry::start_with(
             &env(&ON),
@@ -3825,21 +5045,22 @@ mod tests {
     }
 
     /// N2: Escape followed by another key. Inside the window the two are one
-    /// sequence (Alt+key); past it the Escape counts at its own time, and the
-    /// key joins its burst or starts a new one by the usual rule.
+    /// sequence (Alt+key), pressed when the Escape was; past it the Escape
+    /// counts at its own time, and the key joins its burst or starts a new
+    /// one by the usual rule.
     #[tokio::test]
     async fn the_escape_key_then_another_key_counts_by_when_each_was_pressed() {
         let (telemetry, mut rx) = capturing(ProbeSettings::default());
         let second = 1_000_000_000u64;
-        let cases: [(Duration, i64, usize); 3] = [
-            // Alt+a: one intervention, at the second write.
-            (Duration::from_millis(10), 1, 1),
+        let cases: [(Duration, i64); 3] = [
+            // Alt+a: one intervention, at the Escape that began it.
+            (Duration::from_millis(10), 1),
             // Past the window, inside a burst: one, at the Escape.
-            (Duration::from_secs(1), 1, 0),
+            (Duration::from_secs(1), 1),
             // Past a burst: two.
-            (Duration::from_secs(6), 2, 0),
+            (Duration::from_secs(6), 2),
         ];
-        for (i, (later, count, first_at)) in cases.into_iter().enumerate() {
+        for (i, (later, count)) in cases.into_iter().enumerate() {
             let agent = format!("a{i}");
             begin(&telemetry, generation("p1", &agent), &[]);
             let t0 = 100 * second;
@@ -3851,7 +5072,7 @@ mod tests {
             telemetry.settled().await;
             let (got, times) = interventions(&captured(&mut rx));
             assert_eq!(got, Some(AttrValue::Int(count)), "{later:?}");
-            assert_eq!(times[0], [t0, t1][first_at], "{later:?}");
+            assert_eq!(times[0], t0, "{later:?}");
             if count == 2 {
                 assert_eq!(times, vec![t0, t1]);
             }

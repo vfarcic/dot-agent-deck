@@ -40,6 +40,24 @@
 //! [`REPLACED_RUN_GRACE_NANOS`], or that would hold more than
 //! [`MAX_REPLACED_RUNS`] aside, or that is still aside at daemon shutdown, ends
 //! as [`EndReason::Unknown`] at the time it was replaced.
+//!
+//! **An intervention says what the person did** (`deck.intervention.kind`):
+//! the strongest kind of input in its burst, from the bytes
+//! ([`super::input::InterventionKind`]), raised to an answer when the run's own
+//! cards show the agent waiting on a question or a permission prompt as the
+//! tracker applies it. An answer the deck's question UI gave is one too, at the
+//! time the daemon stamped its event saying so, since a held question's answer
+//! types nothing into the pane.
+//!
+//! **Input, prompt changes and deck answers are applied in the order the deck
+//! recorded them**, which is the caller's job, not the tracker's: the tracker
+//! applies each in the order it is handed them, reads the prompt as the cards
+//! show it then, and never moves a run's last input backward, so a burst's
+//! time can only grow. [`super::exporter`] hands each pane's input over before
+//! the first event broadcast after telemetry was told about it, just after
+//! the pane accepted it, once this tracker has opened the run it was typed
+//! into; the Escape key, and a key whose sequence a held `ESC` begins and the
+//! next write completes, as of the write that held the `ESC`.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -49,6 +67,7 @@ use crate::state::{AppState, SessionStatus};
 use super::accounting::AccountingKey;
 use super::accounting::run_usage::{RunUsage, UsageDirs};
 use super::ci::{CiEffect, CiState, PrCi};
+use super::input::InterventionKind;
 use super::operation::{Description, describe_tool, is_shell_tool};
 use super::run_context::RunContext;
 use super::span::{
@@ -88,6 +107,9 @@ pub const MAX_OPEN_OPERATIONS: usize = 64;
 /// The tool call ids one run remembers having seen, newest kept: an end
 /// naming one of them ends nothing unless that call is still open.
 pub const MAX_SEEN_CALL_IDS: usize = 256;
+
+/// The questions one run remembers the deck answers by typing, newest kept.
+pub const MAX_TYPED_QUESTIONS: usize = 16;
 
 /// The event metadata key carrying the agent's id for one tool call, which
 /// pairs a call's end with its start when several run at once.
@@ -306,11 +328,24 @@ struct ActiveRun {
     interventions: u64,
     status_changes: u64,
     last_human_input: Option<u64>,
+    /// The kind of the current burst of input, and where its
+    /// `deck.intervention` event is in `events` — `None` when the event was
+    /// not kept ([`MAX_EVENTS_PER_RUN`]).
+    burst: Option<(InterventionKind, Option<usize>)>,
+    /// The last wait the agent reported is a notification that asks nothing:
+    /// Claude Code's `idle_prompt`, after every ended turn. Input then is not
+    /// an answer.
+    idle_wait: bool,
     operations: Vec<OpenOperation>,
     operations_count: u64,
     /// The call ids this run's shell starts and ends named, at most
     /// [`MAX_SEEN_CALL_IDS`], oldest first.
     seen_call_ids: VecDeque<String>,
+    /// The ids of the questions this run's agent asked that the deck answers
+    /// by typing keys into the pane, at most [`MAX_TYPED_QUESTIONS`], oldest
+    /// first: those keys are the person's input already, so the deck's
+    /// "answered" event for one of them is not counted again.
+    typed_questions: VecDeque<String>,
     /// The pull request whose checks the run's card holds now, whose CI state
     /// it shares with every other run holding it ([`RunTracker::ci`]).
     ci_pr: Option<PrKey>,
@@ -504,20 +539,76 @@ impl ActiveRun {
         }
     }
 
-    /// See [`RunTracker::observe_run_input`].
-    fn human_input(&mut self, now: u64) {
+    /// See [`RunTracker::observe_run_input`]. Input while the agent waits on
+    /// a prompt is an answer, unless it interrupts. Input handed over with a
+    /// time before the run's last input counts at that last time: the order
+    /// it was handed over in is the order the deck recorded it in.
+    fn human_input(&mut self, now: u64, kind: InterventionKind) {
+        let kind = if self.prompt_open() {
+            kind.max(InterventionKind::Answer)
+        } else {
+            kind
+        };
+        let now = self.last_human_input.map_or(now, |last| now.max(last));
         let new_burst = self
             .last_human_input
             .is_none_or(|last| now.saturating_sub(last) > INTERVENTION_COALESCE_NANOS);
         self.last_human_input = Some(now);
         if new_burst {
             self.interventions += 1;
+            let kept = self.events.len() < MAX_EVENTS_PER_RUN;
             self.push_event(SpanEventRecord {
                 name: EVENT_INTERVENTION,
                 time_unix_nanos: now,
-                attributes: vec![Attribute::str(AttrKey::InterventionKind, "input")],
+                attributes: vec![Attribute::str(AttrKey::InterventionKind, kind.as_str())],
             });
+            self.burst = Some((kind, kept.then(|| self.events.len() - 1)));
+        } else if let Some((burst_kind, at)) = self.burst.as_mut()
+            && kind > *burst_kind
+        {
+            *burst_kind = kind;
+            if let Some(attribute) = at.and_then(|i| self.events.get_mut(i)).and_then(|e| {
+                e.attributes
+                    .iter_mut()
+                    .find(|a| a.key == AttrKey::InterventionKind)
+            }) {
+                *attribute = Attribute::str(AttrKey::InterventionKind, kind.as_str());
+            }
         }
+    }
+
+    /// Remember whether the deck answers `question` by typing keys into the
+    /// pane ([`crate::question::AnswerChannel::Keys`]): the latest
+    /// registration of an id says.
+    fn note_question(&mut self, question: &crate::question::PendingQuestion) {
+        self.typed_questions.retain(|id| *id != question.id);
+        if question.channel == crate::question::AnswerChannel::Keys {
+            if self.typed_questions.len() >= MAX_TYPED_QUESTIONS {
+                self.typed_questions.pop_front();
+            }
+            self.typed_questions.push_back(question.id.clone());
+        }
+    }
+
+    /// Whether the deck answered question `id` by typing keys into the pane.
+    fn answer_was_typed(&self, id: Option<&str>) -> bool {
+        id.is_some_and(|id| self.typed_questions.iter().any(|typed| typed == id))
+    }
+
+    /// Whether the run's pane's card shows the agent waiting on a question
+    /// or a permission prompt: a pending question, or a wait that is not
+    /// [`Self::idle_wait`].
+    fn prompt_open(&self) -> bool {
+        let pane_id = self.start_info.pane_id.as_str();
+        self.cards
+            .sessions
+            .values()
+            .filter(|s| s.pane_id.as_deref() == Some(pane_id))
+            .max_by_key(|s| s.last_activity)
+            .is_some_and(|s| {
+                s.pending_question.is_some()
+                    || (s.status == SessionStatus::WaitingForInput && !self.idle_wait)
+            })
     }
 }
 
@@ -525,7 +616,7 @@ impl ActiveRun {
 /// it — for the times of human input still held back for that run, oldest
 /// first, which are then counted before the run's span is finished. See
 /// [`RunTracker::set_held_input`].
-pub type HeldInput = Box<dyn FnMut(&str, &str) -> Vec<u64> + Send>;
+pub type HeldInput = Box<dyn FnMut(&str, &str) -> Vec<(u64, InterventionKind)> + Send>;
 
 /// See the module docs.
 #[derive(Default)]
@@ -775,9 +866,12 @@ impl RunTracker {
                 interventions: 0,
                 status_changes: 0,
                 last_human_input: None,
+                burst: None,
+                idle_wait: false,
                 operations: Vec::new(),
                 operations_count: 0,
                 seen_call_ids: VecDeque::new(),
+                typed_questions: VecDeque::new(),
                 ci_pr: None,
                 ci_seen: None,
                 ci_pending_since: None,
@@ -929,6 +1023,38 @@ impl RunTracker {
         run.cards.apply_event(event.clone());
         if let Some(agent) = hook_agent(run) {
             run.learned_agent = Some(agent);
+        }
+        match event.event_type {
+            EventType::WaitingForInput => {
+                run.idle_wait = event
+                    .metadata
+                    .get(crate::quota_block::NOTIFICATION_TYPE_METADATA_KEY)
+                    .is_some_and(|kind| {
+                        !crate::quota_block::WORKING_NOTIFICATION_TYPES.contains(&kind.as_str())
+                    });
+            }
+            EventType::PermissionRequest => run.idle_wait = false,
+            _ => {}
+        }
+        if let Some(question) = event.question() {
+            run.note_question(&question);
+        }
+        // The daemon answered a question for a person in the deck's question
+        // UI. The answer is theirs, and counts from when the daemon accepted
+        // it: the daemon makes this event and stamps it then, on the clock
+        // input is timed by. An answer the deck typed into the pane counted
+        // as those keys were written, so its event is not counted again.
+        if event
+            .metadata
+            .contains_key(crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY)
+            && !run.answer_was_typed(event.resolved_question_id())
+        {
+            let accepted = event
+                .timestamp
+                .timestamp_nanos_opt()
+                .and_then(|t| u64::try_from(t).ok())
+                .map_or(now, |t| t.min(now));
+            run.human_input(accepted, InterventionKind::Answer);
         }
         let pull_request = (event.event_type == EventType::PullRequest)
             .then(|| card_pull_request(&run.cards, event))
@@ -1238,18 +1364,37 @@ impl RunTracker {
 
     /// [`Self::observe_run_input`] for whichever run is open on `pane_id`.
     #[cfg(test)]
-    pub fn observe_human_input(&mut self, pane_id: &str, now: u64) {
+    pub fn observe_human_input(&mut self, pane_id: &str, now: u64, kind: InterventionKind) {
         if let Some(run) = self.runs.get_mut(pane_id) {
-            run.human_input(now);
+            run.human_input(now, kind);
         }
+    }
+
+    /// Whether `run_id` is open on `pane_id`, or replaced and waiting for its
+    /// end: whether [`Self::observe_run_input`] would count input for it.
+    pub fn takes_input(&self, pane_id: &str, run_id: &str) -> bool {
+        self.run_id(pane_id) == Some(run_id)
+            || self
+                .replaced
+                .iter()
+                .any(|r| r.run.start_info.pane_id == pane_id && r.run.start_info.run_id == run_id)
     }
 
     /// Input from a person at an attached client reached `pane_id`, while the
     /// run open on it, or replaced and waiting for its end, is `run_id`. Input
     /// the deck injects itself (a delegated task, an inbox delivery) must not
     /// be reported here. Keystrokes less than [`INTERVENTION_COALESCE_NANOS`]
-    /// apart count as one intervention.
-    pub fn observe_run_input(&mut self, pane_id: &str, run_id: &str, now: u64) {
+    /// apart count as one intervention, of the strongest `kind` among them.
+    /// Input is read in the order it is reported in, against the run's cards
+    /// as they stand then: report it before the first event the deck
+    /// broadcast after it, and after every event before.
+    pub fn observe_run_input(
+        &mut self,
+        pane_id: &str,
+        run_id: &str,
+        now: u64,
+        kind: InterventionKind,
+    ) {
         let open = self
             .runs
             .get_mut(pane_id)
@@ -1260,7 +1405,7 @@ impl RunTracker {
                 .map(|r| &mut r.run)
                 .find(|run| run.start_info.pane_id == pane_id && run.start_info.run_id == run_id)
         }) {
-            run.human_input(now);
+            run.human_input(now, kind);
         }
     }
 
@@ -1309,8 +1454,8 @@ impl RunTracker {
     /// interval and the run itself ended at `now`.
     fn finish(&mut self, mut run: ActiveRun, reason: EndReason, exit_code: Option<i32>, now: u64) {
         if let Some(held) = self.held_input.as_mut() {
-            for written in held(&run.start_info.pane_id, &run.start_info.run_id) {
-                run.human_input(written);
+            for (written, kind) in held(&run.start_info.pane_id, &run.start_info.run_id) {
+                run.human_input(written, kind);
             }
         }
         if let Some(open) = run.status.take() {
@@ -2030,10 +2175,10 @@ pub(crate) mod tests {
         tracker.begin_run(start("p1"), 0);
         let second = 1_000_000_000;
         for t in [1, 2, 3, 4] {
-            tracker.observe_human_input("p1", t * second);
+            tracker.observe_human_input("p1", t * second, InterventionKind::Text);
         }
-        tracker.observe_human_input("p1", 20 * second);
-        tracker.observe_human_input("unknown-pane", 21 * second);
+        tracker.observe_human_input("p1", 20 * second, InterventionKind::Text);
+        tracker.observe_human_input("unknown-pane", 21 * second, InterventionKind::Text);
         tracker.end_run("p1", EndReason::Closed, None, 30 * second);
         let spans = tracker.take_finished();
         let run = run_span_of(&spans);
@@ -2049,6 +2194,408 @@ pub(crate) mod tests {
             2
         );
         assert!(attr(run, AttrKey::ExitCode).is_none());
+    }
+
+    /// The `deck.intervention.kind` of each intervention on `pane`'s run,
+    /// ended at `end`.
+    fn kinds_at_end(tracker: &mut RunTracker, pane: &str, end: u64) -> (Vec<String>, i64) {
+        tracker.end_run(pane, EndReason::Closed, None, end);
+        let spans = tracker.take_finished();
+        let run = run_span_of(&spans);
+        let kinds = run
+            .events
+            .iter()
+            .filter(|e| e.name == EVENT_INTERVENTION)
+            .map(|e| {
+                let kinds: Vec<_> = e
+                    .attributes
+                    .iter()
+                    .filter(|a| a.key == AttrKey::InterventionKind)
+                    .collect();
+                match &kinds[..] {
+                    [a] => match &a.value {
+                        AttrValue::Str(kind) => kind.clone(),
+                        other => panic!("{other:?}"),
+                    },
+                    other => panic!("{other:?}"),
+                }
+            })
+            .collect();
+        let Some(AttrValue::Int(count)) = attr(run, AttrKey::InterventionsCount) else {
+            panic!("no intervention count");
+        };
+        (kinds, *count)
+    }
+
+    #[test]
+    fn a_burst_takes_its_strongest_kind() {
+        use InterventionKind::*;
+        let second = 1_000_000_000;
+        for (inputs, expected) in [
+            (vec![Navigate, Text], "text"),
+            (vec![Text, Navigate], "text"),
+            (vec![Text, Paste], "paste"),
+            (vec![Paste, Text, Interrupt, Navigate], "interrupt"),
+            (vec![Navigate], "navigate"),
+        ] {
+            let mut tracker = RunTracker::new();
+            tracker.begin_run(start("p1"), 0);
+            for (i, kind) in inputs.iter().enumerate() {
+                tracker.observe_human_input("p1", (i as u64 + 1) * second, *kind);
+            }
+            // A new burst starts with its own kind.
+            tracker.observe_human_input("p1", 30 * second, Navigate);
+            assert_eq!(
+                kinds_at_end(&mut tracker, "p1", 40 * second),
+                (vec![expected.to_string(), "navigate".to_string()], 2),
+                "{inputs:?}"
+            );
+        }
+    }
+
+    /// A stronger kind later in a burst rewrites only the kind of the burst's
+    /// event: the run's identity on it stays.
+    #[test]
+    fn a_stronger_kind_keeps_the_events_identity() {
+        let mut tracker = RunTracker::new();
+        let mut s = start("p1");
+        s.orchestration = Some(OrchestrationInfo {
+            role: Some("coder".into()),
+            name: Some("tdd".into()),
+            id: Some("orch-1".into()),
+            orchestrator: false,
+        });
+        tracker.begin_run(s, 0);
+        tracker.observe_human_input("p1", 1, InterventionKind::Text);
+        tracker.observe_human_input("p1", 2, InterventionKind::Interrupt);
+        tracker.end_run("p1", EndReason::Closed, None, 10);
+        let spans = tracker.take_finished();
+        let run = run_span_of(&spans);
+        let interventions: Vec<_> = run
+            .events
+            .iter()
+            .filter(|e| e.name == EVENT_INTERVENTION)
+            .collect();
+        let [event] = &interventions[..] else {
+            panic!("{:?}", run.events);
+        };
+        assert_eq!(
+            event.attributes,
+            vec![
+                Attribute::str(AttrKey::InterventionKind, "interrupt"),
+                Attribute::str(AttrKey::Agent, "claude"),
+                Attribute::str(AttrKey::Role, "coder"),
+                Attribute::str(AttrKey::OrchestrationId, "orch-1"),
+            ]
+        );
+    }
+
+    /// Past the per-run event cap a burst still moves the count, and a
+    /// stronger kind later in it rewrites nothing it did not keep.
+    #[test]
+    fn a_burst_past_the_event_cap_counts_without_an_event() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        let gap = INTERVENTION_COALESCE_NANOS + 1;
+        for i in 0..=MAX_EVENTS_PER_RUN as u64 {
+            tracker.observe_human_input("p1", (i + 1) * gap, InterventionKind::Navigate);
+        }
+        let last = (MAX_EVENTS_PER_RUN as u64 + 1) * gap;
+        tracker.observe_human_input("p1", last + 1, InterventionKind::Interrupt);
+        let (kinds, count) = kinds_at_end(&mut tracker, "p1", last + gap);
+        assert_eq!(count, MAX_EVENTS_PER_RUN as i64 + 1);
+        assert_eq!(kinds.len(), MAX_EVENTS_PER_RUN);
+        assert!(kinds.iter().all(|k| k == "navigate"), "{kinds:?}");
+    }
+
+    /// Input while the agent waits on a permission prompt or a question is an
+    /// answer; Ctrl+C or Escape then is still an interrupt; Claude's
+    /// `idle_prompt` notification is no prompt, so input after it keeps its
+    /// own kind.
+    #[test]
+    fn input_while_a_prompt_is_open_is_an_answer() {
+        let idle_prompt = || {
+            let mut e = event("p1", EventType::WaitingForInput);
+            e.metadata.insert(
+                crate::quota_block::NOTIFICATION_TYPE_METADATA_KEY.into(),
+                "idle_prompt".into(),
+            );
+            e
+        };
+        let permission_prompt = || {
+            let mut e = event("p1", EventType::WaitingForInput);
+            e.metadata.insert(
+                crate::quota_block::NOTIFICATION_TYPE_METADATA_KEY.into(),
+                "permission_prompt".into(),
+            );
+            e
+        };
+        for (wait, kind, expected) in [
+            (
+                event("p1", EventType::PermissionRequest),
+                InterventionKind::Text,
+                "answer",
+            ),
+            (
+                event("p1", EventType::WaitingForInput),
+                InterventionKind::Navigate,
+                "answer",
+            ),
+            (permission_prompt(), InterventionKind::Paste, "answer"),
+            (
+                event("p1", EventType::PermissionRequest),
+                InterventionKind::Interrupt,
+                "interrupt",
+            ),
+            (idle_prompt(), InterventionKind::Text, "text"),
+            (event("p1", EventType::Idle), InterventionKind::Text, "text"),
+        ] {
+            let mut tracker = RunTracker::new();
+            tracker.begin_run(start("p1"), 0);
+            tracker.observe_event(&event("p1", EventType::SessionStart), 1);
+            tracker.observe_event(&wait, 2);
+            tracker.observe_human_input("p1", 3, kind);
+            assert_eq!(
+                kinds_at_end(&mut tracker, "p1", 4),
+                (vec![expected.to_string()], 1),
+                "{:?} {:?}",
+                wait.event_type,
+                wait.metadata
+            );
+        }
+    }
+
+    /// Input is read against the prompt as the cards show it when the tracker
+    /// applies it, which is the order it is handed over in: a status applied
+    /// after it — often one the input itself caused — changes nothing, in
+    /// either direction.
+    #[test]
+    fn input_is_read_against_the_prompt_in_the_order_it_is_applied() {
+        for (before, after, expected) in [
+            // Answered, and the agent went back to work.
+            (EventType::PermissionRequest, EventType::Thinking, "answer"),
+            // Typed, and a prompt opened after.
+            (EventType::Thinking, EventType::PermissionRequest, "text"),
+        ] {
+            let mut tracker = RunTracker::new();
+            tracker.begin_run(start("p1"), 0);
+            tracker.observe_event(&event("p1", EventType::SessionStart), 1);
+            tracker.observe_event(&event("p1", before.clone()), 2);
+            tracker.observe_human_input("p1", 3, InterventionKind::Text);
+            tracker.observe_event(&event("p1", after.clone()), 4);
+            assert_eq!(
+                kinds_at_end(&mut tracker, "p1", 5),
+                (vec![expected.to_string()], 1),
+                "{before:?} then {after:?}"
+            );
+        }
+    }
+
+    /// What an event's producer stamped on it plays no part in reading the
+    /// prompt: a prompt that opens again with a stamp behind the ones before
+    /// it is open for the input applied after it.
+    #[test]
+    fn a_producer_stamp_does_not_place_a_prompt() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.observe_event(&event("p1", EventType::SessionStart), 1);
+        for (event_type, stamped, applied) in [
+            (EventType::PermissionRequest, 100, 100),
+            (EventType::Thinking, 101, 101),
+            (EventType::PermissionRequest, 99, 110),
+        ] {
+            let mut e = event("p1", event_type);
+            e.timestamp = chrono::DateTime::from_timestamp_nanos(stamped);
+            tracker.observe_event(&e, applied);
+        }
+        tracker.observe_human_input("p1", 103, InterventionKind::Text);
+        assert_eq!(
+            kinds_at_end(&mut tracker, "p1", 120),
+            (vec!["answer".to_string()], 1)
+        );
+    }
+
+    /// Input handed over with a time before the run's last input counts at
+    /// that last time, in the burst it joins: the last input never moves
+    /// backward, so later input is measured from it.
+    #[test]
+    fn the_last_input_never_moves_backward() {
+        let second = 1_000_000_000;
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.observe_human_input("p1", 11 * second, InterventionKind::Navigate);
+        tracker.observe_human_input("p1", second, InterventionKind::Text);
+        assert_eq!(tracker.runs["p1"].last_human_input, Some(11 * second));
+        tracker.observe_human_input("p1", 12 * second, InterventionKind::Navigate);
+        tracker.end_run("p1", EndReason::Closed, None, 20 * second);
+        let spans = tracker.take_finished();
+        let run = run_span_of(&spans);
+        let interventions: Vec<_> = run
+            .events
+            .iter()
+            .filter(|e| e.name == EVENT_INTERVENTION)
+            .map(|e| (e.time_unix_nanos, e.attributes[0].value.clone()))
+            .collect();
+        assert_eq!(
+            interventions,
+            vec![(11 * second, AttrValue::Str("text".into()))]
+        );
+    }
+
+    /// The deck's answer counts from when the daemon stamped its event, which
+    /// is when it accepted the answer, not from when the tracker applies it.
+    #[test]
+    fn a_deck_answer_counts_from_its_stamp() {
+        let second = 1_000_000_000;
+        let mut answered = event("p1", EventType::Thinking);
+        answered.metadata.insert(
+            crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY.into(),
+            crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_VALUE.into(),
+        );
+        answered.timestamp = chrono::DateTime::from_timestamp_nanos(11 * second as i64);
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.observe_human_input("p1", second, InterventionKind::Text);
+        tracker.observe_event(&answered, 15 * second);
+        tracker.observe_human_input("p1", 12 * second, InterventionKind::Text);
+        tracker.end_run("p1", EndReason::Closed, None, 20 * second);
+        let spans = tracker.take_finished();
+        let run = run_span_of(&spans);
+        let interventions: Vec<_> = run
+            .events
+            .iter()
+            .filter(|e| e.name == EVENT_INTERVENTION)
+            .map(|e| (e.time_unix_nanos, e.attributes[0].value.clone()))
+            .collect();
+        assert_eq!(
+            interventions,
+            vec![
+                (second, AttrValue::Str("text".into())),
+                (11 * second, AttrValue::Str("answer".into())),
+            ]
+        );
+    }
+
+    /// The deck's own "answered" event is an answer: a held question's answer
+    /// types nothing into the pane. Keys the deck typed for the same answer
+    /// coalesce with it into one.
+    #[test]
+    fn an_answer_from_the_deck_question_ui_is_an_answer() {
+        let answered = || {
+            let mut e = event("p1", EventType::Thinking);
+            e.metadata.insert(
+                crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY.into(),
+                crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_VALUE.into(),
+            );
+            e
+        };
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.observe_event(&answered(), 10);
+        assert_eq!(
+            kinds_at_end(&mut tracker, "p1", 20),
+            (vec!["answer".to_string()], 1)
+        );
+
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.observe_event(&event("p1", EventType::PermissionRequest), 1);
+        tracker.observe_human_input("p1", 10, InterventionKind::Text);
+        tracker.observe_event(&answered(), 11);
+        assert_eq!(
+            kinds_at_end(&mut tracker, "p1", 20),
+            (vec!["answer".to_string()], 1)
+        );
+
+        // A question the producer stopped waiting on is not an answer.
+        let mut released = event("p1", EventType::Unknown);
+        released.metadata.insert(
+            crate::event::QUESTION_RELEASED_BY_DECK_METADATA_KEY.into(),
+            crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_VALUE.into(),
+        );
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.observe_event(&released, 10);
+        assert_eq!(kinds_at_end(&mut tracker, "p1", 20), (vec![], 0));
+    }
+
+    /// The deck's "answered" event for a question it answers by typing keys
+    /// into the pane is not counted again: the keys counted as they were
+    /// written, however long before the event. A held question's answer types
+    /// nothing, so its event is the one count.
+    #[test]
+    fn a_deck_answer_counts_once_on_either_channel() {
+        let second = 1_000_000_000;
+        let asking = |channel: &str| {
+            let mut e = event("p1", EventType::PermissionRequest);
+            e.set_question(
+                &serde_json::from_value(serde_json::json!({
+                    "id": "q1",
+                    "kind": "permission",
+                    "questions": [{"prompt": "Allow?", "options": [
+                        {"index": 1, "label": "Yes", "role": "allow_once"},
+                        {"index": 2, "label": "No", "role": "deny"},
+                    ]}],
+                    "raised_at_ms": 1,
+                    "channel": channel,
+                }))
+                .unwrap(),
+            );
+            assert!(e.question().is_some(), "the fixture is a question");
+            e
+        };
+        let answered = || {
+            let mut e = event("p1", EventType::Thinking);
+            e.metadata.insert(
+                crate::event::QUESTION_RESOLVED_METADATA_KEY.into(),
+                "q1".into(),
+            );
+            e.metadata.insert(
+                crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY.into(),
+                crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_VALUE.into(),
+            );
+            e.timestamp = chrono::DateTime::from_timestamp_nanos(10 * second as i64);
+            e
+        };
+
+        // The deck typed the answer's last key more than the coalescing
+        // window before it broadcast the event.
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.observe_event(&event("p1", EventType::SessionStart), 1);
+        tracker.observe_event(&asking("keys"), 2);
+        tracker.observe_human_input("p1", 3 * second, InterventionKind::Text);
+        tracker.observe_event(&answered(), 10 * second);
+        assert_eq!(
+            kinds_at_end(&mut tracker, "p1", 20 * second),
+            (vec!["answer".to_string()], 1),
+            "keys channel"
+        );
+
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.observe_event(&event("p1", EventType::SessionStart), 1);
+        tracker.observe_event(&asking("held"), 2);
+        tracker.observe_event(&answered(), 10 * second);
+        assert_eq!(
+            kinds_at_end(&mut tracker, "p1", 20 * second),
+            (vec!["answer".to_string()], 1),
+            "held channel"
+        );
+
+        // A question asked again under its id on the held channel is answered
+        // without typing, whatever channel it was on before.
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.observe_event(&event("p1", EventType::SessionStart), 1);
+        tracker.observe_event(&asking("keys"), 2);
+        tracker.observe_event(&asking("held"), 3);
+        tracker.observe_event(&answered(), 10 * second);
+        assert_eq!(
+            kinds_at_end(&mut tracker, "p1", 20 * second),
+            (vec!["answer".to_string()], 1),
+            "re-asked on the held channel"
+        );
     }
 
     #[test]
@@ -2452,7 +2999,7 @@ pub(crate) mod tests {
                 e.agent_id = Some(format!("agent-{i}"));
                 tracker.observe_event(&e, i);
             }
-            tracker.observe_human_input(&pane, i);
+            tracker.observe_human_input(&pane, i, InterventionKind::Text);
             tracker.end_agent_run(
                 &pane,
                 Some(&format!("agent-{i}")),
@@ -3420,7 +3967,7 @@ pub(crate) mod tests {
             &shell("p1", EventType::ToolEnd, "Bash", Some("cargo fmt"), None),
             3,
         );
-        tracker.observe_human_input("p1", 4);
+        tracker.observe_human_input("p1", 4, InterventionKind::Text);
         tracker.observe_event(&checks_report("p1", 9, 1, "pending", (0, 0, 0)), 5);
         tracker.observe_event(&checks_report("p1", 9, 2, "passing", (1, 0, 0)), 6);
         tracker.end_run("p1", EndReason::Exited, None, 10);

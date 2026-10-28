@@ -277,6 +277,15 @@ jobs:
       # not set it, so its output must not contain it; a seam that leaked into
       # every bundle would ship to users with nothing saying so.
       - run: "! grep -rl __dadDriver dist/"
+      # Issue #1981 M10: the JUnit report, kept on green runs as well as red
+      # ones. Attempt-named for the reason spelled out on `build-macos`.
+      - name: Preserve this attempt's vitest results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: vitest-attempt-${{ github.run_attempt }}
+          path: desktop/junit/vitest.xml
+          if-no-files-found: warn
 
   # Issues #823 and #836 — the browser-level tier. `desktop-web` above runs ~296
   # vitest tests under `environment: "jsdom"`, and jsdom is a DOM implementation
@@ -583,6 +592,15 @@ jobs:
           # `?fixture=1` scenarios — so this is tidiness rather than a leak, but
           # nobody opens a failure trace from a PR that closed two months ago.
           retention-days: 7
+      # Issue #1981 M10: the JUnit report, kept on green runs as well as red
+      # ones. Attempt-named for the reason spelled out on `build-macos`.
+      - name: Preserve this attempt's browser test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: playwright-junit-attempt-${{ github.run_attempt }}
+          path: desktop/junit/playwright.xml
+          if-no-files-found: warn
 
   # Issue #953 — the driver rung, the one above `desktop-browser` on the ladder.
   # That job drives the built web bundle with fixture data; this one drives the
@@ -742,6 +760,15 @@ jobs:
           # Synthetic content — a sandbox daemon and a bash shell — so this is
           # tidiness rather than a leak.
           retention-days: 7
+      # Issue #1981 M10: the JUnit report, kept on green runs as well as red
+      # ones. Attempt-named for the reason spelled out on `build-macos`.
+      - name: Preserve this attempt's driver test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: desktop-driver-junit-attempt-${{ github.run_attempt }}
+          path: desktop/junit/driver.xml
+          if-no-files-found: warn
 
   # The Linux build, split for wall clock. Until the split, one `build` job ran
   # fmt, clippy, the release build, the fast tier and linkage-check one after
@@ -890,7 +917,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2
         with:
           tool: cargo-nextest@0.9.146
       # The Pi extension's Node suites run from the fast tier
@@ -1121,7 +1148,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2
         with:
           tool: cargo-nextest@0.9.146
       # The same Linux deps `clippy` installs, for the same reason: the archive
@@ -1194,7 +1221,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: 1.99.0
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2
         with:
           tool: cargo-nextest@0.9.146
       # The desktop crate's test binaries link these libraries at run time.
@@ -1599,7 +1626,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2
         with:
           tool: cargo-nextest@0.9.146
       - run: cargo build
@@ -1681,7 +1708,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2
         with:
           tool: cargo-nextest@0.9.146
       - run: cargo build
