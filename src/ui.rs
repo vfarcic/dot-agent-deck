@@ -22500,6 +22500,7 @@ fn collect_recent_prompts(session: &SessionState, max: usize) -> Vec<String> {
         .iter()
         .rev()
         .filter_map(|e| e.user_prompt.as_ref())
+        .filter(|p| !crate::injected_prompt::is_harness_turn(p))
         .take(max)
         .cloned()
         .collect();
