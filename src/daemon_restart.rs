@@ -685,6 +685,8 @@ pub struct RestartControl {
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RestartPause {
+    /// The reservation is taken; the stop check after it has not run yet.
+    AfterBeginning,
     /// Every check passed; `Accepted` is not written yet.
     BeforeAccepting,
     /// `Accepted` is written; the successor is not latched yet.

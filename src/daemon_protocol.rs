@@ -4840,18 +4840,25 @@ async fn handle_restart_daemon(
         verify_restart_target_pinned,
     };
 
-    // 1.
-    let guard = match restart.try_begin() {
-        Some(guard) if !stop_under_way(registry, restart) => guard,
-        _ => {
-            warn!("RestartDaemon refused: another restart or shutdown is already under way");
-            let resp = restart_refusal(
-                RestartRefusalReason::InProgress,
-                "another restart or shutdown of this daemon is already under way".into(),
-            );
-            return write_resp(stream, &resp).await;
-        }
+    // 1. A stop claimed after `try_begin` returned is refused with the lock
+    // in hand, so that refusal releases it before answering (#1950).
+    let in_progress = || {
+        warn!("RestartDaemon refused: another restart or shutdown is already under way");
+        restart_refusal(
+            RestartRefusalReason::InProgress,
+            "another restart or shutdown of this daemon is already under way".into(),
+        )
     };
+    let Some(guard) = restart.try_begin() else {
+        return write_resp(stream, &in_progress()).await;
+    };
+    #[cfg(test)]
+    restart
+        .checkpoint(crate::daemon_restart::RestartPause::AfterBeginning)
+        .await;
+    if stop_under_way(registry, restart) {
+        return answer_without_accepting(stream, restart, guard, None, &in_progress()).await;
+    }
 
     // 2.
     let (target, to_version) = match mode {
@@ -14295,6 +14302,59 @@ mod tests {
         match retry {
             RestartDaemonReply::Accepted { successor, .. } => {
                 assert_eq!(successor, RestartSuccessor::Installed)
+            }
+            other => panic!("expected Accepted once the stop was withdrawn, got {other:?}"),
+        }
+    }
+
+    /// Scenario: a client asks an idle daemon to restart, and a stop is
+    /// claimed just after the handler took its lock but before it checked for
+    /// a stop, so the restart is refused as "already under way". Held just
+    /// after writing that refusal, the stop is withdrawn and the daemon is
+    /// asked again at once: the retry is accepted, not refused by the finished
+    /// request's lock (#1950).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restart_refused_for_a_stop_claimed_after_its_lock_accepts_the_retry() {
+        let fx = RestartFixture::start().await;
+        let begun = fx
+            .restart
+            .pause_at(crate::daemon_restart::RestartPause::AfterBeginning);
+        let restarting = {
+            let client = fx.client();
+            tokio::spawn(async move { client.restart_daemon(RestartFixture::request(None)).await })
+        };
+        tokio::time::timeout(Duration::from_secs(30), begun.reached.notified())
+            .await
+            .expect("the handler took its lock");
+        let stop = fx.restart.claim_stop().expect("a stop can be claimed");
+        let answered = fx
+            .restart
+            .pause_at(crate::daemon_restart::RestartPause::AfterAnswering);
+        begun.resume.notify_one();
+        let reply = tokio::time::timeout(Duration::from_secs(30), restarting)
+            .await
+            .expect("the restart answered")
+            .unwrap();
+        match reply {
+            Ok(crate::daemon_client::GatedQuery::Answered(RestartDaemonReply::Refused {
+                reason,
+                ..
+            })) => assert_eq!(reason, RestartRefusalReason::InProgress),
+            other => panic!("expected Refused(InProgress) for the stop, got {other:?}"),
+        }
+        tokio::time::timeout(Duration::from_secs(30), answered.reached.notified())
+            .await
+            .expect("the refusing handler paused after its answer");
+        drop(stop);
+
+        let retry = tokio::time::timeout(Duration::from_secs(30), fx.restart(None))
+            .await
+            .expect("the retry is answered");
+        answered.resume.notify_one();
+        match retry {
+            RestartDaemonReply::Accepted { successor, .. } => {
+                assert_eq!(successor, RestartSuccessor::ClientSpawns)
             }
             other => panic!("expected Accepted once the stop was withdrawn, got {other:?}"),
         }
