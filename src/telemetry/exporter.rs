@@ -3190,6 +3190,80 @@ mod tests {
         assert_eq!(times, vec![written, written + 6_000_000_000]);
     }
 
+    /// The kinds of the intervention events on `spans`' run span.
+    fn intervention_kinds(spans: &[SpanRecord]) -> Vec<AttrValue> {
+        let run = spans.iter().find(|s| s.name == SPAN_AGENT_RUN).unwrap();
+        run.events
+            .iter()
+            .filter(|e| e.name == crate::telemetry::EVENT_INTERVENTION)
+            .filter_map(|e| {
+                e.attributes
+                    .iter()
+                    .find(|a| a.key == AttrKey::InterventionKind)
+                    .map(|a| a.value.clone())
+            })
+            .collect()
+    }
+
+    /// Input is written, then a status change is broadcast and applied before
+    /// the ingest task takes the input: the input's kind follows the prompt
+    /// in force when it was written, in both directions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_status_applied_before_the_input_is_taken_does_not_change_its_kind() {
+        // Stamped when sent, as a producer stamps them.
+        let now = |agent: &str, event_type| {
+            let mut msg = of("p1", agent, event_type);
+            if let BroadcastMsg::Event(e) = &mut msg {
+                e.timestamp = chrono::Utc::now();
+            }
+            msg
+        };
+        for (agent, before, after, expected) in [
+            (
+                "a1",
+                EventType::PermissionRequest,
+                EventType::Thinking,
+                "answer",
+            ),
+            (
+                "a2",
+                EventType::Thinking,
+                EventType::PermissionRequest,
+                "text",
+            ),
+        ] {
+            let (telemetry, mut rx) = capturing(ProbeSettings::default());
+            let shared = Arc::clone(&telemetry.exporting.as_ref().unwrap().shared);
+            let (tx, events) = broadcast::channel(16);
+            telemetry.subscribe(events);
+            begin(&telemetry, generation("p0", "other"), &[]);
+            begin(&telemetry, generation("p1", agent), &[]);
+            tx.send(now(agent, EventType::SessionStart)).unwrap();
+            tx.send(now(agent, before.clone())).unwrap();
+            telemetry.settled().await;
+
+            // An Escape on another pane holds the ingest task in its timer
+            // branch while the key is written and the status broadcast.
+            let (entered, picked) = oneshot::channel();
+            let (resume, paused) = std::sync::mpsc::channel();
+            *shared.timer_gate.lock().unwrap() = Some((entered, paused));
+            telemetry.observe_client_input("p0", b"\x1b");
+            picked.await.unwrap();
+            telemetry.observe_client_input("p1", b"y");
+            tx.send(now(agent, after.clone())).unwrap();
+            resume.send(()).unwrap();
+
+            telemetry.settled().await;
+            telemetry.end_run("p1", Some(agent), EndReason::Exited, None);
+            telemetry.settled().await;
+            assert_eq!(
+                intervention_kinds(&captured(&mut rx)),
+                vec![AttrValue::Str(expected.into())],
+                "{before:?} then {after:?}"
+            );
+        }
+    }
+
     /// Threads 4 / 10: a run's end is stamped when the ingest task applies
     /// it, after the statuses broadcast before it, so no status starts or ends
     /// after its run, nor does any event on the run.

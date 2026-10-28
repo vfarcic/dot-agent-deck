@@ -136,7 +136,7 @@ A run with many changes keeps its first 1024 events; the two counts keep countin
 
 What the kind cannot tell apart:
 
-- **A paste** counts as `paste` only when the agent has asked your terminal to mark pastes (bracketed paste). Otherwise it arrives exactly like fast typing and counts as `text`. Voice dictation into a pane counts as `text` too.
+- **A paste** counts as `paste` only when the agent has asked your terminal to mark pastes (bracketed paste). Otherwise it arrives exactly like fast typing and counts as `text`. Everything inside a marked paste counts as the paste, even a Ctrl+C or Escape character in the pasted text. Voice dictation into a pane counts as `text` too.
 - **An answer you type** counts as `answer` only while the card shows **Needs Input**, so it follows what each agent reports: see the **Needs Input** rows in [Session management](session-management.md#which-agents-report-which-status). A question the agent asked in its reply text, with no prompt, is answered with `text`. Claude Code's reminder that it is waiting for your next prompt, which arrives after a turn ends, is not a question: what you type after it counts by what you typed.
 - **Mouse clicks and scrolling** count as `navigate` when the client sends them to the agent, which depends on whether the agent asked for the mouse. Scrolling back through the client's own history of the pane is not counted.
 
