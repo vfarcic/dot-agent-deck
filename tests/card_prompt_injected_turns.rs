@@ -124,3 +124,29 @@ fn prompt_002_prompts_typed_after_an_injected_turn_still_reach_the_card() {
     assert_eq!(session.last_user_prompt.as_deref(), Some("ship it"));
     assert_eq!(session.first_prompts, vec!["ship it".to_string()]);
 }
+
+/// Scenario: A card is restored from a daemon snapshot whose last prompt is a
+/// `<task-notification>` turn (an older daemon kept it) and has no prompt
+/// event of its own yet. The card's prompt line shows no part of the
+/// notification.
+#[spec("dashboard/prompt/003")]
+#[test]
+fn prompt_003_a_restored_injected_prompt_is_not_shown() {
+    let mut state = AppState::default();
+    state.register_pane(PANE_ID.to_string());
+    let mut start = prompt_event(TYPED_PROMPT, Utc::now());
+    start.event_type = EventType::SessionStart;
+    start.user_prompt = None;
+    state.apply_event(start);
+    state
+        .sessions
+        .get_mut(SESSION_ID)
+        .expect("the card exists")
+        .last_user_prompt = Some(TASK_NOTIFICATION.to_string());
+
+    let card = card_text(&state, CardDensityKind::Normal);
+    assert!(
+        !card.contains("task-notification") && !card.contains("task-id"),
+        "a restored injected turn must not reach the card:\n{card}"
+    );
+}

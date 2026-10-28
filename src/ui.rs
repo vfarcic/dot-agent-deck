@@ -22508,6 +22508,7 @@ fn collect_recent_prompts(session: &SessionState, max: usize) -> Vec<String> {
 
     if prompts.is_empty()
         && let Some(ref p) = session.last_user_prompt
+        && !crate::injected_prompt::is_harness_turn(p)
     {
         prompts.push(p.clone());
     }

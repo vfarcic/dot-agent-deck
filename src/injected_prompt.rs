@@ -17,6 +17,18 @@
 //! command the user typed is a typed prompt and matches none of them. A deck
 //! message is labelled before it gets here ([`crate::inbox_prompt`]), so its
 //! `✉` label matches none of them either.
+//!
+//! What was found for the other agents (CLAUDE.md rule 20):
+//!
+//! - OpenCode marks the text it adds to a user message itself `synthetic`; the
+//!   deck's plugin does not report it ([`crate::opencode_manage`]), so it never
+//!   reaches this check.
+//! - Pi starts its own runs from `custom` messages, which carry no prompt the
+//!   deck's extension could report.
+//! - Codex (`<subagent_notification>`) and Devin
+//!   (`<subagent_completion_notification>`) have notification wrappers of their
+//!   own, but nothing has shown either one arriving through `UserPromptSubmit`,
+//!   so neither is listed.
 
 /// The openings of the turns a harness submits through the prompt hook.
 ///
@@ -27,11 +39,17 @@ const HARNESS_TURN_OPENERS: &[&str] = &["<task-notification>"];
 
 /// Whether `prompt` is a turn the agent's harness submitted, not one a person
 /// typed.
+///
+/// The opener must be followed by the notification's first child tag, as every
+/// such turn is, so a person's prompt that merely starts with the tag's text
+/// is still theirs.
 pub fn is_harness_turn(prompt: &str) -> bool {
     let prompt = prompt.trim_start();
-    HARNESS_TURN_OPENERS
-        .iter()
-        .any(|opener| prompt.starts_with(opener))
+    HARNESS_TURN_OPENERS.iter().any(|opener| {
+        prompt
+            .strip_prefix(opener)
+            .is_some_and(|rest| rest.trim_start().starts_with('<'))
+    })
 }
 
 #[cfg(test)]
@@ -55,6 +73,8 @@ mod tests {
             "/review 42",
             "✉ build finished",
             "explain <task-notification> to me",
+            "<task-notification> what does this tag mean?",
+            "<task-notification>",
             "<task-notifications> are noisy",
             "",
         ] {
