@@ -293,6 +293,9 @@ struct ActiveRun {
     ci_pr: Option<PrKey>,
     /// What this run's card last showed of that pull request's checks.
     ci_seen: Option<CiState>,
+    /// The report revision and time from which this run's card has shown
+    /// those checks pending, while it does.
+    ci_pending_since: Option<(u64, u64)>,
     /// Rounds of that pull request's checks this run's card saw go from
     /// pending to a result, and how many of them failed: what this run
     /// observed, so runs holding the same pull request each count the same
@@ -340,12 +343,22 @@ impl PrKey {
 /// one increasing counter ([`crate::pull_request::next_revision`]), so a
 /// report whose revision is lower than the newest folded in is history the
 /// state has moved past, and is left out.
+///
+/// **Leaving a report out does not leave its round out.** A newer report can
+/// be a result whose pending phase the shared state never saw, so the rounds
+/// it did record are kept as revision intervals ([`RecordedRounds`]), and a
+/// run whose own card saw a round that none of them, nor the open stretch,
+/// overlaps records that round itself ([`RunTracker::observe_ci`]).
 #[derive(Default)]
 struct SharedCi {
     ci: PrCi,
     /// The highest report revision folded into `ci`. `0` until one with a
     /// revision is: a report with none is folded by arrival.
     revision: u64,
+    /// The revision of the report that opened the open stretch.
+    open_since: u64,
+    /// The rounds recorded for the pull request.
+    rounds: RecordedRounds,
     /// The runs holding it, by run id, the longest-holding first. That one
     /// takes its `deck.ci.change` events, and a stretch that opens goes in its
     /// trace.
@@ -360,6 +373,34 @@ struct SharedCi {
 struct ReleasedCi {
     revision: u64,
     settled: Option<CiState>,
+    rounds: RecordedRounds,
+}
+
+/// The stretches recorded for one pull request, as the revisions of the
+/// reports that opened and ended them: the newest [`MAX_RECORDED_ROUNDS`],
+/// and below `floor` every older one, which counts as overlapping anything
+/// that starts there.
+#[derive(Default)]
+struct RecordedRounds {
+    rounds: VecDeque<(u64, u64)>,
+    floor: u64,
+}
+
+impl RecordedRounds {
+    fn record(&mut self, from: u64, to: u64) {
+        if self.rounds.len() >= MAX_RECORDED_ROUNDS
+            && let Some((_, oldest)) = self.rounds.pop_front()
+        {
+            self.floor = self.floor.max(oldest);
+        }
+        self.rounds.push_back((from, to));
+    }
+
+    /// Whether a round seen from revision `from` to `to` overlaps one already
+    /// recorded.
+    fn covers(&self, from: u64, to: u64) -> bool {
+        from <= self.floor || self.rounds.iter().any(|&(a, b)| a <= to && from <= b)
+    }
 }
 
 /// A unit being spawned: see [`RunTracker::begin_dispatch`].
@@ -378,6 +419,10 @@ pub const MAX_DISPATCHED_ORCHESTRATIONS: usize = 256;
 /// Pull requests no open run holds that the tracker keeps a
 /// [`ReleasedCi`] for. Past it the one with the oldest report is forgotten.
 pub const MAX_RELEASED_PULL_REQUESTS: usize = 256;
+
+/// Recorded stretches one pull request keeps the revisions of
+/// ([`RecordedRounds`]).
+pub const MAX_RECORDED_ROUNDS: usize = 16;
 
 /// The run a stretch of pending checks opened in.
 struct StretchOpener {
@@ -694,6 +739,7 @@ impl RunTracker {
                 seen_call_ids: VecDeque::new(),
                 ci_pr: None,
                 ci_seen: None,
+                ci_pending_since: None,
                 ci_rounds: 0,
                 ci_failures: 0,
                 usage: Some(usage),
@@ -873,7 +919,10 @@ impl RunTracker {
     /// told it: the run joins that pull request's shared CI state, and lets go
     /// of the one it held before. The run counts a round it saw end; the
     /// shared state takes the report only when it is not older than the
-    /// newest one it already took ([`SharedCi`]).
+    /// newest one it already took ([`SharedCi`]). A round the run saw end
+    /// that overlaps no recorded round and not the open stretch is recorded
+    /// as the run saw it, in the run's trace, and leaves the shared state as
+    /// it is.
     fn observe_ci(
         &mut self,
         pane_id: &str,
@@ -889,6 +938,7 @@ impl RunTracker {
         let held = std::mem::replace(&mut run.ci_pr, key.clone());
         if held != key {
             run.ci_seen = None;
+            run.ci_pending_since = None;
             if let Some(held) = held {
                 let identity = child_identity(run);
                 self.release_ci(&held, &run_id, identity, now);
@@ -898,6 +948,9 @@ impl RunTracker {
             return;
         };
         let seen = checks.and_then(|checks| CiState::from_checks(checks.state));
+        // The round this report ended as the run's card saw it: from the
+        // revision and time its pending began, to this result.
+        let mut ended = None;
         if let Some(seen) = seen
             && let Some(run) = self.runs.get_mut(pane_id)
         {
@@ -906,6 +959,9 @@ impl RunTracker {
                 if seen == CiState::Failing {
                     run.ci_failures += 1;
                 }
+                ended = run.ci_pending_since.take().map(|since| (since, seen));
+            } else if seen == CiState::Pending && run.ci_seen != Some(CiState::Pending) {
+                run.ci_pending_since = Some((revision, now));
             }
             run.ci_seen = Some(seen);
         }
@@ -916,24 +972,46 @@ impl RunTracker {
         if !shared.holders.contains(&run_id) {
             shared.holders.push(run_id);
         }
-        if revision != 0 && revision < shared.revision {
-            self.ci.insert(key, shared);
-            return;
+        if revision == 0 || revision >= shared.revision {
+            shared.revision = shared.revision.max(revision);
+            let was_open = shared.ci.is_open();
+            let effects = shared
+                .ci
+                .observe(Some(key.number), checks, now, new_span_id);
+            if shared.ci.is_open() && shared.opener.is_none() {
+                shared.opener = self.run_by_id(&shared.holders[0]).map(|run| StretchOpener {
+                    run_id: run.start_info.run_id.clone(),
+                    trace_id: run.trace_id,
+                    span_id: run.span_id,
+                    identity: child_identity(run),
+                });
+            }
+            let reopened = effects
+                .iter()
+                .any(|effect| matches!(effect, CiEffect::Ended { .. }));
+            for effect in effects {
+                self.record_ci(&mut shared, effect, now);
+            }
+            if shared.ci.is_open() && (!was_open || reopened) {
+                shared.open_since = revision;
+            }
         }
-        shared.revision = shared.revision.max(revision);
-        let effects = shared
-            .ci
-            .observe(Some(key.number), checks, now, new_span_id);
-        if shared.ci.is_open() && shared.opener.is_none() {
-            shared.opener = self.run_by_id(&shared.holders[0]).map(|run| StretchOpener {
-                run_id: run.start_info.run_id.clone(),
-                trace_id: run.trace_id,
-                span_id: run.span_id,
-                identity: child_identity(run),
-            });
-        }
-        for effect in effects {
-            self.record_ci(&mut shared, effect, now);
+        if let Some(((from, start), result)) = ended
+            && from != 0
+            && revision != 0
+            && !shared.rounds.covers(from, revision)
+            && !(shared.ci.is_open() && shared.open_since <= revision)
+            && let Some(run) = self.runs.get(pane_id)
+        {
+            shared.rounds.record(from, revision);
+            self.finished.push(ci_span(
+                (run.trace_id, run.span_id, child_identity(run)),
+                new_span_id(),
+                (start, now),
+                key.number,
+                Some(result),
+                checks,
+            ));
         }
         self.ci.insert(key, shared);
     }
@@ -951,6 +1029,7 @@ impl RunTracker {
                 .map(|settled| PrCi::resumed(key.number, settled))
                 .unwrap_or_default(),
             revision: released.revision,
+            rounds: released.rounds,
             ..SharedCi::default()
         }
     }
@@ -987,6 +1066,7 @@ impl RunTracker {
             ReleasedCi {
                 revision: shared.revision,
                 settled: shared.ci.settled(),
+                rounds: shared.rounds,
             },
         );
     }
@@ -1017,44 +1097,24 @@ impl RunTracker {
                 result,
                 checks,
             } => {
+                if shared.open_since != 0 {
+                    shared.rounds.record(shared.open_since, shared.revision);
+                }
                 let Some(opener) = shared.opener.take() else {
                     return;
                 };
-                let mut attributes = match self.run_by_id(&opener.run_id) {
+                let identity = match self.run_by_id(&opener.run_id) {
                     Some(run) => child_identity(run),
                     None => opener.identity,
                 };
-                attributes.push(Attribute::int(
-                    AttrKey::PrNumber,
-                    saturating_i64(stretch.pr),
+                self.finished.push(ci_span(
+                    (opener.trace_id, opener.span_id, identity),
+                    stretch.span_id,
+                    (stretch.start, now),
+                    stretch.pr,
+                    result,
+                    checks,
                 ));
-                if let Some(result) = result {
-                    attributes.push(Attribute::str(AttrKey::CiResult, result.as_str()));
-                }
-                if let Some(checks) = checks {
-                    attributes.push(Attribute::int(
-                        AttrKey::CiChecksPassing,
-                        i64::from(checks.passing),
-                    ));
-                    attributes.push(Attribute::int(
-                        AttrKey::CiChecksFailing,
-                        i64::from(checks.failing),
-                    ));
-                    attributes.push(Attribute::int(
-                        AttrKey::CiChecksSkipped,
-                        i64::from(checks.skipped),
-                    ));
-                }
-                self.finished.push(SpanRecord {
-                    trace_id: opener.trace_id,
-                    span_id: stretch.span_id,
-                    parent_span_id: Some(opener.span_id),
-                    name: SPAN_AGENT_CI,
-                    start_unix_nanos: stretch.start,
-                    end_unix_nanos: now.max(stretch.start),
-                    attributes,
-                    events: Vec::new(),
-                });
             }
         }
     }
@@ -1611,6 +1671,47 @@ fn status_span(run: &ActiveRun, open: OpenStatus, now: u64) -> SpanRecord {
         name: SPAN_AGENT_STATUS,
         start_unix_nanos: open.start,
         end_unix_nanos: now.max(open.start),
+        attributes,
+        events: Vec::new(),
+    }
+}
+
+/// An `agent.ci` span for a stretch of pending checks of pull request `pr`
+/// over `(start, end)`, in the trace of the run `(trace, parent, identity)`
+/// names, ending in `result` with `checks`.
+fn ci_span(
+    (trace_id, parent, mut attributes): (TraceId, SpanId, Vec<Attribute>),
+    span_id: SpanId,
+    (start, end): (u64, u64),
+    pr: u64,
+    result: Option<CiState>,
+    checks: Option<crate::pull_request_info::PullRequestChecks>,
+) -> SpanRecord {
+    attributes.push(Attribute::int(AttrKey::PrNumber, saturating_i64(pr)));
+    if let Some(result) = result {
+        attributes.push(Attribute::str(AttrKey::CiResult, result.as_str()));
+    }
+    if let Some(checks) = checks {
+        attributes.push(Attribute::int(
+            AttrKey::CiChecksPassing,
+            i64::from(checks.passing),
+        ));
+        attributes.push(Attribute::int(
+            AttrKey::CiChecksFailing,
+            i64::from(checks.failing),
+        ));
+        attributes.push(Attribute::int(
+            AttrKey::CiChecksSkipped,
+            i64::from(checks.skipped),
+        ));
+    }
+    SpanRecord {
+        trace_id,
+        span_id,
+        parent_span_id: Some(parent),
+        name: SPAN_AGENT_CI,
+        start_unix_nanos: start,
+        end_unix_nanos: end.max(start),
         attributes,
         events: Vec::new(),
     }
@@ -3604,6 +3705,90 @@ pub(crate) mod tests {
             ],
             "no copy of the first round's changes"
         );
+    }
+
+    /// Issue #1981 M3: a run prepared while its card watched a round go from
+    /// pending to passing opens only after another run's card first showed
+    /// the pull request already passing, under a newer revision. Both its
+    /// replayed reports are older than that, so the shared state stays
+    /// passing, but no recorded round overlaps the one its card saw: that
+    /// round is recorded once, as its card saw it, in its own trace.
+    #[test]
+    fn a_round_another_run_saw_only_the_result_of_is_recorded_once() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.prepare_run(start("p2"), 0);
+        for pane in ["p1", "p2"] {
+            tracker.observe_event(&event(pane, EventType::SessionStart), 1);
+        }
+        tracker.observe_event(&checks_report("p2", 9, 1, "pending", (0, 0, 0)), 10);
+        tracker.observe_event(&checks_report("p2", 9, 2, "passing", (3, 0, 1)), 20);
+        tracker.observe_event(&checks_report("p1", 9, 3, "passing", (3, 0, 1)), 21);
+        tracker.commit_run("run-p2");
+        tracker.end_run("p1", EndReason::Exited, None, 30);
+        tracker.end_run("p2", EndReason::Exited, None, 30);
+        let spans = tracker.take_finished();
+        assert_eq!(
+            ci_record(&spans, &["p1", "p2"]),
+            (1, vec![1, 0], vec![Some(0), Some(1)])
+        );
+        let span = ci_spans(&spans)[0];
+        assert_eq!((span.start_unix_nanos, span.end_unix_nanos), (10, 20));
+        assert_eq!(span.parent_span_id, Some(run_span_on(&spans, "p2").span_id));
+        assert_eq!(
+            attr(span, AttrKey::CiResult),
+            Some(&AttrValue::Str("passing".into()))
+        );
+        assert_eq!(
+            attr(span, AttrKey::CiChecksPassing),
+            Some(&AttrValue::Int(3))
+        );
+    }
+
+    /// Issue #1981 M3: the same, except the first run's card also saw the
+    /// round's pending phase, before the prepared run's did. The round the
+    /// shared state recorded overlaps the one the prepared run's card saw, so
+    /// it is still recorded once.
+    #[test]
+    fn a_round_another_run_saw_whole_is_not_recorded_again() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.prepare_run(start("p2"), 0);
+        for pane in ["p1", "p2"] {
+            tracker.observe_event(&event(pane, EventType::SessionStart), 1);
+        }
+        tracker.observe_event(&checks_report("p1", 9, 1, "pending", (0, 0, 0)), 9);
+        tracker.observe_event(&checks_report("p2", 9, 2, "pending", (0, 0, 0)), 10);
+        tracker.observe_event(&checks_report("p2", 9, 3, "passing", (3, 0, 0)), 20);
+        tracker.observe_event(&checks_report("p1", 9, 4, "passing", (3, 0, 0)), 21);
+        tracker.commit_run("run-p2");
+        tracker.end_run("p1", EndReason::Exited, None, 30);
+        tracker.end_run("p2", EndReason::Exited, None, 30);
+        let spans = tracker.take_finished();
+        assert_eq!(
+            ci_record(&spans, &["p1", "p2"]),
+            (1, vec![2, 0], vec![Some(1), Some(1)])
+        );
+        let span = ci_spans(&spans)[0];
+        assert_eq!((span.start_unix_nanos, span.end_unix_nanos), (9, 21));
+        assert_eq!(span.parent_span_id, Some(run_span_on(&spans, "p1").span_id));
+    }
+
+    /// Issue #1981 M3: a pull request keeps the revisions of its newest
+    /// [`MAX_RECORDED_ROUNDS`] rounds, and counts every older one as
+    /// overlapping a round that starts before them.
+    #[test]
+    fn recorded_rounds_are_bounded_and_cover_what_they_forgot() {
+        let mut rounds = RecordedRounds::default();
+        for n in 0..MAX_RECORDED_ROUNDS as u64 + 1 {
+            rounds.record(10 * n + 1, 10 * n + 2);
+        }
+        assert_eq!(rounds.rounds.len(), MAX_RECORDED_ROUNDS);
+        assert!(rounds.covers(1, 2), "the forgotten round");
+        assert!(rounds.covers(12, 15));
+        assert!(rounds.covers(5, 11));
+        assert!(!rounds.covers(13, 20));
+        assert!(!rounds.covers(10 * MAX_RECORDED_ROUNDS as u64 + 3, u64::MAX));
     }
 
     /// Issue #1981 M6: a run prepared in the worktree of a unit being
