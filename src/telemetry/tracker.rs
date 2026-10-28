@@ -267,6 +267,11 @@ struct PendingRun {
     /// Its agent already ended, before the run was committed: how and when,
     /// applied by [`RunTracker::commit_run`] once the run opens.
     ended: Option<(EndReason, Option<i32>, u64)>,
+    /// Issue #1981 M7: tasks this run's agent delegated before the run
+    /// opened, each with how many of `events` were held before it, so
+    /// [`RunTracker::commit_run`] opens each hand-off in its place among
+    /// them ([`RunTracker::place_post`]).
+    posts: Vec<(usize, Posted)>,
     /// The dispatched unit it belongs to, when known before it opens
     /// ([`RunTracker::begin_dispatch`]).
     dispatch_name: Option<String>,
@@ -703,6 +708,7 @@ impl RunTracker {
                 events: Vec::new(),
                 usage_dirs: UsageDirs::default(),
                 ended: None,
+                posts: Vec::new(),
                 dispatch_name,
             });
     }
@@ -792,10 +798,26 @@ impl RunTracker {
         }
     }
 
-    /// The agent of the prepared run `run_id` did not start: forget the run.
+    /// The agent of the prepared run `run_id` did not start: forget the run,
+    /// after opening the hand-offs of any task held for it.
     pub fn abort_run(&mut self, run_id: &str) {
+        self.release_posts(run_id);
         if let Some(pending) = self.pending.remove(run_id) {
             pending.forget();
+        }
+    }
+
+    /// Issue #1981 M7: open the hand-off of each task held for the prepared
+    /// run `run_id`, which will not open: while the run is still known, so
+    /// each keeps its run id, though there is no run span to parent it.
+    fn release_posts(&mut self, run_id: &str) {
+        let posts = self
+            .pending
+            .get_mut(run_id)
+            .map(|p| std::mem::take(&mut p.posts))
+            .unwrap_or_default();
+        for (_, posted) in posts {
+            self.delegate_posted(posted);
         }
     }
 
@@ -813,8 +835,17 @@ impl RunTracker {
             run.context = pending.context;
             run.dispatch_name = pending.dispatch_name;
         }
-        for (event, at) in pending.events {
+        // Each task posted in its place among the events, so one posted
+        // before a close is opened in the run before the close ends it.
+        let mut posts = pending.posts.into_iter().peekable();
+        for (held, (event, at)) in pending.events.into_iter().enumerate() {
+            while let Some((_, posted)) = posts.next_if(|(before, _)| *before <= held) {
+                self.delegate_posted(posted);
+            }
             self.observe_kept(event, at);
+        }
+        for (_, posted) in posts {
+            self.delegate_posted(posted);
         }
         if let Some((reason, exit_code, at)) = pending.ended {
             self.end_run(&pane_id, reason, exit_code, at);
@@ -1552,6 +1583,10 @@ impl RunTracker {
     /// shutdown. A replaced run still waiting for its own end ends as
     /// [`EndReason::Unknown`], at the time it was replaced.
     pub fn end_all(&mut self, reason: EndReason, now: u64) {
+        let prepared: Vec<String> = self.pending.keys().cloned().collect();
+        for run_id in prepared {
+            self.release_posts(&run_id);
+        }
         for (_, pending) in self.pending.drain() {
             pending.forget();
         }
@@ -1595,18 +1630,31 @@ impl RunTracker {
             .posted(posted, orchestrator, worker, &run_of, &mut self.finished);
     }
 
-    /// Issue #1981 M7: whether `posted` can be applied as its place on the
-    /// broadcast comes: not while its orchestrator's run is prepared and not
-    /// opened yet, when the hand-off would miss the run's trace.
-    pub fn takes_post(&self, posted: &Posted) -> bool {
-        run_ref(
+    /// Issue #1981 M7: the delegate path posted a task, and its place on the
+    /// broadcast has come: open its hand-off now, or, while its
+    /// orchestrator's run is prepared and not opened yet, hold it with that
+    /// run's events, after the ones held so far, for
+    /// [`Self::commit_run`] to open in that place. Opened now, the hand-off
+    /// would miss the run's trace; opened after the events held, it would
+    /// miss a run they end.
+    pub fn place_post(&mut self, posted: Posted) {
+        let prepared = run_ref(
             &self.runs,
             &self.replaced,
             &self.pending,
             &posted.orchestrator_pane,
             posted.orchestrator_agent_id.as_deref(),
         )
-        .is_none_or(|run| run.span.is_some())
+        .filter(|run| run.span.is_none())
+        .and_then(|run| self.pending.get_mut(&run.run_id))
+        .filter(|pending| pending.posts.len() < MAX_PENDING_EVENTS);
+        match prepared {
+            Some(pending) => {
+                let before = pending.events.len();
+                pending.posts.push((before, posted));
+            }
+            None => self.delegate_posted(posted),
+        }
     }
 
     /// Issue #1981 M7: apply one inbox state change from the daemon's
