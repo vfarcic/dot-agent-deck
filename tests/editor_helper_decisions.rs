@@ -39,7 +39,7 @@ fn nothing_on_path(_: &OsStr) -> bool {
     false
 }
 
-/// Scenario: Split editor values the way each agent does: Claude Code's on literal spaces, Codex's by shell words with single and double quotes and backslashes. Values holding `;`, `$(…)`, backticks, pipes and redirections come back as literal words, never evaluated, and an unterminated quote or a trailing backslash is no command at all.
+/// Scenario: Split editor values the way each agent does: Claude Code's on literal spaces, Codex's by shell words with single and double quotes and backslashes, as Codex's own `shlex::split` does. A backslash-newline outside quotes or inside double quotes joins the lines, and a `#` starting a word comments out the rest of its line, while a quoted or mid-word `#` is a byte. Values holding `;`, `$(…)`, backticks, pipes and redirections come back as literal words, never evaluated, and an unterminated quote or a trailing backslash is no command at all.
 #[spec("inbox/probe/013")]
 #[test]
 fn probe_013_values_are_split_literally() {
@@ -70,6 +70,23 @@ fn probe_013_values_are_split_literally() {
     );
     assert_eq!(shell("ed ''"), Some(words(&["ed", ""])));
     assert_eq!(shell(" \t\n"), Some(vec![]));
+    assert_eq!(
+        shell("vim\\\n -u NONE"),
+        Some(words(&["vim", "-u", "NONE"]))
+    );
+    assert_eq!(
+        shell("\"vi\\\nm\" -u \\\nNONE"),
+        Some(words(&["vim", "-u", "NONE"]))
+    );
+    assert_eq!(
+        shell("vim # it's a note\n-u NONE"),
+        Some(words(&["vim", "-u", "NONE"]))
+    );
+    assert_eq!(shell("# vim"), Some(vec![]));
+    assert_eq!(
+        shell("vim '#x' a#b \"#y\" \\#z"),
+        Some(words(&["vim", "#x", "a#b", "#y", "#z"]))
+    );
     assert_eq!(shell("ed 'open"), None);
     assert_eq!(shell("ed \"open"), None);
     assert_eq!(shell("ed \\"), None);
@@ -122,13 +139,20 @@ fn probe_013_claude_code_chooses_as_claude_does() {
         pick(user, &saved(Some(&helper), Some("nano")), &[]),
         Ok(words(&["nano"]))
     );
+    // Claude Code splits on spaces alone, so a quoted helper path is
+    // another program, whose name keeps its quotes.
+    let quoted = format!("'/x/{HELPER_NAME}'");
+    assert_eq!(
+        pick(user, &saved(Some(&quoted), Some("nano")), &[]),
+        Ok(words(&[&quoted]))
+    );
     assert_eq!(
         pick(user, &saved(Some(&helper), Some(&helper)), &["vi"]),
         Ok(words(&["vi"]))
     );
 }
 
-/// Scenario: Choose Codex's editor: on the user's route a set `VISUAL` wins, an empty one is an error rather than a fallback, an unset one falls back to `EDITOR` with the same rule, neither set is an error, and one of blanks alone is no command; on a tool's route empty values are skipped. Values are shell words, and one naming the helper counts as unset.
+/// Scenario: Choose Codex's editor: on the user's route a set `VISUAL` wins, an empty one is an error rather than a fallback, an unset one falls back to `EDITOR` with the same rule, neither set is an error, and one of blanks alone or a comment alone is no command; on a tool's route empty values are skipped. Values are shell words, and one whose first shell word names the helper counts as unset, quoted or escaped included.
 #[spec("inbox/probe/013")]
 #[test]
 fn probe_013_codex_chooses_as_codex_does() {
@@ -164,11 +188,33 @@ fn probe_013_codex_chooses_as_codex_does() {
         pick(Route::Tool, &saved(Some(""), Some(""))),
         Err(NoEditor::Unset)
     );
-    let helper = HELPER_NAME.to_string();
     assert_eq!(
-        pick(user, &saved(Some(&helper), Some("nano"))),
-        Ok(words(&["nano"]))
+        pick(user, &saved(Some("# vim"), Some("nano"))),
+        Err(NoEditor::Unsplittable)
     );
+    let escaped = HELPER_NAME.replacen('-', "\\-", 1);
+    for helper in [
+        HELPER_NAME.to_string(),
+        format!("'/x/{HELPER_NAME}' --flag"),
+        format!("\"/x y/{HELPER_NAME}\""),
+        format!("/x/{escaped}"),
+    ] {
+        assert_eq!(
+            pick(user, &saved(Some(&helper), Some("nano"))),
+            Ok(words(&["nano"])),
+            "{helper}"
+        );
+        assert_eq!(
+            editor_command(
+                Kind::Learned,
+                user,
+                &saved(Some(&helper), Some("nano")),
+                nothing_on_path
+            ),
+            Ok(words(&["nano"])),
+            "{helper}"
+        );
+    }
 }
 
 /// Scenario: Choose a learned generation's editor (an agent not known yet): a non-empty `VISUAL`, else a non-empty `EDITOR`, else `vi`, in shell words, on either route; a value of blanks alone is no command.

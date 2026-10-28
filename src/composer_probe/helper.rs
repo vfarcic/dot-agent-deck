@@ -35,8 +35,12 @@
 //! wait), every step uses the time left to `D = t0 + 1 s`, and a step with
 //! no time left is skipped rather than called: the reap loop over the
 //! editor's descendants, the report on the connection opened before the
-//! editor, and the wait for its acknowledgement. The socket is nonblocking,
-//! so `EINTR` and partial I/O are charged against `D`. Nothing on this path
+//! editor, and the wait for its acknowledgement. The check is repeated after
+//! every poll that finds the socket ready, before the send or recv it
+//! allows. The socket is nonblocking, so `EINTR` and partial I/O are charged
+//! against `D`. A userspace check can't stop the helper being descheduled
+//! right after it, so the last nonblocking call checked before `D` may start
+//! just after `D`, and returns at once. Nothing on this path
 //! writes to a terminal; the armed path's notice is the helper's only
 //! terminal write. So the helper exits about 1 s after `t0` at most, plus the
 //! kernel's time in its last nonblocking calls, as long as it is scheduled
@@ -128,69 +132,19 @@ pub fn split_spaces(value: &OsStr) -> Vec<OsString> {
         .collect()
 }
 
-/// `value` split by shell-words rules, as Codex splits `VISUAL` (M34):
-/// blanks separate words, single quotes keep everything literally, double
-/// quotes keep everything but a backslash before `\`, `"`, `$`, `` ` `` or a
-/// newline, and a backslash outside quotes keeps the next byte. Nothing is
-/// evaluated: `;`, `$(…)`, `|` and redirections are bytes in a word. `None`
-/// for an unterminated quote or a trailing backslash.
+/// `value` split as Codex splits `VISUAL` (M34), with the parser it calls:
+/// `shlex::split` (Codex `codex-rs/tui/src/external_editor.rs:51` at the
+/// pinned `6aaac694`, unchanged at `rust-v0.164.0`; shlex 1.3.0, whose byte
+/// splitter 2.x keeps unchanged). Blanks separate words, a
+/// `#` starting a word comments out the rest of its line, single quotes keep
+/// everything literally, double quotes keep everything but a backslash
+/// before `\`, `"`, `$` or `` ` `` (kept alone) or a newline (both dropped),
+/// and a backslash outside quotes keeps the next byte, or drops a newline.
+/// Nothing is evaluated: `;`, `$(…)`, `|` and redirections are bytes in a
+/// word. `None` for an unterminated quote or a trailing backslash.
 pub fn split_shell_words(value: &OsStr) -> Option<Vec<OsString>> {
-    #[derive(PartialEq)]
-    enum In {
-        Blank,
-        Word,
-        Single,
-        Double,
-    }
-    let mut words = Vec::new();
-    let mut word = Vec::new();
-    let mut state = In::Blank;
-    let mut bytes = value.as_bytes().iter().copied();
-    while let Some(b) = bytes.next() {
-        match state {
-            In::Blank | In::Word => match b {
-                b' ' | b'\t' | b'\n' => {
-                    if state == In::Word {
-                        words.push(OsString::from_vec(std::mem::take(&mut word)));
-                    }
-                    state = In::Blank;
-                }
-                b'\'' => state = In::Single,
-                b'"' => state = In::Double,
-                b'\\' => {
-                    word.push(bytes.next()?);
-                    state = In::Word;
-                }
-                _ => {
-                    word.push(b);
-                    state = In::Word;
-                }
-            },
-            In::Single => match b {
-                b'\'' => state = In::Word,
-                _ => word.push(b),
-            },
-            In::Double => match b {
-                b'"' => state = In::Word,
-                b'\\' => {
-                    let next = bytes.next()?;
-                    if !matches!(next, b'\\' | b'"' | b'$' | b'`' | b'\n') {
-                        word.push(b'\\');
-                    }
-                    word.push(next);
-                }
-                _ => word.push(b),
-            },
-        }
-    }
-    match state {
-        In::Single | In::Double => None,
-        In::Word => {
-            words.push(OsString::from_vec(word));
-            Some(words)
-        }
-        In::Blank => Some(words),
-    }
+    shlex::bytes::split(value.as_bytes())
+        .map(|words| words.into_iter().map(OsString::from_vec).collect())
 }
 
 /// Which editor an invocation runs.
@@ -217,24 +171,37 @@ pub enum NoEditor {
     Unsplittable,
 }
 
-/// Whether `value`'s first word names the helper itself: the recursion
-/// guard (R2 §7.2), which takes such a value as unset.
-fn names_helper(value: &OsStr) -> bool {
-    split_spaces(value).first().is_some_and(|word| {
-        Path::new(word)
-            .file_name()
-            .is_some_and(|name| name == OsStr::new(HELPER_NAME))
-    })
+/// How `kind` splits an editor value: Claude Code on spaces, the others in
+/// shell words.
+fn split_for(kind: Kind, value: &OsStr) -> Option<Vec<OsString>> {
+    match kind {
+        Kind::Agent(ProbeAgent::Claude) => Some(split_spaces(value)),
+        _ => split_shell_words(value),
+    }
+}
+
+/// Whether `value`'s first word, split as `kind` splits it, names the
+/// helper itself: the recursion guard (R2 §7.2), which takes such a value as
+/// unset.
+fn names_helper(kind: Kind, value: &OsStr) -> bool {
+    split_for(kind, value)
+        .unwrap_or_default()
+        .first()
+        .is_some_and(|word| {
+            Path::new(word)
+                .file_name()
+                .is_some_and(|name| name == OsStr::new(HELPER_NAME))
+        })
 }
 
 /// A saved value, unless the recursion guard drops it.
-fn guarded(value: &Option<OsString>) -> Option<&OsStr> {
-    value.as_deref().filter(|v| !names_helper(v))
+fn guarded(kind: Kind, value: &Option<OsString>) -> Option<&OsStr> {
+    value.as_deref().filter(|v| !names_helper(kind, v))
 }
 
 /// A saved value that is set and not empty, after the guard.
-fn truthy(value: &Option<OsString>) -> Option<&OsStr> {
-    guarded(value).filter(|v| !v.is_empty())
+fn truthy(kind: Kind, value: &Option<OsString>) -> Option<&OsStr> {
+    guarded(kind, value).filter(|v| !v.is_empty())
 }
 
 /// The editor command for `kind` on `route`, from the user's saved
@@ -261,8 +228,8 @@ pub fn editor_command(
 ) -> Result<Vec<OsString>, NoEditor> {
     match kind {
         Kind::Agent(ProbeAgent::Claude) => {
-            let value = truthy(&saved.visual)
-                .or_else(|| truthy(&saved.editor))
+            let value = truthy(kind, &saved.visual)
+                .or_else(|| truthy(kind, &saved.editor))
                 .map(OsStr::to_os_string)
                 .or_else(|| {
                     CLAUDE_DEFAULTS
@@ -287,22 +254,22 @@ pub fn editor_command(
         }
         Kind::Agent(ProbeAgent::Codex) => {
             let value = match route {
-                Route::User => match (guarded(&saved.visual), guarded(&saved.editor)) {
+                Route::User => match (guarded(kind, &saved.visual), guarded(kind, &saved.editor)) {
                     (Some(v), _) if v.is_empty() => return Err(NoEditor::EmptyVisual),
                     (Some(v), _) => v,
                     (None, Some(e)) if e.is_empty() => return Err(NoEditor::EmptyEditor),
                     (None, Some(e)) => e,
                     (None, None) => return Err(NoEditor::Unset),
                 },
-                Route::Tool => truthy(&saved.visual)
-                    .or_else(|| truthy(&saved.editor))
+                Route::Tool => truthy(kind, &saved.visual)
+                    .or_else(|| truthy(kind, &saved.editor))
                     .ok_or(NoEditor::Unset)?,
             };
             shell_command(value)
         }
         Kind::Learned => shell_command(
-            truthy(&saved.visual)
-                .or_else(|| truthy(&saved.editor))
+            truthy(kind, &saved.visual)
+                .or_else(|| truthy(kind, &saved.editor))
                 .unwrap_or(OsStr::new(LEARNED_DEFAULT)),
         ),
     }
@@ -946,7 +913,12 @@ struct ReportChannel {
 }
 
 /// A nonblocking connection to the daemon's hook socket, whose every call is
-/// bounded by a [`Deadline`] and skipped when it has passed.
+/// bounded by a [`Deadline`]: a poll waits at most until it, and a poll,
+/// send or recv is started only after a check that it hasn't passed, a ready
+/// poll being checked again before the call that follows it. A userspace
+/// check can't keep the process from being descheduled between it and the
+/// call, so a nonblocking call checked just before `D` may start just after
+/// it; it then returns without waiting.
 struct Conn {
     stream: UnixStream,
     read: Vec<u8>,
@@ -975,8 +947,10 @@ impl Conn {
         })
     }
 
-    /// Wait for `events` on the socket within `deadline`: `Ok(true)` when
-    /// ready, `Ok(false)` at the deadline. An interrupted poll is retried
+    /// Wait for `events` on the socket within `deadline`: `true` when ready
+    /// with time left for the call that follows, `false` at the deadline,
+    /// including one that passed while the poll returned or after it (amendment
+    /// 6 §2.3: an expired step is skipped). An interrupted poll is retried
     /// against the same deadline.
     fn wait(&self, events: libc::c_short, deadline: Deadline, seams: &seam::Seams) -> bool {
         loop {
@@ -998,7 +972,14 @@ impl Conn {
             seams.trace(&format!("polled {rc}"));
             match rc {
                 0 => return false,
-                n if n > 0 => return true,
+                n if n > 0 => {
+                    seams.pause(seam::Point::Ready);
+                    if deadline.remaining().is_none() {
+                        seams.trace("skip io");
+                        return false;
+                    }
+                    return true;
+                }
                 _ if errno == Some(libc::EINTR) => continue,
                 _ => return false,
             }
@@ -1042,10 +1023,15 @@ impl Conn {
         Ok(())
     }
 
-    /// One line, at most [`MAX_LINE`] bytes, by `deadline`.
+    /// One line, at most [`MAX_LINE`] bytes before its newline, by
+    /// `deadline`. A longer one is refused whether its newline came in the
+    /// same read as the bytes past the bound or not.
     fn read_line(&mut self, deadline: Deadline, seams: &seam::Seams) -> io::Result<String> {
         loop {
             if let Some(end) = self.read.iter().position(|b| *b == b'\n') {
+                if end > MAX_LINE {
+                    return Err(io::ErrorKind::InvalidData.into());
+                }
                 let line: Vec<u8> = self.read.drain(..=end).collect();
                 return String::from_utf8(line).map_err(|_| io::ErrorKind::InvalidData.into());
             }
@@ -1082,9 +1068,11 @@ impl Conn {
 enum Phase {
     /// No editor ran: none was configured (`None`), or starting it failed.
     SpawnFailed(Option<i32>),
-    /// The editor was started and its wait failed with this errno.
+    /// The editor was started and its wait failed, or saw it stop rather
+    /// than end.
     WaitUnknown,
-    /// The editor was reaped with this wait status.
+    /// The editor was reaped with this wait status: an exit or a death by
+    /// signal.
     Reaped(libc::c_int),
 }
 
@@ -1208,10 +1196,11 @@ fn resolve(word: &OsStr, path_var: Option<&OsStr>) -> Result<CString, i32> {
         .ok_or(libc::ENOENT)
 }
 
-/// Start the editor (core §5.2): a child with the inherited mask and
-/// dispositions, SIGPIPE at its default, the given environment and no
-/// descriptor of the helper's (each is close-on-exec). An errno when it
-/// couldn't be started, the child having been reaped.
+/// Start the editor (core §5.2–§5.3): a child with the inherited mask and
+/// dispositions, SIGPIPE at its default, the given environment, and
+/// descriptors 0–2 alone: every other, the helper's own and any the agent
+/// left inheritable, is close-on-exec in the child before its `execve`. An
+/// errno when it couldn't be started, the child having been reaped.
 fn spawn(
     argv: &[OsString],
     env: &[(OsString, OsString)],
@@ -1249,6 +1238,11 @@ fn spawn(
     // SAFETY: both ends were just made and are owned here.
     let (read_end, write_end) =
         unsafe { (OwnedFd::from_raw_fd(pipe[0]), OwnedFd::from_raw_fd(pipe[1])) };
+    // The fallback's bound, read before the fork: `sysconf` isn't
+    // async-signal-safe.
+    // SAFETY: a plain query.
+    let fd_bound = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) }.clamp(3, libc::c_int::MAX.into())
+        as libc::c_int;
     seams.trace(&format!("spawn tasks {}", seam::tasks()));
     // SAFETY: the helper is single-threaded (it runs before anything starts
     // a thread), so the child may run any code; it runs only
@@ -1269,6 +1263,21 @@ fn spawn(
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
             seam::child_defaults();
             libc::sigprocmask(libc::SIG_SETMASK, &inherited.mask, std::ptr::null_mut());
+            // Everything above 2 closes at the exec; the errno pipe's write
+            // end, close-on-exec already, stays open until then. Before
+            // Linux 5.11 there is no `CLOSE_RANGE_CLOEXEC`, so each
+            // descriptor is marked instead.
+            if libc::syscall(
+                libc::SYS_close_range,
+                3 as libc::c_uint,
+                libc::c_uint::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            ) != 0
+            {
+                for fd in 3..fd_bound {
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                }
+            }
             libc::execve(program.as_ptr(), arg_ptrs.as_ptr(), env_ptrs.as_ptr());
             let errno = *libc::__errno_location();
             let bytes = errno.to_ne_bytes();
@@ -1305,26 +1314,32 @@ fn spawn(
     Ok(child)
 }
 
-/// Reap the editor (core §5.3): `waitpid` retried on `EINTR`; any other
-/// failure is `WaitUnknown`, its errno returned.
-fn wait_editor(child: libc::pid_t, seams: &seam::Seams) -> Result<libc::c_int, i32> {
+/// Reap the editor (core §5.3): `waitpid` retried on `EINTR`, an exit or a
+/// death by signal returned. Any other failure is `WaitUnknown`, and so is a
+/// status that is neither: a stop still reaches a parent the editor made its
+/// tracer (`PTRACE_TRACEME`) with no `WUNTRACED`, and the editor hasn't
+/// ended then, nor can the helper tell when it will.
+fn wait_editor(child: libc::pid_t, seams: &seam::Seams) -> Result<libc::c_int, ()> {
     if let Some(errno) = seams.wait_errno() {
         seams.trace(&format!("wait-unknown {errno}"));
-        return Err(errno);
+        return Err(());
     }
     loop {
         let mut status = 0;
         // SAFETY: waiting for this process's own child.
         let rc = unsafe { libc::waitpid(child, &mut status, 0) };
         if rc == child {
-            return Ok(status);
+            if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+                return Ok(status);
+            }
+            seams.trace(&format!("wait-nonterminal {status}"));
+            return Err(());
         }
         match io::Error::last_os_error().raw_os_error() {
             Some(libc::EINTR) => continue,
             errno => {
-                let errno = errno.unwrap_or(libc::EIO);
-                seams.trace(&format!("wait-unknown {errno}"));
-                return Err(errno);
+                seams.trace(&format!("wait-unknown {}", errno.unwrap_or(libc::EIO)));
+                return Err(());
             }
         }
     }
@@ -1408,7 +1423,9 @@ pub mod seam {
     /// A FIFO the helper blocks on, at the points [`PAUSE_AT`] names, until a
     /// byte is written to it.
     pub const PAUSE: &str = "DOT_AGENT_DECK_E2E_HELPER_PAUSE";
-    /// Comma-separated points: `start`, `post-editor`, `mutant`.
+    /// Comma-separated points: `start`, `post-editor`, `ready` (every poll
+    /// that found the socket ready, before the deadline's recheck and the
+    /// call after it) and `mutant`.
     pub const PAUSE_AT: &str = "DOT_AGENT_DECK_E2E_HELPER_PAUSE_AT";
     /// Starting the editor fails with this errno, and nothing is started.
     pub const SPAWN_ERRNO: &str = "DOT_AGENT_DECK_E2E_HELPER_SPAWN_ERRNO";
@@ -1433,6 +1450,7 @@ pub mod seam {
     pub enum Point {
         Start,
         PostEditor,
+        Ready,
         Mutant,
     }
 
@@ -1441,6 +1459,7 @@ pub mod seam {
             match self {
                 Point::Start => "start",
                 Point::PostEditor => "post-editor",
+                Point::Ready => "ready",
                 Point::Mutant => "mutant",
             }
         }
@@ -1649,6 +1668,7 @@ mod seam {
     pub enum Point {
         Start,
         PostEditor,
+        Ready,
     }
 
     pub struct Seams;
@@ -1691,5 +1711,74 @@ mod seam {
     #[inline]
     pub fn tasks() -> usize {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spec::spec;
+    use std::io::Write;
+
+    /// A connection already holding `buffered`, and the daemon's end.
+    fn conn(buffered: Vec<u8>) -> (Conn, UnixStream) {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        ours.set_nonblocking(true).unwrap();
+        let conn = Conn {
+            stream: ours,
+            read: buffered,
+        };
+        (conn, theirs)
+    }
+
+    fn two_seconds() -> Deadline {
+        Deadline::after(Instant::now(), Duration::from_secs(2))
+    }
+
+    /// Scenario: Read daemon lines whose length sits at the bound, arriving in reads of uneven sizes: exactly `MAX_LINE` bytes with the newline in a later read is a line; one byte more is refused when it arrives in the same read as its newline; and a read that carries an unfinished line past the bound is refused at once rather than waited on to the deadline.
+    #[spec("inbox/probe/013")]
+    #[test]
+    fn probe_013_a_daemon_line_is_capped_however_it_arrives() {
+        let seams = seam::Seams::read();
+        let (mut at_bound, mut peer) = conn(vec![b'a'; MAX_LINE]);
+        peer.write_all(b"\n").unwrap();
+        assert_eq!(
+            at_bound.read_line(two_seconds(), &seams).unwrap().len(),
+            MAX_LINE + 1
+        );
+        let (mut over, mut peer) = conn(vec![b'a'; MAX_LINE]);
+        peer.write_all(b"b\n").unwrap();
+        assert_eq!(
+            over.read_line(two_seconds(), &seams).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let (mut unfinished, mut peer) = conn(vec![b'a'; MAX_LINE - 1000]);
+        peer.write_all(&[b'a'; 3000]).unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            unfinished
+                .read_line(two_seconds(), &seams)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// Scenario: The daemon hangs up with nothing sent while `errno` still holds an `EAGAIN` from an earlier call: the read ends at once with end-of-file, not with retries until the deadline.
+    #[spec("inbox/probe/013")]
+    #[test]
+    fn probe_013_a_closed_daemon_ends_a_read_at_once() {
+        let seams = seam::Seams::read();
+        let (mut closed, peer) = conn(Vec::new());
+        drop(peer);
+        // SAFETY: this thread's errno.
+        unsafe { *libc::__errno_location() = libc::EAGAIN };
+        let started = Instant::now();
+        assert_eq!(
+            closed.read_line(two_seconds(), &seams).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 }

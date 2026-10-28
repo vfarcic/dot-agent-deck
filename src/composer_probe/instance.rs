@@ -554,14 +554,15 @@ impl InstanceReader {
 
     /// `arm-G`, opened read-only: `None` when it doesn't exist, an error for
     /// anything else that keeps it from being opened, or for one that isn't
-    /// a regular file. The helper (Q35-12) maps what it gets.
+    /// a regular file. The open doesn't block, so a FIFO there is refused
+    /// rather than waited on. The helper (Q35-12) maps what it gets.
     pub fn arm(&self, generation: &str) -> io::Result<Option<File>> {
         let name = generation_file("arm", generation)
             .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
         let fd = match openat(
             self.dir_fd.as_fd(),
             &name,
-            libc::O_RDONLY | libc::O_NOFOLLOW,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
             0,
         ) {
             Ok(fd) => fd,
@@ -607,12 +608,13 @@ impl InstanceReader {
     }
 
     /// A file's contents, `None` when it doesn't exist; an error for one
-    /// that is a link, not a regular file, or longer than [`READ_MAX`].
+    /// that is a link, not a regular file, or longer than [`READ_MAX`]. The
+    /// open doesn't block, so a FIFO is refused rather than waited on.
     fn read(&self, name: &CStr) -> io::Result<Option<Vec<u8>>> {
         let fd = match openat(
             self.dir_fd.as_fd(),
             name,
-            libc::O_RDONLY | libc::O_NOFOLLOW,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
             0,
         ) {
             Ok(fd) => fd,

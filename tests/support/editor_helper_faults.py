@@ -56,6 +56,18 @@ EDITOR.write_text("#!/usr/bin/python3\n" + "\n".join([
     "    subprocess.Popen(['true'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,",
     "                     stderr=subprocess.DEVNULL)",
     "    time.sleep(0.3)",
+    "if case == 'inherited-fds':",
+    "    (out / 'fds.json').write_text(json.dumps(sorted(int(f) for f in os.listdir('/proc/self/fd'))))",
+    "if case == 'traced-editor':",
+    "    import ctypes, signal",
+    "    libc = ctypes.CDLL(None, use_errno=True)",
+    "    # PTRACE_TRACEME: the helper, this editor's parent, becomes its tracer,",
+    "    # so the stop at the next signal reaches the helper's plain waitpid.",
+    "    if libc.ptrace(0, 0, None, None) != 0:",
+    "        (out / 'traceme-failed').write_text(str(ctypes.get_errno()))",
+    "        sys.exit(90)",
+    "    signal.signal(signal.SIGUSR2, signal.SIG_IGN)",
+    "    os.kill(os.getpid(), signal.SIGUSR2)",
     "if case == 'inherited-signals':",
     "    status = pathlib.Path('/proc/self/status').read_text()",
     "    fields = dict(l.split(':\\t', 1) for l in status.splitlines() if ':\\t' in l)",
@@ -258,10 +270,10 @@ def env(extra=None):
     return base
 
 
-def launch(fds, extra=None, preexec=None):
+def launch(fds, extra=None, preexec=None, pass_fds=()):
     child = subprocess.Popen([HELPER, str(EXPORT)], env=env(extra), cwd=ROOT,
                              stdin=fds if fds >= 0 else subprocess.DEVNULL,
-                             stdout=fds, stderr=fds, preexec_fn=preexec)
+                             stdout=fds, stderr=fds, preexec_fn=preexec, pass_fds=pass_fds)
     CHILDREN.append(child)
     return child
 
@@ -397,11 +409,11 @@ def set_arm(count, length=None):
             page.truncate(length)
 
 
-def pipe_row(extra, post, frontier=False, during=None, outcome=None):
+def pipe_row(extra, post, frontier=False, during=None, outcome=None, pass_fds=()):
     write_identity()
     peer = Peer(post, frontier, **({"outcome": outcome} if outcome else {}))
     peer.start()
-    proc = launch(subprocess.PIPE, extra)
+    proc = launch(subprocess.PIPE, extra, pass_fds=pass_fds)
     if during:
         during(proc)
     rc = finish(proc)
@@ -454,6 +466,82 @@ elif CASE == "expired-deadline":
     assert_nothing_after(t0() + D_NS)
     end, _ = event_ns("exit")
     assert end - resumed < 200_000_000, ("exit follows release at once", end - resumed)
+elif CASE == "ready-past-deadline":
+    # U2-01: the pause point sits between a poll that found the socket ready
+    # and the call it allows. Each pause before the editor ends is released
+    # at once; the first after `t0` (the report's POLLOUT) is held until
+    # 300 ms past D, so that D passes between the ready poll and the send.
+    os.mkfifo(FIFO)
+    extra = {"DOT_AGENT_DECK_E2E_HELPER_PAUSE": str(FIFO),
+             "DOT_AGENT_DECK_E2E_HELPER_PAUSE_AT": "ready"}
+
+    def hold_ready_past_deadline(proc):
+        released = 0
+        deadline = time.monotonic() + 10
+        while True:
+            rows = trace()
+            pauses = sum(1 for _, e in rows if e == "pause ready")
+            if pauses > released:
+                if any(e.startswith("t0 ") for _, e in rows):
+                    break
+                with open(FIFO, "wb") as fifo:
+                    fifo.write(b"x")
+                released += 1
+            assert proc.poll() is None and time.monotonic() < deadline, (CASE, rows)
+            time.sleep(0.005)
+        assert released >= 2, ("the exchange's ready polls paused too", released, trace())
+        start = t0()
+        while mono_ns() < start + D_NS + 300_000_000:
+            time.sleep(0.02)
+        with open(FIFO, "wb") as fifo:
+            fifo.write(b"x")
+
+    rc, peer = pipe_row(extra, post_read_to_eof, during=hold_ready_past_deadline)
+    assert rc == 37, rc
+    assert peer.report == b"", ("no report once D passed after a ready poll", peer.report)
+    rows = trace()
+    held = [ns for ns, e in rows if e == "resume ready"][-1]
+    assert held > t0() + D_NS, ("resumed past D", held - t0())
+    after = [e for ns, e in rows if ns >= held]
+    assert after[:2] == ["resume ready", "skip io"], ("the deadline rechecked first", after)
+    late = [e for e in after if e.split()[0] in ("poll", "send", "recv")]
+    assert not late, ("no call after D", late, rows)
+    assert "report unsent" in after, rows
+    end, _ = event_ns("exit")
+    assert end - held < 200_000_000, ("exit follows release at once", end - held)
+elif CASE == "continued-command":
+    # U2-02: Codex's shlex joins a backslash-newline and drops a comment, so
+    # this saved VISUAL opens the editor with two arguments; a quote inside
+    # the comment is commented out too.
+    value = f"{EDITOR}\\\n --continued # it's a note\n--after"
+    rc, peer = pipe_row({"DOT_AGENT_DECK_EDITOR_USER_VISUAL": value}, post_read_to_eof)
+    assert rc == 37 and SENTINEL.exists(), ("the continued command opened", rc)
+    argv = json.loads((ROOT / "argv.json").read_text())
+    assert argv == ["--continued", "--after", str(EXPORT)], argv
+    assert json.loads(peer.report) == {"report": "editor_done", "tree": "clean"}, peer.report
+elif CASE == "inherited-fds":
+    # Core §5.3: the agent leaves descriptor 57 inheritable; the helper gets
+    # it, the editor doesn't.
+    extra_fd = os.open(ROOT, os.O_RDONLY | os.O_DIRECTORY)
+    os.dup2(extra_fd, 57)
+    os.close(extra_fd)
+    rc, peer = pipe_row({}, post_read_to_eof, pass_fds=(57,))
+    assert rc == 37, rc
+    fds = json.loads((ROOT / "fds.json").read_text())
+    assert 57 not in fds, ("an inherited descriptor reached the editor", fds)
+elif CASE == "traced-editor":
+    # The editor makes the helper its tracer and takes a signal: the stop
+    # reaches the helper's waitpid, which mustn't read it as an exit. The
+    # helper takes it as an unknown wait: no report, exit 1, and the editor,
+    # released when the helper exits, finishes on its own.
+    rc, peer = pipe_row({}, post_read_to_eof)
+    failed = ROOT / "traceme-failed"
+    assert not failed.exists(), ("PTRACE_TRACEME refused here, errno", failed.read_text())
+    assert rc == 1, ("a stop is not an exit", rc, trace())
+    assert any(e.startswith("wait-nonterminal ") for _, e in trace()), trace()
+    assert peer.report == b"", ("no report for a stopped editor", peer.report)
+    assert_exit_by_deadline()
+    wait_unknown_check(peer)
 elif CASE in ("unread-peer", "half-frame"):
     pad = 4 << 20
     os.environ["HALF"] = str(pad // 2)

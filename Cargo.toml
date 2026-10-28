@@ -181,6 +181,10 @@ anyhow = "1"
 # referenced.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# PRD #1666 Q35-12: the editor helper splits a Codex editor value with the
+# parser Codex itself uses (`shlex::split`, pinned at 1.3.0 upstream; 2.x
+# removed only quoting APIs and splits byte for byte the same).
+shlex = "2"
 
 # PRD #42: Windows platform backends — named pipes, Job Objects, security
 # descriptors, `GetNamedPipeServerProcessId`, `LockFileEx`. The dependencies

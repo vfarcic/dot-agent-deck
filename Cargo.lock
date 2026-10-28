@@ -1385,6 +1385,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "sha2 0.11.1",
+ "shlex",
  "spec",
  "tempfile",
  "thiserror 2.0.21",

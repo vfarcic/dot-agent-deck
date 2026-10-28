@@ -876,6 +876,44 @@ fn probe_065_the_reader_reads_only_exact_files() {
     assert!(InstanceReader::open(&dir.path().join("link")).is_err());
 }
 
+/// Scenario: Put a FIFO with no writer at `arm-1`, `kind-2` and `daemon` in an instance directory, a symlink to a regular file at `arm-3` and nothing at `arm-4`, and read each on another thread. Every read returns within five seconds instead of blocking in its open: the FIFO arm as an error, the kind as unreadable and the daemon record as absent; the linked arm is refused as a link and the missing one reads as absent.
+#[spec("inbox/probe/065")]
+#[test]
+fn probe_065_the_arm_reader_refuses_a_fifo_or_a_link_without_blocking() {
+    let dir = tempdir();
+    let fake = dir.path().join("fake");
+    std::fs::create_dir(&fake).unwrap();
+    for name in ["arm-1", "kind-2", DAEMON_FILE] {
+        let path = std::ffi::CString::new(fake.join(name).into_os_string().into_vec()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+    std::fs::write(dir.path().join("page"), [0u8; 24]).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("page"), fake.join("arm-3")).unwrap();
+    let (done, results) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let reader = InstanceReader::open(&fake).unwrap();
+        let arm = |generation| {
+            reader
+                .arm(generation)
+                .map(|file| file.is_some())
+                .map_err(|e| e.raw_os_error())
+        };
+        let arms = [arm("1"), arm("3"), arm("4")];
+        done.send((arms, reader.kind("2"), reader.daemon()))
+            .unwrap();
+    });
+    let (arms, kind, daemon) = results
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("a read blocked on a FIFO");
+    assert_eq!(
+        arms,
+        [Err(Some(libc::EINVAL)), Err(Some(libc::ELOOP)), Ok(false)]
+    );
+    assert_eq!(kind, None);
+    assert_eq!(daemon, None);
+}
+
 fn candidates(names: &[&str]) -> Vec<(String, Vec<u8>)> {
     names
         .iter()

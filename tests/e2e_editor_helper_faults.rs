@@ -141,7 +141,35 @@ fn probe_067_a_passed_deadline_skips_the_report() {
     run("expired-deadline");
 }
 
-/// Scenario: A peer that answers the invocation and then never reads, with the helper's send buffer made small and its report padded to 4 MiB: part of the frame goes out, the rest waits on the deadline, no call starts after it, and the helper exits with the editor's 37 within a second of the editor's exit.
+/// Scenario: The seam pauses the helper at every poll that finds the socket ready, before the call it allows; the test releases each pause of the exchange at once and holds the report's, after the editor exits 37, until 300 ms past `t0 + 1 s`. Released, the helper rechecks its deadline first, skips the send, makes no poll, send or recv, the peer receives no report, and it exits 37 at once.
+#[spec("inbox/probe/067")]
+#[test]
+fn probe_067_a_deadline_passing_after_a_ready_poll_skips_the_call() {
+    run("ready-past-deadline");
+}
+
+/// Scenario: Codex's saved `VISUAL` names the sentinel editor, then a backslash-newline, `--continued`, a comment holding a quote, and `--after` on the next line. The helper splits it as Codex's shlex does, opens the editor with `--continued`, `--after` and the export path, and reports a clean tree.
+#[spec("inbox/probe/067")]
+#[test]
+fn probe_067_a_continued_codex_editor_command_opens() {
+    run("continued-command");
+}
+
+/// Scenario: The agent launches the helper with an extra inheritable descriptor, 57. The editor the helper starts lists its own descriptors, and 57 is not among them, while the helper still reports and exits with the editor's 37.
+#[spec("inbox/probe/067")]
+#[test]
+fn probe_067_the_editor_gets_no_inherited_descriptor_above_2() {
+    run("inherited-fds");
+}
+
+/// Scenario: The editor makes the helper its tracer with `PTRACE_TRACEME` and sends itself an ignored signal, so a stop reaches the helper's `waitpid`. The helper doesn't read the stop as an exit: it sends no report, exits 1 by its deadline, and the editor, released when the helper exits, finishes on its own.
+#[spec("inbox/probe/067")]
+#[test]
+fn probe_067_a_stopped_editor_is_an_unknown_wait_not_an_exit() {
+    run("traced-editor");
+}
+
+/// Scenario: A peer that answers the invocation and then never reads, with the helper's send buffer made small and its report padded to 4 MiB: part of the frame goes out, the rest waits on the deadline, no call starts once the deadline has been seen to pass, and the helper exits with the editor's 37 within a second of the editor's exit.
 #[spec("inbox/probe/067")]
 #[test]
 fn probe_067_an_unread_peer_costs_at_most_the_deadline() {
