@@ -754,53 +754,53 @@
         }
       }
     },
-    "openstackclient@10.3.0": {
-      "last_modified": "2026-10-08T19:21:32Z",
-      "resolved": "github:NixOS/nixpkgs/8edc0c72e3a38faf5434e40d1f19431125fe4b30#openstackclient",
+    "openstackclient@10.5.0": {
+      "last_modified": "2026-10-27T21:33:45Z",
+      "resolved": "github:NixOS/nixpkgs/f05535a0efcb2134c478d1e88434fadf486d42b5#openstackclient",
       "source": "devbox-search",
-      "version": "10.3.0",
+      "version": "10.5.0",
       "systems": {
         "aarch64-darwin": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/nwk1r6xg42468kwr0yib9rfi7crn4pkn-python3.13-python-openstackclient-10.3.0",
+              "path": "/nix/store/fb10y8p8cjynmml2a9vk5mxnlhp66hb9-python3.13-python-openstackclient-10.5.0",
               "default": true
             },
             {
               "name": "dist",
-              "path": "/nix/store/yk2avxfz27bx5b8rmw7hcz0m6sna94g5-python3.13-python-openstackclient-10.3.0-dist"
+              "path": "/nix/store/clv5d4w0ya2dk21a33w47jbaapfj2871-python3.13-python-openstackclient-10.5.0-dist"
             }
           ],
-          "store_path": "/nix/store/nwk1r6xg42468kwr0yib9rfi7crn4pkn-python3.13-python-openstackclient-10.3.0"
+          "store_path": "/nix/store/fb10y8p8cjynmml2a9vk5mxnlhp66hb9-python3.13-python-openstackclient-10.5.0"
         },
         "aarch64-linux": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/24v4p2i8rgvzqwhm1pp3acrnqw5y09pf-python3.13-python-openstackclient-10.3.0",
+              "path": "/nix/store/dyxjs4xwcb1c9kcmavirgc4345ar72vy-python3.13-python-openstackclient-10.5.0",
               "default": true
             },
             {
               "name": "dist",
-              "path": "/nix/store/pk62b0fw20lkh5ndhwsnawqqpipvkg6f-python3.13-python-openstackclient-10.3.0-dist"
+              "path": "/nix/store/qkf7ay954zz9w1sc393pvm2gh206py2p-python3.13-python-openstackclient-10.5.0-dist"
             }
           ],
-          "store_path": "/nix/store/24v4p2i8rgvzqwhm1pp3acrnqw5y09pf-python3.13-python-openstackclient-10.3.0"
+          "store_path": "/nix/store/dyxjs4xwcb1c9kcmavirgc4345ar72vy-python3.13-python-openstackclient-10.5.0"
         },
         "x86_64-linux": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/vlbz802iajgjabpqglih0jmgswlvyf19-python3.13-python-openstackclient-10.3.0",
+              "path": "/nix/store/y6f6s8k3k5803q0hsz37llhagf5vdnip-python3.13-python-openstackclient-10.5.0",
               "default": true
             },
             {
               "name": "dist",
-              "path": "/nix/store/gg06laadbqnv4mi5raac1knr9dg2p6b6-python3.13-python-openstackclient-10.3.0-dist"
+              "path": "/nix/store/nb9rfqi1f0rk11irsvh1r3ags6ix541m-python3.13-python-openstackclient-10.5.0-dist"
             }
           ],
-          "store_path": "/nix/store/vlbz802iajgjabpqglih0jmgswlvyf19-python3.13-python-openstackclient-10.3.0"
+          "store_path": "/nix/store/y6f6s8k3k5803q0hsz37llhagf5vdnip-python3.13-python-openstackclient-10.5.0"
         }
       }
     },
