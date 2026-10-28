@@ -1625,7 +1625,7 @@ fn launch_test_shell(root: &Path) -> std::path::PathBuf {
     shell
 }
 
-/// Scenario: Start a Codex recorder, installed where npm puts Codex's launcher, directly and through scripts that call codex by name, change CODEX_HOME, opt out of trace export or put the real Codex's directory in front of PATH, and through an absolute executable path. Inspect the real argv and environment for safe signal activation, preserved arguments and user choices, no header secret or logs exporter, and unchanged PATH/argv when export is off.
+/// Scenario: Start a Codex recorder, installed where npm puts Codex's launcher, directly and through scripts that call codex by name, change CODEX_HOME, opt out of trace export or put the real Codex's directory in front of PATH, and through an absolute executable path. Inspect argv for exactly one leading embedded-mode pair on direct launches, preserved original arguments and user choices, safe signal activation without header secrets or log export, and unchanged script PATH/argv when export is off.
 #[spec("telemetry/otlp/016")]
 #[test]
 fn telemetry_otlp_016_codex_launch_enables_only_safe_signals() {
@@ -1766,7 +1766,23 @@ fn telemetry_otlp_016_codex_launch_enables_only_safe_signals() {
             .filter(|pair| pair[0] == "-c" && pair[1].starts_with("otel."))
             .map(|pair| pair[1])
             .collect();
-        let original_args: Vec<_> = argv
+        let embedded_pair = ["-c", "shell_environment_policy.set={}"];
+        let direct = matches!(case, "plain" | "user-config" | "absolute");
+        assert_eq!(
+            argv.windows(2)
+                .filter(|pair| *pair == embedded_pair)
+                .count(),
+            usize::from(direct),
+            "{case}: exactly one embedded pair for direct Codex, none for scripts: {argv:?}"
+        );
+        if direct {
+            assert_eq!(
+                argv.get(..2),
+                Some(embedded_pair.as_slice()),
+                "{case}: embedded pair must precede exporters and user arguments"
+            );
+        }
+        let non_telemetry_args: Vec<_> = argv
             .iter()
             .enumerate()
             .filter_map(|(index, arg)| {
@@ -1782,10 +1798,15 @@ fn telemetry_otlp_016_codex_launch_enables_only_safe_signals() {
                 }
             })
             .collect();
+        let original_args = ["argument with spaces", "--fixture-flag"];
+        let expected_args = if direct {
+            [embedded_pair.as_slice(), original_args.as_slice()].concat()
+        } else {
+            original_args.to_vec()
+        };
         assert_eq!(
-            original_args,
-            ["argument with spaces", "--fixture-flag"],
-            "{case}: preserve original argv"
+            non_telemetry_args, expected_args,
+            "{case}: preserve original argv after the direct-only embedded pair"
         );
         close(&deck, &agent(&deck));
         if enabled

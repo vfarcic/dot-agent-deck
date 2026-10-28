@@ -254,10 +254,10 @@ describe("the overview after a New agent start (PRD #1223 M5)", () => {
   });
 
   /**
-   * Scenario: the daemon accepts the start and never lists the agent. After the
-   * bound the dialog closes, no pane opens, and the overview says the agent
-   * was started on that daemon and has not been listed; the line can be
-   * dismissed.
+   * Scenario: the daemon accepts the start and never lists the agent. Once
+   * the waiting state and its timeout effect have settled, advancing the bound
+   * closes the dialog, opens no pane, and shows a dismissible overview notice
+   * saying the agent was started on that daemon and has not been listed.
    */
   it("says so on the overview when the agent has not appeared within the bound", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
@@ -267,6 +267,9 @@ describe("the overview after a New agent start (PRD #1223 M5)", () => {
       fireEvent.click(screen.getByTestId("overview-new-agent"));
       await startFromDialog();
       await screen.findByTestId("new-agent-waiting");
+      // The waiting text can render before the effect that arms the bound.
+      // Flush that effect before advancing its clock.
+      await act(async () => {});
 
       await act(async () => { await vi.advanceTimersByTimeAsync(12_000); });
 
