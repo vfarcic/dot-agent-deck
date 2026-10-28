@@ -255,6 +255,45 @@
       </div>
     </section>
 
+    <!--
+      The video (issue #1995). The served HTML holds a poster that links to
+      the video on YouTube, not a player: the script at the end of the page
+      swaps in the youtube-nocookie player only when the poster is clicked,
+      so no YouTube player loads, and no YouTube cookie is set, before the
+      visitor asks for it. Without script, the poster is a plain link.
+    -->
+    <section class="video" aria-labelledby="video-title">
+      <div class="videoInner">
+        <h2 id="video-title" class="sectionTitle">See it run</h2>
+        <p class="videoIntro">The deck at work: forty-five agents across three machines, from the DevOps &amp; AI Toolkit channel.</p>
+        <div class="videoFrame">
+          <a class="videoPoster" id="video-poster" href="https://www.youtube.com/watch?v=aTB4Iou5YfU" data-embed="https://www.youtube-nocookie.com/embed/aTB4Iou5YfU?autoplay=1" aria-label="Play the video: How I Manage 45 AI Agents Across 3 Machines">
+            <img src="https://i.ytimg.com/vi/aTB4Iou5YfU/maxresdefault.jpg" loading="lazy" width="1280" height="720" alt="">
+            <span class="videoPlay" aria-hidden="true"><svg viewBox="0 0 24 24" width="28" height="28"><path fill="currentColor" d="M8 5.5v13l10.5-6.5z"/></svg></span>
+          </a>
+        </div>
+        <p class="videoCaption">How I Manage 45 AI Agents Across 3 Machines · <a href="https://www.youtube.com/watch?v=aTB4Iou5YfU">Watch on YouTube →</a></p>
+      </div>
+    </section>
+
+    <!--
+      Telemetry (issue #1995). Every claim here is one docs/telemetry.md
+      makes: keep it that way when rewording. The privacy sentence is about
+      the deck's own record; the agents' own telemetry is a separate stream.
+    -->
+    <section class="telemetry" aria-labelledby="telemetry-title">
+      <div class="telemetryInner">
+        <h2 id="telemetry-title" class="sectionTitle">Know what every run did</h2>
+        <p class="telemetryIntro">Point the deck at the OpenTelemetry backend of your choice, hosted or your own, and it sends a record of every agent run: which agent ran, in which role, how long it worked, when you stepped in, what kinds of shell commands it ran, how long its pull request’s CI took, how many tokens it used on which model and what they would cost at list price, and how it ended. Over weeks and across machines, that tells you which agent or model finishes a kind of task with the least help from you, and how much of a run went to tests and CI.</p>
+        <ul class="telemetryList">
+          <li><span class="check" aria-hidden="true">✓</span><span><strong>Off until you turn it on.</strong> With no backend configured, the deck sends nothing. Once on, it works the same whether you use the terminal UI, the desktop app or both.</span></li>
+          <li><span class="check" aria-hidden="true">✓</span><span><strong>Metadata only.</strong> Prompts, file contents, agent output and your API key are never part of the deck’s record. Each agent’s own telemetry, which the deck can switch on and tie to the same run, follows that agent’s settings.</span></li>
+          <li><span class="check" aria-hidden="true">✓</span><span><strong>CPU, memory and disk per run,</strong> on Linux, from an optional collector you run beside the deck.</span></li>
+        </ul>
+        <p class="clientLink"><a href="https://github.com/vfarcic/dot-agent-deck/blob/main/docs/telemetry.md">Read about telemetry →</a></p>
+      </div>
+    </section>
+
     <section class="audience">
       <div class="audienceInner">
         <h2 class="sectionTitle">Who this is for</h2>
@@ -384,6 +423,21 @@
           copy.textContent = 'Copied';
           setTimeout(function () { copy.textContent = 'Copy'; }, 2000);
         }, function () {});
+      });
+    }
+    // Click to load: the poster becomes the player only when asked for.
+    var poster = document.getElementById('video-poster');
+    if (poster) {
+      poster.addEventListener('click', function (event) {
+        event.preventDefault();
+        var player = document.createElement('iframe');
+        player.src = poster.getAttribute('data-embed');
+        player.title = 'How I Manage 45 AI Agents Across 3 Machines';
+        player.allow = 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share';
+        player.referrerPolicy = 'strict-origin-when-cross-origin';
+        player.allowFullscreen = true;
+        poster.replaceWith(player);
+        player.focus();
       });
     }
   })();

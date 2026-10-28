@@ -29,6 +29,7 @@ Agent Deck runs your AI coding agents under one background daemon, shows what ea
 - **Dispatch.** Ask a dispatcher agent for something and it makes a separate copy of your repository (a git worktree), puts one agent or a whole orchestration to work in it, and reports back when the unit is done. Your own working tree is not touched. [Dispatcher mode](docs/dispatcher-mode.md)
 - **Schedules.** Run a prompt on a cron schedule. The daemon fires it, so closing both clients does not stop it. Write one from either client; the Schedules manager that lists them is in the terminal UI. [Schedules](docs/scheduled-tasks.md)
 - **Remote environments.** Run the daemon and the agents on another machine over ssh: `dot-agent-deck connect` runs the terminal UI on the host, and the desktop app shows a remote daemon's agents beside your local ones. The agents keep running when you disconnect. [Remote environments](docs/remote-environments.md)
+- **Telemetry.** Send a record of every agent run to the OpenTelemetry backend of your choice: which agent ran, how long it worked, when you stepped in, what kinds of shell commands it ran, how long its pull request's CI took, how many tokens it used and what they would cost at list price, and how it ended. On Linux, an optional collector adds each run's CPU, memory and disk. It is off until you configure it, works the same from either client, and the deck's record is metadata only: prompts, file contents, agent output and your API key are never part of it. [Telemetry](docs/telemetry.md)
 
 ## Quick Start
 
