@@ -40,6 +40,7 @@ EXPORT_FILE_COUNT = 4096
 EXPORT_LITERAL_COUNT = 100_000
 EXPORT_STREAM_COUNT = 1024
 VERSIONS = ("0.160.0", "0.164.0")
+X2_BACKEND_MODES = {"0.160.0": "default", "0.164.0": "embedded-explicit-no-daemon"}
 ROWS = {
     "X1": {"status": "needs-implementation", "runs_per_setup": 50,
            "needs": ["Q35-12 helper", "Q35-20a frontier and dual-clock log",
@@ -711,6 +712,9 @@ def x2_sample(root, children, version, sample, method):
     argv = [str(root / "bin/strace"), "-f", "-ff", "-ttt", "-xx", "-s", "65536",
             "-e", "trace=" + ("connect,write,writev,ioctl" if method == "instrumented" else "connect"),
             "-o", str(prefix) + ".trace", str(root / "bin" / f"codex-{version}"), "--no-alt-screen"]
+    if version == "0.164.0":
+        # Keep this sample in the foreground embedded backend, without a shared server.
+        argv.append("--no-daemon")
     master, slave = pty.openpty()
     import fcntl
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
@@ -765,9 +769,11 @@ def x2_sample(root, children, version, sample, method):
                         result = arrival_result(capture.tokens, disabled_offset)
                         if result["status"] == "observed":
                             result.update({"method": method, "release": version,
+                                           "backend_mode": X2_BACKEND_MODES[version],
                                            "editor_invoked": True, "CPR": "test-owned fixed 1;1 answerer"})
                             return result
             return {"status": "UNVERIFIED", "reason": "interactive editor cycle did not finish",
+                    "backend_mode": X2_BACKEND_MODES[version],
                     "editor_invoked": notice.exists(), "method": method, "release": version}
     finally:
         os.close(master)
@@ -822,7 +828,7 @@ def run_x2_inner(root, method, samples, network, versions=VERSIONS):
                 "master_observed_arrival": distribution(row["arrival_interval_ns"] for row in rows),
                 "instrumented_write_to_flush": "needs-implementation: cycle-bound trace parser"}
         write_json(root / f"X2-{method}.json", {"results": results, "distribution": summary,
-                   "host_boundary": plan()["host_boundary"], "policy": "Hold; Codex-only, no daemon"})
+                   "host_boundary": plan()["host_boundary"], "policy": "Hold; Codex-only, no deck daemon; backend mode recorded per sample"})
     finally:
         children.ignore_termination()
         try:
@@ -860,6 +866,7 @@ def run_x2(args):
                    "provenance": "reviewed_commit is operator attestation; digest is current script-file bytes at run entry",
                    "network": network, "host_boundary": plan()["host_boundary"],
                    "releases": list(versions), "samples_per_release": args.samples,
+                   "backend_modes": {version: X2_BACKEND_MODES[version] for version in versions},
                    "require_namespace": args.require_namespace})
         argv = [str(root / "bin/python3"), str(Path(__file__).resolve()), "_x2",
                 str(root), args.method, str(args.samples), network, *versions]
