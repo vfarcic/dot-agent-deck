@@ -1255,7 +1255,7 @@ fn replay_transaction(
     panic!("transaction did not release");
 }
 
-/// Scenario: Replay each release's captured truecolor user echo with its background changed to indexed 237 as a positive control, then replay near-miss RGB backgrounds, assistant quotes, partial lines, a missing user marker, and a composer still holding the line. None of the negative screens confirms Submitted, even with an empty composer, and the still-held composer refuses a submit even when the indexed control supplies a recognised transcript row. Mutating only a continuation row also refuses the echo.
+/// Scenario: Replay each release's captured truecolor user echo with its background changed to indexed 237 as a positive control, then replay near-miss RGB backgrounds, assistant quotes, partial lines, a missing user marker, and a composer still holding the line. On the unchanged RGB background, an assistant quote, a user marker displaced to column 1, and a tool-output block containing the exact line supply no submit evidence with an empty composer. The still-held composer refuses a submit even when the indexed control supplies a recognised transcript row, and mutating only a continuation row also refuses the echo.
 #[spec("inbox/doorbell/047")]
 #[test]
 fn doorbell_047_claude_truecolor_transcript_controls() {
@@ -1318,6 +1318,27 @@ fn doorbell_047_claude_truecolor_transcript_controls() {
         recolor(&mut quote, Color::Default);
         quote.cells[user_row][0].text = "●".into();
         negatives.push(("assistant quote".into(), quote));
+
+        // Synthetic controls derived from each measured truecolor echo:
+        // retain its exact line, shaded continuation, geometry and empty
+        // composer; change only the two-cell prefix. These are not captured
+        // assistant/tool responses: their prefixes model those output blocks.
+        assert_eq!(echo.cells[user_row][1].text, " ");
+        for (name, prefix) in [
+            ("RGB assistant quote", ["●", " "]),
+            ("RGB user marker displaced to column 1", [" ", "❯"]),
+            ("RGB tool-output block", ["⎿", " "]),
+        ] {
+            let mut control = echo.clone();
+            for (cell, text) in control.cells[user_row].iter_mut().zip(prefix) {
+                cell.text = text.into();
+            }
+            assert_eq!(control.cells[user_row][0].bg, Color::Rgb(55, 55, 55));
+            assert_eq!(control.cells[user_row][2..], echo.cells[user_row][2..]);
+            assert_eq!(control.cells[user_row + 1], echo.cells[user_row + 1]);
+            assert!(frame(&CLAUDE_PROFILE, &control, 1, true, Some(line)).empty_and_ready());
+            negatives.push((name.into(), control));
+        }
 
         let mut partial = echo.clone();
         let last = partial.cells[user_row + 1]
