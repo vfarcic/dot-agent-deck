@@ -29,8 +29,11 @@
 //!   ([`BroadcastClock`]), and the task counts it before the first event
 //!   broadcast after that once the tracker has opened its run, so it is read
 //!   against the prompt the cards showed then rather than when the task takes
-//!   it. A lone `ESC` takes part too: an event on its pane broadcast after it
-//!   waits out its window, so the Escape key counts before that event;
+//!   it. A lone `ESC` takes part too: an event on its pane, or naming no
+//!   pane, broadcast after it waits out its window, and what the `ESC`
+//!   turns out to be — the Escape key, or the key whose sequence it begins
+//!   when the next write completes that sequence — keeps the `ESC`'s place,
+//!   so it counts before that event;
 //! - a run whose spawn is refused is forgotten when its [`PreparedRun`] is
 //!   dropped uncommitted.
 //!
@@ -449,6 +452,74 @@ struct Written {
 }
 
 impl PaneInput {
+    /// Feed one accepted write, `now` on the wall clock and `at` on the
+    /// monotonic one, that telemetry was told about at broadcast `position`:
+    /// the human input it settles, oldest first, and whether it left a lone
+    /// `ESC` held. Input a held lone `ESC` turns into — the Escape key, once
+    /// its window has passed or another `ESC` follows it, or the key whose
+    /// sequence it begins — keeps the time and position that `ESC` was
+    /// written at; the rest of the write has `now` and `position`. A
+    /// sequence the write leaves incomplete counts when a later write
+    /// completes it.
+    fn write(
+        &mut self,
+        bytes: &[u8],
+        now: u64,
+        position: u64,
+        at: std::time::Instant,
+    ) -> (Vec<Written>, bool) {
+        let mut human = Vec::with_capacity(2);
+        let mut rest = bytes;
+        if let Some((since, written, escaped)) = self.escape {
+            let kind = if at.saturating_duration_since(since) >= LONE_ESCAPE_WINDOW {
+                // Its window has passed: the Escape key, whatever follows.
+                self.escape = None;
+                self.filter
+                    .settle_lone_escape()
+                    .then_some(InterventionKind::Interrupt)
+            } else {
+                let (kind, taken) = self.filter.decide_held(bytes);
+                rest = &bytes[taken..];
+                kind
+            };
+            if let Some(kind) = kind {
+                human.push(Written {
+                    at: written,
+                    kind,
+                    position: escaped,
+                });
+            }
+        }
+        // A paste with no input for its window lost its end marker.
+        if self
+            .paste
+            .is_some_and(|since| at.saturating_duration_since(since) >= PASTE_IDLE_WINDOW)
+        {
+            self.filter.end_paste();
+        }
+        if let Some(kind) = self.filter.classify(rest) {
+            human.push(Written {
+                at: now,
+                kind,
+                position,
+            });
+        }
+        if !self.filter.in_paste() {
+            self.paste = None;
+        } else if !bytes.is_empty() {
+            self.paste = Some(at);
+        }
+        // A non-empty write leaving a lone ESC held ended with it.
+        let mut held = false;
+        if !self.filter.holds_lone_escape() {
+            self.escape = None;
+        } else if !bytes.is_empty() {
+            self.escape = Some((at, now, position));
+            held = true;
+        }
+        (human, held)
+    }
+
     /// Everything this run's input still owes the tracker, oldest first:
     /// what is pending, then a held lone `ESC` when `settle` says it is the
     /// Escape key now.
@@ -621,6 +692,10 @@ struct Shared {
     /// branch, after signalling the first half, until the second receives.
     #[cfg(test)]
     timer_gate: Mutex<Option<Gate>>,
+    /// Test seam: pauses the ingest task once as it is about to wait out a
+    /// lone `ESC` before an event ([`Shared::observe_in_order`]).
+    #[cfg(test)]
+    wait_gate: Mutex<Option<Gate>>,
     /// Test seam: pauses the ingest task once the command queue first polls
     /// empty, before the other branches are polled.
     #[cfg(test)]
@@ -1003,9 +1078,12 @@ impl Telemetry {
     /// intervention, of the kind its bytes say, unless it is only terminal
     /// reports, including a report split across writes
     /// ([`super::input::InputFilter`]). A lone `ESC` — the
-    /// Escape key — is counted, at the time it was written, once
-    /// [`LONE_ESCAPE_WINDOW`] passes without the rest of a report, or when the
-    /// run ends. Input the deck injects itself (a delegated task, an inbox
+    /// Escape key — is counted once [`LONE_ESCAPE_WINDOW`] passes without the
+    /// rest of a report, when another `ESC` follows it, or when the run ends;
+    /// it counts at the time and broadcast position it was written at, not
+    /// those of the write that decided it, and so does the key whose sequence
+    /// it begins when the next write completes that sequence. Input the deck
+    /// injects itself (a delegated task, an inbox
     /// delivery) must not be passed here.
     pub fn observe_client_input(&self, pane_id: &str, bytes: &[u8]) {
         self.observe_client_input_at(pane_id, bytes, now_unix_nanos(), std::time::Instant::now());
@@ -1024,9 +1102,7 @@ impl Telemetry {
             return;
         };
         let shared = &exporting.shared;
-        let mut human = Vec::with_capacity(2);
-        let mut held = false;
-        {
+        let held = {
             let mut filters = shared.lock_filters();
             // No open run on this pane: nothing to count it against.
             let Some(input) = filters
@@ -1046,46 +1122,7 @@ impl Telemetry {
             // PTY's acceptance would take a position read at the write
             // itself, in the pane's writer.
             let position = shared.lock_clock().position();
-            // A lone ESC whose window has passed was the Escape key, whatever
-            // follows it now.
-            if let Some((since, written, position)) = input.escape
-                && at.saturating_duration_since(since) >= LONE_ESCAPE_WINDOW
-            {
-                input.escape = None;
-                if input.filter.settle_lone_escape() {
-                    human.push(Written {
-                        at: written,
-                        kind: InterventionKind::Interrupt,
-                        position,
-                    });
-                }
-            }
-            // A paste with no input for its window lost its end marker.
-            if input
-                .paste
-                .is_some_and(|since| at.saturating_duration_since(since) >= PASTE_IDLE_WINDOW)
-            {
-                input.filter.end_paste();
-            }
-            if let Some(kind) = input.filter.classify(bytes) {
-                human.push(Written {
-                    at: now,
-                    kind,
-                    position,
-                });
-            }
-            if !input.filter.in_paste() {
-                input.paste = None;
-            } else if !bytes.is_empty() {
-                input.paste = Some(at);
-            }
-            // A non-empty write leaving a lone ESC held ended with it.
-            if !input.filter.holds_lone_escape() {
-                input.escape = None;
-            } else if !bytes.is_empty() {
-                input.escape = Some((at, now, position));
-                held = true;
-            }
+            let (human, held) = input.write(bytes, now, position, at);
             // The input waits with its run; the first of it since the tracker
             // last took the run's input sends the reminder to take it.
             let wake = input.pending.is_empty() && !human.is_empty();
@@ -1097,7 +1134,8 @@ impl Telemetry {
                     run_id: input.run_id.clone(),
                 });
             }
-        }
+            held
+        };
         if held {
             shared.escape_held.notify_one();
         }
@@ -1544,14 +1582,21 @@ impl Shared {
     /// first, so the Escape key counts in its place rather than after the
     /// message: until [`LONE_ESCAPE_WINDOW`] has passed since it was written,
     /// and never longer than that window from now, and only for events on its
-    /// pane. An `ESC` whose window has still not passed by then stays held,
-    /// and counts after the message if it is the Escape key.
+    /// pane or naming no pane. A write that decides the `ESC` during the wait
+    /// leaves what it decided in the `ESC`'s place, so that is counted before
+    /// the message too. An `ESC` whose window has still not passed by then
+    /// stays held, and counts after the message if it is the Escape key.
     async fn observe_in_order(&self, msg: &BroadcastMsg, position: u64) {
         let now = std::time::Instant::now();
         if let BroadcastMsg::Event(event) = msg
             && let Some(due) = self.escape_due_before(event.pane_id.as_deref(), position, now)
         {
             let due = due.min(now + LONE_ESCAPE_WINDOW);
+            #[cfg(test)]
+            if let Some((entered, resume)) = self.wait_gate.lock().unwrap().take() {
+                let _ = entered.send(());
+                let _ = resume.recv();
+            }
             tokio::time::sleep_until(Instant::from_std(due)).await;
         }
         self.observe(msg, position, std::time::Instant::now());
@@ -1622,6 +1667,8 @@ fn start_exporting(
         finalizing: watch::Sender::new(0),
         #[cfg(test)]
         timer_gate: Mutex::new(None),
+        #[cfg(test)]
+        wait_gate: Mutex::new(None),
         #[cfg(test)]
         command_gate: Mutex::new(settings.command_gate),
     });
@@ -3844,6 +3891,120 @@ mod tests {
         }
     }
 
+    /// Text typed at 1 s, then an Escape at 5.99 s still held when the deck's
+    /// answer, accepted at 6.01 s, is applied; a second Escape at 6.02 s,
+    /// written while the ingest task waits out the first one's window,
+    /// decides the first as the Escape key. The first counts where it was
+    /// pressed, before the answer: one interrupt from 1 s, rather than the
+    /// text at 1 s and an interrupt at 6.01 s that the answer overtook.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_escape_decided_during_the_wait_for_it_counts_before_the_event() {
+        let second = 1_000_000_000;
+        let ms = 1_000_000;
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("p0", "other"), &[]);
+        begin(&telemetry, generation("p1", "a1"), &[]);
+        tx.send(of("p1", "a1", EventType::SessionStart)).unwrap();
+        telemetry.settled().await;
+        let zero = now_unix_nanos() - 20 * second;
+        let shared = &telemetry.exporting.as_ref().unwrap().shared;
+
+        let resume = hold_ingest(&telemetry, "p0").await;
+        let pressed = std::time::Instant::now();
+        telemetry.observe_client_input_at("p1", b"a", zero + second, pressed);
+        telemetry.observe_client_input_at("p1", b"\x1b", zero + 5990 * ms, pressed);
+        let mut answered = of("p1", "a1", EventType::Thinking);
+        if let BroadcastMsg::Event(e) = &mut answered {
+            e.metadata.insert(
+                crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY.into(),
+                crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_VALUE.into(),
+            );
+            e.timestamp = chrono::DateTime::from_timestamp_nanos((zero + 6010 * ms) as i64);
+        }
+        tx.send(answered).unwrap();
+        let (entered, waiting) = oneshot::channel();
+        let (go, paused) = std::sync::mpsc::channel();
+        *shared.wait_gate.lock().unwrap() = Some((entered, paused));
+        resume.send(()).unwrap();
+        waiting.await.unwrap();
+        telemetry.observe_client_input_at(
+            "p1",
+            b"\x1b",
+            zero + 6020 * ms,
+            pressed + LONE_ESCAPE_WINDOW / 2,
+        );
+        go.send(()).unwrap();
+
+        telemetry.settled().await;
+        telemetry.end_run("p1", Some("a1"), EndReason::Exited, None);
+        telemetry.settled().await;
+        assert_eq!(
+            timed_kinds(&captured(&mut rx)),
+            vec![(zero + second, AttrValue::Str("interrupt".into()))]
+        );
+    }
+
+    /// A lone `ESC` that a later write decides — as the Escape key, by
+    /// another `ESC` or by its window passing, or as the start of a key's
+    /// sequence — counts at the time and broadcast position it was written
+    /// at; the rest of that write counts at its own. A sequence the deciding
+    /// write leaves incomplete counts when a later write completes it.
+    #[test]
+    fn a_decided_escape_keeps_the_time_and_position_it_was_written_at() {
+        use InterventionKind::{Interrupt, Navigate, Text};
+        let pane_input = || PaneInput {
+            run_id: "r1".into(),
+            agent_id: None,
+            ended: false,
+            filter: InputFilter::new(),
+            escape: None,
+            paste: None,
+            pending: Vec::new(),
+        };
+        let timed = |human: Vec<Written>| -> Vec<_> {
+            human.iter().map(|w| (w.at, w.kind, w.position)).collect()
+        };
+        let pressed = std::time::Instant::now();
+        let soon = pressed + LONE_ESCAPE_WINDOW / 2;
+        let late = pressed + LONE_ESCAPE_WINDOW;
+        let cases: [(&[u8], _, Vec<_>, bool); 8] = [
+            (b"\x1b", soon, vec![(1, Interrupt, 3)], true),
+            (
+                b"\x1bab",
+                soon,
+                vec![(1, Interrupt, 3), (2, Text, 5)],
+                false,
+            ),
+            (b"x", soon, vec![(1, Navigate, 3)], false),
+            (b"\r", soon, vec![(1, Text, 3)], false),
+            (b"[Ahi", soon, vec![(1, Navigate, 3), (2, Text, 5)], false),
+            (b"[I", soon, vec![], false),
+            (b"x", late, vec![(1, Interrupt, 3), (2, Text, 5)], false),
+            (b"\x1b", late, vec![(1, Interrupt, 3)], true),
+        ];
+        for (next, at, expected, held) in cases {
+            let mut input = pane_input();
+            assert_eq!(input.write(b"\x1b", 1, 3, pressed).0.len(), 0);
+            let (human, still) = input.write(next, 2, 5, at);
+            assert_eq!(timed(human), expected, "{next:?}");
+            assert_eq!(still, held, "{next:?}");
+            let escape = input
+                .escape
+                .map(|(_, written, position)| (written, position));
+            assert_eq!(escape, held.then_some((2, 5)), "{next:?}");
+        }
+
+        let mut input = pane_input();
+        input.write(b"\x1b", 1, 3, pressed);
+        assert_eq!(timed(input.write(b"[1;", 2, 5, soon).0), vec![]);
+        assert_eq!(
+            timed(input.write(b"5A", 4, 7, soon).0),
+            vec![(4, Navigate, 7)]
+        );
+    }
+
     /// Messages already waiting on the ingest task's receiver when the clock
     /// is made are before it: input written then counts after all of them.
     #[test]
@@ -4440,21 +4601,22 @@ mod tests {
     }
 
     /// N2: Escape followed by another key. Inside the window the two are one
-    /// sequence (Alt+key); past it the Escape counts at its own time, and the
-    /// key joins its burst or starts a new one by the usual rule.
+    /// sequence (Alt+key), pressed when the Escape was; past it the Escape
+    /// counts at its own time, and the key joins its burst or starts a new
+    /// one by the usual rule.
     #[tokio::test]
     async fn the_escape_key_then_another_key_counts_by_when_each_was_pressed() {
         let (telemetry, mut rx) = capturing(ProbeSettings::default());
         let second = 1_000_000_000u64;
-        let cases: [(Duration, i64, usize); 3] = [
-            // Alt+a: one intervention, at the second write.
-            (Duration::from_millis(10), 1, 1),
+        let cases: [(Duration, i64); 3] = [
+            // Alt+a: one intervention, at the Escape that began it.
+            (Duration::from_millis(10), 1),
             // Past the window, inside a burst: one, at the Escape.
-            (Duration::from_secs(1), 1, 0),
+            (Duration::from_secs(1), 1),
             // Past a burst: two.
-            (Duration::from_secs(6), 2, 0),
+            (Duration::from_secs(6), 2),
         ];
-        for (i, (later, count, first_at)) in cases.into_iter().enumerate() {
+        for (i, (later, count)) in cases.into_iter().enumerate() {
             let agent = format!("a{i}");
             begin(&telemetry, generation("p1", &agent), &[]);
             let t0 = 100 * second;
@@ -4466,7 +4628,7 @@ mod tests {
             telemetry.settled().await;
             let (got, times) = interventions(&captured(&mut rx));
             assert_eq!(got, Some(AttrValue::Int(count)), "{later:?}");
-            assert_eq!(times[0], [t0, t1][first_at], "{later:?}");
+            assert_eq!(times[0], t0, "{later:?}");
             if count == 2 {
                 assert_eq!(times, vec![t0, t1]);
             }

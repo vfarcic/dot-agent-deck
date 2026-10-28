@@ -55,7 +55,9 @@
 //! show it then, and never moves a run's last input backward, so a burst's
 //! time can only grow. [`super::exporter`] hands each pane's input over before
 //! the first event broadcast after telemetry was told about it, just after
-//! the pane accepted it.
+//! the pane accepted it, once this tracker has opened the run it was typed
+//! into; the Escape key, and a key whose sequence a held `ESC` begins and the
+//! next write completes, as of the write that held the `ESC`.
 
 use std::collections::{HashMap, VecDeque};
 

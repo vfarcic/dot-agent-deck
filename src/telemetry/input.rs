@@ -18,7 +18,9 @@
 //! The filter holds it like any other incomplete sequence; whoever feeds the
 //! filter settles it as a person's with [`InputFilter::settle_lone_escape`]
 //! once [`LONE_ESCAPE_WINDOW`] has passed with nothing after it, or when the
-//! run ends.
+//! run ends. When a write follows sooner, [`InputFilter::decide_held`] says
+//! what it made of the `ESC`, apart from the rest of that write, so the key
+//! can be counted when the `ESC` was written.
 //!
 //! **What the input was is told apart the same way** ([`InterventionKind`]),
 //! from the bytes alone and never by keeping them: a key that interrupts, a
@@ -187,6 +189,25 @@ impl InputFilter {
         } else {
             false
         }
+    }
+
+    /// Feed the start of one accepted write, as [`Self::classify`] would,
+    /// only until the sequence held from an earlier write is decided: what it
+    /// turned out to be — the Escape key before another `ESC`, Alt with a
+    /// key, a key's sequence — and how many bytes of `bytes` that took.
+    /// `None` when it was a terminal report, when it is still incomplete once
+    /// `bytes` run out, or when nothing was held, which takes no bytes.
+    pub fn decide_held(&mut self, bytes: &[u8]) -> (Option<InterventionKind>, usize) {
+        let mut taken = 0;
+        while self.state != State::Ground
+            && let Some(&b) = bytes.get(taken)
+        {
+            taken += 1;
+            if let Some(kind) = self.step(b) {
+                return (Some(kind), taken);
+            }
+        }
+        (None, taken)
     }
 
     fn step(&mut self, b: u8) -> Option<InterventionKind> {
@@ -548,6 +569,36 @@ mod tests {
         assert!(!filter.settle_lone_escape());
         assert!(filter.is_holding());
         assert!(!filter.feed(b"80R"), "the report completes as a report");
+    }
+
+    /// A held lone `ESC` is decided by the first bytes of the next write, and
+    /// only those are taken: the rest is classified on its own.
+    #[test]
+    fn a_held_escape_is_decided_by_the_bytes_that_follow_it() {
+        use InterventionKind::{Interrupt, Navigate, Paste, Text};
+        let cases: [(&[u8], Option<InterventionKind>, usize, bool); 9] = [
+            // Another ESC: the held one was the Escape key; the new one is held.
+            (b"\x1b", Some(Interrupt), 1, true),
+            (b"\x1bab", Some(Interrupt), 1, true),
+            (b"x", Some(Navigate), 1, false),
+            (b"\r", Some(Text), 1, false),
+            (b"[A", Some(Navigate), 2, false),
+            (b"[Iabc", None, 2, false),
+            (b"[200~pasted", Some(Paste), 5, false),
+            // Still incomplete: decided by a later write.
+            (b"[1;", None, 3, false),
+            (b"", None, 0, true),
+        ];
+        for (next, kind, taken, lone) in cases {
+            let mut filter = InputFilter::new();
+            assert!(!filter.feed(b"\x1b"));
+            assert_eq!(filter.decide_held(next), (kind, taken), "{next:?}");
+            assert_eq!(filter.holds_lone_escape(), lone, "{next:?}");
+        }
+
+        let mut filter = InputFilter::new();
+        assert_eq!(filter.decide_held(b"abc"), (None, 0), "nothing held");
+        assert!(filter.feed(b"abc"));
     }
 
     /// The kind of one whole frame, a lone `ESC` left held settled as the
