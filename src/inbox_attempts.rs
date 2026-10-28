@@ -5187,16 +5187,14 @@ mod tests {
         );
     }
 
-    /// Scenario: Refused repeats still spend the budget, and nothing settles
-    /// without a commit. Two refused automatic repeats followed by the loss
-    /// of the first attempt end `Uncertain(Lapsed)`, where a Retry is issued
-    /// and approved and the first attempt's late commit still settles it. At
-    /// the attempt cap the loss ends `Uncertain(OutOfAttempts)`, Retry
-    /// answers `RetryLimit`, and the late commit still settles. A receiver
-    /// replaced between a refusal and its `NotHanded` keeps the message
-    /// attempting through the resumed attempt; one that dies with no
-    /// successor has both attempts fenced and the message is repeated to the
-    /// next receiver, approved.
+    /// Scenario: Two refused automatic repeats, then the first attempt's
+    /// loss, end `Uncertain(Lapsed)` with a Retry approved, or at the attempt
+    /// cap `Uncertain(OutOfAttempts)` with Retry answering `RetryLimit`; the
+    /// late commit of the first attempt settles either. A receiver replaced
+    /// between a refusal and its `NotHanded` keeps the message attempting
+    /// through the resumed attempt, and one that dies with no successor has
+    /// both attempts fenced and the message repeated to the next receiver,
+    /// approved.
     #[spec("inbox/attempts/040")]
     #[test]
     fn attempts_040_refused_repeats_spend_the_budget_and_recover_by_commit_or_retry() {

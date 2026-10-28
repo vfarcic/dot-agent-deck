@@ -978,6 +978,32 @@ test("pi_028 a replacement carries a hand-over waiting for approval and the queu
 	assert.deepEqual(child.refs("not_handed").concat(second.refs("not_handed")), []);
 });
 
+/// Scenario: A process runs version 4 of the extension's inbox, the last before each approval question carried the receiver's possession, with one message waiting for the deck's approval, and a reload brings this version. The version 4 receiver is replaced rather than kept, and the successor asks about the carried message with its possession on the same line, listing that message.
+test("pi_028 a reload from version 4 replaces the receiver that asked without its possession", async () => {
+	assert.ok(INBOX_VERSION > 4, "a reload keeps version 4's receiver, which asks `may` without its possession (#1940)");
+	const { pi, child } = await started();
+	child.grant = undefined;
+	child.hand(ref(ID));
+	await settle();
+	(globalThis as any)[PROCESS].version = 4;
+	await pi.emit("session_shutdown", { reason: "reload" });
+	const next = instance();
+	const start = next.emit("session_start", { reason: "reload" });
+	await settle();
+	assert.equal(child.ended, true, "version 4's receiver is replaced, not kept");
+	child.exit(0);
+	await start;
+	assert.equal(spawned.length, 2);
+	const second = watcher();
+	second.register(8, { resume: [ref(ID)] });
+	await settle();
+	assert.deepEqual(second.sent("resume_answers").flat().map((r: any) => r.answer), ["retained"], "its state is carried");
+	const asks = second.lines.filter((l) => "may" in l);
+	assert.deepEqual(asks.map((l) => ({ id: l.may.id, a: l.may.a, e: l.may.e })), [ref(ID)]);
+	assert.deepEqual(asks[0].possess?.held, [ref(ID)], "the successor's question carries what it holds");
+	assert.equal(next.sends.length, 1);
+});
+
 /// Scenario: An attempt passes the gate, and a reload of a different version replaces the receiver. The reload's successor owns it: a later settle with nothing queued after a run releases it lost, and so does the successor's own /new; either way a revoke is answered already_handed, never not handed.
 test("pi_028 a replacement carries the reload's ownership of what passed", async () => {
 	for (const end of ["settle", "new"]) {
