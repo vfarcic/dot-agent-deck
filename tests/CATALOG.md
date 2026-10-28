@@ -13094,3 +13094,29 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 - **Asserts:** the native child has nonzero dimensions matching the overlay frame; OCR of the composed X display inside that frame finds the real PR title; Back, Open in browser and Close are visible and usable; Close and Escape from both the toolbar and focused GitHub page remove the overlay and native view; the system-browser handoff receives the real PR URL. The same checks run from the agent pane and the overview row as a control.
 - **Does not assert:** macOS WKWebView or Windows WebView2 placement; GitHub login or cookie persistence; real-agent work. The system browser is replaced by a URL recorder, while the embedded GitHub page is real.
 - **Platform coverage:** Verified on Linux WebKitGTK only, under Xvfb at 96 DPI; macOS WKWebView is not covered and the reported macOS blank/unclosable page was not reproduced here. In addition to the driver tier's prerequisites, this local scenario needs authenticated `gh`, network access to GitHub and PR #1601, Tesseract (`DAD_DRIVER_TESSERACT` or PATH), `/usr/bin/python3` with PyGObject/Gdk 3, and `xdotool` (`DAD_DRIVER_XDOTOOL` or PATH). Nix WebKitGTK also needs its `glib-networking` modules supplied in `GIO_EXTRA_MODULES` for HTTPS. From the repository root, run `DAD_DRIVER_REAL_GITHUB=1 bash desktop/scripts/driver-test.sh` to build and run the driver suite including this scenario; use `--no-build` only with an existing driver-seam-enabled embedded bundle. Evidence, including passing runs, is saved under the gitignored `desktop/driver-results/pull-request-live-<pid>/`.
+
+## Test Case Catalog (continued: tool-operation completion)
+
+##### telemetry/otlp/021 — A normally ended operation has no forced-closure marker.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_operation_end.rs`); real hook CLI and local OTLP/JSON receiver.
+- **Agent:** none; a `cat` stand-in receives synthetic Claude hooks.
+- **Asserts:** matching Bash start/end hooks export the shell operation before run end, omit the `deck.operation.end` attribute entirely, leave the card Working without Error, and closing the pane retains exactly that operation unchanged.
+- **Does not assert:** real-agent hook emission, desktop rendering, or Error end events.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/022 — An operation left open at run end identifies forced closure.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_operation_end.rs`), local OTLP/JSON receiver.
+- **Agent:** none; a `cat` stand-in.
+- **Asserts:** closing a pane with an open shell call exports an operation with `deck.operation.end=run_end` and the run's end timestamp.
+- **Does not assert:** natural exit or daemon shutdown individually, or real-agent execution.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/023 — The open-operation cap identifies the operation it closes.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_operation_end.rs`), local OTLP/JSON receiver.
+- **Agent:** none; a `cat` stand-in.
+- **Asserts:** one more call than the cap exports the oldest call before run end with `deck.operation.end=cap`; its late end leaves the remaining calls for run-end closure.
+- **Does not assert:** sustained overload or real parallel agent calls.
+- **Platform coverage:** mac+linux.

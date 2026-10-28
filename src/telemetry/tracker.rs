@@ -121,6 +121,29 @@ impl EndReason {
     }
 }
 
+/// How an operation ended: on the agent's own end event, or by the deck with
+/// the call still open, so its duration is not the command's (issue #1981).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperationEnd {
+    /// The agent reported the call's end.
+    Agent,
+    /// Still open when its run ended.
+    RunEnd,
+    /// The oldest open call, ended to stay under [`MAX_OPEN_OPERATIONS`].
+    Cap,
+}
+
+impl OperationEnd {
+    /// The `deck.operation.end` value, absent for an end the agent reported.
+    fn as_str(self) -> Option<&'static str> {
+        match self {
+            OperationEnd::Agent => None,
+            OperationEnd::RunEnd => Some("run_end"),
+            OperationEnd::Cap => Some("cap"),
+        }
+    }
+}
+
 /// The orchestration a pane is a role of.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OrchestrationInfo {
@@ -749,7 +772,8 @@ impl RunTracker {
             self.finished.push(status_span(&run, open, now));
         }
         for open in std::mem::take(&mut run.operations) {
-            self.finished.push(operation_span(&run, open, now));
+            self.finished
+                .push(operation_span(&run, open, now, OperationEnd::RunEnd));
         }
         if let Some(effect) = run.ci.end_run() {
             record_ci(&mut run, effect, now, &mut self.finished);
@@ -936,7 +960,7 @@ fn observe_operation(
         EventType::ToolStart => {
             if run.operations.len() >= MAX_OPEN_OPERATIONS {
                 let oldest = run.operations.remove(0);
-                finished.push(operation_span(run, oldest, now));
+                finished.push(operation_span(run, oldest, now, OperationEnd::Cap));
             }
             run.operations_count += 1;
             run.operations.push(OpenOperation {
@@ -964,7 +988,7 @@ fn observe_operation(
             };
             if let Some(i) = i {
                 let open = run.operations.remove(i);
-                finished.push(operation_span(run, open, now));
+                finished.push(operation_span(run, open, now, OperationEnd::Agent));
             }
         }
         _ => {}
@@ -1143,7 +1167,7 @@ fn status_span(run: &ActiveRun, open: OpenStatus, now: u64) -> SpanRecord {
     }
 }
 
-fn operation_span(run: &ActiveRun, open: OpenOperation, now: u64) -> SpanRecord {
+fn operation_span(run: &ActiveRun, open: OpenOperation, now: u64, end: OperationEnd) -> SpanRecord {
     let mut attributes = identity_attributes(&run.start_info);
     let described = &open.operation;
     attributes.extend(Attribute::opt_str(
@@ -1166,6 +1190,7 @@ fn operation_span(run: &ActiveRun, open: OpenOperation, now: u64) -> SpanRecord 
         AttrKey::OperationWrappedWord,
         described.wrapped.word.as_deref(),
     ));
+    attributes.extend(Attribute::opt_str(AttrKey::OperationEnd, end.as_str()));
     SpanRecord {
         trace_id: run.trace_id,
         span_id: open.span_id,
@@ -2174,7 +2199,15 @@ pub(crate) mod tests {
                 (op_attrs(Some("rwx"), Some("sandbox")), 11, 13),
                 (op_attrs(Some("cargo"), Some("test")), 10, 15),
                 (op_attrs(Some("echo"), None), 16, 17),
-                (op_attrs(Some("cargo"), None), 18, 100),
+                (
+                    [
+                        op_attrs(Some("cargo"), None),
+                        vec![Attribute::str(AttrKey::OperationEnd, "run_end")],
+                    ]
+                    .concat(),
+                    18,
+                    100
+                ),
             ]
         );
         let run = run_span_of(&spans);
@@ -2383,9 +2416,19 @@ pub(crate) mod tests {
         );
     }
 
-    /// Starts whose end never arrives are bounded per run.
+    /// Starts whose end never arrives are bounded per run, and the deck marks
+    /// each operation it ends itself with why: `cap` for one the bound evicts,
+    /// `run_end` for one still open when its run ends. An end the agent
+    /// reports carries no mark.
     #[test]
     fn open_operations_are_bounded() {
+        let ends = |spans: &[SpanRecord]| {
+            spans
+                .iter()
+                .filter(|s| s.name == SPAN_AGENT_OPERATION)
+                .map(|s| attr(s, AttrKey::OperationEnd).cloned())
+                .collect::<Vec<_>>()
+        };
         let mut tracker = RunTracker::new();
         tracker.begin_run(start("p1"), 0);
         for t in 0..(MAX_OPEN_OPERATIONS as u64 + 3) {
@@ -2394,11 +2437,16 @@ pub(crate) mod tests {
                 t,
             );
         }
-        assert_eq!(operations(&tracker.take_finished()).len(), 3);
+        assert_eq!(
+            ends(&tracker.take_finished()),
+            vec![Some(AttrValue::Str("cap".into())); 3]
+        );
+        tracker.observe_event(&shell("p1", EventType::ToolEnd, "Bash", None, None), 500);
+        assert_eq!(ends(&tracker.take_finished()), vec![None]);
         tracker.end_run("p1", EndReason::Exited, None, 1000);
         assert_eq!(
-            operations(&tracker.take_finished()).len(),
-            MAX_OPEN_OPERATIONS
+            ends(&tracker.take_finished()),
+            vec![Some(AttrValue::Str("run_end".into())); MAX_OPEN_OPERATIONS - 1]
         );
     }
 
