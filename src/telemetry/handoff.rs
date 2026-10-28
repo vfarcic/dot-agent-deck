@@ -1049,6 +1049,91 @@ mod tests {
         assert_eq!(count(WORKER), None, "not on a worker that received none");
     }
 
+    /// The uncorrelated-report count on each `agent.run` span finished now,
+    /// by run id.
+    fn uncorrelated_counts(tracker: &mut RunTracker) -> Vec<(String, Option<AttrValue>)> {
+        let mut counts: Vec<_> = tracker
+            .take_finished()
+            .iter()
+            .filter(|s| s.name == SPAN_AGENT_RUN)
+            .map(|s| {
+                (
+                    text(s, AttrKey::RunId).unwrap().to_string(),
+                    attr(s, AttrKey::HandoffsUncorrelatedCount).cloned(),
+                )
+            })
+            .collect();
+        counts.sort_by(|a, b| a.0.cmp(&b.0));
+        counts
+    }
+
+    /// The orchestrator's generation `agent` on [`ORCH`].
+    fn orchestrator(agent: &str) -> RunStart {
+        let mut orch = start(ORCH);
+        orch.run_id = format!("run-{agent}");
+        orch.agent_id = Some(agent.into());
+        orch
+    }
+
+    /// PR #2010 review: a report naming no task that reaches the
+    /// orchestrator while its run is prepared, its `Commit` not applied yet,
+    /// is counted on that run once it opens.
+    #[test]
+    fn a_report_naming_no_task_before_its_runs_commit_counts_once_it_opens() {
+        let mut tracker = RunTracker::new();
+        tracker.prepare_run(orchestrator("orch-agent"), 0);
+        tracker.observe_inbox(&uncorrelated(false), 10);
+        tracker.observe_inbox(&uncorrelated(false), 15);
+        tracker.commit_run("run-orch-agent");
+        tracker.end_run(ORCH, EndReason::Exited, None, 30);
+        assert_eq!(
+            uncorrelated_counts(&mut tracker),
+            vec![("run-orch-agent".into(), Some(AttrValue::Int(2)))]
+        );
+    }
+
+    /// PR #2010 review: a report naming no task that reaches a generation a
+    /// newer one replaced, while the older one still runs, is counted on the
+    /// older generation's run, not the newer one.
+    #[test]
+    fn a_report_naming_no_task_for_a_replaced_generation_counts_on_that_generation() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(orchestrator("orch-agent"), 0);
+        tracker.begin_run(orchestrator("orch-agent-2"), 5);
+        tracker.observe_inbox(&uncorrelated(false), 10);
+        tracker.end_agent_run(ORCH, Some("orch-agent"), EndReason::Exited, None, 20);
+        tracker.end_run(ORCH, EndReason::Exited, None, 30);
+        assert_eq!(
+            uncorrelated_counts(&mut tracker),
+            vec![
+                ("run-orch-agent".into(), Some(AttrValue::Int(1))),
+                ("run-orch-agent-2".into(), None),
+            ]
+        );
+    }
+
+    /// PR #2010 review: after a restart, a report naming no task that
+    /// reaches the generation whose run has ended is counted on no run: not
+    /// on the new generation, open or prepared.
+    #[test]
+    fn a_report_for_an_ended_generation_is_not_counted_on_the_one_after_a_restart() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(orchestrator("orch-agent"), 0);
+        tracker.end_run(ORCH, EndReason::Exited, None, 5);
+        tracker.prepare_run(orchestrator("orch-agent-2"), 6);
+        tracker.observe_inbox(&uncorrelated(false), 7);
+        tracker.commit_run("run-orch-agent-2");
+        tracker.observe_inbox(&uncorrelated(false), 10);
+        tracker.end_run(ORCH, EndReason::Exited, None, 30);
+        assert_eq!(
+            uncorrelated_counts(&mut tracker),
+            vec![
+                ("run-orch-agent".into(), None),
+                ("run-orch-agent-2".into(), None),
+            ]
+        );
+    }
+
     #[test]
     fn no_task_or_report_text_reaches_a_span() {
         let mut tracker = team("worker-1");

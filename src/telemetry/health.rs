@@ -4,7 +4,8 @@
 //! Each span covers the interval since the last one and says:
 //!
 //! - `deck.daemon.memory.rss`: the daemon's resident memory in bytes, read
-//!   from `/proc/self/status` (Linux only; absent elsewhere);
+//!   from `/proc/self/status` on the blocking pool as the interval ends
+//!   (Linux only; absent elsewhere);
 //! - `deck.daemon.runs.open`: the runs the tracker holds open or prepared,
 //!   one per agent PTY the deck started;
 //! - `deck.daemon.hook_latency.count`, and when it is not zero `.p50_ms`,
@@ -107,12 +108,18 @@ impl Window {
         }
     }
 
-    /// End this interval at `now` with the measures taken then, giving its
-    /// span, and start the next one.
-    pub fn close(&mut self, now: u64, runs_open: usize, dropped: u64) -> SpanRecord {
+    /// End this interval at `now` with the measures taken then (`rss` from
+    /// [`rss_bytes`]), giving its span, and start the next one.
+    pub fn close(
+        &mut self,
+        now: u64,
+        runs_open: usize,
+        rss: Option<u64>,
+        dropped: u64,
+    ) -> SpanRecord {
         let next = Window::seeded(now, self.rng.next());
         let window = std::mem::replace(self, next);
-        window.span(now, runs_open, rss_bytes(), dropped)
+        window.span(now, runs_open, rss, dropped)
     }
 
     fn span(mut self, now: u64, runs_open: usize, rss: Option<u64>, dropped: u64) -> SpanRecord {
@@ -192,15 +199,26 @@ fn int(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
-/// This process's resident memory in bytes, where the OS says.
+/// This process's resident memory in bytes, where the OS says, read on the
+/// blocking pool: the caller is the telemetry ingest task, which must not
+/// wait on a file read on an async worker.
+pub async fn rss_bytes() -> Option<u64> {
+    off_worker(read_rss).await
+}
+
+/// `read`, run on the blocking pool; `None` if it panicked.
+async fn off_worker(read: fn() -> Option<u64>) -> Option<u64> {
+    tokio::task::spawn_blocking(read).await.ok().flatten()
+}
+
 #[cfg(target_os = "linux")]
-fn rss_bytes() -> Option<u64> {
+fn read_rss() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     rss_from_status(&status)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn rss_bytes() -> Option<u64> {
+fn read_rss() -> Option<u64> {
     None
 }
 
@@ -271,7 +289,7 @@ mod tests {
                 (2_400..=3_050).contains(&late),
                 "seed {seed}: {late} of {MAX_SAMPLES} kept samples are late"
             );
-            let span = window.close(2_000 * ms, 0, 0);
+            let span = window.close(2_000 * ms, 0, None, 0);
             assert_eq!(
                 attr(&span, AttrKey::HookLatencyCount),
                 Some(&AttrValue::Int(3 * MAX_SAMPLES as i64))
@@ -323,7 +341,7 @@ mod tests {
         }
         // A stamp from the future is no delay, not a negative one.
         window.record(5_000 * ms, 4_000 * ms);
-        let span = window.close(2_000 * ms, 0, 0);
+        let span = window.close(2_000 * ms, 0, None, 0);
         assert_eq!(
             attr(&span, AttrKey::HookLatencyCount),
             Some(&AttrValue::Int(101))
@@ -340,7 +358,7 @@ mod tests {
             attr(&span, AttrKey::HookLatencyMax),
             Some(&AttrValue::Int(100))
         );
-        let next = window.close(3_000 * ms, 0, 0);
+        let next = window.close(3_000 * ms, 0, None, 0);
         assert_eq!(next.start_unix_nanos, 2_000 * ms);
         assert_eq!(
             attr(&next, AttrKey::HookLatencyCount),
@@ -353,7 +371,7 @@ mod tests {
     fn a_single_sample_is_every_quantile() {
         let mut window = Window::new(0);
         window.record(0, 1_500_000_000);
-        let span = window.close(2_000_000_000, 1, 0);
+        let span = window.close(2_000_000_000, 1, None, 0);
         for key in [
             AttrKey::HookLatencyP50,
             AttrKey::HookLatencyP95,
@@ -369,6 +387,24 @@ mod tests {
         assert_eq!(rss_from_status(status), Some(1234 * 1024));
         assert_eq!(rss_from_status("Name:\tdeck\n"), None);
         #[cfg(target_os = "linux")]
-        assert!(rss_bytes().is_some_and(|b| b > 0));
+        assert!(read_rss().is_some_and(|b| b > 0));
+    }
+
+    /// Qodo review on PR #2010: the read runs on the blocking pool, not on
+    /// the async worker the ingest task is polled on, and its answer comes
+    /// back to the caller.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rss_is_read_off_the_async_worker() {
+        static READ_ON: std::sync::Mutex<Option<std::thread::ThreadId>> =
+            std::sync::Mutex::new(None);
+        fn read() -> Option<u64> {
+            *READ_ON.lock().unwrap() = Some(std::thread::current().id());
+            Some(7)
+        }
+        assert_eq!(off_worker(read).await, Some(7));
+        let read_on = READ_ON.lock().unwrap().expect("the read ran");
+        assert_ne!(read_on, std::thread::current().id());
+        #[cfg(target_os = "linux")]
+        assert!(rss_bytes().await.is_some_and(|b| b > 0));
     }
 }

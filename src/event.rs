@@ -1041,6 +1041,14 @@ pub const QUESTION_ANSWERED_BY_DECK_METADATA_VALUE: &str = "1";
 /// been. The daemon's alone, like [`QUESTION_ANSWERED_BY_DECK_METADATA_KEY`].
 pub const QUESTION_RELEASED_BY_DECK_METADATA_KEY: &str = "question_released_by_deck";
 
+/// Issue #1981 (PR #2010 review): the daemon's marker on the event it ingests
+/// after typing part of a question's answer and stopping
+/// (`crate::daemon::deck_keyboard_only_event`), so telemetry does not count
+/// it as an agent's hook. The daemon's alone: stripped from every producer
+/// frame. Only the key is read; its value is
+/// [`QUESTION_ANSWERED_BY_DECK_METADATA_VALUE`].
+pub const QUESTION_KEYBOARD_ONLY_BY_DECK_METADATA_KEY: &str = "question_keyboard_only_by_deck";
+
 /// Where a permission prompt stands, on the events the OpenCode hook builds
 /// from one: `pending` on the ask, [`PERMISSION_STATE_REPLIED`] on the answer.
 /// PRD #1631: a question form's answer or dismissal is marked replied too.

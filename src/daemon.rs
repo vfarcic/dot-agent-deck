@@ -2862,6 +2862,10 @@ pub(crate) fn deck_keyboard_only_event(
         background_revision: None,
     };
     event.set_question(question);
+    event.metadata.insert(
+        crate::event::QUESTION_KEYBOARD_ONLY_BY_DECK_METADATA_KEY.to_string(),
+        crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_VALUE.to_string(),
+    );
     event
 }
 
@@ -2968,6 +2972,9 @@ fn admit_producer_event(event: &mut AgentEvent) {
     event
         .metadata
         .remove(crate::event::QUESTION_RELEASED_BY_DECK_METADATA_KEY);
+    event
+        .metadata
+        .remove(crate::event::QUESTION_KEYBOARD_ONLY_BY_DECK_METADATA_KEY);
     if event
         .metadata
         .contains_key(crate::event::QUESTION_METADATA_KEY)
@@ -7767,6 +7774,49 @@ mod quota_admission_tests {
             background: None,
             background_revision: None,
         }
+    }
+
+    /// Issue #1981 (PR #2010 review): the event the daemon ingests after
+    /// typing part of an answer carries its keyboard-only marker, so
+    /// telemetry does not count it as an agent's hook, and a producer frame
+    /// claiming the marker loses it.
+    #[test]
+    fn the_keyboard_only_marker_is_the_daemons_alone() {
+        use crate::event::QUESTION_KEYBOARD_ONLY_BY_DECK_METADATA_KEY;
+        let question: crate::question::PendingQuestion =
+            serde_json::from_value(serde_json::json!({
+                "id": "q1",
+                "kind": "permission",
+                "questions": [{"prompt": "Allow?", "options": [
+                    {"index": 1, "label": "Yes", "role": "allow_once"},
+                    {"index": 2, "label": "No", "role": "deny"},
+                ]}],
+                "raised_at_ms": 1,
+                "channel": "unsupported",
+            }))
+            .unwrap();
+        let made = deck_keyboard_only_event(
+            "s".to_string(),
+            AgentType::ClaudeCode,
+            Some("pane-1".to_string()),
+            Some("1".to_string()),
+            &question,
+        );
+        assert!(
+            made.metadata
+                .contains_key(QUESTION_KEYBOARD_ONLY_BY_DECK_METADATA_KEY)
+        );
+        let mut forged = quota_frame(crate::event::EventType::Unknown);
+        forged.metadata.insert(
+            QUESTION_KEYBOARD_ONLY_BY_DECK_METADATA_KEY.to_string(),
+            crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_VALUE.to_string(),
+        );
+        admit_producer_event(&mut forged);
+        assert!(
+            !forged
+                .metadata
+                .contains_key(QUESTION_KEYBOARD_ONLY_BY_DECK_METADATA_KEY)
+        );
     }
 
     /// Scenario: Post a `quota_blocked` event on the hook socket as a producer

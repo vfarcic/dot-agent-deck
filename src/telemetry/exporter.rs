@@ -1860,9 +1860,16 @@ impl Shared {
 
     /// Issue #1981 M8: `event` was read off the broadcast now: count how long
     /// it took from its hook's stamp, when an agent's hook produced it
-    /// ([`super::health`]).
+    /// ([`super::health`]). The question the daemon turns keyboard-only after
+    /// typing part of its answer is the daemon's own, though
+    /// [`crate::event::AgentEvent::is_daemon_synthetic`] does not say so.
     fn record_hook_latency(&self, event: &crate::event::AgentEvent) {
-        if self.health_interval.is_none() || event.is_daemon_synthetic() {
+        if self.health_interval.is_none()
+            || event.is_daemon_synthetic()
+            || event
+                .metadata
+                .contains_key(crate::event::QUESTION_KEYBOARD_ONLY_BY_DECK_METADATA_KEY)
+        {
             return;
         }
         let Some(stamped) = event
@@ -1879,9 +1886,9 @@ impl Shared {
         self.health.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Issue #1981 M8: end the health interval open now and queue its
-    /// `daemon.health` span.
-    fn sample_health(&self) {
+    /// Issue #1981 M8: end the health interval at `now`, the daemon's
+    /// resident memory then being `rss`, and queue its `daemon.health` span.
+    fn sample_health(&self, now: u64, rss: Option<u64>) {
         let runs_open = self
             .tracker
             .lock()
@@ -1890,9 +1897,7 @@ impl Shared {
         let dropped = self
             .dropped_total
             .load(std::sync::atomic::Ordering::Relaxed);
-        let span = self
-            .lock_health()
-            .close(now_unix_nanos(), runs_open, dropped);
+        let span = self.lock_health().close(now, runs_open, rss, dropped);
         self.enqueue(vec![span]);
     }
 
@@ -2045,7 +2050,12 @@ async fn run_ingest(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiver<C
             }
             () = next_tick(&mut health) => {
                 drain(&shared, &mut events, &mut read).await;
-                shared.sample_health();
+                // The interval ends now; the memory read off this worker
+                // after it is that end's. No event is read meanwhile, and no
+                // lock is held across the read.
+                let now = now_unix_nanos();
+                let rss = super::health::rss_bytes().await;
+                shared.sample_health(now, rss);
             }
             msg = next_event(&mut events) => match msg {
                 Ok(msg) => {
@@ -6616,15 +6626,15 @@ mod tests {
         // Two fit; three are refused.
         shared.enqueue((0..5).map(|_| some_span()).collect());
         // A health span sampled now says three, and is refused itself.
-        shared.sample_health();
+        shared.sample_health(now_unix_nanos(), None);
         let held = captured(&mut rx);
         assert_eq!(held.len(), 2);
         assert!(held.iter().all(|s| s.name == SPAN_AGENT_RUN));
         // Room again: two samples in a row, each counting the refused one.
-        shared.sample_health();
-        shared.sample_health();
+        shared.sample_health(now_unix_nanos(), None);
+        shared.sample_health(now_unix_nanos(), None);
         // The queue is full again: this sample is refused.
-        shared.sample_health();
+        shared.sample_health(now_unix_nanos(), None);
         let samples = captured(&mut rx);
         let dropped: Vec<_> = samples
             .iter()
@@ -6634,7 +6644,7 @@ mod tests {
             })
             .collect();
         assert_eq!(dropped, vec![Some(4), Some(4)]);
-        shared.sample_health();
+        shared.sample_health(now_unix_nanos(), None);
         let next = captured(&mut rx);
         assert_eq!(next.len(), 1);
         assert_eq!(health_attr(&next[0], AttrKey::SpansDropped), Some(5));
@@ -6693,7 +6703,72 @@ mod tests {
             health
                 .iter()
                 .all(|s| health_attr(s, AttrKey::DaemonRunsOpen) == Some(1))
+        ); // The memory read off the ingest task's worker reaches each sample.
+        #[cfg(target_os = "linux")]
+        assert!(
+            health
+                .iter()
+                .all(|s| health_attr(s, AttrKey::DaemonMemoryRss).is_some_and(|b| b > 0)),
+            "{health:?}"
         );
+    }
+
+    /// Greptile review on PR #2010: the question the daemon turns
+    /// keyboard-only after typing part of its answer is broadcast as an
+    /// `unknown` event stamped by the daemon. It is not an agent's hook, so
+    /// only the agent's own event counts toward the interval's hook latency.
+    #[tokio::test]
+    async fn a_question_the_deck_made_keyboard_only_is_no_hook_latency_sample() {
+        let (sink, mut rx) = mpsc::channel(QUEUE_CAPACITY);
+        let telemetry = Arc::new(Telemetry::start_with(
+            &env(&ON),
+            Settings {
+                sink: Some(sink),
+                // Sampled by hand below, not by the interval.
+                health_interval: Some(Duration::from_secs(3600)),
+                ..Settings::default()
+            },
+        ));
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("p1", "a1"), &[]);
+        let mut produced = event("p1", EventType::Thinking);
+        produced.agent_id = Some("a1".into());
+        produced.timestamp = chrono::Utc::now() - chrono::Duration::milliseconds(1500);
+        tx.send(BroadcastMsg::Event(produced)).unwrap();
+        let question: crate::question::PendingQuestion =
+            serde_json::from_value(serde_json::json!({
+                "id": "q1",
+                "kind": "permission",
+                "questions": [{"prompt": "Allow?", "options": [
+                    {"index": 1, "label": "Yes", "role": "allow_once"},
+                    {"index": 2, "label": "No", "role": "deny"},
+                ]}],
+                "raised_at_ms": 1,
+                "channel": "unsupported",
+                "revision": 2,
+            }))
+            .unwrap();
+        let mut keyboard_only = crate::daemon::deck_keyboard_only_event(
+            "p1-session".into(),
+            crate::event::AgentType::ClaudeCode,
+            Some("p1".into()),
+            Some("a1".into()),
+            &question,
+        );
+        keyboard_only.timestamp = chrono::Utc::now() - chrono::Duration::milliseconds(9000);
+        tx.send(BroadcastMsg::Event(keyboard_only)).unwrap();
+        telemetry.settled().await;
+        let shared = &telemetry.exporting.as_ref().unwrap().shared;
+        shared.sample_health(now_unix_nanos(), None);
+        let health: Vec<_> = captured(&mut rx)
+            .into_iter()
+            .filter(|s| s.name == crate::telemetry::SPAN_DAEMON_HEALTH)
+            .collect();
+        assert_eq!(health.len(), 1, "{health:?}");
+        assert_eq!(health_attr(&health[0], AttrKey::HookLatencyCount), Some(1));
+        let max = health_attr(&health[0], AttrKey::HookLatencyMax).unwrap();
+        assert!((1500..9000).contains(&max), "{max}");
     }
 
     /// Issue #1981 M7 review: a post keeps its place on the broadcast. With
@@ -7120,6 +7195,48 @@ mod tests {
         nudge.await.unwrap();
         telemetry.settled().await;
         captured(&mut rx)
+    }
+
+    /// PR #2010 review: with the ingest task paused, the orchestrator's run
+    /// is prepared and its commit queued, and a report naming no task then
+    /// reaches the orchestrator, before its pane-close. Resumed, the report
+    /// is counted on the run, in its place before the close.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_report_naming_no_task_before_a_queued_commit_counts_on_the_run() {
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("work", "wa"), &[]);
+        telemetry.settled().await;
+        let (resume, nudge) = pause_ingest(&telemetry).await;
+        let orch = telemetry
+            .prepare_run(generation("orch", "oa"), &[], None)
+            .unwrap();
+        orch.commit();
+        let BroadcastMsg::Inbox(mut notice) = inbox("orch", "m-n", crate::inbox::StateName::Queued)
+        else {
+            unreachable!()
+        };
+        notice.agent_id = Some("oa".into());
+        notice.provenance = Some(crate::report_recovery::ReportProvenance::Uncorrelated {
+            report_id: "r".into(),
+            producer: crate::report_recovery::Producer {
+                pane_id: "work".into(),
+                agent_id: "wa".into(),
+                role: None,
+            },
+        });
+        tx.send(BroadcastMsg::Inbox(notice)).unwrap();
+        tx.send(pane_closed("orch", "oa")).unwrap();
+        resume.send(()).unwrap();
+        nudge.await.unwrap();
+        telemetry.settled().await;
+        let spans = captured(&mut rx);
+        assert_eq!(
+            attr(run_on(&spans, "orch"), AttrKey::HandoffsUncorrelatedCount),
+            Some(&AttrValue::Int(1)),
+            "{spans:?}"
+        );
     }
 
     fn event_names(span: &SpanRecord) -> Vec<&'static str> {

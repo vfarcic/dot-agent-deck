@@ -275,8 +275,9 @@ struct PendingRun {
     /// applied by [`RunTracker::commit_run`] once the run opens.
     ended: Option<(EndReason, Option<i32>, u64)>,
     /// Issue #1981 M7: tasks this run's agent delegated before the run
-    /// opened, and the inbox notices about them seen since, in the order
-    /// seen, each with how many of `events` were held before it, so
+    /// opened, the inbox notices about them seen since, and the reports
+    /// naming no task its agent received, in the order seen, each with how
+    /// many of `events` were held before it, so
     /// [`RunTracker::commit_run`] applies each in its place among them
     /// ([`RunTracker::place_post`], [`RunTracker::observe_inbox`]).
     handoffs: Vec<(usize, HeldHandoff)>,
@@ -290,6 +291,9 @@ enum HeldHandoff {
     Post(Posted),
     /// An inbox change about a held post, and when it was seen.
     Notice(Change, u64),
+    /// Reports naming no task that reached this run's agent, counted on the
+    /// run once it opens ([`RunTracker::observe_inbox`]).
+    Uncorrelated(u64),
 }
 
 /// A run's own card state, dropped with the run. Tests count the live ones
@@ -545,7 +549,21 @@ impl PendingRun {
     }
 
     fn held_notices(&self) -> usize {
-        self.handoffs.len() - self.held_posts()
+        self.handoffs
+            .iter()
+            .filter(|(_, held)| matches!(held, HeldHandoff::Notice(..)))
+            .count()
+    }
+
+    /// Count a report naming no task, after the events held so far: one
+    /// arriving with no event held since the last adds to its count, so there
+    /// is at most one more entry than events held ([`MAX_PENDING_EVENTS`]).
+    fn hold_uncorrelated(&mut self) {
+        let before = self.events.len();
+        match self.handoffs.last_mut() {
+            Some((at, HeldHandoff::Uncorrelated(count))) if *at == before => *count += 1,
+            _ => self.handoffs.push((before, HeldHandoff::Uncorrelated(1))),
+        }
     }
 
     fn holds_post(&self, task: &str) -> bool {
@@ -867,14 +885,29 @@ impl RunTracker {
             .map(|p| std::mem::take(&mut p.handoffs))
             .unwrap_or_default();
         for (_, held) in held {
-            self.apply_held(held);
+            self.apply_held(run_id, held);
         }
     }
 
-    fn apply_held(&mut self, held: HeldHandoff) {
+    /// Apply `held`, held for the prepared run `run_id`.
+    fn apply_held(&mut self, run_id: &str, held: HeldHandoff) {
         match held {
             HeldHandoff::Post(posted) => self.delegate_posted(posted),
             HeldHandoff::Notice(change, at) => self.apply_change(change, at),
+            HeldHandoff::Uncorrelated(count) => self.count_uncorrelated(run_id, count),
+        }
+    }
+
+    /// Add `count` reports naming no task to the run `run_id`, open or
+    /// replaced; a run that did not open or has ended is not counted on.
+    fn count_uncorrelated(&mut self, run_id: &str, count: u64) {
+        if let Some(run) = self
+            .runs
+            .values_mut()
+            .chain(self.replaced.iter_mut().map(|r| &mut r.run))
+            .find(|run| run.start_info.run_id == run_id)
+        {
+            run.uncorrelated_reports += count;
         }
     }
 
@@ -899,12 +932,12 @@ impl RunTracker {
         let mut handoffs = pending.handoffs.into_iter().peekable();
         for (index, (event, at)) in pending.events.into_iter().enumerate() {
             while let Some((_, held)) = handoffs.next_if(|(before, _)| *before <= index) {
-                self.apply_held(held);
+                self.apply_held(run_id, held);
             }
             self.observe_kept(event, at);
         }
         for (_, held) in handoffs {
-            self.apply_held(held);
+            self.apply_held(run_id, held);
         }
         if let Some((reason, exit_code, at)) = pending.ended {
             self.end_run(&pane_id, reason, exit_code, at);
@@ -1721,19 +1754,32 @@ impl RunTracker {
 
     /// Issue #1981 M7: apply one inbox state change from the daemon's
     /// broadcast to the hand-off it concerns, or count a report that names
-    /// no task on the run of the agent it reached.
+    /// no task on the run of the agent it reached: that agent's generation
+    /// on its pane, whether its run is open, replaced and waiting for its
+    /// end, or prepared ([`run_ref`]). A prepared run holds the count after
+    /// the events held so far, for [`Self::commit_run`] to add in that
+    /// place. A report for a generation whose run has ended is counted on
+    /// no run, never on the generation that replaced it.
     pub fn observe_inbox(&mut self, notice: &crate::event::InboxNotice, now: u64) {
         let Some(change) = Change::of(notice) else {
             return;
         };
         if let Change::Uncorrelated { pane, agent } = &change {
-            if let Some(run) = self.runs.get_mut(pane).filter(|run| {
-                match (run.start_info.agent_id.as_deref(), agent.as_deref()) {
-                    (Some(ours), Some(theirs)) => ours == theirs,
-                    _ => true,
+            let run = run_ref(
+                &self.runs,
+                &self.replaced,
+                &self.pending,
+                pane,
+                agent.as_deref(),
+            );
+            match run {
+                Some(run) if run.span.is_some() => self.count_uncorrelated(&run.run_id, 1),
+                Some(run) => {
+                    if let Some(pending) = self.pending.get_mut(&run.run_id) {
+                        pending.hold_uncorrelated();
+                    }
                 }
-            }) {
-                run.uncorrelated_reports += 1;
+                None => {}
             }
             return;
         }
