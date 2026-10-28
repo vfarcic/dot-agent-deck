@@ -443,7 +443,8 @@ export function AgentTile({
     someone renames it. The role leads for an orchestration role and in the
     preview; outside an orchestration a live deck's role IS the agent type,
     which the binary already says, and so is a role that spells the binary
-    (`Codex` beside `codex`). The model is the preview's alone — a live
+    (`Codex` beside `codex`). With no binary reported, that role is the only
+    word for the type left, so it stays. The model is the preview's alone — a live
     deck has none, and deciding that by mode rather than by matching the word
     the bridge stores means no value the daemon sends can be hidden by its
     spelling.
@@ -451,7 +452,7 @@ export function AgentTile({
   const sameWord = (a: string, b?: string) => b !== undefined && a.trim().toLowerCase() === b.trim().toLowerCase();
   const nameIs = (word: string) => sameWord(word, agent.displayName);
   const identityParts = [
-    (fixture || agent.tab.kind === "orchestration") && !nameIs(agent.role) && !sameWord(agent.role, agent.cli) ? agent.role : undefined,
+    (fixture || agent.tab.kind === "orchestration" || !agent.cli) && !nameIs(agent.role) && !sameWord(agent.role, agent.cli) ? agent.role : undefined,
     agent.cli && !nameIs(agent.cli) ? agent.cli : undefined,
     fixture ? agent.model : undefined,
   ].filter((part): part is string => Boolean(part));

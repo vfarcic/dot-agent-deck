@@ -60,6 +60,13 @@ describe("the agent tile's header (issue #2001)", () => {
     expect(occurrences(card.querySelector("header")?.textContent ?? null, "claude")).toBe(1);
   });
 
+  /// Scenario: A live agent the user named "reviewer" is on the deck from a daemon that reported no binary for it; the line under its title still names its type, Claude code.
+  it("keeps the type when the daemon reported no binary", () => {
+    const card = tile(liveAgent({ displayName: "reviewer", cliName: undefined }));
+    expect(within(card).getByRole("heading", { level: 2 })).toHaveTextContent(/^reviewer$/);
+    expect(occurrences(card.querySelector("header")?.textContent ?? null, "claude code")).toBe(1);
+  });
+
   /// Scenario: A live agent is on the deck, where the daemon reports no model and the agent holds no lease; nothing on its tile reads "Unavailable".
   it("prints no Unavailable for the model or the lease on a live tile", () => {
     const card = tile(liveAgent({}));

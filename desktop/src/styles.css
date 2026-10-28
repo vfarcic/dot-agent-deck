@@ -608,6 +608,11 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .agent-state-mark.status-needs_input, .agent-state-mark.status-queued { color: var(--amber); background: var(--amber); }
 .agent-title-line { display: flex; align-items: center; gap: 6px; }
 .agent-title-line h2 { margin: 0; font-size: 12px; font-weight: 720; }
+/* Issue #2001: the title is the agent's name, which can be long, so it is the
+   one part of the line that gives way — cut with an ellipsis, the whole name in
+   its tooltip — and the status and badges beside it keep their full width. */
+.agent-title-line h2 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-title-line > :not(h2) { flex: 0 0 auto; }
 .agent-identity p { margin: 3px 0 0; overflow: hidden; color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 8.5px; text-overflow: ellipsis; white-space: nowrap; }
 .status-label { padding: 2px 4px; border-radius: 2px; color: var(--faint); background: var(--paper-sunken-strong); font-size: 7px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
 .status-label.status-running { color: var(--teal); background: var(--teal-soft); }
