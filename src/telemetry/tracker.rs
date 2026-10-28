@@ -308,6 +308,9 @@ struct ActiveRun {
     /// deck's record of dispatched units names it
     /// ([`RunTracker::set_dispatch_name`]).
     dispatch_name: Option<String>,
+    /// The agent the run's hooks last named, kept once the card that named it
+    /// is gone ([`resolved_agent`]).
+    learned_agent: Option<AgentType>,
 }
 
 /// A pull request, told apart from another repository's of the same number by
@@ -710,12 +713,19 @@ impl RunTracker {
     /// [`Self::begin_run`], with where the run's agent keeps its usage record.
     fn open_run(&mut self, start: RunStart, now: u64, usage_dirs: UsageDirs) {
         self.expire_replaced(now);
-        if let Some(old) = self.runs.remove(&start.pane_id) {
+        if let Some(mut old) = self.runs.remove(&start.pane_id) {
             let own_end_can_come = matches!(
                 (old.start_info.agent_id.as_deref(), start.agent_id.as_deref()),
                 (Some(a), Some(b)) if a != b
             );
             if own_end_can_come {
+                // A replaced run gets no more pull-request reports, so it
+                // lets go of its pull request now rather than open stretches
+                // and take changes the live run sees.
+                if let Some(key) = old.ci_pr.take() {
+                    let identity = child_identity(&old);
+                    self.release_ci(&key, &old.start_info.run_id, identity, now);
+                }
                 self.replaced.push(ReplacedRun { run: old, at: now });
                 if self.replaced.len() > MAX_REPLACED_RUNS {
                     let oldest = self.replaced.remove(0);
@@ -752,6 +762,7 @@ impl RunTracker {
                 ci_failures: 0,
                 usage: Some(usage),
                 dispatch_name: None,
+                learned_agent: None,
             },
         );
     }
@@ -893,6 +904,9 @@ impl RunTracker {
         // join on that key. A run that started as no known agent takes the
         // kind its hooks name from here on ([`resolved_agent`]).
         run.cards.apply_event(event.clone());
+        if let Some(agent) = hook_agent(run) {
+            run.learned_agent = Some(agent);
+        }
         let pull_request = (event.event_type == EventType::PullRequest)
             .then(|| card_pull_request(&run.cards, event))
             .flatten();
@@ -980,7 +994,11 @@ impl RunTracker {
         if !shared.holders.contains(&run_id) {
             shared.holders.push(run_id);
         }
-        if revision == 0 || revision >= shared.revision {
+        // A report with no checks, or checks in no known state, changes
+        // nothing in the shared state, so it does not order it either: a
+        // result another run reports at an older revision still ends the
+        // stretch.
+        if seen.is_some() && (revision == 0 || revision >= shared.revision) {
             shared.revision = shared.revision.max(revision);
             let was_open = shared.ci.is_open();
             let effects = shared
@@ -1620,11 +1638,21 @@ const AGENT_SOURCE_HOOK: &str = "hook";
 /// The agent `run` is, as far as the deck knows it now, and where that came
 /// from: the kind it started as, which stays even when its hooks name
 /// another; else the kind its hooks have named since, on the latest of the
-/// pane's sessions that names one; else [`AgentType::None`], from nowhere.
+/// pane's sessions that names one, kept when no session does any more (a
+/// `SessionEnd` removed it); else [`AgentType::None`], from nowhere.
 fn resolved_agent(run: &ActiveRun) -> (AgentType, Option<&'static str>) {
     if run.start_info.agent != AgentType::None {
         return (run.start_info.agent.clone(), Some(AGENT_SOURCE_SPAWN));
     }
+    run.learned_agent
+        .clone()
+        .map_or((AgentType::None, None), |agent| {
+            (agent, Some(AGENT_SOURCE_HOOK))
+        })
+}
+
+/// The agent named on the latest of `run`'s pane's sessions that names one.
+fn hook_agent(run: &ActiveRun) -> Option<AgentType> {
     run.cards
         .sessions
         .values()
@@ -1633,9 +1661,7 @@ fn resolved_agent(run: &ActiveRun) -> (AgentType, Option<&'static str>) {
                 && s.agent_type != AgentType::None
         })
         .max_by_key(|s| s.last_activity)
-        .map_or((AgentType::None, None), |s| {
-            (s.agent_type.clone(), Some(AGENT_SOURCE_HOOK))
-        })
+        .map(|s| s.agent_type.clone())
 }
 
 /// The run's agent, as [`resolved_agent`] knows it now, and its role and
@@ -3471,6 +3497,35 @@ pub(crate) mod tests {
         assert_eq!(learned.last(), Some(&text("claude")));
     }
 
+    /// Issue #1981 M4 (review of PR #1991): a run started as no known agent
+    /// keeps the agent its hooks named after a `SessionEnd` removes the card
+    /// that named it, so the run still ends as that agent, from its hooks.
+    #[test]
+    fn a_learned_agent_outlives_its_session_end() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(
+            RunStart {
+                agent: AgentType::None,
+                ..start("p1")
+            },
+            0,
+        );
+        tracker.observe_event(&event("p1", EventType::SessionStart), 1);
+        tracker.observe_event(&event("p1", EventType::ToolStart), 2);
+        tracker.observe_event(&event("p1", EventType::SessionEnd), 3);
+        tracker.end_run("p1", EndReason::Exited, None, 10);
+        let spans = tracker.take_finished();
+        let run = run_span_on(&spans, "p1");
+        assert_eq!(
+            attr(run, AttrKey::Agent),
+            Some(&AttrValue::Str("claude".into()))
+        );
+        assert_eq!(
+            attr(run, AttrKey::AgentSource),
+            Some(&AttrValue::Str("hook".into()))
+        );
+    }
+
     /// Issue #1981 M6: the open runs not yet named list their generations,
     /// and a run named after its dispatched unit carries that name exactly.
     #[test]
@@ -3639,6 +3694,87 @@ pub(crate) mod tests {
             attr(span, AttrKey::CiResult),
             Some(&AttrValue::Str("passing".into()))
         );
+    }
+
+    /// Issue #1981 M3 (review of PR #1991): a report of the pull request
+    /// with no checks changes nothing in the shared state, so it does not
+    /// order it either. Two runs see the checks go pending; a newer report
+    /// with no checks on the first, then the second's result at an older
+    /// revision, still records the round once, with its result.
+    #[test]
+    fn a_report_without_checks_does_not_hide_an_older_result() {
+        let mut tracker = RunTracker::new();
+        for pane in ["p1", "p2"] {
+            tracker.begin_run(start(pane), 0);
+            tracker.observe_event(&event(pane, EventType::SessionStart), 1);
+        }
+        tracker.observe_event(&checks_report("p1", 9, 1, "pending", (0, 0, 0)), 10);
+        tracker.observe_event(&checks_report("p2", 9, 2, "pending", (0, 0, 0)), 11);
+        tracker.observe_event(&pr_report("p1", Some(9), Some(5)), 15);
+        tracker.observe_event(&checks_report("p2", 9, 4, "passing", (3, 0, 0)), 20);
+        tracker.end_run("p1", EndReason::Exited, None, 30);
+        tracker.end_run("p2", EndReason::Exited, None, 30);
+        let spans = tracker.take_finished();
+        let ci = ci_spans(&spans);
+        assert_eq!(ci.len(), 1, "one round: {ci:?}");
+        assert_eq!((ci[0].start_unix_nanos, ci[0].end_unix_nanos), (10, 20));
+        assert_eq!(
+            attr(ci[0], AttrKey::CiResult),
+            Some(&AttrValue::Str("passing".into()))
+        );
+        let s = |v: &str| Some(AttrValue::Str(v.into()));
+        assert_eq!(
+            ci_changes(run_span_on(&spans, "p1")),
+            vec![s("pending"), s("passing")]
+        );
+    }
+
+    /// Issue #1981 M3 (review of PR #1991): a run replaced by its pane's next
+    /// generation lets go of its pull request then. The live run opens the
+    /// next stretch and takes its changes, and no stretch ends before it
+    /// began when the replaced run's own end comes later.
+    #[test]
+    fn a_replaced_run_lets_go_of_its_pull_request() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(generation("p1", "a1"), 0);
+        tracker.observe_event(&event("p1", EventType::SessionStart), 1);
+        tracker.observe_event(&checks_report("p1", 9, 1, "pending", (0, 0, 0)), 10);
+        tracker.begin_run(generation("p1", "a2"), 20);
+        tracker.observe_event(&event("p1", EventType::SessionStart), 21);
+        tracker.observe_event(&checks_report("p1", 9, 2, "pending", (0, 0, 0)), 30);
+        tracker.observe_event(&checks_report("p1", 9, 3, "passing", (3, 0, 0)), 40);
+        tracker.end_agent_run("p1", Some("a1"), EndReason::Exited, None, 50);
+        tracker.end_agent_run("p1", Some("a2"), EndReason::Exited, None, 60);
+        let spans = tracker.take_finished();
+        let run_of = |run_id: &str| {
+            spans
+                .iter()
+                .find(|s| {
+                    s.name == SPAN_AGENT_RUN
+                        && attr(s, AttrKey::RunId) == Some(&AttrValue::Str(run_id.into()))
+                })
+                .unwrap_or_else(|| panic!("an agent.run span for {run_id}"))
+        };
+        let (old, new) = (run_of("run-p1-a1"), run_of("run-p1-a2"));
+        let ci = ci_spans(&spans);
+        for span in &ci {
+            assert!(span.start_unix_nanos <= span.end_unix_nanos, "{span:?}");
+        }
+        let passing = ci
+            .iter()
+            .find(|s| attr(s, AttrKey::CiResult).is_some())
+            .expect("the round the live run saw");
+        assert_eq!(passing.trace_id, new.trace_id, "in the live run's trace");
+        assert_eq!((passing.start_unix_nanos, passing.end_unix_nanos), (30, 40));
+        let unended = ci
+            .iter()
+            .find(|s| attr(s, AttrKey::CiResult).is_none())
+            .expect("the replaced run's stretch, ended as it let go");
+        assert_eq!(unended.trace_id, old.trace_id);
+        assert_eq!((unended.start_unix_nanos, unended.end_unix_nanos), (10, 20));
+        let s = |v: &str| Some(AttrValue::Str(v.into()));
+        assert_eq!(ci_changes(old), vec![s("pending")]);
+        assert_eq!(ci_changes(new), vec![s("pending"), s("passing")]);
     }
 
     /// Issue #1981 M3: a second open run whose card lags is told of a round's
