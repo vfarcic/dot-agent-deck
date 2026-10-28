@@ -90,11 +90,13 @@ pub const MAX_EVENTS_PER_RUN: usize = 1024;
 
 /// Events held for a prepared run until it is committed. Its agent has only
 /// just started, so this is far more than the window ever sees. The same
-/// bound holds the run's posts, and its notices about them, apart: past it, a
-/// 257th post opens at once in a trace of its own with no parent, and a
-/// notice is applied at once ([`RunTracker::place_post`]). That takes 257
-/// posts from one orchestrator before telemetry applies its run's `Commit`,
-/// which is not a realistic workload.
+/// number separately caps the run's held posts and its held notices about
+/// them: a 257th post opens at once in a trace of its own with no parent
+/// ([`RunTracker::place_post`]), and a 257th notice is applied at once, which
+/// puts it in the early buffer to be replayed as its post opens
+/// ([`RunTracker::hold_notice`]). That takes 257 posts, or 257 notices (an
+/// ordinary task produces about five, so about 52 tasks), before telemetry
+/// applies the run's `Commit`, which is not a realistic workload.
 pub const MAX_PENDING_EVENTS: usize = 256;
 
 /// How long a replaced run waits for its own generation's end before it is
