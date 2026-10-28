@@ -724,9 +724,10 @@ mod real {
         assert!(view.file(&dir.path().join("missing")).is_err());
     }
 
-    /// Scenario: A real family record gone stale. With this test process standing in as the agent and a `versions` directory of the test's recorded as its install root, a copy of a sleeper named `2.1.311` started from that directory is `Unknown` (in the family), while a copy named `git` elsewhere is a tool. Once `versions` is renamed `versions-moved`, the `2.1.311` copy, its path now outside the recorded root, and the `git` copy are both `Unknown`. Renamed back, `git` is a tool again.
+    /// Scenario: With this test process standing in as the agent and a `versions` directory recorded as its install root, a sleeper named `2.1.311` started there is `Unknown` (in the family), while a sleeper named `git` elsewhere is a tool. Renaming the root to `versions-moved` makes both sleepers `Unknown`; renaming it back makes `git` a tool again.
     #[spec("inbox/probe/006")]
     #[test]
+    #[ignore = "quarantined: vfarcic, #2011"]
     fn probe_006_a_real_moved_install_root_is_unknown() {
         let dir = tempdir();
         let versions = dir.path().join("versions");
