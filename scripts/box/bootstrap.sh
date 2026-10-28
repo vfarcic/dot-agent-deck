@@ -36,12 +36,18 @@
 #
 # --relay is for a box whose operator runs a local OpenTelemetry relay: a
 # collector listening on 127.0.0.1:4318 that forwards to Honeycomb with its own
-# key. It points every bash shell, and every agent the deck starts, at it;
-# devbox.json's init_hook keeps an endpoint the shell already has, so a vals
-# shell sends through the relay instead of to the endpoint .env.vals.yaml names.
-# It neither installs nor checks the relay; that is the box's own setup. It
-# works with or without --use-vals, and it sticks, turns off and reaches a
-# running daemon exactly as --use-vals does, through its own marked block.
+# key. It makes the relay the endpoint that every shell reading ~/.bashrc, and
+# every agent the deck starts, inherits by default; devbox.json's init_hook
+# keeps an endpoint the shell already has, so a vals shell inherits the relay
+# instead of the endpoint .env.vals.yaml names. A later setting still wins: an
+# OTEL_EXPORTER_OTLP_ENDPOINT in the repository's .env (the init_hook sources it
+# last) or an export further down ~/.bashrc. It neither installs nor checks the
+# relay; that is the box's own setup. It works with or without --use-vals, and
+# it sticks and reaches a running daemon exactly as --use-vals does, through its
+# own marked block. Turning it off (delete the block and re-run) drops the
+# endpoint from ~/.bashrc and environment.d, and unsets it in the running
+# systemd --user manager only while its value there is still the relay address
+# above; an endpoint with any other value is left alone.
 
 set -euo pipefail
 
@@ -170,8 +176,9 @@ fi
 # USE_VALS gets the same placement for the same reason: the daemon's environment
 # is every agent's, and devbox.json's init_hook loads .env.vals.yaml only when
 # it is set. So does OTEL_EXPORTER_OTLP_ENDPOINT with --relay: the init_hook
-# keeps an endpoint the shell already has, so every vals shell then sends
-# through the local relay rather than to the direct endpoint. Each sits in its
+# keeps an endpoint the shell already has, so a vals shell inherits the local
+# relay rather than the direct endpoint unless a later setting overrides it
+# (the repository's .env, or an export further down ~/.bashrc). Each sits in its
 # own marked block right after the PATH block, and they are rewritten in place.
 OPTION_BLOCKS=()
 if [ "$USE_VALS_FLAG" = 1 ] || grep -qF '# >>> dad-box USE_VALS' "$HOME/.bashrc"; then
@@ -195,14 +202,35 @@ fi
 if [ ${#OPTION_BLOCKS[@]} -gt 0 ]; then
   # Drops any earlier copy of the blocks and the blank lines around them, then
   # writes them back after the PATH block, so a re-run leaves the file unchanged.
-  awk -v block="$(printf '%s\n\n' "${OPTION_BLOCKS[@]}")" '
-    /^# >>> dad-box (USE_VALS|RELAY)/ { skip = 1; next }
-    skip { if (/^# <<< dad-box (USE_VALS|RELAY)/) skip = 0; next }
+  # A closing marker ends only the block its own kind opened; a block left open,
+  # a stray close or a close of the other kind fails the run instead, because
+  # skipping to the end of the file would drop whatever follows the marker.
+  if ! awk -v block="$(printf '%s\n\n' "${OPTION_BLOCKS[@]}")" -v file="$HOME/.bashrc" '
+    function fail(msg) { print "bootstrap.sh: " file ": " msg > "/dev/stderr"; bad = 1; exit 1 }
+    /^# >>> dad-box (USE_VALS|RELAY)/ {
+      if (open != "") fail("the dad-box " open " block opened on line " at " has no closing marker before line " NR)
+      open = $4; at = NR; next
+    }
+    /^# <<< dad-box (USE_VALS|RELAY)/ {
+      if (open == "") fail("line " NR " closes a dad-box " $4 " block that no marker opened")
+      if ($4 != open) fail("the dad-box " open " block opened on line " at " is closed by a dad-box " $4 " marker on line " NR)
+      open = ""; next
+    }
+    open != "" { next }
     gap && /^$/ { next }
     gap { print ""; gap = 0 }
     { print }
     /^# <<< dad-box PATH/ { print ""; print block; gap = 1 }
-  ' "$HOME/.bashrc" > "$HOME/.bashrc.dad-box" && mv "$HOME/.bashrc.dad-box" "$HOME/.bashrc"
+    END {
+      if (bad) exit 1
+      if (open != "") fail("the dad-box " open " block opened on line " at " has no closing marker")
+    }
+  ' "$HOME/.bashrc" > "$HOME/.bashrc.dad-box"; then
+    rm -f "$HOME/.bashrc.dad-box"
+    echo "bootstrap.sh: left $HOME/.bashrc unchanged; fix or delete that block by hand, then re-run" >&2
+    exit 1
+  fi
+  mv "$HOME/.bashrc.dad-box" "$HOME/.bashrc"
 fi
 # shellcheck disable=SC2016  # written literally, expanded by the interactive shell
 grep -qF 'devbox global shellenv' "$HOME/.bashrc" || \
@@ -226,7 +254,9 @@ else
 fi
 if [ "$RELAY_FLAG" = 1 ]; then
   systemctl --user set-environment "OTEL_EXPORTER_OTLP_ENDPOINT=$RELAY_ENDPOINT" || echo "  warning: could not set OTEL_EXPORTER_OTLP_ENDPOINT in the running systemd --user manager (applies at next login)"
-else
+elif [ "$(systemctl --user show-environment 2>/dev/null | sed -n 's/^OTEL_EXPORTER_OTLP_ENDPOINT=//p')" = "$RELAY_ENDPOINT" ]; then
+  # Off: clear only the value this script writes, never an endpoint the
+  # operator set in the manager some other way.
   systemctl --user unset-environment OTEL_EXPORTER_OTLP_ENDPOINT || true
 fi
 # shellcheck source=/dev/null
