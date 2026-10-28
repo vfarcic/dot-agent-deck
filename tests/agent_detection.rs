@@ -147,9 +147,7 @@ fn write_executable(path: &std::path::Path, contents: &str) {
         .expect("chmod respawn recorder");
 }
 
-/// Scenario: Spawn an initial pane process, then respawn that same pane with a
-/// bare `codex` command while PATH recorder stubs capture the actual argv. The
-/// replacement child must launch through the Wrapper strategy exactly once.
+/// Scenario: Respawn one pane first with an already-prefixed synthetic Codex command and then with bare Codex through the real wrapper. Each replacement must receive the embedded pair exactly once, preserving the existing-prefix control across respawn.
 #[spec("codex/spawn/005")]
 #[test]
 #[cfg(unix)]
@@ -163,17 +161,13 @@ fn spawn_005_respawn_wraps_codex() {
     std::fs::create_dir(&bin_dir).expect("create respawn bin dir");
     write_executable(
         &bin_dir.join("dot-agent-deck"),
-        "#!/bin/sh\nprintf 'WRAPPED %s\\n' \"$*\" >> \"$CODEX_RESPAWN_RECORD\"\nexec cat\n",
+        "#!/bin/sh\nprintf 'WRAPPED %s\\n' \"$*\" >> \"$CODEX_RESPAWN_RECORD\"\nexec \"$EMBEDDED_DECK_BIN\" \"$@\"\n",
     );
     write_executable(
         &bin_dir.join("codex"),
-        "#!/bin/sh\nprintf 'BARE codex %s\\n' \"$*\" >> \"$CODEX_RESPAWN_RECORD\"\nexec cat\n",
+        include_str!("fixtures/codex-embedded.py"),
     );
-    let path = format!(
-        "{}:{}",
-        bin_dir.display(),
-        std::env::var("PATH").expect("test runner PATH")
-    );
+    let path = format!("{}:/usr/bin:/bin", bin_dir.display());
     // Point the wrapper rewrite at the recorder. The rewrite names the
     // co-located build by absolute path (so the suite tests what it just
     // compiled rather than whatever is installed on $PATH), which means a fake
@@ -195,6 +189,36 @@ fn spawn_005_respawn_wraps_codex() {
                 env: vec![
                     (DOT_AGENT_DECK_PANE_ID.into(), "respawn-pane".into()),
                     ("PATH".into(), path),
+                    ("HOME".into(), fixture.path().to_string_lossy().into_owned()),
+                    (
+                        "CODEX_HOME".into(),
+                        fixture
+                            .path()
+                            .join("codex-home")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    (
+                        "CODEX_ARGS_RECORD".into(),
+                        fixture
+                            .path()
+                            .join("args.jsonl")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    (
+                        "EMBEDDED_DECK_BIN".into(),
+                        env!("CARGO_BIN_EXE_dot-agent-deck").into(),
+                    ),
+                    ("OTEL_SDK_DISABLED".into(), "true".into()),
+                    (
+                        "DOT_AGENT_DECK_SOCKET".into(),
+                        fixture
+                            .path()
+                            .join("unbound.sock")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
                     (
                         "CODEX_RESPAWN_RECORD".into(),
                         record.to_string_lossy().into_owned(),
@@ -203,23 +227,40 @@ fn spawn_005_respawn_wraps_codex() {
                 ..SpawnOptions::default()
             })
             .expect("spawn initial pane process");
-        registry
-            .respawn_agent_for_pane("respawn-pane", "codex")
-            .await
-            .expect("respawn pane as Codex");
-
-        // Wait for a COMPLETE recorded line, not merely for the file to exist:
-        // the shim appends with `>>`, and the shell creates the file before
-        // `printf` writes into it, so an existence-only wait can read an empty
-        // string (PRD #225 — same defect as `orchestration/delegate/009`).
-        expect_launch_lines(&record, 1);
-        let launched = std::fs::read_to_string(&record).expect("read respawn recorder");
-        assert_eq!(
-            launched.trim(),
-            "WRAPPED wrap --agent codex -- codex",
-            "respawning a pane with bare Codex must apply the Wrapper strategy; observed {launched:?}"
-        );
+        let mut failures = Vec::new();
+        for (index, command) in ["codex -c 'shell_environment_policy.set={}'", "codex"]
+            .iter()
+            .enumerate()
+        {
+            registry
+                .respawn_agent_for_pane("respawn-pane", command)
+                .await
+                .expect("respawn pane as Codex");
+            expect_launch_lines(&record, index + 1);
+            common::wait_for_file_lines(&fixture.path().join("args.jsonl"), index + 1, RECORD_WAIT)
+                .expect("respawned synthetic child starts");
+            let launched = std::fs::read_to_string(&record).unwrap();
+            assert_eq!(
+                launched.lines().nth(index).unwrap(),
+                format!(
+                    "WRAPPED wrap --agent codex -- {}",
+                    command.replace('\'', "")
+                ),
+                "wrapper once per respawn"
+            );
+            let recorded = std::fs::read_to_string(fixture.path().join("args.jsonl")).unwrap();
+            let args: Vec<String> =
+                serde_json::from_str(recorded.lines().nth(index).unwrap()).unwrap();
+            if args != ["-c", "shell_environment_policy.set={}"] {
+                failures.push(format!(
+                    "respawn {command}: missing prepended embedded pair; argv={args:?}"
+                ));
+            } else {
+                eprintln!("PASS respawn existing-prefix control: {command}");
+            }
+        }
         registry.shutdown_all();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     });
 }
 
