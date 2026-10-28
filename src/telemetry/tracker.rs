@@ -355,7 +355,8 @@ struct SharedCi {
     /// The highest report revision folded into `ci`. `0` until one with a
     /// revision is: a report with none is folded by arrival.
     revision: u64,
-    /// The revision of the report that opened the open stretch.
+    /// The revision of the report that opened the open stretch: `0` when it
+    /// had none.
     open_since: u64,
     /// The rounds recorded for the pull request.
     rounds: RecordedRounds,
@@ -377,9 +378,11 @@ struct ReleasedCi {
 }
 
 /// The stretches recorded for one pull request, as the revisions of the
-/// reports that opened and ended them: the newest [`MAX_RECORDED_ROUNDS`],
-/// and below `floor` every older one, which counts as overlapping anything
-/// that starts there.
+/// reports that opened and ended them (`0` for an opening report that had
+/// none, which overlaps everything before the end): the
+/// [`MAX_RECORDED_ROUNDS`] that ended last, ordered by that ending revision
+/// whatever order they were recorded in, and below `floor` every older one,
+/// which counts as overlapping anything that starts there.
 #[derive(Default)]
 struct RecordedRounds {
     rounds: VecDeque<(u64, u64)>,
@@ -388,12 +391,17 @@ struct RecordedRounds {
 
 impl RecordedRounds {
     fn record(&mut self, from: u64, to: u64) {
-        if self.rounds.len() >= MAX_RECORDED_ROUNDS
+        // Below the floor it is covered already.
+        if to <= self.floor {
+            return;
+        }
+        let at = self.rounds.partition_point(|&(a, b)| (b, a) <= (to, from));
+        self.rounds.insert(at, (from, to));
+        if self.rounds.len() > MAX_RECORDED_ROUNDS
             && let Some((_, oldest)) = self.rounds.pop_front()
         {
             self.floor = self.floor.max(oldest);
         }
-        self.rounds.push_back((from, to));
     }
 
     /// Whether a round seen from revision `from` to `to` overlaps one already
@@ -1097,7 +1105,9 @@ impl RunTracker {
                 result,
                 checks,
             } => {
-                if shared.open_since != 0 {
+                // A stretch opened by a report with no revision may have
+                // begun at any revision before its end.
+                if shared.revision != 0 {
                     shared.rounds.record(shared.open_since, shared.revision);
                 }
                 let Some(opener) = shared.opener.take() else {
@@ -3789,6 +3799,102 @@ pub(crate) mod tests {
         assert!(rounds.covers(5, 11));
         assert!(!rounds.covers(13, 20));
         assert!(!rounds.covers(10 * MAX_RECORDED_ROUNDS as u64 + 3, u64::MAX));
+    }
+
+    /// Issue #1981 M3: the first run's card saw the round open at a report
+    /// with no revision, and its result under a newer one than either of the
+    /// prepared run's replayed reports. The round recorded from that unknown
+    /// opening overlaps the one the prepared run's card saw, so it is still
+    /// recorded once.
+    #[test]
+    fn a_round_opened_without_a_revision_is_not_recorded_again() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.prepare_run(start("p2"), 0);
+        for pane in ["p1", "p2"] {
+            tracker.observe_event(&event(pane, EventType::SessionStart), 1);
+        }
+        tracker.observe_event(&checks_report("p1", 9, 0, "pending", (0, 0, 0)), 9);
+        tracker.observe_event(&checks_report("p2", 9, 1, "pending", (0, 0, 0)), 10);
+        tracker.observe_event(&checks_report("p2", 9, 2, "passing", (3, 0, 0)), 20);
+        tracker.observe_event(&checks_report("p1", 9, 3, "passing", (3, 0, 0)), 21);
+        tracker.commit_run("run-p2");
+        tracker.end_run("p1", EndReason::Exited, None, 30);
+        tracker.end_run("p2", EndReason::Exited, None, 30);
+        let spans = tracker.take_finished();
+        assert_eq!(
+            ci_record(&spans, &["p1", "p2"]),
+            (1, vec![2, 0], vec![Some(1), Some(1)])
+        );
+        let span = ci_spans(&spans)[0];
+        assert_eq!((span.start_unix_nanos, span.end_unix_nanos), (9, 21));
+        assert_eq!(span.parent_span_id, Some(run_span_on(&spans, "p1").span_id));
+    }
+
+    /// Issue #1981 M3: rounds recorded out of revision order — a newer one
+    /// first, then a full cache of older replayed ones — forget the oldest
+    /// by revision, so a round between them is not counted as covered.
+    #[test]
+    fn recorded_rounds_forget_the_oldest_by_revision() {
+        let mut rounds = RecordedRounds::default();
+        rounds.record(100, 101);
+        for n in 0..MAX_RECORDED_ROUNDS as u64 {
+            rounds.record(2 * n + 1, 2 * n + 2);
+        }
+        assert_eq!(rounds.rounds.len(), MAX_RECORDED_ROUNDS);
+        assert_eq!(rounds.floor, 2);
+        assert!(rounds.covers(1, 2), "the forgotten round");
+        assert!(rounds.covers(100, 101));
+        assert!(!rounds.covers(50, 51));
+        // A round older than the floor is not kept in place of a newer one.
+        rounds.record(1, 2);
+        assert!(rounds.covers(31, 32));
+        assert_eq!(rounds.floor, 2);
+    }
+
+    /// Issue #1981 M3: the same, end to end. One run's card records a round
+    /// while two runs prepared before it buffer older ones: one sixteen
+    /// rounds, the other a round between those and the first run's. Each
+    /// prepared run, once it opens, records every round its card saw, the
+    /// last one included.
+    #[test]
+    fn older_replayed_rounds_do_not_hide_a_newer_one() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.prepare_run(start("p2"), 0);
+        tracker.prepare_run(start("p3"), 0);
+        for pane in ["p1", "p2", "p3"] {
+            tracker.observe_event(&event(pane, EventType::SessionStart), 1);
+        }
+        for n in 0..MAX_RECORDED_ROUNDS as u64 {
+            let (pending, passing) = (2 * n + 1, 2 * n + 2);
+            tracker.observe_event(
+                &checks_report("p2", 9, pending, "pending", (0, 0, 0)),
+                pending,
+            );
+            tracker.observe_event(
+                &checks_report("p2", 9, passing, "passing", (1, 0, 0)),
+                passing,
+            );
+        }
+        tracker.observe_event(&checks_report("p3", 9, 50, "pending", (0, 0, 0)), 50);
+        tracker.observe_event(&checks_report("p3", 9, 51, "passing", (1, 0, 0)), 51);
+        tracker.observe_event(&checks_report("p1", 9, 100, "pending", (0, 0, 0)), 100);
+        tracker.observe_event(&checks_report("p1", 9, 101, "passing", (1, 0, 0)), 101);
+        tracker.commit_run("run-p2");
+        tracker.commit_run("run-p3");
+        for pane in ["p1", "p2", "p3"] {
+            tracker.end_run(pane, EndReason::Exited, None, 200);
+        }
+        let spans = tracker.take_finished();
+        assert_eq!(ci_spans(&spans).len(), MAX_RECORDED_ROUNDS + 2);
+        let p3 = run_span_on(&spans, "p3").span_id;
+        let recovered: Vec<_> = ci_spans(&spans)
+            .into_iter()
+            .filter(|span| span.parent_span_id == Some(p3))
+            .map(|span| (span.start_unix_nanos, span.end_unix_nanos))
+            .collect();
+        assert_eq!(recovered, vec![(50, 51)]);
     }
 
     /// Issue #1981 M6: a run prepared in the worktree of a unit being
