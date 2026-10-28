@@ -1,16 +1,24 @@
 //! Local JSON OTLP receiver shared by operation-completion integration tests.
 
 use serde_json::Value;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+#[cfg(test)]
+mod bounds;
 
 pub const EXPORT_WAIT: Duration = Duration::from_secs(25);
+const MAX_LINE_BYTES: usize = 8 * 1024;
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+const READ_POLL: Duration = Duration::from_millis(100);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Receiver {
     addr: SocketAddr,
@@ -35,7 +43,7 @@ impl Receiver {
                 }
                 let mut stream = stream.unwrap();
                 // Agent SDKs can cancel an empty connection at shutdown.
-                let Some((path, body, protobuf)) = read_request(&stream) else {
+                let Some((path, body, protobuf)) = read_request(&stream, &stopped) else {
                     continue;
                 };
                 if path == "/v1/traces"
@@ -55,6 +63,7 @@ impl Receiver {
                 } else {
                     b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
                 };
+                let _ = stream.set_write_timeout(Some(READ_POLL));
                 let _ = stream.write_all(response);
             }
         });
@@ -97,20 +106,56 @@ impl Drop for Receiver {
     }
 }
 
-fn read_request(stream: &TcpStream) -> Option<(String, Vec<u8>, bool)> {
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    if reader.read_line(&mut line).ok()? == 0 {
-        return None;
+struct RequestReader<'a> {
+    stream: &'a TcpStream,
+    stop: &'a AtomicBool,
+    deadline: Instant,
+}
+
+impl Read for RequestReader<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if self.stop.load(Ordering::Relaxed) || Instant::now() >= self.deadline {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            match self.stream.read(bytes) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) => {}
+                result => return result,
+            }
+        }
     }
+}
+
+fn read_line(reader: &mut impl BufRead) -> Option<String> {
+    let mut line = String::new();
+    let length = reader
+        .take((MAX_LINE_BYTES + 1) as u64)
+        .read_line(&mut line)
+        .ok()?;
+    (length <= MAX_LINE_BYTES && line.ends_with("\r\n")).then_some(line)
+}
+
+fn read_request(stream: &TcpStream, stop: &AtomicBool) -> Option<(String, Vec<u8>, bool)> {
+    stream.set_read_timeout(Some(READ_POLL)).ok()?;
+    let mut reader = BufReader::new(RequestReader {
+        stream,
+        stop,
+        deadline: Instant::now() + REQUEST_TIMEOUT,
+    });
+    let line = read_line(&mut reader)?;
     let path = line.split_whitespace().nth(1)?.to_string();
-    let mut length = 0;
+    let mut header_bytes = line.len();
+    let mut length = None;
     let mut chunked = false;
     let mut protobuf = false;
     loop {
-        line.clear();
-        if reader.read_line(&mut line).ok()? == 0 {
+        let line = read_line(&mut reader)?;
+        header_bytes = header_bytes.checked_add(line.len())?;
+        if header_bytes > MAX_HEADER_BYTES {
             return None;
         }
         if line == "\r\n" {
@@ -118,29 +163,51 @@ fn read_request(stream: &TcpStream) -> Option<(String, Vec<u8>, bool)> {
         }
         let (key, value) = line.trim_end().split_once(':')?;
         match key.to_ascii_lowercase().as_str() {
-            "content-length" => length = value.trim().parse().ok()?,
-            "transfer-encoding" => chunked = value.trim().eq_ignore_ascii_case("chunked"),
+            "content-length" => {
+                let parsed = value.trim().parse::<usize>().ok()?;
+                if parsed > MAX_BODY_BYTES || length.replace(parsed).is_some() {
+                    return None;
+                }
+            }
+            "transfer-encoding" => {
+                if !value.trim().eq_ignore_ascii_case("chunked") {
+                    return None;
+                }
+                chunked = true;
+            }
             "content-type" => protobuf = value.contains("protobuf"),
             _ => {}
         }
     }
+    if chunked && length.is_some() {
+        return None;
+    }
     let mut body = Vec::new();
     if chunked {
         loop {
-            line.clear();
-            reader.read_line(&mut line).ok()?;
+            let line = read_line(&mut reader)?;
             let size = usize::from_str_radix(line.trim().split(';').next()?, 16).ok()?;
             if size == 0 {
+                if read_line(&mut reader)? != "\r\n" {
+                    return None;
+                }
                 break;
             }
             let start = body.len();
-            body.resize(start + size, 0);
+            let end = start.checked_add(size)?;
+            if end > MAX_BODY_BYTES {
+                return None;
+            }
+            body.resize(end, 0);
             reader.read_exact(&mut body[start..]).ok()?;
             let mut crlf = [0; 2];
             reader.read_exact(&mut crlf).ok()?;
+            if crlf != *b"\r\n" {
+                return None;
+            }
         }
     } else {
-        body.resize(length, 0);
+        body.resize(length.unwrap_or(0), 0);
         reader.read_exact(&mut body).ok()?;
     }
     Some((path, body, protobuf))
