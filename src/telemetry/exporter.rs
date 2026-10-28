@@ -77,7 +77,7 @@ use super::propagation::{RunIdentity, agent_env};
 use super::resource::{ResourceAttribute, deck_resource, host_name};
 use super::run_context::{ProbeSettings, Probes};
 use super::span::{SpanRecord, new_run_id};
-use super::tracker::{EndReason, FinishingRun, RunStart, RunTracker};
+use super::tracker::{EndReason, FinishingRun, RunGeneration, RunStart, RunTracker};
 use super::{Protocol, now_unix_nanos, otlp};
 
 /// Spans per request, at most.
@@ -636,6 +636,11 @@ impl BroadcastClock {
 
 type Filters = Mutex<HashMap<String, Vec<PaneInput>>>;
 
+/// The name of the dispatched unit an open run's generation belongs to, from
+/// the deck's record of dispatched units, or `None` when it belongs to none.
+/// See [`Telemetry::set_dispatch_lookup`].
+pub type DispatchLookup = Box<dyn Fn(&RunGeneration) -> Option<String> + Send + Sync>;
+
 fn lock_filters(filters: &Filters) -> std::sync::MutexGuard<'_, HashMap<String, Vec<PaneInput>>> {
     filters.lock().unwrap_or_else(|p| p.into_inner())
 }
@@ -688,6 +693,8 @@ struct Shared {
     /// Batches of ended runs, one per [`Shared::complete_later`] call with
     /// any, whose task has not ended yet: not runs.
     finalizing: watch::Sender<usize>,
+    /// See [`Telemetry::set_dispatch_lookup`].
+    dispatch_lookup: OnceLock<DispatchLookup>,
     /// Test seam: pauses the ingest task once inside its `escape_held`
     /// branch, after signalling the first half, until the second receives.
     #[cfg(test)]
@@ -778,6 +785,38 @@ impl Drop for PreparedRun {
         }
         if let Some(exporting) = &self.telemetry.exporting {
             exporting.shared.with_tracker(|t| t.abort_run(&self.run_id));
+        }
+    }
+}
+
+/// A unit being spawned: see [`Telemetry::begin_dispatch`]. Dropping it ends
+/// the naming of runs by the unit's worktree.
+pub struct DispatchNaming {
+    telemetry: Arc<Telemetry>,
+    name: String,
+    token: u64,
+}
+
+impl DispatchNaming {
+    /// The spawn started the generations `agents`, by pane and agent id, and,
+    /// for an orchestration, the instance `orchestration_id`: name their runs
+    /// that are not named yet — one whose agent started outside the worktree
+    /// — and every role the instance starts later.
+    pub fn spawned(self, agents: &[(String, String)], orchestration_id: Option<&str>) {
+        if let Some(exporting) = &self.telemetry.exporting {
+            exporting
+                .shared
+                .with_tracker(|t| t.name_dispatched(&self.name, agents, orchestration_id));
+        }
+    }
+}
+
+impl Drop for DispatchNaming {
+    fn drop(&mut self) {
+        if let Some(exporting) = &self.telemetry.exporting {
+            exporting
+                .shared
+                .with_tracker(|t| t.end_dispatch(self.token));
         }
     }
 }
@@ -913,6 +952,38 @@ impl Telemetry {
         self.shim_dir = Some(dir);
     }
 
+    /// Name each open run's dispatched unit with `lookup`, asked with the
+    /// tracker let go, as each poll of the runs' usage comes round: for a run
+    /// [`Self::begin_dispatch`] did not name from its start, such as a
+    /// restarted single unit's. The first lookup set stays. Nothing happens
+    /// when not exporting.
+    pub fn set_dispatch_lookup(&self, lookup: DispatchLookup) {
+        if let Some(exporting) = &self.exporting {
+            let _ = exporting.shared.dispatch_lookup.set(lookup);
+        }
+    }
+
+    /// A unit named `name` is about to be spawned in `worktree`: each run
+    /// prepared in it until the returned [`DispatchNaming`] is dropped is
+    /// named after the unit as it is prepared, so it has the name however
+    /// soon its agent exits or its pane closes. Call
+    /// [`DispatchNaming::spawned`] once the spawn says which generations it
+    /// started. `None` when not exporting.
+    pub fn begin_dispatch(self: &Arc<Self>, name: &str, worktree: &Path) -> Option<DispatchNaming> {
+        let exporting = self.exporting.as_ref()?;
+        let token = exporting
+            .shared
+            .tracker
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .begin_dispatch(name, worktree);
+        Some(DispatchNaming {
+            telemetry: Arc::clone(self),
+            name: name.to_string(),
+            token,
+        })
+    }
+
     /// Whether telemetry is configured at all (export or propagation).
     pub fn is_enabled(&self) -> bool {
         self.config.is_some()
@@ -991,7 +1062,7 @@ impl Telemetry {
         if let Some(exporting) = &self.exporting {
             let run_id = start.run_id.clone();
             exporting.shared.with_tracker(|t| {
-                t.prepare_run(start, now_unix_nanos());
+                t.prepare_run_in(start, now_unix_nanos(), prepared.cwd.as_deref());
                 t.set_usage_dirs(&run_id, usage_dirs);
             });
         }
@@ -1425,6 +1496,33 @@ impl Shared {
         });
     }
 
+    /// Name the dispatched unit of every open run that has none yet, by the
+    /// lookup [`Telemetry::set_dispatch_lookup`] set. The lookup is asked with
+    /// the tracker let go, so it may take the deck's own locks; only the
+    /// ingest task opens and ends runs, so a run it names is still the one it
+    /// was asked about, or has ended and is not named.
+    fn name_dispatched_runs(&self) {
+        let Some(lookup) = self.dispatch_lookup.get() else {
+            return;
+        };
+        let runs = self
+            .tracker
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .runs_without_dispatch();
+        let named: Vec<(String, String)> = runs
+            .into_iter()
+            .filter_map(|run| lookup(&run).map(|name| (run.run_id, name)))
+            .collect();
+        if !named.is_empty() {
+            self.with_tracker(|t| {
+                for (run_id, name) in &named {
+                    t.set_dispatch_name(run_id, name);
+                }
+            });
+        }
+    }
+
     fn lock_filters(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<PaneInput>>> {
         lock_filters(&self.filters)
     }
@@ -1665,6 +1763,7 @@ fn start_exporting(
         runtime: tokio::runtime::Handle::current(),
         me: me.clone(),
         finalizing: watch::Sender::new(0),
+        dispatch_lookup: OnceLock::new(),
         #[cfg(test)]
         timer_gate: Mutex::new(None),
         #[cfg(test)]
@@ -1731,7 +1830,10 @@ async fn run_ingest(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiver<C
                 drain(&shared, &mut events, &mut read).await;
                 escape_due = shared.settle_escapes(std::time::Instant::now(), read);
             }
-            _ = usage_poll.tick() => shared.poll_usage(&usage_polling),
+            _ = usage_poll.tick() => {
+                shared.poll_usage(&usage_polling);
+                shared.name_dispatched_runs();
+            }
             msg = next_event(&mut events) => match msg {
                 Ok(msg) => {
                     shared.observe_in_order(&msg, read).await;
@@ -4304,6 +4406,65 @@ mod tests {
             agent: AgentType::None,
             ..generation(pane, agent_id)
         }
+    }
+
+    /// Issue #1981 M6: a dispatched unit's run is named as it is prepared,
+    /// so the name survives the run ending before anything else could name
+    /// it. With the ingest task paused, the run is prepared in the unit's
+    /// worktree and committed, its pane's close is broadcast, and the spawn
+    /// ends without saying which generations it started — as when the close
+    /// also removed the unit from the deck's record. Resumed, the ingest task
+    /// takes the close before the commit, and the run still ends named; a run
+    /// prepared outside the worktree does not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dispatched_run_closed_before_ingest_keeps_its_name() {
+        let (entered, polled_empty) = oneshot::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        let (sink, mut rx) = mpsc::channel(QUEUE_CAPACITY);
+        let telemetry = Arc::new(Telemetry::start_with(
+            &env(&ON),
+            Settings {
+                sink: Some(sink),
+                command_gate: Some((entered, paused)),
+                ..Settings::default()
+            },
+        ));
+        polled_empty.await.unwrap();
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        let naming = telemetry
+            .begin_dispatch("My Unit: exact", Path::new("/w/my-unit"))
+            .unwrap();
+        for (pane, agent, cwd) in [("p1", "a1", "/w/my-unit"), ("p2", "a2", "/w/other")] {
+            telemetry
+                .prepare_run(command_run(pane, agent), &[], Some(PathBuf::from(cwd)))
+                .unwrap()
+                .commit();
+            tx.send(pane_closed(pane, agent)).unwrap();
+        }
+        drop(naming);
+        resume.send(()).unwrap();
+        let mut spans = Vec::new();
+        eventually("both runs' spans were queued", || {
+            spans.extend(captured(&mut rx));
+            ended_runs(&spans).len() == 2
+        })
+        .await;
+        let run = |pane: &str| {
+            *ended_runs(&spans)
+                .iter()
+                .find(|s| attr(s, AttrKey::PaneId) == Some(&AttrValue::Str(pane.into())))
+                .unwrap_or_else(|| panic!("no run span for {pane}"))
+        };
+        assert_eq!(
+            attr(run("p1"), AttrKey::EndReason),
+            Some(&AttrValue::Str("closed".into()))
+        );
+        assert_eq!(
+            attr(run("p1"), AttrKey::DispatchName),
+            Some(&AttrValue::Str("My Unit: exact".into()))
+        );
+        assert_eq!(attr(run("p2"), AttrKey::DispatchName), None);
     }
 
     fn ended_runs(spans: &[SpanRecord]) -> Vec<&SpanRecord> {

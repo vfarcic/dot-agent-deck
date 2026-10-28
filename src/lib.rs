@@ -108,6 +108,7 @@ pub mod inbox_receiver;
 pub mod inbox_spills;
 pub mod inbox_watcher;
 pub mod init;
+pub mod injected_prompt;
 pub mod issue_dispatch;
 pub mod issue_dispatch_run;
 pub mod jsonc_edit;

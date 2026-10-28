@@ -1189,6 +1189,13 @@ const handleMessagePartUpdated = (event, directory) => {{
   if (!part.text) {{
     return;
   }}
+  // Issue #1993: text OpenCode adds to a user message itself (a background
+  // task's result, the turn that continues after a compaction, a file it
+  // read for an attachment) is marked synthetic and is not what the user
+  // typed. The message stays recorded, so its typed text is still reported.
+  if (part.synthetic) {{
+    return;
+  }}
   // Issue #1678: its session may have become known as a child since the
   // message was recorded.
   if (isChildSession(info.rawSessionKey) || isChildSession(part.sessionID)) {{
@@ -3118,6 +3125,10 @@ pub fn uninstall() -> std::io::Result<()> {
 pub fn uninstall_from(path: &PathBuf) -> std::io::Result<()> {
     uninstall_impl(path)
 }
+
+#[cfg(all(test, unix))]
+#[path = "opencode_injected_turn_tests.rs"]
+mod injected_turn_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -6583,7 +6594,10 @@ check(inboxIdsIn("[dot-agent-deck message " + A + " from x]\nhead"), [A], "an un
     /// a recorder, and answer the payloads the plugin sent — or `None` (after a
     /// `SKIP:`) when Node is not available. `node_args` go before the driver.
     #[cfg(unix)]
-    fn run_plugin_driver(body: &str, node_args: &[&str]) -> Option<Vec<serde_json::Value>> {
+    pub(super) fn run_plugin_driver(
+        body: &str,
+        node_args: &[&str],
+    ) -> Option<Vec<serde_json::Value>> {
         run_plugin_driver_with_awaits(body, node_args).map(|(payloads, _)| payloads)
     }
 
