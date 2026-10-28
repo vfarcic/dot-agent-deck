@@ -24,6 +24,7 @@ pub struct Receiver {
     addr: SocketAddr,
     pub endpoint: String,
     spans: Arc<Mutex<Vec<Value>>>,
+    bodies: Arc<Mutex<Vec<Vec<u8>>>>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
@@ -33,8 +34,10 @@ impl Receiver {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let spans = Arc::new(Mutex::new(Vec::new()));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let captured = Arc::clone(&spans);
+        let captured_bodies = Arc::clone(&bodies);
         let stopped = Arc::clone(&stop);
         let worker = std::thread::spawn(move || {
             for stream in listener.incoming() {
@@ -46,6 +49,7 @@ impl Receiver {
                 let Some((path, body, protobuf)) = read_request(&stream, &stopped) else {
                     continue;
                 };
+                captured_bodies.lock().unwrap().push(body.clone());
                 if path == "/v1/traces"
                     && let Ok(body) = serde_json::from_slice::<Value>(&body)
                 {
@@ -71,6 +75,7 @@ impl Receiver {
             addr,
             endpoint: format!("http://{addr}"),
             spans,
+            bodies,
             stop,
             worker: Some(worker),
         }
@@ -78,6 +83,11 @@ impl Receiver {
 
     pub fn spans(&self) -> Vec<Value> {
         self.spans.lock().unwrap().clone()
+    }
+
+    #[allow(dead_code)] // Only privacy contract targets need raw payloads.
+    pub fn bodies(&self) -> Vec<Vec<u8>> {
+        self.bodies.lock().unwrap().clone()
     }
 
     pub fn operations(&self, pane: &str) -> Vec<Value> {
