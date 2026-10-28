@@ -170,6 +170,30 @@ export PATH
 EOF
 )"
 touch "$HOME/.bashrc"
+# The option blocks below are found by their markers, and everything from an
+# opening marker to its close is replaced, so check every one of them before
+# this layer writes anything, whichever flags were given. A block left open, a
+# stray close or a close of the other kind stops the run here, because skipping
+# to the end of the file would drop whatever follows the marker.
+if ! awk -v file="$HOME/.bashrc" '
+  function fail(msg) { print "bootstrap.sh: " file ": " msg > "/dev/stderr"; bad = 1; exit 1 }
+  /^# >>> dad-box (USE_VALS|RELAY)/ {
+    if (open != "") fail("the dad-box " open " block opened on line " at " has no closing marker before line " NR)
+    open = $4; at = NR; next
+  }
+  /^# <<< dad-box (USE_VALS|RELAY)/ {
+    if (open == "") fail("line " NR " closes a dad-box " $4 " block that no marker opened")
+    if ($4 != open) fail("the dad-box " open " block opened on line " at " is closed by a dad-box " $4 " marker on line " NR)
+    open = ""
+  }
+  END {
+    if (bad) exit 1
+    if (open != "") fail("the dad-box " open " block opened on line " at " has no closing marker")
+  }
+' "$HOME/.bashrc"; then
+  echo "bootstrap.sh: left $HOME/.bashrc unchanged; fix or delete that block by hand, then re-run" >&2
+  exit 1
+fi
 if ! grep -qF '# >>> dad-box PATH' "$HOME/.bashrc"; then
   { printf '%s\n\n' "$PATH_BLOCK"; cat "$HOME/.bashrc"; } > "$HOME/.bashrc.dad-box" && mv "$HOME/.bashrc.dad-box" "$HOME/.bashrc"
 fi
@@ -202,34 +226,17 @@ fi
 if [ ${#OPTION_BLOCKS[@]} -gt 0 ]; then
   # Drops any earlier copy of the blocks and the blank lines around them, then
   # writes them back after the PATH block, so a re-run leaves the file unchanged.
-  # A closing marker ends only the block its own kind opened; a block left open,
-  # a stray close or a close of the other kind fails the run instead, because
-  # skipping to the end of the file would drop whatever follows the marker.
-  if ! awk -v block="$(printf '%s\n\n' "${OPTION_BLOCKS[@]}")" -v file="$HOME/.bashrc" '
-    function fail(msg) { print "bootstrap.sh: " file ": " msg > "/dev/stderr"; bad = 1; exit 1 }
-    /^# >>> dad-box (USE_VALS|RELAY)/ {
-      if (open != "") fail("the dad-box " open " block opened on line " at " has no closing marker before line " NR)
-      open = $4; at = NR; next
-    }
-    /^# <<< dad-box (USE_VALS|RELAY)/ {
-      if (open == "") fail("line " NR " closes a dad-box " $4 " block that no marker opened")
-      if ($4 != open) fail("the dad-box " open " block opened on line " at " is closed by a dad-box " $4 " marker on line " NR)
-      open = ""; next
-    }
-    open != "" { next }
+  # The markers were checked at the top of this layer, so every opening marker
+  # here has its own close.
+  awk -v block="$(printf '%s\n\n' "${OPTION_BLOCKS[@]}")" '
+    /^# >>> dad-box (USE_VALS|RELAY)/ { open = 1; next }
+    /^# <<< dad-box (USE_VALS|RELAY)/ { open = 0; next }
+    open { next }
     gap && /^$/ { next }
     gap { print ""; gap = 0 }
     { print }
     /^# <<< dad-box PATH/ { print ""; print block; gap = 1 }
-    END {
-      if (bad) exit 1
-      if (open != "") fail("the dad-box " open " block opened on line " at " has no closing marker")
-    }
-  ' "$HOME/.bashrc" > "$HOME/.bashrc.dad-box"; then
-    rm -f "$HOME/.bashrc.dad-box"
-    echo "bootstrap.sh: left $HOME/.bashrc unchanged; fix or delete that block by hand, then re-run" >&2
-    exit 1
-  fi
+  ' "$HOME/.bashrc" > "$HOME/.bashrc.dad-box"
   mv "$HOME/.bashrc.dad-box" "$HOME/.bashrc"
 fi
 # shellcheck disable=SC2016  # written literally, expanded by the interactive shell
