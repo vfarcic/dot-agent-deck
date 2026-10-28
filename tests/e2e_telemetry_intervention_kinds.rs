@@ -433,7 +433,7 @@ fn hold_question(deck: &TuiDeck, agent: &AgentRecord) -> (BufReader<UnixStream>,
     (reader, pending)
 }
 
-/// Scenario: Hold a synthetic permission hook open and answer it through the same client API used by the deck question UI. The hook receives the chosen answer, no answer keys reach the pane, and the exported run counts one answer intervention.
+/// Scenario: Hold a synthetic permission hook open and answer it through the same client API used by desktop voice answering. The hook receives the chosen answer, no answer keys reach the pane, and the exported run counts one answer intervention.
 #[spec("telemetry/otlp/033")]
 #[test]
 fn telemetry_otlp_033_deck_held_answer_intervention() {
