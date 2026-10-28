@@ -6,7 +6,7 @@ mod common;
 
 use std::fs::File;
 use std::io::{Read as _, Write as _};
-use std::os::fd::FromRawFd as _;
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::net::UnixListener;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -127,6 +127,32 @@ fn read_pty(mut master: File) -> Vec<u8> {
     observed
 }
 
+fn read_pty_line(master: &mut File) -> Vec<u8> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut observed = Vec::new();
+    loop {
+        let mut descriptor = libc::pollfd {
+            fd: master.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        // SAFETY: `descriptor` points to one initialized pollfd containing a
+        // live descriptor owned by `master`, and poll does not retain it.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, remaining.as_millis() as i32) };
+        if ready < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        assert!(ready > 0, "waiting for PTY stderr line: {observed:?}");
+        let mut byte = [0];
+        master.read_exact(&mut byte).expect("read PTY stderr byte");
+        observed.push(byte[0]);
+        if byte[0] == b'\n' {
+            return observed;
+        }
+    }
+}
+
 fn run_with_stderr_redirected() -> (bool, Vec<u8>, Vec<u8>) {
     let fixture = common::harness_tempdir().expect("create stderr-only redirect fixture");
     let stderr_path = fixture.path().join("stderr.log");
@@ -243,7 +269,7 @@ fn collect_wrapper_events(listener: &UnixListener, expected: usize) -> Vec<Agent
     events
 }
 
-/// Scenario: Run the real wrapper with independent redirected and terminal descriptors, then launch synthetic direct Codex on both pipe and PTY paths. Streams and input must retain their routing, Codex must receive its embedded pair once, and a non-Codex agent must keep its arguments unchanged.
+/// Scenario: Run the real wrapper with independent redirected and terminal descriptors, then launch synthetic direct Codex on both pipe and PTY paths, reading its terminal stderr while it waits for input. Streams and input must retain their routing, Codex must receive its embedded pair once, and a non-Codex agent must keep its arguments unchanged.
 #[spec("codex/wrap/003")]
 #[test]
 fn codex_wrap_003_each_descriptor_preserves_its_original_semantics() {
@@ -402,7 +428,7 @@ fn assert_embedded_streams() {
         ] {
             let record = fixture.path().join("args.jsonl");
             std::fs::write(&record, "").unwrap();
-            let (master, slave) = open_pty();
+            let (mut master, slave) = open_pty();
             let mut command = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
             command
                 .args(["wrap", "--agent", agent, "--"])
@@ -437,6 +463,14 @@ fn assert_embedded_streams() {
             // Command retains its configured slave descriptor after spawn;
             // close that copy before waiting for the outer master's EOF.
             drop(command);
+            // Consume terminal stderr while the probe is still waiting for
+            // input. This avoids depending on unread PTY output surviving the
+            // final slave close, which made the macOS assertion see no bytes.
+            let mut terminal_stderr = if tty {
+                read_pty_line(&mut master)
+            } else {
+                Vec::new()
+            };
             child
                 .stdin
                 .take()
@@ -447,9 +481,10 @@ fn assert_embedded_streams() {
                 .wait_with_output()
                 .expect("wait for embedded stream probe");
             let stderr = if tty {
+                terminal_stderr.extend(read_pty(master));
                 // Terminal output passes through two line disciplines; CR
                 // expansion is terminal semantics, not a routing failure.
-                read_pty(master)
+                terminal_stderr
                     .into_iter()
                     .filter(|byte| *byte != b'\r')
                     .collect()
