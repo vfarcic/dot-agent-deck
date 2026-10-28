@@ -89,7 +89,12 @@ pub const INTERVENTION_COALESCE_NANOS: u64 = 5_000_000_000;
 pub const MAX_EVENTS_PER_RUN: usize = 1024;
 
 /// Events held for a prepared run until it is committed. Its agent has only
-/// just started, so this is far more than the window ever sees.
+/// just started, so this is far more than the window ever sees. The same
+/// bound holds the run's posts, and its notices about them, apart: past it, a
+/// 257th post opens at once in a trace of its own with no parent, and a
+/// notice is applied at once ([`RunTracker::place_post`]). That takes 257
+/// posts from one orchestrator before telemetry applies its run's `Commit`,
+/// which is not a realistic workload.
 pub const MAX_PENDING_EVENTS: usize = 256;
 
 /// How long a replaced run waits for its own generation's end before it is
@@ -268,13 +273,21 @@ struct PendingRun {
     /// applied by [`RunTracker::commit_run`] once the run opens.
     ended: Option<(EndReason, Option<i32>, u64)>,
     /// Issue #1981 M7: tasks this run's agent delegated before the run
-    /// opened, each with how many of `events` were held before it, so
-    /// [`RunTracker::commit_run`] opens each hand-off in its place among
-    /// them ([`RunTracker::place_post`]).
-    posts: Vec<(usize, Posted)>,
+    /// opened, and the inbox notices about them seen since, in the order
+    /// seen, each with how many of `events` were held before it, so
+    /// [`RunTracker::commit_run`] applies each in its place among them
+    /// ([`RunTracker::place_post`], [`RunTracker::observe_inbox`]).
+    handoffs: Vec<(usize, HeldHandoff)>,
     /// The dispatched unit it belongs to, when known before it opens
     /// ([`RunTracker::begin_dispatch`]).
     dispatch_name: Option<String>,
+}
+
+/// What a prepared run holds of its hand-offs: see [`PendingRun::handoffs`].
+enum HeldHandoff {
+    Post(Posted),
+    /// An inbox change about a held post, and when it was seen.
+    Notice(Change, u64),
 }
 
 /// A run's own card state, dropped with the run. Tests count the live ones
@@ -522,6 +535,40 @@ pub struct RunGeneration {
 }
 
 impl PendingRun {
+    fn held_posts(&self) -> usize {
+        self.handoffs
+            .iter()
+            .filter(|(_, held)| matches!(held, HeldHandoff::Post(_)))
+            .count()
+    }
+
+    fn held_notices(&self) -> usize {
+        self.handoffs.len() - self.held_posts()
+    }
+
+    fn holds_post(&self, task: &str) -> bool {
+        self.handoffs
+            .iter()
+            .any(|(_, held)| matches!(held, HeldHandoff::Post(p) if p.message_id == task))
+    }
+
+    /// Whether `change` concerns a post held here: the task itself, its
+    /// report, or that report's own changes. `early_report` names the task
+    /// of a report the hand-offs hold for a post not seen yet.
+    fn concerns(&self, change: &Change, early_report: &dyn Fn(&str) -> Option<String>) -> bool {
+        match change {
+            Change::Report { task, .. } => self.holds_post(task),
+            Change::Uncorrelated { .. } => false,
+            other => other.message_id().is_some_and(|id| {
+                self.holds_post(id)
+                    || self.handoffs.iter().any(|(_, held)| {
+                        matches!(held, HeldHandoff::Notice(Change::Report { report, .. }, _) if report == id)
+                    })
+                    || early_report(id).is_some_and(|task| self.holds_post(&task))
+            }),
+        }
+    }
+
     /// The run will not open: remove the usage file made for it.
     fn forget(self) {
         if let Some(file) = self.usage_dirs.usage_file {
@@ -708,7 +755,7 @@ impl RunTracker {
                 events: Vec::new(),
                 usage_dirs: UsageDirs::default(),
                 ended: None,
-                posts: Vec::new(),
+                handoffs: Vec::new(),
                 dispatch_name,
             });
     }
@@ -808,16 +855,24 @@ impl RunTracker {
     }
 
     /// Issue #1981 M7: open the hand-off of each task held for the prepared
-    /// run `run_id`, which will not open: while the run is still known, so
-    /// each keeps its run id, though there is no run span to parent it.
+    /// run `run_id`, which will not open, and apply the notices held about
+    /// them, in the order seen: while the run is still known, so each keeps
+    /// its run id, though there is no run span to parent it.
     fn release_posts(&mut self, run_id: &str) {
-        let posts = self
+        let held = self
             .pending
             .get_mut(run_id)
-            .map(|p| std::mem::take(&mut p.posts))
+            .map(|p| std::mem::take(&mut p.handoffs))
             .unwrap_or_default();
-        for (_, posted) in posts {
-            self.delegate_posted(posted);
+        for (_, held) in held {
+            self.apply_held(held);
+        }
+    }
+
+    fn apply_held(&mut self, held: HeldHandoff) {
+        match held {
+            HeldHandoff::Post(posted) => self.delegate_posted(posted),
+            HeldHandoff::Notice(change, at) => self.apply_change(change, at),
         }
     }
 
@@ -835,17 +890,19 @@ impl RunTracker {
             run.context = pending.context;
             run.dispatch_name = pending.dispatch_name;
         }
-        // Each task posted in its place among the events, so one posted
-        // before a close is opened in the run before the close ends it.
-        let mut posts = pending.posts.into_iter().peekable();
-        for (held, (event, at)) in pending.events.into_iter().enumerate() {
-            while let Some((_, posted)) = posts.next_if(|(before, _)| *before <= held) {
-                self.delegate_posted(posted);
+        // Each task posted, and each notice about one, in its place among
+        // the events: one posted before a close is opened in the run before
+        // the close ends it, and a report that arrived after the close finds
+        // the hand-off already ended.
+        let mut handoffs = pending.handoffs.into_iter().peekable();
+        for (index, (event, at)) in pending.events.into_iter().enumerate() {
+            while let Some((_, held)) = handoffs.next_if(|(before, _)| *before <= index) {
+                self.apply_held(held);
             }
             self.observe_kept(event, at);
         }
-        for (_, posted) in posts {
-            self.delegate_posted(posted);
+        for (_, held) in handoffs {
+            self.apply_held(held);
         }
         if let Some((reason, exit_code, at)) = pending.ended {
             self.end_run(&pane_id, reason, exit_code, at);
@@ -1636,7 +1693,10 @@ impl RunTracker {
     /// run's events, after the ones held so far, for
     /// [`Self::commit_run`] to open in that place. Opened now, the hand-off
     /// would miss the run's trace; opened after the events held, it would
-    /// miss a run they end.
+    /// miss a run they end. Past [`MAX_PENDING_EVENTS`] posts held for one
+    /// run, a post opens at once, in a trace of its own with no parent: that
+    /// takes as many posts from one orchestrator before telemetry applies
+    /// its run's `Commit`, which no real workload comes near.
     pub fn place_post(&mut self, posted: Posted) {
         let prepared = run_ref(
             &self.runs,
@@ -1647,11 +1707,11 @@ impl RunTracker {
         )
         .filter(|run| run.span.is_none())
         .and_then(|run| self.pending.get_mut(&run.run_id))
-        .filter(|pending| pending.posts.len() < MAX_PENDING_EVENTS);
+        .filter(|pending| pending.held_posts() < MAX_PENDING_EVENTS);
         match prepared {
             Some(pending) => {
                 let before = pending.events.len();
-                pending.posts.push((before, posted));
+                pending.handoffs.push((before, HeldHandoff::Post(posted)));
             }
             None => self.delegate_posted(posted),
         }
@@ -1675,6 +1735,37 @@ impl RunTracker {
             }
             return;
         }
+        if !self.hold_notice(&change, now) {
+            self.apply_change(change, now);
+        }
+    }
+
+    /// Issue #1981 M7 review: hold `change`, seen at `now`, in the prepared
+    /// run holding the post it concerns, after the events held so far, for
+    /// [`Self::commit_run`] to apply in that place: applied before the run
+    /// opens, the post would replay it ahead of a close held before it.
+    /// Whether it was held. Past [`MAX_PENDING_EVENTS`] notices held for one
+    /// run, a notice is applied at once, and replayed as the post opens.
+    fn hold_notice(&mut self, change: &Change, now: u64) -> bool {
+        let handoffs = &self.handoffs;
+        let early_report = |id: &str| handoffs.early_report_task(id).map(str::to_string);
+        let Some(pending) = self
+            .pending
+            .values_mut()
+            .find(|pending| pending.concerns(change, &early_report))
+            .filter(|pending| pending.held_notices() < MAX_PENDING_EVENTS)
+        else {
+            return false;
+        };
+        let before = pending.events.len();
+        pending
+            .handoffs
+            .push((before, HeldHandoff::Notice(change.clone(), now)));
+        true
+    }
+
+    /// Apply `change`, seen at `now`, to the hand-offs.
+    fn apply_change(&mut self, change: Change, now: u64) {
         let (runs, replaced, pending) = (&self.runs, &self.replaced, &self.pending);
         let run_of = |pane: &str, agent: &str| run_ref(runs, replaced, pending, pane, Some(agent));
         self.handoffs

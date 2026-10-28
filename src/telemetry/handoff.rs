@@ -193,7 +193,7 @@ impl Change {
     }
 
     /// The message this change is about.
-    fn message_id(&self) -> Option<&str> {
+    pub fn message_id(&self) -> Option<&str> {
         match self {
             Change::Taken(id) | Change::Acknowledged(id) | Change::Undeliverable(id, _) => Some(id),
             Change::Report { report, .. } => Some(report),
@@ -476,6 +476,17 @@ impl Handoffs {
             self.reports.remove(report);
         }
         finished.push(span(id, open, outcome, now));
+    }
+
+    /// The task named by report `report`, when the report is held for a
+    /// post not seen yet.
+    pub fn early_report_task(&self, report: &str) -> Option<&str> {
+        self.early.iter().find_map(|(change, _)| match change {
+            Change::Report {
+                report: r, task, ..
+            } if r == report => Some(task.as_str()),
+            _ => None,
+        })
     }
 
     /// Hand-offs open now.

@@ -7051,6 +7051,234 @@ mod tests {
         drop(orch);
     }
 
+    /// An inbox change to message `id` in `pane`'s inbox, as broadcast.
+    fn inbox(pane: &str, id: &str, state: crate::inbox::StateName) -> BroadcastMsg {
+        BroadcastMsg::Inbox(crate::event::InboxNotice {
+            pane_id: pane.into(),
+            agent_id: None,
+            message_id: id.into(),
+            subject: String::new(),
+            from_label: String::new(),
+            state,
+            reason: None,
+            returned: false,
+            wake_stalled: false,
+            wake_update: false,
+            attention_update: false,
+            requeued: false,
+            provenance: None,
+            notices: Default::default(),
+        })
+    }
+
+    /// Report `report` naming task `task`, queued in `orch`'s inbox by the
+    /// worker `work`/`wa`.
+    fn report_for(orch: &str, report: &str, task: &str) -> BroadcastMsg {
+        let BroadcastMsg::Inbox(mut notice) = inbox(orch, report, crate::inbox::StateName::Queued)
+        else {
+            unreachable!()
+        };
+        notice.provenance = Some(crate::report_recovery::ReportProvenance::Task {
+            task_id: task.into(),
+            report_id: "r".into(),
+            producer: crate::report_recovery::Producer {
+                pane_id: "work".into(),
+                agent_id: "wa".into(),
+                role: Some("coder".into()),
+            },
+        });
+        BroadcastMsg::Inbox(notice)
+    }
+
+    /// With the ingest task paused, the orchestrator's run is prepared and
+    /// its commit queued, task `m-o` is posted, and `before` then the
+    /// orchestrator's pane-close then `after` are broadcast. The spans once
+    /// it resumes.
+    async fn around_a_held_close(
+        before: Vec<BroadcastMsg>,
+        after: Vec<BroadcastMsg>,
+    ) -> Vec<SpanRecord> {
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("work", "wa"), &[]);
+        telemetry.settled().await;
+        let (resume, nudge) = pause_ingest(&telemetry).await;
+        let orch = telemetry
+            .prepare_run(generation("orch", "oa"), &[], None)
+            .unwrap();
+        orch.commit();
+        post_task(&telemetry, "m-o", "orch", "oa");
+        for msg in before {
+            tx.send(msg).unwrap();
+        }
+        tx.send(pane_closed("orch", "oa")).unwrap();
+        for msg in after {
+            tx.send(msg).unwrap();
+        }
+        resume.send(()).unwrap();
+        nudge.await.unwrap();
+        telemetry.settled().await;
+        captured(&mut rx)
+    }
+
+    fn event_names(span: &SpanRecord) -> Vec<&'static str> {
+        span.events.iter().map(|e| e.name).collect()
+    }
+
+    /// Issue #1981 M7 review (the reviewer's
+    /// `review_prepared_post_ignores_report_after_orchestrator_close`): a
+    /// task posted while its orchestrator's run is prepared, the run's
+    /// pane-close, then the worker's report naming the task, all applied as
+    /// the run opens. The report came after the run ended, so the hand-off
+    /// ends `unknown` with the run, with no report event.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_report_after_a_prepared_runs_held_close_finds_the_handoff_ended() {
+        let spans = around_a_held_close(vec![], vec![report_for("orch", "m-r", "m-o")]).await;
+        assert_eq!(handoff_spans(&spans).len(), 1, "{spans:?}");
+        let handoff = handoff(&spans, "m-o");
+        let run = run_on(&spans, "orch");
+        assert_child_of(handoff, run);
+        assert_eq!(
+            attr(handoff, AttrKey::HandoffOutcome),
+            Some(&AttrValue::Str("unknown".into()))
+        );
+        assert_eq!(handoff.end_unix_nanos, run.end_unix_nanos);
+        assert_eq!(event_names(handoff), Vec::<&str>::new());
+    }
+
+    /// Issue #1981 M7 review: `notice`, about task `m-o`, broadcast after the
+    /// prepared orchestrator run's held close, is applied after that close:
+    /// the hand-off ends `unknown` with the run, with nothing taken and no
+    /// other outcome.
+    async fn assert_a_task_notice_after_a_held_close_finds_the_handoff_ended(notice: BroadcastMsg) {
+        let spans = around_a_held_close(vec![], vec![notice]).await;
+        assert_eq!(handoff_spans(&spans).len(), 1, "{spans:?}");
+        let handoff = handoff(&spans, "m-o");
+        let run = run_on(&spans, "orch");
+        assert_child_of(handoff, run);
+        assert_eq!(
+            attr(handoff, AttrKey::HandoffOutcome),
+            Some(&AttrValue::Str("unknown".into()))
+        );
+        assert_eq!(handoff.end_unix_nanos, run.end_unix_nanos);
+        assert_eq!(event_names(handoff), Vec::<&str>::new());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fetch_after_a_prepared_runs_held_close_finds_the_handoff_ended() {
+        assert_a_task_notice_after_a_held_close_finds_the_handoff_ended(inbox(
+            "work",
+            "m-o",
+            crate::inbox::StateName::Fetched,
+        ))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_acknowledgement_after_a_prepared_runs_held_close_finds_the_handoff_ended() {
+        assert_a_task_notice_after_a_held_close_finds_the_handoff_ended(inbox(
+            "work",
+            "m-o",
+            crate::inbox::StateName::Acknowledged,
+        ))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_undeliverable_after_a_prepared_runs_held_close_finds_the_handoff_ended() {
+        let BroadcastMsg::Inbox(mut notice) =
+            inbox("work", "m-o", crate::inbox::StateName::Undeliverable)
+        else {
+            unreachable!()
+        };
+        notice.reason = Some(crate::inbox::UndeliverableReason::AgentExited);
+        assert_a_task_notice_after_a_held_close_finds_the_handoff_ended(BroadcastMsg::Inbox(
+            notice,
+        ))
+        .await;
+    }
+
+    /// Issue #1981 M7 review: the worker's report on a task held for a
+    /// prepared orchestrator run arrives before the run's held close: the
+    /// run had not ended, so the hand-off ends `reported`, with the report's
+    /// event, at the run's end; the orchestrator's acknowledgement after the
+    /// close does not move that end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_report_before_a_prepared_runs_held_close_ends_the_handoff_reported() {
+        use crate::inbox::StateName;
+        let spans = around_a_held_close(
+            vec![
+                inbox("work", "m-o", StateName::Acknowledged),
+                report_for("orch", "m-r", "m-o"),
+            ],
+            vec![inbox("orch", "m-r", StateName::Acknowledged)],
+        )
+        .await;
+        assert_eq!(handoff_spans(&spans).len(), 1, "{spans:?}");
+        let handoff = handoff(&spans, "m-o");
+        let run = run_on(&spans, "orch");
+        assert_child_of(handoff, run);
+        assert_eq!(
+            attr(handoff, AttrKey::HandoffOutcome),
+            Some(&AttrValue::Str("reported".into()))
+        );
+        assert_eq!(handoff.end_unix_nanos, run.end_unix_nanos);
+        assert_eq!(
+            event_names(handoff),
+            vec![
+                crate::telemetry::EVENT_HANDOFF_TAKEN,
+                crate::telemetry::EVENT_HANDOFF_REPORTED
+            ]
+        );
+        assert!(
+            handoff
+                .events
+                .iter()
+                .all(|e| e.time_unix_nanos <= run.end_unix_nanos),
+            "{handoff:?}"
+        );
+    }
+
+    /// Issue #1981 M7 review: a report that overtakes its task's post, then
+    /// the post held for its prepared orchestrator run, the run's close, and
+    /// the orchestrator acknowledging the report: the acknowledgement came
+    /// after the close, so the hand-off ends `reported` at the run's end,
+    /// not at the acknowledgement.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_acknowledgement_after_a_held_close_of_a_report_that_overtook_its_post_stays_after_it()
+     {
+        use crate::inbox::StateName;
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("work", "wa"), &[]);
+        telemetry.settled().await;
+        let (resume, nudge) = pause_ingest(&telemetry).await;
+        let orch = telemetry
+            .prepare_run(generation("orch", "oa"), &[], None)
+            .unwrap();
+        orch.commit();
+        tx.send(report_for("orch", "m-r", "m-o")).unwrap();
+        post_task(&telemetry, "m-o", "orch", "oa");
+        tx.send(pane_closed("orch", "oa")).unwrap();
+        tx.send(inbox("orch", "m-r", StateName::Acknowledged))
+            .unwrap();
+        resume.send(()).unwrap();
+        nudge.await.unwrap();
+        telemetry.settled().await;
+        let spans = captured(&mut rx);
+        assert_eq!(handoff_spans(&spans).len(), 1, "{spans:?}");
+        let handoff = handoff(&spans, "m-o");
+        let run = run_on(&spans, "orch");
+        assert_child_of(handoff, run);
+        assert_eq!(
+            attr(handoff, AttrKey::HandoffOutcome),
+            Some(&AttrValue::Str("reported".into()))
+        );
+        assert_eq!(handoff.end_unix_nanos, run.end_unix_nanos);
+    }
+
     /// Issue #1981 M7: the delegate seam and the inbox's broadcast make one
     /// `agent.handoff` through the whole exporter, in the orchestrator's
     /// trace, carrying none of the task's text.
