@@ -221,6 +221,9 @@ struct PendingRun {
     /// Its agent already ended, before the run was committed: how and when,
     /// applied by [`RunTracker::commit_run`] once the run opens.
     ended: Option<(EndReason, Option<i32>, u64)>,
+    /// The dispatched unit it belongs to, when known before it opens
+    /// ([`RunTracker::begin_dispatch`]).
+    dispatch_name: Option<String>,
 }
 
 /// A run's own card state, dropped with the run. Tests count the live ones
@@ -288,9 +291,12 @@ struct ActiveRun {
     /// The pull request whose checks the run's card holds now, whose CI state
     /// it shares with every other run holding it ([`RunTracker::ci`]).
     ci_pr: Option<PrKey>,
-    /// Rounds of that pull request's checks that ended in a result while this
-    /// run held it, and how many of them failed: what this run observed, so
-    /// runs holding the same pull request each count the same round.
+    /// What this run's card last showed of that pull request's checks.
+    ci_seen: Option<CiState>,
+    /// Rounds of that pull request's checks this run's card saw go from
+    /// pending to a result, and how many of them failed: what this run
+    /// observed, so runs holding the same pull request each count the same
+    /// round, whatever order the shared state took their reports in.
     ci_rounds: u64,
     ci_failures: u64,
     /// The run's usage readers (PRD #1858), taken as the run finishes.
@@ -325,9 +331,21 @@ impl PrKey {
 /// One pull request's checks, as every open run holding it sees them: its
 /// `agent.ci` spans and `deck.ci.change` events are recorded once, however
 /// many runs hold it.
+///
+/// **Reports are folded in the order the daemon made them, not the order
+/// they reach the tracker.** Each run's card is told separately, a prepared
+/// run's reports are applied only when it opens, and a card can lag, so a
+/// report can arrive after a newer one about the same pull request has moved
+/// the shared state on. The daemon stamps every report with a revision from
+/// one increasing counter ([`crate::pull_request::next_revision`]), so a
+/// report whose revision is lower than the newest folded in is history the
+/// state has moved past, and is left out.
 #[derive(Default)]
 struct SharedCi {
     ci: PrCi,
+    /// The highest report revision folded into `ci`. `0` until one with a
+    /// revision is: a report with none is folded by arrival.
+    revision: u64,
     /// The runs holding it, by run id, the longest-holding first. That one
     /// takes its `deck.ci.change` events, and a stretch that opens goes in its
     /// trace.
@@ -335,6 +353,31 @@ struct SharedCi {
     /// Where the open stretch's `agent.ci` span goes.
     opener: Option<StretchOpener>,
 }
+
+/// What is kept of a pull request once no open run holds it, so a report
+/// about it that arrives later — from a run prepared while it was held — is
+/// still ordered against what was already recorded ([`SharedCi`]).
+struct ReleasedCi {
+    revision: u64,
+    settled: Option<CiState>,
+}
+
+/// A unit being spawned: see [`RunTracker::begin_dispatch`].
+struct Dispatching {
+    token: u64,
+    worktree: std::path::PathBuf,
+    name: String,
+}
+
+/// Dispatched orchestration instances whose name the tracker keeps, so a role
+/// started again later is named from its start too. Past it the oldest is
+/// forgotten, and a role it starts is named by the deck's record of
+/// dispatched units instead ([`RunTracker::runs_without_dispatch`]).
+pub const MAX_DISPATCHED_ORCHESTRATIONS: usize = 256;
+
+/// Pull requests no open run holds that the tracker keeps a
+/// [`ReleasedCi`] for. Past it the one with the oldest report is forgotten.
+pub const MAX_RELEASED_PULL_REQUESTS: usize = 256;
 
 /// The run a stretch of pending checks opened in.
 struct StretchOpener {
@@ -421,6 +464,15 @@ pub struct RunTracker {
     finishing: Vec<FinishingRun>,
     /// The CI state of every pull request an open run's card holds.
     ci: HashMap<PrKey, SharedCi>,
+    /// The pull requests no open run holds any more, at most
+    /// [`MAX_RELEASED_PULL_REQUESTS`].
+    released_ci: HashMap<PrKey, ReleasedCi>,
+    /// The units being spawned now.
+    dispatching: Vec<Dispatching>,
+    next_dispatch: u64,
+    /// The names of dispatched orchestration instances, by instance token,
+    /// oldest first, at most [`MAX_DISPATCHED_ORCHESTRATIONS`].
+    dispatched_orchestrations: VecDeque<(String, String)>,
     held_input: Option<HeldInput>,
     /// Test witness: the [`ShadowCards`] alive.
     #[cfg(test)]
@@ -458,6 +510,14 @@ impl RunTracker {
     /// [`Self::commit_run`] are kept for it. A run id prepared twice keeps the
     /// first preparation.
     pub fn prepare_run(&mut self, start: RunStart, now: u64) {
+        self.prepare_run_in(start, now, None);
+    }
+
+    /// [`Self::prepare_run`], for an agent starting in `cwd`: a run of a unit
+    /// being dispatched, or of a dispatched orchestration, is named after the
+    /// unit from here on.
+    pub fn prepare_run_in(&mut self, start: RunStart, now: u64, cwd: Option<&std::path::Path>) {
+        let dispatch_name = self.dispatch_name_for(&start, cwd);
         self.pending
             .entry(start.run_id.clone())
             .or_insert(PendingRun {
@@ -467,7 +527,93 @@ impl RunTracker {
                 events: Vec::new(),
                 usage_dirs: UsageDirs::default(),
                 ended: None,
+                dispatch_name,
             });
+    }
+
+    /// The unit a run about to start belongs to: the dispatched orchestration
+    /// instance it is a role of, else the unit whose worktree `cwd` is in
+    /// while that unit is being spawned — the innermost, should two nest.
+    fn dispatch_name_for(&self, start: &RunStart, cwd: Option<&std::path::Path>) -> Option<String> {
+        let instance = start.orchestration.as_ref().and_then(|o| o.id.as_deref());
+        if let Some(instance) = instance
+            && let Some((_, name)) = self
+                .dispatched_orchestrations
+                .iter()
+                .find(|(id, _)| id == instance)
+        {
+            return Some(name.clone());
+        }
+        let cwd = cwd?;
+        self.dispatching
+            .iter()
+            .filter(|d| cwd.starts_with(&d.worktree))
+            .max_by_key(|d| d.worktree.as_os_str().len())
+            .map(|d| d.name.clone())
+    }
+
+    /// A unit named `name` is about to be spawned in `worktree`: every run
+    /// prepared in it until [`Self::end_dispatch`] is given the token
+    /// returned here belongs to the unit. Naming a run as it is prepared means
+    /// it has the name however soon it ends, before anything the deck records
+    /// of the unit could be looked up.
+    pub fn begin_dispatch(&mut self, name: &str, worktree: &std::path::Path) -> u64 {
+        self.next_dispatch += 1;
+        self.dispatching.push(Dispatching {
+            token: self.next_dispatch,
+            worktree: worktree.to_path_buf(),
+            name: name.to_string(),
+        });
+        self.next_dispatch
+    }
+
+    /// The spawn [`Self::begin_dispatch`] returned `token` for is over.
+    pub fn end_dispatch(&mut self, token: u64) {
+        self.dispatching.retain(|d| d.token != token);
+    }
+
+    /// The unit `name` was spawned as the generations `agents`, by pane and
+    /// agent id, and, for an orchestration, as instance `orchestration_id`:
+    /// name each of their runs that has no name yet, prepared, open or
+    /// replaced, and every role the instance starts later.
+    pub fn name_dispatched(
+        &mut self,
+        name: &str,
+        agents: &[(String, String)],
+        orchestration_id: Option<&str>,
+    ) {
+        let ours = |start: &RunStart| {
+            agents.iter().any(|(pane, agent)| {
+                start.pane_id == *pane && start.agent_id.as_deref() == Some(agent.as_str())
+            }) || (orchestration_id.is_some()
+                && start.orchestration.as_ref().and_then(|o| o.id.as_deref()) == orchestration_id)
+        };
+        for pending in self.pending.values_mut() {
+            if pending.dispatch_name.is_none() && ours(&pending.start) {
+                pending.dispatch_name = Some(name.to_string());
+            }
+        }
+        for run in self
+            .runs
+            .values_mut()
+            .chain(self.replaced.iter_mut().map(|r| &mut r.run))
+        {
+            if run.dispatch_name.is_none() && ours(&run.start_info) {
+                run.dispatch_name = Some(name.to_string());
+            }
+        }
+        if let Some(instance) = orchestration_id
+            && !self
+                .dispatched_orchestrations
+                .iter()
+                .any(|(id, _)| id == instance)
+        {
+            if self.dispatched_orchestrations.len() >= MAX_DISPATCHED_ORCHESTRATIONS {
+                self.dispatched_orchestrations.pop_front();
+            }
+            self.dispatched_orchestrations
+                .push_back((instance.to_string(), name.to_string()));
+        }
     }
 
     /// The agent of the prepared run `run_id` did not start: forget the run.
@@ -489,6 +635,7 @@ impl RunTracker {
         self.open_run(pending.start, pending.prepared_at, pending.usage_dirs);
         if let Some(run) = self.runs.get_mut(&pane_id) {
             run.context = pending.context;
+            run.dispatch_name = pending.dispatch_name;
         }
         for (event, at) in pending.events {
             self.observe_kept(event, at);
@@ -546,6 +693,7 @@ impl RunTracker {
                 operations_count: 0,
                 seen_call_ids: VecDeque::new(),
                 ci_pr: None,
+                ci_seen: None,
                 ci_rounds: 0,
                 ci_failures: 0,
                 usage: Some(usage),
@@ -694,12 +842,12 @@ impl RunTracker {
         let pull_request = (event.event_type == EventType::PullRequest)
             .then(|| card_pull_request(&run.cards, event))
             .flatten();
-        if let Some(pr) = pull_request {
+        if let Some((pr, revision)) = pull_request {
             if let Some(pr) = &pr {
                 run.pr_number = Some(pr.number);
             }
             let key = pr.as_ref().map(PrKey::of);
-            self.observe_ci(pane_id, key, pr.and_then(|pr| pr.checks), now);
+            self.observe_ci(pane_id, key, pr.and_then(|pr| pr.checks), revision, now);
         }
         let Some(run) = self.runs.get_mut(pane_id) else {
             return;
@@ -721,13 +869,17 @@ impl RunTracker {
     }
 
     /// The card of the run open on `pane_id` now holds pull request `key`, or
-    /// none, with `checks`: the run joins that pull request's shared CI state,
-    /// and lets go of the one it held before.
+    /// none, with `checks`, as the daemon's report of revision `revision`
+    /// told it: the run joins that pull request's shared CI state, and lets go
+    /// of the one it held before. The run counts a round it saw end; the
+    /// shared state takes the report only when it is not older than the
+    /// newest one it already took ([`SharedCi`]).
     fn observe_ci(
         &mut self,
         pane_id: &str,
         key: Option<PrKey>,
         checks: Option<crate::pull_request_info::PullRequestChecks>,
+        revision: u64,
         now: u64,
     ) {
         let Some(run) = self.runs.get_mut(pane_id) else {
@@ -735,19 +887,40 @@ impl RunTracker {
         };
         let run_id = run.start_info.run_id.clone();
         let held = std::mem::replace(&mut run.ci_pr, key.clone());
-        if held != key
-            && let Some(held) = held
-        {
-            let identity = child_identity(run);
-            self.release_ci(&held, &run_id, identity, now);
+        if held != key {
+            run.ci_seen = None;
+            if let Some(held) = held {
+                let identity = child_identity(run);
+                self.release_ci(&held, &run_id, identity, now);
+            }
         }
         let Some(key) = key else {
             return;
         };
-        let mut shared = self.ci.remove(&key).unwrap_or_default();
+        let seen = checks.and_then(|checks| CiState::from_checks(checks.state));
+        if let Some(seen) = seen
+            && let Some(run) = self.runs.get_mut(pane_id)
+        {
+            if run.ci_seen == Some(CiState::Pending) && seen != CiState::Pending {
+                run.ci_rounds += 1;
+                if seen == CiState::Failing {
+                    run.ci_failures += 1;
+                }
+            }
+            run.ci_seen = Some(seen);
+        }
+        let mut shared = match self.ci.remove(&key) {
+            Some(shared) => shared,
+            None => self.resume_ci(&key),
+        };
         if !shared.holders.contains(&run_id) {
             shared.holders.push(run_id);
         }
+        if revision != 0 && revision < shared.revision {
+            self.ci.insert(key, shared);
+            return;
+        }
+        shared.revision = shared.revision.max(revision);
         let effects = shared
             .ci
             .observe(Some(key.number), checks, now, new_span_id);
@@ -765,6 +938,23 @@ impl RunTracker {
         self.ci.insert(key, shared);
     }
 
+    /// The shared CI state of pull request `key` as a run takes hold of it:
+    /// fresh, but ordered after what was recorded while runs held it before
+    /// ([`ReleasedCi`]).
+    fn resume_ci(&mut self, key: &PrKey) -> SharedCi {
+        let Some(released) = self.released_ci.remove(key) else {
+            return SharedCi::default();
+        };
+        SharedCi {
+            ci: released
+                .settled
+                .map(|settled| PrCi::resumed(key.number, settled))
+                .unwrap_or_default(),
+            revision: released.revision,
+            ..SharedCi::default()
+        }
+    }
+
     /// The run `run_id`, whose [`child_identity`] is now `identity`, no
     /// longer holds pull request `key`: it ended, or its card moved on. The
     /// last run to let go ends the open stretch without a result.
@@ -778,15 +968,33 @@ impl RunTracker {
         }
         if !shared.holders.is_empty() {
             self.ci.insert(key.clone(), shared);
-        } else if let Some(effect) = shared.ci.end_run() {
+            return;
+        }
+        if let Some(effect) = shared.ci.end_run() {
             self.record_ci(&mut shared, effect, now);
         }
+        if self.released_ci.len() >= MAX_RELEASED_PULL_REQUESTS
+            && let Some(oldest) = self
+                .released_ci
+                .iter()
+                .min_by_key(|(_, released)| released.revision)
+                .map(|(key, _)| key.clone())
+        {
+            self.released_ci.remove(&oldest);
+        }
+        self.released_ci.insert(
+            key.clone(),
+            ReleasedCi {
+                revision: shared.revision,
+                settled: shared.ci.settled(),
+            },
+        );
     }
 
     /// Record what one observation of `shared`'s checks changed: a change is
-    /// an event on the run that has held the pull request longest, a round
-    /// that ended counts for every run holding it, and a stretch that ended is
-    /// a span in the trace of the run it opened in.
+    /// an event on the run that has held the pull request longest, and a
+    /// stretch that ended is a span in the trace of the run it opened in. Each
+    /// run counts the rounds it saw itself ([`Self::observe_ci`]).
     fn record_ci(&mut self, shared: &mut SharedCi, effect: CiEffect, now: u64) {
         match effect {
             CiEffect::Change { from, to, pr } => {
@@ -809,16 +1017,6 @@ impl RunTracker {
                 result,
                 checks,
             } => {
-                if let Some(result) = result {
-                    for id in &shared.holders {
-                        if let Some(run) = self.run_by_id(id) {
-                            run.ci_rounds += 1;
-                            if result == CiState::Failing {
-                                run.ci_failures += 1;
-                            }
-                        }
-                    }
-                }
                 let Some(opener) = shared.opener.take() else {
                     return;
                 };
@@ -1300,11 +1498,12 @@ impl KeptEvent {
 /// it holds none — or `None` when the run holds no such card, so the report had
 /// nothing to land on. Read after the card applied the report, so the card's own
 /// rules decide: a report older than the one it holds is ignored, and a report
-/// of no pull request clears it.
+/// of no pull request clears it. With it, the revision of the report the card
+/// holds it from ([`crate::state::SessionState::pull_request_revision`]).
 fn card_pull_request(
     cards: &AppState,
     event: &AgentEvent,
-) -> Option<Option<crate::pull_request_info::PullRequestInfo>> {
+) -> Option<(Option<crate::pull_request_info::PullRequestInfo>, u64)> {
     cards
         .sessions
         .iter()
@@ -1315,7 +1514,7 @@ fn card_pull_request(
                     && s.agent_id == event.agent_id)
         })
         .max_by_key(|(_, s)| s.last_activity)
-        .map(|(_, s)| s.pull_request.clone())
+        .map(|(_, s)| (s.pull_request.clone(), s.pull_request_revision))
 }
 
 /// The `deck.status` value for a card status.
@@ -3277,5 +3476,216 @@ pub(crate) mod tests {
         assert_eq!(declared.orchestration, None);
         let unknown = RunStart::for_spawn("pane-3", "agent-3", None, Some("/bin/sh -c x"), None);
         assert_eq!(unknown.agent, AgentType::None);
+    }
+
+    /// The `agent.ci` spans, `deck.ci.change` events and per-run round counts
+    /// of a finished set of spans, for the runs on `panes`.
+    fn ci_record(spans: &[SpanRecord], panes: &[&str]) -> (usize, Vec<usize>, Vec<Option<i64>>) {
+        let rounds = |pane: &str| match attr(run_span_on(spans, pane), AttrKey::CiRoundsCount) {
+            Some(AttrValue::Int(n)) => Some(*n),
+            _ => None,
+        };
+        (
+            ci_spans(spans).len(),
+            panes
+                .iter()
+                .map(|pane| ci_changes(run_span_on(spans, pane)).len())
+                .collect(),
+            panes.iter().map(|pane| rounds(pane)).collect(),
+        )
+    }
+
+    /// Issue #1981 M3: a run prepared while another run's card watched its
+    /// pull request's checks go from pending to passing is told of the same
+    /// round — under the daemon's own, interleaved revisions — only once it
+    /// opens, after the shared state has recorded the result. Its replayed
+    /// reports are older than that result, so the round is recorded once: one
+    /// `agent.ci` span and two changes, and each run counts the one round its
+    /// card saw.
+    #[test]
+    fn a_run_committed_after_a_round_ended_does_not_record_it_again() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.prepare_run(start("p2"), 0);
+        for pane in ["p1", "p2"] {
+            tracker.observe_event(&event(pane, EventType::SessionStart), 1);
+        }
+        tracker.observe_event(&checks_report("p1", 9, 1, "pending", (0, 0, 0)), 10);
+        tracker.observe_event(&checks_report("p2", 9, 2, "pending", (0, 0, 0)), 11);
+        tracker.observe_event(&checks_report("p1", 9, 3, "passing", (3, 0, 0)), 20);
+        tracker.observe_event(&checks_report("p2", 9, 4, "passing", (3, 0, 0)), 21);
+        tracker.commit_run("run-p2");
+        tracker.end_run("p1", EndReason::Exited, None, 30);
+        tracker.end_run("p2", EndReason::Exited, None, 30);
+        let spans = tracker.take_finished();
+        assert_eq!(
+            ci_record(&spans, &["p1", "p2"]),
+            (1, vec![2, 0], vec![Some(1), Some(1)])
+        );
+        let span = ci_spans(&spans)[0];
+        assert_eq!((span.start_unix_nanos, span.end_unix_nanos), (10, 20));
+        assert_eq!(
+            attr(span, AttrKey::CiResult),
+            Some(&AttrValue::Str("passing".into()))
+        );
+    }
+
+    /// Issue #1981 M3: a second open run whose card lags is told of a round's
+    /// pending only after the first run's card showed its result. That
+    /// report is older than the result and records nothing; the lagging
+    /// card's own result then repeats the shared state and records nothing
+    /// either, while the lagging run still counts the round it saw.
+    #[test]
+    fn a_stale_report_on_an_open_run_does_not_roll_the_shared_state_back() {
+        let mut tracker = RunTracker::new();
+        for pane in ["p1", "p2"] {
+            tracker.begin_run(start(pane), 0);
+            tracker.observe_event(&event(pane, EventType::SessionStart), 1);
+        }
+        tracker.observe_event(&checks_report("p1", 9, 1, "pending", (0, 0, 0)), 10);
+        tracker.observe_event(&checks_report("p1", 9, 3, "passing", (3, 0, 0)), 20);
+        tracker.observe_event(&checks_report("p2", 9, 2, "pending", (0, 0, 0)), 21);
+        tracker.observe_event(&checks_report("p2", 9, 4, "passing", (3, 0, 0)), 22);
+        // The next round is still recorded, by either card.
+        tracker.observe_event(&checks_report("p2", 9, 5, "pending", (0, 0, 0)), 30);
+        tracker.observe_event(&checks_report("p1", 9, 6, "pending", (0, 0, 0)), 31);
+        tracker.observe_event(&checks_report("p1", 9, 7, "failing", (2, 1, 0)), 40);
+        tracker.end_run("p1", EndReason::Exited, None, 50);
+        tracker.end_run("p2", EndReason::Exited, None, 50);
+        let spans = tracker.take_finished();
+        assert_eq!(
+            ci_record(&spans, &["p1", "p2"]),
+            (2, vec![4, 0], vec![Some(2), Some(1)])
+        );
+        let windows: Vec<_> = ci_spans(&spans)
+            .iter()
+            .map(|s| (s.start_unix_nanos, s.end_unix_nanos))
+            .collect();
+        assert_eq!(windows, vec![(10, 20), (30, 40)]);
+    }
+
+    /// Issue #1981 M3: the order holds after every run holding the pull
+    /// request has let go of it. A run committed afterwards, whose reports
+    /// were made while the first run held it, records nothing the first run
+    /// already did, and a newer round it reports is still recorded.
+    #[test]
+    fn reports_older_than_a_released_pull_requests_record_nothing() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.prepare_run(start("p2"), 0);
+        for pane in ["p1", "p2"] {
+            tracker.observe_event(&event(pane, EventType::SessionStart), 1);
+        }
+        tracker.observe_event(&checks_report("p1", 9, 1, "pending", (0, 0, 0)), 10);
+        tracker.observe_event(&checks_report("p2", 9, 2, "pending", (0, 0, 0)), 11);
+        tracker.observe_event(&checks_report("p1", 9, 3, "passing", (3, 0, 0)), 20);
+        tracker.observe_event(&checks_report("p2", 9, 4, "passing", (3, 0, 0)), 21);
+        tracker.end_run("p1", EndReason::Exited, None, 25);
+        assert_eq!(tracker.ci.len(), 0);
+        tracker.commit_run("run-p2");
+        tracker.observe_event(&checks_report("p2", 9, 5, "pending", (0, 0, 0)), 30);
+        tracker.observe_event(&checks_report("p2", 9, 6, "passing", (4, 0, 0)), 40);
+        tracker.end_run("p2", EndReason::Exited, None, 50);
+        let spans = tracker.take_finished();
+        assert_eq!(
+            ci_record(&spans, &["p1", "p2"]),
+            (2, vec![2, 2], vec![Some(1), Some(2)])
+        );
+        let windows: Vec<_> = ci_spans(&spans)
+            .iter()
+            .map(|s| (s.start_unix_nanos, s.end_unix_nanos))
+            .collect();
+        assert_eq!(windows, vec![(10, 20), (30, 40)]);
+        assert_eq!(
+            ci_changes(run_span_on(&spans, "p2")),
+            vec![
+                Some(AttrValue::Str("pending".into())),
+                Some(AttrValue::Str("passing".into()))
+            ],
+            "no copy of the first round's changes"
+        );
+    }
+
+    /// Issue #1981 M6: a run prepared in the worktree of a unit being
+    /// dispatched is named after the unit from its start — so a run whose
+    /// pane closes before it is even committed keeps the name — while a run
+    /// prepared elsewhere, or in the worktree once the spawn is over, is not.
+    #[test]
+    fn a_run_prepared_in_a_dispatched_worktree_is_named_from_its_start() {
+        let mut tracker = RunTracker::new();
+        let name = "Fix: the unit, exactly";
+        let token = tracker.begin_dispatch(name, std::path::Path::new("/w/unit"));
+        let in_unit = std::path::Path::new("/w/unit/sub");
+        tracker.prepare_run_in(start("p1"), 0, Some(in_unit));
+        tracker.prepare_run_in(start("p2"), 0, Some(std::path::Path::new("/w/unit-2")));
+        let mut closed = event("p1", EventType::SessionEnd);
+        closed
+            .metadata
+            .insert(DAEMON_PANE_CLOSED_METADATA_KEY.into(), "1".into());
+        tracker.observe_event(&closed, 5);
+        tracker.end_dispatch(token);
+        tracker.prepare_run_in(start("p3"), 6, Some(in_unit));
+        for run in ["run-p1", "run-p2", "run-p3"] {
+            tracker.commit_run(run);
+        }
+        for pane in ["p2", "p3"] {
+            tracker.end_run(pane, EndReason::Exited, None, 10);
+        }
+        let spans = tracker.take_finished();
+        let named = |pane: &str| attr(run_span_on(&spans, pane), AttrKey::DispatchName).cloned();
+        assert_eq!(named("p1"), Some(AttrValue::Str(name.into())));
+        assert_eq!(
+            attr(run_span_on(&spans, "p1"), AttrKey::EndReason),
+            Some(&AttrValue::Str("closed".into()))
+        );
+        assert_eq!(named("p2"), None, "a sibling directory is not the worktree");
+        assert_eq!(named("p3"), None, "prepared after the spawn was over");
+    }
+
+    /// Issue #1981 M6: once the spawn says which generations it started, a
+    /// run of one of them that started outside the worktree is named too, as
+    /// is every role its orchestration instance starts later, and nothing
+    /// else.
+    #[test]
+    fn a_dispatched_units_generations_and_instance_are_named() {
+        let mut tracker = RunTracker::new();
+        let role = |pane: &str, agent: &str, instance: &str| RunStart {
+            agent_id: Some(agent.into()),
+            orchestration: Some(OrchestrationInfo {
+                id: Some(instance.into()),
+                ..OrchestrationInfo::default()
+            }),
+            ..start(pane)
+        };
+        tracker.begin_run(role("p1", "a1", "orch-1"), 0);
+        tracker.prepare_run(role("p2", "a2", "orch-1"), 0);
+        tracker.begin_run(role("p3", "a3", "orch-other"), 0);
+        tracker.name_dispatched("Team", &[("p1".into(), "a1".into())], Some("orch-1"));
+        tracker.commit_run("run-p2");
+        // A role the instance starts later.
+        tracker.prepare_run(role("p4", "a4", "orch-1"), 5);
+        tracker.commit_run("run-p4");
+        for pane in ["p1", "p2", "p3", "p4"] {
+            tracker.end_run(pane, EndReason::Exited, None, 10);
+        }
+        let spans = tracker.take_finished();
+        let named: Vec<_> = spans
+            .iter()
+            .filter(|s| s.name == SPAN_AGENT_RUN)
+            .map(|s| {
+                (
+                    attr(s, AttrKey::RunId).cloned(),
+                    attr(s, AttrKey::DispatchName).cloned(),
+                )
+            })
+            .collect();
+        let team = Some(AttrValue::Str("Team".into()));
+        for run in ["run-p1", "run-p2", "run-p4"] {
+            assert!(
+                named.contains(&(Some(AttrValue::Str(run.into())), team.clone())),
+                "{run}: {named:?}"
+            );
+        }
+        assert!(named.contains(&(Some(AttrValue::Str("run-p3".into())), None)));
     }
 }

@@ -156,6 +156,23 @@ impl PrCi {
         self.open.is_some()
     }
 
+    /// The result the checks last showed, when the last thing they showed was
+    /// one.
+    pub fn settled(&self) -> Option<CiState> {
+        self.last.filter(|state| *state != CiState::Pending)
+    }
+
+    /// Pull request `pr`, whose checks last showed the result `settled`: a
+    /// report of that same result changes nothing, and the next pending
+    /// opens a stretch.
+    pub fn resumed(pr: u64, settled: CiState) -> Self {
+        PrCi {
+            pr: Some(pr),
+            last: Some(settled),
+            ..PrCi::default()
+        }
+    }
+
     fn end_open(&mut self, result: Option<CiState>) -> Option<CiEffect> {
         let stretch = self.open.take()?;
         Some(CiEffect::Ended {

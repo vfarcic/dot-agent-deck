@@ -72,7 +72,7 @@ pub mod span;
 pub mod tracker;
 
 pub use config::{Protocol, TelemetryConfig};
-pub use exporter::{PreparedRun, Telemetry};
+pub use exporter::{DispatchNaming, PreparedRun, Telemetry};
 pub use tracker::{EndReason, OrchestrationInfo, RunStart, RunTracker};
 
 use std::sync::Arc;
@@ -124,12 +124,31 @@ fn dispatch_name(
         .map(|unit| unit.name.clone())
 }
 
-/// The dispatch path, once a unit is recorded: name the runs it opened
-/// ([`Telemetry::dispatched`]).
-pub fn observe_dispatch(registry: &crate::agent_pty::AgentPtyRegistry) {
-    if let Some(telemetry) = registry.telemetry() {
-        telemetry.dispatched();
-    }
+/// The dispatch path, before it spawns the unit `name` in `worktree`: name
+/// the runs the spawn prepares there from their start
+/// ([`Telemetry::begin_dispatch`]). Drop the result once the spawn is over,
+/// passing it to [`dispatch_spawned`] first when the spawn succeeded.
+pub fn begin_dispatch(
+    registry: &crate::agent_pty::AgentPtyRegistry,
+    name: &str,
+    worktree: &std::path::Path,
+) -> Option<DispatchNaming> {
+    registry.telemetry()?.begin_dispatch(name, worktree)
+}
+
+/// The dispatch path, once the spawn [`begin_dispatch`] named runs for
+/// started the unit as `handle`: name the runs of its generations and of its
+/// orchestration instance.
+pub fn dispatch_spawned(naming: Option<DispatchNaming>, handle: &crate::spawn::SpawnHandle) {
+    let Some(naming) = naming else {
+        return;
+    };
+    let agents: Vec<(String, String)> = handle
+        .agents
+        .iter()
+        .map(|agent| (agent.pane_id.clone(), agent.id.clone()))
+        .collect();
+    naming.spawned(&agents, handle.orchestration_id.as_deref());
 }
 
 /// `config_dir` holds this daemon's per-run agent configuration files and its
