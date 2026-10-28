@@ -1177,14 +1177,6 @@ pub enum Opened {
 /// The most of one line from the daemon a one-shot reads.
 pub const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 
-/// The least time one write in [`Connection::send`] is given. A socket
-/// timeout shorter than the kernel's clock tick can be read as no timeout on
-/// some platforms, which would leave a write blocked for good on a deck that
-/// reads nothing; a write at the end of the deadline is given this much
-/// rather than less, so it may end a little after the deadline.
-#[cfg(unix)]
-const MIN_WRITE_TIMEOUT: Duration = Duration::from_millis(20);
-
 /// The most lines a connection's reader thread queues that the one-shot has
 /// not yet taken, each of at most [`MAX_LINE_BYTES`]. With the queue full the
 /// thread holds one more, parsed, while it waits for room, and stops reading,
@@ -1442,10 +1434,7 @@ impl Connection {
             if left.is_zero() {
                 break Err(io::Error::from(io::ErrorKind::TimedOut));
             }
-            if let Err(error) = self
-                .stream
-                .set_write_timeout(Some(left.max(MIN_WRITE_TIMEOUT)))
-            {
+            if let Err(error) = self.stream.set_write_timeout(Some(left)) {
                 break Err(error);
             }
             match self.stream.write(rest) {
@@ -2437,6 +2426,8 @@ pub(crate) mod tests {
     fn a_line_after_a_cut_one_is_read_whole() {
         // Each step that can block runs on a worker, and the test names the
         // one it is stuck in rather than hanging until the runner's timeout.
+        // A run that times out leaves its worker (and the deck's reader
+        // thread) stuck until the test process exits.
         let (stage_tx, stage_rx) = std::sync::mpsc::channel::<&'static str>();
         let worker = std::thread::spawn(move || {
             let (mut connection, mut deck) = connection_pair();
