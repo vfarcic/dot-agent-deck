@@ -460,9 +460,10 @@ impl PaneInput {
     /// sequence it begins, with every byte of that key the write holds —
     /// keeps the time and position that `ESC` was written at, as one input;
     /// what follows the key has `now` and `position`. A sequence the write
-    /// leaves incomplete counts when a later write completes it, at that
-    /// write's time and position: an undecided one there alone, and the rest
-    /// of a decided key there as well as at the `ESC`'s.
+    /// leaves undecided counts once, when a later write decides it, at that
+    /// write's time and position. The rest of a key already decided does not
+    /// count again in the write that completes it, except a bracketed paste's,
+    /// which is paste written then.
     fn write(
         &mut self,
         bytes: &[u8],
@@ -4053,8 +4054,8 @@ mod tests {
     /// A lone `ESC` that a later write decides — as the Escape key, by
     /// another `ESC` or by its window passing, or as the start of a key's
     /// sequence — counts at the time and broadcast position it was written
-    /// at; the rest of that write counts at its own. A sequence the deciding
-    /// write leaves incomplete counts when a later write completes it.
+    /// at; the rest of that write counts at its own. A sequence the next
+    /// write leaves undecided counts when a later write decides it.
     #[test]
     fn a_decided_escape_keeps_the_time_and_position_it_was_written_at() {
         use InterventionKind::{Interrupt, Navigate, Text};
@@ -4115,18 +4116,24 @@ mod tests {
     const KEYS_WITH_TAILS: [(&[u8], usize); 3] =
         [(b"OA", 1), ("\u{e9}".as_bytes(), 1), (b"[Mabc", 2)];
 
-    /// A held `ESC`, then the rest of its key and a `z` in two writes split
-    /// at every byte. The key counts once, at the `ESC`'s time and position,
-    /// when the deciding write holds all of it; the `z` counts at the time of
-    /// the write it is in. A key split after it is decided completes in the
-    /// next write and counts there too, and one split before it is decided
-    /// counts there alone, as the docs say.
+    /// A held `ESC`, then the rest of its key, alone or with a `z` after it,
+    /// in two writes split at every byte. A key the first write decides
+    /// counts once, at the `ESC`'s time and position, wherever the split
+    /// falls inside it: the second write adds nothing for the rest of it. The
+    /// `z` counts at the time of the write it is in. A key split before it is
+    /// decided counts once, when the second write decides it, as the docs say.
     #[test]
     fn a_decided_key_counts_its_own_bytes_once() {
         use InterventionKind::{Navigate, Text};
-        for (key, decided) in KEYS_WITH_TAILS {
+        for ((key, decided), with_z) in KEYS_WITH_TAILS
+            .into_iter()
+            .flat_map(|key| [(key, false), (key, true)])
+        {
             let mut rest = key.to_vec();
-            rest.push(b'z');
+            if with_z {
+                rest.push(b'z');
+            }
+            let z = |at, position| with_z.then_some((at, Text, position));
             let pressed = std::time::Instant::now();
             let soon = pressed + LONE_ESCAPE_WINDOW / 4;
             let sooner = pressed + LONE_ESCAPE_WINDOW / 2;
@@ -4147,17 +4154,21 @@ mod tests {
                 let first = timed(input.write(&rest[..at], 2, 5, soon).0);
                 let second = timed(input.write(&rest[at..], 4, 7, sooner).0);
                 let (want_first, want_second) = if at == 0 {
-                    (vec![], vec![(1, Navigate, 3), (4, Text, 7)])
+                    (vec![], [Some((1, Navigate, 3)), z(4, 7)].to_vec())
                 } else if at < decided {
-                    (vec![], vec![(4, Text, 7)])
+                    let kind = if with_z { Text } else { Navigate };
+                    (vec![], vec![Some((4, kind, 7))])
                 } else if at <= key.len() {
-                    (vec![(1, Navigate, 3)], vec![(4, Text, 7)])
+                    (vec![Some((1, Navigate, 3))], vec![z(4, 7)])
                 } else {
-                    (vec![(1, Navigate, 3), (2, Text, 5)], vec![])
+                    (vec![Some((1, Navigate, 3)), z(2, 5)], vec![])
                 };
-                assert_eq!(first, want_first, "{key:?} split at {at}: first write");
-                assert_eq!(second, want_second, "{key:?} split at {at}: second write");
-                assert!(!input.filter.is_holding(), "{key:?} split at {at}");
+                let want_first: Vec<_> = want_first.into_iter().flatten().collect();
+                let want_second: Vec<_> = want_second.into_iter().flatten().collect();
+                let what = format!("{rest:?} split at {at}");
+                assert_eq!(first, want_first, "{what}: first write");
+                assert_eq!(second, want_second, "{what}: second write");
+                assert!(!input.filter.is_holding(), "{what}");
             }
         }
     }
@@ -4235,6 +4246,64 @@ mod tests {
             telemetry.observe_client_input_at(
                 "p1",
                 key,
+                zero + 1010 * ms,
+                pressed + LONE_ESCAPE_WINDOW / 10,
+            );
+            telemetry.observe_client_input_at(
+                "p1",
+                b"z",
+                zero + 7 * second,
+                pressed + Duration::from_secs(7),
+            );
+            resume.send(()).unwrap();
+
+            telemetry.settled().await;
+            telemetry.end_run("p1", Some("a1"), EndReason::Exited, None);
+            telemetry.settled().await;
+            assert_eq!(
+                timed_kinds(&captured(&mut rx)),
+                vec![
+                    (zero + second, AttrValue::Str("navigate".into())),
+                    (zero + 7 * second, AttrValue::Str("answer".into())),
+                ],
+                "{key:?}"
+            );
+        }
+    }
+
+    /// An `ESC` at 1 s, its key's deciding bytes at 1.005 s, a permission
+    /// prompt broadcast, then the rest of the key at 1.01 s: the key was
+    /// counted, as navigation, before the prompt opened, and the rest of it
+    /// is not input of its own, so it does not answer the prompt. A `z` typed
+    /// after the prompt, at 7 s, is the answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_key_split_around_a_prompt_keeps_the_kind_it_had_before_it() {
+        let second = 1_000_000_000;
+        let ms = 1_000_000;
+        for (key, decided) in KEYS_WITH_TAILS {
+            let (telemetry, mut rx) = capturing(ProbeSettings::default());
+            let (tx, events) = broadcast::channel(16);
+            telemetry.subscribe(events);
+            begin(&telemetry, generation("p0", "other"), &[]);
+            begin(&telemetry, generation("p1", "a1"), &[]);
+            tx.send(of("p1", "a1", EventType::SessionStart)).unwrap();
+            telemetry.settled().await;
+            let zero = now_unix_nanos() - 20 * second;
+
+            let resume = hold_ingest(&telemetry, "p0").await;
+            let pressed = std::time::Instant::now();
+            telemetry.observe_client_input_at("p1", b"\x1b", zero + second, pressed);
+            telemetry.observe_client_input_at(
+                "p1",
+                &key[..decided],
+                zero + 1005 * ms,
+                pressed + LONE_ESCAPE_WINDOW / 20,
+            );
+            tx.send(of("p1", "a1", EventType::PermissionRequest))
+                .unwrap();
+            telemetry.observe_client_input_at(
+                "p1",
+                &key[decided..],
                 zero + 1010 * ms,
                 pressed + LONE_ESCAPE_WINDOW / 10,
             );

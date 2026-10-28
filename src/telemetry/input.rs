@@ -115,11 +115,11 @@ enum State {
     /// Inside a bracketed paste: how many of [`PASTE_END`] its last bytes
     /// match.
     Paste(usize),
-    /// After `ESC` and the first byte of a multibyte UTF-8 character: Alt
-    /// with that character, this many bytes still to come.
+    /// After `ESC` and the first byte of a multibyte UTF-8 character, already
+    /// counted: Alt with that character, this many bytes still to come.
     AltChar(u8),
-    /// After an X10 mouse report's `ESC [ M`: this many of its three raw
-    /// payload bytes still to come.
+    /// After an X10 mouse report's `ESC [ M`, already counted: this many of
+    /// its three raw payload bytes still to come.
     X10Mouse(u8),
 }
 
@@ -202,10 +202,11 @@ impl InputFilter {
     /// is one input, not one plus its tail; what follows the key is not taken.
     /// The `ESC` after an Escape key is not the Escape key's: it starts a
     /// sequence of its own, held again. A key whose bytes `bytes` runs out
-    /// inside stays held, and the write that completes it classifies the rest
-    /// as its own. `None` when it was a terminal report, when it is still
-    /// undecided once `bytes` run out, or when nothing was held, which takes
-    /// no bytes.
+    /// inside stays held, and the write that completes it reads the rest as
+    /// the key already counted, of no kind of its own — except a bracketed
+    /// paste, whose later bytes are paste. `None` when it was a terminal
+    /// report, when it is still undecided once `bytes` run out, or when
+    /// nothing was held, which takes no bytes.
     pub fn decide_held(&mut self, bytes: &[u8]) -> (Option<InterventionKind>, usize) {
         let mut taken = 0;
         let mut kind = None;
@@ -321,9 +322,10 @@ impl InputFilter {
                     None
                 }
             }
+            // The key was counted at its `O`.
             State::Ss3 => {
                 if (0x40..=0x7e).contains(&b) {
-                    Some(Navigate)
+                    None
                 } else {
                     self.step(b)
                 }
@@ -342,22 +344,24 @@ impl InputFilter {
                 }
                 Some(Paste)
             }
+            // The key was counted at its lead byte.
             State::AltChar(left) => {
                 if (0x80..=0xbf).contains(&b) {
                     if left > 1 {
                         self.state = State::AltChar(left - 1);
                     }
-                    Some(Navigate)
+                    None
                 } else {
                     // Not UTF-8 after all: the character ended before it.
                     self.step(b)
                 }
             }
+            // The report was counted at its `M`.
             State::X10Mouse(left) => {
                 if left > 1 {
                     self.state = State::X10Mouse(left - 1);
                 }
-                Some(Navigate)
+                None
             }
         }
     }
@@ -627,7 +631,9 @@ mod tests {
     /// — an SS3 key's final byte, the rest of an Alt chord's character, an
     /// X10 mouse report's payload, a paste through its end marker — and
     /// nothing after it is: a key that follows is classified on its own. A
-    /// key the write ends inside stays held, and the next write completes it.
+    /// key the write ends inside stays held, and the next write completes it
+    /// without counting it again: the rest is of no kind, except a paste's,
+    /// which is paste.
     #[test]
     fn a_decided_key_takes_its_own_bytes_and_no_more() {
         use InterventionKind::{Interrupt, Navigate, Paste, Text};
@@ -660,11 +666,11 @@ mod tests {
 
         // Split inside the key: the deciding write takes what it has, the
         // filter stays inside the key, and the next write completes it.
-        for (next, kind, at) in [
-            (&b"OA"[..], Navigate, 1),
-            ("\u{20ac}".as_bytes(), Navigate, 2),
-            (b"[Mabc", Navigate, 3),
-            (b"[200~a\x1b[201~", Paste, 8),
+        for (next, kind, at, rest) in [
+            (&b"OA"[..], Navigate, 1, None),
+            ("\u{20ac}".as_bytes(), Navigate, 2, None),
+            (b"[Mabc", Navigate, 3, None),
+            (b"[200~a\x1b[201~", Paste, 8, Some(Paste)),
         ] {
             let mut filter = InputFilter::new();
             assert!(!filter.feed(b"\x1b"));
@@ -675,8 +681,34 @@ mod tests {
             );
             assert!(filter.is_holding(), "{next:?} split at {at}");
             assert!(!filter.holds_lone_escape(), "{next:?} split at {at}");
-            assert_eq!(filter.classify(&next[at..]), Some(kind), "{next:?}");
+            assert_eq!(filter.classify(&next[at..]), rest, "{next:?}");
             assert!(!filter.is_holding(), "{next:?} completed");
+        }
+    }
+
+    /// A key counted at a byte before its last is counted once, whichever
+    /// write its other bytes arrive in: the rest of an SS3 key, of an Alt
+    /// chord's character or of an X10 mouse report is of no kind in the write
+    /// that brings it, and what follows the key in that write is its own. A
+    /// paste's later bytes are paste, and a CSI key, counted only at its final
+    /// byte, counts in the write that holds it.
+    #[test]
+    fn a_key_split_after_it_is_counted_counts_once() {
+        use InterventionKind::{Navigate, Paste, Text};
+        type Kind = Option<InterventionKind>;
+        let cases: [(&[u8], &[u8], Kind, Kind); 7] = [
+            (b"a\x1bO", b"A", Some(Text), None),
+            (b"\x1bO", b"Az", Some(Navigate), Some(Text)),
+            (b"\x1b\xe2", b"\x82\xac", Some(Navigate), None),
+            (b"\x1b\xe2\x82", b"\xacz", Some(Navigate), Some(Text)),
+            (b"\x1b[Ma", b"bcz", Some(Navigate), Some(Text)),
+            (b"\x1b[200~a", b"b", Some(Paste), Some(Paste)),
+            (b"\x1b[", b"A", None, Some(Navigate)),
+        ];
+        for (first, second, want_first, want_second) in cases {
+            let mut filter = InputFilter::new();
+            assert_eq!(filter.classify(first), want_first, "{first:?}");
+            assert_eq!(filter.classify(second), want_second, "{first:?} {second:?}");
         }
     }
 
