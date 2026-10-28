@@ -195,7 +195,13 @@ if ! awk -v file="$HOME/.bashrc" '
   exit 1
 fi
 if ! grep -qF '# >>> dad-box PATH' "$HOME/.bashrc"; then
-  { printf '%s\n\n' "$PATH_BLOCK"; cat "$HOME/.bashrc"; } > "$HOME/.bashrc.dad-box" && mv "$HOME/.bashrc.dad-box" "$HOME/.bashrc"
+  # A copy that fails part-way is removed and ~/.bashrc is left as it was.
+  if ! { printf '%s\n\n' "$PATH_BLOCK" && cat "$HOME/.bashrc"; } > "$HOME/.bashrc.dad-box"; then
+    rm -f "$HOME/.bashrc.dad-box"
+    echo "bootstrap.sh: could not add the dad-box PATH block to $HOME/.bashrc and left it unchanged; fix the cause above, then re-run" >&2
+    exit 1
+  fi
+  mv "$HOME/.bashrc.dad-box" "$HOME/.bashrc"
 fi
 # USE_VALS gets the same placement for the same reason: the daemon's environment
 # is every agent's, and devbox.json's init_hook loads .env.vals.yaml only when
@@ -228,7 +234,8 @@ if [ ${#OPTION_BLOCKS[@]} -gt 0 ]; then
   # writes them back after the PATH block, so a re-run leaves the file unchanged.
   # The markers were checked at the top of this layer, so every opening marker
   # here has its own close. A rewrite that fails part-way leaves the blocks in
-  # ~/.bashrc as they were and removes its partial copy.
+  # ~/.bashrc as they were and removes its partial copy; a PATH block this run
+  # added just above stays, so the file is not always byte-identical.
   if ! awk -v block="$(printf '%s\n\n' "${OPTION_BLOCKS[@]}")" '
     /^# >>> dad-box (USE_VALS|RELAY)/ { open = 1; next }
     /^# <<< dad-box (USE_VALS|RELAY)/ { open = 0; next }
@@ -239,7 +246,7 @@ if [ ${#OPTION_BLOCKS[@]} -gt 0 ]; then
     /^# <<< dad-box PATH/ { print ""; print block; gap = 1 }
   ' "$HOME/.bashrc" > "$HOME/.bashrc.dad-box"; then
     rm -f "$HOME/.bashrc.dad-box"
-    echo "bootstrap.sh: could not rewrite the dad-box blocks in $HOME/.bashrc and left them as they were; fix the cause above, then re-run" >&2
+    echo "bootstrap.sh: could not rewrite the dad-box blocks in $HOME/.bashrc and left them as they were (a dad-box PATH block added by this run stays); fix the cause above, then re-run" >&2
     exit 1
   fi
   mv "$HOME/.bashrc.dad-box" "$HOME/.bashrc"
