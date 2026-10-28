@@ -441,6 +441,29 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** how `statusCheckRollup` becomes the CI result (`session/pr/001` and the `pull_request` unit tests).
 - **Platform coverage:** mac+linux+windows.
 
+#### dashboard/prompt
+
+##### dashboard/prompt/001 — A turn the agent's harness submits itself does not replace the card's prompt (issue #1993).
+- **Layer:** L1 (`AppState::apply_event` + ratatui `TestBackend`).
+- **Agent:** none (synthetic Claude Code prompt events).
+- **Asserts:** after the prompt `fix the login bug` and then Claude Code's `<task-notification>` turn for a finished background command, the snapshot's `last_user_prompt` (the desktop's Last prompt column) and `first_prompts` hold only the typed prompt, and the card's `Prmt:` line reads it at Normal and Spacious density with no part of the notification.
+- **Does not assert:** that the hook reports or truncates the turn (a real Claude Code is not run; the test supplies the full notification directly, and `injected_prompt`'s unit tests cover a cut one); OpenCode's synthetic turns (covered by the `opencode_manage::injected_turn_tests` unit tests).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/prompt/002 — Prompts the user types after a harness turn still reach the card (issue #1993).
+- **Layer:** L1 (`AppState::apply_event` + ratatui `TestBackend`).
+- **Agent:** none (synthetic Claude Code prompt events).
+- **Asserts:** a slash command (`/review 42`) typed after a `<task-notification>` turn becomes `last_user_prompt` and the card's `Prmt:` line; an ordinary prompt typed after a card's first event was a `<task-notification>` is its `last_user_prompt` and its only `first_prompts` entry.
+- **Does not assert:** deck messages, which are labelled and kept out of `last_user_prompt` separately (`inbox/status/009`, `inbox/claude/009`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/prompt/003 — A card restored with an injected turn as its last prompt does not show it (issue #1993).
+- **Layer:** L1 (`AppState` + ratatui `TestBackend`).
+- **Agent:** none (synthetic Claude Code session).
+- **Asserts:** a card whose `last_user_prompt` is a `<task-notification>` turn, as a snapshot from an older daemon can carry, and which has no prompt event of its own, renders no part of the notification on its `Prmt:` line.
+- **Does not assert:** the desktop's Last prompt column for that card, which shows the older daemon's value as it is.
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/stats
 
 ##### dashboard/stats/001 — A narrow stats bar keeps the `tools` total and spends no width on a per-agent-type breakdown.
