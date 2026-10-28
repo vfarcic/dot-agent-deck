@@ -656,6 +656,27 @@ impl GenerationInput {
     /// and no observation applies. A successor starts with its own.
     pub fn retire(&self) {
         let mut state = self.state.lock_recovering();
+        Self::retire_locked(&mut state);
+    }
+
+    /// [`Self::retire`], first ending the records' pending episode at `now`
+    /// and taking M-FIRST's event, in the same critical section: read before
+    /// it the event misses that episode, after it there are no records.
+    /// `None` with no records attached or once retired.
+    pub fn retire_taking_first_stop(&self, now: Instant) -> Option<FirstStop> {
+        let mut state = self.state.lock_recovering();
+        let stop = match (state.retired, state.records.as_mut()) {
+            (false, Some(records)) => {
+                records.retire(now);
+                Some(records.first_stop(now))
+            }
+            _ => None,
+        };
+        Self::retire_locked(&mut state);
+        stop
+    }
+
+    fn retire_locked(state: &mut State) {
         state.retired = true;
         state.ledger = QueryLedger::default();
         state.backlog = Backlog::new(CprWaitEnd::Counted);

@@ -810,6 +810,13 @@ impl Segments {
     /// Match, release and complete the outstanding segment, then any that a
     /// completion brings to the front.
     fn evaluate(&mut self, records: &mut Records, fifo: &mut HazardFifo, now: Instant) {
+        // A drained record can still learn its frontier, match or report:
+        // the kept facts follow it until it is deleted.
+        for seg in &mut self.segments {
+            if let Some(fact) = seg.record.and_then(|k| records.fact(k)) {
+                seg.fact = Some(fact);
+            }
+        }
         while let Some(seg) = self.segments.front_mut() {
             let (Some(number), Some((_, written_at))) = (seg.number, seg.written) else {
                 return;

@@ -52,17 +52,37 @@
 //! leaves `undecided` once, at its first decision or at its exit drain with
 //! none, and when the count returns to zero with no cause set the step says so
 //! (`rescan`), once, for the caller to re-run what pending refused. The
-//! highest cause by precedence is kept ([`Cause`]).
+//! highest cause by precedence is kept ([`Cause`]). Two triggers apply under
+//! [`EcPolicy::Authority`] as well, which is Q76's decision rather than the
+//! amendments' text: A5 §1.4 and A6 §1.3 introduce the decisionless exit
+//! drain and the dropped observations under `Hold`. Applying them under
+//! `Authority` only refuses more; both reviews of Q35-07 accepted it as a
+//! conservative extension. The first step that opens the scope is kept with
+//! its record for M-FIRST ([`Stop`]).
 //!
 //! **Retention (core §2.6, A2 §3.3).** At most [`RECORD_CAP`] records; an
 //! observation past it creates none ([`Recorded::Dropped`]). A record is
 //! deleted only once it is settled, its exit drained, its completion no
 //! longer pending, and its markers deleted. Its exit facts ([`ExitFact`]) are
 //! handed out at its drain, before it can be deleted, so a segment keeps them
-//! after the record is gone (AU7 §2). The count history keeps an entry while
+//! after the record is gone (AU7 §2); the segment refreshes its copy from
+//! [`Records::fact`] while the record lives, and deletion hands over the last
+//! one. The count history keeps an entry while
 //! an unsettled record's birth floor could still read it, compacts older ones
 //! into a baseline, and holds at most [`HISTORY_CAP`] entries; at either cap
-//! no probe is admitted ([`Records::admits`]).
+//! no probe is admitted ([`Records::admits`]). Compaction keeps, beside the
+//! baseline, whether a zero stamped at the compacted boundary was dropped,
+//! so a birth floor at that instant refuses rather than read the baseline.
+//!
+//! **No E1 or F offset is kept here.** A1's Q35-07 row puts F's offset in
+//! the record beside E1's markers, to be copied into the segment before the
+//! record can go. E1 and F are output events after the segment's own trigger
+//! offset (core §4.5, A1 §2.2), and A3 §3.4 restates EC as markers that
+//! follow `o` on the output stream: the record learns neither from any
+//! channel it has. The segment reads them itself from the output hook
+//! (Q35-08's `ReturnWatch`), so they never depended on the record living.
+//! [`Frontier::Taken`]'s `o` is a different fact, EC's lower bound (A3
+//! §3.3), not F's offset.
 //!
 //! **The quiet clock (Q35-06's condition (b)).** Every step that can change
 //! whether a record is pending takes the generation's hazard FIFO and feeds it
@@ -72,9 +92,25 @@
 //! (`super::epoch::GenerationInput`), which also orders them against the
 //! output hook's latch and the physical tracker's candidates.
 //!
-//! **What reads it, as of this commit: nothing.** The handler, the drain and
-//! the exit observation (Q35-14b), the segments (Q35-08, Q35-20) and
-//! admission (Q35-19) call it later.
+//! **What reads it: the segments (Q35-08), and nothing in production.** The
+//! handler, the drain and the exit observation (Q35-14b), Q35-20 and
+//! admission (Q35-19) call it later. What this module takes on trust, and
+//! the integration therefore owes:
+//! - **Trusted adapters (Q35-14b).** [`Records::observe`] records what it's
+//!   given: a scan observation must be built from the daemon's own identity
+//!   reads with no decision, claim or numbers (nothing here refuses an
+//!   `Armed` on [`Channel::Scan`]), and IPC and marker evidence must be
+//!   authenticated and mapped to its record before it arrives.
+//!   [`Records::match_segment`] records the caller's association; the whole
+//!   match predicate is the segments' (Q35-08, Q35-20).
+//! - **R6's real edges (Q35-14b).** The wrappers in [`super::epoch`] take
+//!   the generation's input lock around these pure steps; the handler,
+//!   reader and ingress call sites, and the real feeder's races against
+//!   them, are checked when they exist.
+//! - **M-FIRST's line (Q35-14b).** Take the event at retirement with
+//!   `GenerationInput::retire_taking_first_stop`, which ends a pending
+//!   episode before the records go, and add whether held input was
+//!   discarded.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -173,8 +209,10 @@ pub enum Tree {
 /// The helper's report after its editor phase (A3 §3.2, A4 §7.5, A6 §2.3).
 /// The editor's exit status or signal isn't on the wire: an editor that
 /// exited and one that was signalled both report `Done`. A helper whose wait
-/// failed (`WaitUnknown`), was killed, or lost its connection reports
-/// nothing, which the exit drain reads as [`Report::None`].
+/// failed (`WaitUnknown`) sends no report, and one killed, or whose
+/// connection was lost, before its report was delivered leaves none: the
+/// exit drain reads either as [`Report::None`]. A report already delivered
+/// stays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Report {
     None,
@@ -385,7 +423,10 @@ impl Record {
 }
 
 /// A record's facts at its exit drain, for a segment to keep after the record
-/// is deleted (AU7 §2).
+/// is deleted (AU7 §2). It's a copy: the record can still learn its
+/// frontier, its match or its report after the drain, so the holder keeps
+/// it current from [`Records::fact`] until [`Records::prune`] hands over the
+/// last one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExitFact {
     pub generation: u64,
@@ -513,13 +554,95 @@ pub struct Episode {
     pub resolved: Resolution,
 }
 
+/// The step that first opened the writer scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopSource {
+    /// A record's decision, on the channel that carried it.
+    Decision {
+        channel: Channel,
+        decision: Decision,
+    },
+    /// A record's report after its editor.
+    Report(Report),
+    /// A record's exit drain: no decision, or an editor-bearing one whose
+    /// report didn't show its end clean.
+    Drain,
+    /// An observation the record cap dropped (no record).
+    DroppedAtCap {
+        channel: Channel,
+        decision: Option<Decision>,
+    },
+    /// An observation the identity refusal dropped (no record).
+    RefusedIdentity {
+        channel: Channel,
+        decision: Option<Decision>,
+    },
+}
+
+/// The record whose step first opened the writer scope, as it stood when it
+/// was last seen: kept current until the record is deleted, so a report or
+/// match after the stop is in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StopRecord {
+    pub key: RecordKey,
+    pub attribution: Attribution,
+    pub claim: Option<Claim>,
+    pub decision: Option<Decision>,
+    /// The numbers it read and the segment it matched: whether a Ctrl+G was
+    /// native or pressed during a check is that segment's kind, the
+    /// caller's to join.
+    pub seg_seen: Option<u64>,
+    pub native_seen: Option<u64>,
+    pub matched: Option<u64>,
+    /// `SpawnFailed` after an `Unarmed` or `Tool` decision is a failed start,
+    /// not an editor that ran.
+    pub report: Report,
+}
+
+impl StopRecord {
+    fn of(r: &Record) -> Self {
+        Self {
+            key: r.key,
+            attribution: r.attribution,
+            claim: r.claim,
+            decision: r.decision,
+            seg_seen: r.seg_seen,
+            native_seen: r.native_seen,
+            matched: r.matched,
+            report: r.report,
+        }
+    }
+}
+
+/// The first event that stopped probing (A5 §3.6, A6 §3.6). Its cause rows
+/// read from these fields: a native or check-time Ctrl+G with an editor
+/// (an `Unarmed` decision; `record.matched` names the segment, and
+/// `record.report` isn't `SpawnFailed`); a tool editor (`Tool`, or
+/// `NotOwned(Tool)`); a `Shape` or `Unknown` editor (the attribution); a
+/// native `SpawnFailed` (`record.report`, kept apart from an editor that
+/// ran, A6); a `Survivors` or unknown report ([`StopSource::Report`], or
+/// [`StopSource::Drain`] with an editor-bearing decision); `EditorUnconfirmed`
+/// ([`StopSource::Drain`] with no decision, A6); a dropped observation, a
+/// scan sighting at the cap included ([`StopSource::DroppedAtCap`],
+/// [`StopSource::RefusedIdentity`]). Whether held input was discarded at
+/// restart is the retiring caller's to add.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stop {
+    /// The cause the card shows for it.
+    pub cause: Cause,
+    /// How long after the generation started.
+    pub after: Duration,
+    pub source: StopSource,
+    /// `None` for a dropped observation.
+    pub record: Option<StopRecord>,
+}
+
 /// M-FIRST's per-generation event (amendment 5 §3.6, amendment 6 §3.6): when
 /// probing first stopped and why, and the pending episodes. No path or
 /// message content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FirstStop {
-    /// The cause, and how long after the generation started.
-    pub stopped: Option<(Cause, Duration)>,
+    pub stopped: Option<Stop>,
     /// How long the generation has been observed (a censored generation has
     /// no stop).
     pub observed: Duration,
@@ -535,6 +658,9 @@ pub struct CountHistory {
     baseline: u32,
     /// Before this, compaction dropped entries: no proof can start earlier.
     exact_from: Option<Instant>,
+    /// A dropped entry stamped `exact_from` was a zero. The baseline is only
+    /// the last count at that instant, so a proof from it refuses.
+    zero_at_boundary: bool,
     entries: VecDeque<(Instant, u32)>,
     latest: Option<Instant>,
 }
@@ -561,10 +687,14 @@ impl CountHistory {
     }
 
     /// The interval proof: the count was at least 1 at `birth_floor` and no
-    /// recorded zero interval meets `[birth_floor, exit]`.
+    /// recorded zero interval meets `[birth_floor, exit]`. A floor at the
+    /// compacted boundary itself refuses when a zero stamped there was
+    /// dropped.
     pub fn proves(&self, birth_floor: Instant, exit: Instant) -> bool {
         exit >= birth_floor
-            && self.exact_from.is_none_or(|from| birth_floor >= from)
+            && self.exact_from.is_none_or(|from| {
+                birth_floor > from || (birth_floor == from && !self.zero_at_boundary)
+            })
             && self.count_at(birth_floor) >= 1
             && !self
                 .entries
@@ -587,6 +717,10 @@ impl CountHistory {
 
     fn drop_front(&mut self) {
         if let Some((stamp, count)) = self.entries.pop_front() {
+            // Entries share a stamp (`set`'s clamp): a zero dropped earlier
+            // at this same instant still meets a proof from it.
+            let same = self.exact_from == Some(stamp);
+            self.zero_at_boundary = count == 0 || (same && self.zero_at_boundary);
             self.baseline = count;
             self.exact_from = Some(stamp);
         }
@@ -698,7 +832,7 @@ pub struct Records {
     history: CountHistory,
     retired: bool,
     pending_since: Option<Instant>,
-    stopped: Option<(Cause, Duration)>,
+    stopped: Option<Stop>,
     episodes: Vec<Episode>,
     episodes_uncounted: u32,
 }
@@ -791,7 +925,16 @@ impl Records {
             Ok(i) => i,
             Err(_) if self.records.len() >= RECORD_CAP => {
                 self.dropped(obs.decision);
-                self.transition(before, now, None);
+                self.transition(
+                    before,
+                    now,
+                    None,
+                    Some(StopSource::DroppedAtCap {
+                        channel: obs.channel,
+                        decision: obs.decision,
+                    }),
+                    None,
+                );
                 return Ok(Recorded::Dropped);
             }
             Err(_) => {
@@ -840,7 +983,12 @@ impl Records {
         let mut resolved = None;
         let mut consumed = false;
         // A decision after the exit drain changes nothing (core §2.4).
-        if let Some(decision) = obs.decision.filter(|_| !r.drained) {
+        let applied = obs.decision.filter(|_| !r.drained);
+        let source = applied.map(|decision| StopSource::Decision {
+            channel: obs.channel,
+            decision,
+        });
+        if let Some(decision) = applied {
             if decision == Decision::Armed && r.first_armed_seen.is_none() {
                 r.first_armed_seen = Some(now);
             }
@@ -868,7 +1016,7 @@ impl Records {
         }
         self.maybe_pop(fifo, i, now);
         self.subsume();
-        let rescan = self.transition(before, now, resolved);
+        let rescan = self.transition(before, now, resolved, source, Some(i));
         self.after(fifo, now);
         Ok(Recorded::Kept {
             settlement: self.records[i].settlement,
@@ -894,7 +1042,13 @@ impl Records {
         {
             self.scope.set(dropped_cause(decision));
         }
-        self.transition(before, now, None);
+        self.transition(
+            before,
+            now,
+            None,
+            Some(StopSource::RefusedIdentity { channel, decision }),
+            None,
+        );
         Ok(())
     }
 
@@ -942,7 +1096,7 @@ impl Records {
             Report::SpawnFailed { .. } | Report::None | Report::Unrecognised => {}
         }
         self.subsume();
-        self.transition(before, now, None);
+        self.transition(before, now, None, Some(StopSource::Report(report)), Some(i));
         self.after(fifo, now);
         Ok(out)
     }
@@ -1044,7 +1198,7 @@ impl Records {
             }
         }
         self.subsume();
-        let rescan = self.transition(before, now, resolved);
+        let rescan = self.transition(before, now, resolved, Some(StopSource::Drain), Some(i));
         self.after(fifo, now);
         let r = &self.records[i];
         Ok(Drained {
@@ -1072,6 +1226,7 @@ impl Records {
             Some(other) if other != seg => Err(Refusal::Matched(other)),
             _ => {
                 r.matched = Some(seg);
+                self.refresh_stop();
                 Ok(())
             }
         }
@@ -1132,10 +1287,19 @@ impl Records {
         Ok(())
     }
 
+    /// A drained record's exit facts as they now stand: a frontier, match or
+    /// report learned after the drain is in them. `None` before the drain.
+    pub fn fact(&self, key: RecordKey) -> Option<ExitFact> {
+        self.records
+            .iter()
+            .find(|r| r.key == key && r.drained)
+            .and_then(|r| r.fact(self.generation))
+    }
+
     /// Delete the record if it may go: settled, its exit drained, its
     /// completion not pending, and its markers deleted (`markers_deleted`,
     /// the caller's result; a failed deletion keeps the record). Its exit
-    /// facts, or `None` when it stays.
+    /// facts as they stand when it goes, or `None` when it stays.
     pub fn prune(
         &mut self,
         fifo: &mut HazardFifo,
@@ -1260,10 +1424,22 @@ impl Records {
         }
     }
 
-    /// After a step: compact the history and feed the quiet clock.
+    /// After a step: compact the history, keep the first stop's record
+    /// current, and feed the quiet clock.
     fn after(&mut self, fifo: &mut HazardFifo, now: Instant) {
         self.compact();
+        self.refresh_stop();
         fifo.records_pending(now, self.any_pending());
+    }
+
+    /// The first stop's record as it now stands, while it exists.
+    fn refresh_stop(&mut self) {
+        if let Some(stopped) = self.stopped.as_mut()
+            && let Some(kept) = stopped.record.as_mut()
+            && let Some(r) = self.records.iter().find(|r| r.key == kept.key)
+        {
+            *kept = StopRecord::of(r);
+        }
     }
 
     fn compact(&mut self) {
@@ -1276,13 +1452,16 @@ impl Records {
         self.history.compact(keep_from);
     }
 
-    /// Book the scope's move from `before`: an episode that ended, a stop, and
-    /// whether the scope just closed.
+    /// Book the scope's move from `before`: an episode that ended, a stop
+    /// (made by `source`, on record `record` if any), and whether the scope
+    /// just closed.
     fn transition(
         &mut self,
         before: ScopeState,
         now: Instant,
         resolved: Option<Resolution>,
+        source: Option<StopSource>,
+        record: Option<usize>,
     ) -> bool {
         let after = self.scope.state();
         if after == ScopeState::Pending && self.pending_since.is_none() {
@@ -1297,8 +1476,13 @@ impl Records {
             };
             self.episode(now.saturating_duration_since(since), resolved);
         }
-        if let (ScopeState::Open(cause), None) = (after, self.stopped) {
-            self.stopped = Some((cause, now.saturating_duration_since(self.started)));
+        if let (ScopeState::Open(cause), None, Some(source)) = (after, self.stopped, source) {
+            self.stopped = Some(Stop {
+                cause,
+                after: now.saturating_duration_since(self.started),
+                source,
+                record: record.map(|i| StopRecord::of(&self.records[i])),
+            });
         }
         before == ScopeState::Pending && after == ScopeState::Closed
     }
@@ -1341,9 +1525,10 @@ fn decision_cause(policy: EcPolicy, decision: Decision) -> Option<Cause> {
     }
 }
 
-/// The cause a dropped observation naming `decision` sets, under either
-/// policy: no record is left to learn how it ended, so what it may have
-/// opened is held (`Armed` never reaches here).
+/// The cause a dropped observation naming `decision` sets: A5 §1.4 and A6
+/// §1.3 under `Hold`, and under `Authority` too by Q76 (the module
+/// documentation), since no record is left to learn how it ended (`Armed`
+/// never reaches here).
 fn dropped_cause(decision: Decision) -> Cause {
     match decision {
         Decision::Unarmed | Decision::Tool => Cause::EditorReturnUnchecked,
@@ -1351,9 +1536,10 @@ fn dropped_cause(decision: Decision) -> Cause {
     }
 }
 
-/// The cause a record's exit drain sets, under either policy (A3 §4.3, A4
-/// §7.4, A6 §1.3): no decision at all, or an editor-bearing decision whose
-/// helper didn't report its tree clean.
+/// The cause a record's exit drain sets, under either policy: an
+/// editor-bearing decision whose helper didn't report its tree clean (A3
+/// §4.3, A4 §7.4), or no decision at all (A6 §1.3 under `Hold`; under
+/// `Authority` by Q76).
 fn drain_cause(r: &Record) -> Option<Cause> {
     match (r.decision, r.report) {
         (None, _) => Some(Cause::EditorUnconfirmed),

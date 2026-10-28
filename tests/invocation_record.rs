@@ -13,8 +13,8 @@ use dot_agent_deck::composer_probe::query_ledger::{
 use dot_agent_deck::composer_probe::record::{
     Attribution, Cause, Channel, Claim, Completion, Decision, EC_POLICY, EPISODE_CAP, EcPolicy,
     Frontier, FrontierOutcome, HISTORY_CAP, Hold, NotConsumed, NotOwned, Observation, RECORD_CAP,
-    Recorded, Records, Refusal, Report, Reported, Resolution, Route, ScopeState, Settlement, Tree,
-    birth_floor_ns, born_at_or_after, parse_marker,
+    Recorded, Records, Refusal, Report, Reported, Resolution, Route, ScopeState, Settlement,
+    StopSource, Tree, birth_floor_ns, born_at_or_after, parse_marker,
 };
 use dot_agent_deck::composer_probe::record::{Marker, RecordKey};
 use spec::spec;
@@ -111,6 +111,21 @@ impl T {
 
     fn settlement(&self, k: RecordKey) -> Settlement {
         self.r.get(k).unwrap().settlement
+    }
+}
+
+/// An `Owned` scan sighting of `k`, with no decision, born at `floor`.
+fn scan(t: &T, k: RecordKey, floor: u64) -> Observation {
+    Observation {
+        generation: G,
+        key: k,
+        channel: Channel::Scan,
+        attribution: OWNED,
+        claim: None,
+        decision: None,
+        seg_seen: None,
+        native_seen: None,
+        birth_floor: t.at(floor),
     }
 }
 
@@ -566,6 +581,104 @@ fn probe_008_a_floor_before_the_kept_history_refuses() {
     assert_eq!(t.r.count(), 1);
 }
 
+/// Scenario: With no record open, raise, lower and raise the count all at one instant, so compaction folds the zero into a positive baseline, and only then observe an `Owned` helper with no decision born at that instant. Its drained exit consumes nothing and the count stays where it was; a helper born just after that instant consumes, and so does one born at a compacted instant whose zero came strictly before it.
+#[spec("inbox/probe/008")]
+#[test]
+fn probe_008_a_zero_compacted_at_the_floor_refuses() {
+    // (script, floor, consumed)
+    type Row = (&'static str, &'static [(u64, i8)], u64, bool);
+    let rows: &[Row] = &[
+        (
+            "a zero and a raise at the floor",
+            &[(10, 1), (10, -1), (10, 1)],
+            10,
+            false,
+        ),
+        (
+            "born just after them",
+            &[(10, 1), (10, -1), (10, 1)],
+            11,
+            true,
+        ),
+        (
+            "a zero before the floor",
+            &[(5, 1), (6, -1), (10, 1)],
+            10,
+            true,
+        ),
+        ("only raises at the floor", &[(10, 1), (10, 1)], 10, true),
+    ];
+    for &(name, script, floor, consumed) in rows {
+        let mut t = T::new(HOLD);
+        for &(at, step) in script {
+            if step > 0 {
+                t.raise(at);
+            } else {
+                t.r.lower(G, t.at(at)).unwrap();
+            }
+        }
+        assert!(t.r.history().is_empty() && t.r.is_empty(), "{name}");
+        assert_eq!(
+            t.r.history().proves(t.at(floor), t.at(30)),
+            consumed,
+            "{name}"
+        );
+        let before = t.r.count();
+        let k = key(1);
+        let o = scan(&t, k, floor);
+        t.full(o, 20);
+        t.exit(k, 30);
+        let want = if consumed {
+            (Settlement::Consumed, before - 1)
+        } else {
+            (Settlement::NotConsumed(NotConsumed::Unproven), before)
+        };
+        assert_eq!((t.drain(k, 31).0, t.r.count()), want, "{name}");
+    }
+}
+
+/// Scenario: With one record open from before, write a zero and a raise at one instant and then enough raises and lowers to push the history one past its cap, so the zero is evicted and the raise beside it is kept; only then observe an `Owned` helper with no decision born at that instant. Its drained exit consumes nothing and the count stays; one born just after it consumes.
+#[spec("inbox/probe/008")]
+#[test]
+fn probe_008_a_zero_evicted_at_the_floor_refuses() {
+    let mut t = T::new(HOLD);
+    t.raise(1);
+    let keeper = scan(&t, key(1), 2);
+    t.full(keeper, 3);
+    t.r.lower(G, t.at(10)).unwrap();
+    t.raise(10);
+    // Never 0 again: 2, 1, 2, 1, ...
+    for i in 0..HISTORY_CAP as u64 - 2 {
+        if i % 2 == 0 {
+            t.raise(20 + i);
+        } else {
+            t.r.lower(G, t.at(20 + i)).unwrap();
+        }
+    }
+    assert_eq!(t.r.history().len(), HISTORY_CAP);
+    t.raise(20 + HISTORY_CAP as u64);
+    assert_eq!(t.r.history().len(), HISTORY_CAP, "the zero was evicted");
+    let end = 30 + HISTORY_CAP as u64;
+    assert!(!t.r.history().proves(t.at(10), t.at(end)));
+    assert!(t.r.history().proves(t.at(11), t.at(end)));
+    let (at, after) = (key(2), key(3));
+    let o = scan(&t, at, 10);
+    t.full(o, end);
+    let o = scan(&t, after, 11);
+    t.full(o, end);
+    let before = t.r.count();
+    t.exit(at, end + 1);
+    assert_eq!(
+        (t.drain(at, end + 2).0, t.r.count()),
+        (Settlement::NotConsumed(NotConsumed::Unproven), before)
+    );
+    t.exit(after, end + 3);
+    assert_eq!(
+        (t.drain(after, end + 4).0, t.r.count()),
+        (Settlement::Consumed, before - 1)
+    );
+}
+
 /// Scenario: Fill the table with 64 records and observe a 65th helper; then, with one record open, push the count history to 256 entries and one more. The 65th makes no record and consumes nothing, at either cap the records refuse admission, and once the cap drops the oldest entry, a proof that needed it fails.
 #[spec("inbox/probe/008")]
 #[test]
@@ -684,6 +797,38 @@ fn probe_008_retention() {
     assert_eq!(t.r.prune(&mut t.f, G, n, true, now), Ok(None));
     t.drain(n, 52);
     assert!(t.r.prune(&mut t.f, G, n, true, now).unwrap().is_some());
+}
+
+/// Scenario: Under `Authority`, an `Unarmed` helper reports its editor clean and its exit is drained; its frontier is taken and its segment matched only afterwards, then it completes and is deleted. The facts read after the drain carry the later frontier and match, and its deletion hands over the same; before its drain there are none.
+#[spec("inbox/probe/008")]
+#[test]
+fn probe_008_the_exit_facts_follow_the_record_until_it_goes() {
+    let mut t = T::new(AUTH);
+    let k = key(1);
+    t.obs(k, Channel::Ipc, OWNED, Some(Decision::Unarmed), 10);
+    t.report(k, Report::Done(Tree::Clean), 11);
+    t.exit(k, 12);
+    assert_eq!(t.r.fact(k), None, "not drained");
+    let now = t.at(13);
+    let at_drain = t.r.drained(&mut t.f, G, k, now).unwrap().fact;
+    assert_eq!(t.r.fact(k), Some(at_drain));
+    assert_eq!(
+        (at_drain.frontier, at_drain.matched),
+        (Frontier::Requested, None)
+    );
+    t.r.frontier(G, k, FrontierOutcome::Taken { offset: 9 })
+        .unwrap();
+    t.r.match_segment(G, k, 4).unwrap();
+    let later = t.r.fact(k).unwrap();
+    assert_eq!(
+        (later.frontier, later.matched),
+        (Frontier::Taken { offset: 9 }, Some(4))
+    );
+    let now = t.at(14);
+    t.r.complete(&mut t.f, G, k, Route::EditorBearing, now, now)
+        .unwrap();
+    assert_eq!(t.r.prune(&mut t.f, G, k, true, now), Ok(Some(later)));
+    assert_eq!(t.r.fact(k), None, "gone");
 }
 
 /// Scenario: Observe `Armed` on an IPC request, again on its marker and again on a second request. The first-`Armed` time is the first observation's and none of the later ones moves it; a helper that never declared `Armed` has none.
@@ -1294,7 +1439,10 @@ fn probe_058_the_last_undecided_unarmed_opens_with_the_decrement() {
     );
     assert!(i.records_admit().is_err());
     let stop = i.first_stop(t0 + ms(30)).unwrap();
-    assert_eq!(stop.stopped, Some((Cause::EditorReturnUnchecked, ms(20))));
+    assert_eq!(
+        stop.stopped.map(|s| (s.cause, s.after)),
+        Some((Cause::EditorReturnUnchecked, ms(20)))
+    );
     assert_eq!(stop.episodes.len(), 1);
     assert_eq!(stop.episodes[0].duration, ms(10));
     assert_eq!(
@@ -1750,7 +1898,15 @@ fn probe_058_the_first_stop_event() {
             (ms(10), Resolution::ExitWithoutDecision),
         ]
     );
-    assert_eq!(stop.stopped, Some((Cause::EditorUnconfirmed, ms(60))));
+    let first = stop.stopped.unwrap();
+    assert_eq!(
+        (first.cause, first.after, first.source),
+        (Cause::EditorUnconfirmed, ms(60), StopSource::Drain)
+    );
+    assert_eq!(
+        first.record.map(|r| (r.key, r.decision)),
+        Some((key(3), None))
+    );
     assert_eq!(t.scope(), ScopeState::Open(Cause::EditorLeftWriter));
     assert_eq!((stop.observed, stop.episodes_uncounted), (ms(100), 0));
 
@@ -1783,4 +1939,158 @@ fn probe_058_the_first_stop_event() {
         (stop.episodes.len(), stop.episodes_uncounted),
         (EPISODE_CAP, 1)
     );
+}
+
+/// Scenario: Under `Hold`, generations stop on: a `Tool` decision by a helper attributed `NotOwned(Tool)`, and an `Unarmed` one at the same time by a helper attributed `NotOwned(Shape)`; a native `Unarmed` whose editor then failed to start, and one whose editor ran, each matched to a segment after the stop; a scan dropped at the record cap; and an identity refusal. Once each record is drained and deleted, every first stop still names its source, its record's attribution, its match and its report, so no two read alike.
+#[spec("inbox/probe/058")]
+#[test]
+fn probe_058_the_first_stop_keeps_its_provenance() {
+    let gone = |t: &mut T, k: RecordKey| {
+        let now = t.at(50);
+        assert!(t.r.prune(&mut t.f, G, k, true, now).unwrap().is_some());
+        assert!(t.r.get(k).is_none());
+        t.r.first_stop(now).stopped.unwrap()
+    };
+
+    // The same cause at the same time, from different editors.
+    let not_owned = |n: NotOwned, channel, decision| {
+        let mut t = T::new(HOLD);
+        let k = key(1);
+        t.obs(k, channel, Attribution::NotOwned(n), Some(decision), 10);
+        t.exit(k, 20);
+        t.drain(k, 21);
+        gone(&mut t, k)
+    };
+    let tool = not_owned(NotOwned::Tool, Channel::Ipc, Decision::Tool);
+    let shape = not_owned(NotOwned::Shape, Channel::Marker, Decision::Unarmed);
+    assert_eq!((tool.cause, tool.after), (shape.cause, shape.after));
+    assert_eq!(
+        tool.source,
+        StopSource::Decision {
+            channel: Channel::Ipc,
+            decision: Decision::Tool,
+        }
+    );
+    assert_eq!(
+        shape.source,
+        StopSource::Decision {
+            channel: Channel::Marker,
+            decision: Decision::Unarmed,
+        }
+    );
+    assert_eq!(
+        tool.record.map(|r| r.attribution),
+        Some(Attribution::NotOwned(NotOwned::Tool))
+    );
+    assert_eq!(
+        shape.record.map(|r| r.attribution),
+        Some(Attribution::NotOwned(NotOwned::Shape))
+    );
+
+    // A native `Unarmed` whose start failed, against one whose editor ran.
+    let native = |report: Report| {
+        let mut t = T::new(HOLD);
+        let k = key(1);
+        t.obs(k, Channel::Ipc, OWNED, Some(Decision::Unarmed), 10);
+        t.r.match_segment(G, k, 4).unwrap();
+        t.report(k, report, 12);
+        t.exit(k, 15);
+        t.drain(k, 16);
+        let later = scan(&t, key(2), 20);
+        t.full(later, 21);
+        assert!(matches!(
+            t.r.get(k).unwrap().completion,
+            Completion::Subsumed { .. }
+        ));
+        gone(&mut t, k)
+    };
+    let failed = native(Report::SpawnFailed { errno: Some(2) });
+    let ran = native(Report::Done(Tree::Clean));
+    assert_eq!(
+        (failed.cause, failed.after, failed.source),
+        (ran.cause, ran.after, ran.source)
+    );
+    let (failed, ran) = (failed.record.unwrap(), ran.record.unwrap());
+    assert_eq!((failed.matched, ran.matched), (Some(4), Some(4)));
+    assert_eq!(failed.report, Report::SpawnFailed { errno: Some(2) });
+    assert_eq!(ran.report, Report::Done(Tree::Clean));
+
+    // Dropped observations have no record.
+    let mut t = T::new(HOLD);
+    for pid in 0..RECORD_CAP as u32 {
+        t.obs(
+            key(100 + pid),
+            Channel::Ipc,
+            Attribution::NotOwned(NotOwned::Tool),
+            Some(Decision::Armed),
+            5,
+        );
+    }
+    assert_eq!(
+        t.obs(key(1), Channel::Scan, OWNED, None, 20),
+        Recorded::Dropped
+    );
+    let stop = t.r.first_stop(t.at(30)).stopped.unwrap();
+    assert_eq!(
+        (stop.cause, stop.source, stop.record),
+        (
+            Cause::EditorUnconfirmed,
+            StopSource::DroppedAtCap {
+                channel: Channel::Scan,
+                decision: None,
+            },
+            None
+        )
+    );
+    let mut t = T::new(HOLD);
+    let now = t.at(20);
+    t.r.refused_identity(G, Channel::Marker, Some(Decision::Tool), now)
+        .unwrap();
+    let stop = t.r.first_stop(now).stopped.unwrap();
+    assert_eq!(
+        (stop.cause, stop.source, stop.record),
+        (
+            Cause::EditorReturnUnchecked,
+            StopSource::RefusedIdentity {
+                channel: Channel::Marker,
+                decision: Some(Decision::Tool),
+            },
+            None
+        )
+    );
+}
+
+/// Scenario: Through the generation's input lock, a helper is seen with no decision, so the writer scope is pending, and the generation retires. Reading M-FIRST's event before retirement misses the pending episode; retiring and taking the event in one step lists it as ended by retirement, and afterwards there is no event to take.
+#[spec("inbox/probe/058")]
+#[test]
+fn probe_058_retirement_takes_the_pending_episode() {
+    let t0 = Instant::now();
+    let input = GenerationInput::new(CprWaitEnd::Counted);
+    assert_eq!(input.retire_taking_first_stop(t0), None, "no records");
+    let input = GenerationInput::new(CprWaitEnd::Counted);
+    assert!(input.attach_records(Records::new(G, HOLD, t0)));
+    let o = Observation {
+        generation: G,
+        key: key(1),
+        channel: Channel::Scan,
+        attribution: OWNED,
+        claim: None,
+        decision: None,
+        seg_seen: None,
+        native_seen: None,
+        birth_floor: t0,
+    };
+    input.record_observe(&o, t0 + ms(10)).unwrap();
+    assert!(input.first_stop(t0 + ms(20)).unwrap().episodes.is_empty());
+    let stop = input.retire_taking_first_stop(t0 + ms(30)).unwrap();
+    let got: Vec<_> = stop
+        .episodes
+        .iter()
+        .map(|e| (e.duration, e.resolved))
+        .collect();
+    assert_eq!(got, [(ms(20), Resolution::Retired)]);
+    assert_eq!((stop.stopped, stop.observed), (None, ms(30)));
+    assert_eq!(input.first_stop(t0 + ms(40)), None);
+    assert_eq!(input.retire_taking_first_stop(t0 + ms(40)), None, "once");
+    assert_eq!(input.records_admit(), Err(Hold::Retired));
 }

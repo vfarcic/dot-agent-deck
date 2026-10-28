@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 
 use dot_agent_deck::composer_probe::query_ledger::{HazardFifo, T_TRIGGER};
 use dot_agent_deck::composer_probe::record::{
-    Attribution, Cause, Channel, Completion, Decision, EC_POLICY, EcPolicy, FrontierOutcome,
-    NotOwned, Observation, RecordKey, Records, Refusal as RecordRefusal, Report, Route, ScopeState,
-    Tree,
+    Attribution, Cause, Channel, Completion, Decision, EC_POLICY, EcPolicy, Frontier,
+    FrontierOutcome, NotOwned, Observation, RecordKey, Records, Refusal as RecordRefusal, Report,
+    Route, ScopeState, Tree,
 };
 use dot_agent_deck::composer_probe::segments::{
     Agent, Ended, Kind, Marker, NOT_RETURNED, Outcome, Refusal, ReturnMarkers, ReturnWatch,
@@ -842,6 +842,36 @@ fn probe_009_a_pruned_record_leaves_its_facts_and_the_hold() {
     t.out(FRAME, 13);
     assert_eq!(t.stages(13), [Stage::AwaitingPostFlush]);
     assert!(t.written().is_empty());
+}
+
+/// Scenario: Under `Hold`, a probe's `Unarmed` helper reports its editor clean and its exit is drained before its frontier is taken; then a later invocation subsumes it and its record is deleted. The segment's kept facts show the frontier as requested at the drain, as taken once it is, and still as taken after the record is gone.
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_the_kept_facts_follow_the_record_until_it_goes() {
+    let mut t = T::new(Agent::Codex, HOLD);
+    let n = t.probe(0);
+    t.write(n, 1);
+    t.ipc(1, Decision::Unarmed, n, 2);
+    t.report(1, Report::Done(Tree::Clean), 3);
+    t.exit(1, 4);
+    let frontier = |t: &T| t.view(5)[0].fact.map(|f| f.frontier);
+    assert_eq!(frontier(&t), Some(Frontier::Requested), "at the drain");
+    t.out(b"later output", 5);
+    let offset = t.m.fed();
+    t.frontier(1);
+    assert_eq!(frontier(&t), Some(Frontier::Taken { offset }));
+    t.ipc(2, Decision::Armed, 0, 10);
+    let pruned =
+        t.r.prune(&mut t.f, G, key(1), true, time(t.t, 11))
+            .unwrap()
+            .is_some();
+    assert!(pruned && t.r.get(key(1)).is_none());
+    t.s.settle(&mut t.r, &mut t.f, time(t.t, 12));
+    assert_eq!(
+        frontier(&t),
+        Some(Frontier::Taken { offset }),
+        "kept after the record went"
+    );
 }
 
 // ---- inbox/probe/050: E1F's truth table ----
