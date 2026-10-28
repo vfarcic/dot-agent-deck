@@ -4,7 +4,7 @@ The deck can send a record of every agent run to an OpenTelemetry backend of you
 
 **It is off unless you configure it.** With no OpenTelemetry endpoint set, the deck sends nothing and behaves exactly as it does without this feature. You turn it on with the standard OpenTelemetry environment variables, so a backend that accepts OTLP over HTTP with its credentials in a header works, hosted or your own; [Connections](#connections) has what the deck's connection does and does not support.
 
-The deck sends metadata only. Prompts, file contents, agent output and your API key are never part of it; [What is never sent](#what-is-never-sent) has the full list, the two values it sends exactly as you wrote them (your own service name and resource attributes), and the one thing it reads from a command line: the program and first word of each command in a shell command line, filtered.
+The deck sends metadata only. Prompts, file contents, agent output and your API key are never part of it; [What is never sent](#what-is-never-sent) has the full list, the values it sends exactly as you wrote them (your own service name and resource attributes, and the names of your orchestrations, roles, dispatched units and repository), and the one thing it reads from a command line: the program and first word of each command in a shell command line, filtered.
 
 Telemetry behaves the same in the TUI and in the desktop app, because the daemon that runs the agents is what sends it. The only difference between the two clients is where you set the variables.
 
@@ -321,14 +321,14 @@ One span per interval, about once a minute, from the daemon that runs your agent
 | `deck.daemon.memory.rss` | The daemon's memory in use, in bytes, at the end of the interval. Linux only; absent on other systems. |
 | `deck.daemon.runs.open` | How many agent runs the daemon had open at the end of the interval. |
 | `deck.daemon.hook_latency.count` | How many status reports from agents (their hooks) reached the deck in the interval. |
-| `deck.daemon.hook_latency.p50_ms`, `deck.daemon.hook_latency.p95_ms`, `deck.daemon.hook_latency.max_ms` | How long those reports took to reach the deck, in milliseconds: the median, the 95th percentile and the slowest. Absent when the count is `0`, so an average over time is not pulled down by quiet intervals. The time is measured from the moment the agent's hook stamped the report. |
+| `deck.daemon.hook_latency.p50_ms`, `deck.daemon.hook_latency.p95_ms`, `deck.daemon.hook_latency.max_ms` | How long those reports took to reach the deck, in milliseconds: the median, the 95th percentile and the slowest. Absent when the count is `0`, so an average over time is not pulled down by quiet intervals. The time is measured from the moment the agent's hook stamped the report, by the agent's own clock, so it is a best estimate: a report stamped later than the deck read it counts as no delay. In an interval with more than 4,096 reports, the median and the 95th percentile are estimated from a random sample of 4,096 of them; the count and the slowest are always exact. |
 | `deck.telemetry.spans.dropped` | How many spans the deck could not send since the daemon started, because too many were waiting to be sent. It only grows; a rise between two intervals means spans were lost in between. |
 
-To send it more or less often, set `DOT_AGENT_DECK_TELEMETRY_HEALTH_INTERVAL_MS` in the daemon's environment to the interval in milliseconds; a value that is not a whole number above `0` keeps the one-minute default. To stop it, drop the `daemon.health` spans in a Collector ([Trim what is sent](#trim-what-is-sent)).
+To send it more or less often, set `DOT_AGENT_DECK_TELEMETRY_HEALTH_INTERVAL_MS` in the daemon's environment to the interval in milliseconds. The shortest interval is 100 milliseconds, and a smaller value is raised to it; a value that is not a whole number above `0` keeps the one-minute default. To stop it, drop the `daemon.health` spans in a Collector ([Trim what is sent](#trim-what-is-sent)).
 
 ## What is never sent
 
-The deck builds what it sends from the attributes on this page. The values of `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` are the exception to everything below: they are yours, and the deck sends them as you wrote them, so do not put a secret or private content in either. Apart from those, the deck never sends:
+The deck builds what it sends from the attributes on this page. Some values are yours, and the deck sends them as you wrote them: `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES`, the orchestration and role names from your configuration, the name you give `dot-agent-deck dispatch`, and your repository's name (the last part of its `origin` remote). Do not put a secret or private content in any of them. Apart from those, the deck never sends:
 
 - prompts, or anything you type into an agent (an intervention is counted, not recorded);
 - file contents, agent output, or the screen of a pane;
@@ -337,7 +337,7 @@ The deck builds what it sends from the attributes on this page. The values of `O
 - secrets: API keys, the values of environment variables, and the values of your OTLP headers (those go to the endpoint you configured as headers, and to nothing else, and the deck does not write them to its log);
 - pane titles, status details, branch names, working-directory paths, remote URLs, or command lines;
 - an agent's error messages: a failed run carries the kind of failure from a known list, or `other`;
-- names you chose: a model name is sent only when the deck recognises it as a known model's name, and a Codex plan only from the plans Codex is known to report. The exceptions are the orchestration and role names from your configuration, and the name you give `dot-agent-deck dispatch`, which is sent as `deck.dispatch.name`; the branch the dispatch creates is not sent.
+- other names you chose: a model name is sent only when the deck recognises it as a known model's name, and a Codex plan only from the plans Codex is known to report. The branch a dispatch creates is not sent.
 
 The [collector](#cpu-memory-and-disk-per-run), a separate program you run yourself, sends a worktree's path only when you start it with `--send-worktree-paths`; [What it sends](#what-it-sends) has its list.
 

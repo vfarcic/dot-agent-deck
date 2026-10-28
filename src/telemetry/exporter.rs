@@ -34,6 +34,11 @@
 //!   turns out to be — the Escape key, or the key whose sequence it begins
 //!   when the next write completes that sequence — keeps the `ESC`'s place,
 //!   so it counts before that event;
+//! - a delegated task's post (issue #1981 M7) keeps its place the same way:
+//!   it notes the broadcast's position as telemetry is told about it, waits
+//!   in [`Shared::posts`], and is applied before the first message broadcast
+//!   after that, so a pane closed after the post does not end the
+//!   orchestrator's run before the post is applied;
 //! - a run whose spawn is refused is forgotten when its [`PreparedRun`] is
 //!   dropped uncommitted.
 //!
@@ -399,10 +404,11 @@ enum Command {
         pane_id: String,
         run_id: String,
     },
-    /// Issue #1981 M7: the delegate path posted a task; applied after the
-    /// inbox notices broadcast before it, so the ones it overtook are held
-    /// for it ([`super::handoff`]).
-    DelegatePosted(super::handoff::Posted),
+    /// Issue #1981 M7: the delegate path posted a task, which waits in
+    /// [`Shared::posts`] with its broadcast position: a reminder to apply
+    /// it, between the broadcast messages it was posted between, if no
+    /// message after it does first ([`super::handoff`]).
+    DelegatePosted,
     /// Acknowledged once everything sent before it, broadcast included, is
     /// applied.
     #[cfg(test)]
@@ -694,8 +700,14 @@ struct Shared {
     /// never before it.
     filters: Arc<Filters>,
     /// Where the broadcast stands, for input to note as it is written. Locked
-    /// after the filters, never before them.
+    /// after the filters and the posts, never before them.
     clock: Mutex<BroadcastClock>,
+    /// Issue #1981 M7: delegated tasks posted and not applied yet, oldest
+    /// first, each with how many messages the daemon had broadcast when
+    /// telemetry was told about it ([`BroadcastClock::position`]): applied
+    /// before every message from that one on. Locked after the tracker,
+    /// never before it.
+    posts: Mutex<std::collections::VecDeque<(u64, super::handoff::Posted)>>,
     /// Wakes the ingest task to time a lone `ESC` that a write left held.
     escape_held: tokio::sync::Notify,
     /// Turned true as shutdown begins: an export in flight gives way to the
@@ -1280,12 +1292,23 @@ impl Telemetry {
     }
 
     /// Issue #1981 M7: the delegate path posted `posted`'s task: open its
-    /// `agent.handoff`, stamped now. Nothing happens when not exporting.
+    /// `agent.handoff`, stamped now, between the broadcast messages sent
+    /// before and after this call. Nothing happens when not exporting.
     pub fn observe_delegate_posted(&self, posted: &super::DelegatePosted<'_>) {
-        if let Some(exporting) = &self.exporting {
-            let posted = super::handoff::Posted::of(posted, now_unix_nanos());
-            let _ = exporting.commands.send(Command::DelegatePosted(posted));
+        let Some(exporting) = &self.exporting else {
+            return;
+        };
+        let shared = &exporting.shared;
+        {
+            // Read under the posts' lock, so the queue is in broadcast order.
+            let mut posts = shared.lock_posts();
+            let position = shared.lock_clock().position();
+            posts.push_back((
+                position,
+                super::handoff::Posted::of(posted, now_unix_nanos()),
+            ));
         }
+        let _ = exporting.commands.send(Command::DelegatePosted);
     }
 
     /// Feed the daemon's broadcast to the tracker until it closes. Nothing
@@ -1567,6 +1590,50 @@ impl Shared {
         self.clock.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    fn lock_posts(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::VecDeque<(u64, super::handoff::Posted)>> {
+        self.posts.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Issue #1981 M7: open the hand-off of each task posted before
+    /// broadcast message `position`, or of every one with `None`, oldest
+    /// first. With `opened_only`, as a broadcast message is applied, a post
+    /// whose orchestrator's run is prepared but not opened yet — its
+    /// [`Command::Commit`] still queued — waits for the post's own
+    /// [`Command::DelegatePosted`], which comes after that commit, as human
+    /// input waits for its run. Returns the position of the first post
+    /// written after `position`.
+    fn take_posts_before(
+        &self,
+        t: &mut RunTracker,
+        position: Option<u64>,
+        opened_only: bool,
+    ) -> Option<u64> {
+        let mut posts = self.lock_posts();
+        let mut left = std::collections::VecDeque::new();
+        let mut next = None;
+        for (at, posted) in posts.drain(..) {
+            if position.is_some_and(|p| at > p) {
+                next.get_or_insert(at);
+                left.push_back((at, posted));
+            } else if opened_only && !t.takes_post(&posted) {
+                left.push_back((at, posted));
+            } else {
+                t.delegate_posted(posted);
+            }
+        }
+        *posts = left;
+        next
+    }
+
+    /// [`Self::take_posts_before`], with the tracker locked for it.
+    fn take_posts(&self, through: Option<u64>) -> Option<u64> {
+        let mut left = None;
+        self.with_tracker(|t| left = self.take_posts_before(t, through, false));
+        left
+    }
+
     /// Count the human input waiting with `run_id` on `pane_id`, if the run
     /// has not ended and taken it already: what was written before broadcast
     /// message `through`, or all of it with `None`. Returns the broadcast
@@ -1747,14 +1814,22 @@ impl Shared {
     fn observe(&self, msg: &BroadcastMsg, position: u64, now: std::time::Instant) {
         match msg {
             BroadcastMsg::Event(event) => self.with_tracker(|t| {
+                self.take_posts_before(t, Some(position), true);
                 // An event naming no pane can be applied to any.
                 self.take_input_before(t, event.pane_id.as_deref(), position, now);
                 t.observe_event(event, now_unix_nanos());
             }),
-            BroadcastMsg::Inbox(notice) => {
-                self.with_tracker(|t| t.observe_inbox(notice, now_unix_nanos()));
+            BroadcastMsg::Inbox(notice) => self.with_tracker(|t| {
+                self.take_posts_before(t, Some(position), true);
+                t.observe_inbox(notice, now_unix_nanos());
+            }),
+            _ => {
+                if !self.lock_posts().is_empty() {
+                    self.with_tracker(|t| {
+                        self.take_posts_before(t, Some(position), true);
+                    });
+                }
             }
-            _ => {}
         }
         self.lock_clock().catch_up();
     }
@@ -1847,6 +1922,7 @@ fn start_exporting(
         health: Mutex::new(super::health::Window::new(now_unix_nanos())),
         filters,
         clock: Mutex::default(),
+        posts: Mutex::default(),
         escape_held: tokio::sync::Notify::new(),
         stopping,
         runtime: tokio::runtime::Handle::current(),
@@ -1913,6 +1989,10 @@ async fn run_ingest(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiver<C
                     take_input(&shared, &mut events, &mut read, pane_id, run_id).await;
                     continue;
                 }
+                if let Command::DelegatePosted = &command {
+                    take_posts(&shared, &mut events, &mut read).await;
+                    continue;
+                }
                 if !apply(&shared, command) {
                     break;
                 }
@@ -1935,6 +2015,9 @@ async fn run_ingest(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiver<C
             _ = usage_poll.tick() => {
                 shared.poll_usage(&usage_polling);
                 shared.name_dispatched_runs();
+                // Issue #1981 M7: a hand-off past its age bound ends then,
+                // not when the next inbox change or post happens to come.
+                shared.with_tracker(|t| t.expire_handoffs(now_unix_nanos()));
             }
             () = next_tick(&mut health) => {
                 drain(&shared, &mut events, &mut read).await;
@@ -2092,6 +2175,23 @@ async fn take_input(
     }
 }
 
+/// Open the hand-off of each task posted, each after the broadcast messages
+/// sent before it was posted, as [`take_input`] counts input. Posts the
+/// broadcast cannot be applied up to — it closed — are applied as they are.
+async fn take_posts(
+    shared: &Shared,
+    events: &mut Option<broadcast::Receiver<BroadcastMsg>>,
+    read: &mut u64,
+) {
+    while let Some(posted) = shared.take_posts(Some(*read)) {
+        drain_to(shared, events, read, posted).await;
+        if *read < posted {
+            shared.take_posts(None);
+            break;
+        }
+    }
+}
+
 /// Apply one command; `false` once the task is to stop.
 fn apply(shared: &Arc<Shared>, command: Command) -> bool {
     match command {
@@ -2117,11 +2217,8 @@ fn apply(shared: &Arc<Shared>, command: Command) -> bool {
                 shared.forget_ended_input(&pane_id, &run_id);
             }
         }
-        // Counted by `run_ingest`, in order with the broadcast.
-        Command::HumanInput { .. } => {}
-        Command::DelegatePosted(posted) => {
-            shared.with_tracker(|t| t.delegate_posted(posted));
-        }
+        // Counted and applied by `run_ingest`, in order with the broadcast.
+        Command::HumanInput { .. } | Command::DelegatePosted => {}
         #[cfg(test)]
         Command::Barrier(ack) => {
             // Once the runs ended before it are completed too.
@@ -2136,6 +2233,9 @@ fn apply(shared: &Arc<Shared>, command: Command) -> bool {
             // the tracker ends the run.
             let (mut finished, finishing) = {
                 let mut tracker = shared.tracker.lock().unwrap_or_else(|p| p.into_inner());
+                // A task posted as shutdown began is opened, to end with the
+                // rest.
+                shared.take_posts_before(&mut tracker, None, false);
                 tracker.end_all(EndReason::DaemonShutdown, now_unix_nanos());
                 tracker.take_finished_deferred()
             };
@@ -6566,6 +6666,107 @@ mod tests {
             health
                 .iter()
                 .all(|s| health_attr(s, AttrKey::DaemonRunsOpen) == Some(1))
+        );
+    }
+
+    /// Issue #1981 M7 review: a post keeps its place on the broadcast. With
+    /// the ingest task paused, a task is posted and then the orchestrator's
+    /// pane-close is broadcast; resumed, the post is applied before the
+    /// close, so the hand-off is the orchestrator run's child and ends
+    /// `unknown` at that run's end rather than parentless and open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_post_is_applied_before_a_pane_close_broadcast_after_it() {
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("orch", "oa"), &[]);
+        begin(&telemetry, generation("work", "wa"), &[]);
+        telemetry.settled().await;
+        let shared = &telemetry.exporting.as_ref().unwrap().shared;
+        let (entered, polled_empty) = oneshot::channel();
+        let (resume, paused) = oneshot::channel();
+        *shared.command_gate.lock().unwrap() = Some((entered, paused));
+        // A barrier brings the task round to the gate, unless its usage poll
+        // already did, with the barrier queued behind it.
+        let nudge = {
+            let telemetry = Arc::clone(&telemetry);
+            tokio::spawn(async move { telemetry.settled().await })
+        };
+        polled_empty.await.unwrap();
+        crate::telemetry::observe_delegate_posted(
+            Some(Arc::clone(&telemetry)),
+            &crate::telemetry::DelegatePosted {
+                message_id: "m-t",
+                orchestrator_pane: "orch",
+                orchestrator_agent_id: Some("oa"),
+                worker_pane: "work",
+                worker_agent_id: "wa",
+                role: "coder",
+            },
+        );
+        tx.send(pane_closed("orch", "oa")).unwrap();
+        resume.send(()).unwrap();
+        nudge.await.unwrap();
+        telemetry.settled().await;
+        let spans = captured(&mut rx);
+        let handoffs: Vec<_> = spans
+            .iter()
+            .filter(|s| s.name == crate::telemetry::SPAN_AGENT_HANDOFF)
+            .collect();
+        assert_eq!(handoffs.len(), 1, "{spans:?}");
+        let handoff = handoffs[0];
+        let run = ended_runs(&spans)
+            .into_iter()
+            .find(|s| attr(s, AttrKey::PaneId) == Some(&AttrValue::Str("orch".into())))
+            .expect("the orchestrator's run ended");
+        assert_eq!(handoff.trace_id, run.trace_id);
+        assert_eq!(handoff.parent_span_id, Some(run.span_id));
+        assert_eq!(attr(handoff, AttrKey::RunId), attr(run, AttrKey::RunId));
+        assert_eq!(
+            attr(handoff, AttrKey::HandoffOutcome),
+            Some(&AttrValue::Str("unknown".into()))
+        );
+        assert_eq!(handoff.end_unix_nanos, run.end_unix_nanos);
+    }
+
+    /// Issue #1981 M7 review: the ingest task ends a hand-off past its age
+    /// bound on its own timer, with no inbox change or post to prompt it,
+    /// at the moment the bound was reached.
+    #[tokio::test]
+    async fn the_ingest_timer_ends_a_handoff_past_its_age_bound() {
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        begin(&telemetry, generation("orch", "oa"), &[]);
+        telemetry.settled().await;
+        let posted_at = now_unix_nanos() - crate::telemetry::handoff::MAX_HANDOFF_AGE_NANOS - 1;
+        let shared = &telemetry.exporting.as_ref().unwrap().shared;
+        shared.with_tracker(|t| {
+            t.delegate_posted(crate::telemetry::handoff::Posted {
+                message_id: "m-old".into(),
+                orchestrator_pane: "orch".into(),
+                orchestrator_agent_id: Some("oa".into()),
+                worker_pane: "work".into(),
+                worker_agent_id: "wa".into(),
+                role: "coder".into(),
+                at: posted_at,
+            });
+        });
+        let mut handoffs = Vec::new();
+        eventually("the timer ended the hand-off", || {
+            handoffs.extend(
+                captured(&mut rx)
+                    .into_iter()
+                    .filter(|s| s.name == crate::telemetry::SPAN_AGENT_HANDOFF),
+            );
+            !handoffs.is_empty()
+        })
+        .await;
+        assert_eq!(
+            attr(&handoffs[0], AttrKey::HandoffOutcome),
+            Some(&AttrValue::Str("unknown".into()))
+        );
+        assert_eq!(
+            handoffs[0].end_unix_nanos,
+            posted_at + crate::telemetry::handoff::MAX_HANDOFF_AGE_NANOS
         );
     }
 

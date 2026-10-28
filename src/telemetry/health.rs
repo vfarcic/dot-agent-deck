@@ -12,14 +12,18 @@
 //!   the hook process stamping them to telemetry reading them off the
 //!   broadcast. Only events an agent's hooks produced count: one the daemon
 //!   made itself ([`crate::event::AgentEvent::is_daemon_synthetic`]) would
-//!   read about zero. An empty interval leaves the quantiles out rather than
-//!   sending zeros, so an average over time is not dragged down by quiet
-//!   intervals;
+//!   read about zero. The stamp is the producer's own clock, so this is best
+//!   effort; a stamp after the read counts as no delay. The count and the
+//!   maximum cover every event; past [`MAX_SAMPLES`] events the quantiles
+//!   are estimated from a uniform sample of the whole interval. An empty
+//!   interval leaves the quantiles out rather than sending zeros, so an
+//!   average over time is not dragged down by quiet intervals;
 //! - `deck.telemetry.spans.dropped`: every span the export queue refused
 //!   since the daemon started, health spans included.
 //!
 //! The interval is [`DEFAULT_INTERVAL`], or [`INTERVAL_ENV`] milliseconds
-//! when the daemon's environment sets it to a whole number above zero.
+//! when the daemon's environment sets it to a whole number above zero, raised
+//! to [`MIN_INTERVAL`].
 
 use std::time::Duration;
 
@@ -34,17 +38,25 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 /// milliseconds.
 pub const INTERVAL_ENV: &str = "DOT_AGENT_DECK_TELEMETRY_HEALTH_INTERVAL_MS";
 
-/// Latency samples one interval keeps. Past it the count still counts and the
-/// maximum still moves; the quantiles are read from the samples kept.
+/// The shortest interval [`INTERVAL_ENV`] can ask for; a shorter one is
+/// raised to it.
+pub const MIN_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Latency samples one interval keeps: a uniform sample of every event in it
+/// (Algorithm R), so the quantiles describe the whole interval however many
+/// events it had. The count and the maximum are exact.
 pub const MAX_SAMPLES: usize = 4096;
 
 /// The health interval `env` asks for: [`INTERVAL_ENV`] when it is a whole
-/// number of milliseconds above zero, else [`DEFAULT_INTERVAL`].
+/// number of milliseconds above zero, at least [`MIN_INTERVAL`], else
+/// [`DEFAULT_INTERVAL`].
 pub fn interval(env: &EnvMap) -> Duration {
     env.get(INTERVAL_ENV)
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|ms| *ms > 0)
-        .map_or(DEFAULT_INTERVAL, Duration::from_millis)
+        .map_or(DEFAULT_INTERVAL, |ms| {
+            Duration::from_millis(ms).max(MIN_INTERVAL)
+        })
 }
 
 /// One interval's hook latencies, from its start.
@@ -54,15 +66,22 @@ pub struct Window {
     count: u64,
     max_ms: u64,
     samples: Vec<u64>,
+    /// Chooses which sample a later event replaces.
+    rng: XorShift,
 }
 
 impl Window {
     pub fn new(start: u64) -> Self {
+        Self::seeded(start, random_seed())
+    }
+
+    fn seeded(start: u64, seed: u64) -> Self {
         Window {
             start,
             count: 0,
             max_ms: 0,
             samples: Vec::new(),
+            rng: XorShift::new(seed),
         }
     }
 
@@ -74,13 +93,25 @@ impl Window {
         self.max_ms = self.max_ms.max(ms);
         if self.samples.len() < MAX_SAMPLES {
             self.samples.push(ms);
+            return;
+        }
+        // Algorithm R: the `count`th event replaces a kept sample with
+        // probability MAX_SAMPLES / count, so every event of the interval is
+        // equally likely to be kept.
+        let slot = self.rng.next() % self.count;
+        if let Some(kept) = usize::try_from(slot)
+            .ok()
+            .and_then(|i| self.samples.get_mut(i))
+        {
+            *kept = ms;
         }
     }
 
     /// End this interval at `now` with the measures taken then, giving its
     /// span, and start the next one.
     pub fn close(&mut self, now: u64, runs_open: usize, dropped: u64) -> SpanRecord {
-        let window = std::mem::replace(self, Window::new(now));
+        let next = Window::seeded(now, self.rng.next());
+        let window = std::mem::replace(self, next);
         window.span(now, runs_open, rss_bytes(), dropped)
     }
 
@@ -124,6 +155,37 @@ impl Window {
 fn quantile(sorted: &[u64], pct: usize) -> u64 {
     let rank = (sorted.len() * pct).div_ceil(100).max(1);
     sorted[rank.min(sorted.len()) - 1]
+}
+
+/// xorshift64*: enough to pick reservoir slots, not for anything secret.
+#[derive(Debug)]
+struct XorShift(u64);
+
+impl XorShift {
+    fn new(seed: u64) -> Self {
+        // Zero is the one state it never leaves.
+        XorShift(if seed == 0 {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            seed
+        })
+    }
+
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+}
+
+fn random_seed() -> u64 {
+    let mut seed = [0u8; 8];
+    // A failed read leaves a fixed seed, which still samples uniformly.
+    let _ = getrandom::fill(&mut seed);
+    u64::from_le_bytes(seed)
 }
 
 fn int(value: u64) -> i64 {
@@ -173,6 +235,55 @@ mod tests {
         assert_eq!(interval(&env("250")), Duration::from_millis(250));
         assert_eq!(interval(&env("0")), DEFAULT_INTERVAL);
         assert_eq!(interval(&env("soon")), DEFAULT_INTERVAL);
+    }
+
+    /// Issue #1981 M8 review: an interval shorter than [`MIN_INTERVAL`] is
+    /// raised to it, so the daemon cannot be made to sample in a busy loop.
+    #[test]
+    fn a_too_short_interval_is_raised_to_the_minimum() {
+        let env = |v: &str| EnvMap::from([(INTERVAL_ENV.to_string(), v.to_string())]);
+        assert_eq!(MIN_INTERVAL, Duration::from_millis(100));
+        assert_eq!(interval(&env("1")), MIN_INTERVAL);
+        assert_eq!(interval(&env("99")), MIN_INTERVAL);
+        assert_eq!(interval(&env("100")), MIN_INTERVAL);
+        assert_eq!(interval(&env("101")), Duration::from_millis(101));
+    }
+
+    /// Issue #1981 M8 review: a burst early in an interval does not fix its
+    /// quantiles. 4,096 events with no delay and then 8,192 a second late
+    /// are two thirds late, so the median and the 95th percentile are the
+    /// late ones; the count and the maximum stay exact.
+    #[test]
+    fn quantiles_sample_the_whole_interval_not_its_start() {
+        let ms = 1_000_000;
+        for seed in [1, 7, 0xDEAD_BEEF, u64::MAX] {
+            let mut window = Window::seeded(0, seed);
+            for _ in 0..MAX_SAMPLES {
+                window.record(10 * ms, 10 * ms);
+            }
+            for _ in 0..2 * MAX_SAMPLES {
+                window.record(10 * ms, 1_010 * ms);
+            }
+            assert_eq!(window.samples.len(), MAX_SAMPLES);
+            let late = window.samples.iter().filter(|s| **s == 1000).count();
+            // Two thirds of the kept samples, give or take sampling noise.
+            assert!(
+                (2_400..=3_050).contains(&late),
+                "seed {seed}: {late} of {MAX_SAMPLES} kept samples are late"
+            );
+            let span = window.close(2_000 * ms, 0, 0);
+            assert_eq!(
+                attr(&span, AttrKey::HookLatencyCount),
+                Some(&AttrValue::Int(3 * MAX_SAMPLES as i64))
+            );
+            for key in [
+                AttrKey::HookLatencyP50,
+                AttrKey::HookLatencyP95,
+                AttrKey::HookLatencyMax,
+            ] {
+                assert_eq!(attr(&span, key), Some(&AttrValue::Int(1000)), "seed {seed}");
+            }
+        }
     }
 
     #[test]

@@ -1595,6 +1595,20 @@ impl RunTracker {
             .posted(posted, orchestrator, worker, &run_of, &mut self.finished);
     }
 
+    /// Issue #1981 M7: whether `posted` can be applied as its place on the
+    /// broadcast comes: not while its orchestrator's run is prepared and not
+    /// opened yet, when the hand-off would miss the run's trace.
+    pub fn takes_post(&self, posted: &Posted) -> bool {
+        run_ref(
+            &self.runs,
+            &self.replaced,
+            &self.pending,
+            &posted.orchestrator_pane,
+            posted.orchestrator_agent_id.as_deref(),
+        )
+        .is_none_or(|run| run.span.is_some())
+    }
+
     /// Issue #1981 M7: apply one inbox state change from the daemon's
     /// broadcast to the hand-off it concerns, or count a report that names
     /// no task on the run of the agent it reached.
@@ -1617,6 +1631,13 @@ impl RunTracker {
         let run_of = |pane: &str, agent: &str| run_ref(runs, replaced, pending, pane, Some(agent));
         self.handoffs
             .apply(change, now, &run_of, &mut self.finished);
+    }
+
+    /// Issue #1981 M7: end every hand-off past its age bound at `now`, and
+    /// forget the held notices past theirs, with no inbox change needed to
+    /// notice ([`super::handoff::Handoffs::expire`]).
+    pub fn expire_handoffs(&mut self, now: u64) {
+        self.handoffs.expire(now, &mut self.finished);
     }
 
     /// Hand-offs open now, and notices held for a post not seen yet.

@@ -20,8 +20,16 @@
 //! A hand-off still open when its orchestrator's run ends ends with it:
 //! `reported` when the report had arrived, `daemon_shutdown` when the daemon
 //! is shutting down, `unknown` otherwise. One still open after
-//! [`MAX_HANDOFF_AGE_NANOS`], or the oldest past [`MAX_OPEN_HANDOFFS`], ends
+//! [`MAX_HANDOFF_AGE_NANOS`] ends `unknown` at that age, whatever ends it
+//! later — the exporter's usage poll checks every couple of seconds, and a
+//! run's end or the daemon's shutdown checks before choosing an outcome
+//! ([`Handoffs::expire`]). The oldest past [`MAX_OPEN_HANDOFFS`] ends
 //! `unknown` where it stands.
+//!
+//! **The post keeps its place on the broadcast.** The exporter applies a post
+//! between the broadcast messages it was made between, the way it places
+//! human input, so a pane closed after the post cannot end the orchestrator's
+//! run before the hand-off finds it.
 //!
 //! **A notice can overtake the post.** The inbox broadcasts the task's
 //! `queued` state before the delegate path returns from posting it, so a fast
@@ -376,7 +384,8 @@ impl Handoffs {
     }
 
     /// The orchestrator run `run_id` ended at `now`, `shutting_down` when the
-    /// daemon is: end every hand-off in it.
+    /// daemon is: end every hand-off in it, after the ones past their age
+    /// bound end `unknown` at it.
     pub fn run_ended(
         &mut self,
         run_id: &str,
@@ -384,6 +393,7 @@ impl Handoffs {
         now: u64,
         finished: &mut Vec<SpanRecord>,
     ) {
+        self.expire(now, finished);
         let ending: Vec<String> = self
             .order
             .iter()
@@ -399,8 +409,10 @@ impl Handoffs {
         }
     }
 
-    /// Daemon shutdown at `now`: end every hand-off still open.
+    /// Daemon shutdown at `now`: end every hand-off still open, the ones
+    /// past their age bound `unknown` at it.
     pub fn end_all(&mut self, now: u64, finished: &mut Vec<SpanRecord>) {
+        self.expire(now, finished);
         let open: Vec<String> = self.order.iter().cloned().collect();
         for id in open {
             self.end_unread(&id, true, now, finished);
@@ -427,18 +439,29 @@ impl Handoffs {
         self.end(id, outcome, now, finished);
     }
 
-    /// End every hand-off open past [`MAX_HANDOFF_AGE_NANOS`] and forget
-    /// every held change past [`EARLY_NOTICE_AGE_NANOS`].
-    fn expire(&mut self, now: u64, finished: &mut Vec<SpanRecord>) {
-        while let Some(oldest) = self.order.front().cloned() {
-            let expired = self
-                .open
-                .get(&oldest)
-                .is_none_or(|h| now.saturating_sub(h.start) >= MAX_HANDOFF_AGE_NANOS);
-            if !expired {
-                break;
-            }
-            self.end(&oldest, Outcome::Unknown, now, finished);
+    /// End every hand-off open [`MAX_HANDOFF_AGE_NANOS`] or longer by `now`
+    /// as `unknown`, at the moment it reached that age, and forget every held
+    /// change past [`EARLY_NOTICE_AGE_NANOS`]. Called before anything else
+    /// touches the hand-offs, and periodically ([`super::RunTracker::expire_handoffs`]),
+    /// so one past its bound never ends any other way.
+    pub fn expire(&mut self, now: u64, finished: &mut Vec<SpanRecord>) {
+        // Every one, not only from the front: posts are stamped where they
+        // are made, so the order of their stamps can differ from the order
+        // they were applied in.
+        let expired: Vec<(String, u64)> = self
+            .order
+            .iter()
+            .filter_map(|id| {
+                let bound = self
+                    .open
+                    .get(id)?
+                    .start
+                    .saturating_add(MAX_HANDOFF_AGE_NANOS);
+                (now >= bound).then(|| (id.clone(), bound))
+            })
+            .collect();
+        for (id, bound) in expired {
+            self.end(&id, Outcome::Unknown, bound, finished);
         }
         self.early
             .retain(|(_, at)| now.saturating_sub(*at) < EARLY_NOTICE_AGE_NANOS);
@@ -882,6 +905,96 @@ mod tests {
         let spans = tracker.take_finished();
         assert_eq!(handoffs(&spans).len(), MAX_OPEN_HANDOFFS);
         assert_eq!(tracker.handoffs_held().0, 0);
+    }
+
+    /// Issue #1981 M7 review: a hand-off left open on a quiet daemon ends
+    /// `unknown` at its age bound when the periodic check runs, with no inbox
+    /// change to prompt it, and a held notice past its own bound goes too.
+    #[test]
+    fn a_quiet_handoff_ends_unknown_at_its_age_bound() {
+        let mut tracker = team("worker-1");
+        post(&mut tracker, 10);
+        tracker.observe_inbox(&notice(WORKER, TASK, StateName::Acknowledged), 20);
+        tracker.observe_inbox(&notice(WORKER, "m-early", StateName::Fetched), 30);
+        assert_eq!(tracker.handoffs_held(), (1, 1));
+        tracker.expire_handoffs(10 + MAX_HANDOFF_AGE_NANOS - 1);
+        assert!(handoffs(&tracker.take_finished()).is_empty());
+        assert_eq!(tracker.handoffs_held(), (1, 0), "the held notice aged out");
+        tracker.expire_handoffs(10 + MAX_HANDOFF_AGE_NANOS + 5_000);
+        let span = only_handoff(&mut tracker);
+        assert_eq!(text(&span, AttrKey::HandoffOutcome), Some("unknown"));
+        assert_eq!(span.end_unix_nanos, 10 + MAX_HANDOFF_AGE_NANOS);
+        assert_eq!(event_names(&span), vec![(EVENT_HANDOFF_TAKEN, 20)]);
+        assert_eq!(tracker.handoffs_held(), (0, 0));
+    }
+
+    /// Issue #1981 M7 review: a daemon shut down after a hand-off passed its
+    /// age bound ends it `unknown` at that bound, not `daemon_shutdown` at the
+    /// shutdown.
+    #[test]
+    fn a_shutdown_past_the_age_bound_ends_the_handoff_unknown() {
+        let mut tracker = team("worker-1");
+        post(&mut tracker, 10);
+        let hour = 60 * 60 * 1_000_000_000;
+        tracker.end_all(EndReason::DaemonShutdown, 10 + 25 * hour);
+        let span = only_handoff(&mut tracker);
+        assert_eq!(text(&span, AttrKey::HandoffOutcome), Some("unknown"));
+        assert_eq!(span.end_unix_nanos, 10 + MAX_HANDOFF_AGE_NANOS);
+        // Parented to the orchestrator's run, which ended with the shutdown.
+        assert!(span.parent_span_id.is_some());
+    }
+
+    /// Issue #1981 M7 review: a report that arrived but was never read is
+    /// `unknown` once the hand-off is past its age bound, whether the check
+    /// or the orchestrator's run ending finds it first.
+    #[test]
+    fn an_unread_report_past_the_age_bound_ends_unknown() {
+        let hour = 60 * 60 * 1_000_000_000;
+        // The orchestrator's run ends at 25 h.
+        let mut tracker = team("worker-1");
+        post(&mut tracker, 10);
+        tracker.observe_inbox(&report(TASK, "worker-1"), 30);
+        tracker.end_run(ORCH, EndReason::Exited, None, 10 + 25 * hour);
+        let span = only_handoff(&mut tracker);
+        assert_eq!(text(&span, AttrKey::HandoffOutcome), Some("unknown"));
+        assert_eq!(span.end_unix_nanos, 10 + MAX_HANDOFF_AGE_NANOS);
+        assert_eq!(event_names(&span), vec![(EVENT_HANDOFF_REPORTED, 30)]);
+
+        // The periodic check finds it first; the late acknowledgement then
+        // finds nothing to end.
+        let mut tracker = team("worker-1");
+        post(&mut tracker, 10);
+        tracker.observe_inbox(&report(TASK, "worker-1"), 30);
+        tracker.expire_handoffs(10 + 25 * hour);
+        let span = only_handoff(&mut tracker);
+        assert_eq!(text(&span, AttrKey::HandoffOutcome), Some("unknown"));
+        assert_eq!(span.end_unix_nanos, 10 + MAX_HANDOFF_AGE_NANOS);
+        tracker.observe_inbox(
+            &notice(ORCH, REPORT, StateName::Acknowledged),
+            10 + 26 * hour,
+        );
+        assert!(handoffs(&tracker.take_finished()).is_empty());
+    }
+
+    /// The age bound is each hand-off's own, not only the oldest post's: a
+    /// post stamped earlier but applied later still ends on time.
+    #[test]
+    fn every_handoff_past_its_bound_ends_not_only_the_first_posted() {
+        let mut tracker = team("worker-1");
+        post(&mut tracker, 100);
+        tracker.delegate_posted(Posted {
+            message_id: "m-stamped-earlier".into(),
+            orchestrator_pane: ORCH.into(),
+            orchestrator_agent_id: Some("orch-agent".into()),
+            worker_pane: WORKER.into(),
+            worker_agent_id: "worker-1".into(),
+            role: "coder".into(),
+            at: 50,
+        });
+        tracker.expire_handoffs(50 + MAX_HANDOFF_AGE_NANOS);
+        let span = only_handoff(&mut tracker);
+        assert_eq!(text(&span, AttrKey::HandoffId), Some("m-stamped-earlier"));
+        assert_eq!(tracker.handoffs_held(), (1, 0));
     }
 
     fn uncorrelated(requeued: bool) -> InboxNotice {
