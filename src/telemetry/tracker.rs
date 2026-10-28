@@ -67,6 +67,7 @@ use crate::state::{AppState, SessionStatus};
 use super::accounting::AccountingKey;
 use super::accounting::run_usage::{RunUsage, UsageDirs};
 use super::ci::{CiEffect, CiState, PrCi};
+use super::handoff::{Change, Handoffs, Posted, RunRef};
 use super::input::InterventionKind;
 use super::operation::{Description, describe_tool, is_shell_tool};
 use super::run_context::RunContext;
@@ -369,6 +370,9 @@ struct ActiveRun {
     /// The agent the run's hooks last named, kept once the card that named it
     /// is gone ([`resolved_agent`]).
     learned_agent: Option<AgentType>,
+    /// Issue #1981 M7: reports this run's agent received that named no task
+    /// (`deck.handoffs.uncorrelated.count`).
+    uncorrelated_reports: u64,
 }
 
 /// A pull request, told apart from another repository's of the same number by
@@ -644,6 +648,8 @@ pub struct RunTracker {
     /// oldest first, at most [`MAX_DISPATCHED_ORCHESTRATIONS`].
     dispatched_orchestrations: VecDeque<(String, String)>,
     held_input: Option<HeldInput>,
+    /// Issue #1981 M7: the delegated tasks whose `agent.handoff` is open.
+    handoffs: Handoffs,
     /// Test witness: the [`ShadowCards`] alive.
     #[cfg(test)]
     shadow_states: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -880,6 +886,7 @@ impl RunTracker {
                 usage: Some(usage),
                 dispatch_name: None,
                 learned_agent: None,
+                uncorrelated_reports: 0,
             },
         );
     }
@@ -1471,6 +1478,12 @@ impl RunTracker {
         }
         let usage = run.usage.take();
         let run_id = run.start_info.run_id.clone();
+        self.handoffs.run_ended(
+            &run_id,
+            reason == EndReason::DaemonShutdown,
+            now,
+            &mut self.finished,
+        );
         let span = run_span(run, reason, exit_code, now);
         match usage {
             // A run with nothing to read is completed here, its span queued
@@ -1549,6 +1562,67 @@ impl RunTracker {
         for pane in panes {
             self.end_run(&pane, reason, None, now);
         }
+        self.handoffs.end_all(now, &mut self.finished);
+    }
+
+    /// Issue #1981 M8: the runs open (replaced ones still waiting for their
+    /// end included) and prepared — one per agent PTY the deck started.
+    pub fn open_runs(&self) -> usize {
+        self.runs.len() + self.replaced.len() + self.pending.len()
+    }
+
+    /// Issue #1981 M7: the delegate path posted a task: open its hand-off
+    /// ([`super::handoff`]).
+    pub fn delegate_posted(&mut self, posted: Posted) {
+        let orchestrator = run_ref(
+            &self.runs,
+            &self.replaced,
+            &self.pending,
+            &posted.orchestrator_pane,
+            posted.orchestrator_agent_id.as_deref(),
+        );
+        let worker = run_ref(
+            &self.runs,
+            &self.replaced,
+            &self.pending,
+            &posted.worker_pane,
+            Some(&posted.worker_agent_id),
+        )
+        .map(|run| run.run_id);
+        let (runs, replaced, pending) = (&self.runs, &self.replaced, &self.pending);
+        let run_of = |pane: &str, agent: &str| run_ref(runs, replaced, pending, pane, Some(agent));
+        self.handoffs
+            .posted(posted, orchestrator, worker, &run_of, &mut self.finished);
+    }
+
+    /// Issue #1981 M7: apply one inbox state change from the daemon's
+    /// broadcast to the hand-off it concerns, or count a report that names
+    /// no task on the run of the agent it reached.
+    pub fn observe_inbox(&mut self, notice: &crate::event::InboxNotice, now: u64) {
+        let Some(change) = Change::of(notice) else {
+            return;
+        };
+        if let Change::Uncorrelated { pane, agent } = &change {
+            if let Some(run) = self.runs.get_mut(pane).filter(|run| {
+                match (run.start_info.agent_id.as_deref(), agent.as_deref()) {
+                    (Some(ours), Some(theirs)) => ours == theirs,
+                    _ => true,
+                }
+            }) {
+                run.uncorrelated_reports += 1;
+            }
+            return;
+        }
+        let (runs, replaced, pending) = (&self.runs, &self.replaced, &self.pending);
+        let run_of = |pane: &str, agent: &str| run_ref(runs, replaced, pending, pane, Some(agent));
+        self.handoffs
+            .apply(change, now, &run_of, &mut self.finished);
+    }
+
+    /// Hand-offs open now, and notices held for a post not seen yet.
+    #[cfg(test)]
+    pub fn handoffs_held(&self) -> (usize, usize) {
+        (self.handoffs.open_count(), self.handoffs.early_count())
     }
 
     /// Runs open (replaced ones still waiting for their end included) and
@@ -2023,6 +2097,14 @@ fn run_span(run: ActiveRun, reason: EndReason, exit_code: Option<i32>, now: u64)
         AttrKey::CiFailuresCount,
         saturating_i64(run.ci_failures),
     ));
+    // On an orchestrator's run always, and on another only when it has one.
+    let orchestrator = start.orchestration.as_ref().is_some_and(|o| o.orchestrator);
+    if orchestrator || run.uncorrelated_reports > 0 {
+        attributes.push(Attribute::int(
+            AttrKey::HandoffsUncorrelatedCount,
+            saturating_i64(run.uncorrelated_reports),
+        ));
+    }
     let end = now.max(run.start);
     SpanRecord {
         trace_id: run.trace_id,
@@ -2034,6 +2116,55 @@ fn run_span(run: ActiveRun, reason: EndReason, exit_code: Option<i32>, now: u64)
         attributes,
         events: run.events,
     }
+}
+
+/// The run of agent `agent_id` on `pane_id`: the one open there, else one
+/// replaced and waiting for its end, else one prepared. An unknown agent id
+/// matches the run open on the pane.
+fn run_ref(
+    runs: &HashMap<String, ActiveRun>,
+    replaced: &[ReplacedRun],
+    pending: &HashMap<String, PendingRun>,
+    pane_id: &str,
+    agent_id: Option<&str>,
+) -> Option<RunRef> {
+    let same = |ours: Option<&str>| match (ours, agent_id) {
+        (Some(ours), Some(theirs)) => ours == theirs,
+        _ => true,
+    };
+    let active = runs
+        .get(pane_id)
+        .filter(|run| same(run.start_info.agent_id.as_deref()))
+        .or_else(|| {
+            replaced.iter().map(|r| &r.run).find(|run| {
+                run.start_info.pane_id == pane_id
+                    && agent_id.is_some()
+                    && run.start_info.agent_id.as_deref() == agent_id
+            })
+        });
+    if let Some(run) = active {
+        return Some(RunRef {
+            run_id: run.start_info.run_id.clone(),
+            span: Some((run.trace_id, run.span_id)),
+            orchestration_id: run
+                .start_info
+                .orchestration
+                .as_ref()
+                .and_then(|o| o.id.clone()),
+        });
+    }
+    pending
+        .values()
+        .find(|p| {
+            p.start.pane_id == pane_id
+                && agent_id.is_some()
+                && p.start.agent_id.as_deref() == agent_id
+        })
+        .map(|p| RunRef {
+            run_id: p.start.run_id.clone(),
+            span: None,
+            orchestration_id: p.start.orchestration.as_ref().and_then(|o| o.id.clone()),
+        })
 }
 
 fn saturating_i64(value: u64) -> i64 {

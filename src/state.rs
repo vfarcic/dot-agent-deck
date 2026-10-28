@@ -6103,6 +6103,19 @@ async fn dispatch_one_owned(
                 message_id = %id,
                 "delegate: task posted to the worker's inbox"
             );
+            // Issue #1981 M7: opens the task's `agent.handoff`; nothing with
+            // telemetry off.
+            crate::telemetry::observe_delegate_posted(
+                registry.telemetry(),
+                &crate::telemetry::DelegatePosted {
+                    message_id: id.as_str(),
+                    orchestrator_pane: &orchestrator_pane_id,
+                    orchestrator_agent_id: orchestrator_agent_id.as_deref(),
+                    worker_pane: &pane_id,
+                    worker_agent_id: &worker_agent_id,
+                    role: &target_role,
+                },
+            );
             // PRD #1666 part 3, round 5 (plan D8): the tasks this one
             // superseded are closed in the ledger; their own arms and records
             // go too, exactly, and nothing of the new task's.

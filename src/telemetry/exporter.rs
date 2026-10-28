@@ -399,6 +399,10 @@ enum Command {
         pane_id: String,
         run_id: String,
     },
+    /// Issue #1981 M7: the delegate path posted a task; applied after the
+    /// inbox notices broadcast before it, so the ones it overtook are held
+    /// for it ([`super::handoff`]).
+    DelegatePosted(super::handoff::Posted),
     /// Acknowledged once everything sent before it, broadcast included, is
     /// applied.
     #[cfg(test)]
@@ -676,6 +680,14 @@ struct Shared {
     tracker: Mutex<RunTracker>,
     queue: mpsc::Sender<ExportMsg>,
     dropped: Mutex<RateLimitedLog>,
+    /// Issue #1981 M8: every span the queue refused since the exporter
+    /// started (`deck.telemetry.spans.dropped`). Unlike [`Self::dropped`],
+    /// which counts only between warnings, never reset.
+    dropped_total: std::sync::atomic::AtomicU64,
+    /// Issue #1981 M8: how often a `daemon.health` span is sent, when it is
+    /// ([`super::health`]), and the hook latencies of the interval open now.
+    health_interval: Option<Duration>,
+    health: Mutex<super::health::Window>,
     /// Each run's input filter, by pane, the newest generation last. The
     /// tracker retires one as it ends that run ([`retire_input`]), so a held
     /// lone `ESC` is counted however the run ends. Locked after the tracker,
@@ -851,6 +863,9 @@ struct Settings {
     /// [`Shared::command_gate`].
     #[cfg(test)]
     command_gate: Option<Gate>,
+    /// Issue #1981 M8: send a `daemon.health` span this often; none when
+    /// unset. Only the daemon's start sets it ([`Telemetry::start_in`]).
+    health_interval: Option<Duration>,
 }
 
 impl Telemetry {
@@ -891,7 +906,11 @@ impl Telemetry {
     /// the current tokio runtime, with per-run agent configuration files
     /// written into `config_dir`.
     pub fn start_in(env: &EnvMap, config_dir: PathBuf) -> Self {
-        Self::start_with_dir(env, config_dir, Settings::default())
+        let settings = Settings {
+            health_interval: Some(super::health::interval(env)),
+            ..Settings::default()
+        };
+        Self::start_with_dir(env, config_dir, settings)
     }
 
     fn start_with_dir(env: &EnvMap, config_dir: PathBuf, settings: Settings) -> Self {
@@ -1258,6 +1277,15 @@ impl Telemetry {
             reason,
             exit_code,
         });
+    }
+
+    /// Issue #1981 M7: the delegate path posted `posted`'s task: open its
+    /// `agent.handoff`, stamped now. Nothing happens when not exporting.
+    pub fn observe_delegate_posted(&self, posted: &super::DelegatePosted<'_>) {
+        if let Some(exporting) = &self.exporting {
+            let posted = super::handoff::Posted::of(posted, now_unix_nanos());
+            let _ = exporting.commands.send(Command::DelegatePosted(posted));
+        }
     }
 
     /// Feed the daemon's broadcast to the tracker until it closes. Nothing
@@ -1694,6 +1722,9 @@ impl Shared {
     /// stays held, and counts after the message if it is the Escape key.
     async fn observe_in_order(&self, msg: &BroadcastMsg, position: u64) {
         let now = std::time::Instant::now();
+        if let BroadcastMsg::Event(event) = msg {
+            self.record_hook_latency(event);
+        }
         if let BroadcastMsg::Event(event) = msg
             && let Some(due) = self.escape_due_before(event.pane_id.as_deref(), position, now)
         {
@@ -1714,14 +1745,56 @@ impl Shared {
     /// the daemon broadcast it, a lone `ESC` among it once its window has
     /// passed by `now`.
     fn observe(&self, msg: &BroadcastMsg, position: u64, now: std::time::Instant) {
-        if let BroadcastMsg::Event(event) = msg {
-            self.with_tracker(|t| {
+        match msg {
+            BroadcastMsg::Event(event) => self.with_tracker(|t| {
                 // An event naming no pane can be applied to any.
                 self.take_input_before(t, event.pane_id.as_deref(), position, now);
                 t.observe_event(event, now_unix_nanos());
-            });
+            }),
+            BroadcastMsg::Inbox(notice) => {
+                self.with_tracker(|t| t.observe_inbox(notice, now_unix_nanos()));
+            }
+            _ => {}
         }
         self.lock_clock().catch_up();
+    }
+
+    /// Issue #1981 M8: `event` was read off the broadcast now: count how long
+    /// it took from its hook's stamp, when an agent's hook produced it
+    /// ([`super::health`]).
+    fn record_hook_latency(&self, event: &crate::event::AgentEvent) {
+        if self.health_interval.is_none() || event.is_daemon_synthetic() {
+            return;
+        }
+        let Some(stamped) = event
+            .timestamp
+            .timestamp_nanos_opt()
+            .and_then(|n| u64::try_from(n).ok())
+        else {
+            return;
+        };
+        self.lock_health().record(stamped, now_unix_nanos());
+    }
+
+    fn lock_health(&self) -> std::sync::MutexGuard<'_, super::health::Window> {
+        self.health.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Issue #1981 M8: end the health interval open now and queue its
+    /// `daemon.health` span.
+    fn sample_health(&self) {
+        let runs_open = self
+            .tracker
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .open_runs();
+        let dropped = self
+            .dropped_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let span = self
+            .lock_health()
+            .close(now_unix_nanos(), runs_open, dropped);
+        self.enqueue(vec![span]);
     }
 
     fn enqueue(&self, spans: Vec<SpanRecord>) {
@@ -1731,6 +1804,8 @@ impl Shared {
                 .try_send(ExportMsg::Span(Box::new(span)))
                 .is_err()
             {
+                self.dropped_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut log = self.dropped.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(suppressed) = log.record(std::time::Instant::now()) {
                     tracing::warn!(
@@ -1756,6 +1831,7 @@ fn start_exporting(
     };
     #[cfg(not(test))]
     let queue = spawn_exporter(config, host, settings.retry, stop)?;
+    let health_interval = settings.health_interval;
     let filters: Arc<Filters> = Arc::default();
     let mut tracker = RunTracker::new();
     let held = Arc::clone(&filters);
@@ -1766,6 +1842,9 @@ fn start_exporting(
         tracker: Mutex::new(tracker),
         queue,
         dropped: Mutex::new(RateLimitedLog::new(ERROR_LOG_INTERVAL)),
+        dropped_total: std::sync::atomic::AtomicU64::new(0),
+        health_interval,
+        health: Mutex::new(super::health::Window::new(now_unix_nanos())),
         filters,
         clock: Mutex::default(),
         escape_held: tokio::sync::Notify::new(),
@@ -1810,6 +1889,13 @@ async fn run_ingest(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiver<C
     let mut usage_poll = tokio::time::interval(USAGE_POLL_INTERVAL);
     usage_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let usage_polling = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // `interval_at`: a plain interval's first tick is immediate, which would
+    // send an empty first interval at once.
+    let mut health = shared.health_interval.map(|every| {
+        let mut tick = tokio::time::interval_at(Instant::now() + every, every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick
+    });
     loop {
         #[cfg(test)]
         pause_at_command_gate(&shared, &commands).await;
@@ -1849,6 +1935,10 @@ async fn run_ingest(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiver<C
             _ = usage_poll.tick() => {
                 shared.poll_usage(&usage_polling);
                 shared.name_dispatched_runs();
+            }
+            () = next_tick(&mut health) => {
+                drain(&shared, &mut events, &mut read).await;
+                shared.sample_health();
             }
             msg = next_event(&mut events) => match msg {
                 Ok(msg) => {
@@ -1906,6 +1996,15 @@ async fn pause_at_command_gate(shared: &Shared, commands: &mpsc::UnboundedReceiv
     shared
         .command_gate_resumed
         .store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+async fn next_tick(tick: &mut Option<tokio::time::Interval>) {
+    match tick {
+        Some(tick) => {
+            tick.tick().await;
+        }
+        None => std::future::pending().await,
+    }
 }
 
 async fn sleep_until(due: Option<std::time::Instant>) {
@@ -2020,6 +2119,9 @@ fn apply(shared: &Arc<Shared>, command: Command) -> bool {
         }
         // Counted by `run_ingest`, in order with the broadcast.
         Command::HumanInput { .. } => {}
+        Command::DelegatePosted(posted) => {
+            shared.with_tracker(|t| t.delegate_posted(posted));
+        }
         #[cfg(test)]
         Command::Barrier(ack) => {
             // Once the runs ended before it are completed too.
@@ -6348,5 +6450,212 @@ mod tests {
             );
         }
         let _ = Attribute::str(AttrKey::RunId, "");
+    }
+
+    fn health_attr(span: &SpanRecord, key: AttrKey) -> Option<i64> {
+        match attr(span, key)? {
+            AttrValue::Int(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    fn some_span() -> SpanRecord {
+        SpanRecord {
+            trace_id: [1; 16],
+            span_id: [1; 8],
+            parent_span_id: None,
+            name: SPAN_AGENT_RUN,
+            start_unix_nanos: 1,
+            end_unix_nanos: 2,
+            attributes: Vec::new(),
+            events: Vec::new(),
+        }
+    }
+
+    /// Issue #1981 M8: `deck.telemetry.spans.dropped` is every span the
+    /// queue refused since the start, the health spans it refused included,
+    /// and is not reset between warnings or between samples.
+    #[tokio::test]
+    async fn dropped_spans_are_counted_exactly_across_health_samples() {
+        let (sink, mut rx) = mpsc::channel(2);
+        let telemetry = Telemetry::start_with(
+            &env(&ON),
+            Settings {
+                sink: Some(sink),
+                ..Settings::default()
+            },
+        );
+        let shared = &telemetry.exporting.as_ref().unwrap().shared;
+        // Two fit; three are refused.
+        shared.enqueue((0..5).map(|_| some_span()).collect());
+        // A health span sampled now says three, and is refused itself.
+        shared.sample_health();
+        let held = captured(&mut rx);
+        assert_eq!(held.len(), 2);
+        assert!(held.iter().all(|s| s.name == SPAN_AGENT_RUN));
+        // Room again: two samples in a row, each counting the refused one.
+        shared.sample_health();
+        shared.sample_health();
+        // The queue is full again: this sample is refused.
+        shared.sample_health();
+        let samples = captured(&mut rx);
+        let dropped: Vec<_> = samples
+            .iter()
+            .map(|s| {
+                assert_eq!(s.name, crate::telemetry::SPAN_DAEMON_HEALTH);
+                health_attr(s, AttrKey::SpansDropped)
+            })
+            .collect();
+        assert_eq!(dropped, vec![Some(4), Some(4)]);
+        shared.sample_health();
+        let next = captured(&mut rx);
+        assert_eq!(next.len(), 1);
+        assert_eq!(health_attr(&next[0], AttrKey::SpansDropped), Some(5));
+        // The interval of each sample starts where the last one ended.
+        assert_eq!(samples[1].start_unix_nanos, samples[0].end_unix_nanos);
+    }
+
+    /// Issue #1981 M8: the ingest task sends `daemon.health` on its interval,
+    /// counting the open runs and the latency of the hook events an agent
+    /// produced, never of one the daemon made itself.
+    #[tokio::test]
+    async fn health_is_sampled_on_its_interval_from_producer_events_only() {
+        let (sink, mut rx) = mpsc::channel(QUEUE_CAPACITY);
+        let telemetry = Arc::new(Telemetry::start_with(
+            &env(&ON),
+            Settings {
+                sink: Some(sink),
+                health_interval: Some(Duration::from_millis(50)),
+                ..Settings::default()
+            },
+        ));
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("p1", "a1"), &[]);
+        let mut produced = event("p1", EventType::Thinking);
+        produced.agent_id = Some("a1".into());
+        produced.timestamp = chrono::Utc::now() - chrono::Duration::milliseconds(1500);
+        tx.send(BroadcastMsg::Event(produced)).unwrap();
+        // The daemon's own: a shell's busy state.
+        tx.send(of("p1", "a1", EventType::ShellBusy)).unwrap();
+        telemetry.settled().await;
+        let applied = now_unix_nanos();
+        let mut health = Vec::new();
+        // Once an interval opened after the events were applied has been
+        // sent, the one they fell in has been too.
+        eventually("an interval after the events", || {
+            health.extend(
+                captured(&mut rx)
+                    .into_iter()
+                    .filter(|s| s.name == crate::telemetry::SPAN_DAEMON_HEALTH),
+            );
+            health.iter().any(|s| s.start_unix_nanos >= applied)
+        })
+        .await;
+        let count: i64 = health
+            .iter()
+            .map(|s| health_attr(s, AttrKey::HookLatencyCount).unwrap())
+            .sum();
+        assert_eq!(count, 1, "{health:?}");
+        let sampled = health
+            .iter()
+            .find(|s| health_attr(s, AttrKey::HookLatencyCount) == Some(1))
+            .unwrap();
+        assert!(health_attr(sampled, AttrKey::HookLatencyP50).unwrap() >= 1500);
+        assert!(
+            health
+                .iter()
+                .all(|s| health_attr(s, AttrKey::DaemonRunsOpen) == Some(1))
+        );
+    }
+
+    /// Issue #1981 M7: the delegate seam and the inbox's broadcast make one
+    /// `agent.handoff` through the whole exporter, in the orchestrator's
+    /// trace, carrying none of the task's text.
+    #[tokio::test]
+    async fn a_posted_task_becomes_a_handoff_through_the_broadcast() {
+        use crate::inbox::StateName;
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        let (tx, events) = broadcast::channel(16);
+        telemetry.subscribe(events);
+        begin(&telemetry, generation("orch", "oa"), &[]);
+        begin(&telemetry, generation("work", "wa"), &[]);
+        let notice = |pane: &str, id: &str, state| crate::event::InboxNotice {
+            pane_id: pane.into(),
+            agent_id: None,
+            message_id: id.into(),
+            subject: "SENTINEL-subject".into(),
+            from_label: "SENTINEL-label".into(),
+            state,
+            reason: None,
+            returned: false,
+            wake_stalled: false,
+            wake_update: false,
+            attention_update: false,
+            requeued: false,
+            provenance: None,
+            notices: Default::default(),
+        };
+        // The worker takes the task before telemetry hears of the post.
+        tx.send(BroadcastMsg::Inbox(notice(
+            "work",
+            "m-t",
+            StateName::Acknowledged,
+        )))
+        .unwrap();
+        crate::telemetry::observe_delegate_posted(
+            Some(Arc::clone(&telemetry)),
+            &crate::telemetry::DelegatePosted {
+                message_id: "m-t",
+                orchestrator_pane: "orch",
+                orchestrator_agent_id: Some("oa"),
+                worker_pane: "work",
+                worker_agent_id: "wa",
+                role: "coder",
+            },
+        );
+        let mut report = notice("orch", "m-r", StateName::Queued);
+        report.provenance = Some(crate::report_recovery::ReportProvenance::Task {
+            task_id: "m-t".into(),
+            report_id: "r".into(),
+            producer: crate::report_recovery::Producer {
+                pane_id: "work".into(),
+                agent_id: "wa".into(),
+                role: Some("coder".into()),
+            },
+        });
+        tx.send(BroadcastMsg::Inbox(report)).unwrap();
+        tx.send(BroadcastMsg::Inbox(notice(
+            "orch",
+            "m-r",
+            StateName::Acknowledged,
+        )))
+        .unwrap();
+        telemetry.settled().await;
+        let spans = captured(&mut rx);
+        let handoffs: Vec<_> = spans
+            .iter()
+            .filter(|s| s.name == crate::telemetry::SPAN_AGENT_HANDOFF)
+            .collect();
+        assert_eq!(handoffs.len(), 1, "{spans:?}");
+        let handoff = handoffs[0];
+        assert_eq!(
+            attr(handoff, AttrKey::HandoffOutcome),
+            Some(&AttrValue::Str("reported".into()))
+        );
+        assert_eq!(
+            handoff.events.iter().map(|e| e.name).collect::<Vec<_>>(),
+            vec![
+                crate::telemetry::EVENT_HANDOFF_TAKEN,
+                crate::telemetry::EVENT_HANDOFF_REPORTED
+            ]
+        );
+        telemetry.end_run("orch", Some("oa"), EndReason::Exited, None);
+        telemetry.settled().await;
+        let spans = captured(&mut rx);
+        let run = spans.iter().find(|s| s.name == SPAN_AGENT_RUN).unwrap();
+        assert_eq!(handoff.trace_id, run.trace_id);
+        assert_eq!(handoff.parent_span_id, Some(run.span_id));
+        assert!(!format!("{handoff:?}").contains("SENTINEL"));
     }
 }
