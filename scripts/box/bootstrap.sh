@@ -160,30 +160,54 @@ step "PATH for interactive, non-interactive and systemd --user processes"
 # The deck daemon is started over a non-interactive ssh session and every agent
 # inherits its PATH. Ubuntu's .bashrc returns early for non-interactive shells,
 # so this block goes at the TOP of it, before that guard.
-PATH_BLOCK="$(cat <<'EOF'
-# >>> dad-box PATH (scripts/box/bootstrap.sh) >>>
+# Every block is found by these exact lines and nothing else.
+PATH_OPEN='# >>> dad-box PATH (scripts/box/bootstrap.sh) >>>'
+PATH_CLOSE='# <<< dad-box PATH <<<'
+VALS_OPEN='# >>> dad-box USE_VALS (scripts/box/bootstrap.sh --use-vals) >>>'
+VALS_CLOSE='# <<< dad-box USE_VALS <<<'
+RELAY_OPEN='# >>> dad-box RELAY (scripts/box/bootstrap.sh --relay) >>>'
+RELAY_CLOSE='# <<< dad-box RELAY <<<'
+PATH_BLOCK="$PATH_OPEN
+$(cat <<'EOF'
 for d in /nix/var/nix/profiles/default/bin "$HOME/.local/share/devbox/global/default/.devbox/nix/profile/default/bin" "$HOME/.opencode/bin" "$HOME/.local/bin"; do
   case ":$PATH:" in *":$d:"*) ;; *) [ -d "$d" ] && PATH="$d:$PATH" ;; esac
 done
 export PATH
-# <<< dad-box PATH <<<
 EOF
-)"
+)
+$PATH_CLOSE"
 touch "$HOME/.bashrc"
-# The option blocks below are found by their markers, and everything from an
-# opening marker to its close is replaced, so check every one of them before
-# this layer writes anything, whichever flags were given. A block left open, a
-# stray close or a close of the other kind stops the run here, because skipping
-# to the end of the file would drop whatever follows the marker.
-if ! awk -v file="$HOME/.bashrc" '
+# The option blocks below are found by their markers, everything from an
+# opening marker to its close is replaced, and they are written back after the
+# PATH block's close, so check every marker before this layer writes anything,
+# whichever flags were given. A block left open, a stray close, a close of
+# another kind or a second PATH block stops the run here, because skipping to
+# the end of the file would drop whatever follows the marker. So does a line
+# that starts like a marker (in any case, with spaces or tabs around its `#` and
+# arrows) but is not exactly one of the six above, trailing whitespace or a CRLF
+# ending included, since the rewrite would read it as ordinary text.
+if ! awk -v file="$HOME/.bashrc" \
+    -v po="$PATH_OPEN" -v pc="$PATH_CLOSE" -v vo="$VALS_OPEN" -v vc="$VALS_CLOSE" -v ro="$RELAY_OPEN" -v rc="$RELAY_CLOSE" '
   function fail(msg) { print "bootstrap.sh: " file ": " msg > "/dev/stderr"; bad = 1; exit 1 }
-  /^# >>> dad-box (USE_VALS|RELAY)/ {
-    if (open != "") fail("the dad-box " open " block opened on line " at " has no closing marker before line " NR)
-    open = $4; at = NR; next
+  BEGIN {
+    kind[po] = "PATH"; kind[vo] = "USE_VALS"; kind[ro] = "RELAY"; opens[po] = opens[vo] = opens[ro] = 1
+    kind[pc] = "PATH"; kind[vc] = "USE_VALS"; kind[rc] = "RELAY"
   }
-  /^# <<< dad-box (USE_VALS|RELAY)/ {
-    if (open == "") fail("line " NR " closes a dad-box " $4 " block that no marker opened")
-    if ($4 != open) fail("the dad-box " open " block opened on line " at " is closed by a dad-box " $4 " marker on line " NR)
+  tolower($0) ~ /^[ \t]*#[ \t]*(>>>|<<<)[ \t]*dad-box/ {
+    if (!($0 in kind)) {
+      why = ""; if ($0 ~ /[ \t\r]$/) why = " (it ends in whitespace or a carriage return)"
+      shown = $0; gsub(/\r/, "\\r", shown)
+      fail("line " NR " looks like a dad-box marker but is not one this script writes" why ": " shown)
+    }
+    k = kind[$0]
+    if ($0 in opens) {
+      if (open != "") fail("the dad-box " open " block opened on line " at " has no closing marker before line " NR)
+      if (k == "PATH" && path_at) fail("line " NR " opens a second dad-box PATH block; the first opened on line " path_at)
+      if (k == "PATH") path_at = NR
+      open = k; at = NR; next
+    }
+    if (open == "") fail("line " NR " closes a dad-box " k " block that no marker opened")
+    if (k != open) fail("the dad-box " open " block opened on line " at " is closed by a dad-box " k " marker on line " NR)
     open = ""
   }
   END {
@@ -194,7 +218,7 @@ if ! awk -v file="$HOME/.bashrc" '
   echo "bootstrap.sh: left $HOME/.bashrc unchanged; fix or delete that block by hand, then re-run" >&2
   exit 1
 fi
-if ! grep -qF '# >>> dad-box PATH' "$HOME/.bashrc"; then
+if ! grep -qxF "$PATH_OPEN" "$HOME/.bashrc"; then
   # A copy that fails part-way is removed and ~/.bashrc is left as it was.
   if ! { printf '%s\n\n' "$PATH_BLOCK" && cat "$HOME/.bashrc"; } > "$HOME/.bashrc.dad-box"; then
     rm -f "$HOME/.bashrc.dad-box"
@@ -211,39 +235,35 @@ fi
 # (the repository's .env, or an export further down ~/.bashrc). Each sits in its
 # own marked block right after the PATH block, and they are rewritten in place.
 OPTION_BLOCKS=()
-if [ "$USE_VALS_FLAG" = 1 ] || grep -qF '# >>> dad-box USE_VALS' "$HOME/.bashrc"; then
+if [ "$USE_VALS_FLAG" = 1 ] || grep -qxF "$VALS_OPEN" "$HOME/.bashrc"; then
   USE_VALS_FLAG=1
-  OPTION_BLOCKS+=("$(cat <<'EOF'
-# >>> dad-box USE_VALS (scripts/box/bootstrap.sh --use-vals) >>>
+  OPTION_BLOCKS+=("$VALS_OPEN
 export USE_VALS=true
-# <<< dad-box USE_VALS <<<
-EOF
-)")
+$VALS_CLOSE")
 fi
-if [ "$RELAY_FLAG" = 1 ] || grep -qF '# >>> dad-box RELAY' "$HOME/.bashrc"; then
+if [ "$RELAY_FLAG" = 1 ] || grep -qxF "$RELAY_OPEN" "$HOME/.bashrc"; then
   RELAY_FLAG=1
-  OPTION_BLOCKS+=("$(cat <<EOF
-# >>> dad-box RELAY (scripts/box/bootstrap.sh --relay) >>>
+  OPTION_BLOCKS+=("$RELAY_OPEN
 export OTEL_EXPORTER_OTLP_ENDPOINT=$RELAY_ENDPOINT
-# <<< dad-box RELAY <<<
-EOF
-)")
+$RELAY_CLOSE")
 fi
 if [ ${#OPTION_BLOCKS[@]} -gt 0 ]; then
   # Drops any earlier copy of the blocks and the blank lines around them, then
   # writes them back after the PATH block, so a re-run leaves the file unchanged.
   # The markers were checked at the top of this layer, so every opening marker
-  # here has its own close. A rewrite that fails part-way leaves the blocks in
-  # ~/.bashrc as they were and removes its partial copy; a PATH block this run
-  # added just above stays, so the file is not always byte-identical.
-  if ! awk -v block="$(printf '%s\n\n' "${OPTION_BLOCKS[@]}")" '
-    /^# >>> dad-box (USE_VALS|RELAY)/ { open = 1; next }
-    /^# <<< dad-box (USE_VALS|RELAY)/ { open = 0; next }
+  # here has its own close and there is exactly one PATH close to write after.
+  # A rewrite that fails part-way leaves the blocks in ~/.bashrc as they were
+  # and removes its partial copy; a PATH block this run added just above stays,
+  # so the file is not always byte-identical.
+  if ! awk -v block="$(printf '%s\n\n' "${OPTION_BLOCKS[@]}")" \
+      -v pc="$PATH_CLOSE" -v vo="$VALS_OPEN" -v vc="$VALS_CLOSE" -v ro="$RELAY_OPEN" -v rc="$RELAY_CLOSE" '
+    $0 == vo || $0 == ro { open = 1; next }
+    $0 == vc || $0 == rc { open = 0; next }
     open { next }
     gap && /^$/ { next }
     gap { print ""; gap = 0 }
     { print }
-    /^# <<< dad-box PATH/ { print ""; print block; gap = 1 }
+    $0 == pc { print ""; print block; gap = 1 }
   ' "$HOME/.bashrc" > "$HOME/.bashrc.dad-box"; then
     rm -f "$HOME/.bashrc.dad-box"
     echo "bootstrap.sh: could not rewrite the dad-box blocks in $HOME/.bashrc and left them as they were (a dad-box PATH block added by this run stays); fix the cause above, then re-run" >&2
@@ -279,7 +299,7 @@ elif [ "$(systemctl --user show-environment 2>/dev/null | sed -n 's/^OTEL_EXPORT
   systemctl --user unset-environment OTEL_EXPORTER_OTLP_ENDPOINT || true
 fi
 # shellcheck source=/dev/null
-eval "$(sed -n '/# >>> dad-box PATH/,/# <<< dad-box PATH/p' "$HOME/.bashrc")"
+eval "$(awk -v po="$PATH_OPEN" -v pc="$PATH_CLOSE" '$0 == po { on = 1 } on { print } $0 == pc { on = 0 }' "$HOME/.bashrc")"
 
 # -------- 5. agents and the deck --------------------------------------------
 
