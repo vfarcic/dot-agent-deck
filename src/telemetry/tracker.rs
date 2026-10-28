@@ -101,10 +101,11 @@ pub const MAX_SEEN_CALL_IDS: usize = 256;
 
 /// Changes to whether a prompt is open that one run remembers, newest kept,
 /// so input is read against the prompt in force when it was written rather
-/// than when the tracker counts it. Input is counted within moments of being
-/// written, and a prompt opens and closes at a person's pace, so this covers
-/// far more than that delay ever spans. Input older than every change kept
-/// is read against the oldest state kept.
+/// than when the tracker counts it. Input is usually counted within moments
+/// of being written, and a prompt opens and closes at a person's pace, so this
+/// usually covers that delay many times over; an ingest task starved for long
+/// enough can still fall further behind. Input older than every change kept is
+/// read against the oldest state kept.
 pub const MAX_PROMPT_CHANGES: usize = 64;
 
 /// The event metadata key carrying the agent's id for one tool call, which
@@ -385,8 +386,13 @@ impl ActiveRun {
             .map_or(self.prompt_before, |(_, open)| *open)
     }
 
-    /// Record, at `at`, whether a prompt is open now, when that changed.
-    fn note_prompt(&mut self, at: u64) {
+    /// Record whether a prompt is open now, when that changed: at `at`, when
+    /// the event saying so was stamped, unless that is earlier than the last
+    /// change kept — an event delivered out of order, or a producer clock
+    /// behind — and then at `now`, when the tracker applies it. A change is
+    /// never placed before one already kept, which would close the interval
+    /// that held input written since.
+    fn note_prompt(&mut self, at: u64, now: u64) {
         let open = self.prompt_open_now();
         let last = self
             .prompt_changes
@@ -396,7 +402,10 @@ impl ActiveRun {
             return;
         }
         // Times only move forward, so the search above finds the latest.
-        let at = self.prompt_changes.back().map_or(at, |(t, _)| at.max(*t));
+        let at = match self.prompt_changes.back() {
+            Some(&(last, _)) if at < last => now.max(last),
+            _ => at,
+        };
         if self.prompt_changes.len() >= MAX_PROMPT_CHANGES
             && let Some((_, oldest)) = self.prompt_changes.pop_front()
         {
@@ -732,7 +741,7 @@ impl RunTracker {
             .timestamp_nanos_opt()
             .and_then(|t| u64::try_from(t).ok())
             .map_or(now, |t| t.min(now));
-        run.note_prompt(happened);
+        run.note_prompt(happened, now);
         // The daemon answered a question for a person in the deck's question
         // UI. The answer is theirs, whether or not the deck typed it.
         if event
@@ -1709,6 +1718,43 @@ pub(crate) mod tests {
             kinds_at_end(&mut tracker, "p1", 20),
             (vec!["answer".to_string()], 1)
         );
+    }
+
+    /// A status stamped before the last prompt change kept — delivered out
+    /// of order, or from a producer clock that fell behind — is placed when
+    /// the tracker applies it, not before that change: input written while
+    /// the prompt was open, and taken only after, is still an answer.
+    #[test]
+    fn a_status_stamped_before_the_last_change_does_not_erase_the_prompt() {
+        for (case, close_stamp) in [
+            // Delivered after the prompt, though stamped just before it.
+            ("out of order", 99),
+            // The producer's clock fell well behind between the two.
+            ("lagging clock", 40),
+        ] {
+            let mut tracker = RunTracker::new();
+            tracker.begin_run(start("p1"), 0);
+            tracker.observe_event(&event("p1", EventType::SessionStart), 1);
+            let mut prompt = event("p1", EventType::PermissionRequest);
+            prompt.timestamp = chrono::DateTime::from_timestamp_nanos(100);
+            tracker.observe_event(&prompt, 100);
+            // Written at 101; the ingest task has not taken it yet.
+            let mut thinking = event("p1", EventType::Thinking);
+            thinking.timestamp = chrono::DateTime::from_timestamp_nanos(close_stamp);
+            tracker.observe_event(&thinking, 102);
+            let run = &tracker.runs["p1"];
+            assert_eq!(
+                run.prompt_changes,
+                VecDeque::from([(100, true), (102, false)]),
+                "{case}"
+            );
+            tracker.observe_human_input("p1", 101, InterventionKind::Text);
+            assert_eq!(
+                kinds_at_end(&mut tracker, "p1", 110),
+                (vec!["answer".to_string()], 1),
+                "{case}"
+            );
+        }
     }
 
     /// The changes kept are bounded; input older than every one kept is

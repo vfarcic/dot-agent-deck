@@ -60,7 +60,7 @@ use super::accounting::run_usage::{UsageDirs, UsageFile};
 use super::accounting::usage_file::USAGE_FILE_ENV;
 use super::accounting::{UsageSource, locate, usage_source};
 use super::config::{EnvMap, TelemetryConfig, redacted_endpoint};
-use super::input::{InputFilter, InterventionKind, LONE_ESCAPE_WINDOW};
+use super::input::{InputFilter, InterventionKind, LONE_ESCAPE_WINDOW, PASTE_IDLE_WINDOW};
 use super::launch::LAUNCH_ENV_KEYS;
 use super::propagation::{RunIdentity, agent_env};
 use super::resource::{ResourceAttribute, deck_resource, host_name};
@@ -415,6 +415,10 @@ struct PaneInput {
     /// When the lone `ESC` the filter holds arrived — monotonic, for the
     /// window, and wall-clock, for the intervention it may become.
     escape: Option<(std::time::Instant, u64)>,
+    /// When the last write that left the filter inside a bracketed paste
+    /// arrived, monotonic: the paste is read as ended once
+    /// [`PASTE_IDLE_WINDOW`] passes with no write after it.
+    paste: Option<std::time::Instant>,
     /// When the human input the filter accepted and the tracker has not
     /// counted yet was written, and what it was, oldest first. Taken, once,
     /// by whichever comes first: the [`Command::HumanInput`] sent with the
@@ -847,6 +851,7 @@ impl Telemetry {
                     ended: false,
                     filter: InputFilter::new(),
                     escape: None,
+                    paste: None,
                     pending: Vec::new(),
                 });
             // Sent before the filters are unlocked, so no notice of input to
@@ -913,8 +918,20 @@ impl Telemetry {
                     human.push((written, InterventionKind::Interrupt));
                 }
             }
+            // A paste with no input for its window lost its end marker.
+            if input
+                .paste
+                .is_some_and(|since| at.saturating_duration_since(since) >= PASTE_IDLE_WINDOW)
+            {
+                input.filter.end_paste();
+            }
             if let Some(kind) = input.filter.classify(bytes) {
                 human.push((now, kind));
+            }
+            if !input.filter.in_paste() {
+                input.paste = None;
+            } else if !bytes.is_empty() {
+                input.paste = Some(at);
             }
             // A non-empty write leaving a lone ESC held ended with it.
             if !input.filter.holds_lone_escape() {
@@ -3260,6 +3277,41 @@ mod tests {
                 intervention_kinds(&captured(&mut rx)),
                 vec![AttrValue::Str(expected.into())],
                 "{before:?} then {after:?}"
+            );
+        }
+    }
+
+    /// A paste whose end marker never comes is read as ended once
+    /// [`PASTE_IDLE_WINDOW`] passes with no input: what follows is its own
+    /// kind. Writes that keep coming within the window keep the paste going,
+    /// however long it runs in all.
+    #[tokio::test]
+    async fn a_paste_with_no_input_for_its_window_is_read_as_ended() {
+        for (agent, gap, expected) in [
+            ("a1", PASTE_IDLE_WINDOW, ["paste", "text", "interrupt"]),
+            (
+                "a2",
+                PASTE_IDLE_WINDOW - Duration::from_millis(1),
+                ["paste", "paste", "paste"],
+            ),
+        ] {
+            let (telemetry, mut rx) = capturing(ProbeSettings::default());
+            begin(&telemetry, generation("p1", agent), &[]);
+            telemetry.settled().await;
+            let at = std::time::Instant::now();
+            // Written in separate bursts, so each write's kind is its own.
+            let written = now_unix_nanos();
+            let apart = 2 * crate::telemetry::tracker::INTERVENTION_COALESCE_NANOS;
+            telemetry.observe_client_input_at("p1", b"\x1b[200~abc", written, at);
+            telemetry.observe_client_input_at("p1", b"def", written + apart, at + gap);
+            telemetry.observe_client_input_at("p1", b"\x03", written + 2 * apart, at + 2 * gap);
+            telemetry.settled().await;
+            telemetry.end_run("p1", Some(agent), EndReason::Exited, None);
+            telemetry.settled().await;
+            assert_eq!(
+                intervention_kinds(&captured(&mut rx)),
+                expected.map(|kind| AttrValue::Str(kind.into())),
+                "{gap:?}"
             );
         }
     }

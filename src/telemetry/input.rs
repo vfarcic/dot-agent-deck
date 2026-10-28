@@ -24,7 +24,10 @@
 //! from the bytes alone and never by keeping them: a key that interrupts, a
 //! bracketed paste, text, or a key that only moves around. Everything between
 //! a bracketed paste's `ESC[200~` and `ESC[201~` is the paste, whatever bytes
-//! it holds — a pasted `0x03` is not Ctrl+C — up to [`MAX_PASTE_BYTES`].
+//! it holds and however long it is — a pasted `0x03` is not Ctrl+C. A paste
+//! whose `ESC[201~` never comes is ended by whoever feeds the filter, with
+//! [`InputFilter::end_paste`], once [`PASTE_IDLE_WINDOW`] has passed with no
+//! input at all.
 
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
@@ -41,12 +44,15 @@ pub const MAX_OSC_BODY: usize = 1024;
 /// enough that the key is counted at once. A report whose remainder arrives
 /// later than this is counted as a person's input.
 pub const LONE_ESCAPE_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
-/// Bytes of a bracketed paste read as the paste while its `ESC[201~` has not
-/// arrived. Only a count is held, never the bytes. A paste that runs past it
-/// is read as ended there, and what follows is classified on its own, so a
-/// terminal that never sends the end marker cannot hold every later key —
-/// Ctrl+C included — as a paste.
-pub const MAX_PASTE_BYTES: usize = 1 << 20;
+/// How long a bracketed paste whose `ESC[201~` has not arrived waits with no
+/// input at all before it is read as ended, so a client that never sends the
+/// end marker — one that died mid-paste, say — cannot hold every later key,
+/// Ctrl+C included, as a paste. A terminal sends a paste as fast as the pane
+/// accepts it, so a gap inside one is the agent not reading its input; this
+/// is far longer than an agent usually stalls under load, and a person who
+/// keeps typing after a lost end marker is read correctly again from the
+/// first key after a pause this long. Its length bounds no memory: the filter holds no paste bytes.
+pub const PASTE_IDLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// What a person's input was, as `deck.intervention.kind` names it. Ordered
 /// by precedence: the strongest kind seen in a burst of input is the burst's.
@@ -84,6 +90,8 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 /// character — F13 and up, the keypad, media and modifier keys — in a CSI-u
 /// report: Unicode's Private Use Area.
 const KITTY_FUNCTIONAL_KEYS: std::ops::RangeInclusive<u32> = 57344..=63743;
+/// The keypad's Delete key in the kitty keyboard protocol.
+const KITTY_KEYPAD_DELETE: u32 = 57426;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 enum State {
@@ -101,9 +109,9 @@ enum State {
     /// After `ESC O`, already counted: a cursor key in application mode
     /// (`ESC O A`) ends with the next byte.
     Ss3,
-    /// Inside a bracketed paste: the bytes of it so far, and how many of
-    /// [`PASTE_END`] the last of them match.
-    Paste { len: usize, matched: usize },
+    /// Inside a bracketed paste: how many of [`PASTE_END`] its last bytes
+    /// match.
+    Paste(usize),
     /// After `ESC` and the first byte of a multibyte UTF-8 character: Alt
     /// with that character, this many bytes still to come.
     AltChar(u8),
@@ -153,6 +161,21 @@ impl InputFilter {
         self.state == State::Esc
     }
 
+    /// Whether the filter is inside a bracketed paste whose end marker has
+    /// not arrived.
+    pub fn in_paste(&self) -> bool {
+        matches!(self.state, State::Paste(_))
+    }
+
+    /// Read a bracketed paste whose end marker has not arrived as ended:
+    /// what comes next is classified on its own. Nothing changes when the
+    /// filter is not inside one.
+    pub fn end_paste(&mut self) {
+        if self.in_paste() {
+            self.state = State::Ground;
+        }
+    }
+
     /// Read a held lone `ESC` as the Escape key — an
     /// [`InterventionKind::Interrupt`]: `true`, and the filter is back between
     /// sequences. `false`, and nothing changes, when something
@@ -194,11 +217,11 @@ impl InputFilter {
                 }
                 // Alt+Enter: a newline.
                 b'\r' | b'\n' => Some(Text),
-                // Alt with a character beyond ASCII, which shells bind to
-                // nothing: the character, as one key, whatever its length.
+                // Alt with a character beyond ASCII: one key, whatever its
+                // length, a shortcut like Alt+x.
                 0xc2..=0xf4 => {
                     self.state = State::AltChar(utf8_continuations(b));
-                    Some(Text)
+                    Some(Navigate)
                 }
                 // Alt+key and the like.
                 _ => Some(Navigate),
@@ -210,7 +233,7 @@ impl InputFilter {
                     } else {
                         Some(match (params.as_slice(), b) {
                             (b"200", b'~') => {
-                                self.state = State::Paste { len: 0, matched: 0 };
+                                self.state = State::Paste(0);
                                 Paste
                             }
                             // An X10 mouse report: three raw bytes follow.
@@ -263,7 +286,7 @@ impl InputFilter {
                     self.step(b)
                 }
             }
-            State::Paste { len, matched } => {
+            State::Paste(matched) => {
                 let matched = if b == PASTE_END[matched] {
                     matched + 1
                 } else if b == PASTE_END[0] {
@@ -271,12 +294,9 @@ impl InputFilter {
                 } else {
                     0
                 };
-                // Ended, or at the bound: what follows is not the paste.
-                if matched < PASTE_END.len() && len + 1 < MAX_PASTE_BYTES {
-                    self.state = State::Paste {
-                        len: len + 1,
-                        matched,
-                    };
+                // Ended: what follows is not the paste.
+                if matched < PASTE_END.len() {
+                    self.state = State::Paste(matched);
                 }
                 Some(Paste)
             }
@@ -285,7 +305,7 @@ impl InputFilter {
                     if left > 1 {
                         self.state = State::AltChar(left - 1);
                     }
-                    Some(Text)
+                    Some(Navigate)
                 } else {
                     // Not UTF-8 after all: the character ended before it.
                     self.step(b)
@@ -333,12 +353,14 @@ fn csi_u_kind(params: &[u8]) -> InterventionKind {
         let field = field?.split(|&b| b == b':').next()?;
         std::str::from_utf8(field).ok()?.parse().ok()
     };
-    let code = number(fields.next());
+    let code = number(fields.next()).map(|c| keypad_as_main(c).unwrap_or(c));
     // The modifiers are sent plus one: 1 is none; bit 2 is Alt, bit 4 Ctrl.
     let modifiers = number(fields.next()).unwrap_or(1).saturating_sub(1);
     let ctrl = modifiers & 4 != 0;
     let alt = modifiers & 2 != 0;
     match code {
+        // The keypad's Delete, as `ESC[3~` is.
+        Some(KITTY_KEYPAD_DELETE) if modifiers == 0 => InterventionKind::Text,
         Some(c) if KITTY_FUNCTIONAL_KEYS.contains(&c) => InterventionKind::Navigate,
         Some(27) => InterventionKind::Interrupt,
         Some(c) if ctrl && (c == u32::from(b'c') || c == u32::from(b'C')) => {
@@ -350,6 +372,25 @@ fn csi_u_kind(params: &[u8]) -> InterventionKind {
         }
         _ => InterventionKind::Navigate,
     }
+}
+
+/// The code the same key has off the keypad, for a kitty keyboard protocol
+/// keypad code that crossterm reads as a character or Enter: keypad 1 is `1`,
+/// keypad Enter is Enter. `None` for every other code.
+fn keypad_as_main(code: u32) -> Option<u32> {
+    let key = match code {
+        57399..=57408 => char::from_digit(code - 57399, 10)?,
+        57409 => '.',
+        57410 => '/',
+        57411 => '*',
+        57412 => '-',
+        57413 => '+',
+        57414 => '\r',
+        57415 => '=',
+        57416 => ',',
+        _ => return None,
+    };
+    Some(u32::from(key))
 }
 
 /// Whether `ESC [ <params> <fin>` is a report a terminal sends unasked: focus
@@ -630,32 +671,63 @@ mod tests {
         assert_eq!(filter.classify(b"\x03"), Some(InterventionKind::Interrupt));
     }
 
-    /// A paste whose end marker never comes is read as ended after
-    /// [`MAX_PASTE_BYTES`], holding nothing, and the next key is its own.
+    /// A paste stays the paste until its end marker, however long it is: a
+    /// Ctrl+C byte past the first MiB of it is pasted text, whole or in
+    /// writes.
     #[test]
-    fn an_unterminated_paste_ends_at_the_bound() {
+    fn a_large_paste_is_a_paste_until_its_end_marker() {
+        let mut frame = b"\x1b[200~".to_vec();
+        frame.extend(std::iter::repeat_n(b'a', (1 << 20) + 1));
+        frame.push(0x03);
+        frame.extend_from_slice(b"\x1b\x1b[A");
+        frame.extend_from_slice(PASTE_END);
+        assert_eq!(kind_of(&frame), Some(InterventionKind::Paste));
+
         let mut filter = InputFilter::new();
-        assert_eq!(filter.classify(b"\x1b[200~"), Some(InterventionKind::Paste));
-        assert_eq!(
-            filter.classify(&vec![b'a'; MAX_PASTE_BYTES - 1]),
-            Some(InterventionKind::Paste)
-        );
-        assert!(filter.is_holding(), "one byte short of the bound");
-        assert_eq!(filter.classify(b"\x03"), Some(InterventionKind::Paste));
-        assert!(!filter.is_holding());
+        for write in frame.chunks(4096) {
+            assert_eq!(filter.classify(write), Some(InterventionKind::Paste));
+        }
+        assert!(!filter.in_paste());
         assert_eq!(filter.classify(b"\x03"), Some(InterventionKind::Interrupt));
     }
 
+    /// A paste whose end marker has not come is ended by
+    /// [`InputFilter::end_paste`]: the next key is its own. Ending nothing
+    /// changes nothing.
+    #[test]
+    fn end_paste_ends_an_unterminated_paste() {
+        let mut filter = InputFilter::new();
+        assert_eq!(
+            filter.classify(b"\x1b[200~ab\x1b[20"),
+            Some(InterventionKind::Paste)
+        );
+        assert!(filter.in_paste());
+        assert_eq!(filter.classify(b"\x03"), Some(InterventionKind::Paste));
+        filter.end_paste();
+        assert!(!filter.in_paste());
+        assert!(!filter.is_holding());
+        assert_eq!(filter.classify(b"\x03"), Some(InterventionKind::Interrupt));
+
+        let mut filter = InputFilter::new();
+        assert!(!filter.feed(b"\x1b[24;"));
+        filter.end_paste();
+        assert!(filter.is_holding(), "a report in progress is left alone");
+        assert!(!filter.feed(b"80R"));
+    }
+
     /// Keys the kitty keyboard protocol reports by a Private Use Area code —
-    /// F13 and up, the keypad, media and modifier keys — only move around.
+    /// F13 and up, the keypad's arrows and Insert, media and modifier keys —
+    /// only move around.
     #[test]
     fn kitty_functional_keys_are_navigation() {
         for frame in [
             &b"\x1b[57344u"[..],
             b"\x1b[57376u",
             b"\x1b[57419u",
+            b"\x1b[57425u",
+            b"\x1b[57427u",
             b"\x1b[57441;2u",
-            b"\x1b[57399:57399;1u",
+            b"\x1b[57426;5u",
             b"\x1b[63743u",
         ] {
             assert_kind_however_split(frame, InterventionKind::Navigate);
@@ -666,22 +738,48 @@ mod tests {
         assert_eq!(kind_of(b"\x1b[63744u"), Some(InterventionKind::Text));
     }
 
-    /// Alt with a character beyond ASCII is that character, one key, however
-    /// many bytes it takes and however they are split.
+    /// The keypad's keys crossterm reads as a character, Enter or Delete are
+    /// the kind the same key is off the keypad, modifiers included.
     #[test]
-    fn alt_with_a_multibyte_character_is_one_text_key() {
+    fn kitty_keypad_characters_are_their_main_keys() {
+        use InterventionKind::*;
+        for (keypad, main, expected) in [
+            (&b"\x1b[57399u"[..], &b"0"[..], Text),
+            (b"\x1b[57400u", b"1", Text),
+            (b"\x1b[57408u", b"9", Text),
+            (b"\x1b[57409u", b".", Text),
+            (b"\x1b[57413;2u", b"\x1b[43;2u", Text),
+            (b"\x1b[57414u", b"\r", Text),
+            (b"\x1b[57414;2u", b"\x1b[13;2u", Text),
+            (b"\x1b[57416u", b",", Text),
+            (b"\x1b[57426u", b"\x1b[3~", Text),
+            (b"\x1b[57400;5u", b"\x1b[49;5u", Navigate),
+            (b"\x1b[57400;3u", b"\x1b[49;3u", Navigate),
+        ] {
+            assert_eq!(kind_of(main), Some(expected), "{main:?}");
+            assert_kind_however_split(keypad, expected);
+        }
+    }
+
+    /// Alt with a character beyond ASCII is one key, however many bytes it
+    /// takes and however they are split, and a shortcut, as Alt+x is and as
+    /// the same key is in the kitty keyboard protocol.
+    #[test]
+    fn alt_with_a_multibyte_character_is_one_navigation_key() {
         for ch in ["é", "ü", "€", "😀"] {
             let mut frame = b"\x1b".to_vec();
             frame.extend_from_slice(ch.as_bytes());
-            assert_kind_however_split(&frame, InterventionKind::Text);
+            assert_kind_however_split(&frame, InterventionKind::Navigate);
         }
+        assert_eq!(kind_of(b"\x1b[252;3u"), Some(InterventionKind::Navigate));
         // A lead byte with no continuation ends there; what follows is its
         // own.
         assert_eq!(kind_of(b"\x1b\xc3\x03"), Some(InterventionKind::Interrupt));
+        assert_eq!(kind_of(b"\x1b\xc3a"), Some(InterventionKind::Text));
         let mut filter = InputFilter::new();
         assert_eq!(
             filter.classify(b"\x1b\xc3\x1b[A"),
-            Some(InterventionKind::Text)
+            Some(InterventionKind::Navigate)
         );
         assert!(!filter.is_holding());
     }
