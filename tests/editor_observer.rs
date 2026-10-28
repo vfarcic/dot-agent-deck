@@ -13,9 +13,9 @@ use std::time::{Duration, Instant};
 
 use dot_agent_deck::composer_probe::epoch::GenerationInput;
 use dot_agent_deck::composer_probe::observe::{
-    ControlOp, ControlRefusal, ControlStep, E2_AFTER, Evidence, Page, Pool, READ_DEADLINE, Seam,
-    Slot, TestLiability, drain_ready, e2_due, marker_observation, outcome, report,
-    scan_observation,
+    Bell, ControlOp, ControlRefusal, ControlStep, E2_AFTER, Evidence, Page, Pool, READ_DEADLINE,
+    Seam, Slot, TestLiability, birth_floor, drain_ready, e2_due, marker_observation, outcome,
+    report, scan_observation,
 };
 use dot_agent_deck::composer_probe::record::{
     Attribution, Cause, Decision, EcPolicy, Marker, NotConsumed, NotOwned, RecordKey, Recorded,
@@ -662,4 +662,119 @@ fn probe_069_a_clean_report_records_no_frontier() {
         s.input().writer_scope().unwrap().state(),
         ScopeState::Open(_)
     ));
+}
+
+/// Scenario: Convert start ticks to a birth floor: 250 ticks at 100 per second with the boot clock at 3 s is 0.5 s before now, a start after the boot clock's reading or a zero tick rate gives none. Drop an `Unarmed` and an `Armed` observation through the identity refusal: the first opens the writer scope and the second doesn't, neither makes a record, and after retirement the refusal is stale. Drain a tool's helper and prune it: it goes with its exit facts, and an unsettled one stays. Ring a bell: a scan asked for is taken once, and a thread parked on it wakes.
+#[spec("inbox/probe/069")]
+#[test]
+fn probe_069_the_floor_the_refusal_the_prune_and_the_bell() {
+    let now = Instant::now();
+    assert_eq!(
+        birth_floor(250, 100, now, 3_000_000_000),
+        Some(now - Duration::from_millis(500))
+    );
+    assert_eq!(
+        birth_floor(250, 100, now, 2_000_000_000),
+        None,
+        "after the clock"
+    );
+    assert_eq!(birth_floor(250, 0, now, 3_000_000_000), None);
+
+    let mut s = seam(Permission::Armable);
+    s.refused(
+        dot_agent_deck::composer_probe::record::Channel::Marker,
+        Some(Decision::Armed),
+        None,
+        now,
+    )
+    .unwrap();
+    assert_eq!(
+        s.input().writer_scope().unwrap().state(),
+        ScopeState::Closed
+    );
+    s.refused(
+        dot_agent_deck::composer_probe::record::Channel::Ipc,
+        Some(Decision::Unarmed),
+        Some(dot_agent_deck::composer_probe::record::Claim::Owned),
+        now,
+    )
+    .unwrap();
+    assert!(matches!(
+        s.input().writer_scope().unwrap().state(),
+        ScopeState::Open(_)
+    ));
+    assert!(s.input().record(key(1)).is_none());
+
+    let tool = request(ComposerDecision::Tool, Some(ComposerClaim::Tool));
+    s.invocation(
+        &tool,
+        Some(evidence(2, Attribution::NotOwned(NotOwned::Tool), None)),
+        now,
+    );
+    s.observe(&scan_observation(G, key(3), Attribution::Owned, now), now)
+        .unwrap();
+    assert_eq!(s.prune(key(2), true, now), Ok(None), "not exited yet");
+    s.exit(key(2), now, now).unwrap();
+    s.drained(key(2), now).unwrap();
+    let fact = s
+        .prune(key(2), true, now)
+        .unwrap()
+        .expect("pruned with its facts");
+    assert_eq!(fact.key, key(2));
+    assert!(s.input().record(key(2)).is_none());
+    s.exit(key(3), now, now).unwrap();
+    s.drained(key(3), now).unwrap();
+    assert_eq!(
+        s.prune(key(3), true, now),
+        Ok(None),
+        "its completion is pending"
+    );
+    assert!(s.input().record(key(3)).is_some());
+    s.input().retire();
+    assert_eq!(
+        s.refused(
+            dot_agent_deck::composer_probe::record::Channel::Scan,
+            None,
+            None,
+            now
+        ),
+        Err(Refusal::Stale)
+    );
+
+    let bell = Arc::new(Bell::default());
+    assert!(!bell.take_scan());
+    bell.ring_scan();
+    assert!(bell.take_scan());
+    assert!(!bell.take_scan(), "taken once");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let parked = std::thread::spawn(move || {
+        tx.send(()).unwrap();
+        let started = Instant::now();
+        std::thread::park_timeout(Duration::from_secs(5));
+        started.elapsed()
+    });
+    rx.recv().unwrap();
+    bell.bind(parked.thread().clone());
+    std::thread::sleep(Duration::from_millis(20));
+    bell.ring();
+    assert!(
+        parked.join().unwrap() < Duration::from_secs(4),
+        "rung awake"
+    );
+    let scanned = Arc::new(Bell::default());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let parked = std::thread::spawn(move || {
+        tx.send(()).unwrap();
+        let started = Instant::now();
+        std::thread::park_timeout(Duration::from_secs(5));
+        started.elapsed()
+    });
+    rx.recv().unwrap();
+    scanned.bind(parked.thread().clone());
+    std::thread::sleep(Duration::from_millis(20));
+    scanned.ring_scan();
+    assert!(
+        parked.join().unwrap() < Duration::from_secs(4),
+        "a scan wakes it too"
+    );
 }
