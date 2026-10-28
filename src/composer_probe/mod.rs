@@ -18,13 +18,16 @@
 //! decision at each spawn ([`install`]) and the instance directory it
 //! installs from ([`instance`], Linux), and the editor helper an installed
 //! agent runs as its editor ([`helper`], Linux), which the binary dispatches
-//! to by its name. The daemon feeds the hook every byte an agent writes,
+//! to by its name, and the daemon's side of that helper: its invocations,
+//! markers, children and exits, which settle the generation's liabilities
+//! ([`observe`]). The daemon feeds the hook every byte an agent writes,
 //! moves the epoch at the PTY writer's enqueue, and decides installation at
 //! every spawn, which installs nothing outside the `e2e` build's assumption
-//! until activation; nothing in the daemon reads what the hook or the epoch
-//! tracks yet, or calls the path rule, the classifier, the attestation or
-//! the permission, or keeps an invocation record or a segment, or publishes
-//! to an arm page, and it refuses every helper invocation as unsupported.
+//! until activation. For an installed generation it keeps the invocation
+//! records, settles the permission to arm, answers its helper and observes
+//! it; nothing publishes a liability outside the `e2e` build's control verb,
+//! and nothing reads the epoch, the records or a segment to admit or hold
+//! anything yet.
 
 pub mod arm;
 #[cfg(target_os = "linux")]
@@ -37,6 +40,7 @@ pub mod helper;
 pub mod install;
 #[cfg(target_os = "linux")]
 pub mod instance;
+pub mod observe;
 pub mod paste_mode;
 pub mod path_rule;
 pub mod query_ledger;

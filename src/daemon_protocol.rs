@@ -3114,6 +3114,20 @@ pub enum AttachRequest {
     ///
     /// Its own short-lived connection: one request, one response, close.
     HostMetrics,
+    /// PRD #1666 part 3 (Q35-14b, OQ10): the `e2e` build's control of an
+    /// installed generation's arm page: `operation` `publish` or `withdraw`
+    /// puts up or takes back its one test liability through the records and
+    /// page a probe uses, writing no byte to the agent, and only for the
+    /// generation the request names while it is the pane's current one and
+    /// may be armed ([`crate::composer_probe::observe::Seam::control`]).
+    /// A build without `e2e` neither compiles nor dispatches it, and refuses
+    /// it as a request it doesn't know; it is never advertised.
+    #[cfg(feature = "e2e")]
+    E2eComposerControl {
+        pane_id: String,
+        generation: u64,
+        operation: String,
+    },
 }
 
 /// PRD #1487: who starts the daemon that replaces one answering
@@ -4580,6 +4594,44 @@ pub async fn run_attach_server_with_counter(
         dummy_worktrees,
     )
     .await
+}
+
+/// PRD #1666 part 3 (Q35-14b): answer [`AttachRequest::E2eComposerControl`]
+/// for `pane_id`'s current generation, off the executor.
+#[cfg(all(feature = "e2e", target_os = "linux"))]
+async fn e2e_composer_control(
+    registry: &Arc<AgentPtyRegistry>,
+    pane_id: &str,
+    generation: u64,
+    operation: &str,
+) -> AttachResponse {
+    use crate::composer_probe::observe::ControlOp;
+    let op = match operation {
+        "publish" => ControlOp::Publish,
+        "withdraw" => ControlOp::Withdraw,
+        _ => return AttachResponse::err("e2e-composer-control: unknown operation"),
+    };
+    let Some(observer) = registry
+        .pane_current_agent_id(pane_id)
+        .and_then(|agent| registry.composer_observer(&agent))
+    else {
+        return AttachResponse::err("e2e-composer-control: no installed generation on that pane");
+    };
+    match tokio::task::spawn_blocking(move || observer.control(generation, op)).await {
+        Ok(Ok(_count)) => AttachResponse::ok(),
+        Ok(Err(refusal)) => AttachResponse::err(format!("e2e-composer-control: {refusal:?}")),
+        Err(_) => AttachResponse::err("e2e-composer-control: the control failed"),
+    }
+}
+
+#[cfg(all(feature = "e2e", not(target_os = "linux")))]
+async fn e2e_composer_control(
+    _registry: &Arc<AgentPtyRegistry>,
+    _pane_id: &str,
+    _generation: u64,
+    _operation: &str,
+) -> AttachResponse {
+    AttachResponse::err("e2e-composer-control: no editor helper on this platform")
 }
 
 /// PRD #1258: answer [`AttachRequest::HostMetrics`] from `cache`.
@@ -6844,6 +6896,15 @@ async fn handle_connection(
         }
         AttachRequest::HostMetrics => {
             write_resp(&mut stream, &host_metrics_response(host_metrics).await).await?
+        }
+        #[cfg(feature = "e2e")]
+        AttachRequest::E2eComposerControl {
+            pane_id,
+            generation,
+            operation,
+        } => {
+            let resp = e2e_composer_control(&registry, &pane_id, generation, &operation).await;
+            write_resp(&mut stream, &resp).await?
         }
         AttachRequest::RecordOrchestratorContext {
             pane_id,

@@ -47,6 +47,7 @@ use std::time::Instant;
 
 use super::epoch::{GenerationInput, OutputNote, output_notes};
 use super::framing::{Csi, Event, Framing, Token};
+use super::observe::BellSlot;
 
 /// DEC private mode 2004: bracketed paste.
 const BRACKETED_PASTE: u32 = 2004;
@@ -59,6 +60,9 @@ const VTE_MAX_PARAMS: usize = 32;
 pub struct OutputHook {
     paste_mode: PasteModeTracker,
     input: Arc<GenerationInput>,
+    /// The generation's observer, once it has one (Q35-14b): rung for a
+    /// child scan when the output turns bracketed paste off.
+    bell: BellSlot,
 }
 
 impl OutputHook {
@@ -67,16 +71,35 @@ impl OutputHook {
         Self {
             paste_mode: PasteModeTracker::default(),
             input,
+            bell: BellSlot::default(),
         }
+    }
+
+    /// Where the generation's observer puts its bell.
+    pub fn bell_slot(&self) -> BellSlot {
+        Arc::clone(&self.bell)
     }
 
     /// Read the next bytes the agent wrote.
     pub fn on_output(&mut self, bytes: &[u8]) {
         let mut notes: Vec<OutputNote> = Vec::new();
-        self.paste_mode
-            .feed_observing(bytes, |token, modes| output_notes(token, modes, &mut notes));
+        let mut paste_off = false;
+        self.paste_mode.feed_observing(bytes, |token, modes| {
+            if let Event::Csi(csi) = token.event
+                && csi.final_byte == b'l'
+                && modes.contains(&BRACKETED_PASTE)
+            {
+                paste_off = true;
+            }
+            output_notes(token, modes, &mut notes)
+        });
         if !notes.is_empty() {
             self.input.on_output(&notes, Instant::now());
+        }
+        // An agent writes `?2004l` as it runs its editor: scan for the
+        // helper while it is starting (R5 §3.3). Ringing takes no lock.
+        if paste_off && let Some(bell) = self.bell.get() {
+            bell.ring_scan();
         }
     }
 

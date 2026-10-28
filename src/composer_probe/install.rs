@@ -366,6 +366,12 @@ pub struct Installation {
     args: Vec<String>,
     #[cfg(target_os = "linux")]
     files: GenerationFiles,
+    /// The instance directory and its helper copy's `(dev, ino)`, for the
+    /// daemon's observer (Q35-14b).
+    #[cfg(target_os = "linux")]
+    instance_dir: std::path::PathBuf,
+    #[cfg(target_os = "linux")]
+    helper_id: super::classifier::FileId,
 }
 
 impl Installation {
@@ -390,6 +396,18 @@ impl Installation {
         &mut self.files
     }
 
+    /// The instance directory the generation's files are in.
+    #[cfg(target_os = "linux")]
+    pub fn instance_dir(&self) -> &Path {
+        &self.instance_dir
+    }
+
+    /// The helper copy's `(dev, ino)`: what an agent's helper runs.
+    #[cfg(target_os = "linux")]
+    pub fn helper_id(&self) -> super::classifier::FileId {
+        self.helper_id
+    }
+
     /// `env` with the editor variables replaced by this installation's.
     pub fn apply_env(&self, env: &mut Vec<(String, String)>) {
         env.retain(|(k, _)| {
@@ -399,12 +417,62 @@ impl Installation {
     }
 
     /// `command` with this installation's arguments, when it has any.
+    ///
+    /// A direct Codex's command also gets Codex's embedded-mode pair
+    /// (`crate::wrap::CODEX_EMBEDDED_ARGS`) right after its executable,
+    /// unless its own arguments already open with it, so every launch shape
+    /// carries one argv: the wrapper's plain launch finds the pair there and
+    /// adds no second one, and a value holding shell syntax, which sends the
+    /// command through the wrapper's shell, where the wrapper adds nothing,
+    /// still carries it. The pair stays ahead of the editor settings, which a
+    /// later override at the same path would otherwise be replaced by.
     pub fn command(&self, command: Option<&str>) -> Option<String> {
         if self.args.is_empty() {
             return None;
         }
-        command.map(|c| with_args(c, &self.args))
+        let command = command?;
+        if self.class == PaneClass::Direct(ProbeAgent::Codex)
+            && let Some(end) = first_word_end(command)
+        {
+            let tokens = crate::event::tokenize_command(command);
+            if !crate::wrap::opens_with_codex_embedded_args(tokens.get(1..).unwrap_or_default()) {
+                let pair: Vec<String> = crate::wrap::CODEX_EMBEDDED_ARGS
+                    .iter()
+                    .map(|arg| arg.to_string())
+                    .collect();
+                let head = with_args(&command[..end], &pair);
+                return Some(with_args(&format!("{head}{}", &command[end..]), &self.args));
+            }
+        }
+        Some(with_args(command, &self.args))
     }
+
+    /// The generation's files, for the daemon's observer to hold for the
+    /// generation's life (Q35-14b).
+    #[cfg(target_os = "linux")]
+    pub fn into_files(self) -> GenerationFiles {
+        self.files
+    }
+}
+
+/// Where `command`'s first word ends, as a shell splits a command
+/// [`pane_class`] calls a direct agent's: blanks separate words, and quotes
+/// keep blanks inside a word. No backslash is read, since such a command
+/// has none. `None` for an empty command or an unterminated quote.
+fn first_word_end(command: &str) -> Option<usize> {
+    let bytes = command.as_bytes();
+    let mut i = bytes.iter().position(|b| !b.is_ascii_whitespace())?;
+    let mut quote = None;
+    while i < bytes.len() {
+        match (quote, bytes[i]) {
+            (None, b) if b.is_ascii_whitespace() => break,
+            (None, q @ (b'\'' | b'"')) => quote = Some(q),
+            (Some(q), b) if b == q => quote = None,
+            _ => {}
+        }
+        i += 1;
+    }
+    quote.is_none().then_some(i)
 }
 
 /// Install generation `generation`, of class `class`, in `instance`: its
@@ -456,6 +524,8 @@ pub fn install(
         env,
         args,
         files,
+        instance_dir: instance.dir().to_path_buf(),
+        helper_id: instance.helper_id(),
     })
 }
 
@@ -500,6 +570,18 @@ fn daemon_instance() -> Result<&'static Instance, SetupError> {
         })
         .as_ref()
         .map_err(|e| *e)
+}
+
+/// Write generation `generation`'s identity file in the daemon's instance,
+/// once its permission reaches `Armable` (Q35-14b; see
+/// [`super::instance::Instance::write_identity`]). Refused when no
+/// generation was installed, so there is no instance.
+#[cfg(target_os = "linux")]
+pub fn write_identity(
+    generation: &str,
+    identity: &super::classifier::Identity,
+) -> Result<(), SetupError> {
+    daemon_instance()?.write_identity(generation, identity)
 }
 
 /// The installation decision for a spawn of generation `generation` running

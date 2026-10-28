@@ -67,29 +67,23 @@
 //! change undone between the reads, or an `exec` of the same executable,
 //! leaves equal reads, and an exit after the last poll is not seen here.
 //!
-//! **What the caller owes (Q35-14b's obligations, not shown here).** This
-//! module takes no lock and touches no generation state, but it can't make
-//! its callers hold none: that every `/proc` and filesystem read here runs
-//! with no lock held, the seam lock and the generation's input lock
-//! included, is to be shown at Q35-14b's call sites. There the caller reads
-//! `gen-G` (`InstanceReader::identity`) and attests off the lock, then
-//! takes the input lock once to apply what it got
+//! **What the caller owes.** This module takes no lock and touches no
+//! generation state, but it can't make its callers hold none. Its one caller
+//! is the daemon's observer (`super::observe::Observer::attest`, Q35-14b),
+//! which reads `gen-G` (`InstanceReader::identity`) once, attests with no
+//! lock held (a debug build asserts it holds no ranked lock there, and the
+//! observer's own seam lock is taken only after), then takes the seam lock
+//! and the input lock once to apply what it got
 //! (`GenerationInput::record_observe` or `record_refused`), where a
-//! generation retired in between refuses the step as stale. The caller
-//! also passes the same helper pin and the same `Agent` (one `gen-G` read)
-//! to [`attribute`] and [`read_export`]: the API doesn't tie them together
-//! or hold the helper's pin for it. Dropping an attestation closes its
-//! pidfds.
-//!
-//! **What this is not, yet.** Nothing in the daemon calls it: the handler,
-//! the drain and the scans that do are Q35-14b's, which also turns the time
-//! namespace, the helper's pidfd and the birth floor into the record's
-//! fields.
+//! generation retired in between refuses the step as stale. It passes the
+//! same helper pin and the same `Agent` to [`attribute`] and
+//! [`read_export`]: the API doesn't tie them together or hold the helper's
+//! pin for it. Dropping an attestation closes its pidfds.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
@@ -577,12 +571,18 @@ pub fn decode_peer_pidfd<P>(got: io::Result<P>) -> io::Result<Option<P>> {
 /// [`Sighting::Peer`]. `None` (no option) refuses the peer's identity, as
 /// an error does: there is no fallback to `SO_PEERCRED`'s pid.
 pub fn peer_pidfd(stream: &UnixStream) -> io::Result<Option<OwnedFd>> {
+    peer_pidfd_of(stream.as_fd())
+}
+
+/// [`peer_pidfd`] for a connected socket the caller holds as a descriptor:
+/// the daemon's hook connections, which aren't a [`UnixStream`].
+pub fn peer_pidfd_of(socket: BorrowedFd<'_>) -> io::Result<Option<OwnedFd>> {
     let mut fd: libc::c_int = -1;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
     // SAFETY: `fd` and `len` are valid for writes of an int and its length.
     let rc = unsafe {
         libc::getsockopt(
-            stream.as_raw_fd(),
+            socket.as_raw_fd(),
             libc::SOL_SOCKET,
             libc::SO_PEERPIDFD,
             (&mut fd as *mut libc::c_int).cast(),

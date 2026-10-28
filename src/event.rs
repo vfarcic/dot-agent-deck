@@ -4326,7 +4326,9 @@ pub struct HookCapabilitiesReply {
     /// [`DaemonMessage::ComposerInvocation`] at this version
     /// ([`COMPOSER_PROBE`]). The shared sender
     /// ([`crate::hook::send_composer_invocation`]) sends one only on the
-    /// connection whose answer named it. No daemon names it yet.
+    /// connection whose answer named it. A daemon names it only on a
+    /// connection whose peer it attests as an installed generation's editor
+    /// helper (Q35-14b).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub composer_probe: Option<u32>,
     /// PRD #1666 part 3 (Q35-12, amendment 3 §3.2): this daemon takes a
@@ -4334,7 +4336,8 @@ pub struct HookCapabilitiesReply {
     /// with a [`EditorTree::Clean`] tree, and acknowledges it with an
     /// [`EditorFrontierAck`] on the same connection, at this version
     /// ([`EDITOR_FRONTIER`]). A helper waits for that acknowledgement only
-    /// when the answer named it. No daemon names it yet.
+    /// when the answer named it. No daemon names it yet: none takes a
+    /// frontier before Q35-20a.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor_frontier: Option<u32>,
     /// On a refusal (the provenance gate), its stable code and sentence.

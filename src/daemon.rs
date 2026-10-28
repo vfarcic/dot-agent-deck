@@ -5922,6 +5922,15 @@ async fn run_hook_loop_with_limits(
                         crate::platform::peercred::peer_pid(&stream).ok(),
                         crate::platform::peercred::peer_is_same_user(&stream),
                     );
+                    // PRD #1666 part 3 (Q35-14b): the connection's descriptor,
+                    // for an editor helper's `SO_PEERPIDFD`, read only when it
+                    // asks the hook capabilities for an installed generation.
+                    // Valid while the halves below live, which is this task.
+                    #[cfg(target_os = "linux")]
+                    let composer_socket = std::os::fd::AsRawFd::as_raw_fd(&stream);
+                    #[cfg(target_os = "linux")]
+                    let mut composer_conn: Option<crate::composer_probe::observe::Connection> =
+                        None;
                     let (read_half, mut write_half) = tokio::io::split(stream);
                     let mut reader = tokio::io::BufReader::new(read_half);
 
@@ -7188,6 +7197,38 @@ async fn run_hook_loop_with_limits(
                                         .await;
                                 }
                                 DaemonMessage::HookCapabilities(_) => {
+                                    // PRD #1666 part 3 (Q35-14b): the composer
+                                    // capability, only to an installed
+                                    // generation's helper copy, named by this
+                                    // connection's `SO_PEERPIDFD` (Q81), and
+                                    // only within the connection budgets.
+                                    #[cfg(target_os = "linux")]
+                                    let composer_probe = match attested_agent
+                                        .as_deref()
+                                        .and_then(|agent| pty_registry.composer_observer(agent))
+                                    {
+                                        Some(observer) => {
+                                            composer_conn = tokio::task::spawn_blocking(move || {
+                                                // SAFETY: the connection's own
+                                                // descriptor, open while this task runs.
+                                                let socket = unsafe {
+                                                    std::os::fd::BorrowedFd::borrow_raw(composer_socket)
+                                                };
+                                                observer.connect(
+                                                    crate::composer_probe::attest::peer_pidfd_of(socket),
+                                                )
+                                            })
+                                            .await
+                                            .ok()
+                                            .flatten();
+                                            composer_conn
+                                                .as_ref()
+                                                .map(|_| crate::event::COMPOSER_PROBE)
+                                        }
+                                        None => None,
+                                    };
+                                    #[cfg(not(target_os = "linux"))]
+                                    let composer_probe = None;
                                     // PRD #1666 part 3, round 5 (plan D1): the
                                     // question, answered on this connection,
                                     // which then carries the mutation.
@@ -7200,6 +7241,7 @@ async fn run_hook_loop_with_limits(
                                         input_mode_report: Some(
                                             crate::input_mode::INPUT_MODE_REPORT,
                                         ),
+                                        composer_probe,
                                         ..Default::default()
                                     };
                                     if let Ok(json) = serde_json::to_string(&reply) {
@@ -7212,20 +7254,105 @@ async fn run_hook_loop_with_limits(
                                         }
                                     }
                                 }
-                                DaemonMessage::ComposerInvocation(_) => {
-                                    // PRD #1666 part 3 (Q35): not served until
-                                    // the capability is (Q35-14b), and none of
-                                    // the request is read before then.
-                                    let reply =
-                                        crate::event::ComposerInvocationReply::unsupported();
-                                    if let Ok(json) = serde_json::to_string(&reply) {
-                                        let line = format!("{json}\n");
-                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
-                                            .await
-                                            .is_err()
-                                        {
-                                            break;
+                                DaemonMessage::ComposerInvocation(request) => {
+                                    // PRD #1666 part 3 (Q35-14b): served only
+                                    // on a connection this daemon told the
+                                    // capability, by the attested agent's
+                                    // observer; anything else is unsupported,
+                                    // and none of its request is read.
+                                    #[cfg(target_os = "linux")]
+                                    let served = composer_conn.take().filter(|conn| {
+                                        attested_agent.as_deref().is_some_and(|agent| {
+                                            pty_registry
+                                                .composer_observer(agent)
+                                                .is_some_and(|o| Arc::ptr_eq(&o, conn.observer()))
+                                        })
+                                    });
+                                    #[cfg(target_os = "linux")]
+                                    let Some(conn) = served
+                                    else {
+                                        let reply =
+                                            crate::event::ComposerInvocationReply::unsupported();
+                                        if let Ok(json) = serde_json::to_string(&reply) {
+                                            let line = format!("{json}\n");
+                                            if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
                                         }
+                                        continue;
+                                    };
+                                    #[cfg(not(target_os = "linux"))]
+                                    {
+                                        let _ = request;
+                                        let reply =
+                                            crate::event::ComposerInvocationReply::unsupported();
+                                        if let Ok(json) = serde_json::to_string(&reply) {
+                                            let line = format!("{json}\n");
+                                            if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                    #[cfg(target_os = "linux")]
+                                    {
+                                        let editor_bearing = request.decision
+                                            != crate::event::ComposerDecision::Armed;
+                                        let (conn, outcome) = match tokio::task::spawn_blocking(
+                                            move || {
+                                                let outcome =
+                                                    conn.observer().invocation(&conn, &request);
+                                                (conn, outcome)
+                                            },
+                                        )
+                                        .await
+                                        {
+                                            Ok(answered) => answered,
+                                            Err(_) => break,
+                                        };
+                                        let reply = crate::event::ComposerInvocationReply {
+                                            outcome: Some(outcome),
+                                            ..Default::default()
+                                        };
+                                        if let Ok(json) = serde_json::to_string(&reply) {
+                                            let line = format!("{json}\n");
+                                            if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
+                                        // The helper's report comes after its
+                                        // editor, which runs as long as the
+                                        // user edits: this connection gives its
+                                        // hook slot back and holds its composer
+                                        // slot instead, and reads one bounded
+                                        // line, or the end.
+                                        if editor_bearing {
+                                            permit.take();
+                                            if let Ok(Some(line)) = crate::bounded_read::read_capped_line(
+                                                &mut reader,
+                                                crate::composer_probe::observe::REPORT_BYTES,
+                                            )
+                                            .await
+                                                && let Ok(report) = serde_json::from_str::<
+                                                    crate::event::EditorReport,
+                                                >(line.trim())
+                                            {
+                                                let _ = tokio::task::spawn_blocking(move || {
+                                                    conn.observer().report(&conn, report);
+                                                })
+                                                .await;
+                                            }
+                                        }
+                                        break;
                                     }
                                 }
                                 DaemonMessage::InputMode(report) => {

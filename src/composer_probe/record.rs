@@ -92,25 +92,24 @@
 //! (`super::epoch::GenerationInput`), which also orders them against the
 //! output hook's latch and the physical tracker's candidates.
 //!
-//! **What reads it: the segments (Q35-08), and nothing in production.** The
-//! handler, the drain and the exit observation (Q35-14b), Q35-20 and
-//! admission (Q35-19) call it later. What this module takes on trust, and
-//! the integration therefore owes:
-//! - **Trusted adapters (Q35-14b).** [`Records::observe`] records what it's
-//!   given: a scan observation must be built from the daemon's own identity
-//!   reads with no decision, claim or numbers (nothing here refuses an
-//!   `Armed` on [`Channel::Scan`]), and IPC and marker evidence must be
-//!   authenticated and mapped to its record before it arrives.
+//! **Who calls it.** The segments (Q35-08) read it, and in the daemon the
+//! observer of an installed generation (Q35-14b, `super::observe`) is its
+//! one caller: the IPC handler, the marker and child scans, the exit
+//! observation and its drain, through the wrappers in [`super::epoch`],
+//! which take the generation's input lock around these pure steps. Q35-20
+//! and admission (Q35-19) call it later. What this module takes on trust,
+//! and where the observer gives it:
+//! - **Trusted adapters.** [`Records::observe`] records what it's given:
+//!   nothing here refuses an `Armed` on [`Channel::Scan`], so the
+//!   observer's scan adapter builds a scan observation from the daemon's own
+//!   identity reads with no decision, claim or numbers, and it attests IPC
+//!   and marker evidence and maps it to its record before it arrives.
 //!   [`Records::match_segment`] records the caller's association; the whole
 //!   match predicate is the segments' (Q35-08, Q35-20).
-//! - **R6's real edges (Q35-14b).** The wrappers in [`super::epoch`] take
-//!   the generation's input lock around these pure steps; the handler,
-//!   reader and ingress call sites, and the real feeder's races against
-//!   them, are checked when they exist.
-//! - **M-FIRST's line (Q35-14b).** Take the event at retirement with
+//! - **M-FIRST's line.** The event is taken at retirement with
 //!   `GenerationInput::retire_taking_first_stop`, which ends a pending
-//!   episode before the records go, and add whether held input was
-//!   discarded.
+//!   episode before the records go; the retiring caller logs it, and adds
+//!   whether held input was discarded.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};

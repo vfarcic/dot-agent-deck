@@ -598,6 +598,48 @@ impl InstanceReader {
             .is_some_and(|seen| stat_at(inv.as_fd(), &seen).is_ok())
     }
 
+    /// The daemon's read of `inv/G/` (Q35-14b): at most `max` names, and
+    /// whether there were more. A name that isn't UTF-8 is skipped: no marker
+    /// is named so.
+    pub fn markers(&self, generation: &str, max: usize) -> io::Result<(Vec<String>, bool)> {
+        let inv = self.inv(generation)?;
+        let (names, more) = names_at_most(inv.as_fd(), max)?;
+        Ok((
+            names
+                .into_iter()
+                .filter_map(|name| name.into_string().ok())
+                .collect(),
+            more,
+        ))
+    }
+
+    /// Rename marker `name` in `inv/G/` to `<name>.seen` (core §2.3's
+    /// handshake), without replacing anything there.
+    pub fn mark_seen(&self, generation: &str, name: &str) -> io::Result<()> {
+        let inv = self.inv(generation)?;
+        if name.contains('/') {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        rename_noreplace(
+            inv.as_fd(),
+            &cstring_of(name),
+            &cstring_of(&format!("{name}.seen")),
+        )
+    }
+
+    /// Remove marker `name` from `inv/G/`; one that is already gone is no
+    /// error.
+    pub fn remove_marker(&self, generation: &str, name: &str) -> io::Result<()> {
+        let inv = self.inv(generation)?;
+        if name.contains('/') {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        match unlink_at(inv.as_fd(), &cstring_of(name), 0) {
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+            other => other,
+        }
+    }
+
     /// `inv/G/`, not followed.
     fn inv(&self, generation: &str) -> io::Result<OwnedFd> {
         if !generation_name_ok(generation) {
@@ -1251,6 +1293,12 @@ fn private(st: &libc::stat, uid: u32, kind: libc::mode_t, mode: libc::mode_t) ->
 /// The names in `dir` but `.` and `..`, read through a duplicate of its
 /// descriptor.
 fn names_at(dir: BorrowedFd<'_>) -> io::Result<Vec<OsString>> {
+    names_at_most(dir, usize::MAX).map(|(names, _)| names)
+}
+
+/// The names in `dir` but `.` and `..`, at most `max` of them, and whether
+/// the directory held more.
+fn names_at_most(dir: BorrowedFd<'_>, max: usize) -> io::Result<(Vec<OsString>, bool)> {
     let dup = dir.try_clone_to_owned()?;
     // SAFETY: a descriptor of a directory, owned by the stream from here,
     // which `closedir` below closes.
@@ -1279,12 +1327,17 @@ fn names_at(dir: BorrowedFd<'_>) -> io::Result<Vec<OsString>> {
             if errno != 0 {
                 return Err(io::Error::from_raw_os_error(errno));
             }
-            return Ok(names);
+            return Ok((names, false));
         }
         // SAFETY: `readdir` returned an entry, whose name is NUL-terminated
         // and valid until the next call on the stream.
         let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
         if name != c"." && name != c".." {
+            if names.len() == max {
+                // SAFETY: the stream, closed once.
+                unsafe { libc::closedir(stream) };
+                return Ok((names, true));
+            }
             names.push(OsString::from_vec(name.to_bytes().to_vec()));
         }
     }

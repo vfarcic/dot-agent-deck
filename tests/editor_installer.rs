@@ -669,7 +669,10 @@ fn probe_064_an_installed_spawn_gets_its_helper_and_files() {
     let installation = install(&instance, CODEX, "7", &originals(Some("e"), None, None)).unwrap();
     assert_eq!(
         installation.command(Some("codex")).as_deref(),
-        Some("codex '-c' 'shell_environment_policy.set.VISUAL=\"e\"'")
+        Some(
+            "codex '-c' 'shell_environment_policy.set={}' \
+             '-c' 'shell_environment_policy.set.VISUAL=\"e\"'"
+        )
     );
     let mut env = vec![
         ("VISUAL".to_string(), "mine".to_string()),
@@ -684,6 +687,80 @@ fn probe_064_an_installed_spawn_gets_its_helper_and_files() {
     assert_eq!(get(&env, SAVED_EDITOR_ENV), None);
     assert_eq!(env.iter().filter(|(k, _)| k == "VISUAL").count(), 1);
     assert_eq!(env.iter().filter(|(k, _)| k == "EDITOR").count(), 1);
+}
+
+/// Scenario: Install a direct Codex whose saved editor value holds shell syntax (`;`, `&`, `|`, parentheses), and one whose value is plain, and run each installed command through the wrapper's launch rewrite. Either way the command carries Codex's embedded-mode pair once, right after the executable and before the editor settings: through the wrapper's shell for the value with syntax, where the wrapper adds nothing, and on the plain launch, where the wrapper finds the pair and adds no second one. A command that already opens with the pair gets no second one, and a quoted executable keeps its quoting.
+#[spec("inbox/probe/064")]
+#[test]
+fn probe_064_a_direct_codex_carries_its_embedded_pair_on_every_launch_shape() {
+    let dir = tempdir();
+    let instance = instance(dir.path());
+    let pair = ["-c", "shell_environment_policy.set={}"];
+    let opens_with_pair = |argv: &[String]| argv.len() >= 3 && argv[1..3] == pair;
+    let count_pair = |argv: &[String]| argv.windows(2).filter(|w| *w == pair).count();
+    for (generation, value, through_shell) in [
+        ("1", "ed; rm -rf x", true),
+        ("2", "a & b | c (d)", true),
+        ("3", "vim -f", false),
+    ] {
+        let installation = install(
+            &instance,
+            CODEX,
+            generation,
+            &originals(Some(value), None, None),
+        )
+        .unwrap();
+        let installed = installation.command(Some("codex --model o3")).unwrap();
+        let argv = shlex::split(&installed).unwrap();
+        assert!(opens_with_pair(&argv), "{value}: {argv:?}");
+        assert_eq!(count_pair(&argv), 1, "{value}: once");
+        assert_eq!(&argv[3..5], ["--model", "o3"], "{value}: its own arguments");
+        assert!(
+            argv[5..]
+                .iter()
+                .any(|a| a == &format!("shell_environment_policy.set.VISUAL=\"{value}\"")),
+            "{value}: the settings after the pair: {argv:?}"
+        );
+        match dot_agent_deck::wrap::wrap_launch_command(&installed, &AgentType::Codex, "/bin/sh") {
+            dot_agent_deck::wrap::LaunchCommand::Argv(wrapper) => {
+                assert!(through_shell, "{value}: {wrapper:?}");
+                let shell_line = wrapper.last().unwrap();
+                assert_eq!(shell_line, &installed, "the shell runs the installed line");
+            }
+            dot_agent_deck::wrap::LaunchCommand::Line(line) => {
+                assert!(!through_shell, "{value}: {line}");
+                let words = shlex::split(&line).unwrap();
+                let after = words.iter().position(|w| w == "--").unwrap() + 1;
+                assert!(opens_with_pair(&words[after..]), "{line}");
+                assert_eq!(count_pair(&words), 1, "{line}");
+            }
+        }
+    }
+    let installation = install(&instance, CODEX, "4", &originals(Some("e"), None, None)).unwrap();
+    let theirs = installation
+        .command(Some(
+            "codex -c 'shell_environment_policy.set={}' --model o3",
+        ))
+        .unwrap();
+    assert_eq!(count_pair(&shlex::split(&theirs).unwrap()), 1, "{theirs}");
+    let quoted = installation
+        .command(Some("'/opt/my tools/codex' --model o3"))
+        .unwrap();
+    let argv = shlex::split(&quoted).unwrap();
+    assert_eq!(argv[0], "/opt/my tools/codex");
+    assert!(opens_with_pair(&argv), "{argv:?}");
+    let launcher = install(
+        &instance,
+        PaneClass::Launcher(ProbeAgent::Codex),
+        "5",
+        &originals(Some("e"), None, None),
+    )
+    .unwrap();
+    assert_eq!(
+        launcher.command(Some("devbox run codex")),
+        None,
+        "no settings below a launcher"
+    );
 }
 
 /// Scenario: Refuse a generation's files when its name can't be a file name (empty, a path, a dot, too long) or when any of them exists already: a second installation of the same generation, or a `kind-G` or `gen-G` written twice, refuses without replacing what is there. Neither a shell nor an uncovered agent installs.

@@ -174,6 +174,36 @@ fn probe_033_installation_precedes_the_header_for_direct_and_wrapper_commands() 
     }
 }
 
+/// Scenario: Enable installation for Codex 0.164.0 and start a direct Codex stand-in whose editor value holds shell syntax, which sends the installed command through the wrapper's shell, where the wrapper adds no argument of its own. The argv it receives still opens with the deck's embedded-mode pair, once, then its own arguments, then the editor settings carrying the value literally.
+#[spec("inbox/probe/033")]
+#[test]
+fn probe_033_an_installed_codex_with_shell_syntax_in_its_editor_is_still_embedded() {
+    let daemon = common::spawn_daemon_serve_with_env(None, "0", &[(ASSUME, ENTRIES)]);
+    let value = "user-editor; true && (exit 0) | cat";
+    let spawned = spawn(
+        &daemon,
+        "codex-syntax",
+        "codex",
+        "0.164.0",
+        Some(value),
+        None,
+        false,
+    );
+    installed(&spawned);
+    let mut expected = spawned.original_argv.as_array().unwrap().clone();
+    for variable in ["VISUAL", "EDITOR"] {
+        expected.push(json!("-c"));
+        expected.push(json!(format!(
+            "shell_environment_policy.set.{variable}=\"{value}\""
+        )));
+    }
+    assert_eq!(
+        spawned.report["argv"],
+        Value::Array(expected),
+        "the embedded pair first, once, through the wrapper's shell"
+    );
+}
+
 /// Scenario: Enable installation for Codex 0.164.0 and start a direct Codex stand-in with unset, exported-empty and nonempty editor settings. The argv it receives opens with the deck's embedded-mode pair, then carries its own arguments, then the installation's editor settings for the set values, so the empty table comes before the settings it would otherwise replace.
 #[spec("inbox/probe/033")]
 #[test]

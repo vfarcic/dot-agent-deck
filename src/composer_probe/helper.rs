@@ -47,10 +47,11 @@
 //! and not stopped: a stopped helper runs no step at all until it is
 //! continued.
 //!
-//! **What this is not, yet.** The daemon advertises neither capability and
-//! refuses every `composer_invocation` as unsupported until Q35-14b, so with
-//! this build's daemon every exchange fails and no report is sent; installation's rollout is empty (Q35-13), so no
-//! production agent runs the helper. Its premises about the kernel's reaper,
+//! **What this is not, yet.** The daemon answers `composer_invocation` on a
+//! connection whose peer it attests as an installed generation's helper copy
+//! (Q35-14b, `super::observe`), but advertises no drain frontier, so a
+//! `Clean` report waits for no acknowledgement; installation's rollout is
+//! empty (Q35-13), so no production agent runs the helper. Its premises about the kernel's reaper,
 //! wait and tty write paths (P-SR′, P-DRN, N1) are UNVERIFIED pending E-PIN
 //! (amendment 5 §3.1): until that evidence is in `docs/develop/`, a `Clean`
 //! report is the helper's observation, not an attestation. Nothing reads a

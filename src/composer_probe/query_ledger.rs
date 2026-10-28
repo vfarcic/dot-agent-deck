@@ -30,9 +30,10 @@
 //!
 //! Who feeds and reads what, as of this commit: the output hook notes queries,
 //! `?2026h` and the D3 report modes, and the shared enqueue settles replies
-//! (both through `GenerationInput`); the physical tracker's native candidate
-//! (Q35-16) and the record's observations (Q35-14b) arrive later, as does
-//! the first reader, probe admission (Q35-19).
+//! (both through `GenerationInput`), and an installed generation's records
+//! feed the pending fact and their pops (Q35-14b); the physical tracker's
+//! native candidate (Q35-16) arrives later, as does the first reader, probe
+//! admission (Q35-19).
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};

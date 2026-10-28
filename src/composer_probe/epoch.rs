@@ -44,8 +44,8 @@
 //! the same lock once attached ([`GenerationInput::attach_records`]), so a
 //! record's transition, its hazard pop and the quiet clock's pause or resume
 //! are one critical section, ordered against the output hook's latch and the
-//! tracker's candidates by the lock alone. No production caller attaches them
-//! yet (Q35-14b does).
+//! tracker's candidates by the lock alone. The daemon attaches them to an
+//! installed generation at its spawn (Q35-14b, `super::observe`).
 //!
 //! **What it costs today.** Nothing reads it to decide, but it isn't free: a
 //! person's op is read as a report and every op is tokenized under this
@@ -628,6 +628,22 @@ impl GenerationInput {
     /// See [`Records::lower`].
     pub fn liability_lower(&self, generation: u64, stamp: Instant) -> Result<u32, Refusal> {
         self.with_records(|r, _| r.lower(generation, stamp))
+    }
+
+    /// The liability count the records hold: what the arm page publishes.
+    /// `None` with no records attached or once retired.
+    pub fn liability_count(&self) -> Option<u32> {
+        self.with_records(|r, _| Ok(r.count())).ok()
+    }
+
+    /// See [`Records::fact`].
+    pub fn record_fact(&self, key: RecordKey) -> Option<ExitFact> {
+        self.with_records(|r, _| Ok(r.fact(key))).ok().flatten()
+    }
+
+    /// Whether the generation retired.
+    pub fn retired(&self) -> bool {
+        self.state.lock_recovering().retired
     }
 
     /// A copy of one record.

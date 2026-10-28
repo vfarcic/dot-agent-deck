@@ -2035,6 +2035,10 @@ pub struct AgentBus {
     /// output hook notes into and the generation's PTY writer moves. Kept
     /// here, outside `state`, so taking it never takes the output lock.
     input: Arc<crate::composer_probe::epoch::GenerationInput>,
+    /// PRD #1666 part 3 (Q35-14b): the bell of an installed generation's
+    /// observer, shared with the output hook: rung when the release latch
+    /// moves.
+    composer_bell: crate::composer_probe::observe::BellSlot,
 }
 
 /// What one [`AgentBus::push`] cost under the output lock (plan §9.1). Read
@@ -2139,6 +2143,8 @@ impl AgentBus {
                 |p| p.cpr_wait_end,
             ),
         ));
+        let output_hook = crate::composer_probe::paste_mode::OutputHook::new(Arc::clone(&input));
+        let composer_bell = output_hook.bell_slot();
         Self {
             tx,
             state: Mutex::new(AgentBusState {
@@ -2147,13 +2153,21 @@ impl AgentBus {
                 ring_start_modes: ReplayModes::default(),
                 evidence: crate::evidence_state::EvidenceState::new(profile, rows, cols),
                 release: crate::release_scanner::ReleaseCapture::start(rows, cols),
-                output_hook: crate::composer_probe::paste_mode::OutputHook::new(Arc::clone(&input)),
+                output_hook,
             }),
             label: String::new(),
             #[cfg(test)]
             between_resize_and_clear: Mutex::new(None),
             input,
+            composer_bell,
         }
+    }
+
+    /// PRD #1666 part 3 (Q35-14b): the generation's release for `agent`, as
+    /// latched so far. Takes the output lock.
+    #[cfg(target_os = "linux")]
+    fn latched_for(&self, agent: &AgentType) -> crate::doorbell_activation::LatchedRelease {
+        self.state.lock().unwrap().release.latched_for(agent)
     }
 
     /// PRD #1666 part 3 (Q35-06): the generation's input epoch, for its PTY
@@ -2236,6 +2250,11 @@ impl AgentBus {
         let latch_changed = !release.is_empty();
         for event in release {
             self.log_release(&event);
+        }
+        // PRD #1666 part 3 (Q35-14b): an installed generation's observer
+        // settles its permission once the header latched.
+        if latch_changed && let Some(bell) = self.composer_bell.get() {
+            bell.ring();
         }
         PushCost {
             hold_ns,
@@ -2503,6 +2522,32 @@ impl AgentBus {
 
 /// PRD #1666 part 3, round 5-wake: one `pane layout` line per change of a
 /// pane's evidence state.
+/// PRD #1666 part 3 (Q35-14b; amendment 5 §3.6, amendment 6 §3.6):
+/// M-FIRST's line for a generation that retired, taken atomically with the
+/// retirement: when probing first stopped and why, and the pending episodes.
+/// No path or message content. A stop's segment kind (native or check-time)
+/// is the matched segment's, and no segment is matched before Q35-20, so
+/// none is joined here; nor is held input, which nothing holds before the
+/// fence (Q35-15/16), so none was discarded.
+fn log_first_stop(agent_id: &str, stop: &crate::composer_probe::record::FirstStop) {
+    let first = stop.stopped.as_ref();
+    tracing::info!(
+        target: "composer_probe",
+        agent_id = %agent_id,
+        observed_ms = stop.observed.as_millis() as u64,
+        stopped = first.is_some(),
+        cause = ?first.map(|s| s.cause),
+        after_ms = first.map(|s| s.after.as_millis() as u64),
+        source = ?first.map(|s| s.source),
+        attribution = ?first.and_then(|s| s.attribution()),
+        decision = ?first.and_then(|s| s.record).and_then(|r| r.decision),
+        episodes = stop.episodes.len(),
+        episodes_uncounted = stop.episodes_uncounted,
+        held_input_discarded = false,
+        "editor probe first stop"
+    );
+}
+
 fn log_evidence_transition(transition: &crate::evidence_state::Transition, cause: &str) {
     tracing::debug!(
         target: "pane_layout",
@@ -3504,6 +3549,11 @@ pub struct RunningAgent {
     /// generation's life; dropping it unmaps the arm page, and the instance
     /// files stay.
     pub composer_install: Option<crate::composer_probe::install::Installation>,
+    /// PRD #1666 part 3 (Q35-14b): the observer of an installed generation,
+    /// which takes its installation over once the record is published
+    /// ([`AgentPtyRegistry::start_composer_observer`]).
+    #[cfg(target_os = "linux")]
+    pub composer: Option<Arc<crate::composer_probe::observe::Observer>>,
 }
 
 /// Issue #714: the source of [`RunningAgent::quota_block`] epochs. Only
@@ -12423,8 +12473,19 @@ impl AgentPtyRegistry {
                     // ledger and doorbell cell.
                     agent.ingress.close();
                     // PRD #1666 part 3 (Q35-06): and its input epoch's
-                    // structures.
-                    agent.bus.input().retire();
+                    // structures; with its invocation records, M-FIRST's
+                    // event is taken in the same section (Q35-14b).
+                    if let Some(stop) = agent
+                        .bus
+                        .input()
+                        .retire_taking_first_stop(std::time::Instant::now())
+                    {
+                        log_first_stop(&agent.bus.label, &stop);
+                    }
+                    #[cfg(target_os = "linux")]
+                    if let Some(observer) = &agent.composer {
+                        observer.stop();
+                    }
                     agent.doorbell.retire();
                     agent
                         .bus
@@ -12631,6 +12692,8 @@ impl AgentPtyRegistry {
             // the lock that publishes the record.
             attest_facts,
             composer_install,
+            #[cfg(target_os = "linux")]
+            composer: None,
         };
 
         // Use the id we pre-allocated above (before spawn) and injected
@@ -12672,6 +12735,10 @@ impl AgentPtyRegistry {
         // PRD #1666 part 3, round 5 test seam: a panic after the record is
         // published and before the spawn returns ((f2')'s seam).
         let _ = self.fault_point(FAULT_SPAWN_AFTER_INSERT);
+        // PRD #1666 part 3 (Q35-14b): an installed generation's observer,
+        // started with the registry lock released.
+        #[cfg(target_os = "linux")]
+        self.start_composer_observer(&id);
         // PRD #1666 §2.8 (auditor R9S-A01): every generation published on a
         // pane — a first start, a respawn, a re-created pane — hands the pane's
         // inbox over to it, before anything the spawn owes that inbox below. A
@@ -12695,6 +12762,74 @@ impl AgentPtyRegistry {
             self.note_inbox_spawn(&pane, &id, integration, refresh, &inbox_spawn.2);
         }
         Ok(id)
+    }
+
+    /// PRD #1666 part 3 (Q35-14b): start generation `id`'s observer from its
+    /// installation, if it was installed: the record's facts read under the
+    /// registry lock, the observer started with it released (it opens the
+    /// instance directory and starts a thread), and kept on the record if
+    /// the record is still there.
+    #[cfg(target_os = "linux")]
+    fn start_composer_observer(&self, id: &str) {
+        let taken = {
+            let mut inner = self.inner.lock();
+            let Some(agent) = inner.agents.get_mut(id) else {
+                return;
+            };
+            let Some(installation) = agent.composer_install.take() else {
+                return;
+            };
+            (
+                installation,
+                Arc::clone(&agent.bus),
+                agent
+                    .spawn_agent_type
+                    .clone()
+                    .or_else(|| agent.agent_type.clone()),
+                agent.spawn_env.clone(),
+                agent.child.process_id().zip(agent.child_started),
+            )
+        };
+        let (installation, bus, agent, env, child) = taken;
+        let weak = Arc::downgrade(&bus);
+        let spawned = crate::composer_probe::observe::Spawned {
+            agent_id: id.to_string(),
+            agent,
+            env,
+            child,
+            input: Arc::clone(bus.input()),
+            latch: Box::new(move |agent| match weak.upgrade() {
+                Some(bus) => bus.latched_for(agent),
+                None => crate::doorbell_activation::LatchedRelease::Unseen,
+            }),
+        };
+        let Some(observer) = crate::composer_probe::observe::Observer::start(
+            installation,
+            spawned,
+            &bus.composer_bell,
+        ) else {
+            tracing::warn!(
+                target: "composer_probe",
+                agent_id = %id,
+                "editor helper installed but not observed"
+            );
+            return;
+        };
+        let mut inner = self.inner.lock();
+        match inner.agents.get_mut(id) {
+            Some(agent) => agent.composer = Some(observer),
+            None => observer.stop(),
+        }
+    }
+
+    /// PRD #1666 part 3 (Q35-14b): an installed generation's observer, by
+    /// its agent id.
+    #[cfg(target_os = "linux")]
+    pub fn composer_observer(
+        &self,
+        agent_id: &str,
+    ) -> Option<Arc<crate::composer_probe::observe::Observer>> {
+        self.inner.lock().agents.get(agent_id)?.composer.clone()
     }
 
     /// PRD #1666 §11: what an OpenCode or Pi generation's start owes its
@@ -13365,6 +13500,8 @@ impl AgentPtyRegistry {
             // installed or not at its own spawn; the old one's page is unmapped
             // with it.
             composer_install: _,
+            #[cfg(target_os = "linux")]
+                composer: _,
             // Issue #454: the OLD record is being removed outright, so its
             // handover flag has nothing left to disown. The fresh generation
             // starts `false` and takes the pane over in `spawn_agent`.
@@ -16183,6 +16320,8 @@ impl AgentPtyRegistry {
                 authoring_kind: None,
                 attest_facts: crate::hook_provenance::AttestFacts::default(),
                 composer_install: None,
+                #[cfg(target_os = "linux")]
+                composer: None,
             },
         );
         id
