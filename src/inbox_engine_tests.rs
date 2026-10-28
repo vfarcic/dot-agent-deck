@@ -5840,3 +5840,63 @@ async fn boundary_072_a_once_wait_from_a_hook_component_is_refused() {
         );
     }
 }
+
+/// Scenario: On an OpenCode and on a Pi receiver alike, a message's first hand-out is held, the receiver's snapshots stop past the possession TTL and the deck hands out the automatic repeat; the receiver still holds the first. When it reports that possession on the same line as its final check for the repeat, the check is refused `held_earlier`. When it reported it on an earlier line that went stale before the check, as a receiver from before this change does, the repeat is approved: the residual. When it reports on the check's line that it dropped the first, the repeat is approved.
+#[spec("inbox/boundary/076")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_076_possession_reported_with_the_check_is_fresh_at_the_check() {
+    let keepalive = Duration::from_millis(100);
+    let ttl = keepalive * crate::inbox_attempts::KEEPALIVES_PER_POSSESS_TTL;
+    for component in [InboxComponent::OpenCodePlugin, InboxComponent::PiExtension] {
+        for (case, held_first, separate) in [
+            ("reported with the check", true, false),
+            ("reported before the check, stale by it", true, true),
+            ("dropped, reported with the check", false, false),
+        ] {
+            let (hub, _state) = hub_with_spool(keepalive, Duration::from_secs(2));
+            let mut peer = Peer::open(&hub, "p", "a", component, INTEGRATION).await;
+            peer.next().await.registered.unwrap();
+            hub.post_direct(Recipient::bound("p", "a"), content("hold me"))
+                .unwrap();
+            let first = peer.handout().await.remove(0);
+            peer.send(serde_json::json!({"possess": {"seq": 1, "seen": attempt(&first).d, "held": [at(&first)]}}))
+                .await;
+            let repeat = peer.handout_ticking(&hub).await.remove(0);
+            assert!(
+                attempt(&repeat).repeat,
+                "{component:?}, {case}: precondition: the stall let the deck repeat it"
+            );
+            let held = if held_first {
+                vec![at(&first), at(&repeat)]
+            } else {
+                vec![at(&repeat)]
+            };
+            let possess = serde_json::json!({"seq": 2, "seen": attempt(&repeat).d, "held": held});
+            let may = serde_json::json!({"q": 1, "id": repeat.id, "a": attempt(&repeat).a, "e": attempt(&repeat).e});
+            if separate {
+                peer.send(serde_json::json!({ "possess": possess })).await;
+                tokio::time::sleep(ttl * 2).await;
+                peer.send(serde_json::json!({ "may": may })).await;
+            } else {
+                peer.send(serde_json::json!({ "possess": possess, "may": may }))
+                    .await;
+            }
+            let grant = loop {
+                if let Some(grant) = peer.next().await.grant {
+                    break grant;
+                }
+            };
+            let refused = held_first && !separate;
+            assert_eq!(
+                (grant.ok, grant.refusal.as_deref()),
+                if refused {
+                    (false, Some("held_earlier"))
+                } else {
+                    (true, None)
+                },
+                "{component:?}, {case}"
+            );
+            peer.close().await;
+        }
+    }
+}

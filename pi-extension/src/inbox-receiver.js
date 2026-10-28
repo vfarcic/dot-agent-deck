@@ -286,12 +286,14 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, r
     watermark.above.add(d);
     while (watermark.above.delete(watermark.seen + 1)) watermark.seen += 1;
   };
+  // What this receiver holds, as the next possession snapshot.
+  const possession = () => {
+    seq += 1;
+    return { seq, seen: watermark.seen, held: [...held.values()].map(inboxRef) };
+  };
   const snapshot = () => {
     if (!child || rx === undefined) return;
-    seq += 1;
-    inboxWrite(child, {
-      possess: { seq, seen: watermark.seen, held: [...held.values()].map(inboxRef) },
-    });
+    inboxWrite(child, { possess: possession() });
   };
   // An attempt a revoke already answered is not held again: a doorbell fetch
   // that issued it can return after the deck revoked it.
@@ -539,7 +541,11 @@ const inboxReceiver = ({ agent, doorbellOnly = false, active, deliver, exited, r
           }, INBOX_GRANT_TIMEOUT_MS);
           timer.unref?.();
         });
-        if (!inboxWrite(child, { may: { q: id, ...ref } })) {
+        // Possession rides with the question, so the deck decides on what
+        // this receiver held when it asked however late the question is
+        // read: an automatic repeat waits while an earlier attempt of its
+        // message is still held here (#1940).
+        if (!inboxWrite(child, { possess: possession(), may: { q: id, ...ref } })) {
           grants.delete(id);
           return undefined;
         }
