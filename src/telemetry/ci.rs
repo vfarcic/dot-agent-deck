@@ -2,12 +2,14 @@
 //! events: what a run's pull request's checks did, as the deck's own poll of
 //! them reported it ([`crate::pull_request_info::PullRequestChecks`]).
 //!
-//! Pure and synchronous, like the tracker that owns one per run. A stretch
-//! opens when the checks are first seen pending and closes when they are seen
-//! passing or failing — so its start and end are each as late as one poll of
-//! the pull request ([`crate::pull_request::DEFAULT_REFRESH`] unless the user
-//! set another interval). The rollup does not say which CI system ran a check,
-//! so nothing here does either.
+//! Pure and synchronous, like the tracker that owns one per pull request,
+//! shared by every run whose card holds it, so a pull request's CI history is
+//! recorded once however many runs watch it. A stretch opens when the checks
+//! are first seen pending and closes when they are seen passing or failing —
+//! so its start and end are each as late as one poll of the pull request
+//! ([`crate::pull_request::DEFAULT_REFRESH`] unless the user set another
+//! interval). The rollup does not say which CI system ran a check, so nothing
+//! here does either.
 
 use crate::pull_request_info::{PullRequestChecks, PullRequestChecksState};
 
@@ -67,9 +69,9 @@ pub enum CiEffect {
     },
 }
 
-/// One run's view of its pull request's checks.
+/// One pull request's checks, as the runs holding it see them.
 #[derive(Debug, Default)]
-pub struct RunCi {
+pub struct PrCi {
     pr: Option<u64>,
     last: Option<CiState>,
     last_checks: Option<PullRequestChecks>,
@@ -80,8 +82,8 @@ pub struct RunCi {
     pub failures: u64,
 }
 
-impl RunCi {
-    /// The run's card now holds pull request `pr` with `checks`, at `now`.
+impl PrCi {
+    /// A run's card now holds pull request `pr` with `checks`, at `now`.
     /// `new_span_id` is called for a stretch that opens.
     pub fn observe(
         &mut self,
@@ -143,9 +145,15 @@ impl RunCi {
         effects
     }
 
-    /// The run ended: its open stretch, if any, ends without a result.
+    /// The last run holding the pull request let go of it: its open stretch,
+    /// if any, ends without a result.
     pub fn end_run(&mut self) -> Option<CiEffect> {
         self.end_open(None)
+    }
+
+    /// Whether a stretch of pending checks is open.
+    pub fn is_open(&self) -> bool {
+        self.open.is_some()
     }
 
     fn end_open(&mut self, result: Option<CiState>) -> Option<CiEffect> {
@@ -180,7 +188,7 @@ mod tests {
 
     #[test]
     fn a_pending_stretch_ends_with_its_result() {
-        let mut ci = RunCi::default();
+        let mut ci = PrCi::default();
         assert_eq!(
             ci.observe(Some(7), Some(checks(Pending, 0, 0)), 10, id(1)),
             vec![CiEffect::Change {
@@ -221,7 +229,7 @@ mod tests {
 
     #[test]
     fn a_result_without_a_pending_stretch_is_a_change_only() {
-        let mut ci = RunCi::default();
+        let mut ci = PrCi::default();
         let effects = ci.observe(Some(7), Some(checks(Passing, 2, 0)), 10, id(1));
         assert_eq!(effects.len(), 1);
         assert_eq!(ci.rounds, 0);
@@ -230,7 +238,7 @@ mod tests {
 
     #[test]
     fn a_new_or_missing_pull_request_ends_the_stretch_without_a_result() {
-        let mut ci = RunCi::default();
+        let mut ci = PrCi::default();
         ci.observe(Some(7), Some(checks(Pending, 0, 0)), 10, id(1));
         let effects = ci.observe(Some(8), Some(checks(Pending, 0, 0)), 20, id(2));
         assert!(matches!(
@@ -256,7 +264,7 @@ mod tests {
 
     #[test]
     fn the_run_ending_ends_the_stretch_with_the_last_counts() {
-        let mut ci = RunCi::default();
+        let mut ci = PrCi::default();
         ci.observe(Some(7), Some(checks(Pending, 2, 0)), 10, id(1));
         assert_eq!(
             ci.end_run(),
@@ -275,7 +283,7 @@ mod tests {
 
     #[test]
     fn missing_or_unknown_checks_change_nothing() {
-        let mut ci = RunCi::default();
+        let mut ci = PrCi::default();
         assert!(ci.observe(Some(7), None, 10, id(1)).is_empty());
         assert!(
             ci.observe(

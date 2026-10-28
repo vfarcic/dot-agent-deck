@@ -13109,3 +13109,37 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 - **Asserts:** the native child has nonzero dimensions matching the overlay frame; OCR of the composed X display inside that frame finds the real PR title; Back, Open in browser and Close are visible and usable; Close and Escape from both the toolbar and focused GitHub page remove the overlay and native view; the system-browser handoff receives the real PR URL. The same checks run from the agent pane and the overview row as a control.
 - **Does not assert:** macOS WKWebView or Windows WebView2 placement; GitHub login or cookie persistence; real-agent work. The system browser is replaced by a URL recorder, while the embedded GitHub page is real.
 - **Platform coverage:** Verified on Linux WebKitGTK only, under Xvfb at 96 DPI; macOS WKWebView is not covered and the reported macOS blank/unclosable page was not reproduced here. In addition to the driver tier's prerequisites, this local scenario needs authenticated `gh`, network access to GitHub and PR #1601, Tesseract (`DAD_DRIVER_TESSERACT` or PATH), `/usr/bin/python3` with PyGObject/Gdk 3, and `xdotool` (`DAD_DRIVER_XDOTOOL` or PATH). Nix WebKitGTK also needs its `glib-networking` modules supplied in `GIO_EXTRA_MODULES` for HTTPS. From the repository root, run `DAD_DRIVER_REAL_GITHUB=1 bash desktop/scripts/driver-test.sh` to build and run the driver suite including this scenario; use `--no-build` only with an existing driver-seam-enabled embedded bundle. Evidence, including passing runs, is saved under the gitignored `desktop/driver-results/pull-request-live-<pid>/`.
+
+## Test Case Catalog — Telemetry identity
+
+##### telemetry/otlp/024 — Child spans and deck events carry their run's agent and orchestration identity.
+
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_span_identity.rs`).
+- **Agent:** declared Pi shell/cat stand-in; synthetic hooks, offline usage reply and fake gh rollups.
+- **Asserts:** agent.operation, agent.status, agent.ci and deck.status_change, deck.intervention, deck.ci.change, deck.model_usage exist and carry the run's deck.agent, deck.role and deck.orchestration.id.
+- **Does not assert:** real-agent hook production, provider telemetry or unscoped affected_checks spans.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/025 — Two runs observing one PR export its CI history once.
+
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_span_identity.rs`).
+- **Agent:** two shell/cat stand-ins in one worktree with offline gh rollups.
+- **Asserts:** both runs observe pending → failing → pending → passing and retain two observed rounds and one failure each; the receiver gets two CI intervals and four change events in total.
+- **Does not assert:** deduplication across daemons, different repositories with the same PR number or ownership handoff while checks are pending.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/026 — Unknown launchers learn agent identity from hooks while declared identity stays authoritative.
+
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_span_identity.rs`).
+- **Agent:** unknown shell/cat launchers and a declared Pi stand-in with synthetic Claude hooks.
+- **Asserts:** hook-learned Claude run identity and source=hook, declared Pi identity and source=spawn despite conflicting hooks, resolved identities on post-hook operation/thinking/working spans, and deck.agent=none with source absent for a silent unknown run.
+- **Does not assert:** real-agent detection or retrospective relabelling of child spans exported before identifying hooks.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/027 — A dispatched run exports its registry unit name without exporting its branch.
+
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_span_identity.rs`).
+- **Agent:** declared Pi shell/cat caller and dispatched single unit.
+- **Asserts:** the real dispatch CLI starts a unit in its worktree; the completed run carries deck.dispatch.name equal to the requested unit and exported spans exclude its branch name.
+- **Does not assert:** dispatched orchestration workers, registry recovery after daemon restart or full branch/content privacy (telemetry/otlp/004).
+- **Platform coverage:** mac+linux.

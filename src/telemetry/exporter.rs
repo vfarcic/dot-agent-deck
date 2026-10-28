@@ -66,7 +66,7 @@ use super::propagation::{RunIdentity, agent_env};
 use super::resource::{ResourceAttribute, deck_resource, host_name};
 use super::run_context::{ProbeSettings, Probes};
 use super::span::{SpanRecord, new_run_id};
-use super::tracker::{EndReason, FinishingRun, RunStart, RunTracker};
+use super::tracker::{EndReason, FinishingRun, RunGeneration, RunStart, RunTracker};
 use super::{Protocol, now_unix_nanos, otlp};
 
 /// Spans per request, at most.
@@ -388,6 +388,9 @@ enum Command {
         pane_id: String,
         run_id: String,
     },
+    /// A unit was dispatched: look up the dispatched unit of each open run
+    /// that has none yet ([`Shared::name_dispatched_runs`]).
+    Dispatched,
     /// Acknowledged once everything sent before it, broadcast included, is
     /// applied.
     #[cfg(test)]
@@ -440,6 +443,11 @@ impl PaneInput {
 
 type Filters = Mutex<HashMap<String, Vec<PaneInput>>>;
 
+/// The name of the dispatched unit an open run's generation belongs to, from
+/// the deck's record of dispatched units, or `None` when it belongs to none.
+/// See [`Telemetry::set_dispatch_lookup`].
+pub type DispatchLookup = Box<dyn Fn(&RunGeneration) -> Option<String> + Send + Sync>;
+
 fn lock_filters(filters: &Filters) -> std::sync::MutexGuard<'_, HashMap<String, Vec<PaneInput>>> {
     filters.lock().unwrap_or_else(|p| p.into_inner())
 }
@@ -485,6 +493,8 @@ struct Shared {
     /// Batches of ended runs, one per [`Shared::complete_later`] call with
     /// any, whose task has not ended yet: not runs.
     finalizing: watch::Sender<usize>,
+    /// See [`Telemetry::set_dispatch_lookup`].
+    dispatch_lookup: OnceLock<DispatchLookup>,
     /// Test seam: pauses the ingest task once inside its `escape_held`
     /// branch, after signalling the first half, until the second receives.
     #[cfg(test)]
@@ -704,6 +714,24 @@ impl Telemetry {
     /// first on the `PATH` of every agent from now on.
     pub fn set_shim_dir(&mut self, dir: PathBuf) {
         self.shim_dir = Some(dir);
+    }
+
+    /// Name each open run's dispatched unit with `lookup`, asked with the
+    /// tracker let go: as each poll of the runs' usage comes round, and at
+    /// once after [`Self::dispatched`]. The first lookup set stays. Nothing
+    /// happens when not exporting.
+    pub fn set_dispatch_lookup(&self, lookup: DispatchLookup) {
+        if let Some(exporting) = &self.exporting {
+            let _ = exporting.shared.dispatch_lookup.set(lookup);
+        }
+    }
+
+    /// A unit was dispatched and recorded: name the runs it opened now, after
+    /// their runs are open, rather than at the next poll.
+    pub fn dispatched(&self) {
+        if let Some(exporting) = &self.exporting {
+            let _ = exporting.commands.send(Command::Dispatched);
+        }
     }
 
     /// Whether telemetry is configured at all (export or propagation).
@@ -1222,6 +1250,33 @@ impl Shared {
         });
     }
 
+    /// Name the dispatched unit of every open run that has none yet, by the
+    /// lookup [`Telemetry::set_dispatch_lookup`] set. The lookup is asked with
+    /// the tracker let go, so it may take the deck's own locks; only the
+    /// ingest task opens and ends runs, so a run it names is still the one it
+    /// was asked about, or has ended and is not named.
+    fn name_dispatched_runs(&self) {
+        let Some(lookup) = self.dispatch_lookup.get() else {
+            return;
+        };
+        let runs = self
+            .tracker
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .runs_without_dispatch();
+        let named: Vec<(String, String)> = runs
+            .into_iter()
+            .filter_map(|run| lookup(&run).map(|name| (run.run_id, name)))
+            .collect();
+        if !named.is_empty() {
+            self.with_tracker(|t| {
+                for (run_id, name) in &named {
+                    t.set_dispatch_name(run_id, name);
+                }
+            });
+        }
+    }
+
     fn lock_filters(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<PaneInput>>> {
         lock_filters(&self.filters)
     }
@@ -1350,6 +1405,7 @@ fn start_exporting(
         runtime: tokio::runtime::Handle::current(),
         me: me.clone(),
         finalizing: watch::Sender::new(0),
+        dispatch_lookup: OnceLock::new(),
         #[cfg(test)]
         timer_gate: Mutex::new(None),
         #[cfg(test)]
@@ -1403,7 +1459,10 @@ async fn run_ingest(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiver<C
             () = sleep_until(escape_due) => {
                 escape_due = shared.settle_escapes(std::time::Instant::now());
             }
-            _ = usage_poll.tick() => shared.poll_usage(&usage_polling),
+            _ = usage_poll.tick() => {
+                shared.poll_usage(&usage_polling);
+                shared.name_dispatched_runs();
+            }
             msg = next_event(&mut events) => match msg {
                 Ok(msg) => shared.observe(&msg),
                 Err(broadcast::error::RecvError::Lagged(missed)) => {
@@ -1517,6 +1576,7 @@ fn apply(shared: &Arc<Shared>, command: Command) -> bool {
             }
         }
         Command::HumanInput { pane_id, run_id } => shared.take_input(&pane_id, &run_id),
+        Command::Dispatched => shared.name_dispatched_runs(),
         #[cfg(test)]
         Command::Barrier(ack) => {
             // Once the runs ended before it are completed too.
@@ -3367,6 +3427,36 @@ mod tests {
             agent: AgentType::None,
             ..generation(pane, agent_id)
         }
+    }
+
+    /// Issue #1981 M6: once a unit is dispatched, its runs are named by the
+    /// lookup straight away — after their commit, so a run that ends at once
+    /// still carries the name — and a run the lookup does not know is not.
+    #[tokio::test]
+    async fn a_dispatch_names_its_runs_at_once() {
+        let (telemetry, mut rx) = capturing(ProbeSettings::default());
+        telemetry.set_dispatch_lookup(Box::new(|run| {
+            (run.agent_id.as_deref() == Some("a1")).then(|| "My Unit: exact".to_string())
+        }));
+        begin(&telemetry, command_run("p1", "a1"), &[]);
+        begin(&telemetry, command_run("p2", "a2"), &[]);
+        telemetry.dispatched();
+        telemetry.end_run("p1", Some("a1"), EndReason::Closed, None);
+        telemetry.end_run("p2", Some("a2"), EndReason::Closed, None);
+        let mut spans = Vec::new();
+        eventually("both runs' spans were queued", || {
+            spans.extend(captured(&mut rx));
+            ended_runs(&spans).len() == 2
+        })
+        .await;
+        let name = |pane: &str| {
+            ended_runs(&spans)
+                .iter()
+                .find(|s| attr(s, AttrKey::PaneId) == Some(&AttrValue::Str(pane.into())))
+                .and_then(|s| attr(s, AttrKey::DispatchName).cloned())
+        };
+        assert_eq!(name("p1"), Some(AttrValue::Str("My Unit: exact".into())));
+        assert_eq!(name("p2"), None);
     }
 
     fn ended_runs(spans: &[SpanRecord]) -> Vec<&SpanRecord> {

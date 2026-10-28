@@ -942,6 +942,9 @@ pub async fn handle_dispatch(
     };
     match spawned {
         Ok(handle) => {
+            // Issue #1981: the unit is recorded and its runs are open, so
+            // telemetry can name them with the unit's exact name now.
+            crate::telemetry::observe_dispatch(&ctx.registry);
             // PRD #220 M2.0 / PRD #1589 D5: the caller was retained for the
             // unit's completion report inside the spawn, before the task was
             // delivered — see `crate::spawn::spawn_dispatched_unit`.

@@ -89,15 +89,47 @@ use std::sync::Arc;
 /// the daemon itself ([`teardown_began`]).
 pub fn start_for_daemon(
     event_tx: &tokio::sync::broadcast::Sender<crate::event::BroadcastMsg>,
-    registry: &crate::agent_pty::AgentPtyRegistry,
+    registry: &Arc<crate::agent_pty::AgentPtyRegistry>,
 ) -> Arc<Telemetry> {
-    start_from(
+    let telemetry = start_from(
         &config::process_env(),
         exporter::default_config_dir(),
         crate::platform::paths::executable_path().as_deref(),
         event_tx,
         registry,
-    )
+    );
+    let registry = Arc::downgrade(registry);
+    telemetry.set_dispatch_lookup(Box::new(move |run| {
+        dispatch_name(&*registry.upgrade()?, run)
+    }));
+    telemetry
+}
+
+/// `deck.dispatch.name` for the open run `run`: the name, exactly as it was
+/// dispatched, of the live unit the deck's record of dispatched units says
+/// its generation belongs to
+/// ([`crate::dispatched_units::DispatchedUnits::unit_of_generation`]). Never
+/// read from the pane id or the branch, which hold a shortened slug of it.
+fn dispatch_name(
+    registry: &crate::agent_pty::AgentPtyRegistry,
+    run: &tracker::RunGeneration,
+) -> Option<String> {
+    registry
+        .dispatched_units()
+        .unit_of_generation(
+            Some(&run.pane_id),
+            run.agent_id.as_deref()?,
+            run.orchestration_id.as_deref(),
+        )
+        .map(|unit| unit.name.clone())
+}
+
+/// The dispatch path, once a unit is recorded: name the runs it opened
+/// ([`Telemetry::dispatched`]).
+pub fn observe_dispatch(registry: &crate::agent_pty::AgentPtyRegistry) {
+    if let Some(telemetry) = registry.telemetry() {
+        telemetry.dispatched();
+    }
 }
 
 /// `config_dir` holds this daemon's per-run agent configuration files and its
@@ -376,6 +408,8 @@ pub enum AttrKey {
     CiChecksSkipped,
     CiRoundsCount,
     CiFailuresCount,
+    AgentSource,
+    DispatchName,
     /// PRD #1858: a run's usage and termination, and one model's usage on a
     /// `deck.model_usage` event ([`accounting::AccountingKey`]).
     Accounting(accounting::AccountingKey),
@@ -424,6 +458,8 @@ impl AttrKey {
         AttrKey::CiChecksSkipped,
         AttrKey::CiRoundsCount,
         AttrKey::CiFailuresCount,
+        AttrKey::AgentSource,
+        AttrKey::DispatchName,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -467,6 +503,8 @@ impl AttrKey {
             AttrKey::CiChecksSkipped => "deck.ci.checks.skipped",
             AttrKey::CiRoundsCount => "deck.ci.rounds.count",
             AttrKey::CiFailuresCount => "deck.ci.failures.count",
+            AttrKey::AgentSource => "deck.agent.source",
+            AttrKey::DispatchName => "deck.dispatch.name",
             AttrKey::Accounting(key) => key.as_str(),
         }
     }
@@ -493,6 +531,81 @@ pub fn now_unix_nanos() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #1981 M6: `deck.dispatch.name` comes from the deck's record of
+    /// dispatched units, as the unit was named — a name longer than its pane
+    /// id and branch can hold, whose slug differs from it — for the single
+    /// unit's own generation and for every role of an orchestration unit, and
+    /// for no other generation.
+    #[test]
+    fn a_runs_dispatch_name_is_the_registrys_exact_name() {
+        use crate::dispatched_units::{Dispatcher, NewUnit, UnitKind, slug_of};
+        let registry = crate::agent_pty::AgentPtyRegistry::new();
+        let single = "Fix: the Very Long unit name — with spaces, punctuation and more than \
+                      sixty-four bytes, which no pane id keeps whole";
+        let team = "Team UNIT #2";
+        assert_ne!(slug_of(single), single);
+        assert_ne!(slug_of(team), team);
+        for (name, kind) in [
+            (
+                single,
+                UnitKind::Single {
+                    pane_id: "sched-dispatch-fix-the-very-long-0".into(),
+                    agent_id: "a1".into(),
+                },
+            ),
+            (
+                team,
+                UnitKind::Orchestration {
+                    orchestration_id: "orch-7".into(),
+                    name: "tdd".into(),
+                    terminal_pane_id: "sched-dispatch-team-unit-2-0".into(),
+                    terminal_agent_id: "a2".into(),
+                },
+            ),
+        ] {
+            registry.dispatched_units().register(NewUnit {
+                name: name.into(),
+                worktree: format!("/w/{}", slug_of(name)).into(),
+                branch: format!("agent/dispatch-{}", slug_of(name)),
+                clone_dir: "/w".into(),
+                dispatcher: Dispatcher {
+                    pane_id: "p0".into(),
+                    agent_id: "a0".into(),
+                },
+                kind,
+                dispatched_at_ms: 1,
+            });
+        }
+        let run = |pane: &str, agent: &str, orchestration: Option<&str>| tracker::RunGeneration {
+            run_id: "r".into(),
+            pane_id: pane.into(),
+            agent_id: Some(agent.into()),
+            orchestration_id: orchestration.map(str::to_string),
+        };
+        assert_eq!(
+            dispatch_name(
+                &registry,
+                &run("sched-dispatch-fix-the-very-long-0", "a1", None)
+            )
+            .as_deref(),
+            Some(single)
+        );
+        assert_eq!(
+            dispatch_name(&registry, &run("any-role-pane", "a9", Some("orch-7"))).as_deref(),
+            Some(team),
+            "every role of the orchestration"
+        );
+        assert_eq!(
+            dispatch_name(
+                &registry,
+                &run("sched-dispatch-fix-the-very-long-0", "a-next", None)
+            ),
+            None,
+            "another generation of the pane is not the unit"
+        );
+        assert_eq!(dispatch_name(&registry, &run("p5", "a5", None)), None);
+    }
 
     #[test]
     fn the_end_reason_follows_shutdown_then_registration() {

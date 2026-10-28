@@ -82,7 +82,8 @@ The deck's runs appear in a dataset named `dot-agent-deck` (or your `OTEL_SERVIC
 - `WHERE name = agent.run`, `GROUP BY deck.role`, `VISUALIZE AVG(deck.interventions.count)` — which roles need you most.
 - `WHERE name = agent.status AND deck.status = blocked`, `GROUP BY host.name`, `VISUALIZE SUM(duration_ms)` — time spent waiting on a permission prompt, per machine.
 - `WHERE name = agent.operation`, `GROUP BY deck.operation.commands`, `VISUALIZE SUM(duration_ms)` — where agents' shell time goes, for example how much of it `cargo test` takes against `cargo build`. Grouping by `deck.operation.commands` rather than by `deck.operation.program` and `deck.operation.word` keeps `cargo fmt && cargo test` apart from a plain `cargo fmt`.
-- `WHERE name = agent.ci AND deck.ci.result exists`, `GROUP BY deck.ci.result`, `VISUALIZE HEATMAP(duration_ms)` — how long CI takes on the pull requests agents open; compare two periods to see what a change to your CI setup did.
+- `WHERE name = agent.ci AND deck.ci.result exists`, `GROUP BY deck.ci.result`, `VISUALIZE HEATMAP(duration_ms)` — how long CI takes on the pull requests agents open; compare two periods to see what a change to your CI setup did. Each stretch of a pull request's CI is sent once, however many of the deck's runs watched it.
+- `WHERE name = agent.operation`, `GROUP BY deck.role`, `VISUALIZE SUM(duration_ms)` — which roles spend the most time in shell commands. Every span and event carries the run's agent, role and orchestration, so no join to `agent.run` is needed.
 
 To see everything one run did, take its `deck.run.id` from an `agent.run` span and query all datasets in the environment with `WHERE deck.run.id = <that id>`: the deck's spans and the agent's own events come back together.
 
@@ -108,21 +109,23 @@ A run starts when the deck starts an agent in a pane and ends when the agent exi
 | --- | --- |
 | `deck.run.id` | A new unique id for this run. The agent gets the same id, which is how its own telemetry joins the run ([below](#agents-own-telemetry)). |
 | `deck.pane.id` | The pane the agent ran in. |
-| `deck.agent` | The agent: `claude`, `opencode`, `codex`, `pi`, `devin`, or `none` for a command the deck does not recognise as an agent. |
+| `deck.agent` | The agent: `claude`, `opencode`, `codex`, `pi`, `devin`, or `none` for a command the deck does not recognise as an agent. When the deck does not recognise the command that started the run, such as a launcher script or a plain shell you then start an agent from, the run takes the agent its hooks report once they report one. An agent the deck recognised when the run started stays that agent, whatever its hooks say. |
+| `deck.agent.source` | Where `deck.agent` came from: `spawn` when the deck knew the agent as it started the run, `hook` when it learned it from the agent's hooks. Absent when the run stayed `none`. |
 | `deck.role` | The orchestration role, for an agent in an orchestration. |
 | `deck.orchestration.name` | The orchestration's name. |
 | `deck.orchestration.id` | The id of that run of the orchestration, the same for every role in it. |
 | `deck.orchestrator` | `true` for the orchestration's orchestrator, `false` for its other roles. |
 | `deck.instructions.commit` | The commit that last changed `CLAUDE.md`, `AGENTS.md` or `.claude/skills` at the root of the agent's repository, whichever directory in it the agent runs from, so you can compare runs before and after an instructions change. Absent outside a git repository or when none of those has any history. |
 | `vcs.repository.name` | The repository's name, taken from the last part of its `origin` remote (`dot-agent-deck` for `git@github.com:vfarcic/dot-agent-deck.git`). The remote's URL itself is never sent. |
-| `deck.pr.number` | The pull request the agent's branch has, once the deck has found it (the same pull request the card's badge shows). |
+| `deck.pr.number` | The pull request the agent's branch has, once the deck has found it (the same pull request the card's badge shows). The run keeps the last one it saw: when the branch later has no pull request, for example after the pull request merged and the worktree moved on, the run still names it. Absent when the run never saw one. |
+| `deck.dispatch.name` | For a run started by `dot-agent-deck dispatch`, the name the unit was dispatched with, exactly as given. Every role of a dispatched orchestration carries it. After an agent of the unit restarts, its new run can take a few seconds to get it, so a restarted agent that runs for less than that may not have it. |
 | `deck.run.end_reason` | `exited` (the agent exited by itself), `closed` (its pane was closed, or the deck stopped the agent, for example to restart it in its pane), `daemon_shutdown`, or `unknown` when the deck could not tell how the run ended. |
 | `deck.run.exit_code` | The exit status of an agent or command that exited by itself. Absent otherwise: when a signal ended it, when its pane was closed or the daemon stopped, or when the deck could not read the status. |
 | `deck.status_changes.count` | How many status changes the run had. |
 | `deck.interventions.count` | How many times you stepped in (see `deck.intervention` below). |
 | `deck.operations.count` | How many shell commands the agent ran (see [`agent.operation`](#agentoperation)). |
-| `deck.ci.rounds.count` | How many times the pull request's checks went from running to a result (see [`agent.ci`](#agentci)). |
-| `deck.ci.failures.count` | How many of those ended failing. |
+| `deck.ci.rounds.count` | How many times the pull request's checks went from running to a result while this run watched it (see [`agent.ci`](#agentci)). Runs that watch the same pull request, such as the roles of one orchestration, each count the same rounds, so do not add them up across runs: to count a pull request's rounds, count its `agent.ci` spans that have a `deck.ci.result`, grouped by `deck.pr.number`. |
+| `deck.ci.failures.count` | How many of those ended failing, counted the same way. |
 
 Events on the `agent.run` span:
 
@@ -130,7 +133,9 @@ Events on the `agent.run` span:
 | --- | --- | --- |
 | `deck.status_change` | `deck.status.from`, `deck.status.to` | The agent's status changed. The first status of a run has only `deck.status.to`. |
 | `deck.intervention` | `deck.intervention.kind` (`input`) | You typed into the agent's pane from either client, or answered its question by voice in the desktop app. Keystrokes less than about five seconds apart count as one intervention. Input the deck sends on its own, such as a delegated task, a message or a scheduled prompt, is not counted, and neither are the replies your terminal sends without you, such as answers to the agent's questions about the cursor position or colours. |
-| `deck.ci.change` | `deck.ci.from`, `deck.ci.to`, `deck.pr.number` | The overall result of the pull request's checks changed: `pending`, `passing` or `failing`. The first one for a pull request has only `deck.ci.to`. |
+| `deck.ci.change` | `deck.ci.from`, `deck.ci.to`, `deck.pr.number` | The overall result of the pull request's checks changed: `pending`, `passing` or `failing`. The first one for a pull request has only `deck.ci.to`. When several runs watch the same pull request, it is sent once, on the run that has watched it longest. |
+
+Every event on the run also carries `deck.agent`, and `deck.role` and `deck.orchestration.id` for an orchestration role, with the same values as the run. For a run that learned its agent from its hooks, an event from before that says `none`.
 
 A run with many changes keeps its first 1024 events; the two counts keep counting after that.
 
@@ -214,7 +219,7 @@ The OpenCode and Pi figures arrive through the plugin and extension the deck ins
 
 ### `agent.status`
 
-One span per stretch of time in one status, ending at the next change or with the run. Attributes: `deck.status`, plus `deck.run.id` and `deck.pane.id` so you can query status time without the parent. The statuses are the ones the dashboard shows ([Session Management](session-management.md)): `thinking`, `working`, `compacting`, `waiting`, `idle`, `error`, `blocked` and `unknown`.
+One span per stretch of time in one status, ending at the next change or with the run. Attributes: `deck.status`, plus `deck.run.id`, `deck.pane.id`, `deck.agent`, and `deck.role` and `deck.orchestration.id` for an orchestration role, so you can query status time without the parent. They have the run's values; a span that ended before a run learned its agent from its hooks says `none`. The statuses are the ones the dashboard shows ([Session Management](session-management.md)): `thinking`, `working`, `compacting`, `waiting`, `idle`, `error`, `blocked` and `unknown`.
 
 ### `agent.operation`
 
@@ -226,7 +231,7 @@ One span per shell command the agent ran, from when the agent started it to when
 | `deck.operation.word` | The first argument after the program, only when no option comes before it: `test` in `cargo test --workspace`, `pr` in `gh pr checks`, and nothing in `git -C repo status`. |
 | `deck.operation.commands` | Every command in the line, in order, each as its program or its program and word with a space between, joined with `,`: `cargo fmt,cargo xtask` for `cargo fmt && cargo xtask affected-checks --run`, and `cargo test` for a line of one command. At most 8 commands. Absent when the first command is recorded without a program. |
 | `deck.operation.wrapped.program`, `deck.operation.wrapped.word` | The program and word of the command a wrapper runs, when the first command is one of the wrappers listed below: `cargo` and `test` for `timeout 600 cargo test`. |
-| `deck.run.id`, `deck.pane.id` | The run, as on `agent.status`. |
+| `deck.run.id`, `deck.pane.id`, `deck.agent`, `deck.role`, `deck.orchestration.id` | The run, as on `agent.status`. |
 
 The span does not say whether the command succeeded. Some agents send that with their own telemetry, joined to the run by `deck.run.id`: Claude Code's tool-result events and Pi's `pi.tool_result` say whether each tool call succeeded ([Agents' own telemetry](#agents-own-telemetry)). Claude Code does not tell the deck when a command fails, so the span of a command that failed in Claude Code can last until the run ends.
 
@@ -261,14 +266,14 @@ Which agents report their shell commands:
 
 ### `agent.ci`
 
-One span per stretch of time the run's pull request had CI checks running, from when the deck first saw them `pending` to when it saw them `passing` or `failing`. It comes from the same check of the pull request that puts the CI badge on the agent's card, so it covers the pull request of the agent's branch once the deck has found it.
+One span per stretch of time a pull request had CI checks running, from when the deck first saw them `pending` to when it saw them `passing` or `failing`. It comes from the same check of the pull request that puts the CI badge on the agent's card, so it covers the pull request of the agent's branch once the deck has found it. **Each stretch is sent once**, however many of the deck's runs watch the pull request (two decks, such as on two machines, each send their own): it is a child of the run that had watched the pull request longest when the checks started, and it can end after that run did, while another run still watches the pull request.
 
 | Attribute | Value |
 | --- | --- |
 | `deck.pr.number` | The pull request. |
-| `deck.ci.result` | `passing` or `failing`. Absent when the stretch ended for another reason: the run ended first, or the agent's branch moved to another pull request. |
+| `deck.ci.result` | `passing` or `failing`. Absent when the stretch ended for another reason: every run watching the pull request ended first, or their branches moved to another pull request. |
 | `deck.ci.checks.passing`, `deck.ci.checks.failing`, `deck.ci.checks.skipped` | How many checks were in each state when the stretch ended. |
-| `deck.run.id`, `deck.pane.id` | The run, as on `agent.status`. |
+| `deck.run.id`, `deck.pane.id`, `deck.agent`, `deck.role`, `deck.orchestration.id` | The run the span is a child of, as on `agent.status`. |
 
 The deck checks the pull request about once a minute (`DOT_AGENT_DECK_PR_REFRESH_SECS` in the daemon's environment changes that), so a stretch's start and end are each up to one check late: compare CI times over many runs rather than reading one to the second. The deck reads the checks as GitHub rolls them up for the pull request, which does not say which CI system ran each one, so to compare two CI setups, compare the periods before and after you switched.
 
@@ -282,7 +287,7 @@ The deck builds what it sends from the attributes on this page. The values of `O
 - secrets: API keys, the values of environment variables, and the values of your OTLP headers (those go to the endpoint you configured as headers, and to nothing else, and the deck does not write them to its log);
 - pane titles, status details, branch names, working-directory paths, remote URLs, or command lines;
 - an agent's error messages: a failed run carries the kind of failure from a known list, or `other`;
-- names you chose: a model name is sent only when the deck recognises it as a known model's name, and a Codex plan only from the plans Codex is known to report.
+- names you chose: a model name is sent only when the deck recognises it as a known model's name, and a Codex plan only from the plans Codex is known to report. The exceptions are the orchestration and role names from your configuration, and the name you give `dot-agent-deck dispatch`, which is sent as `deck.dispatch.name`; the branch the dispatch creates is not sent.
 
 The [collector](#cpu-memory-and-disk-per-run), a separate program you run yourself, sends a worktree's path only when you start it with `--send-worktree-paths`; [What it sends](#what-it-sends) has its list.
 

@@ -358,7 +358,10 @@ fn telemetry_otlp_002_exports_run_and_status_intervals() {
     let pane = agent.pane_id_env.as_deref().unwrap();
     let run = receiver.run(pane);
     assert!(!attribute(&run, "deck.run.id").is_empty(), "run id: {run}");
-    assert_eq!(attribute(&run, "deck.agent"), "none");
+    // Issue #1981 M4: started as no known agent, the run takes the agent its
+    // hooks name.
+    assert_eq!(attribute(&run, "deck.agent"), "claude");
+    assert_eq!(attribute(&run, "deck.agent.source"), "hook");
     assert_eq!(attribute(&run, "deck.run.end_reason"), "closed");
     let spans = receiver.spans();
     let children: Vec<_> = spans
