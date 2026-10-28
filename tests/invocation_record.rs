@@ -2075,11 +2075,14 @@ fn probe_058_the_first_stop_keeps_its_provenance() {
     );
 }
 
-/// Scenario: Two generations fill the record cap under `Hold` with the same 64 `Armed` helpers, then see a 65th helper at the same moment in a scan with no decision: in one it is attributed `Owned` with an `Owned` claim, in the other `NotOwned(Shape)` with no claim. Both stop as `EditorUnconfirmed` with no record, yet each first stop keeps the attribution and claim it was dropped with, and still does after the generation retires and its event is taken. A third generation's first stop, an identity refusal of an `Unarmed` request reported through the input lock, keeps the request's claim through retirement and has no attribution.
+/// Scenario: Generations fill the record cap under `Hold` with the same 64 `Armed` helpers, then each sees one more helper at the same moment. Two scans with no decision and no claim, one attributed `Owned` and one `NotOwned(Shape)`, stop alike except for the attribution each first stop keeps; two `Unarmed` IPC requests with the same attribution, one claiming `Owned` and one `Tool`, stop alike except for the claim each keeps. A last generation's first stop, an identity refusal of an `Unarmed` request reported through the input lock, keeps the request's claim through retirement and has no attribution.
 #[spec("inbox/probe/058")]
 #[test]
 fn probe_058_a_stop_dropped_at_the_cap_keeps_its_attribution() {
-    let capped = |attribution: Attribution, claim: Option<Claim>| {
+    let capped = |channel: Channel,
+                  attribution: Attribution,
+                  claim: Option<Claim>,
+                  decision: Option<Decision>| {
         let t0 = Instant::now();
         let input = GenerationInput::new(CprWaitEnd::Counted);
         assert!(input.attach_records(Records::new(G, HOLD, t0)));
@@ -2098,10 +2101,10 @@ fn probe_058_a_stop_dropped_at_the_cap_keeps_its_attribution() {
             input.record_observe(&o(100 + pid), t0 + ms(5)).unwrap();
         }
         let dropped = Observation {
-            channel: Channel::Scan,
+            channel,
             attribution,
             claim,
-            decision: None,
+            decision,
             ..o(1)
         };
         assert_eq!(
@@ -2114,8 +2117,15 @@ fn probe_058_a_stop_dropped_at_the_cap_keeps_its_attribution() {
             .stopped
             .unwrap()
     };
-    let owned = capped(OWNED, Some(Claim::Owned));
-    let shape = capped(Attribution::NotOwned(NotOwned::Shape), None);
+
+    // Two scans, no claim in either, differing only in attribution.
+    let owned = capped(Channel::Scan, OWNED, None, None);
+    let shape = capped(
+        Channel::Scan,
+        Attribution::NotOwned(NotOwned::Shape),
+        None,
+        None,
+    );
     assert_eq!(
         (owned.cause, owned.after, owned.record),
         (shape.cause, shape.after, shape.record)
@@ -2128,7 +2138,7 @@ fn probe_058_a_stop_dropped_at_the_cap_keeps_its_attribution() {
             channel: Channel::Scan,
             decision: None,
             attribution: OWNED,
-            claim: Some(Claim::Owned),
+            claim: None,
         }
     );
     assert_eq!(
@@ -2145,6 +2155,36 @@ fn probe_058_a_stop_dropped_at_the_cap_keeps_its_attribution() {
         shape.attribution(),
         Some(Attribution::NotOwned(NotOwned::Shape))
     );
+
+    // Two IPC requests, same attribution, differing only in claim.
+    let unarmed = Some(Decision::Unarmed);
+    let claims_owned = capped(Channel::Ipc, OWNED, Some(Claim::Owned), unarmed);
+    let claims_tool = capped(Channel::Ipc, OWNED, Some(Claim::Tool), unarmed);
+    assert_eq!(
+        (claims_owned.cause, claims_owned.after, claims_owned.record),
+        (claims_tool.cause, claims_tool.after, claims_tool.record)
+    );
+    assert_eq!(claims_owned.cause, Cause::EditorReturnUnchecked);
+    assert_ne!(claims_owned, claims_tool);
+    assert_eq!(
+        claims_owned.source,
+        StopSource::DroppedAtCap {
+            channel: Channel::Ipc,
+            decision: unarmed,
+            attribution: OWNED,
+            claim: Some(Claim::Owned),
+        }
+    );
+    assert_eq!(
+        claims_tool.source,
+        StopSource::DroppedAtCap {
+            channel: Channel::Ipc,
+            decision: unarmed,
+            attribution: OWNED,
+            claim: Some(Claim::Tool),
+        }
+    );
+    assert_eq!(claims_owned.attribution(), claims_tool.attribution());
 
     // An identity refusal keeps the request's claim through retirement.
     let t0 = Instant::now();
