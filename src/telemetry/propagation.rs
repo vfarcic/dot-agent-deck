@@ -226,7 +226,7 @@ mod tests {
         assert_eq!(attr("deck.orchestration.name"), Some("tdd"));
         assert_eq!(attr("deck.orchestration.id"), Some("orch-1"));
         assert_eq!(attr("host.name"), Some("studio"));
-        assert_eq!(attr("deck.telemetry.schema_version"), Some("2"));
+        assert_eq!(attr("deck.telemetry.schema_version"), Some("3"));
         assert!(
             get(&out, OTEL_RESOURCE_ATTRIBUTES)
                 .unwrap()

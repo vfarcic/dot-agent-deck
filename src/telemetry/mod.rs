@@ -334,7 +334,7 @@ pub fn observe_pane_input(
 
 /// `deck.telemetry.schema_version`: bumped whenever the attribute set changes
 /// in a way that makes data recorded before and after it incomparable.
-pub const SCHEMA_VERSION: &str = "2";
+pub const SCHEMA_VERSION: &str = "3";
 
 /// The service name a span batch carries when `OTEL_SERVICE_NAME` is unset.
 pub const DEFAULT_SERVICE_NAME: &str = "dot-agent-deck";

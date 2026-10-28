@@ -100,7 +100,7 @@ A run starts when the deck starts an agent in a pane and ends when the agent exi
 | `service.name` | `dot-agent-deck`, or `OTEL_SERVICE_NAME` |
 | `service.version` | The deck's version |
 | `host.name` | The machine's hostname. Tells several machines apart in one backend. |
-| `deck.telemetry.schema_version` | `2`. It changes when the meaning of an attribute on this page changes, so you can keep data recorded before and after apart. A new attribute does not change it. |
+| `deck.telemetry.schema_version` | `3`. It changes when the meaning of an attribute on this page changes, so you can keep data recorded before and after apart. A new attribute does not change it. In `3`, every `agent.status`, `agent.operation` and `agent.ci` span and every event on a run carries the run's agent and role, `agent.ci` spans and `deck.ci.change` events are sent once per pull request instead of once per run watching it, `deck.agent` can come from the agent's hooks, and `deck.pr.number` keeps the last pull request the run saw. Compare CI counts within one version. |
 | your own | Every pair from `OTEL_RESOURCE_ATTRIBUTES`. Your pairs cannot replace the four above; set `OTEL_SERVICE_NAME` to rename the service. |
 
 ### `agent.run`
