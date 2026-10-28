@@ -227,8 +227,9 @@ if [ ${#OPTION_BLOCKS[@]} -gt 0 ]; then
   # Drops any earlier copy of the blocks and the blank lines around them, then
   # writes them back after the PATH block, so a re-run leaves the file unchanged.
   # The markers were checked at the top of this layer, so every opening marker
-  # here has its own close.
-  awk -v block="$(printf '%s\n\n' "${OPTION_BLOCKS[@]}")" '
+  # here has its own close. A rewrite that fails part-way leaves the blocks in
+  # ~/.bashrc as they were and removes its partial copy.
+  if ! awk -v block="$(printf '%s\n\n' "${OPTION_BLOCKS[@]}")" '
     /^# >>> dad-box (USE_VALS|RELAY)/ { open = 1; next }
     /^# <<< dad-box (USE_VALS|RELAY)/ { open = 0; next }
     open { next }
@@ -236,7 +237,11 @@ if [ ${#OPTION_BLOCKS[@]} -gt 0 ]; then
     gap { print ""; gap = 0 }
     { print }
     /^# <<< dad-box PATH/ { print ""; print block; gap = 1 }
-  ' "$HOME/.bashrc" > "$HOME/.bashrc.dad-box"
+  ' "$HOME/.bashrc" > "$HOME/.bashrc.dad-box"; then
+    rm -f "$HOME/.bashrc.dad-box"
+    echo "bootstrap.sh: could not rewrite the dad-box blocks in $HOME/.bashrc and left them as they were; fix the cause above, then re-run" >&2
+    exit 1
+  fi
   mv "$HOME/.bashrc.dad-box" "$HOME/.bashrc"
 fi
 # shellcheck disable=SC2016  # written literally, expanded by the interactive shell
