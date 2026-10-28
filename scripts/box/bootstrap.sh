@@ -9,12 +9,14 @@
 #   bash bootstrap.sh                        # the box itself
 #   bash bootstrap.sh --repo URL [--dir D]   # also clone URL (default dir ~/code/<name>) and devbox install it
 #   bash bootstrap.sh --use-vals             # also export USE_VALS=true, so devbox loads .env.vals.yaml
+#   bash bootstrap.sh --relay                # also export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 (the local relay)
 #
 # Layers, each assuming the one before:
 #   1. apt: docker (Docker's repo), auditd, build-essential, nodejs/npm (runtime for npm-distributed agents)
 #   2. system: sysctl tuning, 8 GB swap, linger, the mem-sampler timer
 #   3. nix + devbox, then `devbox global` from devbox-global.json
-#   4. PATH (and, with --use-vals, USE_VALS) for non-interactive shells and systemd --user,
+#   4. PATH (and, with --use-vals, USE_VALS; with --relay, OTEL_EXPORTER_OTLP_ENDPOINT)
+#      for non-interactive shells and systemd --user,
 #      so the deck daemon finds every agent and every agent inherits the same environment
 #   5. agents (claude, opencode, codex, pi, devin), sem, dot-agent-deck, `hooks install`
 #   6. the optional repo
@@ -31,6 +33,15 @@
 # successor of an in-app daemon restart: its agents see the change only once it
 # is stopped and a new one is started from a fresh login (`dot-agent-deck
 # connect` from your machine does that), not from a shell opened before the run.
+#
+# --relay is for a box whose operator runs a local OpenTelemetry relay: a
+# collector listening on 127.0.0.1:4318 that forwards to Honeycomb with its own
+# key. It points every bash shell, and every agent the deck starts, at it;
+# devbox.json's init_hook keeps an endpoint the shell already has, so a vals
+# shell sends through the relay instead of to the endpoint .env.vals.yaml names.
+# It neither installs nor checks the relay; that is the box's own setup. It
+# works with or without --use-vals, and it sticks, turns off and reaches a
+# running daemon exactly as --use-vals does, through its own marked block.
 
 set -euo pipefail
 
@@ -38,12 +49,15 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_URL=""
 REPO_DIR=""
 USE_VALS_FLAG=0
+RELAY_FLAG=0
+RELAY_ENDPOINT=http://127.0.0.1:4318
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo) REPO_URL="${2:?}"; shift 2 ;;
     --dir)  REPO_DIR="${2:?}"; shift 2 ;;
     --use-vals) USE_VALS_FLAG=1; shift ;;
+    --relay)    RELAY_FLAG=1; shift ;;
     -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "bootstrap.sh: unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -155,20 +169,35 @@ if ! grep -qF '# >>> dad-box PATH' "$HOME/.bashrc"; then
 fi
 # USE_VALS gets the same placement for the same reason: the daemon's environment
 # is every agent's, and devbox.json's init_hook loads .env.vals.yaml only when
-# it is set. The block sits right after the PATH block and is rewritten in place.
+# it is set. So does OTEL_EXPORTER_OTLP_ENDPOINT with --relay: the init_hook
+# keeps an endpoint the shell already has, so every vals shell then sends
+# through the local relay rather than to the direct endpoint. Each sits in its
+# own marked block right after the PATH block, and they are rewritten in place.
+OPTION_BLOCKS=()
 if [ "$USE_VALS_FLAG" = 1 ] || grep -qF '# >>> dad-box USE_VALS' "$HOME/.bashrc"; then
   USE_VALS_FLAG=1
-  VALS_BLOCK="$(cat <<'EOF'
+  OPTION_BLOCKS+=("$(cat <<'EOF'
 # >>> dad-box USE_VALS (scripts/box/bootstrap.sh --use-vals) >>>
 export USE_VALS=true
 # <<< dad-box USE_VALS <<<
 EOF
-)"
-  # Drops any earlier copy of the block and the blank lines around it, then
-  # writes it back after the PATH block, so a re-run leaves the file unchanged.
-  awk -v block="$VALS_BLOCK" '
-    /^# >>> dad-box USE_VALS/ { skip = 1; next }
-    skip { if (/^# <<< dad-box USE_VALS/) skip = 0; next }
+)")
+fi
+if [ "$RELAY_FLAG" = 1 ] || grep -qF '# >>> dad-box RELAY' "$HOME/.bashrc"; then
+  RELAY_FLAG=1
+  OPTION_BLOCKS+=("$(cat <<EOF
+# >>> dad-box RELAY (scripts/box/bootstrap.sh --relay) >>>
+export OTEL_EXPORTER_OTLP_ENDPOINT=$RELAY_ENDPOINT
+# <<< dad-box RELAY <<<
+EOF
+)")
+fi
+if [ ${#OPTION_BLOCKS[@]} -gt 0 ]; then
+  # Drops any earlier copy of the blocks and the blank lines around them, then
+  # writes them back after the PATH block, so a re-run leaves the file unchanged.
+  awk -v block="$(printf '%s\n\n' "${OPTION_BLOCKS[@]}")" '
+    /^# >>> dad-box (USE_VALS|RELAY)/ { skip = 1; next }
+    skip { if (/^# <<< dad-box (USE_VALS|RELAY)/) skip = 0; next }
     gap && /^$/ { next }
     gap { print ""; gap = 0 }
     { print }
@@ -186,6 +215,7 @@ cat > "$HOME/.config/environment.d/999-dad-box.conf" <<'EOF'
 PATH=${HOME}/.local/bin:${HOME}/.opencode/bin:${HOME}/.local/share/devbox/global/default/.devbox/nix/profile/default/bin:/nix/var/nix/profiles/default/bin:${PATH}
 EOF
 [ "$USE_VALS_FLAG" = 1 ] && echo 'USE_VALS=true' >> "$HOME/.config/environment.d/999-dad-box.conf"
+[ "$RELAY_FLAG" = 1 ] && echo "OTEL_EXPORTER_OTLP_ENDPOINT=$RELAY_ENDPOINT" >> "$HOME/.config/environment.d/999-dad-box.conf"
 # The user manager reads environment.d only when it starts, and linger started
 # it before this file existed: apply the same PATH to the running manager too.
 systemctl --user set-environment "PATH=$HOME/.local/bin:$HOME/.opencode/bin:$HOME/.local/share/devbox/global/default/.devbox/nix/profile/default/bin:/nix/var/nix/profiles/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" || echo "  warning: could not update the running systemd --user manager (applies at next login)"
@@ -193,6 +223,11 @@ if [ "$USE_VALS_FLAG" = 1 ]; then
   systemctl --user set-environment USE_VALS=true || echo "  warning: could not set USE_VALS in the running systemd --user manager (applies at next login)"
 else
   systemctl --user unset-environment USE_VALS || true
+fi
+if [ "$RELAY_FLAG" = 1 ]; then
+  systemctl --user set-environment "OTEL_EXPORTER_OTLP_ENDPOINT=$RELAY_ENDPOINT" || echo "  warning: could not set OTEL_EXPORTER_OTLP_ENDPOINT in the running systemd --user manager (applies at next login)"
+else
+  systemctl --user unset-environment OTEL_EXPORTER_OTLP_ENDPOINT || true
 fi
 # shellcheck source=/dev/null
 eval "$(sed -n '/# >>> dad-box PATH/,/# <<< dad-box PATH/p' "$HOME/.bashrc")"
@@ -278,6 +313,9 @@ check gh       'gh auth status'                               'gh auth login && 
 [ "$todo" -eq 0 ] && echo "  nothing — every agent is logged in"
 if [ "$USE_VALS_FLAG" = 1 ] && pgrep -u "$ME" -f 'dot-agent-deck daemon serve' >/dev/null; then
   echo; echo "Note: a deck daemon is already running; its agents get USE_VALS only after it is stopped and started from a fresh login (an in-app restart keeps the old environment)."
+fi
+if [ "$RELAY_FLAG" = 1 ] && pgrep -u "$ME" -f 'dot-agent-deck daemon serve' >/dev/null; then
+  echo; echo "Note: a deck daemon is already running; its agents send through the relay only after it is stopped and started from a fresh login (an in-app restart keeps the old environment)."
 fi
 if ! id -nG | tr ' ' '\n' | grep -qx docker; then
   echo; echo "Note: log out and back in (or reconnect) for the docker group to apply."
