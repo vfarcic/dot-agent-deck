@@ -102,7 +102,20 @@ pub(crate) fn spawn(
     let reply = attach(daemon, request);
     assert_eq!(reply["ok"], true, "spawn {name}: {reply}");
     let report = read_json(&base.with_extension("spawn.json"));
-    let original_argv = json!([executable, base, common::contained_deck_binary(), release]);
+    // A direct Codex is launched in embedded mode whether or not anything is
+    // installed (#2002): the wrapper puts that pair in front of its arguments.
+    let original_argv = if kind == "codex" {
+        json!([
+            executable,
+            "-c",
+            "shell_environment_policy.set={}",
+            base,
+            common::contained_deck_binary(),
+            release
+        ])
+    } else {
+        json!([executable, base, common::contained_deck_binary(), release])
+    };
     Spawn {
         base,
         report,

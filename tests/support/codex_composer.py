@@ -70,7 +70,21 @@ import time
 import tty
 
 tty.setraw(0, termios.TCSANOW)
-base, deck, version = sys.argv[1], sys.argv[2], sys.argv[3]
+
+
+def positionals(argv):
+    # Codex takes `-c key=value` anywhere: the deck puts its embedded-mode
+    # pair first (#2002) and an installed spawn's editor settings last.
+    out, rest = [], iter(argv[1:])
+    for arg in rest:
+        if arg == '-c':
+            next(rest, None)
+        else:
+            out.append(arg)
+    return out
+
+
+base, deck, version = positionals(sys.argv)[:3]
 version = os.environ.get('DOT_AGENT_DECK_TEST_COMPOSER_RELEASE', version)
 if os.environ.get('DOT_AGENT_DECK_TEST_COMPOSER_REPORT') == '1':
     report = {'argv': sys.argv, 'env': {

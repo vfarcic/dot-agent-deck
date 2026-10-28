@@ -176,18 +176,55 @@ fn attribute(value: &Value, key: &str) -> String {
 }
 
 fn launch(receiver: &Receiver) -> (TuiDeck, AgentRecord) {
-    let deck = TuiDeck::builder()
-        .without_agent_credentials()
-        .impersonating_pane_signals()
-        .with_pty_size(180, 45)
-        .with_env("OTEL_EXPORTER_OTLP_ENDPOINT", format!("http://{}", receiver.addr))
-        .with_env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json")
+    let deck = builder(receiver)
         // Raw input prevents Ctrl+C from killing the stand-in and records
         // cursor/paste sequences as received. Advertise bracketed-paste mode.
         .with_continue_session("intervention-standin",
             common::capability_export_command(&format!("/bin/sh -c 'stty raw -echo; printf \"\\033[?2004h{READY}\\n\"; exec cat > intervention-input.bin'")))
         .launch_with_fixture("minimal");
     deck.wait_for_string(READY);
+    only_agent(deck)
+}
+
+/// [`launch`] with a stand-in the doorbell types into: the deck rings only a
+/// screen it has measured, which for tests is the stand-in profile (PRD #1666
+/// part 3). It records each submitted line to `intervention-input.bin` and
+/// runs `inbox fetch` for a doorbell line, appending what that printed.
+fn launch_profiled(receiver: &Receiver, scripts: &std::path::Path) -> (TuiDeck, AgentRecord) {
+    let script = common::write_profiled_agent(scripts);
+    let record = common::exec_profiled_recorder(
+        &script,
+        env!("CARGO_BIN_EXE_dot-agent-deck"),
+        std::path::Path::new("intervention-input.bin"),
+    );
+    let deck = builder(receiver)
+        .with_env("DOT_AGENT_DECK_TEST_COMPOSER_PROFILE", "standin")
+        .with_env(
+            "DOT_AGENT_DECK_TEST_COMPOSER_BINARY",
+            script.to_string_lossy(),
+        )
+        .with_continue_session(
+            "intervention-standin",
+            common::capability_export_command(record.trim_end()),
+        )
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("DOORBELL-STANDIN-READY");
+    only_agent(deck)
+}
+
+fn builder(receiver: &Receiver) -> common::TuiDeckBuilder {
+    TuiDeck::builder()
+        .without_agent_credentials()
+        .impersonating_pane_signals()
+        .with_pty_size(180, 45)
+        .with_env(
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            format!("http://{}", receiver.addr),
+        )
+        .with_env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json")
+}
+
+fn only_agent(deck: TuiDeck) -> (TuiDeck, AgentRecord) {
     let agents = common::agent_records_on(deck.attach_socket_path());
     assert_eq!(agents.len(), 1);
     (deck, agents[0].clone())
@@ -489,7 +526,8 @@ fn telemetry_otlp_034_interrupt_upgrades_text_burst() {
 #[test]
 fn telemetry_otlp_035_deck_doorbell_is_not_intervention() {
     let receiver = Receiver::start();
-    let (deck, agent) = launch(&receiver);
+    let scripts = common::race_safe_tempdir();
+    let (deck, agent) = launch_profiled(&receiver, scripts.path());
     hook(&deck, &event(&agent, EventType::SessionStart));
     hook(&deck, &event(&agent, EventType::Idle));
     common::post_message_on(

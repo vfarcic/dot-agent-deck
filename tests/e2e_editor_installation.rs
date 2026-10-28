@@ -174,6 +174,36 @@ fn probe_033_installation_precedes_the_header_for_direct_and_wrapper_commands() 
     }
 }
 
+/// Scenario: Enable installation for Codex 0.164.0 and start a direct Codex stand-in with unset, exported-empty and nonempty editor settings. The argv it receives opens with the deck's embedded-mode pair, then carries its own arguments, then the installation's editor settings for the set values, so the empty table comes before the settings it would otherwise replace.
+#[spec("inbox/probe/033")]
+#[test]
+fn probe_033_an_installed_codex_is_embedded_and_keeps_its_editor_settings() {
+    let daemon = common::spawn_daemon_serve_with_env(None, "0", &[(ASSUME, ENTRIES)]);
+    for (state, original) in [
+        ("unset", None),
+        ("empty", Some("")),
+        ("set", Some("user-editor --literal")),
+    ] {
+        let name = format!("codex-{state}");
+        let spawned = spawn(&daemon, &name, "codex", "0.164.0", original, None, false);
+        installed(&spawned);
+        let mut expected = spawned.original_argv.as_array().unwrap().clone();
+        if let Some(value) = original {
+            for variable in ["VISUAL", "EDITOR"] {
+                expected.push(json!("-c"));
+                expected.push(json!(format!(
+                    "shell_environment_policy.set.{variable}=\"{value}\""
+                )));
+            }
+        }
+        assert_eq!(
+            spawned.report["argv"],
+            Value::Array(expected),
+            "{name}: the embedded pair first, the editor settings after it"
+        );
+    }
+}
+
 /// Scenario: Enable installation with the daemon's state directory below a directory its group can write, and a private runtime directory. The state directory's root is passed over, so a started Claude stand-in gets a private helper under the runtime directory instead, and nothing is made below the group-writable directory.
 #[spec("inbox/probe/033")]
 #[test]
