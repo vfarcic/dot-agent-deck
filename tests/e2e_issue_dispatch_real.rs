@@ -15,19 +15,17 @@
 //! orchestrator + worker role panes — on the already-attached TUI, without a
 //! reconnect or relaunch.
 //!
-//! ## The production gap this test pins (the RED signal)
-//! Today the daemon's spawn path live-surfaces only SINGLE-AGENT cards: the
-//! orchestration branch in `spawn::spawn` deliberately does NOT call
-//! `surface_spawned_pane` (see the comment at that call site), and an
-//! orchestration TAB is only ever rebuilt from the daemon's `tab_membership`
-//! records at TUI hydration (startup / reconnect). So when an `issue_dispatch`
-//! fire opens an ORCHESTRATION, the orchestrator + worker panes do boot and emit
-//! their own `SessionStart` hooks — which the live `apply_event` path paints as
-//! FLAT dashboard cards — but NO orchestration tab appears live. The user has to
-//! detach and reattach to see the orchestration grouped into its tab. This test
+//! ## The behavior this test pins
+//! The orchestration branch in `spawn::spawn` pushes a typed
+//! `BroadcastMsg::OrchestrationSurface` (`surface_spawned_orchestration`) to
+//! every attached TUI, which attaches each role's PTY and builds the
+//! orchestration TAB mid-session. Without it, an orchestration tab is only
+//! rebuilt from the daemon's `tab_membership` records at TUI hydration (startup /
+//! reconnect), so the orchestrator + worker panes' own `SessionStart` hooks
+//! would paint only FLAT dashboard cards and the user would have to detach and
+//! reattach to see the orchestration grouped into its tab. This test
 //! HARD-ASSERTS the live orchestration tab (label `issue-work`, from the
-//! fixture's `[[orchestrations]] name`) so it is RED until the daemon learns to
-//! surface a dispatched orchestration tab to attached TUIs.
+//! fixture's `[[orchestrations]] name`).
 //!
 //! ## Fixture (permanent, created out-of-band)
 //! The public repo `vfarcic/dot-agent-deck-tests` carries: a committed
@@ -67,11 +65,12 @@
 //! BEHAVIOR, so a configured `issue_dispatch` task fires regardless of the flag
 //! and this deck env carries no `DOT_AGENT_DECK_EXPERIMENTAL`.
 //!
-//! NO REMOTE WRITES: the dispatch creates the branch `agent/issue-1` only in the
-//! local tempdir clone and never pushes; the task is a list-files directive, so
-//! neither agent must push or open a PR. The test asserts (best-effort) that the
-//! fixture repo has no `agent/issue-1` branch after the run. All on-disk state
-//! (clone + worktree) lives under a `common::harness_tempdir()` removed on drop.
+//! The agents are instructed not to push or open PRs; the test best-effort
+//! probes for a pushed `agent/issue-1` branch afterward. The deck itself makes
+//! best-effort claim writes: provisioning/adding `agent-deck/claimed` and
+//! creating/editing a claim comment. A read-only token denies those writes
+//! while dispatch can still succeed (verified 2026-10-27, PRD #421 M2.4).
+//! Clone + worktree live under a `common::harness_tempdir()` removed on drop.
 //!
 //! Decision 23 cost: two short interactive Haiku turns (orchestrator delegates,
 //! worker lists a handful of files) — well under the <$0.05/run bound.
@@ -91,10 +90,10 @@ const FIXTURE_LABEL: &str = "agent-dispatch-test";
 const SCHEDULE_NAME: &str = "github-issues";
 const SENTINEL: &str = "DISPATCH_E2E_SENTINEL.md";
 /// The fixture's `[[orchestrations]] name` — the label the live orchestration
-/// TAB renders with in the tab strip. NOT the schedule/display name
-/// (`github-issues`, which titles the flat per-role cards) and NOT the worktree
-/// basename (`issue-1`), so its appearance on the grid is an unambiguous signal
-/// that the orchestration TAB surfaced — not that a flat role card did.
+/// TAB renders with in the tab strip. The schedule is named `github-issues`,
+/// while flat per-role cards are titled `orchestrator` and `worker` and the
+/// worktree basename is `issue-1`, so the tab label distinguishes the live
+/// orchestration TAB from its role cards.
 const ORCH_TAB_NAME: &str = "issue-work";
 
 /// The schedule's `[[scheduled_tasks]]` + `[scheduled_tasks.issue_dispatch]`
@@ -170,33 +169,9 @@ fn remote_branch_exists(branch: &str) -> Option<bool> {
     }
 }
 
-/// Scenario: Launch the deck attached to a daemon configured with one enabled
-/// `issue_dispatch` schedule that targets the LIVE public fixture repo
-/// `vfarcic/dot-agent-deck-tests` (filtered to the permanent label-gated issue
-/// #1, `max_per_run = 1`) whose `.dot-agent-deck.toml` declares an
-/// `[[orchestrations]] name = "issue-work"` with an `orchestrator` (start) and a
-/// `worker` role, both interactive Haiku `claude`, then fire it via `RunNow` over
-/// the attach socket WITHOUT detaching. With the REAL `gh` on PATH and
-/// `GITHUB_TOKEN` threaded through, the daemon enumerates, clones from GitHub,
-/// creates the per-issue worktree `…/.worktrees/issue-1`, and spawns the
-/// orchestration's role panes into it (the per-issue worktree cwd, shared by both
-/// roles, was pre-trusted in the per-test HOME so claude's first-run gates clear
-/// without a keystroke; the built binary's dir is on PATH so the orchestrator's
-/// `dot-agent-deck delegate --to worker` resolves). After the dispatched agents
-/// register under the schedule name (precondition — proves the live clone +
-/// worktree + spawn happened), HARD-ASSERT that the dispatched ORCHESTRATION
-/// surfaces LIVE as an orchestration TAB labelled `issue-work` in the
-/// already-attached TUI's tab strip, with no reconnect/relaunch. This is RED
-/// today: the orchestration spawn branch does not call `surface_spawned_pane` and
-/// orchestration tabs are only rebuilt at hydration, so the role panes appear
-/// only as flat dashboard cards and no `issue-work` tab ever paints live. Once
-/// GREEN, best-effort: switch to the orchestration tab and observe the worker
-/// (delegated to by the orchestrator) list the cloned repo's files including the
-/// committed sentinel `DISPATCH_E2E_SENTINEL.md` (logged, not asserted — too
-/// LLM/timing-dependent to gate on), and assert (best-effort) the fixture repo has
-/// no pushed `agent/issue-1` branch. Reel-eligible (PTY-attached, records a
-/// `full-stream.cast`); flaky-tolerant (real LLM + real network) — run once, not
-/// looped.
+/// Scenario: Launch an attached deck with a schedule targeting permanent live GitHub issue #1, then fire it via RunNow to clone the fixture and spawn its interactive Haiku orchestration.
+/// After the agents register as `orchestrator` and `worker`, require an `issue-work` orchestration tab to appear in the attached TUI without reconnecting.
+/// Switch to that tab to best-effort observe the worker listing the sentinel file, then best-effort probe that no `agent/issue-1` branch was pushed.
 #[spec("scheduler/dispatch/013")]
 #[test]
 fn dispatch_013_orchestration_surfaces_and_delegates() {
@@ -315,33 +290,30 @@ fn dispatch_013_orchestration_surfaces_and_delegates() {
             .collect::<Vec<_>>()
     );
 
-    // The load-bearing showcase assertion (RED today): the dispatched
+    // The load-bearing showcase assertion: the dispatched
     // ORCHESTRATION must surface LIVE as an orchestration TAB on the
     // already-attached dashboard — its tab-strip label is the fixture's
     // `[[orchestrations]] name`, `issue-work`. The tab strip is only shown once a
     // second tab exists (`TabManager::show_tab_bar` → `tabs.len() > 1`), so seeing
     // `issue-work` on the grid means a real orchestration tab was created live.
     //
-    // Scanned over the cumulative byte history (not a single grid frame). Today
-    // this FAILS: `spawn::spawn`'s orchestration branch does not call
-    // `surface_spawned_pane`, and orchestration tabs are rebuilt only at TUI
-    // hydration — so the role panes' own `SessionStart` hooks paint FLAT
-    // dashboard cards (titled `github-issues`, dir `issue-1`) but no `issue-work`
-    // tab ever appears without a reconnect. The coder's live-orchestration-
-    // surfacing change must make this pass.
+    // Scanned over the cumulative byte history (not a single grid frame). The
+    // tab comes from `spawn::spawn`'s `OrchestrationSurface` broadcast; without
+    // it orchestration tabs are rebuilt only at TUI hydration, so the role panes
+    // would paint only FLAT dashboard cards and no `issue-work` tab would appear
+    // without a reconnect.
     let surfaced = deck.wait_for_stream_string_within(ORCH_TAB_NAME, Duration::from_secs(90));
     assert!(
         surfaced,
         "the dispatched orchestration never surfaced a LIVE tab labelled \
          {ORCH_TAB_NAME:?} within 90s — expected the orchestration tab (with its \
          orchestrator + worker role panes) to appear in the attached TUI's tab \
-         strip without a reconnect. RED today: the orchestration spawn branch does \
-         not live-surface, so only flat per-role dashboard cards appear.\n\
+         strip without a reconnect.\n\
          Final grid:\n{}",
         deck.snapshot_grid()
     );
 
-    // ---- Below here runs only once the feature lands (GREEN). It is the reel
+    // ---- Below here runs only once the tab assertion above passes. It is the reel
     // narrative — best-effort, NOT gating, so LLM/timing variance can't make the
     // load-bearing assertion above flaky. ----
 
@@ -359,8 +331,8 @@ fn dispatch_013_orchestration_surfaces_and_delegates() {
         "reel narrative (soft): sentinel {SENTINEL:?} seen in orchestration panes = {saw_sentinel}"
     );
 
-    // NO REMOTE WRITES: a list-files directive must not push a branch or open a
-    // PR. Confirm (best-effort) the fixture remote has no `agent/issue-1` branch.
+    // Agents are instructed not to push or open PRs. Probe (best-effort) for a
+    // pushed `agent/issue-1` branch; the deck's claim writes are separate.
     // `None` (the gh probe itself failed) is tolerated — only a definitive
     // present branch is a failure.
     if let Some(true) = remote_branch_exists("agent/issue-1") {

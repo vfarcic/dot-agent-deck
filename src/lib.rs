@@ -1,3 +1,18 @@
+// PRD #1666 part 3 (Q59): the `e2e` feature compiles in test seams, many of
+// them steered by environment variables (`host_metrics::e2e_fixed_sample` and
+// `daemon_protocol::advertised_protocol_version` are two), and none may ship.
+// A release-profile build turns `debug_assertions` off, so this refuses
+// `--release --features e2e`. `not(debug_assertions)` is the predicate, not
+// the profile: a dev build with debug assertions switched off is refused too,
+// and a release build with them switched on is not, so a shipping recipe must
+// still leave `e2e` out.
+#[cfg(all(feature = "e2e", not(debug_assertions)))]
+compile_error!(
+    "the `e2e` feature is a test seam and must never ship in a release build: \
+     build `--features e2e` only with debug assertions on (the dev and test \
+     profiles), and build releases without it"
+);
+
 // Shared by the per-agent hook-config adapters (`codex_hooks_manage`,
 // `devin_hooks_manage`); nothing outside the crate calls it.
 mod agent_hook_config;

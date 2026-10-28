@@ -11500,7 +11500,18 @@ fn dispatch_action(
                     // `write_raw_bytes` already phrases the disconnected cases in
                     // the user's terms, so surface it as-is rather than prefixing
                     // it with a second, internal-sounding failure label.
-                    ui.status_message = Some((e.to_string(), std::time::Instant::now()));
+                    //
+                    // PRD #1666 part 2 (G-fix7c): except a pane lost to a deck
+                    // restart, which the next frame drops and names in the one
+                    // restart notice (`process_restart_drops`), not in a
+                    // sentence per pane. The submit debounce above can hold an
+                    // Enter typed during the disconnect until after the reattach
+                    // found the restarted deck.
+                    if embedded.pane_lost_reason(&pane_id)
+                        != Some(crate::embedded_pane::PaneLostReason::DeckRestarted)
+                    {
+                        ui.status_message = Some((e.to_string(), std::time::Instant::now()));
+                    }
                 }
                 ui.last_pane_keystroke_at = Some(std::time::Instant::now());
             }
@@ -45909,3 +45920,8 @@ mod one_shot_protocol_gate_tests {
 #[cfg(all(test, unix))]
 #[path = "ui_restart_surface_tests.rs"]
 mod restart_surface_tests;
+
+/// PRD #1666 part 2 (G-fix7c): a keystroke into a pane lost to a deck restart.
+#[cfg(all(test, unix))]
+#[path = "ui_restart_keystroke_tests.rs"]
+mod restart_keystroke_tests;

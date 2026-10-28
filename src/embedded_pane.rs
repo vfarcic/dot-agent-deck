@@ -1371,6 +1371,29 @@ impl EmbeddedPaneController {
             .unwrap() = Some(reason);
     }
 
+    /// Test-only: end `pane_id`'s I/O task having recorded `reason`, as a
+    /// reattach that gives up does, and return once input to the pane fails.
+    #[cfg(all(test, unix))]
+    pub(crate) fn end_pane_io_for_test(&self, pane_id: &str, reason: PaneLostReason) {
+        let input_tx = {
+            let mut panes = self.panes.lock().unwrap();
+            let pane = panes.get_mut(pane_id).expect("the pane");
+            *pane.backend.lost.lock().unwrap() = Some(reason);
+            if let Some(io_task) = pane.backend.io_task.take() {
+                io_task.abort();
+            }
+            pane.backend.input_tx.clone()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !input_tx.is_closed() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pane's I/O task never ended"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     /// Test-only constructor for code paths that need a `PaneController`
     /// value but never actually exercise pane I/O — e.g. render-frame
     /// tests that build an empty controller just to satisfy a function
