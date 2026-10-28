@@ -1268,7 +1268,7 @@ fn probe_058_the_scope_truth_table() {
                             let k = key(1);
                             match via {
                                 Via::Refused => {
-                                    t.r.refused_identity(G, channel, decision, t.at(20))
+                                    t.r.refused_identity(G, channel, decision, None, t.at(20))
                                         .unwrap();
                                     assert_eq!(t.scope(), state(want_decided), "{row}");
                                     continue;
@@ -1941,7 +1941,7 @@ fn probe_058_the_first_stop_event() {
     );
 }
 
-/// Scenario: Under `Hold`, generations stop on: a `Tool` decision by a helper attributed `NotOwned(Tool)`, and an `Unarmed` one at the same time by a helper attributed `NotOwned(Shape)`; a native `Unarmed` whose editor then failed to start, and one whose editor ran, each matched to a segment after the stop; a scan dropped at the record cap; and an identity refusal. Once each record is drained and deleted, every first stop still names its source, its record's attribution, its match and its report, so no two read alike.
+/// Scenario: Under `Hold`, generations stop on: a `Tool` decision by a helper attributed `NotOwned(Tool)`, and an `Unarmed` one at the same time by a helper attributed `NotOwned(Shape)`; a native `Unarmed` whose editor then failed to start, and one whose editor ran, each matched to a segment after the stop; a scan dropped at the record cap, which keeps its attribution; and an identity refusal of an IPC request, which keeps the request's claim and has no attribution. Once each record is drained and deleted, every first stop still names its source, its record's attribution, its match and its report, so no two read alike.
 #[spec("inbox/probe/058")]
 #[test]
 fn probe_058_the_first_stop_keeps_its_provenance() {
@@ -2038,26 +2038,145 @@ fn probe_058_the_first_stop_keeps_its_provenance() {
             StopSource::DroppedAtCap {
                 channel: Channel::Scan,
                 decision: None,
+                attribution: OWNED,
+                claim: None,
             },
             None
         )
     );
+    assert_eq!(stop.attribution(), Some(OWNED));
     let mut t = T::new(HOLD);
     let now = t.at(20);
-    t.r.refused_identity(G, Channel::Marker, Some(Decision::Tool), now)
-        .unwrap();
+    t.r.refused_identity(
+        G,
+        Channel::Ipc,
+        Some(Decision::Tool),
+        Some(Claim::Tool),
+        now,
+    )
+    .unwrap();
     let stop = t.r.first_stop(now).stopped.unwrap();
     assert_eq!(
         (stop.cause, stop.source, stop.record),
         (
             Cause::EditorReturnUnchecked,
             StopSource::RefusedIdentity {
-                channel: Channel::Marker,
+                channel: Channel::Ipc,
                 decision: Some(Decision::Tool),
+                claim: Some(Claim::Tool),
             },
             None
         )
     );
+    assert_eq!(stop.attribution(), None, "an identity refusal has none");
+    assert_eq!(
+        tool.attribution(),
+        Some(Attribution::NotOwned(NotOwned::Tool))
+    );
+}
+
+/// Scenario: Two generations fill the record cap under `Hold` with the same 64 `Armed` helpers, then see a 65th helper at the same moment in a scan with no decision: in one it is attributed `Owned` with an `Owned` claim, in the other `NotOwned(Shape)` with no claim. Both stop as `EditorUnconfirmed` with no record, yet each first stop keeps the attribution and claim it was dropped with, and still does after the generation retires and its event is taken. A third generation's first stop, an identity refusal of an `Unarmed` request reported through the input lock, keeps the request's claim through retirement and has no attribution.
+#[spec("inbox/probe/058")]
+#[test]
+fn probe_058_a_stop_dropped_at_the_cap_keeps_its_attribution() {
+    let capped = |attribution: Attribution, claim: Option<Claim>| {
+        let t0 = Instant::now();
+        let input = GenerationInput::new(CprWaitEnd::Counted);
+        assert!(input.attach_records(Records::new(G, HOLD, t0)));
+        let o = |pid: u32| Observation {
+            generation: G,
+            key: key(pid),
+            channel: Channel::Ipc,
+            attribution: Attribution::NotOwned(NotOwned::Tool),
+            claim: None,
+            decision: Some(Decision::Armed),
+            seg_seen: None,
+            native_seen: None,
+            birth_floor: t0,
+        };
+        for pid in 0..RECORD_CAP as u32 {
+            input.record_observe(&o(100 + pid), t0 + ms(5)).unwrap();
+        }
+        let dropped = Observation {
+            channel: Channel::Scan,
+            attribution,
+            claim,
+            decision: None,
+            ..o(1)
+        };
+        assert_eq!(
+            input.record_observe(&dropped, t0 + ms(20)).unwrap(),
+            Recorded::Dropped
+        );
+        input
+            .retire_taking_first_stop(t0 + ms(30))
+            .unwrap()
+            .stopped
+            .unwrap()
+    };
+    let owned = capped(OWNED, Some(Claim::Owned));
+    let shape = capped(Attribution::NotOwned(NotOwned::Shape), None);
+    assert_eq!(
+        (owned.cause, owned.after, owned.record),
+        (shape.cause, shape.after, shape.record)
+    );
+    assert_eq!(owned.cause, Cause::EditorUnconfirmed);
+    assert_ne!(owned, shape);
+    assert_eq!(
+        owned.source,
+        StopSource::DroppedAtCap {
+            channel: Channel::Scan,
+            decision: None,
+            attribution: OWNED,
+            claim: Some(Claim::Owned),
+        }
+    );
+    assert_eq!(
+        shape.source,
+        StopSource::DroppedAtCap {
+            channel: Channel::Scan,
+            decision: None,
+            attribution: Attribution::NotOwned(NotOwned::Shape),
+            claim: None,
+        }
+    );
+    assert_eq!(owned.attribution(), Some(OWNED));
+    assert_eq!(
+        shape.attribution(),
+        Some(Attribution::NotOwned(NotOwned::Shape))
+    );
+
+    // An identity refusal keeps the request's claim through retirement.
+    let t0 = Instant::now();
+    let input = GenerationInput::new(CprWaitEnd::Counted);
+    assert!(input.attach_records(Records::new(G, HOLD, t0)));
+    input
+        .record_refused(
+            G,
+            Channel::Ipc,
+            Some(Decision::Unarmed),
+            Some(Claim::Owned),
+            t0 + ms(20),
+        )
+        .unwrap();
+    let refused = input
+        .retire_taking_first_stop(t0 + ms(30))
+        .unwrap()
+        .stopped
+        .unwrap();
+    assert_eq!(
+        (refused.cause, refused.after, refused.record),
+        (Cause::EditorReturnUnchecked, ms(20), None)
+    );
+    assert_eq!(
+        refused.source,
+        StopSource::RefusedIdentity {
+            channel: Channel::Ipc,
+            decision: Some(Decision::Unarmed),
+            claim: Some(Claim::Owned),
+        }
+    );
+    assert_eq!(refused.attribution(), None);
 }
 
 /// Scenario: Through the generation's input lock, a helper is seen with no decision, so the writer scope is pending, and the generation retires. Reading M-FIRST's event before retirement misses the pending episode; retiring and taking the event in one step lists it as ended by retirement, and afterwards there is no event to take.

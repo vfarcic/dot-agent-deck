@@ -544,9 +544,10 @@ impl GenerationInput {
         generation: u64,
         channel: Channel,
         decision: Option<Decision>,
+        claim: Option<record::Claim>,
         now: Instant,
     ) -> Result<(), Refusal> {
-        self.with_records(|r, _| r.refused_identity(generation, channel, decision, now))
+        self.with_records(|r, _| r.refused_identity(generation, channel, decision, claim, now))
     }
 
     /// See [`Records::report`].

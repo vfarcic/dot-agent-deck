@@ -567,15 +567,23 @@ pub enum StopSource {
     /// A record's exit drain: no decision, or an editor-bearing one whose
     /// report didn't show its end clean.
     Drain,
-    /// An observation the record cap dropped (no record).
+    /// An observation the record cap dropped (no record), with the
+    /// attribution and claim it carried: A5 §3.6 asks for the stop's
+    /// attribution, and A6 §3.6's scan sighting at the cap is one of these.
     DroppedAtCap {
         channel: Channel,
         decision: Option<Decision>,
+        attribution: Attribution,
+        claim: Option<Claim>,
     },
-    /// An observation the identity refusal dropped (no record).
+    /// An observation the identity refusal dropped (no record). It has no
+    /// attribution: the refusal is that the process couldn't be identified,
+    /// so none was computed. The helper's claim is kept if its request
+    /// carried one.
     RefusedIdentity {
         channel: Channel,
         decision: Option<Decision>,
+        claim: Option<Claim>,
     },
 }
 
@@ -624,8 +632,9 @@ impl StopRecord {
 /// [`StopSource::Drain`] with an editor-bearing decision); `EditorUnconfirmed`
 /// ([`StopSource::Drain`] with no decision, A6); a dropped observation, a
 /// scan sighting at the cap included ([`StopSource::DroppedAtCap`],
-/// [`StopSource::RefusedIdentity`]). Whether held input was discarded at
-/// restart is the retiring caller's to add.
+/// [`StopSource::RefusedIdentity`]). Its attribution is
+/// [`Stop::attribution`]. Whether held input was discarded at restart is the
+/// retiring caller's to add.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stop {
     /// The cause the card shows for it.
@@ -635,6 +644,18 @@ pub struct Stop {
     pub source: StopSource,
     /// `None` for a dropped observation.
     pub record: Option<StopRecord>,
+}
+
+impl Stop {
+    /// The attribution A5 §3.6 asks for: the record's, or the dropped
+    /// observation's. `None` for an identity refusal, which has none.
+    pub fn attribution(&self) -> Option<Attribution> {
+        match (self.record, self.source) {
+            (Some(r), _) => Some(r.attribution),
+            (None, StopSource::DroppedAtCap { attribution, .. }) => Some(attribution),
+            _ => None,
+        }
+    }
 }
 
 /// M-FIRST's per-generation event (amendment 5 §3.6, amendment 6 §3.6): when
@@ -932,6 +953,8 @@ impl Records {
                     Some(StopSource::DroppedAtCap {
                         channel: obs.channel,
                         decision: obs.decision,
+                        attribution: obs.attribution,
+                        claim: obs.claim,
                     }),
                     None,
                 );
@@ -1027,12 +1050,14 @@ impl Records {
     /// An observation dropped by the identity refusal (core §2.3): no record.
     /// It opens the writer scope only when it names a decision that isn't
     /// helper-only; a scan sighting, or a connection whose request wasn't
-    /// read, names none, and changes nothing (A6 §1.3).
+    /// read, names none, and changes nothing (A6 §1.3). `claim` is the
+    /// request's, kept for M-FIRST only.
     pub fn refused_identity(
         &mut self,
         generation: u64,
         channel: Channel,
         decision: Option<Decision>,
+        claim: Option<Claim>,
         now: Instant,
     ) -> Result<(), Refusal> {
         self.check(generation)?;
@@ -1046,7 +1071,11 @@ impl Records {
             before,
             now,
             None,
-            Some(StopSource::RefusedIdentity { channel, decision }),
+            Some(StopSource::RefusedIdentity {
+                channel,
+                decision,
+                claim,
+            }),
             None,
         );
         Ok(())
