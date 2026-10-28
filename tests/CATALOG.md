@@ -13533,6 +13533,30 @@ PRD #1666 part 3, round 5: where the deck keeps a worker's report, or a dispatch
 - **Asserts:** row T's exact fixed notice in a pipe and in raw master bytes with default OPOST/ONLCR and OPOST disabled; no trimming or escape removal. A stopped or prefilled output queue blocks the armed notice until SIGALRM even with SIGALRM inherited ignored and blocked; an armed background group with TOSTOP actually stops with SIGTTOU, remains stopped past the alarm, and receives the pending alarm after continuation. An ordinary eight-second edit outlives the armed deadline, creates its sentinel and returns 37; a signalled editor returns SIGTERM. Successful silent editors return 37 with no helper bytes on stopped/full output, and without a TOSTOP background stop. Terminal cases give the helper a fixture controlling terminal and fds 0–2 on its slave; the supervisor stays alive through capture. The unresponsive peer belongs to the process whose identity the instance records.
 - **Does not assert:** fault-injected `SpawnFailed` errno reports, `WaitUnknown`, the known post-editor `t0`/expired-deadline pause, no-poll/no-send tracing, short I/O/EINTR, the old diagnostic/alarm RED mutant, live descendant accounting/subreaper/ptrace/namespace behavior, the PositivelyTool branch, signal-mask restoration in the editor, foreground terminal signals, successful IPC outcomes, marker matching or daemon attribution. These remain Q35-12 acceptance work. There is no daemon E2 in this standalone fixture: the background test exercises suspension and continuation, not the Linux daemon's declared-Armed kill. It makes no whole-helper deadline claim across a job-control stop.
 
+##### inbox/probe/021 — Owned helpers settle one published liability after their arm load.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_editor_settlement.rs`), real daemon, installed helper and native stand-in on a private PTY.
+- **Agent:** a copy of the test executable named Claude, with an explicit exec/readiness acknowledgement; no real agent or credential.
+- **Asserts:** the generation-bound e2e control publishes without typing any input; repeat publication and withdrawal are idempotent; a helper paused before its arm load consumes nothing; continued, it consumes once with no sentinel editor, on the normal IPC/marker route and with IPC unavailable (marker-only). Late duplicate observations do not consume a later publication; a request for another generation changes nothing.
+- **Does not assert:** the unit-level drain budgets, cap boundaries, exit-only interval proof, strict IPC-only channel isolation, namespace divergence, or a successor replacing the same pane (the mismatched-generation request covers only refusal on the current pane). The handler and test-only arm-control verb are Q35-14b RED acceptance work until implemented; these lane-1 tests compile but do not execute in the fast gate.
+- **Platform coverage:** Linux; IPC authority requires a kernel providing SO_PEERPIDFD, and A and the helper share the daemon's time namespace. Independently attested markers remain available without IPC authority.
+
+##### inbox/probe/022 — Real process boundaries distinguish tools from unrelated editor invocations.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_editor_settlement.rs`), real kernel process trees and installed helper.
+- **Agent:** native test-executable copies; Bash and Python tool processes; no real agent or credential.
+- **Asserts:** with one arm published, a proper Bash tool opens the sentinel editor and preserves its exit 37; a descendant on a new inode under the install root, a double-forked orphan, and A after an exec to another inode open no further editor and consume nothing; A's helper after the orphan consumes the liability before the replacement case is armed afresh. A no-arm control proves every fixture branch really reaches the sentinel editor, including a successful tool git commit. Every start and replacement acknowledges exec before the test proceeds.
+- **Does not assert:** replacement of an already-unlinked executable, different time namespaces, inaccessible procfs, or macOS process identities. Q35-14b RED acceptance work until the handler/control exists; the fast gate compiles but does not execute the lane-1 test.
+- **Platform coverage:** Linux, A and helper in the daemon's time namespace.
+
+##### inbox/probe/039 — A tool commit and a nested agent cannot spend the composer's arm.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_editor_settlement.rs`), real daemon, git commit and installed helper.
+- **Agent:** native Claude stand-in, a Bash tool and a shell exec to that same F1 binary; no real agent or credential.
+- **Asserts:** with an arm present, Claude's sourced tool environment restores the user's editor for a genuine git commit, which opens the editor once and commits the sentinel subject; a tool shell exec to F1 invokes the helper but opens no additional editor and leaves the arm standing; only A's subsequent owned helper consumes it, once.
+- **Does not assert:** real Claude behavior, Codex's environment policy, or the later integrated probe trigger/segment frontier. Q35-14b RED acceptance work until the handler/control exists; the fast gate compiles but does not execute the lane-1 test.
+- **Platform coverage:** Linux, A and helper in the daemon's time namespace; SO_PEERPIDFD required for IPC authority.
+
 ##### inbox/probe/033 — Editor installation occurs before a measured or unmeasured startup header.
 
 - **Layer:** L2 lane 1 (`tests/e2e_editor_installation.rs`).
