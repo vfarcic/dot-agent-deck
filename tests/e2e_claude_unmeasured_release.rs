@@ -28,6 +28,11 @@ const TASK: &str = "UNMEASURED-RELEASE-TASK-056: write nothing, this is a fixtur
 fn claude_command(deck: &TuiDeck, name: &str, version: &str) -> String {
     use std::os::unix::fs::PermissionsExt;
     let script = deck.workdir().join("claude-composer.py");
+    std::fs::write(
+        deck.workdir().join("composer_external_edit.py"),
+        include_str!("support/composer_external_edit.py"),
+    )
+    .unwrap();
     std::fs::write(&script, include_str!("support/claude_composer.py")).unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
     let base = deck.workdir().join(format!(".claude-{name}"));

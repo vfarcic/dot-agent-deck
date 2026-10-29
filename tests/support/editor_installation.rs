@@ -42,6 +42,11 @@ pub(crate) fn spawn(
 ) -> Spawn {
     let bin = daemon.home.join(format!("bin-{name}"));
     std::fs::create_dir(&bin).unwrap();
+    std::fs::write(
+        bin.join("composer_external_edit.py"),
+        include_str!("composer_external_edit.py"),
+    )
+    .unwrap();
     // A launcher runs Claude's executable below an assignment.
     let executable = bin.join(if kind == "launcher" { "claude" } else { kind });
     let script = if kind == "codex" {

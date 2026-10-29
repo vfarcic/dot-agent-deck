@@ -9,6 +9,9 @@ prompt runs the real `dot-agent-deck inbox fetch` (argv[2]) in the pane, as
 Claude Code's prompt hook hands the agent its mail. No model runs.
 
 Optional fixture knobs (unset by default):
+  DOT_AGENT_DECK_TEST_COMPOSER_EXTERNAL_EDIT=1 enables Ctrl+G; copy
+    composer_external_edit.py beside this executable. See the companion
+    composer-external-edit.md for controls and measured fidelity.
   DOT_AGENT_DECK_TEST_COMPOSER_RELEASE overrides argv[3] in the header.
   DOT_AGENT_DECK_TEST_COMPOSER_REPORT=1 writes .spawn.json beside base:
     argv and the inherited VISUAL/EDITOR/CLAUDE_ENV_FILE (null means unset).
@@ -44,6 +47,7 @@ import termios
 import time
 import tty
 
+original_terminal = termios.tcgetattr(0) if os.isatty(0) else None
 tty.setraw(0, termios.TCSANOW)
 base, deck, version = sys.argv[1], sys.argv[2], sys.argv[3]
 version = os.environ.get('DOT_AGENT_DECK_TEST_COMPOSER_RELEASE', version)
@@ -61,6 +65,12 @@ with open(base + '.pid', 'w') as output:
 capture = open(base + '.bytes', 'ab', buffering=0)
 turns = open(base + '.turns', 'a', buffering=1)
 composer = bytearray()
+external_edit = None
+if os.environ.get("DOT_AGENT_DECK_TEST_COMPOSER_EXTERNAL_EDIT") == "1":
+    import runpy
+    support = runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "composer_external_edit.py"))
+    external_edit = support["ExternalEdit"](base, 'claude', original_terminal)
+
 transcript = []
 
 
@@ -124,6 +134,8 @@ def redraw():
     else:
         out += b'\x1b[2mTry "fix the bug"\x1b[22m'
     out += b'\x1b[27;1H' + rule + b'\x1b[28;3H? for shortcuts'
+    if external_edit and external_edit.error:
+        out += b'\x1b[29;1H' + external_edit.error
     out += ('\x1b[26;%dH' % (3 + len(composer.decode('utf-8', 'replace')))).encode()
     os.write(1, out)
 
@@ -143,7 +155,16 @@ while True:
     if not chunk:
         break
     capture.write(chunk)
-    for value in chunk:
+    for value in external_edit.tokens(chunk) if external_edit else chunk:
+        if value is None:
+            drop_suffix = external_edit.invoke(composer)
+            redraw()
+            if drop_suffix:
+                break
+            continue
+        if isinstance(value, bytes):
+            composer.extend(value)
+            continue
         if escape:
             escape.append(value)
             if len(escape) == 2 and value not in (0x5b, 0x4f):

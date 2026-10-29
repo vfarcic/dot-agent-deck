@@ -11,6 +11,9 @@ composer-profile lane-1 tests are cfg(target_os = "linux") and are not
 compiled on other platforms. Missing python3 fails their explicit preflight.
 
 Optional fixture knobs (unset by default):
+  DOT_AGENT_DECK_TEST_COMPOSER_EXTERNAL_EDIT=1 enables Ctrl+G; copy
+    composer_external_edit.py beside this executable. See the companion
+    composer-external-edit.md for controls and measured fidelity.
   DOT_AGENT_DECK_TEST_COMPOSER_RELEASE appends " v<release>" to the ready
     header; the default header is unchanged.
   DOT_AGENT_DECK_TEST_COMPOSER_REPORT=1 writes .spawn.json beside base:
@@ -50,6 +53,7 @@ import termios
 import time
 import tty
 
+original_terminal = termios.tcgetattr(0) if os.isatty(0) else None
 tty.setraw(0, termios.TCSANOW)
 base = sys.argv[1]
 version = os.environ.get('DOT_AGENT_DECK_TEST_COMPOSER_RELEASE')
@@ -65,6 +69,12 @@ capture = open(base + '.bytes', 'ab', buffering=0)
 turns = open(base + '.turns', 'a', buffering=1)
 reports = open(base + '.mode', 'a', buffering=1)
 line = bytearray()
+external_edit = None
+if os.environ.get("DOT_AGENT_DECK_TEST_COMPOSER_EXTERNAL_EDIT") == "1":
+    import runpy
+    support = runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "composer_external_edit.py"))
+    external_edit = support["ExternalEdit"](base, 'standin', original_terminal)
+
 escape = bytearray()
 transcript = ''
 revision = 0
@@ -130,6 +140,7 @@ def redraw():
              + ('W' * cols).encode() + b'\r\n'
              + transcript.encode() + b'\r\n'
              + ('PROCESSED:' + str(revision)).encode() + b'\r\n'
+             + (external_edit.error + b'\r\n' if external_edit and external_edit.error else b'')
              + b'COMPOSER: ' + content)
     os.write(1, frame)
 
@@ -203,7 +214,16 @@ while True:
     if not chunk:
         break
     capture.write(chunk)
-    for value in chunk:
+    for value in external_edit.tokens(chunk) if external_edit else chunk:
+        if value is None:
+            drop_suffix = external_edit.invoke(line)
+            redraw()
+            if drop_suffix:
+                break
+            continue
+        if isinstance(value, bytes):
+            line.extend(value)
+            continue
         if escape:
             escape.append(value)
             if len(escape) >= 3 and 0x40 <= value <= 0x7e:

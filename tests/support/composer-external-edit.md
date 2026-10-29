@@ -1,0 +1,42 @@
+# Synthetic composer external editing
+
+Set `DOT_AGENT_DECK_TEST_COMPOSER_EXTERNAL_EDIT=1` to enable Ctrl+G in `empty_composer.py`, `claude_composer.py`, or `codex_composer.py`. Unset, empty, `0`, and other values leave the old input/render path in use. Copy `composer_external_edit.py` beside an installed copy of a composer; the existing Rust fixture installers do this. This companion module is loaded only when editing is enabled. These are trusted test programs; their editor commands run with the fixture's permissions. Use a private HOME, TMPDIR, CODEX_HOME, work directory and endpoints, as their consumers do.
+
+The stand-in with no agent-specific screen uses Claude's export/selection convention for testing; there is no real agent measurement for that synthetic profile. A Ctrl+G exports the current bytes, disables bracketed paste, starts the selected editor with the export as its argument and waits for it, then enables bracketed paste and redraws. Success imports the edited bytes; a failed editor preserves the previous draft. Codex additionally draws `Failed to open editor: editor exited with status exit status: 1` for exit 1 and keeps that line on redraw. Claude does not gain Codex's failed-exit line. Enabled startup emits a paste-mode enable. No timer synthesizes an editor decision or resumption.
+
+The following files beside `base` steer subsequent candidates. They are ordinary test controls, independent of whether an identical input byte came from a human or the deck; the fixture does not infer the source of Ctrl+G.
+
+| Control | Effect |
+| --- | --- |
+| `.edit-mechanism` containing `H-chunk` | After invoking, discard the suffix of the same `os.read` that contained the candidate. |
+| `.edit-mechanism` containing `H-flush` | Immediately before starting the editor, discard queued tty input with `tcflush(TCIFLUSH)`. |
+| `.edit-mechanism` containing `H-ignore` | Read and discard tty input during a 500 ms dispatch window. |
+| `.edit-delay` present | Read the candidate, wait 500 ms, then dispatch. With no loss mechanism the bytes queued during this delay remain queued. |
+| `.edit-drop` present | Drop each candidate without exporting, invoking or emitting a suspension/resumption pair (CX-H). Remove it to permit a later candidate. |
+| `.edit-ignore-next` present | Remove this file and ignore one candidate, with no markers or editor. Use it for a human-ignored candidate or Claude's lapse followed by a retry. It confers no knowledge about the byte's source. |
+| `.edit-dispatched` | Written with a monotonic timestamp after an accepted candidate is read, before its dispatch delay. The test can send input into the window without guessing when the candidate was read. It is a test witness, not a production protocol. |
+
+The three loss mechanisms are synthetic hypotheses defined in the core design revision 6, section 3.1, rather than measured claims about Claude. The 500 ms dispatch delay, dropped/ignored candidates and non-returning editor are injected conditions. Codex also discards same-read suffixes and unread input from its suspended editor interval by default on the enabled path, matching the input-loss observations below. A user editor that reads its stdin receives subsequently written keys on the same tty. The fixture restores the original tty flags while the child runs and restores raw mode without a flush on Claude's return.
+
+`composer_test_editor.py` is a reusable editor fixture. Copy it to a private executable path and choose `VISUAL='<executable> <mode> <absolute-base>'`. It appends no shell evaluation. The composer appends the export filename. Modes `fast`, `fail`, and `trim` have no deliberate sleep: they write `EDITED`, exit 1 after writing `EDITED`, or write `EDITED` followed by spaces and a newline. Modes `wait`/`hang` wait without a deadline for `<base>.editor-go`; `read` first reads a line from stdin, saves it in `.editor-input`, then waits for `.editor-go`. The helper atomically publishes `.editor-started` with its captured pid, argv, original bytes, mode and tty flags; `.editor-finished` is a completion witness. Tests release the waiting helper and kill a captured helper pid on failure before stopping its composer. The immediate-editor control deliberately places the first 50 ms observer scan after the child has exited; it tests an observer that missed the lifetime, not a wall-clock scheduling guarantee on an overloaded host.
+
+Ctrl+G accepts raw BEL, `CSI 103;5u`, press/repeat `CSI 103;5:1u` / `CSI 103;5:2u`, and `CSI 27;5;103~`, including split reads. A bracketed paste is literal text, with Claude retaining pasted BEL and Codex removing it. This is a limited input fixture rather than the production tokenizer: it does not implement arbitrary keyboard protocols, navigation, Vim undo, cursor insertion, paste placeholders, menus or tool environments.
+
+## Measured sources and limits
+
+The source records below live in the orchestration workspace's gitignored `.dot-agent-deck/`; they are provenance, not files generated by these controls. The fixture self-tests are `composer_001_external_editor_and_input_mechanisms` under the existing `harness/composer/001` entry. They exercise synthetic processes, not actual agents, attestation, a gate or release authority. `SpawnFailed` and `WaitUnknown` remain outcomes of the real editor helper and its existing fault harness (`inbox/probe/067`); this fixture waits for whichever VISUAL executable the test selects and does not fabricate those IPC outcomes.
+
+The marker counts below were measured for actual editor invocations. This fixture also emits a pair if command resolution or its direct editor exec fails; the native marker behavior for those two cases was not measured in the cited records. Use the existing real-helper fault harness for OQ5, rather than treating that fixture convention as native evidence. Claude's successful whitespace normalization and Codex's precise tty flags are likewise outside the cited measurements; their conventions are identified below.
+
+| Copied behavior | Source record |
+| --- | --- |
+| Claude `TMPDIR/claude-<uid>/claude-prompt-<uuid>.md`, directory 0700, observed file 0664 under the measured umask | `prerestart-workdone/tester-p3-q35m2-report.md`, M20/M24. The fixture creates the file with 0666 filtered by the inherited umask; it does not claim every umask produces 0664. |
+| Claude truthy VISUAL, then truthy EDITOR; literal-space splitting; default search code/vi/nano; exact-string code/subl rewrite; editor-specific file/line arguments | `prerestart-workdone/tester-p3-q35pre-report.md`, section C; `tester-p3-q35m-report.md`, M8/M9; `tester-p3-q35m2-report.md`, M22/M23 and its argument-family table. |
+| Codex `CODEX_HOME/editor/.tmp<6 alphanumeric>.md`, file 0600; present VISUAL wins even if empty, absent VISUAL falls back to EDITOR, absent both errors; shell-word grouping without shell evaluation | `prerestart-workdone/tester-p3-q35m3-report.md`, M33/M34. |
+| Codex success trims trailing whitespace, exit 1 preserves draft and prints the exact status line | `prerestart-workdone/tester-p3-q35m3-report.md`, M32 and its consecutive-export results. Claude's successful whitespace normalization was not measured there; this fixture imports Claude's successful file byte-for-byte. |
+| Claude one `ESC[?2004l`, Codex two disables, then one resume `ESC[?2004h` | `prerestart-workdone/tester-p3-q35m4-report.md`, M43; `tester-p3-q35m5-report.md`, M43b; `r5wake-measurements/q35m5-m43b-summary.json`. Startup's single enable is a synthetic baseline; the full native startup protocol is not reproduced. |
+| Raw and encoded candidate forms, split frames and pasted BEL distinction | `prerestart-workdone/tester-p3-q35m2-report.md`, M19; `tester-p3-q35m6-workdone.md`, D1/D3 and the paste matrix. |
+| Codex loses input released during a non-reading editor; post-resume input retained in measured cases | `prerestart-workdone/tester-p3-q35m3-report.md`, M31. The fixture's explicit discard implements that observable result, without claiming it is Codex's internal mechanism. |
+| Canonical, echoing editor stdin on the same pane tty | `prerestart-workdone/tester-p3-q35pre-report.md`, section C's fd table. This is measured for Claude; restoring the same original tty flags for synthetic Codex is a fixture convention, not a Codex termios measurement. |
+
+No production daemon, real-agent configuration or model is used by the direct fixture self-tests. The existing consumer reruns use the harness's private endpoints with the editing knob off.
