@@ -35,7 +35,7 @@ fn capture(bytes: &str) -> Value {
     json!({
         "rows": 4, "cols": 12, "phase": "idle", "framing": "synchronized",
         "reads": [{"at_ns": 0, "bytes": bytes.as_bytes()}],
-        "gap_events": [], "phase_ended": true
+        "gap_events": [], "quiet_observations": [], "phase_ended": true
     })
 }
 
@@ -119,7 +119,71 @@ fn rechunk(trace: &Value, width: usize) -> Value {
             .collect::<Vec<_>>()
     );
     assert_eq!(split["gap_events"], trace["gap_events"]);
+    assert_eq!(split["quiet_observations"], trace["quiet_observations"]);
     split
+}
+
+fn quiet_observation(after_operation: usize, off: usize, start_ns: u64, elapsed_ns: u64) -> Value {
+    json!({"after_operation": after_operation, "off": off,
+           "start_ns": start_ns, "observed_ns": start_ns + elapsed_ns,
+           "elapsed_ns": elapsed_ns})
+}
+
+/// Scenario: End a quiet-gap capture on a reviewed screen, first without measured silence and then with it. Only measured silence closes the last frame, and a later arrival at the same position must not count it twice.
+#[spec("inbox/doorbell/060")]
+#[test]
+fn doorbell_060_measured_terminal_quiet_closes_once() {
+    let before = control("before");
+    let mut trace = capture(&before);
+    trace["framing"] = json!("quiet_gap");
+    inconclusive(&evaluate(trace.clone()), "unterminated frame");
+    trace["quiet_observations"] = json!([quiet_observation(6, before.len(), 0, 49_999_999)]);
+    inconclusive(&evaluate(trace.clone()), "unterminated frame");
+    trace["quiet_observations"] = json!([quiet_observation(6, before.len(), 0, 50_000_000)]);
+    for width in [1, 7, usize::MAX] {
+        let report = evaluate(rechunk(&trace, width));
+        passed(&report);
+        assert_eq!(report.complete_frames, 1, "{report:?}");
+        assert_eq!(report.stalls, 0, "{report:?}");
+    }
+    trace["quiet_observations"]
+        .as_array_mut()
+        .unwrap()
+        .push(quiet_observation(6, before.len(), 0, 75_000_000));
+    let repeated = evaluate(trace.clone());
+    passed(&repeated);
+    assert_eq!(repeated.complete_frames, 1, "{repeated:?}");
+    assert_eq!(repeated.stalls, 0, "{repeated:?}");
+    // A later real read supersedes the earlier silence at position six.
+    let after = control("after");
+    trace["reads"].as_array_mut().unwrap().push(json!({
+        "at_ns": 100_000_000, "bytes": after.as_bytes()
+    }));
+    trace["gap_events"] = json!([{"after_operation": 6, "elapsed_ns": 100_000_000}]);
+    trace["quiet_observations"]
+        .as_array_mut()
+        .unwrap()
+        .push(quiet_observation(
+            12,
+            before.len() + after.len(),
+            100_000_000,
+            50_000_000,
+        ));
+    for width in [1, 7, usize::MAX] {
+        let report = evaluate(rechunk(&trace, width));
+        passed(&report);
+        assert_eq!(
+            report.complete_frames, 2,
+            "deduplicate position six: {report:?}"
+        );
+        assert_eq!(report.stalls, 0, "{report:?}");
+    }
+    // Silence cannot complete a pending CSI, even after a recognised screen.
+    let mut unfinished = capture(&format!("{before}\x1b["));
+    unfinished["framing"] = json!("quiet_gap");
+    unfinished["quiet_observations"] =
+        json!([quiet_observation(6, before.len() + 2, 0, 50_000_000)]);
+    inconclusive(&evaluate(unfinished), "unterminated frame");
 }
 
 fn recording(stem: &str) -> RecordedCapture {
@@ -563,7 +627,7 @@ fn timing_reference() -> Value {
     oracle
 }
 
-/// Scenario: Rechunk a redraw without changing its gap events and then add a gap at its erased intermediate template. Rechunking preserves the verdict; the added frame boundary changes which cells a later restore may draw.
+/// Scenario: Rechunk a redraw without changing its arrival gaps or measured silence, then add measured quiet at its erased intermediate template. Rechunking preserves the verdict; the added frame boundary changes which cells a later restore may draw.
 #[spec("inbox/doorbell/060")]
 #[test]
 fn doorbell_060_timing_preserving_rechunk_and_changed_gap_control() {
@@ -572,7 +636,9 @@ fn doorbell_060_timing_preserving_rechunk_and_changed_gap_control() {
         control("partial_erase"),
         control("restore_previous")
     );
-    let trace = quiet(&middle, &[(6, 50_000_000), (19, 50_000_000)]);
+    let mut trace = quiet(&middle, &[(6, 50_000_000)]);
+    let raw_len = control("before").len() + middle.len() + control("after").len();
+    trace["quiet_observations"] = json!([quiet_observation(19, raw_len, 100_000_000, 50_000_000)]);
     for width in [1, 7, usize::MAX] {
         passed(&run(
             timing_reference(),
@@ -580,14 +646,29 @@ fn doorbell_060_timing_preserving_rechunk_and_changed_gap_control() {
             Limits::default(),
         ));
     }
-    let changed = quiet(
-        &middle,
-        &[(6, 50_000_000), (9, 50_000_000), (19, 50_000_000)],
-    );
-    differs(
-        &run(timing_reference(), changed, Limits::default()),
-        "transient_content",
-    );
+    let mut changed = trace.clone();
+    changed["quiet_observations"]
+        .as_array_mut()
+        .unwrap()
+        .insert(
+            0,
+            quiet_observation(
+                9,
+                control("before").len() + control("partial_erase").len(),
+                0,
+                50_000_000,
+            ),
+        );
+    for width in [1, 7, usize::MAX] {
+        differs(
+            &run(
+                timing_reference(),
+                rechunk(&changed, width),
+                Limits::default(),
+            ),
+            "transient_content",
+        );
+    }
 }
 
 /// Scenario: Read at 0, 100, 140 and 180 milliseconds, so merging the middle reads under the first timestamp would invent an 80-millisecond gap. Preserve the original operation-indexed gaps when merging; only the deliberately invented gap changes the verdict.
