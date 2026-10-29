@@ -11,6 +11,9 @@ use dot_agent_deck::release_check::evaluate::{
 use serde_json::{Value, json};
 use spec::spec;
 
+#[path = "support/release_check_recording.rs"]
+mod release_check_recording;
+
 const SYNC_ON: &str = "\x1b[?2026h";
 const SYNC_OFF: &str = "\x1b[?2026l";
 
@@ -145,20 +148,7 @@ fn claude_record() -> &'static dot_agent_deck::doorbell_activation::ReleaseRecor
 
 /// Replace evidence bytes and rebase indexes; do not add a test-only failure knob.
 fn replace_bytes(trace: &mut RecordedCapture, start: usize, end: usize, bytes: &[u8]) {
-    let shift = bytes.len() as i64 - (end - start) as i64;
-    trace.bytes.splice(start..end, bytes.iter().copied());
-    for point in trace.index["points"].as_object_mut().unwrap().values_mut() {
-        let offset = point.as_u64().unwrap() as usize;
-        if offset >= end {
-            *point = json!((offset as i64 + shift) as usize);
-        } else if offset > start {
-            *point = json!(start + bytes.len());
-        }
-    }
-    // One push deliberately removes read boundaries from the fact-only replay.
-    // The oracle's timing tests above retain gap events separately.
-    trace.index["read_lens"] = json!([trace.bytes.len()]);
-    assert!(trace.index["edges"].as_array().unwrap().is_empty());
+    release_check_recording::replace_bytes(&mut trace.bytes, &mut trace.index, start, end, bytes);
 }
 
 /// Scenario: Replay the Codex capture with its first header shifted one column to the right. The otherwise familiar launch fails its release_recogniser fact.
@@ -526,7 +516,7 @@ fn doorbell_060_non_neighbour_past_quiet_gap() {
     );
 }
 
-/// Scenario: Pause three times in one redraw, each pause shorter than the operation budget by itself. The pending evidence spans all stalls and eventually exceeds the shared transition budget.
+/// Scenario: Pause three times in one redraw, with each stall's bytes and operations below its respective budget. Independently binding byte and operation limits each hold the redraw as inconclusive because pending evidence accumulates across the stalls; a generous budget passes and counts the stalls.
 #[spec("inbox/doorbell/060")]
 #[test]
 fn doorbell_060_stalls_share_transition_bound() {
@@ -541,17 +531,28 @@ fn doorbell_060_stalls_share_transition_bound() {
             (21, 50_000_000),
         ],
     );
-    inconclusive(
-        &run(
-            reference(),
-            trace,
-            Limits {
-                transition_bytes: 1_048_576,
-                transition_operations: 12,
-            },
-        ),
-        "limit: transition",
-    );
+    let generous = evaluate(trace.clone());
+    passed(&generous);
+    assert_eq!(generous.stalls, 3, "{generous:?}");
+    assert_eq!(generous.accepted_t1_stalls, 3, "{generous:?}");
+    for limits in [
+        Limits {
+            transition_bytes: 1_048_576,
+            transition_operations: 12,
+        },
+        Limits {
+            // Each three-operation partial erase is 13 bytes; the whole
+            // pending redraw is 49 bytes. Resetting at every stall would
+            // therefore incorrectly fit this 26-byte budget.
+            transition_bytes: 26,
+            transition_operations: 100_000,
+        },
+    ] {
+        inconclusive(
+            &run(reference(), trace.clone(), limits),
+            "limit: transition",
+        );
+    }
 }
 
 fn timing_reference() -> Value {

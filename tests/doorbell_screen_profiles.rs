@@ -18,6 +18,9 @@ use dot_agent_deck::release_scanner::{
 use semver::Version;
 use spec::spec;
 
+#[path = "support/release_check_recording.rs"]
+mod release_check_recording;
+
 /// One recorded launch: the bytes, the sizes the PTY reader returned them in,
 /// the stream offset of each named moment, and each resize.
 struct Trace {
@@ -37,6 +40,10 @@ fn fixture(stem: &str) -> Trace {
     let index: serde_json::Value =
         serde_json::from_slice(&std::fs::read(base.join(format!("{stem}.json"))).expect("index"))
             .expect("index json");
+    trace_from_recording(bytes, &index)
+}
+
+fn trace_from_recording(bytes: Vec<u8>, index: &serde_json::Value) -> Trace {
     let num = |v: &serde_json::Value| v.as_u64().unwrap() as usize;
     Trace {
         rows: index["rows"].as_u64().unwrap() as u16,
@@ -297,10 +304,81 @@ fn latch_of(bytes: &[u8]) -> ScanLatch {
     scanner.latch().clone()
 }
 
-/// Scenario: Feed header-like text in other shapes and positions: the Codex header one column off, without its `(v`, with a pre-release tag or unterminated, and Claude Code's header at another column or with a pre-release tag. None latches; a Claude Code version written in pieces latches once, complete, without a conflict.
+/// Scenario: Feed header-like text in other shapes and positions, including shifting the real Codex capture's first header one column while retaining its resize evidence. The doctored capture remains replayable but its first header is not recognised; synthetic wrong headers do not latch, and a Claude Code version written in pieces latches once when complete.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_release_recogniser_negatives() {
+    let stem = "codex-inbox/r5wake/codex-0.164.0-composer-24x80";
+    let original = fixture(stem);
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let mut index: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join(format!("{stem}.json"))).unwrap()).unwrap();
+    let mut bytes = original.bytes.clone();
+    let at = bytes
+        .windows(b"OpenAI Codex".len())
+        .position(|b| b == b"OpenAI Codex")
+        .unwrap();
+    release_check_recording::replace_bytes(&mut bytes, &mut index, at, at, b"\x1b[C");
+    let doctored = trace_from_recording(bytes, &index);
+    assert_eq!(doctored.edges.len(), 30, "retain the full resize evidence");
+    assert_eq!(
+        doctored.read_lens.iter().sum::<usize>(),
+        doctored.bytes.len()
+    );
+    for (name, offset) in &original.points {
+        assert_eq!(doctored.points[name], offset + 3, "point {name}");
+    }
+    let read_ends: Vec<_> = doctored
+        .read_lens
+        .iter()
+        .scan(0, |sum, len| {
+            *sum += len;
+            Some(*sum)
+        })
+        .collect();
+    for (&(old, rows, cols), &(off, r, c)) in original.edges.iter().zip(&doctored.edges) {
+        assert_eq!((off, r, c), (old + 3, rows, cols));
+        assert!(
+            read_ends.contains(&off),
+            "resize at {off} must split replay"
+        );
+    }
+    for name in original.points.keys() {
+        // Replay the whole capture, including the later resized screens.
+        assert_eq!(
+            original.size_at(original.points[name]),
+            doctored.size_at(doctored.points[name])
+        );
+        if name.starts_with("resize-") || name.starts_with("nudge-") {
+            let expected = original.parser_upto(original.points[name]);
+            let actual = doctored.parser_upto(doctored.points[name]);
+            assert_eq!(
+                expected.screen().contents_formatted(),
+                actual.screen().contents_formatted(),
+                "unchanged {name}"
+            );
+        }
+    }
+    let empty = doctored.points["empty"];
+    assert!(matches!(
+        latch_of(&original.bytes[..original.points["empty"]]),
+        ScanLatch::Latched { .. }
+    ));
+    assert_eq!(latch_of(&doctored.bytes[..empty]), ScanLatch::Pending);
+    // Later incremental header paints use the original column positions.
+    // Check the complete initial draw before those paints, rather than
+    // requiring their later text to stay intact after shifting the header.
+    let header_end = at
+        + original.bytes[at..]
+            .windows(b"\x1b[3;1H".len())
+            .position(|bytes| bytes == b"\x1b[3;1H")
+            .unwrap();
+    let initial = doctored.parser_upto(header_end + 3);
+    let screen = initial.screen().contents();
+    assert!(screen.contains("OpenAI Codex (v0.164.0)"), "{screen}");
+    assert!(initial.screen().cell(1, 5).unwrap().contents().is_empty());
+    assert_eq!(initial.screen().cell(1, 6).unwrap().contents(), "O");
+
     let codex = |col: u16, text: &str| format!("\x1b[2;{}H{text}\r\n", col + 1).into_bytes();
     assert!(matches!(
         latch_of(&codex(5, "OpenAI Codex (v0.164.0)")),
