@@ -1323,6 +1323,19 @@ impl Telemetry {
         });
     }
 
+    /// Issue #1981 M8: an attach took `took` ([`super::observe_attach`]).
+    /// Counted in the open health interval; nothing happens when not
+    /// exporting or when health spans are off. Takes only the interval's own
+    /// lock, for as long as it takes to keep one sample.
+    pub fn observe_attach(&self, took: Duration) {
+        let Some(exporting) = &self.exporting else {
+            return;
+        };
+        if exporting.shared.health_interval.is_some() {
+            exporting.shared.lock_health().record_attach(took);
+        }
+    }
+
     /// Issue #1981 M7: the delegate path posted `posted`'s task: open its
     /// `agent.handoff`, stamped now, between the broadcast messages sent
     /// before and after this call. Nothing happens when not exporting.
@@ -1899,7 +1912,22 @@ impl Shared {
 
     /// Issue #1981 M8: end the health interval at `now`, the daemon's
     /// resident memory then being `rss`, and queue its `daemon.health` span.
+    #[cfg(test)]
     fn sample_health(&self, now: u64, rss: Option<u64>) {
+        let ended = self.cut_health(now);
+        self.send_health(ended, now, rss);
+    }
+
+    /// Issue #1981 M8: end the health interval at `now`, before its memory
+    /// is read, so an attach that finishes during the read counts in the
+    /// next interval rather than in one that ended before it.
+    fn cut_health(&self, now: u64) -> super::health::Window {
+        self.lock_health().cut(now)
+    }
+
+    /// Queue the `daemon.health` span of `ended`, which ended at `now` with
+    /// the daemon's resident memory then being `rss`.
+    fn send_health(&self, ended: super::health::Window, now: u64, rss: Option<u64>) {
         let runs_open = self
             .tracker
             .lock()
@@ -1908,8 +1936,7 @@ impl Shared {
         let dropped = self
             .dropped_total
             .load(std::sync::atomic::Ordering::Relaxed);
-        let span = self.lock_health().close(now, runs_open, rss, dropped);
-        self.enqueue(vec![span]);
+        self.enqueue(vec![ended.span(now, runs_open, rss, dropped)]);
     }
 
     fn enqueue(&self, spans: Vec<SpanRecord>) {
@@ -2066,8 +2093,9 @@ async fn run_ingest(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiver<C
                 // after it is that end's. No event is read meanwhile, and no
                 // lock is held across the read.
                 let now = now_unix_nanos();
+                let ended = shared.cut_health(now);
                 let rss = super::health::rss_bytes().await;
-                shared.sample_health(now, rss);
+                shared.send_health(ended, now, rss);
             }
             msg = next_event(&mut events) => match msg {
                 Ok(msg) => {
@@ -6724,6 +6752,54 @@ mod tests {
                 .all(|s| health_attr(s, AttrKey::DaemonMemoryRss).is_some_and(|b| b > 0)),
             "{health:?}"
         );
+    }
+
+    /// Issue #1981 M8: an attach the daemon reports goes into the next
+    /// `daemon.health` span, and none is counted with health spans off.
+    #[tokio::test]
+    async fn an_attach_is_counted_in_the_next_health_span() {
+        let (sink, mut rx) = mpsc::channel(QUEUE_CAPACITY);
+        let telemetry = Arc::new(Telemetry::start_with(
+            &env(&ON),
+            Settings {
+                sink: Some(sink),
+                health_interval: Some(Duration::from_millis(50)),
+                ..Settings::default()
+            },
+        ));
+        let before = now_unix_nanos();
+        crate::telemetry::observe_attach(Some(Arc::clone(&telemetry)), Duration::from_millis(42));
+        let mut health = Vec::new();
+        eventually("an interval after the attach", || {
+            health.extend(
+                captured(&mut rx)
+                    .into_iter()
+                    .filter(|s| s.name == crate::telemetry::SPAN_DAEMON_HEALTH),
+            );
+            health.iter().any(|s| s.start_unix_nanos >= before)
+        })
+        .await;
+        let counted: i64 = health
+            .iter()
+            .map(|s| health_attr(s, AttrKey::AttachLatencyCount).unwrap())
+            .sum();
+        assert_eq!(counted, 1, "{health:?}");
+        let sampled = health
+            .iter()
+            .find(|s| health_attr(s, AttrKey::AttachLatencyCount) == Some(1))
+            .unwrap();
+        assert_eq!(health_attr(sampled, AttrKey::AttachLatencyMax), Some(42));
+
+        // Health spans off: nothing to count it in, and nothing breaks.
+        let off = Telemetry::start_with(
+            &env(&ON),
+            Settings {
+                health_interval: None,
+                ..Settings::default()
+            },
+        );
+        off.observe_attach(Duration::from_millis(1));
+        crate::telemetry::observe_attach(None, Duration::from_millis(1));
     }
 
     /// Issue #1981 M8: `event` as the daemon admits it from a producer,
