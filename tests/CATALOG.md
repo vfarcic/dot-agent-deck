@@ -188,7 +188,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### telemetry/otlp/018 — Real interactive Codex safely joins its own telemetry to the deck run. [reel]
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_telemetry_export_live.rs`).
 - **Agent:** real Codex called by name inside a wrapper shell script on the auth-compatible cheap model (ChatGPT default gpt-5.6-luna).
-- **Asserts:** real shell copies a unique fixture, the pane completes and card settles, native traces/metrics carry the deck resource run id, no logs are captured and prompt/file/output sentinels are absent from every captured body.
+- **Asserts:** real shell copies a unique fixture, the pane completes and card settles, native traces/metrics carry the deck resource run id, Codex sends no logs (the deck's own `dot-agent-deck` log records, #1981 M8, are allowed) and prompt/file/output sentinels are absent from every captured body.
 - **Does not assert:** Codex sandbox enforcement or native metric values.
 - **Platform coverage:** mac+linux when authenticated.
 
