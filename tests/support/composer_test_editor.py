@@ -17,10 +17,14 @@ path = Path(args[-1].removesuffix(':1'))
 record = {'argv': args, 'path': str(path), 'hex': path.read_bytes().hex(),
           'mode': path.stat().st_mode & 0o777, 'tty': [os.isatty(n) for n in range(3)],
           'pid': os.getpid()}
+if mode == 'late-hang':
+    Path(base + '.editor-publish-waiting').touch()
+    while not os.path.exists(base + '.editor-publish-go'):
+        time.sleep(0.005)
 temporary = Path(base + '.editor-started.tmp')
 temporary.write_text(json.dumps(record))
 temporary.replace(base + '.editor-started')
-if mode in ('wait', 'hang', 'read'):
+if mode in ('wait', 'hang', 'read', 'late-hang'):
     if mode == 'read':
         data = os.read(0, 1024)
         Path(base + '.editor-input').write_bytes(data)

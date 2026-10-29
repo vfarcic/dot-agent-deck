@@ -33,15 +33,16 @@ class ExternalEditor(unittest.TestCase):
                for key, value in env.items() if value is not None}
         composer = Composer(root, fixture, env, instrument=True)
         self.addCleanup(composer.close)
-        def stop_editor():
-            if not composer.path('.editor-finished').exists():
-                try:
-                    os.kill(composer.read_json('.editor-started')['pid'], signal.SIGKILL)
-                except (FileNotFoundError, ProcessLookupError, TypeError, json.JSONDecodeError):
-                    pass
-        self.addCleanup(stop_editor)
+        self.addCleanup(self.stop_editor, composer)
         composer.ready()
         return composer
+
+    def stop_editor(self, composer):
+        if not composer.path('.editor-finished').exists():
+            try:
+                os.kill(composer.read_json('.editor-started')['pid'], signal.SIGKILL)
+            except (FileNotFoundError, ProcessLookupError, TypeError, json.JSONDecodeError):
+                pass
 
     def type(self, composer, data):
         os.write(composer.master, data)
@@ -196,6 +197,21 @@ class ExternalEditor(unittest.TestCase):
                     kept = mechanism == 'none' and fixture != 'codex_composer.py'
                     self.assertEqual(result, b'EDITEDTAIL' if kept else b'EDITED')
 
+        # M44d BEL/D3/same-frame retained BASETAIL in 20/20 trials for
+        # each Codex release. Keeping Claude/empty tails here is synthetic;
+        # H-chunk is an explicit injected loss, independent of interval flush.
+        for fixture in FIXTURES:
+            for mechanism in ('none', 'H-chunk'):
+                with self.subTest(fixture=fixture, same_read=mechanism):
+                    composer = self.start(fixture, 'fail')
+                    composer.path('.edit-mechanism').write_text(mechanism)
+                    self.type(composer, b'BASE\x07TAIL')
+                    self.assertEqual(bytes.fromhex(self.started(composer)['hex']), b'BASE')
+                    self.resumed(composer)
+                    expected = b'BASETAIL' if mechanism == 'none' else b'BASE'
+                    self.assertEqual(self.draft(composer), expected,
+                                     'same-read suffix retained unless H-chunk is injected')
+
     def test_dropped_candidate_and_ignored_human_then_retry(self):
         """Scenario: drop a candidate persistently or ignore it once, then retry; no editor opens for the ignored key and the retry exports the untouched draft."""
         for fixture in FIXTURES:
@@ -236,10 +252,23 @@ class ExternalEditor(unittest.TestCase):
                     self.resumed(composer)
 
     def test_encoded_candidates_split_paste_and_successful_trim(self):
-        """Scenario: send encoded Ctrl+G keys, including split reads, then a paste containing BEL; exports distinguish the shortcut from pasted text and pin successful Codex trimming."""
+        """Scenario: send each agent's sampled composer keys, including split reads and non-invoking controls, then paste a BEL. Check editor invocation, retained draft and successful Codex trimming; the empty-screen profile and split scheduling are synthetic."""
+        # M44e ordinary-composer observations, 4/4 or 0/4 for these forms:
+        # Claude 2.1.310 and both Codex 0.160.0/0.164.0. This is not a
+        # global inert-set claim across other states, clients or releases.
+        forms = (b'\x07', b'\x1b[103;5u', b'\x1b[103;5:1u',
+                 b'\x1b[103;5:2u', b'\x1b[103;5:3u', b'\x1b[27;5;103~',
+                 b'\x1b[71;5u', b'\x1b[71;5:1u', b'\x1b[71;5:2u',
+                 b'\x1b[71;5:3u', b'\x1b[27;5;71~')
+        sampled_invocations = {
+            'codex_composer.py': {b'\x07', b'\x1b[103;5u',
+                                  b'\x1b[103;5:1u', b'\x1b[103;5:2u'},
+            'claude_composer.py': {b'\x07', b'\x1b[103;5u', b'\x1b[27;5;103~',
+                                   b'\x1b[71;5u', b'\x1b[27;5;71~'},
+        }
+        sampled_invocations['empty_composer.py'] = sampled_invocations['claude_composer.py']
         for fixture in FIXTURES:
-            for form in (b'\x07', b'\x1b[103;5u', b'\x1b[103;5:1u',
-                         b'\x1b[103;5:2u', b'\x1b[27;5;103~'):
+            for form in forms:
                 with self.subTest(fixture=fixture, form=form):
                     composer = self.start(fixture, 'fail')
                     self.type(composer, b'BASE' + form[:2])
@@ -247,6 +276,14 @@ class ExternalEditor(unittest.TestCase):
                     if len(form) > 2:
                         self.assertFalse(composer.path('.editor-started').exists())
                     self.type(composer, form[2:])
+                    if form not in sampled_invocations[fixture]:
+                        composer.cycle()
+                        self.assertFalse(composer.path('.editor-started').exists(),
+                                         'key did not invoke in sampled ordinary composer')
+                        self.assertNotIn(b'\x1b[?2004l', composer.output)
+                        self.assertEqual(self.draft(composer), b'BASE')
+                        self.resumed(composer)
+                        continue
                     self.assertEqual(bytes.fromhex(self.started(composer)['hex']), b'BASE')
                     self.resumed(composer)
             with self.subTest(fixture=fixture, paste=True):
@@ -265,6 +302,27 @@ class ExternalEditor(unittest.TestCase):
                 self.resumed(composer)
                 expected = b'EDITED' if fixture == 'codex_composer.py' else b'EDITED   \n'
                 self.assertEqual(self.draft(composer), expected)
+
+    def test_cleanup_waits_for_editor_pid_publication(self):
+        """Scenario: pause a hanging editor before it publishes its PID, then run failure cleanup. Cleanup releases the late publisher and returns after the composer has reaped it."""
+        for fixture in FIXTURES:
+            with self.subTest(fixture=fixture):
+                composer = self.start(fixture, 'late-hang')
+                self.type(composer, b'BASE\x07')
+                composer.wait(lambda: composer.path('.editor-publish-waiting').exists(),
+                              'editor paused before PID publication')
+                self.assertFalse(composer.path('.editor-started').exists())
+                try:
+                    self.stop_editor(composer)
+                    self.assertTrue(composer.path('.editor-finished').exists(),
+                                    'cleanup returned before late editor publication/exit')
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(self.started(composer)['pid'], 0)
+                finally:
+                    # Also release/reap the child when testing the old cleanup.
+                    composer.path('.editor-go').touch()
+                    composer.path('.editor-publish-go').touch()
+                    self.resumed(composer)
 
     def test_immediate_editor_is_gone_before_the_first_scan(self):
         """Scenario: let the immediate editor finish before a deliberately delayed first 50 ms scan; the draft and resume marker still appear even though that scan cannot observe the editor running."""
