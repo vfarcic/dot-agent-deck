@@ -10,6 +10,27 @@
 
 ## Test Case Catalog
 
+##### inbox/release-check/001 — Self-check fields are additive, bounded and readable by the frozen pre-SC-08 client.
+- **Layer:** Fast (`tests/release_check_wire.rs`); pure serde round-trips and card notice projection.
+- **Agent:** none.
+- **Asserts:** every new hold cause, including unavailable, preserves the optional agent/release/fact/reason fields and shows the design's card words; field bounds and fixed vocabularies tolerate future values; old summaries and absent fields remain readable; release-check snapshot states/progress and optional times round-trip, absent lists are omitted and present-empty lists retained; Hello advertises release_check with protocol 12 unchanged; each new request round-trips; the frozen old reader ignores new fields, maps new causes to Unknown and retains its literal cannot_type notice, independently checked on literal new payloads as a positive control.
+- **Does not assert:** daemon-produced journal publication, real cross-version binaries, terminal layout, desktop rendering, runner behavior or authority conferred by any snapshot. Proposed DTO/container and vocabulary assumptions are in `tests/fixtures/release-check/wire/README.md`.
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/release-check/002 — The shared client withholds all three self-check verbs without the capability.
+- **Layer:** Fast (`tests/release_check_client.rs`), scripted test-owned Unix sockets.
+- **Agent:** none.
+- **Asserts:** run, cancel and forget return unsupported and send no verb for absent, empty or unrelated capabilities; a daemon advertising release_check receives each exact request once; its semantic refusal is surfaced.
+- **Does not assert:** real daemon operations, containment, agent launch, authentication, capability-cache implementation or a connection-reuse policy.
+- **Platform coverage:** mac+linux.
+
+##### inbox/release-check/003 — The CLI exposes the action matrix and refuses malformed or unavailable actions locally.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_release_check_cli.rs`), fresh empty per-command sandboxes and captured-child deadlines.
+- **Agent:** none; PATH has no executable, and no daemon is launched.
+- **Asserts:** status/run/cancel/forget/export/mode help succeeds; missing and excess arguments, unsupported agents, unsafe releases and invalid modes fail with clap guidance; valid forms reach a semantic outcome; run/cancel fail without a daemon, export fails without a matching record, and no command bootstraps a socket.
+- **Does not assert:** a running daemon's actions, successful check, exported content, scrubber coverage, mode persistence, cancellation cleanup, PTY rendering or a real agent. The design's export ellipsis and other grammar assumptions are recorded in the wire README.
+- **Platform coverage:** mac+linux+windows.
+
 This is the authoritative list of test cases the harness must cover. IDs are stable per Decision 7; tests reference them via `#[spec("…")]` annotations once the harness exists in M2. Coverage is enumerated from the code as it ships today (Decision 27 — "code is authoritative"); documented behaviors with no catalog entry are listed as deliberate skips at the end of this section.
 
 Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows once the harness's Windows path is ready per Decision 4); **mac+linux+windows** = portable from day one.
