@@ -467,7 +467,7 @@ tasks:
     tool-cache: ci-devbox-v1
     env:
       NIX_CONFIG: experimental-features = nix-command flakes
-      DEVBOX_USE_VERSION: 0.18.5
+      DEVBOX_USE_VERSION: 0.19.0
     run: |
       scripts/check-pin-lockstep.sh
       # The release binary, checked against its published SHA-256 (the
