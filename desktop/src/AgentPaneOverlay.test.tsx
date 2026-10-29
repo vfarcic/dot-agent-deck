@@ -235,7 +235,7 @@ describe("agent pane overlay", () => {
     fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
     const overlay = screen.getByTestId("agent-pane-overlay");
     expect(within(overlay).getAllByRole("tab")).toHaveLength(5);
-    expect(within(overlay).getByRole("heading", { name: "Planner" })).toBeVisible();
+    expect(within(overlay).getByRole("heading", { name: "Plan / architecture" })).toBeVisible();
     // Nothing is removed from the header, and identity matters MORE here: in
     // the grid, position tells a reader which tile they are looking at.
     expect(within(overlay).getByText("ATT")).toBeVisible();

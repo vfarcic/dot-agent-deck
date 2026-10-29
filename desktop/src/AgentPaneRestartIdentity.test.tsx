@@ -99,7 +99,7 @@ describe("an open pane across a deck restart that reuses its agent id", () => {
     await act(async () => { rerender(<DeckShell runtime={deck.runtime("process-b")} initialView={{ kind: "overview" }} />); });
 
     expect(screen.queryByTestId("agent-pane-overlay"), "the pane of a stopped agent must close").not.toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: "Successor" }), "the open view must not become the successor's agent").toBeNull();
+    expect(screen.queryByRole("heading", { name: "Successor run" }), "the open view must not become the successor's agent").toBeNull();
     expect(screen.getAllByTestId("restart-toast")).toHaveLength(1);
     expectRestartNotice();
     expect(deck.sendTerminalInput).not.toHaveBeenCalled();
@@ -145,7 +145,7 @@ describe("an open pane across a deck restart that reuses its agent id", () => {
 
     openPlanner("Successor run");
     const pane = screen.getByTestId("agent-pane-overlay");
-    expect(within(pane).getByRole("heading", { name: "Successor" })).toBeVisible();
+    expect(within(pane).getByRole("heading", { name: "Successor run" })).toBeVisible();
     expect(within(pane).getByTestId("terminal-planner")).toBeVisible();
     expect(deck.declared().at(-1)).toMatchObject({ agentId: "planner", incarnation: "process-b" });
     fireEvent.click(within(pane).getByRole("button", { name: /Type into/ }));
@@ -165,7 +165,7 @@ describe("an open pane across a deck restart that reuses its agent id", () => {
       expect(deck.declared()).toEqual([]);
       await act(async () => { rerender(<DeckShell runtime={first} initialView={view} />); });
     }
-    expect(within(screen.getByTestId("agent-pane-overlay")).getByRole("heading", { name: "Planner" })).toBeVisible();
+    expect(within(screen.getByTestId("agent-pane-overlay")).getByRole("heading", { name: "Plan / architecture" })).toBeVisible();
     expect(deck.declared()).toContainEqual(expect.objectContaining({ agentId: "planner", incarnation: "process-a" }));
 
     await act(async () => { rerender(<DeckShell runtime={deck.runtime("process-b")} initialView={view} />); });
