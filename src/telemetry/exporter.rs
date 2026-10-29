@@ -83,7 +83,7 @@ use super::input::{InputFilter, InterventionKind, LONE_ESCAPE_WINDOW, PASTE_IDLE
 use super::launch::LAUNCH_ENV_KEYS;
 use super::propagation::{RunIdentity, agent_env};
 use super::resource::{ResourceAttribute, deck_resource, host_name};
-use super::run_context::{ProbeSettings, Probes};
+use super::run_context::{BranchReads, ProbeSettings, Probes};
 use super::span::{SpanRecord, new_run_id};
 use super::tracker::{EndReason, FinishingRun, RunGeneration, RunStart, RunTracker};
 use super::{Protocol, now_unix_nanos, otlp};
@@ -768,6 +768,8 @@ struct Exporting {
     shared: Arc<Shared>,
     commands: mpsc::UnboundedSender<Command>,
     probes: Probes,
+    /// Issue #1981 M6: the branch reads spawns wait for.
+    branch_reads: BranchReads,
     ingest: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// When the daemon began a teardown a stop client is timing — see
     /// [`Telemetry::teardown_began`].
@@ -1123,9 +1125,16 @@ impl Telemetry {
         };
         if let Some(exporting) = &self.exporting {
             let run_id = start.run_id.clone();
+            // Read before the agent starts, so it is the branch the run
+            // started on, and outside the tracker's lock.
+            let branch = prepared
+                .cwd
+                .as_deref()
+                .and_then(|cwd| exporting.branch_reads.read(cwd));
             exporting.shared.with_tracker(|t| {
                 t.prepare_run_in(start, now_unix_nanos(), prepared.cwd.as_deref());
                 t.set_usage_dirs(&run_id, usage_dirs);
+                t.set_branch(&run_id, branch);
             });
         }
         Some(prepared)
@@ -2002,6 +2011,7 @@ fn start_exporting(
         shared,
         commands,
         probes: Probes::new(settings.probes),
+        branch_reads: BranchReads::default(),
         ingest: Mutex::new(Some(ingest)),
         teardown_began: OnceLock::new(),
     })
@@ -7463,9 +7473,9 @@ mod tests {
 
     /// Issue #1981 M7 review: the worker's report on a task held for a
     /// prepared orchestrator run arrives before the run's held close: the
-    /// run had not ended, so the hand-off ends `reported`, with the report's
-    /// event, at the run's end; the orchestrator's acknowledgement after the
-    /// close does not move that end.
+    /// run had not ended, so the hand-off ends `reported` when the report
+    /// arrived, with its event; the orchestrator's acknowledgement after the
+    /// close records no read, the run having ended without one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_report_before_a_prepared_runs_held_close_ends_the_handoff_reported() {
         use crate::inbox::StateName;
@@ -7485,7 +7495,6 @@ mod tests {
             attr(handoff, AttrKey::HandoffOutcome),
             Some(&AttrValue::Str("reported".into()))
         );
-        assert_eq!(handoff.end_unix_nanos, run.end_unix_nanos);
         assert_eq!(
             event_names(handoff),
             vec![
@@ -7493,20 +7502,25 @@ mod tests {
                 crate::telemetry::EVENT_HANDOFF_REPORTED
             ]
         );
+        assert_eq!(handoff.end_unix_nanos, handoff.events[1].time_unix_nanos);
+        assert!(handoff.end_unix_nanos <= run.end_unix_nanos, "{handoff:?}");
+        assert_no_read(&spans);
+    }
+
+    fn assert_no_read(spans: &[SpanRecord]) {
         assert!(
-            handoff
-                .events
+            spans
                 .iter()
-                .all(|e| e.time_unix_nanos <= run.end_unix_nanos),
-            "{handoff:?}"
+                .all(|s| s.name != crate::telemetry::SPAN_AGENT_HANDOFF_READ),
+            "{spans:?}"
         );
     }
 
     /// Issue #1981 M7 review: a report that overtakes its task's post, then
     /// the post held for its prepared orchestrator run, the run's close, and
-    /// the orchestrator acknowledging the report: the acknowledgement came
-    /// after the close, so the hand-off ends `reported` at the run's end,
-    /// not at the acknowledgement.
+    /// the orchestrator acknowledging the report: the hand-off ends
+    /// `reported` when the post finds the report, and the acknowledgement,
+    /// after the close, records no read.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_acknowledgement_after_a_held_close_of_a_report_that_overtook_its_post_stays_after_it()
      {
@@ -7538,7 +7552,8 @@ mod tests {
             attr(handoff, AttrKey::HandoffOutcome),
             Some(&AttrValue::Str("reported".into()))
         );
-        assert_eq!(handoff.end_unix_nanos, run.end_unix_nanos);
+        assert!(handoff.end_unix_nanos <= run.end_unix_nanos, "{handoff:?}");
+        assert_no_read(&spans);
     }
 
     /// Issue #1981 M7: the delegate seam and the inbox's broadcast make one
@@ -7611,6 +7626,11 @@ mod tests {
             .collect();
         assert_eq!(handoffs.len(), 1, "{spans:?}");
         let handoff = handoffs[0];
+        // The orchestrator's acknowledgement is a read span of its own.
+        let read = spans
+            .iter()
+            .find(|s| s.name == crate::telemetry::SPAN_AGENT_HANDOFF_READ)
+            .expect("a read span");
         assert_eq!(
             attr(handoff, AttrKey::HandoffOutcome),
             Some(&AttrValue::Str("reported".into()))
@@ -7629,5 +7649,9 @@ mod tests {
         assert_eq!(handoff.trace_id, run.trace_id);
         assert_eq!(handoff.parent_span_id, Some(run.span_id));
         assert!(!format!("{handoff:?}").contains("SENTINEL"));
+        assert_eq!(read.trace_id, handoff.trace_id);
+        assert_eq!(read.parent_span_id, Some(handoff.span_id));
+        assert_eq!(read.start_unix_nanos, handoff.end_unix_nanos);
+        assert!(!format!("{read:?}").contains("SENTINEL"));
     }
 }

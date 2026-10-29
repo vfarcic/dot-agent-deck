@@ -447,14 +447,14 @@ fn telemetry_otlp_003_agent_and_deck_share_run_id() {
     assert_eq!(attribute(&run, "deck.run.id"), run_id);
 }
 
-/// Scenario: Print private output, type private input, and send private hook fields while a privately titled pane exports with a secret header, then start a successor in a privately named git directory with private file contents, branch, command argument and ordinary environment value. Require an intervention, the authentication header and the telemetry exporter's startup log, and reject every private sentinel from exported bodies, URIs, non-authentication headers and telemetry-module log lines.
+/// Scenario: Print private output, type private input, and send private hook fields while a privately titled pane exports with a secret header, then start a successor in a privately named git directory with private file contents, branch, command argument and ordinary environment value. Require an intervention, the authentication header, the telemetry exporter's startup log and the branch as the successor run's `vcs.ref.head.name`, and reject every other private sentinel from exported bodies, and every sentinel from URIs, non-authentication headers and telemetry-module log lines.
 #[spec("telemetry/otlp/004")]
 #[test]
 fn telemetry_otlp_004_content_stays_out_of_request_bodies() {
     private_content_stays_out_of_exports("http/json");
 }
 
-/// Scenario: Export HTTP/protobuf from a privately titled stand-in pane while printing output, typing input and sending prompt/tool hook fields, then run a successor in a private git cwd that prints private file contents with private command and environment values. Require accepted run exports, an intervention and the intended authentication header, and reject the private sentinels from request bodies, URIs, non-authentication headers and telemetry-module logs.
+/// Scenario: Export HTTP/protobuf from a privately titled stand-in pane while printing output, typing input and sending prompt/tool hook fields, then run a successor in a private git cwd on a private branch that prints private file contents with private command and environment values. Require accepted run exports, an intervention, the intended authentication header and the branch in the successor's run, and reject the other private sentinels from request bodies and every sentinel from URIs, non-authentication headers and telemetry-module logs.
 #[spec("telemetry/otlp/013")]
 #[test]
 fn telemetry_otlp_013_protobuf_content_stays_out_of_request_bodies() {
@@ -587,7 +587,29 @@ fn private_content_stays_out_of_exports(protocol: &str) {
         !successor_run_id.is_empty(),
         "successor must receive a run id"
     );
-    wait_for_private_run(&receiver, &successor_run_id);
+    let successor_request = wait_for_private_run(&receiver, &successor_run_id);
+    // Issue #1981 M6: the branch is the one private name the deck sends, as
+    // the successor run's `vcs.ref.head.name`, so it is kept out of the body
+    // sentinels below and still out of URIs, headers and the log.
+    if protocol == "http/json" {
+        let run = receiver
+            .spans()
+            .into_iter()
+            .find(|span| {
+                span["name"] == "agent.run" && attribute(span, "deck.run.id") == successor_run_id
+            })
+            .expect("successor agent.run");
+        assert_eq!(
+            attribute(&run, "vcs.ref.head.name"),
+            BRANCH_SECRET,
+            "successor run: {run}"
+        );
+    } else {
+        assert!(
+            body_contains(&successor_request.body, BRANCH_SECRET),
+            "the successor run must carry its branch"
+        );
+    }
     let requests = receiver.requests();
     assert!(
         requests.iter().any(|request| request
@@ -611,7 +633,7 @@ fn private_content_stays_out_of_exports(protocol: &str) {
     for request in requests {
         for sentinel in sentinels {
             assert!(
-                !body_contains(&request.body, sentinel),
+                sentinel == BRANCH_SECRET || !body_contains(&request.body, sentinel),
                 "private sentinel {sentinel} leaked into OTLP body"
             );
             assert!(

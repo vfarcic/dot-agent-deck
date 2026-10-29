@@ -1,6 +1,7 @@
 //! Issue #1981 M7: one `agent.handoff` span per task an orchestrator
-//! delegates, from the task's post to the orchestrator reading the worker's
-//! report.
+//! delegates, from the task's post to the worker's report arriving, and one
+//! `agent.handoff.read` span per report the orchestrator then reads, from the
+//! report arriving to the orchestrator acknowledging it.
 //!
 //! **What opens one.** The delegate path tells telemetry it posted a task
 //! ([`super::observe_delegate_posted`]), which is the one place that knows a
@@ -11,15 +12,27 @@
 //! - the worker taking the task (`fetched`, `claimed` or `acknowledged` on
 //!   the task's message) is the `deck.handoff.taken` event, once;
 //! - a report naming the task reaching the orchestrator's inbox (`queued`,
-//!   with the task's id in its provenance) is the `deck.handoff.reported`
-//!   event, once, and refreshes the worker's run from the report's producer;
-//! - the orchestrator acknowledging that report ends the span `reported`;
+//!   with the task's id in its provenance) ends the span `reported`, with a
+//!   `deck.handoff.reported` event at its end, and takes the worker's run
+//!   from the report's producer;
+//! - the orchestrator acknowledging that report is the end of the
+//!   `agent.handoff.read` span, a child of the hand-off's span that starts
+//!   where the hand-off ended;
 //! - the task found undeliverable ends it `undeliverable`, with the inbox's
 //!   reason, or `superseded` when that reason is a newer task replacing it.
 //!
+//! **Why the read is a span of its own.** The hand-off ends when the report
+//! arrives, so it measures the worker's side whatever the orchestrator does
+//! next, and a span event cannot come after its span's end. The read is a
+//! child of the hand-off rather than of the orchestrator's run so it joins to
+//! the task structurally, by parent, in the same trace, as well as by
+//! `deck.handoff.id`; its duration is the time the report waited to be read.
+//! A report its orchestrator's run ends without reading has no read span, and
+//! neither does one still unread after [`MAX_HANDOFF_AGE_NANOS`] or pushed out
+//! by [`MAX_UNREAD_REPORTS`].
+//!
 //! A hand-off still open when its orchestrator's run ends ends with it:
-//! `reported` when the report had arrived, `daemon_shutdown` when the daemon
-//! is shutting down, `unknown` otherwise. One still open after
+//! `daemon_shutdown` when the daemon is shutting down, `unknown` otherwise. One still open after
 //! [`MAX_HANDOFF_AGE_NANOS`] ends `unknown` at that age, whatever ends it
 //! later — the exporter's usage poll checks every couple of seconds, and a
 //! run's end or the daemon's shutdown checks before choosing an outcome
@@ -41,7 +54,7 @@
 //! Only ids, the worker's role and enum names reach a span: never the task,
 //! its subject, its label or the report.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::event::InboxNotice;
 use crate::inbox::{StateName, UndeliverableReason};
@@ -50,13 +63,21 @@ use crate::report_recovery::ReportProvenance;
 use super::span::{
     Attribute, SpanEventRecord, SpanId, SpanRecord, TraceId, new_span_id, new_trace_id,
 };
-use super::{AttrKey, EVENT_HANDOFF_REPORTED, EVENT_HANDOFF_TAKEN, SPAN_AGENT_HANDOFF};
+use super::{
+    AttrKey, EVENT_HANDOFF_REPORTED, EVENT_HANDOFF_TAKEN, SPAN_AGENT_HANDOFF,
+    SPAN_AGENT_HANDOFF_READ,
+};
 
 /// Hand-offs open at once. Past it the oldest ends as `unknown`.
 pub const MAX_OPEN_HANDOFFS: usize = 256;
 
-/// How long a hand-off may stay open before it ends as `unknown`.
+/// How long a hand-off may stay open before it ends as `unknown`, and how
+/// long a report may wait to be read before its read is forgotten.
 pub const MAX_HANDOFF_AGE_NANOS: u64 = 24 * 60 * 60 * 1_000_000_000;
+
+/// Reports that arrived and wait to be read. Past it the oldest is forgotten,
+/// and its read is not recorded.
+pub const MAX_UNREAD_REPORTS: usize = 256;
 
 /// Notices for messages no hand-off knows yet, held for a post they may have
 /// overtaken. Past it the oldest is dropped.
@@ -68,8 +89,7 @@ pub const EARLY_NOTICE_AGE_NANOS: u64 = 60 * 1_000_000_000;
 /// How a hand-off ended (`deck.handoff.outcome`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// The orchestrator read the report, or its run ended after the report
-    /// arrived.
+    /// The worker's report arrived.
     Reported,
     /// The task never reached its worker, for the inbox's reason.
     Undeliverable(Option<UndeliverableReason>),
@@ -214,8 +234,23 @@ struct OpenHandoff {
     role: String,
     worker_run_id: Option<String>,
     taken: Option<u64>,
-    /// When the report arrived, and its message id.
-    reported: Option<(u64, String)>,
+    /// When the report arrived: the hand-off ends then.
+    reported: Option<u64>,
+}
+
+/// A report that arrived for a hand-off, waiting for its orchestrator to
+/// read it: what its `agent.handoff.read` span needs.
+#[derive(Debug)]
+struct UnreadReport {
+    task: String,
+    trace_id: TraceId,
+    /// The hand-off's span, the read's parent.
+    handoff_span: SpanId,
+    arrived: u64,
+    orchestrator_pane: String,
+    orchestrator_run_id: Option<String>,
+    orchestration_id: Option<String>,
+    role: String,
 }
 
 /// Every open hand-off, by task id. See the module docs.
@@ -224,8 +259,15 @@ pub struct Handoffs {
     open: HashMap<String, OpenHandoff>,
     /// Open task ids, oldest post first.
     order: VecDeque<String>,
-    /// The task each arrived report names, by report message id.
-    reports: HashMap<String, String>,
+    /// Reports that arrived and are not read yet, by report message id.
+    unread: HashMap<String, UnreadReport>,
+    /// Their ids, oldest arrival first.
+    unread_order: VecDeque<String>,
+    /// The last [`MAX_OPEN_HANDOFFS`] tasks whose hand-off ended, oldest
+    /// first: a later notice about one, such as the retirement the inbox
+    /// broadcasts after a report, is not held as an early notice.
+    ended: VecDeque<String>,
+    ended_ids: HashSet<String>,
     /// Changes for messages no hand-off knew yet, oldest first, with when
     /// each was seen.
     early: VecDeque<(Change, u64)>,
@@ -294,9 +336,9 @@ impl Handoffs {
     fn concerns(&self, task: &str, change: &Change) -> bool {
         match change {
             Change::Report { task: t, .. } => t == task,
-            other => other
-                .message_id()
-                .is_some_and(|id| id == task || self.reports.get(id).is_some_and(|t| t == task)),
+            other => other.message_id().is_some_and(|id| {
+                id == task || self.unread.get(id).is_some_and(|r| r.task == task)
+            }),
         }
     }
 
@@ -327,10 +369,20 @@ impl Handoffs {
         run_of: &dyn Fn(&str, &str) -> Option<RunRef>,
         finished: &mut Vec<SpanRecord>,
     ) -> bool {
+        // A notice about a task whose hand-off ended has nothing left to
+        // change.
+        if let Change::Taken(id)
+        | Change::Acknowledged(id)
+        | Change::Undeliverable(id, _)
+        | Change::Report { task: id, .. } = &change
+            && self.ended_ids.contains(id)
+        {
+            return true;
+        }
         match change {
             Change::Taken(id) => {
                 // The orchestrator taking a report is not reading it.
-                if self.reports.contains_key(&id) {
+                if self.unread.contains_key(&id) {
                     return true;
                 }
                 let Some(open) = self.open.get_mut(&id) else {
@@ -339,8 +391,9 @@ impl Handoffs {
                 open.taken.get_or_insert(now.max(open.start));
             }
             Change::Acknowledged(id) => {
-                if let Some(task) = self.reports.get(&id).cloned() {
-                    self.end(&task, Outcome::Reported, now, finished);
+                if let Some(unread) = self.unread.remove(&id) {
+                    self.unread_order.retain(|r| *r != id);
+                    finished.push(read_span(unread, now));
                 } else if let Some(open) = self.open.get_mut(&id) {
                     open.taken.get_or_insert(now.max(open.start));
                 } else {
@@ -348,18 +401,16 @@ impl Handoffs {
                 }
             }
             Change::Undeliverable(id, reason) => {
-                let Some(open) = self.open.get(&id) else {
-                    return false;
-                };
-                // A task whose report arrived was delivered, whatever
+                // A task whose report arrived has ended, delivered, whatever
                 // becomes of its message now.
-                if open.reported.is_none() {
-                    let outcome = match reason {
-                        Some(UndeliverableReason::Superseded) => Outcome::Superseded,
-                        other => Outcome::Undeliverable(other),
-                    };
-                    self.end(&id, outcome, now, finished);
+                if !self.open.contains_key(&id) {
+                    return false;
                 }
+                let outcome = match reason {
+                    Some(UndeliverableReason::Superseded) => Outcome::Superseded,
+                    other => Outcome::Undeliverable(other),
+                };
+                self.end(&id, outcome, now, finished);
             }
             Change::Report {
                 report,
@@ -369,12 +420,28 @@ impl Handoffs {
                 let Some(open) = self.open.get_mut(&task) else {
                     return false;
                 };
-                if open.reported.is_none() {
-                    open.reported = Some((now.max(open.start), report.clone()));
-                    if let Some(run) = run_of(&pane, &agent) {
-                        open.worker_run_id = Some(run.run_id);
+                let arrived = now.max(open.start).max(open.taken.unwrap_or(0));
+                open.reported = Some(arrived);
+                if let Some(run) = run_of(&pane, &agent) {
+                    open.worker_run_id = Some(run.run_id);
+                }
+                let unread = UnreadReport {
+                    task: task.clone(),
+                    trace_id: open.trace_id,
+                    handoff_span: open.span_id,
+                    arrived,
+                    orchestrator_pane: open.orchestrator_pane.clone(),
+                    orchestrator_run_id: open.orchestrator_run_id.clone(),
+                    orchestration_id: open.orchestration_id.clone(),
+                    role: open.role.clone(),
+                };
+                self.end(&task, Outcome::Reported, arrived, finished);
+                self.unread.insert(report.clone(), unread);
+                self.unread_order.push_back(report);
+                while self.unread_order.len() > MAX_UNREAD_REPORTS {
+                    if let Some(oldest) = self.unread_order.pop_front() {
+                        self.unread.remove(&oldest);
                     }
-                    self.reports.insert(report, task);
                 }
             }
             // Counted on the run by the tracker.
@@ -385,7 +452,7 @@ impl Handoffs {
 
     /// The orchestrator run `run_id` ended at `now`, `shutting_down` when the
     /// daemon is: end every hand-off in it, after the ones past their age
-    /// bound end `unknown` at it.
+    /// bound end `unknown` at it, and forget the reports it left unread.
     pub fn run_ended(
         &mut self,
         run_id: &str,
@@ -405,8 +472,12 @@ impl Handoffs {
             .cloned()
             .collect();
         for id in ending {
-            self.end_unread(&id, shutting_down, now, finished);
+            self.end_unreported(&id, shutting_down, now, finished);
         }
+        self.unread
+            .retain(|_, r| r.orchestrator_run_id.as_deref() != Some(run_id));
+        let unread = &self.unread;
+        self.unread_order.retain(|id| unread.contains_key(id));
     }
 
     /// Daemon shutdown at `now`: end every hand-off still open, the ones
@@ -415,23 +486,24 @@ impl Handoffs {
         self.expire(now, finished);
         let open: Vec<String> = self.order.iter().cloned().collect();
         for id in open {
-            self.end_unread(&id, true, now, finished);
+            self.end_unreported(&id, true, now, finished);
         }
         self.early.clear();
+        self.unread.clear();
+        self.unread_order.clear();
+        self.ended.clear();
+        self.ended_ids.clear();
     }
 
-    /// End `id` with its report unread: `reported` when it arrived.
-    fn end_unread(
+    /// End `id`, whose report has not arrived.
+    fn end_unreported(
         &mut self,
         id: &str,
         shutting_down: bool,
         now: u64,
         finished: &mut Vec<SpanRecord>,
     ) {
-        let reported = self.open.get(id).is_some_and(|h| h.reported.is_some());
-        let outcome = if reported {
-            Outcome::Reported
-        } else if shutting_down {
+        let outcome = if shutting_down {
             Outcome::DaemonShutdown
         } else {
             Outcome::Unknown
@@ -465,6 +537,10 @@ impl Handoffs {
         }
         self.early
             .retain(|(_, at)| now.saturating_sub(*at) < EARLY_NOTICE_AGE_NANOS);
+        self.unread
+            .retain(|_, r| now.saturating_sub(r.arrived) < MAX_HANDOFF_AGE_NANOS);
+        let unread = &self.unread;
+        self.unread_order.retain(|id| unread.contains_key(id));
     }
 
     fn end(&mut self, id: &str, outcome: Outcome, now: u64, finished: &mut Vec<SpanRecord>) {
@@ -472,10 +548,15 @@ impl Handoffs {
         let Some(open) = self.open.remove(id) else {
             return;
         };
-        if let Some((_, report)) = &open.reported {
-            self.reports.remove(report);
-        }
         finished.push(span(id, open, outcome, now));
+        if self.ended_ids.insert(id.to_string()) {
+            self.ended.push_back(id.to_string());
+        }
+        while self.ended.len() > MAX_OPEN_HANDOFFS {
+            if let Some(oldest) = self.ended.pop_front() {
+                self.ended_ids.remove(&oldest);
+            }
+        }
     }
 
     /// The task named by report `report`, when the report is held for a
@@ -499,6 +580,38 @@ impl Handoffs {
     #[cfg(test)]
     pub fn early_count(&self) -> usize {
         self.early.len()
+    }
+
+    /// Reports that arrived and are not read yet.
+    #[cfg(test)]
+    pub fn unread_count(&self) -> usize {
+        self.unread.len()
+    }
+}
+
+/// The `agent.handoff.read` span of `unread`, which its orchestrator read at
+/// `now`.
+fn read_span(unread: UnreadReport, now: u64) -> SpanRecord {
+    let mut attributes = vec![Attribute::str(AttrKey::HandoffId, &unread.task)];
+    attributes.extend(Attribute::opt_str(
+        AttrKey::RunId,
+        unread.orchestrator_run_id.as_deref(),
+    ));
+    attributes.push(Attribute::str(AttrKey::PaneId, &unread.orchestrator_pane));
+    attributes.extend(Attribute::opt_str(AttrKey::Role, Some(&unread.role)));
+    attributes.extend(Attribute::opt_str(
+        AttrKey::OrchestrationId,
+        unread.orchestration_id.as_deref(),
+    ));
+    SpanRecord {
+        trace_id: unread.trace_id,
+        span_id: new_span_id(),
+        parent_span_id: Some(unread.handoff_span),
+        name: SPAN_AGENT_HANDOFF_READ,
+        start_unix_nanos: unread.arrived,
+        end_unix_nanos: now.max(unread.arrived),
+        attributes,
+        events: Vec::new(),
     }
 }
 
@@ -533,7 +646,7 @@ fn span(id: &str, open: OpenHandoff, outcome: Outcome, now: u64) -> SpanRecord {
             attributes: Vec::new(),
         });
     }
-    if let Some((at, _)) = open.reported {
+    if let Some(at) = open.reported {
         events.push(SpanEventRecord {
             name: EVENT_HANDOFF_REPORTED,
             time_unix_nanos: at,
@@ -667,6 +780,13 @@ mod tests {
             .collect()
     }
 
+    fn reads(spans: &[SpanRecord]) -> Vec<&SpanRecord> {
+        spans
+            .iter()
+            .filter(|s| s.name == SPAN_AGENT_HANDOFF_READ)
+            .collect()
+    }
+
     fn only_handoff(tracker: &mut RunTracker) -> SpanRecord {
         let spans = tracker.take_finished();
         let found = handoffs(&spans);
@@ -681,17 +801,17 @@ mod tests {
             .collect()
     }
 
+    /// The hand-off ends when the report arrives, and the orchestrator's
+    /// read of it is a span of its own, a child of the hand-off from where it
+    /// ended to the acknowledgement.
     #[test]
-    fn a_task_ends_reported_when_its_report_is_acknowledged() {
+    fn a_task_ends_reported_when_its_report_arrives() {
         let mut tracker = team("worker-1");
         post(&mut tracker, 10);
         tracker.observe_inbox(&notice(WORKER, TASK, StateName::Fetched), 20);
         tracker.observe_inbox(&notice(WORKER, TASK, StateName::Acknowledged), 25);
-        tracker.observe_inbox(&report(TASK, "worker-1"), 30);
-        // The report fetched but not yet acknowledged: still open.
-        tracker.observe_inbox(&notice(ORCH, REPORT, StateName::Fetched), 35);
         assert!(handoffs(&tracker.take_finished()).is_empty());
-        tracker.observe_inbox(&notice(ORCH, REPORT, StateName::Acknowledged), 40);
+        tracker.observe_inbox(&report(TASK, "worker-1"), 30);
         let span = only_handoff(&mut tracker);
         assert_eq!(text(&span, AttrKey::HandoffId), Some(TASK));
         assert_eq!(text(&span, AttrKey::HandoffOutcome), Some("reported"));
@@ -709,7 +829,29 @@ mod tests {
             vec![(EVENT_HANDOFF_TAKEN, 20), (EVENT_HANDOFF_REPORTED, 30)],
             "a fetch and an acknowledgement are one take"
         );
-        assert_eq!((span.start_unix_nanos, span.end_unix_nanos), (10, 40));
+        assert_eq!((span.start_unix_nanos, span.end_unix_nanos), (10, 30));
+        assert_eq!(tracker.unread_count(), 1);
+
+        // The orchestrator fetching the report is not reading it.
+        tracker.observe_inbox(&notice(ORCH, REPORT, StateName::Fetched), 35);
+        assert!(tracker.take_finished().is_empty());
+        tracker.observe_inbox(&notice(ORCH, REPORT, StateName::Acknowledged), 40);
+        let spans = tracker.take_finished();
+        let found = reads(&spans);
+        assert_eq!((found.len(), spans.len()), (1, 1), "{spans:?}");
+        let read = found[0];
+        assert_eq!((read.start_unix_nanos, read.end_unix_nanos), (30, 40));
+        assert_eq!(
+            (read.trace_id, read.parent_span_id),
+            (span.trace_id, Some(span.span_id))
+        );
+        assert_eq!(text(read, AttrKey::HandoffId), Some(TASK));
+        assert_eq!(text(read, AttrKey::RunId), Some("run-orch-pane"));
+        assert_eq!(text(read, AttrKey::PaneId), Some(ORCH));
+        assert_eq!(text(read, AttrKey::Role), Some("coder"));
+        assert_eq!(text(read, AttrKey::OrchestrationId), Some("orch-1"));
+        assert_eq!(tracker.unread_count(), 0);
+
         // Parented to the orchestrator's run, in its trace.
         tracker.end_run(ORCH, EndReason::Exited, None, 50);
         let spans = tracker.take_finished();
@@ -729,12 +871,31 @@ mod tests {
         post(&mut tracker, 10);
         assert_eq!(tracker.handoffs_held(), (1, 0));
         tracker.observe_inbox(&report(TASK, "worker-1"), 30);
-        tracker.observe_inbox(&notice(ORCH, REPORT, StateName::Acknowledged), 40);
         let span = only_handoff(&mut tracker);
         assert_eq!(
             event_names(&span),
             vec![(EVENT_HANDOFF_TAKEN, 10), (EVENT_HANDOFF_REPORTED, 30)]
         );
+    }
+
+    /// A report and its acknowledgement that both overtake the post are
+    /// replayed in order: the hand-off ends at the report, and the read
+    /// follows it.
+    #[test]
+    fn a_report_and_its_read_that_overtake_the_post_are_applied_in_order() {
+        let mut tracker = team("worker-1");
+        tracker.observe_inbox(&report(TASK, "worker-1"), 5);
+        tracker.observe_inbox(&notice(ORCH, REPORT, StateName::Acknowledged), 6);
+        assert_eq!(tracker.handoffs_held(), (0, 2));
+        post(&mut tracker, 10);
+        let spans = tracker.take_finished();
+        let handoff = handoffs(&spans)[0];
+        let read = reads(&spans)[0];
+        assert_eq!(text(handoff, AttrKey::HandoffOutcome), Some("reported"));
+        assert_eq!(read.parent_span_id, Some(handoff.span_id));
+        assert_eq!(read.start_unix_nanos, handoff.end_unix_nanos);
+        assert_eq!(tracker.handoffs_held(), (0, 0));
+        assert_eq!(tracker.unread_count(), 0);
     }
 
     #[test]
@@ -769,7 +930,7 @@ mod tests {
     }
 
     #[test]
-    fn an_orchestrator_run_ending_first_ends_the_handoff_unknown_or_reported() {
+    fn an_orchestrator_run_ending_first_ends_the_handoff_or_forgets_its_read() {
         // No report: unknown, at the run's end.
         let mut tracker = team("worker-1");
         post(&mut tracker, 10);
@@ -780,19 +941,21 @@ mod tests {
         assert_eq!(span.end_unix_nanos, 50);
         assert_eq!(event_names(&span), vec![(EVENT_HANDOFF_TAKEN, 20)]);
 
-        // The report arrived but was never read: reported, at the run's end,
-        // with no acknowledgement to end it.
+        // The report arrived but was never read: the hand-off ended
+        // `reported` when it arrived, and the run's end records no read.
         let mut tracker = team("worker-1");
         post(&mut tracker, 10);
         tracker.observe_inbox(&report(TASK, "worker-1"), 30);
-        tracker.end_run(ORCH, EndReason::Exited, None, 60);
         let span = only_handoff(&mut tracker);
         assert_eq!(text(&span, AttrKey::HandoffOutcome), Some("reported"));
-        assert_eq!(span.end_unix_nanos, 60);
-        assert_eq!(event_names(&span), vec![(EVENT_HANDOFF_REPORTED, 30)]);
-        // A late acknowledgement of that report finds nothing to end.
+        assert_eq!(span.end_unix_nanos, 30);
+        tracker.end_run(ORCH, EndReason::Exited, None, 60);
+        let spans = tracker.take_finished();
+        assert!(handoffs(&spans).is_empty() && reads(&spans).is_empty());
+        assert_eq!(tracker.unread_count(), 0);
+        // A late acknowledgement of that report finds nothing to read.
         tracker.observe_inbox(&notice(ORCH, REPORT, StateName::Acknowledged), 70);
-        assert!(handoffs(&tracker.take_finished()).is_empty());
+        assert!(reads(&tracker.take_finished()).is_empty());
     }
 
     #[test]
@@ -837,11 +1000,60 @@ mod tests {
         let mut tracker = team("worker-1");
         post(&mut tracker, 10);
         tracker.observe_inbox(&report(TASK, "worker-1"), 30);
+        let span = only_handoff(&mut tracker);
+        assert_eq!(text(&span, AttrKey::HandoffOutcome), Some("reported"));
         tracker.observe_inbox(&undeliverable(UndeliverableReason::AgentExited), 35);
         assert!(handoffs(&tracker.take_finished()).is_empty());
         tracker.observe_inbox(&notice(ORCH, REPORT, StateName::Acknowledged), 40);
-        let span = only_handoff(&mut tracker);
-        assert_eq!(text(&span, AttrKey::HandoffOutcome), Some("reported"));
+        assert_eq!(reads(&tracker.take_finished()).len(), 1);
+    }
+
+    /// Qodo review on PR #2019: the inbox retires a task after its report,
+    /// and that notice, about a hand-off already ended, is consumed rather
+    /// than held as an early notice, where it would crowd out real ones.
+    #[test]
+    fn notices_about_an_ended_task_are_not_held() {
+        let mut tracker = team("worker-1");
+        post(&mut tracker, 10);
+        tracker.observe_inbox(&report(TASK, "worker-1"), 30);
+        tracker.observe_inbox(&undeliverable(UndeliverableReason::Superseded), 31);
+        tracker.observe_inbox(&notice(WORKER, TASK, StateName::Acknowledged), 32);
+        assert_eq!(tracker.handoffs_held(), (0, 0));
+        let spans = tracker.take_finished();
+        assert_eq!(handoffs(&spans).len(), 1, "{spans:?}");
+        // The report's own notices still reach its read.
+        tracker.observe_inbox(&notice(ORCH, REPORT, StateName::Acknowledged), 40);
+        assert_eq!(reads(&tracker.take_finished()).len(), 1);
+        assert_eq!(tracker.handoffs_held(), (0, 0));
+    }
+
+    #[test]
+    fn unread_reports_are_bounded_in_count_and_age() {
+        let mut tracker = team("worker-1");
+        for i in 0..MAX_UNREAD_REPORTS + 1 {
+            let task = format!("m-task-{i}");
+            tracker.delegate_posted(Posted {
+                message_id: task.clone(),
+                orchestrator_pane: ORCH.into(),
+                orchestrator_agent_id: Some("orch-agent".into()),
+                worker_pane: WORKER.into(),
+                worker_agent_id: "worker-1".into(),
+                role: "coder".into(),
+                at: 10,
+            });
+            let mut n = report(&task, "worker-1");
+            n.message_id = format!("m-report-{i}");
+            tracker.observe_inbox(&n, 20);
+        }
+        assert_eq!(tracker.unread_count(), MAX_UNREAD_REPORTS);
+        tracker.take_finished();
+        // The oldest was forgotten: its acknowledgement records no read.
+        tracker.observe_inbox(&notice(ORCH, "m-report-0", StateName::Acknowledged), 30);
+        assert!(reads(&tracker.take_finished()).is_empty());
+        tracker.observe_inbox(&notice(ORCH, "m-report-1", StateName::Acknowledged), 30);
+        assert_eq!(reads(&tracker.take_finished()).len(), 1);
+        tracker.expire_handoffs(20 + MAX_HANDOFF_AGE_NANOS);
+        assert_eq!(tracker.unread_count(), 0, "forgotten at the age bound");
     }
 
     #[test]
@@ -851,7 +1063,6 @@ mod tests {
         // The worker respawns before reporting.
         tracker.begin_run(worker("worker-2"), 20);
         tracker.observe_inbox(&report(TASK, "worker-2"), 30);
-        tracker.observe_inbox(&notice(ORCH, REPORT, StateName::Acknowledged), 40);
         let span = only_handoff(&mut tracker);
         assert_eq!(
             text(&span, AttrKey::HandoffWorkerRunId),
@@ -955,36 +1166,39 @@ mod tests {
         assert!(span.parent_span_id.is_some());
     }
 
-    /// Issue #1981 M7 review: a report that arrived but was never read is
-    /// `unknown` once the hand-off is past its age bound, whether the check
-    /// or the orchestrator's run ending finds it first.
+    /// A report still unread past the age bound is forgotten, whether the
+    /// check or the orchestrator's run ending finds it first: its late
+    /// acknowledgement records no read.
     #[test]
-    fn an_unread_report_past_the_age_bound_ends_unknown() {
+    fn an_unread_report_past_the_age_bound_records_no_read() {
         let hour = 60 * 60 * 1_000_000_000;
-        // The orchestrator's run ends at 25 h.
+        // The periodic check finds it first.
         let mut tracker = team("worker-1");
         post(&mut tracker, 10);
         tracker.observe_inbox(&report(TASK, "worker-1"), 30);
-        tracker.end_run(ORCH, EndReason::Exited, None, 10 + 25 * hour);
-        let span = only_handoff(&mut tracker);
-        assert_eq!(text(&span, AttrKey::HandoffOutcome), Some("unknown"));
-        assert_eq!(span.end_unix_nanos, 10 + MAX_HANDOFF_AGE_NANOS);
-        assert_eq!(event_names(&span), vec![(EVENT_HANDOFF_REPORTED, 30)]);
-
-        // The periodic check finds it first; the late acknowledgement then
-        // finds nothing to end.
-        let mut tracker = team("worker-1");
-        post(&mut tracker, 10);
-        tracker.observe_inbox(&report(TASK, "worker-1"), 30);
-        tracker.expire_handoffs(10 + 25 * hour);
-        let span = only_handoff(&mut tracker);
-        assert_eq!(text(&span, AttrKey::HandoffOutcome), Some("unknown"));
-        assert_eq!(span.end_unix_nanos, 10 + MAX_HANDOFF_AGE_NANOS);
+        assert_eq!(
+            text(&only_handoff(&mut tracker), AttrKey::HandoffOutcome),
+            Some("reported")
+        );
+        tracker.expire_handoffs(30 + MAX_HANDOFF_AGE_NANOS);
+        assert_eq!(tracker.unread_count(), 0);
         tracker.observe_inbox(
             &notice(ORCH, REPORT, StateName::Acknowledged),
             10 + 26 * hour,
         );
-        assert!(handoffs(&tracker.take_finished()).is_empty());
+        assert!(reads(&tracker.take_finished()).is_empty());
+
+        // An acknowledgement past the bound, with no check in between: the
+        // bound is applied before the acknowledgement is.
+        let mut tracker = team("worker-1");
+        post(&mut tracker, 10);
+        tracker.observe_inbox(&report(TASK, "worker-1"), 30);
+        tracker.take_finished();
+        tracker.observe_inbox(
+            &notice(ORCH, REPORT, StateName::Acknowledged),
+            30 + MAX_HANDOFF_AGE_NANOS,
+        );
+        assert!(reads(&tracker.take_finished()).is_empty());
     }
 
     /// The age bound is each hand-off's own, not only the oldest post's: a
@@ -1140,8 +1354,9 @@ mod tests {
         post(&mut tracker, 10);
         tracker.observe_inbox(&report(TASK, "worker-1"), 30);
         tracker.observe_inbox(&notice(ORCH, REPORT, StateName::Acknowledged), 40);
-        let span = only_handoff(&mut tracker);
-        let all = format!("{span:?}");
+        let spans = tracker.take_finished();
+        assert_eq!((handoffs(&spans).len(), reads(&spans).len()), (1, 1));
+        let all = format!("{spans:?}");
         assert!(!all.contains("PRIVATE"), "{all}");
     }
 }

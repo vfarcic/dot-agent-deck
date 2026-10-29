@@ -90,7 +90,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### telemetry/otlp/004 — Private content stays out of exports and telemetry-module logs while interventions remain visible.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
 - **Agent:** synthetic shell and cat with synthesized hook content.
-- **Asserts:** with HTTP/JSON, distinct sentinels from output, TUI-typed human input, prompt/tool hook fields, pane title, OTLP secret header, file contents printed by the stand-in, git branch, command argument, pane cwd directory and an ordinary environment value appear in no received request body, URI, non-authentication header or captured telemetry-module log line; the telemetry exporter's startup log is present, the authentication header arrives as intended and the completed run contains an intervention event. A successor actually reads the private file in the privately named git cwd before its run is exported.
+- **Asserts:** with HTTP/JSON, distinct sentinels from output, TUI-typed human input, prompt/tool hook fields, pane title, OTLP secret header, file contents printed by the stand-in, command argument, pane cwd directory and an ordinary environment value appear in no received request body, URI, non-authentication header or captured telemetry-module log line; the git branch is sent, as the successor run's `vcs.ref.head.name` (issue #1981 M6), and appears in no URI, non-authentication header or telemetry-module log line; the telemetry exporter's startup log is present, the authentication header arrives as intended and the completed run contains an intervention event. A successor actually reads the private file in the privately named git cwd before its run is exported.
 - **Does not assert:** content policies for an external agent's own exporter or daemon log targets outside dot_agent_deck::telemetry and its submodules.
 - **Platform coverage:** mac+linux.
 
@@ -153,7 +153,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### telemetry/otlp/013 — Protobuf exports exclude private content across the binary's export pipeline.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
 - **Agent:** synthetic shell and cat with synthesized hook content.
-- **Asserts:** the same private channels as 004 stay absent from raw HTTP/protobuf request bodies, URIs, non-authentication headers and telemetry-module logs. Accepted protobuf bodies contain the original and successor run ids with agent.run, the original run exports a human intervention, the authentication header arrives and the telemetry startup log is captured.
+- **Asserts:** the same private channels as 004 stay absent from raw HTTP/protobuf request bodies, URIs, non-authentication headers and telemetry-module logs, and as in 004 the git branch is the exception in bodies: the successor run's accepted body carries it. Accepted protobuf bodies contain the original and successor run ids with agent.run, the original run exports a human intervention, the authentication header arrives and the telemetry startup log is captured.
 - **Does not assert:** a full protobuf schema decode or privacy of external agents' own telemetry.
 - **Platform coverage:** mac+linux.
 
@@ -13231,12 +13231,12 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 - **Does not assert:** real-agent detection or retrospective relabelling of child spans exported before identifying hooks.
 - **Platform coverage:** mac+linux.
 
-##### telemetry/otlp/027 — A dispatched run exports its registry unit name without exporting its branch.
+##### telemetry/otlp/027 — A dispatched run exports its registry unit name and its branch.
 
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_span_identity.rs`).
 - **Agent:** declared Pi shell/cat caller and dispatched single unit.
-- **Asserts:** the real dispatch CLI starts a unit in its worktree; the completed run carries deck.dispatch.name equal to the requested unit and exported spans exclude its branch name.
-- **Does not assert:** dispatched orchestration workers, registry recovery after daemon restart or full branch/content privacy (telemetry/otlp/004).
+- **Asserts:** the real dispatch CLI starts a unit in its worktree; the completed run carries deck.dispatch.name equal to the requested unit and vcs.ref.head.name equal to the unit's branch (issue #1981 M6, which reversed the earlier withholding of branch names).
+- **Does not assert:** dispatched orchestration workers, registry recovery after daemon restart or content privacy (telemetry/otlp/004).
 - **Platform coverage:** mac+linux.
 
 ## Test Case Catalog — Intervention kinds
@@ -13323,11 +13323,11 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 
 ## Test Case Catalog — Telemetry handoffs and daemon health
 
-##### telemetry/otlp/038 — A delegated task ends its handoff when the orchestrator acknowledges its report.
+##### telemetry/otlp/038 — A delegated task ends its handoff when the report arrives, and the orchestrator's acknowledgement is a read span.
 
 - **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_handoff.rs`); local OTLP/JSON receiver and real delegate, work-done, fetch and ack CLI calls.
 - **Agent:** two Python PTY stand-ins; no real agent or credential.
-- **Asserts:** one delegated task exports one agent.handoff after report acknowledgement, remains unexported while its report is queued or merely fetched, has one taken and one reported event in timestamp order, carries the orchestrator run/pane/trace/parent, worker run id, worker role and orchestration id, ends reported, survives subsequent run closure without duplication and excludes private task/report sentinels from captured raw JSON bodies.
+- **Asserts:** one delegated task exports one agent.handoff once its report arrives, while the report is still unread and the orchestrator alive, ending reported at the reported event's time, with one taken and one reported event in timestamp order, the orchestrator run/pane/trace/parent, worker run id, worker role and orchestration id; a mere fetch of the report exports no agent.handoff.read, and the acknowledgement exports exactly one, a child of the handoff in its trace, from the report's arrival to after the ack, with the orchestrator's run, pane, the role and orchestration id (issue #1981 M7, which moved the handoff's end from the read to the report); neither is duplicated at run closure, and private task/report sentinels are absent from captured raw JSON bodies.
 - **Does not assert:** natural orchestrator exit before acknowledgement, worker respawn identity refresh, superseding, daemon shutdown, bounded-map eviction or privacy of external agent SDKs.
 - **Platform coverage:** mac+linux.
 
@@ -13335,7 +13335,7 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 
 - **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_handoff.rs`); real delegate CLI and local OTLP/JSON receiver.
 - **Agent:** two Python PTY stand-ins; the test terminates its own worker PID before task fetch.
-- **Asserts:** the inbox marks the posted task undeliverable, one agent.handoff exports outcome=undeliverable with the agent_exited enum reason, orchestrator parent/trace and worker role, no reported event, no duplicate at orchestrator closure and no private task text in raw JSON bodies.
+- **Asserts:** the inbox marks the posted task undeliverable, one agent.handoff exports outcome=undeliverable with the agent_exited enum reason, orchestrator parent/trace and worker role, no reported event, no agent.handoff.read, no duplicate at orchestrator closure and no private task text in raw JSON bodies.
 - **Does not assert:** deliberate StopAgent cancellation, absent target roles that were never posted, delivery retry exhaustion, or other undeliverable reasons.
 - **Platform coverage:** mac+linux.
 
@@ -13343,7 +13343,7 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 
 - **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_handoff.rs`); real work-done and inbox-fetch CLI calls and local OTLP/JSON receiver.
 - **Agent:** two Python PTY stand-ins with no commissioned task.
-- **Asserts:** a real note reaches the orchestrator, its completed agent.run has deck.handoffs.uncorrelated.count=1, no agent.handoff is invented, and the private report sentinel is absent from captured raw JSON bodies.
+- **Asserts:** a real note reaches the orchestrator, its completed agent.run has deck.handoffs.uncorrelated.count=1, no agent.handoff or agent.handoff.read is invented, and the private report sentinel is absent from captured raw JSON bodies.
 - **Does not assert:** report retry deduplication, several uncorrelated notes, or a report sent while a commissioned task is outstanding.
 - **Platform coverage:** mac+linux.
 
