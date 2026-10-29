@@ -32,7 +32,8 @@
 //! read the binding Claude loaded, so a release whose record doesn't verify
 //! it holds ([`Hold::Unmeasured`]); every record leaves it absent until M49b
 //! is measured. The spawn read's contents hold too when they bind Ctrl+G or
-//! the external-editor action, or can't be read or parsed (CL-9). Where
+//! the external-editor action, or can't be read or parsed (CL-9), and an
+//! object that repeats a member name counts as unparsable. Where
 //! Claude looks is measured only for `$HOME/.claude` (M39), so a
 //! `CLAUDE_CONFIG_DIR` in the agent's environment holds
 //! ([`claude_keybindings_path`]).
@@ -115,7 +116,8 @@ pub enum Hold {
     Changed,
     /// A source can't be read.
     Unreadable(Unreadable),
-    /// A source can't be parsed.
+    /// A source can't be parsed, or (Claude's) an object in it names one
+    /// member twice.
     Unparsable,
     /// Ctrl+G is bound to another action, or the external-editor action to
     /// another key.
@@ -289,25 +291,89 @@ impl ClaudeKeymap {
 /// (a `Chat` context that unbinds Ctrl+G and binds the action elsewhere), so
 /// the check reads every string the same way rather than trusting one
 /// layout, and an explicit default binding holds too.
+///
+/// An object that names one member twice, at any depth and compared after
+/// its escapes are decoded (`"a"` and `"a"`), is unparsable: which of
+/// the two Claude reads isn't measured, and a parse into
+/// [`serde_json::Value`] keeps only the last, so an earlier member's subtree
+/// would never reach the check. The scan reads the raw document instead
+/// ([`ClaudeScan`]).
 fn claude_bindings(contents: &[u8]) -> Result<(), Hold> {
+    let ClaudeScan(rebound) = serde_json::from_slice(contents).map_err(|_| Hold::Unparsable)?;
+    if rebound { Err(Hold::Rebound) } else { Ok(()) }
+}
+
+/// One JSON value of a Claude `keybindings.json`, read straight from the
+/// document: whether any string in it, a member name or a value at any
+/// depth, names [`CLAUDE_EDITOR_ACTION`] or spells Ctrl+G. Deserializing it
+/// fails when an object repeats a member name.
+struct ClaudeScan(bool);
+
+impl<'de> serde::Deserialize<'de> for ClaudeScan {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(ClaudeScanVisitor)
+    }
+}
+
+struct ClaudeScanVisitor;
+
+impl ClaudeScanVisitor {
     fn holds(s: &str) -> bool {
         claude_mentions(s) || claude_strokes(s).iter().any(|k| is_ctrl_g(k))
     }
-    fn walk(value: &serde_json::Value) -> bool {
-        match value {
-            serde_json::Value::String(s) => holds(s),
-            serde_json::Value::Array(items) => items.iter().any(walk),
-            serde_json::Value::Object(map) => {
-                map.iter().any(|(key, value)| holds(key) || walk(value))
-            }
-            _ => false,
-        }
+}
+
+impl<'de> serde::de::Visitor<'de> for ClaudeScanVisitor {
+    type Value = ClaudeScan;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a JSON value")
     }
-    let doc: serde_json::Value = serde_json::from_slice(contents).map_err(|_| Hold::Unparsable)?;
-    if walk(&doc) {
-        Err(Hold::Rebound)
-    } else {
-        Ok(())
+
+    fn visit_bool<E>(self, _: bool) -> Result<ClaudeScan, E> {
+        Ok(ClaudeScan(false))
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<ClaudeScan, E> {
+        Ok(ClaudeScan(false))
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<ClaudeScan, E> {
+        Ok(ClaudeScan(false))
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<ClaudeScan, E> {
+        Ok(ClaudeScan(false))
+    }
+
+    fn visit_unit<E>(self) -> Result<ClaudeScan, E> {
+        Ok(ClaudeScan(false))
+    }
+
+    fn visit_str<E>(self, s: &str) -> Result<ClaudeScan, E> {
+        Ok(ClaudeScan(Self::holds(s)))
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<ClaudeScan, A::Error> {
+        let mut rebound = false;
+        while let Some(ClaudeScan(item)) = seq.next_element()? {
+            rebound |= item;
+        }
+        Ok(ClaudeScan(rebound))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<ClaudeScan, A::Error> {
+        let mut names = std::collections::HashSet::new();
+        let mut rebound = false;
+        while let Some(name) = map.next_key::<String>()? {
+            rebound |= Self::holds(&name);
+            if !names.insert(name) {
+                return Err(serde::de::Error::custom("a member name repeats"));
+            }
+            let ClaudeScan(value) = map.next_value()?;
+            rebound |= value;
+        }
+        Ok(ClaudeScan(rebound))
     }
 }
 

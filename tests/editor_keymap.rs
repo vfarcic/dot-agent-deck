@@ -725,7 +725,7 @@ fn probe_014_claude_scan_reads_every_string() {
     }
 }
 
-/// Scenario: Claude's `keybindings.json` spells Ctrl+G in ways splitting a string into strokes would lose — whitespace inside a word (`c trl+g`, `ct rl+g`, `< c-g >`) or a stroke followed by a word starting with `-` (`ctrl+g -`) — in a member name and in a value; each holds as rebound, as do a stroke split by something other than whitespace (`ctrl + (g)`) and a string that only happens to contain a spelling (`ctrl+gx`). The control, a document of unrelated bindings and near-miss words, allows the probe.
+/// Scenario: Claude's `keybindings.json` spells Ctrl+G in ways splitting a string into strokes would lose — whitespace inside a word (`c trl+g`, `ct rl+g`, `< c-g >`) or a stroke followed by a word starting with `-` (`ctrl+g -`) — in a member name and in a value; each holds as rebound, as do a stroke split by something other than whitespace (`ctrl + (g)`, alone or after another stroke) and a string that only happens to contain a spelling (`ctrl+gx`). The control, a document of unrelated bindings and near-miss words, allows the probe.
 #[spec("inbox/probe/014")]
 #[test]
 fn probe_014_claude_spellings_strokes_would_split_hold() {
@@ -739,6 +739,7 @@ fn probe_014_claude_spellings_strokes_would_split_hold() {
         "ctrl+g -",
         "ctrl+x ctrl+g -",
         "ctrl + (g)",
+        "ctrl+x, ctrl + (g)",
         "ctrl+gx",
     ] {
         for contents in [
@@ -754,6 +755,34 @@ fn probe_014_claude_spellings_strokes_would_split_hold() {
     write(
         &path,
         r#"{"bindings":[{"context":"Chat","bindings":{"ctrl+h":"chat:submit","c-h":null,"^h":"chat:cancel","<c-x> -":"chat:killAgents"}}],"note":"go, gauge, chat: external, ctrl+ h g"}"#,
+    );
+    let control = ClaudeKeymap::at_spawn(path, &verified());
+    assert_eq!(control.check(), Ok(()));
+}
+
+/// Scenario: Claude's `keybindings.json` names one object member twice: a `bindings` whose first copy binds Ctrl+G and whose second is empty, a `key` of `ctrl+g` then `ctrl+h`, an `action` of the external editor then another, a name written once plainly and once with a `\u` escape, and a repeat nested in a context's bindings or deep in arrays; each holds as unparsable, including the ones whose strings are otherwise unrelated. The control uses the same name in sibling objects, at different depths and in another case, beside booleans, numbers and null, and allows the probe.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_a_claude_member_named_twice_holds() {
+    let dir = test_temp::tempdir().unwrap();
+    let path = keybindings(&dir);
+    for contents in [
+        r#"{"bindings":{"ctrl+g":null},"bindings":{}}"#,
+        r#"{"key":"ctrl+g","key":"ctrl+h"}"#,
+        r#"{"action":"chat:externalEditor","action":"chat:submit"}"#,
+        r#"{"ctrl+g":null,"ctrl+g":null}"#,
+        r#"{"note":"go","note":"gauge"}"#,
+        r#"{"bindings":[{"context":"Chat","bindings":{"ctrl+e":"chat:submit","ctrl+e":"chat:cancel"}}]}"#,
+        r#"{"a":[[{"b":{"c":1,"c":1}}]]}"#,
+    ] {
+        write(&path, contents);
+        let keymap = ClaudeKeymap::at_spawn(path.clone(), &verified());
+        assert_eq!(keymap.check(), Err(Hold::Unparsable), "{contents}");
+    }
+
+    write(
+        &path,
+        r#"{"bindings":[{"context":"Chat","bindings":{"ctrl+e":"chat:submit"}},{"context":"Global","bindings":{"ctrl+e":"chat:submit","Ctrl+E":null}}],"context":"top","n":[true,false,-1,2,0.5,null]}"#,
     );
     let control = ClaudeKeymap::at_spawn(path, &verified());
     assert_eq!(control.check(), Ok(()));
