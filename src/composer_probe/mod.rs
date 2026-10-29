@@ -20,7 +20,8 @@
 //! agent runs as its editor ([`helper`], Linux), which the binary dispatches
 //! to by its name, and the daemon's side of that helper: its invocations,
 //! markers, children and exits, which settle the generation's liabilities
-//! ([`observe`]). The daemon feeds the hook every byte an agent writes,
+//! ([`observe`]), and whether an agent's key-binding sources still leave
+//! Ctrl+G on its external editor ([`keymap`], no caller yet). The daemon feeds the hook every byte an agent writes,
 //! moves the epoch at the PTY writer's enqueue, and decides installation at
 //! every spawn, which installs nothing outside the `e2e` build's assumption
 //! until activation. For an installed generation it keeps the invocation
@@ -40,6 +41,7 @@ pub mod helper;
 pub mod install;
 #[cfg(target_os = "linux")]
 pub mod instance;
+pub mod keymap;
 pub mod observe;
 pub mod paste_mode;
 pub mod path_rule;
