@@ -1,5 +1,5 @@
-#![cfg(feature = "e2e")]
-//! SC-08 clap and no-daemon refusals, entirely inside per-command sandboxes.
+#![cfg(all(feature = "e2e", unix))]
+//! SC-08 CLI parsing and exit codes against missing test-owned endpoints on Unix.
 
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
@@ -36,7 +36,8 @@ fn run(args: &[&str]) -> (Output, String) {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // No agent executable can be resolved, even if a regression attempts a launch.
+    // No agent executable can be resolved through PATH. Absolute-path launches and
+    // current-executable daemon bootstraps are not prevented by this override.
     let empty_bin = root.join("bin");
     std::fs::create_dir(&empty_bin).unwrap();
     command.env("PATH", empty_bin);
@@ -46,8 +47,8 @@ fn run(args: &[&str]) -> (Output, String) {
         .unwrap();
     let output = runtime.block_on(async {
         let mut command = tokio::process::Command::from(command);
-        // A timeout drops this specific child's wait future and kills it;
-        // output pipes drain concurrently with the event-driven exit wait.
+        // A timeout drops this specific child's wait future and kills that child,
+        // not detached descendants. Output pipes drain during the exit wait.
         command.kill_on_drop(true);
         let child = command.spawn().unwrap();
         tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
@@ -62,12 +63,12 @@ fn run(args: &[&str]) -> (Output, String) {
     );
     assert!(
         !root.join("attach.sock").exists() && !root.join("hook.sock").exists(),
-        "CLI must not bootstrap a daemon: {args:?}: {text}"
+        "test-owned socket paths must be absent after CLI exit: {args:?}: {text}"
     );
     (output, text)
 }
 
-/// Scenario: Open release-check help and each of its six command help pages in a fresh empty sandbox. Every action in the design's matrix is discoverable without starting a daemon.
+/// Scenario: Open release-check help and each of its six command help pages in a fresh empty Unix sandbox. Every action in the design's matrix is discoverable, and the test-owned socket paths are absent after exit.
 #[spec("inbox/release-check/003")]
 #[test]
 fn release_check_003_help_lists_all_six_actions() {
@@ -87,7 +88,7 @@ fn release_check_003_help_lists_all_six_actions() {
     }
 }
 
-/// Scenario: Invoke every release-check verb with missing or excess arguments, invalid modes, unsupported agents and unsafe release identifiers. Clap refuses each locally with its usage error before any daemon connection or file export can occur.
+/// Scenario: Invoke every release-check verb with missing or excess arguments, invalid modes, unsupported agents and unsafe release identifiers in a fresh Unix sandbox. Each exits with clap's usage error, and the test-owned socket paths are absent after exit.
 #[spec("inbox/release-check/003")]
 #[test]
 fn release_check_003_invalid_arguments_are_refused_locally() {
@@ -134,10 +135,10 @@ fn release_check_003_invalid_arguments_are_refused_locally() {
     }
 }
 
-/// Scenario: Invoke correctly formed status, run, cancel, forget, export and all three mode choices against missing test-owned endpoints and an empty record store. Valid syntax reaches a semantic result; run and cancel refuse the absent daemon without bootstrapping one.
+/// Scenario: Invoke correctly formed status, run, cancel, forget, export and all three mode choices against missing test-owned endpoints and an empty record store on Unix. Each passes clap, run/cancel report a nonempty exit-1 diagnostic, export exits 1, and the socket paths are absent after exit; the precise semantic failure reason is not pinned.
 #[spec("inbox/release-check/003")]
 #[test]
-fn release_check_003_valid_syntax_reaches_semantic_result_without_a_daemon() {
+fn release_check_003_valid_syntax_passes_clap_against_missing_endpoints() {
     for args in [
         vec!["status"],
         vec!["run", "claude"],
@@ -162,7 +163,7 @@ fn release_check_003_valid_syntax_reaches_semantic_result_without_a_daemon() {
             assert_eq!(
                 output.status.code(),
                 Some(1),
-                "no daemon must refuse {command:?}: {text}"
+                "run/cancel must exit 1 against missing endpoints: {command:?}: {text}"
             );
             assert!(
                 !text.trim().is_empty(),
@@ -173,7 +174,7 @@ fn release_check_003_valid_syntax_reaches_semantic_result_without_a_daemon() {
             assert_eq!(
                 output.status.code(),
                 Some(1),
-                "no matching record must refuse export: {text}"
+                "export must exit 1 against an empty store: {text}"
             );
         }
     }

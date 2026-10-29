@@ -53,7 +53,7 @@ async fn case(
     .await
 }
 
-/// Scenario: Request run, cancel and forget from isolated scripted daemons whose Hello omits, empties or advertises unrelated capabilities. Each call is unsupported and sends no verb, whereas a daemon advertising release_check receives each exact request once and its refusal is surfaced.
+/// Scenario: Request run, cancel and forget from isolated scripted daemons whose Hello omits, empties or advertises unrelated capabilities, draining every connection to EOF before inspecting requests. Each call is unsupported and sends no verb, whereas a daemon advertising release_check receives each exact request once and its refusal is surfaced.
 #[spec("inbox/release-check/002")]
 #[tokio::test]
 async fn release_check_002_every_shared_client_verb_is_capability_gated() {

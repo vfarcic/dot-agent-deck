@@ -13,23 +13,23 @@
 ##### inbox/release-check/001 — Self-check fields are additive, bounded and readable by the frozen pre-SC-08 client.
 - **Layer:** Fast (`tests/release_check_wire.rs`); pure serde round-trips and card notice projection.
 - **Agent:** none.
-- **Asserts:** every new hold cause, including unavailable, preserves the optional agent/release/fact/reason fields and shows the design's card words; field bounds and fixed vocabularies tolerate future values; old summaries and absent fields remain readable; release-check snapshot states/progress and optional times round-trip, absent lists are omitted and present-empty lists retained; Hello advertises release_check with protocol 12 unchanged; each new request round-trips; the frozen old reader ignores new fields, maps new causes to Unknown and retains its literal cannot_type notice, independently checked on literal new payloads as a positive control.
+- **Asserts:** every new hold cause, including unavailable, preserves the optional agent/release/fact/reason fields and shows the design's Rust card words; all 25 proposed facts and 20 reasons retain their wire identities while genuinely future strings become other; old summaries and absent fields remain readable; snapshot states/progress and optional times round-trip, missing/null result state, timestamps and queue position remain absent, including a first queued journal; only sixteen-lowercase-hex display identities are retained and invalid ones become absent; absent lists are omitted and present-empty lists retained; Hello advertises release_check with protocol 12 unchanged; each new request round-trips; the frozen old reader ignores new fields, maps new causes to Unknown and retains its literal cannot_type notice, independently checked on literal new payloads as a positive control.
 - **Does not assert:** daemon-produced journal publication, real cross-version binaries, terminal layout, desktop rendering, runner behavior or authority conferred by any snapshot. Proposed DTO/container and vocabulary assumptions are in `tests/fixtures/release-check/wire/README.md`.
 - **Platform coverage:** mac+linux+windows.
 
 ##### inbox/release-check/002 — The shared client withholds all three self-check verbs without the capability.
 - **Layer:** Fast (`tests/release_check_client.rs`), scripted test-owned Unix sockets.
 - **Agent:** none.
-- **Asserts:** run, cancel and forget return unsupported and send no verb for absent, empty or unrelated capabilities; a daemon advertising release_check receives each exact request once; its semantic refusal is surfaced.
+- **Asserts:** run, cancel and forget return unsupported and send no verb for absent, empty or unrelated capabilities; capture drains accepted connections and pending backlog through EOF within a deadline before inspecting the requests; a write-then-Unsupported control fails the same no-verbs assertion; a daemon advertising release_check receives each exact request once; its semantic refusal is surfaced. The capture control is in `tests/release_check_wire.rs` so it can execute before the new client API exists.
 - **Does not assert:** real daemon operations, containment, agent launch, authentication, capability-cache implementation or a connection-reuse policy.
 - **Platform coverage:** mac+linux.
 
-##### inbox/release-check/003 — The CLI exposes the action matrix and refuses malformed or unavailable actions locally.
+##### inbox/release-check/003 — The CLI exposes the action matrix, rejects malformed arguments and parses valid forms against missing endpoints.
 - **Layer:** L2 process integration, lane 1 (`tests/e2e_release_check_cli.rs`), fresh empty per-command sandboxes and captured-child deadlines.
-- **Agent:** none; PATH has no executable, and no daemon is launched.
-- **Asserts:** status/run/cancel/forget/export/mode help succeeds; missing and excess arguments, unsupported agents, unsafe releases and invalid modes fail with clap guidance; valid forms reach a semantic outcome; run/cancel fail without a daemon, export fails without a matching record, and no command bootstraps a socket.
-- **Does not assert:** a running daemon's actions, successful check, exported content, scrubber coverage, mode persistence, cancellation cleanup, PTY rendering or a real agent. The design's export ellipsis and other grammar assumptions are recorded in the wire README.
-- **Platform coverage:** mac+linux+windows.
+- **Agent:** none requested; the cleared environment and empty PATH prevent ordinary PATH lookup of agents, without enforcing absence of absolute-path launches or a daemon bootstrap.
+- **Asserts:** status/run/cancel/forget/export/mode help succeeds; missing and excess arguments, unsupported agents, unsafe releases and invalid modes fail with clap guidance; valid forms exit 0 or 1 rather than clap's 2; run/cancel exit 1 with nonempty output and export exits 1 against an empty store; test-owned socket paths are absent after each CLI exit.
+- **Does not assert:** the exact semantic refusal reason, absence of a transient or still-starting daemon, detached-descendant containment, a running daemon's actions, successful check, exported content, scrubber coverage, mode persistence, cancellation cleanup, PTY rendering or a real agent. Windows native-home isolation is unverified, so the test is Unix-only. The design's export ellipsis and other grammar assumptions are recorded in the wire README.
+- **Platform coverage:** mac+linux.
 
 This is the authoritative list of test cases the harness must cover. IDs are stable per Decision 7; tests reference them via `#[spec("…")]` annotations once the harness exists in M2. Coverage is enumerated from the code as it ships today (Decision 27 — "code is authoritative"); documented behaviors with no catalog entry are listed as deliberate skips at the end of this section.
 

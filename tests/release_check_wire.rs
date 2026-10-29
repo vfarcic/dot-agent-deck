@@ -15,7 +15,7 @@ mod old;
 #[path = "fixtures/release-check/wire/scripted_daemon.rs"]
 mod scripted_daemon;
 
-/// Scenario: A deliberately broken caller writes a run verb on several sockets and immediately returns Unsupported without waiting for a reply. The capture must retain every queued frame, so the same no-verbs assertion used by the client matrix rejects this caller.
+/// Scenario: A deliberately broken caller writes run verbs on pending sockets and Hello-accepted sockets, then returns Unsupported without waiting for the verbs' replies. Capture must retain every frame, so the same no-verbs assertion used by the client matrix rejects both callers.
 #[cfg(unix)]
 #[spec("inbox/release-check/002")]
 #[tokio::test]
@@ -24,31 +24,53 @@ async fn release_check_002_capture_detects_a_write_before_unsupported() {
     use std::os::unix::net::UnixStream;
 
     use dot_agent_deck::daemon_client::GatedQuery;
-    use dot_agent_deck::daemon_protocol::KIND_REQ;
+    use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_RESP, read_frame, write_frame};
 
     let request = json!({"op":"release-check-run","agent":"claude"});
     let payload = serde_json::to_vec(&request).unwrap();
     let mut frame = vec![KIND_REQ];
     frame.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
     frame.extend_from_slice(&payload);
-    let (result, sent) = scripted_daemon::capture(None, false, |path| async move {
-        // These tiny synchronous writes deliberately never yield to the current-thread
-        // server. All peers close before capture stops accepting, leaving queued data.
-        for _ in 0..3 {
-            let mut stream = UnixStream::connect(&path).unwrap();
-            stream.write_all(&frame).unwrap();
-        }
-        GatedQuery::<()>::Unsupported
-    })
-    .await;
+    for accepted_first in [false, true] {
+        let frame = frame.clone();
+        let (result, sent) = scripted_daemon::capture(None, false, |path| async move {
+            for _ in 0..3 {
+                if accepted_first {
+                    let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+                    write_frame(&mut stream, KIND_REQ, br#"{"op":"hello"}"#)
+                        .await
+                        .unwrap();
+                    let (kind, _) = read_frame(&mut stream).await.unwrap().unwrap();
+                    assert_eq!(kind, KIND_RESP);
+                    // The Hello has been answered, so this exercises an accepted
+                    // reader whose final verb can still be buffered at return.
+                    assert_eq!(stream.try_write(&frame).unwrap(), frame.len());
+                } else {
+                    // Tiny synchronous writes never yield to the current-thread
+                    // server. All peers close with frames in the accept backlog.
+                    let mut stream = UnixStream::connect(&path).unwrap();
+                    stream.write_all(&frame).unwrap();
+                }
+            }
+            GatedQuery::<()>::Unsupported
+        })
+        .await;
+        assert_eq!(result, GatedQuery::Unsupported);
+        assert_eq!(
+            sent,
+            vec![request.clone(); 3],
+            "capture lost queued verb frames; accepted_first={accepted_first}"
+        );
+        let panic = std::panic::catch_unwind(|| scripted_daemon::assert_no_verbs(&sent))
+            .expect_err("the client matrix's no-verbs assertion must reject this control");
+        let message = panic.downcast_ref::<String>().unwrap();
+        assert!(message.contains("unsupported call sent"), "{message}");
+        assert!(message.contains("release-check-run"), "{message}");
+    }
+    let (result, sent) =
+        scripted_daemon::capture(None, false, |_| async { GatedQuery::<()>::Unsupported }).await;
     assert_eq!(result, GatedQuery::Unsupported);
-    assert_eq!(sent, vec![request; 3], "capture lost queued verb frames");
-    let panic = std::panic::catch_unwind(|| scripted_daemon::assert_no_verbs(&sent))
-        .expect_err("the client matrix's no-verbs assertion must reject this control");
-    let message = panic.downcast_ref::<String>().unwrap();
-    assert!(message.contains("unsupported call sent"), "{message}");
-    assert!(message.contains("release-check-run"), "{message}");
-    scripted_daemon::assert_no_verbs(&[]);
+    scripted_daemon::assert_no_verbs(&sent);
 }
 
 const CAUSES: &[&str] = &[
@@ -81,6 +103,8 @@ const FACTS: &[&str] = &[
     "mode_transient",
     "unrecognised_control",
     "unterminated_frame",
+    "recogniser_disagrees",
+    "endpoint",
     "unexpected_request",
     "timing",
     "namespace_entry",
@@ -92,6 +116,7 @@ const REASONS: &[&str] = &[
     "limit_trace",
     "limit_disk",
     "limit_mock",
+    "cli",
     "launch",
     "runner_stopped",
     "namespace_entry_refused",
@@ -101,6 +126,8 @@ const REASONS: &[&str] = &[
     "subreaper",
     "namespace_filter",
     "pid_namespace",
+    "no_network_namespace",
+    "executable_changed",
     "no_cdhash",
     "no_keychain_evidence",
 ];
@@ -372,7 +399,7 @@ fn snapshot(state: &str, progress: &str) -> Value {
         "finished_at_ms":1700000002000_i64,"queue_position":8}]})
 }
 
-/// Scenario: Read old replies without release checks, present-empty snapshots, and every journal state and progress value. New replies survive both readers, future state/progress values become other, bounded fields cannot grow unchecked, and advertising this additive feature changes no protocol version.
+/// Scenario: Read old replies, empty snapshots, every journal state/progress and first queued or running rows with no result state or later times. Missing/null optional fields stay absent, valid sixteen-lowercase-hex display identities survive while invalid ones disappear, future enums become other, and the additive capability and requests keep protocol 12.
 #[spec("inbox/release-check/001")]
 #[test]
 fn release_check_001_snapshots_capability_and_request_roundtrips() {
@@ -421,6 +448,94 @@ fn release_check_001_snapshots_capability_and_request_roundtrips() {
             assert!(frozen.inbox_messages.is_none());
         }
     }
+    for progress in ["queued", "running"] {
+        for explicit_null in [false, true] {
+            let mut input = snapshot("passed", progress);
+            let row = input["release_checks"][0].as_object_mut().unwrap();
+            for field in [
+                "state",
+                "queued_at_ms",
+                "started_at_ms",
+                "finished_at_ms",
+                "queue_position",
+            ] {
+                row.remove(field);
+                if explicit_null {
+                    row.insert(field.into(), Value::Null);
+                }
+            }
+            let emitted = roundtrip::<AttachResponse>(input);
+            let row = &emitted["release_checks"][0];
+            assert_eq!(row["progress"], progress);
+            assert_eq!(row["identity"], "0123456789abcdef");
+            for field in [
+                "state",
+                "queued_at_ms",
+                "started_at_ms",
+                "finished_at_ms",
+                "queue_position",
+            ] {
+                assert!(
+                    row.get(field).is_none(),
+                    "{progress}, null={explicit_null}: absent {field} must not invent a value: {row}"
+                );
+            }
+        }
+    }
+    // Remove each optional field individually too: later timestamps and a result
+    // state cannot be prerequisites for decoding any of the other present fields.
+    for field in [
+        "state",
+        "queued_at_ms",
+        "started_at_ms",
+        "finished_at_ms",
+        "queue_position",
+    ] {
+        for explicit_null in [false, true] {
+            let mut input = snapshot("passed", "running");
+            let row = input["release_checks"][0].as_object_mut().unwrap();
+            row.remove(field);
+            let expected = Value::Object(row.clone());
+            if explicit_null {
+                row.insert(field.into(), Value::Null);
+            }
+            let emitted = roundtrip::<AttachResponse>(input);
+            assert_eq!(
+                emitted["release_checks"][0], expected,
+                "missing/null {field} must leave the other snapshot fields intact"
+            );
+        }
+    }
+    for identity in ["0000000000000000", "ffffffffffffffff"] {
+        let mut input = snapshot("passed", "complete");
+        input["release_checks"][0]["identity"] = json!(identity);
+        assert_eq!(
+            roundtrip::<AttachResponse>(input)["release_checks"][0]["identity"],
+            identity
+        );
+    }
+    for identity in [
+        "".into(),
+        "a".repeat(15),
+        "a".repeat(17),
+        "g".repeat(16),
+        "0123456789ABCDEF".into(),
+        "0123456789abcde\n".into(),
+        "0123456789abcde\u{1b}".into(),
+        "é".repeat(8),
+        "f".repeat(4096),
+    ] {
+        let mut input = snapshot("passed", "complete");
+        input["release_checks"][0]["identity"] = json!(identity);
+        let mut expected = input["release_checks"][0].clone();
+        expected.as_object_mut().unwrap().remove("identity");
+        let emitted = roundtrip::<AttachResponse>(input);
+        assert_eq!(
+            emitted["release_checks"],
+            json!([expected]),
+            "invalid display identity must become absent without losing its row or other fields, never truncated: {identity:?}"
+        );
+    }
     let mut future = snapshot("future_state", "future_progress");
     let row = &mut future["release_checks"][0];
     row["identity"] = json!("f".repeat(4096));
@@ -433,7 +548,7 @@ fn release_check_001_snapshots_capability_and_request_roundtrips() {
     assert_eq!(row["progress"], "other");
     assert_eq!(row["agent"], "other");
     assert!(row.get("release").is_none());
-    assert!(row["identity"].as_str().unwrap().len() <= 16);
+    assert!(row.get("identity").is_none());
     assert!(
         row.get("queue_position")
             .is_none_or(|v| v.as_u64().is_some_and(|p| p <= 8))
