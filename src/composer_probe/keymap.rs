@@ -293,7 +293,7 @@ impl ClaudeKeymap {
 /// layout, and an explicit default binding holds too.
 ///
 /// An object that names one member twice, at any depth and compared after
-/// its escapes are decoded (`"a"` and `"a"`), is unparsable: which of
+/// its escapes are decoded (`"a"` and `"\u0061"`), is unparsable: which of
 /// the two Claude reads isn't measured, and a parse into
 /// [`serde_json::Value`] keeps only the last, so an earlier member's subtree
 /// would never reach the check. The scan reads the raw document instead

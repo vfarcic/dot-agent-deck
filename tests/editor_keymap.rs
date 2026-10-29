@@ -760,7 +760,7 @@ fn probe_014_claude_spellings_strokes_would_split_hold() {
     assert_eq!(control.check(), Ok(()));
 }
 
-/// Scenario: Claude's `keybindings.json` names one object member twice: a `bindings` whose first copy binds Ctrl+G and whose second is empty, a `key` of `ctrl+g` then `ctrl+h`, an `action` of the external editor then another, a name written once plainly and once with a `\u` escape, and a repeat nested in a context's bindings or deep in arrays; each holds as unparsable, including the ones whose strings are otherwise unrelated. The control uses the same name in sibling objects, at different depths and in another case, beside booleans, numbers and null, and allows the probe.
+/// Scenario: Claude's `keybindings.json` names one object member twice: a `bindings` whose first copy binds Ctrl+G and whose second is empty, a `key` of `ctrl+g` then `ctrl+h`, an `action` of the external editor then another, a name written once plainly and once with a `\u` escape (`ctrl+g` and `ctrl+\u0067`, and `note` and `n\u006fte` with no Ctrl+G anywhere), and a repeat nested in a context's bindings or deep in arrays; each holds as unparsable, including the ones whose strings are otherwise unrelated. The control uses the same name in sibling objects, at different depths and in another case, a name escaped once (`n\u006fte`), beside booleans, numbers and null, and allows the probe.
 #[spec("inbox/probe/014")]
 #[test]
 fn probe_014_a_claude_member_named_twice_holds() {
@@ -772,6 +772,9 @@ fn probe_014_a_claude_member_named_twice_holds() {
         r#"{"action":"chat:externalEditor","action":"chat:submit"}"#,
         r#"{"ctrl+g":null,"ctrl+g":null}"#,
         r#"{"note":"go","note":"gauge"}"#,
+        r#"{"ctrl+g":null,"ctrl+\u0067":null}"#,
+        r#"{"note":"go","n\u006fte":"gauge"}"#,
+        r#"{"note":1,"\u006eote":2}"#,
         r#"{"bindings":[{"context":"Chat","bindings":{"ctrl+e":"chat:submit","ctrl+e":"chat:cancel"}}]}"#,
         r#"{"a":[[{"b":{"c":1,"c":1}}]]}"#,
     ] {
@@ -782,7 +785,7 @@ fn probe_014_a_claude_member_named_twice_holds() {
 
     write(
         &path,
-        r#"{"bindings":[{"context":"Chat","bindings":{"ctrl+e":"chat:submit"}},{"context":"Global","bindings":{"ctrl+e":"chat:submit","Ctrl+E":null}}],"context":"top","n":[true,false,-1,2,0.5,null]}"#,
+        r#"{"bindings":[{"context":"Chat","bindings":{"ctrl+e":"chat:submit"}},{"context":"Global","bindings":{"ctrl+e":"chat:submit","Ctrl+E":null}}],"context":"top","n\u006fte":1,"n":[true,false,-1,2,0.5,null]}"#,
     );
     let control = ClaudeKeymap::at_spawn(path, &verified());
     assert_eq!(control.check(), Ok(()));
