@@ -380,7 +380,8 @@ class DriverKnobs(unittest.TestCase):
                                      frames[agent]['resized'])
 
     def test_driver_faults_change_bytes_inside_one_write(self):
-        """Scenario: raise each screen fault on each composer; its raw operations are present in the sole initial write, including a drawn-and-erased overlay."""
+        """Scenario: raise each screen fault on each composer; its raw operations are present in the sole initial write. The modal adds foreign content while preserving the reviewed composer bytes and cursor."""
+        frames = json.loads((SUPPORT.parent / 'fixtures/release-check/driver-frames.json').read_text())
         faults = {'overlay': b'\x1b[35;5H!\x1b[2K',
                   'moved_glyph': b'\x1b[35;5HC\x1b[2K',
                   'mode': b'\x1b[?1000h\x1b[?1000l',
@@ -394,6 +395,13 @@ class DriverKnobs(unittest.TestCase):
                     writes = [bytes(json.loads(line)) for line in composer.path('.writes').read_text().splitlines()]
                     self.assertEqual(writes, [composer.output])
                     self.assertIn(inserted, writes[0])
+                    if fault == 'modal':
+                        end = b'\x1b[?2026l' if agent == 'codex' else b''
+                        ready = frames[agent]['ready'].encode()
+                        body = ready[:-len(end)] if end else ready
+                        cursor = body[body.rfind(b'\x1b['):]
+                        self.assertEqual(writes[0], body + inserted + cursor + end,
+                                         'modal must preserve the composer and restore its cursor')
                     if agent == 'codex':
                         self.assertLess(writes[0].index(inserted), writes[0].index(b'\x1b[?2026l'))
 
