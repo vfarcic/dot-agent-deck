@@ -1,4 +1,4 @@
-//! Native raw-terminal fixture for S-15. Mailbox commands are fixture controls,
+//! Native raw-terminal fixture for S-15/S-16. Mailbox commands are fixture controls,
 //! never production transport shortcuts. All input assertions read PTY bytes.
 //!
 //! Assumed Q35-15 interface: the existing generation-bound, e2e-only
@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::Shutdown;
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -144,6 +145,15 @@ impl Fixture {
     pub fn fence(&self) {
         self.require_control("fence");
     }
+
+    /// Q35-16 cuts when a segment is open OR a liability is present. Use
+    /// Q35-14b's existing publication control to establish that second
+    /// condition, rather than assuming that closing a gate arms a probe.
+    pub fn check(&self, client: &Client) {
+        self.emit(client, b"\x1b[2J\x1b[H\x1b[2;12HClaude Code v2.1.310\r\n");
+        self.require_control("publish");
+        self.fence();
+    }
     pub fn release(&self) {
         self.require_control("release");
     }
@@ -164,14 +174,31 @@ impl Fixture {
         );
     }
 
+    /// A frame may become several lazy sub-ops at a candidate. Wait for
+    /// acceptance without prescribing that implementation's node count.
+    pub fn wait_any_held(&self) {
+        assert!(
+            common::wait_until(common::child_boot_budget(), || {
+                let status = self.require_control("fence-status");
+                status["composer_fence"]["held_ops"].as_u64().unwrap() > 0
+                    && status["composer_fence"]["full_waiters"] == 0
+            }),
+            "the combined frame must be accepted behind the fence"
+        );
+    }
+
     pub fn connect(&self) -> Client {
         Client::attach(&self.daemon.attach_socket, &self.id)
     }
 
     pub fn command(&self, command: &str) -> Value {
+        self.command_value(&json!(command))
+    }
+
+    fn command_value(&self, command: &Value) -> Value {
         let response = self.base.with_extension("response");
         assert!(!response.exists());
-        atomic_json(&self.base.with_extension("command"), &json!(command));
+        atomic_json(&self.base.with_extension("command"), command);
         let result = read_json(&response);
         fs::remove_file(response).unwrap();
         result
@@ -236,6 +263,27 @@ impl Fixture {
                 .any(|w| w == QUERY)),
             "query must cross output publication before its reply is sent"
         );
+    }
+
+    /// Output originates in the stand-in, crosses the real reader/ledger,
+    /// and is observed on attach before the test sends its next input.
+    pub fn emit(&self, client: &Client, bytes: &[u8]) {
+        assert!(!bytes.is_empty());
+        let before = client.output().len();
+        self.command_value(&json!({"emit": bytes}));
+        assert!(
+            common::wait_until(common::child_boot_budget(), || client.output()[before..]
+                .windows(bytes.len())
+                .any(|window| window == bytes)),
+            "fixture output must cross publication before the next acceptance: {bytes:?}"
+        );
+    }
+
+    /// Read by the stand-in through the same public arm-page ABI as the
+    /// installed helper, rather than inspecting the daemon's private FIFO.
+    pub fn native_seq(&self) -> u64 {
+        let publication = self.command("arm");
+        publication["native_seq"].as_u64().unwrap()
     }
 }
 
@@ -403,8 +451,15 @@ pub fn agent_process() -> bool {
         let path = base.with_extension("command");
         if let Ok(bytes) = fs::read(&path) {
             fs::remove_file(path).unwrap();
-            let command: String = serde_json::from_slice(&bytes).unwrap();
-            let response = match command.as_str() {
+            let command: Value = serde_json::from_slice(&bytes).unwrap();
+            if let Some(bytes) = command.get("emit") {
+                let bytes: Vec<u8> = serde_json::from_value(bytes.clone()).unwrap();
+                std::io::stdout().write_all(&bytes).unwrap();
+                std::io::stdout().flush().unwrap();
+                atomic_json(&base.with_extension("response"), &json!({"ok": true}));
+                continue;
+            }
+            let response = match command.as_str().unwrap() {
                 "query" => {
                     std::io::stdout().write_all(QUERY).unwrap();
                     std::io::stdout().flush().unwrap();
@@ -421,6 +476,7 @@ pub fn agent_process() -> bool {
                     assert_eq!(unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut size) }, 0);
                     json!({"size": [size.ws_row, size.ws_col]})
                 }
+                "arm" => helper_publication(),
                 "drain" => {
                     // Drain all currently ready input before acknowledging.
                     // The next main-loop poll still catches any later leak.
@@ -443,4 +499,36 @@ pub fn agent_process() -> bool {
             atomic_json(&base.with_extension("response"), &response);
         }
     }
+}
+
+fn helper_publication() -> Value {
+    use dot_agent_deck::composer_probe::{arm, instance::InstanceReader};
+
+    let helper = PathBuf::from(std::env::var_os("VISUAL").unwrap());
+    let reader = InstanceReader::open(helper.parent().unwrap()).unwrap();
+    let generation = std::env::var("DOT_AGENT_DECK_EDITOR_GEN").unwrap();
+    let file = reader.arm(&generation).unwrap().unwrap();
+    let len = usize::try_from(file.metadata().unwrap().len()).unwrap();
+    // SAFETY: a read-only shared mapping of this fixture generation's arm
+    // file. The daemon publishes atomic words; the helper reads that ABI.
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    assert_ne!(ptr, libc::MAP_FAILED);
+    // SAFETY: the successful, page-aligned mapping above lives until munmap.
+    let publication = unsafe { arm::ArmReader::at(ptr.cast(), len) }
+        .unwrap()
+        .read_publication();
+    // SAFETY: exactly the live mapping above, unmapped once after the read.
+    assert_eq!(unsafe { libc::munmap(ptr, len) }, 0);
+    let publication = publication.expect("helper must read a consistent quiescent publication");
+    json!({"count": publication.count, "seg_seq": publication.seg_seq,
+        "native_seq": publication.native_seq})
 }
