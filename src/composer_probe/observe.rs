@@ -770,6 +770,13 @@ pub enum ControlRefusal {
 /// The page a [`Seam`] publishes to.
 pub trait Page {
     fn publish(&mut self, count: u32);
+
+    /// Publish `count` with `native_seq`, the last native Ctrl+G candidate
+    /// the planner numbered (Q35-16, A2 §4.4). A page with no native word
+    /// keeps nothing of it.
+    fn publish_native(&mut self, count: u32, native_seq: u64) {
+        let _ = (count, native_seq);
+    }
 }
 
 /// One generation's state that changes the count, under the seam lock: the
@@ -820,6 +827,13 @@ impl<P: Page> Seam<P> {
 
     pub fn page(&mut self) -> &mut P {
         &mut self.page
+    }
+
+    /// Publish `native_seq`, the last number of a native Ctrl+G candidate
+    /// about to be submitted (Q35-16, A2 §4.4), with the count the page
+    /// already shows: the helper reads it in the same seqlock as the count.
+    pub fn publish_native(&mut self, native_seq: u64) {
+        self.page.publish_native(self.published, native_seq);
     }
 
     /// Publish the records' count if the page doesn't show it.
@@ -1085,6 +1099,10 @@ mod linux {
         fn publish(&mut self, count: u32) {
             // No segment numbers until probes exist (Q35-19/20).
             self.arm().publisher().publish(count, 0);
+        }
+
+        fn publish_native(&mut self, count: u32, native_seq: u64) {
+            self.arm().publisher().publish_native(count, 0, native_seq);
         }
     }
 
@@ -1648,6 +1666,15 @@ mod linux {
                 drain_park: std::sync::Mutex::new(None),
             });
             let weak = Arc::downgrade(&observer);
+            // Q35-16: the planner's native numbers go to this generation's
+            // page, through the seam lock, which takes nothing of the
+            // writer's or the ingress ledger's.
+            let page = Weak::clone(&weak);
+            observer.input().set_native_page(Box::new(move |seq| {
+                if let Some(observer) = page.upgrade() {
+                    observer.lock().seam.publish_native(seq);
+                }
+            }));
             let thread = std::thread::Builder::new()
                 .name(format!("composer-observer-{generation}"))
                 .spawn(move || run(weak))

@@ -38,8 +38,9 @@
 //! (both through `GenerationInput`), and an installed generation's records
 //! feed the pending fact and their pops (Q35-14b), and a profile learned
 //! after spawn moves `B` to its rule (Q35-18a, [`Backlog::adopt`]); the
-//! physical tracker's native candidate (Q35-16) arrives later, as does the
-//! first reader, probe admission (Q35-19).
+//! planner numbers native candidates at acceptance and the physical tracker
+//! enters each as the PTY takes it (Q35-16); the first reader, probe
+//! admission, is Q35-19's.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -380,11 +381,21 @@ impl HazardFifo {
     }
 
     /// A native candidate was physically accepted at `now`, with `B` as
-    /// `backlog` says. Its number, or `None` once numbering is exhausted (then
-    /// no candidate is numbered, and the FIFO stays non-clear until
-    /// retirement).
+    /// `backlog` says: [`Self::number`] and [`Self::enter`] at once. Its
+    /// number, or `None` once numbering is exhausted (then no candidate is
+    /// numbered, and the FIFO stays non-clear until retirement).
     pub fn accept(&mut self, now: Instant, backlog: bool) -> Option<u64> {
-        self.advance(now);
+        let seq = self.number()?;
+        self.enter(seq, now, backlog);
+        Some(seq)
+    }
+
+    /// Number the next native candidate, at its acceptance and in the
+    /// planner's order, before it is published and submitted (A2 §4.4).
+    /// `None` once numbering is exhausted, which is sticky. A number whose
+    /// candidate is never written (its job taken back) is skipped: the
+    /// helper's `native_seen` only bounds pops from above.
+    pub fn number(&mut self) -> Option<u64> {
         if self.exhausted {
             return None;
         }
@@ -393,6 +404,16 @@ impl HazardFifo {
             return None;
         };
         self.native_seq = seq;
+        Some(seq)
+    }
+
+    /// Native candidate `seq`, numbered by [`Self::number`], was physically
+    /// accepted at `now`, with `B` as `backlog` says: it enters, `Latched`
+    /// when `B` holds and `Quiet` otherwise (A1 §3.3). Candidates enter in
+    /// the order they were numbered, since the writer takes them in the
+    /// order they were accepted.
+    pub fn enter(&mut self, seq: u64, now: Instant, backlog: bool) {
+        self.advance(now);
         if self.extra > 0 || self.entries.len() == HAZARD_SLOTS {
             // While anything is counted, every new entry is counted too, so
             // every counted entry is newer than every kept one.
@@ -416,7 +437,6 @@ impl HazardFifo {
                 state,
             });
         }
-        Some(seq)
     }
 
     /// `B` turned true at `now`: every `Quiet` entry still quiet latches,

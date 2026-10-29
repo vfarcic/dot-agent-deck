@@ -688,6 +688,10 @@ pub enum NotTyped {
     Deadline,
     /// The line's write failed before the pane took any of it.
     WriteFailed,
+    /// The pane's input was inside an escape sequence, a string or a paste
+    /// the user hadn't finished when the line was to start (PRD #1666 part
+    /// 3, Q35-16): nothing was written, and the doorbell tries again later.
+    OffGround,
 }
 
 /// What step 1 is decided from (plan §1.1).
@@ -735,6 +739,7 @@ pub enum Job {
 const JOB_QUEUED: u8 = 0;
 const JOB_STARTED: u8 = 1;
 const JOB_WITHDRAWN: u8 = 2;
+const JOB_REFUSED: u8 = 3;
 
 /// One queued job's claim word (plan §2.3, Q24): the one word the PTY writer
 /// thread's job (`PtyJob` in `src/agent_pty.rs`), the writer, every
@@ -756,6 +761,34 @@ pub enum ClaimState {
     Started,
     /// Taken back before the writer came to it: it is never written.
     Withdrawn,
+    /// The writer came to it and its start condition refused it
+    /// ([`JobClaim::start_if`]): it is never written, and the writer, not a
+    /// withdrawer, accounts for it.
+    Refused,
+}
+
+/// What the PTY writer thread knows when it comes to a job (PRD #1666 part
+/// 3, Q35-16, I-8), built there from its own state, for a job's start
+/// condition: where the bytes the PTY took so far leave the stream, whether
+/// its generation retired (a writer thread is one generation's, and a
+/// successor published on its pane retires it), and when.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartCtx {
+    pub boundary: crate::composer_probe::planner::Boundary,
+    pub retired: bool,
+    pub now: Instant,
+}
+
+/// What [`JobClaim::start_if`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Start<R> {
+    /// Started: the writer writes it.
+    Started,
+    /// Its condition refused it, for this reason: it is never written.
+    Refused(R),
+    /// It was no longer queued (taken back, or already started): the
+    /// condition wasn't asked.
+    NotQueued,
 }
 
 impl JobClaim {
@@ -765,7 +798,37 @@ impl JobClaim {
         match self.state.load(Ordering::Acquire) {
             JOB_QUEUED => ClaimState::Queued,
             JOB_STARTED => ClaimState::Started,
+            JOB_REFUSED => ClaimState::Refused,
             _ => ClaimState::Withdrawn,
+        }
+    }
+
+    /// The writer, before the job's first byte, for a job with a start
+    /// condition (PRD #1666 part 3, Q35-16, I-8): `pred` is asked, on the
+    /// writer thread with `ctx` the writer built, only while the job is still
+    /// queued. `Ok` starts it as [`Self::start`] does; `Err(reason)` moves it
+    /// to refused and hands `reason` back unchanged, whatever its type. Either
+    /// move is one compare-and-swap from queued, so a take-back that lands
+    /// while `pred` runs wins and the job is [`Start::NotQueued`]: a refused
+    /// job is never also withdrawn, nor a withdrawn one refused.
+    pub fn start_if<R>(
+        &self,
+        ctx: &StartCtx,
+        pred: impl FnOnce(&StartCtx) -> Result<(), R>,
+    ) -> Start<R> {
+        if self.state() != ClaimState::Queued {
+            return Start::NotQueued;
+        }
+        let (to, verdict) = match pred(ctx) {
+            Ok(()) => (JOB_STARTED, Start::Started),
+            Err(reason) => (JOB_REFUSED, Start::Refused(reason)),
+        };
+        match self
+            .state
+            .compare_exchange(JOB_QUEUED, to, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => verdict,
+            Err(_) => Start::NotQueued,
         }
     }
 
@@ -840,6 +903,11 @@ pub enum Event {
     /// The job's write did not finish within its bound. It is still the
     /// transaction's until it ends.
     JobStalled,
+    /// The writer came to the job and its start condition refused it
+    /// ([`JobClaim::start_if`]): none of it was written (PRD #1666 part 3,
+    /// Q35-16: a deck line starts only where the bytes the pane took leave
+    /// its input at a boundary).
+    JobNotStarted,
     /// Exact or other hook evidence forwarded by the hook arm, which has
     /// already moved the cell.
     Evidence { token: RingToken, exact: bool },
@@ -1129,6 +1197,18 @@ impl<'c> Txn<'c> {
             (Phase::LineJob(stage), Event::JobEnded { accepted, ok }) => {
                 self.line_ended(stage, accepted, ok, seam, now)
             }
+            // Refused at the writer: nothing of this job was written. The
+            // line's first stage leaves the attempt with nothing written; a
+            // later job of a line already in the pane can't be finished.
+            (Phase::LineJob(0), Event::JobNotStarted) if !self.wrote => {
+                self.nothing_written(NotTyped::OffGround, now)
+            }
+            (Phase::LineJob(_) | Phase::CrJob, Event::JobNotStarted) => {
+                self.unresolve(Cause::WriteStalled, seam, now)
+            }
+            (Phase::DeleteJob, Event::JobNotStarted) => {
+                self.suspend_and_pause(Cause::WithdrawalStalled, now)
+            }
             (Phase::LineJob(_), Event::JobStalled) => {
                 self.unresolve(Cause::WriteStalled, seam, now)
             }
@@ -1190,6 +1270,10 @@ impl<'c> Txn<'c> {
     fn track_job(&mut self, event: &Event, now: Instant) {
         match (event, self.job) {
             (Event::JobStarted, Owned::Queued(kind)) => self.started(kind),
+            (Event::JobNotStarted, Owned::Queued(_)) => {
+                self.job = Owned::Idle;
+                self.claim = None;
+            }
             (Event::JobEnded { accepted, .. }, Owned::Queued(kind) | Owned::Running(kind)) => {
                 self.job = Owned::Idle;
                 self.claim = None;
@@ -1248,7 +1332,9 @@ impl<'c> Txn<'c> {
             return;
         };
         let claim = self.claim.take().expect("a queued job has its claim");
-        if claim.withdraw() {
+        // A job its start condition refused was never written, as one taken
+        // back wasn't: the writer accounted for it.
+        if claim.withdraw() || claim.state() == ClaimState::Refused {
             self.job = Owned::Idle;
         } else {
             self.started(kind);

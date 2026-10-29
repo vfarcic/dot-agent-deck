@@ -367,6 +367,13 @@ impl Framing {
         self.state == State::Ground && !self.paste
     }
 
+    /// Whether the stream ends in a lone ESC, outside a paste: the Escape
+    /// key, until a byte after it says whether it began a sequence (Q35-16's
+    /// physical boundary reads it apart from ground).
+    pub fn escape_pending(&self) -> bool {
+        self.state == State::Esc && !self.paste
+    }
+
     fn token<'a>(&self, event: Event<'a>) -> Token<'a> {
         Token {
             event,

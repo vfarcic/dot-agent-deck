@@ -101,6 +101,9 @@ pub(crate) struct Generation {
     pub(crate) retired: Arc<AtomicBool>,
     pub(crate) exited: Arc<AtomicBool>,
     pub(crate) writer: Arc<AsyncMutex<PaneWriter>>,
+    /// PRD #1666 part 3 (Q35-16): the generation's physical boundary, read
+    /// and waited on without the writer.
+    pub(crate) physical: Arc<crate::composer_probe::planner::Physical>,
     /// The effective agent type: the spawn type, else the type the
     /// generation's own hooks reported.
     pub(crate) agent: Option<AgentType>,
@@ -259,6 +262,7 @@ impl AgentPtyRegistry {
             retired: Arc::clone(&agent.pane_retired),
             exited: Arc::clone(&agent.exited),
             writer: Arc::clone(&agent.writer),
+            physical: agent.gate.physical(),
             agent: agent
                 .spawn_agent_type
                 .clone()
@@ -593,11 +597,34 @@ impl AgentPtyRegistry {
             return RingReport::before_admission(RingOutcome::Suspended);
         }
         let stall = self.pty_write_stall_bound();
+        // PRD #1666 part 3 (Q35-16, core §4.8): a deck line starts only where
+        // the bytes the pane took leave its input in ground or after a lone
+        // ESC, so a ring waits, before it takes the writer, for a paste or
+        // escape sequence the user is part-way through to finish: the writer
+        // stays free for the bytes that finish it. Bounded as taking the
+        // writer is; still inside one then, nothing is written and the
+        // doorbell tries later.
+        if within_real_time(stall, generation.physical.until_line())
+            .await
+            .is_none()
+        {
+            return RingReport::before_admission(RingOutcome::Txn(txn::Outcome::NothingWritten(
+                txn::NotTyped::OffGround,
+            )));
+        }
         let Some(guard) =
             within_real_time(stall, Arc::clone(&generation.writer).lock_owned()).await
         else {
             return RingReport::before_admission(RingOutcome::NotReading);
         };
+        // Bytes accepted between the wake and the writer can have left it
+        // inside a sequence again: then this attempt writes nothing. The
+        // writer checks again when it comes to each job (I-8).
+        if !guard.physical_boundary().line_may_start() {
+            return RingReport::before_admission(RingOutcome::Txn(txn::Outcome::NothingWritten(
+                txn::NotTyped::OffGround,
+            )));
+        }
         // The one deadline of the whole hold (plan §2.3): `D` runs from the
         // moment the writer is the ring's, so admission's reads spend the same
         // budget as the transaction.
@@ -862,6 +889,22 @@ impl AgentPtyRegistry {
             // What the pane shows now, in the order the transaction needs it.
             if !generation.open() {
                 pending.push_back(txn::Event::Retired);
+            }
+            // PRD #1666 part 3 (Q35-16): the writer refused to start the job
+            // (I-8); none of it was written.
+            if let Some(slot) = job.as_mut()
+                && let Some(why) = slot.job.refused()
+            {
+                tracing::debug!(
+                    target: "doorbell",
+                    pane_id = %pane,
+                    agent_id = %agent,
+                    attempt = txn.attempt(),
+                    ?why,
+                    "doorbell job not started"
+                );
+                job = None;
+                pending.push_back(txn::Event::JobNotStarted);
             }
             if let Some(slot) = job.as_mut() {
                 if slot.started_at.is_none() && slot.job.started() {

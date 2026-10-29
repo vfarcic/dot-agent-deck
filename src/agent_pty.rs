@@ -4639,6 +4639,12 @@ pub(crate) struct UserFrame {
     bytes: Vec<u8>,
     ticket: Option<crate::ingress_ledger::TicketGuard>,
     notice: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    /// PRD #1666 part 3 (Q35-16): where the planner cut it at acceptance,
+    /// if it did: the end of its first Ctrl+G candidate that opens a segment.
+    cut: Option<crate::composer_probe::planner::Cut>,
+    /// PRD #1666 part 3 (Q35-16): the cut op this is a sub-op of, once it was
+    /// split. The ticket stays with the op's last sub-op.
+    part: Option<Arc<SubOps>>,
 }
 
 impl UserFrame {
@@ -4651,7 +4657,42 @@ impl UserFrame {
             bytes,
             ticket,
             notice,
+            cut: None,
+            part: None,
         }
+    }
+
+    /// PRD #1666 part 3 (Q35-16, core §4.3): how a release takes this held
+    /// frame. No cut: whole. A cut at its last byte: whole, its candidate
+    /// opening the next segment. Otherwise its prefix through the cut, as a
+    /// sub-op of the same op with no ticket of its own, and this frame left
+    /// as the rest, keeping the ticket, its own next cut read lazily from the
+    /// planner's state at this one: the rest of a cut op is cut at every
+    /// candidate, one release at a time.
+    fn split(&mut self) -> crate::composer_probe::gate::Cutting<UserFrame> {
+        use crate::composer_probe::gate::Cutting;
+        let Some(cut) = self.cut.take() else {
+            return Cutting::Whole;
+        };
+        if cut.at >= self.bytes.len() {
+            return Cutting::Through;
+        }
+        let whole = self.bytes.len();
+        let part = Arc::clone(self.part.get_or_insert_with(|| SubOps::new(whole)));
+        let rest = self.bytes.split_off(cut.at);
+        let prefix = std::mem::replace(&mut self.bytes, rest);
+        self.cut = crate::composer_probe::planner::next_cut(&cut.resume, &self.bytes);
+        let taken = prefix.len();
+        Cutting::Split(
+            UserFrame {
+                bytes: prefix,
+                ticket: None,
+                notice: self.notice.clone(),
+                cut: None,
+                part: Some(part),
+            },
+            taken,
+        )
     }
 
     pub(crate) fn bytes(&self) -> &[u8] {
@@ -4674,7 +4715,13 @@ impl UserFrame {
         if let Some(notice) = &self.notice {
             let _ = notice.try_send(reason.as_bytes().to_vec());
         }
-        self.refuse(reason);
+        // Q35-16: the rest of a cut op whose earlier sub-ops the PTY took
+        // part of settles as written in part.
+        match (self.ticket, &self.part) {
+            (Some(ticket), Some(part)) => ticket.refuse_after(part.accepted(), reason),
+            (Some(ticket), None) => ticket.refuse(reason),
+            (None, _) => {}
+        }
     }
 }
 
@@ -4698,9 +4745,9 @@ pub(crate) enum Accepted {
 /// captured generation's exit token, which the thread checks with the
 /// generation's retirement just before it writes, and the frame's route to
 /// its connection, which a refusal or a failed write there is told through.
-/// Only a fence's release makes one, which a production build can't reach
-/// before Q35-20 ([`PaneGate`]).
-#[cfg_attr(not(any(test, feature = "e2e")), allow(dead_code))]
+/// A fence's release makes one, and so does a person's op whose Ctrl+G
+/// candidate the planner cut while a liability is out (Q35-16), neither of
+/// which a production build reaches before activation.
 struct Released {
     exited: Arc<AtomicBool>,
     notice: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
@@ -4747,10 +4794,14 @@ enum Acceptance {
     /// already accepted it, exempt ([`crate::composer_probe::epoch::GenerationInput::pass_ahead`]),
     /// so it only enters the in-flight count here (R-U2-04).
     PassedAhead,
+    /// PRD #1666 part 3 (Q35-16): accepted by the planner as the gate let it
+    /// through, which moved its epoch and numbered its native candidates
+    /// there: it enters the in-flight count here, and its numbers are
+    /// published before it is sent.
+    Planned(Option<crate::composer_probe::planner::Natives>),
     /// Released by a fence, which moved its epoch and counted it in flight
-    /// when it held it.
-    #[cfg_attr(not(any(test, feature = "e2e")), allow(dead_code))]
-    Released(Released),
+    /// when it held it; with the cut op it is a sub-op of, if it is one.
+    Released(Released, Option<Arc<SubOps>>),
 }
 
 /// PRD #1666 part 3 (Q35-15): a generation's fence gate
@@ -4767,9 +4818,19 @@ pub(crate) struct PaneGate {
     in_flight: Arc<PtyInFlight>,
     #[cfg(any(test, feature = "e2e"))]
     input: Arc<crate::composer_probe::epoch::GenerationInput>,
+    /// PRD #1666 part 3 (Q35-16): the generation's physical boundary, which
+    /// a doorbell reads and waits on without the pane writer's lock.
+    physical: Arc<crate::composer_probe::planner::Physical>,
 }
 
 impl PaneGate {
+    /// PRD #1666 part 3 (Q35-16, core §12.1): whether the bytes the PTY took
+    /// so far leave the pane's input at a boundary, and the wake for its
+    /// return there.
+    pub(crate) fn physical(&self) -> Arc<crate::composer_probe::planner::Physical> {
+        Arc::clone(&self.physical)
+    }
+
     /// Close the fence at the generation's output offset as of now. `false`
     /// once retired.
     #[cfg(any(test, feature = "e2e"))]
@@ -4839,7 +4900,6 @@ pub struct PaneWriter {
     /// set when its reader sees the PTY's end, which is not its retirement
     /// (the registry can still hold an exited agent): a release checks it,
     /// and carries it to the writer thread with every job it submits.
-    #[cfg_attr(not(any(test, feature = "e2e")), allow(dead_code))]
     exited: Arc<AtomicBool>,
 }
 
@@ -4868,6 +4928,7 @@ impl PaneWriter {
             in_flight: Arc::clone(&pty.in_flight),
             #[cfg(any(test, feature = "e2e"))]
             input: Arc::clone(&pty.input),
+            physical: Arc::clone(&pty.physical),
         });
         Self {
             pty,
@@ -4895,7 +4956,7 @@ impl PaneWriter {
     /// frame written now at its enqueue, for a held one as it is held, and
     /// for a passing reply not at all (it is exempt).
     pub(crate) async fn accept(&self, frame: UserFrame, waiter: Option<FrameWaiter>) -> Accepted {
-        use crate::composer_probe::epoch::Writer;
+        use crate::composer_probe::epoch::{Plan, Writer};
         use crate::composer_probe::gate::Admission;
         let input = &self.pty.input;
         let in_flight = &self.pty.in_flight;
@@ -4909,14 +4970,38 @@ impl PaneWriter {
             |frame, trigger| input.pass_ahead(Writer::Human, &frame.bytes, trigger),
             |frame| {
                 // R5 §4.7: a held op is in flight from acceptance, and
-                // leaves once, when it is written or refused.
-                input.enqueue(Writer::Human, &frame.bytes);
+                // leaves once, when it is written or refused. Q35-16: a
+                // segment is open, so the planner finds its first cut here,
+                // classified once, and the release reads it.
+                frame.cut = input
+                    .enqueue_planned(Writer::Human, &frame.bytes, Plan::Held)
+                    .cut;
                 in_flight.count.fetch_add(1, Ordering::SeqCst);
             },
         );
         match admitted {
-            Admission::Open(frame) => {
-                Accepted::Written(self.write_user_ticketed(&frame.bytes, frame.ticket).await)
+            Admission::Open(mut frame) => {
+                // Q35-16 (core §4.3): no segment is open. The planner reads
+                // the frame here: with a liability out its first Ctrl+G
+                // candidate cuts it and opens one; with none, its candidates
+                // are native, numbered now and published before it is sent.
+                let planned = input.enqueue_planned(Writer::Human, &frame.bytes, Plan::Open);
+                input.accepted_parks();
+                match planned.cut {
+                    Some(cut) => {
+                        frame.cut = Some(cut);
+                        self.hold_cut(frame, len);
+                        Accepted::Held
+                    }
+                    None => Accepted::Written(
+                        self.write_user_accepted(
+                            &frame.bytes,
+                            frame.ticket,
+                            Acceptance::Planned(planned.natives),
+                        )
+                        .await,
+                    ),
+                }
             }
             Admission::PassAhead(frame) => {
                 // Accepted already, so the seam a test parks at sits between
@@ -4940,9 +5025,44 @@ impl PaneWriter {
         }
     }
 
+    /// PRD #1666 part 3 (Q35-16, core §4.3): a frame the gate let through
+    /// whose planner cut it, a liability being out: it is accepted, its epoch
+    /// moved, and the gate now owns it, as it owns a held frame. The prefix
+    /// through its cut is submitted, as a release submits, and the rest is
+    /// held behind the segment its Ctrl+G candidate opens. Its connection
+    /// reads on, and hears of a refusal or a failed write as a released
+    /// frame's does.
+    fn hold_cut(&self, frame: UserFrame, len: usize) {
+        let in_flight = &self.pty.in_flight;
+        // In flight from acceptance, as a held frame is.
+        in_flight.count.fetch_add(1, Ordering::SeqCst);
+        let trigger = self.pty.input.output_offset();
+        let split = |frame: &mut UserFrame| {
+            let cutting = frame.split();
+            if matches!(cutting, crate::composer_probe::gate::Cutting::Split(..)) {
+                // One more sub-op in flight: the rest stays held.
+                in_flight.count.fetch_add(1, Ordering::SeqCst);
+            }
+            cutting
+        };
+        match self.gate.gate.cut_open(frame, len, trigger, split) {
+            Ok(through) => {
+                for frame in through {
+                    self.pty.submit_released(frame, Arc::clone(&self.exited));
+                }
+            }
+            Err(frame) => {
+                frame.refuse_accepted("exited");
+                in_flight.leave();
+            }
+        }
+    }
+
     /// PRD #1666 part 3 (Q35-15; R6 §5.3, core §8.1): open the fence and
     /// submit what it held, in acceptance order, before this writer's lock
-    /// lets anything else be accepted. `target` is the release-time check of
+    /// lets anything else be accepted. Q35-16: only as far as the first held
+    /// Ctrl+G candidate the planner cut at, whose prefix goes and whose
+    /// segment keeps the fence closed over the rest. `target` is the release-time check of
     /// the captured target (the generation still the pane's live owner, and
     /// writable): when it fails, every held op is refused with its reason
     /// instead, and its connection told; an exited generation fails it with
@@ -4961,7 +5081,17 @@ impl PaneWriter {
         } else {
             target
         };
-        let held = self.gate.gate.release();
+        let in_flight = &self.pty.in_flight;
+        let held = self
+            .gate
+            .gate
+            .release_cut(self.pty.input.output_offset(), |frame| {
+                let cutting = frame.split();
+                if matches!(cutting, crate::composer_probe::gate::Cutting::Split(..)) {
+                    in_flight.count.fetch_add(1, Ordering::SeqCst);
+                }
+                cutting
+            });
         let mut submitted = 0;
         for frame in held {
             match target {
@@ -5060,6 +5190,24 @@ impl PaneWriter {
         queued: impl FnOnce(),
         ticket: Option<crate::ingress_ledger::TicketGuard>,
     ) -> std::io::Result<AnswerWrite> {
+        // Q35-16 (core §4.3): an answer the planner would cut is refused at
+        // acceptance, whole, rather than split.
+        if self
+            .pty
+            .input
+            .would_cut(
+                crate::composer_probe::epoch::Writer::Answer,
+                bytes,
+                self.gate.gate.status().fenced,
+            )
+            .is_some()
+        {
+            if let Some(ticket) = ticket {
+                ticket.refuse(ANSWER_HOLDS_CTRL_G);
+            }
+            queued();
+            return Ok(AnswerWrite::Refused);
+        }
         match self
             .pty
             .run_queued(PtyOp::Answer(bytes.to_vec(), gate), queued, ticket)
@@ -5095,24 +5243,40 @@ impl PaneWriter {
     /// drop guard of its own: the transaction is the job's one withdrawer
     /// while it runs, and the returned [`DeckJob`] leaves the in-flight count
     /// once for a take-back it sees. `None` when the writer thread is gone.
+    ///
+    /// PRD #1666 part 3 (Q35-16, core §4.8): the job starts only if, when
+    /// the writer comes to it, the bytes the PTY took leave the pane's input
+    /// where a line may start (in ground, or after a lone ESC) and the
+    /// generation hasn't retired; otherwise it is refused there, writes
+    /// nothing, and [`DeckJob::refused`] says why.
     pub(crate) fn queue_deck_job(
         &self,
         bytes: Vec<u8>,
         claim: Arc<crate::doorbell_txn::JobClaim>,
     ) -> Option<DeckJob> {
         let (tx, done) = oneshot::channel();
-        let (claim, _) = self.pty.submit_claimed(
+        let (refused_tx, refused) = oneshot::channel();
+        let (claim, _) = self.pty.submit_job(
             PtyOp::WriteAll(bytes, ByteSource::Deck, true),
             PtyReply::Async(tx),
             None,
             claim,
+            Acceptance::Now,
+            Some(start_check(deck_line_starts, refused_tx)),
         )?;
         Some(DeckJob {
             claim,
             in_flight: Arc::clone(&self.pty.in_flight),
             done,
+            refused,
             left: false,
         })
+    }
+
+    /// PRD #1666 part 3 (Q35-16, core §12.1): where the bytes the PTY took
+    /// so far leave the pane's input.
+    pub(crate) fn physical_boundary(&self) -> crate::composer_probe::planner::Boundary {
+        self.pty.physical.boundary()
     }
 }
 
@@ -5131,11 +5295,23 @@ pub(crate) struct DeckJob {
     claim: Arc<crate::doorbell_txn::JobClaim>,
     in_flight: Arc<PtyInFlight>,
     done: oneshot::Receiver<PtyJobDone>,
+    /// Why the writer refused to start it (Q35-16), once it did.
+    refused: oneshot::Receiver<DeckLineRefusal>,
     /// The take-back has left the in-flight count.
     left: bool,
 }
 
 impl DeckJob {
+    /// PRD #1666 part 3 (Q35-16, I-8): the writer came to the job and its
+    /// start condition refused it, for this reason: none of it was written,
+    /// and the writer left the in-flight count.
+    pub(crate) fn refused(&mut self) -> Option<DeckLineRefusal> {
+        if self.claim.state() != crate::doorbell_txn::ClaimState::Refused {
+            return None;
+        }
+        self.refused.try_recv().ok()
+    }
+
     /// The writer has claimed the job: some of its bytes may be in.
     pub(crate) fn started(&self) -> bool {
         self.claim.state() == crate::doorbell_txn::ClaimState::Started
@@ -5377,6 +5553,104 @@ struct PtyJob {
     /// release submitted, checked against the generation's retirement and
     /// exit just before it is written.
     released: Option<Released>,
+    /// PRD #1666 part 3 (Q35-16, I-8): the job's start condition, asked on
+    /// the writer thread when it comes to the job. None: it starts as any
+    /// job does.
+    start: Option<StartCheck>,
+    /// PRD #1666 part 3 (Q35-16): the native Ctrl+G candidates the planner
+    /// numbered in it, reported to the hazard FIFO as the PTY takes each.
+    natives: Option<crate::composer_probe::planner::NativeRun>,
+    /// PRD #1666 part 3 (Q35-16, core §4.3): the cut op it is a sub-op of.
+    part: Option<Arc<SubOps>>,
+}
+
+/// PRD #1666 part 3 (Q35-16, I-8): a job's start condition, type-erased: it
+/// asks the job's claim [`crate::doorbell_txn::JobClaim::start_if`] with the
+/// context the writer thread built, hands a refusal's reason to whoever
+/// queued the job, and answers whether the job started.
+type StartCheck =
+    Box<dyn FnOnce(&crate::doorbell_txn::JobClaim, &crate::doorbell_txn::StartCtx) -> bool + Send>;
+
+/// A [`StartCheck`] from `pred`, its refusal's reason sent, unchanged, on
+/// `refused`.
+fn start_check<R: Send + 'static>(
+    pred: impl FnOnce(&crate::doorbell_txn::StartCtx) -> Result<(), R> + Send + 'static,
+    refused: oneshot::Sender<R>,
+) -> StartCheck {
+    Box::new(move |claim, ctx| match claim.start_if(ctx, pred) {
+        crate::doorbell_txn::Start::Started => true,
+        crate::doorbell_txn::Start::Refused(reason) => {
+            let _ = refused.send(reason);
+            false
+        }
+        crate::doorbell_txn::Start::NotQueued => false,
+    })
+}
+
+/// PRD #1666 part 3 (Q35-16, core §4.3): the sub-ops a cut op became, which
+/// share its one ticket. The ticket stays with the last sub-op, which settles
+/// it once with what every sub-op took; a sub-op the PTY fails, in part or
+/// whole, ends every later one `Gone`, refused at its dequeue with nothing
+/// written. Sub-ops are written in order, so the last one settles after every
+/// earlier one has reported.
+#[derive(Debug)]
+pub(crate) struct SubOps {
+    /// The whole op's length.
+    len: usize,
+    accepted: std::sync::atomic::AtomicUsize,
+    failed: Mutex<Option<std::io::ErrorKind>>,
+}
+
+impl SubOps {
+    fn new(len: usize) -> Arc<Self> {
+        Arc::new(Self {
+            len,
+            accepted: std::sync::atomic::AtomicUsize::new(0),
+            failed: Mutex::new(None),
+        })
+    }
+
+    fn took(&self, accepted: usize, error: Option<std::io::ErrorKind>) {
+        self.accepted.fetch_add(accepted, Ordering::SeqCst);
+        if let Some(kind) = error {
+            self.failed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_insert(kind);
+        }
+    }
+
+    fn accepted(&self) -> usize {
+        self.accepted.load(Ordering::SeqCst)
+    }
+
+    fn failed(&self) -> Option<std::io::ErrorKind> {
+        *self.failed.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// PRD #1666 part 3 (Q35-16, I-8): why the writer refused to start one of the
+/// deck's own lines: core's reason type for [`start_check`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeckLineRefusal {
+    /// The bytes the PTY took so far leave the pane's input inside an escape
+    /// sequence, a string or a paste: a deck line starts only in ground or
+    /// after a lone ESC (core §4.8, [`crate::composer_probe::planner::Boundary`]).
+    OffGround,
+    /// The generation retired, a successor published on its pane included.
+    Retired,
+}
+
+/// The deck line's start condition (core §4.8): the written stream where a
+/// line may start, and the generation not retired.
+fn deck_line_starts(ctx: &crate::doorbell_txn::StartCtx) -> Result<(), DeckLineRefusal> {
+    if ctx.retired {
+        Err(DeckLineRefusal::Retired)
+    } else if !ctx.boundary.line_may_start() {
+        Err(DeckLineRefusal::OffGround)
+    } else {
+        Ok(())
+    }
 }
 
 impl PtyOp {
@@ -5506,6 +5780,9 @@ struct PtyWriterThread {
     /// PRD #1666 part 3 (Q35-06): the generation's input epoch, moved at the
     /// enqueue below, before a job reaches the thread.
     input: Arc<crate::composer_probe::epoch::GenerationInput>,
+    /// PRD #1666 part 3 (Q35-16): the physical boundary the thread's
+    /// tracker publishes, one `write(2)` return at a time.
+    physical: Arc<crate::composer_probe::planner::Physical>,
 }
 
 impl PtyWriterThread {
@@ -5514,7 +5791,7 @@ impl PtyWriterThread {
         recorder: InputRecorder,
         input: Arc<crate::composer_probe::epoch::GenerationInput>,
     ) -> Self {
-        Self::spawn_reporting_to(inner, recorder, Arc::default(), input)
+        Self::spawn_reporting_to(inner, recorder, Arc::default(), input, Arc::default())
     }
 
     /// [`Self::spawn`], counting its jobs in `in_flight` — kept across a writer
@@ -5524,38 +5801,110 @@ impl PtyWriterThread {
         recorder: InputRecorder,
         in_flight: Arc<PtyInFlight>,
         input: Arc<crate::composer_probe::epoch::GenerationInput>,
+        physical: Arc<crate::composer_probe::planner::Physical>,
     ) -> Self {
         let (jobs, queue) = std::sync::mpsc::channel::<PtyJob>();
         let thread_in_flight = in_flight.clone();
+        let thread_input = Arc::clone(&input);
+        let thread_physical = Arc::clone(&physical);
         std::thread::Builder::new()
             .name("pty-writer".to_string())
             .spawn(move || {
+                // PRD #1666 part 3 (Q35-16): the physical tracker, fed what
+                // the PTY took, one `write(2)` return at a time.
+                let mut tracker = crate::composer_probe::planner::PhysicalTracker::default();
                 while let Ok(job) = queue.recv() {
-                    if !job.state.start() {
+                    let PtyJob {
+                        op,
+                        state,
+                        reply,
+                        ticket,
+                        released,
+                        start,
+                        natives,
+                        part,
+                    } = job;
+                    // PRD #1666 part 3 (Q35-16, I-8): a job with a start
+                    // condition starts only if it holds against what this
+                    // thread knows now, in the same serialization as the
+                    // write it would make.
+                    let started = match start {
+                        Some(check) => check(
+                            &state,
+                            &crate::doorbell_txn::StartCtx {
+                                boundary: tracker.boundary(),
+                                retired: recorder.retired.load(Ordering::SeqCst),
+                                now: Instant::now(),
+                            },
+                        ),
+                        None => state.start(),
+                    };
+                    if !started {
                         // Withdrawn by a caller that stopped waiting, or by
-                        // the doorbell transaction that queued it; whoever
-                        // took it back has left the in-flight count.
+                        // the doorbell transaction that queued it: whoever
+                        // took it back has left the in-flight count. Refused
+                        // by its start condition: this thread leaves it. Either
+                        // way it is dropped here, at its dequeue, so its reply
+                        // channel closes now and nothing else holds it (I-6′).
+                        if state.state() == crate::doorbell_txn::ClaimState::Refused {
+                            if let Some(ticket) = ticket {
+                                ticket.settle_refused("not-started");
+                            }
+                            thread_in_flight.leave();
+                        }
                         continue;
                     }
                     // PRD #1666 part 3 (Q35-15, core §8.1): a held op
                     // released before its generation retired or its target
                     // exited, and reached after, ends unwritten: refused
                     // once, its connection told (R-U2-02/03).
-                    if let Some(released) = &job.released
+                    if let Some(released) = &released
                         && (recorder.retired.load(Ordering::SeqCst)
                             || released.exited.load(Ordering::SeqCst))
                     {
                         released.tell("exited");
-                        if let Some(ticket) = job.ticket {
-                            ticket.settle_refused("exited");
+                        if let Some(ticket) = ticket {
+                            match &part {
+                                Some(part) if part.accepted() > 0 => ticket.settle_written(
+                                    part.len,
+                                    part.accepted(),
+                                    Some(std::io::ErrorKind::BrokenPipe),
+                                ),
+                                _ => ticket.settle_refused("exited"),
+                            }
                         }
                         thread_in_flight.leave();
                         continue;
                     }
-                    let len = job.op.len();
-                    let done = match job.op {
+                    // PRD #1666 part 3 (Q35-16, core §4.3): an earlier sub-op
+                    // of the same cut op failed, so this one ends `Gone`,
+                    // unwritten; the ticket, which this last sub-op carries,
+                    // is refused once with that failure.
+                    if let Some(part) = &part
+                        && let Some(kind) = part.failed()
+                    {
+                        if let Some(ticket) = ticket {
+                            ticket.settle_written(part.len, part.accepted(), Some(kind));
+                        }
+                        thread_in_flight.leave();
+                        continue;
+                    }
+                    let mut tracking = Tracking {
+                        tracker: &mut tracker,
+                        physical: &thread_physical,
+                        natives,
+                        input: &thread_input,
+                    };
+                    let len = op.len();
+                    let done = match op {
                         PtyOp::Write(buf, source) => {
-                            match write_once_recorded(inner.as_mut(), &buf, &recorder, source) {
+                            match write_once_recorded(
+                                inner.as_mut(),
+                                &buf,
+                                &recorder,
+                                source,
+                                &mut tracking,
+                            ) {
                                 Ok(n) => PtyJobDone {
                                     accepted: n,
                                     result: Ok(()),
@@ -5569,8 +5918,13 @@ impl PtyWriterThread {
                             }
                         }
                         PtyOp::WriteAll(buf, source, flush) => {
-                            let mut done =
-                                write_all_recorded(inner.as_mut(), &buf, &recorder, source);
+                            let mut done = write_all_recorded(
+                                inner.as_mut(),
+                                &buf,
+                                &recorder,
+                                source,
+                                &mut tracking,
+                            );
                             if flush {
                                 done.flushed = Some(inner.flush());
                             }
@@ -5583,6 +5937,7 @@ impl PtyWriterThread {
                                     &buf,
                                     &recorder,
                                     ByteSource::Answer,
+                                    &mut tracking,
                                 );
                                 done.flushed = Some(inner.flush());
                                 done
@@ -5612,32 +5967,40 @@ impl PtyWriterThread {
                     // claiming the agent exited unless it did (fix 2,
                     // R-U2-01); its ticket says how much went in, below,
                     // once.
-                    if let Some(released) = &job.released
+                    if let Some(released) = &released
                         && done.result.is_err()
                     {
                         released.tell_failed(recorder.retired.load(Ordering::SeqCst));
                     }
+                    // PRD #1666 part 3 (Q35-16): a sub-op adds what it took
+                    // to its op, and a failure ends the op's later sub-ops.
+                    let (len, accepted) = match &part {
+                        Some(part) => {
+                            part.took(
+                                done.accepted,
+                                done.result.as_ref().err().map(std::io::Error::kind),
+                            );
+                            (part.len, part.accepted())
+                        }
+                        None => (len, done.accepted),
+                    };
                     // PRD #1666 part 3, round 5-wake: the human operation's
                     // ticket settles with what the PTY took. A voice answer
                     // superseded before its keys were written wrote nothing.
-                    if let Some(ticket) = job.ticket {
+                    if let Some(ticket) = ticket {
                         let error = done.result.as_ref().err();
                         if error.is_some_and(|e| {
                             e.get_ref().is_some_and(|i| i.is::<AnswerSuperseded>())
                         }) {
                             ticket.settle_cancelled();
                         } else {
-                            ticket.settle_written(
-                                len,
-                                done.accepted,
-                                error.map(std::io::Error::kind),
-                            );
+                            ticket.settle_written(len, accepted, error.map(std::io::Error::kind));
                         }
                     }
                     // Answered BEFORE it counts as finished, so a caller whose
                     // bound runs out in between finds the answer rather than
                     // reporting a finished write as stalled.
-                    match job.reply {
+                    match reply {
                         PtyReply::Async(tx) => {
                             let _ = tx.send(done);
                         }
@@ -5653,6 +6016,7 @@ impl PtyWriterThread {
             jobs,
             in_flight,
             input,
+            physical,
         }
     }
 
@@ -5697,7 +6061,7 @@ impl PtyWriterThread {
         Arc<crate::doorbell_txn::JobClaim>,
         Option<crate::ingress_ledger::TicketHandle>,
     )> {
-        self.submit_job(op, reply, ticket, state, Acceptance::Now)
+        self.submit_job(op, reply, ticket, state, Acceptance::Now, None)
     }
 
     /// PRD #1666 part 3 (Q35-15): submit an op a fence held. It moved the
@@ -5706,7 +6070,6 @@ impl PtyWriterThread {
     /// and `exited`, its target's exit token, before writing it. Its frame's
     /// notice goes with it, so a refusal or a failed write on the thread
     /// reaches its connection (R-U2-03).
-    #[cfg(any(test, feature = "e2e"))]
     fn submit_released(&self, frame: UserFrame, exited: Arc<AtomicBool>) {
         let (tx, _) = oneshot::channel();
         let _ = self.submit_job(
@@ -5714,10 +6077,14 @@ impl PtyWriterThread {
             PtyReply::Async(tx),
             frame.ticket,
             Arc::default(),
-            Acceptance::Released(Released {
-                exited,
-                notice: frame.notice,
-            }),
+            Acceptance::Released(
+                Released {
+                    exited,
+                    notice: frame.notice,
+                },
+                frame.part,
+            ),
+            None,
         );
     }
 
@@ -5728,6 +6095,7 @@ impl PtyWriterThread {
         ticket: Option<crate::ingress_ledger::TicketGuard>,
         state: Arc<crate::doorbell_txn::JobClaim>,
         acceptance: Acceptance,
+        start: Option<StartCheck>,
     ) -> Option<(
         Arc<crate::doorbell_txn::JobClaim>,
         Option<crate::ingress_ledger::TicketHandle>,
@@ -5738,11 +6106,15 @@ impl PtyWriterThread {
             "a claim is queued once"
         );
         let accept_now = matches!(acceptance, Acceptance::Now);
-        let released = match acceptance {
-            Acceptance::Released(released) => Some(released),
+        let (released, part, planned) = match acceptance {
+            Acceptance::Released(released, part) => (Some(released), part, None),
+            Acceptance::Planned(natives) => {
+                self.in_flight.count.fetch_add(1, Ordering::SeqCst);
+                (None, None, natives)
+            }
             Acceptance::Now | Acceptance::PassedAhead => {
                 self.in_flight.count.fetch_add(1, Ordering::SeqCst);
-                None
+                (None, None, None)
             }
         };
         let queue = |ticket: Option<crate::ingress_ledger::JobTicket>| {
@@ -5754,11 +6126,32 @@ impl PtyWriterThread {
             // job is sent, so the thread can't start a job whose move isn't
             // visible. Under the ledger's lock on the ticketed branch
             // (ledger, then the epoch's leaf lock), alone on the other. A
-            // released job moved it when its fence held it, and a reply that
-            // passed ahead was accepted, exempt, by the gate's decision.
+            // released job moved it when its fence held it, a reply that
+            // passed ahead was accepted, exempt, by the gate's decision, and
+            // a planned one by the planner as the gate let it through.
+            //
+            // Q35-16: a person's op written now around the gate is the
+            // planner's too, which numbers its native candidates in the same
+            // hold; nothing around the gate can be cut.
+            let mut natives = planned;
             if accept_now && let Some((writer, bytes)) = op.epoch_writer() {
-                self.input.enqueue(writer, bytes);
+                use crate::composer_probe::epoch::{Plan, Writer};
+                if matches!(writer, Writer::Human | Writer::Answer) {
+                    natives = self
+                        .input
+                        .enqueue_planned(writer, bytes, Plan::Bypass)
+                        .natives;
+                } else {
+                    self.input.enqueue(writer, bytes);
+                }
                 self.input.accepted_parks();
+            }
+            // A2 §4.4: the last native number is on the arm page before the
+            // job can reach the writer. The page's own lock is taken here,
+            // under the ledger's on the ticketed branch, and takes nothing of
+            // the ledger's.
+            if let Some(natives) = &natives {
+                self.input.publish_native(natives.last);
             }
             let job = PtyJob {
                 op,
@@ -5766,6 +6159,9 @@ impl PtyWriterThread {
                 reply,
                 ticket,
                 released,
+                start,
+                natives: natives.map(crate::composer_probe::planner::Natives::run),
+                part,
             };
             if let Err(std::sync::mpsc::SendError(job)) = self.jobs.send(job) {
                 // Q35-15 fix 2 (R-U2-02): nobody awaits a released job, so
@@ -5814,9 +6210,14 @@ impl PtyWriterThread {
         acceptance: Acceptance,
     ) -> PtyJobOutcome {
         let (tx, mut rx) = oneshot::channel();
-        let Some((state, handle)) =
-            self.submit_job(op, PtyReply::Async(tx), ticket, Arc::default(), acceptance)
-        else {
+        let Some((state, handle)) = self.submit_job(
+            op,
+            PtyReply::Async(tx),
+            ticket,
+            Arc::default(),
+            acceptance,
+            None,
+        ) else {
             return PtyJobOutcome::Gone;
         };
         let mut guard = WithdrawUnlessAnswered {
@@ -5992,10 +6393,12 @@ fn write_once_recorded(
     buf: &[u8],
     recorder: &InputRecorder,
     source: ByteSource,
+    tracking: &mut Tracking<'_>,
 ) -> std::io::Result<usize> {
     #[cfg(test)]
     recorder.pause_at(PtyWritePause::BeforeWrite);
     let n = w.write(buf)?;
+    tracking.written(&buf[..n.min(buf.len())]);
     #[cfg(test)]
     recorder.pause_at(PtyWritePause::AfterWrite);
     let turns = recorder.turns_after_write();
@@ -6003,6 +6406,28 @@ fn write_once_recorded(
     recorder.pause_at(PtyWritePause::BeforeRecord);
     recorder.record(source, &buf[..n], turns);
     Ok(n)
+}
+
+/// PRD #1666 part 3 (Q35-16, I-6 without its timestamp): what the writer
+/// thread does with each `write(2)` return besides recording it: the physical
+/// tracker reads the bytes the PTY took and publishes its boundary, and the
+/// job's native candidates the planner numbered enter the hazard FIFO as the
+/// PTY takes each one, by the planner's reading, replayed.
+struct Tracking<'a> {
+    tracker: &'a mut crate::composer_probe::planner::PhysicalTracker,
+    physical: &'a crate::composer_probe::planner::Physical,
+    natives: Option<crate::composer_probe::planner::NativeRun>,
+    input: &'a crate::composer_probe::epoch::GenerationInput,
+}
+
+impl Tracking<'_> {
+    fn written(&mut self, written: &[u8]) {
+        self.tracker.written(written, self.physical);
+        if let Some(natives) = self.natives.as_mut() {
+            let input = self.input;
+            natives.written(written, |seq| input.enter_native(seq, Instant::now()));
+        }
+    }
 }
 
 /// Issue #525: [`write_all_tracked`]'s loop, recording each accepted slice as
@@ -6013,10 +6438,11 @@ fn write_all_recorded(
     buf: &[u8],
     recorder: &InputRecorder,
     source: ByteSource,
+    tracking: &mut Tracking<'_>,
 ) -> PtyJobDone {
     let mut written = 0usize;
     while written < buf.len() {
-        match write_once_recorded(w, &buf[written..], recorder, source) {
+        match write_once_recorded(w, &buf[written..], recorder, source, tracking) {
             Ok(0) => {
                 return PtyJobDone {
                     accepted: written,
@@ -6048,11 +6474,26 @@ fn write_all_recorded(
 /// Every byte written through this impl is a user's — see [`PaneWriter`]. It
 /// blocks the calling thread until the PTY answers, as a direct write did;
 /// async code takes [`PaneWriter::write_user`] instead (issue #525).
+///
+/// PRD #1666 part 3 (Q35-16, core §4.3): while a check is open or a liability
+/// is out, a Ctrl+G candidate cuts a write: it hands the PTY the bytes
+/// through the candidate and returns that short count, which
+/// [`std::io::Write`] allows, and the caller's next call carries the rest,
+/// which the planner reads then, once. Nothing cuts otherwise.
 impl std::io::Write for PaneWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let cut = self
+            .pty
+            .input
+            .would_cut(
+                crate::composer_probe::epoch::Writer::Human,
+                buf,
+                self.gate.gate.status().fenced,
+            )
+            .unwrap_or(buf.len());
         let done = self
             .pty
-            .run_blocking(PtyOp::Write(buf.to_vec(), ByteSource::User))
+            .run_blocking(PtyOp::Write(buf[..cut].to_vec(), ByteSource::User))
             .ok_or_else(PtyWriterThread::gone)?;
         done.result.map(|()| done.accepted)
     }
@@ -6531,7 +6972,16 @@ pub(crate) enum AnswerWrite {
     /// The question changed while the keys were queued: nothing was written
     /// (audit T1).
     Superseded,
+    /// PRD #1666 part 3 (Q35-16, core §4.3): the keys hold a Ctrl+G candidate
+    /// while a check is open or a liability is out, so they were refused at
+    /// acceptance: splitting them would break the answer's all-or-nothing
+    /// write. Nothing was written.
+    Refused,
 }
+
+/// PRD #1666 part 3 (Q35-16, core §4.3): why a voice answer whose keys hold a
+/// Ctrl+G candidate is refused while a check is open or a liability is out.
+pub(crate) const ANSWER_HOLDS_CTRL_G: &str = "the answer contains a key the deck can't hold safely";
 
 /// The error a PTY thread reports for an answer whose [`AnswerGate`] no longer
 /// held — told apart from a failed write by its type.
@@ -7153,6 +7603,12 @@ mod input_epoch_tests;
 #[cfg(test)]
 #[path = "agent_pty_fence_tests.rs"]
 mod fence_tests;
+
+/// PRD #1666 part 3 (Q35-16): the planner and the physical tracker on the
+/// real pane writer.
+#[cfg(test)]
+#[path = "agent_pty_planner_tests.rs"]
+mod planner_tests;
 
 /// PRD #1666 part 3 (Q35-18a): the redraw estimate and `B` at profile
 /// adoption on the real bus and registry.
@@ -9313,6 +9769,7 @@ impl AgentPtyRegistry {
         {
             Ok(AnswerWrite::Written(at)) => Ok(at),
             Ok(AnswerWrite::Superseded) => Err("the question changed before the keys were typed"),
+            Ok(AnswerWrite::Refused) => Err(ANSWER_HOLDS_CTRL_G),
             Err(_) => Err("writing to the agent's terminal failed"),
         }
     }
@@ -16615,7 +17072,9 @@ impl AgentPtyRegistry {
         let (displaced, recorder) = rx.await.expect("the displaced writer comes back");
         let in_flight = guard.pty.in_flight.clone();
         let input = guard.pty.input.clone();
-        guard.pty = PtyWriterThread::spawn_reporting_to(inner, recorder, in_flight, input);
+        let physical = guard.pty.physical.clone();
+        guard.pty =
+            PtyWriterThread::spawn_reporting_to(inner, recorder, in_flight, input, physical);
         displaced
     }
 
@@ -25910,6 +26369,49 @@ mod spawn_tests {
         registry.shutdown_all();
     }
 
+    /// Scenario: The user types an unfinished escape sequence (`ESC [`) into the model editor, then a ring starts. The ring waits for the sequence to finish rather than typing into it, writing nothing; once its bound passes it ends with nothing written, the pane holding only the user's bytes. The user finishes the sequence (`C`, cursor right), the editor redraws its empty composer, and the next ring types and submits its line after them.
+    #[spec("inbox/probe/076")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn probe_076_a_ring_waits_for_the_users_escape_sequence_to_finish() {
+        use crate::doorbell_txn::{NotTyped, Outcome};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-off-ground", OnEnter::Submit);
+        registry.set_pty_write_stall_bound_for_test(Duration::from_millis(300));
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, b"\x1b[")
+            .await
+            .unwrap();
+        typed_until(&editor, |t| t == b"\x1b[").await;
+        let started = Instant::now();
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::NothingWritten(NotTyped::OffGround)),
+            "{report:?}"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(300), "it waited");
+        assert_eq!(editor.typed(), b"\x1b[", "nothing typed into the sequence");
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, b"C")
+            .await
+            .unwrap();
+        typed_until(&editor, |t| t == b"\x1b[C").await;
+        editor
+            .bus
+            .push(claude_screen("", &[], false, EDITOR_COLS as usize));
+        editor.wait_clean();
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::Submitted),
+            "{report:?}"
+        );
+        let typed = editor.typed();
+        assert!(typed.starts_with(b"\x1b[C"), "{typed:?}");
+        assert!(typed_line(&typed[3..]).is_some(), "{typed:?}");
+        registry.shutdown_all();
+    }
+
     /// Wait (bounded) until the model editor has been typed something that
     /// satisfies `done`.
     async fn typed_until(editor: &ModelEditor, done: impl Fn(&[u8]) -> bool) {
@@ -28973,6 +29475,7 @@ mod spawn_tests {
                     jobs: pty_jobs,
                     in_flight,
                     input,
+                    physical: Arc::default(),
                 };
                 thread.run_blocking(PtyOp::WriteAll(b"human".to_vec(), ByteSource::User, true))
             }
@@ -29037,6 +29540,7 @@ mod spawn_tests {
                     jobs: pty_jobs,
                     in_flight,
                     input,
+                    physical: Arc::default(),
                 };
                 thread.run_blocking(PtyOp::WriteAll(b"human".to_vec(), ByteSource::User, true))
             }

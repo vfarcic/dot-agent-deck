@@ -33,6 +33,16 @@
 //! pass ahead ([`GenerationInput::pass_ahead`]), and a fence closes only
 //! through the `e2e` build's control verb until a probe opens one (Q35-20).
 //!
+//! **The planner (Q35-16).** The input framing kept here is the logical
+//! planner of `super::planner`: [`GenerationInput::enqueue_planned`] reads a
+//! person's op once, at its acceptance, against the ledger as it stands,
+//! and in the same hold either finds its first cut (a segment is open, or
+//! the records hold a liability) or numbers its native Ctrl+G candidates in
+//! the hazard FIFO's sequence. The planner reads the records' count for
+//! that, and nothing in production raises it before activation, so there it
+//! only numbers. The FIFO's entries come later, one per candidate the PTY
+//! took ([`GenerationInput::enter_native`]).
+//!
 //! **The lock.** One mutex per generation at rank [`crate::lock_rank::R6`],
 //! above every other ranked lock, so the debug checker refuses any ranked
 //! lock taken under it. The daemon takes it under the registry's record
@@ -55,12 +65,19 @@
 //! **What it costs today.** Nothing reads it to decide, but it isn't free: a
 //! person's op is read as a report and every op is tokenized under this
 //! lock, inside the ingress lock when ticketed, and an output push that
-//! carries notes waits for it while holding the output lock.
+//! carries notes waits for it while holding the output lock. Q35-16 adds no
+//! decision read under it: a person's op is read as a report and tokenized
+//! as before, its candidates found and numbered in that same pass, plus a
+//! clone of the framing when it numbers. Native numbers are published to the
+//! arm page with this lock released. Outside it, a cut op's rest is read
+//! again, from the cut's saved state, when it is released, and the writer
+//! thread replays an op with native candidates over what the PTY took.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use super::framing::{Csi, Event, Framing, Report, Str, StringKind, Token, whole_report};
+use super::planner::{Cut, Natives, first_cut, is_candidate};
 use super::query_ledger::{
     Backlog, CprWaitEnd, EntryView, HazardFifo, HazardPop, Pop, QueryHistory, QueryKind,
     QueryLedger,
@@ -318,18 +335,94 @@ struct State {
     retired: bool,
 }
 
+/// How the planner reads an op at its acceptance (Q35-16, core §4.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Plan {
+    /// A closed fence holds it: a segment is open, so its first Ctrl+G
+    /// candidate cuts it, and nothing in it is native.
+    Held,
+    /// Written now through the gate: its first candidate cuts it while a
+    /// liability is out; with none out, every candidate is native.
+    Open,
+    /// Written now by a path that doesn't pass the gate: nothing can be cut,
+    /// and its candidates are native while no liability is out.
+    Bypass,
+}
+
+/// What the planner decided for one op, once, at its acceptance.
+#[derive(Debug, Clone)]
+pub struct Planned {
+    pub enqueued: Enqueued,
+    /// The first cut, when its candidates cut.
+    pub cut: Option<Cut>,
+    /// The native candidates it carries, numbered.
+    pub natives: Option<Natives>,
+}
+
 /// [`GenerationInput::enqueue`] under a hold the caller already has.
 fn enqueue_locked(state: &mut State, writer: Writer, bytes: &[u8]) -> Enqueued {
+    plan_locked(state, writer, bytes, None).enqueued
+}
+
+/// Whether a liability is out on the generation: the count its records hold,
+/// which is what the arm page publishes.
+fn liability_out(state: &State) -> bool {
+    !state.retired && state.records.as_ref().is_some_and(|r| r.count() > 0)
+}
+
+/// Whether `bytes` from `writer`, read from the framing as it stands, are one
+/// whole colour reply to a query the ledger keeps: the one op whose ending
+/// BEL is no candidate (D3′, A2 §5).
+fn solicited_reply(state: &State, writer: Writer, bytes: &[u8]) -> bool {
+    writer == Writer::Human && solicited_whole(state, whole_report(&state.framing, bytes))
+}
+
+/// [`solicited_reply`] for an op whose whole report was read already.
+fn solicited_whole(state: &State, whole: Option<Report>) -> bool {
+    matches!(
+        whole,
+        Some(report @ Report::OscColour { .. })
+            if QueryKind::answered_by(report).is_some_and(|k| state.ledger.solicited(k))
+    )
+}
+
+/// [`GenerationInput::enqueue_planned`] under a hold the caller already has;
+/// `plan` `None` plans nothing.
+fn plan_locked(state: &mut State, writer: Writer, bytes: &[u8], plan: Option<Plan>) -> Planned {
     // Only a person's op can be exempt, so no other is read as a report.
-    let exempt = match writer {
-        Writer::Human => whole_report(&state.framing, bytes).filter(|&report| {
-            state.modes.enabled(report)
-                || QueryKind::answered_by(report).is_some_and(|k| state.ledger.exempts(k))
-        }),
+    let whole = match writer {
+        Writer::Human => whole_report(&state.framing, bytes),
         _ => None,
     };
-    for &byte in bytes {
+    let exempt = whole.filter(|&report| {
+        state.modes.enabled(report)
+            || QueryKind::answered_by(report).is_some_and(|k| state.ledger.exempts(k))
+    });
+    // A person's keys and a voice answer's are the planner's; the deck's own
+    // bytes open no segment and are never native.
+    let person = matches!(writer, Writer::Human | Writer::Answer);
+    let liability = liability_out(state);
+    let (cutting, numbering) = match plan.filter(|_| person) {
+        None => (false, false),
+        Some(Plan::Held) => (true, false),
+        Some(Plan::Open) => (liability, !liability),
+        Some(Plan::Bypass) => (false, !liability),
+    };
+    // From ground, an op with neither a BEL nor an ESC holds no candidate,
+    // so it has nothing to number and its start state needn't be kept.
+    let numbering = numbering
+        && !state.retired
+        && !(state.framing.at_ground() && !bytes.iter().any(|&b| b == 0x07 || b == 0x1b));
+    let solicited = (cutting || numbering) && solicited_whole(state, whole);
+    let start = numbering.then(|| state.framing.clone());
+    let mut cut = None;
+    let mut numbered: Option<(u64, u64)> = None;
+    for (i, &byte) in bytes.iter().enumerate() {
+        let mut candidates = 0usize;
         state.framing.feed(byte, |token| {
+            if is_candidate(&token, solicited) {
+                candidates += 1;
+            }
             let answered = token
                 .report()
                 .filter(|_| !token.in_paste)
@@ -343,8 +436,24 @@ fn enqueue_locked(state: &mut State, writer: Writer, bytes: &[u8]) -> Enqueued {
                 }
             }
         });
+        if candidates == 0 {
+            continue;
+        }
+        if cutting && cut.is_none() {
+            cut = Some(Cut {
+                at: i + 1,
+                resume: state.framing.clone(),
+            });
+        }
+        if numbering {
+            for _ in 0..candidates {
+                if let Some(seq) = state.hazards.number() {
+                    numbered = Some(numbered.map_or((seq, seq), |(first, _)| (first, seq)));
+                }
+            }
+        }
     }
-    match exempt {
+    let enqueued = match exempt {
         Some(report) => Enqueued::Exempt(report),
         None => {
             let owner = match writer {
@@ -353,6 +462,13 @@ fn enqueue_locked(state: &mut State, writer: Writer, bytes: &[u8]) -> Enqueued {
             };
             Enqueued::Moved(state.epoch.record(owner))
         }
+    };
+    Planned {
+        enqueued,
+        cut,
+        natives: numbered
+            .zip(start)
+            .map(|((first, last), start)| Natives { first, last, start }),
     }
 }
 
@@ -365,10 +481,25 @@ pub struct GenerationInput {
     /// it hands over a push's notes, outside the lock: the offset a query is
     /// noted at, and a fence's trigger (Q35-15).
     output_offset: AtomicU64,
+    /// Where native numbers are published (Q35-16): called with no lock of
+    /// this module held.
+    native_page: NativePage,
     /// Test seam: parks an acceptance between the epoch's move and the job
     /// becoming visible, so a test can see the one before the other.
     #[cfg(test)]
     accept_park: std::sync::Mutex<Option<AcceptPark>>,
+}
+
+/// The generation's native-number publisher, once its observer runs.
+#[derive(Default)]
+struct NativePage(std::sync::OnceLock<Box<dyn Fn(u64) + Send + Sync>>);
+
+impl std::fmt::Debug for NativePage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("NativePage")
+            .field(&self.0.get().is_some())
+            .finish()
+    }
 }
 
 /// Test seam: one armed park at acceptance ([`GenerationInput::park_next_acceptance`]).
@@ -413,6 +544,7 @@ impl GenerationInput {
                 retired: false,
             }),
             output_offset: AtomicU64::new(0),
+            native_page: NativePage::default(),
             #[cfg(test)]
             accept_park: std::sync::Mutex::new(None),
         }
@@ -491,6 +623,59 @@ impl GenerationInput {
     /// epoch unless it is an exempt report.
     pub fn enqueue(&self, writer: Writer, bytes: &[u8]) -> Enqueued {
         enqueue_locked(&mut self.state.lock_recovering(), writer, bytes)
+    }
+
+    /// [`Self::enqueue`], with the planner's decision for the op's Ctrl+G
+    /// candidates made in the same hold (Q35-16, core §4.3): the classification
+    /// is the ledger's as it stands now, and nothing reads it again for this
+    /// op. Native candidates are numbered here, in acceptance order; the
+    /// caller publishes the last number before it submits the op
+    /// ([`Self::publish_native`]).
+    pub fn enqueue_planned(&self, writer: Writer, bytes: &[u8], plan: Plan) -> Planned {
+        plan_locked(&mut self.state.lock_recovering(), writer, bytes, Some(plan))
+    }
+
+    /// Where `bytes` from `writer` would be cut, read from the framing as it
+    /// stands, while a segment is open (`segment_open`) or a liability is
+    /// out: the end of their first candidate. `None` when nothing cuts.
+    /// Changes nothing: a caller that writes only up to the cut enqueues
+    /// those bytes alone, so the rest is read once, when it comes again.
+    pub fn would_cut(&self, writer: Writer, bytes: &[u8], segment_open: bool) -> Option<usize> {
+        let state = self.state.lock_recovering();
+        if !matches!(writer, Writer::Human | Writer::Answer)
+            || !(segment_open || liability_out(&state))
+        {
+            return None;
+        }
+        let solicited = solicited_reply(&state, writer, bytes);
+        first_cut(&state.framing, bytes, solicited).map(|cut| cut.at)
+    }
+
+    /// Native candidate `seq` was physically accepted at `now` (the physical
+    /// tracker's report, A1 §3.3): it enters the hazard FIFO, `Latched` when
+    /// `B` holds now. Nothing once retired.
+    pub fn enter_native(&self, seq: u64, now: Instant) {
+        let mut guard = self.state.lock_recovering();
+        let state = &mut *guard;
+        if state.retired {
+            return;
+        }
+        let backlog = state.backlog.holds();
+        state.hazards.enter(seq, now, backlog);
+    }
+
+    /// Where native numbers are published: the generation's arm page, once
+    /// its observer runs. Set once; `false` when one was set already.
+    pub fn set_native_page(&self, page: Box<dyn Fn(u64) + Send + Sync>) -> bool {
+        self.native_page.0.set(page).is_ok()
+    }
+
+    /// Publish `seq`, the last native number of an op about to be submitted
+    /// (A2 §4.4), with no lock of this module held. Nothing with no page.
+    pub fn publish_native(&self, seq: u64) {
+        if let Some(page) = self.native_page.0.get() {
+            page(seq);
+        }
     }
 
     /// An edit the deck learned of from outside the PTY (an editor session

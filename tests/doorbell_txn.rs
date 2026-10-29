@@ -8,12 +8,13 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use dot_agent_deck::composer_probe::planner::Boundary;
 use dot_agent_deck::doorbell_screen::TOKEN_HEAD_CHARS;
 use dot_agent_deck::doorbell_txn::{
     Action, Admission, AttemptCounter, AttemptRing, Caps, Cause, ComposerView, Event, Frame, Job,
     JobClaim, Latch, LatchCell, NotTyped, Outcome, Publisher, Resolution, RingToken, Seam,
-    SeamRead, Shown, TOKEN_ALPHABET, TOKEN_DRAWS, TXN_MAX, Txn, admit, hook_evidence, pick_token,
-    project, ring_entry, seam_until,
+    SeamRead, Shown, Start, StartCtx, TOKEN_ALPHABET, TOKEN_DRAWS, TXN_MAX, Txn, admit,
+    hook_evidence, pick_token, project, ring_entry, seam_until,
 };
 use dot_agent_deck::inbox::MessageId;
 use spec::spec;
@@ -61,6 +62,9 @@ enum Write {
     /// free after the release, and either way only if it was not taken back
     /// first.
     NeverStarts,
+    /// The writer comes to it and its start condition refuses it (PRD
+    /// #1666 part 3, Q35-16): none of it is written.
+    Refused,
 }
 
 type Change = Box<dyn FnOnce(&mut World)>;
@@ -276,6 +280,21 @@ impl World {
         let write = self.writes.pop_front().unwrap_or(Write::Whole);
         if write == Write::NeverStarts {
             self.queued = Some((job.clone(), claim));
+        } else if write == Write::Refused {
+            let ctx = StartCtx {
+                boundary: Boundary::Inside,
+                retired: false,
+                now: self.now,
+            };
+            let refused = claim.start_if(&ctx, |c| {
+                if c.boundary.line_may_start() {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            });
+            assert_eq!(refused, Start::Refused(()));
+            self.events.push_back(Event::JobNotStarted);
         } else if claim.start() {
             self.run_job(job, write);
         } else {
@@ -323,6 +342,7 @@ impl World {
         let (bytes, shown) = Self::bytes(job);
         match write {
             Write::NeverStarts => unreachable!("a job that never starts stays queued"),
+            Write::Refused => unreachable!("a refused job is never run"),
             Write::EndsUnseen { after, took } => {
                 if took {
                     self.pane.push(shown);
@@ -2119,6 +2139,31 @@ fn doorbell_058_a_head_echo_missing_or_not_the_deck_s_types_nothing_more() {
     assert_eq!(outcome, Ok(Outcome::Submitted));
     assert_eq!(arriving.pane.len(), 3, "{:?}", arriving.pane);
     assert_eq!(arriving.pane[0], head_of(&line));
+}
+
+/// Scenario: The writer refuses to start a ring's first job because the pane's input is inside a sequence the user hasn't finished; separately, it refuses the Enter after the line was typed. The first attempt ends with nothing written for that reason and writes nothing; the second never sends its Enter and withdraws the line it typed.
+#[spec("inbox/probe/075")]
+#[test]
+fn probe_075_a_refused_deck_job_is_nothing_written_before_the_line_and_unresolved_after() {
+    let mut refused = World::new();
+    refused.writes.push_back(Write::Refused);
+    let (outcome, _) = run(&mut refused);
+    assert_eq!(outcome, Ok(Outcome::NothingWritten(NotTyped::OffGround)));
+    assert!(refused.pane.is_empty(), "{:?}", refused.pane);
+    assert!(refused.taken_back.is_empty(), "the writer accounted for it");
+
+    let mut enter = World::new();
+    enter.writes.push_back(Write::Whole);
+    enter.writes.push_back(Write::Refused);
+    let (outcome, line) = run(&mut enter);
+    assert_eq!(outcome, Ok(Outcome::Withdrawn));
+    assert_eq!(enter.pane.first(), Some(&line));
+    assert!(
+        enter.pane[1..].iter().all(|w| w.starts_with("<DEL")),
+        "{:?}",
+        enter.pane
+    );
+    assert!(!enter.pane.iter().any(|w| w == "<CR>"), "no Enter");
 }
 
 /// Scenario: The writer takes 1 to 7 bytes of the token head, then none of it; then all of it with its flush failing; then the whole head with the admission lost while its echo is awaited. Part of a head is never deleted and nothing more is written (Unresolved); none of it is nothing written; a whole head is withdrawn with eight deletes and the placeholder's confirmation (Withdrawn), and the rest is never typed.

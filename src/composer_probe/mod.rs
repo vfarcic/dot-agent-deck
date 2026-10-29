@@ -25,14 +25,19 @@
 //! Ctrl+G on its external editor ([`keymap`], no caller yet), and the fence
 //! gate every attach frame passes through on its way to the PTY ([`gate`]),
 //! which holds a person's input while a fence is closed and lets a reply to a
-//! later query pass ahead. The daemon feeds the hook every byte an agent writes,
+//! later query pass ahead, and the two framings of a pane's input: the
+//! planner that cuts or numbers each Ctrl+G candidate at acceptance and the
+//! tracker of what the PTY took, at whose boundary alone a deck line starts
+//! ([`planner`]). The daemon feeds the hook every byte an agent writes,
 //! moves the epoch at acceptance, and decides installation at
 //! every spawn, which installs nothing outside the `e2e` build's assumption
 //! until activation. For an installed generation it keeps the invocation
 //! records, settles the permission to arm, answers its helper and observes
 //! it; nothing publishes a liability or closes a fence outside the `e2e`
-//! build's control verb, and nothing reads the epoch, the records or a
-//! segment to admit or hold anything yet.
+//! build's control verb, and nothing reads the epoch or a segment to admit
+//! or hold anything yet. The planner reads the records' liability count, to
+//! cut a person's input while one is out, which in production it never is
+//! before activation.
 
 pub mod arm;
 #[cfg(target_os = "linux")]
@@ -50,6 +55,7 @@ pub mod keymap;
 pub mod observe;
 pub mod paste_mode;
 pub mod path_rule;
+pub mod planner;
 pub mod query_ledger;
 pub mod query_wait;
 pub mod record;

@@ -47,6 +47,17 @@
 //! back what is held, and it ends nothing already submitted: a released job
 //! that has started stays in flight until the writer reports it.
 //!
+//! **Cuts (Q35-16, core §4.3).** The planner reads each op at acceptance
+//! and, while a segment is open or a liability is out, cuts it after its
+//! first Ctrl+G candidate. A release then goes only as far as the first cut
+//! ([`Gate::release_cut`]): the prefix through it is written, and the
+//! candidate opens the next segment, the fence staying closed behind it with
+//! the rest held in order. An op the gate lets through with no fence, cut
+//! because a liability is out, closes one at its cut ([`Gate::cut_open`]).
+//! Each cut makes one more sub-op, held in the queue's place of the op, so
+//! sub-ops count against [`FENCE_OPS_CAP`] as the op did, and a frame full of
+//! candidates is split one cut at a time.
+//!
 //! **The lock.** One mutex, a leaf: nothing calls out of it but the two
 //! closures [`Gate::admit`] is given, which classify against and move the
 //! epoch (`R6`, the top rank). Acceptance and release run under the pane
@@ -63,6 +74,21 @@ pub const FENCE_CAP: usize = 1024 * 1024;
 
 /// The most ops a fence holds (R6 §5.1).
 pub const FENCE_OPS_CAP: usize = 1024;
+
+/// What a release does with one held op (Q35-16, core §4.3), as its caller's
+/// `split` decides from the cut the planner made at its acceptance.
+#[derive(Debug)]
+pub enum Cutting<T> {
+    /// No cut: it goes, and the release goes on to the next op.
+    Whole,
+    /// Its cut is at its last byte: it goes whole, and its Ctrl+G candidate
+    /// opens a new segment, behind which everything after it stays held.
+    Through,
+    /// Its prefix through its cut goes, as a sub-op of this many bytes; the
+    /// op, now its rest, stays first in the queue behind the segment its
+    /// candidate opens.
+    Split(T, usize),
+}
 
 /// What [`Gate::admit`] did with an op.
 #[derive(Debug)]
@@ -162,17 +188,17 @@ impl<T> Gate<T> {
     /// handed back before. `passes(op, trigger)` decides whether it is a
     /// reply that passes ahead of a fence closed at `trigger`, and accepts it
     /// when it is, so the caller submits it with nothing left to decide;
-    /// `hold(op)` runs
-    /// just before the gate takes it, to move the epoch and count it in
-    /// flight. Both run under the gate's lock. A zero-byte op the gate
-    /// settles isn't held, so `hold` doesn't run for it.
+    /// `hold(op)` runs just before the gate takes it, to move the epoch, plan
+    /// the op's cuts into it (Q35-16) and count it in flight. Both run under
+    /// the gate's lock. A zero-byte op the gate settles isn't held, so `hold`
+    /// doesn't run for it.
     pub fn admit(
         self: &Arc<Self>,
-        op: T,
+        mut op: T,
         len: usize,
         waiter: Option<Waiter<T>>,
         passes: impl FnOnce(&T, u64) -> bool,
-        hold: impl FnOnce(&T),
+        hold: impl FnOnce(&mut T),
     ) -> Admission<T> {
         let mut inner = self.lock();
         if inner.retired {
@@ -202,7 +228,7 @@ impl<T> Gate<T> {
             let waiter = waiter.unwrap_or_else(|| self.wait_in(&mut inner));
             return Admission::Full(op, waiter);
         }
-        hold(&op);
+        hold(&mut op);
         fence.held_bytes += len;
         fence.held.push_back((op, len));
         drop(inner);
@@ -232,6 +258,96 @@ impl<T> Gate<T> {
         };
         self.moved(&mut inner);
         held
+    }
+
+    /// Open the fence as far as the first cut (Q35-16, core §4.3, §4.6): what
+    /// it held, in acceptance order, up to and including the first op `split`
+    /// cuts, of which only the prefix through its cut comes back. The
+    /// candidate there opens the next segment: the fence stays closed, its
+    /// trigger moved to `trigger`, holding the rest in order. With no cut the
+    /// fence opens, as [`Self::release`] opens it. `split` runs under the
+    /// gate's lock and must take no lock. Empty when no fence was closed, or
+    /// once retired.
+    pub fn release_cut(&self, trigger: u64, split: impl FnMut(&mut T) -> Cutting<T>) -> Vec<T> {
+        let mut inner = self.lock();
+        let Some(fence) = inner.fence.as_mut() else {
+            return Vec::new();
+        };
+        let (out, cut) = Self::through_cut(fence, split);
+        if cut {
+            fence.trigger = trigger;
+        } else {
+            inner.fence = None;
+        }
+        self.moved(&mut inner);
+        out
+    }
+
+    /// An op the gate let through with no fence closed, whose planner cut it
+    /// (Q35-16, core §4.3): a liability is out, so its Ctrl+G candidate opens
+    /// a segment. The fence closes at `trigger`, holding the op, and opens as
+    /// far as its cut ([`Self::release_cut`]): the prefix through the cut
+    /// comes back for the caller to submit, and the rest stays held. If a
+    /// fence was closed since the op was let through, the op joins it, held
+    /// whole, and nothing comes back. `Err(op)` once retired.
+    pub fn cut_open(
+        &self,
+        op: T,
+        len: usize,
+        trigger: u64,
+        split: impl FnMut(&mut T) -> Cutting<T>,
+    ) -> Result<Vec<T>, T> {
+        let mut inner = self.lock();
+        if inner.retired {
+            return Err(op);
+        }
+        if let Some(fence) = inner.fence.as_mut() {
+            fence.held_bytes += len;
+            fence.held.push_back((op, len));
+            self.moved(&mut inner);
+            return Ok(Vec::new());
+        }
+        let fence = inner.fence.insert(Fence {
+            trigger,
+            held: VecDeque::from([(op, len)]),
+            held_bytes: len,
+        });
+        let (out, cut) = Self::through_cut(fence, split);
+        if !cut {
+            inner.fence = None;
+        }
+        self.moved(&mut inner);
+        Ok(out)
+    }
+
+    /// Take `fence`'s held ops, in order, through the first one `split`
+    /// cuts; whether one did.
+    fn through_cut(
+        fence: &mut Fence<T>,
+        mut split: impl FnMut(&mut T) -> Cutting<T>,
+    ) -> (Vec<T>, bool) {
+        let mut out = Vec::new();
+        while let Some((mut op, len)) = fence.held.pop_front() {
+            match split(&mut op) {
+                Cutting::Whole => {
+                    fence.held_bytes -= len;
+                    out.push(op);
+                }
+                Cutting::Through => {
+                    fence.held_bytes -= len;
+                    out.push(op);
+                    return (out, true);
+                }
+                Cutting::Split(prefix, taken) => {
+                    let taken = taken.min(len);
+                    fence.held_bytes -= taken;
+                    out.push(prefix);
+                    fence.held.push_front((op, len - taken));
+                    return (out, true);
+                }
+            }
+        }
+        (out, false)
     }
 
     /// The generation retired: from now on nothing is accepted, and what was

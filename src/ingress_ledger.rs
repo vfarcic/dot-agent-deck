@@ -283,6 +283,19 @@ impl TicketGuard {
         self.ledger.settle(self.ticket, Settlement::Refused(reason));
     }
 
+    /// The rest of an operation refused after the PTY took `accepted` of its
+    /// earlier bytes (PRD #1666 part 3, Q35-16: a cut operation's sub-ops):
+    /// written in part when it took any, refused with `reason` when none.
+    pub fn refuse_after(mut self, accepted: usize, reason: &'static str) {
+        self.armed = false;
+        let how = if accepted > 0 {
+            Settlement::Partial { accepted }
+        } else {
+            Settlement::Refused(reason)
+        };
+        self.ledger.settle(self.ticket, how);
+    }
+
     /// The operation carried no byte and was accepted: done, with nothing to
     /// write (Q35-15, a zero-byte frame while a fence holds input).
     pub fn settle_empty(mut self) {
