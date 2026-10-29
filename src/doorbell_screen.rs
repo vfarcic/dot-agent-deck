@@ -266,6 +266,10 @@ pub struct ScreenProfile {
     /// when the generation's `B` turns false (PRD #1666 part 3, Q35-06; A2
     /// §4.2).
     pub cpr_wait_end: crate::composer_probe::query_ledger::CprWaitEnd,
+    /// How long the agent may take to redraw by itself after a size change,
+    /// and which of its queries it waits on (PRD #1666 part 3, Q35-18a; A1
+    /// §4.1). Advice for when to nudge or probe, never a safety fact.
+    pub redraw: crate::composer_probe::query_wait::RedrawTiming,
 }
 
 impl ScreenProfile {
@@ -641,6 +645,16 @@ pub static CODEX_PROFILE: ScreenProfile = ScreenProfile {
     // P-WE: every production CPR wait in `codex-rs/tui` ends before the next
     // `?2026h` its own control flow writes (M-WE checks it on the binaries).
     cpr_wait_end: crate::composer_probe::query_ledger::CprWaitEnd::SyncBegin,
+    // crossterm's `position()` polls for its reply for 2000 ms on the draw
+    // path (`crossterm-ed1cdab.md:342–371`), the "about two seconds, then
+    // redraws" above, and M41's slope; only the CPR wait blocks its input
+    // loop (DA1 and OSC 10/11 are read before it starts).
+    redraw: crate::composer_probe::query_wait::RedrawTiming {
+        per_size_change: std::time::Duration::from_millis(2000),
+        margin: std::time::Duration::from_millis(500),
+        cap: std::time::Duration::from_secs(120),
+        waits_on: &[crate::composer_probe::query_ledger::QueryKind::Cpr],
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -830,6 +844,14 @@ pub static CLAUDE_PROFILE: ScreenProfile = ScreenProfile {
     min_cols: 80,
     input: crate::composer_model::Semantics::ClaudeCode,
     cpr_wait_end: crate::composer_probe::query_ledger::CprWaitEnd::Counted,
+    // A full redraw within 9 ms of each of the 10 resizes and 10 nudges
+    // measured, rounded up; it emits no CPR and waits on no query.
+    redraw: crate::composer_probe::query_wait::RedrawTiming {
+        per_size_change: std::time::Duration::from_millis(50),
+        margin: std::time::Duration::ZERO,
+        cap: std::time::Duration::from_secs(5),
+        waits_on: &[],
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -965,6 +987,15 @@ pub static STANDIN_PROFILE: ScreenProfile = ScreenProfile {
     min_cols: 40,
     input: crate::composer_model::Semantics::ClaudeCode,
     cpr_wait_end: crate::composer_probe::query_ledger::CprWaitEnd::Counted,
+    // The stand-in's contract: it reads its size between 25 ms waits for
+    // input, redraws on a change and asks nothing, so Claude Code's values
+    // cover it.
+    redraw: crate::composer_probe::query_wait::RedrawTiming {
+        per_size_change: std::time::Duration::from_millis(50),
+        margin: std::time::Duration::ZERO,
+        cap: std::time::Duration::from_secs(5),
+        waits_on: &[],
+    },
 };
 
 /// The `editor_probe` record the e2e stand-ins follow, for each agent they

@@ -65,6 +65,7 @@ use super::query_ledger::{
     Backlog, CprWaitEnd, EntryView, HazardFifo, HazardPop, Pop, QueryHistory, QueryKind,
     QueryLedger,
 };
+use super::query_wait::{QueryWaitEstimate, RedrawTiming};
 use super::record::{
     self, Channel, Decision, Drained, ExitFact, FirstStop, FrontierOutcome, Hold, Record,
     RecordKey, Recorded, Records, Refusal, Reported, Route, WriterScope,
@@ -309,6 +310,9 @@ struct State {
     ledger: QueryLedger,
     backlog: Backlog,
     hazards: HazardFifo,
+    /// When the generation's redraw waits are expected to have run out
+    /// (Q35-18a). Availability advice: nothing here reads it.
+    estimate: QueryWaitEstimate,
     /// The generation's invocation records, once attached.
     records: Option<Records>,
     retired: bool,
@@ -352,8 +356,8 @@ fn enqueue_locked(state: &mut State, writer: Writer, bytes: &[u8]) -> Enqueued {
     }
 }
 
-/// One generation's input epoch, query ledger, `B` and hazard FIFO, under
-/// one leaf lock. See the module documentation.
+/// One generation's input epoch, query ledger, `B`, hazard FIFO and redraw
+/// estimate, under one leaf lock. See the module documentation.
 #[derive(Debug)]
 pub struct GenerationInput {
     state: RankedMutex<{ R6 }, State>,
@@ -383,8 +387,19 @@ impl Default for GenerationInput {
 
 impl GenerationInput {
     /// A generation whose screen profile ends a CPR wait as `cpr_wait_end`
-    /// says.
+    /// says, with no redraw timing.
     pub fn new(cpr_wait_end: CprWaitEnd) -> Self {
+        Self::profiled(cpr_wait_end, None, Instant::now())
+    }
+
+    /// A generation spawned at `spawn` whose screen profile ends a CPR wait
+    /// as `cpr_wait_end` says and redraws as `redraw` says, `None` while it
+    /// has no profile (Q35-18a).
+    pub fn profiled(
+        cpr_wait_end: CprWaitEnd,
+        redraw: Option<&'static RedrawTiming>,
+        spawn: Instant,
+    ) -> Self {
         Self {
             state: RankedMutex::new(State {
                 epoch: InputEpoch::default(),
@@ -393,6 +408,7 @@ impl GenerationInput {
                 ledger: QueryLedger::default(),
                 backlog: Backlog::new(cpr_wait_end),
                 hazards: HazardFifo::default(),
+                estimate: QueryWaitEstimate::new(redraw, spawn),
                 records: None,
                 retired: false,
             }),
@@ -508,6 +524,7 @@ impl GenerationInput {
             match note {
                 OutputNote::Query(kind) => {
                     state.ledger.note(kind, offset);
+                    state.estimate.query(kind, now);
                     if kind == QueryKind::Cpr {
                         state.backlog.cpr_query();
                     }
@@ -520,6 +537,49 @@ impl GenerationInput {
                 state.hazards.latch(now);
             }
         }
+    }
+
+    /// The daemon applied a size change to the PTY at `now`: a dimension
+    /// change or a nudge edge (Q35-18a). Nothing once retired.
+    pub fn size_change(&self, now: Instant) {
+        let mut state = self.state.lock_recovering();
+        if !state.retired {
+            state.estimate.size_change(now);
+        }
+    }
+
+    /// The generation's screen profile was learned at `now`, after a spawn
+    /// with none (Q35-18a): the redraw estimate takes `redraw` and counts the
+    /// last size change before it, and `B` takes `cpr_wait_end` keeping its
+    /// value ([`Backlog::adopt`]). The ledger, the FIFO and the records are
+    /// untouched. `false`, changing nothing, once retired or for a generation
+    /// that already has a redraw timing.
+    pub fn adopt_profile(
+        &self,
+        cpr_wait_end: CprWaitEnd,
+        redraw: &'static RedrawTiming,
+        now: Instant,
+    ) -> bool {
+        let mut state = self.state.lock_recovering();
+        if state.retired || !state.estimate.adopt(redraw, now) {
+            return false;
+        }
+        state.backlog.adopt(cpr_wait_end);
+        true
+    }
+
+    /// When the generation's redraw waits are expected to have run out, or
+    /// `None` for no estimate (see
+    /// [`QueryWaitEstimate::estimate`]). Writes nothing.
+    pub fn query_wait_estimate(&self) -> Option<Instant> {
+        self.state.lock_recovering().estimate.estimate()
+    }
+
+    /// Test seam: every fact the lock keeps, as text, so a test can tell
+    /// whether a call changed any of them.
+    #[cfg(test)]
+    pub(crate) fn state_text(&self) -> String {
+        format!("{:?}", *self.state.lock_recovering())
     }
 
     /// A native Ctrl+G candidate was physically accepted at `now` (Q35-16's

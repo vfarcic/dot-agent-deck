@@ -2142,11 +2142,13 @@ impl AgentBus {
         cols: u16,
     ) -> Self {
         let (tx, _rx0) = broadcast::channel(BROADCAST_CAPACITY);
-        let input = Arc::new(crate::composer_probe::epoch::GenerationInput::new(
+        let input = Arc::new(crate::composer_probe::epoch::GenerationInput::profiled(
             profile.map_or(
                 crate::composer_probe::query_ledger::CprWaitEnd::Counted,
                 |p| p.cpr_wait_end,
             ),
+            profile.map(|p| &p.redraw),
+            Instant::now(),
         ));
         let output_hook = crate::composer_probe::paste_mode::OutputHook::new(Arc::clone(&input));
         let composer_bell = output_hook.bell_slot();
@@ -2409,6 +2411,9 @@ impl AgentBus {
         #[cfg(test)]
         self.run_between_resize_and_clear();
         state.clear_ring();
+        // PRD #1666 part 3 (Q35-18a): under the output lock, so the size
+        // change sits at its place among the queries the hook notes.
+        self.input.size_change(Instant::now());
         let transition = state
             .evidence
             .edge(crate::evidence_state::EdgeReason::Resize, rows, cols);
@@ -2448,6 +2453,9 @@ impl AgentBus {
     ) -> Result<(), E> {
         let mut state = self.state.lock().unwrap();
         let result = resize();
+        if result.is_ok() {
+            self.input.size_change(Instant::now());
+        }
         let transition = match (&result, reason) {
             (Ok(()), _) => state.evidence.edge(reason, rows, cols),
             (Err(_), crate::evidence_state::EdgeReason::NudgeRestore) => {
@@ -2481,9 +2489,16 @@ impl AgentBus {
 
     /// PRD #1666 part 3, round 5-wake: the generation's profile, learned from
     /// the agent type its own hooks reported, under the lock `push` takes so
-    /// its edge sits at its place in the stream.
+    /// its edge sits at its place in the stream. The generation's input takes
+    /// the profile's redraw timing and `B`'s rule under the same lock
+    /// (Q35-18a), so the frames and queries noted before it are the counted
+    /// rule's and those after it the profile's.
     fn adopt_profile(&self, profile: &'static crate::doorbell_screen::ScreenProfile) {
-        let transition = self.state.lock().unwrap().evidence.adopt(profile);
+        let mut state = self.state.lock().unwrap();
+        let transition = state.evidence.adopt(profile);
+        self.input
+            .adopt_profile(profile.cpr_wait_end, &profile.redraw, Instant::now());
+        drop(state);
         if let Some(transition) = transition {
             log_evidence_transition(&transition, "profile_learned");
         }
@@ -7115,6 +7130,12 @@ mod input_epoch_tests;
 #[cfg(test)]
 #[path = "agent_pty_fence_tests.rs"]
 mod fence_tests;
+
+/// PRD #1666 part 3 (Q35-18a): the redraw estimate and `B` at profile
+/// adoption on the real bus and registry.
+#[cfg(test)]
+#[path = "agent_pty_query_wait_tests.rs"]
+mod query_wait_tests;
 
 /// PRD #1666 part 3, round 5-wake (plan §1.1, §3.4′): the doorbell's ring on
 /// the real writer, and the re-projection publisher.

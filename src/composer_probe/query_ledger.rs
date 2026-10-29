@@ -36,9 +36,10 @@
 //! Who feeds and reads what, as of this commit: the output hook notes queries,
 //! `?2026h` and the D3 report modes, and the shared enqueue settles replies
 //! (both through `GenerationInput`), and an installed generation's records
-//! feed the pending fact and their pops (Q35-14b); the physical tracker's
-//! native candidate (Q35-16) arrives later, as does the first reader, probe
-//! admission (Q35-19).
+//! feed the pending fact and their pops (Q35-14b), and a profile learned
+//! after spawn moves `B` to its rule (Q35-18a, [`Backlog::adopt`]); the
+//! physical tracker's native candidate (Q35-16) arrives later, as does the
+//! first reader, probe admission (Q35-19).
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -236,6 +237,23 @@ impl Backlog {
         if self.end == CprWaitEnd::Counted && !self.saturated {
             self.outstanding = self.outstanding.saturating_sub(1);
         }
+    }
+
+    /// The generation's profile was learned after spawn and declares `end`
+    /// (Q35-18a, R3506-U3-02): `B` keeps its value across the change. A wait
+    /// the counted rule still holds becomes a CPR after the last frame on the
+    /// frame rule, so only a `?2026h` noted after adoption ends it; a frame
+    /// noted before adoption, which the counted rule ignored, doesn't. No
+    /// count is reset and no earlier query is taken as answered.
+    pub fn adopt(&mut self, end: CprWaitEnd) {
+        match (self.end, end) {
+            (CprWaitEnd::Counted, CprWaitEnd::SyncBegin) => self.after_sync = self.holds(),
+            (CprWaitEnd::SyncBegin, CprWaitEnd::Counted) if self.after_sync => {
+                self.outstanding = self.outstanding.max(1);
+            }
+            _ => {}
+        }
+        self.end = end;
     }
 
     /// `B`.

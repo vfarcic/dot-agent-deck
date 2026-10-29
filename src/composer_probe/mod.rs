@@ -11,7 +11,8 @@
 //! invocation and its read of the export ([`attest`], Linux), the arm page
 //! the daemon publishes to its editor helper ([`arm`]), the permission to
 //! arm ([`permission`]), the input epoch with the query ledger, `B` and the
-//! native hazard FIFO kept beside it ([`epoch`], [`query_ledger`]), a
+//! native hazard FIFO kept beside it ([`epoch`], [`query_ledger`]) and the
+//! estimate of when an agent's redraw waits run out ([`query_wait`]), a
 //! generation's invocation records, what each settles and its writer scope
 //! ([`record`]), the segments each check or held Ctrl+G opens and what
 //! releases and completes them ([`segments`]), and installation: the
@@ -50,6 +51,7 @@ pub mod observe;
 pub mod paste_mode;
 pub mod path_rule;
 pub mod query_ledger;
+pub mod query_wait;
 pub mod record;
 pub mod segments;
 
