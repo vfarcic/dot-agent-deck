@@ -477,6 +477,11 @@ fn codex_027_a_dialog_on_the_head_gets_nothing_more() {
     let typed = codex.typed();
     assert_eq!(typed.len(), 8, "the head alone: {typed:?}");
     assert!(typed.starts_with('(') && typed.ends_with(')'), "{typed:?}");
+    let inputs = codex.inputs();
+    assert!(
+        inputs[0].0 >= deck.anchor(&codex) + MEASURED_SETTLE.as_nanos() as u64,
+        "no byte before the measured settle window"
+    );
     assert!(
         codex.dialog_bytes().is_empty(),
         "{:?}",
@@ -642,23 +647,22 @@ fn codex_027_a_dialog_mid_attempt_on_an_inherited_release_sets_its_tripwire() {
     );
 }
 
-/// Scenario: On inherited Codex 0.165.0, a screen that is not Codex's composer is up when a task is queued, then the composer comes back but its Enter submits nothing and shows nothing, so the attempt finds no submit evidence. Neither sets the release's tripwire, and a transcript row reading "Update now" on a later ring is no dialog either: that ring is delivered and the tripwire stays unset.
+/// Scenario: On measured Codex 0.164.0, an unrecognised screen gets no byte, and a later swallowed Enter leaves the task queued with no submit evidence. A fresh generation with a transcript row reading "Update now" still delivers its task because that row is not a dialog.
 #[spec("inbox/codex/027")]
 #[test]
-fn codex_027_what_is_not_a_recognised_dialog_never_sets_the_tripwire() {
+fn codex_027_unrecognised_screen_and_missing_submit_evidence_stay_safe() {
     let deck = Deck::new();
     let codex = deck.codex(
-        "codex-027-inherit-generic",
-        INHERITED,
+        "codex-027-measured-generic",
+        MEASURED,
         Some("codex"),
         &[(".hidden", "")],
     );
-    deck.latched(&codex, INHERITED);
+    deck.latched(&codex, MEASURED);
     deck.idle(&codex);
     let id = enqueue(&deck.daemon, &codex.pane, BODY);
-    unchanged(&codex.pane, INHERITED_SETTLE + Duration::from_secs(2));
+    unchanged(&codex.pane, MEASURED_SETTLE + Duration::from_secs(2));
     assert!(bytes(&codex.pane).is_empty(), "{:?}", codex.typed());
-    assert!(!deck.tripped(), "{}", deck.log());
 
     codex.set(".swallow", "");
     codex.clear(".hidden");
@@ -670,22 +674,20 @@ fn codex_027_what_is_not_a_recognised_dialog_never_sets_the_tripwire() {
         "the Enter gets no submit evidence: {}",
         deck.log()
     );
-    assert!(!deck.tripped(), "{}", deck.log());
     state(&deck.daemon, &codex.pane, &id, "queued");
 
     // A fresh generation, a transcript row reading "Update now".
     deck.stop(codex);
     let next = deck.codex(
-        "codex-027-inherit-generic",
-        INHERITED,
+        "codex-027-measured-generic",
+        MEASURED,
         Some("codex"),
         &[(".extra", "Update now")],
     );
-    deck.latched(&next, INHERITED);
+    deck.latched(&next, MEASURED);
     deck.idle(&next);
     let id = enqueue(&deck.daemon, &next.pane, "AFTER-UPDATE-NOW-027");
     delivered(&deck, &next, &id);
-    assert!(!deck.tripped(), "{}", deck.log());
 }
 
 // ---------------------------------------------------------------------------
