@@ -7390,6 +7390,7 @@ fn stream_reject_message(reason: &str) -> String {
     match reason {
         "history-only" => "Input not delivered: session is history-only".to_string(),
         "exited" => "Input not delivered: the agent has exited".to_string(),
+        "write-failed" => "Input not delivered: the agent's terminal did not take it".to_string(),
         "stale" | "wrong-session" => "Input not delivered: the pane's session changed".to_string(),
         other => format!("Input not delivered ({other})"),
     }
@@ -40407,7 +40408,7 @@ mod tests {
 
         // Focused + PaneInput → feedback + leave PaneInput (both key & paste map
         // to the same daemon reason, so one reason covers both).
-        for reason in ["history-only", "exited"] {
+        for reason in ["history-only", "exited", "write-failed"] {
             let mut ui = default_ui();
             ui.mode = UiMode::PaneInput;
             let acted =
@@ -40426,6 +40427,12 @@ mod tests {
                 ui.status_message.as_ref().map(|(m, _)| m)
             );
         }
+        // PRD #1666 part 3 (Q35-15 fix 2): a write the agent's terminal
+        // failed is not reported as the agent having exited.
+        assert_eq!(
+            stream_reject_message("write-failed"),
+            "Input not delivered: the agent's terminal did not take it"
+        );
 
         // Rejection for a DIFFERENT (non-focused) pane must not disturb input.
         let mut ui = default_ui();

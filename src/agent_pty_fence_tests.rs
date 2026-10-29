@@ -472,48 +472,97 @@ async fn probe_011_a_release_to_an_exited_target_writes_nothing() {
     assert_eq!(rig.in_flight(), 0);
 }
 
-/// Scenario: Hold a frame and release it to a PTY that fails the write after taking three of its bytes, and another to a PTY that fails at once. Each ticket settles once with what the PTY took, partial or failed, and each frame's connection is told `exited` once: nobody awaits a released write, so that typed rejection is how its failure reaches the person (R-U2-03).
+/// Scenario: Hold a frame and release it to a PTY that fails the write after taking three of its bytes, another to a PTY that fails at once, and a third to a PTY that fails with an error no exit explains, each while its agent is live and its generation not retired. Each ticket settles once with what the PTY took, partial or failed, and each frame's connection is told `write-failed` once, not `exited`: nobody awaits a released write, so that typed rejection is how its failure reaches the person, and a failed write is no evidence the agent exited (R-U2-03, fix 2 R-U2-01).
 #[spec("inbox/probe/011")]
 #[tokio::test(flavor = "multi_thread")]
 async fn probe_011_a_released_write_that_fails_tells_its_connection() {
-    for (budget, expected) in [
-        (3, Settlement::Partial { accepted: 3 }),
-        (0, Settlement::Failed(std::io::ErrorKind::BrokenPipe)),
+    for (budget, kind, expected) in [
+        (
+            3,
+            std::io::ErrorKind::BrokenPipe,
+            Settlement::Partial { accepted: 3 },
+        ),
+        (
+            0,
+            std::io::ErrorKind::BrokenPipe,
+            Settlement::Failed(std::io::ErrorKind::BrokenPipe),
+        ),
+        (
+            0,
+            std::io::ErrorKind::WriteZero,
+            Settlement::Failed(std::io::ErrorKind::WriteZero),
+        ),
     ] {
-        let mut rig = Rig::new(true, Some((budget, std::io::ErrorKind::BrokenPipe)));
+        let mut rig = Rig::new(true, Some((budget, kind)));
         rig.fence();
         let (_, ticket) = rig.offer(b"abcdef").await;
         assert_eq!(rig.writer.release_fence(Ok(())), 1);
         assert_eq!(rig.settles(ticket).await, [expected]);
-        assert_eq!(rig.notices.try_recv().unwrap(), b"exited");
-        assert!(rig.notices.try_recv().is_err(), "told once");
         rig.writer.until_idle().await;
+        assert!(!rig.retired.load(Ordering::SeqCst));
+        assert!(!rig.exited.load(Ordering::SeqCst));
+        assert_eq!(rig.notices.try_recv().unwrap(), WRITE_FAILED.as_bytes());
+        assert!(rig.notices.try_recv().is_err(), "told once");
+        assert_eq!(rig.settled(ticket).len(), 1, "settled once");
         assert_eq!(rig.in_flight(), 0);
     }
 }
 
-/// Scenario: Hold a frame while the writer thread is gone, then release it. The released frame's ticket settles failed with a broken pipe, once, and nothing stays in flight.
+/// Scenario: Hold a frame while the writer thread is gone, then release it; separately submit a released frame to a gone writer after its target exited, its generation not retired. Each released frame's ticket settles failed with a broken pipe, once, its connection is told once (`write-failed` while the target is live, `exited` once it exited), and nothing stays in flight (fix 2, R-U2-02).
 #[spec("inbox/probe/011")]
 #[tokio::test(flavor = "multi_thread")]
 async fn probe_011_a_release_to_a_gone_writer_settles_once() {
-    let rig = Rig::new(true, None);
-    rig.fence();
-    let (_, ticket) = rig.offer(b"orphan").await;
-    let (tx, back) = oneshot::channel();
-    rig.writer
-        .pty
-        .submit(
-            PtyOp::Surrender(tx),
-            PtyReply::Blocking(std::sync::mpsc::sync_channel(1).0),
-        )
-        .unwrap();
-    let _displaced = back.await.unwrap();
-    rig.writer.release_fence(Ok(()));
-    assert_eq!(
-        rig.settled(ticket),
-        [Settlement::Failed(std::io::ErrorKind::BrokenPipe)]
-    );
-    assert_eq!(rig.in_flight(), 0);
+    for exited in [false, true] {
+        let mut rig = Rig::new(true, None);
+        rig.fence();
+        let (_, ticket) = rig.offer(b"orphan").await;
+        let (tx, back) = oneshot::channel();
+        rig.writer
+            .pty
+            .submit(
+                PtyOp::Surrender(tx),
+                PtyReply::Blocking(std::sync::mpsc::sync_channel(1).0),
+            )
+            .unwrap();
+        let _displaced = back.await.unwrap();
+        let tell = if exited {
+            // Exited after the release's own check, which would have refused
+            // it: submitted as a release that passed that check, counted in
+            // flight as its acceptance would have, and failed by the gone
+            // writer.
+            let (frame, released) = rig.frame(b"exited");
+            rig.writer
+                .pty
+                .in_flight
+                .count
+                .fetch_add(1, Ordering::SeqCst);
+            rig.exited.store(true, Ordering::SeqCst);
+            rig.writer
+                .pty
+                .submit_released(frame, Arc::clone(&rig.exited));
+            assert_eq!(
+                rig.settled(released),
+                [Settlement::Failed(std::io::ErrorKind::BrokenPipe)]
+            );
+            rig.writer.release_fence(Ok(()));
+            assert_eq!(rig.settled(ticket), [Settlement::Refused("exited")]);
+            b"exited".as_slice()
+        } else {
+            rig.writer.release_fence(Ok(()));
+            assert_eq!(
+                rig.settled(ticket),
+                [Settlement::Failed(std::io::ErrorKind::BrokenPipe)]
+            );
+            WRITE_FAILED.as_bytes()
+        };
+        assert_eq!(rig.notices.try_recv().unwrap(), tell);
+        if exited {
+            // The held frame, refused at its release.
+            assert_eq!(rig.notices.try_recv().unwrap(), b"exited");
+        }
+        assert!(rig.notices.try_recv().is_err(), "told once");
+        assert_eq!(rig.in_flight(), 0);
+    }
 }
 
 /// Scenario: Close a fence, hold a key, have the agent's output ask a DA1 query, then hand the gate one whole DA1 reply while the PTY is taking writes slowly, and submit a deck job straight to the writer. The reply is written at once past the closed fence, is in flight while it is written, moves no epoch and takes no held op or byte; the deck job, which never came through acceptance, is written too and counts in flight but not in the fence; the key waits for the release (I-5).

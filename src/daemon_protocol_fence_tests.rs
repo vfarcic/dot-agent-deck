@@ -342,6 +342,73 @@ async fn probe_011_a_connection_that_ends_while_full_gives_up_its_place() {
     pane.stop();
 }
 
+/// Scenario: Close a pane's fence and fill it, then from an attached connection send a frame, which waits for room, and one more behind it; shut the connection for writing while still reading from it. A shut write half is the client leaving: the waiting frame gives up its place and settles cancelled once, the connection's stream ends for its reader, and after the release neither frame is written (Q3515FIX-A-U3-02).
+#[spec("inbox/probe/011")]
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_011_a_connection_shut_for_writing_while_full_gives_up_its_place() {
+    use tokio::io::AsyncWriteExt;
+    let pane = FencedPane::new("probe-011-full-half-close").await;
+    assert!(pane.gate().fence());
+    let filler = pane.ledger.admit();
+    let accepted = pane
+        .writer()
+        .lock()
+        .await
+        .accept(
+            UserFrame::new(vec![b'h'; FENCE_CAP], Some(filler), None),
+            None,
+        )
+        .await;
+    assert!(matches!(accepted, Accepted::Held));
+    let mut client = pane.attach().await;
+    write_frame(&mut client, KIND_STREAM_IN, b"parked")
+        .await
+        .unwrap();
+    pane.until("the frame waits for room", || {
+        pane.gate().status().full_waiters == 1
+    })
+    .await;
+    write_frame(&mut client, KIND_STREAM_IN, b"behind")
+        .await
+        .unwrap();
+    client.shutdown().await.unwrap();
+    pane.until("the waiter leaves", || {
+        pane.gate().status().full_waiters == 0
+    })
+    .await;
+    let cancelled = || {
+        pane.ledger
+            .settled()
+            .into_iter()
+            .filter(|(_, how)| *how == Settlement::Cancelled)
+            .count()
+    };
+    pane.until("the waiting frame settles", || cancelled() == 1)
+        .await;
+    // Still reading: the daemon ends the stream rather than leaving it open.
+    let ended = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match read_frame(&mut client).await {
+                Ok(Some((KIND_STREAM_END, _))) | Ok(None) | Err(_) => break,
+                Ok(Some(_)) => {}
+            }
+        }
+    })
+    .await;
+    assert!(ended.is_ok(), "the reader sees the stream end");
+    assert_eq!(pane.writer().lock().await.release_fence(Ok(())), 1);
+    pane.until("the fence's frame is written", || {
+        pane.taken().len() >= FENCE_CAP
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let taken = pane.taken();
+    assert_eq!(taken.len(), FENCE_CAP);
+    assert!(!contains(&taken, b"parked") && !contains(&taken, b"behind"));
+    assert_eq!(cancelled(), 1, "settled once");
+    pane.stop();
+}
+
 /// Scenario: Close a pane's fence, note the human-input counter, and from an attached connection send an empty frame; note it again and send a key. Each frame, though nothing reaches the PTY until the fence is released, counts as the person's input as soon as it is accepted: the counter has moved past each mark while the key is still held, so an answer typed for a question asked before either is refused (R-U3-01).
 #[spec("inbox/probe/011")]
 #[tokio::test(flavor = "multi_thread")]

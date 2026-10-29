@@ -199,7 +199,9 @@ impl IngressLedger {
     /// failed `enqueue`, or (Q35-15 fix, A-U3-03) the writer's queue disposing
     /// of a job it was sent, unrun, before this hold armed it: the drop marks
     /// the flag [`DISPOSED`], and the hold, finding it so, settles the ticket
-    /// `Failed(BrokenPipe)` instead of leaving it queued and unreported.
+    /// `Failed(BrokenPipe)` instead of leaving it queued and unreported. A
+    /// disposal that looked before this hold armed the job and moves the flag
+    /// after finds it [`QUEUED`] and reports it itself (fix 2).
     fn queue_with<T>(
         &self,
         ticket: u64,
@@ -381,25 +383,34 @@ impl Drop for JobTicket {
     /// Unrun with a queued job: the writer is gone. A drop still unqueued,
     /// inside a failed enqueue or a disposal before the queueing hold armed
     /// it, reports nothing and marks the flag [`DISPOSED`]: the hold, which
-    /// is still held, reports it.
+    /// is still held, reports it. One state decides which, retried until it
+    /// moves (Q35-15 fix 2, A-U3-03): a hold that arms the job between this
+    /// drop's look at the flag and its move leaves it [`QUEUED`], and the
+    /// drop then reports it as a queued job, rather than failing its move
+    /// and leaving it unreported.
     fn drop(&mut self) {
-        match self
-            .armed
-            .compare_exchange(QUEUED, REPORTED, Ordering::SeqCst, Ordering::SeqCst)
-        {
-            Ok(_) => self.ledger.settle(
-                self.ticket,
-                Settlement::Failed(std::io::ErrorKind::BrokenPipe),
-            ),
-            Err(UNQUEUED) => {
-                let _ = self.armed.compare_exchange(
-                    UNQUEUED,
-                    DISPOSED,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                );
+        let mut seen = self.armed.load(Ordering::SeqCst);
+        loop {
+            let next = match seen {
+                QUEUED => REPORTED,
+                UNQUEUED => DISPOSED,
+                _ => return,
+            };
+            #[cfg(test)]
+            tests::park_between_look_and_move(seen);
+            match self
+                .armed
+                .compare_exchange(seen, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(QUEUED) => {
+                    return self.ledger.settle(
+                        self.ticket,
+                        Settlement::Failed(std::io::ErrorKind::BrokenPipe),
+                    );
+                }
+                Ok(_) => return,
+                Err(now) => seen = now,
             }
-            Err(_) => {}
         }
     }
 }
@@ -436,6 +447,22 @@ impl TicketHandle {
 mod tests {
     use super::*;
     use spec::spec;
+
+    thread_local! {
+        /// Run by a [`JobTicket`] dropped on this thread, between its look at
+        /// an unqueued flag and its move of it: the seam a queueing hold can
+        /// arm the job in (A-U3-03).
+        static PARK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn park_between_look_and_move(seen: u8) {
+        if seen == UNQUEUED
+            && let Some(park) = PARK.with(|park| park.borrow_mut().take())
+        {
+            park();
+        }
+    }
 
     /// Scenario: Queue a ticket's job where the queue refuses it, drop a job's ticket unrun, and settle a ticket after its ledger was closed. The refused queueing settles the ticket as failed without moving the job mark, the unrun job's ticket settles as failed, and a late settlement in a closed ledger leaves nothing outstanding.
     #[spec("inbox/doorbell/035")]
@@ -494,6 +521,48 @@ mod tests {
                 Some(handle)
             })
             .expect("the queue took it");
+        assert_eq!(
+            ledger.settled(),
+            [(ticket, Settlement::Failed(std::io::ErrorKind::BrokenPipe))]
+        );
+        assert_eq!(ledger.marks().outstanding, 0);
+        assert_eq!(ledger.jobs_unreported(), 0);
+        handle.settle_cancelled();
+        assert_eq!(ledger.settled().len(), 1, "reported once");
+    }
+
+    /// Scenario: Queue a ticket's job whose receiving side drops it unrun on another thread, which sees the job not yet queued and is held there while the queueing hold arms it, then let the drop finish. The drop reports the now-queued job failed with a broken pipe, once, and nothing stays outstanding or unreported (A-U3-03).
+    #[spec("inbox/probe/011")]
+    #[test]
+    fn probe_011_a_disposal_that_straddles_the_arming_reports_once() {
+        let ledger = IngressLedger::new();
+        let guard = ledger.admit();
+        let ticket = guard.ticket();
+        let (looked, looked_rx) = std::sync::mpsc::channel::<()>();
+        let (go, go_rx) = std::sync::mpsc::channel::<()>();
+        let mut dropper = None;
+        let handle = guard
+            .into_job(|job| {
+                let handle = job.handle();
+                // The receiving side drops it unrun, held after its look.
+                dropper = Some(std::thread::spawn(move || {
+                    PARK.with(|park| {
+                        *park.borrow_mut() = Some(Box::new(move || {
+                            looked.send(()).unwrap();
+                            go_rx.recv().unwrap();
+                        }));
+                    });
+                    drop(job);
+                }));
+                looked_rx.recv().unwrap();
+                Some(handle)
+            })
+            .expect("the queue took it");
+        // The hold armed it while the drop was held: queued, unreported.
+        assert_eq!(ledger.jobs_unreported(), 1);
+        assert!(ledger.settled().is_empty());
+        go.send(()).unwrap();
+        dropper.unwrap().join().unwrap();
         assert_eq!(
             ledger.settled(),
             [(ticket, Settlement::Failed(std::io::ErrorKind::BrokenPipe))]

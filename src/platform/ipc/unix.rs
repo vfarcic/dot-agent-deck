@@ -62,29 +62,122 @@ impl crate::platform::transport::HalfCloseOnDrop for IpcWriteHalf {}
 /// sleeps until the next edge rather than spinning, while `rd`'s own
 /// readiness is left as it was, for the reader that reads those frames next.
 /// (Clearing it on `rd` would leave that reader waiting for an edge the
-/// queued data never raises again.) A descriptor it can't duplicate or
-/// watch leaves it pending for good rather than resolving: failing to watch
-/// for the close is no reason to drop the person's input.
+/// queued data never raises again.)
+///
+/// A shut write half counts as the close even while the peer still reads:
+/// this transport treats a dropped write half as the client leaving
+/// (`IpcWriteHalf`), so a caller cancels what it was holding for the
+/// connection then.
+///
+/// A descriptor it can't duplicate or watch, descriptor exhaustion say, is
+/// tried again [`WATCH_RETRIES`] times, backing off from [`WATCH_RETRY_FIRST`]
+/// (Q35-15 fix 2, Q3515FIX-A-U3-02); after that it stays pending for good
+/// rather than resolving, since failing to watch for the close is no reason to
+/// drop the person's input. A caller that must end promptly then needs
+/// another signal, as the attach loop has its output task's end.
 pub async fn peer_closed(rd: &IpcReadHalf) {
-    use std::os::fd::AsFd;
-    let stream: &UnixStream = rd.as_ref();
-    let Ok(watch) = stream.as_fd().try_clone_to_owned().and_then(|fd| {
-        let watch = std::os::unix::net::UnixStream::from(fd);
+    peer_closed_watching(rd, |stream| {
+        use std::os::fd::AsFd;
+        let watch = std::os::unix::net::UnixStream::from(stream.as_fd().try_clone_to_owned()?);
         watch.set_nonblocking(true)?;
         UnixStream::from_std(watch)
-    }) else {
-        return std::future::pending().await;
-    };
-    loop {
-        match watch.ready(tokio::io::Interest::READABLE).await {
-            Ok(ready) if !ready.is_read_closed() => {
-                let _ = watch.try_io(tokio::io::Interest::READABLE, || {
-                    Err::<(), _>(io::ErrorKind::WouldBlock.into())
-                });
+    })
+    .await
+}
+
+/// How many times [`peer_closed`] tries again to set up its watch.
+const WATCH_RETRIES: u32 = 8;
+/// [`peer_closed`]'s first wait before trying again, doubled for each next
+/// one: about 25 seconds of tries in all.
+const WATCH_RETRY_FIRST: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// [`peer_closed`], its watch made by `watch_of`.
+async fn peer_closed_watching(
+    rd: &IpcReadHalf,
+    mut watch_of: impl FnMut(&UnixStream) -> io::Result<UnixStream>,
+) {
+    let stream: &UnixStream = rd.as_ref();
+    let mut backoff = WATCH_RETRY_FIRST;
+    for attempt in 0..=WATCH_RETRIES {
+        if let Ok(watch) = watch_of(stream) {
+            loop {
+                match watch.ready(tokio::io::Interest::READABLE).await {
+                    Ok(ready) if !ready.is_read_closed() => {
+                        let _ = watch.try_io(tokio::io::Interest::READABLE, || {
+                            Err::<(), _>(io::ErrorKind::WouldBlock.into())
+                        });
+                    }
+                    Ok(_) => return,
+                    Err(_) => break,
+                }
             }
-            Ok(_) => return,
-            Err(_) => return std::future::pending().await,
         }
+        if attempt < WATCH_RETRIES {
+            tokio::time::sleep(backoff).await;
+            backoff *= 2;
+        }
+    }
+    std::future::pending().await
+}
+
+#[cfg(test)]
+mod peer_closed_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn dup(stream: &UnixStream) -> io::Result<UnixStream> {
+        use std::os::fd::AsFd;
+        let watch = std::os::unix::net::UnixStream::from(stream.as_fd().try_clone_to_owned()?);
+        watch.set_nonblocking(true)?;
+        UnixStream::from_std(watch)
+    }
+
+    /// Scenario: Watch a connection for its peer's close while the watch can't be set up at first, as when the daemon is out of descriptors, then can; close the peer. The watch is tried again and resolves on the close (Q3515FIX-A-U3-02).
+    #[spec::spec("inbox/probe/011")]
+    #[tokio::test(start_paused = true)]
+    async fn probe_011_a_watch_that_fails_at_first_is_tried_again() {
+        let (ours, peer) = UnixStream::pair().unwrap();
+        let (rd, _wr) = ours.into_split();
+        let mut fails = 2;
+        let watching = peer_closed_watching(&rd, |stream| {
+            if fails > 0 {
+                fails -= 1;
+                return Err(io::Error::from_raw_os_error(libc::EMFILE));
+            }
+            dup(stream)
+        });
+        tokio::pin!(watching);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut watching)
+                .await
+                .is_err(),
+            "the peer is still there"
+        );
+        drop(peer);
+        tokio::time::timeout(Duration::from_secs(5), watching)
+            .await
+            .expect("the close is seen once the watch is set up");
+    }
+
+    /// Scenario: Watch a connection for its peer's close while the watch can never be set up, and close the peer. The watch is tried a bounded number of times and then stays pending rather than resolving: failing to watch is not taken for the close, and a caller relies on its other signal (Q3515FIX-A-U3-02).
+    #[spec::spec("inbox/probe/011")]
+    #[tokio::test(start_paused = true)]
+    async fn probe_011_a_watch_that_never_sets_up_stays_pending() {
+        let (ours, peer) = UnixStream::pair().unwrap();
+        let (rd, _wr) = ours.into_split();
+        drop(peer);
+        let mut tries = 0;
+        let watching = peer_closed_watching(&rd, |_| {
+            tries += 1;
+            Err(io::Error::from_raw_os_error(libc::EMFILE))
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_secs(600), watching)
+                .await
+                .is_err(),
+            "an unwatched close is not reported"
+        );
+        assert_eq!(tries, WATCH_RETRIES + 1);
     }
 }
 

@@ -4715,7 +4715,27 @@ impl Released {
             let _ = notice.try_send(reason.as_bytes().to_vec());
         }
     }
+
+    /// Tell the frame's connection its write failed (Q35-15 fix 2,
+    /// R-U2-01/02): `exited` when its generation retired or its target
+    /// exited, which is what the person is told for a dead target before
+    /// acceptance; otherwise [`WRITE_FAILED`], since a failed write is no
+    /// evidence the agent exited.
+    fn tell_failed(&self, retired: bool) {
+        self.tell(if retired || self.exited.load(Ordering::SeqCst) {
+            "exited"
+        } else {
+            WRITE_FAILED
+        });
+    }
 }
+
+/// PRD #1666 part 3 (Q35-15 fix 2, R-U2-01): the typed rejection a released
+/// frame's connection gets when the PTY failed its write, in part or whole,
+/// or its writer thread was gone, while its target is still live. A reason
+/// a client doesn't know reaches the person verbatim, which both clients have
+/// done since `KIND_STREAM_REJECT` existed.
+pub(crate) const WRITE_FAILED: &str = "write-failed";
 
 /// How a job reached [`PtyWriterThread::submit_job`], which decides what is
 /// still left to do at its enqueue.
@@ -5588,14 +5608,14 @@ impl PtyWriterThread {
                     };
                     // PRD #1666 part 3 (Q35-15 fix, R-U2-03): a released
                     // write has no caller awaiting it, so when the PTY fails
-                    // it, in part or whole, its connection is told the PTY
-                    // can't take its input, `exited`, the reason the attach
-                    // loop gives a dead PTY; its ticket says how much went
-                    // in, below, once.
+                    // it, in part or whole, its connection is told, without
+                    // claiming the agent exited unless it did (fix 2,
+                    // R-U2-01); its ticket says how much went in, below,
+                    // once.
                     if let Some(released) = &job.released
                         && done.result.is_err()
                     {
-                        released.tell("exited");
+                        released.tell_failed(recorder.retired.load(Ordering::SeqCst));
                     }
                     // PRD #1666 part 3, round 5-wake: the human operation's
                     // ticket settles with what the PTY took. A voice answer
@@ -5747,7 +5767,13 @@ impl PtyWriterThread {
                 ticket,
                 released,
             };
-            if self.jobs.send(job).is_err() {
+            if let Err(std::sync::mpsc::SendError(job)) = self.jobs.send(job) {
+                // Q35-15 fix 2 (R-U2-02): nobody awaits a released job, so
+                // its connection is told here; dropping the job leaves its
+                // ticket to this enqueue's hold, which settles it once.
+                if let Some(released) = &job.released {
+                    released.tell_failed(false);
+                }
                 self.in_flight.leave();
                 return None;
             }
