@@ -306,7 +306,11 @@ pub(super) struct Gen {
     /// the task's delegate watch remains. An id goes when the watch does
     /// ([`forget_uncertain`]): a delegation with `--supersede` that retires it
     /// ends the watch-based route, leaving a later commit only a retained
-    /// cancelled-task record to correct through, if the task has one.
+    /// cancelled-task record to correct through, if the task has one. An id
+    /// also goes when that correction is sent ([`delivered_after_all`]).
+    /// Issue #1816: an id is added only while its task has a delegate watch
+    /// and goes with it, so the set holds at most one id per live watch, not
+    /// one per task the generation was ever handed.
     pub(super) uncertain_told: HashSet<String>,
 }
 
@@ -1051,7 +1055,7 @@ pub(super) fn release(
         let approved = linked
             && generation
                 .model
-                .may_hand_over(&delivery.id, a, e, rx)
+                .may_hand_over(now, &delivery.id, a, e, rx)
                 .is_ok();
         if approved && *write == CapsWrite::Written {
             // The caps stay in the deck and the caps file: the waiter reads
@@ -1303,6 +1307,7 @@ fn refusal_code(refusal: HandOverRefusal) -> &'static str {
         HandOverRefusal::WrongReceiver => "wrong_receiver",
         HandOverRefusal::Committed => "committed",
         HandOverRefusal::Revoked => "revoked",
+        HandOverRefusal::HeldEarlier => "held_earlier",
     }
 }
 
@@ -1388,7 +1393,10 @@ pub(super) fn control(
         }
     }
     let grant = control.may.as_ref().map(|may| {
-        match generation.model.may_hand_over(&may.id, may.a, may.e, rx) {
+        match generation
+            .model
+            .may_hand_over(now, &may.id, may.a, may.e, rx)
+        {
             Ok(_) => InboxGrant {
                 q: may.q,
                 ok: true,
@@ -1769,8 +1777,50 @@ pub(super) fn apply(st: &mut HubState, key: &AgentKey, now: Instant, out: &mut O
         }
     }
     sync(st, key, now, &returned);
+    forget_spent(st, key);
     super::drain_events(st);
     broadcast_notices(st, key, now);
+}
+
+/// Issue #1816: drop `key`'s model records that have no use left. A record
+/// goes once the model has no further use for it ([`AttemptModel::spent`]:
+/// ended, every attempt's evidence reclaimed) and the inbox no longer holds a
+/// copy of its message that the pane could read it through: a user action or
+/// an `ack <id>` on a copy the inbox still lists finds the record it found
+/// before. Runs after [`sync`], so an ended state is mirrored into the inbox
+/// before its record can go.
+fn forget_spent(st: &mut HubState, key: &AgentKey) {
+    let Some(generation) = st.receipts.gens.get(key) else {
+        return;
+    };
+    let spent: Vec<String> = generation
+        .model
+        .ids()
+        .into_iter()
+        .filter(|id| generation.model.spent(id))
+        .collect();
+    if spent.is_empty() {
+        return;
+    }
+    // Every copy `Inbox::get` could answer for the pane, and any other
+    // message without a recipient: keeping a record too long is safe.
+    let held: HashSet<&str> = st
+        .inbox
+        .all()
+        .iter()
+        .filter(|m| m.recipient.as_ref().is_none_or(|r| r.pane_id == key.0))
+        .map(|m| m.id.as_str())
+        .collect();
+    let gone: Vec<String> = spent
+        .into_iter()
+        .filter(|id| !held.contains(id.as_str()))
+        .collect();
+    let Some(generation) = st.receipts.gens.get_mut(key) else {
+        return;
+    };
+    for id in &gone {
+        generation.model.forget(id);
+    }
 }
 
 /// Whether `key`'s receipts came through a receiver on `slot`.

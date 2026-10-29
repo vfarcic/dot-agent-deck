@@ -907,7 +907,10 @@ pub async fn handle_dispatch(
     // caller (an internal caller with nobody to report to) records nothing.
     let spawned = match ctx.caller.as_ref() {
         Some(caller) => {
-            crate::spawn::spawn_dispatched_unit(
+            // Issue #1981: the runs the unit's agents open are named after it
+            // from their start, so one that ends at once still carries it.
+            let naming = crate::telemetry::begin_dispatch(&ctx.registry, name, &paths.worktree_dir);
+            let spawned = crate::spawn::spawn_dispatched_unit(
                 req,
                 &ctx.registry,
                 &notifier,
@@ -926,7 +929,11 @@ pub async fn handle_dispatch(
                 },
                 caller.clone(),
             )
-            .await
+            .await;
+            if let Ok(handle) = &spawned {
+                crate::telemetry::dispatch_spawned(naming, handle);
+            }
+            spawned
         }
         None => {
             spawn(

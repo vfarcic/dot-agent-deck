@@ -2301,6 +2301,10 @@ fn pump_reader(
             &agent_id,
             registry.is_shutting_down(),
             || registry.is_agent_still_registered(&agent_id),
+            || {
+                let mut inner = registry.inner.lock();
+                inner.agents.get_mut(&agent_id)?.child.try_wait().ok()?
+            },
         );
     }
     // PRD #1666 S3: whatever the exit, messages bound to this agent can no
@@ -5728,6 +5732,11 @@ pub struct AgentPtyRegistry {
     /// child is terminated — see [`Self::pause_next_respawn_for_test`].
     #[cfg(test)]
     respawn_pause: RespawnPause,
+    /// Issue #1950 test seam: replaces [`RESPAWN_SETTLE_TIMEOUT`] in
+    /// [`Self::freeze_admission`] — see
+    /// [`Self::shorten_respawn_settle_for_test`].
+    #[cfg(test)]
+    respawn_settle: Mutex<Option<Duration>>,
     /// PRD #1666 §2.8 test seam: generations whose exit the inbox hears of
     /// only once the test lets it — see [`Self::hold_exit_cleanup_for_test`].
     #[cfg(test)]
@@ -6734,10 +6743,11 @@ struct PointerWrite {
     queued: bool,
     /// How long the dispatch was queued, from arm time until it dequeued.
     queued_for: Duration,
-    /// The write has begun and not yet returned.
+    /// The dispatch holds the pane's locks and its task is not acknowledged.
     in_progress: bool,
-    /// How long the posted task waited for the worker to acknowledge it
-    /// (PRD #1666; before it, how long a typed pointer waited for a draft).
+    /// How long from the dispatch taking the pane's locks to the worker's
+    /// acknowledgement (PRD #1666 part 3; before it, from the post, and
+    /// before PRD #1666, how long a typed pointer waited for a draft).
     deferred: Duration,
 }
 
@@ -6763,11 +6773,12 @@ pub struct DelegationIdleClock {
     /// How long the dispatch was queued before it went on towards its write.
     /// The idle clock runs that much later.
     pub pointer_queued_for: Duration,
-    /// The task is posted and the worker has not acknowledged it yet, so how
-    /// long it waited is not known yet.
+    /// The dispatch holds the pane's locks, and the worker has not
+    /// acknowledged its task yet, so how long it waited is not known yet.
     pub pointer_in_progress: bool,
-    /// How long the posted task waited for the worker's acknowledgement. The
-    /// idle clock runs that much later.
+    /// How long from the dispatch taking the pane's locks to the worker's
+    /// acknowledgement. The idle clock runs that much later, so it starts at
+    /// the acknowledgement.
     pub pointer_deferred: Duration,
 }
 
@@ -7751,6 +7762,8 @@ impl AgentPtyRegistry {
             #[cfg(test)]
             respawn_pause: Mutex::new(None),
             #[cfg(test)]
+            respawn_settle: Mutex::new(None),
+            #[cfg(test)]
             exit_cleanup_holds: Mutex::new(HashMap::new()),
             #[cfg(test)]
             handover_holds: Mutex::new(HashMap::new()),
@@ -8157,10 +8170,11 @@ impl AgentPtyRegistry {
         }
     }
 
-    /// Issue #544: the delegation `seq` on `worker_pane_id` is about to post
-    /// its task, which the worker then has to acknowledge. Until
-    /// [`Self::finish_delegation_pointer_write`], the idle-worker watch holds
-    /// its report. A no-op if the record is gone or a newer one replaced it.
+    /// Issue #544: the dispatch of delegation `seq` on `worker_pane_id` holds
+    /// the pane's locks and goes on to post its task, which the worker then
+    /// has to acknowledge. Until [`Self::finish_delegation_pointer_write`],
+    /// the idle-worker watch holds its report. A no-op if the record is gone
+    /// or a newer one replaced it.
     pub fn begin_delegation_pointer_write(&self, worker_pane_id: &str, seq: u64) {
         let mut tracker = self.delegations.lock();
         if let Some(record) = tracker.records.get_mut(worker_pane_id)
@@ -8172,8 +8186,9 @@ impl AgentPtyRegistry {
         }
     }
 
-    /// Issue #544: the post [`Self::begin_delegation_pointer_write`] announced
-    /// has ended — acknowledged after `deferred`, or refused (zero).
+    /// Issue #544: the dispatch [`Self::begin_delegation_pointer_write`]
+    /// announced has ended — its task acknowledged `deferred` after the
+    /// dispatch began, or never posted.
     pub fn finish_delegation_pointer_write(
         &self,
         worker_pane_id: &str,
@@ -8181,6 +8196,31 @@ impl AgentPtyRegistry {
         deferred: Duration,
     ) {
         let mut tracker = self.delegations.lock();
+        Self::finish_pointer_locked(&mut tracker, worker_pane_id, seq, deferred);
+    }
+
+    /// [`Self::finish_delegation_pointer_write`] for a destructor, as
+    /// [`Self::dequeue_delegation_pointer_write_in_drop`] is.
+    pub(crate) fn finish_delegation_pointer_write_in_drop(
+        &self,
+        worker_pane_id: &str,
+        seq: u64,
+        deferred: Duration,
+    ) {
+        if let Some(mut tracker) = self
+            .delegations
+            .lock_in_drop(crate::lock_rank::OnPoison::Skip)
+        {
+            Self::finish_pointer_locked(&mut tracker, worker_pane_id, seq, deferred);
+        }
+    }
+
+    fn finish_pointer_locked(
+        tracker: &mut DelegationTracker,
+        worker_pane_id: &str,
+        seq: u64,
+        deferred: Duration,
+    ) {
         if let Some(record) = tracker.records.get_mut(worker_pane_id)
             && record.seq == seq
         {
@@ -15956,7 +15996,23 @@ impl AgentPtyRegistry {
     /// at once with a message saying the daemon is restarting, rather than
     /// waiting on a decision that may take a client round trip.
     pub async fn freeze_admission(&self) -> Result<AdmissionFreeze<'_>, RespawnsInFlight> {
-        self.freeze_admission_within(RESPAWN_SETTLE_TIMEOUT).await
+        #[cfg(test)]
+        let settle = self
+            .respawn_settle
+            .lock()
+            .unwrap()
+            .unwrap_or(RESPAWN_SETTLE_TIMEOUT);
+        #[cfg(not(test))]
+        let settle = RESPAWN_SETTLE_TIMEOUT;
+        self.freeze_admission_within(settle).await
+    }
+
+    /// Issue #1950 test seam: bound [`Self::freeze_admission`]'s wait for
+    /// respawns in flight by `settle`, so a restart refused for a stuck
+    /// respawn answers without waiting out [`RESPAWN_SETTLE_TIMEOUT`].
+    #[cfg(test)]
+    pub(crate) fn shorten_respawn_settle_for_test(&self, settle: Duration) {
+        *self.respawn_settle.lock().unwrap() = Some(settle);
     }
 
     /// [`Self::freeze_admission`] with its wait for respawns in flight bounded
@@ -17969,13 +18025,15 @@ mod spawn_tests {
     /// published on a pane, however many have followed it. A history capped
     /// per pane let a late frame from a generation evicted by the cap fall back
     /// to the type-and-timestamp rule it exists to replace.
+    ///
+    /// Scenario: Publish 34 short-lived agents on one pane, closing each predecessor after its successor takes over. The newest generation is current and every earlier generation is still displaced after its record and PTY have been reaped.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_pane_remembers_every_generation_it_published() {
         use crate::event::GenerationVerdict;
         let registry = Arc::new(AgentPtyRegistry::new());
         let pane = "many-generations-pane-320";
-        let mut published = Vec::new();
+        let mut published: Vec<String> = Vec::new();
         for _ in 0..34 {
             let id = registry
                 .spawn_agent(SpawnOptions {
@@ -17991,6 +18049,16 @@ mod spawn_tests {
                     "generation {id} never exited"
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            // Keep the real publish/handover path, but release the exited
+            // predecessor's PTY before spawning again (#1884). Waiting for
+            // live_count() == 0 alone leaves every master open in the registry.
+            // The registry now retains at most two PTY records. The history
+            // assertions below also prove that reaping does not erase a verdict.
+            if let Some(previous) = published.last() {
+                registry
+                    .close_agent(previous)
+                    .expect("reap the exited predecessor and release its PTY");
             }
             published.push(id);
         }

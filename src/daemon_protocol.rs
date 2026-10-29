@@ -1124,6 +1124,14 @@ pub const CAP_HELLO_FOLLOW_ON: &str = "hello-follow-on";
 /// bump. Advertised on every platform.
 pub const CAP_DECK_OUTCOMES: &str = "deck-outcomes";
 
+/// Capability string for [`AttachRequest::AddressedMessage`] (issue #1947):
+/// message an orchestration's orchestrator, or a folder's one standalone
+/// agent, by folder and/or orchestration name. Held by
+/// [`crate::daemon_client::DaemonClient::addressed_message`], which refuses to
+/// send the request to a daemon that does not advertise it, so no
+/// [`PROTOCOL_VERSION`] bump. Advertised on every platform.
+pub const CAP_ADDRESSED_MESSAGE: &str = "addressed-message";
+
 /// The longest [`FinalReply::text`] the daemon stores or sends, in bytes. A
 /// longer reply is cut to its longest valid UTF-8 prefix within the bound
 /// ([`clamp_turn_reply`]). Reading speaks a summary of the reply, so the head
@@ -1304,6 +1312,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_CLOSE_AGENTS,
     CAP_HELLO_FOLLOW_ON,
     CAP_DECK_OUTCOMES,
+    CAP_ADDRESSED_MESSAGE,
 ];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
@@ -1326,6 +1335,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_CLOSE_AGENTS,
     CAP_HELLO_FOLLOW_ON,
     CAP_DECK_OUTCOMES,
+    CAP_ADDRESSED_MESSAGE,
 ];
 
 // ---------------------------------------------------------------------------
@@ -2262,6 +2272,19 @@ pub enum AttachRequest {
         /// Resolve and report, stop nothing.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         dry_run: bool,
+    },
+    /// Issue #1947: message an orchestration's orchestrator (or a folder's
+    /// one standalone agent) by address — `dot-agent-deck inbox send`.
+    /// Resolved and refused daemon-side by `crate::orchestrator_address`; the
+    /// caller must be an attested agent pane. Answered with
+    /// [`AttachResponse::addressed_message`].
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_ADDRESSED_MESSAGE`]** on
+    /// the connection that carries it, so no [`PROTOCOL_VERSION`] bump.
+    AddressedMessage {
+        address: crate::orchestrator_address::MessageAddress,
+        caller: CallerClaim,
+        body: String,
     },
     AttachStream {
         id: String,
@@ -3900,6 +3923,14 @@ pub struct AttachResponse {
     /// older client ignores the key and an older daemon omits it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance_id: Option<String>,
+    /// Issue #1760: a service manager started this daemon and starts it again
+    /// after a failure-status exit (`crate::daemon_restart::Supervisor`), on the
+    /// live daemon's `Hello` reply only. A local restart onto a new build then
+    /// asks for [`RestartSuccessor::Installed`], so the daemon hands back to its
+    /// service instead of stopping it. Additive: `false` is omitted, and is what
+    /// an older daemon's reply reads as, so no [`PROTOCOL_VERSION`] bump.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub supervised: bool,
     /// PRD #1666 S3: this deck's id, the 8-character token in every inbox
     /// address and message id (`m-<deck>-…`), on the live daemon's `Hello`
     /// reply only. It is persisted in the daemon's state directory, so it is the
@@ -3944,6 +3975,11 @@ pub struct AttachResponse {
     /// optional, and its request is capability-gated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deck_outcomes: Option<crate::report_recovery::DeckOutcomes>,
+    /// Issue #1947: the answer to [`AttachRequest::AddressedMessage`]. `None` on
+    /// every other response. A refusal is a report on an `ok` response.
+    /// Additive and optional, and its request is capability-gated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub addressed_message: Option<crate::orchestrator_address::AddressedMessageReport>,
 }
 
 /// PRD #1487: this daemon process's identity for [`AttachResponse::instance_id`]
@@ -4760,7 +4796,9 @@ fn restart_refusal(reason: RestartRefusalReason, message: String) -> AttachRespo
 /// PRD #1487: the [`AttachRequest::RestartDaemon`] arm. Steps, in order:
 ///
 /// 1. Take the restart lock; a held lock, an accepted restart, or a daemon
-///    already shutting down is `InProgress`. Held until step 6.
+///    already shutting down is `InProgress`. Held until step 6, or until an
+///    answer that accepts nothing is about to be written
+///    ([`answer_without_accepting`]).
 /// 2. `Installed` mode: resolve and verify the target. A failure is `Refused`
 ///    and nothing has been touched — before the live-set check, so nobody is
 ///    asked to confirm a restart that cannot happen.
@@ -4802,18 +4840,25 @@ async fn handle_restart_daemon(
         verify_restart_target_pinned,
     };
 
-    // 1.
-    let guard = match restart.try_begin() {
-        Some(guard) if !stop_under_way(registry, restart) => guard,
-        _ => {
-            warn!("RestartDaemon refused: another restart or shutdown is already under way");
-            let resp = restart_refusal(
-                RestartRefusalReason::InProgress,
-                "another restart or shutdown of this daemon is already under way".into(),
-            );
-            return write_resp(stream, &resp).await;
-        }
+    // 1. A stop claimed after `try_begin` returned is refused with the lock
+    // in hand, so that refusal releases it before answering (#1950).
+    let in_progress = || {
+        warn!("RestartDaemon refused: another restart or shutdown is already under way");
+        restart_refusal(
+            RestartRefusalReason::InProgress,
+            "another restart or shutdown of this daemon is already under way".into(),
+        )
     };
+    let Some(guard) = restart.try_begin() else {
+        return write_resp(stream, &in_progress()).await;
+    };
+    #[cfg(test)]
+    restart
+        .checkpoint(crate::daemon_restart::RestartPause::AfterBeginning)
+        .await;
+    if stop_under_way(registry, restart) {
+        return answer_without_accepting(stream, restart, guard, None, &in_progress()).await;
+    }
 
     // 2.
     let (target, to_version) = match mode {
@@ -4827,7 +4872,8 @@ async fn handle_restart_daemon(
                         restart.install().startup_exe.display()
                     );
                     warn!(?reason, "RestartDaemon refused: {message}");
-                    return write_resp(stream, &restart_refusal(reason, message)).await;
+                    let resp = restart_refusal(reason, message);
+                    return answer_without_accepting(stream, restart, guard, None, &resp).await;
                 }
             };
             let check_target = target.clone();
@@ -4853,7 +4899,8 @@ async fn handle_restart_daemon(
                 }
                 Err((reason, message)) => {
                     warn!(?reason, target = %target.display(), "RestartDaemon refused: {message}");
-                    return write_resp(stream, &restart_refusal(reason, message)).await;
+                    let resp = restart_refusal(reason, message);
+                    return answer_without_accepting(stream, restart, guard, None, &resp).await;
                 }
             }
         }
@@ -4874,17 +4921,15 @@ async fn handle_restart_daemon(
                            try again once it is back"
                 .to_string();
             warn!("RestartDaemon refused: {message}");
-            return write_resp(
-                stream,
-                &restart_refusal(RestartRefusalReason::InProgress, message),
-            )
-            .await;
+            let resp = restart_refusal(RestartRefusalReason::InProgress, message);
+            return answer_without_accepting(stream, restart, guard, None, &resp).await;
         }
     };
     // A stop that arrived during the verification or the freeze wins: refuse,
     // having stopped nothing (Qodo 4201244680).
     if stop_under_way(registry, restart) {
-        return refuse_restart_for_stop(stream).await;
+        let resp = restart_refusal_for_stop();
+        return answer_without_accepting(stream, restart, guard, Some(admission), &resp).await;
     }
     let at_stake = {
         let role_maps = state.read().await;
@@ -4894,7 +4939,6 @@ async fn handle_restart_daemon(
 
     // 4.
     if let Some(reply) = restart_decision(&at_stake, confirm.as_ref()) {
-        drop(admission);
         let stale = matches!(
             reply,
             RestartDaemonReply::NeedsConfirmation { stale: true, .. }
@@ -4918,7 +4962,7 @@ async fn handle_restart_daemon(
         );
         let mut resp = AttachResponse::err(summary);
         resp.restart = Some(reply);
-        return write_resp(stream, &resp).await;
+        return answer_without_accepting(stream, restart, guard, Some(admission), &resp).await;
     }
 
     #[cfg(test)]
@@ -4928,7 +4972,8 @@ async fn handle_restart_daemon(
 
     // The last moment a stop can still be answered as a refusal.
     if stop_under_way(registry, restart) {
-        return refuse_restart_for_stop(stream).await;
+        let resp = restart_refusal_for_stop();
+        return answer_without_accepting(stream, restart, guard, Some(admission), &resp).await;
     }
 
     // 5. A failed write returns here, dropping the reservation: nothing was
@@ -5012,13 +5057,38 @@ fn stop_under_way(
     registry.is_shutting_down() || restart.is_stop_requested()
 }
 
-async fn refuse_restart_for_stop(stream: &mut IpcStream) -> io::Result<()> {
+fn restart_refusal_for_stop() -> AttachResponse {
     warn!("RestartDaemon refused: the daemon is stopping");
-    let resp = restart_refusal(
+    restart_refusal(
         RestartRefusalReason::InProgress,
         "this daemon is stopping; nothing was restarted".into(),
-    );
-    write_resp(stream, &resp).await
+    )
+}
+
+/// Write an answer to a [`AttachRequest::RestartDaemon`] that accepts no
+/// restart — `NeedsConfirmation` or a refusal — releasing the reservation and
+/// the lock first (#1950). A client may act on the answer the moment it reads
+/// it — confirm, or try again — and that request must meet what the daemon is
+/// doing, not this finished one: with the lock still held it would be refused
+/// as another restart in progress. The reservation goes before the lock, so a
+/// freeze the next handler takes is never lifted by this one's drop.
+async fn answer_without_accepting(
+    stream: &mut IpcStream,
+    restart: &crate::daemon_restart::RestartControl,
+    guard: tokio::sync::MutexGuard<'_, ()>,
+    admission: Option<crate::agent_pty::AdmissionFreeze<'_>>,
+    resp: &AttachResponse,
+) -> io::Result<()> {
+    drop(admission);
+    drop(guard);
+    let written = write_resp(stream, resp).await;
+    #[cfg(test)]
+    restart
+        .checkpoint(crate::daemon_restart::RestartPause::AfterAnswering)
+        .await;
+    #[cfg(not(test))]
+    let _ = restart;
+    written
 }
 
 /// PRD #1589 D5: end the dispatched unit `record` belonged to, once its agent
@@ -6582,6 +6652,23 @@ async fn handle_connection(
             };
             write_resp(&mut stream, &resp).await?
         }
+        AttachRequest::AddressedMessage {
+            address,
+            caller,
+            body,
+        } => {
+            // Issue #1947: resolve, authorize and post, or refuse — see
+            // `crate::orchestrator_address`.
+            let report = crate::orchestrator_address::handle_addressed_message(
+                address, caller, body, &registry,
+            )
+            .await;
+            let resp = AttachResponse {
+                addressed_message: Some(report),
+                ..AttachResponse::ok()
+            };
+            write_resp(&mut stream, &resp).await?
+        }
         AttachRequest::SetAgentLabel {
             id,
             display_name,
@@ -6826,6 +6913,9 @@ async fn handle_connection(
             // PRD #1666 S3: the deck token every inbox address and message id
             // carries.
             resp.deck_id = Some(registry.inbox().deck().to_string());
+            // Issue #1760: say whether a service manager restarts this daemon.
+            resp.supervised =
+                restart.install().supervisor != crate::daemon_restart::Supervisor::None;
             if !omit_running_agents {
                 let summary = RunningAgentsSummary::from_records(&registry.agent_records());
                 resp = resp.with_running_agents(summary);
@@ -13824,7 +13914,14 @@ mod tests {
         }
 
         async fn restart(&self, confirm: Option<RestartStopSet>) -> RestartDaemonReply {
-            match self.client().restart_daemon(Self::request(confirm)).await {
+            self.ask(Self::request(confirm)).await
+        }
+
+        async fn ask(
+            &self,
+            request: crate::daemon_client::RestartDaemonRequest,
+        ) -> RestartDaemonReply {
+            match self.client().restart_daemon(request).await {
                 Ok(crate::daemon_client::GatedQuery::Answered(reply)) => reply,
                 other => panic!("no restart answer: {other:?}"),
             }
@@ -13920,9 +14017,10 @@ mod tests {
     /// record already lifted out, the replacement not yet published — when a
     /// client confirms a restart naming the old worker. The restart waits for
     /// the respawn instead of snapshotting an empty pane, sees the replacement,
-    /// and asks again naming it; confirming that set is accepted with the
-    /// pane's new worker in the named set, so nothing it stops is unnamed and
-    /// no replacement is stranded (PRD #1487 re-check R2).
+    /// and asks again naming it; confirming that set at once — while the
+    /// handler that asked has not yet returned — is accepted with the pane's
+    /// new worker in the named set, so nothing it stops is unnamed and no
+    /// replacement is stranded (PRD #1487 re-check R2, #1950).
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_respawn_mid_window_is_named_by_the_restart_or_it_asks_again() {
@@ -13954,6 +14052,11 @@ mod tests {
             .expect("the respawn reached its window")
             .unwrap();
 
+        // #1950: hold the handler that asks just after its question is written,
+        // where a client confirming at once can overtake its return.
+        let asked = fx
+            .restart
+            .pause_at(crate::daemon_restart::RestartPause::AfterAnswering);
         let restarting = {
             let client = fx.client();
             let request = RestartFixture::request(Some(confirm));
@@ -13994,8 +14097,15 @@ mod tests {
             !fx.registry.is_admission_frozen(),
             "asking released the reservation"
         );
+        tokio::time::timeout(Duration::from_secs(30), asked.reached.notified())
+            .await
+            .expect("the handler that asked paused after its answer");
 
-        match fx.restart(Some(at_stake)).await {
+        let confirmed = tokio::time::timeout(Duration::from_secs(30), fx.restart(Some(at_stake)))
+            .await
+            .expect("the confirmation is answered");
+        asked.resume.notify_one();
+        match confirmed {
             RestartDaemonReply::Accepted { stopping, .. } => {
                 assert_eq!(
                     stop_set_ids(&stopping),
@@ -14010,6 +14120,243 @@ mod tests {
                 );
             }
             other => panic!("expected Accepted, got {other:?}"),
+        }
+    }
+
+    /// Scenario: a client asks a daemon it started from a path it cannot use
+    /// to restart onto its installed build — first a path the daemon cannot
+    /// work out, then a build that is not there — and is refused. Held just
+    /// after writing each refusal, the daemon is asked again at once: the
+    /// retry gets the same reason, not "another restart is already under way"
+    /// (#1950).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refused_restart_answers_a_retry_with_its_own_reason() {
+        let bin = tempfile::tempdir().unwrap();
+        let cases = [
+            (
+                crate::daemon_restart::InstallRecord::unresolved(),
+                RestartRefusalReason::TargetUnresolvable,
+            ),
+            (
+                crate::daemon_restart::InstallRecord {
+                    startup_exe: bin.path().join("dot-agent-deck"),
+                    supervisor: crate::daemon_restart::Supervisor::None,
+                },
+                RestartRefusalReason::TargetMissing,
+            ),
+        ];
+        for (install, expected) in cases {
+            let fx = RestartFixture::start_with(install).await;
+            let answered = fx
+                .restart
+                .pause_at(crate::daemon_restart::RestartPause::AfterAnswering);
+            match fx.ask(installed_request()).await {
+                RestartDaemonReply::Refused { reason, .. } => assert_eq!(reason, expected),
+                other => panic!("expected Refused({expected:?}), got {other:?}"),
+            }
+            tokio::time::timeout(Duration::from_secs(30), answered.reached.notified())
+                .await
+                .expect("the refusing handler paused after its answer");
+
+            let retry = tokio::time::timeout(Duration::from_secs(30), fx.ask(installed_request()))
+                .await
+                .expect("the retry is answered");
+            answered.resume.notify_one();
+            match retry {
+                RestartDaemonReply::Refused { reason, .. } => assert_eq!(
+                    reason, expected,
+                    "the retry is refused for its own reason, not the finished request"
+                ),
+                other => panic!("expected Refused({expected:?}), got {other:?}"),
+            }
+        }
+    }
+
+    /// Scenario: a worker is stuck mid-respawn, so a client's restart is
+    /// refused because an agent is being restarted. Held just after writing
+    /// that refusal, the daemon lets the respawn finish and is asked again at
+    /// once: the retry is answered with a question naming the worker, not
+    /// "another restart is already under way" (#1950).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restart_refused_for_a_stuck_respawn_answers_the_retry() {
+        let fx = RestartFixture::start().await;
+        fx.registry
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                command: Some("cat"),
+                env: vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "respawning-pane".to_string(),
+                )],
+                ..crate::agent_pty::SpawnOptions::default()
+            })
+            .expect("the worker starts");
+        fx.registry
+            .shorten_respawn_settle_for_test(Duration::from_millis(300));
+        let (reached, release) = fx.registry.pause_next_respawn_for_test();
+        let respawn = {
+            let registry = fx.registry.clone();
+            tokio::spawn(async move {
+                registry
+                    .respawn_agent_for_pane("respawning-pane", "cat")
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(30), reached)
+            .await
+            .expect("the respawn reached its window")
+            .unwrap();
+
+        let answered = fx
+            .restart
+            .pause_at(crate::daemon_restart::RestartPause::AfterAnswering);
+        match fx.restart(None).await {
+            RestartDaemonReply::Refused { reason, message } => {
+                assert_eq!(reason, RestartRefusalReason::InProgress);
+                assert!(message.contains("being restarted"), "{message}");
+            }
+            other => panic!("expected Refused(InProgress) for the respawn, got {other:?}"),
+        }
+        tokio::time::timeout(Duration::from_secs(30), answered.reached.notified())
+            .await
+            .expect("the refusing handler paused after its answer");
+        release.send(()).unwrap();
+        let new = tokio::time::timeout(Duration::from_secs(30), respawn)
+            .await
+            .expect("the respawn finishes")
+            .unwrap()
+            .expect("the respawn publishes its replacement");
+
+        let retry = tokio::time::timeout(Duration::from_secs(30), fx.restart(None))
+            .await
+            .expect("the retry is answered");
+        answered.resume.notify_one();
+        match retry {
+            RestartDaemonReply::NeedsConfirmation { at_stake, .. } => assert_eq!(
+                stop_set_ids(&at_stake),
+                std::collections::BTreeSet::from([new])
+            ),
+            other => panic!("expected a question naming the replacement, got {other:?}"),
+        }
+    }
+
+    /// Scenario: a client asks an idle daemon to restart onto its installed
+    /// build, and a stop is claimed while the build is being checked, so the
+    /// restart is refused as "the daemon is stopping". Held just after
+    /// writing that refusal, the stop is withdrawn and the daemon is asked
+    /// again at once: the retry is accepted, not refused as "another restart
+    /// is already under way" (#1950).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restart_refused_for_a_withdrawn_stop_accepts_the_retry() {
+        let bin = tempfile::tempdir().unwrap();
+        let started = bin.path().join("started");
+        let go = bin.path().join("go");
+        // Only the first check waits; the retry's answers at once.
+        let prelude = format!(
+            "if [ ! -e '{go}' ]; then touch '{started}'; while [ ! -e '{go}' ]; do sleep 0.02; done; fi",
+            started = started.display(),
+            go = go.display()
+        );
+        let target = installed_build(bin.path(), &prelude);
+        let fx = RestartFixture::start_with(crate::daemon_restart::InstallRecord {
+            startup_exe: target,
+            supervisor: crate::daemon_restart::Supervisor::None,
+        })
+        .await;
+
+        let answered = fx
+            .restart
+            .pause_at(crate::daemon_restart::RestartPause::AfterAnswering);
+        let restarting = {
+            let client = fx.client();
+            tokio::spawn(async move { client.restart_daemon(installed_request()).await })
+        };
+        wait_until("the installed build is being checked", || started.exists()).await;
+        let stop = fx.restart.claim_stop().expect("a stop can be claimed");
+        std::fs::write(&go, b"").unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(30), restarting)
+            .await
+            .expect("the restart answered")
+            .unwrap();
+        match reply {
+            Ok(crate::daemon_client::GatedQuery::Answered(RestartDaemonReply::Refused {
+                reason,
+                message,
+            })) => {
+                assert_eq!(reason, RestartRefusalReason::InProgress);
+                assert!(message.contains("stopping"), "{message}");
+            }
+            other => panic!("expected Refused(InProgress) for the stop, got {other:?}"),
+        }
+        tokio::time::timeout(Duration::from_secs(30), answered.reached.notified())
+            .await
+            .expect("the refusing handler paused after its answer");
+        drop(stop);
+
+        let retry = tokio::time::timeout(Duration::from_secs(30), fx.ask(installed_request()))
+            .await
+            .expect("the retry is answered");
+        answered.resume.notify_one();
+        match retry {
+            RestartDaemonReply::Accepted { successor, .. } => {
+                assert_eq!(successor, RestartSuccessor::Installed)
+            }
+            other => panic!("expected Accepted once the stop was withdrawn, got {other:?}"),
+        }
+    }
+
+    /// Scenario: a client asks an idle daemon to restart, and a stop is
+    /// claimed just after the handler took its lock but before it checked for
+    /// a stop, so the restart is refused as "already under way". Held just
+    /// after writing that refusal, the stop is withdrawn and the daemon is
+    /// asked again at once: the retry is accepted, not refused by the finished
+    /// request's lock (#1950).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restart_refused_for_a_stop_claimed_after_its_lock_accepts_the_retry() {
+        let fx = RestartFixture::start().await;
+        let begun = fx
+            .restart
+            .pause_at(crate::daemon_restart::RestartPause::AfterBeginning);
+        let restarting = {
+            let client = fx.client();
+            tokio::spawn(async move { client.restart_daemon(RestartFixture::request(None)).await })
+        };
+        tokio::time::timeout(Duration::from_secs(30), begun.reached.notified())
+            .await
+            .expect("the handler took its lock");
+        let stop = fx.restart.claim_stop().expect("a stop can be claimed");
+        let answered = fx
+            .restart
+            .pause_at(crate::daemon_restart::RestartPause::AfterAnswering);
+        begun.resume.notify_one();
+        let reply = tokio::time::timeout(Duration::from_secs(30), restarting)
+            .await
+            .expect("the restart answered")
+            .unwrap();
+        match reply {
+            Ok(crate::daemon_client::GatedQuery::Answered(RestartDaemonReply::Refused {
+                reason,
+                ..
+            })) => assert_eq!(reason, RestartRefusalReason::InProgress),
+            other => panic!("expected Refused(InProgress) for the stop, got {other:?}"),
+        }
+        tokio::time::timeout(Duration::from_secs(30), answered.reached.notified())
+            .await
+            .expect("the refusing handler paused after its answer");
+        drop(stop);
+
+        let retry = tokio::time::timeout(Duration::from_secs(30), fx.restart(None))
+            .await
+            .expect("the retry is answered");
+        answered.resume.notify_one();
+        match retry {
+            RestartDaemonReply::Accepted { successor, .. } => {
+                assert_eq!(successor, RestartSuccessor::ClientSpawns)
+            }
+            other => panic!("expected Accepted once the stop was withdrawn, got {other:?}"),
         }
     }
 

@@ -56,6 +56,10 @@ fn pane(daemon: &DaemonProc, name: &str, command: &str) -> Pane {
         "cwd":daemon.home, "rows":24, "cols":100,
         "env":[["DOT_AGENT_DECK_PANE_ID",name]], "display_name":name}),
     );
+    spawned_pane(daemon, name, reply)
+}
+
+fn spawned_pane(daemon: &DaemonProc, name: &str, reply: Value) -> Pane {
     assert_eq!(reply["ok"], true, "stand-in spawn: {reply}");
     let agent = reply["id"].as_str().expect("spawned agent id").to_string();
     let token = tokio::runtime::Runtime::new()
@@ -286,7 +290,7 @@ fn inbox_protocol_021_a_pane_capability_holder_outside_the_agent_tree_takes_its_
     );
 }
 
-/// Scenario: Two panes run, and a third pane's agent is stopped and started again so it has a new generation. From outside every pane, requests for the first pane's queued task carrying the second pane's capability, no capability at all, or the third pane's earlier generation's capability are each refused with their own named cause, and every task stays queued. The same outside process holding the first pane's current capability is refused the old plain fetch, which takes nothing, then fetches its task on receipts and acknowledges it.
+/// Scenario: Two panes run, and a third pane's agent is stopped and started again, waiting for its pane id to become reusable, so it has a new generation. From outside every pane, requests for the first pane's queued task carrying the second pane's capability, no capability at all, or the third pane's earlier generation's capability are each refused with their own named cause, and every task stays queued. The same outside process holding the first pane's current capability is refused the old plain fetch, which takes nothing, then fetches its task on receipts and acknowledges it.
 #[spec("inbox/protocol/022")]
 #[test]
 fn inbox_protocol_022_a_wrong_missing_or_earlier_capability_takes_nothing() {
@@ -328,7 +332,27 @@ fn inbox_protocol_022_a_wrong_missing_or_earlier_capability_takes_nothing() {
     let earlier = pane(&daemon, "capability-respawned", "exec /bin/cat");
     let stopped = attach(&daemon, json!({"op":"stop-agent", "id":earlier.agent}));
     assert_eq!(stopped["ok"], true, "stop the first generation: {stopped}");
-    let current = pane(&daemon, "capability-respawned", "exec /bin/cat");
+    // Stop success says the agent has stopped; its handler can still hold
+    // the pane id while finishing cleanup after that reply (#1930).
+    let deadline = std::time::Instant::now() + WAIT;
+    let replacement = loop {
+        let reply = attach(
+            &daemon,
+            json!({"op":"start-agent", "command":common::capability_export_command("exec /bin/cat"),
+            "cwd":daemon.home, "rows":24, "cols":100,
+            "env":[["DOT_AGENT_DECK_PANE_ID",earlier.id]], "display_name":earlier.id}),
+        );
+        if reply["error"] != "Duplicate pane id: capability-respawned" {
+            break reply;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stopped pane's cleanup did not release its id: {reply}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let current = spawned_pane(&daemon, &earlier.id, replacement);
+    assert_eq!(current.id, earlier.id);
     assert_ne!(current.agent, earlier.agent);
     let successor_task = post(
         &daemon,

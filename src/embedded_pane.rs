@@ -1328,6 +1328,35 @@ impl EmbeddedPaneController {
         notice_identity_refusal(&self.close_warnings, error)
     }
 
+    /// Issue #1913: record that `pane_id`'s agent was lost to a deck restart,
+    /// as its reattach does once it meets the restarted deck, when the pane is
+    /// still attached on `replaced` — a process the caller knows the deck
+    /// replaced. Answers whether it was recorded.
+    pub(crate) fn mark_lost_to_restart(&self, pane_id: &str, replaced: &Incarnation) -> bool {
+        let panes = self.panes.lock().unwrap();
+        let Some(pane) = panes.get(pane_id) else {
+            return false;
+        };
+        let attached_on_replaced = pane
+            .backend
+            .attached
+            .lock()
+            .unwrap()
+            .incarnation
+            .as_ref()
+            .is_some_and(|attached_on| attached_on.same_process(replaced));
+        if attached_on_replaced {
+            *pane.backend.lost.lock().unwrap() = Some(PaneLostReason::DeckRestarted);
+        }
+        attached_on_replaced
+    }
+
+    /// Issue #1913: whether this controller holds a local pane under
+    /// `pane_id` at all, attached or not.
+    pub(crate) fn holds_pane(&self, pane_id: &str) -> bool {
+        self.panes.lock().unwrap().contains_key(pane_id)
+    }
+
     /// Test-only: record that `pane_id`'s agent was lost for `reason`, as
     /// the pane's reattach does, without waiting out a reattach.
     #[cfg(all(test, unix))]
@@ -1340,6 +1369,29 @@ impl EmbeddedPaneController {
             .lost
             .lock()
             .unwrap() = Some(reason);
+    }
+
+    /// Test-only: end `pane_id`'s I/O task having recorded `reason`, as a
+    /// reattach that gives up does, and return once input to the pane fails.
+    #[cfg(all(test, unix))]
+    pub(crate) fn end_pane_io_for_test(&self, pane_id: &str, reason: PaneLostReason) {
+        let input_tx = {
+            let mut panes = self.panes.lock().unwrap();
+            let pane = panes.get_mut(pane_id).expect("the pane");
+            *pane.backend.lost.lock().unwrap() = Some(reason);
+            if let Some(io_task) = pane.backend.io_task.take() {
+                io_task.abort();
+            }
+            pane.backend.input_tx.clone()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !input_tx.is_closed() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pane's I/O task never ended"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     /// Test-only constructor for code paths that need a `PaneController`

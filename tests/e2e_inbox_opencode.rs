@@ -102,6 +102,21 @@ impl OpenCode {
         );
         let module = root.join("fixture-plugin.mjs");
         std::fs::copy(plugin, &module).unwrap();
+        // PRD #1666 Q57: the receiver as installed before it reported its
+        // possession with each final check, the one line that differs.
+        if config["oldReceiver"] == true {
+            let text = std::fs::read_to_string(&module).unwrap();
+            let old = text.replace(
+                "inboxWrite(child, { possess: possession(), may: { q: id, ...ref } })",
+                OLD_MAY_WRITE,
+            );
+            assert_eq!(
+                old.matches(OLD_MAY_WRITE).count(),
+                1,
+                "the generated receiver asks its final check in one place"
+            );
+            std::fs::write(&module, old).unwrap();
+        }
         if config["preServer"] == true {
             std::fs::copy(
                 root.join("plugin/dot-agent-deck.js"),
@@ -688,30 +703,190 @@ fn opencode_005_a_lost_watcher_resumes_and_a_closed_one_requeues_nothing() {
     }
 }
 
-/// Scenario: Leave a delivered task without an assistant child across many keepalives. The plugin keeps it in every possession snapshot, so it is never repeated and never undeliverable; once OpenCode answers it, it is acknowledged, with one prompt.
+/// Scenario: Leave a delivered task without an assistant child and stall the plugin for one second, within a load-scaled possession TTL. Check for a repeat or loss of fetched state before checking that fresh snapshots span a full TTL on a monotonic clock; once OpenCode answers it, it is acknowledged.
 #[spec("inbox/opencode/006")]
 #[test]
 fn opencode_006_a_held_delivery_is_never_repeated() {
-    let op = OpenCode::new("session", json!({"keepaliveMs":"300","maxDeliver":"2"}));
+    // A one-second scheduling gap exceeded the old 900 ms TTL (#1940).
+    // Keep the gap, but give the fixture's 100 ms snapshot cadence a six-second
+    // TTL, widened under load. Observe beyond that TTL so a missing renewal
+    // cannot hide inside the initial issue grace. The fixture pulses the real
+    // plugin's keepalive callback; it does not manufacture possession reports.
+    let keepalive = common::load_scaled(Duration::from_secs(2));
+    let ttl = keepalive * 3;
+    let op = OpenCode::new(
+        "session",
+        json!({"keepaliveMs":keepalive.as_millis().to_string(),"maxDeliver":"2","snapshotStallMs":1000,"snapshotEveryMs":100}),
+    );
     let id = op.post();
     op.wait_kind("prompt");
-    assert!(
-        !common::wait_until(Duration::from_secs(4), || op.prompts().len() > 1
-            || op.message_state(&id) != "fetched"),
-        "a possessed delivery is never repeated: {:?}",
+    op.wait_kind("stalled");
+    let observation = std::cell::RefCell::new((0, Value::Null));
+    common::wait_until(keepalive * 4, || {
+        let prompt_count = op.prompts().len();
+        let message_state = op.message_state(&id);
+        let repeated_or_lost = prompt_count > 1 || message_state != "fetched";
+        observation.replace((prompt_count, message_state));
+        repeated_or_lost
+    });
+    let (prompt_count, message_state) = observation.into_inner();
+    // Preserve the observation that ended polling and name a regression before
+    // judging fixture history, which an early failure necessarily cuts short.
+    assert_eq!(
+        prompt_count,
+        1,
+        "a possessed delivery was repeated before acknowledgement: {:?}",
         op.events()
     );
+    assert_eq!(
+        message_state,
+        "fetched",
+        "a possessed delivery lost fetched state before acknowledgement: {:?}",
+        op.events()
+    );
+    let snapshots: Vec<_> = op
+        .events()
+        .into_iter()
+        .filter(|e| e["kind"] == "stdin")
+        .filter_map(|e| {
+            let control: Value = serde_json::from_str(e["text"].as_str()?).ok()?;
+            control["possess"]["held"]
+                .as_array()?
+                .iter()
+                .any(|held| held["id"] == id)
+                .then(|| e["monotonicMs"].as_i64().unwrap())
+        })
+        .collect();
+    let ttl_ms = i64::try_from(ttl.as_millis()).unwrap();
     assert!(
-        op.controls()
-            .iter()
-            .filter(|c| c["possess"].is_object())
-            .count()
-            >= 6,
-        "a snapshot answers each keepalive: {:?}",
-        op.controls()
+        snapshots.len() >= 4
+            && snapshots.last().unwrap() - snapshots[0] >= ttl_ms
+            && snapshots
+                .windows(2)
+                .all(|pair| (0..ttl_ms).contains(&(pair[1] - pair[0]))),
+        "fixture must report possession across a full TTL without a lapse; ttl={ttl:?}, snapshots={snapshots:?}; events={:?}",
+        op.events()
     );
     op.acknowledge(&id);
     assert_eq!(op.prompts().len(), 1);
+}
+
+/// The final check as a receiver from before PRD #1666 Q57 writes it: no
+/// possession on the same line.
+const OLD_MAY_WRITE: &str = "inboxWrite(child, { may: { q: id, ...ref } })";
+
+/// #1940's stall: one task is prompted and left without an assistant child,
+/// then, from the first snapshot holding it after that prompt (the fixture
+/// waits for the prompt), the plugin's event loop blocks just past the
+/// possession TTL while it still holds the task, long enough for the deck to hand out an automatic
+/// repeat and short enough that the watcher keeps its stream. Returns the
+/// task id once the repeat's `not_handed` (or its prompt) is in.
+fn stalled_repeat(config: Value) -> (OpenCode, String) {
+    let keepalive = common::load_scaled(Duration::from_millis(300));
+    let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap();
+    let mut config = config;
+    config["keepaliveMs"] = json!(ms(keepalive).to_string());
+    config["maxDeliver"] = json!("2");
+    // Land the held snapshot a third of a keepalive after one, and resume a
+    // third of a keepalive before the watcher's fourth check: the deck's TTL
+    // runs out a third of a keepalive before the plugin resumes.
+    config["snapshotStallDelayMs"] = json!(ms(keepalive / 3));
+    config["snapshotStallMs"] = json!(ms(keepalive * 10 / 3));
+    let op = OpenCode::new("session", config);
+    let id = op.post();
+    op.wait_kind("prompt");
+    op.wait_kind("stalled");
+    let repeated = |op: &OpenCode| {
+        op.controls().iter().any(|c| {
+            c["not_handed"]
+                .as_array()
+                .is_some_and(|refs| refs.iter().any(|r| r["id"] == id && r["e"] == 2))
+        }) || op.prompts().len() > 1
+    };
+    assert!(
+        common::wait_until(WAIT, || repeated(&op)),
+        "precondition: the stall let the deck hand out e:2; events={:?}",
+        op.events()
+    );
+    assert_eq!(
+        op.watchers().len(),
+        1,
+        "precondition: the watcher kept its stream through the stall: {}",
+        timeline(&op)
+    );
+    (op, id)
+}
+
+/// The grant that answered the plugin's final check for attempt `e` of `id`.
+fn grant_for(op: &OpenCode, id: &str, e: u32) -> (Value, Value) {
+    let may = op
+        .controls()
+        .into_iter()
+        .find(|c| c["may"]["id"] == id && c["may"]["e"] == e)
+        .unwrap_or_else(|| panic!("the plugin asked for e:{e}: {:?}", op.controls()));
+    let q = may["may"]["q"].clone();
+    let grant = watcher_streams(op)
+        .values()
+        .flat_map(|stream| stream.lines().map(str::to_owned).collect::<Vec<_>>())
+        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+        .find(|reply| reply["grant"]["q"] == q)
+        .unwrap_or_else(|| panic!("the deck answered q:{q}: {:?}", op.events()))["grant"]
+        .clone();
+    (may, grant)
+}
+
+/// Scenario: Prompt a task through the generated TUI plugin and leave it unanswered, then stall the plugin past the possession TTL so the deck hands out an automatic repeat while the plugin still holds the first. The repeat's final check is refused `held_earlier`, the plugin reports it not handed, and OpenCode gets exactly one prompt; the matching assistant turn acknowledges the task. The same holds for the receiver as installed before it reported possession with its check.
+#[spec("inbox/opencode/057")]
+#[test]
+fn opencode_057_a_stalled_plugin_still_holding_a_task_is_not_prompted_again() {
+    for old_receiver in [false, true] {
+        let (op, id) = stalled_repeat(json!({"oldReceiver": old_receiver}));
+        let (may, grant) = grant_for(&op, &id, 2);
+        assert_eq!(
+            (&grant["ok"], &grant["refusal"]),
+            (&json!(false), &json!("held_earlier")),
+            "old receiver {old_receiver}: the repeat waits behind the held attempt: {}",
+            timeline(&op)
+        );
+        assert_eq!(
+            may["possess"]["held"]
+                .as_array()
+                .is_some_and(|held| held.iter().any(|h| h["id"] == id && h["e"] == 1)),
+            !old_receiver,
+            "old receiver {old_receiver}: the check carries the plugin's possession only from a current plugin: {may}"
+        );
+        assert!(
+            !common::wait_until(Duration::from_secs(2), || op.prompts().len() > 1),
+            "old receiver {old_receiver}: OpenCode got the task twice: {:?}",
+            op.prompts()
+        );
+        assert_eq!(op.message_state(&id), "fetched");
+        op.acknowledge(&id);
+        assert_eq!(op.prompts().len(), 1, "old receiver {old_receiver}");
+    }
+}
+
+/// Scenario: After the same stall and refused repeat, the person aborts the unanswered turn: its session goes idle, so the plugin drops the task. The deck then prompts it once more, marked as a possible repeat, and the matching assistant turn acknowledges it, so after this one refusal the lost task still reaches OpenCode.
+#[spec("inbox/opencode/058")]
+#[test]
+fn opencode_058_a_task_lost_after_a_refused_repeat_is_prompted_again_marked() {
+    let (op, id) = stalled_repeat(json!({}));
+    let (_, grant) = grant_for(&op, &id, 2);
+    assert_eq!(grant["ok"], false, "precondition: the repeat was refused");
+    assert_eq!(op.prompts().len(), 1, "precondition: one prompt so far");
+    op.session_status("shown", "idle");
+    assert!(
+        common::wait_until(WAIT, || op.prompts().len() >= 2),
+        "a task the plugin lost after a refused repeat is prompted again: {}",
+        timeline(&op)
+    );
+    assert_eq!(
+        op.marked(&id),
+        1,
+        "the repeat is marked as a possible repeat"
+    );
+    op.acknowledge(&id);
+    assert_eq!(op.prompts().len(), 2);
 }
 
 /// Scenario: Load the generated server plugin with mini, full-TUI, run, serve and attach argv. Only the main-thread mini process arms a native watcher; the full TUI's worker keeps a doorbell-only receiver that is never armed, and run, serve and attach start none.

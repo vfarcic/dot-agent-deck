@@ -58,7 +58,7 @@ const CLI_BREW: SelfUpgradePlan = {
   provenance: { checked: false, reason: "the GitHub CLI (`gh`) is not installed" },
   lines: [
     { text: "dot-agent-deck CLI: update available: v0.47.0 (current: v0.46.0)", command: null },
-    { text: "Installed with Homebrew (/opt/homebrew/Cellar/dot-agent-deck/0.46.0/bin/dot-agent-deck). Upgrading runs `brew upgrade dot-agent-deck`, which installs the tap's latest release.", command: null },
+    { text: "Installed with Homebrew (/opt/homebrew/Cellar/dot-agent-deck/0.46.0/bin/dot-agent-deck). Upgrading runs `brew update`, which refreshes Homebrew's copy of the tap, then `brew upgrade dot-agent-deck`, which installs the tap's latest release.", command: null },
   ],
 };
 
@@ -175,7 +175,7 @@ describe("SelfUpgradeDialog", () => {
     render(<SelfUpgradeDialog copies={BOTH} check={checkOf(APP_DEB, CLI_BREW)} api={api} onClose={onClose} copyText={vi.fn(async () => undefined)} />);
 
     expect(screen.getByTestId("self-upgrade-plan-app")).toHaveTextContent(APP_DEB.headline);
-    expect(screen.getByTestId("self-upgrade-plan-cli")).toHaveTextContent("Upgrading runs `brew upgrade dot-agent-deck`");
+    expect(screen.getByTestId("self-upgrade-plan-cli")).toHaveTextContent("Upgrading runs `brew update`, which refreshes Homebrew's copy of the tap, then `brew upgrade dot-agent-deck`");
     expect(screen.getByTestId("self-upgrade-question")).toHaveTextContent("Upgrade Agent Deck (desktop app) to v0.47.0?");
     expect(api.run).not.toHaveBeenCalled();
 
@@ -404,11 +404,11 @@ describe("SelfUpgradeDialog", () => {
       ok: false,
       installed: false,
       relaunch: false,
-      lines: [{ text: "`brew upgrade dot-agent-deck` finished, but dot-agent-deck still reports v0.46.0, not v0.47.0: Homebrew does not offer v0.47.0 yet. Try again later.", command: null }],
+      lines: [{ text: "`brew upgrade dot-agent-deck` finished, but dot-agent-deck still reports v0.46.0, not v0.47.0: Homebrew's tap does not carry v0.47.0 yet, even after `brew update`. Once it does, refresh it and upgrade again:", command: null }],
     });
     const result = screen.getByTestId("self-upgrade-result-cli");
     expect(result).toHaveAttribute("data-ok", "false");
-    expect(result).toHaveTextContent("Homebrew does not offer v0.47.0 yet");
+    expect(result).toHaveTextContent("Homebrew's tap does not carry v0.47.0 yet, even after `brew update`");
     expect(screen.queryByTestId("self-upgrade-relaunch")).not.toBeInTheDocument();
   });
 
@@ -426,7 +426,7 @@ describe("SelfUpgradeDialog", () => {
     expect(screen.getByTestId("self-upgrade-done")).toBeInTheDocument();
     expect(api.run).toHaveBeenCalledTimes(1);
     fireEvent.click(screen.getByTestId("self-upgrade-close"));
-    expect(onClose).toHaveBeenCalledWith({ installed: true });
+    expect(onClose).toHaveBeenCalledWith({ installed: true, relaunch: true });
   });
 
   /** Scenario: The Local daemon section's dialog covers the CLI alone (issue #1753): it is titled with the CLI's release, says what follows it, never offers Relaunch for an app installed earlier, and tells its opener whether it closed having changed nothing or after an upgrade. */
@@ -452,7 +452,7 @@ describe("SelfUpgradeDialog", () => {
     await finish({ ...BREWED, ok: false, installed: false });
     expect(screen.queryByTestId("self-upgrade-relaunch")).not.toBeInTheDocument();
     fireEvent.keyDown(screen.getByTestId("self-upgrade-dialog"), { key: "Escape" });
-    expect(onClose).toHaveBeenLastCalledWith({ installed: false });
+    expect(onClose).toHaveBeenLastCalledWith({ installed: false, relaunch: false });
   });
 
   /** Scenario: While the dialog is open, the rest of the window is inert, so a rail button cannot be reached with Tab and switch screens under a running upgrade; closing the dialog gives the window back. */
@@ -478,7 +478,7 @@ describe("SelfUpgradeDialog", () => {
 
     await finish({ ...BREWED, ok: false, installed: false });
     act(() => { topmostOverlayClose()?.(); });
-    expect(onClose).toHaveBeenLastCalledWith({ installed: false });
+    expect(onClose).toHaveBeenLastCalledWith({ installed: false, relaunch: false });
   });
 
   /** Scenario: issue #1839 — an upgrade's result names the installed path, and that path carries a bidi override; the dialog shows the line with the rest of the path intact and the override removed, as the bridge's own result already arrives (`self_upgrade_037`). */

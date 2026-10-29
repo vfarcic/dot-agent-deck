@@ -1,3 +1,18 @@
+// PRD #1666 part 3 (Q59): the `e2e` feature compiles in test seams, many of
+// them steered by environment variables (`host_metrics::e2e_fixed_sample` and
+// `daemon_protocol::advertised_protocol_version` are two), and none may ship.
+// A release-profile build turns `debug_assertions` off, so this refuses
+// `--release --features e2e`. `not(debug_assertions)` is the predicate, not
+// the profile: a dev build with debug assertions switched off is refused too,
+// and a release build with them switched on is not, so a shipping recipe must
+// still leave `e2e` out.
+#[cfg(all(feature = "e2e", not(debug_assertions)))]
+compile_error!(
+    "the `e2e` feature is a test seam and must never ship in a release build: \
+     build `--features e2e` only with debug assertions on (the dev and test \
+     profiles), and build releases without it"
+);
+
 // Shared by the per-agent hook-config adapters (`codex_hooks_manage`,
 // `devin_hooks_manage`); nothing outside the crate calls it.
 mod agent_hook_config;
@@ -93,6 +108,7 @@ pub mod inbox_receiver;
 pub mod inbox_spills;
 pub mod inbox_watcher;
 pub mod init;
+pub mod injected_prompt;
 pub mod issue_dispatch;
 pub mod issue_dispatch_run;
 pub mod jsonc_edit;
@@ -106,6 +122,8 @@ pub mod login_shell;
 // PRD #1223 M2: what the daemon reports about itself to a new-agent form.
 pub mod new_agent_options;
 pub mod opencode_manage;
+// Issue #1947: finding and messaging an orchestration's orchestrator.
+pub mod orchestrator_address;
 pub mod orchestrator_context;
 pub mod orchestrator_ext;
 pub mod osc52;
@@ -136,6 +154,7 @@ pub mod remote_tunnel;
 pub mod repo_identity;
 pub mod report_recovery;
 pub mod retained_store;
+pub mod roles_cli;
 pub mod schedule_cli;
 // Issue #1635: upgrading this machine's CLI and desktop app in place.
 pub mod scheduler;

@@ -29,6 +29,11 @@ export default defineConfig({
     // tauri-driver, run by `pnpm test:driver`, and vitest would find no suite in
     // them.
     exclude: [...configDefaults.exclude, "e2e/**", "driver/**"],
+    // CI also writes a JUnit report (issue #1981 M10), which both CI backends
+    // keep as the run's test results. Naming any reporter replaces the
+    // default one, so "default" stays in the list.
+    reporters: process.env.CI ? ["default", "junit"] : ["default"],
+    outputFile: { junit: "junit/vitest.xml" },
     setupFiles: ["./src/test/setup.ts"],
     // Bound concurrent jsdom bootstraps on shared development hosts. Letting
     // the pool use every available core timed out 15 worker startups while

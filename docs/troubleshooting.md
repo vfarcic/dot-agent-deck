@@ -301,7 +301,7 @@ Some refusals do not mark any card, because the deck cannot tell which agent the
 
 ### Codex events not showing
 
-Codex only runs hooks it trusts. The deck records trust for its own hook entries, and only those, in the Codex home's `config.toml`, at startup and whenever it starts a Codex pane. This does not depend on how you launch Codex, so a launcher (`devbox run codex-big`, a script, an alias) needs nothing added.
+Codex only runs hooks it trusts. The deck records trust for its own hook entries, and only those, in the Codex home's `config.toml`, at startup and whenever it starts a Codex pane. This does not depend on how you launch Codex, so a launcher (`devbox run codex-big`, a script, an alias) needs nothing added for its hooks to run. For each pane to report as itself, a launcher does need one setting: see [Two Codex panes report as one](#two-codex-panes-report-as-one).
 
 If a Codex card never shows a tool, a prompt or **Needs Input**, its hooks are not running. You see one of two things. Usually the card shows **Thinking** while Codex's screen is changing and **Idle** once it has been still for a few seconds (in the desktop app, **running** and then **idle**; [Which agents report which status](session-management.md#which-agents-report-which-status)). If instead it stays **Idle** even while Codex works, start with step 2. Check in this order:
 
@@ -324,6 +324,18 @@ Note: the deck's Codex hook for PreToolUse is turned off in Codex's /hooks list,
 The deck's log also records a warning naming those hooks each time the deck records trust. To get the detail back, turn the hook on again in Codex's `/hooks` list.
 
 While Codex's hooks are not trusted, or if you turn off the deck's `UserPromptSubmit` hook in Codex's `/hooks` list, a doorbell asks Codex to run `dot-agent-deck inbox fetch` itself. That command confirms each message it prints to the deck, and needs sandbox network access to reach the deck. When Codex's sandbox also keeps it from writing the deck's receipt records, the agent's card in the TUI, or its tile in the desktop app, says messages may repeat: the messages are still delivered, and one may be sent twice. Trust the hooks to restore automatic message hand-over, including at turn end.
+
+### Two Codex panes report as one
+
+A Codex pane the deck starts with a direct `codex` command reports as itself: its card (TUI) or tile (desktop) shows its own status, prompt and tool, and what it sends the deck, such as `work-done`, is counted for that pane. For that, the deck starts Codex without Codex's shared background server, so Codex may show a one-line notice when it starts saying it is running without the shared background server. The notice is expected. The TUI and the desktop app behave the same.
+
+The deck does this when a pane's command runs `codex` directly, by name or by path. In these cases panes can still share the server, and two of them can report as one:
+
+- **A launcher, script or alias**, such as `devbox run codex-big`, a shell script, a command that sets a variable before `codex` (such as `FOO=1 codex`), or a command with `&&` or `|`. The deck cannot change the command your launcher finally runs, so make that command start Codex without the shared server: add `--no-daemon` (Codex 0.156.0 or later), or put `-c 'shell_environment_policy.set={}'` before Codex's other arguments, which Codex 0.155.0 also accepts. A script named `codex` that does not pass on the arguments it is given needs the same change.
+- **`--remote`, and Codex's agents overview**, which connect to a shared server on purpose. Panes using them are not kept apart.
+- **Panes started before you upgraded the deck**, and a pane a [scheduled task](scheduled-tasks.md) reuses, which keep the mode they started in. Restart the agent to give it its own reports. A shared server that was already running keeps running, and Codex sessions already connected to it stay connected; Codex panes the deck starts with a direct `codex` command from now on do not use it.
+
+This depends on how Codex decides whether to use its shared server, so a later Codex release could change it.
 
 ### Codex as a role or worker: allow sandbox network access
 

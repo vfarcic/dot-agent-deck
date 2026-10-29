@@ -277,6 +277,15 @@ jobs:
       # not set it, so its output must not contain it; a seam that leaked into
       # every bundle would ship to users with nothing saying so.
       - run: "! grep -rl __dadDriver dist/"
+      # Issue #1981 M10: the JUnit report, kept on green runs as well as red
+      # ones. Attempt-named for the reason spelled out on `build-macos`.
+      - name: Preserve this attempt's vitest results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: vitest-attempt-${{ github.run_attempt }}
+          path: desktop/junit/vitest.xml
+          if-no-files-found: warn
 
   # Issues #823 and #836 — the browser-level tier. `desktop-web` above runs ~296
   # vitest tests under `environment: "jsdom"`, and jsdom is a DOM implementation
@@ -331,8 +340,10 @@ jobs:
     # raise it to paper over a hang.
     # On 2026-10-22 the apt downloads of `--with-deps` took 14–20 minutes (the
     # browser download stayed at seconds; see the install step), exhausting that
-    # budget, so allow 25 minutes for install, 15 for the suite (observed 8–12)
-    # and 5 for setup/reporting, with separate step limits bounding a hung suite.
+    # budget. Since issue #1934 the .debs are fetched in their own step, bounded
+    # at 15 minutes (three 3-minute attempts and the index fetches), and the
+    # install that follows at 8; with 15 for the suite (observed 8–12) and the
+    # rest for setup/reporting, separate step limits bound each part.
     timeout-minutes: 45
     defaults:
       run:
@@ -442,10 +453,11 @@ jobs:
       # `jobs:`, issue #1743): ~119 MB of a budget that `main` already nearly
       # fills. Each key covers one runner image version and one Playwright
       # version. A new image restores the previous image's entry by prefix and
-      # fetches only what changed. Rejected alternatives: a retry, because the
-      # slow attempts did not recover (one averaged 85 kB/s over 23 minutes, and
-      # in the three traced file by file the rate fell rather than rose), so a
-      # retry on the same runner would most likely repeat it; Playwright's
+      # fetches only what changed. Rejected alternatives: a retry from the same
+      # mirror, because the slow attempts did not recover (one averaged 85 kB/s
+      # over 23 minutes, and in the three traced file by file the rate fell
+      # rather than rose), so it would most likely repeat it — issue #1934's
+      # prefetch step below retries from the next mirror instead; Playwright's
       # container image, which would move the trust to that image and need
       # another pin kept in lockstep with `@playwright/test`. `.rwx/ci.yml`'s
       # copy of this job has no cache because it has not needed one: in the 57
@@ -491,8 +503,43 @@ jobs:
             fi
           done
           echo "Handed apt $kept cached .debs; dropped $dropped."
+      # Issue #1934 — the cache above does not always hold: it is saved only
+      # from `main`, and the repository's cache budget evicts it (on 2026-10-26
+      # it was gone from about 03:40 to 13:30 UTC, and again overnight), so a
+      # run in that window fetches all 142 MB from the mirror. Four attempts on
+      # 2026-10-26 did, from an Azure mirror serving a few kB/s, and timed out
+      # in the install step below at 25 minutes. This step fetches the same
+      # .debs with a limit per attempt and moves off that mirror after the
+      # first stalled one; `.github/scripts/apt-prefetch.sh` has the evidence.
+      # The package list is Playwright's own: `install-deps --dry-run` prints
+      # what `--with-deps` would install (exiting 1 when that is anything),
+      # and the arguments match the `apt-get install` it runs.
+      - name: Fetch the .debs, bounding each attempt
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          rc=0
+          out=$(pnpm exec playwright install-deps --dry-run chromium webkit 2>&1) || rc=$?
+          pkgs=()
+          while read -r pkg; do
+            pkgs+=("$pkg")
+          done < <(sed -n 's/^  \([^ ]\+\)$/\1/p' <<< "$out")
+          if [ "${#pkgs[@]}" -eq 0 ]; then
+            echo "$out"
+            if [ "$rc" -eq 0 ]; then
+              exit 0
+            fi
+            echo "::error::Read no package list from Playwright's install-deps --dry-run (exit $rc)."
+            exit 1
+          fi
+          echo "Playwright's dependencies to install: ${#pkgs[@]} packages."
+          ../.github/scripts/apt-prefetch.sh --no-install-recommends "${pkgs[@]}"
+      # The fetch above leaves apt nothing to download, so this installs from
+      # the archive cache and downloads only the browsers (9-12 s from the CDN
+      # in every measured run).
       - run: pnpm exec playwright install --with-deps chromium webkit
-        timeout-minutes: 25
+        timeout-minutes: 8
       # Rebuilt from what this run installed, so a package nothing installs any
       # more, a version Ubuntu has replaced or a dropped file is not saved
       # again. It runs on every ref, so a branch's run shows what `main` would
@@ -545,6 +592,15 @@ jobs:
           # `?fixture=1` scenarios — so this is tidiness rather than a leak, but
           # nobody opens a failure trace from a PR that closed two months ago.
           retention-days: 7
+      # Issue #1981 M10: the JUnit report, kept on green runs as well as red
+      # ones. Attempt-named for the reason spelled out on `build-macos`.
+      - name: Preserve this attempt's browser test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: playwright-junit-attempt-${{ github.run_attempt }}
+          path: desktop/junit/playwright.xml
+          if-no-files-found: warn
 
   # Issue #953 — the driver rung, the one above `desktop-browser` on the ladder.
   # That job drives the built web bundle with fixture data; this one drives the
@@ -579,10 +635,11 @@ jobs:
     # suite 86s. The original 30-minute budget was four times that, capping a
     # wedged window at a fraction of the 6-hour default. Re-tune from more
     # runs; do not raise it to paper over a hang.
-    # Slow downloads on 2026-10-22 warrant 25 minutes for apt, 10 for the suite
-    # and 15 for builds/setup/reporting (run 39821435797 used about 6 minutes
-    # outside the suite), with the suite's own limit bounding a wedged window.
-    timeout-minutes: 50
+    # Slow downloads on 2026-10-22 warranted 25 minutes for apt; since issue
+    # #1934 the apt step's attempts are bounded and it gets 15, with 10 for the
+    # suite and 15 for builds/setup/reporting (run 39821435797 used about 6
+    # minutes outside the suite), the suite's own limit bounding a wedged window.
+    timeout-minutes: 45
     env:
       # The ONE place tauri-driver's version is written. renovate.json's
       # tauri-driver customManager bumps this line, and
@@ -610,7 +667,7 @@ jobs:
           cache-dependency-path: desktop/pnpm-lock.yaml
       # The desktop crate's build set — the same six packages as `build`, whose
       # comment names the other places that declare it — plus the six this job
-      # alone needs at run time: `webkit2gtk-driver` is WebKitWebDriver for the
+      # alone needs at run time: the driver package is WebKitWebDriver for the
       # SAME WebKitGTK the app links against, `xvfb` is the display, `xclip`
       # reads that display's clipboard from outside the app for `terminal_002`
       # (issue #1403), and `xdotool` moves the display's focus to and from the
@@ -619,13 +676,48 @@ jobs:
       # second deck is reached through, and `libnss-wrapper`, which points the
       # app's `ssh` at the sandbox's `known_hosts` (`FarDeck` in
       # `desktop/driver/harness.ts` says why).
+      #
+      # The driver package has two names. Ubuntu 26.04 renamed
+      # `webkit2gtk-driver` to `webkitgtk-webdriver` and dropped the old name,
+      # 24.04 has only the old one, and `ubuntu-latest` lands on either while
+      # GitHub migrates it (run 40227995009 failed on 26.04). So this installs
+      # whichever has a candidate rather than pinning `runs-on`, which would
+      # only move the break to 24.04's retirement. Both put the binary at
+      # `/usr/bin/WebKitWebDriver`, where the suite step below points; checked
+      # in `ubuntu:24.04` and `ubuntu:26.04` containers on 2026-10-25. The
+      # other packages here have the same names on both.
+      #
+      # Issue #1934 — the .debs (80 MB) are fetched by
+      # `.github/scripts/apt-prefetch.sh` before the install, for the reason
+      # that script records: on 2026-10-26 this step sat on an Azure mirror
+      # serving a few kB/s until its 25-minute limit (run 40395729937). The
+      # prefetch bounds each attempt and moves off that mirror after the first
+      # stalled one, so the install finds every .deb already downloaded. Its
+      # first run on a runner did exactly that (run 40450743777: 78 of 80 MB
+      # from Azure in a 5-minute first attempt, the rest from
+      # archive.ubuntu.com in 1 s). They
+      # are not cached the way `desktop-browser`'s are: that cache is evicted
+      # by the repository's cache budget for hours at a time, so it cannot be
+      # what keeps this step inside its limit, and another entry would add to
+      # the pressure that evicts `main`'s Rust caches.
       - name: Install driver system dependencies
-        timeout-minutes: 25
+        timeout-minutes: 15
         run: |
+          set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+          # Read whole rather than with `grep -q`, whose early exit can fail
+          # the pipeline under pipefail and pick the wrong name.
+          driver=webkitgtk-webdriver
+          candidate=$(apt-cache policy "$driver" | sed -n 's/^ *Candidate: //p')
+          if [ -z "$candidate" ] || [ "$candidate" = "(none)" ]; then
+            driver=webkit2gtk-driver
+          fi
+          echo "WebKitWebDriver package: $driver"
+          pkgs=(libwebkit2gtk-4.1-dev libgtk-3-dev \
             libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev \
-            webkit2gtk-driver xvfb xclip xdotool openssh-server libnss-wrapper
+            "$driver" xvfb xclip xdotool openssh-server libnss-wrapper)
+          .github/scripts/apt-prefetch.sh "${pkgs[@]}"
+          sudo apt-get install -y "${pkgs[@]}"
       # From crates.io source with its own lockfile, not a prebuilt binary:
       # tauri-driver publishes none, and a third-party build cache would be a
       # binary this job then executes on trust alone. rust-cache keeps
@@ -668,6 +760,15 @@ jobs:
           # Synthetic content — a sandbox daemon and a bash shell — so this is
           # tidiness rather than a leak.
           retention-days: 7
+      # Issue #1981 M10: the JUnit report, kept on green runs as well as red
+      # ones. Attempt-named for the reason spelled out on `build-macos`.
+      - name: Preserve this attempt's driver test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: desktop-driver-junit-attempt-${{ github.run_attempt }}
+          path: desktop/junit/driver.xml
+          if-no-files-found: warn
 
   # The Linux build, split for wall clock. Until the split, one `build` job ran
   # fmt, clippy, the release build, the fast tier and linkage-check one after
@@ -816,7 +917,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2
         with:
           tool: cargo-nextest@0.9.146
       # The Pi extension's Node suites run from the fast tier
@@ -827,6 +928,15 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
+      # Issue #1708 — the Pi extension's type gate, which until then ran
+      # nowhere. In this job, rather than `desktop-web` beside the desktop's own
+      # tsc, because `build` aggregates this one, so a type error blocks the
+      # merge. `--ignore-scripts`: tsc needs no install script, so none of the
+      # type packages' dependencies runs code on the runner.
+      - run: npm ci --ignore-scripts
+        working-directory: pi-extension
+      - run: npm run typecheck
+        working-directory: pi-extension
       # The desktop crate's Linux build deps — the comment on `clippy`'s copy of
       # this step has why, and where else the same set is declared.
       - run: |
@@ -1038,7 +1148,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2
         with:
           tool: cargo-nextest@0.9.146
       # The same Linux deps `clippy` installs, for the same reason: the archive
@@ -1111,7 +1221,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: 1.99.0
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2
         with:
           tool: cargo-nextest@0.9.146
       # The desktop crate's test binaries link these libraries at run time.
@@ -1516,7 +1626,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2
         with:
           tool: cargo-nextest@0.9.146
       - run: cargo build
@@ -1598,7 +1708,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2
         with:
           tool: cargo-nextest@0.9.146
       - run: cargo build

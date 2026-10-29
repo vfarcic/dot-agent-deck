@@ -1041,6 +1041,14 @@ pub const QUESTION_ANSWERED_BY_DECK_METADATA_VALUE: &str = "1";
 /// been. The daemon's alone, like [`QUESTION_ANSWERED_BY_DECK_METADATA_KEY`].
 pub const QUESTION_RELEASED_BY_DECK_METADATA_KEY: &str = "question_released_by_deck";
 
+/// Issue #1981 M8 (PR #2010 review): when the daemon received a producer's
+/// event, in Unix nanoseconds, set on every event admitted from a producer
+/// (`crate::daemon::admit_producer_event`) over any copy the producer sent.
+/// The daemon's alone: an event the daemon builds itself never carries it,
+/// which is how telemetry tells an agent's hook from the daemon's own events
+/// when it counts hook latency. Nothing outside telemetry reads it.
+pub const RECEIVED_BY_DECK_AT_METADATA_KEY: &str = "received_by_deck_at_ns";
+
 /// Where a permission prompt stands, on the events the OpenCode hook builds
 /// from one: `pending` on the ask, [`PERMISSION_STATE_REPLIED`] on the answer.
 /// PRD #1631: a question form's answer or dismissal is marked replied too.
@@ -3663,7 +3671,8 @@ pub struct InboxMayHandOver {
 pub struct InboxGrant {
     pub q: u64,
     pub ok: bool,
-    /// Why not (`committed`, `revoked`, `wrong_receiver`, `unknown`).
+    /// Why not (`committed`, `revoked`, `wrong_receiver`, `unknown`, and from
+    /// PRD #1666 Q57 `held_earlier`). The deck's receiver acts on `ok` alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal: Option<String>,
 }
@@ -4062,6 +4071,9 @@ pub struct InboxStreamControl {
     /// them ignores them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub possess: Option<InboxPossess>,
+    /// PRD #1666 Q57: the deck's receiver sends its `possess` on the same line, which
+    /// the daemon applies first, so the check is decided on what it held when
+    /// it asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub may: Option<InboxMayHandOver>,
     /// PRD #1666 §3: attempts the component handed to the agent, their

@@ -33,18 +33,18 @@ fn put_tag(buf: &mut Vec<u8>, field: u32, wire: u8) {
     put_varint(buf, (u64::from(field) << 3) | u64::from(wire));
 }
 
-fn put_bytes(buf: &mut Vec<u8>, field: u32, bytes: &[u8]) {
+pub(crate) fn put_bytes(buf: &mut Vec<u8>, field: u32, bytes: &[u8]) {
     put_tag(buf, field, WIRE_LEN);
     put_varint(buf, bytes.len() as u64);
     buf.extend_from_slice(bytes);
 }
 
-fn put_fixed64(buf: &mut Vec<u8>, field: u32, value: u64) {
+pub(crate) fn put_fixed64(buf: &mut Vec<u8>, field: u32, value: u64) {
     put_tag(buf, field, WIRE_FIXED64);
     buf.extend_from_slice(&value.to_le_bytes());
 }
 
-fn put_varint_field(buf: &mut Vec<u8>, field: u32, value: u64) {
+pub(crate) fn put_varint_field(buf: &mut Vec<u8>, field: u32, value: u64) {
     put_tag(buf, field, WIRE_VARINT);
     put_varint(buf, value);
 }
@@ -177,12 +177,14 @@ pub fn encode_json(resource: &[ResourceAttribute], spans: &[SpanRecord]) -> Vec<
     serde_json::to_vec(&body).expect("a JSON value always serializes")
 }
 
-/// The `partial_success` of an `ExportTraceServiceResponse`: spans the
-/// backend did not accept, and its message about them (or a warning, with
-/// none rejected).
+/// The `partial_success` of an `ExportTraceServiceResponse` (spans) or an
+/// `ExportMetricsServiceResponse` (data points, for PRD #1859's collector):
+/// what the backend did not accept, and its message about it (or a warning,
+/// with none rejected). Both messages number the count 1 and the message 2.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PartialSuccess {
-    pub rejected_spans: i64,
+    /// Spans or data points.
+    pub rejected: i64,
     pub error_message: String,
 }
 
@@ -234,8 +236,9 @@ fn read_fields(buf: &[u8]) -> Option<Vec<(u64, Wire<'_>)>> {
     Some(out)
 }
 
-/// The `partial_success` (field 1) of a protobuf `ExportTraceServiceResponse`;
-/// `None` when the body has none or is not such a message.
+/// The `partial_success` (field 1) of a protobuf `ExportTraceServiceResponse`
+/// or `ExportMetricsServiceResponse`, which share its layout; `None` when the
+/// body has none or is not such a message.
 pub fn decode_partial_success_protobuf(body: &[u8]) -> Option<PartialSuccess> {
     let partial = read_fields(body)?
         .into_iter()
@@ -247,7 +250,7 @@ pub fn decode_partial_success_protobuf(body: &[u8]) -> Option<PartialSuccess> {
     let mut out = PartialSuccess::default();
     for (field, value) in read_fields(partial)? {
         match (field, value) {
-            (1, Wire::Varint(rejected)) => out.rejected_spans = rejected as i64,
+            (1, Wire::Varint(rejected)) => out.rejected = rejected as i64,
             (2, Wire::Bytes(message)) => {
                 out.error_message = String::from_utf8_lossy(message).into_owned();
             }
@@ -262,12 +265,26 @@ pub fn decode_partial_success_protobuf(body: &[u8]) -> Option<PartialSuccess> {
 /// not JSON. The count may be a string, as the mapping writes an `int64`, or a
 /// number.
 pub fn decode_partial_success_json(body: &[u8]) -> Option<PartialSuccess> {
+    decode_json_partial_success(body, "rejectedSpans", "rejected_spans")
+}
+
+/// [`decode_partial_success_json`] for an `ExportMetricsServiceResponse`,
+/// whose count is `rejectedDataPoints`.
+pub fn decode_metrics_partial_success_json(body: &[u8]) -> Option<PartialSuccess> {
+    decode_json_partial_success(body, "rejectedDataPoints", "rejected_data_points")
+}
+
+fn decode_json_partial_success(
+    body: &[u8],
+    count_camel: &str,
+    count_snake: &str,
+) -> Option<PartialSuccess> {
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     let field = |v: &'_ serde_json::Value, camel: &str, snake: &str| {
         v.get(camel).or_else(|| v.get(snake)).cloned()
     };
     let partial = field(&value, "partialSuccess", "partial_success")?;
-    let rejected_spans = match field(&partial, "rejectedSpans", "rejected_spans") {
+    let rejected = match field(&partial, count_camel, count_snake) {
         Some(serde_json::Value::String(count)) => count.trim().parse().unwrap_or(0),
         Some(serde_json::Value::Number(count)) => count.as_i64().unwrap_or(0),
         _ => 0,
@@ -277,7 +294,7 @@ pub fn decode_partial_success_json(body: &[u8]) -> Option<PartialSuccess> {
         _ => String::new(),
     };
     Some(PartialSuccess {
-        rejected_spans,
+        rejected,
         error_message,
     })
 }
@@ -287,6 +304,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::event::{AgentType, EventType};
     use crate::telemetry::config::{EnvMap, TelemetryConfig};
+    use crate::telemetry::input::InterventionKind;
     use crate::telemetry::resource::deck_resource;
     use crate::telemetry::run_context::RunContext;
     use crate::telemetry::span::Attribute;
@@ -489,7 +507,7 @@ pub(crate) mod tests {
         let mut tracker = RunTracker::new();
         tracker.begin_run(start("p1"), 10);
         tracker.observe_event(&event("p1", EventType::ToolStart), 20);
-        tracker.observe_human_input("p1", 25);
+        tracker.observe_human_input("p1", 25, InterventionKind::Text);
         tracker.end_run("p1", EndReason::Exited, Some(-1), 30);
         let spans = tracker.take_finished();
         let resource = deck_resource("dot-agent-deck", Some("host-a"), &[]);
@@ -673,7 +691,7 @@ pub(crate) mod tests {
                 t += 1;
             }
         }
-        tracker.observe_human_input("pane-1", t);
+        tracker.observe_human_input("pane-1", t, InterventionKind::Text);
         tracker.end_run("pane-1", EndReason::Exited, Some(1), t + 1);
         tracker.end_all(EndReason::DaemonShutdown, t + 2);
         let spans = tracker.take_finished();
@@ -806,7 +824,7 @@ pub(crate) mod tests {
         assert_eq!(
             decode_partial_success_protobuf(&response),
             Some(PartialSuccess {
-                rejected_spans: 3,
+                rejected: 3,
                 error_message: "bad span".into()
             })
         );
@@ -827,8 +845,35 @@ pub(crate) mod tests {
         ] {
             assert_eq!(
                 decode_partial_success_json(body.as_bytes()),
-                expected.map(|(rejected_spans, message)| PartialSuccess {
-                    rejected_spans,
+                expected.map(|(rejected, message)| PartialSuccess {
+                    rejected,
+                    error_message: message.into()
+                }),
+                "{body}"
+            );
+        }
+    }
+
+    /// PRD #1859: a metrics response's `partial_success` counts data points.
+    #[test]
+    fn metrics_partial_success_decodes_its_own_count() {
+        for (body, expected) in [
+            (
+                r#"{"partialSuccess":{"rejectedDataPoints":"100","errorMessage":"no"}}"#,
+                Some((100, "no")),
+            ),
+            (
+                r#"{"partial_success":{"rejected_data_points":5}}"#,
+                Some((5, "")),
+            ),
+            // A traces count is not a metrics count.
+            (r#"{"partialSuccess":{"rejectedSpans":"2"}}"#, Some((0, ""))),
+            ("{}", None),
+        ] {
+            assert_eq!(
+                decode_metrics_partial_success_json(body.as_bytes()),
+                expected.map(|(rejected, message)| PartialSuccess {
+                    rejected,
                     error_message: message.into()
                 }),
                 "{body}"

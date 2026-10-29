@@ -420,9 +420,11 @@ mod tests {
             },
         );
         let behind = Outcome::BrewNotUpgraded {
+            brew: PathBuf::from("/opt/homebrew/bin/brew"),
             formula: "dot-agent-deck",
             reported: Some("0.47.0".into()),
             offered: "0.48.0".into(),
+            refresh_failed: None,
         };
         assert!(after_upgrade(&host, &brew_plan, &behind).is_empty());
 

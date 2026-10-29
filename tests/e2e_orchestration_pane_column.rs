@@ -58,7 +58,14 @@ fn write_beta_agent(deck: &TuiDeck) {
          sleep 1\n\
          {pre_tool_use}\
          sleep 600\n",
-        session_start = common::claude_session_start_line(bin, "beta-sess"),
+        // The bare hook, not `claude_session_start_line`: that one also draws
+        // Claude Code's prompt box and repaints it on every resize by clearing
+        // the screen, which wipes BETA_ROLE_SENTINEL when focus resizes the
+        // pane. This stand-in needs the status events, not the box.
+        session_start = common::claude_hook_line(
+            bin,
+            r#"{"hook_event_name":"SessionStart","session_id":"beta-sess"}"#,
+        ),
         pre_tool_use = common::claude_hook_line(
             bin,
             r#"{"hook_event_name":"PreToolUse","session_id":"beta-sess","tool_name":"Bash"}"#,

@@ -2607,13 +2607,15 @@ where
 /// plugin's child) then writes one [`crate::question::ReplyAck`] line, read
 /// within `ack_wait`; any other producer acts on the line itself, so a written
 /// line is a delivered answer, as it always was. A line whose write or flush
-/// failed is unconfirmed for every producer.
+/// failed, or did not finish within `write_timeout`, is unconfirmed for every
+/// producer.
 async fn write_held_reply<R, W>(
     reader: &mut R,
     writer: &mut W,
     held: crate::agent_pty::HeldReply,
     ack: bool,
     ack_wait: Duration,
+    write_timeout: Duration,
 ) where
     R: tokio::io::AsyncBufRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
@@ -2622,12 +2624,10 @@ async fn write_held_reply<R, W>(
     let Ok(json) = serde_json::to_string(&held.reply) else {
         return;
     };
-    let written = async {
-        writer.write_all(format!("{json}\n").as_bytes()).await?;
-        writer.flush().await
-    }
-    .await
-    .is_ok();
+    // Issue #1693: bounded like every other reply on the connection.
+    let written = write_hook_reply(writer, &format!("{json}\n"), write_timeout)
+        .await
+        .is_ok();
     let Some(delivery) = held.delivery else {
         return;
     };
@@ -2941,7 +2941,13 @@ fn notify_orchestrator_of_quota_block(
 ///   these values are copied into the arm queue before anything else looks at
 ///   them;
 /// * the daemon-authored background-work aggregate (`background`,
-///   `background_revision`, issue #1678) is stripped from every producer frame.
+///   `background_revision`, issue #1678) is stripped from every producer frame;
+/// * `received_by_deck_at_ns` (issue #1981 M8,
+///   [`crate::event::RECEIVED_BY_DECK_AT_METADATA_KEY`]) is set to now, over
+///   any copy the producer sent: it marks the event as a producer's for
+///   telemetry's hook latency. Every producer ingress admits here — the hook
+///   socket's raw events and its `question` messages — so no event the daemon
+///   builds itself carries it.
 fn admit_producer_event(event: &mut AgentEvent) {
     use crate::quota_block::{
         QUOTA_BLOCKED_LIFTED_METADATA_KEY, QUOTA_BLOCKED_METADATA_KEYS,
@@ -2968,6 +2974,18 @@ fn admit_producer_event(event: &mut AgentEvent) {
     event
         .metadata
         .remove(crate::event::QUESTION_RELEASED_BY_DECK_METADATA_KEY);
+    // Issue #1981 M8: when the daemon received the event, over any copy the
+    // producer sent, so telemetry counts hook latency for producers' events
+    // alone and no producer can forge or skew it.
+    event
+        .metadata
+        .remove(crate::event::RECEIVED_BY_DECK_AT_METADATA_KEY);
+    if let Some(now) = chrono::Utc::now().timestamp_nanos_opt() {
+        event.metadata.insert(
+            crate::event::RECEIVED_BY_DECK_AT_METADATA_KEY.to_string(),
+            now.to_string(),
+        );
+    }
     if event
         .metadata
         .contains_key(crate::event::QUESTION_METADATA_KEY)
@@ -3347,7 +3365,9 @@ async fn poll_codex_rollouts(
 /// other failure. An `Error` carries no provider text, like the Claude Code
 /// `StopFailure` it gives parity with: the card shows the status, and the
 /// message stays in the rollout it came from.
-fn codex_rollout_failure_event(failure: crate::codex_rollout_tail::CodexTurnFailure) -> AgentEvent {
+pub(crate) fn codex_rollout_failure_event(
+    failure: crate::codex_rollout_tail::CodexTurnFailure,
+) -> AgentEvent {
     use crate::quota_block::{
         QUOTA_BLOCKED_DETAIL_METADATA_KEY, QUOTA_BLOCKED_KIND_METADATA_KEY,
         QUOTA_BLOCKED_RESETS_AT_MS_METADATA_KEY, QUOTA_BLOCKED_SOURCE_CODEX_ROLLOUT,
@@ -5660,6 +5680,56 @@ async fn run_hook_loop_with_idle_timeout(
     .await
 }
 
+/// Issue #1693: write one reply `line` to a hook connection and flush it,
+/// giving up after `deadline` — the connection's idle timeout.
+///
+/// The read on a hook connection is bounded by that timeout and the reply
+/// writes used to have no deadline, so a peer that sent lines without reading
+/// its replies filled the socket's send buffer and parked the connection's
+/// task in `write_all` for good, holding its hook-pool slot. With the write
+/// bounded too, a peer that does not read loses its slot the way a peer that
+/// does not write already does. On an error the caller drops the connection.
+async fn write_hook_reply<W>(
+    writer: &mut W,
+    line: &str,
+    deadline: Duration,
+) -> Result<(), ReplyWriteError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let write = async {
+        writer.write_all(line.as_bytes()).await?;
+        writer.flush().await
+    };
+    match tokio::time::timeout(deadline, write).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            // A client that hung up before its reply is ordinary.
+            debug!(error = %e, "hook socket: reply write failed; dropping connection");
+            Err(ReplyWriteError::Failed)
+        }
+        Err(_elapsed) => {
+            warn!(
+                idle_timeout_ms = deadline.as_millis(),
+                "hook socket: reclaiming a connection that did not read its replies within \
+                 the idle window — the peer kept the connection open while the daemon's \
+                 replies filled its socket buffer, so it is stalled or misbehaving"
+            );
+            Err(ReplyWriteError::TimedOut)
+        }
+    }
+}
+
+/// Why [`write_hook_reply`] gave up on a reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplyWriteError {
+    /// The write or flush failed, usually because the peer hung up.
+    Failed,
+    /// The write did not finish within the idle timeout: the peer is not
+    /// reading.
+    TimedOut,
+}
+
 /// [`run_hook_loop`] with every bound supplied — the seam the PRD #1631 hold
 /// tests use to reach the connection cap, the hold budget and the hold
 /// deadline without spending their production values.
@@ -5900,8 +5970,12 @@ async fn run_hook_loop_with_limits(
                                         &refusal.caller_message(),
                                     ) {
                                         let line = format!("{json}\n");
-                                        let _ = write_half.write_all(line.as_bytes()).await;
-                                        let _ = write_half.flush().await;
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
                                     }
                                     continue;
                                 }
@@ -5944,9 +6018,16 @@ async fn run_hook_loop_with_limits(
                                                 );
                                                 if let Ok(json) = serde_json::to_string(&refusal) {
                                                     let line = format!("{json}\n");
-                                                    let _ =
-                                                        write_half.write_all(line.as_bytes()).await;
-                                                    let _ = write_half.flush().await;
+                                                    if write_hook_reply(
+                                                        &mut write_half,
+                                                        &line,
+                                                        idle_timeout,
+                                                    )
+                                                        .await
+                                                        .is_err()
+                                                    {
+                                                        break;
+                                                    }
                                                 }
                                                 continue;
                                             }
@@ -5966,9 +6047,16 @@ async fn run_hook_loop_with_limits(
                                                     crate::event::SignalAck::refused(code, &message);
                                                 if let Ok(json) = serde_json::to_string(&refusal) {
                                                     let line = format!("{json}\n");
-                                                    let _ =
-                                                        write_half.write_all(line.as_bytes()).await;
-                                                    let _ = write_half.flush().await;
+                                                    if write_hook_reply(
+                                                        &mut write_half,
+                                                        &line,
+                                                        idle_timeout,
+                                                    )
+                                                        .await
+                                                        .is_err()
+                                                    {
+                                                        break;
+                                                    }
                                                 }
                                                 continue;
                                             }
@@ -5976,8 +6064,20 @@ async fn run_hook_loop_with_limits(
                                     }
                                     if let Some(json) = msg.provenance_ack_reply() {
                                         let line = format!("{json}\n");
-                                        let _ = write_half.write_all(line.as_bytes()).await;
-                                        let _ = write_half.flush().await;
+                                        // Issue #1693: this ack precedes the
+                                        // work, and a CLI older than #1129
+                                        // sends `dispatch` and hangs up without
+                                        // reading. Its write FAILS, and its
+                                        // dispatch must still run, so only a
+                                        // timeout — a peer holding the
+                                        // connection open without reading —
+                                        // drops the connection here.
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                            .await
+                                            == Err(ReplyWriteError::TimedOut)
+                                        {
+                                            break;
+                                        }
                                     }
                                     if matches!(
                                         provenance,
@@ -6027,8 +6127,12 @@ async fn run_hook_loop_with_limits(
                                     INBOX_UNATTESTED_MESSAGE,
                                 ) {
                                     let line = format!("{json}\n");
-                                    let _ = write_half.write_all(line.as_bytes()).await;
-                                    let _ = write_half.flush().await;
+                                    if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
                                 }
                                 continue;
                             }
@@ -6047,8 +6151,12 @@ async fn run_hook_loop_with_limits(
                                     INBOX_WRONG_AGENT_MESSAGE,
                                 ) {
                                     let line = format!("{json}\n");
-                                    let _ = write_half.write_all(line.as_bytes()).await;
-                                    let _ = write_half.flush().await;
+                                    if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
                                 }
                                 continue;
                             }
@@ -6083,8 +6191,12 @@ async fn run_hook_loop_with_limits(
                                     };
                                     if let Ok(json) = serde_json::to_string(&reply) {
                                         let line = format!("{json}\n");
-                                        let _ = write_half.write_all(line.as_bytes()).await;
-                                        let _ = write_half.flush().await;
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
                                     }
                                 }
                                 DaemonMessage::InboxWait(req)
@@ -6106,8 +6218,16 @@ async fn run_hook_loop_with_limits(
                                         );
                                         if let Ok(json) = serde_json::to_string(&reply) {
                                             let line = format!("{json}\n");
-                                            let _ = write_half.write_all(line.as_bytes()).await;
-                                            let _ = write_half.flush().await;
+                                            if write_hook_reply(
+                                                &mut write_half,
+                                                &line,
+                                                idle_timeout,
+                                            )
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
                                         }
                                         continue;
                                     }
@@ -6118,8 +6238,16 @@ async fn run_hook_loop_with_limits(
                                         let reply = crate::event::InboxWaitReply::not_in_deck();
                                         if let Ok(json) = serde_json::to_string(&reply) {
                                             let line = format!("{json}\n");
-                                            let _ = write_half.write_all(line.as_bytes()).await;
-                                            let _ = write_half.flush().await;
+                                            if write_hook_reply(
+                                                &mut write_half,
+                                                &line,
+                                                idle_timeout,
+                                            )
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
                                         }
                                         continue;
                                     }
@@ -6153,8 +6281,16 @@ async fn run_hook_loop_with_limits(
                                             );
                                             if let Ok(json) = serde_json::to_string(&reply) {
                                                 let line = format!("{json}\n");
-                                                let _ = write_half.write_all(line.as_bytes()).await;
-                                                let _ = write_half.flush().await;
+                                                if write_hook_reply(
+                                                    &mut write_half,
+                                                    &line,
+                                                    idle_timeout,
+                                                )
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    break;
+                                                }
                                             }
                                             continue;
                                         }
@@ -6232,8 +6368,16 @@ async fn run_hook_loop_with_limits(
                                             ))
                                         {
                                             let line = format!("{json}\n");
-                                            let _ = write_half.write_all(line.as_bytes()).await;
-                                            let _ = write_half.flush().await;
+                                            if write_hook_reply(
+                                                &mut write_half,
+                                                &line,
+                                                idle_timeout,
+                                            )
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
                                         }
                                         continue;
                                     }
@@ -6262,8 +6406,12 @@ async fn run_hook_loop_with_limits(
                                     };
                                     if let Ok(json) = serde_json::to_string(&ack) {
                                         let line = format!("{json}\n");
-                                        let _ = write_half.write_all(line.as_bytes()).await;
-                                        let _ = write_half.flush().await;
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
                                     }
                                 }
                                 DaemonMessage::InboxFetch(req)
@@ -6298,9 +6446,16 @@ async fn run_hook_loop_with_limits(
                                             );
                                             if let Ok(json) = serde_json::to_string(&reply) {
                                                 let line = format!("{json}\n");
-                                                let _ =
-                                                    write_half.write_all(line.as_bytes()).await;
-                                                let _ = write_half.flush().await;
+                                                if write_hook_reply(
+                                                    &mut write_half,
+                                                    &line,
+                                                    idle_timeout,
+                                                )
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    break;
+                                                }
                                             }
                                             continue;
                                         };
@@ -6332,8 +6487,16 @@ async fn run_hook_loop_with_limits(
                                             );
                                             if let Ok(json) = serde_json::to_string(&reply) {
                                                 let line = format!("{json}\n");
-                                                let _ = write_half.write_all(line.as_bytes()).await;
-                                                let _ = write_half.flush().await;
+                                                if write_hook_reply(
+                                                    &mut write_half,
+                                                    &line,
+                                                    idle_timeout,
+                                                )
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    break;
+                                                }
                                             }
                                             continue;
                                         }
@@ -6379,8 +6542,12 @@ async fn run_hook_loop_with_limits(
                                     };
                                     if let Ok(json) = serde_json::to_string(&reply) {
                                         let line = format!("{json}\n");
-                                        let _ = write_half.write_all(line.as_bytes()).await;
-                                        let _ = write_half.flush().await;
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
                                     }
                                 }
                                 DaemonMessage::InboxCommitted(req) => {
@@ -6431,8 +6598,12 @@ async fn run_hook_loop_with_limits(
                                     };
                                     if let Ok(json) = serde_json::to_string(&reply) {
                                         let line = format!("{json}\n");
-                                        let _ = write_half.write_all(line.as_bytes()).await;
-                                        let _ = write_half.flush().await;
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
                                     }
                                 }
                                 DaemonMessage::InboxList(req) => {
@@ -6452,8 +6623,12 @@ async fn run_hook_loop_with_limits(
                                     };
                                     if let Ok(json) = json {
                                         let line = format!("{json}\n");
-                                        let _ = write_half.write_all(line.as_bytes()).await;
-                                        let _ = write_half.flush().await;
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
                                     }
                                 }
                                 DaemonMessage::InboxPublish(_)
@@ -6486,8 +6661,16 @@ async fn run_hook_loop_with_limits(
                                             refusal.message(),
                                         ) {
                                             let line = format!("{json}\n");
-                                            let _ = write_half.write_all(line.as_bytes()).await;
-                                            let _ = write_half.flush().await;
+                                            if write_hook_reply(
+                                                &mut write_half,
+                                                &line,
+                                                idle_timeout,
+                                            )
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
                                         }
                                         continue;
                                     }
@@ -6530,8 +6713,12 @@ async fn run_hook_loop_with_limits(
                                     };
                                     if let Ok(json) = json {
                                         let line = format!("{json}\n");
-                                        let _ = write_half.write_all(line.as_bytes()).await;
-                                        let _ = write_half.flush().await;
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
                                     }
                                 }
                                 DaemonMessage::Delegate(signal) => {
@@ -6593,8 +6780,12 @@ async fn run_hook_loop_with_limits(
                                     // this a no-op.
                                     if let Ok(json) = serde_json::to_string(&resp) {
                                         let line = format!("{json}\n");
-                                        let _ = write_half.write_all(line.as_bytes()).await;
-                                        let _ = write_half.flush().await;
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
                                     }
                                 }
                                 DaemonMessage::RestartRole(signal) => {
@@ -6625,8 +6816,12 @@ async fn run_hook_loop_with_limits(
                                     .await;
                                     if let Ok(json) = serde_json::to_string(&resp) {
                                         let line = format!("{json}\n");
-                                        let _ = write_half.write_all(line.as_bytes()).await;
-                                        let _ = write_half.flush().await;
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
                                     }
                                 }
                                 DaemonMessage::SpawnRole(signal) => {
@@ -6653,8 +6848,12 @@ async fn run_hook_loop_with_limits(
                                     .await;
                                     if let Ok(json) = serde_json::to_string(&resp) {
                                         let line = format!("{json}\n");
-                                        let _ = write_half.write_all(line.as_bytes()).await;
-                                        let _ = write_half.flush().await;
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
                                     }
                                 }
                                 DaemonMessage::Dispatch(signal) => {
@@ -6852,8 +7051,12 @@ async fn run_hook_loop_with_limits(
                                     };
                                     if let Ok(json) = serde_json::to_string(&ack) {
                                         let line = format!("{json}\n");
-                                        let _ = write_half.write_all(line.as_bytes()).await;
-                                        let _ = write_half.flush().await;
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
                                     }
                                     pty_registry
                                         .pause_point(crate::task_completion::PAUSE_ACKED)
@@ -6871,8 +7074,12 @@ async fn run_hook_loop_with_limits(
                                     };
                                     if let Ok(json) = serde_json::to_string(&reply) {
                                         let line = format!("{json}\n");
-                                        let _ = write_half.write_all(line.as_bytes()).await;
-                                        let _ = write_half.flush().await;
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
                                     }
                                 }
                                 DaemonMessage::WorkDoneTask(request) => {
@@ -6904,8 +7111,12 @@ async fn run_hook_loop_with_limits(
                                     };
                                     if let Ok(json) = serde_json::to_string(&reply) {
                                         let line = format!("{json}\n");
-                                        let _ = write_half.write_all(line.as_bytes()).await;
-                                        let _ = write_half.flush().await;
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
                                     }
                                     pty_registry
                                         .pause_point(crate::task_completion::PAUSE_ACKED)
@@ -6951,8 +7162,12 @@ async fn run_hook_loop_with_limits(
                                     };
                                     if let Ok(json) = serde_json::to_string(&ack) {
                                         let line = format!("{json}\n");
-                                        let _ = write_half.write_all(line.as_bytes()).await;
-                                        let _ = write_half.flush().await;
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
                                     }
                                 }
                                 DaemonMessage::GetSeed(req) => {
@@ -6988,9 +7203,12 @@ async fn run_hook_loop_with_limits(
                                     );
                                     if let Ok(json) = serde_json::to_string(&resp) {
                                         let line = format!("{json}\n");
-                                        let _ =
-                                            write_half.write_all(line.as_bytes()).await;
-                                        let _ = write_half.flush().await;
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
                                     }
                                 }
                                 DaemonMessage::Question(signal) => {
@@ -7035,6 +7253,7 @@ async fn run_hook_loop_with_limits(
                                         held,
                                         ack,
                                         limits.ack_wait,
+                                        idle_timeout,
                                     )
                                     .await;
                                     break;
@@ -7065,9 +7284,12 @@ async fn run_hook_loop_with_limits(
                                     );
                                     if let Ok(json) = serde_json::to_string(&resp) {
                                         let line = format!("{json}\n");
-                                        let _ =
-                                            write_half.write_all(line.as_bytes()).await;
-                                        let _ = write_half.flush().await;
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -7567,6 +7789,65 @@ mod quota_admission_tests {
         }
     }
 
+    /// Issue #1981 M8 (PR #2010 review): every event admitted from a producer
+    /// carries the daemon's receipt stamp, set when it was admitted and over
+    /// any copy the producer sent, so a producer can neither forge one nor
+    /// skew the latency read from it. The event the daemon ingests after
+    /// typing part of an answer is the daemon's own and carries none, so
+    /// telemetry does not count it as an agent's hook.
+    #[test]
+    fn the_receipt_stamp_is_the_daemons_alone() {
+        use crate::event::RECEIVED_BY_DECK_AT_METADATA_KEY;
+        let stamp = |event: &AgentEvent| {
+            event
+                .metadata
+                .get(RECEIVED_BY_DECK_AT_METADATA_KEY)
+                .map(|v| v.parse::<i64>().expect("a stamp is Unix nanoseconds"))
+        };
+        let question: crate::question::PendingQuestion =
+            serde_json::from_value(serde_json::json!({
+                "id": "q1",
+                "kind": "permission",
+                "questions": [{"prompt": "Allow?", "options": [
+                    {"index": 1, "label": "Yes", "role": "allow_once"},
+                    {"index": 2, "label": "No", "role": "deny"},
+                ]}],
+                "raised_at_ms": 1,
+                "channel": "unsupported",
+            }))
+            .unwrap();
+        let made = deck_keyboard_only_event(
+            "s".to_string(),
+            AgentType::ClaudeCode,
+            Some("pane-1".to_string()),
+            Some("1".to_string()),
+            &question,
+        );
+        assert_eq!(stamp(&made), None, "{:?}", made.metadata);
+        let before = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+        let mut plain = quota_frame(crate::event::EventType::Thinking);
+        admit_producer_event(&mut plain);
+        // A copy claiming the epoch would read as decades of latency, and one
+        // far ahead as none.
+        let mut forged = [0, i64::MAX].map(|claimed| {
+            let mut forged = quota_frame(crate::event::EventType::Unknown);
+            forged.metadata.insert(
+                RECEIVED_BY_DECK_AT_METADATA_KEY.to_string(),
+                claimed.to_string(),
+            );
+            admit_producer_event(&mut forged);
+            forged
+        });
+        let after = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+        for admitted in std::iter::once(&mut plain).chain(forged.iter_mut()) {
+            let at = stamp(admitted).expect("an admitted event is stamped");
+            assert!(
+                (before..=after).contains(&at),
+                "{at} not in {before}..={after}"
+            );
+        }
+    }
+
     /// Scenario: Post a `quota_blocked` event on the hook socket as a producer
     /// would, with a forged daemon source marker, an unknown kind and an
     /// out-of-range reset, and a `thinking` event carrying quota-reason keys.
@@ -7677,6 +7958,13 @@ mod quota_admission_tests {
             ],
         );
         admit_producer_event(&mut smuggled);
+        // Issue #1981 M8: admission adds the daemon's receipt stamp.
+        assert!(
+            smuggled
+                .metadata
+                .remove(crate::event::RECEIVED_BY_DECK_AT_METADATA_KEY)
+                .is_some()
+        );
         assert_eq!(
             smuggled.metadata.keys().collect::<Vec<_>>(),
             vec!["other"],
@@ -7714,13 +8002,14 @@ mod quota_admission_tests {
                 "t".to_string(),
             ),
         ];
+        // Each count includes the daemon's receipt stamp (issue #1981 M8).
         let mut claude = with(crate::event::EventType::Thinking, &codex_keys);
         admit_producer_event(&mut claude);
-        assert_eq!(claude.metadata.len(), 1, "{:?}", claude.metadata);
+        assert_eq!(claude.metadata.len(), 2, "{:?}", claude.metadata);
         let mut codex = with(crate::event::EventType::Thinking, &codex_keys);
         codex.agent_type = AgentType::Codex;
         admit_producer_event(&mut codex);
-        assert_eq!(codex.metadata.len(), 3, "{:?}", codex.metadata);
+        assert_eq!(codex.metadata.len(), 4, "{:?}", codex.metadata);
         // Issue #1354: a thread-spawned Codex subagent's hooks carry the
         // parent's session and the subagent's own rollout and turn, so they
         // lose both keys rather than re-arm the parent's watch.
@@ -7731,7 +8020,7 @@ mod quota_admission_tests {
             "a7c1".to_string(),
         );
         admit_producer_event(&mut subagent);
-        assert_eq!(subagent.metadata.len(), 2, "{:?}", subagent.metadata);
+        assert_eq!(subagent.metadata.len(), 3, "{:?}", subagent.metadata);
         assert!(subagent.is_from_subagent());
     }
 
@@ -19197,6 +19486,7 @@ mod question_hold_tests {
                 held,
                 false,
                 Duration::from_millis(100),
+                HOOK_CONNECTION_IDLE_TIMEOUT,
             )
             .await;
             rx.await.expect("an outcome is always reported")
@@ -19316,3 +19606,8 @@ mod hook_pin_refresh_tests {
         assert!(state.read().await.hook_binaries.notices().is_empty());
     }
 }
+
+// Unix-only, like `hook_ingestion_tests`: it drives the loop over a Unix socket.
+#[cfg(all(test, unix))]
+#[path = "daemon_hook_reply_deadline_tests.rs"]
+mod hook_reply_deadline_tests;

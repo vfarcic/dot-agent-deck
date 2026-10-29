@@ -2191,6 +2191,100 @@ async fn a_superseded_uncertain_task_leaves_no_told_marker() {
     peer.close().await;
 }
 
+/// Issue #1816: on one long-lived generation, task after task goes
+/// uncertain and is superseded by the next; the record that its orchestrator
+/// was told goes with each watch, so it never holds more than the one live
+/// watch's id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn told_markers_stay_within_the_live_watches_over_many_tasks() {
+    let hub = hub_with(Duration::from_secs(30), Duration::from_secs(60));
+    let mut peer = Peer::open(&hub, "p", "a", InboxComponent::OpenCodePlugin, INTEGRATION).await;
+    peer.next().await;
+    let key = ("p".to_string(), "a".to_string());
+    let mut seq = 0;
+    for task in 0..4 {
+        let id = hub
+            .post_delegate(
+                Recipient::bound("p", "a"),
+                "coder",
+                Some(Recipient::bound("o", "oa")),
+                DelegateLedger::default(),
+                content(&format!("uncertain task {task}")),
+                &|| true,
+            )
+            .unwrap()
+            .0;
+        lapse_until_uncertain(&hub, &mut peer, id.as_str(), &mut seq).await;
+        until("the orchestrator to be told it is uncertain", || {
+            hub.tick();
+            hub.lock().receipts.gens[&key]
+                .uncertain_told
+                .contains(id.as_str())
+        })
+        .await;
+        let st = hub.lock();
+        assert_eq!(
+            st.receipts.gens[&key].uncertain_told.len(),
+            1,
+            "task {task}: only the live watch's marker is kept"
+        );
+        assert!(st.delegates.contains_key(id.as_str()));
+    }
+    peer.close().await;
+}
+
+/// Scenario: A long-lived OpenCode generation whose pane keeps two ended
+/// messages of history is handed six messages, each committed in turn. Its
+/// delivery model keeps the records of the two the inbox still lists, and a
+/// Cancel pressed on one of them is still answered as already delivered;
+/// the records of the four the inbox dropped are gone.
+#[spec("inbox/boundary/075")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_075_a_long_lived_generation_keeps_only_the_records_the_inbox_lists() {
+    use crate::daemon_protocol::InboxActionOutcome;
+    let limits = InboxLimits {
+        ack_wait: Duration::from_secs(60),
+        history_per_pane: 2,
+        ..InboxLimits::default()
+    };
+    let hub = Arc::new(InboxHub::new(deck(), limits, Duration::from_secs(30)));
+    let mut peer = Peer::open(&hub, "p", "a", InboxComponent::OpenCodePlugin, INTEGRATION).await;
+    peer.next().await;
+    let key = ("p".to_string(), "a".to_string());
+    let records = || hub.lock().receipts.gens[&key].model.ids();
+    let mut ids = Vec::new();
+    for n in 0..6 {
+        let id = hub
+            .post_direct(Recipient::bound("p", "a"), content(&format!("task {n}")))
+            .unwrap();
+        let handed = peer.handout().await;
+        assert_eq!(handed[0].id, id.as_str());
+        peer.send(serde_json::json!({"committed": [at(&handed[0])]}))
+            .await;
+        until("the commit to settle", || {
+            state_of(&hub, "p", id.as_str()) == StateName::Acknowledged
+        })
+        .await;
+        ids.push(id.as_str().to_string());
+        assert!(
+            records().len() <= 2,
+            "message {n}: the model holds {:?}",
+            records()
+        );
+    }
+    let mut kept = ids[4..].to_vec();
+    kept.sort();
+    assert_eq!(records(), kept, "the two the inbox still lists");
+    let revision = hub.lock().receipts.gens[&key]
+        .model
+        .delivery(&ids[5])
+        .unwrap()
+        .revision;
+    let cancel = hub.inbox_action("p", "a", &ids[5], revision, false, "tui-1");
+    assert_eq!(cancel.outcome, InboxActionOutcome::AlreadySettled);
+    peer.close().await;
+}
+
 /// Reviewer R9T-03 (PR #1735 review 4298669219): a task delegated to a Pi
 /// receiver is reported not handed on every attempt, so it runs out of
 /// attempts: the orchestrator is told it is undeliverable and the worker's
@@ -5744,5 +5838,65 @@ async fn boundary_072_a_once_wait_from_a_hook_component_is_refused() {
                 .is_none_or(|generation| generation.model.delivery(id.as_str()).is_none()),
             "{component:?}: no attempt is issued"
         );
+    }
+}
+
+/// Scenario: On an OpenCode and on a Pi receiver alike, the receiver holds a message's first hand-out while its snapshots stop past the possession TTL, and the deck hands out the automatic repeat. Reporting that possession on the same line as the repeat's final check gets it refused `held_earlier`. Reporting it on an earlier line gone stale before the check (a receiver from before this change: the residual), or reporting on the check's line that it dropped the first, gets the repeat approved.
+#[spec("inbox/boundary/076")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boundary_076_possession_reported_with_the_check_is_fresh_at_the_check() {
+    let keepalive = Duration::from_millis(100);
+    let ttl = keepalive * crate::inbox_attempts::KEEPALIVES_PER_POSSESS_TTL;
+    for component in [InboxComponent::OpenCodePlugin, InboxComponent::PiExtension] {
+        for (case, held_first, separate) in [
+            ("reported with the check", true, false),
+            ("reported before the check, stale by it", true, true),
+            ("dropped, reported with the check", false, false),
+        ] {
+            let (hub, _state) = hub_with_spool(keepalive, Duration::from_secs(2));
+            let mut peer = Peer::open(&hub, "p", "a", component, INTEGRATION).await;
+            peer.next().await.registered.unwrap();
+            hub.post_direct(Recipient::bound("p", "a"), content("hold me"))
+                .unwrap();
+            let first = peer.handout().await.remove(0);
+            peer.send(serde_json::json!({"possess": {"seq": 1, "seen": attempt(&first).d, "held": [at(&first)]}}))
+                .await;
+            let repeat = peer.handout_ticking(&hub).await.remove(0);
+            assert!(
+                attempt(&repeat).repeat,
+                "{component:?}, {case}: precondition: the stall let the deck repeat it"
+            );
+            let held = if held_first {
+                vec![at(&first), at(&repeat)]
+            } else {
+                vec![at(&repeat)]
+            };
+            let possess = serde_json::json!({"seq": 2, "seen": attempt(&repeat).d, "held": held});
+            let may = serde_json::json!({"q": 1, "id": repeat.id, "a": attempt(&repeat).a, "e": attempt(&repeat).e});
+            if separate {
+                peer.send(serde_json::json!({ "possess": possess })).await;
+                tokio::time::sleep(ttl * 2).await;
+                peer.send(serde_json::json!({ "may": may })).await;
+            } else {
+                peer.send(serde_json::json!({ "possess": possess, "may": may }))
+                    .await;
+            }
+            let grant = loop {
+                if let Some(grant) = peer.next().await.grant {
+                    break grant;
+                }
+            };
+            let refused = held_first && !separate;
+            assert_eq!(
+                (grant.ok, grant.refusal.as_deref()),
+                if refused {
+                    (false, Some("held_earlier"))
+                } else {
+                    (true, None)
+                },
+                "{component:?}, {case}"
+            );
+            peer.close().await;
+        }
     }
 }

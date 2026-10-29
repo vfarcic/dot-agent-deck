@@ -1269,9 +1269,11 @@ mod tests {
 
         let others = [
             Outcome::BrewNotUpgraded {
+                brew: PathBuf::from("/opt/homebrew/bin/brew"),
                 formula: "dot-agent-deck",
                 reported: Some(CURRENT.into()),
                 offered: LATEST.into(),
+                refresh_failed: None,
             },
             Outcome::Replaced {
                 path: PathBuf::from("/home/u/.local/bin/dot-agent-deck"),
@@ -1318,9 +1320,11 @@ mod tests {
         let dto = outcome_dto(SelfCopy::Cli, &staged, Vec::new());
         assert!(dto.ok && !dto.installed);
         let not_brewed = Outcome::BrewNotUpgraded {
+            brew: PathBuf::from("/opt/homebrew/bin/brew"),
             formula: "dot-agent-deck",
             reported: Some(CURRENT.into()),
             offered: LATEST.into(),
+            refresh_failed: None,
         };
         assert!(!outcome_dto(SelfCopy::Cli, &not_brewed, Vec::new()).installed);
         for installed in [
@@ -1355,9 +1359,11 @@ mod tests {
         let dto = outcome_dto(
             SelfCopy::Cli,
             &Outcome::BrewNotUpgraded {
+                brew: PathBuf::from("/opt/homebrew/bin/brew"),
                 formula: "dot-agent-deck",
                 reported: Some(CURRENT.into()),
                 offered: LATEST.into(),
+                refresh_failed: None,
             },
             Vec::new(),
         );
@@ -1366,7 +1372,8 @@ mod tests {
         assert_eq!(
             texts(&dto.lines),
             vec![
-                "`brew upgrade dot-agent-deck` finished, but dot-agent-deck still reports v0.46.0, not v0.47.0: Homebrew does not offer v0.47.0 yet. Try again later."
+                "`brew upgrade dot-agent-deck` finished, but dot-agent-deck still reports v0.46.0, not v0.47.0: Homebrew's tap does not carry v0.47.0 yet, even after `brew update`. Once it does, refresh it and upgrade again:",
+                "/opt/homebrew/bin/brew update && /opt/homebrew/bin/brew upgrade dot-agent-deck",
             ]
         );
     }

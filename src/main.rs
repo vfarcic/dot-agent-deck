@@ -266,6 +266,26 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// List the live agents with their folder, orchestration and role, and
+    /// which one is each orchestration's orchestrator — the agent to message
+    /// with `inbox send`.
+    ///
+    /// --folder and --orchestration select what `inbox send` would address
+    /// with the same flags (all the agents of each matching orchestration)
+    /// when run on the same machine as the deck, which is how agents in deck
+    /// panes run it, and combine as an intersection.
+    Roles {
+        /// Print a JSON array instead of the table.
+        #[arg(long)]
+        json: bool,
+        /// Only the orchestrations in this folder or, when none is, its
+        /// nearest parent folder that has one.
+        #[arg(long, value_name = "PATH")]
+        folder: Option<String>,
+        /// Only the orchestrations with this config name or title.
+        #[arg(long, value_name = "NAME")]
+        orchestration: Option<String>,
+    },
     /// Acknowledge a message the deck delivered to you (`m-…`). Exits non-zero
     /// only when the deck says it holds no such message for you; any other
     /// failure to acknowledge is harmless, and the task goes on.
@@ -861,6 +881,28 @@ enum InboxAction {
         /// offered to another, e.g. `30m`, `1h30m`, `90s`.
         #[arg(long, value_name = "DURATION")]
         claim_ttl: Option<String>,
+    },
+    /// Message an orchestration's orchestrator from outside it, by folder,
+    /// orchestration name, or both. With a folder alone that holds no
+    /// orchestration, the one standalone agent there is messaged instead,
+    /// which is how an orchestrator answers a standalone agent. Your text
+    /// arrives as UNTRUSTED data, with the deck naming your pane and how to
+    /// reply. A worker reports to its own orchestrator with `work-done`.
+    ///
+    /// Exit status: 0 sent; 1 refused (nothing matched, the address was
+    /// ambiguous, or the orchestrator is not live); 2 the running daemon is
+    /// too old for `inbox send`; 3 no daemon is running.
+    #[command(group(clap::ArgGroup::new("address").required(true).multiple(true).args(["folder", "orchestration"])))]
+    Send {
+        /// The orchestration in this folder or, when none is, in its nearest
+        /// parent folder that has one.
+        #[arg(long, value_name = "PATH")]
+        folder: Option<String>,
+        /// The orchestration with this config name or title.
+        #[arg(long, value_name = "NAME")]
+        orchestration: Option<String>,
+        #[command(flatten)]
+        body: InboxBody,
     },
     /// Report a job you were offered as done.
     Complete {
@@ -1906,6 +1948,11 @@ fn main() -> ExitCode {
                 body,
                 claim_ttl,
             } => dot_agent_deck::inbox_cli::offer(&pool, body.text, body.file, claim_ttl),
+            InboxAction::Send {
+                folder,
+                orchestration,
+                body,
+            } => run_inbox_send_cli(folder, orchestration, body),
             InboxAction::Complete { id } => dot_agent_deck::inbox_cli::settle(&id, true),
             InboxAction::Release { id } => dot_agent_deck::inbox_cli::settle(&id, false),
         },
@@ -2036,6 +2083,11 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        Some(Commands::Roles {
+            json,
+            folder,
+            orchestration,
+        }) => run_roles_cli(json, folder, orchestration),
         Some(Commands::Close {
             units,
             unit_ids,
@@ -2731,6 +2783,29 @@ async fn run_tui_session() -> ExitCode {
     // #577) — see `launch_project_dir`.
     dot_agent_deck::features::init_and_watch(&launch_project_dir());
 
+    // Install hooks/plugins for detected agents (best-effort), driven from the
+    // agent registry: each spec's OWN startup install, in `ALL` order (PRD #20
+    // M2 / R20-010), so a future agent reusing `NativeHooks`/`Plugin` runs its
+    // own installer. Codex starts its scoped, hash-pinned trust write here too
+    // (PRD #20 §4.2.1), on a thread of its own that this does not wait for
+    // (issue #1665); Pi materializes at spawn time and has no startup install.
+    //
+    // PRD #91: BEFORE the daemon is bootstrapped, because a lazy-spawned
+    // daemon runs the same installs before it binds and would leave nothing
+    // for this one to change, so the TUI could never say that it changed the
+    // hooks. Whatever it changed or could not change is the note `run_tui`
+    // shows as it starts. The daemon's own pass then finds nothing to do.
+    // On a blocking thread, since the installers read and write files and run
+    // the agents' CLIs (Qodo on PR #1925).
+    let mut startup_hooks = UnshownStartupNote(
+        tokio::task::spawn_blocking(dot_agent_deck::hooks_refresh::startup_install)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("startup hook install did not finish: {e}");
+                None
+            }),
+    );
+
     let state = Arc::new(RwLock::new(AppState::default()));
     // PRD #741 M2: the TUI always talks to the daemon on this machine, so it
     // names it as one. `attach_path` stays the same value it always was — the
@@ -2903,34 +2978,20 @@ async fn run_tui_session() -> ExitCode {
     // the alt-screen, so loading here keeps the warnings ahead of it.
     let keybindings = dot_agent_deck::keybindings::KeybindingConfig::load();
 
-    // Auto-install hooks/plugins for detected agents (silent, best-effort).
-    // PRD #20 M2 / R20-010: driven from the agent registry — iterate the shipped
-    // agents and run each spec's OWN startup auto-install action. Order is stable
-    // (`ALL` order). Dispatching per-spec (rather than mapping the reusable
-    // `IntegrationStrategy` enum to a hardcoded incumbent) means a future agent
-    // reusing `NativeHooks`/`Plugin` runs ITS OWN installer, not Claude's or
-    // OpenCode's. Claude installs native hooks and OpenCode its plugin at
-    // startup; Codex installs its native `hooks.json` AND records scoped,
-    // hash-pinned trust for it here too (PRD #20 §4.2.1 — command-agnostic, so a
-    // launcher like `devbox run codex-big` that the spawn seam can't detect is
-    // still covered); Pi (`Extension`) materializes at spawn-time (see
-    // `agent_pty`), so its `startup_auto_install` is `None` and it is skipped.
-    {
-        use dot_agent_deck::agent_registry::ALL;
-        for spec in ALL {
-            if let Some(install) = spec.startup_auto_install {
-                install();
-            }
-        }
-    }
-
     let pane_controller: Arc<dyn PaneController> = Arc::new(
         EmbeddedPaneController::new(attach_path.clone(), tokio::runtime::Handle::current())
             .with_protocol_gate(),
     );
     let tui_state = state.clone();
+    let startup_note = startup_hooks.0.take();
     let tui_result = tokio::task::spawn_blocking(move || {
-        run_tui(tui_state, pane_controller, config, keybindings)
+        run_tui(
+            tui_state,
+            pane_controller,
+            config,
+            keybindings,
+            startup_note,
+        )
     })
     .await;
 
@@ -2946,6 +3007,20 @@ async fn run_tui_session() -> ExitCode {
         eprintln!("TUI error: {e}");
     }
     ExitCode::SUCCESS
+}
+
+/// PRD #91: the startup hook install's note until `run_tui` takes it. A launch
+/// that returns before the TUI opens (a failed bootstrap or handshake) drops
+/// it here instead, and what the user has to fix goes to stderr, as the TUI
+/// would have printed it on exit (Qodo on PR #1925).
+struct UnshownStartupNote(Option<dot_agent_deck::hooks_refresh::StartupNote>);
+
+impl Drop for UnshownStartupNote {
+    fn drop(&mut self) {
+        for warning in self.0.take().map(|note| note.warnings).unwrap_or_default() {
+            eprintln!("{warning}");
+        }
+    }
 }
 
 /// PRD #76 M2.17: spawn the TUI's event subscriber — see
@@ -3793,6 +3868,68 @@ async fn run_close_cli(args: dot_agent_deck::close_cli::CloseArgs) -> ExitCode {
     ExitCode::from(output.code)
 }
 
+/// `--folder`, made absolute against this shell's cwd and left otherwise as
+/// spelled: the daemon canonicalises it.
+fn absolute_address(
+    folder: Option<String>,
+    orchestration: Option<String>,
+) -> dot_agent_deck::orchestrator_address::MessageAddress {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    dot_agent_deck::orchestrator_address::MessageAddress {
+        folder: folder.map(|f| dot_agent_deck::roles_cli::absolute_folder(&f, &cwd)),
+        orchestration,
+    }
+}
+
+fn print_cli_output(output: dot_agent_deck::roles_cli::CliOutput) -> ExitCode {
+    print!("{}", output.stdout);
+    eprint!("{}", output.stderr);
+    ExitCode::from(output.code)
+}
+
+/// `dot-agent-deck roles` — issue #1947. See [`dot_agent_deck::roles_cli`].
+#[tokio::main]
+async fn run_roles_cli(
+    json: bool,
+    folder: Option<String>,
+    orchestration: Option<String>,
+) -> ExitCode {
+    let client = DaemonClient::new(client_attach_socket_path());
+    let address = absolute_address(folder, orchestration);
+    print_cli_output(dot_agent_deck::roles_cli::run_roles(&client, json, &address).await)
+}
+
+/// `dot-agent-deck inbox send` — issue #1947. Connect-only, like `close`:
+/// messaging an orchestrator on a daemon this call just started would reach
+/// nobody.
+#[tokio::main]
+async fn run_inbox_send_cli(
+    folder: Option<String>,
+    orchestration: Option<String>,
+    body: InboxBody,
+) -> ExitCode {
+    let identity = match dot_agent_deck::close_cli::ambient_identity() {
+        Ok(identity) => identity,
+        Err(message) => {
+            let message = message
+                .replace("run `close`", "run `inbox send`")
+                .replace("Nothing was closed.", "Nothing was sent.");
+            eprintln!("{message}");
+            return ExitCode::from(dot_agent_deck::close_cli::EXIT_REFUSED);
+        }
+    };
+    let text = match dot_agent_deck::roles_cli::read_body(body.text, body.file, std::io::stdin()) {
+        Ok(text) => text,
+        Err(why) => {
+            eprintln!("refused: {why}; nothing was sent.");
+            return ExitCode::from(dot_agent_deck::close_cli::EXIT_REFUSED);
+        }
+    };
+    let client = DaemonClient::new(client_attach_socket_path());
+    let address = absolute_address(folder, orchestration);
+    print_cli_output(dot_agent_deck::roles_cli::run_send(&client, &identity, address, text).await)
+}
+
 #[tokio::main]
 async fn run_daemon_install_cli() -> ExitCode {
     match dot_agent_deck::daemon_service::run_install().await {
@@ -3909,10 +4046,15 @@ async fn run_daemon_restart_cli(force: bool) -> ExitCode {
 /// (Daemon::with_attach + run_daemon_with) so a remote running this
 /// subcommand binds the same two sockets a local TUI would.
 ///
-/// Hook auto-install is skipped here on purpose: `remote add` already runs
-/// `hooks install` on the remote, and the on-disk hook scripts only need
-/// to be (re)installed when the binary version changes — not every time
-/// the daemon starts.
+/// Every agent's hook auto-install runs before this, in the `DaemonCmd::Serve`
+/// arm (issue #1157), so an agent this daemon starts with no TUI attached —
+/// a scheduled task, a dispatched unit, a restored pane — finds hooks naming
+/// a live deck. The OpenCode plugin's install also runs again before each
+/// OpenCode agent starts (PRD #1666 §11), so a plugin missing, or pinned to a
+/// deleted copy, because OpenCode was set up or a copy removed after this
+/// daemon started is repaired before the agent loads it (PRD #190,
+/// `hooks/install/023`). A pin to another live, durable install is kept by the
+/// same rules as at startup.
 #[tokio::main]
 async fn run_daemon_serve_cli(
     hook_binaries: dot_agent_deck::hook_binary::HookBinaryState,

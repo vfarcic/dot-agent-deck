@@ -223,6 +223,21 @@ mod tests {
         }
     }
 
+    /// Issue #1947: agents in an orchestration message only its orchestrator,
+    /// never another worker, and so do agents outside it.
+    #[test]
+    fn every_worker_role_messages_only_its_orchestrator() {
+        let lib = role_library();
+        for role in &lib.role {
+            assert!(
+                role.prompt_template
+                    .contains("Message only your orchestrator, never another worker"),
+                "role `{}` is missing the messaging convention",
+                role.name
+            );
+        }
+    }
+
     /// Issue #551: workers share one checkout, so a role that changes files
     /// must neither move the branch from under another agent nor sweep that
     /// agent's changes into its own commit.

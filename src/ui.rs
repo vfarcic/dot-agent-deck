@@ -3196,6 +3196,33 @@ fn surface_orchestration_config_drift(ui: &mut UiState, tab: Option<&Tab>, warni
     ui.session_warnings.push(warning);
 }
 
+/// PRD #91: tell the user what the startup hook install came to. The status
+/// line says it as the dashboard appears; what the user has to fix also joins
+/// `session_warnings`, printed on exit, because the status line expires after
+/// [`STATUS_MESSAGE_TTL`]. Returns the status line it set, for
+/// [`restart_startup_hook_note`].
+fn surface_startup_hook_note(
+    ui: &mut UiState,
+    note: Option<crate::hooks_refresh::StartupNote>,
+) -> Option<String> {
+    let note = note?;
+    ui.status_message = Some((note.status.clone(), std::time::Instant::now()));
+    ui.session_warnings.extend(note.warnings);
+    Some(note.status)
+}
+
+/// PRD #91: start the startup note's [`STATUS_MESSAGE_TTL`] again once the
+/// first frame is about to be drawn, so a slow hydration from the daemon does
+/// not use it up before anyone sees it (Qodo on PR #1925). A status line that
+/// startup has since replaced is left as it is.
+fn restart_startup_hook_note(ui: &mut UiState, status: Option<&str>) {
+    if let Some((shown, at)) = &mut ui.status_message
+        && Some(shown.as_str()) == status
+    {
+        *at = std::time::Instant::now();
+    }
+}
+
 /// Issue #1199: the status-line summary shown when the New Agent form loads a
 /// project config that still declares `[[modes]]`. Short enough for one status
 /// row; the full text, naming the file, goes to `session_warnings`.
@@ -4450,6 +4477,76 @@ fn adopt_context_path_into_owning_tab(
     }
 }
 
+/// Issue #1913: retire each tab slot that holds one of `surface`'s role pane
+/// ids for an agent a deck restart replaced, so the surface's role is placed
+/// rather than read as already shown. The surface must come from a named
+/// process the deck has not replaced; a late one from a replaced process is no
+/// newer than what the tabs hold.
+///
+/// - A slot whose local pane is still attached on a process the deck replaced
+///   is that pane lost to the restart, recorded as its reattach would record
+///   it, and [`process_restart_drops`] drops it now — attachment, slot, tab
+///   once empty — and names its agent in the restart notice, whether or not a
+///   card of the old agent was dropped with it.
+/// - A slot with no local pane under its id at all (a lost pane a card's
+///   focus dropped, whose own attach did not follow) in a tab that is not this
+///   surface's orchestration is forgotten from that tab, as a closed pane's.
+///   In this surface's own tab it is left for the surface to fill.
+fn retire_slots_a_restart_left(
+    state: &SharedState,
+    embedded: &EmbeddedPaneController,
+    tab_manager: &mut TabManager,
+    ui: &mut UiState,
+    surface: &OrchestrationSurface,
+    learned_from: &crate::daemon_client::Incarnation,
+) {
+    if learned_from.is_unnamed() || state.blocking_read().process_replaced(learned_from) {
+        return;
+    }
+    let mut lost = false;
+    let mut unheld: Vec<String> = Vec::new();
+    for role in &surface.roles {
+        let Some(tab_index) = tab_manager.tab_index_for_pane(&role.pane_id) else {
+            continue;
+        };
+        if !embedded.holds_pane(&role.pane_id) {
+            if !tab_manager.orchestration_tab_is(
+                tab_index,
+                &surface.cwd,
+                &surface.name,
+                surface.orchestration_id.as_deref(),
+            ) {
+                unheld.push(role.pane_id.clone());
+            }
+            continue;
+        }
+        if let Some(attached_on) = embedded.pane_incarnation(&role.pane_id)
+            && !attached_on.same_process(learned_from)
+            && state.blocking_read().process_replaced(&attached_on)
+        {
+            lost |= embedded.mark_lost_to_restart(&role.pane_id, &attached_on);
+        }
+    }
+    if lost {
+        process_restart_drops(state, embedded, tab_manager, ui);
+    }
+    for pane_id in unheld {
+        let Some(outcome) = tab_manager.forget_externally_closed_pane(&pane_id) else {
+            continue;
+        };
+        if outcome.tab_removed {
+            let mut st = state.blocking_write();
+            for dead in &outcome.dead_slot_pane_ids {
+                st.remove_sessions_for_pane(dead);
+            }
+        }
+        if ui.mode == UiMode::PaneInput && outcome.tab_removed && outcome.was_active {
+            ui.mode = UiMode::Normal;
+        }
+        ui.mark_session_dirty();
+    }
+}
+
 /// Build one live orchestration tab from a daemon [`OrchestrationSurface`].
 /// Idempotent on the role pane ids, so a duplicate broadcast (or a race with a
 /// reconnect that already hydrated the tab) doesn't double-build.
@@ -4477,6 +4574,10 @@ fn surface_one_orchestration(
     // every live role of its orchestration, some of them possibly in its tab
     // already. Those are dropped and the rest are placed below, which grows the
     // existing tab, rather than the whole surface being skipped.
+    //
+    // Issue #1913: a slot a deck restart left under one of these pane ids is
+    // not this role's, and goes before the ownership check below.
+    retire_slots_a_restart_left(state, embedded, tab_manager, ui, &surface, learned_from);
     let owned = |tab_manager: &TabManager, role: &crate::event::OrchestrationSurfaceRole| {
         tab_manager.tab_index_for_pane(&role.pane_id).is_some()
     };
@@ -6678,9 +6779,8 @@ fn open_upgrade_dialog(ui: &mut UiState) {
     let message = match (check, badge) {
         (Some(check), Some(badge)) if badge.offers_upgrade => {
             let mut dialog = crate::upgrade_dialog::UpgradeDialog::new(check.plans.clone());
-            if let Some(installed) = installed {
-                // The first plan is always this TUI's own copy.
-                dialog = dialog.with_installed(0, installed);
+            if let (Some(installed), Some(tui)) = (installed, check.this_tui()) {
+                dialog = dialog.with_installed(tui, installed);
             }
             ui.upgrade_dialog = Some(dialog);
             ui.mode = UiMode::Upgrade;
@@ -6688,9 +6788,8 @@ fn open_upgrade_dialog(ui: &mut UiState) {
         }
         (_, Some(restart)) => restart.text.trim().to_string(),
         (Some(check), None) => check
-            .plans
-            .first()
-            .map_or_else(String::new, |plan| plan.headline()),
+            .this_tui()
+            .map_or_else(String::new, |tui| check.plans[tui].headline()),
         (None, None) => "No newer release has been found.".to_string(),
     };
     // A version from the release check reaches the bar, so it is filtered as
@@ -6755,8 +6854,8 @@ fn sync_upgrade_state(ui: &mut UiState, snapshot: &AppState, state: &SharedState
 /// is this TUI's own copy.
 fn upgrade_job(ui: &UiState, index: usize) -> Option<(crate::self_upgrade::UpgradePlan, bool)> {
     let plan = ui.upgrade_dialog.as_ref()?.plans().get(index)?.clone();
-    // The first plan is always this TUI's own copy (`upgrade_dialog::check`).
-    Some((plan, index == 0))
+    let this_tui = crate::upgrade_dialog::is_this_tui(&plan);
+    Some((plan, this_tui))
 }
 
 /// Issue #1635: hand a finished upgrade's result to its dialog, and start the
@@ -11401,7 +11500,18 @@ fn dispatch_action(
                     // `write_raw_bytes` already phrases the disconnected cases in
                     // the user's terms, so surface it as-is rather than prefixing
                     // it with a second, internal-sounding failure label.
-                    ui.status_message = Some((e.to_string(), std::time::Instant::now()));
+                    //
+                    // PRD #1666 part 2 (G-fix7c): except a pane lost to a deck
+                    // restart, which the next frame drops and names in the one
+                    // restart notice (`process_restart_drops`), not in a
+                    // sentence per pane. The submit debounce above can hold an
+                    // Enter typed during the disconnect until after the reattach
+                    // found the restarted deck.
+                    if embedded.pane_lost_reason(&pane_id)
+                        != Some(crate::embedded_pane::PaneLostReason::DeckRestarted)
+                    {
+                        ui.status_message = Some((e.to_string(), std::time::Instant::now()));
+                    }
                 }
                 ui.last_pane_keystroke_at = Some(std::time::Instant::now());
             }
@@ -12493,6 +12603,7 @@ pub fn run_tui(
     pane: Arc<dyn PaneController>,
     config: DashboardConfig,
     keybindings: KeybindingConfig,
+    startup_hooks: Option<crate::hooks_refresh::StartupNote>,
 ) -> std::io::Result<()> {
     let terminal_modes = TerminalModes::default();
     let hook_terminal_modes = terminal_modes.clone();
@@ -12615,6 +12726,7 @@ pub fn run_tui(
 
     let mut tick: u64 = 0;
     let mut ui = UiState::new(config, keybindings);
+    let startup_hook_status = surface_startup_hook_note(&mut ui, startup_hooks);
     // PRD #196: restore the persisted global last-command so the new-pane form
     // can seed from it from the very first spawn of the session. Loaded
     // UNCONDITIONALLY — independent of the snapshot-restore gate below (which only
@@ -13453,6 +13565,7 @@ pub fn run_tui(
     // first frame does not read the restore itself as a move and immediately
     // write the same position back.
     ui.session_focus = tab_manager.capture_focus_snapshot();
+    restart_startup_hook_note(&mut ui, startup_hook_status.as_deref());
 
     'outer: loop {
         // Issue #1138: the clean half of the hangup response. The watchdog
@@ -15856,6 +15969,10 @@ fn render_card_grid(
     tick: u64,
     // Issue #413: handed to every card's `Last:` field — see `format_elapsed`.
     now: DateTime<Utc>,
+    // Issue #1947: the orchestrator seats, whose cards carry the ORCHESTRATOR
+    // badge. The live deck passes `AppState::orchestrator_pane_ids`; the L1
+    // seams pass `None`, so their snapshots do not move.
+    orchestrator_panes: Option<&HashSet<String>>,
 ) -> Rect {
     // 1 row for the title + 1 row for the stats bar at the bottom of the deck.
     let available_for_cards = area.height.saturating_sub(2);
@@ -16003,6 +16120,9 @@ fn render_card_grid(
                 ui.mode,
                 declared_agent_type,
                 now,
+                session.pane_id.as_deref().is_some_and(|pane_id| {
+                    orchestrator_panes.is_some_and(|panes| panes.contains(pane_id))
+                }),
             );
             // PRD #80 M4: record this card's screen rect (paired with its flat
             // selection index) for the mouse hit-test. Safe to mutate `ui` here
@@ -16376,6 +16496,7 @@ fn render_frame(
             total_sessions,
             tick,
             wall_now,
+            Some(&state.orchestrator_pane_ids),
         );
         render_stats_bar(frame, &state.aggregate_stats(), stats_area);
     }
@@ -21796,6 +21917,10 @@ fn render_session_card(
     // against. Passed in, never read here, so a card renders as a pure function
     // of its inputs — see `format_elapsed`.
     now: DateTime<Utc>,
+    // Issue #1947: this pane is its orchestration's orchestrator seat — the
+    // agent `inbox send` messages — so its title carries an ORCHESTRATOR
+    // badge, as the desktop's tile does. Only the live card grid sets it.
+    is_orchestrator: bool,
 ) {
     // The type the card SHOWS. A launcher command (`devbox run -- codex`)
     // identifies nothing, so without the declaration this stays
@@ -21921,6 +22046,24 @@ fn render_session_card(
     // today (ASCII labels, and `flash_dot`'s `●` is ambiguous-width, so one
     // column), so the budget is unchanged and no card snapshot moves.
     let max_title = (area.width as usize).saturating_sub(badge_width + 2);
+    // Issue #1947: the orchestrator seat's ORCHESTRATOR badge — the desktop
+    // tile's word — ends the title when the whole title still fits beside it.
+    // Every title segment ends with a space, so the badge needs none of its
+    // own. Where it does not fit (a sidebar card), the badge takes a row of
+    // its own below instead, so neither the type and role name nor the word
+    // is cut to make room for the other.
+    let title_width: usize = title_segments
+        .iter()
+        .map(|(text, _)| unicode_width::UnicodeWidthStr::width(text.as_str()))
+        .sum();
+    let seat_in_title = is_orchestrator
+        && title_width + unicode_width::UnicodeWidthStr::width(CARD_ORCHESTRATOR_BADGE)
+            <= max_title;
+    let seat_row = is_orchestrator && !seat_in_title;
+    let mut title_segments = title_segments;
+    if seat_in_title {
+        title_segments.push((CARD_ORCHESTRATOR_BADGE.to_string(), title_bold));
+    }
     let title_spans = truncate_styled_segments(title_segments, max_title);
 
     // Issue #442. An UNSELECTED card's border colour is its STATUS, so an idle
@@ -22134,6 +22277,11 @@ fn render_session_card(
         }
         None => status_lines.extend(attention.map(plain)),
     }
+    // Issue #1947: the ORCHESTRATOR badge the title had no room for, after the
+    // attention rows, so at Minimal density a reason keeps the one row.
+    if seat_row {
+        status_lines.push(plain((CARD_ORCHESTRATOR_BADGE.to_string(), title_bold)));
+    }
 
     let prompts = if density.max_prompts() == 0 {
         Vec::new()
@@ -22180,6 +22328,10 @@ fn render_session_card(
     let content = Paragraph::new(lines);
     frame.render_widget(content, inner);
 }
+
+/// Issue #1947: the orchestrator seat's card badge, at the end of its title or
+/// on a row of its own ([`render_session_card`]).
+const CARD_ORCHESTRATOR_BADGE: &str = "ORCHESTRATOR";
 
 /// Title columns a card keeps before its inbox line gives up its words for
 /// the bare count ([`card_inbox_badge`]).
@@ -22348,6 +22500,7 @@ fn collect_recent_prompts(session: &SessionState, max: usize) -> Vec<String> {
         .iter()
         .rev()
         .filter_map(|e| e.user_prompt.as_ref())
+        .filter(|p| !crate::injected_prompt::is_harness_turn(p))
         .take(max)
         .cloned()
         .collect();
@@ -22355,6 +22508,7 @@ fn collect_recent_prompts(session: &SessionState, max: usize) -> Vec<String> {
 
     if prompts.is_empty()
         && let Some(ref p) = session.last_user_prompt
+        && !crate::injected_prompt::is_harness_turn(p)
     {
         prompts.push(p.clone());
     }
@@ -23148,6 +23302,7 @@ pub fn render_card_with_declared_agent_to_buffer(
                 mode,
                 declared_agent_type,
                 now,
+                false,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -23222,6 +23377,7 @@ pub fn render_dashboard_cards_to_buffer(
                     UiMode::Normal,
                     None,
                     now,
+                    false,
                 );
             }
         })
@@ -23310,6 +23466,7 @@ pub fn render_card_grid_to_buffer(
                 sessions.len(),
                 0,
                 now,
+                None,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -34759,6 +34916,90 @@ mod tests {
         }
     }
 
+    /// Issue #1947: the orchestrator seat's card says so in its title; any
+    /// other card does not. At about 40 columns — a 120-column terminal's
+    /// default sidebar — with a long role name, Working status and a queued
+    /// message, the whole word stays and the name is what gets cut (A3).
+    #[test]
+    fn an_orchestrator_card_carries_the_orchestrator_badge() {
+        let render = |session: &SessionState, name: &str, width: u16, is_orchestrator: bool| {
+            let name = name.to_string();
+            let backend = ratatui::backend::TestBackend::new(width, 6);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_session_card(
+                        frame,
+                        frame.area(),
+                        session,
+                        0,
+                        false,
+                        Some(&name),
+                        Some(1),
+                        CardDensity::Compact,
+                        UiMode::Normal,
+                        None,
+                        Utc::now(),
+                        is_orchestrator,
+                    );
+                })
+                .unwrap();
+            buffer_to_string(terminal.backend().buffer())
+        };
+        let idle = make_session(SessionStatus::Idle);
+        let seat = render(&idle, "lead", 74, true);
+        let title = seat.lines().next().unwrap();
+        assert!(title.contains("· lead ORCHESTRATOR"), "{seat}");
+        assert!(!render(&idle, "lead", 74, false).contains("ORCHESTRATOR"));
+
+        let mut busy = make_session(SessionStatus::Working);
+        let inbox = crate::inbox_display::CardInbox {
+            pending: 1,
+            ..Default::default()
+        };
+        let queued: AgentEvent = serde_json::from_value(serde_json::json!({
+            "session_id": "",
+            "agent_type": "claude_code",
+            "event_type": "notification",
+            "timestamp": Utc::now(),
+            "metadata": { crate::inbox_display::CARD_INBOX_METADATA_KEY: inbox.encode() },
+        }))
+        .unwrap();
+        busy.recent_events.push_back(queued);
+        let long = "orchestrator-with-a-very-long-role-name";
+        for width in [40, 41, 44] {
+            let card = render(&busy, long, width, true);
+            let title = card.lines().next().unwrap();
+            assert!(title.contains("Working"), "{width}: {card}");
+            assert!(title.contains("queued"), "{width}: {card}");
+            // The title has no room for the word, so it takes a row of its
+            // own, whole, and the title cuts only what it cut before.
+            assert!(!title.contains("ORCHESTRATOR"), "{width}: {card}");
+            assert_eq!(
+                title,
+                render(&busy, long, width, false).lines().next().unwrap(),
+                "{width}: {card}"
+            );
+            assert_eq!(
+                card.lines()
+                    .filter(|line| line.contains("│ORCHESTRATOR "))
+                    .count(),
+                1,
+                "{width}: {card}"
+            );
+            assert!(!render(&busy, long, width, false).contains("ORCHESTRATOR"));
+        }
+
+        // CI red on PR #1956: a 40-column sidebar card has room for the whole
+        // `<type> · <role>` title or for the word, not both. The role name
+        // stays whole, and the badge moves to its own row.
+        let card = render(&idle, "coordinator", 40, true);
+        let title = card.lines().next().unwrap();
+        assert!(title.contains(" · coordinator "), "{card}");
+        assert!(!title.contains('…'), "{card}");
+        assert!(card.contains("│ORCHESTRATOR "), "{card}");
+    }
+
     #[test]
     fn bell_on_transition_to_waiting() {
         let mut sessions = HashMap::new();
@@ -41538,6 +41779,54 @@ mod tests {
         insta::assert_snapshot!(glossary_status_row(&state, &mut ui), @" COMMAND  No pane linked to agent s0");
     }
 
+    /// Scenario: Start the dashboard after a startup hook install that changed
+    /// Claude Code's hooks: the status line reads "Installed or repaired the
+    /// deck's hooks for Claude Code." and nothing is kept for the exit report.
+    /// Start it after one that could not update them: the status line gives
+    /// the reason, and the exit report keeps it with the fix.
+    #[spec("dashboard/status-message/008")]
+    #[test]
+    fn status_message_008_the_startup_hook_install_is_on_the_status_line() {
+        use crate::event::AgentType;
+        use crate::hooks_refresh::{STARTUP_FIX, startup_note};
+        use tokio::sync::RwLock;
+        let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+
+        let mut ui = default_ui();
+        assert_eq!(surface_startup_hook_note(&mut ui, None), None);
+        assert_eq!(glossary_status_text(&ui), None);
+
+        let shown = surface_startup_hook_note(&mut ui, startup_note(&[AgentType::ClaudeCode], &[]));
+        assert!(ui.session_warnings.is_empty());
+
+        // A slow hydration does not use up the note's lifetime before the
+        // first frame, and a status line startup replaced is left alone.
+        let long_ago = std::time::Instant::now() - STATUS_MESSAGE_TTL;
+        ui.status_message.as_mut().unwrap().1 = long_ago;
+        restart_startup_hook_note(&mut ui, shown.as_deref());
+        assert!(ui.status_message.as_ref().unwrap().1 > long_ago);
+        let replaced = Some(("Config drift: …".to_string(), long_ago));
+        ui.status_message = replaced.clone();
+        restart_startup_hook_note(&mut ui, shown.as_deref());
+        assert_eq!(ui.status_message, replaced);
+        ui.status_message = Some((shown.clone().unwrap(), long_ago));
+        insta::assert_snapshot!(glossary_status_row(&state, &mut ui), @" COMMAND  Installed or repaired the deck's hooks for Claude Code.");
+
+        let mut ui = default_ui();
+        let why = "~/.claude/settings.json is not valid JSON (left unchanged)".to_string();
+        let _ = surface_startup_hook_note(
+            &mut ui,
+            startup_note(&[], &[(AgentType::ClaudeCode, vec![why])]),
+        );
+        let line = "Claude Code's hooks could not be updated: ~/.claude/settings.json is not valid JSON (left unchanged).";
+        assert_eq!(glossary_status_text(&ui), Some(line));
+        assert_eq!(
+            ui.session_warnings,
+            vec![line.to_string(), STARTUP_FIX.to_string()]
+        );
+        insta::assert_snapshot!(glossary_status_row(&state, &mut ui), @" COMMAND  Claude Code's hooks could not be updated: ~/.claude/settings.json is not valid JSON (left");
+    }
+
     /// Drive `Action::Focus` (Enter) on the one card of `snapshot` against `pc`.
     fn glossary_enter_on_card(
         snapshot: &AppState,
@@ -45628,3 +45917,13 @@ mod one_shot_protocol_gate_tests {
         assert_eq!(daemon.recorded(), vec!["0:list-agents".to_string()]);
     }
 }
+
+/// Issue #1913: a deck restart that reuses an orchestration tab's pane ids.
+#[cfg(all(test, unix))]
+#[path = "ui_restart_surface_tests.rs"]
+mod restart_surface_tests;
+
+/// PRD #1666 part 2 (G-fix7c): a keystroke into a pane lost to a deck restart.
+#[cfg(all(test, unix))]
+#[path = "ui_restart_keystroke_tests.rs"]
+mod restart_keystroke_tests;

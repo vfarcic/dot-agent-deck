@@ -169,7 +169,7 @@ tasks:
     if: ${{ tasks.backend.values.active == 'true' }}
     call: nodejs/install 1.2.0
     with:
-      node-version: "24.22.1"
+      node-version: "24.22.2"
 
   - key: go-task
     if: ${{ tasks.backend.values.active == 'true' }}
@@ -213,6 +213,8 @@ tasks:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_INCREMENTAL: "0"
     run: |
+      # pi-extension/'s typecheck (issue #1708), as in ci.yml's `test` job.
+      (cd pi-extension && npm ci --ignore-scripts && npm run typecheck)
       cargo test-fast
       # Keep only the dependencies in the tool cache, as Swatinem/rust-cache
       # does on GitHub: the workspace crates rebuild every run anyway (fresh
@@ -326,6 +328,13 @@ tasks:
       pnpm test
       pnpm build
       ! grep -rl __dadDriver dist/
+    # No `options`, here or on the two desktop tasks below: naming the Vitest
+    # or Playwright framework makes Captain read the file with that framework's
+    # JSON parser, which finds no tests in a JUnit XML file. Without it Captain
+    # infers the JUnit parser from the file.
+    outputs:
+      test-results:
+        - path: desktop/junit/vitest.xml
 
   # desktop/: the Playwright suite in Chromium and WebKit (`desktop-browser`).
   - key: desktop-browser
@@ -341,6 +350,9 @@ tasks:
       pnpm exec playwright install --with-deps chromium webkit
       pnpm test:browser:types
       pnpm test:browser
+    outputs:
+      test-results:
+        - path: desktop/junit/playwright.xml
 
   # The desktop app driven through WebKitWebDriver under Xvfb
   # (`desktop-driver`).
@@ -356,7 +368,12 @@ tasks:
     run: |
       sudo apt-get update
       # openssh-server and libnss-wrapper: fleet_001's far deck (issue #1356).
-      sudo apt-get install -y webkit2gtk-driver xvfb xclip xdotool openssh-server libnss-wrapper
+      # UCF_FORCE_CONFFMISS: a restored ci-desktop-driver-v1 tool cache can
+      # carry ucf's record of /etc/ssh/sshd_config without the file itself,
+      # and ucf then refuses to recreate the "deleted" file, which fails
+      # openssh-server's postinst (PR #1915's run 01a173dc7cf1, and three
+      # others on 2026-10-25). This makes ucf write it, as a clean install does.
+      sudo env UCF_FORCE_CONFFMISS=1 apt-get install -y webkit2gtk-driver xvfb xclip xdotool openssh-server libnss-wrapper
       cargo install tauri-driver --locked --version "$TAURI_DRIVER_VERSION"
       # `cargo install` puts it in Cargo's bin dir, which is not on PATH here.
       export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
@@ -368,6 +385,13 @@ tasks:
       VITE_DAD_DRIVER_SEAM=1 pnpm tauri build --debug --no-bundle
       DAD_DRIVER_NATIVE_DRIVER=/usr/bin/WebKitWebDriver \
         xvfb-run -a -s "-screen 0 1920x1080x24 -dpi 96" pnpm test:driver
+    # No `options`: Captain names no framework for node:test, so it infers the
+    # parser from the JUnit file. That parser ignores a case outside a
+    # `<testsuite>`, which is why `test:driver` writes this file through
+    # desktop/scripts/junit-reporter.mjs rather than node's own junit reporter.
+    outputs:
+      test-results:
+        - path: desktop/junit/driver.xml
 
   # Type-checks the workspace for Windows from Linux (`windows-cross-check`).
   - key: windows-cross-check
@@ -419,13 +443,13 @@ tasks:
       # checksum (`<tarball>.sha256` beside it).
       curl -fsSLo /tmp/nix.tar.xz \
         "https://releases.nixos.org/nix/nix-${NIX_VERSION}/nix-${NIX_VERSION}-x86_64-linux.tar.xz"
-      echo "6ce3ce3703fdc241b560cba401c5d338042122fe5b1a81e07bf1a623f259eba0  /tmp/nix.tar.xz" | sha256sum -c -
+      echo "ff66236d2f7e2a21f3350e73668e021ac6a8881ef277a38e16e952bfb22718c3  /tmp/nix.tar.xz" | sha256sum -c -
       tar -xJf /tmp/nix.tar.xz -C /tmp
       "/tmp/nix-${NIX_VERSION}-x86_64-linux/install" --no-daemon
       echo "$HOME/.nix-profile/bin" >> "$RWX_ENV/PATH"
     env:
       NIX_CONFIG: experimental-features = nix-command flakes
-      NIX_VERSION: 2.35.3
+      NIX_VERSION: 2.35.4
 
   # `nix flake check` (`nix`).
   - key: nix

@@ -365,10 +365,10 @@ pub struct Delivery {
 }
 
 impl Delivery {
-    fn new(offer: bool) -> Self {
+    fn new(offer: bool, a: u32) -> Self {
         Delivery {
             offer,
-            a: 1,
+            a,
             state: MessageState::Queued,
             revision: 0,
             attempts: Vec::new(),
@@ -539,6 +539,9 @@ pub enum HandOverRefusal {
     WrongReceiver,
     Committed,
     Revoked,
+    /// An automatic repeat asked while a fresh snapshot still holds an
+    /// earlier attempt of its assignment.
+    HeldEarlier,
 }
 
 /// The component side of the final hand-over check: its synchronous local
@@ -626,7 +629,24 @@ pub struct AttemptModel {
     receivers: BTreeMap<Rx, Receiver>,
     slots: BTreeMap<Slot, Rx>,
     next_rx: u64,
+    /// One record per message handed to this generation. Issue #1816: a
+    /// record is kept while its message is live, while any attempt still
+    /// holds evidence (a late commit can still correct the sender), and
+    /// while the inbox keeps the message's copy for the pane, which a user
+    /// action or an `ack <id>` reads through it. The hub's receipt engine
+    /// drops it once all three have ended ([`Self::forget`]), so a
+    /// long-lived generation holds its live messages, its unreclaimed ones
+    /// (which the evidence budget bounds, [`Limits::evidence_limit`]) and at
+    /// most the inbox's retained history, not every message it saw.
     messages: BTreeMap<String, Delivery>,
+    /// Issue #1816: the highest assignment of any record [`Self::forget`]
+    /// dropped. A record [`Self::post`] creates starts its assignments above
+    /// it, so a message id posted again after its record went never reuses
+    /// an `(a, e)` of the one before it, and a late commit of the earlier
+    /// attempt (a stream's `committed` names only the id and the attempt)
+    /// cannot settle the new one. Zero until a record goes, so assignments
+    /// start at 1 as before.
+    forgotten_a: u32,
     evidence_reserved: usize,
     effects: Vec<Effect>,
     exited: bool,
@@ -652,6 +672,7 @@ impl AttemptModel {
             slots: BTreeMap::new(),
             next_rx: 1,
             messages: BTreeMap::new(),
+            forgotten_a: 0,
             evidence_reserved: 0,
             effects: Vec::new(),
             exited: false,
@@ -724,9 +745,10 @@ impl AttemptModel {
     }
 
     pub fn post(&mut self, id: &str, offer: bool) {
+        let a = self.forgotten_a + 1;
         self.messages
             .entry(id.to_string())
-            .or_insert_with(|| Delivery::new(offer));
+            .or_insert_with(|| Delivery::new(offer, a));
     }
 
     pub fn delivery(&self, id: &str) -> Option<&Delivery> {
@@ -1442,6 +1464,37 @@ impl AttemptModel {
         self.messages.keys().cloned().collect()
     }
 
+    /// Issue #1816: whether `id`'s record has no use left inside this model.
+    /// Its message ended and every attempt's evidence was reclaimed
+    /// ([`Self::reclaim`]), so no attempt keeps a late-commit verifier, owes a
+    /// resume answer or a revoke, or is withheld. The model no longer holds
+    /// any of its attempts' evidence, whose spool files the hub removes after
+    /// the lock is released, so a receipt in the spool no longer settles it.
+    /// No attempt keeps a verifier, so the design no longer counts on a late
+    /// commit to correct the sender, though a stream's `committed` or an
+    /// explicit `ack <id>` (through the inbox's copy) still reaches it while
+    /// the record is here.
+    pub fn spent(&self, id: &str) -> bool {
+        self.messages.get(id).is_some_and(|msg| {
+            msg.state.is_terminal() && msg.attempts.iter().all(|at| at.reclaimed)
+        })
+    }
+
+    /// Issue #1816: drop `id`'s record if it is [`Self::spent`]. The caller
+    /// decides when nothing outside the model reads it any more. Its
+    /// assignment raises [`Self::forgotten_a`], so a record created for the
+    /// same id later starts above every attempt this one had.
+    pub fn forget(&mut self, id: &str) -> bool {
+        if !self.spent(id) {
+            return false;
+        }
+        let Some(msg) = self.messages.remove(id) else {
+            return false;
+        };
+        self.forgotten_a = self.forgotten_a.max(msg.a);
+        true
+    }
+
     /// The incarnation an attempt is bound to.
     pub fn attempt_rx(&self, id: &str, a: u32, e: u32) -> Option<Rx> {
         self.messages.get(id)?.attempt(a, e).map(|at| at.rx)
@@ -1528,8 +1581,17 @@ impl AttemptModel {
     /// receiver itself, once it has dropped the callback and installed its
     /// local revoke. An approval carries the incarnation epoch it was granted
     /// under.
+    ///
+    /// An automatic repeat is refused (`HeldEarlier`) while an earlier,
+    /// unfinished attempt of its assignment is listed by its own live
+    /// receiver's snapshot, fresh at `now` (#1940); a Retry the user chose
+    /// is not. That proves possession only as fresh as the snapshot: a
+    /// receiver that reports it on the check's own control line is judged on
+    /// what it held when it asked, one that reported it earlier only while
+    /// that report is younger than `POSSESS_TTL`.
     pub fn may_hand_over(
         &self,
+        now: Instant,
         id: &str,
         a: u32,
         e: u32,
@@ -1557,6 +1619,18 @@ impl AttemptModel {
         }
         if at.revoked || msg.latch || a != msg.a {
             return Err(HandOverRefusal::Revoked);
+        }
+        let held_earlier = at.kind == IssueKind::AutoRepeat
+            && msg.attempts.iter().any(|t| {
+                t.a == a
+                    && t.e < e
+                    && !t.stage.is_final()
+                    && !t.resume_pending
+                    && self.live(t.rx)
+                    && snapshot_holds(&self.receivers, &self.limits, id, t, now)
+            });
+        if held_earlier {
+            return Err(HandOverRefusal::HeldEarlier);
         }
         Ok(Grant {
             id: id.to_string(),
@@ -2948,9 +3022,9 @@ mod tests {
             m.snapshot(t, tui2, 2, u.d, &[("u", 1, u.e)]),
             SnapshotOutcome::Dropped
         );
-        assert!(m.may_hand_over("s", 1, s.e, server2).is_ok());
+        assert!(m.may_hand_over(t, "s", 1, s.e, server2).is_ok());
         assert_eq!(
-            m.may_hand_over("u", 1, u.e, tui2),
+            m.may_hand_over(t, "u", 1, u.e, tui2),
             Err(HandOverRefusal::WrongReceiver)
         );
         assert!(
@@ -3076,7 +3150,7 @@ mod tests {
         let rx1 = m.register(t, Slot::Pi, true).rx;
         m.post("g", false);
         let g = issue_held(&mut m, t, "g", rx1, 1);
-        let grant = m.may_hand_over("g", 1, g.e, rx1).expect("approved");
+        let grant = m.may_hand_over(t, "g", 1, g.e, rx1).expect("approved");
         let mut guard = CallbackGuard::new(grant.epoch);
         assert!(guard.may_call(&grant));
         let rx2 = m.register(t, Slot::Pi, true).rx;
@@ -3087,10 +3161,12 @@ mod tests {
             "rebinding voids the outstanding approval"
         );
         assert_eq!(
-            m.may_hand_over("g", 1, g.e, rx1),
+            m.may_hand_over(t, "g", 1, g.e, rx1),
             Err(HandOverRefusal::WrongReceiver)
         );
-        let fresh = m.may_hand_over("g", 1, g.e, rx2).expect("approved again");
+        let fresh = m
+            .may_hand_over(t, "g", 1, g.e, rx2)
+            .expect("approved again");
         assert!(guard.may_call(&fresh));
         guard.revoke("g", 1, g.e);
         assert!(!guard.may_call(&fresh));
@@ -3100,7 +3176,7 @@ mod tests {
         m.post("q", false);
         let before = m.evidence_reserved();
         let q1 = issue_held(&mut m, t, "q", server, 1);
-        m.may_hand_over("q", 1, q1.e, server).expect("approved");
+        m.may_hand_over(t, "q", 1, q1.e, server).expect("approved");
         let t1 = past_ttl(t);
         m.snapshot(t1, tui, 1, 0, &[]);
         m.tick(t1);
@@ -3623,7 +3699,7 @@ mod tests {
         let rx = m.register(t, Slot::Pi, false).rx;
         m.post("m", false);
         let at = issue_held(&mut m, t, "m", rx, 1);
-        let grant = m.may_hand_over("m", 1, at.e, rx).expect("approved");
+        let grant = m.may_hand_over(t, "m", 1, at.e, rx).expect("approved");
         let mut guard = CallbackGuard::new(grant.epoch);
         let r = m.delivery("m").unwrap().revision;
         assert!(matches!(
@@ -3632,7 +3708,7 @@ mod tests {
         ));
         m.drain_effects();
         assert_eq!(
-            m.may_hand_over("m", 1, at.e, rx),
+            m.may_hand_over(t, "m", 1, at.e, rx),
             Err(HandOverRefusal::Revoked)
         );
         assert_eq!(
@@ -3680,7 +3756,7 @@ mod tests {
         m.stage(later, "c", 1, second.e, Stage::Committed, None);
         let reserved = m.evidence_reserved();
         assert_eq!(
-            m.may_hand_over("c", 1, first.e, server),
+            m.may_hand_over(later, "c", 1, first.e, server),
             Err(HandOverRefusal::Committed)
         );
         assert!(
@@ -3762,7 +3838,7 @@ mod tests {
                 "the replay was lost with the replacement that died before publishing it"
             );
             assert!(
-                m.may_hand_over("m", 1, at.e, next.rx).is_err(),
+                m.may_hand_over(t, "m", 1, at.e, next.rx).is_err(),
                 "a final attempt is not callable"
             );
             assert_eq!(
@@ -4515,6 +4591,102 @@ mod tests {
         assert_eq!(m.state("m"), Some(MessageState::Settled));
     }
 
+    /// Scenario: A generation is handed a message that settles, one still
+    /// held, and one a Claude waiter handed over that the user then cancels.
+    /// The settled one's record can be dropped at once; the held one's cannot
+    /// while it is live, nor the cancelled one's while its attempt can still
+    /// correct the sender. Once that attempt's late commit arrives, the
+    /// sender is corrected and its record can be dropped too.
+    #[spec("inbox/attempts/036")]
+    #[test]
+    fn attempts_036_a_record_is_spent_once_ended_and_reclaimed() {
+        let (mut m, t) = model();
+        let rx = m.register(t, Slot::OpencodeServer, false).rx;
+        m.post("settled", false);
+        let settled = issue_held(&mut m, t, "settled", rx, 1);
+        m.stage(
+            t,
+            "settled",
+            settled.a,
+            settled.e,
+            Stage::Committed,
+            Some(rx),
+        );
+        assert_eq!(m.state("settled"), Some(MessageState::Settled));
+        m.post("live", false);
+        issue_held(&mut m, t, "live", rx, 2);
+        assert!(m.spent("settled"));
+        assert!(!m.spent("live"), "a live message is never spent");
+        assert!(!m.forget("live"));
+        assert!(m.forget("settled"));
+        assert!(m.delivery("settled").is_none());
+        assert!(!m.forget("settled"), "forgetting twice drops nothing");
+
+        let waiter = m.register(t, Slot::OnceWaiter, false).rx;
+        m.post("cancelled", false);
+        let inert = m.issue(t, "cancelled", waiter).expect("issue");
+        m.stage(
+            t,
+            "cancelled",
+            inert.a,
+            inert.e,
+            Stage::Handed,
+            Some(waiter),
+        );
+        let revision = m.delivery("cancelled").unwrap().revision;
+        m.cancel(t, "cancelled", GEN, revision);
+        assert_eq!(
+            m.state("cancelled"),
+            Some(MessageState::Undeliverable(UndeliverableReason::Cancelled))
+        );
+        assert!(
+            !m.forget("cancelled"),
+            "its handed-inert attempt can still correct the sender"
+        );
+        m.drain_effects();
+        m.stage(t, "cancelled", inert.a, inert.e, Stage::Committed, None);
+        assert!(m.drain_effects().contains(&Effect::DeliveredAfterAll {
+            id: "cancelled".to_string(),
+            despite_cancel: true,
+        }));
+        assert!(m.forget("cancelled"), "the correction was its last use");
+        assert_eq!(m.ids(), vec!["live".to_string()]);
+    }
+
+    /// Scenario: A message settles and its record is dropped; a sender then
+    /// posts a new message under the same id to the same generation. The new
+    /// record's attempt is numbered above the dropped one's, so the earlier
+    /// attempt's late commit is refused as unknown and the new message stays
+    /// attempting until its own attempt commits.
+    #[spec("inbox/attempts/037")]
+    #[test]
+    fn attempts_037_a_reused_id_takes_no_late_commit_of_a_dropped_record() {
+        let (mut m, t) = model();
+        let rx = m.register(t, Slot::OpencodeServer, false).rx;
+        m.post("m", false);
+        let old = issue_held(&mut m, t, "m", rx, 1);
+        m.stage(t, "m", old.a, old.e, Stage::Committed, Some(rx));
+        assert!(m.forget("m"));
+        m.post("m", false);
+        assert!(m.delivery("m").unwrap().a > old.a);
+        let new = issue_held(&mut m, t, "m", rx, 2);
+        assert_ne!((new.a, new.e), (old.a, old.e));
+        assert_eq!(
+            m.stage(t, "m", old.a, old.e, Stage::Committed, None),
+            StageOutcome::Unknown,
+            "the dropped record's attempt is not the new one"
+        );
+        assert_eq!(m.state("m"), Some(MessageState::Attempting));
+        m.stage(t, "m", new.a, new.e, Stage::Committed, None);
+        assert_eq!(m.state("m"), Some(MessageState::Settled));
+        m.post("other", false);
+        assert_eq!(
+            m.delivery("other").unwrap().a,
+            old.a + 1,
+            "a record created after one was dropped starts above it"
+        );
+    }
+
     /// Scenario: A Claude waiter of an agent allowed one attempt per message
     /// is issued a message while the agent reads idle. Well past the idle
     /// grace, the clock's tick is the first to learn that a turn started.
@@ -4581,7 +4753,7 @@ mod tests {
             StageOutcome::WrongReceiver
         );
         assert_eq!(
-            m.may_hand_over("issued", 1, issued.e, old.rx),
+            m.may_hand_over(t, "issued", 1, issued.e, old.rx),
             Err(HandOverRefusal::WrongReceiver)
         );
         m.tick(t + wait * 10);
@@ -4789,5 +4961,403 @@ mod tests {
             "the newest attempt that may have reached the agent"
         );
         assert_eq!(m.commit_target("nope"), Err(CommitTargetRefusal::NoAttempt));
+    }
+
+    /// #1940's stall: `id`'s first attempt is issued to `rx` and held, the
+    /// receiver's snapshots then stop for longer than the TTL, a spool check
+    /// clears the attempt and the automatic repeat goes to the same receiver.
+    fn stalled_repeat(
+        m: &mut AttemptModel,
+        t: Instant,
+        id: &str,
+        rx: Rx,
+    ) -> (Issued, Issued, Instant) {
+        let first = issue_held(m, t, id, rx, 1);
+        let stalled = past_ttl(t);
+        m.tick(stalled);
+        let repeat = m.issue(stalled, id, rx).expect("automatic repeat");
+        assert_eq!(repeat.kind, IssueKind::AutoRepeat);
+        (first, repeat, stalled)
+    }
+
+    fn stage_of(m: &AttemptModel, id: &str, e: u32) -> Stage {
+        m.delivery(id).unwrap().attempt(1, e).unwrap().stage
+    }
+
+    /// Scenario: On each stream slot (OpenCode TUI, OpenCode server, Pi) a
+    /// message's first attempt is still held when its receiver stalls past
+    /// the TTL, so the deck issues an automatic repeat; the receiver then
+    /// reports both. The repeat is refused `held_earlier` and the first is
+    /// approved; the refusal stages nothing; the receiver's `NotHanded` for
+    /// the repeat leaves the message attempting with no repeat scheduled,
+    /// and the first attempt's commit settles it with no revoke and no
+    /// witness violation.
+    #[spec("inbox/attempts/038")]
+    #[test]
+    fn attempts_038_an_automatic_repeat_is_refused_while_an_earlier_attempt_is_held() {
+        for slot in [Slot::OpencodeTui, Slot::OpencodeServer, Slot::Pi] {
+            let (mut m, t) = model();
+            let rx = m.register(t, slot, false).rx;
+            m.post("m", false);
+            let (first, repeat, now) = stalled_repeat(&mut m, t, "m", rx);
+            m.snapshot(
+                now,
+                rx,
+                2,
+                repeat.d,
+                &[("m", 1, first.e), ("m", 1, repeat.e)],
+            );
+            assert_eq!(
+                m.may_hand_over(now, "m", 1, repeat.e, rx),
+                Err(HandOverRefusal::HeldEarlier),
+                "{slot:?}: the repeat waits behind the attempt its receiver holds"
+            );
+            assert!(
+                m.may_hand_over(now, "m", 1, first.e, rx).is_ok(),
+                "{slot:?}: the held attempt itself is still approved"
+            );
+            assert_eq!(
+                stage_of(&m, "m", repeat.e),
+                Stage::Issued,
+                "{slot:?}: a refusal is not a witness"
+            );
+            m.drain_effects();
+            assert_eq!(
+                m.stage(now, "m", 1, repeat.e, Stage::NotHanded, Some(rx)),
+                StageOutcome::Applied
+            );
+            assert_eq!(m.state("m"), Some(MessageState::Attempting), "{slot:?}");
+            assert!(
+                !repeat_scheduled(&m, "m"),
+                "{slot:?}: the held attempt keeps the message, no further repeat"
+            );
+            assert_eq!(
+                m.stage(now, "m", 1, first.e, Stage::Committed, None),
+                StageOutcome::Applied
+            );
+            assert_eq!(m.state("m"), Some(MessageState::Settled), "{slot:?}");
+            let effects = m.drain_effects();
+            assert!(
+                !effects
+                    .iter()
+                    .any(|f| matches!(f, Effect::Revoke { .. } | Effect::WitnessViolation { .. })),
+                "{slot:?}: the repeat is final and its NotHanded was true: {effects:?}"
+            );
+        }
+    }
+
+    /// Scenario: The repeat is approved whenever the earlier attempt is not
+    /// shown held at the moment of the check: the receiver dropped it; the
+    /// snapshot that listed it went stale before the check (the residual for
+    /// a receiver that does not report possession with its check), while the
+    /// same stale history with possession reported at the check refuses and
+    /// with the earlier attempt omitted approves; a Retry the user chose; an
+    /// earlier attempt awaiting its resume answer; the later of two automatic
+    /// repeats only; and another receiver's claim to an attempt that is not
+    /// its own, while the owner's own fresh snapshot does refuse.
+    #[spec("inbox/attempts/039")]
+    #[test]
+    fn attempts_039_the_guard_does_not_hold_back_a_lapse_a_retry_or_a_stale_report() {
+        // A genuine lapse: the receiver dropped the earlier attempt.
+        let (mut m, t) = model();
+        let rx = m.register(t, Slot::OpencodeTui, false).rx;
+        m.post("m", false);
+        let (_, repeat, now) = stalled_repeat(&mut m, t, "m", rx);
+        m.snapshot(now, rx, 2, repeat.d, &[("m", 1, repeat.e)]);
+        assert!(m.may_hand_over(now, "m", 1, repeat.e, rx).is_ok());
+
+        // Fresh before the check, stale by it; then reported with the check.
+        let (mut m, t) = model();
+        let rx = m.register(t, Slot::OpencodeTui, false).rx;
+        m.post("m", false);
+        let (first, repeat, now) = stalled_repeat(&mut m, t, "m", rx);
+        let both = [("m", 1, first.e), ("m", 1, repeat.e)];
+        m.snapshot(now, rx, 2, repeat.d, &both);
+        let asked = now + ttl();
+        assert!(
+            m.may_hand_over(asked, "m", 1, repeat.e, rx).is_ok(),
+            "a snapshot stale at the check proves nothing: the residual"
+        );
+        m.snapshot(asked, rx, 3, repeat.d, &both);
+        assert_eq!(
+            m.may_hand_over(asked, "m", 1, repeat.e, rx),
+            Err(HandOverRefusal::HeldEarlier),
+            "possession reported with the check is fresh at the check"
+        );
+        m.snapshot(asked, rx, 4, repeat.d, &[("m", 1, repeat.e)]);
+        assert!(
+            m.may_hand_over(asked, "m", 1, repeat.e, rx).is_ok(),
+            "the same history with the earlier attempt dropped is a lapse"
+        );
+
+        // A Retry the user chose on held_long is exempt.
+        let (mut m, t) = model();
+        let rx = m.register(t, Slot::OpencodeTui, false).rx;
+        m.post("m", false);
+        let first = issue_held(&mut m, t, "m", rx, 1);
+        let long = t + HELD_LONG_AFTER + Duration::from_secs(1);
+        m.snapshot(long, rx, 2, first.d, &[("m", 1, first.e)]);
+        m.tick(long);
+        assert!(m.delivery("m").unwrap().held_long(), "precondition");
+        let r = m.delivery("m").unwrap().revision;
+        assert!(matches!(
+            m.retry(long, "m", GEN, r),
+            ActionOutcome::Applied { .. }
+        ));
+        let retry = m.issue(long, "m", rx).expect("manual retry");
+        assert_eq!(retry.kind, IssueKind::ManualRetry);
+        m.snapshot(
+            long,
+            rx,
+            3,
+            retry.d,
+            &[("m", 1, first.e), ("m", 1, retry.e)],
+        );
+        assert!(m.may_hand_over(long, "m", 1, retry.e, rx).is_ok());
+
+        // An earlier attempt awaiting its resume answer is not held by a live
+        // receiver, and the retired one's fresh snapshot does not count.
+        let (mut m, t) = model();
+        let rx = m.register(t, Slot::OpencodeTui, false).rx;
+        m.post("m", false);
+        let (first, repeat, now) = stalled_repeat(&mut m, t, "m", rx);
+        m.snapshot(
+            now,
+            rx,
+            2,
+            repeat.d,
+            &[("m", 1, first.e), ("m", 1, repeat.e)],
+        );
+        let next = m.register(now, Slot::OpencodeTui, false).rx;
+        m.resume_answer(now, next, "m", 1, repeat.e, ResumeAnswer::Retained);
+        assert!(
+            m.delivery("m")
+                .unwrap()
+                .attempt(1, first.e)
+                .unwrap()
+                .resume_pending
+        );
+        assert!(m.may_hand_over(now, "m", 1, repeat.e, next).is_ok());
+
+        // Two automatic repeats: only the later one waits.
+        let (mut m, t) = model();
+        let rx = m.register(t, Slot::OpencodeTui, false).rx;
+        m.post("m", false);
+        let (_, second, now) = stalled_repeat(&mut m, t, "m", rx);
+        m.snapshot(now, rx, 2, second.d, &[("m", 1, second.e)]);
+        let later = past_ttl(now);
+        m.tick(later);
+        let third = m.issue(later, "m", rx).expect("second automatic repeat");
+        m.snapshot(
+            later,
+            rx,
+            3,
+            third.d,
+            &[("m", 1, second.e), ("m", 1, third.e)],
+        );
+        assert!(m.may_hand_over(later, "m", 1, second.e, rx).is_ok());
+        assert_eq!(
+            m.may_hand_over(later, "m", 1, third.e, rx),
+            Err(HandOverRefusal::HeldEarlier)
+        );
+
+        // Possession is the owner's own report: the TUI listing the server's
+        // attempt proves nothing, the server's own fresh snapshot does.
+        let (mut m, t) = model();
+        let server = m.register(t, Slot::OpencodeServer, false).rx;
+        let tui = m.register(t, Slot::OpencodeTui, false).rx;
+        m.post("m", false);
+        let first = issue_held(&mut m, t, "m", server, 1);
+        let now = past_ttl(t);
+        m.snapshot(now, tui, 1, 0, &[]);
+        m.tick(now);
+        let repeat = m.issue(now, "m", tui).expect("automatic repeat");
+        m.snapshot(
+            now,
+            tui,
+            2,
+            repeat.d,
+            &[("m", 1, first.e), ("m", 1, repeat.e)],
+        );
+        assert!(m.may_hand_over(now, "m", 1, repeat.e, tui).is_ok());
+        m.snapshot(now, server, 2, first.d, &[("m", 1, first.e)]);
+        assert_eq!(
+            m.may_hand_over(now, "m", 1, repeat.e, tui),
+            Err(HandOverRefusal::HeldEarlier)
+        );
+    }
+
+    /// Scenario: Two refused automatic repeats, then the first attempt's
+    /// loss, end `Uncertain(Lapsed)` with a Retry approved, or at the attempt
+    /// cap `Uncertain(OutOfAttempts)` with Retry answering `RetryLimit`; the
+    /// late commit of the first attempt settles either. A receiver replaced
+    /// between a refusal and its `NotHanded` keeps the message attempting
+    /// through the resumed attempt, and one that dies with no successor has
+    /// both attempts fenced and the message repeated to the next receiver,
+    /// approved.
+    #[spec("inbox/attempts/040")]
+    #[test]
+    fn attempts_040_refused_repeats_spend_the_budget_and_recover_by_commit_or_retry() {
+        // Two refusals, then the first attempt is lost.
+        let (mut m, t) = model();
+        let rx = m.register(t, Slot::OpencodeTui, false).rx;
+        m.post("m", false);
+        let (first, second, now) = stalled_repeat(&mut m, t, "m", rx);
+        m.snapshot(
+            now,
+            rx,
+            2,
+            second.d,
+            &[("m", 1, first.e), ("m", 1, second.e)],
+        );
+        assert_eq!(
+            m.may_hand_over(now, "m", 1, second.e, rx),
+            Err(HandOverRefusal::HeldEarlier)
+        );
+        m.stage(now, "m", 1, second.e, Stage::NotHanded, Some(rx));
+        let again = past_ttl(now);
+        m.tick(again);
+        let third = m.issue(again, "m", rx).expect("second automatic repeat");
+        assert_eq!(third.kind, IssueKind::AutoRepeat);
+        m.snapshot(
+            again,
+            rx,
+            3,
+            third.d,
+            &[("m", 1, first.e), ("m", 1, third.e)],
+        );
+        assert_eq!(
+            m.may_hand_over(again, "m", 1, third.e, rx),
+            Err(HandOverRefusal::HeldEarlier)
+        );
+        m.stage(again, "m", 1, third.e, Stage::NotHanded, Some(rx));
+        m.snapshot(again, rx, 4, third.d, &[]);
+        m.tick(again);
+        let d = m.delivery("m").unwrap();
+        assert_eq!(
+            (d.state, d.issued, d.auto_repeats),
+            (MessageState::Uncertain(UncertainReason::Lapsed), 3, 2),
+            "both refusals were counted"
+        );
+        let r = d.revision;
+        assert!(matches!(
+            m.retry(again, "m", GEN, r),
+            ActionOutcome::Applied { .. }
+        ));
+        let retry = m.issue(again, "m", rx).expect("manual retry");
+        m.snapshot(again, rx, 5, retry.d, &[("m", 1, retry.e)]);
+        assert!(m.may_hand_over(again, "m", 1, retry.e, rx).is_ok());
+        m.drain_effects();
+        m.stage(again, "m", 1, first.e, Stage::Committed, None);
+        assert_eq!(m.state("m"), Some(MessageState::Settled));
+        assert!(m.drain_effects().contains(&Effect::Revoke {
+            id: "m".into(),
+            a: 1,
+            e: retry.e
+        }));
+
+        // At the attempt cap, Retry is refused and only the commit settles.
+        let (mut m, t) = model_with(Limits {
+            max_attempts: 2,
+            ..Limits::default()
+        });
+        let rx = m.register(t, Slot::OpencodeTui, false).rx;
+        m.post("m", false);
+        let (first, repeat, now) = stalled_repeat(&mut m, t, "m", rx);
+        m.snapshot(
+            now,
+            rx,
+            2,
+            repeat.d,
+            &[("m", 1, first.e), ("m", 1, repeat.e)],
+        );
+        assert_eq!(
+            m.may_hand_over(now, "m", 1, repeat.e, rx),
+            Err(HandOverRefusal::HeldEarlier)
+        );
+        m.stage(now, "m", 1, repeat.e, Stage::NotHanded, Some(rx));
+        m.snapshot(now, rx, 3, repeat.d, &[]);
+        m.tick(now);
+        assert_eq!(
+            m.state("m"),
+            Some(MessageState::Uncertain(UncertainReason::OutOfAttempts))
+        );
+        let r = m.delivery("m").unwrap().revision;
+        assert_eq!(m.retry(now, "m", GEN, r), ActionOutcome::RetryLimit);
+        m.stage(now, "m", 1, first.e, Stage::Committed, None);
+        assert_eq!(m.state("m"), Some(MessageState::Settled));
+
+        // The receiver is replaced between the refusal and its NotHanded.
+        let (mut m, t) = model();
+        let rx = m.register(t, Slot::OpencodeTui, false).rx;
+        m.post("m", false);
+        let (first, repeat, now) = stalled_repeat(&mut m, t, "m", rx);
+        m.snapshot(
+            now,
+            rx,
+            2,
+            repeat.d,
+            &[("m", 1, first.e), ("m", 1, repeat.e)],
+        );
+        assert!(m.may_hand_over(now, "m", 1, repeat.e, rx).is_err());
+        let next = m.register(now, Slot::OpencodeTui, false);
+        assert_eq!(
+            next.resume,
+            vec![
+                ("m".to_string(), 1, first.e),
+                ("m".to_string(), 1, repeat.e)
+            ]
+        );
+        assert_ne!(
+            m.stage(now, "m", 1, repeat.e, Stage::NotHanded, Some(rx)),
+            StageOutcome::Applied,
+            "a retired incarnation's report is not taken"
+        );
+        m.resume_answer(now, next.rx, "m", 1, first.e, ResumeAnswer::Retained);
+        m.resume_answer(now, next.rx, "m", 1, repeat.e, ResumeAnswer::Unknown);
+        assert_eq!(stage_of(&m, "m", repeat.e), Stage::Fenced);
+        m.snapshot(now, next.rx, 1, first.d, &[("m", 1, first.e)]);
+        assert_eq!(m.state("m"), Some(MessageState::Attempting));
+        assert!(!repeat_scheduled(&m, "m"));
+        assert!(m.may_hand_over(now, "m", 1, first.e, next.rx).is_ok());
+        m.drain_effects();
+        m.stage(now, "m", 1, first.e, Stage::Committed, None);
+        assert_eq!(m.state("m"), Some(MessageState::Settled));
+        assert!(
+            !m.drain_effects()
+                .iter()
+                .any(|f| matches!(f, Effect::WitnessViolation { .. }))
+        );
+
+        // The receiver dies with no successor before its NotHanded.
+        let (mut m, t) = model();
+        let rx = m.register(t, Slot::OpencodeTui, false).rx;
+        m.post("m", false);
+        let (first, repeat, now) = stalled_repeat(&mut m, t, "m", rx);
+        m.snapshot(
+            now,
+            rx,
+            2,
+            repeat.d,
+            &[("m", 1, first.e), ("m", 1, repeat.e)],
+        );
+        assert!(m.may_hand_over(now, "m", 1, repeat.e, rx).is_err());
+        m.stream_closed(now, rx);
+        let gone = now + Limits::default().closed_retire_after() + Duration::from_secs(1);
+        m.tick(gone);
+        assert!(!m.live(rx), "precondition: the clock retired it");
+        assert_eq!(
+            (stage_of(&m, "m", first.e), stage_of(&m, "m", repeat.e)),
+            (Stage::Fenced, Stage::Fenced)
+        );
+        assert_ne!(m.state("m"), Some(MessageState::Settled));
+        let next = m.register(gone, Slot::OpencodeTui, false).rx;
+        m.tick(gone);
+        let last = m.issue(gone, "m", next).expect("the last automatic repeat");
+        assert_eq!(last.kind, IssueKind::AutoRepeat);
+        m.snapshot(gone, next, 1, last.d, &[("m", 1, last.e)]);
+        assert!(m.may_hand_over(gone, "m", 1, last.e, next).is_ok());
+        m.stage(gone, "m", 1, last.e, Stage::Committed, None);
+        assert_eq!(m.state("m"), Some(MessageState::Settled));
     }
 }

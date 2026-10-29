@@ -308,6 +308,122 @@ fn telemetry_otlp_005_real_claude_telemetry_joins_deck_run() {
     );
 }
 
+/// Scenario: Run trusted interactive Claude Haiku in an attached pane and ask it to copy a unique sentinel through Bash, observing Thinking, Working and Idle. Exit Claude normally so its final usage is written, then require provider-reported Haiku tokens, estimated cost and completed termination on the deck's exported run.
+#[spec("telemetry/usage/007")]
+#[test]
+fn telemetry_usage_007_real_interactive_haiku_usage() {
+    skip_unless!(common::check_claude_available());
+    let receiver = Receiver::start();
+    let deck = TuiDeck::builder()
+        .with_pty_size(180, 50)
+        .with_imported_claude_credentials()
+        .with_claude_trust_workdir()
+        .with_env("OTEL_EXPORTER_OTLP_ENDPOINT", &receiver.endpoint)
+        .with_env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json")
+        .with_continue_session(
+            "usage-haiku",
+            "claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read Write",
+        )
+        .launch_with_fixture("chain-smoke-claude");
+    const SENTINEL: &str = "usage_1858_sentinel_9f07.txt";
+    const PROOF: &str = "usage_1858_proof_9f07.txt";
+    std::fs::write(deck.workdir().join(SENTINEL), "USAGE_REAL_AGENT_OK_9f07\n").unwrap();
+    deck.wait_for_string("Claude Code v");
+    deck.send_bytes(b"\x04");
+    deck.wait_for_string("Dir:");
+    let agent = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|agent| agent.display_name.as_deref() == Some("usage-haiku"))
+        .expect("interactive Haiku pane");
+    let pane = agent.pane_id_env.as_deref().unwrap();
+    let start = deck.stream_text().len();
+    let directive = format!(
+        "Use Bash exactly once to run: sleep 3; cat '{}/{SENTINEL}' > '{}/{PROOF}'. Do not modify any other file. Then reply USAGE_DONE and end your turn.",
+        deck.workdir().display(),
+        deck.workdir().display(),
+    );
+    common::post_message_on(deck.attach_socket_path(), pane, &agent.id, &directive)
+        .expect("post real usage task");
+    assert!(
+        common::wait_until(Duration::from_secs(120), || {
+            let stream = deck.stream_text();
+            common::match_needles_in_order(
+                stream.get(start..).unwrap_or_default().as_bytes(),
+                &["Thinking", "Working", "Bash", "Idle"],
+            ) == 4
+        }),
+        "Haiku must visibly complete Thinking → Working/Bash → Idle:\n{}",
+        deck.snapshot_grid()
+    );
+    common::wait_for_file_trimmed_eq(
+        &deck.workdir().join(PROOF),
+        "USAGE_REAL_AGENT_OK_9f07",
+        Duration::from_secs(10),
+    )
+    .expect("Haiku must copy the unique sentinel");
+    // Claude writes cost-state on a normal exit; killing its PTY discards it.
+    deck.send_bytes(b"\x04");
+    deck.send_keys(b"/exit");
+    deck.wait_for_string("/exit");
+    deck.send_keys(b"\r");
+    let run = receiver.run(pane);
+    assert_eq!(
+        attribute(&run, "deck.tokens.provenance"),
+        "provider_reported",
+        "Haiku run must carry usage: {run}"
+    );
+    assert_eq!(
+        attribute(&run, "deck.cost.provenance"),
+        "estimated",
+        "Haiku cost must be a labelled estimate: {run}"
+    );
+    assert_eq!(
+        attribute(&run, "deck.run.termination"),
+        "completed",
+        "Haiku completed its turn: {run}"
+    );
+    assert_eq!(
+        attribute(&run, "deck.run.termination.provenance"),
+        "provider_reported"
+    );
+    let usage = run["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| {
+            event["name"] == "deck.model_usage"
+                && attribute(event, "gen_ai.response.model").starts_with("claude-haiku-")
+        })
+        .expect("Haiku model usage event");
+    assert_eq!(
+        attribute(usage, "deck.tokens.provenance"),
+        "provider_reported"
+    );
+    assert_eq!(attribute(usage, "deck.cost.provenance"), "estimated");
+    for value in [&run, usage] {
+        for key in [
+            "gen_ai.usage.input_tokens",
+            "gen_ai.usage.output_tokens",
+            "deck.cost.microusd",
+        ] {
+            let integer = value["attributes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|attr| attr["key"] == key)
+                .and_then(|attr| {
+                    attr["value"]["intValue"]
+                        .as_u64()
+                        .or_else(|| attr["value"]["intValue"].as_str()?.parse().ok())
+                });
+            assert!(
+                integer.is_some_and(|n| n > 0),
+                "positive {key} expected: {value}"
+            );
+        }
+    }
+}
+
 // OTLP logs and traces both wrap each resource in field 1, whose resource is
 // field 1 again. Decode resource string attributes only; do not search raw
 // bytes, where a log body could accidentally satisfy the join assertion.

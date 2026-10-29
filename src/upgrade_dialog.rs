@@ -6,7 +6,7 @@
 //! SelfUpgradeDialog.tsx`) step for step, so a user moving between the two
 //! clients meets the same flow (CLAUDE.md rule 22): every copy's plan is
 //! shown; the copies that can be upgraded from here are offered one at a time,
-//! this TUI's own copy first; nothing changes until the user picks Upgrade;
+//! the desktop app first (issue #1959); nothing changes until the user picks Upgrade;
 //! Cancel before anything ran closes the dialog, and after an upgrade it skips
 //! that copy; a copy that cannot be upgraded from here shows what to do and
 //! offers only Close. Both start each question on Cancel, so Enter alone
@@ -36,8 +36,9 @@ use crate::self_upgrade::{
 };
 use crate::state::SharedState;
 
-/// What the last check found: this TUI's copy first, then the other copy on
-/// the machine (the desktop app) when one was found.
+/// What the last check found: this TUI's copy and the other copy on the
+/// machine (the desktop app) when one was found, the app first
+/// ([`discover::app_first`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpgradeCheck {
     pub plans: Vec<UpgradePlan>,
@@ -51,16 +52,28 @@ impl UpgradeCheck {
         self.notice_after_install(false)
     }
 
-    /// As [`Self::notice`], but passing over this TUI's own copy (the first
-    /// plan) when `tui_installed`: its newer build is already on disk and
-    /// only a restart is left.
+    /// As [`Self::notice`], but passing over this TUI's own copy when
+    /// `tui_installed`: its newer build is already on disk and only a restart
+    /// is left.
     pub fn notice_after_install(&self, tui_installed: bool) -> Option<String> {
         self.plans
             .iter()
-            .enumerate()
-            .find(|(i, plan)| !(tui_installed && *i == 0) && plan.action != PlanAction::UpToDate)
-            .map(|(_, plan)| plan.headline())
+            .find(|plan| {
+                !(tui_installed && is_this_tui(plan)) && plan.action != PlanAction::UpToDate
+            })
+            .map(UpgradePlan::headline)
     }
+
+    /// The index of this TUI's own copy among [`Self::plans`].
+    pub fn this_tui(&self) -> Option<usize> {
+        self.plans.iter().position(is_this_tui)
+    }
+}
+
+/// Whether `plan` is for the copy this TUI runs from: the CLI, since the TUI
+/// is the CLI's binary ([`check`] plans the desktop app beside it).
+pub fn is_this_tui(plan: &UpgradePlan) -> bool {
+    plan.installation.copy == CopyKind::Cli
 }
 
 /// The badge as the footer draws it: the notice and the key that opens the
@@ -127,8 +140,8 @@ pub async fn check() -> Result<UpgradeCheck, UpgradeError> {
         .await?;
     let plans = tokio::task::spawn_blocking(move || {
         let options = PlanOptions::terminal(&SystemHost::default());
-        std::iter::once(&running)
-            .chain(other.as_ref())
+        discover::app_first(&running, other.as_ref())
+            .into_iter()
             .map(|copy| plan::plan(copy, &releases, &options))
             .collect()
     })
@@ -382,7 +395,7 @@ pub struct UpgradeDialog {
 }
 
 impl UpgradeDialog {
-    /// A dialog over `plans`, this TUI's own copy first.
+    /// A dialog over `plans`, in the order they are offered: the app first.
     pub fn new(plans: Vec<UpgradePlan>) -> Self {
         let n = plans.len();
         let mut dialog = Self {
@@ -1087,9 +1100,11 @@ mod tests {
             },
         );
         let behind = Outcome::BrewNotUpgraded {
+            brew: "/opt/homebrew/bin/brew".into(),
             formula: "dot-agent-deck",
             reported: Some("0.46.0".into()),
             offered: "0.47.0".into(),
+            refresh_failed: None,
         };
         let result = RunResult::from_outcome(&plan, &behind, true);
         assert!(!result.ok);
@@ -1115,6 +1130,65 @@ mod tests {
         let result = RunResult::from_outcome(&plan, &reached, true);
         assert!(result.ok);
         assert!(result.tui_restart.is_some());
+    }
+
+    /// Issue #1959: the app's plan comes first, so the badge leads with the
+    /// app while both are behind, and once this TUI's own copy is installed
+    /// it is passed over wherever it sits, leaving the app on offer.
+    #[test]
+    fn the_app_comes_first_and_this_tui_is_found_by_its_copy() {
+        use crate::self_upgrade::detect::{InstallMethod, Installation, Platform, Tools};
+        use crate::self_upgrade::{PlanOptions, ProvenanceCheck};
+        let copy = |copy, executable: &str, method| Installation {
+            copy,
+            executable: executable.into(),
+            version: "0.46.0".into(),
+            platform: Some(Platform::LinuxAmd64),
+            method,
+            tools: Tools::default(),
+        };
+        let cli = copy(
+            CopyKind::Cli,
+            "/home/u/.local/bin/dot-agent-deck",
+            InstallMethod::DownloadedWritable {
+                binary: "/home/u/.local/bin/dot-agent-deck".into(),
+            },
+        );
+        let app = copy(
+            CopyKind::Desktop,
+            "/usr/bin/agent-deck",
+            InstallMethod::DesktopDeb,
+        );
+        let options = PlanOptions {
+            staging_root: "/stage".into(),
+            can_prompt_for_privilege: false,
+            provenance: ProvenanceCheck::Unavailable { reason: "x".into() },
+        };
+        let check = UpgradeCheck {
+            plans: discover::app_first(&cli, Some(&app))
+                .into_iter()
+                .map(|copy| plan::plan(copy, &"0.47.0".into(), &options))
+                .collect(),
+        };
+        assert_eq!(check.this_tui(), Some(1));
+        assert_eq!(check.notice(), Some(check.plans[0].headline()));
+        assert!(
+            check.plans[0].headline().contains("desktop app"),
+            "{:?}",
+            check.plans[0].headline()
+        );
+        assert_eq!(
+            check.notice_after_install(true),
+            Some(check.plans[0].headline())
+        );
+        let app_current = UpgradeCheck {
+            plans: vec![
+                plan::plan(&app, &"0.46.0".into(), &options),
+                check.plans[1].clone(),
+            ],
+        };
+        assert_eq!(app_current.notice(), Some(check.plans[1].headline()));
+        assert_eq!(app_current.notice_after_install(true), None);
     }
 
     #[test]

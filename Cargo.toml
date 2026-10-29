@@ -39,6 +39,9 @@ name = "dot-agent-deck"
 version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
+# PRD #1859: `src/bin/dot-agent-deck-collector.rs` is this package's second
+# binary, so a bare `cargo run` needs telling which one is the deck.
+default-run = "dot-agent-deck"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -114,6 +117,11 @@ getrandom = "0.4"
 # anything. Already in this workspace's lockfile (the desktop crate's graph
 # carries 0.10.9), so the version resolves to code the workspace builds today.
 sha2 = "0.11"
+# PRD #1859: the collector's body reader takes a response's chunks as reqwest
+# hands them over, as `bytes::Bytes`, so it can refuse one past its cap before
+# copying any of it. Already in the graph as reqwest's own dependency, so
+# naming it adds no new code to the build.
+bytes = "1"
 
 # Issue #250: `build.rs` validates an injected `DAD_VERSION` with the EXACT
 # parser `src/version.rs` uses (`semver::Version::parse`), so the set of
