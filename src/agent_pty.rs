@@ -1013,6 +1013,9 @@ pub struct AgentPty {
     /// only inherited forward — so it must be created here, at spawn, and live as
     /// long as the agent. See [`crate::platform::proc::AgentProcessGroup`].
     pub process_group: crate::platform::proc::AgentProcessGroup,
+    /// PRD #1666 part 3 (Q84): the argv the deck executed as the child, the
+    /// launch provenance an editor-probe observer binds `A` from.
+    pub argv: Vec<std::ffi::OsString>,
 }
 
 /// PRD #92 F8: hardcoded grace window between SIGTERM and the SIGKILL
@@ -1929,6 +1932,7 @@ fn spawn_with_dir(
         match *never {}
     }
 
+    let argv = cmd.get_argv().clone();
     let child = pair
         .slave
         .spawn_command(cmd)
@@ -1991,6 +1995,7 @@ fn spawn_with_dir(
         writer,
         reader,
         process_group,
+        argv,
     })
 }
 
@@ -12520,7 +12525,17 @@ impl AgentPtyRegistry {
             writer,
             reader,
             process_group,
+            argv,
         } = pty;
+        // PRD #1666 part 3 (Q84): what the deck executed, for the observer's
+        // binding of `A`.
+        #[cfg(target_os = "linux")]
+        let composer_install = composer_install.map(|mut installation| {
+            installation.set_launch(argv);
+            installation
+        });
+        #[cfg(not(target_os = "linux"))]
+        drop(argv);
 
         // PRD #1666 part 3, round 5-wake: the evidence state tracks the spawn
         // type's measured screen, and the release scanner reads the header,
@@ -12802,6 +12817,7 @@ impl AgentPtyRegistry {
                 Some(bus) => bus.latched_for(agent),
                 None => crate::doorbell_activation::LatchedRelease::Unseen,
             }),
+            assumed: crate::composer_probe::install::captured_assumption(),
         };
         let Some(observer) = crate::composer_probe::observe::Observer::start(
             installation,
@@ -21493,6 +21509,7 @@ mod spawn_tests {
             writer,
             mut reader,
             process_group,
+            argv: _,
         } = pty;
         // Detached: on Linux the read ends in `EIO` once the slave is gone, but
         // nothing here depends on when, so it is never joined.

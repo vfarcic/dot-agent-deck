@@ -592,6 +592,16 @@ impl GenerationInput {
         self.with_records(|r, fifo| r.drained(fifo, generation, key, now))
     }
 
+    /// See [`Records::drained_uncertain`].
+    pub fn record_drained_uncertain(
+        &self,
+        generation: u64,
+        key: RecordKey,
+        now: Instant,
+    ) -> Result<Drained, Refusal> {
+        self.with_records(|r, fifo| r.drained_uncertain(fifo, generation, key, now))
+    }
+
     /// See [`Records::match_segment`].
     pub fn record_match(&self, generation: u64, key: RecordKey, seg: u64) -> Result<(), Refusal> {
         self.with_records(|r, _| r.match_segment(generation, key, seg))

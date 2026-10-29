@@ -1181,6 +1181,36 @@ impl Records {
         key: RecordKey,
         now: Instant,
     ) -> Result<Drained, Refusal> {
+        self.drain(fifo, generation, key, now, true)
+    }
+
+    /// The record's exit drain gave up with its decision evidence not all
+    /// read (Q84: a marker read that overflowed or failed past its retries,
+    /// or a connection that never finished). Settled as [`drained`] settles
+    /// it, except that it is never the exit that consumes: an open record
+    /// settles `NotConsumed(Unproven)` whatever the interval proves, and the
+    /// birth-floor fallback pops nothing, since a decision or a `native_seen`
+    /// it didn't read could have said otherwise.
+    ///
+    /// [`drained`]: Records::drained
+    pub fn drained_uncertain(
+        &mut self,
+        fifo: &mut HazardFifo,
+        generation: u64,
+        key: RecordKey,
+        now: Instant,
+    ) -> Result<Drained, Refusal> {
+        self.drain(fifo, generation, key, now, false)
+    }
+
+    fn drain(
+        &mut self,
+        fifo: &mut HazardFifo,
+        generation: u64,
+        key: RecordKey,
+        now: Instant,
+        complete: bool,
+    ) -> Result<Drained, Refusal> {
         self.check(generation)?;
         let i = self.index(key)?;
         let before = self.scope.state();
@@ -1197,7 +1227,8 @@ impl Records {
                 r.frontier = Frontier::Missing;
             }
             if r.settlement == Settlement::Open {
-                let proved = r.attribution == Attribution::Owned
+                let proved = complete
+                    && r.attribution == Attribution::Owned
                     && matches!(r.claim, None | Some(Claim::Owned))
                     && count > 0
                     && self.history.proves(r.birth_floor, exit);
@@ -1220,7 +1251,7 @@ impl Records {
             if consumed {
                 self.history.set(now, count - 1);
             }
-            if self.records[i].attribution == Attribution::Owned {
+            if complete && self.records[i].attribution == Attribution::Owned {
                 let r = &mut self.records[i];
                 fifo.pop_at_drain(&mut r.hazard_pop, r.birth_floor, now);
             }

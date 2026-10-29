@@ -372,6 +372,10 @@ pub struct Installation {
     instance_dir: std::path::PathBuf,
     #[cfg(target_os = "linux")]
     helper_id: super::classifier::FileId,
+    /// The argv the deck executed as the generation's PTY child, once it
+    /// spawned: the launch provenance that binds `A` (Q84).
+    #[cfg(target_os = "linux")]
+    launch: Vec<OsString>,
 }
 
 impl Installation {
@@ -406,6 +410,18 @@ impl Installation {
     #[cfg(target_os = "linux")]
     pub fn helper_id(&self) -> super::classifier::FileId {
         self.helper_id
+    }
+
+    /// Record the argv the deck executed as the generation's PTY child.
+    #[cfg(target_os = "linux")]
+    pub fn set_launch(&mut self, argv: Vec<OsString>) {
+        self.launch = argv;
+    }
+
+    /// The argv the deck executed as the PTY child; empty before the spawn.
+    #[cfg(target_os = "linux")]
+    pub fn launch(&self) -> &[OsString] {
+        &self.launch
     }
 
     /// `env` with the editor variables replaced by this installation's.
@@ -526,6 +542,7 @@ pub fn install(
         files,
         instance_dir: instance.dir().to_path_buf(),
         helper_id: instance.helper_id(),
+        launch: Vec::new(),
     })
 }
 
@@ -571,18 +588,6 @@ fn daemon_instance() -> Result<&'static Instance, SetupError> {
         })
         .as_ref()
         .map_err(|e| *e)
-}
-
-/// Write generation `generation`'s identity file in the daemon's instance,
-/// once its permission reaches `Armable` (Q35-14b; see
-/// [`super::instance::Instance::write_identity`]). Refused when no
-/// generation was installed, so there is no instance.
-#[cfg(target_os = "linux")]
-pub fn write_identity(
-    generation: &str,
-    identity: &super::classifier::Identity,
-) -> Result<(), SetupError> {
-    daemon_instance()?.write_identity(generation, identity)
 }
 
 /// The installation decision for a spawn of generation `generation` running

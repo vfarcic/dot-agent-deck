@@ -35,51 +35,78 @@
 //! decision and the attribution are what consume, the read is only what the
 //! helper reports to its agent.
 //!
-//! **The drain** (core §2.4, AU7 §2). A record whose exit is observed is
-//! settled by its exit only once its decision evidence is drained: no
-//! composer connection of its helper is still open, or [`READ_DEADLINE`]
-//! has passed since its exit, and its markers have been read again. Until
-//! then the drain is rescheduled, never settled. A connection is registered
-//! when its capability question is answered, which is before a helper can
-//! send a decision on it, so a decision on IPC is always on a registered
-//! connection. Work is bounded per generation and in total ([`Pool`]):
-//! composer connections open at once, the bytes of the one report read after
-//! an invocation, attestations at once and per pass, and marker names read
-//! per pass. Past a bound a scan or a marker waits for the next pass; a
-//! connection gets no capability; an attestation not run is an identity
-//! refusal (`record_refused`, with the request's claim on IPC and none for a
-//! scan, an unread connection or a marker).
+//! **The drain** (core §2.4, AU7 §2, Q84). A record whose exit is observed
+//! is settled by its exit only once its decision evidence is drained: every
+//! composer connection of its helper has finished, and its markers have been
+//! read again completely. A connection is registered when its capability
+//! question is answered, which is before a helper can send a decision on it,
+//! so a decision on IPC is always on a registered connection. When the exit
+//! is observed each of the helper's connections is told ([`Departure`]); its
+//! reader applies what it reads, and ends the connection at its end or once
+//! [`READ_DEADLINE`] has passed with nothing pending, so a line read or
+//! being applied is applied before the drain. A marker read that overflows
+//! or fails is no drain: nothing settles, and no marker is taken as
+//! deleted. Until both hold the drain is rescheduled; after
+//! [`DRAIN_RETRIES`] passes it gives up to the uncertain outcome
+//! (`NotConsumed(Unproven)` for an open record, no fallback pop), never to
+//! the clean one, and keeps its record and markers. A decision that arrives
+//! after the exit drained is logged and changes nothing: the helper is told
+//! the settled outcome (core §2.4's table). Work is bounded per
+//! generation and in total ([`Pool`]): composer connections open at once,
+//! the bytes of the one report read after an invocation, attestations at
+//! once and per pass, and marker names read per pass. Past a bound a scan or
+//! a marker waits for the next pass; a connection gets no capability; an
+//! attestation not run is an identity refusal (`record_refused`, with the
+//! request's claim on IPC and none for a scan, an unread connection or a
+//! marker).
 //!
-//! **The kill** (core §5.4, P-E2). A record whose helper declared `Armed`
-//! and is still alive [`E2_AFTER`] after the first `Armed` observation of it
-//! is killed through its pidfd. The clock starts at the first observation of
-//! `Armed` and a duplicate doesn't move it ([`e2_due`]). A helper stopped
-//! before its arm load, or on an editor path, is never killed.
+//! **The kill** (core §5.4, P-E2, Q84). A record whose helper declared
+//! `Armed` and is still alive [`E2_AFTER`] after the first `Armed`
+//! observation of it is killed through its pidfd, only when that pidfd was
+//! pinned for a helper the daemon attested as this instance's helper copy
+//! (its connection's peer pidfd, or a child scan with its start ticks) and
+//! the process still runs that copy. A marker's name never makes a process
+//! one E2 signals. The clock starts at the first observation of `Armed` and
+//! a duplicate doesn't move it ([`e2_due`]). A helper stopped before its arm
+//! load, or on an editor path, is never killed.
 //!
-//! **Permission** (plan §1.2). A generation is armable once its header
+//! **Permission** (plan §1.2, Q84). A generation is armable once its header
 //! latched an exact release with a verified `editor_probe` record and `A`
-//! is bound; then `gen-G` is written. As of this commit `A` is bound only
-//! for a direct Claude, as the PTY child (Q35-22 binds it below a launcher;
-//! a direct Codex runs below the deck's wrapper, so its `A` isn't the PTY
-//! child either). Nothing in production publishes a liability: installation
+//! is bound; then `gen-G` is written. `A` is bound only for a direct Claude,
+//! from the deck's own launch record ([`bound_agent`]): the PTY child the
+//! deck spawned, or the one child of the deck's own `sh -c`, running the
+//! agent's executable with the argv the launch gives it. A user's launcher
+//! script binds nothing (Q35-22 binds below a launcher; a direct Codex runs
+//! below the deck's wrapper, so its `A` isn't the PTY child either). One
+//! settler at a time ([`SettleClaim`]) computes it, and only a settlement
+//! that moves it out of `Pending` publishes `A` with it, so `gen-G` is
+//! written once. Nothing in production publishes a liability: installation
 //! rolls out to no class until activation, and the only publisher is the
 //! `e2e` build's control verb ([`Seam::control`]).
 //!
-//! **Lock order.** No lock is held while a process or a file is read:
+//! **Lock order.** No lock is held while a file is read or written:
 //! ```text
 //! registry (R4) ─ clone Arc<Observer>, released ─┐
-//! hook task │ observer thread │ attach handler ──┴─> attest (no lock)
+//! hook task │ observer thread │ attach handler ──┴─> attest, bind, /proc and
+//!                                                     inv/G reads, marker renames
+//!                                                     and deletion, gen-G write
+//!                                                     (no lock)
 //!                                                     └─> seam (Mutex) ─> input (R6)
 //!                                                                  └─> arm page stores
+//! settle claim (atomic, held across bind and the gen-G write, no lock) ─> seam
 //! output lock (bus) ─> Bell (atomics, unpark)
+//! observer exit observed ─> Departure (atomic, notify) ─> hook task's read deadline
 //! retirement: R4 ─> R6 (retire_taking_first_stop); Observer::stop (atomics)
 //! ```
 //! The seam lock isn't ranked; nothing takes it under R4, R6 or the output
-//! lock, and nothing under it but the input lock's leaf steps and memory
-//! stores to the arm page. Retirement: the pane's successor retires the
-//! input (records and scope dropped, M-FIRST taken in the same section) and
-//! stops the observer; the observer's thread holds it weakly and ends at its
-//! next wake, and the arm page is unmapped when the record goes.
+//! lock. Under it are the input lock's leaf steps, memory stores to the arm
+//! page, and two kinds of system call on descriptors already held: `poll` of
+//! each pinned pidfd for its exit, and the `dup` of a pidfd E2 is about to
+//! check. No path is opened, read, renamed, unlinked or written under it.
+//! Retirement: the pane's successor retires the input (records and scope
+//! dropped, M-FIRST taken in the same section) and stops the observer; the
+//! observer's thread holds it weakly and ends at its next wake, and the arm
+//! page is unmapped when the record goes.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -103,8 +130,15 @@ pub const SCAN_PERIOD: Duration = Duration::from_millis(50);
 pub const IDLE_SWEEP: Duration = Duration::from_secs(1);
 
 /// How long after a helper's exit its open connections may still deliver
-/// (core §2.4).
+/// (core §2.4): a connection with nothing pending once it passes has said
+/// nothing more.
 pub const READ_DEADLINE: Duration = Duration::from_millis(100);
+
+/// How many passes an exited record's drain is rescheduled while its
+/// decision evidence isn't all read (a connection not finished, a marker
+/// read that overflowed or failed) before it gives up to the uncertain
+/// outcome (Q84): about 5 s at [`SCAN_PERIOD`].
+pub const DRAIN_RETRIES: u32 = 100;
 
 /// How long an `Armed` helper may live after its decision was first seen
 /// (core §5.4).
@@ -320,13 +354,251 @@ pub fn e2_due(r: &record::Record, now: Instant) -> bool {
             .is_some_and(|first| now.saturating_duration_since(first) >= E2_AFTER)
 }
 
-/// Whether an exited helper's drain may settle at `now` (core §2.4): none of
-/// its composer connections is open (`open`, how many are), or
-/// [`READ_DEADLINE`] has passed since its exit was observed at `exited`, after
-/// which a connection still open is taken to have said nothing more.
-/// Otherwise the drain is rescheduled, and nothing settles.
-pub fn drain_ready(open: u32, exited: Instant, now: Instant) -> bool {
-    open == 0 || now.saturating_duration_since(exited) >= READ_DEADLINE
+/// What a pass does with an exited record's drain (core §2.4, Q84).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainStep {
+    /// Its evidence is all read: settle by the exit.
+    Settle,
+    /// Reschedule: nothing settles.
+    Wait,
+    /// The retries are spent with evidence still unread: the uncertain
+    /// outcome ([`super::record::Records::drained_uncertain`]), never the
+    /// clean one.
+    GiveUp,
+}
+
+/// The drain's step for an exited record (core §2.4, Q84): `open`, its
+/// helper's composer connections not finished yet (one finishes at its end,
+/// or once [`READ_DEADLINE`] has passed since its helper's exit was observed
+/// with nothing pending, after its last line was applied); `markers_read`,
+/// whether this pass read the record's markers completely (no overflow, no
+/// error, every one applied within the budget); `retries`, the passes
+/// already rescheduled. No timer settles an open connection: only its
+/// finishing does, or the retries running out to the uncertain outcome.
+pub fn drain_step(open: u32, markers_read: bool, retries: u32) -> DrainStep {
+    if open == 0 && markers_read {
+        DrainStep::Settle
+    } else if retries >= DRAIN_RETRIES {
+        DrainStep::GiveUp
+    } else {
+        DrainStep::Wait
+    }
+}
+
+/// A composer connection's view of its helper's exit (core §2.4): the
+/// observer marks it when it observes the exit, and the connection's reader
+/// then reads what is pending for [`READ_DEADLINE`] more. Marking takes no
+/// lock and wakes every waiter.
+#[derive(Debug, Default)]
+pub struct Departure {
+    gone: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl Departure {
+    /// The helper's exit was observed.
+    pub fn depart(&self) {
+        self.gone.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    pub fn departed(&self) -> bool {
+        self.gone.load(Ordering::Acquire)
+    }
+
+    /// Resolves once [`Departure::depart`] has been called, before or after
+    /// this.
+    pub async fn wait(&self) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.departed() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Resolves [`READ_DEADLINE`] after the exit was observed (as this
+    /// waiter learns it): what the connection says after that is taken as
+    /// nothing.
+    pub async fn read_deadline(&self) {
+        self.wait().await;
+        tokio::time::sleep(READ_DEADLINE).await;
+    }
+}
+
+/// The one settler of a generation's permission at a time (Q84): the
+/// observer's pass and the control verb both settle it, and whichever takes
+/// this claim first computes, writes `gen-G` and publishes; the other
+/// returns, and finds the permission settled or settles it later itself.
+#[derive(Debug, Default)]
+pub struct SettleClaim {
+    held: AtomicBool,
+}
+
+/// A held [`SettleClaim`], released when dropped.
+#[derive(Debug)]
+pub struct Settling<'a> {
+    claim: &'a SettleClaim,
+}
+
+impl SettleClaim {
+    /// The claim, unless another settler holds it.
+    pub fn claim(&self) -> Option<Settling<'_>> {
+        self.held
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            // Lazily: a guard built for a failed claim would release the
+            // holder's when dropped.
+            .then(|| Settling { claim: self })
+    }
+}
+
+impl Drop for Settling<'_> {
+    fn drop(&mut self) {
+        self.claim.held.store(false, Ordering::Release);
+    }
+}
+
+/// The argv a POSIX shell's `-c` gives the simple command `line`, or `None`
+/// when the shell would expand, redirect or run anything else in it (Q84's
+/// launch provenance): blanks separate words, single quotes keep everything,
+/// double quotes keep everything but `$`, `` ` `` and `\` (refused), and an
+/// unquoted `\` keeps the next character. Any unquoted expansion, glob,
+/// control or comment character, a leading assignment, a line break or an
+/// unterminated quote refuses.
+pub fn shell_words(line: &str) -> Option<Vec<String>> {
+    const SPECIAL: &[char] = &[
+        '$', '`', ';', '&', '|', '(', ')', '<', '>', '*', '?', '[', '{', '}', '~', '#', '\n', '\r',
+        '!',
+    ];
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut started = false;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            ' ' | '\t' => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            }
+            '\'' => {
+                started = true;
+                loop {
+                    match chars.next()? {
+                        '\'' => break,
+                        c => word.push(c),
+                    }
+                }
+            }
+            '"' => {
+                started = true;
+                loop {
+                    match chars.next()? {
+                        '"' => break,
+                        '$' | '`' | '\\' => return None,
+                        c => word.push(c),
+                    }
+                }
+            }
+            '\\' => {
+                started = true;
+                match chars.next()? {
+                    '\n' => return None,
+                    c => word.push(c),
+                }
+            }
+            '=' if words.is_empty() => return None,
+            c if SPECIAL.contains(&c) => return None,
+            c => {
+                started = true;
+                word.push(c);
+            }
+        }
+    }
+    if started {
+        words.push(word);
+    }
+    (!words.is_empty()).then_some(words)
+}
+
+/// What binding reads of one process: its executable's `(dev, ino)` and its
+/// argv.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcFacts {
+    pub exe: super::classifier::FileId,
+    pub argv: Vec<std::ffi::OsString>,
+}
+
+/// Which process [`bound_agent`] binds as `A`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bound {
+    /// The PTY child itself.
+    Pty,
+    /// The PTY child's one child, by pid.
+    Child(u32),
+}
+
+/// Whether `program`'s basename is a shell's ([`super::install::SHELLS`]).
+fn is_shell(program: &std::ffi::OsStr) -> bool {
+    std::path::Path::new(program)
+        .file_name()
+        .is_some_and(|name| super::install::SHELLS.iter().any(|shell| name == *shell))
+}
+
+/// `A` for a direct Claude from the deck's own launch record (Q84): `launch`
+/// is the argv the deck executed as the PTY child, `pty` that process now
+/// (the caller has pinned it by the pid and start ticks the deck spawned),
+/// `children` its children, and `resolve` a program word's executable as
+/// the agent's `PATH` finds it.
+///
+/// The agent's argv is `launch` itself, or, when `launch` is the deck's
+/// shell running one line (`<shell> -c <line>`), the words the shell gives
+/// that line ([`shell_words`]); a program that is itself a shell binds
+/// nothing. The PTY child is `A` when it runs that program's executable with
+/// exactly that argv (the deck executed it, or its shell `exec`ed it). Its
+/// one child is `A` only when the PTY child is still the deck's shell, its
+/// executable and argv the launch's, and that child runs the program with
+/// the argv. Anything else, a user's launcher script among it (its process
+/// runs an interpreter, not the program's own executable), binds nothing:
+/// launchers are Q35-22's.
+pub fn bound_agent(
+    launch: &[std::ffi::OsString],
+    pty: &ProcFacts,
+    children: &[(u32, ProcFacts)],
+    resolve: impl Fn(&std::ffi::OsStr) -> Option<super::classifier::FileId>,
+) -> Option<Bound> {
+    let first = launch.first()?;
+    let shell_line = match launch {
+        [shell, flag, line] if is_shell(shell) && flag == "-c" => Some(line.to_str()?),
+        _ => None,
+    };
+    let expected: Vec<std::ffi::OsString> = match shell_line {
+        Some(line) => shell_words(line)?.into_iter().map(Into::into).collect(),
+        None => launch.to_vec(),
+    };
+    let program = expected.first()?;
+    if is_shell(program) {
+        return None;
+    }
+    let agent_exe = resolve(program)?;
+    let runs_agent = |p: &ProcFacts| p.exe == agent_exe && p.argv == expected;
+    if runs_agent(pty) {
+        return Some(Bound::Pty);
+    }
+    if shell_line.is_some()
+        && resolve(first) == Some(pty.exe)
+        && pty.argv == launch
+        && let [(pid, child)] = children
+        && runs_agent(child)
+    {
+        return Some(Bound::Child(*pid));
+    }
+    None
 }
 
 /// A start in clock ticks since boot as an [`Instant`] at or before the
@@ -453,11 +725,14 @@ impl<P: Page> Seam<P> {
         self.permission
     }
 
-    /// Settle the permission. Once out of `Pending` it doesn't move.
-    pub fn set_permission(&mut self, permission: Permission) {
-        if self.permission == Permission::Pending {
+    /// Settle the permission. Once out of `Pending` it doesn't move: whether
+    /// this call moved it, so only its winner publishes what goes with it.
+    pub fn set_permission(&mut self, permission: Permission) -> bool {
+        let moved = self.permission == Permission::Pending && permission != Permission::Pending;
+        if moved {
             self.permission = permission;
         }
+        moved
     }
 
     pub fn page(&mut self) -> &mut P {
@@ -569,6 +844,14 @@ impl<P: Page> Seam<P> {
         outcome(decided, recorded, read)
     }
 
+    /// Whether a decision for `key` now would come after its record's exit
+    /// drained, which the records ignore (core §2.4: the helper is told the
+    /// settled outcome). The caller logs it with the seam lock released, so
+    /// it isn't lost silently (Q84).
+    pub fn late(&self, key: RecordKey) -> bool {
+        self.input.record(key).is_some_and(|r| r.drained)
+    }
+
     /// A scan's or a marker's observation.
     pub fn observe(&mut self, obs: &Observation, now: Instant) -> Result<Recorded, Refusal> {
         let recorded = self.input.record_observe(obs, now);
@@ -611,6 +894,19 @@ impl<P: Page> Seam<P> {
     /// consume, so the page follows.
     pub fn drained(&mut self, key: RecordKey, now: Instant) -> Result<record::Drained, Refusal> {
         let drained = self.input.record_drained(self.generation, key, now);
+        self.sync();
+        drained
+    }
+
+    /// The exit drain given up with evidence unread: nothing consumes.
+    pub fn drained_uncertain(
+        &mut self,
+        key: RecordKey,
+        now: Instant,
+    ) -> Result<record::Drained, Refusal> {
+        let drained = self
+            .input
+            .record_drained_uncertain(self.generation, key, now);
         self.sync();
         drained
     }
@@ -671,17 +967,19 @@ pub use linux::{Connection, Observer, Spawned};
 #[cfg(target_os = "linux")]
 mod linux {
     use std::collections::HashMap;
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
+    use std::io::Read;
     use std::os::fd::{AsRawFd, OwnedFd};
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::sync::{Arc, Mutex, Weak};
     use std::time::{Duration, Instant};
 
     use super::{
-        ATTESTATIONS, ATTESTATIONS_PER_PASS, Bell, CONNECTIONS, CONNECTIONS_PER_GENERATION,
-        CONTROL_PERMISSION_WAIT, ControlOp, ControlRefusal, Evidence, IDLE_SWEEP,
-        MARKER_NAMES_PER_PASS, Page, Pool, SCAN_PERIOD, Seam, Slot, drain_ready, e2_due,
-        marker_observation, scan_observation,
+        ATTESTATIONS, ATTESTATIONS_PER_PASS, Bell, Bound, CONNECTIONS, CONNECTIONS_PER_GENERATION,
+        CONTROL_PERMISSION_WAIT, ControlOp, ControlRefusal, Departure, DrainStep, Evidence,
+        IDLE_SWEEP, MARKER_NAMES_PER_PASS, Page, Pool, ProcFacts, SCAN_PERIOD, Seam, SettleClaim,
+        Slot, bound_agent, drain_step, e2_due, marker_observation, scan_observation,
     };
     use crate::composer_probe::attest::{
         self, Agent, Kernel, LinuxKernel, Pinned, Sighting, attribute, read_export,
@@ -694,7 +992,7 @@ mod linux {
         self, Attribution, Channel, EC_POLICY, ExitFact, RecordKey, Records,
     };
     use crate::composer_probe::{Binding, InertCause, Permission};
-    use crate::doorbell_activation::LatchedRelease;
+    use crate::doorbell_activation::{EditorProbe, LatchedRelease};
     use crate::event::{AgentType, ComposerInvocationRequest, ComposerOutcome, EditorReport};
 
     impl Page for GenerationFiles {
@@ -707,15 +1005,29 @@ mod linux {
     /// The most exit facts an observer keeps after their records go.
     const FACTS_KEPT: usize = record::RECORD_CAP;
 
+    /// The most bytes of a process's argv binding reads.
+    const ARGV_BYTES: u64 = 128 << 10;
+
+    /// A record's helper, held by its pidfd for its exit.
+    struct Pin {
+        fd: OwnedFd,
+        /// Whether E2 may signal it (Q84): only a helper the daemon attested
+        /// as this instance's helper copy, by its connection's peer pidfd or
+        /// by a child scan with its start ticks. A pin from a marker's name
+        /// watches the exit and is never signalled.
+        killable: bool,
+    }
+
     /// What a pass watches, under the seam lock with the seam.
     #[derive(Default)]
     struct Watch {
         /// Helpers with a record whose exit isn't observed yet.
-        pins: HashMap<RecordKey, OwnedFd>,
-        /// Exits observed, drain pending, with when.
-        exited: HashMap<RecordKey, Instant>,
-        /// Composer connections open, by the helper on the other end.
-        open: HashMap<RecordKey, u32>,
+        pins: HashMap<RecordKey, Pin>,
+        /// Exits observed, drain pending, with the passes it was rescheduled.
+        exited: HashMap<RecordKey, u32>,
+        /// Composer connections not finished yet, by the helper on the other
+        /// end.
+        open: HashMap<RecordKey, Vec<Arc<Departure>>>,
         /// The last exit facts of records that went: no segment holds them
         /// yet (Q35-20).
         facts: std::collections::VecDeque<ExitFact>,
@@ -744,6 +1056,10 @@ mod linux {
         /// The generation's release as latched for an agent, read with no
         /// seam lock held.
         pub latch: Box<dyn Fn(&AgentType) -> LatchedRelease + Send + Sync>,
+        /// The `e2e` build's assumed editor-probe records (the daemon's
+        /// [`crate::composer_probe::install::captured_assumption`]): nothing
+        /// in production.
+        pub assumed: &'static [(AgentType, semver::Version, EditorProbe<'static>)],
     }
 
     /// One installed generation's observer. See the module documentation.
@@ -755,9 +1071,13 @@ mod linux {
         kind: Kind,
         env: Vec<(String, String)>,
         child: Option<(u32, u64)>,
+        /// The argv the deck executed as the PTY child.
+        launch: Vec<OsString>,
         reader: InstanceReader,
         helper_id: FileId,
         latch: Box<dyn Fn(&AgentType) -> LatchedRelease + Send + Sync>,
+        assumed: &'static [(AgentType, semver::Version, EditorProbe<'static>)],
+        settling: SettleClaim,
         inner: Mutex<Inner>,
         connections: Arc<Pool>,
         bell: Arc<Bell>,
@@ -765,10 +1085,14 @@ mod linux {
     }
 
     /// A composer connection: its helper, pinned by the connection's peer
-    /// pidfd, and its budget slot. Dropping it closes the registration.
+    /// pidfd, and its budget slot. It is open for the drain until it is
+    /// dropped, which its reader does at its end, or once
+    /// [`Connection::read_deadline`] passed with nothing pending, after
+    /// applying what it read.
     pub struct Connection {
         observer: Arc<Observer>,
         helper: Pinned<OwnedFd>,
+        departure: Arc<Departure>,
         _slot: Slot,
     }
 
@@ -776,15 +1100,22 @@ mod linux {
         pub fn observer(&self) -> &Arc<Observer> {
             &self.observer
         }
+
+        /// Resolves [`super::READ_DEADLINE`] after the observer observed
+        /// this connection's helper exit: a reader with nothing pending then
+        /// ends the connection, and its silence counts as no decision.
+        pub async fn read_deadline(&self) {
+            self.departure.read_deadline().await;
+        }
     }
 
     impl Drop for Connection {
         fn drop(&mut self) {
             let key = key_of(&self.helper);
             let mut inner = self.observer.lock();
-            if let Some(n) = inner.watch.open.get_mut(&key) {
-                *n = n.saturating_sub(1);
-                if *n == 0 {
+            if let Some(open) = inner.watch.open.get_mut(&key) {
+                open.retain(|d| !Arc::ptr_eq(d, &self.departure));
+                if open.is_empty() {
                     inner.watch.open.remove(&key);
                 }
             }
@@ -849,6 +1180,60 @@ mod linux {
             })
     }
 
+    /// `pid`'s executable and argv, `None` when either can't be read or the
+    /// argv is longer than [`ARGV_BYTES`].
+    fn proc_facts(pid: u32) -> Option<ProcFacts> {
+        let exe = exe_id(pid)?;
+        let mut bytes = Vec::new();
+        std::fs::File::open(format!("/proc/{pid}/cmdline"))
+            .ok()?
+            .take(ARGV_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() as u64 > ARGV_BYTES {
+            return None;
+        }
+        if bytes.last() == Some(&0) {
+            bytes.pop();
+        }
+        let argv = bytes
+            .split(|b| *b == 0)
+            .map(|arg| OsStr::from_bytes(arg).to_os_string())
+            .collect();
+        Some(ProcFacts { exe, argv })
+    }
+
+    /// The executable a shell (or the deck's spawn) runs for `program` with
+    /// `path` as its `PATH`: an absolute path as it is, a bare name by the
+    /// first directory holding an executable file of that name. A relative
+    /// path, or a relative or empty `PATH` entry reached before a match,
+    /// resolves nothing: what it names depends on a directory binding
+    /// doesn't read.
+    fn resolve_program(program: &OsStr, path: Option<&OsStr>) -> Option<FileId> {
+        let file = |candidate: &std::path::Path| {
+            std::fs::metadata(candidate)
+                .ok()
+                .filter(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .map(|m| FileId {
+                    dev: m.dev(),
+                    ino: m.ino(),
+                })
+        };
+        let named = std::path::Path::new(program);
+        if program.as_bytes().contains(&b'/') {
+            return named.is_absolute().then(|| file(named)).flatten();
+        }
+        for dir in std::env::split_paths(path?) {
+            if !dir.is_absolute() {
+                return None;
+            }
+            if let Some(found) = file(&dir.join(program)) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
     fn exited(pidfd: &OwnedFd) -> bool {
         LinuxKernel::default().exited(pidfd).unwrap_or(true)
     }
@@ -867,7 +1252,7 @@ mod linux {
         }
     }
 
-    /// `A`'s children, from every thread's `children` file.
+    /// A process's children, from every thread's `children` file.
     fn children(pid: u32) -> Vec<u32> {
         let mut found = Vec::new();
         let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
@@ -884,6 +1269,13 @@ mod linux {
         found.sort_unstable();
         found.dedup();
         found
+    }
+
+    /// A marker read of an exited record's helper: its marker names, and
+    /// whether the read was complete.
+    struct MarkerRead {
+        mine: Vec<(String, record::Marker)>,
+        complete: bool,
     }
 
     impl Observer {
@@ -910,6 +1302,7 @@ mod linux {
             };
             let reader = InstanceReader::open(installation.instance_dir()).ok()?;
             let helper_id = installation.helper_id();
+            let launch = installation.launch().to_vec();
             if !spawned
                 .input
                 .attach_records(Records::new(generation, EC_POLICY, Instant::now()))
@@ -925,9 +1318,12 @@ mod linux {
                 kind,
                 env: spawned.env,
                 child: spawned.child,
+                launch,
                 reader,
                 helper_id,
                 latch: spawned.latch,
+                assumed: spawned.assumed,
+                settling: SettleClaim::default(),
                 inner: Mutex::new(Inner {
                     seam: Seam::new(generation, spawned.input, installation.into_files()),
                     watch: Watch::default(),
@@ -951,6 +1347,36 @@ mod linux {
             self.stopped
                 .store(true, std::sync::atomic::Ordering::Release);
             self.bell.ring();
+        }
+
+        /// The generation's input, its records attached.
+        pub fn input(&self) -> Arc<GenerationInput> {
+            Arc::clone(self.lock().seam.input())
+        }
+
+        /// The generation's permission as settled so far.
+        pub fn permission(&self) -> Permission {
+            self.lock().seam.permission()
+        }
+
+        /// `A`, once the permission settled `Armable` with it bound.
+        pub fn bound_agent(&self) -> Option<Identity> {
+            self.lock().watch.agent.clone()
+        }
+
+        /// `key`'s exit facts once its record drained: the record's own while
+        /// it stays, the kept copy once it went.
+        pub fn exit_fact(&self, key: RecordKey) -> Option<ExitFact> {
+            let inner = self.lock();
+            inner.seam.input().record_fact(key).or_else(|| {
+                inner
+                    .watch
+                    .facts
+                    .iter()
+                    .rev()
+                    .find(|f| f.key == key)
+                    .copied()
+            })
         }
 
         fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -1023,7 +1449,8 @@ mod linux {
         /// A composer connection's capability question (Q81): pin its peer by
         /// `SO_PEERPIDFD`, and register it when the peer runs this
         /// instance's helper copy and the budgets allow. `None` gets no
-        /// capability.
+        /// capability. A helper whose exit was already observed is departed
+        /// from the start.
         pub fn connect(
             self: &Arc<Self>,
             peer: std::io::Result<Option<OwnedFd>>,
@@ -1034,17 +1461,38 @@ mod linux {
                 return None;
             }
             let slot = Slot::take(&self.connections, &CONNECTIONS)?;
-            *self.lock().watch.open.entry(key_of(&helper)).or_default() += 1;
+            let key = key_of(&helper);
+            let departure = Arc::new(Departure::default());
+            {
+                let mut inner = self.lock();
+                if inner
+                    .seam
+                    .input()
+                    .record(key)
+                    .is_some_and(|r| r.exit_observed.is_some())
+                {
+                    departure.depart();
+                }
+                inner
+                    .watch
+                    .open
+                    .entry(key)
+                    .or_default()
+                    .push(Arc::clone(&departure));
+            }
             Some(Connection {
                 observer: Arc::clone(self),
                 helper,
+                departure,
                 _slot: slot,
             })
         }
 
         /// An invocation on `conn` (core §2.3–§2.4): attested off the lock,
         /// then recorded and settled under it, the epoch moved for a
-        /// non-`Armed` decision. The helper's pidfd is kept for its exit.
+        /// non-`Armed` decision. The helper's pidfd is kept for its exit, and
+        /// E2 may signal it: the connection's peer pidfd named this
+        /// instance's helper copy.
         pub fn invocation(
             &self,
             conn: &Connection,
@@ -1054,25 +1502,38 @@ mod linux {
                 return ComposerOutcome::Uncertain;
             }
             let evidence = self.attest(&conn.helper, Some(&request.argv));
-            let outcome = {
+            let key = key_of(&conn.helper);
+            let (outcome, late) = {
                 let mut inner = self.lock();
+                let late = evidence.is_some() && inner.seam.late(key);
                 let outcome = inner.seam.invocation(request, evidence, Instant::now());
-                let key = key_of(&conn.helper);
                 if evidence.is_some()
-                    && inner.seam.input().record(key).is_some()
-                    && !inner.watch.pins.contains_key(&key)
-                    && let Ok(pidfd) = conn.helper.pidfd().try_clone()
+                    && unexited(&inner, key)
+                    && let Ok(fd) = conn.helper.pidfd().try_clone()
                 {
-                    inner.watch.pins.insert(key, pidfd);
+                    hold(&mut inner.watch, key, fd, true);
                 }
-                outcome
+                (outcome, late)
             };
+            if late {
+                self.log_late(key, Channel::Ipc, super::decision(request.decision));
+            }
             self.bell.ring();
             outcome
         }
 
-        /// The report a helper sent after its editor, on `conn`.
+        /// The report a helper sent after its editor, on `conn`. A failed
+        /// start is logged with its errno and no path (amendment 6 §2.2).
         pub fn report(&self, conn: &Connection, report: EditorReport) {
+            if let EditorReport::SpawnFailed { errno } = report {
+                tracing::info!(
+                    target: "composer_probe",
+                    agent_id = %self.agent_id,
+                    pid = conn.helper.pid,
+                    errno,
+                    "editor helper couldn't start the editor"
+                );
+            }
             self.lock()
                 .seam
                 .report(key_of(&conn.helper), report, Instant::now());
@@ -1099,38 +1560,50 @@ mod linux {
             result
         }
 
-        /// `A` for a direct Claude: the PTY child, or, when the deck ran the
-        /// command under its shell's `-c` and that shell didn't `exec` it,
-        /// the shell's one child; pinned, with its family read from its
-        /// executable. `Err(true)` when it exited.
+        /// `A` for a direct Claude, from the deck's own launch record
+        /// ([`bound_agent`], Q84): the PTY child, pinned by the pid and start
+        /// ticks the deck spawned, or its one child when the deck's shell
+        /// runs it; pinned, its facts read again after the pin and its
+        /// family read from its executable. `Err(true)` when it, or the PTY
+        /// child, exited.
         fn bind(&self) -> Result<Identity, bool> {
-            let (pid, start) = match (self.class, self.child) {
+            let (pty_pid, pty_start) = match (self.class, self.child) {
                 (PaneClass::Direct(ProbeAgent::Claude), Some(child)) => child,
                 _ => return Err(false),
             };
-            let shell = std::fs::read_link(format!("/proc/{pid}/exe"))
-                .ok()
-                .and_then(|exe| exe.file_name().map(|n| n.to_os_string()))
-                .is_some_and(|name| {
-                    crate::composer_probe::install::SHELLS
-                        .iter()
-                        .any(|shell| name == *shell)
-                });
-            let (pid, start) = if shell {
-                let below = children(pid);
-                let [only] = below.as_slice() else {
-                    return Err(false);
-                };
-                let mut kernel = LinuxKernel::default();
-                let stat = kernel.stat(*only).map_err(|_| false)?;
-                if stat.ppid != pid {
-                    return Err(false);
-                }
-                (*only, stat.start)
-            } else {
-                (pid, start)
-            };
             let mut kernel = LinuxKernel::default();
+            let pty_pin = attest::pin(
+                &mut kernel,
+                Sighting::Pid {
+                    pid: pty_pid,
+                    start: Some(pty_start),
+                },
+            )
+            .map_err(|why| why == attest::Unpinned::Exited)?;
+            let pty = proc_facts(pty_pid).ok_or(false)?;
+            let below: Vec<(u32, ProcFacts)> = children(pty_pid)
+                .into_iter()
+                .filter(|c| kernel.stat(*c).is_ok_and(|stat| stat.ppid == pty_pid))
+                .filter_map(|c| Some((c, proc_facts(c)?)))
+                .collect();
+            let path = self.env_value("PATH");
+            let chosen = bound_agent(&self.launch, &pty, &below, |program| {
+                resolve_program(program, path.as_deref())
+            });
+            // The reads were the PTY child's: it was alive after them.
+            if kernel.exited(pty_pin.pidfd()).unwrap_or(true) {
+                return Err(true);
+            }
+            let (pid, start, facts) = match chosen.ok_or(false)? {
+                Bound::Pty => (pty_pid, pty_start, pty),
+                Bound::Child(pid) => {
+                    let facts = below
+                        .into_iter()
+                        .find_map(|(c, facts)| (c == pid).then_some(facts))
+                        .ok_or(false)?;
+                    (pid, kernel.stat(pid).map_err(|_| false)?.start, facts)
+                }
+            };
             let pinned = attest::pin(
                 &mut kernel,
                 Sighting::Pid {
@@ -1139,14 +1612,17 @@ mod linux {
                 },
             )
             .map_err(|why| why == attest::Unpinned::Exited)?;
+            // What was bound is what is pinned.
+            if proc_facts(pid).as_ref() != Some(&facts) {
+                return Err(false);
+            }
             let exe = std::fs::read_link(format!("/proc/{pid}/exe")).map_err(|_| false)?;
-            let exe_file = exe_id(pid).ok_or(false)?;
             let root = exe.parent().ok_or(false)?.to_path_buf();
             let root_meta = std::fs::metadata(&root).map_err(|_| false)?;
             let identity = Identity {
                 pid,
                 start,
-                exe: exe_file,
+                exe: facts.exe,
                 install_root: root,
                 install_root_id: FileId {
                     dev: root_meta.dev(),
@@ -1166,8 +1642,16 @@ mod linux {
 
         /// Plan §1.2's permission, once the header latched: with the e2e
         /// assumption's records in the `e2e` build. An armable generation
-        /// gets `gen-G`, and one whose file can't be written is inert.
+        /// gets `gen-G`, and one whose file can't be written is inert. One
+        /// settler at a time ([`SettleClaim`], Q84): it computes and writes
+        /// with no lock held, and publishes the permission with `A` under
+        /// the seam lock only if the permission was still pending, so the
+        /// identity file is written once, by the one settlement that wins,
+        /// and nothing replaces what it published.
         fn settle_permission(&self) {
+            let Some(_settling) = self.settling.claim() else {
+                return;
+            };
             if self.lock().seam.permission() != Permission::Pending {
                 return;
             }
@@ -1184,14 +1668,13 @@ mod linux {
             };
             let records = crate::doorbell_activation::with_assumed_editor_probes(
                 crate::doorbell_activation::RELEASE_RECORDS.to_vec(),
-                crate::composer_probe::install::captured_assumption(),
+                self.assumed,
             );
             let mut permission =
                 crate::composer_probe::permission(&records, agent, header.as_ref(), binding);
             if permission == Permission::Armable
                 && let Some(identity) = &identity
-                && let Err(cause) =
-                    crate::composer_probe::install::write_identity(&self.name(), identity)
+                && let Err(cause) = self.reader.write_identity(&self.name(), identity)
             {
                 tracing::warn!(
                     target: "composer_probe",
@@ -1201,7 +1684,15 @@ mod linux {
                 );
                 permission = Permission::Inert(InertCause::Unbound);
             }
-            if permission != Permission::Pending {
+            let won = {
+                let mut inner = self.lock();
+                let won = inner.seam.set_permission(permission);
+                if won && permission == Permission::Armable {
+                    inner.watch.agent = identity;
+                }
+                won
+            };
+            if won {
                 tracing::info!(
                     target: "composer_probe",
                     agent_id = %self.agent_id,
@@ -1209,11 +1700,19 @@ mod linux {
                     "editor probe permission settled"
                 );
             }
-            let mut inner = self.lock();
-            inner.seam.set_permission(permission);
-            if inner.seam.permission() == Permission::Armable {
-                inner.watch.agent = identity;
-            }
+        }
+
+        /// A decision that came after its record's exit drained: ignored by
+        /// the records, logged here with no lock held.
+        fn log_late(&self, key: RecordKey, channel: Channel, decided: record::Decision) {
+            tracing::warn!(
+                target: "composer_probe",
+                agent_id = %self.agent_id,
+                pid = key.pid,
+                ?channel,
+                ?decided,
+                "editor helper decision after its exit settled; ignored"
+            );
         }
 
         /// Whether the next wait is a scan's period.
@@ -1244,12 +1743,13 @@ mod linux {
             }
             self.markers(&mut budget);
             self.exits();
-            self.drains();
+            self.drains(&mut budget);
             self.kills();
         }
 
         /// The child scan: this instance's helper copies among `A`'s
-        /// children, each attested and observed once.
+        /// children, each attested and observed once. A pin a marker made
+        /// for one of them is replaced by the scan's, which E2 may signal.
         fn scan(&self, a: u32, budget: &mut u32) {
             for pid in children(a) {
                 if exe_id(pid) != Some(self.helper_id) {
@@ -1265,8 +1765,14 @@ mod linux {
                     continue;
                 }
                 let key = key_of(&helper);
-                if self.lock().seam.input().record(key).is_some() {
-                    continue;
+                {
+                    let mut inner = self.lock();
+                    if inner.seam.input().record(key).is_some() {
+                        if inner.watch.pins.get(&key).is_some_and(|p| !p.killable) {
+                            hold(&mut inner.watch, key, helper.into_pidfd(), true);
+                        }
+                        continue;
+                    }
                 }
                 if *budget == 0 {
                     return;
@@ -1279,10 +1785,8 @@ mod linux {
                     Some(e) => {
                         let obs =
                             scan_observation(self.generation, e.key, e.attribution, e.birth_floor);
-                        if inner.seam.observe(&obs, now).is_ok()
-                            && inner.seam.input().record(key).is_some()
-                        {
-                            inner.watch.pins.insert(key, helper.into_pidfd());
+                        if inner.seam.observe(&obs, now).is_ok() && unexited(&inner, key) {
+                            hold(&mut inner.watch, key, helper.into_pidfd(), true);
                         }
                     }
                     None => {
@@ -1300,15 +1804,14 @@ mod linux {
                 return;
             };
             if more {
-                let mut inner = self.lock();
-                if !inner.watch.marker_overflow {
+                let first = !std::mem::replace(&mut self.lock().watch.marker_overflow, true);
+                if first {
                     tracing::warn!(
                         target: "composer_probe",
                         agent_id = %self.agent_id,
                         "more editor helper markers than a pass reads"
                     );
                 }
-                inner.watch.marker_overflow = true;
             }
             for file in names {
                 let Some(marker) = record::parse_marker(&file) else {
@@ -1324,6 +1827,9 @@ mod linux {
             }
         }
 
+        /// Apply one marker. A marker reports a decision for the process its
+        /// name gives; it never makes that process one E2 may signal (Q84):
+        /// a pin taken from its name only watches the exit.
         fn apply_marker(&self, name: &str, file: &str, marker: &record::Marker, budget: &mut u32) {
             let known = self.lock().seam.input().record(marker.key);
             let mut kernel = LinuxKernel::default();
@@ -1356,8 +1862,9 @@ mod linux {
                 (Err(_), None) => None,
             };
             let now = Instant::now();
-            {
+            let late = {
                 let mut inner = self.lock();
+                let late = evidence.is_some() && inner.seam.late(marker.key);
                 match evidence {
                     Some(e) => {
                         let obs = marker_observation(
@@ -1368,11 +1875,9 @@ mod linux {
                         );
                         let _ = inner.seam.observe(&obs, now);
                         if let Ok(helper) = pinned
-                            && inner.seam.input().record(marker.key).is_some()
-                            && !inner.watch.pins.contains_key(&marker.key)
-                            && !inner.watch.exited.contains_key(&marker.key)
+                            && unexited(&inner, marker.key)
                         {
-                            inner.watch.pins.insert(marker.key, helper.into_pidfd());
+                            hold(&mut inner.watch, marker.key, helper.into_pidfd(), false);
                         }
                     }
                     None => {
@@ -1382,6 +1887,10 @@ mod linux {
                                 .refused(Channel::Marker, Some(marker.decision), None, now);
                     }
                 }
+                late
+            };
+            if late {
+                self.log_late(marker.key, Channel::Marker, marker.decision);
             }
             if let Err(error) = self.reader.mark_seen(name, file) {
                 tracing::debug!(
@@ -1393,110 +1902,227 @@ mod linux {
             }
         }
 
-        /// Exits: a pinned helper whose pidfd reads ready.
+        /// Exits: a pinned helper whose pidfd reads ready. Its connections
+        /// are told, so each reads what is pending for the read deadline.
         fn exits(&self) {
             let mut inner = self.lock();
             let gone: Vec<RecordKey> = inner
                 .watch
                 .pins
                 .iter()
-                .filter(|(_, fd)| exited(fd))
+                .filter(|(_, pin)| exited(&pin.fd))
                 .map(|(k, _)| *k)
                 .collect();
             for key in gone {
                 inner.watch.pins.remove(&key);
                 let at = Instant::now();
                 if inner.seam.exit(key, at, at).is_ok() {
-                    inner.watch.exited.insert(key, at);
+                    inner.watch.exited.insert(key, 0);
+                    for departure in inner.watch.open.get(&key).into_iter().flatten() {
+                        departure.depart();
+                    }
                 }
             }
         }
 
-        /// Drains: an exited record with its evidence drained is settled by
-        /// its exit, its facts kept, and pruned once it may go. One whose
-        /// connection is still open within the read deadline is
-        /// rescheduled.
-        fn drains(&self) {
+        /// This pass's read of `key`'s markers for its drain: complete only
+        /// when the directory read neither failed nor overflowed and every
+        /// marker of `key`'s not yet seen was applied within `budget`.
+        fn drain_markers(
+            &self,
+            listing: &std::io::Result<(Vec<String>, bool)>,
+            key: RecordKey,
+            budget: &mut u32,
+        ) -> MarkerRead {
             let name = self.name();
-            let ready: Vec<RecordKey> = {
+            let Ok((names, more)) = listing else {
+                return MarkerRead {
+                    mine: Vec::new(),
+                    complete: false,
+                };
+            };
+            let mine: Vec<(String, record::Marker)> = names
+                .iter()
+                .filter_map(|n| record::parse_marker(n).map(|m| (n.clone(), m)))
+                .filter(|(_, m)| m.key == key)
+                .collect();
+            let mut complete = !more;
+            for (file, marker) in mine.iter().filter(|(_, m)| !m.renamed) {
+                if *budget == 0 {
+                    complete = false;
+                    break;
+                }
+                self.apply_marker(&name, file, marker, budget);
+            }
+            MarkerRead { mine, complete }
+        }
+
+        /// Drains (core §2.4, Q84): an exited record settles by its exit only
+        /// once every composer connection of its helper finished and this
+        /// pass read its markers completely. Otherwise it is rescheduled; a
+        /// record still unread after [`super::DRAIN_RETRIES`] passes gives up
+        /// to the uncertain outcome and keeps its markers and its record. A
+        /// settled one's markers are deleted with no lock held, and it is
+        /// pruned, its facts kept, once it may go.
+        fn drains(&self, budget: &mut u32) {
+            let name = self.name();
+            let waiting: Vec<(RecordKey, u32, u32)> = {
                 let inner = self.lock();
-                let now = Instant::now();
                 inner
                     .watch
                     .exited
                     .iter()
-                    .filter(|(key, at)| {
-                        drain_ready(inner.watch.open.get(key).copied().unwrap_or(0), **at, now)
+                    .map(|(key, retries)| {
+                        let open = inner.watch.open.get(key).map_or(0, Vec::len);
+                        (*key, u32::try_from(open).unwrap_or(u32::MAX), *retries)
                     })
-                    .map(|(k, _)| *k)
                     .collect()
             };
-            if ready.is_empty() {
+            if waiting.is_empty() {
                 return;
             }
             // The markers again, before any settles by its exit.
-            let names = self
-                .reader
-                .markers(&name, MARKER_NAMES_PER_PASS)
-                .map(|(names, _)| names)
-                .unwrap_or_default();
-            for key in ready {
-                let mine: Vec<(String, record::Marker)> = names
-                    .iter()
-                    .filter_map(|n| record::parse_marker(n).map(|m| (n.clone(), m)))
-                    .filter(|(_, m)| m.key == key)
-                    .collect();
-                let mut budget = u32::MAX;
-                for (file, marker) in mine.iter().filter(|(_, m)| !m.renamed) {
-                    self.apply_marker(&name, file, marker, &mut budget);
-                }
-                let mut inner = self.lock();
+            let listing = waiting
+                .iter()
+                .any(|(_, open, _)| *open == 0)
+                .then(|| self.reader.markers(&name, MARKER_NAMES_PER_PASS));
+            for (key, open, retries) in waiting {
+                let read = match &listing {
+                    Some(listing) if open == 0 => self.drain_markers(listing, key, budget),
+                    _ => MarkerRead {
+                        mine: Vec::new(),
+                        complete: false,
+                    },
+                };
                 let now = Instant::now();
-                let Ok(drained) = inner.seam.drained(key, now) else {
-                    inner.watch.exited.remove(&key);
-                    continue;
-                };
-                inner.watch.exited.remove(&key);
-                let deleted = mine.iter().all(|(file, m)| {
-                    let seen = if m.renamed {
-                        file.clone()
-                    } else {
-                        format!("{file}.seen")
-                    };
-                    self.reader.remove_marker(&name, file).is_ok()
-                        && self.reader.remove_marker(&name, &seen).is_ok()
-                });
-                let fact = match inner.seam.prune(key, deleted, now) {
-                    Ok(Some(last)) => last,
-                    _ => inner.seam.input().record_fact(key).unwrap_or(drained.fact),
-                };
-                let facts = &mut inner.watch.facts;
-                facts.retain(|f| f.key != key);
-                if facts.len() == FACTS_KEPT {
-                    facts.pop_front();
+                match drain_step(open, read.complete, retries) {
+                    DrainStep::Wait => {
+                        if let Some(retries) = self.lock().watch.exited.get_mut(&key) {
+                            *retries += 1;
+                        }
+                    }
+                    DrainStep::GiveUp => {
+                        let mut inner = self.lock();
+                        inner.watch.exited.remove(&key);
+                        let _ = inner.seam.drained_uncertain(key, now);
+                        drop(inner);
+                        tracing::warn!(
+                            target: "composer_probe",
+                            agent_id = %self.agent_id,
+                            pid = key.pid,
+                            open,
+                            "editor helper's decision evidence not all read after its exit; \
+                             settled as uncertain"
+                        );
+                    }
+                    DrainStep::Settle => {
+                        let drained = {
+                            let mut inner = self.lock();
+                            inner.watch.exited.remove(&key);
+                            inner.seam.drained(key, now)
+                        };
+                        let Ok(drained) = drained else {
+                            continue;
+                        };
+                        let deleted = read.mine.iter().all(|(file, m)| {
+                            let seen = if m.renamed {
+                                file.clone()
+                            } else {
+                                format!("{file}.seen")
+                            };
+                            self.reader.remove_marker(&name, file).is_ok()
+                                && self.reader.remove_marker(&name, &seen).is_ok()
+                        });
+                        let mut inner = self.lock();
+                        let fact = match inner.seam.prune(key, deleted, Instant::now()) {
+                            Ok(Some(last)) => last,
+                            _ => inner.seam.input().record_fact(key).unwrap_or(drained.fact),
+                        };
+                        let facts = &mut inner.watch.facts;
+                        facts.retain(|f| f.key != key);
+                        if facts.len() == FACTS_KEPT {
+                            facts.pop_front();
+                        }
+                        facts.push_back(fact);
+                    }
                 }
-                facts.push_back(fact);
             }
         }
 
-        /// E2 (core §5.4): an `Armed` helper alive past its bound.
+        /// E2 (core §5.4, Q84): an `Armed` helper alive past its bound, held
+        /// by a pin E2 may signal, and still running this instance's helper
+        /// copy (its executable read first, its liveness after, so the read
+        /// was the pinned process's). Each check after the first is made
+        /// with no lock held; one that no longer runs the helper copy is
+        /// never signalled.
         fn kills(&self) {
-            let inner = self.lock();
-            let now = Instant::now();
-            for (key, pidfd) in &inner.watch.pins {
-                let Some(r) = inner.seam.input().record(*key) else {
-                    continue;
-                };
-                if e2_due(&r, now) && !exited(pidfd) {
-                    let killed = kill(pidfd);
+            let due: Vec<(RecordKey, OwnedFd)> = {
+                let inner = self.lock();
+                let now = Instant::now();
+                inner
+                    .watch
+                    .pins
+                    .iter()
+                    .filter(|(key, pin)| {
+                        pin.killable
+                            && inner
+                                .seam
+                                .input()
+                                .record(**key)
+                                .is_some_and(|r| e2_due(&r, now))
+                    })
+                    .filter_map(|(key, pin)| Some((*key, pin.fd.try_clone().ok()?)))
+                    .collect()
+            };
+            for (key, fd) in due {
+                if exe_id(key.pid) != Some(self.helper_id) {
+                    if exited(&fd) {
+                        continue;
+                    }
+                    if let Some(pin) = self.lock().watch.pins.get_mut(&key) {
+                        pin.killable = false;
+                    }
                     tracing::warn!(
                         target: "composer_probe",
                         agent_id = %self.agent_id,
                         pid = key.pid,
-                        killed,
-                        "editor helper still alive after its armed bound; killed"
+                        "editor helper alive after its armed bound no longer runs the helper; \
+                         not killed"
                     );
+                    continue;
                 }
+                if exited(&fd) {
+                    continue;
+                }
+                let killed = kill(&fd);
+                tracing::warn!(
+                    target: "composer_probe",
+                    agent_id = %self.agent_id,
+                    pid = key.pid,
+                    killed,
+                    "editor helper still alive after its armed bound; killed"
+                );
+            }
+        }
+    }
+
+    /// Whether `key` has a record whose exit isn't observed yet: only such a
+    /// helper is pinned, so an exit is observed, and drained, once.
+    fn unexited(inner: &Inner, key: RecordKey) -> bool {
+        inner
+            .seam
+            .input()
+            .record(key)
+            .is_some_and(|r| r.exit_observed.is_none())
+    }
+
+    /// Hold `key`'s helper by `fd`: a pin E2 may signal replaces one it may
+    /// not, and nothing else replaces a pin.
+    fn hold(watch: &mut Watch, key: RecordKey, fd: OwnedFd, killable: bool) {
+        match watch.pins.get(&key) {
+            Some(pin) if pin.killable || !killable => {}
+            _ => {
+                watch.pins.insert(key, Pin { fd, killable });
             }
         }
     }

@@ -399,20 +399,29 @@ impl Instance {
     /// absolute path that, read now, is a directory with the recorded
     /// `(dev, ino)`; otherwise nothing is written (R35CODE4-U2-02).
     pub fn write_identity(&self, generation: &str, identity: &Identity) -> Result<(), SetupError> {
-        let name = generation_file("gen", generation)?;
-        if decode_identity(encode_identity(identity).as_bytes()).as_ref() != Some(identity) {
-            return Err(SetupError::InstallRoot);
-        }
-        let root =
-            std::fs::metadata(&identity.install_root).map_err(|_| SetupError::InstallRoot)?;
-        if !root.is_dir() || file_id(&root) != identity.install_root_id {
-            return Err(SetupError::InstallRoot);
-        }
-        create_file_at(self.dir_fd.as_fd(), &name, 0o400)
-            .map_err(exists_is_generation)?
-            .write_all(encode_identity(identity).as_bytes())?;
-        Ok(())
+        write_identity_at(self.dir_fd.as_fd(), generation, identity)
     }
+}
+
+/// `gen-G` written once in the instance directory `dir`, as
+/// [`Instance::write_identity`] says.
+fn write_identity_at(
+    dir: BorrowedFd<'_>,
+    generation: &str,
+    identity: &Identity,
+) -> Result<(), SetupError> {
+    let name = generation_file("gen", generation)?;
+    if decode_identity(encode_identity(identity).as_bytes()).as_ref() != Some(identity) {
+        return Err(SetupError::InstallRoot);
+    }
+    let root = std::fs::metadata(&identity.install_root).map_err(|_| SetupError::InstallRoot)?;
+    if !root.is_dir() || file_id(&root) != identity.install_root_id {
+        return Err(SetupError::InstallRoot);
+    }
+    create_file_at(dir, &name, 0o400)
+        .map_err(exists_is_generation)?
+        .write_all(encode_identity(identity).as_bytes())?;
+    Ok(())
 }
 
 /// A setup error as the I/O error it came from, for a reader.
@@ -533,6 +542,13 @@ impl InstanceReader {
     /// `daemon`.
     pub fn daemon(&self) -> Option<DaemonId> {
         DaemonId::decode(&self.read(&cstring(DAEMON_FILE)).ok()??)
+    }
+
+    /// Write `gen-G` once, through this reader's directory: the daemon's
+    /// observer of the generation does it at `Armable` (Q35-14b), as
+    /// [`Instance::write_identity`] says.
+    pub fn write_identity(&self, generation: &str, identity: &Identity) -> Result<(), SetupError> {
+        write_identity_at(self.dir_fd.as_fd(), generation, identity)
     }
 
     /// `gen-G`: `None` when it is absent, unreadable or malformed.

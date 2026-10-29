@@ -11,12 +11,14 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use dot_agent_deck::composer_probe::classifier::FileId;
 use dot_agent_deck::composer_probe::epoch::GenerationInput;
 use dot_agent_deck::composer_probe::observe::{
-    Bell, ControlOp, ControlRefusal, ControlStep, E2_AFTER, Evidence, Page, Pool, READ_DEADLINE,
-    Seam, Slot, TestLiability, birth_floor, drain_ready, e2_due, marker_observation, outcome,
-    report, scan_observation,
+    Bell, ControlOp, ControlRefusal, ControlStep, DRAIN_RETRIES, Departure, DrainStep, E2_AFTER,
+    Evidence, Page, Pool, READ_DEADLINE, Seam, SettleClaim, Slot, TestLiability, birth_floor,
+    drain_step, e2_due, marker_observation, outcome, report, scan_observation,
 };
+use dot_agent_deck::composer_probe::observe::{Bound, ProcFacts, bound_agent, shell_words};
 use dot_agent_deck::composer_probe::record::{
     Attribution, Cause, Decision, EcPolicy, Marker, NotConsumed, NotOwned, RecordKey, Recorded,
     Records, Refusal, Report, ScopeState, Settlement, Tree,
@@ -303,19 +305,28 @@ fn probe_070_each_budget_holds_per_generation_and_in_total() {
     assert!(Pool::new(0).used() == 0 && !Pool::new(0).take());
 }
 
-/// Scenario: Ask whether an exited helper's drain may settle: with a connection open it is rescheduled until the read deadline has passed since its exit, and settles at once with none open. Then drive a decisionless `Owned` helper through the seam: born after a liability was published, its exit observed, and not drained, it stays open and consumes nothing; drained once, its exit consumes the liability and the page follows; drained again, nothing moves.
+/// Scenario: Ask the drain what to do with an exited helper: with a connection of its not finished, or its markers not read completely, it is rescheduled however long ago the exit was, and only once its retries are spent does it give up to the uncertain outcome; with neither it settles. Then drive a decisionless `Owned` helper through the seam: born after a liability was published, its exit observed, and not drained, it stays open and consumes nothing; drained once, its exit consumes the liability and the page follows; drained again, nothing moves.
 #[spec("inbox/probe/070")]
 #[test]
 fn probe_070_the_drain_reschedules_while_evidence_is_undrained() {
-    let exited = Instant::now();
-    assert!(!drain_ready(1, exited, exited));
-    assert!(!drain_ready(
-        2,
-        exited,
-        exited + READ_DEADLINE - Duration::from_millis(1)
-    ));
-    assert!(drain_ready(1, exited, exited + READ_DEADLINE));
-    assert!(drain_ready(0, exited, exited));
+    assert_eq!(drain_step(0, true, 0), DrainStep::Settle);
+    assert_eq!(drain_step(0, true, DRAIN_RETRIES + 5), DrainStep::Settle);
+    for (open, markers_read) in [(1, true), (2, true), (0, false), (1, false)] {
+        assert_eq!(
+            drain_step(open, markers_read, 0),
+            DrainStep::Wait,
+            "no timer settles: {open} open, markers read {markers_read}"
+        );
+        assert_eq!(
+            drain_step(open, markers_read, DRAIN_RETRIES - 1),
+            DrainStep::Wait
+        );
+        assert_eq!(
+            drain_step(open, markers_read, DRAIN_RETRIES),
+            DrainStep::GiveUp,
+            "never Settle while evidence is unread"
+        );
+    }
 
     let mut s = seam(Permission::Armable);
     assert_eq!(s.control(G, ControlOp::Publish), Ok(1));
@@ -777,4 +788,324 @@ fn probe_069_the_floor_the_refusal_the_prune_and_the_bell() {
         parked.join().unwrap() < Duration::from_secs(4),
         "a scan wakes it too"
     );
+}
+
+/// Scenario: A connection's departure is marked when its helper's exit is observed: a waiter started before the mark and one started after it both resolve, and the read deadline resolves no sooner than `READ_DEADLINE` after the mark; with no mark, neither resolves.
+#[spec("inbox/probe/070")]
+#[test]
+fn probe_070_a_departure_wakes_its_connection_then_waits_the_read_deadline() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let quiet = Departure::default();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), quiet.read_deadline())
+                .await
+                .is_err(),
+            "no exit observed: no deadline"
+        );
+
+        let departure = Arc::new(Departure::default());
+        let early = tokio::spawn({
+            let departure = Arc::clone(&departure);
+            async move { departure.wait().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!departure.departed());
+        let marked = Instant::now();
+        departure.depart();
+        let within = Duration::from_secs(2);
+        tokio::time::timeout(within, early)
+            .await
+            .expect("a waiter from before the mark wakes")
+            .unwrap();
+        tokio::time::timeout(within, departure.wait())
+            .await
+            .expect("a waiter from after the mark resolves");
+        tokio::time::timeout(within, departure.read_deadline())
+            .await
+            .expect("the read deadline resolves");
+        assert!(marked.elapsed() >= READ_DEADLINE);
+    });
+}
+
+/// Scenario: Settle an `Owned`, decisionless helper's exit whose interval proof holds, once with its evidence read (the control: it consumes) and once given up with evidence unread: the second consumes nothing, settles `NotConsumed(Unproven)`, opens the writer scope as unconfirmed, and moves no count. An `Armed` decision that arrives after either settlement is told the settled outcome (`Mine` for the consumption, `Uncertain` for the uncertain one) and changes nothing: no decision, no count.
+#[spec("inbox/probe/070")]
+#[test]
+fn probe_070_a_drain_given_up_never_consumes_and_a_late_decision_changes_nothing() {
+    for complete in [true, false] {
+        let mut s = seam(Permission::Armable);
+        assert_eq!(s.control(G, ControlOp::Publish), Ok(1));
+        let born = Instant::now();
+        s.observe(&scan_observation(G, key(1), Attribution::Owned, born), born)
+            .unwrap();
+        let exit = born + Duration::from_millis(5);
+        s.exit(key(1), exit, exit).unwrap();
+        assert!(!s.late(key(1)), "exited, not yet drained");
+        let drained = if complete {
+            s.drained(key(1), exit)
+        } else {
+            s.drained_uncertain(key(1), exit)
+        }
+        .unwrap();
+        if complete {
+            assert_eq!(drained.settlement, Settlement::Consumed);
+            assert_eq!(count(&s), 0);
+        } else {
+            assert_eq!(
+                drained.settlement,
+                Settlement::NotConsumed(NotConsumed::Unproven)
+            );
+            assert_eq!(count(&s), 1, "the liability stays");
+            assert_eq!(s.page().0, [1]);
+            assert_eq!(
+                s.input().writer_scope().unwrap().state(),
+                ScopeState::Open(Cause::EditorUnconfirmed)
+            );
+        }
+        assert!(s.late(key(1)), "a decision now comes after the drain");
+        assert!(!s.late(key(2)), "no record");
+        let before = count(&s);
+        let late = s.invocation(
+            &armed(),
+            Some(evidence(1, Attribution::Owned, Some(ExportRead::Empty))),
+            exit,
+        );
+        let settled = if complete {
+            ComposerOutcome::Mine {
+                read: ExportRead::Empty,
+            }
+        } else {
+            ComposerOutcome::Uncertain
+        };
+        assert_eq!(late, settled, "complete: {complete}");
+        assert_eq!(count(&s), before);
+        assert_eq!(s.input().record(key(1)).unwrap().decision, None);
+    }
+}
+
+/// Scenario: Two settlers race for a generation's permission behind a barrier: exactly one takes the claim at a time, failed attempts while it is held leave it held, a released claim can be taken again, and the seam moves out of `Pending` once, the second settlement (another permission) reporting it lost and changing nothing.
+#[spec("inbox/probe/073")]
+#[test]
+fn probe_073_the_permission_settles_once() {
+    let claim = Arc::new(SettleClaim::default());
+    for _ in 0..50 {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let both = Arc::new(std::sync::Barrier::new(2));
+        let racers: Vec<_> = (0..2)
+            .map(|_| {
+                let claim = Arc::clone(&claim);
+                let barrier = Arc::clone(&barrier);
+                let both = Arc::clone(&both);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let held = claim.claim();
+                    let won = held.is_some();
+                    // Both have tried before either lets go.
+                    both.wait();
+                    drop(held);
+                    won
+                })
+            })
+            .collect();
+        let won: Vec<bool> = racers.into_iter().map(|r| r.join().unwrap()).collect();
+        assert_eq!(won.iter().filter(|w| **w).count(), 1, "{won:?}");
+    }
+    let held = claim.claim().expect("released when dropped");
+    for _ in 0..3 {
+        assert!(
+            claim.claim().is_none(),
+            "a failed claim leaves the holder's in place"
+        );
+    }
+    drop(held);
+    assert!(claim.claim().is_some());
+
+    let mut s = seam(Permission::Pending);
+    assert!(
+        !s.set_permission(Permission::Pending),
+        "pending moves nothing"
+    );
+    assert!(s.set_permission(Permission::Armable));
+    assert!(!s.set_permission(Permission::Inert(InertCause::Unbound)));
+    assert_eq!(s.permission(), Permission::Armable);
+}
+
+fn id(ino: u64) -> FileId {
+    FileId { dev: 1, ino }
+}
+
+fn argv(words: &[&str]) -> Vec<std::ffi::OsString> {
+    words.iter().map(Into::into).collect()
+}
+
+fn facts(ino: u64, words: &[&str]) -> ProcFacts {
+    ProcFacts {
+        exe: id(ino),
+        argv: argv(words),
+    }
+}
+
+/// The executables a scripted `PATH` resolves: `/bin/sh` is 1, the real
+/// Claude 2, a user's launcher script named `claude` 3, a tool 4.
+fn resolve(program: &std::ffi::OsStr) -> Option<FileId> {
+    match program.to_str()? {
+        "/bin/sh" => Some(id(1)),
+        "/opt/claude/claude" | "claude" => Some(id(2)),
+        "/home/u/bin/claude" => Some(id(3)),
+        "/usr/bin/tool" => Some(id(4)),
+        _ => None,
+    }
+}
+
+/// Scenario: Split the command lines the deck's shell runs as the shell would, for the plain argv a direct agent's command is: quoted words keep their blanks and a `'\''` keeps its quote; every line the shell would expand, redirect, glob, chain or comment, a leading assignment, a line break or an unterminated quote gives no argv at all.
+#[spec("inbox/probe/073")]
+#[test]
+fn probe_073_shell_words_splits_only_a_plain_command() {
+    assert_eq!(
+        shell_words("claude --model haiku"),
+        Some(vec!["claude".into(), "--model".into(), "haiku".into()])
+    );
+    assert_eq!(
+        shell_words("  '/opt/my claude/claude'\t\"a b\" 'it'\\''s' x=y "),
+        Some(vec![
+            "/opt/my claude/claude".into(),
+            "a b".into(),
+            "it's".into(),
+            "x=y".into()
+        ])
+    );
+    assert_eq!(
+        shell_words("claude ''"),
+        Some(vec!["claude".into(), String::new()])
+    );
+    for refused in [
+        "",
+        "   ",
+        "claude $HOME",
+        "claude \"$HOME\"",
+        "claude `id`",
+        "claude; id",
+        "claude && id",
+        "claude | tee",
+        "claude > out",
+        "claude *",
+        "claude ?",
+        "claude [ab]",
+        "claude {a,b}",
+        "claude ~/x",
+        "claude # note",
+        "claude\nid",
+        "claude \\\nmore",
+        "X=1 claude",
+        "claude 'open",
+        "claude \"open",
+        "claude (x)",
+    ] {
+        assert_eq!(shell_words(refused), None, "{refused:?}");
+    }
+}
+
+/// Scenario: Bind `A` from the deck's own launch record over a scripted process table: the deck's direct launch, and its `sh -c` line whether the shell `exec`ed the agent or forked it as its one child, bind the agent; a user's launcher script named `claude` binds nothing, whether its child is the real Claude or a tool, and nor does a shell that is no longer the deck's, a child with other arguments or another executable, two children, a line the shell would expand, or a launch whose program is a shell.
+#[spec("inbox/probe/073")]
+#[test]
+fn probe_073_a_shells_child_is_bound_only_from_the_decks_own_launch() {
+    let line = "/opt/claude/claude --model haiku";
+    let deck_shell = argv(&["/bin/sh", "-c", line]);
+    let agent = facts(2, &["/opt/claude/claude", "--model", "haiku"]);
+    let shell = facts(1, &["/bin/sh", "-c", line]);
+
+    // The deck executed the agent itself, whatever its arguments.
+    let direct = argv(&["/opt/claude/claude", "--model", "haiku"]);
+    assert_eq!(bound_agent(&direct, &agent, &[], resolve), Some(Bound::Pty));
+    let flagged = argv(&["/opt/claude/claude", "-c", "haiku"]);
+    assert_eq!(
+        bound_agent(
+            &flagged,
+            &facts(2, &["/opt/claude/claude", "-c", "haiku"]),
+            &[],
+            resolve
+        ),
+        Some(Bound::Pty),
+        "a `-c` that isn't a shell's is the agent's own argument"
+    );
+    // The deck's shell exec'd it, or forked it as its only child.
+    assert_eq!(
+        bound_agent(&deck_shell, &agent, &[], resolve),
+        Some(Bound::Pty)
+    );
+    assert_eq!(
+        bound_agent(&deck_shell, &shell, &[(77, agent.clone())], resolve),
+        Some(Bound::Child(77))
+    );
+
+    // A user's launcher script named `claude`: its process runs the
+    // interpreter, so neither it nor its child is bound, whatever the child.
+    let launcher = argv(&["/home/u/bin/claude"]);
+    let script = facts(1, &["/bin/sh", "/home/u/bin/claude"]);
+    let real = facts(2, &["/opt/claude/claude"]);
+    let tool = facts(4, &["/usr/bin/tool"]);
+    assert_eq!(
+        bound_agent(&launcher, &script, &[(78, real.clone())], resolve),
+        None
+    );
+    assert_eq!(
+        bound_agent(&launcher, &script, &[(79, tool.clone())], resolve),
+        None
+    );
+    // The same launcher run under the deck's shell.
+    let launched = argv(&["/bin/sh", "-c", "/home/u/bin/claude"]);
+    let under = facts(1, &["/bin/sh", "/home/u/bin/claude"]);
+    assert_eq!(
+        bound_agent(&launched, &shell, &[(80, under.clone())], resolve),
+        None
+    );
+    assert_eq!(
+        bound_agent(&launched, &under, &[(81, real.clone())], resolve),
+        None
+    );
+
+    // The deck's shell, but not as it launched it, or not the one child.
+    let other_shell = facts(1, &["/bin/sh", "-c", "something else"]);
+    assert_eq!(
+        bound_agent(&deck_shell, &other_shell, &[(82, agent.clone())], resolve),
+        None
+    );
+    let other_args = facts(2, &["/opt/claude/claude", "--model", "opus"]);
+    assert_eq!(
+        bound_agent(&deck_shell, &shell, &[(83, other_args)], resolve),
+        None
+    );
+    let other_exe = facts(4, &["/opt/claude/claude", "--model", "haiku"]);
+    assert_eq!(
+        bound_agent(&deck_shell, &shell, &[(84, other_exe)], resolve),
+        None
+    );
+    assert_eq!(
+        bound_agent(
+            &deck_shell,
+            &shell,
+            &[(85, agent.clone()), (86, tool)],
+            resolve
+        ),
+        None
+    );
+    // A line the shell would expand, and a launch that is only a shell.
+    let expanded = argv(&["/bin/sh", "-c", "/opt/claude/claude $ARGS"]);
+    assert_eq!(bound_agent(&expanded, &shell, &[(87, real)], resolve), None);
+    assert_eq!(
+        bound_agent(&argv(&["/bin/sh"]), &shell, &[(88, agent.clone())], resolve),
+        None
+    );
+    let nested = argv(&["/bin/sh", "-c", "sh -c claude"]);
+    assert_eq!(
+        bound_agent(&nested, &shell, &[(89, agent.clone())], resolve),
+        None
+    );
+    // An unresolvable program binds nothing.
+    let unknown = argv(&["/nowhere/claude"]);
+    assert_eq!(bound_agent(&unknown, &agent, &[], resolve), None);
+    assert_eq!(bound_agent(&[], &agent, &[], resolve), None);
 }
