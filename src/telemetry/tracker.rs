@@ -284,8 +284,8 @@ struct PendingRun {
     /// The dispatched unit it belongs to, when known before it opens
     /// ([`RunTracker::begin_dispatch`]).
     dispatch_name: Option<String>,
-    /// Its git context is being resolved ([`RunTracker::set_context`]).
-    context_pending: bool,
+    /// The branch it starts on ([`RunTracker::set_branch`]).
+    branch: Option<String>,
 }
 
 /// What a prepared run holds of its hand-offs: see [`PendingRun::handoffs`].
@@ -399,38 +399,8 @@ struct ActiveRun {
     /// Issue #1981 M7: reports this run's agent received that named no task
     /// (`deck.handoffs.uncorrelated.count`).
     uncorrelated_reports: u64,
-    /// Its git context is being resolved: its span waits for it when the run
-    /// ends first ([`RunTracker::set_context`]).
-    context_pending: bool,
-}
-
-/// How long an ended run's span waits for its git context before it is sent
-/// without it: every probe's deadline, one after another, and a second more.
-pub const CONTEXT_WAIT_NANOS: u64 = (super::run_context::PROBE_DEADLINE.as_nanos() as u64)
-    * super::run_context::PROBES_PER_RUN
-    + 1_000_000_000;
-
-/// An ended run's span, ready to send, or to send once its usage is read.
-enum Ending {
-    Finished(SpanRecord),
-    Finishing(FinishingRun),
-}
-
-impl Ending {
-    fn span_mut(&mut self) -> &mut SpanRecord {
-        match self {
-            Ending::Finished(span) => span,
-            Ending::Finishing(finishing) => &mut finishing.span,
-        }
-    }
-}
-
-/// An ended run whose span waits for its git context, until `until`
-/// ([`CONTEXT_WAIT_NANOS`]).
-struct AwaitingContext {
-    run_id: String,
-    until: u64,
-    ending: Ending,
+    /// Issue #1981 M6: `vcs.ref.head.name`, the branch the run started on.
+    branch: Option<String>,
 }
 
 /// A pull request, told apart from another repository's of the same number by
@@ -742,8 +712,6 @@ pub struct RunTracker {
     /// ([`Self::take_finished_deferred`]). A run with nothing to read
     /// ([`RunUsage::reads`]) is never one: its span is in `finished`.
     finishing: Vec<FinishingRun>,
-    /// Ended runs whose span waits for their git context, oldest first.
-    awaiting_context: Vec<AwaitingContext>,
     /// The CI state of every pull request an open run's card holds.
     ci: HashMap<PrKey, SharedCi>,
     /// The pull requests no open run holds any more, at most
@@ -813,9 +781,7 @@ impl RunTracker {
                 ended: None,
                 handoffs: Vec::new(),
                 dispatch_name,
-                // The deck resolves the context of a run that starts in a
-                // directory ([`super::exporter`]).
-                context_pending: cwd.is_some(),
+                branch: None,
             });
     }
 
@@ -962,8 +928,8 @@ impl RunTracker {
         self.open_run(pending.start, pending.prepared_at, pending.usage_dirs);
         if let Some(run) = self.runs.get_mut(&pane_id) {
             run.context = pending.context;
-            run.context_pending = pending.context_pending;
             run.dispatch_name = pending.dispatch_name;
+            run.branch = pending.branch;
         }
         // Each task posted, and each notice about one, in its place among
         // the events: one posted before a close is opened in the run before
@@ -1050,7 +1016,7 @@ impl RunTracker {
                 dispatch_name: None,
                 learned_agent: None,
                 uncorrelated_reports: 0,
-                context_pending: false,
+                branch: None,
             },
         );
     }
@@ -1069,13 +1035,19 @@ impl RunTracker {
         self.shadow_states.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Attach the git-derived context once it has been resolved, to the run
-    /// whether it is prepared, open, replaced or ended and waiting for it
-    /// ([`CONTEXT_WAIT_NANOS`]). Ignored once the run's span has been sent.
+    /// Issue #1981 M6: the branch prepared run `run_id` starts on, read before
+    /// its agent starts ([`super::run_context::branch_at`]).
+    pub fn set_branch(&mut self, run_id: &str, branch: Option<String>) {
+        if let Some(pending) = self.pending.get_mut(run_id) {
+            pending.branch = branch;
+        }
+    }
+
+    /// Attach the git-derived context once it has been resolved. Ignored when
+    /// the run it was resolved for has already ended or been replaced.
     pub fn set_context(&mut self, run_id: &str, context: RunContext) {
         if let Some(pending) = self.pending.get_mut(run_id) {
             pending.context = context;
-            pending.context_pending = false;
         } else if let Some(run) = self
             .runs
             .values_mut()
@@ -1083,39 +1055,6 @@ impl RunTracker {
             .find(|run| run.start_info.run_id == run_id)
         {
             run.context = context;
-            run.context_pending = false;
-        } else if let Some(i) = self
-            .awaiting_context
-            .iter()
-            .position(|a| a.run_id == run_id)
-        {
-            let mut awaiting = self.awaiting_context.remove(i);
-            awaiting
-                .ending
-                .span_mut()
-                .attributes
-                .extend(context_attributes(&context));
-            self.queue(awaiting.ending);
-        }
-    }
-
-    /// Send every ended run's span whose wait for its git context ran out by
-    /// `now`, without it.
-    pub fn release_overdue_context(&mut self, now: u64) {
-        let (overdue, waiting) = std::mem::take(&mut self.awaiting_context)
-            .into_iter()
-            .partition(|a| a.until <= now);
-        self.awaiting_context = waiting;
-        for awaiting in overdue {
-            self.queue(awaiting.ending);
-        }
-    }
-
-    /// Queue an ended run's span with the others finished.
-    fn queue(&mut self, ending: Ending) {
-        match ending {
-            Ending::Finished(span) => self.finished.push(span),
-            Ending::Finishing(finishing) => self.finishing.push(finishing),
         }
     }
 
@@ -1683,40 +1622,28 @@ impl RunTracker {
             now,
             &mut self.finished,
         );
-        let context_pending = run.context_pending;
         let span = run_span(run, reason, exit_code, now);
-        let ending = match usage {
+        match usage {
             // A run with nothing to read is completed here, its span queued
             // with the others it finished.
-            Some(usage) if !usage.reads() => Ending::Finished(
+            Some(usage) if !usage.reads() => self.finished.push(
                 FinishingRun {
                     span,
                     usage,
-                    run_id: run_id.clone(),
+                    run_id,
                     reason,
                     exit_code,
                 }
                 .complete(),
             ),
-            Some(usage) => Ending::Finishing(FinishingRun {
+            Some(usage) => self.finishing.push(FinishingRun {
                 span,
                 usage,
-                run_id: run_id.clone(),
+                run_id,
                 reason,
                 exit_code,
             }),
-            None => Ending::Finished(span),
-        };
-        // A run that ended before its git context resolved, as one that
-        // exits within a second of starting can, waits for it.
-        if context_pending {
-            self.awaiting_context.push(AwaitingContext {
-                run_id,
-                until: now.saturating_add(CONTEXT_WAIT_NANOS),
-                ending,
-            });
-        } else {
-            self.queue(ending);
+            None => self.finished.push(span),
         }
     }
 
@@ -1778,8 +1705,6 @@ impl RunTracker {
             self.end_run(&pane, reason, None, now);
         }
         self.handoffs.end_all(now, &mut self.finished);
-        // Nothing waits past shutdown: the spans go without their context.
-        self.release_overdue_context(u64::MAX);
     }
 
     /// Issue #1981 M8: the runs open (replaced ones still waiting for their
@@ -2330,21 +2255,6 @@ fn operation_span(run: &ActiveRun, open: OpenOperation, now: u64, end: Operation
     }
 }
 
-/// The `agent.run` attributes the run's git context gives.
-fn context_attributes(context: &RunContext) -> Vec<Attribute> {
-    [
-        (
-            AttrKey::InstructionsCommit,
-            context.instructions_commit.as_deref(),
-        ),
-        (AttrKey::RepositoryName, context.repository_name.as_deref()),
-        (AttrKey::BranchName, context.branch.as_deref()),
-    ]
-    .into_iter()
-    .filter_map(|(key, value)| Attribute::opt_str(key, value))
-    .collect()
-}
-
 fn run_span(run: ActiveRun, reason: EndReason, exit_code: Option<i32>, now: u64) -> SpanRecord {
     let start = &run.start_info;
     let mut attributes = identity_attributes(start);
@@ -2364,7 +2274,18 @@ fn run_span(run: ActiveRun, reason: EndReason, exit_code: Option<i32>, now: u64)
         ));
         attributes.push(Attribute::bool(AttrKey::Orchestrator, orch.orchestrator));
     }
-    attributes.extend(context_attributes(&run.context));
+    attributes.extend(Attribute::opt_str(
+        AttrKey::InstructionsCommit,
+        run.context.instructions_commit.as_deref(),
+    ));
+    attributes.extend(Attribute::opt_str(
+        AttrKey::RepositoryName,
+        run.context.repository_name.as_deref(),
+    ));
+    attributes.extend(Attribute::opt_str(
+        AttrKey::BranchName,
+        run.branch.as_deref(),
+    ));
     attributes.extend(Attribute::opt_str(
         AttrKey::InvokingSkill,
         start.invoking_skill.as_deref(),
@@ -3035,81 +2956,24 @@ pub(crate) mod tests {
         );
     }
 
-    /// Issue #1981 M6: a run that ends before its git context resolves, as
-    /// a run that exits within a second of starting can, is sent once the
-    /// context arrives and carries it; one whose context never comes is sent
-    /// without it when the wait runs out, and daemon shutdown waits for none.
+    /// Issue #1981 M6: the branch read as the run was prepared is the run's,
+    /// on its span however soon the run ends; a run begun without one has
+    /// none.
     #[test]
-    fn a_run_that_ends_before_its_context_waits_for_it() {
-        let cwd = std::path::Path::new("/w/repo");
-        let context = RunContext {
-            branch: Some("agent/short".into()),
-            ..RunContext::default()
-        };
+    fn a_prepared_runs_branch_is_on_its_span() {
         let mut tracker = RunTracker::new();
-        tracker.prepare_run_in(start("p1"), 0, Some(cwd));
+        tracker.prepare_run(start("p1"), 0);
+        tracker.set_branch("run-p1", Some("agent/dispatch-x".into()));
         tracker.commit_run("run-p1");
-        tracker.end_run("p1", EndReason::Exited, Some(0), 10);
-        assert!(
-            tracker
-                .take_finished()
-                .iter()
-                .all(|s| s.name != SPAN_AGENT_RUN),
-            "sent before its context resolved"
-        );
-        tracker.release_overdue_context(10 + CONTEXT_WAIT_NANOS - 1);
-        assert!(tracker.take_finished().is_empty());
-        tracker.set_context("run-p1", context.clone());
+        tracker.end_run("p1", EndReason::Exited, Some(0), 1);
+        tracker.begin_run(start("p2"), 0);
+        tracker.end_run("p2", EndReason::Exited, Some(0), 1);
         let spans = tracker.take_finished();
         assert_eq!(
-            attr(run_span_of(&spans), AttrKey::BranchName),
-            Some(&AttrValue::Str("agent/short".into()))
+            attr(run_span_on(&spans, "p1"), AttrKey::BranchName),
+            Some(&AttrValue::Str("agent/dispatch-x".into()))
         );
-        tracker.set_context("run-p1", context.clone());
-        assert!(tracker.take_finished().is_empty(), "sent once");
-
-        // Resolved while it ran: no wait.
-        tracker.prepare_run_in(start("p2"), 0, Some(cwd));
-        tracker.set_context("run-p2", context.clone());
-        tracker.commit_run("run-p2");
-        tracker.end_run("p2", EndReason::Exited, Some(0), 10);
-        assert_eq!(
-            attr(run_span_of(&tracker.take_finished()), AttrKey::BranchName),
-            Some(&AttrValue::Str("agent/short".into()))
-        );
-
-        // Never resolved: sent without it once the wait runs out.
-        tracker.prepare_run_in(start("p3"), 0, Some(cwd));
-        tracker.commit_run("run-p3");
-        tracker.end_run("p3", EndReason::Exited, Some(0), 10);
-        tracker.release_overdue_context(10 + CONTEXT_WAIT_NANOS);
-        let spans = tracker.take_finished();
-        assert_eq!(attr(run_span_of(&spans), AttrKey::BranchName), None);
-
-        // Shutdown sends a waiting span at once.
-        tracker.prepare_run_in(start("p4"), 0, Some(cwd));
-        tracker.commit_run("run-p4");
-        tracker.end_run("p4", EndReason::Exited, Some(0), 10);
-        tracker.end_all(EndReason::DaemonShutdown, 11);
-        assert_eq!(
-            tracker
-                .take_finished()
-                .iter()
-                .filter(|s| s.name == SPAN_AGENT_RUN)
-                .count(),
-            1
-        );
-
-        // A run with no directory has no context to wait for.
-        tracker.prepare_run_in(start("p5"), 0, None);
-        tracker.commit_run("run-p5");
-        tracker.end_run("p5", EndReason::Exited, Some(0), 10);
-        assert!(
-            tracker
-                .take_finished()
-                .iter()
-                .any(|s| s.name == SPAN_AGENT_RUN)
-        );
+        assert_eq!(attr(run_span_on(&spans, "p2"), AttrKey::BranchName), None);
     }
 
     #[test]
@@ -3128,7 +2992,6 @@ pub(crate) mod tests {
             RunContext {
                 instructions_commit: Some("a".repeat(40)),
                 repository_name: Some("dot-agent-deck".into()),
-                branch: Some("agent/dispatch-x".into()),
             },
         );
         tracker.observe_event(&event("p1", EventType::SessionStart), 1);
@@ -3155,10 +3018,6 @@ pub(crate) mod tests {
         assert_eq!(
             attr(run, AttrKey::RepositoryName),
             Some(&AttrValue::Str("dot-agent-deck".into()))
-        );
-        assert_eq!(
-            attr(run, AttrKey::BranchName),
-            Some(&AttrValue::Str("agent/dispatch-x".into()))
         );
         assert_eq!(attr(run, AttrKey::PrNumber), Some(&AttrValue::Int(1741)));
         assert_eq!(attr(run, AttrKey::ExitCode), Some(&AttrValue::Int(3)));
@@ -5171,10 +5030,6 @@ pub(crate) mod tests {
         }
         for pane in ["p2", "p3"] {
             tracker.end_run(pane, EndReason::Exited, None, 10);
-        }
-        // Prepared in a directory, each waits for its git context.
-        for run in ["run-p1", "run-p2", "run-p3"] {
-            tracker.set_context(run, RunContext::default());
         }
         let spans = tracker.take_finished();
         let named = |pane: &str| attr(run_span_on(&spans, pane), AttrKey::DispatchName).cloned();

@@ -83,7 +83,7 @@ use super::input::{InputFilter, InterventionKind, LONE_ESCAPE_WINDOW, PASTE_IDLE
 use super::launch::LAUNCH_ENV_KEYS;
 use super::propagation::{RunIdentity, agent_env};
 use super::resource::{ResourceAttribute, deck_resource, host_name};
-use super::run_context::{ProbeSettings, Probes, RunContext};
+use super::run_context::{ProbeSettings, Probes};
 use super::span::{SpanRecord, new_run_id};
 use super::tracker::{EndReason, FinishingRun, RunGeneration, RunStart, RunTracker};
 use super::{Protocol, now_unix_nanos, otlp};
@@ -1123,9 +1123,16 @@ impl Telemetry {
         };
         if let Some(exporting) = &self.exporting {
             let run_id = start.run_id.clone();
+            // Read before the agent starts, so it is the branch the run
+            // started on, and outside the tracker's lock.
+            let branch = prepared
+                .cwd
+                .as_deref()
+                .and_then(super::run_context::branch_at);
             exporting.shared.with_tracker(|t| {
                 t.prepare_run_in(start, now_unix_nanos(), prepared.cwd.as_deref());
                 t.set_usage_dirs(&run_id, usage_dirs);
+                t.set_branch(&run_id, branch);
             });
         }
         Some(prepared)
@@ -1197,20 +1204,13 @@ impl Telemetry {
             });
         }
         // The git probes run off the spawn path; the run's context
-        // attributes appear on its span once they have resolved, and a run
-        // that ends first waits for them. Probes that could not start leave
-        // the context absent, and the run waits for nothing.
+        // attributes appear on its span once they have resolved.
         if let Some(cwd) = run.cwd.clone() {
             let shared = Arc::clone(&exporting.shared);
             let run_id = run.run_id.clone();
-            let started = exporting.probes.spawn(cwd, move |context| {
+            exporting.probes.spawn(cwd, move |context| {
                 shared.with_tracker(|t| t.set_context(&run_id, context));
             });
-            if !started {
-                exporting
-                    .shared
-                    .with_tracker(|t| t.set_context(&run.run_id, RunContext::default()));
-            }
         }
     }
 
@@ -2055,13 +2055,7 @@ async fn run_ingest(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiver<C
                 shared.name_dispatched_runs();
                 // Issue #1981 M7: a hand-off past its age bound ends then,
                 // not when the next inbox change or post happens to come.
-                // A run's span whose git context never came goes without
-                // it ([`super::tracker::CONTEXT_WAIT_NANOS`]).
-                shared.with_tracker(|t| {
-                    let now = now_unix_nanos();
-                    t.expire_handoffs(now);
-                    t.release_overdue_context(now);
-                });
+                shared.with_tracker(|t| t.expire_handoffs(now_unix_nanos()));
             }
             () = next_tick(&mut health) => {
                 drain(&shared, &mut events, &mut read).await;
