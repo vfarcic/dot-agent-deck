@@ -6,7 +6,7 @@
     "git":                          "2.56.0",
     "upcloud-cli":                  "3.37.0",
     "openstackclient":              "10.5.0",
-    "gh":                           "2.103.2",
+    "gh":                           "2.103.3",
     "asciinema":                    "3.2.1",
     "cargo-nextest":                "0.9.146",
     "rustc":                        "1.99.0",
