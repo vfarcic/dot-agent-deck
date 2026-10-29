@@ -25,6 +25,13 @@ class ExternalEdit:
         self.escape = bytearray()
         self.paste = False
         self.error = b''
+        # M44e's ordinary-composer samples, not the production detector's
+        # conservative candidate union. The empty stand-in copies Claude as
+        # a synthetic convention; other UI states/releases are not modeled.
+        self.shortcuts = ({b'\x1b[103;5u', b'\x1b[103;5:1u', b'\x1b[103;5:2u'}
+                          if agent == 'codex' else
+                          {b'\x1b[103;5u', b'\x1b[71;5u',
+                           b'\x1b[27;5;103~', b'\x1b[27;5;71~'})
         os.write(1, b'\x1b[?2004h')
 
     def path(self, suffix):
@@ -44,9 +51,7 @@ class ExternalEdit:
                         self.paste = True
                     elif sequence == b'\x1b[201~':
                         self.paste = False
-                    elif not self.paste and sequence in (
-                            b'\x1b[103;5u', b'\x1b[103;5:1u', b'\x1b[103;5:2u',
-                            b'\x1b[27;5;103~'):
+                    elif not self.paste and sequence in self.shortcuts:
                         yield None
                 continue
             if value == 27:
@@ -155,4 +160,7 @@ class ExternalEdit:
             tty.setraw(0, termios.TCSANOW)
             path.unlink(missing_ok=True)
             os.write(1, b'\x1b[?2004h')
-        return mechanism == 'H-chunk' or self.agent == 'codex'
+        # The M31 suspended-interval flush above is separate from a suffix
+        # already in this read. M44d's sampled Codex same-frame BEL controls
+        # retain that suffix; dropping it is an explicit synthetic injection.
+        return mechanism == 'H-chunk'

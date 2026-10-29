@@ -2,8 +2,9 @@
 """Trusted synthetic editor: MODE BASE [literal arguments ...] EXPORT.
 
 Modes: fast (no intentional wait), fail (edit then exit 1), trim (write trailing
-whitespace), hang/wait (wait for BASE.editor-go), read (read stdin, then wait).
-BASE.editor-started atomically records argv, original bytes, tty flags and pid.
+whitespace), hang/wait (wait for BASE.editor-go), read (read stdin, then wait),
+late-hang (wait for BASE.editor-publish-go before publishing, then hang).
+BASE.editor-started atomically records argv, original bytes, isatty booleans and pid.
 This is a test fixture, not an editor sandbox. See composer-external-edit.md.
 """
 import json

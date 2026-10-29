@@ -32,17 +32,63 @@ class ExternalEditor(unittest.TestCase):
         env = {key: value.replace('{base}', str(base))
                for key, value in env.items() if value is not None}
         composer = Composer(root, fixture, env, instrument=True)
+        composer.editor_mode = mode
         self.addCleanup(composer.close)
         self.addCleanup(self.stop_editor, composer)
         composer.ready()
         return composer
 
     def stop_editor(self, composer):
-        if not composer.path('.editor-finished').exists():
+        # Sticky releases precede any PID read: a child that has not yet
+        # published cannot subsequently hang on either fixture barrier.
+        composer.path('.editor-go').touch()
+        composer.path('.editor-publish-go').touch()
+        if composer.editor_mode == 'read' and not composer.path('.editor-input').exists():
             try:
-                os.kill(composer.read_json('.editor-started')['pid'], signal.SIGKILL)
-            except (FileNotFoundError, ProcessLookupError, TypeError, json.JSONDecodeError):
+                os.write(composer.master, b'\n')
+            except OSError:
                 pass
+        if not composer.path('.edit-dispatched').exists():
+            return
+
+        def record():
+            try:
+                return composer.read_json('.editor-started')
+            except json.JSONDecodeError:
+                return None
+
+        def reaped(pid):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            return False
+
+        # Keep the parent alive to wait/reap its editor, including a late PID
+        # publisher. Command resolution errors have a resume but no child.
+        deadline = time.monotonic() + 3
+        child = None
+        while time.monotonic() < deadline:
+            composer.drain()
+            child = record()
+            if child and reaped(child['pid']):
+                return
+            if not child and b'\x1b[?2004h' in composer.output[
+                    composer.output.rfind(b'\x1b[?2004l'):]:
+                return
+            time.sleep(0.005)
+        if child:
+            try:
+                os.kill(child['pid'], signal.SIGKILL)
+            except ProcessLookupError:
+                return
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                composer.drain()
+                if reaped(child['pid']):
+                    return
+                time.sleep(0.005)
+        raise AssertionError('cleanup could not observe editor exit within its bound')
 
     def type(self, composer, data):
         os.write(composer.master, data)
