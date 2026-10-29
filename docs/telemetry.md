@@ -89,7 +89,7 @@ To see everything one run did, take its `deck.run.id` from an `agent.run` span a
 
 ## What the deck sends
 
-The deck sends traces with six kinds of spans: `agent.run`, one per agent run, and, as children of their run, `agent.status`, one per stretch of time the agent spent in one status, `agent.operation`, one per shell command the agent ran, and `agent.ci`, one per stretch of time the run's pull request had CI checks running. An orchestrator's run also has `agent.handoff`, one per task it delegated. Apart from the runs, the daemon sends `daemon.health` about once a minute, on its own health.
+The deck sends traces with seven kinds of spans: `agent.run`, one per agent run, and, as children of their run, `agent.status`, one per stretch of time the agent spent in one status, `agent.operation`, one per shell command the agent ran, and `agent.ci`, one per stretch of time the run's pull request had CI checks running. An orchestrator's run also has `agent.handoff`, one per task it delegated, and under it `agent.handoff.read`, one per report the orchestrator read. Apart from the runs, the daemon sends `daemon.health` about once a minute, on its own health.
 
 A run starts when the deck starts an agent in a pane and ends when the agent exits, its pane is closed, or the daemon shuts down. Restarting an agent in the same pane starts a new run with a new id. **A value the deck cannot determine is left out, never guessed and never sent empty.** The deck does not send a span for a run that is still open when the daemon crashes or is killed by force.
 
@@ -289,7 +289,7 @@ The deck checks the pull request about once a minute (`DOT_AGENT_DECK_PR_REFRESH
 
 ### `agent.handoff`
 
-One span per task an orchestrator delegates to a role, from when the deck puts the task in the worker's inbox to when the orchestrator acknowledges the worker's report. It is a child of the orchestrator's `agent.run`, so it sits in the orchestrator's trace.
+One span per task an orchestrator delegates to a role, from when the deck puts the task in the worker's inbox to when the worker's report reaches the orchestrator's inbox. It is a child of the orchestrator's `agent.run`, so it sits in the orchestrator's trace. When the orchestrator then reads the report, an [`agent.handoff.read`](#agenthandoffread) span records that.
 
 | Attribute | Value |
 | --- | --- |
@@ -306,11 +306,24 @@ Events on the span:
 | Event | When |
 | --- | --- |
 | `deck.handoff.taken` | The worker took the task from its inbox. |
-| `deck.handoff.reported` | The worker's report for the task reached the orchestrator's inbox. |
+| `deck.handoff.reported` | The worker's report for the task reached the orchestrator's inbox. It is at the span's end. |
 
-So the time from the span's start to `deck.handoff.taken` is how long the task waited for the worker, from `deck.handoff.taken` to `deck.handoff.reported` is the worker's work, and from `deck.handoff.reported` to the span's end is how long the orchestrator took to read the report. When the orchestrator's run ends before it reads a report that did arrive, the span ends with the run and its outcome is still `reported`. A task that a newer one to the same role supersedes keeps its hand-off open until its own report arrives, unless the newer task replaces it before the worker acknowledged it.
+So the time from the span's start to `deck.handoff.taken` is how long the task waited for the worker, and from `deck.handoff.taken` to the span's end is the worker's work. A task that a newer one to the same role supersedes keeps its hand-off open until its own report arrives, unless the newer task replaces it before the worker acknowledged it.
 
 A report sent with `work-done` but without `--task-id` cannot be matched to a task, so it ends no hand-off: it is counted in `deck.handoffs.uncorrelated.count` on the run that received it, and a hand-off whose worker reported that way ends `unknown` with its orchestrator's run. Only the ids, the role and the outcome are sent, never the task, the report or a message's subject.
+
+### `agent.handoff.read`
+
+One span per report the orchestrator read, from when the report reached its inbox to when the orchestrator acknowledged it (`dot-agent-deck ack`). Its duration is how long the report waited to be read. It is a child of the report's `agent.handoff`, in the same trace, and starts where that span ends, so a trace view shows the read right after the hand-off.
+
+| Attribute | Value |
+| --- | --- |
+| `deck.handoff.id` | The task's message id, as on its `agent.handoff`. |
+| `deck.run.id`, `deck.pane.id` | The orchestrator's run and pane. |
+| `deck.role` | The role the task went to. |
+| `deck.orchestration.id` | The orchestration, as on `agent.run`. |
+
+There is no read span for a report the orchestrator never acknowledged: its run ended first, or the report was still unread after a day. Fetching a report without acknowledging it is not a read. To find reports that were never read, look for `agent.handoff` spans with outcome `reported` and no `agent.handoff.read` with the same `deck.handoff.id`.
 
 ### `daemon.health`
 

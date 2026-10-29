@@ -13323,11 +13323,11 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 
 ## Test Case Catalog — Telemetry handoffs and daemon health
 
-##### telemetry/otlp/038 — A delegated task ends its handoff when the orchestrator acknowledges its report.
+##### telemetry/otlp/038 — A delegated task ends its handoff when the report arrives, and the orchestrator's acknowledgement is a read span.
 
 - **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_handoff.rs`); local OTLP/JSON receiver and real delegate, work-done, fetch and ack CLI calls.
 - **Agent:** two Python PTY stand-ins; no real agent or credential.
-- **Asserts:** one delegated task exports one agent.handoff after report acknowledgement, remains unexported while its report is queued or merely fetched, has one taken and one reported event in timestamp order, carries the orchestrator run/pane/trace/parent, worker run id, worker role and orchestration id, ends reported, survives subsequent run closure without duplication and excludes private task/report sentinels from captured raw JSON bodies.
+- **Asserts:** one delegated task exports one agent.handoff once its report arrives, while the report is still unread and the orchestrator alive, ending reported at the reported event's time, with one taken and one reported event in timestamp order, the orchestrator run/pane/trace/parent, worker run id, worker role and orchestration id; a mere fetch of the report exports no agent.handoff.read, and the acknowledgement exports exactly one, a child of the handoff in its trace, from the report's arrival to after the ack, with the orchestrator's run, pane, the role and orchestration id (issue #1981 M7, which moved the handoff's end from the read to the report); neither is duplicated at run closure, and private task/report sentinels are absent from captured raw JSON bodies.
 - **Does not assert:** natural orchestrator exit before acknowledgement, worker respawn identity refresh, superseding, daemon shutdown, bounded-map eviction or privacy of external agent SDKs.
 - **Platform coverage:** mac+linux.
 
@@ -13335,7 +13335,7 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 
 - **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_handoff.rs`); real delegate CLI and local OTLP/JSON receiver.
 - **Agent:** two Python PTY stand-ins; the test terminates its own worker PID before task fetch.
-- **Asserts:** the inbox marks the posted task undeliverable, one agent.handoff exports outcome=undeliverable with the agent_exited enum reason, orchestrator parent/trace and worker role, no reported event, no duplicate at orchestrator closure and no private task text in raw JSON bodies.
+- **Asserts:** the inbox marks the posted task undeliverable, one agent.handoff exports outcome=undeliverable with the agent_exited enum reason, orchestrator parent/trace and worker role, no reported event, no agent.handoff.read, no duplicate at orchestrator closure and no private task text in raw JSON bodies.
 - **Does not assert:** deliberate StopAgent cancellation, absent target roles that were never posted, delivery retry exhaustion, or other undeliverable reasons.
 - **Platform coverage:** mac+linux.
 
@@ -13343,7 +13343,7 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 
 - **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_handoff.rs`); real work-done and inbox-fetch CLI calls and local OTLP/JSON receiver.
 - **Agent:** two Python PTY stand-ins with no commissioned task.
-- **Asserts:** a real note reaches the orchestrator, its completed agent.run has deck.handoffs.uncorrelated.count=1, no agent.handoff is invented, and the private report sentinel is absent from captured raw JSON bodies.
+- **Asserts:** a real note reaches the orchestrator, its completed agent.run has deck.handoffs.uncorrelated.count=1, no agent.handoff or agent.handoff.read is invented, and the private report sentinel is absent from captured raw JSON bodies.
 - **Does not assert:** report retry deduplication, several uncorrelated notes, or a report sent while a commissioned task is outstanding.
 - **Platform coverage:** mac+linux.
 

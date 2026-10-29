@@ -7387,9 +7387,9 @@ mod tests {
 
     /// Issue #1981 M7 review: the worker's report on a task held for a
     /// prepared orchestrator run arrives before the run's held close: the
-    /// run had not ended, so the hand-off ends `reported`, with the report's
-    /// event, at the run's end; the orchestrator's acknowledgement after the
-    /// close does not move that end.
+    /// run had not ended, so the hand-off ends `reported` when the report
+    /// arrived, with its event; the orchestrator's acknowledgement after the
+    /// close records no read, the run having ended without one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_report_before_a_prepared_runs_held_close_ends_the_handoff_reported() {
         use crate::inbox::StateName;
@@ -7409,7 +7409,6 @@ mod tests {
             attr(handoff, AttrKey::HandoffOutcome),
             Some(&AttrValue::Str("reported".into()))
         );
-        assert_eq!(handoff.end_unix_nanos, run.end_unix_nanos);
         assert_eq!(
             event_names(handoff),
             vec![
@@ -7417,20 +7416,25 @@ mod tests {
                 crate::telemetry::EVENT_HANDOFF_REPORTED
             ]
         );
+        assert_eq!(handoff.end_unix_nanos, handoff.events[1].time_unix_nanos);
+        assert!(handoff.end_unix_nanos <= run.end_unix_nanos, "{handoff:?}");
+        assert_no_read(&spans);
+    }
+
+    fn assert_no_read(spans: &[SpanRecord]) {
         assert!(
-            handoff
-                .events
+            spans
                 .iter()
-                .all(|e| e.time_unix_nanos <= run.end_unix_nanos),
-            "{handoff:?}"
+                .all(|s| s.name != crate::telemetry::SPAN_AGENT_HANDOFF_READ),
+            "{spans:?}"
         );
     }
 
     /// Issue #1981 M7 review: a report that overtakes its task's post, then
     /// the post held for its prepared orchestrator run, the run's close, and
-    /// the orchestrator acknowledging the report: the acknowledgement came
-    /// after the close, so the hand-off ends `reported` at the run's end,
-    /// not at the acknowledgement.
+    /// the orchestrator acknowledging the report: the hand-off ends
+    /// `reported` when the post finds the report, and the acknowledgement,
+    /// after the close, records no read.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_acknowledgement_after_a_held_close_of_a_report_that_overtook_its_post_stays_after_it()
      {
@@ -7462,7 +7466,8 @@ mod tests {
             attr(handoff, AttrKey::HandoffOutcome),
             Some(&AttrValue::Str("reported".into()))
         );
-        assert_eq!(handoff.end_unix_nanos, run.end_unix_nanos);
+        assert!(handoff.end_unix_nanos <= run.end_unix_nanos, "{handoff:?}");
+        assert_no_read(&spans);
     }
 
     /// Issue #1981 M7: the delegate seam and the inbox's broadcast make one
@@ -7535,6 +7540,11 @@ mod tests {
             .collect();
         assert_eq!(handoffs.len(), 1, "{spans:?}");
         let handoff = handoffs[0];
+        // The orchestrator's acknowledgement is a read span of its own.
+        let read = spans
+            .iter()
+            .find(|s| s.name == crate::telemetry::SPAN_AGENT_HANDOFF_READ)
+            .expect("a read span");
         assert_eq!(
             attr(handoff, AttrKey::HandoffOutcome),
             Some(&AttrValue::Str("reported".into()))
@@ -7553,5 +7563,9 @@ mod tests {
         assert_eq!(handoff.trace_id, run.trace_id);
         assert_eq!(handoff.parent_span_id, Some(run.span_id));
         assert!(!format!("{handoff:?}").contains("SENTINEL"));
+        assert_eq!(read.trace_id, handoff.trace_id);
+        assert_eq!(read.parent_span_id, Some(handoff.span_id));
+        assert_eq!(read.start_unix_nanos, handoff.end_unix_nanos);
+        assert!(!format!("{read:?}").contains("SENTINEL"));
     }
 }

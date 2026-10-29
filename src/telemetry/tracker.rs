@@ -1833,6 +1833,12 @@ impl RunTracker {
         (self.handoffs.open_count(), self.handoffs.early_count())
     }
 
+    /// Hand-off reports that arrived and wait to be read.
+    #[cfg(test)]
+    pub fn unread_count(&self) -> usize {
+        self.handoffs.unread_count()
+    }
+
     /// Runs open (replaced ones still waiting for their end included) and
     /// prepared: what the tracker holds between spans.
     #[cfg(test)]

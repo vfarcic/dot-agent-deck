@@ -67,6 +67,16 @@ fn handoffs(receiver: &Receiver, id: &str) -> Vec<Value> {
         .collect()
 }
 
+fn reads(receiver: &Receiver, id: &str) -> Vec<Value> {
+    receiver
+        .spans()
+        .into_iter()
+        .filter(|s| {
+            s["name"] == "agent.handoff.read" && attribute(s, "deck.handoff.id") == Some(id)
+        })
+        .collect()
+}
+
 fn one_handoff(receiver: &Receiver, id: &str) -> Value {
     assert!(
         common::wait_until(EXPORT_WAIT, || !handoffs(receiver, id).is_empty()),
@@ -132,10 +142,10 @@ fn no_private_payload(receiver: &Receiver) {
     }
 }
 
-/// Scenario: Delegate a private task to a stand-in worker, have it fetch and report with the task id, and leave the report unread for an export interval. Only acknowledging the report may complete one handoff, with both lifecycle events, the orchestrator parent, the worker run identity and no private task or report text in the exported payload.
+/// Scenario: Delegate a private task to a stand-in worker, have it fetch and report with the task id, then let the orchestrator fetch and later acknowledge the report. The handoff must export when the report arrives, with both lifecycle events, the orchestrator parent and the worker run identity, and the acknowledgement must add one agent.handoff.read child span from the report's arrival to the read, with no private task or report text in the exported payload.
 #[spec("telemetry/otlp/038")]
 #[test]
-fn telemetry_otlp_038_handoff_ends_when_orchestrator_reads_report() {
+fn telemetry_otlp_038_handoff_ends_when_report_arrives_and_read_follows() {
     let receiver = Receiver::start();
     let deck = launch(&receiver);
     let (orch, worker) = route::team(&deck, false);
@@ -150,6 +160,7 @@ fn telemetry_otlp_038_handoff_ends_when_orchestrator_reads_report() {
             .any(|m| m["id"] == id && m["text"].as_str().is_some_and(|t| t.contains(TASK)))
     );
     inbox::state(&deck, &worker, &id, "acknowledged");
+    let before_report = chrono::Utc::now().timestamp_nanos_opt().unwrap() as u64;
     cli(
         &deck,
         &worker,
@@ -159,32 +170,7 @@ fn telemetry_otlp_038_handoff_ends_when_orchestrator_reads_report() {
     let report_id = reports[0]["id"].as_str().unwrap();
     assert_eq!(reports[0]["provenance"]["task_id"], id);
     assert_eq!(reports[0]["state"], "queued");
-    // The existing exporter sends a batch within five seconds. Waiting beyond
-    // that makes an implementation that incorrectly ends at t2 observable.
-    assert!(
-        !common::wait_until(Duration::from_secs(7), || !handoffs(&receiver, &id)
-            .is_empty()),
-        "handoff exported before the orchestrator read its report"
-    );
-
-    // A receipt fetch alone must not stand in for the orchestrator's ack.
-    let (_held_receiver, report) = inbox::take(&deck, &orch);
-    assert!(
-        report["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|m| m["id"] == report_id)
-    );
-    inbox::state(&deck, &orch, report_id, "fetched");
-    assert!(
-        !common::wait_until(Duration::from_secs(7), || !handoffs(&receiver, &id)
-            .is_empty()),
-        "fetching the report must not finish a handoff before acknowledgement"
-    );
-    let before_ack = chrono::Utc::now().timestamp_nanos_opt().unwrap() as u64;
-    cli(&deck, &orch, &["ack", report_id]);
-    inbox::state(&deck, &orch, report_id, "acknowledged");
+    // The report has arrived and nobody has read it: the handoff is over.
     let handoff = one_handoff(&receiver, &id);
     assert!(
         receiver.run(&orch.id).is_none(),
@@ -211,7 +197,44 @@ fn telemetry_otlp_038_handoff_ends_when_orchestrator_reads_report() {
     let taken = nanos(event("deck.handoff.taken"), "timeUnixNano");
     let reported = nanos(event("deck.handoff.reported"), "timeUnixNano");
     assert!(nanos(&handoff, "startTimeUnixNano") <= taken && taken <= reported);
-    assert!(reported <= before_ack && before_ack <= nanos(&handoff, "endTimeUnixNano"));
+    assert!(before_report <= reported);
+    assert_eq!(reported, nanos(&handoff, "endTimeUnixNano"));
+
+    // A receipt fetch alone must not stand in for the orchestrator's ack. The
+    // exporter sends a batch within five seconds, so waiting beyond that
+    // makes a read recorded at the fetch observable.
+    let (_held_receiver, report) = inbox::take(&deck, &orch);
+    assert!(
+        report["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == report_id)
+    );
+    inbox::state(&deck, &orch, report_id, "fetched");
+    assert!(
+        !common::wait_until(Duration::from_secs(7), || !reads(&receiver, &id).is_empty()),
+        "fetching the report must not record its read"
+    );
+    let before_ack = chrono::Utc::now().timestamp_nanos_opt().unwrap() as u64;
+    cli(&deck, &orch, &["ack", report_id]);
+    inbox::state(&deck, &orch, report_id, "acknowledged");
+    assert!(
+        common::wait_until(EXPORT_WAIT, || !reads(&receiver, &id).is_empty()),
+        "acknowledging the report must export its read; exported={:?}",
+        receiver.spans()
+    );
+    let read = reads(&receiver, &id).remove(0);
+    assert_eq!(read["traceId"], handoff["traceId"]);
+    assert_eq!(read["parentSpanId"], handoff["spanId"]);
+    assert_eq!(nanos(&read, "startTimeUnixNano"), reported);
+    assert!(before_ack <= nanos(&read, "endTimeUnixNano"));
+    assert_eq!(attribute(&read, "deck.pane.id"), Some(orch.id.as_str()));
+    assert_eq!(attribute(&read, "deck.role"), Some("coder"));
+    assert_eq!(
+        attribute(&read, "deck.orchestration.id"),
+        Some("route-fixture")
+    );
     stop(&deck, &worker);
     stop(&deck, &orch);
     let worker_run = completed_run(&receiver, &worker);
@@ -220,6 +243,10 @@ fn telemetry_otlp_038_handoff_ends_when_orchestrator_reads_report() {
     assert_eq!(handoff["parentSpanId"], orch_run["spanId"]);
     assert_eq!(
         attribute(&handoff, "deck.run.id"),
+        attribute(&orch_run, "deck.run.id")
+    );
+    assert_eq!(
+        attribute(&read, "deck.run.id"),
         attribute(&orch_run, "deck.run.id")
     );
     assert!(attribute(&worker_run, "deck.run.id").is_some());
@@ -232,10 +259,11 @@ fn telemetry_otlp_038_handoff_ends_when_orchestrator_reads_report() {
         vec![handoff],
         "run closure must not export it again"
     );
+    assert_eq!(reads(&receiver, &id), vec![read], "one read per report");
     no_private_payload(&receiver);
 }
 
-/// Scenario: Delegate a private task to a stand-in worker, then terminate that worker before it fetches the task. The completed handoff must identify undeliverable delivery and the agent_exited reason, remain parented to the orchestrator run and exclude the task text from OTLP payloads.
+/// Scenario: Delegate a private task to a stand-in worker, then terminate that worker before it fetches the task. The completed handoff must identify undeliverable delivery and the agent_exited reason, remain parented to the orchestrator run, have no read span and exclude the task text from OTLP payloads.
 #[spec("telemetry/otlp/039")]
 #[test]
 fn telemetry_otlp_039_handoff_marks_exited_worker_undeliverable() {
@@ -287,10 +315,14 @@ fn telemetry_otlp_039_handoff_marks_exited_worker_undeliverable() {
     assert_eq!(handoff["traceId"], run["traceId"]);
     assert_eq!(handoff["parentSpanId"], run["spanId"]);
     assert_eq!(handoffs(&receiver, &id), vec![handoff]);
+    assert!(
+        reads(&receiver, &id).is_empty(),
+        "a task with no report has no read"
+    );
     no_private_payload(&receiver);
 }
 
-/// Scenario: Send a note from an uncommissioned stand-in worker through the real work-done CLI without a task id and let the orchestrator fetch it. Closing the orchestrator must export an uncorrelated count of one on its run without inventing a handoff or leaking the note text.
+/// Scenario: Send a note from an uncommissioned stand-in worker through the real work-done CLI without a task id and let the orchestrator fetch it. Closing the orchestrator must export an uncorrelated count of one on its run without inventing a handoff or read span or leaking the note text.
 #[spec("telemetry/otlp/040")]
 #[test]
 fn telemetry_otlp_040_unscoped_work_done_counts_without_inventing_handoff() {
@@ -313,8 +345,8 @@ fn telemetry_otlp_040_unscoped_work_done_counts_without_inventing_handoff() {
         receiver
             .spans()
             .iter()
-            .all(|s| s["name"] != "agent.handoff"),
-        "an uncorrelated report must not manufacture a task span"
+            .all(|s| s["name"] != "agent.handoff" && s["name"] != "agent.handoff.read"),
+        "an uncorrelated report must not manufacture a task or read span"
     );
     // A worker's completed run is a distinct identity, so the run under test
     // cannot be selected by accidentally taking the first agent.run.
