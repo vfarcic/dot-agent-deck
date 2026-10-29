@@ -107,7 +107,18 @@ vte = { version = "0.15", default-features = false }
 futures-util = "=0.3.34"
 regex = "1"
 open = "5"
-unicode-width = "0.2"
+# Held at 0.2.2 (Renovate PR #1982, closed). 0.2.3 gives the halfwidth katakana
+# sound marks U+FF9E/U+FF9F width 1, and ratatui-core 0.1.2's `CellWidth` still
+# adds 1 per mark to make up for the zero width 0.2.2 reported, so ratatui lays
+# a halfwidth `ｶﾞ` out across 3 cells while a terminal draws it in 2: a blank
+# cell after every such cluster, and
+# `ui::tests::truncate_styled_segments_budgets_clusters_at_their_drawn_width`
+# fails. The exact pin holds the whole graph, ratatui's copy included, because
+# cargo resolves every `0.2` requirement to one version — which also keeps
+# Renovate's lock file maintenance (`cargo update`) from taking 0.2.3. Lift it
+# once a ratatui-core release adds that 1 only when unicode-width reports the
+# mark as zero-width, together with the `unicode-width` rule in renovate.json.
+unicode-width = "=0.2.2"
 cron = "0.17.0"
 # Issue #1077: OS randomness for the per-spawn hook capability token
 # (`src/hook_provenance.rs`). Already in this workspace's dependency graph as a

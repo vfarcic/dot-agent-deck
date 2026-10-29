@@ -224,7 +224,7 @@ describe("a pane with no terminal", () => {
     const pane = screen.getByTestId("agent-pane-overlay");
     // The same pane, not a replacement: losing a daemon is a state, not a close.
     expect(pane).toBe(before);
-    expect(within(pane).getByRole("heading", { name: "Planner on build-box" })).toBeVisible();
+    expect(within(pane).getByRole("heading", { name: "Plan / architecture on build-box" })).toBeVisible();
 
     // The state, readable from the DOM rather than inferred from a blank box.
     expect(pane.querySelector(".agent-terminal-stack")).toHaveAttribute("data-terminal-state", "unreachable-deck");
@@ -329,7 +329,7 @@ describe("a pane with no terminal", () => {
     const after = screen.getByTestId("agent-pane-overlay");
     // The same pane, not a replacement: no unmount, no identity change.
     expect(after).toBe(before);
-    expect(within(after).getByRole("heading", { name: "Planner on build-box" })).toBeVisible();
+    expect(within(after).getByRole("heading", { name: "Plan / architecture on build-box" })).toBeVisible();
 
     // The notice is gone and a terminal is there, keyed to the pane's own deck
     // — which is still NOT the selected one.
@@ -382,7 +382,7 @@ describe("a pane with no terminal", () => {
     await act(async () => { rerender(<DeckShell runtime={answering.runtime("local")} initialView={paneView} />); });
 
     const pane = screen.getByTestId("agent-pane-overlay");
-    expect(within(pane).getByRole("heading", { name: "Planner on build-box" })).toBeVisible();
+    expect(within(pane).getByRole("heading", { name: "Plan / architecture on build-box" })).toBeVisible();
     expect(within(pane).getByTestId("terminal-planner")).toBeVisible();
     expect(pane.querySelector(".agent-tile")).toHaveAttribute("data-agent-record", "live");
   });
@@ -632,7 +632,7 @@ describe("a pane whose agent has left the fleet", () => {
     // The view survived the outage, so the pane is simply back — same agent,
     // same deck, live terminal, and the declaration naming it again.
     const pane = screen.getByTestId("agent-pane-overlay");
-    expect(within(pane).getByRole("heading", { name: "Planner on build-box" })).toBeVisible();
+    expect(within(pane).getByRole("heading", { name: "Plan / architecture on build-box" })).toBeVisible();
     expect(within(pane).getByTestId("terminal-planner")).toBeVisible();
     expect(viewportProps.at(-1)).toMatchObject({ agentId: "planner", deckId: REMOTE_DECK_ID });
     expect(returned.setShownTerminals).toHaveBeenLastCalledWith([{ deckId: REMOTE_DECK_ID, agentId: "planner" }]);

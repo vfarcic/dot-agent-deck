@@ -169,7 +169,7 @@ tasks:
     if: ${{ tasks.backend.values.active == 'true' }}
     call: nodejs/install 1.2.0
     with:
-      node-version: "24.22.1"
+      node-version: "26.13.0"
 
   - key: go-task
     if: ${{ tasks.backend.values.active == 'true' }}
@@ -467,14 +467,14 @@ tasks:
     tool-cache: ci-devbox-v1
     env:
       NIX_CONFIG: experimental-features = nix-command flakes
-      DEVBOX_USE_VERSION: 0.18.4
+      DEVBOX_USE_VERSION: 0.18.5
     run: |
       scripts/check-pin-lockstep.sh
       # The release binary, checked against its published SHA-256 (the
       # release's checksums.txt), rather than the get.jetify.com script.
       curl -fsSLo /tmp/devbox.tar.gz \
         "https://github.com/jetify-com/devbox/releases/download/${DEVBOX_USE_VERSION}/devbox_${DEVBOX_USE_VERSION}_linux_amd64.tar.gz"
-      echo "4a466a8788186da73f3c692697917c79452b758f40b454b4761e6d1fcd2acad9  /tmp/devbox.tar.gz" | sha256sum -c -
+      echo "5b452a778b620fcbff460fe9cbd86ad87f5eb50b8b58923a429a5cf189fbf00d  /tmp/devbox.tar.gz" | sha256sum -c -
       sudo tar -xzf /tmp/devbox.tar.gz -C /usr/local/bin devbox
       devbox run -- bash scripts/devbox-smoke.sh
 

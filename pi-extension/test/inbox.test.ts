@@ -978,7 +978,7 @@ test("pi_028 a replacement carries a hand-over waiting for approval and the queu
 	assert.deepEqual(child.refs("not_handed").concat(second.refs("not_handed")), []);
 });
 
-/// Scenario: A process runs version 4 of the extension's inbox, the last before each approval question carried the receiver's possession, with one message waiting for the deck's approval, and a reload brings this version. The version 4 receiver is replaced rather than kept, and the successor asks about the carried message with its possession on the same line, listing that message.
+/// Scenario: A process runs a receiver labelled version 4, the last version before each approval question carried the receiver's possession, with one message waiting for the deck's approval, and a reload brings this version. The test models the older receiver by its version marker (a current receiver relabelled version 4) and does not execute the historical version 4 receiver; that receiver is replaced rather than kept, and the successor asks about the carried message with its possession on the same line, listing that message.
 test("pi_028 a reload from version 4 replaces the receiver that asked without its possession", async () => {
 	assert.ok(INBOX_VERSION > 4, "a reload keeps version 4's receiver, which asks `may` without its possession (#1940)");
 	const { pi, child } = await started();

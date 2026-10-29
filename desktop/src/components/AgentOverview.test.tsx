@@ -2553,7 +2553,7 @@ describe("DeckShell", () => {
     expect(overlay).toHaveAttribute("role", "dialog");
     expect(overlay).toHaveAccessibleName("Planner agent");
     expect(overlay).toHaveAttribute("aria-modal", "true");
-    expect(within(overlay).getByRole("heading", { name: "Planner" })).toBeVisible();
+    expect(within(overlay).getByRole("heading", { name: "Plan / architecture" })).toBeVisible();
     expect(document.querySelector(".agent-grid")).toBeInTheDocument();
     expect(screen.getByTestId("agent-tile-builder")).toBeInTheDocument();
     expect(screen.queryByTestId("overview-table-region")).not.toBeInTheDocument();

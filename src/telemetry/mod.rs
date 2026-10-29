@@ -378,6 +378,16 @@ pub fn observe_delegate_posted(telemetry: Option<Arc<Telemetry>>, posted: &Deleg
     }
 }
 
+/// Issue #1981 M8: the daemon streamed a pane to a client, `took` from taking
+/// the request to having written the pane's screen to it, which goes into
+/// the next `daemon.health` span ([`health`]). Nothing happens when
+/// telemetry or its health spans are off.
+pub fn observe_attach(telemetry: Option<Arc<Telemetry>>, took: std::time::Duration) {
+    if let Some(telemetry) = telemetry {
+        telemetry.observe_attach(took);
+    }
+}
+
 /// `deck.telemetry.schema_version`: bumped whenever the attribute set changes
 /// in a way that makes data recorded before and after it incomparable.
 pub const SCHEMA_VERSION: &str = "3";
@@ -390,20 +400,24 @@ pub const SPAN_AGENT_RUN: &str = "agent.run";
 pub const SPAN_AGENT_STATUS: &str = "agent.status";
 pub const SPAN_AGENT_OPERATION: &str = "agent.operation";
 pub const SPAN_AGENT_CI: &str = "agent.ci";
-/// Issue #1981 M7: one delegated task, from its post to the orchestrator
-/// reading its report ([`handoff`]).
+/// Issue #1981 M7: one delegated task, from its post to its report arriving
+/// ([`handoff`]).
 pub const SPAN_AGENT_HANDOFF: &str = "agent.handoff";
+/// Issue #1981 M7: the orchestrator reading a task's report, from the report
+/// arriving to the orchestrator acknowledging it ([`handoff`]).
+pub const SPAN_AGENT_HANDOFF_READ: &str = "agent.handoff.read";
 /// Issue #1981 M8: the daemon's own health over one interval ([`health`]).
 pub const SPAN_DAEMON_HEALTH: &str = "daemon.health";
 
 /// Every span name, for the tests that check what reaches a payload.
 #[cfg(test)]
-pub const SPAN_NAMES: [&str; 6] = [
+pub const SPAN_NAMES: [&str; 7] = [
     SPAN_AGENT_RUN,
     SPAN_AGENT_STATUS,
     SPAN_AGENT_OPERATION,
     SPAN_AGENT_CI,
     SPAN_AGENT_HANDOFF,
+    SPAN_AGENT_HANDOFF_READ,
     SPAN_DAEMON_HEALTH,
 ];
 
@@ -441,6 +455,8 @@ pub enum AttrKey {
     Orchestrator,
     InstructionsCommit,
     RepositoryName,
+    /// Issue #1981 M6: the branch checked out where the run started.
+    BranchName,
     InvokingSkill,
     IssueNumber,
     PrNumber,
@@ -485,6 +501,11 @@ pub enum AttrKey {
     HookLatencyP50,
     HookLatencyP95,
     HookLatencyMax,
+    /// Issue #1981 M8: how long attaches took on a `daemon.health` span.
+    AttachLatencyCount,
+    AttachLatencyP50,
+    AttachLatencyP95,
+    AttachLatencyMax,
     SpansDropped,
     /// PRD #1858: a run's usage and termination, and one model's usage on a
     /// `deck.model_usage` event ([`accounting::AccountingKey`]).
@@ -509,6 +530,7 @@ impl AttrKey {
         AttrKey::Orchestrator,
         AttrKey::InstructionsCommit,
         AttrKey::RepositoryName,
+        AttrKey::BranchName,
         AttrKey::InvokingSkill,
         AttrKey::IssueNumber,
         AttrKey::PrNumber,
@@ -548,6 +570,10 @@ impl AttrKey {
         AttrKey::HookLatencyP50,
         AttrKey::HookLatencyP95,
         AttrKey::HookLatencyMax,
+        AttrKey::AttachLatencyCount,
+        AttrKey::AttachLatencyP50,
+        AttrKey::AttachLatencyP95,
+        AttrKey::AttachLatencyMax,
         AttrKey::SpansDropped,
     ];
 
@@ -567,6 +593,7 @@ impl AttrKey {
             AttrKey::Orchestrator => "deck.orchestrator",
             AttrKey::InstructionsCommit => "deck.instructions.commit",
             AttrKey::RepositoryName => "vcs.repository.name",
+            AttrKey::BranchName => "vcs.ref.head.name",
             AttrKey::InvokingSkill => "deck.invoking_skill",
             AttrKey::IssueNumber => "deck.issue.number",
             AttrKey::PrNumber => "deck.pr.number",
@@ -606,6 +633,10 @@ impl AttrKey {
             AttrKey::HookLatencyP50 => "deck.daemon.hook_latency.p50_ms",
             AttrKey::HookLatencyP95 => "deck.daemon.hook_latency.p95_ms",
             AttrKey::HookLatencyMax => "deck.daemon.hook_latency.max_ms",
+            AttrKey::AttachLatencyCount => "deck.daemon.attach_latency.count",
+            AttrKey::AttachLatencyP50 => "deck.daemon.attach_latency.p50_ms",
+            AttrKey::AttachLatencyP95 => "deck.daemon.attach_latency.p95_ms",
+            AttrKey::AttachLatencyMax => "deck.daemon.attach_latency.max_ms",
             AttrKey::SpansDropped => "deck.telemetry.spans.dropped",
             AttrKey::Accounting(key) => key.as_str(),
         }

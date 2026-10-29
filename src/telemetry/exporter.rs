@@ -83,7 +83,7 @@ use super::input::{InputFilter, InterventionKind, LONE_ESCAPE_WINDOW, PASTE_IDLE
 use super::launch::LAUNCH_ENV_KEYS;
 use super::propagation::{RunIdentity, agent_env};
 use super::resource::{ResourceAttribute, deck_resource, host_name};
-use super::run_context::{ProbeSettings, Probes};
+use super::run_context::{BranchReads, ProbeSettings, Probes};
 use super::span::{SpanRecord, new_run_id};
 use super::tracker::{EndReason, FinishingRun, RunGeneration, RunStart, RunTracker};
 use super::{Protocol, now_unix_nanos, otlp};
@@ -768,6 +768,8 @@ struct Exporting {
     shared: Arc<Shared>,
     commands: mpsc::UnboundedSender<Command>,
     probes: Probes,
+    /// Issue #1981 M6: the branch reads spawns wait for.
+    branch_reads: BranchReads,
     ingest: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// When the daemon began a teardown a stop client is timing — see
     /// [`Telemetry::teardown_began`].
@@ -1123,9 +1125,16 @@ impl Telemetry {
         };
         if let Some(exporting) = &self.exporting {
             let run_id = start.run_id.clone();
+            // Read before the agent starts, so it is the branch the run
+            // started on, and outside the tracker's lock.
+            let branch = prepared
+                .cwd
+                .as_deref()
+                .and_then(|cwd| exporting.branch_reads.read(cwd));
             exporting.shared.with_tracker(|t| {
                 t.prepare_run_in(start, now_unix_nanos(), prepared.cwd.as_deref());
                 t.set_usage_dirs(&run_id, usage_dirs);
+                t.set_branch(&run_id, branch);
             });
         }
         Some(prepared)
@@ -1312,6 +1321,19 @@ impl Telemetry {
             reason,
             exit_code,
         });
+    }
+
+    /// Issue #1981 M8: an attach took `took` ([`super::observe_attach`]).
+    /// Counted in the open health interval; nothing happens when not
+    /// exporting or when health spans are off. Takes only the interval's own
+    /// lock, for as long as it takes to keep one sample.
+    pub fn observe_attach(&self, took: Duration) {
+        let Some(exporting) = &self.exporting else {
+            return;
+        };
+        if exporting.shared.health_interval.is_some() {
+            exporting.shared.lock_health().record_attach(took);
+        }
     }
 
     /// Issue #1981 M7: the delegate path posted `posted`'s task: open its
@@ -1890,7 +1912,22 @@ impl Shared {
 
     /// Issue #1981 M8: end the health interval at `now`, the daemon's
     /// resident memory then being `rss`, and queue its `daemon.health` span.
+    #[cfg(test)]
     fn sample_health(&self, now: u64, rss: Option<u64>) {
+        let ended = self.cut_health(now);
+        self.send_health(ended, now, rss);
+    }
+
+    /// Issue #1981 M8: end the health interval at `now`, before its memory
+    /// is read, so an attach that finishes during the read counts in the
+    /// next interval rather than in one that ended before it.
+    fn cut_health(&self, now: u64) -> super::health::Window {
+        self.lock_health().cut(now)
+    }
+
+    /// Queue the `daemon.health` span of `ended`, which ended at `now` with
+    /// the daemon's resident memory then being `rss`.
+    fn send_health(&self, ended: super::health::Window, now: u64, rss: Option<u64>) {
         let runs_open = self
             .tracker
             .lock()
@@ -1899,8 +1936,7 @@ impl Shared {
         let dropped = self
             .dropped_total
             .load(std::sync::atomic::Ordering::Relaxed);
-        let span = self.lock_health().close(now, runs_open, rss, dropped);
-        self.enqueue(vec![span]);
+        self.enqueue(vec![ended.span(now, runs_open, rss, dropped)]);
     }
 
     fn enqueue(&self, spans: Vec<SpanRecord>) {
@@ -1975,6 +2011,7 @@ fn start_exporting(
         shared,
         commands,
         probes: Probes::new(settings.probes),
+        branch_reads: BranchReads::default(),
         ingest: Mutex::new(Some(ingest)),
         teardown_began: OnceLock::new(),
     })
@@ -2056,8 +2093,9 @@ async fn run_ingest(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiver<C
                 // after it is that end's. No event is read meanwhile, and no
                 // lock is held across the read.
                 let now = now_unix_nanos();
+                let ended = shared.cut_health(now);
                 let rss = super::health::rss_bytes().await;
-                shared.sample_health(now, rss);
+                shared.send_health(ended, now, rss);
             }
             msg = next_event(&mut events) => match msg {
                 Ok(msg) => {
@@ -6716,6 +6754,54 @@ mod tests {
         );
     }
 
+    /// Issue #1981 M8: an attach the daemon reports goes into the next
+    /// `daemon.health` span, and none is counted with health spans off.
+    #[tokio::test]
+    async fn an_attach_is_counted_in_the_next_health_span() {
+        let (sink, mut rx) = mpsc::channel(QUEUE_CAPACITY);
+        let telemetry = Arc::new(Telemetry::start_with(
+            &env(&ON),
+            Settings {
+                sink: Some(sink),
+                health_interval: Some(Duration::from_millis(50)),
+                ..Settings::default()
+            },
+        ));
+        let before = now_unix_nanos();
+        crate::telemetry::observe_attach(Some(Arc::clone(&telemetry)), Duration::from_millis(42));
+        let mut health = Vec::new();
+        eventually("an interval after the attach", || {
+            health.extend(
+                captured(&mut rx)
+                    .into_iter()
+                    .filter(|s| s.name == crate::telemetry::SPAN_DAEMON_HEALTH),
+            );
+            health.iter().any(|s| s.start_unix_nanos >= before)
+        })
+        .await;
+        let counted: i64 = health
+            .iter()
+            .map(|s| health_attr(s, AttrKey::AttachLatencyCount).unwrap())
+            .sum();
+        assert_eq!(counted, 1, "{health:?}");
+        let sampled = health
+            .iter()
+            .find(|s| health_attr(s, AttrKey::AttachLatencyCount) == Some(1))
+            .unwrap();
+        assert_eq!(health_attr(sampled, AttrKey::AttachLatencyMax), Some(42));
+
+        // Health spans off: nothing to count it in, and nothing breaks.
+        let off = Telemetry::start_with(
+            &env(&ON),
+            Settings {
+                health_interval: None,
+                ..Settings::default()
+            },
+        );
+        off.observe_attach(Duration::from_millis(1));
+        crate::telemetry::observe_attach(None, Duration::from_millis(1));
+    }
+
     /// Issue #1981 M8: `event` as the daemon admits it from a producer,
     /// received `ms` milliseconds after its hook stamped it
     /// (`crate::daemon::admit_producer_event`).
@@ -7390,9 +7476,9 @@ mod tests {
 
     /// Issue #1981 M7 review: the worker's report on a task held for a
     /// prepared orchestrator run arrives before the run's held close: the
-    /// run had not ended, so the hand-off ends `reported`, with the report's
-    /// event, at the run's end; the orchestrator's acknowledgement after the
-    /// close does not move that end.
+    /// run had not ended, so the hand-off ends `reported` when the report
+    /// arrived, with its event; the orchestrator's acknowledgement after the
+    /// close records no read, the run having ended without one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_report_before_a_prepared_runs_held_close_ends_the_handoff_reported() {
         use crate::inbox::StateName;
@@ -7412,7 +7498,6 @@ mod tests {
             attr(handoff, AttrKey::HandoffOutcome),
             Some(&AttrValue::Str("reported".into()))
         );
-        assert_eq!(handoff.end_unix_nanos, run.end_unix_nanos);
         assert_eq!(
             event_names(handoff),
             vec![
@@ -7420,20 +7505,25 @@ mod tests {
                 crate::telemetry::EVENT_HANDOFF_REPORTED
             ]
         );
+        assert_eq!(handoff.end_unix_nanos, handoff.events[1].time_unix_nanos);
+        assert!(handoff.end_unix_nanos <= run.end_unix_nanos, "{handoff:?}");
+        assert_no_read(&spans);
+    }
+
+    fn assert_no_read(spans: &[SpanRecord]) {
         assert!(
-            handoff
-                .events
+            spans
                 .iter()
-                .all(|e| e.time_unix_nanos <= run.end_unix_nanos),
-            "{handoff:?}"
+                .all(|s| s.name != crate::telemetry::SPAN_AGENT_HANDOFF_READ),
+            "{spans:?}"
         );
     }
 
     /// Issue #1981 M7 review: a report that overtakes its task's post, then
     /// the post held for its prepared orchestrator run, the run's close, and
-    /// the orchestrator acknowledging the report: the acknowledgement came
-    /// after the close, so the hand-off ends `reported` at the run's end,
-    /// not at the acknowledgement.
+    /// the orchestrator acknowledging the report: the hand-off ends
+    /// `reported` when the post finds the report, and the acknowledgement,
+    /// after the close, records no read.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_acknowledgement_after_a_held_close_of_a_report_that_overtook_its_post_stays_after_it()
      {
@@ -7465,7 +7555,8 @@ mod tests {
             attr(handoff, AttrKey::HandoffOutcome),
             Some(&AttrValue::Str("reported".into()))
         );
-        assert_eq!(handoff.end_unix_nanos, run.end_unix_nanos);
+        assert!(handoff.end_unix_nanos <= run.end_unix_nanos, "{handoff:?}");
+        assert_no_read(&spans);
     }
 
     /// Issue #1981 M7: the delegate seam and the inbox's broadcast make one
@@ -7541,6 +7632,11 @@ mod tests {
             .collect();
         assert_eq!(handoffs.len(), 1, "{spans:?}");
         let handoff = handoffs[0];
+        // The orchestrator's acknowledgement is a read span of its own.
+        let read = spans
+            .iter()
+            .find(|s| s.name == crate::telemetry::SPAN_AGENT_HANDOFF_READ)
+            .expect("a read span");
         assert_eq!(
             attr(handoff, AttrKey::HandoffOutcome),
             Some(&AttrValue::Str("reported".into()))
@@ -7559,5 +7655,9 @@ mod tests {
         assert_eq!(handoff.trace_id, run.trace_id);
         assert_eq!(handoff.parent_span_id, Some(run.span_id));
         assert!(!format!("{handoff:?}").contains("SENTINEL"));
+        assert_eq!(read.trace_id, handoff.trace_id);
+        assert_eq!(read.parent_span_id, Some(handoff.span_id));
+        assert_eq!(read.start_unix_nanos, handoff.end_unix_nanos);
+        assert!(!format!("{read:?}").contains("SENTINEL"));
     }
 }

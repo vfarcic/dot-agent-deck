@@ -168,7 +168,7 @@
 
     <section class="story" aria-labelledby="story-title">
       <!--
-        The four steps are <h3>s, so the section needs an <h2> above them or
+        The steps are <h3>s, so the section needs an <h2> above them or
         the document outline jumps a level. The design has no room for a
         visible one, so it is visually hidden rather than dropped.
       -->
@@ -241,17 +241,71 @@
           <p>Ask a dispatcher for something — “work on the search bug” — and it makes a separate copy of your repository and puts an agent, or a whole orchestration, to work inside it. It works in that copy rather than in your working tree, so start as many as you like and carry on with what you were doing. Each unit arrives on the deck, as a card or a tab in the terminal UI and as a row or a group in the desktop app, and reports back when it is done.</p>
         </div>
         <!--
-          A single frame: the dispatcher's work is a conversation in an
-          agent's pane and the desktop fixture has no dispatcher transcript to
-          capture, so the caption says what the desktop app does instead.
+          The desktop frame is a capture by hand, not from a cargo
+          docs-screenshots scenario: the desktop fixture has no dispatcher
+          transcript. Its arrows are the maintainer's, kept on purpose
+          (issue #1995).
         -->
-        <div class="storyFigures storyFiguresSingle">
+        <div class="storyFigures">
           <figure class="storyFigure">
             <span class="storyFigureLabel">Terminal UI</span>
             <img src="/img/dispatch.webp" loading="lazy" alt="A dispatcher pane in the terminal UI. The request asks for three dispatched agents or teams at a time, counting the two already running, and a stop at twenty in total; the dispatcher reads it back as a standing loop that keeps three units running, dispatches a fresh one each time a slot frees, and stops once twenty have been dispatched, with eighteen more to go">
-            <figcaption>A dispatcher pane with two units already up, asked to keep three running at a time and stop at twenty — which it reads back as a standing loop with eighteen still to go. In the desktop app a dispatcher is an agent like any other: you talk to it in its pane, and the units it starts appear on the dashboard.</figcaption>
+            <figcaption>A dispatcher pane with two units already up, asked to keep three running at a time and stop at twenty — which it reads back as a standing loop with eighteen still to go.</figcaption>
+          </figure>
+          <figure class="storyFigure">
+            <span class="storyFigureLabel">Desktop app</span>
+            <img src="/img/dispatch-desktop.png" loading="lazy" alt="The desktop app’s view of a dispatcher, a Claude Code agent, with its terminal open: the dispatcher offers to run each unit in its own worktree and asks what to work on, and the request below asks for up to 15 issues and up to 3 PRDs, letting it choose which ones and whether each gets a single agent or an orchestration, with three yellow arrows pointing at the request">
+            <figcaption>In the desktop app a dispatcher is an agent like any other: you talk to it in its terminal, here asking for up to fifteen issues and three PRDs, and the units it starts appear on the dashboard.</figcaption>
           </figure>
         </div>
+      </div>
+
+      <!--
+        Telemetry (issue #1995). Every claim here is one docs/telemetry.md
+        makes: keep it that way when rewording. The privacy sentence is about
+        the deck's own record; the agents' own telemetry is a separate stream.
+      -->
+      <div class="storyRow">
+        <div class="storyText">
+          <span class="storyStep">05</span>
+          <h3>Know what every run did</h3>
+          <p>Point the deck at the OpenTelemetry backend of your choice, hosted or your own, and it sends a record of every agent run: which agent ran, in which role, how long it worked, when you stepped in, what kinds of shell commands it ran, how long its pull request’s CI took, how it ended, and, for the agents that report them, how many tokens it used on which model and what they would cost at list price. Over weeks and across machines, that tells you which agent or model finishes a kind of task with the least help from you, and how much of a run went to tests and CI.</p>
+          <p>It is off until you turn it on, and works the same whichever client you use. The deck’s record is metadata only: prompts, file contents, agent output and your API key are never part of it, and each agent’s own telemetry, which the deck can switch on and tie to the same run, follows that agent’s settings. On Linux, an optional collector you run beside the deck adds CPU and memory per run, and disk per worktree.</p>
+        </div>
+        <!--
+          A single frame: telemetry has no screen in either client, so the
+          frame is the backend it lands in. The capture is by hand, not from
+          a cargo docs-screenshots scenario: it is a real week of the deck's
+          own runs in Honeycomb.
+        -->
+        <div class="storyFigures storyFiguresSingle">
+          <figure class="storyFigure">
+            <span class="storyFigureLabel">Example: Honeycomb</span>
+            <img src="/img/telemetry-honeycomb.png" loading="lazy" alt="Honeycomb’s Query Results for the dot-agent-deck dataset in dark theme: a week of agent runs charted as a count, a duration heatmap and median duration, one coloured line per agent, beside the dataset’s schema listing deck.agent and the deck.ci attributes">
+            <figcaption>One example backend: a week of the deck’s own runs in Honeycomb, one line per agent. Any backend that accepts OpenTelemetry over HTTP works.</figcaption>
+          </figure>
+        </div>
+      </div>
+    </section>
+
+    <!--
+      The video (issue #1995). The served HTML holds a poster that links to
+      the video on YouTube, not a player: the script at the end of the page
+      swaps in the youtube-nocookie player only when the poster is clicked,
+      so no YouTube player loads, and no YouTube cookie is set, before the
+      visitor asks for it. Without script, the poster is a plain link.
+    -->
+    <section class="video" aria-labelledby="video-title">
+      <div class="videoInner">
+        <h2 id="video-title" class="sectionTitle">See it run</h2>
+        <p class="videoIntro">The deck at work: forty-five agents across three machines, from the DevOps &amp; AI Toolkit channel.</p>
+        <div class="videoFrame">
+          <a class="videoPoster" id="video-poster" href="https://www.youtube.com/watch?v=aTB4Iou5YfU" data-embed="https://www.youtube-nocookie.com/embed/aTB4Iou5YfU?autoplay=1" aria-label="Play the video: How I Manage 45 AI Agents Across 3 Machines">
+            <img src="https://i.ytimg.com/vi/aTB4Iou5YfU/maxresdefault.jpg" loading="lazy" width="1280" height="720" alt="">
+            <span class="videoPlay" aria-hidden="true"><svg viewBox="0 0 24 24" width="28" height="28"><path fill="currentColor" d="M8 5.5v13l10.5-6.5z"/></svg></span>
+          </a>
+        </div>
+        <p class="videoCaption">How I Manage 45 AI Agents Across 3 Machines · <a href="https://www.youtube.com/watch?v=aTB4Iou5YfU">Watch on YouTube →</a></p>
       </div>
     </section>
 
@@ -384,6 +438,25 @@
           copy.textContent = 'Copied';
           setTimeout(function () { copy.textContent = 'Copy'; }, 2000);
         }, function () {});
+      });
+    }
+    // Click to load: the poster becomes the player only when asked for.
+    var poster = document.getElementById('video-poster');
+    if (poster) {
+      poster.addEventListener('click', function (event) {
+        // A modified click keeps its usual meaning: a new tab or window.
+        if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) {
+          return;
+        }
+        event.preventDefault();
+        var player = document.createElement('iframe');
+        player.src = poster.getAttribute('data-embed');
+        player.title = 'How I Manage 45 AI Agents Across 3 Machines';
+        player.allow = 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share';
+        player.referrerPolicy = 'strict-origin-when-cross-origin';
+        player.allowFullscreen = true;
+        poster.replaceWith(player);
+        player.focus();
       });
     }
   })();

@@ -89,7 +89,7 @@ To see everything one run did, take its `deck.run.id` from an `agent.run` span a
 
 ## What the deck sends
 
-The deck sends traces with six kinds of spans: `agent.run`, one per agent run, and, as children of their run, `agent.status`, one per stretch of time the agent spent in one status, `agent.operation`, one per shell command the agent ran, and `agent.ci`, one per stretch of time the run's pull request had CI checks running. An orchestrator's run also has `agent.handoff`, one per task it delegated. Apart from the runs, the daemon sends `daemon.health` about once a minute, on its own health.
+The deck sends traces with seven kinds of spans: `agent.run`, one per agent run, and, as children of their run, `agent.status`, one per stretch of time the agent spent in one status, `agent.operation`, one per shell command the agent ran, and `agent.ci`, one per stretch of time the run's pull request had CI checks running. An orchestrator's run also has `agent.handoff`, one per task it delegated, and under it `agent.handoff.read`, one per report the orchestrator read. Apart from the runs, the daemon sends `daemon.health` about once a minute, on its own health.
 
 A run starts when the deck starts an agent in a pane and ends when the agent exits, its pane is closed, or the daemon shuts down. Restarting an agent in the same pane starts a new run with a new id. **A value the deck cannot determine is left out, never guessed and never sent empty.** The deck does not send a span for a run that is still open when the daemon crashes or is killed by force.
 
@@ -117,6 +117,7 @@ A run starts when the deck starts an agent in a pane and ends when the agent exi
 | `deck.orchestrator` | `true` for the orchestration's orchestrator, `false` for its other roles. |
 | `deck.instructions.commit` | The commit that last changed `CLAUDE.md`, `AGENTS.md` or `.claude/skills` at the root of the agent's repository, whichever directory in it the agent runs from, so you can compare runs before and after an instructions change. Absent outside a git repository or when none of those has any history. |
 | `vcs.repository.name` | The repository's name, taken from the last part of its `origin` remote (`dot-agent-deck` for `git@github.com:vfarcic/dot-agent-deck.git`). The remote's URL itself is never sent. |
+| `vcs.ref.head.name` | The git branch checked out in the agent's working directory when the run started, such as `agent/dispatch-fix-login` for a unit started by `dot-agent-deck dispatch`. Use it to join a run to its pull request even when the run ended before the pull request existed. It is the branch name exactly as you or the agent named it, so it can carry private text: see [What is never sent](#what-is-never-sent) and [Trim what is sent](#trim-what-is-sent). Absent outside a git repository, on a detached `HEAD`, or when the repository's files did not answer within a quarter of a second, so a slow disk never holds up an agent's start. A branch the agent switches to later is not recorded. |
 | `deck.pr.number` | The pull request the agent's branch has, once the deck has found it (the same pull request the card's badge shows). The run keeps the last one it saw: when the branch later has no pull request, for example after the pull request merged and the worktree moved on, the run still names it. Absent when the run never saw one. |
 | `deck.dispatch.name` | For a run started by `dot-agent-deck dispatch`, the name the unit was dispatched with, exactly as given. Every role of a dispatched orchestration carries it. When the agent of a single-agent unit restarts, its new run can take a few seconds to get it, so a restarted agent that runs for less than that may not have it. |
 | `deck.run.end_reason` | `exited` (the agent exited by itself), `closed` (its pane was closed, or the deck stopped the agent, for example to restart it in its pane), `daemon_shutdown`, or `unknown` when the deck could not tell how the run ended. |
@@ -289,7 +290,7 @@ The deck checks the pull request about once a minute (`DOT_AGENT_DECK_PR_REFRESH
 
 ### `agent.handoff`
 
-One span per task an orchestrator delegates to a role, from when the deck puts the task in the worker's inbox to when the orchestrator acknowledges the worker's report. It is a child of the orchestrator's `agent.run`, so it sits in the orchestrator's trace.
+One span per task an orchestrator delegates to a role, from when the deck puts the task in the worker's inbox to when the worker's report reaches the orchestrator's inbox. It is a child of the orchestrator's `agent.run`, so it sits in the orchestrator's trace. When the orchestrator then reads the report, an [`agent.handoff.read`](#agenthandoffread) span records that.
 
 | Attribute | Value |
 | --- | --- |
@@ -306,11 +307,24 @@ Events on the span:
 | Event | When |
 | --- | --- |
 | `deck.handoff.taken` | The worker took the task from its inbox. |
-| `deck.handoff.reported` | The worker's report for the task reached the orchestrator's inbox. |
+| `deck.handoff.reported` | The worker's report for the task reached the orchestrator's inbox. It is at the span's end. |
 
-So the time from the span's start to `deck.handoff.taken` is how long the task waited for the worker, from `deck.handoff.taken` to `deck.handoff.reported` is the worker's work, and from `deck.handoff.reported` to the span's end is how long the orchestrator took to read the report. When the orchestrator's run ends before it reads a report that did arrive, the span ends with the run and its outcome is still `reported`. A task that a newer one to the same role supersedes keeps its hand-off open until its own report arrives, unless the newer task replaces it before the worker acknowledged it.
+So the time from the span's start to `deck.handoff.taken` is how long the task waited for the worker, and from `deck.handoff.taken` to the span's end is the worker's work. A task that a newer one to the same role supersedes keeps its hand-off open until its own report arrives, unless the newer task replaces it before the worker acknowledged it.
 
 A report sent with `work-done` but without `--task-id` cannot be matched to a task, so it ends no hand-off: it is counted in `deck.handoffs.uncorrelated.count` on the run that received it, and a hand-off whose worker reported that way ends `unknown` with its orchestrator's run. Only the ids, the role and the outcome are sent, never the task, the report or a message's subject.
+
+### `agent.handoff.read`
+
+One span per report the orchestrator read, from when the report reached its inbox to when the orchestrator acknowledged it (`dot-agent-deck ack`). Its duration is how long the report waited to be read. It is a child of the report's `agent.handoff`, in the same trace, and starts where that span ends, so a trace view shows the read right after the hand-off.
+
+| Attribute | Value |
+| --- | --- |
+| `deck.handoff.id` | The task's message id, as on its `agent.handoff`. |
+| `deck.run.id`, `deck.pane.id` | The orchestrator's run and pane. |
+| `deck.role` | The role the task went to. |
+| `deck.orchestration.id` | The orchestration, as on `agent.run`. |
+
+Fetching a report without acknowledging it is not a read. A read is recorded only while the deck still remembers the report: it forgets a report when the orchestrator's run ends, when the report is a day old, and when more than 256 reports are waiting to be read, oldest first. Acknowledging a forgotten report records nothing. So an `agent.handoff` with outcome `reported` and no `agent.handoff.read` with the same `deck.handoff.id` is a report with no recorded read: usually one nobody read, but possibly one read after the deck forgot it.
 
 ### `daemon.health`
 
@@ -322,22 +336,24 @@ One span per interval, about once a minute, from the daemon that runs your agent
 | `deck.daemon.runs.open` | How many agent runs the daemon had open at the end of the interval. |
 | `deck.daemon.hook_latency.count` | How many status reports from agents (their hooks) reached the deck in the interval. Updates the deck makes itself, such as a pane closing or a failure it read from an agent's log, are not counted. |
 | `deck.daemon.hook_latency.p50_ms`, `deck.daemon.hook_latency.p95_ms`, `deck.daemon.hook_latency.max_ms` | How long those reports took to reach the deck, in milliseconds: the median, the 95th percentile and the slowest. Absent when the count is `0`, so an average over time is not pulled down by quiet intervals. The time is measured from the moment the agent's hook stamped the report, by the agent's own clock, to the moment the deck received it, so it is a best estimate: a report stamped later than the deck received it counts as no delay. In an interval with more than 4,096 reports, the median and the 95th percentile are estimated from a random sample of 4,096 of them; the count and the slowest are always exact. |
+| `deck.daemon.attach_latency.count` | How many times a client attached to an agent's terminal in the interval, as the TUI and the desktop app do to show it, reconnecting included. An attach that fails, for example to an agent that has gone, is not counted. |
+| `deck.daemon.attach_latency.p50_ms`, `deck.daemon.attach_latency.p95_ms`, `deck.daemon.attach_latency.max_ms` | How long attaching took, in milliseconds, from the daemon taking the request to it having sent the pane's current screen: the median, the 95th percentile and the slowest. Absent when the count is `0`. A slow value means the agent's terminal came up late in the client. It is measured by the daemon, so it leaves out the time the request took to reach it and the time the client took to draw the screen. Sampled like the hook latencies above. |
 | `deck.telemetry.spans.dropped` | How many spans the deck could not send since the daemon started, because too many were waiting to be sent. It only grows; a rise between two intervals means spans were lost in between. |
 
 To send it more or less often, set `DOT_AGENT_DECK_TELEMETRY_HEALTH_INTERVAL_MS` in the daemon's environment to the interval in milliseconds. The shortest interval is 100 milliseconds, and a smaller value is raised to it; a value that is not a whole number above `0` keeps the one-minute default. To stop it, drop the `daemon.health` spans in a Collector ([Trim what is sent](#trim-what-is-sent)).
 
 ## What is never sent
 
-The deck builds what it sends from the attributes on this page. Some values are yours, and the deck sends them as you wrote them: `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES`, the orchestration and role names from your configuration, the name you give `dot-agent-deck dispatch`, and your repository's name (the last part of its `origin` remote). Do not put a secret or private content in any of them. Apart from those, the deck never sends:
+The deck builds what it sends from the attributes on this page. Some values are yours, and the deck sends them as you wrote them: `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES`, the orchestration and role names from your configuration, the name you give `dot-agent-deck dispatch`, your repository's name (the last part of its `origin` remote) and **the name of the branch an agent starts on** (`vcs.ref.head.name`). Do not put a secret or private content in any of them. Branch names in particular can carry private text: a branch named after a customer, an unreleased product or a security fix sends that name to your backend. To keep them out of it, delete `vcs.ref.head.name` in a Collector ([Trim what is sent](#trim-what-is-sent)). Apart from those, the deck never sends:
 
 - prompts, or anything you type into an agent (an intervention is counted, not recorded);
 - file contents, agent output, or the screen of a pane;
 - tool-call arguments, or anything else from an agent's tool calls;
 - the text of a delegated task, a worker's report or any other message, or a message's subject;
 - secrets: API keys, the values of environment variables, and the values of your OTLP headers (those go to the endpoint you configured as headers, and to nothing else, and the deck does not write them to its log);
-- pane titles, status details, branch names, working-directory paths, remote URLs, or command lines;
+- pane titles, status details, working-directory paths, remote URLs, or command lines;
 - an agent's error messages: a failed run carries the kind of failure from a known list, or `other`;
-- other names you chose: a model name is sent only when the deck recognises it as a known model's name, and a Codex plan only from the plans Codex is known to report. The branch a dispatch creates is not sent.
+- other names you chose: a model name is sent only when the deck recognises it as a known model's name, and a Codex plan only from the plans Codex is known to report.
 
 The [collector](#cpu-memory-and-disk-per-run), a separate program you run yourself, sends a worktree's path only when you start it with `--send-worktree-paths`; [What it sends](#what-it-sends) has its list.
 
@@ -591,6 +607,8 @@ processors:
   attributes/trim:
     actions:
       - key: vcs.repository.name
+        action: delete
+      - key: vcs.ref.head.name
         action: delete
       - key: deck.orchestration.name
         action: delete

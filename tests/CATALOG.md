@@ -90,7 +90,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### telemetry/otlp/004 — Private content stays out of exports and telemetry-module logs while interventions remain visible.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
 - **Agent:** synthetic shell and cat with synthesized hook content.
-- **Asserts:** with HTTP/JSON, distinct sentinels from output, TUI-typed human input, prompt/tool hook fields, pane title, OTLP secret header, file contents printed by the stand-in, git branch, command argument, pane cwd directory and an ordinary environment value appear in no received request body, URI, non-authentication header or captured telemetry-module log line; the telemetry exporter's startup log is present, the authentication header arrives as intended and the completed run contains an intervention event. A successor actually reads the private file in the privately named git cwd before its run is exported.
+- **Asserts:** with HTTP/JSON, distinct sentinels from output, TUI-typed human input, prompt/tool hook fields, pane title, OTLP secret header, file contents printed by the stand-in, command argument, pane cwd directory and an ordinary environment value appear in no received request body, URI, non-authentication header or captured telemetry-module log line; the git branch is sent, as the successor run's `vcs.ref.head.name` (issue #1981 M6), and appears in no URI, non-authentication header or telemetry-module log line; the telemetry exporter's startup log is present, the authentication header arrives as intended and the completed run contains an intervention event. A successor actually reads the private file in the privately named git cwd before its run is exported.
 - **Does not assert:** content policies for an external agent's own exporter or daemon log targets outside dot_agent_deck::telemetry and its submodules.
 - **Platform coverage:** mac+linux.
 
@@ -153,7 +153,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### telemetry/otlp/013 — Protobuf exports exclude private content across the binary's export pipeline.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
 - **Agent:** synthetic shell and cat with synthesized hook content.
-- **Asserts:** the same private channels as 004 stay absent from raw HTTP/protobuf request bodies, URIs, non-authentication headers and telemetry-module logs. Accepted protobuf bodies contain the original and successor run ids with agent.run, the original run exports a human intervention, the authentication header arrives and the telemetry startup log is captured.
+- **Asserts:** the same private channels as 004 stay absent from raw HTTP/protobuf request bodies, URIs, non-authentication headers and telemetry-module logs, and as in 004 the git branch is the exception in bodies: the successor run's accepted body carries it. Accepted protobuf bodies contain the original and successor run ids with agent.run, the original run exports a human intervention, the authentication header arrives and the telemetry startup log is captured.
 - **Does not assert:** a full protobuf schema decode or privacy of external agents' own telemetry.
 - **Platform coverage:** mac+linux.
 
@@ -13200,7 +13200,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 ##### inbox/pi/028 — A Pi extension version replacement disposes, drains and transfers.
 - **Layer:** Fast (`src/orchestrator_ext.rs` running `pi-extension/test/inbox.test.ts` under Node), a stand-in receipt watcher and a stand-in Pi.
 - **Agent:** none.
-- **Asserts:** The old receiver is disposed before its drain, the drain is awaited (exit, or SIGTERM then SIGKILL at the deadline), two initializers share one replacement, a compatible state answers `retained` and an incompatible one `unknown` (a different state shape, or version 1, never released), revokes answer `already_handed` and nothing is reported `not_handed`, and the disposed receiver delivers nothing to Pi. During the drain the old receiver still takes a message and a revoke and keeps a commit the reload's successor witnessed; afterwards the message goes to the successor, the re-sent revoke is answered `revoked_ack` and the commit is published by the new watcher. An attempt waiting for approval and one queued behind it both reach the successor, in order, each behind a fresh `may`. A passed attempt's reload ownership is carried, so a later settle or the successor's `/new` releases it `lost`, also when the outgoing session's reload shutdown arrives after the replacement finished and the successor started. Across an incompatible replacement the successor's session number is above the outgoing one's, and the outgoing session's delayed shutdown reports no Idle after the successor's Thinking, also when the old state had no count to carry. `INBOX_VERSION` is above 2, so a reload from version 2 replaces its receiver: its three waiting messages are carried and handed to the successor one admission at a time. It is above 4 too, so a reload from version 4, whose questions carried no possession, replaces that receiver: the carried message is answered `retained` and the successor's `may` for it carries a possession snapshot listing it on the same line (#1940).
+- **Asserts:** The old receiver is disposed before its drain, the drain is awaited (exit, or SIGTERM then SIGKILL at the deadline), two initializers share one replacement, a compatible state answers `retained` and an incompatible one `unknown` (a different state shape, or version 1, never released), revokes answer `already_handed` and nothing is reported `not_handed`, and the disposed receiver delivers nothing to Pi. During the drain the old receiver still takes a message and a revoke and keeps a commit the reload's successor witnessed; afterwards the message goes to the successor, the re-sent revoke is answered `revoked_ack` and the commit is published by the new watcher. An attempt waiting for approval and one queued behind it both reach the successor, in order, each behind a fresh `may`. A passed attempt's reload ownership is carried, so a later settle or the successor's `/new` releases it `lost`, also when the outgoing session's reload shutdown arrives after the replacement finished and the successor started. Across an incompatible replacement the successor's session number is above the outgoing one's, and the outgoing session's delayed shutdown reports no Idle after the successor's Thinking, also when the old state had no count to carry. `INBOX_VERSION` is above 2, so a reload from version 2 replaces its receiver: its three waiting messages are carried and handed to the successor one admission at a time. It is above 4 too, so a reload from a receiver labelled version 4 (a current receiver relabelled by its version marker; the historical version 4 receiver, whose questions carried no possession, is not executed) replaces that receiver: the carried message is answered `retained` and the successor's `may` for it carries a possession snapshot listing it on the same line (#1940).
 - **Does not assert:** A real Pi reload (lane 2).
 - **Platform coverage:** all (prints `SKIP:` without Node 23.6+).
 - **Cost:** under a second.
@@ -13770,12 +13770,12 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 - **Does not assert:** real-agent detection or retrospective relabelling of child spans exported before identifying hooks.
 - **Platform coverage:** mac+linux.
 
-##### telemetry/otlp/027 — A dispatched run exports its registry unit name without exporting its branch.
+##### telemetry/otlp/027 — A dispatched run exports its registry unit name and its branch.
 
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_span_identity.rs`).
 - **Agent:** declared Pi shell/cat caller and dispatched single unit.
-- **Asserts:** the real dispatch CLI starts a unit in its worktree; the completed run carries deck.dispatch.name equal to the requested unit and exported spans exclude its branch name.
-- **Does not assert:** dispatched orchestration workers, registry recovery after daemon restart or full branch/content privacy (telemetry/otlp/004).
+- **Asserts:** the real dispatch CLI starts a unit in its worktree; the completed run carries deck.dispatch.name equal to the requested unit and vcs.ref.head.name equal to the unit's branch (issue #1981 M6, which reversed the earlier withholding of branch names).
+- **Does not assert:** dispatched orchestration workers, registry recovery after daemon restart or content privacy (telemetry/otlp/004).
 - **Platform coverage:** mac+linux.
 
 ## Test Case Catalog — Intervention kinds
@@ -13862,11 +13862,11 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 
 ## Test Case Catalog — Telemetry handoffs and daemon health
 
-##### telemetry/otlp/038 — A delegated task ends its handoff when the orchestrator acknowledges its report.
+##### telemetry/otlp/038 — A delegated task ends its handoff when the report arrives, and the orchestrator's acknowledgement is a read span.
 
 - **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_handoff.rs`); local OTLP/JSON receiver and real delegate, work-done, fetch and ack CLI calls.
 - **Agent:** two Python PTY stand-ins; no real agent or credential.
-- **Asserts:** one delegated task exports one agent.handoff after report acknowledgement, remains unexported while its report is queued or merely fetched, has one taken and one reported event in timestamp order, carries the orchestrator run/pane/trace/parent, worker run id, worker role and orchestration id, ends reported, survives subsequent run closure without duplication and excludes private task/report sentinels from captured raw JSON bodies.
+- **Asserts:** one delegated task exports one agent.handoff once its report arrives, while the report is still unread and the orchestrator alive, ending reported at the reported event's time, with one taken and one reported event in timestamp order, the orchestrator run/pane/trace/parent, worker run id, worker role and orchestration id; a mere fetch of the report exports no agent.handoff.read, and the acknowledgement exports exactly one, a child of the handoff in its trace, from the report's arrival to after the ack, with the orchestrator's run, pane, the role and orchestration id (issue #1981 M7, which moved the handoff's end from the read to the report); neither is duplicated at run closure, and private task/report sentinels are absent from captured raw JSON bodies.
 - **Does not assert:** natural orchestrator exit before acknowledgement, worker respawn identity refresh, superseding, daemon shutdown, bounded-map eviction or privacy of external agent SDKs.
 - **Platform coverage:** mac+linux.
 
@@ -13874,7 +13874,7 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 
 - **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_handoff.rs`); real delegate CLI and local OTLP/JSON receiver.
 - **Agent:** two Python PTY stand-ins; the test terminates its own worker PID before task fetch.
-- **Asserts:** the inbox marks the posted task undeliverable, one agent.handoff exports outcome=undeliverable with the agent_exited enum reason, orchestrator parent/trace and worker role, no reported event, no duplicate at orchestrator closure and no private task text in raw JSON bodies.
+- **Asserts:** the inbox marks the posted task undeliverable, one agent.handoff exports outcome=undeliverable with the agent_exited enum reason, orchestrator parent/trace and worker role, no reported event, no agent.handoff.read, no duplicate at orchestrator closure and no private task text in raw JSON bodies.
 - **Does not assert:** deliberate StopAgent cancellation, absent target roles that were never posted, delivery retry exhaustion, or other undeliverable reasons.
 - **Platform coverage:** mac+linux.
 
@@ -13882,7 +13882,7 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 
 - **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_handoff.rs`); real work-done and inbox-fetch CLI calls and local OTLP/JSON receiver.
 - **Agent:** two Python PTY stand-ins with no commissioned task.
-- **Asserts:** a real note reaches the orchestrator, its completed agent.run has deck.handoffs.uncorrelated.count=1, no agent.handoff is invented, and the private report sentinel is absent from captured raw JSON bodies.
+- **Asserts:** a real note reaches the orchestrator, its completed agent.run has deck.handoffs.uncorrelated.count=1, no agent.handoff or agent.handoff.read is invented, and the private report sentinel is absent from captured raw JSON bodies.
 - **Does not assert:** report retry deduplication, several uncorrelated notes, or a report sent while a commissioned task is outstanding.
 - **Platform coverage:** mac+linux.
 
@@ -13900,4 +13900,12 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 - **Agent:** one Python PTY stand-in with exactly one timestamped producer hook; no real agent.
 - **Asserts:** a producer Thinking hook is observed, a real stop produces an observed daemon-synthetic SessionEnd, health intervals spanning the actions count one sample in total, its single-sample p50/p95/max retain at least 1.4 seconds of the injected 1.5-second age, and a later quiet interval resets count to zero and omits latency quantiles.
 - **Does not assert:** exact delivery latency, multi-sample percentile algorithms, every synthetic event variant, queue overflow, OTLP logs or attach latency.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/043 — Attaching to an agent's terminal is timed on daemon health.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_attach_latency.rs`); real attach socket, local OTLP/JSON receiver and shortened health interval.
+- **Agent:** two Python PTY stand-ins; no real agent or credential.
+- **Asserts:** three attaches to the orchestrator's terminal over the real attach socket are counted in deck.daemon.attach_latency.count on the daemon.health spans that follow (at least three, the TUI's own attaches included), every interval with attaches has ordered p50 <= p95 <= max, and intervals with none omit the quantiles.
+- **Does not assert:** exact latency values, the client's own drawing time, that a failed attach is not counted, or attaches from the desktop app.
 - **Platform coverage:** mac+linux.
