@@ -10358,6 +10358,14 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** real-agent fidelity, containment, capture timing, publication or admission authority, or SC-15's future reviewed sandbox templates. Shipped capture fact checks extend `inbox/doorbell/036` and `/047` instead of assigning them new IDs.
 - **Platform coverage:** mac+linux (same offline bytes and templates; no platform identity or process reads).
 
+##### inbox/doorbell/061 — Local release-check store fences stale results and preserves revocations across crashes.
+
+- **Layer:** Fast (`tests/release_check_store.rs`), offline filesystem contract with tempdirs and instance-local fault injection; no daemon or PTY.
+- **Agent:** none; synthetic executable digests and owner identities, no credential or process lookup.
+- **Asserts:** all nine store transition rows and every pruning checkpoint/table column, both non-durable unlink recovery outcomes, epoch recovery, store-id and floor CAS fences, Forget and evidence eviction, floor-fenced recreation, durable ring marks and PendingTrip, dead-owner-only conversion and retry, watermark preservation under seeded random rows and a guaranteed random crash, image agreement, no-follow operations, validated names, private modes, retention order and independent-handle lock serialization. Every injected crash is checked at its named boundary and after recovery.
+- **Does not assert:** SC-02 identity measurement, evaluator correctness, daemon atomic latches or watch delivery, terminal transaction revocation, capture limits, real ring bytes, UI state or real-agent execution. Initially interface RED at the absent store module; assertions require implementation before behavioral verification.
+- **Platform coverage:** Linux only; tempfile roots, no real HOME or state directory.
+
 ##### inbox/probe/001 — Every PTY op that carries bytes moves the generation's input epoch before the writer thread can see it.
 - **Layer:** Fast, in-module in `src/agent_pty_input_epoch_tests.rs`: the real `PtyWriterThread` and `PaneWriter` over a test writer that records the epoch it finds at each `write`, gated so a job stays queued; no PTY, agent or daemon.
 - **Agent:** none.
