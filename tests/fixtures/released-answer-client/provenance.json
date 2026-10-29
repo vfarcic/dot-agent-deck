@@ -1,0 +1,66 @@
+[
+  {
+    "tag": "v0.49.2",
+    "path": "desktop/src-tauri/src/voice/lease.rs",
+    "first": 1,
+    "last": 211,
+    "sha256": "77e5eb389c665aaab0734c37535fd2a30a7cc8d2365ae2f056935a53249baf06"
+  },
+  {
+    "tag": "v0.49.2",
+    "path": "src/daemon_client.rs",
+    "first": 3084,
+    "last": 3129,
+    "sha256": "a6be6570c4fb91e4f38cb8820845b7e89062181901379474fcbe02fde3eb39ec"
+  },
+  {
+    "tag": "v0.49.2",
+    "path": "src/daemon_protocol.rs",
+    "first": 2784,
+    "last": 2808,
+    "sha256": "1781073e50846ddf1d19b32e86483b53fb0c6d1d986a0cf3d68c1527d64a0d69"
+  },
+  {
+    "tag": "v0.49.2",
+    "path": "desktop/src-tauri/src/lib.rs",
+    "first": 3868,
+    "last": 3868,
+    "sha256": "fa657a95535172a567b779aa9e18553697c40c101ec1c9dff52b2a5324535f20"
+  },
+  {
+    "tag": "v0.49.2",
+    "path": "desktop/src-tauri/src/lib.rs",
+    "first": 3960,
+    "last": 3979,
+    "sha256": "28de5d940f8238cbd525e73ec70e372c5a1ed10cfbb4a8aba27fd15281c047dc"
+  },
+  {
+    "tag": "v0.49.2",
+    "path": "desktop/src-tauri/src/voice/question.rs",
+    "first": 1030,
+    "last": 1038,
+    "sha256": "1bbd3bb2bf758c91b37ec98a3c326f4dc79f42e9595344b1516c22604d8e4868"
+  },
+  {
+    "tag": "v0.49.2",
+    "path": "desktop/src-tauri/src/voice/question.rs",
+    "first": 1109,
+    "last": 1112,
+    "sha256": "cb48de96bd9215bbba6994dd5d086e96c4b84bfdd9b23d740ee1fe7eaae3730f"
+  },
+  {
+    "tag": "v0.49.2",
+    "path": "desktop/src-tauri/src/voice/question.rs",
+    "first": 1065,
+    "last": 1065,
+    "sha256": "02bbcf02f031ed63a993657c0564d9a64a3cbfcc7b9e4e1a220f126dca8c55bf"
+  },
+  {
+    "compiled_file": "client.rs",
+    "sha256": "4ea3f296b7e54e37ee39fdc0f4b05ed87da448c0d7214b41772b8dcf77c66d34"
+  },
+  {
+    "compiled_file": "lease.rs",
+    "sha256": "77e5eb389c665aaab0734c37535fd2a30a7cc8d2365ae2f056935a53249baf06"
+  }
+]

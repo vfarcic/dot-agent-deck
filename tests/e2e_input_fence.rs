@@ -6,9 +6,254 @@ mod common;
 mod fixture;
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
+#[rustfmt::skip]
+#[path = "fixtures/released-answer-client/client.rs"]
+mod released;
+
+pub use dot_agent_deck::{daemon_protocol, question};
 
 use fixture::{CAP, Fixture, REPLY};
 use spec::spec;
+
+fn released_hashes() {
+    use sha2::{Digest, Sha256};
+    let provenance: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+        "fixtures/released-answer-client/provenance.json"
+    ))
+    .unwrap();
+    for (name, source) in [
+        (
+            "client.rs",
+            include_str!("fixtures/released-answer-client/client.rs"),
+        ),
+        (
+            "lease.rs",
+            include_str!("fixtures/released-answer-client/lease.rs"),
+        ),
+    ] {
+        let expected = provenance
+            .iter()
+            .find(|entry| entry["compiled_file"] == name)
+            .unwrap();
+        assert_eq!(
+            Sha256::digest(source.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            expected["sha256"].as_str().unwrap(),
+            "frozen v0.49.2 {name} changed"
+        );
+    }
+}
+
+fn ask_recorder(f: &Fixture, id: &str) -> question::PendingQuestion {
+    let q = serde_json::json!({
+        "id": id, "kind": "choice", "channel": "keys", "raised_at_ms": 1,
+        "questions": [{"prompt": "Which colour?", "multi_select": false,
+            "options": [{"index": 1, "label": "Green", "role": "choice"},
+                        {"index": 2, "label": "Blue", "role": "choice"}]}],
+    });
+    assert!(
+        serde_json::from_value::<question::PendingQuestion>(q.clone())
+            .unwrap()
+            .sanitized()
+            .is_some(),
+        "the synthetic question must survive production validation"
+    );
+    f.hook_event("permission_request", Some(&q));
+    assert!(
+        common::wait_until(common::child_boot_budget(), || f
+            .live()
+            .is_some_and(|s| s.pending_question.is_some_and(|q| q.id == id))),
+        "question hook did not reach the live snapshot: {:?}",
+        f.live()
+    );
+    f.live().unwrap().pending_question.unwrap()
+}
+
+fn hook_during_answer(f: &Fixture) {
+    let tool_name = f.hook_event("tool_start", None);
+    assert!(
+        common::wait_until(common::child_boot_budget(), || f
+            .live()
+            .is_some_and(|s| s.active_tool.is_some_and(|t| t.name == tool_name))),
+        "a hook was blocked by the answer's lifecycle lock during the hold"
+    );
+    assert!(
+        f.live().unwrap().pending_question.is_some(),
+        "status hook must leave the question pending"
+    );
+}
+
+/// Scenario: A frozen v0.49.2 voice client answers the recorder's keyboard question with no fence. The released request completes as answered, its one digit reaches the terminal, and neither a client token nor a settlement entry appears; this controls the setup used by the held-answer cases.
+#[spec("question/answer/023")]
+#[test]
+fn question_answer_023_released_client_open_control() {
+    use std::sync::{Arc, Mutex};
+    released_hashes();
+    let f = Fixture::start(true);
+    let _attached = f.connect();
+    f.hook_event("session_start", None);
+    let q = ask_recorder(&f, "q-open-control");
+    let client = released::Client {
+        socket: f.answer_socket(),
+        sent: Arc::new(Mutex::new(Vec::new())),
+    };
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    assert_eq!(
+        runtime.block_on(client.voice_answer(f.agent_id(), &q.id, q.revision)),
+        released::lease::Leased::Sent(dot_agent_deck::daemon_client::AnswerReport::Answered)
+    );
+    f.expect_input(b"1");
+    f.expect_stable_input(b"1");
+    assert!(f.live().unwrap().answer_settlements.is_empty());
+    assert!(client.sent.lock().unwrap()[0].get("client_token").is_none());
+}
+
+/// Scenario: A frozen v0.49.2 voice client answers a synthetic keyboard question while the real daemon fences its input; status hooks still arrive and a repeat is refused immediately. Its real 15-second timeout displays the released unconfirmed warning, then release writes the answer exactly once without creating a token settlement.
+#[spec("question/answer/023")]
+#[test]
+fn question_answer_023_released_voice_timeout_then_one_write() {
+    use released::lease::Leased;
+    use std::sync::{Arc, Mutex};
+    released_hashes();
+    let f = Fixture::start(true);
+    let _attached = f.connect();
+    f.hook_event("session_start", None);
+    let q = ask_recorder(&f, "q-old-client");
+    f.fence();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let client = Arc::new(released::Client {
+        socket: f.answer_socket(),
+        sent: Arc::new(Mutex::new(Vec::new())),
+    });
+    let answer = {
+        let client = client.clone();
+        let id = f.agent_id().to_string();
+        let q = q.clone();
+        runtime.spawn(async move { client.voice_answer(&id, &q.id, q.revision).await })
+    };
+    f.wait_held(1, 0);
+    f.expect_stable_input(b"");
+    hook_during_answer(&f);
+    let repeat = runtime
+        .block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                client.voice_answer(f.agent_id(), &q.id, q.revision),
+            )
+            .await
+        })
+        .expect("repeat must refuse instead of queueing behind the first answer");
+    assert_eq!(
+        repeat,
+        Leased::Sent(dot_agent_deck::daemon_client::AnswerReport::Refused(
+            question::AnswerRefusal::AnswerInProgress
+        ))
+    );
+    assert_eq!(
+        released::progress_words("tester").1,
+        "Another answer to tester is still being sent — nothing was sent."
+    );
+    let timed_out = runtime.block_on(answer).unwrap();
+    assert_eq!(
+        timed_out,
+        Leased::Unconfirmed("the deck did not answer in time".into())
+    );
+    let report = released::timeout_outcome(timed_out, "tester");
+    assert_eq!(report.kind, "unconfirmed");
+    assert_eq!(
+        report.sentence,
+        "The answer may have been sent, but tester did not confirm it — check tester before answering again."
+    );
+    hook_during_answer(&f);
+    assert!(f.live().unwrap().answer_settlements.is_empty());
+    f.expect_stable_input(b"");
+    f.release();
+    f.expect_input(b"1");
+    f.expect_stable_input(b"1");
+    assert!(
+        f.live().unwrap().answer_settlements.is_empty(),
+        "a tokenless released client must not get a settlement entry"
+    );
+    let next = ask_recorder(&f, "q-after-timeout");
+    assert_eq!(
+        runtime.block_on(client.voice_answer(f.agent_id(), &next.id, next.revision)),
+        Leased::Sent(dot_agent_deck::daemon_client::AnswerReport::Answered),
+        "settling the timed-out consumer must release its answer reservation"
+    );
+    f.expect_input(b"11");
+    f.expect_stable_input(b"11");
+    assert!(f.live().unwrap().answer_settlements.is_empty());
+    for request in client.sent.lock().unwrap().iter() {
+        assert!(
+            request.get("client_token").is_none(),
+            "released request gained a token: {request}"
+        );
+    }
+}
+
+/// Scenario: A released voice answer waits behind a fence when a new question supersedes it, or the recorder exits and is replaced in the same pane. Releasing the old acceptance must type nothing into either recorder and must not create a token settlement; the successor's own fresh question remains answerable once.
+#[spec("question/answer/023")]
+#[test]
+fn question_answer_023_released_answer_superseded_or_retired() {
+    use released::lease::Leased;
+    use std::sync::{Arc, Mutex};
+    for retire in [false, true] {
+        let mut f = Fixture::start(true);
+        let _attached = f.connect();
+        f.hook_event("session_start", None);
+        let q = ask_recorder(&f, "q-before");
+        f.fence();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let client = Arc::new(released::Client {
+            socket: f.answer_socket(),
+            sent: Arc::new(Mutex::new(Vec::new())),
+        });
+        let answer = {
+            let client = client.clone();
+            let id = f.agent_id().to_string();
+            runtime.spawn(async move { client.voice_answer(&id, &q.id, q.revision).await })
+        };
+        f.wait_held(1, 0);
+        hook_during_answer(&f);
+        let next = if retire {
+            f.command("exit");
+            f.wait_exit();
+            f.replace();
+            f.hook_event("session_start", None);
+            let next = ask_recorder(&f, "q-successor");
+            assert_ne!(
+                f.old_release()["ok"],
+                true,
+                "a retired generation cannot release its successor"
+            );
+            assert!(f.previous_input().is_empty());
+            next
+        } else {
+            let next = ask_recorder(&f, "q-replacement");
+            f.release();
+            next
+        };
+        let outcome = runtime.block_on(answer).unwrap();
+        assert!(
+            !matches!(
+                outcome,
+                Leased::Sent(dot_agent_deck::daemon_client::AnswerReport::Answered)
+            ),
+            "superseded/retired accepted answer must not report a write: {outcome:?}"
+        );
+        f.expect_stable_input(b"");
+        assert!(f.live().unwrap().answer_settlements.is_empty());
+        assert_eq!(
+            runtime.block_on(client.voice_answer(f.agent_id(), &next.id, next.revision)),
+            Leased::Sent(dot_agent_deck::daemon_client::AnswerReport::Answered)
+        );
+        f.expect_input(b"1");
+        f.expect_stable_input(b"1");
+        assert!(f.live().unwrap().answer_settlements.is_empty());
+    }
+}
 
 /// Scenario: Attach to a raw-terminal recorder without opening a fence, send empty frames, split escape sequences, OSC replies, Ctrl+G encodings and a large paste, then detach and reattach. A resize must reach the terminal and the recorder must receive exactly the original bytes in order, once.
 #[spec("inbox/probe/015")]

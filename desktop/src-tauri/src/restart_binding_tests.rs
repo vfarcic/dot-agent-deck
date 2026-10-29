@@ -31,6 +31,9 @@ struct Script {
     /// Agent `1`'s live session state on every listing, when set — the voice
     /// answer pin's pending question rides in it.
     live: Option<serde_json::Value>,
+    answer_capability: Option<bool>,
+    answer_delay: Option<std::time::Duration>,
+    answer_requests: Vec<serde_json::Value>,
 }
 
 /// A deck whose daemon restarts at its socket as the same build. Every request
@@ -163,10 +166,36 @@ impl RestartingDeck {
                             let request: serde_json::Value =
                                 serde_json::from_slice(&payload).unwrap_or_default();
                             let op = request["op"].as_str().unwrap_or_default().to_string();
+                            if op == "answer-question" {
+                                let delay = {
+                                    let mut script = script.lock().unwrap();
+                                    script.answer_requests.push(request.clone());
+                                    if script.answer_delay.is_some()
+                                        && let Some(live) = script.live.as_mut()
+                                    {
+                                        live["pending_question"]["answer_queued"] = true.into();
+                                    }
+                                    script.answer_delay
+                                };
+                                if let Some(delay) = delay {
+                                    tokio::time::sleep(delay).await;
+                                }
+                            }
                             let reply = if op == "hello" {
                                 *script.lock().unwrap().hellos.entry(process).or_default() += 1;
                                 follow_on = request["follow_on"] == true;
-                                hello_from(process)
+                                let mut hello = hello_from(process);
+                                if let Some(advertise) = script.lock().unwrap().answer_capability {
+                                    let capabilities = hello.capabilities.get_or_insert_default();
+                                    capabilities.retain(|cap| cap != dot_agent_deck::daemon_protocol::CAP_ANSWER_SETTLEMENT);
+                                    if advertise {
+                                        capabilities.push(
+                                            dot_agent_deck::daemon_protocol::CAP_ANSWER_SETTLEMENT
+                                                .into(),
+                                        );
+                                    }
+                                }
+                                hello
                             } else {
                                 // A snapshot's host sample is observation, not
                                 // an action on an agent, and rides beside the
@@ -804,6 +833,106 @@ fn handshake_013_a_voice_answer_after_a_restart_answers_nothing() {
                 "control: the answer reaches the deck that listed the question; {:?}",
                 deck.received_by("a")
             );
+        }
+    }
+}
+
+/// Scenario: Invoke the real Tauri voice-answer command over mock-runtime IPC against a scripted daemon that holds the answer past its 15-second deadline. The command returns unconfirmed, its queued snapshot crosses the desktop projection, and each eventual outcome preserves the request's own token; an older daemon receives the same answer without a token.
+#[test]
+fn question_answer_024_tauri_timeout_and_settlement_bridge() {
+    use tauri::Manager;
+    use tauri::ipc::{CallbackFn, InvokeBody};
+    use tauri::test::{INVOKE_KEY, get_ipc_response, mock_builder};
+    use tauri::webview::InvokeRequest;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let _selection = runtime.block_on(crate::dto::SELECTION_LOCK.lock());
+    for supported in [true, false] {
+        let deck = {
+            let _entered = runtime.enter();
+            RestartingDeck::start("answer-settlement", "answer-process")
+        };
+        deck.ask(&permission_question());
+        {
+            let mut script = deck.script.lock().unwrap();
+            script.answer_capability = Some(supported);
+            script.answer_delay = supported.then_some(std::time::Duration::from_secs(16));
+        }
+        let _local = select(&deck);
+        let state = DesktopState::default();
+        let row = runtime.block_on(listed_row(&deck, &state));
+        let question = row.pending_question.unwrap();
+        let app = mock_builder()
+            .manage(state)
+            .invoke_handler(tauri::generate_handler![
+                crate::desktop_voice_answer_question
+            ])
+            .build(crate::app_context())
+            .unwrap();
+        let main = tauri::WebviewWindowBuilder::new(
+            &app,
+            crate::pr_browser::MAIN_WEBVIEW_LABEL,
+            tauri::WebviewUrl::default(),
+        )
+        .build()
+        .unwrap();
+        let answer = get_ipc_response(&main, InvokeRequest {
+            cmd: "desktop_voice_answer_question".into(), callback: CallbackFn(0), error: CallbackFn(1),
+            url: "tauri://localhost".parse().unwrap(),
+            body: InvokeBody::Json(serde_json::json!({
+                "deckId": crate::dto::deck_wire_id(&deck.endpoint()), "agentId": "1", "agent": "planner",
+                "questionId": question.id, "form": [{"questionIndex": 0, "optionIndices": [1]}],
+                "confirmedAlways": false, "lease": "41", "revision": question.revision, "incarnation": row.incarnation,
+            })),
+            headers: Default::default(), invoke_key: INVOKE_KEY.to_string(),
+        }).expect("the Tauri command returns an outcome").deserialize::<serde_json::Value>().unwrap();
+        let requests = deck.script.lock().unwrap().answer_requests.clone();
+        assert_eq!(requests.len(), 1);
+        if !supported {
+            assert!(
+                requests[0].get("client_token").is_none(),
+                "an older daemon must not receive a token"
+            );
+            assert_eq!(answer["kind"], "answered");
+            continue;
+        }
+        assert_eq!(requests[0]["client_token"], 41);
+        assert_eq!(answer["kind"], "unconfirmed");
+        assert_eq!(
+            answer["sentence"],
+            "The answer may have been sent, but planner did not confirm it — check planner before answering again."
+        );
+        let state = app.state::<DesktopState>();
+        let queued = runtime.block_on(listed_row(&deck, &state));
+        assert!(queued.pending_question.unwrap().answer_queued);
+        for outcome in [
+            "written",
+            "partial",
+            "superseded",
+            "retired",
+            "write_failed",
+        ] {
+            {
+                let mut script = deck.script.lock().unwrap();
+                let live = script.live.as_mut().unwrap();
+                live["pending_question"]["answer_queued"] = false.into();
+                live["answer_settlements"] = serde_json::json!([{
+                    "question_id": question.id, "revision": question.revision, "client_token": 41, "outcome": outcome,
+                }]);
+            }
+            let settled = runtime.block_on(listed_row(&deck, &state));
+            let dto = serde_json::to_value(settled).unwrap();
+            assert_eq!(
+                dto["answerSettlements"][0],
+                serde_json::json!({
+                    "questionId": question.id, "revision": question.revision, "clientToken": 41, "outcome": outcome,
+                })
+            );
+            assert_ne!(dto["pendingQuestion"]["answerQueued"], true);
         }
     }
 }
