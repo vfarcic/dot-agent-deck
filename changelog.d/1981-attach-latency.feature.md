@@ -1,0 +1,3 @@
+## Telemetry Times How Long Agents' Terminals Take to Open
+
+The `daemon.health` span the daemon sends about once a minute now also says how quickly its agents' terminals open in the TUI and the desktop app. `deck.daemon.attach_latency.count` is how many times a client attached to an agent's terminal in the interval, reconnecting included, and `deck.daemon.attach_latency.p50_ms`, `.p95_ms` and `.max_ms` are how long that took, from the daemon taking the request to it having sent the terminal's current screen. So you can spot a daemon that is slow to show you your agents, for example `MAX(deck.daemon.attach_latency.p95_ms)` over time. The quantiles are left out of an interval with no attach. See [Telemetry](https://agent-deck.devopstoolkit.ai/docs/telemetry.md).

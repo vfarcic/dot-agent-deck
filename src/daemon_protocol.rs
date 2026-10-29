@@ -8553,6 +8553,7 @@ async fn handle_attach_stream(
     geometry_updates: bool,
     client_id: Option<String>,
 ) -> io::Result<()> {
+    let attach_started = std::time::Instant::now();
     let handle = match registry.subscribe_with_viewport_for_client(
         &id,
         viewport,
@@ -8617,6 +8618,9 @@ async fn handle_attach_stream(
         let _ = write_or_timeout(&mut wr, KIND_STREAM_END, b"timeout").await;
         return Ok(());
     }
+    // Issue #1981 M8: the client has its screen; how long that took goes to
+    // the `daemon.health` span.
+    crate::telemetry::observe_attach(registry.telemetry(), attach_started.elapsed());
 
     let mut rx = handle.rx;
     let writer = handle.writer;

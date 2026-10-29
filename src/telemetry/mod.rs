@@ -383,6 +383,16 @@ pub fn observe_delegate_posted(telemetry: Option<Arc<Telemetry>>, posted: &Deleg
     }
 }
 
+/// Issue #1981 M8: the daemon streamed a pane to a client, `took` from taking
+/// the request to having written the pane's screen to it, which goes into
+/// the next `daemon.health` span ([`health`]). Nothing happens when
+/// telemetry or its health spans are off.
+pub fn observe_attach(telemetry: Option<Arc<Telemetry>>, took: std::time::Duration) {
+    if let Some(telemetry) = telemetry {
+        telemetry.observe_attach(took);
+    }
+}
+
 /// `deck.telemetry.schema_version`: bumped whenever the attribute set changes
 /// in a way that makes data recorded before and after it incomparable.
 pub const SCHEMA_VERSION: &str = "3";
@@ -496,6 +506,11 @@ pub enum AttrKey {
     HookLatencyP50,
     HookLatencyP95,
     HookLatencyMax,
+    /// Issue #1981 M8: how long attaches took on a `daemon.health` span.
+    AttachLatencyCount,
+    AttachLatencyP50,
+    AttachLatencyP95,
+    AttachLatencyMax,
     SpansDropped,
     /// Issue #1981 M8: a daemon log record's callsite ([`logs`]).
     LogTarget,
@@ -566,6 +581,10 @@ impl AttrKey {
         AttrKey::HookLatencyP50,
         AttrKey::HookLatencyP95,
         AttrKey::HookLatencyMax,
+        AttrKey::AttachLatencyCount,
+        AttrKey::AttachLatencyP50,
+        AttrKey::AttachLatencyP95,
+        AttrKey::AttachLatencyMax,
         AttrKey::SpansDropped,
         AttrKey::LogTarget,
         AttrKey::CodeFilePath,
@@ -630,6 +649,10 @@ impl AttrKey {
             AttrKey::HookLatencyP50 => "deck.daemon.hook_latency.p50_ms",
             AttrKey::HookLatencyP95 => "deck.daemon.hook_latency.p95_ms",
             AttrKey::HookLatencyMax => "deck.daemon.hook_latency.max_ms",
+            AttrKey::AttachLatencyCount => "deck.daemon.attach_latency.count",
+            AttrKey::AttachLatencyP50 => "deck.daemon.attach_latency.p50_ms",
+            AttrKey::AttachLatencyP95 => "deck.daemon.attach_latency.p95_ms",
+            AttrKey::AttachLatencyMax => "deck.daemon.attach_latency.max_ms",
             AttrKey::SpansDropped => "deck.telemetry.spans.dropped",
             AttrKey::LogTarget => "deck.log.target",
             AttrKey::CodeFilePath => "code.file.path",

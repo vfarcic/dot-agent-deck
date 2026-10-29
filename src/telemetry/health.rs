@@ -19,6 +19,11 @@
 //!   are estimated from a uniform sample of the whole interval. An empty
 //!   interval leaves the quantiles out rather than sending zeros, so an
 //!   average over time is not dragged down by quiet intervals;
+//! - `deck.daemon.attach_latency.count`, and when it is not zero `.p50_ms`,
+//!   `.p95_ms` and `.max_ms`: how long the interval's attaches took, from the
+//!   daemon taking a client's request to stream a pane to it having written
+//!   the pane's current screen, the snapshot replay, to the client. Sampled
+//!   and summarised as the hook latencies are;
 //! - `deck.telemetry.spans.dropped`: every span the export queue refused
 //!   since the daemon started, health spans included.
 //!
@@ -43,9 +48,9 @@ pub const INTERVAL_ENV: &str = "DOT_AGENT_DECK_TELEMETRY_HEALTH_INTERVAL_MS";
 /// raised to it.
 pub const MIN_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Latency samples one interval keeps: a uniform sample of every event in it
-/// (Algorithm R), so the quantiles describe the whole interval however many
-/// events it had. The count and the maximum are exact.
+/// Latency samples one interval keeps, per measure: a uniform sample of every
+/// event in it (Algorithm R), so the quantiles describe the whole interval
+/// however many events it had. The count and the maximum are exact.
 pub const MAX_SAMPLES: usize = 4096;
 
 /// The health interval `env` asks for: [`INTERVAL_ENV`] when it is a whole
@@ -60,13 +65,57 @@ pub fn interval(env: &EnvMap) -> Duration {
         })
 }
 
-/// One interval's hook latencies, from its start.
-#[derive(Debug)]
-pub struct Window {
-    start: u64,
+/// One interval's latencies of one kind: how many, the slowest, and a
+/// uniform sample of them.
+#[derive(Debug, Default)]
+struct Latencies {
     count: u64,
     max_ms: u64,
     samples: Vec<u64>,
+}
+
+impl Latencies {
+    /// One more latency of `ms` milliseconds, `rng` choosing which kept
+    /// sample it replaces once [`MAX_SAMPLES`] are kept.
+    fn record(&mut self, ms: u64, rng: &mut XorShift) {
+        self.count += 1;
+        self.max_ms = self.max_ms.max(ms);
+        if self.samples.len() < MAX_SAMPLES {
+            self.samples.push(ms);
+            return;
+        }
+        // Algorithm R: the `count`th event replaces a kept sample with
+        // probability MAX_SAMPLES / count, so every event of the interval is
+        // equally likely to be kept.
+        let slot = rng.next() % self.count;
+        if let Some(kept) = usize::try_from(slot)
+            .ok()
+            .and_then(|i| self.samples.get_mut(i))
+        {
+            *kept = ms;
+        }
+    }
+
+    /// The count, and when it is not zero the median, 95th percentile and
+    /// maximum, under the four keys given.
+    fn attributes(mut self, [count, p50, p95, max]: [AttrKey; 4]) -> Vec<Attribute> {
+        let mut attributes = vec![Attribute::int(count, int(self.count))];
+        if self.count > 0 {
+            self.samples.sort_unstable();
+            attributes.push(Attribute::int(p50, int(quantile(&self.samples, 50))));
+            attributes.push(Attribute::int(p95, int(quantile(&self.samples, 95))));
+            attributes.push(Attribute::int(max, int(self.max_ms)));
+        }
+        attributes
+    }
+}
+
+/// One interval's hook and attach latencies, from its start.
+#[derive(Debug)]
+pub struct Window {
+    start: u64,
+    hooks: Latencies,
+    attaches: Latencies,
     /// Chooses which sample a later event replaces.
     rng: XorShift,
 }
@@ -79,9 +128,8 @@ impl Window {
     fn seeded(start: u64, seed: u64) -> Self {
         Window {
             start,
-            count: 0,
-            max_ms: 0,
-            samples: Vec::new(),
+            hooks: Latencies::default(),
+            attaches: Latencies::default(),
             rng: XorShift::new(seed),
         }
     }
@@ -90,22 +138,14 @@ impl Window {
     /// read at `now`. A stamp after `now` reads as no delay.
     pub fn record(&mut self, stamped: u64, now: u64) {
         let ms = now.saturating_sub(stamped) / 1_000_000;
-        self.count += 1;
-        self.max_ms = self.max_ms.max(ms);
-        if self.samples.len() < MAX_SAMPLES {
-            self.samples.push(ms);
-            return;
-        }
-        // Algorithm R: the `count`th event replaces a kept sample with
-        // probability MAX_SAMPLES / count, so every event of the interval is
-        // equally likely to be kept.
-        let slot = self.rng.next() % self.count;
-        if let Some(kept) = usize::try_from(slot)
-            .ok()
-            .and_then(|i| self.samples.get_mut(i))
-        {
-            *kept = ms;
-        }
+        self.hooks.record(ms, &mut self.rng);
+    }
+
+    /// Issue #1981 M8: an attach took `took`, from the daemon taking the
+    /// request to it having written the pane's screen to the client.
+    pub fn record_attach(&mut self, took: Duration) {
+        let ms = u64::try_from(took.as_millis()).unwrap_or(u64::MAX);
+        self.attaches.record(ms, &mut self.rng);
     }
 
     /// End this interval at `now` with the measures taken then (`rss` from
@@ -117,13 +157,21 @@ impl Window {
         rss: Option<u64>,
         dropped: u64,
     ) -> SpanRecord {
-        let next = Window::seeded(now, self.rng.next());
-        let window = std::mem::replace(self, next);
-        window.span(now, runs_open, rss, dropped)
+        self.cut(now).span(now, runs_open, rss, dropped)
     }
 
-    fn span(mut self, now: u64, runs_open: usize, rss: Option<u64>, dropped: u64) -> SpanRecord {
-        let mut attributes = Vec::with_capacity(7);
+    /// End this interval at `now` and start the next one, giving the ended
+    /// one, whose span [`Self::span`] makes once the measures taken at its
+    /// end are in. What is recorded after the cut goes to the next interval,
+    /// however long those measures take.
+    pub fn cut(&mut self, now: u64) -> Window {
+        let next = Window::seeded(now, self.rng.next());
+        std::mem::replace(self, next)
+    }
+
+    /// This ended interval's span, ending at `now`.
+    pub fn span(self, now: u64, runs_open: usize, rss: Option<u64>, dropped: u64) -> SpanRecord {
+        let mut attributes = Vec::with_capacity(11);
         if let Some(rss) = rss {
             attributes.push(Attribute::int(AttrKey::DaemonMemoryRss, int(rss)));
         }
@@ -131,19 +179,18 @@ impl Window {
             AttrKey::DaemonRunsOpen,
             int(u64::try_from(runs_open).unwrap_or(u64::MAX)),
         ));
-        attributes.push(Attribute::int(AttrKey::HookLatencyCount, int(self.count)));
-        if self.count > 0 {
-            self.samples.sort_unstable();
-            attributes.push(Attribute::int(
-                AttrKey::HookLatencyP50,
-                int(quantile(&self.samples, 50)),
-            ));
-            attributes.push(Attribute::int(
-                AttrKey::HookLatencyP95,
-                int(quantile(&self.samples, 95)),
-            ));
-            attributes.push(Attribute::int(AttrKey::HookLatencyMax, int(self.max_ms)));
-        }
+        attributes.extend(self.hooks.attributes([
+            AttrKey::HookLatencyCount,
+            AttrKey::HookLatencyP50,
+            AttrKey::HookLatencyP95,
+            AttrKey::HookLatencyMax,
+        ]));
+        attributes.extend(self.attaches.attributes([
+            AttrKey::AttachLatencyCount,
+            AttrKey::AttachLatencyP50,
+            AttrKey::AttachLatencyP95,
+            AttrKey::AttachLatencyMax,
+        ]));
         attributes.push(Attribute::int(AttrKey::SpansDropped, int(dropped)));
         SpanRecord {
             trace_id: new_trace_id(),
@@ -282,8 +329,8 @@ mod tests {
             for _ in 0..2 * MAX_SAMPLES {
                 window.record(10 * ms, 1_010 * ms);
             }
-            assert_eq!(window.samples.len(), MAX_SAMPLES);
-            let late = window.samples.iter().filter(|s| **s == 1000).count();
+            assert_eq!(window.hooks.samples.len(), MAX_SAMPLES);
+            let late = window.hooks.samples.iter().filter(|s| **s == 1000).count();
             // Two thirds of the kept samples, give or take sampling noise.
             assert!(
                 (2_400..=3_050).contains(&late),
@@ -313,10 +360,17 @@ mod tests {
             attr(&span, AttrKey::HookLatencyCount),
             Some(&AttrValue::Int(0))
         );
+        assert_eq!(
+            attr(&span, AttrKey::AttachLatencyCount),
+            Some(&AttrValue::Int(0))
+        );
         for key in [
             AttrKey::HookLatencyP50,
             AttrKey::HookLatencyP95,
             AttrKey::HookLatencyMax,
+            AttrKey::AttachLatencyP50,
+            AttrKey::AttachLatencyP95,
+            AttrKey::AttachLatencyMax,
         ] {
             assert_eq!(attr(&span, key), None);
         }
@@ -365,6 +419,66 @@ mod tests {
             Some(&AttrValue::Int(0))
         );
         assert_eq!(attr(&next, AttrKey::HookLatencyP50), None);
+    }
+
+    /// Issue #1981 M8: attaches are summarised apart from hook events, in
+    /// whole milliseconds, and each interval starts with none.
+    #[test]
+    fn attach_latencies_are_summarised_apart_from_hooks() {
+        let mut window = Window::new(0);
+        for ms in 1..=100 {
+            window.record_attach(Duration::from_millis(ms));
+        }
+        window.record_attach(Duration::from_micros(999));
+        let span = window.close(2_000_000_000, 0, None, 0);
+        assert_eq!(
+            attr(&span, AttrKey::AttachLatencyCount),
+            Some(&AttrValue::Int(101))
+        );
+        assert_eq!(
+            attr(&span, AttrKey::AttachLatencyP50),
+            Some(&AttrValue::Int(50))
+        );
+        assert_eq!(
+            attr(&span, AttrKey::AttachLatencyP95),
+            Some(&AttrValue::Int(95))
+        );
+        assert_eq!(
+            attr(&span, AttrKey::AttachLatencyMax),
+            Some(&AttrValue::Int(100))
+        );
+        assert_eq!(
+            attr(&span, AttrKey::HookLatencyCount),
+            Some(&AttrValue::Int(0)),
+            "an attach is not a hook event"
+        );
+        let next = window.close(3_000_000_000, 0, None, 0);
+        assert_eq!(
+            attr(&next, AttrKey::AttachLatencyCount),
+            Some(&AttrValue::Int(0))
+        );
+        assert_eq!(attr(&next, AttrKey::AttachLatencyMax), None);
+    }
+
+    /// Qodo review on PR #2020: an attach that finishes while the ended
+    /// interval's memory is being read belongs to the next interval, not to
+    /// a span that ends before it.
+    #[test]
+    fn an_attach_after_the_cut_counts_in_the_next_interval() {
+        let mut window = Window::new(0);
+        let ended = window.cut(1_000);
+        window.record_attach(Duration::from_millis(5));
+        let span = ended.span(1_000, 0, Some(1), 0);
+        assert_eq!(
+            attr(&span, AttrKey::AttachLatencyCount),
+            Some(&AttrValue::Int(0))
+        );
+        let next = window.close(2_000, 0, None, 0);
+        assert_eq!(next.start_unix_nanos, 1_000);
+        assert_eq!(
+            attr(&next, AttrKey::AttachLatencyCount),
+            Some(&AttrValue::Int(1))
+        );
     }
 
     #[test]
