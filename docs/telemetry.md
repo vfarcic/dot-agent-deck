@@ -323,7 +323,7 @@ One span per report the orchestrator read, from when the report reached its inbo
 | `deck.role` | The role the task went to. |
 | `deck.orchestration.id` | The orchestration, as on `agent.run`. |
 
-There is no read span for a report the orchestrator never acknowledged: its run ended first, or the report was still unread after a day. Fetching a report without acknowledging it is not a read. To find reports that were never read, look for `agent.handoff` spans with outcome `reported` and no `agent.handoff.read` with the same `deck.handoff.id`.
+Fetching a report without acknowledging it is not a read. A read is recorded only while the deck still remembers the report: it forgets a report when the orchestrator's run ends, when the report is a day old, and when more than 256 reports are waiting to be read, oldest first. Acknowledging a forgotten report records nothing. So an `agent.handoff` with outcome `reported` and no `agent.handoff.read` with the same `deck.handoff.id` is a report with no recorded read: usually one nobody read, but possibly one read after the deck forgot it.
 
 ### `daemon.health`
 

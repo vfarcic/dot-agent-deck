@@ -54,7 +54,7 @@
 //! Only ids, the worker's role and enum names reach a span: never the task,
 //! its subject, its label or the report.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::event::InboxNotice;
 use crate::inbox::{StateName, UndeliverableReason};
@@ -263,6 +263,11 @@ pub struct Handoffs {
     unread: HashMap<String, UnreadReport>,
     /// Their ids, oldest arrival first.
     unread_order: VecDeque<String>,
+    /// The last [`MAX_OPEN_HANDOFFS`] tasks whose hand-off ended, oldest
+    /// first: a later notice about one, such as the retirement the inbox
+    /// broadcasts after a report, is not held as an early notice.
+    ended: VecDeque<String>,
+    ended_ids: HashSet<String>,
     /// Changes for messages no hand-off knew yet, oldest first, with when
     /// each was seen.
     early: VecDeque<(Change, u64)>,
@@ -364,6 +369,16 @@ impl Handoffs {
         run_of: &dyn Fn(&str, &str) -> Option<RunRef>,
         finished: &mut Vec<SpanRecord>,
     ) -> bool {
+        // A notice about a task whose hand-off ended has nothing left to
+        // change.
+        if let Change::Taken(id)
+        | Change::Acknowledged(id)
+        | Change::Undeliverable(id, _)
+        | Change::Report { task: id, .. } = &change
+            && self.ended_ids.contains(id)
+        {
+            return true;
+        }
         match change {
             Change::Taken(id) => {
                 // The orchestrator taking a report is not reading it.
@@ -476,6 +491,8 @@ impl Handoffs {
         self.early.clear();
         self.unread.clear();
         self.unread_order.clear();
+        self.ended.clear();
+        self.ended_ids.clear();
     }
 
     /// End `id`, whose report has not arrived.
@@ -532,6 +549,14 @@ impl Handoffs {
             return;
         };
         finished.push(span(id, open, outcome, now));
+        if self.ended_ids.insert(id.to_string()) {
+            self.ended.push_back(id.to_string());
+        }
+        while self.ended.len() > MAX_OPEN_HANDOFFS {
+            if let Some(oldest) = self.ended.pop_front() {
+                self.ended_ids.remove(&oldest);
+            }
+        }
     }
 
     /// The task named by report `report`, when the report is held for a
@@ -981,6 +1006,25 @@ mod tests {
         assert!(handoffs(&tracker.take_finished()).is_empty());
         tracker.observe_inbox(&notice(ORCH, REPORT, StateName::Acknowledged), 40);
         assert_eq!(reads(&tracker.take_finished()).len(), 1);
+    }
+
+    /// Qodo review on PR #2019: the inbox retires a task after its report,
+    /// and that notice, about a hand-off already ended, is consumed rather
+    /// than held as an early notice, where it would crowd out real ones.
+    #[test]
+    fn notices_about_an_ended_task_are_not_held() {
+        let mut tracker = team("worker-1");
+        post(&mut tracker, 10);
+        tracker.observe_inbox(&report(TASK, "worker-1"), 30);
+        tracker.observe_inbox(&undeliverable(UndeliverableReason::Superseded), 31);
+        tracker.observe_inbox(&notice(WORKER, TASK, StateName::Acknowledged), 32);
+        assert_eq!(tracker.handoffs_held(), (0, 0));
+        let spans = tracker.take_finished();
+        assert_eq!(handoffs(&spans).len(), 1, "{spans:?}");
+        // The report's own notices still reach its read.
+        tracker.observe_inbox(&notice(ORCH, REPORT, StateName::Acknowledged), 40);
+        assert_eq!(reads(&tracker.take_finished()).len(), 1);
+        assert_eq!(tracker.handoffs_held(), (0, 0));
     }
 
     #[test]
