@@ -4,11 +4,16 @@
 //! input epoch's leaf lock (`super::epoch::GenerationInput`):
 //!
 //! - [`QueryLedger`], D3′'s exemption ledger: the queries of the reply forms
-//!   (CPR, DA1, OSC 10/11) the output emitted and nothing has answered yet.
+//!   (CPR, DA1, OSC 10/11) the output emitted and nothing has answered yet,
+//!   each with the output offset it was noted at (its provenance, Q35-15).
 //!   At most [`LEDGER_SLOTS`], never evicted. A query past them saturates it
 //!   for the generation's life: from then on no reply is exempt and none can
 //!   pass ahead, and the ledger counts what it dropped. Saturation refuses
-//!   nothing by itself (A1 §3.2).
+//!   nothing by itself (A1 §3.2). Exemption and pass-ahead are two
+//!   questions: a reply is exempt when it answers a query the ledger keeps
+//!   ([`QueryLedger::exempts`]), and may pass ahead of a fence only when the
+//!   query it answers was emitted after the fence's trigger
+//!   ([`QueryLedger::passes_ahead`], I-5).
 //! - [`Backlog`], `B`: whether the agent may be waiting on a cursor position
 //!   report, read from its own state and never from the ledger's saturation
 //!   (A2 §4.2). Each screen profile declares how a wait ends
@@ -84,19 +89,22 @@ pub enum QueryHistory {
 /// D3′'s outstanding queries (A1 §3.2 (a)). See the module documentation.
 #[derive(Debug, Clone, Default)]
 pub struct QueryLedger {
-    outstanding: VecDeque<QueryKind>,
+    /// Each kept query with the output offset it was noted at, oldest first.
+    outstanding: VecDeque<(QueryKind, u64)>,
     saturated: bool,
     dropped: u32,
 }
 
 impl QueryLedger {
-    /// The output emitted a query of `kind`.
-    pub fn note(&mut self, kind: QueryKind) {
+    /// The output emitted a query of `kind`, noted at output offset
+    /// `offset`: the generation's output byte count once the push carrying
+    /// it was read.
+    pub fn note(&mut self, kind: QueryKind, offset: u64) {
         if self.saturated || self.outstanding.len() == LEDGER_SLOTS {
             self.saturated = true;
             self.dropped = self.dropped.saturating_add(1);
         } else {
-            self.outstanding.push_back(kind);
+            self.outstanding.push_back((kind, offset));
         }
     }
 
@@ -104,7 +112,7 @@ impl QueryLedger {
     /// saturation the kept entries still match (A2 §5); a query dropped at
     /// saturation doesn't.
     pub fn solicited(&self, kind: QueryKind) -> bool {
-        self.outstanding.contains(&kind)
+        self.answered(kind).is_some()
     }
 
     /// Whether one whole reply to `kind` is exempt from touching the box:
@@ -113,11 +121,29 @@ impl QueryLedger {
         !self.saturated && kind != QueryKind::Cpr && self.solicited(kind)
     }
 
+    /// Whether one whole reply to `kind` may pass ahead of a fence whose
+    /// trigger is at output offset `trigger` (I-5): exempt, and the query it
+    /// answers, the oldest kept one of its kind, was noted after `trigger`.
+    /// A reply to a query emitted at or before the trigger is exempt and
+    /// still held.
+    pub fn passes_ahead(&self, kind: QueryKind, trigger: u64) -> bool {
+        self.exempts(kind) && self.answered(kind).is_some_and(|offset| offset > trigger)
+    }
+
+    /// The offset of the query a reply to `kind` answers: the oldest kept
+    /// one of that kind.
+    fn answered(&self, kind: QueryKind) -> Option<u64> {
+        self.outstanding
+            .iter()
+            .find(|&&(k, _)| k == kind)
+            .map(|&(_, offset)| offset)
+    }
+
     /// A reply to `kind` reached the agent: it answers the oldest kept query
     /// of that kind. `false` when none was outstanding (a duplicate or an
     /// unsolicited reply).
     pub fn settle(&mut self, kind: QueryKind) -> bool {
-        match self.outstanding.iter().position(|&k| k == kind) {
+        match self.outstanding.iter().position(|&(k, _)| k == kind) {
             Some(at) => {
                 self.outstanding.remove(at);
                 true

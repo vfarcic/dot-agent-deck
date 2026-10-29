@@ -36,9 +36,22 @@
 //! outstanding is recorded twice, `Retired` and then however its guard or
 //! job ended, and a ticket admitted to a closed ledger, never outstanding,
 //! is recorded once, when it ends.
+//!
+//! **Physical outcomes, exactly once (PRD #1666 part 3, Q35-15, I-4).** Every
+//! ticket is made by [`IngressLedger::admit`] and reports one *physical*
+//! outcome, once: written in full or in part, failed, refused, cancelled
+//! before a byte could be written (its guard dropped, or its job taken back
+//! before it started), or dropped unrun with the writer's queue. A guard's
+//! paths each disarm it; a job's three (the writer's report, its take-back,
+//! its drop unrun) share one flag, so whichever comes first is the only one.
+//! `Retired` is not one of them: it is the generation's *logical* event, and
+//! a job already queued when its generation retires stays unreported
+//! ([`IngressLedger::jobs_unreported`]) until the writer, its take-back or
+//! its disposal reports it, while it leaves the outstanding set the doorbell
+//! reads.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// How a ticket ended.
@@ -67,6 +80,9 @@ struct LedgerInner {
     /// Tickets admitted and not yet settled, with whether their job was
     /// queued.
     outstanding: BTreeMap<u64, bool>,
+    /// Tickets whose job was queued and hasn't reported its physical outcome,
+    /// kept across the close.
+    unreported: std::collections::BTreeSet<u64>,
     closed: bool,
     /// The most recent settlements, for the log and for tests.
     settled: Vec<(u64, Settlement)>,
@@ -137,6 +153,12 @@ impl IngressLedger {
         self.inner.lock().unwrap().closed
     }
 
+    /// How many queued jobs haven't reported their physical outcome. Unlike
+    /// the outstanding set, retirement doesn't empty it.
+    pub fn jobs_unreported(&self) -> usize {
+        self.inner.lock().unwrap().unreported.len()
+    }
+
     /// The most recent settlements, oldest first: a log in which a ticket
     /// retired while outstanding appears again when it ends (see the module
     /// documentation).
@@ -161,6 +183,7 @@ impl IngressLedger {
 
     fn settle(&self, ticket: u64, how: Settlement) {
         let mut inner = self.inner.lock().unwrap();
+        inner.unreported.remove(&ticket);
         if inner.outstanding.remove(&ticket).is_some() || inner.closed {
             push_settled(&mut inner, ticket, how);
         }
@@ -176,14 +199,16 @@ impl IngressLedger {
     fn queue_with<T>(
         &self,
         ticket: u64,
-        armed: &AtomicBool,
+        armed: &AtomicU8,
         enqueue: impl FnOnce() -> Option<T>,
     ) -> Option<T> {
         let mut inner = self.inner.lock().unwrap();
         let queued = enqueue();
         if queued.is_some() {
-            armed.store(true, Ordering::SeqCst);
+            // A job the writer already finished stays reported.
+            let _ = armed.compare_exchange(UNQUEUED, QUEUED, Ordering::SeqCst, Ordering::SeqCst);
             inner.job_mark += 1;
+            inner.unreported.insert(ticket);
             if let Some(job) = inner.outstanding.get_mut(&ticket) {
                 *job = true;
             }
@@ -241,6 +266,14 @@ impl TicketGuard {
         self.ledger.settle(self.ticket, Settlement::Refused(reason));
     }
 
+    /// The operation carried no byte and was accepted: done, with nothing to
+    /// write (Q35-15, a zero-byte frame while a fence holds input).
+    pub fn settle_empty(mut self) {
+        self.armed = false;
+        self.ledger
+            .settle(self.ticket, Settlement::Written { bytes: 0 });
+    }
+
     /// Hand the ticket to a job: `enqueue` queues the job carrying the
     /// returned [`JobTicket`]; from then on the job settles it. Returns
     /// whatever `enqueue` returned, `None` when the job could not be queued
@@ -249,7 +282,7 @@ impl TicketGuard {
         self.armed = false;
         let ledger = Arc::clone(&self.ledger);
         let ticket = self.ticket;
-        let armed = Arc::new(AtomicBool::new(false));
+        let armed = Arc::new(AtomicU8::new(UNQUEUED));
         let job = JobTicket {
             ledger: Arc::clone(&ledger),
             ticket,
@@ -277,16 +310,26 @@ pub struct JobTicket {
     ticket: u64,
     /// Set once the job is queued, and cleared when the job settles the
     /// ticket itself; a ticket dropped while armed settles `Failed`.
-    armed: Arc<AtomicBool>,
+    /// [`UNQUEUED`], [`QUEUED`] or [`REPORTED`].
+    armed: Arc<AtomicU8>,
 }
 
 impl JobTicket {
     /// A handle that can settle the ticket `Cancelled` from the caller's side,
-    /// at the moment the job is taken back.
+    /// at the moment the job is taken back. It shares the job's flag, so the
+    /// take-back and the job's own report are one report between them.
     pub(crate) fn handle(&self) -> TicketHandle {
         TicketHandle {
             ledger: Arc::clone(&self.ledger),
             ticket: self.ticket,
+            armed: Arc::clone(&self.armed),
+        }
+    }
+
+    /// Report `how` unless another path of this job already reported.
+    fn report(&self, how: Settlement) {
+        if self.armed.swap(REPORTED, Ordering::SeqCst) != REPORTED {
+            self.ledger.settle(self.ticket, how);
         }
     }
 
@@ -298,26 +341,36 @@ impl JobTicket {
         accepted: usize,
         error: Option<std::io::ErrorKind>,
     ) {
-        self.armed.store(false, Ordering::SeqCst);
         let how = match error {
             None if accepted == len => Settlement::Written { bytes: accepted },
             Some(kind) if accepted == 0 => Settlement::Failed(kind),
             _ => Settlement::Partial { accepted },
         };
-        self.ledger.settle(self.ticket, how);
+        self.report(how);
     }
 
     /// The job ended having written nothing on purpose (a voice answer whose
     /// question changed before its keys were reached).
     pub(crate) fn settle_cancelled(self) {
-        self.armed.store(false, Ordering::SeqCst);
-        self.ledger.settle(self.ticket, Settlement::Cancelled);
+        self.report(Settlement::Cancelled);
+    }
+
+    /// The job was refused before it wrote anything: a released op whose
+    /// generation retired before the writer reached it (Q35-15, core §8.1).
+    pub(crate) fn settle_refused(self, reason: &'static str) {
+        self.report(Settlement::Refused(reason));
     }
 }
 
 impl Drop for JobTicket {
+    /// Unrun with a queued job: the writer is gone. A drop inside a failed
+    /// enqueue, still unqueued, reports nothing: the queueing hold does.
     fn drop(&mut self) {
-        if self.armed.swap(false, Ordering::SeqCst) {
+        if self
+            .armed
+            .compare_exchange(QUEUED, REPORTED, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
             self.ledger.settle(
                 self.ticket,
                 Settlement::Failed(std::io::ErrorKind::BrokenPipe),
@@ -326,18 +379,28 @@ impl Drop for JobTicket {
     }
 }
 
+/// A job ticket not yet in a queue.
+const UNQUEUED: u8 = 0;
+/// A job ticket whose job is queued and hasn't reported.
+const QUEUED: u8 = 1;
+/// A job ticket that reported its physical outcome.
+const REPORTED: u8 = 2;
+
 /// Settles a queued job's ticket `Cancelled` when the job is taken back
 /// before it started — the one case its caller, not the writer thread, ends
-/// it.
+/// it. A writer that later drops the taken-back job reports nothing more.
 #[derive(Debug, Clone)]
 pub(crate) struct TicketHandle {
     ledger: Arc<IngressLedger>,
     ticket: u64,
+    armed: Arc<AtomicU8>,
 }
 
 impl TicketHandle {
     pub(crate) fn settle_cancelled(&self) {
-        self.ledger.settle(self.ticket, Settlement::Cancelled);
+        if self.armed.swap(REPORTED, Ordering::SeqCst) != REPORTED {
+            self.ledger.settle(self.ticket, Settlement::Cancelled);
+        }
     }
 }
 

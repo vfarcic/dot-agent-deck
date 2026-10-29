@@ -8,11 +8,13 @@
 //! `AgentBus::push_timed`. It feeds [`PasteModeTracker`] and, from the same
 //! pass over the bytes, hands the generation's input epoch the queries,
 //! `?2026h` and report modes it saw (Q35-06, `super::epoch::OutputNote`),
-//! taking the epoch's lock once for a push that has any. No decision reads
-//! the tracker or those notes yet: the hook changes no byte that is
-//! published, kept or replayed, and no decision. It is not free: it is one
-//! more pass over the bytes while the output lock is held, before they are
-//! published.
+//! taking the epoch's lock once for a push that has any, after advancing the
+//! generation's output offset by the push's length. No decision reads the
+//! tracker yet; of what the notes feed, only the query ledger is read, by a
+//! closed fence deciding whether a reply passes ahead (Q35-15), and only the
+//! `e2e` build closes one. The hook changes no byte that is published, kept
+//! or replayed. It is not free: it is one more pass over the bytes while the
+//! output lock is held, before they are published.
 //!
 //! The tracker is separate from the ring's `ReplayModes` on purpose (plan PA
 //! U3-01): it reads the output through [`Framing::output`], which reads
@@ -93,6 +95,9 @@ impl OutputHook {
             }
             output_notes(token, modes, &mut notes)
         });
+        // The push's end is the offset its queries are noted at (Q35-15):
+        // one atomic add per push, outside the epoch's lock.
+        self.input.advance_output(bytes.len());
         if !notes.is_empty() {
             self.input.on_output(&notes, Instant::now());
         }

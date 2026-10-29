@@ -38,7 +38,7 @@ fn probe_045_the_ninth_query_saturates_the_ledger() {
     for mix in mixes {
         let mut ledger = QueryLedger::default();
         for &k in mix {
-            ledger.note(k);
+            ledger.note(k, 0);
         }
         assert_eq!(
             (ledger.outstanding(), ledger.saturated()),
@@ -46,7 +46,7 @@ fn probe_045_the_ninth_query_saturates_the_ledger() {
         );
         assert_eq!(ledger.history(), QueryHistory::Exact);
         assert_eq!(ledger.exempts(DA1), mix.contains(&DA1), "the control");
-        ledger.note(DA1);
+        ledger.note(DA1, 0);
         assert!(ledger.saturated());
         assert_eq!((ledger.outstanding(), ledger.dropped()), (LEDGER_SLOTS, 1));
         assert_eq!(ledger.history(), QueryHistory::Unknown);
@@ -60,7 +60,7 @@ fn probe_045_the_ninth_query_saturates_the_ledger() {
             assert!(ledger.settle(DA1));
             assert_eq!(ledger.outstanding(), LEDGER_SLOTS - 1);
         }
-        ledger.note(BG);
+        ledger.note(BG, 0);
         assert!(ledger.saturated(), "a freed slot doesn't unsaturate it");
         assert_eq!(ledger.history(), QueryHistory::Unknown);
         assert_eq!(ledger.dropped(), 2);

@@ -12,9 +12,11 @@
 //! nothing foreign since its admission (R3 §3.4). A prompt or turn hook moves
 //! none of the numbers.
 //!
-//! **Where it moves, as of this commit.** At the PTY writer's shared enqueue,
-//! before the job is handed to the writer thread, so the writer can't start
-//! a job whose move isn't visible (R3 §3.2); Q35-15 moves it to acceptance.
+//! **Where it moves.** At acceptance (Q35-15): for an op the PTY writer
+//! takes at once, at its enqueue, before the job is handed to the writer
+//! thread, so the writer can't start a job whose move isn't visible (R3
+//! §3.2); for an op a closed fence holds (`super::gate`), when it enters the
+//! held queue, before anything can release it, and not again when it does.
 //! A deck write with no job named ([`Writer::UnnamedDeck`], which every deck
 //! write in the daemon is as of this commit) counts as foreign. Exempt reports
 //! don't move it: a whole focus or SGR mouse report while the agent has that
@@ -24,9 +26,12 @@
 //! in enqueue order: a withdrawn job leaves that framing ahead of what the
 //! PTY took, which Q35-15/16's physical tracker corrects.
 //!
-//! **What reads it, as of this commit: nothing.** The card, admission and
-//! the ring's reconcile read it from Q35-19 and Q35-21 on; existing doorbell
-//! behaviour reads `PaneInputState` as before.
+//! **What reads it, as of this commit.** The epoch's numbers: nothing. The
+//! card, admission and the ring's reconcile read them from Q35-19 and Q35-21
+//! on; existing doorbell behaviour reads `PaneInputState` as before. The
+//! ledger is read by a closed fence's acceptance, for whether a reply may
+//! pass ahead ([`GenerationInput::passes_ahead`]), and a fence closes only
+//! through the `e2e` build's control verb until a probe opens one (Q35-20).
 //!
 //! **The lock.** One mutex per generation at rank [`crate::lock_rank::R6`],
 //! above every other ranked lock, so the debug checker refuses any ranked
@@ -52,6 +57,7 @@
 //! lock, inside the ingress lock when ticketed, and an output push that
 //! carries notes waits for it while holding the output lock.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use super::framing::{Csi, Event, Framing, Report, Str, StringKind, Token, whole_report};
@@ -313,6 +319,22 @@ struct State {
 #[derive(Debug)]
 pub struct GenerationInput {
     state: RankedMutex<{ R6 }, State>,
+    /// How many bytes the output hook has read, advanced by the hook before
+    /// it hands over a push's notes, outside the lock: the offset a query is
+    /// noted at, and a fence's trigger (Q35-15).
+    output_offset: AtomicU64,
+    /// Test seam: parks an acceptance between the epoch's move and the job
+    /// becoming visible, so a test can see the one before the other.
+    #[cfg(test)]
+    accept_park: std::sync::Mutex<Option<AcceptPark>>,
+}
+
+/// Test seam: one armed park at acceptance ([`GenerationInput::park_next_acceptance`]).
+#[cfg(test)]
+#[derive(Debug)]
+struct AcceptPark {
+    reached: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
 }
 
 impl Default for GenerationInput {
@@ -336,13 +358,70 @@ impl GenerationInput {
                 records: None,
                 retired: false,
             }),
+            output_offset: AtomicU64::new(0),
+            #[cfg(test)]
+            accept_park: std::sync::Mutex::new(None),
         }
     }
 
-    /// One byte-carrying op is being handed to the PTY writer: classify it
-    /// against the framing at its start, the report modes and the ledger;
-    /// settle the queries its replies answer; move the epoch unless it is an
-    /// exempt report.
+    /// The output hook read `len` more bytes; called before it hands over
+    /// that push's notes, so a query is noted at the end of its push.
+    pub fn advance_output(&self, len: usize) {
+        self.output_offset.fetch_add(len as u64, Ordering::SeqCst);
+    }
+
+    /// The output offset as of now: a fence closed now has this trigger,
+    /// and a query noted later is after it.
+    pub fn output_offset(&self) -> u64 {
+        self.output_offset.load(Ordering::SeqCst)
+    }
+
+    /// Whether `bytes` from `writer` may pass ahead of a fence whose trigger
+    /// is at output offset `trigger` (I-5): a person's op that is one whole
+    /// D3′-exempt reply, read against the framing at its start, answering a
+    /// query noted after `trigger`. Changes nothing: the op's acceptance
+    /// ([`Self::enqueue`]) settles the query and, the reply being exempt,
+    /// moves no epoch.
+    pub fn passes_ahead(&self, writer: Writer, bytes: &[u8], trigger: u64) -> bool {
+        if writer != Writer::Human {
+            return false;
+        }
+        // A retired generation's ledger is empty, so nothing passes.
+        let state = self.state.lock_recovering();
+        whole_report(&state.framing, bytes)
+            .and_then(QueryKind::answered_by)
+            .is_some_and(|kind| state.ledger.passes_ahead(kind, trigger))
+    }
+
+    /// Test seam: the next acceptance parks after it moved the epoch and
+    /// before its job is visible to the writer or the held queue, until the
+    /// returned sender sends.
+    #[cfg(test)]
+    pub(crate) fn park_next_acceptance(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached_tx, reached) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        *self.accept_park.lock().unwrap() = Some(AcceptPark {
+            reached: reached_tx,
+            release: release_rx,
+        });
+        (reached, release)
+    }
+
+    /// Test seam: where an acceptance parks when a test asked.
+    pub(crate) fn accepted_parks(&self) {
+        #[cfg(test)]
+        if let Some(park) = self.accept_park.lock().unwrap().take() {
+            let _ = park.reached.send(());
+            let _ = park.release.recv();
+        }
+    }
+
+    /// One byte-carrying op is accepted, for the PTY writer or a fence's
+    /// held queue: classify it against the framing at its start, the report
+    /// modes and the ledger; settle the queries its replies answer; move the
+    /// epoch unless it is an exempt report.
     pub fn enqueue(&self, writer: Writer, bytes: &[u8]) -> Enqueued {
         let mut guard = self.state.lock_recovering();
         let state = &mut *guard;
@@ -398,18 +477,21 @@ impl GenerationInput {
         state.epoch.apply(&obs)
     }
 
-    /// The output hook's notes from one push, in order, at `now`.
+    /// The output hook's notes from one push, in order, at `now`. Its
+    /// queries are noted at the output offset as of now, which the hook has
+    /// advanced past the push ([`Self::advance_output`]).
     pub fn on_output(&self, notes: &[OutputNote], now: Instant) {
         let mut guard = self.state.lock_recovering();
         let state = &mut *guard;
         if state.retired {
             return;
         }
+        let offset = self.output_offset();
         for &note in notes {
             let before = state.backlog.holds();
             match note {
                 OutputNote::Query(kind) => {
-                    state.ledger.note(kind);
+                    state.ledger.note(kind, offset);
                     if kind == QueryKind::Cpr {
                         state.backlog.cpr_query();
                     }
@@ -486,7 +568,9 @@ impl GenerationInput {
     }
 
     /// Whether a whole reply to `kind` would be recognised as solicited, and
-    /// whether it would be exempt (and so eligible to pass ahead, I-5).
+    /// whether it would be D3′-exempt. Exemption isn't pass-ahead
+    /// eligibility: that also needs the answered query to be after a fence's
+    /// trigger ([`Self::passes_ahead`], I-5).
     pub fn reply_class(&self, kind: QueryKind) -> (bool, bool) {
         let state = self.state.lock_recovering();
         (state.ledger.solicited(kind), state.ledger.exempts(kind))

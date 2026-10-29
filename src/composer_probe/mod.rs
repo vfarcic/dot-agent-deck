@@ -20,15 +20,18 @@
 //! agent runs as its editor ([`helper`], Linux), which the binary dispatches
 //! to by its name, and the daemon's side of that helper: its invocations,
 //! markers, children and exits, which settle the generation's liabilities
-//! ([`observe`]), and whether an agent's key-binding sources still leave
-//! Ctrl+G on its external editor ([`keymap`], no caller yet). The daemon feeds the hook every byte an agent writes,
-//! moves the epoch at the PTY writer's enqueue, and decides installation at
+//! ([`observe`]), whether an agent's key-binding sources still leave
+//! Ctrl+G on its external editor ([`keymap`], no caller yet), and the fence
+//! gate every attach frame passes through on its way to the PTY ([`gate`]),
+//! which holds a person's input while a fence is closed and lets a reply to a
+//! later query pass ahead. The daemon feeds the hook every byte an agent writes,
+//! moves the epoch at acceptance, and decides installation at
 //! every spawn, which installs nothing outside the `e2e` build's assumption
 //! until activation. For an installed generation it keeps the invocation
 //! records, settles the permission to arm, answers its helper and observes
-//! it; nothing publishes a liability outside the `e2e` build's control verb,
-//! and nothing reads the epoch, the records or a segment to admit or hold
-//! anything yet.
+//! it; nothing publishes a liability or closes a fence outside the `e2e`
+//! build's control verb, and nothing reads the epoch, the records or a
+//! segment to admit or hold anything yet.
 
 pub mod arm;
 #[cfg(target_os = "linux")]
@@ -36,6 +39,7 @@ pub mod attest;
 pub mod classifier;
 pub mod epoch;
 pub mod framing;
+pub mod gate;
 #[cfg(target_os = "linux")]
 pub mod helper;
 pub mod install;

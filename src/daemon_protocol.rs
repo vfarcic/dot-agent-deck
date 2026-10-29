@@ -3120,6 +3120,12 @@ pub enum AttachRequest {
     /// page a probe uses, writing no byte to the agent, and only for the
     /// generation the request names while it is the pane's current one and
     /// may be armed ([`crate::composer_probe::observe::Seam::control`]).
+    /// Q35-15 adds `fence`, `release` and `fence-status`: close that
+    /// generation's fence gate at its output offset as of now, writing
+    /// nothing; open it through the release path, which re-checks the
+    /// captured target and submits what it held in order; and read its
+    /// counts (`composer_fence` in the response). Each is refused for any
+    /// generation but the pane's current one.
     /// A build without `e2e` neither compiles nor dispatches it, and refuses
     /// it as a request it doesn't know; it is never advertised.
     #[cfg(feature = "e2e")]
@@ -3995,6 +4001,12 @@ pub struct AttachResponse {
     /// it answers is capability-gated, so neither moves [`PROTOCOL_VERSION`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_metrics: Option<HostMetrics>,
+    /// PRD #1666 part 3 (Q35-15): the `e2e` build's answer to
+    /// [`AttachRequest::E2eComposerControl`]'s `fence-status`. Compiled into
+    /// that build alone, which is the only one that can ask for it.
+    #[cfg(feature = "e2e")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer_fence: Option<ComposerFenceStatus>,
     /// PRD #1589: the answer to [`AttachRequest::CloseAgents`]. `None` on every
     /// other response. A refusal is a report, answered `ok: true`; `ok: false`
     /// is reserved for a request the daemon could not process at all. Additive
@@ -4596,10 +4608,89 @@ pub async fn run_attach_server_with_counter(
     .await
 }
 
-/// PRD #1666 part 3 (Q35-14b): answer [`AttachRequest::E2eComposerControl`]
-/// for `pane_id`'s current generation, off the executor.
-#[cfg(all(feature = "e2e", target_os = "linux"))]
+/// PRD #1666 part 3 (Q35-15): a fence's counts, the `e2e` build's
+/// `fence-status` answer.
+#[cfg(feature = "e2e")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerFenceStatus {
+    pub fenced: bool,
+    pub held_ops: usize,
+    pub held_bytes: usize,
+    pub full_waiters: usize,
+}
+
+/// PRD #1666 part 3 (Q35-14b, Q35-15): answer
+/// [`AttachRequest::E2eComposerControl`] for `pane_id`'s current
+/// generation. `fence` closes the generation's fence gate at its output
+/// offset as of now, writing nothing; `release` re-checks the captured target
+/// as a release does and submits what the fence held, in order; `fence-status`
+/// reads its counts. Each is refused unless `generation` is the pane's
+/// current one, so a retired generation can't release its successor.
+/// `publish` and `withdraw` go to the generation's observer.
+#[cfg(feature = "e2e")]
 async fn e2e_composer_control(
+    registry: &Arc<AgentPtyRegistry>,
+    state: &SharedState,
+    pane_id: &str,
+    generation: u64,
+    operation: &str,
+) -> AttachResponse {
+    if !matches!(operation, "fence" | "release" | "fence-status") {
+        return e2e_composer_observer_control(registry, pane_id, generation, operation).await;
+    }
+    let Some(agent) = registry
+        .pane_current_agent_id(pane_id)
+        .filter(|agent| *agent == generation.to_string())
+    else {
+        return AttachResponse::err("e2e-composer-control: not the pane's current generation");
+    };
+    let Some((gate, writer)) = registry.composer_fence(&agent) else {
+        return AttachResponse::err("e2e-composer-control: not the pane's current generation");
+    };
+    match operation {
+        "fence" => {
+            if gate.fence() {
+                AttachResponse::ok()
+            } else {
+                AttachResponse::err("e2e-composer-control: the generation retired")
+            }
+        }
+        "release" => {
+            let w = writer.lock().await;
+            // Core §8.1: the captured target is still the pane's live owner
+            // and writable, checked under the writer as the attach loop's
+            // re-validation is.
+            let owner = registry.pane_current_agent_id(pane_id).as_deref() == Some(agent.as_str());
+            let target = if !owner {
+                Err("stale")
+            } else if state.read().await.pane_writable(pane_id) != crate::event::Writable::Live {
+                Err("history-only")
+            } else {
+                Ok(())
+            };
+            w.release_fence(target);
+            AttachResponse::ok()
+        }
+        _ => {
+            let status = gate.status();
+            AttachResponse {
+                ok: true,
+                composer_fence: Some(ComposerFenceStatus {
+                    fenced: status.fenced,
+                    held_ops: status.held_ops,
+                    held_bytes: status.held_bytes,
+                    full_waiters: status.full_waiters,
+                }),
+                ..Default::default()
+            }
+        }
+    }
+}
+
+/// PRD #1666 part 3 (Q35-14b): the observer half of
+/// [`e2e_composer_control`], off the executor.
+#[cfg(all(feature = "e2e", target_os = "linux"))]
+async fn e2e_composer_observer_control(
     registry: &Arc<AgentPtyRegistry>,
     pane_id: &str,
     generation: u64,
@@ -4625,7 +4716,7 @@ async fn e2e_composer_control(
 }
 
 #[cfg(all(feature = "e2e", not(target_os = "linux")))]
-async fn e2e_composer_control(
+async fn e2e_composer_observer_control(
     _registry: &Arc<AgentPtyRegistry>,
     _pane_id: &str,
     _generation: u64,
@@ -6903,7 +6994,8 @@ async fn handle_connection(
             generation,
             operation,
         } => {
-            let resp = e2e_composer_control(&registry, &pane_id, generation, &operation).await;
+            let resp =
+                e2e_composer_control(&registry, &state, &pane_id, generation, &operation).await;
             write_resp(&mut stream, &resp).await?
         }
         AttachRequest::RecordOrchestratorContext {
@@ -8860,191 +8952,219 @@ async fn handle_attach_stream(
 
     // Input loop: STREAM_IN bytes are forwarded to the shared PTY writer;
     // DETACH (or unknown frame / EOF) ends the loop.
-    loop {
+    'frames: loop {
         match read_frame(&mut rd).await {
             Ok(Some((KIND_STREAM_IN, bytes))) => {
                 // PRD #1666 part 3, round 5-wake (plan §2.1′): the frame is a
                 // human operation on this generation's input from here, before
-                // any await, until it is refused or its PTY job ends.
-                let mut ticket = registry.admit_ingress(&id);
-                // PRD #20 blocker-6: enforce liveness AUTHORITATIVELY here, not
-                // just in the UI. If the focused session became non-live (a
-                // wrapped Codex pane that declared `history-only`, or a
-                // view-only target), REJECT the key / bracketed-paste frame
-                // rather than forwarding it to the PTY — a UI-only gate can't
-                // close the race where a pane goes non-live while a stream is
-                // already open, nor protect an older/stale client. A pane with
-                // no non-live declaration stays `Live` (the historical default),
-                // so native PTY panes are unaffected. The connection stays open
-                // (the client remains attached, seeing output) — only the write
-                // is dropped.
-                // PRD #20 R20-008: reject frames to a target that has exited
-                // (its reader thread saw EOF) even if the registry entry hasn't
-                // been reaped yet — the cached writer points at a dead PTY.
-                //
-                // PRD #20 R20-007 (finding #10): a rejection is no longer a
-                // silent debug-only drop. Send a TYPED, NON-terminal
-                // `KIND_STREAM_REJECT` frame (via the output task) so the client
-                // can surface honest feedback and leave its input mode for BOTH
-                // key and paste, while the stream stays open.
-                if exited.load(std::sync::atomic::Ordering::SeqCst) {
-                    tracing::debug!(
-                        target: "pane_write",
-                        agent_id = %id,
-                        pane_id = %pane_id,
-                        payload_len = bytes.len(),
-                        "STREAM_IN rejected — target agent has exited"
-                    );
-                    if let Some(ticket) = ticket.take() {
-                        ticket.refuse("exited");
-                    }
-                    enqueue_reject(&reject_tx, b"exited");
-                    continue;
-                }
-                // Finding #3: resolve by agent identity for a paneless target, by
-                // pane otherwise. Both default to `Live` when nothing is declared,
-                // so an ordinary shell is unaffected; a declared non-live target
-                // (paneless or paned) fails closed.
-                let pre_lock_writable = {
-                    let guard = state.read().await;
-                    if is_paneless {
-                        guard.agent_writable(&id)
-                    } else {
-                        guard.pane_writable(&pane_id)
-                    }
-                };
-                if pre_lock_writable != crate::event::Writable::Live {
-                    tracing::debug!(
-                        target: "pane_write",
-                        agent_id = %id,
-                        pane_id = %pane_id,
-                        payload_len = bytes.len(),
-                        "STREAM_IN rejected — target is not live (history-only / view-only)"
-                    );
-                    if let Some(ticket) = ticket.take() {
-                        ticket.refuse("history-only");
-                    }
-                    enqueue_reject(&reject_tx, b"history-only");
-                    continue;
-                }
-                // PRD #1666 part 3, round 5-wake (Q19): the ticket admitted
-                // above is the doorbell's record of this frame from before it
-                // waits for the writer: a ring not yet past its first byte
-                // ends with nothing written, and one past it is not
-                // disturbed and lets the frame follow its release.
-                #[cfg(feature = "e2e")]
-                crate::doorbell::record_for_test(&format!("human-arrived {pane_id}"));
-                let w = writer.lock().await;
-                // PRD #20 R20-006 (finding #7): RE-VALIDATE under the held writer,
-                // immediately before writing. A close/respawn (registry removal),
-                // a liveness transition, or a rebind can land WHILE this frame
-                // waited for the writer lock — the pre-lock checks above cannot
-                // see that. Re-check exit, the pane's CURRENT live owner (it must
-                // still be THIS agent), and writability, holding the writer
-                // through the completed write, so no bytes reach a target already
-                // declared stale/removed/non-live. All rejections send the same
-                // typed frame and keep the stream open.
-                if exited.load(std::sync::atomic::Ordering::SeqCst) {
-                    drop(w);
-                    if let Some(ticket) = ticket.take() {
-                        ticket.refuse("exited");
-                    }
-                    enqueue_reject(&reject_tx, b"exited");
-                    continue;
-                }
-                // The pane→agent ownership re-check only applies to an agent
-                // that actually carries a pane id: a daemon-side agent with no
-                // pane (`<no-pane>`) has no pane→agent mapping to re-resolve, and
-                // its stream is bound directly to the agent's own writer, so skip
-                // the check (it would spuriously find no owner and reject).
-                if !is_paneless {
-                    match registry.pane_current_agent_id(&pane_id) {
-                        Some(current) if current == id => {}
-                        Some(_) => {
-                            drop(w);
-                            if let Some(ticket) = ticket.take() {
-                                ticket.refuse("wrong-session");
-                            }
-                            enqueue_reject(&reject_tx, b"wrong-session");
-                            continue;
-                        }
-                        None => {
-                            drop(w);
-                            if let Some(ticket) = ticket.take() {
-                                ticket.refuse("stale");
-                            }
-                            enqueue_reject(&reject_tx, b"stale");
-                            continue;
-                        }
-                    }
-                }
-                // Finding #3: re-validate writability under the held writer, by
-                // agent identity for a paneless target and by pane otherwise.
-                let post_lock_writable = {
-                    let guard = state.read().await;
-                    if is_paneless {
-                        guard.agent_writable(&id)
-                    } else {
-                        guard.pane_writable(&pane_id)
-                    }
-                };
-                if post_lock_writable != crate::event::Writable::Live {
-                    drop(w);
-                    if let Some(ticket) = ticket.take() {
-                        ticket.refuse("history-only");
-                    }
-                    enqueue_reject(&reject_tx, b"history-only");
-                    continue;
-                }
-                // PRD #128 (cherry-picked from PR #122): byte-level trace
-                // of STREAM_IN frames forwarded to the per-agent PTY
-                // writer. Useful for confirming that bytes the TUI
-                // queued arrived as distinct frames and that no other
-                // path interleaved a write on the same writer mutex
-                // between them. Gated by `RUST_LOG=trace`. Emitted
-                // INSIDE the writer mutex so trace order matches actual
-                // write order. Both `agent_id` and `pane_id` are
-                // emitted so the M1.4 diff against the daemon-initiated
-                // trace in `AgentPtyRegistry::write_to_pane_internal`
-                // can join on either key (`pane_id` is cached once per
-                // attach above).
-                tracing::trace!(
-                    target: "pane_write",
-                    source = "stream_in",
-                    agent_id = %id,
-                    pane_id = %pane_id,
-                    payload_len = bytes.len(),
-                    payload = %escape_bytes_for_log(&bytes),
-                    "STREAM_IN forwarded to PTY writer"
+                // any await, until it is refused or its PTY job ends. Q35-15
+                // (I-4): its ticket is made here and nowhere else, and travels
+                // with the frame to whichever path settles it.
+                let mut frame = crate::agent_pty::UserFrame::new(
+                    bytes,
+                    registry.admit_ingress(&id),
+                    Some(reject_tx.clone()),
                 );
-                // Issue #525: awaited, not written inline — the PTY is written
-                // by the pane writer's own thread, so a pane whose agent has
-                // stopped reading holds this task, never a runtime worker.
-                if w.write_user_ticketed(&bytes, ticket.take()).await.is_err() {
+                // PRD #1666 part 3 (Q35-15, R5 §4.3): a frame a closed fence
+                // has no room for comes back with its place in the fence's
+                // queue. This loop then waits for the fence to change,
+                // without the writer and without reading the socket (the
+                // client's next frames wait in it: backpressure), and runs
+                // every check below again before offering it once more.
+                let mut waiter: Option<crate::agent_pty::FrameWaiter> = None;
+                loop {
+                    // PRD #20 blocker-6: enforce liveness AUTHORITATIVELY here, not
+                    // just in the UI. If the focused session became non-live (a
+                    // wrapped Codex pane that declared `history-only`, or a
+                    // view-only target), REJECT the key / bracketed-paste frame
+                    // rather than forwarding it to the PTY — a UI-only gate can't
+                    // close the race where a pane goes non-live while a stream is
+                    // already open, nor protect an older/stale client. A pane with
+                    // no non-live declaration stays `Live` (the historical default),
+                    // so native PTY panes are unaffected. The connection stays open
+                    // (the client remains attached, seeing output) — only the write
+                    // is dropped.
+                    // PRD #20 R20-008: reject frames to a target that has exited
+                    // (its reader thread saw EOF) even if the registry entry hasn't
+                    // been reaped yet — the cached writer points at a dead PTY.
+                    //
+                    // PRD #20 R20-007 (finding #10): a rejection is no longer a
+                    // silent debug-only drop. Send a TYPED, NON-terminal
+                    // `KIND_STREAM_REJECT` frame (via the output task) so the client
+                    // can surface honest feedback and leave its input mode for BOTH
+                    // key and paste, while the stream stays open.
+                    if exited.load(std::sync::atomic::Ordering::SeqCst) {
+                        tracing::debug!(
+                            target: "pane_write",
+                            agent_id = %id,
+                            pane_id = %pane_id,
+                            payload_len = frame.bytes().len(),
+                            "STREAM_IN rejected — target agent has exited"
+                        );
+                        frame.refuse("exited");
+                        enqueue_reject(&reject_tx, b"exited");
+                        continue 'frames;
+                    }
+                    // Finding #3: resolve by agent identity for a paneless target, by
+                    // pane otherwise. Both default to `Live` when nothing is declared,
+                    // so an ordinary shell is unaffected; a declared non-live target
+                    // (paneless or paned) fails closed.
+                    let pre_lock_writable = {
+                        let guard = state.read().await;
+                        if is_paneless {
+                            guard.agent_writable(&id)
+                        } else {
+                            guard.pane_writable(&pane_id)
+                        }
+                    };
+                    if pre_lock_writable != crate::event::Writable::Live {
+                        tracing::debug!(
+                            target: "pane_write",
+                            agent_id = %id,
+                            pane_id = %pane_id,
+                            payload_len = frame.bytes().len(),
+                            "STREAM_IN rejected — target is not live (history-only / view-only)"
+                        );
+                        frame.refuse("history-only");
+                        enqueue_reject(&reject_tx, b"history-only");
+                        continue 'frames;
+                    }
+                    // PRD #1666 part 3, round 5-wake (Q19): the ticket admitted
+                    // above is the doorbell's record of this frame from before it
+                    // waits for the writer: a ring not yet past its first byte
+                    // ends with nothing written, and one past it is not
+                    // disturbed and lets the frame follow its release.
+                    #[cfg(feature = "e2e")]
+                    if waiter.is_none() {
+                        crate::doorbell::record_for_test(&format!("human-arrived {pane_id}"));
+                    }
+                    let w = writer.lock().await;
+                    // PRD #20 R20-006 (finding #7): RE-VALIDATE under the held writer,
+                    // immediately before writing. A close/respawn (registry removal),
+                    // a liveness transition, or a rebind can land WHILE this frame
+                    // waited for the writer lock — the pre-lock checks above cannot
+                    // see that. Re-check exit, the pane's CURRENT live owner (it must
+                    // still be THIS agent), and writability, holding the writer
+                    // through the completed write, so no bytes reach a target already
+                    // declared stale/removed/non-live. All rejections send the same
+                    // typed frame and keep the stream open.
+                    if exited.load(std::sync::atomic::Ordering::SeqCst) {
+                        drop(w);
+                        frame.refuse("exited");
+                        enqueue_reject(&reject_tx, b"exited");
+                        continue 'frames;
+                    }
+                    // The pane→agent ownership re-check only applies to an agent
+                    // that actually carries a pane id: a daemon-side agent with no
+                    // pane (`<no-pane>`) has no pane→agent mapping to re-resolve, and
+                    // its stream is bound directly to the agent's own writer, so skip
+                    // the check (it would spuriously find no owner and reject).
+                    if !is_paneless {
+                        match registry.pane_current_agent_id(&pane_id) {
+                            Some(current) if current == id => {}
+                            Some(_) => {
+                                drop(w);
+                                frame.refuse("wrong-session");
+                                enqueue_reject(&reject_tx, b"wrong-session");
+                                continue 'frames;
+                            }
+                            None => {
+                                drop(w);
+                                frame.refuse("stale");
+                                enqueue_reject(&reject_tx, b"stale");
+                                continue 'frames;
+                            }
+                        }
+                    }
+                    // Finding #3: re-validate writability under the held writer, by
+                    // agent identity for a paneless target and by pane otherwise.
+                    let post_lock_writable = {
+                        let guard = state.read().await;
+                        if is_paneless {
+                            guard.agent_writable(&id)
+                        } else {
+                            guard.pane_writable(&pane_id)
+                        }
+                    };
+                    if post_lock_writable != crate::event::Writable::Live {
+                        drop(w);
+                        frame.refuse("history-only");
+                        enqueue_reject(&reject_tx, b"history-only");
+                        continue 'frames;
+                    }
+                    // PRD #128 (cherry-picked from PR #122): byte-level trace
+                    // of STREAM_IN frames forwarded to the per-agent PTY
+                    // writer. Useful for confirming that bytes the TUI
+                    // queued arrived as distinct frames and that no other
+                    // path interleaved a write on the same writer mutex
+                    // between them. Gated by `RUST_LOG=trace`. Emitted
+                    // INSIDE the writer mutex so trace order matches actual
+                    // write order. Both `agent_id` and `pane_id` are
+                    // emitted so the M1.4 diff against the daemon-initiated
+                    // trace in `AgentPtyRegistry::write_to_pane_internal`
+                    // can join on either key (`pane_id` is cached once per
+                    // attach above).
+                    tracing::trace!(
+                        target: "pane_write",
+                        source = "stream_in",
+                        agent_id = %id,
+                        pane_id = %pane_id,
+                        payload_len = frame.bytes().len(),
+                        payload = %escape_bytes_for_log(frame.bytes()),
+                        "STREAM_IN forwarded to PTY writer"
+                    );
+                    // Issue #525: awaited, not written inline — the PTY is
+                    // written by the pane writer's own thread, so a pane whose
+                    // agent has stopped reading holds this task, never a
+                    // runtime worker. PRD #1666 part 3 (Q35-15): handed to the
+                    // fence gate, which with no fence writes it and awaits it
+                    // exactly as before, outcome and order included.
+                    match w.accept(frame, waiter.take()).await {
+                        crate::agent_pty::Accepted::Written(Ok(())) => {}
+                        crate::agent_pty::Accepted::Written(Err(_)) => break 'frames,
+                        // Q35-15 (R5 §4.3): held or settled. It is the
+                        // fence's now, ticket and all, and this loop reads
+                        // on, which is what lets a reply on this same
+                        // connection be read while its keys are held.
+                        crate::agent_pty::Accepted::Held => {}
+                        crate::agent_pty::Accepted::Full(back, mut place) => {
+                            drop(w);
+                            place.changed().await;
+                            frame = back;
+                            waiter = Some(place);
+                            continue;
+                        }
+                        crate::agent_pty::Accepted::Retired(back) => {
+                            drop(w);
+                            back.refuse("exited");
+                            enqueue_reject(&reject_tx, b"exited");
+                            continue 'frames;
+                        }
+                    }
+                    // PRD #127 M2.2: a STREAM_IN frame is a *user* keystroke —
+                    // record it as the pane's human input, keyed by `pane_id_env`.
+                    // That record is what lets the deck refuse to type an answer
+                    // to an agent's question into a pane a human has typed into
+                    // since the question arrived
+                    // (`crate::agent_pty::AgentPtyRegistry::user_typed_since_question`,
+                    // PRD #1631).
+                    //
+                    // Issue #424 H1 (both reviewers): recorded BEFORE the writer is
+                    // released, and the `write_user` above records it too (the pane
+                    // writer observes every non-daemon byte — see
+                    // `crate::agent_pty::PaneWriter`), so whatever takes the writer
+                    // next sees this frame's input. This call keeps the frame-level
+                    // contract, including the zero-byte frame the auditor noted:
+                    // a frame counts as input even when it carries no byte.
+                    //
+                    // Issue #542: stamped THROUGH the held writer, which skips it
+                    // once this agent has been closed — a frame that passed the
+                    // re-validation above and finishes after the close must not
+                    // bring the closed pane's clock back.
+                    w.note_user_input(&pane_id);
+                    drop(w);
                     break;
                 }
-                // PRD #127 M2.2: a STREAM_IN frame is a *user* keystroke —
-                // record it as the pane's human input, keyed by `pane_id_env`.
-                // That record is what lets the deck refuse to type an answer
-                // to an agent's question into a pane a human has typed into
-                // since the question arrived
-                // (`crate::agent_pty::AgentPtyRegistry::user_typed_since_question`,
-                // PRD #1631).
-                //
-                // Issue #424 H1 (both reviewers): recorded BEFORE the writer is
-                // released, and the `write_user` above records it too (the pane
-                // writer observes every non-daemon byte — see
-                // `crate::agent_pty::PaneWriter`), so whatever takes the writer
-                // next sees this frame's input. This call keeps the frame-level
-                // contract, including the zero-byte frame the auditor noted:
-                // a frame counts as input even when it carries no byte.
-                //
-                // Issue #542: stamped THROUGH the held writer, which skips it
-                // once this agent has been closed — a frame that passed the
-                // re-validation above and finishes after the close must not
-                // bring the closed pane's clock back.
-                w.note_user_input(&pane_id);
-                drop(w);
             }
             Ok(Some((KIND_DETACH, _))) => {
                 // Explicit M2.5 detach: client signalled intent to leave the
@@ -9069,6 +9189,12 @@ async fn handle_attach_stream(
     output_task.abort();
     Ok(())
 }
+
+/// PRD #1666 part 3 (Q35-15): the attach loop's forced short and failed
+/// writes, through the private writer seam.
+#[cfg(test)]
+#[path = "daemon_protocol_fence_tests.rs"]
+mod fence_tests;
 
 #[cfg(test)]
 mod tests {
