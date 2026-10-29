@@ -715,7 +715,7 @@ fn probe_014_claude_scan_reads_every_string() {
             Err(Hold::Rebound),
         ),
         (
-            r#"{"bindings":[{"context":"Chat","bindings":{"ctrl+e":"chat:submit","ctrl + x ctrl + h":"chat:cancel"}}],"note":"go, gauge, ctrl+gx"}"#,
+            r#"{"bindings":[{"context":"Chat","bindings":{"ctrl+e":"chat:submit","ctrl + x ctrl + h":"chat:cancel"}}],"note":"go, gauge"}"#,
             Ok(()),
         ),
     ] {
@@ -723,6 +723,40 @@ fn probe_014_claude_scan_reads_every_string() {
         let keymap = ClaudeKeymap::at_spawn(path.clone(), &verified());
         assert_eq!(keymap.check(), want, "{contents}");
     }
+}
+
+/// Scenario: Claude's `keybindings.json` spells Ctrl+G in ways splitting a string into strokes would lose — whitespace inside a word (`c trl+g`, `ct rl+g`, `< c-g >`) or a stroke followed by a word starting with `-` (`ctrl+g -`) — in a member name and in a value; each holds as rebound, as do a stroke split by something other than whitespace (`ctrl + (g)`) and a string that only happens to contain a spelling (`ctrl+gx`). The control, a document of unrelated bindings and near-miss words, allows the probe.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_claude_spellings_strokes_would_split_hold() {
+    let dir = test_temp::tempdir().unwrap();
+    let path = keybindings(&dir);
+    for spelling in [
+        "c trl+g",
+        "ct rl+g",
+        "< c-g >",
+        "C ontrol - G",
+        "ctrl+g -",
+        "ctrl+x ctrl+g -",
+        "ctrl + (g)",
+        "ctrl+gx",
+    ] {
+        for contents in [
+            serde_json::json!({"bindings": [{"context": "Chat", "bindings": {spelling: null}}]}),
+            serde_json::json!({"bindings": [{"key": spelling, "action": "chat:submit"}]}),
+        ] {
+            write(&path, &contents.to_string());
+            let keymap = ClaudeKeymap::at_spawn(path.clone(), &verified());
+            assert_eq!(keymap.check(), Err(Hold::Rebound), "{contents}");
+        }
+    }
+
+    write(
+        &path,
+        r#"{"bindings":[{"context":"Chat","bindings":{"ctrl+h":"chat:submit","c-h":null,"^h":"chat:cancel","<c-x> -":"chat:killAgents"}}],"note":"go, gauge, chat: external, ctrl+ h g"}"#,
+    );
+    let control = ClaudeKeymap::at_spawn(path, &verified());
+    assert_eq!(control.check(), Ok(()));
 }
 
 /// Scenario: Codex's sources are read before the spawn and again after the first ready frame: a file changed between the two, created where none was, or removed holds with "changed", whatever either read binds. The control reads the same files twice and allows the probe.

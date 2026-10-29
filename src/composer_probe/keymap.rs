@@ -283,14 +283,15 @@ impl ClaudeKeymap {
 
 /// Whether a `keybindings.json` leaves Ctrl+G on the external editor: no
 /// string in the document, an object's member name or a value at any depth,
-/// may name [`CLAUDE_EDITOR_ACTION`] or hold Ctrl+G in any of its strokes
-/// ([`claude_names_editor`], [`claude_strokes`]). The format's layout isn't
-/// measured beyond M39 (a `Chat` context that unbinds Ctrl+G and binds the
-/// action elsewhere), so the check reads every string the same way rather
-/// than trusting one layout, and an explicit default binding holds too.
+/// may name [`CLAUDE_EDITOR_ACTION`] or spell Ctrl+G, either in one of its
+/// strokes ([`claude_strokes`]) or anywhere in it once whitespace is removed
+/// ([`claude_mentions`]). The format's layout isn't measured beyond M39
+/// (a `Chat` context that unbinds Ctrl+G and binds the action elsewhere), so
+/// the check reads every string the same way rather than trusting one
+/// layout, and an explicit default binding holds too.
 fn claude_bindings(contents: &[u8]) -> Result<(), Hold> {
     fn holds(s: &str) -> bool {
-        claude_names_editor(s) || claude_strokes(s).iter().any(|k| is_ctrl_g(k))
+        claude_mentions(s) || claude_strokes(s).iter().any(|k| is_ctrl_g(k))
     }
     fn walk(value: &serde_json::Value) -> bool {
         match value {
@@ -310,15 +311,27 @@ fn claude_bindings(contents: &[u8]) -> Result<(), Hold> {
     }
 }
 
-/// Whether `s` names [`CLAUDE_EDITOR_ACTION`], in any case and with any
-/// whitespace inside it.
-fn claude_names_editor(s: &str) -> bool {
-    let s: String = s
-        .chars()
+/// Whether `s`, lower-cased and with all its whitespace removed, contains
+/// [`CLAUDE_EDITOR_ACTION`] or any of [`CTRL_G`]'s spellings. Removing the
+/// whitespace keeps the spellings [`is_ctrl_g`] reads (`c trl+g`, `< c-g >`)
+/// that splitting a string into strokes would break apart, and a
+/// containment test keeps a stroke that joining strokes would extend
+/// (`ctrl+g -`). That over-holds: a string that only happens to contain one,
+/// such as `abc-g` or `ctrl+gx`, holds as rebound too. That's accepted:
+/// holding is the conservative answer, and every Claude release holds on
+/// P-KB1 today anyway. The stroke check still runs beside it, for a stroke
+/// whose words something other than whitespace separates (`ctrl + (g)`).
+fn claude_mentions(s: &str) -> bool {
+    let s = squeezed(s);
+    s.contains(&CLAUDE_EDITOR_ACTION.to_lowercase()) || CTRL_G.iter().any(|g| s.contains(g))
+}
+
+/// `s` lower-cased, with all its whitespace removed.
+fn squeezed(s: &str) -> String {
+    s.chars()
         .filter(|c| !c.is_whitespace())
         .flat_map(char::to_lowercase)
-        .collect();
-    s.contains(&CLAUDE_EDITOR_ACTION.to_lowercase())
+        .collect()
 }
 
 /// The key strokes a string could spell: split at anything that can't be
@@ -351,16 +364,20 @@ fn claude_strokes(s: &str) -> Vec<String> {
 /// accepts that isn't here isn't seen. Codex has its own, pinned grammar
 /// ([`codex_key`]).
 pub fn is_ctrl_g(key: &str) -> bool {
-    let key: String = key
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .flat_map(char::to_lowercase)
-        .collect();
-    matches!(
-        key.as_str(),
-        "ctrl+g" | "ctrl-g" | "control+g" | "control-g" | "c-g" | "<c-g>" | "^g"
-    )
+    CTRL_G.contains(&squeezed(key).as_str())
 }
+
+/// The spellings [`is_ctrl_g`] reads as Ctrl+G, lower-cased and without
+/// whitespace.
+const CTRL_G: &[&str] = &[
+    "ctrl+g",
+    "ctrl-g",
+    "control+g",
+    "control-g",
+    "c-g",
+    "<c-g>",
+    "^g",
+];
 
 /// The sources one Codex launch reads its key bindings from (R6 §9.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
