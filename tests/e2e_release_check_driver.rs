@@ -164,6 +164,7 @@ fn rechunk(trace: &Value, width: usize) -> Value {
         .as_array()
         .unwrap()
         .iter()
+        .chain(trace["quiet_observations"].as_array().unwrap())
         .map(|gap| ends[gap["after_operation"].as_u64().unwrap() as usize])
         .collect();
     boundaries.extend([0, raw.len()]);
@@ -188,6 +189,7 @@ fn rechunk(trace: &Value, width: usize) -> Value {
             .collect::<Vec<_>>()
     );
     assert_eq!(out["gap_events"], trace["gap_events"]);
+    assert_eq!(out["quiet_observations"], trace["quiet_observations"]);
     assert_eq!(trace_bytes(&out), raw);
     out
 }
@@ -255,7 +257,7 @@ fn doorbell_060_driver_collects_standin_bytes_modes_and_layout() {
     }
 }
 
-/// Scenario: Run each composer faithfully, then separately change its release, input mode, echo, complete screen or transient output. The evaluator names the failed fact for every changed candidate.
+/// Scenario: Run each composer faithfully, then separately change its release, input mode, echo, complete screen or transient output. The modal preserves the reviewed composer and cursor, so only its foreign cells cause the named complete-frame failure.
 #[spec("inbox/doorbell/060")]
 #[test]
 fn doorbell_060_driver_fault_knobs_name_the_failed_fact() {
@@ -277,6 +279,36 @@ fn doorbell_060_driver_fault_knobs_name_the_failed_fact() {
         ] {
             let root = tempfile::tempdir().unwrap();
             let observed = capture(plan(root.path(), agent, typing, &[(knob, value)]));
+            if value == "modal" {
+                let mut actual = dot_agent_deck::vt_grid::parser(50, 200, 0);
+                actual.process(&bytes(&observed["bytes"]));
+                let mut good = dot_agent_deck::vt_grid::parser(50, 200, 0);
+                good.process(frames()[agent]["ready"].as_str().unwrap().as_bytes());
+                assert_eq!(
+                    actual.screen().cursor_position(),
+                    good.screen().cursor_position()
+                );
+                for row in 0..50 {
+                    for col in 0..200 {
+                        if row == 34 && (4..12).contains(&col) {
+                            assert_eq!(
+                                actual.screen().cell(row, col).unwrap().contents(),
+                                "Confirm?"
+                                    .chars()
+                                    .nth(usize::from(col - 4))
+                                    .unwrap()
+                                    .to_string()
+                            );
+                        } else {
+                            assert_eq!(
+                                actual.screen().cell(row, col),
+                                good.screen().cell(row, col),
+                                "modal changed reviewed {agent} cell ({row}, {col})"
+                            );
+                        }
+                    }
+                }
+            }
             differs(&measure(reference(agent, typing), &observed), fact);
         }
     }
@@ -321,58 +353,112 @@ fn doorbell_060_driver_overlay_inside_one_replay_read() {
     }
 }
 
-/// Scenario: Pause between Claude's ready and typed screens. Capture derives exactly the elapsed-read gap at the last completed operation before typing, retaining the measured final quiet observation separately from phase end.
+/// Scenario: Pause between Claude's ready and typed screens. Each checkpoint carries exactly the measured arrival and quiet boundaries with their original clock and operation provenance; the later arrival supersedes the earlier quiet observation without duplicating a frame boundary.
 #[spec("inbox/doorbell/060")]
 #[test]
 fn doorbell_060_driver_derives_gaps_once_at_capture() {
     let root = tempfile::tempdir().unwrap();
     let capture = capture(plan(root.path(), "claude", true, &[]));
-    let trace = &capture["observations"][1]["oracle"];
-    let raw = trace_bytes(trace);
-    let gaps = trace["gap_events"].as_array().unwrap();
-    let ends = operation_ends(&raw);
-    let reads: Vec<_> = capture["reads"]
+    let all_reads: Vec<_> = capture["reads"]
         .as_array()
         .unwrap()
         .iter()
         .filter(|read| read["len"].as_u64().unwrap() > 0)
         .collect();
-    let mut expected = Vec::new();
-    for pair in reads.windows(2) {
-        let elapsed = pair[1]["t"].as_u64().unwrap() - pair[0]["t"].as_u64().unwrap();
-        if elapsed >= Q {
-            let off = pair[1]["off"].as_u64().unwrap() as usize;
-            let operations = ends.partition_point(|end| *end <= off) - 1;
-            expected.push(operations);
-            assert!(gaps.iter().any(|gap|
-                gap["after_operation"] == operations && gap["elapsed_ns"] == elapsed));
-        }
-    }
-    assert!(
-        !expected.is_empty(),
-        "the controller must actually wait across Q"
-    );
-    let last_operation = ends.len() - 1;
-    for gap in gaps {
-        let position = gap["after_operation"].as_u64().unwrap() as usize;
-        assert!(
-            expected.contains(&position) || position == last_operation,
-            "invented gap at operation {position}"
+    let quiet = capture["quiet_observations"].as_array().unwrap();
+    let observations = capture["observations"].as_array().unwrap();
+    assert_eq!(observations.len(), 2);
+    assert_eq!(quiet.len(), 2, "one measured quiet record per checkpoint");
+    for (checkpoint, observation) in observations.iter().enumerate() {
+        let trace = &observation["oracle"];
+        let raw = trace_bytes(trace);
+        let ends = operation_ends(&raw);
+        let reads: Vec<_> = all_reads
+            .iter()
+            .copied()
+            .filter(|read| {
+                read["off"].as_u64().unwrap() + read["len"].as_u64().unwrap() <= raw.len() as u64
+            })
+            .collect();
+        let expected_gaps: Vec<_> = reads
+            .windows(2)
+            .filter_map(|pair| {
+                let elapsed = pair[1]["t"].as_u64().unwrap() - pair[0]["t"].as_u64().unwrap();
+                if elapsed < Q {
+                    return None;
+                }
+                let off = pair[1]["off"].as_u64().unwrap() as usize;
+                let operations = ends.partition_point(|end| *end <= off) - 1;
+                Some(json!({"after_operation": operations, "elapsed_ns": elapsed}))
+            })
+            .collect();
+        assert_eq!(
+            trace["gap_events"],
+            json!(expected_gaps),
+            "arrival evidence at checkpoint {checkpoint}"
         );
-        assert!(gap["elapsed_ns"].as_u64().unwrap() >= Q);
+        if checkpoint == 1 {
+            assert!(
+                !expected_gaps.is_empty(),
+                "the controller must actually wait across Q"
+            );
+        }
+        for evidence in &quiet[..=checkpoint] {
+            let off = evidence["off"].as_u64().unwrap() as usize;
+            assert!(off <= raw.len());
+            let operations = ends.partition_point(|end| *end <= off) - 1;
+            let last_read = reads
+                .iter()
+                .rfind(|read| {
+                    read["off"].as_u64().unwrap() + read["len"].as_u64().unwrap() == off as u64
+                })
+                .expect("quiet must be anchored to an actual completed read");
+            assert_eq!(evidence["after_operation"], operations);
+            assert_eq!(evidence["start_ns"], last_read["t"]);
+            let start = evidence["start_ns"].as_u64().unwrap();
+            let observed = evidence["observed_ns"].as_u64().unwrap();
+            assert!(observed >= start);
+            assert_eq!(evidence["elapsed_ns"], observed - start);
+            assert!(
+                observed - start >= 2 * Q,
+                "checkpoint must finish its bounded quiet wait"
+            );
+            if let Some(next) = reads.iter().find(|read| read["off"] == off) {
+                assert!(observed <= next["t"].as_u64().unwrap());
+            }
+        }
+        let expected_quiet: Vec<_> = quiet[..=checkpoint]
+            .iter()
+            .filter(|evidence| {
+                !expected_gaps
+                    .iter()
+                    .any(|gap| gap["after_operation"] == evidence["after_operation"])
+            })
+            .cloned()
+            .collect();
+        assert_eq!(
+            expected_quiet.len(),
+            1,
+            "only the terminal quiet boundary survives"
+        );
+        assert_eq!(expected_quiet[0]["off"], raw.len());
+        assert_eq!(expected_quiet[0]["after_operation"], ends.len() - 1);
+        assert_eq!(
+            trace["quiet_observations"],
+            json!(expected_quiet),
+            "quiet evidence at checkpoint {checkpoint}"
+        );
+        let positions: std::collections::BTreeSet<_> = expected_gaps
+            .iter()
+            .chain(&expected_quiet)
+            .map(|event| event["after_operation"].as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            positions.len(),
+            expected_gaps.len() + expected_quiet.len(),
+            "one boundary per operation position, without duplicates"
+        );
     }
-    assert!(
-        gaps.iter()
-            .any(|gap| gap["after_operation"] == last_operation),
-        "the terminal quiet observation needs its own capture-time evidence"
-    );
-    let terminal = capture["quiet_observations"]
-        .as_array()
-        .unwrap()
-        .last()
-        .unwrap();
-    assert_eq!(terminal["off"], raw.len());
-    assert!(terminal["elapsed_ns"].as_u64().unwrap() >= Q);
 }
 
 /// Scenario: Capture faithful and faulty stand-ins, then split their output into one-byte, seven-byte or whole-frame reads without moving a captured gap. Every verdict and frame/stall count stays equal, including splits inside UTF-8 and CSI sequences.
@@ -413,7 +499,7 @@ fn doorbell_060_driver_timing_preserving_rechunking() {
     }
 }
 
-/// Scenario: Capture Claude erasing and restoring its old placeholder before typing, preserving the original quiet gaps. Add a gap just after the erased screen: this new frame boundary makes the later restored old glyphs fail.
+/// Scenario: Capture Claude erasing and restoring its old placeholder before typing, preserving the captured arrival gaps and measured silence. Add a quiet observation just after the erased screen: this new frame boundary makes the later restored old glyphs fail at every replay width.
 #[spec("inbox/doorbell/060")]
 #[test]
 fn doorbell_060_driver_added_gap_can_change_the_verdict() {
@@ -441,14 +527,21 @@ fn doorbell_060_driver_added_gap_can_change_the_verdict() {
     let erase_end = raw.windows(ERASE.len()).position(|w| w == ERASE).unwrap() + ERASE.len();
     let after_operation = operation_ends(&raw[..erase_end]).len() - 1;
     let mut changed = trace.clone();
-    let gaps = changed["gap_events"].as_array_mut().unwrap();
+    let gaps = changed["gap_events"].as_array().unwrap();
     assert!(
         !gaps
             .iter()
             .any(|gap| gap["after_operation"] == after_operation)
     );
-    gaps.push(json!({"after_operation": after_operation, "elapsed_ns": Q}));
-    gaps.sort_by_key(|gap| gap["after_operation"].as_u64().unwrap());
+    let quiet = changed["quiet_observations"].as_array_mut().unwrap();
+    assert!(
+        !quiet
+            .iter()
+            .any(|event| event["after_operation"] == after_operation)
+    );
+    quiet.push(json!({"after_operation": after_operation, "off": erase_end,
+                      "start_ns": 0, "observed_ns": Q, "elapsed_ns": Q}));
+    quiet.sort_by_key(|event| event["after_operation"].as_u64().unwrap());
     for width in [1, 7, usize::MAX] {
         differs(
             &replay(reference.clone(), rechunk(&changed, width)),
@@ -457,21 +550,38 @@ fn doorbell_060_driver_added_gap_can_change_the_verdict() {
     }
 }
 
-/// Scenario: Run both synthetic composers' default and fault controls in private PTYs. Defaults match frozen parent bytes, and every enabled knob changes only its declared observable output or termios.
+/// Scenario: Run both synthetic composers' default and fault controls in private PTYs with a local deadline. Defaults match frozen parent bytes, and every enabled knob changes only its declared observable output or termios; a hung self-check child is killed and reaped with captured diagnostics.
 #[spec("inbox/doorbell/060")]
 #[test]
 fn doorbell_060_driver_standin_knob_self_checks() {
-    let output = std::process::Command::new("/usr/bin/python3")
+    let root = tempfile::tempdir().unwrap();
+    let stdout_path = root.path().join("stdout");
+    let stderr_path = root.path().join("stderr");
+    let mut child = std::process::Command::new("/usr/bin/python3")
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/composer_knob_checks.py"))
         .arg("DriverKnobs")
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
-        .output()
+        .stdout(std::fs::File::create(&stdout_path).unwrap())
+        .stderr(std::fs::File::create(&stderr_path).unwrap())
+        .spawn()
         .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let (status, timed_out) = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break (status, false);
+        }
+        if std::time::Instant::now() >= deadline {
+            // The direct child may have exited between try_wait and kill.
+            let _ = child.kill();
+            break (child.wait().unwrap(), true);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
     assert!(
-        output.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        !timed_out && status.success(),
+        "Python self-check timed_out={timed_out}, status={status}:\n{}\n{}",
+        std::fs::read_to_string(stdout_path).unwrap(),
+        std::fs::read_to_string(stderr_path).unwrap()
     );
 }

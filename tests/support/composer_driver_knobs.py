@@ -45,7 +45,7 @@ def frame(data, agent, redraw_number):
     elif fault:
         raise ValueError('unknown DRIVER_FAULT: ' + fault)
     # Restore the reviewed frame's cursor after the injected operations.
-    if fault in ('overlay', 'moved_glyph', 'mode', 'control'):
+    if fault in ('overlay', 'moved_glyph', 'mode', 'control', 'modal'):
         body += cursor
     if os.environ.get(PREFIX + 'TIMING_RESTORE') == '1' and redraw_number > 1:
         if agent != 'claude':
