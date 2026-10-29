@@ -11,6 +11,46 @@ use spec::spec;
 #[path = "fixtures/release-check/wire/old_client.rs"]
 mod old;
 
+#[cfg(unix)]
+#[path = "fixtures/release-check/wire/scripted_daemon.rs"]
+mod scripted_daemon;
+
+/// Scenario: A deliberately broken caller writes a run verb on several sockets and immediately returns Unsupported without waiting for a reply. The capture must retain every queued frame, so the same no-verbs assertion used by the client matrix rejects this caller.
+#[cfg(unix)]
+#[spec("inbox/release-check/002")]
+#[tokio::test]
+async fn release_check_002_capture_detects_a_write_before_unsupported() {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+
+    use dot_agent_deck::daemon_client::GatedQuery;
+    use dot_agent_deck::daemon_protocol::KIND_REQ;
+
+    let request = json!({"op":"release-check-run","agent":"claude"});
+    let payload = serde_json::to_vec(&request).unwrap();
+    let mut frame = vec![KIND_REQ];
+    frame.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
+    frame.extend_from_slice(&payload);
+    let (result, sent) = scripted_daemon::capture(None, false, |path| async move {
+        // These tiny synchronous writes deliberately never yield to the current-thread
+        // server. All peers close before capture stops accepting, leaving queued data.
+        for _ in 0..3 {
+            let mut stream = UnixStream::connect(&path).unwrap();
+            stream.write_all(&frame).unwrap();
+        }
+        GatedQuery::<()>::Unsupported
+    })
+    .await;
+    assert_eq!(result, GatedQuery::Unsupported);
+    assert_eq!(sent, vec![request; 3], "capture lost queued verb frames");
+    let panic = std::panic::catch_unwind(|| scripted_daemon::assert_no_verbs(&sent))
+        .expect_err("the client matrix's no-verbs assertion must reject this control");
+    let message = panic.downcast_ref::<String>().unwrap();
+    assert!(message.contains("unsupported call sent"), "{message}");
+    assert!(message.contains("release-check-run"), "{message}");
+    scripted_daemon::assert_no_verbs(&[]);
+}
+
 const CAUSES: &[&str] = &[
     "release_check_running",
     "release_check_differs",
