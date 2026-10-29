@@ -10,6 +10,12 @@ Claude Code's prompt hook hands the agent its mail. No model runs.
 
 Optional fixture knobs (unset by default):
   DOT_AGENT_DECK_TEST_COMPOSER_RELEASE overrides argv[3] in the header.
+  DOT_AGENT_DECK_TEST_COMPOSER_DRIVER_FAULT selects overlay, moved_glyph,
+    mode, control, modal, missing_echo or echo_mode (SC-06 only).
+  DOT_AGENT_DECK_TEST_COMPOSER_TIMING_RESTORE=1 adds a neighbour-cell erase
+    and restore before later redraws (SC-06 quiet-gap control).
+    These knobs need composer_driver_knobs.py beside this script; when off,
+    copied standalone scripts retain their original dependency-free output.
   DOT_AGENT_DECK_TEST_COMPOSER_REPORT=1 writes .spawn.json beside base:
     argv and the inherited VISUAL/EDITOR/CLAUDE_ENV_FILE (null means unset).
   DOT_AGENT_DECK_TEST_COMPOSER_BASH_TOOL=1 enables a Claude-style tool shell,
@@ -44,7 +50,14 @@ import termios
 import time
 import tty
 
+driver_knobs = None
+if (os.environ.get('DOT_AGENT_DECK_TEST_COMPOSER_DRIVER_FAULT') or
+        os.environ.get('DOT_AGENT_DECK_TEST_COMPOSER_TIMING_RESTORE') == '1'):
+    import composer_driver_knobs as driver_knobs
+
 tty.setraw(0, termios.TCSANOW)
+if driver_knobs:
+    driver_knobs.input_mode(0)
 base, deck, version = sys.argv[1], sys.argv[2], sys.argv[3]
 version = os.environ.get('DOT_AGENT_DECK_TEST_COMPOSER_RELEASE', version)
 if os.environ.get('DOT_AGENT_DECK_TEST_COMPOSER_REPORT') == '1':
@@ -62,6 +75,7 @@ capture = open(base + '.bytes', 'ab', buffering=0)
 turns = open(base + '.turns', 'a', buffering=1)
 composer = bytearray()
 transcript = []
+redraw_number = 0
 
 
 def bash_tool():
@@ -113,19 +127,22 @@ def bash_tool():
 
 
 def redraw():
+    global redraw_number
+    redraw_number += 1
     cols = os.get_terminal_size(0).columns
     rule = ('─' * cols).encode()
     out = b'\x1b[2J\x1b[H\x1b[2;12HClaude Code v' + version.encode() + b'\r'
     for i, message in enumerate(transcript[-5:]):
         out += ('\x1b[%d;1H\x1b[48;5;237m❯ ' % (4 + i * 2)).encode() + message + b'\x1b[0m'
     out += b'\x1b[25;1H' + rule + '\x1b[26;1H❯ '.encode()
-    if composer:
-        out += bytes(composer)
+    shown_composer = driver_knobs.visible_composer(composer) if driver_knobs else composer
+    if shown_composer:
+        out += bytes(shown_composer)
     else:
         out += b'\x1b[2mTry "fix the bug"\x1b[22m'
     out += b'\x1b[27;1H' + rule + b'\x1b[28;3H? for shortcuts'
-    out += ('\x1b[26;%dH' % (3 + len(composer.decode('utf-8', 'replace')))).encode()
-    os.write(1, out)
+    out += ('\x1b[26;%dH' % (3 + len(shown_composer.decode('utf-8', 'replace')))).encode()
+    os.write(1, driver_knobs.frame(out, 'claude', redraw_number) if driver_knobs else out)
 
 
 redraw()

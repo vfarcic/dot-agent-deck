@@ -27,8 +27,16 @@ PREFIX = 'DOT_AGENT_DECK_TEST_COMPOSER_'
 BOOTSTRAP = r"""
 import builtins, contextlib, json, os, runpy, select, sys, time
 script = sys.argv.pop(1)
+sys.path.insert(0, os.path.dirname(script))
 base = sys.argv[1]
 original_open, original_load, original_select = builtins.open, json.load, select.select
+original_write = os.write
+def checked_write(fd, data):
+    if fd == 1 and os.environ.get('CHECK_DRIVER_WRITES') == '1':
+        with original_open(base + '.writes', 'a') as log:
+            log.write(json.dumps(list(data)) + '\n')
+    return original_write(fd, data)
+os.write = checked_write
 first = True
 tick = 0
 def checked_open(path, mode='r', *args, **kwargs):
@@ -71,13 +79,13 @@ runpy.run_path(script, run_name='__main__')
 
 
 class Composer:
-    def __init__(self, root, fixture, extra=None, instrument=False):
+    def __init__(self, root, fixture, extra=None, instrument=False, rows=40, cols=140):
         self.base = root / fixture
         env = {'PATH': os.environ['PATH'], 'HOME': str(root),
                'TERM': 'xterm-256color', 'LANG': 'C.UTF-8'}
         env.update(extra or {})
         self.master, slave = pty.openpty()
-        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 140, 0, 0))
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
         script = str(SUPPORT / fixture)
         tail = [str(self.base)]
         if fixture != 'empty_composer.py':
@@ -322,6 +330,91 @@ class ComposerKnobs(unittest.TestCase):
                 finally:
                     composer.path('.tick-go').touch()
                 composer.cycle()
+
+
+class DriverKnobs(unittest.TestCase):
+    """SC-06 controls, independent of the existing mailbox controls."""
+
+    setUp = ComposerKnobs.setUp
+
+    def start_driver(self, agent, extra=None, instrument=False):
+        root = self.root / str(len(list(self.root.iterdir())))
+        root.mkdir()
+        composer = Composer(root, agent + '_composer.py', extra, instrument,
+                            rows=50, cols=200)
+        self.addCleanup(composer.close)
+        last = [b'', time.monotonic()]
+        def settled():
+            if composer.output != last[0]:
+                last[:] = [composer.output, time.monotonic()]
+            return (composer.path('.pid').exists() and composer.output and
+                    time.monotonic() - last[1] >= .04)
+        composer.wait(settled, 'initial driver frame')
+        return composer
+
+    def changed_frame(self, composer, action):
+        before = composer.output
+        last = [before, time.monotonic()]
+        action()
+        def settled():
+            if composer.output != last[0]:
+                last[:] = [composer.output, time.monotonic()]
+            return composer.output != before and time.monotonic() - last[1] >= .04
+        composer.wait(settled, 'settled changed frame')
+        return composer.output[len(before):].decode()
+
+    def test_driver_defaults_match_frozen_parent_frames(self):
+        """Scenario: start, type, delete and resize with the new knobs unset or disabled; all emitted bytes equal the frozen pre-change stand-ins."""
+        frames = json.loads((SUPPORT.parent / 'fixtures/release-check/driver-frames.json').read_text())
+        for agent in ('claude', 'codex'):
+            for extra in ({}, {PREFIX + 'DRIVER_FAULT': '', PREFIX + 'TIMING_RESTORE': '0'}):
+                with self.subTest(agent=agent, extra=extra):
+                    composer = self.start_driver(agent, extra)
+                    self.assertEqual(composer.output.decode(), frames[agent]['ready'])
+                    self.assertEqual(self.changed_frame(composer, lambda: os.write(composer.master, b'(abcdef) synthetic')),
+                                     frames[agent]['typed'])
+                    self.assertEqual(self.changed_frame(composer, lambda: os.write(composer.master, b'\x7f' * 18)),
+                                     frames[agent]['deleted'])
+                    self.assertEqual(self.changed_frame(composer, lambda: fcntl.ioctl(
+                        composer.master, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 140, 0, 0))),
+                                     frames[agent]['resized'])
+
+    def test_driver_faults_change_bytes_inside_one_write(self):
+        """Scenario: raise each screen fault on each composer; its raw operations are present in the sole initial write, including a drawn-and-erased overlay."""
+        faults = {'overlay': b'\x1b[35;5H!\x1b[2K',
+                  'moved_glyph': b'\x1b[35;5HC\x1b[2K',
+                  'mode': b'\x1b[?1000h\x1b[?1000l',
+                  'control': b'\x1b]52;c;YQ==\x07',
+                  'modal': b'\x1b[35;5HConfirm?'}
+        for agent in ('claude', 'codex'):
+            for fault, inserted in faults.items():
+                with self.subTest(agent=agent, fault=fault):
+                    composer = self.start_driver(agent, {PREFIX + 'DRIVER_FAULT': fault,
+                                                         'CHECK_DRIVER_WRITES': '1'}, instrument=True)
+                    writes = [bytes(json.loads(line)) for line in composer.path('.writes').read_text().splitlines()]
+                    self.assertEqual(writes, [composer.output])
+                    self.assertIn(inserted, writes[0])
+                    if agent == 'codex':
+                        self.assertLess(writes[0].index(inserted), writes[0].index(b'\x1b[?2026l'))
+
+    def test_driver_echo_and_termios_faults_are_observable(self):
+        """Scenario: type a line with echo drawing disabled, then start with terminal echo enabled; the missing text and wrong slave mode can be measured independently."""
+        for agent in ('claude', 'codex'):
+            composer = self.start_driver(agent, {PREFIX + 'DRIVER_FAULT': 'missing_echo'})
+            frame = self.changed_frame(composer, lambda: os.write(composer.master, b'(abcdef) synthetic'))
+            self.assertNotIn('(abcdef) synthetic', frame)
+            self.assertFalse(termios.tcgetattr(composer.master)[3] & (termios.ICANON | termios.ECHO))
+            wrong_mode = self.start_driver(agent, {PREFIX + 'DRIVER_FAULT': 'echo_mode'})
+            self.assertTrue(termios.tcgetattr(wrong_mode.master)[3] & termios.ECHO)
+            self.assertFalse(termios.tcgetattr(wrong_mode.master)[3] & termios.ICANON)
+
+    def test_driver_timing_restore_preserves_old_cells_until_typing(self):
+        """Scenario: type into Claude's empty composer; before the typed redraw one write erases and restores only the old placeholder's own cells."""
+        composer = self.start_driver('claude', {PREFIX + 'TIMING_RESTORE': '1'})
+        frames = json.loads((SUPPORT.parent / 'fixtures/release-check/driver-frames.json').read_text())
+        self.assertEqual(composer.output.decode(), frames['claude']['ready'])
+        frame = self.changed_frame(composer, lambda: os.write(composer.master, b'(abcdef) synthetic'))
+        self.assertEqual(frame, '\x1b[26;3H\x1b[2X\x1b[H\x1b[26;3H\x1b[2mTr\x1b[22m\x1b[H' + frames['claude']['typed'])
 
 
 if __name__ == '__main__':

@@ -4,6 +4,8 @@ These fixtures pin SC-01 of the revision-6 self-check design. `oracle.json` is a
 
 The tests run on Linux and macOS without reading a real HOME, process identity, credential or agent executable. macOS reads the same committed bytes; these tests do not cover its cdhash, Keychain or containment.
 
+SC-06's synthetic PTY-driver tests and default-off stand-in knobs extend this fixture family. Their [driver contract and evidence map](driver/README.md) specify the separate missing driver interface, fixed synthetic screens, Linux execution, offline macOS reads and the final-quiet-boundary convention needing coder/design agreement.
+
 ## Assumed interface for the coder
 
 The tests intentionally fail to import the not-yet-existing `dot_agent_deck::release_check::evaluate`. No production shim is supplied. That module exports the following measurement interface; names can change by agreement, but the controls must not be weakened to accommodate an implementation.

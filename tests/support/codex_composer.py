@@ -34,6 +34,10 @@ CLOCK_MONOTONIC time), .dialog_bytes, .turns (each submitted line) and .hooks
 (what the prompt hook printed).
 
 Optional fixture knobs (unset by default):
+  DOT_AGENT_DECK_TEST_COMPOSER_DRIVER_FAULT selects overlay, moved_glyph,
+    mode, control, modal, missing_echo or echo_mode (SC-06 only).
+    These need composer_driver_knobs.py beside the script; the default path
+    keeps copied scripts self-contained and their output byte-identical.
   DOT_AGENT_DECK_TEST_COMPOSER_RELEASE overrides argv[3] in the header.
   DOT_AGENT_DECK_TEST_COMPOSER_REPORT=1 writes .spawn.json beside base:
     argv and the inherited VISUAL/EDITOR/CLAUDE_ENV_FILE (null means unset).
@@ -69,7 +73,14 @@ import termios
 import time
 import tty
 
+driver_knobs = None
+if (os.environ.get('DOT_AGENT_DECK_TEST_COMPOSER_DRIVER_FAULT') or
+        os.environ.get('DOT_AGENT_DECK_TEST_COMPOSER_TIMING_RESTORE') == '1'):
+    import composer_driver_knobs as driver_knobs
+
 tty.setraw(0, termios.TCSANOW)
+if driver_knobs:
+    driver_knobs.input_mode(0)
 
 
 def positionals(argv):
@@ -106,6 +117,7 @@ dialog_bytes = open(base + '.dialog_bytes', 'ab', buffering=0)
 turns = open(base + '.turns', 'a', buffering=1)
 composer = bytearray()
 transcript = []
+redraw_number = 0
 MARKER = b'\x1b[?2026h\x1b[1;1H\x1b[J'
 DIALOGS = {
     'update': ('Update available! 0.164.0 -> 0.999.0',
@@ -186,6 +198,8 @@ def at(row, col):
 
 
 def redraw():
+    global redraw_number
+    redraw_number += 1
     cols, rows = os.get_terminal_size(0)
     out = bytearray(MARKER)
     name = dialog_now()
@@ -203,7 +217,7 @@ def redraw():
                 out += at(row, 0) + label.encode()
         out += at(4 + len(choices) + 1, 2) + b'Press enter to continue'
         out += b'\x1b[?2026l'
-        os.write(1, bytes(out))
+        os.write(1, driver_knobs.frame(bytes(out), 'codex', redraw_number) if driver_knobs else bytes(out))
         return
     inner = cols - 2
     if not flag('.noheader'):
@@ -226,21 +240,22 @@ def redraw():
     if flag('.hidden'):
         out += at(row, 0) + b'Working (esc to interrupt)'
         out += b'\x1b[?2026l'
-        os.write(1, bytes(out))
+        os.write(1, driver_knobs.frame(bytes(out), 'codex', redraw_number) if driver_knobs else bytes(out))
         return
     prompt_row = row
     out += at(prompt_row, 0) + b'\x1b[1m\xe2\x80\xba\x1b[0m '
-    if composer:
-        out += bytes(composer)
+    shown_composer = driver_knobs.visible_composer(composer) if driver_knobs else composer
+    if shown_composer:
+        out += bytes(shown_composer)
     else:
         out += b'\x1b[2mAsk Codex to do anything\x1b[0m'
     out += at(prompt_row + 2, 2) + b'gpt-test low \xc2\xb7 ~/work'
-    if not composer:
+    if not shown_composer:
         out += at(prompt_row + 3, 2) + b'? for shortcuts'
-    shown = len(composer.decode('utf-8', 'replace'))
+    shown = len(shown_composer.decode('utf-8', 'replace'))
     out += at(prompt_row, 2 + shown)
     out += b'\x1b[?2026l'
-    os.write(1, bytes(out))
+    os.write(1, driver_knobs.frame(bytes(out), 'codex', redraw_number) if driver_knobs else bytes(out))
 
 
 def run_hook(event, extra):

@@ -78,6 +78,41 @@ fn inconclusive(report: &Evaluation, expected: &str) {
     }
 }
 
+/// Scenario: Read the frozen synthetic driver's ready, typed, deleted and resized ANSI on either platform without launching a child. Each fixed screen forms one accepted complete frame against its own reviewed template.
+#[spec("inbox/doorbell/060")]
+#[test]
+fn doorbell_060_driver_frozen_frames_read_without_a_pty() {
+    let frames: Value =
+        serde_json::from_str(include_str!("fixtures/release-check/driver-frames.json")).unwrap();
+    for agent in ["claude", "codex"] {
+        for name in ["ready", "typed", "deleted", "resized"] {
+            let (rows, cols) = if name == "resized" {
+                (40, 140)
+            } else {
+                (50, 200)
+            };
+            let ansi = frames[agent][name].as_str().unwrap();
+            let mut oracle = reference();
+            oracle["rows"] = json!(rows);
+            oracle["cols"] = json!(cols);
+            oracle["templates"] = json!([{"name": name, "phase": "idle", "ansi": ansi}]);
+            // Claude's actual framing stays quiet-gap in the driver tests.
+            // Here a synthetic wrapper selects the fixed fixture's final grid.
+            let output = if agent == "claude" {
+                sync(ansi)
+            } else {
+                ansi.to_owned()
+            };
+            let mut trace = capture(&output);
+            trace["rows"] = json!(rows);
+            trace["cols"] = json!(cols);
+            let report = run(oracle, trace, Limits::default());
+            passed(&report);
+            assert_eq!(report.complete_frames, 1, "{agent}/{name}: {report:?}");
+        }
+    }
+}
+
 fn quiet(middle: &str, gaps: &[(usize, u64)]) -> Value {
     let mut trace = capture(&format!(
         "{}{middle}{}",
