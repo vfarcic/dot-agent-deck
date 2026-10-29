@@ -29,6 +29,17 @@
 //! that runs. It is a hardening of trusted git against repository content, not
 //! a sandbox.
 //!
+//! **The branch is read differently** ([`branch_at`]): from the repository's
+//! `HEAD` file, as the run is prepared and before its agent starts, so it is
+//! the branch the run started on even when the agent switches branches at
+//! once. That read runs no program and reads at most a `.git` file and a
+//! `HEAD` file per run, each only when it is a regular file, opened without
+//! waiting and read up to [`MAX_PROBE_OUTPUT`]. It runs on a thread of its
+//! own that the spawn waits for at most [`BRANCH_READ_DEADLINE`], with at
+//! most [`MAX_BRANCH_READS`] such threads alive at once
+//! ([`BranchReads::read`]), so a file system that stops answering costs a
+//! run its branch, not its start.
+//!
 //! **And they are bounded.** Each probe has a deadline after which its process
 //! is killed and reaped, its captured output is capped, at most
 //! [`MAX_CONCURRENT_PROBES`] run at once, and the deck cancels outstanding ones
@@ -211,6 +222,128 @@ impl Probes {
         while tasks.try_join_next().is_some() {}
         tasks.len()
     }
+}
+
+/// How long an agent's spawn waits for its branch ([`BranchReads::read`]).
+pub const BRANCH_READ_DEADLINE: Duration = Duration::from_millis(250);
+
+/// Branch reads alive at once, at most, the ones a stalled file system holds
+/// past their deadline included.
+pub const MAX_BRANCH_READS: usize = 4;
+
+/// The branch reads in flight, bounded by [`MAX_BRANCH_READS`].
+#[derive(Debug, Default)]
+pub struct BranchReads {
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl BranchReads {
+    /// [`branch_at`] for `cwd`, waited for at most [`BRANCH_READ_DEADLINE`].
+    pub fn read(&self, cwd: &Path) -> Option<String> {
+        let cwd = cwd.to_path_buf();
+        self.read_with(BRANCH_READ_DEADLINE, move || branch_at(&cwd))
+    }
+
+    /// `read` on a thread of its own, waited for at most `deadline`. `None`
+    /// when it is late, when [`MAX_BRANCH_READS`] are alive already, or when
+    /// no thread can be started. A late read finishes on its own thread, and
+    /// counts against the limit until it does.
+    pub fn read_with(
+        &self,
+        deadline: Duration,
+        read: impl FnOnce() -> Option<String> + Send + 'static,
+    ) -> Option<String> {
+        use std::sync::atomic::Ordering;
+        if self.in_flight.fetch_add(1, Ordering::SeqCst) >= MAX_BRANCH_READS {
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        /// Gives the read's place back however its thread ends.
+        struct Slot(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Slot {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let slot = Slot(Arc::clone(&self.in_flight));
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("deck-branch-read".into())
+            .spawn(move || {
+                let _slot = slot;
+                let _ = tx.send(read());
+            })
+            .ok()?;
+        rx.recv_timeout(deadline).ok().flatten()
+    }
+
+    /// Reads alive now.
+    #[cfg(test)]
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Issue #1981 M6: the branch checked out in the repository `cwd` is in, read
+/// from its `HEAD` file without running git: the nearest `.git` above `cwd`,
+/// a directory or, in a linked worktree, a file naming one. `None` outside a
+/// repository, on a detached `HEAD`, or when either file is not a regular
+/// file or cannot be read.
+pub fn branch_at(cwd: &Path) -> Option<String> {
+    let (dir, dot_git, meta) = cwd.ancestors().find_map(|dir| {
+        let dot_git = dir.join(".git");
+        let meta = std::fs::metadata(&dot_git).ok()?;
+        Some((dir, dot_git, meta))
+    })?;
+    let git_dir = if meta.is_dir() {
+        dot_git
+    } else {
+        let pointer = read_small_file(&dot_git)?;
+        let target = pointer
+            .strip_prefix("gitdir: ")?
+            .trim_end_matches(['\n', '\r']);
+        let target = Path::new(target);
+        if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            dir.join(target)
+        }
+    };
+    branch_from_head(&read_small_file(&git_dir.join("HEAD"))?)
+}
+
+/// The branch a `HEAD` file's contents name (`ref: refs/heads/feature/x`
+/// gives `feature/x`). Only the line ending git writes is removed, so a name
+/// is sent exactly as git holds it. `None` for a detached `HEAD`, a ref
+/// outside `refs/heads/`, an empty name or one with a control character.
+pub fn branch_from_head(contents: &str) -> Option<String> {
+    let line = contents.strip_suffix('\n').unwrap_or(contents);
+    let name = line.strip_prefix("ref: refs/heads/")?;
+    (!name.is_empty() && !name.chars().any(char::is_control)).then(|| name.to_string())
+}
+
+/// `path`'s text, at most [`MAX_PROBE_OUTPUT`] bytes of it, when it is a
+/// regular file. Opened without waiting, so a FIFO swapped in after the check
+/// cannot hold up the spawn path.
+fn read_small_file(path: &Path) -> Option<String> {
+    use std::io::Read;
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(MAX_PROBE_OUTPUT).read_to_string(&mut text).ok()?;
+    Some(text)
 }
 
 /// Run the two probes in `cwd` under `settings`, each holding one of `permits`
@@ -527,6 +660,127 @@ mod tests {
             "the commit that last touched an instruction path, not HEAD"
         );
         assert_eq!(context.repository_name.as_deref(), Some("my-repo"));
+    }
+
+    /// Issue #1981 M6: the branch comes from `HEAD`, in the repository's own
+    /// `.git` directory and in a linked worktree's, from any directory in it,
+    /// and before the branch has a commit.
+    #[tokio::test]
+    async fn the_branch_is_read_from_head() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let repo = scratch.path().join("checkout");
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        git(&repo, scratch.path(), &["init", "--quiet"]);
+        git(
+            &repo,
+            scratch.path(),
+            &["symbolic-ref", "HEAD", "refs/heads/feature/x-1981"],
+        );
+        assert_eq!(
+            branch_at(&repo).as_deref(),
+            Some("feature/x-1981"),
+            "unborn"
+        );
+        assert_eq!(
+            branch_at(&repo.join("sub")).as_deref(),
+            Some("feature/x-1981")
+        );
+        std::fs::write(repo.join("CLAUDE.md"), "rules").unwrap();
+        git(&repo, scratch.path(), &["add", "CLAUDE.md"]);
+        git(&repo, scratch.path(), &["commit", "--quiet", "-m", "rules"]);
+        let worktree = scratch.path().join("linked");
+        git(
+            &repo,
+            scratch.path(),
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "agent/dispatch-unit",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(branch_at(&worktree).as_deref(), Some("agent/dispatch-unit"));
+        assert_eq!(branch_at(&repo).as_deref(), Some("feature/x-1981"));
+        git(&repo, scratch.path(), &["checkout", "--quiet", "--detach"]);
+        assert_eq!(branch_at(&repo), None, "detached");
+        assert_eq!(branch_at(scratch.path()), None, "outside a repository");
+    }
+
+    #[test]
+    fn a_branch_is_read_only_from_a_heads_ref_and_kept_as_written() {
+        assert_eq!(
+            branch_from_head("ref: refs/heads/agent/x\n").as_deref(),
+            Some("agent/x")
+        );
+        assert_eq!(
+            branch_from_head("ref: refs/heads/feature\u{a0}\n").as_deref(),
+            Some("feature\u{a0}"),
+            "only git's line ending is removed"
+        );
+        assert_eq!(branch_from_head("ref: refs/tags/v1\n"), None);
+        assert_eq!(branch_from_head(&"a".repeat(40)), None, "detached");
+        assert_eq!(branch_from_head("ref: refs/heads/\n"), None);
+        assert_eq!(branch_from_head("ref: refs/heads/a\rb\n"), None);
+    }
+
+    /// Qodo review on PR #2018: a read that does not come back in time costs
+    /// the run its branch, not its start, and stalled reads are bounded.
+    #[test]
+    fn a_stalled_branch_read_gives_up_at_its_deadline_and_is_bounded() {
+        let reads = BranchReads::default();
+        let (release, stalled) = std::sync::mpsc::channel::<()>();
+        let stalled = Arc::new(Mutex::new(stalled));
+        let started = std::time::Instant::now();
+        for _ in 0..MAX_BRANCH_READS {
+            let stalled = Arc::clone(&stalled);
+            let got = reads.read_with(Duration::from_millis(50), move || {
+                let _ = stalled.lock().unwrap().recv();
+                Some("late".into())
+            });
+            assert_eq!(got, None);
+        }
+        assert_eq!(reads.in_flight(), MAX_BRANCH_READS);
+        // At the limit nothing more starts, and nothing waits.
+        let at_limit = std::time::Instant::now();
+        assert_eq!(
+            reads.read_with(Duration::from_secs(5), || panic!(
+                "not started at the limit"
+            )),
+            None
+        );
+        assert!(at_limit.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        // Once the stalled reads finish, their places come back.
+        drop(release);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while reads.in_flight() > 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(reads.in_flight(), 0);
+        assert_eq!(
+            reads
+                .read_with(Duration::from_secs(5), || Some("agent/x".into()))
+                .as_deref(),
+            Some("agent/x")
+        );
+    }
+
+    /// A `HEAD` that is a FIFO, which a hostile repository could plant, is
+    /// not read, so it cannot hold up an agent's spawn.
+    #[cfg(unix)]
+    #[test]
+    fn a_head_that_is_not_a_regular_file_is_not_read() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let git_dir = scratch.path().join(".git");
+        std::fs::create_dir(&git_dir).unwrap();
+        let head = std::ffi::CString::new(git_dir.join("HEAD").to_str().unwrap()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(head.as_ptr(), 0o600) }, 0);
+        let started = std::time::Instant::now();
+        assert_eq!(branch_at(scratch.path()), None);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     /// An agent working in a subdirectory of its repository gets the commit of
