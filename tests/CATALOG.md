@@ -13362,3 +13362,11 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 - **Asserts:** a producer Thinking hook is observed, a real stop produces an observed daemon-synthetic SessionEnd, health intervals spanning the actions count one sample in total, its single-sample p50/p95/max retain at least 1.4 seconds of the injected 1.5-second age, and a later quiet interval resets count to zero and omits latency quantiles.
 - **Does not assert:** exact delivery latency, multi-sample percentile algorithms, every synthetic event variant, queue overflow, OTLP logs or attach latency.
 - **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/043 — Attaching to an agent's terminal is timed on daemon health.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_attach_latency.rs`); real attach socket, local OTLP/JSON receiver and shortened health interval.
+- **Agent:** two Python PTY stand-ins; no real agent or credential.
+- **Asserts:** three attaches to the orchestrator's terminal over the real attach socket are counted in deck.daemon.attach_latency.count on the daemon.health spans that follow (at least three, the TUI's own attaches included), every interval with attaches has ordered p50 <= p95 <= max, and intervals with none omit the quantiles.
+- **Does not assert:** exact latency values, the client's own drawing time, that a failed attach is not counted, or attaches from the desktop app.
+- **Platform coverage:** mac+linux.
