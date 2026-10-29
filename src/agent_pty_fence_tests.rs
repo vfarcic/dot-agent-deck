@@ -800,6 +800,8 @@ async fn probe_011_a_take_back_after_the_close_reports_once() {
     );
     assert_eq!(rig.ledger.jobs_unreported(), 0);
     assert_eq!(rig.taken(), b"blocker");
+    // The flush leaves the count just after it answers.
+    rig.writer.until_idle().await;
     assert_eq!(rig.in_flight(), 0);
 }
 

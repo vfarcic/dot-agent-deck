@@ -372,3 +372,44 @@ async fn probe_011_a_held_frame_is_human_input_at_acceptance() {
     drop(client);
     pane.stop();
 }
+
+/// Scenario: Close a pane's fence and fill it, then from an attached connection send a frame, which waits for room, and one more behind it, and release the fence. The connection stays: the waiting frame and the one queued behind it in the socket both reach the PTY after the fence's own bytes, in order, so watching for the connection's end while the frame waited left nothing unread (R-U2-01).
+#[spec("inbox/probe/011")]
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_011_a_frame_behind_a_full_one_is_read_after_the_release() {
+    let pane = FencedPane::new("probe-011-full-then-read").await;
+    assert!(pane.gate().fence());
+    let filler = pane.ledger.admit();
+    let accepted = pane
+        .writer()
+        .lock()
+        .await
+        .accept(
+            UserFrame::new(vec![b'h'; FENCE_CAP], Some(filler), None),
+            None,
+        )
+        .await;
+    assert!(matches!(accepted, Accepted::Held));
+    let mut client = pane.attach().await;
+    write_frame(&mut client, KIND_STREAM_IN, b"waiting|")
+        .await
+        .unwrap();
+    pane.until("the frame waits for room", || {
+        pane.gate().status().full_waiters == 1
+    })
+    .await;
+    write_frame(&mut client, KIND_STREAM_IN, b"after|")
+        .await
+        .unwrap();
+    // Let the queued frame's readiness reach the parked wait first.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(pane.writer().lock().await.release_fence(Ok(())), 1);
+    let mut expected = vec![b'h'; FENCE_CAP];
+    expected.extend_from_slice(b"waiting|after|");
+    pane.until("both frames are written after the fence's", || {
+        pane.taken() == expected
+    })
+    .await;
+    drop(client);
+    pane.stop();
+}

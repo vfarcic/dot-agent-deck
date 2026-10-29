@@ -57,19 +57,33 @@ impl crate::platform::transport::HalfCloseOnDrop for IpcWriteHalf {}
 /// its end of `rd`'s socket, or shut it for writing, without reading a byte:
 /// frames the client sent before closing stay unread in the socket. It waits
 /// for the socket's hang-up readiness, which the kernel raises with the data
-/// still queued; a readiness for data alone is cleared, unread, and waited
-/// past, so the wait sleeps until the next edge rather than spinning. An
-/// error waiting counts as closed.
+/// still queued, on a duplicate of the descriptor with a registration of its
+/// own: a readiness for data alone is cleared there, unread, so the wait
+/// sleeps until the next edge rather than spinning, while `rd`'s own
+/// readiness is left as it was, for the reader that reads those frames next.
+/// (Clearing it on `rd` would leave that reader waiting for an edge the
+/// queued data never raises again.) A descriptor it can't duplicate or
+/// watch leaves it pending for good rather than resolving: failing to watch
+/// for the close is no reason to drop the person's input.
 pub async fn peer_closed(rd: &IpcReadHalf) {
+    use std::os::fd::AsFd;
     let stream: &UnixStream = rd.as_ref();
+    let Ok(watch) = stream.as_fd().try_clone_to_owned().and_then(|fd| {
+        let watch = std::os::unix::net::UnixStream::from(fd);
+        watch.set_nonblocking(true)?;
+        UnixStream::from_std(watch)
+    }) else {
+        return std::future::pending().await;
+    };
     loop {
-        match stream.ready(tokio::io::Interest::READABLE).await {
+        match watch.ready(tokio::io::Interest::READABLE).await {
             Ok(ready) if !ready.is_read_closed() => {
-                let _ = stream.try_io(tokio::io::Interest::READABLE, || {
+                let _ = watch.try_io(tokio::io::Interest::READABLE, || {
                     Err::<(), _>(io::ErrorKind::WouldBlock.into())
                 });
             }
-            Ok(_) | Err(_) => return,
+            Ok(_) => return,
+            Err(_) => return std::future::pending().await,
         }
     }
 }
