@@ -49,8 +49,11 @@
 //! (Q85), so a line read before then is applied before the drain, and the
 //! connection's slot comes back. A connection that ends holding a partial
 //! line, or with bytes still pending at its deadline, or on a line or a
-//! report it refused, left evidence unread ([`read_line`]): its record never
-//! settles clean, only uncertain. A marker read that overflows or fails is no drain: nothing
+//! report it refused or couldn't parse, left evidence unread ([`read_line`]):
+//! its record, one made after the loss included, never settles clean, only
+//! uncertain. That mark is kept while the helper lives (Q87), within
+//! [`LOST_PER_GENERATION`] and [`LOST_TOTAL`]; a loss past them settles every
+//! record of its generation uncertain instead. A marker read that overflows or fails is no drain: nothing
 //! settles, and no marker is taken as deleted. Until both hold the drain is
 //! rescheduled; after [`DRAIN_RETRIES`] passes (a count, not a time) it
 //! gives up to the uncertain outcome
@@ -60,11 +63,12 @@
 //! the settled outcome (core §2.4's table). Work is bounded per
 //! generation and in total ([`Pool`]): composer connections open at once,
 //! the bytes of the one report read after an invocation, attestations at
-//! once and per pass, and marker names read per pass. Past a bound a scan or
-//! a marker waits for the next pass; a connection gets no capability; an
-//! attestation not run is an identity refusal (`record_refused`, with the
-//! request's claim on IPC and none for a scan, an unread connection or a
-//! marker).
+//! once and per pass, marker names read per pass, and lost-connection marks
+//! kept. Past a bound a scan or a marker waits for the next pass; a
+//! connection gets no capability; a loss with no mark left latches the
+//! generation's overflow; an attestation not run is an identity refusal
+//! (`record_refused`, with the request's claim on IPC and none for a scan, an
+//! unread connection or a marker).
 //!
 //! **The kill** (core §5.4, P-E2, Q84). A record whose helper declared
 //! `Armed` and is still alive [`E2_AFTER`] after the first `Armed`
@@ -108,7 +112,10 @@
 //! lock. Under it are the input lock's leaf steps, memory stores to the arm
 //! page, and two kinds of system call on descriptors already held: `poll` of
 //! each pidfd it keeps for a helper's exit (a record's pin, a connected
-//! helper's, one a connection that lost bytes left, Q85), and the `dup` of a pidfd E2 is about to check. No path is opened, read, renamed, unlinked or written under it.
+//! helper's, one a connection that lost bytes left, Q85), each helper's one hold
+//! shared by its connections, its watches and its pin (Q87), and the `close` of
+//! a hold whose last holder goes. No path is opened, read, renamed,
+//! unlinked or written under it.
 //! Retirement: the pane's successor retires the input (records and scope
 //! dropped, M-FIRST taken in the same section) and stops the observer; the
 //! observer's thread holds it weakly and ends at its next wake, and the arm
@@ -157,6 +164,13 @@ pub const E2_AFTER: Duration = Duration::from_secs(5);
 /// Composer connections open at once, per generation and in total.
 pub const CONNECTIONS_PER_GENERATION: u32 = 8;
 pub const CONNECTIONS_TOTAL: u32 = 64;
+
+/// Helpers kept as having lost a connection's bytes (Q87), per generation
+/// and in total: each holds its helper's pidfd until the mark may go. One
+/// more than a pool allows latches its generation's loss overflow instead,
+/// and every record of that generation then drains only uncertain.
+pub const LOST_PER_GENERATION: u32 = 8;
+pub const LOST_TOTAL: u32 = 64;
 
 /// The most bytes of the report line read after an invocation.
 pub const REPORT_BYTES: usize = 4 << 10;
@@ -247,6 +261,9 @@ impl Drop for Slot {
 
 /// Composer connections open in the daemon.
 pub static CONNECTIONS: Pool = Pool::new(CONNECTIONS_TOTAL);
+
+/// Lost-connection marks kept in the daemon (Q87).
+pub static LOST: Pool = Pool::new(LOST_TOTAL);
 
 /// Attestations running in the daemon.
 pub static ATTESTATIONS: Pool = Pool::new(ATTESTATIONS_TOTAL);
@@ -408,17 +425,18 @@ pub fn drain_step(open: u32, markers_read: bool, unread: bool, retries: u32) -> 
 /// observer marks it when it observes the exit, and the connection's reader
 /// then reads for [`READ_DEADLINE`] more, in total (Q85): the deadline is
 /// anchored at the first mark, so nothing the peer sends renews it. Marking
-/// takes no lock and wakes every waiter.
+/// takes no lock and wakes every waiter. Its clock is tokio's, which is the
+/// system's monotonic clock outside a runtime whose clock a test paused.
 #[derive(Debug, Default)]
 pub struct Departure {
-    at: OnceLock<Instant>,
+    at: OnceLock<tokio::time::Instant>,
     notify: tokio::sync::Notify,
 }
 
 impl Departure {
     /// The helper's exit was observed. A second mark moves nothing.
     pub fn depart(&self) {
-        self.at.get_or_init(Instant::now);
+        self.at.get_or_init(tokio::time::Instant::now);
         self.notify.notify_waiters();
     }
 
@@ -427,13 +445,14 @@ impl Departure {
     }
 
     /// When the reading ends: [`READ_DEADLINE`] after the first mark.
-    pub fn deadline(&self) -> Option<Instant> {
+    pub fn deadline(&self) -> Option<tokio::time::Instant> {
         self.at.get().map(|at| *at + READ_DEADLINE)
     }
 
     /// Whether the read deadline has passed.
     pub fn expired(&self) -> bool {
-        self.deadline().is_some_and(|end| Instant::now() >= end)
+        self.deadline()
+            .is_some_and(|end| tokio::time::Instant::now() >= end)
     }
 
     /// Resolves once [`Departure::depart`] has been called, before or after
@@ -455,9 +474,42 @@ impl Departure {
     pub async fn read_deadline(&self) {
         self.wait().await;
         if let Some(end) = self.deadline() {
-            tokio::time::sleep_until(tokio::time::Instant::from_std(end)).await;
+            tokio::time::sleep_until(end).await;
         }
     }
+}
+
+/// The next line on a composer connection whose helper's exit `departure`
+/// marks (core §2.4, Q85), or `None` once the connection is to end. `line`
+/// is the connection's accumulator, kept by the caller across calls. A read
+/// races the read deadline and the deadline wins a tie, so a peer that keeps
+/// sending can't extend it: a call made after the deadline reads nothing,
+/// and one made before it ends at the deadline itself, however recently the
+/// last line came. At the deadline a partial line in `line`, or bytes still
+/// to read by `pending`, call `lose`. A line returned before the deadline is
+/// the caller's to apply.
+pub async fn read_before<R>(
+    departure: &Departure,
+    line: &mut crate::bounded_read::CappedLine,
+    reader: &mut tokio::io::BufReader<R>,
+    max_bytes: usize,
+    pending: impl FnOnce(&tokio::io::BufReader<R>) -> bool,
+    lose: impl FnOnce(),
+) -> Option<Result<Option<String>, crate::bounded_read::CappedLineError>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    if !departure.expired() {
+        tokio::select! {
+            biased;
+            () = departure.read_deadline() => {}
+            read = line.read(reader, max_bytes) => return Some(read),
+        }
+    }
+    if line.partial() || pending(reader) {
+        lose();
+    }
+    None
 }
 
 /// The one settler of a generation's permission at a time (Q84): the
@@ -992,6 +1044,8 @@ impl Bell {
 /// when an installed generation's observer starts.
 pub type BellSlot = Arc<OnceLock<Arc<Bell>>>;
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use linux::HeldForTest;
 #[cfg(target_os = "linux")]
 pub use linux::{Connection, Observer, Spawned, read_line};
 
@@ -1009,8 +1063,9 @@ mod linux {
     use super::{
         ATTESTATIONS, ATTESTATIONS_PER_PASS, Bell, Bound, CONNECTIONS, CONNECTIONS_PER_GENERATION,
         CONTROL_PERMISSION_WAIT, ControlOp, ControlRefusal, Departure, DrainStep, Evidence,
-        IDLE_SWEEP, MARKER_NAMES_PER_PASS, Page, Pool, ProcFacts, SCAN_PERIOD, Seam, SettleClaim,
-        Slot, bound_agent, drain_step, e2_due, marker_observation, scan_observation,
+        IDLE_SWEEP, LOST, LOST_PER_GENERATION, MARKER_NAMES_PER_PASS, Page, Pool, ProcFacts,
+        SCAN_PERIOD, Seam, SettleClaim, Slot, bound_agent, drain_step, e2_due, marker_observation,
+        read_before, scan_observation,
     };
     use crate::composer_probe::attest::{
         self, Agent, Kernel, LinuxKernel, Pinned, Sighting, attribute, read_export,
@@ -1039,9 +1094,14 @@ mod linux {
     /// The most bytes of a process's argv binding reads.
     const ARGV_BYTES: u64 = 128 << 10;
 
+    /// A helper held by its pidfd (Q87): one per helper, shared by its
+    /// connections, its connected watch (`peers`), its lost mark (`unread`)
+    /// and its pin, so a watch never depends on duplicating a descriptor.
+    type Held = Arc<Pinned<OwnedFd>>;
+
     /// A record's helper, held by its pidfd for its exit.
     struct Pin {
-        fd: OwnedFd,
+        fd: Held,
         /// Whether E2 may signal it (Q84): only a helper the daemon attested
         /// as this instance's helper copy, by its connection's peer pidfd or
         /// by a child scan with its start ticks. A pin from a marker's name
@@ -1059,18 +1119,26 @@ mod linux {
         /// Composer connections not finished yet, by the helper on the other
         /// end.
         open: HashMap<RecordKey, Vec<Arc<Departure>>>,
-        /// A pidfd of each helper in `open` (Q85), for its exit when no
-        /// record pins it: its connections' read deadline then runs from
-        /// that exit too, so a helper that never got a record leaves no
-        /// connection open behind it. Removed with its `open` entry.
-        peers: HashMap<RecordKey, OwnedFd>,
+        /// Each helper in `open` (Q85), held for its exit when no record
+        /// pins it: its connections' read deadline then runs from that exit
+        /// too, so a helper that never got a record leaves no connection
+        /// open behind it. Admission puts the connection's own hold here
+        /// (Q87), so no connection is open unwatched. Removed with its
+        /// `open` entry.
+        peers: HashMap<RecordKey, Held>,
         /// Helpers one of whose connections ended with bytes it didn't read
-        /// (Q85), each with a pidfd of its own for the helper's exit (`None`
-        /// when the dup failed): their drain settles only uncertain. Removed
-        /// when the record drains, or, for a helper with no record, once it
-        /// exited with no connection left open ([`Observer::exits`]), so the
-        /// map holds no more than the live helpers and the records.
-        unread: HashMap<RecordKey, Option<OwnedFd>>,
+        /// (Q85), held for the helper's exit: their drain settles only
+        /// uncertain, and a record made for one later inherits that. Kept
+        /// until the record drains, or, for a helper with no record, until
+        /// it exited with no connection left open ([`Observer::exits`]);
+        /// never while it lives. Each takes a unit of
+        /// [`super::LOST_PER_GENERATION`] and [`super::LOST_TOTAL`].
+        unread: HashMap<RecordKey, Lost>,
+        /// A loss no mark could be kept for (Q87): the lost pools were
+        /// full. Until the generation retires every record of it drains only
+        /// uncertain, since any of them might be the one whose loss went
+        /// unmarked.
+        lost_overflow: bool,
         /// The last exit facts of records that went: no segment holds them
         /// yet (Q35-20).
         facts: std::collections::VecDeque<ExitFact>,
@@ -1078,6 +1146,24 @@ mod linux {
         agent: Option<Identity>,
         /// More marker names than a pass reads.
         marker_overflow: bool,
+    }
+
+    /// A lost mark's hold on its helper, and its unit of the lost pools.
+    struct Lost {
+        helper: Held,
+        _slot: Slot,
+    }
+
+    impl Watch {
+        /// The hold already kept for `key`'s helper, if any (Q87): its
+        /// connections', its lost mark's or its pin's.
+        fn held(&self, key: RecordKey) -> Option<Held> {
+            self.peers
+                .get(&key)
+                .or_else(|| self.unread.get(&key).map(|lost| &lost.helper))
+                .or_else(|| self.pins.get(&key).map(|pin| &pin.fd))
+                .cloned()
+        }
     }
 
     struct Inner {
@@ -1123,18 +1209,21 @@ mod linux {
         settling: SettleClaim,
         inner: Mutex<Inner>,
         connections: Arc<Pool>,
+        lost: Arc<Pool>,
         bell: Arc<Bell>,
         stopped: std::sync::atomic::AtomicBool,
     }
 
-    /// A composer connection: its helper, pinned by the connection's peer
-    /// pidfd, and its budget slot. It is open for the drain until it is
-    /// dropped, which its reader does at its end, or at
-    /// [`Connection::read_deadline`] ([`read_line`]), after applying the
-    /// lines it read before then. Dropping it gives its slot back.
+    /// A composer connection: its helper, held by the pidfd its observer
+    /// watches for the helper's exit (the connection's peer pidfd, or the
+    /// hold the observer already kept for that helper, Q87), and its budget
+    /// slot. It is open for the drain until it is dropped, which its reader
+    /// does at its end, or at [`Connection::read_deadline`] ([`read_line`]),
+    /// after applying the lines it read before then. Dropping it gives its
+    /// slot back.
     pub struct Connection {
         observer: Arc<Observer>,
-        helper: Pinned<OwnedFd>,
+        helper: Held,
         departure: Arc<Departure>,
         _slot: Slot,
     }
@@ -1152,24 +1241,35 @@ mod linux {
             self.departure.read_deadline().await;
         }
 
-        /// Whether the read deadline has passed.
-        pub fn expired(&self) -> bool {
-            self.departure.expired()
-        }
-
         /// The reader is ending this connection with bytes it didn't read
-        /// (Q85): a partial line, bytes pending at the read deadline, or a
-        /// line it refused. What they said is unknown, so the helper's
-        /// record drains only uncertain. Recorded unless the record already
-        /// drained (a late connection's loss changes nothing settled) and
+        /// (Q85), or read a line it couldn't use (Q87): a partial line,
+        /// bytes pending at the read deadline, a line it refused, or one it
+        /// couldn't parse. What they said is unknown, so the helper's record,
+        /// one made later included, drains only uncertain. Recorded unless
+        /// the record already drained (a late connection's loss changes
+        /// nothing settled), as a mark holding the helper for its exit, or,
+        /// when the lost pools are full, as the generation's loss overflow;
         /// logged either way.
         pub fn lose(&self) {
             let key = key_of(&self.helper);
-            let pidfd = self.helper.pidfd().try_clone().ok();
             let mut inner = self.observer.lock();
             let settled = inner.seam.input().record(key).is_some_and(|r| r.drained);
-            if !settled {
-                inner.watch.unread.entry(key).or_insert(pidfd);
+            let mut overflow = false;
+            if !settled && !inner.watch.unread.contains_key(&key) {
+                match Slot::take(&self.observer.lost, &LOST) {
+                    Some(slot) => {
+                        inner.watch.unread.insert(
+                            key,
+                            Lost {
+                                helper: Arc::clone(&self.helper),
+                                _slot: slot,
+                            },
+                        );
+                    }
+                    None => {
+                        overflow = !std::mem::replace(&mut inner.watch.lost_overflow, true);
+                    }
+                }
             }
             drop(inner);
             tracing::warn!(
@@ -1180,19 +1280,26 @@ mod linux {
                 "editor helper's connection ended with bytes unread; its exit settles \
                  only as uncertain"
             );
+            if overflow {
+                tracing::warn!(
+                    target: "composer_probe",
+                    agent_id = %self.observer.agent_id,
+                    "more editor helpers lost a connection's bytes than are kept; every \
+                     exit of this generation now settles only as uncertain"
+                );
+            }
         }
     }
 
     /// The next line on a composer connection (core §2.4, Q85), or `None`
     /// once it is to end. `line` is the connection's accumulator, kept by the
     /// caller across calls; `socket` the connection's own descriptor. With no
-    /// connection (`conn` is `None`) it is [`CappedLine::read`]. With one, a
-    /// read races its read deadline and the deadline wins a tie, so a peer
-    /// that keeps sending can't extend it: at the deadline a partial line in
-    /// `line`, or bytes still buffered in `reader` or waiting on `socket`,
-    /// make the connection [`Connection::lose`] them, and `None` tells the
-    /// caller to drop it. A line returned before the deadline is the
-    /// caller's to apply before it drops the connection.
+    /// connection (`conn` is `None`) it is [`CappedLine::read`]. With one it
+    /// is [`read_before`] its read deadline: a partial line in `line`, or
+    /// bytes still buffered in `reader` or waiting on `socket`, at the
+    /// deadline make the connection [`Connection::lose`] them, and `None`
+    /// tells the caller to drop it. A line returned before the deadline is
+    /// the caller's to apply before it drops the connection.
     ///
     /// [`CappedLine::read`]: crate::bounded_read::CappedLine::read
     pub async fn read_line<R>(
@@ -1208,17 +1315,15 @@ mod linux {
         let Some(conn) = conn else {
             return Some(line.read(reader, max_bytes).await);
         };
-        if !conn.expired() {
-            tokio::select! {
-                biased;
-                () = conn.read_deadline() => {}
-                read = line.read(reader, max_bytes) => return Some(read),
-            }
-        }
-        if line.partial() || pending(reader, socket) {
-            conn.lose();
-        }
-        None
+        read_before(
+            &conn.departure,
+            line,
+            reader,
+            max_bytes,
+            |reader| pending(reader, socket),
+            || conn.lose(),
+        )
+        .await
     }
 
     /// Whether a connection still has bytes to read: buffered by `reader`,
@@ -1252,6 +1357,50 @@ mod linux {
             // Closed with no lock held.
             drop(peer);
             self.observer.bell.ring();
+        }
+    }
+
+    /// What the observer holds of a connection's helper, for the daemon's
+    /// tests (Q87): `None` where it holds nothing, else whether it is this
+    /// connection's own hold.
+    #[cfg(test)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct HeldForTest {
+        pub peer: Option<bool>,
+        pub lost: Option<bool>,
+        pub pin: Option<bool>,
+    }
+
+    #[cfg(test)]
+    impl Connection {
+        pub(crate) fn held_for_test(&self) -> HeldForTest {
+            let key = key_of(&self.helper);
+            let inner = self.observer.lock();
+            let mine = |held: &Held| Arc::ptr_eq(held, &self.helper);
+            HeldForTest {
+                peer: inner.watch.peers.get(&key).map(mine),
+                lost: inner.watch.unread.get(&key).map(|l| mine(&l.helper)),
+                pin: inner.watch.pins.get(&key).map(|p| mine(&p.fd)),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    impl Observer {
+        /// The lost marks kept, the generation's lost pool in use, and
+        /// whether its loss overflowed (Q87).
+        pub(crate) fn lost_for_test(&self) -> (usize, u32, bool) {
+            let inner = self.lock();
+            (
+                inner.watch.unread.len(),
+                self.lost.used(),
+                inner.watch.lost_overflow,
+            )
+        }
+
+        /// Whether `key`'s helper has a lost mark kept.
+        pub(crate) fn lost_mark_for_test(&self, key: RecordKey) -> bool {
+            self.lock().watch.unread.contains_key(&key)
         }
     }
 
@@ -1460,6 +1609,7 @@ mod linux {
                     watch: Watch::default(),
                 }),
                 connections: Arc::new(Pool::new(CONNECTIONS_PER_GENERATION)),
+                lost: Arc::new(Pool::new(LOST_PER_GENERATION)),
                 bell: Arc::clone(&bell),
                 stopped: std::sync::atomic::AtomicBool::new(false),
             });
@@ -1580,22 +1730,26 @@ mod linux {
         /// A composer connection's capability question (Q81): pin its peer by
         /// `SO_PEERPIDFD`, and register it when the peer runs this
         /// instance's helper copy and the budgets allow. `None` gets no
-        /// capability. A helper whose exit was already observed is departed
-        /// from the start.
+        /// capability. A registered connection is always watched (Q87): it
+        /// and the observer's `peers` share one hold on the helper, the one
+        /// the observer already kept for that helper if there is one,
+        /// otherwise this pin; nothing is duplicated, so nothing can fail
+        /// between taking the slot and watching. A helper whose exit was
+        /// already observed is departed from the start.
         pub fn connect(
             self: &Arc<Self>,
             peer: std::io::Result<Option<OwnedFd>>,
         ) -> Option<Connection> {
             let mut kernel = LinuxKernel::default();
-            let helper = attest::pin(&mut kernel, Sighting::Peer(peer)).ok()?;
-            if exe_id(helper.pid) != Some(self.helper_id) {
+            let pinned = attest::pin(&mut kernel, Sighting::Peer(peer)).ok()?;
+            if exe_id(pinned.pid) != Some(self.helper_id) {
                 return None;
             }
             let slot = Slot::take(&self.connections, &CONNECTIONS)?;
-            let key = key_of(&helper);
+            let key = key_of(&pinned);
+            let fresh: Held = Arc::new(pinned);
             let departure = Arc::new(Departure::default());
-            let peer = helper.pidfd().try_clone().ok();
-            {
+            let helper = {
                 let mut inner = self.lock();
                 if inner
                     .seam
@@ -1605,16 +1759,22 @@ mod linux {
                 {
                     departure.depart();
                 }
+                let helper = inner.watch.held(key).unwrap_or_else(|| Arc::clone(&fresh));
                 inner
                     .watch
                     .open
                     .entry(key)
                     .or_default()
                     .push(Arc::clone(&departure));
-                if let Some(peer) = peer {
-                    inner.watch.peers.entry(key).or_insert(peer);
-                }
-            }
+                inner
+                    .watch
+                    .peers
+                    .entry(key)
+                    .or_insert_with(|| Arc::clone(&helper));
+                helper
+            };
+            // An unused pin is closed with no lock held.
+            drop(fresh);
             // Watched from the next pass on, at the scan's period rather
             // than the idle sweep's (Q85).
             self.bell.ring();
@@ -1645,11 +1805,8 @@ mod linux {
                 let mut inner = self.lock();
                 let late = evidence.is_some() && inner.seam.late(key);
                 let outcome = inner.seam.invocation(request, evidence, Instant::now());
-                if evidence.is_some()
-                    && unexited(&inner, key)
-                    && let Ok(fd) = conn.helper.pidfd().try_clone()
-                {
-                    hold(&mut inner.watch, key, fd, true);
+                if evidence.is_some() && unexited(&inner, key) {
+                    hold(&mut inner.watch, key, Arc::clone(&conn.helper), true);
                 }
                 (outcome, late)
             };
@@ -1907,7 +2064,7 @@ mod linux {
                     let mut inner = self.lock();
                     if inner.seam.input().record(key).is_some() {
                         if inner.watch.pins.get(&key).is_some_and(|p| !p.killable) {
-                            hold(&mut inner.watch, key, helper.into_pidfd(), true);
+                            hold(&mut inner.watch, key, Arc::new(helper), true);
                         }
                         continue;
                     }
@@ -1924,7 +2081,7 @@ mod linux {
                         let obs =
                             scan_observation(self.generation, e.key, e.attribution, e.birth_floor);
                         if inner.seam.observe(&obs, now).is_ok() && unexited(&inner, key) {
-                            hold(&mut inner.watch, key, helper.into_pidfd(), true);
+                            hold(&mut inner.watch, key, Arc::new(helper), true);
                         }
                     }
                     None => {
@@ -2015,7 +2172,7 @@ mod linux {
                         if let Ok(helper) = pinned
                             && unexited(&inner, marker.key)
                         {
-                            hold(&mut inner.watch, marker.key, helper.into_pidfd(), false);
+                            hold(&mut inner.watch, marker.key, Arc::new(helper), false);
                         }
                     }
                     None => {
@@ -2049,7 +2206,7 @@ mod linux {
                 .watch
                 .pins
                 .iter()
-                .filter(|(_, pin)| exited(&pin.fd))
+                .filter(|(_, pin)| exited(pin.fd.pidfd()))
                 .map(|(k, _)| *k)
                 .collect();
             for key in gone {
@@ -2069,23 +2226,22 @@ mod linux {
                 }
                 let departures = watch.open.get(key).into_iter().flatten();
                 let waiting: Vec<&Arc<Departure>> = departures.filter(|d| !d.departed()).collect();
-                if !waiting.is_empty() && exited(peer) {
+                if !waiting.is_empty() && exited(peer.pidfd()) {
                     for departure in waiting {
                         departure.depart();
                     }
                 }
             }
-            // A lost connection's mark outlives nothing it could still
-            // matter to (Q85): a drained record, or a helper with no record
-            // that exited with no connection open, which no exit drain can
-            // reach any more.
+            // A lost connection's mark goes only once nothing can still
+            // need it (Q85, Q87): its record drained, or, with no record,
+            // its helper exited with no connection open, so no channel can
+            // make the record that would inherit it. Never while the helper
+            // lives.
             watch
                 .unread
-                .retain(|key, pidfd| match seam.input().record(*key) {
+                .retain(|key, lost| match seam.input().record(*key) {
                     Some(record) => !record.drained,
-                    None => {
-                        watch.open.contains_key(key) || pidfd.as_ref().is_some_and(|fd| !exited(fd))
-                    }
+                    None => watch.open.contains_key(key) || !exited(lost.helper.pidfd()),
                 });
         }
 
@@ -2126,9 +2282,9 @@ mod linux {
         /// pass read its markers completely. Otherwise it is rescheduled; a
         /// record still unread after [`super::DRAIN_RETRIES`] passes, or one
         /// a connection ended with bytes unread once its markers are read
-        /// (Q85), gives up to the uncertain outcome and keeps its markers and
-        /// its record. A
-        /// settled one's markers are deleted with no lock held, and it is
+        /// (Q85), or any of a generation whose loss overflowed (Q87), gives
+        /// up to the uncertain outcome and keeps its markers and its record.
+        /// A settled one's markers are deleted with no lock held, and it is
         /// pruned, its facts kept, once it may go.
         fn drains(&self, budget: &mut u32) {
             let name = self.name();
@@ -2140,7 +2296,8 @@ mod linux {
                     .iter()
                     .map(|(key, retries)| {
                         let open = inner.watch.open.get(key).map_or(0, Vec::len);
-                        let unread = inner.watch.unread.contains_key(key);
+                        let unread =
+                            inner.watch.lost_overflow || inner.watch.unread.contains_key(key);
                         (
                             *key,
                             u32::try_from(open).unwrap_or(u32::MAX),
@@ -2231,7 +2388,7 @@ mod linux {
         /// with no lock held; one that no longer runs the helper copy is
         /// never signalled.
         fn kills(&self) {
-            let due: Vec<(RecordKey, OwnedFd)> = {
+            let due: Vec<(RecordKey, Held)> = {
                 let inner = self.lock();
                 let now = Instant::now();
                 inner
@@ -2246,12 +2403,12 @@ mod linux {
                                 .record(**key)
                                 .is_some_and(|r| e2_due(&r, now))
                     })
-                    .filter_map(|(key, pin)| Some((*key, pin.fd.try_clone().ok()?)))
+                    .map(|(key, pin)| (*key, Arc::clone(&pin.fd)))
                     .collect()
             };
             for (key, fd) in due {
                 if exe_id(key.pid) != Some(self.helper_id) {
-                    if exited(&fd) {
+                    if exited(fd.pidfd()) {
                         continue;
                     }
                     if let Some(pin) = self.lock().watch.pins.get_mut(&key) {
@@ -2266,10 +2423,10 @@ mod linux {
                     );
                     continue;
                 }
-                if exited(&fd) {
+                if exited(fd.pidfd()) {
                     continue;
                 }
-                let killed = kill(&fd);
+                let killed = kill(fd.pidfd());
                 tracing::warn!(
                     target: "composer_probe",
                     agent_id = %self.agent_id,
@@ -2293,7 +2450,7 @@ mod linux {
 
     /// Hold `key`'s helper by `fd`: a pin E2 may signal replaces one it may
     /// not, and nothing else replaces a pin.
-    fn hold(watch: &mut Watch, key: RecordKey, fd: OwnedFd, killable: bool) {
+    fn hold(watch: &mut Watch, key: RecordKey, fd: Held, killable: bool) {
         match watch.pins.get(&key) {
             Some(pin) if pin.killable || !killable => {}
             _ => {

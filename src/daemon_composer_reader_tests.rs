@@ -6,23 +6,36 @@
 //! socket the test created, so the daemon's `SO_PEERPIDFD` names the helper
 //! while the test keeps the descriptor: once the helper is killed, the test
 //! is the foreign process still holding its connection. Every process a test
-//! starts is killed by its captured handle.
+//! starts is killed by its captured handle, when the test ends or panics
+//! ([`Deck`]'s drop), and the observer stopped with it. A bound deck
+//! ([`Deck::start_bound`], Q87) binds `A` to the test process itself, from
+//! its own argv, so the helpers it starts are `A`'s children, which the
+//! child scan records `Owned` when their last argument is a Claude export.
 
 use super::*;
 use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+use crate::composer_probe::Permission;
 use crate::composer_probe::epoch::GenerationInput;
 use crate::composer_probe::install::{Originals, PaneClass, ProbeAgent, install};
 use crate::composer_probe::instance::{DaemonId, Instance, open_root, splittable};
 use crate::composer_probe::observe::{
-    CONNECTIONS_PER_GENERATION, Observer, READ_DEADLINE, Spawned,
+    CONNECTIONS_PER_GENERATION, ControlOp, HeldForTest, LOST_PER_GENERATION, Observer,
+    READ_DEADLINE, Spawned,
 };
-use crate::composer_probe::record::{Decision, RecordKey, Report, Tree};
+use crate::composer_probe::record::{
+    Attribution, Decision, NotConsumed, RecordKey, Report, Settlement, Tree,
+};
+use crate::doorbell_activation::{
+    EditorProbe, EditorSelection, ExportShape, KeymapSource, LatchedRelease, Measurement,
+    PasteToggles,
+};
 use crate::event::{
     AgentType, ComposerClaim, ComposerDecision, ComposerInvocationReply, ComposerInvocationRequest,
     HookCapabilitiesReply, HookCapabilitiesRequest,
 };
 use spec::spec;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -36,6 +49,36 @@ const PANE: &str = "composer-reader-pane";
 /// How long a test waits for something that, done right, takes a few
 /// observer passes.
 const SETTLE: Duration = Duration::from_secs(5);
+
+/// The release a bound deck's latch reports, which `RELEASE_RECORDS` holds
+/// for Claude.
+fn release() -> semver::Version {
+    semver::Version::new(2, 1, 310)
+}
+
+/// An editor-probe record for that release, as the `e2e` build assumes one.
+fn assumed() -> &'static [(AgentType, semver::Version, EditorProbe<'static>)] {
+    static ASSUMED: std::sync::OnceLock<Vec<(AgentType, semver::Version, EditorProbe<'static>)>> =
+        std::sync::OnceLock::new();
+    ASSUMED.get_or_init(|| {
+        vec![(
+            AgentType::ClaudeCode,
+            release(),
+            EditorProbe {
+                export: ExportShape::ClaudeTmpdir,
+                selection: EditorSelection::ClaudeCode,
+                paste_toggles: PasteToggles {
+                    disables: 1,
+                    enables: 1,
+                },
+                keymap_sources: &[KeymapSource::ClaudeKeybindings],
+                keymap_loaded_at_start: Measurement::Verified(()),
+                inert_candidates: &[],
+                pasted_bel_is_text: Measurement::Absent,
+            },
+        )]
+    })
+}
 
 fn start_of(pid: u32) -> u64 {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
@@ -115,6 +158,18 @@ struct Deck {
 
 impl Deck {
     async fn start() -> Deck {
+        Deck::start_with(false).await
+    }
+
+    /// A deck whose observer binds `A` to this test process (Q87): its
+    /// launch is the process's own argv, its release latched with an
+    /// editor-probe record, and its `TMPDIR` the deck's directory, so the
+    /// permission settles `Armable` and a liability can be published.
+    async fn start_bound() -> Deck {
+        Deck::start_with(true).await
+    }
+
+    async fn start_with(bound: bool) -> Deck {
         let registry = Arc::new(AgentPtyRegistry::new());
         let id = registry
             .spawn_agent(SpawnOptions {
@@ -158,21 +213,47 @@ impl Deck {
             &Originals::default(),
         )
         .unwrap();
-        installation.set_launch(Vec::new());
-        let observer = Observer::start(
-            installation,
+        let spawned = if bound {
+            let mut argv = std::fs::read(format!("/proc/{me}/cmdline")).unwrap();
+            if argv.last() == Some(&0) {
+                argv.pop();
+            }
+            let launch: Vec<std::ffi::OsString> = argv
+                .split(|b| *b == 0)
+                .map(|arg| std::ffi::OsStr::from_bytes(arg).to_os_string())
+                .collect();
+            assert!(
+                std::path::Path::new(&launch[0]).is_absolute(),
+                "the test binary runs by an absolute path: {launch:?}"
+            );
+            installation.set_launch(launch);
+            Spawned {
+                agent_id: id.clone(),
+                agent: Some(AgentType::ClaudeCode),
+                env: vec![(
+                    "TMPDIR".to_string(),
+                    dir.path().to_str().unwrap().to_string(),
+                )],
+                child: Some((me, start_of(me))),
+                input: Arc::new(GenerationInput::default()),
+                latch: Box::new(|_| LatchedRelease::Known(release())),
+                assumed: assumed(),
+            }
+        } else {
+            installation.set_launch(Vec::new());
             Spawned {
                 agent_id: id.clone(),
                 agent: Some(AgentType::ClaudeCode),
                 env: vec![],
                 child: None,
                 input: Arc::new(GenerationInput::default()),
-                latch: Box::new(|_| crate::doorbell_activation::LatchedRelease::Unseen),
+                latch: Box::new(|_| LatchedRelease::Unseen),
                 assumed: &[],
-            },
-            &Arc::new(std::sync::OnceLock::new()),
-        )
-        .expect("observer");
+            }
+        };
+        let observer =
+            Observer::start(installation, spawned, &Arc::new(std::sync::OnceLock::new()))
+                .expect("observer");
         registry.set_composer_observer_for_test(&id, Arc::clone(&observer));
 
         let sock = dir.path().join("hook.sock");
@@ -214,6 +295,21 @@ impl Deck {
     /// connections to the hook socket that it made itself before its
     /// `exec` and that the test holds.
     async fn helper(&mut self, name: &str, connections: usize) -> (u32, Vec<Peer>) {
+        self.helper_with(name, connections, false).await
+    }
+
+    /// [`Deck::helper`] whose last argument is a Claude export under the
+    /// deck's `TMPDIR`, so a bound deck's scan attributes it `Owned`.
+    async fn owned_helper(&mut self, name: &str, connections: usize) -> (u32, Vec<Peer>) {
+        self.helper_with(name, connections, true).await
+    }
+
+    async fn helper_with(
+        &mut self,
+        name: &str,
+        connections: usize,
+        export: bool,
+    ) -> (u32, Vec<Peer>) {
         let fifo = self.dir.path().join(name);
         let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
         // SAFETY: a NUL-terminated path.
@@ -245,6 +341,16 @@ impl Deck {
             .args(["-c", "read x < \"$0\""])
             .arg(&fifo)
             .stdin(Stdio::null());
+        if export {
+            // SAFETY: `getuid(2)` has no failure mode.
+            let uid = unsafe { libc::getuid() };
+            command.arg(
+                self.dir
+                    .path()
+                    .join(format!("claude-{uid}"))
+                    .join(format!("claude-prompt-{name}.md")),
+            );
+        }
         // SAFETY: `connect(2)` is async-signal-safe, and the closure only
         // reads what it owns. The descriptors are the parent's, inherited
         // across the fork and closed by the `exec`: the connection is the
@@ -297,8 +403,8 @@ impl Deck {
         assert!(reply.composer_probe.is_some(), "{reply:?}");
     }
 
-    fn invocation(&self, decision: ComposerDecision) -> String {
-        let request = DaemonMessage::ComposerInvocation(ComposerInvocationRequest {
+    fn request(&self, decision: ComposerDecision) -> ComposerInvocationRequest {
+        ComposerInvocationRequest {
             pane_id: PANE.to_string(),
             token: Some(self.token.clone()),
             generation: self.generation,
@@ -307,7 +413,11 @@ impl Deck {
             seg_seen: Some(0),
             native_seen: Some(0),
             argv: vec!["/tmp/claude-1000/claude-prompt-1.md".into()],
-        });
+        }
+    }
+
+    fn invocation(&self, decision: ComposerDecision) -> String {
+        let request = DaemonMessage::ComposerInvocation(self.request(decision));
         format!("{}\n", serde_json::to_string(&request).unwrap())
     }
 
@@ -343,14 +453,37 @@ impl Deck {
         self.observer.input().record(key).is_none() && self.observer.exit_fact(key).is_some()
     }
 
+    /// `key`'s record once the bound deck's scan attributed it `Owned`,
+    /// with no decision.
+    async fn scanned_owned(&self, key: RecordKey) {
+        let input = self.observer.input();
+        assert!(
+            wait_for(SETTLE, || input.record(key).is_some()).await,
+            "the scan records the helper"
+        );
+        let record = input.record(key).unwrap();
+        assert_eq!(record.attribution, Attribution::Owned, "{record:?}");
+        assert_eq!(record.decision, None);
+    }
+
+    /// Ends the hook loop; [`Deck`]'s drop does the rest.
     async fn stop(mut self) {
+        self.handle.abort();
+        let _ = (&mut self.handle).await;
+    }
+}
+
+impl Drop for Deck {
+    /// Panic-safe (Q87): the observer stopped, every process the test
+    /// started killed and reaped, the hook loop ended and the agent gone,
+    /// whether the test passed or not.
+    fn drop(&mut self) {
         self.observer.stop();
         for child in &mut self.started {
             let _ = child.kill();
             let _ = child.wait();
         }
         self.handle.abort();
-        let _ = (&mut self.handle).await;
         self.registry.shutdown_all();
     }
 }
@@ -504,7 +637,7 @@ async fn probe_074_a_report_whole_is_applied_and_one_cut_drains_uncertain() {
     deck.stop().await;
 }
 
-/// Scenario: A helper copy declares `Unarmed` and is killed without sending anything more, its connection held open by the test: the connection closes at its read deadline, and the exit settles in the ordinary way, its record pruned and its exit facts kept with no report.
+/// Scenario: A helper copy declares `Unarmed` and is killed without sending anything more, its connection held open by the test: the connection closes no sooner than the read deadline after the instant the observer recorded the exit, and the exit settles in the ordinary way, its record pruned and its exit facts kept with no report.
 #[spec("inbox/probe/074")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn probe_074_a_quiet_connection_closes_at_its_deadline_and_settles() {
@@ -515,20 +648,22 @@ async fn probe_074_a_quiet_connection_closes_at_its_deadline_and_settles() {
     deck.register(&mut peer).await;
     deck.unarmed(&mut peer, key).await;
     deck.kill(helper);
-    let exited = Instant::now();
     tokio::time::timeout(SETTLE, peer.closed())
         .await
         .expect("closed at its read deadline");
-    assert!(
-        exited.elapsed() >= READ_DEADLINE,
-        "not before the deadline: {:?}",
-        exited.elapsed()
-    );
+    let closed = Instant::now();
     assert!(
         wait_for(SETTLE, || deck.settled(key)).await,
         "a quiet connection's exit settles"
     );
     let fact = deck.observer.exit_fact(key).unwrap();
+    // The observer marks the departure after it records the exit, so the
+    // deadline is no sooner than this.
+    assert!(
+        closed >= fact.exit_observed + READ_DEADLINE,
+        "closed {:?} after the observed exit, before the read deadline",
+        closed.saturating_duration_since(fact.exit_observed)
+    );
     assert_eq!(fact.report, Report::None);
     assert_eq!(fact.decision, Some(Decision::Unarmed));
     deck.stop().await;
@@ -600,5 +735,248 @@ async fn probe_074_a_refused_line_drains_uncertain() {
     );
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(deck.uncertain(key), "kept, never pruned as settled");
+    deck.stop().await;
+}
+
+/// Scenario: A live helper copy with no record gets two connections registered by its pidfd: the first is admitted watched, by its own hold on the helper, and the second shares that hold. The first ends with bytes unread and both close; the helper still lives, so across the observer's passes its lost mark is kept, and a third connection shares the mark's hold. The `Unarmed` invocation made on it creates the record, which inherits the earlier loss: once the helper is killed its exit drains only to the uncertain outcome. The control helper, with the same steps and no loss, settles in the ordinary way.
+#[spec("inbox/probe/074")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_074_a_loss_before_its_record_is_kept_and_inherited() {
+    let mut deck = Deck::start().await;
+    let (helper, _) = deck.helper("lost", 0).await;
+    let key = key_of(helper);
+    let first = deck
+        .observer
+        .connect(Ok(Some(pidfd(helper))))
+        .expect("admitted");
+    assert_eq!(
+        first.held_for_test(),
+        HeldForTest {
+            peer: Some(true),
+            lost: None,
+            pin: None
+        },
+        "admitted watched, by its own hold"
+    );
+    let second = deck
+        .observer
+        .connect(Ok(Some(pidfd(helper))))
+        .expect("admitted");
+    assert_eq!(
+        second.held_for_test().peer,
+        Some(true),
+        "one hold per helper"
+    );
+    first.lose();
+    assert_eq!(
+        second.held_for_test().lost,
+        Some(true),
+        "the mark keeps that hold"
+    );
+    drop(first);
+    drop(second);
+    // Past the pass each close rings and an idle sweep: alive, so kept.
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
+    assert!(
+        deck.observer.lost_mark_for_test(key),
+        "a live helper's loss is never forgotten"
+    );
+    let third = deck
+        .observer
+        .connect(Ok(Some(pidfd(helper))))
+        .expect("admitted");
+    assert_eq!(
+        third.held_for_test(),
+        HeldForTest {
+            peer: Some(true),
+            lost: Some(true),
+            pin: None
+        },
+        "a later connection shares the mark's hold"
+    );
+    let observer = Arc::clone(&deck.observer);
+    let request = deck.request(ComposerDecision::Unarmed);
+    let third = tokio::task::spawn_blocking(move || {
+        observer.invocation(&third, &request);
+        third
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        deck.observer.input().record(key).and_then(|r| r.decision),
+        Some(Decision::Unarmed)
+    );
+    assert_eq!(
+        third.held_for_test().pin,
+        Some(true),
+        "its pin shares it too"
+    );
+    drop(third);
+    deck.kill(helper);
+    assert!(
+        wait_for(SETTLE, || deck.uncertain(key)).await,
+        "the record made after the loss inherits it"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(deck.uncertain(key), "kept, never pruned as settled");
+
+    let (control, _) = deck.helper("control", 0).await;
+    let control_key = key_of(control);
+    let conn = deck
+        .observer
+        .connect(Ok(Some(pidfd(control))))
+        .expect("admitted");
+    let observer = Arc::clone(&deck.observer);
+    let request = deck.request(ComposerDecision::Unarmed);
+    tokio::task::spawn_blocking(move || {
+        observer.invocation(&conn, &request);
+    })
+    .await
+    .unwrap();
+    deck.kill(control);
+    assert!(
+        wait_for(SETTLE, || deck.settled(control_key)).await,
+        "with no loss the exit settles"
+    );
+    deck.stop().await;
+}
+
+/// Scenario: With `A` bound and nothing published, more live helper copies than a generation keeps lost marks for each get a connection that ends with bytes unread: the marks and their pool stop at the bound and the generation's loss overflow latches. Killed, the helpers' marks go and give their units back, and the overflow stays. A liability is then published, and a helper copy born after it, recorded `Owned` with no decision by the scan, is killed with no loss of its own: its exit drains only to the uncertain outcome and the liability stays, never consumed by the exit alone.
+#[spec("inbox/probe/074")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_074_lost_marks_are_bounded_and_overflow_drains_uncertain() {
+    let mut deck = Deck::start_bound().await;
+    assert!(
+        wait_for(SETTLE, || deck.observer.permission() == Permission::Armable).await,
+        "{:?}",
+        deck.observer.permission()
+    );
+    let mut cycled = Vec::new();
+    for i in 0..=LOST_PER_GENERATION {
+        let (pid, _) = deck.helper(&format!("lost-{i}"), 0).await;
+        let conn = deck
+            .observer
+            .connect(Ok(Some(pidfd(pid))))
+            .expect("admitted");
+        conn.lose();
+        drop(conn);
+        cycled.push(pid);
+    }
+    assert_eq!(
+        deck.observer.lost_for_test(),
+        (LOST_PER_GENERATION as usize, LOST_PER_GENERATION, true),
+        "bounded, and the loss past the bound latched"
+    );
+    let input = deck.observer.input();
+    assert!(
+        cycled
+            .iter()
+            .all(|pid| input.record(key_of(*pid)).is_none())
+    );
+    for pid in cycled {
+        deck.kill(pid);
+    }
+    assert!(
+        wait_for(SETTLE, || deck.observer.lost_for_test() == (0, 0, true)).await,
+        "exited with no record, their marks go; the overflow stays: {:?}",
+        deck.observer.lost_for_test()
+    );
+
+    assert_eq!(
+        deck.observer.control(deck.generation, ControlOp::Publish),
+        Ok(1)
+    );
+    // Born after the publication, past its start ticks' granularity.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (helper, _) = deck.owned_helper("after", 0).await;
+    let key = key_of(helper);
+    deck.scanned_owned(key).await;
+    assert!(!deck.observer.lost_mark_for_test(key));
+    deck.kill(helper);
+    assert!(
+        wait_for(SETTLE, || deck.uncertain(key)).await,
+        "an overflowed generation drains uncertain"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let record = input.record(key).expect("kept");
+    assert_eq!(
+        record.settlement,
+        Settlement::NotConsumed(NotConsumed::Unproven)
+    );
+    assert_eq!(
+        input.liability_count(),
+        Some(1),
+        "never consumed by the exit alone"
+    );
+    deck.stop().await;
+}
+
+/// Scenario: With `A` bound and a liability published, a helper copy born after it is recorded `Owned` with no decision by the scan; on its registered connection it sends half of an invocation line and closes its end, so the daemon reads the half line to the end and can't parse it. Once the helper is killed its exit drains only to the uncertain outcome and the liability stays. The control helper, born after the same publication, closes its registered connection with nothing sent: its exit drains in the ordinary way and consumes the liability.
+#[spec("inbox/probe/074")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_074_half_an_invocation_ended_by_the_close_drains_uncertain() {
+    let mut deck = Deck::start_bound().await;
+    assert!(
+        wait_for(SETTLE, || deck.observer.permission() == Permission::Armable).await,
+        "{:?}",
+        deck.observer.permission()
+    );
+    assert_eq!(
+        deck.observer.control(deck.generation, ControlOp::Publish),
+        Ok(1)
+    );
+    let input = deck.observer.input();
+    // Born after the publication, past its start ticks' granularity.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (helper, mut peers) = deck.owned_helper("half", 1).await;
+    let key = key_of(helper);
+    let mut peer = peers.pop().unwrap();
+    deck.scanned_owned(key).await;
+    deck.register(&mut peer).await;
+    let line = deck.invocation(ComposerDecision::Unarmed);
+    peer.send(&line.as_bytes()[..line.len() / 2]).await;
+    peer.writer.shutdown().await.unwrap();
+    tokio::time::timeout(SETTLE, peer.closed())
+        .await
+        .expect("closed at the end");
+    deck.kill(helper);
+    assert!(
+        wait_for(SETTLE, || deck.uncertain(key)).await,
+        "half an invocation read to the end drains uncertain"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let record = input.record(key).expect("kept");
+    assert_eq!(record.decision, None);
+    assert_eq!(
+        record.settlement,
+        Settlement::NotConsumed(NotConsumed::Unproven)
+    );
+    assert_eq!(
+        input.liability_count(),
+        Some(1),
+        "never consumed by the exit alone"
+    );
+
+    let (clean, mut peers) = deck.owned_helper("clean", 1).await;
+    let clean_key = key_of(clean);
+    let mut peer = peers.pop().unwrap();
+    deck.scanned_owned(clean_key).await;
+    deck.register(&mut peer).await;
+    peer.writer.shutdown().await.unwrap();
+    tokio::time::timeout(SETTLE, peer.closed())
+        .await
+        .expect("closed at the end");
+    deck.kill(clean);
+    assert!(
+        wait_for(SETTLE, || deck
+            .observer
+            .exit_fact(clean_key)
+            .is_some_and(|f| f.settlement == Settlement::Consumed))
+        .await,
+        "a clean close settles by the exit and consumes: {:?}",
+        input.record(clean_key)
+    );
+    assert_eq!(input.liability_count(), Some(0));
     deck.stop().await;
 }

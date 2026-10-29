@@ -16,7 +16,7 @@ use dot_agent_deck::composer_probe::epoch::GenerationInput;
 use dot_agent_deck::composer_probe::observe::{
     Bell, ControlOp, ControlRefusal, ControlStep, DRAIN_RETRIES, Departure, DrainStep, E2_AFTER,
     Evidence, Page, Pool, READ_DEADLINE, Seam, SettleClaim, Slot, TestLiability, birth_floor,
-    drain_step, e2_due, marker_observation, outcome, report, scan_observation,
+    drain_step, e2_due, marker_observation, outcome, read_before, report, scan_observation,
 };
 use dot_agent_deck::composer_probe::observe::{Bound, ProcFacts, bound_agent, shell_words};
 use dot_agent_deck::composer_probe::record::{
@@ -825,7 +825,7 @@ fn probe_070_a_departure_wakes_its_connection_then_waits_the_read_deadline() {
         });
         tokio::task::yield_now().await;
         assert!(!departure.departed());
-        let marked = Instant::now();
+        let marked = tokio::time::Instant::now();
         departure.depart();
         assert!(!departure.expired(), "not before the deadline");
         let end = departure.deadline().expect("marked");
@@ -851,7 +851,7 @@ fn probe_070_a_departure_wakes_its_connection_then_waits_the_read_deadline() {
             Some(end),
             "a second mark moves nothing"
         );
-        let again = Instant::now();
+        let again = tokio::time::Instant::now();
         tokio::time::timeout(within, departure.read_deadline())
             .await
             .expect("the read deadline resolves");
@@ -861,6 +861,85 @@ fn probe_070_a_departure_wakes_its_connection_then_waits_the_read_deadline() {
             again.elapsed()
         );
     });
+}
+
+/// Scenario: On a paused clock, a connection's helper is marked departed, a complete line arrives 90 ms later and the reader returns it, and then the peer goes silent with the connection held open: the next read ends exactly at the read deadline, 100 ms after the departure, not a full read deadline after that last line, and with nothing unread it marks nothing lost. The same with half a line arriving at 90 ms ends at the same instant and marks the connection lost.
+#[spec("inbox/probe/070")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn probe_070_a_late_line_then_silence_ends_at_the_departure_deadline() {
+    use tokio::io::AsyncWriteExt as _;
+    // The paused clock's timer granularity.
+    const TICK: Duration = Duration::from_millis(2);
+
+    for half in [false, true] {
+        let (peer, mut holder) = tokio::io::duplex(1024);
+        let mut reader = tokio::io::BufReader::new(peer);
+        let mut line = dot_agent_deck::bounded_read::CappedLine::default();
+        let departure = Departure::default();
+        let departed = tokio::time::Instant::now();
+        departure.depart();
+        let late = Duration::from_millis(90);
+        let send = async {
+            tokio::time::sleep(late).await;
+            let bytes: &[u8] = if half {
+                b"{\"half\":"
+            } else {
+                b"{\"whole\":1}\n"
+            };
+            holder.write_all(bytes).await.unwrap();
+        };
+        let mut lost = false;
+        if half {
+            let (_, ended) = tokio::join!(
+                send,
+                read_before(
+                    &departure,
+                    &mut line,
+                    &mut reader,
+                    1024,
+                    |_| false,
+                    || lost = true
+                ),
+            );
+            assert!(ended.is_none(), "half a line is never returned");
+        } else {
+            let (_, read) = tokio::join!(
+                send,
+                read_before(
+                    &departure,
+                    &mut line,
+                    &mut reader,
+                    1024,
+                    |_| false,
+                    || { panic!("nothing is unread") }
+                ),
+            );
+            assert_eq!(read.unwrap().unwrap().as_deref(), Some("{\"whole\":1}"));
+            assert!(
+                (late..late + TICK).contains(&departed.elapsed()),
+                "the line, read when it came: {:?}",
+                departed.elapsed()
+            );
+            let ended = read_before(
+                &departure,
+                &mut line,
+                &mut reader,
+                1024,
+                |_| false,
+                || lost = true,
+            )
+            .await;
+            assert!(ended.is_none(), "silence ends the connection");
+        }
+        // A deadline renewed by the line would end at 190 ms.
+        assert!(
+            (READ_DEADLINE..READ_DEADLINE + TICK).contains(&departed.elapsed()),
+            "ends at the departure's deadline, not a read deadline after the last line: {:?}",
+            departed.elapsed()
+        );
+        assert_eq!(lost, half, "only the half line is lost");
+        drop(holder);
+    }
 }
 
 /// Scenario: Settle an `Owned`, decisionless helper's exit whose interval proof holds, once with its evidence read (the control: it consumes) and once given up with evidence unread: the second consumes nothing, settles `NotConsumed(Unproven)`, opens the writer scope as unconfirmed, and moves no count. An `Armed` decision that arrives after either settlement is told the settled outcome (`Mine` for the consumption, `Uncertain` for the uncertain one) and changes nothing: no decision, no count.

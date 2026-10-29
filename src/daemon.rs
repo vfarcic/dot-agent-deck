@@ -8005,6 +8005,15 @@ async fn run_hook_loop_with_limits(
                             )
                             .await;
                         } else {
+                            // PRD #1666 part 3 (Q87): on a registered composer
+                            // connection a line it can't parse, half an
+                            // invocation ended by the peer's close among them,
+                            // is evidence unread, so its helper's exit drains
+                            // only uncertain. Other connections are unchanged.
+                            #[cfg(target_os = "linux")]
+                            if let Some(conn) = composer_conn.as_ref() {
+                                conn.lose();
+                            }
                             // The line is producer-controlled, and issue #903
                             // is about not letting a producer make the daemon
                             // spend unbounded resources on a message it is
