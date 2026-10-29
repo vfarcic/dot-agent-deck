@@ -1,0 +1,5 @@
+## Telemetry Sends the Daemon's Warnings and Errors
+
+With telemetry on, the daemon now also sends each warning and error it logs to your OTLP backend as a log record (`/v1/logs`), so a problem the daemon runs into shows up next to the agent runs it affected, without you having to find and read its log file. A record says where the daemon logged and how serious it was: `WARN` or `ERROR`, the part of the deck that logged it (`deck.log.target`), the source file and line (`code.file.path`, `code.line.number`) and the names of the fields it logged (`deck.log.fields`). The message text and the values are never sent; for those, look up the same moment in the daemon's own log.
+
+The daemon does not wait for these to be sent. If warnings come faster than they can go out, the extra ones are dropped and counted in a `deck.telemetry.logs.dropped` record. The `OTEL_EXPORTER_OTLP_LOGS_*` variables point them somewhere else, and `OTEL_LOGS_EXPORTER=none` in the daemon's environment turns them off on their own. A Collector that should pass them on needs a `logs` pipeline. See [Telemetry](https://agent-deck.devopstoolkit.ai/docs/telemetry.md).

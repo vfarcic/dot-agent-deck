@@ -342,6 +342,30 @@ One span per interval, about once a minute, from the daemon that runs your agent
 
 To send it more or less often, set `DOT_AGENT_DECK_TELEMETRY_HEALTH_INTERVAL_MS` in the daemon's environment to the interval in milliseconds. The shortest interval is 100 milliseconds, and a smaller value is raised to it; a value that is not a whole number above `0` keeps the one-minute default. To stop it, drop the `daemon.health` spans in a Collector ([Trim what is sent](#trim-what-is-sent)).
 
+### The daemon's warnings and errors
+
+Besides the traces, the daemon sends each warning and error it logs as an OTLP log record, from its start onwards, so a problem the daemon logs shows up in your backend next to the runs it affected. Records go to `<OTEL_EXPORTER_OTLP_ENDPOINT>/v1/logs`, every two seconds or so, with the same resource attributes as the spans.
+
+A record says **where** the daemon logged and how bad it was, never **what** it logged:
+
+| Field or attribute | Value |
+| --- | --- |
+| `severityText`, `severityNumber` | `WARN` (13) or `ERROR` (17). Nothing below a warning is sent, whatever `RUST_LOG` says. |
+| `deck.log.target` | The part of the deck that logged it, such as `dot_agent_deck::daemon_protocol`. |
+| `code.file.path`, `code.line.number` | The source file and line of the log statement, such as `src/daemon_protocol.rs`. A file from outside the deck's own source is left out, because its path names the machine the binary was built on. |
+| `deck.log.fields` | The names of the fields the statement logs, comma-separated, such as `message,pane_id`. Their values are never sent. |
+
+There is no message text: the record has no body. To read what a warning said, look up the same time in the daemon's log on your machine ([Enabling Debug Logs](troubleshooting.md#enabling-debug-logs)); the source file and line tell you which statement it was.
+
+The records and the log file do not hold quite the same set:
+
+- **Warnings about the telemetry itself are not sent**, such as an export the backend refused, because a failing export cannot report itself. They are in the log file, at most one a minute.
+- **Warnings from libraries the deck uses are sent**, even though the log file only records their errors. One from a library that logs through Rust's `log` crate says `deck.log.target` `log` and has no file or line, because those are only in its message.
+
+The daemon does not wait for them to be sent: when warnings arrive faster than they can be sent, the extra ones are dropped and counted, and the next batch carries one record with `deck.telemetry.logs.dropped`, the number dropped. Each batch is sent once: one your backend does not accept is lost, and so are the last two seconds of warnings when the daemon stops.
+
+The `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL`, `OTEL_EXPORTER_OTLP_LOGS_HEADERS` and `OTEL_EXPORTER_OTLP_LOGS_TIMEOUT` variables override the general ones for these records, as the OpenTelemetry specification describes. `grpc` is not supported for them. To stop them alone, set `OTEL_LOGS_EXPORTER=none` in the daemon's environment.
+
 ## What is never sent
 
 The deck builds what it sends from the attributes on this page. Some values are yours, and the deck sends them as you wrote them: `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES`, the orchestration and role names from your configuration, the name you give `dot-agent-deck dispatch`, your repository's name (the last part of its `origin` remote) and **the name of the branch an agent starts on** (`vcs.ref.head.name`). Do not put a secret or private content in any of them. Branch names in particular can carry private text: a branch named after a customer, an unreleased product or a security fix sends that name to your backend. To keep them out of it, delete `vcs.ref.head.name` in a Collector ([Trim what is sent](#trim-what-is-sent)). Apart from those, the deck never sends:
@@ -353,6 +377,7 @@ The deck builds what it sends from the attributes on this page. Some values are 
 - secrets: API keys, the values of environment variables, and the values of your OTLP headers (those go to the endpoint you configured as headers, and to nothing else, and the deck does not write them to its log);
 - pane titles, status details, working-directory paths, remote URLs, or command lines;
 - an agent's error messages: a failed run carries the kind of failure from a known list, or `other`;
+- the text of the daemon's own warnings and errors, or the values they name: [those records](#the-daemons-warnings-and-errors) carry only where the daemon logged and how severe it was;
 - other names you chose: a model name is sent only when the deck recognises it as a known model's name, and a Codex plan only from the plans Codex is known to report.
 
 The [collector](#cpu-memory-and-disk-per-run), a separate program you run yourself, sends a worktree's path only when you start it with `--send-worktree-paths`; [What it sends](#what-it-sends) has its list.
@@ -641,7 +666,7 @@ service:
       exporters: [otlphttp/honeycomb]
 ```
 
-`host.name` and the other resource attributes are dropped with the Collector's `resource` processor instead of `attributes`. Agents pointed at the same Collector need `logs` and `metrics` pipelines as well for their own data.
+`host.name` and the other resource attributes are dropped with the Collector's `resource` processor instead of `attributes`. The deck's own warnings and errors arrive as logs, so a Collector that should pass them on needs a `logs` pipeline too, and so do agents pointed at the same Collector, with a `metrics` pipeline as well for their own data.
 
 ## Turn it off
 

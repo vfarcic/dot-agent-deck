@@ -2667,43 +2667,57 @@ async fn run_dashboard() -> ExitCode {
 /// would land inside that single-threaded window and break the `set_var`
 /// soundness invariant the login-shell PATH capture relies on.
 fn init_logging_from_env() {
-    if let Ok(log_val) = std::env::var("DOT_AGENT_DECK_LOG") {
-        // Issue #1135: the default is resolved per platform, not spelled as a
-        // Unix literal. `/tmp/...` is rooted but driveless on Windows, so it
-        // resolved against the current drive as `\tmp\dot-agent-deck.log` —
-        // a directory that usually does not exist, and the open below creates
-        // the file but never its parent, so the subscriber was never installed
-        // and nothing was logged. An explicit value is still used verbatim.
-        let log_path = if log_val.is_empty() || log_val == "1" {
-            dot_agent_deck::platform::paths::default_debug_log_path()
-        } else {
-            std::path::PathBuf::from(log_val)
-        };
-        // Issues #1791, #1796: a test process does not open an inherited log
-        // that is not its own; see `config_write_guard::log_write_allowed`.
-        if !dot_agent_deck::config_write_guard::log_write_allowed(&log_path) {
-            return;
-        }
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-        {
-            Ok(log_file) => {
-                tracing_subscriber::fmt()
-                    .with_env_filter(dot_agent_deck::logging::env_filter_from_env())
-                    .with_writer(log_file)
-                    .with_ansi(false)
-                    .init();
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+
+    // The file logger: unchanged in what it writes and at what level.
+    let file = std::env::var("DOT_AGENT_DECK_LOG")
+        .ok()
+        .and_then(|log_val| {
+            // Issue #1135: the default is resolved per platform, not spelled as a
+            // Unix literal. `/tmp/...` is rooted but driveless on Windows, so it
+            // resolved against the current drive as `\tmp\dot-agent-deck.log` —
+            // a directory that usually does not exist, and the open below creates
+            // the file but never its parent, so the subscriber was never installed
+            // and nothing was logged. An explicit value is still used verbatim.
+            let log_path = if log_val.is_empty() || log_val == "1" {
+                dot_agent_deck::platform::paths::default_debug_log_path()
+            } else {
+                std::path::PathBuf::from(log_val)
+            };
+            // Issues #1791, #1796: a test process does not open an inherited log
+            // that is not its own; see `config_write_guard::log_write_allowed`.
+            if !dot_agent_deck::config_write_guard::log_write_allowed(&log_path) {
+                return None;
             }
-            Err(e) => {
-                eprintln!(
-                    "Warning: failed to open log file {}: {e}",
-                    log_path.display()
-                );
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+            {
+                Ok(log_file) => Some(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(log_file)
+                        .with_ansi(false)
+                        .with_filter(dot_agent_deck::logging::env_filter_from_env()),
+                ),
+                Err(e) => {
+                    eprintln!(
+                        "Warning: failed to open log file {}: {e}",
+                        log_path.display()
+                    );
+                    None
+                }
             }
-        }
+        });
+    // Issue #1981 M8: the daemon's warnings and errors over OTLP, with a
+    // filter of its own; idle until the daemon starts its telemetry.
+    let otlp = dot_agent_deck::telemetry::logs::otlp_log_layer();
+    if file.is_none() && otlp.is_none() {
+        return;
     }
+    tracing_subscriber::registry().with(file).with(otlp).init();
 }
 
 /// Prepare the endpoint directory, then lazy-spawn a daemon at `endpoint` if

@@ -188,7 +188,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### telemetry/otlp/018 — Real interactive Codex safely joins its own telemetry to the deck run. [reel]
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_telemetry_export_live.rs`).
 - **Agent:** real Codex called by name inside a wrapper shell script on the auth-compatible cheap model (ChatGPT default gpt-5.6-luna).
-- **Asserts:** real shell copies a unique fixture, the pane completes and card settles, native traces/metrics carry the deck resource run id, no logs are captured and prompt/file/output sentinels are absent from every captured body.
+- **Asserts:** real shell copies a unique fixture, the pane completes and card settles, native traces/metrics carry the deck resource run id, Codex sends no logs (the deck's own `dot-agent-deck` log records, #1981 M8, are allowed) and prompt/file/output sentinels are absent from every captured body.
 - **Does not assert:** Codex sandbox enforcement or native metric values.
 - **Platform coverage:** mac+linux when authenticated.
 
@@ -13369,4 +13369,12 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 - **Agent:** two Python PTY stand-ins; no real agent or credential.
 - **Asserts:** three attaches to the orchestrator's terminal over the real attach socket are counted in deck.daemon.attach_latency.count on the daemon.health spans that follow (at least three, the TUI's own attaches included), every interval with attaches has ordered p50 <= p95 <= max, and intervals with none omit the quantiles.
 - **Does not assert:** exact latency values, the client's own drawing time, that a failed attach is not counted, or attaches from the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/044 — The daemon's warnings reach OTLP logs as callsites, without their text.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_daemon_logs.rs`); real attach socket, local OTLP/JSON receiver and the captured daemon log.
+- **Agent:** none; the warning is the daemon's own, triggered by an oversized attach frame.
+- **Asserts:** the daemon's "attach protocol connection error" warning arrives as one OTLP/JSON log record under `service.name=dot-agent-deck` with severity WARN (13), `deck.log.target=dot_agent_deck::daemon_protocol`, `code.file.path=src/daemon_protocol.rs`, a line number and `deck.log.fields=message`, with no body; no received body contains the warning's text; and `deck.log` still records the warning, so the file logger's output is unchanged.
+- **Does not assert:** ERROR records, the dropped-record count under load (unit-tested in `telemetry::logs`), OTLP/protobuf logs, the logs-specific endpoint variables, or delivery when the backend refuses a batch.
 - **Platform coverage:** mac+linux.
