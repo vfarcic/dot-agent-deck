@@ -645,6 +645,9 @@ pub(crate) mod tests {
             RunContext {
                 instructions_commit: Some("b".repeat(40)),
                 repository_name: Some("repo".into()),
+                // The branch the deck sends comes from git, never from an
+                // event's branch metadata, which carries a sentinel here.
+                branch: Some("agent/x".into()),
             },
         );
         let mut t = 2;

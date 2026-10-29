@@ -1,9 +1,10 @@
 //! Run context the deck derives from a pane's working directory: the commit
-//! its instructions were last changed in, and the repository's name.
+//! its instructions were last changed in, the repository's name, and the
+//! branch checked out there.
 //!
 //! Each is absent when it cannot be determined — outside a git repository, with
-//! no history for the instruction paths, with no `origin` remote, or when a
-//! probe does not finish in time — and never guessed. The working directory
+//! no history for the instruction paths, with no `origin` remote, on a detached
+//! `HEAD`, or when a probe does not finish in time — and never guessed. The working directory
 //! itself is read here and never sent.
 //!
 //! **The probes switch off the ways configuration is known to make these reads
@@ -11,7 +12,7 @@
 //! make an ordinary read run another program: a signature verifier for
 //! `log.showSignature`, an fsmonitor hook, a pager, a lazy fetch of missing
 //! objects in a partial clone (and the transport and credential helpers behind
-//! it). [`harden`] switches each of those off for these two commands, apart
+//! it). [`harden`] switches each of those off for these commands, apart
 //! from fsmonitor, which [`crate::git_env::git_async`] already switches off
 //! (with hooks) for every git the deck runs, and the
 //! remote URL is read as configured (`git config`), without `insteadOf`
@@ -50,6 +51,8 @@ pub const INSTRUCTION_PATHS: [&str; 3] =
 
 /// How long one git command may run before it is killed.
 pub const PROBE_DEADLINE: Duration = Duration::from_secs(5);
+/// The git commands [`resolve_with`] runs for one run, one after another.
+pub const PROBES_PER_RUN: u64 = 3;
 /// Git commands running at once, at most, across all runs.
 pub const MAX_CONCURRENT_PROBES: usize = 4;
 /// Runs whose context is waiting to be resolved, at most. Past it a new run's
@@ -114,6 +117,8 @@ pub const HARDENING_ENV_REMOVED: [&str; 13] = [
 pub struct RunContext {
     pub instructions_commit: Option<String>,
     pub repository_name: Option<String>,
+    /// Issue #1981 M6: the branch `HEAD` names when the run starts.
+    pub branch: Option<String>,
 }
 
 /// How probes are run. Tests replace the program with a stand-in.
@@ -162,13 +167,14 @@ impl Probes {
 
     /// Resolve `cwd`'s context on the current runtime and hand it to `done`.
     /// Nothing happens without a runtime, when the queue is full, or after
-    /// [`Self::shutdown`]: the run's context stays absent.
-    pub fn spawn(&self, cwd: PathBuf, done: impl FnOnce(RunContext) + Send + 'static) {
+    /// [`Self::shutdown`]: the run's context stays absent. Whether the probes
+    /// were started.
+    pub fn spawn(&self, cwd: PathBuf, done: impl FnOnce(RunContext) + Send + 'static) -> bool {
         if *self.cancel.borrow() {
-            return;
+            return false;
         }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
+            return false;
         };
         let mut tasks = self.tasks.lock().unwrap_or_else(|p| p.into_inner());
         while tasks.try_join_next().is_some() {}
@@ -176,7 +182,7 @@ impl Probes {
             tracing::debug!(
                 "telemetry: run-context probes are backed up; leaving this run's absent"
             );
-            return;
+            return false;
         }
         let settings = self.settings.clone();
         let permits = Arc::clone(&self.permits);
@@ -188,6 +194,7 @@ impl Probes {
             },
             &runtime,
         );
+        true
     }
 
     /// Daemon shutdown: cancel every outstanding probe, which kills and reaps
@@ -213,8 +220,8 @@ impl Probes {
     }
 }
 
-/// Run the two probes in `cwd` under `settings`, each holding one of `permits`
-/// while it runs. Either is absent if it fails, times out or is cancelled.
+/// Run the probes in `cwd` under `settings`, each holding one of `permits`
+/// while it runs. Each is absent if it fails, times out or is cancelled.
 pub async fn resolve_with(
     settings: &ProbeSettings,
     permits: &Semaphore,
@@ -231,17 +238,38 @@ pub async fn resolve_with(
     let repository_name = probe(
         settings,
         permits,
-        cancel,
+        cancel.clone(),
         cwd,
         &["config", "--get", "remote.origin.url"],
     )
     .await
     .as_deref()
     .and_then(repository_name_from_remote_url);
+    // `symbolic-ref` rather than `rev-parse --abbrev-ref`: it also names the
+    // branch of a repository with no commits yet.
+    let branch = probe(
+        settings,
+        permits,
+        cancel,
+        cwd,
+        &["symbolic-ref", "-q", "HEAD"],
+    )
+    .await
+    .as_deref()
+    .and_then(branch_from_head_ref);
     RunContext {
         instructions_commit,
         repository_name,
+        branch,
     }
+}
+
+/// The branch a `HEAD` symbolic ref names (`refs/heads/feature/x` gives
+/// `feature/x`). `None` for anything outside `refs/heads/`, an empty name or
+/// one with a control character.
+pub fn branch_from_head_ref(head: &str) -> Option<String> {
+    let name = head.trim().strip_prefix("refs/heads/")?;
+    (!name.is_empty() && !name.chars().any(char::is_control)).then(|| name.to_string())
 }
 
 /// [`resolve_with`] with the default settings and a permit of its own.
@@ -492,8 +520,21 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, scratch.path(), &["init", "--quiet"]);
 
-        // No history and no remote yet: both absent.
-        assert_eq!(resolve(&repo).await, RunContext::default());
+        git(
+            &repo,
+            scratch.path(),
+            &["symbolic-ref", "HEAD", "refs/heads/feature/x-1981"],
+        );
+
+        // No history and no remote yet: both absent, and the branch is named
+        // before it has a commit.
+        assert_eq!(
+            resolve(&repo).await,
+            RunContext {
+                branch: Some("feature/x-1981".into()),
+                ..RunContext::default()
+            }
+        );
 
         std::fs::write(repo.join("CLAUDE.md"), "rules").unwrap();
         git(&repo, scratch.path(), &["add", "CLAUDE.md"]);
@@ -527,6 +568,22 @@ mod tests {
             "the commit that last touched an instruction path, not HEAD"
         );
         assert_eq!(context.repository_name.as_deref(), Some("my-repo"));
+        assert_eq!(context.branch.as_deref(), Some("feature/x-1981"));
+
+        // A detached `HEAD` names no branch.
+        git(&repo, scratch.path(), &["checkout", "--quiet", "--detach"]);
+        assert_eq!(resolve(&repo).await.branch, None);
+    }
+
+    #[test]
+    fn a_branch_is_read_only_from_a_heads_ref() {
+        assert_eq!(
+            branch_from_head_ref("refs/heads/agent/x\n").as_deref(),
+            Some("agent/x")
+        );
+        assert_eq!(branch_from_head_ref("refs/tags/v1"), None);
+        assert_eq!(branch_from_head_ref("refs/heads/"), None);
+        assert_eq!(branch_from_head_ref("refs/heads/a\u{7}b"), None);
     }
 
     /// An agent working in a subdirectory of its repository gets the commit of
@@ -806,12 +863,12 @@ mod tests {
         let context = resolve_with(&settings, &permits, rx, scratch.path()).await;
         assert!(
             started.elapsed() < Duration::from_secs(5),
-            "bounded by the two deadlines: {:?}",
+            "bounded by the three deadlines: {:?}",
             started.elapsed()
         );
         assert_eq!(context, RunContext::default());
         let spawned = pids(&pid_file);
-        assert_eq!(spawned.len(), 2, "both probes ran");
+        assert_eq!(spawned.len(), 3, "every probe ran");
         for pid in spawned {
             assert!(!alive(&pid), "probe {pid} was killed and reaped");
         }
@@ -844,7 +901,7 @@ mod tests {
         }
         assert_eq!(probes.outstanding(), 0);
         // After shutdown nothing new starts.
-        probes.spawn(cwd, |_| panic!("no probe after shutdown"));
+        assert!(!probes.spawn(cwd, |_| panic!("no probe after shutdown")));
         assert_eq!(probes.outstanding(), 0);
     }
 
@@ -858,9 +915,10 @@ mod tests {
         settings.max_concurrent = 1;
         settings.max_queued = 2;
         let probes = Probes::new(settings);
-        for _ in 0..5 {
-            probes.spawn(scratch.path().to_path_buf(), |_| {});
-        }
+        let started = (0..5)
+            .filter(|_| probes.spawn(scratch.path().to_path_buf(), |_| {}))
+            .count();
+        assert_eq!(started, 2, "the rest say they were not started");
         assert_eq!(probes.outstanding(), 2, "the rest were left absent");
         wait_for_pids(&pid_file, 1).await;
         tokio::time::sleep(Duration::from_millis(300)).await;

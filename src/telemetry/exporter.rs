@@ -83,7 +83,7 @@ use super::input::{InputFilter, InterventionKind, LONE_ESCAPE_WINDOW, PASTE_IDLE
 use super::launch::LAUNCH_ENV_KEYS;
 use super::propagation::{RunIdentity, agent_env};
 use super::resource::{ResourceAttribute, deck_resource, host_name};
-use super::run_context::{ProbeSettings, Probes};
+use super::run_context::{ProbeSettings, Probes, RunContext};
 use super::span::{SpanRecord, new_run_id};
 use super::tracker::{EndReason, FinishingRun, RunGeneration, RunStart, RunTracker};
 use super::{Protocol, now_unix_nanos, otlp};
@@ -1197,13 +1197,20 @@ impl Telemetry {
             });
         }
         // The git probes run off the spawn path; the run's context
-        // attributes appear on its span once they have resolved.
+        // attributes appear on its span once they have resolved, and a run
+        // that ends first waits for them. Probes that could not start leave
+        // the context absent, and the run waits for nothing.
         if let Some(cwd) = run.cwd.clone() {
             let shared = Arc::clone(&exporting.shared);
             let run_id = run.run_id.clone();
-            exporting.probes.spawn(cwd, move |context| {
+            let started = exporting.probes.spawn(cwd, move |context| {
                 shared.with_tracker(|t| t.set_context(&run_id, context));
             });
+            if !started {
+                exporting
+                    .shared
+                    .with_tracker(|t| t.set_context(&run.run_id, RunContext::default()));
+            }
         }
     }
 
@@ -2048,7 +2055,13 @@ async fn run_ingest(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiver<C
                 shared.name_dispatched_runs();
                 // Issue #1981 M7: a hand-off past its age bound ends then,
                 // not when the next inbox change or post happens to come.
-                shared.with_tracker(|t| t.expire_handoffs(now_unix_nanos()));
+                // A run's span whose git context never came goes without
+                // it ([`super::tracker::CONTEXT_WAIT_NANOS`]).
+                shared.with_tracker(|t| {
+                    let now = now_unix_nanos();
+                    t.expire_handoffs(now);
+                    t.release_overdue_context(now);
+                });
             }
             () = next_tick(&mut health) => {
                 drain(&shared, &mut events, &mut read).await;

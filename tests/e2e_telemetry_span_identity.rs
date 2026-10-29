@@ -606,7 +606,7 @@ impl Drop for SiblingWorktreeGuard {
     }
 }
 
-/// Scenario: Dispatch a single synthetic unit from a declared Pi caller, wait for the unit to start in its own worktree and close it. The completed unit run must carry the exact dispatch name from the deck registry and must not export the unit branch name.
+/// Scenario: Dispatch a single synthetic unit from a declared Pi caller, wait for the unit to start in its own worktree and close it. The completed unit run must carry the exact dispatch name from the deck registry and the unit's branch as `vcs.ref.head.name`.
 #[spec("telemetry/otlp/027")]
 #[test]
 fn telemetry_otlp_027_dispatched_run_carries_registry_name() {
@@ -663,14 +663,16 @@ fn telemetry_otlp_027_dispatched_run_carries_registry_name() {
     common::wait_for_file_contains(&worktree.join("dispatcher.env"), "DOT_AGENT_DECK_PANE_ID=");
     close(&deck, &unit);
     let run = receiver.run(&unit);
-    let exported = serde_json::to_string(&receiver.spans()).unwrap();
-    assert!(
-        !exported.contains(&format!("agent/dispatch-{UNIT}")),
-        "dispatch branch leaked into telemetry"
-    );
     assert_eq!(
         string(&run, "deck.dispatch.name"),
         UNIT,
         "completed dispatched run must carry registry unit name: {run}"
+    );
+    // Issue #1981 M6: the unit's branch is sent, so its runs join to the pull
+    // request that branch opens.
+    assert_eq!(
+        string(&run, "vcs.ref.head.name"),
+        format!("agent/dispatch-{UNIT}"),
+        "completed dispatched run must carry its branch: {run}"
     );
 }

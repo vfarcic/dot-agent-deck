@@ -117,6 +117,7 @@ A run starts when the deck starts an agent in a pane and ends when the agent exi
 | `deck.orchestrator` | `true` for the orchestration's orchestrator, `false` for its other roles. |
 | `deck.instructions.commit` | The commit that last changed `CLAUDE.md`, `AGENTS.md` or `.claude/skills` at the root of the agent's repository, whichever directory in it the agent runs from, so you can compare runs before and after an instructions change. Absent outside a git repository or when none of those has any history. |
 | `vcs.repository.name` | The repository's name, taken from the last part of its `origin` remote (`dot-agent-deck` for `git@github.com:vfarcic/dot-agent-deck.git`). The remote's URL itself is never sent. |
+| `vcs.ref.head.name` | The git branch checked out in the agent's working directory when the run started, such as `agent/dispatch-fix-login` for a unit started by `dot-agent-deck dispatch`. Use it to join a run to its pull request even when the run ended before the pull request existed. It is the branch name exactly as you or the agent named it, so it can carry private text: see [What is never sent](#what-is-never-sent) and [Trim what is sent](#trim-what-is-sent). Absent outside a git repository or on a detached `HEAD`. A branch the agent switches to later is not recorded. |
 | `deck.pr.number` | The pull request the agent's branch has, once the deck has found it (the same pull request the card's badge shows). The run keeps the last one it saw: when the branch later has no pull request, for example after the pull request merged and the worktree moved on, the run still names it. Absent when the run never saw one. |
 | `deck.dispatch.name` | For a run started by `dot-agent-deck dispatch`, the name the unit was dispatched with, exactly as given. Every role of a dispatched orchestration carries it. When the agent of a single-agent unit restarts, its new run can take a few seconds to get it, so a restarted agent that runs for less than that may not have it. |
 | `deck.run.end_reason` | `exited` (the agent exited by itself), `closed` (its pane was closed, or the deck stopped the agent, for example to restart it in its pane), `daemon_shutdown`, or `unknown` when the deck could not tell how the run ended. |
@@ -328,16 +329,16 @@ To send it more or less often, set `DOT_AGENT_DECK_TELEMETRY_HEALTH_INTERVAL_MS`
 
 ## What is never sent
 
-The deck builds what it sends from the attributes on this page. Some values are yours, and the deck sends them as you wrote them: `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES`, the orchestration and role names from your configuration, the name you give `dot-agent-deck dispatch`, and your repository's name (the last part of its `origin` remote). Do not put a secret or private content in any of them. Apart from those, the deck never sends:
+The deck builds what it sends from the attributes on this page. Some values are yours, and the deck sends them as you wrote them: `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES`, the orchestration and role names from your configuration, the name you give `dot-agent-deck dispatch`, your repository's name (the last part of its `origin` remote) and **the name of the branch an agent starts on** (`vcs.ref.head.name`). Do not put a secret or private content in any of them. Branch names in particular can carry private text: a branch named after a customer, an unreleased product or a security fix sends that name to your backend. To keep them out of it, delete `vcs.ref.head.name` in a Collector ([Trim what is sent](#trim-what-is-sent)). Apart from those, the deck never sends:
 
 - prompts, or anything you type into an agent (an intervention is counted, not recorded);
 - file contents, agent output, or the screen of a pane;
 - tool-call arguments, or anything else from an agent's tool calls;
 - the text of a delegated task, a worker's report or any other message, or a message's subject;
 - secrets: API keys, the values of environment variables, and the values of your OTLP headers (those go to the endpoint you configured as headers, and to nothing else, and the deck does not write them to its log);
-- pane titles, status details, branch names, working-directory paths, remote URLs, or command lines;
+- pane titles, status details, working-directory paths, remote URLs, or command lines;
 - an agent's error messages: a failed run carries the kind of failure from a known list, or `other`;
-- other names you chose: a model name is sent only when the deck recognises it as a known model's name, and a Codex plan only from the plans Codex is known to report. The branch a dispatch creates is not sent.
+- other names you chose: a model name is sent only when the deck recognises it as a known model's name, and a Codex plan only from the plans Codex is known to report.
 
 The [collector](#cpu-memory-and-disk-per-run), a separate program you run yourself, sends a worktree's path only when you start it with `--send-worktree-paths`; [What it sends](#what-it-sends) has its list.
 
@@ -591,6 +592,8 @@ processors:
   attributes/trim:
     actions:
       - key: vcs.repository.name
+        action: delete
+      - key: vcs.ref.head.name
         action: delete
       - key: deck.orchestration.name
         action: delete
