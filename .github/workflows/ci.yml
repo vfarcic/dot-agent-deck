@@ -264,7 +264,7 @@ jobs:
           version: 12.9.0
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 24
+          node-version: 26
           cache: pnpm
           cache-dependency-path: desktop/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
@@ -358,7 +358,7 @@ jobs:
           version: 12.9.0
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 24
+          node-version: 26
           cache: pnpm
           cache-dependency-path: desktop/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
@@ -662,7 +662,7 @@ jobs:
           version: 12.9.0
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 24
+          node-version: 26
           cache: pnpm
           cache-dependency-path: desktop/pnpm-lock.yaml
       # The desktop crate's build set — the same six packages as `build`, whose
@@ -927,7 +927,7 @@ jobs:
       # the desktop jobs and devbox.json.
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: 24
+          node-version: 26
       # Issue #1708 — the Pi extension's type gate, which until then ran
       # nowhere. In this job, rather than `desktop-web` beside the desktop's own
       # tsc, because `build` aggregates this one, so a type error blocks the
