@@ -41,13 +41,19 @@
 //! read again completely. A connection is registered when its capability
 //! question is answered, which is before a helper can send a decision on it,
 //! so a decision on IPC is always on a registered connection. When the exit
-//! is observed each of the helper's connections is told ([`Departure`]); its
-//! reader applies what it reads, and ends the connection at its end or once
-//! [`READ_DEADLINE`] has passed with nothing pending, so a line read or
-//! being applied is applied before the drain. A marker read that overflows
-//! or fails is no drain: nothing settles, and no marker is taken as
-//! deleted. Until both hold the drain is rescheduled; after
-//! [`DRAIN_RETRIES`] passes it gives up to the uncertain outcome
+//! is observed each of the helper's connections is told ([`Departure`]),
+//! whether or not the helper has a record (Q85); its reader applies what it
+//! reads, and ends the connection at its end or at its read deadline,
+//! [`READ_DEADLINE`] after the exit in total, however many lines arrive
+//! meanwhile from whatever process still holds the helper's descriptor
+//! (Q85), so a line read before then is applied before the drain, and the
+//! connection's slot comes back. A connection that ends holding a partial
+//! line, or with bytes still pending at its deadline, or on a line or a
+//! report it refused, left evidence unread ([`read_line`]): its record never
+//! settles clean, only uncertain. A marker read that overflows or fails is no drain: nothing
+//! settles, and no marker is taken as deleted. Until both hold the drain is
+//! rescheduled; after [`DRAIN_RETRIES`] passes (a count, not a time) it
+//! gives up to the uncertain outcome
 //! (`NotConsumed(Unproven)` for an open record, no fallback pop), never to
 //! the clean one, and keeps its record and markers. A decision that arrives
 //! after the exit drained is logged and changes nothing: the helper is told
@@ -95,14 +101,14 @@
 //!                                                                  └─> arm page stores
 //! settle claim (atomic, held across bind and the gen-G write, no lock) ─> seam
 //! output lock (bus) ─> Bell (atomics, unpark)
-//! observer exit observed ─> Departure (atomic, notify) ─> hook task's read deadline
+//! observer exit observed ─> Departure (once-set instant, notify) ─> hook task's read deadline
 //! retirement: R4 ─> R6 (retire_taking_first_stop); Observer::stop (atomics)
 //! ```
 //! The seam lock isn't ranked; nothing takes it under R4, R6 or the output
 //! lock. Under it are the input lock's leaf steps, memory stores to the arm
 //! page, and two kinds of system call on descriptors already held: `poll` of
-//! each pinned pidfd for its exit, and the `dup` of a pidfd E2 is about to
-//! check. No path is opened, read, renamed, unlinked or written under it.
+//! each pidfd it keeps for a helper's exit (a record's pin, a connected
+//! helper's, one a connection that lost bytes left, Q85), and the `dup` of a pidfd E2 is about to check. No path is opened, read, renamed, unlinked or written under it.
 //! Retirement: the pane's successor retires the input (records and scope
 //! dropped, M-FIRST taken in the same section) and stops the observer; the
 //! observer's thread holds it weakly and ends at its next wake, and the arm
@@ -137,7 +143,11 @@ pub const READ_DEADLINE: Duration = Duration::from_millis(100);
 /// How many passes an exited record's drain is rescheduled while its
 /// decision evidence isn't all read (a connection not finished, a marker
 /// read that overflowed or failed) before it gives up to the uncertain
-/// outcome (Q84): about 5 s at [`SCAN_PERIOD`].
+/// outcome (Q84). A count of passes, not a time: a pass waits at most
+/// [`SCAN_PERIOD`] while a liability is published, so 100 passes take about
+/// 5 s when nothing wakes them, but a bell wakes a pass early and slow work
+/// delays one, so the give-up can come sooner or later than that. It is an
+/// availability allowance, not a safety bound: giving up consumes nothing.
 pub const DRAIN_RETRIES: u32 = 100;
 
 /// How long an `Armed` helper may live after its decision was first seen
@@ -361,23 +371,32 @@ pub enum DrainStep {
     Settle,
     /// Reschedule: nothing settles.
     Wait,
-    /// The retries are spent with evidence still unread: the uncertain
+    /// Evidence that will never be read (a connection ended with it unread),
+    /// or the retries spent with evidence still unread: the uncertain
     /// outcome ([`super::record::Records::drained_uncertain`]), never the
     /// clean one.
     GiveUp,
 }
 
-/// The drain's step for an exited record (core §2.4, Q84): `open`, its
+/// The drain's step for an exited record (core §2.4, Q84, Q85): `open`, its
 /// helper's composer connections not finished yet (one finishes at its end,
-/// or once [`READ_DEADLINE`] has passed since its helper's exit was observed
-/// with nothing pending, after its last line was applied); `markers_read`,
-/// whether this pass read the record's markers completely (no overflow, no
-/// error, every one applied within the budget); `retries`, the passes
-/// already rescheduled. No timer settles an open connection: only its
-/// finishing does, or the retries running out to the uncertain outcome.
-pub fn drain_step(open: u32, markers_read: bool, retries: u32) -> DrainStep {
+/// or at its read deadline, [`READ_DEADLINE`] after its helper's exit was
+/// observed, after the lines it read before then were applied);
+/// `markers_read`, whether this pass read the record's markers completely
+/// (no overflow, no error, every one applied within the budget); `unread`,
+/// whether a finished connection ended with bytes it didn't read (a partial
+/// line, bytes still pending at its deadline, a line it refused); `retries`,
+/// the passes already rescheduled. No timer settles an open connection:
+/// only its finishing does, or the retries running out to the uncertain
+/// outcome. Evidence a connection left unread is never read later, so once
+/// nothing else is outstanding the record gives up at once.
+pub fn drain_step(open: u32, markers_read: bool, unread: bool, retries: u32) -> DrainStep {
     if open == 0 && markers_read {
-        DrainStep::Settle
+        if unread {
+            DrainStep::GiveUp
+        } else {
+            DrainStep::Settle
+        }
     } else if retries >= DRAIN_RETRIES {
         DrainStep::GiveUp
     } else {
@@ -387,23 +406,34 @@ pub fn drain_step(open: u32, markers_read: bool, retries: u32) -> DrainStep {
 
 /// A composer connection's view of its helper's exit (core §2.4): the
 /// observer marks it when it observes the exit, and the connection's reader
-/// then reads what is pending for [`READ_DEADLINE`] more. Marking takes no
-/// lock and wakes every waiter.
+/// then reads for [`READ_DEADLINE`] more, in total (Q85): the deadline is
+/// anchored at the first mark, so nothing the peer sends renews it. Marking
+/// takes no lock and wakes every waiter.
 #[derive(Debug, Default)]
 pub struct Departure {
-    gone: AtomicBool,
+    at: OnceLock<Instant>,
     notify: tokio::sync::Notify,
 }
 
 impl Departure {
-    /// The helper's exit was observed.
+    /// The helper's exit was observed. A second mark moves nothing.
     pub fn depart(&self) {
-        self.gone.store(true, Ordering::Release);
+        self.at.get_or_init(Instant::now);
         self.notify.notify_waiters();
     }
 
     pub fn departed(&self) -> bool {
-        self.gone.load(Ordering::Acquire)
+        self.at.get().is_some()
+    }
+
+    /// When the reading ends: [`READ_DEADLINE`] after the first mark.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.at.get().map(|at| *at + READ_DEADLINE)
+    }
+
+    /// Whether the read deadline has passed.
+    pub fn expired(&self) -> bool {
+        self.deadline().is_some_and(|end| Instant::now() >= end)
     }
 
     /// Resolves once [`Departure::depart`] has been called, before or after
@@ -420,12 +450,13 @@ impl Departure {
         }
     }
 
-    /// Resolves [`READ_DEADLINE`] after the exit was observed (as this
-    /// waiter learns it): what the connection says after that is taken as
-    /// nothing.
+    /// Resolves at [`Departure::deadline`]: the same instant for every call,
+    /// however many lines were read since the mark.
     pub async fn read_deadline(&self) {
         self.wait().await;
-        tokio::time::sleep(READ_DEADLINE).await;
+        if let Some(end) = self.deadline() {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(end)).await;
+        }
     }
 }
 
@@ -962,14 +993,14 @@ impl Bell {
 pub type BellSlot = Arc<OnceLock<Arc<Bell>>>;
 
 #[cfg(target_os = "linux")]
-pub use linux::{Connection, Observer, Spawned};
+pub use linux::{Connection, Observer, Spawned, read_line};
 
 #[cfg(target_os = "linux")]
 mod linux {
     use std::collections::HashMap;
     use std::ffi::{OsStr, OsString};
     use std::io::Read;
-    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::sync::{Arc, Mutex, Weak};
@@ -1028,6 +1059,18 @@ mod linux {
         /// Composer connections not finished yet, by the helper on the other
         /// end.
         open: HashMap<RecordKey, Vec<Arc<Departure>>>,
+        /// A pidfd of each helper in `open` (Q85), for its exit when no
+        /// record pins it: its connections' read deadline then runs from
+        /// that exit too, so a helper that never got a record leaves no
+        /// connection open behind it. Removed with its `open` entry.
+        peers: HashMap<RecordKey, OwnedFd>,
+        /// Helpers one of whose connections ended with bytes it didn't read
+        /// (Q85), each with a pidfd of its own for the helper's exit (`None`
+        /// when the dup failed): their drain settles only uncertain. Removed
+        /// when the record drains, or, for a helper with no record, once it
+        /// exited with no connection left open ([`Observer::exits`]), so the
+        /// map holds no more than the live helpers and the records.
+        unread: HashMap<RecordKey, Option<OwnedFd>>,
         /// The last exit facts of records that went: no segment holds them
         /// yet (Q35-20).
         facts: std::collections::VecDeque<ExitFact>,
@@ -1086,9 +1129,9 @@ mod linux {
 
     /// A composer connection: its helper, pinned by the connection's peer
     /// pidfd, and its budget slot. It is open for the drain until it is
-    /// dropped, which its reader does at its end, or once
-    /// [`Connection::read_deadline`] passed with nothing pending, after
-    /// applying what it read.
+    /// dropped, which its reader does at its end, or at
+    /// [`Connection::read_deadline`] ([`read_line`]), after applying the
+    /// lines it read before then. Dropping it gives its slot back.
     pub struct Connection {
         observer: Arc<Observer>,
         helper: Pinned<OwnedFd>,
@@ -1102,24 +1145,112 @@ mod linux {
         }
 
         /// Resolves [`super::READ_DEADLINE`] after the observer observed
-        /// this connection's helper exit: a reader with nothing pending then
-        /// ends the connection, and its silence counts as no decision.
+        /// this connection's helper exit, at the same instant however often
+        /// it is awaited: the reader then ends the connection
+        /// ([`read_line`]).
         pub async fn read_deadline(&self) {
             self.departure.read_deadline().await;
         }
+
+        /// Whether the read deadline has passed.
+        pub fn expired(&self) -> bool {
+            self.departure.expired()
+        }
+
+        /// The reader is ending this connection with bytes it didn't read
+        /// (Q85): a partial line, bytes pending at the read deadline, or a
+        /// line it refused. What they said is unknown, so the helper's
+        /// record drains only uncertain. Recorded unless the record already
+        /// drained (a late connection's loss changes nothing settled) and
+        /// logged either way.
+        pub fn lose(&self) {
+            let key = key_of(&self.helper);
+            let pidfd = self.helper.pidfd().try_clone().ok();
+            let mut inner = self.observer.lock();
+            let settled = inner.seam.input().record(key).is_some_and(|r| r.drained);
+            if !settled {
+                inner.watch.unread.entry(key).or_insert(pidfd);
+            }
+            drop(inner);
+            tracing::warn!(
+                target: "composer_probe",
+                agent_id = %self.observer.agent_id,
+                pid = key.pid,
+                settled,
+                "editor helper's connection ended with bytes unread; its exit settles \
+                 only as uncertain"
+            );
+        }
+    }
+
+    /// The next line on a composer connection (core §2.4, Q85), or `None`
+    /// once it is to end. `line` is the connection's accumulator, kept by the
+    /// caller across calls; `socket` the connection's own descriptor. With no
+    /// connection (`conn` is `None`) it is [`CappedLine::read`]. With one, a
+    /// read races its read deadline and the deadline wins a tie, so a peer
+    /// that keeps sending can't extend it: at the deadline a partial line in
+    /// `line`, or bytes still buffered in `reader` or waiting on `socket`,
+    /// make the connection [`Connection::lose`] them, and `None` tells the
+    /// caller to drop it. A line returned before the deadline is the
+    /// caller's to apply before it drops the connection.
+    ///
+    /// [`CappedLine::read`]: crate::bounded_read::CappedLine::read
+    pub async fn read_line<R>(
+        conn: Option<&Connection>,
+        line: &mut crate::bounded_read::CappedLine,
+        reader: &mut tokio::io::BufReader<R>,
+        socket: BorrowedFd<'_>,
+        max_bytes: usize,
+    ) -> Option<Result<Option<String>, crate::bounded_read::CappedLineError>>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        let Some(conn) = conn else {
+            return Some(line.read(reader, max_bytes).await);
+        };
+        if !conn.expired() {
+            tokio::select! {
+                biased;
+                () = conn.read_deadline() => {}
+                read = line.read(reader, max_bytes) => return Some(read),
+            }
+        }
+        if line.partial() || pending(reader, socket) {
+            conn.lose();
+        }
+        None
+    }
+
+    /// Whether a connection still has bytes to read: buffered by `reader`,
+    /// or waiting on `socket`.
+    fn pending<R: tokio::io::AsyncRead>(
+        reader: &tokio::io::BufReader<R>,
+        socket: BorrowedFd<'_>,
+    ) -> bool {
+        if !reader.buffer().is_empty() {
+            return true;
+        }
+        let mut pending: libc::c_int = 0;
+        // SAFETY: `FIONREAD` writes one `int`; `socket` is a borrowed, open
+        // descriptor.
+        unsafe { libc::ioctl(socket.as_raw_fd(), libc::FIONREAD, &mut pending) == 0 && pending > 0 }
     }
 
     impl Drop for Connection {
         fn drop(&mut self) {
             let key = key_of(&self.helper);
             let mut inner = self.observer.lock();
+            let mut peer = None;
             if let Some(open) = inner.watch.open.get_mut(&key) {
                 open.retain(|d| !Arc::ptr_eq(d, &self.departure));
                 if open.is_empty() {
                     inner.watch.open.remove(&key);
+                    peer = inner.watch.peers.remove(&key);
                 }
             }
             drop(inner);
+            // Closed with no lock held.
+            drop(peer);
             self.observer.bell.ring();
         }
     }
@@ -1463,6 +1594,7 @@ mod linux {
             let slot = Slot::take(&self.connections, &CONNECTIONS)?;
             let key = key_of(&helper);
             let departure = Arc::new(Departure::default());
+            let peer = helper.pidfd().try_clone().ok();
             {
                 let mut inner = self.lock();
                 if inner
@@ -1479,7 +1611,13 @@ mod linux {
                     .entry(key)
                     .or_default()
                     .push(Arc::clone(&departure));
+                if let Some(peer) = peer {
+                    inner.watch.peers.entry(key).or_insert(peer);
+                }
             }
+            // Watched from the next pass on, at the scan's period rather
+            // than the idle sweep's (Q85).
+            self.bell.ring();
             Some(Connection {
                 observer: Arc::clone(self),
                 helper,
@@ -1903,7 +2041,8 @@ mod linux {
         }
 
         /// Exits: a pinned helper whose pidfd reads ready. Its connections
-        /// are told, so each reads what is pending for the read deadline.
+        /// are told, so each reads until its read deadline; so are those of
+        /// a helper with no pin whose own pidfd reads ready (Q85).
         fn exits(&self) {
             let mut inner = self.lock();
             let gone: Vec<RecordKey> = inner
@@ -1923,6 +2062,31 @@ mod linux {
                     }
                 }
             }
+            let Inner { seam, watch } = &mut *inner;
+            for (key, peer) in &watch.peers {
+                if watch.pins.contains_key(key) {
+                    continue;
+                }
+                let departures = watch.open.get(key).into_iter().flatten();
+                let waiting: Vec<&Arc<Departure>> = departures.filter(|d| !d.departed()).collect();
+                if !waiting.is_empty() && exited(peer) {
+                    for departure in waiting {
+                        departure.depart();
+                    }
+                }
+            }
+            // A lost connection's mark outlives nothing it could still
+            // matter to (Q85): a drained record, or a helper with no record
+            // that exited with no connection open, which no exit drain can
+            // reach any more.
+            watch
+                .unread
+                .retain(|key, pidfd| match seam.input().record(*key) {
+                    Some(record) => !record.drained,
+                    None => {
+                        watch.open.contains_key(key) || pidfd.as_ref().is_some_and(|fd| !exited(fd))
+                    }
+                });
         }
 
         /// This pass's read of `key`'s markers for its drain: complete only
@@ -1960,13 +2124,15 @@ mod linux {
         /// Drains (core §2.4, Q84): an exited record settles by its exit only
         /// once every composer connection of its helper finished and this
         /// pass read its markers completely. Otherwise it is rescheduled; a
-        /// record still unread after [`super::DRAIN_RETRIES`] passes gives up
-        /// to the uncertain outcome and keeps its markers and its record. A
+        /// record still unread after [`super::DRAIN_RETRIES`] passes, or one
+        /// a connection ended with bytes unread once its markers are read
+        /// (Q85), gives up to the uncertain outcome and keeps its markers and
+        /// its record. A
         /// settled one's markers are deleted with no lock held, and it is
         /// pruned, its facts kept, once it may go.
         fn drains(&self, budget: &mut u32) {
             let name = self.name();
-            let waiting: Vec<(RecordKey, u32, u32)> = {
+            let waiting: Vec<(RecordKey, u32, bool, u32)> = {
                 let inner = self.lock();
                 inner
                     .watch
@@ -1974,7 +2140,13 @@ mod linux {
                     .iter()
                     .map(|(key, retries)| {
                         let open = inner.watch.open.get(key).map_or(0, Vec::len);
-                        (*key, u32::try_from(open).unwrap_or(u32::MAX), *retries)
+                        let unread = inner.watch.unread.contains_key(key);
+                        (
+                            *key,
+                            u32::try_from(open).unwrap_or(u32::MAX),
+                            unread,
+                            *retries,
+                        )
                     })
                     .collect()
             };
@@ -1984,9 +2156,9 @@ mod linux {
             // The markers again, before any settles by its exit.
             let listing = waiting
                 .iter()
-                .any(|(_, open, _)| *open == 0)
+                .any(|(_, open, _, _)| *open == 0)
                 .then(|| self.reader.markers(&name, MARKER_NAMES_PER_PASS));
-            for (key, open, retries) in waiting {
+            for (key, open, unread, retries) in waiting {
                 let read = match &listing {
                     Some(listing) if open == 0 => self.drain_markers(listing, key, budget),
                     _ => MarkerRead {
@@ -1995,7 +2167,7 @@ mod linux {
                     },
                 };
                 let now = Instant::now();
-                match drain_step(open, read.complete, retries) {
+                match drain_step(open, read.complete, unread, retries) {
                     DrainStep::Wait => {
                         if let Some(retries) = self.lock().watch.exited.get_mut(&key) {
                             *retries += 1;
@@ -2004,6 +2176,7 @@ mod linux {
                     DrainStep::GiveUp => {
                         let mut inner = self.lock();
                         inner.watch.exited.remove(&key);
+                        inner.watch.unread.remove(&key);
                         let _ = inner.seam.drained_uncertain(key, now);
                         drop(inner);
                         tracing::warn!(
@@ -2011,6 +2184,7 @@ mod linux {
                             agent_id = %self.agent_id,
                             pid = key.pid,
                             open,
+                            unread,
                             "editor helper's decision evidence not all read after its exit; \
                              settled as uncertain"
                         );
@@ -2019,6 +2193,7 @@ mod linux {
                         let drained = {
                             let mut inner = self.lock();
                             inner.watch.exited.remove(&key);
+                            inner.watch.unread.remove(&key);
                             inner.seam.drained(key, now)
                         };
                         let Ok(drained) = drained else {

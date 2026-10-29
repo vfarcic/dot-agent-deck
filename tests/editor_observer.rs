@@ -305,27 +305,36 @@ fn probe_070_each_budget_holds_per_generation_and_in_total() {
     assert!(Pool::new(0).used() == 0 && !Pool::new(0).take());
 }
 
-/// Scenario: Ask the drain what to do with an exited helper: with a connection of its not finished, or its markers not read completely, it is rescheduled however long ago the exit was, and only once its retries are spent does it give up to the uncertain outcome; with neither it settles. Then drive a decisionless `Owned` helper through the seam: born after a liability was published, its exit observed, and not drained, it stays open and consumes nothing; drained once, its exit consumes the liability and the page follows; drained again, nothing moves.
+/// Scenario: Ask the drain what to do with an exited helper: with a connection of its not finished, or its markers not read completely, it is rescheduled however long ago the exit was, and only once its retries are spent does it give up to the uncertain outcome; with neither it settles, unless a connection of its ended with bytes it never read, which gives up to the uncertain outcome at once rather than settling. Then drive a decisionless `Owned` helper through the seam: born after a liability was published, its exit observed, and not drained, it stays open and consumes nothing; drained once, its exit consumes the liability and the page follows; drained again, nothing moves.
 #[spec("inbox/probe/070")]
 #[test]
 fn probe_070_the_drain_reschedules_while_evidence_is_undrained() {
-    assert_eq!(drain_step(0, true, 0), DrainStep::Settle);
-    assert_eq!(drain_step(0, true, DRAIN_RETRIES + 5), DrainStep::Settle);
+    assert_eq!(drain_step(0, true, false, 0), DrainStep::Settle);
+    assert_eq!(
+        drain_step(0, true, false, DRAIN_RETRIES + 5),
+        DrainStep::Settle
+    );
+    // Q85: a connection that ended with bytes unread never settles clean;
+    // once nothing else is outstanding it gives up without waiting out the
+    // retries, since what it didn't read is never read later.
+    assert_eq!(drain_step(0, true, true, 0), DrainStep::GiveUp);
     for (open, markers_read) in [(1, true), (2, true), (0, false), (1, false)] {
-        assert_eq!(
-            drain_step(open, markers_read, 0),
-            DrainStep::Wait,
-            "no timer settles: {open} open, markers read {markers_read}"
-        );
-        assert_eq!(
-            drain_step(open, markers_read, DRAIN_RETRIES - 1),
-            DrainStep::Wait
-        );
-        assert_eq!(
-            drain_step(open, markers_read, DRAIN_RETRIES),
-            DrainStep::GiveUp,
-            "never Settle while evidence is unread"
-        );
+        for unread in [false, true] {
+            assert_eq!(
+                drain_step(open, markers_read, unread, 0),
+                DrainStep::Wait,
+                "no timer settles: {open} open, markers read {markers_read}, unread {unread}"
+            );
+            assert_eq!(
+                drain_step(open, markers_read, unread, DRAIN_RETRIES - 1),
+                DrainStep::Wait
+            );
+            assert_eq!(
+                drain_step(open, markers_read, unread, DRAIN_RETRIES),
+                DrainStep::GiveUp,
+                "never Settle while evidence is unread"
+            );
+        }
     }
 
     let mut s = seam(Permission::Armable);
@@ -790,7 +799,7 @@ fn probe_069_the_floor_the_refusal_the_prune_and_the_bell() {
     );
 }
 
-/// Scenario: A connection's departure is marked when its helper's exit is observed: a waiter started before the mark and one started after it both resolve, and the read deadline resolves no sooner than `READ_DEADLINE` after the mark; with no mark, neither resolves.
+/// Scenario: A connection's departure is marked when its helper's exit is observed: a waiter started before the mark and one started after it both resolve, and the read deadline resolves no sooner than `READ_DEADLINE` after the mark; with no mark, neither resolves. The deadline is one instant: marking again doesn't move it, and once it has passed, awaiting it again resolves at once instead of starting a new window.
 #[spec("inbox/probe/070")]
 #[test]
 fn probe_070_a_departure_wakes_its_connection_then_waits_the_read_deadline() {
@@ -800,6 +809,8 @@ fn probe_070_a_departure_wakes_its_connection_then_waits_the_read_deadline() {
         .unwrap();
     rt.block_on(async {
         let quiet = Departure::default();
+        assert_eq!(quiet.deadline(), None);
+        assert!(!quiet.expired());
         assert!(
             tokio::time::timeout(Duration::from_millis(150), quiet.read_deadline())
                 .await
@@ -816,6 +827,9 @@ fn probe_070_a_departure_wakes_its_connection_then_waits_the_read_deadline() {
         assert!(!departure.departed());
         let marked = Instant::now();
         departure.depart();
+        assert!(!departure.expired(), "not before the deadline");
+        let end = departure.deadline().expect("marked");
+        assert!(end >= marked + READ_DEADLINE);
         let within = Duration::from_secs(2);
         tokio::time::timeout(within, early)
             .await
@@ -828,6 +842,24 @@ fn probe_070_a_departure_wakes_its_connection_then_waits_the_read_deadline() {
             .await
             .expect("the read deadline resolves");
         assert!(marked.elapsed() >= READ_DEADLINE);
+        assert!(departure.expired());
+
+        // Anchored (Q85): nothing renews it.
+        departure.depart();
+        assert_eq!(
+            departure.deadline(),
+            Some(end),
+            "a second mark moves nothing"
+        );
+        let again = Instant::now();
+        tokio::time::timeout(within, departure.read_deadline())
+            .await
+            .expect("the read deadline resolves");
+        assert!(
+            again.elapsed() < READ_DEADLINE,
+            "a passed deadline resolves at once: {:?}",
+            again.elapsed()
+        );
     });
 }
 

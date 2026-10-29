@@ -5838,34 +5838,6 @@ enum ReplyWriteError {
     TimedOut,
 }
 
-/// PRD #1666 part 3 (Q84): resolves at a registered composer connection's
-/// read deadline ([`crate::composer_probe::observe::Connection::read_deadline`]),
-/// never for any other connection.
-#[cfg(target_os = "linux")]
-async fn composer_read_deadline(conn: Option<&crate::composer_probe::observe::Connection>) {
-    match conn {
-        Some(conn) => conn.read_deadline().await,
-        None => std::future::pending().await,
-    }
-}
-
-/// PRD #1666 part 3 (Q84): whether a composer connection still has bytes
-/// to read at its read deadline: buffered by `reader`, or waiting on
-/// `socket`, the connection's own descriptor.
-#[cfg(target_os = "linux")]
-fn composer_pending<R: tokio::io::AsyncRead>(
-    reader: &tokio::io::BufReader<R>,
-    socket: std::os::fd::RawFd,
-) -> bool {
-    if !reader.buffer().is_empty() {
-        return true;
-    }
-    let mut pending: libc::c_int = 0;
-    // SAFETY: `FIONREAD` writes one `int`; `socket` is the caller's open
-    // descriptor, alive for this synchronous call.
-    unsafe { libc::ioctl(socket, libc::FIONREAD, &mut pending) == 0 && pending > 0 }
-}
-
 /// [`run_hook_loop`] with every bound supplied — the seam the PRD #1631 hold
 /// tests use to reach the connection cap, the hold budget and the hold
 /// deadline without spending their production values.
@@ -5963,6 +5935,7 @@ async fn run_hook_loop_with_limits(
                         None;
                     let (read_half, mut write_half) = tokio::io::split(stream);
                     let mut reader = tokio::io::BufReader::new(read_half);
+                    let mut line_buf = crate::bounded_read::CappedLine::default();
 
                     // Issue #903 (duplicate #319): this used to be
                     // `reader.lines()` driven by `next_line()`, which grows its
@@ -5982,32 +5955,49 @@ async fn run_hook_loop_with_limits(
                         // the daemon is the one working: `dispatch`'s worktree
                         // creation and `delegate`'s `clear = true` respawn both
                         // run in the arms below, outside this call.
-                        let read = crate::bounded_read::read_capped_line(
+                        // PRD #1666 part 3 (Q84, Q85): a registered composer
+                        // connection whose helper's exit the observer saw
+                        // reads until its read deadline, one instant for the
+                        // whole connection, and ends there; what it hadn't
+                        // read by then makes its record's drain uncertain.
+                        // `line_buf` keeps a partial line across the race.
+                        #[cfg(target_os = "linux")]
+                        let read = crate::composer_probe::observe::read_line(
+                            composer_conn.as_ref(),
+                            &mut line_buf,
                             &mut reader,
+                            // SAFETY: the connection's own descriptor, owned
+                            // by the halves alive in this task for the whole
+                            // read.
+                            unsafe { std::os::fd::BorrowedFd::borrow_raw(composer_socket) },
                             crate::bounded_read::MAX_HOOK_LINE_BYTES,
                         );
-                        // PRD #1666 part 3 (Q84): a registered composer
-                        // connection whose helper's exit the observer saw
-                        // reads on until its read deadline, then ends with
-                        // nothing pending, so the drain waits for it and
-                        // never for a timer alone (core §2.4).
-                        #[cfg(target_os = "linux")]
-                        let composer_deadline = composer_read_deadline(composer_conn.as_ref());
                         #[cfg(not(target_os = "linux"))]
-                        let composer_deadline = std::future::pending::<()>();
-                        let read = tokio::select! {
-                            biased;
-                            read = tokio::time::timeout(idle_timeout, read) => Some(read),
-                            () = composer_deadline => None,
+                        let read = async {
+                            Some(
+                                line_buf
+                                    .read(&mut reader, crate::bounded_read::MAX_HOOK_LINE_BYTES)
+                                    .await,
+                            )
                         };
-                        let Some(read) = read else {
-                            #[cfg(target_os = "linux")]
-                            if composer_pending(&reader, composer_socket) {
-                                continue;
-                            }
-                            break;
+                        let line = match tokio::time::timeout(idle_timeout, read)
+                            .await
+                            .map(|read| read.ok_or(()))
+                        {
+                            // The read deadline: the connection ends.
+                            Ok(Err(())) => break,
+                            Ok(Ok(read)) => Ok(read),
+                            Err(elapsed) => Err(elapsed),
                         };
-                        let line = match read
+                        // A composer connection ending mid-line or on a line
+                        // it refused leaves its record's evidence unread.
+                        #[cfg(target_os = "linux")]
+                        if let Some(conn) = composer_conn.as_ref()
+                            && (line_buf.partial() || matches!(line, Ok(Err(_))))
+                        {
+                            conn.lose();
+                        }
+                        let line = match line
                         {
                             Err(_elapsed) => {
                                 warn!(
@@ -7391,33 +7381,51 @@ async fn run_hook_loop_with_limits(
                                         // slot instead, and reads one bounded
                                         // line, or the end.
                                         // It reads until its helper's exit
-                                        // plus the read deadline, and then
-                                        // only what is still pending (Q84).
+                                        // plus the read deadline (Q84, Q85);
+                                        // what it hadn't read by then, or a
+                                        // report it refused or couldn't
+                                        // parse, makes the drain uncertain.
                                         if editor_bearing {
                                             permit.take();
-                                            let line = loop {
-                                                tokio::select! {
-                                                    biased;
-                                                    read = crate::bounded_read::read_capped_line(
-                                                        &mut reader,
-                                                        crate::composer_probe::observe::REPORT_BYTES,
-                                                    ) => break read.ok().flatten(),
-                                                    () = conn.read_deadline() => {
-                                                        if !composer_pending(&reader, composer_socket) {
-                                                            break None;
-                                                        }
-                                                    }
+                                            let line = match crate::composer_probe::observe::read_line(
+                                                Some(&conn),
+                                                &mut line_buf,
+                                                &mut reader,
+                                                // SAFETY: the connection's own
+                                                // descriptor, owned by the
+                                                // halves alive in this task for
+                                                // the whole read.
+                                                unsafe {
+                                                    std::os::fd::BorrowedFd::borrow_raw(
+                                                        composer_socket,
+                                                    )
+                                                },
+                                                crate::composer_probe::observe::REPORT_BYTES,
+                                            )
+                                            .await
+                                            {
+                                                Some(Ok(line)) => line,
+                                                Some(Err(_)) => {
+                                                    conn.lose();
+                                                    None
                                                 }
+                                                None => None,
                                             };
-                                            if let Some(line) = line
-                                                && let Ok(report) = serde_json::from_str::<
+                                            if let Some(line) = line {
+                                                match serde_json::from_str::<
                                                     crate::event::EditorReport,
                                                 >(line.trim())
-                                            {
-                                                let _ = tokio::task::spawn_blocking(move || {
-                                                    conn.observer().report(&conn, report);
-                                                })
-                                                .await;
+                                                {
+                                                    Ok(report) => {
+                                                        let _ = tokio::task::spawn_blocking(
+                                                            move || {
+                                                                conn.observer().report(&conn, report);
+                                                            },
+                                                        )
+                                                        .await;
+                                                    }
+                                                    Err(_) => conn.lose(),
+                                                }
                                             }
                                         }
                                         break;
@@ -21189,3 +21197,8 @@ mod composer_invocation_tests {
 #[cfg(all(test, unix))]
 #[path = "daemon_hook_reply_deadline_tests.rs"]
 mod hook_reply_deadline_tests;
+
+// Linux-only: the composer probe's observer and `SO_PEERPIDFD` are.
+#[cfg(all(test, target_os = "linux"))]
+#[path = "daemon_composer_reader_tests.rs"]
+mod composer_reader_tests;

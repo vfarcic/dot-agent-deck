@@ -15,7 +15,7 @@ use std::ffi::OsString;
 use std::fs::{File, Permissions};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, OnceLock};
@@ -28,7 +28,7 @@ use dot_agent_deck::composer_probe::instance::{
     DaemonId, Instance, InstanceReader, open_root, splittable,
 };
 use dot_agent_deck::composer_probe::observe::{
-    Bell, ControlOp, DRAIN_RETRIES, E2_AFTER, Observer, SCAN_PERIOD, Spawned,
+    Bell, ControlOp, ControlRefusal, DRAIN_RETRIES, E2_AFTER, Observer, SCAN_PERIOD, Spawned,
 };
 use dot_agent_deck::composer_probe::record::{Decision, NotConsumed, RecordKey, Settlement};
 use dot_agent_deck::doorbell_activation::{
@@ -151,6 +151,17 @@ impl Harness {
     /// `agent` gives the launch from the helper copy's path: `A`'s argv,
     /// executed by the test as the deck executes a direct command, or none.
     fn start(agent: impl FnOnce(&Path) -> Option<Vec<OsString>>) -> Harness {
+        Harness::start_on(None, None, agent)
+    }
+
+    /// [`Harness::start`] with `path` as the agent's `PATH` (Q85), and `A`
+    /// executed as `execvp` executes its program word from the directory
+    /// `run_from`: the file of that name there, the word as `argv[0]`.
+    fn start_on(
+        path: Option<&Path>,
+        run_from: Option<&Path>,
+        agent: impl FnOnce(&Path) -> Option<Vec<OsString>>,
+    ) -> Harness {
         let dir = tempdir();
         let daemon = DaemonId {
             pid: std::process::id(),
@@ -174,7 +185,12 @@ impl Harness {
         let mut started = Vec::new();
         let agent = agent(instance.helper());
         let child = agent.as_ref().map(|launch| {
-            let a = Command::new(&launch[0])
+            let program = match run_from {
+                Some(dir) => dir.join(&launch[0]),
+                None => PathBuf::from(&launch[0]),
+            };
+            let a = Command::new(program)
+                .arg0(&launch[0])
                 .args(&launch[1..])
                 .stdin(Stdio::null())
                 .spawn()
@@ -194,7 +210,9 @@ impl Harness {
             Spawned {
                 agent_id: G.to_string(),
                 agent: Some(AgentType::ClaudeCode),
-                env: vec![],
+                env: path
+                    .map(|dir| vec![("PATH".to_string(), dir.to_str().unwrap().to_string())])
+                    .unwrap_or_default(),
                 child,
                 input: Arc::new(GenerationInput::default()),
                 latch: Box::new(|_| LatchedRelease::Known(release())),
@@ -320,7 +338,7 @@ fn probe_072_e2_signals_only_a_helper_the_daemon_attested() {
     drop((armed_conn, editor_conn));
 }
 
-/// Scenario: A helper's `Unarmed` invocation is recorded and its connection closed, then `inv/G/` is filled past what a pass reads and the helper killed: its exit is observed but the record isn't drained while the read overflows, however long it waits; once the extra names go it drains and is pruned. The same with `inv/G/` moved away (a failed read) instead: not drained until it is back.
+/// Scenario: A helper's `Unarmed` invocation is recorded and its connection closed, then `inv/G/` is filled past what a pass reads and the helper killed: its exit is observed but the record isn't drained while the read overflows, for as long as this test waits, which is well within the drain's retries; once the extra names go it drains in the ordinary way and is pruned. The same with `inv/G/` moved away (a failed read) instead: not drained until it is back.
 #[spec("inbox/probe/072")]
 #[test]
 fn probe_072_an_overflowed_or_failed_marker_read_is_no_drain() {
@@ -421,7 +439,7 @@ fn probe_072_a_drain_still_unread_after_its_retries_is_given_up_and_kept() {
     );
 }
 
-/// Scenario: Launch `A` as the deck launches a direct Claude, with two helper copies as its children, and race four control publications against the observer's own settlement: the permission settles `Armable` once, `A` stays bound and `gen-G` names it. The scan records both helpers; each gets a registered connection and is killed. The connection carrying a decision still in flight keeps the drain waiting past the read deadline until that `Unarmed` decision is applied and the connection closes, so the exit settles `NotConsumed(Unarmed)`; the control connection, with nothing in flight, closes at its deadline and its helper's exit settles with no decision.
+/// Scenario: Launch `A` as the deck launches a direct Claude, with two helper copies as its children, and start four control publications alongside the observer's own settlement (not forced to overlap it): the permission settles `Armable` once, `A` stays bound and `gen-G` names it. The scan records both helpers; each gets a registered connection and is killed. The connection carrying a decision still in flight keeps the drain waiting past the read deadline until that `Unarmed` decision is applied and the connection closes, so the exit settles `NotConsumed(Unarmed)`; the control connection, with nothing in flight, closes at its deadline and its helper's exit settles with no decision.
 #[spec("inbox/probe/072")]
 #[test]
 fn probe_072_a_decision_in_flight_at_the_exit_is_applied_before_the_drain() {
@@ -544,4 +562,68 @@ fn probe_072_a_decision_in_flight_at_the_exit_is_applied_before_the_drain() {
         fact.settlement,
         Settlement::NotConsumed(NotConsumed::Unarmed)
     );
+}
+
+/// A native install's layout (Q85): two versioned executables, and `claude`
+/// on the agent's `PATH` a symlink to version `named`. `A` is launched as the
+/// deck launches a direct `claude`, blocked reading a FIFO, and the file it
+/// runs is version `runs`: from that `PATH` when the two are the same, and
+/// from another directory's `claude` symlink when they aren't.
+fn native_install(named: &str, runs: &str) -> (tempfile::TempDir, Harness) {
+    let bin = tempdir();
+    let versions = bin.path().join("versions");
+    std::fs::create_dir(&versions).unwrap();
+    for version in ["2.1.309", "2.1.310"] {
+        let exe = versions.join(version);
+        std::fs::copy("/bin/sh", &exe).unwrap();
+        std::fs::set_permissions(&exe, Permissions::from_mode(0o700)).unwrap();
+    }
+    let path = bin.path().join("path");
+    std::fs::create_dir(&path).unwrap();
+    std::os::unix::fs::symlink(versions.join(named), path.join("claude")).unwrap();
+    let run_from = if runs == named {
+        path.clone()
+    } else {
+        let other = bin.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        std::os::unix::fs::symlink(versions.join(runs), other.join("claude")).unwrap();
+        other
+    };
+    let fifo = bin.path().join("fifo");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    let h = Harness::start_on(Some(&path), Some(&run_from), |_| {
+        Some(vec![
+            "claude".into(),
+            "-c".into(),
+            "read x < \"$0\"".into(),
+            fifo.clone().into(),
+        ])
+    });
+    (bin, h)
+}
+
+/// Scenario: Lay Claude out as its native installer does, `claude` on the agent's `PATH` a symlink to a versioned executable, and launch it by that name as the deck launches a direct Claude: `A` binds to the launched process, so a control publication succeeds. The control: the symlink on `PATH` names another version than the one the launched process runs, and nothing binds, so the publication is refused and no `A` is bound.
+#[spec("inbox/probe/072")]
+#[test]
+fn probe_072_a_native_install_binds_through_its_path_symlink() {
+    let (_bin, h) = native_install("2.1.310", "2.1.310");
+    assert_eq!(h.observer.control(G, ControlOp::Publish), Ok(1));
+    assert_eq!(h.observer.permission(), Permission::Armable);
+    let bound = h
+        .observer
+        .bound_agent()
+        .expect("A binds through the symlink");
+    assert_eq!(bound.pid, h.started[0].id());
+
+    let (_bin, h) = native_install("2.1.309", "2.1.310");
+    assert!(
+        matches!(
+            h.observer.control(G, ControlOp::Publish),
+            Err(ControlRefusal::Permission(_))
+        ),
+        "nothing published while no A is bound"
+    );
+    assert!(h.observer.bound_agent().is_none());
 }

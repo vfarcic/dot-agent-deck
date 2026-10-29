@@ -12838,6 +12838,23 @@ impl AgentPtyRegistry {
         }
     }
 
+    /// Test seam for PRD #1666 part 3 (Q85): `observer` as agent `id`'s
+    /// generation's, as [`Self::start_composer_observer`] keeps one, for a
+    /// hook loop test that builds the observer over an instance of its own.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn set_composer_observer_for_test(
+        &self,
+        id: &str,
+        observer: Arc<crate::composer_probe::observe::Observer>,
+    ) {
+        self.inner
+            .lock()
+            .agents
+            .get_mut(id)
+            .expect("a spawned agent")
+            .composer = Some(observer);
+    }
+
     /// PRD #1666 part 3 (Q35-14b): an installed generation's observer, by
     /// its agent id.
     #[cfg(target_os = "linux")]
