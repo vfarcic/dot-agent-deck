@@ -157,12 +157,20 @@ impl Window {
         rss: Option<u64>,
         dropped: u64,
     ) -> SpanRecord {
-        let next = Window::seeded(now, self.rng.next());
-        let window = std::mem::replace(self, next);
-        window.span(now, runs_open, rss, dropped)
+        self.cut(now).span(now, runs_open, rss, dropped)
     }
 
-    fn span(self, now: u64, runs_open: usize, rss: Option<u64>, dropped: u64) -> SpanRecord {
+    /// End this interval at `now` and start the next one, giving the ended
+    /// one, whose span [`Self::span`] makes once the measures taken at its
+    /// end are in. What is recorded after the cut goes to the next interval,
+    /// however long those measures take.
+    pub fn cut(&mut self, now: u64) -> Window {
+        let next = Window::seeded(now, self.rng.next());
+        std::mem::replace(self, next)
+    }
+
+    /// This ended interval's span, ending at `now`.
+    pub fn span(self, now: u64, runs_open: usize, rss: Option<u64>, dropped: u64) -> SpanRecord {
         let mut attributes = Vec::with_capacity(11);
         if let Some(rss) = rss {
             attributes.push(Attribute::int(AttrKey::DaemonMemoryRss, int(rss)));
@@ -450,6 +458,27 @@ mod tests {
             Some(&AttrValue::Int(0))
         );
         assert_eq!(attr(&next, AttrKey::AttachLatencyMax), None);
+    }
+
+    /// Qodo review on PR #2020: an attach that finishes while the ended
+    /// interval's memory is being read belongs to the next interval, not to
+    /// a span that ends before it.
+    #[test]
+    fn an_attach_after_the_cut_counts_in_the_next_interval() {
+        let mut window = Window::new(0);
+        let ended = window.cut(1_000);
+        window.record_attach(Duration::from_millis(5));
+        let span = ended.span(1_000, 0, Some(1), 0);
+        assert_eq!(
+            attr(&span, AttrKey::AttachLatencyCount),
+            Some(&AttrValue::Int(0))
+        );
+        let next = window.close(2_000, 0, None, 0);
+        assert_eq!(next.start_unix_nanos, 1_000);
+        assert_eq!(
+            attr(&next, AttrKey::AttachLatencyCount),
+            Some(&AttrValue::Int(1))
+        );
     }
 
     #[test]
