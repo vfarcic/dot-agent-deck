@@ -83,7 +83,7 @@ use super::input::{InputFilter, InterventionKind, LONE_ESCAPE_WINDOW, PASTE_IDLE
 use super::launch::LAUNCH_ENV_KEYS;
 use super::propagation::{RunIdentity, agent_env};
 use super::resource::{ResourceAttribute, deck_resource, host_name};
-use super::run_context::{ProbeSettings, Probes};
+use super::run_context::{BranchReads, ProbeSettings, Probes};
 use super::span::{SpanRecord, new_run_id};
 use super::tracker::{EndReason, FinishingRun, RunGeneration, RunStart, RunTracker};
 use super::{Protocol, now_unix_nanos, otlp};
@@ -768,6 +768,8 @@ struct Exporting {
     shared: Arc<Shared>,
     commands: mpsc::UnboundedSender<Command>,
     probes: Probes,
+    /// Issue #1981 M6: the branch reads spawns wait for.
+    branch_reads: BranchReads,
     ingest: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// When the daemon began a teardown a stop client is timing — see
     /// [`Telemetry::teardown_began`].
@@ -1128,7 +1130,7 @@ impl Telemetry {
             let branch = prepared
                 .cwd
                 .as_deref()
-                .and_then(super::run_context::branch_at);
+                .and_then(|cwd| exporting.branch_reads.read(cwd));
             exporting.shared.with_tracker(|t| {
                 t.prepare_run_in(start, now_unix_nanos(), prepared.cwd.as_deref());
                 t.set_usage_dirs(&run_id, usage_dirs);
@@ -1982,6 +1984,7 @@ fn start_exporting(
         shared,
         commands,
         probes: Probes::new(settings.probes),
+        branch_reads: BranchReads::default(),
         ingest: Mutex::new(Some(ingest)),
         teardown_began: OnceLock::new(),
     })

@@ -34,7 +34,11 @@
 //! the branch the run started on even when the agent switches branches at
 //! once. That read runs no program and reads at most a `.git` file and a
 //! `HEAD` file per run, each only when it is a regular file, opened without
-//! waiting and read up to [`MAX_PROBE_OUTPUT`].
+//! waiting and read up to [`MAX_PROBE_OUTPUT`]. It runs on a thread of its
+//! own that the spawn waits for at most [`BRANCH_READ_DEADLINE`], with at
+//! most [`MAX_BRANCH_READS`] such threads alive at once
+//! ([`BranchReads::read`]), so a file system that stops answering costs a
+//! run its branch, not its start.
 //!
 //! **And they are bounded.** Each probe has a deadline after which its process
 //! is killed and reaped, its captured output is capped, at most
@@ -217,6 +221,66 @@ impl Probes {
         let mut tasks = self.tasks.lock().unwrap_or_else(|p| p.into_inner());
         while tasks.try_join_next().is_some() {}
         tasks.len()
+    }
+}
+
+/// How long an agent's spawn waits for its branch ([`BranchReads::read`]).
+pub const BRANCH_READ_DEADLINE: Duration = Duration::from_millis(250);
+
+/// Branch reads alive at once, at most, the ones a stalled file system holds
+/// past their deadline included.
+pub const MAX_BRANCH_READS: usize = 4;
+
+/// The branch reads in flight, bounded by [`MAX_BRANCH_READS`].
+#[derive(Debug, Default)]
+pub struct BranchReads {
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl BranchReads {
+    /// [`branch_at`] for `cwd`, waited for at most [`BRANCH_READ_DEADLINE`].
+    pub fn read(&self, cwd: &Path) -> Option<String> {
+        let cwd = cwd.to_path_buf();
+        self.read_with(BRANCH_READ_DEADLINE, move || branch_at(&cwd))
+    }
+
+    /// `read` on a thread of its own, waited for at most `deadline`. `None`
+    /// when it is late, when [`MAX_BRANCH_READS`] are alive already, or when
+    /// no thread can be started. A late read finishes on its own thread, and
+    /// counts against the limit until it does.
+    pub fn read_with(
+        &self,
+        deadline: Duration,
+        read: impl FnOnce() -> Option<String> + Send + 'static,
+    ) -> Option<String> {
+        use std::sync::atomic::Ordering;
+        if self.in_flight.fetch_add(1, Ordering::SeqCst) >= MAX_BRANCH_READS {
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        /// Gives the read's place back however its thread ends.
+        struct Slot(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Slot {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let slot = Slot(Arc::clone(&self.in_flight));
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("deck-branch-read".into())
+            .spawn(move || {
+                let _slot = slot;
+                let _ = tx.send(read());
+            })
+            .ok()?;
+        rx.recv_timeout(deadline).ok().flatten()
+    }
+
+    /// Reads alive now.
+    #[cfg(test)]
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -659,6 +723,48 @@ mod tests {
         assert_eq!(branch_from_head(&"a".repeat(40)), None, "detached");
         assert_eq!(branch_from_head("ref: refs/heads/\n"), None);
         assert_eq!(branch_from_head("ref: refs/heads/a\rb\n"), None);
+    }
+
+    /// Qodo review on PR #2018: a read that does not come back in time costs
+    /// the run its branch, not its start, and stalled reads are bounded.
+    #[test]
+    fn a_stalled_branch_read_gives_up_at_its_deadline_and_is_bounded() {
+        let reads = BranchReads::default();
+        let (release, stalled) = std::sync::mpsc::channel::<()>();
+        let stalled = Arc::new(Mutex::new(stalled));
+        let started = std::time::Instant::now();
+        for _ in 0..MAX_BRANCH_READS {
+            let stalled = Arc::clone(&stalled);
+            let got = reads.read_with(Duration::from_millis(50), move || {
+                let _ = stalled.lock().unwrap().recv();
+                Some("late".into())
+            });
+            assert_eq!(got, None);
+        }
+        assert_eq!(reads.in_flight(), MAX_BRANCH_READS);
+        // At the limit nothing more starts, and nothing waits.
+        let at_limit = std::time::Instant::now();
+        assert_eq!(
+            reads.read_with(Duration::from_secs(5), || panic!(
+                "not started at the limit"
+            )),
+            None
+        );
+        assert!(at_limit.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        // Once the stalled reads finish, their places come back.
+        drop(release);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while reads.in_flight() > 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(reads.in_flight(), 0);
+        assert_eq!(
+            reads
+                .read_with(Duration::from_secs(5), || Some("agent/x".into()))
+                .as_deref(),
+            Some("agent/x")
+        );
     }
 
     /// A `HEAD` that is a FIFO, which a hostile repository could plant, is
