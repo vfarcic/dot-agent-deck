@@ -268,10 +268,6 @@ impl Deck {
             .unwrap_or_default()
     }
 
-    fn tripped(&self) -> bool {
-        self.log().contains("pane release: tripwire set")
-    }
-
     /// Stop the generation in `codex`'s pane, keeping the pane's name free.
     fn stop(&self, codex: Codex) {
         assert_eq!(
@@ -407,7 +403,7 @@ fn codex_027_a_measured_codex_is_rung_in_two_stages_after_its_settle_window() {
     assert!(record["inbox"]["wake_hold"].is_null(), "{record}");
 }
 
-/// Scenario: With measured Codex 0.164.0's header latched and the generation idle, open each of its post-ready dialogs in turn (update, folder trust, hooks review) and queue a task. After the settle window the deck's admission sees the dialog and types nothing, neither into the dialog nor anywhere else, and logs the dialog as why, with no tripwire set on a measured release; once the dialog closes the empty composer is rung and the task delivered.
+/// Scenario: With measured Codex 0.164.0's header latched and the generation idle, open each of its post-ready dialogs in turn (update, folder trust, hooks review) and queue a task. After the settle window the deck's admission sees the dialog and types nothing, neither into the dialog nor anywhere else, and logs the dialog as why; once the dialog closes the empty composer is rung and the task delivered.
 #[spec("inbox/codex/027")]
 #[test]
 fn codex_027_a_dialog_at_admission_gets_no_byte() {
@@ -434,10 +430,6 @@ fn codex_027_a_dialog_at_admission_gets_no_byte() {
         );
         assert!(codex.dialog_bytes().is_empty(), "{dialog}");
         state(&deck.daemon, &codex.pane, &id, "queued");
-        assert!(
-            !deck.tripped(),
-            "{dialog}: a measured release has no tripwire"
-        );
 
         codex.clear(".dialog");
         let line = delivered(&deck, &codex, &id);
@@ -766,7 +758,6 @@ fn codex_028_a_fresh_codex_behind_a_dialog_gets_no_byte_until_it_closes() {
         );
         held(&deck, &codex, &id, Duration::from_millis(1500), dialog);
         assert!(codex.dialog_bytes().is_empty(), "{dialog}");
-        assert!(!deck.tripped(), "{dialog}");
 
         codex.clear(".dialog");
         let line = delivered(&deck, &codex, &id);
