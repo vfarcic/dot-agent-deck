@@ -168,7 +168,7 @@ fn probe_023_detach_reattach_and_resize_preserve_held_input() {
     f.expect_stable_input(b"before-detach|after-reattach|");
 }
 
-/// Scenario: Retire a fenced recorder with a full paste held and another frame waiting for capacity, then replace it in the same pane. Both old connections must finish or receive an honest refusal, no held or waiting byte may reach either terminal, and the replacement must accept its own fresh input.
+/// Scenario: Exit a fenced recorder with a full paste held and another frame waiting for capacity, then replace it in the same pane to retire its generation. Both old connections must finish or receive an honest refusal, no held or waiting byte may reach either terminal, and the replacement must accept its own fresh input.
 #[spec("inbox/probe/023")]
 #[test]
 fn probe_023_retirement_discards_held_and_full_waiting_bytes() {
@@ -182,9 +182,10 @@ fn probe_023_retirement_discards_held_and_full_waiting_bytes() {
     f.wait_held(1, 1);
     f.expect_stable_input(b"");
     f.command("exit");
+    f.wait_exit();
+    f.replace();
     held.wait_end();
     waiting.wait_end();
-    f.replace();
     let refused = f.old_release();
     assert_ne!(refused["ok"], true, "old generation release: {refused}");
     let mut successor = f.connect();
