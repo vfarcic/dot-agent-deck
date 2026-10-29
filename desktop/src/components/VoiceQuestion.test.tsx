@@ -8,7 +8,7 @@
  */
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fixtureDesktopFeatures, mapDesktopSnapshot, type DesktopSnapshotDto, type VoiceResultDto, type VoiceStatusDto, type VoiceTranscriptionDto } from "../lib/bridge";
+import { TauriDeckBridge, fixtureDesktopFeatures, mapDesktopSnapshot, type DesktopSnapshotDto, type VoiceResultDto, type VoiceStatusDto, type VoiceTranscriptionDto } from "../lib/bridge";
 import words from "../../../tests/fixtures/inbox-display.json";
 import type { DeckRuntimeState } from "../types";
 import {
@@ -27,6 +27,9 @@ import {
   type VoiceQuestionTarget,
 } from "../lib/voiceQuestion";
 import { VOICE_DICTATION_SEND_MS, VOICE_JOIN_WINDOW_MS, VOICE_STATUS_POLL_MS, VoiceControlPanel, newAnswerLease, type VoicePane } from "./VoiceControlPanel";
+
+const { tauriInvoke } = vi.hoisted(() => ({ tauriInvoke: vi.fn() }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: tauriInvoke }));
 
 function microphone() {
   const queue: string[] = [];
@@ -170,20 +173,31 @@ describe("answering an agent's question by voice", () => {
     expect(screen.queryByText(SENT.sentence)).toBeNull();
   });
 
-  /// Scenario: inbox/probe/018 — the answer request times out, then a snapshot carries a settlement for this panel's own token, question and revision. The visible report changes to that outcome; partial or failed writes never read as a successful answer.
+  /// Scenario: question/answer/024 extends inbox/probe/018 through the real TypeScript Tauri bridge: the answer is queued, its command returns unconfirmed at 15 seconds, then a snapshot carries this panel's own settlement. The visible report changes to each physical outcome; partial or failed writes never read as a successful answer.
   it.each([
     ["written", /Allowed: touch x/], ["partial", /part|some/i],
     ["superseded", /newer|changed|moved|superseded/i], ["retired", /ended|restart|retired|gone/i],
     ["write_failed", /fail|could not|couldn't|not.*written/i],
-  ] as const)("inbox/probe/018: own-token %s settlement updates an unconfirmed answer", async (outcome, expected) => {
+  ] as const)("question/answer/024: own-token %s settlement updates an unconfirmed answer through the bridge", async (outcome, expected) => {
     const voice = microphone();
     const { rt, sendVoiceAnswer } = runtime(voice, () => UNCONFIRMED);
+    const bridge = new TauriDeckBridge();
+    tauriInvoke.mockReset();
+    tauriInvoke.mockImplementationOnce(() => new Promise((resolve) => { window.setTimeout(() => resolve(UNCONFIRMED), 15_000); }));
+    sendVoiceAnswer.mockImplementation((target, form, confirmed, lease) => bridge.sendVoiceAnswer(target, form, confirmed, lease));
     const view = render(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={composerPane()} selectedDeckId="local" />);
     await turnOnVoice();
     await speak(voice, "yes");
     await waitOut(VOICE_DICTATION_SEND_MS);
+    const queued = composerPane({ inputHeld: { generation: 9, cause: "checking", heldOps: 1, heldBytes: 1, sinceMs: 1 } }, true);
+    view.rerender(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={queued} selectedDeckId="local" />);
+    await flush();
+    expect(screen.getByTestId("voice-question")).toHaveTextContent(words.queued);
+    expect(screen.queryByText(SENT.sentence)).toBeNull();
+    await waitOut(15_000);
     expect(screen.getByTestId("voice-report")).toHaveTextContent(UNCONFIRMED.sentence);
     const token = Number(sendVoiceAnswer.mock.calls[0][3]);
+    expect(tauriInvoke).toHaveBeenCalledWith("desktop_voice_answer_question", expect.objectContaining({ lease: String(token), questionId: "q-1", revision: 7 }));
     const settled = composerPane({ answerSettlements: [{ questionId: "q-1", revision: 7, clientToken: token, outcome }] });
     view.rerender(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={settled} selectedDeckId="local" />);
     await flush();
@@ -192,8 +206,8 @@ describe("answering an agent's question by voice", () => {
     if (outcome !== "written") expect(screen.getByTestId("voice-report")).not.toHaveTextContent(SENT.sentence);
   });
 
-  /// Scenario: inbox/probe/018 — after a timeout, snapshots clear the queued flag or question, carry a different token, question or revision, replace the agent generation, or report an unknown outcome. Without a matching known settlement the panel keeps its unconfirmed warning.
-  it.each(["no_settlement", "question_gone", "other_token", "other_question", "other_revision", "other_generation", "unknown_outcome"])
+  /// Scenario: inbox/probe/018 and question/answer/024 — after a timeout, snapshots clear the queued flag or question, carry a different token, question or revision, replace the agent generation, or report an unknown outcome. A coalesced snapshot that missed the entry, eight retained entries that evicted it, and an older daemon omitting settlement fields keep the unconfirmed warning too.
+  it.each(["no_settlement", "question_gone", "other_token", "other_question", "other_revision", "other_generation", "unknown_outcome", "coalesced", "evicted", "older_daemon"])
   ("inbox/probe/018: %s never confirms a timed-out answer", async (control) => {
     const voice = microphone();
     const { rt, sendVoiceAnswer } = runtime(voice, () => UNCONFIRMED);
@@ -209,12 +223,48 @@ describe("answering an agent's question by voice", () => {
       outcome: control === "unknown_outcome" ? "future_outcome" : "written",
     }];
     const next = composerPane({ answerSettlements: ["no_settlement", "question_gone"].includes(control) ? [] : settlements });
+    if (control === "coalesced") next.answerSettlements = [];
+    if (control === "evicted") next.answerSettlements = Array.from({ length: 8 }, (_, i) => ({ questionId: "q-1", revision: 7, clientToken: token + i + 1, outcome: "written" }));
+    if (control === "older_daemon") {
+      delete next.answerSettlements;
+      if (next.question) delete next.question.answerQueued;
+    }
     if (control === "question_gone") next.question = undefined;
     if (control === "other_generation") next.spawnedAtMs = 2;
     view.rerender(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={next} selectedDeckId="local" />);
     await flush();
     expect(screen.getByTestId("voice-report")).toHaveTextContent(UNCONFIRMED.sentence);
     expect(screen.getByTestId("voice-report")).not.toHaveTextContent(SENT.sentence);
+  });
+
+  /// Scenario: question/answer/024 — one answer times out, a second answer settles as a partial write, then a snapshot finally carries the older acceptance's successful settlement. The row keeps the newer partial-write warning, including after the question disappears and the old entry is evicted.
+  it("question/answer/024: an older acceptance cannot overwrite the newer outcome", async () => {
+    const voice = microphone();
+    const { rt, sendVoiceAnswer } = runtime(voice, () => UNCONFIRMED);
+    const view = render(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={composerPane()} selectedDeckId="local" />);
+    await turnOnVoice();
+    await speak(voice, "yes");
+    await waitOut(VOICE_DICTATION_SEND_MS);
+    const oldToken = Number(sendVoiceAnswer.mock.calls[0][3]);
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(UNCONFIRMED.sentence);
+    await speak(voice, "yes");
+    await waitOut(VOICE_DICTATION_SEND_MS);
+    expect(sendVoiceAnswer).toHaveBeenCalledTimes(2);
+    const token = Number(sendVoiceAnswer.mock.calls[1][3]);
+    expect(token).not.toBe(oldToken);
+    const partial = composerPane({ answerSettlements: [{ questionId: "q-1", revision: 7, clientToken: token, outcome: "partial" }] });
+    view.rerender(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={partial} selectedDeckId="local" />);
+    await flush();
+    const warning = screen.getByTestId("voice-report").textContent;
+    expect(warning).toMatch(/Only part of the answer/);
+    const older = composerPane({ answerSettlements: [{ questionId: "q-1", revision: 7, clientToken: oldToken, outcome: "written" }] });
+    older.question = undefined;
+    for (const pane of [older, composerPane({ answerSettlements: [] })]) {
+      view.rerender(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={pane} selectedDeckId="local" />);
+      await flush();
+      expect(screen.getByTestId("voice-report").textContent).toBe(warning);
+      expect(screen.getByTestId("voice-report")).not.toHaveTextContent(SENT.sentence);
+    }
   });
 
   /// Scenario: inbox/probe/018 (Q35-10 review) — the answer is on its way and the user presses Cancel, whose request never reaches the app; the send then times out unconfirmed and a snapshot settles the answer as written. Whether the cancel's failure arrives before the unconfirmed result, between it and the settlement, or after the settlement, the row ends saying the answer was written and that the cancel could not stop it.

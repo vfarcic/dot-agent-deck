@@ -17,7 +17,7 @@ use dot_agent_deck::daemon_protocol::{
 };
 use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -94,9 +94,13 @@ impl Fixture {
         let started = inbox::attach(
             &self.daemon,
             json!({"op": "start-agent",
-                "command": format!("{} --exact {ENTRY} --nocapture --test-threads=1", quote(&self.exe)),
+                // Common's before-main scrubber also runs in the copied
+                // libtest child. Preserve this sandbox's issued identity
+                // under fixture names before exec, leaving the scrub intact.
+                "command": format!(r#"DAD_FENCE_PANE="$DOT_AGENT_DECK_PANE_ID" DAD_FENCE_AGENT="$DOT_AGENT_DECK_AGENT_ID" DAD_FENCE_AUTH="$DOT_AGENT_DECK_PANE_CAPABILITY" DAD_FENCE_SOCKET="$DOT_AGENT_DECK_SOCKET" {} --exact {ENTRY} --nocapture --test-threads=1"#, quote(&self.exe)),
                 "cwd": self.daemon.home, "rows": 40, "cols": 140,
-                "env": [[MODE, self.base.to_str().unwrap()], ["DOT_AGENT_DECK_PANE_ID", PANE]],
+                "env": [[MODE, self.base.to_str().unwrap()], ["DOT_AGENT_DECK_PANE_ID", PANE],
+                    ["DOT_AGENT_DECK_SOCKET", self.daemon.hook_socket.to_str().unwrap()]],
             }),
         );
         assert_eq!(started["ok"], true, "native recorder spawn: {started}");
@@ -191,6 +195,48 @@ impl Fixture {
         Client::attach(&self.daemon.attach_socket, &self.id)
     }
 
+    pub fn answer_socket(&self) -> PathBuf {
+        self.daemon.attach_socket.clone()
+    }
+
+    pub fn agent_id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn live(&self) -> Option<dot_agent_deck::state::SessionSnapshot> {
+        common::agent_records_on(&self.daemon.attach_socket)
+            .into_iter()
+            .find(|record| record.id == self.id)
+            .and_then(|record| record.live)
+    }
+
+    pub fn hook_event(&self, event_type: &str, question: Option<&Value>) -> String {
+        let events = self.daemon.subscribe_events();
+        let tool_name = format!(
+            "answer-fence-hook-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        );
+        let reply = self.command_value(&json!({"event": {
+            "session_id": format!("answer-session-{}", self.generation),
+            "agent_type": "claude_code", "event_type": event_type,
+            "timestamp": chrono::Utc::now(),
+            "tool_name": tool_name,
+            "metadata": question.map(|q| json!({"pending_question": q.to_string()})).unwrap_or(json!({})),
+        }}));
+        assert_eq!(reply["ok"], true, "native hook fixture: {reply}");
+        events.wait_for(
+            |event| event.tool_name.as_deref() == Some(tool_name.as_str()),
+            common::child_boot_budget(),
+        );
+        if event_type == "session_start" {
+            assert!(
+                common::wait_until(common::child_boot_budget(), || self.live().is_some()),
+                "session-start hook did not reach this recorder's snapshot"
+            );
+        }
+        tool_name
+    }
+
     pub fn command(&self, command: &str) -> Value {
         self.command_value(&json!(command))
     }
@@ -198,7 +244,15 @@ impl Fixture {
     fn command_value(&self, command: &Value) -> Value {
         let response = self.base.with_extension("response");
         assert!(!response.exists());
+        let observer = command.get("event").map(|_| self.connect());
         atomic_json(&self.base.with_extension("command"), command);
+        if let Some(observer) = observer {
+            assert!(
+                common::wait_until(common::child_boot_budget(), || response.exists()),
+                "native hook acknowledgement missing; terminal output: {}",
+                String::from_utf8_lossy(&observer.output())
+            );
+        }
         let result = read_json(&response);
         fs::remove_file(response).unwrap();
         result
@@ -452,6 +506,55 @@ pub fn agent_process() -> bool {
         if let Ok(bytes) = fs::read(&path) {
             fs::remove_file(path).unwrap();
             let command: Value = serde_json::from_slice(&bytes).unwrap();
+            if let Some(event) = command.get("event") {
+                let sent = (|| -> Result<(), String> {
+                    let mut event = event.clone();
+                    for (field, name) in [
+                        ("pane_id", "DAD_FENCE_PANE"),
+                        ("agent_id", "DAD_FENCE_AGENT"),
+                        ("token", "DAD_FENCE_AUTH"),
+                    ] {
+                        event[field] =
+                            json!(std::env::var(name).map_err(|e| format!("{name}: {e}"))?);
+                    }
+                    event["deck_build"] = json!(inbox::SYNTHETIC_DECK_BUILD);
+                    let socket = PathBuf::from(
+                        std::env::var("DAD_FENCE_SOCKET").map_err(|e| e.to_string())?,
+                    );
+                    // Bare hook events deliberately lose question metadata.
+                    // Publish a keyboard question through the attested,
+                    // unheld producer message used by real key-channel hooks.
+                    if event["metadata"].get("pending_question").is_some() {
+                        let request = json!({"message_type": "question", "pane_id": event["pane_id"],
+                            "token": event["token"], "event": event, "hold": false,
+                            "ack": false, "confirm_hold": false, "deck_build": inbox::SYNTHETIC_DECK_BUILD});
+                        let mut stream = UnixStream::connect(socket).map_err(|e| e.to_string())?;
+                        stream
+                            .set_read_timeout(Some(common::child_boot_budget()))
+                            .map_err(|e| e.to_string())?;
+                        stream
+                            .set_write_timeout(Some(common::child_boot_budget()))
+                            .map_err(|e| e.to_string())?;
+                        writeln!(stream, "{request}").map_err(|e| e.to_string())?;
+                        let mut reply = String::new();
+                        BufReader::new(stream)
+                            .read_line(&mut reply)
+                            .map_err(|e| e.to_string())?;
+                        serde_json::from_str::<dot_agent_deck::question::QuestionReply>(
+                            reply.trim(),
+                        )
+                        .map_err(|e| format!("unheld question reply: {e}"))?;
+                        return Ok(());
+                    }
+                    common::write_hook_line(&socket, &event.to_string())
+                        .map_err(|e| format!("synthetic hook socket: {e}"))
+                })();
+                atomic_json(
+                    &base.with_extension("response"),
+                    &json!({"ok": sent.is_ok(), "error": sent.err()}),
+                );
+                continue;
+            }
             if let Some(bytes) = command.get("emit") {
                 let bytes: Vec<u8> = serde_json::from_value(bytes.clone()).unwrap();
                 std::io::stdout().write_all(&bytes).unwrap();
