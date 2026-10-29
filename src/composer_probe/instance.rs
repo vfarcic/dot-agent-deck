@@ -704,10 +704,14 @@ pub struct Sweep {
     /// scan failed or saw an empty entry. The caller's own and anything not a
     /// directory aren't counted.
     pub kept: usize,
-    /// Why the scan kept everything, if it did.
+    /// Why the scan couldn't be trusted, if it couldn't: every directory is
+    /// then kept. A scan that succeeded but saw an empty entry keeps every
+    /// one too, with this `None` and the entries in `unknown`.
     pub scan_error: Option<ScanError>,
-    /// Entries of live processes that read empty. Such an entry could name
-    /// any directory, so while there is one no gone daemon's is removed.
+    /// Entries of live processes that read empty, in a scan that succeeded.
+    /// Such an entry could name any directory, so while there is one no gone
+    /// daemon's is removed. A scan that failed counts none, whatever it saw
+    /// before failing: `scan_error` is then the reason everything was kept.
     pub unknown: usize,
     /// Removals that failed.
     pub failed: usize,
@@ -1036,9 +1040,9 @@ pub fn scan_proc(visit: &mut dyn FnMut(&[u8])) -> Result<(), ScanError> {
 /// owner of `/proc/<pid>`, which reads as root for a process that made
 /// itself non-dumpable. An entry that reads empty is visited as empty when
 /// its process still lives afterwards, and skipped when it is gone or has
-/// exited: a process shows an empty `environ` while its exec is under way,
-/// before the new image's environment is set up, so the read says nothing
-/// about what it names ([`removable`] keeps everything for it).
+/// exited ([`exited`]): a process shows an empty `environ` while its exec is
+/// under way, before the new image's environment is set up, so the read says
+/// nothing about what it names ([`removable`] keeps everything for it).
 pub fn scan_processes(
     pids: impl IntoIterator<Item = u32>,
     visit: &mut dyn FnMut(&[u8]),
@@ -1052,11 +1056,25 @@ pub fn scan_processes_in(
     pids: impl IntoIterator<Item = u32>,
     visit: &mut dyn FnMut(&[u8]),
 ) -> Result<(), ScanError> {
+    scan_processes_with(
+        pids,
+        &mut |pid, file| std::fs::read(proc.join(pid.to_string()).join(file)),
+        visit,
+    )
+}
+
+/// [`scan_processes`], with `read(pid, file)` reading `/proc/<pid>/<file>`
+/// (`status`, `environ`, `maps`), in the order the scan needs them.
+pub fn scan_processes_with(
+    pids: impl IntoIterator<Item = u32>,
+    read: &mut dyn FnMut(u32, &str) -> io::Result<Vec<u8>>,
+    visit: &mut dyn FnMut(&[u8]),
+) -> Result<(), ScanError> {
     // SAFETY: `getuid` has no preconditions.
     let uid = unsafe { libc::getuid() };
+    let mut read = |pid, file| proc_read(read(pid, file));
     for pid in pids {
-        let dir = proc.join(pid.to_string());
-        let status = match proc_read(&dir.join("status"))? {
+        let status = match read(pid, "status")? {
             Some(status) => status,
             None => continue,
         };
@@ -1065,7 +1083,7 @@ pub fn scan_processes_in(
         }
         let mut empty = 0;
         for file in ["environ", "maps"] {
-            match proc_read(&dir.join(file))? {
+            match read(pid, file)? {
                 Some(bytes) if bytes.is_empty() => empty += 1,
                 Some(bytes) => visit(&bytes),
                 None => {}
@@ -1073,7 +1091,7 @@ pub fn scan_processes_in(
         }
         // Read after the entries, so a process that exited before they were
         // read is seen as exited.
-        if empty > 0 && proc_read(&dir.join("status"))?.is_some_and(|s| !exited(&s)) {
+        if empty > 0 && read(pid, "status")?.is_some_and(|s| !exited(&s)) {
             for _ in 0..empty {
                 visit(&[]);
             }
@@ -1082,19 +1100,29 @@ pub fn scan_processes_in(
     Ok(())
 }
 
-/// Whether a `status` file's process has exited: its `State:` is `Z`
-/// (zombie) or `X` (dead). A state that can't be read is taken as live.
+/// Whether a `status` file's whole process has exited: its `State:` is `Z`
+/// (zombie) or `X` (dead) and its `Threads:` is at most 1. The state is the
+/// thread-group leader's alone: a leader that ended with `pthread_exit` is a
+/// zombie, its `environ` and `maps` read empty, while another of its threads
+/// still runs with the process's environment and mappings, and `Threads:`
+/// counts that thread. A state or a thread count that can't be read is taken
+/// as live.
 fn exited(status: &[u8]) -> bool {
-    status
-        .split(|b| *b == b'\n')
-        .find_map(|l| l.strip_prefix(b"State:"))
-        .and_then(|line| line.split(u8::is_ascii_whitespace).find(|f| !f.is_empty()))
-        .is_some_and(|state| state == b"Z" || state == b"X")
+    let field = |name: &[u8]| {
+        status
+            .split(|b| *b == b'\n')
+            .find_map(|l| l.strip_prefix(name))
+            .and_then(|line| line.split(u8::is_ascii_whitespace).find(|f| !f.is_empty()))
+    };
+    field(b"State:").is_some_and(|state| state == b"Z" || state == b"X")
+        && field(b"Threads:")
+            .and_then(ascii_number::<u32>)
+            .is_some_and(|threads| threads <= 1)
 }
 
-/// A `/proc` file, `None` when its process is gone.
-fn proc_read(path: &Path) -> Result<Option<Vec<u8>>, ScanError> {
-    match std::fs::read(path) {
+/// A read of a `/proc` file, `None` when its process is gone.
+fn proc_read(read: io::Result<Vec<u8>>) -> Result<Option<Vec<u8>>, ScanError> {
+    match read {
         Ok(bytes) => Ok(Some(bytes)),
         Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => Ok(None),
         Err(_) => Err(ScanError::Unreadable),

@@ -28,8 +28,8 @@ use dot_agent_deck::composer_probe::instance::{
     PAGE_BYTES, READ_MAX, ScanError, Sweep, candidate_roots, choose_root, decode_identity,
     encode_identity, generation_name_ok, identify, instance_name, liveness, liveness_from,
     may_be_alive, open_root, owned_by, parse_instance_name, removable, remove_identified,
-    same_contents, scan_processes, scan_processes_in, splittable, status_uid, sweep, sweep_root,
-    sweep_with,
+    same_contents, scan_processes, scan_processes_in, scan_processes_with, splittable, status_uid,
+    sweep, sweep_root, sweep_with,
 };
 use dot_agent_deck::doorbell_activation::{
     EditorProbe, EditorSelection, ExportShape, Measurement, PasteToggles,
@@ -1048,7 +1048,7 @@ fn probe_065_retention_removes_only_what_nothing_uses() {
     }
 }
 
-/// Scenario: Sweep a real root with this host's processes: directories for this process (live), a gone daemon, a gone daemon whose path a running child's environment names, a name that isn't an instance's and a symlink to a gone daemon's directory. When every process of this user could be read, only the unnamed gone daemon's directory is removed; when one couldn't, nothing is.
+/// Scenario: Sweep a real root with this host's processes: directories for this process (live), a gone daemon, a gone daemon whose path a running child's environment names, a name that isn't an instance's and a symlink to a gone daemon's directory. When every process of this user could be read and none showed an empty entry, only the unnamed gone daemon's directory is removed; when one couldn't be read, or a live one showed an empty entry, nothing is.
 #[spec("inbox/probe/065")]
 #[test]
 fn probe_065_a_sweep_keeps_what_a_process_names() {
@@ -1301,7 +1301,7 @@ fn probe_065_a_process_whose_name_is_not_utf8_keeps_its_instance() {
     assert_eq!(swept.removed.len(), 1, "{swept:?}");
 }
 
-/// Scenario: Sweep a gone daemon's instance with a scripted `/proc` holding one process of this user. While it lives, an empty `environ`, or an empty `maps`, keeps the instance and is counted as unknown, with no scan error; a zombie with both empty doesn't keep it, and a live process whose environment is there but doesn't name the instance doesn't either.
+/// Scenario: Sweep a gone daemon's instance with a scripted `/proc` holding one process of this user. While it lives, an empty `environ`, or an empty `maps`, keeps the instance and is counted as unknown, with no scan error, and so does a zombie leader whose other thread still runs; a single-threaded zombie with both empty doesn't keep it, and a live process whose environment is there but doesn't name the instance doesn't either.
 #[spec("inbox/probe/065")]
 #[test]
 fn probe_065_an_empty_entry_of_a_live_process_keeps_every_instance() {
@@ -1309,12 +1309,15 @@ fn probe_065_an_empty_entry_of_a_live_process_keeps_every_instance() {
     let root = private_dir(&dir.path().join("editor"));
     let proc = dir.path().join("proc");
     let uid = unsafe { libc::getuid() };
-    // Process 7, this user's, in `state`, with these entries.
-    let process = |state: &str, environ: &[u8], maps: &[u8]| {
+    // Process 7, this user's, in `state` with `threads`, with these entries.
+    let process = |state: &str, threads: u32, environ: &[u8], maps: &[u8]| {
         let pid = proc.join("7");
         std::fs::create_dir_all(&pid).unwrap();
         let mut status = b"Name:\tna\xffme\n".to_vec();
-        status.extend(format!("State:\t{state}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n").bytes());
+        status.extend(
+            format!("State:\t{state}\nThreads:\t{threads}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n")
+                .bytes(),
+        );
         std::fs::write(pid.join("status"), status).unwrap();
         std::fs::write(pid.join("environ"), environ).unwrap();
         std::fs::write(pid.join("maps"), maps).unwrap();
@@ -1331,21 +1334,29 @@ fn probe_065_an_empty_entry_of_a_live_process_keeps_every_instance() {
     let maps = b"7f00-7f01 r-xp 0 08:01 5 /usr/bin/sh\n".as_slice();
     let gone = fake_instance(&root, 1, 1);
     for (environ, entry) in [(b"".as_slice(), maps), (other, b"".as_slice())] {
-        process("R (running)", environ, entry);
+        process("R (running)", 1, environ, entry);
         let result = swept();
         assert_eq!(result.scan_error, None, "{result:?}");
         assert!(result.removed.is_empty(), "{result:?}");
         assert_eq!((result.kept, result.unknown), (1, 1), "{result:?}");
         assert!(gone.join(DAEMON_FILE).exists());
     }
-    // Exited, its entries read empty and it keeps nothing.
-    process("Z (zombie)", b"", b"");
+    // A zombie leader whose other thread still runs: the process lives, and
+    // its entries, empty, keep the instance.
+    process("Z (zombie)", 2, b"", b"");
+    let result = swept();
+    assert_eq!(result.scan_error, None, "{result:?}");
+    assert!(result.removed.is_empty(), "{result:?}");
+    assert_eq!((result.kept, result.unknown), (1, 2), "{result:?}");
+    // Exited, its one thread a zombie, its entries read empty and it keeps
+    // nothing.
+    process("Z (zombie)", 1, b"", b"");
     let result = swept();
     assert_eq!(result.removed, ["1-1"], "{result:?}");
     assert_eq!((result.kept, result.unknown), (0, 0), "{result:?}");
     // Live, its environment there and naming another path, it keeps nothing.
     let gone = fake_instance(&root, 1, 1);
-    process("S (sleeping)", other, maps);
+    process("S (sleeping)", 1, other, maps);
     let result = swept();
     assert_eq!(result.removed, ["1-1"], "{result:?}");
     assert_eq!((result.kept, result.unknown), (0, 0), "{result:?}");
@@ -1361,6 +1372,120 @@ fn probe_065_an_empty_entry_of_a_live_process_keeps_every_instance() {
         },
     );
     assert_eq!(kept, Ok(vec![]));
+}
+
+/// Scenario: Sweep a gone daemon's instance with one scripted process of this user that is live when first read, its `environ` or both entries empty, and change what its `status` reads the second time. Gone, a single-threaded zombie or dead by then, it keeps nothing; still live, a zombie leader with another thread, a state or thread count that can't be parsed, it keeps the instance and its empty entries are counted; a re-read that fails keeps it as a scan error, and so does a later process that can't be read, with no empty entry counted.
+#[spec("inbox/probe/065")]
+#[test]
+fn probe_065_the_status_re_read_decides_an_empty_entry() {
+    let dir = tempdir();
+    let root = private_dir(&dir.path().join("editor"));
+    let uid = unsafe { libc::getuid() };
+    let status =
+        |rest: &str| format!("Name:\tsh\n{rest}Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n").into_bytes();
+    let live = status("State:\tS (sleeping)\nThreads:\t1\n");
+    let maps = b"7f00-7f01 r-xp 0 08:01 5 /usr/bin/sh\n".as_slice();
+    // Process 7, live at its first `status` read, with these entries, and
+    // `again` (a status, or an errno) at its second.
+    let swept = |environ: &[u8], maps: &[u8], again: Result<Vec<u8>, i32>| {
+        let mut reads = 0;
+        sweep_with(
+            &root,
+            "own-0",
+            |_, _| false,
+            |visit| {
+                scan_processes_with(
+                    [7],
+                    &mut |pid, file| {
+                        assert_eq!(pid, 7);
+                        match file {
+                            "environ" => Ok(environ.to_vec()),
+                            "maps" => Ok(maps.to_vec()),
+                            "status" => {
+                                reads += 1;
+                                match reads {
+                                    1 => Ok(live.clone()),
+                                    2 => again.clone().map_err(std::io::Error::from_raw_os_error),
+                                    _ => panic!("status read {reads} times"),
+                                }
+                            }
+                            other => panic!("{other}"),
+                        }
+                    },
+                    visit,
+                )
+            },
+        )
+    };
+    // It exited after its entries were read: they say nothing, and the
+    // instance goes.
+    for again in [
+        Err(libc::ENOENT),
+        Err(libc::ESRCH),
+        Ok(status("State:\tZ (zombie)\nThreads:\t1\n")),
+        Ok(status("State:\tX (dead)\nThreads:\t1\n")),
+    ] {
+        let gone = fake_instance(&root, 1, 1);
+        let result = swept(b"", maps, again.clone());
+        assert_eq!(result.removed, ["1-1"], "{again:?} {result:?}");
+        assert_eq!(
+            (result.kept, result.unknown),
+            (0, 0),
+            "{again:?} {result:?}"
+        );
+        assert_eq!(result.scan_error, None, "{again:?} {result:?}");
+        assert!(!gone.exists());
+    }
+    // It may still live: its empty entries keep the instance.
+    let gone = fake_instance(&root, 1, 1);
+    for again in [
+        live.clone(),
+        status("State:\tZ (zombie)\nThreads:\t2\n"),
+        status("State:\tZ (zombie)\n"),
+        status("State:\tZ (zombie)\nThreads:\tmany\n"),
+        status("State:\t?\nThreads:\t1\n"),
+        status("Threads:\t1\n"),
+        b"".to_vec(),
+    ] {
+        let shown = String::from_utf8_lossy(&again).into_owned();
+        let result = swept(b"", maps, Ok(again));
+        assert_eq!(result.scan_error, None, "{shown} {result:?}");
+        assert!(result.removed.is_empty(), "{shown} {result:?}");
+        assert_eq!((result.kept, result.unknown), (1, 1), "{shown} {result:?}");
+        assert!(gone.join(DAEMON_FILE).exists());
+    }
+    // Both entries empty: each one counts.
+    let result = swept(b"", b"", Ok(live.clone()));
+    assert!(result.removed.is_empty(), "{result:?}");
+    assert_eq!((result.kept, result.unknown), (1, 2), "{result:?}");
+    // The re-read fails: the scan can't be trusted, and keeps everything.
+    let result = swept(b"", maps, Err(libc::EACCES));
+    assert_eq!(result.scan_error, Some(ScanError::Unreadable), "{result:?}");
+    assert!(result.removed.is_empty(), "{result:?}");
+    assert_eq!((result.kept, result.unknown), (1, 0), "{result:?}");
+    // A process that can't be read after one with an empty entry: the scan
+    // fails, and the empty entry isn't counted.
+    let result = sweep_with(
+        &root,
+        "own-0",
+        |_, _| false,
+        |visit| {
+            scan_processes_with(
+                [7, 8],
+                &mut |pid, file| match (pid, file) {
+                    (7, "status") => Ok(live.clone()),
+                    (7, "environ") => Ok(Vec::new()),
+                    (7, "maps") => Ok(maps.to_vec()),
+                    _ => Err(std::io::Error::from_raw_os_error(libc::EACCES)),
+                },
+                visit,
+            )
+        },
+    );
+    assert_eq!(result.scan_error, Some(ScanError::Unreadable), "{result:?}");
+    assert!(result.removed.is_empty(), "{result:?}");
+    assert_eq!((result.kept, result.unknown), (1, 0), "{result:?}");
+    assert!(gone.join(DAEMON_FILE).exists());
 }
 
 /// Scenario: Make an instance in a root already holding a directory that isn't an instance's, and read what the sweep at creation reports: it was kept, nothing was removed, and no scan was needed. Install a generation, find its arm page among this process's mappings, drop the installation, and find it no longer mapped while its file stays.
