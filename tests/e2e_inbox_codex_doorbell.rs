@@ -86,6 +86,11 @@ impl Deck {
     fn new() -> Self {
         let bin = common::harness_tempdir().unwrap();
         let script = bin.path().join("codex-composer.py");
+        std::fs::write(
+            bin.path().join("composer_external_edit.py"),
+            include_str!("support/composer_external_edit.py"),
+        )
+        .unwrap();
         std::fs::write(&script, include_str!("support/codex_composer.py")).unwrap();
         let log = bin.path().join("deck.log");
         let hooks = hook_list_response();
