@@ -314,7 +314,7 @@ fn doorbell_053_key_effects_and_own_settle() {
     );
 }
 
-/// Scenario: Ask the table about Codex releases around complete and incomplete records: an exact incomplete record beside an older complete one, an incomplete newest-older record, minor distances 4 and 5, a patch release, another major, a pre-release and a release older than every record. Only the in-range releases above a complete newest source inherit.
+/// Scenario: Put a measured Go Codex 0.164.0 beside newer minor and patch releases, a pre-release, another major and an older release. Every release without its own record is held as unmeasured_release, while an exact incomplete record keeps its own missing fact instead of borrowing an older Go.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_inheritance_rules() {
@@ -327,37 +327,27 @@ fn doorbell_053_inheritance_rules() {
         no_go(&verdict(&records, &CODEX, "0.164.0")),
         Some(NoGo::UnverifiedMeasurement("echo"))
     );
-    // The newest older record is the source, never one past it.
-    let records = [
+    let records = [complete(CODEX, "0.164.0", 2)];
+    assert!(matches!(
+        verdict(&records, &CODEX, "0.164.0"),
+        Activation::Go { .. }
+    ));
+    for release in ["0.165.0", "0.168.9", "0.169.0", "0.164.1", "0.164.9"] {
+        let got = verdict(&records, &CODEX, release);
+        assert_eq!(
+            no_go(&got),
+            Some(NoGo::UnmeasuredRelease),
+            "{release} has no measurements of its own: {got:?}"
+        );
+    }
+    // A nearby incomplete record supplies no authority either.
+    let incomplete_source = [
         complete(CODEX, "0.160.0", 2),
         incomplete(CODEX, "0.163.0", 2),
     ];
     assert_eq!(
-        no_go(&verdict(&records, &CODEX, "0.164.0")),
-        Some(NoGo::InheritSourceIncomplete)
-    );
-    let records = [complete(CODEX, "0.160.0", 2)];
-    let inherited = |release: &str| match verdict(&records, &CODEX, release) {
-        Activation::Inherited {
-            from,
-            profile,
-            settle,
-            ..
-        } => {
-            assert_eq!(from, v("0.160.0"));
-            assert_eq!(profile, "test-profile");
-            assert_eq!(settle, Duration::from_secs(10));
-            true
-        }
-        _ => false,
-    };
-    assert!(inherited("0.164.0"), "minor distance 4 inherits");
-    assert!(inherited("0.160.3"), "a patch release inherits");
-    assert!(inherited("0.164.9"));
-    assert_eq!(
-        no_go(&verdict(&records, &CODEX, "0.165.0")),
-        Some(NoGo::UnmeasuredRelease),
-        "minor distance 5"
+        no_go(&verdict(&incomplete_source, &CODEX, "0.164.0")),
+        Some(NoGo::UnmeasuredRelease)
     );
     assert_eq!(
         no_go(&verdict(&records, &CODEX, "1.0.0")),
