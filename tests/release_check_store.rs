@@ -54,6 +54,12 @@ fn evidence(outcome: Outcome) -> Evidence {
     }
 }
 
+fn publication_evidence() -> Evidence {
+    let mut value = evidence(Outcome::Passed);
+    value.body = b"new publication: \0\xff opaque evidence".to_vec();
+    value
+}
+
 struct Fixture {
     temp: TempDir,
     store: Store,
@@ -218,7 +224,7 @@ fn apply_row(store: &mut Store, key: &Key, ticket: &Ticket, row: Row) -> Result<
     match row {
         Row::Queue => store.queue(key).map(|_| ()),
         Row::Publish => store
-            .publish(ticket, evidence(Outcome::Passed), IMAGE)
+            .publish(ticket, publication_evidence(), IMAGE)
             .map(|_| ()),
         Row::RingStart => store.ring_start(key, &mark("row")).map(|_| ()),
         Row::RingEnd => store.ring_end(key, &mark("row"), None),
@@ -230,8 +236,26 @@ fn apply_row(store: &mut Store, key: &Key, ticket: &Ticket, row: Row) -> Result<
     }
 }
 
-// Each row has both a clean transition check and a crash check at EVERY
-// temp-file fsync, rename and directory-fsync of every file that it writes.
+// Derive the recovered target from completed filesystem operations, never
+// from the implementation's recovered state. Temp-file fsync leaves the old
+// target; rename is uncertain until the directory barrier completes.
+fn replaced(steps: &[Checkpoint], file: FileKind, image: CrashImage) -> bool {
+    steps.contains(&checkpoint(file, WriteStep::DirectorySynced))
+        || (steps.contains(&checkpoint(file, WriteStep::Renamed))
+            && matches!(image, CrashImage::KeepUnsynced))
+}
+
+fn removed(
+    steps: &[Checkpoint],
+    unsynced: Checkpoint,
+    durable: Checkpoint,
+    image: CrashImage,
+) -> bool {
+    steps.contains(&durable)
+        || (steps.contains(&unsynced) && matches!(image, CrashImage::KeepUnsynced))
+}
+
+// Each row asserts its clean transition and named filesystem crash boundaries.
 fn transition(row: Row) {
     let (mut fixture, key, ticket) = setup_row(row);
     let before = journal(&fixture.store, &key);
@@ -240,6 +264,9 @@ fn transition(row: Row) {
     invariant(&fixture.store);
     let after = fixture.store.view(&key).unwrap();
     let new_metadata = fixture.store.metadata().unwrap();
+    if matches!(row, Row::Publish) {
+        assert_eq!(after.evidence, Some(publication_evidence()));
+    }
     match row {
         Row::Prune => {
             assert!(after.journal.is_none());
@@ -336,12 +363,16 @@ fn transition(row: Row) {
     }
 
     let points = match row {
-        Row::Prune => vec![
-            Checkpoint::PruneBeforeFloor,
-            Checkpoint::PruneFloorDurable,
-            Checkpoint::PruneAfterUnlink { index: 0 },
-            Checkpoint::PruneUnlinkDurable { index: 0 },
-        ],
+        Row::Prune => {
+            let mut points = vec![Checkpoint::PruneBeforeFloor];
+            points.extend(write_points(FileKind::Store));
+            points.extend([
+                Checkpoint::PruneFloorDurable,
+                Checkpoint::PruneAfterUnlink { index: 0 },
+                Checkpoint::PruneUnlinkDurable { index: 0 },
+            ]);
+            points
+        }
         Row::Evict => vec![
             Checkpoint::EvidenceUnlinked,
             Checkpoint::EvidenceUnlinkDurable,
@@ -365,26 +396,111 @@ fn transition(row: Row) {
     for point in points {
         for image in [CrashImage::KeepUnsynced, CrashImage::DropUnsynced] {
             let (mut fixture, key, ticket) = setup_row(row);
-            let old = journal(&fixture.store, &key);
+            let old = fixture.store.view(&key).unwrap();
+            let metadata = fixture.store.metadata().unwrap();
             testing::arm(&mut fixture.store, Fault::CrashAt(point));
             crashed(apply_row(&mut fixture.store, &key, &ticket, row), point);
+            // The trace records completed I/O, including barriers before the
+            // requested fault, without prescribing evidence-write ordering.
+            let steps = testing::completed_steps(&fixture.store);
+            assert_eq!(steps.last(), Some(&point), "{row:?} at {point:?}");
+            if !matches!(row, Row::Prune | Row::Evict)
+                && steps.iter().any(|step| {
+                    matches!(
+                        step,
+                        Checkpoint::Write {
+                            file: FileKind::Store,
+                            ..
+                        }
+                    )
+                })
+            {
+                assert!(
+                    steps.contains(&checkpoint(FileKind::Journal, WriteStep::DirectorySynced)),
+                    "store write preceded durable journal: {row:?} {steps:?}"
+                );
+            }
+            let journal_removed = removed(
+                &steps,
+                Checkpoint::PruneAfterUnlink { index: 0 },
+                Checkpoint::PruneUnlinkDurable { index: 0 },
+                image,
+            );
+            if steps.contains(&Checkpoint::PruneAfterUnlink { index: 0 }) {
+                assert!(steps.contains(&Checkpoint::PruneFloorDurable));
+                assert!(steps.contains(&checkpoint(FileKind::Store, WriteStep::DirectorySynced)));
+            }
+            let journal_replaced = replaced(&steps, FileKind::Journal, image);
+            let expected_journal = if journal_removed {
+                None
+            } else if journal_replaced {
+                after.journal.clone()
+            } else {
+                old.journal.clone()
+            };
+            let expected_evidence = if removed(
+                &steps,
+                Checkpoint::EvidenceUnlinked,
+                Checkpoint::EvidenceUnlinkDurable,
+                image,
+            ) {
+                None
+            } else if replaced(&steps, FileKind::Evidence, image) {
+                Some(publication_evidence())
+            } else {
+                old.evidence.clone()
+            };
+            let store_replaced = replaced(&steps, FileKind::Store, image);
+            let expected_floor = if matches!(row, Row::Prune) && store_replaced {
+                metadata.epoch
+            } else {
+                metadata.floor
+            };
+            // Queue epochs are observable in the journal even before the
+            // metadata write. Authority events are observable in last_event.
+            let expected_epoch = expected_journal
+                .as_ref()
+                .map_or(metadata.epoch, |journal| {
+                    metadata
+                        .epoch
+                        .max(journal.last_event)
+                        .max(journal.queued.unwrap_or(0))
+                })
+                .max(if store_replaced {
+                    new_metadata.epoch
+                } else {
+                    metadata.epoch
+                });
             fixture.reload(image);
             let recovered = fixture.store.view(&key).unwrap();
-            if let Some(current) = &recovered.journal {
-                assert!(
-                    Some(current) == after.journal.as_ref() || current == &old,
-                    "torn journal after {row:?} at {point:?}, image {image:?}: {current:?}"
-                );
-                assert!(current.revoked_through >= old.revoked_through);
-            } else {
-                assert!(matches!(row, Row::Prune), "lost journal: {row:?} {point:?}");
-                assert!(fixture.store.metadata().unwrap().floor >= ticket.queued);
-            }
-            let observed = fixture.store.metadata().unwrap().epoch;
+            let context = format!("{row:?} at {point:?}, image {image:?}, steps {steps:?}");
+            assert_eq!(recovered.journal, expected_journal, "journal: {context}");
+            assert_eq!(recovered.evidence, expected_evidence, "evidence: {context}");
+            let recovered_metadata = fixture.store.metadata().unwrap();
+            assert_eq!(recovered_metadata.store_id, metadata.store_id, "{context}");
+            assert_eq!(recovered_metadata.floor, expected_floor, "floor: {context}");
+            assert_eq!(recovered_metadata.epoch, expected_epoch, "epoch: {context}");
+            // Fence against independently expected pre-crash epochs, rather
+            // than blessing whatever counter recovery happens to report.
             let next = fixture.store.queue(&key).unwrap();
             assert!(
-                next.queued > observed,
-                "reused epoch after {row:?} at {point:?}"
+                next.queued > expected_epoch,
+                "reused queue epoch: {context}"
+            );
+            let publication = published(
+                fixture
+                    .store
+                    .publish(&next, publication_evidence(), IMAGE)
+                    .unwrap(),
+            );
+            assert!(
+                publication > next.queued && publication > expected_epoch,
+                "reused publication epoch: {context}"
+            );
+            let forgotten = fixture.store.forget(&key).unwrap();
+            assert!(
+                forgotten > publication && forgotten > expected_epoch,
+                "reused Forget epoch: {context}"
             );
         }
     }
@@ -421,6 +537,9 @@ fn pruning(point: PrunePoint, column: PruneColumn) {
         } else {
             &key
         };
+        let metadata = fixture.store.metadata().unwrap();
+        let old_key = journal(&fixture.store, &key);
+        let old_other = journal(&fixture.store, &other);
         let checkpoint = match point {
             PrunePoint::BeforeFloor => Checkpoint::PruneBeforeFloor,
             PrunePoint::FloorDurable => Checkpoint::PruneFloorDurable,
@@ -435,25 +554,62 @@ fn pruning(point: PrunePoint, column: PruneColumn) {
             checkpoint,
         );
         fixture.reload(image);
-        // Assert against the RECOVERED directory, and force both outcomes of
-        // the unsynced unlink rather than trusting the host filesystem.
-        let absent = fixture.store.view(&key).unwrap().journal.is_none();
-        if matches!(point, PrunePoint::UnlinkUnsynced)
-            && !matches!(column, PruneColumn::OtherNoEvent)
-        {
-            assert_eq!(absent, matches!(image, CrashImage::KeepUnsynced));
-        }
+        let expected_absent = match point {
+            PrunePoint::BeforeFloor | PrunePoint::FloorDurable => false,
+            PrunePoint::UnlinkUnsynced => matches!(image, CrashImage::KeepUnsynced),
+            PrunePoint::UnlinkDurable | PrunePoint::Recreated => true,
+        };
+        let expected_floor = if matches!(point, PrunePoint::BeforeFloor) {
+            metadata.floor
+        } else {
+            metadata.epoch
+        };
+        let recovered_metadata = fixture.store.metadata().unwrap();
+        assert_eq!(
+            recovered_metadata.floor, expected_floor,
+            "{point:?} {column:?} {image:?}"
+        );
+        assert_eq!(recovered_metadata.epoch, metadata.epoch);
+        let old_chosen = if matches!(column, PruneColumn::OtherNoEvent) {
+            &old_other
+        } else {
+            &old_key
+        };
+        assert_eq!(
+            fixture.store.view(chosen).unwrap().journal,
+            (!expected_absent).then(|| old_chosen.clone()),
+            "chosen journal: {point:?} {column:?} {image:?}"
+        );
+        let (untouched, old_untouched) = if matches!(column, PruneColumn::OtherNoEvent) {
+            (&key, &old_key)
+        } else {
+            (&other, &old_other)
+        };
+        assert_eq!(
+            journal(&fixture.store, untouched),
+            *old_untouched,
+            "untouched journal: {point:?} {column:?} {image:?}"
+        );
         if matches!(point, PrunePoint::Recreated) {
-            fixture.store.queue(chosen).unwrap();
+            assert!(fixture.store.view(chosen).unwrap().journal.is_none());
+            let newer = fixture.store.queue(chosen).unwrap();
+            assert!(newer.queued > metadata.epoch);
             let recreated = journal(&fixture.store, chosen);
-            let floor = fixture.store.metadata().unwrap().floor;
-            assert_eq!(recreated.last_event, floor);
-            assert_eq!(recreated.revoked_through, floor);
+            assert_eq!(recreated.last_event, expected_floor);
+            assert_eq!(recreated.revoked_through, expected_floor);
+            assert_eq!(recreated.state, None);
+            assert_eq!(recreated.queued, Some(newer.queued));
+            assert!(recreated.ringing.is_empty());
             fixture.reload(CrashImage::KeepUnsynced);
         }
         let rejects = matches!(column, PruneColumn::ChosenWithEvent)
             || (!matches!(column, PruneColumn::OtherNoEvent)
-                && (absent || matches!(point, PrunePoint::Recreated)));
+                && match point {
+                    PrunePoint::BeforeFloor | PrunePoint::FloorDurable => false,
+                    // Both recovered images were independently asserted above.
+                    PrunePoint::UnlinkUnsynced => expected_absent,
+                    PrunePoint::UnlinkDurable | PrunePoint::Recreated => true,
+                });
         let recovered = snapshot(&fixture.store, &key);
         fixture.reload(CrashImage::KeepUnsynced);
         assert_eq!(
@@ -481,6 +637,162 @@ fn key_with_release(release: &str) -> Key {
 
 fn snapshot(store: &Store, key: &Key) -> (store::Metadata, Option<Journal>) {
     (store.metadata().unwrap(), store.view(key).unwrap().journal)
+}
+
+fn tuple_isolation() {
+    let base = key("1.0.0");
+    let variants = [
+        (
+            "platform",
+            Key {
+                platform: "macos".into(),
+                ..base.clone()
+            },
+        ),
+        (
+            "agent",
+            Key {
+                agent: "codex".into(),
+                ..base.clone()
+            },
+        ),
+        (
+            "release",
+            Key {
+                release: "1.0.1".into(),
+                ..base.clone()
+            },
+        ),
+        (
+            "argv class",
+            Key {
+                argv_class: "non-interactive".into(),
+                ..base.clone()
+            },
+        ),
+        (
+            "executable digest",
+            Key {
+                executable_digest: "c".repeat(64),
+                ..base.clone()
+            },
+        ),
+        (
+            "companion digest",
+            Key {
+                companion_digests: vec!["c".repeat(64)],
+                ..base.clone()
+            },
+        ),
+        (
+            "companion list length",
+            Key {
+                companion_digests: vec!["b".repeat(64), "c".repeat(64)],
+                ..base.clone()
+            },
+        ),
+        (
+            "deck image hash",
+            Key {
+                deck_image_hash: "e".repeat(64),
+                ..base.clone()
+            },
+        ),
+    ];
+    for (field, variant) in variants {
+        let mut f = Fixture::new();
+        let base_ticket = f.store.queue(&base).unwrap();
+        let variant_ticket = f.store.queue(&variant).unwrap();
+        assert_eq!(base_ticket.key, base, "{field}");
+        assert_eq!(variant_ticket.key, variant, "{field}");
+        assert_eq!(f.store.keys().unwrap().len(), 2, "key collision: {field}");
+        for file in [FileKind::Journal, FileKind::Evidence] {
+            assert_ne!(
+                testing::path(&f.store, &base, file),
+                testing::path(&f.store, &variant, file),
+                "path collision: {field} {file:?}"
+            );
+        }
+        let base_evidence = publication_evidence();
+        let mut variant_evidence = evidence(Outcome::Passed);
+        variant_evidence.runner_image_hash = variant.deck_image_hash.clone();
+        variant_evidence.body = format!("independent {field}\0evidence").into_bytes();
+        let base_publication = published(
+            f.store
+                .publish(&base_ticket, base_evidence.clone(), &base.deck_image_hash)
+                .unwrap(),
+        );
+        let base_journal = journal(&f.store, &base);
+        let variant_publication = published(
+            f.store
+                .publish(
+                    &variant_ticket,
+                    variant_evidence.clone(),
+                    &variant.deck_image_hash,
+                )
+                .unwrap(),
+        );
+        assert!(variant_publication > base_publication);
+        let variant_journal = journal(&f.store, &variant);
+        assert_eq!(
+            journal(&f.store, &base),
+            base_journal,
+            "publication crossed keys: {field}"
+        );
+        for reopen in [false, true] {
+            if reopen {
+                f.reload(CrashImage::KeepUnsynced);
+            }
+            for (key, expected_journal, expected_evidence) in [
+                (&base, &base_journal, &base_evidence),
+                (&variant, &variant_journal, &variant_evidence),
+            ] {
+                let view = f.store.view(key).unwrap();
+                assert_eq!(view.journal.as_ref(), Some(expected_journal), "{field}");
+                assert_eq!(view.evidence.as_ref(), Some(expected_evidence), "{field}");
+            }
+        }
+        let base_old = f.store.queue(&base).unwrap();
+        let variant_old = f.store.queue(&variant).unwrap();
+        f.trip(&base);
+        let revoked_base = journal(&f.store, &base);
+        stale(&mut f.store, &base_old);
+        assert_eq!(
+            journal(&f.store, &variant).revoked_through,
+            variant_journal.revoked_through,
+            "trip crossed keys: {field}"
+        );
+        published(
+            f.store
+                .publish(
+                    &variant_old,
+                    variant_evidence.clone(),
+                    &variant.deck_image_hash,
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            journal(&f.store, &base),
+            revoked_base,
+            "completion cleared other revocation: {field}"
+        );
+        f.store.forget(&variant).unwrap();
+        f.reload(CrashImage::KeepUnsynced);
+        assert_eq!(
+            journal(&f.store, &base),
+            revoked_base,
+            "Forget crossed keys: {field}"
+        );
+        assert_eq!(
+            f.store.view(&base).unwrap().evidence,
+            Some(base_evidence),
+            "{field}"
+        );
+        assert!(
+            f.store.view(&variant).unwrap().evidence.is_none(),
+            "{field}"
+        );
+    }
 }
 
 fn recreation(trip: bool) {
@@ -1215,28 +1527,64 @@ fn doorbell_061_removal_stays_anchored_after_directory_rename() {
     assert_eq!(fs::read_dir(sentinel).unwrap().count(), 2);
 }
 
-/// Scenario: Try to ring a queued-only key and a key with each nonpassing result, then after Forget and a durable trip. Every refusal leaves the journal and epoch unchanged and grants no first-write permit.
+/// Scenario: Publish distinct nonpassing results and reopen each one to verify its exact state and opaque evidence. Try to ring a queued-only key, each result, then Forgotten and revoked keys; refusal leaves the journal and epoch unchanged.
 #[test]
 #[spec("inbox/doorbell/061")]
 fn doorbell_061_nonpassing_states_refuse_ring_without_mutation() {
     let mut f = Fixture::new();
     let key = key("1.0.0");
     f.store.queue(&key).unwrap();
-    for outcome in [
+    for (index, outcome) in [
         None,
         Some(Outcome::Differs {
             fact: "echo".into(),
         }),
         Some(Outcome::Inconclusive {
-            reason: "fixture".into(),
+            reason: "fixture timeout".into(),
         }),
         Some(Outcome::Unavailable {
-            reason: "fixture".into(),
+            reason: "fixture executable missing".into(),
         }),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         if let Some(outcome) = outcome {
+            let state = match &outcome {
+                Outcome::Differs { fact } => State::Differs { fact: fact.clone() },
+                Outcome::Inconclusive { reason } => State::Inconclusive {
+                    reason: reason.clone(),
+                },
+                Outcome::Unavailable { reason } => State::Unavailable {
+                    reason: reason.clone(),
+                },
+                Outcome::Passed => unreachable!(),
+            };
             let ticket = f.store.queue(&key).unwrap();
-            published(f.store.publish(&ticket, evidence(outcome), IMAGE).unwrap());
+            let mut expected_evidence = evidence(outcome);
+            expected_evidence.body = format!("nonpassing-{index}: opaque\0body").into_bytes();
+            let mut expected_journal = journal(&f.store, &key);
+            let epoch = f.store.metadata().unwrap().epoch + 1;
+            expected_journal.last_event = epoch;
+            expected_journal.state = Some(state);
+            expected_journal.queued = None;
+            assert_eq!(
+                published(
+                    f.store
+                        .publish(&ticket, expected_evidence.clone(), IMAGE)
+                        .unwrap()
+                ),
+                epoch
+            );
+            for reopen in [false, true] {
+                if reopen {
+                    f.reload(CrashImage::KeepUnsynced);
+                }
+                let view = f.store.view(&key).unwrap();
+                assert_eq!(view.journal, Some(expected_journal.clone()));
+                assert_eq!(view.evidence, Some(expected_evidence.clone()));
+                assert_eq!(view.admission, None);
+            }
         }
         let before = snapshot(&f.store, &key);
         assert!(f.store.ring_start(&key, &mark("refused")).is_err());
@@ -1253,7 +1601,7 @@ fn doorbell_061_nonpassing_states_refuse_ring_without_mutation() {
     assert_eq!(snapshot(&f.store, &key), before);
 }
 
-/// Scenario: Queue a check on a new key without intervening authority events. The queue leaves last_event at the floor, so its own passing result must publish.
+/// Scenario: Queue a check on a new key without intervening authority events and reopen its passing result with its evidence intact. Repeat with keys differing in one tuple field at a time; publications, tickets and revocations remain independent.
 #[test]
 #[spec("inbox/doorbell/061")]
 fn doorbell_061_uncontended_queue_publishes() {
@@ -1268,29 +1616,57 @@ fn doorbell_061_uncontended_queue_publishes() {
     assert!(row.ringing.is_empty());
     assert!(queued.queued > row.last_event);
     assert_eq!(f.store.metadata().unwrap().epoch, queued.queued);
-    published(
+    let expected_evidence = publication_evidence();
+    let publication = published(
         f.store
-            .publish(&queued, evidence(Outcome::Passed), IMAGE)
+            .publish(&queued, expected_evidence.clone(), IMAGE)
             .unwrap(),
     );
+    let expected_journal = Journal {
+        last_event: publication,
+        revoked_through: floor,
+        state: Some(State::Passed { publication }),
+        queued: None,
+        ringing: Vec::new(),
+    };
+    for reopen in [false, true] {
+        if reopen {
+            f.reload(CrashImage::KeepUnsynced);
+        }
+        let view = f.store.view(&key).unwrap();
+        assert_eq!(view.journal, Some(expected_journal.clone()));
+        assert_eq!(view.evidence, Some(expected_evidence.clone()));
+        assert_eq!(view.admission, Some(publication));
+    }
+    tuple_isolation();
 }
 
 /// Scenario: Crash after the queue epoch is durable and before a runner could launch. Reload must allocate above that durable q even though queue never returned its ticket.
 #[test]
 #[spec("inbox/doorbell/061")]
 fn doorbell_061_queue_crash_before_launch() {
-    let mut f = Fixture::new();
-    let key = key("1.0.0");
-    let point = Checkpoint::QueuePersistedBeforeLaunch;
-    testing::arm(&mut f.store, Fault::CrashAt(point));
-    crashed(f.store.queue(&key).map(|_| ()), point);
-    f.reload(CrashImage::DropUnsynced);
-    let persisted_q = f.store.metadata().unwrap().epoch;
-    assert!(persisted_q > 0);
-    assert!(f.store.queue(&key).unwrap().queued > persisted_q);
+    for image in [CrashImage::KeepUnsynced, CrashImage::DropUnsynced] {
+        let mut f = Fixture::new();
+        let key = key("1.0.0");
+        f.pass(&key);
+        f.trip(&key);
+        f.pass(&key);
+        let metadata = f.store.metadata().unwrap();
+        let expected_q = metadata.epoch + 1;
+        let mut expected_journal = journal(&f.store, &key);
+        expected_journal.queued = Some(expected_q);
+        let point = Checkpoint::QueuePersistedBeforeLaunch;
+        testing::arm(&mut f.store, Fault::CrashAt(point));
+        crashed(f.store.queue(&key).map(|_| ()), point);
+        f.reload(image);
+        assert_eq!(f.store.metadata().unwrap().epoch, expected_q);
+        assert_eq!(f.store.metadata().unwrap().floor, metadata.floor);
+        assert_eq!(journal(&f.store, &key), expected_journal);
+        assert!(f.store.queue(&key).unwrap().queued > expected_q);
+    }
 }
 
-/// Scenario: Queue three keys and crash before the floor, after the floor, and after each unsynced or durable unlink. Each reload keeps G at least the floor, rejects completions for absent keys, and preserves untouched keys.
+/// Scenario: Queue three keys and crash before the floor, after the floor, and after each unsynced or durable unlink. Each reload has the specified floor and chosen journals at that checkpoint, rejects the specified old completions, and preserves the untouched key.
 #[test]
 #[spec("inbox/doorbell/061")]
 fn doorbell_061_prune_between_unlinks_keeps_floor() {
@@ -1306,14 +1682,50 @@ fn doorbell_061_prune_between_unlinks_keeps_floor() {
             let mut f = Fixture::new();
             let keys = [key("1.0.0"), key("2.0.0"), key("3.0.0")];
             let tickets: Vec<_> = keys.iter().map(|key| f.store.queue(key).unwrap()).collect();
+            let before: Vec<_> = keys.iter().map(|key| journal(&f.store, key)).collect();
+            let metadata = f.store.metadata().unwrap();
             testing::arm(&mut f.store, Fault::CrashAt(point));
             crashed(testing::prune_keys(&mut f.store, &keys[..2]), point);
             f.reload(image);
             let meta = f.store.metadata().unwrap();
-            assert!(meta.epoch >= meta.floor);
-            for (key, ticket) in keys.iter().zip(tickets) {
-                if f.store.view(key).unwrap().journal.is_none() {
-                    assert!(meta.floor >= ticket.queued);
+            assert_eq!(meta.epoch, metadata.epoch);
+            assert_eq!(
+                meta.floor,
+                if matches!(point, Checkpoint::PruneBeforeFloor) {
+                    metadata.floor
+                } else {
+                    metadata.epoch
+                }
+            );
+            let absent: Vec<_> = (0..3)
+                .map(|index| match point {
+                    Checkpoint::PruneBeforeFloor | Checkpoint::PruneFloorDurable => false,
+                    Checkpoint::PruneAfterUnlink { index: unlinked } => {
+                        index < unlinked
+                            || (index == unlinked && matches!(image, CrashImage::KeepUnsynced))
+                    }
+                    Checkpoint::PruneUnlinkDurable { index: unlinked } => index <= unlinked,
+                    _ => unreachable!(),
+                })
+                .collect();
+            // Assert the complete directory before publication can mutate it.
+            for (index, key) in keys.iter().enumerate() {
+                assert_eq!(
+                    f.store.view(key).unwrap().journal,
+                    (!absent[index]).then(|| before[index].clone()),
+                    "{point:?} {image:?}, key {index}"
+                );
+            }
+            let recovered: Vec<_> = keys.iter().map(|key| snapshot(&f.store, key)).collect();
+            f.reload(CrashImage::KeepUnsynced);
+            assert_eq!(
+                keys.iter()
+                    .map(|key| snapshot(&f.store, key))
+                    .collect::<Vec<_>>(),
+                recovered
+            );
+            for (index, (key, ticket)) in keys.iter().zip(tickets).enumerate() {
+                if absent[index] {
                     stale(&mut f.store, &ticket);
                 } else {
                     published(
@@ -1502,7 +1914,7 @@ fn doorbell_061_watermark_survives_successor_states() {
     assert!(journal(&f.store, &key).revoked_through >= trip);
 }
 
-/// Scenario: Run seeded random sequences of all transition rows, with a crash at a seeded write boundary and reloads after every action. The watermark never decreases, including across pruning and recreation; failures print the replay seed.
+/// Scenario: Run eight fixed seeds with 64 generated row choices each, replacing one choice with a queue-write crash at a seeded boundary and reloading after actions. Check the watermark through these bounded histories, including reachable pruning and recreation; failures print the replay seed.
 #[test]
 #[spec("inbox/doorbell/061")]
 fn doorbell_061_watermark_random_rows_random_crash() {
@@ -1557,12 +1969,14 @@ fn doorbell_061_validated_names_and_private_modes() {
     validation_controls();
 }
 
-/// Scenario: Publish over twenty results for one agent with older passing and newer nonpassing evidence. Retention removes the oldest nonpassing evidence first while every journal and watermark remains.
+/// Scenario: Publish over twenty distinct results for one agent with older passing and newer nonpassing evidence. Retention removes the oldest nonpassing evidence first; retained evidence and journals round-trip intact after reopening.
 #[test]
 #[spec("inbox/doorbell/061")]
 fn doorbell_061_evidence_retention_keeps_journals() {
     let mut f = Fixture::new();
     let mut keys = Vec::new();
+    let mut expected_evidence = Vec::new();
+    let mut expected_journals = Vec::new();
     for i in 0..22 {
         let key = key(&format!("1.0.{i}"));
         let ticket = f.store.queue(&key).unwrap();
@@ -1573,7 +1987,11 @@ fn doorbell_061_evidence_retention_keeps_journals() {
                 reason: "fixture".into(),
             }
         };
-        published(f.store.publish(&ticket, evidence(outcome), IMAGE).unwrap());
+        let mut value = evidence(outcome);
+        value.body = format!("retained evidence {i}\0\u{ff}").into_bytes();
+        published(f.store.publish(&ticket, value.clone(), IMAGE).unwrap());
+        expected_evidence.push(value);
+        expected_journals.push(journal(&f.store, &key));
         keys.push(key);
     }
     f.store.retain_evidence(20).unwrap();
@@ -1586,8 +2004,22 @@ fn doorbell_061_evidence_retention_keeps_journals() {
         .filter(|key| f.store.view(key).unwrap().evidence.is_some())
         .count();
     assert_eq!(count, 20);
-    for key in keys {
-        assert!(f.store.view(&key).unwrap().journal.is_some());
+    for reopen in [false, true] {
+        if reopen {
+            f.reload(CrashImage::KeepUnsynced);
+        }
+        for (index, key) in keys.iter().enumerate() {
+            let view = f.store.view(key).unwrap();
+            assert_eq!(view.journal.as_ref(), Some(&expected_journals[index]));
+            assert_eq!(
+                view.evidence,
+                if index == 1 || index == 2 {
+                    None
+                } else {
+                    Some(expected_evidence[index].clone())
+                }
+            );
+        }
     }
 }
 
@@ -1607,10 +2039,10 @@ fn doorbell_061_prune_oldest_event_skips_marks() {
     assert!(f.store.view(&keys[2]).unwrap().journal.is_some());
 }
 
-/// Scenario: Open two store handles and release two threads together to queue checks for the same key. Their epochs must be distinct and a later clean load must retain the maximum without any lost authority event.
+/// Scenario: Release two same-process threads together to queue checks through independent handles and check distinct epochs and the reloaded maximum. This concurrency smoke test does not force overlapping critical sections or establish cross-process flock behavior.
 #[test]
 #[spec("inbox/doorbell/061")]
-fn doorbell_061_store_lock_serializes_independent_handles() {
+fn doorbell_061_independent_handles_concurrency_smoke() {
     let f = Fixture::new();
     let root = f.root();
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
@@ -1632,7 +2064,7 @@ fn doorbell_061_store_lock_serializes_independent_handles() {
     epochs.sort();
     assert!(
         epochs[0] < epochs[1],
-        "store lock lost an epoch: {epochs:?}"
+        "same-process concurrency smoke lost an epoch: {epochs:?}"
     );
     let store = testing::open(&root, vec![owner(100)]).unwrap();
     assert_eq!(store.metadata().unwrap().epoch, epochs[1]);
