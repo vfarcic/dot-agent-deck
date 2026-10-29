@@ -10490,6 +10490,23 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** the line-number arguments Claude Code gives a known editor family, which the helper doesn't reproduce; a real process or terminal (`inbox/probe/020`, `067`).
 - **Platform coverage:** Linux.
 
+##### inbox/probe/015 — With no fence, attach input keeps its bytes, reconnect and resize behavior, and generation isolation.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_input_fence.rs`, `tests/support/input_fence.rs`), real daemon and attach sockets, no assumption variable or fence control.
+- **Agent:** a copy of the native test executable, in raw terminal mode; no real agent or credential.
+- **Asserts:** empty frames add no bytes; ordered frames preserve split terminal sequences, NUL, BEL and a paste larger than 1 MiB; a reattached connection continues the same byte stream; a real resize reaches the slave's `TIOCGWINSZ`; after natural exit, the predecessor's stream ends or refuses and only the replacement's own sentinel reaches its terminal. Exact raw captures and a fixture-side drain plus a stability window detect loss, duplication and late leakage.
+- **Does not assert:** forced short `write(2)` returns or partial/error physical outcomes: the writer-replacement seam is private to unit tests, and no attach-level fault injection exists. The large paste drives the real writer but does not claim to force a short syscall. It does not assert rendering, logical ticket bookkeeping, a real agent, or C1. These are equivalence guards expected to be GREEN on the pre-Q35-15 base.
+- **Platform coverage:** Linux.
+
+##### inbox/probe/023 — The attach loop hands fenced input off, keeps order across clients, and permits solicited replies except behind their own connection's Full frame.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_input_fence.rs`, `tests/support/input_fence.rs`), real daemon, raw attach clients and native slave-terminal recorder; installation uses the existing `claude@2.1.310` e2e assumption.
+- **Agent:** a copy of the native test executable; no real agent or credential.
+- **Asserts:** two clients' held frames reach the terminal in acceptance order after release; a client can answer a newly emitted DA1 query after handing off its own held key; a client at the 1 MiB fence cap with a Full waiter does not prevent another client's solicited reply passing ahead; a reply behind its own Full frame waits until release, then follows all that connection's bytes without loss; detach, reattach and resize preserve held bytes and do not release them; retirement ends or refuses held/Full connections and discards their bytes without delivering any to the successor. Final assertions compare actual raw terminal captures, including the pass-ahead class's permitted reordering.
+- **Synchronization contract:** the existing generation-bound `e2e-composer-control` gains `fence` (close at the current output offset, no input), `release` (production drain/revalidation), and read-only `fence-status`, whose `composer_fence.held_ops` and `full_waiters` counts arrange acceptance/backpressure barriers. A query must be seen on real attach output before its reply is sent. The status counts are not the output oracle.
+- **Does not assert:** automatic segment completion, query timeout duration, display of `input_held`, exact-once physical ticket accounting, count-cap fairness/reservation, query provenance on opposite sides of a trigger (coder's `011`), forced partial writes, or C1's responder. Explicit release substitutes for the later segment policy, and saturation of the replying connection is released by that control rather than a synthetic timeout claiming to be production authority. Q35-15 RED slice: fence/release/status are absent on its base.
+- **Platform coverage:** Linux.
+
 ##### inbox/probe/016 — The composer probe's wire declarations cross versions both ways, tolerate what a newer deck adds, and the invocation is answered unsupported and withheld without the capability.
 - **Layer:** Fast. Pure in `tests/composer_wire.rs`: this build's types against frozen copies of the v0.49.0 readers (vendored test-only structs copied from the `v0.49.0` tag: the answer request, pending question, pane snapshot, inbox summary and notice with their flattened card notices and the notice's provenance, capabilities answer, hook verbs and the agent-event fallback; nested values the commit does not touch kept as JSON), and the shared sender (`dot_agent_deck::hook::send_composer_invocation`) against a scripted Unix-socket daemon. In-module in `src/daemon.rs` (`composer_invocation_tests`): the real hook loop on a temp socket, with a reserved spawn's token and no PTY.
 - **Agent:** none.
