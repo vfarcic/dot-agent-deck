@@ -497,7 +497,9 @@ export function createFixtureStartedAgent(started: FixtureStartedAgent): AgentSe
     role,
     displayName: started.displayName || role,
     cli,
-    model: "Unavailable",
+    // None: the tile prints the model in fixture mode, and a live tile has
+    // none to print (issue #2001), so an empty one previews it faithfully.
+    model: "",
     status: "running",
     task: "Task metadata unavailable from the daemon",
     cwd: started.cwd,
@@ -1312,7 +1314,10 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
     currentAttempt: 1,
     paused: false,
     stages: state === "empty" || docs ? [] : stages.map((stage) => ({ ...stage })),
-    agents: fleet.map((agent) => ({ ...agent })),
+    // Issue #2001: the docs scenarios picture a LIVE deck, whose tile prints no
+    // model, while the tile prints one in fixture mode. Emptied here rather
+    // than in `crowdedAgent`, whose placeholder the crowded scenario keeps.
+    agents: fleet.map((agent) => (docs ? { ...agent, model: "" } : { ...agent })),
     handoffs: docs ? [] : [
       { id: "dlg-demo-3", toRole: "Reviewer", orchestration: "dot-agent-deck", taskPreview: "Review the terminal lifecycle change; report findings only.", status: "delegated", respawned: true, at: "14:41:22" },
       { id: "dlg-demo-2", toRole: "Builder", orchestration: "dot-agent-deck", taskPreview: "Implement the Tauri client as a second daemon surface.", status: "done", respawned: true, at: "14:40:58" },

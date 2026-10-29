@@ -157,7 +157,7 @@ test.describe("agent pane overlay", () => {
     await expect(overlay).toHaveAttribute("role", "dialog");
     await expect(overlay).toHaveAttribute("aria-label", "Planner agent");
     await expect(overlay).toHaveAttribute("aria-modal", "true");
-    await expect(overlay.getByRole("heading", { name: "Planner" })).toBeVisible();
+    await expect(overlay.getByRole("heading", { name: "Plan / architecture" })).toBeVisible();
     await expect(overlay.getByRole("button", { name: "Back to dashboard" })).toBeVisible();
     await expect(grid).toBeAttached();
     await expect(otherTile).toBeAttached();
@@ -224,7 +224,7 @@ test.describe("agent pane overlay", () => {
 
     const overlay = page.getByTestId("agent-pane-overlay");
     await expect(overlay).toBeVisible();
-    await expect(overlay.getByRole("heading", { name: "Builder" })).toBeVisible();
+    await expect(overlay.getByRole("heading", { name: "Nightly build watch" })).toBeVisible();
     await expect(overlay.locator(".agent-terminal-stack")).toHaveAttribute("data-terminal-state", "attached");
     await expect(overlay.locator(".terminal-viewport")).toBeVisible();
     await expect(overlay.getByLabel("Builder terminal input")).toBeAttached();

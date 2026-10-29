@@ -435,6 +435,27 @@ export function AgentTile({
   // The daemon's `error` is merged into `failed` for grouping; the card says
   // what the daemon said, the word the TUI's card uses (rule 22).
   const tileStatusLabel = agent.daemonStatus === "error" ? "error" : statusLabel(agent.status);
+  /*
+    Issue #2001 — the line under the title says what the agent IS, each fact
+    once, and only the facts the deck has. The title is the agent's name, so a
+    part that spells the same word is dropped: an agent started without a name
+    is named after its command (`claude`), and a role keeps its role name until
+    someone renames it. The role leads for an orchestration role and in the
+    preview; outside an orchestration a live deck's role IS the agent type,
+    which the binary already says, and so is a role that spells the binary
+    (`Codex` beside `codex`). With no binary reported, that role is the only
+    word for the type left, so it stays. The model is the preview's alone — a live
+    deck has none, and deciding that by mode rather than by matching the word
+    the bridge stores means no value the daemon sends can be hidden by its
+    spelling.
+  */
+  const sameWord = (a: string, b?: string) => b !== undefined && a.trim().toLowerCase() === b.trim().toLowerCase();
+  const nameIs = (word: string) => sameWord(word, agent.displayName);
+  const identityParts = [
+    (fixture || agent.tab.kind === "orchestration" || !agent.cli) && !nameIs(agent.role) && !sameWord(agent.role, agent.cli) ? agent.role : undefined,
+    agent.cli && !nameIs(agent.cli) ? agent.cli : undefined,
+    fixture ? agent.model : undefined,
+  ].filter((part): part is string => Boolean(part));
   const badge = inboxBadge(agent.inbox);
   const inboxNoticeRow = inboxNotice(agent.inbox);
   const attention = agent.inbox?.attention ?? [];
@@ -470,7 +491,8 @@ export function AgentTile({
           <div>
             <div className="agent-title-line">
               <VoiceNumber number={voiceNumber} hidden />
-              <h2>{agent.role}</h2>
+              {/* Issue #2001 — the name the agent was given or renamed to. */}
+              <h2 title={agent.displayName}>{agent.displayName}</h2>
               {agent.isStartRole && <span className="coordinator-badge" title="Orchestration start role">ORCHESTRATOR</span>}
               {/*
                 Issue #1143 — a held record's status is a past reading, so it is
@@ -512,9 +534,11 @@ export function AgentTile({
             ) : (
               <p>
                 {/* Issue #856: the binary the daemon named, dropped entirely
-                    when it named none — the separator goes with it rather than
-                    leaving a dangling `· Unavailable`. */}
-                {agent.cli ? <>{agent.cli} <span aria-hidden="true">·</span> </> : null}{agent.model}
+                    when it named none — each separator goes with the part it
+                    precedes rather than dangling. */}
+                {identityParts.map((part, index) => (
+                  <span key={index}>{index > 0 && <span aria-hidden="true"> · </span>}{part}</span>
+                ))}
                 {onRename && (
                   <button
                     className="agent-rename-trigger"
@@ -765,7 +789,12 @@ export function AgentTile({
       </div>
 
       <footer className="agent-footer">
-        <span>{fixture ? `LEASE · ${agent.writeLease.toUpperCase()}` : "LEASE · UNAVAILABLE"}</span>
+        {/* Issue #2001 — the lease is the preview's; a live tile prints none
+            rather than a fixed `LEASE · UNAVAILABLE`, and neither prints
+            `"unknown"`, the field's own absence marker (no daemon value spells
+            it; see `AgentSession.writeLease`). An empty cell keeps the footer's
+            three columns where they are. */}
+        <span>{fixture && agent.writeLease !== "unknown" ? `LEASE · ${agent.writeLease.toUpperCase()}` : null}</span>
         {/*
           The deck's own word for a working directory the daemon did not report.
           The model says `undefined` rather than carrying the word, because the

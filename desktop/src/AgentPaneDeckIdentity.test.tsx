@@ -212,15 +212,15 @@ describe("agent pane deck identity", () => {
     fireEvent.click(openControl("Plan / architecture"));
     const beforePane = screen.getByTestId("agent-pane-overlay");
     const beforeTerminal = within(beforePane).getByTestId("terminal-planner");
-    expect(within(beforePane).getByRole("heading", { name: "Planner" })).toBeVisible();
+    expect(within(beforePane).getByRole("heading", { name: "Plan / architecture" })).toBeVisible();
 
     await act(async () => { rerender(<DeckShell runtime={deck.runtime("remote")} initialView={{ kind: "overview" }} />); });
 
     const afterPane = screen.getByTestId("agent-pane-overlay");
     expect(afterPane).toBe(beforePane);
     expect(within(afterPane).getByTestId("terminal-planner")).toBe(beforeTerminal);
-    expect(within(afterPane).getByRole("heading", { name: "Planner" })).toBeVisible();
-    expect(within(afterPane).queryByRole("heading", { name: "Planner on build-box" })).toBeNull();
+    expect(within(afterPane).getByRole("heading", { name: "Plan / architecture" })).toBeVisible();
+    expect(within(afterPane).queryByRole("heading", { name: "Plan / architecture on build-box" })).toBeNull();
     expect(within(afterPane).queryByTestId("terminal-absent-planner")).toBeNull();
     expect(viewportProps.at(-1)).toMatchObject({ agentId: "planner", deckId: FIXTURE_DAEMON_ID });
     const declaration = JSON.stringify(deck.setShownTerminals.mock.calls.at(-1));
@@ -252,7 +252,7 @@ describe("agent pane deck identity", () => {
     fireEvent.click(openControl("Plan / architecture on build-box"));
 
     const pane = screen.getByTestId("agent-pane-overlay");
-    expect(within(pane).getByRole("heading", { name: "Planner on build-box" })).toBeVisible();
+    expect(within(pane).getByRole("heading", { name: "Plan / architecture on build-box" })).toBeVisible();
     expect(within(pane).queryByTestId("terminal-absent-planner")).toBeNull();
     expect(within(pane).getByTestId("terminal-planner")).toBeVisible();
     expect(pane.querySelector(".agent-terminal-stack")).toHaveAttribute("data-terminal-state", "attached");
@@ -299,7 +299,7 @@ describe("agent pane deck identity", () => {
     await act(async () => { rerender(<DeckShell runtime={deck.runtime("local")} initialView={{ kind: "overview" }} />); });
     expect(screen.getByTestId("agent-pane-overlay")).toBe(pane);
     expect(within(pane).getByTestId("terminal-planner")).toBe(terminal);
-    expect(within(pane).getByRole("heading", { name: "Planner on build-box" })).toBeVisible();
+    expect(within(pane).getByRole("heading", { name: "Plan / architecture on build-box" })).toBeVisible();
     expect(within(pane).queryByTestId("terminal-absent-planner")).toBeNull();
     for (const call of deck.setShownTerminals.mock.calls.slice(1)) {
       const declaration = JSON.stringify(call);
@@ -338,7 +338,7 @@ describe("agent pane deck identity", () => {
     fireEvent.click(openControl("Plan / architecture on build-box"));
 
     const pane = screen.getByTestId("agent-pane-overlay");
-    expect(within(pane).getByRole("heading", { name: "Planner on build-box" })).toBeVisible();
+    expect(within(pane).getByRole("heading", { name: "Plan / architecture on build-box" })).toBeVisible();
     expect(screen.queryByTestId("terminal-input-status-planner")).not.toBeInTheDocument();
     const mounted = viewportProps.filter((props) => props.agentId === "planner");
     expect(mounted).not.toHaveLength(0);
@@ -534,7 +534,7 @@ describe("agent pane identity fence", () => {
     const { rerender } = render(<DeckShell runtime={deck.runtime("local")} initialView={paneView} />);
 
     const pane = screen.getByTestId("agent-pane-overlay");
-    expect(within(pane).getByRole("heading", { name: "Planner" })).toBeVisible();
+    expect(within(pane).getByRole("heading", { name: "Plan / architecture" })).toBeVisible();
 
     await act(async () => { rerender(<DeckShell runtime={deck.runtime("remote")} initialView={paneView} />); });
 

@@ -608,6 +608,11 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .agent-state-mark.status-needs_input, .agent-state-mark.status-queued { color: var(--amber); background: var(--amber); }
 .agent-title-line { display: flex; align-items: center; gap: 6px; }
 .agent-title-line h2 { margin: 0; font-size: 12px; font-weight: 720; }
+/* Issue #2001: the title is the agent's name, which can be long, so it is the
+   one part of the line that gives way — cut with an ellipsis, the whole name in
+   its tooltip — and the status and badges beside it keep their full width. */
+.agent-title-line h2 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-title-line > :not(h2) { flex: 0 0 auto; }
 .agent-identity p { margin: 3px 0 0; overflow: hidden; color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 8.5px; text-overflow: ellipsis; white-space: nowrap; }
 .status-label { padding: 2px 4px; border-radius: 2px; color: var(--faint); background: var(--paper-sunken-strong); font-size: 7px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
 .status-label.status-running { color: var(--teal); background: var(--teal-soft); }
@@ -646,13 +651,19 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .agent-attempt { width: 38px; height: 33px; display: grid; grid-template-columns: 1fr; place-items: center; border-left: 1px solid var(--line); }
 .agent-attempt span { color: var(--faint); font-size: 7px; letter-spacing: .08em; }
 .agent-attempt strong { font-family: "JetBrains Mono", monospace; font-size: 11px; }
-.agent-assignment { min-height: 50px; padding: 7px 11px; border-bottom: 1px solid var(--line); background: var(--paper); }
-.agent-assignment > span { color: var(--faint); font-size: 7px; font-weight: 800; letter-spacing: .12em; }
-.agent-assignment p { margin: 3px 0 0; display: -webkit-box; overflow: hidden; color: var(--ink-soft); font-size: 9.5px; line-height: 1.35; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+/* Issue #2000: each label sits on its value's first line rather than on a row
+   of its own. A prompt that wraps hangs under its own first word, as the TUI
+   card's `Prmt:` does; the min-height is the two-line clamp, so a one-line
+   prompt does not make its tile shorter than its neighbours. */
+.agent-assignment { min-height: 40px; padding: 7px 11px; display: flex; align-items: baseline; gap: 8px; border-bottom: 1px solid var(--line); background: var(--paper); }
+.agent-assignment > span { flex: 0 0 auto; color: var(--faint); font-size: 7px; font-weight: 800; letter-spacing: .12em; }
+.agent-assignment p { min-width: 0; margin: 0; display: -webkit-box; overflow: hidden; color: var(--ink-soft); font-size: 9.5px; line-height: 1.35; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 /* One equal column per reading rather than a fixed four: with the agent
    details hidden (issue #1400) a live tile shows two, TIME and TOOLS. */
-.agent-instruments { min-height: 40px; display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; border-bottom: 1px solid var(--line); }
-.agent-instruments > div { padding: 6px 8px; display: flex; flex-direction: column; gap: 2px; border-right: 1px solid var(--line); }
+.agent-instruments { min-height: 26px; display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; border-bottom: 1px solid var(--line); }
+/* Issue #2000: label and value on one row, wrapping to two only when a cell is
+   too narrow for both. */
+.agent-instruments > div { padding: 6px 8px; display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 5px; border-right: 1px solid var(--line); }
 .agent-instruments > div:last-child { border: 0; }
 .agent-instruments span { color: var(--faint); font-size: 6.5px; font-weight: 800; letter-spacing: .1em; }
 .agent-instruments strong { font-size: 9px; }
@@ -662,7 +673,10 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .agent-tabs button em { min-width: 14px; padding: 1px 3px; border-radius: 8px; color: var(--shell-ink-soft); background: var(--shell-raised); font-size: 7px; font-style: normal; }
 .agent-tabs button:hover, .agent-tabs button.is-active { color: var(--shell-ink); }
 .agent-tabs button.is-active { border-bottom-color: var(--shell-teal); }
-.agent-panel { min-height: 320px; height: 42vh; max-height: 560px; display: flex; flex-direction: column; background: var(--terminal); }
+/* Issue #2000: the 26px the inline labels saved above the terminal go to the
+   terminal, so a tile keeps its height and shows more of it. The overlay's
+   panel flexes and needs no such sum. */
+.agent-panel { min-height: 346px; height: calc(42vh + 26px); max-height: 586px; display: flex; flex-direction: column; background: var(--terminal); }
 /* The terminal fills whatever the input-state notice leaves; min-height:0 lets
    it shrink instead of shoving that line past the tile's overflow:hidden edge.
    A bounded terminal also makes FitAddon report real rows to the PTY, so the
@@ -1225,7 +1239,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 @media (min-width: 1450px) {
   .agent-tabs button span { display: inline; }
   .agent-tabs button { min-width: 61px; }
-  .agent-panel { height: 36vh; max-height: 520px; }
+  .agent-panel { height: calc(36vh + 26px); max-height: 546px; }
 }
 
 @media (max-width: 1260px) {
@@ -1242,7 +1256,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
   .topbar { height: auto; min-height: 68px; grid-template-columns: 1fr auto; }
   .run-instruments { display: none; }
   .agent-grid { grid-template-columns: 1fr; }
-  .agent-panel { height: 340px; max-height: 340px; }
+  .agent-panel { height: 366px; max-height: 366px; }
   .workflow-track { overflow-x: auto; grid-template-columns: repeat(6, minmax(125px, 1fr)); }
   .command-trigger span { display: none; }
   .command-trigger { min-width: auto; }
@@ -1275,8 +1289,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
   .agent-tile:not(.is-selected) { display: none; }
   .agent-panel, .agent-tabs { display: none; }
   .agent-footer { height: 34px; }
-  .agent-instruments { min-height: 46px; }
-  .agent-assignment { min-height: 58px; }
+  .agent-instruments { min-height: 32px; }
+  .agent-assignment { min-height: 48px; }
   .evidence-drawer { width: 100%; inset: 0 0 var(--voice-reserved); grid-template-rows: 64px 38px 1fr auto 30px; }
   .config-sheet, .orchestration-sheet, .projects-sheet { width: 100%; }
   .projects-layout { display: flex; flex-direction: column; }
