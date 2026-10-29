@@ -1212,7 +1212,15 @@ mod linux {
         lost: Arc<Pool>,
         bell: Arc<Bell>,
         stopped: std::sync::atomic::AtomicBool,
+        /// A test's park in the drain (Q91), called with each exited
+        /// record's key between the drain's snapshot and its settlement,
+        /// with no lock held.
+        #[cfg(test)]
+        drain_park: std::sync::Mutex<Option<DrainPark>>,
     }
+
+    #[cfg(test)]
+    type DrainPark = Arc<dyn Fn(RecordKey) + Send + Sync>;
 
     /// A composer connection: its helper, held by the pidfd its observer
     /// watches for the helper's exit (the connection's peer pidfd, or the
@@ -1401,6 +1409,30 @@ mod linux {
         /// Whether `key`'s helper has a lost mark kept.
         pub(crate) fn lost_mark_for_test(&self, key: RecordKey) -> bool {
             self.lock().watch.unread.contains_key(&key)
+        }
+
+        /// Call `park` in every drain between its snapshot and its
+        /// settlement (Q91), with the record's key and no lock held: a test
+        /// blocks there to change what the settlement then reads.
+        pub(crate) fn park_drains_for_test(
+            &self,
+            park: impl Fn(RecordKey) + Send + Sync + 'static,
+        ) {
+            *self
+                .drain_park
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(park));
+        }
+
+        fn parked(&self, key: RecordKey) {
+            let park = self
+                .drain_park
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(park) = park {
+                park(key);
+            }
         }
     }
 
@@ -1612,6 +1644,8 @@ mod linux {
                 lost: Arc::new(Pool::new(LOST_PER_GENERATION)),
                 bell: Arc::clone(&bell),
                 stopped: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                drain_park: std::sync::Mutex::new(None),
             });
             let weak = Arc::downgrade(&observer);
             let thread = std::thread::Builder::new()
@@ -2284,27 +2318,22 @@ mod linux {
         /// a connection ended with bytes unread once its markers are read
         /// (Q85), or any of a generation whose loss overflowed (Q87), gives
         /// up to the uncertain outcome and keeps its markers and its record.
-        /// A settled one's markers are deleted with no lock held, and it is
-        /// pruned, its facts kept, once it may go.
+        /// The step is taken from the record's open connections, its loss
+        /// and the generation's overflow as they are under the lock the
+        /// settlement is committed under (Q91), not as the snapshot before
+        /// the marker reads found them: another helper's loss can latch the
+        /// overflow while those reads run with no lock held. A settled
+        /// one's markers are deleted with no lock held, and it is pruned,
+        /// its facts kept, once it may go.
         fn drains(&self, budget: &mut u32) {
             let name = self.name();
-            let waiting: Vec<(RecordKey, u32, bool, u32)> = {
+            let waiting: Vec<(RecordKey, u32, u32)> = {
                 let inner = self.lock();
                 inner
                     .watch
                     .exited
                     .iter()
-                    .map(|(key, retries)| {
-                        let open = inner.watch.open.get(key).map_or(0, Vec::len);
-                        let unread =
-                            inner.watch.lost_overflow || inner.watch.unread.contains_key(key);
-                        (
-                            *key,
-                            u32::try_from(open).unwrap_or(u32::MAX),
-                            unread,
-                            *retries,
-                        )
-                    })
+                    .map(|(key, retries)| (*key, open_of(&inner.watch, *key), *retries))
                     .collect()
             };
             if waiting.is_empty() {
@@ -2313,9 +2342,9 @@ mod linux {
             // The markers again, before any settles by its exit.
             let listing = waiting
                 .iter()
-                .any(|(_, open, _, _)| *open == 0)
+                .any(|(_, open, _)| *open == 0)
                 .then(|| self.reader.markers(&name, MARKER_NAMES_PER_PASS));
-            for (key, open, unread, retries) in waiting {
+            for (key, open, retries) in waiting {
                 let read = match &listing {
                     Some(listing) if open == 0 => self.drain_markers(listing, key, budget),
                     _ => MarkerRead {
@@ -2323,15 +2352,19 @@ mod linux {
                         complete: false,
                     },
                 };
+                #[cfg(test)]
+                self.parked(key);
                 let now = Instant::now();
+                let mut inner = self.lock();
+                let open = open_of(&inner.watch, key);
+                let unread = inner.watch.lost_overflow || inner.watch.unread.contains_key(&key);
                 match drain_step(open, read.complete, unread, retries) {
                     DrainStep::Wait => {
-                        if let Some(retries) = self.lock().watch.exited.get_mut(&key) {
+                        if let Some(retries) = inner.watch.exited.get_mut(&key) {
                             *retries += 1;
                         }
                     }
                     DrainStep::GiveUp => {
-                        let mut inner = self.lock();
                         inner.watch.exited.remove(&key);
                         inner.watch.unread.remove(&key);
                         let _ = inner.seam.drained_uncertain(key, now);
@@ -2347,12 +2380,10 @@ mod linux {
                         );
                     }
                     DrainStep::Settle => {
-                        let drained = {
-                            let mut inner = self.lock();
-                            inner.watch.exited.remove(&key);
-                            inner.watch.unread.remove(&key);
-                            inner.seam.drained(key, now)
-                        };
+                        inner.watch.exited.remove(&key);
+                        inner.watch.unread.remove(&key);
+                        let drained = inner.seam.drained(key, now);
+                        drop(inner);
                         let Ok(drained) = drained else {
                             continue;
                         };
@@ -2448,12 +2479,21 @@ mod linux {
             .is_some_and(|r| r.exit_observed.is_none())
     }
 
-    /// Hold `key`'s helper by `fd`: a pin E2 may signal replaces one it may
-    /// not, and nothing else replaces a pin.
-    fn hold(watch: &mut Watch, key: RecordKey, fd: Held, killable: bool) {
+    /// `key`'s helper's composer connections not finished yet.
+    fn open_of(watch: &Watch, key: RecordKey) -> u32 {
+        u32::try_from(watch.open.get(&key).map_or(0, Vec::len)).unwrap_or(u32::MAX)
+    }
+
+    /// Pin `key`'s helper: a pin E2 may signal replaces one it may not, and
+    /// nothing else replaces a pin. The pin is the hold already kept for the
+    /// helper (Q87, Q91), its connections', its lost mark's or the pin it
+    /// replaces, so a helper is held once however its pin is made; only a
+    /// helper held by nothing yet is held by `fresh`.
+    fn hold(watch: &mut Watch, key: RecordKey, fresh: Held, killable: bool) {
         match watch.pins.get(&key) {
             Some(pin) if pin.killable || !killable => {}
             _ => {
+                let fd = watch.held(key).unwrap_or(fresh);
                 watch.pins.insert(key, Pin { fd, killable });
             }
         }

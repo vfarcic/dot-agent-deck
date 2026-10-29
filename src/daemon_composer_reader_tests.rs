@@ -19,7 +19,7 @@ use crate::composer_probe::epoch::GenerationInput;
 use crate::composer_probe::install::{Originals, PaneClass, ProbeAgent, install};
 use crate::composer_probe::instance::{DaemonId, Instance, open_root, splittable};
 use crate::composer_probe::observe::{
-    CONNECTIONS_PER_GENERATION, ControlOp, HeldForTest, LOST_PER_GENERATION, Observer,
+    CONNECTIONS_PER_GENERATION, ControlOp, HeldForTest, LOST, LOST_PER_GENERATION, Observer,
     READ_DEADLINE, Spawned,
 };
 use crate::composer_probe::record::{
@@ -978,5 +978,269 @@ async fn probe_074_half_an_invocation_ended_by_the_close_drains_uncertain() {
         input.record(clean_key)
     );
     assert_eq!(input.liability_count(), Some(0));
+    deck.stop().await;
+}
+
+/// Where a test parks the observer's drain of one record (Q91): the drain
+/// blocks there, between its snapshot and its settlement, until released.
+/// Released when dropped too, so a failing test never leaves the observer's
+/// thread parked.
+#[derive(Default)]
+struct DrainGate {
+    /// Parked, released.
+    state: std::sync::Mutex<(bool, bool)>,
+    changed: std::sync::Condvar,
+}
+
+impl DrainGate {
+    fn lock(&self) -> std::sync::MutexGuard<'_, (bool, bool)> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The observer's side: wait here until released.
+    fn park(&self) {
+        let mut state = self.lock();
+        state.0 = true;
+        self.changed.notify_all();
+        while !state.1 {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn parked(&self) -> bool {
+        self.lock().0
+    }
+
+    fn release(&self) {
+        self.lock().1 = true;
+        self.changed.notify_all();
+    }
+}
+
+/// Releases its gate when dropped.
+struct Released(Arc<DrainGate>);
+
+impl Drop for Released {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+/// Units of the daemon's total lost pool a test took, given back when
+/// dropped. The pool is a process static: nextest runs each test in its own
+/// process, so no other test sees it full.
+struct TakenFromTotal(u32);
+
+impl Drop for TakenFromTotal {
+    fn drop(&mut self) {
+        for _ in 0..self.0 {
+            LOST.give();
+        }
+    }
+}
+
+/// What latches the generation's loss overflow while a drain is parked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Latch {
+    Nothing,
+    /// The generation's lost pool is full.
+    Generation,
+    /// The daemon's total lost pool is full.
+    Total,
+}
+
+/// A decisionless `Owned` helper born after a liability's publication is
+/// killed, and its drain parked between its snapshot and its settlement
+/// (Q91); `latch` then latches the generation's loss overflow, or doesn't,
+/// through another helper's connection ending with bytes unread, and the
+/// drain is released. With the overflow latched the exit drains only to
+/// the uncertain outcome and the liability stays; without it, it settles
+/// and consumes.
+async fn overflow_while_a_drain_is_parked(latch: Latch) {
+    let mut deck = Deck::start_bound().await;
+    assert!(
+        wait_for(SETTLE, || deck.observer.permission() == Permission::Armable).await,
+        "{:?}",
+        deck.observer.permission()
+    );
+    // Before the publication, so no scan records them: live helpers holding
+    // every lost mark the generation keeps, and one more whose connection
+    // stays open to lose its bytes later.
+    if latch == Latch::Generation {
+        for i in 0..LOST_PER_GENERATION {
+            let (pid, _) = deck.helper(&format!("marked-{i}"), 0).await;
+            let conn = deck
+                .observer
+                .connect(Ok(Some(pidfd(pid))))
+                .expect("admitted");
+            conn.lose();
+        }
+        assert_eq!(
+            deck.observer.lost_for_test(),
+            (LOST_PER_GENERATION as usize, LOST_PER_GENERATION, false),
+            "the generation's pool full, and nothing latched yet"
+        );
+    }
+    let (loser, _) = deck.helper("loser", 0).await;
+    let late = deck
+        .observer
+        .connect(Ok(Some(pidfd(loser))))
+        .expect("admitted");
+
+    assert_eq!(
+        deck.observer.control(deck.generation, ControlOp::Publish),
+        Ok(1)
+    );
+    let input = deck.observer.input();
+    // Born after the publication, past its start ticks' granularity.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (helper, _) = deck.owned_helper("parked", 0).await;
+    let key = key_of(helper);
+    deck.scanned_owned(key).await;
+    let gate = Arc::new(DrainGate::default());
+    let _released = Released(Arc::clone(&gate));
+    deck.observer.park_drains_for_test({
+        let gate = Arc::clone(&gate);
+        move |drained| {
+            if drained == key {
+                gate.park();
+            }
+        }
+    });
+    deck.kill(helper);
+    assert!(
+        wait_for(SETTLE, || gate.parked()).await,
+        "the drain reaches its settlement"
+    );
+    assert!(
+        !deck.observer.lost_for_test().2,
+        "nothing latched when the drain took its snapshot"
+    );
+    match latch {
+        Latch::Nothing => {}
+        Latch::Generation => late.lose(),
+        Latch::Total => {
+            let mut taken = TakenFromTotal(0);
+            while LOST.take() {
+                taken.0 += 1;
+            }
+            late.lose();
+            assert_eq!(
+                deck.observer.lost_for_test().1,
+                0,
+                "the generation's unit given back when the total refused"
+            );
+        }
+    }
+    assert_eq!(
+        deck.observer.lost_for_test().2,
+        latch != Latch::Nothing,
+        "{latch:?}"
+    );
+    gate.release();
+
+    if latch == Latch::Nothing {
+        assert!(
+            wait_for(SETTLE, || deck
+                .observer
+                .exit_fact(key)
+                .is_some_and(|f| f.settlement == Settlement::Consumed))
+            .await,
+            "with no overflow the parked drain settles and consumes: {:?}",
+            input.record(key)
+        );
+        assert_eq!(input.liability_count(), Some(0));
+    } else {
+        assert!(
+            wait_for(SETTLE, || deck.uncertain(key)).await,
+            "an overflow latched before the settlement drains uncertain: {:?}",
+            input.record(key)
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let record = input.record(key).expect("kept");
+        assert_eq!(
+            record.settlement,
+            Settlement::NotConsumed(NotConsumed::Unproven)
+        );
+        assert_eq!(
+            input.liability_count(),
+            Some(1),
+            "never consumed by the exit alone"
+        );
+    }
+    drop(late);
+    deck.stop().await;
+}
+
+/// Scenario: With `A` bound, the generation's lost pool filled by live helpers' marks and a liability published, a decisionless `Owned` helper born after the publication is killed and its drain is held between its snapshot and its settlement. Meanwhile another helper's connection ends with bytes unread, finds no lost mark left and latches the generation's loss overflow; released, the drain settles only to the uncertain outcome and the liability stays.
+#[spec("inbox/probe/074")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_074_overflow_latched_by_the_generation_pool_during_a_drain_holds_it_uncertain() {
+    overflow_while_a_drain_is_parked(Latch::Generation).await;
+}
+
+/// Scenario: With `A` bound and a liability published, a decisionless `Owned` helper born after the publication is killed and its drain is held between its snapshot and its settlement. Meanwhile the daemon's total lost pool is taken whole, as other generations' marks would, and another helper's connection ends with bytes unread: the total refuses it a mark, the generation's unit comes back, and its loss overflow latches. Released, the drain settles only to the uncertain outcome and the liability stays.
+#[spec("inbox/probe/074")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_074_overflow_latched_by_the_total_pool_during_a_drain_holds_it_uncertain() {
+    overflow_while_a_drain_is_parked(Latch::Total).await;
+}
+
+/// Scenario: The control for the two above: the same decisionless `Owned` helper's drain is held between its snapshot and its settlement and released with nothing lost meanwhile; it settles by its exit and consumes the liability.
+#[spec("inbox/probe/074")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_074_a_drain_held_with_no_overflow_settles_and_consumes() {
+    overflow_while_a_drain_is_parked(Latch::Nothing).await;
+}
+
+/// Scenario: With `A` bound and nothing published, so no scan runs, a live helper copy with no record gets a connection registered by its pidfd, held by its own hold. A liability is then published, and the child scan records the helper and pins it: the pin is the connection's hold, not a second one.
+#[spec("inbox/probe/074")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_074_a_scan_after_a_connection_pins_its_hold() {
+    let mut deck = Deck::start_bound().await;
+    assert!(
+        wait_for(SETTLE, || deck.observer.permission() == Permission::Armable).await,
+        "{:?}",
+        deck.observer.permission()
+    );
+    let (helper, _) = deck.owned_helper("connected", 0).await;
+    let key = key_of(helper);
+    let conn = deck
+        .observer
+        .connect(Ok(Some(pidfd(helper))))
+        .expect("admitted");
+    assert_eq!(
+        conn.held_for_test(),
+        HeldForTest {
+            peer: Some(true),
+            lost: None,
+            pin: None
+        },
+        "admitted watched, by its own hold, before any scan"
+    );
+    assert_eq!(
+        deck.observer.control(deck.generation, ControlOp::Publish),
+        Ok(1)
+    );
+    let input = deck.observer.input();
+    assert!(
+        wait_for(SETTLE, || input.record(key).is_some()
+            && conn.held_for_test().pin.is_some())
+        .await,
+        "the scan records and pins the helper: {:?}",
+        input.record(key)
+    );
+    assert_eq!(
+        conn.held_for_test().pin,
+        Some(true),
+        "the scan's pin is the connection's hold"
+    );
+    drop(conn);
+    deck.kill(helper);
     deck.stop().await;
 }
