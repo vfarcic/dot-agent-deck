@@ -395,20 +395,24 @@ pub const SPAN_AGENT_RUN: &str = "agent.run";
 pub const SPAN_AGENT_STATUS: &str = "agent.status";
 pub const SPAN_AGENT_OPERATION: &str = "agent.operation";
 pub const SPAN_AGENT_CI: &str = "agent.ci";
-/// Issue #1981 M7: one delegated task, from its post to the orchestrator
-/// reading its report ([`handoff`]).
+/// Issue #1981 M7: one delegated task, from its post to its report arriving
+/// ([`handoff`]).
 pub const SPAN_AGENT_HANDOFF: &str = "agent.handoff";
+/// Issue #1981 M7: the orchestrator reading a task's report, from the report
+/// arriving to the orchestrator acknowledging it ([`handoff`]).
+pub const SPAN_AGENT_HANDOFF_READ: &str = "agent.handoff.read";
 /// Issue #1981 M8: the daemon's own health over one interval ([`health`]).
 pub const SPAN_DAEMON_HEALTH: &str = "daemon.health";
 
 /// Every span name, for the tests that check what reaches a payload.
 #[cfg(test)]
-pub const SPAN_NAMES: [&str; 6] = [
+pub const SPAN_NAMES: [&str; 7] = [
     SPAN_AGENT_RUN,
     SPAN_AGENT_STATUS,
     SPAN_AGENT_OPERATION,
     SPAN_AGENT_CI,
     SPAN_AGENT_HANDOFF,
+    SPAN_AGENT_HANDOFF_READ,
     SPAN_DAEMON_HEALTH,
 ];
 
