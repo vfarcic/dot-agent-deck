@@ -13628,6 +13628,22 @@ PRD #1666 part 3, round 5: where the deck keeps a worker's report, or a dispatch
 - **Does not assert:** Codex's tool policy, real Claude's sourcing behavior, helper dispatch, or a nested agent.
 - **Platform coverage:** Linux.
 
+##### inbox/probe/062 — A reader frontier follows the reaped child's completed slave writes and waits while foreign output remains ready.
+
+- **Layer:** L2 lane 1 (`tests/e2e_pty_drain_frontier.rs`), the real sandbox daemon and PTY reader, a Python slave writer and raw AttachStream capture.
+- **Agent:** synthetic Python only; no real agent or editor.
+- **Asserts:** 1,000 reaped-child trials with bursts larger than the line-discipline buffer and three split writes place every completed byte behind frontier `o`; the capture equals the written stream byte for byte. With each zero poll paused, a foreign writer fills the master to EAGAIN three times; the shared request stays pending, then settles after draining without a fresh wake. A separate GREEN fixture control runs those 1,000 writes without claiming frontier evidence. The preserved e2e no-zero-poll mutant is selected through `DAD_TEST_FRONTIER_MUTANT=1`; it must make the foreign-writer case RED once the assumed interface exists.
+- **Does not assert:** E-PIN, E-LD or E-MF (acceptance gates requiring independent evidence); marker authority, EC/E1F, the private poll/error/CAS/lifecycle rows or lock ordering. Coder owns master-before-wake combined readiness, nonempty zero poll then read, HUP-only/ERR/NVAL/EINTR/errors, stale generation, queued teardown, marker start before `o`, wake retirement/errors/coalescing, offset exhaustion, and A6's after-zero-before-publication race in both orders, including reader-local snapshots, retirement before adoption and later requests with one outcome and settlement. The e2e interface and barrier assumptions are documented in the test module; missing operations are a runtime RED, not a mock frontier. Mutation evidence remains owed until implementation.
+- **Platform coverage:** Linux. macOS remains `Missing` until its independent support/evidence exists; this Linux slice does not execute a macOS request.
+
+##### inbox/probe/063 — A surviving predecessor-slave writer cannot put its return-marker sentinel on the successor master stream.
+
+- **Layer:** L2 lane 1 (`tests/e2e_pty_generation_isolation.rs`), the production registry and real PTY reader/subscription, with separate respawn and close-then-recreate cases.
+- **Agent:** Python stand-ins only; no real agent or editor.
+- **Asserts:** the detached retained-slave writer's sentinel, including `?2004h` and `?2026h`, appears on the predecessor stream first. The predecessor capture handle is dropped before teardown. The same surviving writer acknowledges each of three actual post-replacement write attempts, reporting success or an old-terminal errno, while a successor-owned marker advances the raw successor capture after each attempt; that capture excludes the predecessor sentinel. The recreation case confirms it took the missing-record path separately from respawn.
+- **Does not assert:** successor frontier or E1F (later surfaces, not executable on this base); terminal identity from fd numbers or pts names; a writer acquiring the successor slave by path; the daemon's socket/CLI restart route. This regression is expected GREEN on the base, with no manufactured production failure.
+- **Platform coverage:** Linux; no macOS execution is claimed.
+
 ##### inbox/probe/064 — Installation is decided before a spawn from its command class and the rollout, and an installed spawn gets the helper, its saved editor settings and its generation's files.
 
 - **Layer:** Fast (`tests/editor_installer.rs`, Linux), pure and on real files in a temporary directory: the decision and what it installs (`src/composer_probe/install.rs`) in an instance made by `src/composer_probe/instance.rs`; the environment file and the appended arguments run through a real `bash`. No daemon, PTY or agent; `inbox/probe/012`, `033` and `034` drive installation through a daemon's real spawns.
