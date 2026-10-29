@@ -2696,7 +2696,7 @@ impl Sender {
 
 /// At most `max` bytes of `response`'s body; what could not be read is left
 /// out.
-async fn bounded_body(mut response: reqwest::Response, max: usize) -> Vec<u8> {
+pub(super) async fn bounded_body(mut response: reqwest::Response, max: usize) -> Vec<u8> {
     let mut body = Vec::new();
     while body.len() < max {
         let Ok(Some(chunk)) = response.chunk().await else {

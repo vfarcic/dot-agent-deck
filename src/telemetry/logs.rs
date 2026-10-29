@@ -9,28 +9,37 @@
 //! own tree is a path on the machine that built the binary, so only a relative
 //! one is sent.
 //!
+//! An event from a library that logs through the `log` crate reaches `tracing`
+//! on a callsite shared by every such event, so its record says
+//! `deck.log.target=log` and has no file or line: the real ones are field
+//! values, which are not sent.
+//!
 //! **What it costs a callsite.** [`OtlpLogLayer::on_event`] runs inside the
 //! `tracing` macro, wherever the daemon logs, some of it under locks the PTY
-//! and doorbell paths rank. It does bounded, non-blocking work only: when the
-//! export is live it copies the event's static metadata and the time into a
-//! bounded channel with `try_send`, and when that channel is full it drops the
-//! record and counts it. It takes no lock. Everything else — draining,
-//! encoding, sending — happens on the export task, off the callsite.
+//! and doorbell paths rank. It does bounded, non-blocking work only: it copies
+//! the event's static metadata and the time into a bounded channel with
+//! `try_send`, and when that channel is full it drops the record and counts
+//! it. It takes no lock. Everything else — draining, encoding, sending —
+//! happens on the export task, off the callsite.
 //!
-//! **When it is live.** The layer is installed with the file logger
+//! **When it sends.** The layer is installed with the file logger
 //! ([`otlp_log_layer`], from the binary's `init_logging_from_env`) whenever
-//! the process environment configures an OTLP logs destination, and does
-//! nothing until the daemon starts its telemetry ([`start_for_daemon`]), so a
-//! TUI or CLI process never exports. Its filter is its own ([`filter`]): WARN
-//! and above, whatever `RUST_LOG` says, and nothing from the telemetry module
-//! itself, so an export that fails cannot feed its own failure back in.
+//! the process environment configures an OTLP logs destination, and keeps
+//! what it sees from then on, so the daemon's warnings from before its
+//! telemetry starts are sent too. Only the daemon starts an export
+//! ([`start_for_daemon`]): in a TUI or CLI process the channel fills to its
+//! bound and then drops, and nothing is sent. Its filter is its own
+//! ([`filter`]): WARN and above, whatever `RUST_LOG` says, and nothing from
+//! the telemetry module itself, so an export that fails cannot feed its own
+//! failure back in; such failures go to the file logger, at most once a
+//! minute.
 //!
 //! **Best effort.** One attempt per batch, no retries: a batch the backend
 //! does not take is lost, and so are records still in the channel when the
 //! daemon stops. Records the channel dropped are reported in the next batch as
 //! one record carrying `deck.telemetry.logs.dropped`.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -155,7 +164,6 @@ pub struct Record {
 pub struct LogChannel {
     tx: SyncSender<Record>,
     rx: Mutex<Option<Receiver<Record>>>,
-    live: AtomicBool,
     dropped: AtomicU64,
 }
 
@@ -165,16 +173,13 @@ impl LogChannel {
         Arc::new(LogChannel {
             tx,
             rx: Mutex::new(Some(rx)),
-            live: AtomicBool::new(false),
             dropped: AtomicU64::new(0),
         })
     }
 
-    /// Start accepting records, and hand over the receiving end — once.
-    fn go_live(&self) -> Option<Receiver<Record>> {
-        let rx = self.rx.lock().unwrap_or_else(|p| p.into_inner()).take()?;
-        self.live.store(true, Ordering::Release);
-        Some(rx)
+    /// The receiving end, for the export task — once.
+    fn take_receiver(&self) -> Option<Receiver<Record>> {
+        self.rx.lock().unwrap_or_else(|p| p.into_inner()).take()
     }
 
     /// Records dropped since the last call.
@@ -201,9 +206,6 @@ impl OtlpLogLayer {
 
 impl<S: Subscriber> Layer<S> for OtlpLogLayer {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-        if !self.channel.live.load(Ordering::Acquire) {
-            return;
-        }
         let record = Record {
             metadata: event.metadata(),
             time_unix_nanos: now_unix_nanos(),
@@ -226,8 +228,8 @@ pub fn filter() -> Targets {
 }
 
 /// The layer to install beside the file logger, filtered by [`filter`], when
-/// the process environment configures an OTLP logs destination. It stays idle
-/// until [`start_for_daemon`].
+/// the process environment configures an OTLP logs destination. What it keeps
+/// is sent once the daemon calls [`start_for_daemon`].
 pub fn otlp_log_layer<S>() -> Option<Filtered<OtlpLogLayer, Targets, S>>
 where
     S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
@@ -247,26 +249,8 @@ pub fn start_for_daemon(env: &EnvMap) {
     if tokio::runtime::Handle::try_current().is_err() {
         return;
     }
-    let Some(rx) = channel.go_live() else {
-        return;
-    };
-    let channel = Arc::clone(channel);
-    let host = host_name();
-    tokio::spawn(export(channel, rx, config, host));
-}
-
-/// The export task: every [`EXPORT_INTERVAL`], send what accumulated.
-async fn export(
-    channel: Arc<LogChannel>,
-    rx: Receiver<Record>,
-    config: LogsConfig,
-    host: Option<String>,
-) {
-    let resource = deck_resource(
-        &config.service_name,
-        host.as_deref(),
-        &config.user_resource_attributes,
-    );
+    // Built before the receiver is taken, so a client that cannot be built
+    // leaves the export for nothing to have claimed.
     let Ok(client) = reqwest::Client::builder()
         .timeout(config.timeout)
         .redirect(reqwest::redirect::Policy::none())
@@ -276,6 +260,28 @@ async fn export(
         tracing::warn!("telemetry: the OTLP logs client could not be built; no logs are sent");
         return;
     };
+    let Some(rx) = channel.take_receiver() else {
+        return;
+    };
+    let channel = Arc::clone(channel);
+    let host = host_name();
+    tokio::spawn(export(channel, rx, config, client, host));
+}
+
+/// The export task: every [`EXPORT_INTERVAL`], send what accumulated.
+async fn export(
+    channel: Arc<LogChannel>,
+    rx: Receiver<Record>,
+    config: LogsConfig,
+    client: reqwest::Client,
+    host: Option<String>,
+) {
+    let resource = deck_resource(
+        &config.service_name,
+        host.as_deref(),
+        &config.user_resource_attributes,
+    );
+    let mut failures = super::exporter::RateLimitedLog::new(super::exporter::ERROR_LOG_INTERVAL);
     tracing::info!(
         endpoint = %config::redacted_endpoint(&config.endpoint),
         "telemetry: exporting the daemon's warnings and errors as OTLP logs"
@@ -306,19 +312,47 @@ async fn export(
                 .body(body)
                 .send()
                 .await;
-            match sent {
-                Ok(response) if response.status().is_success() => {}
-                Ok(response) => tracing::debug!(
-                    status = response.status().as_u16(),
-                    "telemetry: the OTLP backend did not take a batch of logs"
-                ),
-                Err(_) => tracing::debug!("telemetry: a batch of OTLP logs could not be sent"),
+            let failure = match sent {
+                Ok(response) if response.status().is_success() => {
+                    rejected(&config.protocol, response)
+                        .await
+                        .map(|n| format!("the backend did not accept {n} of them"))
+                }
+                Ok(response) => Some(format!(
+                    "the backend answered HTTP {}",
+                    response.status().as_u16()
+                )),
+                Err(_) => Some("the request could not be sent".to_string()),
+            };
+            // To the file logger only: the layer leaves the telemetry
+            // module's own events out, so this cannot feed itself.
+            if let Some(failure) = failure
+                && let Some(suppressed) = failures.record(std::time::Instant::now())
+            {
+                tracing::warn!(
+                    records = records.len(),
+                    suppressed_failures = suppressed,
+                    endpoint = %config::redacted_endpoint(&config.endpoint),
+                    "telemetry: OTLP logs export failed: {failure}"
+                );
             }
             if !full {
                 break;
             }
         }
     }
+}
+
+/// How many records a successful answer says the backend did not accept, from
+/// its `partial_success`, when any. Its message is not read: it can echo the
+/// configured headers' values.
+async fn rejected(protocol: &Protocol, response: reqwest::Response) -> Option<i64> {
+    let body = super::exporter::bounded_body(response, super::exporter::MAX_RESPONSE_BODY).await;
+    let partial = match protocol {
+        Protocol::HttpJson => super::otlp::decode_logs_partial_success_json(&body),
+        _ => super::otlp::decode_partial_success_protobuf(&body),
+    }?;
+    (partial.rejected > 0).then_some(partial.rejected)
 }
 
 fn severity(level: &Level) -> (u64, &'static str) {
@@ -488,7 +522,7 @@ mod tests {
 
     fn live(capacity: usize) -> (Arc<LogChannel>, Receiver<Record>) {
         let channel = LogChannel::new(capacity);
-        let rx = channel.go_live().unwrap();
+        let rx = channel.take_receiver().unwrap();
         (channel, rx)
     }
 
@@ -538,17 +572,19 @@ mod tests {
     }
 
     /// Only WARN and ERROR reach the channel, nothing from the telemetry
-    /// module, and nothing before the export is live.
+    /// module; and a warning from before the export started is kept for it
+    /// (Qodo review on PR #2021: the daemon's startup warnings).
     #[test]
-    fn the_layer_takes_warnings_and_errors_only_once_live() {
+    fn the_layer_takes_warnings_and_errors_from_its_install() {
         let channel = LogChannel::new(16);
         log_through(
             subscriber_with(OtlpLogLayer::new(Arc::clone(&channel))),
             || {
-                tracing::warn!(target: DAEMON, "before the export is live");
+                tracing::warn!(target: DAEMON, "before the export started");
             },
         );
-        let rx = channel.go_live().unwrap();
+        let rx = channel.take_receiver().unwrap();
+        assert_eq!(rx.try_iter().count(), 1, "kept for the export");
         log_through(
             subscriber_with(OtlpLogLayer::new(Arc::clone(&channel))),
             || {
@@ -646,10 +682,73 @@ mod tests {
 
     /// The receiving end is handed out once, so a second start does nothing.
     #[test]
-    fn the_export_goes_live_once() {
+    fn the_export_starts_once() {
         let channel = LogChannel::new(1);
-        assert!(channel.go_live().is_some());
-        assert!(channel.go_live().is_none());
+        assert!(channel.take_receiver().is_some());
+        assert!(channel.take_receiver().is_none());
+    }
+
+    /// Greptile and Qodo review on PR #2021: the protobuf body, the default
+    /// protocol, decoded field by field against `logs.proto`: the resource,
+    /// the scope, each record's time, severity number and text, observed
+    /// time and attributes, no body, and the dropped count's record.
+    #[test]
+    fn the_protobuf_body_follows_logs_proto() {
+        use crate::telemetry::otlp::tests::{Field, fields, sub};
+        let (channel, rx) = live(4);
+        log_through(subscriber_with(OtlpLogLayer::new(channel)), || {
+            tracing::error!(target: DAEMON, pane_id = SECRET, "failed");
+        });
+        let records: Vec<Record> = rx.try_iter().collect();
+        let resource = deck_resource("dot-agent-deck", Some("h"), &[]);
+        let body = encode_protobuf(&resource, &records, 3, 99);
+        let resource_logs = sub(&body, 1);
+        assert_eq!(resource_logs.len(), 1);
+        let resource_msg = sub(resource_logs[0], 1)[0];
+        assert!(!sub(resource_msg, 1).is_empty(), "resource attributes");
+        let scope_logs = sub(resource_logs[0], 2)[0];
+        let scope = sub(scope_logs, 1)[0];
+        assert_eq!(sub(scope, 1)[0], SCOPE_NAME.as_bytes());
+        let log_records = sub(scope_logs, 2);
+        assert_eq!(log_records.len(), 2, "the error and the dropped count");
+        let key_of = |kv: &[u8]| String::from_utf8(sub(kv, 1)[0].to_vec()).unwrap();
+        for (record, (severity, text, time)) in log_records.iter().zip([
+            (SEVERITY_ERROR, "ERROR", records[0].time_unix_nanos),
+            (SEVERITY_WARN, "WARN", 99),
+        ]) {
+            let mut seen = Vec::new();
+            for (field, value) in fields(record) {
+                match (field, value) {
+                    (1, Field::Fixed64(t)) => assert_eq!(t, time),
+                    (2, Field::Varint(n)) => assert_eq!(n, severity),
+                    (3, Field::Bytes(t)) => assert_eq!(t, text.as_bytes()),
+                    (6, Field::Bytes(_)) => {}
+                    (11, Field::Fixed64(t)) => assert_eq!(t, 99),
+                    (other, value) => panic!("unexpected field {other}: {value:?}"),
+                }
+                seen.push(field);
+            }
+            for field in [1, 2, 3, 6, 11] {
+                assert!(seen.contains(&field), "field {field} missing: {seen:?}");
+            }
+            assert!(!seen.contains(&5), "no body");
+        }
+        let keys: Vec<String> = sub(log_records[0], 6).into_iter().map(key_of).collect();
+        assert_eq!(
+            keys,
+            [
+                "deck.log.target",
+                "code.file.path",
+                "code.line.number",
+                "deck.log.fields"
+            ]
+        );
+        let dropped = sub(log_records[1], 6);
+        assert_eq!(key_of(dropped[0]), "deck.telemetry.logs.dropped");
+        assert!(matches!(
+            fields(sub(dropped[0], 2)[0])[..],
+            [(3, Field::Varint(3))]
+        ));
     }
 
     #[test]

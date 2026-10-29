@@ -342,7 +342,7 @@ To send it more or less often, set `DOT_AGENT_DECK_TELEMETRY_HEALTH_INTERVAL_MS`
 
 ### The daemon's warnings and errors
 
-Besides the traces, the daemon sends each warning and error it logs as an OTLP log record (the same warnings and errors its log file records when you turn that on), so a problem the daemon logs shows up in your backend next to the runs it affected. Records go to `<OTEL_EXPORTER_OTLP_ENDPOINT>/v1/logs`, every two seconds or so, with the same resource attributes as the spans.
+Besides the traces, the daemon sends each warning and error it logs as an OTLP log record, from its start onwards, so a problem the daemon logs shows up in your backend next to the runs it affected. Records go to `<OTEL_EXPORTER_OTLP_ENDPOINT>/v1/logs`, every two seconds or so, with the same resource attributes as the spans.
 
 A record says **where** the daemon logged and how bad it was, never **what** it logged:
 
@@ -354,6 +354,11 @@ A record says **where** the daemon logged and how bad it was, never **what** it 
 | `deck.log.fields` | The names of the fields the statement logs, comma-separated, such as `message,pane_id`. Their values are never sent. |
 
 There is no message text: the record has no body. To read what a warning said, look up the same time in the daemon's log on your machine ([Enabling Debug Logs](troubleshooting.md#enabling-debug-logs)); the source file and line tell you which statement it was.
+
+The records and the log file do not hold quite the same set:
+
+- **Warnings about the telemetry itself are not sent**, such as an export the backend refused, because a failing export cannot report itself. They are in the log file, at most one a minute.
+- **Warnings from libraries the deck uses are sent**, even though the log file only records their errors. One from a library that logs through Rust's `log` crate says `deck.log.target` `log` and has no file or line, because those are only in its message.
 
 The daemon does not wait for them to be sent: when warnings arrive faster than they can be sent, the extra ones are dropped and counted, and the next batch carries one record with `deck.telemetry.logs.dropped`, the number dropped. Each batch is sent once: one your backend does not accept is lost, and so are the last two seconds of warnings when the daemon stops.
 
