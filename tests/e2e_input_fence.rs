@@ -91,7 +91,7 @@ fn hook_during_answer(f: &Fixture) {
 fn question_answer_023_released_client_open_control() {
     use std::sync::{Arc, Mutex};
     released_hashes();
-    let f = Fixture::start(true);
+    let f = Fixture::questions();
     let _attached = f.connect();
     f.hook_event("session_start", None);
     let q = ask_recorder(&f, "q-open-control");
@@ -117,7 +117,7 @@ fn question_answer_023_released_voice_timeout_then_one_write() {
     use released::lease::Leased;
     use std::sync::{Arc, Mutex};
     released_hashes();
-    let f = Fixture::start(true);
+    let f = Fixture::questions();
     let _attached = f.connect();
     f.hook_event("session_start", None);
     let q = ask_recorder(&f, "q-old-client");
@@ -200,7 +200,7 @@ fn question_answer_023_released_answer_superseded_or_retired() {
     use released::lease::Leased;
     use std::sync::{Arc, Mutex};
     for retire in [false, true] {
-        let mut f = Fixture::start(true);
+        let mut f = Fixture::questions();
         let _attached = f.connect();
         f.hook_event("session_start", None);
         let q = ask_recorder(&f, "q-before");

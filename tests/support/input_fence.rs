@@ -62,10 +62,19 @@ pub struct Fixture {
     generation: u64,
     previous: Option<(PathBuf, u64)>,
     installed: bool,
+    hook_events: bool,
 }
 
 impl Fixture {
     pub fn start(installed: bool) -> Self {
+        Self::start_with_hooks(installed, false)
+    }
+
+    pub fn questions() -> Self {
+        Self::start_with_hooks(true, true)
+    }
+
+    fn start_with_hooks(installed: bool, hook_events: bool) -> Self {
         let extra = if installed {
             vec![("DOT_AGENT_DECK_E2E_ASSUME_EDITOR_PROBE", "claude@2.1.310")]
         } else {
@@ -85,22 +94,43 @@ impl Fixture {
             generation: 0,
             previous: None,
             installed,
+            hook_events,
         };
         f.spawn();
         f
     }
 
     fn spawn(&mut self) {
+        let command = format!(
+            "{} --exact {ENTRY} --nocapture --test-threads=1",
+            quote(&self.exe)
+        );
+        // Common's before-main scrubber also runs in the copied libtest
+        // child. Alias this sandbox's issued identity for question producers;
+        // the pre-existing attach tests keep their original launch command.
+        let command = if self.hook_events {
+            format!(
+                r#"DAD_FENCE_PANE="$DOT_AGENT_DECK_PANE_ID" DAD_FENCE_AGENT="$DOT_AGENT_DECK_AGENT_ID" DAD_FENCE_AUTH="$DOT_AGENT_DECK_PANE_CAPABILITY" DAD_FENCE_SOCKET="$DOT_AGENT_DECK_SOCKET" {command}"#
+            )
+        } else {
+            command
+        };
+        let mut env = vec![
+            (MODE, self.base.to_str().unwrap()),
+            ("DOT_AGENT_DECK_PANE_ID", PANE),
+        ];
+        if self.hook_events {
+            env.push((
+                "DOT_AGENT_DECK_SOCKET",
+                self.daemon.hook_socket.to_str().unwrap(),
+            ));
+        }
         let started = inbox::attach(
             &self.daemon,
             json!({"op": "start-agent",
-                // Common's before-main scrubber also runs in the copied
-                // libtest child. Preserve this sandbox's issued identity
-                // under fixture names before exec, leaving the scrub intact.
-                "command": format!(r#"DAD_FENCE_PANE="$DOT_AGENT_DECK_PANE_ID" DAD_FENCE_AGENT="$DOT_AGENT_DECK_AGENT_ID" DAD_FENCE_AUTH="$DOT_AGENT_DECK_PANE_CAPABILITY" DAD_FENCE_SOCKET="$DOT_AGENT_DECK_SOCKET" {} --exact {ENTRY} --nocapture --test-threads=1"#, quote(&self.exe)),
+                "command": command,
                 "cwd": self.daemon.home, "rows": 40, "cols": 140,
-                "env": [[MODE, self.base.to_str().unwrap()], ["DOT_AGENT_DECK_PANE_ID", PANE],
-                    ["DOT_AGENT_DECK_SOCKET", self.daemon.hook_socket.to_str().unwrap()]],
+                "env": env,
             }),
         );
         assert_eq!(started["ok"], true, "native recorder spawn: {started}");
