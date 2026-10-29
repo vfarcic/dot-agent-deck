@@ -1101,12 +1101,23 @@ pub fn scan_processes_with(
 }
 
 /// Whether a `status` file's whole process has exited: its `State:` is `Z`
-/// (zombie) or `X` (dead) and its `Threads:` is at most 1. The state is the
+/// (zombie) or `X` (dead) and its `Threads:` is exactly 1. The state is the
 /// thread-group leader's alone: a leader that ended with `pthread_exit` is a
 /// zombie, its `environ` and `maps` read empty, while another of its threads
 /// still runs with the process's environment and mappings, and `Threads:`
-/// counts that thread. A state or a thread count that can't be read is taken
-/// as live.
+/// counts that thread.
+///
+/// Why 1 and not 0, from Linux v5.15 and v6.12: `task_sig()`
+/// (`fs/proc/array.c`) reads `signal->nr_threads` under `lock_task_sighand()`
+/// and reports 0 when the task's `sighand` is gone, and `__exit_signal()`
+/// (`kernel/exit.c`) decrements `nr_threads` and clears `sighand` in one
+/// `siglock` section. So a task still attached to its group reads a count
+/// that includes itself, and a detached one reads 0, which says nothing about
+/// the rest of the group: in a non-leader exec, `de_thread()` (`fs/exec.c`)
+/// keeps the old leader counted beside the execing thread until
+/// `release_task()` detaches it. A zombie or dead task reading 1 is the only
+/// task its group still counts. A state or a thread count that is 0, missing
+/// or can't be parsed is taken as live.
 fn exited(status: &[u8]) -> bool {
     let field = |name: &[u8]| {
         status
@@ -1117,7 +1128,7 @@ fn exited(status: &[u8]) -> bool {
     field(b"State:").is_some_and(|state| state == b"Z" || state == b"X")
         && field(b"Threads:")
             .and_then(ascii_number::<u32>)
-            .is_some_and(|threads| threads <= 1)
+            .is_some_and(|threads| threads == 1)
 }
 
 /// A read of a `/proc` file, `None` when its process is gone.

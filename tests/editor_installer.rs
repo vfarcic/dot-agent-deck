@@ -1374,7 +1374,7 @@ fn probe_065_an_empty_entry_of_a_live_process_keeps_every_instance() {
     assert_eq!(kept, Ok(vec![]));
 }
 
-/// Scenario: Sweep a gone daemon's instance with one scripted process of this user that is live when first read, its `environ` or both entries empty, and change what its `status` reads the second time. Gone, a single-threaded zombie or dead by then, it keeps nothing; still live, a zombie leader with another thread, a state or thread count that can't be parsed, it keeps the instance and its empty entries are counted; a re-read that fails keeps it as a scan error, and so does a later process that can't be read, with no empty entry counted.
+/// Scenario: Sweep a gone daemon's instance with one scripted process of this user that is live when first read, its `environ` or both entries empty, and change what its `status` reads the second time. Gone, a single-threaded zombie or dead by then, it keeps nothing; still live, a zombie leader with another thread, a zombie or dead task whose thread count reads 0, a state or thread count that can't be parsed, it keeps the instance and its empty entries are counted; a re-read that fails keeps it as a scan error, and so does a later process that can't be read, with no empty entry counted.
 #[spec("inbox/probe/065")]
 #[test]
 fn probe_065_the_status_re_read_decides_an_empty_entry() {
@@ -1441,6 +1441,8 @@ fn probe_065_the_status_re_read_decides_an_empty_entry() {
     for again in [
         live.clone(),
         status("State:\tZ (zombie)\nThreads:\t2\n"),
+        status("State:\tZ (zombie)\nThreads:\t0\n"),
+        status("State:\tX (dead)\nThreads:\t0\n"),
         status("State:\tZ (zombie)\n"),
         status("State:\tZ (zombie)\nThreads:\tmany\n"),
         status("State:\t?\nThreads:\t1\n"),
