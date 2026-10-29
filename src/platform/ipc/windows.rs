@@ -97,6 +97,14 @@ pub type IpcWriteHalf = tokio::io::WriteHalf<IpcStream>;
 /// [`HalfCloseOnDrop`]: crate::platform::transport::HalfCloseOnDrop
 impl crate::platform::transport::HalfCloseOnDrop for IpcWriteHalf {}
 
+/// PRD #1666 part 3 (Q35-15 fix, R-U2-01): the Unix backend's peer-close
+/// wait. A named pipe offers no readiness for the peer's close that doesn't
+/// read, so this never resolves; a caller that also watches its connection's
+/// writer learns of a broken pipe from the writer's failure instead.
+pub async fn peer_closed(_rd: &IpcReadHalf) {
+    std::future::pending().await
+}
+
 /// Total budget for the `ERROR_PIPE_BUSY` connect retry. The busy error is the
 /// named-pipe analogue of a momentarily-unaccepted socket: all server
 /// instances are connected and the next one hasn't been created yet. We retry

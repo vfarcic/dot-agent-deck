@@ -194,8 +194,12 @@ impl IngressLedger {
     /// seen together. `enqueue` returns whether the job was queued; when it
     /// was not, the ticket settles as `Failed(BrokenPipe)` (the writer is
     /// gone) and the job mark does not move. `armed` is set, still under the
-    /// hold, once the job is queued: a job ticket dropped before then (inside
-    /// a failed `enqueue`) settles nothing itself, since this hold settles it.
+    /// hold, once the job is queued: a job ticket dropped before then settles
+    /// nothing itself, since this hold settles it. That drop is inside a
+    /// failed `enqueue`, or (Q35-15 fix, A-U3-03) the writer's queue disposing
+    /// of a job it was sent, unrun, before this hold armed it: the drop marks
+    /// the flag [`DISPOSED`], and the hold, finding it so, settles the ticket
+    /// `Failed(BrokenPipe)` instead of leaving it queued and unreported.
     fn queue_with<T>(
         &self,
         ticket: u64,
@@ -204,9 +208,20 @@ impl IngressLedger {
     ) -> Option<T> {
         let mut inner = self.inner.lock().unwrap();
         let queued = enqueue();
-        if queued.is_some() {
-            // A job the writer already finished stays reported.
-            let _ = armed.compare_exchange(UNQUEUED, QUEUED, Ordering::SeqCst, Ordering::SeqCst);
+        // One compare-exchange decides between the writer's queue and this
+        // hold, so a disposal can't land between a check and the arming.
+        let armed_now = queued.is_some()
+            && match armed.compare_exchange(UNQUEUED, QUEUED, Ordering::SeqCst, Ordering::SeqCst) {
+                // A job the writer already finished stays reported.
+                Ok(_) | Err(REPORTED) => true,
+                // Disposed of unrun before it was armed: reported below.
+                Err(_) => false,
+            };
+        if !armed_now {
+            // A take-back handle finds it reported and reports nothing more.
+            armed.store(REPORTED, Ordering::SeqCst);
+        }
+        if armed_now {
             inner.job_mark += 1;
             inner.unreported.insert(ticket);
             if let Some(job) = inner.outstanding.get_mut(&ticket) {
@@ -363,18 +378,28 @@ impl JobTicket {
 }
 
 impl Drop for JobTicket {
-    /// Unrun with a queued job: the writer is gone. A drop inside a failed
-    /// enqueue, still unqueued, reports nothing: the queueing hold does.
+    /// Unrun with a queued job: the writer is gone. A drop still unqueued,
+    /// inside a failed enqueue or a disposal before the queueing hold armed
+    /// it, reports nothing and marks the flag [`DISPOSED`]: the hold, which
+    /// is still held, reports it.
     fn drop(&mut self) {
-        if self
+        match self
             .armed
             .compare_exchange(QUEUED, REPORTED, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
         {
-            self.ledger.settle(
+            Ok(_) => self.ledger.settle(
                 self.ticket,
                 Settlement::Failed(std::io::ErrorKind::BrokenPipe),
-            );
+            ),
+            Err(UNQUEUED) => {
+                let _ = self.armed.compare_exchange(
+                    UNQUEUED,
+                    DISPOSED,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+            }
+            Err(_) => {}
         }
     }
 }
@@ -385,6 +410,9 @@ const UNQUEUED: u8 = 0;
 const QUEUED: u8 = 1;
 /// A job ticket that reported its physical outcome.
 const REPORTED: u8 = 2;
+/// A job ticket dropped unrun before its queueing hold armed it; the hold
+/// reports it (A-U3-03).
+const DISPOSED: u8 = 3;
 
 /// Settles a queued job's ticket `Cancelled` when the job is taken back
 /// before it started — the one case its caller, not the writer thread, ends
@@ -449,5 +477,30 @@ mod tests {
             "a closed ledger admits nothing outstanding"
         );
         drop(after_close);
+    }
+
+    /// Scenario: Queue a ticket's job where the writer's queue accepts it and then disposes of it unrun before the queueing hold arms it, as an unwinding writer thread would, and take the job back afterwards. The ticket settles once, failed with a broken pipe, leaves nothing outstanding or unreported, and the take-back reports nothing more.
+    #[spec("inbox/probe/011")]
+    #[test]
+    fn probe_011_a_job_disposed_of_before_it_is_armed_reports_once() {
+        let ledger = IngressLedger::new();
+        let guard = ledger.admit();
+        let ticket = guard.ticket();
+        let handle = guard
+            .into_job(|job| {
+                let handle = job.handle();
+                // Sent, then dropped by the receiving side, unrun.
+                drop(job);
+                Some(handle)
+            })
+            .expect("the queue took it");
+        assert_eq!(
+            ledger.settled(),
+            [(ticket, Settlement::Failed(std::io::ErrorKind::BrokenPipe))]
+        );
+        assert_eq!(ledger.marks().outstanding, 0);
+        assert_eq!(ledger.jobs_unreported(), 0);
+        handle.settle_cancelled();
+        assert_eq!(ledger.settled().len(), 1, "reported once");
     }
 }

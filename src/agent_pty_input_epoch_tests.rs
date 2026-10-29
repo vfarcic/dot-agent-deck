@@ -216,6 +216,7 @@ async fn probe_001_every_pane_writer_path_moves_the_epoch() {
         None,
         Arc::new(Mutex::new(PaneInputState::default())),
         Arc::new(AtomicBool::new(false)),
+        Arc::default(),
         None,
         Arc::clone(&w.input),
     );

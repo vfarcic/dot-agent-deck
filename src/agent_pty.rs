@@ -4678,6 +4678,46 @@ pub(crate) enum Accepted {
     Retired(UserFrame),
 }
 
+/// PRD #1666 part 3 (Q35-15 fix; core §8.1, R-U2-02/03): what a job a fence
+/// released carries to the writer thread besides its bytes and ticket: the
+/// captured generation's exit token, which the thread checks with the
+/// generation's retirement just before it writes, and the frame's route to
+/// its connection, which a refusal or a failed write there is told through.
+/// Only a fence's release makes one, which a production build can't reach
+/// before Q35-20 ([`PaneGate`]).
+#[cfg_attr(not(any(test, feature = "e2e")), allow(dead_code))]
+struct Released {
+    exited: Arc<AtomicBool>,
+    notice: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+}
+
+impl Released {
+    /// Tell the frame's connection `reason` with the typed rejection it
+    /// would have got before acceptance; a full rejection queue drops it, as
+    /// the attach loop's own does.
+    fn tell(&self, reason: &'static str) {
+        if let Some(notice) = &self.notice {
+            let _ = notice.try_send(reason.as_bytes().to_vec());
+        }
+    }
+}
+
+/// How a job reached [`PtyWriterThread::submit_job`], which decides what is
+/// still left to do at its enqueue.
+enum Acceptance {
+    /// Accepted at this enqueue: it moves the epoch and enters the in-flight
+    /// count here.
+    Now,
+    /// A reply that passed ahead of a closed fence: the gate's decision
+    /// already accepted it, exempt ([`crate::composer_probe::epoch::GenerationInput::pass_ahead`]),
+    /// so it only enters the in-flight count here (R-U2-04).
+    PassedAhead,
+    /// Released by a fence, which moved its epoch and counted it in flight
+    /// when it held it.
+    #[cfg_attr(not(any(test, feature = "e2e")), allow(dead_code))]
+    Released(Released),
+}
+
 /// PRD #1666 part 3 (Q35-15): a generation's fence gate
 /// ([`crate::composer_probe::gate`]) with the writer's in-flight count and
 /// the input epoch it reads, so the registry can close it, read it and retire
@@ -4760,6 +4800,12 @@ pub struct PaneWriter {
     /// attach frame passes through ([`Self::accept`]). Shared with
     /// [`RunningAgent::gate`], which retires it without this writer's lock.
     gate: Arc<PaneGate>,
+    /// PRD #1666 part 3 (Q35-15 fix, core §8.1): the generation's exit token,
+    /// set when its reader sees the PTY's end, which is not its retirement
+    /// (the registry can still hold an exited agent): a release checks it,
+    /// and carries it to the writer thread with every job it submits.
+    #[cfg_attr(not(any(test, feature = "e2e")), allow(dead_code))]
+    exited: Arc<AtomicBool>,
 }
 
 impl PaneWriter {
@@ -4768,6 +4814,7 @@ impl PaneWriter {
         pane_id_env: Option<String>,
         state: Arc<Mutex<PaneInputState>>,
         retired: Arc<AtomicBool>,
+        exited: Arc<AtomicBool>,
         doorbell: Option<Arc<crate::doorbell_generation::GenerationDoorbell>>,
         input: Arc<crate::composer_probe::epoch::GenerationInput>,
     ) -> Self {
@@ -4792,6 +4839,7 @@ impl PaneWriter {
             state,
             retired,
             gate,
+            exited,
         }
     }
 
@@ -4801,14 +4849,16 @@ impl PaneWriter {
     }
 
     /// PRD #1666 part 3 (Q35-15; R5 §4.3): hand an attach frame to the
-    /// generation's fence gate. With no fence, and for a reply that passes
-    /// ahead of one, it is written now and awaited, exactly as
-    /// [`Self::write_user_ticketed`] writes it. While a fence holds input, it
-    /// is held, ticket and all, and the caller reads its next frame; a
-    /// zero-byte frame settles at once. With no room, it comes back with its
-    /// place in the queue, and the caller drops this writer's lock and waits
-    /// on that place before offering it again. The epoch moves at acceptance:
-    /// for a written frame at its enqueue, for a held one as it is held.
+    /// generation's fence gate. With no fence, it is written now and
+    /// awaited, as [`Self::write_user_ticketed`] writes it; a reply that
+    /// passes ahead of one is too, accepted by the gate's decision itself and
+    /// not classified again at its enqueue. While a fence holds input, it is
+    /// held, ticket and all, and the caller reads its next frame; a zero-byte
+    /// frame settles at once. With no room, it comes back with its place in
+    /// the queue, and the caller drops this writer's lock and waits on that
+    /// place before offering it again. The epoch moves at acceptance: for a
+    /// frame written now at its enqueue, for a held one as it is held, and
+    /// for a passing reply not at all (it is exempt).
     pub(crate) async fn accept(&self, frame: UserFrame, waiter: Option<FrameWaiter>) -> Accepted {
         use crate::composer_probe::epoch::Writer;
         use crate::composer_probe::gate::Admission;
@@ -4819,7 +4869,9 @@ impl PaneWriter {
             frame,
             len,
             waiter,
-            |frame, trigger| input.passes_ahead(Writer::Human, &frame.bytes, trigger),
+            // R-U2-04: the decision is the reply's acceptance, under one
+            // hold of the epoch's lock; nothing classifies it again.
+            |frame, trigger| input.pass_ahead(Writer::Human, &frame.bytes, trigger),
             |frame| {
                 // R5 §4.7: a held op is in flight from acceptance, and
                 // leaves once, when it is written or refused.
@@ -4828,8 +4880,17 @@ impl PaneWriter {
             },
         );
         match admitted {
-            Admission::Open(frame) | Admission::PassAhead(frame) => {
+            Admission::Open(frame) => {
                 Accepted::Written(self.write_user_ticketed(&frame.bytes, frame.ticket).await)
+            }
+            Admission::PassAhead(frame) => {
+                // Accepted already, so the seam a test parks at sits between
+                // that decision and the job reaching the writer.
+                input.accepted_parks();
+                Accepted::Written(
+                    self.write_user_accepted(&frame.bytes, frame.ticket, Acceptance::PassedAhead)
+                        .await,
+                )
             }
             Admission::Held => Accepted::Held,
             Admission::Settled(frame) => {
@@ -4849,18 +4910,28 @@ impl PaneWriter {
     /// lets anything else be accepted. `target` is the release-time check of
     /// the captured target (the generation still the pane's live owner, and
     /// writable): when it fails, every held op is refused with its reason
-    /// instead, and its connection told. Each submitted job is checked again
+    /// instead, and its connection told; an exited generation fails it with
+    /// `exited` whatever `target` says. Each submitted job is checked again
     /// on the writer thread, just before it is written, against this
-    /// generation's retirement. How many ops it submitted. Compiled where a
-    /// fence can be closed ([`PaneGate`]).
+    /// generation's retirement and exit, and carries its connection's
+    /// rejection route there ([`Released`]). How many ops it submitted.
+    /// Compiled where a fence can be closed ([`PaneGate`]).
     #[cfg(any(test, feature = "e2e"))]
     pub(crate) fn release_fence(&self, target: Result<(), &'static str>) -> usize {
+        // Core §8.1 (R-U2-02): an exited target fails the release-time check
+        // for every caller, whatever `target` says, as the attach loop's
+        // re-validation checks exit first.
+        let target = if self.exited.load(Ordering::SeqCst) {
+            Err("exited")
+        } else {
+            target
+        };
         let held = self.gate.gate.release();
         let mut submitted = 0;
         for frame in held {
             match target {
                 Ok(()) => {
-                    self.pty.submit_released(frame);
+                    self.pty.submit_released(frame, Arc::clone(&self.exited));
                     submitted += 1;
                 }
                 Err(reason) => {
@@ -4903,12 +4974,25 @@ impl PaneWriter {
         bytes: &[u8],
         ticket: Option<crate::ingress_ledger::TicketGuard>,
     ) -> std::io::Result<()> {
+        self.write_user_accepted(bytes, ticket, Acceptance::Now)
+            .await
+    }
+
+    /// [`Self::write_user_ticketed`] for a frame whose acceptance is
+    /// `acceptance`.
+    async fn write_user_accepted(
+        &self,
+        bytes: &[u8],
+        ticket: Option<crate::ingress_ledger::TicketGuard>,
+        acceptance: Acceptance,
+    ) -> std::io::Result<()> {
         match self
             .pty
-            .run_ticketed(
+            .run_accepted(
                 PtyOp::WriteAll(bytes.to_vec(), ByteSource::User, true),
                 None,
                 ticket,
+                acceptance,
             )
             .await
         {
@@ -5255,9 +5339,9 @@ struct PtyJob {
     /// own writes carry none.
     ticket: Option<crate::ingress_ledger::JobTicket>,
     /// PRD #1666 part 3 (Q35-15, core §8.1): an op a fence held and a
-    /// release submitted, checked against the generation's retirement just
-    /// before it is written.
-    released: bool,
+    /// release submitted, checked against the generation's retirement and
+    /// exit just before it is written.
+    released: Option<Released>,
 }
 
 impl PtyOp {
@@ -5419,9 +5503,14 @@ impl PtyWriterThread {
                         continue;
                     }
                     // PRD #1666 part 3 (Q35-15, core §8.1): a held op
-                    // released before its generation retired and reached
-                    // after it ends unwritten, refused once.
-                    if job.released && recorder.retired.load(Ordering::SeqCst) {
+                    // released before its generation retired or its target
+                    // exited, and reached after, ends unwritten: refused
+                    // once, its connection told (R-U2-02/03).
+                    if let Some(released) = &job.released
+                        && (recorder.retired.load(Ordering::SeqCst)
+                            || released.exited.load(Ordering::SeqCst))
+                    {
+                        released.tell("exited");
                         if let Some(ticket) = job.ticket {
                             ticket.settle_refused("exited");
                         }
@@ -5482,6 +5571,17 @@ impl PtyWriterThread {
                             return;
                         }
                     };
+                    // PRD #1666 part 3 (Q35-15 fix, R-U2-03): a released
+                    // write has no caller awaiting it, so when the PTY fails
+                    // it, in part or whole, its connection is told the PTY
+                    // can't take its input, `exited`, the reason the attach
+                    // loop gives a dead PTY; its ticket says how much went
+                    // in, below, once.
+                    if let Some(released) = &job.released
+                        && done.result.is_err()
+                    {
+                        released.tell("exited");
+                    }
                     // PRD #1666 part 3, round 5-wake: the human operation's
                     // ticket settles with what the PTY took. A voice answer
                     // superseded before its keys were written wrote nothing.
@@ -5562,22 +5662,27 @@ impl PtyWriterThread {
         Arc<crate::doorbell_txn::JobClaim>,
         Option<crate::ingress_ledger::TicketHandle>,
     )> {
-        self.submit_job(op, reply, ticket, state, false)
+        self.submit_job(op, reply, ticket, state, Acceptance::Now)
     }
 
     /// PRD #1666 part 3 (Q35-15): submit an op a fence held. It moved the
     /// epoch and entered the in-flight count when it was accepted, so it does
     /// neither again; nobody awaits it, and the writer checks its generation
-    /// before writing it.
+    /// and `exited`, its target's exit token, before writing it. Its frame's
+    /// notice goes with it, so a refusal or a failed write on the thread
+    /// reaches its connection (R-U2-03).
     #[cfg(any(test, feature = "e2e"))]
-    fn submit_released(&self, frame: UserFrame) {
+    fn submit_released(&self, frame: UserFrame, exited: Arc<AtomicBool>) {
         let (tx, _) = oneshot::channel();
         let _ = self.submit_job(
             PtyOp::WriteAll(frame.bytes, ByteSource::User, true),
             PtyReply::Async(tx),
             frame.ticket,
             Arc::default(),
-            true,
+            Acceptance::Released(Released {
+                exited,
+                notice: frame.notice,
+            }),
         );
     }
 
@@ -5587,7 +5692,7 @@ impl PtyWriterThread {
         reply: PtyReply,
         ticket: Option<crate::ingress_ledger::TicketGuard>,
         state: Arc<crate::doorbell_txn::JobClaim>,
-        released: bool,
+        acceptance: Acceptance,
     ) -> Option<(
         Arc<crate::doorbell_txn::JobClaim>,
         Option<crate::ingress_ledger::TicketHandle>,
@@ -5597,9 +5702,14 @@ impl PtyWriterThread {
             crate::doorbell_txn::ClaimState::Queued,
             "a claim is queued once"
         );
-        if !released {
-            self.in_flight.count.fetch_add(1, Ordering::SeqCst);
-        }
+        let accept_now = matches!(acceptance, Acceptance::Now);
+        let released = match acceptance {
+            Acceptance::Released(released) => Some(released),
+            Acceptance::Now | Acceptance::PassedAhead => {
+                self.in_flight.count.fetch_add(1, Ordering::SeqCst);
+                None
+            }
+        };
         let queue = |ticket: Option<crate::ingress_ledger::JobTicket>| {
             let handle = ticket
                 .as_ref()
@@ -5609,8 +5719,9 @@ impl PtyWriterThread {
             // job is sent, so the thread can't start a job whose move isn't
             // visible. Under the ledger's lock on the ticketed branch
             // (ledger, then the epoch's leaf lock), alone on the other. A
-            // released job moved it when its fence held it.
-            if !released && let Some((writer, bytes)) = op.epoch_writer() {
+            // released job moved it when its fence held it, and a reply that
+            // passed ahead was accepted, exempt, by the gate's decision.
+            if accept_now && let Some((writer, bytes)) = op.epoch_writer() {
                 self.input.enqueue(writer, bytes);
                 self.input.accepted_parks();
             }
@@ -5643,14 +5754,28 @@ impl PtyWriterThread {
 
     /// [`Self::run`] for a human operation's bytes, whose ticket the job
     /// takes over.
+    #[cfg(test)]
     async fn run_ticketed(
         &self,
         op: PtyOp,
         bound: Option<Duration>,
         ticket: Option<crate::ingress_ledger::TicketGuard>,
     ) -> PtyJobOutcome {
+        self.run_accepted(op, bound, ticket, Acceptance::Now).await
+    }
+
+    /// [`Self::run_ticketed`] for a job whose acceptance is `acceptance`.
+    async fn run_accepted(
+        &self,
+        op: PtyOp,
+        bound: Option<Duration>,
+        ticket: Option<crate::ingress_ledger::TicketGuard>,
+        acceptance: Acceptance,
+    ) -> PtyJobOutcome {
         let (tx, mut rx) = oneshot::channel();
-        let Some((state, handle)) = self.submit_ticketed(op, PtyReply::Async(tx), ticket) else {
+        let Some((state, handle)) =
+            self.submit_job(op, PtyReply::Async(tx), ticket, Arc::default(), acceptance)
+        else {
             return PtyJobOutcome::Gone;
         };
         let mut guard = WithdrawUnlessAnswered {
@@ -12900,6 +13025,7 @@ impl AgentPtyRegistry {
             pane_id_env.clone(),
             self.pane_input.clone(),
             pane_retired.clone(),
+            exited.clone(),
             Some(Arc::clone(&doorbell)),
             Arc::clone(bus.input()),
         );
@@ -13108,8 +13234,8 @@ impl AgentPtyRegistry {
     }
 
     /// PRD #1666 part 3 (Q35-15): a generation's fence gate and its writer,
-    /// by its agent id, for the `e2e` build's control verb.
-    #[cfg(feature = "e2e")]
+    /// by its agent id, for the `e2e` build's control verb and the tests.
+    #[cfg(any(test, feature = "e2e"))]
     pub(crate) fn composer_fence(
         &self,
         agent_id: &str,
@@ -16549,12 +16675,14 @@ impl AgentPtyRegistry {
         inner.next_id += 1;
         let id = format!("test-agent-{}", inner.next_id);
         let pane_retired = Arc::new(AtomicBool::new(false));
+        let exited = Arc::new(AtomicBool::new(false));
         let bus = Arc::new(AgentBus::new());
         let pane_writer = PaneWriter::new(
             writer,
             None,
             self.pane_input.clone(),
             pane_retired.clone(),
+            exited.clone(),
             None,
             Arc::clone(bus.input()),
         );
@@ -16604,7 +16732,7 @@ impl AgentPtyRegistry {
                 hook_token: crate::hook_provenance::mint(),
                 pty_rows: 24,
                 pty_cols: 80,
-                exited: Arc::new(AtomicBool::new(false)),
+                exited,
                 // Issue #454: `false` is the birth value — the flag latches to
                 // `true` only when a *successor* takes this record's pane, and
                 // nothing here spawns one: this seam inserts a record directly
@@ -28784,6 +28912,7 @@ mod spawn_tests {
             Some("q24-pane".to_string()),
             Arc::new(Mutex::new(PaneInputState::default())),
             Arc::new(AtomicBool::new(false)),
+            Arc::default(),
             None,
             Arc::default(),
         );
@@ -28909,6 +29038,7 @@ mod spawn_tests {
             Some(PANE.to_string()),
             state.clone(),
             retired.clone(),
+            Arc::default(),
             None,
             Arc::default(),
         );

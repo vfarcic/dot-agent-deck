@@ -13,7 +13,9 @@
 //! op is one of:
 //! - **pass-ahead** (I-5): a person's op that is one whole D3′-exempt reply
 //!   to a query noted after the fence's trigger
-//!   (`super::epoch::GenerationInput::passes_ahead`). It is written at once,
+//!   (`super::epoch::GenerationInput::pass_ahead`), decided and accepted in
+//!   one hold of the epoch's lock, so the query it answers and its exemption
+//!   can't change between the two. It is written at once,
 //!   ahead of what is held. It never enters the held queue, doesn't count
 //!   against [`FENCE_OPS_CAP`] or [`FENCE_CAP`], doesn't move the epoch (it is
 //!   exempt) and counts in the writer's in-flight count, as any write does.
@@ -65,7 +67,8 @@ pub const FENCE_OPS_CAP: usize = 1024;
 /// What [`Gate::admit`] did with an op.
 #[derive(Debug)]
 pub enum Admission<T> {
-    /// No fence: the caller writes it, awaiting the PTY, as before.
+    /// No fence: the caller writes it, awaiting the PTY, as before. (A
+    /// retired gate answers [`Self::Retired`] instead, fence or none.)
     Open(T),
     /// Fenced, and a reply that passes ahead: the caller writes it now.
     PassAhead(T),
@@ -156,8 +159,10 @@ impl<T> Gate<T> {
     }
 
     /// Offer `op`, `len` bytes long, from the holder of `waiter` if it was
-    /// handed back before. `passes(op, trigger)` says whether it is a reply
-    /// that may pass ahead of a fence closed at `trigger`; `hold(op)` runs
+    /// handed back before. `passes(op, trigger)` decides whether it is a
+    /// reply that passes ahead of a fence closed at `trigger`, and accepts it
+    /// when it is, so the caller submits it with nothing left to decide;
+    /// `hold(op)` runs
     /// just before the gate takes it, to move the epoch and count it in
     /// flight. Both run under the gate's lock. A zero-byte op the gate
     /// settles isn't held, so `hold` doesn't run for it.

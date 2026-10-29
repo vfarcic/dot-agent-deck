@@ -30,7 +30,7 @@
 //! card, admission and the ring's reconcile read them from Q35-19 and Q35-21
 //! on; existing doorbell behaviour reads `PaneInputState` as before. The
 //! ledger is read by a closed fence's acceptance, for whether a reply may
-//! pass ahead ([`GenerationInput::passes_ahead`]), and a fence closes only
+//! pass ahead ([`GenerationInput::pass_ahead`]), and a fence closes only
 //! through the `e2e` build's control verb until a probe opens one (Q35-20).
 //!
 //! **The lock.** One mutex per generation at rank [`crate::lock_rank::R6`],
@@ -314,6 +314,44 @@ struct State {
     retired: bool,
 }
 
+/// [`GenerationInput::enqueue`] under a hold the caller already has.
+fn enqueue_locked(state: &mut State, writer: Writer, bytes: &[u8]) -> Enqueued {
+    // Only a person's op can be exempt, so no other is read as a report.
+    let exempt = match writer {
+        Writer::Human => whole_report(&state.framing, bytes).filter(|&report| {
+            state.modes.enabled(report)
+                || QueryKind::answered_by(report).is_some_and(|k| state.ledger.exempts(k))
+        }),
+        _ => None,
+    };
+    for &byte in bytes {
+        state.framing.feed(byte, |token| {
+            let answered = token
+                .report()
+                .filter(|_| !token.in_paste)
+                .and_then(QueryKind::answered_by);
+            if let Some(kind) = answered
+                && !state.retired
+            {
+                state.ledger.settle(kind);
+                if kind == QueryKind::Cpr {
+                    state.backlog.cpr_reply();
+                }
+            }
+        });
+    }
+    match exempt {
+        Some(report) => Enqueued::Exempt(report),
+        None => {
+            let owner = match writer {
+                Writer::Deck(job) => Some(job),
+                Writer::UnnamedDeck | Writer::Human | Writer::Answer => None,
+            };
+            Enqueued::Moved(state.epoch.record(owner))
+        }
+    }
+}
+
 /// One generation's input epoch, query ledger, `B` and hazard FIFO, under
 /// one leaf lock. See the module documentation.
 #[derive(Debug)]
@@ -376,21 +414,34 @@ impl GenerationInput {
         self.output_offset.load(Ordering::SeqCst)
     }
 
-    /// Whether `bytes` from `writer` may pass ahead of a fence whose trigger
-    /// is at output offset `trigger` (I-5): a person's op that is one whole
-    /// D3′-exempt reply, read against the framing at its start, answering a
-    /// query noted after `trigger`. Changes nothing: the op's acceptance
-    /// ([`Self::enqueue`]) settles the query and, the reply being exempt,
-    /// moves no epoch.
-    pub fn passes_ahead(&self, writer: Writer, bytes: &[u8], trigger: u64) -> bool {
+    /// Whether `bytes` from `writer` pass ahead of a fence whose trigger is
+    /// at output offset `trigger` (I-5), and, when they do, their acceptance,
+    /// in one hold of the lock: a person's op that is one whole D3′-exempt
+    /// reply, read against the framing at its start, answering a query noted
+    /// after `trigger`, is fed to the framing and settles that query here,
+    /// classified exempt, so it moves no epoch. The decision, the query it
+    /// consumes and its exemption are one decision: an output push that
+    /// saturates the ledger lands before it, and the reply is held, or after
+    /// it, and changes nothing about it. Its job is then submitted with no
+    /// second [`Self::enqueue`] (Q35-15 fix, R-U2-04). `false`, changing
+    /// nothing, for anything else.
+    pub fn pass_ahead(&self, writer: Writer, bytes: &[u8], trigger: u64) -> bool {
         if writer != Writer::Human {
             return false;
         }
         // A retired generation's ledger is empty, so nothing passes.
-        let state = self.state.lock_recovering();
-        whole_report(&state.framing, bytes)
+        let mut guard = self.state.lock_recovering();
+        let passes = whole_report(&guard.framing, bytes)
             .and_then(QueryKind::answered_by)
-            .is_some_and(|kind| state.ledger.passes_ahead(kind, trigger))
+            .is_some_and(|kind| guard.ledger.passes_ahead(kind, trigger));
+        if passes {
+            let accepted = enqueue_locked(&mut guard, writer, bytes);
+            debug_assert!(
+                matches!(accepted, Enqueued::Exempt(_)),
+                "a reply that passes ahead is exempt under the same hold"
+            );
+        }
+        passes
     }
 
     /// Test seam: the next acceptance parks after it moved the epoch and
@@ -423,42 +474,7 @@ impl GenerationInput {
     /// modes and the ledger; settle the queries its replies answer; move the
     /// epoch unless it is an exempt report.
     pub fn enqueue(&self, writer: Writer, bytes: &[u8]) -> Enqueued {
-        let mut guard = self.state.lock_recovering();
-        let state = &mut *guard;
-        // Only a person's op can be exempt, so no other is read as a report.
-        let exempt = match writer {
-            Writer::Human => whole_report(&state.framing, bytes).filter(|&report| {
-                state.modes.enabled(report)
-                    || QueryKind::answered_by(report).is_some_and(|k| state.ledger.exempts(k))
-            }),
-            _ => None,
-        };
-        for &byte in bytes {
-            state.framing.feed(byte, |token| {
-                let answered = token
-                    .report()
-                    .filter(|_| !token.in_paste)
-                    .and_then(QueryKind::answered_by);
-                if let Some(kind) = answered
-                    && !state.retired
-                {
-                    state.ledger.settle(kind);
-                    if kind == QueryKind::Cpr {
-                        state.backlog.cpr_reply();
-                    }
-                }
-            });
-        }
-        match exempt {
-            Some(report) => Enqueued::Exempt(report),
-            None => {
-                let owner = match writer {
-                    Writer::Deck(job) => Some(job),
-                    Writer::UnnamedDeck | Writer::Human | Writer::Answer => None,
-                };
-                Enqueued::Moved(state.epoch.record(owner))
-            }
-        }
+        enqueue_locked(&mut self.state.lock_recovering(), writer, bytes)
     }
 
     /// An edit the deck learned of from outside the PTY (an editor session
@@ -570,7 +586,7 @@ impl GenerationInput {
     /// Whether a whole reply to `kind` would be recognised as solicited, and
     /// whether it would be D3′-exempt. Exemption isn't pass-ahead
     /// eligibility: that also needs the answered query to be after a fence's
-    /// trigger ([`Self::passes_ahead`], I-5).
+    /// trigger ([`Self::pass_ahead`], I-5).
     pub fn reply_class(&self, kind: QueryKind) -> (bool, bool) {
         let state = self.state.lock_recovering();
         (state.ledger.solicited(kind), state.ledger.exempts(kind))

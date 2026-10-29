@@ -53,6 +53,27 @@ pub type IpcWriteHalf = tokio::net::unix::OwnedWriteHalf;
 /// [`HalfCloseOnDrop`]: crate::platform::transport::HalfCloseOnDrop
 impl crate::platform::transport::HalfCloseOnDrop for IpcWriteHalf {}
 
+/// PRD #1666 part 3 (Q35-15 fix, R-U2-01): resolves once the peer has closed
+/// its end of `rd`'s socket, or shut it for writing, without reading a byte:
+/// frames the client sent before closing stay unread in the socket. It waits
+/// for the socket's hang-up readiness, which the kernel raises with the data
+/// still queued; a readiness for data alone is cleared, unread, and waited
+/// past, so the wait sleeps until the next edge rather than spinning. An
+/// error waiting counts as closed.
+pub async fn peer_closed(rd: &IpcReadHalf) {
+    let stream: &UnixStream = rd.as_ref();
+    loop {
+        match stream.ready(tokio::io::Interest::READABLE).await {
+            Ok(ready) if !ready.is_read_closed() => {
+                let _ = stream.try_io(tokio::io::Interest::READABLE, || {
+                    Err::<(), _>(io::ErrorKind::WouldBlock.into())
+                });
+            }
+            Ok(_) | Err(_) => return,
+        }
+    }
+}
+
 /// Async bidirectional IPC stream. Unix backend: a thin newtype over
 /// [`tokio::net::UnixStream`]. `AsyncRead`/`AsyncWrite` delegate to the inner
 /// socket so the framing helpers in `daemon_protocol` and `daemon_client`

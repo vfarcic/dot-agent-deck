@@ -4659,7 +4659,9 @@ async fn e2e_composer_control(
             let w = writer.lock().await;
             // Core §8.1: the captured target is still the pane's live owner
             // and writable, checked under the writer as the attach loop's
-            // re-validation is.
+            // re-validation is. Its exit is checked first, by
+            // `release_fence` itself, for this caller and any other (Q35-15
+            // fix, R-U2-02).
             let owner = registry.pane_current_agent_id(pane_id).as_deref() == Some(agent.as_str());
             let target = if !owner {
                 Err("stale")
@@ -8859,7 +8861,7 @@ async fn handle_attach_stream(
     // read it as end-of-stream. A legacy attach gets a receiver that is never
     // ready, which parks that arm forever without affecting the others.
     let mut geometry_rx = handle.geometry_rx;
-    let output_task = tokio::spawn(async move {
+    let mut output_task = tokio::spawn(async move {
         loop {
             tokio::select! {
                 // Bias toward output so heavy PTY traffic isn't starved by
@@ -8974,7 +8976,9 @@ async fn handle_attach_stream(
                 // queue. This loop then waits for the fence to change,
                 // without the writer and without reading the socket (the
                 // client's next frames wait in it: backpressure), and runs
-                // every check below again before offering it once more.
+                // every check below again before offering it once more. A
+                // connection that ends while it waits gives its place up
+                // (core §8.2, Q35-15 fix R-U2-01): see the `Full` arm.
                 let mut waiter: Option<crate::agent_pty::FrameWaiter> = None;
                 loop {
                     // PRD #20 blocker-6: enforce liveness AUTHORITATIVELY here, not
@@ -9122,7 +9126,11 @@ async fn handle_attach_stream(
                     // agent has stopped reading holds this task, never a
                     // runtime worker. PRD #1666 part 3 (Q35-15): handed to the
                     // fence gate, which with no fence writes it and awaits it
-                    // exactly as before, outcome and order included.
+                    // as before, outcome and order included, for a generation
+                    // that is still live. One race ends differently (R-U3-02):
+                    // a generation retired between the checks above and this
+                    // acceptance is refused `exited` (`Accepted::Retired`),
+                    // where before the write was attempted.
                     match w.accept(frame, waiter.take()).await {
                         crate::agent_pty::Accepted::Written(Ok(())) => {}
                         crate::agent_pty::Accepted::Written(Err(_)) => break 'frames,
@@ -9133,7 +9141,26 @@ async fn handle_attach_stream(
                         crate::agent_pty::Accepted::Held => {}
                         crate::agent_pty::Accepted::Full(back, mut place) => {
                             drop(w);
-                            place.changed().await;
+                            // Core §8.2 (Q35-15 fix, R-U2-01): the wait also
+                            // ends when the connection does, whether the
+                            // client closed its end (seen without reading
+                            // the frames still queued behind this one) or
+                            // the output task ended on a broken or wedged
+                            // socket or the agent's end. Then the frame was
+                            // never accepted: dropping it settles its ticket
+                            // `Cancelled`, once, its place leaves the queue
+                            // and passes to the next waiter, and leaving the
+                            // loop releases this viewer.
+                            let ended = tokio::select! {
+                                biased;
+                                () = crate::platform::ipc::peer_closed(&rd) => true,
+                                _ = &mut output_task => true,
+                                () = place.changed() => false,
+                            };
+                            if ended {
+                                drop((back, place));
+                                break 'frames;
+                            }
                             frame = back;
                             waiter = Some(place);
                             continue;
@@ -9195,8 +9222,9 @@ async fn handle_attach_stream(
 }
 
 /// PRD #1666 part 3 (Q35-15): the attach loop's forced short and failed
-/// writes, through the private writer seam.
-#[cfg(test)]
+/// writes, through the private writer seam. Unix only: it attaches over a
+/// Unix socket, as the other attach tests do.
+#[cfg(all(test, unix))]
 #[path = "daemon_protocol_fence_tests.rs"]
 mod fence_tests;
 

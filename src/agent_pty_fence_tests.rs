@@ -4,7 +4,7 @@
 use super::*;
 use crate::composer_probe::epoch::GenerationInput;
 use crate::composer_probe::gate::{FENCE_CAP, FENCE_OPS_CAP};
-use crate::composer_probe::query_ledger::QueryKind;
+use crate::composer_probe::query_ledger::{LEDGER_SLOTS, QueryKind};
 use crate::ingress_ledger::{IngressLedger, Settlement};
 use spec::spec;
 
@@ -53,6 +53,9 @@ struct Rig {
     input: Arc<GenerationInput>,
     ledger: Arc<IngressLedger>,
     retired: Arc<AtomicBool>,
+    /// The generation's exit token, which its reader would set at the PTY's
+    /// end.
+    exited: Arc<AtomicBool>,
     taken: Arc<Mutex<Vec<u8>>>,
     open: Arc<(Mutex<bool>, std::sync::Condvar)>,
     entered: Mutex<std::sync::mpsc::Receiver<()>>,
@@ -70,6 +73,7 @@ impl Rig {
         let open = Arc::new((Mutex::new(open), std::sync::Condvar::new()));
         let (tx, entered) = std::sync::mpsc::channel();
         let retired = Arc::new(AtomicBool::new(false));
+        let exited = Arc::new(AtomicBool::new(false));
         let writer = PaneWriter::new(
             Box::new(Scripted {
                 taken: Arc::clone(&taken),
@@ -80,6 +84,7 @@ impl Rig {
             None,
             Arc::new(Mutex::new(PaneInputState::default())),
             Arc::clone(&retired),
+            Arc::clone(&exited),
             None,
             Arc::clone(&input),
         );
@@ -92,6 +97,7 @@ impl Rig {
             input,
             ledger: IngressLedger::new(),
             retired,
+            exited,
             taken,
             open,
             entered: Mutex::new(entered),
@@ -386,11 +392,11 @@ async fn probe_011_retirement_refuses_held_and_full_frames_once() {
     assert_eq!(rig.taken(), b"");
 }
 
-/// Scenario: Hold a frame, release it behind a write the PTY isn't taking, retire the generation, then let the PTY take again; separately release with the captured target no longer the pane's owner. The released frame is refused `exited` on the writer thread and never written; the failed target check refuses every held frame with its reason and tells its connection; each reports once and nothing stays in flight.
+/// Scenario: Hold a frame, release it behind a write the PTY isn't taking, retire the generation, then let the PTY take again; separately release with the captured target no longer the pane's owner. The released frame is refused `exited` on the writer thread, never written, and its connection is told `exited` once; the failed target check refuses every held frame with its reason and tells its connection; each reports once and nothing stays in flight.
 #[spec("inbox/probe/011")]
 #[tokio::test(flavor = "multi_thread")]
 async fn probe_011_a_release_reached_after_retirement_writes_nothing() {
-    let rig = Rig::new(false, None);
+    let mut rig = Rig::new(false, None);
     let (tx, _blocker) = std::sync::mpsc::sync_channel(1);
     rig.writer
         .pty
@@ -408,6 +414,10 @@ async fn probe_011_a_release_reached_after_retirement_writes_nothing() {
     assert_eq!(rig.settles(ticket).await, [Settlement::Refused("exited")]);
     rig.writer.until_idle().await;
     assert_eq!(rig.taken(), b"blocker");
+    // R-U2-03: the refusal on the writer thread reaches the connection.
+    assert_eq!(rig.notices.try_recv().unwrap(), b"exited");
+    assert!(rig.notices.try_recv().is_err(), "told once");
+    assert_eq!(rig.in_flight(), 0);
 
     let mut rig = Rig::new(true, None);
     rig.fence();
@@ -420,6 +430,66 @@ async fn probe_011_a_release_reached_after_retirement_writes_nothing() {
     }
     assert_eq!(rig.in_flight(), 0);
     assert_eq!(rig.taken(), b"");
+}
+
+/// Scenario: Hold a frame and mark its target exited, its generation not retired, before releasing; separately hold a frame, release it behind a write the PTY isn't taking, and mark the target exited before the PTY takes again. Neither frame is written: the first release submits nothing and refuses it `exited`, the second is refused `exited` on the writer thread; each ticket reports once, its connection is told `exited` once, and nothing stays in flight (R-U2-02, R-U2-03).
+#[spec("inbox/probe/011")]
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_011_a_release_to_an_exited_target_writes_nothing() {
+    let mut rig = Rig::new(true, None);
+    rig.fence();
+    let (_, ticket) = rig.offer(b"before").await;
+    rig.exited.store(true, Ordering::SeqCst);
+    assert_eq!(rig.writer.release_fence(Ok(())), 0, "refused at release");
+    assert_eq!(rig.settled(ticket), [Settlement::Refused("exited")]);
+    assert_eq!(rig.notices.try_recv().unwrap(), b"exited");
+    assert!(rig.notices.try_recv().is_err(), "told once");
+    assert!(!rig.retired.load(Ordering::SeqCst));
+    assert_eq!(rig.in_flight(), 0);
+    assert_eq!(rig.taken(), b"");
+
+    let mut rig = Rig::new(false, None);
+    let (tx, _blocker) = std::sync::mpsc::sync_channel(1);
+    rig.writer
+        .pty
+        .submit(
+            PtyOp::Write(b"blocker".to_vec(), ByteSource::User),
+            PtyReply::Blocking(tx),
+        )
+        .unwrap();
+    rig.entered.lock().unwrap().recv().unwrap();
+    rig.fence();
+    let (_, ticket) = rig.offer(b"after").await;
+    assert_eq!(rig.writer.release_fence(Ok(())), 1);
+    rig.exited.store(true, Ordering::SeqCst);
+    rig.open();
+    assert_eq!(rig.settles(ticket).await, [Settlement::Refused("exited")]);
+    rig.writer.until_idle().await;
+    assert_eq!(rig.taken(), b"blocker");
+    assert_eq!(rig.notices.try_recv().unwrap(), b"exited");
+    assert!(rig.notices.try_recv().is_err(), "told once");
+    assert!(!rig.retired.load(Ordering::SeqCst));
+    assert_eq!(rig.in_flight(), 0);
+}
+
+/// Scenario: Hold a frame and release it to a PTY that fails the write after taking three of its bytes, and another to a PTY that fails at once. Each ticket settles once with what the PTY took, partial or failed, and each frame's connection is told `exited` once: nobody awaits a released write, so that typed rejection is how its failure reaches the person (R-U2-03).
+#[spec("inbox/probe/011")]
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_011_a_released_write_that_fails_tells_its_connection() {
+    for (budget, expected) in [
+        (3, Settlement::Partial { accepted: 3 }),
+        (0, Settlement::Failed(std::io::ErrorKind::BrokenPipe)),
+    ] {
+        let mut rig = Rig::new(true, Some((budget, std::io::ErrorKind::BrokenPipe)));
+        rig.fence();
+        let (_, ticket) = rig.offer(b"abcdef").await;
+        assert_eq!(rig.writer.release_fence(Ok(())), 1);
+        assert_eq!(rig.settles(ticket).await, [expected]);
+        assert_eq!(rig.notices.try_recv().unwrap(), b"exited");
+        assert!(rig.notices.try_recv().is_err(), "told once");
+        rig.writer.until_idle().await;
+        assert_eq!(rig.in_flight(), 0);
+    }
 }
 
 /// Scenario: Hold a frame while the writer thread is gone, then release it. The released frame's ticket settles failed with a broken pipe, once, and nothing stays in flight.
@@ -532,6 +602,59 @@ async fn probe_011_only_a_reply_to_a_query_after_the_trigger_passes_ahead() {
     rig.taken_becomes(&[DA1_REPLY, &held].concat()).await;
 }
 
+/// Scenario: Close a fence, hold a key, and have the agent's output ask eight DA1 queries after the trigger, filling the query ledger. Hand the gate one whole DA1 reply and park it just after the gate decided it passes ahead; while it is parked, have the output ask two more queries, which saturates the ledger, then let it go; then offer a second DA1 reply to the saturated ledger. The reply decided before the saturation is written ahead and moves no epoch; the one offered after it is held and moves the epoch once; the key never reaches the PTY before the release, and after it the PTY has the passing reply, then the key, then the held reply (R-U2-04).
+#[spec("inbox/probe/011")]
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_011_pass_ahead_and_its_epoch_are_one_decision() {
+    let rig = Arc::new(Rig::new(true, None));
+    rig.fence();
+    let (accepted, key) = rig.offer(b"key|").await;
+    assert!(matches!(accepted, Accepted::Held));
+    for _ in 0..LEDGER_SLOTS {
+        rig.query(QueryKind::Da1);
+    }
+    let epoch = rig.input.epoch().epoch();
+    let (reached, release) = rig.input.park_next_acceptance();
+    let offered = tokio::spawn({
+        let rig = Arc::clone(&rig);
+        async move { rig.offer(DA1_REPLY).await }
+    });
+    tokio::task::spawn_blocking(move || reached.recv_timeout(Duration::from_secs(8)))
+        .await
+        .unwrap()
+        .expect("the reply parks after its decision");
+    // The output hook saturates the ledger between the decision and the
+    // job reaching the writer.
+    rig.query(QueryKind::Da1);
+    rig.query(QueryKind::Da1);
+    assert!(
+        !rig.input.reply_class(QueryKind::Da1).1,
+        "saturated: a reply classified now is not exempt"
+    );
+    assert_eq!(rig.taken(), b"");
+    release.send(()).unwrap();
+    let (accepted, _) = offered.await.unwrap();
+    assert!(
+        written(&accepted),
+        "decided before the saturation, it passes"
+    );
+    assert_eq!(rig.input.epoch().epoch(), epoch, "and moves no epoch");
+    assert_eq!(rig.taken(), DA1_REPLY);
+    assert_eq!(rig.writer.gate().status().held_ops, 1);
+    assert!(rig.settled(key).is_empty(), "the key is still held");
+
+    let (accepted, _) = rig.offer(DA1_REPLY).await;
+    assert!(
+        matches!(accepted, Accepted::Held),
+        "offered after the saturation, it is held"
+    );
+    assert_eq!(rig.input.epoch().epoch(), epoch + 1, "and moves the epoch");
+    assert_eq!(rig.taken(), DA1_REPLY);
+    rig.writer.release_fence(Ok(()));
+    rig.taken_becomes(&[DA1_REPLY, b"key|", DA1_REPLY].concat())
+        .await;
+}
+
 /// Scenario: Hand the gate a frame with no fence and park its acceptance just after it moved the epoch. While parked, the epoch has moved and the PTY writer has been handed nothing; once the park lets go, the frame is written.
 #[spec("inbox/probe/011")]
 #[tokio::test(flavor = "multi_thread")]
@@ -561,7 +684,7 @@ async fn probe_011_the_epoch_moves_before_the_job_is_visible() {
     assert_eq!(rig.taken(), b"parked");
 }
 
-/// Scenario: Take a queued job back after its generation's ledger closed, and close a ledger while a started job is still inside the PTY. The taken-back job reports one physical outcome, cancelled, beside the logical retirement row; the started job leaves the outstanding set at retirement but stays unreported until the writer reports it written, once.
+/// Scenario: Take a queued job back, then close its generation's ledger while a started job is still inside the PTY. The taken-back job reports one physical outcome, cancelled, and the writer dropping it later reports nothing more; the started job leaves the outstanding set at retirement but stays unreported until the writer reports it written, once.
 #[spec("inbox/probe/011")]
 #[tokio::test(flavor = "multi_thread")]
 async fn probe_011_each_ticket_reports_one_physical_outcome() {
@@ -620,6 +743,64 @@ async fn probe_011_each_ticket_reports_one_physical_outcome() {
     assert_eq!(physical(started_id2), [Settlement::Written { bytes: 6 }]);
     assert!(rig.settled(started_id2).contains(&Settlement::Retired));
     assert_eq!(rig.ledger.jobs_unreported(), 0);
+}
+
+/// Scenario: Close a generation's ledger while a job of its is queued behind a write the PTY isn't taking, then take that job back by dropping its caller, and let the PTY take again. The ticket is logged retired at the close and then reports one physical outcome, cancelled, at the take-back; the writer, reaching the taken-back job, reports nothing more, and nothing stays in flight or unreported.
+#[spec("inbox/probe/011")]
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_011_a_take_back_after_the_close_reports_once() {
+    let rig = Arc::new(Rig::new(false, None));
+    let (tx, _blocker) = std::sync::mpsc::sync_channel(1);
+    rig.writer
+        .pty
+        .submit(
+            PtyOp::Write(b"blocker".to_vec(), ByteSource::User),
+            PtyReply::Blocking(tx),
+        )
+        .unwrap();
+    rig.entered.lock().unwrap().recv().unwrap();
+    let queued = rig.ledger.admit();
+    let queued_id = queued.ticket();
+    let caller = tokio::spawn({
+        let rig = Arc::clone(&rig);
+        async move {
+            rig.writer
+                .pty
+                .run_ticketed(
+                    PtyOp::WriteAll(b"queued".to_vec(), ByteSource::User, true),
+                    None,
+                    Some(queued),
+                )
+                .await;
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while rig.ledger.marks().job_mark == 0 {
+        assert!(Instant::now() < deadline, "the job is queued");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    rig.ledger.close();
+    assert_eq!(rig.ledger.jobs_unreported(), 1);
+    caller.abort();
+    let _ = caller.await;
+    assert_eq!(
+        rig.settled(queued_id),
+        [Settlement::Retired, Settlement::Cancelled]
+    );
+    rig.open();
+    rig.writer.until_idle().await;
+    assert!(matches!(
+        rig.writer.pty.run(PtyOp::Flush, None).await,
+        PtyJobOutcome::Done(_)
+    ));
+    assert_eq!(
+        rig.settled(queued_id),
+        [Settlement::Retired, Settlement::Cancelled],
+        "reported once"
+    );
+    assert_eq!(rig.ledger.jobs_unreported(), 0);
+    assert_eq!(rig.taken(), b"blocker");
+    assert_eq!(rig.in_flight(), 0);
 }
 
 /// Hold `bytes` from a person in `id`'s fence, closing it first.
