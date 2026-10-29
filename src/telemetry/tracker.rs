@@ -284,6 +284,8 @@ struct PendingRun {
     /// The dispatched unit it belongs to, when known before it opens
     /// ([`RunTracker::begin_dispatch`]).
     dispatch_name: Option<String>,
+    /// The branch it starts on ([`RunTracker::set_branch`]).
+    branch: Option<String>,
 }
 
 /// What a prepared run holds of its hand-offs: see [`PendingRun::handoffs`].
@@ -397,6 +399,8 @@ struct ActiveRun {
     /// Issue #1981 M7: reports this run's agent received that named no task
     /// (`deck.handoffs.uncorrelated.count`).
     uncorrelated_reports: u64,
+    /// Issue #1981 M6: `vcs.ref.head.name`, the branch the run started on.
+    branch: Option<String>,
 }
 
 /// A pull request, told apart from another repository's of the same number by
@@ -777,6 +781,7 @@ impl RunTracker {
                 ended: None,
                 handoffs: Vec::new(),
                 dispatch_name,
+                branch: None,
             });
     }
 
@@ -924,6 +929,7 @@ impl RunTracker {
         if let Some(run) = self.runs.get_mut(&pane_id) {
             run.context = pending.context;
             run.dispatch_name = pending.dispatch_name;
+            run.branch = pending.branch;
         }
         // Each task posted, and each notice about one, in its place among
         // the events: one posted before a close is opened in the run before
@@ -1010,6 +1016,7 @@ impl RunTracker {
                 dispatch_name: None,
                 learned_agent: None,
                 uncorrelated_reports: 0,
+                branch: None,
             },
         );
     }
@@ -1026,6 +1033,14 @@ impl RunTracker {
     #[cfg(test)]
     pub fn live_shadow_states(&self) -> usize {
         self.shadow_states.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Issue #1981 M6: the branch prepared run `run_id` starts on, read before
+    /// its agent starts ([`super::run_context::branch_at`]).
+    pub fn set_branch(&mut self, run_id: &str, branch: Option<String>) {
+        if let Some(pending) = self.pending.get_mut(run_id) {
+            pending.branch = branch;
+        }
     }
 
     /// Attach the git-derived context once it has been resolved. Ignored when
@@ -2268,6 +2283,10 @@ fn run_span(run: ActiveRun, reason: EndReason, exit_code: Option<i32>, now: u64)
         run.context.repository_name.as_deref(),
     ));
     attributes.extend(Attribute::opt_str(
+        AttrKey::BranchName,
+        run.branch.as_deref(),
+    ));
+    attributes.extend(Attribute::opt_str(
         AttrKey::InvokingSkill,
         start.invoking_skill.as_deref(),
     ));
@@ -2935,6 +2954,26 @@ pub(crate) mod tests {
             (vec!["answer".to_string()], 1),
             "re-asked on the held channel"
         );
+    }
+
+    /// Issue #1981 M6: the branch read as the run was prepared is the run's,
+    /// on its span however soon the run ends; a run begun without one has
+    /// none.
+    #[test]
+    fn a_prepared_runs_branch_is_on_its_span() {
+        let mut tracker = RunTracker::new();
+        tracker.prepare_run(start("p1"), 0);
+        tracker.set_branch("run-p1", Some("agent/dispatch-x".into()));
+        tracker.commit_run("run-p1");
+        tracker.end_run("p1", EndReason::Exited, Some(0), 1);
+        tracker.begin_run(start("p2"), 0);
+        tracker.end_run("p2", EndReason::Exited, Some(0), 1);
+        let spans = tracker.take_finished();
+        assert_eq!(
+            attr(run_span_on(&spans, "p1"), AttrKey::BranchName),
+            Some(&AttrValue::Str("agent/dispatch-x".into()))
+        );
+        assert_eq!(attr(run_span_on(&spans, "p2"), AttrKey::BranchName), None);
     }
 
     #[test]

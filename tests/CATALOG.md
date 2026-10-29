@@ -90,7 +90,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### telemetry/otlp/004 — Private content stays out of exports and telemetry-module logs while interventions remain visible.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
 - **Agent:** synthetic shell and cat with synthesized hook content.
-- **Asserts:** with HTTP/JSON, distinct sentinels from output, TUI-typed human input, prompt/tool hook fields, pane title, OTLP secret header, file contents printed by the stand-in, git branch, command argument, pane cwd directory and an ordinary environment value appear in no received request body, URI, non-authentication header or captured telemetry-module log line; the telemetry exporter's startup log is present, the authentication header arrives as intended and the completed run contains an intervention event. A successor actually reads the private file in the privately named git cwd before its run is exported.
+- **Asserts:** with HTTP/JSON, distinct sentinels from output, TUI-typed human input, prompt/tool hook fields, pane title, OTLP secret header, file contents printed by the stand-in, command argument, pane cwd directory and an ordinary environment value appear in no received request body, URI, non-authentication header or captured telemetry-module log line; the git branch is sent, as the successor run's `vcs.ref.head.name` (issue #1981 M6), and appears in no URI, non-authentication header or telemetry-module log line; the telemetry exporter's startup log is present, the authentication header arrives as intended and the completed run contains an intervention event. A successor actually reads the private file in the privately named git cwd before its run is exported.
 - **Does not assert:** content policies for an external agent's own exporter or daemon log targets outside dot_agent_deck::telemetry and its submodules.
 - **Platform coverage:** mac+linux.
 
@@ -153,7 +153,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### telemetry/otlp/013 — Protobuf exports exclude private content across the binary's export pipeline.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
 - **Agent:** synthetic shell and cat with synthesized hook content.
-- **Asserts:** the same private channels as 004 stay absent from raw HTTP/protobuf request bodies, URIs, non-authentication headers and telemetry-module logs. Accepted protobuf bodies contain the original and successor run ids with agent.run, the original run exports a human intervention, the authentication header arrives and the telemetry startup log is captured.
+- **Asserts:** the same private channels as 004 stay absent from raw HTTP/protobuf request bodies, URIs, non-authentication headers and telemetry-module logs, and as in 004 the git branch is the exception in bodies: the successor run's accepted body carries it. Accepted protobuf bodies contain the original and successor run ids with agent.run, the original run exports a human intervention, the authentication header arrives and the telemetry startup log is captured.
 - **Does not assert:** a full protobuf schema decode or privacy of external agents' own telemetry.
 - **Platform coverage:** mac+linux.
 
@@ -13231,12 +13231,12 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 - **Does not assert:** real-agent detection or retrospective relabelling of child spans exported before identifying hooks.
 - **Platform coverage:** mac+linux.
 
-##### telemetry/otlp/027 — A dispatched run exports its registry unit name without exporting its branch.
+##### telemetry/otlp/027 — A dispatched run exports its registry unit name and its branch.
 
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_span_identity.rs`).
 - **Agent:** declared Pi shell/cat caller and dispatched single unit.
-- **Asserts:** the real dispatch CLI starts a unit in its worktree; the completed run carries deck.dispatch.name equal to the requested unit and exported spans exclude its branch name.
-- **Does not assert:** dispatched orchestration workers, registry recovery after daemon restart or full branch/content privacy (telemetry/otlp/004).
+- **Asserts:** the real dispatch CLI starts a unit in its worktree; the completed run carries deck.dispatch.name equal to the requested unit and vcs.ref.head.name equal to the unit's branch (issue #1981 M6, which reversed the earlier withholding of branch names).
+- **Does not assert:** dispatched orchestration workers, registry recovery after daemon restart or content privacy (telemetry/otlp/004).
 - **Platform coverage:** mac+linux.
 
 ## Test Case Catalog — Intervention kinds
