@@ -13,9 +13,15 @@
 //! open descriptor whose `fstat` must not move across the read
 //! ([`read_source`]); a symlink is followed and its target's identity is
 //! kept. A missing file is a read too ([`SourceRead::Absent`]), so a file
-//! created where none was, or removed, differs from what was read before.
-//! `ctime` can't be set back by a user, so a file changed and then restored
-//! differs as well.
+//! created where none was, or removed, differs from what was read before. A
+//! file changed and then restored is seen when an identity field or its bytes
+//! differ from the earlier read; the timestamps have the filesystem's
+//! granularity, so the tuple isn't a count of edits, and an edit undone
+//! within one tick with the same bytes isn't seen.
+//!
+//! The reads are bounded in bytes, not in time ([`read_source`]): a source on
+//! a stalled filesystem can block the caller, so callers read with no lock
+//! held, and nothing here is a deadline.
 //!
 //! **Claude Code** ([`ClaudeKeymap`], R6 §9.1) reads `keybindings.json`. The
 //! deck records it at spawn and reads it again before each admission and at
@@ -26,7 +32,10 @@
 //! read the binding Claude loaded, so a release whose record doesn't verify
 //! it holds ([`Hold::Unmeasured`]); every record leaves it absent until M49b
 //! is measured. The spawn read's contents hold too when they bind Ctrl+G or
-//! the external-editor action, or can't be read or parsed (CL-9).
+//! the external-editor action, or can't be read or parsed (CL-9). Where
+//! Claude looks is measured only for `$HOME/.claude` (M39), so a
+//! `CLAUDE_CONFIG_DIR` in the agent's environment holds
+//! ([`claude_keybindings_path`]).
 //!
 //! **Codex** ([`CodexSources`], R6 §9.2, R5 §7.1) reads `$CODEX_HOME/config.toml`,
 //! the selected profile's `$CODEX_HOME/<name>.config.toml`, the trusted
@@ -36,9 +45,12 @@
 //! release record's precedence ([`KeymapSource`] order, a later source
 //! winning key by key) and the effective `tui.keymap` is checked: a probe
 //! is allowed only when `open_external_editor` is Ctrl+G (by default or
-//! explicitly) and no other action is on Ctrl+G (CX-10b). A source present
-//! (a file that exists, a selected profile, a `-c`) that the record doesn't
-//! list has no known precedence and holds.
+//! explicitly) and no other action is on Ctrl+G (CX-10b). Only the
+//! contexts, actions and key spellings both pinned releases accept are read
+//! ([`CODEX_KEYMAP`], [`codex_key`]); anything else in `tui.keymap` holds
+//! ([`Hold::UnknownKey`]). A source present (a file that exists, a selected
+//! profile, a `-c`) that the record doesn't list has no known precedence and
+//! holds.
 
 use crate::doorbell_activation::{EditorProbe, KeymapSource, Measurement};
 use std::ffi::OsString;
@@ -108,8 +120,9 @@ pub enum Hold {
     /// Ctrl+G is bound to another action, or the external-editor action to
     /// another key.
     Rebound,
-    /// The keymap table holds something this module doesn't read as a
-    /// binding (CX-10b's unknown key).
+    /// The keymap table holds a context, action or key spelling outside what
+    /// the pinned releases accept, or a value that isn't a binding (CX-10b's
+    /// unknown key).
     UnknownKey,
     /// A source the release's record doesn't list, so its precedence isn't
     /// known.
@@ -118,10 +131,15 @@ pub enum Hold {
 
 /// Reads `path`, following a symlink: absent, its identity and contents, or
 /// why it can't be read. One descriptor is opened (non-blocking, so a FIFO
-/// can't hang it) and judged by `fstat` before and after the read; a file
-/// that moved in between, or whose contents aren't the size `fstat` gave, is
-/// [`Unreadable::Unstable`]. It does file I/O: call
-/// it with no lock held.
+/// with no writer can't hang it) and judged by `fstat` before and after the
+/// read; a file that moved in between, or whose contents aren't the size
+/// `fstat` gave, is [`Unreadable::Unstable`].
+///
+/// It reads at most [`SOURCE_BYTES`] and one more, but nothing bounds how
+/// long that takes: the path lookup, the open of a device (rejected only
+/// after it opens), and a regular file on a stalled FUSE or network
+/// filesystem can each block. Call it with no lock held, and don't treat it
+/// as deadline-bounded.
 pub fn read_source(path: &Path) -> SourceRead {
     #[cfg(unix)]
     {
@@ -195,16 +213,21 @@ fn read_unix(path: &Path) -> SourceRead {
     }
 }
 
-/// Where Claude Code reads `keybindings.json`: `$CLAUDE_CONFIG_DIR` when
-/// set and non-empty, else `$HOME/.claude` (M39 measured the second), from
-/// the agent's environment `env`. `None` when neither is known.
-pub fn claude_keybindings_path(env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-    let set = |name: &str| env(name).filter(|v| !v.is_empty());
-    let dir = match set("CLAUDE_CONFIG_DIR") {
-        Some(dir) => PathBuf::from(dir),
-        None => PathBuf::from(set("HOME")?).join(".claude"),
-    };
-    Some(dir.join("keybindings.json"))
+/// Where Claude Code reads `keybindings.json`, from the agent's environment
+/// `env`: `$HOME/.claude/keybindings.json`, the one location M39 measured.
+/// [`Hold::Unmeasured`] when `CLAUDE_CONFIG_DIR` is present, empty included,
+/// because which source Claude then reads isn't measured and the deck doesn't
+/// guess it; and when `HOME` is unset, empty or relative, because where
+/// Claude then looks isn't either.
+pub fn claude_keybindings_path(env: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, Hold> {
+    if env("CLAUDE_CONFIG_DIR").is_some() {
+        return Err(Hold::Unmeasured);
+    }
+    let home = PathBuf::from(env("HOME").ok_or(Hold::Unmeasured)?);
+    if !home.is_absolute() {
+        return Err(Hold::Unmeasured);
+    }
+    Ok(home.join(".claude").join("keybindings.json"))
 }
 
 /// Claude Code's `keybindings.json` for one generation (R6 §9.1): the read
@@ -258,20 +281,24 @@ impl ClaudeKeymap {
     }
 }
 
-/// Whether a `keybindings.json` leaves Ctrl+G on the external editor: it
-/// mustn't name [`CLAUDE_EDITOR_ACTION`] or have a key with Ctrl+G in any
-/// chord step, anywhere in the document. The format's layout isn't
+/// Whether a `keybindings.json` leaves Ctrl+G on the external editor: no
+/// string in the document, an object's member name or a value at any depth,
+/// may name [`CLAUDE_EDITOR_ACTION`] or hold Ctrl+G in any of its strokes
+/// ([`claude_names_editor`], [`claude_strokes`]). The format's layout isn't
 /// measured beyond M39 (a `Chat` context that unbinds Ctrl+G and binds the
-/// action elsewhere), so the check reads every key and string rather than
-/// one layout, and an explicit default binding holds too.
+/// action elsewhere), so the check reads every string the same way rather
+/// than trusting one layout, and an explicit default binding holds too.
 fn claude_bindings(contents: &[u8]) -> Result<(), Hold> {
+    fn holds(s: &str) -> bool {
+        claude_names_editor(s) || claude_strokes(s).iter().any(|k| is_ctrl_g(k))
+    }
     fn walk(value: &serde_json::Value) -> bool {
         match value {
-            serde_json::Value::String(s) => s == CLAUDE_EDITOR_ACTION,
+            serde_json::Value::String(s) => holds(s),
             serde_json::Value::Array(items) => items.iter().any(walk),
-            serde_json::Value::Object(map) => map
-                .iter()
-                .any(|(key, value)| key.split_whitespace().any(is_ctrl_g) || walk(value)),
+            serde_json::Value::Object(map) => {
+                map.iter().any(|(key, value)| holds(key) || walk(value))
+            }
             _ => false,
         }
     }
@@ -283,8 +310,46 @@ fn claude_bindings(contents: &[u8]) -> Result<(), Hold> {
     }
 }
 
-/// Whether a key's spelling is Ctrl+G, in the spellings the agents' keymap
-/// files are known to accept and their common variants.
+/// Whether `s` names [`CLAUDE_EDITOR_ACTION`], in any case and with any
+/// whitespace inside it.
+fn claude_names_editor(s: &str) -> bool {
+    let s: String = s
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect();
+    s.contains(&CLAUDE_EDITOR_ACTION.to_lowercase())
+}
+
+/// The key strokes a string could spell: split at anything that can't be
+/// part of a spelling [`is_ctrl_g`] reads, then a word that ends in `+`,
+/// `-` or `^` joined to the next, and a word that starts with `+` or `-` to
+/// the one before, so `ctrl + g` is one stroke and `ctrl+x ctrl+g` two.
+fn claude_strokes(s: &str) -> Vec<String> {
+    let mut strokes: Vec<String> = Vec::new();
+    let mut joining = false;
+    let words = s
+        .split(|c: char| !(c.is_alphanumeric() || "+-^<>".contains(c)))
+        .filter(|word| !word.is_empty());
+    for word in words {
+        match strokes.last_mut() {
+            Some(last) if joining || word.starts_with(['+', '-']) => last.push_str(word),
+            _ => strokes.push(word.to_string()),
+        }
+        joining = word.ends_with(['+', '-', '^']);
+    }
+    strokes
+}
+
+/// Whether a stroke's spelling is Ctrl+G for Claude Code's
+/// `keybindings.json`, in any case and with spaces. The spelling the
+/// measurements used is `ctrl+g` (M39's and M49b's file for Claude Code
+/// 2.1.310: `{"bindings": [{"context": "Chat", "bindings": {"ctrl+g": null,
+/// "ctrl+e": "chat:externalEditor"}}]}`). Claude's key grammar isn't
+/// pinned, so the others are variants recognised so that a file written with
+/// them holds, not spellings Claude is known to accept; a spelling Claude
+/// accepts that isn't here isn't seen. Codex has its own, pinned grammar
+/// ([`codex_key`]).
 pub fn is_ctrl_g(key: &str) -> bool {
     let key: String = key
         .chars()
@@ -512,10 +577,323 @@ fn merge(base: &mut toml::Table, over: toml::Table) {
     }
 }
 
+/// The `tui.keymap` contexts and their actions that both pinned Codex
+/// releases accept: `TuiKeymap` and its context structs in
+/// `codex-rs/config/src/tui_keymap.rs` at `rust-v0.160.0` (`a956835d`) and
+/// `rust-v0.164.0` (`6aaac694`), quoted with their line numbers from the
+/// same pinned checkouts as the tester's source bundles, in
+/// `.dot-agent-deck/sources/codex-keymap.md`. Each context cites the
+/// `TuiKeymap` field and the struct, each action its field, as
+/// `<0.160 line>, <0.164 line>`. A name only one release has (0.164's
+/// `global.leader`, `chat.open_presets`, `agents.fork` and
+/// `agents.toggle_pin`) isn't listed, so it holds.
+pub const CODEX_KEYMAP: &[(&str, &[&str])] = &[
+    // `global`: field of `TuiKeymap` at 504, 543; `TuiGlobalKeymap` at 94, 135
+    (
+        "global",
+        &[
+            "open_agents",              // 96, 139
+            "open_transcript",          // 98, 141
+            "find_transcript",          // 100, 143
+            "focus_activity",           // 102, 145
+            "open_external_editor",     // 104, 147
+            "copy",                     // 106, 149
+            "clear_terminal",           // 108, 151
+            "submit",                   // 110, 153
+            "queue",                    // 112, 155
+            "toggle_shortcuts",         // 114, 157
+            "toggle_vim_mode",          // 116, 159
+            "toggle_fast_mode",         // 118, 161
+            "toggle_raw_output",        // 120, 163
+            "toggle_side_conversation", // 122, 165
+        ],
+    ),
+    // `chat`: field of `TuiKeymap` at 506, 545; `TuiChatKeymap` at 129, 171
+    (
+        "chat",
+        &[
+            "toggle_voice",              // 131, 175
+            "toggle_voice_mute",         // 133, 177
+            "interrupt_turn",            // 135, 179
+            "decrease_reasoning_effort", // 137, 181
+            "increase_reasoning_effort", // 139, 183
+            "previous_permission_mode",  // 141, 185
+            "next_permission_mode",      // 143, 187
+            "edit_queued_message",       // 145, 189
+            "prompt_stack_back",         // 147, 191
+            "skip_question",             // 149, 193
+        ],
+    ),
+    // `composer`: field of `TuiKeymap` at 508, 547; `TuiComposerKeymap` at 156, 199
+    (
+        "composer",
+        &[
+            "submit",                  // 158, 201
+            "queue",                   // 160, 203
+            "toggle_shortcuts",        // 162, 205
+            "history_search_previous", // 164, 207
+            "history_search_next",     // 166, 209
+        ],
+    ),
+    // `editor`: field of `TuiKeymap` at 510, 549; `TuiEditorKeymap` at 173, 215
+    (
+        "editor",
+        &[
+            "insert_newline",       // 175, 217
+            "move_left",            // 177, 219
+            "move_right",           // 179, 221
+            "move_up",              // 181, 223
+            "move_down",            // 183, 225
+            "move_word_left",       // 185, 227
+            "move_word_right",      // 187, 229
+            "move_line_start",      // 189, 231
+            "move_line_end",        // 191, 233
+            "delete_backward",      // 193, 235
+            "delete_forward",       // 195, 237
+            "delete_backward_word", // 197, 239
+            "delete_forward_word",  // 199, 241
+            "kill_line_start",      // 201, 243
+            "kill_whole_line",      // 203, 245
+            "kill_line_end",        // 205, 247
+            "yank",                 // 207, 249
+        ],
+    ),
+    // `vim_normal`: field of `TuiKeymap` at 512, 551; `TuiVimNormalKeymap` at 217, 259
+    (
+        "vim_normal",
+        &[
+            "enter_insert",          // 219, 261
+            "append_after_cursor",   // 221, 263
+            "append_line_end",       // 223, 265
+            "insert_line_start",     // 225, 267
+            "open_line_below",       // 227, 269
+            "open_line_above",       // 229, 271
+            "enter_replace_mode",    // 231, 273
+            "move_left",             // 233, 275
+            "move_right",            // 235, 277
+            "move_up",               // 237, 279
+            "move_down",             // 239, 281
+            "move_word_forward",     // 241, 283
+            "move_word_backward",    // 243, 285
+            "move_word_end",         // 245, 287
+            "move_line_start",       // 247, 289
+            "move_line_end",         // 249, 291
+            "find_forward",          // 251, 293
+            "find_backward",         // 253, 295
+            "till_forward",          // 255, 297
+            "till_backward",         // 257, 299
+            "jump_top",              // 259, 301
+            "jump_bottom",           // 261, 303
+            "delete_char",           // 263, 305
+            "replace_char",          // 265, 307
+            "repeat_last_change",    // 267, 309
+            "substitute_char",       // 269, 311
+            "delete_to_line_end",    // 271, 313
+            "change_to_line_end",    // 273, 315
+            "yank_line",             // 275, 317
+            "paste_after",           // 277, 319
+            "start_delete_operator", // 279, 321
+            "start_yank_operator",   // 281, 323
+            "start_change_operator", // 283, 325
+            "undo",                  // 285, 327
+            "redo",                  // 287, 329
+            "cancel_operator",       // 289, 331
+        ],
+    ),
+    // `vim_operator`: field of `TuiKeymap` at 514, 553; `TuiVimOperatorKeymap` at 300, 342
+    (
+        "vim_operator",
+        &[
+            "delete_line",               // 302, 344
+            "yank_line",                 // 304, 346
+            "motion_left",               // 306, 348
+            "motion_right",              // 308, 350
+            "motion_up",                 // 310, 352
+            "motion_down",               // 312, 354
+            "motion_word_forward",       // 314, 356
+            "motion_word_backward",      // 316, 358
+            "motion_word_end",           // 318, 360
+            "motion_line_start",         // 320, 362
+            "motion_line_end",           // 322, 364
+            "motion_find_forward",       // 324, 366
+            "motion_find_backward",      // 326, 368
+            "motion_till_forward",       // 328, 370
+            "motion_till_backward",      // 330, 372
+            "motion_jump_top",           // 332, 374
+            "motion_jump_bottom",        // 334, 376
+            "select_inner_text_object",  // 336, 378
+            "select_around_text_object", // 338, 380
+            "cancel",                    // 340, 382
+        ],
+    ),
+    // `vim_search`: field of `TuiKeymap` at 516, 555; `TuiVimSearchKeymap` at 347, 388
+    (
+        "vim_search",
+        &[
+            "forward",  // 349, 390
+            "backward", // 351, 392
+            "next",     // 353, 394
+            "previous", // 355, 396
+        ],
+    ),
+    // `vim_text_object`: field of `TuiKeymap` at 518, 557; `TuiVimTextObjectKeymap` at 362, 402
+    (
+        "vim_text_object",
+        &[
+            "word",         // 364, 404
+            "big_word",     // 366, 406
+            "parentheses",  // 368, 408
+            "brackets",     // 370, 410
+            "braces",       // 372, 412
+            "double_quote", // 374, 414
+            "single_quote", // 376, 416
+            "backtick",     // 378, 418
+            "cancel",       // 380, 420
+        ],
+    ),
+    // `pager`: field of `TuiKeymap` at 520, 559; `TuiPagerKeymap` at 387, 426
+    (
+        "pager",
+        &[
+            "scroll_up",        // 389, 428
+            "scroll_down",      // 391, 430
+            "page_up",          // 393, 432
+            "page_down",        // 395, 434
+            "half_page_up",     // 397, 436
+            "half_page_down",   // 399, 438
+            "jump_top",         // 401, 440
+            "jump_bottom",      // 403, 442
+            "close",            // 405, 444
+            "close_transcript", // 407, 446
+            "find",             // 409, 448
+        ],
+    ),
+    // `list`: field of `TuiKeymap` at 522, 561; `TuiListKeymap` at 416, 454
+    (
+        "list",
+        &[
+            "move_up",     // 418, 456
+            "move_down",   // 420, 458
+            "move_left",   // 422, 460
+            "move_right",  // 424, 462
+            "page_up",     // 426, 464
+            "page_down",   // 428, 466
+            "jump_top",    // 430, 468
+            "jump_bottom", // 432, 470
+            "accept",      // 434, 472
+            "cancel",      // 436, 474
+        ],
+    ),
+    // `agents`: field of `TuiKeymap` at 524, 563; `TuiAgentsKeymap` at 443, 480
+    (
+        "agents",
+        &[
+            "resume",          // 445, 482
+            "search",          // 447, 484
+            "new_task",        // 449, 486
+            "new_worktree",    // 451, 488
+            "rename",          // 453, 492
+            "stop",            // 455, 494
+            "archive",         // 457, 496
+            "delete",          // 459, 498
+            "hide",            // 461, 500
+            "toggle_grouping", // 463, 504
+        ],
+    ),
+    // `approval`: field of `TuiKeymap` at 526, 565; `TuiApprovalKeymap` at 470, 510
+    (
+        "approval",
+        &[
+            "open_fullscreen",     // 472, 512
+            "open_thread",         // 474, 514
+            "approve",             // 476, 516
+            "approve_for_session", // 478, 518
+            "approve_for_prefix",  // 480, 520
+            "deny",                // 482, 522
+            "decline",             // 484, 524
+            "cancel",              // 486, 526
+        ],
+    ),
+];
+
+/// One Codex key spec in canonical form, one string per stroke, or `None`
+/// where the grammar both pinned releases accept refuses it: 0.160's
+/// `normalize_keybinding_spec`, `normalize_keybinding_stroke` and
+/// `normalize_key_name` (`tui_keymap.rs:539`, `:559`, `:640`; 0.164 at
+/// `:578`, `:609`, `:700` accepts all of it and adds `super`/`cmd`/`command`
+/// and `leader`, which this refuses). At most two strokes split at
+/// whitespace; a stroke is lowercased and split at `-`, empty segments
+/// dropped; `ctrl`/`control`, `alt`/`option` and `shift`, each at most once,
+/// come before the key; the key is a printable ASCII character other than
+/// `-`, a named key (aliases `escape`, `return`, `spacebar`,
+/// `pgup`/`pageup`, `pgdn`/`pagedown`, `del`), or `f1`–`f24`. The canonical
+/// stroke orders its modifiers `ctrl-alt-shift-`. Codex matches a key event
+/// to a binding by `(key, modifiers)` equality after `normalize_key_parts`
+/// (`codex-rs/tui/src/key_hint.rs:125,148` at 0.160, `:132,166` at 0.164),
+/// so the deck's Ctrl+G (`0x07`, read as `g` with Control) is the stroke
+/// `ctrl-g` and no other.
+pub fn codex_key(raw: &str) -> Option<Vec<String>> {
+    let strokes: Vec<&str> = raw.split_whitespace().collect();
+    if strokes.is_empty() || strokes.len() > 2 {
+        return None;
+    }
+    strokes.into_iter().map(codex_stroke).collect()
+}
+
+fn codex_stroke(raw: &str) -> Option<String> {
+    const MODIFIERS: [&str; 3] = ["ctrl", "alt", "shift"];
+    let lower = raw.trim().to_ascii_lowercase();
+    let mut held = [false; 3];
+    let mut key = Vec::new();
+    for segment in lower.split('-').filter(|s| !s.is_empty()) {
+        let modifier = match segment {
+            "ctrl" | "control" => Some(0),
+            "alt" | "option" => Some(1),
+            "shift" => Some(2),
+            _ => None,
+        };
+        match modifier {
+            Some(_) if !key.is_empty() => return None,
+            Some(i) if held[i] => return None,
+            Some(i) => held[i] = true,
+            None => key.push(segment),
+        }
+    }
+    let key = key.join("-");
+    let key = match key.as_str() {
+        "escape" => "esc",
+        "return" => "enter",
+        "spacebar" => "space",
+        "pgup" | "pageup" => "page-up",
+        "pgdn" | "pagedown" => "page-down",
+        "del" => "delete",
+        "enter" | "tab" | "backspace" | "esc" | "delete" | "up" | "down" | "left" | "right"
+        | "home" | "end" | "page-up" | "page-down" | "space" | "minus" => key.as_str(),
+        one if one.len() == 1 && one.as_bytes()[0].is_ascii_graphic() && one != "-" => one,
+        f if f
+            .strip_prefix('f')
+            .and_then(|n| n.parse::<u8>().ok())
+            .is_some_and(|n| (1..=24).contains(&n)) =>
+        {
+            f
+        }
+        _ => return None,
+    };
+    let mut stroke: Vec<&str> = MODIFIERS
+        .iter()
+        .zip(held)
+        .filter_map(|(name, on)| on.then_some(*name))
+        .collect();
+    stroke.push(key);
+    Some(stroke.join("-"))
+}
+
 /// The effective `tui.keymap`: contexts, each a table of action to a key or
-/// a list of keys. Where [`CODEX_EDITOR_ACTION`] is bound, Ctrl+G must be
-/// one of its keys (another key beside it moves nothing off Ctrl+G), and no
-/// other action may be on Ctrl+G.
+/// a list of keys, every name in [`CODEX_KEYMAP`] and every key in
+/// [`codex_key`]'s grammar, else [`Hold::UnknownKey`]. A key with Ctrl+G in
+/// any stroke must be the single stroke `ctrl-g` on [`CODEX_EDITOR_ACTION`];
+/// where that action is bound, `ctrl-g` must be one of its keys (another key
+/// beside it moves nothing off Ctrl+G).
 fn codex_bindings(merged: &toml::Table) -> Result<(), Hold> {
     let Some(tui) = merged.get("tui") else {
         return Ok(());
@@ -525,9 +903,16 @@ fn codex_bindings(merged: &toml::Table) -> Result<(), Hold> {
         return Ok(());
     };
     let keymap = keymap.as_table().ok_or(Hold::UnknownKey)?;
-    for context in keymap.values() {
+    for (name, context) in keymap {
+        let known = CODEX_KEYMAP
+            .iter()
+            .find_map(|(known, actions)| (known == name).then_some(*actions))
+            .ok_or(Hold::UnknownKey)?;
         let context = context.as_table().ok_or(Hold::UnknownKey)?;
         for (action, keys) in context {
+            if !known.contains(&action.as_str()) {
+                return Err(Hold::UnknownKey);
+            }
             let keys: Vec<&str> = match keys {
                 toml::Value::String(key) => vec![key.as_str()],
                 toml::Value::Array(keys) => keys
@@ -536,8 +921,16 @@ fn codex_bindings(merged: &toml::Table) -> Result<(), Hold> {
                     .collect::<Result<_, _>>()?,
                 _ => return Err(Hold::UnknownKey),
             };
+            let keys: Vec<Vec<String>> = keys
+                .into_iter()
+                .map(|k| codex_key(k).ok_or(Hold::UnknownKey))
+                .collect::<Result<_, _>>()?;
             let editor = action == CODEX_EDITOR_ACTION;
-            if keys.iter().any(|k| is_ctrl_g(k)) != editor {
+            let alone = |k: &Vec<String>| k.len() == 1 && k[0] == "ctrl-g";
+            let anywhere = |k: &Vec<String>| k.iter().any(|stroke| stroke == "ctrl-g");
+            if keys.iter().any(|k| anywhere(k) && !(editor && alone(k)))
+                || (editor && !keys.iter().any(alone))
+            {
                 return Err(Hold::Rebound);
             }
         }

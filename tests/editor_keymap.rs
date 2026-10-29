@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use dot_agent_deck::composer_probe::keymap::{
     ClaudeKeymap, CodexSources, Hold, SOURCE_BYTES, SourceRead, Unreadable,
-    claude_keybindings_path, codex_keymap, is_ctrl_g, read_source,
+    claude_keybindings_path, codex_key, codex_keymap, is_ctrl_g, read_source,
 };
 use dot_agent_deck::doorbell_activation::{
     EditorProbe, EditorSelection, ExportShape, KeymapSource, Measurement, PasteToggles,
@@ -257,7 +257,7 @@ fn probe_014_a_symlinked_file_is_read_through_and_retargeting_holds() {
     assert_eq!(retargeted.check(), Err(Hold::Changed));
 }
 
-/// Scenario: Claude's `keybindings.json` is looked for under `CLAUDE_CONFIG_DIR` when it is set and non-empty, else under `HOME/.claude`; with neither there is no path.
+/// Scenario: Claude's `keybindings.json` is looked for under `HOME/.claude` when `CLAUDE_CONFIG_DIR` isn't in the agent's environment. With `CLAUDE_CONFIG_DIR` set, or set but empty, the lookup holds as unmeasured instead of following it, and so does a `HOME` that is unset, empty or relative.
 #[spec("inbox/probe/014")]
 #[test]
 fn probe_014_where_claude_reads_its_bindings() {
@@ -270,17 +270,24 @@ fn probe_014_where_claude_reads_its_bindings() {
     };
     assert_eq!(
         claude_keybindings_path(env(&[("HOME", "/h"), ("CLAUDE_CONFIG_DIR", "/c")])),
-        Some(PathBuf::from("/c/keybindings.json"))
+        Err(Hold::Unmeasured)
     );
     assert_eq!(
         claude_keybindings_path(env(&[("HOME", "/h"), ("CLAUDE_CONFIG_DIR", "")])),
-        Some(PathBuf::from("/h/.claude/keybindings.json"))
+        Err(Hold::Unmeasured),
+        "present but empty"
     );
     assert_eq!(
         claude_keybindings_path(env(&[("HOME", "/h")])),
-        Some(PathBuf::from("/h/.claude/keybindings.json"))
+        Ok(PathBuf::from("/h/.claude/keybindings.json"))
     );
-    assert_eq!(claude_keybindings_path(env(&[])), None);
+    for home in [&[][..], &[("HOME", "")], &[("HOME", "h")]] {
+        assert_eq!(
+            claude_keybindings_path(env(home)),
+            Err(Hold::Unmeasured),
+            "{home:?}"
+        );
+    }
 }
 
 /// Scenario: Ctrl+G is recognised in the spellings the keymap files use, in either case and with spaces, and nothing else is: not Ctrl+H, not plain G, not Alt+G.
@@ -407,7 +414,7 @@ fn editor_on(key: &str) -> String {
 #[test]
 fn probe_014_codex_sources_merge_in_the_records_precedence() {
     let reversed: Vec<KeymapSource> = CODEX_ORDER.iter().rev().copied().collect();
-    let restore = "-ctui.keymap.global.open_external_editor=ctrl+g";
+    let restore = "-ctui.keymap.global.open_external_editor=ctrl-g";
     let move_off = "-ctui.keymap.global.open_external_editor=f6";
 
     let codex = Codex::new();
@@ -419,12 +426,12 @@ fn probe_014_codex_sources_merge_in_the_records_precedence() {
     assert_eq!(codex.resolve(&[restore], CODEX_ORDER), Ok(()), "-c wins");
     assert_eq!(codex.resolve(&[restore], &reversed), Err(Hold::Rebound));
 
-    write(&codex.config(), &editor_on("ctrl+g"));
+    write(&codex.config(), &editor_on("ctrl-g"));
     assert_eq!(codex.resolve(&[move_off], CODEX_ORDER), Err(Hold::Rebound));
     assert_eq!(codex.resolve(&[move_off], &reversed), Ok(()));
 
     write(&codex.config(), &editor_on("f6"));
-    write(&codex.profile(), &editor_on("ctrl+g"));
+    write(&codex.profile(), &editor_on("ctrl-g"));
     assert_eq!(
         codex.resolve(&["-p", "work"], CODEX_ORDER),
         Ok(()),
@@ -436,7 +443,7 @@ fn probe_014_codex_sources_merge_in_the_records_precedence() {
     );
 
     write(&codex.profile(), &editor_on("f6"));
-    write(&codex.project(), &editor_on("ctrl+g"));
+    write(&codex.project(), &editor_on("ctrl-g"));
     assert_eq!(
         codex.resolve(&["-p", "work"], CODEX_ORDER),
         Ok(()),
@@ -460,11 +467,11 @@ fn probe_014_codex_bindings_that_hold() {
     let codex = Codex::new();
     for (config, want) in [
         (
-            "[tui.keymap.global]\nquit = \"ctrl+g\"\n".to_string(),
+            "[tui.keymap.global]\ncopy = \"ctrl-g\"\n".to_string(),
             Err(Hold::Rebound),
         ),
         (
-            "[tui.keymap.composer]\nnewline = [\"f2\", \"ctrl-g\"]\n".to_string(),
+            "[tui.keymap.editor]\ninsert_newline = [\"f2\", \"ctrl-g\"]\n".to_string(),
             Err(Hold::Rebound),
         ),
         (
@@ -482,13 +489,13 @@ fn probe_014_codex_bindings_that_hold() {
             Err(Hold::UnknownKey),
         ),
         (
-            "[tui.keymap.global]\nquit = 7\n".to_string(),
+            "[tui.keymap.global]\ncopy = 7\n".to_string(),
             Err(Hold::UnknownKey),
         ),
         ("[tui.keymap\n".to_string(), Err(Hold::Unparsable)),
-        (editor_on("ctrl+g"), Ok(())),
+        (editor_on("ctrl-g"), Ok(())),
         (
-            "[tui.keymap.global]\nopen_external_editor = [\"ctrl+g\", \"f6\"]\nquit = \"ctrl+q\"\n"
+            "[tui.keymap.global]\nopen_external_editor = [\"ctrl-g\", \"f6\"]\ncopy = \"ctrl-o\"\n"
                 .to_string(),
             Ok(()),
         ),
@@ -544,6 +551,180 @@ fn probe_014_codex_bindings_that_hold() {
     );
 }
 
+/// Scenario: A Codex keymap with a context, an action or a key spelling outside what both pinned releases accept holds as unknown: an unknown context (also an empty one), an unknown action beside known ones, a name only the newer release has, and spellings the grammar refuses (`+` instead of `-`, a modifier after the key, three strokes, `f25`, `cmd-`, `leader`). Ctrl+G in another spelling the grammar accepts, on another action or in a chord, holds as rebound. The controls bind known actions in known contexts with accepted spellings, leave a known context empty, and spell the editor's Ctrl+G with Codex's aliases; each allows the probe.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_codex_names_and_spellings_outside_the_pinned_schema_hold() {
+    let codex = Codex::new();
+    let copy_on = |key: &str| format!("[tui.keymap.global]\ncopy = \"{key}\"\n");
+    let mut cases = vec![
+        (
+            "[tui.keymap.unmeasured_context]\nunmeasured_action = \"f6\"\n".to_string(),
+            Err(Hold::UnknownKey),
+        ),
+        (
+            "[tui.keymap.unmeasured_context]\n".to_string(),
+            Err(Hold::UnknownKey),
+        ),
+        (
+            "[tui.keymap.global]\ncopy = \"ctrl-o\"\nnot_a_measured_action = \"f6\"\n".to_string(),
+            Err(Hold::UnknownKey),
+        ),
+        (
+            "[tui.keymap.global]\nleader = \"ctrl-x\"\n".to_string(),
+            Err(Hold::UnknownKey),
+        ),
+        (editor_on("ctrl+g"), Err(Hold::UnknownKey)),
+        (
+            "[tui.keymap.global]\nopen_external_editor = [\"ctrl-g\", \"unmeasured-key\"]\n"
+                .to_string(),
+            Err(Hold::UnknownKey),
+        ),
+    ];
+    for spelling in [
+        "unmeasured-key",
+        "ctrl+o",
+        "o-ctrl",
+        "ctrl-ctrl-o",
+        "ctrl-x ctrl-y ctrl-z",
+        "f25",
+        "cmd-o",
+        "leader c",
+        "",
+        " ",
+    ] {
+        cases.push((copy_on(spelling), Err(Hold::UnknownKey)));
+    }
+    for spelling in ["Control-G", "CTRL--g", "ctrl-x ctrl-g", "ctrl-g x"] {
+        cases.push((copy_on(spelling), Err(Hold::Rebound)));
+    }
+    cases.push((editor_on("ctrl-g x"), Err(Hold::Rebound)));
+    cases.extend([
+        (
+            "[tui.keymap.global]\ncopy = \"ctrl-o\"\n[tui.keymap.pager]\nclose = [\"q\", \"escape\"]\n[tui.keymap.list]\npage_up = \"alt-pgup\"\n[tui.keymap.editor]\n"
+                .to_string(),
+            Ok(()),
+        ),
+        (copy_on("f24"), Ok(())),
+        (copy_on("ctrl-shift-g"), Ok(())),
+        (copy_on("ctrl-x g"), Ok(())),
+        (editor_on("Control-G"), Ok(())),
+        (editor_on(" CTRL--g "), Ok(())),
+    ]);
+    for (config, want) in cases {
+        write(&codex.config(), &config);
+        assert_eq!(codex.resolve(&[], CODEX_ORDER), want, "{config}");
+    }
+}
+
+/// Scenario: Codex key spellings read in the grammar both pinned releases accept: each alias becomes its canonical key, each named key, printable character and function key up to F24 is kept, modifiers in any order and spelling come out as `ctrl-alt-shift-`, and a two-stroke chord stays two strokes. Spellings the grammar refuses read as nothing.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_codex_key_spellings_in_the_pinned_grammar() {
+    for (raw, want) in [
+        ("escape", "esc"),
+        ("Return", "enter"),
+        ("spacebar", "space"),
+        ("pgup", "page-up"),
+        ("PageUp", "page-up"),
+        ("pgdn", "page-down"),
+        ("pagedown", "page-down"),
+        ("del", "delete"),
+        ("shift-option-control-x", "ctrl-alt-shift-x"),
+        ("Control-G", "ctrl-g"),
+        ("f1", "f1"),
+        ("F24", "f24"),
+        ("?", "?"),
+    ] {
+        assert_eq!(codex_key(raw), Some(vec![want.to_string()]), "{raw}");
+    }
+    for named in [
+        "enter",
+        "tab",
+        "backspace",
+        "esc",
+        "delete",
+        "up",
+        "down",
+        "left",
+        "right",
+        "home",
+        "end",
+        "page-up",
+        "page-down",
+        "space",
+        "minus",
+    ] {
+        assert_eq!(
+            codex_key(&format!("alt-{named}")),
+            Some(vec![format!("alt-{named}")]),
+            "{named}"
+        );
+    }
+    assert_eq!(
+        codex_key("ctrl-x  ctrl-g"),
+        Some(vec!["ctrl-x".to_string(), "ctrl-g".to_string()])
+    );
+    for refused in [
+        "",
+        "-",
+        "ctrl",
+        "ctrl+g",
+        "g-ctrl",
+        "alt-alt-g",
+        "f0",
+        "f25",
+        "super-g",
+        "cmd-g",
+        "leader g",
+        "a b c",
+        "ctrl-é",
+        "insert",
+    ] {
+        assert_eq!(codex_key(refused), None, "{refused}");
+    }
+}
+
+/// Scenario: Claude's `keybindings.json` is read as strings wherever they sit: Ctrl+G as a value rather than a member name, the external-editor action as a member name rather than a value, either one deep in nested arrays and objects, and Ctrl+G spelled with spaces, in a chord or alone, each hold as rebound. The control, a document of unrelated bindings that also uses spaced spellings and strings that merely contain a `g`, allows the probe.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_claude_scan_reads_every_string() {
+    let dir = test_temp::tempdir().unwrap();
+    let path = keybindings(&dir);
+    for (contents, want) in [
+        (
+            r#"{"bindings":[{"key":"ctrl+g","action":"chat:submit"}]}"#,
+            Err(Hold::Rebound),
+        ),
+        (r#"{"chat:externalEditor":null}"#, Err(Hold::Rebound)),
+        (
+            r#"{"a":[{"b":[{"c":"chat:externalEditor"}]}]}"#,
+            Err(Hold::Rebound),
+        ),
+        (r#"{"a":[{"b":[{"^G":1}]}]}"#, Err(Hold::Rebound)),
+        (
+            r#"{"bindings":[{"context":"Chat","bindings":{"ctrl + g":"chat:submit"}}]}"#,
+            Err(Hold::Rebound),
+        ),
+        (
+            r#"{"bindings":[{"key":"ctrl + x  ctrl + g","action":"chat:submit"}]}"#,
+            Err(Hold::Rebound),
+        ),
+        (
+            r#"{"bindings":[{"key":"Control - G"}]}"#,
+            Err(Hold::Rebound),
+        ),
+        (
+            r#"{"bindings":[{"context":"Chat","bindings":{"ctrl+e":"chat:submit","ctrl + x ctrl + h":"chat:cancel"}}],"note":"go, gauge, ctrl+gx"}"#,
+            Ok(()),
+        ),
+    ] {
+        write(&path, contents);
+        let keymap = ClaudeKeymap::at_spawn(path.clone(), &verified());
+        assert_eq!(keymap.check(), want, "{contents}");
+    }
+}
+
 /// Scenario: Codex's sources are read before the spawn and again after the first ready frame: a file changed between the two, created where none was, or removed holds with "changed", whatever either read binds. The control reads the same files twice and allows the probe.
 #[spec("inbox/probe/014")]
 #[test]
@@ -583,7 +764,7 @@ fn probe_014_a_codex_source_changed_between_its_reads_holds() {
     );
 
     let before = sources.read();
-    write(&codex.project(), &editor_on("ctrl+g"));
+    write(&codex.project(), &editor_on("ctrl-g"));
     assert_eq!(
         codex_keymap(&before, &sources.read(), CODEX_ORDER),
         Err(Hold::Changed),
