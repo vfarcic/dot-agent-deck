@@ -1,0 +1,13 @@
+{
+  "before": "\u001b[HABCD\u001b[H",
+  "after": "\u001b[HABXY\u001b[H",
+  "overlay": "\u001b[3;1H!\u001b[2K\u001b[H",
+  "moved_glyph": "\u001b[3;1HA\u001b[2K\u001b[H",
+  "partial_erase": "\u001b[1;3H\u001b[2X\u001b[H",
+  "restore_previous": "\u001b[1;3HCD\u001b[H",
+  "clear": "\u001b[2J\u001b[H",
+  "mode": "\u001b[?1000h\u001b[?1000l",
+  "clipboard": "\u001b]52;c;c2VjcmV0\u0007",
+  "scroll_future": "\u001b[HABXY\u001b[4;1H\n\u001b[H",
+  "new_modal": "\u001b[3;1HConfirm?\u001b[H"
+}

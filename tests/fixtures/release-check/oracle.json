@@ -1,0 +1,13 @@
+{
+  "rows": 4,
+  "cols": 12,
+  "templates": [
+    {"name": "before", "phase": "idle", "ansi": "\u001b[HABCD\u001b[H"},
+    {"name": "after", "phase": "idle", "ansi": "\u001b[HABXY\u001b[H"}
+  ],
+  "transient_modes": [2026],
+  "allowed_controls": [],
+  "history_lines": [],
+  "variable_regions": [],
+  "fields": []
+}
