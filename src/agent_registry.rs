@@ -357,7 +357,7 @@ pub enum FirstHook {
     /// 0.160.0, measured: `SessionStart` 338 ms and 449 ms after the first
     /// prompt's Enter). Such a generation may be rung on its own measured
     /// proof instead, which the doorbell's transaction checks on every ring
-    /// whatever this says: an activated release (`Go` or `Inherited`) it
+    /// whatever this says: an activated release (`Go`) it
     /// latched from its own start-up header, a Clean frame of that release's
     /// profile showing the empty ready composer, its own input-mode evidence
     /// and its settle anchor. A predecessor's report in the same pane is

@@ -83,9 +83,6 @@ pub(crate) struct Typing {
     pub(crate) profile: &'static crate::doorbell_screen::ScreenProfile,
     pub(crate) caps: txn::Caps,
     pub(crate) settle: Duration,
-    /// The latched release, when it is typed into under an inherited
-    /// profile: the release a recognised dialog trips (plan §4.6).
-    pub(crate) inherited: Option<(AgentType, semver::Version)>,
     /// How the verdict reads in the `doorbell attempt` line.
     pub(crate) verdict: String,
     /// The release the verdict was read for, latched from the generation's
@@ -319,7 +316,6 @@ impl AgentPtyRegistry {
                     staged_head: None,
                 },
                 settle: Duration::ZERO,
-                inherited: None,
                 verdict: "Go (e2e stand-in)".to_string(),
                 release: None,
             }));
@@ -345,36 +341,21 @@ impl AgentPtyRegistry {
         evidence_profile: Option<&'static crate::doorbell_screen::ScreenProfile>,
     ) -> Result<Typing, &'static str> {
         use crate::doorbell_activation::{Activation, RELEASE_RECORDS};
-        let tripwires = self.doorbell_tripwires.tripped();
         let verdict = crate::doorbell_generation::generation_activation(
             &RELEASE_RECORDS,
             agent.as_ref(),
             &latch,
-            &tripwires,
         );
         let released = match &latch {
             crate::doorbell_activation::LatchedRelease::Known(release) => Some(release.clone()),
             _ => None,
         };
-        let (profile_id, staged, settle, record_release, inherited) = match &verdict {
+        let (profile_id, staged, settle) = match &verdict {
             Activation::Go {
                 profile,
                 staged,
                 settle,
-            } => (*profile, *staged, *settle, released.clone(), None),
-            Activation::Inherited {
-                from,
-                profile,
-                staged,
-                settle,
-                ..
-            } => (
-                *profile,
-                *staged,
-                *settle,
-                Some(from.clone()),
-                agent.clone().zip(released.clone()),
-            ),
+            } => (*profile, *staged, *settle),
             Activation::NoGo(no_go) => return Err(no_go.clause()),
         };
         let profile = crate::doorbell_screen::profile(profile_id)
@@ -382,9 +363,7 @@ impl AgentPtyRegistry {
             .ok_or(crate::doorbell_activation::NoGo::UnmeasuredRelease.clause())?;
         let record = RELEASE_RECORDS
             .iter()
-            .find(|r| {
-                Some(&r.agent) == agent.as_ref() && Some(&r.release) == record_release.as_ref()
-            })
+            .find(|r| Some(&r.agent) == agent.as_ref() && Some(&r.release) == released.as_ref())
             .ok_or(crate::doorbell_activation::NoGo::UnmeasuredRelease.clause())?;
         let verified = |m: bool| m;
         let caps = txn::Caps {
@@ -406,7 +385,6 @@ impl AgentPtyRegistry {
             profile,
             caps,
             settle,
-            inherited,
             verdict: format!("{verdict:?}"),
             release: released.as_ref().map(ToString::to_string),
         })
@@ -677,8 +655,8 @@ impl AgentPtyRegistry {
         // locks and the pane input state are read by `try_lock` and retried
         // until `D`, the admission check reads the hub the same way, and the
         // awaits wait at most for what is left of `D`. Leaf locks on the way
-        // (the evidence channel map, the tripwire list) are waited on, and
-        // `D` does not bound that wait.
+        // (the evidence channel map) are waited on, and `D` does not bound
+        // that wait.
         let drained = within_real_time(Duration::from_millis(100).min(left()), guard.until_idle())
             .await
             .is_some();
@@ -776,9 +754,6 @@ impl AgentPtyRegistry {
                     "doorbell attempt: not admitted"
                 );
                 drop(guard);
-                if let (txn::NotTyped::Dialog(dialog), Ok(typing)) = (why, &typing) {
-                    self.trip_on_dialog(typing, dialog);
-                }
                 return RingReport::before_admission(RingOutcome::Txn(
                     txn::Outcome::NothingWritten(why),
                 ));
@@ -954,10 +929,6 @@ impl AgentPtyRegistry {
         {
             input.reconcile_deck_submit(&pane);
         }
-        // A dialog's tripwire fans out to every live generation through the
-        // registry's lock, whose holders can wait on other locks: done once
-        // the writer is released, below.
-        let mut tripped: Option<&'static str> = None;
         if let txn::Outcome::Unresolved(cause) = outcome {
             tracing::warn!(
                 target: "doorbell",
@@ -968,9 +939,6 @@ impl AgentPtyRegistry {
                 cell = ?generation.doorbell.cell().load(),
                 "doorbell unresolved"
             );
-            if cause.is_dialog() {
-                tripped = txn.last_dialog();
-            }
             let left = txn.deadline().saturating_duration_since(Instant::now());
             if !left.is_zero() {
                 let waited = self.request_reprojection_and_wait(&pane, &agent);
@@ -996,9 +964,6 @@ impl AgentPtyRegistry {
         drop(job);
         drop(guard);
         self.doorbell_txn_end(&agent);
-        if let Some(dialog) = tripped {
-            self.trip_on_dialog(&typing, dialog);
-        }
         report
     }
 
@@ -1080,37 +1045,6 @@ impl AgentPtyRegistry {
             *job = None;
         }
         (wake, released)
-    }
-
-    /// A recognised dialog on an inherited release sets its tripwire (plan
-    /// §4.6), and every live generation of that release is re-projected.
-    fn trip_on_dialog(&self, typing: &Typing, dialog: &'static str) {
-        let Some((agent, release)) = typing.inherited.as_ref() else {
-            return;
-        };
-        if dialog == "unrecognised" {
-            return;
-        }
-        if self.doorbell_tripwires.trip(agent, release) {
-            tracing::warn!(
-                target: "pane_release",
-                agent = ?agent,
-                %release,
-                dialog,
-                "pane release: tripwire set; this release needs a measurement"
-            );
-            let live: Vec<(String, String)> = {
-                let inner = self.inner.lock();
-                inner
-                    .agents
-                    .iter()
-                    .filter_map(|(id, a)| Some((a.pane_id_env.clone()?, id.clone())))
-                    .collect()
-            };
-            for (pane, id) in live {
-                self.request_reprojection(&pane, &id);
-            }
-        }
     }
 
     /// Ask the publisher to re-project `agent_id`'s generation in `pane_id`
@@ -1282,7 +1216,6 @@ impl AgentPtyRegistry {
                                     &crate::doorbell_activation::LatchedRelease::Known(
                                         record.release.clone()
                                     ),
-                                    &[],
                                 ),
                                 crate::doorbell_activation::Activation::Go { .. }
                             )

@@ -28,13 +28,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-/// The measured release, and one that inherits from it (Q13).
+/// The measured release.
 const MEASURED: &str = "0.164.0";
-const INHERITED: &str = "0.165.0";
-/// The settle windows the deck gives them: 0.164.0's slowest measured
-/// start-up dialog plus half, and the inherited floor.
+/// The settle window the deck gives it: 0.164.0's slowest measured start-up
+/// dialog plus half.
 const MEASURED_SETTLE: Duration = Duration::from_millis(6030);
-const INHERITED_SETTLE: Duration = Duration::from_secs(10);
 /// Long enough for a fresh generation's settle window and its ring.
 const RING_WAIT: Duration = Duration::from_secs(40);
 
@@ -568,83 +566,6 @@ fn codex_027_a_pane_its_hooks_call_codex_is_rung() {
     let line = delivered(&deck, &codex, &id);
     assert_eq!(codex.typed(), format!("{line}\r"));
     assert_eq!(head(&codex.inputs()[0].1), head(&line));
-}
-
-/// Scenario: Codex 0.165.0, a release the deck has not measured, inherits measured 0.164.0's profile. Its update dialog is open when, after the inherited settle window of 10 s, the deck's admission reads it: nothing is typed and the release's tripwire is set, so a new generation of 0.165.0 in the same pane is held as release_tripwire, while a measured 0.164.0 generation in another pane is still rung.
-#[spec("inbox/codex/027")]
-#[test]
-fn codex_027_a_dialog_on_an_inherited_release_sets_its_tripwire() {
-    let deck = Deck::new();
-    let codex = deck.codex("codex-027-inherit", INHERITED, Some("codex"), &[]);
-    deck.latched(&codex, INHERITED);
-    codex.set(".dialog", "update");
-    deck.idle(&codex);
-    let id = enqueue(&deck.daemon, &codex.pane, BODY);
-    assert!(
-        common::wait_until(RING_WAIT, || deck.tripped()),
-        "the tripwire is set: {}",
-        deck.log()
-    );
-    let refused = deck.lines(&codex.pane.agent, "Dialog(\"update\")");
-    assert!(!refused.is_empty(), "{}", deck.log());
-    assert!(bytes(&codex.pane).is_empty(), "{:?}", codex.typed());
-    assert!(codex.dialog_bytes().is_empty());
-    state(&deck.daemon, &codex.pane, &id, "queued");
-    let first = refused[0].clone();
-    assert!(
-        deck.log().find(&first).unwrap() < deck.log().find("pane release: tripwire set").unwrap(),
-        "the refusal comes first"
-    );
-
-    deck.stop(codex);
-    let next = deck.codex("codex-027-inherit", INHERITED, Some("codex"), &[]);
-    deck.latched(&next, INHERITED);
-    assert!(
-        common::wait_until(WAIT, || deck
-            .lines(&next.pane.agent, "doorbell off")
-            .iter()
-            .any(|l| l.contains("release_tripwire"))),
-        "the next generation of 0.165.0 is held: {}",
-        deck.log()
-    );
-
-    let measured = deck.codex("codex-027-measured", MEASURED, Some("codex"), &[]);
-    deck.latched(&measured, MEASURED);
-    deck.idle(&measured);
-    let id = enqueue(&deck.daemon, &measured.pane, BODY);
-    delivered(&deck, &measured, &id);
-}
-
-/// Scenario: On inherited Codex 0.165.0 the folder-trust dialog opens the moment the deck's token head lands. The deck types nothing more, the attempt ends unresolved with the dialog named, and the release's tripwire is set.
-#[spec("inbox/codex/027")]
-#[test]
-fn codex_027_a_dialog_mid_attempt_on_an_inherited_release_sets_its_tripwire() {
-    let deck = Deck::new();
-    let codex = deck.codex(
-        "codex-027-inherit-head",
-        INHERITED,
-        Some("codex"),
-        &[(".dialog_on_head", "")],
-    );
-    deck.latched(&codex, INHERITED);
-    deck.idle(&codex);
-    enqueue(&deck.daemon, &codex.pane, BODY);
-    assert!(
-        common::wait_until(RING_WAIT, || deck.tripped()),
-        "the tripwire is set: {}",
-        deck.log()
-    );
-    let ended = deck.lines(&codex.pane.agent, "doorbell attempt ended");
-    assert!(
-        ended.iter().any(|l| l.contains("DialogAfterTyping")),
-        "{ended:?}"
-    );
-    assert_eq!(codex.typed().len(), 8, "{:?}", codex.typed());
-    let inputs = codex.inputs();
-    assert!(
-        inputs[0].0 >= deck.anchor(&codex) + INHERITED_SETTLE.as_nanos() as u64,
-        "no byte before the inherited settle window"
-    );
 }
 
 /// Scenario: On measured Codex 0.164.0, an unrecognised screen gets no byte, and a later swallowed Enter leaves the task queued with no submit evidence. A fresh generation with a transcript row reading "Update now" still delivers its task because that row is not a dialog.

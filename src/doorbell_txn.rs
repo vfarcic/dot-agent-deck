@@ -693,7 +693,7 @@ pub enum NotTyped {
 /// What step 1 is decided from (plan §1.1).
 #[derive(Debug, Clone)]
 pub struct Admission {
-    /// The activation verdict: `Ok` for Go or Inherited, else the clause.
+    /// The activation verdict: `Ok` for Go, else the clause.
     pub activation: Result<(), &'static str>,
     /// The input-mode evidence: usable with both bits clear, or the clause.
     pub mode: Result<(), &'static str>,
@@ -1054,12 +1054,6 @@ impl<'c> Txn<'c> {
     /// agent did not take.
     pub fn cr_reached(&self) -> bool {
         self.after_cr
-    }
-
-    /// The dialog the latest frame showed, by its measured name, or
-    /// `unrecognised` for one of the profile's shape with an unknown title.
-    pub fn last_dialog(&self) -> Option<&'static str> {
-        self.frame.dialog
     }
 
     pub fn phase(&self) -> Phase {

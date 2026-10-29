@@ -195,8 +195,7 @@ impl Grid {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialog {
     /// One of the release's measured post-ready dialogs, by the name the
-    /// key-effect measurements use (`update`, `trust`, `hooks`): the markers
-    /// an inherited release's tripwire is to be set by (plan §4.6).
+    /// key-effect measurements use (`update`, `trust`, `hooks`).
     Measured(&'static str),
     /// A screen with the dialog shape the profile knows (a highlighted
     /// numbered choice) but a title it does not.

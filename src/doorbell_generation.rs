@@ -13,13 +13,10 @@
 //! the input-mode evidence of an unwrapped pane, read from the deck's own PTY
 //! master; the first-ring settle anchor; and the activation verdict for the
 //! generation's effective agent type and latched release, against the
-//! recorded measurements and the tripwires set since the daemon started.
+//! recorded measurements.
 
-use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-
-use semver::Version;
 
 use crate::doorbell_activation::{
     Activation, LatchedRelease, NoGo, ReleaseRecord, activation, assumed_codex_head_echo,
@@ -27,32 +24,6 @@ use crate::doorbell_activation::{
 };
 use crate::doorbell_txn::{AttemptCounter, AttemptRing, Latch, LatchCell, RingToken};
 use crate::event::AgentType;
-
-/// The releases on which the deck recognised a measured dialog since it
-/// started (plan §4.6, Q13): set only on an inherited release, and from then
-/// on every generation of that release is held as `release_tripwire` until
-/// the daemon restarts.
-#[derive(Debug, Default)]
-pub struct Tripwires {
-    set: Mutex<Vec<(AgentType, Version)>>,
-}
-
-impl Tripwires {
-    /// Set the tripwire for `agent`'s `release`; `true` when it was not set
-    /// before.
-    pub fn trip(&self, agent: &AgentType, release: &Version) -> bool {
-        let mut set = self.set.lock().unwrap();
-        if set.iter().any(|(a, r)| a == agent && r == release) {
-            return false;
-        }
-        set.push((agent.clone(), release.clone()));
-        true
-    }
-
-    pub fn tripped(&self) -> Vec<(AgentType, Version)> {
-        self.set.lock().unwrap().clone()
-    }
-}
 
 /// The verdict for a generation of `agent` whose header latched `latch`
 /// (plan §4.6): `records` with the e2e build's Claude Code exclusion applied,
@@ -65,7 +36,6 @@ pub fn generation_activation<'a>(
     records: &[ReleaseRecord<'a>],
     agent: Option<&AgentType>,
     latch: &LatchedRelease,
-    tripwires: &[(AgentType, Version)],
 ) -> Activation<'a> {
     let Some(agent) = agent.filter(|a| **a != AgentType::None) else {
         return Activation::NoGo(NoGo::UnmeasuredRelease);
@@ -77,15 +47,14 @@ pub fn generation_activation<'a>(
     if !records.iter().any(|record| record.agent == *agent) {
         return Activation::NoGo(NoGo::UnmeasuredRelease);
     }
-    activation(&records, agent, latch, tripwires)
+    activation(&records, agent, latch)
 }
 
-/// The clause a verdict holds a generation with, `None` for `Go` and
-/// `Inherited`.
+/// The clause a verdict holds a generation with, `None` for `Go`.
 pub fn refused_clause(verdict: &Activation<'_>) -> Option<&'static str> {
     match verdict {
         Activation::NoGo(no_go) => Some(no_go.clause()),
-        Activation::Go { .. } | Activation::Inherited { .. } => None,
+        Activation::Go { .. } => None,
     }
 }
 
@@ -326,6 +295,7 @@ fn duplicate(fd: std::os::fd::RawFd) -> Option<std::os::fd::OwnedFd> {
 mod tests {
     use super::*;
     use crate::doorbell_txn::{Cause, Resolution};
+    use semver::Version;
 
     #[test]
     fn evidence_on_receipt_resolves_the_open_attempt_by_its_token() {
@@ -414,29 +384,18 @@ mod tests {
     }
 
     #[test]
-    fn a_tripwire_is_set_once_per_release() {
-        let wires = Tripwires::default();
-        let v = Version::new(0, 165, 0);
-        assert!(wires.trip(&AgentType::Codex, &v));
-        assert!(!wires.trip(&AgentType::Codex, &v));
-        assert!(wires.trip(&AgentType::ClaudeCode, &v));
-        assert_eq!(wires.tripped().len(), 2);
-    }
-
-    #[test]
     fn a_generation_with_no_agent_type_has_no_profile_to_type_under() {
         let records = &crate::doorbell_activation::RELEASE_RECORDS;
         let latch = LatchedRelease::Known(Version::new(2, 1, 310));
         assert_eq!(
-            refused_clause(&generation_activation(records, None, &latch, &[])),
+            refused_clause(&generation_activation(records, None, &latch)),
             Some("unmeasured_release")
         );
         assert_eq!(
             refused_clause(&generation_activation(
                 records,
                 Some(&AgentType::None),
-                &latch,
-                &[]
+                &latch
             )),
             Some("unmeasured_release")
         );
@@ -444,8 +403,7 @@ mod tests {
             refused_clause(&generation_activation(
                 records,
                 Some(&AgentType::ClaudeCode),
-                &latch,
-                &[]
+                &latch
             )),
             None
         );
@@ -460,7 +418,7 @@ mod tests {
                 LatchedRelease::Known(Version::new(1, 0, 0)),
             ] {
                 assert_eq!(
-                    refused_clause(&generation_activation(records, Some(&agent), &latch, &[])),
+                    refused_clause(&generation_activation(records, Some(&agent), &latch)),
                     Some("unmeasured_release"),
                     "{agent:?} {latch:?}"
                 );
@@ -471,8 +429,7 @@ mod tests {
             refused_clause(&generation_activation(
                 records,
                 Some(&AgentType::ClaudeCode),
-                &LatchedRelease::Unseen,
-                &[]
+                &LatchedRelease::Unseen
             )),
             Some("unknown_release")
         );

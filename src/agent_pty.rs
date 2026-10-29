@@ -6936,9 +6936,6 @@ pub struct AgentPtyRegistry {
     /// PRD #1666 part 3, round 5-wake (plan §2.3): per pane, the channel a
     /// prompt hook's ring evidence reaches a waiting doorbell transaction on.
     doorbell_evidence: Mutex<HashMap<String, broadcast::Sender<RingEvidence>>>,
-    /// PRD #1666 part 3, round 5-wake (plan §4.6): the inherited releases a
-    /// recognised dialog has disabled since the daemon started.
-    doorbell_tripwires: crate::doorbell_generation::Tripwires,
     /// PRD #1666 part 3, round 5-wake (plan §3.4′): the re-projection
     /// publisher's requests, once it runs.
     doorbell_publisher:
@@ -9132,7 +9129,6 @@ impl AgentPtyRegistry {
             repaint_nudges: Mutex::new(HashMap::new()),
             doorbell_txns: Mutex::new(HashMap::new()),
             doorbell_evidence: Mutex::new(HashMap::new()),
-            doorbell_tripwires: Default::default(),
             doorbell_publisher: std::sync::OnceLock::new(),
             doorbell_publishing: Mutex::new(()),
             #[cfg(test)]
@@ -11660,12 +11656,6 @@ impl AgentPtyRegistry {
             .agents
             .get(agent_id)
             .map(|agent| Arc::clone(&agent.doorbell))
-    }
-
-    /// The releases whose tripwire is set since the daemon started (plan
-    /// §4.6).
-    pub fn doorbell_tripwires(&self) -> &crate::doorbell_generation::Tripwires {
-        &self.doorbell_tripwires
     }
 
     /// `agent_id`'s ingress ledger, while it is in the registry.
@@ -24101,7 +24091,6 @@ mod spawn_tests {
                 &RELEASE_RECORDS,
                 &AgentType::Codex,
                 &latched_for(&bus),
-                &[],
             ),
             Activation::NoGo(NoGo::ScannerBudget)
         );

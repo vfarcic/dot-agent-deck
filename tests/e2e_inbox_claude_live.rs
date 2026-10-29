@@ -397,7 +397,6 @@ fn measured(release: &str) -> bool {
                 &RELEASE_RECORDS,
                 &dot_agent_deck::event::AgentType::ClaudeCode,
                 &LatchedRelease::Known(version),
-                &[],
             ),
             Activation::Go { .. }
         )

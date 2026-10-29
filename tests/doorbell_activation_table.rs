@@ -72,7 +72,7 @@ fn known(release: &str) -> LatchedRelease {
 }
 
 fn verdict<'a>(records: &[ReleaseRecord<'a>], agent: &AgentType, release: &str) -> Activation<'a> {
-    activation(records, agent, &known(release), &[])
+    activation(records, agent, &known(release))
 }
 
 fn no_go(a: &Activation<'_>) -> Option<NoGo> {
@@ -196,7 +196,7 @@ fn doorbell_053_unlatched_releases_and_capabilities() {
         (LatchedRelease::ScannerBudget, NoGo::ScannerBudget),
     ] {
         assert_eq!(
-            no_go(&activation(&records, &CODEX, &latch, &[])),
+            no_go(&activation(&records, &CODEX, &latch)),
             Some(want.clone())
         );
         assert_eq!(NoGo::UnknownRelease.clause(), "unknown_release");
@@ -332,7 +332,7 @@ fn doorbell_053_key_effects_and_own_settle() {
 /// Scenario: Put a measured Go Codex 0.164.0 beside newer minor and patch releases, a pre-release, another major and an older release. Every release without its own record is held as unmeasured_release, while an exact incomplete record keeps its own missing fact instead of borrowing an older Go.
 #[spec("inbox/doorbell/053")]
 #[test]
-fn doorbell_053_inheritance_rules() {
+fn doorbell_053_only_an_exact_record_admits() {
     // An exact record decides, even incomplete, past an older complete one.
     let records = [
         complete(CODEX, "0.160.0", 2),
@@ -386,95 +386,10 @@ fn doorbell_053_inheritance_rules() {
     );
 }
 
-/// Scenario: Set the tripwire for one inherited Codex release and ask about it and about another inherited release. The tripped one is held as release_tripwire while the other still inherits, and a measured release is unaffected.
+/// Scenario: Ask about Claude Code releases newer than a complete Claude Code record, including a patch release and a pre-release, and about agents with no record. Each is held as unmeasured_release, while the exact Claude Code release stays Go.
 #[spec("inbox/doorbell/053")]
 #[test]
-fn doorbell_053_tripwire_is_per_release() {
-    let records = [complete(CODEX, "0.160.0", 2), complete(CODEX, "0.162.0", 2)];
-    let tripped = [(CODEX, v("0.163.0"))];
-    assert_eq!(
-        no_go(&activation(&records, &CODEX, &known("0.163.0"), &tripped)),
-        Some(NoGo::ReleaseTripwire)
-    );
-    assert!(matches!(
-        activation(&records, &CODEX, &known("0.164.0"), &tripped),
-        Activation::Inherited { .. }
-    ));
-    // A tripwire on another agent type's release of the same number does nothing.
-    let other = [(CLAUDE, v("0.164.0"))];
-    assert!(matches!(
-        activation(&records, &CODEX, &known("0.164.0"), &other),
-        Activation::Inherited { .. }
-    ));
-    assert!(matches!(
-        activation(
-            &records,
-            &CODEX,
-            &known("0.162.0"),
-            &[(CODEX, v("0.162.0"))]
-        ),
-        Activation::Go { .. }
-    ));
-}
-
-/// Scenario: Ask about inherited Codex releases with first-dialog times recorded on several releases: a slow older record beside a fast newer source, a record whose timing is unverified, a slower record of another agent, and only fast records. The window is twice the slowest verified Codex time with a 10 s floor, never the source's alone, and over the cap it is held, never clamped.
-#[spec("inbox/doorbell/053")]
-#[test]
-fn doorbell_053_timing_set() {
-    let records = [
-        complete(CODEX, "0.160.0", 12),
-        complete(CODEX, "0.164.0", 2),
-    ];
-    assert_eq!(
-        verdict(&records, &CODEX, "0.165.0"),
-        Activation::Inherited {
-            from: v("0.164.0"),
-            profile: "test-profile",
-            staged: false,
-            settle: Duration::from_secs(24),
-            settle_from: Some(v("0.160.0")),
-        }
-    );
-    let records = [
-        complete(CODEX, "0.160.0", 16),
-        complete(CODEX, "0.164.0", 2),
-    ];
-    assert_eq!(
-        no_go(&verdict(&records, &CODEX, "0.165.0")),
-        Some(NoGo::SettleOverCap),
-        "2 × 16 s = 32 s is over the cap"
-    );
-    // An unverified timing adds nothing.
-    let unverified = ReleaseRecord {
-        first_modal: Measurement::Unverified,
-        ..complete(CODEX, "0.158.0", 0)
-    };
-    let with = [unverified, complete(CODEX, "0.164.0", 2)];
-    let without = [complete(CODEX, "0.164.0", 2)];
-    assert_eq!(
-        verdict(&with, &CODEX, "0.165.0"),
-        verdict(&without, &CODEX, "0.165.0")
-    );
-    // Another agent type's slower record adds nothing.
-    let mixed = [
-        complete(CLAUDE, "2.1.310", 20),
-        complete(CODEX, "0.164.0", 2),
-    ];
-    assert_eq!(
-        verdict(&mixed, &CODEX, "0.165.0"),
-        verdict(&without, &CODEX, "0.165.0")
-    );
-    // Only fast records: the 10 s floor.
-    assert!(matches!(
-        verdict(&without, &CODEX, "0.165.0"),
-        Activation::Inherited { settle, .. } if settle == Duration::from_secs(10)
-    ));
-}
-
-/// Scenario: Ask about Claude Code releases newer than a complete Claude Code record, including a patch release. Claude Code never inherits: each is held as unmeasured_release.
-#[spec("inbox/doorbell/053")]
-#[test]
-fn doorbell_053_inheritance_is_codex_only() {
+fn doorbell_053_claude_and_other_agents_need_their_own_record() {
     let records = [complete(CLAUDE, "2.1.310", 0)];
     for release in ["2.1.311", "2.2.0", "2.1.310-beta.1"] {
         assert_eq!(
@@ -534,7 +449,7 @@ fn doorbell_053_claude_record_exclusion() {
     assert_eq!(parse_unrecorded_claude_releases("").unwrap(), vec![]);
 }
 
-/// Scenario: Build the three Codex tables where removing a Codex record would unblock inheritance or shorten its window: an incomplete exact record, an incomplete newest source, and a slow timing. Ask each first with no exclusion and then with an exclusion list naming the same version strings. Every Codex verdict is unchanged.
+/// Scenario: Build three Codex tables: an incomplete exact record, an incomplete record beside a newer unrecorded release, and a slow older record beside a newer unrecorded release. Ask each first with no exclusion and then with an exclusion list naming the same version strings. Every Codex verdict is unchanged.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_exclusion_never_reaches_codex() {
@@ -544,20 +459,20 @@ fn doorbell_053_exclusion_never_reaches_codex() {
         complete(CODEX, "0.160.0", 2),
         incomplete(CODEX, "0.164.0", 2),
     ];
-    // (y) an incomplete newest source stays inherit_source_incomplete.
+    // (y) a newer release beside an incomplete record stays unmeasured.
     let y = [
         complete(CODEX, "0.160.0", 2),
         incomplete(CODEX, "0.163.0", 2),
     ];
-    // (z) a slow timing stays over the cap.
+    // (z) a newer release beside a slow record stays unmeasured.
     let z = [
         complete(CODEX, "0.160.0", 16),
         complete(CODEX, "0.164.0", 2),
     ];
     for (table, release, want) in [
         (&x[..], "0.164.0", Some(NoGo::UnverifiedMeasurement("echo"))),
-        (&y[..], "0.164.0", Some(NoGo::InheritSourceIncomplete)),
-        (&z[..], "0.165.0", Some(NoGo::SettleOverCap)),
+        (&y[..], "0.164.0", Some(NoGo::UnmeasuredRelease)),
+        (&z[..], "0.165.0", Some(NoGo::UnmeasuredRelease)),
     ] {
         let intact = verdict(table, &CODEX, release);
         assert_eq!(no_go(&intact), want);
@@ -656,7 +571,7 @@ fn doorbell_053_exclusion_only_ever_disables() {
     assert_eq!(tables, 125 * 9);
 }
 
-/// Scenario: Give a staged record (a message-id digit commits in its dialog) each state of its head-echo measurement, and an unstaged record no head-echo measurement at all; then make a staged record the newest source of an inherited release. The staged record is Go only with its head echo verified, held as missing_measurement or unverified_measurement naming head_echo otherwise and unmeasured_release when unraisable; the unstaged record is Go without one; and an inherited release whose source lacks it is inherit_source_incomplete.
+/// Scenario: Give a staged record (a message-id digit commits in its dialog) each state of its head-echo measurement, and an unstaged record no head-echo measurement at all; then ask about a newer release beside a staged record, with and without its head echo. The staged record is Go only with its head echo verified, held as missing_measurement or unverified_measurement naming head_echo otherwise and unmeasured_release when unraisable; the unstaged record is Go without one; and the newer release is unmeasured_release either way.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_a_staged_line_needs_its_head_echo_measured() {
@@ -704,17 +619,15 @@ fn doorbell_053_a_staged_line_needs_its_head_echo_measured() {
         verdict(&[unstaged], &CODEX, "0.164.0"),
         Activation::Go { staged: false, .. }
     ));
-    // A source without it does not lend its profile.
-    let records = [staged(Measurement::Absent)];
-    assert_eq!(
-        no_go(&verdict(&records, &CODEX, "0.165.0")),
-        Some(NoGo::InheritSourceIncomplete)
-    );
-    let records = [staged(Measurement::Verified(()))];
-    assert!(matches!(
-        verdict(&records, &CODEX, "0.165.0"),
-        Activation::Inherited { staged: true, .. }
-    ));
+    // A newer release borrows nothing from a staged record, complete or not.
+    for head_echo in [Measurement::Absent, Measurement::Verified(())] {
+        let records = [staged(head_echo)];
+        assert_eq!(
+            no_go(&verdict(&records, &CODEX, "0.165.0")),
+            Some(NoGo::UnmeasuredRelease),
+            "{head_echo:?}"
+        );
+    }
 }
 
 /// Scenario: For every dialog of every release record the deck carries, now and in any later edit of the table, look up each byte the line's first stage can contain: both parentheses and every letter of the token alphabet. Each must be classified, and classified inert: a record in which one of them commits, moves, edits or dismisses, or is left unmeasured, fails this test.
@@ -811,7 +724,6 @@ fn doorbell_053_the_shipped_records_verdicts() {
                 &RELEASE_RECORDS,
                 &CLAUDE,
                 &LatchedRelease::Known(v(release)),
-                &[]
             ),
             exact_verdict(record)
         );
@@ -898,9 +810,9 @@ fn doorbell_053_an_editor_record_decides_no_ring() {
             };
             assert_eq!(exact_verdict(&record), want, "{editor:?}");
             let one = std::slice::from_ref(&record);
-            assert_eq!(activation(one, &record.agent, &release, &[]), want);
+            assert_eq!(activation(one, &record.agent, &release), want);
             assert_eq!(
-                generation_activation(one, Some(&record.agent), &release, &[]),
+                generation_activation(one, Some(&record.agent), &release),
                 want,
                 "{editor:?}"
             );
@@ -909,7 +821,7 @@ fn doorbell_053_an_editor_record_decides_no_ring() {
     assert_eq!((go, held), (3, 3 + 3 * REQUIRED.len()));
 }
 
-/// Scenario: Enumerate small record tables (Codex and Claude Code records on a few releases, each complete, incomplete or absent, fast or slow) and, for each, every assignment of a verified or missing editor record to its records, then ask the table about every live release in range, inherited ones included. Every verdict equals the one with no editor record anywhere.
+/// Scenario: Enumerate small record tables (Codex and Claude Code records on a few releases, each complete, incomplete or absent, fast or slow) and, for each, every assignment of a verified or missing editor record to its records, then ask the table about every live release in range, unrecorded ones included. Every verdict equals the one with no editor record anywhere.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_editor_records_move_no_verdict_in_any_table() {
@@ -934,7 +846,6 @@ fn doorbell_053_editor_records_move_no_verdict_in_any_table() {
     )
     .collect();
     let mut tables = 0;
-    let mut inherited = 0;
     for table in 0..states.len().pow(5) {
         let mut records = Vec::new();
         let mut n = table;
@@ -954,10 +865,6 @@ fn doorbell_053_editor_records_move_no_verdict_in_any_table() {
             .iter()
             .map(|(agent, r)| verdict(&records, agent, r))
             .collect();
-        inherited += intact
-            .iter()
-            .filter(|a| matches!(a, Activation::Inherited { .. }))
-            .count();
         for mask in 1..(1u32 << records.len()) {
             let with: Vec<ReleaseRecord<'_>> = records
                 .iter()
@@ -978,7 +885,6 @@ fn doorbell_053_editor_records_move_no_verdict_in_any_table() {
         tables += 1;
     }
     assert_eq!(tables, 4usize.pow(5));
-    assert!(inherited > 0, "no table exercised inheritance");
 }
 
 /// Scenario: Ask about each record the deck ships, as shipped and with the e2e assumption giving every one of them a verified editor record. Every shipped record's editor record is absent; the assumption changes that field and nothing else, adds no record, and leaves every verdict, Claude Code 2.1.310's Go and both Codex releases' missing_measurement, as it was.
@@ -1012,8 +918,8 @@ fn doorbell_053_the_editor_probe_assumption_moves_no_shipped_verdict() {
         assert_eq!(exact_verdict(after), exact_verdict(before));
         let release = LatchedRelease::Known(before.release.clone());
         assert_eq!(
-            generation_activation(&assumed, Some(&before.agent), &release, &[]),
-            generation_activation(&RELEASE_RECORDS, Some(&before.agent), &release, &[]),
+            generation_activation(&assumed, Some(&before.agent), &release),
+            generation_activation(&RELEASE_RECORDS, Some(&before.agent), &release),
         );
     }
     assert_eq!(
@@ -1021,7 +927,6 @@ fn doorbell_053_the_editor_probe_assumption_moves_no_shipped_verdict() {
             &assumed,
             Some(&CLAUDE),
             &known("2.1.311"),
-            &[]
         )),
         Some(NoGo::UnmeasuredRelease)
     );

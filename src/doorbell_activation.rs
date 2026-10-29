@@ -8,30 +8,22 @@
 //! one release of one agent, and nothing reads this table until that admission
 //! is wired in. [`activation`] turns a generation's release (latched from its
 //! start-up header, [`crate::release_scanner`]) and the recorded measurements
-//! ([`RELEASE_RECORDS`]) into a verdict: [`Activation::Go`],
-//! [`Activation::Inherited`] (Codex only, a release newer than the newest one
-//! measured, within four minor versions), or [`Activation::NoGo`] with the
-//! clause the card's `cannot_type` reason and the deck log name.
+//! ([`RELEASE_RECORDS`]) into a verdict: [`Activation::Go`], or
+//! [`Activation::NoGo`] with the clause the card's `cannot_type` reason and the
+//! deck log name.
 //!
 //! The rules apply in order, and the first that matches decides:
 //!
 //! 1. the release is not latched → `unknown_release` (or the latch's own
 //!    clause, `release_conflict`, `scanner_geometry` or `scanner_budget`);
-//! 2. a record exists for exactly this release → that record decides, and it
-//!    never falls through to inheritance ([`exact_verdict`]: the required
-//!    measurements, then no first-stage byte committing in any measured
-//!    dialog, then `head_echo` when the line is staged, then the settle cap);
-//! 3. the agent is not Codex, the release is a pre-release, or no record is
-//!    older → `unmeasured_release`;
-//! 4. the release's tripwire is set → `release_tripwire`;
-//! 5. the newest older record (the **source**) is not itself `Go` →
-//!    `inherit_source_incomplete`;
-//! 6. the source is another major version, or more than [`INHERIT_MINOR_SPAN`]
-//!    minor versions older → `unmeasured_release`;
-//! 7. the inherited settle window, `max(2 × T, 10 s)` with `T` the slowest
-//!    verified first-dialog time of any record of the agent, exceeds
-//!    [`SETTLE_CAP`] → `settle_over_cap`, never clamped;
-//! 8. otherwise `Inherited` from the source.
+//! 2. a record exists for exactly this release → that record decides
+//!    ([`exact_verdict`]: the required measurements, then no first-stage byte
+//!    committing in any measured dialog, then `head_echo` when the line is
+//!    staged, then the settle cap);
+//! 3. otherwise → `unmeasured_release`. A release is admitted by its own
+//!    record alone: one newer than every record, a patch of a measured one or
+//!    a pre-release borrows nothing from a nearby record, whatever the
+//!    distance (SC-00).
 //!
 //! Nothing here reads a screen or a clock: it is a pure function of its inputs,
 //! so the doorbell can ask it at every admission and `inbox/doorbell/053`
@@ -48,17 +40,10 @@ use semver::Version;
 use crate::event::AgentType;
 
 /// The longest first-ring settle window the deck accepts (plan §4.4). A
-/// measured or inherited window above it is `settle_over_cap`, never clamped:
+/// measured window above it is `settle_over_cap`, never clamped:
 /// the hold clock pauses inside the window, and the cap keeps that pause from
 /// hiding a hold for long.
 pub const SETTLE_CAP: Duration = Duration::from_secs(30);
-
-/// The shortest settle window an inherited release gets (plan §4.4, Q13).
-pub const INHERITED_SETTLE_FLOOR: Duration = Duration::from_secs(10);
-
-/// How many minor versions past its source an inherited Codex release may be
-/// (Q13, K = 4). A patch release of the source is at distance 0.
-pub const INHERIT_MINOR_SPAN: u64 = 4;
 
 /// The state of one measurement in a release's record.
 ///
@@ -284,12 +269,6 @@ pub enum NoGo {
     FirstStageCommits { dialog: String, key: u8 },
     /// The release's first-ring settle window is longer than [`SETTLE_CAP`].
     SettleOverCap,
-    /// A dialog was recognised on this inherited release since the daemon
-    /// started.
-    ReleaseTripwire,
-    /// The newest older record, which an inherited release would take its
-    /// profile from, is not complete.
-    InheritSourceIncomplete,
 }
 
 impl NoGo {
@@ -304,8 +283,6 @@ impl NoGo {
             NoGo::UnmeasuredRelease => "unmeasured_release",
             NoGo::FirstStageCommits { .. } => "first_stage_commits",
             NoGo::SettleOverCap => "settle_over_cap",
-            NoGo::ReleaseTripwire => "release_tripwire",
-            NoGo::InheritSourceIncomplete => "inherit_source_incomplete",
         }
     }
 }
@@ -320,17 +297,6 @@ pub enum Activation<'a> {
         /// or confirms an action in one of the release's dialogs.
         staged: bool,
         settle: Duration,
-    },
-    /// A Codex release newer than the newest one measured, typed into under
-    /// that record's profile (Q13).
-    Inherited {
-        from: Version,
-        profile: &'a str,
-        staged: bool,
-        settle: Duration,
-        /// The record whose first-dialog time set the settle window, if any
-        /// record carries one.
-        settle_from: Option<Version>,
     },
     NoGo(NoGo),
 }
@@ -436,13 +402,12 @@ pub fn exact_verdict<'a>(record: &ReleaseRecord<'a>) -> Activation<'a> {
 }
 
 /// The verdict for a generation of `agent` whose header latched `release`,
-/// given the recorded measurements and the tripwires set since the daemon
-/// started. See the module documentation for the rule order.
+/// given the recorded measurements. See the module documentation for the
+/// rule order.
 pub fn activation<'a>(
     records: &[ReleaseRecord<'a>],
     agent: &AgentType,
     release: &LatchedRelease,
-    tripwires: &[(AgentType, Version)],
 ) -> Activation<'a> {
     // Rule 1.
     let release = match release {
@@ -452,62 +417,15 @@ pub fn activation<'a>(
         LatchedRelease::ScannerGeometry => return Activation::NoGo(NoGo::ScannerGeometry),
         LatchedRelease::ScannerBudget => return Activation::NoGo(NoGo::ScannerBudget),
     };
-    let own: Vec<&ReleaseRecord<'a>> = records.iter().filter(|r| r.agent == *agent).collect();
     // Rule 2: an exact record decides, complete or not.
-    if let Some(record) = own.iter().find(|r| r.release == *release) {
+    if let Some(record) = records
+        .iter()
+        .find(|r| r.agent == *agent && r.release == *release)
+    {
         return exact_verdict(record);
     }
     // Rule 3.
-    let source = own
-        .iter()
-        .filter(|r| r.release < *release)
-        .max_by(|a, b| a.release.cmp(&b.release));
-    let Some(source) = source else {
-        return Activation::NoGo(NoGo::UnmeasuredRelease);
-    };
-    if *agent != AgentType::Codex || !release.pre.is_empty() {
-        return Activation::NoGo(NoGo::UnmeasuredRelease);
-    }
-    // Rule 4.
-    if tripwires.iter().any(|(a, r)| a == agent && r == release) {
-        return Activation::NoGo(NoGo::ReleaseTripwire);
-    }
-    // Rule 5: the newest older record, and never one past it.
-    let Activation::Go {
-        profile, staged, ..
-    } = exact_verdict(source)
-    else {
-        return Activation::NoGo(NoGo::InheritSourceIncomplete);
-    };
-    // Rule 6.
-    if source.release.major != release.major
-        || release.minor.saturating_sub(source.release.minor) > INHERIT_MINOR_SPAN
-    {
-        return Activation::NoGo(NoGo::UnmeasuredRelease);
-    }
-    // Rule 7: the timing set is every record of the agent with a verified
-    // first-dialog time, whatever its release and whether or not the record is
-    // otherwise complete.
-    let slowest = own
-        .iter()
-        .filter_map(|r| r.first_modal.verified().map(|m| (m.time(), &r.release)))
-        .max_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
-    let (t, settle_from) = match slowest {
-        Some((t, from)) if t > Duration::ZERO => (t, Some(from.clone())),
-        _ => (Duration::ZERO, None),
-    };
-    let settle = (t * 2).max(INHERITED_SETTLE_FLOOR);
-    if settle > SETTLE_CAP {
-        return Activation::NoGo(NoGo::SettleOverCap);
-    }
-    // Rule 8.
-    Activation::Inherited {
-        from: source.release.clone(),
-        profile,
-        staged,
-        settle,
-        settle_from,
-    }
+    Activation::NoGo(NoGo::UnmeasuredRelease)
 }
 
 /// The releases of `agent` the deck has records for, oldest first: what the
@@ -571,8 +489,7 @@ pub fn unrecorded_claude_releases() -> Vec<Version> {
 /// `records` without the **Claude Code** records for `unrecorded`. A record of
 /// any other agent is kept whatever its version string, so the exclusion can
 /// only turn a Claude Code release's own verdict into rule 3's
-/// `unmeasured_release`: Claude Code never inherits, and no Claude Code record
-/// feeds another release's verdict.
+/// `unmeasured_release`: no record feeds another release's verdict.
 pub fn without_unrecorded_claude<'a>(
     records: &[ReleaseRecord<'a>],
     unrecorded: &[Version],
