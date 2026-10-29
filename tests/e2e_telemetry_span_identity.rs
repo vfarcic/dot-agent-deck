@@ -55,8 +55,11 @@ impl Receiver {
                 if reader.read_line(&mut line).unwrap_or(0) == 0 {
                     continue;
                 }
+                // Issue #1981 M8: the daemon's warnings arrive as logs; only
+                // the traces are this receiver's to keep.
+                let logs = line.starts_with("POST /v1/logs ");
                 assert!(
-                    line.starts_with("POST /v1/traces "),
+                    logs || line.starts_with("POST /v1/traces "),
                     "unexpected OTLP request: {line}"
                 );
                 let mut size = 0;
@@ -102,7 +105,9 @@ impl Receiver {
                     body.resize(size, 0);
                     reader.read_exact(&mut body).unwrap();
                 }
-                captured.lock().unwrap().push(body);
+                if !logs {
+                    captured.lock().unwrap().push(body);
+                }
                 let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
             }
         });

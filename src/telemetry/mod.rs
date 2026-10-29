@@ -65,6 +65,7 @@ pub mod handoff;
 pub mod health;
 pub mod input;
 pub mod launch;
+pub mod logs;
 pub mod operation;
 pub mod otlp;
 pub mod propagation;
@@ -94,8 +95,12 @@ pub fn start_for_daemon(
     event_tx: &tokio::sync::broadcast::Sender<crate::event::BroadcastMsg>,
     registry: &Arc<crate::agent_pty::AgentPtyRegistry>,
 ) -> Arc<Telemetry> {
+    let env = config::process_env();
+    // Issue #1981 M8: the daemon's warnings and errors, when the binary
+    // installed the layer that collects them.
+    logs::start_for_daemon(&env);
     let telemetry = start_from(
-        &config::process_env(),
+        &env,
         exporter::default_config_dir(),
         crate::platform::paths::executable_path().as_deref(),
         event_tx,
@@ -488,6 +493,12 @@ pub enum AttrKey {
     HookLatencyP95,
     HookLatencyMax,
     SpansDropped,
+    /// Issue #1981 M8: a daemon log record's callsite ([`logs`]).
+    LogTarget,
+    CodeFilePath,
+    CodeLineNumber,
+    LogFields,
+    LogsDropped,
     /// PRD #1858: a run's usage and termination, and one model's usage on a
     /// `deck.model_usage` event ([`accounting::AccountingKey`]).
     Accounting(accounting::AccountingKey),
@@ -552,6 +563,11 @@ impl AttrKey {
         AttrKey::HookLatencyP95,
         AttrKey::HookLatencyMax,
         AttrKey::SpansDropped,
+        AttrKey::LogTarget,
+        AttrKey::CodeFilePath,
+        AttrKey::CodeLineNumber,
+        AttrKey::LogFields,
+        AttrKey::LogsDropped,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -611,6 +627,11 @@ impl AttrKey {
             AttrKey::HookLatencyP95 => "deck.daemon.hook_latency.p95_ms",
             AttrKey::HookLatencyMax => "deck.daemon.hook_latency.max_ms",
             AttrKey::SpansDropped => "deck.telemetry.spans.dropped",
+            AttrKey::LogTarget => "deck.log.target",
+            AttrKey::CodeFilePath => "code.file.path",
+            AttrKey::CodeLineNumber => "code.line.number",
+            AttrKey::LogFields => "deck.log.fields",
+            AttrKey::LogsDropped => "deck.telemetry.logs.dropped",
             AttrKey::Accounting(key) => key.as_str(),
         }
     }

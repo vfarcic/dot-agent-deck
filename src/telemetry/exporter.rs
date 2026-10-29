@@ -2358,7 +2358,7 @@ impl RateLimitedLog {
     }
 }
 
-fn build_headers(headers: &[(String, String)]) -> reqwest::header::HeaderMap {
+pub(super) fn build_headers(headers: &[(String, String)]) -> reqwest::header::HeaderMap {
     let mut map = reqwest::header::HeaderMap::new();
     let mut invalid = 0usize;
     for (key, value) in headers {

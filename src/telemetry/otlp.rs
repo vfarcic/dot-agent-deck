@@ -14,7 +14,7 @@ use super::span::{AttrValue, SpanEventRecord, SpanRecord, hex};
 /// not a request it served or made.
 const SPAN_KIND_INTERNAL: u64 = 1;
 
-const SCOPE_NAME: &str = "dot-agent-deck";
+pub(crate) const SCOPE_NAME: &str = "dot-agent-deck";
 
 const WIRE_VARINT: u8 = 0;
 const WIRE_FIXED64: u8 = 1;
@@ -59,7 +59,7 @@ fn any_value(value: &AttrValue) -> Vec<u8> {
     buf
 }
 
-fn key_value(key: &str, value: &AttrValue) -> Vec<u8> {
+pub(crate) fn key_value(key: &str, value: &AttrValue) -> Vec<u8> {
     let mut buf = Vec::new();
     put_bytes(&mut buf, 1, key.as_bytes());
     put_bytes(&mut buf, 2, &any_value(value));
@@ -127,7 +127,7 @@ fn json_value(value: &AttrValue) -> serde_json::Value {
     }
 }
 
-fn json_kv(key: &str, value: &AttrValue) -> serde_json::Value {
+pub(crate) fn json_kv(key: &str, value: &AttrValue) -> serde_json::Value {
     serde_json::json!({ "key": key, "value": json_value(value) })
 }
 

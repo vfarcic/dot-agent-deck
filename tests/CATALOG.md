@@ -13362,3 +13362,11 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 - **Asserts:** a producer Thinking hook is observed, a real stop produces an observed daemon-synthetic SessionEnd, health intervals spanning the actions count one sample in total, its single-sample p50/p95/max retain at least 1.4 seconds of the injected 1.5-second age, and a later quiet interval resets count to zero and omits latency quantiles.
 - **Does not assert:** exact delivery latency, multi-sample percentile algorithms, every synthetic event variant, queue overflow, OTLP logs or attach latency.
 - **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/044 — The daemon's warnings reach OTLP logs as callsites, without their text.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_daemon_logs.rs`); real attach socket, local OTLP/JSON receiver and the captured daemon log.
+- **Agent:** none; the warning is the daemon's own, triggered by an oversized attach frame.
+- **Asserts:** the daemon's "attach protocol connection error" warning arrives as one OTLP/JSON log record under `service.name=dot-agent-deck` with severity WARN (13), `deck.log.target=dot_agent_deck::daemon_protocol`, `code.file.path=src/daemon_protocol.rs`, a line number and `deck.log.fields=message`, with no body; no received body contains the warning's text; and `deck.log` still records the warning, so the file logger's output is unchanged.
+- **Does not assert:** ERROR records, the dropped-record count under load (unit-tested in `telemetry::logs`), OTLP/protobuf logs, the logs-specific endpoint variables, or delivery when the backend refuses a batch.
+- **Platform coverage:** mac+linux.

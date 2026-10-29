@@ -228,8 +228,14 @@ pub fn resolve_endpoint(env: &EnvMap) -> Option<String> {
 /// separated by commas, each part percent-decoded; an entry with no `=` or an
 /// empty key is skipped, and a key named twice keeps its last value.
 pub fn resolve_headers(env: &EnvMap) -> Vec<(String, String)> {
-    let Some(raw) = non_empty(env, OTEL_EXPORTER_OTLP_TRACES_HEADERS)
-        .or_else(|| non_empty(env, OTEL_EXPORTER_OTLP_HEADERS))
+    resolve_headers_for(env, OTEL_EXPORTER_OTLP_TRACES_HEADERS)
+}
+
+/// [`resolve_headers`] for the signal whose own headers variable is
+/// `specific`: that variable when it is set, else
+/// `OTEL_EXPORTER_OTLP_HEADERS`.
+pub fn resolve_headers_for(env: &EnvMap, specific: &str) -> Vec<(String, String)> {
+    let Some(raw) = non_empty(env, specific).or_else(|| non_empty(env, OTEL_EXPORTER_OTLP_HEADERS))
     else {
         return Vec::new();
     };
