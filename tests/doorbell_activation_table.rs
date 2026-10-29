@@ -214,10 +214,25 @@ fn doorbell_053_unlatched_releases_and_capabilities() {
     ));
 }
 
-/// Scenario: Give a complete record one dialog in which a token letter commits, one in which a parenthesis does, then one in which only a byte of the line's fixed text after the token (`n`) commits, then one in which only a message-id digit commits, then one whose own first-dialog time puts its settle window over the cap. The first two are held as first_stage_commits naming the dialog and key, the next two are Go and staged, the last is held as settle_over_cap.
+/// Scenario: Give complete records dialogs in which a token letter, parenthesis, later fixed-text byte or message-id digit commits, and a first-dialog time over the cap. The first two are held as first_stage_commits, later committing bytes require staging, and excessive timing is held as settle_over_cap; in a mixed table, each exact release retains its own settle window.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_key_effects_and_own_settle() {
+    let records = [
+        complete(CODEX, "0.160.0", 16),
+        complete(CODEX, "0.164.0", 2),
+    ];
+    for (release, seconds) in [("0.160.0", 24), ("0.164.0", 3)] {
+        assert_eq!(
+            verdict(&records, &CODEX, release),
+            Activation::Go {
+                profile: "test-profile",
+                staged: false,
+                settle: Duration::from_secs(seconds),
+            },
+            "{release} retains its own measured settle in a mixed table"
+        );
+    }
     for key in *b"d()z" {
         let keys = [(key, KeyEffect::Commits)];
         let dialogs = [DialogKeys {
@@ -332,6 +347,11 @@ fn doorbell_053_inheritance_rules() {
         verdict(&records, &CODEX, "0.164.0"),
         Activation::Go { .. }
     ));
+    assert_eq!(
+        no_go(&verdict(&records, &CODEX, "0.165.0-alpha.1")),
+        Some(NoGo::UnmeasuredRelease),
+        "a nearby newer pre-release"
+    );
     for release in ["0.165.0", "0.168.9", "0.169.0", "0.164.1", "0.164.9"] {
         let got = verdict(&records, &CODEX, release);
         assert_eq!(
@@ -353,11 +373,6 @@ fn doorbell_053_inheritance_rules() {
         no_go(&verdict(&records, &CODEX, "1.0.0")),
         Some(NoGo::UnmeasuredRelease),
         "another major"
-    );
-    assert_eq!(
-        no_go(&verdict(&records, &CODEX, "0.161.0-alpha.1")),
-        Some(NoGo::UnmeasuredRelease),
-        "a pre-release"
     );
     assert_eq!(
         no_go(&verdict(&records, &CODEX, "0.159.9")),
@@ -428,20 +443,6 @@ fn doorbell_053_timing_set() {
         no_go(&verdict(&records, &CODEX, "0.165.0")),
         Some(NoGo::SettleOverCap),
         "2 × 16 s = 32 s is over the cap"
-    );
-    assert!(
-        matches!(
-            verdict(&records, &CODEX, "0.164.0"),
-            Activation::Go { settle, .. } if settle == Duration::from_secs(3)
-        ),
-        "0.164.0 itself stays Go on its own timing"
-    );
-    assert!(
-        matches!(
-            verdict(&records, &CODEX, "0.160.0"),
-            Activation::Go { settle, .. } if settle == Duration::from_secs(24)
-        ),
-        "16 s + 50 % is within the cap"
     );
     // An unverified timing adds nothing.
     let unverified = ReleaseRecord {
