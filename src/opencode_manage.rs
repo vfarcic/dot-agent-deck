@@ -7778,18 +7778,31 @@ writeFileSync("{posts}", JSON.stringify(posts));
              answered itself, and the refused reply is posted again once re-asked"
         );
 
-        let acked: Vec<serde_json::Value> = std::fs::read_to_string(&acks)
+        // Each child appends its own line, so the file's order is whichever
+        // child's write ran first, not the plugin's: a loaded run measured the
+        // refused child's line after its successor's. The posts above pin the
+        // plugin's order; here, what each child heard.
+        let mut acked: Vec<String> = std::fs::read_to_string(&acks)
             .unwrap()
             .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l)
+                    .unwrap()
+                    .to_string()
+            })
             .collect();
+        acked.sort();
+        let mut expected: Vec<String> = [
+            serde_json::json!({"delivered": true}),
+            serde_json::json!({"delivered": false, "detail": "OpenCode answered 500"}),
+            serde_json::json!({"delivered": true}),
+        ]
+        .iter()
+        .map(serde_json::Value::to_string)
+        .collect();
+        expected.sort();
         assert_eq!(
-            acked,
-            vec![
-                serde_json::json!({"delivered": true}),
-                serde_json::json!({"delivered": false, "detail": "OpenCode answered 500"}),
-                serde_json::json!({"delivered": true}),
-            ],
+            acked, expected,
             "each child hears what OpenCode made of its reply"
         );
 
