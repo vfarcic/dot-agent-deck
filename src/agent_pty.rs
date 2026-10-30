@@ -6132,6 +6132,12 @@ impl PtyWriterThread {
                         #[cfg(test)]
                         PtyOp::Surrender(back) => {
                             thread_in_flight.leave();
+                            // The queue goes before the writer is handed
+                            // back, so a job sent once the caller has it
+                            // finds no reader at once, rather than waiting
+                            // in the queue until this thread's return drops
+                            // it (the gone-writer tests' setup race).
+                            drop(queue);
                             let _ = back.send((inner, recorder));
                             return;
                         }
