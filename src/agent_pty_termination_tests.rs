@@ -86,6 +86,9 @@ fn pump(steps: Vec<io::Result<Vec<u8>>>) -> (Vec<u8>, Termination) {
         agent.clone(),
         Some(pane.to_string()),
         None,
+        // A scripted reader has no master to poll: the plain loop.
+        #[cfg(target_os = "linux")]
+        None,
     );
     let termination = captured(&registry, &agent);
     registry.shutdown_all();

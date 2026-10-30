@@ -1034,16 +1034,15 @@ impl<P: Page> Seam<P> {
     }
 
     /// A helper's report after its editor, on its connection. A `Clean`
-    /// report asks for a drain frontier, which no reader takes yet
-    /// (Q35-20a), so it is recorded missing at once.
+    /// report asks the generation's reader for a drain frontier (Q35-20a),
+    /// which the record learns when the reader takes it, or as missing at
+    /// once where no reader takes frontiers.
     pub fn report(&mut self, key: RecordKey, got: EditorReport, now: Instant) {
         if let Ok(record::Reported::RequestFrontier) =
             self.input
                 .record_report(self.generation, key, report(got), now)
         {
-            let _ =
-                self.input
-                    .record_frontier(self.generation, key, record::FrontierOutcome::Missing);
+            self.input.request_frontier(self.generation, Some(key));
         }
     }
 

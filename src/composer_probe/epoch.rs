@@ -81,11 +81,13 @@
 //! numbers bound what that harness observed, and are no claim that it costs
 //! nothing in timing.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use super::admission;
 use super::framing::{Csi, Event, Framing, Report, Str, StringKind, Token, whole_report};
+use super::frontier::{FrontierQueue, Request};
 use super::planner::{Cut, Natives, first_cut, is_candidate};
 use super::query_ledger::{
     Backlog, CprWaitEnd, EntryView, HazardFifo, HazardPop, Pop, QueryHistory, QueryKind,
@@ -493,6 +495,8 @@ pub struct GenerationInput {
     /// Where native numbers are published (Q35-16): called with no lock of
     /// this module held.
     native_page: NativePage,
+    /// The drain frontier's requests and its reader's wake (Q35-20a).
+    frontier: FrontierQueue,
     /// Test seam: parks an acceptance between the epoch's move and the job
     /// becoming visible, so a test can see the one before the other.
     #[cfg(test)]
@@ -554,6 +558,7 @@ impl GenerationInput {
             }),
             output_offset: AtomicU64::new(0),
             native_page: NativePage::default(),
+            frontier: FrontierQueue::default(),
             #[cfg(test)]
             accept_park: std::sync::Mutex::new(None),
         }
@@ -913,6 +918,30 @@ impl GenerationInput {
         now: Instant,
     ) -> Result<Reported, Refusal> {
         self.with_records(|r, fifo| r.report(fifo, generation, key, report, now))
+    }
+
+    /// The generation's drain-frontier queue (Q35-20a).
+    pub fn frontier(&self) -> &FrontierQueue {
+        &self.frontier
+    }
+
+    /// Ask for a drain frontier for `generation`, which `record` learns when
+    /// it has one (Q35-20a). What can't be taken is settled `Missing` here.
+    pub fn request_frontier(&self, generation: u64, record: Option<RecordKey>) -> Arc<Request> {
+        let (request, settled) = self.frontier.request(generation, record);
+        self.settle_frontier(&settled);
+        request
+    }
+
+    /// The requests in `settled` had their outcome set by the caller: each
+    /// one's record learns it. Called with no bus lock held, so this
+    /// module's lock is never taken under it from the reader (A5 §3.2).
+    pub fn settle_frontier(&self, settled: &[Arc<Request>]) {
+        for request in settled {
+            if let (Some(key), Some(outcome)) = (request.record(), request.outcome()) {
+                let _ = self.record_frontier(request.generation(), key, outcome);
+            }
+        }
     }
 
     /// See [`Records::frontier`].

@@ -65,6 +65,9 @@ pub struct OutputHook {
     /// The generation's observer, once it has one (Q35-14b): rung for a
     /// child scan when the output turns bracketed paste off.
     bell: BellSlot,
+    /// How many bytes it has read, `None` once that can't advance: the drain
+    /// frontier's `o` (Q35-20a, A5 §3.2), read under the output lock.
+    fed: Option<u64>,
 }
 
 impl OutputHook {
@@ -74,6 +77,7 @@ impl OutputHook {
             paste_mode: PasteModeTracker::default(),
             input,
             bell: BellSlot::default(),
+            fed: Some(0),
         }
     }
 
@@ -98,6 +102,11 @@ impl OutputHook {
         // The push's end is the offset its queries are noted at (Q35-15):
         // one atomic add per push, outside the epoch's lock.
         self.input.advance_output(bytes.len());
+        self.fed = self.fed.and_then(|fed| {
+            u64::try_from(bytes.len())
+                .ok()
+                .and_then(|n| fed.checked_add(n))
+        });
         if !notes.is_empty() {
             self.input.on_output(&notes, Instant::now());
         }
@@ -106,6 +115,20 @@ impl OutputHook {
         if paste_off && let Some(bell) = self.bell.get() {
             bell.ring_scan();
         }
+    }
+
+    /// Every byte it has read, counted: the offset a drain frontier taken now
+    /// is at. `None` once the count overflowed, which is sticky, and every
+    /// frontier is then missing (A5 §3.2).
+    pub fn fed(&self) -> Option<u64> {
+        self.fed
+    }
+
+    /// Test seam: start the count at `fed`, to reach exhaustion with a
+    /// reduced bound.
+    #[cfg(test)]
+    pub(crate) fn set_fed(&mut self, fed: u64) {
+        self.fed = Some(fed);
     }
 
     /// The agent's bracketed-paste mode, as far as its output says.

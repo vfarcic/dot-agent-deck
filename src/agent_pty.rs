@@ -2271,6 +2271,31 @@ impl AgentBus {
         }
     }
 
+    /// PRD #1666 part 3 (Q35-20a, A4 §7.2): publish a drain frontier for
+    /// `pending`, under this lock: `Taken{o}`, `o` the output hook's fed
+    /// count, for each request nothing has settled yet. Returns the requests
+    /// this call settled, which their records learn after the lock is
+    /// released, and whether the count was exhausted (every one `Missing`).
+    #[cfg(target_os = "linux")]
+    fn publish_frontier(
+        &self,
+        pending: &[Arc<crate::composer_probe::frontier::Request>],
+    ) -> (Vec<Arc<crate::composer_probe::frontier::Request>>, bool) {
+        use crate::composer_probe::record::FrontierOutcome;
+        let state = self.state.lock().unwrap();
+        let fed = state.output_hook.fed();
+        let outcome = fed.map_or(FrontierOutcome::Missing, |offset| FrontierOutcome::Taken {
+            offset,
+        });
+        let settled = pending
+            .iter()
+            .filter(|request| request.settle(outcome))
+            .cloned()
+            .collect();
+        drop(state);
+        (settled, fed.is_none())
+    }
+
     /// One `pane release` line.
     fn log_release(&self, event: &crate::release_scanner::CaptureEvent) {
         use crate::release_scanner::{CaptureEvent, ScanLatch, WindowClose};
@@ -2903,9 +2928,29 @@ impl RemovalEvidence {
 /// drain plus kills, and the daemon's own `Arc` outlives this in the normal
 /// case), but it means `Weak` does not remove this thread from the
 /// registry's lifetime entirely — only from keeping it alive unconditionally.
+/// The reader's loop where no frontier is taken (macOS, Windows, and a Linux
+/// generation whose frontier setup failed): read, push, until the end.
+fn read_plain(
+    mut reader: Box<dyn std::io::Read + Send>,
+    bus: &AgentBus,
+    mut pushed: impl FnMut(PushCost),
+) -> ReadEnd {
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break ReadEnd::Eof,
+            Ok(n) => pushed(bus.push_timed(buf[..n].to_vec())),
+            // PRD #1666 part 3, round 5-wake: a read a signal interrupted is
+            // retried, not taken for the end of the stream.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => break ReadEnd::Error(e.kind()),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn pump_reader(
-    mut reader: Box<dyn std::io::Read + Send>,
+    reader: Box<dyn std::io::Read + Send>,
     bus: Arc<AgentBus>,
     exited: Arc<AtomicBool>,
     removal: Arc<RemovalEvidence>,
@@ -2914,27 +2959,36 @@ fn pump_reader(
     agent_id: String,
     pane_id_env: Option<String>,
     runtime_handle: Option<tokio::runtime::Handle>,
+    #[cfg(target_os = "linux")] frontier: Option<frontier_reader::Frontier>,
 ) {
-    let mut buf = [0u8; 8192];
-    let read_end = loop {
-        match reader.read(&mut buf) {
-            Ok(0) => break ReadEnd::Eof,
-            Ok(n) => {
-                // PRD #1666 part 3, round 5-wake: a latch that changed is
-                // re-projected, after the push released the bus lock.
-                if bus.push_timed(buf[..n].to_vec()).latch_changed
-                    && let (Some(registry), Some(pane)) =
-                        (registry.upgrade(), pane_id_env.as_deref())
-                {
-                    registry.request_reprojection(pane, &agent_id);
-                }
-            }
-            // PRD #1666 part 3, round 5-wake: a read a signal interrupted is
-            // retried, not taken for the end of the stream.
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => break ReadEnd::Error(e.kind()),
+    // PRD #1666 part 3, round 5-wake: a latch that changed is re-projected,
+    // after the push released the bus lock.
+    let pushed = |cost: PushCost| {
+        if cost.latch_changed
+            && let (Some(registry), Some(pane)) = (registry.upgrade(), pane_id_env.as_deref())
+        {
+            registry.request_reprojection(pane, &agent_id);
         }
     };
+    // PRD #1666 part 3 (Q35-20a): on Linux the reader also takes drain
+    // frontiers; with no frontier set up it reads as it always has.
+    #[cfg(target_os = "linux")]
+    let read_end = match frontier {
+        Some(frontier) => frontier.run(reader, &bus, pushed),
+        None => read_plain(reader, &bus, pushed),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let read_end = read_plain(reader, &bus, pushed);
+    // Q35-20a: the generation is retiring, so every frontier request still
+    // outstanding is missing, and every later one is at once (A4 §7.2).
+    {
+        let input = bus.input();
+        input.settle_frontier(
+            &input
+                .frontier()
+                .retire(crate::composer_probe::frontier::Retired::Reader),
+        );
+    }
     // PRD #1666 part 3, round 5-wake: the header window ends with the stream.
     bus.close_release(crate::release_scanner::WindowClose::AgentExit);
     // Whether the registry still held this generation when its output ended:
@@ -8022,6 +8076,24 @@ mod planner_tests;
 #[cfg(test)]
 #[path = "agent_pty_query_wait_tests.rs"]
 mod query_wait_tests;
+
+/// PRD #1666 part 3 (Q35-20a): the Linux reader, which takes drain
+/// frontiers.
+#[cfg(target_os = "linux")]
+#[path = "agent_pty_frontier.rs"]
+mod frontier_reader;
+
+/// PRD #1666 part 3 (Q35-20a): the frontier reader's fail-closed table, on
+/// scripted polls and reads and the real bus.
+#[cfg(all(test, target_os = "linux"))]
+#[path = "agent_pty_frontier_tests.rs"]
+mod frontier_reader_tests;
+
+/// PRD #1666 part 3 (Q35-20a): the frontier reader's throughput and latency
+/// against the blocking loop, measured by hand on a real PTY.
+#[cfg(all(test, target_os = "linux"))]
+#[path = "agent_pty_frontier_throughput.rs"]
+mod frontier_throughput;
 
 /// PRD #1666 part 3, round 5-wake (plan §1.1, §3.4′): the doorbell's ring on
 /// the real writer, and the re-projection publisher.
@@ -13948,6 +14020,15 @@ impl AgentPtyRegistry {
         // On exit, pump_reader sets `exited` and signals `change_notify` so
         // the idle monitor learns about the death immediately instead of
         // waiting for the next poll cycle.
+        // PRD #1666 part 3 (Q35-20a): the reader's frontier wake and its
+        // duplicate of the master, attached before the reader starts.
+        #[cfg(target_os = "linux")]
+        let frontier = frontier_reader::Frontier::setup(
+            &bus,
+            &preallocated_id,
+            master.as_raw_fd(),
+            &captured_env,
+        );
         std::thread::spawn(move || {
             pump_reader(
                 reader,
@@ -13959,6 +14040,8 @@ impl AgentPtyRegistry {
                 agent_id_for_thread,
                 pane_id_env_for_thread,
                 runtime_handle_for_thread,
+                #[cfg(target_os = "linux")]
+                frontier,
             )
         });
 
@@ -14220,6 +14303,18 @@ impl AgentPtyRegistry {
         let inner = self.inner.lock();
         let agent = inner.agents.get(agent_id)?;
         Some((Arc::clone(&agent.gate), agent.writer.clone()))
+    }
+
+    /// PRD #1666 part 3 (Q35-20a): a generation's input, which holds its
+    /// drain-frontier queue, by its agent id.
+    #[cfg(feature = "e2e")]
+    pub(crate) fn composer_input(
+        &self,
+        agent_id: &str,
+    ) -> Option<Arc<crate::composer_probe::epoch::GenerationInput>> {
+        Some(Arc::clone(
+            self.inner.lock().agents.get(agent_id)?.bus.input(),
+        ))
     }
 
     /// PRD #1666 part 3 (Q35-14b): an installed generation's observer, by

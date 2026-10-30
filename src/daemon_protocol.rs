@@ -4010,6 +4010,12 @@ pub struct AttachResponse {
     #[cfg(feature = "e2e")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub composer_fence: Option<ComposerFenceStatus>,
+    /// PRD #1666 part 3 (Q35-20a): the `e2e` build's answer to
+    /// [`AttachRequest::E2eComposerControl`]'s `frontier-enqueue` and
+    /// `frontier-status`. Compiled into that build alone.
+    #[cfg(feature = "e2e")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer_frontier: Option<ComposerFrontierStatus>,
     /// PRD #1589: the answer to [`AttachRequest::CloseAgents`]. `None` on every
     /// other response. A refusal is a report, answered `ok: true`; `ok: false`
     /// is reserved for a request the daemon could not process at all. Additive
@@ -4622,6 +4628,35 @@ pub struct ComposerFenceStatus {
     pub full_waiters: usize,
 }
 
+/// PRD #1666 part 3 (Q35-20a): a drain-frontier request, the `e2e` build's
+/// `frontier-enqueue` and `frontier-status` answer. `state` is `pending`,
+/// `taken` or `missing`; `offset` is set when it is `taken`.
+#[cfg(feature = "e2e")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerFrontierStatus {
+    pub request_id: u64,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+}
+
+#[cfg(feature = "e2e")]
+impl ComposerFrontierStatus {
+    fn of(request: &crate::composer_probe::frontier::Request) -> Self {
+        use crate::composer_probe::record::FrontierOutcome;
+        let (state, offset) = match request.outcome() {
+            None => ("pending", None),
+            Some(FrontierOutcome::Taken { offset }) => ("taken", Some(offset)),
+            Some(FrontierOutcome::Missing) => ("missing", None),
+        };
+        Self {
+            request_id: request.id(),
+            state: state.to_string(),
+            offset,
+        }
+    }
+}
+
 /// PRD #1666 part 3 (Q35-14b, Q35-15): answer
 /// [`AttachRequest::E2eComposerControl`] for `pane_id`'s current
 /// generation. `fence` closes the generation's fence gate at its output
@@ -4630,6 +4665,9 @@ pub struct ComposerFenceStatus {
 /// reads its counts. Each is refused unless `generation` is the pane's
 /// current one, so a retired generation can't release its successor.
 /// `publish` and `withdraw` go to the generation's observer.
+/// `frontier-enqueue` asks the generation's reader for a drain frontier
+/// through the queue a `Clean` report uses, and `frontier-status:<id>` reads
+/// one back, writing nothing (Q35-20a).
 #[cfg(feature = "e2e")]
 async fn e2e_composer_control(
     registry: &Arc<AgentPtyRegistry>,
@@ -4638,6 +4676,9 @@ async fn e2e_composer_control(
     generation: u64,
     operation: &str,
 ) -> AttachResponse {
+    if operation == "frontier-enqueue" || operation.starts_with("frontier-status:") {
+        return e2e_composer_frontier(registry, pane_id, generation, operation);
+    }
     if !matches!(operation, "fence" | "release" | "fence-status") {
         return e2e_composer_observer_control(registry, pane_id, generation, operation).await;
     }
@@ -4689,6 +4730,37 @@ async fn e2e_composer_control(
                 ..Default::default()
             }
         }
+    }
+}
+
+/// PRD #1666 part 3 (Q35-20a): the frontier half of
+/// [`e2e_composer_control`], refused unless `generation` is the pane's
+/// current one.
+#[cfg(feature = "e2e")]
+fn e2e_composer_frontier(
+    registry: &Arc<AgentPtyRegistry>,
+    pane_id: &str,
+    generation: u64,
+    operation: &str,
+) -> AttachResponse {
+    let Some(input) = registry
+        .pane_current_agent_id(pane_id)
+        .filter(|agent| *agent == generation.to_string())
+        .and_then(|agent| registry.composer_input(&agent))
+    else {
+        return AttachResponse::err("e2e-composer-control: not the pane's current generation");
+    };
+    let request = match operation.strip_prefix("frontier-status:") {
+        None => input.request_frontier(generation, None),
+        Some(id) => match id.parse().ok().and_then(|id| input.frontier().get(id)) {
+            Some(request) => request,
+            None => return AttachResponse::err("e2e-composer-control: no such frontier request"),
+        },
+    };
+    AttachResponse {
+        ok: true,
+        composer_frontier: Some(ComposerFrontierStatus::of(&request)),
+        ..Default::default()
     }
 }
 

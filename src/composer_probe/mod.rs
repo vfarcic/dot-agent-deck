@@ -49,6 +49,7 @@ pub mod attest;
 pub mod classifier;
 pub mod epoch;
 pub mod framing;
+pub mod frontier;
 pub mod gate;
 #[cfg(target_os = "linux")]
 pub mod helper;
