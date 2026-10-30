@@ -468,8 +468,10 @@ GATES — CLAUDE.md is the authority, this is the summary:
   its own initiative.
 - When `DAD_REMOTE_EXEC=rwx` is set in your environment
   (docs/develop/rwx.md): the helper already runs its cargo commands in an RWX
-  sandbox, and any OTHER heavy cargo command you run (a filtered nextest or
-  `cargo test-e2e` run, a build) goes through `rwx sandbox exec -- <command>`,
+  sandbox, and every OTHER cargo command that compiles (a build, a
+  `cargo test-e2e` run, and a `cargo test-fast` or `cargo nextest` run
+  filtered to a single test, since a filter narrows what runs, not what compiles) goes
+  through `rwx sandbox exec -- <command>`,
   then `rwx sandbox stop`, so the compile leaves this shared machine; if
   `rwx whoami` fails, run it locally and say so in your report. Anything that
   reaches a real agent (`cargo test-e2e-live`, or any command with the
