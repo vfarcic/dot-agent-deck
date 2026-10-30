@@ -678,21 +678,39 @@ fn telemetry_otlp_007_real_opencode_telemetry_joins_deck_run() {
 /// exported. Only read on a failure.
 fn opencode_startup_evidence(deck: &TuiDeck, receiver: &Receiver, agent: Option<&str>) -> String {
     use std::fmt::Write as _;
+    // Redact before shortening: a credential cut in half no longer matches.
+    let clip = |text: &str, max: usize| -> String {
+        common::redact_credentials_for_output(text)
+            .chars()
+            .take(max)
+            .collect()
+    };
     let mut out = String::from("--- OpenCode startup evidence (issue #2022) ---\n");
     match agent {
         Some(id) => {
             let raw = common::pane_snapshot_on(deck.attach_socket_path(), id);
+            let text = common::redact_credentials_for_output(&String::from_utf8_lossy(&raw));
+            let tail: String = text
+                .chars()
+                .skip(text.chars().count().saturating_sub(2048))
+                .collect();
             let _ = writeln!(
                 out,
-                "pane PTY bytes from the daemon: {}; tail: {:?}",
-                raw.len(),
-                String::from_utf8_lossy(&raw[raw.len().saturating_sub(2048)..])
+                "pane PTY bytes from the daemon: {}; tail: {tail:?}",
+                raw.len()
             );
         }
         None => out.push_str("no agent record named telemetry-opencode-mini\n"),
     }
     let workdir = deck.workdir().canonicalize().unwrap_or_default();
-    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+    let processes: Vec<_> = match std::fs::read_dir("/proc") {
+        Ok(entries) => entries.flatten().collect(),
+        Err(error) => {
+            let _ = writeln!(out, "no process details: cannot read /proc: {error}");
+            Vec::new()
+        }
+    };
+    for entry in processes {
         let dir = entry.path();
         if std::fs::read_link(dir.join("cwd")).ok().as_deref() != Some(workdir.as_path()) {
             continue;
@@ -702,7 +720,12 @@ fn opencode_startup_evidence(deck: &TuiDeck, receiver: &Receiver, agent: Option<
             .unwrap_or_default();
         let stat = std::fs::read_to_string(dir.join("stat")).unwrap_or_default();
         let wchan = std::fs::read_to_string(dir.join("wchan")).unwrap_or_default();
-        let _ = writeln!(out, "process {stat:.120} wchan={wchan} cmd={cmdline:.200}");
+        let _ = writeln!(
+            out,
+            "process {} wchan={wchan} cmd={}",
+            clip(&stat, 120),
+            clip(&cmdline, 200)
+        );
         let pid = entry.file_name().to_string_lossy().to_string();
         if let Ok(ss) = std::process::Command::new("ss").args(["-tnpH"]).output() {
             for line in String::from_utf8_lossy(&ss.stdout).lines() {
@@ -726,7 +749,7 @@ fn opencode_startup_evidence(deck: &TuiDeck, receiver: &Receiver, agent: Option<
                 let text = std::fs::read_to_string(&path).unwrap_or_default();
                 let lines: Vec<_> = text.lines().collect();
                 for line in &lines[lines.len().saturating_sub(80)..] {
-                    let _ = writeln!(out, "    {line:.400}");
+                    let _ = writeln!(out, "    {}", clip(line, 400));
                 }
             }
         }
@@ -737,7 +760,7 @@ fn opencode_startup_evidence(deck: &TuiDeck, receiver: &Receiver, agent: Option<
             .any(|resource| attribute(resource, "service.name") == "opencode")
         {
             let body = String::from_utf8_lossy(&request.body);
-            let _ = writeln!(out, "OpenCode {}: {body:.4000}", request.path);
+            let _ = writeln!(out, "OpenCode {}: {}", request.path, clip(&body, 4000));
         }
     }
     common::redact_credentials_for_output(&out)
