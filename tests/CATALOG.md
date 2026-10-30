@@ -12257,6 +12257,34 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Does not assert:** that the refused answer's own question is answerable again, which `question/hold/015` covers; the hook loop's acknowledgement reading.
 - **Platform coverage:** mac+linux.
 
+##### question/answer/019 — A question cleared while its answer is held ends the answer superseded.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`, the generation's fence closed and released by the test, PRD #1666 part 3, Q35-17).
+- **Agent:** none (`/bin/cat` stand-in for Codex).
+- **Asserts:** a voice answer that names a client token, sent while a fence holds the agent's input, is held and its question shows `answer_queued`; an Idle event clearing the question is ingested within 2 s, not behind the answer; on release nothing is typed, the answer is refused `stale`, the agent's snapshot carries one settlement naming that token as `superseded`, and no reservation is left.
+- **Does not assert:** a real probe opening the fence (Q35-20); the desktop's words for the settlement (`question/answer/024`).
+- **Platform coverage:** mac+linux.
+
+##### question/answer/020 — Hooks flow and a repeat is refused while an answer is held.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`, a closed fence).
+- **Agent:** none (`/bin/cat` stand-in for Codex).
+- **Asserts:** while a voice answer is held behind a fence, a tool-start hook is ingested within 2 s and reaches the card with the question still pending; a second answer is refused `answer_in_progress` within 2 s; after the first answer's handler is aborted, the held key's reservation still refuses a third answer; on release the held key is typed once and the refused answers type nothing, the reservation clears once the key's job ends, and the agent's next question is answered.
+- **Does not assert:** a handler cancelled by its connection closing in production, where the attach handler runs the answer on a task of its own.
+- **Platform coverage:** mac+linux.
+
+##### question/answer/021 — Settlements name their own token and outcome; retirement clears the reservation.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`, a closed fence, and `AppState`'s settlement list directly).
+- **Agent:** none (`/bin/cat` stand-in for Codex).
+- **Asserts:** a held answer released and written settles `written` under its token, and a concurrent watcher of the agent's snapshot never sees `answer_queued` gone without that settlement; an answer held when its agent is closed is not reported written, types nothing, clears its reservation, settles `retired` and leaves the question unqueued; dropping an older reservation leaves a newer one on the same pane, and a reservation belongs to its generation; the list keeps the 8 newest settlements per generation, newest first, until 120 s after each.
+- **Does not assert:** the `partial` and `write_failed` outcomes, which need a PTY that fails a held write (the mapping from the writer's outcome is in `src/agent_pty.rs`, `HeldAnswerWrite::settled`).
+- **Platform coverage:** mac+linux.
+
+##### question/answer/022 — With no fence an answer settles as before.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`, no fence).
+- **Agent:** none (`/bin/cat` stand-in for Codex).
+- **Asserts:** with no fence, a voice answer naming a client token is typed and answered, the question never shows `answer_queued`, no settlement is recorded and nothing stays reserved; one whose question is cleared while its key waits on the PTY thread is refused `stale`, types nothing and records no settlement. `question/answer/016`–`018` run unchanged.
+- **Does not assert:** a tokenless held answer, which `question/answer/023` covers end to end.
+- **Platform coverage:** mac+linux.
+
 ##### question/answer/023 — A released voice client's fenced answer remains unconfirmed until its physical outcome.
 - **Layer:** L2 lane 1 (`tests/e2e_input_fence.rs`, native raw-terminal recorder and the spawned daemon).
 - **Agent:** none; synthetic recorder, no voice hardware.
@@ -12269,7 +12297,7 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Layer:** L1/fast unit (`src/daemon_client.rs`, a scripted Unix-socket daemon that answers `Hello` with a chosen capability list and records every other request).
 - **Agent:** none.
 - **Asserts:** `DaemonClient::answer_question_with_token_while` with token 42 sends `client_token: 42` in the `answer-question` request when the daemon advertises `answer-question` and `answer-settlement`, and sends the same request with no `client_token` key when it advertises only `answer-question`; both report the answer as answered (PRD #1666 part 3, Q35-10 review R3510-U3-03).
-- **Does not assert:** the desktop's own call of the sender or the daemon's handling of the token (no daemon in this build advertises `answer-settlement` yet); a daemon advertising no `answer-question`, which `question/answer/004` covers.
+- **Does not assert:** the desktop's own call of the sender or the daemon's handling of the token (this build's daemon advertises `answer-settlement` since Q35-17; `question/answer/019`–`022` cover its handling); a daemon advertising no `answer-question`, which `question/answer/004` covers.
 - **Platform coverage:** mac+linux.
 
 #### question/desktop

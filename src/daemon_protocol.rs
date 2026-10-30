@@ -16763,6 +16763,394 @@ mod question_answer_tests {
         assert_eq!(broadcast.resolved_question_id(), Some("q-bash"));
         assert!(broadcast.is_daemon_synthetic());
     }
+
+    // ------------------------------------------------------------------
+    // PRD #1666 part 3 (Q35-17, core §8.4, OQ6): voice answers through a
+    // fence.
+
+    impl Fixture {
+        /// Close the agent's fence, as a probe will (Q35-20).
+        fn fence(&self) {
+            let (gate, _) = self.registry.composer_fence(&self.agent_id).unwrap();
+            assert!(gate.fence(), "the generation is live");
+        }
+
+        /// Open the fence and submit what it held.
+        async fn release(&self) {
+            let (_, writer) = self.registry.composer_fence(&self.agent_id).unwrap();
+            writer.lock().await.release_fence(Ok(()));
+        }
+
+        /// Wait until the fence holds `n` ops.
+        async fn until_held(&self, n: usize) {
+            let (gate, _) = self.registry.composer_fence(&self.agent_id).unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while gate.status().held_ops != n {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the fence holds {} ops, not {n}",
+                    gate.status().held_ops
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        /// Answer `question_id` at its pending revision, naming
+        /// `client_token`, on a task of its own.
+        fn tokened_task(
+            &self,
+            question_id: &'static str,
+            answers: Vec<QuestionAnswer>,
+            client_token: Option<u64>,
+        ) -> tokio::task::JoinHandle<Result<(), AnswerRefusal>> {
+            let registry = self.registry.clone();
+            let state = self.state.clone();
+            let event_tx = self.event_tx.clone();
+            let agent_id = self.agent_id.clone();
+            tokio::spawn(async move {
+                let revision = state
+                    .read()
+                    .await
+                    .pending_question_for(&agent_id, Some(PANE))
+                    .and_then(|(_, q)| q.revision);
+                answer_question_tokened_at(
+                    &registry,
+                    &state,
+                    &event_tx,
+                    &agent_id,
+                    question_id,
+                    revision,
+                    &answers,
+                    false,
+                    client_token,
+                )
+                .await
+            })
+        }
+
+        /// The agent's settlements as its snapshot reports them.
+        async fn settlements(&self) -> Vec<crate::question::AnswerSettlement> {
+            self.state
+                .read()
+                .await
+                .live_session_for(&self.agent_id, Some(PANE))
+                .map(|live| live.answer_settlements)
+                .unwrap_or_default()
+        }
+
+        fn reserved(&self) -> bool {
+            self.registry
+                .question_answers()
+                .answer_reserved(PANE, &self.agent_id)
+        }
+
+        /// A tool starting: a status hook that leaves the question pending.
+        fn tool_start(&self) -> AgentEvent {
+            let mut event = self.event(EventType::ToolStart);
+            event.tool_name = Some("Bash".into());
+            event
+        }
+    }
+
+    fn settled(
+        question_id: &str,
+        revision: Option<u64>,
+        client_token: u64,
+        outcome: crate::question::SettlementOutcome,
+    ) -> crate::question::AnswerSettlement {
+        crate::question::AnswerSettlement {
+            question_id: question_id.into(),
+            revision: revision.expect("a stamped question"),
+            client_token,
+            outcome,
+        }
+    }
+
+    /// Scenario: The deck is checking a Codex agent's input box, so it holds
+    /// what is typed there, when a voice answer arrives: the answer is
+    /// queued, and the question shows it. The agent then moves on, clearing
+    /// the question, which the deck takes in at once rather than after the
+    /// answer. When the deck stops holding, the answer's digit is not typed;
+    /// the answer is refused as stale and its settlement says superseded.
+    #[spec("question/answer/019")]
+    #[tokio::test]
+    async fn question_answer_019_a_question_cleared_while_its_answer_is_held_ends_superseded() {
+        use crate::question::SettlementOutcome;
+        let fx = Fixture::start(AgentType::Codex).await;
+        fx.ask_ingested(&codex_single("call_fenced", "Which colour?"))
+            .await;
+        let revision = fx.pending_question().await.unwrap().revision;
+        fx.fence();
+        let answering = fx.tokened_task("call_fenced", vec![one(0, 2)], Some(19));
+        fx.until_held(1).await;
+        assert!(
+            fx.pending_question().await.unwrap().answer_queued,
+            "the held answer shows as queued"
+        );
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            fx.ingest_task(fx.event(EventType::Idle)),
+        )
+        .await
+        .expect("the clearing event isn't held behind the answer")
+        .unwrap();
+        assert_eq!(fx.pending_question().await, None);
+        fx.release().await;
+        assert_eq!(
+            answering.await.unwrap(),
+            Err(AnswerRefusal::Stale { current_id: None })
+        );
+        assert!(
+            !fx.screen_shows_within("2", Duration::from_millis(500))
+                .await,
+            "nothing was typed into the moved-on agent"
+        );
+        assert_eq!(
+            fx.settlements().await,
+            [settled(
+                "call_fenced",
+                revision,
+                19,
+                SettlementOutcome::Superseded
+            )]
+        );
+        assert!(!fx.reserved());
+    }
+
+    /// Scenario: While the deck holds a Codex agent's input and a voice
+    /// answer is queued behind it, the agent reports a tool starting, which
+    /// the card takes in at once; a second answer to the same agent is
+    /// refused at once as already being sent. The first answer's sender then
+    /// stops waiting, and a third answer is still refused, because the queued
+    /// answer still holds its place; once the deck stops holding, its digit
+    /// is typed once and the agent can be answered again.
+    #[spec("question/answer/020")]
+    #[tokio::test]
+    async fn question_answer_020_hooks_flow_and_a_repeat_is_refused_while_an_answer_is_held() {
+        let fx = Fixture::start(AgentType::Codex).await;
+        fx.ask_ingested(&codex_single("call_held", "Which colour?"))
+            .await;
+        fx.fence();
+        let answering = fx.tokened_task("call_held", vec![one(0, 2)], None);
+        fx.until_held(1).await;
+        tokio::time::timeout(Duration::from_secs(2), fx.ingest_task(fx.tool_start()))
+            .await
+            .expect("a status hook isn't held behind the answer")
+            .unwrap();
+        let live = fx
+            .state
+            .read()
+            .await
+            .live_session_for(&fx.agent_id, Some(PANE))
+            .unwrap();
+        assert_eq!(
+            live.active_tool.map(|tool| tool.name).as_deref(),
+            Some("Bash"),
+            "the hook reached the card"
+        );
+        assert_eq!(fx.pending().await.as_deref(), Some("call_held"));
+        let repeat = tokio::time::timeout(
+            Duration::from_secs(2),
+            fx.answer("call_held", &[(0, &[1], None)], false),
+        )
+        .await
+        .expect("the repeat is refused at once, not queued behind the held answer");
+        assert_eq!(repeat, Err(AnswerRefusal::AnswerInProgress));
+        // The handler stops waiting: its slot goes, the key's reservation
+        // stays until the key's job ends.
+        answering.abort();
+        let _ = answering.await;
+        assert!(fx.reserved(), "the held key keeps the agent reserved");
+        assert_eq!(
+            fx.answer("call_held", &[(0, &[1], None)], false).await,
+            Err(AnswerRefusal::AnswerInProgress)
+        );
+        fx.release().await;
+        assert!(fx.screen_shows("2").await, "the held key was typed");
+        assert!(
+            !fx.screen_shows_within("1", Duration::from_millis(300))
+                .await,
+            "the refused answers typed nothing"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while fx.reserved() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the reservation outlived the key's job"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        fx.ask_ingested(&codex_single("call_next", "Which shade?"))
+            .await;
+        assert_eq!(
+            fx.answer("call_next", &[(0, &[1], None)], false).await,
+            Ok(())
+        );
+        assert!(fx.screen_shows("21").await);
+    }
+
+    /// Scenario: Three voice answers wait behind the deck's check of a Codex
+    /// agent's input. The first is written when the check ends, and its
+    /// settlement says written, under its own token; while it waited, every
+    /// look at the agent showed it queued or showed its settlement, never
+    /// neither. The second's agent is closed while it waits: nothing is
+    /// typed, the reservation clears, and its settlement says retired. A
+    /// late end of an earlier answer's place never frees a newer one's, and
+    /// the agent's list keeps its 8 newest settlements for 120 seconds.
+    #[spec("question/answer/021")]
+    #[tokio::test]
+    async fn question_answer_021_settlements_name_their_token_and_retirement_clears() {
+        use crate::question::{AnswerSettlement, SettlementOutcome};
+        // Written, watched throughout.
+        let fx = Fixture::start(AgentType::Codex).await;
+        fx.ask_ingested(&codex_single("call_one", "Which colour?"))
+            .await;
+        let revision = fx.pending_question().await.unwrap().revision;
+        fx.fence();
+        let answering = fx.tokened_task("call_one", vec![one(0, 2)], Some(5));
+        let watcher = {
+            let (state, agent_id) = (fx.state.clone(), fx.agent_id.clone());
+            tokio::spawn(async move {
+                let mut seen_queued = false;
+                loop {
+                    let live = state
+                        .read()
+                        .await
+                        .live_session_for(&agent_id, Some(PANE))
+                        .unwrap();
+                    let queued = live
+                        .pending_question
+                        .as_ref()
+                        .is_some_and(|q| q.answer_queued);
+                    let settled = live.answer_settlements.iter().any(|s| s.client_token == 5);
+                    seen_queued |= queued;
+                    assert!(
+                        !seen_queued || queued || settled,
+                        "a snapshot showed the queued flag gone without the outcome"
+                    );
+                    if settled {
+                        return seen_queued;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        fx.until_held(1).await;
+        fx.release().await;
+        assert_eq!(answering.await.unwrap(), Ok(()));
+        assert!(watcher.await.unwrap(), "the watcher saw the answer queued");
+        assert!(fx.screen_shows("2").await);
+        assert_eq!(
+            fx.settlements().await,
+            [settled("call_one", revision, 5, SettlementOutcome::Written)]
+        );
+
+        // Retired: the agent closes while its answer is held.
+        let fx = Fixture::start(AgentType::Codex).await;
+        fx.ask_ingested(&codex_single("call_two", "Which colour?"))
+            .await;
+        let revision = fx.pending_question().await.unwrap().revision;
+        fx.fence();
+        let answering = fx.tokened_task("call_two", vec![one(0, 2)], Some(6));
+        fx.until_held(1).await;
+        assert!(fx.reserved());
+        fx.registry.close_agent(&fx.agent_id).unwrap();
+        assert!(
+            answering.await.unwrap().is_err(),
+            "a retired answer isn't reported written"
+        );
+        assert!(!fx.reserved(), "retirement cleared the reservation");
+        assert_eq!(
+            fx.settlements().await,
+            [settled("call_two", revision, 6, SettlementOutcome::Retired)]
+        );
+        assert!(!fx.pending_question().await.unwrap().answer_queued);
+
+        // A late end clears only its own reservation.
+        let answers = fx.registry.question_answers();
+        let older = answers.reserve(PANE, "g", "q", Some(1));
+        let newer = answers.reserve(PANE, "g", "q", Some(1));
+        drop(older);
+        assert!(answers.answer_reserved(PANE, "g"), "the newer one stays");
+        assert!(!answers.answer_reserved(PANE, "other-generation"));
+        drop(newer);
+        assert!(!answers.answer_reserved(PANE, "g"));
+
+        // Bounds: 8 per generation, newest first, for 120 seconds.
+        let mut state = crate::state::AppState::default();
+        let now = std::time::Instant::now();
+        let entry = |token| AnswerSettlement {
+            question_id: "q".into(),
+            revision: 1,
+            client_token: token,
+            outcome: SettlementOutcome::Written,
+        };
+        for token in 0..10 {
+            state.push_answer_settlement("g", entry(token), now);
+        }
+        let tokens = |kept: Vec<AnswerSettlement>| {
+            kept.into_iter().map(|s| s.client_token).collect::<Vec<_>>()
+        };
+        let newest: Vec<u64> = (2..10).rev().collect();
+        assert_eq!(tokens(state.answer_settlements_at("g", now)), newest);
+        assert!(state.answer_settlements_at("other", now).is_empty());
+        let retention = crate::question::ANSWER_SETTLEMENT_RETENTION;
+        assert_eq!(
+            tokens(state.answer_settlements_at("g", now + retention - Duration::from_secs(1))),
+            newest
+        );
+        assert!(state.answer_settlements_at("g", now + retention).is_empty());
+        state.push_answer_settlement("h", entry(42), now + retention);
+        assert_eq!(
+            tokens(state.answer_settlements_at("h", now + retention)),
+            [42]
+        );
+    }
+
+    /// Scenario: With no check holding a Codex agent's input, a voice answer
+    /// that names a client token is typed and reported as before; the
+    /// question never shows as queued, no settlement is recorded and nothing
+    /// stays reserved. An answer whose question changes while its key waits
+    /// for the terminal is refused as stale, as before, also with no
+    /// settlement.
+    #[spec("question/answer/022")]
+    #[tokio::test]
+    async fn question_answer_022_with_no_fence_an_answer_settles_as_before() {
+        let fx = Fixture::start(AgentType::Codex).await;
+        fx.ask_ingested(&codex_single("call_open", "Which colour?"))
+            .await;
+        let answering = fx.tokened_task("call_open", vec![one(0, 2)], Some(22));
+        assert_eq!(answering.await.unwrap(), Ok(()));
+        assert!(fx.screen_shows("2").await);
+        assert_eq!(fx.pending().await, None);
+        assert!(fx.settlements().await.is_empty());
+        assert!(!fx.reserved());
+
+        fx.ask_ingested(&codex_single("call_moved", "Which shade?"))
+            .await;
+        let (reached, resume) = fx
+            .registry
+            .question_answers()
+            .arm_barrier(crate::agent_pty::ANSWER_KEY_ON_PTY_THREAD);
+        let answering = fx.tokened_task("call_moved", vec![one(0, 1)], Some(23));
+        reached.await.expect("the key reached the PTY thread");
+        assert!(
+            !fx.pending_question().await.unwrap().answer_queued,
+            "an unheld answer never shows as queued"
+        );
+        fx.ingest_task(fx.event(EventType::Idle)).await.unwrap();
+        resume.send(()).unwrap();
+        assert_eq!(
+            answering.await.unwrap(),
+            Err(AnswerRefusal::Stale { current_id: None })
+        );
+        assert!(
+            !fx.screen_shows_within("21", Duration::from_millis(300))
+                .await
+        );
+        assert!(fx.settlements().await.is_empty());
+        assert!(!fx.reserved());
+    }
 }
 
 /// PRD #1666 §6.4: a Retry or Cancel names a message by its exact id.
