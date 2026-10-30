@@ -158,8 +158,12 @@ async fn question_hold_024_a_producer_that_never_reads_cannot_pin_a_hold() {
     assert_eq!(reading.holds.available_permits(), 1);
     drop(reading);
 
-    // A producer whose send buffer has no room for the `held` line.
+    // A producer whose send buffer has no room for the `held` line. The
+    // handler gives up at the 300 ms write timeout; the bound below leaves
+    // room for a loaded box and still refuses a release seconds late.
+    let started = tokio::time::Instant::now();
     let (outcome, stalled) = hold_with_confirmation(1).await;
+    let elapsed = started.elapsed();
     let outcome = outcome.expect(
         "the `held` write never gave up: a producer that does not read parked the handler \
          before its hold deadline started",
@@ -167,6 +171,10 @@ async fn question_hold_024_a_producer_that_never_reads_cannot_pin_a_hold() {
     assert!(
         outcome.is_none(),
         "a producer that cannot be written to is released as one that hung up"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the stalled producer was released after {elapsed:?}, not near the 300 ms write timeout"
     );
     assert_eq!(
         stalled.holds.available_permits(),
