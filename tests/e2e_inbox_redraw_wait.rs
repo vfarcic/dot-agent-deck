@@ -30,6 +30,11 @@ const MARGIN: Duration = Duration::from_millis(1500);
 const NUDGE: &str = "doorbell evidence-refresh nudge";
 /// Long enough for a nudge, the stand-in's 2 s redraw after it and a ring.
 const RING_WAIT: Duration = Duration::from_secs(30);
+/// How long to watch for a second nudge after the first: past the estimate
+/// the first nudge's own two size changes move (one wait each, plus the
+/// margin), with scheduling headroom, so it is the once-per-episode guard
+/// that keeps a second one away, not the estimate.
+const AFTER_NUDGE: Duration = Duration::from_millis(2 * 2000 + 1500 + 3000);
 
 /// One sandbox daemon with its log at debug for the doorbell.
 struct Deck {
@@ -156,7 +161,7 @@ fn probe_055_a_burst_of_five_resizes_needs_no_nudge() {
     );
 }
 
-/// Scenario: Start a CPR stand-in that never redraws after a size change, Idle; resize its terminal once and queue a task. The deck nudges it exactly once, no earlier than 2 s plus the 1.5 s margin after the resize, and not again while its screen stays stale, so the task stays queued.
+/// Scenario: Start a CPR stand-in that never redraws after a size change, Idle; resize its terminal once and queue a task. The deck nudges it once, no earlier than 2 s plus the 1.5 s margin after the resize, and not again in the 8.5 s after that nudge, past the estimate its own two size changes move, while its screen stays stale, so the task stays queued.
 #[spec("inbox/probe/055")]
 #[test]
 fn probe_055_an_agent_that_never_redraws_is_nudged_once_at_its_estimate() {
@@ -176,7 +181,7 @@ fn probe_055_an_agent_that_never_redraws_is_nudged_once_at_its_estimate() {
         "nudged at {nudged}, before the estimate's floor {earliest}"
     );
     assert!(
-        !common::wait_until(PER_SIZE_CHANGE * 2, || deck.nudges(&pane).len() > 1),
+        !common::wait_until(AFTER_NUDGE, || deck.nudges(&pane).len() > 1),
         "once per episode"
     );
     assert!(rung_line(&pane, &id).is_none(), "a stale screen isn't rung");

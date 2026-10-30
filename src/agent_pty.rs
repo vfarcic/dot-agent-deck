@@ -5713,8 +5713,11 @@ struct SubOpsEnding {
 }
 
 /// One sub-op of a [`SubOps`] submitted to the writer, until its job ends or
-/// is dropped unrun: dropping it is the sub-op's end, after it added what it
-/// took. Settles the op's refused rest when it is the last to end.
+/// is dropped unrun: dropping it is the sub-op's end. On a normal completion
+/// that is after it added what it took; when the writer unwinds or its job is
+/// disposed of, it ends with whatever the aggregate already holds, so bytes
+/// the PTY took that it never added aren't counted. Settles the op's refused
+/// rest when it is the last to end.
 #[derive(Debug)]
 pub(crate) struct SubOpRun(Arc<SubOps>);
 

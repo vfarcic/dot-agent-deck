@@ -42,7 +42,7 @@ taken = []
 
 
 def redraw():
-    cols = os.get_terminal_size(0).columns
+    cols = geometry.columns
     content = bytes(line) if line else b"\x1b[2m<empty>\x1b[22m"
     width = b"W" * cols if witnessed else b"WAITING-FOR-A-SIZE-CHANGE"
     frame = (
@@ -68,8 +68,11 @@ def size_changed():
     redraw()
 
 
-redraw()
+# The size the ready screen is drawn at, sampled before that screen is
+# published: a resize the test makes once it sees the screen is then always
+# an edge from this size, never taken as the baseline.
 geometry = os.get_terminal_size(0)
+redraw()
 while True:
     if os.get_terminal_size(0) != geometry:
         size_changed()
