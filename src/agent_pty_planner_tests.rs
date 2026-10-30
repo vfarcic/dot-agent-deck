@@ -538,7 +538,7 @@ async fn probe_010_an_osc_reply_is_a_candidate_unless_a_kept_query_solicited_it_
         .await;
 }
 
-/// Scenario: Behind a check, hold one 16 MiB frame of BELs and release three times; then, with no liability or check, write another. Each release writes one byte and leaves one held node; the open frame numbers all its candidates as one range, published once, and the hazard FIFO keeps sixteen entries and counts the rest.
+/// Scenario: Behind a check, hold one 16 MiB frame of BELs and release three times; then, with no liability or check and a cursor position query outstanding, write another. Each release writes one byte and leaves one held node; the open frame numbers all its candidates as one range, published once, and the hazard FIFO keeps sixteen latched entries and counts the rest.
 #[spec("inbox/probe/010")]
 #[tokio::test(flavor = "multi_thread")]
 async fn probe_010_a_16_mib_candidate_frame_is_cut_lazily_and_numbered_as_one_range() {
@@ -564,6 +564,10 @@ async fn probe_010_a_16_mib_candidate_frame_is_cut_lazily_and_numbered_as_one_ra
     }
     rig.writer.gate().retire();
     let open = Rig::new(true, None);
+    // A cursor position query the agent waits on: `B` holds, so each entry
+    // is `Latched` and none leaves under D5's quiet period while a slow
+    // machine is still writing the frame.
+    open.hook.lock().unwrap().on_output(b"\x1b[6n");
     let (accepted, _) = open.offer(&vec![0x07u8; MIB16]).await;
     assert!(matches!(accepted, Accepted::Written(Ok(()))));
     assert_eq!(open.page(), [MIB16 as u64], "one publication for the range");
@@ -572,6 +576,10 @@ async fn probe_010_a_16_mib_candidate_frame_is_cut_lazily_and_numbered_as_one_ra
         kept.len(),
         crate::composer_probe::query_ledger::HAZARD_SLOTS
     );
+    assert!(kept.iter().all(|e| matches!(
+        e,
+        crate::composer_probe::query_ledger::EntryView::Latched { .. }
+    )));
     assert_eq!(extra as usize, MIB16 - kept.len());
 }
 
