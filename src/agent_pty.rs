@@ -4712,13 +4712,18 @@ impl UserFrame {
     /// would have got before acceptance. A full rejection queue drops it, as
     /// the attach loop's own does.
     fn refuse_accepted(self, reason: &'static str) {
-        if let Some(notice) = &self.notice {
+        // Q35-16 fix: one notice per op, whichever part of it comes first.
+        if let Some(notice) = &self.notice
+            && self.part.as_ref().is_none_or(|part| part.tell_once())
+        {
             let _ = notice.try_send(reason.as_bytes().to_vec());
         }
         // Q35-16: the rest of a cut op whose earlier sub-ops the PTY took
-        // part of settles as written in part.
+        // part of settles as written in part, once every earlier sub-op
+        // still with the writer has reported what it took (the fix,
+        // Q3516-R-U2-01).
         match (self.ticket, &self.part) {
-            (Some(ticket), Some(part)) => ticket.refuse_after(part.accepted(), reason),
+            (Some(ticket), Some(part)) => part.refuse_rest(ticket, reason),
             (Some(ticket), None) => ticket.refuse(reason),
             (None, _) => {}
         }
@@ -4801,7 +4806,7 @@ enum Acceptance {
     Planned(Option<crate::composer_probe::planner::Natives>),
     /// Released by a fence, which moved its epoch and counted it in flight
     /// when it held it; with the cut op it is a sub-op of, if it is one.
-    Released(Released, Option<Arc<SubOps>>),
+    Released(Released, Option<SubOpRun>),
 }
 
 /// PRD #1666 part 3 (Q35-15): a generation's fence gate
@@ -5560,8 +5565,9 @@ struct PtyJob {
     /// PRD #1666 part 3 (Q35-16): the native Ctrl+G candidates the planner
     /// numbered in it, reported to the hazard FIFO as the PTY takes each.
     natives: Option<crate::composer_probe::planner::NativeRun>,
-    /// PRD #1666 part 3 (Q35-16, core §4.3): the cut op it is a sub-op of.
-    part: Option<Arc<SubOps>>,
+    /// PRD #1666 part 3 (Q35-16, core §4.3): the cut op it is a sub-op of,
+    /// with this sub-op running until the job is dropped (the fix).
+    part: Option<SubOpRun>,
 }
 
 /// PRD #1666 part 3 (Q35-16, I-8): a job's start condition, type-erased: it
@@ -5593,21 +5599,111 @@ fn start_check<R: Send + 'static>(
 /// whole, ends every later one `Gone`, refused at its dequeue with nothing
 /// written. Sub-ops are written in order, so the last one settles after every
 /// earlier one has reported.
+///
+/// **The op's settlement waits for its running sub-ops (Q35-16 fix,
+/// Q3516-R-U2-01 / Q3516-A-U2-01).** A held rest refused while an earlier
+/// sub-op is still with the writer (retirement, or a release whose target
+/// check failed, neither of which takes the pane writer) doesn't settle the
+/// ticket from what has been counted so far: a sub-op adds what it took only
+/// once its whole job returns, so the PTY may have taken bytes the count
+/// doesn't show yet. Every sub-op submitted to the writer holds a
+/// [`SubOpRun`] until its job ends or is disposed of; the rest's refusal is
+/// kept here, and settled once, from the final count, when the last of them
+/// ends. Nothing waits for the PTY to do it: whoever ends last settles.
+///
+/// **One notice per op.** The op's connection is told of a refusal or a
+/// failed write once, by whichever of its sub-ops or its rest comes first
+/// ([`Self::tell_once`]).
 #[derive(Debug)]
 pub(crate) struct SubOps {
     /// The whole op's length.
     len: usize,
-    accepted: std::sync::atomic::AtomicUsize,
+    /// Shared with the last sub-op's job ticket, which reads it when that
+    /// job ends unrun ([`crate::ingress_ledger::TicketGuard::into_job_after`]).
+    accepted: Arc<std::sync::atomic::AtomicUsize>,
     failed: Mutex<Option<std::io::ErrorKind>>,
+    ending: Mutex<SubOpsEnding>,
+    /// The op's connection was told.
+    told: AtomicBool,
+}
+
+/// [`SubOps`]' sub-ops still with the writer, and the refusal of the op's
+/// held rest waiting for them to end.
+#[derive(Debug, Default)]
+struct SubOpsEnding {
+    running: usize,
+    rest: Option<(crate::ingress_ledger::TicketGuard, &'static str)>,
+}
+
+/// One sub-op of a [`SubOps`] submitted to the writer, until its job ends or
+/// is dropped unrun: dropping it is the sub-op's end, after it added what it
+/// took. Settles the op's refused rest when it is the last to end.
+#[derive(Debug)]
+pub(crate) struct SubOpRun(Arc<SubOps>);
+
+impl std::ops::Deref for SubOpRun {
+    type Target = SubOps;
+
+    fn deref(&self) -> &SubOps {
+        &self.0
+    }
+}
+
+impl Drop for SubOpRun {
+    fn drop(&mut self) {
+        let rest = {
+            let mut ending = self.0.ending.lock().unwrap_or_else(|e| e.into_inner());
+            ending.running -= 1;
+            if ending.running == 0 {
+                ending.rest.take()
+            } else {
+                None
+            }
+        };
+        if let Some((ticket, reason)) = rest {
+            ticket.refuse_after(self.0.accepted(), reason);
+        }
+    }
 }
 
 impl SubOps {
     fn new(len: usize) -> Arc<Self> {
         Arc::new(Self {
             len,
-            accepted: std::sync::atomic::AtomicUsize::new(0),
+            accepted: Arc::default(),
             failed: Mutex::new(None),
+            ending: Mutex::default(),
+            told: AtomicBool::new(false),
         })
+    }
+
+    /// A sub-op is being submitted to the writer: it runs until the returned
+    /// [`SubOpRun`] is dropped.
+    fn run(self: &Arc<Self>) -> SubOpRun {
+        self.ending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .running += 1;
+        SubOpRun(Arc::clone(self))
+    }
+
+    /// The op's held rest is refused with `reason`: its ticket settles now
+    /// when no sub-op is with the writer, and otherwise when the last one
+    /// ends, from what they all took.
+    fn refuse_rest(&self, ticket: crate::ingress_ledger::TicketGuard, reason: &'static str) {
+        let mut ending = self.ending.lock().unwrap_or_else(|e| e.into_inner());
+        if ending.running > 0 {
+            ending.rest = Some((ticket, reason));
+            return;
+        }
+        drop(ending);
+        ticket.refuse_after(self.accepted(), reason);
+    }
+
+    /// Whether this caller is the first to tell the op's connection
+    /// anything: one notice per op.
+    fn tell_once(&self) -> bool {
+        !self.told.swap(true, Ordering::SeqCst)
     }
 
     fn took(&self, accepted: usize, error: Option<std::io::ErrorKind>) {
@@ -5862,7 +5958,9 @@ impl PtyWriterThread {
                         && (recorder.retired.load(Ordering::SeqCst)
                             || released.exited.load(Ordering::SeqCst))
                     {
-                        released.tell("exited");
+                        if part.as_ref().is_none_or(|part| part.tell_once()) {
+                            released.tell("exited");
+                        }
                         if let Some(ticket) = ticket {
                             match &part {
                                 Some(part) if part.accepted() > 0 => ticket.settle_written(
@@ -5969,6 +6067,7 @@ impl PtyWriterThread {
                     // once.
                     if let Some(released) = &released
                         && done.result.is_err()
+                        && part.as_ref().is_none_or(|part| part.tell_once())
                     {
                         released.tell_failed(recorder.retired.load(Ordering::SeqCst));
                     }
@@ -6082,7 +6181,7 @@ impl PtyWriterThread {
                     exited,
                     notice: frame.notice,
                 },
-                frame.part,
+                frame.part.as_ref().map(SubOps::run),
             ),
             None,
         );
@@ -6117,6 +6216,9 @@ impl PtyWriterThread {
                 (None, None, None)
             }
         };
+        let prior = part
+            .as_ref()
+            .map(|part: &SubOpRun| Arc::clone(&part.accepted));
         let queue = |ticket: Option<crate::ingress_ledger::JobTicket>| {
             let handle = ticket
                 .as_ref()
@@ -6167,7 +6269,9 @@ impl PtyWriterThread {
                 // Q35-15 fix 2 (R-U2-02): nobody awaits a released job, so
                 // its connection is told here; dropping the job leaves its
                 // ticket to this enqueue's hold, which settles it once.
-                if let Some(released) = &job.released {
+                if let Some(released) = &job.released
+                    && job.part.as_ref().is_none_or(|part| part.tell_once())
+                {
                     released.tell_failed(false);
                 }
                 self.in_flight.leave();
@@ -6176,7 +6280,9 @@ impl PtyWriterThread {
             Some((state.clone(), handle))
         };
         match ticket {
-            Some(ticket) => ticket.into_job(|job| queue(Some(job))),
+            // Q35-16 fix (Q3516-A-U3-02): the last sub-op's ticket knows
+            // what the earlier ones took, for its failure paths.
+            Some(ticket) => ticket.into_job_after(prior, |job| queue(Some(job))),
             None => queue(None),
         }
     }

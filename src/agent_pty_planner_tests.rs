@@ -14,23 +14,33 @@ const G: u64 = 7;
 
 /// A PTY writer that keeps every `write` call's bytes, one chunk per call.
 /// While shut it takes nothing, after saying a write arrived; with a budget
-/// it takes that many bytes in all and then fails every write.
+/// it takes that many bytes in all and then fails every write. With a
+/// per-call cap a call takes at most that many (a short write), and with
+/// `shut_after` the call after that many calls finds it shut.
 struct Scripted {
     chunks: Arc<Mutex<Vec<Vec<u8>>>>,
     open: Arc<(Mutex<bool>, std::sync::Condvar)>,
     entered: std::sync::mpsc::Sender<()>,
     budget: Option<usize>,
+    per_call: Option<usize>,
+    shut_after: Option<usize>,
+    calls: usize,
 }
 
 impl std::io::Write for Scripted {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let _ = self.entered.send(());
         let (open, wake) = &*self.open;
+        if self.shut_after == Some(self.calls) {
+            *open.lock().unwrap() = false;
+        }
+        self.calls += 1;
+        let _ = self.entered.send(());
         let mut guard = open.lock().unwrap();
         while !*guard {
             guard = wake.wait(guard).unwrap();
         }
         drop(guard);
+        let buf = &buf[..self.per_call.map_or(buf.len(), |cap| cap.min(buf.len()))];
         let n = match &mut self.budget {
             None => buf.len(),
             Some(0) => return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
@@ -64,10 +74,35 @@ struct Rig {
     /// Every native number published, in order.
     page: Arc<Mutex<Vec<u64>>>,
     hook: Mutex<crate::composer_probe::paste_mode::OutputHook>,
+    /// The pane's input state, where a test arms a write pause.
+    state: Arc<Mutex<PaneInputState>>,
 }
+
+/// How a [`Rig`]'s scripted PTY behaves: see [`Scripted`]. `pane` names the
+/// pane its writer records into, which a write pause needs.
+#[derive(Default)]
+struct Script {
+    budget: Option<usize>,
+    per_call: Option<usize>,
+    shut_after: Option<usize>,
+    pane: bool,
+}
+
+/// The pane a [`Script`] with `pane` records into.
+const PANE: &str = "planner-pane";
 
 impl Rig {
     fn new(open: bool, budget: Option<usize>) -> Self {
+        Self::scripted(
+            open,
+            Script {
+                budget,
+                ..Script::default()
+            },
+        )
+    }
+
+    fn scripted(open: bool, script: Script) -> Self {
         let input = Arc::new(GenerationInput::default());
         assert!(input.attach_records(Records::new(G, EcPolicy::Hold, Instant::now())));
         let page = Arc::new(Mutex::new(Vec::new()));
@@ -77,15 +112,19 @@ impl Rig {
         let open = Arc::new((Mutex::new(open), std::sync::Condvar::new()));
         let (tx, entered) = std::sync::mpsc::channel();
         let retired = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(Mutex::new(PaneInputState::default()));
         let writer = PaneWriter::new(
             Box::new(Scripted {
                 chunks: Arc::clone(&chunks),
                 open: Arc::clone(&open),
                 entered: tx,
-                budget,
+                budget: script.budget,
+                per_call: script.per_call,
+                shut_after: script.shut_after,
+                calls: 0,
             }),
-            None,
-            Arc::new(Mutex::new(PaneInputState::default())),
+            script.pane.then(|| PANE.to_string()),
+            Arc::clone(&state),
             Arc::clone(&retired),
             Arc::new(AtomicBool::new(false)),
             None,
@@ -107,7 +146,56 @@ impl Rig {
             notice,
             page,
             hook,
+            state,
         }
+    }
+
+    /// Park the writer thread after its next PTY write returns, before what
+    /// it took is accounted: the "reached" receiver and the "resume" sender.
+    /// Needs a rig with a pane.
+    fn pause_after_write(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached, reached_rx) = std::sync::mpsc::channel();
+        let (resume, release) = std::sync::mpsc::channel();
+        self.state.lock().unwrap().write_pause = Some(PtyWritePauseArm {
+            pane_id_env: PANE.to_string(),
+            at: PtyWritePause::AfterWrite,
+            reached,
+            release,
+        });
+        (reached_rx, resume)
+    }
+
+    /// Forget every write call reported so far.
+    fn drain_entered(&self) {
+        while self.entered.lock().unwrap().try_recv().is_ok() {}
+    }
+
+    /// Wait until a write call arrives at the PTY.
+    async fn write_entered(&self) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while self.entered.lock().unwrap().try_recv().is_err() {
+            assert!(Instant::now() < deadline, "no write arrived at the PTY");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    /// Shut the PTY: a write arriving now waits until [`Self::open`].
+    fn shut(&self) {
+        *self.open.0.lock().unwrap() = false;
+    }
+
+    /// Make the writer thread leave, handing its PTY writer back, once it
+    /// comes to this job: jobs queued after it are dropped unrun.
+    fn surrender(&self) -> oneshot::Receiver<(Box<dyn std::io::Write + Send>, InputRecorder)> {
+        let (tx, rx) = oneshot::channel();
+        self.writer
+            .pty
+            .submit(
+                PtyOp::Surrender(tx),
+                PtyReply::Blocking(std::sync::mpsc::sync_channel(1).0),
+            )
+            .expect("the writer thread is running");
+        rx
     }
 
     /// A liability out: the planner cuts what the gate lets through.
@@ -414,6 +502,147 @@ async fn probe_010_retirement_refuses_a_cut_rest_as_written_in_part() {
         Some(b"exited".as_slice())
     );
     assert_eq!(rig.in_flight(), 0);
+}
+
+/// Scenario: Behind a check, hold `ab`, BEL and `cd`, release once and park the writer just after the PTY took the prefix, before it counted it; retire the generation there. Nothing settles while the prefix is unaccounted; once the writer resumes, the ticket settles once, as three bytes written in part, and the connection is told `exited` once.
+#[spec("inbox/probe/010")]
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_010_retirement_waits_for_a_prefix_the_pty_took_but_hasnt_counted() {
+    let mut rig = Rig::scripted(
+        true,
+        Script {
+            pane: true,
+            ..Script::default()
+        },
+    );
+    rig.fence();
+    let (_, ticket) = rig.offer(b"ab\x07cd").await;
+    let (reached, resume) = rig.pause_after_write();
+    rig.release();
+    tokio::task::spawn_blocking(move || reached.recv().expect("the writer parks"))
+        .await
+        .unwrap();
+    assert_eq!(rig.taken(), b"ab\x07", "the PTY took the prefix");
+    rig.writer.gate().retire();
+    assert!(
+        rig.settled(ticket).is_empty(),
+        "no settlement while the prefix's count is outstanding"
+    );
+    resume.send(()).unwrap();
+    assert_eq!(
+        rig.settles(ticket).await,
+        [Settlement::Partial { accepted: 3 }]
+    );
+    rig.idle().await;
+    assert_eq!(rig.settled(ticket).len(), 1, "settled once");
+    assert_eq!(rig.in_flight(), 0);
+    assert_eq!(
+        rig.notices.recv().await.as_deref(),
+        Some(b"exited".as_slice())
+    );
+    assert!(rig.notices.try_recv().is_err(), "told once");
+}
+
+/// Scenario: Behind a check, hold `ab`, BEL and `cd` on a PTY that takes two bytes a call and then stops taking any; release once, so the prefix's write took `ab` and waits inside the PTY for its BEL, and retire the generation there. Nothing settles while the prefix is inside the PTY; once the PTY takes the BEL, the ticket settles once, as three bytes written in part.
+#[spec("inbox/probe/010")]
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_010_retirement_waits_for_a_prefix_still_inside_the_pty_after_a_short_write() {
+    let mut rig = Rig::scripted(
+        true,
+        Script {
+            per_call: Some(2),
+            shut_after: Some(1),
+            ..Script::default()
+        },
+    );
+    rig.fence();
+    let (_, ticket) = rig.offer(b"ab\x07cd").await;
+    rig.release();
+    rig.taken_becomes(b"ab").await;
+    rig.write_entered().await;
+    rig.write_entered().await;
+    rig.writer.gate().retire();
+    assert!(
+        rig.settled(ticket).is_empty(),
+        "no settlement while the prefix is inside the PTY"
+    );
+    rig.open();
+    rig.taken_becomes(b"ab\x07").await;
+    assert_eq!(
+        rig.settles(ticket).await,
+        [Settlement::Partial { accepted: 3 }]
+    );
+    rig.idle().await;
+    assert_eq!(rig.settled(ticket).len(), 1, "settled once");
+    assert_eq!(rig.in_flight(), 0);
+    assert_eq!(
+        rig.notices.recv().await.as_deref(),
+        Some(b"exited".as_slice())
+    );
+    assert!(rig.notices.try_recv().is_err(), "told once");
+}
+
+/// Scenario: Behind a check, hold `ab`, BEL and `cd` on a PTY that takes two bytes and then fails; release once, so the prefix writes `ab` and fails, then retire the generation while the rest is held. The connection is told of the failed write once and not again for the retirement, and the ticket settles once, as two bytes written in part.
+#[spec("inbox/probe/010")]
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_010_a_failed_prefix_then_retirement_tells_the_connection_once() {
+    let mut rig = Rig::new(true, Some(2));
+    rig.fence();
+    let (_, ticket) = rig.offer(b"ab\x07cd").await;
+    rig.release();
+    rig.taken_becomes(b"ab").await;
+    rig.flight(1).await;
+    rig.writer.gate().retire();
+    assert_eq!(
+        rig.settles(ticket).await,
+        [Settlement::Partial { accepted: 2 }]
+    );
+    rig.idle().await;
+    assert_eq!(rig.in_flight(), 0);
+    assert_eq!(
+        rig.notices.recv().await.as_deref(),
+        Some(crate::agent_pty::WRITE_FAILED.as_bytes())
+    );
+    assert!(rig.notices.try_recv().is_err(), "told once");
+}
+
+/// Scenario: Behind a check, hold `ab`, BEL and `cd` and release the prefix, which the PTY takes. Then the writer thread leaves: once with the rest's job queued behind its leaving, so the job is dropped unrun, and once before the rest is released, so its job can't be queued. Either way the ticket settles once as three bytes written in part, not as a failure that forgets the prefix.
+#[spec("inbox/probe/010")]
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_010_a_last_sub_op_dropped_unrun_settles_with_what_the_prefix_took() {
+    for queued in [true, false] {
+        let rig = Rig::new(true, None);
+        rig.fence();
+        let (_, ticket) = rig.offer(b"ab\x07cd").await;
+        rig.release();
+        rig.taken_becomes(b"ab\x07").await;
+        rig.flight(1).await;
+        if queued {
+            // The thread is busy with a write around the gate while it is
+            // told to leave and the rest is queued behind that.
+            rig.shut();
+            rig.drain_entered();
+            let busy = rig.writer.write_user(b"z");
+            tokio::pin!(busy);
+            tokio::select! {
+                _ = &mut busy => panic!("the PTY is shut"),
+                () = rig.write_entered() => {}
+            }
+            let left = rig.surrender();
+            assert_eq!(rig.release(), 1);
+            rig.open();
+            busy.await.unwrap();
+            left.await.expect("the writer thread left");
+        } else {
+            rig.surrender().await.expect("the writer thread left");
+            assert_eq!(rig.release(), 1);
+        }
+        assert_eq!(
+            rig.settles(ticket).await,
+            [Settlement::Partial { accepted: 3 }],
+            "queued behind the leaving: {queued}"
+        );
+    }
 }
 
 /// Scenario: Through the blocking `Write` path, with a liability out, write `ab`, BEL and `cd`. The call returns 3, a short count at the cut, and the PTY took exactly those bytes; the caller's next call carries `cd` and returns 2. With no liability the same bytes return 5 in one call.

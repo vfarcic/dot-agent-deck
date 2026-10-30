@@ -51,7 +51,7 @@
 //! reads.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// How a ticket ended.
@@ -202,10 +202,15 @@ impl IngressLedger {
     /// `Failed(BrokenPipe)` instead of leaving it queued and unreported. A
     /// disposal that looked before this hold armed the job and moves the flag
     /// after finds it [`QUEUED`] and reports it itself (fix 2).
+    ///
+    /// `prior` is what earlier sub-ops of the same operation took (PRD #1666
+    /// part 3, Q35-16 fix, Q3516-A-U3-02): a failure here settles `Partial`
+    /// with it when they took any ([`failed_after`]).
     fn queue_with<T>(
         &self,
         ticket: u64,
         armed: &AtomicU8,
+        prior: Option<&AtomicUsize>,
         enqueue: impl FnOnce() -> Option<T>,
     ) -> Option<T> {
         let mut inner = self.inner.lock().unwrap();
@@ -230,13 +235,20 @@ impl IngressLedger {
                 *job = true;
             }
         } else if inner.outstanding.remove(&ticket).is_some() || inner.closed {
-            push_settled(
-                &mut inner,
-                ticket,
-                Settlement::Failed(std::io::ErrorKind::BrokenPipe),
-            );
+            push_settled(&mut inner, ticket, failed_after(prior));
         }
         queued
+    }
+}
+
+/// PRD #1666 part 3 (Q35-16 fix, Q3516-A-U3-02): how a job that ends unrun
+/// because its writer is gone settles: `Failed(BrokenPipe)`, or, when it is
+/// the last sub-op of a cut operation whose earlier sub-ops took `prior`
+/// bytes, written in part with those.
+fn failed_after(prior: Option<&AtomicUsize>) -> Settlement {
+    match prior.map_or(0, |prior| prior.load(Ordering::SeqCst)) {
+        0 => Settlement::Failed(std::io::ErrorKind::BrokenPipe),
+        accepted => Settlement::Partial { accepted },
     }
 }
 
@@ -304,11 +316,26 @@ impl TicketGuard {
             .settle(self.ticket, Settlement::Written { bytes: 0 });
     }
 
+    /// [`Self::into_job_after`] for a whole operation.
+    #[cfg(test)]
+    pub(crate) fn into_job<T>(self, enqueue: impl FnOnce(JobTicket) -> Option<T>) -> Option<T> {
+        self.into_job_after(None, enqueue)
+    }
+
     /// Hand the ticket to a job: `enqueue` queues the job carrying the
     /// returned [`JobTicket`]; from then on the job settles it. Returns
     /// whatever `enqueue` returned, `None` when the job could not be queued
     /// (the ticket is then settled).
-    pub(crate) fn into_job<T>(mut self, enqueue: impl FnOnce(JobTicket) -> Option<T>) -> Option<T> {
+    ///
+    /// `prior` is set for the last sub-op of a cut operation (PRD #1666 part
+    /// 3, Q35-16 fix, Q3516-A-U3-02): what its earlier sub-ops took, so a job
+    /// dropped unrun, or one that could not be queued, settles written in
+    /// part with it rather than failed. `None` for a whole operation.
+    pub(crate) fn into_job_after<T>(
+        mut self,
+        prior: Option<Arc<AtomicUsize>>,
+        enqueue: impl FnOnce(JobTicket) -> Option<T>,
+    ) -> Option<T> {
         self.armed = false;
         let ledger = Arc::clone(&self.ledger);
         let ticket = self.ticket;
@@ -317,8 +344,9 @@ impl TicketGuard {
             ledger: Arc::clone(&ledger),
             ticket,
             armed: Arc::clone(&armed),
+            prior: prior.clone(),
         };
-        ledger.queue_with(ticket, &armed, move || enqueue(job))
+        ledger.queue_with(ticket, &armed, prior.as_deref(), move || enqueue(job))
     }
 }
 
@@ -333,7 +361,8 @@ impl Drop for TicketGuard {
 /// A job's ownership of a ticket. The writer thread settles it when the job
 /// ends; a job taken back before it started settles it `Cancelled` through
 /// its [`TicketHandle`]; a job dropped unrun (its writer thread gone) settles
-/// it `Failed(BrokenPipe)`.
+/// it `Failed(BrokenPipe)`, or written in part with what the earlier sub-ops
+/// of its cut operation took ([`TicketGuard::into_job_after`]).
 #[derive(Debug)]
 pub struct JobTicket {
     ledger: Arc<IngressLedger>,
@@ -342,6 +371,9 @@ pub struct JobTicket {
     /// ticket itself; a ticket dropped while armed settles `Failed`.
     /// [`UNQUEUED`], [`QUEUED`] or [`REPORTED`].
     armed: Arc<AtomicU8>,
+    /// What the earlier sub-ops of its cut operation took, when it is the
+    /// last of them ([`TicketGuard::into_job_after`]).
+    prior: Option<Arc<AtomicUsize>>,
 }
 
 impl JobTicket {
@@ -416,10 +448,9 @@ impl Drop for JobTicket {
                 .compare_exchange(seen, next, Ordering::SeqCst, Ordering::SeqCst)
             {
                 Ok(QUEUED) => {
-                    return self.ledger.settle(
-                        self.ticket,
-                        Settlement::Failed(std::io::ErrorKind::BrokenPipe),
-                    );
+                    return self
+                        .ledger
+                        .settle(self.ticket, failed_after(self.prior.as_deref()));
                 }
                 Ok(_) => return,
                 Err(now) => seen = now,
