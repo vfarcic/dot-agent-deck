@@ -168,6 +168,20 @@ pub enum Boundary {
     /// Q35-16: users press Escape alone to interrupt an agent, and holding
     /// every ring until their next key would make the doorbell wait after
     /// each interrupt, not rarely (`inbox/doorbell/019`).
+    ///
+    /// **An accepted exception, with a residual (the Q35-16 review fix;
+    /// both reviewers and the orchestrator accepted it).** A lone ESC isn't
+    /// certainly the Escape key. It can be the first half of a key whose
+    /// terminal sends ESC and the rest separately, an Alt+key (ESC then the
+    /// key's byte, a multibyte character's included) or a sequence split
+    /// across frames; and before the agent's own ESC timeout runs out, its
+    /// reader can take the deck's first byte as Alt+that byte. So a deck line
+    /// started here can lose its first byte to such a key, or turn it into
+    /// one. That is the behaviour before Q35-16, kept for doorbell lines
+    /// only: a probe never starts here, and Q35-19's probes use the strict
+    /// ground predicate ([`Physical::until_ground`], [`Framing::at_ground`]),
+    /// never [`Physical::until_line`] or [`Self::line_may_start`], which are
+    /// no permission to probe.
     Escape,
     /// In ground, outside any paste, string or escape sequence.
     Ground,

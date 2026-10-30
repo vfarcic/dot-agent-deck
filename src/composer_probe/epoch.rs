@@ -65,13 +65,20 @@
 //! **What it costs today.** Nothing reads it to decide, but it isn't free: a
 //! person's op is read as a report and every op is tokenized under this
 //! lock, inside the ingress lock when ticketed, and an output push that
-//! carries notes waits for it while holding the output lock. Q35-16 adds no
-//! decision read under it: a person's op is read as a report and tokenized
-//! as before, its candidates found and numbered in that same pass, plus a
-//! clone of the framing when it numbers. Native numbers are published to the
-//! arm page with this lock released. Outside it, a cut op's rest is read
-//! again, from the cut's saved state, when it is released, and the writer
-//! thread replays an op with native candidates over what the PTY took.
+//! carries notes waits for it while holding the output lock. Q35-16's
+//! planner decides under it: whether a person's op is cut at a candidate or
+//! its candidates are numbered native is read from the liability state here
+//! ([`GenerationInput::enqueue_planned`], [`GenerationInput::would_cut`]),
+//! which no production path sets before activation. The op is still read as
+//! a report and tokenized once, its candidates found in that same pass, now
+//! with that bookkeeping and a clone of the framing when it numbers, all
+//! under this lock. Native numbers are published to the arm page with this
+//! lock released. Outside it, a cut op's rest is read again, from the cut's
+//! saved state, when it is released, and the writer thread replays an op
+//! with native candidates over what the PTY took. What the planner costs
+//! here was measured in one A/B harness (Q35-16's `r6-contention.md`); those
+//! numbers bound what that harness observed, and are no claim that it costs
+//! nothing in timing.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
