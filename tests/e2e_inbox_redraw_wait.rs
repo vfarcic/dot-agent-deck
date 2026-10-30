@@ -138,7 +138,7 @@ fn probe_055_one_resize_waits_for_the_agents_own_redraw_then_rings() {
     );
 }
 
-/// Scenario: Start the CPR stand-in Idle, resize its terminal five times 50 ms apart through 130, 129, 130, 129 and 130 columns, and queue a task. The stand-in's one redraw 2 s after the first change lands at the final width, so the deck sends no nudge and the doorbell rings.
+/// Scenario: Start the CPR stand-in Idle, resize its terminal five times back to back through 130, 129, 130, 129 and 130 columns, and queue a task. The stand-in's one redraw 2 s after the first change lands at the final width, so the deck sends no nudge and the doorbell rings.
 #[spec("inbox/probe/055")]
 #[test]
 fn probe_055_a_burst_of_five_resizes_needs_no_nudge() {
@@ -146,7 +146,6 @@ fn probe_055_a_burst_of_five_resizes_needs_no_nudge() {
     let pane = deck.stand_in("burst", &[]);
     for cols in [130, 129, 130, 129, 130] {
         deck.resize(&pane, 40, cols);
-        std::thread::sleep(Duration::from_millis(50));
     }
     let id = enqueue(&deck.daemon, &pane, BODY);
     deck.rings(&pane, &id);
@@ -176,8 +175,10 @@ fn probe_055_an_agent_that_never_redraws_is_nudged_once_at_its_estimate() {
         nudged >= earliest,
         "nudged at {nudged}, before the estimate's floor {earliest}"
     );
-    std::thread::sleep(PER_SIZE_CHANGE * 2);
-    assert_eq!(deck.nudges(&pane).len(), 1, "once per episode");
+    assert!(
+        !common::wait_until(PER_SIZE_CHANGE * 2, || deck.nudges(&pane).len() > 1),
+        "once per episode"
+    );
     assert!(rung_line(&pane, &id).is_none(), "a stale screen isn't rung");
     state(&deck.daemon, &pane, &id, "queued");
 }
