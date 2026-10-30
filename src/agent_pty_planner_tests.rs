@@ -582,6 +582,62 @@ async fn probe_010_retirement_waits_for_a_prefix_still_inside_the_pty_after_a_sh
     assert!(rig.notices.try_recv().is_err(), "told once");
 }
 
+/// Scenario: Behind a check, hold three BELs on a shut PTY and release twice, so two of the frame's sub-ops are with the writer, then retire the generation while the third is held. When the PTY opens and takes both, the ticket settles once, as two bytes written in part, only after the second sub-op reported, and the connection is told `exited` once.
+#[spec("inbox/probe/010")]
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_010_retirement_waits_for_every_running_sub_op() {
+    let mut rig = Rig::new(false, None);
+    rig.fence();
+    let (_, ticket) = rig.offer(b"\x07\x07\x07").await;
+    assert_eq!(rig.release(), 1);
+    assert_eq!(rig.release(), 1);
+    rig.write_entered().await;
+    rig.writer.gate().retire();
+    assert!(rig.settled(ticket).is_empty());
+    rig.open();
+    rig.taken_becomes(b"\x07\x07").await;
+    assert_eq!(
+        rig.settles(ticket).await,
+        [Settlement::Partial { accepted: 2 }]
+    );
+    rig.idle().await;
+    assert_eq!(rig.settled(ticket).len(), 1, "settled once");
+    assert_eq!(rig.in_flight(), 0);
+    assert_eq!(
+        rig.notices.recv().await.as_deref(),
+        Some(b"exited".as_slice())
+    );
+    assert!(rig.notices.try_recv().is_err(), "told once");
+}
+
+/// Scenario: Behind a check, hold three BELs on a shut PTY and release twice, so one sub-op is inside the PTY and the next is queued; the generation then retires, refusing the held rest. When the PTY opens, the first sub-op's BEL is written, the queued one is reached after the retirement and ends unwritten, the connection is told `exited` once, not once per part, and the ticket settles once, as one byte written in part.
+#[spec("inbox/probe/010")]
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_010_a_sub_op_reached_after_retirement_doesnt_tell_the_connection_again() {
+    let mut rig = Rig::new(false, None);
+    rig.fence();
+    let (_, ticket) = rig.offer(b"\x07\x07\x07").await;
+    assert_eq!(rig.release(), 1);
+    assert_eq!(rig.release(), 1);
+    rig.write_entered().await;
+    rig.retired.store(true, Ordering::SeqCst);
+    rig.writer.gate().retire();
+    rig.open();
+    assert_eq!(
+        rig.settles(ticket).await,
+        [Settlement::Partial { accepted: 1 }]
+    );
+    rig.idle().await;
+    assert_eq!(rig.taken(), b"\x07", "the queued sub-op wasn't written");
+    assert_eq!(rig.settled(ticket).len(), 1, "settled once");
+    assert_eq!(rig.in_flight(), 0);
+    assert_eq!(
+        rig.notices.recv().await.as_deref(),
+        Some(b"exited".as_slice())
+    );
+    assert!(rig.notices.try_recv().is_err(), "told once");
+}
+
 /// Scenario: Behind a check, hold `ab`, BEL and `cd` on a PTY that takes two bytes and then fails; release once, so the prefix writes `ab` and fails, then retire the generation while the rest is held. The connection is told of the failed write once and not again for the retirement, and the ticket settles once, as two bytes written in part.
 #[spec("inbox/probe/010")]
 #[tokio::test(flavor = "multi_thread")]
