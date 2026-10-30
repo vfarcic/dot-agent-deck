@@ -21,7 +21,7 @@
     "curl":                         "8.22.0",
     "ripgrep":                      "15.2.0",
     "python314Packages.pyte":       "0.8.2",
-    "github:NixOS/nixpkgs/nixos-26.05#nodejs_24": {
+    "github:NixOS/nixpkgs/nixos-26.05#nodejs_26": {
       "disable_plugin": true
     },
     "pnpm":                       "12.9.0",
