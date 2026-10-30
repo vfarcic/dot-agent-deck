@@ -4645,6 +4645,21 @@ pub(crate) struct UserFrame {
     /// PRD #1666 part 3 (Q35-16): the cut op this is a sub-op of, once it was
     /// split. The ticket stays with the op's last sub-op.
     part: Option<Arc<SubOps>>,
+    /// PRD #1666 part 3 (Q35-17, core §8.4): a voice answer's keys rather
+    /// than a person's frame: written as an answer, under its question's
+    /// gate, and its outcome sent to whoever awaits it. Never cut: an answer
+    /// the planner would cut is refused before acceptance.
+    answer: Option<HeldAnswer>,
+}
+
+/// PRD #1666 part 3 (Q35-17, core §8.4): what a voice answer's keys carry
+/// through a fence: the gate the writer thread checks before writing them,
+/// with the answer's reservation, and where the job's outcome goes. Dropped
+/// unwritten (retirement, a failed release check), its reply closes and its
+/// reservation clears.
+struct HeldAnswer {
+    gate: AnswerGate,
+    reply: oneshot::Sender<PtyJobDone>,
 }
 
 impl UserFrame {
@@ -4659,6 +4674,7 @@ impl UserFrame {
             notice,
             cut: None,
             part: None,
+            answer: None,
         }
     }
 
@@ -4690,6 +4706,7 @@ impl UserFrame {
                 notice: self.notice.clone(),
                 cut: None,
                 part: Some(part),
+                answer: None,
             },
             taken,
         )
@@ -5188,6 +5205,16 @@ impl PaneWriter {
     /// Audit T1: the PTY thread writes the keys only if `gate` still holds when
     /// it comes to them — [`AnswerWrite::Superseded`], with nothing written,
     /// otherwise.
+    ///
+    /// PRD #1666 part 3 (Q35-17, core §8.4): the keys pass the generation's
+    /// fence gate as a person's frame does. With no fence they are written now
+    /// and awaited, as before, `queued` called once they are queued. While a
+    /// fence holds input they are held in acceptance order and this returns
+    /// [`AnswerWrite::Held`] at once, without calling `queued`: the caller
+    /// drops this writer and its other locks and awaits the outcome, which
+    /// arrives when a release writes them (the gate checked then) or when they
+    /// are dropped unwritten. A held answer's sequence number is the one at
+    /// its acceptance, so a keystroke accepted after it counts as typed since.
     pub(crate) async fn write_answer(
         &self,
         bytes: &[u8],
@@ -5195,16 +5222,14 @@ impl PaneWriter {
         queued: impl FnOnce(),
         ticket: Option<crate::ingress_ledger::TicketGuard>,
     ) -> std::io::Result<AnswerWrite> {
+        use crate::composer_probe::epoch::{Plan, Writer};
+        use crate::composer_probe::gate::Admission;
         // Q35-16 (core §4.3): an answer the planner would cut is refused at
         // acceptance, whole, rather than split.
         if self
             .pty
             .input
-            .would_cut(
-                crate::composer_probe::epoch::Writer::Answer,
-                bytes,
-                self.gate.gate.status().fenced,
-            )
+            .would_cut(Writer::Answer, bytes, self.gate.gate.status().fenced)
             .is_some()
         {
             if let Some(ticket) = ticket {
@@ -5213,9 +5238,61 @@ impl PaneWriter {
             queued();
             return Ok(AnswerWrite::Refused);
         }
+        let (reply, done) = oneshot::channel();
+        let frame = UserFrame {
+            answer: Some(HeldAnswer { gate, reply }),
+            ..UserFrame::new(bytes.to_vec(), ticket, None)
+        };
+        let input = &self.pty.input;
+        let in_flight = &self.pty.in_flight;
+        let admitted = self.gate.gate.admit(
+            frame,
+            bytes.len(),
+            None,
+            // An answer is never a reply to a query: it passes no fence.
+            |_, _| false,
+            |frame| {
+                // As a person's held frame: in flight and its epoch moved
+                // from acceptance. Its candidates were refused above, so
+                // nothing cuts it.
+                frame.cut = input
+                    .enqueue_planned(Writer::Answer, &frame.bytes, Plan::Held)
+                    .cut;
+                in_flight.count.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        let frame = match admitted {
+            Admission::Open(frame) => frame,
+            Admission::Held => {
+                return Ok(AnswerWrite::Held(HeldAnswerWrite {
+                    at: self.state.lock().unwrap().input_seq,
+                    done,
+                }));
+            }
+            Admission::Retired(frame) => {
+                if let Some(ticket) = frame.ticket {
+                    ticket.refuse("exited");
+                }
+                queued();
+                return Ok(AnswerWrite::Exited);
+            }
+            Admission::Full(frame, _place) => {
+                // No room behind the fence: refused whole rather than waited
+                // for under the question's lifecycle.
+                if let Some(ticket) = frame.ticket {
+                    ticket.refuse(ANSWER_INPUT_FULL);
+                }
+                queued();
+                return Ok(AnswerWrite::Full);
+            }
+            Admission::PassAhead(_) | Admission::Settled(_) => {
+                unreachable!("an answer passes no fence and its keys carry bytes")
+            }
+        };
+        let HeldAnswer { gate, .. } = frame.answer.expect("an answer frame");
         match self
             .pty
-            .run_queued(PtyOp::Answer(bytes.to_vec(), gate), queued, ticket)
+            .run_queued(PtyOp::Answer(frame.bytes, gate), queued, frame.ticket)
             .await
         {
             PtyJobOutcome::Done(PtyJobDone { result: Err(e), .. })
@@ -6165,14 +6242,23 @@ impl PtyWriterThread {
 
     /// PRD #1666 part 3 (Q35-15): submit an op a fence held. It moved the
     /// epoch and entered the in-flight count when it was accepted, so it does
-    /// neither again; nobody awaits it, and the writer checks its generation
+    /// neither again; nobody awaits it but a held voice answer's handler
+    /// (Q35-17), and the writer checks its generation
     /// and `exited`, its target's exit token, before writing it. Its frame's
     /// notice goes with it, so a refusal or a failed write on the thread
     /// reaches its connection (R-U2-03).
     fn submit_released(&self, frame: UserFrame, exited: Arc<AtomicBool>) {
-        let (tx, _) = oneshot::channel();
+        // Q35-17: a voice answer is written as one, under its gate, and its
+        // outcome goes to whoever awaits it.
+        let (op, tx) = match frame.answer {
+            Some(answer) => (PtyOp::Answer(frame.bytes, answer.gate), answer.reply),
+            None => (
+                PtyOp::WriteAll(frame.bytes, ByteSource::User, true),
+                oneshot::channel().0,
+            ),
+        };
         let _ = self.submit_job(
-            PtyOp::WriteAll(frame.bytes, ByteSource::User, true),
+            op,
             PtyReply::Async(tx),
             frame.ticket,
             Arc::default(),
@@ -6959,6 +7045,16 @@ impl HeldQuestions {
 ///
 /// - **One question transition at a time per pane** — the question lifecycle
 ///   ([`Self::lock_lifecycle`]), below.
+/// - **An accepted answer's reservation** (PRD #1666 part 3, Q35-17, core
+///   §8.4). A key a fence holds is accepted, and the handler drops the
+///   writer and the lifecycle there and awaits its outcome outside them. The
+///   key carries a reservation ([`Self::reserve`]) keyed by the pane, the
+///   generation, the question and its revision, and an acceptance number; it
+///   clears when the key's job ends or the key is dropped unwritten, not
+///   when the handler stops waiting, and clears only the reservation it
+///   names. While one is set for the agent, another answer is refused
+///   [`crate::question::AnswerRefusal::AnswerInProgress`], as a held slot
+///   refuses it ([`Self::answer_reserved`]).
 ///
 /// # The question lifecycle (audit R1–R3)
 ///
@@ -6979,8 +7075,10 @@ impl HeldQuestions {
 /// - **the keyboard-only mark** on a question the deck typed part of an
 ///   answer into;
 /// - **delivery** of an answer: a held reply from its revalidation to the
-///   deck's clearing event, and each key from its revalidation until the write
-///   is queued on the pane's PTY thread. The lifecycle is not held across the
+///   deck's clearing event, and each key from its revalidation until it is
+///   accepted: queued on the pane's PTY thread, or held by a fence (Q35-17),
+///   in which case the question's `answer_queued` is set before the lifecycle
+///   is released. The lifecycle is not held across the
 ///   write itself, so the thread checks the key's question again before
 ///   writing it ([`AnswerGate`], audit T1) — against the record
 ///   [`Self::note_pending`] keeps, updated wherever the daemon changes which
@@ -7003,8 +7101,53 @@ pub struct QuestionAnswers {
     /// Shared with every [`AnswerGate`], which reads it on a PTY thread.
     raised: Arc<Mutex<HashMap<String, RaisedQuestion>>>,
     answered: Mutex<HashMap<String, AnsweredMark>>,
+    /// PRD #1666 part 3 (Q35-17): per pane, the accepted answer key that
+    /// holds the reservation ([`Self::reserve`]).
+    reserved: Arc<Mutex<HashMap<String, Reserved>>>,
+    acceptances: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     barriers: Mutex<HashMap<&'static str, QuestionBarrier>>,
+}
+
+/// The accepted answer key holding a pane's reservation
+/// ([`QuestionAnswers::reserve`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Reserved {
+    generation: String,
+    question_id: String,
+    revision: Option<u64>,
+    acceptance: u64,
+}
+
+/// PRD #1666 part 3 (Q35-17, core §8.4): an accepted answer key's
+/// reservation. Dropping it clears the pane's reservation when it is still
+/// this one, and nothing otherwise: a late end of an earlier key never
+/// clears a newer key's reservation.
+#[derive(Debug)]
+pub(crate) struct AnswerReservation {
+    reserved: Arc<Mutex<HashMap<String, Reserved>>>,
+    pane_id: String,
+    acceptance: u64,
+}
+
+impl Drop for AnswerReservation {
+    fn drop(&mut self) {
+        let mut reserved = self.reserved.lock().unwrap_or_else(|e| e.into_inner());
+        if reserved
+            .get(&self.pane_id)
+            .is_some_and(|held| held.acceptance == self.acceptance)
+            && let Some(held) = reserved.remove(&self.pane_id)
+        {
+            tracing::debug!(
+                pane_id = %self.pane_id,
+                generation = %held.generation,
+                question_id = %held.question_id,
+                revision = ?held.revision,
+                acceptance = held.acceptance,
+                "question: an accepted answer key settled; its reservation cleared"
+            );
+        }
+    }
 }
 
 /// See [`QuestionAnswers::arm_barrier`]: the "reached" sender and the
@@ -7047,6 +7190,11 @@ pub(crate) struct AnswerGate {
     pane_id: String,
     question_id: String,
     revision: Option<u64>,
+    /// PRD #1666 part 3 (Q35-17, core §8.4): the answer's reservation, which
+    /// clears when this gate is dropped: when the writer thread has checked
+    /// it and written the keys or not, or when they are dropped unwritten.
+    /// So it outlives a handler that stopped waiting for them.
+    reservation: Option<AnswerReservation>,
     /// Test seam: the PTY thread stops here before its check — see
     /// [`QuestionAnswers::arm_barrier`] and [`ANSWER_KEY_ON_PTY_THREAD`].
     #[cfg(test)]
@@ -7083,6 +7231,107 @@ pub(crate) enum AnswerWrite {
     /// acceptance: splitting them would break the answer's all-or-nothing
     /// write. Nothing was written.
     Refused,
+    /// PRD #1666 part 3 (Q35-17): a fence holds input, and the keys are held
+    /// behind it: their outcome comes later ([`HeldAnswerWrite::settled`]).
+    Held(HeldAnswerWrite),
+    /// The generation retired before the keys were accepted: nothing was
+    /// written.
+    Exited,
+    /// PRD #1666 part 3 (Q35-17): a fence holds input and has no room left
+    /// for the keys: refused, nothing written.
+    Full,
+}
+
+/// PRD #1666 part 3 (Q35-17, core §8.4): a voice answer's keys a fence
+/// accepted and holds.
+pub(crate) struct HeldAnswerWrite {
+    /// The human-input sequence number at their acceptance.
+    at: u64,
+    done: oneshot::Receiver<PtyJobDone>,
+}
+
+/// How a [`HeldAnswerWrite`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeldAnswerOutcome {
+    /// Written in full, after a release.
+    Written,
+    /// The question changed before the keys were reached: nothing written.
+    Superseded,
+    /// The PTY failed the write, after taking `accepted` bytes of it.
+    Failed { accepted: usize },
+    /// Dropped unwritten: the generation retired, or the release found its
+    /// target no longer writable.
+    Gone,
+}
+
+impl HeldAnswerWrite {
+    /// The human-input sequence number at the keys' acceptance.
+    pub(crate) fn at(&self) -> u64 {
+        self.at
+    }
+
+    /// Await the keys' physical outcome, holding nothing.
+    pub(crate) async fn settled(self) -> HeldAnswerOutcome {
+        match self.done.await {
+            Ok(PtyJobDone { result: Ok(()), .. }) => HeldAnswerOutcome::Written,
+            Ok(PtyJobDone {
+                result: Err(e),
+                accepted,
+                ..
+            }) => {
+                if e.get_ref()
+                    .is_some_and(|inner| inner.is::<AnswerSuperseded>())
+                {
+                    HeldAnswerOutcome::Superseded
+                } else {
+                    HeldAnswerOutcome::Failed { accepted }
+                }
+            }
+            Err(_) => HeldAnswerOutcome::Gone,
+        }
+    }
+}
+
+/// PRD #1666 part 3 (Q35-17): why a voice answer was refused when a fence
+/// holding input had no room for its keys.
+pub(crate) const ANSWER_INPUT_FULL: &str =
+    "the deck is holding the agent's input and has no room for the answer";
+
+/// Why a voice answer's key wasn't typed: its question changed first.
+pub(crate) const ANSWER_QUESTION_CHANGED: &str = "the question changed before the keys were typed";
+
+/// Why a voice answer's key wasn't typed: the PTY failed the write.
+pub(crate) const ANSWER_WRITE_FAILED: &str = "writing to the agent's terminal failed";
+
+/// A voice answer's key the PTY took ([`AgentPtyRegistry::write_answer_keys`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KeyWritten {
+    /// The human-input sequence number it was committed at: the one when it
+    /// was written, or when a fence accepted it (Q35-17).
+    pub(crate) at: u64,
+    /// A fence held it before it was written.
+    pub(crate) held: bool,
+}
+
+/// A voice answer's key that wasn't typed, in full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KeyNotWritten {
+    pub(crate) detail: &'static str,
+    /// A fence held it first (Q35-17).
+    pub(crate) held: bool,
+    /// What it comes to as an answer's physical outcome, were it the first
+    /// key ([`crate::question::SettlementOutcome`]).
+    pub(crate) outcome: crate::question::SettlementOutcome,
+}
+
+impl KeyNotWritten {
+    fn now(detail: &'static str, outcome: crate::question::SettlementOutcome) -> Self {
+        Self {
+            detail,
+            held: false,
+            outcome,
+        }
+    }
 }
 
 /// PRD #1666 part 3 (Q35-16, core §4.3): why a voice answer whose keys hold a
@@ -7147,6 +7396,48 @@ impl QuestionAnswers {
             pane_id: pane_id.to_string(),
             _held: lock.lock_owned().await,
         }
+    }
+
+    /// PRD #1666 part 3 (Q35-17, core §8.4): reserve `pane_id` for the answer
+    /// key `generation` is about to accept for `question_id` at `revision`,
+    /// replacing any reservation there. Taken under the pane's lifecycle, with
+    /// the agent's slot held.
+    pub(crate) fn reserve(
+        &self,
+        pane_id: &str,
+        generation: &str,
+        question_id: &str,
+        revision: Option<u64>,
+    ) -> AnswerReservation {
+        let acceptance = self.acceptances.fetch_add(1, Ordering::SeqCst) + 1;
+        self.reserved
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                pane_id.to_string(),
+                Reserved {
+                    generation: generation.to_string(),
+                    question_id: question_id.to_string(),
+                    revision,
+                    acceptance,
+                },
+            );
+        AnswerReservation {
+            reserved: Arc::clone(&self.reserved),
+            pane_id: pane_id.to_string(),
+            acceptance,
+        }
+    }
+
+    /// Whether an accepted answer key of `generation` still holds `pane_id`'s
+    /// reservation. A predecessor's on the same pane doesn't count: its key
+    /// can't reach the successor ([`PaneGate::retire`]).
+    pub fn answer_reserved(&self, pane_id: &str, generation: &str) -> bool {
+        self.reserved
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(pane_id)
+            .is_some_and(|held| held.generation == generation)
     }
 
     /// `agent_id`'s answer lock.
@@ -7303,6 +7594,7 @@ impl QuestionAnswers {
             pane_id: pane_id.to_string(),
             question_id: question_id.to_string(),
             revision,
+            reservation: None,
             #[cfg(test)]
             pause: self
                 .barriers
@@ -9831,7 +10123,18 @@ impl AgentPtyRegistry {
     /// ingested after that check is not stopped: the key is already going to
     /// the PTY, and only the next key's check detects the change. A redraw the
     /// agent makes with no hook is detected by neither check.
-    pub async fn write_answer_keys<Fut>(
+    ///
+    /// **Through a fence (PRD #1666 part 3, Q35-17, core §8.4).** While a
+    /// fence holds the pane's input, the key is accepted and held: the writer
+    /// is dropped, `held` runs under the lifecycle (the daemon marks the
+    /// question `answer_queued`), the lifecycle is dropped, and the outcome is
+    /// awaited outside every lock, so the pane's events, a question-clearing
+    /// one included, are ingested meanwhile and a release can take the writer.
+    /// The key carries the answer's reservation ([`QuestionAnswers::reserve`])
+    /// until its job ends. With no fence, nothing changes: acceptance is the
+    /// queueing, just before the write, and `held` doesn't run.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_answer_keys<Fut, HeldFut>(
         &self,
         agent_id: &str,
         pane_id: &str,
@@ -9839,44 +10142,107 @@ impl AgentPtyRegistry {
         revision: Option<u64>,
         keys: &[u8],
         revalidate: impl FnOnce() -> Fut,
-    ) -> Result<u64, &'static str>
+        held: impl FnOnce() -> HeldFut,
+    ) -> Result<KeyWritten, KeyNotWritten>
     where
         Fut: std::future::Future<Output = bool>,
+        HeldFut: std::future::Future<Output = ()>,
     {
+        use crate::question::SettlementOutcome;
         // PRD #1666 part 3, round 5-wake: a voice answer's keys are a human
         // operation on the agent's input, admitted before any await.
         let ticket = self.admit_ingress(agent_id);
-        let refuse = |ticket: Option<crate::ingress_ledger::TicketGuard>, why: &'static str| {
+        let refuse = |ticket: Option<crate::ingress_ledger::TicketGuard>,
+                      detail: &'static str,
+                      outcome: SettlementOutcome| {
             if let Some(ticket) = ticket {
-                ticket.refuse(why);
+                ticket.refuse(detail);
             }
-            Err(why)
+            Err(KeyNotWritten::now(detail, outcome))
         };
         let Some(target) = self.writer_target_for_agent(agent_id) else {
-            return refuse(ticket, "the agent is not running");
+            return refuse(
+                ticket,
+                "the agent is not running",
+                SettlementOutcome::Retired,
+            );
         };
         let writer = target.writer.lock().await;
         let lifecycle = self.question_answers.lock_lifecycle(pane_id).await;
         if target.exited.load(Ordering::SeqCst) {
-            return refuse(ticket, "the agent exited");
+            return refuse(ticket, "the agent exited", SettlementOutcome::Retired);
         }
         if !revalidate().await {
-            return refuse(ticket, "the question changed before the keys were typed");
+            return refuse(
+                ticket,
+                ANSWER_QUESTION_CHANGED,
+                SettlementOutcome::Superseded,
+            );
         }
         self.question_answers
             .barrier("answer_keys:revalidated")
             .await;
-        let gate = self
+        let mut gate = self
             .question_answers
             .answer_gate(pane_id, question_id, revision);
-        match writer
-            .write_answer(keys, gate, move || drop(lifecycle), ticket)
-            .await
-        {
-            Ok(AnswerWrite::Written(at)) => Ok(at),
-            Ok(AnswerWrite::Superseded) => Err("the question changed before the keys were typed"),
-            Ok(AnswerWrite::Refused) => Err(ANSWER_HOLDS_CTRL_G),
-            Err(_) => Err("writing to the agent's terminal failed"),
+        gate.reservation =
+            Some(
+                self.question_answers
+                    .reserve(pane_id, agent_id, question_id, revision),
+            );
+        let mut lifecycle = Some(lifecycle);
+        let wrote = writer
+            .write_answer(keys, gate, || drop(lifecycle.take()), ticket)
+            .await;
+        let failed = |detail| KeyNotWritten::now(detail, SettlementOutcome::WriteFailed);
+        let pending = match wrote {
+            Ok(AnswerWrite::Written(at)) => return Ok(KeyWritten { at, held: false }),
+            Ok(AnswerWrite::Superseded) => {
+                return Err(KeyNotWritten::now(
+                    ANSWER_QUESTION_CHANGED,
+                    SettlementOutcome::Superseded,
+                ));
+            }
+            Ok(AnswerWrite::Refused) => return Err(failed(ANSWER_HOLDS_CTRL_G)),
+            Ok(AnswerWrite::Full) => return Err(failed(ANSWER_INPUT_FULL)),
+            Ok(AnswerWrite::Exited) => {
+                return Err(KeyNotWritten::now(
+                    "the agent exited",
+                    SettlementOutcome::Retired,
+                ));
+            }
+            Err(_) => return Err(failed(ANSWER_WRITE_FAILED)),
+            Ok(AnswerWrite::Held(pending)) => pending,
+        };
+        // Q35-17 (core §8.4): accepted and held. A release needs the writer,
+        // and the pane's events need the lifecycle, so neither is kept across
+        // the wait; the question is marked queued first, under the lifecycle.
+        drop(writer);
+        held().await;
+        drop(lifecycle);
+        self.question_answers.barrier("answer_keys:held").await;
+        let at = pending.at();
+        let not_written = |detail, outcome| {
+            Err(KeyNotWritten {
+                detail,
+                held: true,
+                outcome,
+            })
+        };
+        match pending.settled().await {
+            HeldAnswerOutcome::Written => Ok(KeyWritten { at, held: true }),
+            HeldAnswerOutcome::Superseded => {
+                not_written(ANSWER_QUESTION_CHANGED, SettlementOutcome::Superseded)
+            }
+            HeldAnswerOutcome::Failed { accepted } => not_written(
+                ANSWER_WRITE_FAILED,
+                if accepted > 0 {
+                    SettlementOutcome::Partial
+                } else {
+                    SettlementOutcome::WriteFailed
+                },
+            ),
+            HeldAnswerOutcome::Gone => not_written("the agent exited", SettlementOutcome::Retired),
         }
     }
 

@@ -111,7 +111,9 @@ pub struct PendingQuestion {
     /// question and holds it until it can write it, so a client shows it as
     /// queued. Its outcome is an [`AnswerSettlement`] on the snapshot, never
     /// this flag clearing. Additive: an older reader ignores it and a
-    /// newer one reads its absence as not queued. No daemon sets it yet.
+    /// newer one reads its absence as not queued. Set while a fence holds
+    /// a key of the answer (Q35-17), and kept by a repeat of the question at
+    /// the same revision.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub answer_queued: bool,
 }
@@ -128,8 +130,8 @@ pub const ANSWER_SETTLEMENT_RETENTION: std::time::Duration = std::time::Duration
 /// the `client_token` its request carried
 /// (`crate::daemon_protocol::AttachRequest::AnswerQuestion`), so a client
 /// whose own request timed out learns the outcome of its own answer and of no
-/// other. A request without a token settles no entry. No daemon writes one
-/// yet.
+/// other. A request without a token settles no entry, and neither does an
+/// answer no fence held (Q35-17).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnswerSettlement {
     pub question_id: String,
@@ -649,6 +651,8 @@ impl PendingQuestion {
             raised_at_ms: 0,
             channel: AnswerChannel::Unknown,
             revision: None,
+            // The daemon's mark (Q35-17), not the producer's content.
+            answer_queued: false,
             tool: q.tool.clone().map(|tool| QuestionTool {
                 use_id: None,
                 ..tool

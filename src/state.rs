@@ -857,8 +857,10 @@ pub struct SessionSnapshot {
     pub input_held: Option<crate::inbox_display::InputHeld>,
     /// PRD #1666 part 3 (Q35): the outcomes of this pane's recently held
     /// answers that carried a client token, newest first, at most
-    /// [`crate::question::MAX_ANSWER_SETTLEMENTS`]. Additive, as
-    /// [`Self::input_held`] is; absent while empty. No daemon sets it yet.
+    /// [`crate::question::MAX_ANSWER_SETTLEMENTS`], each kept
+    /// [`crate::question::ANSWER_SETTLEMENT_RETENTION`]. Additive, as
+    /// [`Self::input_held`] is; absent while empty. The daemon fills it per
+    /// agent generation ([`AppState::live_session_for`], Q35-17).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub answer_settlements: Vec<crate::question::AnswerSettlement>,
 }
@@ -1176,8 +1178,9 @@ impl SessionState {
             pull_request_revision: Some(self.pull_request_revision),
             background: held.and_then(|(background, _)| background.filter(|b| !b.is_empty())),
             background_revision: held.map(|(_, revision)| revision),
-            // PRD #1666 part 3 (Q35): declared on the wire, set by no daemon
-            // yet.
+            // PRD #1666 part 3 (Q35): `input_held` is declared on the wire
+            // and set by no daemon yet; the settlements are the daemon's
+            // per generation, which `AppState::live_session_for` fills.
             input_held: None,
             answer_settlements: Vec::new(),
         }
@@ -2141,6 +2144,14 @@ pub struct AppState {
     /// Issue #1678: what the last applied event did to its card's background
     /// work — see [`Self::take_applied_background`].
     applied_background: Option<AppliedBackground>,
+    /// PRD #1666 part 3 (Q35-17): per agent generation, the settled answers a
+    /// fence held whose requests carried a client token, newest first, with
+    /// when each settled ([`Self::push_answer_settlement`]). Only the daemon
+    /// writes it; a client's own state keeps it empty.
+    answer_settlements: HashMap<
+        String,
+        std::collections::VecDeque<(std::time::Instant, crate::question::AnswerSettlement)>,
+    >,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -7212,8 +7223,82 @@ impl AppState {
                         session_id: session_id.clone(),
                         established_ms: established_at.timestamp_millis(),
                     });
+                // PRD #1666 part 3 (Q35-17): this generation's settled held
+                // answers.
+                snapshot.answer_settlements =
+                    self.answer_settlements_at(agent_id, std::time::Instant::now());
                 snapshot
             })
+    }
+
+    /// PRD #1666 part 3 (Q35-17, OQ6): record that an answer `generation`'s
+    /// pane held, whose request carried a client token, settled as
+    /// `settlement` says, at `now`. Each generation keeps its
+    /// [`crate::question::MAX_ANSWER_SETTLEMENTS`] most recent, each for
+    /// [`crate::question::ANSWER_SETTLEMENT_RETENTION`]; expired ones, any
+    /// generation's, are dropped here.
+    pub fn push_answer_settlement(
+        &mut self,
+        generation: &str,
+        settlement: crate::question::AnswerSettlement,
+        now: std::time::Instant,
+    ) {
+        let retention = crate::question::ANSWER_SETTLEMENT_RETENTION;
+        self.answer_settlements.retain(|_, kept| {
+            kept.retain(|(at, _)| now.saturating_duration_since(*at) < retention);
+            !kept.is_empty()
+        });
+        let kept = self
+            .answer_settlements
+            .entry(generation.to_string())
+            .or_default();
+        kept.push_front((now, settlement));
+        kept.truncate(crate::question::MAX_ANSWER_SETTLEMENTS);
+    }
+
+    /// PRD #1666 part 3 (Q35-17): `generation`'s settlements as of `now`,
+    /// newest first, without the expired ones.
+    pub fn answer_settlements_at(
+        &self,
+        generation: &str,
+        now: std::time::Instant,
+    ) -> Vec<crate::question::AnswerSettlement> {
+        self.answer_settlements
+            .get(generation)
+            .into_iter()
+            .flatten()
+            .filter(|(at, _)| {
+                now.saturating_duration_since(*at) < crate::question::ANSWER_SETTLEMENT_RETENTION
+            })
+            .map(|(_, settlement)| settlement.clone())
+            .collect()
+    }
+
+    /// PRD #1666 part 3 (Q35-17, OQ6): mark the question pending on `pane_id`
+    /// as `question_id` at `revision` as holding a queued answer, or not.
+    /// Nothing when another question, or another revision, is pending there:
+    /// the flag belongs to the revision the answer was accepted for. Whether
+    /// one was changed.
+    pub fn set_answer_queued(
+        &mut self,
+        pane_id: &str,
+        question_id: &str,
+        revision: Option<u64>,
+        queued: bool,
+    ) -> bool {
+        let mut changed = false;
+        for session in self.sessions.values_mut() {
+            if session.pane_id.as_deref() == Some(pane_id)
+                && let Some(question) = session
+                    .pending_question
+                    .as_mut()
+                    .filter(|q| q.id == question_id && q.revision == revision)
+            {
+                changed |= question.answer_queued != queued;
+                question.answer_queued = queued;
+            }
+        }
+        changed
     }
 
     /// PRD #1631 (audit T2): the pane of the session `session_id`, if it has

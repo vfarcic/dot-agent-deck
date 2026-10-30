@@ -2402,7 +2402,8 @@ pub(crate) fn note_pending_question(
 ///   same id and content ([`crate::question::PendingQuestion::same_content`]),
 ///   keeps that revision — and keeps a keyboard-only channel the daemon set on
 ///   it after typing part of an answer, so a repeat cannot make a half-typed
-///   form answerable again.
+///   form answerable again, and the `answer_queued` mark of an answer a fence
+///   holds (Q35-17).
 /// - Anything else is new content and gets a fresh revision; a hold on the old
 ///   one is then released by the reconciliation that follows the apply.
 ///
@@ -2426,6 +2427,12 @@ fn stamp_question_revision(
         (None, Some(current)) if current.revision.is_some() => current.revision,
         _ => Some(registry.question_holds().mint_revision()),
     };
+    // PRD #1666 part 3 (Q35-17): `answer_queued` is the daemon's, set while
+    // a fence holds an answer to this revision: a repeat keeps it, and a
+    // producer's copy never sets it.
+    question.answer_queued = current
+        .as_ref()
+        .is_some_and(|current| current.revision == question.revision && current.answer_queued);
     if let Some(current) = current
         && current.revision == question.revision
         && current.channel == crate::question::AnswerChannel::Unsupported

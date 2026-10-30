@@ -775,8 +775,9 @@ pub const CAP_ANSWER_QUESTION: &str = "answer-question";
 ///
 /// Names a FEATURE, like [`CAP_AUTHORING_KIND`] names a field: an older daemon
 /// drops the token silently and never reports a settlement, so a client
-/// sends the token only to a daemon whose `Hello` reply names this. No daemon
-/// advertises it yet.
+/// sends the token only to a daemon whose `Hello` reply names this. Advertised
+/// since Q35-17, on both platform lists: the `AnswerQuestion` arm that reads
+/// the token isn't platform-gated.
 pub const CAP_ANSWER_SETTLEMENT: &str = "answer-settlement";
 
 /// Capability string for [`AttachRequest::RecordOrchestratorContext`] (issue
@@ -1312,6 +1313,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_PREPARE_DEADLINE,
     CAP_LAST_COMMAND,
     CAP_ANSWER_QUESTION,
+    CAP_ANSWER_SETTLEMENT,
     CAP_RECORD_ORCHESTRATOR_CONTEXT,
     CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT,
     CAP_RESTART_DAEMON,
@@ -1336,6 +1338,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_LIST_DIRECTORIES_OPTIONS,
     CAP_LAST_COMMAND,
     CAP_ANSWER_QUESTION,
+    CAP_ANSWER_SETTLEMENT,
     CAP_RECORD_ORCHESTRATOR_CONTEXT,
     CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT,
     CAP_RESTART_DAEMON,
@@ -2820,7 +2823,7 @@ pub enum AttachRequest {
         /// [`crate::question::AnswerSettlement`]s after its request timed
         /// out. Sent only to a daemon advertising [`CAP_ANSWER_SETTLEMENT`];
         /// an older daemon drops the unknown key (this enum does not deny
-        /// unknown fields). No client sends it yet.
+        /// unknown fields). The desktop's voice answer sends it (Q35-10).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_token: Option<u64>,
     },
@@ -6961,22 +6964,34 @@ async fn handle_connection(
             answers,
             confirmed_always,
             revision,
-            // PRD #1666 part 3 (Q35): read once answers are held (Q35-17);
-            // until then a token names nothing this daemon settles.
-            client_token: _,
+            client_token,
         } => {
-            let resp = match answer_question_at(
-                &registry,
-                &state,
-                &event_tx,
-                &agent_id,
-                &question_id,
-                revision,
-                &answers,
-                confirmed_always,
-            )
-            .await
-            {
+            // PRD #1666 part 3 (Q35-17): on a task of its own, so an answer a
+            // fence holds settles, and its settlement is recorded, even when
+            // this connection goes before it does.
+            let answering = {
+                let (registry, state, event_tx) =
+                    (Arc::clone(&registry), state.clone(), event_tx.clone());
+                tokio::spawn(async move {
+                    answer_question_tokened_at(
+                        &registry,
+                        &state,
+                        &event_tx,
+                        &agent_id,
+                        &question_id,
+                        revision,
+                        &answers,
+                        confirmed_always,
+                        client_token,
+                    )
+                    .await
+                })
+            };
+            let resp = match answering.await.unwrap_or_else(|_| {
+                Err(crate::question::AnswerRefusal::WriteFailed {
+                    detail: "the deck's answer task ended".into(),
+                })
+            }) {
                 Ok(()) => AttachResponse::ok(),
                 Err(refusal) => AttachResponse {
                     ok: false,
@@ -7978,6 +7993,63 @@ pub(crate) async fn answer_question(
     .await
 }
 
+/// PRD #1666 part 3 (Q35-17, OQ6): settle an answer a fence held: name its
+/// physical `outcome` by the request's `client_token`, when it carried one,
+/// among `agent_id`'s settlements, and clear the question's `answer_queued`,
+/// in one state write so no snapshot shows the flag gone without the outcome.
+async fn settle_held_answer(
+    state: &SharedState,
+    agent_id: &str,
+    pane_id: &str,
+    question_id: &str,
+    revision: Option<u64>,
+    client_token: Option<u64>,
+    outcome: crate::question::SettlementOutcome,
+) {
+    let mut guard = state.write().await;
+    if let (Some(client_token), Some(revision)) = (client_token, revision) {
+        guard.push_answer_settlement(
+            agent_id,
+            crate::question::AnswerSettlement {
+                question_id: question_id.to_string(),
+                revision,
+                client_token,
+                outcome,
+            },
+            std::time::Instant::now(),
+        );
+    }
+    guard.set_answer_queued(pane_id, question_id, revision, false);
+}
+
+/// [`answer_question_tokened_at`] for a request with no client token, as
+/// every request before Q35-17 was.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn answer_question_at(
+    registry: &Arc<AgentPtyRegistry>,
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    agent_id: &str,
+    question_id: &str,
+    requested_revision: Option<u64>,
+    answers: &[crate::question::QuestionAnswer],
+    confirmed_always: bool,
+) -> Result<(), crate::question::AnswerRefusal> {
+    answer_question_tokened_at(
+        registry,
+        state,
+        event_tx,
+        agent_id,
+        question_id,
+        requested_revision,
+        answers,
+        confirmed_always,
+        None,
+    )
+    .await
+}
+
 /// PRD #1631: [`AttachRequest::AnswerQuestion`]'s handler.
 ///
 /// Refusal order: the agent, a pending question, the id and the revision the
@@ -8038,8 +8110,26 @@ pub(crate) async fn answer_question(
 /// before every key, against the sequence number the deck's previous key was
 /// committed at. When a write fails after some keys went in, the question is
 /// left pending but marked keyboard-only.
+///
+/// **A request that carried `client_token`** (PRD #1666 part 3, Q35-17, OQ6).
+///
+/// **Through a fence.** A key a fence holds is accepted: the question is
+/// marked `answer_queued`, the writer and the lifecycle are released, and the
+/// key's physical outcome is awaited outside them
+/// ([`AgentPtyRegistry::write_answer_keys`]). The reply still reports the
+/// actual outcome, as before. While the key is held another answer to the
+/// agent is refused [`AnswerRefusal::AnswerInProgress`], by its slot or, past
+/// a handler that stopped waiting, by its reservation.
+///
+/// **The settlement.** When any key of the answer was held, the answer's
+/// outcome — `Written`, `Partial`, `Superseded`, `Retired` or
+/// `WriteFailed` — is pushed to the agent's settlements, named by
+/// `client_token`, in the same state write that clears `answer_queued`, and
+/// before the deck's own event clears the question, so no snapshot shows the
+/// flag gone without the outcome. A request with no token settles as before,
+/// with no entry; an answer no fence held makes no entry either.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn answer_question_at(
+pub(crate) async fn answer_question_tokened_at(
     registry: &Arc<AgentPtyRegistry>,
     state: &SharedState,
     event_tx: &broadcast::Sender<BroadcastMsg>,
@@ -8048,8 +8138,11 @@ pub(crate) async fn answer_question_at(
     requested_revision: Option<u64>,
     answers: &[crate::question::QuestionAnswer],
     confirmed_always: bool,
+    client_token: Option<u64>,
 ) -> Result<(), crate::question::AnswerRefusal> {
-    use crate::question::{AnswerChannel, AnswerRefusal, OptionRole, QuestionReply};
+    use crate::question::{
+        AnswerChannel, AnswerRefusal, OptionRole, QuestionReply, SettlementOutcome,
+    };
     let record = registry
         .agent_records()
         .into_iter()
@@ -8063,6 +8156,11 @@ pub(crate) async fn answer_question_at(
     let _answering = slot
         .try_lock()
         .map_err(|_| AnswerRefusal::AnswerInProgress)?;
+    // Q35-17: a key a fence holds keeps the agent reserved until its job
+    // ends, even past a handler that stopped waiting for it.
+    if registry.question_answers().answer_reserved(pane, agent_id) {
+        return Err(AnswerRefusal::AnswerInProgress);
+    }
     let (session_id, agent_type, question) = {
         let guard = state.read().await;
         let (session_id, question) = guard
@@ -8167,6 +8265,20 @@ pub(crate) async fn answer_question_at(
             // The human-input sequence number the deck's own last key was
             // committed at (audit N1); `None` until one is.
             let mut committed: Option<u64> = None;
+            // Q35-17: a fence held one of the answer's keys, so its outcome
+            // is settled for the client that sent it.
+            let mut held_any = false;
+            let settle = |outcome: SettlementOutcome| {
+                settle_held_answer(
+                    state,
+                    agent_id,
+                    pane,
+                    &question.id,
+                    revision,
+                    client_token,
+                    outcome,
+                )
+            };
             // The mark this answer made covers the whole id from here, unless a
             // same-id replacement registered while the keys were being typed is
             // what is pending: that one was never answered (Qodo #1561). Asked
@@ -8200,6 +8312,14 @@ pub(crate) async fn answer_question_at(
                             .pending_question_for(agent_id, pane_id.as_deref())
                             .is_some_and(|(_, q)| q.id == question.id && q.revision == revision)
                 };
+                // Q35-17: a key a fence holds marks the question queued,
+                // under the lifecycle, before the lifecycle is released.
+                let queued = || async {
+                    state
+                        .write()
+                        .await
+                        .set_answer_queued(pane, &question.id, revision, true);
+                };
                 match registry
                     .write_answer_keys(
                         agent_id,
@@ -8208,20 +8328,32 @@ pub(crate) async fn answer_question_at(
                         revision,
                         key.as_bytes(),
                         still_ours,
+                        queued,
                     )
                     .await
                 {
-                    Ok(at) => {
+                    Ok(written) => {
+                        held_any |= written.held;
                         registry
                             .question_answers()
                             .barrier("answer_question:key_written")
                             .await;
-                        committed = Some(at);
+                        committed = Some(written.at);
                         registry
                             .question_answers()
                             .mark_answered(pane, &question.id, revision);
                     }
-                    Err(detail) => {
+                    Err(failure) => {
+                        held_any |= failure.held;
+                        let detail = failure.detail;
+                        if held_any {
+                            settle(if typed > 0 {
+                                SettlementOutcome::Partial
+                            } else {
+                                failure.outcome
+                            })
+                            .await;
+                        }
                         // Audit T1: with nothing typed, a question that is no
                         // longer this revision — registered again under its
                         // id, replaced, or cleared, before the key's check or
@@ -8318,6 +8450,11 @@ pub(crate) async fn answer_question_at(
                         return Err(refusal);
                     }
                 }
+            }
+            // Q35-17: every key is in; the settlement goes before the deck's
+            // own event below clears the question with its flag.
+            if held_any {
+                settle(SettlementOutcome::Written).await;
             }
         }
         AnswerChannel::Unsupported | AnswerChannel::Unknown => {

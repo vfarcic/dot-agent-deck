@@ -737,6 +737,7 @@ async fn probe_010_an_answer_holding_a_candidate_is_refused_while_a_liability_is
         pane_id: "p".into(),
         question_id: "q".into(),
         revision: None,
+        reservation: None,
         pause: None,
     };
     rig.liability();
