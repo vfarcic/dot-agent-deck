@@ -10566,15 +10566,123 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** automatic segment completion, query timeout duration, display of `input_held`, exact-once physical ticket accounting, count-cap fairness/reservation, query provenance on opposite sides of a trigger (coder's `011`), forced partial writes, or C1's responder. Explicit release substitutes for the later segment policy, and saturation of the replying connection is released by that control rather than a synthetic timeout claiming to be production authority. Q35-15 RED slice: fence/release/status are absent on its base.
 - **Platform coverage:** Linux.
 
+##### inbox/probe/026 — A live check preserves typing through injected loss mechanisms and applies only its own empty observation.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_live_segments.rs`, `tests/support/live_segments.rs`), except the 036 companion in `tests/e2e_input_fence.rs`.
+- **Agent:** native test executable with the reviewed F2 Python composer and real installed helper/editor; no real agent or credential.
+- **Asserts:** H-chunk, H-flush and H-ignore under a witnessed delayed dispatch retain two distinct human frames in order; a foreign acceptance keeps observed unchanged; the empty control covers its own probe byte; repeated epoch reads are inert and a stale-generation read refuses.
+- **Does not assert:** Mail delivery after the check (S-21), physical short-write accounting or generated property oracles. On the pre-Q35-20 base, the live request/epoch contracts are intentionally RED at the missing operations; later assertions await the coder's GREEN run. The standalone helper/lifecycle controls can already pass.
+- **Platform coverage:** Linux.
+
+##### inbox/probe/027 — Human Ctrl+G candidates hand their suffix to the running user editor.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_live_segments.rs`, `tests/support/live_segments.rs`), except the 036 companion in `tests/e2e_input_fence.rs`.
+- **Agent:** native test executable with the reviewed F2 Python composer and real installed helper/editor; no real agent or credential.
+- **Asserts:** The native-F2 no-arm control passes the actual draft and three tty descriptors through the installed helper; raw BEL, lower CSI-u, lower modifyOtherKeys and upper CSI-u forms, whole and split, dispatch a waiting HumanG separately and deliver the suffix to the actual editor.
+- **Does not assert:** The remaining keyboard forms, real agents or a universal assertion about read chunk boundaries. On the pre-Q35-20 base, the live request/epoch contracts are intentionally RED at the missing operations; later assertions await the coder's GREEN run. The standalone helper/lifecycle controls can already pass.
+- **Platform coverage:** Linux.
+
+##### inbox/probe/028 — An ignored check holds typing until the generation is replaced.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_live_segments.rs`, `tests/support/live_segments.rs`), except the 036 companion in `tests/e2e_input_fence.rs`.
+- **Agent:** native test executable with the reviewed F2 Python composer and real installed helper/editor; no real agent or credential.
+- **Asserts:** A dropped candidate leaves keys pending, publishes held input after the display delay and sends no held key into its successor.
+- **Does not assert:** The card hold reason or delivery authority (S-21), or timer-based release. On the pre-Q35-20 base, the live request/epoch contracts are intentionally RED at the missing operations; later assertions await the coder's GREEN run. The standalone helper/lifecycle controls can already pass.
+- **Platform coverage:** Linux.
+
+##### inbox/probe/029 — Codex typing waits for the matched complete return.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_live_segments.rs`, `tests/support/live_segments.rs`), except the 036 companion in `tests/e2e_input_fence.rs`.
+- **Agent:** native test executable with the reviewed F2 Python composer and real installed helper/editor; no real agent or credential.
+- **Asserts:** The real helper exits while its composer return is held; typed keys remain absent until the complete return and arrive once after it.
+- **Does not assert:** A real Codex premise, E-MF verification, or the separate gated-flush row (051). On the pre-Q35-20 base, the live request/epoch contracts are intentionally RED at the missing operations; later assertions await the coder's GREEN run. The standalone helper/lifecycle controls can already pass.
+- **Platform coverage:** Linux.
+
+##### inbox/probe/030 — A Claude lapse retries only while nothing waits behind it.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_live_segments.rs`, `tests/support/live_segments.rs`), except the 036 companion in `tests/e2e_input_fence.rs`.
+- **Agent:** native test executable with the reviewed F2 Python composer and real installed helper/editor; no real agent or credential.
+- **Asserts:** After a real T_TRIGGER lapse, a retry writes its second probe and runs the actual helper with nothing held; holding human keys prevents that retry.
+- **Does not assert:** Unattended mail delivery (S-21), accelerated clocks, or the Broken presentation bit's live retry history. On the pre-Q35-20 base, the live request/epoch contracts are intentionally RED at the missing operations; later assertions await the coder's GREEN run. The standalone helper/lifecycle controls can already pass.
+- **Platform coverage:** Linux.
+
+##### inbox/probe/031 — A dropped Codex trigger retains human input through retirement.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_live_segments.rs`, `tests/support/live_segments.rs`), except the 036 companion in `tests/e2e_input_fence.rs`.
+- **Agent:** native test executable with the reviewed F2 Python composer and real installed helper/editor; no real agent or credential.
+- **Asserts:** The unresolved live segment holds human keys and sends none into its replacement. The existing answer/fence lifecycle companions remain in 036 and question/answer/023.
+- **Does not assert:** A deck line accepted through a live segment, delivery after E1 (S-21), or U-R. On the pre-Q35-20 base, the live request/epoch contracts are intentionally RED at the missing operations; later assertions await the coder's GREEN run. The standalone helper/lifecycle controls can already pass.
+- **Platform coverage:** Linux.
+
+##### inbox/probe/032 — The live probe paths respect native backlog and overflow hazards.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_live_segments.rs`, `tests/support/live_segments.rs`), except the 036 companion in `tests/e2e_input_fence.rs`.
+- **Agent:** native test executable with the reviewed F2 Python composer and real installed helper/editor; no real agent or credential.
+- **Asserts:** A native candidate latched during CPR refuses first/retry requests, remains hazardous after the CPR response and quiet timeout, and recovers on replacement; counted native FIFO overflow does not age into permission; exemption-ledger saturation alone admits, while an actual native hazard refuses.
+- **Does not assert:** C1, the card CannotCheck reason (S-21), artificial exhaustion of u64 numbering, or measured availability. On the pre-Q35-20 base, the live request/epoch contracts are intentionally RED at the missing operations; later assertions await the coder's GREEN run. The standalone helper/lifecycle controls can already pass.
+- **Platform coverage:** Linux.
+
+##### inbox/probe/036 — Retirement ends held typing, a tokened answer and a Full waiter together.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_input_fence.rs`, `tests/support/input_fence.rs`), the existing native recorder and real attach connections.
+- **Agent:** native test executable with the real installed generation and a synthetic keyboard question; no real agent or credential.
+- **Asserts:** L2 in tests/e2e_input_fence.rs extends the existing native recorder: hold an answer plus a paste filling the fence and a third producer waiting Full, replace the generation, receive an honest answer outcome and both connection ends, and observe only fresh successor bytes with no predecessor settlement.
+- **Does not assert:** A live probe arm interleaving, a public per-ticket callback count, or partial-write fault injection. On the pre-Q35-20 base, the live request/epoch contracts are intentionally RED at the missing operations; later assertions await the coder's GREEN run. The standalone helper/lifecycle controls can already pass.
+- **Platform coverage:** Linux.
+
+##### inbox/probe/046 — The attached real TUI displays and clears live held typing, then reports retirement loss.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_live_segments.rs`, `tests/support/live_segments.rs`), except the 036 companion in `tests/e2e_input_fence.rs`.
+- **Agent:** native test executable with the reviewed F2 Python composer and real installed helper/editor; no real agent or credential.
+- **Asserts:** A PTY/vt100 TuiDeck attaches to the real sandbox daemon; delayed-dispatch typing produces shared held-input words, release clears them and retirement reports typing as not delivered; the successor capture stays empty.
+- **Does not assert:** The desktop client, S-21's mail hold reason, or a real-agent reel clip. On the pre-Q35-20 base, the live request/epoch contracts are intentionally RED at the missing operations; later assertions await the coder's GREEN run. The standalone helper/lifecycle controls can already pass.
+- **Platform coverage:** Linux.
+
+##### inbox/probe/048 — Both external-edit producers move the foreign epoch.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_live_segments.rs`, `tests/support/live_segments.rs`), except the 036 companion in `tests/e2e_input_fence.rs`.
+- **Agent:** native test executable with the reviewed F2 Python composer and real installed helper/editor; no real agent or credential.
+- **Asserts:** Read-only epoch checks around an unreported external editor, including immediate completion, require one native input plus one unmatched ExternalEdit movement without observed advancing.
+- **Does not assert:** Delivery or a later attempt's decision (S-21), or a guaranteed exit-before-scan interleaving. On the pre-Q35-20 base, the live request/epoch contracts are intentionally RED at the missing operations; later assertions await the coder's GREEN run. The standalone helper/lifecycle controls can already pass.
+- **Platform coverage:** Linux.
+
+##### inbox/probe/049 — Failed editor outcomes and incomplete marker histories grant no early release.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_live_segments.rs`, `tests/support/live_segments.rs`), except the 036 companion in `tests/e2e_input_fence.rs`.
+- **Agent:** native test executable with the reviewed F2 Python composer and real installed helper/editor; no real agent or credential.
+- **Asserts:** Pre-trigger complete mode pairs cannot be reused; incomplete or malformed post-trigger markers keep Codex typing held. After a failed spawn or a wait failure following real spawn on a HumanG, production Hold policy retains its suffix even after the complete return and retires it without a successor write.
+- **Does not assert:** Authority-policy failed-start release, foreign complete pairs inside the disclosed R-XW0 residual, a privately injected record mismatch, or the coder's generated release-authority oracle. On the pre-Q35-20 base, the live request/epoch contracts are intentionally RED at the missing operations; later assertions await the coder's GREEN run. The standalone helper/lifecycle controls can already pass.
+- **Platform coverage:** Linux.
+
+##### inbox/probe/051 — Codex re-enable alone cannot release typing into its pending terminal flush.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_live_segments.rs`, `tests/support/live_segments.rs`), except the 036 companion in `tests/e2e_input_fence.rs`.
+- **Agent:** native test executable with the reviewed F2 Python composer and real installed helper/editor; no real agent or credential.
+- **Asserts:** The local fixture emits re-enable before a witnessed real tcflush, pauses that flush, accepts human typing, and then requires every key once after the flush and next redraw marker.
+- **Does not assert:** A real Codex, frontier premise verification, or EC policy activation. On the pre-Q35-20 base, the live request/epoch contracts are intentionally RED at the missing operations; later assertions await the coder's GREEN run. The standalone helper/lifecycle controls can already pass.
+- **Platform coverage:** Linux.
+
+##### inbox/probe/057 — Pending helper recovery, decisionless exit and real E2 preserve their distinct outcomes.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_live_segments.rs`, `tests/support/live_segments.rs`), except the 036 companion in `tests/e2e_input_fence.rs`.
+- **Agent:** native test executable with the reviewed F2 Python composer and real installed helper/editor; no real agent or credential.
+- **Asserts:** A real helper paused before arm load is seen Pending before foreign return noise and held typing; Armed recovery delivers the keys and admits a second check. A captured decisionless helper exit opens scope and refuses the next probe. Separately the installed Armed helper is stopped after actual liability consumption, then E2 must kill it with SIGKILL; an unarmed editor waiting beyond that bound must survive and finish normally.
+- **Does not assert:** Background survivors, cap-dropped or cross-record server histories, namespace setup, report-before-decision reordering, or EC Authority-policy matrices. On the pre-Q35-20 base, the live request/epoch contracts are intentionally RED at the missing operations; later assertions await the coder's GREEN run. The standalone helper/lifecycle controls can already pass.
+- **Platform coverage:** Linux.
+
+
 ##### inbox/probe/059 — Probe admission is rechecked in a scripted writer section after scope, required completion, physical boundary, estimate or generation changes.
 
 - **Layer:** Synthetic interface contracts, lane 1 (`tests/e2e_probe_admission.rs`, gated by `e2e`), public `GenerationInput`, `Seam` and `probe::start` interfaces with a recording page and a scripted byte sink; no daemon or PTY, so these are not PTY L2 coverage.
 - **Agent:** none; no credential.
 - **Asserts:** first probes, retries and lapse retries scheduled before a scope becomes Pending or Open refuse with no publication or scripted probe byte; an incomplete required owned invocation does the same until its matched helper-only completion is supplied. Pruning a non-required tool record after Survivors, missing report or Unarmed/SpawnFailed leaves its scope refusal; an identity-refused scan alone permits a probe. The writer's lone ESC, inside-sequence boundary and retired context refuse; O5 uses the estimate moved after scheduling, writes nothing while refusing and admits at its new deadline. Retirement before the arm leaves the page untouched. Retirement launched from the publication callback before its store must order after the arm's successful raise rather than make an already published arm refuse; a bounded channel wait permits retirement to block behind the transaction. Fresh-generation controls publish and write once.
 - **Does not assert:** that a live writer calls these interfaces, live first/retry/lapse submission, automatic fence/segment creation or undo, live scope recognition from real helpers, card causes, prompt hand-over or delivery, the main-composer screen recognizer, physical PTY bytes or the real mapped arm page. Those remain S-20/S-21 integration rows; the byte sink writes only when the pure start returns Started. The publication race is expected RED on `7fea52a9` (retirement completes during publication, then the raise returns Stale). The bounded wait is an interleaving aid, not a measured scheduler bound.
-- **Platform coverage:** all.
+- **S-20 live additions:** `tests/e2e_live_segments.rs` requests checks through the real binary's ordinary writer path, reads the real mapped page to retain nonzero seg_seq through count-only and native-number publications, queues ordinary mail to test the automatic tick, and changes scope through a real helper between live scheduling and the writer. The e2e-only request, read-only epoch/observer operations and bounded scheduled barrier are explicit contracts in that test file. These integration assertions are RED until Q35-20; they do not certify the remaining arm/CAS/undo interleavings or privately injected record histories listed above.
+- **Platform coverage:** all for the pure interfaces; Linux for the S-20 live additions.
 
 ##### inbox/probe/061 — OSC reply classification survives saturation and delayed writes, with native numbering outside checks and candidate cuts inside them.
+
+- **S-20 live admission:** `probe_061_live_admission_reads_actual_osc_reply_and_native_histories` in `tests/e2e_live_segments.rs` adds real attach OSC 10 whole retained BEL/ST replies and a raw native BEL, then requests a real probe. It pins immediate admission for the report controls and quiet-period refusal followed by expiry recovery for the native key; the broader split/saturation physical classification matrix remains in the existing recorder functions below. It does not claim automatic in-check HumanG completion for every OSC variant.
 
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_input_fence.rs`, `tests/support/input_fence.rs`), the real daemon, attach input/output and a native raw-terminal recorder, with installation under the existing `claude@2.1.310` e2e assumption.
 - **Agent:** a copy of the test executable, not a real agent; no credential.
@@ -12318,6 +12426,8 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Platform coverage:** mac+linux.
 
 ##### question/answer/023 — A released voice client's fenced answer remains unconfirmed until its physical outcome.
+
+- **S-20 lifecycle additions:** `question_answer_023_tokened_disconnect_keeps_accepted_answer_owned` cancels a current tokened client only after acceptance and requires one physical digit and one matching Written settlement after release. `question_answer_023_a_full_fence_refuses_the_answer_without_a_digit` requires prompt input-full refusal with no answer digit or written settlement; the original paste still arrives exactly. The frozen released-client functions below remain unchanged. Partial/WriteFailed fault injection on an accepted held answer is not covered by these additions.
 - **Layer:** L2 lane 1 (`tests/e2e_input_fence.rs`, native raw-terminal recorder and the spawned daemon).
 - **Agent:** none; synthetic recorder, no voice hardware.
 - **Control:** `question_answer_023_released_client_open_control` runs the frozen sender without a fence, verifies one terminal digit, and checks that its request has no token and its snapshot has no settlement entry.
