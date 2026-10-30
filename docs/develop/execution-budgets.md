@@ -47,7 +47,7 @@ This page is the evidence for PRD #635's discovery. It covers:
   - It starts when the worker acknowledges the task, not when the task is sent.
   - It posts one notice per delegation to the orchestrator that delegated, then nothing more.
   - It stops nothing.
-  - The value is re-read from the orchestration's directory, then the worker's, on every delegate. See [override](#override-who-can-raise-a-limit).
+  - The value is re-read from the orchestration's directory, then the worker's, on every delegate. See the override row under [hard cases](#hard-cases).
 - **Waiting for input:** the orchestrator is told after 30 s, at most once per four such windows per worker.
 - **Blocked by a provider limit** (#714):
   - **Detection:** Claude Code, Codex and OpenCode report a usage limit or depleted credits through structured signals. The card then reads Blocked with the reset time, and the orchestrator gets one notice per outstanding delegation.
@@ -214,7 +214,14 @@ Each run started `claude -p` with Haiku in its own session (`setsid`), as the de
 
 ### Replaying the sample against candidate limits
 
-Each work item below is one worktree. The figures are from the replay.
+Each work item below is one worktree. The figures are from the replay. How a work item's figures are built from its sessions (`analyse.py`):
+
+- **Active time per item** is the **sum** of its sessions' active time, with overlapping sessions each counted in full. For a team, it is agent-hours, not hours a person waited. It is an upper bound on the item's busy wall time.
+- **Wall-time span per item** runs from the first session's start to the last session's end, with overlaps counted once.
+- **Sessions at once per item** is the peak number of the item's sessions whose spans (first event to last event) overlap.
+- **Estimated cost per item** is the sum of Claude Code's own per-session estimates.
+
+A limit on busy wall time, with overlaps counted once, would sit between the two time rows. It would hit no more items than the summed active-time row, because a union of intervals is never longer than their sum.
 
 - **Outcomes:** 197 of the 241 non-main worktrees reached a merged pull request on their branch. 3 had only closed, unmerged ones. 41 had no pull request of their own: most were reviews, rebases and fixes of someone else's pull request, which #633 also found.
 - **Per work item:** median 1 session and 0.7 h active (90th percentile: 13 sessions, 2.4 h active, a peak of 3 sessions at once). Claude Code's estimated cost has a median of $7 and a 90th percentile of $26.
