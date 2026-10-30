@@ -1065,24 +1065,79 @@ impl GenerationInput {
         outside: &admission::Outside,
         now: Instant,
     ) -> Result<(), admission::Refusal> {
-        let inside = {
-            let state = self.state.lock_recovering();
-            let records = match (state.retired, state.records.as_ref()) {
-                (false, Some(records)) => Some(records),
-                _ => None,
-            };
-            admission::Inside {
-                retired: state.retired,
-                records: records.map_or(Err(Hold::Retired), Records::admits),
-                exhausted: state.hazards.exhausted(),
-                hazards_clear: state.hazards.clear_at(now),
-                count: records.map_or(0, Records::count),
-                epoch: state.epoch.epoch(),
-                backlog: state.backlog.holds(),
-                estimate: state.estimate.estimate(),
-            }
+        Self::admit_locked(&self.state.lock_recovering(), outside, now)
+    }
+
+    /// Admission over `state`, read in the caller's hold of the lock.
+    fn admit_locked(
+        state: &State,
+        outside: &admission::Outside,
+        now: Instant,
+    ) -> Result<(), admission::Refusal> {
+        let records = match (state.retired, state.records.as_ref()) {
+            (false, Some(records)) => Some(records),
+            _ => None,
+        };
+        let inside = admission::Inside {
+            retired: state.retired,
+            records: records.map_or(Err(Hold::Retired), Records::admits),
+            exhausted: state.hazards.exhausted(),
+            hazards_clear: state.hazards.clear_at(now),
+            count: records.map_or(0, Records::count),
+            epoch: state.epoch.epoch(),
+            backlog: state.backlog.holds(),
+            estimate: state.estimate.estimate(),
         };
         admission::admit(&inside, outside, now)
+    }
+
+    /// **The arm increment's records half** (Q35-19, A4 §4; the Q35-19
+    /// review's U2): in one hold of this lock, ask admission with `outside`
+    /// at `now`, check that the raise can be recorded, hand `publish` the
+    /// raised count to store, and record the raise stamped after the store.
+    /// Retirement takes this lock too, so it lands wholly before the arm,
+    /// which then refuses `Retired` and publishes nothing, or wholly after
+    /// it, when the arm stands complete and the records it raised go with
+    /// the generation. A refusal calls `publish` not at all. `publish` runs
+    /// under this lock: it may store to the page, which takes no lock, and
+    /// must not take one.
+    pub fn arm_probe(
+        &self,
+        generation: u64,
+        outside: &admission::Outside,
+        now: Instant,
+        publish: impl FnOnce(u32),
+    ) -> Result<u32, admission::Refusal> {
+        let mut state = self.state.lock_recovering();
+        Self::admit_locked(&state, outside, now)?;
+        Self::raise_locked(&mut state, generation, publish).map_err(admission::Refusal::Raise)
+    }
+
+    /// The raise with no admission, for the `e2e` build's control verb: the
+    /// same single critical section as [`Self::arm_probe`]'s, so retirement
+    /// can't land between the store and the record either.
+    pub fn raise_published(
+        &self,
+        generation: u64,
+        publish: impl FnOnce(u32),
+    ) -> Result<u32, Refusal> {
+        Self::raise_locked(&mut self.state.lock_recovering(), generation, publish)
+    }
+
+    /// Check the raise, store it with `publish`, then record it, stamped
+    /// after the store: nothing refuses once `publish` ran.
+    fn raise_locked(
+        state: &mut State,
+        generation: u64,
+        publish: impl FnOnce(u32),
+    ) -> Result<u32, Refusal> {
+        let records = match (state.retired, state.records.as_mut()) {
+            (false, Some(records)) => records,
+            _ => return Err(Refusal::Stale),
+        };
+        let raised = records.can_raise(generation)?;
+        publish(raised);
+        records.raise(generation, Instant::now())
     }
 
     /// See [`Records::first_stop`].

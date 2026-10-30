@@ -870,17 +870,32 @@ impl<P: Page> Seam<P> {
     /// writer scope or leave a record incomplete holds too, so none lands
     /// between the check and the publication; a native candidate enters the
     /// hazard FIFO only from the writer thread, which is the one running
-    /// this. What the output hook can change in between (`B`, a `Quiet`
-    /// entry latching) could as well land just after the byte. A refusal
-    /// publishes nothing and records nothing. The new count.
+    /// this. The check, the publication and the record are one critical
+    /// section of the generation's input lock ([`GenerationInput::arm_probe`]),
+    /// which retirement takes as well (the Q35-19 review's U2), so a
+    /// retirement lands before the arm, which then refuses, or after it.
+    /// What the output hook can change in between (`B`, a `Quiet` entry
+    /// latching) could as well land just after the byte. **A refusal
+    /// publishes nothing and records nothing**: every refusal, retirement's
+    /// included, comes before the store. The new count.
     pub fn arm(
         &mut self,
         seg_seq: u64,
         outside: &Outside,
         now: Instant,
     ) -> Result<u32, AdmissionRefusal> {
-        self.admits(outside, now)?;
-        self.raise(seg_seq).map_err(AdmissionRefusal::Raise)
+        let outside = Outside {
+            permission: self.permission,
+            ..*outside
+        };
+        let input = Arc::clone(&self.input);
+        let page = &mut self.page;
+        let raised = input.arm_probe(self.generation, &outside, now, |raised| {
+            page.publish_probe(raised, seg_seq);
+        })?;
+        self.published = raised;
+        self.seg_seq = seg_seq;
+        Ok(raised)
     }
 
     /// The take-back of an arm whose job a withdrawal won after
@@ -895,17 +910,18 @@ impl<P: Page> Seam<P> {
     }
 
     /// One more liability on the page with `seg_seq`, a store from zero
-    /// stamped after it: the only raise of the count, for [`Self::arm`] and
-    /// the `e2e` build's control verb ([`Self::control`]).
+    /// stamped after it, for the `e2e` build's control verb
+    /// ([`Self::control`]): the same critical section as [`Self::arm`]'s,
+    /// with no admission. The new count.
     fn raise(&mut self, seg_seq: u64) -> Result<u32, Refusal> {
-        let count = self.input.liability_count().ok_or(Refusal::Stale)?;
-        let raised = count.checked_add(1).ok_or(Refusal::Count)?;
-        self.page.publish_probe(raised, seg_seq);
+        let input = Arc::clone(&self.input);
+        let page = &mut self.page;
+        let raised = input.raise_published(self.generation, |raised| {
+            page.publish_probe(raised, seg_seq);
+        })?;
         self.published = raised;
         self.seg_seq = seg_seq;
-        let recorded = self.input.liability_raise(self.generation, Instant::now());
-        self.sync();
-        recorded
+        Ok(raised)
     }
 
     /// Publish the records' count if the page doesn't show it.

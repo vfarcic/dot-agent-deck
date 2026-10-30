@@ -11,6 +11,12 @@
 //! page's count goes up only in `super::observe::Seam::arm`, which asks it
 //! again first, on the writer thread, in the section that publishes the arm
 //! (A5 §1.5). So a refusal writes no probe byte and changes no arm word.
+//! That holds for a retirement racing the arm too: the arm's check, page
+//! store and record are one critical section of the input lock
+//! (`GenerationInput::arm_probe`), which retirement also takes, so it lands
+//! before the check, which refuses, or after the record, when the arm is
+//! complete. A refusal of the section's own raise (the count's bound, a
+//! stale generation) is decided before the store as well.
 //!
 //! **The conjuncts, in the order they are asked** (each refusal names the
 //! first that failed):
@@ -532,6 +538,34 @@ mod tests {
         assert_eq!(ask(&physical), Err(Refusal::OffGround(Boundary::Inside)));
         tracker.written(b"A", &physical);
         assert_eq!(ask(&physical), Ok(()));
+    }
+
+    /// Scenario: Arm through the generation's input with a refusal the raise itself makes after admission admits: the arm names a generation other than its records', and, separately, the generation retires before the arm. Each refuses before the page is stored, so the publication is never called; a matching arm calls it once with the raised count, then records it.
+    #[spec("inbox/probe/077")]
+    #[test]
+    fn probe_077_an_arm_refused_after_admission_publishes_nothing() {
+        let now = Instant::now();
+        let input = generation();
+        let mut stored = Vec::new();
+        assert_eq!(
+            input.arm_probe(G + 1, &outside(), now, |n| stored.push(n)),
+            Err(Refusal::Raise(
+                crate::composer_probe::record::Refusal::Stale
+            ))
+        );
+        assert!(stored.is_empty(), "nothing stored for a refused raise");
+        assert_eq!(
+            input.arm_probe(G, &outside(), now, |n| stored.push(n)),
+            Ok(1)
+        );
+        assert_eq!(stored, [1]);
+        assert_eq!(input.liability_count(), Some(1));
+        input.retire();
+        assert_eq!(
+            input.arm_probe(G, &outside(), now, |n| stored.push(n)),
+            Err(Refusal::Retired)
+        );
+        assert_eq!(stored, [1]);
     }
 
     /// Scenario: On a live generation, note more D3′ queries than the exemption ledger keeps, so it saturates, with no native Ctrl+G accepted; then note a CPR so `B` holds. Admission admits a first probe in both states, and refuses only the lapse retry once `B` holds.

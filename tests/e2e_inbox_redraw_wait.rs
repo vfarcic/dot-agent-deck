@@ -32,8 +32,12 @@ const NUDGE: &str = "doorbell evidence-refresh nudge";
 const RING_WAIT: Duration = Duration::from_secs(30);
 /// How long to watch for a second nudge after the first: past the estimate
 /// the first nudge's own two size changes move (one wait each, plus the
-/// margin), with scheduling headroom, so it is the once-per-episode guard
-/// that keeps a second one away, not the estimate.
+/// margin), with 3 s of scheduling headroom. That is headroom for the
+/// controlled timing of these runs, not a bound for every interleaving: the
+/// watch starts at the nudge's log line, which precedes its two size
+/// changes, and a delay in applying them, or a late stand-in report, moves
+/// the estimate later. Within that, the once-per-episode guard is what keeps
+/// a second nudge away.
 const AFTER_NUDGE: Duration = Duration::from_millis(2 * 2000 + 1500 + 3000);
 
 /// One sandbox daemon with its log at debug for the doorbell.
@@ -161,7 +165,7 @@ fn probe_055_a_burst_of_five_resizes_needs_no_nudge() {
     );
 }
 
-/// Scenario: Start a CPR stand-in that never redraws after a size change, Idle; resize its terminal once and queue a task. The deck nudges it once, no earlier than 2 s plus the 1.5 s margin after the resize, and not again in the 8.5 s after that nudge, past the estimate its own two size changes move, while its screen stays stale, so the task stays queued.
+/// Scenario: Start a CPR stand-in that never redraws after a size change, Idle; resize its terminal once and queue a task. The deck nudges it once, no earlier than 2 s plus the 1.5 s margin after the resize, and not again in the 8.5 s after that nudge, a window past the estimate its own two size changes move when they're applied promptly, while its screen stays stale, so the task stays queued.
 #[spec("inbox/probe/055")]
 #[test]
 fn probe_055_an_agent_that_never_redraws_is_nudged_once_at_its_estimate() {

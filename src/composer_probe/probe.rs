@@ -28,9 +28,13 @@
 //! step, then every [`BACKOFF_LAST`]. After [`BROKEN_AFTER`] failures in a
 //! row the generation's observer is broken, which its caller shows and logs;
 //! the waits go on as above, and a person's op makes one fresh attempt due
-//! at once, so a repaired daemon or a transient failure recovers. R2 §6.8
-//! says both "broken after three failures" and "10 min, then every 30 min";
-//! this reading keeps both: broken is a state to show, not a stop. A due
+//! at once, so a repaired daemon or a transient failure recovers. R2 §6.8's
+//! rule that three failures make the observer broken until a person retries
+//! is superseded by R5's continuing retries (R5's reconciliation table), and
+//! the waits here continue. The `broken` bit is kept only as presentation:
+//! shown and logged, read by no wait and by no admission conjunct. Q35-20
+//! must not feed it back as an "observer isn't broken" admission condition,
+//! which would stop the continuing retries at the third failure. A due
 //! attempt is still only an attempt: admission decides. Arithmetic past
 //! `Instant`'s range leaves the attempt undue, failing toward fewer probes.
 
@@ -378,7 +382,7 @@ mod tests {
         assert_eq!(seam.lock().unwrap().input().liability_count(), Some(0));
     }
 
-    /// Scenario: Read the crate's production sources. The records' raise is called in exactly one place, through the input's wrapper, whose one caller is the seam's own raise; that raise is called only by the arm section, after it asks admission, and by the `e2e` build's control verb; admission's predicate is called only by the generation's read of it, which only the seam's admission check calls, which the arm section calls first.
+    /// Scenario: Read the crate's production sources. The records' raise is recorded in exactly one place, the input's locked raise, which only the arm and the `e2e` control verb's raise reach; the arm asks admission first in the same hold of the input lock, and the raise without a publication has no production caller. Admission's predicate is called only by the generation's locked read of it, which the admission check and the arm share.
     #[spec("inbox/probe/078")]
     #[test]
     fn probe_078_the_arm_increment_has_one_call_site() {
@@ -424,41 +428,65 @@ mod tests {
 
         assert_eq!(
             names(sites(".liability_raise(")),
-            ["observe.rs"],
-            "the records' raise has one caller"
+            Vec::<String>::new(),
+            "the raise without a publication has no production caller"
         );
         assert_eq!(
-            names(sites("r.raise(")),
+            names(sites("records.raise(")),
             ["epoch.rs"],
-            "the records' own raise has one caller, the wrapper"
+            "the records' raise is recorded in one place, the locked raise"
         );
+        assert_eq!(
+            names(sites("Self::raise_locked(")),
+            ["epoch.rs", "epoch.rs"],
+            "the locked raise: the arm and the control verb's raise"
+        );
+        assert_eq!(names(sites(".arm_probe(")), ["observe.rs"]);
+        assert_eq!(names(sites(".raise_published(")), ["observe.rs"]);
         assert_eq!(
             names(sites("self.raise(")),
-            ["observe.rs", "observe.rs"],
-            "the seam's raise: the arm and the control verb"
+            ["observe.rs"],
+            "the seam's raise: the control verb"
         );
         assert_eq!(names(sites("admission::admit(")), ["epoch.rs"]);
+        assert_eq!(
+            names(sites("Self::admit_locked(")),
+            ["epoch.rs", "epoch.rs"],
+            "admission: the check alone and the arm"
+        );
         assert_eq!(names(sites(".admit_probe(")), ["observe.rs"]);
-        assert_eq!(names(sites("self.admits(")), ["observe.rs"]);
 
-        let observe = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/composer_probe/observe.rs"),
-        )
-        .unwrap();
-        let arm = observe
-            .split("pub fn arm(")
-            .nth(1)
-            .and_then(|rest| rest.split("\n    }\n").next())
-            .expect("the arm section");
-        let asked = arm.find("self.admits(").expect("the arm asks admission");
-        let raised = arm.find("self.raise(").expect("the arm raises");
+        let read = |file: &str| {
+            std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("src/composer_probe")
+                    .join(file),
+            )
+            .unwrap()
+        };
+        let section = |text: &str, head: &str| -> String {
+            text.split(head)
+                .nth(1)
+                .and_then(|rest| rest.split("\n    }\n").next())
+                .unwrap_or_else(|| panic!("{head}"))
+                .to_owned()
+        };
+        let arm = section(&read("epoch.rs"), "pub fn arm_probe(");
+        let asked = arm
+            .find("Self::admit_locked(")
+            .expect("the arm asks admission");
+        let raised = arm.find("Self::raise_locked(").expect("the arm raises");
         assert!(asked < raised, "admission is asked before the raise");
-        let control = observe
-            .split("pub fn control(")
-            .nth(1)
-            .and_then(|rest| rest.split("\n    }\n").next())
-            .expect("the control verb");
-        assert!(control.contains("self.raise("), "the other raise");
+        let lock = arm.find("lock_recovering()").expect("one hold of the lock");
+        assert!(lock < asked, "in the same hold");
+        assert!(
+            section(&read("observe.rs"), "pub fn arm(").contains(".arm_probe("),
+            "the seam's arm is that section"
+        );
+        assert!(
+            section(&read("observe.rs"), "pub fn control(").contains("self.raise("),
+            "the other raise"
+        );
     }
 
     /// Scenario: Publish and withdraw the control verb's test liability after a probe published segment number 9. The count goes 1 and back to 0 through the same raise, and the page keeps showing 9.
