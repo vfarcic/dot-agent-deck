@@ -7,12 +7,12 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use dot_agent_deck::composer_probe::framing::Framing;
 use dot_agent_deck::composer_probe::planner::{
-    Boundary, FLUSH_MARGIN, FLUSH_QUIET, FLUSH_RESPONSE, InputGrammar, Natives, Physical,
-    PhysicalTracker, WakeAt, first_cut, is_candidate, next_cut,
+    Boundary, InputGrammar, Natives, Physical, PhysicalTracker, WakeAt, first_cut, is_candidate,
+    next_cut,
 };
 use spec::spec;
 
@@ -244,22 +244,26 @@ fn probe_076_a_transition_after_registration_wakes_the_waiter() {
     assert!(poll_once(std::pin::pin!(physical.until_ground())).is_ready());
 }
 
-/// Scenario: Feed the writer's tracker, with Claude Code 2.1.310/2.1.312's measured input grammar, the user's `ESC [` then Ctrl+U, and separately `ESC [` then Enter: each C0 aborts the CSI, so the stream is in ground at once with no wait. The strict grammar keeps the same bytes inside the CSI.
+/// Where `bytes` leave the stream, written as one write with `grammar`.
+fn boundary_after(bytes: &[u8], grammar: InputGrammar) -> Boundary {
+    let physical = Physical::default();
+    let mut tracker = PhysicalTracker::default();
+    tracker.written_as(bytes, &physical, grammar);
+    assert_eq!(tracker.boundary(), physical.boundary());
+    physical.boundary()
+}
+
+/// Scenario: Feed the writer's tracker, with Claude Code 2.1.310/2.1.312's measured input grammar, the user's `ESC [` then Ctrl+U, `ESC [` then Enter, and `ESC [` then BEL, each as two writes: each C0 aborts the CSI, so the stream is in ground at once. The strict grammar keeps the same bytes inside the CSI, and under the measured one a CSI's parameters, intermediates and private marker keep it open.
 #[spec("inbox/probe/076")]
 #[test]
 fn probe_076_the_measured_grammar_aborts_a_csi_on_a_c0() {
-    let t0 = Instant::now();
     for c0 in [0x15u8, b'\r', 0x07] {
         let physical = Physical::default();
         let mut tracker = PhysicalTracker::default();
-        tracker.written_with(b"\x1b[", &physical, InputGrammar::ClaudeMeasured, t0);
+        tracker.written_as(b"\x1b[", &physical, InputGrammar::ClaudeMeasured);
         assert_eq!(physical.boundary(), Boundary::Inside);
-        tracker.written_with(&[c0], &physical, InputGrammar::ClaudeMeasured, t0);
+        tracker.written_as(&[c0], &physical, InputGrammar::ClaudeMeasured);
         assert_eq!(physical.boundary(), Boundary::Ground, "{c0:#x} aborts it");
-        assert!(
-            !physical.flushed(t0 + Duration::from_secs(10)),
-            "no flush pending"
-        );
 
         let physical = Physical::default();
         let mut tracker = PhysicalTracker::default();
@@ -267,57 +271,141 @@ fn probe_076_the_measured_grammar_aborts_a_csi_on_a_c0() {
         tracker.written(&[c0], &physical);
         assert_eq!(physical.boundary(), Boundary::Inside, "{c0:#x}, strict");
     }
-}
-
-/// Scenario: With the measured grammar, leave an OSC unfinished (`ESC ]` then Ctrl+U, which stays inside it): no deck byte may start inside the agent's 50 ms quiet window or the tracker's margin after it, so the stream counts as flushed only from 50 ms plus the margin after the last write, and then the writer's settle reads ground. A response-like prefix (`ESC ] 11;`) waits 2 s plus the margin; a lone ESC, an open paste and the strict grammar never flush.
-#[spec("inbox/probe/076")]
-#[test]
-fn probe_076_no_deck_byte_inside_the_agents_flush_window() {
-    let measured = InputGrammar::ClaudeMeasured;
-    let t0 = Instant::now();
-    let physical = Physical::default();
-    let mut tracker = PhysicalTracker::default();
-    tracker.written_with(b"\x1b]", &physical, measured, t0);
-    tracker.written_with(b"\x15", &physical, measured, t0 + Duration::from_millis(30));
-    let last = t0 + Duration::from_millis(30);
-    for inside in [0, 1, 49, 50, 449] {
-        let at = last + Duration::from_millis(inside);
-        assert!(!physical.flushed(at), "+{inside} ms is still inside");
+    for open in [b"\x1b[1;2".as_slice(), b"\x1b[1 ", b"\x1b[?"] {
         assert_eq!(
-            tracker.settle(&physical, at),
+            boundary_after(open, InputGrammar::ClaudeMeasured),
             Boundary::Inside,
-            "+{inside} ms"
+            "{open:?}: parameters and intermediates stay inside"
         );
     }
-    let due = last + FLUSH_QUIET + FLUSH_MARGIN;
-    assert!(physical.flushed(due));
-    assert_eq!(tracker.settle(&physical, due), Boundary::Ground);
+}
 
-    let physical = Physical::default();
-    let mut tracker = PhysicalTracker::default();
-    tracker.written_with(b"\x1b]11;", &physical, measured, t0);
-    assert!(
-        !physical.flushed(t0 + FLUSH_QUIET + FLUSH_MARGIN),
-        "a response-like prefix waits longer"
-    );
-    assert!(physical.flushed(t0 + FLUSH_RESPONSE + FLUSH_MARGIN));
+/// Scenario: Open an OSC (`ESC ]`), a DCS (`ESC P`) and an APC (`ESC _ G`) and follow each with an ordinary C0 (Ctrl+U, Enter), a BEL, CAN, SUB, ST (`ESC \`), an ESC opening a CSI (`ESC [`, then `A` finishing it), and an ESC then a BEL, under the measured grammar and the strict one. Both read each ending as Claude Code 2.1.310/2.1.312's tokenizer does, except a BEL after a DCS or APC, which ends it only under the measured grammar; an ordinary C0 stays inside every string, and a BEL inside an open paste ends the string but not the paste.
+#[spec("inbox/probe/076")]
+#[test]
+fn probe_076_the_measured_grammar_ends_strings_where_the_agent_does() {
+    use Boundary::{Ground, Inside};
+    let measured = InputGrammar::ClaudeMeasured;
+    let strict = InputGrammar::Strict;
+    for opener in [b"\x1b]".as_slice(), b"\x1bP", b"\x1b_G"] {
+        let osc = opener == b"\x1b]";
+        // (ending, measured, strict)
+        let rows: [(&[u8], Boundary, Boundary); 10] = [
+            (b"\x15", Inside, Inside),
+            (b"\r", Inside, Inside),
+            (b"\x07", Ground, if osc { Ground } else { Inside }),
+            (b"\x18", Ground, Ground),
+            (b"\x1a", Ground, Ground),
+            (b"\x1b\\", Ground, Ground),
+            (b"\x1b[", Inside, Inside),
+            (b"\x1b[A", Ground, Ground),
+            (b"\x1b\x07", Ground, Ground),
+            (b"\x15\r\x07", Ground, if osc { Ground } else { Inside }),
+        ];
+        for (ending, want_measured, want_strict) in rows {
+            let bytes = [opener, ending].concat();
+            assert_eq!(
+                boundary_after(&bytes, measured),
+                want_measured,
+                "measured {bytes:?}"
+            );
+            assert_eq!(
+                boundary_after(&bytes, strict),
+                want_strict,
+                "strict {bytes:?}"
+            );
+        }
+        let pasted = [b"\x1b[200~".as_slice(), opener, b"\x07"].concat();
+        assert_eq!(boundary_after(&pasted, measured), Inside, "{pasted:?}");
+        let closed = [pasted.as_slice(), b"\x1b[201~"].concat();
+        assert_eq!(boundary_after(&closed, measured), Ground, "{closed:?}");
+    }
+}
 
-    for (what, bytes, grammar) in [
-        ("lone ESC", b"\x1b".as_slice(), measured),
-        ("paste", b"\x1b[200~abc", measured),
-        ("strict", b"\x1b]", InputGrammar::Strict),
+/// Scenario: Under the measured grammar, leave a CSI, an OSC, a DCS, a reply-like OSC (`ESC ] 11;`) and a reply-like CSI (`ESC [ <`) unfinished, register a waiter for a deck line and one for ground on each, and let a minute of (paused) time pass with no write: the stream stays inside and neither waiter wakes, since no grammar ends a sequence by time (Q87). The user's finishing key then wakes both.
+#[spec("inbox/probe/076")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn probe_076_no_grammar_ends_a_sequence_by_time() {
+    let measured = InputGrammar::ClaudeMeasured;
+    for (open, finish) in [
+        (b"\x1b[".as_slice(), b"C".as_slice()),
+        (b"\x1b]", b"\x07"),
+        (b"\x1bP", b"\x07"),
+        (b"\x1b]11;", b"\x1b\\"),
+        (b"\x1b[<", b"\x15"),
+    ] {
+        let physical = Arc::new(Physical::default());
+        let mut tracker = PhysicalTracker::default();
+        tracker.written_as(open, &physical, measured);
+        let waiters = [
+            tokio::spawn({
+                let physical = Arc::clone(&physical);
+                async move { physical.until_line().await }
+            }),
+            tokio::spawn({
+                let physical = Arc::clone(&physical);
+                async move { physical.until_ground().await }
+            }),
+        ];
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(physical.boundary(), Boundary::Inside, "{open:?}");
+        assert!(
+            waiters.iter().all(|w| !w.is_finished()),
+            "{open:?}: no timer woke a waiter"
+        );
+        tracker.written_as(finish, &physical, measured);
+        assert_eq!(physical.boundary(), Boundary::Ground, "{open:?}{finish:?}");
+        for waiter in waiters {
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("the finishing key wakes it")
+                .unwrap();
+        }
+    }
+}
+
+/// Scenario: A waiter for ground registers while a paste is open; one write closes the paste and opens an OSC, so the stream stays inside and the waiter is neither woken nor resolved; the BEL that ends the OSC then wakes it. Under the measured grammar, a waiter registered inside `ESC [` is woken by the Ctrl+U that aborts it.
+#[spec("inbox/probe/076")]
+#[test]
+fn probe_076_an_inside_to_inside_write_leaves_a_waiter_waiting() {
+    struct Flag(AtomicBool);
+    impl Wake for Flag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let measured = InputGrammar::ClaudeMeasured;
+    for (open, inside, finish) in [
+        (
+            b"\x1b[200~abc".as_slice(),
+            b"\x1b[201~\x1b]".as_slice(),
+            b"\x07".as_slice(),
+        ),
+        (b"\x1b[", b"", b"\x15"),
     ] {
         let physical = Physical::default();
         let mut tracker = PhysicalTracker::default();
-        tracker.written_with(bytes, &physical, grammar, t0);
-        assert!(!physical.flushed(t0 + Duration::from_secs(60)), "{what}");
+        tracker.written_as(open, &physical, measured);
+        let flag = Arc::new(Flag(AtomicBool::new(false)));
+        let waker = Waker::from(Arc::clone(&flag));
+        let mut cx = Context::from_waker(&waker);
+        let mut wait = std::pin::pin!(physical.until_ground());
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        tracker.written_as(inside, &physical, measured);
+        assert_eq!(physical.boundary(), Boundary::Inside, "{open:?}{inside:?}");
+        assert!(!flag.0.load(Ordering::SeqCst), "{open:?}{inside:?}");
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        tracker.written_as(finish, &physical, measured);
+        assert!(flag.0.load(Ordering::SeqCst), "{finish:?} woke it");
+        assert!(wait.as_mut().poll(&mut cx).is_ready());
     }
 }
 
-/// Scenario: Only a latched Claude Code 2.1.310 or 2.1.312 reads with the measured grammar; another Claude release, and Codex, read strictly.
+/// Scenario: Only a Claude Code 2.1.310 or 2.1.312 release, latched for a generation spawned as Claude Code, reads with the measured grammar; another Claude release, Codex, a generation of no known agent, a conflicting header, a header not seen and a scanner dropped before one all read strictly, and the latch is asked about the generation's own agent.
 #[spec("inbox/probe/076")]
 #[test]
 fn probe_076_the_grammar_follows_the_latched_release() {
+    use dot_agent_deck::doorbell_activation::LatchedRelease;
     use dot_agent_deck::event::AgentType;
     let v = |p| semver::Version::new(2, 1, p);
     assert_eq!(
@@ -336,37 +424,37 @@ fn probe_076_the_grammar_follows_the_latched_release() {
         InputGrammar::of(&AgentType::Codex, &semver::Version::new(0, 164, 0)),
         InputGrammar::Strict
     );
-}
-
-/// Scenario: With the measured grammar, leave an OSC unfinished, then let the agent's flush come due with no write in between. A key the user types after it is read from ground, not as more of the dead string, so a plain key leaves the stream in ground; and a waiter for a deck line, registered while the OSC was open, resolves at the flush with no further write.
-#[spec("inbox/probe/076")]
-#[tokio::test(flavor = "current_thread")]
-async fn probe_076_the_flush_ends_the_sequence_for_writes_and_waiters() {
-    let measured = InputGrammar::ClaudeMeasured;
-    let t0 = Instant::now();
-    let physical = Physical::default();
-    let mut tracker = PhysicalTracker::default();
-    tracker.written_with(b"\x1b]", &physical, measured, t0);
-    let due = t0 + FLUSH_QUIET + FLUSH_MARGIN;
-    tracker.written_with(b"x", &physical, measured, due + Duration::from_millis(1));
+    let claude = AgentType::ClaudeCode;
+    let asked = std::cell::RefCell::new(Vec::new());
+    let known = |agent: &AgentType| {
+        asked.borrow_mut().push(agent.clone());
+        LatchedRelease::Known(v(310))
+    };
     assert_eq!(
-        tracker.boundary(),
-        Boundary::Ground,
-        "the key after the flush"
+        InputGrammar::latched(Some(&claude), known),
+        InputGrammar::ClaudeMeasured
     );
-
-    let physical = Arc::new(Physical::default());
-    let mut tracker = PhysicalTracker::default();
-    tracker.written_with(b"\x1b]", &physical, measured, Instant::now());
-    let waiter = tokio::spawn({
-        let physical = Arc::clone(&physical);
-        async move { physical.until_line().await }
-    });
-    tokio::task::yield_now().await;
-    assert!(!waiter.is_finished(), "inside the window");
-    tokio::time::sleep(FLUSH_QUIET + FLUSH_MARGIN + Duration::from_millis(5)).await;
-    tokio::time::timeout(Duration::from_secs(1), waiter)
-        .await
-        .expect("the flush wakes the waiter")
-        .unwrap();
+    assert_eq!(asked.borrow().as_slice(), [AgentType::ClaudeCode]);
+    assert_eq!(
+        InputGrammar::latched(Some(&AgentType::Codex), |_| LatchedRelease::Known(v(310))),
+        InputGrammar::Strict,
+        "a Codex generation"
+    );
+    assert_eq!(
+        InputGrammar::latched(None, |_| LatchedRelease::Known(v(310))),
+        InputGrammar::Strict,
+        "no agent"
+    );
+    for latch in [
+        LatchedRelease::Conflict,
+        LatchedRelease::Unseen,
+        LatchedRelease::ScannerGeometry,
+        LatchedRelease::ScannerBudget,
+    ] {
+        assert_eq!(
+            InputGrammar::latched(Some(&claude), |_| latch.clone()),
+            InputGrammar::Strict,
+            "{latch:?}"
+        );
+    }
 }

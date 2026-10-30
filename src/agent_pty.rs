@@ -2055,6 +2055,9 @@ pub struct AgentBus {
     /// observer, shared with the output hook: rung when the release latch
     /// moves.
     composer_bell: crate::composer_probe::observe::BellSlot,
+    /// The agent the generation was spawned as, whose release alone sets its
+    /// input grammar (Q83); `None` keeps it strict.
+    spawned_as: Option<AgentType>,
 }
 
 /// What one [`AgentBus::push`] cost under the output lock (plan §9.1). Read
@@ -2178,6 +2181,15 @@ impl AgentBus {
             between_resize_and_clear: Mutex::new(None),
             input,
             composer_bell,
+            spawned_as: None,
+        }
+    }
+
+    /// The bus for a generation spawned as `agent` (Q83).
+    pub fn spawned_as(self, agent: Option<AgentType>) -> Self {
+        Self {
+            spawned_as: agent,
+            ..self
         }
     }
 
@@ -2243,6 +2255,16 @@ impl AgentBus {
         });
         let evidence_ns = u64::try_from(held.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let release = state.release.push(&arc);
+        // Q83: the input grammar follows what the capture holds for the
+        // generation's own agent after the whole push, so a conflict or
+        // another agent's header leaves it strict however the output was
+        // split.
+        let grammar = (!release.is_empty()).then(|| {
+            crate::composer_probe::planner::InputGrammar::latched(
+                self.spawned_as.as_ref(),
+                |agent| state.release.latched_for(agent),
+            )
+        });
         let scanner = state.release.last_push();
         state.live_modes.feed(&arc);
         state.output_hook.on_output(&arc);
@@ -2266,18 +2288,10 @@ impl AgentBus {
             log_evidence_transition(&transition, "output");
         }
         let latch_changed = !release.is_empty();
+        if let Some(grammar) = grammar {
+            self.input.set_input_grammar(grammar);
+        }
         for event in release {
-            // Q83: the generation's input grammar follows its latched
-            // release.
-            if let crate::release_scanner::CaptureEvent::Latched(latch)
-            | crate::release_scanner::CaptureEvent::Closed { latch, .. } = &event
-                && let crate::release_scanner::ScanLatch::Latched { agent, release, .. } = latch
-            {
-                self.input
-                    .set_input_grammar(crate::composer_probe::planner::InputGrammar::of(
-                        agent, release,
-                    ));
-            }
             self.log_release(&event);
         }
         // PRD #1666 part 3 (Q35-14b): an installed generation's observer
@@ -6084,7 +6098,7 @@ impl PtyWriterThread {
                         Some(check) => check(
                             &state,
                             &crate::doorbell_txn::StartCtx {
-                                boundary: tracker.settle(&thread_physical, Instant::now()),
+                                boundary: tracker.boundary(),
                                 retired: recorder.retired.load(Ordering::SeqCst),
                                 now: Instant::now(),
                             },
@@ -6699,12 +6713,8 @@ struct Tracking<'a> {
 
 impl Tracking<'_> {
     fn written(&mut self, written: &[u8]) {
-        self.tracker.written_with(
-            written,
-            self.physical,
-            self.input.input_grammar(),
-            Instant::now(),
-        );
+        self.tracker
+            .written_as(written, self.physical, self.input.input_grammar());
         if let Some(natives) = self.natives.as_mut() {
             let input = self.input;
             natives.written(written, |seq| input.enter_native(seq, Instant::now()));
@@ -14007,12 +14017,10 @@ impl AgentPtyRegistry {
         // A pane that names a stand-in wants it, whatever type it starts as.
         #[cfg(feature = "e2e")]
         let profile = standin.as_ref().map(|(_, profile)| *profile).or(profile);
-        let bus = Arc::new(AgentBus::for_generation(
-            &preallocated_id,
-            profile,
-            captured_rows,
-            captured_cols,
-        ));
+        let bus = Arc::new(
+            AgentBus::for_generation(&preallocated_id, profile, captured_rows, captured_cols)
+                .spawned_as(spawn_agent_type.clone()),
+        );
         let bus_for_thread = bus.clone();
         let exited = Arc::new(AtomicBool::new(false));
         let exited_for_thread = exited.clone();
@@ -24977,6 +24985,63 @@ mod spawn_tests {
         }
     }
 
+    /// Claude Code's start-up header for `version`, drawn where Claude Code
+    /// 2.1.310 draws it: `Claude Code` at row 1, column 11.
+    fn claude_header(version: &str) -> Vec<u8> {
+        format!("\x1b[2;12HClaude Code v{version}\r").into_bytes()
+    }
+
+    /// Scenario: Feed generations' buses Claude Code 2.1.310's header. One spawned as Claude Code reads its input with the measured grammar from the push that latched it; one spawned as Codex, and one of no known agent, stay strict. Then a Claude Code generation is fed 2.1.310's header followed by 2.1.312's, as one push, split after the first header, and one byte per push: every split ends in a conflict and the strict grammar, so the writer's tracker reads the user's `ESC [` then Ctrl+U as still inside the CSI.
+    #[spec("inbox/probe/076")]
+    #[test]
+    fn probe_076_the_input_grammar_follows_the_generations_own_latch() {
+        use crate::composer_probe::planner::{Boundary, InputGrammar, Physical, PhysicalTracker};
+        use crate::release_scanner::ScanLatch;
+        let claude = Some(AgentType::ClaudeCode);
+        let grammar = |bus: &AgentBus| bus.input().input_grammar();
+        let bus = AgentBus::for_generation("g-q83-a", None, 24, 80).spawned_as(claude.clone());
+        assert_eq!(grammar(&bus), InputGrammar::Strict, "before a header");
+        bus.push(claude_header("2.1.310"));
+        assert_eq!(grammar(&bus), InputGrammar::ClaudeMeasured);
+        for other in [Some(AgentType::Codex), None] {
+            let bus = AgentBus::for_generation("g-q83-b", None, 24, 80).spawned_as(other.clone());
+            bus.push(claude_header("2.1.310"));
+            assert!(matches!(latch(&bus), ScanLatch::Latched { .. }));
+            assert_eq!(grammar(&bus), InputGrammar::Strict, "{other:?}");
+        }
+        let first = claude_header("2.1.310");
+        let trace = [
+            first.as_slice(),
+            b"\x1b[2J".as_slice(),
+            &claude_header("2.1.312"),
+        ]
+        .concat();
+        for cuts in [
+            vec![],
+            vec![first.len()],
+            (1..trace.len()).collect::<Vec<_>>(),
+        ] {
+            let bus = AgentBus::for_generation("g-q83-c", None, 24, 80).spawned_as(claude.clone());
+            let mut from = 0;
+            for &cut in cuts.iter().chain(std::iter::once(&trace.len())) {
+                bus.push(trace[from..cut].to_vec());
+                from = cut;
+                if cut == first.len() {
+                    assert_eq!(grammar(&bus), InputGrammar::ClaudeMeasured, "{cuts:?}");
+                }
+            }
+            assert!(
+                matches!(latch(&bus), ScanLatch::Conflict { .. }),
+                "{cuts:?}"
+            );
+            assert_eq!(grammar(&bus), InputGrammar::Strict, "{cuts:?}");
+            let physical = Physical::default();
+            let mut tracker = PhysicalTracker::default();
+            tracker.written_as(b"\x1b[\x15", &physical, grammar(&bus));
+            assert_eq!(physical.boundary(), Boundary::Inside, "{cuts:?}");
+        }
+    }
+
     /// Scenario: Replay commit 1's recorded launches of Codex 0.164.0, 0.160.0 and Claude Code 2.1.310 through a generation's bus at pseudo-random splits. Each latches exactly what feeding the bytes one at a time latches.
     #[spec("inbox/doorbell/055")]
     #[test]
@@ -27042,38 +27107,120 @@ mod spawn_tests {
         registry.shutdown_all();
     }
 
-    /// Scenario: The model editor latches Claude Code 2.1.310, so its input is read with the measured grammar. The user types an unfinished OSC (`ESC ]`), and a ring starts at once: it writes no byte while the agent's flush window (50 ms plus the tracker's margin) runs, ending at its 300 ms bound with nothing written, the pane holding only the user's bytes.
-    #[spec("inbox/probe/076")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-    async fn probe_076_a_ring_writes_nothing_inside_the_agents_flush_window() {
-        use crate::composer_probe::planner::{FLUSH_MARGIN, FLUSH_QUIET, InputGrammar};
-        use crate::doorbell_txn::{NotTyped, Outcome};
-        let registry = Arc::new(AgentPtyRegistry::new());
-        let editor = ModelEditor::spawn(&registry, "pane-flush-window", OnEnter::Submit);
-        registry.set_pty_write_stall_bound_for_test(Duration::from_millis(300));
+    /// Wait (bounded) until the model editor's input reads with `grammar`.
+    async fn grammar_until(
+        editor: &ModelEditor,
+        grammar: crate::composer_probe::planner::InputGrammar,
+    ) {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while editor.bus.input().input_grammar() != InputGrammar::ClaudeMeasured {
-            assert!(Instant::now() < deadline, "the release never latched");
+        while editor.bus.input().input_grammar() != grammar {
+            assert!(
+                Instant::now() < deadline,
+                "the grammar never became {grammar:?}"
+            );
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
+    }
+
+    /// Past Claude Code's own waits for an unfinished sequence (50 ms, and
+    /// 2 s for one that may be a terminal's reply), with room to spare.
+    const PAST_THE_AGENTS_WAITS: Duration = Duration::from_millis(2500);
+
+    /// Scenario: The model editor latches Claude Code 2.1.310, so its input is read with the measured grammar. The user types an unfinished DCS (`ESC P`) and Ctrl+U, which stays inside it, and the editor shows its empty composer. 2.5 s later, past Claude Code's own waits for an unfinished sequence, a ring still waits its bound, writes nothing and ends with nothing written. The user's BEL ends the string, as the measured grammar reads it, and the next ring types and submits its line after the user's bytes.
+    #[spec("inbox/probe/076")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn probe_076_a_measured_release_holds_an_unfinished_string_until_a_key_ends_it() {
+        use crate::composer_probe::planner::InputGrammar;
+        use crate::doorbell_txn::{NotTyped, Outcome};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-held-string", OnEnter::Submit);
+        registry.set_pty_write_stall_bound_for_test(Duration::from_millis(300));
+        grammar_until(&editor, InputGrammar::ClaudeMeasured).await;
+        let keys = b"\x1bP\x15";
         registry
-            .write_user_bytes(&editor.pane, &editor.id, b"\x1b]")
+            .write_user_bytes(&editor.pane, &editor.id, keys)
             .await
             .unwrap();
         let written = Instant::now();
-        typed_until(&editor, |t| t == b"\x1b]").await;
+        typed_until(&editor, |t| t == keys).await;
+        editor.wait_drawn("");
+        editor.wait_clean();
+        tokio::time::sleep_until((written + PAST_THE_AGENTS_WAITS).into()).await;
         let report = editor.ring().await;
-        let ended = written.elapsed();
         assert_eq!(
             report.outcome,
             RingOutcome::Txn(Outcome::NothingWritten(NotTyped::OffGround)),
             "{report:?}"
         );
-        assert_eq!(editor.typed(), b"\x1b]", "no deck byte inside the window");
-        assert!(
-            ended < FLUSH_QUIET + FLUSH_MARGIN,
-            "the ring's bound ended inside the window ({ended:?}), so the check covered it"
+        assert_eq!(editor.typed(), keys, "nothing typed into the string");
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, b"\x07")
+            .await
+            .unwrap();
+        let ended = [keys.as_slice(), b"\x07"].concat();
+        typed_until(&editor, |t| t == ended).await;
+        editor.wait_clean();
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::Submitted),
+            "{report:?}"
         );
+        let typed = editor.typed();
+        assert!(typed.starts_with(&ended), "{typed:?}");
+        assert!(typed_line(&typed[ended.len()..]).is_some(), "{typed:?}");
+        registry.shutdown_all();
+    }
+
+    /// Scenario: The model editor latches Claude Code 2.1.310, then draws 2.1.312's header too: the conflict puts its input back on the strict grammar. The user types `ESC [` and Ctrl+U, which the measured grammar would end at once but the strict one keeps inside the CSI, and the editor shows its empty composer. 2.5 s later a ring still waits its bound, writes nothing and ends with nothing written. The user's `C` finishes the CSI, and the next ring gets past that wait, stopping only at the release conflict, since the deck types into no release whose header conflicts.
+    #[spec("inbox/probe/076")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn probe_076_a_strict_release_holds_a_csi_until_a_key_ends_it() {
+        use crate::composer_probe::planner::InputGrammar;
+        use crate::doorbell_txn::{NotTyped, Outcome};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-held-csi", OnEnter::Submit);
+        registry.set_pty_write_stall_bound_for_test(Duration::from_millis(300));
+        grammar_until(&editor, InputGrammar::ClaudeMeasured).await;
+        editor.bus.push(claude_header("2.1.312"));
+        grammar_until(&editor, InputGrammar::Strict).await;
+        editor
+            .bus
+            .push(claude_screen("", &[], false, EDITOR_COLS as usize));
+        editor.wait_clean();
+        let keys = b"\x1b[\x15";
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, keys)
+            .await
+            .unwrap();
+        let written = Instant::now();
+        typed_until(&editor, |t| t == keys).await;
+        editor.wait_drawn("");
+        editor.wait_clean();
+        tokio::time::sleep_until((written + PAST_THE_AGENTS_WAITS).into()).await;
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::NothingWritten(NotTyped::OffGround)),
+            "{report:?}"
+        );
+        assert_eq!(editor.typed(), keys, "nothing typed into the CSI");
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, b"C")
+            .await
+            .unwrap();
+        let ended = [keys.as_slice(), b"C"].concat();
+        typed_until(&editor, |t| t == ended).await;
+        editor.wait_clean();
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::NothingWritten(NotTyped::CannotType(
+                "release_conflict"
+            ))),
+            "past the wait, only the release stops it: {report:?}"
+        );
+        assert_eq!(editor.typed(), ended);
         registry.shutdown_all();
     }
 

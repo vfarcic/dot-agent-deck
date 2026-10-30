@@ -42,7 +42,6 @@
 //! unmeasured), and this commit lets paste mode suppress no candidate.
 
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
@@ -214,11 +213,6 @@ impl Boundary {
 pub struct Physical {
     boundary: AtomicU8,
     wake: Notify,
-    /// When the sequence the stream ends in counts as flushed by the agent's
-    /// own reader, if its grammar flushes one (Q83, [`InputGrammar`]): from
-    /// then the boundary reads ground. Set with the boundary, by the writer
-    /// thread.
-    flush_at: std::sync::Mutex<Option<Instant>>,
 }
 
 impl Default for Physical {
@@ -226,32 +220,18 @@ impl Default for Physical {
         Self {
             boundary: AtomicU8::new(Boundary::Ground as u8),
             wake: Notify::new(),
-            flush_at: std::sync::Mutex::new(None),
         }
     }
 }
 
 impl Physical {
-    /// Where the written stream is now: inside a sequence the agent's own
-    /// reader has flushed by now reads as ground (Q83).
+    /// Where the written stream is now.
     pub fn boundary(&self) -> Boundary {
         match self.boundary.load(Ordering::SeqCst) {
             b if b == Boundary::Ground as u8 => Boundary::Ground,
             b if b == Boundary::Escape as u8 => Boundary::Escape,
-            _ if self.flushed(Instant::now()) => Boundary::Ground,
             _ => Boundary::Inside,
         }
-    }
-
-    /// When the sequence the stream ends in counts as flushed, if it ends in
-    /// one the agent's grammar flushes.
-    fn flush_at(&self) -> Option<Instant> {
-        *self.flush_at.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Whether the sequence the stream ends in counts as flushed at `now`.
-    pub fn flushed(&self, now: Instant) -> bool {
-        self.flush_at().is_some_and(|at| now >= at)
     }
 
     /// Whether the written stream is in ground.
@@ -263,14 +243,6 @@ impl Physical {
     /// returned. A move to a more settled boundary wakes every waiter
     /// registered before it.
     pub fn set(&self, boundary: Boundary) {
-        self.set_flushing(boundary, None);
-    }
-
-    /// [`Self::set`], with when the sequence `boundary` ends in counts as
-    /// flushed by the agent's reader (Q83), `None` for never.
-    pub fn set_flushing(&self, boundary: Boundary, flush_at: Option<Instant>) {
-        *self.flush_at.lock().unwrap_or_else(|e| e.into_inner()) =
-            flush_at.filter(|_| boundary == Boundary::Inside);
         let was = self.boundary.swap(boundary as u8, Ordering::SeqCst);
         if (boundary as u8) > was {
             self.wake.notify_waiters();
@@ -306,44 +278,46 @@ impl Physical {
                 return;
             }
             at(WakeAt::Rechecked);
-            // A flush is a move to ground no write announces: wake at it.
-            match self.flush_at() {
-                Some(at) => {
-                    tokio::select! {
-                        () = notified => {}
-                        () = tokio::time::sleep_until(at.into()) => {}
-                    }
-                }
-                None => notified.await,
-            }
+            notified.await;
         }
     }
 }
 
 /// How an agent's own input reader frames what it reads, as far as the
 /// physical tracker follows it (Q83).
+///
+/// Only bytes the agent's reader ends a sequence on are followed, never its
+/// clock. Claude Code also drops an unfinished sequence by itself once no
+/// input comes for 50 ms (2 s for one that may be a terminal's reply), but
+/// the deck sees only its own write return, not the agent's reader take the
+/// bytes: no margin on that clock bounds a reader, relay or timer running
+/// late, and a deck byte written after it could still land inside the
+/// sequence. So a sequence the user leaves open holds the deck's lines until
+/// a key ends it, under either grammar (Q87, the user's decision).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InputGrammar {
     /// The tracker's own framing: a sequence stays open until a byte ends it.
     /// Every agent and release whose reader wasn't read from source.
     #[default]
     Strict,
-    /// Claude Code 2.1.310 and 2.1.312's key reader, read from their bundled
-    /// source (the Q83 source study: the tokenizer and `xy`, `nd`, `ll`):
-    /// - a C0 other than ESC inside a CSI aborts it to ground and is read
-    ///   from ground (an SS3 already ends at one in the strict framing);
-    /// - an unfinished sequence is flushed once 50 ms pass with no input,
-    ///   except one its `ll` recogniser keeps for 2 s
-    ///   ([`Framing::response_like_prefix`]). A paste is kept strict: what
-    ///   the reader leaves after its 2 s paste flush wasn't established, and
-    ///   a lone ESC isn't flushed here either, so it stays
-    ///   [`Boundary::Escape`] and admits no probe.
+    /// Claude Code 2.1.310 and 2.1.312's key tokenizer, read from their
+    /// bundled source (the Q83 source study):
+    /// - a C0 other than ESC inside a CSI aborts it, and is read from ground
+    ///   (an SS3 already ends at one in the strict framing);
+    /// - a BEL ends a DCS or APC string, as it ends an OSC in both grammars.
+    ///
+    /// Its other string endings (ST, CAN, SUB, an ESC opening another
+    /// sequence) are the strict framing's too, and an ordinary C0 stays
+    /// inside a string in both. The tokenizer takes `ESC ^` and `ESC X` as
+    /// whole keys and drops an APC early unless its prefix is a graphics
+    /// reply; the tracker keeps those strings open, the conservative
+    /// direction.
     ClaudeMeasured,
 }
 
 impl InputGrammar {
-    /// The grammar of `agent`'s `release`, latched from its start-up header:
-    /// the measured one only for the releases read from source.
+    /// The grammar of `agent`'s `release`: the measured one only for the
+    /// releases read from source.
     pub fn of(agent: &crate::event::AgentType, release: &semver::Version) -> Self {
         let measured = [
             semver::Version::new(2, 1, 310),
@@ -355,19 +329,28 @@ impl InputGrammar {
             Self::Strict
         }
     }
-}
 
-/// The agent's quiet wait before it flushes an unfinished sequence (`Yn`).
-pub const FLUSH_QUIET: Duration = Duration::from_millis(50);
-/// Its wait for a sequence that may be a terminal's response (`$c`).
-pub const FLUSH_RESPONSE: Duration = Duration::from_millis(2000);
-/// What the tracker adds to either, since the agent's wait runs from when
-/// its reader took the last byte, which is after this thread's write
-/// returned, and its timer can fire late: a reader or timer delayed longer
-/// than this behind the write is the residual, and the deck's next byte could
-/// then still reach it inside the sequence. Generous on purpose: it costs a
-/// ring under half a second after a sequence the user abandoned.
-pub const FLUSH_MARGIN: Duration = Duration::from_millis(400);
+    /// The grammar of a generation spawned as `agent`, from what its release
+    /// capture latched for that agent: [`Self::of`] for a release known for
+    /// it, and strict for anything else, a conflicting header, another
+    /// agent's header or none included.
+    ///
+    /// The latch is about the process that drew the header, at capture time.
+    /// It is no proof that the same parser reads the input later: a
+    /// generation that replaces its process in place after the window closed
+    /// keeps the grammar its first process latched.
+    pub fn latched(
+        agent: Option<&crate::event::AgentType>,
+        latched: impl FnOnce(&crate::event::AgentType) -> crate::doorbell_activation::LatchedRelease,
+    ) -> Self {
+        match agent.map(|agent| (agent, latched(agent))) {
+            Some((agent, crate::doorbell_activation::LatchedRelease::Known(release))) => {
+                Self::of(agent, &release)
+            }
+            _ => Self::Strict,
+        }
+    }
+}
 
 /// The writer thread's own tracker: the input framing over the bytes the PTY
 /// took, publishing its boundary to [`Physical`].
@@ -379,54 +362,32 @@ pub struct PhysicalTracker {
 impl PhysicalTracker {
     /// The PTY took `written`, read with the strict grammar.
     pub fn written(&mut self, written: &[u8], physical: &Physical) {
-        self.written_with(written, physical, InputGrammar::Strict, Instant::now());
+        self.written_as(written, physical, InputGrammar::Strict);
     }
 
-    /// The PTY took `written` at `now`, read as `grammar` reads it (Q83).
-    pub fn written_with(
-        &mut self,
-        written: &[u8],
-        physical: &Physical,
-        grammar: InputGrammar,
-        now: Instant,
-    ) {
+    /// The PTY took `written`, read as `grammar` reads it (Q83). A grammar
+    /// that moves between writes reads only the bytes after the move its way:
+    /// what was taken before stays as it was read. So input typed before the
+    /// release latched was read strictly, and an `ESC [` then Ctrl+U typed
+    /// before Claude Code drew its header holds the deck's lines until a key
+    /// ends the CSI, as for an unmeasured release: the conservative
+    /// direction, left so on purpose.
+    pub fn written_as(&mut self, written: &[u8], physical: &Physical, grammar: InputGrammar) {
         if written.is_empty() {
             return;
         }
         let measured = grammar == InputGrammar::ClaudeMeasured;
-        // The agent's reader flushed what the stream ended in before these
-        // bytes came.
-        if measured && physical.flushed(now) {
-            self.framing.abandon();
-        }
         for &byte in written {
             if measured && byte < 0x20 && byte != 0x1b && self.framing.in_csi() {
                 self.framing.abandon();
+            } else if measured && byte == 0x07 && self.framing.in_dcs_or_apc() {
+                // The BEL is the string's last byte.
+                self.framing.abandon();
+                continue;
             }
             self.framing.feed(byte, |_| {});
         }
-        let boundary = Boundary::of(&self.framing);
-        let flush_at =
-            (measured && boundary == Boundary::Inside && !self.framing.in_paste()).then(|| {
-                let quiet = if self.framing.response_like_prefix() {
-                    FLUSH_RESPONSE
-                } else {
-                    FLUSH_QUIET
-                };
-                now + quiet + FLUSH_MARGIN
-            });
-        physical.set_flushing(boundary, flush_at);
-    }
-
-    /// Where the stream is at `now`, applying a flush of the agent's that
-    /// has come due (Q83): what this thread's start conditions read, so a job
-    /// starts on the same boundary the waiters were woken by.
-    pub fn settle(&mut self, physical: &Physical, now: Instant) -> Boundary {
-        if physical.flushed(now) {
-            self.framing.abandon();
-            physical.set(Boundary::of(&self.framing));
-        }
-        Boundary::of(&self.framing)
+        physical.set(Boundary::of(&self.framing));
     }
 
     /// Where the bytes taken so far end.

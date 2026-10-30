@@ -498,8 +498,9 @@ pub struct GenerationInput {
     native_page: NativePage,
     /// The drain frontier's requests and its reader's wake (Q35-20a).
     frontier: FrontierQueue,
-    /// How the agent's input reader frames what it reads, once its release
-    /// latched (Q83, [`InputGrammar`]); strict until then.
+    /// How the agent's input reader frames what it reads, as its release
+    /// capture holds it for the generation's own agent (Q83,
+    /// [`InputGrammar::latched`]); strict until a release is known.
     input_grammar: AtomicU8,
     /// Test seam: parks an acceptance between the epoch's move and the job
     /// becoming visible, so a test can see the one before the other.
@@ -933,7 +934,8 @@ impl GenerationInput {
         }
     }
 
-    /// The generation's release latched with `grammar`.
+    /// The generation's release capture moved, and holds `grammar` for its
+    /// agent: strict again after a conflict.
     pub fn set_input_grammar(&self, grammar: InputGrammar) {
         let value = match grammar {
             InputGrammar::Strict => 0,
