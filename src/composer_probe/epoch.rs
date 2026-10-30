@@ -82,12 +82,13 @@
 //! nothing in timing.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Instant;
 
 use super::admission;
 use super::framing::{Csi, Event, Framing, Report, Str, StringKind, Token, whole_report};
 use super::frontier::{FrontierQueue, Request};
+use super::planner::InputGrammar;
 use super::planner::{Cut, Natives, first_cut, is_candidate};
 use super::query_ledger::{
     Backlog, CprWaitEnd, EntryView, HazardFifo, HazardPop, Pop, QueryHistory, QueryKind,
@@ -497,6 +498,9 @@ pub struct GenerationInput {
     native_page: NativePage,
     /// The drain frontier's requests and its reader's wake (Q35-20a).
     frontier: FrontierQueue,
+    /// How the agent's input reader frames what it reads, once its release
+    /// latched (Q83, [`InputGrammar`]); strict until then.
+    input_grammar: AtomicU8,
     /// Test seam: parks an acceptance between the epoch's move and the job
     /// becoming visible, so a test can see the one before the other.
     #[cfg(test)]
@@ -559,6 +563,7 @@ impl GenerationInput {
             output_offset: AtomicU64::new(0),
             native_page: NativePage::default(),
             frontier: FrontierQueue::default(),
+            input_grammar: AtomicU8::new(0),
             #[cfg(test)]
             accept_park: std::sync::Mutex::new(None),
         }
@@ -918,6 +923,23 @@ impl GenerationInput {
         now: Instant,
     ) -> Result<Reported, Refusal> {
         self.with_records(|r, fifo| r.report(fifo, generation, key, report, now))
+    }
+
+    /// The agent's input grammar (Q83): strict until [`Self::set_input_grammar`].
+    pub fn input_grammar(&self) -> InputGrammar {
+        match self.input_grammar.load(Ordering::SeqCst) {
+            1 => InputGrammar::ClaudeMeasured,
+            _ => InputGrammar::Strict,
+        }
+    }
+
+    /// The generation's release latched with `grammar`.
+    pub fn set_input_grammar(&self, grammar: InputGrammar) {
+        let value = match grammar {
+            InputGrammar::Strict => 0,
+            InputGrammar::ClaudeMeasured => 1,
+        };
+        self.input_grammar.store(value, Ordering::SeqCst);
     }
 
     /// The generation's drain-frontier queue (Q35-20a).

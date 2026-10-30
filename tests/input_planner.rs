@@ -1,15 +1,18 @@
 //! PRD #1666 part 3 (Q35-16): the planner's pure parts
 //! (`src/composer_probe/planner.rs`): where a person's op is cut, how its
 //! native candidates are replayed over what the PTY took, and the physical
-//! boundary with its ground wake.
+//! boundary with its ground wake, and the measured input grammar it reads a
+//! Claude Code 2.1.310/2.1.312 generation's input with (Q83).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
+use std::time::{Duration, Instant};
 
 use dot_agent_deck::composer_probe::framing::Framing;
 use dot_agent_deck::composer_probe::planner::{
-    Boundary, Natives, Physical, PhysicalTracker, WakeAt, first_cut, is_candidate, next_cut,
+    Boundary, FLUSH_MARGIN, FLUSH_QUIET, FLUSH_RESPONSE, InputGrammar, Natives, Physical,
+    PhysicalTracker, WakeAt, first_cut, is_candidate, next_cut,
 };
 use spec::spec;
 
@@ -239,4 +242,131 @@ fn probe_076_a_transition_after_registration_wakes_the_waiter() {
     );
     assert!(wait.as_mut().poll(&mut cx).is_ready());
     assert!(poll_once(std::pin::pin!(physical.until_ground())).is_ready());
+}
+
+/// Scenario: Feed the writer's tracker, with Claude Code 2.1.310/2.1.312's measured input grammar, the user's `ESC [` then Ctrl+U, and separately `ESC [` then Enter: each C0 aborts the CSI, so the stream is in ground at once with no wait. The strict grammar keeps the same bytes inside the CSI.
+#[spec("inbox/probe/076")]
+#[test]
+fn probe_076_the_measured_grammar_aborts_a_csi_on_a_c0() {
+    let t0 = Instant::now();
+    for c0 in [0x15u8, b'\r', 0x07] {
+        let physical = Physical::default();
+        let mut tracker = PhysicalTracker::default();
+        tracker.written_with(b"\x1b[", &physical, InputGrammar::ClaudeMeasured, t0);
+        assert_eq!(physical.boundary(), Boundary::Inside);
+        tracker.written_with(&[c0], &physical, InputGrammar::ClaudeMeasured, t0);
+        assert_eq!(physical.boundary(), Boundary::Ground, "{c0:#x} aborts it");
+        assert!(
+            !physical.flushed(t0 + Duration::from_secs(10)),
+            "no flush pending"
+        );
+
+        let physical = Physical::default();
+        let mut tracker = PhysicalTracker::default();
+        tracker.written(b"\x1b[", &physical);
+        tracker.written(&[c0], &physical);
+        assert_eq!(physical.boundary(), Boundary::Inside, "{c0:#x}, strict");
+    }
+}
+
+/// Scenario: With the measured grammar, leave an OSC unfinished (`ESC ]` then Ctrl+U, which stays inside it): no deck byte may start inside the agent's 50 ms quiet window or the tracker's margin after it, so the stream counts as flushed only from 50 ms plus the margin after the last write, and then the writer's settle reads ground. A response-like prefix (`ESC ] 11;`) waits 2 s plus the margin; a lone ESC, an open paste and the strict grammar never flush.
+#[spec("inbox/probe/076")]
+#[test]
+fn probe_076_no_deck_byte_inside_the_agents_flush_window() {
+    let measured = InputGrammar::ClaudeMeasured;
+    let t0 = Instant::now();
+    let physical = Physical::default();
+    let mut tracker = PhysicalTracker::default();
+    tracker.written_with(b"\x1b]", &physical, measured, t0);
+    tracker.written_with(b"\x15", &physical, measured, t0 + Duration::from_millis(30));
+    let last = t0 + Duration::from_millis(30);
+    for inside in [0, 1, 49, 50, 449] {
+        let at = last + Duration::from_millis(inside);
+        assert!(!physical.flushed(at), "+{inside} ms is still inside");
+        assert_eq!(
+            tracker.settle(&physical, at),
+            Boundary::Inside,
+            "+{inside} ms"
+        );
+    }
+    let due = last + FLUSH_QUIET + FLUSH_MARGIN;
+    assert!(physical.flushed(due));
+    assert_eq!(tracker.settle(&physical, due), Boundary::Ground);
+
+    let physical = Physical::default();
+    let mut tracker = PhysicalTracker::default();
+    tracker.written_with(b"\x1b]11;", &physical, measured, t0);
+    assert!(
+        !physical.flushed(t0 + FLUSH_QUIET + FLUSH_MARGIN),
+        "a response-like prefix waits longer"
+    );
+    assert!(physical.flushed(t0 + FLUSH_RESPONSE + FLUSH_MARGIN));
+
+    for (what, bytes, grammar) in [
+        ("lone ESC", b"\x1b".as_slice(), measured),
+        ("paste", b"\x1b[200~abc", measured),
+        ("strict", b"\x1b]", InputGrammar::Strict),
+    ] {
+        let physical = Physical::default();
+        let mut tracker = PhysicalTracker::default();
+        tracker.written_with(bytes, &physical, grammar, t0);
+        assert!(!physical.flushed(t0 + Duration::from_secs(60)), "{what}");
+    }
+}
+
+/// Scenario: Only a latched Claude Code 2.1.310 or 2.1.312 reads with the measured grammar; another Claude release, and Codex, read strictly.
+#[spec("inbox/probe/076")]
+#[test]
+fn probe_076_the_grammar_follows_the_latched_release() {
+    use dot_agent_deck::event::AgentType;
+    let v = |p| semver::Version::new(2, 1, p);
+    assert_eq!(
+        InputGrammar::of(&AgentType::ClaudeCode, &v(310)),
+        InputGrammar::ClaudeMeasured
+    );
+    assert_eq!(
+        InputGrammar::of(&AgentType::ClaudeCode, &v(312)),
+        InputGrammar::ClaudeMeasured
+    );
+    assert_eq!(
+        InputGrammar::of(&AgentType::ClaudeCode, &v(314)),
+        InputGrammar::Strict
+    );
+    assert_eq!(
+        InputGrammar::of(&AgentType::Codex, &semver::Version::new(0, 164, 0)),
+        InputGrammar::Strict
+    );
+}
+
+/// Scenario: With the measured grammar, leave an OSC unfinished, then let the agent's flush come due with no write in between. A key the user types after it is read from ground, not as more of the dead string, so a plain key leaves the stream in ground; and a waiter for a deck line, registered while the OSC was open, resolves at the flush with no further write.
+#[spec("inbox/probe/076")]
+#[tokio::test(flavor = "current_thread")]
+async fn probe_076_the_flush_ends_the_sequence_for_writes_and_waiters() {
+    let measured = InputGrammar::ClaudeMeasured;
+    let t0 = Instant::now();
+    let physical = Physical::default();
+    let mut tracker = PhysicalTracker::default();
+    tracker.written_with(b"\x1b]", &physical, measured, t0);
+    let due = t0 + FLUSH_QUIET + FLUSH_MARGIN;
+    tracker.written_with(b"x", &physical, measured, due + Duration::from_millis(1));
+    assert_eq!(
+        tracker.boundary(),
+        Boundary::Ground,
+        "the key after the flush"
+    );
+
+    let physical = Arc::new(Physical::default());
+    let mut tracker = PhysicalTracker::default();
+    tracker.written_with(b"\x1b]", &physical, measured, Instant::now());
+    let waiter = tokio::spawn({
+        let physical = Arc::clone(&physical);
+        async move { physical.until_line().await }
+    });
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished(), "inside the window");
+    tokio::time::sleep(FLUSH_QUIET + FLUSH_MARGIN + Duration::from_millis(5)).await;
+    tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("the flush wakes the waiter")
+        .unwrap();
 }

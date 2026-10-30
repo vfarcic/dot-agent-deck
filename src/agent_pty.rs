@@ -2267,6 +2267,17 @@ impl AgentBus {
         }
         let latch_changed = !release.is_empty();
         for event in release {
+            // Q83: the generation's input grammar follows its latched
+            // release.
+            if let crate::release_scanner::CaptureEvent::Latched(latch)
+            | crate::release_scanner::CaptureEvent::Closed { latch, .. } = &event
+                && let crate::release_scanner::ScanLatch::Latched { agent, release, .. } = latch
+            {
+                self.input
+                    .set_input_grammar(crate::composer_probe::planner::InputGrammar::of(
+                        agent, release,
+                    ));
+            }
             self.log_release(&event);
         }
         // PRD #1666 part 3 (Q35-14b): an installed generation's observer
@@ -6073,7 +6084,7 @@ impl PtyWriterThread {
                         Some(check) => check(
                             &state,
                             &crate::doorbell_txn::StartCtx {
-                                boundary: tracker.boundary(),
+                                boundary: tracker.settle(&thread_physical, Instant::now()),
                                 retired: recorder.retired.load(Ordering::SeqCst),
                                 now: Instant::now(),
                             },
@@ -6688,7 +6699,12 @@ struct Tracking<'a> {
 
 impl Tracking<'_> {
     fn written(&mut self, written: &[u8]) {
-        self.tracker.written(written, self.physical);
+        self.tracker.written_with(
+            written,
+            self.physical,
+            self.input.input_grammar(),
+            Instant::now(),
+        );
         if let Some(natives) = self.natives.as_mut() {
             let input = self.input;
             natives.written(written, |seq| input.enter_native(seq, Instant::now()));
@@ -27023,6 +27039,41 @@ mod spawn_tests {
         let typed = editor.typed();
         assert!(typed.starts_with(b"\x1b[C"), "{typed:?}");
         assert!(typed_line(&typed[3..]).is_some(), "{typed:?}");
+        registry.shutdown_all();
+    }
+
+    /// Scenario: The model editor latches Claude Code 2.1.310, so its input is read with the measured grammar. The user types an unfinished OSC (`ESC ]`), and a ring starts at once: it writes no byte while the agent's flush window (50 ms plus the tracker's margin) runs, ending at its 300 ms bound with nothing written, the pane holding only the user's bytes.
+    #[spec("inbox/probe/076")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn probe_076_a_ring_writes_nothing_inside_the_agents_flush_window() {
+        use crate::composer_probe::planner::{FLUSH_MARGIN, FLUSH_QUIET, InputGrammar};
+        use crate::doorbell_txn::{NotTyped, Outcome};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-flush-window", OnEnter::Submit);
+        registry.set_pty_write_stall_bound_for_test(Duration::from_millis(300));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while editor.bus.input().input_grammar() != InputGrammar::ClaudeMeasured {
+            assert!(Instant::now() < deadline, "the release never latched");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, b"\x1b]")
+            .await
+            .unwrap();
+        let written = Instant::now();
+        typed_until(&editor, |t| t == b"\x1b]").await;
+        let report = editor.ring().await;
+        let ended = written.elapsed();
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::NothingWritten(NotTyped::OffGround)),
+            "{report:?}"
+        );
+        assert_eq!(editor.typed(), b"\x1b]", "no deck byte inside the window");
+        assert!(
+            ended < FLUSH_QUIET + FLUSH_MARGIN,
+            "the ring's bound ended inside the window ({ended:?}), so the check covered it"
+        );
         registry.shutdown_all();
     }
 

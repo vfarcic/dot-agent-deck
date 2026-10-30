@@ -374,6 +374,46 @@ impl Framing {
         self.state == State::Esc && !self.paste
     }
 
+    /// Whether the stream ends inside a CSI (Q83: a measured grammar aborts
+    /// one on a C0).
+    pub fn in_csi(&self) -> bool {
+        self.state == State::Csi
+    }
+
+    /// Whether a bracketed paste is open.
+    pub fn in_paste(&self) -> bool {
+        self.paste
+    }
+
+    /// Drop the escape sequence or string the stream ends in, as an agent's
+    /// reader does that abandons it (Q83), leaving the stream in ground; a
+    /// paste stays open.
+    pub fn abandon(&mut self) {
+        self.state = State::Ground;
+    }
+
+    /// Whether the unfinished sequence the stream ends in is one Claude Code
+    /// 2.1.310/2.1.312's key reader keeps for its 2 s response budget rather
+    /// than flushing after 50 ms (its `ll` recogniser, Q83), read wider, never
+    /// narrower: any CSI with a byte after `ESC [` (`ll` takes an SGR mouse
+    /// prefix and `ESC [` followed by parameters, or by a private marker,
+    /// parameters and intermediates), an OSC whose first byte is a digit, a
+    /// DCS whose first byte is one of `0-9 > | $ + = !`, and an APC starting
+    /// `G`, at any length (`ll` bounds them at 32, 64 or 256 bytes).
+    pub fn response_like_prefix(&self) -> bool {
+        let first = (self.len > 0).then(|| self.buf[0]);
+        match self.state {
+            State::Csi => self.started,
+            State::Str { kind, .. } => match (kind, first) {
+                (StringKind::Osc, Some(b)) => b.is_ascii_digit(),
+                (StringKind::Dcs, Some(b)) => b.is_ascii_digit() || b">|$+=!".contains(&b),
+                (StringKind::Apc, Some(b)) => b == b'G',
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     fn token<'a>(&self, event: Event<'a>) -> Token<'a> {
         Token {
             event,
