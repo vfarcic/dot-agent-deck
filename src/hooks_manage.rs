@@ -46,6 +46,29 @@ const STOP_FAILURE_HOOK: &str = "StopFailure";
 /// version is treated as older.
 pub const STOP_FAILURE_MIN_CLAUDE_VERSION: (u64, u64, u64) = (2, 1, 78);
 
+/// Issue #1835: the hook Claude Code fires INSTEAD of `PostToolUse` when a tool
+/// call fails — a Bash command exiting non-zero, say. Without it the deck never
+/// hears that the call ended: the card keeps the command as its running tool,
+/// and the call's `agent.operation` span stays open until the run ends.
+/// Installed with no matcher, and only for a Claude Code at least
+/// [`POST_TOOL_USE_FAILURE_MIN_CLAUDE_VERSION`].
+const POST_TOOL_USE_FAILURE_HOOK: &str = "PostToolUseFailure";
+
+/// Issue #1835: the first Claude Code release the deck installs
+/// [`POST_TOOL_USE_FAILURE_HOOK`] for.
+///
+/// The key first appears in Claude Code's bundle between 2.0.55 and 2.0.60,
+/// but this is the release it was MEASURED on: on 2026-10-30, with a sandboxed
+/// `HOME`, a `settings.json` holding `SessionStart`, `UserPromptSubmit`,
+/// `PreToolUse`, `PostToolUse`, `PostToolUseFailure` and `Stop` command hooks,
+/// and `claude -p` (Haiku) running a Bash `false`, 2.1.78 and 2.1.314 both ran
+/// every hook and fired `PostToolUseFailure` (with the call's `tool_use_id`,
+/// and no `PostToolUse`) for the failed call. It equals
+/// [`STOP_FAILURE_MIN_CLAUDE_VERSION`], so the "an older release drops every
+/// hook given an unknown key" hazard (issue #714) is covered for the releases
+/// below it too. An unknown version is treated as older.
+pub const POST_TOOL_USE_FAILURE_MIN_CLAUDE_VERSION: (u64, u64, u64) = (2, 1, 78);
+
 /// PRD #1631: the hook Claude Code runs when it is about to ask the user for
 /// permission — a tool prompt, an `AskUserQuestion` form, a plan approval. Its
 /// payload carries the question, and a decision printed by a hook that is still
@@ -80,6 +103,8 @@ pub const PERMISSION_REQUEST_HOOK_TIMEOUT_SECS: u64 = 3600;
 pub struct ClaudeHookGates {
     pub stop_failure: bool,
     pub permission_request: bool,
+    /// Issue #1835 ([`POST_TOOL_USE_FAILURE_MIN_CLAUDE_VERSION`]).
+    pub post_tool_use_failure: bool,
     /// The native inbox waiter (PRD #1666, [`CLAUDE_ASYNC_REWAKE_MIN`]).
     pub async_rewake: bool,
 }
@@ -91,6 +116,8 @@ impl ClaudeHookGates {
         Self {
             stop_failure: version.is_some_and(|v| v >= STOP_FAILURE_MIN_CLAUDE_VERSION),
             permission_request: version.is_some_and(|v| v >= PERMISSION_REQUEST_MIN_CLAUDE_VERSION),
+            post_tool_use_failure: version
+                .is_some_and(|v| v >= POST_TOOL_USE_FAILURE_MIN_CLAUDE_VERSION),
             async_rewake: version.is_some_and(|v| v >= CLAUDE_ASYNC_REWAKE_MIN),
         }
     }
@@ -480,6 +507,7 @@ fn hook_types_all() -> Vec<&'static str> {
     hook_types(ClaudeHookGates {
         stop_failure: true,
         permission_request: true,
+        post_tool_use_failure: true,
         async_rewake: true,
     })
 }
@@ -493,6 +521,9 @@ fn hook_types(gates: ClaudeHookGates) -> Vec<&'static str> {
     }
     if gates.permission_request {
         types.push(PERMISSION_REQUEST_HOOK);
+    }
+    if gates.post_tool_use_failure {
+        types.push(POST_TOOL_USE_FAILURE_HOOK);
     }
     types
 }
@@ -1251,8 +1282,13 @@ fn uninstall_impl(settings: &mut Value) -> UninstallOutcome {
     }
     // Issue #714: an emptied `StopFailure` key goes too — an older Claude Code
     // rejects the key itself, empty or not. PRD #1631: so does an emptied
-    // `PermissionRequest`, for the same reason.
-    for gated in [STOP_FAILURE_HOOK, PERMISSION_REQUEST_HOOK] {
+    // `PermissionRequest`, for the same reason, and issue #1835 an emptied
+    // `PostToolUseFailure`.
+    for gated in [
+        STOP_FAILURE_HOOK,
+        PERMISSION_REQUEST_HOOK,
+        POST_TOOL_USE_FAILURE_HOOK,
+    ] {
         if hooks
             .get(gated)
             .and_then(|v| v.as_array())
@@ -1738,6 +1774,17 @@ pub fn install_with(resolve: impl FnOnce() -> Result<String, String>) -> Result<
              reported {}, and the deck installs it only for Claude Code {major}.{minor}.{patch} \
              or newer. Without it, a Claude Code agent's questions cannot be answered from the \
              desktop app. Run this again after updating Claude Code.",
+            claude_version.as_deref().unwrap_or("nothing usable")
+        );
+    }
+    if !gates.post_tool_use_failure {
+        let (major, minor, patch) = POST_TOOL_USE_FAILURE_MIN_CLAUDE_VERSION;
+        println!(
+            "Note: the {POST_TOOL_USE_FAILURE_HOOK} hook was not installed: `claude --version` \
+             reported {}, and the deck installs it only for Claude Code {major}.{minor}.{patch} \
+             or newer. Without it, a Claude Code tool call that fails stays on the agent's card \
+             as its running tool until the agent's next step. Run this again after updating \
+             Claude Code.",
             claude_version.as_deref().unwrap_or("nothing usable")
         );
     }
@@ -2290,6 +2337,7 @@ mod tests {
             ClaudeHookGates {
                 stop_failure: true,
                 permission_request: true,
+                post_tool_use_failure: true,
                 async_rewake: false,
             }
         );
@@ -2298,6 +2346,7 @@ mod tests {
             ClaudeHookGates {
                 stop_failure: true,
                 permission_request: false,
+                post_tool_use_failure: true,
                 async_rewake: false,
             }
         );
@@ -2378,6 +2427,7 @@ mod tests {
         let gates = ClaudeHookGates {
             stop_failure: false,
             permission_request: false,
+            post_tool_use_failure: false,
             async_rewake: true,
         };
         let old = crate::test_paths::abs("/opt/old/dot-agent-deck");
@@ -2419,6 +2469,7 @@ mod tests {
         let gates = ClaudeHookGates {
             stop_failure: false,
             permission_request: false,
+            post_tool_use_failure: false,
             async_rewake: true,
         };
         let binary = crate::test_paths::abs("/opt/deck/dot-agent-deck");
