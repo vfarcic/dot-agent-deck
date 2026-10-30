@@ -78,10 +78,13 @@ pub struct GenerationDoorbell {
     /// A first attempt was admitted: later rings do not wait for the settle
     /// window (plan §4.4).
     first_admitted: AtomicBool,
-    /// The e2e build's stand-in editor's executable, when its profile was
-    /// selected for this generation.
+    /// The e2e build's stand-in editor's executable and the stand-in profile
+    /// selected for this generation, when one was.
     #[cfg(feature = "e2e")]
-    standin: Option<std::path::PathBuf>,
+    standin: Option<(
+        std::path::PathBuf,
+        &'static crate::doorbell_screen::ScreenProfile,
+    )>,
     /// What to do when a move outside a transaction (the hook arm's
     /// evidence, the user's own clear) changed the cell: the registry asks
     /// for the generation's re-projection.
@@ -130,20 +133,29 @@ impl GenerationDoorbell {
         }
     }
 
-    /// The e2e build's stand-in profile was selected for this generation,
-    /// for `binary`.
+    /// An e2e build's stand-in profile was selected for this generation,
+    /// for its executable.
     #[cfg(feature = "e2e")]
-    pub fn with_standin(self, binary: Option<std::path::PathBuf>) -> Self {
-        Self {
-            standin: binary,
-            ..self
-        }
+    pub fn with_standin(
+        self,
+        standin: Option<(
+            std::path::PathBuf,
+            &'static crate::doorbell_screen::ScreenProfile,
+        )>,
+    ) -> Self {
+        Self { standin, ..self }
     }
 
-    /// The stand-in's executable, when its profile was selected.
+    /// The stand-in's executable, when a stand-in profile was selected.
     #[cfg(feature = "e2e")]
     pub fn standin(&self) -> Option<&std::path::Path> {
-        self.standin.as_deref()
+        self.standin.as_ref().map(|(binary, _)| binary.as_path())
+    }
+
+    /// The stand-in profile selected, when one was.
+    #[cfg(feature = "e2e")]
+    pub fn standin_profile(&self) -> Option<&'static crate::doorbell_screen::ScreenProfile> {
+        self.standin.as_ref().map(|(_, profile)| *profile)
     }
 
     /// A generation whose attempt numbers start at `next` (tests reach the

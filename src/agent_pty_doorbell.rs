@@ -304,14 +304,17 @@ impl AgentPtyRegistry {
         lock: impl FnOnce(&'s Mutex<AgentBusState>) -> Option<std::sync::MutexGuard<'s, AgentBusState>>,
     ) -> Option<Result<Typing, &'static str>> {
         #[cfg(feature = "e2e")]
-        if let Some(binary) = generation.doorbell.standin() {
+        if let (Some(binary), Some(profile)) = (
+            generation.doorbell.standin(),
+            generation.doorbell.standin_profile(),
+        ) {
             if !crate::doorbell_screen::standin_running(generation.child_pid, binary) {
                 return Some(Err(
                     crate::doorbell_activation::NoGo::UnmeasuredRelease.clause()
                 ));
             }
             return Some(Ok(Typing {
-                profile: &crate::doorbell_screen::STANDIN_PROFILE,
+                profile,
                 caps: txn::Caps {
                     delete_key: true,
                     placeholder: true,
@@ -447,8 +450,8 @@ impl AgentPtyRegistry {
     ) -> Option<crate::composer_model::Semantics> {
         let generation = self.doorbell_generation(pane_id, agent_id)?;
         #[cfg(feature = "e2e")]
-        if generation.doorbell.standin().is_some() {
-            return Some(crate::doorbell_screen::STANDIN_PROFILE.input);
+        if let Some(profile) = generation.doorbell.standin_profile() {
+            return Some(profile.input);
         }
         let state = generation.bus.state.lock().unwrap();
         state.evidence.profile().map(|profile| profile.input)
@@ -560,6 +563,29 @@ impl AgentPtyRegistry {
                 bus.evidence().0,
                 crate::evidence_state::EvidenceStatus::Dirty { .. }
                     | crate::evidence_state::EvidenceStatus::Pending { .. }
+            )
+        })
+    }
+
+    /// PRD #1666 part 3 (Q35-18b, O1; A1 §4.3, A2 §6, A3 §6.4): whether
+    /// `agent_id`'s evidence-refresh nudge may fire at `now`: its evidence
+    /// is Dirty or Pending and `now` has reached its generation's query-wait
+    /// estimate, or there is none
+    /// ([`crate::composer_probe::query_wait::nudge_due`]). An agent that
+    /// redraws by itself before then needs no nudge. Availability only: it
+    /// decides nothing about safety, and once the size changes and queries
+    /// stop, the estimate stops moving and the nudge comes due.
+    pub fn doorbell_nudge_due(&self, agent_id: &str, now: Instant) -> bool {
+        let bus = {
+            let inner = self.inner.lock();
+            inner.agents.get(agent_id).map(|a| Arc::clone(&a.bus))
+        };
+        bus.is_some_and(|bus| {
+            let evidence = bus.evidence().0;
+            crate::composer_probe::query_wait::nudge_due(
+                &evidence,
+                bus.input().query_wait_estimate(),
+                now,
             )
         })
     }

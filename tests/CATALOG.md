@@ -10607,6 +10607,13 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** that a real Codex or Claude Code redraws within its declared time (M41, the profiles' measurements); anything reading the estimate: O1's nudge (Q35-18b, `inbox/probe/055`) or O5's admission hint (Q35-19); P-WE itself (M-WE); a round trip between rules, which production never makes (it adopts once, from the counted rule).
 - **Platform coverage:** all.
 
+##### inbox/probe/055 — The doorbell's evidence-refresh nudge waits until the agent's own redraw is due by its query-wait estimate, so an agent that redraws by itself after a resize is never nudged, and one that doesn't is nudged once.
+- **Layer:** L2 lane 1 (`tests/e2e_inbox_redraw_wait.rs`), real binary, daemon, doorbell tick and daemon-owned PTY, resized through the attach socket; nudges counted and timed from the doorbell's debug log line.
+- **Agent:** none (the CPR stand-in, `tests/support/cpr_composer.py`, selected by `DOT_AGENT_DECK_TEST_COMPOSER_PROFILE=standin-cpr` with `DOT_AGENT_DECK_TEST_COMPOSER_BINARY` naming it: the doorbell stand-in's screen, which on a size change asks for the cursor position, gets no answer and redraws 2 s later at the size it has then; its profile declares 2 s per size change and a 1.5 s margin).
+- **Asserts:** an Idle stand-in resized once with a task queued gets no nudge and is rung after its own redraw; a burst of five resizes 50 ms apart (130, 129, 130, 129, 130 columns) gets no nudge and is rung; a stand-in that never redraws after a size change is nudged exactly once, no earlier than the resize plus 2 s plus the margin, and not again over the next 4 s, its task staying queued; a stand-in with no width witness from start-up and no size change since spawn is nudged once, as before O1, and rung after the redraw that nudge brings.
+- **Does not assert:** that a real Codex or Claude Code redraws within its declared time (M41); eventual firing under continuing size changes or queries, which can keep moving the estimate (A2 §6); a nudge's timing for an agent the deck doesn't type into (it never nudges one).
+- **Platform coverage:** linux.
+
 #### inbox/boundary
 
 ##### inbox/boundary/001 — No ack-wait redelivers a receipt hand-out.

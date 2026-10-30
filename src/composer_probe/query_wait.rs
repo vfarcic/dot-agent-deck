@@ -13,11 +13,12 @@
 //! checked; an update whose arithmetic overflows leaves no estimate, which a
 //! caller reads as due at its next evaluation (A3 §6.4).
 //!
-//! Who feeds and reads it, as of this commit: the generation's input
+//! Who feeds and reads it: the generation's input
 //! (`super::epoch::GenerationInput`) keeps it under its leaf lock, fed by the
 //! bus at each applied size change and nudge edge and by the output hook's
-//! query notes; nothing reads it to decide. O1's nudge (Q35-18b) and O5's
-//! admission hint (Q35-19) are its callers, through [`nudge_due`] and
+//! query notes. O1 (Q35-18b) reads it: the doorbell tick's evidence-refresh
+//! nudge waits for it through [`nudge_due`], which decides when a nudge is
+//! sent and nothing about safety. O5's admission hint (Q35-19) is to read
 //! [`QueryWaitEstimate::estimate`]. Reading it writes nothing.
 
 use std::time::{Duration, Instant};
@@ -142,7 +143,8 @@ impl QueryWaitEstimate {
 /// a nudge's own edges move the estimate, and a start-up or a learned
 /// profile with no size change since spawn has its estimate at spawn plus
 /// the margin. The other conjuncts (idle, not held, once per episode) stay
-/// with the doorbell tick. No caller yet (Q35-18b).
+/// with the doorbell tick, which asks this through
+/// `AgentPtyRegistry::doorbell_nudge_due` (Q35-18b).
 pub fn nudge_due(evidence: &EvidenceStatus, estimate: Option<Instant>, now: Instant) -> bool {
     matches!(
         evidence,

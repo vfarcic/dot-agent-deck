@@ -872,6 +872,11 @@ async fn run_tick(
             && registry.doorbell_settling(&pane, &agent, hooked);
         let suspended = registry.doorbell_suspended(&agent);
         let dirty = queued && refused.is_none() && registry.doorbell_evidence_dirty(&agent);
+        // PRD #1666 part 3 (Q35-18b, O1): the nudge waits until the agent's
+        // own redraw is due by its generation's query-wait estimate. That
+        // estimate is real time, so it is read against the real clock even
+        // where an e2e build's policy clock runs ahead.
+        let due = dirty && registry.doorbell_nudge_due(&agent, Instant::now());
         let (action, nudge, rering) = {
             let mut slots = slots.lock().unwrap_or_else(|e| e.into_inner());
             let slot = slots.entry((pane.clone(), agent.clone())).or_default();
@@ -937,8 +942,8 @@ async fn run_tick(
             slot.bell.observe(&facts);
             // Plan §2.2's evidence-refresh nudge: once per episode, between
             // attempts, for a screen that stays Dirty with nothing redrawing
-            // it.
-            let nudge = dirty && facts.idle && !facts.held && !working && slot.nudged.is_none();
+            // it, once the agent's own redraw was due (O1).
+            let nudge = due && facts.idle && !facts.held && !working && slot.nudged.is_none();
             if nudge {
                 slot.nudged = Some(input.turns);
             }

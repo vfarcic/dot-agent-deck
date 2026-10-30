@@ -13885,16 +13885,18 @@ impl AgentPtyRegistry {
         // has a profile of its own, chosen only by its explicit selector and
         // executable path.
         #[cfg(feature = "e2e")]
-        let standin =
-            crate::doorbell_screen::standin_selected(&captured_env, spawn_command.as_deref())
-                .or_else(crate::doorbell_screen::standin_from_daemon_env);
+        let standin = crate::doorbell_screen::standin_selected_profile(
+            &captured_env,
+            spawn_command.as_deref(),
+        )
+        .or_else(|| {
+            crate::doorbell_screen::standin_from_daemon_env()
+                .map(|binary| (binary, &crate::doorbell_screen::STANDIN_PROFILE))
+        });
         let profile = crate::doorbell_screen::profile_for_agent(spawn_agent_type.as_ref());
-        // A pane that names the stand-in wants it, whatever type it starts as.
+        // A pane that names a stand-in wants it, whatever type it starts as.
         #[cfg(feature = "e2e")]
-        let profile = standin
-            .as_ref()
-            .map(|_| &crate::doorbell_screen::STANDIN_PROFILE)
-            .or(profile);
+        let profile = standin.as_ref().map(|(_, profile)| *profile).or(profile);
         let bus = Arc::new(AgentBus::for_generation(
             &preallocated_id,
             profile,

@@ -867,6 +867,11 @@ pub const STANDIN_SELECTOR_ENV: &str = "DOT_AGENT_DECK_TEST_COMPOSER_PROFILE";
 #[cfg(feature = "e2e")]
 pub const STANDIN_BINARY_ENV: &str = "DOT_AGENT_DECK_TEST_COMPOSER_BINARY";
 
+/// The selector's value that picks [`STANDIN_CPR_PROFILE`] instead
+/// (`inbox/probe/055`).
+#[cfg(feature = "e2e")]
+pub const STANDIN_CPR_SELECTOR: &str = "standin-cpr";
+
 #[cfg(feature = "e2e")]
 const STANDIN_READY: &str = "DOORBELL-STANDIN-READY";
 #[cfg(feature = "e2e")]
@@ -997,6 +1002,32 @@ pub static STANDIN_PROFILE: ScreenProfile = ScreenProfile {
     },
 };
 
+/// The e2e build's CPR stand-in (`tests/support/cpr_composer.py`,
+/// `inbox/probe/055`): the stand-in's screen, except that on a size change
+/// it asks for the cursor position, as Codex's input loop does, gets no
+/// answer, and redraws 2 s later at the size it has then. Its redraw timing
+/// is that contract, with a margin for a loaded machine's scheduling.
+#[cfg(feature = "e2e")]
+pub static STANDIN_CPR_PROFILE: ScreenProfile = ScreenProfile {
+    id: "e2e-standin-cpr",
+    composer: standin_composer,
+    ready: standin_ready,
+    placeholder: standin_placeholder,
+    dialog: standin_dialog,
+    transcript_user_line: standin_transcript_user_line,
+    redraw_marker: b"\x1b[2J\x1b[H",
+    width_witness: standin_width_witness,
+    min_cols: 40,
+    input: crate::composer_model::Semantics::ClaudeCode,
+    cpr_wait_end: crate::composer_probe::query_ledger::CprWaitEnd::Counted,
+    redraw: crate::composer_probe::query_wait::RedrawTiming {
+        per_size_change: std::time::Duration::from_millis(2000),
+        margin: std::time::Duration::from_millis(1500),
+        cap: std::time::Duration::from_secs(120),
+        waits_on: &[crate::composer_probe::query_ledger::QueryKind::Cpr],
+    },
+};
+
 /// The `editor_probe` record the e2e stand-ins follow, for each agent they
 /// stand in for: what an e2e run's assumption
 /// ([`crate::doorbell_activation::assumed_editor_probes`]) gives a recorded
@@ -1055,6 +1086,32 @@ pub fn standin_selected(
     env: &[(String, String)],
     command: Option<&str>,
 ) -> Option<std::path::PathBuf> {
+    selected_by(env, command, "standin")
+}
+
+/// The stand-in a pane's spawn selects and the profile it selects it with:
+/// [`standin_selected`] under [`STANDIN_PROFILE`], or the same rule with the
+/// selector [`STANDIN_CPR_SELECTOR`] under [`STANDIN_CPR_PROFILE`].
+#[cfg(feature = "e2e")]
+pub fn standin_selected_profile(
+    env: &[(String, String)],
+    command: Option<&str>,
+) -> Option<(std::path::PathBuf, &'static ScreenProfile)> {
+    standin_selected(env, command)
+        .map(|binary| (binary, &STANDIN_PROFILE))
+        .or_else(|| {
+            selected_by(env, command, STANDIN_CPR_SELECTOR)
+                .map(|binary| (binary, &STANDIN_CPR_PROFILE))
+        })
+}
+
+/// [`standin_selected`]'s rule for the selector value `selector`.
+#[cfg(feature = "e2e")]
+fn selected_by(
+    env: &[(String, String)],
+    command: Option<&str>,
+    selector: &str,
+) -> Option<std::path::PathBuf> {
     let command = command?;
     let value = |name: &str| -> Option<String> {
         if let Some((_, v)) = env.iter().rev().find(|(k, _)| k == name) {
@@ -1068,7 +1125,7 @@ pub fn standin_selected(
         };
         Some(raw.to_string())
     };
-    if value(STANDIN_SELECTOR_ENV).as_deref() != Some("standin") {
+    if value(STANDIN_SELECTOR_ENV).as_deref() != Some(selector) {
         return None;
     }
     let binary = std::path::PathBuf::from(value(STANDIN_BINARY_ENV)?);
