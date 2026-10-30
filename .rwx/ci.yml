@@ -474,7 +474,7 @@ tasks:
       # release's checksums.txt), rather than the get.jetify.com script.
       curl -fsSLo /tmp/devbox.tar.gz \
         "https://github.com/jetify-com/devbox/releases/download/${DEVBOX_USE_VERSION}/devbox_${DEVBOX_USE_VERSION}_linux_amd64.tar.gz"
-      echo "5b452a778b620fcbff460fe9cbd86ad87f5eb50b8b58923a429a5cf189fbf00d  /tmp/devbox.tar.gz" | sha256sum -c -
+      echo "13a9c9ca15ffef279f5c37694e7feeeeaed93d7ab7b0a69c7b4301a06bcd21ba  /tmp/devbox.tar.gz" | sha256sum -c -
       sudo tar -xzf /tmp/devbox.tar.gz -C /usr/local/bin devbox
       devbox run -- bash scripts/devbox-smoke.sh
 
