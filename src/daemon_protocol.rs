@@ -17000,7 +17000,9 @@ mod question_answer_tests {
     /// agent's input. The first is written when the check ends, and its
     /// settlement says written, under its own token; while it waited, every
     /// look at the agent showed it queued or showed its settlement, never
-    /// neither. The second's agent is closed while it waits: nothing is
+    /// neither. The second answers a two-question form in a pane the person
+    /// typed in earlier, and both its keys are typed. The third's agent is
+    /// closed while it waits: nothing is
     /// typed, the reservation clears, and its settlement says retired. A
     /// late end of an earlier answer's place never frees a newer one's, and
     /// the agent's list keeps its 8 newest settlements for 120 seconds.
@@ -17050,6 +17052,29 @@ mod question_answer_tests {
         assert_eq!(
             fx.settlements().await,
             [settled("call_one", revision, 5, SettlementOutcome::Written)]
+        );
+
+        // A two-key answer held after the person typed in the pane: its next
+        // key is checked against the first key's acceptance, so both are
+        // typed.
+        let fx = Fixture::start(AgentType::Codex).await;
+        fx.registry.note_user_input(PANE);
+        fx.ask_ingested(&codex_form("call_form")).await;
+        let revision = fx.pending_question().await.unwrap().revision;
+        fx.fence();
+        let answering = fx.tokened_task("call_form", vec![one(0, 2), one(1, 1)], Some(7));
+        fx.until_held(1).await;
+        fx.release().await;
+        assert_eq!(answering.await.unwrap(), Ok(()));
+        assert!(fx.screen_shows("21").await, "both keys were typed");
+        assert_eq!(
+            fx.settlements().await,
+            [settled(
+                "call_form",
+                revision,
+                7,
+                SettlementOutcome::Written
+            )]
         );
 
         // Retired: the agent closes while its answer is held.
