@@ -2451,6 +2451,9 @@ struct QuestionConnection<'a, R, W> {
     slot: &'a mut Option<tokio::sync::OwnedSemaphorePermit>,
     holds: &'a Arc<tokio::sync::Semaphore>,
     hold_deadline: Duration,
+    /// The bound on the `held` line's write: the connection's idle timeout,
+    /// as for every other reply on it (issue #1976).
+    write_timeout: Duration,
 }
 
 /// PRD #1631: apply a producer's [`crate::event::QuestionSignal`] and, for a
@@ -2490,7 +2493,8 @@ struct QuestionConnection<'a, R, W> {
 ///
 /// Returns the reply line to write — with, for an answer, where to report
 /// what became of it ([`crate::agent_pty::ReplyDelivery`]) — or `None` when
-/// the producer's connection closed while it waited: the producer is gone, so
+/// the producer's connection closed while it waited, or its `held` line could
+/// not be written within `write_timeout` (issue #1976): the producer is gone, so
 /// the question goes too (Claude Code kills its hook when the keyboard answers
 /// No or Esc [observed]); the status is left for the next event to decide.
 async fn handle_question_signal<R, W>(
@@ -2578,16 +2582,26 @@ where
     // Held: the hook-pool slot goes back, so this wait never queues another
     // producer's hook (audit A6). `_budget` bounds it instead.
     drop(conn.slot.take());
-    if confirm_hold && let Ok(json) = serde_json::to_string(&QuestionReply::held(&id)) {
-        // A failed write means the producer is gone, which the read below
-        // sees as well.
-        let _ = async {
-            conn.writer
-                .write_all(format!("{json}\n").as_bytes())
-                .await?;
-            conn.writer.flush().await
-        }
+    if confirm_hold
+        && let Ok(json) = serde_json::to_string(&QuestionReply::held(&id))
+        && write_hook_reply(conn.writer, &format!("{json}\n"), conn.write_timeout)
+            .await
+            .is_err()
+    {
+        // Issue #1976: a producer that cannot be written to within the idle
+        // timeout is released as one that hung up, so it cannot park this
+        // handler, and its hold-budget permit, before the deadline below.
+        drop_held_question(
+            state,
+            event_tx,
+            registry,
+            &pane_id,
+            &id,
+            hold.generation,
+            "the producer did not read its held line",
+        )
         .await;
+        return None;
     }
     // Any read outcome means the producer is gone or misbehaving: a holding
     // producer sends nothing more on this connection.
@@ -7261,6 +7275,7 @@ async fn run_hook_loop_with_limits(
                                             slot: &mut permit,
                                             holds: &hold_limit,
                                             hold_deadline: limits.hold_deadline,
+                                            write_timeout: idle_timeout,
                                         },
                                     )
                                     .await
@@ -8884,6 +8899,7 @@ mod hook_ingestion_tests {
                 slot: &mut slot,
                 holds: &holds,
                 hold_deadline: Duration::from_secs(5),
+                write_timeout: Duration::from_secs(5),
             },
         )
         .await;
@@ -19631,6 +19647,11 @@ mod hook_pin_refresh_tests {
 #[cfg(all(test, unix))]
 #[path = "daemon_hook_reply_deadline_tests.rs"]
 mod hook_reply_deadline_tests;
+
+// Unix-only, like `question_hold_tests`, which it sits beside.
+#[cfg(all(test, unix))]
+#[path = "daemon_held_confirmation_deadline_tests.rs"]
+mod held_confirmation_deadline_tests;
 
 // Issue #1664: one session's hook events apply in the order they were sent.
 // Unix-only, like `hook_reply_deadline_tests`: it drives the loop over a Unix

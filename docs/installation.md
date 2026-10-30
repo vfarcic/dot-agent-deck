@@ -185,7 +185,7 @@ The deck learns each agent's status (Thinking, Working, Needs Input, and so on) 
 
 | Agent | Installed when | What is written |
 |---|---|---|
-| Claude Code | `~/.claude` exists | Hook entries in `~/.claude/settings.json`. The `StopFailure` hook (used for **Error** and **Blocked**) only when `claude --version` reports 2.1.78 or newer. |
+| Claude Code | `~/.claude` exists | Hook entries in `~/.claude/settings.json`. The `StopFailure` hook (used for **Error** and **Blocked**) and the `PostToolUseFailure` hook (which tells the deck that a tool call that failed has ended) only when `claude --version` reports 2.1.78 or newer. |
 | OpenCode | `$XDG_CONFIG_HOME/opencode` (default `~/.config/opencode`) or `~/.opencode` exists; checked again every time the deck starts an OpenCode agent | The plugin file `plugin/dot-agent-deck.js` under that directory. |
 | Codex | `codex` is on the daemon's `PATH` | Hooks in `$CODEX_HOME/hooks.json` (default `~/.codex`), and trust for those hooks. |
 | Devin | `devin` is on the daemon's `PATH` | Hook entries in `$XDG_CONFIG_HOME/devin/config.json` (default `~/.config/devin/config.json`). |
