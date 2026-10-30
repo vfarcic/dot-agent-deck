@@ -112,7 +112,7 @@ It has to work across orchestration, dispatch and cross-project work, and withou
 
 | class | decision | evidence that it pays | false-positive risk | where it can run today |
 | --- | --- | --- | --- | --- |
-| **invariant** | refuse (or hold) a dispatch whose base lacks a declared `needs` dependency | C11 (3 units redone), C3 if declared | none observed: a declared edge is either satisfied or not | a dispatching skill; in the product, `dispatch` (part 3's files) |
+| **invariant** | refuse (or hold) a dispatch whose base lacks a declared `needs` dependency | C11 (3 units redone) and C3, had the edge been declared | none observed: a declared edge is either satisfied or not | a dispatching skill; in the product, `dispatch` (part 3's files) |
 | **invariant** | at most one live unit per issue | C14; the 2026-08-11 duplicates | low, but only for units that name their issue; C14's ad-hoc unit did not | the queues' in-flight scan; in the product, the dispatched-units registry (part 3's) plus the forge |
 | **invariant** | a unit's diff touches no path another live effort `reserves` | the part 3 boundary; C17 | none, by construction | `pick-area.sh --check`, `git diff` against the reserved list |
 | **invariant** | merge only when CI has covered the merged result for the files the PR changes | C6, C7, C8 | measured by the overlap check: its own rule says it can request an update CI already covered | `/merge-pr`'s overlap check; or a GitHub merge queue or strict up-to-date rule, which would catch C6–C8 outright at the cost of more CI round trips |
@@ -157,7 +157,7 @@ Three policies were applied to every case, each using only what was knowable whe
 | C6–C8 | red `main` three times | integration invariant (merged-result CI) identifies all three; the overlap check alone identifies C7 incidentally | same as A | misses (different files) |
 | C9 | 8 conflicted merges, 28–63 h open | `reserves` identifies, if the docs rewrite had declared one | warns (sweep across `docs/`), land last | blocks 8 units |
 | C10 | 12 conflicted merges | passes | warns (area) | blocks |
-| C11 | 3 units redone | **identifies** (base lacks #1617), declared in the title | identifies | — |
+| C11 | 3 units redone | identifies *only if* `needs #1617` was declared in the fixed form; the dependency was in #1631's title | warns: base not on the default branch, 19 behind | — |
 | C12 | 2 units redone | no edge; the base-distance setting decides | warns (6 behind) | — |
 | C13 | caught by an advisory check | passes | misses | misses |
 | C14 | a duplicate PR | **misses**: the ad-hoc unit named no issue | warns only if the subjects are compared (agent judgement) | misses |
@@ -169,9 +169,9 @@ Three policies were applied to every case, each using only what was knowable whe
 
 **Totals against the PRD's `Go` bar** ("prevents or identifies at least three observed conflict or rework cases while wrongly blocking at most one clearly independent task set"):
 
-- **A identifies, unconditionally on the information that existed:** C11 at spawn, and C6, C7 and C8 at integration through the merged-result invariant. That is four cases, with no wrong block among C1, C2 and C17.
-- **Most of A's other value depends on declarations nobody wrote.** C3, C5 and C9 are caught only if an edge had been declared in a form a machine reads, and the sample shows declarations in about 2% of units, all as prose. Without that habit, A's spawn-time half catches one case in the sample.
-- **None of A's four catches needs the deck.** C11 is what `/dispatch-base` (#1638) now guards against. C6–C8 need the merged-result invariant, which is a ruleset or merge-queue setting, not deck code; today's overlap check (#1610) approximates it, and per `/merge-pr` would have flagged C7 only through unrelated files. So until edges are declared, the deck adds little that the skills and the ruleset cannot do.
+- **A identifies, with no declaration needed:** C6, C7 and C8 at integration, through the merged-result invariant. That is three cases, with no wrong block among C1, C2 and C17. It identifies **no case at spawn** without a declaration, because an edge counts only once it is written in the fixed form (Milestone 2).
+- **All of A's spawn-time value depends on declarations nobody wrote.** C3, C5, C9 and C11 are caught only if an edge had been declared in a form a machine reads. The dependency was in the text in C3 and C11 (and C11's unit was also visibly cut from a feature branch, which the advisory base check flags), but the sample shows declarations in about 2% of units, all as prose.
+- **None of A's unconditional catches needs the deck.** C6–C8 need the merged-result invariant, which is a ruleset or merge-queue setting, not deck code; today's overlap check (#1610) approximates it, and per `/merge-pr` would have flagged C7 only through unrelated files. So until edges are declared, the deck adds little that the skills and the ruleset cannot do.
 - **H fails the bar outright.** It wrongly blocks C2's independent pairs and, across the 300 PRs, would have serialised 141 overlapping PRs that never conflicted in order to prevent at most 43 that did.
 - **B's warnings point at the most expensive failures in the sample** (C4, C9, C10: 31 conflicted merges and PRs held open for days), at the cost of noise on C2-like sets. Those failures were predictable at dispatch time from the issue text.
 - **The identity model has one gap that matters.** An ad-hoc dispatch need not name its issue, so neither the duplicate invariant nor a `needs` edge can see it (C14). The identities the other identified cases needed were issue and PR numbers, branches and paths, which survive a restart and need no work graph.
@@ -180,7 +180,7 @@ Three policies were applied to every case, each using only what was knowable whe
 
 **Recommendation: Revise.** Ship dependency and conflict *visibility* and the declaration habit first, outside the product. Enforce in the deck only after declarations exist in practice and part 3 has merged.
 
-**Why not Go.** The bar's arithmetic is met: four cases are identified with no wrong block. But none of the four needs the deck: one is guarded by a skill rule, and three need a ruleset setting. The deck-side spawn invariant has one unconditional catch in the sample, because nothing declares edges in a machine-readable form today. Building product enforcement now would also mean editing `dispatch`, the dispatched-units registry and the protocol, all of which part 3 owns. The Go bar's "identity model that works without a work graph" holds for issue-named units but not for ad-hoc dispatch.
+**Why not Go.** The bar's arithmetic is met only at its floor: three cases are identified with no wrong block. But all three are integration-time catches that need a ruleset setting, not the deck. The deck-side spawn invariant catches nothing in the sample without a declaration, and nothing declares edges in a machine-readable form today; the one stale-base case it would have caught with one (C11) is what `/dispatch-base` (#1638) now guards against. Building product enforcement now would also mean editing `dispatch`, the dispatched-units registry and the protocol, all of which part 3 owns. The Go bar's "identity model that works without a work graph" holds for issue-named units but not for ad-hoc dispatch.
 
 **Why not Stop.** Git and prompt-level planning did not expose the relevant decisions reliably. Declared dependencies were ignored at dispatch (C3, C11). The costliest failures (C4, C9, C10) were predictable from the issue text, and nothing surfaced them until the merge. Concurrent PRs that shared files conflicted at four to five times the rate of those that did not (23% against 5%), and stayed open about seven times longer at the median, although part of that gap is because open time breeds overlap.
 
