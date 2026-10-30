@@ -26,12 +26,15 @@
 //! two events out of order; this narrows the race to that, it does not close
 //! it.
 //!
-//! Only a connection's FIRST line takes part: hook producers send each raw
-//! event on a connection of its own, and lines on one connection are already
-//! read in order.
-//! `DaemonMessage` lines, a `question` among them, are not ordered here: their
-//! ticket is released when the line is read, so a held question or a dispatch
-//! never holds back anyone's events.
+//! Only a connection's first raw event takes part, and only when nothing but
+//! an `inbox_announce` came before it on that connection: hook producers send
+//! a raw event on a connection of its own, a `SessionStart` hook behind the
+//! announce of its agent's inbox waiter (`hook::send_lines_and_drain`), and
+//! lines on one connection are already read in order. That announce keeps the
+//! connection's place for the event after it. Every other `DaemonMessage`
+//! line, a `question` among them, is not ordered here: its ticket is released
+//! when the line is read, so a held question or a dispatch never holds back
+//! anyone's events.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -153,35 +156,63 @@ pub(crate) struct Turn {
 struct OrderedFields {
     #[serde(default)]
     message_type: Option<serde::de::IgnoredAny>,
-    session_id: String,
+    #[serde(default)]
+    session_id: Option<String>,
     #[serde(default)]
     pane_id: Option<String>,
 }
 
-/// Whether the hook loop will read `line` as a raw `AgentEvent`, and if so its
-/// session and pane. The loop tries `DaemonMessage` first, so a line that
-/// parses as one is not an event here either.
-fn event_keys(line: &str) -> Option<Keys> {
-    let fields: OrderedFields = serde_json::from_str(line).ok()?;
-    if fields.message_type.is_some()
-        && serde_json::from_str::<crate::event::DaemonMessage>(line).is_ok()
-    {
-        return None;
+/// How the hook loop will read a line, as far as ordering is concerned.
+#[derive(Debug, PartialEq, Eq)]
+enum LineKind {
+    /// A raw `AgentEvent`, with its session and pane.
+    Event(Keys),
+    /// An `inbox_announce`, which a `SessionStart` hook sends ahead of its
+    /// event on the same connection.
+    Announce,
+    /// Anything else.
+    Other,
+}
+
+/// How the hook loop will read `line`. The loop tries `DaemonMessage` first,
+/// so a line that parses as one is not an event here either.
+fn line_kind(line: &str) -> LineKind {
+    let Ok(fields) = serde_json::from_str::<OrderedFields>(line) else {
+        return LineKind::Other;
+    };
+    if fields.message_type.is_some() {
+        match serde_json::from_str::<crate::event::DaemonMessage>(line) {
+            Ok(crate::event::DaemonMessage::InboxAnnounce(_)) => return LineKind::Announce,
+            Ok(_) => return LineKind::Other,
+            Err(_) => {}
+        }
     }
-    Some(Keys {
-        session: fields.session_id,
-        pane: fields.pane_id,
-    })
+    match fields.session_id {
+        Some(session) => LineKind::Event(Keys {
+            session,
+            pane: fields.pane_id,
+        }),
+        None => LineKind::Other,
+    }
 }
 
 /// Called with each line a hook connection reads, and the connection's ticket
-/// while it still has one. For a connection's first line that is a raw event,
+/// while it still has one. For a raw event that the ticket still covers,
 /// waits until the events accepted ahead of it with the same session or pane
-/// have been handled, and returns the turn to hold while it is applied. For
-/// anything else the ticket is released and there is no turn.
-pub(crate) async fn turn_for_line(ticket: Option<Ticket>, line: &str) -> Option<Turn> {
-    let ticket = ticket?;
-    let keys = event_keys(line)?;
+/// have been handled, and returns the turn to hold while it is applied. An
+/// `inbox_announce` leaves the ticket for the line after it; anything else
+/// releases it. There is no turn for either.
+pub(crate) async fn turn_for_line(ticket: &mut Option<Ticket>, line: &str) -> Option<Turn> {
+    ticket.as_ref()?;
+    let keys = match line_kind(line) {
+        LineKind::Event(keys) => keys,
+        LineKind::Announce => return None,
+        LineKind::Other => {
+            ticket.take();
+            return None;
+        }
+    };
+    let ticket = ticket.take()?;
     let shared = Arc::clone(&ticket.shared);
     if let Some(connection) = shared.lock().connections.get_mut(&ticket.seq) {
         connection.keys = Some(keys.clone());
@@ -263,12 +294,13 @@ mod tests {
         let first = order.admit();
         let second = order.admit();
         let line = event("s", None);
-        let mut later = Box::pin(turn_for_line(Some(second), &line));
+        let mut second = Some(second);
+        let mut later = Box::pin(turn_for_line(&mut second, &line));
         assert!(
             still_waiting(&mut later).await,
             "the earlier one has not been read"
         );
-        let earlier = turn_for_line(Some(first), &event("s", None))
+        let earlier = turn_for_line(&mut Some(first), &event("s", None))
             .await
             .expect("an event takes a turn");
         assert!(
@@ -284,11 +316,12 @@ mod tests {
         let order = HookEventOrder::new(Duration::from_secs(60));
         let first = order.admit();
         let second = order.admit();
-        let earlier = turn_for_line(Some(first), &event("old", Some("p")))
+        let earlier = turn_for_line(&mut Some(first), &event("old", Some("p")))
             .await
             .expect("an event takes a turn");
         let line = event("new", Some("p"));
-        let mut later = Box::pin(turn_for_line(Some(second), &line));
+        let mut second = Some(second);
+        let mut later = Box::pin(turn_for_line(&mut second, &line));
         assert!(still_waiting(&mut later).await);
         drop(earlier);
         assert!(later.await.is_some());
@@ -299,11 +332,11 @@ mod tests {
         let order = HookEventOrder::new(Duration::from_secs(60));
         let first = order.admit();
         let second = order.admit();
-        let _earlier = turn_for_line(Some(first), &event("a", Some("p1")))
+        let _earlier = turn_for_line(&mut Some(first), &event("a", Some("p1")))
             .await
             .expect("an event takes a turn");
         assert!(
-            turn_for_line(Some(second), &event("b", Some("p2")))
+            turn_for_line(&mut Some(second), &event("b", Some("p2")))
                 .await
                 .is_some()
         );
@@ -319,9 +352,9 @@ mod tests {
             "session_id": "s", "timestamp": "2026-10-30T12:00:00Z",
         })
         .to_string();
-        assert!(turn_for_line(Some(first), &message).await.is_none());
+        assert!(turn_for_line(&mut Some(first), &message).await.is_none());
         assert!(
-            turn_for_line(Some(second), &event("s", Some("p")))
+            turn_for_line(&mut Some(second), &event("s", Some("p")))
                 .await
                 .is_some()
         );
@@ -333,7 +366,8 @@ mod tests {
         let first = order.admit();
         let second = order.admit();
         let line = event("s", None);
-        let mut later = Box::pin(turn_for_line(Some(second), &line));
+        let mut second = Some(second);
+        let mut later = Box::pin(turn_for_line(&mut second, &line));
         assert!(still_waiting(&mut later).await);
         drop(first);
         assert!(later.await.is_some());
@@ -347,15 +381,56 @@ mod tests {
         let second = order.admit();
         let started = Instant::now();
         assert!(
-            turn_for_line(Some(second), &event("s", None))
+            turn_for_line(&mut Some(second), &event("s", None))
                 .await
                 .is_some()
         );
         assert_eq!(started.elapsed(), wait);
     }
 
+    /// The `inbox_announce` a `SessionStart` hook sends ahead of its event on
+    /// the same connection.
+    fn announce(pane: &str) -> String {
+        serde_json::to_string(&crate::event::DaemonMessage::InboxAnnounce(
+            crate::event::InboxAnnounceRequest {
+                pane_id: pane.to_string(),
+                agent_id: None,
+                token: None,
+                component: crate::event::InboxComponent::ClaudeHooks,
+                component_version: None,
+                wake: crate::event::InboxWake::TurnEnd,
+                pid: None,
+            },
+        ))
+        .expect("serialize an inbox_announce")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_announce_keeps_the_place_for_the_event_after_it() {
+        let order = HookEventOrder::new(Duration::from_secs(60));
+        let mut first = Some(order.admit());
+        let mut second = Some(order.admit());
+        assert!(turn_for_line(&mut first, &announce("p")).await.is_none());
+        assert!(first.is_some(), "the announce must not give up the place");
+        let line = event("s", Some("p"));
+        let mut later = Box::pin(turn_for_line(&mut second, &line));
+        assert!(
+            still_waiting(&mut later).await,
+            "the announced event is not read yet"
+        );
+        let earlier = turn_for_line(&mut first, &event("s", Some("p")))
+            .await
+            .expect("the announced event takes the connection's turn");
+        assert!(
+            still_waiting(&mut later).await,
+            "the announced event is being applied"
+        );
+        drop(earlier);
+        assert!(later.await.is_some());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn only_the_first_line_of_a_connection_is_ordered() {
-        assert!(turn_for_line(None, &event("s", None)).await.is_none());
+        assert!(turn_for_line(&mut None, &event("s", None)).await.is_none());
     }
 }

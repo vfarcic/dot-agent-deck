@@ -143,7 +143,7 @@ fn limits() -> HookLoopLimits {
     }
 }
 
-/// Scenario: Drive the hook loop over a real socket. One session's `session_start` is sent on a connection the daemon accepts first, and its `quota_blocked` on a connection accepted after it, but the second line is written first and the first only once the daemon has had the chance to apply the second. The session must have both applied in the order they were accepted and read Blocked; a control session sent the ordinary way reads Blocked too.
+/// Scenario: Drive the hook loop over a real socket. One session's `session_start` is sent on a connection the daemon accepts first, and its `quota_blocked` on a connection accepted after it, but the second line is written first and the first only once the daemon has had the chance to apply the second. The session must have both applied in the order they were accepted and read Blocked; a control session sent the ordinary way reads Blocked too. The same holds when the earlier connection first sends an `inbox_announce` and its `session_start` after it, as a `SessionStart` hook does.
 #[spec("hooks/ingest/009")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ingest_009_one_sessions_events_apply_in_the_order_they_were_sent() {
@@ -207,6 +207,59 @@ async fn ingest_009_one_sessions_events_apply_in_the_order_they_were_sent() {
         !overtook,
         "the quota_blocked was applied before the session_start its sender sent first"
     );
+
+    // The same, with the earlier connection carrying an `inbox_announce`
+    // ahead of its event, as a `SessionStart` hook with an inbox waiter sends
+    // them (`hook::send_lines_and_drain`). The announce is read first and
+    // must keep the connection's place for the event behind it.
+    let mut first = deck.connect().await;
+    let second = deck.connect().await;
+    send(second, &event("announced", "quota_blocked")).await;
+    first
+        .write_all(format!("{}\n", announce()).as_bytes())
+        .await
+        .expect("write the announce");
+    let overtook = deck
+        .wait_applied("announced", 1, Duration::from_secs(1))
+        .await;
+    send(first, &event("announced", "session_start")).await;
+    assert!(
+        deck.wait_applied("announced", 2, Duration::from_secs(10))
+            .await,
+        "both of the announced session's events must be applied, got {:?}",
+        deck.applied("announced").await
+    );
+    assert_eq!(
+        deck.status("announced").await,
+        Some(crate::state::SessionStatus::Blocked),
+        "an announce ahead of the session_start must not let the quota_blocked overtake it"
+    );
+    assert_eq!(
+        deck.applied("announced").await,
+        vec![SessionStart, QuotaBlocked]
+    );
+    assert!(
+        !overtook,
+        "the quota_blocked was applied while the announced session_start's connection held \
+         only its announce"
+    );
+}
+
+/// An `inbox_announce` for a pane this loop never issued a token for. The
+/// daemon refuses it with a reply line and goes on reading the connection.
+fn announce() -> String {
+    serde_json::to_string(&DaemonMessage::InboxAnnounce(
+        crate::event::InboxAnnounceRequest {
+            pane_id: "pane-announced".to_string(),
+            agent_id: None,
+            token: None,
+            component: crate::event::InboxComponent::ClaudeHooks,
+            component_version: None,
+            wake: crate::event::InboxWake::TurnEnd,
+            pid: None,
+        },
+    ))
+    .expect("serialize an inbox_announce")
 }
 
 /// Scenario: Drive the hook loop with a short predecessor wait. A peer connects and never writes; a session's `session_start` is then sent on a connection accepted after it. The event must still be applied, once the silent peer has had its predecessor wait, while that peer's connection is still open.

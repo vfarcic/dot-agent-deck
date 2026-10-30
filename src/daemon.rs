@@ -5911,10 +5911,11 @@ async fn run_hook_loop_with_limits(
                         };
                         // Issue #1664: a raw event waits for the events of its
                         // session or pane accepted ahead of it, and holds its
-                        // turn until this line is handled; anything else just
-                        // gives up its place. See `crate::hook_event_order`.
+                        // turn until this line is handled; an `inbox_announce`
+                        // keeps the place for the event after it, and anything
+                        // else gives it up. See `crate::hook_event_order`.
                         let _event_turn = crate::hook_event_order::turn_for_line(
-                            event_order_ticket.take(),
+                            &mut event_order_ticket,
                             &line,
                         )
                         .await;
