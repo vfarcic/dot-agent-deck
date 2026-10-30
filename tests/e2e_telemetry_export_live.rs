@@ -556,6 +556,12 @@ fn telemetry_otlp_007_real_opencode_telemetry_joins_deck_run() {
         .with_imported_opencode_credentials()
         .with_env("PATH", common::path_with_binary_dir())
         .with_env("OPENCODE_DISABLE_AUTOUPDATE", "1")
+        // Issue #2022: a config dir whose tui.json lists a plugin (the deck's)
+        // makes OpenCode npm-install @opencode-ai/plugin into it before its
+        // first frame. In this fresh HOME that is a registry download that
+        // overran the composer wait. The deck's plugins import no SDK, and
+        // OpenCode logs a failed install and carries on, so fail it at once.
+        .with_env("npm_config_offline", "true")
         .with_env("OTEL_EXPORTER_OTLP_ENDPOINT", &receiver.endpoint)
         .with_env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json")
         .with_continue_session(
@@ -566,15 +572,26 @@ fn telemetry_otlp_007_real_opencode_telemetry_joins_deck_run() {
     const SENTINEL: &str = "telemetry_opencode_sentinel_7c31.txt";
     const PROOF: &str = "telemetry_opencode_proof_7c31.txt";
     std::fs::write(deck.workdir().join(SENTINEL), "TELEMETRY_OPENCODE_OK\n").unwrap();
-    assert!(
-        deck.wait_for_grid_string_within("Ask anything", Duration::from_secs(60)),
-        "real interactive OpenCode must render its composer:\n{}",
-        deck.snapshot_grid()
-    );
+    let composer_wait = std::time::Instant::now();
+    let composer = deck.wait_for_grid_string_within("Ask anything", Duration::from_secs(60));
     let agent = common::agent_records_on(deck.attach_socket_path())
         .into_iter()
-        .find(|agent| agent.display_name.as_deref() == Some("telemetry-opencode-mini"))
-        .expect("real interactive OpenCode pane");
+        .find(|agent| agent.display_name.as_deref() == Some("telemetry-opencode-mini"));
+    assert!(
+        composer,
+        "real interactive OpenCode must render its composer:\n{}\n{}",
+        deck.snapshot_grid(),
+        opencode_startup_evidence(
+            &deck,
+            &receiver,
+            agent.as_ref().map(|agent| agent.id.as_str())
+        )
+    );
+    eprintln!(
+        "OpenCode composer appeared after {:?}",
+        composer_wait.elapsed()
+    );
+    let agent = agent.expect("real interactive OpenCode pane");
     let pane = agent.pane_id_env.as_deref().expect("pane id");
     let start = deck.stream_text().len();
     let directive = format!(
@@ -654,6 +671,76 @@ fn telemetry_otlp_007_real_opencode_telemetry_joins_deck_run() {
             &deck.workdir().to_string_lossy(),
         ],
     );
+}
+
+/// Issue #2022: what OpenCode was doing when its composer never appeared —
+/// the bytes it wrote to its PTY, its processes, its own log and the logs it
+/// exported. Only read on a failure.
+fn opencode_startup_evidence(deck: &TuiDeck, receiver: &Receiver, agent: Option<&str>) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::from("--- OpenCode startup evidence (issue #2022) ---\n");
+    match agent {
+        Some(id) => {
+            let raw = common::pane_snapshot_on(deck.attach_socket_path(), id);
+            let _ = writeln!(
+                out,
+                "pane PTY bytes from the daemon: {}; tail: {:?}",
+                raw.len(),
+                String::from_utf8_lossy(&raw[raw.len().saturating_sub(2048)..])
+            );
+        }
+        None => out.push_str("no agent record named telemetry-opencode-mini\n"),
+    }
+    let workdir = deck.workdir().canonicalize().unwrap_or_default();
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let dir = entry.path();
+        if std::fs::read_link(dir.join("cwd")).ok().as_deref() != Some(workdir.as_path()) {
+            continue;
+        }
+        let cmdline = std::fs::read(dir.join("cmdline"))
+            .map(|bytes| String::from_utf8_lossy(&bytes).replace('\0', " "))
+            .unwrap_or_default();
+        let stat = std::fs::read_to_string(dir.join("stat")).unwrap_or_default();
+        let wchan = std::fs::read_to_string(dir.join("wchan")).unwrap_or_default();
+        let _ = writeln!(out, "process {stat:.120} wchan={wchan} cmd={cmdline:.200}");
+        let pid = entry.file_name().to_string_lossy().to_string();
+        if let Ok(ss) = std::process::Command::new("ss").args(["-tnpH"]).output() {
+            for line in String::from_utf8_lossy(&ss.stdout).lines() {
+                if line.contains(&format!("pid={pid},")) {
+                    let _ = writeln!(out, "  socket {line}");
+                }
+            }
+        }
+    }
+    let home = deck.home_dir();
+    for dir in [
+        home.join(".local/share/opencode/log"),
+        home.join(".local/state/opencode/locks"),
+        home.join(".cache/opencode"),
+    ] {
+        let _ = writeln!(out, "{}:", dir.display());
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let _ = writeln!(out, "  {}", path.display());
+            if dir.ends_with("log") {
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let lines: Vec<_> = text.lines().collect();
+                for line in &lines[lines.len().saturating_sub(80)..] {
+                    let _ = writeln!(out, "    {line:.400}");
+                }
+            }
+        }
+    }
+    for request in receiver.requests() {
+        if request_resources(&request)
+            .iter()
+            .any(|resource| attribute(resource, "service.name") == "opencode")
+        {
+            let body = String::from_utf8_lossy(&request.body);
+            let _ = writeln!(out, "OpenCode {}: {body:.4000}", request.path);
+        }
+    }
+    common::redact_credentials_for_output(&out)
 }
 
 fn finish_native_join(
