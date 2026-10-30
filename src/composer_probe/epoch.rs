@@ -26,8 +26,10 @@
 //! in enqueue order: a withdrawn job leaves that framing ahead of what the
 //! PTY took, which Q35-15/16's physical tracker corrects.
 //!
-//! **What reads it, as of this commit.** The epoch's numbers: nothing. The
-//! card, admission and the ring's reconcile read them from Q35-19 and Q35-21
+//! **What reads it, as of this commit.** The epoch's numbers: probe
+//! admission ([`GenerationInput::admit_probe`], Q35-19), which nothing calls
+//! in production before Q35-20 wires it, for a lapse retry's "nothing since
+//! the lapsed byte". The card and the ring's reconcile read them from Q35-21
 //! on; existing doorbell behaviour reads `PaneInputState` as before. The
 //! ledger is read by a closed fence's acceptance, for whether a reply may
 //! pass ahead ([`GenerationInput::pass_ahead`]), and a fence closes only
@@ -82,6 +84,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use super::admission;
 use super::framing::{Csi, Event, Framing, Report, Str, StringKind, Token, whole_report};
 use super::planner::{Cut, Natives, first_cut, is_candidate};
 use super::query_ledger::{
@@ -1022,6 +1025,35 @@ impl GenerationInput {
     pub fn records_admit(&self) -> Result<(), Hold> {
         self.with_records(|r, _| Ok(r.admits()))
             .unwrap_or(Err(Hold::Retired))
+    }
+
+    /// Probe admission for this generation at `now` (Q35-19, A4 §4): its own
+    /// half read in one hold of the lock, then [`admission::admit`] with the
+    /// caller's `outside`. Writes nothing: the hazard FIFO is read as of `now`
+    /// without bringing its clock up to date, and O5 reads only the estimate.
+    pub fn admit_probe(
+        &self,
+        outside: &admission::Outside,
+        now: Instant,
+    ) -> Result<(), admission::Refusal> {
+        let inside = {
+            let state = self.state.lock_recovering();
+            let records = match (state.retired, state.records.as_ref()) {
+                (false, Some(records)) => Some(records),
+                _ => None,
+            };
+            admission::Inside {
+                retired: state.retired,
+                records: records.map_or(Err(Hold::Retired), Records::admits),
+                exhausted: state.hazards.exhausted(),
+                hazards_clear: state.hazards.clear_at(now),
+                count: records.map_or(0, Records::count),
+                epoch: state.epoch.epoch(),
+                backlog: state.backlog.holds(),
+                estimate: state.estimate.estimate(),
+            }
+        };
+        admission::admit(&inside, outside, now)
     }
 
     /// See [`Records::first_stop`].

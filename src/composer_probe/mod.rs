@@ -28,7 +28,10 @@
 //! later query pass ahead, and the two framings of a pane's input: the
 //! planner that cuts or numbers each Ctrl+G candidate at acceptance and the
 //! tracker of what the PTY took, at whose boundary alone a deck line starts
-//! ([`planner`]). The daemon feeds the hook every byte an agent writes,
+//! ([`planner`]), and probe admission: the one predicate every check write
+//! asks ([`admission`]), the probe job's start on the writer thread with the
+//! arm published only inside it, and the retry schedule ([`probe`]), which
+//! nothing calls yet (Q35-20 wires them). The daemon feeds the hook every byte an agent writes,
 //! moves the epoch at acceptance, and decides installation at
 //! every spawn, which installs nothing outside the `e2e` build's assumption
 //! until activation. For an installed generation it keeps the invocation
@@ -39,6 +42,7 @@
 //! cut a person's input while one is out, which in production it never is
 //! before activation.
 
+pub mod admission;
 pub mod arm;
 #[cfg(target_os = "linux")]
 pub mod attest;
@@ -56,6 +60,7 @@ pub mod observe;
 pub mod paste_mode;
 pub mod path_rule;
 pub mod planner;
+pub mod probe;
 pub mod query_ledger;
 pub mod query_wait;
 pub mod record;

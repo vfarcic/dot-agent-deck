@@ -538,6 +538,32 @@ impl HazardFifo {
         !self.exhausted && self.entries.is_empty() && self.extra == 0
     }
 
+    /// [`Self::clear`]'s answer at `now`, read without bringing the clock
+    /// up to date or letting anything leave: probe admission's read
+    /// (Q35-19), which writes nothing. A `Quiet` entry counts as gone once
+    /// the running time [`Self::advance`] would reach at `now` has run past
+    /// [`T_TRIGGER`] since it entered, so the two agree.
+    pub fn clear_at(&self, now: Instant) -> bool {
+        if self.exhausted || self.extra > 0 {
+            return false;
+        }
+        let now = self.latest.map_or(now, |latest| latest.max(now));
+        let run = match (self.paused, self.mark) {
+            (false, Some(mark)) => self.run + now.saturating_duration_since(mark),
+            _ => self.run,
+        };
+        self.entries.iter().all(|e| match e.state {
+            EntryState::Latched => false,
+            EntryState::Quiet { run_at_entry } => run - run_at_entry > T_TRIGGER,
+        })
+    }
+
+    /// Whether numbering or the count past [`HAZARD_SLOTS`] couldn't advance
+    /// (A3 §6.1): sticky, until retirement.
+    pub fn exhausted(&self) -> bool {
+        self.exhausted
+    }
+
     /// The live kept entries, oldest first, as of `now`.
     pub fn entries(&mut self, now: Instant) -> Vec<EntryView> {
         self.advance(now);

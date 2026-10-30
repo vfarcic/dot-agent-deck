@@ -126,6 +126,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::Permission;
+use super::admission::{Outside, Refusal as AdmissionRefusal};
 use super::epoch::GenerationInput;
 use super::record::{
     self, Attribution, Channel, Claim, Decision, Observation, RecordKey, Recorded, Refusal, Report,
@@ -769,7 +770,17 @@ pub enum ControlRefusal {
 
 /// The page a [`Seam`] publishes to.
 pub trait Page {
+    /// Publish `count`, leaving the segment and native numbers as the page
+    /// last held them.
     fn publish(&mut self, count: u32);
+
+    /// Publish `count` with `seg_seq`, the probe's segment number, in one
+    /// publication (Q35-19, R5 §4.2): the helper reads both in the same
+    /// seqlock. A page with no segment word keeps only the count.
+    fn publish_probe(&mut self, count: u32, seg_seq: u64) {
+        let _ = seg_seq;
+        self.publish(count);
+    }
 
     /// Publish `count` with `native_seq`, the last native Ctrl+G candidate
     /// the planner numbered (Q35-16, A2 §4.4). A page with no native word
@@ -789,6 +800,8 @@ pub struct Seam<P> {
     input: Arc<GenerationInput>,
     page: P,
     published: u32,
+    /// The segment number the page shows.
+    seg_seq: u64,
     test: TestLiability,
     permission: Permission,
 }
@@ -802,6 +815,7 @@ impl<P: Page> Seam<P> {
             input,
             page,
             published: 0,
+            seg_seq: 0,
             test: TestLiability::default(),
             permission: Permission::Pending,
         }
@@ -836,6 +850,64 @@ impl<P: Page> Seam<P> {
         self.page.publish_native(self.published, native_seq);
     }
 
+    /// Probe admission at `now` with this seam's permission (Q35-19, A4 §4):
+    /// what each of the deck's check writes asks when it is scheduled, the
+    /// first probe, a scheduled retry and Claude's lapse retry alike
+    /// (`outside.attempt` names which). Writes nothing.
+    pub fn admits(&self, outside: &Outside, now: Instant) -> Result<(), AdmissionRefusal> {
+        let outside = Outside {
+            permission: self.permission,
+            ..*outside
+        };
+        self.input.admit_probe(&outside, now)
+    }
+
+    /// **The arm increment** (Q35-19, A4 §4, A5 §1.5): admission asked again
+    /// with `outside` as the writer thread reads it when it comes to the
+    /// probe's job, then, only on `Ok`, `count + 1` and `seg_seq` published
+    /// in one publication and the raise recorded, stamped after the store.
+    /// Run under the seam lock, which every record step that can open the
+    /// writer scope or leave a record incomplete holds too, so none lands
+    /// between the check and the publication; a native candidate enters the
+    /// hazard FIFO only from the writer thread, which is the one running
+    /// this. What the output hook can change in between (`B`, a `Quiet`
+    /// entry latching) could as well land just after the byte. A refusal
+    /// publishes nothing and records nothing. The new count.
+    pub fn arm(
+        &mut self,
+        seg_seq: u64,
+        outside: &Outside,
+        now: Instant,
+    ) -> Result<u32, AdmissionRefusal> {
+        self.admits(outside, now)?;
+        self.raise(seg_seq).map_err(AdmissionRefusal::Raise)
+    }
+
+    /// The take-back of an arm whose job a withdrawal won after
+    /// [`Self::arm`] published it (`super::probe::start`): the liability
+    /// leaves with the job, stamped before the store. The new count.
+    pub fn disarm(&mut self) -> Result<u32, Refusal> {
+        // A store to zero is stamped before it.
+        let stamp = Instant::now();
+        let lowered = self.input.liability_lower(self.generation, stamp);
+        self.sync();
+        lowered
+    }
+
+    /// One more liability on the page with `seg_seq`, a store from zero
+    /// stamped after it: the only raise of the count, for [`Self::arm`] and
+    /// the `e2e` build's control verb ([`Self::control`]).
+    fn raise(&mut self, seg_seq: u64) -> Result<u32, Refusal> {
+        let count = self.input.liability_count().ok_or(Refusal::Stale)?;
+        let raised = count.checked_add(1).ok_or(Refusal::Count)?;
+        self.page.publish_probe(raised, seg_seq);
+        self.published = raised;
+        self.seg_seq = seg_seq;
+        let recorded = self.input.liability_raise(self.generation, Instant::now());
+        self.sync();
+        recorded
+    }
+
     /// Publish the records' count if the page doesn't show it.
     fn sync(&mut self) {
         if let Some(count) = self.input.liability_count()
@@ -867,15 +939,8 @@ impl<P: Page> Seam<P> {
                 self.test = test;
                 return Ok(count);
             }
-            ControlStep::Raise => {
-                let raised = count
-                    .checked_add(1)
-                    .ok_or(ControlRefusal::Records(Refusal::Count))?;
-                // A store from zero is stamped after it.
-                self.page.publish(raised);
-                self.published = raised;
-                self.input.liability_raise(self.generation, Instant::now())
-            }
+            // The page keeps the segment number it shows.
+            ControlStep::Raise => self.raise(self.seg_seq),
             ControlStep::Lower => {
                 // A store to zero is stamped before it.
                 let stamp = Instant::now();
@@ -1097,12 +1162,19 @@ mod linux {
 
     impl Page for GenerationFiles {
         fn publish(&mut self, count: u32) {
-            // No segment numbers until probes exist (Q35-19/20).
-            self.arm().publisher().publish(count, 0);
+            let mut publisher = self.arm().publisher();
+            let seg_seq = publisher.seg_seq();
+            publisher.publish(count, seg_seq);
+        }
+
+        fn publish_probe(&mut self, count: u32, seg_seq: u64) {
+            self.arm().publisher().publish(count, seg_seq);
         }
 
         fn publish_native(&mut self, count: u32, native_seq: u64) {
-            self.arm().publisher().publish_native(count, 0, native_seq);
+            let mut publisher = self.arm().publisher();
+            let seg_seq = publisher.seg_seq();
+            publisher.publish_native(count, seg_seq, native_seq);
         }
     }
 

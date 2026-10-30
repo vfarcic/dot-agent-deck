@@ -343,6 +343,12 @@ mod page {
             })
         }
 
+        /// The segment number the last publication stored: this is the
+        /// page's only writer, so its own last store is what it reads.
+        pub fn seg_seq(&self) -> u64 {
+            self.words.seg_seq.load(Ordering::Relaxed)
+        }
+
         /// Publish `count` and `seg_seq` together, leaving `native_seq` as
         /// the last publication to store it left it.
         pub fn publish(&mut self, count: u32, seg_seq: u64) {
