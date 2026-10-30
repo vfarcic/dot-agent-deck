@@ -1,0 +1,771 @@
+#![cfg(all(feature = "e2e", target_os = "linux"))]
+
+//! S-20: physical gate/release and epoch contracts, before S-21 makes those
+//! numbers authoritative for mail. No assertion here requires mail delivery.
+//!
+//! Assumed e2e-only additions to `e2e-composer-control`:
+//! * `epoch`: read-only `composer_epoch: {epoch, observed, last_foreign}`.
+//! * `observer-status`: read-only `composer_observer: {scope}` (`pending`,
+//!   `closed`, `open`), used as an observation barrier for the real scanner.
+//! * `probe-request`: submit a normal first probe through the same scheduling,
+//!   writer-thread admission, arm, claim and undo path as the live tick. Reply
+//!   after refusal or the probe's physical write, not after helper completion;
+//!   a refusal is `ok:true` (the operation ran), with no arm/fence/epoch move.
+//!   `probe-request:retry` and `probe-request:lapse` ask the corresponding
+//!   production paths, with their normal eligibility checks. These never
+//!   manufacture a record, ignore permission, or act as `publish`/`fence`.
+//! * `DOT_AGENT_DECK_E2E_PROBE_GATE=<single component under fixture HOME>`:
+//!   a bounded `scheduled` barrier before the writer revalidates admission;
+//!   write `scheduled.arrived`, wait for `scheduled.release`, and record
+//!   `scheduled.timed-out` on expiry. It is enabled only when `<root>/phase`
+//!   says `scheduled`; Drop releases it. It grants no admission or release.
+//!
+//! No release-authorizing output state is injected. F2 and the real helper
+//! produce decisions, marker pairs, actual editor work and process exits.
+//! Codex rows also assume the existing e2e assumption can bind this direct
+//! native stand-in as Armable; the production launcher/interpreter binding
+//! work stays in Q35-22. A missing e2e binding must be reported explicitly.
+
+mod common;
+#[path = "support/inbox_doorbell.rs"]
+mod inbox;
+#[path = "support/live_segments.rs"]
+mod live;
+
+use live::{Fixture, WAIT};
+use serde_json::{Value, json};
+use spec::spec;
+use std::fs;
+use std::time::{Duration, Instant};
+
+ctor::declarative::ctor! {
+    // The fixture child is selected by its private environment before libtest
+    // parses Codex's injected arguments. The normal test process returns.
+    #[ctor(unsafe)]
+    fn native_fixture_entry() {
+        live::native_entry();
+    }
+}
+
+fn wait_span(span: Duration) {
+    let start = Instant::now();
+    assert!(common::wait_until(span + Duration::from_secs(1), || start
+        .elapsed()
+        >= span));
+}
+
+fn held_words() -> String {
+    let words: Value = serde_json::from_str(include_str!("fixtures/inbox-display.json")).unwrap();
+    words["inputHeld"]["checking"].as_str().unwrap().into()
+}
+
+fn has_held(snapshot: &Value) -> bool {
+    snapshot.get("input_held").is_some_and(|v| !v.is_null())
+        || snapshot
+            .as_object()
+            .is_some_and(|o| o.values().any(has_held))
+}
+
+/// Scenario: Launch the reviewed F2 composer under a native synthetic agent and type a draft followed by Ctrl+G without a deck probe. The real installed helper must run the user's editor with that draft and all three terminal descriptors, then the composer must accept following keys.
+#[spec("inbox/probe/027")]
+#[test]
+fn probe_027_native_f2_control_runs_the_real_unarmed_editor() {
+    let f = Fixture::start("claude");
+    let mut human = f.connect();
+    human.write("fixture-draft");
+    f.expect(b"fixture-draft");
+    human.write("\x07");
+    let editor = live::read_json(&f.path("editor-started"));
+    assert_eq!(
+        editor["hex"], "666978747572652d6472616674",
+        "real helper must pass the unarmed draft to the editor"
+    );
+    assert_eq!(editor["tty"], json!([true, true, true]));
+    f.wait("helper-exited");
+    human.write("AFTER");
+    f.expect(b"fixture-draft\x07AFTER");
+    f.stable(b"fixture-draft\x07AFTER");
+}
+
+/// Scenario: For each injected same-read, flush and dispatch-window key-loss mechanism, request a real check and type distinct keys in its delayed dispatch window. After the helper settles, every key must arrive once and in order, and a foreign acceptance during the check must keep the empty observation from clearing the epoch.
+#[spec("inbox/probe/026")]
+#[test]
+fn probe_026_delayed_checks_preserve_typing_under_each_loss_mechanism() {
+    for mechanism in ["H-chunk", "H-flush", "H-ignore"] {
+        let f = Fixture::start("claude");
+        f.setting("edit-mechanism", mechanism);
+        f.flag("edit-delay");
+        let before = f.epoch();
+        f.probe();
+        f.wait("edit-dispatched");
+        let mut human = f.connect();
+        human.write("FIRST");
+        human.write("SECOND");
+        f.wait_held();
+        f.wait("helper-exited");
+        f.expect(b"\x07FIRSTSECOND");
+        f.stable(b"\x07FIRSTSECOND");
+        let after = f.epoch();
+        assert!(
+            after.0 > before.0 && after.2 > before.2,
+            "foreign acceptance must move the epoch: {before:?} -> {after:?}"
+        );
+        assert_eq!(
+            after.1, before.1,
+            "an observation cannot clear a check that accepted foreign input"
+        );
+    }
+}
+
+/// Scenario: Check an untouched empty box with no intervening input, then read the numbers twice and try a stale generation. Only the successfully matched empty check may advance observed; the read-only operation changes none of the three numbers and a stale request is refused.
+#[spec("inbox/probe/026")]
+#[test]
+fn probe_026_empty_settlement_and_read_only_epoch_control() {
+    let f = Fixture::start("claude");
+    let before = f.epoch();
+    assert_eq!(f.epoch(), before, "reading the epoch must be inert");
+    let stale = f.control_for(f.generation + 1, "epoch");
+    assert_ne!(
+        stale["ok"], true,
+        "read-only still binds the current generation: {stale}"
+    );
+    f.probe();
+    f.wait("helper-exited");
+    assert!(
+        common::wait_until(WAIT, || {
+            let e = f.epoch();
+            e.0 == before.0 + 1 && e.1 == e.0 && e.2 == before.2
+        }),
+        "the matching empty observation should cover exactly its own probe byte"
+    );
+    f.expect(b"\x07");
+}
+
+/// Scenario: Hold each sampled invoking Ctrl+G form behind a probe whose helper has exited but whose return is delayed, then type a line for the user's editor in the same frame. Completing the first segment must dispatch the user's candidate separately and deliver the suffix to the actual running editor, including split-read keyboard forms.
+#[spec("inbox/probe/027")]
+#[test]
+fn probe_027_human_candidates_dispatch_alone_then_reach_the_user_editor() {
+    for form in ["\x07", "\x1b[103;5u", "\x1b[27;5;103~", "\x1b[71;5u"] {
+        for split in [false, true] {
+            let f = Fixture::start("claude");
+            f.flag("hold-return");
+            f.setting("editor-mode", "read");
+            f.setting("edit-mechanism", "H-chunk");
+            f.probe();
+            f.wait("helper-exited");
+            let mut human = f.connect();
+            if split && form.len() > 1 {
+                human.write(&form[..2]);
+                human.write(&format!("{}USER-EDITOR\n", &form[2..]));
+            } else {
+                human.write(&format!("{form}USER-EDITOR\n"));
+            }
+            f.wait_held();
+            f.flag("resume-go");
+            f.wait("editor-input");
+            assert_eq!(
+                fs::read(f.path("editor-input")).unwrap(),
+                b"USER-EDITOR\n",
+                "{form:?}, split={split}: the intended reader is the user's editor"
+            );
+            f.flag("editor-go");
+        }
+    }
+}
+
+/// Scenario: Make the composer drop every candidate, start a check and type keys behind it. The keys and held-input explanation must remain pending beyond the display timer, and replacing the generation must discard them without sending them to its successor.
+#[spec("inbox/probe/028")]
+#[test]
+fn probe_028_an_ignored_candidate_holds_until_generation_replacement() {
+    let mut f = Fixture::start("claude");
+    f.flag("edit-drop");
+    f.probe();
+    let mut human = f.connect();
+    human.write("HELD-UNTIL-RESPAWN");
+    f.wait_held();
+    wait_span(Duration::from_millis(350));
+    assert!(
+        has_held(&f.snapshot()),
+        "the daemon must publish held input on the real agent snapshot"
+    );
+    f.stable(b"\x07");
+    f.replace();
+    f.stable(b"");
+}
+
+/// Scenario: On a synthetic Codex generation, stop the composer after the real helper exits and type during its check. Exit and the disabled-paste state alone must leave the keys held; the matching re-enable permits them once, after the editor interval's flush.
+#[spec("inbox/probe/029")]
+#[test]
+fn probe_029_codex_requires_the_complete_matched_return() {
+    let f = Fixture::start("codex");
+    f.flag("hold-return");
+    f.probe();
+    f.wait("helper-exited");
+    let mut human = f.connect();
+    human.write("AFTER-CODEX-E1");
+    f.wait_held();
+    f.stable(b"\x07");
+    f.flag("resume-go");
+    f.expect(b"\x07AFTER-CODEX-E1");
+    f.stable(b"\x07AFTER-CODEX-E1");
+}
+
+/// Scenario: Make the Codex stand-in emit its re-enable before a witnessed, still-pending real terminal input flush, then type during that window. The mode transition must release no keys into the flush; after the flush and the composer's next redraw marker, every typed key must arrive once.
+#[spec("inbox/probe/051")]
+#[test]
+fn probe_051_codex_enable_before_a_gated_real_flush_cannot_release_typing() {
+    let f = Fixture::start("codex");
+    f.flag("gate-flush");
+    f.probe();
+    f.wait("flush-arrived");
+    let mut human = f.connect();
+    human.write("AFTER-THE-REAL-FLUSH");
+    f.wait_held();
+    f.stable(b"\x07");
+    f.flag("flush-go");
+    f.expect(b"\x07AFTER-THE-REAL-FLUSH");
+    f.stable(b"\x07AFTER-THE-REAL-FLUSH");
+}
+
+/// Scenario: Ignore a Claude check once, let it lapse, and request its one retry with and without held human input. With nothing held the second probe is written and its real helper runs; held keys prohibit that retry and stay pending.
+#[spec("inbox/probe/030")]
+#[test]
+fn probe_030_lapse_retry_depends_on_whether_keys_wait_behind_it() {
+    for held in [false, true] {
+        let f = Fixture::start("claude");
+        f.flag("edit-ignore-next");
+        f.probe();
+        f.expect(b"\x07");
+        let mut human = f.connect();
+        if held {
+            human.write("WAITING");
+            f.wait_held();
+        }
+        wait_span(
+            dot_agent_deck::composer_probe::query_ledger::T_TRIGGER + Duration::from_millis(50),
+        );
+        f.control("probe-request:lapse");
+        if held {
+            f.stable(b"\x07");
+        } else {
+            f.wait("helper-exited");
+            f.expect(b"\x07\x07");
+            f.stable(b"\x07\x07");
+        }
+    }
+}
+
+/// Scenario: Drop the check byte in a Codex composer and submit human input behind the unresolved segment. It must remain absent from the terminal until generation retirement, and no withheld byte may appear in the replacement pane.
+#[spec("inbox/probe/031")]
+#[test]
+fn probe_031_dropped_trigger_holds_human_input_through_retirement() {
+    let mut f = Fixture::start("codex");
+    f.flag("edit-drop");
+    f.probe();
+    let mut human = f.connect();
+    human.write("HUMAN-NEVER-WRITTEN");
+    f.wait_held();
+    // The answer-specific companion below uses the existing question fixture;
+    // this branch pins CX-H's physical human-input outcome independently.
+    f.stable(b"\x07");
+    f.replace();
+    f.stable(b"");
+}
+
+/// Scenario: Enter a native candidate while a CPR is outstanding, then ask the live first and retry paths for a probe after the quiet timeout. The latched candidate must prohibit new probe bytes even after a CPR response; a fresh generation is the positive admission control.
+#[spec("inbox/probe/032")]
+#[test]
+fn probe_032_native_backlog_latch_refuses_first_and_retry_then_respawn_recovers() {
+    let mut f = Fixture::start("claude");
+    f.flag("edit-drop");
+    f.emit(b"\x1b[6n");
+    let mut human = f.connect();
+    human.write("\x07");
+    f.expect(b"\x07");
+    let page = f.page();
+    f.probe();
+    f.control("probe-request:retry");
+    f.stable(b"\x07");
+    assert_eq!(
+        f.page(),
+        page,
+        "refused live attempts must not publish an arm"
+    );
+    human.write("\x1b[1;1R");
+    f.expect(b"\x07\x1b[1;1R");
+    wait_span(dot_agent_deck::composer_probe::query_ledger::T_TRIGGER + Duration::from_millis(50));
+    f.probe();
+    f.stable(b"\x07\x1b[1;1R");
+    f.replace();
+    f.probe();
+    f.wait("helper-exited");
+    f.expect(b"\x07");
+}
+
+/// Scenario: Fill the outstanding query history before a native candidate and request both first and retry probes. The overflowed history must refuse those attempts without a page publication; an otherwise identical saturated ledger without a native candidate must still allow the control probe.
+#[spec("inbox/probe/032")]
+#[test]
+fn probe_032_overflow_refuses_only_when_native_history_is_hazardous() {
+    for native in [false, true] {
+        let f = Fixture::start("claude");
+        f.flag("edit-drop");
+        let queries =
+            b"\x1b[c".repeat(dot_agent_deck::composer_probe::query_ledger::LEDGER_SLOTS + 2);
+        f.emit(&queries);
+        let mut human = f.connect();
+        if native {
+            human.write("\x07");
+            f.expect(b"\x07");
+        }
+        let page = f.page();
+        f.probe();
+        if native {
+            f.stable(b"\x07");
+            assert_eq!(f.page(), page);
+        } else {
+            f.expect(b"\x07");
+            assert!(
+                f.page().seg_seq > 0,
+                "ledger saturation alone must still admit the probe"
+            );
+        }
+    }
+}
+
+/// Scenario: Overflow the physical native-candidate FIFO while a CPR is pending, then let its quiet period pass and request a new probe. Neither the latched entries nor the counted overflow may disappear on a timer, so no probe byte or arm publication is allowed.
+#[spec("inbox/probe/032")]
+#[test]
+fn probe_032_counted_native_fifo_overflow_never_ages_into_permission() {
+    let f = Fixture::start("claude");
+    f.flag("edit-drop");
+    f.emit(b"\x1b[6n");
+    let keys = "\x07".repeat(dot_agent_deck::composer_probe::query_ledger::HAZARD_SLOTS + 2);
+    let mut human = f.connect();
+    human.write(&keys);
+    f.expect(keys.as_bytes());
+    let page = f.page();
+    wait_span(dot_agent_deck::composer_probe::query_ledger::T_TRIGGER + Duration::from_millis(50));
+    f.probe();
+    f.stable(keys.as_bytes());
+    assert_eq!(
+        f.page(),
+        page,
+        "counted native overflow must not grant an arm"
+    );
+}
+
+/// Scenario: With the real TUI attached to the sandbox daemon, type in the delayed check window and watch the actual card. It must show the shared checking explanation, clear it after the check releases the keys, and show the shared not-delivered words if a second hold is retired.
+#[spec("inbox/probe/046")]
+#[test]
+fn probe_046_attached_dashboard_shows_clears_and_retires_held_typing() {
+    let mut f = Fixture::start("claude");
+    f.hook_event("session_start");
+    let tui = common::TuiDeck::builder()
+        .with_pty_size(200, 50)
+        .with_env(
+            "DOT_AGENT_DECK_ATTACH_SOCKET",
+            f.daemon.attach_socket.to_string_lossy(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_SOCKET",
+            f.daemon.hook_socket.to_string_lossy(),
+        )
+        .launch_with_fixture("minimal");
+    f.flag("edit-delay");
+    f.flag("hold-return");
+    f.probe();
+    f.wait("edit-dispatched");
+    let mut human = f.connect();
+    human.write("VISIBLE-HELD");
+    let checking = held_words();
+    assert!(
+        common::wait_until(WAIT, || tui.snapshot_grid().contains(&checking)),
+        "attached card never showed held-input words:\n{}",
+        tui.snapshot_grid()
+    );
+    f.flag("resume-go");
+    f.expect(b"\x07VISIBLE-HELD");
+    assert!(
+        common::wait_until(WAIT, || !tui.snapshot_grid().contains(&checking)),
+        "settled hold stayed on attached card:\n{}",
+        tui.snapshot_grid()
+    );
+    f.remove("hold-return");
+    f.remove("edit-delay");
+    f.flag("edit-drop");
+    f.probe();
+    human.write("RETIRED-VISIBLE");
+    f.wait_held();
+    f.replace();
+    let words: Value = serde_json::from_str(include_str!("fixtures/inbox-display.json")).unwrap();
+    let retired = words["notDelivered"].as_str().unwrap();
+    assert!(
+        common::wait_until(WAIT, || {
+            let grid = tui.snapshot_grid();
+            grid.contains(retired) && grid.contains("typing")
+        }),
+        "retired held keys must be reported in attached TUI:\n{}",
+        tui.snapshot_grid()
+    );
+    f.stable(b"");
+}
+
+/// Scenario: Invoke the user's editor without the installed helper, including a no-delay editor that exits before an observer scan, and read the epoch around its output pair. The fallback must move the foreign epoch once for that unmatched edit, without a hook or synthetic observation clearing it.
+#[spec("inbox/probe/048")]
+#[test]
+fn probe_048_unreported_and_fast_external_edits_move_the_foreign_epoch() {
+    for (reported, fast) in [(true, false), (false, false), (false, true)] {
+        let f = Fixture::start("claude");
+        if !reported {
+            f.flag("lost-ipc");
+        }
+        f.flag("hold-return");
+        let before = f.epoch();
+        let mut human = f.connect();
+        human.write("\x07");
+        f.wait("editor-started");
+        if !fast {
+            wait_span(Duration::from_millis(100));
+        }
+        f.wait("helper-exited");
+        f.flag("resume-go");
+        assert!(
+            common::wait_until(WAIT, || f.epoch().0 >= before.0 + 2),
+            "native key and unmatched external edit must each count, including early exit"
+        );
+        let after = f.epoch();
+        assert_eq!(
+            after.0,
+            before.0 + 2,
+            "one native input plus one ExternalEdit producer"
+        );
+        assert_eq!(after.2, after.0, "external edit is foreign");
+        assert_eq!(
+            after.1, before.1,
+            "an unreported editor never grants an empty observation"
+        );
+        f.stable(b"\x07");
+    }
+}
+
+/// Scenario: Emit a complete mode pair before a Codex check, then incomplete or malformed markers after its real helper exits while its return is delayed. Those bytes must grant no release; the original composer's matching re-enable must let the keys through once.
+#[spec("inbox/probe/049")]
+#[test]
+fn probe_049_mode_observations_and_malformed_pairs_are_not_release_authority() {
+    for noise in [
+        b"already-disabled".as_slice(),
+        b"\x1b[?2004l",
+        b"\x1b[?2004l\x1b[?2004;h",
+    ] {
+        let f = Fixture::start("codex");
+        // Pre-trigger markers cannot be re-used for this segment.
+        f.emit(b"\x1b[?2004l\x1b[?2004h");
+        f.flag("hold-return");
+        f.probe();
+        f.wait("helper-exited");
+        let mut human = f.connect();
+        human.write("MATCHED-RETURN-ONLY");
+        f.wait_held();
+        f.emit(noise);
+        f.stable(b"\x07");
+        f.flag("resume-go");
+        f.expect(b"\x07MATCHED-RETURN-ONLY");
+        f.stable(b"\x07MATCHED-RETURN-ONLY");
+    }
+}
+
+/// Scenario: Hold a human editor's helper after a failed spawn or an injected wait failure following a real editor start. Under production Hold policy, exit and even a full return must leave the suffix held; replacing the generation must discard it without sending it to the successor.
+#[spec("inbox/probe/049")]
+#[test]
+fn probe_049_failed_editor_outcomes_stay_held_under_production_hold() {
+    for outcome in ["spawn-failed", "wait-unknown"] {
+        let mut f = Fixture::start("claude");
+        f.flag("hold-return");
+        f.probe();
+        f.wait("helper-exited");
+        let mut human = f.connect();
+        // A HumanG segment follows the already-complete probe.
+        human.write("\x07OQ5-HELD");
+        f.wait_held();
+        f.flag(&format!("{outcome}-2"));
+        f.flag("resume-go-1");
+        // Distinct witnesses and releases separate the second quick failure
+        // from the first helper's completed return.
+        f.wait("helper-exited-2");
+        assert!(
+            !fs::read(f.path("bytes"))
+                .unwrap()
+                .windows(b"OQ5-HELD".len())
+                .any(|w| w == b"OQ5-HELD"),
+            "{outcome}: exit alone released the pending suffix"
+        );
+        f.flag("resume-go-2");
+        f.expect(b"\x07\x07");
+        assert!(
+            common::wait_until(WAIT, || f.screen().contains("Try \"fix the bug\"")),
+            "the complete real return must be visible before the negative watch"
+        );
+        f.stable(b"\x07\x07");
+        f.probe();
+        f.stable(b"\x07\x07");
+        f.replace();
+        f.stable(b"");
+    }
+}
+
+/// Scenario: Admit a probe through the live writer and read its nonzero segment from the installed mapped page. A following count-only publication and a physical native candidate must retain that segment number while publishing the updated count and native number coherently.
+#[spec("inbox/probe/059")]
+#[test]
+fn probe_059_live_page_retains_segment_across_count_and_native_publications() {
+    let f = Fixture::start("claude");
+    f.probe();
+    f.wait("helper-exited");
+    f.wait_open();
+    let first = f.page();
+    assert!(
+        first.seg_seq > 0,
+        "a real probe must publish its segment before its byte"
+    );
+    f.control("publish");
+    let raised = f.page();
+    assert_eq!(
+        raised.seg_seq, first.seg_seq,
+        "count-only raise retains segment"
+    );
+    f.control("withdraw");
+    f.flag("edit-drop");
+    let mut human = f.connect();
+    human.write("\x07");
+    f.expect(b"\x07\x07");
+    let native = f.page();
+    assert_eq!(
+        native.seg_seq, first.seg_seq,
+        "native publication retains probe segment"
+    );
+    assert!(
+        native.native_seq > first.native_seq,
+        "native candidate must publish its own sequence"
+    );
+}
+
+/// Scenario: Accept a genuine native BEL under an OSC colour-reply history, with retained, dropped, whole and split BEL/ST replies, then ask the live probe path. A non-exempt BEL prohibits the check during its quiet period; a whole solicited report or an ST reply leaves the control probe eligible, and expiry recovers the quiet native case.
+#[spec("inbox/probe/061")]
+#[test]
+fn probe_061_live_admission_reads_actual_osc_reply_and_native_histories() {
+    for (reply, native) in [
+        ("\x1b]10;rgb:ffff/ffff/ffff\x07", false),
+        ("\x1b]10;rgb:ffff/ffff/ffff\x1b\\", false),
+        ("\x07", true),
+    ] {
+        let f = Fixture::start("claude");
+        f.flag("edit-drop");
+        f.emit(b"\x1b]10;?\x1b\\");
+        let mut human = f.connect();
+        human.write(reply);
+        f.expect(reply.as_bytes());
+        f.probe();
+        if native {
+            f.stable(reply.as_bytes());
+            wait_span(
+                dot_agent_deck::composer_probe::query_ledger::T_TRIGGER + Duration::from_millis(50),
+            );
+            f.probe();
+        }
+        f.expect(&[reply.as_bytes(), b"\x07"].concat());
+    }
+}
+
+/// Scenario: Queue ordinary mail for an idle synthetic agent whose empty box has been touched by a harmless key. The production doorbell tick must submit a probe through the installed helper without a test request; this checks the automatic integration rather than requiring mail delivery from the later authority switch.
+#[spec("inbox/probe/059")]
+#[test]
+fn probe_059_automatic_tick_submits_a_real_probe() {
+    let f = Fixture::start("claude");
+    f.hook_event("session_start");
+    f.hook_event("idle");
+    f.flag("edit-ignore-next");
+    let mut human = f.connect();
+    human.write("x\x7f");
+    f.expect(b"x\x7f");
+    f.enqueue();
+    assert!(
+        common::wait_until(WAIT, || f.input().contains(&7)),
+        "the ordinary doorbell tick never submitted a probe; input {:?}",
+        f.input()
+    );
+    assert!(
+        f.page().seg_seq > 0,
+        "automatic checks publish a nonzero segment"
+    );
+}
+
+/// Scenario: Pause a live probe after scheduling, run the native agent's real unarmed helper until its writer scope is open, then let the writer attempt the probe. The newly unsafe scope must cause refusal without a probe byte, a page change or a surviving fence.
+#[spec("inbox/probe/059")]
+#[test]
+fn probe_059_scope_changed_after_live_scheduling_refuses_the_writer() {
+    let f = Fixture::with_env("claude", &[("DOT_AGENT_DECK_E2E_PROBE_GATE", "probe-gate")]);
+    let root = f.daemon.home.join("probe-gate");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("phase"), "scheduled").unwrap();
+    let before = f.page();
+    std::thread::scope(|threads| {
+        let request = threads.spawn(|| f.probe());
+        assert!(
+            common::wait_until(Duration::from_secs(6), || {
+                assert!(
+                    !request.is_finished(),
+                    "live probe returned before the scheduled barrier (the assumed probe request/gate is missing)"
+                );
+                root.join("scheduled.arrived").exists()
+            }),
+            "live writer never reached its scheduled barrier"
+        );
+        let export = f
+            .daemon
+            .home
+            .join("tmp")
+            .join(format!("claude-{}", unsafe { libc::getuid() }))
+            .join("claude-prompt-scope.md");
+        fs::create_dir_all(export.parent().unwrap()).unwrap();
+        fs::write(&export, "").unwrap();
+        f.command(json!({"action":"invoke","path":export}));
+        assert!(
+            common::wait_until(Duration::from_secs(3), || f.scope() == "open"),
+            "the real native editor invocation must open scope before writer admission"
+        );
+        fs::write(root.join("scheduled.release"), "").unwrap();
+        request.join().unwrap();
+    });
+    assert!(
+        !root.join("scheduled.timed-out").exists(),
+        "the seam must not time out into a false refusal"
+    );
+    f.stable(b"");
+    assert_eq!(
+        f.page(),
+        before,
+        "refusal after live scheduling must not publish an arm"
+    );
+    let mut human = f.connect();
+    human.write("NO-STRAY-FENCE");
+    f.expect(b"NO-STRAY-FENCE");
+}
+
+/// Scenario: Pause the real helper before its arm load until the observer has actually seen Pending, then type behind the check and emit foreign return bytes. No key may escape before its decision; after the helper resumes Armed and the original composer returns, the keys must arrive once and a subsequent empty check must be admitted.
+#[spec("inbox/probe/057")]
+#[test]
+fn probe_057_pending_to_armed_recovers_held_keys_and_a_second_probe() {
+    let f = Fixture::start("claude");
+    let paused = f.pause_helper();
+    f.flag("hold-return");
+    f.probe();
+    f.wait("helper-started");
+    assert!(
+        common::wait_until(WAIT, || f.scope() == "pending"),
+        "scan must see the paused helper before its decision"
+    );
+    let mut human = f.connect();
+    human.write("RECOVERED");
+    f.wait_held();
+    f.emit(b"\x1b[?2004l\x1b[?2004h");
+    f.stable(b"\x07");
+    f.remove("pause-helper");
+    paused.release();
+    f.wait("helper-exited-1");
+    f.flag("resume-go-1");
+    f.expect(b"\x07RECOVERED");
+    human.write("\x15");
+    f.expect(b"\x07RECOVERED\x15");
+    assert!(
+        common::wait_until(WAIT, || f.screen().contains("Try \"fix the bug\"")),
+        "clear must be redrawn before the next check"
+    );
+    f.remove("hold-return");
+    f.probe();
+    f.wait("helper-exited-2");
+    f.expect(b"\x07RECOVERED\x15\x07");
+    f.stable(b"\x07RECOVERED\x15\x07");
+}
+
+/// Scenario: Let the observer see a real helper paused before any decision, then kill only that fixture-captured helper PID. Its decisionless exit and a return-marker pair cannot turn the held keys or later probe into input; replacing the generation must still leave the successor empty.
+#[spec("inbox/probe/057")]
+#[test]
+fn probe_057_decisionless_exit_keeps_scope_open_and_refuses_the_next_probe() {
+    let mut f = Fixture::start("claude");
+    let _pause = f.pause_helper();
+    f.probe();
+    let helper = live::read_json(&f.path("helper-started"));
+    assert!(common::wait_until(WAIT, || f.scope() == "pending"));
+    let mut human = f.connect();
+    human.write("NO-DECISION-NEVER");
+    f.wait_held();
+    let pid = helper["pid"].as_u64().unwrap() as i32;
+    // SAFETY: this PID was acknowledged by our native fixture after its own
+    // spawn. It still lives in the paused helper at the Pending barrier.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    f.wait("helper-exited");
+    assert!(common::wait_until(WAIT, || f.scope() == "open"));
+    f.probe();
+    f.stable(b"\x07");
+    f.replace();
+    f.stable(b"");
+}
+
+/// Scenario: Publish an arm and pause the actual installed helper while its socket is readable, then stop that captured helper after its decision has consumed the arm. The observer must kill the still-stopped, attested Armed helper with SIGKILL after its bound; its own alarm cannot execute while stopped, so the signal distinguishes the daemon's E2 path.
+#[spec("inbox/probe/057")]
+#[test]
+fn probe_057_real_e2_kills_only_the_attested_armed_helper() {
+    let f = Fixture::start("claude");
+    let _pause = f.pause_helper();
+    f.setting("helper-pause-at", "ready");
+    f.control("publish");
+    let mut human = f.connect();
+    human.write("\x07");
+    let helper = live::read_json(&f.path("helper-started"));
+    assert!(
+        common::wait_until(WAIT, || fs::read_to_string(f.path("helper-trace"))
+            .unwrap_or_default()
+            .contains("pause ready")),
+        "the real helper must pause in its socket exchange"
+    );
+    assert!(
+        common::wait_until(WAIT, || f.page().count == 0),
+        "the observer must actually settle the Armed decision before the kill watch"
+    );
+    let pid = helper["pid"].as_u64().unwrap() as i32;
+    // SAFETY: the native fixture acknowledged this helper PID, which is still
+    // blocked at our FIFO. No process name or production PID is used.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    let result = live::read_json(&f.path("helper-result-1"));
+    assert_eq!(
+        result["signal"],
+        libc::SIGKILL,
+        "E2 must be the attested pidfd kill, not the helper alarm: {result}"
+    );
+    assert!(
+        !f.path("editor-started").exists(),
+        "an Armed helper runs no user editor"
+    );
+}
+
+/// Scenario: Run a genuine unarmed editor that waits longer than the Armed helper's five-second kill bound. The daemon must leave both the user's editor and its waiting helper alive, then accept their ordinary completion when the editor is released.
+#[spec("inbox/probe/057")]
+#[test]
+fn probe_057_e2_does_not_kill_a_running_user_editor() {
+    let f = Fixture::start("claude");
+    f.setting("editor-mode", "wait");
+    let mut human = f.connect();
+    human.write("\x07");
+    f.wait("editor-started");
+    wait_span(dot_agent_deck::composer_probe::observe::E2_AFTER + Duration::from_millis(150));
+    assert!(
+        !f.path("helper-exited").exists(),
+        "an editor-bearing helper must not be enrolled in E2"
+    );
+    f.flag("editor-go");
+    let result = live::read_json(&f.path("helper-result-1"));
+    assert_eq!(
+        result["code"], 0,
+        "the real editor/helper return normally: {result}"
+    );
+    assert_eq!(result["signal"], Value::Null);
+}

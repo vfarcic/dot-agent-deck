@@ -453,6 +453,185 @@ fn probe_023_retirement_discards_held_and_full_waiting_bytes() {
     assert_eq!(f.previous_input(), b"");
 }
 
+// tester: S-20 begin
+/// Scenario: Hold typing and a tokened keyboard answer in a full fence while a third attach connection waits for capacity, then retire and replace the recorder. Each old connection must finish, the answer must return without claiming a write, no old byte or settlement may reach the successor, and the successor must accept only its own fresh keys.
+#[spec("inbox/probe/036")]
+#[test]
+fn probe_036_retirement_settles_typing_answer_and_full_waiter_once() {
+    let mut f = Fixture::questions();
+    let mut typing = f.connect();
+    let mut waiting = f.connect();
+    f.hook_event("session_start", None);
+    let q = ask_recorder(&f, "retirement-held-answer");
+    f.fence();
+    let socket = f.answer_socket();
+    let id = f.agent_id().to_owned();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let answer = runtime.spawn(async move {
+        dot_agent_deck::daemon_client::DaemonClient::new(socket)
+            .answer_question_with_token_while(
+                || true,
+                &id,
+                &q.id,
+                q.revision,
+                vec![question::QuestionAnswer {
+                    question_index: 0,
+                    option_indices: vec![1],
+                    text: None,
+                }],
+                false,
+                Some(3636),
+            )
+            .await
+    });
+    f.wait_held(1, 0);
+    typing.send(&vec![b'H'; CAP - 1]);
+    f.wait_held(2, 0);
+    waiting.send(b"FULL-WAITER-NEVER");
+    f.wait_held(2, 1);
+    f.expect_stable_input(b"");
+    f.command("exit");
+    f.wait_exit();
+    f.replace();
+    let reply = runtime
+        .block_on(async { tokio::time::timeout(common::child_boot_budget(), answer).await })
+        .expect("accepted answer must finish when its generation retires")
+        .expect("one answer completion")
+        .expect("retirement answer response");
+    assert_ne!(
+        reply,
+        dot_agent_deck::daemon_client::AnswerReport::Answered,
+        "retirement cannot report a written answer: {reply:?}"
+    );
+    assert!(
+        f.live().is_none_or(|s| s.answer_settlements.is_empty()),
+        "a predecessor settlement must not appear on the successor"
+    );
+    typing.wait_end();
+    waiting.wait_end();
+    assert_ne!(f.old_release()["ok"], true);
+    assert!(f.previous_input().is_empty());
+    let mut successor = f.connect();
+    successor.send(b"SUCCESSOR-ONLY");
+    f.expect_input(b"SUCCESSOR-ONLY");
+    f.expect_stable_input(b"SUCCESSOR-ONLY");
+}
+
+/// Scenario: Accept a tokened keyboard answer behind a full fence, then disconnect the requesting client after acceptance. Releasing the hold must still write the accepted answer once and publish exactly one matching Written settlement, preserving the detached daemon task's ownership.
+#[spec("question/answer/023")]
+#[test]
+fn question_answer_023_tokened_disconnect_keeps_accepted_answer_owned() {
+    let f = Fixture::questions();
+    let attached = f.connect();
+    f.hook_event("session_start", None);
+    let q = ask_recorder(&f, "accepted-disconnect");
+    f.fence();
+    let socket = f.answer_socket();
+    let id = f.agent_id().to_owned();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let answer = runtime.spawn(async move {
+        dot_agent_deck::daemon_client::DaemonClient::new(socket)
+            .answer_question_with_token_while(
+                || true,
+                &id,
+                &q.id,
+                q.revision,
+                vec![question::QuestionAnswer {
+                    question_index: 0,
+                    option_indices: vec![1],
+                    text: None,
+                }],
+                false,
+                Some(3623),
+            )
+            .await
+    });
+    f.wait_held(1, 0);
+    answer.abort();
+    assert!(runtime.block_on(answer).unwrap_err().is_cancelled());
+    f.release();
+    f.expect_input(b"1");
+    f.expect_stable_input(b"1");
+    assert!(
+        common::wait_until(common::child_boot_budget(), || f.live().is_some_and(|s| s
+            .answer_settlements
+            .iter()
+            .any(|s| s.client_token == 3623))),
+        "accepted disconnected answer must settle after physical completion"
+    );
+    let own: Vec<_> = f
+        .live()
+        .unwrap()
+        .answer_settlements
+        .into_iter()
+        .filter(|s| s.client_token == 3623)
+        .collect();
+    assert_eq!(own.len(), 1);
+    assert_eq!(own[0].outcome, question::SettlementOutcome::Written);
+    drop(attached);
+}
+
+/// Scenario: Fill a fence with held typing, then raise a fresh keyboard question and answer it with a client token. The answer must refuse promptly with the input-full explanation, never enqueue a digit or claim a written settlement, and releasing the typing must preserve the original paste exactly.
+#[spec("question/answer/023")]
+#[test]
+fn question_answer_023_a_full_fence_refuses_the_answer_without_a_digit() {
+    let f = Fixture::questions();
+    let mut human = f.connect();
+    f.hook_event("session_start", None);
+    f.fence();
+    let paste = vec![b'P'; CAP];
+    human.send(&paste);
+    f.wait_held(1, 0);
+    let q = ask_recorder(&f, "answer-full");
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let client = dot_agent_deck::daemon_client::DaemonClient::new(f.answer_socket());
+    let outcome = runtime
+        .block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                client.answer_question_with_token_while(
+                    || true,
+                    f.agent_id(),
+                    &q.id,
+                    q.revision,
+                    vec![question::QuestionAnswer {
+                        question_index: 0,
+                        option_indices: vec![1],
+                        text: None,
+                    }],
+                    false,
+                    Some(3624),
+                ),
+            )
+            .await
+        })
+        .expect("a Full answer must refuse rather than park a client")
+        .unwrap();
+    match outcome {
+        dot_agent_deck::daemon_client::AnswerReport::Refused(
+            question::AnswerRefusal::WriteFailed { detail },
+        ) => assert!(
+            detail.contains("no room for the answer"),
+            "honest Full refusal: {detail}"
+        ),
+        other => panic!("expected the answer-specific Full refusal, got {other:?}"),
+    }
+    f.wait_held(1, 0);
+    f.expect_stable_input(b"");
+    f.release();
+    f.expect_input(&paste);
+    f.expect_stable_input(&paste);
+    assert!(
+        !f.live()
+            .unwrap()
+            .answer_settlements
+            .iter()
+            .any(|s| s.client_token == 3624 && s.outcome == question::SettlementOutcome::Written)
+    );
+}
+
+// tester: S-20 end
+
 // S-16's oracle is OSC syntax plus the script's query history, not the
 // production tokenizer or the paste-mode tracker's parity with vt100.
 // It observes actual PTY input and the native sequence exposed to helpers.
