@@ -16,7 +16,9 @@ const G: u64 = 7;
 /// While shut it takes nothing, after saying a write arrived; with a budget
 /// it takes that many bytes in all and then fails every write. With a
 /// per-call cap a call takes at most that many (a short write), and with
-/// `shut_after` the call after that many calls finds it shut.
+/// `shut_after` the call after that many calls finds it shut. With
+/// `panic_on` that call (counted from 0) takes its bytes and then panics
+/// before it returns, unwinding the writer thread.
 struct Scripted {
     chunks: Arc<Mutex<Vec<Vec<u8>>>>,
     open: Arc<(Mutex<bool>, std::sync::Condvar)>,
@@ -24,6 +26,7 @@ struct Scripted {
     budget: Option<usize>,
     per_call: Option<usize>,
     shut_after: Option<usize>,
+    panic_on: Option<usize>,
     calls: usize,
 }
 
@@ -51,6 +54,9 @@ impl std::io::Write for Scripted {
             }
         };
         self.chunks.lock().unwrap().push(buf[..n].to_vec());
+        if self.panic_on == Some(self.calls - 1) {
+            panic!("the scripted PTY writer unwinds after taking {n} bytes");
+        }
         Ok(n)
     }
 
@@ -85,6 +91,7 @@ struct Script {
     budget: Option<usize>,
     per_call: Option<usize>,
     shut_after: Option<usize>,
+    panic_on: Option<usize>,
     pane: bool,
 }
 
@@ -121,6 +128,7 @@ impl Rig {
                 budget: script.budget,
                 per_call: script.per_call,
                 shut_after: script.shut_after,
+                panic_on: script.panic_on,
                 calls: 0,
             }),
             script.pane.then(|| PANE.to_string()),
@@ -659,6 +667,77 @@ async fn probe_010_a_failed_prefix_then_retirement_tells_the_connection_once() {
         rig.notices.recv().await.as_deref(),
         Some(crate::agent_pty::WRITE_FAILED.as_bytes())
     );
+    assert!(rig.notices.try_recv().is_err(), "told once");
+}
+
+/// Scenario: Behind a check, hold `ab`, BEL and `cd` on a shut PTY, release once so the prefix's write waits inside the PTY, and retire the generation there. The PTY then takes the prefix and the writer thread panics before the write returns, so the prefix is never counted. Unwinding ends the sub-op and settles the ticket once, refused `exited` with nothing counted although the PTY took three bytes: the unwind frees the waiting settlement but recovers no bytes it never counted. Nothing waits on the dead thread: the connection is told `exited` once and a later write finds the writer gone at once.
+#[spec("inbox/probe/010")]
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_010_a_writer_unwinding_before_it_counts_a_prefix_settles_the_rest_once() {
+    let mut rig = Rig::scripted(
+        false,
+        Script {
+            panic_on: Some(0),
+            ..Script::default()
+        },
+    );
+    rig.fence();
+    let (_, ticket) = rig.offer(b"ab\x07cd").await;
+    rig.release();
+    rig.write_entered().await;
+    rig.writer.gate().retire();
+    assert!(
+        rig.settled(ticket).is_empty(),
+        "no settlement while the prefix is inside the PTY"
+    );
+    rig.open();
+    rig.taken_becomes(b"ab\x07").await;
+    assert_eq!(
+        rig.settles(ticket).await,
+        [Settlement::Refused("exited")],
+        "settled from what was counted, which the unwind never added to"
+    );
+    let later = tokio::time::timeout(Duration::from_secs(8), rig.writer.write_user(b"z"))
+        .await
+        .expect("a write after the writer thread died doesn't wait on it");
+    assert!(later.is_err(), "the writer is gone");
+    assert_eq!(rig.taken(), b"ab\x07");
+    assert_eq!(rig.settled(ticket).len(), 1, "settled once");
+    assert_eq!(
+        rig.in_flight(),
+        1,
+        "the unwound job is never counted out: an idle wait on this writer is bounded by its caller"
+    );
+    assert_eq!(
+        rig.notices.recv().await.as_deref(),
+        Some(b"exited".as_slice())
+    );
+    assert!(rig.notices.try_recv().is_err(), "told once");
+}
+
+/// Scenario: Behind a check, hold `ab`, BEL and `cd` on a PTY that takes two bytes and then fails; release once, so the prefix writes `ab` and fails and its connection is told. Then the writer thread leaves and the rest is released, so its job can't be queued. The connection isn't told a second time, and the ticket settles once, as two bytes written in part.
+#[spec("inbox/probe/010")]
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_010_an_unqueueable_rest_after_a_failed_prefix_doesnt_tell_the_connection_again() {
+    let mut rig = Rig::new(true, Some(2));
+    rig.fence();
+    let (_, ticket) = rig.offer(b"ab\x07cd").await;
+    rig.release();
+    rig.taken_becomes(b"ab").await;
+    rig.flight(1).await;
+    assert_eq!(
+        rig.notices.recv().await.as_deref(),
+        Some(crate::agent_pty::WRITE_FAILED.as_bytes())
+    );
+    rig.surrender().await.expect("the writer thread left");
+    assert_eq!(rig.release(), 1);
+    assert_eq!(
+        rig.settles(ticket).await,
+        [Settlement::Partial { accepted: 2 }]
+    );
+    rig.idle().await;
+    assert_eq!(rig.settled(ticket).len(), 1, "settled once");
+    assert_eq!(rig.in_flight(), 0);
     assert!(rig.notices.try_recv().is_err(), "told once");
 }
 

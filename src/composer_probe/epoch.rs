@@ -62,9 +62,8 @@
 //! tracker's candidates by the lock alone. The daemon attaches them to an
 //! installed generation at its spawn (Q35-14b, `super::observe`).
 //!
-//! **What it costs today.** Nothing reads it to decide, but it isn't free: a
-//! person's op is read as a report and every op is tokenized under this
-//! lock, inside the ingress lock when ticketed, and an output push that
+//! **What it costs today.** A person's op is read as a report and every op
+//! is tokenized under this lock, inside the ingress lock when ticketed, and an output push that
 //! carries notes waits for it while holding the output lock. Q35-16's
 //! planner decides under it: whether a person's op is cut at a candidate or
 //! its candidates are numbered native is read from the liability state here
