@@ -5,7 +5,7 @@
 //! The outer half (`outer.rs`) builds the inputs, creates the sandbox, starts
 //! `bwrap` with this binary as its command and answers the host-side half of
 //! each pre-connect check over [`crate::ctl`]. This half proves its own
-//! namespace, drives rule 12's scenario, tears it down by verified identity,
+//! namespace, drives CLAUDE.md rule 12's scenario, tears it down by verified identity,
 //! and hands its evidence back as JSON.
 
 use std::cell::RefCell;
@@ -783,7 +783,7 @@ pub(crate) fn kernel_owner_line(path: &Path) -> String {
 
 /// Which build plays which part in a run.
 ///
-/// Forward is rule 12's pairing: the previous release serves the daemon and
+/// Forward is CLAUDE.md rule 12's pairing: the previous release serves the daemon and
 /// stands the orchestration up under it; the branch attaches second, declines
 /// the prompt, and is the CLI every pane command and the final status query
 /// use. Reverse swaps the two builds and changes nothing else about the
@@ -1744,7 +1744,7 @@ fn with_attached_tui(
              `{ROLE_REVIEWER}` pane, then `{} inbox fetch --json` and `{} inbox list --json` from \
              inside the orchestrator pane: {work_done_note}\n\
              status: issued `{} agent-event --type running` from inside the `{ROLE_REVIEWER}` \
-             pane, LAST as rule 12 requires. {status_note}{}",
+             pane, LAST as CLAUDE.md rule 12 requires. {status_note}{}",
             cast.pane_cli,
             cast.pane_cli,
             cast.pane_cli,
@@ -1917,7 +1917,7 @@ fn with_attached_tui(
         // daemon at the legacy address must never bind, create or unlink
         // anything at its own spelling. Recorded as an observation rather than
         // as a fifth tell — it is specific to one change's claim, where the four
-        // tells are what rule 12 asks of every change.
+        // tells are what CLAUDE.md rule 12 asks of every change.
         let own_dir = sandbox::per_uid_dir(plan.uid);
         ev.step(format!(
             "the branch build's own endpoint directory {} (inside the namespace; `{}` outside) {} \
@@ -3823,7 +3823,7 @@ pub fn compare_hellos(old_raw: &str, new_raw: &str) -> Result<Vec<String>, Strin
     notes.push(if op == np {
         format!(
             "PROTOCOL_VERSION matches on both sides ({}), so this run exercises SEMANTICS behind \
-             a stable wire — which is what rule 12 is for",
+             a stable wire — which is what CLAUDE.md rule 12 is for",
             op.map(|v| v.to_string())
                 .unwrap_or_else(|| "<absent>".into())
         )

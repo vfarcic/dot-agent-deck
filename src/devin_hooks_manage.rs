@@ -7,7 +7,7 @@
 //! `dot-agent-deck hook --agent devin` — into Devin's user config, so a live
 //! session's prompt / tool / turn events ride the deck's existing
 //! raw-`AgentEvent` hook socket (no new wire, no `PROTOCOL_VERSION` bump —
-//! rule 12).
+//! CLAUDE.md rule 12).
 //!
 //! It is the [`IntegrationStrategy::NativeHooks`] analog of
 //! [`crate::hooks_manage`] (Claude), but it borrows its SAFETY discipline from

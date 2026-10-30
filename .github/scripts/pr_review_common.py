@@ -76,7 +76,7 @@ DENY_PATHS = (
 # They disagreed until #1000 review: the selector truncated to five paths in the
 # GitHub files API's alphabetical order, and `src/daemon_protocol.rs` sorts LAST
 # of these prefixes. A protocol change touching five `.github/` files therefore
-# lost the protocol path before the vote job ever saw it, so rule 12's
+# lost the protocol path before the vote job ever saw it, so CLAUDE.md rule 12's
 # unverifiable cross-version obligation was silently downgraded to the `.github/`
 # catch-all and the "Touches:" line never mentioned the protocol at all.
 DENY_PRECEDENCE = (

@@ -13,7 +13,7 @@
 //! on a machine the client cannot see still gets a context to read. Nothing in
 //! lane 1 proves an agent ever reads it, and CLAUDE.md rule 4 asks for exactly
 //! one test per major feature that validates it as a user actually uses and sees
-//! it. This is that test, and rule 5 records that it runs on a developer's
+//! it. This is that test, and CLAUDE.md rule 5 records that it runs on a developer's
 //! machine and **nowhere in CI** — so a break here surfaces when someone next
 //! runs `cargo test-e2e-live`, not on any schedule.
 //!
@@ -44,7 +44,7 @@
 //!
 //! ## What makes the assertion robust rather than lucky
 //! The task the daemon writes into the context is a directive list-files
-//! command (rule 4's shape, copied from `scheduler/dispatch/013`), and the
+//! command (CLAUDE.md rule 4's shape, copied from `scheduler/dispatch/013`), and the
 //! fixture ships a uniquely named [`SENTINEL`]. So the hard assertion is on one
 //! literal filename appearing in the coordinator's pane — never on prose the
 //! model composes. The sentinel is deliberately absent from the context file
@@ -60,7 +60,7 @@
 //!
 //! Cost (Decision 23): one short interactive Haiku turn (read a file, run
 //! `ls -a`, print the listing) — well under the <$0.05/run bound. Flaky-tolerant
-//! (real LLM) per rule 4: run once, not looped.
+//! (real LLM) per CLAUDE.md rule 4: run once, not looped.
 
 mod common;
 
@@ -87,12 +87,12 @@ const COORDINATOR_ROLE: &str = "coordinator";
 /// `name` and `start`, so a role's command never crosses the wire and the
 /// spawning client is the party that holds it. `Read` lets the coordinator open
 /// the daemon-published context without stopping at a permission prompt;
-/// `Bash` lets it genuinely run `ls -a`. Interactive — no `-p`, per rule 4.
+/// `Bash` lets it genuinely run `ls -a`. Interactive — no `-p`, per CLAUDE.md rule 4.
 const COORDINATOR_COMMAND: &str =
     "claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read";
 
 /// The committed fixture file the coordinator must report back. Uniquely named
-/// (rule 4) so the assertion survives LLM phrasing and tool variance: only this
+/// (CLAUDE.md rule 4) so the assertion survives LLM phrasing and tool variance: only this
 /// literal has to come through, and `common::wait_for_pane_text_on` matches it
 /// wrap-insensitively.
 const SENTINEL: &str = "context_proof_9d4f2a.txt";

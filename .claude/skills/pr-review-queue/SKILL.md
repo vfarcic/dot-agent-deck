@@ -123,7 +123,7 @@ Print every included PR with **number, title, author, whether it is the runner's
 
 Then **ask how many to dispatch**, recommending **2–3**. Do not assume "all of them", and do not offer "all" as the recommended option.
 
-Each unit that verifies runs `/verify-pr`, which since issue #502 **reads** the PR's `e2e-deterministic` CI run (or its `RWX: linux` status, when `.github/ci-backend` says `rwx`) rather than reproducing lane 1 locally — so a verification is now dominated by the release build, `test-fast` and the windows cross-check rather than by tens of minutes of PTY time. It still builds its own multi-GB `target/`, and a unit may opt into a local lane-1 run with `--e2e` where CI's is missing. How much of that to spend at once is the user's call, not yours. Some of that need not land here at all: `ci.yml` is `workflow_dispatch`-able, so a unit working on **its own** branch can run the full matrix on GitHub's runners ([`docs/develop/ci-on-demand.md`](../../../docs/develop/ci-on-demand.md)). It relieves no gate — rule 2's run before a commit exists — and it buys nothing at all on someone else's PR, where the run already exists and is the unit's to read rather than to restart.
+Each unit that verifies runs `/verify-pr`, which since issue #502 **reads** the PR's `e2e-deterministic` CI run (or its `RWX: linux` status, when `.github/ci-backend` says `rwx`) rather than reproducing lane 1 locally — so a verification is now dominated by the release build, `test-fast` and the windows cross-check rather than by tens of minutes of PTY time. It still builds its own multi-GB `target/`, and a unit may opt into a local lane-1 run with `--e2e` where CI's is missing. How much of that to spend at once is the user's call, not yours. Some of that need not land here at all: `ci.yml` is `workflow_dispatch`-able, so a unit working on **its own** branch can run the full matrix on GitHub's runners ([`docs/develop/ci-on-demand.md`](../../../docs/develop/ci-on-demand.md)). It relieves no gate — CLAUDE.md rule 2's run before a commit exists — and it buys nothing at all on someone else's PR, where the run already exists and is the unit's to read rather than to restart.
 
 **The count is a security decision, not only a cost one.** N units means N concurrent agents, N independent chances for the untrusted-content problem in step 5 to land, and N simultaneous `cargo build` / `nextest` / `xtask` runs over code nobody has read yet. That is what a "just do all of them" answer is really buying.
 
@@ -333,11 +333,11 @@ Derive it from `scan.sh`'s buckets, then write prose that names the real files:
 | `DEPS` | Read the version delta and the exact-pin comments in `Cargo.toml`; a lockfile-only bump still ships transitively. |
 | `SRC` | The catch-all for `src/*` that is neither protocol nor UI — **the most ordinary code PR in this repo, and the one most likely to get a lazy note.** Name the actual modules and the actual invariant each one could break. |
 | `UI_SNAPSHOT` | An `.insta` snapshot moved. Confirm the new bytes are the intended rendering, not a regression accepted by `cargo insta accept`. |
-| `CATALOG` | `tests/CATALOG.md` changed — check the ` [reel]` markers, since rule 4 makes that opt-in the difference between a clip and a silent omission. |
-| `PRD` / `CHANGELOG` | Prose-only surfaces. Check the fragment's category (`.feature` / `.bugfix` / `.breaking`) matches what shipped, and rule 12's bump policy. |
+| `CATALOG` | `tests/CATALOG.md` changed — check the ` [reel]` markers, since CLAUDE.md rule 4 makes that opt-in the difference between a clip and a silent omission. |
+| `PRD` / `CHANGELOG` | Prose-only surfaces. Check the fragment's category (`.feature` / `.bugfix` / `.breaking`) matches what shipped, and CLAUDE.md rule 12's bump policy. |
 | `OTHER` | Nothing classified it, so nothing suggests a risk. Read the paths yourself and say what they are — never leave the note empty because the bucket was. |
 | Destructive operations (worktree/branch removal, file deletion, reaping) | Scrutinise the safety gates. Be specific about **what could be destroyed if a gate is wrong** — name the path or ref, not "data loss". |
-| `DOCS` / `DOCS_DEVELOP` | Rules 10 and 11: no hard-wrapped prose; developer docs stay under `docs/develop/` and out of `docs/published.toml`; a new user page has a manifest entry whose title matches its first heading. |
+| `DOCS` / `DOCS_DEVELOP` | CLAUDE.md rules 10 and 11: no hard-wrapped prose; developer docs stay under `docs/develop/` and out of `docs/published.toml`; a new user page has a manifest entry whose title matches its first heading. |
 
 A PR usually hits more than one row. Merge them into prose rather than pasting the table.
 

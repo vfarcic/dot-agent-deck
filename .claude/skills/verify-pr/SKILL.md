@@ -29,8 +29,8 @@ A PR number, `#number`, or PR URL. If none was given, ask — do not guess from 
 2. **Never push to the contributor's branch and never merge as part of this skill.** The deliverable is a recommendation. Merging is the user's action, on their say-so.
 3. **Never post to GitHub.** The report is local. If the user later wants it sent, that is a separate, explicitly-confirmed action. Approving a held workflow run (Phase 1b) is the one GitHub write this skill makes — it publishes no content and it is gated on the Phase 0 safety verdict.
 4. **Never present a skipped check as a passed one.** Every `SKIPPED` / `BLOCKED` / `ATTENTION` row from `checks.sh` appears in the report, with its reason.
-5. **A single e2e failure is not a verdict.** Rule 6's isolation rerun comes first (Phase 5).
-6. **Nothing learned here goes to global memory** (rule 13). Durable findings belong in the repo; PR-specific ones belong in the report.
+5. **A single e2e failure is not a verdict.** CLAUDE.md rule 6's isolation rerun comes first (Phase 5).
+6. **Nothing learned here goes to global memory** (CLAUDE.md rule 13). Durable findings belong in the repo; PR-specific ones belong in the report.
 
 ## Phase 0 — Scan before running anything
 
@@ -56,7 +56,7 @@ The gate also reports `INCOMPLETE_FILE_LIST` when fewer files came back than `PR
 
 **`REVIEWS_AT_HEAD`** — `complete` means every review app in `.claude/skills/pr-create/reviewers.json` has finished on the head (`REVIEWS_FINISHED` names them). `incomplete` lists the rest in `REVIEWS_NOT_FINISHED`: a review still running, or an app that produced nothing within its bound, such as Greptile out of quota. `unknown`, with all three lists `unknown`, means the status could not be read, and `REVIEWS_ERROR` says why; treat it as not knowing, never as "no app has finished". The scan does not wait; to wait, run `.claude/skills/pr-create/wait-reviews.sh <n>` (issue #1256). Either way, say in the report which apps' reviews you read, because the findings you list under "Already covered" are only as complete as the reviews that finished.
 
-Then read what the existing reviewers already found, per rule 8:
+Then read what the existing reviewers already found, per CLAUDE.md rule 8:
 
 ```bash
 gh api repos/{owner}/{repo}/pulls/<n>/comments --paginate
@@ -92,7 +92,7 @@ Re-running on a PR that has been pushed to since: `setup.sh <n> --force`.
 
 - **A `pull_request` run executes the contributor's workflow files, so read them before approving.** The run checks out the PR *merge ref*, and the workflow definitions come from that ref too — a fork's edit to `.github/**` **is live in the run you are approving**. What makes a fork run safe is not the definitions' origin: it is that GitHub withholds every secret except `GITHUB_TOKEN` from a fork `pull_request` and reduces that token to read-only.
 
-  **On a same-repository branch that property does not apply, and this repository DOES hold an agent credential.** The repository secret `ANTHROPIC_API_KEY` exists for the agent PR reviewer (`.github/workflows/pr-review-batch.yml`, which passes it to the generated `pr-review.lock.yml`), which puts that key on a runner and reaches a real agent; its firewall keeps the raw variable out of the agent container and proxies the call, which limits model visibility but not runner presence. So a same-repo branch that adds a step reading `${{ secrets.ANTHROPIC_API_KEY }}` gets it. What is true, and is the narrow claim worth carrying, is that **no *test* credential is registered here and no e2e test reaches a real agent in CI** (rule 5, and line 138 below). Do not read that as "nothing here holds a secret worth a pre-merge run" — that absolute was in this file and it was false, which is the worst place for it to be, since this is the section that tells a maintainer whether approving CI execution is safe. Re-check the live secret list rather than assuming either way.
+  **On a same-repository branch that property does not apply, and this repository DOES hold an agent credential.** The repository secret `ANTHROPIC_API_KEY` exists for the agent PR reviewer (`.github/workflows/pr-review-batch.yml`, which passes it to the generated `pr-review.lock.yml`), which puts that key on a runner and reaches a real agent; its firewall keeps the raw variable out of the agent container and proxies the call, which limits model visibility but not runner presence. So a same-repo branch that adds a step reading `${{ secrets.ANTHROPIC_API_KEY }}` gets it. What is true, and is the narrow claim worth carrying, is that **no *test* credential is registered here and no e2e test reaches a real agent in CI** (CLAUDE.md rule 5, and line 138 below). Do not read that as "nothing here holds a secret worth a pre-merge run" — that absolute was in this file and it was false, which is the worst place for it to be, since this is the section that tells a maintainer whether approving CI execution is safe. Re-check the live secret list rather than assuming either way.
 
   So a malicious workflow edit is both a blocking finding **and** an approval blocker: it runs on the runner the moment you approve.
 
@@ -120,7 +120,7 @@ Then carry on to Phase 2 and read the results in Phase 6 (`gh pr checks <n>`). R
 
 **If it fails**, do not approve. That is a **DO NOT MERGE** finding: name the file, line, and mechanism, and say plainly that CI was left unapproved on purpose. Approving to "see what happens" is the one thing this phase must never do.
 
-Every head commit gets its own held runs, so a contributor's follow-up push — or your own, per rule 2's exception — needs this phase again.
+Every head commit gets its own held runs, so a contributor's follow-up push — or your own, per hard rule 2's exception — needs this phase again.
 
 ## Phase 2 — Run every automated gate
 
@@ -130,7 +130,7 @@ bash .claude/skills/verify-pr/checks.sh --dir ../dot-agent-deck-pr-<n>
 
 **Run this in the background** (`run_in_background: true`) — the suite runs far longer than a foreground tool call allows. It appends a row to `<worktree>/target/verify-pr/summary.tsv` as each step finishes and writes `DONE` at the end, so poll those instead of blocking. Logs land per step under `target/verify-pr/logs/`.
 
-Steps, cheapest first: `fmt`, `clippy` (both rule 2 — note clippy carries **both** e2e features, so it type-checks lane 2's files — the only step in this skill that compiles them, and CI-side the only thing that does, since no test reaching a real agent runs in any CI job), `build --release`, `test-fast` (rule 5's fast tier), `linkage-check` (rule 7), `windows-cross`, `audit`. It does not stop at the first failure — a review needs the whole picture. If the build fails, the test steps are marked `BLOCKED` rather than burning minutes restating it.
+Steps, cheapest first: `fmt`, `clippy` (both CLAUDE.md rule 2 — note clippy carries **both** e2e features, so it type-checks lane 2's files — the only step in this skill that compiles them, and CI-side the only thing that does, since no test reaching a real agent runs in any CI job), `build --release`, `test-fast` (rule 5's fast tier), `linkage-check` (rule 7), `windows-cross`, `audit`. It does not stop at the first failure — a review needs the whole picture. If the build fails, the test steps are marked `BLOCKED` rather than burning minutes restating it.
 
 **Lane 1 is CI's job, so READ its run rather than reproducing it.** The `e2e` step is **off by default** since issue #502: `ci.yml`'s `e2e-deterministic` job runs `cargo test-e2e` on every PR, so the signal already exists on the PR you are reviewing. **When the PR's `.github/ci-backend` says `rwx`, that job reads `skipped` and the tier ran on RWX instead**, inside the `RWX: linux` status (its `e2e` tasks); read that one, with `rwx results <run-id>` from the link `gh pr checks` prints (docs/develop/rwx.md). Get it, and put it in the report as a row like any other gate:
 
@@ -161,7 +161,7 @@ If it still cannot run, that surface is **UNVERIFIED**. Never green.
 
 ## Phase 3 — Read the code
 
-Work through `.claude/skills/verify-pr/checklist.md` against the diff, skipping sections whose buckets `scan.sh` did not report. It covers scope and silent deletions, rule 4's test ladder, snapshot review, rule 12's contract question, rule 9's flag gating, rules 10/11 for docs, the exact-pin comments in `Cargo.toml`, code quality, and the security section.
+Work through `.claude/skills/verify-pr/checklist.md` against the diff, skipping sections whose buckets `scan.sh` did not report. It covers scope and silent deletions, CLAUDE.md rule 4's test ladder, snapshot review, rule 12's contract question, rule 9's flag gating, rules 10/11 for docs, the exact-pin comments in `Cargo.toml`, code quality, and the security section.
 
 Classify every finding as **blocking**, **follow-up**, or **nit**, and cite `file_path:line`. A finding you cannot state as a concrete failure — inputs or state, and the wrong result — is speculation; drop it or verify it.
 
@@ -169,7 +169,7 @@ Classify every finding as **blocking**, **follow-up**, or **nit**, and cite `fil
 
 Only when the diff calls for it:
 
-**`RULE_12_TRIGGERED=true`** (daemon, protocol, orchestration, hooks) → run the cross-version manual test from rule 12. Start a daemon from the **previous release** with an agent under it, run the branch **TUI** against that older daemon, and confirm a **delegate** still routes and **hooks** (work-done, status) still arrive. If either silently stops, the PR broke the contract behind a stable wire — it needs a `PROTOCOL_VERSION` bump or a `.breaking.md` fragment, and the verdict is **REQUEST CHANGES**.
+**`RULE_12_TRIGGERED=true`** (daemon, protocol, orchestration, hooks) → run the cross-version manual test from CLAUDE.md rule 12. Start a daemon from the **previous release** with an agent under it, run the branch **TUI** against that older daemon, and confirm a **delegate** still routes and **hooks** (work-done, status) still arrive. If either silently stops, the PR broke the contract behind a stable wire — it needs a `PROTOCOL_VERSION` bump or a `.breaking.md` fragment, and the verdict is **REQUEST CHANGES**.
 
 **`RULE_4_TRIGGERED=true`** (user-visible TUI surface) → see it yourself. Use `/run-dot-agent-deck`, whose driver runs the binary against a fresh tempdir sandbox; without that redirection the TUI attaches to the developer's real daemon or contends on its lock files. Confirm the surface behaves as the PR describes, and that a `.snap` update reflects intended rendering rather than a regression pinned in place.
 
@@ -198,7 +198,7 @@ git -C ../dot-agent-deck-pr-<n>-base reset --hard origin/main
 
 Do **not** hand-roll a worktree under the scratchpad to get a second baseline. A cargo `target/` is multi-GB and the scratchpad is typically a tmpfs, so the build dies at link time with a misleading `linking with 'cc' failed`, and the space it does consume comes out of the RAM the compile needs (CLAUDE.md rule 14). Every worktree belongs at a disk-backed `../<repo>-<suffix>` sibling.
 
-**Flakes.** The e2e tier is flaky-tolerant by design — which is why rule 5 keeps lane 1 advisory rather than required, and why lane 2 is not a gate anywhere — and timing-sensitive tests here have failed on one platform and passed on two others in the same run. Per rule 6, rerun the single failing test in isolation first:
+**Flakes.** The e2e tier is flaky-tolerant by design — which is why lane 2 is not a gate anywhere, though lane 1 (`e2e-deterministic`) is a required check — and timing-sensitive tests here have failed on one platform and passed on two others in the same run. Per CLAUDE.md rule 6, rerun the single failing test in isolation first:
 
 ```bash
 cd ../dot-agent-deck-pr-<n> && cargo nextest run --features e2e <test-name>
@@ -267,7 +267,7 @@ UNVERIFIED. Nothing in CI covers it.>
 <findings from the inline comments, attributed to whichever app raised them, and whether the author answered them. Do not duplicate them above.>
 
 ## NOT verified
-<skipped real-agent tests; the rule 12 cross-version test if it was not run;
+<skipped real-agent tests; the CLAUDE.md rule 12 cross-version test if it was not run;
 anything --no-e2e or --only skipped. Windows belongs here always while
 `build-windows` is `if: false`, and macOS belongs here always on a PR, since
 `build-macos` runs on `main`, not on pull requests: a `skipped` conclusion verifies

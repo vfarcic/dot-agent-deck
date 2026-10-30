@@ -1438,7 +1438,7 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
     // orchestration and the team got something done".
     //
     // The observable is a uniquely-named sentinel FILE in the dispatched worktree
-    // (rule 4): it survives LLM phrasing and tool variance, and — unlike anything
+    // (CLAUDE.md rule 4): it survives LLM phrasing and tool variance, and — unlike anything
     // on the grid — it cannot be produced by an agent merely echoing the task back.
     const SENTINEL: &str = "dispatch_delegate_a41f.txt";
     // Where a coder that took the checkout for its project would put it. A file

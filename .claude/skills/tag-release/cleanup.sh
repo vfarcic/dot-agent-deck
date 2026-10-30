@@ -479,7 +479,7 @@ done < <(git branch -r --format='%(refname:short)' 2>/dev/null | grep '^origin/'
 
 # --- Sibling directories: tool caches and strays ---
 #
-# Scanned beside the MAIN checkout, where rule 14's `../<repo>-<suffix>` scheme
+# Scanned beside the MAIN checkout, where CLAUDE.md rule 14's `../<repo>-<suffix>` scheme
 # puts worktrees and where the tools below put their caches, matching only
 # `<repo>-*` and `dad-*` so an unrelated project next door is never listed.
 # Registered worktrees are left to the loop above. Symlinks are skipped: a

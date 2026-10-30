@@ -197,7 +197,8 @@ mod prd_skills;
 /// parsing `/proc`, and every property that makes that safe — the never-kill
 /// list, the two-part MCP identification, the stat-field arithmetic past a comm
 /// containing spaces, and the pid-reuse check before escalating — is a RUNTIME
-/// one that no compile step sees. Same argument rule 5 records for
+/// one that no compile step sees. Same argument `docs/develop/e2e-lanes.md` ("`--workspace`
+/// on all three aliases, and the fast-tier exceptions") records for
 /// `clean_tmp.rs`. Tests only; driven against a synthetic `PROC_ROOT` with
 /// signals recorded rather than sent, so no test ever signals a real process.
 ///
@@ -1205,13 +1206,13 @@ fn rule_no_raw_wait_in_e2e(inputs: &Inputs) -> Vec<String> {
 /// function entirely.
 ///
 /// **One exception, and it is CLAUDE.md rule 6's, not a loosening of Decision
-/// 26** (issue #488). Rule 6 (#908) names quarantine as the costly way to clear
+/// 26** (issue #488). CLAUDE.md rule 6 (#908) names quarantine as the costly way to clear
 /// a red test — a named owner, an expiry issue, and the test "marked in the
 /// tree, `#[ignore = "quarantined: <owner>, #<issue>"]`, so a run reports it
 /// skipped instead of failed". This check predated that and refused every
-/// `#[ignore]`, so the mark rule 6 prescribes could not land on any `#[spec]`
+/// `#[ignore]`, so the mark CLAUDE.md rule 6 prescribes could not land on any `#[spec]`
 /// test — which is every e2e test — and the only escapes left were the ones
-/// rule 6 refuses: fix it now, or leave it red. So exactly that form passes,
+/// CLAUDE.md rule 6 refuses: fix it now, or leave it red. So exactly that form passes,
 /// and nothing looser: a bare `#[ignore]`, a free-text reason such as
 /// `"flaky"`, or a mark missing its owner or issue number still fails, because
 /// the owner and the issue are what stop a quarantine becoming the graveyard

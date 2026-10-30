@@ -200,7 +200,7 @@ done
 [ "$file_list_complete" = true ] || read_first="${read_first:+${read_first} }INCOMPLETE_FILE_LIST"
 emit READ_DIFF_BEFORE_RUNNING "${read_first:-none}"
 
-# Rule 12 (cross-version contract) and rule 4 (TUI test ladder) triggers.
+# CLAUDE.md rule 12 (cross-version contract) and rule 4 (TUI test ladder) triggers.
 has_bucket PROTOCOL && emit RULE_12_TRIGGERED true || emit RULE_12_TRIGGERED false
 if has_bucket UI || has_bucket UI_SNAPSHOT; then
   emit RULE_4_TRIGGERED true
@@ -280,7 +280,7 @@ else
   emit REVIEWS_ERROR none
 fi
 
-# Rule 8: the findings live ONLY in the inline review comments, for every app.
+# CLAUDE.md rule 8: the findings live ONLY in the inline review comments, for every app.
 # A finished review, or a green `Greptile Review` check-run, is NOT the review.
 inline=$(gh api "repos/{owner}/{repo}/pulls/${pr}/comments" --paginate --jq '.[].id' 2>/dev/null | wc -l | tr -d ' ')
 emit INLINE_REVIEW_COMMENTS "${inline:-unknown}"

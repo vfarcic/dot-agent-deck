@@ -16,7 +16,7 @@
 //! at a wide-but-very-short terminal, driving the production
 //! `render_new_pane_form` through the `render_new_pane_form_to_buffer` seam.
 //!
-//! The third (`render/layout/006`, PRD #313 M5) is the L1 snapshot rule 4 asks
+//! The third (`render/layout/006`, PRD #313 M5) is the L1 snapshot CLAUDE.md rule 4 asks
 //! for on a user-facing layout change: it renders a whole orchestration tab
 //! unzoomed and zoomed through `render_orchestration_frame_to_buffer` and pins
 //! what zoom removes (the sidebar, the non-focused roles) against what it must

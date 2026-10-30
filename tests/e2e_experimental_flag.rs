@@ -18,7 +18,7 @@
 //!
 //! Decision 6: gated behind the `e2e` feature so CI's `cargo test-fast`
 //! never compiles it. Authored RED — the flag plumbing and the gated
-//! footer do not exist yet — and NOT run per-task (rule 5: the L2 suite is
+//! footer do not exist yet — and NOT run per-task (CLAUDE.md rule 5: the L2 suite is
 //! the pre-PR gate, not the per-task gate).
 
 mod common;
@@ -63,8 +63,9 @@ fn gating_003_env_var_toggles_footer_e2e() {
     // (We must NOT use `wait_until_quiescent` here: the harness documents
     // quiescence as unreliable because the deck redraws often enough that a
     // 50ms idle window may never occur — so it times out on the always-
-    // redrawing dashboard. Rule 21 forbids sleeps, so a positive sentinel +
-    // same-frame absence check is the deterministic primitive.)
+    // redrawing dashboard. Linkage-check rule 5 (Decision 21) forbids sleeps,
+    // so a positive sentinel + same-frame absence check is the deterministic
+    // primitive.)
     let off = TuiDeck::launch_with_fixture("minimal");
     off.wait_for_string("No active agents");
     assert!(

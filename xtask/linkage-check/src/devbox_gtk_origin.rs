@@ -4,7 +4,8 @@
 //!
 //! That property is a RUNTIME one — the script either compares the resolved
 //! `libdir` against the store prefix or it does not, and no compile step can
-//! tell. It is the same shape CLAUDE.md rule 5 records for
+//! tell. It is the same shape `docs/develop/e2e-lanes.md` ("`--workspace` on all
+//! three aliases, and the fast-tier exceptions") records for
 //! `xtask/linkage-check/src/clean_tmp.rs` and `junit_strip.rs`: a script whose
 //! whole value is an assertion, which is exactly the class that stays green
 //! while doing nothing.

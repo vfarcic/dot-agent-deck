@@ -266,7 +266,7 @@ e2e = []
 # spawning `claude` spends a credential with no environment variable
 # involved. Credential handling for a LOCAL lane-2 run is issue #785.
 #
-# One CI job does still compile these files, and it is the only one: rule 2's
+# One CI job does still compile these files, and it is the only one: CLAUDE.md rule 2's
 # `cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D
 # warnings`. Do not "simplify" `e2e-live` out of that command — it is all that
 # stands between these files and a type error nobody sees until someone runs

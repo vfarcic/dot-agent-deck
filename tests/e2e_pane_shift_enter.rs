@@ -53,9 +53,9 @@
 //!
 //! Decision 23 cost: `001`'s draft assertions submit NOTHING, so they cost zero
 //! LLM tokens; only its positive control (one plain Enter, one `touch`) spends a
-//! short Haiku turn, and `002` spends none. Local-only (Decision 8 / rule 5):
+//! short Haiku turn, and `002` spends none. Local-only (Decision 8 / CLAUDE.md rule 5):
 //! gated on the `e2e` feature so CI's `cargo test-fast` never compiles it.
-//! Flaky-tolerant (real agent) per rule 4 — run once, not looped.
+//! Flaky-tolerant (real agent) per CLAUDE.md rule 4 — run once, not looped.
 //!
 //! Bug fix, not a showcase: NO ` [reel]` marker on the catalog entries (PRD #180).
 
@@ -334,7 +334,7 @@ fn key_forwarding_001_shift_enter_inserts_newline_without_submitting() {
     //
     // It is the one step that depends on a live model turn, so it carries the
     // widest ceiling in the file (120 s). That is the deliberate trade: this file
-    // lives in the flaky-tolerant pre-PR e2e tier (rule 4/5), and a control that
+    // lives in the flaky-tolerant pre-PR e2e tier (CLAUDE.md rules 4/5), and a control that
     // never fails is not a control. ---
     deck.send_bytes(b"\r");
     assert!(

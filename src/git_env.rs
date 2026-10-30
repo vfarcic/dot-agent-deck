@@ -28,7 +28,7 @@
 //! `xtask/linkage-check`'s rule 13 fails the build on a `git` program literal
 //! anywhere else in `src/`'s production half.
 //!
-//! Production is the narrow claim on purpose. Rule 13 exempts anything gated
+//! Production is the narrow claim on purpose. Linkage-check rule 13 exempts anything gated
 //! on `test` by a `#[cfg]`, so a fixture that builds its own repositories is a
 //! separate question — [`fixture_git`] below is what those should use, and
 //! issue #1121 is where that half is tracked.
@@ -146,7 +146,7 @@ fn scrubbed() -> Command {
 ///
 /// Every synchronous `git` invocation in [`crate::worktree_owner`]'s and
 /// [`crate::worktree_reclaim`]'s PRODUCTION code goes through here — checked
-/// by rule 13, not merely intended — which makes
+/// by linkage-check rule 13, not merely intended — which makes
 /// [`crate::worktree_owner::git_dir_of`], and so the ownership gate, the
 /// enumeration the reclaim decision is made from, and the removal behind it,
 /// immune to the same ambient override. Their test fixtures are outside that

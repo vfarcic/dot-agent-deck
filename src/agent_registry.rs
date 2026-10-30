@@ -85,7 +85,7 @@ pub enum IntegrationStrategy {
 /// here contains `0x03`.
 ///
 /// **Served by the daemon, not compiled into a client** (PRD #1541 M1 decision
-/// 7, rule 18): a deck answers for the agent versions on its own host, the way
+/// 7, CLAUDE.md rule 18): a deck answers for the agent versions on its own host, the way
 /// [`crate::agent_pty::AgentRecord::cli_name`] answers which binary it forked
 /// (issue #856). It reaches clients as
 /// [`crate::agent_pty::AgentRecord::prompt_keys`], an additive optional field.

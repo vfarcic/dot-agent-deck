@@ -15,7 +15,8 @@
 //! it on review. The same hole was a denial of service: one malformed block
 //! from a stranger raised out of the selector and killed the whole sweep.
 //!
-//! That is the shape CLAUDE.md rule 5 records for `clean_tmp.rs` and
+//! That is the shape `docs/develop/e2e-lanes.md` ("`--workspace` on all three
+//! aliases, and the fast-tier exceptions") records for `clean_tmp.rs` and
 //! `junit_strip.rs` — a safety property that exists only at runtime — so these
 //! tests put it in `cargo test-fast`, where a change that quietly reopens the
 //! boundary goes red on the per-task gate rather than after an unearned
@@ -209,7 +210,7 @@ fn prose_around_the_block_does_not_hide_it() {
 
 /// Issue #998: the explanation the merger reads must be the SPECIFIC one, not a
 /// generic "protected path". A pull request touching both `src/daemon_protocol.rs`
-/// and `.github/` must be explained by rule 12's unverifiable cross-version test,
+/// and `.github/` must be explained by CLAUDE.md rule 12's unverifiable cross-version test,
 /// which is the harder obligation — not by the CI catch-all that happens to match
 /// too. Ordering — DENY_PRECEDENCE in `pr_review_common` — is the whole mechanism,
 /// so it is worth a test.
