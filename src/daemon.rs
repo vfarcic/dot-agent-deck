@@ -2422,6 +2422,9 @@ struct HookLoopLimits {
     hold_deadline: Duration,
     max_holds: usize,
     ack_wait: Duration,
+    /// Issue #1664: how long an earlier connection that has sent nothing can
+    /// hold back a later event ([`crate::hook_event_order::PREDECESSOR_WAIT`]).
+    event_order_wait: Duration,
 }
 
 impl HookLoopLimits {
@@ -2432,6 +2435,7 @@ impl HookLoopLimits {
             hold_deadline: QUESTION_HOLD_DEADLINE,
             max_holds: MAX_HELD_QUESTIONS,
             ack_wait: HELD_REPLY_ACK_WAIT,
+            event_order_wait: crate::hook_event_order::PREDECESSOR_WAIT,
         }
     }
 }
@@ -5767,6 +5771,9 @@ async fn run_hook_loop_with_limits(
     // PRD #1631 (audit A6): held questions wait under a budget of their own,
     // not in the connection pool above.
     let hold_limit = Arc::new(tokio::sync::Semaphore::new(limits.max_holds));
+    // Issue #1664: the order connections are accepted in, so one session's
+    // events apply in the order they were sent.
+    let event_order = crate::hook_event_order::HookEventOrder::new(limits.event_order_wait);
     // Whether the cap is currently holding, so the warning below fires on the
     // transition into saturation rather than once per waiting connection.
     let mut at_cap = false;
@@ -5791,6 +5798,9 @@ async fn run_hook_loop_with_limits(
             }
             accept_res = accept_hook_connection(&listener, &conn_limit, limits.max_connections, &mut at_cap) => match accept_res {
             Ok((permit, stream)) => {
+                // Issue #1664: taken here, in accept order, before the task
+                // that may run ahead of an earlier connection's is spawned.
+                let mut event_order_ticket = Some(event_order.admit());
                 let hold_limit = Arc::clone(&hold_limit);
                 let state = state.clone();
                 let event_tx = event_tx.clone();
@@ -5913,6 +5923,16 @@ async fn run_hook_loop_with_limits(
                                 break;
                             }
                         };
+                        // Issue #1664: a raw event waits for the events of its
+                        // session or pane accepted ahead of it, and holds its
+                        // turn until this line is handled; an `inbox_announce`
+                        // keeps the place for the event after it, and anything
+                        // else gives it up. See `crate::hook_event_order`.
+                        let _event_turn = crate::hook_event_order::turn_for_line(
+                            &mut event_order_ticket,
+                            &line,
+                        )
+                        .await;
                         if let Ok(msg) = serde_json::from_str::<DaemonMessage>(&line) {
                             // Issue #1077: ONE provenance gate for every verb on
                             // this socket, ahead of the match rather than inside
@@ -19632,3 +19652,10 @@ mod hook_reply_deadline_tests;
 #[cfg(all(test, unix))]
 #[path = "daemon_held_confirmation_deadline_tests.rs"]
 mod held_confirmation_deadline_tests;
+
+// Issue #1664: one session's hook events apply in the order they were sent.
+// Unix-only, like `hook_reply_deadline_tests`: it drives the loop over a Unix
+// socket.
+#[cfg(all(test, unix))]
+#[path = "daemon_hook_event_order_tests.rs"]
+mod hook_event_order_tests;

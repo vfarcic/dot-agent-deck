@@ -2878,6 +2878,20 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** that a dispatch whose acknowledgement FAILED, rather than timed out, still runs (the unknown pane runs none here); the dispatch itself, which `orchestration/dispatch` owns.
 - **Platform coverage:** mac+linux (Unix-domain socket).
 
+##### hooks/ingest/009 — One session's hook events apply in the order their connections were accepted (issue #1664).
+- **Layer:** L1 (the real `run_hook_loop_with_limits` driven against a real Unix hook socket in-process, with a 60s predecessor wait so the result does not depend on load; no PTY, no deck binary, no agent).
+- **Agent:** none (raw OpenCode `session_start` and `quota_blocked` lines, one per connection).
+- **Asserts:** a control session whose two events are written the ordinary way ends Blocked with both applied in order; then, for a second session, a `session_start` connection is accepted ahead of a `quota_blocked` connection but writes its line only after the `quota_blocked` has been sent and the daemon given a second to apply it. The card must read Blocked, the session's applied events must be `session_start` then `quota_blocked`, and the `quota_blocked` must not have been applied during that second. A third session repeats the reordering with the earlier connection sending an `inbox_announce` first and its `session_start` after it on the same connection, as a `SessionStart` hook with an inbox waiter does; the announce must keep the connection's place, with the same three assertions. Before the fix the later connection's task applied its event first and the `session_start` then reset the card to Idle, the symptom in `status/blocked/019`'s quarantine.
+- **Does not assert:** the ordering of events of different sessions and panes, which do not wait for each other (`hook_event_order` unit tests); the production predecessor wait (2s), which `hooks/ingest/010` exercises at a smaller value; ordering of `DaemonMessage` lines such as `question`, which take no part.
+- **Platform coverage:** mac+linux (Unix-domain socket).
+
+##### hooks/ingest/010 — A connection that never writes holds later events back only for the predecessor wait (issue #1664).
+- **Layer:** L1 (as `hooks/ingest/009`, with a 200ms predecessor wait).
+- **Agent:** none (one silent peer, then one `session_start` on a later connection).
+- **Asserts:** an event accepted behind a connection that stays open and silent is still applied while that connection is open, which is reachable only through the predecessor wait running out, since the silent peer's idle timeout (60s) is far past the test's 20s bound.
+- **Does not assert:** how long the event was held, beyond that bound (the exact wait is pinned by the `hook_event_order` unit test with paused time); the `debug!` line the wait writes when it gives up.
+- **Platform coverage:** mac+linux (Unix-domain socket).
+
 #### hooks/install
 
 ##### hooks/install/001 — Launching the deck with `~/.claude/` present writes hook entries into `~/.claude/settings.json` idempotently.
