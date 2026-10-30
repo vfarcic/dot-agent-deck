@@ -13389,7 +13389,7 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 - **Does not assert:** that Claude Code fires the hook (measured on 2.1.78 and 2.1.314 by hand, and covered live by `telemetry/otlp/046`), or the note `hooks install` prints when the gate is closed.
 - **Platform coverage:** mac+linux.
 
-##### status/tool_end/001 — A failed Claude Code tool call ends on the card without turning it to Error.
+##### status/tool-end/001 — A failed Claude Code tool call ends on the card without turning it to Error.
 
 - **Layer:** fast tier (`tests/claude_tool_failure.rs`), the real `dot-agent-deck hook --agent claude-code` CLI feeding `AppState::apply_event`.
 - **Agent:** none (Claude Code-shaped hook payloads; the `PostToolUseFailure` shape recorded from 2.1.314).
@@ -13409,6 +13409,6 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_telemetry_failed_operation_live.rs`); local OTLP/JSON receiver.
 - **Agent:** real interactive Claude Code on Haiku, with the hooks the deck installs.
-- **Asserts:** Haiku runs one Bash command that copies a unique sentinel and exits 3; the turn visibly goes Working/Bash → Idle; the operation exports while the run is open and no exported operation carries `deck.operation.end`; the grid shows no Error.
-- **Does not assert:** that Claude Code fired `PostToolUseFailure` rather than another end (the hook is the only end it sends for a failed call, measured by hand on 2.1.314), or Claude Code's own success flag on its tool-result event.
+- **Asserts:** Haiku runs one plain Bash command, `cp <sentinel> <proof>; exit 3`, which copies a unique sentinel and fails; the turn visibly goes Working/Bash → Idle; that command's operation (`deck.operation.program=cp`) exports while the run is open, without `deck.operation.end`, and ends before the run; the grid shows no Error. Skips, with the reason, when the installed Claude Code is below the hook's 2.1.78 floor.
+- **Does not assert:** that Claude Code fired `PostToolUseFailure` rather than another end (the hook is the only end it sends for a failed call, measured by hand on 2.1.314), other operations Haiku might run, or Claude Code's own success flag on its tool-result event.
 - **Platform coverage:** linux (lane 2 runs on a developer's machine).

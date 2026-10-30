@@ -259,7 +259,7 @@ fn card_after(end: Value) -> (AppState, Option<AgentEvent>) {
 }
 
 /// Scenario: Through the real `hook --agent claude-code` CLI, start a session and a Bash call to `false`, then send the `PostToolUseFailure` Claude Code fires for it (the payload shape recorded from 2.1.314). The CLI must post a ToolEnd for that `tool_use_id`, and the card must drop the command as its running tool, count it, and stay Working rather than Error — exactly as the same call ended by a `PostToolUse` (the control) leaves it.
-#[spec("status/tool_end/001")]
+#[spec("status/tool-end/001")]
 #[test]
 fn status_tool_end_001_failed_claude_tool_call_ends_without_error() {
     let (control, control_end) = card_after(claude_payload(

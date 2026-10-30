@@ -12,11 +12,22 @@ use spec::spec;
 use std::time::Duration;
 use telemetry_operation_receiver::{EXPORT_WAIT, Receiver, attribute, nanos};
 
-/// Scenario: Start trusted interactive Claude Haiku in a real attached pane and ask it to run one Bash command that copies a uniquely named sentinel and then exits 3, visibly completing its turn. The failed command's exported operation must end while the run is still open and without the deck's forced-closure attribute, and the card must finish Idle rather than Error.
+/// Scenario: Start trusted interactive Claude Haiku in a real attached pane and ask it to run one Bash command that copies a uniquely named sentinel with `cp` and then exits 3, visibly completing its turn. That command's exported `cp` operation must end while the run is still open and without the deck's forced-closure attribute, and the card must finish Idle rather than Error.
 #[spec("telemetry/otlp/046")]
 #[test]
 fn telemetry_otlp_046_real_claude_failed_command_ends_its_operation() {
     skip_unless!(common::check_claude_available());
+    // The deck installs the hook under test only for a Claude Code at or above
+    // its floor; below it, a failed call still ends at run end, by design.
+    let (gates, version) = dot_agent_deck::hooks_manage::installed_claude_hook_gates();
+    skip_unless!(if gates.post_tool_use_failure {
+        Ok(())
+    } else {
+        Err(format!(
+            "the deck installs PostToolUseFailure only for Claude Code 2.1.78 or newer; \
+             `claude --version` reported {version:?}"
+        ))
+    });
     let receiver = Receiver::start();
     let deck = TuiDeck::builder()
         .with_pty_size(180, 50)
@@ -41,10 +52,10 @@ fn telemetry_otlp_046_real_claude_failed_command_ends_its_operation() {
         .expect("real interactive Haiku pane");
     let pane = agent.pane_id_env.as_deref().expect("pane id");
     let start = deck.stream_text().len();
+    // Plain words only, so the deck records `cp` as the operation's program
+    // and the test can tell this command's span from any other.
     let directive = format!(
-        "Use Bash exactly once to run: cat '{}/{SENTINEL}' > '{}/{PROOF}'; exit 3. The command is meant to fail with exit code 3; do not retry it or run anything else. Then reply FAILED_OP_DONE and end your turn.",
-        deck.workdir().display(),
-        deck.workdir().display(),
+        "In the current directory, use Bash exactly once to run this exact command: cp {SENTINEL} {PROOF}; exit 3. The command is meant to fail with exit code 3; do not retry it or run anything else. Then reply FAILED_OP_DONE and end your turn."
     );
     common::post_message_on(deck.attach_socket_path(), pane, &agent.id, &directive)
         .expect("post failing task to Claude");
@@ -63,21 +74,27 @@ fn telemetry_otlp_046_real_claude_failed_command_ends_its_operation() {
         "real Claude must visibly complete Working/Bash → Idle:\n{}",
         deck.snapshot_grid()
     );
+    let failed = || {
+        receiver
+            .operations(pane)
+            .into_iter()
+            .find(|operation| attribute(operation, "deck.operation.program") == Some("cp"))
+    };
     assert!(
-        common::wait_until(EXPORT_WAIT, || !receiver.operations(pane).is_empty()),
-        "the failed command's operation must export when Claude ends the call, not at run \
-         end (issue #1835)"
+        common::wait_until(EXPORT_WAIT, || failed().is_some()),
+        "the failed `cp …; exit 3` operation must export when Claude ends the call, not at \
+         run end (issue #1835); exported: {:?}",
+        receiver.operations(pane)
     );
     assert!(
         receiver.run(pane).is_none(),
         "the operation must finish while the run is open"
     );
-    for operation in receiver.operations(pane) {
-        assert!(
-            attribute(&operation, "deck.operation.end").is_none(),
-            "Claude ended this call itself, so the deck must not have closed it: {operation}"
-        );
-    }
+    let failed = failed().unwrap();
+    assert!(
+        attribute(&failed, "deck.operation.end").is_none(),
+        "Claude ended this call itself, so the deck must not have closed it: {failed}"
+    );
     assert!(
         !deck.snapshot_grid().contains("Error"),
         "a failed command is ordinary agent work, not an Error card:\n{}",
@@ -95,11 +112,8 @@ fn telemetry_otlp_046_real_claude_failed_command_ends_its_operation() {
         common::wait_until(EXPORT_WAIT, || receiver.run(pane).is_some()),
         "run never exported"
     );
-    let run_end = nanos(&receiver.run(pane).unwrap(), "endTimeUnixNano");
-    for operation in receiver.operations(pane) {
-        assert!(
-            nanos(&operation, "endTimeUnixNano") < run_end,
-            "every operation must have ended before the run did: {operation}"
-        );
-    }
+    assert!(
+        nanos(&failed, "endTimeUnixNano") < nanos(&receiver.run(pane).unwrap(), "endTimeUnixNano"),
+        "the failed command must have ended before the run did: {failed}"
+    );
 }
