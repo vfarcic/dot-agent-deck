@@ -1192,6 +1192,12 @@ fn map_event_type(hook_event_name: &str) -> Option<EventType> {
         "UserPromptSubmit" => Some(EventType::Thinking),
         "PreToolUse" => Some(EventType::ToolStart),
         "PostToolUse" => Some(EventType::ToolEnd),
+        // Issue #1835: Claude Code fires `PostToolUseFailure` INSTEAD of
+        // `PostToolUse` when a tool call fails [observed on 2.1.78 and
+        // 2.1.314], with the same `tool_use_id`. It ends the call as a
+        // `PostToolUse` does. Not `Error`: a failed command is ordinary agent
+        // work, and the turn goes on.
+        "PostToolUseFailure" => Some(EventType::ToolEnd),
         "Notification" => Some(EventType::WaitingForInput),
         "PermissionRequest" => Some(EventType::PermissionRequest),
         "Stop" => Some(EventType::Idle),
