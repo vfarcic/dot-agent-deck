@@ -11934,6 +11934,13 @@ The desktop half of answering by voice. These tests live in the desktop crate (`
 - **Does not assert:** a different agent's late frames, which admission refuses before ingest (issue #320).
 - **Platform coverage:** mac+linux.
 
+##### question/hold/024 — A producer that never reads its connection cannot pin a hold (issue #1976).
+- **Layer:** L1/fast unit (`src/daemon_held_confirmation_deadline_tests.rs`, `handle_question_signal` called directly over in-memory duplex pipes).
+- **Agent:** none (a `/bin/sh` stand-in pane).
+- **Asserts:** a held question sent with `confirm_hold` on a connection that stays open but whose write side has no room for the `held` line is released within the connection's idle timeout, as a producer that hung up is: the handler returns no reply, the hold-budget permit comes back, the hold is no longer registered and the pane shows no pending question. The control, a producer that reads, is told `held` and released at the hold deadline.
+- **Does not assert:** the stall over a real Unix socket, whose send buffer would have to be filled to within one line of full; the write deadline itself is `write_hook_reply`'s, as for `hooks/ingest/007`.
+- **Platform coverage:** mac+linux.
+
 ##### question/live/001 — A real Haiku permission is answered once and the command completes. [reel]
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_questions.rs`).
 - **Agent:** real interactive Claude Code, pinned Haiku 4.5, imported developer credentials and pre-seeded project trust.
