@@ -24,7 +24,7 @@
 //! | a request for another generation | `Missing` |
 //! | the reader's end | every outstanding request `Missing`, and every later one at once (here, and in `pump_reader` for every platform) |
 //! | the fed count can't advance | `Missing`, sticky (the output hook's count) |
-//! | after `rc == 0`, a process other than the daemon holds the master, or one that could can't be read (E-MF, [`master_holders`]) | `Missing` for the pending set |
+//! | after `rc == 0`, the `/proc` census finds another holder of the master, or can't complete (E-MF, UNVERIFIED: [`master_holders`]) | `Missing` for the pending set |
 //!
 //! **Publication.** `o` is the output hook's fed count, read under the bus
 //! lock in the same critical section that sets `Taken{o}`, and this thread
@@ -78,7 +78,7 @@ struct PtyIo {
     master: OwnedFd,
     wake: Arc<EventFd>,
     /// The master's identity and the tick before its `openpty`; `None` when
-    /// either couldn't be read, and then no scan can establish S-M.
+    /// either couldn't be read, and then every census is unknown.
     owner: Option<(MasterId, u64)>,
 }
 
@@ -498,10 +498,11 @@ fn zero_step(
         return;
     }
     control.after_zero();
-    // E-MF: S-M checked, not assumed. A holder outside the daemon, or one
-    // that could be and can't be read, and P-DRN doesn't apply: missing.
+    // E-MF (UNVERIFIED): a census of the master's other holders, read now.
+    // It doesn't establish S-M (`master_holders`), but a holder it finds, or
+    // a read it can't complete, makes the frontier missing.
     let holders = io.holders();
-    if holders != Holders::Sole {
+    if holders != Holders::NoneFound {
         tracing::warn!(
             target: "composer_frontier",
             generation,

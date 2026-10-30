@@ -28,7 +28,7 @@ struct Script {
     zero: VecDeque<io::Result<i16>>,
     reads: VecDeque<io::Result<Vec<u8>>>,
     drains: VecDeque<io::Result<()>>,
-    /// What each holder scan finds, `Sole` once it runs out.
+    /// What each holder census finds, `NoneFound` once it runs out.
     holders: VecDeque<Holders>,
     /// Each `wait`'s `wake` argument, in order.
     waited: Vec<bool>,
@@ -96,7 +96,7 @@ impl ReaderIo for Script {
         self.drains.pop_front().unwrap_or(Ok(()))
     }
     fn holders(&mut self) -> Holders {
-        self.holders.pop_front().unwrap_or(Holders::Sole)
+        self.holders.pop_front().unwrap_or(Holders::NoneFound)
     }
 }
 

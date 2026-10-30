@@ -1,12 +1,12 @@
 # Inbox kernel premises: E-PIN, E-LD and E-MF
 
-PRD #1666 part 3's drain frontier (Q35-20a, `src/agent_pty_frontier.rs`) rests on P-DRN: after a zero-timeout poll of a PTY master reports nothing, every byte written to the slave before the poll and not discarded has been read from the master. P-DRN holds only under S-M, that no process other than the daemon holds the master. Amendment 5 §3.1 of the Q35-core design makes three evidence items acceptance gates for Q35-20a, and asks that the results be kept in the repository rather than only under the gitignored `.dot-agent-deck/`. This page is that record. Under `EcPolicy::Hold`, which is production's policy, a taken frontier authorises nothing, so these premises are load-bearing only for the `Authority` flip and for any later design that reads a frontier.
+PRD #1666 part 3's drain frontier (Q35-20a, `src/agent_pty_frontier.rs`) rests on P-DRN: after a zero-timeout poll of a PTY master reports nothing, every byte written to the slave before the poll and not discarded has been read from the master. P-DRN holds only under S-M, that no process other than the daemon holds the master. Amendment 5 §3.1 of the Q35-core design makes three evidence items acceptance gates for Q35-20a, and asks that the results be kept in the repository rather than only under the gitignored `.dot-agent-deck/`. This page is that record. Under `EcPolicy::Hold`, which is production's policy, a taken frontier authorises nothing. The premises gate Q35-20a's acceptance as premise-backed, M-FR-X's reading of its frontiers as sound, the `Authority` flip, and any later design that reads a frontier. Until E-PIN and E-MF are in, Q35-20a lands as observation code (decision Q86).
 
 | Item | Status (2026-10-30) | Where |
 | --- | --- | --- |
 | E-PIN: re-pin the `upstream` (Linux `v7.0`) source rows against the running kernel, Ubuntu 7.0.0-31.31 @ `68d75f08` | **UNVERIFIED for every `.c` row.** Launchpad's plain-file endpoint still answers `504`. The header rows are pinned (below) | this page |
 | E-LD: the writers of a master's `ldisc_sem` | **answered against `v7.0`**: none is reachable from the slave; P-DRN stands, pending E-PIN | this page; full excerpts in `.dot-agent-deck/sources/e-ld-ldisc-sem.md` (local) |
-| E-MF: portable-pty's `openpty` → `FD_CLOEXEC` window | **checked at each frontier**: the reader scans `/proc` and publishes `Missing` when another process holds the master or could and can't be read | `src/composer_probe/master_holders.rs` |
+| E-MF: portable-pty's `openpty` → `FD_CLOEXEC` window | **UNVERIFIED.** A `/proc` census before each publication makes the frontier `Missing` when it finds another holder or can't complete, but a sampled census neither establishes nor enforces S-M | `src/composer_probe/master_holders.rs` |
 
 ## E-PIN
 
@@ -23,6 +23,19 @@ The header rows can be pinned now, from the running kernel's own headers package
 | `include/linux/tty_buffer.h` | identical |
 | `include/linux/ptrace.h` | identical |
 | `include/linux/sched/signal.h` (`delay_group_leader`, `:731–738`) | one line differs, `:742` (a lock annotation, `__acquires` → `__cond_acquires`), outside the quoted range |
+
+The comparison, so it can be checked again: SHA-256 (first 16 hex digits) of each file in the `v7.0` copy and in `/usr/src/linux-headers-7.0.0-31` (package version 7.0.0-31.31), on 2026-10-30.
+
+| Header | `v7.0` | 7.0.0-31 |
+| --- | --- | --- |
+| `include/linux/termios_internal.h` | `253508873d174df2` | `253508873d174df2` |
+| `include/uapi/asm-generic/termbits.h` | `6769d652b4178463` | `6769d652b4178463` |
+| `include/uapi/asm-generic/termbits-common.h` | `b022fb7a77f70ad6` | `b022fb7a77f70ad6` |
+| `include/linux/tty.h` | `132e1af4beac811b` | `132e1af4beac811b` |
+| `include/linux/tty_buffer.h` | `c8ba3e2968700181` | `c8ba3e2968700181` |
+| `include/linux/ptrace.h` | `1150f9a6c9e4dea3` | `1150f9a6c9e4dea3` |
+| `include/linux/sched/signal.h` | `8ec050eb7733d3ce` | `bc0d296b1ca63968` |
+| `include/linux/sched/signal.h`, lines 731–738 only | `c36b2cac68493c86` | `c36b2cac68493c86` |
 
 ## E-LD
 
@@ -44,27 +57,37 @@ By amendment 5's decision rule, P-DRN stands: the semaphore's writers are reacha
 
 ## E-MF
 
-portable-pty 0.8.1 calls `libc::openpty` and sets `FD_CLOEXEC` on both descriptors only afterwards (`src/unix.rs:56–58`). A fork and exec by another daemon thread in between inherits the master.
+**Status: UNVERIFIED** (decision Q86), alongside E-PIN. portable-pty 0.8.1 calls `libc::openpty` and sets `FD_CLOEXEC` on both descriptors only afterwards (`src/unix.rs:56–58`), so a fork and exec by another daemon thread in between inherits the master. Q35-20a doesn't close that window, and what it adds doesn't establish S-M.
 
-**Why it's checked rather than enforced.** A spawn lock would have to order every fork in the daemon process against `openpty`, including `std::process::Command` calls across the crate and in dependencies, which no lock in this crate can reach. An atomic close-on-exec open (`posix_openpt(O_CLOEXEC)` and `TIOCGPTPEER`) would need portable-pty's master and slave built from our descriptors, and its constructors are private, so it means replacing portable-pty's spawn path. Amendment 6 adds that atomic close-on-exec wouldn't establish S-M either, since a fork with no exec keeps every descriptor.
+**What the reader does.** Before publishing each frontier, after the zero poll, it takes a census of the master's other holders (`src/composer_probe/master_holders.rs`). The spawn reads the boot clock, in ticks, just before `openpty`, and the census reads every task's descriptor table (`/proc/<pid>/task/<tid>/fd`) of each process started at or after that tick, except the daemon and kernel threads. A descriptor holds the master when it is the same `ptmx` inode on the same device with the same `tty-index`. The frontier is `Missing` when the census finds a holder, or when any read fails other than by its process, task or descriptor having gone (`ENOENT`, `ESRCH`). A task whose table can't be listed is skipped only when a re-read shows it exiting or a zombie (it runs no more user code; a table it shares is read through its live siblings), or when its real uid isn't the daemon's.
 
-**What the check does.** The spawn reads the boot clock, in ticks, just before `openpty`. A process can hold the master only by inheriting it across a fork, so any holder other than the daemon started at or after that tick. Before publishing each frontier, after the zero poll, the reader lists `/proc` and reads the descriptors of every process started at or after that tick, except the daemon itself and kernel threads. A descriptor holds the master when it is the same `ptmx` inode, on the same device, with the same `tty-index` in its `fdinfo`. The frontier is `Missing` when:
+**Why it isn't S-M.** The census is one reading after the poll. Within the threat model (inheritance across `fork`; socket passing, `ptrace` and `pidfd_getfd(2)` are outside it), it still misses:
 
-- a process holds the master;
-- a process whose real uid is the daemon's can't have its descriptors listed, unless it has started exiting or is a zombie. The kernel makes an exiting task's `/proc/<pid>/fd` root's, and such a task runs no more user code.
+- a holder that used the master and closed it, or exited, before the reading, including a master-side change that outlives the process that made it;
+- a process forked after the census listed `/proc`, whose parent then closed its own copy before being read;
+- a thread created after its process's task list was read.
 
-Another user's process is skipped: it can hold the master only by being sent it over a socket, which is outside the threat model, as `ptrace` and `pidfd_getfd(2)` are.
+**What would establish it.** A causal mechanism, not a better census: an atomic close-on-exec pair (a portable-pty patch to its Linux pair creation, or a pair-creation broker that receives the descriptors close-on-exec), each still owing an analysis of fork without exec and of reacquisition. Neither is part-3 work unless the user reopens R-XW′ (Q86).
 
-**What the check doesn't establish.** It is a reading at one instant, so:
+**Fork without exec in the daemon.** In production none was found: `src/wrap.rs`'s lifetime backstop forks only under `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS`, and its reaper closes its inherited descriptors (`close_all_descriptors`); the editor helper's fork (`src/composer_probe/helper.rs`) runs in the helper process. The daemon's fork-then-exec children hold the master between the fork and the exec; a census that reads one then makes the frontier `Missing`.
 
-- a holder that used the master and closed it, or exited, before the scan isn't seen;
-- a process forked while `/proc` is being listed may be missed.
+**What it costs.**
 
-Two cases fail safe:
+- **Yield.** Any same-user process that can't be read and started after an agent's spawn makes that agent's frontiers `Missing` while it lives. On the development box this was measured on, those are `sshd-session` processes, one per SSH login. Neither review found a sound narrower discriminator (name, ancestry, session and uid aren't provenance), so they stay `Unknown` (Q85/Q86). Under `Hold` that changes nothing a user sees; it lowers how often M-FR-X gets a frontier.
+- **Reader time.** The census runs on the pane's reader thread, outside the bus lock, once per zero poll that finds the master empty with a request pending, and the pane's output waits while it runs. Measured on the development box on 2026-10-30 (`census_latency`, debug build, 403 processes, 892 tasks, load 2.8), 30 runs each:
 
-- **The daemon's own forks.** The daemon's fork-then-exec children hold the master between the fork and the exec, so a scan that lands there makes the frontier `Missing`.
-- **Fork without exec.** In production the daemon has no such site. `src/wrap.rs`'s lifetime backstop forks only under `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS`, and the reaper it forks closes its inherited descriptors. The editor helper's fork (`src/composer_probe/helper.rs`) runs in the helper process, not in the daemon.
+| Census | p50 | p90 | max |
+| --- | --- | --- | --- |
+| a generation just spawned (one process started since) | 13.0 ms | 16.9 ms | 29.4 ms |
+| every task of every process, read errors ignored: the bound for a long-lived generation | 101.7 ms | 109.8 ms | 129.5 ms |
 
-**What it costs.** Any process of the daemon's user that started after an agent's spawn and can't be read makes that agent's frontiers `Missing` while it lives. On the development box this page was written on, those processes are `sshd-session`, one per SSH login, so an SSH login made after an agent's spawn turns its frontiers off until that login ends. Under `Hold` that changes nothing a user sees, but it lowers how often M-FR-X gets a frontier. Narrowing by process lineage isn't sound: a process reparented to a subreaper loses the ancestry that would clear it, and whether an ancestor is a child subreaper can't be read from `/proc`. The way to remove the cost is to close the inheritance window itself (an atomic close-on-exec open, which needs portable-pty's spawn replaced), after which a scan would cover only fork-without-exec, which production doesn't do.
+  No production generation requests a frontier before activation, since installation's rollout is empty (Q35-13), so no user can see this delay today. At activation, a pause of that size after each editor return is something a user could notice, and rule 19's fragment question reopens then.
 
-**Coverage.** `src/composer_probe/master_holders.rs`'s units read the real `/proc` for a sole holder, an inheritor, a process that started before the master and a zombie, each restricted to its own pids so other processes on the machine can't change the result, and a scripted `/proc` for each branch of the scan (an old process, a kernel thread, one that went away, an exiting one, another user's, an unreadable one of this user's, a failed stat). `inbox/probe/062` covers the reader's `Missing` when a holder is found or unreadable. The 1,000-trial e2e (`tests/e2e_pty_drain_frontier.rs`) passes with the scan in place. Its first runs found the exiting-task case: the fixture's short-lived children made the frontier `Missing` until exiting tasks were skipped.
+- **Throughput with no frontier requested.** The poll loop against the blocking loop it replaced (`src/agent_pty_frontier_throughput.rs`, release build, RWX sandbox, 16 cores, load 4.8, seven runs of each, 2026-10-30). These cover the extra `poll` per read only, not the census, since no frontier is requested:
+
+| Reader | 256 MiB burst, median | MiB/s | one-byte round trip p50 | p99 | max |
+| --- | --- | --- | --- | --- | --- |
+| blocking loop | 1.991 s | 129 | 13.4 µs | 19.6 µs | 301 µs |
+| poll loop | 2.005 s | 128 | 14.6 µs | 21.3 µs | 123 µs |
+
+**Coverage.** The census units read the real `/proc` restricted to their own pids (a holder found, none found, a process started before the master, a zombie, and the reviewers' control: an inheritor whose leader left with the raw `exit` syscall while a sibling thread keeps the master, which the census finds through the sibling's task). A scripted `/proc`, one read at a time, covers each branch: every failed read other than going away is `Unknown`, at the listing, the task list, the stat, a descriptor's link, file and `fdinfo`, a `ptmx` descriptor of this inode with no `tty-index`, the re-read stat and the real uid. Hand mutants over those branches and the per-task reading: 10 of 10 caught. `inbox/probe/062` covers the reader's `Missing` when a census finds a holder or can't complete.
