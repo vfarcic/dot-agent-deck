@@ -844,7 +844,7 @@ fn telemetry_otlp_009_transient_failure_retries_run_once() {
     );
 }
 
-/// Scenario: Show Thinking for a stand-in waiting on an exit gate, publish its final Working hook, and immediately release it to exit naturally. The completed run must say exited and retain the last Working interval and status-change event.
+/// Scenario: Show Thinking for a stand-in waiting on an exit gate, publish its final Working hook, and immediately release it to exit naturally. The completed run must say exited with code zero and retain the last Working interval and status-change event.
 #[spec("telemetry/otlp/010")]
 #[test]
 fn telemetry_otlp_010_natural_exit_retains_last_status() {
@@ -887,6 +887,7 @@ fn telemetry_otlp_010_natural_exit_retains_last_status() {
         "exited",
         "natural exit must not look like StopAgent"
     );
+    assert_eq!(integer_attribute(&run, "deck.run.exit_code"), 0);
     assert!(
         receiver
             .spans()
@@ -905,6 +906,88 @@ fn telemetry_otlp_010_natural_exit_retains_last_status() {
                 && attribute(event, "deck.status.to") == "working"),
         "final Working status change was lost before natural exit: {run}"
     );
+}
+
+// Assumed e2e-only seam for #2028 (not implemented by this test slice):
+// capture DOT_AGENT_DECK_E2E_EXIT_GATE from the generation's spawn environment.
+// In pump_reader's common EOF tail, after signal_agent_exit and immediately
+// before the telemetry call, atomically write this agent id to <dir>/arrived
+// and wait for <dir>/release. Hold no registry/bus locks while waiting, bound
+// the wait, and apply the seam to both the Linux frontier and plain reader.
+// This controls scheduling; it must not supply a verdict or an exit code.
+struct ExitTelemetryGate(std::path::PathBuf);
+
+impl ExitTelemetryGate {
+    fn release(&self) {
+        std::fs::write(self.0.join("release"), "release").unwrap();
+    }
+}
+
+impl Drop for ExitTelemetryGate {
+    fn drop(&mut self) {
+        // Release before TuiDeck tears down its sandbox, including on RED.
+        let _ = std::fs::write(self.0.join("release"), "release");
+    }
+}
+
+/// Scenario: Let stand-ins exit naturally with codes zero and seven, and pause each reader after EOF publication but before telemetry finishes the run. Close the already-exited pane, release the reader, and require the exported run to retain exited and the original code rather than changing to closed.
+#[spec("telemetry/otlp/010")]
+#[test]
+fn telemetry_otlp_010_close_after_eof_retains_exit_reason_and_code() {
+    for code in [0, 7] {
+        let root = common::harness_tempdir().unwrap();
+        let gate_path = root.path().join("exit-telemetry-gate");
+        std::fs::create_dir(&gate_path).unwrap();
+        let receiver = Receiver::start();
+        let deck = TuiDeck::builder()
+            .without_agent_credentials()
+            .with_env("OTEL_EXPORTER_OTLP_ENDPOINT", &receiver.endpoint)
+            .with_env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json")
+            .with_env(
+                "DOT_AGENT_DECK_E2E_EXIT_GATE",
+                gate_path.to_str().unwrap(),
+            )
+            .with_continue_session(
+                "telemetry-eof-close",
+                format!("/bin/sh -c 'printf TELEMETRY_EOF_CLOSE_READY; while [ ! -f telemetry-exit ]; do sleep 0.02; done; exit {code}'"),
+            )
+            .launch_with_fixture("minimal");
+        let gate = ExitTelemetryGate(gate_path);
+        deck.wait_for_string("TELEMETRY_EOF_CLOSE_READY");
+        let agent = agent(&deck);
+        let pane = agent.pane_id_env.as_deref().unwrap();
+        std::fs::write(deck.workdir().join("telemetry-exit"), "exit").unwrap();
+        assert!(
+            common::wait_until(Duration::from_secs(10), || {
+                std::fs::read_to_string(gate.0.join("arrived"))
+                    .is_ok_and(|id| id.trim() == agent.id)
+            }),
+            "#2028 needs the e2e-only EOF hold point: reader for agent {} did not acknowledge DOT_AGENT_DECK_E2E_EXIT_GATE after EOF publication; exported runs: {:?}",
+            agent.id,
+            receiver.spans()
+        );
+        assert!(
+            receiver.spans().iter().all(|span| {
+                span["name"] != "agent.run" || attribute(span, "deck.pane.id") != pane
+            }),
+            "the hold point must precede completion of this run"
+        );
+        // StopAgent succeeding proves the post-EOF entry was removed while
+        // this generation's reader was held, rather than racing another read.
+        close(&deck, &agent);
+        gate.release();
+        let run = receiver.run(pane);
+        assert_eq!(
+            attribute(&run, "deck.run.end_reason"),
+            "exited",
+            "#2028: closing after natural EOF must retain exited and code {code}: {run}"
+        );
+        assert_eq!(
+            integer_attribute(&run, "deck.run.exit_code"),
+            code,
+            "#2028: removing the exited record must retain its measured exit code: {run}"
+        );
+    }
 }
 
 /// Scenario: Open a two-role orchestration with a stand-in worker that records its propagated identity, then delegate to its clear=true role to replace it. Closing the replacement must deliver two distinct completed runs for that pane, and the replacement's recorded identity must match its own exported run.

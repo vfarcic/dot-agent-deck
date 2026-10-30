@@ -132,8 +132,8 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### telemetry/otlp/010 — Natural exit retains the final published status.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
 - **Agent:** synthetic shell waiting on an exit gate, with synthesized hooks.
-- **Asserts:** after visible Thinking, a final Working hook is published immediately before natural exit; the completed run says exited and includes the Working child interval and status-change event.
-- **Does not assert:** a deliberately paused exporter subscriber, real-agent hooks or an exit-code attribute.
+- **Asserts:** after visible Thinking, a final Working hook is published immediately before natural exit; the completed run says exited with code zero and includes the Working child interval and status-change event. A second case holds the reader after EOF publication and before telemetry completion, closes the already-exited pane, then requires exited and the original zero or seven exit code in the exported run (#2028). Deliberate-close control: telemetry/otlp/002 still exports closed.
+- **Does not assert:** a deliberately paused exporter subscriber, real-agent hooks, respawn during the EOF hold, daemon shutdown or forced Linux plain-reader fallback. The delayed case assumes the e2e-only DOT_AGENT_DECK_E2E_EXIT_GATE hold point documented in the test; until implemented, its RED is the absent hold acknowledgement, not a reproduced wrong end reason.
 - **Platform coverage:** mac+linux.
 
 ##### telemetry/otlp/011 — Respawning an orchestration worker mints a new run identity.
