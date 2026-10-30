@@ -495,7 +495,7 @@ mod tests {
         assert_eq!(input.reply_class(QueryKind::Cpr), cpr);
     }
 
-    /// Scenario: On an unprofiled generation, note a CPR query, then a `?2026h` frame, accept a native Ctrl+G, and learn Codex's profile; then note a frame, a CPR and a frame. `B` holds through the pre-adoption frame and across adoption, the native candidate stays latched and the CPR stays solicited, and the first frame after adoption ends `B`; afterwards the frame rule runs as on a generation born Codex. With the count at zero, adoption leaves `B` false; a saturated count becomes one wait that the next frame ends.
+    /// Scenario: On an unprofiled generation, note a CPR query, then a `?2026h` frame, accept a native Ctrl+G, and learn Codex's profile; then note a frame, a CPR and a frame. `B` holds through the pre-adoption frame and across adoption, the native candidate stays latched and the CPR stays solicited, and the first frame after adoption ends `B`; afterwards the frame rule runs as on a generation born Codex. With the count at zero, adoption leaves `B` false; two CPR queries still outstanding are one wait that the next frame ends (a count that actually saturated: `query_ledger.rs`'s `probe_054_a_saturated_count_adopted_is_one_wait_the_next_frame_ends`).
     #[spec("inbox/probe/054")]
     #[test]
     fn probe_054_b_keeps_its_value_when_codex_is_adopted() {
@@ -542,18 +542,18 @@ mod tests {
             }]
         );
 
-        let mut saturated = Backlog::new(CprWaitEnd::Counted);
+        let mut two = Backlog::new(CprWaitEnd::Counted);
         for _ in 0..3 {
-            saturated.cpr_query();
+            two.cpr_query();
         }
-        saturated.cpr_reply();
-        saturated.adopt(CprWaitEnd::SyncBegin);
-        assert!(saturated.holds(), "two outstanding are one wait");
-        saturated.sync_begin();
-        assert!(!saturated.holds());
+        two.cpr_reply();
+        two.adopt(CprWaitEnd::SyncBegin);
+        assert!(two.holds(), "two outstanding are one wait");
+        two.sync_begin();
+        assert!(!two.holds());
     }
 
-    /// Scenario: Move `B` between rules in each direction and to the same rule, with and without a wait outstanding. `B` reads the same before and after every change; leaving the frame rule mid-wait keeps a counted wait that only a CPR reply ends.
+    /// Scenario: From a fresh state, move `B` once between rules in each direction and to the same rule, with and without a wait outstanding. `B` reads the same before and after each single change; leaving the frame rule mid-wait keeps a counted wait that only a CPR reply ends. A round trip isn't covered: production adopts once, from the counted rule (`Backlog::adopt`).
     #[spec("inbox/probe/054")]
     #[test]
     fn probe_054_b_adoption_is_continuous_in_every_direction() {

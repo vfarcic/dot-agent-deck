@@ -241,11 +241,20 @@ impl Backlog {
     }
 
     /// The generation's profile was learned after spawn and declares `end`
-    /// (Q35-18a, R3506-U3-02): `B` keeps its value across the change. A wait
-    /// the counted rule still holds becomes a CPR after the last frame on the
-    /// frame rule, so only a `?2026h` noted after adoption ends it; a frame
-    /// noted before adoption, which the counted rule ignored, doesn't. No
-    /// count is reset and no earlier query is taken as answered.
+    /// (Q35-18a, R3506-U3-02): `B` keeps its value across that one change. A
+    /// wait the counted rule still holds, a saturated count included, becomes
+    /// a CPR after the last frame on the frame rule, so only a `?2026h` noted
+    /// after adoption ends it; a frame noted before adoption, which the
+    /// counted rule ignored, doesn't. No count is reset and no earlier query
+    /// is taken as answered.
+    ///
+    /// **One-shot, as production uses it.** A generation adopts a profile at
+    /// most once ([`super::epoch::GenerationInput::adopt_profile`] refuses a
+    /// second), from the counted rule. Each single change from a fresh state
+    /// keeps `B`, in either direction, but a round trip doesn't: the count a
+    /// wait left behind survives the frame rule, so returning to the counted
+    /// rule after a frame ended the wait holds `B` again on that stale count
+    /// (Q3518A-A-U3-02). Nothing makes that trip today.
     pub fn adopt(&mut self, end: CprWaitEnd) {
         match (self.end, end) {
             (CprWaitEnd::Counted, CprWaitEnd::SyncBegin) => self.after_sync = self.holds(),
@@ -569,6 +578,24 @@ mod tests {
         }
         assert!(b.holds(), "a saturated count never counts down");
         assert_eq!(b.outstanding, u32::MAX);
+    }
+
+    /// Scenario: Saturate the CPR count on the counted rule, then adopt the frame rule, note a reply and a `?2026h`. `B` holds across the adoption, a reply doesn't end it, and the frame after adoption does; the count and its saturation are left as they were (Q3518A-R-U3-01 / A-U3-01).
+    #[spec("inbox/probe/054")]
+    #[test]
+    fn probe_054_a_saturated_count_adopted_is_one_wait_the_next_frame_ends() {
+        let mut b = Backlog::new(CprWaitEnd::Counted);
+        b.outstanding = u32::MAX - 1;
+        b.cpr_query();
+        assert!(b.saturated && b.holds(), "saturated");
+        b.adopt(CprWaitEnd::SyncBegin);
+        assert!(b.holds(), "adoption keeps B");
+        b.cpr_reply();
+        assert!(b.holds(), "a reply doesn't end a frame-ended wait");
+        b.sync_begin();
+        assert!(!b.holds(), "the frame after adoption ends it");
+        assert!(b.saturated, "nothing reset the saturation");
+        assert_eq!(b.outstanding, u32::MAX, "nor the count");
     }
 
     /// Scenario: Bring the FIFO's `native_seq` to its last value and accept two more native candidates. The first is numbered `u64::MAX`, the second isn't, and the FIFO stays non-clear, refusing further numbers, however it is popped.

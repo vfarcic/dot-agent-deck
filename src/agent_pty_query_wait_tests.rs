@@ -147,3 +147,30 @@ fn probe_054_clean_frames_leave_the_estimate() {
     assert_eq!(bus.input().query_wait_estimate(), estimate);
     assert_eq!(bus.input().reply_class(QueryKind::Cpr), (false, false));
 }
+
+/// Scenario: On a Codex-profiled bus with an estimate from one applied resize, fail an ordinary resize, a nudge's shrink and a nudge's restore through the bus's own fallible resize closures. Each failure returns its error and leaves the estimate where the applied resize put it, and the failed restore still leaves the width unknown (Q3518A-R-U3-02 / A-U3-03).
+#[spec("inbox/probe/054")]
+#[test]
+fn probe_054_a_failed_size_change_feeds_nothing() {
+    use crate::evidence_state::{EdgeReason, EvidenceStatus};
+    let bus = AgentBus::profiled(Some(&CODEX_PROFILE), 24, 80);
+    bus.resize_and_clear(24, 100, || Ok::<(), ()>(())).unwrap();
+    let estimate = bus.input().query_wait_estimate();
+    assert!(estimate.is_some());
+    assert_eq!(bus.resize_and_clear(24, 90, || Err("ioctl")), Err("ioctl"));
+    assert_eq!(bus.input().query_wait_estimate(), estimate, "resize");
+    assert_eq!(
+        bus.resize_and_mark_edge(EdgeReason::NudgeShrink, 24, 99, || Err("ioctl")),
+        Err("ioctl")
+    );
+    assert_eq!(bus.input().query_wait_estimate(), estimate, "shrink");
+    assert_eq!(
+        bus.resize_and_mark_edge(EdgeReason::NudgeRestore, 24, 100, || Err("ioctl")),
+        Err("ioctl")
+    );
+    assert_eq!(bus.input().query_wait_estimate(), estimate, "restore");
+    assert!(matches!(
+        bus.evidence().0,
+        EvidenceStatus::GeometryUnknown { .. }
+    ));
+}
