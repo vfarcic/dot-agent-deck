@@ -14,7 +14,7 @@ use super::span::{AttrValue, SpanEventRecord, SpanRecord, hex};
 /// not a request it served or made.
 const SPAN_KIND_INTERNAL: u64 = 1;
 
-const SCOPE_NAME: &str = "dot-agent-deck";
+pub(crate) const SCOPE_NAME: &str = "dot-agent-deck";
 
 const WIRE_VARINT: u8 = 0;
 const WIRE_FIXED64: u8 = 1;
@@ -59,7 +59,7 @@ fn any_value(value: &AttrValue) -> Vec<u8> {
     buf
 }
 
-fn key_value(key: &str, value: &AttrValue) -> Vec<u8> {
+pub(crate) fn key_value(key: &str, value: &AttrValue) -> Vec<u8> {
     let mut buf = Vec::new();
     put_bytes(&mut buf, 1, key.as_bytes());
     put_bytes(&mut buf, 2, &any_value(value));
@@ -127,7 +127,7 @@ fn json_value(value: &AttrValue) -> serde_json::Value {
     }
 }
 
-fn json_kv(key: &str, value: &AttrValue) -> serde_json::Value {
+pub(crate) fn json_kv(key: &str, value: &AttrValue) -> serde_json::Value {
     serde_json::json!({ "key": key, "value": json_value(value) })
 }
 
@@ -268,6 +268,13 @@ pub fn decode_partial_success_json(body: &[u8]) -> Option<PartialSuccess> {
     decode_json_partial_success(body, "rejectedSpans", "rejected_spans")
 }
 
+/// [`decode_partial_success_json`] for an `ExportLogsServiceResponse`, whose
+/// count is `rejectedLogRecords`. Its protobuf form shares the layout
+/// [`decode_partial_success_protobuf`] reads.
+pub fn decode_logs_partial_success_json(body: &[u8]) -> Option<PartialSuccess> {
+    decode_json_partial_success(body, "rejectedLogRecords", "rejected_log_records")
+}
+
 /// [`decode_partial_success_json`] for an `ExportMetricsServiceResponse`,
 /// whose count is `rejectedDataPoints`.
 pub fn decode_metrics_partial_success_json(body: &[u8]) -> Option<PartialSuccess> {
@@ -315,7 +322,7 @@ pub(crate) mod tests {
     // ---- a minimal, schema-aware protobuf reader for the assertions ----
 
     #[derive(Debug)]
-    enum Field<'a> {
+    pub(crate) enum Field<'a> {
         Varint(u64),
         Fixed64(u64),
         Bytes(&'a [u8]),
@@ -335,7 +342,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn fields(buf: &[u8]) -> Vec<(u32, Field<'_>)> {
+    pub(crate) fn fields(buf: &[u8]) -> Vec<(u32, Field<'_>)> {
         let mut out = Vec::new();
         let mut pos = 0;
         while pos < buf.len() {
@@ -362,7 +369,7 @@ pub(crate) mod tests {
         out
     }
 
-    fn sub(buf: &[u8], field: u32) -> Vec<&[u8]> {
+    pub(crate) fn sub(buf: &[u8], field: u32) -> Vec<&[u8]> {
         fields(buf)
             .into_iter()
             .filter_map(|(f, v)| match v {

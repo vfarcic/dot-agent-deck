@@ -710,8 +710,13 @@ fn finish_native_join(
     );
     let requests = receiver.requests();
     if forbid_logs {
+        // Issue #1981 M8: the deck's own warnings arrive as logs too; only
+        // the agent's must stay off.
         assert!(
-            !requests.iter().any(|request| request.path == "/v1/logs"),
+            !requests.iter().any(|request| request.path == "/v1/logs"
+                && request_resources(request)
+                    .iter()
+                    .any(|resource| attribute(resource, "service.name") != "dot-agent-deck")),
             "Codex logs carry tool content and must stay off"
         );
     }

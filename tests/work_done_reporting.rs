@@ -1580,7 +1580,7 @@ async fn poll_until(timeout: Duration, condition: impl Fn() -> bool) -> bool {
 /// laundered completion would overwrite.
 const COMMISSIONED_SENTINEL: &str = "commissioned-report-body-5e2c";
 
-/// Scenario: Delegate to `coder` and let it report, so the deck files that report at `.dot-agent-deck/work-done-coder.md`; delegate again and wait until the task is in its inbox, then let the worker's process EXIT ON ITS OWN — no `StopAgent`, no pane close — and start a different agent in the same pane id. That successor was never delegated to, so when it reports `work-done` the orchestrator must be told the deck has no outstanding delegation on record, must not get a second "has completed their task" pointer, and the first report must still be the one in `work-done-coder.md`.
+/// Scenario: Delegate to `coder` and let it report, so the deck files that report at `.dot-agent-deck/work-done-coder.md`; delegate again and wait until the task is in its inbox, then let the worker's process EXIT ON ITS OWN — no `StopAgent`, no pane close — and start a different agent in the same pane id. That successor was never delegated to, so its `work-done` without a task id must be accepted as an uncorrelated note to the orchestrator's inbox, must not produce a second "has completed their task" pointer, and must leave the first report in `work-done-coder.md`.
 #[spec("orchestration/work-done/014")]
 #[test]
 fn work_done_014_a_successor_in_an_exited_worker_s_pane_does_not_inherit_its_commission() {
@@ -1675,9 +1675,35 @@ fn work_done_014_a_successor_in_an_exited_worker_s_pane_does_not_inherit_its_com
             "the successor must be a different agent"
         );
 
-        harness
-            .work_done(&format!("Did what a person asked me. {FRESH_SENTINEL}"))
-            .await;
+        let (mut request, provenance) = dot_agent_deck::task_completion::worker_report(
+            &harness.registry,
+            WORKER_PANE,
+            &format!("Did what a person asked me. {FRESH_SENTINEL}"),
+            false,
+        );
+        // Match the CLI without --task-id: this successor is sending a note,
+        // even if exit cleanup has not yet settled its predecessor's task.
+        request.mode = dot_agent_deck::event::WorkDoneMode::Uncorrelated;
+        let completion = dot_agent_deck::task_completion::complete_with_state(
+            &harness.state,
+            &harness.registry,
+            request,
+            &provenance,
+        )
+        .await;
+        let dot_agent_deck::task_completion::Completion::Reply(reply) = completion else {
+            panic!("the successor's note must receive a confirmed reply; got {completion:?}");
+        };
+        assert_eq!(
+            reply.disposition,
+            dot_agent_deck::event::WorkDoneDisposition::Uncorrelated,
+            "the successor names no task, so its report must be accepted as a note; reply = {reply:?}"
+        );
+        assert_eq!(
+            reply.destination,
+            Some(dot_agent_deck::report_recovery::Destination::Inbox),
+            "the successor's note must reach the orchestrator's inbox; reply = {reply:?}"
+        );
         let snapshot = harness
             .wait_for_orchestrator(
                 |snapshot| {

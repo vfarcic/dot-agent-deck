@@ -2386,7 +2386,7 @@ impl RateLimitedLog {
     }
 }
 
-fn build_headers(headers: &[(String, String)]) -> reqwest::header::HeaderMap {
+pub(super) fn build_headers(headers: &[(String, String)]) -> reqwest::header::HeaderMap {
     let mut map = reqwest::header::HeaderMap::new();
     let mut invalid = 0usize;
     for (key, value) in headers {
@@ -2724,7 +2724,7 @@ impl Sender {
 
 /// At most `max` bytes of `response`'s body; what could not be read is left
 /// out.
-async fn bounded_body(mut response: reqwest::Response, max: usize) -> Vec<u8> {
+pub(super) async fn bounded_body(mut response: reqwest::Response, max: usize) -> Vec<u8> {
     let mut body = Vec::new();
     while body.len() < max {
         let Ok(Some(chunk)) = response.chunk().await else {
