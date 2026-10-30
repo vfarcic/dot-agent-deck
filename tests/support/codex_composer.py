@@ -34,6 +34,9 @@ CLOCK_MONOTONIC time), .dialog_bytes, .turns (each submitted line) and .hooks
 (what the prompt hook printed).
 
 Optional fixture knobs (unset by default):
+  DOT_AGENT_DECK_TEST_COMPOSER_EXTERNAL_EDIT=1 enables Ctrl+G; copy
+    composer_external_edit.py beside this executable. See the companion
+    composer-external-edit.md for controls and measured fidelity.
   DOT_AGENT_DECK_TEST_COMPOSER_RELEASE overrides argv[3] in the header.
   DOT_AGENT_DECK_TEST_COMPOSER_REPORT=1 writes .spawn.json beside base:
     argv and the inherited VISUAL/EDITOR/CLAUDE_ENV_FILE (null means unset).
@@ -69,6 +72,7 @@ import termios
 import time
 import tty
 
+original_terminal = termios.tcgetattr(0) if os.isatty(0) else None
 tty.setraw(0, termios.TCSANOW)
 
 
@@ -105,6 +109,12 @@ inputs = open(base + '.inputs', 'a', buffering=1)
 dialog_bytes = open(base + '.dialog_bytes', 'ab', buffering=0)
 turns = open(base + '.turns', 'a', buffering=1)
 composer = bytearray()
+external_edit = None
+if os.environ.get("DOT_AGENT_DECK_TEST_COMPOSER_EXTERNAL_EDIT") == "1":
+    import runpy
+    support = runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "composer_external_edit.py"))
+    external_edit = support["ExternalEdit"](base, 'codex', original_terminal)
+
 transcript = []
 MARKER = b'\x1b[?2026h\x1b[1;1H\x1b[J'
 DIALOGS = {
@@ -223,6 +233,9 @@ def redraw():
     for line in rows_shown:
         out += at(row, 0) + b'\x1b[2m\xe2\x80\xba\x1b[0m ' + line
         row += 2
+    if external_edit and external_edit.error:
+        out += at(row, 0) + external_edit.error
+        row += 2
     if flag('.hidden'):
         out += at(row, 0) + b'Working (esc to interrupt)'
         out += b'\x1b[?2026l'
@@ -290,7 +303,16 @@ while True:
         dialog_bytes.write(chunk)
         continue
     submitted = None
-    for value in chunk:
+    for value in external_edit.tokens(chunk) if external_edit else chunk:
+        if value is None:
+            drop_suffix = external_edit.invoke(composer)
+            redraw()
+            if drop_suffix:
+                break
+            continue
+        if isinstance(value, bytes):
+            composer.extend(value)
+            continue
         if value == 13:
             if flag('.keep'):
                 continue

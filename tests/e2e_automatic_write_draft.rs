@@ -245,6 +245,11 @@ fn launch_composer_as(selector: &str, named: Binary) -> (TuiDeck, Pane) {
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
     let binary = deck.home_dir().join("doorbell-composer");
+    std::fs::write(
+        deck.home_dir().join("composer_external_edit.py"),
+        include_str!("support/composer_external_edit.py"),
+    )
+    .unwrap();
     std::fs::write(&binary, include_str!("support/empty_composer.py")).unwrap();
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
     let other = deck.home_dir().join("other-composer");
