@@ -14446,10 +14446,21 @@ impl AppState {
         // card reads Needs Input — also when the question rides a `ToolStart`
         // (Codex's `request_user_input`), which on its own would read Working.
         // A Blocked card keeps its status: it is the stickier truth.
+        // PRD #1666 part 3 (Q35-17): `answer_queued` is the daemon's mark of
+        // an answer a fence holds, which a question read off an event never
+        // carries (`PendingQuestion::sanitized`): a repeat of the pending
+        // question at its revision keeps it.
+        let queued = session
+            .pending_question
+            .as_ref()
+            .filter(|q| q.answer_queued)
+            .map(|q| (q.id.clone(), q.revision));
         if clears_question {
             session.pending_question = None;
         }
-        if let Some(question) = raised_question {
+        if let Some(mut question) = raised_question {
+            question.answer_queued = queued
+                .is_some_and(|(id, revision)| id == question.id && revision == question.revision);
             session.pending_question = Some(question);
             if session.status != SessionStatus::Blocked {
                 if session.status != SessionStatus::WaitingForInput {

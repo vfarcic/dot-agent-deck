@@ -16868,10 +16868,11 @@ mod question_answer_tests {
 
     /// Scenario: The deck is checking a Codex agent's input box, so it holds
     /// what is typed there, when a voice answer arrives: the answer is
-    /// queued, and the question shows it. The agent then moves on, clearing
-    /// the question, which the deck takes in at once rather than after the
-    /// answer. When the deck stops holding, the answer's digit is not typed;
-    /// the answer is refused as stale and its settlement says superseded.
+    /// queued, and the question shows it, also after the agent repeats the
+    /// question. The agent then moves on, clearing the question, which the
+    /// deck takes in at once rather than after the answer. When the deck stops
+    /// holding, the answer's digit is not typed; the answer is refused as
+    /// stale and its settlement says superseded.
     #[spec("question/answer/019")]
     #[tokio::test]
     async fn question_answer_019_a_question_cleared_while_its_answer_is_held_ends_superseded() {
@@ -16887,6 +16888,12 @@ mod question_answer_tests {
             fx.pending_question().await.unwrap().answer_queued,
             "the held answer shows as queued"
         );
+        // The agent repeating its question keeps it, and its queued mark.
+        fx.ask_ingested(&codex_single("call_fenced", "Which colour?"))
+            .await;
+        let repeated = fx.pending_question().await.unwrap();
+        assert_eq!(repeated.revision, revision, "a repeat isn't a new question");
+        assert!(repeated.answer_queued, "a repeat keeps the queued mark");
         tokio::time::timeout(
             Duration::from_secs(2),
             fx.ingest_task(fx.event(EventType::Idle)),

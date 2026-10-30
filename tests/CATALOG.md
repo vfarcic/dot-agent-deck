@@ -12260,7 +12260,7 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 ##### question/answer/019 — A question cleared while its answer is held ends the answer superseded.
 - **Layer:** L1/fast unit (`src/daemon_protocol.rs`, the generation's fence closed and released by the test, PRD #1666 part 3, Q35-17).
 - **Agent:** none (`/bin/cat` stand-in for Codex).
-- **Asserts:** a voice answer that names a client token, sent while a fence holds the agent's input, is held and its question shows `answer_queued`; an Idle event clearing the question is ingested within 2 s, not behind the answer; on release nothing is typed, the answer is refused `stale`, the agent's snapshot carries one settlement naming that token as `superseded`, and no reservation is left.
+- **Asserts:** a voice answer that names a client token, sent while a fence holds the agent's input, is held and its question shows `answer_queued`, and the agent repeating the question keeps its revision and that mark; an Idle event clearing the question is ingested within 2 s, not behind the answer; on release nothing is typed, the answer is refused `stale`, the agent's snapshot carries one settlement naming that token as `superseded`, and no reservation is left.
 - **Does not assert:** a real probe opening the fence (Q35-20); the desktop's words for the settlement (`question/answer/024`).
 - **Platform coverage:** mac+linux.
 
