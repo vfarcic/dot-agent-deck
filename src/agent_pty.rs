@@ -25631,6 +25631,9 @@ mod spawn_tests {
     struct EditorControl {
         on_enter: OnEnter,
         drawing: Drawing,
+        /// Model the agent recovering its parser and empty prompt without
+        /// another user byte (a parser abort or incomplete-escape timer).
+        recover_empty_input: Option<usize>,
         /// Draw a dialog once the composer holds this many characters.
         dialog_at: Option<usize>,
         /// The width the agent draws for.
@@ -25788,6 +25791,7 @@ mod spawn_tests {
             let control = Arc::new(Mutex::new(EditorControl {
                 on_enter,
                 drawing: Drawing::Composer,
+                recover_empty_input: None,
                 dialog_at: None,
                 cols: EDITOR_COLS as usize,
             }));
@@ -25810,6 +25814,24 @@ mod spawn_tests {
                     let mut arrow = 0u8;
                     let mut transcript: Vec<String> = Vec::new();
                     while !stop.load(Ordering::SeqCst) {
+                        let recovered = {
+                            let mut control = control.lock().unwrap();
+                            if control
+                                .recover_empty_input
+                                .is_some_and(|through| seen >= through)
+                            {
+                                control.recover_empty_input.take();
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if recovered {
+                            composer.clear();
+                            cursor = 0;
+                            arrow = 0;
+                            bus.push(claude_screen("", &transcript, false, EDITOR_COLS as usize));
+                        }
                         let bytes = std::fs::read(&typed).unwrap_or_default();
                         if bytes.len() > seen {
                             let (on_enter, mut drawing, dialog_at, cols) = {
@@ -27002,6 +27024,86 @@ mod spawn_tests {
         assert!(typed.starts_with(b"\x1b[C"), "{typed:?}");
         assert!(typed_line(&typed[3..]).is_some(), "{typed:?}");
         registry.shutdown_all();
+    }
+
+    /// Source-derived recovery model, not a real Claude run: the installed
+    /// 2.1.310/2.1.312 tokenizer aborts CSI/SS3 on C0 and its key reader
+    /// flushes incomplete sequences (including OSC/DCS) after 50 ms of
+    /// quiescence. Model the resulting empty prompt explicitly; do not give
+    /// the deck an extra finishing byte that the user never typed.
+    async fn ring_after_agent_input_recovery(case: &str, keys: &[u8]) {
+        use crate::doorbell_txn::Outcome;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, case, OnEnter::Submit);
+        registry.set_pty_write_stall_bound_for_test(Duration::from_millis(300));
+
+        // The same registry/editor can deliver before the unfinished input.
+        let control = editor.ring().await;
+        assert_eq!(control.outcome, RingOutcome::Txn(Outcome::Submitted));
+        let before = editor.typed();
+        assert!(before.ends_with(b"\r"), "control must submit its line");
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, keys)
+            .await
+            .unwrap();
+        let expected = [before.as_slice(), keys].concat();
+        typed_until(&editor, |typed| typed == expected).await;
+
+        // The fixture consumes all the user's bytes before recovering its
+        // parser and redrawing. This is agent output, not a physical input
+        // reset, hook, timer in the deck, or synthetic finishing keystroke.
+        editor.control.lock().unwrap().recover_empty_input = Some(expected.len());
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while editor.control.lock().unwrap().recover_empty_input.is_some() {
+            assert!(Instant::now() < deadline, "model agent never recovered");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        editor.wait_drawn("");
+        editor.wait_clean();
+
+        let mut reports = Vec::new();
+        for _ in 0..3 {
+            let report = editor.ring().await;
+            reports.push(report);
+            if report.outcome == RingOutcome::Txn(Outcome::Submitted) {
+                break;
+            }
+        }
+        let typed = editor.typed();
+        let after = typed.strip_prefix(expected.as_slice()).unwrap();
+        registry.shutdown_all();
+        assert!(
+            typed_line(after).is_some() && after.ends_with(b"\r"),
+            "{case}: recovered empty agent must receive a submitted doorbell without another user byte; attempts={reports:?}; user suffix={keys:?}; automatic bytes={after:?}"
+        );
+    }
+
+    /// Scenario: Deliver a control doorbell, then type ESC [ and Ctrl+U into the model editor. After the agent recovers its parser and redraws an empty prompt, a doorbell must be typed and submitted within three attempt bounds without another user key.
+    #[spec("inbox/probe/076")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn probe_076_csi_ctrl_u_recovery_releases_delivery() {
+        ring_after_agent_input_recovery("csi-ctrl-u", b"\x1b[\x15").await;
+    }
+
+    /// Scenario: Deliver a control doorbell, then type ESC [ and Enter into the model editor. Once the agent recovers and shows its empty prompt, the waiting doorbell must submit within three attempt bounds with no finishing key from the user.
+    #[spec("inbox/probe/076")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn probe_076_csi_enter_recovery_releases_delivery() {
+        ring_after_agent_input_recovery("csi-enter", b"\x1b[\r").await;
+    }
+
+    /// Scenario: Deliver a control doorbell, then type ESC ] and Ctrl+U into the model editor. Model the agent's incomplete-sequence timeout restoring an empty prompt; a new doorbell must submit within three attempt bounds without a string terminator from the user.
+    #[spec("inbox/probe/076")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn probe_076_osc_ctrl_u_recovery_releases_delivery() {
+        ring_after_agent_input_recovery("osc-ctrl-u", b"\x1b]\x15").await;
+    }
+
+    /// Scenario: Deliver a control doorbell, then type ESC ] and Enter into the model editor. After the agent's modeled timeout restores an empty prompt, a new doorbell must submit within three attempt bounds without another byte from the user.
+    #[spec("inbox/probe/076")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn probe_076_osc_enter_recovery_releases_delivery() {
+        ring_after_agent_input_recovery("osc-enter", b"\x1b]\r").await;
     }
 
     /// Wait (bounded) until the model editor has been typed something that
