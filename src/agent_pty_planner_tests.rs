@@ -331,7 +331,7 @@ async fn probe_010_every_held_candidate_cuts_one_release_at_a_time() {
     assert_eq!(rig.in_flight(), 0);
 }
 
-/// Scenario: With a liability out and no check open, offer a frame holding a CSI-u Ctrl+G between two letters, then a plain frame. The first is accepted and held: its prefix through the key reaches the PTY at once, and its rest and the next frame wait behind the fence it closed until a release.
+/// Scenario: With a liability out and no check open, offer a frame holding a CSI-u Ctrl+G between two letters, then a plain frame; after a release, lower the liability and type a BEL. The first frame is accepted and held: its prefix through the key reaches the PTY at once, and its rest and the next frame wait behind the fence it closed until a release; the cut key took no native number, so the BEL is numbered 1.
 #[spec("inbox/probe/010")]
 #[tokio::test(flavor = "multi_thread")]
 async fn probe_010_with_a_liability_out_an_open_frame_is_cut_at_its_candidate() {
@@ -360,6 +360,11 @@ async fn probe_010_with_a_liability_out_an_open_frame_is_cut_at_its_candidate() 
     );
     rig.idle().await;
     assert_eq!(rig.in_flight(), 0);
+    // The cut candidate took no native number: once the liability is
+    // lowered, the next candidate is the first one numbered.
+    rig.input.liability_lower(G, Instant::now()).unwrap();
+    rig.offer(b"\x07").await;
+    assert_eq!(rig.page(), [1]);
 }
 
 /// Scenario: With a liability out, a check open and a PTY that takes two bytes and then fails, hold `ab`, BEL and `cd`, then release twice. The first sub-op writes `ab` and fails, its connection is told once; the rest ends unwritten at its dequeue, and the ticket settles once, as two bytes written in part.
