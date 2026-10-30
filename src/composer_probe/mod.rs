@@ -31,7 +31,10 @@
 //! ([`planner`]), and probe admission: the one predicate every check write
 //! asks ([`admission`]), the probe job's start on the writer thread with the
 //! arm published only inside it, and the retry schedule ([`probe`]), which
-//! nothing calls yet (Q35-20 wires them). The daemon feeds the hook every byte an agent writes,
+//! nothing calls yet (Q35-20 wires them), and the drain frontier's request
+//! queue and wake ([`frontier`]), which a generation's Linux PTY reader takes
+//! frontiers from, with the check that no other process holds its master
+//! ([`master_holders`], Linux). The daemon feeds the hook every byte an agent writes,
 //! moves the epoch at acceptance, and decides installation at
 //! every spawn, which installs nothing outside the `e2e` build's assumption
 //! until activation. For an installed generation it keeps the invocation
@@ -57,6 +60,8 @@ pub mod install;
 #[cfg(target_os = "linux")]
 pub mod instance;
 pub mod keymap;
+#[cfg(target_os = "linux")]
+pub mod master_holders;
 pub mod observe;
 pub mod paste_mode;
 pub mod path_rule;

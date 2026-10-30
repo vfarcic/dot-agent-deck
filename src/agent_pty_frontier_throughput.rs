@@ -36,9 +36,11 @@ enum Reader {
 struct Pty {
     master: Box<dyn portable_pty::MasterPty + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
+    opened: Option<u64>,
 }
 
 fn spawn(argv: &[&str]) -> Pty {
+    let opened = crate::composer_probe::master_holders::boot_ticks();
     let pair = NativePtySystem::default()
         .openpty(PtySize {
             rows: 24,
@@ -54,6 +56,7 @@ fn spawn(argv: &[&str]) -> Pty {
     Pty {
         master: pair.master,
         child,
+        opened,
     }
 }
 
@@ -67,7 +70,7 @@ fn read(pty: &Pty, bus: &AgentBus, reader: Reader) -> usize {
             read_plain(source, bus, counted);
         }
         Reader::Frontier => {
-            Frontier::setup(bus, "7", pty.master.as_raw_fd(), &[])
+            Frontier::setup(bus, "7", pty.master.as_raw_fd(), pty.opened, &[])
                 .expect("frontier setup")
                 .run(source, bus, counted);
         }
@@ -99,7 +102,7 @@ fn round_trips(reader: Reader) -> Vec<Duration> {
     let source = pty.master.try_clone_reader().unwrap();
     let frontier = match reader {
         Reader::Plain => None,
-        Reader::Frontier => Frontier::setup(&bus, "7", pty.master.as_raw_fd(), &[]),
+        Reader::Frontier => Frontier::setup(&bus, "7", pty.master.as_raw_fd(), pty.opened, &[]),
     };
     let thread = std::thread::spawn(move || match frontier {
         None => read_plain(source, &thread_bus, |_| {}),

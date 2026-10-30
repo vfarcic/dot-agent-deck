@@ -24,6 +24,7 @@
 //! | a request for another generation | `Missing` |
 //! | the reader's end | every outstanding request `Missing`, and every later one at once (here, and in `pump_reader` for every platform) |
 //! | the fed count can't advance | `Missing`, sticky (the output hook's count) |
+//! | after `rc == 0`, a process other than the daemon holds the master, or one that could can't be read (E-MF, [`master_holders`]) | `Missing` for the pending set |
 //!
 //! **Publication.** `o` is the output hook's fed count, read under the bus
 //! lock in the same critical section that sets `Taken{o}`, and this thread
@@ -46,6 +47,7 @@ use std::sync::Arc;
 
 use super::{AgentBus, PushCost, ReadEnd};
 use crate::composer_probe::frontier::{EventFd, Request, Retired};
+use crate::composer_probe::master_holders::{self, Holders, MasterId};
 use crate::composer_probe::record::FrontierOutcome;
 
 const POLLIN: i16 = libc::POLLIN;
@@ -65,6 +67,8 @@ pub(super) trait ReaderIo {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>;
     /// Read the wake back to zero; nothing pending counts as drained.
     fn drain_wake(&mut self) -> io::Result<()>;
+    /// Whether a process other than the daemon holds the master (E-MF).
+    fn holders(&mut self) -> Holders;
 }
 
 /// The production [`ReaderIo`]: the reader portable-pty gave, a duplicate of
@@ -73,6 +77,9 @@ struct PtyIo {
     reader: Box<dyn Read + Send>,
     master: OwnedFd,
     wake: Arc<EventFd>,
+    /// The master's identity and the tick before its `openpty`; `None` when
+    /// either couldn't be read, and then no scan can establish S-M.
+    owner: Option<(MasterId, u64)>,
 }
 
 fn poll(fds: &mut [libc::pollfd], timeout: libc::c_int) -> io::Result<libc::c_int> {
@@ -123,12 +130,24 @@ impl ReaderIo for PtyIo {
     fn drain_wake(&mut self) -> io::Result<()> {
         self.wake.drain()
     }
+
+    fn holders(&mut self) -> Holders {
+        match &self.owner {
+            Some((master, since)) => master_holders::holders(master, *since),
+            None => Holders::Unknown {
+                pid: 0,
+                step: "identity",
+                errno: None,
+            },
+        }
+    }
 }
 
 /// A generation's frontier reader, set up before its thread starts.
 pub(super) struct Frontier {
     master: OwnedFd,
     wake: Arc<EventFd>,
+    owner: Option<(MasterId, u64)>,
     generation: u64,
     control: Control,
 }
@@ -137,10 +156,12 @@ impl Frontier {
     /// Attach a wake to `bus`'s frontier queue and duplicate the master to
     /// poll. `None` when any step fails: the reader then reads as before,
     /// and every frontier request is `Missing`, since nothing attached.
+    /// `opened` is the boot tick read before the master's `openpty`.
     pub(super) fn setup(
         bus: &AgentBus,
         agent_id: &str,
         master: Option<RawFd>,
+        opened: Option<u64>,
         env: &[(String, String)],
     ) -> Option<Self> {
         let generation = agent_id.parse::<u64>().ok()?;
@@ -159,10 +180,21 @@ impl Frontier {
         match setup() {
             Ok((master, wake)) => {
                 let wake = Arc::new(wake);
+                let owner = master_holders::master_id(master.as_raw_fd())
+                    .ok()
+                    .zip(opened);
+                if owner.is_none() {
+                    tracing::warn!(
+                        target: "composer_frontier",
+                        agent_id,
+                        "the master's identity or open time is unknown; the generation's frontiers will be missing"
+                    );
+                }
                 bus.input().frontier().attach(generation, wake.clone());
                 Some(Self {
                     master,
                     wake,
+                    owner,
                     generation,
                     control: Control::from_env(env),
                 })
@@ -189,6 +221,7 @@ impl Frontier {
         let Self {
             master,
             wake,
+            owner,
             generation,
             mut control,
         } = self;
@@ -196,6 +229,7 @@ impl Frontier {
             reader,
             master,
             wake,
+            owner,
         };
         run(&mut io, bus, generation, &mut control, pushed)
     }
@@ -464,6 +498,23 @@ fn zero_step(
         return;
     }
     control.after_zero();
+    // E-MF: S-M checked, not assumed. A holder outside the daemon, or one
+    // that could be and can't be read, and P-DRN doesn't apply: missing.
+    let holders = io.holders();
+    if holders != Holders::Sole {
+        tracing::warn!(
+            target: "composer_frontier",
+            generation,
+            holders = ?holders,
+            "another process may hold the master; the frontier is missing"
+        );
+        let refused: Vec<Arc<Request>> = pending
+            .drain(..)
+            .filter(|r| r.settle(FrontierOutcome::Missing))
+            .collect();
+        input.settle_frontier(&refused);
+        return;
+    }
     let (settled, exhausted) = bus.publish_frontier(pending);
     pending.clear();
     if exhausted {

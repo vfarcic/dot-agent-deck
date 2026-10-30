@@ -1016,6 +1016,11 @@ pub struct AgentPty {
     /// PRD #1666 part 3 (Q84): the argv the deck executed as the child, the
     /// launch provenance an editor-probe observer binds `A` from.
     pub argv: Vec<std::ffi::OsString>,
+    /// PRD #1666 part 3 (E-MF): the boot-clock tick read just before
+    /// `openpty`: a process that could have inherited the master started at
+    /// or after it.
+    #[cfg(target_os = "linux")]
+    pub opened: Option<u64>,
 }
 
 /// PRD #92 F8: hardcoded grace window between SIGTERM and the SIGKILL
@@ -1687,6 +1692,10 @@ fn spawn_with_dir(
 
     let pty_system = NativePtySystem::default();
 
+    // PRD #1666 part 3 (E-MF): before the master exists, so every process
+    // that could inherit it started at or after this tick.
+    #[cfg(target_os = "linux")]
+    let opened = crate::composer_probe::master_holders::boot_ticks();
     let pair = pty_system
         .openpty(PtySize {
             rows,
@@ -1996,6 +2005,8 @@ fn spawn_with_dir(
         reader,
         process_group,
         argv,
+        #[cfg(target_os = "linux")]
+        opened,
     })
 }
 
@@ -13949,6 +13960,8 @@ impl AgentPtyRegistry {
             reader,
             process_group,
             argv,
+            #[cfg(target_os = "linux")]
+            opened,
         } = pty;
         // PRD #1666 part 3 (Q84): what the deck executed, for the observer's
         // binding of `A`.
@@ -14027,6 +14040,7 @@ impl AgentPtyRegistry {
             &bus,
             &preallocated_id,
             master.as_raw_fd(),
+            opened,
             &captured_env,
         );
         std::thread::spawn(move || {
@@ -22998,7 +23012,7 @@ mod spawn_tests {
             writer,
             mut reader,
             process_group,
-            argv: _,
+            ..
         } = pty;
         // Detached: on Linux the read ends in `EIO` once the slave is gone, but
         // nothing here depends on when, so it is never joined.

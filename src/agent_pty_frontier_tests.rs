@@ -9,6 +9,7 @@ use std::sync::atomic::AtomicUsize;
 use super::frontier_reader::{Control, ReaderIo, run};
 use super::*;
 use crate::composer_probe::frontier::{EventFd, MAX_OUTSTANDING, Request, Retired, Wake};
+use crate::composer_probe::master_holders::Holders;
 use crate::composer_probe::record::{FrontierOutcome, RecordKey};
 use crate::composer_probe::segments::{Marker, ReturnMarkers, ReturnWatch};
 use spec::spec;
@@ -27,6 +28,8 @@ struct Script {
     zero: VecDeque<io::Result<i16>>,
     reads: VecDeque<io::Result<Vec<u8>>>,
     drains: VecDeque<io::Result<()>>,
+    /// What each holder scan finds, `Sole` once it runs out.
+    holders: VecDeque<Holders>,
     /// Each `wait`'s `wake` argument, in order.
     waited: Vec<bool>,
     zero_polls: usize,
@@ -91,6 +94,9 @@ impl ReaderIo for Script {
     fn drain_wake(&mut self) -> io::Result<()> {
         self.drained += 1;
         self.drains.pop_front().unwrap_or(Ok(()))
+    }
+    fn holders(&mut self) -> Holders {
+        self.holders.pop_front().unwrap_or(Holders::Sole)
     }
 }
 
@@ -318,6 +324,9 @@ impl ReaderIo for Hooked<'_> {
     }
     fn drain_wake(&mut self) -> io::Result<()> {
         self.inner.drain_wake()
+    }
+    fn holders(&mut self) -> Holders {
+        self.inner.holders()
     }
 }
 
@@ -653,4 +662,43 @@ fn probe_062_a_clean_report_learns_the_readers_frontier() {
         bus.input().record(key).unwrap().frontier,
         Frontier::Taken { offset: 10 }
     );
+}
+
+/// Scenario: The zero poll finds the master empty, but the holder scan finds another process holding the master, then, on another request, one it couldn't read. Neither request is taken: each is missing, and the output keeps flowing.
+#[spec("inbox/probe/062")]
+#[test]
+fn probe_062_another_holder_of_the_master_makes_the_frontier_missing() {
+    for found in [
+        Holders::Other(4242),
+        Holders::Unknown {
+            pid: 4243,
+            step: "fd",
+            errno: Some(libc::EACCES),
+        },
+    ] {
+        let bus = bus();
+        let request = ask(&bus);
+        let mut script = Script::default()
+            .wait(IN, IN)
+            .read(b"out")
+            .wait(IN, 0)
+            .read(b"more");
+        script.holders.push_back(found.clone());
+        let published = Arc::new(Mutex::new(0));
+        let mut control = Control {
+            published: Some(Box::new({
+                let published = published.clone();
+                move |_: &[Arc<Request>]| *published.lock().unwrap() += 1
+            })),
+            ..Control::default()
+        };
+        run(&mut script, &bus, GEN, &mut control, |_| {});
+        assert_eq!(request.outcome(), MISSING, "{found:?}");
+        assert_eq!(
+            *published.lock().unwrap(),
+            0,
+            "{found:?}: nothing published"
+        );
+        assert_eq!(bus.snapshot(), b"outmore", "{found:?}");
+    }
 }
