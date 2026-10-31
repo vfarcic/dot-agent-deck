@@ -1,7 +1,7 @@
 //! `inbox/doorbell/036`: Claude Code's notice above the main composer, told
 //! from a suggestion list by its measured shape (`src/doorbell_screen.rs`).
-//! Every near-miss is derived from a real recorded frame, so only the row
-//! under test differs from a screen Claude Code actually drew.
+//! Every near-miss is derived from a real recorded frame, changing the notice
+//! row and, for the preceding-row controls, rows immediately above it.
 use std::path::PathBuf;
 
 use dot_agent_deck::doorbell_screen::{CLAUDE_PROFILE, Grid, GridCell};
@@ -72,7 +72,7 @@ fn right_aligned(grid: &Grid, text: &str) -> usize {
     usize::from(grid.cols) - 2 - text.chars().count()
 }
 
-/// Scenario: Take Claude Code 2.1.310's and 2.1.312's recorded 24×80 and 40×120 main composers under the quota notice, which the profile accepts, and redraw only the row above the upper rule into near-misses: the notice moved off its two-cell right inset, a list entry or wrapped description ending at that same column, a right-aligned row with a list's column gap, a notice part-coloured or emboldened, a notice with list rows above it, a list row under a notice, and a left-indented entry ending at the inset. On the empty composer, whose effort notice starts in the right half, redraw that row as a right-aligned list entry, and the notice with a second colour or a column gap. Every near-miss is refused; the unchanged frames, a blank row and a single run starting one column right of the list indent stay ready.
+/// Scenario: Take both recorded Claude releases' 24×80 and 40×120 composers and redraw the notice row and preceding rows into suggestion-list near-misses, including changed dim and inverse cells; every near-miss is refused. The unchanged notices, a uniformly dim notice, a blank row and a single run starting right of the list indent stay ready. The genuine right-half effort notice stays ready with an occupied row above it at right insets zero, one and two, while a uniformly inverse notice is refused.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_a_notice_is_told_from_a_list_by_its_shape() {
@@ -148,6 +148,22 @@ fn doorbell_036_a_notice_is_told_from_a_list_by_its_shape() {
             g.cells[notice_row as usize][first].bold = !style.bold;
             cases.push(("the notice with a bold character", false, g));
             let mut g = real.clone();
+            g.cells[notice_row as usize][first].dim = !style.dim;
+            cases.push(("the notice with a changed dim character", false, g));
+            let mut g = real.clone();
+            g.cells[notice_row as usize][first].inverse = true;
+            cases.push(("the notice with an inverse character", false, g));
+            let mut g = real.clone();
+            for cell in &mut g.cells[notice_row as usize][first..=last] {
+                cell.dim = true;
+            }
+            cases.push(("the uniformly dim notice", true, g));
+            let mut g = real.clone();
+            for cell in &mut g.cells[notice_row as usize][first..=last] {
+                cell.inverse = true;
+            }
+            cases.push(("the uniformly inverse notice", false, g));
+            let mut g = real.clone();
             draw(&mut g, notice_row, first, &notice, &style);
             g.cells[notice_row as usize][first].bg = vt100::Color::Idx(237);
             cases.push(("the notice with a background", false, g));
@@ -189,6 +205,24 @@ fn doorbell_036_a_notice_is_told_from_a_list_by_its_shape() {
                 .to_string();
             let effort_style = row[effort_first].clone();
             cases.push(("the effort notice", true, empty.clone()));
+            for inset in [0, 1, 2] {
+                let mut g = empty.clone();
+                let start = usize::from(g.cols) - inset - effort.chars().count();
+                assert!(start >= usize::from(g.cols / 2), "{stem}");
+                draw(&mut g, effort_row, start, &effort, &effort_style);
+                g.cells[effort_row as usize - 1] = list_rows[1].clone();
+                cases.push((
+                    match inset {
+                        0 => {
+                            "the right-half effort notice at inset zero with an occupied row above"
+                        }
+                        1 => "the right-half effort notice at inset one with an occupied row above",
+                        _ => "the right-half effort notice at inset two with an occupied row above",
+                    },
+                    true,
+                    g,
+                ));
+            }
             let mut g = empty.clone();
             let short_entry = "/add-dir    Add a directory";
             let at = right_aligned(&g, short_entry);

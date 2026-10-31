@@ -420,7 +420,7 @@ fn doorbell_036_codex_composer_over_real_frames() {
     }
 }
 
-/// Scenario: Replay Claude Code 2.1.310 and 2.1.312 at the empty composer, while holding a line, after submission and after clearing, then open each release's recorded overview, slash menu, file menu, shell mode and exit warning at 24×80, 40×120 and 50×200 in the indexed dark theme, at 50×200 in the indexed light theme, and at 50×200 in truecolor dark/light and dark-ansi/light-ansi/dark-daltonized palettes. The profile accepts the main composer even with warning phrases quoted in the transcript, refuses the other surfaces, and recognises the submitted user line. Replay 2.1.312's compound-key capture too: marker insertion reveals the retained two spaces, and blank Enter after non-ASCII deletion preserves the draft.
+/// Scenario: Replay both Claude releases' composers and menu surfaces at every recorded size and palette; the main composer stays ready with warning phrases quoted in its transcript, while overview, menus, shell mode and exit warning refuse readiness. Compound-key captures reveal retained spaces and preserve the draft after blank Enter. Replay every Claude fixture at every recorded PTY read boundary with production parsing and recorded resizes, pinning each composer-bearing frame's ready and empty-ready decisions in the committed ledger.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_claude_composer_over_real_frames() {
@@ -534,6 +534,91 @@ fn doorbell_036_claude_composer_over_real_frames() {
         "Claude must recognise the main composer and refuse other input surfaces:\n{}",
         wrong_surfaces.join("\n\n")
     );
+    assert_claude_corpus_decisions();
+}
+
+/// Characterisation at recorded read boundaries, not at arbitrary byte splits.
+/// The fixture name, one-based read number, byte offset and current geometry
+/// identify each frame. Include every frame with a production composer,
+/// including populated editors and other surfaces sharing the composer shape.
+fn assert_claude_corpus_decisions() {
+    use std::fmt::Write;
+
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude-inbox/r5wake");
+    let mut stems: Vec<_> = std::fs::read_dir(&base)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "bin"))
+        .map(|path| path.file_stem().unwrap().to_str().unwrap().to_owned())
+        .collect();
+    stems.sort();
+    assert!(!stems.is_empty(), "Claude corpus must not be empty");
+    let mut actual = String::from(
+        "# Production Grid at recorded PTY read boundaries; resizes apply before the next byte.\n\
+         # Frame = fixture/read-number@end-offset:rowsxcols; columns = ready empty-and-ready.\n\
+         # Characterisation of this corpus only; no claim about arbitrary splits or unknown screens.\n",
+    );
+    for stem in &stems {
+        let trace = fixture(&format!("claude-inbox/r5wake/{stem}"));
+        assert_eq!(
+            trace.read_lens.iter().sum::<usize>(),
+            trace.bytes.len(),
+            "{stem}"
+        );
+        let mut parser = dot_agent_deck::vt_grid::parser(trace.rows, trace.cols, 0);
+        let mut edges = trace.edges.iter().peekable();
+        let mut offset = 0;
+        for (read, len) in trace.read_lens.iter().enumerate() {
+            let end = offset + len;
+            while let Some(&&(at, rows, cols)) = edges.peek().filter(|edge| edge.0 < end) {
+                assert!(at >= offset, "{stem}: resize edges must be ordered");
+                parser.process(&trace.bytes[offset..at]);
+                parser
+                    .screen_mut()
+                    .set_size(rows.try_into().unwrap(), cols.try_into().unwrap());
+                offset = at;
+                edges.next();
+            }
+            parser.process(&trace.bytes[offset..end]);
+            offset = end;
+            let grid = Grid::of(parser.screen(), end as u64);
+            if (CLAUDE_PROFILE.composer)(&grid).is_some() {
+                let decision = |ready| if ready { "ready" } else { "refused" };
+                writeln!(
+                    actual,
+                    "{stem}/{}@{end}:{}x{} {} {}",
+                    read + 1,
+                    grid.rows,
+                    grid.cols,
+                    decision((CLAUDE_PROFILE.ready)(&grid)),
+                    decision(CLAUDE_PROFILE.empty_and_ready(&grid))
+                )
+                .unwrap();
+            }
+        }
+    }
+    let expected = include_str!("fixtures/claude-inbox/r5wake/claude-ready.expectations.txt");
+    if actual != expected {
+        // A separate candidate never updates the oracle. Review its frame-level
+        // diff before explicitly replacing the committed expectations.
+        let candidate = base.join("claude-ready.actual.txt");
+        std::fs::write(&candidate, &actual).unwrap();
+        let first = actual
+            .lines()
+            .zip(expected.lines())
+            .position(|(a, e)| a != e)
+            .unwrap_or_else(|| actual.lines().count().min(expected.lines().count()));
+        panic!(
+            "Claude corpus decision changed at ledger line {}: expected {:?}, actual {:?}; expected {} lines, actual {} lines over {} fixtures; review {}",
+            first + 1,
+            expected.lines().nth(first),
+            actual.lines().nth(first),
+            expected.lines().count(),
+            actual.lines().count(),
+            stems.len(),
+            candidate.display()
+        );
+    }
 }
 
 /// Scenario: Take the recorded Claude Code 2.1.310 session at its cleared, empty composer and type three spaces into it, then move the cursor out of the composer instead. Neither is the empty ready composer, to the profile or to the frame admission reads, although both show no text: the blank composer with the cursor where Claude Code keeps it is the control. The spaces are appended to the real capture, as the terminal shows typed spaces; no session typing spaces was recorded.
