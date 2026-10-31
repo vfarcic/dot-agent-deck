@@ -10783,11 +10783,32 @@ impl AgentPtyRegistry {
         // directory the child resolves (its own `PI_CODING_AGENT_DIR`, else
         // its `HOME`; a relative one where the child enters, see
         // [`pi_refresh_cwd`]), likewise before it starts.
+        //
+        // PRD #2050: which OpenCode the command starts is asked first (its
+        // binary resolved on the child's PATH, then `--version`, cached by the
+        // binary's file identity), so the refresh writes the plugin layout
+        // that version loads; a wrapper the deck cannot see into gets the
+        // layout for either. A directly started 2.x gets `--standalone`, so
+        // its server plugins run with this pane's environment rather than in
+        // OpenCode's shared background service.
+        let mut standalone_command: Option<String> = None;
         let inbox_refresh = if opencode_spawn(inbox_agent_type.as_ref(), spawn_command.as_deref()) {
-            Some((
-                InboxIntegration::OpenCode,
-                crate::inbox_hub::off_the_executor(crate::opencode_manage::refresh_for_spawn),
-            ))
+            let path_env = overlay_value(&opts.env, "PATH")
+                .map(std::ffi::OsString::from)
+                .or_else(|| std::env::var_os("PATH"));
+            let command = spawn_command.clone();
+            let (target, refreshed) = crate::inbox_hub::off_the_executor(move || {
+                let target =
+                    crate::opencode_version::spawn_target(command.as_deref(), path_env.as_deref());
+                let refreshed = crate::opencode_manage::refresh_for_spawn(target.major());
+                (target, refreshed)
+            });
+            if target.major() == Some(crate::opencode_version::Major::V2) {
+                standalone_command = spawn_command
+                    .as_deref()
+                    .and_then(crate::opencode_version::with_standalone);
+            }
+            Some((InboxIntegration::OpenCode, refreshed))
         } else if pi_spawn(inbox_agent_type.as_ref(), spawn_command.as_deref()) {
             let env = opts.env.clone();
             let failed = match pi_refresh_cwd(opts.cwd, dir) {
@@ -10799,6 +10820,13 @@ impl AgentPtyRegistry {
             Some((InboxIntegration::Pi, (Vec::new(), failed)))
         } else {
             None
+        };
+        let opts = match standalone_command.as_deref() {
+            Some(command) => SpawnOptions {
+                command: Some(command),
+                ..opts
+            },
+            None => opts,
         };
         let guard = PtyGuard::new(spawn_with_dir(opts, dir)?);
         #[cfg(test)]

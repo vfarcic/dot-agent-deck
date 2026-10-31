@@ -54,6 +54,90 @@ fn stale_plugin_dir(root: &Path) -> PathBuf {
     root.join("plugin").join("dot-agent-deck")
 }
 
+/// PRD #2050: which plugin layout an install writes, chosen by the OpenCode
+/// generation the agent will run.
+///
+/// The server module is the same for every layout — one file whose default
+/// export carries both generations' implementations — so a wrong guess never
+/// loads the wrong server code. What differs is where it goes and which TUI
+/// half goes with it:
+///
+/// - [`Layout::V1`]: the module in every existing config root (today's
+///   fan-out, unchanged) and the 1.x TUI half (`dot-agent-deck-tui.js` listed
+///   in `tui.json`).
+/// - [`Layout::V2`]: the module in the global config root only, since OpenCode
+///   2.x also scans `~/.opencode` for a project under `$HOME` and refuses a
+///   second copy of the same plugin id (`Duplicate plugin ID`); the deck's
+///   copy in the legacy root is removed. The 2.x TUI half is a directory,
+///   `plugins/dot-agent-deck-tui/tui.js`.
+/// - [`Layout::Unknown`]: the version could not be told (a wrapper command,
+///   a failed `--version`, an install with no command to look at): the 1.x
+///   fan-out and BOTH TUI halves, which do not see each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    V1,
+    V2,
+    Unknown,
+}
+
+impl Layout {
+    /// The layout for a detected generation, [`Layout::Unknown`] for none.
+    pub fn for_major(major: Option<crate::opencode_version::Major>) -> Self {
+        match major {
+            Some(crate::opencode_version::Major::V1) => Layout::V1,
+            Some(crate::opencode_version::Major::V2) => Layout::V2,
+            None => Layout::Unknown,
+        }
+    }
+}
+
+/// PRD #2050: the first line of a server module written for a known
+/// OpenCode generation's layout, followed by `1` or `2`. An install that has
+/// no command to tell the version from (startup, `hooks refresh`, `hooks
+/// install`) reads it back from the global root's module ([`remembered_major`])
+/// and keeps that layout, so a restart neither puts back the legacy-root copy
+/// a 2.x spawn removed nor adds the 2.x TUI half a 1.x spawn removed.
+const LAYOUT_MARKER_PREFIX: &str = "// dot-agent-deck OpenCode layout: ";
+
+/// The marker line for `major`.
+fn layout_marker(major: crate::opencode_version::Major) -> String {
+    let n = match major {
+        crate::opencode_version::Major::V1 => 1,
+        crate::opencode_version::Major::V2 => 2,
+    };
+    format!("{LAYOUT_MARKER_PREFIX}{n}")
+}
+
+/// The generation the server module under `root` was last written for, from
+/// its marker line; `None` with no module or no marker.
+fn remembered_major(root: &Path) -> Option<crate::opencode_version::Major> {
+    let js = std::fs::read_to_string(plugin_file(root)).ok()?;
+    match js.lines().next()?.strip_prefix(LAYOUT_MARKER_PREFIX)? {
+        "1" => Some(crate::opencode_version::Major::V1),
+        "2" => Some(crate::opencode_version::Major::V2),
+        _ => None,
+    }
+}
+
+/// The layout an install with no command to look at writes: the one last
+/// written to `roots`' global root, else [`Layout::Unknown`].
+fn remembered_layout(roots: &[PathBuf]) -> Layout {
+    Layout::for_major(roots.first().and_then(|root| remembered_major(root)))
+}
+
+/// PRD #2050: OpenCode 2.x's TUI plugin directory under a config root. A
+/// directory, because 2.x resolves a TUI half only from a directory plugin;
+/// it holds no `server.js`/`index.js`, so 2.x does not load it as a server
+/// plugin, and OpenCode 1.x's one-level file glob does not see it.
+fn tui_v2_dir(root: &Path) -> PathBuf {
+    root.join("plugins").join("dot-agent-deck-tui")
+}
+
+/// The 2.x TUI plugin file, `<root>/plugins/dot-agent-deck-tui/tui.js`.
+fn tui_v2_file(root: &Path) -> PathBuf {
+    tui_v2_dir(root).join("tui.js")
+}
+
 /// PRD #163 M1: route the home lookup through the platform seam instead of
 /// reading `$HOME` directly, so that on Windows — where `$HOME` is normally
 /// unset — the OpenCode plugin roots resolve under `%USERPROFILE%` instead of
@@ -132,14 +216,34 @@ fn existing_plugin_artifacts() -> Vec<PathBuf> {
 /// seam earlier, at `durable_binary_path()`; by the time we are here the path is
 /// decided and the only step left, serializing a `&str` into a `String`, cannot
 /// fail.
+#[cfg(test)]
 fn plugin_template(binary_path: &str) -> String {
+    plugin_template_for(binary_path, None)
+}
+
+/// [`plugin_template`], with the layout marker ([`LAYOUT_MARKER_PREFIX`]) as
+/// its first line when it is written for a known generation's layout.
+fn plugin_template_for(
+    binary_path: &str,
+    marker: Option<crate::opencode_version::Major>,
+) -> String {
+    let module = plugin_module(binary_path);
+    match marker {
+        Some(major) => format!("{}\n{module}", layout_marker(major)),
+        None => module,
+    }
+}
+
+/// The server module's JavaScript ([`plugin_template`]).
+fn plugin_module(binary_path: &str) -> String {
     let binary_path_json =
         serde_json::to_string(binary_path).expect("serializing a &str to a String is infallible");
-    let inbox = inbox_js(SERVER_INBOX_JS);
+    let inbox = inbox_js(&format!("{SERVER_INBOX_JS}{SERVER_INBOX_V2_JS}"));
     let usage = USAGE_FILE_JS;
+    let entry = format!("{SERVER_ENTRY_JS}{SERVER_V2_JS}");
     format!(
         r#"import {{ execFile, execFileSync, spawn }} from "child_process";
-import {{ closeSync, constants as fsConstants, fstatSync, openSync, writeSync }} from "fs";
+import {{ closeSync, constants as fsConstants, fstatSync, openSync, readFileSync, writeSync }} from "fs";
 import {{ isMainThread }} from "worker_threads";
 
 // Duplicate-load guard. The installer fans out to EVERY candidate config root
@@ -316,6 +420,11 @@ const noteResolved = (requestId) => {{
 // (the SDK reports one as `error`, or a response that is not ok, rather than
 // throwing) — which `await-answer --ack` passes to the deck.
 const replyThroughOpenCode = async (client, answer) => {{
+  // PRD #2050: on OpenCode 2.x the reply goes through its own API instead
+  // (`v2Replier`).
+  if (typeof client?.dadReply === "function") {{
+    return client.dadReply(answer);
+  }}
   const refused = (detail) => ({{ delivered: false, detail: String(detail).slice(0, 200) }});
   const http = client?._client;
   if (!http || typeof http.post !== "function") {{
@@ -1212,194 +1321,803 @@ const handleMessagePartUpdated = (event, directory) => {{
 
 {inbox}
 {usage}
-export const DotAgentDeckPlugin = async (ctx) => {{
+{entry}
+"#
+    )
+}
+
+/// The server plugin's entry points, after its shared state and helpers
+/// ([`plugin_template`]): the event handler both OpenCode generations feed
+/// (1.x hands it its own events; 2.x's events are translated into the same
+/// shape first, [`SERVER_V2_JS`]), the tool-call reports, and the 1.x
+/// factory, whose behaviour is unchanged by PRD #2050. The module's default
+/// export, at the end of [`SERVER_V2_JS`], carries both generations.
+const SERVER_ENTRY_JS: &str = r#"// One OpenCode event, in OpenCode 1.x's shape (`{ type, properties }`), as
+// the deck reports it. `client` is what a held question's answer is replied
+// through (awaitAnswer).
+const handleEvent = async (event, directory, client) => {
+  const eventType = event?.type ?? "";
+  if (
+    eventType === "message.created" ||
+    eventType === "message.updated"
+  ) {
+    recordUserMessage(event, directory);
+    return;
+  }
+  if (eventType === "message.part.updated") {
+    handleMessagePartUpdated(event, directory);
+    return;
+  }
+  if (eventType === "message.part.delta") {
+    recordReplyDelta(event?.properties);
+    return;
+  }
+  if (
+    eventType === "permission.asked" ||
+    eventType === "permission.replied" ||
+    eventType === "question.asked" ||
+    eventType === "question.replied" ||
+    eventType === "question.rejected"
+  ) {
+    // Issue #1678: a child session's prompt is its subagent's, filed under
+    // the root with the child's id, like its tool calls. PRD #1631: and,
+    // like the root's, the ask goes through `await-answer` so the deck can
+    // answer it, and the reply names the request it answers. A question
+    // form is the subagent's in the same way as a permission prompt.
+    const props = event?.properties ?? {};
+    const askingId = props.sessionID ?? props.sessionId;
+    if (isChildSession(askingId)) {
+      const payload = subagentPayload(undefined, askingId, directory, {
+        event: eventType,
+        prompt: permissionPrompt(props),
+      });
+      if (eventType === "permission.asked" || eventType === "question.asked") {
+        awaitAnswer(client, { ...payload, properties: props }, () => sendEvent(payload));
+        return;
+      }
+      payload.request_id = props.requestID ?? props.id;
+      noteResolved(payload.request_id);
+      stopHeldAnswer(payload.request_id);
+      sendEvent(payload);
+      return;
+    }
+  }
+  if (eventType === "permission.asked" || eventType === "question.asked") {
+    // PRD #1631: reported through `await-answer`, which also waits for
+    // the deck's answer. A prompt that cannot be held, or whose child
+    // fails before it is done with it, is reported plainly, with no
+    // `properties`, so the card still shows it.
+    const payload = questionPayload(event, directory);
+    ensureSessionRegistered(payload.session_id, payload.cwd);
+    const plain = permissionPayload(event, directory);
+    awaitAnswer(client, payload, () => sendEvent(plain));
+    return;
+  }
+  if (
+    eventType === "permission.replied" ||
+    eventType === "question.replied" ||
+    eventType === "question.rejected"
+  ) {
+    const payload = permissionPayload(event, directory);
+    noteResolved(payload.request_id);
+    stopHeldAnswer(payload.request_id);
+    ensureSessionRegistered(payload.session_id, payload.cwd);
+    sendEvent(payload);
+    return;
+  }
+  if (eventType === "server.instance.disposed") {
+    flushSessions();
+    return;
+  }
+  if (!event?.type?.startsWith("session.")) {
+    return;
+  }
+  if (eventType === "session.created" || eventType === "session.updated") {
+    noteSessionAncestry(event?.properties?.info);
+  }
+  const ownId = event?.properties?.sessionID ?? event?.properties?.info?.id;
+  if (isChildSession(ownId)) {
+    handleChildSessionEvent(event, ownId, directory);
+    return;
+  }
+  const payload = sessionPayload(event, directory);
+  if (event?.type === "session.deleted") {
+    const deletedId = event?.properties?.info?.id ?? event?.properties?.sessionID;
+    if (deletedId) {
+      forgetReplyState(deletedId);
+      sessionParents.delete(sessionKey(deletedId));
+      cancelAncestryLookup(deletedId);
+    }
+    closeSession(payload.session_id, payload.cwd, false, false);
+    return;
+  }
+  ensureSessionRegistered(
+    payload.session_id,
+    payload.cwd,
+    payload.status,
+    event?.type !== "session.created"
+  );
+  const rawSessionId = event?.properties?.sessionID;
+  if (event?.type === "session.error") {
+    recordTurnError(rawSessionId, event?.properties?.error);
+  }
+  sendEvent(isIdleReport(payload) ? { ...payload, ...takeReply(rawSessionId) } : payload);
+};
+
+// A tool call's start or end (`tool.execute.before` / `tool.execute.after`),
+// as the deck reports it. A child session's call is its subagent's.
+const reportTool = (eventName, sessionID, tool, args, callID, directory) => {
+  if (isChildSession(sessionID)) {
+    sendEvent(
+      subagentPayload(undefined, sessionID, directory, {
+        event: eventName,
+        tool_name: tool,
+        tool_input: args,
+        call_id: callID,
+      })
+    );
+    return;
+  }
+  const sessionId = normalizeSessionId(defaultSessionId(sessionID), directory);
+  ensureSessionRegistered(sessionId, directory);
+  sendEvent({
+    session_id: sessionId,
+    event: eventName,
+    tool_name: tool,
+    tool_input: args,
+    call_id: callID,
+    cwd: directory,
+  });
+};
+
+// PRD #2050: an OpenCode 1.x loader that predates the `{ id, server }`
+// default object calls every function export, deduplicated by export value,
+// so it may call this factory twice — once as `DotAgentDeckPlugin`, once as
+// the default object's `server` — with the same context. The second call
+// with a context already seen returns inert hooks. A later instance (OpenCode
+// re-running the plugin after disposing one) gets a new context and loads.
+// 1.18.35 takes `default.server` alone (measured), so this never fires there.
+const DAD_SEEN_CONTEXTS = typeof WeakSet === "function" ? new WeakSet() : undefined;
+
+export const DotAgentDeckPlugin = async (ctx) => {
   // A second copy of this plugin in the same OpenCode process returns inert
   // hooks, so one real action produces one event. See DAD_GUARD above.
-  if (DAD_ALREADY_LOADED) {{
-    return {{ event: async () => {{}} }};
-  }}
+  if (DAD_ALREADY_LOADED) {
+    return { event: async () => {} };
+  }
+  if (ctx && typeof ctx === "object" && DAD_SEEN_CONTEXTS) {
+    if (DAD_SEEN_CONTEXTS.has(ctx)) {
+      return { event: async () => {} };
+    }
+    DAD_SEEN_CONTEXTS.add(ctx);
+  }
 
   const directory = ctx?.directory ?? process.cwd();
   sessionClient = ctx?.client;
   startInbox(ctx?.client);
 
-  return {{
+  return {
     "chat.message": async (input, output) => interceptDoorbell(input, output),
-    event: async (input) => {{
+    event: async (input) => {
       const event = input?.event;
       const eventType = event?.type ?? "";
       observeInbox(event);
-      if (eventType === "message.updated") {{
+      if (eventType === "message.updated") {
         recordUsage(event?.properties?.info);
-      }}
-      if (eventType === "message.part.updated") {{
+      }
+      if (eventType === "message.part.updated") {
         recordUsageStep(event?.properties?.part);
-      }}
-      if (
-        eventType === "message.created" ||
-        eventType === "message.updated"
-      ) {{
-        recordUserMessage(event, directory);
-        return;
-      }}
-      if (eventType === "message.part.updated") {{
-        handleMessagePartUpdated(event, directory);
-        return;
-      }}
-      if (eventType === "message.part.delta") {{
-        recordReplyDelta(event?.properties);
-        return;
-      }}
-      if (
-        eventType === "permission.asked" ||
-        eventType === "permission.replied" ||
-        eventType === "question.asked" ||
-        eventType === "question.replied" ||
-        eventType === "question.rejected"
-      ) {{
-        // Issue #1678: a child session's prompt is its subagent's, filed under
-        // the root with the child's id, like its tool calls. PRD #1631: and,
-        // like the root's, the ask goes through `await-answer` so the deck can
-        // answer it, and the reply names the request it answers. A question
-        // form is the subagent's in the same way as a permission prompt.
-        const props = event?.properties ?? {{}};
-        const askingId = props.sessionID ?? props.sessionId;
-        if (isChildSession(askingId)) {{
-          const payload = subagentPayload(undefined, askingId, directory, {{
-            event: eventType,
-            prompt: permissionPrompt(props),
-          }});
-          if (eventType === "permission.asked" || eventType === "question.asked") {{
-            awaitAnswer(ctx?.client, {{ ...payload, properties: props }}, () => sendEvent(payload));
-            return;
-          }}
-          payload.request_id = props.requestID ?? props.id;
-          noteResolved(payload.request_id);
-          stopHeldAnswer(payload.request_id);
-          sendEvent(payload);
-          return;
-        }}
-      }}
-      if (eventType === "permission.asked" || eventType === "question.asked") {{
-        // PRD #1631: reported through `await-answer`, which also waits for
-        // the deck's answer. A prompt that cannot be held, or whose child
-        // fails before it is done with it, is reported plainly, with no
-        // `properties`, so the card still shows it.
-        const payload = questionPayload(event, directory);
-        ensureSessionRegistered(payload.session_id, payload.cwd);
-        const plain = permissionPayload(event, directory);
-        awaitAnswer(ctx?.client, payload, () => sendEvent(plain));
-        return;
-      }}
-      if (
-        eventType === "permission.replied" ||
-        eventType === "question.replied" ||
-        eventType === "question.rejected"
-      ) {{
-        const payload = permissionPayload(event, directory);
-        noteResolved(payload.request_id);
-        stopHeldAnswer(payload.request_id);
-        ensureSessionRegistered(payload.session_id, payload.cwd);
-        sendEvent(payload);
-        return;
-      }}
-      if (eventType === "server.instance.disposed") {{
-        flushSessions();
-        return;
-      }}
-      if (!event?.type?.startsWith("session.")) {{
-        return;
-      }}
-      if (eventType === "session.created" || eventType === "session.updated") {{
-        noteSessionAncestry(event?.properties?.info);
-      }}
-      const ownId = event?.properties?.sessionID ?? event?.properties?.info?.id;
-      if (isChildSession(ownId)) {{
-        handleChildSessionEvent(event, ownId, directory);
-        return;
-      }}
-      const payload = sessionPayload(event, directory);
-      if (event?.type === "session.deleted") {{
-        const deletedId = event?.properties?.info?.id ?? event?.properties?.sessionID;
-        if (deletedId) {{
-          forgetReplyState(deletedId);
-          sessionParents.delete(sessionKey(deletedId));
-          cancelAncestryLookup(deletedId);
-        }}
-        closeSession(payload.session_id, payload.cwd, false, false);
-        return;
-      }}
-      ensureSessionRegistered(
-        payload.session_id,
-        payload.cwd,
-        payload.status,
-        event?.type !== "session.created"
-      );
-      const rawSessionId = event?.properties?.sessionID;
-      if (event?.type === "session.error") {{
-        recordTurnError(rawSessionId, event?.properties?.error);
-      }}
-      sendEvent(isIdleReport(payload) ? {{ ...payload, ...takeReply(rawSessionId) }} : payload);
-    }},
-    "tool.execute.before": async (input, output) => {{
-      if (isChildSession(input?.sessionID)) {{
-        sendEvent(
-          subagentPayload(undefined, input.sessionID, directory, {{
-            event: "tool.execute.before",
-            tool_name: input?.tool,
-            tool_input: output?.args,
-            call_id: input?.callID,
-          }})
-        );
-        return;
-      }}
-      const sessionId = normalizeSessionId(
-        defaultSessionId(input?.sessionID),
-        directory
-      );
-      ensureSessionRegistered(sessionId, directory);
-      sendEvent({{
-        session_id: sessionId,
-        event: "tool.execute.before",
-        tool_name: input?.tool,
-        tool_input: output?.args,
-        call_id: input?.callID,
-        cwd: directory,
-      }});
-    }},
-    "tool.execute.after": async (input) => {{
-      if (isChildSession(input?.sessionID)) {{
-        sendEvent(
-          subagentPayload(undefined, input.sessionID, directory, {{
-            event: "tool.execute.after",
-            tool_name: input?.tool,
-            tool_input: input?.args,
-            call_id: input?.callID,
-          }})
-        );
-        return;
-      }}
-      const sessionId = normalizeSessionId(
-        defaultSessionId(input?.sessionID),
-        directory
-      );
-      ensureSessionRegistered(sessionId, directory);
-      sendEvent({{
-        session_id: sessionId,
-        event: "tool.execute.after",
-        tool_name: input?.tool,
-        tool_input: input?.args,
-        call_id: input?.callID,
-        cwd: directory,
-      }});
-    }},
-  }};
-}};
+      }
+      await handleEvent(event, directory, ctx?.client);
+    },
+    "tool.execute.before": async (input, output) =>
+      reportTool("tool.execute.before", input?.sessionID, input?.tool, output?.args, input?.callID, directory),
+    "tool.execute.after": async (input) =>
+      reportTool("tool.execute.after", input?.sessionID, input?.tool, input?.args, input?.callID, directory),
+  };
+};
 
-export default DotAgentDeckPlugin;
-"#
-    )
-}
+"#;
+
+/// PRD #2050: the server plugin's OpenCode 2.x implementation, the default
+/// export's `setup`. OpenCode 2.x has no 1.x-style hooks object: it hands
+/// `setup` a context whose `event.subscribe` streams `{ type, data,
+/// location }` events, and whose `tool.hook` / `session.hook` register
+/// callbacks. Each event the deck reports is translated into the 1.x shape
+/// and fed to the same handler 1.x uses ([`SERVER_ENTRY_JS`]), so the deck
+/// receives the same `hook --agent opencode` payloads from either generation
+/// and nothing in the daemon's protocol changes.
+///
+/// It never reports from OpenCode 2.x's shared background service (`serve
+/// --service`), whose environment is not the pane's; the deck starts a 2.x it
+/// can see with `--standalone`, whose private server inherits the pane's.
+const SERVER_V2_JS: &str = r#"// --- OpenCode 2.x (PRD #2050) ---
+//
+// Where this runs, measured on 2.2.5: `opencode --standalone` (and `mini`,
+// `run` with it) starts its own server as a child, `opencode serve --stdio
+// --port 0`, which inherits the client's environment, so DOT_AGENT_DECK_PANE_ID
+// and the deck's other variables are the pane's. Without `--standalone` the
+// client attaches to the shared background service (`opencode serve
+// --service`, read from 2.2.5's service launcher), started once with
+// whichever environment came first and shared by every pane and project:
+// there `process.env` is NOT the pane's, and every report would name the
+// wrong pane or none. So this implementation stays inert in the background
+// service, and reports everywhere else.
+const v2ServerArgs = () => process.argv.slice(2);
+const V2_SERVICE = () => v2ServerArgs().includes("--service");
+// OpenCode 2.x's subcommands (2.2.5 `--help`); any other first word of the
+// client's arguments is the top-level TUI (a flag, or a directory argument).
+const V2_SUBCOMMANDS = new Set(["upgrade", "update", "uninstall", "acp", "api", "debug", "auth",
+  "mcp", "plugin", "models", "stats", "mini", "run", "session", "service", "reload", "pair", "serve"]);
+// The arguments of the client this plugin serves. In a `serve` process they
+// are its parent's (measured on 2.2.5: a standalone server's parent is the
+// `opencode` / `opencode mini` / `opencode run` the user started), read once;
+// in any other process, its own. Undefined when the parent's cannot be read
+// (no /proc and no `ps`).
+let v2ClientArgsMemo;
+const v2ClientArgs = () => {
+  const own = v2ServerArgs();
+  if (own[0] !== "serve") return own;
+  if (v2ClientArgsMemo !== undefined) return v2ClientArgsMemo || undefined;
+  v2ClientArgsMemo = null;
+  const ppid = process.ppid;
+  if (!ppid || ppid <= 1) return undefined;
+  try {
+    const argv = readFileSync(`/proc/${ppid}/cmdline`, "utf8").split("\0").filter(Boolean);
+    if (argv.length) v2ClientArgsMemo = argv.slice(1);
+  } catch (_) {
+    try {
+      const text = execFileSync("ps", ["-o", "args=", "-p", String(ppid)], {
+        timeout: 2000,
+        stdio: ["ignore", "pipe", "ignore"],
+        encoding: "utf8",
+      });
+      const argv = text.trim().split(/\s+/).filter(Boolean);
+      if (argv.length) v2ClientArgsMemo = argv.slice(1);
+    } catch (_) {}
+  }
+  return v2ClientArgsMemo || undefined;
+};
+// "tui" (the full TUI), a subcommand name, or undefined when the client's
+// arguments cannot be read.
+const v2ClientMode = () => {
+  const args = v2ClientArgs();
+  if (!args) return undefined;
+  return typeof args[0] === "string" && V2_SUBCOMMANDS.has(args[0]) ? args[0] : "tui";
+};
+
+// The 2.x shell tool is `shell`; 1.x called it `bash`, and the deck reads a
+// tool named `shell` as Codex's joined argv (telemetry::operation). Its input
+// is `{ command, workdir, timeout, background }` (measured on 2.2.5's tool
+// list), the key `bash` carried in 1.x, so it is reported as `bash`.
+const v2ToolName = (tool) => (tool === "shell" ? "bash" : tool);
+
+// Issue #714 on 2.x: a failed provider response's allow-listed headers, by
+// session, from `session.hook("http.response")` — 2.x's error no longer
+// carries them. Only the headers errorFields forwards are kept, at most
+// MAX_REPLY_SESSIONS sessions' worth.
+const v2FailedHeaders = new Map();
+const v2NoteResponse = (input) => {
+  const response = input?.response;
+  if (!response || response.ok !== false || !idFits(input?.sessionID)) return;
+  const kept = {};
+  let count = 0;
+  try {
+    response.headers?.forEach?.((value, name) => {
+      const key = String(name).toLowerCase();
+      if (count < 32 && typeof value === "string" && (ERROR_HEADER_ALLOW.has(key) || key.startsWith(ERROR_HEADER_PREFIX))) {
+        kept[key] = value.slice(0, 200);
+        count += 1;
+      }
+    });
+  } catch (_) {}
+  rememberBounded(v2FailedHeaders, input.sessionID, kept);
+};
+
+// Permission requests' sessions, by request id: 2.x's reply names both.
+const v2PermissionSessions = new Map();
+
+// What a held question's answer is replied through on 2.x (awaitAnswer's
+// `client`): `permission.reply`, a public API, replaces 1.x's POST through
+// the SDK internal. 2.x's server context has no form reply, so a form is
+// never held (v2FormEvent) and never answered here.
+const v2Replier = (ctx) => ({
+  dadReply: async (answer) => {
+    const refused = (detail) => ({ delivered: false, detail: String(detail).slice(0, 200) });
+    if (answer?.kind !== "permission") return refused("only permission prompts are answered on OpenCode 2");
+    const requestID = answer.request_id;
+    const sessionID = v2PermissionSessions.get(requestID);
+    const decision = answer.body?.reply;
+    if (typeof requestID !== "string" || !sessionID) return refused("the answer names no known request");
+    if (decision !== "once" && decision !== "always" && decision !== "reject") return refused("the answer is not a permission reply");
+    try {
+      await ctx.permission.reply({ sessionID, requestID, decision });
+      return { delivered: true };
+    } catch (error) {
+      return refused(error?.message ?? "the reply could not be sent");
+    }
+  },
+});
+
+// Usage (PRD #1858) on 2.x: each step reports its own counts on
+// `session.step.ended`, and its model on `session.step.started`. A message's
+// cost is the sum of its steps', as 1.x's message cost was.
+const v2StepModels = new Map();
+const v2StepCounts = new Map();
+const v2Costs = new Map();
+const v2RecordStepStarted = (data) => {
+  if (!USAGE_FILE_ON || !idFits(data?.assistantMessageID)) return;
+  rememberBounded(v2StepModels, data.assistantMessageID, data.model?.id, MAX_USAGE_MESSAGES);
+};
+const v2RecordStepEnded = (data, failed) => {
+  if (!USAGE_FILE_ON || !idFits(data?.assistantMessageID)) return;
+  const id = data.assistantMessageID;
+  const n = (v2StepCounts.get(id) ?? 0) + 1;
+  rememberBounded(v2StepCounts, id, n, MAX_USAGE_MESSAGES);
+  const cost = typeof data.cost === "number" && Number.isFinite(data.cost) ? data.cost : 0;
+  const total = (v2Costs.get(id) ?? 0) + cost;
+  rememberBounded(v2Costs, id, total, MAX_USAGE_MESSAGES);
+  if (!failed) recordUsageStep({ type: "step-finish", messageID: id, id: `${id}:${n}`, tokens: data.tokens });
+  recordUsage({
+    role: "assistant",
+    id,
+    modelID: v2StepModels.get(id),
+    sessionID: data.sessionID,
+    tokens: failed ? undefined : data.tokens,
+    cost: total,
+    finish: failed ? undefined : data.finish,
+    error: failed ? { name: data.error?.type, data: { statusCode: data.error?.status } } : undefined,
+    time: failed ? {} : { completed: 1 },
+  });
+};
+
+// Sessions reported working since they were last reported idle. Measured on
+// 2.2.5 (`opencode run`): the event stream carries no `session.created`,
+// `session.status` or `session.idle` at all; a turn is `session.execution.started`
+// and ends `succeeded`, `failed` or `interrupted`. So a turn's start is
+// reported as 1.x's `busy` status and its end as 1.x's `idle` status (after
+// the error report for a failed or interrupted turn, as 1.x's `session.error`
+// was followed by idle), once per turn: a session not in this set is not
+// ended again, so a real idle event and an execution end cannot both end it.
+const v2Busy = new Set();
+
+// Measured on 2.2.5: no `session.created` reaches the plugin, so whether a
+// session is a subagent's child is asked of OpenCode (`session.get`, at most
+// V2_ANCESTRY_MS) the first time it reports, before its report is made.
+const V2_ANCESTRY_MS = 1000;
+const v2Ancestry = async (ctx, sessionID) => {
+  const key = sessionKey(sessionID);
+  if (key === undefined || sessionParents.has(key) || typeof ctx?.session?.get !== "function") return;
+  let timer;
+  try {
+    const info = await Promise.race([
+      Promise.resolve(ctx.session.get({ sessionID })),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(undefined), V2_ANCESTRY_MS);
+        timer?.unref?.();
+      }),
+    ]);
+    const answer = info?.data ?? info;
+    if (answer?.id === sessionID && !sessionParents.has(key)) {
+      noteSessionAncestry({ id: sessionID, parentID: answer.parentID });
+    }
+  } catch (_) {
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+// A 2.x event's directory: where it happened, else where the server runs.
+const v2Directory = (event, ctx) =>
+  event?.location?.directory ?? event?.data?.location?.directory ?? ctx?.location?.directory ?? process.cwd();
+
+// A 2.x event as the 1.x-shaped events handleEvent reports, in order (none
+// for an event the deck takes no report from).
+const v2Translate = (event, directory) => {
+  const data = event?.data ?? {};
+  const sessionID = data.sessionID;
+  const idle = () =>
+    v2Busy.has(sessionID) ? [{ type: "session.status", properties: { sessionID, status: { type: "idle" } } }] : [];
+  switch (event?.type) {
+    case "session.execution.succeeded":
+      return idle();
+    case "session.execution.failed":
+    case "session.execution.interrupted":
+      return [v2TranslateOne(event, directory), ...idle()];
+    default: {
+      const one = v2TranslateOne(event, directory);
+      return one ? [one] : [];
+    }
+  }
+};
+
+// One 2.x event in 1.x's shape; undefined for one with no 1.x counterpart.
+const v2TranslateOne = (event, directory) => {
+  const data = event?.data ?? {};
+  const sessionID = data.sessionID;
+  switch (event?.type) {
+    case "session.created":
+      return { type: "session.created", properties: { info: { id: sessionID, parentID: data.parentID, directory } } };
+    case "session.status":
+      return { type: "session.status", properties: { sessionID, status: data.status } };
+    case "session.idle":
+      return { type: "session.idle", properties: { sessionID } };
+    case "session.deleted":
+      return { type: "session.deleted", properties: { sessionID, info: { id: sessionID } } };
+    case "session.execution.started":
+      return v2Busy.has(sessionID)
+        ? undefined
+        : { type: "session.status", properties: { sessionID, status: { type: "busy" } } };
+    case "session.execution.failed": {
+      // Issue #714: the same error fields 1.x's `session.error` carried, so
+      // the deck classifies a quota or credit refusal the same way. 2.x
+      // names the error `type` where 1.x had `name`.
+      const error = data.error ?? {};
+      const headers = v2FailedHeaders.get(sessionID);
+      v2FailedHeaders.delete(sessionID);
+      return {
+        type: "session.error",
+        properties: {
+          sessionID,
+          error: {
+            name: error.type,
+            data: { message: error.message, responseBody: error.response?.body, responseHeaders: headers },
+          },
+        },
+      };
+    }
+    case "session.execution.interrupted":
+      // An interrupted turn is 1.x's aborted message: the turn ending, which
+      // the deck reads as Idle, not Error.
+      return { type: "session.error", properties: { sessionID, error: { name: "MessageAbortedError" } } };
+    case "permission.asked":
+      if (typeof data.id === "string" && idFits(sessionID)) {
+        rememberBounded(v2PermissionSessions, data.id, sessionID);
+      }
+      // 2.x renamed the properties the deck reads (`permission` → `action`,
+      // `patterns` → `resources`, `always` → `save`, `tool.callID` →
+      // `source.id`); they are given back their 1.x names, so the deck's
+      // question builder reads either generation's prompt.
+      return {
+        type: "permission.asked",
+        properties: {
+          id: data.id,
+          sessionID,
+          permission: data.action,
+          patterns: Array.isArray(data.resources) ? data.resources : [],
+          always: Array.isArray(data.save) ? data.save : [],
+          metadata: data.metadata,
+          message: data.message,
+          ...(data.source?.id ? { tool: { callID: data.source.id, messageID: data.source.messageID } } : {}),
+        },
+      };
+    case "permission.replied":
+      v2PermissionSessions.delete(data.requestID);
+      return { type: "permission.replied", properties: { sessionID, requestID: data.requestID, reply: data.reply } };
+    default:
+      return undefined;
+  }
+};
+
+// A question form (`form.*`). 2.x's server context has no form reply, so a
+// form is reported plainly — the card shows it — and answered in OpenCode;
+// its reply or cancellation clears it.
+const v2FormEvent = (event, directory) => {
+  const data = event?.data ?? {};
+  const form = event.type === "form.created" ? data.form ?? {} : data;
+  const sessionID = form.sessionID;
+  const requestID = form.id;
+  const name = event.type === "form.created" ? "question.asked" : event.type === "form.replied" ? "question.replied" : "question.rejected";
+  const props = { sessionID, id: requestID, title: form.title };
+  if (isChildSession(sessionID)) {
+    const payload = subagentPayload(undefined, sessionID, directory, { event: name, prompt: permissionPrompt(props) });
+    if (name !== "question.asked") payload.request_id = requestID;
+    sendEvent(payload);
+    return;
+  }
+  const payload = permissionPayload({ type: name, properties: props }, directory);
+  ensureSessionRegistered(payload.session_id, payload.cwd);
+  sendEvent(payload);
+};
+
+// Assistant text (PRD #1497's reply) on 2.x: each text block's final text
+// arrives on `session.text.ended`, numbered within its message by `ordinal`.
+const v2RecordText = (data) => {
+  if (!idFits(data?.assistantMessageID) || !idFits(data?.sessionID)) return;
+  recordAssistantMessage({ id: data.assistantMessageID, sessionID: data.sessionID });
+  recordReplyPart({
+    type: "text",
+    id: `${data.assistantMessageID}:${data.ordinal}`,
+    messageID: data.assistantMessageID,
+    sessionID: data.sessionID,
+    text: data.text,
+  });
+};
+
+// One 2.x event: its usage, inbox and reply bookkeeping, then the deck's
+// report through the 1.x handler.
+const v2HandleEvent = async (event, ctx, replier) => {
+  const type = event?.type ?? "";
+  const data = event?.data ?? {};
+  const directory = v2Directory(event, ctx);
+  observeInboxV2(event);
+  if (data.sessionID && type !== "session.created" && type !== "session.deleted") {
+    await v2Ancestry(ctx, data.sessionID);
+  }
+  if (type === "session.status") {
+    if (data.status?.type === "idle") v2Busy.delete(data.sessionID);
+    else if (data.sessionID) rememberBounded(v2Busy, data.sessionID);
+  } else if (type === "session.idle" || type === "session.deleted") {
+    v2Busy.delete(data.sessionID);
+  } else if (type === "session.step.started") {
+    v2RecordStepStarted(data);
+  } else if (type === "session.step.ended") {
+    v2RecordStepEnded(data, false);
+  } else if (type === "session.step.failed") {
+    v2RecordStepEnded(data, true);
+  } else if (type === "session.text.ended") {
+    v2RecordText(data);
+    return;
+  } else if (type === "form.created" || type === "form.replied" || type === "form.cancelled") {
+    v2FormEvent(event, directory);
+    return;
+  } else if (type === "location.shutdown") {
+    flushSessions();
+    return;
+  }
+  for (const translated of v2Translate(event, directory)) {
+    const status = translated.type === "session.status" ? translated.properties.status?.type : undefined;
+    if (status === "busy") rememberBounded(v2Busy, translated.properties.sessionID);
+    else if (status === "idle") v2Busy.delete(translated.properties.sessionID);
+    await handleEvent(translated, directory, replier);
+  }
+};
+
+// The default export's `setup`: OpenCode 2.x's plugin entry point. Returns
+// the cleanup 2.x runs when it unloads the plugin (measured on 2.2.5: on
+// server shutdown).
+const setupV2 = async (ctx) => {
+  if (V2_SERVICE()) {
+    return () => {};
+  }
+  // 2.x may load the plugin again in this module after unloading it (its
+  // cleanup ran handleShutdown): the new instance reports again.
+  shuttingDown = false;
+  const directory = ctx?.location?.directory ?? process.cwd();
+  const replier = v2Replier(ctx);
+  // The ancestry lookup's client (lookUpAncestry), in 1.x's call shape.
+  sessionClient = {
+    session: {
+      get: ({ path }) => ctx.session.get({ sessionID: path?.id }),
+    },
+  };
+  const registrations = [];
+  const register = async (domain, name, callback) => {
+    try {
+      const registration = await domain?.hook?.(name, callback);
+      if (registration) registrations.push(registration);
+    } catch (_) {}
+  };
+  await register(ctx.session, "prompt", async (input) => {
+    try {
+      await interceptDoorbellV2(input);
+      const sessionID = input?.sessionID;
+      if (!sessionID) return;
+      await v2Ancestry(ctx, sessionID);
+      if (isChildSession(sessionID)) return;
+      emitUserPrompt(normalizeSessionId(sessionID, directory), input?.prompt?.text, directory);
+    } catch (_) {}
+  });
+  await register(ctx.session, "http.response", (input) => v2NoteResponse(input));
+  await register(ctx.tool, "execute.before", async (input) => {
+    await v2Ancestry(ctx, input?.sessionID);
+    reportTool("tool.execute.before", input?.sessionID, v2ToolName(input?.tool), input?.input, input?.id, directory);
+  });
+  // A failed call ends like a completed one (`status: "error"`), so the
+  // card's tool ends either way, as it did on 1.x.
+  await register(ctx.tool, "execute.after", async (input) => {
+    await v2Ancestry(ctx, input?.sessionID);
+    reportTool("tool.execute.after", input?.sessionID, v2ToolName(input?.tool), input?.input, input?.id, directory);
+  });
+  startInboxV2(ctx);
+  const subscription = typeof AbortController === "function" ? new AbortController() : undefined;
+  let stopped = false;
+  (async () => {
+    try {
+      const stream = ctx.event.subscribe(subscription ? { signal: subscription.signal } : undefined);
+      for await (const event of stream) {
+        if (stopped) break;
+        try {
+          await v2HandleEvent(event, ctx, replier);
+        } catch (_) {}
+      }
+    } catch (_) {}
+  })();
+  return async () => {
+    stopped = true;
+    try {
+      subscription?.abort();
+    } catch (_) {}
+    stopInboxV2();
+    for (const registration of registrations.splice(0)) {
+      try {
+        await registration.dispose();
+      } catch (_) {}
+    }
+    handleShutdown();
+  };
+};
+
+// Both generations from one module (PRD #2050): OpenCode 1.x (1.18.29+)
+// takes `{ id, server }` and calls `server`; OpenCode 2.x takes `{ id, setup }`
+// and calls `setup`. Each ignores the other's key (measured: 1.18.35 called
+// `server` once and never `setup`; 2.2.5 called `setup` and never `server`).
+export default { id: "dot-agent-deck", server: DotAgentDeckPlugin, setup: setupV2 };
+"#;
+
+/// PRD #2050: the server plugin's inbox roles on OpenCode 2.x, after the 1.x
+/// ones ([`SERVER_INBOX_JS`]) and sharing their state.
+///
+/// - Under the full TUI (whose own TUI plugin is handed the deck's messages,
+///   [`TUI_V2_JS`]) it announces, keeps a doorbell-only receiver, and catches
+///   a submitted doorbell line before the model sees it.
+/// - Under `opencode mini`, which loads no TUI plugin (measured on 2.2.5), it
+///   arms its own stream and starts each message in mini's session with
+///   `session.prompt`.
+/// - Under `run`, `session` or another subcommand it does nothing: that is
+///   not the pane's interactive OpenCode.
+///
+/// Which client it serves is read from its parent's argv (`v2ClientMode`).
+const SERVER_INBOX_V2_JS: &str = r#"// --- OpenCode 2.x inbox (PRD #2050) ---
+let v2InboxStarted = false;
+const v2InboxInteractive = () => {
+  const mode = v2ClientMode();
+  return mode === undefined || mode === "tui" || mode === "mini";
+};
+const v2InboxMini = () => v2ClientMode() === "mini";
+// A 2.x client call in the shape inboxHandOver reads: what it returned, or,
+// when it threw an error naming an HTTP status, `{ error, response: { status } }`
+// so a refusal before acceptance (4xx) is told apart from a lost call.
+const v2Call = (call) => async () => {
+  try {
+    return await call();
+  } catch (error) {
+    const status = error?.status ?? error?.response?.status ?? error?.cause?.status;
+    if (typeof status === "number") return { error, response: { status } };
+    throw error;
+  }
+};
+// Record which deck message ids an OpenCode inbox item carries.
+const v2NotePending = (inboxID, text) => {
+  const receiver = serverReceiver();
+  if (!receiver || !inboxID) return;
+  const ids = inboxIdsIn(text).filter((id) => receiver.of(id).length > 0);
+  if (ids.length) {
+    inboxRemember(miniPending, inboxID, [...new Set([...(miniPending.get(inboxID) ?? []), ...ids])]);
+  }
+};
+const v2MiniDeliver = async (ctx, message, generation) => {
+  const ref = inboxRef(message);
+  const receiver = serverReceiver();
+  if (!receiver || generation !== inboxGeneration()) return;
+  try {
+    while (!miniTarget) {
+      if (generation !== inboxGeneration()) return;
+      await inboxSleep(200);
+    }
+    const sessionID = miniTarget;
+    const text = inboxText(message);
+    await inboxHandOver(
+      receiver,
+      ref,
+      sessionID,
+      v2Call(async () => {
+        const item = await ctx.session.prompt({ sessionID, text });
+        if (item?.id) v2NotePending(item.id, text);
+        return item;
+      }),
+      () => generation === inboxGeneration() && miniTarget === sessionID,
+    );
+  } catch (_) {
+    if (generation === inboxGeneration()) receiver.notHanded(ref);
+  }
+};
+const startInboxV2 = (ctx) => {
+  try {
+    if (!inboxInPane() || !v2InboxInteractive()) return;
+    v2InboxStarted = true;
+    const generation = inboxGeneration() + 1;
+    globalThis[INBOX_GENERATION] = generation;
+    serverReceiver()?.stop();
+    globalThis[INBOX_RECEIVER] = undefined;
+    const mini = v2InboxMini() && typeof ctx?.session?.prompt === "function";
+    if (!mini && !globalThis[INBOX_ANNOUNCED]) {
+      globalThis[INBOX_ANNOUNCED] = true;
+      try {
+        execFileSync(hookBinary(), ["inbox", "announce", "--agent", "opencode"], {
+          timeout: 5000,
+          stdio: ["ignore", "ignore", "ignore"],
+        });
+      } catch (_) {}
+    }
+    const receiver = inboxReceiver({
+      agent: "opencode-mini",
+      doorbellOnly: !mini,
+      active: () => generation === inboxGeneration(),
+      deliver: mini
+        ? (message) => {
+            miniQueue = miniQueue.then(() => v2MiniDeliver(ctx, message, generation));
+          }
+        : undefined,
+    });
+    globalThis[INBOX_RECEIVER] = receiver;
+    receiver.start();
+  } catch (_) {}
+};
+const stopInboxV2 = () => {
+  if (!v2InboxStarted) return;
+  try {
+    globalThis[INBOX_GENERATION] = inboxGeneration() + 1;
+    serverReceiver()?.stop();
+    globalThis[INBOX_RECEIVER] = undefined;
+  } catch (_) {}
+};
+const observeInboxV2 = (event) => {
+  try {
+    const receiver = serverReceiver();
+    const type = event?.type;
+    const data = event?.data ?? {};
+    if (type === "session.created") {
+      if (data.sessionID && !data.parentID) miniTarget = data.sessionID;
+      return;
+    }
+    if (!receiver) return;
+    if (type === "session.inbox.enqueued") {
+      if (data.item?.type === "user") v2NotePending(data.inboxID, data.item.payload?.text);
+    } else if (type === "session.inbox.delivered") {
+      // OpenCode took the item into a turn: every attempt it carries is
+      // committed.
+      const refs = intercepted.get(data.inboxID) ?? [];
+      intercepted.delete(data.inboxID);
+      if (refs.length) receiver.committed(refs);
+      const mini = [];
+      for (const id of miniPending.get(data.inboxID) ?? []) mini.push(...receiver.of(id));
+      miniPending.delete(data.inboxID);
+      if (mini.length) {
+        if (data.sessionID) miniTurns.add(data.sessionID);
+        receiver.committed(mini);
+        receiver.send({ repaint: true });
+      }
+    } else if (type === "session.inbox.cancelled") {
+      // A withdrawn prompt: its attempts are lost, not released — the deck
+      // may repeat them, marked as possible repeats.
+      for (const id of miniPending.get(data.inboxID) ?? []) {
+        for (const ref of receiver.of(id)) receiver.lost(ref);
+      }
+      for (const ref of intercepted.get(data.inboxID) ?? []) receiver.lost(ref);
+      miniPending.delete(data.inboxID);
+      intercepted.delete(data.inboxID);
+    } else if (type === "session.idle" || (type === "session.status" && data.status?.type === "idle")) {
+      if (!data.sessionID) return;
+      for (const ref of receiver.inSession(data.sessionID)) receiver.lost(ref);
+      if (miniTurns.delete(data.sessionID)) receiver.send({ repaint: true });
+    }
+  } catch (_) {}
+};
+// The doorbell on 2.x: `session.hook("prompt")` hands over the prompt before
+// it is queued, and its text is replaced in place, as 1.x's `chat.message`
+// parts were. Only under the pane's interactive OpenCode.
+const interceptDoorbellV2 = async (input) => {
+  if (!inboxInPane() || !v2InboxInteractive() || typeof input?.prompt?.text !== "string") return;
+  const parts = [{ type: "text", text: input.prompt.text }];
+  await interceptDoorbell(
+    { sessionID: input.sessionID, messageID: input.messageID },
+    { parts },
+    true,
+  );
+  input.prompt.text = parts[0].text;
+};
+"#;
 
 /// PRD #1858: the plugin's half of the deck's usage file. Each update of an
 /// assistant message, and each step of one that finishes, appends one line of
@@ -1997,9 +2715,11 @@ const observeInbox = (event) => {
 // the full TUI, whose server plugin runs in a worker thread, or `--mini` — never
 // in `run`, `serve` or another subcommand an agent starts inside its pane.
 const inboxInteractive = () => !isMainThread || isMini();
-const interceptDoorbell = async (input, output) => {
+// `v2`: called by OpenCode 2.x's prompt hook (interceptDoorbellV2), which has
+// already checked that this is the pane's interactive OpenCode.
+const interceptDoorbell = async (input, output, v2 = false) => {
   try {
-    if (!inboxInPane() || !inboxInteractive() || !Array.isArray(output?.parts)) return;
+    if (!inboxInPane() || !(v2 || inboxInteractive()) || !Array.isArray(output?.parts)) return;
     const receiver = serverReceiver();
     for (const part of output.parts) {
       if (part?.type !== "text" || typeof part.text !== "string") continue;
@@ -2074,6 +2794,208 @@ fn tui_plugin_template(binary_path: &str) -> String {
         inbox_js(TUI_INBOX_JS)
     )
 }
+
+/// PRD #2050: OpenCode 2.x's TUI plugin, `<root>/plugins/dot-agent-deck-tui/tui.js`
+/// ([`tui_v2_file`]), with `BINARY_PATH` pinned like the others.
+///
+/// OpenCode 2.x loads `tui.js` from a directory under a config root's
+/// `plugins/` in the process that draws the full TUI (measured on 2.2.5: the
+/// client process, with the pane's environment; `opencode mini` loads none).
+/// The directory has no `server.js` or `index.js`, so 2.x's server-plugin
+/// scan skips it, and OpenCode 1.x's one-level file glob never sees it.
+fn tui_v2_template(binary_path: &str) -> String {
+    let binary_path_json =
+        serde_json::to_string(binary_path).expect("serializing a &str to a String is infallible");
+    format!(
+        "// dot-agent-deck's OpenCode 2 TUI plugin, generated by `dot-agent-deck hooks install`.\n\
+         // Regenerated on every install; edits are overwritten.\n\
+         import {{ execFile, spawn }} from \"child_process\";\n\n\
+         const BINARY_PATH = {binary_path_json};\n\n{}{}",
+        TUI_HOOK_BINARY_JS,
+        inbox_js(TUI_V2_JS)
+    )
+}
+
+/// PRD #2050: the 1.x TUI plugin's behaviour on OpenCode 2.x's TUI API: arm
+/// the deck's stream and start each message in the session on screen — in
+/// place in a root session, in the root of a subagent's session (shown
+/// first), and in a new session, shown, from the home screen — waiting while
+/// a dialog is open and re-reading the screen after every wait.
+///
+/// What moved: the route is `ui.router.current()` (`{ type, sessionID }`),
+/// sessions are `data.session.get`, a prompt is `client.session.prompt({
+/// sessionID, text })`, which keeps the session's own model and agent, and a
+/// prompt's progress is reported on `session.inbox.*` events naming the
+/// inbox item that call returned. OpenCode 2.x exposes no "dialog open" flag:
+/// one is taken to be open while the keymap's mode is neither the base mode
+/// nor the composer (measured: `base` with no dialog on 2.2.5; the modes a
+/// dialog pushes are unmeasured).
+const TUI_V2_JS: &str = r#"const TUI_GUARD = "__dotAgentDeckTuiLoaded";
+
+const setup = async (api) => {
+  try {
+    if (globalThis[TUI_GUARD]?.active || !inboxInPane()) return;
+    const instance = { active: true };
+    globalThis[TUI_GUARD] = instance;
+    let queue = Promise.resolve();
+    // Which OpenCode inbox item carries which deck message ids.
+    const pending = new Map();
+    const unsubscribe = [];
+
+    const sessionOf = (id) => {
+      try {
+        return api.data?.session?.get?.(id);
+      } catch (_) {
+        return undefined;
+      }
+    };
+    const dialogOpen = () => {
+      try {
+        const mode = api.keymap?.mode?.current?.();
+        return typeof mode === "string" && mode !== "base" && mode !== "composer";
+      } catch (_) {
+        return false;
+      }
+    };
+    const untilNoDialog = async () => {
+      while (instance.active && dialogOpen()) await inboxSleep(100);
+    };
+    const rootOf = (id) => {
+      let current = id;
+      for (let n = 0; n < 64; n++) {
+        const parent = sessionOf(current)?.parentID;
+        if (!parent) return current;
+        current = parent;
+      }
+      return current;
+    };
+    const shownSession = () => {
+      try {
+        const route = api.ui?.router?.current?.();
+        return route?.type === "session" ? route.sessionID : undefined;
+      } catch (_) {
+        return undefined;
+      }
+    };
+    const show = (sessionID) => api.ui.router.navigate({ type: "session", sessionID });
+    class Retired extends Error {}
+    const stillActive = () => {
+      if (!instance.active) throw new Retired();
+    };
+    const target = async () => {
+      await untilNoDialog();
+      stillActive();
+      const shown = shownSession();
+      if (shown) {
+        const root = rootOf(shown);
+        if (root !== shown) show(root);
+        return root;
+      }
+      const created = await api.client.session.create({});
+      stillActive();
+      const sessionID = created?.id ?? created?.data?.id;
+      if (!sessionID) throw new Error("no session was created");
+      if (shownSession()) throw new Error("the person opened a session meanwhile");
+      show(sessionID);
+      return sessionID;
+    };
+    const notePending = (inboxID, text) => {
+      if (!inboxID) return;
+      const ids = inboxIdsIn(text).filter((id) => receiver.of(id).length > 0);
+      if (ids.length) inboxRemember(pending, inboxID, [...new Set([...(pending.get(inboxID) ?? []), ...ids])]);
+    };
+    let receiver;
+    const deliver = async (message) => {
+      const ref = inboxRef(message);
+      try {
+        stillActive();
+        const sessionID = await target();
+        const text = inboxText(message);
+        const onTarget = () => {
+          const now = shownSession();
+          return now === undefined || rootOf(now) === sessionID;
+        };
+        stillActive();
+        if (!onTarget()) throw new Error("the session changed");
+        await inboxHandOver(
+          receiver,
+          ref,
+          sessionID,
+          async () => {
+            try {
+              const item = await api.client.session.prompt({ sessionID, text });
+              notePending(item?.id ?? item?.data?.id, text);
+              return item;
+            } catch (error) {
+              const status = error?.status ?? error?.response?.status ?? error?.cause?.status;
+              if (typeof status === "number") return { error, response: { status } };
+              throw error;
+            }
+          },
+          () => instance.active && !dialogOpen() && onTarget(),
+        );
+      } catch (error) {
+        if (!(error instanceof Retired)) receiver.notHanded(ref);
+      }
+    };
+    receiver = inboxReceiver({
+      agent: "opencode",
+      active: () => instance.active,
+      deliver: (message) => {
+        queue = queue.then(() => deliver(message));
+      },
+    });
+
+    const on = (type, handler) => {
+      try {
+        const off = api.data?.on?.(type, (event) => {
+          try {
+            handler(event?.data ?? {});
+          } catch (_) {}
+        });
+        if (typeof off === "function") unsubscribe.push(off);
+      } catch (_) {}
+    };
+    on("session.inbox.enqueued", (data) => {
+      if (data.item?.type === "user") notePending(data.inboxID, data.item.payload?.text);
+    });
+    on("session.inbox.delivered", (data) => {
+      const refs = [];
+      for (const id of pending.get(data.inboxID) ?? []) refs.push(...receiver.of(id));
+      pending.delete(data.inboxID);
+      receiver.committed(refs);
+    });
+    on("session.inbox.cancelled", (data) => {
+      // A withdrawn prompt: lost, not released.
+      for (const id of pending.get(data.inboxID) ?? []) {
+        for (const ref of receiver.of(id)) receiver.lost(ref);
+      }
+      pending.delete(data.inboxID);
+    });
+    for (const type of ["session.status", "session.idle"]) {
+      on(type, (data) => {
+        const idle = type === "session.idle" || data.status?.type === "idle";
+        if (!idle || !data.sessionID) return;
+        // Idle with an attempt handed and not started on: the turn was
+        // aborted. Lost, so the deck may repeat it.
+        for (const ref of receiver.inSession(data.sessionID)) receiver.lost(ref);
+      });
+    }
+    receiver.start();
+    return () => {
+      instance.active = false;
+      for (const off of unsubscribe.splice(0)) {
+        try {
+          off();
+        } catch (_) {}
+      }
+      receiver.stop();
+    };
+  } catch (_) {}
+};
+
+export default { id: "dot-agent-deck-tui", setup };
+"#;
 
 /// The TUI plugin's copy of the server plugin's `hookBinary` (PRD #1497's
 /// `DOT_AGENT_DECK_BIN` override, absolute paths only).
@@ -2274,6 +3196,7 @@ export default { id: "dot-agent-deck", tui };
 /// obsolete nested `dot-agent-deck/` directory (see [`stale_plugin_dir`]) so an
 /// upgrade migrates the layout in place. Shared by every install path
 /// (auto + explicit + test seam).
+#[cfg(test)]
 fn write_plugin(root: &Path, binary_path: &str) -> std::io::Result<PathBuf> {
     write_plugin_reporting(root, binary_path).map(|(path, _)| path)
 }
@@ -2281,7 +3204,18 @@ fn write_plugin(root: &Path, binary_path: &str) -> std::io::Result<PathBuf> {
 /// [`write_plugin`], also reporting whether anything on disk changed. A plugin
 /// already holding exactly these bytes, with no stale nested layout beside it,
 /// is left untouched — same bytes, inode and mtime (PRD #1487).
+#[cfg(test)]
 fn write_plugin_reporting(root: &Path, binary_path: &str) -> std::io::Result<(PathBuf, bool)> {
+    write_plugin_reporting_for(root, binary_path, None)
+}
+
+/// [`write_plugin_reporting`], with the layout `marker` as the file's first
+/// line ([`plugin_template_for`]).
+fn write_plugin_reporting_for(
+    root: &Path,
+    binary_path: &str,
+    marker: Option<crate::opencode_version::Major>,
+) -> std::io::Result<(PathBuf, bool)> {
     let plugin_dir = root.join("plugin");
     let path = plugin_file(root);
     let stale = stale_plugin_dir(root);
@@ -2290,7 +3224,7 @@ fn write_plugin_reporting(root: &Path, binary_path: &str) -> std::io::Result<(Pa
     crate::config_write_guard::ensure_config_write_allowed(&path)?;
     crate::config_write_guard::ensure_config_write_allowed(&stale)?;
 
-    let content = plugin_template(binary_path);
+    let content = plugin_template_for(binary_path, marker);
     if !stale.is_dir() && std::fs::read(&path).is_ok_and(|existing| existing == content.as_bytes())
     {
         return Ok((path, false));
@@ -2465,10 +3399,22 @@ fn below_floor(file: &Path) -> bool {
 }
 
 /// [`auto_install_to`], adding each root it could not write to `failed`.
+#[cfg(test)]
 fn auto_install_to_reporting(
     roots: &[PathBuf],
     binary_path: &str,
     failed: &mut Vec<String>,
+) -> Vec<(PathBuf, String)> {
+    auto_install_to_reporting_for(roots, binary_path, failed, None)
+}
+
+/// [`auto_install_to_reporting`], writing each module with the layout
+/// `marker` ([`plugin_template_for`]).
+fn auto_install_to_reporting_for(
+    roots: &[PathBuf],
+    binary_path: &str,
+    failed: &mut Vec<String>,
+    marker: Option<crate::opencode_version::Major>,
 ) -> Vec<(PathBuf, String)> {
     // Held across the read-preserve-write span, not just the write. See
     // [`PLUGIN_LOCK`].
@@ -2538,7 +3484,7 @@ fn auto_install_to_reporting(
             Some(_) => (binary_path.to_string(), true),
             None => (binary_path.to_string(), false),
         };
-        let written = write_plugin_reporting(root, &pinned);
+        let written = write_plugin_reporting_for(root, &pinned, marker);
         if let Err(e) = &written {
             failed.push(format!("{}: {e}", plugin_file(root).display()));
         }
@@ -2601,11 +3547,23 @@ fn auto_install_to_reporting(
 /// probe. Each successful write emits one `Installed OpenCode plugin: <path>` line to
 /// `out`. Every target is attempted even if an earlier one fails; the first error (if
 /// any) is returned so the caller surfaces it.
+#[cfg(test)]
 fn install_to_roots(
     roots: &[PathBuf],
     fallback_root: impl FnOnce() -> PathBuf,
     binary_path: &str,
     out: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    install_to_roots_for(roots, fallback_root, binary_path, out, None)
+}
+
+/// [`install_to_roots`], writing each module with the layout `marker`.
+fn install_to_roots_for(
+    roots: &[PathBuf],
+    fallback_root: impl FnOnce() -> PathBuf,
+    binary_path: &str,
+    out: &mut impl std::io::Write,
+    marker: Option<crate::opencode_version::Major>,
 ) -> std::io::Result<()> {
     // The explicit path writes rather than preserves, but it publishes to the
     // same file the auto path reads back — so it takes the same lock. See
@@ -2623,8 +3581,8 @@ fn install_to_roots(
 
     let mut first_err: Option<std::io::Error> = None;
     for root in &targets {
-        match write_plugin(root, binary_path) {
-            Ok(path) => {
+        match write_plugin_reporting_for(root, binary_path, marker) {
+            Ok((path, _)) => {
                 let _ = writeln!(out, "Installed OpenCode plugin: {}", path.display());
             }
             Err(e) => {
@@ -2973,40 +3931,24 @@ pub fn refresh_install() -> crate::hooks_refresh::InstallAttempt {
 /// before its child does, so the agent loads the integration this deck checks
 /// it against. Returns the pins and every integration file it could not
 /// write, for the card to say so.
-pub fn refresh_for_spawn() -> (Vec<crate::hook_binary::HookPin>, Vec<String>) {
-    auto_install_reporting()
+pub fn refresh_for_spawn(
+    major: Option<crate::opencode_version::Major>,
+) -> (Vec<crate::hook_binary::HookPin>, Vec<String>) {
+    auto_install_reporting_for(Layout::for_major(major))
 }
 
 fn auto_install_reporting() -> (Vec<crate::hook_binary::HookPin>, Vec<String>) {
+    auto_install_reporting_for(remembered_layout(&candidate_roots()))
+}
+
+/// PRD #2050: the automatic install for `layout`, over the real config roots,
+/// pinned to this deck's durable binary.
+fn auto_install_reporting_for(layout: Layout) -> (Vec<crate::hook_binary::HookPin>, Vec<String>) {
     let mut failed = Vec::new();
     let roots = candidate_roots();
-    let (binary_path, pins) = auto_install_resolved(&roots, &mut failed, || {
+    let (_, pins) = auto_install_layout(&roots, layout, &mut failed, || {
         crate::platform::paths::durable_binary_path()
     });
-    // PRD #1666 S8: the TUI plugin, into the XDG root, from the same resolved
-    // binary the server plugin was installed with. OpenCode reads `tui.json`
-    // from the XDG root only, so a legacy-only layout gets its TUI half there
-    // too (PR #1735 review): OpenCode creates that root itself on any run
-    // (measured on 1.18.35, `opencode --version` included), so creating it for
-    // an installed OpenCode is not speculative. With no root at all nothing is
-    // created.
-    if let Some(binary_path) = binary_path
-        && roots.iter().any(|root| root.exists())
-    {
-        let xdg = &roots[0];
-        match crate::config_write_guard::ensure_config_write_allowed(&tui_plugin_file(xdg))
-            .and_then(|()| std::fs::create_dir_all(xdg))
-        {
-            Ok(()) => auto_install_tui(xdg, &binary_path, &mut failed),
-            Err(e) => {
-                failed.push(format!("{}: {e}", xdg.display()));
-                tracing::warn!(
-                    "auto-install: could not create the OpenCode config root {} for its TUI                      plugin: {e}; deck messages will reach OpenCode by the doorbell instead",
-                    xdg.display()
-                );
-            }
-        }
-    }
     // One pin per binary: the roots of one machine name the same install.
     let mut out: Vec<crate::hook_binary::HookPin> = Vec::new();
     for (root, binary) in pins {
@@ -3019,6 +3961,256 @@ fn auto_install_reporting() -> (Vec<crate::hook_binary::HookPin>, Vec<String>) {
         }
     }
     (out, failed)
+}
+
+/// PRD #2050: the automatic install of `layout` over `roots` (the global
+/// root first, then the legacy one), with the binary resolution injected.
+/// Returns the binary resolved and the pin each root holds afterwards.
+///
+/// [`Layout::Unknown`] (a spawn whose version the deck cannot see) installs
+/// both TUI halves, and places the server module the way the global root's
+/// marker remembers ([`remembered_major`]): in the global root only when it
+/// was last written for 2.x, so a wrapper's spawn does not bring back the
+/// duplicate a 2.x spawn removed; otherwise in every existing root.
+fn auto_install_layout(
+    roots: &[PathBuf],
+    layout: Layout,
+    failed: &mut Vec<String>,
+    resolve: impl FnOnce() -> Result<String, String>,
+) -> (Option<String>, Vec<(PathBuf, String)>) {
+    use crate::opencode_version::Major;
+    let remembered = roots.first().and_then(|root| remembered_major(root));
+    let marker = match layout {
+        Layout::V1 => Some(Major::V1),
+        Layout::V2 => Some(Major::V2),
+        Layout::Unknown => remembered,
+    };
+    let (binary_path, pins) = if marker == Some(Major::V2) {
+        auto_install_v2_resolved(roots, failed, resolve)
+    } else {
+        auto_install_resolved_for(roots, failed, resolve, marker)
+    };
+    // PRD #1666 S8: the TUI plugin, into the XDG root, from the same resolved
+    // binary the server plugin was installed with. OpenCode reads `tui.json`
+    // from the XDG root only, so a legacy-only layout gets its TUI half there
+    // too (PR #1735 review): OpenCode creates that root itself on any run
+    // (measured on 1.18.35, `opencode --version` included), so creating it for
+    // an installed OpenCode is not speculative. With no root at all nothing is
+    // created. PRD #2050: OpenCode 2.x reads its TUI plugins from the same
+    // root, as a `plugins/` directory.
+    if let Some(binary_path) = binary_path.as_deref()
+        && roots.iter().any(|root| root.exists())
+        && let Some(xdg) = roots.first()
+    {
+        match crate::config_write_guard::ensure_config_write_allowed(&tui_plugin_file(xdg))
+            .and_then(|()| std::fs::create_dir_all(xdg))
+        {
+            Ok(()) => {
+                if layout != Layout::V2 {
+                    auto_install_tui(xdg, binary_path, failed);
+                }
+                if layout == Layout::V1 {
+                    // OpenCode 1.x never loads the 2.x half; it goes, so a
+                    // machine back on 1.x carries only what it runs.
+                    remove_tui_v2(xdg, failed);
+                } else {
+                    auto_install_tui_v2(xdg, binary_path, failed);
+                }
+            }
+            Err(e) => {
+                failed.push(format!("{}: {e}", xdg.display()));
+                tracing::warn!(
+                    "auto-install: could not create the OpenCode config root {} for its TUI \
+                     plugin: {e}; deck messages will reach OpenCode by the doorbell instead",
+                    xdg.display()
+                );
+            }
+        }
+    }
+    (binary_path, pins)
+}
+
+/// PRD #2050: the server module for OpenCode 2.x: the global root only
+/// (`roots[0]`), created when missing — a 2.x was detected, so OpenCode is
+/// installed and creates that root itself — and the deck's own copy removed
+/// from every other root, where 2.x would load it as a duplicate. A legacy
+/// copy's pin carries over when the global root has no module yet, so a pin
+/// to another live install is kept by the same rules as any other root.
+fn auto_install_v2_resolved(
+    roots: &[PathBuf],
+    failed: &mut Vec<String>,
+    resolve: impl FnOnce() -> Result<String, String>,
+) -> (Option<String>, Vec<(PathBuf, String)>) {
+    let Some((global, legacy)) = roots.split_first() else {
+        return (None, Vec::new());
+    };
+    let binary_path = match resolve() {
+        Ok(binary_path) => binary_path,
+        Err(e) => {
+            tracing::warn!("auto-install: {e}");
+            failed.push(e);
+            return (None, Vec::new());
+        }
+    };
+    let global_file = plugin_file(global);
+    if let Err(e) = crate::config_write_guard::ensure_config_write_allowed(&global_file)
+        .and_then(|()| std::fs::create_dir_all(global))
+    {
+        failed.push(format!("{}: {e}", global_file.display()));
+        tracing::warn!(
+            "auto-install: could not create the OpenCode config root {}: {e}",
+            global.display()
+        );
+        return (Some(binary_path), Vec::new());
+    }
+    let pins = {
+        let _guard = lock_plugin();
+        if std::fs::symlink_metadata(&global_file).is_err()
+            && let Some(js) = legacy
+                .iter()
+                .find_map(|root| std::fs::read_to_string(plugin_file(root)).ok())
+                .filter(|js| binary_path_literal(js).is_some())
+        {
+            let dir = global.join("plugin");
+            if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| {
+                crate::agent_hook_config::write_atomic(&dir, &global_file, js.as_bytes())
+            }) {
+                tracing::warn!(
+                    "auto-install: could not carry the OpenCode plugin over to {}: {e}",
+                    global_file.display()
+                );
+            }
+        }
+        drop(_guard);
+        auto_install_to_reporting_for(
+            std::slice::from_ref(global),
+            &binary_path,
+            failed,
+            Some(crate::opencode_version::Major::V2),
+        )
+    };
+    // Removed only once the global copy is in place, so a failed write never
+    // leaves OpenCode with no module at all.
+    if pins.iter().any(|(root, _)| root == global) {
+        for root in legacy {
+            remove_duplicate_module(root, failed);
+        }
+    }
+    (Some(binary_path), pins)
+}
+
+/// PRD #2050: remove the deck's server module (and any obsolete nested
+/// layout) from `root`, where OpenCode 2.x would load it as a second copy of
+/// the global root's. Only the deck's own file names are touched.
+fn remove_duplicate_module(root: &Path, failed: &mut Vec<String>) {
+    let _guard = lock_plugin();
+    for artifact in [plugin_file(root), stale_plugin_dir(root)] {
+        if std::fs::symlink_metadata(&artifact).is_err() {
+            continue;
+        }
+        let removed =
+            crate::config_write_guard::ensure_config_write_allowed(&artifact).and_then(|()| {
+                if artifact.is_dir() {
+                    std::fs::remove_dir_all(&artifact)
+                } else {
+                    std::fs::remove_file(&artifact)
+                }
+            });
+        match removed {
+            Ok(()) => tracing::info!(
+                "auto-install: removed {}: OpenCode 2 loads the deck's plugin from the global \
+                 config root, and would refuse this copy as a duplicate",
+                artifact.display()
+            ),
+            Err(e) => {
+                failed.push(format!("{}: {e}", artifact.display()));
+                tracing::warn!(
+                    "auto-install: could not remove {}, which OpenCode 2 would load as a \
+                     duplicate plugin: {e}",
+                    artifact.display()
+                );
+            }
+        }
+    }
+}
+
+/// PRD #2050: write OpenCode 2.x's TUI plugin under `root` pinned to `pin`,
+/// leaving a file that already holds those bytes untouched. Whether it
+/// changed anything. Callers hold [`PLUGIN_LOCK`].
+fn write_tui_v2(root: &Path, pin: &str) -> std::io::Result<bool> {
+    let file = tui_v2_file(root);
+    crate::config_write_guard::ensure_config_write_allowed(&file)?;
+    let content = tui_v2_template(pin);
+    if std::fs::read(&file).ok().as_deref() == Some(content.as_bytes()) {
+        return Ok(false);
+    }
+    let dir = tui_v2_dir(root);
+    std::fs::create_dir_all(&dir)?;
+    crate::agent_hook_config::write_atomic(&dir, &file, content.as_bytes())?;
+    crate::agent_hook_config::note_config_change();
+    Ok(true)
+}
+
+/// PRD #2050: remove OpenCode 2.x's TUI half from `root`, for a machine
+/// running 1.x. Only the deck's own directory is touched.
+fn remove_tui_v2(root: &Path, failed: &mut Vec<String>) {
+    let _guard = lock_plugin();
+    let dir = tui_v2_dir(root);
+    if std::fs::symlink_metadata(&dir).is_err() {
+        return;
+    }
+    match crate::config_write_guard::ensure_config_write_allowed(&dir)
+        .and_then(|()| std::fs::remove_dir_all(&dir))
+    {
+        Ok(()) => tracing::info!(
+            "auto-install: removed the OpenCode 2 TUI plugin at {}: this OpenCode is 1.x",
+            dir.display()
+        ),
+        Err(e) => {
+            failed.push(format!("{}: {e}", dir.display()));
+            tracing::warn!("auto-install: could not remove {}: {e}", dir.display());
+        }
+    }
+}
+
+/// PRD #2050: the automatic install's 2.x TUI half, its pin following the
+/// same rules as the 1.x half's ([`auto_install_tui`]).
+fn auto_install_tui_v2(root: &Path, binary_path: &str, failed: &mut Vec<String>) {
+    let _guard = lock_plugin();
+    let file = tui_v2_file(root);
+    let takeover = crate::hook_binary::Takeover::current();
+    let pin = match existing_pin(&file) {
+        Some(existing) if crate::agent_hook_config::auto_install_keeps(&existing) => {
+            if crate::agent_hook_config::executables_match(&existing, binary_path) {
+                Some(existing)
+            } else if takeover.supersedes(&existing) {
+                Some(binary_path.to_string())
+            } else if below_floor(&file) {
+                Some(existing)
+            } else {
+                None
+            }
+        }
+        _ => Some(binary_path.to_string()),
+    };
+    let Some(pin) = pin else {
+        return;
+    };
+    match write_tui_v2(root, &pin) {
+        Ok(true) => tracing::info!(
+            "auto-install: installed the OpenCode 2 TUI plugin at {}",
+            file.display()
+        ),
+        Ok(false) => {}
+        Err(e) => {
+            failed.push(format!("{}: {e}", file.display()));
+            tracing::warn!(
+                "auto-install: failed to install the OpenCode 2 TUI plugin at {}: {e}; deck \
+                 messages will reach OpenCode by the doorbell instead",
+                file.display()
+            );
+        }
+    }
 }
 
 /// [`auto_install`] with the binary-path resolution injected, so the PRD #381 M6
@@ -3038,17 +4230,28 @@ fn auto_install_reporting() -> (Vec<crate::hook_binary::HookPin>, Vec<String>) {
 ///
 /// Returns the binary path it resolved (`None` when it installed nothing) and
 /// the pin each existing root holds afterwards.
+#[cfg(test)]
 fn auto_install_resolved(
     roots: &[PathBuf],
     failed: &mut Vec<String>,
     resolve: impl FnOnce() -> Result<String, String>,
+) -> (Option<String>, Vec<(PathBuf, String)>) {
+    auto_install_resolved_for(roots, failed, resolve, None)
+}
+
+/// [`auto_install_resolved`], writing each module with the layout `marker`.
+fn auto_install_resolved_for(
+    roots: &[PathBuf],
+    failed: &mut Vec<String>,
+    resolve: impl FnOnce() -> Result<String, String>,
+    marker: Option<crate::opencode_version::Major>,
 ) -> (Option<String>, Vec<(PathBuf, String)>) {
     if !roots.iter().any(|root| root.exists()) {
         return (None, Vec::new());
     }
     match resolve() {
         Ok(binary_path) => {
-            let pins = auto_install_to_reporting(roots, &binary_path, failed);
+            let pins = auto_install_to_reporting_for(roots, &binary_path, failed, marker);
             (Some(binary_path), pins)
         }
         Err(e) => {
@@ -3062,20 +4265,59 @@ fn auto_install_resolved(
 /// `dot-agent-deck hooks install --agent opencode`. Unlike [`auto_install`],
 /// this ALWAYS writes the freshly resolved path: the user asked for this
 /// install by name, so an existing pin is not preserved (PRD #381 M5).
+///
+/// PRD #2050: there is no command here to tell the OpenCode version from, so
+/// this writes the layout the global root's module was last written for
+/// ([`remembered_major`]), and with none remembered [`Layout::Unknown`]: the
+/// 1.x fan-out and both TUI halves. The next OpenCode agent the deck starts
+/// detects its version and settles the layout.
 pub fn install() -> std::io::Result<()> {
+    use crate::opencode_version::Major;
     let binary_path =
         crate::platform::paths::durable_binary_path().map_err(std::io::Error::other)?;
-
-    install_to_roots(
-        &candidate_roots(),
-        xdg_default_root,
-        &binary_path,
-        &mut std::io::stdout(),
-    )?;
-    // PRD #1666 S8: the TUI plugin, in the XDG root only (design §7.2).
+    let roots = candidate_roots();
     let root = xdg_default_root();
+    let remembered = remembered_major(&root);
+    let v2 = remembered == Some(Major::V2);
+    if v2 {
+        install_to_roots_for(
+            &[],
+            || root.clone(),
+            &binary_path,
+            &mut std::io::stdout(),
+            remembered,
+        )?;
+        for legacy in roots.iter().skip(1) {
+            for artifact in [plugin_file(legacy), stale_plugin_dir(legacy)] {
+                if std::fs::symlink_metadata(&artifact).is_ok() {
+                    uninstall_impl(&artifact)?;
+                }
+            }
+        }
+    } else {
+        install_to_roots_for(
+            &roots,
+            xdg_default_root,
+            &binary_path,
+            &mut std::io::stdout(),
+            remembered,
+        )?;
+    }
     let _guard = lock_plugin();
     std::fs::create_dir_all(&root)?;
+    // PRD #2050: OpenCode 2.x's TUI half, a directory 1.x never sees —
+    // unless this machine is known to run 1.x.
+    if remembered != Some(Major::V1) {
+        write_tui_v2(&root, &binary_path)?;
+        println!(
+            "Installed OpenCode 2 TUI plugin: {}",
+            tui_v2_file(&root).display()
+        );
+    }
+    if v2 {
+        return Ok(());
+    }
+    // PRD #1666 S8: the TUI plugin, in the XDG root only (design §7.2).
     let tui_file = tui_plugin_file(&root);
     match install_tui_half(&root, Some(&binary_path))? {
         TuiEntry::Added(file) => {
@@ -3108,6 +4350,13 @@ pub fn uninstall() -> std::io::Result<()> {
     // cannot be edited safely stops the uninstall before anything is deleted.
     for root in candidate_roots() {
         uninstall_tui_half(&root)?;
+        // PRD #2050: OpenCode 2.x's TUI half, a directory of the deck's own.
+        let dir = tui_v2_dir(&root);
+        if std::fs::symlink_metadata(&dir).is_ok() {
+            crate::config_write_guard::ensure_config_write_allowed(&dir)?;
+            std::fs::remove_dir_all(&dir)?;
+            println!("Removed OpenCode 2 TUI plugin: {}", dir.display());
+        }
     }
     let artifacts = existing_plugin_artifacts();
     if artifacts.is_empty() {
@@ -3611,8 +4860,10 @@ pub(crate) mod tests {
         assert!(content.contains("const permissionPayload"));
         assert!(content.contains("\"permission.asked\""));
         // PR #1698 review: both tool hooks, root and child session, forward the
-        // call's id, which a `permission.asked` names as `tool.callID`.
-        assert_eq!(content.matches("call_id: input?.callID,").count(), 4);
+        // call's id, which a `permission.asked` names as `tool.callID`
+        // (PRD #2050: through the one report both generations share).
+        assert_eq!(content.matches("call_id: callID,").count(), 2);
+        assert_eq!(content.matches("input?.callID, directory)").count(), 2);
     }
 
     /// The installer intentionally fans out to every existing OpenCode config
@@ -4384,7 +5635,8 @@ pub(crate) mod tests {
         std::fs::write(
             &driver,
             format!(
-                r#"import plugin from "{}";
+                r#"import pluginModule from "{}";
+const plugin = pluginModule.server;
 const hooks = await plugin({{ directory: "/work" }});
 await hooks.event({{ event: {{ type: "session.error", properties: {{ sessionID: "s1", error: "boom" }} }} }});
 "#,
@@ -4713,7 +5965,7 @@ const client = {{ session: {{
   messages: () => new Promise((r) => {{ releaseMessages = r; }}),
   promptAsync: async (req) => {{ prompts.push(req.path.id); return {{}}; }},
 }} }};
-const {{ default: plugin }} = await import("{}");
+const {{ default: {{ server: plugin }} }} = await import("{}");
 const hooks = await plugin({{ directory: "/work", client }});
 await hooks.event({{ event: {{ type: "session.created", properties: {{ info: {{ id: "s1" }} }} }} }});
 for (let n = 0; n < 100 && !releaseMessages; n++) await sleep(20);
@@ -4775,7 +6027,7 @@ process.exit(0);
         std::fs::write(
             &driver,
             format!(
-                r#"const {{ default: plugin }} = await import("{}");
+                r#"const {{ default: {{ server: plugin }} }} = await import("{}");
 const hooks = await plugin({{ directory: "/work", client: {{}} }});
 const updated = (info) => hooks.event({{ event: {{ type: "message.updated", properties: {{ info }} }} }});
 await hooks.event({{ event: {{ type: "session.created", properties: {{ info: {{ id: "s1", directory: "/work" }} }} }} }});
@@ -4903,7 +6155,7 @@ process.exit(0);
             &driver,
             format!(
                 r#"import {{ chmodSync }} from "fs";
-const {{ default: plugin }} = await import("{}");
+const {{ default: {{ server: plugin }} }} = await import("{}");
 const hooks = await plugin({{ directory: "/work", client: {{}} }});
 const send = (type, properties) => hooks.event({{ event: {{ type, properties }} }});
 const updated = (info) => send("message.updated", {{ info }});
@@ -5134,7 +6386,7 @@ console.log(JSON.stringify({{
         std::fs::write(
             &driver,
             format!(
-                r#"const {{ default: plugin }} = await import("{}");
+                r#"const {{ default: {{ server: plugin }} }} = await import("{}");
 const hooks = await plugin({{ directory: "/work", client: {{}} }});
 const send = (type, properties) => hooks.event({{ event: {{ type, properties }} }});
 const updated = (info) => send("message.updated", {{ info }});
@@ -5232,7 +6484,7 @@ process.exit(0);
             &driver,
             format!(
                 r#"import {{ copyFileSync }} from "fs";
-const {{ default: plugin }} = await import("{}");
+const {{ default: {{ server: plugin }} }} = await import("{}");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const asked = [];
 let answer;
@@ -5958,7 +7210,7 @@ const client = {{ session: {{
   messages: async () => ({{ data: [] }}),
   promptAsync: async (req) => {{ prompts.push(req.path.id); return {{}}; }},
 }} }};
-const {{ default: plugin }} = await import("{plugin}");
+const {{ default: {{ server: plugin }} }} = await import("{plugin}");
 const hooks = await plugin({{ directory: "/work", client }});
 await hooks.event({{ event: {{ type: "session.created", properties: {{ info: {{ id: "s1" }} }} }} }});
 for (let n = 0; n < 150 && !asked(); n++) await sleep(20);
@@ -6114,7 +7366,7 @@ check(called, [1], "never reaches OpenCode");
                 &driver,
                 format!(
                     r#"process.argv = [process.argv[0], "opencode", ...{argv}];
-const {{ default: plugin }} = await import("{}");
+const {{ default: {{ server: plugin }} }} = await import("{}");
 const hooks = await plugin({{ directory: "/work" }});
 // PRD #1666 §4: the substitution needs this context's receiver registered.
 await new Promise((r) => setTimeout(r, 500));
@@ -6190,7 +7442,8 @@ process.exit(0);
         std::fs::write(
             &driver,
             format!(
-                r#"import plugin from "{}";
+                r#"import pluginModule from "{}";
+const plugin = pluginModule.server;
 const hooks = await plugin({{ directory: "/work" }});
 await hooks.event({{ event: {{ type: "session.error", properties: {{ sessionID: "s1", error: {{
   name: "APIError",
@@ -6329,7 +7582,8 @@ await hooks.event({{ event: {{ type: "session.error", properties: {{ sessionID: 
         std::fs::write(
             &driver,
             format!(
-                r#"import plugin from "{}";
+                r#"import pluginModule from "{}";
+const plugin = pluginModule.server;
 const hooks = await plugin({{ directory: "/work" }});
 const send = (type, properties) => hooks.event({{ event: {{ type, properties }} }});
 const part = (sessionID, messageID, id, type, text) =>
@@ -6642,7 +7896,7 @@ check(inboxIdsIn("[dot-agent-deck message " + A + " from x]\nhead"), [A], "an un
         std::fs::write(
             &driver,
             format!(
-                "import plugin from {plugin};\nimport {{ existsSync as awaitsExist, readFileSync as readAwaits }} from \"fs\";\nconst awaited = async (n) => {{\n  for (let i = 0; i < 1600; i += 1) {{\n    if (awaitsExist({awaits}) && readAwaits({awaits}, \"utf8\").split(\"\\n\").filter(Boolean).length >= n) return;\n    await new Promise((r) => setTimeout(r, 25));\n  }}\n  throw new Error(\"await-answer was not handed \" + n);\n}};\n{body}",
+                "import pluginModule from {plugin};\nconst plugin = pluginModule.server;\nimport {{ existsSync as awaitsExist, readFileSync as readAwaits }} from \"fs\";\nconst awaited = async (n) => {{\n  for (let i = 0; i < 1600; i += 1) {{\n    if (awaitsExist({awaits}) && readAwaits({awaits}, \"utf8\").split(\"\\n\").filter(Boolean).length >= n) return;\n    await new Promise((r) => setTimeout(r, 25));\n  }}\n  throw new Error(\"await-answer was not handed \" + n);\n}};\n{body}",
                 plugin = serde_json::to_string(&plugin.display().to_string()).unwrap(),
                 awaits = serde_json::to_string(&awaits.display().to_string()).unwrap(),
             ),
@@ -7701,7 +8955,8 @@ fi
         std::fs::write(
             &driver,
             format!(
-                r#"import plugin from "{plugin}";
+                r#"import pluginModule from "{plugin}";
+const plugin = pluginModule.server;
 import {{ existsSync, readFileSync, writeFileSync }} from "fs";
 const posts = [];
 let refuseNext = false;
@@ -8002,7 +9257,8 @@ fi
         std::fs::write(
             &driver,
             format!(
-                r#"import plugin from "{plugin}";
+                r#"import pluginModule from "{plugin}";
+const plugin = pluginModule.server;
 const hooks = await plugin({{ directory: "/work", client: {{}} }});
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const asked = {permission};
@@ -8063,6 +9319,767 @@ await wait(1500);
             crate::hook::build_opencode_event(plain).map(|e| e.event_type),
             Some(crate::event::EventType::WaitingForInput),
             "the plain question reads as Needs Input"
+        );
+    }
+
+    // --- PRD #2050: OpenCode 2.x ---
+
+    /// The paths a layout test reads, under `fixture`: the global (XDG) root
+    /// and the legacy one, both present, as on a machine where OpenCode has run.
+    #[cfg(unix)]
+    struct LayoutFixture {
+        _dir: tempfile::TempDir,
+        roots: Vec<PathBuf>,
+        bin: String,
+    }
+
+    #[cfg(unix)]
+    impl LayoutFixture {
+        fn new() -> Self {
+            let dir = crate::test_temp::tempdir().unwrap();
+            let roots = vec![
+                dir.path().join("config").join("opencode"),
+                dir.path().join("home").join(".opencode"),
+            ];
+            for root in &roots {
+                std::fs::create_dir_all(root).unwrap();
+            }
+            let bin = seed_deck(&dir.path().join("local").join("dot-agent-deck"));
+            LayoutFixture {
+                _dir: dir,
+                roots,
+                bin,
+            }
+        }
+        fn install(&self, layout: Layout) -> Vec<String> {
+            let mut failed = Vec::new();
+            auto_install_layout(&self.roots, layout, &mut failed, || Ok(self.bin.clone()));
+            failed
+        }
+        fn global(&self) -> &Path {
+            &self.roots[0]
+        }
+        fn legacy(&self) -> &Path {
+            &self.roots[1]
+        }
+        /// What is installed: (module in global, module in legacy, 1.x TUI
+        /// half, 2.x TUI half).
+        fn state(&self) -> (bool, bool, bool, bool) {
+            (
+                plugin_file(self.global()).exists(),
+                plugin_file(self.legacy()).exists(),
+                tui_plugin_file(self.global()).exists(),
+                tui_v2_file(self.global()).exists(),
+            )
+        }
+    }
+
+    /// OpenCode 2.x: the module in the global root only, marked for 2.x, the
+    /// legacy copy (which 2.x would refuse as a duplicate) removed, and the
+    /// 2.x TUI half installed; 1.x: today's fan-out, marked for 1.x, the 1.x
+    /// TUI half, no 2.x half. Every module is the same dual-shape code.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_layout_follows_the_detected_version() {
+        let v2 = LayoutFixture::new();
+        assert_eq!(v2.install(Layout::V2), Vec::<String>::new());
+        assert_eq!(v2.state(), (true, false, false, true));
+        assert_eq!(
+            remembered_major(v2.global()),
+            Some(crate::opencode_version::Major::V2)
+        );
+        assert_eq!(
+            existing_binary_path(v2.global()).as_deref(),
+            Some(v2.bin.as_str())
+        );
+        assert_eq!(
+            existing_pin(&tui_v2_file(v2.global())).as_deref(),
+            Some(v2.bin.as_str())
+        );
+        let module = std::fs::read_to_string(plugin_file(v2.global())).unwrap();
+        assert!(module.contains(
+            "export default { id: \"dot-agent-deck\", server: DotAgentDeckPlugin, setup: setupV2 };"
+        ));
+
+        let v1 = LayoutFixture::new();
+        assert_eq!(v1.install(Layout::V1), Vec::<String>::new());
+        assert_eq!(v1.state(), (true, true, true, false));
+        assert_eq!(
+            remembered_major(v1.global()),
+            Some(crate::opencode_version::Major::V1)
+        );
+        assert!(
+            std::fs::read_to_string(v1.global().join("tui.json"))
+                .unwrap()
+                .contains("dot-agent-deck-tui.js")
+        );
+    }
+
+    /// A machine that switches OpenCode 1.x → 2.x → 1.x gets, on each next
+    /// spawn, the layout of the version it now runs: the upgrade removes the
+    /// legacy-root duplicate and adds the 2.x TUI half, the downgrade puts the
+    /// legacy copy back and removes the 2.x half. Installs with no command to
+    /// look at (startup, `hooks refresh`) keep whichever was last detected,
+    /// and an unknown spawn (a wrapper) adds both TUI halves without bringing
+    /// a duplicate back.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_layout_is_repaired_when_the_version_switches() {
+        let f = LayoutFixture::new();
+        f.install(Layout::V1);
+        assert_eq!(f.state(), (true, true, true, false), "1.x");
+        assert_eq!(remembered_layout(&f.roots), Layout::V1);
+        f.install(remembered_layout(&f.roots));
+        assert_eq!(
+            f.state(),
+            (true, true, true, false),
+            "a restart on 1.x adds nothing"
+        );
+
+        f.install(Layout::V2);
+        let (global, legacy, _, tui_v2) = f.state();
+        assert_eq!(
+            (global, legacy, tui_v2),
+            (true, false, true),
+            "upgraded to 2.x"
+        );
+        assert_eq!(remembered_layout(&f.roots), Layout::V2);
+        f.install(remembered_layout(&f.roots));
+        assert!(
+            !plugin_file(f.legacy()).exists(),
+            "a restart on 2.x brings no duplicate back"
+        );
+        f.install(Layout::Unknown);
+        assert!(
+            !plugin_file(f.legacy()).exists(),
+            "nor does a wrapper's spawn"
+        );
+        assert!(
+            tui_plugin_file(f.global()).exists() && tui_v2_file(f.global()).exists(),
+            "which gets both TUI halves"
+        );
+
+        f.install(Layout::V1);
+        assert_eq!(f.state(), (true, true, true, false), "back on 1.x");
+        assert_eq!(remembered_layout(&f.roots), Layout::V1);
+    }
+
+    /// With nothing remembered (no module yet, or one from before PRD #2050),
+    /// an install that cannot tell the version writes today's fan-out and both
+    /// TUI halves, which work under either generation.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_unknown_layout_installs_both_tui_halves() {
+        let f = LayoutFixture::new();
+        assert_eq!(remembered_layout(&f.roots), Layout::Unknown);
+        assert_eq!(f.install(Layout::Unknown), Vec::<String>::new());
+        assert_eq!(f.state(), (true, true, true, true));
+        assert_eq!(remembered_major(f.global()), None);
+        assert_eq!(
+            std::fs::read_to_string(plugin_file(f.global())).unwrap(),
+            plugin_template(&f.bin),
+            "unmarked: the same bytes as before PRD #2050's markers"
+        );
+    }
+
+    /// The upgrade to 2.x keeps a pin to another live install that only the
+    /// legacy root's copy held: the copy is carried to the global root under
+    /// the usual pin rules before the legacy one is removed.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_layout_carries_a_legacy_pin_over() {
+        let f = LayoutFixture::new();
+        let other = seed_deck(&f._dir.path().join("homebrew").join("dot-agent-deck"));
+        write_plugin(f.legacy(), &other).unwrap();
+        assert_eq!(f.install(Layout::V2), Vec::<String>::new());
+        assert!(!plugin_file(f.legacy()).exists());
+        assert_eq!(
+            existing_binary_path(f.global()).as_deref(),
+            Some(other.as_str())
+        );
+    }
+
+    /// A drive of the generated module's OpenCode 2.x `setup` under Node with
+    /// a fake 2.x context: an event stream of `{ type, data, location }`,
+    /// `tool.hook`, `session.hook`, `session.get`/`prompt` and
+    /// `permission.reply`. `body` runs after `setup` with `emit(type, data)`,
+    /// `hooks` (the registered callbacks), `prompts`, `replies` and `cleanup`.
+    const FAKE_V2_CTX_JS: &str = r#"const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const queue = [];
+let wake;
+let subscribed = false;
+const stream = { [Symbol.asyncIterator]() { return { next: async () => {
+  while (!queue.length) await new Promise((r) => { wake = r; });
+  return { value: queue.shift(), done: false };
+} }; } };
+const emit = async (type, data, directory = "/work") => {
+  queue.push({ id: "evt", created: Date.now(), type, data, location: { directory } });
+  wake?.();
+  await sleep(40);
+};
+const hooks = { tool: {}, session: {} };
+const prompts = [];
+const replies = [];
+const parents = {};
+const registration = (domain, name) => ({ dispose: async () => { delete hooks[domain][name]; } });
+const ctx = {
+  location: { directory: "/work" },
+  event: { subscribe: () => { subscribed = true; return stream; } },
+  tool: { hook: async (name, cb) => { hooks.tool[name] = cb; return registration("tool", name); } },
+  session: {
+    hook: async (name, cb) => { hooks.session[name] = cb; return registration("session", name); },
+    get: async ({ sessionID }) => ({ id: sessionID, parentID: parents[sessionID] }),
+    prompt: async (input) => { prompts.push(input); return { id: "inbox-" + prompts.length }; },
+  },
+  permission: { reply: async (input) => { replies.push(input); } },
+};
+"#;
+
+    /// Run `body` against the module's 2.x `setup` (see [`FAKE_V2_CTX_JS`]),
+    /// as a standalone server's plugin, outside a deck pane.
+    #[cfg(unix)]
+    fn run_v2_driver(body: &str) -> Option<(Vec<serde_json::Value>, Vec<serde_json::Value>)> {
+        run_plugin_driver_with_awaits(
+            &format!(
+                "{FAKE_V2_CTX_JS}\ndelete process.env.DOT_AGENT_DECK_PANE_ID;\ndelete process.env.DOT_AGENT_DECK_USAGE_FILE;\nprocess.argv.push(\"serve\", \"--stdio\");\nconst cleanup = await pluginModule.setup(ctx);\n{body}\nprocess.exit(0);\n"
+            ),
+            &[],
+        )
+    }
+
+    /// The module both generations load: `{ id, server, setup }`, the 1.x
+    /// factory as `server` (also still a named export), and a `setup` that
+    /// stays inert — subscribes to nothing, registers nothing — outside a
+    /// standalone server, where `process.env` is not the pane's.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_module_exports_both_shapes_and_v2_stays_inert_in_a_shared_service() {
+        let Some((payloads, _)) = run_plugin_driver_with_awaits(
+            &format!(
+                "{FAKE_V2_CTX_JS}\nimport * as named from {module};\nconst shape = {{ id: pluginModule.id, server: typeof pluginModule.server, setup: typeof pluginModule.setup, same: named.DotAgentDeckPlugin === pluginModule.server }};\nprocess.argv.push(\"serve\", \"--service\");\nconst cleanup = await pluginModule.setup(ctx);\nawait sleep(50);\nconsole.log(JSON.stringify(shape));\nif (subscribed || Object.keys(hooks.tool).length || Object.keys(hooks.session).length || typeof cleanup !== \"function\") process.exit(3);\nif (shape.id !== \"dot-agent-deck\" || shape.server !== \"function\" || shape.setup !== \"function\" || !shape.same) process.exit(4);\nprocess.exit(0);\n",
+                module = "\"./dot-agent-deck.mjs\""
+            ),
+            &[],
+        ) else {
+            return;
+        };
+        assert!(payloads.is_empty(), "{payloads:?}");
+    }
+
+    /// Scenario-level drive of 2.x `setup`: a session starts, the user's
+    /// prompt arrives through `session.hook("prompt")`, the turn starts, a
+    /// `shell` call runs and FAILS, a `read` call completes, a subagent's
+    /// child session works and stops, the assistant replies, and the turn goes
+    /// idle; a later turn fails on a provider quota and another is
+    /// interrupted; unloading flushes the session. The deck receives the same
+    /// `hook --agent opencode` payloads it gets from 1.x, with `shell`
+    /// reported as `bash`.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_setup_reports_the_1x_payload_vocabulary() {
+        let Some((payloads, _)) = run_v2_driver(
+            r#"await sleep(50);
+await emit("session.created", { sessionID: "s1", location: { directory: "/work" }, slug: "a", version: "2.2.5" });
+await hooks.session.prompt({ sessionID: "s1", messageID: "msg-1", prompt: { text: "  list the files  " }, delivery: "steer" });
+await emit("session.execution.started", { sessionID: "s1" });
+await hooks.tool["execute.before"]({ tool: "shell", sessionID: "s1", agent: "build", messageID: "a1", id: "call-1", input: { command: "ls -la" } });
+await hooks.tool["execute.after"]({ tool: "shell", sessionID: "s1", agent: "build", messageID: "a1", id: "call-1", input: { command: "ls -la" }, status: "error", error: { message: "exit 2" } });
+await hooks.tool["execute.before"]({ tool: "read", sessionID: "s1", agent: "build", messageID: "a1", id: "call-2", input: { path: "a.txt" } });
+await hooks.tool["execute.after"]({ tool: "read", sessionID: "s1", agent: "build", messageID: "a1", id: "call-2", input: { path: "a.txt" }, status: "completed", result: {} });
+await emit("session.created", { sessionID: "c1", parentID: "s1", location: { directory: "/work" }, slug: "b", version: "2.2.5" });
+await hooks.session.prompt({ sessionID: "c1", messageID: "msg-2", prompt: { text: "subagent task" }, delivery: "queue" });
+await emit("session.status", { sessionID: "c1", status: { type: "busy" } });
+await hooks.tool["execute.before"]({ tool: "grep", sessionID: "c1", agent: "explore", messageID: "a2", id: "call-3", input: { pattern: "x" } });
+await emit("session.idle", { sessionID: "c1" });
+await emit("session.text.ended", { sessionID: "s1", assistantMessageID: "a1", ordinal: 0, text: "Here are the files." });
+await emit("session.status", { sessionID: "s1", status: { type: "idle" } });
+await emit("session.execution.started", { sessionID: "s1" });
+await hooks.session["http.response"]({ sessionID: "s1", response: { ok: false, headers: new Map([["Retry-After", "30"], ["x-other", "no"]]) } });
+await emit("session.execution.failed", { sessionID: "s1", error: { type: "APIError", message: "You exceeded your quota", status: 429, response: { body: JSON.stringify({ error: { type: "usage_limit_reached", resets_at: 1790001000 } }) } } });
+await emit("session.execution.interrupted", { sessionID: "s1", reason: "user" });
+await cleanup();
+await sleep(50);"#,
+        ) else {
+            return;
+        };
+        let events: Vec<&str> = payloads
+            .iter()
+            .map(|p| p["event"].as_str().unwrap_or(""))
+            .collect();
+        let find = |event: &str| -> Vec<&serde_json::Value> {
+            payloads.iter().filter(|p| p["event"] == event).collect()
+        };
+        assert_eq!(
+            find("session.created")[0]["session_id"],
+            "s1",
+            "{payloads:#?}"
+        );
+        let prompts = find("session.prompt");
+        assert_eq!(
+            prompts.len(),
+            1,
+            "only the user's prompt, not the subagent's: {payloads:#?}"
+        );
+        assert_eq!(prompts[0]["prompt"], "list the files");
+        let busy = payloads
+            .iter()
+            .find(|p| p["event"] == "session.status" && p["status"] == "busy")
+            .expect("the turn's start reads as working");
+        assert_eq!(busy["session_id"], "s1");
+        let starts = find("tool.execute.before");
+        assert_eq!(
+            starts[0]["tool_name"], "bash",
+            "2.x `shell` is reported as `bash`"
+        );
+        assert_eq!(starts[0]["tool_input"]["command"], "ls -la");
+        assert_eq!(starts[0]["call_id"], "call-1");
+        assert_eq!(starts[1]["tool_name"], "read");
+        let ends = find("tool.execute.after");
+        assert_eq!(ends[0]["tool_name"], "bash", "the failed call still ends");
+        assert_eq!(ends[0]["call_id"], "call-1");
+        assert_eq!(ends[1]["call_id"], "call-2");
+        let start = &find("subagent.start")[0];
+        assert_eq!(
+            (&start["session_id"], &start["subagent_id"]),
+            (&"s1".into(), &"c1".into())
+        );
+        let child_tool = starts.iter().find(|p| p["call_id"] == "call-3").unwrap();
+        assert_eq!(child_tool["subagent_id"], "c1");
+        assert_eq!(find("subagent.stop")[0]["subagent_id"], "c1");
+        let idle = payloads
+            .iter()
+            .find(|p| p["event"] == "session.status" && p["status"] == "idle")
+            .unwrap();
+        assert_eq!(idle["reply"], "Here are the files.", "{payloads:#?}");
+        let errors = find("session.error");
+        assert_eq!(errors[0]["error_name"], "APIError");
+        assert_eq!(errors[0]["error_message"], "You exceeded your quota");
+        assert_eq!(
+            errors[0]["response_markers"]["error"]["type"],
+            "usage_limit_reached"
+        );
+        assert_eq!(
+            errors[0]["response_headers"],
+            serde_json::json!({"retry-after": "30"}),
+            "allow-listed headers from session.hook(\"http.response\")"
+        );
+        assert_eq!(
+            errors[1]["error_name"], "MessageAbortedError",
+            "an interrupted turn ends as 1.x's abort"
+        );
+        assert_eq!(
+            events.last(),
+            Some(&"session.deleted"),
+            "unloading flushes the session: {events:?}"
+        );
+    }
+
+    /// 2.x's `permission.asked` is held through `await-answer` like 1.x's,
+    /// with its properties given back their 1.x names so the deck's question
+    /// builder reads them; its `permission.replied` names the request. A
+    /// question form is reported plainly (2.x's server context has no form
+    /// reply) and cleared by its reply or cancellation.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_setup_reports_blocked_prompts_and_forms() {
+        let Some((payloads, awaits)) = run_v2_driver(
+            r#"await sleep(50);
+await emit("session.created", { sessionID: "s1", location: { directory: "/work" }, slug: "a", version: "2.2.5" });
+await emit("permission.asked", { id: "per-1", sessionID: "s1", action: "bash", resources: ["rm -rf build"], save: ["rm *"], metadata: { command: "rm -rf build" }, source: { type: "tool", messageID: "a1", id: "call-9" } });
+await awaited(1);
+await emit("permission.replied", { sessionID: "s1", requestID: "per-1", reply: "once" });
+await emit("form.created", { form: { id: "form-1", sessionID: "s1", title: "Which branch?", fields: [] } });
+await emit("form.replied", { id: "form-1", sessionID: "s1", answer: {} });
+await emit("form.created", { form: { id: "form-2", sessionID: "s1", title: "Proceed?", fields: [] } });
+await emit("form.cancelled", { id: "form-2", sessionID: "s1" });"#,
+        ) else {
+            return;
+        };
+        assert_eq!(awaits.len(), 1, "{awaits:?}");
+        let props = &awaits[0]["properties"];
+        assert_eq!(awaits[0]["event"], "permission.asked");
+        assert_eq!(awaits[0]["session_id"], "s1");
+        assert_eq!(props["id"], "per-1");
+        assert_eq!(props["permission"], "bash");
+        assert_eq!(props["patterns"], serde_json::json!(["rm -rf build"]));
+        assert_eq!(props["always"], serde_json::json!(["rm *"]));
+        assert_eq!(props["metadata"]["command"], "rm -rf build");
+        assert_eq!(props["tool"]["callID"], "call-9");
+        let question = crate::question::opencode_permission_asked(props, 0)
+            .expect("the deck builds its question from the renamed properties");
+        assert_eq!(question.id, "per-1");
+        let replied: Vec<_> = payloads
+            .iter()
+            .filter(|p| p["event"] == "permission.replied")
+            .collect();
+        assert_eq!(replied[0]["request_id"], "per-1");
+        let asked: Vec<_> = payloads
+            .iter()
+            .filter(|p| p["event"] == "question.asked")
+            .collect();
+        assert_eq!(asked.len(), 2, "{payloads:#?}");
+        assert_eq!(asked[0]["prompt"], "Which branch?");
+        assert!(
+            asked[0].get("properties").is_none(),
+            "a form is shown, not held"
+        );
+        let cleared: Vec<_> = payloads
+            .iter()
+            .filter(|p| p["event"] == "question.replied" || p["event"] == "question.rejected")
+            .map(|p| {
+                (
+                    p["event"].as_str().unwrap(),
+                    p["request_id"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            cleared,
+            vec![
+                ("question.replied", "form-1"),
+                ("question.rejected", "form-2")
+            ]
+        );
+    }
+
+    /// The deck's answer to a 2.x permission prompt goes back through 2.x's
+    /// own `permission.reply`, with the session the prompt came from, and its
+    /// outcome is acknowledged to `await-answer`.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_permission_answer_replies_through_the_permission_api() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let acks = dir.path().join("acks.jsonl");
+        let recorder = dir.path().join("recorder.sh");
+        crate::test_isolation::write_script(
+            &recorder,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"await-answer\" ]; then\n  IFS= read -r input\n  printf '%s\\n' '{{\"kind\":\"permission\",\"request_id\":\"per-1\",\"body\":{{\"reply\":\"always\"}}}}'\n  IFS= read -r ack\n  printf '%s\\n' \"$ack\" >> '{acks}'\nfi\ncat > /dev/null\nexit 0\n",
+                acks = acks.display(),
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let plugin = dir.path().join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                "import pluginModule from {plugin};\n{FAKE_V2_CTX_JS}\ndelete process.env.DOT_AGENT_DECK_PANE_ID;\nprocess.argv.push(\"serve\", \"--stdio\");\nawait pluginModule.setup(ctx);\nawait sleep(50);\nawait emit(\"permission.asked\", {{ id: \"per-1\", sessionID: \"s1\", action: \"bash\", resources: [\"ls\"], save: [\"ls\"] }});\nfor (let n = 0; n < 200 && !replies.length; n++) await sleep(20);\nawait sleep(200);\nconsole.log(JSON.stringify(replies));\nprocess.exit(0);\n",
+                plugin = serde_json::to_string(&plugin.display().to_string()).unwrap(),
+            ),
+        )
+        .unwrap();
+        let out = std::process::Command::new("node")
+            .arg(&driver)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let replies: serde_json::Value =
+            serde_json::from_str(stdout.lines().last().unwrap_or("null")).unwrap();
+        assert_eq!(
+            replies,
+            serde_json::json!([{"sessionID": "s1", "requestID": "per-1", "decision": "always"}])
+        );
+        let ack = std::fs::read_to_string(&acks).unwrap_or_default();
+        assert!(ack.contains("\"delivered\":true"), "{ack}");
+    }
+
+    /// PRD #1858 on 2.x: each step's counts (`session.step.ended`) and model
+    /// (`session.step.started`) are written to the deck's usage file as one
+    /// assistant message's usage line, the message's steps summed and its
+    /// cost added up across them.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_setup_writes_step_usage() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = crate::test_temp::tempdir().unwrap();
+        let usage = dir.path().join("usage.jsonl");
+        std::fs::write(&usage, b"").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&usage, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let recorder = dir.path().join("recorder.sh");
+        crate::test_isolation::write_script(&recorder, b"#!/bin/sh\ncat > /dev/null\nexit 0\n")
+            .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let plugin = dir.path().join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                "import pluginModule from {plugin};\n{FAKE_V2_CTX_JS}\ndelete process.env.DOT_AGENT_DECK_PANE_ID;\nprocess.argv.push(\"serve\", \"--stdio\");\nawait pluginModule.setup(ctx);\nawait sleep(50);\nconst tokens = (i, o) => ({{ input: i, output: o, reasoning: 1, cache: {{ read: 2, write: 0 }} }});\nawait emit(\"session.created\", {{ sessionID: \"s1\", location: {{ directory: \"/work\" }}, slug: \"a\", version: \"2.2.5\" }});\nawait emit(\"session.step.started\", {{ sessionID: \"s1\", assistantMessageID: \"a1\", agent: \"build\", model: {{ id: \"claude-haiku-4-5\", providerID: \"anthropic\" }}, started: 1 }});\nawait emit(\"session.step.ended\", {{ sessionID: \"s1\", assistantMessageID: \"a1\", finish: \"tool-calls\", cost: 0.25, tokens: tokens(10, 5) }});\nawait emit(\"session.step.ended\", {{ sessionID: \"s1\", assistantMessageID: \"a1\", finish: \"stop\", cost: 0.5, tokens: tokens(20, 7) }});\nprocess.exit(0);\n",
+                plugin = serde_json::to_string(&plugin.display().to_string()).unwrap(),
+            ),
+        )
+        .unwrap();
+        let out = std::process::Command::new("node")
+            .arg(&driver)
+            .env("DOT_AGENT_DECK_USAGE_FILE", &usage)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let text = std::fs::read_to_string(&usage).unwrap();
+        let last: serde_json::Value =
+            serde_json::from_str(text.lines().last().expect("a usage line")).unwrap();
+        assert_eq!(last["id"], "a1", "{text}");
+        assert_eq!(last["model"], "claude-haiku-4-5");
+        assert_eq!(last["input"], 30, "the steps' counts are summed: {text}");
+        assert_eq!(last["output"], 14, "output includes reasoning: {text}");
+        assert_eq!(last["cache_read"], 4);
+        assert_eq!(last["cost_usd"], 0.75);
+        assert_eq!(last["stop"], "stop");
+    }
+
+    /// Under `opencode mini` (2.x loads no TUI plugin there, measured on
+    /// 2.2.5), the server plugin is the deck's receiver: a message the deck
+    /// hands over starts in mini's session through `session.prompt`, and the
+    /// inbox item that call returns is committed when OpenCode delivers it.
+    /// Which client the server serves is read from its parent's argv, here a
+    /// shell named `opencode mini`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opencode_v2_mini_delivers_through_session_prompt() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (recorder, controls) = inbox_recorder(dir.path());
+        let plugin = dir.path().join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                "import pluginModule from {plugin};\n{FAKE_V2_CTX_JS}\nprocess.argv.push(\"serve\", \"--stdio\");\nconst cleanup = await pluginModule.setup(ctx);\nawait sleep(50);\nawait emit(\"session.created\", {{ sessionID: \"s1\", location: {{ directory: \"/work\" }}, slug: \"a\", version: \"2.2.5\" }});\nfor (let n = 0; n < 150 && !prompts.length; n++) await sleep(20);\nawait sleep(100);\nawait emit(\"session.inbox.delivered\", {{ sessionID: \"s1\", inboxID: \"inbox-1\" }});\nawait sleep(300);\nawait cleanup();\nconsole.log(JSON.stringify({{ prompts }}));\nprocess.exit(0);\n",
+                plugin = serde_json::to_string(&plugin.display().to_string()).unwrap(),
+            ),
+        )
+        .unwrap();
+        // The server's parent: a shell whose argv is `opencode mini`.
+        std::fs::write(
+            dir.path().join("mini"),
+            format!("node '{}'\n", driver.display()),
+        )
+        .unwrap();
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg("exec -a opencode sh mini")
+            .current_dir(dir.path())
+            .envs(crate::test_isolation::unreachable_endpoints())
+            .env("DOT_AGENT_DECK_PANE_ID", "pane-1")
+            .env("DOT_AGENT_DECK_PANE_CAPABILITY", "a".repeat(64))
+            .env("DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS", "3600000")
+            .output()
+            .expect("run node");
+        assert!(out.status.success(), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let result: serde_json::Value =
+            serde_json::from_str(stdout.lines().last().unwrap_or("null")).unwrap();
+        let prompts = result["prompts"].as_array().cloned().unwrap_or_default();
+        assert_eq!(prompts.len(), 1, "{result}");
+        assert_eq!(prompts[0]["sessionID"], "s1");
+        let text = prompts[0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("[dot-agent-deck message m-k3xzq2ab-0f3c9a71d2e4b850"),
+            "the deck's framed message: {text}"
+        );
+        let written = std::fs::read_to_string(&controls).unwrap_or_default();
+        assert!(written.contains("\"handed\""), "{written}");
+        assert!(
+            written.contains("\"committed\""),
+            "delivered, so committed: {written}"
+        );
+        assert!(
+            !written.contains("call inbox announce"),
+            "mini is the receiver itself, it does not announce: {written}"
+        );
+    }
+
+    /// OpenCode 2.x's TUI half, driven with a fake 2.x TUI API: a message the
+    /// deck hands over while a subagent's session is on screen waits for the
+    /// open dialog to close, then starts in that session's root (shown
+    /// first) through `client.session.prompt`, and is committed when OpenCode
+    /// delivers the inbox item that call returned.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_tui_delivers_to_the_root_and_commits_on_delivery() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (recorder, controls) = inbox_recorder(dir.path());
+        let plugin = dir.path().join("tui.mjs");
+        std::fs::write(&plugin, tui_v2_template(&recorder.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                r#"const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const prompts = [];
+const navigations = [];
+const handlers = new Map();
+let mode = "dialog";
+let route = {{ type: "session", sessionID: "child" }};
+const sessions = {{ child: {{ id: "child", parentID: "rootA" }}, rootA: {{ id: "rootA" }} }};
+const api = {{
+  data: {{
+    session: {{ get: (id) => sessions[id] }},
+    on: (type, fn) => {{ handlers.set(type, fn); return () => handlers.delete(type); }},
+  }},
+  keymap: {{ mode: {{ current: () => mode }} }},
+  ui: {{ router: {{
+    current: () => route,
+    navigate: (to) => {{ navigations.push(to.sessionID); route = to; }},
+  }} }},
+  client: {{ session: {{
+    create: async () => ({{ id: "fresh" }}),
+    prompt: async (input) => {{ prompts.push(input); return {{ id: "inbox-1", sessionID: input.sessionID, type: "user" }}; }},
+  }} }},
+}};
+const {{ default: mod }} = await import("{plugin}");
+if (mod.id !== "dot-agent-deck-tui" || typeof mod.setup !== "function") process.exit(5);
+const cleanup = await mod.setup(api);
+await sleep(500);
+const heldByDialog = prompts.length === 0;
+mode = "base";
+for (let n = 0; n < 150 && !prompts.length; n++) await sleep(20);
+handlers.get("session.inbox.delivered")?.({{ type: "session.inbox.delivered", data: {{ sessionID: "rootA", inboxID: "inbox-1" }} }});
+await sleep(300);
+cleanup?.();
+console.log(JSON.stringify({{ heldByDialog, prompts, navigations }}));
+process.exit(0);
+"#,
+                plugin = plugin.display()
+            ),
+        )
+        .unwrap();
+        let result = run_inbox_driver(&driver);
+        assert_eq!(result["heldByDialog"], true, "{result}");
+        assert_eq!(
+            result["navigations"],
+            serde_json::json!(["rootA"]),
+            "{result}"
+        );
+        let prompts = result["prompts"].as_array().cloned().unwrap_or_default();
+        assert_eq!(prompts.len(), 1, "{result}");
+        assert_eq!(prompts[0]["sessionID"], "rootA");
+        assert!(
+            prompts[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("m-k3xzq2ab-0f3c9a71d2e4b850")
+        );
+        let written = std::fs::read_to_string(&controls).unwrap_or_default();
+        assert!(written.contains("\"handed\""), "{written}");
+        assert!(written.contains("\"committed\""), "{written}");
+    }
+
+    /// The event stream real OpenCode 2.2.5 sends (measured with `opencode
+    /// run --standalone`): no `session.created`, no `session.status`, no
+    /// `session.idle`; a turn is `session.execution.started` … `succeeded`.
+    /// The deck still gets the session, the prompt, working, and the turn's
+    /// end with its reply; and a subagent's session, known only by asking
+    /// `session.get`, is reported as the subagent's, its prompt not as the
+    /// user's.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_setup_reads_turns_from_execution_events() {
+        let Some((payloads, _)) = run_v2_driver(
+            r#"parents.c9 = "s1";
+await sleep(50);
+await hooks.session.prompt({ sessionID: "s1", messageID: "msg-1", prompt: { text: "Reply with exactly PONG." }, delivery: "steer" });
+await emit("session.inbox.enqueued", { sessionID: "s1", inboxID: "msg-1", item: { type: "user", payload: { text: "Reply with exactly PONG." }, delivery: "steer" } });
+await emit("session.execution.started", { sessionID: "s1" });
+await emit("session.inbox.delivered", { sessionID: "s1", inboxID: "msg-1" });
+await hooks.session.prompt({ sessionID: "c9", messageID: "msg-2", prompt: { text: "explore the repo" }, delivery: "steer" });
+await emit("session.execution.started", { sessionID: "c9" });
+await emit("session.execution.succeeded", { sessionID: "c9" });
+await emit("session.step.started", { sessionID: "s1", assistantMessageID: "a1", agent: "build", model: { id: "big-pickle", providerID: "opencode" }, started: 1 });
+await emit("session.text.ended", { sessionID: "s1", assistantMessageID: "a1", ordinal: 0, text: "PONG" });
+await emit("session.step.ended", { sessionID: "s1", assistantMessageID: "a1", finish: "stop", cost: 0, tokens: { input: 82, output: 3, reasoning: 0, cache: { read: 5914, write: 0 } } });
+await emit("session.execution.succeeded", { sessionID: "s1" });
+await emit("session.idle", { sessionID: "s1" });
+await emit("location.shutdown", {});"#,
+        ) else {
+            return;
+        };
+        let events: Vec<(String, String)> = payloads
+            .iter()
+            .map(|p| {
+                (
+                    p["event"].as_str().unwrap_or("").to_string(),
+                    p["status"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(payloads[0]["event"], "session.created", "{events:?}");
+        let prompts: Vec<_> = payloads
+            .iter()
+            .filter(|p| p["event"] == "session.prompt")
+            .collect();
+        assert_eq!(
+            prompts.len(),
+            1,
+            "the subagent's prompt is not the user's: {events:?}"
+        );
+        assert_eq!(prompts[0]["prompt"], "Reply with exactly PONG.");
+        let start = payloads
+            .iter()
+            .find(|p| p["event"] == "subagent.start")
+            .expect("subagent start");
+        assert_eq!(
+            (&start["session_id"], &start["subagent_id"]),
+            (&"s1".into(), &"c9".into())
+        );
+        assert!(
+            payloads
+                .iter()
+                .any(|p| p["event"] == "subagent.stop" && p["subagent_id"] == "c9")
+        );
+        let idles: Vec<_> = payloads
+            .iter()
+            .filter(|p| {
+                p["session_id"] == "s1" && (p["status"] == "idle" || p["event"] == "session.idle")
+            })
+            .collect();
+        assert_eq!(
+            idles[0]["reply"], "PONG",
+            "the turn's end carries its reply: {events:?}"
+        );
+        assert!(
+            idles.iter().skip(1).all(|p| p.get("reply").is_none()),
+            "the reply is sent once: {events:?}"
+        );
+        assert!(
+            payloads.iter().any(|p| p["event"] == "session.status"
+                && p["status"] == "busy"
+                && p["session_id"] == "s1"),
+            "{events:?}"
+        );
+        assert_eq!(
+            events.last().map(|e| e.0.as_str()),
+            Some("session.deleted"),
+            "{events:?}"
         );
     }
 }
