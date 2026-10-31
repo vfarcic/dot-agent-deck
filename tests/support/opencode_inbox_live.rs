@@ -30,18 +30,14 @@ pub struct OpenCode {
     observer: Option<std::thread::JoinHandle<()>>,
 }
 
+/// The binary `DOT_AGENT_DECK_OPENCODE_TEST_BIN` picks answers `--version`
+/// (PRD #2050: the same binary, and so the same major version, every command
+/// line below is built for).
 pub fn available() -> Result<(), String> {
     common::install_credential_redaction();
-    let result = Command::new("opencode")
-        .arg("--version")
-        .current_dir(std::env::temp_dir())
-        .output()
-        .map_err(|e| format!("OpenCode unavailable: {e}"))?;
-    if result.status.success() {
-        Ok(())
-    } else {
-        Err("OpenCode --version failed".into())
-    }
+    common::opencode_test_version()
+        .map(|_| ())
+        .map_err(|e| format!("OpenCode unavailable: {e}"))
 }
 
 impl OpenCode {
@@ -74,11 +70,11 @@ impl OpenCode {
         {
             std::fs::copy(common::contained_deck_binary(), &installed).unwrap();
         }
-        let path = format!(
+        let path = common::path_with_opencode_test_bin(&format!(
             "{}:{}",
             installed.parent().unwrap().display(),
             std::env::var("PATH").unwrap()
-        );
+        ));
         let mut install = Self::command(&deck, "dot-agent-deck");
         install.args(["hooks", "install", "--agent", "opencode"]);
         let output = install.output().unwrap();
@@ -89,6 +85,26 @@ impl OpenCode {
         }
         // Observe the actual route and expose navigation for the child-view
         // precondition. This fixture neither delivers nor acknowledges tasks.
+        // OpenCode 2.x loads a TUI plugin only from `plugins/<name>/tui.js`
+        // exporting `{ id, setup }`, and names routes `{type, sessionID}`; the
+        // observer maps that back to 1.x's `{name, params}` so every reader of
+        // the route file stays version-blind (PRD #2050).
+        if common::opencode_test_is_v2() {
+            let dir = root.join("plugins/deck-test-route");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("tui.js"), r#"import {readFileSync,writeFileSync,renameSync,unlinkSync} from 'node:fs';
+export default {id:'deck-test-route',setup:async(api)=>{
+ const base=process.env.DECK_TEST_ROUTE;
+ const timer=setInterval(()=>{try{
+  const r=api.ui.router.current();
+  const route=r.type==='session'?{name:'session',params:{sessionID:r.sessionID}}:{name:r.type,params:r.data??{}};
+  writeFileSync(base+'.tmp',JSON.stringify({route,pid:process.pid}));renameSync(base+'.tmp',base);
+  try {const id=readFileSync(base+'.navigate','utf8');unlinkSync(base+'.navigate');api.ui.router.navigate({type:'session',sessionID:id});}catch{}
+ }catch{}},100);
+ return ()=>clearInterval(timer);
+}};
+"#).unwrap();
+        }
         let observer = root.join("test-route-observer.js");
         std::fs::write(&observer, r#"import {readFileSync,writeFileSync,renameSync,unlinkSync} from 'node:fs';
 export default {id:'deck-test-route',tui:async(api)=>{
@@ -113,14 +129,10 @@ export default {id:'deck-test-route',tui:async(api)=>{
         std::fs::write(config_path, config.to_string()).unwrap();
         for _ in 0..older {
             let output = Self::command(&deck, "timeout")
-                .args([
-                    "120",
-                    "opencode",
-                    "run",
-                    "--model",
-                    common::opencode_test_model(),
+                .args(["120", "opencode"])
+                .args(common::opencode_run_args(
                     "Reply with only the number equal to 800 plus 31. Do not use tools.",
-                ])
+                ))
                 .output()
                 .unwrap();
             assert!(
@@ -145,11 +157,7 @@ export default {id:'deck-test-route',tui:async(api)=>{
             deck.workdir().into(),
             work.clone(),
         );
-        let command = format!(
-            "opencode --model {} --auto {}",
-            common::opencode_test_model(),
-            if mini { "--mini" } else { "" }
-        );
+        let command = common::opencode_interactive_command(mini, true, "");
         let command = if launcher {
             let script = work.join("run-worker.sh");
             std::fs::write(&script, format!("#!/bin/sh\nexec {command}\n")).unwrap();
@@ -304,11 +312,11 @@ export default {id:'deck-test-route',tui:async(api)=>{
             .env("HOME", deck.home_dir())
             .env(
                 "PATH",
-                format!(
+                common::path_with_opencode_test_bin(&format!(
                     "{}:{}",
                     deck.home_dir().join(".local/bin").display(),
                     std::env::var("PATH").unwrap()
-                ),
+                )),
             )
             .env("XDG_CONFIG_HOME", deck.home_dir().join(".config"))
             .env("XDG_DATA_HOME", deck.home_dir().join(".local/share"))
@@ -855,14 +863,24 @@ export default {id:'deck-test-route',tui:async(api)=>{
             .unwrap_or(Value::Null)
     }
     pub fn transcript(&self) -> Value {
+        // OpenCode 1.x keeps `session`/`message`/`part`; 2.x has none of them
+        // and keeps `session_v2`/`session_message`/`session_part` instead
+        // (measured on 2.2.5, PRD #2050). A table this version lacks is left
+        // out rather than failing, because `evidence()` reads this on every
+        // failure and a panic here would hide the assertion that failed. The
+        // readers of the 1.x keys still find nothing on 2.x until ported.
         let script = r#"import json,sqlite3,sys
 c=sqlite3.connect(sys.argv[1]);c.row_factory=sqlite3.Row
 out={}
-for table in ('session','message','part'):
+have={r[0] for r in c.execute("select name from sqlite_master where type='table'")}
+for table in ('session','message','part','session_v2','session_message','session_part'):
+ if table not in have: continue
  rows=[]
  for row in c.execute('select * from '+table):
   r=dict(row)
-  if 'data' in r:r['data']=json.loads(r['data'])
+  if isinstance(r.get('data'),str):
+   try:r['data']=json.loads(r['data'])
+   except ValueError:pass
   rows.append(r)
  out[table]=rows
 print(json.dumps(out))

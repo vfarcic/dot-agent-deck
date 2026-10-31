@@ -560,7 +560,7 @@ fn telemetry_otlp_007_real_opencode_telemetry_joins_deck_run() {
         .with_env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json")
         .with_continue_session(
             "telemetry-opencode-mini",
-            format!("opencode --model {} --auto", common::opencode_test_model()),
+            common::opencode_interactive_command(false, true, ""),
         )
         .launch_with_fixture("minimal");
     const SENTINEL: &str = "telemetry_opencode_sentinel_7c31.txt";

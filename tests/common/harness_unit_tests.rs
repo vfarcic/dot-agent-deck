@@ -2802,9 +2802,26 @@ fn match_prefix_then_terminal_reports_incomplete_prefix() {
     assert!(!terminal);
 }
 
+/// Scenario: Feed the version parser what OpenCode 2.x and 1.x print for
+/// `--version`, plus noise. Both real shapes parse to their numbers and
+/// anything that is not a version is refused.
+#[test]
+fn opencode_version_parser_reads_both_majors_and_refuses_noise() {
+    assert_eq!(parse_opencode_version("opencode v2.2.5\n"), Some((2, 2, 5)));
+    assert_eq!(parse_opencode_version("1.18.35\n"), Some((1, 18, 35)));
+    assert_eq!(
+        parse_opencode_version("\n v2.10.0-beta.1"),
+        Some((2, 10, 0))
+    );
+    assert_eq!(parse_opencode_version(""), None);
+    assert_eq!(parse_opencode_version("opencode"), None);
+    assert_eq!(parse_opencode_version("ERROR Unrecognized flag"), None);
+}
+
 /// Scenario: Import a synthetic OpenCode auth file while a hostile host config
-/// sits beside it. Only auth is copied, a minimal isolated config is created,
-/// and the imported token is registered for recording redaction.
+/// sits beside it. Only auth is copied, a minimal isolated config naming only
+/// the test model is created, and the imported token is registered for
+/// recording redaction.
 #[test]
 fn opencode_import_is_auth_only_and_synthesizes_minimal_config() {
     let source = race_safe_tempdir();
@@ -2833,7 +2850,7 @@ fn opencode_import_is_auth_only_and_synthesizes_minimal_config() {
     );
     assert_eq!(
         std::fs::read_to_string(target.path().join(".config/opencode/opencode.json")).unwrap(),
-        MINIMAL_OPENCODE_CONFIG
+        minimal_opencode_config()
     );
     assert!(
         !target

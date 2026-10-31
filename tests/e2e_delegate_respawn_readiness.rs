@@ -374,7 +374,14 @@ fn delegate_046_real_opencode_consumes_boot_queued_task_in_place() {
     skip_unless!(opencode_live::available());
     let mut op = opencode_live::OpenCode::with_clear(false, 0, true, true, true);
     let script = op.work.join("run-worker.sh");
-    std::fs::write(&script, format!("#!/bin/sh\nwhile [ ! -f boot-release ]; do sleep 0.1; done\nexec opencode --model {} --auto\n", common::opencode_test_model())).unwrap();
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nwhile [ ! -f boot-release ]; do sleep 0.1; done\nexec {}\n",
+            common::opencode_interactive_command(false, true, "")
+        ),
+    )
+    .unwrap();
     let name = "opencode-boot-6d3e9a.txt";
     let body = format!(
         "Use the shell to run exactly: printf '{}' >> '{}'. Then reply DONE-{name} and end your turn.",

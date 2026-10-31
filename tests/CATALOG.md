@@ -3094,6 +3094,27 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** a plugin folder the deck cannot write, and the card notice that follows (`inbox/boundary/025`); a plugin pinned to another live install, which is kept (`inbox/boundary/025`); the plugin template's integration level (`inbox/boundary/025`); the daemon's startup install (`hooks/install/009`); Claude Code's hooks, which the daemon installs only when it starts (decision on issue #190); a real OpenCode.
 - **Platform coverage:** mac+linux.
 
+##### hooks/install/025 — An OpenCode 2.x agent starts with the deck's 2.x layout and `--standalone` (PRD #2050).
+- **Layer:** L2 headless e2e, lane 1 (`tests/e2e_daemon_plugin_refresh.rs`), the real `daemon serve` with both OpenCode roots (`~/.config/opencode`, `~/.opencode`) created after it started, so only the per-spawn install writes anything.
+- **Agent:** none; a stand-in `opencode`, first on the daemon's `PATH` and run as a scheduled task's command through `RunNow`, answers `--version` with `opencode v2.2.5` and records its argv and which deck artifacts exist the moment it starts.
+- **Asserts:** the server module is in the global root only (`~/.config/opencode/plugin/dot-agent-deck.js`), with none in `~/.opencode/plugin/`, where 2.x would fail a second copy with `Duplicate plugin ID`; the 2.x TUI half is at `~/.config/opencode/plugins/dot-agent-deck-tui/tui.js`; under Node the server module default-exports `{ id: "dot-agent-deck", server, setup }` and the TUI half `{ id, setup }`; the agent's argv carries `--standalone` exactly once.
+- **Does not assert:** that a real OpenCode 2.x loads either module (`inbox/opencode/060`); delivery through them (`inbox/opencode/059`); a wrapper command the deck cannot see into; the startup and `hooks install` detection paths.
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/026 — An OpenCode 1.x agent keeps today's layout and gets no `--standalone` (PRD #2050).
+- **Layer:** as `hooks/install/025`.
+- **Agent:** the same stand-in, answering `--version` with `1.18.35`.
+- **Asserts:** the server module is in both roots and, imported under Node, has a shape OpenCode 1.x loads (a default-exported function, as before PRD #2050, or `{ id, server }`, as the dual-shape module has); there is no 2.x TUI half; the agent's argv carries no `--standalone`. Green before PRD #2050's production change: it guards that the 1.x path stays as it is.
+- **Does not assert:** the 1.x TUI half (`dot-agent-deck-tui.js` and its `tui.json` entry), which the per-spawn install does not own; a real OpenCode 1.x.
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/027 — Switching OpenCode between 1.x and 2.x repairs the layout on the next spawn (PRD #2050).
+- **Layer:** as `hooks/install/025`, three scheduled tasks fired in turn.
+- **Agent:** the same stand-in, replaced by a new file between spawns (1.x, then 2.x, then 1.x), as an installer replaces the binary, so a version cache keyed on the file sees each change.
+- **Asserts:** each agent starts with its own version's layout as `hooks/install/025`/`026` define it: the upgrade removes the legacy-root copy and adds the 2.x TUI half and `--standalone`; the downgrade restores the server module in both roots and removes the 2.x TUI half and `--standalone`.
+- **Does not assert:** an in-place rewrite of the binary that keeps size, mtime and inode; a version change between two spawns of the same running agent.
+- **Platform coverage:** mac+linux.
+
 #### hooks/stale
 
 ##### hooks/stale/001 — The notice names the agents, binary, versions and remedy, keeping the agents and both versions at 60 columns.
@@ -12452,6 +12473,13 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** real cancellation behaviour; the budget once both automatic repeats are spent (inbox/attempts/040).
 - **Cost:** none.
 
+##### inbox/opencode/059 — An OpenCode 2.x pane receives an inbox message through the installed 2.x plugin (PRD #2050).
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`), real `hooks install --agent opencode` with a stand-in `opencode` answering `opencode v2.2.5` first on `PATH`, then a real daemon pane.
+- **Agent:** `tests/fixtures/opencode-inbox/api-v2.mjs`, a fake OpenCode 2.x host loading the installed server module's `setup(ctx)` and the installed 2.x TUI half's `setup(api)` in one process, with the context shapes of OpenCode 2.2.5's declarations (`ctx.event.subscribe`, `session.prompt` resolving to the queued inbox item, `api.data.on`, `api.ui.router`); events are 2.x's `{ type, data }`; any member it does not implement is logged as `unimplemented` rather than throwing.
+- **Asserts:** both halves set up; the pane arms; one posted message is prompted once into the shown session, framed, through the 2.x session API (either half may send it); after the host runs that turn to idle the message reads acknowledged and is not prompted again; the composer is never touched.
+- **Does not assert:** that the fake matches every behaviour of a real 2.x host (`inbox/opencode/060` runs one); the acknowledgement path (`ack_how`); `mini`, busy queues, doorbell interception, child sessions and every other 1.x inbox case, which have no 2.x twin yet.
+- **Cost:** none.
+
 ##### inbox/opencode/007 — The server inbox arms only for main-thread mini launches.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_opencode.rs`)
 - **Agent:** generated server plugin under mini, full-TUI, run, serve and attach argv.
@@ -12563,6 +12591,13 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Agent:** interactive OpenCode 1.18.35, Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
 - **Asserts:** An explicitly cancellable request reaches Thinking with a real running `bash` `sleep 30` call visible in both views before one logical Esc, 300 ms, Esc interrupt produces a genuine Idle and settled empty composer; no deck TUI watcher, genuine doorbell, server-plugin fetch bound to its doorbell-only receiver, ID-correlated frame and assembled execution token visible in both views, sentinel, `plugin_confirmed` / one delivery and a delivered card; interception before the model, with no model-side inbox fetch, restarted `sleep 30` or completion reply marker requested by the priming prompt through observed execution.
 - **Does not assert:** Cancellation of arbitrary earlier requests: this proves delivery and execution after an explicitly cancellable request; the deck does not cancel arbitrary earlier requests. Also excludes a completed natural-language final reply, future model behavior after execution, remote attach or non-TUI OpenCode commands.
+- **Cost:** cheap real-agent turns, sequential locally with strict preflight.
+
+##### inbox/opencode/060 — Real interactive OpenCode 2.x shows status and tool detail on its card and runs a delegate. [reel]
+- **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_inbox_opencode_live.rs`), through `tests/support/opencode_inbox_live.rs`.
+- **Agent:** interactive OpenCode 2.x (`opencode --standalone --auto`, the model from the scratch HOME's `opencode.json`), `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins. Skips unless `DOT_AGENT_DECK_OPENCODE_TEST_BIN` (or the `opencode` on `PATH`) is 2.x.
+- **Asserts:** a typed prompt that writes a uniquely named sentinel with the shell turns the card Working, arrives as an OpenCode prompt event and a ToolStart whose detail names the sentinel, shows that detail on the card, writes the sentinel, and ends in an Idle event with the card reading Idle and still showing the prompt; then a genuine orchestrator delegate is acted on (a second sentinel), reads acknowledged, and the card settles Idle.
+- **Does not assert:** Blocked, question forms, `mini`, busy queues, telemetry operations, or the desktop app's rendering of the same card.
 - **Cost:** cheap real-agent turns, sequential locally with strict preflight.
 
 #### inbox/pi

@@ -303,12 +303,20 @@ fn question_live_005_opencode_permission_and_multiselect_reply() {
     skip_unless!(common::check_opencode_available());
     let config = common::harness_tempdir().unwrap();
     let settings = config.path().join("opencode.json");
+    // PRD #2050: the model rides in the config too, because OpenCode 2.x's
+    // top-level `opencode` takes no `--model`
+    // (`common::opencode_interactive_command`).
     std::fs::write(
         &settings,
-        r#"{"$schema":"https://opencode.ai/config.json","permission":{"bash":"ask"}}"#,
+        serde_json::json!({
+            "$schema": "https://opencode.ai/config.json",
+            "model": common::opencode_test_model(),
+            "permission": {"bash": "ask"},
+        })
+        .to_string(),
     )
     .unwrap();
-    let command = format!("opencode --model {}", quote(common::opencode_test_model()));
+    let command = common::opencode_interactive_command(false, false, "");
     let deck = TuiDeck::builder()
         .with_pty_size(200, 50)
         .with_env("PATH", path())
