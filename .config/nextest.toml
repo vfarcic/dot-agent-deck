@@ -286,6 +286,15 @@ slow-timeout = { period = "60s", terminate-after = 7 }
 filter = 'binary(e2e_inbox_opencode_live)'
 slow-timeout = { period = "60s", terminate-after = 6 }
 
+# PRD #1666 part 3: `tests/e2e_inbox_load.rs` gives each real agent an absolute
+# window (240s native, 300s Codex) under CPU pressure and asks for a timeout
+# above 360s. `load_002` (OpenCode) was killed at the default 3 x 60s with its
+# work done (it passed in 298.66s when run alone, 2026-10-31). Binary-wide, as
+# the file asks, so the other three load scenarios get the same window.
+[[profile.default.overrides]]
+filter = 'binary(e2e_inbox_load)'
+slow-timeout = { period = "60s", terminate-after = 7 }
+
 # Issue #1094: the real-Claude `pane restart` / `pane spawn` tests boot up to
 # two interactive Claude generations and run one delegated turn in sequential
 # waits whose own bounds, the harness's fixed 30s ones included, sum to about
