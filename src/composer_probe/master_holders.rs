@@ -197,8 +197,16 @@ fn parse_tty_index(text: &str) -> Option<u32> {
 
 /// The names in a directory, every entry error kept.
 fn names(dir: &str) -> io::Result<Vec<String>> {
-    std::fs::read_dir(dir)?
-        .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+    entry_names(std::fs::read_dir(dir)?.map(|entry| entry.map(|e| e.file_name())))
+}
+
+/// [`names`]'s collector: the first entry error is the result, even after
+/// entries that were read.
+fn entry_names(
+    entries: impl Iterator<Item = io::Result<std::ffi::OsString>>,
+) -> io::Result<Vec<String>> {
+    entries
+        .map(|name| Ok(name?.to_string_lossy().into_owned()))
         .collect()
 }
 
@@ -454,6 +462,17 @@ mod tests {
         child
     }
 
+    /// A child killed and reaped when the test ends, a failed assertion
+    /// included, so a RED run leaves no fixture process behind.
+    struct Reaped(std::process::Child);
+
+    impl Drop for Reaped {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     fn sleeper(fd: RawFd) -> std::process::Child {
         inheritor(fd, std::process::Command::new("sleep").arg("30"))
     }
@@ -522,6 +541,14 @@ mod tests {
             eprintln!("SKIP: python3 is not available");
             return;
         }
+        // The script's raw `exit` syscall number is known for these two.
+        if !matches!(std::env::consts::ARCH, "x86_64" | "aarch64") {
+            eprintln!(
+                "SKIP: no exit syscall number for {}",
+                std::env::consts::ARCH
+            );
+            return;
+        }
         let since = boot_ticks().unwrap();
         let (master, _slave) = openpty();
         let id = master_id(master.as_raw_fd()).unwrap();
@@ -530,18 +557,54 @@ mod tests {
             time.sleep(0.2)\n\
             nr = {'x86_64': 60, 'aarch64': 93}[os.uname().machine]\n\
             ctypes.CDLL(None).syscall(nr, 0)\n";
-        let mut child = inheritor(
+        let child = Reaped(inheritor(
             master.as_raw_fd(),
             std::process::Command::new("python3").args(["-c", script]),
-        );
-        let pid = child.id();
+        ));
+        let pid = child.0.id();
         until("the leader to be a zombie with its sibling alive", || {
             Proc.stat(Task { pid, tid: pid }).is_ok_and(|s| s.ending)
                 && Proc.tasks(pid).is_ok_and(|t| t.len() >= 2)
         });
         assert_eq!(real_scan(&id, since, &[pid]), Holders::Other(pid));
-        child.kill().unwrap();
-        child.wait().unwrap();
+    }
+
+    /// The collector every real `/proc` listing goes through keeps an entry
+    /// error that follows entries it read (Q35-20a fix review, U3): a
+    /// dropped one would list a partial table as the whole.
+    #[test]
+    fn a_directory_entry_error_after_read_entries_is_the_listing() {
+        let entries = |rest: io::Result<std::ffi::OsString>| {
+            [Ok("1".into()), rest, Ok("3".into())].into_iter()
+        };
+        assert_eq!(
+            entry_names(entries(Ok("2".into()))).unwrap(),
+            ["1", "2", "3"]
+        );
+        let error = entry_names(entries(Err(io::Error::from_raw_os_error(libc::EIO)))).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    }
+
+    /// `fdinfo` text the kernel writes for a `ptmx` descriptor, and text it
+    /// doesn't: an absent or malformed `tty-index` is `None`, which a
+    /// matching descriptor reads as Unknown, never as an index.
+    #[test]
+    fn fdinfo_reads_its_tty_index_and_nothing_else() {
+        let fdinfo = |index: &str| format!("pos:\t0\nflags:\t02\nmnt_id:\t30\nino:\t7\n{index}");
+        assert_eq!(parse_tty_index(&fdinfo("tty-index:\t5\n")), Some(5));
+        assert_eq!(parse_tty_index(&fdinfo("tty-index:\t12")), Some(12));
+        for malformed in [
+            "",
+            "tty-index:\n",
+            "tty-index:\t\n",
+            "tty-index:\tx\n",
+            "tty-index:\t-1\n",
+            "tty-index:\t5x\n",
+            "tty-index:\t4294967296\n",
+            "tty_index:\t5\n",
+        ] {
+            assert_eq!(parse_tty_index(&fdinfo(malformed)), None, "{malformed:?}");
+        }
     }
 
     #[test]
