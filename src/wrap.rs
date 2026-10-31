@@ -1882,34 +1882,38 @@ fn child_pre_exec(ctty_fd: RawFd) -> std::io::Result<()> {
 /// post-exit drain/kill path below.
 #[cfg(unix)]
 fn open_inner_pty(rows: u16, cols: u16) -> std::io::Result<(OwnedFd, OwnedFd)> {
-    let mut master: RawFd = -1;
-    let mut slave: RawFd = -1;
-    let mut ws = libc::winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    // SAFETY: `openpty` fills both descriptors on success; each is turned into an
-    // `OwnedFd` exactly once so ownership (and close-on-drop) is unambiguous.
-    let rc = unsafe {
-        // macOS declares `termp`/`winp` as `*mut` while Linux uses `*const`;
-        // `null_mut()` and `&mut ws` satisfy the `*mut` signature and coerce to
-        // `*const` on Linux, so this call compiles on both.
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::addr_of_mut!(ws),
-        )
-    };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: `openpty` returned two fresh, valid descriptors; each becomes an
-    // `OwnedFd` exactly once here, so close-on-drop is unambiguous from now on.
-    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    // Issue #1884: on macOS the allocation alone is retried on a transient
+    // failure, never the `cloexec` setup below it.
+    let (master, slave) = crate::pty_open_retry::open_raw(|| {
+        let mut master: RawFd = -1;
+        let mut slave: RawFd = -1;
+        let mut ws = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: `openpty` fills both descriptors on success; each is turned into an
+        // `OwnedFd` exactly once so ownership (and close-on-drop) is unambiguous.
+        let rc = unsafe {
+            // macOS declares `termp`/`winp` as `*mut` while Linux uses `*const`;
+            // `null_mut()` and `&mut ws` satisfy the `*mut` signature and coerce to
+            // `*const` on Linux, so this call compiles on both.
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(ws),
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `openpty` returned two fresh, valid descriptors; each becomes an
+        // `OwnedFd` exactly once here, so close-on-drop is unambiguous from now on.
+        Ok(unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) })
+    })?;
     // Owned first, then flagged: if either fails, both descriptors are already
     // owned and close on the early return instead of leaking (the ordering
     // `portable_pty` uses at `unix.rs:52-58`, and for the same reason). Both

@@ -142,6 +142,8 @@ pub mod project_config;
 // there is for files this process wrote, and this one is for a path a caller
 // selected over the attach socket.
 pub mod project_resolve;
+// Issue #1884: the bounded macOS retry of PTY allocation.
+pub mod pty_open_retry;
 // PRD #1401: the pull request an agent's work produced, on the session wire.
 pub mod pull_request;
 pub mod pull_request_info;
