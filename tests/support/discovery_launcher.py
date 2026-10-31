@@ -9,9 +9,13 @@ import sys
 import time
 
 base = Path(os.environ['DAD_LIVE_SEGMENTS_BASE'])
-# The wrapper resolves its own command normally. No native path is handed to
-# it by the fixture; the daemon's independent authority is its spawn-time pin.
-native = Path(shutil.which(os.environ['DAD_LIVE_SEGMENTS_KIND']))
+# Usually resolve normally; missing-pin histories launch the genuine copy by
+# absolute path beside this wrapper, without adding it to the spawn PATH.
+# Neither route supplies the daemon with executable authority.
+kind = os.environ['DAD_LIVE_SEGMENTS_KIND']
+native = (Path(__file__).resolve().parent / kind
+          if os.environ['DAD_DISCOVERY_ABSOLUTE'] == '1'
+          else Path(shutil.which(kind)))
 mode = os.environ['DAD_DISCOVERY_LAUNCH']
 
 
@@ -49,6 +53,7 @@ publish('launcher-ready', {
     'pid': os.getpid(),
     'generation': int(os.environ.get('DOT_AGENT_DECK_EDITOR_GEN', '0')),
     'instance': str(Path(os.environ['VISUAL']).parent),
+    'spawn_path': os.environ['PATH'],
     'editors': {key: os.environ.get(key) for key in (
         'VISUAL', 'EDITOR', 'DOT_AGENT_DECK_EDITOR_GEN')},
 })
