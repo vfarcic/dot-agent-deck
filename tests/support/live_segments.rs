@@ -120,7 +120,7 @@ impl Fixture {
             checked_replace(
                 include_str!("claude_composer.py"),
                 "            result = subprocess.run([deck, 'inbox', 'fetch']",
-                "            if os.path.exists(base + '.fetch-notice-only') and b'dot-agent-deck: message ' not in line:\n                continue\n            result = subprocess.run([deck, 'inbox', 'fetch']",
+                "            if os.path.exists(base + '.fetch-paused') or (os.path.exists(base + '.fetch-notice-only') and b'dot-agent-deck: message ' not in line):\n                continue\n            result = subprocess.run([deck, 'inbox', 'fetch']",
             )
         };
         let composer = checked_replace(
@@ -756,6 +756,24 @@ pub fn native_entry() {
         if let Ok(data) = fs::read(base.with_extension("command")) {
             fs::remove_file(base.with_extension("command")).unwrap();
             let cmd: Value = serde_json::from_slice(&data).unwrap();
+            if cmd["action"] == "fetch" {
+                // An independent ordinary CLI consumer, with this sandbox
+                // pane's own environment; no input goes to its composer.
+                let output = Command::new(common::contained_deck_binary())
+                    .args(["inbox", "fetch"])
+                    .envs(env.clone())
+                    .output()
+                    .unwrap();
+                atomic(
+                    &base.with_extension("response"),
+                    &json!({
+                        "ok":output.status.success(),
+                        "stdout":String::from_utf8(output.stdout).unwrap(),
+                        "stderr":String::from_utf8(output.stderr).unwrap(),
+                    }),
+                );
+                continue;
+            }
             let mut reply = json!({"ok":true});
             if cmd["action"] == "emit" {
                 let bytes: Vec<u8> = serde_json::from_value(cmd["bytes"].clone()).unwrap();
