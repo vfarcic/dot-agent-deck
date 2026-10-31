@@ -182,7 +182,33 @@ jobs:
       flake_only: ${{ steps.detect.outputs.flake_only }}
       binary: ${{ steps.detect.outputs.binary }}
       linux_backend: ${{ steps.backend.outputs.linux_backend }}
+      dad_version: ${{ steps.version.outputs.dad_version }}
     steps:
+      # Issue #326 — the version the binaries built in this run report. Every
+      # checkout here is shallow and fetches no tags, so `build.rs`'s
+      # `git describe` finds none and a build falls through to the `0.1.0`
+      # placeholder, which the binary reads as "version unknown" (`0.1.0+unknown`).
+      # Release builds and a developer's checkout know their version, and the
+      # tests were written there: `remote upgrade` with no `--version`, for
+      # one, refuses on an unknown one. So the jobs that run what they build
+      # take `DAD_VERSION` from here: the newest `vX.Y.Z` tag, which is what
+      # `git describe --tags --abbrev=0` reports in a developer's checkout of
+      # `main`. `git ls-remote` reads the tags without the history, which a
+      # deep fetch would download. A failure fails this job, and with it the
+      # run, rather than sending every build down the placeholder path.
+      # `.rwx/ci.yml`'s `backend` task does the same for RWX.
+      - id: version
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          version=$(git ls-remote --tags --refs "https://github.com/$REPO.git" 'v*' \
+            | sed -n 's#.*refs/tags/v\([0-9]*\.[0-9]*\.[0-9]*\)$#\1#p' | sort -V | tail -n 1)
+          if [ -z "$version" ]; then
+            echo "::error::no vX.Y.Z release tag found in $REPO"
+            exit 1
+          fi
+          echo "dad_version=$version" | tee -a "$GITHUB_OUTPUT"
       # Which system runs the Linux jobs for a PULL REQUEST:
       # `.github/ci-backend` says `rwx` or `gha`, read at the commit under
       # test. Only pull requests move to RWX; a push to `main` always runs here,
@@ -646,6 +672,8 @@ jobs:
       # `desktop/scripts/driver-test.sh` reads it from here for a local run
       # instead of restating it.
       TAURI_DRIVER_VERSION: 2.0.6
+      # Issue #326: see the `changes` job's `version` step.
+      DAD_VERSION: ${{ needs.changes.outputs.dad_version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -907,6 +935,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
     runs-on: ubuntu-latest
+    env:
+      # Issue #326: see the `changes` job's `version` step.
+      DAD_VERSION: ${{ needs.changes.outputs.dad_version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -1138,6 +1169,10 @@ jobs:
       # for this profile instead of restoring artifacts built with debug info
       # and, on an exact key hit, never saving the rebuild.
       CARGO_PROFILE_DEV_DEBUG: "0"
+      # Issue #326: see the `changes` job's `version` step. The shards run this
+      # archive, so they need no copy; `lifecycle/version/001`'s nested build
+      # sets its own.
+      DAD_VERSION: ${{ needs.changes.outputs.dad_version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -1578,6 +1613,9 @@ jobs:
     needs: changes
     if: false
     runs-on: windows-latest
+    env:
+      # Issue #326: see the `changes` job's `version` step.
+      DAD_VERSION: ${{ needs.changes.outputs.dad_version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -1697,6 +1735,8 @@ jobs:
     # by several minutes run to run, so read that as ~2-3 minutes, not exact.
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # Issue #326: see the `changes` job's `version` step.
+      DAD_VERSION: ${{ needs.changes.outputs.dad_version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

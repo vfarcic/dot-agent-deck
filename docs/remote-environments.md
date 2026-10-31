@@ -311,11 +311,13 @@ Run the suggested `remote upgrade`. A different message, `Remote 'my-vm' rejecte
 | `Invalid remote name` | The name breaks the rules in [the reference](#remote-add-reference). | Use letters, digits, `.`, `-`, `_`, starting with a letter or digit. |
 | `Invalid remote address` | The target, port or key path was refused (for example a host starting with `-`). | Pass a plain `[user@]host`. |
 | `Invalid --version` | Not `X.Y.Z` or `vX.Y.Z`. | Fix the version. |
+| `This dot-agent-deck build does not know its own version` | Your local build could not tell which release it is (its `--version` ends in `+unknown`), so it has no version to install by default. | Pass `--version <x.y.z>`. |
 | `No remote named '<name>'` | `remote upgrade`, `remote remove` or `connect` got an unregistered name. | `dot-agent-deck remote list`. |
 | `Remote arch is …; supported: linux-{amd64,arm64}, darwin-{amd64,arm64}.` | The host is another OS or architecture. | Use a supported host. |
 | `Failed to detect remote arch` | `uname -s -m` failed on the host. | Check the host's shell. |
 | `Failed to download dot-agent-deck v<version> for <platform> from <url>.` | The host has no outbound HTTPS to GitHub, no `curl`, the release does not exist, or `~/.local/bin` is not writable. | Fix egress, install `curl`, or check the version. |
 | `Installed binary reports … but expected …` | The binary on the host is another version (common with `--no-install`). | Drop `--no-install`, or pass the version the host has. |
+| `The remote's dot-agent-deck build does not know its own version` | The binary on the host was built without a version (its `--version` ends in `+unknown`), so it cannot be checked against `--version`. | Drop `--no-install` to install a release, or rebuild the host's binary with `DAD_VERSION=<x.y.z>` set. |
 | `` `dot-agent-deck hooks install` on remote failed`` | Writing `~/.claude/settings.json` on the host failed. | Read the error it quotes; it is often a malformed existing `settings.json`. |
 | `` `brew upgrade dot-agent-deck` on remote failed`` | Homebrew on the host failed. | Run `brew upgrade dot-agent-deck` on the host and read its output. |
 | `Could not tell how dot-agent-deck is installed on the remote` | The install check printed something unexpected. | Check that the host's login shell starts cleanly over non-interactive ssh (`ssh <target> true` prints nothing). |

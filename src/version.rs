@@ -36,6 +36,29 @@ impl ReleaseChannel {
     }
 }
 
+/// The SemVer build metadata a build that could not determine its own version
+/// carries (issue #326): `build.rs` reports such a build as the
+/// `CARGO_PKG_VERSION` placeholder plus `+unknown`, e.g. `0.1.0+unknown`.
+/// `build_version_resolve.rs` keeps the same value for the build script.
+pub const UNKNOWN_VERSION_METADATA: &str = "unknown";
+
+/// Whether `version` (with or without a leading `v`) is a build that does not
+/// know its own version, rather than a release: its build metadata is exactly
+/// [`UNKNOWN_VERSION_METADATA`]. A bare `0.1.0` is not unknown, because
+/// `v0.1.0` is a real release. An unparseable value is not unknown either; it
+/// is just unreadable, which every caller already handles.
+pub fn is_unknown_version(version: &str) -> bool {
+    let version = version.trim();
+    semver::Version::parse(version.strip_prefix('v').unwrap_or(version))
+        .is_ok_and(|parsed| parsed.build.as_str() == UNKNOWN_VERSION_METADATA)
+}
+
+/// Whether this build knows which release it is. False only for a build that
+/// fell through to the `CARGO_PKG_VERSION` placeholder (issue #326).
+pub fn own_version_known() -> bool {
+    !is_unknown_version(env!("DAD_VERSION"))
+}
+
 pub(crate) fn current_version() -> semver::Version {
     semver::Version::parse(env!("DAD_VERSION")).expect("DAD_VERSION is valid semver")
 }

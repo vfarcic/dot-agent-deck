@@ -30,7 +30,7 @@ Everything under [Required](#required) must hold before `remote add` succeeds an
 
 To identify the host, `remote add` reads only `uname -s -m`; it does not check the distribution. Two things do vary:
 
-- **glibc.** The Linux release binaries are glibc builds; there is no musl build. On a musl distribution such as Alpine, install the deck on the host from source or with [Nix](installation.md#nix), put the binary (or a symlink to it) at `~/.local/bin/dot-agent-deck`, and register with `--no-install --version <the version it reports>`.
+- **glibc.** The Linux release binaries are glibc builds; there is no musl build. On a musl distribution such as Alpine, install the deck on the host from source or with [Nix](installation.md#nix), put the binary (or a symlink to it) at `~/.local/bin/dot-agent-deck`, and register with `--no-install --version <the version it reports>`. Build it with `DAD_VERSION=<x.y.z>` set, or from a checkout with tags: a build that cannot tell which release it is reports a version ending in `+unknown`, and `remote add` refuses it.
 - **systemd.** Only needed to [run the daemon as a service](daemon-service.md). Without systemd, and without `XDG_RUNTIME_DIR` set, the daemon's sockets go in the temp directory ([Where the deck puts its files](#where-the-deck-puts-its-files)).
 
 ### ssh access

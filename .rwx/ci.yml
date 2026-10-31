@@ -147,6 +147,18 @@ tasks:
       put rust "$(on "$not_lock_only")"
       put nix "$(on "$([ "$devbox_only" != true ] && echo true || echo false)")"
       put aarch64 "$(on "$cargo")"
+      # Issue #326 — the version the binaries built in this run report, as
+      # ci.yml's `changes` job's `version` step explains: `code` is a shallow
+      # clone with no tags, so a build would otherwise report the placeholder
+      # as "version unknown". The newest vX.Y.Z tag is what a developer's
+      # checkout of `main` reports. The tasks that run what they build read it.
+      dad_version=$(git ls-remote --tags --refs origin 'v*' \
+        | sed -n 's#.*refs/tags/v\([0-9]*\.[0-9]*\.[0-9]*\)$#\1#p' | sort -V | tail -n 1)
+      if [ -z "$dad_version" ]; then
+        echo "no vX.Y.Z release tag found at origin" >&2
+        exit 1
+      fi
+      put dad_version "$dad_version"
 
   - key: rust
     if: ${{ tasks.backend.values.active == 'true' }}
@@ -208,6 +220,8 @@ tasks:
     tool-cache: ci-test-v2
     env:
       DAD_REQUIRE_GO_TASK: "1"
+      # Issue #326: see the `backend` task.
+      DAD_VERSION: ${{ tasks.backend.values.dad_version }}
       # Line tables keep file:line in panics and backtraces but drop the rest
       # of the debug info, which is most of `target/`'s size and link time.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -241,6 +255,10 @@ tasks:
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_INCREMENTAL: "0"
+      # Issue #326: see the `backend` task. The partitions run this archive,
+      # so they need no copy; `lifecycle/version/001`'s nested build sets its
+      # own.
+      DAD_VERSION: ${{ tasks.backend.values.dad_version }}
     run: |
       cargo nextest archive --workspace --features e2e --archive-file e2e.tar.zst
       # Keep only the dependencies in the tool cache, as Swatinem/rust-cache
@@ -365,6 +383,8 @@ tasks:
     env:
       TAURI_DRIVER_VERSION: 2.0.6
       CARGO_INCREMENTAL: "0"
+      # Issue #326: see the `backend` task.
+      DAD_VERSION: ${{ tasks.backend.values.dad_version }}
     run: |
       sudo apt-get update
       # openssh-server and libnss-wrapper: fleet_001's far deck (issue #1356).
