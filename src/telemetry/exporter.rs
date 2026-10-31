@@ -85,7 +85,9 @@ use super::propagation::{RunIdentity, agent_env};
 use super::resource::{ResourceAttribute, deck_resource, host_name};
 use super::run_context::{BranchReads, ProbeSettings, Probes};
 use super::span::{SpanRecord, new_run_id};
-use super::tracker::{EndReason, FinishingRun, RunGeneration, RunStart, RunTracker};
+use super::tracker::{
+    EndReason, EndedByThemselves, FinishingRun, RunGeneration, RunStart, RunTracker,
+};
 use super::{Protocol, now_unix_nanos, otlp};
 
 /// Spans per request, at most.
@@ -710,6 +712,9 @@ fn retire_input(filters: &Filters, pane_id: &str, run_id: &str) -> Vec<(u64, Int
 /// What the spawn path, the reader threads and the ingest task share.
 struct Shared {
     tracker: Mutex<RunTracker>,
+    /// Issue #2028: the tracker's [`EndedByThemselves`], which the PTY readers
+    /// write to without the tracker's lock.
+    ended_by_themselves: EndedByThemselves,
     queue: mpsc::Sender<ExportMsg>,
     dropped: Mutex<RateLimitedLog>,
     /// Issue #1981 M8: every span the queue refused since the exporter
@@ -1280,6 +1285,22 @@ impl Telemetry {
         };
         if held {
             shared.escape_held.notify_one();
+        }
+    }
+
+    /// Issue #2028: generation `agent_id`'s terminal ended while the deck
+    /// still held it, so it ended by itself: a close that removes it after
+    /// this does not end its run, which its own [`Self::end_run`] ends.
+    /// Takes only the note's own lock, so the PTY reader can call it under
+    /// the registry's.
+    pub fn agent_ended_by_itself(&self, agent_id: &str) {
+        if let Some(exporting) = &self.exporting {
+            exporting
+                .shared
+                .ended_by_themselves
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(agent_id.to_string());
         }
     }
 
@@ -1980,8 +2001,10 @@ fn start_exporting(
     tracker.set_held_input(Box::new(move |pane_id, run_id| {
         retire_input(&held, pane_id, run_id)
     }));
+    let ended_by_themselves = tracker.ended_by_themselves();
     let shared = Arc::new_cyclic(|me| Shared {
         tracker: Mutex::new(tracker),
+        ended_by_themselves,
         queue,
         dropped: Mutex::new(RateLimitedLog::new(ERROR_LOG_INTERVAL)),
         dropped_total: std::sync::atomic::AtomicU64::new(0),

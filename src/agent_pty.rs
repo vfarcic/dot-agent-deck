@@ -2852,7 +2852,13 @@ const TERMINATION_WAIT: Duration = Duration::from_millis(200);
 /// generation's own evidence for as long as the reader lives, however many
 /// other generations end meanwhile. Empty while nothing has removed it.
 #[derive(Debug, Default)]
-pub(crate) struct RemovalEvidence(AtomicU8);
+pub(crate) struct RemovalEvidence {
+    removal: AtomicU8,
+    /// Issue #2028: the child's exit status as the close or respawn that
+    /// removed the generation reaped it, so an exit the reader saw before the
+    /// removal keeps its code.
+    reaped: std::sync::OnceLock<portable_pty::ExitStatus>,
+}
 
 /// What [`RemovalEvidence`] records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2876,7 +2882,7 @@ impl RemovalEvidence {
     const REPLACEMENT_FAILED: u8 = 4;
 
     fn get(&self) -> Option<Removal> {
-        match self.0.load(Ordering::SeqCst) {
+        match self.removal.load(Ordering::SeqCst) {
             Self::CLOSED => Some(Removal::Closed),
             Self::RESPAWNING => Some(Removal::Respawning),
             Self::REPLACED => Some(Removal::Replaced),
@@ -2887,17 +2893,17 @@ impl RemovalEvidence {
 
     /// A close or shutdown removed the generation.
     fn closed(&self) {
-        self.0.store(Self::CLOSED, Ordering::SeqCst);
+        self.removal.store(Self::CLOSED, Ordering::SeqCst);
     }
 
     /// A respawn lifted the generation out.
     fn respawning(&self) {
-        self.0.store(Self::RESPAWNING, Ordering::SeqCst);
+        self.removal.store(Self::RESPAWNING, Ordering::SeqCst);
     }
 
     /// The respawn that lifted it out published its successor.
     fn replaced(&self) {
-        let _ = self.0.compare_exchange(
+        let _ = self.removal.compare_exchange(
             Self::RESPAWNING,
             Self::REPLACED,
             Ordering::SeqCst,
@@ -2905,9 +2911,21 @@ impl RemovalEvidence {
         );
     }
 
+    /// The remover reaped `child`: its status, once it has one.
+    fn record_reaped(&self, child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
+        if let Ok(Some(status)) = child.try_wait() {
+            let _ = self.reaped.set(status);
+        }
+    }
+
+    /// The status [`Self::record_reaped`] recorded.
+    fn reaped(&self) -> Option<portable_pty::ExitStatus> {
+        self.reaped.get().cloned()
+    }
+
     /// The respawn returned: without a successor, unless one was published.
     fn respawn_returned(&self) {
-        let _ = self.0.compare_exchange(
+        let _ = self.removal.compare_exchange(
             Self::RESPAWNING,
             Self::REPLACEMENT_FAILED,
             Ordering::SeqCst,
@@ -3099,10 +3117,12 @@ fn pump_reader(
     // PRD #1666 part 3, round 5-wake: the header window ends with the stream.
     bus.close_release(crate::release_scanner::WindowClose::AgentExit);
     // Whether the registry still held this generation when its output ended:
-    // read before any of the exit handling below, which can remove it.
-    let registered_at_eof = registry
-        .upgrade()
-        .is_some_and(|registry| registry.is_agent_still_registered(&agent_id));
+    // read before any of the exit handling below, which can remove it, and in
+    // the lock hold that marks it crashed (issue #2028), so the telemetry
+    // verdict below is the one taken at EOF. In that hold telemetry also
+    // learns of it, so a close that removes the generation after its EOF does
+    // not end its run as closed.
+    //
     // Issue #868: must run regardless of whether `pane_id_env` is set — a
     // dashboard pane crashes just as much as an orchestration one, and the
     // block below (release/sweep/notify) only fires when a pane id exists.
@@ -3115,9 +3135,16 @@ fn pump_reader(
     // `pump_reader_marks_natural_exit_as_crashed_but_not_deliberate_close`
     // failing under plain `cargo test`, and reachable by a `pane restart`
     // refusal check landing in it.
-    if let Some(registry) = registry.upgrade() {
-        registry.mark_agent_crashed(&agent_id);
-    }
+    let registered_at_eof = registry.upgrade().is_some_and(|registry| {
+        let telemetry = registry.telemetry();
+        registry.mark_agent_crashed(&agent_id, || {
+            crate::telemetry::agent_ended_by_itself(
+                telemetry.as_deref(),
+                pane_id_env.as_deref(),
+                &agent_id,
+            );
+        })
+    });
     exited.store(true, Ordering::SeqCst);
     change_notify.notify_one();
     // PRD #1666 part 3, round 5 (plan D7): a respawned unit terminal's
@@ -3146,10 +3173,15 @@ fn pump_reader(
             pane_id_env.as_deref(),
             &agent_id,
             registry.is_shutting_down(),
-            || registry.is_agent_still_registered(&agent_id),
+            registered_at_eof,
+            // Issue #2028: once a close or respawn removed the record, the
+            // status it reaped.
             || {
                 let mut inner = registry.inner.lock();
-                inner.agents.get_mut(&agent_id)?.child.try_wait().ok()?
+                match inner.agents.get_mut(&agent_id) {
+                    Some(agent) => agent.child.try_wait().ok()?,
+                    None => removal.reaped(),
+                }
             },
         );
     }
@@ -12346,21 +12378,25 @@ impl AgentPtyRegistry {
         self.inner.lock().agents.contains_key(agent_id)
     }
 
-    /// Marks `agent_id`'s entry as crashed if it is still registered — a
-    /// no-op if the entry has already been removed (a deliberate
-    /// `close_agent`/`respawn_agent_for_pane` teardown, which removes the
-    /// entry before its own kill completes, same as
+    /// Marks `agent_id`'s entry as crashed if it is still registered, runs
+    /// `registered` in the same lock hold, and says whether it was — a no-op
+    /// if the entry has already been removed
+    /// (a deliberate `close_agent`/`respawn_agent_for_pane` teardown, which
+    /// removes the entry before its own kill completes, same as
     /// `is_agent_still_registered`'s own doc explains). Folds the
     /// check-and-set into a single lock acquisition so there is no
     /// TOCTOU gap between "is this still a natural exit" and "mark it" —
     /// deliberately NOT implemented as a separate `is_agent_still_registered`
     /// call followed by a second locked mutation, which would reopen exactly
     /// the race this method exists to avoid.
-    fn mark_agent_crashed(&self, agent_id: &str) {
+    fn mark_agent_crashed(&self, agent_id: &str, registered: impl FnOnce()) -> bool {
         let mut inner = self.inner.lock();
-        if let Some(agent) = inner.agents.get_mut(agent_id) {
-            agent.crashed = Some(true);
-        }
+        let Some(agent) = inner.agents.get_mut(agent_id) else {
+            return false;
+        };
+        agent.crashed = Some(true);
+        registered();
+        true
     }
 
     /// Deliver the "worker exited without work-done" report for
@@ -14726,6 +14762,7 @@ impl AgentPtyRegistry {
             AGENT_TERMINATE_GRACE,
             &agent.process_group,
         );
+        agent.removal.record_reaped(&mut agent.child);
         // Notify the idle monitor so it observes the registry shrink
         // immediately. The pump_reader thread will *also* signal once it
         // sees EOF from the kill, but doing it here makes the
@@ -15195,6 +15232,7 @@ impl AgentPtyRegistry {
         // the same worker. Same shape `daemon_protocol.rs` uses for
         // `close_agent`.
         let mut child = child;
+        let removal = Arc::clone(&in_flight.removal);
         // The process group moves onto the blocking task too — it is what the
         // teardown's force phase reaps the descendant tree through (PRD #163 M3),
         // and it is dropped there once the old child is gone.
@@ -15204,6 +15242,7 @@ impl AgentPtyRegistry {
                 AGENT_TERMINATE_GRACE,
                 &process_group,
             );
+            removal.record_reaped(&mut child);
         })
         .await;
         if let Err(join_err) = join {
@@ -31385,6 +31424,47 @@ mod spawn_tests {
             .delegation_idle_clock("worker", second.seq)
             .expect("armed");
         assert!(!clock.pointer_queued && clock.pointer_in_progress);
+    }
+
+    /// Issue #2028: the reader takes its exit verdict from
+    /// `mark_agent_crashed`'s lock hold, and a close that removes an already
+    /// exited generation afterwards leaves the status it reaped in the
+    /// generation's removal evidence, so neither the verdict nor the code
+    /// depends on the record outliving the EOF.
+    #[tokio::test]
+    async fn a_close_after_natural_exit_keeps_the_eof_verdict_and_the_reaped_code() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("sh -c 'exit 7'"),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn a naturally-exiting agent");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline && registry.live_count() > 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            registry.live_count(),
+            0,
+            "test prerequisite: the agent exited"
+        );
+        let removal = Arc::clone(&registry.inner.lock().agents[&id].removal);
+        assert!(
+            registry.mark_agent_crashed(&id, || {}),
+            "a generation nothing removed is the reader's natural exit"
+        );
+        assert!(removal.reaped().is_none(), "nothing has removed it yet");
+        registry.close_agent(&id).expect("close the exited agent");
+        assert!(
+            !registry.mark_agent_crashed(&id, || panic!("not registered")),
+            "a removed generation is not a natural exit"
+        );
+        assert_eq!(
+            removal.reaped().map(|status| status.exit_code()),
+            Some(7),
+            "the close must keep the code of the exit it reaped"
+        );
     }
 
     /// `is_agent_still_registered` is `pump_reader`'s only way to tell a

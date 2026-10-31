@@ -59,7 +59,8 @@
 //! into; the Escape key, and a key whose sequence a held `ESC` begins and the
 //! next write completes, as of the write that held the `ESC`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use crate::event::{AgentEvent, AgentType, DAEMON_PANE_CLOSED_METADATA_KEY, EventType};
 use crate::state::{AppState, SessionStatus};
@@ -698,6 +699,13 @@ impl ActiveRun {
 /// [`RunTracker::set_held_input`].
 pub type HeldInput = Box<dyn FnMut(&str, &str) -> Vec<(u64, InterventionKind)> + Send>;
 
+/// Issue #2028: the generations whose terminal ended while the deck still
+/// held them, noted by their PTY reader at that end
+/// ([`super::Telemetry::agent_ended_by_itself`]) and forgotten once their own
+/// end is applied. Locked after the tracker, never before it, and nothing
+/// else is taken while it is held.
+pub type EndedByThemselves = Arc<Mutex<HashSet<String>>>;
+
 /// See the module docs.
 #[derive(Default)]
 pub struct RunTracker {
@@ -726,6 +734,9 @@ pub struct RunTracker {
     held_input: Option<HeldInput>,
     /// Issue #1981 M7: the delegated tasks whose `agent.handoff` is open.
     handoffs: Handoffs,
+    /// Issue #2028: see [`EndedByThemselves`]. A pane's close broadcast does
+    /// not end the run of a generation in it: its own end does, as exited.
+    ended_by_themselves: EndedByThemselves,
     /// Test witness: the [`ShadowCards`] alive.
     #[cfg(test)]
     shadow_states: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -743,6 +754,30 @@ impl RunTracker {
     /// or the daemon shut down.
     pub fn set_held_input(&mut self, held: HeldInput) {
         self.held_input = Some(held);
+    }
+
+    /// The set the PTY readers note a generation that ended by itself in
+    /// ([`EndedByThemselves`]).
+    pub fn ended_by_themselves(&self) -> EndedByThemselves {
+        Arc::clone(&self.ended_by_themselves)
+    }
+
+    /// Whether generation `agent_id` ended by itself ([`EndedByThemselves`]).
+    fn ended_by_itself(&self, agent_id: Option<&str>) -> bool {
+        agent_id.is_some_and(|agent_id| {
+            self.ended_by_themselves
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains(agent_id)
+        })
+    }
+
+    /// Generation `agent_id`'s own end was applied: its note is done with.
+    fn forget_ended_by_itself(&self, agent_id: &str) {
+        self.ended_by_themselves
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(agent_id);
     }
 
     /// The `deck.run.id` of the run open on `pane_id`, if any.
@@ -925,6 +960,7 @@ impl RunTracker {
             return;
         };
         let pane_id = pending.start.pane_id.clone();
+        let agent_id = pending.start.agent_id.clone();
         self.open_run(pending.start, pending.prepared_at, pending.usage_dirs);
         if let Some(run) = self.runs.get_mut(&pane_id) {
             run.context = pending.context;
@@ -947,6 +983,9 @@ impl RunTracker {
         }
         if let Some((reason, exit_code, at)) = pending.ended {
             self.end_run(&pane_id, reason, exit_code, at);
+            if let Some(agent_id) = agent_id.as_deref() {
+                self.forget_ended_by_itself(agent_id);
+            }
         }
     }
 
@@ -1146,14 +1185,19 @@ impl RunTracker {
             event.agent_id.as_deref(),
         ) && ours != theirs
         {
-            if closed {
+            if closed && !self.ended_by_itself(Some(theirs)) {
                 self.end_replaced(pane_id, theirs, EndReason::Closed, None, now);
             }
             return;
         }
         if closed {
-            let pane_id = pane_id.to_string();
-            self.end_run(&pane_id, EndReason::Closed, None, now);
+            // Issue #2028: a generation that ended by itself before the close
+            // removed it is ended by its own end, as exited.
+            let ours = run.start_info.agent_id.clone();
+            if !self.ended_by_itself(ours.as_deref()) {
+                let pane_id = pane_id.to_string();
+                self.end_run(&pane_id, EndReason::Closed, None, now);
+            }
             return;
         }
 
@@ -1669,6 +1713,9 @@ impl RunTracker {
         let other_generation = self.runs.get(pane_id).is_some_and(|run| {
             matches!((run.start_info.agent_id.as_deref(), agent_id), (Some(a), Some(b)) if a != b)
         });
+        // A prepared run keeps its note until it opens with the close it
+        // may hold ([`Self::commit_run`]).
+        let mut held = false;
         if self.runs.contains_key(pane_id) && !other_generation {
             self.end_run(pane_id, reason, exit_code, now);
         } else if let Some(agent_id) = agent_id
@@ -1682,6 +1729,10 @@ impl RunTracker {
                 other => other,
             };
             pending.ended.get_or_insert((reason, exit_code, now));
+            held = true;
+        }
+        if !held && let Some(agent_id) = agent_id {
+            self.forget_ended_by_itself(agent_id);
         }
         self.expire_replaced(now);
     }
@@ -1704,6 +1755,10 @@ impl RunTracker {
         for pane in panes {
             self.end_run(&pane, reason, None, now);
         }
+        self.ended_by_themselves
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
         self.handoffs.end_all(now, &mut self.finished);
     }
 
@@ -3156,6 +3211,57 @@ pub(crate) mod tests {
             (AttrValue::Str("exited".into()), 30)
         );
         assert_eq!(tracker.held(), (0, 0));
+    }
+
+    /// Issue #2028: a generation whose reader saw it end by itself keeps its
+    /// run open through a pane close that removes it afterwards, open or
+    /// replaced, and its own end ends it as exited, with its code. The note
+    /// is forgotten with that end.
+    #[test]
+    fn a_close_after_a_generation_ended_by_itself_leaves_its_own_end_to_end_it() {
+        let mut tracker = RunTracker::new();
+        let noted = tracker.ended_by_themselves();
+        let closed = |agent_id: &str| {
+            let mut closed = event("p1", EventType::SessionEnd);
+            closed.agent_id = Some(agent_id.into());
+            closed
+                .metadata
+                .insert(DAEMON_PANE_CLOSED_METADATA_KEY.into(), "1".into());
+            closed
+        };
+        tracker.begin_run(generation("p1", "a1"), 0);
+        noted.lock().unwrap().insert("a1".into());
+        tracker.observe_event(&closed("a1"), 5);
+        assert_eq!(tracker.run_id("p1"), Some("run-p1-a1"), "the close waits");
+        tracker.end_agent_run("p1", Some("a1"), EndReason::Exited, Some(7), 6);
+        let spans = tracker.take_finished();
+        assert_eq!(
+            end_of(&spans, "run-p1-a1"),
+            (AttrValue::Str("exited".into()), 6)
+        );
+        assert_eq!(
+            attr(run_span_of(&spans), AttrKey::ExitCode),
+            Some(&AttrValue::Int(7))
+        );
+        assert!(noted.lock().unwrap().is_empty(), "forgotten with its end");
+
+        tracker.begin_run(generation("p1", "b1"), 10);
+        tracker.begin_run(generation("p1", "b2"), 11);
+        noted.lock().unwrap().insert("b1".into());
+        tracker.observe_event(&closed("b1"), 12);
+        assert_eq!(tracker.held(), (2, 0), "the replaced run still waits");
+        tracker.end_agent_run("p1", Some("b1"), EndReason::Exited, Some(0), 13);
+        assert_eq!(
+            end_of(&tracker.take_finished(), "run-p1-b1"),
+            (AttrValue::Str("exited".into()), 13)
+        );
+        assert!(noted.lock().unwrap().is_empty());
+        tracker.observe_event(&closed("b2"), 14);
+        assert_eq!(
+            end_of(&tracker.take_finished(), "run-p1-b2"),
+            (AttrValue::Str("closed".into()), 14),
+            "a generation nothing noted still ends with its close"
+        );
     }
 
     /// Qodo item 18: a replaced run whose own end never arrives is still
