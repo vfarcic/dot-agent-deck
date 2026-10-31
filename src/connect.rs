@@ -1052,9 +1052,19 @@ fn maybe_nudge_upgrade<R: BufRead, W: Write>(
                 remote_version,
                 crate::untrusted_text::REMOTE_NAME_MAX_BYTES,
             );
+            // The bare command installs this build's own version, which
+            // `remote upgrade` refuses when it carries other build metadata,
+            // so it is named only when it would work.
+            let fix = if crate::remote::validate_version_string(local_version).is_ok() {
+                format!("`dot-agent-deck remote upgrade {name}` installs {local_version} there.")
+            } else {
+                format!(
+                    "`dot-agent-deck remote upgrade {name} --version <x.y.z>` installs a release there."
+                )
+            };
             writeln!(
                 output,
-                "Remote '{name}' runs a dot-agent-deck build that does not know its own version ({shown}), so no upgrade is offered. `dot-agent-deck remote upgrade {name}` installs {local_version} there."
+                "Remote '{name}' runs a dot-agent-deck build that does not know its own version ({shown}), so no upgrade is offered. {fix}"
             )?;
             output.flush()?;
         }
@@ -3399,7 +3409,33 @@ mod tests {
             shown.contains("does not know its own version (0.1.0+unknown)"),
             "{shown}"
         );
-        assert!(shown.contains("remote upgrade prod"), "{shown}");
+        assert!(
+            shown.contains("`dot-agent-deck remote upgrade prod` installs 0.49.3 there."),
+            "{shown}"
+        );
+
+        // A laptop version `remote upgrade` would refuse as its default
+        // (build metadata) is not promised; the user is told to pick one.
+        let upgrader = RecordingUpgrader::new();
+        let mut input: &[u8] = b"";
+        let mut output: Vec<u8> = Vec::new();
+        maybe_nudge_upgrade(
+            &upgrader,
+            "prod",
+            "0.1.0+unknown",
+            "0.49.3+nix",
+            None,
+            true,
+            &mut input,
+            &mut output,
+        )
+        .expect("nudge");
+        let shown = String::from_utf8(output).unwrap();
+        assert!(
+            shown.contains("`dot-agent-deck remote upgrade prod --version <x.y.z>`"),
+            "{shown}"
+        );
+        assert!(!shown.contains("installs 0.49.3+nix"), "{shown}");
 
         // A genuine 0.1.0 (a real release) is still older, and still nudged.
         let upgrader = RecordingUpgrader::new();

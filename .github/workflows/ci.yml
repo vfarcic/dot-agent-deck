@@ -184,31 +184,6 @@ jobs:
       linux_backend: ${{ steps.backend.outputs.linux_backend }}
       dad_version: ${{ steps.version.outputs.dad_version }}
     steps:
-      # Issue #326 — the version the binaries built in this run report. Every
-      # checkout here is shallow and fetches no tags, so `build.rs`'s
-      # `git describe` finds none and a build falls through to the `0.1.0`
-      # placeholder, which the binary reads as "version unknown" (`0.1.0+unknown`).
-      # Release builds and a developer's checkout know their version, and the
-      # tests were written there: `remote upgrade` with no `--version`, for
-      # one, refuses on an unknown one. So the jobs that run what they build
-      # take `DAD_VERSION` from here: the newest `vX.Y.Z` tag, which is what
-      # `git describe --tags --abbrev=0` reports in a developer's checkout of
-      # `main`. `git ls-remote` reads the tags without the history, which a
-      # deep fetch would download. A failure fails this job, and with it the
-      # run, rather than sending every build down the placeholder path.
-      # `.rwx/ci.yml`'s `backend` task does the same for RWX.
-      - id: version
-        env:
-          REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          version=$(git ls-remote --tags --refs "https://github.com/$REPO.git" 'v*' \
-            | sed -n 's#.*refs/tags/v\([0-9]*\.[0-9]*\.[0-9]*\)$#\1#p' | sort -V | tail -n 1)
-          if [ -z "$version" ]; then
-            echo "::error::no vX.Y.Z release tag found in $REPO"
-            exit 1
-          fi
-          echo "dad_version=$version" | tee -a "$GITHUB_OUTPUT"
       # Which system runs the Linux jobs for a PULL REQUEST:
       # `.github/ci-backend` says `rwx` or `gha`, read at the commit under
       # test. Only pull requests move to RWX; a push to `main` always runs here,
@@ -263,6 +238,36 @@ jobs:
             files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[] | .filename, (.previous_filename // empty)' || true)
           fi
           printf '%s' "$files" | scripts/ci-changes.sh "$EVENT" "${PR_AUTHOR:-}" | tee -a "$GITHUB_OUTPUT"
+      # Issue #326 — the version the binaries built in this run report. Every
+      # checkout here is shallow and fetches no tags, so `build.rs`'s
+      # `git describe` finds none and a build falls through to the `0.1.0`
+      # placeholder, which the binary reads as "version unknown" (`0.1.0+unknown`).
+      # Release builds and a developer's checkout know their version, and the
+      # tests were written there: `remote upgrade` with no `--version`, for
+      # one, refuses on an unknown one. So the jobs that run what they build
+      # take `DAD_VERSION` from here: the newest `vX.Y.Z` tag, which is what
+      # `git describe --tags --abbrev=0` reports in a developer's checkout of
+      # `main`. `git ls-remote` reads the tags without the history, which a
+      # deep fetch would download. A failure fails this job, and with it the
+      # run, rather than sending every build down the placeholder path. It
+      # runs only when a job here will build (the same conditions those jobs
+      # carry; `linux_backend` reads `rwx` only on a pull request, where
+      # `build-macos` does not run), so an RWX-owned or lock-only PR cannot
+      # go red over a tag it would not use. `.rwx/ci.yml`'s `backend` task
+      # does the same for RWX.
+      - id: version
+        if: steps.detect.outputs.devbox_only != 'true' && steps.detect.outputs.flake_only != 'true' && steps.backend.outputs.linux_backend != 'rwx'
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          version=$(git ls-remote --tags --refs "https://github.com/$REPO.git" 'v*' \
+            | sed -n 's#.*refs/tags/v\([0-9]*\.[0-9]*\.[0-9]*\)$#\1#p' | sort -V | tail -n 1)
+          if [ -z "$version" ]; then
+            echo "::error::no vX.Y.Z release tag found in $REPO"
+            exit 1
+          fi
+          echo "dad_version=$version" | tee -a "$GITHUB_OUTPUT"
 
   # PR #416 review M2: the desktop web app's TypeScript tests and type-check
   # were previously run by no CI job anywhere (~800 lines of vitest invisible

@@ -151,12 +151,18 @@ tasks:
       # ci.yml's `changes` job's `version` step explains: `code` is a shallow
       # clone with no tags, so a build would otherwise report the placeholder
       # as "version unknown". The newest vX.Y.Z tag is what a developer's
-      # checkout of `main` reports. The tasks that run what they build read it.
-      dad_version=$(git ls-remote --tags --refs origin 'v*' \
-        | sed -n 's#.*refs/tags/v\([0-9]*\.[0-9]*\.[0-9]*\)$#\1#p' | sort -V | tail -n 1)
-      if [ -z "$dad_version" ]; then
-        echo "no vX.Y.Z release tag found at origin" >&2
-        exit 1
+      # checkout of `main` reports. The tasks that run what they build read it,
+      # and all of them run only when `rust` is true, so the lookup runs, and
+      # can fail the run, only then: a run that builds nothing cannot go red
+      # over a tag it would not use.
+      dad_version=""
+      if [ "$(on "$not_lock_only")" = true ]; then
+        dad_version=$(git ls-remote --tags --refs origin 'v*' \
+          | sed -n 's#.*refs/tags/v\([0-9]*\.[0-9]*\.[0-9]*\)$#\1#p' | sort -V | tail -n 1)
+        if [ -z "$dad_version" ]; then
+          echo "no vX.Y.Z release tag found at origin" >&2
+          exit 1
+        fi
       fi
       put dad_version "$dad_version"
 
