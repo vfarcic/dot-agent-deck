@@ -2780,6 +2780,15 @@ pub struct RunningAgent {
     /// agent. Keeping the origin rather than a stale flag lets A → B → A trust
     /// it again and keeps A → B → B from doing so.
     pub badge_command: Option<String>,
+    /// PRD #2050 (audit F3): the OpenCode version the spawn-time probe read
+    /// from the binary this generation's command names directly
+    /// ([`crate::opencode_version::SpawnTarget::Direct`]); `None` for a
+    /// wrapper, any other agent, or a probe that did not answer. The daemon's
+    /// watch ([`crate::opencode_mode`]) takes it as the version of the
+    /// OpenCode client in this pane, which a file-identity match alone misses
+    /// when the command names a launcher script that `exec`s another binary
+    /// (an old npm 1.x `bin/opencode`). Daemon-local, not on the wire.
+    pub opencode_spawn_version: Option<crate::opencode_version::Version>,
     /// The full env vec passed to [`AgentPtyRegistry::spawn_agent`] at
     /// the original spawn, captured so
     /// [`AgentPtyRegistry::respawn_agent_for_pane`] can re-apply it on
@@ -10792,18 +10801,37 @@ impl AgentPtyRegistry {
         // its server plugins run with this pane's environment rather than in
         // OpenCode's shared background service, and its program word becomes
         // the absolute path that was probed.
+        //
+        // A wrapper (`devbox run oc`, a script) is not seen into, and its
+        // layout stays the one for either generation. But the `opencode` its
+        // environment resolves to — on the pane's PATH, else the daemon's
+        // login-shell PATH — is the file the deck would itself run, so it is
+        // asked `--version` the same way and the answer recorded by file
+        // identity (review F2). The watch then knows the version of a client
+        // that runs that very file, and runs nothing it finds itself.
         let mut standalone_command: Option<String> = None;
+        let mut opencode_spawn_version = None;
         let inbox_refresh = if opencode_spawn(inbox_agent_type.as_ref(), spawn_command.as_deref()) {
+            let daemon_path = std::env::var_os("PATH");
             let path_env = overlay_value(&opts.env, "PATH")
                 .map(std::ffi::OsString::from)
-                .or_else(|| std::env::var_os("PATH"));
+                .or_else(|| daemon_path.clone());
             let command = spawn_command.clone();
             let (target, refreshed) = crate::inbox_hub::off_the_executor(move || {
                 let target =
                     crate::opencode_version::spawn_target(command.as_deref(), path_env.as_deref());
+                if target == crate::opencode_version::SpawnTarget::Wrapper {
+                    crate::opencode_version::probe_path_opencode(
+                        path_env.as_deref(),
+                        daemon_path.as_deref(),
+                    );
+                }
                 let refreshed = crate::opencode_manage::refresh_for_spawn(target.major());
                 (target, refreshed)
             });
+            if let crate::opencode_version::SpawnTarget::Direct { version, .. } = &target {
+                opencode_spawn_version = *version;
+            }
             if target.major() == Some(crate::opencode_version::Major::V2)
                 && let crate::opencode_version::SpawnTarget::Direct { program, .. } = &target
             {
@@ -11076,6 +11104,7 @@ impl AgentPtyRegistry {
             spawn_agent_type,
             badge_command: spawn_command.clone(),
             spawn_command,
+            opencode_spawn_version,
             spawn_env: captured_env,
             hook_token: hook_token_for_record,
             pty_rows: captured_rows,
@@ -12007,6 +12036,8 @@ impl AgentPtyRegistry {
             // Issue #1602: the fresh generation records the command it is
             // actually launched with, which is the one passed in here.
             spawn_command: _,
+            // The fresh generation's own spawn probes again.
+            opencode_spawn_version: _,
             badge_command: previous_badge_command,
             spawn_env,
             // Issue #1077: the OLD generation's hook capability token is
@@ -14538,6 +14569,7 @@ impl AgentPtyRegistry {
                     pane_id: agent.pane_id_env.clone()?,
                     agent_id: agent_id.clone(),
                     root_pid: i32::try_from(agent.child.process_id()?).ok()?,
+                    spawn_version: agent.opencode_spawn_version,
                 })
             })
             .collect()
@@ -14821,6 +14853,7 @@ impl AgentPtyRegistry {
                 spawn_agent_type: None,
                 spawn_command: None,
                 badge_command: None,
+                opencode_spawn_version: None,
                 spawn_env: Vec::new(),
                 // A synthetic agent holds no pane (`pane_id_env: None`), so its
                 // token can never attest a pane claim — but it still gets a real

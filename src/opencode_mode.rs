@@ -141,9 +141,15 @@ fn private_server(row: &ProcRow) -> bool {
 }
 
 /// Whether process `pid`'s stdin and stdout are both sockets. An OpenCode 2
-/// private server's are, a socketpair with its client (measured on 2.2.5),
-/// while a process a tool started keeps the tool's pipes or `/dev/null`.
-/// Read from `/proc`; `false` when either cannot be read.
+/// private server's are, a socketpair with its client (measured on 2.2.5).
+/// This is a heuristic, not a binding: under OpenCode's Bun runtime a child
+/// started with piped stdio gets a socket on stdin and a pipe on stdout
+/// (measured on 1.18.35 and 2.2.5), so for a process a tool started the check
+/// rests on stdout alone, and a tool that redirects its stdio defeats it. On
+/// 2.x what keeps a tool's process from passing for the client's server is
+/// that tools run under the private server (measured), so their processes
+/// resolve to it; on 1.x, where tools run in the client, this check is all
+/// there is. Read from `/proc`; `false` when either cannot be read.
 #[cfg(target_os = "linux")]
 pub fn stdio_is_sockets(pid: u32) -> bool {
     [0, 1].iter().all(|fd| {
@@ -213,7 +219,12 @@ pub fn find_client(rows: &[ProcRow], root: i32) -> Option<Client> {
 ///
 /// An unsupported version is said at once; the shared service after
 /// [`SHARED_GRACE`]; a silent plugin after [`SILENT_GRACE`], and never while
-/// one of the other two applies, since they explain the silence.
+/// one of the other two applies, since they explain the silence. A silent
+/// plugin whose OpenCode's version is unknown and that has no private server
+/// may be an OpenCode 2 on the shared service, so its notice names both
+/// remedies ([`AgentNotice::opencode_not_reporting_maybe_shared`], review F2);
+/// a known 1.x, or a client with a private server (which only a standalone
+/// OpenCode 2 has), gets the install remedy alone.
 pub fn notice_for(
     client: &Client,
     version: Option<Version>,
@@ -228,7 +239,14 @@ pub fn notice_for(
     if version.map(Major::of) == Some(Major::V2) && !client.private_server {
         return (seen_for >= SHARED_GRACE).then(AgentNotice::opencode_shared_service);
     }
-    (!reporting && seen_for >= SILENT_GRACE).then(AgentNotice::opencode_not_reporting)
+    if reporting || seen_for < SILENT_GRACE {
+        return None;
+    }
+    Some(if version.is_none() && !client.private_server {
+        AgentNotice::opencode_not_reporting_maybe_shared()
+    } else {
+        AgentNotice::opencode_not_reporting()
+    })
 }
 
 /// One sample of the processes below `roots`: the whole process table's
@@ -307,21 +325,27 @@ pub(crate) fn arguments_of(_pid: u32) -> Option<Vec<String>> {
     None
 }
 
-/// One OpenCode agent the daemon watches: its pane, its registry id and the
-/// pid its process tree hangs from.
+/// One OpenCode agent the daemon watches: its pane, its registry id, the
+/// pid its process tree hangs from, and the version the spawn-time probe read
+/// from the binary its command names directly (`None` for a wrapper).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Watched {
     pub pane_id: String,
     pub agent_id: String,
     pub root_pid: i32,
+    pub spawn_version: Option<Version>,
 }
 
 /// What the daemon remembers between samples: when it first saw each agent's
 /// current client, so a notice that needs time waits for it, and a new client
-/// (OpenCode restarted inside the pane) starts the wait again.
+/// (OpenCode restarted inside the pane) starts the wait again; and which
+/// wrapper-started clients' generations it has already passed on to be
+/// remembered as the plugin layout ([`Watch::take_confirmed`]).
 #[derive(Debug, Default)]
 pub struct Watch {
     first_seen: HashMap<String, (i32, std::time::Instant)>,
+    confirmed_for: HashMap<String, (i32, Major)>,
+    confirmed: Vec<Major>,
 }
 
 impl Watch {
@@ -346,11 +370,33 @@ impl Watch {
     /// Forget every agent except `keep`.
     pub fn retain(&mut self, keep: &HashSet<&str>) {
         self.first_seen.retain(|id, _| keep.contains(id.as_str()));
+        self.confirmed_for
+            .retain(|id, _| keep.contains(id.as_str()));
     }
 
     /// Forget `agent_id`'s client (the pane runs none now).
     pub fn forget(&mut self, agent_id: &str) {
         self.first_seen.remove(agent_id);
+        self.confirmed_for.remove(agent_id);
+    }
+
+    /// Note that `agent_id`'s wrapper-started client `client_pid` runs
+    /// generation `major`, queueing it for [`Self::take_confirmed`] the first
+    /// time that client is seen to.
+    fn confirm(&mut self, agent_id: &str, client_pid: i32, major: Major) {
+        if self.confirmed_for.get(agent_id) != Some(&(client_pid, major)) {
+            self.confirmed_for
+                .insert(agent_id.to_string(), (client_pid, major));
+            self.confirmed.push(major);
+        }
+    }
+
+    /// The generations wrapper-started clients were newly seen to run since
+    /// the last call, oldest first: the plugin layout to remember for the
+    /// next install that has no command to look at
+    /// ([`crate::opencode_manage::remember_layout`]).
+    pub fn take_confirmed(&mut self) -> Vec<Major> {
+        std::mem::take(&mut self.confirmed)
     }
 }
 
@@ -362,11 +408,18 @@ pub const REPORT_SLACK: Duration = Duration::from_secs(10);
 /// One look at every watched agent: the notice each one's card should carry
 /// now, from the process sample `rows`.
 ///
-/// - `version_of` gives a client binary's version. In production it is
-///   [`crate::opencode_version::recorded_version`], which only reads what the
-///   spawn-time probe recorded and runs nothing, so a client the deck did not
-///   probe has an unknown version (and gets neither the shared-service nor
-///   the unsupported-version notice).
+/// - The client's version is the agent's [`Watched::spawn_version`] when its
+///   command named the binary directly: that pane's client is what the deck
+///   started, even when the file it runs is another one (an npm launcher
+///   script that `exec`s the native binary, audit F3). Otherwise it is what
+///   `version_of` gives the client's binary. In production that is
+///   [`crate::opencode_version::recorded_version`], which only reads what a
+///   spawn-time probe recorded (a direct command's binary, or the `opencode`
+///   a wrapper's PATH resolves to) and runs nothing, so a client running a
+///   file no spawn probed has an unknown version (and gets neither the
+///   shared-service nor the unsupported-version notice). A wrapper-started
+///   client whose version is known this way has its generation queued on
+///   `watch` ([`Watch::take_confirmed`]).
 /// - `last_report` gives, per agent, when its plugin last showed it runs (a
 ///   receiver registered, or a native hook event). It counts only when it is
 ///   no older than [`REPORT_SLACK`] before the deck first saw the agent's
@@ -392,7 +445,16 @@ pub fn evaluate(
                 }
                 Some(client) => {
                     let seen_for = watch.seen_for(&w.agent_id, client.pid, now);
-                    let version = client.exe.as_deref().and_then(version_of);
+                    let version = match w.spawn_version {
+                        Some(version) => Some(version),
+                        None => {
+                            let recorded = client.exe.as_deref().and_then(version_of);
+                            if let Some(version) = recorded {
+                                watch.confirm(&w.agent_id, client.pid, Major::of(version));
+                            }
+                            recorded
+                        }
+                    };
                     let first_seen = now.checked_sub(seen_for + REPORT_SLACK);
                     let reporting = last_report
                         .get(&w.agent_id)
@@ -413,7 +475,10 @@ pub fn evaluate(
 /// sample at a time: a sample that stalls (a `ps` stuck on a hung filesystem)
 /// stalls this watch and nothing else, and never starts a second one. It
 /// never runs a binary it finds: versions come only from the spawn-time
-/// probe's record ([`crate::opencode_version::recorded_version`]).
+/// probe's record ([`evaluate`]). A wrapper-started client whose version that
+/// record gives has its generation remembered as the plugin layout
+/// ([`crate::opencode_manage::remember_layout`]), for the next install that
+/// has no command to look at.
 pub async fn run_monitor(
     registry: std::sync::Arc<crate::agent_pty::AgentPtyRegistry>,
     state: crate::state::SharedState,
@@ -439,27 +504,22 @@ pub async fn run_monitor(
             .collect();
         {
             let state = state.read().await;
-            let (now, wall) = (std::time::Instant::now(), chrono::Utc::now());
             for w in &watched {
-                // The newest native hook event of this pane's agent, as an
-                // instant on the monitor's clock.
+                // The newest native hook event of this pane's agent (review
+                // F3/F9: not `last_activity`, which wrapper and
+                // daemon-synthetic frames also move, and which is wall-clock).
                 let hooked = state
                     .sessions
                     .values()
                     .filter(|session| {
-                        session.native_hooks_reported
-                            && session.pane_id.as_deref() == Some(w.pane_id.as_str())
+                        session.pane_id.as_deref() == Some(w.pane_id.as_str())
                             && session
                                 .agent_id
                                 .as_deref()
                                 .is_none_or(|agent| agent == w.agent_id)
                     })
-                    .map(|session| session.last_activity)
-                    .max()
-                    .map(|at| {
-                        let ago = (wall - at).to_std().unwrap_or_default();
-                        now.checked_sub(ago).unwrap_or(now)
-                    });
+                    .filter_map(|session| session.last_native_hook_at)
+                    .max();
                 if let Some(at) = hooked {
                     let entry = last_report.entry(w.agent_id.clone()).or_insert(at);
                     *entry = (*entry).max(at);
@@ -477,6 +537,9 @@ pub async fn run_monitor(
                 &crate::opencode_version::recorded_version,
                 &last_report,
             );
+            for major in watch.take_confirmed() {
+                crate::opencode_manage::remember_layout(major);
+            }
             Some((watch, notices))
         });
         let Ok(outcome) = job.await else {
@@ -571,7 +634,8 @@ mod tests {
 
     #[test]
     fn the_client_is_the_topmost_opencode_and_a_direct_command_is_its_own_root() {
-        // A node launcher (an older npm install) running the native binary.
+        // OpenCode's native binary as the child of a process that is not
+        // OpenCode (here node).
         let rows = vec![
             row(200, 1, "/usr/bin/node", &[]),
             row(
@@ -660,6 +724,125 @@ mod tests {
         );
     }
 
+    /// Scenario (review F2): a silent plugin whose OpenCode the deck could not
+    /// tell the version of (a wrapper started it) and which has no private
+    /// server may be an OpenCode 2 on the shared service, so its notice names
+    /// both remedies; with a private server (only a standalone OpenCode 2 has
+    /// one) or a known 1.x, the install remedy alone, word for word as before.
+    #[test]
+    fn an_unknown_version_without_a_private_server_names_both_remedies() {
+        let unknown = notice_for(&client(false), None, SILENT_GRACE, false).unwrap();
+        assert_eq!(unknown.kind, AgentNoticeKind::OpencodeNotReporting);
+        assert_eq!(
+            unknown.text,
+            crate::agent_notice::OPENCODE_NOT_REPORTING_MAYBE_SHARED
+        );
+        for (private_server, version) in [(true, None), (false, Some((1, 19, 5)))] {
+            let known = notice_for(&client(private_server), version, SILENT_GRACE, false).unwrap();
+            assert_eq!(
+                known.text,
+                crate::agent_notice::OPENCODE_NOT_REPORTING,
+                "{private_server} {version:?}"
+            );
+        }
+        assert_eq!(
+            kind(notice_for(&client(false), None, SILENT_GRACE, true)),
+            None,
+            "reporting"
+        );
+    }
+
+    /// Scenario (audit F3): a pane started directly on an old npm OpenCode,
+    /// whose `bin/opencode` is a `#!/bin/sh` launcher that `exec`s a native
+    /// binary, so the client's executable is a file nobody probed. The
+    /// version the spawn read from the launcher counts for that pane's client,
+    /// so the card says the version is too old; a wrapper pane running the
+    /// same unprobed file stays unknown.
+    #[test]
+    fn a_direct_spawns_version_counts_for_its_panes_client() {
+        let rows = wrapped(&["opencode"], None);
+        let watched = |spawn_version| Watched {
+            pane_id: "a".to_string(),
+            agent_id: "agent-a".to_string(),
+            root_pid: 100,
+            spawn_version,
+        };
+        let unprobed = |_: &Path| None;
+        let t0 = std::time::Instant::now();
+        let direct = evaluate(
+            &[watched(Some((1, 0, 0)))],
+            &rows,
+            &mut Watch::default(),
+            t0,
+            &unprobed,
+            &HashMap::new(),
+        );
+        assert_eq!(
+            direct[0].1.as_ref().map(|n| n.kind),
+            Some(AgentNoticeKind::OpencodeUnsupportedVersion)
+        );
+        let wrapper = evaluate(
+            &[watched(None)],
+            &rows,
+            &mut Watch::default(),
+            t0,
+            &unprobed,
+            &HashMap::new(),
+        );
+        assert_eq!(wrapper[0].1, None, "unknown, and too early to call silent");
+    }
+
+    /// Scenario (review F2): a wrapper pane's client runs the file the deck
+    /// probed on the pane's PATH, so its version is known; its generation is
+    /// queued once, to be remembered as the plugin layout, and again only
+    /// for a new client. A direct pane's generation is never queued: its
+    /// spawn already wrote that layout.
+    #[test]
+    fn a_wrapper_clients_known_generation_is_queued_once_per_client() {
+        let rows = wrapped(&["opencode"], None);
+        let restarted: Vec<ProcRow> = rows
+            .iter()
+            .cloned()
+            .map(|mut r| {
+                if r.pid == 102 {
+                    r.pid = 202;
+                }
+                r
+            })
+            .collect();
+        let wrapper = [Watched {
+            pane_id: "a".to_string(),
+            agent_id: "agent-a".to_string(),
+            root_pid: 100,
+            spawn_version: None,
+        }];
+        let v2 = |_: &Path| Some((2, 2, 5));
+        let mut watch = Watch::default();
+        let t0 = std::time::Instant::now();
+        let none = HashMap::new();
+        evaluate(&wrapper, &rows, &mut watch, t0, &v2, &none);
+        assert_eq!(watch.take_confirmed(), vec![Major::V2]);
+        evaluate(&wrapper, &rows, &mut watch, t0 + POLL_INTERVAL, &v2, &none);
+        assert_eq!(watch.take_confirmed(), vec![], "the same client");
+        evaluate(
+            &wrapper,
+            &restarted,
+            &mut watch,
+            t0 + POLL_INTERVAL * 2,
+            &v2,
+            &none,
+        );
+        assert_eq!(watch.take_confirmed(), vec![Major::V2], "a new client");
+
+        let direct = [Watched {
+            spawn_version: Some((2, 2, 5)),
+            ..wrapper[0].clone()
+        }];
+        let mut watch = Watch::default();
+        evaluate(&direct, &rows, &mut watch, t0, &v2, &none);
+        assert_eq!(watch.take_confirmed(), vec![]);
+    }
+
     #[test]
     fn a_silent_plugin_is_reported_only_after_its_grace_and_only_while_silent() {
         for version in [Some((1, 19, 5)), Some((2, 2, 5)), None] {
@@ -695,6 +878,7 @@ mod tests {
             pane_id: pane.to_string(),
             agent_id: format!("agent-{pane}"),
             root_pid: root,
+            spawn_version: None,
         };
         let all = [watched("a", 100), watched("b", 300), watched("c", 400)];
         let t0 = std::time::Instant::now();
@@ -745,6 +929,7 @@ mod tests {
             pane_id: "a".to_string(),
             agent_id: "agent-a".to_string(),
             root_pid: 100,
+            spawn_version: None,
         }];
         let v2 = |_: &Path| Some((2, 2, 5));
         let mut watch = Watch::default();

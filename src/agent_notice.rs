@@ -50,8 +50,15 @@ pub const OPENCODE_SUPPORTED_FLOOR: crate::opencode_version::Version = (1, 18, 2
 /// [`AgentNoticeKind::OpencodeSharedService`]'s sentence.
 pub const OPENCODE_SHARED_SERVICE: &str = "Add --standalone to the command or run opencode service set disabled true, then restart: OpenCode 2's shared service hides this agent";
 
-/// [`AgentNoticeKind::OpencodeNotReporting`]'s sentence.
+/// [`AgentNoticeKind::OpencodeNotReporting`]'s sentence, when the agent's
+/// OpenCode is known to be 1.x or a standalone OpenCode 2.
 pub const OPENCODE_NOT_REPORTING: &str = "Run dot-agent-deck hooks install --agent opencode, then restart: the deck's OpenCode plugin is not reporting from this agent";
+
+/// [`AgentNoticeKind::OpencodeNotReporting`]'s sentence when the deck does not
+/// know the agent's OpenCode version (a wrapper started it) and it has no
+/// private server, so it may be an OpenCode 2 on the shared service: both
+/// remedies, the shared service's first.
+pub const OPENCODE_NOT_REPORTING_MAYBE_SHARED: &str = "Add --standalone to the command (OpenCode 2) or run dot-agent-deck hooks install --agent opencode, then restart: the deck's OpenCode plugin is not reporting";
 
 impl AgentNotice {
     /// OpenCode 2 on its shared background service.
@@ -67,6 +74,16 @@ impl AgentNotice {
         Self {
             kind: AgentNoticeKind::OpencodeNotReporting,
             text: OPENCODE_NOT_REPORTING.to_string(),
+        }
+    }
+
+    /// The deck's plugin has not reported from a running OpenCode whose
+    /// version the deck does not know and which may be on OpenCode 2's shared
+    /// service ([`OPENCODE_NOT_REPORTING_MAYBE_SHARED`]).
+    pub fn opencode_not_reporting_maybe_shared() -> Self {
+        Self {
+            kind: AgentNoticeKind::OpencodeNotReporting,
+            text: OPENCODE_NOT_REPORTING_MAYBE_SHARED.to_string(),
         }
     }
 
@@ -129,6 +146,16 @@ mod tests {
         assert!(
             silent.contains("dot-agent-deck hooks install --agent opencode"),
             "{silent}"
+        );
+        let unknown = AgentNotice::opencode_not_reporting_maybe_shared();
+        assert_eq!(unknown.kind, AgentNoticeKind::OpencodeNotReporting);
+        assert!(
+            unknown.text.starts_with("Add --standalone to the command")
+                && unknown
+                    .text
+                    .contains("dot-agent-deck hooks install --agent opencode, then restart"),
+            "{}",
+            unknown.text
         );
         let old = AgentNotice::opencode_unsupported_version((1, 18, 28)).text;
         assert_eq!(

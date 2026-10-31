@@ -5141,17 +5141,22 @@ fn admit_inbox_component_with(
 ///   ([`crate::opencode_mode::opencode_name`]) whose arguments carry the
 ///   tokens `serve` and `--stdio`;
 /// - on Linux, its stdin and stdout are both sockets, as a private server's
-///   are (measured on 2.2.5: a socketpair with its client). A process a tool
-///   starts with `exec opencode serve --stdio` keeps the tool's stdio, which
-///   is pipes or `/dev/null`, so it stands as named. Off Linux this is not
-///   checked;
+///   are (measured on 2.2.5: a socketpair with its client). This is a
+///   heuristic: under OpenCode's Bun runtime a tool's child started with
+///   piped stdio has a socket on stdin and a pipe on stdout (measured on
+///   1.18.35 and 2.2.5), so for a process a tool starts it rests on stdout,
+///   and a tool that redirects its stdio (`exec opencode serve --stdio
+///   1>&0`) passes it. Off Linux this is not checked;
 /// - its direct parent runs the very same executable and is not above the
 ///   agent's own process `root` ([`admit_component`]).
 ///
-/// When any of that fails, or cannot be read, `instance` stands. On 2.2.5 a
-/// tool's commands run under the private server, not the client (measured),
-/// so a nested OpenCode a tool starts resolves at most to the pane's private
-/// server, which is not the pinned client, and the hub's pin refuses it.
+/// When any of that fails, or cannot be read, `instance` stands. On 2.x the
+/// barrier is the parentage: on 2.2.5 a tool's commands run under the
+/// private server, not the client (measured), so a nested OpenCode a tool
+/// starts resolves at most to the pane's private server, which is not the
+/// pinned client, and the hub's pin refuses it. On 1.x, where tools run in
+/// the client, the socket check is all that stands, and a redirect defeats
+/// it; that is a process the agent itself runs (audit D1's accepted scope).
 fn opencode_server_client(
     instance: u32,
     root: Option<u32>,

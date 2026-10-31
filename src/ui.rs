@@ -23715,6 +23715,7 @@ pub fn render_orchestration_frame_to_buffer(
                 display_name: None,
                 shell_synthetic_working: false,
                 native_hooks_reported: false,
+                last_native_hook_at: None,
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 output_set_status: false,
@@ -24513,6 +24514,7 @@ pub fn observe_dashboard_geometry(width: u16, height: u16, card_count: usize) ->
                 display_name: None,
                 shell_synthetic_working: false,
                 native_hooks_reported: false,
+                last_native_hook_at: None,
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 output_set_status: false,
@@ -27298,6 +27300,7 @@ mod tests {
                 display_name: None,
                 shell_synthetic_working: false,
                 native_hooks_reported: false,
+                last_native_hook_at: None,
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 output_set_status: false,
@@ -31107,6 +31110,7 @@ mod tests {
             display_name: None,
             shell_synthetic_working: false,
             native_hooks_reported: false,
+            last_native_hook_at: None,
             orchestration_orphaned: false,
             subagent_wait: None,
             output_set_status: false,
@@ -34157,6 +34161,7 @@ mod tests {
             display_name: None,
             shell_synthetic_working: false,
             native_hooks_reported: false,
+            last_native_hook_at: None,
             orchestration_orphaned: false,
             subagent_wait: None,
             output_set_status: false,
@@ -34954,6 +34959,7 @@ mod tests {
             display_name: None,
             shell_synthetic_working: false,
             native_hooks_reported: false,
+            last_native_hook_at: None,
             orchestration_orphaned: false,
             subagent_wait: None,
             output_set_status: false,
@@ -35140,6 +35146,28 @@ mod tests {
         │Run dot-agent-deck hooks install --agent opencode, then   │
         │restart: the deck's OpenCode plugin is not reporting from │
         │this agent                                                │
+        │                                                          │
+        │                                                          │
+        ");
+    }
+
+    /// Scenario: an OpenCode card whose deck plugin never reported, and whose
+    /// OpenCode version the deck does not know (a wrapper started it, with no
+    /// private server), is drawn 60 columns wide; the notice row wraps over
+    /// three rows and shows both fixes, `--standalone` first, and the restart
+    /// (PRD #2050, review F2).
+    #[test]
+    fn an_opencode_card_shows_the_unknown_version_not_reporting_notice_whole() {
+        let card = opencode_card_with_agent_notice(
+            crate::agent_notice::OPENCODE_NOT_REPORTING_MAYBE_SHARED,
+            60,
+            CardDensity::Normal,
+        );
+        insta::assert_snapshot!(card, @r"
+        │Dir:  —                                                   │
+        │Add --standalone to the command (OpenCode 2) or run       │
+        │dot-agent-deck hooks install --agent opencode, then       │
+        │restart: the deck's OpenCode plugin is not reporting      │
         │                                                          │
         │                                                          │
         ");
@@ -35617,6 +35645,7 @@ mod tests {
             display_name: None,
             shell_synthetic_working: false,
             native_hooks_reported: false,
+            last_native_hook_at: None,
             orchestration_orphaned: false,
             subagent_wait: None,
             output_set_status: false,
@@ -35661,6 +35690,7 @@ mod tests {
             display_name: None,
             shell_synthetic_working: false,
             native_hooks_reported: false,
+            last_native_hook_at: None,
             orchestration_orphaned: false,
             subagent_wait: None,
             output_set_status: false,
@@ -35696,6 +35726,7 @@ mod tests {
             display_name: None,
             shell_synthetic_working: false,
             native_hooks_reported: false,
+            last_native_hook_at: None,
             orchestration_orphaned: false,
             subagent_wait: None,
             output_set_status: false,

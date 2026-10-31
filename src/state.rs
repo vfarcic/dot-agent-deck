@@ -913,6 +913,13 @@ pub struct SessionState {
     /// guards against would then end that turn again. A respawned agent gets a
     /// new card, so its predecessor's hooks do not speak for it. Process-local.
     pub native_hooks_reported: bool,
+    /// PRD #2050 (review F3/F9): when the newest frame that set
+    /// [`Self::native_hooks_reported`] arrived, on the monotonic clock. The
+    /// daemon's OpenCode watch ([`crate::opencode_mode`]) reads it as the
+    /// plugin's last sign of life, rather than `last_activity`, which wrapper
+    /// and daemon-synthetic frames also move and which follows the wall
+    /// clock. `None` until a native frame arrives. Process-local.
+    pub last_native_hook_at: Option<std::time::Instant>,
     /// Issue #770: this session's pane is an ORPHANED orchestration role pane —
     /// the daemon holds no orchestration role for it, so
     /// `dot-agent-deck delegate` from it is refused and no worker can be
@@ -8781,6 +8788,7 @@ impl AppState {
                 display_name: None,
                 shell_synthetic_working: false,
                 native_hooks_reported: false,
+                last_native_hook_at: None,
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 output_set_status: false,
@@ -13544,6 +13552,7 @@ impl AppState {
                 display_name: None,
                 shell_synthetic_working: false,
                 native_hooks_reported: false,
+                last_native_hook_at: None,
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 output_set_status: false,
@@ -13841,6 +13850,7 @@ impl AppState {
             && !event.is_daemon_synthetic()
         {
             session.native_hooks_reported = true;
+            session.last_native_hook_at = Some(std::time::Instant::now());
         }
         // Issue #714: a `Blocked` card is STICKY. The provider has refused the
         // agent, and the frames that typically trail that refusal — OpenCode's
@@ -17464,6 +17474,53 @@ mod tests {
         );
     }
 
+    /// PRD #2050 (review F3/F9): the instant of the agent's last native hook
+    /// frame moves only with a native frame: a daemon-synthetic frame (the
+    /// shell-activity pair) landing on the same card later moves
+    /// `last_activity` but leaves it where it was, so it cannot vouch for an
+    /// OpenCode whose plugin stopped reporting.
+    #[test]
+    fn only_a_native_frame_moves_the_last_native_hook_instant() {
+        let event = |event_type| AgentEvent {
+            session_id: "s1".to_string(),
+            agent_type: AgentType::OpenCode,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: Some("worker".to_string()),
+            agent_id: Some("agent-1".to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            background: None,
+            background_revision: None,
+        };
+        let mut state = AppState::default();
+        let before = std::time::Instant::now();
+        state.apply_event(event(EventType::SessionStart));
+        let native = state.sessions["s1"]
+            .last_native_hook_at
+            .expect("a native frame records its instant");
+        assert!(native >= before);
+        let activity = state.sessions["s1"].last_activity;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        state.apply_event(event(EventType::ShellBusy));
+        state.apply_event(event(EventType::ShellIdle));
+        assert_eq!(
+            state.sessions["s1"].last_native_hook_at,
+            Some(native),
+            "a daemon-synthetic frame is not the agent's hook"
+        );
+        assert!(
+            state.sessions["s1"].last_activity >= activity,
+            "the synthetic frame still counts as activity"
+        );
+    }
+
     /// PRD #370 M2: the whole point of the feature — `ShellBusy` fills a
     /// stale `Idle`/`Unknown` gap with `Working`, and the paired `ShellIdle`
     /// reverts it, WITHOUT either one ever clobbering a real, agent-emitted
@@ -18985,6 +19042,7 @@ mod tests {
                 display_name: None,
                 shell_synthetic_working: false,
                 native_hooks_reported: false,
+                last_native_hook_at: None,
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 output_set_status: false,
