@@ -3584,6 +3584,90 @@ struct HydrationTrace {
     handle: JoinHandle<()>,
 }
 
+fn hydration_diagnostics_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some()
+}
+
+fn hydration_registry_snapshot(registry: &AgentPtyRegistry) -> String {
+    format!(
+        "registry (record, alive)={:?}",
+        registry.agent_records_including_exited()
+    )
+}
+
+/// Scenario: Render diagnostic snapshots of a registered live `cat` child and a retained child that exited normally. Both records remain in the snapshot with accurately labeled exit flags.
+#[spec("session/live/017")]
+#[test]
+fn live_017_diagnostic_registry_labels_live_and_retained_exited_records() {
+    child_lifetime_bound::arm();
+    let registry = Arc::new(AgentPtyRegistry::new());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build diagnostic control runtime");
+    let _guard = rt.enter();
+    let live = registry
+        .spawn_agent(SpawnOptions {
+            command: Some("cat"),
+            ..SpawnOptions::default()
+        })
+        .expect("spawn live diagnostic control");
+    let exited = registry
+        .spawn_agent(SpawnOptions {
+            command: Some("exit 0"),
+            ..SpawnOptions::default()
+        })
+        .expect("spawn retained exited diagnostic control");
+    rt.block_on(async {
+        let _ = tokio::time::timeout(Duration::from_secs(5), registry.agent_exit_signal(&exited))
+            .await
+            .expect("diagnostic control child must exit within 5s");
+    });
+    let records = registry.agent_records_including_exited();
+    for (id, observed_exited) in [(&live, false), (&exited, true)] {
+        let record = records
+            .iter()
+            .find(|(record, _)| &record.id == id)
+            .expect("both diagnostic control records remain registered");
+        assert_eq!(record.1, observed_exited, "control exit flag for {id}");
+    }
+    let snapshot = hydration_registry_snapshot(&registry);
+    // Stop only the children owned by this registry, before assertions can panic.
+    registry.shutdown_all();
+    assert!(
+        snapshot.starts_with("registry (record, observed_exited)="),
+        "diagnostic must label the stored exit flag accurately: {snapshot}"
+    );
+    for (id, observed_exited) in [(&live, false), (&exited, true)] {
+        let (record, _) = records.iter().find(|(record, _)| &record.id == id).unwrap();
+        assert!(
+            snapshot.contains(&format!("({record:?}, {observed_exited})")),
+            "diagnostic must print id={id} with observed_exited={observed_exited}: {snapshot}"
+        );
+    }
+}
+
+/// Scenario: Select the test-only hydration observer with a diagnostic option. Only the literal `1` enables it; an absent value, `0`, an empty value and other strings keep hydration on the original socket.
+#[spec("session/live/017")]
+#[test]
+fn live_017_diagnostic_opt_in_requires_literal_one() {
+    for (value, expected) in [
+        (None, false),
+        (Some("1"), true),
+        (Some("0"), false),
+        (Some(""), false),
+        (Some("true"), false),
+        (Some("01"), false),
+        (Some(" 1"), false),
+    ] {
+        assert_eq!(
+            hydration_diagnostics_enabled(value.map(std::ffi::OsStr::new)),
+            expected,
+            "diagnostic option {value:?} must enable tracing only for literal 1"
+        );
+    }
+}
+
 impl Drop for HydrationTrace {
     fn drop(&mut self) {
         self.handle.abort();
@@ -3614,8 +3698,8 @@ impl HydrationTrace {
                                 matches!(&parsed, Ok(AttachRequest::AttachStream { .. }));
                             if listing {
                                 transcript.lock().unwrap().push(format!(
-                                    "before ListAgents registry (record, alive)={:?}",
-                                    registry.agent_records_including_exited()
+                                    "before ListAgents {}",
+                                    hydration_registry_snapshot(&registry)
                                 ));
                             }
                             write_frame(&mut upstream, kind, &request).await?;
@@ -3725,7 +3809,9 @@ async fn live_017_reconnect_adopts_the_daemons_pane_generation_inner() {
 
     // A fresh TUI hydrates over the real attach socket (`ListAgents`).
     // Opt in when reproducing #1786; the default path has no proxy scheduling.
-    let trace = if std::env::var_os("DAD_REHYDRATION_DIAGNOSTICS").is_some() {
+    let trace = if hydration_diagnostics_enabled(
+        std::env::var_os("DAD_REHYDRATION_DIAGNOSTICS").as_deref(),
+    ) {
         Some(HydrationTrace::start(&daemon).await)
     } else {
         None
@@ -3747,8 +3833,8 @@ async fn live_017_reconnect_adopts_the_daemons_pane_generation_inner() {
         .find(|pane| pane.agent_id == agent_id)
         .unwrap_or_else(|| {
             panic!(
-                "the wrapped pane was not hydrated; hydrated={hydrated:?}; registry after hydration (record, alive)={:?}; wire trace={:?}",
-                daemon.registry.agent_records_including_exited(),
+                "the wrapped pane was not hydrated; hydrated={hydrated:?}; after hydration {}; wire trace={:?}",
+                hydration_registry_snapshot(&daemon.registry),
                 trace.as_ref().map(|trace| trace.entries.lock().unwrap().clone())
             )
         })
