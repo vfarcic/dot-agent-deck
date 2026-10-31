@@ -650,6 +650,15 @@ impl UpgradePlan {
     /// The first line: the same words as the TUI's footer badge.
     pub fn headline(&self) -> String {
         match self.action {
+            PlanAction::UpToDate
+                if crate::version::is_unknown_version(&self.installation.version) =>
+            {
+                format!(
+                    "{} does not know which release it is (it reports v{}), so no upgrade is offered. Install a release to get upgrade notices.",
+                    self.label(),
+                    self.installation.version
+                )
+            }
             PlanAction::UpToDate => format!(
                 "{} is up to date (v{}).",
                 self.label(),
@@ -1192,6 +1201,51 @@ mod tests {
             assert_eq!(plan.action, PlanAction::UpToDate);
             assert_eq!(plan.lines().len(), 1);
         }
+    }
+
+    /// Issue #326: a copy that does not know its own version reports the
+    /// `0.1.0` placeholder marked `+unknown`. Read as `0.1.0` it was offered
+    /// every release, and the badge never went away; it is offered nothing,
+    /// on either formula, and the headline says why.
+    #[test]
+    fn plan_033_a_copy_that_does_not_know_its_version_is_offered_nothing() {
+        let exe = "/home/u/.local/bin/dot-agent-deck";
+        let mut found = cli(
+            exe,
+            InstallMethod::DownloadedWritable {
+                binary: PathBuf::from(exe),
+            },
+        );
+        found.version = "0.1.0+unknown".into();
+        for releases in [
+            releases("0.49.3", None),
+            releases("0.50.0-beta.1", Some("0.50.0-beta.1")),
+        ] {
+            let planned = plan(&found, &releases, &options());
+            assert_eq!(planned.action, PlanAction::UpToDate);
+            assert_eq!(planned.lines().len(), 1);
+            let headline = planned.headline();
+            assert!(
+                headline.contains("does not know which release it is (it reports v0.1.0+unknown)"),
+                "{headline}"
+            );
+            assert!(!headline.contains("up to date"), "{headline}");
+        }
+
+        let mut beta = found.clone();
+        beta.method = InstallMethod::Homebrew {
+            formula: HomebrewFormula::Beta,
+            prefix: PathBuf::from("/home/linuxbrew/.linuxbrew"),
+        };
+        let planned = plan(&beta, &releases("0.50.0-beta.1", None), &options());
+        assert_eq!(planned.action, PlanAction::UpToDate);
+
+        // A copy that genuinely runs the 0.1.0 release is still offered one.
+        found.version = "0.1.0".into();
+        assert_ne!(
+            plan(&found, &"0.49.3".into(), &options()).action,
+            PlanAction::UpToDate
+        );
     }
 
     #[test]

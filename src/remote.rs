@@ -2120,6 +2120,19 @@ pub enum RemoteAddError {
     UnsupportedType { kind: String },
     #[error("Invalid --version '{input}': must look like '0.24.5' or 'v0.24.5'.")]
     InvalidVersion { input: String },
+    /// The version to install is the one this build reports, and this build
+    /// does not know it (issue #326): it fell back to the `0.1.0` placeholder,
+    /// which names an old release rather than this build.
+    #[error(
+        "This dot-agent-deck build does not know its own version (it reports {input}), so it cannot choose a release to install. Pass --version <x.y.z> naming the release you want on the remote."
+    )]
+    VersionUnknown { input: String },
+    /// The remote's binary reports that it does not know its own version
+    /// (issue #326), so whether it is the requested release cannot be told.
+    #[error(
+        "The remote's dot-agent-deck build does not know its own version (it reports {actual}), so it cannot be checked against {expected}. Install a release there (`remote add` or `remote upgrade` without --no-install), or rebuild it with DAD_VERSION=<x.y.z> set, or from a checkout with tags."
+    )]
+    RemoteVersionUnknown { actual: String, expected: String },
     #[error(transparent)]
     Ssh(#[from] SshError),
     #[error("Remote arch is `{arch}`; supported: linux-{{amd64,arm64}}, darwin-{{amd64,arm64}}.")]
@@ -2188,6 +2201,14 @@ fn version_regex() -> &'static Regex {
 /// (GitHub release tag) prepends `v` themselves. The user may type either
 /// `0.24.5` or `v0.24.5`; both normalize to `0.24.5`.
 pub fn validate_version_string(version: &str) -> Result<String, RemoteAddError> {
+    // Issue #326: the default `--version` is this build's own, and a build
+    // that does not know it carries `+unknown`. Say so, rather than calling
+    // the user's input invalid when they typed none.
+    if crate::version::is_unknown_version(version) {
+        return Err(RemoteAddError::VersionUnknown {
+            input: version.to_string(),
+        });
+    }
     if version_regex().is_match(version) {
         Ok(version.strip_prefix('v').unwrap_or(version).to_string())
     } else {
@@ -2266,6 +2287,12 @@ fn install_and_verify(
             });
         }
         let actual = parse_version_output(&v.stdout).unwrap_or_else(|| v.stdout.trim().to_string());
+        if crate::version::is_unknown_version(&actual) {
+            return Err(RemoteAddError::RemoteVersionUnknown {
+                actual: scrub_remote_text(&actual),
+                expected: version.to_string(),
+            });
+        }
         if actual != version {
             return Err(RemoteAddError::VersionMismatch {
                 actual: scrub_remote_text(&actual),
@@ -2318,6 +2345,7 @@ pub const UNVERIFIED_BUILD: &str = "an unverified build";
 fn replaced_but_unverified(binary: &str, check: RemoteAddError) -> RemoteAddError {
     let on_disk = match &check {
         RemoteAddError::VersionMismatch { actual, .. } => validate_version_string(actual).ok(),
+        RemoteAddError::RemoteVersionUnknown { actual, .. } => Some(actual.clone()),
         _ => None,
     };
     RemoteAddError::ReplacedButUnverified {
@@ -2527,6 +2555,12 @@ fn remote_binary_version(
         });
     }
     let actual = parse_version_output(&v.stdout).unwrap_or_else(|| v.stdout.trim().to_string());
+    if crate::version::is_unknown_version(&actual) {
+        return Err(RemoteAddError::RemoteVersionUnknown {
+            actual: scrub_remote_text(&actual),
+            expected: expected.to_string(),
+        });
+    }
     validate_version_string(&actual).map_err(|_| RemoteAddError::VersionMismatch {
         actual: scrub_remote_text(&actual),
         expected: expected.to_string(),
@@ -4146,6 +4180,130 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(RemoteUpgradeError::Inner(err).installed_version(), None);
+    }
+
+    /// Issue #326: `remote add` and `remote upgrade` default `--version` to
+    /// this build's own, and a build that does not know it reports
+    /// `0.1.0+unknown`. Both refuse it as "version unknown" before any ssh
+    /// call (an empty script panics on the first one), rather than installing
+    /// the real, ancient v0.1.0 or calling the user's input invalid.
+    #[test]
+    fn remote_add_and_upgrade_refuse_an_unknown_own_version_before_any_ssh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("remotes.toml");
+        let opts = AddOptions {
+            name: "prod".to_string(),
+            remote_type: "ssh".to_string(),
+            target: "user@host".to_string(),
+            port: 22,
+            key: None,
+            version: "0.1.0+unknown".to_string(),
+            no_install: true,
+            release_base: "https://example.test/releases/download".to_string(),
+        };
+        for no_install in [true, false] {
+            let opts = AddOptions {
+                no_install,
+                ..opts.clone()
+            };
+            let err = add(&opts, &ScriptedSsh::new([]), &path).expect_err("refused");
+            assert!(
+                matches!(&err, RemoteAddError::VersionUnknown { input } if input == "0.1.0+unknown"),
+                "{err:?}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains("does not know its own version"), "{msg}");
+            assert!(msg.contains("--version <x.y.z>"), "{msg}");
+        }
+        assert!(!path.exists(), "a refused add wrote the registry");
+
+        let upgrade_opts = UpgradeOptions {
+            name: "prod".to_string(),
+            version: "0.1.0+unknown".to_string(),
+            no_install: true,
+            release_base: "https://example.test/releases/download".to_string(),
+        };
+        let err =
+            upgrade_reporting_to(&upgrade_opts, &ScriptedSsh::new([]), &path, &mut Vec::new())
+                .expect_err("refused");
+        assert!(
+            matches!(
+                &err,
+                RemoteUpgradeError::Inner(RemoteAddError::VersionUnknown { .. })
+            ),
+            "{err:?}"
+        );
+
+        // A genuine 0.1.0 is a real release, and still a valid --version.
+        assert_eq!(validate_version_string("0.1.0").unwrap(), "0.1.0");
+    }
+
+    /// Issue #326: `--no-install` against a remote whose binary does not know
+    /// its own version says so, on the `~/.local/bin` path and the Homebrew
+    /// one, rather than reporting a mismatch with an ancient `0.1.0`.
+    #[test]
+    fn no_install_reports_a_remote_build_that_does_not_know_its_version() {
+        let target = SshTarget::parse("user@host", 22, None);
+        let unknown = || ssh_ok("dot-agent-deck 0.1.0+unknown\n");
+
+        let executor = ScriptedSsh::new([unknown()]);
+        let err = install_and_verify(
+            &executor,
+            &target,
+            "linux-amd64",
+            "0.49.3",
+            "https://example.test/releases/download",
+            true,
+        )
+        .expect_err("an unknown remote version is not the requested one");
+        assert!(
+            matches!(
+                &err,
+                RemoteAddError::RemoteVersionUnknown { actual, expected }
+                    if actual == "0.1.0+unknown" && expected == "0.49.3"
+            ),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string().contains("does not know its own version"),
+            "{err}"
+        );
+
+        let brew_probe = || ssh_ok("local-bin=\nhomebrew=/opt/homebrew\nformula=dot-agent-deck\n");
+        let executor = ScriptedSsh::new([brew_probe(), unknown()]);
+        let err = install_or_upgrade(
+            &executor,
+            &target,
+            "mac",
+            "darwin-arm64",
+            "0.49.3",
+            "https://example.test/releases/download",
+            true,
+            false,
+            &mut Vec::new(),
+        )
+        .err()
+        .expect("an unknown Homebrew version is not the requested one");
+        assert!(
+            matches!(err, RemoteAddError::RemoteVersionUnknown { .. }),
+            "{err:?}"
+        );
+
+        // A remote that genuinely runs the 0.1.0 release is still a mismatch.
+        let executor = ScriptedSsh::new([ssh_ok("dot-agent-deck 0.1.0\n")]);
+        let err = install_and_verify(
+            &executor,
+            &target,
+            "linux-amd64",
+            "0.49.3",
+            "https://example.test/releases/download",
+            true,
+        )
+        .expect_err("a different release is a mismatch");
+        assert!(
+            matches!(err, RemoteAddError::VersionMismatch { .. }),
+            "{err:?}"
+        );
     }
 
     /// Issue #1350: `remote add` refuses an unsafe address with the rules the
