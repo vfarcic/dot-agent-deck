@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.49.4] - 2026-10-31
+
+### Fixed
+
+- **Status Updates From One Agent Stay in Order on a Busy Machine**
+  On a heavily loaded machine, two status updates that one agent sent close together could be applied in the wrong order, so a card could show a status the agent had already moved past. The visible case was an OpenCode agent that had hit its usage limit: its card could read Idle instead of Blocked, so a delegate to it gave no warning and the orchestrator was not told it was blocked.
+  Updates from one agent's session, and from one pane, are now applied in the order the agent sent them, so a blocked agent's card reads Blocked.
+- **Failed Claude Code Commands End on Time**
+  A tool call that fails in Claude Code, such as a Bash command that exits with an error, now ends on the agent's card as soon as Claude Code moves on. Before, the deck never heard that a failed call had ended, so the card kept showing the failed command as the one running, and with telemetry on, that command's `agent.operation` span lasted until the run ended. A failed command is ordinary agent work, so the card keeps its status and does not turn to Error.
+  The deck installs the `PostToolUseFailure` hook that makes this work for Claude Code 2.1.78 or newer, the next time the TUI or the daemon starts. See [Installation](https://agent-deck.devopstoolkit.ai/docs/installation.md#agent-hooks) for the hooks the deck installs.
+- **A Failed Terminal Open on macOS Is Retried Before the Agent Pane Fails**
+  On macOS, opening the terminal for a new agent pane could fail with `failed to openpty: … Device not configured`, and the pane did not start. When macOS reports that error, the deck now retries the open before giving up, so a pane that hits it can still start. If every try fails, or the terminal fails to open for any other reason, you see the same error as before.
+- **A copy that does not know its version is no longer treated as the oldest release**
+  A dot-agent-deck built from source without a version (no `DAD_VERSION` set and no git tags in the checkout) used to report itself as v0.1.0. Everything that compares versions then read it as the oldest release: the TUI badge, the desktop app and `dot-agent-deck upgrade` offered an upgrade forever, `connect` asked to upgrade such a remote on every connection, and `remote add` / `remote upgrade` quietly installed the real v0.1.0 release. Such a copy now reports `0.1.0+unknown`, and dot-agent-deck says it does not know its version instead: no upgrade is offered and the notice says why, `connect` names the remote's unknown version and the `remote upgrade` command that fixes it, `remote add` and `remote upgrade` ask you to pass `--version`, and `remote add --no-install` reports a remote copy that does not know its version as unknown instead of as a mismatch. Released builds are unaffected. To build a copy that knows its version, set `DAD_VERSION=<x.y.z>` or build from a checkout that has the tags.
+
+
+
 ## [0.49.3] - 2026-10-30
 
 ### Added
