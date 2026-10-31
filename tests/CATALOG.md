@@ -10016,11 +10016,11 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 - **Platform coverage:** mac+linux.
 
 ##### inbox/doorbell/009 — Enter releases a doorbell after an attached human draft.
-- **Layer:** L2 lane 1 (`tests/e2e_automatic_write_draft.rs`), real binary and daemon-owned PTY, attached real TUI.
-- **Agent:** none (the e2e stand-in profile's Python editor (selected by `DOT_AGENT_DECK_TEST_COMPOSER_PROFILE=standin` with `DOT_AGENT_DECK_TEST_COMPOSER_BINARY` naming the executable the pane runs); no agent executable or credential).
-- **Asserts:** Real TUI keystrokes keep a task deferred while the stand-in's composer shows the draft; Enter produces separate submissions for the human draft and the token-led line, exactly `<draft>\r<line>\r`, the attached TUI showing the submitted row's token and id, without typing message content.
+- **Layer:** L2 lane 1 (`tests/e2e_probe_delivery.rs`), real binary and daemon-owned PTY, attached real TUI.
+- **Agent:** none (the native synthetic Claude with the F2 Python composer and real installed helper; no agent executable or credential).
+- **Asserts:** Real TUI keystrokes keep a task deferred while the stand-in's composer shows the draft; Enter produces separate submissions for the human draft and the token-led line, exactly `<draft>\x07\r\x07<line>\r`, the attached TUI showing the submitted row's token and id, without typing message content.
 - **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
-- **Platform coverage:** mac+linux.
+- **Platform coverage:** Linux.
 
 ##### inbox/doorbell/010 — A genuine draft stays protected; an empty editor releases the doorbell.
 
@@ -10034,25 +10034,27 @@ The live reviewer-sequence case (`doorbell_010_live_reviewer_sequence_stays_held
 
 The live history case (`doorbell_010_live_history_enter_recovers_the_doorbell`) completes the fallback positive control, sends a prompt of its own, recalls it with Up (the composer shows it) and presses Enter, which submits it again; once that turn is Idle and the next waiter killed, a posted task must reach its sentinel through the doorbell within 30 seconds with no further key, `End` then `Ctrl+U` being sent only to diagnose a hold.
 
-- **Layer:** L2 lane 1 (`tests/e2e_automatic_write_draft.rs`), real binary and daemon-owned PTY, attached real TUI; L2 lane 2 (`tests/e2e_inbox_claude_live.rs`), interactive Haiku in an attached TUI.
+- **Layer:** L2 lane 1 (`tests/e2e_automatic_write_draft.rs`, `tests/e2e_probe_delivery.rs`), real binary and daemon-owned PTY, attached real TUI; L2 lane 2 (`tests/e2e_inbox_claude_live.rs`), interactive Haiku in an attached TUI.
 - **Agent:** the e2e stand-in profile's Python editor and the tester's explicitly profiled synthetic composer (`tests/support/empty_composer.py`) in lane 1; real Claude Haiku in lane 2.
 - **Asserts:** The real TUI holds a draft for a 1500 ms observation with the task Queued and no ring; Ctrl+U permits the token-led line without submitting the draft. A companion deterministic case receives and fetches a control task (its capture settling at the line and one Enter, with no cleanup CR), presses Left, waits for captured navigation bytes and a processed empty-composer redraw, and requires another doorbell and nonce-bearing fetch. Its composer consumes navigation separately from text and supplies a redraw marker, width witness, dim placeholder and transcript echo; the e2e-only profile requires both the explicit selector and its executable path. Three controls require zero typed bytes, the task queued with no delivery and `cannot_type` past the stall threshold: no selector, the selector with no executable path, and the selector naming another executable copy that the pane does not run. The real-agent empty-editor cases first complete a fallback-delivered control task, then press Right in the empty editor or erase an exact visible draft completely with Backspace. Right has a recipient-processing barrier: a harmless marker is drawn after the initial key, Left and Right visibly move across it, and Backspace redraws the exact empty composer, without a submit or clear key. Another task must create its sentinel within 30 seconds without another keypress; exact sentinel contents, acknowledged state and single delivery are checked afterward with the helper's separate 120-second waits. Left opens Claude Code 2.1.310's background-session overview: a companion case observes it for 5 seconds with the input row exactly unchanged and showing its empty placeholder, an unchanged util-linux `script --log-in` input ledger, the task Queued, zero deliveries, no logged pane write, doorbell attempt or ring, and no sentinel. Capturing the human Left first validates the ledger; subsequent bytes would be automatic because the test sends no further input. The overview is not a recognised composer, so it holds delivery. A retained-draft case covers typed, history-recalled and partly deleted text, including navigation within text: over 5 seconds, longer than the configured 2-second stall threshold, the composer stays exact, the task stays Queued with zero deliveries, no doorbell is appended, and `wake_stalled` plus the matching log line are required; clearing then delivers the original sentinel once, and the hold must report `possible_draft`. Native waiters are killed by captured scratch-process pid to isolate fallback. On empty-editor failure, Ctrl+U recovery is recorded before the automatic-delivery assertion fails.
 - **Does not assert:** delivery through an armed native waiter; an age-based permission rule at arbitrary durations, which `inbox/doorbell/040` takes on with a controlled clock (the live observation is 5 seconds); Codex, OpenCode, Pi or the desktop client; bytes consumed internally by Claude after the input-recording relay, whose nested PTY's own mode the deck's termios read does not describe. Return from the overview is outside this guard: Claude Code 2.1.310 does not reliably return to a ready composer on Esc. Right and Backspace retain recovery coverage.
-- **Platform coverage:** mac+linux for the stand-in draft cases; linux for the synthetic composer-profile cases (their mode reporter uses SO_PEERCRED and /proc, and the stand-in profile reads the process's command line from /proc) and lane 2's captured-waiter fixture. The composer-profile cases are compiled out elsewhere, rather than reporting a successful runtime skip. Python 3 on PATH is an explicit failing preflight, with no pip dependencies. The live overview ledger additionally requires util-linux `script`.
+- **Platform coverage:** Linux for the native F2 draft and navigation cases; linux for the synthetic composer-profile cases (their mode reporter uses SO_PEERCRED and /proc, and the stand-in profile reads the process's command line from /proc) and lane 2's captured-waiter fixture. The composer-profile cases are compiled out elsewhere, rather than reporting a successful runtime skip. Python 3 on PATH is an explicit failing preflight, with no pip dependencies. The live overview ledger additionally requires util-linux `script`.
+
+S-21 re-oracles the attached draft/no-cap and empty-navigation functions in `tests/e2e_probe_delivery.rs`: an observed non-empty draft stays held during the 1500 ms observation, and Ctrl+U requires another real check before the notice and CLI fetch. This function is Linux-only; the unmodified profile-selection controls and lane-2 cases retain their own platforms and obligations.
 
 ##### inbox/doorbell/011 — A submitted ring sends nothing after a fresh human draft.
-- **Layer:** L2 lane 1 (`tests/e2e_automatic_write_draft.rs`), real binary and daemon-owned PTY, attached real TUI.
-- **Agent:** none (the e2e stand-in profile's Python editor (selected by `DOT_AGENT_DECK_TEST_COMPOSER_PROFILE=standin` with `DOT_AGENT_DECK_TEST_COMPOSER_BINARY` naming the executable the pane runs); no agent executable or credential).
-- **Asserts:** After a submitted ring, the attached TUI types a new draft and another consumer fetches and acknowledges the task: over 700 ms nothing submits the draft, Ctrl+U reaches the pane, and over a further 700 ms nothing follows it (the capture is exactly `<line>\r<draft>\x15`); one ring in all, and the draft is never submitted.
+- **Layer:** L2 lane 1 (`tests/e2e_probe_delivery.rs`), real binary and daemon-owned PTY, attached real TUI.
+- **Agent:** none (the native synthetic Claude with the F2 Python composer and real installed helper; no agent executable or credential).
+- **Asserts:** after one submitted and actually fetched notice, the attached TUI types and clears a draft without another byte from that ring; a later message requires a fresh check, then a separate notice and actual fetch. The draft is never submitted.
 - **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
-- **Platform coverage:** mac+linux.
+- **Platform coverage:** Linux.
 
 ##### inbox/doorbell/012 — A drafted batch coalesces and fetch preserves arrival order.
-- **Layer:** L2 lane 1 (`tests/e2e_automatic_write_draft.rs`), real binary and daemon-owned PTY, attached real TUI.
-- **Agent:** none (the e2e stand-in profile's Python editor (selected by `DOT_AGENT_DECK_TEST_COMPOSER_PROFILE=standin` with `DOT_AGENT_DECK_TEST_COMPOSER_BINARY` naming the executable the pane runs); no agent executable or credential).
+- **Layer:** L2 lane 1 (`tests/e2e_probe_delivery.rs`), real binary and daemon-owned PTY, attached real TUI.
+- **Agent:** none (the native synthetic Claude with the F2 Python composer and real installed helper; no agent executable or credential).
 - **Asserts:** Two reports wait behind a real TUI draft; clearing it produces one token-led ring and one fetch returns both bodies in arrival order, with no body typed into the pane or shown on the deck's grid.
 - **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
-- **Platform coverage:** mac+linux.
+- **Platform coverage:** Linux.
 
 ##### inbox/doorbell/013 — The doorbell policy rings only when every guard passes.
 - **Layer:** L1 unit (`src/doorbell.rs`, pure `decide` with injected time).
@@ -10096,12 +10098,12 @@ The live history case (`doorbell_010_live_history_enter_recovers_the_doorbell`) 
 - **Does not assert:** the daemon wiring or what the screen shows.
 - **Platform coverage:** mac+linux+windows.
 
-##### inbox/doorbell/019 — An interrupt's Escapes stop holding the doorbell when the turn ends; a draft on screen still holds it.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary, daemon-owned PTY and attach input stream.
-- **Agent:** none (the e2e stand-in profile's Python editor (selected by `DOT_AGENT_DECK_TEST_COMPOSER_PROFILE=standin` with `DOT_AGENT_DECK_TEST_COMPOSER_BINARY` naming the executable the pane runs); no agent executable or credential), its hooks reported as OpenCode, Claude Code, Codex and Pi.
-- **Asserts:** for each of the four agent types, Thinking, then Escape, 300 ms, Escape forwarded as the user's keys, then Idle: the capture is exactly the two Escapes, then the token-led line and its Enter, and a fetch delivers the task. Text typed before or after the Escapes leaves the composer showing a draft, so the pane stays untouched and the task Queued. Two Escapes pressed on an agent that is already Idle followed by two more Idle reports (OpenCode's duplicate pair) leave the composer empty with nothing else drawn, and that pane is rung: the stand-in draws no menu, and the deck reads its screen.
+##### inbox/doorbell/019 — Escape keys touch the box; a subsequent check decides whether its draft holds the notice.
+- **Layer:** L2 lane 1 (`tests/e2e_probe_delivery.rs`), real binary, daemon-owned PTY and attach input stream.
+- **Agent:** native synthetic Claude with the F2 Python composer and real installed helper; no real agent or credential.
+- **Asserts:** Escape keys touch the box even when followed by Idle; completing the physical sequence with a typed-and-deleted character requires a check before the notice. A retained draft stays held after repeated Idle reports and a real non-empty read; clearing it requires another check before delivery.
 - **Does not assert:** a real agent's interrupt or menu screen, an Idle from an agent that has since been replaced (`inbox/doorbell/020`), or an Idle racing the PTY write (`inbox/doorbell/022`, `inbox/doorbell/023`).
-- **Platform coverage:** mac+linux.
+- **Platform coverage:** Linux.
 - **Cost:** none.
 
 ##### inbox/doorbell/020 — A replaced agent's Idle cannot release its successor's Escapes.
@@ -10261,11 +10263,11 @@ The live history case (`doorbell_010_live_history_enter_recovers_the_doorbell`) 
 - **Platform coverage:** mac+linux in lane 1; linux in lane 2.
 
 ##### inbox/doorbell/040 — No age gives the doorbell leave to type over a draft.
-- **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY, the e2e-only controlled policy clock (`clock-ms`) and the daemon's log.
+- **Layer:** L2 lane 1 (`tests/e2e_probe_delivery.rs`), real binary and daemon-owned PTY, the e2e-only controlled policy clock (`clock-ms`) and the native F2 helper.
 - **Agent:** none (the e2e stand-in profile's Python editor; no agent executable or credential).
-- **Asserts:** with a human draft in an Idle stand-in's composer and a task queued, completed policy ticks at controlled ages of 5 s, 10 s, 86,399 s and 86,400 s, the later two past the stall window, each leave the pane holding exactly the draft and the task Queued; the inbox names `possible_draft`, and the daemon logs that reason once; once the clock is released and the draft cleared, the doorbell rings, the capture being the draft, Ctrl+U and the token-led line with its Enter.
+- **Asserts:** a real helper first reads a retained draft; policy ticks at 5 s, 10 s, 86,399 s and 86,400 s leave exactly the draft and its check byte, with no submitted notice and possible-draft raised once in the log. Clearing requires a fresh check before one notice and actual delivery.
 - **Does not assert:** a real agent's composer, or timer sources other than the doorbell's policy clock (the transaction's own deadline runs on the real clock).
-- **Platform coverage:** mac+linux.
+- **Platform coverage:** Linux.
 
 
 ##### inbox/doorbell/041 — The doorbell says why it holds an agent's waiting messages once the hold has lasted.
@@ -10727,6 +10729,22 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** automatic segment completion, query timeout duration, display of `input_held`, exact-once physical ticket accounting, count-cap fairness/reservation, query provenance on opposite sides of a trigger (coder's `011`), forced partial writes, or C1's responder. Explicit release substitutes for the later segment policy, and saturation of the replying connection is released by that control rather than a synthetic timeout claiming to be production authority. Q35-15 RED slice: fence/release/status are absent on its base.
 - **Platform coverage:** Linux.
 
+##### inbox/probe/024 — A touched empty box is checked before its waiting mail is delivered.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_probe_delivery.rs`, native F2 fixture).
+- **Agent:** native synthetic Claude and Codex; no real agent or credential.
+- **Asserts:** typing and deleting text requires one physical BEL check before one token-led notice and its actual CLI/prompt-hook inbox hand-over; the message body is not typed into the pane.
+- **Does not assert:** launcher binding, activation, a real agent or a measured Codex head-echo premise. The e2e observer assumption and Codex head-echo assumption are explicit.
+- **Platform coverage:** Linux.
+
+##### inbox/probe/025 — An observed draft holds the notice; deleting it requires another check.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_probe_delivery.rs`, native F2 fixture).
+- **Agent:** native synthetic Claude; no real agent or credential.
+- **Asserts:** three actual spaces survive an observed non-empty check, mail stays unsubmitted with possible-draft, and three deletes require a second check before one real inbox delivery.
+- **Does not assert:** a timeout bypass, launcher binding, activation or real-agent availability.
+- **Platform coverage:** Linux.
+
 ##### inbox/probe/026 — A live check preserves typing through injected loss mechanisms and applies only its own empty observation.
 
 - **S-20c export-chain branches:** `probe_026_empty_settlement_and_read_only_epoch_control` keeps the actual export alive until the test calls the daemon's public `verify_export` with `LinuxFsView`. A supported chain must settle Empty; an unsupported one must report Unreadable, leave observed unchanged and write no following input. It prints the selected branch, with a test-specific nextest `success-output = "immediate"` override so passing CI logs show it, and fails the unsupported branch under `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`. Fast-tier `probe_005_filesystems_outside_the_allow_list_refuse` covers an overlayfs root above an otherwise supported chain; `probe_005_the_agents_exports_pass` covers supported chains. This empty control queues no producer; it does not prove that pending typing or mail stays held on an unsupported export. The delayed-check histories separately cover typing retention under the three injected loss mechanisms, without selecting the export-chain branch.
@@ -10734,7 +10752,8 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_live_segments.rs`, `tests/support/live_segments.rs`).
 - **Agent:** native test executable with the reviewed F2 Python composer and real installed helper/editor; no real agent or credential.
 - **Asserts:** H-chunk, H-flush and H-ignore under a witnessed delayed dispatch retain two distinct human frames in order; a foreign acceptance keeps observed unchanged; the empty control covers its own probe byte; repeated epoch reads are inert and a stale-generation read refuses.
-- **Does not assert:** Mail delivery after the check (S-21), physical short-write accounting or generated property oracles. On the pre-Q35-20 base, the live request/epoch contracts are intentionally RED at the missing operations; later assertions await the coder's GREEN run. The standalone helper/lifecycle controls can already pass.
+- **S-21 authority:** `tests/e2e_probe_delivery.rs` queues mail during each delayed loss mechanism, requires the two human frames without a notice, then a clear and another physical check before actual delivery.
+- **Does not assert:** Physical short-write accounting or generated property oracles. On the pre-Q35-20 base, live operations are missing; S-21's delivery assertions await Q35-21.
 - **Platform coverage:** Linux.
 
 ##### inbox/probe/027 — Human Ctrl+G candidates hand their suffix to the running user editor.
@@ -10773,7 +10792,8 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **The lapse retry's checks are Claude's (Q35-20dfix, coder, O-20.7c):** `probe_030_only_a_claude_probe_reaches_the_lapse_retrys_checks` (fast, `src/agent_pty_segments.rs`): a Claude and a Codex probe, each with its own byte through the input, written past `T_TRIGGER` with no helper, nothing held and `B` holding. Only Claude's reads as lapsed (`admission_fence`), so its lapse attempt reaches admission's lapse checks and `B` refuses it; Codex's is refused `NotLapsed`, before any lapse check, though an attempt carries no agent.
 - **Mutation pin (PRD #1666 part 3 mutation run, 2026-11-02):** `probe_030_an_armed_empty_read_settles_empty_only_on_the_decks_own_claim` (fast, `src/composer_probe/epoch.rs`): an `Armed` probe whose export the daemon read empty settles the schedule empty (next attempt due at once) when the helper's claim is the deck's own or no claim is recorded, and non-empty when it is a tool's or `Claim::Unknown` (kills `Live::settle_probe`'s claim comparison inverted and its `claim_mine` guard replaced with `true`).
 - **No lapse retry under a parked read (the reva21 review's U3-1):** `probe_030_a_lapse_retry_waits_while_an_empty_read_is_parked` (fast, `src/composer_probe/epoch.rs`): a lone Claude probe lapses, its lapse is counted and its backoff passes, so its lapse retry is due; with an earlier `Armed` empty read parked for its keymap re-read the retry is not due (as `probe_due` already answered for a first attempt), and once the re-read settles it, it is due again. Before the fix `lapse_due` answered the schedule alone, so a retry could start under the parked read and one failure could be counted twice. It parks the read by hand in the generation's state rather than through a helper's settlement.
-- **Does not assert:** Unattended mail delivery (S-21), accelerated clocks, or the Broken presentation bit's live retry history. On the pre-Q35-20 base, the live request/epoch contracts are intentionally RED at the missing operations; later assertions await the coder's GREEN run. The standalone helper/lifecycle controls can already pass.
+- **S-21 authority:** `tests/e2e_probe_delivery.rs` requires automatic lapse recovery with no held human input to deliver the mail once without another keypress.
+- **Does not assert:** Accelerated clocks or the Broken presentation bit's live retry history. On the pre-Q35-20 base, the live request/epoch contracts are intentionally RED at the missing operations; later assertions await the coder's GREEN run. The standalone helper/lifecycle controls can already pass. S-21's post-check delivery assertions await Q35-21.
 - **Platform coverage:** Linux.
 
 ##### inbox/probe/031 — A dropped Codex trigger retains human input through retirement.
@@ -10781,7 +10801,8 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_live_segments.rs`, `tests/support/live_segments.rs`).
 - **Agent:** native test executable with the reviewed F2 Python composer and real installed helper/editor; no real agent or credential.
 - **Asserts:** The unresolved live segment holds human keys and sends none into its replacement. The existing answer/fence lifecycle companions remain in 036 and question/answer/023.
-- **Does not assert:** A deck line accepted through a live segment, delivery after E1 (S-21), or U-R. On the pre-Q35-20 base, the live request/epoch contracts are intentionally RED at the missing operations; later assertions await the coder's GREEN run. The standalone helper/lifecycle controls can already pass.
+- **S-21 authority:** `tests/e2e_probe_delivery.rs` queues mail while the real Codex helper has exited but its return is held, observes no notice, then requires one actual hand-over after the composer completes E1.
+- **Does not assert:** A deck line accepted through a live segment or U-R. On the pre-Q35-20 base, the live request/epoch contracts are intentionally RED at the missing operations; later assertions await the coder's GREEN run. S-21's post-check delivery assertions await Q35-21.
 - **Platform coverage:** Linux.
 
 ##### inbox/probe/032 — The live probe paths respect native backlog and overflow hazards.
@@ -10789,7 +10810,8 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_live_segments.rs`, `tests/support/live_segments.rs`).
 - **Agent:** native test executable with the reviewed F2 Python composer and real installed helper/editor; no real agent or credential.
 - **Asserts:** A native candidate latched during CPR prevents a first probe; immediate retry and post-CPR/quiet-timeout requests write nothing, and a retry after the real 30-second refusal backoff reports refused rather than not_due without bytes or arm publication. Replacement admits a fresh probe. Counted native FIFO overflow does not age into permission; exemption-ledger saturation alone admits a first probe, while an actual native hazard refuses it.
-- **Does not assert:** C1, the card CannotCheck reason (S-21), artificial exhaustion of u64 numbering, or measured availability. Nor that a spawn into the pane straight after its stop is admitted at once: the live-segments fixture's `Fixture::replace()` retries the exact `Duplicate pane id: live-segments` refusal for up to 10 seconds, because the stop's reply can arrive before its pane-cleanup hold is dropped (#1218); any other refusal fails at once. On the pre-Q35-20 base, the live request/epoch contracts are intentionally RED at the missing operations; later assertions await the coder's GREEN run. The standalone helper/lifecycle controls can already pass.
+- **S-21 authority:** `tests/e2e_probe_delivery.rs` requires the real snapshot and attached TUI to name CannotCheck after a native candidate arrives behind an outstanding CPR, with no automatic check or notice written.
+- **Does not assert:** C1, artificial exhaustion of u64 numbering, or measured availability. Nor that a spawn into the pane straight after its stop is admitted at once: the live-segments fixture's `Fixture::replace()` retries the exact `Duplicate pane id: live-segments` refusal for up to 10 seconds, because the stop's reply can arrive before its pane-cleanup hold is dropped (#1218); any other refusal fails at once. On the pre-Q35-20 base, the live request/epoch contracts are intentionally RED at the missing operations; later assertions await the coder's GREEN run. The standalone helper/lifecycle controls can already pass. S-21's card-authority assertions await Q35-21.
 - **Platform coverage:** Linux.
 
 ##### inbox/probe/036 — Retirement ends held typing, a tokened answer and a Full waiter together.
@@ -10819,6 +10841,22 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** The desktop client, S-21's mail hold reason, unreadable-export retention of mail, timing of the display thresholds, or a real-agent reel clip. The unsupported branch advances a recheck deadline, so it does not prove natural Empty settlement there.
 - **Platform coverage:** Linux.
 
+##### inbox/probe/037 — Production Absent holds touched Claude and Codex boxes with their delivery-route explanations.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_probe_delivery.rs`); desktop bridge/card assertions in `desktop/src/components/InboxSurfaces.test.tsx`.
+- **Agent:** native synthetic Claude and Codex without editor-probe or head-echo assumptions; synthetic native components in the route controls; no real agent or credential.
+- **Asserts:** the daemon's Absent hold and attached TUI name needs-fetch for Claude without a waiter and cannot-type for Codex's prompt route; a further clear permits neither probe nor notice, while a real prompt still hands over mail. Desktop cards render those snapshot reasons without possible-draft remedies.
+- **Does not assert:** an activated observer, launcher binding, a native desktop window, or a real agent.
+- **Platform coverage:** Linux (daemon/TUI), desktop vitest.
+
+##### inbox/probe/047 — A user's submit or clear recovers a suspended notice without authorizing an unchecked box.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_probe_delivery.rs`).
+- **Agent:** native synthetic Claude; no real agent or credential.
+- **Asserts:** a real notice interrupted by an unrecognised screen suspends; a user submit or clear recovers it, with the subsequent empty box checked before the next notice.
+- **Does not assert:** private writer faults, a real agent, or recovery from bytes inside a paste or terminal reply (coder tokenizer units).
+- **Platform coverage:** Linux.
+
 ##### inbox/probe/048 — Both external-edit producers move the foreign epoch.
 
 - **S-20e exit-before-scan:** the immediate direct-editor row holds the observer before the trigger and requires its acknowledgement of `passes_held && !pass_running`, so no pass can start during the editor's lifetime. It witnesses editor exit and composer return, verifies the hold still acknowledged and the finished-pass counter unchanged, then resumes the observer. The epoch assertions require exactly one native input plus one unmatched foreign ExternalEdit movement without an empty observation; this row does not simulate a lost report connection from an installed helper.
@@ -10828,7 +10866,8 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_live_segments.rs`, `tests/support/live_segments.rs`).
 - **Agent:** native test executable with the reviewed F2 Python composer and real installed helper/editor; no real agent or credential.
 - **Asserts:** Read-only epoch checks around an external editor, invoked through the installed helper or directly without that helper, including immediate completion, require one native input plus one unmatched ExternalEdit movement without observed advancing. The direct invocation does not exercise a lost report connection from a helper. As fast units (`tests/live_gate.rs`, `src/agent_pty_release_oracle_tests.rs`), a record read after the pair it was the session of lends nothing to a later unrelated pair, over generated session and foreign-pair sequences (R-U2-04); over 600 generated scripts whose sessions overlap (births, records, pairs and drains interleaved, foreign pairs among them, backlogs of early pairs past what the accounting remembers, helpers born after earlier pairs ended with every record late, sessions whose pair never comes, and the clock passing the grace mid-script), with every stamp on one virtual clock, a credit's drain stamp included through a test-only step clock (R-C-U2-01), the production accounting is compared after every step with a reference accounting in the test that forgets nothing and caps nothing: its credits are an ordered subsequence of the reference's with the same drain stamps, every debt the reference still owes that ended after the watermark is remembered, and it moves the epoch at every pair where the reference does; on the reference, from any point at which nothing is left to lend (no credit live, every pairless session's record and every record whose pair was read made) and from any point of a script whose every session's pair comes, the epoch moves at least once per pair no record accounts for, and an unrelated pair read after every session drained and the grace passed always moves it; the run requires at least 20 scripts each reaching a peak of outstanding late-session debt past the cap, such a backlog with staggered floors at that moment, a pairless session, a quiescent end, fewer credits than the reference and a forgotten debt (230, 138, 193, 321, 22 and 312 when written), a staggered backlog with at least as many floors born after its oldest outstanding pair as the cap (8), and 5 each of own pairs read after their grace (7) and own pairs read inside their grace after the clock passed one before their drain (8); the strengthened run fails on the explanation order before the watermark-first fix (307 of 600 seeds on the inclusion check, 27 on the move check alone) and with a wall-clock drain stamp (90 seeds); a helper's own pair read a millisecond after its drain, the drain coming after the clock passed a whole grace, moves nothing, and an unrelated pair after it moves the epoch once (R-C-U2-01); fixed backlogs of one pair more than the cap followed by late records and an unrelated pair move it for that pair, with every helper born before the first pair and with births staggered between pairs (R-B-U2-01); a drained record whose pair never came lends nothing once its grace after the drain is over, its own pair delivered after the grace moves the epoch once, and a running session keeps its credit (the audit's U3-4).
-- **Does not assert:** Delivery or a later attempt's decision (S-21), or an installed helper's lost report connection. The reference is the invariant's, not the truth about whose pair is whose: credits are consumed oldest first, so a foreign pair read while another session's credit is live moves the epoch only at that session's own pair, and the absolute count over suffixes does not show that the epoch moves at each foreign pair as it is read. In a script with a session whose pair never comes, the absolute count is checked only from points at which nothing is left to lend; before them a pairless session's credit, or a credit its record displaced, can stand for a foreign pair in both accountings, and only the comparison with the reference applies. The grace after a drain is a policy, not a bound on output delivery: a session's own pair delivered later costs one more epoch. On the pre-Q35-20 base, the live request/epoch contracts are intentionally RED at the missing operations; later assertions await the coder's GREEN run. The standalone helper/lifecycle controls can already pass.
+- **S-21 authority:** `tests/e2e_probe_delivery.rs` first establishes an empty observation, then asks the composer to perform a reported or direct unreported real edit whose editor preserves the empty export. No human input intervenes: ExternalEdit alone requires another physical check before actual mail delivery. A separate GREEN-intended fixture control proves both invocations preserve the empty box without terminal input.
+- **Does not assert:** An installed helper's lost report connection. The reference is the invariant's, not the truth about whose pair is whose: credits are consumed oldest first, so a foreign pair read while another session's credit is live moves the epoch only at that session's own pair, and the absolute count over suffixes does not show that the epoch moves at each foreign pair as it is read. In a script with a session whose pair never comes, the absolute count is checked only from points at which nothing is left to lend; before them a pairless session's credit, or a credit its record displaced, can stand for a foreign pair in both accountings, and only the comparison with the reference applies. The grace after a drain is a policy, not a bound on output delivery: a session's own pair delivered later costs one more epoch. On the pre-Q35-20 base, the live request/epoch contracts are intentionally RED at the missing operations; later assertions await the coder's GREEN run. The standalone helper/lifecycle controls can already pass. S-21's post-edit delivery assertions await Q35-21.
 - **Platform coverage:** Linux.
 
 ##### inbox/probe/049 — Failed editor outcomes and incomplete marker histories grant no early release.
@@ -12198,6 +12237,8 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Asserts:** no byte before the settle window, then the token head alone, the rest once the head shows, and one Enter, with the task acknowledged through Codex's own prompt hook and WAKE naming `turn_end`; the update, folder-trust and hooks-review dialogs at admission each get no byte on the measured release, and the task is delivered once the dialog closes; a dialog opening on the head gets nothing more and the card says so; a doorbell-shaped line the deck did not type, and the deck's own old line typed back, get no byte; a draft Codex keeps on Enter holds the doorbell; a pane its hooks call Codex is rung. On measured 0.164.0 an unrecognised screen gets no byte, a swallowed Enter leaves the task queued with `no_submit_evidence`, and a harmless "Update now" transcript row permits delivery.
 - **Does not assert:** a real Codex, a generation that has not reported (`inbox/codex/028`), or the untrusted-hooks path, where the wrapper reads the screen's output as activity.
 - **Platform coverage:** mac+linux.
+
+The kept-on-Enter draft function moves to `tests/e2e_probe_delivery.rs` in S-21: an installed native synthetic Codex performs a real non-empty check, then clearing requires another completed check before the staged notice and actual prompt-hook delivery. This function uses the e2e editor-probe and head-echo assumptions and runs on Linux.
 
 ##### inbox/codex/028 — A fresh Codex is rung before its first prompt on its own measured proof, and on nothing else.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex_doorbell.rs`), the real wrapper, writer, hook CLI and daemon.
