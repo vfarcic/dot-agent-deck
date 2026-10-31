@@ -596,7 +596,10 @@ impl TuiDeckBuilder {
     /// or other user configuration into a recorded real-agent run.
     pub fn with_imported_opencode_credentials(mut self) -> Self {
         self.credential_imports.push(CredentialImport::OpenCode);
-        self
+        // OpenCode 1.18.35 npm-installs its plugin SDK before drawing a composer
+        // in a fresh HOME with a tui.json plugin (#2044). The deck's plugins use
+        // Node builtins; offline mode avoids waiting on a registry download.
+        self.with_env("npm_config_offline", "true")
     }
 
     /// Import the host user's Codex `auth.json` into the isolated per-test HOME
