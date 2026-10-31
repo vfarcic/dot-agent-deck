@@ -91,10 +91,13 @@
 //! writer scope's state, so an `EditorLeftWriter` (or other) cause is
 //! published with the stage.
 //!
-//! **What reads it, as of this commit: nothing.** Q35-20 wires it into the
-//! output hook, the gate and admission. M-PF1 (Q77) hasn't run, so this is
-//! observation code: the premises of E1F's rows are unverified on real
-//! agents.
+//! **What reads it** (Q35-20): an installed generation's input keeps its
+//! segments beside its records (`super::epoch::GenerationInput`), feeds them
+//! the output hook's markers and every record step, and its release driver
+//! (`crate::agent_pty`) does what [`Segments::front`] allows to the held
+//! input. No production generation is `Armable` before activation, so none
+//! opens a segment there. M-PF1 (Q77) hasn't run, so this is observation
+//! code: the premises of E1F's rows are unverified on real agents.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -300,6 +303,20 @@ impl ReturnWatch {
     }
 }
 
+/// What the front segment lets the held input do ([`Segments::front`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Front {
+    /// No segment is open.
+    None,
+    /// The front segment holds everything behind it.
+    Held,
+    /// The front segment released: what is held may go as far as the next
+    /// held candidate, which waits for the segment to complete.
+    Released,
+    /// The front is a `HumanG` waiting for its trigger.
+    Trigger,
+}
+
 /// How a segment ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -413,6 +430,9 @@ struct Segment {
     /// When its record was first seen drained (E5's origin).
     drained_at: Option<Instant>,
     released: bool,
+    /// A probe whose matched decision was handed to the epoch's settlement
+    /// ([`Segments::take_decided_probes`]).
+    decided: bool,
 }
 
 impl Segment {
@@ -431,6 +451,7 @@ impl Segment {
             enabled_at: None,
             drained_at: None,
             released: false,
+            decided: false,
         }
     }
 
@@ -526,6 +547,90 @@ impl Segments {
         self.segments
             .push_back(Segment::new(Kind::HumanG, Some(op), None));
         Ok(())
+    }
+
+    /// A person's Ctrl+G a release reached at the front of the held input
+    /// with no segment open (Q35-20): every segment ahead of it has ended,
+    /// so it is a `HumanG` whose trigger may be written now, numbered here.
+    /// The caller publishes the number, then submits the trigger alone. With
+    /// a segment open it waits behind it instead ([`Self::open_human_g`]),
+    /// and this refuses [`Refusal::Busy`].
+    pub fn open_held_trigger(&mut self) -> Result<u64, Refusal> {
+        self.live()?;
+        if !self.segments.is_empty() {
+            return Err(Refusal::Busy);
+        }
+        let number = self.next_number()?;
+        self.last = number;
+        self.segments
+            .push_back(Segment::new(Kind::HumanG, None, Some(number)));
+        Ok(number)
+    }
+
+    /// What the front segment lets the held input do now (Q35-20): nothing
+    /// while it holds, go as far as the next held candidate once it has
+    /// released, and with no segment open, the same, the candidate there
+    /// then opening the next segment. A front `HumanG` still unnumbered
+    /// asks for its trigger.
+    pub fn front(&self) -> Front {
+        match self.segments.front() {
+            None => Front::None,
+            Some(seg) if seg.number.is_none() => Front::Trigger,
+            Some(seg) if seg.released => Front::Released,
+            Some(_) => Front::Held,
+        }
+    }
+
+    /// Whether the only open segment is a Claude probe that lapsed (core
+    /// §4.7), so admission may read the gate as [`super::admission::Fence::Lapsed`]
+    /// when nothing is held behind it. The writer epoch of its own byte is
+    /// the caller's.
+    pub fn lapsed_alone(&self, now: Instant) -> bool {
+        self.segments.len() == 1 && self.segments.front().is_some_and(|s| self.lapsed(s, now))
+    }
+
+    /// The open segments' count.
+    pub fn len(&self) -> usize {
+        self.segments.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    /// The probes whose matched record has decided, each once (Q35-20, R3
+    /// §3.4's apply rule): the caller settles the epoch from each.
+    pub fn take_decided_probes(&mut self, records: &Records) -> Vec<(u64, RecordKey, Decision)> {
+        let mut decided = Vec::new();
+        for seg in &mut self.segments {
+            if seg.kind != Kind::Probe || seg.decided {
+                continue;
+            }
+            let (Some(number), Some(key)) = (seg.number, seg.record) else {
+                continue;
+            };
+            let decision = records
+                .get(key)
+                .and_then(|r| r.decision)
+                .or_else(|| seg.fact.and_then(|f| f.decision));
+            if let Some(decision) = decision {
+                seg.decided = true;
+                decided.push((number, key, decision));
+            }
+        }
+        decided
+    }
+
+    /// Hand probe `number`'s decision to [`Self::take_decided_probes`] again
+    /// later: its settlement waits for something its record doesn't hold yet.
+    pub fn undecide(&mut self, number: u64) {
+        if let Some(seg) = self
+            .segments
+            .iter_mut()
+            .find(|s| s.kind == Kind::Probe && s.number == Some(number))
+        {
+            seg.decided = false;
+        }
     }
 
     /// The number of the next `HumanG` whose trigger may be written, once

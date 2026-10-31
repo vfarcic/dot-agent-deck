@@ -107,9 +107,14 @@ impl OutputHook {
                 .ok()
                 .and_then(|n| fed.checked_add(n))
         });
+        let now = Instant::now();
         if !notes.is_empty() {
-            self.input.on_output(&notes, Instant::now());
+            self.input.on_output(&notes, now);
         }
+        // Q35-20: an installed generation's segments read the same bytes
+        // for their return markers, after the notes, under the same output
+        // lock. Nothing without segments attached.
+        self.input.on_output_bytes(bytes, now);
         // An agent writes `?2004l` as it runs its editor: scan for the
         // helper while it is starting (R5 §3.3). Ringing takes no lock.
         if paste_off && let Some(bell) = self.bell.get() {

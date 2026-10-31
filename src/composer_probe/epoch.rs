@@ -26,14 +26,17 @@
 //! in enqueue order: a withdrawn job leaves that framing ahead of what the
 //! PTY took, which Q35-15/16's physical tracker corrects.
 //!
-//! **What reads it, as of this commit.** The epoch's numbers: probe
-//! admission ([`GenerationInput::admit_probe`], Q35-19), which nothing calls
-//! in production before Q35-20 wires it, for a lapse retry's "nothing since
-//! the lapsed byte". The card and the ring's reconcile read them from Q35-21
-//! on; existing doorbell behaviour reads `PaneInputState` as before. The
-//! ledger is read by a closed fence's acceptance, for whether a reply may
-//! pass ahead ([`GenerationInput::pass_ahead`]), and a fence closes only
-//! through the `e2e` build's control verb until a probe opens one (Q35-20).
+//! **What reads it.** The epoch's numbers: probe admission
+//! ([`GenerationInput::admit_probe`], Q35-19), which the probe request and
+//! the doorbell tick ask for an `Armable` generation (Q35-20), for a lapse
+//! retry's "nothing since the lapsed byte", and the schedule's
+//! epoch-moved wait. A probe's settlement applies to `observed` here (R3
+//! §3.4), and the second `ExternalEdit` producer moves it
+//! ([`GenerationInput::on_output_bytes`]). The card and the ring's reconcile
+//! read them from Q35-21 on; existing doorbell behaviour reads
+//! `PaneInputState` as before. The ledger is read by a closed fence's
+//! acceptance, for whether a reply may pass ahead
+//! ([`GenerationInput::pass_ahead`]).
 //!
 //! **The planner (Q35-16).** The input framing kept here is the logical
 //! planner of `super::planner`: [`GenerationInput::enqueue_planned`] reads a
@@ -96,15 +99,17 @@ use super::framing::{Csi, Event, Framing, Report, Str, StringKind, Token, whole_
 use super::frontier::{FrontierQueue, Request};
 use super::planner::InputGrammar;
 use super::planner::{Cut, Natives, first_cut, is_candidate};
+use super::probe::Schedule;
 use super::query_ledger::{
     Backlog, CprWaitEnd, EntryView, HazardFifo, HazardPop, Pop, QueryHistory, QueryKind,
     QueryLedger,
 };
 use super::query_wait::{QueryWaitEstimate, RedrawTiming};
 use super::record::{
-    self, Channel, Decision, Drained, ExitFact, FirstStop, FrontierOutcome, Hold, Record,
-    RecordKey, Recorded, Records, Refusal, Reported, Route, WriterScope,
+    self, Attribution, Channel, Decision, Drained, ExitFact, FirstStop, FrontierOutcome, Hold,
+    NotOwned, Record, RecordKey, Recorded, Records, Refusal, Reported, Route, WriterScope,
 };
+use super::segments::{self, Front, Marker, ReturnMarkers, Seen, Segments};
 use crate::lock_rank::{R6, RankedMutex};
 
 /// A deck job the epoch can name: a probe's, or a ring transaction's.
@@ -350,7 +355,63 @@ struct State {
     estimate: QueryWaitEstimate,
     /// The generation's invocation records, once attached.
     records: Option<Records>,
+    /// Its segments and what they read, attached with the records (Q35-20).
+    live: Option<Live>,
     retired: bool,
+}
+
+/// The most explanations [`Live::explained`] banks: each `Owned` record
+/// accounts for one bracketed-paste pair, and more than a few outstanding
+/// would only let a later unreported editor go unnoticed.
+const EXPLAINED_CAP: u8 = 4;
+
+/// The most daemon reads of an `Armed` export kept for the epoch's
+/// settlement ([`Live::reads`]).
+const READS_KEPT: usize = record::RECORD_CAP;
+
+/// PRD #1666 part 3 (Q35-20): an installed generation's segments and what
+/// they read, under the epoch's lock with its records, so a record step, the
+/// segments' match, release and completion, and the epoch's settlement are
+/// one critical section (O-20.3).
+#[derive(Debug)]
+struct Live {
+    segments: Segments,
+    /// The output read for return markers, every byte from attachment on.
+    markers: ReturnMarkers,
+    /// `ExternalEdit`'s second producer (PR U3-11): a `?2004l` was read and
+    /// no `?2004h` has followed it yet.
+    pair_open: bool,
+    /// Records made since the last pair that may account for one: an editor
+    /// session the deck saw, so its pair isn't an unreported one.
+    explained: u8,
+    /// When the deck may try a probe again (R2 §6.8, R5's continuing
+    /// retries). Its `broken` bit is presentation only (O-20.6).
+    schedule: Schedule,
+    /// Each open probe: its segment number, its job, and `E0`, the epoch
+    /// just before its own byte moved it (set at its enqueue).
+    probes: Vec<Probe>,
+    /// The daemon's read of an `Armed` invocation's export: whether it was
+    /// empty, for the epoch's settlement of the probe it matches.
+    reads: std::collections::VecDeque<(RecordKey, bool)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Probe {
+    number: u64,
+    job: DeckJobId,
+    e0: Option<u64>,
+}
+
+/// What a probe's settlement did to the schedule and the epoch (Q35-20).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeRead {
+    /// Its matched helper read the box empty, and the epoch's apply rule
+    /// (R3 §3.4) moved `observed` when it says so.
+    Empty { applied: bool },
+    /// The box held something, or the read couldn't be trusted.
+    NonEmpty,
+    /// No liability was read: an uncertain check.
+    Uncertain,
 }
 
 /// How the planner reads an op at its acceptance (Q35-16, core §4.3).
@@ -375,11 +436,90 @@ pub struct Planned {
     pub cut: Option<Cut>,
     /// The native candidates it carries, numbered.
     pub natives: Option<Natives>,
+    /// The input framing at its first byte, when its candidates cut: what a
+    /// release reads it from (Q35-20).
+    pub framing: Option<Framing>,
 }
 
 /// [`GenerationInput::enqueue`] under a hold the caller already has.
 fn enqueue_locked(state: &mut State, writer: Writer, bytes: &[u8]) -> Enqueued {
-    plan_locked(state, writer, bytes, None).enqueued
+    let enqueued = plan_locked(state, writer, bytes, None).enqueued;
+    // Q35-20 (R3 §3.4): a probe's own byte; `E0` is the epoch just before
+    // it, read in the same hold that moved it.
+    if let (Writer::Deck(job), Enqueued::Moved(to)) = (writer, enqueued)
+        && let Some(live) = state.live.as_mut()
+        && let Some(probe) = live.probes.iter_mut().find(|p| p.job == job)
+    {
+        probe.e0 = to.checked_sub(1);
+    }
+    enqueued
+}
+
+/// Q35-20: settle what a step allows the segments (match, release,
+/// completion), then the epoch's settlement of each probe whose matched
+/// record decided (R3 §3.4), in the caller's hold of the lock.
+fn settle_live(state: &mut State, now: Instant) {
+    let (Some(live), Some(records), false) =
+        (state.live.as_mut(), state.records.as_mut(), state.retired)
+    else {
+        return;
+    };
+    live.segments.settle(records, &mut state.hazards, now);
+    for (number, key, decision) in live.segments.take_decided_probes(records) {
+        let Some(at) = live.probes.iter().position(|p| p.number == number) else {
+            continue;
+        };
+        let read = live
+            .reads
+            .iter()
+            .rev()
+            .find(|(k, _)| *k == key)
+            .map(|(_, empty)| *empty);
+        // An `Armed` decision can reach the records on a marker before the
+        // helper's own invocation, which carries the daemon's read: wait for
+        // the read, until the record drained.
+        if decision == Decision::Armed
+            && read.is_none()
+            && records.get(key).is_some_and(|r| !r.drained)
+        {
+            live.segments.undecide(number);
+            continue;
+        }
+        let probe = live.probes.remove(at);
+        let claim_mine = records
+            .get(key)
+            .is_none_or(|r| r.claim.is_none_or(|c| c == record::Claim::Owned));
+        tracing::debug!(
+            target: "composer_probe",
+            number,
+            ?decision,
+            ?read,
+            claim_mine,
+            e0 = ?probe.e0,
+            "probe settled"
+        );
+        match (decision, read) {
+            (Decision::Armed, Some(true)) if claim_mine => {
+                if let Some(e0) = probe.e0 {
+                    state.epoch.apply(&Observation {
+                        probe: probe.job,
+                        admitted_at: e0,
+                        read_empty: true,
+                        retired: false,
+                    });
+                }
+                live.schedule.empty();
+            }
+            (Decision::Armed, _) => {
+                live.schedule.non_empty(now, state.epoch.epoch());
+            }
+            _ => live.schedule.failed(now),
+        }
+    }
+    for ended in live.segments.take_ended() {
+        live.probes.retain(|p| Some(p.number) != ended.number);
+        tracing::debug!(target: "composer_probe", ?ended, "segment ended");
+    }
 }
 
 /// Whether a liability is out on the generation: the count its records hold,
@@ -433,9 +573,14 @@ fn plan_locked(state: &mut State, writer: Writer, bytes: &[u8], plan: Option<Pla
         && !(state.framing.at_ground() && !bytes.iter().any(|&b| b == 0x07 || b == 0x1b));
     let solicited = (cutting || numbering) && solicited_whole(state, whole);
     let start = numbering.then(|| state.framing.clone());
+    let at_start = cutting.then(|| state.framing.clone());
     let mut cut = None;
     let mut numbered: Option<(u64, u64)> = None;
+    let mut ground = 0;
     for (i, &byte) in bytes.iter().enumerate() {
+        if state.framing.at_ground() {
+            ground = i;
+        }
         let mut candidates = 0usize;
         state.framing.feed(byte, |token| {
             if is_candidate(&token, solicited) {
@@ -460,6 +605,7 @@ fn plan_locked(state: &mut State, writer: Writer, bytes: &[u8], plan: Option<Pla
         if cutting && cut.is_none() {
             cut = Some(Cut {
                 at: i + 1,
+                start: ground,
                 resume: state.framing.clone(),
             });
         }
@@ -487,6 +633,7 @@ fn plan_locked(state: &mut State, writer: Writer, bytes: &[u8], plan: Option<Pla
         natives: numbered
             .zip(start)
             .map(|((first, last), start)| Natives { first, last, start }),
+        framing: at_start,
     }
 }
 
@@ -495,6 +642,10 @@ fn plan_locked(state: &mut State, writer: Writer, bytes: &[u8], plan: Option<Pla
 #[derive(Debug)]
 pub struct GenerationInput {
     state: RankedMutex<{ R6 }, State>,
+    /// Woken after any step that may have moved the segments (Q35-20): the
+    /// generation's release driver waits on it. Notified with this lock
+    /// released.
+    moved: tokio::sync::Notify,
     /// How many bytes the output hook has read, advanced by the hook before
     /// it hands over a push's notes, outside the lock: the offset a query is
     /// noted at, and a fence's trigger (Q35-15).
@@ -565,8 +716,10 @@ impl GenerationInput {
                 hazards: HazardFifo::default(),
                 estimate: QueryWaitEstimate::new(redraw, spawn),
                 records: None,
+                live: None,
                 retired: false,
             }),
+            moved: tokio::sync::Notify::new(),
             output_offset: AtomicU64::new(0),
             native_page: NativePage::default(),
             frontier: FrontierQueue::default(),
@@ -871,6 +1024,260 @@ impl GenerationInput {
         self.state.lock_recovering().epoch.touched()
     }
 
+    /// PRD #1666 part 3 (Q35-20): attach the generation's segments, which
+    /// wait for `agent`'s return path, beside its records. Once, after the
+    /// records, and never after retirement.
+    pub fn attach_segments(&self, generation: u64, agent: segments::Agent) -> bool {
+        let mut state = self.state.lock_recovering();
+        if state.retired || state.records.is_none() || state.live.is_some() {
+            return false;
+        }
+        state.live = Some(Live {
+            segments: Segments::new(generation, agent),
+            markers: ReturnMarkers::default(),
+            pair_open: false,
+            explained: 0,
+            schedule: Schedule::default(),
+            probes: Vec::new(),
+            reads: std::collections::VecDeque::new(),
+        });
+        true
+    }
+
+    /// Whether the generation has segments attached (and hasn't retired).
+    pub fn has_segments(&self) -> bool {
+        let state = self.state.lock_recovering();
+        !state.retired && state.live.is_some()
+    }
+
+    /// What the release driver waits on (Q35-20).
+    pub fn segments_moved(&self) -> &tokio::sync::Notify {
+        &self.moved
+    }
+
+    /// The output hook's bytes, for the return markers and the second
+    /// `ExternalEdit` producer (Q35-20, PR U3-11): every byte the agent
+    /// wrote, in order, at `now`. Nothing without segments attached.
+    ///
+    /// **The second producer.** A complete `?2004l` … `?2004h` pair, the
+    /// shape of an editor session, that no record the deck made accounts for
+    /// moves the epoch as an external edit when its `?2004h` is read: an
+    /// editor the agent ran without the deck's helper may have changed the
+    /// box. A record accounts for one pair whichever is read first, since
+    /// the helper's report and the agent's output reach the daemon on
+    /// different paths. A mode observation alone, or the tracker's boolean,
+    /// releases and grants nothing (the Q35-02 condition): only the
+    /// segments' own watch, after a trigger's written offset, is E1.
+    pub fn on_output_bytes(&self, bytes: &[u8], now: Instant) {
+        let mut guard = self.state.lock_recovering();
+        let state = &mut *guard;
+        let (Some(live), false) = (state.live.as_mut(), state.retired) else {
+            return;
+        };
+        let mut seen: Vec<Seen> = Vec::new();
+        live.markers.feed(bytes, &mut seen);
+        if seen.is_empty() {
+            return;
+        }
+        tracing::debug!(target: "composer_probe", ?seen, "return markers");
+        for s in &seen {
+            match s.marker {
+                Marker::PasteOff => live.pair_open = true,
+                Marker::PasteOn if live.pair_open => {
+                    live.pair_open = false;
+                    if live.explained > 0 {
+                        live.explained -= 1;
+                    } else {
+                        state.epoch.record(None);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(records) = state.records.as_mut() {
+            live.segments
+                .on_output(records, &mut state.hazards, &seen, now);
+        }
+        settle_live(state, now);
+        drop(guard);
+        self.moved.notify_one();
+    }
+
+    /// The daemon read an `Armed` invocation's export (Q35-20): whether it
+    /// was empty, for the epoch's settlement of the probe it matches.
+    pub fn note_read(&self, key: RecordKey, empty: bool) {
+        let mut state = self.state.lock_recovering();
+        if let Some(live) = state.live.as_mut() {
+            if live.reads.len() == READS_KEPT {
+                live.reads.pop_front();
+            }
+            live.reads.push_back((key, empty));
+        }
+    }
+
+    /// Whether a probe attempt is due at `now` (R2 §6.8).
+    pub fn probe_due(&self, now: Instant) -> bool {
+        let state = self.state.lock_recovering();
+        let epoch = state.epoch.epoch();
+        state
+            .live
+            .as_ref()
+            .is_some_and(|live| live.schedule.due(now, epoch))
+    }
+
+    /// A due attempt failed at `now`: refused by admission, or its job
+    /// refused or failed at the writer.
+    pub fn probe_failed(&self, now: Instant) {
+        if let Some(live) = self.state.lock_recovering().live.as_mut() {
+            live.schedule.failed(now);
+        }
+    }
+
+    /// Whether the last attempt failed, so a due one is the schedule's
+    /// retry.
+    pub fn probe_retrying(&self) -> bool {
+        self.state
+            .lock_recovering()
+            .live
+            .as_ref()
+            .is_some_and(|live| live.schedule.failures() > 0)
+    }
+
+    /// Open a probe's segment at `now` (core §4.5): its number and job, to
+    /// publish and queue. `held`: the gate holds input, which forbids a
+    /// lapse retry's supersession (core §4.7).
+    pub fn segment_open_probe(
+        &self,
+        held: bool,
+        now: Instant,
+    ) -> Result<(u64, DeckJobId), segments::Refusal> {
+        let mut state = self.state.lock_recovering();
+        let live = match (state.retired, state.live.as_mut()) {
+            (false, Some(live)) => live,
+            _ => return Err(segments::Refusal::Retired),
+        };
+        let number = live.segments.open_probe(held, now)?;
+        let job = DeckJobId(number);
+        live.probes.push(Probe {
+            number,
+            job,
+            e0: None,
+        });
+        // A superseded lapsed probe's ending.
+        for ended in live.segments.take_ended() {
+            live.probes.retain(|p| Some(p.number) != ended.number);
+        }
+        Ok((number, job))
+    }
+
+    /// Segment `number`'s trigger: the writer took it, the output at
+    /// `offset` and the instant `at` as its job started (a lower bound, so
+    /// no marker the agent writes after reading it can come before).
+    pub fn segment_written(
+        &self,
+        number: u64,
+        offset: u64,
+        at: Instant,
+        now: Instant,
+    ) -> Result<(), segments::Refusal> {
+        self.segment_step(now, |seg, records, fifo| {
+            seg.written(records, fifo, number, offset, at, now)
+        })
+    }
+
+    /// Segment `number`'s trigger was withdrawn or refused before the writer
+    /// started it.
+    pub fn segment_withdrawn(&self, number: u64) -> Result<(), segments::Refusal> {
+        self.segment_step(Instant::now(), |seg, _, _| seg.withdrawn(number))
+    }
+
+    /// Segment `number`'s trigger write failed.
+    pub fn segment_write_failed(&self, number: u64) -> Result<(), segments::Refusal> {
+        self.segment_step(Instant::now(), |seg, _, _| seg.write_failed(number))
+    }
+
+    /// Record `key`'s editor child was observed running an executable other
+    /// than the helper (core §4.6's `HumanG/Unarmed` row).
+    pub fn segment_editor_running(&self, key: RecordKey, now: Instant) -> bool {
+        self.segment_step(now, |seg, records, fifo| {
+            Ok(seg.editor_running(records, fifo, key, now))
+        })
+        .unwrap_or(false)
+    }
+
+    /// A held Ctrl+G at the front of the held input, with no segment open:
+    /// its number, to publish before its trigger is written alone.
+    pub fn segment_trigger(&self) -> Result<u64, segments::Refusal> {
+        self.segment_step(Instant::now(), |seg, _, _| seg.open_held_trigger())
+    }
+
+    fn segment_step<T>(
+        &self,
+        now: Instant,
+        step: impl FnOnce(&mut Segments, &mut Records, &mut HazardFifo) -> Result<T, segments::Refusal>,
+    ) -> Result<T, segments::Refusal> {
+        let mut guard = self.state.lock_recovering();
+        let state = &mut *guard;
+        let (Some(live), Some(records), false) =
+            (state.live.as_mut(), state.records.as_mut(), state.retired)
+        else {
+            return Err(segments::Refusal::Retired);
+        };
+        let result = step(&mut live.segments, records, &mut state.hazards);
+        settle_live(state, now);
+        drop(guard);
+        self.moved.notify_one();
+        result
+    }
+
+    /// What the front segment lets the held input do, `None` with no
+    /// segments attached or once retired.
+    pub fn segments_front(&self) -> Option<Front> {
+        let state = self.state.lock_recovering();
+        match (state.retired, state.live.as_ref()) {
+            (false, Some(live)) => Some(live.segments.front()),
+            _ => None,
+        }
+    }
+
+    /// The open segments, as of `now`.
+    pub fn segments_view(&self, now: Instant) -> Vec<segments::View> {
+        let state = self.state.lock_recovering();
+        match (state.retired, state.live.as_ref(), state.records.as_ref()) {
+            (false, Some(live), Some(records)) => live.segments.view(records, now),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The gate as probe admission reads it (core §4.7–§4.8): open with no
+    /// fence and no segment; lapsed when its only segment is a Claude probe
+    /// that lapsed with nothing held behind it (`held_ops` from the gate),
+    /// with that probe's `E0`; closed otherwise.
+    pub fn admission_fence(
+        &self,
+        fenced: bool,
+        held_ops: usize,
+        now: Instant,
+    ) -> (admission::Fence, Option<u64>) {
+        let state = self.state.lock_recovering();
+        let Some(live) = state.live.as_ref().filter(|_| !state.retired) else {
+            return (admission::Fence::Closed, None);
+        };
+        if live.segments.is_empty() {
+            let fence = if fenced {
+                admission::Fence::Closed
+            } else {
+                admission::Fence::Open
+            };
+            return (fence, None);
+        }
+        if held_ops == 0 && live.segments.lapsed_alone(now) {
+            let e0 = live.probes.first().and_then(|p| p.e0);
+            return (admission::Fence::Lapsed, e0);
+        }
+        (admission::Fence::Closed, None)
+    }
+
     /// Attach the generation's invocation records (Q35-07). Once: a second
     /// table, or one after retirement, is refused.
     pub fn attach_records(&self, records: Records) -> bool {
@@ -894,10 +1301,21 @@ impl GenerationInput {
     ) -> Result<T, Refusal> {
         let mut guard = self.state.lock_recovering();
         let state = &mut *guard;
-        match (state.retired, state.records.as_mut()) {
+        let result = match (state.retired, state.records.as_mut()) {
             (false, Some(records)) => step(records, &mut state.hazards),
-            _ => Err(Refusal::Stale),
+            _ => return Err(Refusal::Stale),
+        };
+        // Q35-20 (O-20.3): what the step allows the segments, in the same
+        // hold.
+        let live = state.live.is_some();
+        if live {
+            settle_live(state, Instant::now());
         }
+        drop(guard);
+        if live {
+            self.moved.notify_one();
+        }
+        result
     }
 
     /// See [`Records::observe`].
@@ -906,7 +1324,23 @@ impl GenerationInput {
         obs: &record::Observation,
         now: Instant,
     ) -> Result<Recorded, Refusal> {
-        self.with_records(|r, fifo| r.observe(fifo, obs, now))
+        let made = std::cell::Cell::new(false);
+        let recorded = self.with_records(|r, fifo| {
+            let before = r.get(obs.key).is_some();
+            let recorded = r.observe(fifo, obs, now);
+            made.set(!before && r.get(obs.key).is_some());
+            recorded
+        });
+        // An editor session the deck saw accounts for one bracketed-paste
+        // pair (PR U3-11's second producer). A tool's helper isn't the
+        // composer's, so it explains none.
+        if made.get() && obs.attribution != Attribution::NotOwned(NotOwned::Tool) {
+            let mut state = self.state.lock_recovering();
+            if let Some(live) = state.live.as_mut() {
+                live.explained = live.explained.saturating_add(1).min(EXPLAINED_CAP);
+            }
+        }
+        recorded
     }
 
     /// See [`Records::refused_identity`].
@@ -1040,7 +1474,19 @@ impl GenerationInput {
         markers_deleted: bool,
         now: Instant,
     ) -> Result<Option<ExitFact>, Refusal> {
-        self.with_records(|r, fifo| r.prune(fifo, generation, key, markers_deleted, now))
+        let pruned =
+            self.with_records(|r, fifo| r.prune(fifo, generation, key, markers_deleted, now));
+        // AU7 §2: the segment it matched keeps its facts after it goes.
+        if let Ok(Some(fact)) = pruned {
+            let mut guard = self.state.lock_recovering();
+            let state = &mut *guard;
+            if let (Some(live), Some(records)) = (state.live.as_mut(), state.records.as_mut()) {
+                let _ = live
+                    .segments
+                    .drained(records, &mut state.hazards, fact, now);
+            }
+        }
+        pruned
     }
 
     /// See [`Records::raise`].
@@ -1181,6 +1627,8 @@ impl GenerationInput {
     pub fn retire(&self) {
         let mut state = self.state.lock_recovering();
         Self::retire_locked(&mut state);
+        drop(state);
+        self.moved.notify_one();
     }
 
     /// [`Self::retire`], first ending the records' pending episode at `now`
@@ -1197,10 +1645,17 @@ impl GenerationInput {
             _ => None,
         };
         Self::retire_locked(&mut state);
+        drop(state);
+        self.moved.notify_one();
         stop
     }
 
     fn retire_locked(state: &mut State) {
+        if let Some(live) = state.live.as_mut() {
+            live.segments.retire();
+            let _ = live.segments.take_ended();
+            live.probes.clear();
+        }
         state.retired = true;
         state.ledger = QueryLedger::default();
         state.backlog = Backlog::new(CprWaitEnd::Counted);

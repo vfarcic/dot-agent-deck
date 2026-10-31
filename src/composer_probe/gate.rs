@@ -19,10 +19,10 @@
 //!   ahead of what is held. It never enters the held queue, doesn't count
 //!   against [`FENCE_OPS_CAP`] or [`FENCE_CAP`], doesn't move the epoch (it is
 //!   exempt) and counts in the writer's in-flight count, as any write does.
-//!   The same holds for every job that doesn't come through acceptance at
-//!   all: the deck's own writes are submitted to the writer straight, and a
-//!   closed fence neither holds nor counts them (Q35-20 brings the deck's
-//!   lines under it).
+//!   A job that doesn't come through acceptance at all, the deck's own
+//!   line, is submitted to the writer straight, and a closed fence doesn't
+//!   count it: the writer refuses to start it while the fence is closed
+//!   (Q35-20, CX-H), so it writes nothing past a check.
 //! - **settled**: a zero-byte op has nothing to order against the PTY; it
 //!   settles at acceptance and adds no node (R6 §5.1).
 //! - **held**: it fits, so the gate owns it, ticket and all, from now until
@@ -58,9 +58,17 @@
 //! sub-ops count against [`FENCE_OPS_CAP`] as the op did, and a frame full of
 //! candidates is split one cut at a time.
 //!
-//! **The lock.** One mutex, a leaf: nothing calls out of it but the two
+//! **Segments (Q35-20).** A probe's arm section runs under this lock
+//! ([`Gate::arm_section`]), so a person's op is accepted either before it,
+//! taking the probe's queued job back, or after it, held behind the fence it
+//! closed. A segment's release goes as far as the last ground point before
+//! the next held candidate ([`Gate::release_until`]), and a trigger through
+//! the next cut ([`Gate::release_cut`]).
+//!
+//! **The lock.** One mutex, a leaf: nothing calls out of it but the
 //! closures [`Gate::admit`] is given, which classify against and move the
-//! epoch (`R6`, the top rank). Acceptance and release run under the pane
+//! epoch (`R6`, the top rank), and the arm section's, which takes the seam's
+//! lock and the epoch's. Acceptance and release run under the pane
 //! writer's own lock, so they are serialised with each other; retirement and
 //! the status read take only this one.
 
@@ -68,6 +76,8 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::Notify;
+
+use crate::doorbell_txn::{ClaimState, JobClaim};
 
 /// The most bytes a fence holds, unless one op alone is larger (R6 §5.1).
 pub const FENCE_CAP: usize = 1024 * 1024;
@@ -108,6 +118,17 @@ pub enum Admission<T> {
     Retired(T),
 }
 
+/// One held op as [`Gate::release_until`] reads it (Q35-20).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Measure {
+    /// The last offset in the op, from 0 to its length, at which the input
+    /// is in ground before any candidate in it; `None` when there is none.
+    pub ground: Option<usize>,
+    /// A Ctrl+G candidate starts in it, or was begun by an earlier op and
+    /// ends in it: the release stops here.
+    pub candidate: bool,
+}
+
 /// A fence's counts, for the `e2e` build's status read.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Status {
@@ -115,6 +136,9 @@ pub struct Status {
     pub held_ops: usize,
     pub held_bytes: usize,
     pub full_waiters: usize,
+    /// Since when something has been held without a break (Q35-20's
+    /// display timers); `None` while nothing is.
+    pub held_since: Option<std::time::Instant>,
 }
 
 #[derive(Debug)]
@@ -124,12 +148,20 @@ struct Fence<T> {
     trigger: u64,
     held: VecDeque<(T, usize)>,
     held_bytes: usize,
+    /// When its held queue last went from empty to holding.
+    since: Option<std::time::Instant>,
+    /// A probe's arm section closed it (Q35-20): the segments' release
+    /// driver owns its opening. A fence closed any other way isn't the
+    /// driver's to open.
+    segmented: bool,
 }
 
 #[derive(Debug)]
 struct Inner<T> {
     fence: Option<Fence<T>>,
     retired: bool,
+    /// A probe's job queued and not yet at its arm section (Q35-20).
+    probe: Option<Arc<JobClaim>>,
     /// Full waiters, oldest first.
     waiters: VecDeque<u64>,
     next_waiter: u64,
@@ -150,6 +182,7 @@ impl<T> Default for Gate<T> {
             inner: Mutex::new(Inner {
                 fence: None,
                 retired: false,
+                probe: None,
                 waiters: VecDeque::new(),
                 next_waiter: 0,
                 version: 0,
@@ -180,6 +213,8 @@ impl<T> Gate<T> {
             trigger,
             held: VecDeque::new(),
             held_bytes: 0,
+            since: None,
+            segmented: false,
         });
         true
     }
@@ -217,10 +252,22 @@ impl<T> Gate<T> {
             let waiter = waiter.unwrap_or_else(|| self.wait_in(&mut inner));
             return Admission::Full(op, waiter);
         }
-        let Some(fence) = inner.fence.as_mut() else {
+        if inner.fence.is_none() {
+            // R5 §4.2 (Q35-20): a person's op accepted while a probe's job
+            // is still queued takes it back, by the claim's swap, before the
+            // op is written; the arm section, which takes this lock, then
+            // finds it taken back and publishes nothing.
+            if len > 0
+                && let Some(claim) = inner.probe.take()
+            {
+                claim.withdraw();
+            }
             drop(inner);
             drop(waiter);
             return Admission::Open(op);
+        }
+        let Some(fence) = inner.fence.as_mut() else {
+            unreachable!("checked above");
         };
         let fits = fence.held.is_empty()
             || (fence.held.len() < FENCE_OPS_CAP && fence.held_bytes + len <= FENCE_CAP);
@@ -229,6 +276,9 @@ impl<T> Gate<T> {
             return Admission::Full(op, waiter);
         }
         hold(&mut op);
+        if fence.held.is_empty() {
+            fence.since = Some(std::time::Instant::now());
+        }
         fence.held_bytes += len;
         fence.held.push_back((op, len));
         drop(inner);
@@ -283,6 +333,166 @@ impl<T> Gate<T> {
         out
     }
 
+    /// Release what a released or ended segment lets go (Q35-20, core §4.6):
+    /// the held ops, in acceptance order, as far as the last point before
+    /// the next held Ctrl+G candidate at which the input is in ground, so no
+    /// byte of the candidate, nor of a sequence that may still become one,
+    /// goes ahead of its segment. `measure` reads each held op in order (it
+    /// carries the input's state from one to the next) until one holds a
+    /// candidate; `split(op, n)` takes an op's first `n` bytes off as a
+    /// sub-op, leaving the rest held first. With no candidate held and every
+    /// op taken, the fence opens when `open`, which the caller passes only
+    /// when no segment is outstanding; otherwise it stays closed, holding the
+    /// rest. Both closures run under the gate's lock and must take no lock.
+    /// Empty when no fence was closed.
+    pub fn release_until(
+        &self,
+        mut measure: impl FnMut(&T) -> Measure,
+        mut split: impl FnMut(&mut T, usize) -> T,
+        open: bool,
+    ) -> Vec<T> {
+        let mut inner = self.lock();
+        let Some(fence) = inner.fence.as_mut() else {
+            return Vec::new();
+        };
+        // The last ground point before the first candidate: (op, offset).
+        let mut stop = (0usize, 0usize);
+        let mut candidate = false;
+        for (i, (op, _)) in fence.held.iter().enumerate() {
+            let m = measure(op);
+            if let Some(ground) = m.ground {
+                stop = (i, ground);
+            }
+            if m.candidate {
+                candidate = true;
+                break;
+            }
+        }
+        let (whole, part) = match stop {
+            // With no segment outstanding and no candidate held, nothing is
+            // left to hold for: an unfinished sequence at the end (a lone
+            // Escape) goes too.
+            _ if open && !candidate => (fence.held.len(), 0),
+            (i, off) if fence.held.get(i).is_some_and(|(_, len)| off >= *len) => (i + 1, 0),
+            (i, off) => (i, off),
+        };
+        let mut out = Vec::new();
+        for _ in 0..whole {
+            if let Some((op, len)) = fence.held.pop_front() {
+                fence.held_bytes -= len;
+                out.push(op);
+            }
+        }
+        if part > 0
+            && let Some((op, len)) = fence.held.front_mut()
+        {
+            let prefix = split(op, part);
+            *len -= part;
+            fence.held_bytes -= part;
+            out.push(prefix);
+        }
+        if open && !candidate && fence.held.is_empty() {
+            inner.fence = None;
+        }
+        if !out.is_empty() || inner.fence.is_none() {
+            self.moved(&mut inner);
+        }
+        out
+    }
+
+    /// Whether a probe's arm section closed the fence that is closed now
+    /// (Q35-20): only such a fence is the segments' to open.
+    pub fn segment_fenced(&self) -> bool {
+        self.lock().fence.as_ref().is_some_and(|f| f.segmented)
+    }
+
+    /// Whether a fence is closed with nothing held behind it.
+    pub fn fenced_empty(&self) -> bool {
+        self.lock()
+            .fence
+            .as_ref()
+            .is_some_and(|f| f.held.is_empty())
+    }
+
+    /// Whether any held op holds a Ctrl+G candidate (Q35-20), `cut` saying
+    /// whether an op does.
+    pub fn holds_any(&self, cut: impl Fn(&T) -> bool) -> bool {
+        self.lock()
+            .fence
+            .as_ref()
+            .is_some_and(|f| f.held.iter().any(|(op, _)| cut(op)))
+    }
+
+    /// Open the fence when nothing is held behind it (Q35-20: the last
+    /// segment ended with no input waiting). Whether it opened.
+    pub fn open_if_empty(&self) -> bool {
+        let mut inner = self.lock();
+        if inner.fence.as_ref().is_some_and(|f| f.held.is_empty()) {
+            inner.fence = None;
+            self.moved(&mut inner);
+            return true;
+        }
+        false
+    }
+
+    /// The probe's arm section (Q35-20, O-20.2): under the gate's lock, so
+    /// that a person's op is either accepted before it, finding the probe's
+    /// job still queued and taking it back ([`Self::admit`]), or after it,
+    /// finding the fence closed and being held. `section` runs only while
+    /// the gate isn't retired and the job wasn't taken back, with the gate's
+    /// counts as they stand under the lock; on its `Ok` the
+    /// fence closes at the output offset `trigger` reads then, which is
+    /// before the probe's byte. `section` may take the seam's lock and the
+    /// epoch's (R6) under this one; nothing takes this lock under either.
+    pub fn arm_section<R>(
+        &self,
+        claim: &Arc<JobClaim>,
+        retired: R,
+        taken_back: R,
+        section: impl FnOnce(Status) -> Result<(), R>,
+        trigger: impl FnOnce() -> u64,
+    ) -> Result<(), R> {
+        let mut inner = self.lock();
+        let pending = inner.probe.take();
+        if inner.retired {
+            return Err(retired);
+        }
+        if claim.state() != ClaimState::Queued
+            || pending.as_ref().is_some_and(|p| !Arc::ptr_eq(p, claim))
+        {
+            inner.probe = pending;
+            return Err(taken_back);
+        }
+        let status = Status {
+            fenced: inner.fence.is_some(),
+            held_ops: inner.fence.as_ref().map_or(0, |f| f.held.len()),
+            held_bytes: inner.fence.as_ref().map_or(0, |f| f.held_bytes),
+            full_waiters: inner.waiters.len(),
+            held_since: None,
+        };
+        section(status)?;
+        let trigger = trigger();
+        inner
+            .fence
+            .get_or_insert(Fence {
+                trigger,
+                held: VecDeque::new(),
+                held_bytes: 0,
+                since: None,
+                segmented: true,
+            })
+            .segmented = true;
+        self.moved(&mut inner);
+        Ok(())
+    }
+
+    /// A probe's job was queued under `claim` (Q35-20, R5 §4.2): until its
+    /// arm section runs, a person's op the gate accepts with no fence closed
+    /// takes it back first.
+    pub fn probe_queued(&self, claim: Arc<JobClaim>) {
+        self.lock().probe = Some(claim);
+    }
+
     /// An op the gate let through with no fence closed, whose planner cut it
     /// (Q35-16, core §4.3): a liability is out, so its Ctrl+G candidate opens
     /// a segment. The fence closes at `trigger`, holding the op, and opens as
@@ -302,6 +512,9 @@ impl<T> Gate<T> {
             return Err(op);
         }
         if let Some(fence) = inner.fence.as_mut() {
+            if fence.held.is_empty() {
+                fence.since = Some(std::time::Instant::now());
+            }
             fence.held_bytes += len;
             fence.held.push_back((op, len));
             self.moved(&mut inner);
@@ -311,6 +524,8 @@ impl<T> Gate<T> {
             trigger,
             held: VecDeque::from([(op, len)]),
             held_bytes: len,
+            since: Some(std::time::Instant::now()),
+            segmented: false,
         });
         let (out, cut) = Self::through_cut(fence, split);
         if !cut {
@@ -358,6 +573,7 @@ impl<T> Gate<T> {
             return Vec::new();
         }
         inner.retired = true;
+        inner.probe = None;
         let held = inner
             .fence
             .take()
@@ -378,6 +594,11 @@ impl<T> Gate<T> {
             held_ops: inner.fence.as_ref().map_or(0, |f| f.held.len()),
             held_bytes: inner.fence.as_ref().map_or(0, |f| f.held_bytes),
             full_waiters: inner.waiters.len(),
+            held_since: inner
+                .fence
+                .as_ref()
+                .filter(|f| !f.held.is_empty())
+                .and_then(|f| f.since),
         }
     }
 }

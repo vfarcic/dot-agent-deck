@@ -59,10 +59,15 @@ pub fn is_candidate(token: &Token<'_>, solicited_reply: bool) -> bool {
 
 /// Where the planner cut an op: right after the candidate whose last byte is
 /// at `at - 1`, with the planner's state there, from which the rest of the op
-/// is read when it is next released.
+/// is read when it is next released. `start` is where the candidate began in
+/// this op: the last offset before it at which the input framing was in
+/// ground, or 0 when the candidate began in an earlier op (Q35-20: a release
+/// goes as far as `start`, and the trigger from there through `at` is
+/// written alone).
 #[derive(Debug, Clone)]
 pub struct Cut {
     pub at: usize,
+    pub start: usize,
     pub resume: Framing,
 }
 
@@ -77,12 +82,17 @@ pub fn next_cut(start: &Framing, bytes: &[u8]) -> Option<Cut> {
 /// op's classification at acceptance.
 pub fn first_cut(start: &Framing, bytes: &[u8], solicited_reply: bool) -> Option<Cut> {
     let mut framing = start.clone();
+    let mut ground = 0;
     for (i, &byte) in bytes.iter().enumerate() {
+        if framing.at_ground() {
+            ground = i;
+        }
         let mut cut = false;
         framing.feed(byte, |token| cut |= is_candidate(&token, solicited_reply));
         if cut {
             return Some(Cut {
                 at: i + 1,
+                start: ground,
                 resume: framing,
             });
         }

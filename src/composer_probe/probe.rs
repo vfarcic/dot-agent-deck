@@ -126,6 +126,11 @@ impl Schedule {
         self.broken
     }
 
+    /// The failures in a row so far.
+    pub fn failures(&self) -> u32 {
+        self.failures
+    }
+
     /// An attempt failed at `now`: refused, uncertain, or lapsed.
     pub fn failed(&mut self, now: Instant) {
         self.failures = self.failures.saturating_add(1);
