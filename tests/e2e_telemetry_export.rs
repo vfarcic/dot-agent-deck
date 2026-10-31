@@ -908,13 +908,13 @@ fn telemetry_otlp_010_natural_exit_retains_last_status() {
     );
 }
 
-// Assumed e2e-only seam for #2028 (not implemented by this test slice):
-// capture DOT_AGENT_DECK_E2E_EXIT_GATE from the generation's spawn environment.
-// In pump_reader's common EOF tail, after signal_agent_exit and immediately
-// before the telemetry call, atomically write this agent id to <dir>/arrived
-// and wait for <dir>/release. Hold no registry/bus locks while waiting, bound
-// the wait, and apply the seam to both the Linux frontier and plain reader.
-// This controls scheduling; it must not supply a verdict or an exit code.
+// The e2e-only ExitGate in src/agent_pty.rs reads DOT_AGENT_DECK_E2E_EXIT_GATE
+// from the generation's spawn environment, falling back to the daemon's.
+// In pump_reader's common EOF tail, after exit publication and before the
+// telemetry call, it atomically publishes this agent id to <dir>/arrived and
+// waits for <dir>/release for up to 120 seconds. Both the Linux frontier and
+// plain reader reach this gate, which controls scheduling rather than the
+// end reason or exit code.
 struct ExitTelemetryGate(std::path::PathBuf);
 
 impl ExitTelemetryGate {
