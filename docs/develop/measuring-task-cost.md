@@ -4,7 +4,7 @@ Do the work normally. Measure what it costs. Post the numbers.
 
 This page is the **durable protocol** for issue #906's cost measurements. The task itself — which issue, which shape, which concurrency level — comes from whoever dispatched the run and stays short.
 
-It is a reference, deliberately not a skill: a skill's description is injected into every session's context (the 38 existing ones already cost ~10.7 KB before any work starts), and this serves a bounded experiment plus the occasional "did that change make things faster" question. Both are deliberately initiated, so nothing needs to discover it unprompted. Developer docs under `docs/develop/` are excluded from the Docusaurus build (CLAUDE.md rule 11), so this never reaches the public site.
+It is a reference, deliberately not a skill: a skill's description is injected into every session's context (the 28 under `.claude/skills/` carried ~10.6 KB of description on 2026-10-31, before any work starts), and this serves a bounded experiment plus the occasional "did that change make things faster" question. Both are deliberately initiated, so nothing needs to discover it unprompted. Developer docs under `docs/develop/` are never published: the site build (`cargo xtask site`) refuses a `develop/` page (CLAUDE.md rule 11), so this never reaches the public site.
 
 ## The prime directive
 
