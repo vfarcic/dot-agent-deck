@@ -26497,12 +26497,20 @@ mod spawn_tests {
         (id, typed, dir)
     }
 
-    /// Scenario: Replay Claude Code 2.1.310's and 2.1.312's recorded screens into a raw pane: the empty main composer, then the same composer with `Press Ctrl-C again to exit` in its status row after a first Ctrl+C. The deck rings each. On the empty composer the ring is admitted and types; on the exit-warning screen, whose composer still shows the ordinary placeholder, nothing reaches the pane.
+    /// Scenario: Replay Claude Code 2.1.310's and 2.1.312's recorded screens at 50×200, 24×80 and 40×120 into a raw pane: the empty main composer, then the same composer with `Press Ctrl-C again to exit` in its status row after a first Ctrl+C, and at 24×80 and 40×120 also the empty composer under the quota notice that starts left of the midpoint. The deck rings each. On the empty composers the ring is admitted and types; on the exit-warning screen, whose composer still shows the ordinary placeholder, nothing reaches the pane.
     #[spec("inbox/doorbell/036")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn doorbell_036_a_ring_on_the_recorded_exit_warning_types_nothing() {
-        for release in ["2.1.310", "2.1.312"] {
-            let stem = format!("claude-inbox/r5wake/claude-{release}-menus-50x200");
+        for (release, size) in [
+            ("2.1.310", "50x200"),
+            ("2.1.312", "50x200"),
+            ("2.1.310", "24x80"),
+            ("2.1.312", "24x80"),
+            ("2.1.310", "40x120"),
+            ("2.1.312", "40x120"),
+        ] {
+            let label = format!("{release} {size}");
+            let stem = format!("claude-inbox/r5wake/claude-{release}-menus-{size}");
             let registry = Arc::new(AgentPtyRegistry::new());
             let ring = |id: String, pane: &'static str| {
                 let registry = Arc::clone(&registry);
@@ -26523,18 +26531,32 @@ mod spawn_tests {
             let control = ring(id, "pane-recorded-empty").await;
             assert!(
                 control.attempt.is_some() && !std::fs::read(&typed).unwrap().is_empty(),
-                "{release}: the empty composer admits the ring: {control:?}"
+                "{label}: the empty composer admits the ring: {control:?}"
             );
+            if size != "50x200" {
+                // The quota notice starts left of the midpoint at these widths.
+                let (id, typed, _dir) = recorded_claude_pane(
+                    &registry,
+                    "pane-recorded-notice",
+                    &stem,
+                    "transcript-quotation",
+                );
+                let notice = ring(id, "pane-recorded-notice").await;
+                assert!(
+                    notice.attempt.is_some() && !std::fs::read(&typed).unwrap().is_empty(),
+                    "{label}: the composer under the quota notice admits the ring: {notice:?}"
+                );
+            }
             let (id, typed, _dir) =
                 recorded_claude_pane(&registry, "pane-recorded-exit", &stem, "exit-warning");
             let report = ring(id, "pane-recorded-exit").await;
             assert!(
                 report.attempt.is_none() && !report.cr_reached,
-                "{release}: the exit warning refuses the ring: {report:?}"
+                "{label}: the exit warning refuses the ring: {report:?}"
             );
             assert!(
                 std::fs::read(&typed).unwrap().is_empty(),
-                "{release}: nothing reaches the pane"
+                "{label}: nothing reaches the pane"
             );
             registry.shutdown_all();
         }

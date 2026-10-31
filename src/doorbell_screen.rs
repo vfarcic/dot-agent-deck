@@ -750,18 +750,89 @@ fn claude_composer(grid: &Grid) -> Option<Composer> {
 /// 2026-10-31, `claude-*-menus-50x200`).
 const CLAUDE_EXIT_WARNING: &str = "Press Ctrl-C again to exit";
 
+/// The columns Claude Code 2.1.310 and 2.1.312 leave blank right of a notice
+/// it aligns right on the row above the composer's upper rule: its last
+/// character sits two cells short of the right edge in every menu capture
+/// (80, 120 and 200 columns, measured 2026-10-31, `claude-*-menus-*`).
+/// Mid-resize frames have drawn it one or two cells further right, and only
+/// a notice starting in the right half is accepted there.
+const CLAUDE_NOTICE_RIGHT_INSET: u16 = 2;
+
+/// The furthest column right a suggestion list starts an entry at: `❯ ` at
+/// column 2 on the selected slash command, `/name` or `+ path` at column 4 on
+/// the others (measured 2026-10-31, `claude-*-menus-*`). A notice that starts
+/// left of the midpoint must start right of it.
+const CLAUDE_LIST_INDENT: usize = 4;
+
+/// Whether `row`, right above the composer's upper rule, holds nothing a
+/// suggestion list could have drawn (measured 2026-10-31 at 24×80, 40×120
+/// and 50×200 in eight palettes, `claude-*-menus-*`). A list starts its
+/// entries by [`CLAUDE_LIST_INDENT`], with a gap between a slash command's
+/// name and its description and its other rows above; the main composer has
+/// nothing there, or one notice aligned right (the effort level, a paste
+/// hint, a quota warning). So the row is clear when it is blank, or when it
+/// is one run of text, with no gap of two or more blank cells, drawn in one
+/// style (one foreground, no background, no change of bold, dim or inverse
+/// part-way) and either:
+/// - starts in the right half, as the effort level and paste hint do at every
+///   measured width and through the recorded resizes, or
+/// - has the measured shape of a notice long enough to start left of the
+///   midpoint (the quota warning at 80 and 120 columns): it ends exactly
+///   [`CLAUDE_NOTICE_RIGHT_INSET`] cells short of the right edge, starts right
+///   of [`CLAUDE_LIST_INDENT`], and stands alone, the row above it blank,
+///   where a list's last row has the rest of the list above it.
+///
+/// Anything else there is refused. Ending at the notice's column is not
+/// enough on its own: a wrapped slash-command entry does too at 80 columns.
+/// And the notice's words are not read, so a transcript quoting them, or a
+/// notice reworded, decides nothing.
+fn claude_clear_above_frame(grid: &Grid, row: u16) -> bool {
+    let cells = &grid.cells[row as usize];
+    let Some(first) = cells.iter().position(|c| !c.blank()) else {
+        return true;
+    };
+    let last = cells.iter().rposition(|c| !c.blank()).unwrap_or(first);
+    let one_run = !cells[first..=last]
+        .windows(2)
+        .any(|pair| pair[0].blank() && pair[1].blank());
+    let style = &cells[first];
+    let one_style = cells[first..=last].iter().filter(|c| !c.blank()).all(|c| {
+        c.fg == style.fg
+            && c.bg == vt100::Color::Default
+            && c.bold == style.bold
+            && c.dim == style.dim
+            && !c.inverse
+    });
+    if !(one_run && one_style) {
+        return false;
+    }
+    if first >= usize::from(grid.cols / 2) {
+        return true;
+    }
+    let inset = usize::from(grid.cols) == last + 1 + usize::from(CLAUDE_NOTICE_RIGHT_INSET);
+    let alone = row
+        .checked_sub(1)
+        .is_some_and(|above| grid.row_extent(above) == 0);
+    inset && first > CLAUDE_LIST_INDENT && alone
+}
+
 /// The ready screen: the composer framed by two full-width rules with a
 /// status row under the lower one, and none of the other surfaces Claude
 /// Code 2.1.310 and 2.1.312 draw around that same frame (measured
-/// 2026-10-31, `claude-*-menus-50x200`). Each is told by where and how it
-/// draws, not by any phrase elsewhere on the screen, so a transcript quoting
-/// them doesn't count:
-/// - the background-session overview: its rules in the default colour and
-///   its `❯` grey, where the main composer's rules are grey and its glyph is
-///   grey only while Claude Code works;
-/// - a slash-command or file suggestion list, drawn from the left on the
-///   row right above the upper rule, where the main composer has nothing or
-///   a notice aligned right;
+/// 2026-10-31, `claude-*-menus-*`: 24×80, 40×120 and 50×200 in the indexed
+/// dark theme, 50×200 in indexed light, truecolor dark and light, dark-ansi,
+/// light-ansi and dark-daltonized). Each is told by where and how it draws,
+/// not by any phrase elsewhere on the screen, so a transcript quoting them
+/// doesn't count:
+/// - the background-session overview: its upper rule in the terminal's
+///   default colour and its `❯` coloured, where the main composer's rule is
+///   coloured and its `❯` is in the default colour. The relationship is what
+///   holds across the measured palettes, not any one colour: in the ANSI
+///   themes the main composer's rule and the overview's `❯` are both basic
+///   colour 7;
+/// - a slash-command or file suggestion list on the row right above the
+///   upper rule, where the main composer has nothing or a notice
+///   ([`claude_clear_above_frame`]);
 /// - the exit warning, [`CLAUDE_EXIT_WARNING`] in the status row.
 fn claude_ready(grid: &Grid) -> bool {
     let Some(composer) = claude_composer(grid) else {
@@ -780,12 +851,9 @@ fn claude_ready(grid: &Grid) -> bool {
         && grid
             .cell(composer.prompt_row, 0)
             .is_some_and(|c| c.fg != vt100::Color::Default);
-    let suggestions = upper.checked_sub(1).is_some_and(|row| {
-        grid.cells[row as usize]
-            .iter()
-            .position(|c| !c.blank())
-            .is_some_and(|col| col < usize::from(grid.cols / 2))
-    });
+    let suggestions = upper
+        .checked_sub(1)
+        .is_some_and(|row| !claude_clear_above_frame(grid, row));
     let exit_warning = grid
         .text_from(close + 1, 0)
         .trim_start()
