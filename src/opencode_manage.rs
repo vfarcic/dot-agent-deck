@@ -119,10 +119,23 @@ fn remembered_major(root: &Path) -> Option<crate::opencode_version::Major> {
     }
 }
 
+/// The generation an install with no command to look at remembers: the
+/// marker of the module in OpenCode 2.x's global root `v2_global`, else that
+/// of `roots`' first (1.x's global) root. The two are one directory unless
+/// `$OPENCODE_CONFIG_DIR` moves 2.x's; then a 2.x install leaves no module in
+/// the XDG root, and a 1.x install rewrites both, so the first one present is
+/// the latest.
+fn remembered_major_in(
+    roots: &[PathBuf],
+    v2_global: &Path,
+) -> Option<crate::opencode_version::Major> {
+    remembered_major(v2_global).or_else(|| roots.first().and_then(|root| remembered_major(root)))
+}
+
 /// The layout an install with no command to look at writes: the one last
-/// written to `roots`' global root, else [`Layout::Unknown`].
-fn remembered_layout(roots: &[PathBuf]) -> Layout {
-    Layout::for_major(roots.first().and_then(|root| remembered_major(root)))
+/// written ([`remembered_major_in`]), else [`Layout::Unknown`].
+fn remembered_layout(roots: &[PathBuf], v2_global: &Path) -> Layout {
+    Layout::for_major(remembered_major_in(roots, v2_global))
 }
 
 /// PRD #2050: OpenCode 2.x's TUI plugin directory under a config root. A
@@ -151,10 +164,77 @@ fn home_dir() -> PathBuf {
     crate::platform::paths::home_dir_with_tmp_fallback()
 }
 
+/// `$XDG_CONFIG_HOME`, else `~/.config`. An empty or relative value is
+/// ignored, as the XDG base-directory spec says
+/// ([`crate::platform::paths::absolute_dir_from_env`]): taken literally, an
+/// empty `XDG_CONFIG_HOME=` made the install write `opencode/` into the
+/// current directory. (OpenCode itself, 1.18.35 and 2.2.5 alike, ignores an
+/// empty value too, but resolves a relative one against its own working
+/// directory, which the deck cannot know, so a relative value has no root
+/// the deck could write into.) Read on every platform, as OpenCode reads it.
 fn xdg_config_root(home: &Path) -> PathBuf {
-    std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| home.join(".config"))
+    xdg_config_root_from(home, std::env::var_os("XDG_CONFIG_HOME").as_deref())
+}
+
+/// [`xdg_config_root`] for an explicit `XDG_CONFIG_HOME` value.
+fn xdg_config_root_from(home: &Path, xdg_config_home: Option<&std::ffi::OsStr>) -> PathBuf {
+    crate::platform::paths::absolute_dir_from_env(xdg_config_home)
+        .unwrap_or_else(|| home.join(".config"))
+}
+
+/// PRD #2050: `$OPENCODE_CONFIG_DIR`, when it names an absolute directory.
+///
+/// Measured: OpenCode 2.2.5 takes it as its global config root instead of
+/// `$XDG_CONFIG_HOME/opencode` (`opencode debug paths`), so the server module,
+/// the 2.x TUI half and `cli.json` live there. OpenCode 1.18.35 keeps
+/// `$XDG_CONFIG_HOME/opencode` as its global root and scans this directory as
+/// an extra one, for plugins (`plugin/`) and `tui.json` alike, so for 1.x it
+/// is one more root of the fan-out ([`candidate_roots`]). Both ignore an
+/// empty value; a relative one is ignored here for the reason
+/// [`xdg_config_root`] gives.
+fn opencode_config_dir() -> Option<std::ffi::OsString> {
+    std::env::var_os("OPENCODE_CONFIG_DIR")
+}
+
+/// PRD #2050: OpenCode 2.x's global config root: `$OPENCODE_CONFIG_DIR`, else
+/// `$XDG_CONFIG_HOME/opencode` ([`opencode_config_dir`]).
+fn v2_global_root() -> PathBuf {
+    roots_from(
+        &home_dir(),
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        opencode_config_dir().as_deref(),
+    )
+    .1
+}
+
+/// The OpenCode config roots for `home` and the values of `XDG_CONFIG_HOME`
+/// and `OPENCODE_CONFIG_DIR`: the roots every install considers
+/// ([`candidate_roots`]), and OpenCode 2.x's global root ([`v2_global_root`]).
+fn roots_from(
+    home: &Path,
+    xdg_config_home: Option<&std::ffi::OsStr>,
+    config_dir: Option<&std::ffi::OsStr>,
+) -> (Vec<PathBuf>, PathBuf) {
+    let xdg = xdg_config_root_from(home, xdg_config_home).join("opencode");
+    let config_dir = crate::platform::paths::absolute_dir_from_env(config_dir);
+    let mut roots = vec![xdg.clone(), home.join(".opencode")];
+    if let Some(dir) = &config_dir
+        && !roots.contains(dir)
+    {
+        roots.push(dir.clone());
+    }
+    (roots, config_dir.unwrap_or(xdg))
+}
+
+/// PRD #2050: the roots of an OpenCode 2.x install: its global root
+/// `v2_global` first, then every root of `roots` that is not it, from which
+/// the deck's copies are removed (2.x scans `~/.opencode` for a project under
+/// `$HOME`, and does not read `$XDG_CONFIG_HOME/opencode` at all once
+/// `$OPENCODE_CONFIG_DIR` moves its root).
+fn v2_roots(roots: &[PathBuf], v2_global: &Path) -> Vec<PathBuf> {
+    std::iter::once(v2_global.to_path_buf())
+        .chain(roots.iter().filter(|root| *root != v2_global).cloned())
+        .collect()
 }
 
 /// The XDG-default OpenCode config root (`$XDG_CONFIG_HOME/opencode`, defaulting
@@ -171,12 +251,18 @@ fn xdg_default_root() -> PathBuf {
 /// existence — that is the caller's job. This is the single source of truth for which
 /// layouts we touch, shared by `existing_plugin_artifacts` (uninstall), `auto_install`,
 /// and `install`. Adding a future layout is a one-line change here.
+///
+/// PRD #2050: `$OPENCODE_CONFIG_DIR` ([`opencode_config_dir`]) comes last when
+/// it names another directory, since OpenCode 1.x loads plugins from it too.
+/// The first root stays `$XDG_CONFIG_HOME/opencode`, 1.x's global root, where
+/// the 1.x TUI half goes; OpenCode 2.x's global root is [`v2_global_root`].
 fn candidate_roots() -> Vec<PathBuf> {
-    let home = home_dir();
-    vec![
-        xdg_config_root(&home).join("opencode"),
-        home.join(".opencode"),
-    ]
+    roots_from(
+        &home_dir(),
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        opencode_config_dir().as_deref(),
+    )
+    .0
 }
 
 /// All plugin artifacts that currently exist on disk across candidate roots (XDG
@@ -3634,11 +3720,24 @@ fn fresh_tui_config(file: &Path) -> String {
 /// under a candidate root, as a plain path or a `file://` URL. Anything else,
 /// even an entry that mentions `dot-agent-deck`, is the user's.
 fn is_deck_tui_entry(entry: &str) -> bool {
-    candidate_roots().iter().any(|root| {
-        let file = tui_plugin_file(root);
-        let path = file.to_string_lossy();
-        entry == path || entry.strip_prefix("file://") == Some(&*path)
-    })
+    candidate_roots()
+        .iter()
+        .any(|root| names_tui_file(entry, root))
+}
+
+/// Whether `entry` names the deck's TUI file under `root`, as a plain path or
+/// a `file://` URL.
+fn names_tui_file(entry: &str, root: &Path) -> bool {
+    let file = tui_plugin_file(root);
+    let path = file.to_string_lossy();
+    entry == path || entry.strip_prefix("file://") == Some(&*path)
+}
+
+/// [`is_deck_tui_entry`], also accepting the TUI file under any of `roots`
+/// (the roots an edit was handed, which are the candidate roots outside a
+/// test).
+fn is_deck_tui_entry_under(entry: &str, roots: &[&Path]) -> bool {
+    roots.iter().any(|root| names_tui_file(entry, root)) || is_deck_tui_entry(entry)
 }
 
 /// A TUI config's text, `None` when the file does not exist, or why it may
@@ -3747,7 +3846,8 @@ fn install_tui_half(root: &Path, pin: Option<&str>) -> std::io::Result<TuiEntry>
         .collect();
     for (path, text) in &configs {
         if let Ok(Some(text)) = text
-            && crate::jsonc_edit::has_entry(text, is_deck_tui_entry).unwrap_or(false)
+            && crate::jsonc_edit::has_entry(text, |e| is_deck_tui_entry_under(e, &[root]))
+                .unwrap_or(false)
         {
             return Ok(TuiEntry::Present(path.clone()));
         }
@@ -3824,11 +3924,11 @@ fn auto_install_tui(root: &Path, binary_path: &str, failed: &mut Vec<String>) {
 }
 
 /// Remove the deck's entry from `root`'s TUI configs (deleting one the
-/// installer created from nothing), then the TUI file. A config that cannot
-/// be edited safely, while the deck's TUI plugin may be listed in it, stops
-/// here with nothing deleted, so OpenCode is never left listing a plugin file
-/// that is gone.
-fn uninstall_tui_half(root: &Path) -> std::io::Result<()> {
+/// installer created from nothing), then the TUI file, telling `say` what
+/// was removed. A config that cannot be edited safely, while the deck's TUI
+/// plugin may be listed in it, stops here with nothing deleted, so OpenCode
+/// is never left listing a plugin file that is gone.
+fn uninstall_tui_half(root: &Path, say: &mut dyn FnMut(String)) -> std::io::Result<()> {
     let file = tui_plugin_file(root);
     let _lock = lock_tui_configs(root)?;
     let file_exists = std::fs::symlink_metadata(&file).is_ok();
@@ -3838,18 +3938,18 @@ fn uninstall_tui_half(root: &Path) -> std::io::Result<()> {
         let text = match read_tui_config(&path) {
             Ok(None) => continue,
             Ok(Some(text)) => text,
-            Err(why) if file_exists => return Err(left_unchanged(&path, &file, &why)),
+            Err(why) if file_exists => return Err(left_unchanged(&path, &file, &why, say)),
             Err(_) => continue,
         };
         if text == fresh_tui_config(&file) {
             edits.push((path, text, None));
             continue;
         }
-        match crate::jsonc_edit::remove_entries(&text, is_deck_tui_entry) {
+        match crate::jsonc_edit::remove_entries(&text, |e| is_deck_tui_entry_under(e, &[root])) {
             Ok(None) => {}
             Ok(Some(updated)) => edits.push((path, text, Some(updated))),
             Err(why) if file_exists || text.contains("dot-agent-deck-tui.js") => {
-                return Err(left_unchanged(&path, &file, &why.to_string()));
+                return Err(left_unchanged(&path, &file, &why.to_string(), say));
             }
             Err(_) => {}
         }
@@ -3864,37 +3964,195 @@ fn uninstall_tui_half(root: &Path) -> std::io::Result<()> {
     // read, by a writer outside the deck's lock.
     for (path, text, _) in &edits {
         if read_tui_config(path).ok().flatten().as_ref() != Some(text) {
-            return Err(left_unchanged(path, &file, CHANGED_DURING_EDIT));
+            return Err(left_unchanged(path, &file, CHANGED_DURING_EDIT, say));
         }
     }
     for (path, _, updated) in edits {
         match updated {
             Some(updated) => {
                 crate::agent_hook_config::write_atomic(root, &path, updated.as_bytes())?;
-                println!("Removed the OpenCode TUI plugin from {}", path.display());
+                crate::agent_hook_config::note_config_change();
+                say(format!(
+                    "Removed the OpenCode TUI plugin from {}",
+                    path.display()
+                ));
             }
             None => {
                 std::fs::remove_file(&path)?;
-                println!("Removed {}", path.display());
+                crate::agent_hook_config::note_config_change();
+                say(format!("Removed {}", path.display()));
             }
         }
     }
     if file_exists {
         std::fs::remove_file(&file)?;
-        println!("Removed OpenCode TUI plugin: {}", file.display());
+        crate::agent_hook_config::note_config_change();
+        say(format!("Removed OpenCode TUI plugin: {}", file.display()));
     }
     Ok(())
 }
 
-fn left_unchanged(config: &Path, file: &Path, why: &str) -> std::io::Error {
-    println!(
+fn left_unchanged(
+    config: &Path,
+    file: &Path,
+    why: &str,
+    say: &mut dyn FnMut(String),
+) -> std::io::Error {
+    say(format!(
         "Left {} unchanged: {why}. Kept {} so OpenCode does not list a missing plugin. \
          Remove {} from its \"plugin\" list, then run the uninstall again.",
         config.display(),
         file.display(),
         tui_entry_literal(file)
-    );
+    ));
     std::io::Error::other(format!("left {} unchanged: {why}", config.display()))
+}
+
+/// PRD #2050: the automatic install's removal of the 1.x TUI half from
+/// `root`, for a machine running OpenCode 2.x: quiet on stdout, a refusal
+/// added to `failed`.
+fn auto_remove_tui_half(root: &Path, failed: &mut Vec<String>) {
+    let _guard = lock_plugin();
+    let file = tui_plugin_file(root);
+    let present = TUI_CONFIG_FILES
+        .iter()
+        .any(|name| std::fs::symlink_metadata(root.join(name)).is_ok())
+        || std::fs::symlink_metadata(&file).is_ok();
+    if !present {
+        return;
+    }
+    let mut said = |line: String| {
+        tracing::info!("auto-install: OpenCode 2 loads no 1.x TUI plugin: {line}");
+    };
+    if let Err(e) = uninstall_tui_half(root, &mut said) {
+        failed.push(format!("{}: {e}", file.display()));
+        tracing::warn!(
+            "auto-install: could not remove the OpenCode 1.x TUI plugin under {}: {e}",
+            root.display()
+        );
+    }
+}
+
+/// PRD #2050: OpenCode 2.x's CLI config file, `<root>/cli.json`. 2.x creates
+/// it when it starts with none, copying 1.x's `<root>/tui.json` `plugin` list
+/// into its `plugins` list (measured on 2.2.5; source: `cli.config.migrate`,
+/// which reads `tui.json` only while `cli.json` is absent, so the copy is
+/// made once per missing `cli.json`, not on every start). The deck's 1.x TUI
+/// entry copied there names a file, which 2.x does not load as a TUI plugin.
+const CLI_CONFIG_FILE: &str = "cli.json";
+
+/// The list in [`CLI_CONFIG_FILE`] that holds the copied entries.
+const CLI_PLUGIN_LIST: &str = "plugins";
+
+/// The roots whose `cli.json` the deck cleans: OpenCode 2.x's global root,
+/// and the XDG root when `$OPENCODE_CONFIG_DIR` moved it elsewhere.
+fn cli_roots(xdg: &Path, v2_global: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![v2_global.to_path_buf()];
+    if xdg != v2_global {
+        roots.push(xdg.to_path_buf());
+    }
+    roots
+}
+
+/// PRD #2050: remove the deck's own 1.x TUI entry ([`is_deck_tui_entry`])
+/// from `<root>/cli.json`'s `plugins` list, keeping every other entry and
+/// byte of the file ([`crate::jsonc_edit`]). A missing `cli.json` is never
+/// created. `Ok(Some(path))` when an entry was removed, `Ok(None)` when there
+/// was nothing to remove, and `Err` with the reason when the file holds the
+/// entry (or may: it mentions the deck's TUI file) but could not be edited.
+///
+/// OpenCode 1.x never reads `cli.json`, so the entry serves no generation and
+/// goes whatever layout is being installed.
+fn remove_cli_entry(root: &Path, tui_roots: &[&Path]) -> Result<Option<PathBuf>, String> {
+    let path = root.join(CLI_CONFIG_FILE);
+    if std::fs::symlink_metadata(&path).is_err() {
+        return Ok(None);
+    }
+    let mentions_deck =
+        || std::fs::read_to_string(&path).is_ok_and(|text| text.contains("dot-agent-deck-tui.js"));
+    let text = match read_tui_config(&path) {
+        Ok(None) => return Ok(None),
+        Ok(Some(text)) => text,
+        Err(why) if mentions_deck() => return Err(why),
+        Err(_) => return Ok(None),
+    };
+    let updated = match crate::jsonc_edit::remove_list_entries(&text, CLI_PLUGIN_LIST, |e| {
+        is_deck_tui_entry_under(e, tui_roots)
+    }) {
+        Ok(None) => return Ok(None),
+        Ok(Some(updated)) => updated,
+        Err(why) if mentions_deck() => return Err(why.to_string()),
+        Err(_) => return Ok(None),
+    };
+    crate::config_write_guard::ensure_config_write_allowed(&path).map_err(|e| e.to_string())?;
+    let _lock = crate::agent_hook_config::lock_config(&path).map_err(|e| e.to_string())?;
+    // Hardening M5, as for `tui.json`: OpenCode or an editor may have saved
+    // the file since it was read; publishing the splice would undo that save.
+    if read_tui_config(&path) != Ok(Some(text)) {
+        return Err(CHANGED_DURING_EDIT.to_string());
+    }
+    crate::agent_hook_config::write_atomic(root, &path, updated.as_bytes())
+        .map_err(|e| e.to_string())?;
+    crate::agent_hook_config::note_config_change();
+    Ok(Some(path))
+}
+
+/// [`remove_cli_entry`] for every root of `roots` (which are also the roots
+/// the deck's TUI file may be named under), as the automatic install does
+/// it: quiet on stdout, a refusal added to `failed`.
+fn auto_remove_cli_entries(roots: &[PathBuf], failed: &mut Vec<String>) {
+    let tui_roots: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
+    for root in roots {
+        match remove_cli_entry(root, &tui_roots) {
+            Ok(Some(path)) => tracing::info!(
+                "auto-install: removed the deck's OpenCode 1.x TUI plugin entry from {}, \
+                 where OpenCode 2 copied it from tui.json and cannot load it",
+                path.display()
+            ),
+            Ok(None) => {}
+            Err(why) => {
+                let path = root.join(CLI_CONFIG_FILE);
+                failed.push(format!("{}: {why}", path.display()));
+                tracing::warn!(
+                    "auto-install: left {} unchanged: {why}; remove the entry naming \
+                     dot-agent-deck-tui.js from its \"plugins\" list, which OpenCode 2 cannot \
+                     load",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+/// [`remove_cli_entry`] for every root of `roots`, as `hooks install` and
+/// `hooks uninstall` do it: each outcome printed, the first refusal returned.
+fn remove_cli_entries_printing(roots: &[PathBuf]) -> std::io::Result<()> {
+    let tui_roots: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
+    let mut first_err = None;
+    for root in roots {
+        let path = root.join(CLI_CONFIG_FILE);
+        match remove_cli_entry(root, &tui_roots) {
+            Ok(Some(path)) => println!(
+                "Removed the OpenCode 1.x TUI plugin entry from {}",
+                path.display()
+            ),
+            Ok(None) => {}
+            Err(why) => {
+                println!(
+                    "Left {} unchanged: {why}. Remove the entry naming dot-agent-deck-tui.js \
+                     from its \"plugins\" list: OpenCode 2 cannot load it.",
+                    path.display()
+                );
+                first_err.get_or_insert_with(|| {
+                    std::io::Error::other(format!("left {} unchanged: {why}", path.display()))
+                });
+            }
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Silently install OpenCode plugin into every existing layout, and the TUI
@@ -3938,7 +4196,7 @@ pub fn refresh_for_spawn(
 }
 
 fn auto_install_reporting() -> (Vec<crate::hook_binary::HookPin>, Vec<String>) {
-    auto_install_reporting_for(remembered_layout(&candidate_roots()))
+    auto_install_reporting_for(remembered_layout(&candidate_roots(), &v2_global_root()))
 }
 
 /// PRD #2050: the automatic install for `layout`, over the real config roots,
@@ -3946,7 +4204,7 @@ fn auto_install_reporting() -> (Vec<crate::hook_binary::HookPin>, Vec<String>) {
 fn auto_install_reporting_for(layout: Layout) -> (Vec<crate::hook_binary::HookPin>, Vec<String>) {
     let mut failed = Vec::new();
     let roots = candidate_roots();
-    let (_, pins) = auto_install_layout(&roots, layout, &mut failed, || {
+    let (_, pins) = auto_install_layout(&roots, &v2_global_root(), layout, &mut failed, || {
         crate::platform::paths::durable_binary_path()
     });
     // One pin per binary: the roots of one machine name the same install.
@@ -3963,30 +4221,37 @@ fn auto_install_reporting_for(layout: Layout) -> (Vec<crate::hook_binary::HookPi
     (out, failed)
 }
 
-/// PRD #2050: the automatic install of `layout` over `roots` (the global
-/// root first, then the legacy one), with the binary resolution injected.
-/// Returns the binary resolved and the pin each root holds afterwards.
+/// PRD #2050: the automatic install of `layout` over `roots` (1.x's global
+/// root first, then the legacy one, then `$OPENCODE_CONFIG_DIR` when it names
+/// another directory) and OpenCode 2.x's global root `v2_global`, with the
+/// binary resolution injected. Returns the binary resolved and the pin each
+/// root holds afterwards.
 ///
 /// [`Layout::Unknown`] (a spawn whose version the deck cannot see) installs
-/// both TUI halves, and places the server module the way the global root's
-/// marker remembers ([`remembered_major`]): in the global root only when it
+/// both TUI halves, and places the server module the way the marker
+/// remembers ([`remembered_major_in`]): in the 2.x global root only when it
 /// was last written for 2.x, so a wrapper's spawn does not bring back the
 /// duplicate a 2.x spawn removed; otherwise in every existing root.
+///
+/// Every layout also removes the deck's entry from OpenCode 2.x's `cli.json`
+/// ([`auto_remove_cli_entries`]); [`Layout::V2`] removes the 1.x TUI half as
+/// well, whose `tui.json` entry 2.x would otherwise copy there again.
 fn auto_install_layout(
     roots: &[PathBuf],
+    v2_global: &Path,
     layout: Layout,
     failed: &mut Vec<String>,
     resolve: impl FnOnce() -> Result<String, String>,
 ) -> (Option<String>, Vec<(PathBuf, String)>) {
     use crate::opencode_version::Major;
-    let remembered = roots.first().and_then(|root| remembered_major(root));
+    let remembered = remembered_major_in(roots, v2_global);
     let marker = match layout {
         Layout::V1 => Some(Major::V1),
         Layout::V2 => Some(Major::V2),
         Layout::Unknown => remembered,
     };
     let (binary_path, pins) = if marker == Some(Major::V2) {
-        auto_install_v2_resolved(roots, failed, resolve)
+        auto_install_v2_resolved(&v2_roots(roots, v2_global), failed, resolve)
     } else {
         auto_install_resolved_for(roots, failed, resolve, marker)
     };
@@ -3996,38 +4261,62 @@ fn auto_install_layout(
     // too (PR #1735 review): OpenCode creates that root itself on any run
     // (measured on 1.18.35, `opencode --version` included), so creating it for
     // an installed OpenCode is not speculative. With no root at all nothing is
-    // created. PRD #2050: OpenCode 2.x reads its TUI plugins from the same
-    // root, as a `plugins/` directory.
-    if let Some(binary_path) = binary_path.as_deref()
-        && roots.iter().any(|root| root.exists())
-        && let Some(xdg) = roots.first()
-    {
-        match crate::config_write_guard::ensure_config_write_allowed(&tui_plugin_file(xdg))
-            .and_then(|()| std::fs::create_dir_all(xdg))
-        {
-            Ok(()) => {
-                if layout != Layout::V2 {
-                    auto_install_tui(xdg, binary_path, failed);
-                }
-                if layout == Layout::V1 {
-                    // OpenCode 1.x never loads the 2.x half; it goes, so a
-                    // machine back on 1.x carries only what it runs.
-                    remove_tui_v2(xdg, failed);
-                } else {
-                    auto_install_tui_v2(xdg, binary_path, failed);
-                }
-            }
-            Err(e) => {
-                failed.push(format!("{}: {e}", xdg.display()));
-                tracing::warn!(
-                    "auto-install: could not create the OpenCode config root {} for its TUI \
-                     plugin: {e}; deck messages will reach OpenCode by the doorbell instead",
-                    xdg.display()
-                );
-            }
+    // created. PRD #2050: OpenCode 2.x reads its TUI plugins from its own
+    // global root, as a `plugins/` directory.
+    let Some(binary_path) = binary_path.as_deref() else {
+        return (None, pins);
+    };
+    if !roots.iter().any(|root| root.exists()) && !v2_global.exists() {
+        return (Some(binary_path.to_string()), pins);
+    }
+    let Some(xdg) = roots.first() else {
+        return (Some(binary_path.to_string()), pins);
+    };
+    if layout == Layout::V2 {
+        // OpenCode 2.x never loads the 1.x half, and copies its `tui.json`
+        // entry into a `cli.json` it creates, where that entry is dead.
+        auto_remove_tui_half(xdg, failed);
+    } else if ensure_root(xdg, &tui_plugin_file(xdg), failed) {
+        auto_install_tui(xdg, binary_path, failed);
+    }
+    if layout == Layout::V1 {
+        // OpenCode 1.x never loads the 2.x half; it goes, so a machine back on
+        // 1.x carries only what it runs.
+        for root in v2_roots(roots, v2_global) {
+            remove_tui_v2(&root, failed);
+        }
+    } else {
+        if ensure_root(v2_global, &tui_v2_file(v2_global), failed) {
+            auto_install_tui_v2(v2_global, binary_path, failed);
+        }
+        // A 2.x half left in a root 2.x no longer reads (one written before
+        // `$OPENCODE_CONFIG_DIR` moved its root).
+        for root in roots.iter().filter(|root| *root != v2_global) {
+            remove_tui_v2(root, failed);
         }
     }
-    (binary_path, pins)
+    auto_remove_cli_entries(&cli_roots(xdg, v2_global), failed);
+    (Some(binary_path.to_string()), pins)
+}
+
+/// Create the config root `root` for `file` the deck is about to write, when
+/// the config guard allows it; whether it may go ahead. A refusal is added to
+/// `failed` and logged.
+fn ensure_root(root: &Path, file: &Path, failed: &mut Vec<String>) -> bool {
+    match crate::config_write_guard::ensure_config_write_allowed(file)
+        .and_then(|()| std::fs::create_dir_all(root))
+    {
+        Ok(()) => true,
+        Err(e) => {
+            failed.push(format!("{}: {e}", root.display()));
+            tracing::warn!(
+                "auto-install: could not create the OpenCode config root {} for its TUI \
+                 plugin: {e}; deck messages will reach OpenCode by the doorbell instead",
+                root.display()
+            );
+            false
+        }
+    }
 }
 
 /// PRD #2050: the server module for OpenCode 2.x: the global root only
@@ -4267,27 +4556,29 @@ fn auto_install_resolved_for(
 /// install by name, so an existing pin is not preserved (PRD #381 M5).
 ///
 /// PRD #2050: there is no command here to tell the OpenCode version from, so
-/// this writes the layout the global root's module was last written for
-/// ([`remembered_major`]), and with none remembered [`Layout::Unknown`]: the
-/// 1.x fan-out and both TUI halves. The next OpenCode agent the deck starts
-/// detects its version and settles the layout.
+/// this writes the layout last written ([`remembered_major_in`]), and with
+/// none remembered [`Layout::Unknown`]: the 1.x fan-out and both TUI halves.
+/// The next OpenCode agent the deck starts detects its version and settles
+/// the layout. Every layout removes the deck's entry from OpenCode 2.x's
+/// `cli.json`, and the 2.x layout the 1.x TUI half ([`remove_cli_entry`]).
 pub fn install() -> std::io::Result<()> {
     use crate::opencode_version::Major;
     let binary_path =
         crate::platform::paths::durable_binary_path().map_err(std::io::Error::other)?;
     let roots = candidate_roots();
     let root = xdg_default_root();
-    let remembered = remembered_major(&root);
+    let v2_global = v2_global_root();
+    let remembered = remembered_major_in(&roots, &v2_global);
     let v2 = remembered == Some(Major::V2);
     if v2 {
         install_to_roots_for(
             &[],
-            || root.clone(),
+            || v2_global.clone(),
             &binary_path,
             &mut std::io::stdout(),
             remembered,
         )?;
-        for legacy in roots.iter().skip(1) {
+        for legacy in roots.iter().filter(|r| **r != v2_global) {
             for artifact in [plugin_file(legacy), stale_plugin_dir(legacy)] {
                 if std::fs::symlink_metadata(&artifact).is_ok() {
                     uninstall_impl(&artifact)?;
@@ -4304,19 +4595,23 @@ pub fn install() -> std::io::Result<()> {
         )?;
     }
     let _guard = lock_plugin();
-    std::fs::create_dir_all(&root)?;
     // PRD #2050: OpenCode 2.x's TUI half, a directory 1.x never sees —
     // unless this machine is known to run 1.x.
     if remembered != Some(Major::V1) {
-        write_tui_v2(&root, &binary_path)?;
+        std::fs::create_dir_all(&v2_global)?;
+        write_tui_v2(&v2_global, &binary_path)?;
         println!(
             "Installed OpenCode 2 TUI plugin: {}",
-            tui_v2_file(&root).display()
+            tui_v2_file(&v2_global).display()
         );
     }
+    remove_cli_entries_printing(&cli_roots(&root, &v2_global))?;
     if v2 {
-        return Ok(());
+        // OpenCode 2.x loads no 1.x TUI half, and copies its `tui.json` entry
+        // into a `cli.json` it creates, where the entry is dead.
+        return uninstall_tui_half(&root, &mut |line| println!("{line}"));
     }
+    std::fs::create_dir_all(&root)?;
     // PRD #1666 S8: the TUI plugin, in the XDG root only (design §7.2).
     let tui_file = tui_plugin_file(&root);
     match install_tui_half(&root, Some(&binary_path))? {
@@ -4346,10 +4641,13 @@ pub fn install() -> std::io::Result<()> {
 }
 
 pub fn uninstall() -> std::io::Result<()> {
+    // PRD #2050: the deck's entry OpenCode 2.x copied into its `cli.json`.
+    let roots = candidate_roots();
+    remove_cli_entries_printing(&cli_roots(&xdg_default_root(), &v2_global_root()))?;
     // PRD #1666 S8: the TUI plugin's entry and file first, so a config that
     // cannot be edited safely stops the uninstall before anything is deleted.
-    for root in candidate_roots() {
-        uninstall_tui_half(&root)?;
+    for root in roots {
+        uninstall_tui_half(&root, &mut |line| println!("{line}"))?;
         // PRD #2050: OpenCode 2.x's TUI half, a directory of the deck's own.
         let dir = tui_v2_dir(&root);
         if std::fs::symlink_metadata(&dir).is_ok() {
@@ -9353,8 +9651,18 @@ await wait(1500);
         }
         fn install(&self, layout: Layout) -> Vec<String> {
             let mut failed = Vec::new();
-            auto_install_layout(&self.roots, layout, &mut failed, || Ok(self.bin.clone()));
+            auto_install_layout(&self.roots, self.v2_global(), layout, &mut failed, || {
+                Ok(self.bin.clone())
+            });
             failed
+        }
+        /// OpenCode 2.x's global root: the XDG root, or the third root when
+        /// the fixture has one (`$OPENCODE_CONFIG_DIR`).
+        fn v2_global(&self) -> &Path {
+            self.roots.get(2).unwrap_or(&self.roots[0])
+        }
+        fn remembered(&self) -> Layout {
+            remembered_layout(&self.roots, self.v2_global())
         }
         fn global(&self) -> &Path {
             &self.roots[0]
@@ -9428,8 +9736,8 @@ await wait(1500);
         let f = LayoutFixture::new();
         f.install(Layout::V1);
         assert_eq!(f.state(), (true, true, true, false), "1.x");
-        assert_eq!(remembered_layout(&f.roots), Layout::V1);
-        f.install(remembered_layout(&f.roots));
+        assert_eq!(f.remembered(), Layout::V1);
+        f.install(f.remembered());
         assert_eq!(
             f.state(),
             (true, true, true, false),
@@ -9443,8 +9751,8 @@ await wait(1500);
             (true, false, true),
             "upgraded to 2.x"
         );
-        assert_eq!(remembered_layout(&f.roots), Layout::V2);
-        f.install(remembered_layout(&f.roots));
+        assert_eq!(f.remembered(), Layout::V2);
+        f.install(f.remembered());
         assert!(
             !plugin_file(f.legacy()).exists(),
             "a restart on 2.x brings no duplicate back"
@@ -9461,7 +9769,7 @@ await wait(1500);
 
         f.install(Layout::V1);
         assert_eq!(f.state(), (true, true, true, false), "back on 1.x");
-        assert_eq!(remembered_layout(&f.roots), Layout::V1);
+        assert_eq!(f.remembered(), Layout::V1);
     }
 
     /// With nothing remembered (no module yet, or one from before PRD #2050),
@@ -9471,7 +9779,7 @@ await wait(1500);
     #[test]
     fn opencode_unknown_layout_installs_both_tui_halves() {
         let f = LayoutFixture::new();
-        assert_eq!(remembered_layout(&f.roots), Layout::Unknown);
+        assert_eq!(f.remembered(), Layout::Unknown);
         assert_eq!(f.install(Layout::Unknown), Vec::<String>::new());
         assert_eq!(f.state(), (true, true, true, true));
         assert_eq!(remembered_major(f.global()), None);
@@ -9497,6 +9805,257 @@ await wait(1500);
             existing_binary_path(f.global()).as_deref(),
             Some(other.as_str())
         );
+    }
+
+    /// Scenario: the config roots are resolved from `HOME`,
+    /// `XDG_CONFIG_HOME` and `OPENCODE_CONFIG_DIR`. An empty or relative
+    /// `XDG_CONFIG_HOME` is ignored (XDG spec), so nothing lands in the
+    /// current directory; `OPENCODE_CONFIG_DIR` becomes OpenCode 2.x's global
+    /// root and one more 1.x root, and is likewise ignored when empty or
+    /// relative.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_roots_follow_xdg_config_home_and_opencode_config_dir() {
+        use std::ffi::OsStr;
+        let home = Path::new("/h");
+        let default = (
+            vec![
+                PathBuf::from("/h/.config/opencode"),
+                PathBuf::from("/h/.opencode"),
+            ],
+            PathBuf::from("/h/.config/opencode"),
+        );
+        assert_eq!(roots_from(home, None, None), default);
+        for ignored in ["", "opencode-cfg", "./cfg"] {
+            assert_eq!(
+                roots_from(home, Some(OsStr::new(ignored)), None),
+                default,
+                "XDG_CONFIG_HOME={ignored:?}"
+            );
+            assert_eq!(
+                roots_from(home, None, Some(OsStr::new(ignored))),
+                default,
+                "OPENCODE_CONFIG_DIR={ignored:?}"
+            );
+        }
+        assert_eq!(
+            roots_from(home, Some(OsStr::new("/x")), None),
+            (
+                vec![PathBuf::from("/x/opencode"), PathBuf::from("/h/.opencode")],
+                PathBuf::from("/x/opencode"),
+            )
+        );
+        assert_eq!(
+            roots_from(home, None, Some(OsStr::new("/ocd"))),
+            (
+                vec![
+                    PathBuf::from("/h/.config/opencode"),
+                    PathBuf::from("/h/.opencode"),
+                    PathBuf::from("/ocd"),
+                ],
+                PathBuf::from("/ocd"),
+            )
+        );
+        assert_eq!(
+            roots_from(home, None, Some(OsStr::new("/h/.config/opencode"))),
+            default,
+            "a config dir that is the XDG root is not a second root"
+        );
+    }
+
+    /// A [`LayoutFixture`] with `$OPENCODE_CONFIG_DIR` set, as its third root.
+    #[cfg(unix)]
+    fn config_dir_fixture() -> LayoutFixture {
+        let mut f = LayoutFixture::new();
+        let dir = f._dir.path().join("ocd");
+        std::fs::create_dir_all(&dir).unwrap();
+        f.roots.push(dir);
+        f
+    }
+
+    /// Scenario: with `$OPENCODE_CONFIG_DIR` set, an OpenCode 2.x spawn puts
+    /// the server module and the 2.x TUI half in that directory only (2.x's
+    /// global root), removing the deck's copies from the XDG and legacy
+    /// roots; a 1.x spawn afterwards writes the module to every root 1.x
+    /// scans, that directory included, the 1.x TUI half to the XDG root, and
+    /// removes the 2.x half again.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_layout_follows_opencode_config_dir() {
+        let f = config_dir_fixture();
+        let ocd = f.roots[2].clone();
+        f.install(Layout::V1);
+        assert!(f.roots.iter().all(|root| plugin_file(root).exists()));
+
+        assert_eq!(f.install(Layout::V2), Vec::<String>::new());
+        assert!(plugin_file(&ocd).exists());
+        assert!(!plugin_file(f.global()).exists(), "XDG copy removed");
+        assert!(!plugin_file(f.legacy()).exists(), "legacy copy removed");
+        assert!(tui_v2_file(&ocd).exists());
+        assert!(!tui_v2_file(f.global()).exists());
+        assert_eq!(
+            remembered_major(&ocd),
+            Some(crate::opencode_version::Major::V2)
+        );
+        assert_eq!(f.remembered(), Layout::V2);
+        assert_eq!(existing_binary_path(&ocd).as_deref(), Some(f.bin.as_str()));
+
+        assert_eq!(f.install(Layout::V1), Vec::<String>::new());
+        assert!(f.roots.iter().all(|root| plugin_file(root).exists()));
+        assert!(!tui_v2_file(&ocd).exists());
+        assert!(tui_plugin_file(f.global()).exists());
+        assert_eq!(f.remembered(), Layout::V1);
+    }
+
+    /// `cli.json` as OpenCode 2.2.5 writes it after migrating `tui.json`
+    /// (`JSON.stringify(…, null, 2)`), holding `entries` in `plugins`.
+    #[cfg(unix)]
+    fn migrated_cli_json(entries: &[&str]) -> String {
+        let value = serde_json::json!({
+            "$schema": "https://opencode.ai/cli.json",
+            "plugins": entries,
+            "theme": {"name": "opencode"},
+        });
+        serde_json::to_string_pretty(&value).unwrap() + "\n"
+    }
+
+    /// Scenario: a machine upgraded from OpenCode 1.x, where 2.x copied the
+    /// deck's 1.x TUI entry from `tui.json` into `cli.json`'s `plugins`
+    /// (where 2.x cannot load it). The next 2.x install removes only the
+    /// deck's entry from `cli.json`, keeping the user's entries, an object
+    /// entry and every other member, and removes the 1.x TUI half: the deck's
+    /// entry in a `tui.json` the user owns, and a `tui.json` the deck created
+    /// from nothing, so a later 2.x start with no `cli.json` has nothing of
+    /// the deck's to copy again.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_layout_removes_the_migrated_cli_entry_and_the_1x_tui_half() {
+        let f = LayoutFixture::new();
+        f.install(Layout::V1);
+        let entry = tui_plugin_file(f.global()).to_string_lossy().into_owned();
+        let tui_json = f.global().join("tui.json");
+        assert!(std::fs::read_to_string(&tui_json).unwrap().contains(&entry));
+        // What 2.2.5's migration writes: the user's plugin, the deck's, and
+        // an object entry (a `[name, options]` tuple in `tui.json`).
+        let cli = f.global().join("cli.json");
+        let before = migrated_cli_json(&["user-tui-plugin", &entry]).replace(
+            "\"plugins\": [",
+            "\"plugins\": [\n    {\n      \"package\": \"pkg\",\n      \"options\": {\n        \"a\": 1\n      }\n    },",
+        );
+        std::fs::write(&cli, &before).unwrap();
+        std::fs::set_permissions(&cli, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+
+        assert_eq!(f.install(Layout::V2), Vec::<String>::new());
+        let after = std::fs::read_to_string(&cli).unwrap();
+        assert_eq!(
+            after,
+            before.replace(
+                &format!(",\n    {}", serde_json::to_string(&entry).unwrap()),
+                ""
+            ),
+            "only the deck's entry goes"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(parsed["plugins"][1], "user-tui-plugin");
+        assert_eq!(parsed["plugins"][0]["package"], "pkg");
+        assert_eq!(parsed["theme"]["name"], "opencode");
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(
+                &std::fs::metadata(&cli).unwrap().permissions()
+            ) & 0o777,
+            0o600,
+            "OpenCode's owner-only mode is kept"
+        );
+        assert!(!tui_json.exists(), "the tui.json the deck created goes");
+        assert!(!tui_plugin_file(f.global()).exists());
+
+        // A second install changes nothing.
+        assert_eq!(f.install(Layout::V2), Vec::<String>::new());
+        assert_eq!(std::fs::read_to_string(&cli).unwrap(), after);
+
+        // A tui.json the user owns keeps everything but the deck's entry.
+        let g = LayoutFixture::new();
+        let entry = tui_plugin_file(g.global()).to_string_lossy().into_owned();
+        let user_tui = format!(
+            "{{\n  // mine\n  \"theme\": \"dark\",\n  \"plugin\": [{}, \"user-tui-plugin\"]\n}}\n",
+            serde_json::to_string(&entry).unwrap()
+        );
+        std::fs::write(g.global().join("tui.json"), &user_tui).unwrap();
+        std::fs::write(tui_plugin_file(g.global()), "// old").unwrap();
+        assert_eq!(g.install(Layout::V2), Vec::<String>::new());
+        assert_eq!(
+            std::fs::read_to_string(g.global().join("tui.json")).unwrap(),
+            "{\n  // mine\n  \"theme\": \"dark\",\n  \"plugin\": [\"user-tui-plugin\"]\n}\n"
+        );
+        assert!(!tui_plugin_file(g.global()).exists());
+    }
+
+    /// Scenario: `cli.json` is OpenCode 2.x's own file. No install creates
+    /// it; every layout — 1.x (which never reads it) and unknown included —
+    /// removes the deck's dead entry from it, so a wrapper's spawn on a 2.x
+    /// machine cannot leave it behind; and with `$OPENCODE_CONFIG_DIR` set the
+    /// entry is removed from the `cli.json` there.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_cli_json_is_never_created_and_every_layout_cleans_it() {
+        for layout in [Layout::V1, Layout::V2, Layout::Unknown] {
+            let f = LayoutFixture::new();
+            assert_eq!(f.install(layout), Vec::<String>::new());
+            assert!(
+                !f.global().join("cli.json").exists(),
+                "{layout:?} must not create cli.json"
+            );
+
+            let entry = tui_plugin_file(f.global()).to_string_lossy().into_owned();
+            let cli = f.global().join("cli.json");
+            std::fs::write(&cli, migrated_cli_json(&[&entry, "user-tui-plugin"])).unwrap();
+            assert_eq!(f.install(layout), Vec::<String>::new());
+            assert_eq!(
+                std::fs::read_to_string(&cli).unwrap(),
+                migrated_cli_json(&["user-tui-plugin"]),
+                "{layout:?}"
+            );
+        }
+
+        let f = config_dir_fixture();
+        let ocd = f.roots[2].clone();
+        let entry = tui_plugin_file(f.global()).to_string_lossy().into_owned();
+        let cli = ocd.join("cli.json");
+        std::fs::write(&cli, migrated_cli_json(&[&format!("file://{entry}")])).unwrap();
+        assert_eq!(f.install(Layout::V2), Vec::<String>::new());
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cli).unwrap()).unwrap();
+        assert_eq!(after["plugins"], serde_json::json!([]));
+        assert_eq!(after["theme"]["name"], "opencode");
+        assert!(!f.global().join("cli.json").exists());
+    }
+
+    /// Scenario: a `cli.json` the deck cannot edit safely. One that names the
+    /// deck's TUI file but is not valid JSONC is left as it is and reported
+    /// as a failure (so the card can say so); one that does not mention the
+    /// deck at all is nobody's business and reports nothing.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_an_uneditable_cli_json_is_reported_only_when_it_names_the_deck() {
+        let f = LayoutFixture::new();
+        let cli = f.global().join("cli.json");
+        std::fs::write(&cli, "{\"plugins\": [\"x\"").unwrap();
+        assert_eq!(f.install(Layout::V2), Vec::<String>::new());
+        assert_eq!(
+            std::fs::read_to_string(&cli).unwrap(),
+            "{\"plugins\": [\"x\""
+        );
+
+        let broken = format!(
+            "{{\"plugins\": [{}",
+            serde_json::to_string(&tui_plugin_file(f.global()).to_string_lossy()).unwrap()
+        );
+        std::fs::write(&cli, &broken).unwrap();
+        let failed = f.install(Layout::V2);
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert!(failed[0].contains("cli.json"), "{failed:?}");
+        assert_eq!(std::fs::read_to_string(&cli).unwrap(), broken);
     }
 
     /// A drive of the generated module's OpenCode 2.x `setup` under Node with
