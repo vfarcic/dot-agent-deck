@@ -23,7 +23,7 @@ The spans are sent once, after the last command and after the sandbox is stopped
 
 ## The spans
 
-`affected_checks.run`, one per `--run`, from the start of the invocation (so it includes computing the change and probing the runner) to the end of the sandbox stop. A `--run` that cannot compute the change still sends one, `failed` with plan `unknown` and no command span, without probing the runner:
+`affected_checks.run`, one per `--run`, from the start of the invocation (so it includes computing the change and probing the runner) to its end (after the sandbox stop, when `DAD_REMOTE_EXEC_KEEP=0` asks for one). A `--run` that cannot compute the change still sends one, `failed` with plan `unknown` and no command span, without probing the runner:
 
 | Attribute | Value |
 | --- | --- |

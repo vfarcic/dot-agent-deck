@@ -490,6 +490,66 @@ fn code_cleanup_009_renovate_reads_every_tool_pin() {
     );
 }
 
+/// The RWX sandbox installs cargo-mutants so `/code-cleanup`'s mutation step can
+/// run there instead of on the shared dev box. Its copy of the pin must equal
+/// `find-targets.sh`'s, which refuses any other version, and the one Renovate
+/// manager for that script must also read the sandbox's copy, so a bump moves
+/// both in one PR rather than leaving the sandbox a version behind.
+#[test]
+fn code_cleanup_018_the_sandbox_installs_the_pinned_cargo_mutants() {
+    let path = ".rwx/sandbox.yml";
+    let text = fs::read_to_string(repo_root().join(path)).expect("read .rwx/sandbox.yml");
+    let pin_line = Regex::new(r"(?m)^\s*CARGO_MUTANTS_VERSION=(\S+)$").expect("static regex");
+    let pins: Vec<&str> = pin_line
+        .captures_iter(&text)
+        .map(|c| c.get(1).expect("group").as_str())
+        .collect();
+    assert_eq!(
+        pins,
+        [pin("CARGO_MUTANTS_VERSION").as_str()],
+        "{path} must pin cargo-mutants once, at find-targets.sh's version"
+    );
+
+    let config: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repo_root().join("renovate.json")).expect("read renovate.json"),
+    )
+    .expect("renovate.json is not valid JSON");
+    let reads = |m: &serde_json::Value, file: &str| {
+        m["managerFilePatterns"].as_array().is_some_and(|ps| {
+            ps.iter().filter_map(|p| p.as_str()).any(|p| {
+                let p = p.trim_start_matches('/').trim_end_matches('/');
+                Regex::new(p).is_ok_and(|r| r.is_match(file))
+            })
+        })
+    };
+    let manager = config["customManagers"]
+        .as_array()
+        .expect("renovate.json has a customManagers array")
+        .iter()
+        .find(|m| reads(m, ".claude/skills/code-cleanup/find-targets.sh"))
+        .expect("a customManager reads find-targets.sh");
+    assert!(
+        reads(manager, path),
+        "the customManager for find-targets.sh must also read {path}"
+    );
+    let found: Vec<(String, String)> = manager["matchStrings"]
+        .as_array()
+        .expect("matchStrings")
+        .iter()
+        .flat_map(|m| {
+            let re = Regex::new(m.as_str().expect("a string matchString")).expect("matchString");
+            re.captures_iter(&text)
+                .map(|c| (c["depName"].to_string(), c["currentValue"].to_string()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        found,
+        [("cargo-mutants".to_string(), pin("CARGO_MUTANTS_VERSION"))],
+        "Renovate must extract the cargo-mutants pin from {path}"
+    );
+}
+
 /// The pin `find-targets.sh` holds for `var`.
 fn pin(var: &str) -> String {
     let text = fs::read_to_string(script("find-targets.sh")).expect("read find-targets.sh");

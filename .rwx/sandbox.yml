@@ -72,6 +72,21 @@ tasks:
     with:
       node-version: "26.13.0"
 
+  # cargo-mutants, for `/code-cleanup`'s tests mode
+  # (`.claude/skills/code-cleanup/find-targets.sh tests`), so a mutation run,
+  # one rebuild and test run per mutant, leaves the shared dev box too. The
+  # version is find-targets.sh's pin, written again here in the layout the
+  # Renovate customManager for that script reads, so one bump moves both;
+  # find-targets.sh refuses any other version, and
+  # code_cleanup_018_the_sandbox_installs_the_pinned_cargo_mutants fails a drift.
+  - key: cargo-mutants
+    use: rust
+    run: |
+      # renovate: datasource=crate depName=cargo-mutants
+      CARGO_MUTANTS_VERSION=27.1.0
+      cargo install cargo-mutants --locked --version "$CARGO_MUTANTS_VERSION" --root "$HOME/.cargo"
+      "$HOME/.cargo/bin/cargo-mutants" mutants --version
+
   - key: go-task
     run: |
       curl -LsSf https://github.com/go-task/task/releases/download/v3.53.1/task_linux_amd64.tar.gz \
@@ -79,7 +94,7 @@ tasks:
       task --version
 
   - key: sandbox
-    use: [system-packages, code, rust, nextest, go-task, node]
+    use: [system-packages, code, rust, nextest, cargo-mutants, go-task, node]
     runner:
       cpus: 16
       memory: 64gb
@@ -88,9 +103,10 @@ tasks:
       DAD_REQUIRE_GO_TASK: "1"
       # Issue #2052: see the `version` task.
       DAD_VERSION: ${{ tasks.version.values.dad_version }}
-    # Billed per second while alive, idle included. `affected-checks --run`
-    # stops it when it finishes; this is the backstop for everything else (an
-    # interrupted run, an ad-hoc `rwx sandbox exec`). A running command counts
+    # Billed per second while alive, idle included. Nothing stops it after a
+    # command by default (`affected-checks --run` included, unless
+    # DAD_REMOTE_EXEC_KEEP=0): one unit's agents share it, and a stop killed a
+    # teammate's running command (2026-10-31). This timeout is what stops it. A running command counts
     # as activity (measured 2026-10-22: a 3-minute command survived a 1-minute
     # timeout), so a short timeout cannot cut a long test run off.
     run: rwx-sandbox --inactivity-timeout 5m
