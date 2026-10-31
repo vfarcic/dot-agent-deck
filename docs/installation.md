@@ -186,7 +186,7 @@ The deck learns each agent's status (Thinking, Working, Needs Input, and so on) 
 | Agent | Installed when | What is written |
 |---|---|---|
 | Claude Code | `~/.claude` exists | Hook entries in `~/.claude/settings.json`. The `StopFailure` hook (used for **Error** and **Blocked**) and the `PostToolUseFailure` hook (which tells the deck that a tool call that failed has ended) only when `claude --version` reports 2.1.78 or newer. |
-| OpenCode | `$XDG_CONFIG_HOME/opencode` (default `~/.config/opencode`) or `~/.opencode` exists; checked again every time the deck starts an OpenCode agent | The plugin file `plugin/dot-agent-deck.js` under that directory. |
+| OpenCode | `$XDG_CONFIG_HOME/opencode` (default `~/.config/opencode`, also when `XDG_CONFIG_HOME` is empty or not an absolute path), `~/.opencode` or `$OPENCODE_CONFIG_DIR` exists; checked again every time the deck starts an OpenCode agent | The plugin file `plugin/dot-agent-deck.js` under that directory. For OpenCode 2, only in OpenCode 2's own configuration directory (`$OPENCODE_CONFIG_DIR`, else `$XDG_CONFIG_HOME/opencode`), together with `plugins/dot-agent-deck-tui/`. See [OpenCode 1.x and 2.x](#opencode-1x-and-2x). |
 | Codex | `codex` is on the daemon's `PATH` | Hooks in `$CODEX_HOME/hooks.json` (default `~/.codex`), and trust for those hooks. |
 | Devin | `devin` is on the daemon's `PATH` | Hook entries in `$XDG_CONFIG_HOME/devin/config.json` (default `~/.config/devin/config.json`). |
 | Pi | Every time the deck starts a Pi pane | A bundled extension; nothing to install. |
@@ -236,6 +236,34 @@ A copy so old that it does not report its version is named as one that "predates
 If you open the desktop app on macOS straight from its disk image, or before moving it out of Downloads (macOS then runs it from a temporary location), and no other copy of `dot-agent-deck` is installed in `~/.local/bin` or on your `PATH`, it installs no hooks, and both clients say `Agent hooks are off` with `Move Agent Deck to /Applications and reopen it to turn agent hooks on.` Do that, and the hooks are installed when the app starts again.
 
 Pi is not affected: its extension always runs the copy that started the pane.
+
+### OpenCode 1.x and 2.x
+
+The deck works with OpenCode 1.18.29 and later 1.x releases, and with OpenCode 2. An OpenCode 2 agent gets the same card, deck messages and delegated tasks as an OpenCode 1.x agent, in the TUI and the desktop app, except for the differences in this section.
+
+**You do not tell the deck which version you run.** Before it starts an OpenCode agent, the deck asks the OpenCode that the agent's command runs for its version, and installs the plugin that version loads. When you upgrade OpenCode from 1.x to 2, or go back, the next OpenCode agent the deck starts gets the right plugin, with nothing for you to run; restart OpenCode agents that were already running. When the command starts OpenCode through a wrapper, the deck cannot ask, and sets the plugin up so that either version loads it.
+
+**OpenCode older than 1.18.29 is not supported.** The agent's card says so, for example `OpenCode 1.18.28 is older than the deck supports (1.18.29 or later): upgrade OpenCode, then restart the agent`.
+
+**OpenCode 2 has to run with its own server in each pane.** By default OpenCode 2 connects every `opencode` you start to one shared background service, and in that service the deck cannot tell one pane's agent from another's. Its `--standalone` flag gives each OpenCode its own server instead.
+
+- When the agent's command runs `opencode` directly, for example `opencode`, `opencode mini`, `opencode --continue` or `/usr/local/bin/opencode`, the deck adds `--standalone` for you when it finds OpenCode 2. It adds the flag only as it starts the agent: the command you configured stays as you wrote it. A command that already says `--standalone` or `--server` is left alone.
+- When the command starts OpenCode through a wrapper, such as a script, an alias or `devbox run oc`, the deck cannot add the flag. Add `--standalone` to the `opencode` command inside the wrapper, or run `opencode service set disabled true` once, which makes every OpenCode 2 on the machine run with its own server. Also declare the agent, `agent = "opencode"`, on the role ([Declaring the agent behind a launcher command](orchestration.md#declaring-the-agent-behind-a-launcher-command)), so the deck knows the pane runs OpenCode and can warn you on its card when something is wrong.
+
+If an OpenCode 2 agent runs on the shared service anyway, its card says `OpenCode 2 is using its shared background service, so the deck cannot follow this agent: …` and names both fixes. [An OpenCode card says the deck cannot follow it, is not working, or is too old](troubleshooting.md#an-opencode-card-says-the-deck-cannot-follow-it-is-not-working-or-is-too-old) lists each OpenCode card message and what to do.
+
+**Choosing the model on OpenCode 2.** OpenCode 2's full interface (`opencode`) refuses the `--model` flag, so a command such as `opencode --model gpt-4o` written for OpenCode 1.x does not start on OpenCode 2. Set the model in OpenCode's configuration instead, or start `opencode mini --model <provider/model>`.
+
+**Questions and forms.** When OpenCode 2 asks you something with a form, its card shows **Needs Input** in both clients. In OpenCode's full interface (`opencode`), the deck knows the form's questions and options, so in the desktop app you can [answer it by voice](desktop/voice.md#answering-an-agents-question), as you can on OpenCode 1.x; in the TUI, which has no voice control, you answer it in the pane. These forms are answered in OpenCode's pane in both clients:
+
+- every form in `opencode mini`: the card shows `answer this form in OpenCode: <the form's title>`;
+- a form with a question that appears only after another one is answered, a hidden field, or a field OpenCode fills in from elsewhere.
+
+**Deck messages in `opencode mini`.** A deck message or delegated task reaches OpenCode 2's `mini` and leaves what you were typing in place. By default, OpenCode 2's `mini` does not show the commands the agent runs or their output, so a delegated task's work can look shorter in the pane than it was; that is OpenCode's own display setting, not the deck's.
+
+**A message that arrives on OpenCode 2's home screen.** When a deck message opens a new session from OpenCode 2's home screen while you have unsent text there, the text moves into the new session's prompt, so you do not lose it.
+
+**Going back from OpenCode 2 to 1.x.** OpenCode 1.x cannot open the data OpenCode 2 has used, and stops with `Database is not empty and has no session table`. This is OpenCode's behaviour, with or without the deck; see OpenCode's documentation before you downgrade.
 
 ## Desktop app
 
@@ -584,4 +612,4 @@ brew uninstall dot-agent-deck                  # Homebrew; or delete the downloa
 sudo apt remove agent-deck                     # desktop app on Linux; on macOS delete /Applications/Agent Deck.app
 ```
 
-Your settings, keybindings, saved workspace and registered remotes are in `~/.config/dot-agent-deck/`, and schedules are in `$XDG_CONFIG_HOME/dot-agent-deck/schedules.toml` when `XDG_CONFIG_HOME` is set (otherwise the same directory). Delete them to remove your configuration too.
+Your settings, keybindings, saved workspace and registered remotes are in `~/.config/dot-agent-deck/`, and schedules are in `$XDG_CONFIG_HOME/dot-agent-deck/schedules.toml` when `XDG_CONFIG_HOME` is set to an absolute path (otherwise the same directory). Delete them to remove your configuration too.

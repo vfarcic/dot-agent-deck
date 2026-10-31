@@ -50,7 +50,7 @@ To identify the host, `remote add` reads only `uname -s -m`; it does not check t
   | Agent | Install (one option) |
   |---|---|
   | Claude Code | `npm install -g @anthropic-ai/claude-code` (needs Node.js) |
-  | OpenCode | `npm install -g opencode-ai` (needs Node.js) |
+  | OpenCode | `npm install -g opencode-ai` for OpenCode 1.x, or `npm install -g @opencode/cli` for OpenCode 2 (needs Node.js) |
   | Pi | `npm install -g @earendil-works/pi-coding-agent` (needs Node.js) |
   | Codex | `npm install -g @openai/codex` (needs Node.js) |
   | Devin | the vendor's install instructions; `devin` must end up on `PATH` |
