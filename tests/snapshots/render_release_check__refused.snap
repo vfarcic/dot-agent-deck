@@ -1,0 +1,10 @@
+---
+source: tests/render_release_check.rs
+expression: panel(frames.last().unwrap())
+---
+Release checks
+▸ Claude Code 2.1.313 · 0123456789abcdef
+Couldn't complete the check: the check can't be cleaned up safely.
+Progress: complete
+This daemon cannot run release checks.
+[Re-check R] [Forget f] [Export e] [Close Esc]

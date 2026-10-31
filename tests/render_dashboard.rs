@@ -740,6 +740,10 @@ fn status_012_card_says_a_stalled_wake_and_what_to_do() {
 /// A Normal card at 80 columns for an idle agent whose daemon summary has one
 /// queued message, with `extra` merged into the summary.
 fn inbox_hold_card(extra: serde_json::Value) -> String {
+    inbox_hold_card_at_width(extra, 80)
+}
+
+fn inbox_hold_card_at_width(extra: serde_json::Value, width: u16) -> String {
     let mut session = card_stats_session("/home/dev/api-svc");
     session.status = SessionStatus::Idle;
     let mut inbox = serde_json::json!({
@@ -768,7 +772,7 @@ fn inbox_hold_card(extra: serde_json::Value) -> String {
         0,
         render_now(),
         false,
-        80,
+        width,
         CardDensityKind::Normal.rendered_height(),
     );
     buffer_to_text(&buffer)
@@ -846,6 +850,52 @@ fn status_030_card_says_why_the_doorbell_holds() {
             "{why} must say {stalled_line:?}:\n{rendered}"
         );
     }
+}
+
+/// Scenario: An idle agent has one waiting message while its installed release is being checked or held after a check. Render each of the seven self-check causes, including a machine that cannot run the check, and compare the whole visible notice with the design's user words rather than the old generic fetch advice.
+#[spec("inbox/status/030")]
+#[test]
+fn status_030_card_names_each_release_check_hold() {
+    insta::assert_snapshot!("release_check_card_holds", release_check_card_notices());
+}
+
+fn release_check_card_notices() -> String {
+    [
+        ("running", "claude", None, None),
+        ("differs", "claude", Some("layout"), None),
+        ("inconclusive", "claude", None, Some("launch")),
+        (
+            "unavailable",
+            "claude",
+            None,
+            Some("no_process_containment"),
+        ),
+        ("tripped", "claude", None, None),
+        ("no_reference", "codex", None, None),
+        ("off", "claude", None, None),
+    ]
+    .into_iter()
+    .map(|(cause, agent, fact, reason)| {
+        let rendered = inbox_hold_card_at_width(
+            serde_json::json!({
+                "wake_stalled": true, "wake_hold": "cannot_type",
+                "hold_detail": {"cause": format!("release_check_{cause}"),
+                    "agent": agent, "release": "2.1.313", "fact": fact, "reason": reason}
+            }),
+            180,
+        );
+        // Snapshot the actual notice row; omit clock/stats and box drawing
+        // which already have dashboard snapshots. 180 columns fit the words
+        // without depending on the card's truncation at a smaller width.
+        let line = rendered
+            .lines()
+            .find(|line| line.starts_with("│✉1"))
+            .unwrap_or_else(|| panic!("{cause}: no inbox notice on the card:\n{rendered}"))
+            .trim_matches(|c: char| c == '│' || c.is_whitespace());
+        format!("{cause}: {line}")
+    })
+    .collect::<Vec<_>>()
+    .join("\n")
 }
 
 /// Feed real wire snapshots through one client's hydration path, preserving the

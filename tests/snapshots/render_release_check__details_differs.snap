@@ -1,0 +1,9 @@
+---
+source: tests/render_release_check.rs
+expression: panel(frames.last().unwrap())
+---
+Release checks
+▸ Claude Code 2.1.313 · 0123456789abcdef
+Didn't pass the deck's check: the screen layout changed.
+Progress: complete
+[Re-check R] [Forget f] [Export e] [Close Esc]

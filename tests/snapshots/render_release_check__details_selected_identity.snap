@@ -1,0 +1,11 @@
+---
+source: tests/render_release_check.rs
+expression: panel(frames.last().unwrap())
+---
+Release checks
+Claude Code 2.1.313 · 0123456789abcdef
+▸ Claude Code 2.1.313 · fedcba9876543210
+Claude Code 2.1.310 · aaaaaaaaaaaaaaaa
+Behaved differently from its check. Check its pane.
+Progress: complete
+[Re-check R] [Forget f] [Export e] [Close Esc]

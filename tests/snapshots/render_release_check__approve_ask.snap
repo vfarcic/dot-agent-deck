@@ -1,0 +1,11 @@
+---
+source: tests/render_release_check.rs
+expression: panel(frames.last().unwrap())
+---
+Release checks
+▸ Claude Code 2.1.313 · 0123456789abcdef
+Waiting to check on this machine.
+Progress: queued
+Queue position: 2
+Check queued.
+[Re-check R] [Cancel c] [Forget f] [Export e] [Close Esc]

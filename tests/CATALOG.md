@@ -24,6 +24,20 @@
 - **Does not assert:** real daemon operations, containment, agent launch, authentication, capability-cache implementation or a connection-reuse policy.
 - **Platform coverage:** mac+linux.
 
+##### inbox/release-check/004 — The TUI shows release-check Details, selected records and the action matrix.
+- **Layer:** L1 (`tests/render_release_check.rs`), in-process production input/rendering with TestBackend and insta snapshots, external command boundary substituted.
+- **Agent:** none.
+- **Asserts:** queued/running, passed, differs, inconclusive, unavailable, revoked, forgotten, no-reference and off Details; progress, queue position and display identity; selection across multiple releases and two identities of one release; Escape restores the card without an operation; Re-check from a hold or agent details, approval in ask mode, Cancel, selected-release Forget, Export directory entry/cancellation, mode auto/ask/off and visible command refusal. Accepted command replies change the rendered surface. The existing `inbox/status/030` case additionally snapshots the seven self-check card sentences in `tests/render_dashboard.rs`.
+- **Does not assert:** real daemon actions, persistent config changes, export files/scrubbing/preview inspection, runner execution, authority selected by a short identity, or desktop parity. The external adapter's accepted operations are synthetic; shared-client capability checks remain `/002`. Choosing a particular publication for mutations among same-agent/same-release identities is not expressible by SC-08's verbs and remains a named interface gap in `fixtures/release-check/tui.md`. Expected snapshots and proposed seam/keys are failing-first contracts, not already implemented UI.
+- **Platform coverage:** mac+linux+windows.
+
+##### inbox/release-check/005 — A checking card advances to delivery in the same stand-in pane.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_release_check_tui.rs`), isolated daemon and TUI.
+- **Agent:** the existing Python synthetic composer; no real agent or check runner.
+- **Asserts:** the attached card says checking while the stand-in result barrier is held; the input inventory is empty and the message stays queued; a passed result reaches real admission, visibly submits one notification in the original pane, and a subsequent synthetic integration fetch receives and acknowledges the body; the card's waiting line clears and the captured pane pid remains the same.
+- **Does not assert:** an actual agent's receipt/work, runner containment, real self-check evidence, publication races, local-record authority, or reel eligibility. The e2e-only stand-in outcome driver is an explicit assumed interface in `fixtures/release-check/tui.md`; missing driver support is setup-RED, not proof of a runtime rendering failure.
+- **Platform coverage:** mac+linux.
+
 ##### inbox/release-check/003 — The CLI exposes the action matrix, rejects malformed arguments and parses valid forms against missing endpoints.
 - **Layer:** L2 process integration, lane 1 (`tests/e2e_release_check_cli.rs`), fresh empty per-command sandboxes and captured-child deadlines.
 - **Agent:** none requested; the cleared environment and empty PATH prevent ordinary PATH lookup of agents, without enforcing absence of absolute-path launches or a daemon bootstrap.
@@ -11330,6 +11344,7 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Asserts:** for an idle agent with one waiting message and a stalled wake, a summary naming `possible_draft`, `awaiting_prompt`, `paste_open`, `cannot_type`, `not_taken`, `uncertain_input` or `dialog_during_ring` puts `✉1` and that reason's words (`waiting: there may be an unsent draft in its input. Send or clear it.`, `not yet taken: the agent may be waiting at a prompt. Check its pane.`, `waiting: a paste into its input has not finished.`, `waiting for the agent to fetch it. Send it a prompt.`, `waiting: the agent did not take the deck's Enter. Send it a prompt.`, `waiting: the deck's notice may be in its input. Check it before Enter.`, `waiting: a dialog may have taken the deck's keys. Check its pane.`) on the card's notice row, and the status line keeps the count without the stall's `waiting to wake`; the desktop tile shows the same from the same shared words (`tests/fixtures/inbox-display.json`). A reason this build does not know, and a summary from a daemon older than the field with its wake stalled, show `✉1 waiting to wake: send it a prompt`. With nothing waiting, `uncertain_input` and `dialog_during_ring` still warn in their own words (`The deck's notice may be in its input. Check it before pressing Enter.`, `A dialog may have taken the deck's keys. Check the agent's pane.`) in both clients, and `cannot_type` says nothing.
 - **Does not assert:** when the doorbell names a reason (`inbox/doorbell/041`), or a narrow card's row budget.
 - **Q35 display extension:** `needs_fetch` and generic `cannot_check` also show the shared reason on the notice row, with the count kept and stalled words omitted. The TUI uses a roomy card for these longer explanations; detail-specific and wordless-fallback controls are `inbox/probe/017` and `018`.
+- **Self-check display extension:** the TUI snapshots the seven `release_check_*` notice rows, including `unavailable`, at 180 columns against revision-6 §4.5's sentences. The fact/reason wording proposals are in `tests/fixtures/release-check/tui.md`; desktop parity for these new causes remains SC-11's work, not evidence from this Rust test.
 - **Platform coverage:** all.
 
 ##### inbox/status/031 — Held orchestrators remain prominent across tabs and reconnects.

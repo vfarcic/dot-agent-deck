@@ -1,0 +1,5 @@
+---
+source: tests/render_release_check.rs
+expression: agent_settings(frames.last().unwrap())
+---
+Release checks: auto [Change M] [Re-check R] [Details v]

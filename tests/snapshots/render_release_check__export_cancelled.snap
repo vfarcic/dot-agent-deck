@@ -1,0 +1,9 @@
+---
+source: tests/render_release_check.rs
+expression: panel(cancelled.last().unwrap())
+---
+Release checks
+▸ Claude Code 2.1.313 · 0123456789abcdef
+Passed the deck's check on this machine.
+Progress: complete
+[Re-check R] [Forget f] [Export e] [Close Esc]

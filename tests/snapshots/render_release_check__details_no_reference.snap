@@ -1,0 +1,7 @@
+---
+source: tests/render_release_check.rs
+expression: panel(frames.last().unwrap())
+---
+Release checks
+The deck has no checked release of Codex to compare with. Send it a prompt.
+[Re-check R] [Close Esc]
