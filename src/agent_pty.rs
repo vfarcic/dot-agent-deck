@@ -1682,7 +1682,8 @@ fn spawn_with_dir(
         return Err(AgentPtyError::CwdNotADirectory(dir.to_string()));
     }
 
-    let pty_system = NativePtySystem::default();
+    // Issue #1884: allocation alone is retried on macOS; nothing below is.
+    let pty_system = crate::pty_open_retry::RetryingPtySystem(NativePtySystem::default());
 
     let pair = pty_system
         .openpty(PtySize {
@@ -14705,7 +14706,7 @@ impl AgentPtyRegistry {
         child: Box<dyn portable_pty::Child + Send + Sync>,
         pane_id_env: Option<&str>,
     ) -> String {
-        let pair = NativePtySystem::default()
+        let pair = crate::pty_open_retry::RetryingPtySystem::default()
             .openpty(PtySize {
                 rows: 24,
                 cols: 80,
@@ -19496,7 +19497,7 @@ mod spawn_tests {
         // the child can be moved into the returned AgentPty. Dropping the
         // guard on that error path must force-kill and reap the child so
         // no orphan PID is left behind.
-        let pty_system = NativePtySystem::default();
+        let pty_system = crate::pty_open_retry::RetryingPtySystem::default();
         let pair = pty_system
             .openpty(PtySize {
                 rows: 24,
@@ -19540,7 +19541,7 @@ mod spawn_tests {
     fn foreground_pgid_differs_while_a_foreground_child_runs() {
         use std::io::Write as _;
 
-        let pty_system = NativePtySystem::default();
+        let pty_system = crate::pty_open_retry::RetryingPtySystem::default();
         let pair = pty_system
             .openpty(PtySize {
                 rows: 24,
