@@ -163,19 +163,81 @@ fn release_version_lookup_003_an_unreadable_remote_is_an_error() {
     );
 }
 
+/// Whether a `run` body invokes the script on a line that is not a shell
+/// comment. A comment naming the script is not a call to it, and both RWX
+/// callers carry one (PR #2056 review).
+fn runs_script(run: &str) -> bool {
+    run.lines()
+        .map(str::trim_start)
+        .any(|l| !l.starts_with('#') && l.contains(SCRIPT))
+}
+
+fn load_yaml(file: &str) -> Yaml {
+    let text =
+        fs::read_to_string(repo_root().join(file)).unwrap_or_else(|e| panic!("read {file}: {e}"));
+    YamlLoader::load_from_str(&text)
+        .unwrap_or_else(|e| panic!("{file} is not valid YAML: {e}"))
+        .remove(0)
+}
+
+/// The `run` body of the item in `items` whose `field` is `value`: an RWX
+/// task by its `key`, a GitHub Actions step by its `id`.
+fn run_of<'a>(items: &'a Yaml, field: &str, value: &str, file: &str) -> &'a str {
+    items
+        .as_vec()
+        .unwrap_or_else(|| panic!("{file}: expected a list of tasks or steps"))
+        .iter()
+        .find(|i| i[field].as_str() == Some(value))
+        .unwrap_or_else(|| panic!("{file} has no {field} `{value}`; update this test"))["run"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{file}'s {field} `{value}` has no `run` body"))
+}
+
 #[test]
-fn release_version_lookup_004_every_caller_runs_the_script_and_keeps_no_copy() {
+fn release_version_lookup_004_a_comment_naming_the_script_is_not_a_call() {
+    assert!(runs_script(&format!("set -e\nv=$({SCRIPT} origin)\n")));
+    assert!(runs_script(&format!(
+        "  if x; then\n    v=$({SCRIPT} origin)\n  fi"
+    )));
+    assert!(
+        !runs_script(&format!("# {SCRIPT} reads the tag\nv=0.1.0\n")),
+        "a body whose only mention of the script is a comment does not run it"
+    );
+    assert!(!runs_script("v=$(git describe --tags)"));
+}
+
+#[test]
+fn release_version_lookup_005_every_caller_runs_the_script_and_keeps_no_copy() {
+    let ci = load_yaml(".github/workflows/ci.yml");
+    let rwx_ci = load_yaml(".rwx/ci.yml");
+    let sandbox = load_yaml(".rwx/sandbox.yml");
+    let callers = [
+        (
+            ".github/workflows/ci.yml",
+            run_of(&ci["jobs"]["changes"]["steps"], "id", "version", "ci.yml"),
+        ),
+        (
+            ".rwx/ci.yml",
+            run_of(&rwx_ci["tasks"], "key", "backend", ".rwx/ci.yml"),
+        ),
+        (
+            ".rwx/sandbox.yml",
+            run_of(&sandbox["tasks"], "key", "version", ".rwx/sandbox.yml"),
+        ),
+    ];
+    for (file, run) in callers {
+        assert!(
+            runs_script(run),
+            "{file}'s version lookup no longer runs {SCRIPT}, so its builds may get no version \
+             or a different one"
+        );
+    }
     for file in [
         ".github/workflows/ci.yml",
         ".rwx/ci.yml",
         ".rwx/sandbox.yml",
     ] {
-        let text = fs::read_to_string(repo_root().join(file))
-            .unwrap_or_else(|e| panic!("read {file}: {e}"));
-        assert!(
-            text.contains(SCRIPT),
-            "{file} no longer runs {SCRIPT}, so its builds may get no version or a different one"
-        );
+        let text = fs::read_to_string(repo_root().join(file)).unwrap();
         assert!(
             !text.contains("ls-remote --tags"),
             "{file} lists tags itself: run {SCRIPT} instead of keeping a second copy of the lookup"
@@ -186,18 +248,15 @@ fn release_version_lookup_004_every_caller_runs_the_script_and_keeps_no_copy() {
 /// The `changes` job checks out only the files it names, so a script it runs
 /// that its sparse checkout leaves out is a step that fails on every run.
 #[test]
-fn release_version_lookup_005_the_changes_job_checks_the_script_out() {
-    let text = fs::read_to_string(repo_root().join(".github/workflows/ci.yml"))
-        .expect("read .github/workflows/ci.yml");
-    let docs = YamlLoader::load_from_str(&text).expect("ci.yml is valid YAML");
-    let steps = docs[0]["jobs"]["changes"]["steps"]
+fn release_version_lookup_006_the_changes_job_checks_the_script_out() {
+    let ci = load_yaml(".github/workflows/ci.yml");
+    let steps = ci["jobs"]["changes"]["steps"]
         .as_vec()
         .expect("ci.yml has a `changes` job with steps");
-    let runs_script = steps
-        .iter()
-        .any(|s| s["run"].as_str().is_some_and(|r| r.contains(SCRIPT)));
     assert!(
-        runs_script,
+        steps
+            .iter()
+            .any(|s| s["run"].as_str().is_some_and(runs_script)),
         "the `changes` job no longer runs {SCRIPT}; update this test"
     );
     let sparse: Vec<&str> = steps
