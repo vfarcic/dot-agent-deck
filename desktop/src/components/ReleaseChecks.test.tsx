@@ -228,14 +228,19 @@ describe("inbox/release-check/004 — desktop Details and controls", () => {
     expect(registryDispatch).toHaveBeenCalledWith("releaseCheckSelect");
   });
 
-  /// Scenario: Select a completed row while a different check runs; Cancel opens a confirmation, dismissal leaves the check running, and manual acceptance stops the running check without an identity selector.
+  /// Scenario: Select a completed row while a different check runs; Cancel opens a confirmation focused on shared Back, so default activation preserves the running check. Reopen and explicitly accept to stop the running check without an identity selector.
   it("cancels the running check independently of row selection", async () => {
     const app = mount({ rows: [row("passed", { release: "2.1.312" }), row("passed", { identity: secondIdentity, state: null, progress: "running", queuePosition: 1 })] });
     openDetails(); selectRecord(identity);
     expect(details()).toHaveTextContent(shared.details.cancel_running);
     click("Cancel", details());
     expect(screen.getByRole("alertdialog", { name: /cancel.*check/i })).toHaveTextContent(shared.cancelConfirmation);
-    click("Cancel", screen.getByRole("alertdialog", { name: /cancel.*check/i }));
+    const dismiss = within(screen.getByRole("alertdialog", { name: /cancel.*check/i })).getByRole("button", { name: shared.confirmDismiss });
+    expect(dismiss).toHaveFocus();
+    // jsdom does not synthesize a native button click from keyDown(Enter).
+    // Activate the focused button explicitly to model that default action.
+    fireEvent.click(document.activeElement!);
+    expect(screen.queryByRole("alertdialog", { name: /cancel.*check/i })).toBeNull();
     expect(app.requests).toEqual([]);
     click("Cancel", details()); click("Cancel check", screen.getByRole("alertdialog", { name: /cancel.*check/i }));
     await waitFor(() => expect(app.requests).toEqual([{ type: "release_check_cancel", deckId: app.deckId }]));
@@ -245,17 +250,23 @@ describe("inbox/release-check/004 — desktop Details and controls", () => {
     expect(registryDispatch).toHaveBeenCalledWith("releaseCheckConfirmCancel");
   });
 
-  /// Scenario: Select an older release with one or two identities; the multi-identity confirmation names its release-wide scope. Escape preserves the records, then manual acceptance forgets the selected older release, preserves the current release, and offers only Re-check and Close on forgotten records.
+  /// Scenario: Select an older release with one or two identities; the multi-identity confirmation names its release-wide scope. Escape and default Back activation preserve the records, then explicit acceptance forgets the selected older release, preserves the current release, and offers only Re-check and Close on forgotten records.
   it.each([false, true])("forgets release-wide, several identities=%s", async (several) => {
     const app = mount({ rows: [row(), row("passed", { release: olderRelease, identity: secondIdentity }), ...(several ? [row("passed", { release: olderRelease, identity: "aaaaaaaaaaaaaaaa" })] : [])] });
     openDetails(); selectRecord(secondIdentity); click("Forget", details());
     let confirmation = screen.getByRole("alertdialog", { name: /forget/i });
+    expect(within(confirmation).getByRole("button", { name: shared.confirmDismiss })).toHaveFocus();
     expect(confirmation).toHaveTextContent(fill(shared.forgetConfirmation, { release: olderRelease }));
     expect(confirmation).toHaveTextContent(olderRelease);
     if (several) expect(confirmation).toHaveTextContent(fill(shared.details.forget_release, { release: olderRelease }));
     else expect(confirmation).not.toHaveTextContent(fill(shared.details.forget_release, { release: olderRelease }));
     fireEvent.keyDown(confirmation, { key: "Escape" });
     expect(details()).toHaveTextContent(shared.details.passed);
+    expect(app.requests).toEqual([]);
+    click("Forget", details()); confirmation = screen.getByRole("alertdialog", { name: /forget/i });
+    expect(within(confirmation).getByRole("button", { name: shared.confirmDismiss })).toHaveFocus();
+    fireEvent.click(document.activeElement!);
+    expect(screen.queryByRole("alertdialog", { name: /forget/i })).toBeNull();
     expect(app.requests).toEqual([]);
     click("Forget", details()); confirmation = screen.getByRole("alertdialog", { name: /forget/i });
     expect(app.requests).toEqual([]);
@@ -309,7 +320,7 @@ describe("inbox/release-check/004 — desktop Details and controls", () => {
     }
   });
 
-  /// Scenario: Choosing off while a check runs asks before cancelling it. Escape leaves ask and the running check intact; manual acceptance shows off and the runner-stopped reply, and turning auto back on remains possible.
+  /// Scenario: Choosing off while a check runs asks before cancelling it. Escape and default Back activation leave ask and the running check intact; explicit acceptance shows off and the runner-stopped reply.
   it("confirms off during a running check and applies the cancellation reply", async () => {
     const app = mount({ mode: "ask", rows: [row("passed", { state: null, progress: "running", queuePosition: 1 })] });
     fireEvent.keyDown(document.body, { key: "p" });
@@ -317,10 +328,16 @@ describe("inbox/release-check/004 — desktop Details and controls", () => {
     fireEvent.change(setting, { target: { value: "off" } });
     const confirmation = screen.getByRole("alertdialog", { name: /release checks off/i });
     expect(confirmation).toHaveTextContent(shared.offConfirmation);
+    expect(within(confirmation).getByRole("button", { name: shared.confirmDismiss })).toHaveFocus();
     expect(app.requests).toEqual([]);
     fireEvent.keyDown(confirmation, { key: "Escape" });
     expect(setting).toHaveValue("ask");
     expect(app.requests).toEqual([]);
+    fireEvent.change(setting, { target: { value: "off" } });
+    expect(within(screen.getByRole("alertdialog", { name: /release checks off/i })).getByRole("button", { name: shared.confirmDismiss })).toHaveFocus();
+    fireEvent.click(document.activeElement!);
+    expect(screen.queryByRole("alertdialog", { name: /release checks off/i })).toBeNull();
+    expect(setting).toHaveValue("ask"); expect(app.requests).toEqual([]);
     fireEvent.change(setting, { target: { value: "off" } });
     click("Turn off", screen.getByRole("alertdialog", { name: /release checks off/i }));
     await waitFor(() => expect(app.requests).toEqual([{ type: "release_check_mode", deckId: app.deckId, mode: "off" }]));
@@ -490,6 +507,7 @@ describe("inbox/release-check/004 — recorded output is inert display text", ()
     const text = diagnostic.textContent!;
     expect(text).toContain("\\u{202e}"); expect(text).toMatch(/truncated/i);
     expect(Array.from(text).length).toBeLessThanOrEqual(inspectionCodePoints + (source === "name" ? 5 : 0));
+    expect(text).toContain(shared.displayTruncated);
     expect(text).not.toContain("END_OF_DIAGNOSTIC"); inertDom(document.body);
     expect(app.requests).toHaveLength(1);
   });
@@ -507,6 +525,7 @@ describe("inbox/release-check/004 — recorded output is inert display text", ()
     click("Export files"); await act(async () => { await Promise.resolve(); });
     expect(app.requests).toHaveLength(1);
     expect(screen.getByRole("alert")).toHaveTextContent(/directory.*(?:control|invalid)|(?:control|invalid).*directory/i);
+    expect(screen.getByRole("alert")).toHaveTextContent(shared.invalidDirectory);
     click("Cancel export"); expect(app.requests).toHaveLength(1);
   });
 
@@ -522,10 +541,11 @@ describe("inbox/release-check/004 — recorded output is inert display text", ()
       expect(screen.getByRole("alert")).toHaveTextContent(/directory.*(?:control|invalid)|(?:control|invalid).*directory/i);
     } else {
       fireEvent.change(input, { target: { value: raw } });
-      click("Export files"); await act(async () => { await Promise.resolve(); });
     }
+    click("Export files"); await act(async () => { await Promise.resolve(); });
     expect(app.requests).toHaveLength(1);
     expect(screen.getByRole("alert")).toHaveTextContent(/directory.*(?:control|invalid)|(?:control|invalid).*directory/i);
+    expect(screen.getByRole("alert")).toHaveTextContent(shared.invalidDirectory);
     inertDom(document.body);
   });
 
@@ -538,7 +558,25 @@ describe("inbox/release-check/004 — recorded output is inert display text", ()
     const echo = screen.getByRole("region", { name: "Export destination" });
     expect(Array.from(echo.textContent!).length).toBeLessThanOrEqual(inspectionCodePoints);
     expect(echo).toHaveTextContent(/truncated/i); expect(echo).not.toHaveTextContent("END_OF_DIRECTORY");
+    expect(echo).toHaveTextContent(shared.displayTruncated);
     inertDom(echo); inertDom(document.body); click("Cancel export"); expect(app.requests).toHaveLength(1);
+  });
+
+  /// Scenario: Choose a destination with bidi and zero-width characters but no control characters. Its echo and success message use printable escapes, while the confirmed external write receives the exact raw path.
+  it("allows bidi and zero-width destinations with an escaped echo", async () => {
+    const app = mount(); openDetails(); click("Continue", await preview());
+    const raw = "/export/\u202e\u200b";
+    const escaped = "/export/\\u{202e}\\u{200b}";
+    fireEvent.change(screen.getByRole("textbox", { name: "Directory" }), { target: { value: raw } });
+    expect(screen.getByRole("region", { name: "Export destination" }).textContent).toBe(escaped);
+    inertDom(document.body);
+    click("Export files");
+    await waitFor(() => expect(app.requests).toEqual([
+      { type: "release_check_export_preview", deckId: app.deckId, agent: "claude", release },
+      { type: "release_check_export", deckId: app.deckId, agent: "claude", release, dir: raw },
+    ]));
+    expect(details()).toHaveTextContent(escaped);
+    inertDom(document.body);
   });
 });
 
