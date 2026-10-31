@@ -1563,11 +1563,14 @@ fn main() -> ExitCode {
             // reaches the user only as an exit 0 with nothing said.
             //
             // Safe for a CLI whose stdout is the documented output.
-            // `init_logging_from_env` installs a subscriber ONLY when
-            // `DOT_AGENT_DECK_LOG` is set, and the subscriber it installs writes
-            // only to that file — so this command's own stdout is unchanged
-            // whether logging is on or off, and nothing a hook installer logs
-            // can end up in what a caller parses.
+            // `init_logging_from_env` installs a subscriber when
+            // `DOT_AGENT_DECK_LOG` is set or an OTLP logs destination is
+            // configured (#2021). Neither layer writes to stdout: the file layer
+            // writes to that file, and the OTLP layer only queues records, which
+            // nothing in this process exports (only daemon startup starts the
+            // exporter) — so this command's own stdout is unchanged whether
+            // logging is on or off, and nothing a hook installer logs can end up
+            // in what a caller parses.
             init_logging_from_env();
             // PRD #20 finding #15: dispatch through the SPEC's own handler rather
             // than a strategy-keyed hardcoded incumbent. Behaviour is unchanged
@@ -2606,11 +2609,13 @@ fn main() -> ExitCode {
             // Diagnosing a Codex delegate that never got its prompt meant
             // reading the wire.
             //
-            // Safe in a pane. `init_logging_from_env` installs a subscriber ONLY
-            // when `DOT_AGENT_DECK_LOG` is set, and that subscriber only ever
-            // writes to that file — never to stdout or stderr — so a wrapper
-            // whose descriptors ARE the agent's terminal cannot paint a LOG LINE
-            // into it. (The setup itself has exactly one stderr line, `Warning:
+            // Safe in a pane. `init_logging_from_env` installs a subscriber when
+            // `DOT_AGENT_DECK_LOG` is set or an OTLP logs destination is
+            // configured (#2021), and neither layer writes to stdout or stderr:
+            // the file layer writes to that file, and the OTLP layer only queues
+            // records, which nothing in the wrapper exports (only daemon startup
+            // starts the exporter) — so a wrapper whose descriptors ARE the
+            // agent's terminal cannot paint a LOG LINE into it. (The setup itself has exactly one stderr line, `Warning:
             // failed to open log file …`, on a log path it cannot open; so the
             // claim is about the log stream, not about the call being incapable
             // of writing to the terminal at all. Narrowed under issue #730's
