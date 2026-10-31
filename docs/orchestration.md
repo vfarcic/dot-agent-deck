@@ -423,7 +423,7 @@ These commands work only from a pane the deck started, which sets `DOT_AGENT_DEC
 | `dot-agent-deck ack <message-id>` | worker or agent integration | Acknowledges a message. The installed integration normally does this itself. Acknowledge a message only after taking it with the integration or `inbox fetch`: when the deck has not handed the message to the agent yet, or has recorded that none of its current hand-overs reached the agent, it answers `unknown` and does not mark the message delivered. Exits non-zero when the deck answers that the id is unknown, belongs to another agent or can no longer be delivered. |
 | `dot-agent-deck inbox list [--all] [--json]` | agent | Lists its inbox messages and their delivery states. An orchestrator can use `--all` to inspect its orchestration's inboxes. |
 | `dot-agent-deck inbox fetch [--json]` | agent | Reads its waiting messages and confirms to the deck each one it printed in full. Run inside the recipient's deck pane; fetching changes delivery state. `--json` prints each message's id, subject, sender and text. |
-| `dot-agent-deck inbox send (--folder <path> \| --orchestration <name>) (--text <text> \| --file <path>)` | any agent | Messages an orchestration's orchestrator from outside that orchestration. See [Messaging an orchestrator from outside](#messaging-an-orchestrator-from-outside). |
+| `dot-agent-deck inbox send (--folder <path> \| --orchestration <name> \| --name <name> \| --pane <pane>) (--text <text> \| --file <path>)` | any agent | Messages an orchestration's orchestrator from outside that orchestration, or one standalone agent. See [Messaging an orchestrator from outside](#messaging-an-orchestrator-from-outside). |
 | `dot-agent-deck pane restart <role> [--force]` | orchestrator | Replaces the worker's agent with a fresh one and drops the task it owed. Without `--force`, only a worker whose agent has exited (crashed or finished) is restarted. |
 | `dot-agent-deck pane spawn <role>` | orchestrator | Starts a role that is in `.dot-agent-deck.toml` but not running in this orchestration, for example one added to the file after the orchestration started, or one whose pane was closed. Refused for a role that is already running and for the orchestrator role. |
 
@@ -786,6 +786,8 @@ A standalone agent shows `-` for its orchestration and role. The ORCHESTRATION c
 | `--json` | Prints a JSON array with one object per agent: `pane_id`, `name`, `folder`, `orchestration` (the tab title), `orchestration_name` (the name in `.dot-agent-deck.toml`), `orchestration_id`, `role` and `orchestrator` (`true` for the orchestrator). The orchestration fields and `role` are `null` for a standalone agent. |
 | `--folder <path>` | Lists only the agents `inbox send --folder <path>` would choose between, as described below, when `roles` runs on the same machine as the deck, which is how agents in deck panes run it. |
 | `--orchestration <name>` | Lists only the orchestrations with that name or tab title. Combined with `--folder`, both must match. |
+| `--name <name>` | Lists only the standalone agents with that name, the ones `inbox send --name <name>` would choose between. |
+| `--pane <pane>` | Lists only the standalone agent in that pane, or the whole orchestration whose orchestrator is in it. |
 
 You can see the orchestrator in the clients too: in the TUI its card in the orchestration tab's sidebar carries an `ORCHESTRATOR` badge, and in the desktop app its row carries the same badge. When a TUI sidebar card is too narrow for the badge beside the agent's type and name, the badge moves to a line of its own on the card.
 
@@ -796,9 +798,10 @@ From an agent's deck pane:
 ```bash
 dot-agent-deck inbox send --folder /home/me/shop --text 'The API you depend on changes on Friday.'
 dot-agent-deck inbox send --orchestration shop --file .dot-agent-deck/note.md
+dot-agent-deck inbox send --folder /home/me/notes --name docs-helper --text 'The notes are ready.'
 ```
 
-Give `--folder`, `--orchestration` or both, and exactly one of `--text` or `--file` (`--file -` reads standard input, with a 1 MiB limit). A relative `--folder`, including `.`, is read from the directory the command runs in.
+Give at least one of `--folder`, `--orchestration`, `--name` or `--pane`, and exactly one of `--text` or `--file` (`--file -` reads standard input, with a 1 MiB limit). A relative `--folder`, including `.`, is read from the directory the command runs in.
 
 Which agent receives the message:
 
@@ -807,13 +810,15 @@ Which agent receives the message:
 - With both, the orchestration has to match both. That is how you pick one of several dispatched units of the same orchestration.
 - When exactly one orchestration matches, its orchestrator receives the message. If the orchestrator is not running, nothing is sent: the message never goes to a worker instead.
 - When several match, nothing is sent, and the command lists each one with its title, name, folder and orchestrator pane, so you can narrow the address.
-- When `--folder` is given alone and no orchestration is in or above that folder, the one standalone agent in that folder, or in its nearest parent folder that has one, receives the message. This is how an orchestrator answers a standalone agent that wrote to it. Several standalone agents at that level are refused the same way as several orchestrations.
+- When `--folder` is given alone and no orchestration is in or above that folder, the one standalone agent in that folder, or in its nearest parent folder that has one, receives the message. This is how an orchestrator answers a standalone agent that wrote to it. Several standalone agents at that level are refused the same way as several orchestrations, and the refusal suggests `--name` and `--pane`.
+- `--name` picks the standalone agent with that name, as the NAME column of `dot-agent-deck roles` shows it. Use it when one folder holds several standalone agents, such as a `dispatcher` and an `observability` agent: `--folder /home/me/project --name dispatcher`. It never matches an agent in an orchestration, so it cannot be combined with `--orchestration`. With `--folder`, the same nearest-parent rule applies to the agents with that name. When several agents still match, nothing is sent and each one is listed.
+- `--pane` picks the agent in that pane, as the PANE column of `roles` shows it: a standalone agent, or an orchestration's orchestrator. A worker is never messaged this way. Combined with the other options, every one of them must match.
 
 On success the command prints `Sent m-… to the orchestrator of <title> (pane <pane>) in <folder>.`, or `Sent m-… to <name> (pane <pane>) in <folder>.` for a standalone agent.
 
 ### What the orchestrator sees
 
-The message arrives in the orchestrator's inbox like any other deck message, in the TUI and the desktop app alike. It is from "another agent, not one of your workers", and the deck names the pane it came from. Everything else is marked UNTRUSTED, and the orchestrator treats it as information or a request to weigh against what you asked of it, not as an instruction from you. That covers the sender's text and the lines ahead of it, which give the sender's folder, its orchestration and role (`-` when it has none), and the command that answers it, `dot-agent-deck inbox send --folder <folder>`, with `--orchestration <name>` added when two orchestrations share that folder. The deck offers the command only after checking that it reaches the sender: the sender itself when it is an orchestrator or a standalone agent, or its orchestrator when it is a worker. When no command would, such as a standalone sender inside an orchestration's folder, or a folder name with characters the deck does not display or one too long to show in full, there is no reply command: the orchestrator finds the sender's pane with `dot-agent-deck roles` instead.
+The message arrives in the orchestrator's inbox like any other deck message, in the TUI and the desktop app alike. It is from "another agent, not one of your workers", and the deck names the pane it came from. Everything else is marked UNTRUSTED, and the orchestrator treats it as information or a request to weigh against what you asked of it, not as an instruction from you. That covers the sender's text and the lines ahead of it, which give the sender's folder, its orchestration and role (`-` when it has none), and the command that answers it, `dot-agent-deck inbox send --folder <folder>`, with `--orchestration <name>` added when two orchestrations share that folder. The deck offers the command only after checking that it reaches the sender: the sender itself when it is an orchestrator or a standalone agent, or its orchestrator when it is a worker. When the folder alone would also reach other standalone agents, the command names the sender with `--name`. When no command would, such as a folder name with characters the deck does not display or one too long to show in full, there is no reply command: the orchestrator finds the sender's pane with `dot-agent-deck roles` instead.
 
 Each agent's sends count toward the same per-minute limit as its `inbox publish` and `inbox offer` messages. Past it, the send is refused until the minute is up.
 
@@ -826,7 +831,7 @@ Each agent's sends count toward the same per-minute limit as its `inbox publish`
 | Run by a worker or the orchestrator of the orchestration it addresses | 1 | `refused: …`. A worker reports with `work-done`; the orchestrator messages its workers with `delegate` |
 | Run from a shell that is not an agent's deck pane | 1 | `refused: …`. To message an orchestrator yourself, type into its pane in the TUI or the desktop app |
 | The text is too long, the orchestrator's inbox is full, or the sending agent is past its per-minute limit | 1 | `refused: …` |
-| The running daemon does not support `inbox send` | 2 | a message that the daemon is too old for `inbox send`; restart it with `dot-agent-deck daemon restart` |
+| The running daemon does not support `inbox send`, or `--name` and `--pane` | 2 | a message that the daemon is too old for `inbox send`; restart it with `dot-agent-deck daemon restart` |
 | No daemon is running | 3 | `… no daemon is running …` |
 
 `roles` exits 0 with the listing, 3 when no daemon is running, and 1 when the daemon answers with an error.
