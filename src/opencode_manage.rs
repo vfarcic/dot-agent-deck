@@ -1564,8 +1564,14 @@ const reportTool = (eventName, sessionID, tool, args, callID, directory) => {
 // re-running the plugin after disposing one) gets a new context and loads.
 // 1.18.35 takes `default.server` alone (measured), so this never fires there.
 const DAD_SEEN_CONTEXTS = typeof WeakSet === "function" ? new WeakSet() : undefined;
+const V1_SERVER_CALLED = "__dotAgentDeckV1ServerCalled";
 
 export const DotAgentDeckPlugin = async (ctx) => {
+  // PRD #2050: this process runs OpenCode 1.x, which calls `server`. 1.19.5
+  // also calls the module's 2.x `setup` (measured: after `server`, in the
+  // full TUI's worker and in `--mini` once its first session exists), which
+  // must then stay inert (setupV2).
+  globalThis[V1_SERVER_CALLED] = true;
   // A second copy of this plugin in the same OpenCode process returns inert
   // hooks, so one real action produces one event. See DAD_GUARD above.
   if (DAD_ALREADY_LOADED) {
@@ -1975,6 +1981,14 @@ const setupV2 = async (ctx) => {
   if (V2_SERVICE()) {
     return () => {};
   }
+  // OpenCode 1.19.5 calls `setup` too, after `server`, with a context of its
+  // own (`options`, `agent`, `catalog`, …: no `event`, no `session`; measured).
+  // The 1.x implementation already serves this process: run here as well and
+  // the 2.x inbox would read `--mini` as the full TUI, announce, and replace
+  // mini's receiver with a doorbell-only one.
+  if (globalThis[V1_SERVER_CALLED] || typeof ctx?.event?.subscribe !== "function") {
+    return () => {};
+  }
   // 2.x may load the plugin again in this module after unloading it (its
   // cleanup ran handleShutdown): the new instance reports again.
   shuttingDown = false;
@@ -2091,13 +2105,51 @@ const v2NotePending = (inboxID, text) => {
     inboxRemember(miniPending, inboxID, [...new Set([...(miniPending.get(inboxID) ?? []), ...ids])]);
   }
 };
+// The session `opencode mini` shows, when this plugin did not see it created.
+// 2.x mini creates (or resumes) its session as it starts, through the server
+// API, before this plugin's event stream is subscribed (measured on 2.2.5: the
+// session existed 0.2 s before `setup` ran, and no `session.created` reached
+// the plugin), and draws only that session. So it is found the way mini finds
+// it (2.2.5's mini resolver): `--session <id>` names it; `--continue` takes the
+// newest root session of the directory; otherwise mini created a fresh one,
+// the newest root session of the directory created since this server started.
+// A `--fork` is a new session too. Undefined while none is found.
+const v2ClientFlag = (args, long, short) => {
+  for (let n = 0; n < args.length; n++) {
+    const arg = args[n];
+    if (arg === long || (short && arg === short)) return args[n + 1];
+    if (typeof arg === "string" && arg.startsWith(long + "=")) return arg.slice(long.length + 1);
+  }
+  return undefined;
+};
+const v2FindMiniTarget = async (ctx) => {
+  const args = v2ClientArgs() ?? [];
+  const fork = args.includes("--fork");
+  const named = v2ClientFlag(args, "--session", "-s");
+  if (named && !fork) return named;
+  const directory = ctx?.location?.directory ?? process.cwd();
+  const listed = await ctx.session.list({ directory, parentID: null, limit: 20, order: "desc" });
+  const roots = (Array.isArray(listed?.data) ? listed.data : []).filter(
+    (s) => typeof s?.id === "string" && !s.parentID && (s.location?.directory ?? directory) === directory,
+  );
+  if (!fork && (args.includes("--continue") || args.includes("-c"))) return roots[0]?.id;
+  const started = typeof performance === "object" ? performance.timeOrigin : Date.now();
+  return roots.find((s) => typeof s.time?.created === "number" && s.time.created >= started - 1000)?.id;
+};
 const v2MiniDeliver = async (ctx, message, generation) => {
   const ref = inboxRef(message);
   const receiver = serverReceiver();
   if (!receiver || generation !== inboxGeneration()) return;
   try {
-    while (!miniTarget) {
+    for (let n = 0; !miniTarget; n++) {
       if (generation !== inboxGeneration()) return;
+      if (n % 5 === 0 && typeof ctx?.session?.list === "function") {
+        try {
+          const found = await v2FindMiniTarget(ctx);
+          if (found && !miniTarget) miniTarget = found;
+          continue;
+        } catch (_) {}
+      }
       await inboxSleep(200);
     }
     const sessionID = miniTarget;
@@ -2914,8 +2966,9 @@ fn tui_v2_template(binary_path: &str) -> String {
 /// PRD #2050: the 1.x TUI plugin's behaviour on OpenCode 2.x's TUI API: arm
 /// the deck's stream and start each message in the session on screen — in
 /// place in a root session, in the root of a subagent's session (shown
-/// first), and in a new session, shown, from the home screen — waiting while
-/// a dialog is open and re-reading the screen after every wait.
+/// first), and in a new session, shown, from the home screen, carrying the
+/// home screen's unsent draft into that session's composer — waiting while a
+/// dialog is open and re-reading the screen after every wait.
 ///
 /// What moved: the route is `ui.router.current()` (`{ type, sessionID }`),
 /// sessions are `data.session.get`, a prompt is `client.session.prompt({
@@ -2991,8 +3044,57 @@ const setup = async (api) => {
       const sessionID = created?.id ?? created?.data?.id;
       if (!sessionID) throw new Error("no session was created");
       if (shownSession()) throw new Error("the person opened a session meanwhile");
+      const stashed = await stashDraft();
       show(sessionID);
+      if (stashed) await restoreDraft(sessionID);
       return sessionID;
+    };
+    // The person's unsent draft on the home screen. 2.x gives home and each
+    // session a composer of its own, so opening the new session would leave
+    // the draft behind, where 1.x carried it along. The plugin API reads no
+    // composer, but the TUI's own `prompt.stash` / `prompt.stash.pop` commands
+    // move a whole prompt (text, files, pasted parts) and are dispatchable:
+    // stash on home, then pop once the session's composer is mounted
+    // (measured on 2.2.5: `prompt.stash.pop` is reachable again, with
+    // `session.compact`, about 0.1 s after navigating, and the popped prompt
+    // leaves OpenCode's stash empty). A pop that never becomes reachable
+    // leaves the draft in OpenCode's stash list, not lost.
+    const command = (id) => {
+      try {
+        const found = api.keymap?.commands?.().find((c) => c?.id === id);
+        if (!found) return undefined;
+        const enabled = typeof found.enabled === "function" ? found.enabled() : found.enabled;
+        return enabled === false ? undefined : found;
+      } catch (_) {
+        return undefined;
+      }
+    };
+    // Whether the draft went to the stash: `prompt.stash` is reachable only
+    // while the composer holds text, and the stash empties it.
+    const stashDraft = async () => {
+      if (!command("prompt.stash")) return false;
+      try {
+        api.keymap.dispatch("prompt.stash");
+      } catch (_) {
+        return false;
+      }
+      for (let n = 0; n < 10; n++) {
+        if (!command("prompt.stash")) return true;
+        await inboxSleep(10);
+      }
+      return false;
+    };
+    const restoreDraft = async (sessionID) => {
+      for (let n = 0; n < 100 && instance.active; n++) {
+        if (shownSession() !== sessionID) return;
+        if (command("session.compact") && command("prompt.stash.pop")) {
+          try {
+            api.keymap.dispatch("prompt.stash.pop");
+          } catch (_) {}
+          return;
+        }
+        await inboxSleep(20);
+      }
     };
     const notePending = (inboxID, text) => {
       if (!inboxID) return;
@@ -6403,6 +6505,81 @@ process.exit(0);
             written.contains("\"not_handed\""),
             "positively not handed: {written}"
         );
+    }
+
+    /// Scenario (PRD #2050, inbox/opencode/020 on 1.19.5): OpenCode 1.x runs
+    /// `opencode --mini`, calls the module's `server`, creates mini's first
+    /// session, and then — as 1.19.5 does — calls the 2.x `setup` too, once
+    /// with its own context (no `event`, no `session`) and once with a
+    /// 2.x-shaped one. `setup` stays inert both times: nothing is announced,
+    /// no doorbell-only receiver replaces mini's, nothing is subscribed, and
+    /// the deck's message still starts in mini's session as 1.x's mini
+    /// receiver delivers it.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_1x_mini_stays_the_receiver_when_1x_also_calls_setup() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (recorder, controls) = inbox_recorder(dir.path());
+        let plugin = dir.path().join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                r#"process.argv = [process.argv[0], "opencode", "--mini"];
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const prompts = [];
+let subscribed = false;
+const client = {{ session: {{
+  messages: async () => ({{ data: [] }}),
+  promptAsync: async (req) => {{ prompts.push(req.path.id); return {{}}; }},
+}} }};
+const {{ default: mod }} = await import("{}");
+const hooks = await mod.server({{ directory: "/work", client }});
+await hooks.event({{ event: {{ type: "session.created", properties: {{ info: {{ id: "s1" }} }} }} }});
+const own = await mod.setup({{ options: {{}}, agent: {{}}, aisdk: {{}}, catalog: {{}}, command: {{}}, integration: {{}}, plugin: {{}}, reference: {{}}, skill: {{}} }});
+const shaped = await mod.setup({{
+  location: {{ directory: "/work" }},
+  event: {{ subscribe: () => {{ subscribed = true; return {{ [Symbol.asyncIterator]: () => ({{ next: () => new Promise(() => {{}}) }}) }}; }} }},
+  session: {{ hook: async () => undefined, prompt: async () => ({{}}) }},
+  tool: {{ hook: async () => undefined }},
+}});
+for (let n = 0; n < 150 && !prompts.length; n++) await sleep(20);
+await sleep(300);
+console.log(JSON.stringify({{ prompts, subscribed, cleanups: [typeof own, typeof shaped] }}));
+process.exit(0);
+"#,
+                plugin.display()
+            ),
+        )
+        .unwrap();
+        let result = run_inbox_driver(&driver);
+        assert_eq!(result["prompts"], serde_json::json!(["s1"]), "{result}");
+        assert_eq!(result["subscribed"], false, "{result}");
+        assert_eq!(
+            result["cleanups"],
+            serde_json::json!(["function", "function"]),
+            "{result}"
+        );
+        let written = std::fs::read_to_string(&controls).unwrap_or_default();
+        assert!(
+            !written.contains("call inbox announce"),
+            "mini is the receiver itself, it does not announce: {written}"
+        );
+        assert!(
+            !written.contains("--doorbell-only"),
+            "no doorbell-only receiver replaces mini's: {written}"
+        );
+        assert_eq!(
+            written.matches("call inbox wait").count(),
+            1,
+            "one receiver, mini's: {written}"
+        );
+        assert!(written.contains("\"handed\""), "{written}");
     }
 
     /// PRD #1858: each update of an assistant message appends its usage to
@@ -10601,6 +10778,229 @@ await emit("form.cancelled", { id: "form-2", sessionID: "s1" });"#,
             !written.contains("call inbox announce"),
             "mini is the receiver itself, it does not announce: {written}"
         );
+    }
+
+    /// Run a 2.x mini driver: `body` after the module's `setup` with
+    /// [`FAKE_V2_CTX_JS`] plus `ctx.session.list` answering `sessions` (newest
+    /// first, as `order: "desc"` does) and recording each input in `lists`,
+    /// under a server whose parent's argv is `opencode mini <client_args>`.
+    /// The driver's last stdout line, parsed, and the recorder's controls.
+    #[cfg(target_os = "linux")]
+    fn run_v2_mini_driver(client_args: &str, body: &str) -> (serde_json::Value, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let (recorder, controls) = inbox_recorder(dir.path());
+        let plugin = dir.path().join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                "import pluginModule from {plugin};\n{FAKE_V2_CTX_JS}\nconst lists = [];\nlet sessions = [];\nctx.session.list = async (input) => {{ lists.push(input); return {{ data: sessions, cursor: {{}} }}; }};\nconst now = Date.now();\nprocess.argv.push(\"serve\", \"--stdio\");\n{body}\nprocess.exit(0);\n",
+                plugin = serde_json::to_string(&plugin.display().to_string()).unwrap(),
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("mini"),
+            format!("node '{}'\n", driver.display()),
+        )
+        .unwrap();
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("exec -a opencode sh mini {client_args}"))
+            .current_dir(dir.path())
+            .envs(crate::test_isolation::unreachable_endpoints())
+            .env("DOT_AGENT_DECK_PANE_ID", "pane-1")
+            .env("DOT_AGENT_DECK_PANE_CAPABILITY", "a".repeat(64))
+            .env("DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS", "3600000")
+            .output()
+            .expect("run node");
+        assert!(out.status.success(), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let result = serde_json::from_str(stdout.lines().last().unwrap_or("null")).unwrap();
+        (
+            result,
+            std::fs::read_to_string(&controls).unwrap_or_default(),
+        )
+    }
+
+    /// Scenario (PRD #2050, inbox/opencode/020 on 2.2.5): a fresh `opencode
+    /// mini` created its session before the deck's server plugin subscribed,
+    /// so no `session.created` reaches the plugin. A message the deck hands
+    /// over still starts in mini's session: the plugin finds it the way mini
+    /// does — the newest root session of the directory created since this
+    /// server started — and passes over an older root and a newer subagent
+    /// session. Mini's own session appears in the listing only after the
+    /// message arrives, and is found on a later look.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opencode_v2_mini_delivers_into_the_session_it_started_with() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let (result, written) = run_v2_mini_driver(
+            "",
+            r#"sessions = [
+  { id: "ses_child", parentID: "ses_mini", time: { created: now + 5 }, location: { directory: "/work" } },
+  { id: "ses_old", time: { created: now - 3600000 }, location: { directory: "/work" } },
+];
+const cleanup = await pluginModule.setup(ctx);
+await sleep(700);
+const early = prompts.length;
+sessions = [sessions[0], { id: "ses_mini", time: { created: now }, location: { directory: "/work" } }, sessions[1]];
+for (let n = 0; n < 150 && !prompts.length; n++) await sleep(20);
+await sleep(100);
+await cleanup();
+console.log(JSON.stringify({ early, prompts, lists }));"#,
+        );
+        assert_eq!(result["early"], 0, "no older root is mini's: {result}");
+        let prompts = result["prompts"].as_array().cloned().unwrap_or_default();
+        assert_eq!(prompts.len(), 1, "{result}");
+        assert_eq!(prompts[0]["sessionID"], "ses_mini", "{result}");
+        assert_eq!(
+            result["lists"][0],
+            serde_json::json!({"directory": "/work", "parentID": null, "limit": 20, "order": "desc"}),
+            "{result}"
+        );
+        assert!(written.contains("\"handed\""), "{written}");
+    }
+
+    /// Scenario (PRD #2050): `opencode mini --session <id>` shows that session
+    /// and `--continue` the newest root session of the directory, which is
+    /// where the deck's message starts when the plugin saw neither created.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opencode_v2_mini_delivers_into_a_named_or_continued_session() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let body = r#"sessions = [
+  { id: "ses_newest", time: { created: now - 60000 }, location: { directory: "/work" } },
+  { id: "ses_older", time: { created: now - 3600000 }, location: { directory: "/work" } },
+];
+const cleanup = await pluginModule.setup(ctx);
+for (let n = 0; n < 150 && !prompts.length; n++) await sleep(20);
+await sleep(100);
+await cleanup();
+console.log(JSON.stringify({ prompts, lists: lists.length }));"#;
+        for (args, expected) in [
+            ("--session ses_named", "ses_named"),
+            ("-s ses_named", "ses_named"),
+            ("--continue", "ses_newest"),
+        ] {
+            let (result, _) = run_v2_mini_driver(args, body);
+            let prompts = result["prompts"].as_array().cloned().unwrap_or_default();
+            assert_eq!(prompts.len(), 1, "{args}: {result}");
+            assert_eq!(prompts[0]["sessionID"], expected, "{args}: {result}");
+        }
+    }
+
+    /// Scenario (PRD #2050, inbox/opencode/016 on 2.2.5): the person has an
+    /// unsent draft on OpenCode 2's home screen when the deck hands over a
+    /// message. The TUI half stashes the draft with OpenCode's own
+    /// `prompt.stash`, opens a new session for the message, and once that
+    /// session's composer is reachable pops the draft into it, so the draft
+    /// survives as on 1.x. With no draft, nothing is stashed or popped.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_tui_carries_the_home_draft_into_the_new_session() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        for draft in ["DRAFT-KEEP-71b3", ""] {
+            let dir = tempfile::tempdir().unwrap();
+            let (recorder, controls) = inbox_recorder(dir.path());
+            let plugin = dir.path().join("tui.mjs");
+            std::fs::write(&plugin, tui_v2_template(&recorder.to_string_lossy())).unwrap();
+            let driver = dir.path().join("driver.mjs");
+            std::fs::write(
+                &driver,
+                format!(
+                    r#"const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const prompts = [];
+const navigations = [];
+const dispatched = [];
+const handlers = new Map();
+let route = {{ type: "home" }};
+// The composers: home's, then the new session's, which mounts a few looks
+// after navigating (measured: about 0.1 s), and OpenCode's stash.
+const composer = {{ home: {draft}, session: "" }};
+const stash = [];
+let looksSinceNavigate = 0;
+const mounted = () => route.type === "home" ? "home" : (++looksSinceNavigate > 3 ? "session" : undefined);
+const api = {{
+  data: {{
+    session: {{ get: (id) => ({{ id }}) }},
+    on: (type, fn) => {{ handlers.set(type, fn); return () => handlers.delete(type); }},
+  }},
+  keymap: {{
+    mode: {{ current: () => "base" }},
+    commands: () => {{
+      const where = mounted();
+      const list = [{{ id: "session.new" }}];
+      if (route.type === "session") list.push({{ id: "session.compact" }});
+      if (where) {{
+        list.push({{ id: "prompt.stash", enabled: !!composer[where] }});
+        list.push({{ id: "prompt.stash.pop", enabled: stash.length > 0 }});
+      }}
+      return list;
+    }},
+    dispatch: (id) => {{
+      dispatched.push(id);
+      const where = mounted();
+      if (!where) return;
+      if (id === "prompt.stash" && composer[where]) {{ stash.push(composer[where]); composer[where] = ""; }}
+      if (id === "prompt.stash.pop" && stash.length) composer[where] = stash.pop();
+    }},
+  }},
+  ui: {{ router: {{
+    current: () => route,
+    navigate: (to) => {{ navigations.push(to.sessionID); route = to; looksSinceNavigate = 0; }},
+  }} }},
+  client: {{ session: {{
+    create: async () => ({{ id: "fresh" }}),
+    prompt: async (input) => {{ prompts.push(input); return {{ id: "inbox-1", sessionID: input.sessionID, type: "user" }}; }},
+  }} }},
+}};
+const {{ default: mod }} = await import("{plugin}");
+const cleanup = await mod.setup(api);
+for (let n = 0; n < 150 && !prompts.length; n++) await sleep(20);
+await sleep(200);
+cleanup?.();
+console.log(JSON.stringify({{ prompts, navigations, dispatched, composer, stash }}));
+process.exit(0);
+"#,
+                    draft = serde_json::to_string(draft).unwrap(),
+                    plugin = plugin.display()
+                ),
+            )
+            .unwrap();
+            let result = run_inbox_driver(&driver);
+            assert_eq!(
+                result["navigations"],
+                serde_json::json!(["fresh"]),
+                "{result}"
+            );
+            let prompts = result["prompts"].as_array().cloned().unwrap_or_default();
+            assert_eq!(prompts.len(), 1, "{result}");
+            assert_eq!(prompts[0]["sessionID"], "fresh", "{result}");
+            assert_eq!(result["stash"], serde_json::json!([]), "{result}");
+            if draft.is_empty() {
+                assert_eq!(result["dispatched"], serde_json::json!([]), "{result}");
+            } else {
+                assert_eq!(
+                    result["dispatched"],
+                    serde_json::json!(["prompt.stash", "prompt.stash.pop"]),
+                    "{result}"
+                );
+                assert_eq!(result["composer"]["session"], draft, "{result}");
+            }
+            let written = std::fs::read_to_string(&controls).unwrap_or_default();
+            assert!(written.contains("\"handed\""), "{written}");
+        }
     }
 
     /// OpenCode 2.x's TUI half, driven with a fake 2.x TUI API: a message the
