@@ -18,11 +18,16 @@ import shlex
 import shutil
 import signal
 import struct
+import subprocess
 import sys
 import termios
 import time
 
 SHA = '4f4178ce41d83e23341ebfbaecdbcf8ea6bf7baea0690025abe49eeec3a5d01d'
+PINS = {
+    '2.1.310': 'b73676430af12f97316a798b8371f81d640f90a58bdcb8f3ce56a835bb47df56',
+    '2.1.312': SHA,
+}
 H, E, L, R, BS, D, K = '\x1b[H', '\x1b[F', '\x1b[D', '\x1b[C', '\x7f', '\x1b[3~', '\x15'
 CASES = [
     ('reviewer', ['ab', '\n', '  ', H, K, H, BS, D, D, K]),
@@ -63,6 +68,7 @@ class Recorder:
         self.screen = pyte.Screen(cols, rows)
         self.stream = pyte.ByteStream(self.screen)
         self.lines, self.keys = [], []
+        self.frames = {}
         self.fd = None
 
     def size(self, rows, cols):
@@ -105,7 +111,9 @@ class Recorder:
 
     def snap(self, name):
         self.points[name] = len(self.raw)
-        return {'text': self.text(), 'cursor': [self.screen.cursor.y, self.screen.cursor.x], 'off': len(self.raw)}
+        frame = {'text': self.text(), 'cursor': [self.screen.cursor.y, self.screen.cursor.x], 'off': len(self.raw)}
+        self.frames[name] = frame
+        return frame
 
     def reset(self):
         self.send('reset')
@@ -126,6 +134,42 @@ class Recorder:
         self.pump(1)
         self.snap('empty')
         assert self.modes[-1]['bits'] == [False, False], self.modes
+        if kind == 'menus':
+            for name, key in [('slash', '/'), ('at', '@'), ('bang', '!')]:
+                self.send(key)
+                self.pump(1)
+                self.snap(name)
+                self.send('\x1b')
+                self.pump(.3)
+                self.send('\x15')
+                self.pump(.3)
+            self.send('\x03')
+            self.pump(.2)
+            self.snap('exit-warning')
+            self.pump(3)
+            # This is a real transcript echo, blocked before any model turn.
+            quotation = ('Quoted UI phrases: Your conversation moved to the background; '
+                         'describe a task for a new session; Press Ctrl-C again to exit; '
+                         '/help; @file; ! shell mode.')
+            self.lines.append(quotation)
+            self.send(quotation)
+            self.pump(.5)
+            self.send('\r')
+            self.wait(lambda: (self.out / 'hook.jsonl').exists())
+            self.pump(1)
+            self.snap('quotation-echo')
+            self.send('\x15')
+            self.pump(.5)
+            self.snap('transcript-quotation')
+            self.send(L)
+            self.pump(.3)
+            if 'Press ← again to open agents' in self.text():
+                self.send(L)
+            self.wait(lambda: any(row.startswith('❯') and 'describe a task for a new session' in row
+                                  for row in self.screen.display))
+            self.pump(.5)
+            self.snap('overview')
+            return
         if kind == 'startup':
             for sample in range(200):
                 self.pump(.1)
@@ -240,10 +284,11 @@ class Recorder:
                  'read_lens': [r['len'] for r in self.reads], 'points': self.points,
                  'edges': self.edges, 'lines': self.lines}
         (self.out / 'index.json').write_text(json.dumps(index, indent=2))
-        result = {'sha256': SHA, 'pid': pid, 'error': error, 'reads': self.reads,
+        result = {'sha256': self.sha256, 'release': self.release, 'pid': pid, 'error': error, 'reads': self.reads,
                   'executable': self.executable, 'model': 'haiku',
                   'events': self.events, 'modes': self.modes, 'keys': self.keys}
         (self.out / 'result.json').write_text(json.dumps(result, indent=2))
+        (self.out / 'frames.json').write_text(json.dumps(self.frames, indent=2, ensure_ascii=False))
 
 
 def main():
@@ -258,9 +303,14 @@ def main():
     assert home.name == 'home' and home.parent == Path.cwd().resolve(), 'requires TuiDeck private HOME'
     assert Path(os.environ['DOT_AGENT_DECK_ATTACH_SOCKET']).parent == home.parent, 'requires private endpoint'
     binary = Path(shutil.which('claude')).resolve(strict=True)
-    assert hashlib.sha256(binary.read_bytes()).hexdigest() == SHA, 'executable pin changed'
+    digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+    assert digest in (PINS.values() if kind == 'menus' else [SHA]), 'executable pin changed'
+    release = subprocess.check_output([str(binary), '--version'], text=True).split()[0]
+    expected = PINS[release] if kind == 'menus' else SHA
+    assert digest == expected, 'executable pin changed'
     recorder = Recorder(out, rows, cols)
     recorder.executable = str(binary)
+    recorder.release, recorder.sha256 = release, expected
     # Only the harness's disposable HOME is writable by this controller.
     settings = home / '.claude/settings.json'
     hook = ' '.join(shlex.quote(x) for x in [sys.executable, str(Path(__file__).resolve()), '--block-hook', str(out)])
@@ -295,7 +345,7 @@ def main():
                 break
             time.sleep(.02)
         os.close(fd)
-        assert hashlib.sha256(binary.read_bytes()).hexdigest() == SHA, 'executable pin changed'
+        assert hashlib.sha256(binary.read_bytes()).hexdigest() == expected, 'executable pin changed'
         recorder.save(child, error)
 
 
