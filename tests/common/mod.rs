@@ -6499,7 +6499,10 @@ pub fn check_opencode_available() -> Result<(), String> {
     install_credential_redaction();
     // PRD #2050: the binary `DOT_AGENT_DECK_OPENCODE_TEST_BIN` picks, and its
     // version read once, so every gated test learns which command line to use.
-    if opencode_test_bin().is_none_or(|bin| !cli_invocable(&bin.to_string_lossy())) {
+    let Some(bin) = opencode_test_bin() else {
+        return Err(opencode_test_bin_missing());
+    };
+    if !cli_invocable(&bin.to_string_lossy()) {
         return Err(format!(
             "OpenCode CLI not installed (could not invoke `opencode --version`; \
              {OPENCODE_TEST_BIN_ENV} names another binary)"
@@ -6597,7 +6600,29 @@ fn opencode_model_probe() -> Result<(), String> {
     // plugins, and the only measured probe hang on 2.2.5 (65 s,
     // `status_blocked_023`) happened with that service holding its port.
     let bin = opencode_test_bin().ok_or("OpenCode CLI not installed")?;
+    // PRD #2050: a data directory of the probe's own, holding only a copy of
+    // the host's OpenCode credentials. The probe used to write its session into
+    // the developer's real `~/.local/share/opencode`, and that directory is one
+    // major's: OpenCode 1.18.35 refuses a database 2.x has migrated (`Database
+    // is not empty and has no session table`, measured), so with
+    // `DOT_AGENT_DECK_OPENCODE_TEST_BIN` pointing at a 1.x the probe failed on a
+    // machine whose PATH OpenCode is 2.x. 2.x imports the copied `auth.json`
+    // into its fresh database (`import_legacy_credentials`, measured).
+    let data = harness_tempdir()
+        .map_err(|e| format!("could not create the OpenCode probe data directory: {e}"))?;
+    match import_opencode_credentials_from(&host_home(), data.path()) {
+        Ok(_) => {}
+        // No auth file: an env key may authorise the model, and otherwise the
+        // probe's own failure names what is missing.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "could not stage OpenCode credentials for the probe: {e}"
+            ));
+        }
+    }
     let mut child = std::process::Command::new(bin)
+        .env("XDG_DATA_HOME", data.path().join(".local").join("share"))
         .args(opencode_run_args(OPENCODE_PROBE_PROMPT))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(out))
@@ -7198,6 +7223,8 @@ pub fn opencode_test_model() -> &'static str {
 /// curl installer writes to the same `~/.opencode/bin/opencode` the 1.x one
 /// did, so whichever is on `PATH` is only one of the two. An absolute path, or
 /// a name looked up on `PATH`; unset or empty means `opencode` from `PATH`.
+/// The value [`OPENCODE_TEST_BIN_V1`] names the pinned OpenCode 1.x that
+/// `scripts/box/bootstrap.sh` installs off `PATH`.
 ///
 /// It reaches a real-agent pane through [`opencode_test_bin_dir`]: a directory
 /// holding an `opencode` link to the chosen binary, which
@@ -7208,27 +7235,76 @@ pub fn opencode_test_model() -> &'static str {
 /// `opencode` on its `PATH` must keep finding the stub.
 pub const OPENCODE_TEST_BIN_ENV: &str = "DOT_AGENT_DECK_OPENCODE_TEST_BIN";
 
+/// The [`OPENCODE_TEST_BIN_ENV`] value naming the pinned OpenCode 1.x
+/// ([`OPENCODE_PINNED_V1`]), so a run on the 1.x half needs no path:
+/// `DOT_AGENT_DECK_OPENCODE_TEST_BIN=v1 cargo test-e2e-live <filter>`.
+pub const OPENCODE_TEST_BIN_V1: &str = "v1";
+
+/// Where `scripts/box/bootstrap.sh` installs the pinned OpenCode 1.x, off
+/// `PATH`, relative to the home directory (PRD #2050). OpenCode 2's installer
+/// owns `~/.opencode/bin/opencode`, so the 1.x half lives here.
+pub const OPENCODE_PINNED_V1: &str = ".local/share/dot-agent-deck/opencode-1/bin/opencode";
+
 /// The OpenCode binary [`OPENCODE_TEST_BIN_ENV`] selects, resolved to a path:
 /// the variable's value (looked up on `PATH` when it has no `/`), else the
 /// first `opencode` on `PATH`. `None` when nothing resolves, which the
-/// preflights report as "OpenCode CLI not installed".
+/// preflights report with [`opencode_test_bin_missing`].
 pub fn opencode_test_bin() -> Option<&'static Path> {
     static BIN: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     BIN.get_or_init(|| {
-        let chosen = std::env::var(OPENCODE_TEST_BIN_ENV)
-            .ok()
-            .map(|raw| raw.trim().to_string())
-            .filter(|raw| !raw.is_empty())
-            .unwrap_or_else(|| "opencode".to_string());
-        if chosen.contains('/') {
-            let path = PathBuf::from(&chosen);
-            return path.is_file().then_some(path);
-        }
-        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .map(|dir| dir.join(&chosen))
-            .find(|candidate| candidate.is_file())
+        resolve_opencode_test_bin(
+            &opencode_test_bin_choice(),
+            &host_home(),
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )
     })
     .as_deref()
+}
+
+/// [`OPENCODE_TEST_BIN_ENV`]'s value, trimmed; `opencode` when unset or empty.
+fn opencode_test_bin_choice() -> String {
+    std::env::var(OPENCODE_TEST_BIN_ENV)
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+        .unwrap_or_else(|| "opencode".to_string())
+}
+
+/// [`opencode_test_bin`]'s resolution with its inputs passed in: `v1` is the
+/// pinned 1.x under `home`, a value with a `/` is a path, and anything else is
+/// a name looked up on `path`. Only an existing file resolves.
+pub(crate) fn resolve_opencode_test_bin(
+    chosen: &str,
+    home: &Path,
+    path: &std::ffi::OsStr,
+) -> Option<PathBuf> {
+    if chosen == OPENCODE_TEST_BIN_V1 {
+        let pinned = home.join(OPENCODE_PINNED_V1);
+        return pinned.is_file().then_some(pinned);
+    }
+    if chosen.contains('/') {
+        let path = PathBuf::from(chosen);
+        return path.is_file().then_some(path);
+    }
+    std::env::split_paths(path)
+        .map(|dir| dir.join(chosen))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Why [`opencode_test_bin`] found nothing, for a preflight's `SKIP:`: for
+/// `v1`, where the pinned 1.x belongs and the script that installs it.
+pub fn opencode_test_bin_missing() -> String {
+    if opencode_test_bin_choice() == OPENCODE_TEST_BIN_V1 {
+        format!(
+            "the pinned OpenCode 1.x that {OPENCODE_TEST_BIN_ENV}={OPENCODE_TEST_BIN_V1} names is \
+             not installed at ~/{OPENCODE_PINNED_V1}; install it with scripts/box/bootstrap.sh"
+        )
+    } else {
+        format!(
+            "OpenCode CLI not installed (no `opencode` on PATH, or {OPENCODE_TEST_BIN_ENV} names \
+             a binary that does not exist)"
+        )
+    }
 }
 
 /// Parse what `opencode --version` prints into `(major, minor, patch)`: 2.x
@@ -7255,9 +7331,7 @@ pub fn opencode_test_version() -> Result<(u32, u32, u32), String> {
         std::sync::OnceLock::new();
     VERSION
         .get_or_init(|| {
-            let bin = opencode_test_bin().ok_or_else(|| {
-                format!("OpenCode CLI not installed (no `opencode` on PATH and no {OPENCODE_TEST_BIN_ENV})")
-            })?;
+            let bin = opencode_test_bin().ok_or_else(opencode_test_bin_missing)?;
             let output = std::process::Command::new(bin)
                 .arg("--version")
                 .current_dir(std::env::temp_dir())
@@ -7343,6 +7417,21 @@ pub fn path_with_opencode_test_bin(path: &str) -> String {
         .to_string_lossy()
         .into_owned()
 }
+
+/// What an interactive OpenCode shows once a prompt typed into it can be
+/// submitted: its mode line (`Build auto · <model>` under the full TUI's
+/// composer on both majors, `Build · <model>` in 2.x mini's footer, ` BUILD `
+/// in 1.x `--mini`, so compare case-blind there), which follows the
+/// composer's `Ask anything` placeholder by about 0.2 s. Wait for it before
+/// typing.
+///
+/// PRD #2050, measured on OpenCode 2.2.5 in a raw PTY outside the deck: a
+/// prompt typed the moment `Ask anything` appeared, then submitted once it was
+/// on screen, was dropped with no session written in 2 of 3 trials (and in
+/// `inbox/opencode/016`, `018`, `019`, `status/blocked/023` and
+/// `telemetry/otlp/007`, which typed at that moment); gated on this line, 6 of
+/// 6 were submitted. 1.x draws the line too (uppercase in `--mini`).
+pub const OPENCODE_SUBMIT_READY: &str = "Build";
 
 /// The command line that starts an interactive OpenCode on [`opencode_test_model`]
 /// for whichever major version [`opencode_test_bin`] is, with `extra` appended

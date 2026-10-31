@@ -2818,6 +2818,42 @@ fn opencode_version_parser_reads_both_majors_and_refuses_noise() {
     assert_eq!(parse_opencode_version("ERROR Unrecognized flag"), None);
 }
 
+/// Scenario: Resolve the OpenCode test-binary knob against a scratch home and
+/// PATH. `v1` names the pinned 1.x under the home only once that file exists,
+/// a path names itself, and a bare name is found on PATH; nothing else
+/// resolves.
+#[test]
+fn opencode_test_bin_resolves_v1_to_the_pinned_install() {
+    let home = race_safe_tempdir();
+    let bin_dir = race_safe_tempdir();
+    let path = std::ffi::OsString::from(bin_dir.path());
+    assert_eq!(
+        resolve_opencode_test_bin(OPENCODE_TEST_BIN_V1, home.path(), &path),
+        None,
+        "v1 resolves only once the pinned 1.x is installed"
+    );
+    let pinned = home.path().join(OPENCODE_PINNED_V1);
+    std::fs::create_dir_all(pinned.parent().unwrap()).expect("pinned dir");
+    std::fs::write(&pinned, "").expect("pinned binary");
+    assert_eq!(
+        resolve_opencode_test_bin(OPENCODE_TEST_BIN_V1, home.path(), &path),
+        Some(pinned.clone())
+    );
+    assert_eq!(
+        resolve_opencode_test_bin(&pinned.to_string_lossy(), home.path(), &path),
+        Some(pinned)
+    );
+    assert_eq!(
+        resolve_opencode_test_bin("opencode", home.path(), &path),
+        None
+    );
+    std::fs::write(bin_dir.path().join("opencode"), "").expect("PATH binary");
+    assert_eq!(
+        resolve_opencode_test_bin("opencode", home.path(), &path),
+        Some(bin_dir.path().join("opencode"))
+    );
+}
+
 /// Scenario: Import a synthetic OpenCode auth file while a hostile host config
 /// sits beside it. Only auth is copied, a minimal isolated config naming only
 /// the test model is created, and the imported token is registered for

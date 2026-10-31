@@ -82,6 +82,9 @@ impl OpenCode {
         let root = deck.home_dir().join(".config/opencode");
         if !watcher {
             std::fs::write(root.join("tui.json"), "{}").unwrap();
+            // OpenCode 2.x reads no `tui.json` entry: its TUI half is a
+            // `plugins/<name>/` directory (PRD #2050).
+            let _ = std::fs::remove_dir_all(root.join("plugins/dot-agent-deck-tui"));
         }
         // Observe the actual route and expose navigation for the child-view
         // precondition. This fixture neither delivers nor acknowledges tasks.
@@ -272,6 +275,16 @@ export default {id:'deck-test-route',tui:async(api)=>{
             observer: Some(observer),
         };
         result.wait_screen("Ask anything");
+        // Case-blind: 1.x `--mini` prints its mode line as ` BUILD `.
+        assert!(
+            common::wait_until(BUDGET, || result
+                .screen()
+                .to_lowercase()
+                .contains(&common::OPENCODE_SUBMIT_READY.to_lowercase())),
+            "OpenCode must show its mode line ({:?}) before a prompt is typed; {}",
+            common::OPENCODE_SUBMIT_READY,
+            result.evidence()
+        );
         result
             .startup
             .trace
@@ -429,7 +442,17 @@ export default {id:'deck-test-route',tui:async(api)=>{
     }
     pub fn prompt(&self, text: &str) {
         let mut input = self.input(text);
-        self.wait_screen(text);
+        // A prompt longer than the composer is wide wraps across its rows
+        // (inbox/opencode/060's sentinel path does at 140 columns), so a plain
+        // substring check of the screen never finds it.
+        assert!(
+            common::wait_until(BUDGET, || {
+                let shown = self.screen();
+                shown.contains(text) || composer::composer_has_prompt(&shown, text)
+            }),
+            "OpenCode's composer must show {text:?}; {}",
+            self.evidence()
+        );
         input.write("\r");
     }
     pub fn prior(&self) {
@@ -862,40 +885,15 @@ export default {id:'deck-test-route',tui:async(api)=>{
             .and_then(|s| serde_json::from_slice(&s).ok())
             .unwrap_or(Value::Null)
     }
+    /// OpenCode's own record of every session, as `session`, `message` and
+    /// `part` arrays in OpenCode 1.x's shape, whichever major wrote it.
     pub fn transcript(&self) -> Value {
-        // OpenCode 1.x keeps `session`/`message`/`part`; 2.x has none of them
-        // and keeps `session_v2`/`session_message`/`session_part` instead
-        // (measured on 2.2.5, PRD #2050). A table this version lacks is left
-        // out rather than failing, because `evidence()` reads this on every
-        // failure and a panic here would hide the assertion that failed. The
-        // readers of the 1.x keys still find nothing on 2.x until ported.
-        let script = r#"import json,sqlite3,sys
-c=sqlite3.connect(sys.argv[1]);c.row_factory=sqlite3.Row
-out={}
-have={r[0] for r in c.execute("select name from sqlite_master where type='table'")}
-for table in ('session','message','part','session_v2','session_message','session_part'):
- if table not in have: continue
- rows=[]
- for row in c.execute('select * from '+table):
-  r=dict(row)
-  if isinstance(r.get('data'),str):
-   try:r['data']=json.loads(r['data'])
-   except ValueError:pass
-  rows.append(r)
- out[table]=rows
-print(json.dumps(out))
-"#;
-        let output = Command::new("python3")
-            .args(["-c", script])
-            .arg(
-                self.deck
-                    .home_dir()
-                    .join(".local/share/opencode/opencode.db"),
-            )
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "transcript: {output:?}");
-        serde_json::from_slice(&output.stdout).unwrap()
+        transcript_of(
+            &self
+                .deck
+                .home_dir()
+                .join(".local/share/opencode/opencode.db"),
+        )
     }
     pub fn roots(&self) -> Vec<Value> {
         self.transcript()["session"]
@@ -972,6 +970,95 @@ impl Drop for OpenCode {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.save_diagnostics()));
         eprintln!("OpenCode run diagnostics: {}", self.diagnostics.display());
     }
+}
+
+/// Read OpenCode's database at `db` into `session`, `message` and `part`
+/// arrays shaped as OpenCode 1.x stores them, so the readers above stay
+/// version-blind (PRD #2050).
+///
+/// OpenCode 1.x keeps exactly those tables. 2.x has none of them: it keeps
+/// `session_v2`, and `session_message` rows whose `type` is the role (`user`,
+/// `assistant`, plus bookkeeping rows such as `idle`) with the user's text in
+/// `data.text` and an assistant's parts inline in `data.content`. Measured on
+/// 2.2.5 in a throwaway HOME: `session_part` stayed empty through a turn with
+/// a subagent and a running `sleep`, a running tool is written into its
+/// message as `state.status: "running"` and rewritten when it completes, the
+/// shell tool is named `shell` with its output in `state.content[].text`, and
+/// no row links an assistant message to the user message it answers. So the
+/// 2.x rows are mapped: `type` becomes `data.role`; an assistant's `parentID`
+/// is the latest user message before it in its session by `seq`; `shell`
+/// becomes `bash` with its text output as `state.output`; a model
+/// `{id, providerID}` gains 1.x's `modelID`; and a user message, which
+/// carries no model on 2.x, takes the model of the first reply to it, else
+/// its session's. The raw 2.x tables stay in the output for diagnostics.
+///
+/// A missing database or table reads as empty rather than failing:
+/// `evidence()` reads this on every failure, and a panic here would hide the
+/// assertion that failed.
+pub fn transcript_of(db: &std::path::Path) -> Value {
+    let script = r#"import json,os,sqlite3,sys
+out={'session':[],'message':[],'part':[]}
+if not os.path.exists(sys.argv[1]):
+ print(json.dumps(out));sys.exit(0)
+c=sqlite3.connect(sys.argv[1]);c.row_factory=sqlite3.Row
+def load(v):
+ if isinstance(v,str):
+  try:return json.loads(v)
+  except ValueError:pass
+ return v
+have={r[0] for r in c.execute("select name from sqlite_master where type='table'")}
+for table in ('session','message','part','session_v2','session_message','session_part'):
+ if table not in have: continue
+ rows=[]
+ for row in c.execute('select * from '+table):
+  r=dict(row)
+  for k in ('data','model'):
+   if k in r: r[k]=load(r[k])
+  rows.append(r)
+ out[table]=rows
+def model(m):
+ if not isinstance(m,dict): return m
+ m=dict(m);m.setdefault('modelID',m.get('id'));return m
+if 'session_v2' in have and 'session' not in have:
+ out['session']=[dict(s) for s in out['session_v2']]
+ by_session={s['id']:model(s.get('model')) for s in out['session_v2']}
+ rows=sorted((m for m in out.get('session_message',[]) if m['type'] in ('user','assistant')),key=lambda m:(m['session_id'],m['seq']))
+ last_user={};messages=[];parts=[]
+ for m in rows:
+  d=m['data'] if isinstance(m['data'],dict) else {}
+  nd={k:v for k,v in d.items() if k not in ('content','text','files')}
+  nd['role']=m['type']
+  if 'model' in nd: nd['model']=model(nd['model'])
+  if m['type']=='user': last_user[m['session_id']]=m['id']
+  else: nd['parentID']=last_user.get(m['session_id'])
+  messages.append({'id':m['id'],'session_id':m['session_id'],'seq':m['seq'],'time_created':m['time_created'],'time_updated':m['time_updated'],'data':nd})
+  base={'message_id':m['id'],'session_id':m['session_id'],'time_created':m['time_created']}
+  if m['type']=='user':
+   parts.append(dict(base,id=m['id']+'/0',data={'type':'text','text':d.get('text') or ''}))
+   continue
+  for i,item in enumerate(d.get('content') or []):
+   if not isinstance(item,dict): continue
+   data=dict(item)
+   if item.get('type')=='tool':
+    state=dict(item.get('state') or {})
+    state.setdefault('output',''.join(x.get('text','') for x in state.get('content') or [] if isinstance(x,dict)))
+    name=item.get('name')
+    data={'type':'tool','tool':'bash' if name=='shell' else name,'callID':item.get('id'),'state':state}
+   parts.append(dict(base,id=item.get('id') or m['id']+'/'+str(i),data=data))
+ for u in messages:
+  if u['data']['role']!='user' or u['data'].get('model'): continue
+  reply=next((a for a in messages if a['data'].get('parentID')==u['id'] and a['data'].get('model')),None)
+  u['data']['model']=reply['data']['model'] if reply else by_session.get(u['session_id'])
+ out['message']=messages;out['part']=parts
+print(json.dumps(out))
+"#;
+    let output = Command::new("python3")
+        .args(["-I", "-c", script])
+        .arg(db)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "transcript: {output:?}");
+    serde_json::from_slice(&output.stdout).unwrap()
 }
 
 fn completed_reply(transcript: &Value, id: &str) -> Option<String> {
@@ -1205,6 +1292,79 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(250),
             "diagnostic observer teardown must be bounded, took {elapsed:?}"
+        );
+    }
+
+    /// Scenario: Build a database in OpenCode 2.x's layout, with rows shaped as
+    /// 2.2.5 writes them (a root and a child session, a user prompt, a shell tool
+    /// turn and a stop), and read it. The transcript must come back in 1.x's
+    /// `session`/`message`/`part` shape with roles, `parentID`, `bash` and the
+    /// model filled in; a missing database must read as empty.
+    #[test]
+    fn transcript_reads_opencode_2_rows_in_the_1x_shape() {
+        let scratch = common::harness_tempdir().expect("transcript fixture");
+        assert_eq!(
+            transcript_of(&scratch.path().join("absent.db")),
+            json!({"session":[],"message":[],"part":[]})
+        );
+        let db = scratch.path().join("opencode.db");
+        let seed = r#"import sqlite3,sys,json
+c=sqlite3.connect(sys.argv[1])
+c.execute('create table session_v2 (id text primary key, parent_id text, model text, time_created integer)')
+c.execute('create table session_message (id text primary key, session_id text, type text, seq integer, time_created integer, time_updated integer, data text)')
+c.execute('create table session_part (message_id text, session_id text, ordinal integer, type text, data text)')
+m=json.dumps({"id":"big-pickle","providerID":"opencode","variant":"default"})
+c.execute("insert into session_v2 values ('root',null,?,1)",(m,))
+c.execute("insert into session_v2 values ('child','root',?,2)",(m,))
+rows=[('u1','root','user',4,{"text":"run it","files":[]}),
+ ('a1','root','assistant',5,{"model":json.loads(m),"finish":"tool-calls","content":[{"type":"tool","id":"call_1","name":"shell","state":{"status":"completed","input":{"command":"echo hi"},"content":[{"type":"text","text":"hi\n"}]}}]}),
+ ('a2','root','assistant',9,{"model":json.loads(m),"finish":"stop","content":[{"type":"text","text":"927"}]}),
+ ('i1','root','idle',10,{"outcome":"succeeded"})]
+for (i,s,t,q,d) in rows:
+ c.execute('insert into session_message values (?,?,?,?,?,?,?)',(i,s,t,q,q,q,json.dumps(d)))
+c.commit()
+"#;
+        let output = Command::new("python3")
+            .args(["-I", "-c", seed])
+            .arg(&db)
+            .output()
+            .expect("seed the 2.x fixture database");
+        assert!(output.status.success(), "seed: {output:?}");
+        let transcript = transcript_of(&db);
+        let sessions = transcript["session"].as_array().unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(
+            sessions
+                .iter()
+                .any(|s| s["id"] == "child" && s["parent_id"] == "root")
+        );
+        let messages = transcript["message"].as_array().unwrap();
+        assert_eq!(
+            messages.iter().map(|m| m["id"].clone()).collect::<Vec<_>>(),
+            [json!("u1"), json!("a1"), json!("a2")],
+            "only user and assistant rows are messages: {transcript}"
+        );
+        assert_eq!(messages[0]["data"]["role"], "user");
+        assert_eq!(messages[0]["data"]["model"]["providerID"], "opencode");
+        assert_eq!(messages[0]["data"]["model"]["modelID"], "big-pickle");
+        assert_eq!(messages[2]["data"]["parentID"], "u1");
+        assert_eq!(messages[2]["data"]["finish"], "stop");
+        let parts = transcript["part"].as_array().unwrap();
+        assert!(parts.iter().any(
+            |p| p["message_id"] == "u1" && p["data"] == json!({"type":"text","text":"run it"})
+        ));
+        let tool = parts
+            .iter()
+            .find(|p| p["data"]["type"] == "tool")
+            .expect("the shell call is a tool part");
+        assert_eq!(tool["id"], "call_1");
+        assert_eq!(tool["data"]["tool"], "bash");
+        assert_eq!(tool["data"]["state"]["input"]["command"], "echo hi");
+        assert_eq!(tool["data"]["state"]["output"], "hi\n");
+        assert!(
+            parts.iter().any(
+                |p| p["message_id"] == "a2" && p["data"] == json!({"type":"text","text":"927"})
+            )
         );
     }
 

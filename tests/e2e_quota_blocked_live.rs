@@ -133,9 +133,10 @@ fn status_blocked_022_real_claude_api_failure_ends_error_not_thinking() {
     assert_error_card(&viewer, name);
 }
 
-/// Scenario: Start a genuine interactive OpenCode session with an unsupported
-/// model, submit one prompt, and observe the real plugin's session.error as an
-/// Error event and Error card. The non-quota failure must not show Blocked.
+/// Scenario: Start a genuine interactive OpenCode session whose provider rejects
+/// the turn (an unsupported model on 1.x, a rejected API key on 2.x), submit
+/// one prompt, and observe the real plugin's error as an Error event and Error
+/// card. The non-quota failure must not show Blocked.
 #[spec("status/blocked/023")]
 #[test]
 fn status_blocked_023_real_opencode_api_error_is_forwarded_not_blocked() {
@@ -151,15 +152,24 @@ fn status_blocked_023_real_opencode_api_error_is_forwarded_not_blocked() {
 
     let events = viewer.subscribe_events();
     let name = "opencode-err";
-    // An unsupported model is the error this test provokes. OpenCode 2.x's
-    // top-level `opencode` takes no `--model`, so on 2.x it goes in the scratch
-    // HOME's `opencode.json`, which is where 2.x reads an interactive model
-    // from (PRD #2050, `common::opencode_interactive_command`).
+    // An unsupported model is the error this test provokes on 1.x. OpenCode
+    // 2.x's top-level `opencode` takes no `--model`, so on 2.x the model goes
+    // in the scratch HOME's `opencode.json` (PRD #2050,
+    // `common::opencode_interactive_command`) — and there 2.x does not fail on
+    // a model it cannot use: it answered the turn (measured on 2.2.5). So on
+    // 2.x the provider is handed a key it rejects, which fails the turn with
+    // a non-quota `provider.auth` 401 (measured: `finish: "error"`, idle
+    // outcome `failed`) and spends nothing. The deck forwards no
+    // `OPENAI_API_KEY` to a pane (`INHERIT_PASS`).
     const UNSUPPORTED: &str = "openai/gpt-5.4-mini";
     let command = if common::opencode_test_is_v2() {
         std::fs::write(
             viewer.home_dir().join(".config/opencode/opencode.json"),
-            serde_json::json!({ "model": UNSUPPORTED }).to_string(),
+            serde_json::json!({
+                "model": UNSUPPORTED,
+                "provider": {"openai": {"options": {"apiKey": "sk-rejected-status-blocked-023"}}},
+            })
+            .to_string(),
         )
         .expect("point the scratch OpenCode config at the unsupported model");
         common::opencode_interactive_command(false, false, "")
@@ -168,7 +178,9 @@ fn status_blocked_023_real_opencode_api_error_is_forwarded_not_blocked() {
     };
     let agent_id = start_agent(&control, &viewer, name, &command);
     let composer_wait = std::time::Instant::now();
-    let composer = control.wait_for_grid_string_within("Ask anything", Duration::from_secs(45));
+    let composer = control.wait_for_grid_string_within("Ask anything", Duration::from_secs(45))
+        && control
+            .wait_for_grid_string_within(common::OPENCODE_SUBMIT_READY, Duration::from_secs(45));
     eprintln!(
         "OpenCode composer ready={composer} after {:?}",
         composer_wait.elapsed()

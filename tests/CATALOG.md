@@ -1176,7 +1176,7 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 
 ##### status/blocked/023 — A real OpenCode API failure ends as Error (issue #714).
 - **Layer:** L2, lane 2, PTY-attached (`tests/e2e_quota_blocked_live.rs`).
-- **Agent:** real interactive OpenCode with a listed model that this account's provider rejects with HTTP 400; developer credentials required.
+- **Agent:** real interactive OpenCode whose provider rejects the turn: on 1.x a listed model this account's provider rejects with HTTP 400; on 2.x, which answers on another model instead of failing on one it cannot use, a rejected API key in the scratch `opencode.json` (HTTP 401, `provider.auth`). Developer credentials required.
 - **Asserts:** a submitted prompt produces an Error event through the installed plugin and a rendered Error card, never Blocked. Then waits for the `Idle` events OpenCode sends as the failed run ends and requires the card to still read Error for 3 s afterwards (issue #1493 controls found them repainting it Idle; `status/blocked/027` pins the rule at L1).
 - **Does not assert:** a real quota-exhausted account.
 - **Platform coverage:** mac+linux.
@@ -12539,56 +12539,56 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 
 ##### inbox/opencode/015 — Real idle OpenCode receives a native delegate in its shown session. [reel]
 - **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_inbox_opencode_live.rs`).
-- **Agent:** interactive OpenCode 1.18.35, Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
+- **Agent:** interactive OpenCode 1.x or 2.x (`DOT_AGENT_DECK_OPENCODE_TEST_BIN`), Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
 - **Asserts:** Idle with a prior prompt, same shown session, visible framed message and reply, exact sentinel, plugin-confirmed acknowledgement.
 - **Does not assert:** Fresh-home routing and busy queues.
 - **Cost:** cheap real-agent turns, sequential locally with strict preflight.
 
 ##### inbox/opencode/016 — Real OpenCode /new keeps a draft and leaves the old session unchanged.
 - **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_inbox_opencode_live.rs`).
-- **Agent:** interactive OpenCode 1.18.35, Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
+- **Agent:** interactive OpenCode 1.x or 2.x (`DOT_AGENT_DECK_OPENCODE_TEST_BIN`), Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
 - **Asserts:** New shown session, retained composer draft, unchanged old messages, sentinel and acknowledgement.
 - **Does not assert:** A model change made on home before any prompt.
 - **Cost:** cheap real-agent turns, sequential locally with strict preflight.
 
 ##### inbox/opencode/017 — Real fresh OpenCode avoids three older roots and uses the argv model.
 - **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_inbox_opencode_live.rs`).
-- **Agent:** interactive OpenCode 1.18.35, Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
+- **Agent:** interactive OpenCode 1.x or 2.x (`DOT_AGENT_DECK_OPENCODE_TEST_BIN`), Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
 - **Asserts:** Three real seeded roots remain unchanged; a fourth shown root uses the argv test model and executes the task.
 - **Does not assert:** Provider defaults when argv has no model.
 - **Cost:** cheap real-agent turns, sequential locally with strict preflight.
 
 ##### inbox/opencode/018 — Real busy OpenCode shows QUEUED and executes native delegates in order.
 - **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_inbox_opencode_live.rs`).
-- **Agent:** interactive OpenCode 1.18.35, Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
-- **Asserts:** A genuine slow tool followed by a delegate, visible QUEUED, exact append order and acknowledgement.
+- **Agent:** interactive OpenCode 1.x or 2.x (`DOT_AGENT_DECK_OPENCODE_TEST_BIN`), Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
+- **Asserts:** A genuine slow tool followed by a delegate, visible QUEUED (1.x only: 2.x draws no such label), exact append order and acknowledgement.
 - **Does not assert:** Escape cancellation and ack-wait redelivery.
 - **Cost:** cheap real-agent turns, sequential locally with strict preflight.
 
 ##### inbox/opencode/019 — A real OpenCode child view returns to the root to execute a delegate.
 - **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_inbox_opencode_live.rs`).
-- **Agent:** interactive OpenCode 1.18.35, Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
+- **Agent:** interactive OpenCode 1.x or 2.x (`DOT_AGENT_DECK_OPENCODE_TEST_BIN`), Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
 - **Asserts:** A genuine subagent child, actual child-view precondition, navigation to root, visible reply, sentinel and no task in the child.
 - **Does not assert:** Manual navigation shortcuts; a test observer invokes the real route API for setup.
 - **Cost:** cheap real-agent turns, sequential locally with strict preflight.
 
 ##### inbox/opencode/020 — Real OpenCode mini redraws native work without losing a draft.
 - **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_inbox_opencode_live.rs`).
-- **Agent:** interactive OpenCode 1.18.35, Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
+- **Agent:** interactive OpenCode 1.x or 2.x (`DOT_AGENT_DECK_OPENCODE_TEST_BIN`), Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
 - **Asserts:** Native mini component, ID-correlated frame and assembled execution token visible in both terminal views without further input, a completed tool result for that delivery, retained draft in both views, exact sentinel, `acknowledged` / `plugin_confirmed` / one delivery and the delivered card; the busy footer disappears from both views within ten seconds after genuine Idle.
 - **Does not assert:** A model-generated final reply or a long transcript's redraw latency.
 - **Cost:** cheap real-agent turns, sequential locally with strict preflight.
 
 ##### inbox/opencode/021 — Real OpenCode respawns a killed inbox watcher and delivers natively.
 - **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_inbox_opencode_live.rs`).
-- **Agent:** interactive OpenCode 1.18.35, Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
+- **Agent:** interactive OpenCode 1.x or 2.x (`DOT_AGENT_DECK_OPENCODE_TEST_BIN`), Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
 - **Asserts:** Only the captured pane-owned watcher is killed; a new watcher arms and the next delegate visibly completes without a doorbell.
 - **Does not assert:** Pi or OpenCode process crash cleanup.
 - **Cost:** cheap real-agent turns, sequential locally with strict preflight.
 
 ##### inbox/opencode/022 — Real unarmed OpenCode intercepts a doorbell before the model.
 - **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_inbox_opencode_live.rs`).
-- **Agent:** interactive OpenCode 1.18.35, Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
+- **Agent:** interactive OpenCode 1.x or 2.x (`DOT_AGENT_DECK_OPENCODE_TEST_BIN`), Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
 - **Asserts:** An explicitly cancellable request reaches Thinking with a real running `bash` `sleep 30` call visible in both views before one logical Esc, 300 ms, Esc interrupt produces a genuine Idle and settled empty composer; no deck TUI watcher, genuine doorbell, server-plugin fetch bound to its doorbell-only receiver, ID-correlated frame and assembled execution token visible in both views, sentinel, `plugin_confirmed` / one delivery and a delivered card; interception before the model, with no model-side inbox fetch, restarted `sleep 30` or completion reply marker requested by the priming prompt through observed execution.
 - **Does not assert:** Cancellation of arbitrary earlier requests: this proves delivery and execution after an explicitly cancellable request; the deck does not cancel arbitrary earlier requests. Also excludes a completed natural-language final reply, future model behavior after execution, remote attach or non-TUI OpenCode commands.
 - **Cost:** cheap real-agent turns, sequential locally with strict preflight.
@@ -12596,7 +12596,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 ##### inbox/opencode/060 — Real interactive OpenCode 2.x shows status and tool detail on its card and runs a delegate. [reel]
 - **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_inbox_opencode_live.rs`), through `tests/support/opencode_inbox_live.rs`.
 - **Agent:** interactive OpenCode 2.x (`opencode --standalone --auto`, the model from the scratch HOME's `opencode.json`), `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins. Skips unless `DOT_AGENT_DECK_OPENCODE_TEST_BIN` (or the `opencode` on `PATH`) is 2.x.
-- **Asserts:** a typed prompt that writes a uniquely named sentinel with the shell turns the card Working, arrives as an OpenCode prompt event and a ToolStart whose detail names the sentinel, shows that detail on the card, writes the sentinel, and ends in an Idle event with the card reading Idle and still showing the prompt; then a genuine orchestrator delegate is acted on (a second sentinel), reads acknowledged, and the card settles Idle.
+- **Asserts:** a typed prompt that writes a uniquely named sentinel with the shell (a path relative to the project, so the deck's shortened tool detail still names it) turns the card Working, arrives as an OpenCode prompt event and a ToolStart whose detail names the sentinel, shows that detail on the card, writes the sentinel, and ends in an Idle event with the card reading Idle and still showing the prompt; then a genuine orchestrator delegate is acted on (a second sentinel), reads acknowledged, and the card settles Idle.
 - **Does not assert:** Blocked, question forms, `mini`, busy queues, telemetry operations, or the desktop app's rendering of the same card.
 - **Cost:** cheap real-agent turns, sequential locally with strict preflight.
 

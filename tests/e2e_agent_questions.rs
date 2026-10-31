@@ -333,6 +333,7 @@ fn question_live_005_opencode_permission_and_multiselect_reply() {
     let sentinel = deck.workdir().join("question_opencode_542c01e8.txt");
     let id = agent_id(&deck);
     visible(&deck, "Ask anything");
+    visible(&deck, common::OPENCODE_SUBMIT_READY);
     submit(
         &deck,
         &format!(
@@ -352,7 +353,17 @@ fn question_live_005_opencode_permission_and_multiselect_reply() {
         ["Allow once", "Allow always", "Reject"]
     );
     visible(&deck, "Allow once");
-    visible(&deck, "Allow always");
+    // OpenCode's own dialog: 2.x labels the second option `Always allow`
+    // (measured on 2.2.5) where 1.x said `Allow always`; the deck's labels
+    // asserted above are the deck's, not OpenCode's.
+    visible(
+        &deck,
+        if common::opencode_test_is_v2() {
+            "Always allow"
+        } else {
+            "Allow always"
+        },
+    );
     assert!(!sentinel.exists());
     assert_eq!(
         answer(&deck, &id, &q, vec![selection(0, &[1])]),

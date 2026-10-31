@@ -101,7 +101,7 @@ fn opencode_017_live_fresh_launch_avoids_older_roots_and_uses_argv_model() {
     );
 }
 
-/// Scenario: While OpenCode executes a slow real shell tool, delegate an append task. The TUI must show QUEUED and the delegated task must append only after the current tool, then visibly reply and acknowledge the inbox delivery.
+/// Scenario: While OpenCode executes a slow real shell tool, delegate an append task. The TUI must show QUEUED (OpenCode 1.x; 2.x draws no such label) and the delegated task must append only after the current tool, then visibly reply and acknowledge the inbox delivery.
 #[spec("inbox/opencode/018")]
 #[test]
 fn opencode_018_live_busy_delegates_show_queued_and_execute_in_order() {
@@ -116,7 +116,13 @@ fn opencode_018_live_busy_delegates_show_queued_and_execute_in_order() {
         "Use the shell to run exactly: printf '1\\n' >> '{}/order.txt'. Then reply FIRST-DONE.",
         path.display()
     ));
-    op.wait_screen("QUEUED");
+    // OpenCode 1.x labels a prompt waiting behind a running turn `QUEUED`;
+    // 2.x draws no such label (measured on 2.2.5: no "queue" text on screen
+    // after a second prompt was submitted mid-turn), so on 2.x the order the
+    // work lands in below is what shows the task waited.
+    if !common::opencode_test_is_v2() {
+        op.wait_screen("QUEUED");
+    }
     common::wait_for_file_trimmed_eq(&path.join("order.txt"), "0\n1", BUDGET)
         .unwrap_or_else(|why| panic!("queued order: {why}; {}", op.evidence()));
     op.wait_reply(&first);
@@ -290,12 +296,14 @@ fn opencode_060_live_opencode_2_shows_status_and_runs_a_delegate() {
                 || event.pane_id.as_deref() == Some(pane.as_str()))
     };
 
-    // A prompt the user types, as they would in the pane.
+    // A prompt the user types, as they would in the pane. The path is
+    // relative to OpenCode's working directory (the project) so the command
+    // names the sentinel within the deck's shortened tool detail, which an
+    // absolute scratch path pushes past its cut.
     const PROMPTED: &str = "opencode2-prompt-5e81b4.txt";
     let prompt = format!(
-        "Use the shell to run exactly: printf '{}' > '{}'; sleep 3. Then reply DONE and end your turn.",
+        "Use the shell to run exactly: printf '{}' > {PROMPTED}; sleep 3. Then reply DONE and end your turn.",
         live::CONTENT,
-        op.work.join(PROMPTED).display()
     );
     op.prompt(&prompt);
     op.deck.send_bytes(b"\x04");
