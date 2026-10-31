@@ -123,6 +123,7 @@ pub mod login_shell;
 // PRD #1223 M2: what the daemon reports about itself to a new-agent form.
 pub mod new_agent_options;
 pub mod opencode_manage;
+pub mod opencode_version;
 // Issue #1947: finding and messaging an orchestration's orchestrator.
 pub mod orchestrator_address;
 pub mod orchestrator_context;
