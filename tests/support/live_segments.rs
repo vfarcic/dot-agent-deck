@@ -131,6 +131,11 @@ impl Fixture {
             // Same bytes, name and claimed argv; a different kernel executable.
             fs::copy(&exe, &fake).unwrap();
             fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+            // An undeclared wrapper may claim either agent through its hook.
+            // Give the saved launch PATH independent native identities for both.
+            let other = native.join(if kind == "codex" { "claude" } else { "codex" });
+            fs::copy(&exe, &other).unwrap();
+            fs::set_permissions(&other, fs::Permissions::from_mode(0o700)).unwrap();
         }
         fs::write(
             native.join("composer_external_edit.py"),
@@ -205,9 +210,8 @@ impl Fixture {
         );
         let command = if self.launcher.is_some() {
             format!(
-                "{} {}",
-                quote(&self.exe.parent().unwrap().join("launcher")),
-                quote(&self.exe)
+                "{} --discovery-fixture",
+                quote(&self.exe.parent().unwrap().join("launcher"))
             )
         } else {
             format!("{} --live-segments-fixture", quote(&self.exe))
@@ -250,6 +254,7 @@ impl Fixture {
             .expect("installed synthetic generation");
         self.instance = PathBuf::from(ready["instance"].as_str().unwrap());
         if self.launcher.is_none() {
+            assert_eq!(ready["exe"], json!(self.exe), "native exec acknowledgement");
             self.wait_screen();
         }
     }
@@ -490,6 +495,9 @@ impl Fixture {
         r["id"].as_str().expect("queued message id").into()
     }
     pub fn hook_event(&self, event: &str) {
+        self.hook_event_as(event, self.kind);
+    }
+    pub fn hook_event_as(&self, event: &str, claimed_kind: &str) {
         let pid = read_json(&self.path("ready"))["pid"].as_u64().unwrap();
         let initial = fs::read(format!("/proc/{pid}/environ")).unwrap();
         let token = initial
@@ -497,12 +505,12 @@ impl Fixture {
             .find_map(|e| e.strip_prefix(b"DOT_AGENT_DECK_PANE_CAPABILITY="))
             .map(|v| std::str::from_utf8(v).unwrap())
             .expect("own native fixture capability");
-        let session = if self.kind == "codex" {
+        let session = if claimed_kind == "codex" {
             format!("{}-session", self.agent)
         } else {
             format!("segment-session-{}", self.generation)
         };
-        let request = json!({"session_id":session,"pane_id":PANE,"agent_id":self.agent,"token":token,"deck_build":"","event_type":event,"agent_type":if self.kind=="codex" {"codex"} else {"claude_code"},"timestamp":chrono::Utc::now(),"cwd":self.daemon.home,"metadata":{}});
+        let request = json!({"session_id":session,"pane_id":PANE,"agent_id":self.agent,"token":token,"deck_build":"","event_type":event,"agent_type":if claimed_kind=="codex" {"codex"} else {"claude_code"},"timestamp":chrono::Utc::now(),"cwd":self.daemon.home,"metadata":{}});
         let mut stream = inbox::connect(&self.daemon, &request).into_inner();
         stream.shutdown(std::net::Shutdown::Write).unwrap();
         use std::io::Read;
