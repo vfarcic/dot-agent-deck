@@ -11,8 +11,11 @@
 //!
 //! What this module does NOT do: see through a wrapper. A command whose
 //! program is not an OpenCode binary (`devbox run oc-big`, `env FOO=1
-//! opencode`) is [`SpawnTarget::Wrapper`]: its version is unknown, and its
-//! argv is never rewritten.
+//! opencode`) is [`SpawnTarget::Wrapper`]: its version is unknown at spawn,
+//! and its argv is never rewritten. The `opencode` its PATH resolves to is
+//! probed too ([`probe_path_opencode`]), so that once the daemon's watch sees
+//! the pane's client run that very file, its version is known
+//! ([`recorded_version`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -109,13 +112,15 @@ impl FileKey {
 
 /// One cached answer: the file identity it was asked of, what the binary
 /// said (`None` when it said nothing usable, so a binary that cannot report
-/// its version is not asked on every spawn), and when it was stored, for
-/// eviction.
+/// its version is not asked on every spawn), when it was stored, for
+/// eviction, and, for a probe that did not complete, when the answer stops
+/// counting ([`PROBE_FAILURE_TTL`]).
 #[derive(Debug, Clone)]
 struct Entry {
     key: FileKey,
     version: Option<Version>,
     stored: u64,
+    expires: Option<std::time::Instant>,
 }
 
 /// Cached answers, by resolved binary path, at most [`MAX_CACHE_ENTRIES`].
@@ -127,6 +132,16 @@ struct VersionCache {
 
 impl VersionCache {
     fn insert(&mut self, path: PathBuf, key: FileKey, version: Option<Version>) {
+        self.insert_expiring(path, key, version, None);
+    }
+
+    fn insert_expiring(
+        &mut self,
+        path: PathBuf,
+        key: FileKey,
+        version: Option<Version>,
+        expires: Option<std::time::Instant>,
+    ) {
         self.stored += 1;
         let stored = self.stored;
         self.entries.insert(
@@ -135,6 +150,7 @@ impl VersionCache {
                 key,
                 version,
                 stored,
+                expires,
             },
         );
         while self.entries.len() > MAX_CACHE_ENTRIES {
@@ -165,32 +181,54 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// The most of `--version`'s output the probe reads.
 const PROBE_OUTPUT_LIMIT: u64 = 4096;
 
+/// How long a probe that did not complete (it could not be started, failed,
+/// or ran out of time) stands for the binary's answer before it is asked
+/// again (review F4/F5): long enough that a binary whose `--version` hangs
+/// does not hold up every spawn by [`PROBE_TIMEOUT`], short enough that one
+/// that timed out on a loaded machine is asked again soon.
+const PROBE_FAILURE_TTL: Duration = Duration::from_secs(60);
+
 /// The version of the binary at `path`, from the cache when its file
 /// identity is unchanged, otherwise from `probe` (which runs it). `None`
 /// when the file cannot be read, the probe did not complete, or its output
 /// is not a version.
 ///
 /// `probe` answers the binary's output when it ran to a successful exit, and
-/// `None` when it could not be started, failed or timed out. Only a completed
-/// run is cached: a probe that timed out on a loaded machine is asked again
-/// on the next spawn rather than leaving the binary's version unknown for the
-/// daemon's lifetime.
+/// `None` when it could not be started, failed or timed out. A completed run
+/// is cached for the file's life; one that did not complete only for
+/// [`PROBE_FAILURE_TTL`], so a probe that timed out on a loaded machine is
+/// asked again a minute later rather than leaving the binary's version
+/// unknown for the daemon's lifetime, and a binary that hangs costs one
+/// timeout a minute rather than one per spawn.
 pub fn detect_with(path: &Path, probe: impl FnOnce(&Path) -> Option<String>) -> Option<Version> {
+    detect_with_at(path, std::time::Instant::now(), probe)
+}
+
+/// [`detect_with`], as of `now`.
+fn detect_with_at(
+    path: &Path,
+    now: std::time::Instant,
+    probe: impl FnOnce(&Path) -> Option<String>,
+) -> Option<Version> {
     let key = FileKey::of(path)?;
     {
         let cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(entry) = cache.as_ref().and_then(|c| c.entries.get(path))
             && entry.key == key
+            && entry.expires.is_none_or(|expires| now < expires)
         {
             return entry.version;
         }
     }
-    let output = probe(path)?;
-    let version = parse_version(&output);
+    let output = probe(path);
     let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-    cache
-        .get_or_insert_with(VersionCache::default)
-        .insert(path.to_path_buf(), key, version);
+    let cache = cache.get_or_insert_with(VersionCache::default);
+    let Some(output) = output else {
+        cache.insert_expiring(path.to_path_buf(), key, None, Some(now + PROBE_FAILURE_TTL));
+        return None;
+    };
+    let version = parse_version(&output);
+    cache.insert(path.to_path_buf(), key, version);
     version
 }
 
@@ -201,9 +239,9 @@ pub fn detect(path: &Path, path_env: Option<&std::ffi::OsStr>) -> Option<Version
 
 /// PRD #2050, audit M1: the version a spawn-time probe recorded for the file
 /// `exe` is, matched by file identity rather than path, so a client found
-/// through a symlink or another path to the same file is still known. Never
-/// runs anything: a binary the deck did not probe as it started an agent
-/// (one a wrapper or a tool started) is `None`, an unknown version.
+/// through a symlink or another path to the same file is still known, for
+/// whichever pane's spawn probed it. Never runs anything: a file no spawn
+/// probed is `None`, an unknown version.
 pub fn recorded_version(exe: &Path) -> Option<Version> {
     let key = FileKey::of(exe)?;
     let cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
@@ -211,7 +249,7 @@ pub fn recorded_version(exe: &Path) -> Option<Version> {
         .as_ref()?
         .entries
         .values()
-        .filter(|entry| entry.key == key)
+        .filter(|entry| entry.key == key && entry.version.is_some())
         .max_by_key(|entry| entry.stored)
         .and_then(|entry| entry.version)
 }
@@ -221,8 +259,9 @@ pub fn recorded_version(exe: &Path) -> Option<Version> {
 /// started, fails or times out. Blocking: callers run it off the async
 /// executor.
 ///
-/// The probe runs with a minimal environment (`PATH`, the child's, so an npm
-/// launcher finds `node`; `HOME`), from `/`, in a process group of its own.
+/// The probe runs with a minimal environment (`PATH`, the child's, so a
+/// launcher script finds what it runs; `HOME`), from `/`, in a process group
+/// of its own.
 /// Its output is read on a separate thread joined against the deadline, so a
 /// descendant that keeps the pipe open cannot hold the spawn past the
 /// timeout, and on a timeout the whole group is killed.
@@ -257,7 +296,15 @@ fn run_version_within(
     }
     let mut child = command.spawn().ok()?;
     let deadline = std::time::Instant::now() + timeout;
-    let stdout = child.stdout.take()?;
+    let Some(stdout) = child.stdout.take() else {
+        kill_probe(&mut child);
+        return None;
+    };
+    // The reader ends at EOF, when every process holding the pipe has closed
+    // it. A descendant that left the probe's process group (`setsid`) while
+    // holding it escapes the group kill below and keeps this thread blocked
+    // until it exits: one thread per such probe, which the failure record
+    // ([`PROBE_FAILURE_TTL`]) limits to one a minute per binary.
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut out = Vec::new();
@@ -265,33 +312,85 @@ fn run_version_within(
         let _ = tx.send(read.map(|_| out));
     });
     let exited = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if std::time::Instant::now() < deadline => {
+        match leader_exited(&mut child) {
+            Ok(true) => break true,
+            Ok(false) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(20));
             }
-            _ => break None,
+            Ok(false) => break false,
+            // The leader's state cannot be read: it is not signalled, since
+            // its pid may no longer be its own.
+            Err(_) => return None,
         }
     };
-    let output = exited.and_then(|status| {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        let out = rx.recv_timeout(remaining).ok()?.ok()?;
-        status
-            .success()
-            .then(|| String::from_utf8_lossy(&out).into_owned())
-    });
-    if output.is_none() {
+    if !exited {
+        // Out of time, the leader still running or unreaped: its pid is still
+        // the group's id, so the group is the probe's own.
         kill_probe(&mut child);
+        return None;
     }
-    output
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    match rx.recv_timeout(remaining) {
+        Ok(read) => {
+            // EOF with the leader gone: nothing of the probe's holds the pipe,
+            // so nothing is signalled, only the leader reaped.
+            let status = child.wait().ok()?;
+            let out = read.ok()?;
+            status
+                .success()
+                .then(|| String::from_utf8_lossy(&out).into_owned())
+        }
+        Err(_) => {
+            // The leader exited but a descendant still holds the pipe. The
+            // leader is not reaped yet ([`leader_exited`] leaves it a zombie),
+            // so its pid still names the group, and the group is killed
+            // before it is reaped.
+            kill_probe(&mut child);
+            None
+        }
+    }
 }
 
-/// Kill a probe that ran out of time, with every process in its group.
+/// Whether the probe's leader has exited, leaving it unreaped, so its pid
+/// (and with it the process group's id) cannot be reissued until
+/// [`kill_probe`] or `wait` reaps it (audit L3, review F5).
+#[cfg(unix)]
+fn leader_exited(child: &mut std::process::Child) -> std::io::Result<bool> {
+    let pid = libc::id_t::try_from(child.id()).map_err(std::io::Error::other)?;
+    // SAFETY: a zeroed `siginfo_t` is a valid out-parameter for `waitid`,
+    // which only writes into it; `si_pid` reads the field `waitid` filled
+    // (it stays 0 when no child changed state, per POSIX for `WNOHANG`).
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let rc = libc::waitid(
+            libc::P_PID,
+            pid,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        );
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(info.si_pid() != 0)
+    }
+}
+
+/// Elsewhere than Unix there are no process groups to keep: whether the
+/// probe exited, reaping it.
+#[cfg(not(unix))]
+fn leader_exited(child: &mut std::process::Child) -> std::io::Result<bool> {
+    child.try_wait().map(|status| status.is_some())
+}
+
+/// Kill a probe whose leader has not been reaped, with every process in its
+/// group, then reap it. Never called once the leader was reaped: its pid could
+/// by then name another process group (review F5).
 fn kill_probe(child: &mut std::process::Child) {
     #[cfg(unix)]
     if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
         // SAFETY: `killpg` takes plain integers; the group is the probe's
-        // own (`process_group(0)` made the child its leader).
+        // own (`process_group(0)` made the child its leader, and the leader
+        // is unreaped, so the id is still the group's).
         unsafe {
             libc::killpg(pgid, libc::SIGKILL);
         }
@@ -333,6 +432,14 @@ impl SpawnTarget {
 /// ships). Anything else starting `opencode` (`opencode-wrapper.sh`,
 /// `opencode-fresh`) is a wrapper of the user's: the deck neither runs it to
 /// ask its version nor rewrites its command (audit L4).
+///
+/// A file with such a name is accepted whatever it holds, a `#!` script
+/// included. Not because of the pinned 1.19.5: its npm `bin` is
+/// `bin/opencode.exe`, which its postinstall hard-links to the native ELF.
+/// Because older npm 1.x installs (1.0.0, read from its tarball) ship
+/// `bin/opencode` as a `#!/bin/sh` launcher that `exec`s the native binary,
+/// and that launcher must still be recognised, so its version is read and its
+/// card can say when it is too old.
 pub fn opencode_name(name: &str) -> bool {
     let name = name.strip_suffix(".exe").unwrap_or(name);
     let Some(rest) = name.strip_prefix("opencode") else {
@@ -416,6 +523,35 @@ pub fn spawn_target_with(
 /// [`spawn_target_with`], asking the real binary.
 pub fn spawn_target(command: Option<&str>, path_env: Option<&std::ffi::OsStr>) -> SpawnTarget {
     spawn_target_with(command, path_env, |program| detect(program, path_env))
+}
+
+/// PRD #2050 (review F2): for a spawn whose command is a wrapper, the file
+/// `opencode` resolves to on `spawn_path` (the PATH the deck hands the
+/// wrapper), else on `fallback_path` (the daemon's login-shell PATH), asked
+/// `--version` through `detect` (cached by file identity, like a direct
+/// spawn's probe). The deck chooses that file, as it chooses a direct
+/// command's, so this runs nothing a pane started. Whether the wrapper runs
+/// it is not known here: the daemon's watch counts the answer for a pane's
+/// client only when the client runs that same file
+/// ([`recorded_version`]). `None` when no `opencode` resolves. Blocking.
+pub fn probe_path_opencode_with(
+    spawn_path: Option<&std::ffi::OsStr>,
+    fallback_path: Option<&std::ffi::OsStr>,
+    detect: impl FnOnce(&Path, Option<&std::ffi::OsStr>) -> Option<Version>,
+) -> Option<(PathBuf, Option<Version>)> {
+    let (path, path_env) = resolve_program("opencode", spawn_path)
+        .map(|path| (path, spawn_path))
+        .or_else(|| resolve_program("opencode", fallback_path).map(|path| (path, fallback_path)))?;
+    let version = detect(&path, path_env);
+    Some((path, version))
+}
+
+/// [`probe_path_opencode_with`], asking the real binary.
+pub fn probe_path_opencode(
+    spawn_path: Option<&std::ffi::OsStr>,
+    fallback_path: Option<&std::ffi::OsStr>,
+) -> Option<(PathBuf, Option<Version>)> {
+    probe_path_opencode_with(spawn_path, fallback_path, detect)
 }
 
 /// OpenCode 2.x subcommands that start a session and take `--standalone`
@@ -523,6 +659,13 @@ fn shell_words(command: &str) -> Vec<Word<'_>> {
 
 /// `path` as one shell word: itself when it holds only characters a shell
 /// leaves alone, otherwise single-quoted.
+///
+/// The quoting is POSIX (review F7): correct for sh, bash, zsh, dash and ksh,
+/// which is what `$SHELL -c` runs on the machines the deck supports. Under
+/// fish a backslash inside single quotes is an escape, so a path holding one
+/// changes (though nothing is injected), and shells such as nushell or elvish
+/// parse `'\''` differently. Only a path outside the plain set is quoted at
+/// all, and the registry keeps the configured command, not this rewrite.
 fn shell_quote(path: &str) -> String {
     let plain = !path.is_empty()
         && path.chars().all(|c| {
@@ -673,12 +816,29 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(detect_with(&bin, probe("opencode v2.3.0")), Some((2, 3, 0)));
 
-        // A probe that did not complete (a timeout, a spawn failure) is not
-        // remembered: the next spawn asks again.
+        // A probe that did not complete (a timeout, a spawn failure) stands
+        // for PROBE_FAILURE_TTL: a spawn inside it is not held up by asking
+        // again, and one after it asks again.
         let slow = dir.path().join("opencode-slow");
         std::fs::write(&slow, b"x").unwrap();
-        assert_eq!(detect_with(&slow, |_| None), None);
-        assert_eq!(detect_with(&slow, probe("2.2.5")), Some((2, 2, 5)));
+        let now = std::time::Instant::now();
+        assert_eq!(detect_with_at(&slow, now, |_| None), None);
+        assert_eq!(
+            detect_with_at(&slow, now + PROBE_FAILURE_TTL / 2, |_| panic!(
+                "asked again inside the failure's TTL"
+            )),
+            None
+        );
+        assert_eq!(recorded_version(&slow), None);
+        assert_eq!(
+            detect_with_at(
+                &slow,
+                now + PROBE_FAILURE_TTL + Duration::from_secs(1),
+                probe("2.2.5")
+            ),
+            Some((2, 2, 5))
+        );
+        assert_eq!(recorded_version(&slow), Some((2, 2, 5)));
 
         // A binary that prints no version is remembered as such.
         let silent = dir.path().join("opencode-silent");
@@ -691,6 +851,59 @@ mod tests {
         assert_eq!(
             detect_with(&dir.path().join("missing"), |_| panic!("probed")),
             None
+        );
+    }
+
+    /// Scenario (review F2): a wrapper pane's PATH holds an `opencode`, which
+    /// the deck resolves and asks its version with that PATH; with none on
+    /// the pane's PATH it falls back to the daemon's, and with none on either
+    /// nothing is asked. Only a file named exactly `opencode` is taken.
+    #[cfg(unix)]
+    #[test]
+    fn a_wrapper_panes_path_opencode_is_probed_with_its_own_path() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let pane_bin = dir.path().join("pane");
+        let daemon_bin = dir.path().join("daemon");
+        let empty = dir.path().join("empty");
+        for d in [&pane_bin, &daemon_bin, &empty] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        for d in [&pane_bin, &daemon_bin] {
+            let file = d.join("opencode");
+            crate::test_isolation::write_script(&file, b"x").unwrap();
+            std::fs::set_permissions(
+                &file,
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        std::fs::write(empty.join("opencode-wrapper.sh"), b"x").unwrap();
+        let pane_path = std::env::join_paths([&empty, &pane_bin]).unwrap();
+        let daemon_path = std::env::join_paths([&daemon_bin]).unwrap();
+        let empty_path = std::env::join_paths([&empty]).unwrap();
+        let mut asked = Vec::new();
+        let mut probe = |path: &Path, env: Option<&std::ffi::OsStr>| {
+            asked.push((path.to_path_buf(), env.map(std::ffi::OsStr::to_os_string)));
+            Some((2, 2, 5))
+        };
+        assert_eq!(
+            probe_path_opencode_with(Some(&pane_path), Some(&daemon_path), &mut probe),
+            Some((pane_bin.join("opencode"), Some((2, 2, 5))))
+        );
+        assert_eq!(
+            probe_path_opencode_with(Some(&empty_path), Some(&daemon_path), &mut probe),
+            Some((daemon_bin.join("opencode"), Some((2, 2, 5))))
+        );
+        assert_eq!(
+            probe_path_opencode_with(Some(&empty_path), Some(&empty_path), &mut probe),
+            None
+        );
+        assert_eq!(
+            asked,
+            vec![
+                (pane_bin.join("opencode"), Some(pane_path.clone())),
+                (daemon_bin.join("opencode"), Some(daemon_path.clone())),
+            ]
         );
     }
 
@@ -895,6 +1108,59 @@ printf '%s|%s|%s\n' \"$(pwd)\" \"${HOME:+home}\" \"${DOT_AGENT_DECK_PANE_ID:-non
             ""
         };
         assert_eq!(out.trim(), format!("/|{expected_home}|none"));
+    }
+
+    /// Scenario: a `--version` that fails after starting a background child
+    /// that does not hold its output; the probe returns at once and leaves
+    /// that child alone, since once the probe's leader has exited and its
+    /// output reached EOF nothing of the probe needs stopping (review F5: a
+    /// group kill after the leader is reaped could reach a process that
+    /// reused its pid).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_finished_probe_signals_nothing() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let pid_file = dir.path().join("background.pid");
+        let failing = dir.path().join("opencode");
+        crate::test_isolation::write_script(
+            &failing,
+            format!(
+                "#!/bin/sh
+sleep 30 >/dev/null 2>&1 &
+echo $! > '{}'
+exit 3
+",
+                pid_file.display()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &failing,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+        let path_env = std::ffi::OsString::from("/usr/bin:/bin");
+        let started = std::time::Instant::now();
+        let out = run_version_within(&failing, Some(&path_env), Duration::from_secs(5));
+        assert_eq!(out, None, "a failed probe answers nothing");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "it did not wait for the timeout: {:?}",
+            started.elapsed()
+        );
+        let background: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let state = std::fs::read_to_string(format!("/proc/{background}/stat")).ok();
+        let alive = state.is_some_and(|s| s.split_whitespace().nth(2) != Some("Z"));
+        // SAFETY: plain integers; the background `sleep` this test started.
+        unsafe {
+            libc::kill(background, libc::SIGKILL);
+        }
+        assert!(alive, "the finished probe's group was not signalled");
     }
 
     #[test]
