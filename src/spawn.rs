@@ -4278,6 +4278,7 @@ mod tests {
         tab_membership: Option<TabMembership>,
     ) -> crate::agent_pty::AgentRecord {
         crate::agent_pty::AgentRecord {
+            input_held: None,
             id: "7".into(),
             pane_id_env: pane_id.map(str::to_string),
             display_name: display_name.map(str::to_string),

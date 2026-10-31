@@ -966,6 +966,21 @@ async fn run_tick(
             debug!(pane_id = %pane, agent_id = %agent, "doorbell evidence-refresh nudge");
             registry.nudge_repaint(&agent);
         }
+        // PRD #1666 part 3 (Q35-20): an `Armable` generation whose box was
+        // touched is checked first: the tick submits a probe when one is
+        // due, and rings nothing while a check is outstanding (its fence
+        // would hold the line anyway). No production generation is
+        // `Armable` before activation; whether a ring follows a check stays
+        // today's decision until Q35-21.
+        if matches!(action, Some((Action::Ring { .. }, _)))
+            && registry.composer_probe_tick(&pane, &agent)
+        {
+            let mut slots = slots.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(slot) = slots.get_mut(&(pane.clone(), agent.clone())) {
+                slot.busy = false;
+            }
+            continue;
+        }
         let Some((Action::Ring { id }, covered)) = action else {
             continue;
         };

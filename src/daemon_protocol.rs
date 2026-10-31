@@ -4016,6 +4016,21 @@ pub struct AttachResponse {
     #[cfg(feature = "e2e")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub composer_frontier: Option<ComposerFrontierStatus>,
+    /// PRD #1666 part 3 (Q35-20): the `e2e` build's answer to
+    /// [`AttachRequest::E2eComposerControl`]'s read-only `epoch`.
+    #[cfg(feature = "e2e")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer_epoch: Option<ComposerEpochStatus>,
+    /// PRD #1666 part 3 (Q35-20): the `e2e` build's answer to the read-only
+    /// `observer-status`.
+    #[cfg(feature = "e2e")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer_observer: Option<ComposerObserverStatus>,
+    /// PRD #1666 part 3 (Q35-20): the `e2e` build's answer to
+    /// `probe-request[:retry|:lapse]`.
+    #[cfg(feature = "e2e")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer_probe: Option<ComposerProbeStatus>,
     /// PRD #1589: the answer to [`AttachRequest::CloseAgents`]. `None` on every
     /// other response. A refusal is a report, answered `ok: true`; `ok: false`
     /// is reserved for a request the daemon could not process at all. Additive
@@ -4628,6 +4643,35 @@ pub struct ComposerFenceStatus {
     pub full_waiters: usize,
 }
 
+/// PRD #1666 part 3 (Q35-20): a generation's input epoch, the `e2e` build's
+/// read-only `epoch` answer (R3 §3.1's numbers).
+#[cfg(feature = "e2e")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerEpochStatus {
+    pub epoch: u64,
+    pub observed: u64,
+    pub last_foreign: u64,
+}
+
+/// PRD #1666 part 3 (Q35-20): a generation's observer, the `e2e` build's
+/// read-only `observer-status` answer: its writer scope, `pending`,
+/// `closed` or `open`.
+#[cfg(feature = "e2e")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerObserverStatus {
+    pub scope: String,
+}
+
+/// PRD #1666 part 3 (Q35-20): what a probe request did, the `e2e` build's
+/// `probe-request` answer: `not_due`, `refused`, `written` or `taken_back`.
+#[cfg(feature = "e2e")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerProbeStatus {
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// PRD #1666 part 3 (Q35-20a): a drain-frontier request, the `e2e` build's
 /// `frontier-enqueue` and `frontier-status` answer. `state` is `pending`,
 /// `taken` or `missing`; `offset` is set when it is `taken`.
@@ -4678,6 +4722,9 @@ async fn e2e_composer_control(
 ) -> AttachResponse {
     if operation == "frontier-enqueue" || operation.starts_with("frontier-status:") {
         return e2e_composer_frontier(registry, pane_id, generation, operation);
+    }
+    if matches!(operation, "epoch" | "observer-status") || operation.starts_with("probe-request") {
+        return e2e_composer_probe_control(registry, pane_id, generation, operation).await;
     }
     if !matches!(operation, "fence" | "release" | "fence-status") {
         return e2e_composer_observer_control(registry, pane_id, generation, operation).await;
@@ -4761,6 +4808,99 @@ fn e2e_composer_frontier(
         ok: true,
         composer_frontier: Some(ComposerFrontierStatus::of(&request)),
         ..Default::default()
+    }
+}
+
+/// PRD #1666 part 3 (Q35-20): the probe half of [`e2e_composer_control`],
+/// refused unless `generation` is the pane's current one. `epoch` and
+/// `observer-status` read and change nothing. `probe-request`, with
+/// `:retry` or `:lapse`, asks the production probe path
+/// ([`AgentPtyRegistry::composer_probe`]): the generation's own schedule,
+/// admission when scheduled and at the writer's arm section, the claim, the
+/// arm and its undo. It manufactures no record, ignores no permission and
+/// publishes or fences nothing itself.
+#[cfg(feature = "e2e")]
+async fn e2e_composer_probe_control(
+    registry: &Arc<AgentPtyRegistry>,
+    pane_id: &str,
+    generation: u64,
+    operation: &str,
+) -> AttachResponse {
+    let Some(agent) = registry
+        .pane_current_agent_id(pane_id)
+        .filter(|agent| *agent == generation.to_string())
+    else {
+        return AttachResponse::err("e2e-composer-control: not the pane's current generation");
+    };
+    match operation {
+        "epoch" => {
+            let Some(input) = registry.composer_input(&agent) else {
+                return AttachResponse::err(
+                    "e2e-composer-control: not the pane's current generation",
+                );
+            };
+            let epoch = input.epoch();
+            AttachResponse {
+                ok: true,
+                composer_epoch: Some(ComposerEpochStatus {
+                    epoch: epoch.epoch(),
+                    observed: epoch.observed(),
+                    last_foreign: epoch.last_foreign(),
+                }),
+                ..Default::default()
+            }
+        }
+        "observer-status" => {
+            let Some(input) = registry.composer_input(&agent) else {
+                return AttachResponse::err(
+                    "e2e-composer-control: not the pane's current generation",
+                );
+            };
+            use crate::composer_probe::record::ScopeState;
+            let Some(scope) = input.writer_scope() else {
+                return AttachResponse::err("e2e-composer-control: no observer on that pane");
+            };
+            let scope = match scope.state() {
+                ScopeState::Closed => "closed",
+                ScopeState::Pending => "pending",
+                ScopeState::Open(_) => "open",
+            };
+            AttachResponse {
+                ok: true,
+                composer_observer: Some(ComposerObserverStatus {
+                    scope: scope.to_string(),
+                }),
+                ..Default::default()
+            }
+        }
+        _ => {
+            use crate::agent_pty::{ProbeAsk, ProbeOutcome};
+            let ask = match operation {
+                "probe-request" => ProbeAsk::First,
+                "probe-request:retry" => ProbeAsk::Retry,
+                "probe-request:lapse" => ProbeAsk::Lapse,
+                _ => return AttachResponse::err("e2e-composer-control: unknown operation"),
+            };
+            let (outcome, reason) = match registry.composer_probe(pane_id, &agent, ask).await {
+                ProbeOutcome::NotDue => ("not_due", None),
+                ProbeOutcome::Refused(why) => ("refused", Some(why)),
+                ProbeOutcome::Written => ("written", None),
+                ProbeOutcome::TakenBack => ("taken_back", None),
+                ProbeOutcome::Unavailable => {
+                    return AttachResponse::err(
+                        "e2e-composer-control: no probe-capable generation on that pane",
+                    );
+                }
+            };
+            AttachResponse {
+                ok: true,
+                composer_probe: Some(ComposerProbeStatus {
+                    outcome: outcome.to_string(),
+                    reason,
+                }),
+                ..Default::default()
+            }
+        }
     }
 }
 
@@ -5792,6 +5932,9 @@ async fn handle_connection(
             // PRD #1666 S3: each agent's inbox, after the live join, which
             // decides whether the doorbell can reach it.
             crate::agent_pty::attach_inbox_summaries(&registry, &mut records);
+            // PRD #1666 part 3 (Q35-20): held typing, after the live join,
+            // whose snapshot carries it too.
+            crate::agent_pty::attach_input_held(&registry, &mut records);
             let mut resp = AttachResponse::agent_records(records);
             resp.orchestration_roles = Some(orchestration_roles);
             // Issue #887: the client's only observable of the schedule seed the
@@ -11654,6 +11797,7 @@ mod tests {
             orchestrator_context_path: None,
             authoring_kind: None,
             inbox: None,
+            input_held: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: AgentRecord = serde_json::from_str(&json).unwrap();
@@ -11679,6 +11823,7 @@ mod tests {
             orchestrator_context_path: None,
             authoring_kind: None,
             inbox: None,
+            input_held: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
@@ -11835,6 +11980,7 @@ mod tests {
 
         // (b) An AgentRecord carrying a live snapshot round-trips with live == Some.
         let rec = AgentRecord {
+            input_held: None,
             id: "9".into(),
             pane_id_env: Some("pane-9".into()),
             display_name: None,
@@ -12240,6 +12386,7 @@ mod tests {
             orchestrator_context_path: None,
             authoring_kind: None,
             inbox: None,
+            input_held: None,
         };
         let value: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).expect("serializes"))

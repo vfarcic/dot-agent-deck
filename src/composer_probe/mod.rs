@@ -31,7 +31,7 @@
 //! ([`planner`]), and probe admission: the one predicate every check write
 //! asks ([`admission`]), the probe job's start on the writer thread with the
 //! arm published only inside it, and the retry schedule ([`probe`]), which
-//! nothing calls yet (Q35-20 wires them), and the drain frontier's request
+//! the daemon's probe request and doorbell tick use (Q35-20), and the drain frontier's request
 //! queue and wake ([`frontier`]), which a generation's Linux PTY reader takes
 //! frontiers from, with the check that no other process holds its master
 //! ([`master_holders`], Linux). The daemon feeds the hook every byte an agent writes,
@@ -39,11 +39,13 @@
 //! every spawn, which installs nothing outside the `e2e` build's assumption
 //! until activation. For an installed generation it keeps the invocation
 //! records, settles the permission to arm, answers its helper and observes
-//! it; nothing publishes a liability or closes a fence outside the `e2e`
-//! build's control verb, and nothing reads the epoch or a segment to admit
-//! or hold anything yet. The planner reads the records' liability count, to
-//! cut a person's input while one is out, which in production it never is
-//! before activation.
+//! it. A probe on an `Armable` generation publishes a liability and closes a
+//! fence (Q35-20), and its segments release what the fence held; no
+//! production generation is `Armable` before activation, so in production
+//! only the `e2e` build's assumption reaches any of it. Whether a ring
+//! follows a check still reads today's draft tracking until Q35-21. The
+//! planner reads the records' liability count, to cut a person's input while
+//! one is out.
 
 pub mod admission;
 pub mod arm;

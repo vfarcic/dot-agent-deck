@@ -98,8 +98,15 @@ fn recorder() -> InputRecorder {
 /// op has to be given a number here, and then listed by [`every_op`].
 fn constructor(op: &PtyOp) -> usize {
     match op {
-        PtyOp::Write(_, ByteSource::Deck | ByteSource::User | ByteSource::Answer) => 0,
-        PtyOp::WriteAll(_, ByteSource::Deck | ByteSource::User | ByteSource::Answer, _) => 1,
+        PtyOp::Write(
+            _,
+            ByteSource::Deck | ByteSource::Probe(_) | ByteSource::User | ByteSource::Answer,
+        ) => 0,
+        PtyOp::WriteAll(
+            _,
+            ByteSource::Deck | ByteSource::Probe(_) | ByteSource::User | ByteSource::Answer,
+            _,
+        ) => 1,
         PtyOp::Answer(..) => 2,
         PtyOp::Flush => 3,
         PtyOp::Surrender(_) => 4,
@@ -110,7 +117,12 @@ fn constructor(op: &PtyOp) -> usize {
 /// whether it carries bytes.
 fn every_op(answers: &QuestionAnswers) -> Vec<(String, PtyOp)> {
     let mut ops = Vec::new();
-    for source in [ByteSource::Deck, ByteSource::User, ByteSource::Answer] {
+    for source in [
+        ByteSource::Deck,
+        ByteSource::Probe(crate::composer_probe::epoch::DeckJobId(7)),
+        ByteSource::User,
+        ByteSource::Answer,
+    ] {
         ops.push((
             format!("Write {source:?}"),
             PtyOp::Write(format!("write-{source:?}").into_bytes(), source),
@@ -139,6 +151,7 @@ fn expected_writer(op: &PtyOp) -> Option<Writer> {
     match op {
         PtyOp::Write(_, s) | PtyOp::WriteAll(_, s, _) => Some(match s {
             ByteSource::Deck => Writer::UnnamedDeck,
+            ByteSource::Probe(job) => Writer::Deck(*job),
             ByteSource::User => Writer::Human,
             ByteSource::Answer => Writer::Answer,
         }),
@@ -183,6 +196,13 @@ fn probe_001_every_op_moves_the_epoch_before_the_writer_sees_it() {
             .expect("the writer thread runs");
         let queued = w.input.epoch();
         match writer {
+            // Q35-20: a probe's own byte names its job, so it isn't foreign.
+            Some(Writer::Deck(job)) => {
+                assert_eq!(queued.epoch(), 2, "{label}: moved while still queued");
+                assert_eq!(queued.owner(), Some(job), "{label}: its job named");
+                assert_eq!(queued.last_foreign(), 1, "{label}: not foreign");
+                assert!(queued.touched(), "{label}");
+            }
             Some(_) => {
                 assert_eq!(queued.epoch(), 2, "{label}: moved while still queued");
                 assert_eq!(queued.owner(), None, "{label}: no deck job named");

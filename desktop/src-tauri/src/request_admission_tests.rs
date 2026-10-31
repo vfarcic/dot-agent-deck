@@ -124,6 +124,7 @@ fn replacements() -> [(&'static str, AttachResponse, bool); 3] {
 
 fn listed(id: &str) -> AgentRecord {
     AgentRecord {
+        input_held: None,
         id: id.into(),
         pane_id_env: Some(PANE.into()),
         display_name: None,

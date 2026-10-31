@@ -2028,6 +2028,7 @@ impl DaemonClient {
                 .unwrap_or_default()
                 .into_iter()
                 .map(|id| AgentRecord {
+                    input_held: None,
                     id,
                     pane_id_env: None,
                     display_name: None,
@@ -8434,6 +8435,7 @@ start = true
         // prefers that map over the session's own name — and it was the one
         // string on this record with no scrub here at all.
         let mut rec = AgentRecord {
+            input_held: None,
             id: "9".into(),
             pane_id_env: None,
             display_name: Some(format!("de\x1bplo\u{202e}yer\0 {}", "\u{3bc}".repeat(400))),
@@ -8499,6 +8501,7 @@ start = true
         // TUI's bucketing / tracing never sees control bytes — the
         // agent is still real and lands on the dashboard.
         let mut rec = AgentRecord {
+            input_held: None,
             id: "7".into(),
             pane_id_env: None,
             display_name: None,
@@ -8523,6 +8526,7 @@ start = true
 
         // And a valid record round-trips untouched.
         let mut ok = AgentRecord {
+            input_held: None,
             id: "8".into(),
             pane_id_env: None,
             display_name: None,

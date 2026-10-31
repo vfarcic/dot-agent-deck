@@ -3085,6 +3085,7 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
             if let AttachRequest::ListAgents = req {
                 let over_long = "a".repeat(100_000);
                 let hostile = AgentRecord {
+                    input_held: None,
                     id: "hostile-live-7".into(),
                     pane_id_env: Some("pane-hostile".into()),
                     // Issue #833: hostile in BOTH dimensions, like the live

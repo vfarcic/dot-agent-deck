@@ -4960,6 +4960,7 @@ mod tests {
     /// `Default`); only `cwd` + `tab_membership` matter to `worktree_of_record`.
     fn record(cwd: Option<&str>, membership: Option<TabMembership>) -> AgentRecord {
         AgentRecord {
+            input_held: None,
             id: "a1".into(),
             pane_id_env: None,
             display_name: None,

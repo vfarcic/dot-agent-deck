@@ -244,6 +244,7 @@ async fn handle_connection(
                 .into_iter()
                 .find_map(|(key, value)| (key == "DOT_AGENT_DECK_PANE_ID").then_some(value));
             records.lock().unwrap().push(AgentRecord {
+                input_held: None,
                 id: id.clone(),
                 pane_id_env,
                 display_name,
@@ -338,6 +339,7 @@ fn orchestration_record(
         "worker"
     };
     AgentRecord {
+        input_held: None,
         id: agent_id.to_string(),
         pane_id_env: Some(pane_id.to_string()),
         display_name: Some(format!("{orchestration}-{role_name}")),

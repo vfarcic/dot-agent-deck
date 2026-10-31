@@ -511,6 +511,7 @@ mod tests {
 
     fn record(id: &str, pane_id: &str) -> AgentRecord {
         AgentRecord {
+            input_held: None,
             id: id.into(),
             pane_id_env: Some(pane_id.into()),
             display_name: Some(format!("worker-{id}")),

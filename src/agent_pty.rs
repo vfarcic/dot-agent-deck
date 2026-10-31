@@ -4208,6 +4208,13 @@ pub struct AgentRecord {
         deserialize_with = "lenient_inbox_summary"
     )]
     pub inbox: Option<crate::inbox_hub::InboxSummary>,
+    /// PRD #1666 part 3 (Q35-20, R5 §10.1): the deck is holding what a
+    /// person typed into this generation's pane while it checks the agent's
+    /// input box, on the record whether or not a hook session has reported;
+    /// a live snapshot carries the same value. Additive and optional, the
+    /// [`Self::inbox`] precedent: an older reader ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_held: Option<crate::inbox_display::InputHeld>,
 }
 
 impl AgentRecord {
@@ -4259,6 +4266,19 @@ pub fn attach_prompt_keys(records: &mut [AgentRecord]) {
         record.prompt_keys = record
             .reported_agent_type()
             .and_then(|agent_type| crate::agent_registry::spec(agent_type).prompt_keys.clone());
+    }
+}
+
+/// PRD #1666 part 3 (Q35-20, R5 §10.1): each record's held typing, on the
+/// record and on its live snapshot when it has one. Display only: what it
+/// shows releases nothing.
+pub fn attach_input_held(registry: &AgentPtyRegistry, records: &mut [AgentRecord]) {
+    for record in records {
+        let held = registry.input_held(&record.id);
+        if let Some(live) = record.live.as_mut() {
+            live.input_held = held.clone();
+        }
+        record.input_held = held;
     }
 }
 
@@ -4892,6 +4912,10 @@ pub(crate) struct UserFrame {
     /// gate, and its outcome sent to whoever awaits it. Never cut: an answer
     /// the planner would cut is refused before acceptance.
     answer: Option<HeldAnswer>,
+    /// PRD #1666 part 3 (Q35-20): the input framing at its first byte, as
+    /// the planner read it when the gate took it: what a release reads it
+    /// from to stop short of a candidate.
+    framing: Option<crate::composer_probe::framing::Framing>,
 }
 
 /// PRD #1666 part 3 (Q35-17, core §8.4): what a voice answer's keys carry
@@ -4917,6 +4941,7 @@ impl UserFrame {
             cut: None,
             part: None,
             answer: None,
+            framing: None,
         }
     }
 
@@ -4940,6 +4965,7 @@ impl UserFrame {
         let rest = self.bytes.split_off(cut.at);
         let prefix = std::mem::replace(&mut self.bytes, rest);
         self.cut = crate::composer_probe::planner::next_cut(&cut.resume, &self.bytes);
+        self.framing = Some(cut.resume);
         let taken = prefix.len();
         Cutting::Split(
             UserFrame {
@@ -4949,6 +4975,7 @@ impl UserFrame {
                 cut: None,
                 part: Some(part),
                 answer: None,
+                framing: None,
             },
             taken,
         )
@@ -5237,9 +5264,9 @@ impl PaneWriter {
                 // leaves once, when it is written or refused. Q35-16: a
                 // segment is open, so the planner finds its first cut here,
                 // classified once, and the release reads it.
-                frame.cut = input
-                    .enqueue_planned(Writer::Human, &frame.bytes, Plan::Held)
-                    .cut;
+                let planned = input.enqueue_planned(Writer::Human, &frame.bytes, Plan::Held);
+                frame.cut = planned.cut;
+                frame.framing = planned.framing;
                 in_flight.count.fetch_add(1, Ordering::SeqCst);
             },
         );
@@ -5254,6 +5281,7 @@ impl PaneWriter {
                 match planned.cut {
                     Some(cut) => {
                         frame.cut = Some(cut);
+                        frame.framing = planned.framing;
                         self.hold_cut(frame, len);
                         Accepted::Held
                     }
@@ -5497,9 +5525,9 @@ impl PaneWriter {
                 // As a person's held frame: in flight and its epoch moved
                 // from acceptance. Its candidates were refused above, so
                 // nothing cuts it.
-                frame.cut = input
-                    .enqueue_planned(Writer::Answer, &frame.bytes, Plan::Held)
-                    .cut;
+                let planned = input.enqueue_planned(Writer::Answer, &frame.bytes, Plan::Held);
+                frame.cut = planned.cut;
+                frame.framing = planned.framing;
                 in_flight.count.fetch_add(1, Ordering::SeqCst);
             },
         );
@@ -5580,13 +5608,23 @@ impl PaneWriter {
     ) -> Option<DeckJob> {
         let (tx, done) = oneshot::channel();
         let (refused_tx, refused) = oneshot::channel();
+        let gate = Arc::clone(&self.gate.gate);
         let (claim, _) = self.pty.submit_job(
             PtyOp::WriteAll(bytes, ByteSource::Deck, true),
             PtyReply::Async(tx),
             None,
             claim,
             Acceptance::Now,
-            Some(start_check(deck_line_starts, refused_tx)),
+            Some(start_check(
+                move |ctx| {
+                    // Q35-20 (CX-H): no deck line goes past a closed fence.
+                    if gate.status().fenced {
+                        return Err(DeckLineRefusal::Fenced);
+                    }
+                    deck_line_starts(ctx)
+                },
+                refused_tx,
+            )),
         )?;
         Some(DeckJob {
             claim,
@@ -5692,6 +5730,9 @@ impl Drop for DeckJob {
 #[derive(Debug, Clone, Copy)]
 enum ByteSource {
     Deck,
+    /// PRD #1666 part 3 (Q35-20): a probe's own `0x07`, the deck's, named to
+    /// the epoch as its job's so the probe's settlement can apply.
+    Probe(crate::composer_probe::epoch::DeckJobId),
     User,
     /// PRD #1631: a voice answer's keys — recorded as the user's input (they
     /// are the user's answer) without moving the human-input sequence (audit
@@ -5740,7 +5781,7 @@ impl InputRecorder {
         }
         let clears_before = state.user_clears(pane_id);
         match source {
-            ByteSource::Deck => state.note_deck_bytes(pane_id, accepted),
+            ByteSource::Deck | ByteSource::Probe(_) => state.note_deck_bytes(pane_id, accepted),
             ByteSource::User => state.note_user_bytes(pane_id, accepted),
             ByteSource::Answer => state.note_user_bytes_as(pane_id, accepted, false),
         }
@@ -5757,7 +5798,7 @@ impl InputRecorder {
         // intervention; the deck's own never are.
         let telemetry = state.telemetry.clone();
         drop(state);
-        let human = !matches!(source, ByteSource::Deck);
+        let human = !matches!(source, ByteSource::Deck | ByteSource::Probe(_));
         crate::telemetry::observe_pane_input(telemetry, human, pane_id, accepted);
     }
 
@@ -6057,6 +6098,9 @@ pub(crate) enum DeckLineRefusal {
     OffGround,
     /// The generation retired, a successor published on its pane included.
     Retired,
+    /// PRD #1666 part 3 (Q35-20, CX-H): a fence holds the pane's input
+    /// while a check runs: the deck's own line is held back with a person's.
+    Fenced,
 }
 
 /// The deck line's start condition (core §4.8): the written stream where a
@@ -6080,6 +6124,7 @@ impl PtyOp {
         use crate::composer_probe::epoch::Writer;
         let writer = |source: ByteSource| match source {
             ByteSource::Deck => Writer::UnnamedDeck,
+            ByteSource::Probe(job) => Writer::Deck(job),
             ByteSource::User => Writer::Human,
             ByteSource::Answer => Writer::Answer,
         };
@@ -8298,7 +8343,14 @@ mod frontier_throughput;
 /// the real writer, and the re-projection publisher.
 #[path = "agent_pty_doorbell.rs"]
 mod doorbell_ring;
+
+/// PRD #1666 part 3 (Q35-20): an installed generation's segments in the
+/// live gate: the probe job and the release driver.
+#[path = "agent_pty_segments.rs"]
+mod segment_driver;
 pub use doorbell_ring::{RingOutcome, RingReport};
+#[cfg(feature = "e2e")]
+pub(crate) use segment_driver::{ProbeAsk, ProbeOutcome};
 
 /// PRD #1666 part 3, round 5-wake (plan §9.1): the release scanner's budget,
 /// measured by hand on the real push path.
@@ -14436,6 +14488,8 @@ impl AgentPtyRegistry {
         // started with the registry lock released.
         #[cfg(target_os = "linux")]
         self.start_composer_observer(&id);
+        #[cfg(target_os = "linux")]
+        self.start_segment_driver(&id);
         // PRD #1666 §2.8 (auditor R9S-A01): every generation published on a
         // pane — a first start, a respawn, a re-created pane — hands the pane's
         // inbox over to it, before anything the spawn owes that inbox below. A
@@ -17297,6 +17351,7 @@ impl AgentPtyRegistry {
             orchestrator_context_path: None,
             authoring_kind: agent.authoring_kind,
             inbox: None,
+            input_held: None,
         }
     }
 
@@ -17678,6 +17733,7 @@ impl AgentPtyRegistry {
                 orchestrator_context_path: None,
                 authoring_kind: agent.authoring_kind,
                 inbox: None,
+                input_held: None,
             })
             .collect();
         records.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));
@@ -24394,6 +24450,7 @@ mod spawn_tests {
         live_type: Option<Option<AgentType>>,
     ) -> AgentRecord {
         AgentRecord {
+            input_held: None,
             id: "1".into(),
             pane_id_env: None,
             display_name: None,
@@ -24642,6 +24699,7 @@ mod spawn_tests {
             orchestrator_context_path: None,
             authoring_kind: None,
             inbox: None,
+            input_held: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -30287,6 +30345,7 @@ mod spawn_tests {
             orchestrator_context_path: None,
             authoring_kind: None,
             inbox: None,
+            input_held: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();

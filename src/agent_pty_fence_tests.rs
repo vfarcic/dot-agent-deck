@@ -565,7 +565,7 @@ async fn probe_011_a_release_to_a_gone_writer_settles_once() {
     }
 }
 
-/// Scenario: Close a fence, hold a key, have the agent's output ask a DA1 query, then hand the gate one whole DA1 reply while the PTY is taking writes slowly, and submit a deck job straight to the writer. The reply is written at once past the closed fence, is in flight while it is written, moves no epoch and takes no held op or byte; the deck job, which never came through acceptance, is written too and counts in flight but not in the fence; the key waits for the release (I-5).
+/// Scenario: Close a fence, hold a key, have the agent's output ask a DA1 query, then hand the gate one whole DA1 reply while the PTY is taking writes slowly, and submit a deck job straight to the writer. The reply is written at once past the closed fence, is in flight while it is written, moves no epoch and takes no held op or byte; the deck's own line is refused at the writer while the fence holds (Q35-20, CX-H) and writes nothing; the key waits for the release (I-5).
 #[spec("inbox/probe/011")]
 #[tokio::test(flavor = "multi_thread")]
 async fn probe_011_a_reply_passes_ahead_of_a_closed_fence() {
@@ -600,12 +600,12 @@ async fn probe_011_a_reply_passes_ahead_of_a_closed_fence() {
         .writer
         .queue_deck_job(b"deck|".to_vec(), Arc::default())
         .expect("the writer thread runs");
-    job.done().await.expect("written past the fence");
+    assert!(job.done().await.is_none(), "no deck line past the fence");
+    assert_eq!(job.refused(), Some(DeckLineRefusal::Fenced));
     assert_eq!(rig.writer.gate().status().held_ops, 1);
     assert!(rig.settled(key).is_empty(), "the key is still held");
     rig.writer.release_fence(Ok(()));
-    rig.taken_becomes(&[DA1_REPLY, b"deck|", b"key|"].concat())
-        .await;
+    rig.taken_becomes(&[DA1_REPLY, b"key|"].concat()).await;
 }
 
 /// Scenario: With a CPR query and a DA1 query asked before the fence closed, the DA1 one in the very push the fence closes after, and a DA1 query after, hold a key and hand the gate a DA1 reply, a CPR reply and another DA1 reply; then two replies in one frame, a reply to nothing and half a reply, each against a fresh query asked after the trigger. Both DA1 replies are exempt, but only the second, answering the later query, passes ahead: the first answers the earlier query and is held; the CPR reply is never exempt; two replies in one frame, a reply to no query and a split reply are held. After release the PTY has the passing reply, then everything else in acceptance order.

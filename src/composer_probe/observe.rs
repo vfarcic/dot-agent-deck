@@ -929,6 +929,14 @@ impl<P: Page> Seam<P> {
         Ok(raised)
     }
 
+    /// Publish `seg_seq`, a `HumanG`'s segment number, with the count the
+    /// page shows (Q35-20, core §4.5): the helper the agent runs for it reads
+    /// the number in the same seqlock as the count.
+    pub fn publish_segment(&mut self, seg_seq: u64) {
+        self.seg_seq = seg_seq;
+        self.page.publish_probe(self.published, seg_seq);
+    }
+
     /// Publish the records' count if the page doesn't show it.
     fn sync(&mut self) {
         if let Some(count) = self.input.liability_count()
@@ -991,6 +999,14 @@ impl<P: Page> Seam<P> {
         }
         let claimed = request.claim.map(claim);
         let read = evidence.and_then(|e| e.read);
+        // Q35-20 (R3 §3.4): the daemon's read of an `Armed` export, kept for
+        // the epoch's settlement of the probe its record matches.
+        if decided == Decision::Armed
+            && let Some(e) = evidence
+        {
+            self.input
+                .note_read(e.key, matches!(read, Some(ExportRead::Empty)));
+        }
         let recorded = match evidence {
             Some(e) => self.input.record_observe(
                 &Observation {
@@ -1256,6 +1272,8 @@ mod linux {
         agent: Option<Identity>,
         /// More marker names than a pass reads.
         marker_overflow: bool,
+        /// Records whose editor child was reported running (Q35-20).
+        editors: Vec<RecordKey>,
     }
 
     /// A lost mark's hold on its helper, and its unit of the lost pools.
@@ -1279,6 +1297,34 @@ mod linux {
     struct Inner {
         seam: Seam<GenerationFiles>,
         watch: Watch,
+    }
+
+    /// Q35-20 (O-20.7b): a generation's keymap sources as read when its
+    /// permission settled, and what an admission compares a fresh read with.
+    enum KeymapEvidence {
+        Claude(crate::composer_probe::keymap::ClaudeKeymap),
+        Codex {
+            sources: crate::composer_probe::keymap::CodexSources,
+            before: Box<crate::composer_probe::keymap::CodexRead>,
+            precedence: &'static [crate::doorbell_activation::KeymapSource],
+        },
+        Held(crate::composer_probe::keymap::Hold),
+    }
+
+    impl KeymapEvidence {
+        fn check(&self) -> Result<(), crate::composer_probe::keymap::Hold> {
+            match self {
+                KeymapEvidence::Claude(keymap) => keymap.check(),
+                KeymapEvidence::Codex {
+                    sources,
+                    before,
+                    precedence,
+                } => {
+                    crate::composer_probe::keymap::codex_keymap(before, &sources.read(), precedence)
+                }
+                KeymapEvidence::Held(hold) => Err(*hold),
+            }
+        }
     }
 
     /// How an installed generation was spawned: what the observer needs of
@@ -1322,6 +1368,9 @@ mod linux {
         lost: Arc<Pool>,
         bell: Arc<Bell>,
         stopped: std::sync::atomic::AtomicBool,
+        /// Q35-20 (O-20.7b): the keymap sources as read when the
+        /// permission settled `Armable`.
+        keymap: std::sync::OnceLock<KeymapEvidence>,
         /// A test's park in the drain (Q91), called with each exited
         /// record's key between the drain's snapshot and its settlement,
         /// with no lock held.
@@ -1731,6 +1780,17 @@ mod linux {
             {
                 return None;
             }
+            // Q35-20: its segments, for the agent whose return path they
+            // wait on. A generation whose agent isn't known gets none, and
+            // no probe can open one.
+            let segments_agent = match agent.as_ref() {
+                Some(AgentType::ClaudeCode) => Some(crate::composer_probe::segments::Agent::Claude),
+                Some(AgentType::Codex) => Some(crate::composer_probe::segments::Agent::Codex),
+                _ => None,
+            };
+            if let Some(segments_agent) = segments_agent {
+                spawned.input.attach_segments(generation, segments_agent);
+            }
             let bell = Arc::new(Bell::default());
             let observer = Arc::new(Observer {
                 agent_id: spawned.agent_id,
@@ -1754,6 +1814,7 @@ mod linux {
                 lost: Arc::new(Pool::new(LOST_PER_GENERATION)),
                 bell: Arc::clone(&bell),
                 stopped: std::sync::atomic::AtomicBool::new(false),
+                keymap: std::sync::OnceLock::new(),
                 #[cfg(test)]
                 drain_park: std::sync::Mutex::new(None),
             });
@@ -1791,6 +1852,146 @@ mod linux {
         /// The generation's permission as settled so far.
         pub fn permission(&self) -> Permission {
             self.lock().seam.permission()
+        }
+
+        /// Probe admission at `now` with this generation's permission
+        /// (Q35-19's predicate), writing nothing.
+        pub fn admits(
+            &self,
+            outside: &super::Outside,
+            now: Instant,
+        ) -> Result<(), super::AdmissionRefusal> {
+            self.lock().seam.admits(outside, now)
+        }
+
+        /// The arm increment for segment `seg_seq` (Q35-19's
+        /// [`Seam::arm`]), on the writer thread in the probe's arm section.
+        pub fn arm_segment(
+            &self,
+            seg_seq: u64,
+            outside: &super::Outside,
+            now: Instant,
+        ) -> Result<u32, super::AdmissionRefusal> {
+            self.lock().seam.arm(seg_seq, outside, now)
+        }
+
+        /// Settle the generation's permission now, if it can be (plan
+        /// §1.2): a probe request asks rather than wait for the next sweep.
+        /// Reads `/proc` and writes `gen-G` with no lock held.
+        pub fn settle(&self) {
+            self.settle_permission();
+        }
+
+        /// The take-back of an arm a withdrawal won (`probe::start`).
+        pub fn disarm(&self) {
+            let _ = self.lock().seam.disarm();
+        }
+
+        /// Publish a `HumanG`'s segment number with the count the page
+        /// shows, before its trigger is submitted (core §4.5).
+        pub fn publish_segment(&self, seg_seq: u64) {
+            self.lock().seam.publish_segment(seg_seq);
+        }
+
+        /// The writer scope's state, `None` once retired.
+        pub fn scope(&self) -> Option<record::ScopeState> {
+            self.input().writer_scope().map(|s| s.state())
+        }
+
+        /// Whether the keymap sources still leave Ctrl+G on the external
+        /// editor (O-20.7b), read again now. File I/O: call it with no lock
+        /// held. No evidence (the permission never settled `Armable`) is
+        /// [`crate::composer_probe::keymap::Hold::Unmeasured`].
+        pub fn keymap(&self) -> Result<(), crate::composer_probe::keymap::Hold> {
+            debug_assert!(crate::lock_rank::held_ranks().is_empty());
+            match self.keymap.get() {
+                Some(evidence) => evidence.check(),
+                None => Err(crate::composer_probe::keymap::Hold::Unmeasured),
+            }
+        }
+
+        /// The keymap evidence for `agent` under `probe` (O-20.7b): Claude's
+        /// `keybindings.json` read now; Codex's launch sources (its config,
+        /// profile and the overrides on `args`, the bound agent's own
+        /// arguments) read now. Codex's trusted project files and its
+        /// pre-spawn read aren't read here.
+        fn keymap_evidence(
+            &self,
+            agent: &AgentType,
+            probe: &EditorProbe<'static>,
+            args: &[OsString],
+        ) -> KeymapEvidence {
+            use crate::composer_probe::keymap;
+            let env = |name: &str| self.env_value(name);
+            match agent {
+                AgentType::ClaudeCode => match keymap::claude_keybindings_path(env) {
+                    Ok(path) => KeymapEvidence::Claude(keymap::ClaudeKeymap::at_spawn(path, probe)),
+                    Err(hold) => KeymapEvidence::Held(hold),
+                },
+                AgentType::Codex => {
+                    let home = self
+                        .env_value("CODEX_HOME")
+                        .map(std::path::PathBuf::from)
+                        .or_else(|| {
+                            self.env_value("HOME")
+                                .map(|h| std::path::PathBuf::from(h).join(".codex"))
+                        });
+                    let Some(home) = home else {
+                        return KeymapEvidence::Held(keymap::Hold::Unmeasured);
+                    };
+                    match keymap::CodexSources::from_launch(&home, args, Vec::new()) {
+                        Ok(sources) => {
+                            let before = Box::new(sources.read());
+                            KeymapEvidence::Codex {
+                                sources,
+                                before,
+                                precedence: probe.keymap_sources,
+                            }
+                        }
+                        Err(hold) => KeymapEvidence::Held(hold),
+                    }
+                }
+                _ => KeymapEvidence::Held(keymap::Hold::Unmeasured),
+            }
+        }
+
+        /// A helper record whose decision opened the user's editor (core
+        /// §4.6's `HumanG/Unarmed` row): its editor child, seen running an
+        /// executable other than the helper copy, is reported to the
+        /// segments once. Run each pass, with no lock held for the reads.
+        fn editors(&self) {
+            let waiting: Vec<RecordKey> = {
+                let inner = self.lock();
+                inner
+                    .watch
+                    .pins
+                    .keys()
+                    .copied()
+                    .filter(|key| {
+                        inner.seam.input().record(*key).is_some_and(|r| {
+                            r.decision == Some(record::Decision::Unarmed)
+                                && r.exit_observed.is_none()
+                        })
+                    })
+                    .filter(|key| !inner.watch.editors.contains(key))
+                    .collect()
+            };
+            for key in waiting {
+                let running = children(key.pid)
+                    .into_iter()
+                    .any(|pid| exe_id(pid).is_some_and(|id| id != self.helper_id));
+                if !running {
+                    continue;
+                }
+                let mut inner = self.lock();
+                inner.watch.editors.push(key);
+                if inner.watch.editors.len() > record::RECORD_CAP {
+                    inner.watch.editors.remove(0);
+                }
+                let input = Arc::clone(inner.seam.input());
+                drop(inner);
+                input.segment_editor_running(key, Instant::now());
+            }
         }
 
         /// `A`, once the permission settled `Armable` with it bound.
@@ -2017,6 +2218,14 @@ mod linux {
         fn bind(&self) -> Result<Identity, bool> {
             let (pty_pid, pty_start) = match (self.class, self.child) {
                 (PaneClass::Direct(ProbeAgent::Claude), Some(child)) => child,
+                // Q89: the `e2e` build's assumption may bind a direct native
+                // Codex stand-in as `A`; production binds Codex below the
+                // deck's wrapper or a launcher only at Q35-22.
+                (PaneClass::Direct(ProbeAgent::Codex), Some(child))
+                    if cfg!(feature = "e2e") && !self.assumed.is_empty() =>
+                {
+                    child
+                }
                 _ => return Err(false),
             };
             let mut kernel = LinuxKernel::default();
@@ -2052,6 +2261,16 @@ mod linux {
                     (pid, kernel.stat(pid).map_err(|_| false)?.start, facts)
                 }
             };
+            // Q89 (`e2e` only): a direct Codex runs below the deck's own
+            // `wrap --agent codex -- <program> <args>`; its `A` is the
+            // wrapper's one child running that program with those args.
+            let (pid, start, facts) = if matches!(self.class, PaneClass::Direct(ProbeAgent::Codex))
+                && cfg!(feature = "e2e")
+            {
+                self.below_deck_wrapper(&mut kernel, pid, start, facts)?
+            } else {
+                (pid, start, facts)
+            };
             let pinned = attest::pin(
                 &mut kernel,
                 Sighting::Pid {
@@ -2086,6 +2305,56 @@ mod linux {
                 return Err(false);
             }
             Ok(identity)
+        }
+
+        /// Q89 (`e2e` only): when `pid` runs this daemon's own executable as
+        /// `wrap --agent codex -- <program> <args>`, the wrapper's one child
+        /// running `<program>`'s executable with exactly `<program> <args>`;
+        /// otherwise `pid` itself. Anything else below a wrapper binds
+        /// nothing (`Err(false)`): launchers are Q35-22's.
+        fn below_deck_wrapper(
+            &self,
+            kernel: &mut LinuxKernel,
+            pid: u32,
+            start: u64,
+            facts: ProcFacts,
+        ) -> Result<(u32, u64, ProcFacts), bool> {
+            let own = std::env::current_exe()
+                .ok()
+                .and_then(|exe| std::fs::metadata(exe).ok())
+                .map(|m| FileId {
+                    dev: m.dev(),
+                    ino: m.ino(),
+                });
+            let argv: Vec<&OsStr> = facts.argv.iter().map(OsString::as_os_str).collect();
+            let wrapped = match argv.as_slice() {
+                [_, wrap, flag, agent, dashes, rest @ ..]
+                    if *wrap == "wrap"
+                        && *flag == "--agent"
+                        && *agent == "codex"
+                        && *dashes == "--"
+                        && !rest.is_empty()
+                        && own == Some(facts.exe) =>
+                {
+                    rest.iter().map(|a| a.to_os_string()).collect::<Vec<_>>()
+                }
+                _ => return Ok((pid, start, facts)),
+            };
+            let path = self.env_value("PATH");
+            let program = resolve_program(&wrapped[0], path.as_deref()).ok_or(false)?;
+            let below: Vec<(u32, ProcFacts)> = children(pid)
+                .into_iter()
+                .filter(|c| kernel.stat(*c).is_ok_and(|stat| stat.ppid == pid))
+                .filter_map(|c| Some((c, proc_facts(c)?)))
+                .collect();
+            let [(child, child_facts)] = below.as_slice() else {
+                return Err(false);
+            };
+            if child_facts.exe != program || child_facts.argv != wrapped {
+                return Err(false);
+            }
+            let child_start = kernel.stat(*child).map_err(|_| false)?.start;
+            Ok((*child, child_start, child_facts.clone()))
         }
 
         /// Plan §1.2's permission, once the header latched: with the e2e
@@ -2131,6 +2400,29 @@ mod linux {
                     "editor probe identity not written; the generation stays inert"
                 );
                 permission = Permission::Inert(InertCause::Unbound);
+            }
+            // Q35-20 (O-20.7b): the generation's keymap sources, read now,
+            // with no lock held, for its release's record: what each
+            // admission compares a fresh read with.
+            if permission == Permission::Armable
+                && let Some(LatchedRelease::Known(release)) = header.as_ref()
+                && let Some(probe) = records
+                    .iter()
+                    .find(|r| r.agent == *agent && r.release == *release)
+                    .and_then(|r| match r.editor_probe {
+                        crate::doorbell_activation::Measurement::Verified(probe) => Some(probe),
+                        _ => None,
+                    })
+            {
+                // The bound agent's own arguments: a direct Codex's `-c`
+                // overrides and profile are on its argv, not on the deck's
+                // launch line.
+                let args = identity
+                    .as_ref()
+                    .and_then(|a| proc_facts(a.pid))
+                    .map(|f| f.argv.get(1..).unwrap_or_default().to_vec())
+                    .unwrap_or_default();
+                let _ = self.keymap.set(self.keymap_evidence(agent, &probe, &args));
             }
             let won = {
                 let mut inner = self.lock();
@@ -2190,6 +2482,7 @@ mod linux {
                 self.scan(agent.pid, &mut budget);
             }
             self.markers(&mut budget);
+            self.editors();
             self.exits();
             self.drains(&mut budget);
             self.kills();

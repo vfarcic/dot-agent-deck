@@ -2472,6 +2472,7 @@ command = "cat"
 
     fn agent_with(cwd: &str, spawned_at_ms: Option<i64>) -> AgentRecord {
         AgentRecord {
+            input_held: None,
             id: cwd.to_string(),
             pane_id_env: None,
             display_name: None,

@@ -244,6 +244,7 @@ mod tests {
 
     fn record(id: &str, pane: &str, live: Option<SessionSnapshot>) -> AgentRecord {
         AgentRecord {
+            input_held: None,
             id: id.to_string(),
             pane_id_env: Some(pane.to_string()),
             display_name: None,

@@ -4194,6 +4194,7 @@ mod tests {
 
     fn fixture_record() -> AgentRecord {
         AgentRecord {
+            input_held: None,
             id: "agent-7".into(),
             pane_id_env: Some("pane-7".into()),
             display_name: Some("builder".into()),

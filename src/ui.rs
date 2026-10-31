@@ -42134,6 +42134,7 @@ mod tests {
     ) {
         let (tx, mut rx) = tokio::sync::broadcast::channel(4);
         let record = crate::agent_pty::AgentRecord {
+            input_held: None,
             id: agent_id.to_string(),
             pane_id_env: Some(pane_id.to_string()),
             display_name: Some(name.to_string()),

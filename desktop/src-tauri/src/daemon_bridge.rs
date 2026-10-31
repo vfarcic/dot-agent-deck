@@ -3686,6 +3686,7 @@ mod tests {
     #[cfg(unix)]
     fn listed_agent(id: &str, pane_id: &str) -> dot_agent_deck::daemon_client::AgentRecord {
         dot_agent_deck::daemon_client::AgentRecord {
+            input_held: None,
             id: id.into(),
             pane_id_env: Some(pane_id.into()),
             display_name: None,

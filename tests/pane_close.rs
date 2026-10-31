@@ -332,6 +332,7 @@ async fn handle_connection(
             let records = replacement_id
                 .map(|replacement_id| {
                     vec![AgentRecord {
+                        input_held: None,
                         id: replacement_id,
                         pane_id_env: pane_id_env.lock().unwrap().clone(),
                         display_name: None,
