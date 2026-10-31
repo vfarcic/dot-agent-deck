@@ -1132,6 +1132,17 @@ pub const CAP_DECK_OUTCOMES: &str = "deck-outcomes";
 /// [`PROTOCOL_VERSION`] bump. Advertised on every platform.
 pub const CAP_ADDRESSED_MESSAGE: &str = "addressed-message";
 
+/// Capability string for [`AttachRequest::AddressedMessage`]'s address naming
+/// one agent, by `name` or `pane` (issue #2053,
+/// [`crate::orchestrator_address::MessageAddress`]). Like
+/// [`CAP_AUTHORING_KIND`], it names FIELDS on an existing verb: serde drops an
+/// unknown key, so a daemon without it would resolve the rest of the address
+/// and could message a different agent. Held by
+/// [`crate::daemon_client::DaemonClient::addressed_message`], which refuses to
+/// send such an address to a daemon that does not advertise it, so no
+/// [`PROTOCOL_VERSION`] bump. Advertised on every platform.
+pub const CAP_ADDRESSED_MESSAGE_AGENT: &str = "addressed-message-agent";
+
 /// The longest [`FinalReply::text`] the daemon stores or sends, in bytes. A
 /// longer reply is cut to its longest valid UTF-8 prefix within the bound
 /// ([`clamp_turn_reply`]). Reading speaks a summary of the reply, so the head
@@ -1313,6 +1324,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_HELLO_FOLLOW_ON,
     CAP_DECK_OUTCOMES,
     CAP_ADDRESSED_MESSAGE,
+    CAP_ADDRESSED_MESSAGE_AGENT,
 ];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
@@ -1336,6 +1348,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_HELLO_FOLLOW_ON,
     CAP_DECK_OUTCOMES,
     CAP_ADDRESSED_MESSAGE,
+    CAP_ADDRESSED_MESSAGE_AGENT,
 ];
 
 // ---------------------------------------------------------------------------

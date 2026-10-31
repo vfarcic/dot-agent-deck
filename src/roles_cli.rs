@@ -123,7 +123,7 @@ pub fn filter<'a>(
     address: &MessageAddress,
     keys: &HashMap<String, String>,
 ) -> Vec<&'a AgentRecord> {
-    if address.folder.is_none() && address.orchestration.is_none() {
+    if address.is_empty() {
         return records.iter().collect();
     }
     let key = |folder: &str| {
@@ -291,9 +291,10 @@ pub async fn run_send(
             EXIT_REFUSED,
         );
     };
-    if address.folder.is_none() && address.orchestration.is_none() {
+    if address.is_empty() {
         return CliOutput::stderr(
-            "refused: give --folder, --orchestration, or both; nothing was sent.".to_string(),
+            "refused: give --folder, --orchestration, --name or --pane; nothing was sent."
+                .to_string(),
             EXIT_REFUSED,
         );
     }
@@ -473,6 +474,7 @@ mod tests {
         let address = MessageAddress {
             folder: Some(rows[1].folder.clone()),
             orchestration: None,
+            ..MessageAddress::default()
         };
         let listed: Vec<_> = filter(&records, &address, &HashMap::new())
             .into_iter()
@@ -518,6 +520,7 @@ mod tests {
         let at = |folder: &str| MessageAddress {
             folder: Some(folder.to_string()),
             orchestration: None,
+            ..MessageAddress::default()
         };
         assert_eq!(panes(at("/w/team/src")), ["p-o", "p-w"]);
         assert_eq!(panes(at("/w/solo")), ["p-s"]);
@@ -526,6 +529,7 @@ mod tests {
             panes(MessageAddress {
                 folder: Some("/w/team".to_string()),
                 orchestration: Some("other".to_string()),
+                ..MessageAddress::default()
             }),
             Vec::<String>::new(),
             "the two filters intersect"
@@ -573,6 +577,7 @@ mod tests {
             let address = MessageAddress {
                 folder: Some(folder.to_string_lossy().into_owned()),
                 orchestration: None,
+                ..MessageAddress::default()
             };
             let listed: Vec<String> = select_rows(&records, &address)
                 .await
@@ -693,6 +698,7 @@ mod tests {
             MessageAddress {
                 folder: Some("/w".to_string()),
                 orchestration: None,
+                ..MessageAddress::default()
             },
             "hi".to_string(),
         )
