@@ -240,10 +240,6 @@ fn measure_with_path(kind: &str, rows: u16, cols: u16, path: Option<&str>) -> Ca
         .unwrap()
         .keep();
     let output = root.join("capture");
-    eprintln!(
-        "Claude 2.1.312 {kind} {rows}x{cols} evidence: {}",
-        output.display()
-    );
     let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
     let script = root.join("measure.py");
     std::fs::write(&script, include_str!("support/claude_release_measure.py")).unwrap();
@@ -283,6 +279,11 @@ fn measure_with_path(kind: &str, rows: u16, cols: u16, path: Option<&str>) -> Ca
     let read_json =
         |name: &str| serde_json::from_slice(&std::fs::read(output.join(name)).unwrap()).unwrap();
     let result: Value = read_json("result.json");
+    eprintln!(
+        "Claude {} {kind} {rows}x{cols} evidence: {}",
+        result["release"].as_str().unwrap(),
+        output.display()
+    );
     assert!(
         result["error"].is_null(),
         "measurement premise differed: {}; {}",
