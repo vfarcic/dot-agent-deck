@@ -89,6 +89,8 @@ fn pump(steps: Vec<io::Result<Vec<u8>>>) -> (Vec<u8>, Termination) {
         // A scripted reader has no master to poll: the plain loop.
         #[cfg(target_os = "linux")]
         None,
+        #[cfg(feature = "e2e")]
+        None,
     );
     let termination = captured(&registry, &agent);
     registry.shutdown_all();

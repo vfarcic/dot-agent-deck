@@ -2993,6 +2993,47 @@ impl RemovalEvidence {
 /// drain plus kills, and the daemon's own `Arc` outlives this in the normal
 /// case), but it means `Weak` does not remove this thread from the
 /// registry's lifetime entirely — only from keeping it alive unconditionally.
+/// Issue #2028, the `e2e` build only: `DOT_AGENT_DECK_E2E_EXIT_GATE` names a
+/// directory, and the reader, once the generation's exit is published and
+/// before its telemetry run ends, writes its agent id to `<dir>/arrived` and
+/// waits until `<dir>/release` exists. It decides nothing; it only lets a test
+/// act in that window.
+#[cfg(feature = "e2e")]
+struct ExitGate(PathBuf);
+
+#[cfg(feature = "e2e")]
+impl ExitGate {
+    /// How long a hold waits for its release before going on regardless, so
+    /// a test that died can't park a sandbox daemon's reader for good.
+    const LIMIT: Duration = Duration::from_secs(120);
+
+    /// The gate the generation's spawn environment names: its own variables,
+    /// then the daemon's, which the child inherits.
+    fn from_env(env: &[(String, String)]) -> Option<Self> {
+        const NAME: &str = "DOT_AGENT_DECK_E2E_EXIT_GATE";
+        env.iter()
+            .rev()
+            .find(|(k, _)| k == NAME)
+            .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var(NAME).ok())
+            .filter(|dir| !dir.is_empty())
+            .map(|dir| Self(dir.into()))
+    }
+
+    fn hold(&self, agent_id: &str) {
+        let temporary = self.0.join("arrived.tmp");
+        if std::fs::write(&temporary, agent_id).is_err()
+            || std::fs::rename(&temporary, self.0.join("arrived")).is_err()
+        {
+            return;
+        }
+        let start = Instant::now();
+        while start.elapsed() < Self::LIMIT && !self.0.join("release").exists() {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
 /// The reader's loop where no frontier is taken (macOS, Windows, and a Linux
 /// generation whose frontier setup failed): read, push, until the end.
 fn read_plain(
@@ -3025,6 +3066,7 @@ fn pump_reader(
     pane_id_env: Option<String>,
     runtime_handle: Option<tokio::runtime::Handle>,
     #[cfg(target_os = "linux")] frontier: Option<frontier_reader::Frontier>,
+    #[cfg(feature = "e2e")] exit_gate: Option<ExitGate>,
 ) {
     // PRD #1666 part 3, round 5-wake: a latch that changed is re-projected,
     // after the push released the bus lock.
@@ -3090,6 +3132,12 @@ fn pump_reader(
     // registry leaves nothing to wake.
     if let Some(registry) = registry.upgrade() {
         registry.signal_agent_exit(&agent_id);
+    }
+    // Issue #2028: the e2e hold between the exit's publication and its
+    // telemetry, with no lock held.
+    #[cfg(feature = "e2e")]
+    if let Some(gate) = exit_gate {
+        gate.hold(&agent_id);
     }
     // PRD #1741: this generation's telemetry run ends with its PTY.
     if let Some(registry) = registry.upgrade() {
@@ -14096,6 +14144,8 @@ impl AgentPtyRegistry {
             opened,
             &captured_env,
         );
+        #[cfg(feature = "e2e")]
+        let exit_gate = ExitGate::from_env(&captured_env);
         std::thread::spawn(move || {
             pump_reader(
                 reader,
@@ -14109,6 +14159,8 @@ impl AgentPtyRegistry {
                 runtime_handle_for_thread,
                 #[cfg(target_os = "linux")]
                 frontier,
+                #[cfg(feature = "e2e")]
+                exit_gate,
             )
         });
 
