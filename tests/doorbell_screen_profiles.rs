@@ -420,7 +420,7 @@ fn doorbell_036_codex_composer_over_real_frames() {
     }
 }
 
-/// Scenario: Replay Claude Code 2.1.310 and 2.1.312 at the empty composer, while holding a line, after submission and after clearing, then open each release's recorded overview, slash menu, file menu, shell mode and exit warning. The profile accepts the main composer even with warning phrases quoted in the transcript, refuses the other surfaces, and recognises the submitted user line. Replay 2.1.312's compound-key capture too: marker insertion reveals the retained two spaces, and blank Enter after non-ASCII deletion preserves the draft.
+/// Scenario: Replay Claude Code 2.1.310 and 2.1.312 at the empty composer, while holding a line, after submission and after clearing, then open each release's recorded overview, slash menu, file menu, shell mode and exit warning in indexed dark, truecolor dark/light and dark-ansi/light-ansi/dark-daltonized palettes. The profile accepts the main composer even with warning phrases quoted in the transcript, refuses the other surfaces, and recognises the submitted user line. Replay 2.1.312's compound-key capture too: marker insertion reveals the retained two spaces, and blank Enter after non-ASCII deletion preserves the draft.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_claude_composer_over_real_frames() {
@@ -471,43 +471,56 @@ fn doorbell_036_claude_composer_over_real_frames() {
 
     let mut wrong_surfaces = Vec::new();
     for release in ["2.1.310", "2.1.312"] {
-        let trace = fixture(&format!(
-            "claude-inbox/r5wake/claude-{release}-menus-50x200"
-        ));
-        for (point, expected) in [
-            ("empty", true),
-            ("transcript-quotation", true),
-            ("overview", false),
-            ("slash", false),
-            ("at", false),
-            ("bang", false),
-            ("exit-warning", false),
+        for set in [
+            "50x200",
+            "truecolor-dark-50x200",
+            "truecolor-light-50x200",
+            "dark-ansi-50x200",
+            "light-ansi-50x200",
+            "dark-daltonized-50x200",
         ] {
-            let grid = trace.grid(point);
-            let ready = (CLAUDE_PROFILE.ready)(&grid);
-            if ready != expected {
-                wrong_surfaces.push(format!(
-                    "Claude {release} {point}: ready={ready}, expected {expected}\n{}",
-                    trace.parser_upto(trace.points[point]).screen().contents()
-                ));
+            let trace = fixture(&format!("claude-inbox/r5wake/claude-{release}-menus-{set}"));
+            for (point, expected) in [
+                ("empty", true),
+                ("transcript-quotation", true),
+                ("overview", false),
+                ("slash", false),
+                ("at", false),
+                ("bang", false),
+                ("exit-warning", false),
+            ] {
+                let grid = trace.grid(point);
+                let ready = (CLAUDE_PROFILE.ready)(&grid);
+                let empty_and_ready = CLAUDE_PROFILE.empty_and_ready(&grid);
+                eprintln!(
+                    "Claude {release} {set} {point}: ready={ready}, empty_and_ready={empty_and_ready}, expected {expected}"
+                );
+                if ready != expected || empty_and_ready != expected {
+                    let failure = if expected {
+                        "wrong refusal (availability)"
+                    } else {
+                        "wrong acceptance (safety)"
+                    };
+                    wrong_surfaces.push(format!(
+                        "Claude {release} {set} {point}: {failure}: ready={ready}, empty_and_ready={empty_and_ready}, expected {expected}\n{}",
+                        trace.parser_upto(trace.points[point]).screen().contents()
+                    ));
+                }
             }
-            if expected {
-                assert!(CLAUDE_PROFILE.empty_and_ready(&grid), "{release} {point}");
+            let quotation = trace
+                .parser_upto(trace.points["transcript-quotation"])
+                .screen()
+                .contents();
+            for phrase in [
+                "Your conversation moved to the background",
+                "describe a task for a new session",
+                "Press Ctrl-C again to exit",
+            ] {
+                assert!(
+                    quotation.contains(phrase),
+                    "missing real transcript quote {phrase:?}"
+                );
             }
-        }
-        let quotation = trace
-            .parser_upto(trace.points["transcript-quotation"])
-            .screen()
-            .contents();
-        for phrase in [
-            "Your conversation moved to the background",
-            "describe a task for a new session",
-            "Press Ctrl-C again to exit",
-        ] {
-            assert!(
-                quotation.contains(phrase),
-                "missing real transcript quote {phrase:?}"
-            );
         }
     }
     assert!(

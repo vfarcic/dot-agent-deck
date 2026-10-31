@@ -134,7 +134,7 @@ class Recorder:
         self.pump(1)
         self.snap('empty')
         assert self.modes[-1]['bits'] == [False, False], self.modes
-        if kind == 'menus':
+        if kind.startswith('menus'):
             for name, key in [('slash', '/'), ('at', '@'), ('bang', '!')]:
                 self.send(key)
                 self.pump(1)
@@ -158,7 +158,11 @@ class Recorder:
             self.wait(lambda: (self.out / 'hook.jsonl').exists())
             self.pump(1)
             self.snap('quotation-echo')
-            self.send('\x15')
+            # Ctrl+U only clears the last visual line on wrapped composers.
+            for _ in quotation:
+                self.send(BS)
+                self.pump(.01)
+            self.wait(lambda: not self.composer().strip())
             self.pump(.5)
             self.snap('transcript-quotation')
             self.send(L)
@@ -286,6 +290,7 @@ class Recorder:
         (self.out / 'index.json').write_text(json.dumps(index, indent=2))
         result = {'sha256': self.sha256, 'release': self.release, 'pid': pid, 'error': error, 'reads': self.reads,
                   'executable': self.executable, 'model': 'haiku',
+                  'theme': self.theme, 'term': 'xterm-256color', 'colorterm': self.colorterm,
                   'events': self.events, 'modes': self.modes, 'keys': self.keys}
         (self.out / 'result.json').write_text(json.dumps(result, indent=2))
         (self.out / 'frames.json').write_text(json.dumps(self.frames, indent=2, ensure_ascii=False))
@@ -304,17 +309,34 @@ def main():
     assert Path(os.environ['DOT_AGENT_DECK_ATTACH_SOCKET']).parent == home.parent, 'requires private endpoint'
     binary = Path(shutil.which('claude')).resolve(strict=True)
     digest = hashlib.sha256(binary.read_bytes()).hexdigest()
-    assert digest in (PINS.values() if kind == 'menus' else [SHA]), 'executable pin changed'
+    assert digest in (PINS.values() if kind.startswith('menus') else [SHA]), 'executable pin changed'
     release = subprocess.check_output([str(binary), '--version'], text=True).split()[0]
-    expected = PINS[release] if kind == 'menus' else SHA
+    expected = PINS[release] if kind.startswith('menus') else SHA
     assert digest == expected, 'executable pin changed'
     recorder = Recorder(out, rows, cols)
     recorder.executable = str(binary)
     recorder.release, recorder.sha256 = release, expected
+    menu_settings = {
+        'menus': ('dark', None),
+        'menus-truecolor-dark': ('dark', 'truecolor'),
+        'menus-truecolor-light': ('light', 'truecolor'),
+        'menus-dark-ansi': ('dark-ansi', None),
+        'menus-light-ansi': ('light-ansi', None),
+        'menus-dark-daltonized': ('dark-daltonized', None),
+    }
+    recorder.theme, recorder.colorterm = menu_settings[kind] if kind.startswith('menus') else ('dark', None)
+    # Both preferences are private: settings.json overrides the legacy value.
+    if kind.startswith('menus'):
+        preferences = home / '.claude.json'
+        preference_data = json.loads(preferences.read_text())
+        preference_data['theme'] = recorder.theme
+        preferences.write_text(json.dumps(preference_data))
     # Only the harness's disposable HOME is writable by this controller.
     settings = home / '.claude/settings.json'
     hook = ' '.join(shlex.quote(x) for x in [sys.executable, str(Path(__file__).resolve()), '--block-hook', str(out)])
     configuration = json.loads(settings.read_text()) if settings.exists() else {}
+    if kind.startswith('menus'):
+        configuration['theme'] = recorder.theme
     configuration['autoUpdates'] = False
     configuration['hooks'] = {'UserPromptSubmit': [{'hooks': [{'type': 'command', 'command': hook}]}]}
     settings.write_text(json.dumps(configuration))
@@ -324,6 +346,8 @@ def main():
         # M1's original clear environment advertised xterm-256color without
         # COLORTERM. TuiDeck advertises truecolor for its own outer screen.
         os.environ.pop('COLORTERM', None)
+        if recorder.colorterm:
+            os.environ['COLORTERM'] = recorder.colorterm
         os.environ['TERM'] = 'xterm-256color'
         os.environ['LANG'] = 'C.UTF-8'
         os.environ['DISABLE_AUTOUPDATER'] = '1'

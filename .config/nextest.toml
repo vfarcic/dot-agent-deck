@@ -238,6 +238,12 @@ slow-timeout = { period = "60s", terminate-after = 8 }
 filter = 'test(opencode_auto_submits_daemon_injected_prompt)'
 slow-timeout = { period = "60s", terminate-after = 6 }
 
+# Ten sequential menu recordings (two pinned releases, five palettes) take
+# about 200s at the recorder's paced keystrokes, before startup overhead.
+[[profile.default.overrides]]
+filter = 'test(doorbell_036_live_release_menu_frames)'
+slow-timeout = { period = "60s", terminate-after = 6 }
+
 # PRD #1631: `codex/hooks/001` drives one real interactive Codex turn, behind
 # `check_codex_available`'s preflight. In that PRD's lane-2 run, on a box with
 # `io full` near 70%, its isolated retry spent over 120s in the preflight, ran

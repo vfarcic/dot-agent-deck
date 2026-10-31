@@ -1,0 +1,391 @@
+2.1.310 empty offset=1892 cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-2574762-pw5kZZ/.tmpOBDyJD
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                                    ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Try "how does <filepath> work?"
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents
+
+row 46: "─" fg=Idx(7) bg=Default
+row 47: "❯" fg=Default bg=Default
+row 48: "─" fg=Idx(7) bg=Default
+
+2.1.310 slash offset=2445 cursor=(47, 3)
+
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-2574762-pw5kZZ/.tmpOBDyJD
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ❯ /loop                             Repeat a prompt or command on an interval (e.g. /loop 5m /foo)
+    /add-dir                          Add a new working directory
+    /advisor                          Let Claude consult a stronger model at key moments
+    /artifacts                        Browse your published and shared artifacts
+    /auto-mode-setup                  Teach auto mode about your environment, plus optional rule tweaks
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ /
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+row 46: "─" fg=Idx(7) bg=Default
+row 47: "❯" fg=Default bg=Default
+row 48: "─" fg=Idx(7) bg=Default
+
+2.1.310 at offset=3014 cursor=(47, 3)
+
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-2574762-pw5kZZ/.tmpOBDyJD
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    + .dot-agent-deck.toml
+    + .git/
+    + attach.sock
+    + session.toml
+    + hook.sock
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ @
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+row 46: "─" fg=Idx(7) bg=Default
+row 47: "❯" fg=Default bg=Default
+row 48: "─" fg=Idx(7) bg=Default
+
+2.1.310 bang offset=4554 cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-2574762-pw5kZZ/.tmpOBDyJD
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                                    ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+! Try "how does <filepath> work?"
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ! for shell mode
+
+row 46: "─" fg=Idx(5) bg=Default
+row 47: "!" fg=Idx(5) bg=Default
+row 48: "─" fg=Idx(5) bg=Default
+
+2.1.310 exit-warning offset=5979 cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-2574762-pw5kZZ/.tmpOBDyJD
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                                    ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Try "how does <filepath> work?"
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Press Ctrl-C again to exit
+
+row 46: "─" fg=Idx(7) bg=Default
+row 47: "❯" fg=Default bg=Default
+row 48: "─" fg=Idx(7) bg=Default
+
+2.1.310 transcript-quotation offset=14113 cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-2574762-pw5kZZ/.tmpOBDyJD
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: Quoted UI phrases: Your conversation moved to the background; describe a task for a new session; Press Ctrl-C again to exit; /help; @file; ! shell mode.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                        You've used 81% of your weekly limit · resets Nov 2, 9pm (UTC)
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+row 46: "─" fg=Idx(7) bg=Default
+row 47: "❯" fg=Default bg=Default
+row 48: "─" fg=Idx(7) bg=Default
+
+2.1.310 overview offset=17537 cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  New sessions: Opus 5.5 · high effort · /var/tmp/dad-e2e-1000/dad-tests-2574762-pw5kZZ/.tmpOBDyJD
+ ▝▝   ▝▝   1 awaiting input · 0 working · 0 completed
+
+Your conversation moved to the background — enter opens it · esc returns to it · ctrl+c twice quits
+
+Needs input
+ Sessions that have a question or need your decision land here
+ ✻ current session  .tmpOBDyJD                                                                                                                                                                        0s
+
+Working
+ Sessions Claude is actively working on — they keep running even if you close the terminal
+
+Completed
+ Finished sessions wait here for you to review
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ A different way to work with Claude: hand off a bigger task than you would chat through, and Claude organizes it in the sections above so you know when it needs you.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ describe a task for a new session
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode · enter to return · space to reply · ctrl+x to delete · ? for shortcuts
+
+row 46: "─" fg=Default bg=Default
+row 47: "❯" fg=Idx(8) bg=Default
+row 48: "─" fg=Default bg=Default

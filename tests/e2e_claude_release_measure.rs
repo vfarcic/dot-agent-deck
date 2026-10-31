@@ -300,10 +300,40 @@ fn measure_with_path(kind: &str, rows: u16, cols: u16, path: Option<&str>) -> Ca
     capture
 }
 
-/// Scenario: Open the slash menu, file menu, shell mode, exit warning and background overview in isolated real Claude Code 2.1.310 and 2.1.312 composers. Capture their raw bytes and rendered frames, including a normal composer with warning phrases quoted in a real user transcript echo whose submission is blocked before a model turn.
+fn assert_empty_menu_composer(capture: &Capture) {
+    // Check the complete bounded editor independently of the ready recogniser.
+    let parser = capture.parser(capture.point("transcript-quotation"));
+    let screen = parser.screen();
+    let (rows, cols) = screen.size();
+    let (rows, cols) = (rows.get(), cols.get());
+    let prompt = (1..rows)
+        .rev()
+        .find(|&row| screen.cell(row, 0).unwrap().contents() == "❯")
+        .expect("quotation must leave a main composer");
+    assert_eq!(screen.cell(prompt - 1, 0).unwrap().contents(), "─");
+    let bottom = (prompt + 1..rows)
+        .find(|&row| screen.cell(row, 0).unwrap().contents() == "─")
+        .expect("main composer must have a lower rule");
+    for row in prompt..bottom {
+        for col in 0..cols {
+            if (row, col) != (prompt, 0) {
+                assert!(
+                    screen.cell(row, col).unwrap().contents().trim().is_empty(),
+                    "retained quotation draft at ({row},{col}): {}",
+                    screen.contents()
+                );
+            }
+        }
+    }
+    assert_eq!(screen.cursor_position(), (prompt, 2));
+}
+
+/// Scenario: Open the slash menu, file menu, shell mode, exit warning and background overview in isolated real Claude Code 2.1.310 and 2.1.312 composers at 50×200 in truecolor dark/light and indexed dark-ansi/light-ansi/dark-daltonized themes. Capture their raw bytes and rendered frames, including a normal composer with warning phrases quoted in a real user transcript echo whose submission is blocked before a model turn.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_live_release_menu_frames() {
+    use vt100::Color::{Idx, Rgb};
+
     skip_unless!(common::check_claude_available());
     for release in ["2.1.310", "2.1.312"] {
         let key = format!("DOT_AGENT_DECK_CLAUDE_MENU_{}", release.replace('.', "_"));
@@ -319,65 +349,148 @@ fn doorbell_036_live_release_menu_frames() {
             root.path().display(),
             std::env::var("PATH").unwrap()
         );
-        let capture = measure_with_path("menus", 50, 200, Some(&path));
-        assert_eq!(capture.result["release"], release);
-        assert!(
-            capture
-                .parser(capture.point("overview"))
-                .screen()
-                .contents()
-                .lines()
-                .any(|row| {
-                    row.starts_with('❯') && row.contains("describe a task for a new session")
-                }),
-            "{release}: overview must show its own composer, beyond the transcript quotation"
-        );
-        for (point, signature) in [
-            ("slash", "/add-dir"),
-            ("at", ".dot-agent-deck.toml"),
-            ("bang", "! for shell mode"),
-            ("exit-warning", "Press Ctrl-C again to exit"),
-            ("overview", "describe a task for a new session"),
+        for (kind, theme, colorterm, rule, shell, overview) in [
             (
-                "transcript-quotation",
-                "Original prompt: Quoted UI phrases:",
+                "menus-truecolor-dark",
+                "dark",
+                Some("truecolor"),
+                Rgb(136, 136, 136),
+                Rgb(253, 93, 177),
+                Rgb(153, 153, 153),
+            ),
+            (
+                "menus-truecolor-light",
+                "light",
+                Some("truecolor"),
+                Rgb(138, 138, 138),
+                Rgb(255, 0, 135),
+                Rgb(102, 102, 102),
+            ),
+            (
+                "menus-dark-ansi",
+                "dark-ansi",
+                None,
+                Idx(7),
+                Idx(13),
+                Idx(7),
+            ),
+            (
+                "menus-light-ansi",
+                "light-ansi",
+                None,
+                Idx(7),
+                Idx(5),
+                Idx(8),
+            ),
+            (
+                "menus-dark-daltonized",
+                "dark-daltonized",
+                None,
+                Idx(244),
+                Idx(75),
+                Idx(246),
             ),
         ] {
-            assert!(
+            let (rows, cols) = (50, 200);
+            let capture = measure_with_path(kind, rows, cols, Some(&path));
+            eprintln!(
+                "{release} {kind} {rows}x{cols} capture: {}",
+                capture.root.display()
+            );
+            assert_eq!(capture.result["release"], release);
+            assert_eq!(capture.result["theme"], theme);
+            assert_eq!(capture.result["colorterm"], serde_json::json!(colorterm));
+            let foreground = |point: &str, row| {
                 capture
                     .parser(capture.point(point))
                     .screen()
+                    .cell(row, 0)
+                    .unwrap()
+                    .fgcolor()
+            };
+            assert_eq!(foreground("empty", rows - 4), rule, "{kind} main rule");
+            assert_eq!(foreground("bang", rows - 3), shell, "{kind} shell glyph");
+            assert_eq!(
+                foreground("overview", rows - 3),
+                overview,
+                "{kind} overview glyph"
+            );
+            assert_empty_menu_composer(&capture);
+            assert!(
+                capture
+                    .parser(capture.point("overview"))
+                    .screen()
                     .contents()
-                    .contains(signature),
-                "{release} {point}: missing real screen signature {signature:?}"
+                    .lines()
+                    .any(|row| {
+                        row.starts_with('❯') && row.contains("describe a task for a new session")
+                    }),
+                "{release}: overview must show its own composer, beyond the transcript quotation"
+            );
+            for (point, signature) in [
+                ("slash", "/add-dir"),
+                ("at", ".dot-agent-deck.toml"),
+                ("bang", "! for shell mode"),
+                ("exit-warning", "Press Ctrl-C again to exit"),
+                ("overview", "describe a task for a new session"),
+                (
+                    "transcript-quotation",
+                    "Original prompt: Quoted UI phrases:",
+                ),
+            ] {
+                assert!(
+                    capture
+                        .parser(capture.point(point))
+                        .screen()
+                        .contents()
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .contains(signature),
+                    "{release} {point}: missing real screen signature {signature:?}"
+                );
+            }
+            let mut rendered = String::new();
+            for point in [
+                "empty",
+                "slash",
+                "at",
+                "bang",
+                "exit-warning",
+                "transcript-quotation",
+                "overview",
+            ] {
+                let parser = capture.parser(capture.point(point));
+                eprintln!("{release} {point}:\n{}", parser.screen().contents());
+                rendered.push_str(&format!(
+                    "{release} {point} offset={} cursor={:?}\n{}\n\n",
+                    capture.point(point),
+                    parser.screen().cursor_position(),
+                    parser.screen().contents()
+                ));
+                let palette: Vec<_> = (0..rows)
+                    .filter_map(|row| {
+                        let cell = parser.screen().cell(row, 0)?;
+                        matches!(cell.contents(), "❯" | "─" | "!").then(|| {
+                            format!(
+                                "row {row}: {:?} fg={:?} bg={:?}",
+                                cell.contents(),
+                                cell.fgcolor(),
+                                cell.bgcolor()
+                            )
+                        })
+                    })
+                    .collect();
+                rendered.push_str(&format!("{}\n\n", palette.join("\n")));
+            }
+            std::fs::write(capture.root.join("rendered.txt"), rendered).unwrap();
+            let hooks = std::fs::read_to_string(capture.root.join("hook.jsonl")).unwrap();
+            assert_eq!(
+                hooks.lines().count(),
+                1,
+                "one blocked submission; no model turn"
             );
         }
-        let mut rendered = String::new();
-        for point in [
-            "empty",
-            "slash",
-            "at",
-            "bang",
-            "exit-warning",
-            "transcript-quotation",
-            "overview",
-        ] {
-            let parser = capture.parser(capture.point(point));
-            eprintln!("{release} {point}:\n{}", parser.screen().contents());
-            rendered.push_str(&format!(
-                "{release} {point} offset={} cursor={:?}\n{}\n\n",
-                capture.point(point),
-                parser.screen().cursor_position(),
-                parser.screen().contents()
-            ));
-        }
-        std::fs::write(capture.root.join("rendered.txt"), rendered).unwrap();
-        let hooks = std::fs::read_to_string(capture.root.join("hook.jsonl")).unwrap();
-        assert_eq!(
-            hooks.lines().count(),
-            1,
-            "one blocked submission; no model turn"
-        );
     }
 }
 
