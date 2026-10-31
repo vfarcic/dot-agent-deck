@@ -5931,6 +5931,10 @@ async fn run_hook_loop_with_limits(
                         let _event_turn = crate::hook_event_order::turn_for_line(
                             &mut event_order_ticket,
                             &line,
+                            // Issue #2043: so a line the provenance gate below
+                            // refuses, or admits unattested, holds nobody's
+                            // attested event back.
+                            &*pty_registry,
                         )
                         .await;
                         if let Ok(msg) = serde_json::from_str::<DaemonMessage>(&line) {
