@@ -213,6 +213,12 @@ mod reap_orphans;
 /// validator is `scripts/release-channel-vars.sh`, driven here under `bash`.
 #[cfg(all(test, unix))]
 mod release_channel_vars;
+/// Issue #2052 follow-up: the one lookup that gives a tagless CI or sandbox
+/// build its `DAD_VERSION`, `scripts/latest-release-version.sh`, and its three
+/// callers. Tests only, and Unix only — the script is driven under `bash`
+/// against an offline `git` stand-in.
+#[cfg(all(test, unix))]
+mod release_version_lookup;
 /// PRD #740: the job-graph properties in `release.yml` that keep a desktop
 /// bundler failure off the CLI release. Tests only — nothing can run that
 /// workflow outside a tag, so a bad edit is otherwise observable only after a
