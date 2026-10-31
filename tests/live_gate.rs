@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use dot_agent_deck::composer_probe::epoch::GenerationInput;
 use dot_agent_deck::composer_probe::framing::Framing;
-use dot_agent_deck::composer_probe::gate::{Admission, Cutting, Gate, Measure};
+use dot_agent_deck::composer_probe::gate::{Admission, Cutting, FENCE_CAP, Gate, Measure};
 use dot_agent_deck::composer_probe::planner::{Cut, first_cut, next_cut};
 use dot_agent_deck::composer_probe::probe;
 use dot_agent_deck::composer_probe::query_ledger::CprWaitEnd;
@@ -142,7 +142,7 @@ fn model(stream: &[u8]) -> (Vec<bool>, Vec<(usize, usize)>) {
     (ground, found)
 }
 
-/// Scenario: Generate streams of held ops from text, BELs, CSI-u Ctrl+G parts and lone ESCs, each op cut where the planner reads a candidate, and drive the gate with random segment releases (as far as the next candidate, opening the fence or not) and triggers (through the next cut). Every byte comes out exactly once and in acceptance order; a release goes exactly as far as the last ground point before the next candidate (or everything when it may open with none held), never into it, and the gate's held byte count matches; a trigger always ends exactly at a candidate's end; and once nothing holds a candidate, a release that may open the fence writes everything and opens it.
+/// Scenario: Generate streams of held ops from text, BELs, CSI-u Ctrl+G parts and lone ESCs, each op cut where the planner reads a candidate, and drive the gate with random segment releases (as far as the next candidate, opening the fence or not) and triggers (through the next cut). Every byte comes out exactly once and in acceptance order; a release goes exactly as far as the last ground point before the next candidate (or everything when it may open with none held), never into it, and the gate's held byte count matches; no release submits an empty sub-op or leaves an emptied op held, one that may not open leaves the fence closed, and a trigger always ends exactly at a candidate's end; and once nothing holds a candidate, a release that may open the fence writes everything and opens it.
 #[spec("inbox/probe/010")]
 #[test]
 fn probe_010_segment_releases_and_triggers_keep_every_byte_once_and_short_of_candidates() {
@@ -182,7 +182,22 @@ fn probe_010_segment_releases_and_triggers_keep_every_byte_once_and_short_of_can
             match rng.below(3) {
                 0 | 1 => {
                     let open = rng.below(2) == 0;
+                    let fenced = gate.status().fenced;
                     let out = gate.release_until(Op::measure, Op::split_at, open);
+                    assert!(
+                        out.iter().all(|o| !o.bytes.is_empty()),
+                        "seed {seed}: a release submits no empty sub-op"
+                    );
+                    assert!(
+                        !gate.holds_any(|o| o.bytes.is_empty()),
+                        "seed {seed}: no emptied op stays held"
+                    );
+                    if fenced && !open {
+                        assert!(
+                            gate.status().fenced,
+                            "seed {seed}: a release that may not open leaves the fence closed"
+                        );
+                    }
                     let n: usize = out.iter().map(|o| o.bytes.len()).sum();
                     written.extend(out.into_iter().map(|o| (o.id, o.bytes)));
                     // How far the model says this release goes: the last
@@ -433,4 +448,43 @@ fn probe_048_an_unexplained_paste_pair_moves_the_epoch_once() {
     assert_eq!(input.epoch().epoch(), 2, "a tool's record explains nothing");
     input.on_output_bytes(OFF, now);
     assert_eq!(input.epoch().epoch(), 2, "a lone disable");
+}
+
+/// Scenario: Fill a closed fence with one op of its whole byte cap, so the next op is handed back with a place in the queue, then let a segment release the held op without opening the fence. The waiting op's place is woken by the release, so its caller tries again rather than waiting for a fence that may never open.
+#[spec("inbox/probe/010")]
+#[test]
+fn probe_010_a_segment_release_wakes_a_full_waiter() {
+    let gate: Arc<Gate<Op>> = Arc::default();
+    assert!(gate.fence(0));
+    let big = Op {
+        id: 0,
+        bytes: vec![b'a'; FENCE_CAP],
+        cut: None,
+        framing: Framing::default(),
+    };
+    assert!(matches!(
+        gate.admit(big, FENCE_CAP, None, |_, _| false, |_| {}),
+        Admission::Held
+    ));
+    let next = Op {
+        id: 1,
+        bytes: b"b".to_vec(),
+        cut: None,
+        framing: Framing::default(),
+    };
+    let Admission::Full(_, mut waiter) = gate.admit(next, 1, None, |_, _| false, |_| {}) else {
+        panic!("no room behind a full fence");
+    };
+    let out = gate.release_until(Op::measure, Op::split_at, false);
+    assert_eq!(out.len(), 1, "the held op goes");
+    assert!(gate.status().fenced, "the segment still holds the fence");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    runtime
+        .block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiter.changed()).await
+        })
+        .expect("the release wakes the waiting op");
 }
