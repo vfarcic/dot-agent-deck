@@ -471,12 +471,13 @@ GATES — CLAUDE.md is the authority, this is the summary:
   sandbox, and every OTHER cargo command that compiles (a build, a
   `cargo test-e2e` run, and a `cargo test-fast` or `cargo nextest` run
   filtered to a single test, since a filter narrows what runs, not what compiles) goes
-  through `rwx sandbox exec -- <command>`,
-  then `rwx sandbox stop`, so the compile leaves this shared machine; if
-  `rwx whoami` fails, run it locally and say so in your report. Anything that
-  reaches a real agent (`cargo test-e2e-live`, or any command with the
-  `e2e-live` feature) and `cargo mutants` (the sandbox does not have it; do
-  not raise its `--jobs`) stay local.
+  through `rwx sandbox exec -- <command>`, `cargo mutants` included (do not
+  raise its `--jobs`), so the compile leaves this shared machine. Do not run
+  `rwx sandbox stop`: the agents in this worktree share the sandbox, a stop
+  kills a command one of them is running in it, and it stops itself after
+  five idle minutes. If `rwx whoami` fails, run it locally and say so in your
+  report. Anything that reaches a real agent (`cargo test-e2e-live`, or any
+  command with the `e2e-live` feature) stays local.
 - The full matrix can also run on GitHub's runners, and it RELIEVES NOTHING
   above. ci.yml carries a bare `workflow_dispatch:`, so after a push
   `gh workflow run ci.yml --ref <branch>` runs it there (take the run id from
