@@ -75,8 +75,9 @@ fn stale_plugin_dir(root: &Path) -> PathBuf {
 ///   halves, which do not see each other, and the module where the layout
 ///   last written put it ([`remembered_major_in`]); with nothing remembered,
 ///   in the global roots only ([`global_roots`]), which both generations
-///   load, so a 2.x reached through a wrapper never meets a second copy in
-///   `~/.opencode` (review S3).
+///   load, and the deck's own copy in `~/.opencode` removed once 2.x's
+///   global root holds the module, so a 2.x reached through a wrapper never
+///   meets a second copy there (review S3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layout {
     V1,
@@ -4610,8 +4611,9 @@ fn auto_install_reporting_for(layout: Layout) -> (Vec<crate::hook_binary::HookPi
 /// was last written for 2.x, so a wrapper's spawn does not bring back the
 /// duplicate a 2.x spawn removed; in every existing root when it was last
 /// written for 1.x; and with nothing remembered in the existing global roots
-/// ([`global_roots`]), falling back to every existing root only when none of
-/// them exists.
+/// ([`global_roots`]), removing the deck's legacy `~/.opencode` copy
+/// ([`auto_install_unknown_resolved`]), and falling back to every existing
+/// root only when none of them exists.
 ///
 /// Every layout also removes the deck's entry from OpenCode 2.x's `cli.json`
 /// ([`auto_remove_cli_entries`]); [`Layout::V2`] removes the 1.x TUI half as
@@ -4634,7 +4636,7 @@ fn auto_install_layout(
     let (binary_path, pins) = if marker == Some(Major::V2) {
         auto_install_v2_resolved(&v2_roots(roots, v2_global), failed, resolve)
     } else if marker.is_none() && global.iter().any(|root| root.exists()) {
-        auto_install_resolved_for(&global, failed, resolve, None)
+        auto_install_unknown_resolved(roots, v2_global, &global, failed, resolve)
     } else {
         auto_install_resolved_for(roots, failed, resolve, marker)
     };
@@ -4735,41 +4737,91 @@ fn auto_install_v2_resolved(
         );
         return (Some(binary_path), Vec::new());
     }
-    let pins = {
-        let _guard = lock_plugin();
-        // Audit L2: read bounded and without blocking on a FIFO
-        // ([`bounded_module_text`]), since this holds `PLUGIN_LOCK`, which
-        // every other OpenCode install waits on.
-        if std::fs::symlink_metadata(&global_file).is_err()
-            && let Some(js) = legacy
-                .iter()
-                .find_map(|root| bounded_module_text(&plugin_file(root)))
-                .filter(|js| binary_path_literal(js).is_some())
-        {
-            let dir = global.join("plugin");
-            if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| {
-                crate::agent_hook_config::write_atomic(&dir, &global_file, js.as_bytes())
-            }) {
-                tracing::warn!(
-                    "auto-install: could not carry the OpenCode plugin over to {}: {e}",
-                    global_file.display()
-                );
-            }
-        }
-        drop(_guard);
-        auto_install_to_reporting_for(
-            std::slice::from_ref(global),
-            &binary_path,
-            failed,
-            Some(crate::opencode_version::Major::V2),
-        )
-    };
+    carry_module_over(global, legacy);
+    let pins = auto_install_to_reporting_for(
+        std::slice::from_ref(global),
+        &binary_path,
+        failed,
+        Some(crate::opencode_version::Major::V2),
+    );
     // Removed only once the global copy is in place, so a failed write never
     // leaves OpenCode with no module at all.
     if pins.iter().any(|(root, _)| root == global) {
         for root in legacy {
             remove_duplicate_module(root, failed);
         }
+    }
+    (Some(binary_path), pins)
+}
+
+/// PRD #2050: when `global` has no server module yet, copy the first pinned
+/// module found in `legacy` there, so that a pin to another live install
+/// which only a legacy copy held is judged by the usual pin rules
+/// ([`auto_install_to_reporting_for`]) before that legacy copy is removed.
+fn carry_module_over(global: &Path, legacy: &[PathBuf]) {
+    let global_file = plugin_file(global);
+    let _guard = lock_plugin();
+    // Audit L2: read bounded and without blocking on a FIFO
+    // ([`bounded_module_text`]), since this holds `PLUGIN_LOCK`, which every
+    // other OpenCode install waits on.
+    if std::fs::symlink_metadata(&global_file).is_err()
+        && let Some(js) = legacy
+            .iter()
+            .find_map(|root| bounded_module_text(&plugin_file(root)))
+            .filter(|js| binary_path_literal(js).is_some())
+    {
+        let dir = global.join("plugin");
+        if let Err(e) = crate::config_write_guard::ensure_config_write_allowed(&global_file)
+            .and_then(|()| std::fs::create_dir_all(&dir))
+            .and_then(|()| {
+                crate::agent_hook_config::write_atomic(&dir, &global_file, js.as_bytes())
+            })
+        {
+            tracing::warn!(
+                "auto-install: could not carry the OpenCode plugin over to {}: {e}",
+                global_file.display()
+            );
+        }
+    }
+}
+
+/// PRD #2050, review S3: the automatic install of [`Layout::Unknown`] with no
+/// layout remembered and some global root ([`global_roots`]) present: the
+/// module in the existing global roots, and the deck's own copy removed from
+/// the legacy `~/.opencode` once OpenCode 2.x's global root `v2_global` holds
+/// the module. OpenCode 2.x would refuse that copy as a duplicate for a
+/// project under `$HOME`, and 1.x loads the XDG global root as well, so
+/// neither generation needs it. A legacy pin is carried over first, as the
+/// 2.x layout does ([`carry_module_over`]). Only the deck's file names are
+/// removed ([`remove_duplicate_module`]).
+fn auto_install_unknown_resolved(
+    roots: &[PathBuf],
+    v2_global: &Path,
+    global: &[PathBuf],
+    failed: &mut Vec<String>,
+    resolve: impl FnOnce() -> Result<String, String>,
+) -> (Option<String>, Vec<(PathBuf, String)>) {
+    let binary_path = match resolve() {
+        Ok(binary_path) => binary_path,
+        Err(e) => {
+            tracing::warn!("auto-install: {e}");
+            failed.push(e);
+            return (None, Vec::new());
+        }
+    };
+    let legacy = roots.get(1).filter(|legacy| !global.contains(legacy));
+    if let Some(legacy) = legacy {
+        for root in global.iter().filter(|root| root.exists()) {
+            carry_module_over(root, std::slice::from_ref(legacy));
+        }
+    }
+    let pins = auto_install_to_reporting_for(global, &binary_path, failed, None);
+    // Removed only once 2.x's global copy is in place, so a failed write never
+    // leaves OpenCode with no module at all.
+    if let Some(legacy) = legacy
+        && pins.iter().any(|(root, _)| root == v2_global)
+    {
+        remove_duplicate_module(legacy, failed);
     }
     (Some(binary_path), pins)
 }
@@ -4944,8 +4996,9 @@ fn auto_install_resolved_for(
 /// PRD #2050: there is no command here to tell the OpenCode version from, so
 /// this writes the layout last written ([`remembered_major_in`]), and with
 /// none remembered [`Layout::Unknown`]: the module in the existing global
-/// roots ([`global_roots`]), or every root when none of them exists, and both
-/// TUI halves.
+/// roots ([`global_roots`]) with the deck's own `~/.opencode` copy removed
+/// once 2.x's global root holds it, or every root when none of them exists,
+/// and both TUI halves.
 /// The next OpenCode agent the deck starts detects its version and settles
 /// the layout. Every layout removes the deck's entry from OpenCode 2.x's
 /// `cli.json`, and the 2.x layout the 1.x TUI half ([`remove_cli_entry`]).
@@ -4977,11 +5030,8 @@ pub fn install() -> std::io::Result<()> {
         // As the automatic install does: with nothing remembered, the
         // existing global roots only, or every root when none of them exists.
         let global = global_roots(&roots, &v2_global);
-        let targets = if remembered.is_none() && global.iter().any(|root| root.exists()) {
-            global
-        } else {
-            roots.clone()
-        };
+        let global_only = remembered.is_none() && global.iter().any(|root| root.exists());
+        let targets = if global_only { global } else { roots.clone() };
         install_to_roots_for(
             &targets,
             xdg_default_root,
@@ -4989,6 +5039,19 @@ pub fn install() -> std::io::Result<()> {
             &mut std::io::stdout(),
             remembered,
         )?;
+        // Review S3: OpenCode 2.x's global root now holds the module, so the
+        // deck's own copy in `~/.opencode`, which 2.x would refuse as a
+        // duplicate, goes; 1.x loads the XDG root as well.
+        if global_only
+            && plugin_file(&v2_global).exists()
+            && let Some(legacy) = roots.get(1).filter(|legacy| !targets.contains(legacy))
+        {
+            for artifact in [plugin_file(legacy), stale_plugin_dir(legacy)] {
+                if std::fs::symlink_metadata(&artifact).is_ok() {
+                    uninstall_impl(&artifact)?;
+                }
+            }
+        }
     }
     let _guard = lock_plugin();
     // PRD #2050: OpenCode 2.x's TUI half, a directory 1.x never sees —
@@ -10308,6 +10371,93 @@ await wait(1500);
             std::fs::read_to_string(plugin_file(f.global())).unwrap(),
             plugin_template(&f.bin),
             "unmarked: the same bytes as before PRD #2050's markers"
+        );
+    }
+
+    /// Review S3 follow-up: a wrapper's spawn (nothing remembered) on a
+    /// machine that still has the deck's copy in `~/.opencode` from an older
+    /// deck removes that copy, and its obsolete nested layout, once the global
+    /// root holds the module, so OpenCode 2 meets no `Duplicate plugin ID`
+    /// after an upgrade with no manual step. Other files in that directory
+    /// are left alone.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_unknown_layout_removes_the_decks_legacy_copy() {
+        let f = LayoutFixture::new();
+        write_plugin(f.legacy(), &f.bin).unwrap();
+        std::fs::create_dir_all(stale_plugin_dir(f.legacy())).unwrap();
+        std::fs::write(stale_plugin_dir(f.legacy()).join("index.js"), "x").unwrap();
+        let other = f.legacy().join("plugin").join("someone-else.js");
+        std::fs::write(&other, "export default {}").unwrap();
+        assert_eq!(f.remembered(), Layout::Unknown);
+
+        assert_eq!(f.install(Layout::Unknown), Vec::<String>::new());
+        let (global, legacy, tui, tui_v2) = f.state();
+        assert_eq!((global, legacy, tui, tui_v2), (true, false, true, true));
+        assert!(!stale_plugin_dir(f.legacy()).exists());
+        assert_eq!(
+            std::fs::read_to_string(&other).unwrap(),
+            "export default {}",
+            "only the deck's own files are removed"
+        );
+        assert_eq!(
+            existing_binary_path(f.global()).as_deref(),
+            Some(f.bin.as_str())
+        );
+        assert_eq!(f.remembered(), Layout::Unknown);
+    }
+
+    /// A pin to another live install that only the legacy copy held is
+    /// carried to the global root before the legacy copy goes, as the 2.x
+    /// layout does.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_unknown_layout_carries_a_legacy_pin_over() {
+        let f = LayoutFixture::new();
+        let other = seed_deck(&f._dir.path().join("homebrew").join("dot-agent-deck"));
+        write_plugin(f.legacy(), &other).unwrap();
+        assert_eq!(f.install(Layout::Unknown), Vec::<String>::new());
+        assert!(!plugin_file(f.legacy()).exists());
+        assert_eq!(
+            existing_binary_path(f.global()).as_deref(),
+            Some(other.as_str())
+        );
+    }
+
+    /// With `$OPENCODE_CONFIG_DIR` moving OpenCode 2.x's global root, the
+    /// legacy copy stays until that root holds the module: a module only in
+    /// the XDG root is not what 2.x loads.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_unknown_layout_keeps_the_legacy_copy_until_2s_global_root_has_the_module() {
+        let mut f = LayoutFixture::new();
+        f.roots.push(f._dir.path().join("ocd"));
+        write_plugin(f.legacy(), &f.bin).unwrap();
+        assert_eq!(f.install(Layout::Unknown), Vec::<String>::new());
+        assert!(plugin_file(f.global()).exists());
+        assert!(
+            plugin_file(f.legacy()).exists(),
+            "2.x's global root does not exist, so the legacy copy is kept"
+        );
+        std::fs::create_dir_all(&f.roots[2]).unwrap();
+        assert_eq!(f.install(Layout::Unknown), Vec::<String>::new());
+        assert!(plugin_file(&f.roots[2]).exists());
+        assert!(!plugin_file(f.legacy()).exists());
+    }
+
+    /// With only `~/.opencode` present (no global root), a wrapper's spawn
+    /// keeps today's fan-out: the module is written and kept there.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_unknown_layout_with_only_the_legacy_root_fans_out() {
+        let f = LayoutFixture::new();
+        std::fs::remove_dir_all(f.global()).unwrap();
+        assert_eq!(f.install(Layout::Unknown), Vec::<String>::new());
+        assert!(plugin_file(f.legacy()).exists());
+        assert!(!plugin_file(f.global()).exists());
+        assert_eq!(
+            existing_binary_path(f.legacy()).as_deref(),
+            Some(f.bin.as_str())
         );
     }
 
