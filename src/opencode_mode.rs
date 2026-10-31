@@ -477,8 +477,9 @@ pub fn evaluate(
 /// never runs a binary it finds: versions come only from the spawn-time
 /// probe's record ([`evaluate`]). A wrapper-started client whose version that
 /// record gives has its generation remembered as the plugin layout
-/// ([`crate::opencode_manage::remember_layout`]), for the next install that
-/// has no command to look at.
+/// ([`crate::opencode_manage::remember_layout`], in the deck's own state, not
+/// in OpenCode's config), for the next install that has no command to look
+/// at.
 pub async fn run_monitor(
     registry: std::sync::Arc<crate::agent_pty::AgentPtyRegistry>,
     state: crate::state::SharedState,

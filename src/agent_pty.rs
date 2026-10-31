@@ -10820,11 +10820,15 @@ impl AgentPtyRegistry {
             let (target, refreshed) = crate::inbox_hub::off_the_executor(move || {
                 let target =
                     crate::opencode_version::spawn_target(command.as_deref(), path_env.as_deref());
-                if target == crate::opencode_version::SpawnTarget::Wrapper {
-                    crate::opencode_version::probe_path_opencode(
-                        path_env.as_deref(),
-                        daemon_path.as_deref(),
-                    );
+                match target.major() {
+                    Some(major) => crate::opencode_manage::remember_layout(major),
+                    None if target == crate::opencode_version::SpawnTarget::Wrapper => {
+                        crate::opencode_version::probe_path_opencode(
+                            path_env.as_deref(),
+                            daemon_path.as_deref(),
+                        );
+                    }
+                    None => {}
                 }
                 let refreshed = crate::opencode_manage::refresh_for_spawn(target.major());
                 (target, refreshed)

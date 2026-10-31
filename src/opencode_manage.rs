@@ -101,7 +101,9 @@ impl Layout {
 /// no command to tell the version from (startup, `hooks refresh`, `hooks
 /// install`) reads it back from the global root's module ([`remembered_major`])
 /// and keeps that layout, so a restart neither puts back the legacy-root copy
-/// a 2.x spawn removed nor adds the 2.x TUI half a 1.x spawn removed.
+/// a 2.x spawn removed nor adds the 2.x TUI half a 1.x spawn removed. The
+/// generation the deck last saw an agent run, recorded in its own state
+/// directory ([`remember_layout`]), comes before it.
 const LAYOUT_MARKER_PREFIX: &str = "// dot-agent-deck OpenCode layout: ";
 
 /// The marker line for `major`.
@@ -139,6 +141,7 @@ fn remembered_major_in(
 
 /// The layout an install with no command to look at writes: the one last
 /// written ([`remembered_major_in`]), else [`Layout::Unknown`].
+#[cfg(test)]
 fn remembered_layout(roots: &[PathBuf], v2_global: &Path) -> Layout {
     Layout::for_major(remembered_major_in(roots, v2_global))
 }
@@ -3723,30 +3726,76 @@ fn sync_layout_marker_with(
     Ok(true)
 }
 
-/// PRD #2050 (review F2): remember `major` as the plugin layout for the next
-/// install that has no command to look at (startup, `hooks refresh`), by
-/// setting the layout marker of the deck's module in each global config root
-/// that holds one ([`sync_layout_marker`]). The daemon's OpenCode watch calls
-/// it once a wrapper-started OpenCode is seen to run a binary whose version a
-/// spawn-time probe recorded, the only way the deck learns the generation a
-/// wrapper runs. Nothing else in the module changes, and a root with no
-/// module gets none. Blocking.
-pub fn remember_layout(major: crate::opencode_version::Major) {
-    remember_layout_in(&candidate_roots(), &v2_global_root(), major);
+/// PRD #2050 (review F2): the file, in the deck's state directory, holding
+/// the OpenCode generation the deck last saw an agent run: `1` or `2`.
+const DETECTED_LAYOUT_FILE: &str = "opencode-layout";
+
+/// [`DETECTED_LAYOUT_FILE`] under the deck's state directory.
+fn detected_layout_file() -> PathBuf {
+    crate::platform::paths::state_dir().join(DETECTED_LAYOUT_FILE)
 }
 
-/// [`remember_layout`] over `roots`, OpenCode 2.x's global root being
-/// `v2_global`.
-fn remember_layout_in(roots: &[PathBuf], v2_global: &Path, major: crate::opencode_version::Major) {
-    let _guard = lock_plugin();
-    for root in global_roots(roots, v2_global) {
-        if let Err(e) = sync_layout_marker(&root, Some(major)) {
-            tracing::warn!(
-                "could not record the OpenCode layout in {}: {e}",
-                plugin_file(&root).display()
-            );
-        }
+/// The generation recorded at `path` ([`remember_layout_at`]); `None` when
+/// there is none or it cannot be read.
+fn detected_major_at(path: &Path) -> Option<crate::opencode_version::Major> {
+    let text = crate::bounded_read::read_config_file(path, 16).ok()??;
+    match text.trim() {
+        "1" => Some(crate::opencode_version::Major::V1),
+        "2" => Some(crate::opencode_version::Major::V2),
+        _ => None,
     }
+}
+
+/// The generation an install with no command to look at goes by: the one the
+/// deck last saw an agent run ([`remember_layout`]), else the one the
+/// modules' markers remember ([`remembered_major_in`]).
+fn remembered_major_now(
+    roots: &[PathBuf],
+    v2_global: &Path,
+) -> Option<crate::opencode_version::Major> {
+    detected_major_at(&detected_layout_file()).or_else(|| remembered_major_in(roots, v2_global))
+}
+
+/// PRD #2050 (review F2): remember `major`, the OpenCode generation an agent
+/// was just seen to run, as the plugin layout for the next install that has
+/// no command to look at (startup, `hooks install`). Called by a spawn that
+/// detected the version of the binary its command names, and by the daemon's
+/// OpenCode watch once a wrapper-started OpenCode is seen to run a binary
+/// whose version a spawn-time probe recorded, the only way the deck learns
+/// the generation a wrapper runs; so the record is always the latest
+/// detection.
+///
+/// It goes to the deck's own state directory, not into OpenCode's config:
+/// OpenCode 2 reloads its plugins when the module file changes, and a rewrite
+/// while an agent runs ended that agent's session in the middle of a turn
+/// (measured on 2.2.5 in lane 2: a `SessionEnd` and a new `SessionStart`, and
+/// the turn's idle never reported). Blocking.
+pub fn remember_layout(major: crate::opencode_version::Major) {
+    let path = detected_layout_file();
+    if let Err(e) = remember_layout_at(&path, major) {
+        tracing::debug!(
+            "could not record the OpenCode generation in {}: {e}",
+            path.display()
+        );
+    }
+}
+
+/// [`remember_layout`] into `path`. Whether it wrote.
+fn remember_layout_at(path: &Path, major: crate::opencode_version::Major) -> std::io::Result<bool> {
+    if detected_major_at(path) == Some(major) {
+        return Ok(false);
+    }
+    crate::config_write_guard::ensure_config_write_allowed(path)?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("the state file has no directory"))?;
+    std::fs::create_dir_all(dir)?;
+    let text = match major {
+        crate::opencode_version::Major::V1 => "1\n",
+        crate::opencode_version::Major::V2 => "2\n",
+    };
+    crate::agent_hook_config::write_atomic(dir, path, text.as_bytes())?;
+    Ok(true)
 }
 
 fn write_plugin_reporting_for(
@@ -4677,7 +4726,9 @@ pub fn refresh_for_spawn(
 }
 
 fn auto_install_reporting() -> (Vec<crate::hook_binary::HookPin>, Vec<String>) {
-    auto_install_reporting_for(remembered_layout(&candidate_roots(), &v2_global_root()))
+    let roots = candidate_roots();
+    let v2_global = v2_global_root();
+    auto_install_reporting_for(Layout::for_major(remembered_major_now(&roots, &v2_global)))
 }
 
 /// PRD #2050: the automatic install for `layout`, over the real config roots,
@@ -5112,7 +5163,7 @@ pub fn install() -> std::io::Result<()> {
     let roots = candidate_roots();
     let root = xdg_default_root();
     let v2_global = v2_global_root();
-    let remembered = remembered_major_in(&roots, &v2_global);
+    let remembered = remembered_major_now(&roots, &v2_global);
     let v2 = remembered == Some(Major::V2);
     if v2 {
         install_to_roots_for(
@@ -10601,27 +10652,34 @@ await wait(1500);
         assert_eq!(f.remembered(), Layout::Unknown, "nothing was detected");
     }
 
-    /// Review F2: once the daemon's watch sees a wrapper-started OpenCode run
-    /// a probed 2.x binary, the layout is remembered in the module of each
-    /// global root that holds one, so the next install with no command to
-    /// look at writes 2.x's layout; a root with no module gets none, and the
-    /// module is otherwise unchanged.
+    /// Review F2: the generation an agent was seen to run is recorded in the
+    /// deck's own state file, written only when it changes, and an install
+    /// with no command to look at goes by it before the modules' markers;
+    /// nothing in OpenCode's config is touched by recording it.
     #[cfg(unix)]
     #[test]
-    fn a_confirmed_generation_is_remembered_for_the_next_install() {
+    fn a_detected_generation_is_remembered_outside_opencodes_config() {
+        use crate::opencode_version::Major;
         let f = LayoutFixture::new();
-        assert_eq!(f.install(Layout::Unknown), Vec::<String>::new());
-        assert_eq!(f.remembered(), Layout::Unknown);
-        let before = std::fs::read_to_string(plugin_file(f.global())).unwrap();
-        remember_layout_in(&f.roots, f.v2_global(), crate::opencode_version::Major::V2);
-        assert_eq!(f.remembered(), Layout::V2);
-        let after = std::fs::read_to_string(plugin_file(f.global())).unwrap();
+        assert_eq!(f.install(Layout::V1), Vec::<String>::new());
+        let module = std::fs::read(plugin_file(f.global())).unwrap();
+        let state = f._dir.path().join("state").join(DETECTED_LAYOUT_FILE);
+        assert_eq!(detected_major_at(&state), None);
+        assert!(remember_layout_at(&state, Major::V2).unwrap());
+        assert!(!remember_layout_at(&state, Major::V2).unwrap(), "unchanged");
+        assert_eq!(detected_major_at(&state), Some(Major::V2));
         assert_eq!(
-            after.split_once('\n').map(|(_, rest)| rest),
-            Some(before.as_str()),
-            "only the marker line was added"
+            std::fs::read(plugin_file(f.global())).unwrap(),
+            module,
+            "OpenCode's module is untouched"
         );
-        assert!(!plugin_file(f.legacy()).exists(), "no module created");
+        assert_eq!(
+            detected_major_at(&state).or_else(|| remembered_major_in(&f.roots, f.v2_global())),
+            Some(Major::V2),
+            "the detection wins over the module's older marker"
+        );
+        assert!(remember_layout_at(&state, Major::V1).unwrap());
+        assert_eq!(detected_major_at(&state), Some(Major::V1));
     }
 
     /// Audit F8: another install that regenerates the module between the
