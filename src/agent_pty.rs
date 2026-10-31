@@ -10790,7 +10790,8 @@ impl AgentPtyRegistry {
         // that version loads; a wrapper the deck cannot see into gets the
         // layout for either. A directly started 2.x gets `--standalone`, so
         // its server plugins run with this pane's environment rather than in
-        // OpenCode's shared background service.
+        // OpenCode's shared background service, and its program word becomes
+        // the absolute path that was probed.
         let mut standalone_command: Option<String> = None;
         let inbox_refresh = if opencode_spawn(inbox_agent_type.as_ref(), spawn_command.as_deref()) {
             let path_env = overlay_value(&opts.env, "PATH")
@@ -10803,10 +10804,14 @@ impl AgentPtyRegistry {
                 let refreshed = crate::opencode_manage::refresh_for_spawn(target.major());
                 (target, refreshed)
             });
-            if target.major() == Some(crate::opencode_version::Major::V2) {
-                standalone_command = spawn_command
-                    .as_deref()
-                    .and_then(crate::opencode_version::with_standalone);
+            if target.major() == Some(crate::opencode_version::Major::V2)
+                && let crate::opencode_version::SpawnTarget::Direct { program, .. } = &target
+            {
+                // Naming the probed file, so the user's shell cannot start a
+                // different `opencode` from the one asked its version.
+                standalone_command = spawn_command.as_deref().and_then(|command| {
+                    crate::opencode_version::with_standalone_at(command, program)
+                });
             }
             Some((InboxIntegration::OpenCode, refreshed))
         } else if pi_spawn(inbox_agent_type.as_ref(), spawn_command.as_deref()) {

@@ -107,75 +107,197 @@ impl FileKey {
     }
 }
 
-/// Cached answers, by resolved binary path: the file identity they were
-/// asked of and what the binary said (`None` when it said nothing usable,
-/// so a binary that cannot report its version is not asked on every spawn).
-type VersionCache = HashMap<PathBuf, (FileKey, Option<Version>)>;
+/// One cached answer: the file identity it was asked of, what the binary
+/// said (`None` when it said nothing usable, so a binary that cannot report
+/// its version is not asked on every spawn), and when it was stored, for
+/// eviction.
+#[derive(Debug, Clone)]
+struct Entry {
+    key: FileKey,
+    version: Option<Version>,
+    stored: u64,
+}
+
+/// Cached answers, by resolved binary path, at most [`MAX_CACHE_ENTRIES`].
+#[derive(Debug, Default)]
+struct VersionCache {
+    entries: HashMap<PathBuf, Entry>,
+    stored: u64,
+}
+
+impl VersionCache {
+    fn insert(&mut self, path: PathBuf, key: FileKey, version: Option<Version>) {
+        self.stored += 1;
+        let stored = self.stored;
+        self.entries.insert(
+            path,
+            Entry {
+                key,
+                version,
+                stored,
+            },
+        );
+        while self.entries.len() > MAX_CACHE_ENTRIES {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.stored)
+                .map(|(path, _)| path.clone())
+            else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+}
+
 static CACHE: Mutex<Option<VersionCache>> = Mutex::new(None);
+
+/// The most binaries the cache remembers; the oldest answer goes first.
+/// A machine runs a handful of OpenCode binaries, so this is a bound, not a
+/// working-set size.
+const MAX_CACHE_ENTRIES: usize = 64;
 
 /// How long `--version` may take. Measured on this project's dev box: 2.x
 /// answers in 0.2–0.4 s and 1.x in 1.0–1.3 s.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The most of `--version`'s output the probe reads.
+const PROBE_OUTPUT_LIMIT: u64 = 4096;
+
 /// The version of the binary at `path`, from the cache when its file
 /// identity is unchanged, otherwise from `probe` (which runs it). `None`
-/// when the file cannot be read or the probe's output is not a version.
+/// when the file cannot be read, the probe did not complete, or its output
+/// is not a version.
+///
+/// `probe` answers the binary's output when it ran to a successful exit, and
+/// `None` when it could not be started, failed or timed out. Only a completed
+/// run is cached: a probe that timed out on a loaded machine is asked again
+/// on the next spawn rather than leaving the binary's version unknown for the
+/// daemon's lifetime.
 pub fn detect_with(path: &Path, probe: impl FnOnce(&Path) -> Option<String>) -> Option<Version> {
     let key = FileKey::of(path)?;
     {
         let cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((cached_key, version)) = cache.as_ref().and_then(|c| c.get(path))
-            && *cached_key == key
+        if let Some(entry) = cache.as_ref().and_then(|c| c.entries.get(path))
+            && entry.key == key
         {
-            return *version;
+            return entry.version;
         }
     }
-    let version = probe(path).as_deref().and_then(parse_version);
+    let output = probe(path)?;
+    let version = parse_version(&output);
     let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
     cache
-        .get_or_insert_with(HashMap::new)
-        .insert(path.to_path_buf(), (key, version));
+        .get_or_insert_with(VersionCache::default)
+        .insert(path.to_path_buf(), key, version);
     version
 }
 
-/// [`detect_with`], asking the binary itself.
-pub fn detect(path: &Path) -> Option<Version> {
-    detect_with(path, run_version)
+/// [`detect_with`], asking the binary itself with `path_env` as its `PATH`.
+pub fn detect(path: &Path, path_env: Option<&std::ffi::OsStr>) -> Option<Version> {
+    detect_with(path, |p| run_version(p, path_env))
+}
+
+/// PRD #2050, audit M1: the version a spawn-time probe recorded for the file
+/// `exe` is, matched by file identity rather than path, so a client found
+/// through a symlink or another path to the same file is still known. Never
+/// runs anything: a binary the deck did not probe as it started an agent
+/// (one a wrapper or a tool started) is `None`, an unknown version.
+pub fn recorded_version(exe: &Path) -> Option<Version> {
+    let key = FileKey::of(exe)?;
+    let cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    cache
+        .as_ref()?
+        .entries
+        .values()
+        .filter(|entry| entry.key == key)
+        .max_by_key(|entry| entry.stored)
+        .and_then(|entry| entry.version)
 }
 
 /// Run `<path> --version` with no stdin, bounded by [`PROBE_TIMEOUT`]; its
-/// stdout, or `None` when it cannot be started, fails or times out.
-/// Blocking: callers run it off the async executor.
-fn run_version(path: &Path) -> Option<String> {
+/// stdout (at most [`PROBE_OUTPUT_LIMIT`] bytes), or `None` when it cannot be
+/// started, fails or times out. Blocking: callers run it off the async
+/// executor.
+///
+/// The probe runs with a minimal environment (`PATH`, the child's, so an npm
+/// launcher finds `node`; `HOME`), from `/`, in a process group of its own.
+/// Its output is read on a separate thread joined against the deadline, so a
+/// descendant that keeps the pipe open cannot hold the spawn past the
+/// timeout, and on a timeout the whole group is killed.
+fn run_version(path: &Path, path_env: Option<&std::ffi::OsStr>) -> Option<String> {
+    run_version_within(path, path_env, PROBE_TIMEOUT)
+}
+
+/// [`run_version`], bounded by `timeout`.
+fn run_version_within(
+    path: &Path,
+    path_env: Option<&std::ffi::OsStr>,
+    timeout: Duration,
+) -> Option<String> {
     use std::io::Read as _;
-    let mut child = std::process::Command::new(path)
+    let mut command = std::process::Command::new(path);
+    command
         .arg("--version")
+        .env_clear()
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    let started = std::time::Instant::now();
-    loop {
+        .stderr(std::process::Stdio::null());
+    if let Some(path_env) = path_env {
+        command.env("PATH", path_env);
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        command.env("HOME", home);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.current_dir("/").process_group(0);
+    }
+    let mut child = command.spawn().ok()?;
+    let deadline = std::time::Instant::now() + timeout;
+    let stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let read = stdout.take(PROBE_OUTPUT_LIMIT).read_to_end(&mut out);
+        let _ = tx.send(read.map(|_| out));
+    });
+    let exited = loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return None;
-                }
-                let mut out = String::new();
-                child.stdout.take()?.read_to_string(&mut out).ok()?;
-                return Some(out);
-            }
-            Ok(None) if started.elapsed() < PROBE_TIMEOUT => {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(20));
             }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
+            _ => break None,
+        }
+    };
+    let output = exited.and_then(|status| {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let out = rx.recv_timeout(remaining).ok()?.ok()?;
+        status
+            .success()
+            .then(|| String::from_utf8_lossy(&out).into_owned())
+    });
+    if output.is_none() {
+        kill_probe(&mut child);
+    }
+    output
+}
+
+/// Kill a probe that ran out of time, with every process in its group.
+fn kill_probe(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: `killpg` takes plain integers; the group is the probe's
+        // own (`process_group(0)` made the child its leader).
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
         }
     }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// What a spawn's command starts, as far as the deck can see.
@@ -205,17 +327,41 @@ impl SpawnTarget {
     }
 }
 
+/// Whether `name` (a file name) names an OpenCode binary: `opencode`, or
+/// `opencode` followed by a version (`opencode2`, `opencode-1.18.35`,
+/// `opencode.2`), optionally ending `.exe` (the native binary an npm install
+/// ships). Anything else starting `opencode` (`opencode-wrapper.sh`,
+/// `opencode-fresh`) is a wrapper of the user's: the deck neither runs it to
+/// ask its version nor rewrites its command (audit L4).
+pub fn opencode_name(name: &str) -> bool {
+    let name = name.strip_suffix(".exe").unwrap_or(name);
+    let Some(rest) = name.strip_prefix("opencode") else {
+        return false;
+    };
+    let rest = rest
+        .strip_prefix('-')
+        .or_else(|| rest.strip_prefix('.'))
+        .unwrap_or(rest);
+    if rest.is_empty() {
+        return name == "opencode";
+    }
+    rest.starts_with(|c: char| c.is_ascii_digit())
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
 /// The program token of `command`: its first whitespace-separated word, when
-/// that names an OpenCode binary (`opencode`, `opencode2`, `opencode-1.18.35`,
-/// a path ending in one of those). A quoted or otherwise unusual first word
-/// is not one: the deck does not parse shell syntax here.
+/// that names an OpenCode binary ([`opencode_name`], or a path ending in
+/// one). A quoted or otherwise unusual first word is not one: the deck does
+/// not parse shell syntax here.
 fn opencode_program(command: &str) -> Option<&str> {
     let program = command.split_whitespace().next()?;
     if program.contains(['"', '\'', '$', '`', '\\', '=']) {
         return None;
     }
     let name = Path::new(program).file_name()?.to_str()?;
-    name.starts_with("opencode").then_some(program)
+    opencode_name(name).then_some(program)
 }
 
 /// The file `program` resolves to: itself when it names a path, otherwise
@@ -269,13 +415,126 @@ pub fn spawn_target_with(
 
 /// [`spawn_target_with`], asking the real binary.
 pub fn spawn_target(command: Option<&str>, path_env: Option<&std::ffi::OsStr>) -> SpawnTarget {
-    spawn_target_with(command, path_env, detect)
+    spawn_target_with(command, path_env, |program| detect(program, path_env))
 }
 
 /// OpenCode 2.x subcommands that start a session and take `--standalone`
 /// (2.2.5 `--help`): `mini`, `run` and `session`. Any other subcommand
 /// (`plugin`, `auth`, `serve`, …) is not an agent session and is left alone.
 const STANDALONE_SUBCOMMANDS: [&str; 3] = ["mini", "run", "session"];
+
+/// OpenCode flags that take a value as the next word (2.2.5 `--help` for the
+/// top level and `mini`, and 1.x's `--model`, `--port` and `--hostname`).
+/// Every other flag is read as a switch.
+pub const VALUE_FLAGS: &[&str] = &[
+    "--server",
+    "--session",
+    "-s",
+    "--prompt",
+    "--log-level",
+    "--completions",
+    "--model",
+    "-m",
+    "--agent",
+    "--replay-limit",
+    "--port",
+    "--hostname",
+];
+
+/// The index in `args` (a command's words after its program) of the first
+/// word that is not a flag or a flag's value: OpenCode's subcommand, or a
+/// directory, when the command names one. Flags may come before the
+/// subcommand (`opencode --auto mini`, accepted by 2.2.5), so they are
+/// skipped; a [`VALUE_FLAGS`] flag written without `=` skips its value too.
+pub fn first_positional<S: AsRef<str>>(args: &[S]) -> Option<usize> {
+    let mut n = 0;
+    while let Some(arg) = args.get(n).map(AsRef::as_ref) {
+        if arg == "--" {
+            return (n + 1 < args.len()).then_some(n + 1);
+        }
+        if arg.starts_with('-') && arg.len() > 1 {
+            n += if !arg.contains('=') && VALUE_FLAGS.contains(&arg) {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        return Some(n);
+    }
+    None
+}
+
+/// One shell word of a command: its byte range and its text, and whether any
+/// of it was quoted or escaped (so it is a value, never a flag the deck
+/// reads).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Word<'a> {
+    start: usize,
+    end: usize,
+    text: &'a str,
+    quoted: bool,
+}
+
+/// `command` split into shell words, honouring single and double quotes and
+/// backslashes, so a quoted prompt (`run "explain --standalone"`) is one word
+/// rather than several the deck could misread as flags (review N4).
+fn shell_words(command: &str) -> Vec<Word<'_>> {
+    let mut words = Vec::new();
+    let mut chars = command.char_indices().peekable();
+    while let Some(&(start, c)) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        let mut quoted = false;
+        let mut quote: Option<char> = None;
+        let mut end = start;
+        while let Some(&(_, c)) = chars.peek() {
+            match quote {
+                Some(q) if c == q => quote = None,
+                Some('"') if c == '\\' => {
+                    chars.next();
+                }
+                Some(_) => {}
+                None if c.is_whitespace() => break,
+                None if c == '\'' || c == '"' => {
+                    quote = Some(c);
+                    quoted = true;
+                }
+                None if c == '\\' => {
+                    quoted = true;
+                    chars.next();
+                }
+                None => {}
+            }
+            chars.next();
+            end = chars.peek().map_or(command.len(), |&(next, _)| next);
+        }
+        words.push(Word {
+            start,
+            end,
+            text: &command[start..end],
+            quoted,
+        });
+    }
+    words
+}
+
+/// `path` as one shell word: itself when it holds only characters a shell
+/// leaves alone, otherwise single-quoted.
+fn shell_quote(path: &str) -> String {
+    let plain = !path.is_empty()
+        && path.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '/' | '_' | '.' | ',' | '+' | '@' | '%' | ':' | '-')
+        });
+    if plain {
+        path.to_string()
+    } else {
+        format!("'{}'", path.replace('\'', "'\\''"))
+    }
+}
 
 /// PRD #2050: `command` with `--standalone` added, for an OpenCode 2.x the
 /// deck starts directly, so its server plugins run in a private server that
@@ -285,38 +544,54 @@ const STANDALONE_SUBCOMMANDS: [&str; 3] = ["mini", "run", "session"];
 /// already says `--standalone` or `--server` (connecting to a named server),
 /// or runs a subcommand that is not a session.
 ///
-/// The flag goes right after the program (or after `mini`/`run`/`session`),
-/// and the rest of the command is kept byte for byte, so a quoted prompt or
-/// a trailing directory argument is not disturbed.
+/// The flag goes right after the session subcommand (`mini`/`run`/`session`)
+/// when there is one, flags before it skipped ([`first_positional`]), and
+/// otherwise right after the program; the rest of the command is kept byte
+/// for byte, so a quoted prompt or a trailing directory argument is not
+/// disturbed.
 pub fn with_standalone(command: &str) -> Option<String> {
-    let program = opencode_program(command)?;
-    let words: Vec<&str> = command.split_whitespace().collect();
-    if words.iter().any(|w| {
-        *w == "--standalone"
-            || w.starts_with("--standalone=")
-            || *w == "--server"
-            || w.starts_with("--server=")
+    standalone_rewrite(command, None)
+}
+
+/// [`with_standalone`], with the program word replaced by `program`, the
+/// absolute path the deck resolved and asked `--version` (review S6): the
+/// rewritten command runs through the user's shell, whose startup files may
+/// change `PATH`, so naming the file keeps the binary that runs the one the
+/// deck probed.
+pub fn with_standalone_at(command: &str, program: &Path) -> Option<String> {
+    standalone_rewrite(command, program.to_str())
+}
+
+fn standalone_rewrite(command: &str, program_path: Option<&str>) -> Option<String> {
+    opencode_program(command)?;
+    let words = shell_words(command);
+    let (program, rest) = words.split_first()?;
+    if rest.iter().any(|w| {
+        !w.quoted
+            && (w.text == "--standalone"
+                || w.text.starts_with("--standalone=")
+                || w.text == "--server"
+                || w.text.starts_with("--server="))
     }) {
         return None;
     }
-    // Byte offset just past the program word.
-    let program_start = command.find(program)?;
-    let mut insert_at = program_start + program.len();
-    match words.get(1) {
-        Some(sub) if STANDALONE_SUBCOMMANDS.contains(sub) => {
-            let sub_start = insert_at + command[insert_at..].find(sub)?;
-            insert_at = sub_start + sub.len();
-        }
-        // A flag, a directory argument, or nothing: the top-level TUI.
-        Some(word) if word.starts_with('-') || word.contains('/') || *word == "." => {}
-        None => {}
+    let texts: Vec<&str> = rest.iter().map(|w| w.text).collect();
+    let insert_at = match first_positional(&texts).map(|n| &rest[n]) {
+        Some(sub) if !sub.quoted && STANDALONE_SUBCOMMANDS.contains(&sub.text) => sub.end,
+        // A directory argument, or no positional word: the top-level TUI.
+        Some(word) if word.quoted || word.text.contains('/') || word.text == "." => program.end,
+        None => program.end,
         // Any other word: another subcommand (or a bare directory name the
         // deck cannot tell from one), left alone rather than guessed at.
         Some(_) => return None,
-    }
+    };
+    let head = match program_path {
+        Some(path) => format!("{}{}", shell_quote(path), &command[program.end..insert_at]),
+        None => command[program.start..insert_at].to_string(),
+    };
     Some(format!(
-        "{} --standalone{}",
-        &command[..insert_at],
+        "{}{head} --standalone{}",
+        &command[..program.start],
         &command[insert_at..]
     ))
 }
@@ -398,6 +673,13 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(detect_with(&bin, probe("opencode v2.3.0")), Some((2, 3, 0)));
 
+        // A probe that did not complete (a timeout, a spawn failure) is not
+        // remembered: the next spawn asks again.
+        let slow = dir.path().join("opencode-slow");
+        std::fs::write(&slow, b"x").unwrap();
+        assert_eq!(detect_with(&slow, |_| None), None);
+        assert_eq!(detect_with(&slow, probe("2.2.5")), Some((2, 2, 5)));
+
         // A binary that prints no version is remembered as such.
         let silent = dir.path().join("opencode-silent");
         std::fs::write(&silent, b"x").unwrap();
@@ -459,6 +741,216 @@ mod tests {
         let unknown = spawn_target_with(Some("opencode"), Some(&path_env), |_| None);
         assert_eq!(unknown.major(), None);
         assert!(matches!(unknown, SpawnTarget::Direct { version: None, .. }));
+    }
+
+    #[test]
+    fn only_opencode_and_versioned_names_are_opencode_binaries() {
+        for name in [
+            "opencode",
+            "opencode2",
+            "opencode-1.18.35",
+            "opencode.2",
+            "opencode.exe",
+            "opencode-2.2.5-beta.1",
+        ] {
+            assert!(opencode_name(name), "{name}");
+        }
+        for name in [
+            "opencode-wrapper.sh",
+            "opencode-fresh",
+            "opencode-sync",
+            "opencodex",
+            "opencode-",
+            "opencode.",
+            "xopencode",
+            "",
+        ] {
+            assert!(!opencode_name(name), "{name}");
+        }
+        assert_eq!(with_standalone("opencode-wrapper.sh mini"), None);
+        assert_eq!(
+            with_standalone("opencode-1.18.35 mini").as_deref(),
+            Some("opencode-1.18.35 mini --standalone")
+        );
+    }
+
+    /// Scenario: the cache answers a client found in a pane's process tree
+    /// only from what a spawn-time probe recorded, by file identity — through
+    /// another path to the same file too — and never runs a binary it was not
+    /// asked to probe (audit M1).
+    #[cfg(unix)]
+    #[test]
+    fn a_recorded_version_is_matched_by_file_identity_and_never_probed() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let bin = dir.path().join("opencode");
+        std::fs::write(&bin, b"recorded-binary").unwrap();
+        let link = dir.path().join("linked-opencode");
+        std::os::unix::fs::symlink(&bin, &link).unwrap();
+        let stranger = dir.path().join("opencode-x");
+        std::fs::write(&stranger, b"never probed").unwrap();
+        assert_eq!(recorded_version(&bin), None, "nothing recorded yet");
+        assert_eq!(
+            detect_with(&bin, |_| Some("opencode v2.2.5".to_string())),
+            Some((2, 2, 5))
+        );
+        assert_eq!(recorded_version(&bin), Some((2, 2, 5)));
+        assert_eq!(recorded_version(&link), Some((2, 2, 5)), "same file");
+        assert_eq!(recorded_version(&stranger), None, "never asked");
+        std::fs::write(&bin, b"upgraded in place, longer").unwrap();
+        assert_eq!(recorded_version(&bin), None, "a changed file is unknown");
+    }
+
+    #[test]
+    fn the_cache_is_bounded() {
+        let mut cache = VersionCache::default();
+        let key = FileKey {
+            size: 1,
+            mtime_ns: 1,
+            inode: 1,
+        };
+        for n in 0..MAX_CACHE_ENTRIES + 10 {
+            cache.insert(
+                PathBuf::from(format!("/bin/opencode{n}")),
+                key.clone(),
+                None,
+            );
+        }
+        assert_eq!(cache.entries.len(), MAX_CACHE_ENTRIES);
+        assert!(!cache.entries.contains_key(Path::new("/bin/opencode0")));
+        assert!(cache.entries.contains_key(&PathBuf::from(format!(
+            "/bin/opencode{}",
+            MAX_CACHE_ENTRIES + 9
+        ))));
+    }
+
+    /// Scenario: a `--version` that prints a version and exits while a
+    /// background child it started keeps stdout open is cut off at the
+    /// timeout instead of holding the spawn, and its whole process group,
+    /// the background child included, is killed (audit L3). A plain one is
+    /// read, from `/` and with only `PATH` and `HOME` in its environment.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_version_probe_is_bounded_and_kills_its_process_group() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let pid_file = dir.path().join("background.pid");
+        let lingering = dir.path().join("opencode");
+        crate::test_isolation::write_script(
+            &lingering,
+            format!(
+                "#!/bin/sh
+sleep 30 &
+echo $! > '{}'
+echo 'opencode v2.2.5'
+",
+                pid_file.display()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &lingering,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+        let path_env = std::ffi::OsString::from("/usr/bin:/bin");
+        let started = std::time::Instant::now();
+        let out = run_version_within(&lingering, Some(&path_env), Duration::from_millis(500));
+        assert_eq!(out, None, "the pipe never closed");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        let background: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let gone = (0..100).any(|_| {
+            let state = std::fs::read_to_string(format!("/proc/{background}/stat")).ok();
+            let dead = state.is_none_or(|s| s.split_whitespace().nth(2) == Some("Z"));
+            if !dead {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            dead
+        });
+        assert!(gone, "the background child was killed with the group");
+
+        let plain = dir.path().join("opencode-plain");
+        crate::test_isolation::write_script(
+            &plain,
+            b"#!/bin/sh
+printf '%s|%s|%s\n' \"$(pwd)\" \"${HOME:+home}\" \"${DOT_AGENT_DECK_PANE_ID:-none}\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &plain,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+        let out = run_version_within(&plain, Some(&path_env), Duration::from_secs(5)).unwrap();
+        let expected_home = if std::env::var_os("HOME").is_some() {
+            "home"
+        } else {
+            ""
+        };
+        assert_eq!(out.trim(), format!("/|{expected_home}|none"));
+    }
+
+    #[test]
+    fn adds_standalone_after_leading_flags_and_ignores_quoted_words() {
+        // The subcommand is found past leading flags (review S2).
+        assert_eq!(
+            with_standalone("opencode --auto mini").as_deref(),
+            Some("opencode --auto mini --standalone")
+        );
+        assert_eq!(
+            with_standalone("opencode --log-level info mini -m openai/gpt-5-mini").as_deref(),
+            Some("opencode --log-level info mini --standalone -m openai/gpt-5-mini")
+        );
+        assert_eq!(with_standalone("opencode --auto plugin list"), None);
+        assert_eq!(
+            with_standalone("opencode --session ses_1").as_deref(),
+            Some("opencode --standalone --session ses_1"),
+            "a flag's value is not a subcommand"
+        );
+        // A quoted prompt is never read as the flag (review N4).
+        assert_eq!(
+            with_standalone("opencode run \"explain --standalone\"").as_deref(),
+            Some("opencode run --standalone \"explain --standalone\"")
+        );
+        assert_eq!(
+            with_standalone("opencode run 'and --server too'").as_deref(),
+            Some("opencode run --standalone 'and --server too'")
+        );
+        assert_eq!(
+            with_standalone("opencode \"my project\"").as_deref(),
+            Some("opencode --standalone \"my project\"")
+        );
+    }
+
+    #[test]
+    fn the_rewrite_names_the_binary_the_deck_probed() {
+        assert_eq!(
+            with_standalone_at(
+                "opencode mini -m x/y",
+                Path::new("/home/u/.opencode/bin/opencode")
+            )
+            .as_deref(),
+            Some("/home/u/.opencode/bin/opencode mini --standalone -m x/y")
+        );
+        assert_eq!(
+            with_standalone_at(
+                "opencode",
+                Path::new("/Users/u/Application Support/it's/opencode")
+            )
+            .as_deref(),
+            Some("'/Users/u/Application Support/it'\\''s/opencode' --standalone")
+        );
+        assert_eq!(
+            with_standalone_at("opencode --standalone", Path::new("/bin/opencode")),
+            None
+        );
     }
 
     #[test]

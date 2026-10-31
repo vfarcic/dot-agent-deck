@@ -93,9 +93,10 @@ const NOT_A_SESSION: &[&str] = &[
 ];
 
 /// Whether `name` (a file name) names an OpenCode binary: `opencode`,
-/// `opencode2`, `opencode.exe`, `opencode-1.18.35`.
-fn opencode_name(name: &str) -> bool {
-    name.starts_with("opencode")
+/// `opencode2`, `opencode.exe`, `opencode-1.18.35`
+/// ([`crate::opencode_version::opencode_name`]).
+pub fn opencode_name(name: &str) -> bool {
+    crate::opencode_version::opencode_name(name)
 }
 
 fn file_name(path: &Path) -> Option<&str> {
@@ -116,17 +117,46 @@ pub fn is_opencode(row: &ProcRow) -> bool {
     }
 }
 
-/// The OpenCode subcommand `row` runs, if its arguments say one.
+/// The OpenCode subcommand `row` runs, if its arguments say one: the first
+/// word after the program that is not a flag or a flag's value, since flags
+/// may come first (`opencode --auto mini`).
 fn subcommand(row: &ProcRow) -> Option<&str> {
-    row.argv.as_ref()?.get(1).map(String::as_str)
+    let args = row.argv.as_ref()?.get(1..)?;
+    crate::opencode_version::first_positional(args).map(|n| args[n].as_str())
+}
+
+/// Whether `argv` (a process's arguments, program first) carries `serve` and
+/// `--stdio` as words after the program: an OpenCode private server's
+/// arguments (`serve --stdio --port 0`, measured on 2.2.5). Matched as words
+/// anywhere, not by position, so a program path that `ps` split on its
+/// spaces (macOS) does not hide them.
+pub fn serves_stdio(argv: &[String]) -> bool {
+    let args = argv.get(1..).unwrap_or_default();
+    args.iter().any(|a| a == "serve") && args.iter().any(|a| a == "--stdio")
 }
 
 /// Whether `row` is an OpenCode private server (`serve --stdio`).
 fn private_server(row: &ProcRow) -> bool {
-    is_opencode(row)
-        && row.argv.as_ref().is_some_and(|argv| {
-            argv.get(1).map(String::as_str) == Some("serve") && argv.iter().any(|a| a == "--stdio")
-        })
+    is_opencode(row) && row.argv.as_deref().is_some_and(serves_stdio)
+}
+
+/// Whether process `pid`'s stdin and stdout are both sockets. An OpenCode 2
+/// private server's are, a socketpair with its client (measured on 2.2.5),
+/// while a process a tool started keeps the tool's pipes or `/dev/null`.
+/// Read from `/proc`; `false` when either cannot be read.
+#[cfg(target_os = "linux")]
+pub fn stdio_is_sockets(pid: u32) -> bool {
+    [0, 1].iter().all(|fd| {
+        std::fs::read_link(format!("/proc/{pid}/fd/{fd}"))
+            .is_ok_and(|target| target.to_string_lossy().starts_with("socket:"))
+    })
+}
+
+/// Off Linux there is no `/proc` to read a process's descriptors from, so
+/// this is not checked: always `true`.
+#[cfg(not(target_os = "linux"))]
+pub fn stdio_is_sockets(_pid: u32) -> bool {
+    true
 }
 
 /// `root` and every process below it in `rows`, breadth first, each once.
@@ -251,15 +281,20 @@ pub(crate) fn arguments_of(pid: u32) -> Option<Vec<String>> {
 }
 
 /// Process `pid`'s arguments, split on whitespace (`ps` joins them), which is
-/// enough for the words this module looks for.
+/// enough for the words this module looks for, matched as words
+/// ([`serves_stdio`]). The `ps` runs off the async executor
+/// ([`crate::inbox_hub::off_the_executor`]): the daemon's receiver admission
+/// reaches it from a connection handler. Untested here: no macOS host.
 #[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) fn arguments_of(pid: u32) -> Option<Vec<String>> {
-    let out = std::process::Command::new("ps")
-        .args(["-o", "args=", "-p", &pid.to_string()])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
+    let out = crate::inbox_hub::off_the_executor(|| {
+        std::process::Command::new("ps")
+            .args(["-o", "args=", "-p", &pid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+    })
+    .ok()?;
     let argv: Vec<String> = String::from_utf8_lossy(&out.stdout)
         .split_whitespace()
         .map(str::to_string)
@@ -319,18 +354,31 @@ impl Watch {
     }
 }
 
+/// How long before the deck first saw a client its plugin's last sign may be
+/// and still count for that client: the plugin can report as OpenCode
+/// starts, up to a poll before the first sample sees the process.
+pub const REPORT_SLACK: Duration = Duration::from_secs(10);
+
 /// One look at every watched agent: the notice each one's card should carry
-/// now, from the process sample `rows`. `version_of` reads a client binary's
-/// version (cached by [`crate::opencode_version::detect`] in production) and
-/// `reporting` names the agents whose plugin has shown it runs. Blocking when
-/// `version_of` is.
+/// now, from the process sample `rows`.
+///
+/// - `version_of` gives a client binary's version. In production it is
+///   [`crate::opencode_version::recorded_version`], which only reads what the
+///   spawn-time probe recorded and runs nothing, so a client the deck did not
+///   probe has an unknown version (and gets neither the shared-service nor
+///   the unsupported-version notice).
+/// - `last_report` gives, per agent, when its plugin last showed it runs (a
+///   receiver registered, or a native hook event). It counts only when it is
+///   no older than [`REPORT_SLACK`] before the deck first saw the agent's
+///   current client, so a sign from an earlier OpenCode in the same pane does
+///   not vouch for one restarted with a broken plugin (review N1).
 pub fn evaluate(
     watched: &[Watched],
     rows: &[ProcRow],
     watch: &mut Watch,
     now: std::time::Instant,
     version_of: &dyn Fn(&Path) -> Option<Version>,
-    reporting: &HashSet<String>,
+    last_report: &HashMap<String, std::time::Instant>,
 ) -> Vec<(Watched, Option<AgentNotice>)> {
     let keep: HashSet<&str> = watched.iter().map(|w| w.agent_id.as_str()).collect();
     watch.retain(&keep);
@@ -345,7 +393,11 @@ pub fn evaluate(
                 Some(client) => {
                     let seen_for = watch.seen_for(&w.agent_id, client.pid, now);
                     let version = client.exe.as_deref().and_then(version_of);
-                    notice_for(&client, version, seen_for, reporting.contains(&w.agent_id))
+                    let first_seen = now.checked_sub(seen_for + REPORT_SLACK);
+                    let reporting = last_report
+                        .get(&w.agent_id)
+                        .is_some_and(|&at| first_seen.is_none_or(|from| at >= from));
+                    notice_for(&client, version, seen_for, reporting)
                 }
             };
             (w.clone(), notice)
@@ -359,7 +411,9 @@ pub fn evaluate(
 /// ([`crate::inbox_hub::InboxHub::set_agent_notice`], which tells the clients
 /// only of a change). Takes no sample while no OpenCode agent runs. One
 /// sample at a time: a sample that stalls (a `ps` stuck on a hung filesystem)
-/// stalls this watch and nothing else, and never starts a second one.
+/// stalls this watch and nothing else, and never starts a second one. It
+/// never runs a binary it finds: versions come only from the spawn-time
+/// probe's record ([`crate::opencode_version::recorded_version`]).
 pub async fn run_monitor(
     registry: std::sync::Arc<crate::agent_pty::AgentPtyRegistry>,
     state: crate::state::SharedState,
@@ -374,28 +428,41 @@ pub async fn run_monitor(
             watch.retain(&HashSet::new());
             continue;
         }
-        let mut reporting: HashSet<String> = watched
+        let mut last_report: HashMap<String, std::time::Instant> = watched
             .iter()
-            .filter(|w| {
+            .filter_map(|w| {
                 registry
                     .inbox()
-                    .integration_registered(&w.pane_id, &w.agent_id)
+                    .integration_registered_at(&w.pane_id, &w.agent_id)
+                    .map(|at| (w.agent_id.clone(), at))
             })
-            .map(|w| w.agent_id.clone())
             .collect();
         {
             let state = state.read().await;
+            let (now, wall) = (std::time::Instant::now(), chrono::Utc::now());
             for w in &watched {
-                let hooked = state.sessions.values().any(|session| {
-                    session.native_hooks_reported
-                        && session.pane_id.as_deref() == Some(w.pane_id.as_str())
-                        && session
-                            .agent_id
-                            .as_deref()
-                            .is_none_or(|agent| agent == w.agent_id)
-                });
-                if hooked {
-                    reporting.insert(w.agent_id.clone());
+                // The newest native hook event of this pane's agent, as an
+                // instant on the monitor's clock.
+                let hooked = state
+                    .sessions
+                    .values()
+                    .filter(|session| {
+                        session.native_hooks_reported
+                            && session.pane_id.as_deref() == Some(w.pane_id.as_str())
+                            && session
+                                .agent_id
+                                .as_deref()
+                                .is_none_or(|agent| agent == w.agent_id)
+                    })
+                    .map(|session| session.last_activity)
+                    .max()
+                    .map(|at| {
+                        let ago = (wall - at).to_std().unwrap_or_default();
+                        now.checked_sub(ago).unwrap_or(now)
+                    });
+                if let Some(at) = hooked {
+                    let entry = last_report.entry(w.agent_id.clone()).or_insert(at);
+                    *entry = (*entry).max(at);
                 }
             }
         }
@@ -407,8 +474,8 @@ pub async fn run_monitor(
                 &rows,
                 &mut watch,
                 std::time::Instant::now(),
-                &crate::opencode_version::detect,
-                &reporting,
+                &crate::opencode_version::recorded_version,
+                &last_report,
             );
             Some((watch, notices))
         });
@@ -630,10 +697,10 @@ mod tests {
             root_pid: root,
         };
         let all = [watched("a", 100), watched("b", 300), watched("c", 400)];
-        let reporting = HashSet::from(["agent-a".to_string()]);
+        let t0 = std::time::Instant::now();
+        let reporting = HashMap::from([("agent-a".to_string(), t0)]);
         let v2 = |_: &Path| Some((2, 2, 5));
         let mut watch = Watch::default();
-        let t0 = std::time::Instant::now();
         let first = evaluate(&all, &rows, &mut watch, t0, &v2, &reporting);
         assert!(
             first.iter().all(|(_, n)| n.is_none()),
@@ -652,6 +719,89 @@ mod tests {
                 ("c", None),
             ]
         );
+    }
+
+    /// Scenario: an OpenCode pane whose plugin reported once, then OpenCode
+    /// was restarted in the same pane with a plugin that never reports. The
+    /// old sign does not vouch for the new client, so after the grace its
+    /// card says the integration is not working; a sign from the new client
+    /// clears it (review N1).
+    #[test]
+    fn a_sign_from_an_earlier_opencode_does_not_vouch_for_a_restarted_one() {
+        let rows_with = |client_pid: i32| {
+            vec![
+                row(1, 0, "/sbin/init", &[]),
+                row(100, 1, "/usr/bin/dash", &[]),
+                row(client_pid, 100, OC, &["opencode", "--standalone"]),
+                row(
+                    client_pid + 1,
+                    client_pid,
+                    OC,
+                    &["opencode", "serve", "--stdio"],
+                ),
+            ]
+        };
+        let watched = [Watched {
+            pane_id: "a".to_string(),
+            agent_id: "agent-a".to_string(),
+            root_pid: 100,
+        }];
+        let v2 = |_: &Path| Some((2, 2, 5));
+        let mut watch = Watch::default();
+        let t0 = std::time::Instant::now();
+        let mut last_report = HashMap::from([("agent-a".to_string(), t0)]);
+        let kind_at = |watch: &mut Watch, rows: &[ProcRow], at, last: &HashMap<_, _>| {
+            evaluate(&watched, rows, watch, at, &v2, last)[0]
+                .1
+                .as_ref()
+                .map(|n| n.kind)
+        };
+        let first = rows_with(102);
+        assert_eq!(kind_at(&mut watch, &first, t0, &last_report), None);
+        assert_eq!(
+            kind_at(&mut watch, &first, t0 + SILENT_GRACE * 2, &last_report),
+            None,
+            "idle but its plugin reported"
+        );
+        // OpenCode restarted in the pane, long after that sign.
+        let restarted = rows_with(202);
+        let t1 = t0 + SILENT_GRACE * 3;
+        assert_eq!(kind_at(&mut watch, &restarted, t1, &last_report), None);
+        assert_eq!(
+            kind_at(&mut watch, &restarted, t1 + SILENT_GRACE, &last_report),
+            Some(AgentNoticeKind::OpencodeNotReporting),
+            "the earlier OpenCode's sign does not count"
+        );
+        last_report.insert("agent-a".to_string(), t1 + SILENT_GRACE);
+        assert_eq!(
+            kind_at(&mut watch, &restarted, t1 + SILENT_GRACE * 2, &last_report),
+            None
+        );
+    }
+
+    #[test]
+    fn the_subcommand_is_found_past_leading_flags_and_serve_as_words() {
+        let rows = wrapped(&["opencode", "--auto", "auth", "login"], None);
+        assert_eq!(find_client(&rows, 100), None, "`auth` behind a flag");
+        let rows = wrapped(&["opencode", "--log-level", "info", "mini"], None);
+        assert_eq!(find_client(&rows, 100).map(|c| c.pid), Some(102));
+        let split: Vec<String> = [
+            "/Users/u/Application",
+            "Support/oc/opencode",
+            "serve",
+            "--stdio",
+        ]
+        .iter()
+        .map(|a| a.to_string())
+        .collect();
+        assert!(serves_stdio(&split), "a path `ps` split on its space");
+        assert!(!serves_stdio(&[
+            "opencode".to_string(),
+            "serve".to_string()
+        ]));
+        assert!(!serves_stdio(
+            &["serve".to_string(), "--stdio".to_string()][..1]
+        ));
     }
 
     #[test]

@@ -3427,15 +3427,17 @@ impl InboxHub {
         }
     }
 
-    /// PRD #2050: whether a receiver of `agent_id`'s own integration (its
-    /// plugin or extension) has registered for its messages in `pane_id` —
-    /// evidence that the integration loaded in that agent.
-    pub fn integration_registered(&self, pane_id: &str, agent_id: &str) -> bool {
+    /// PRD #2050: when a receiver of `agent_id`'s own integration (its plugin
+    /// or extension) last registered for its messages in `pane_id` —
+    /// evidence that the integration loaded in that agent — or `None` when
+    /// none has.
+    pub fn integration_registered_at(&self, pane_id: &str, agent_id: &str) -> Option<Instant> {
         self.lock()
             .receipts
             .floors
             .get(&(pane_id.to_string(), agent_id.to_string()))
-            .is_some_and(|floor| floor.registered)
+            .filter(|floor| floor.registered)
+            .and_then(|floor| floor.registered_at)
     }
 
     /// PRD #1666 part 3 (R-2): the deck admitted `agent_id`'s own request for
