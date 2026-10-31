@@ -119,28 +119,30 @@ impl Rng {
 /// Ctrl+G (`ESC [ 103 ; 5 u`) and a lone ESC.
 const ALPHABET: &[u8] = b"ab\x07\x1b[103;5u";
 
-/// Where the candidates in `stream` end and where each began (the last
-/// ground point before it), as the planner reads the whole stream.
-fn candidates(stream: &[u8]) -> Vec<(usize, usize)> {
+/// Where the input is in ground after each prefix of `stream` (index `k`:
+/// after `k` bytes), and where each candidate ends with the last ground point
+/// before it, as the planner reads the whole stream.
+fn model(stream: &[u8]) -> (Vec<bool>, Vec<(usize, usize)>) {
+    let mut ground = vec![true];
+    let mut framing = Framing::default();
+    for &b in stream {
+        framing.feed(b, |_| {});
+        ground.push(framing.at_ground());
+    }
     let mut found = Vec::new();
     let mut framing = Framing::default();
     let mut from = 0;
-    loop {
-        let Some(cut) = first_cut(&framing, &stream[from..], false) else {
-            return found;
-        };
-        // `start` is relative to `from` and to a ground point there.
-        let mut start = from + cut.start;
-        if cut.start == 0 && !framing.at_ground() {
-            start = found.last().map_or(0, |&(end, _)| end);
-        }
-        found.push((from + cut.at, start));
+    while let Some(cut) = first_cut(&framing, &stream[from..], false) {
+        let end = from + cut.at;
+        let start = (0..end).rev().find(|&k| ground[k]).unwrap_or(0);
+        found.push((end, start));
         framing = cut.resume;
-        from += cut.at;
+        from = end;
     }
+    (ground, found)
 }
 
-/// Scenario: Generate streams of held ops from text, BELs, CSI-u Ctrl+G parts and lone ESCs, each op cut where the planner reads a candidate, and drive the gate with random segment releases (as far as the next candidate, opening the fence or not) and triggers (through the next cut). Every byte comes out exactly once and in acceptance order; a release never writes any byte from a candidate's start onward; a trigger always ends exactly at a candidate's end; and once nothing holds a candidate, a release that may open the fence writes everything and opens it.
+/// Scenario: Generate streams of held ops from text, BELs, CSI-u Ctrl+G parts and lone ESCs, each op cut where the planner reads a candidate, and drive the gate with random segment releases (as far as the next candidate, opening the fence or not) and triggers (through the next cut). Every byte comes out exactly once and in acceptance order; a release goes exactly as far as the last ground point before the next candidate (or everything when it may open with none held), never into it, and the gate's held byte count matches; a trigger always ends exactly at a candidate's end; and once nothing holds a candidate, a release that may open the fence writes everything and opens it.
 #[spec("inbox/probe/010")]
 #[test]
 fn probe_010_segment_releases_and_triggers_keep_every_byte_once_and_short_of_candidates() {
@@ -172,7 +174,7 @@ fn probe_010_segment_releases_and_triggers_keep_every_byte_once_and_short_of_can
                 Admission::Held
             ));
         }
-        let marks = candidates(&stream);
+        let (ground, marks) = model(&stream);
         let mut written: Vec<(usize, Vec<u8>)> = Vec::new();
         let mut offset = 0usize;
         for _ in 0..12 {
@@ -183,14 +185,27 @@ fn probe_010_segment_releases_and_triggers_keep_every_byte_once_and_short_of_can
                     let out = gate.release_until(Op::measure, Op::split_at, open);
                     let n: usize = out.iter().map(|o| o.bytes.len()).sum();
                     written.extend(out.into_iter().map(|o| (o.id, o.bytes)));
-                    if let Some((_, start)) = next {
-                        assert!(
-                            offset + n <= start,
-                            "seed {seed}: a release wrote into a candidate ({} > {start})",
-                            offset + n
-                        );
+                    // How far the model says this release goes: the last
+                    // ground point before the next candidate; with none, the
+                    // last ground point, or everything when it may open.
+                    let expected = match next {
+                        Some((_, start)) => start,
+                        None if open => stream.len(),
+                        None => (0..=stream.len()).rev().find(|&k| ground[k]).unwrap_or(0),
                     }
+                    .max(offset);
+                    assert_eq!(
+                        offset + n,
+                        expected,
+                        "seed {seed}: a release went to {} where the model stops at {expected}",
+                        offset + n
+                    );
                     offset += n;
+                    assert_eq!(
+                        gate.status().held_bytes,
+                        stream.len() - offset,
+                        "seed {seed}: the gate counts what it holds"
+                    );
                     if open && next.is_none() {
                         assert!(
                             !gate.status().fenced,
@@ -206,6 +221,11 @@ fn probe_010_segment_releases_and_triggers_keep_every_byte_once_and_short_of_can
                     let n: usize = out.iter().map(|o| o.bytes.len()).sum();
                     written.extend(out.into_iter().map(|o| (o.id, o.bytes)));
                     offset += n;
+                    assert_eq!(
+                        gate.status().held_bytes,
+                        stream.len() - offset,
+                        "seed {seed}: the gate counts what it holds"
+                    );
                     assert!(
                         marks.iter().any(|&(end, _)| end == offset),
                         "seed {seed}: a trigger ended at {offset}, not at a candidate's end"
