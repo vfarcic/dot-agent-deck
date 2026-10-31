@@ -556,12 +556,6 @@ fn telemetry_otlp_007_real_opencode_telemetry_joins_deck_run() {
         .with_imported_opencode_credentials()
         .with_env("PATH", common::path_with_binary_dir())
         .with_env("OPENCODE_DISABLE_AUTOUPDATE", "1")
-        // Issue #2022: a config dir whose tui.json lists a plugin (the deck's)
-        // makes OpenCode npm-install @opencode-ai/plugin into it before its
-        // first frame. In this fresh HOME that is a registry download that
-        // overran the composer wait. The deck's plugins import no SDK, and
-        // OpenCode logs a failed install and carries on, so fail it at once.
-        .with_env("npm_config_offline", "true")
         .with_env("OTEL_EXPORTER_OTLP_ENDPOINT", &receiver.endpoint)
         .with_env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json")
         .with_continue_session(
