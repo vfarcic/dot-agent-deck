@@ -26291,6 +26291,111 @@ mod spawn_tests {
         registry.shutdown_all();
     }
 
+    /// A raw `cat` pane, like [`ModelEditor`]'s, whose screen is a recorded
+    /// Claude Code capture replayed up to `point` and then left as it is:
+    /// the deck reads the real frame, and whatever it types lands in the
+    /// returned file. The capture's header latches its release.
+    fn recorded_claude_pane(
+        registry: &Arc<AgentPtyRegistry>,
+        pane: &str,
+        stem: &str,
+        point: &str,
+    ) -> (String, std::path::PathBuf, tempfile::TempDir) {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let bytes = std::fs::read(base.join(format!("{stem}.bin"))).unwrap();
+        let index: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(base.join(format!("{stem}.json"))).unwrap())
+                .unwrap();
+        let (rows, cols) = (
+            index["rows"].as_u64().unwrap() as u16,
+            index["cols"].as_u64().unwrap() as u16,
+        );
+        let upto = index["points"][point].as_u64().unwrap() as usize;
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let typed = dir.path().join("typed");
+        std::fs::write(&typed, b"").unwrap();
+        let command = format!(
+            "stty raw -echo && exec cat > '{}'",
+            typed.to_string_lossy().replace('\'', "'\\''")
+        );
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some(&command),
+                rows,
+                cols,
+                agent_type: Some(AgentType::ClaudeCode),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    pane.to_string(),
+                )]),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the recorded pane");
+        let bus = Arc::clone(&registry.inner.lock().agents[&id].bus);
+        let doorbell = registry.generation_doorbell(&id).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while doorbell.unwrapped_mode().is_err() {
+            assert!(Instant::now() < deadline, "the pane never went raw");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        bus.push(bytes[..upto].to_vec());
+        registry.request_reprojection(pane, &id);
+        while !matches!(
+            bus.evidence().0,
+            crate::evidence_state::EvidenceStatus::Clean { .. }
+        ) {
+            assert!(
+                Instant::now() < deadline,
+                "the recorded screen never turned Clean"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        (id, typed, dir)
+    }
+
+    /// Scenario: Replay Claude Code 2.1.310's and 2.1.312's recorded screens into a raw pane: the empty main composer, then the same composer with `Press Ctrl-C again to exit` in its status row after a first Ctrl+C. The deck rings each. On the empty composer the ring is admitted and types; on the exit-warning screen, whose composer still shows the ordinary placeholder, nothing reaches the pane.
+    #[spec("inbox/doorbell/036")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn doorbell_036_a_ring_on_the_recorded_exit_warning_types_nothing() {
+        for release in ["2.1.310", "2.1.312"] {
+            let stem = format!("claude-inbox/r5wake/claude-{release}-menus-50x200");
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let ring = |id: String, pane: &'static str| {
+                let registry = Arc::clone(&registry);
+                async move {
+                    registry
+                        .ring_doorbell(
+                            pane,
+                            &id,
+                            crate::inbox::MessageId::parse("m-abcdefgh-0123456789abcdef").unwrap(),
+                            true,
+                            || async { true },
+                        )
+                        .await
+                }
+            };
+            let (id, typed, _dir) =
+                recorded_claude_pane(&registry, "pane-recorded-empty", &stem, "empty");
+            let control = ring(id, "pane-recorded-empty").await;
+            assert!(
+                control.attempt.is_some() && !std::fs::read(&typed).unwrap().is_empty(),
+                "{release}: the empty composer admits the ring: {control:?}"
+            );
+            let (id, typed, _dir) =
+                recorded_claude_pane(&registry, "pane-recorded-exit", &stem, "exit-warning");
+            let report = ring(id, "pane-recorded-exit").await;
+            assert!(
+                report.attempt.is_none() && !report.cr_reached,
+                "{release}: the exit warning refuses the ring: {report:?}"
+            );
+            assert!(
+                std::fs::read(&typed).unwrap().is_empty(),
+                "{release}: nothing reaches the pane"
+            );
+            registry.shutdown_all();
+        }
+    }
+
     /// Scenario: Q19, the ledger as the doorbell's input: a human operation is admitted to the model editor's generation and held, then the deck rings; then, with nothing outstanding, the deck rings again while a human operation is admitted between admission and its first byte. Both rings end with nothing written (human input), the pane receives no deck byte, and once nothing is outstanding the next ring is admitted and submitted.
     #[spec("inbox/doorbell/050")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -745,8 +745,24 @@ fn claude_composer(grid: &Grid) -> Option<Composer> {
     })
 }
 
+/// What Claude Code 2.1.310 and 2.1.312 draw in the status row under the
+/// composer after a first Ctrl+C, in place of the mode line (measured
+/// 2026-10-31, `claude-*-menus-50x200`).
+const CLAUDE_EXIT_WARNING: &str = "Press Ctrl-C again to exit";
+
 /// The ready screen: the composer framed by two full-width rules with a
-/// status row under the lower one.
+/// status row under the lower one, and none of the other surfaces Claude
+/// Code 2.1.310 and 2.1.312 draw around that same frame (measured
+/// 2026-10-31, `claude-*-menus-50x200`). Each is told by where and how it
+/// draws, not by any phrase elsewhere on the screen, so a transcript quoting
+/// them doesn't count:
+/// - the background-session overview: its rules in the default colour and
+///   its `❯` grey, where the main composer's rules are grey and its glyph is
+///   grey only while Claude Code works;
+/// - a slash-command or file suggestion list, drawn from the left on the
+///   row right above the upper rule, where the main composer has nothing or
+///   a notice aligned right;
+/// - the exit warning, [`CLAUDE_EXIT_WARNING`] in the status row.
 fn claude_ready(grid: &Grid) -> bool {
     let Some(composer) = claude_composer(grid) else {
         return false;
@@ -754,7 +770,27 @@ fn claude_ready(grid: &Grid) -> bool {
     let Some(close) = (composer.last_row + 1..grid.rows).find(|&r| claude_rule(grid, r)) else {
         return false;
     };
-    (close + 1..grid.rows).any(|r| grid.row_extent(r) > 0)
+    if !(close + 1..grid.rows).any(|r| grid.row_extent(r) > 0) {
+        return false;
+    }
+    let upper = composer.prompt_row - 1;
+    let overview = grid.cells[upper as usize]
+        .iter()
+        .all(|c| c.fg == vt100::Color::Default)
+        && grid
+            .cell(composer.prompt_row, 0)
+            .is_some_and(|c| c.fg != vt100::Color::Default);
+    let suggestions = upper.checked_sub(1).is_some_and(|row| {
+        grid.cells[row as usize]
+            .iter()
+            .position(|c| !c.blank())
+            .is_some_and(|col| col < usize::from(grid.cols / 2))
+    });
+    let exit_warning = grid
+        .text_from(close + 1, 0)
+        .trim_start()
+        .starts_with(CLAUDE_EXIT_WARNING);
+    !overview && !suggestions && !exit_warning
 }
 
 /// Claude Code's dialogs show their choices as `❯ 1. …`; none was seen after
