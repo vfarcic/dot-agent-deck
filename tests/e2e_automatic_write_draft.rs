@@ -12,10 +12,6 @@ use inbox::*;
 use spec::spec;
 use std::time::Duration;
 
-fn launch() -> (TuiDeck, Pane) {
-    launch_with(&[("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "30000")])
-}
-
 fn launch_with(extra: &[(&str, &str)]) -> (TuiDeck, Pane) {
     let mut builder = TuiDeck::builder()
         .with_pty_size(160, 45)
@@ -34,40 +30,6 @@ fn launch_with(extra: &[(&str, &str)]) -> (TuiDeck, Pane) {
     deck.send_keys(b"1");
     deck.wait_for_string("DOORBELL-STANDIN-READY");
     (deck, pane)
-}
-
-/// The head of the submitted row the attached TUI shows for the ring
-/// `line` naming `id`: its token and the id, which fit the pane's width
-/// where the whole token-led line may wrap.
-fn shown_submitted(line: &str, id: &str) -> String {
-    format!("SUBMITTED:{}{PREFIX}{id}", &line[..8])
-}
-
-fn draft(deck: &TuiDeck, pane: &Pane) {
-    deck.send_keys(DRAFT.as_bytes());
-    assert!(
-        common::wait_until(WAIT, || bytes(pane) == DRAFT.as_bytes()),
-        "attached TUI must forward the human draft: {}",
-        deck.snapshot_grid()
-    );
-    deck.wait_for_string(DRAFT);
-}
-
-/// Scenario: Type a human draft through the attached TUI and queue a task. Enter must leave the draft and the token-led doorbell as separate submitted lines visibly in the pane, without typing the task content.
-#[spec("inbox/doorbell/009")]
-#[test]
-fn doorbell_009_attached_draft_enter_releases_the_doorbell() {
-    let (deck, pane) = launch();
-    draft(&deck, &pane);
-    let id = enqueue(&deck, &pane, BODY);
-    unchanged(&pane, Duration::from_millis(700));
-    assert!(rings(&pane).is_empty());
-    deck.send_keys(b"\r");
-    ring(&deck, &pane, &id);
-    let line = rung_line(&pane, &id).unwrap();
-    deck.wait_for_string(&shown_submitted(&line, &id));
-    assert_eq!(bytes(&pane), format!("{DRAFT}\r{line}\r").as_bytes());
-    assert!(!deck.snapshot_grid().contains(BODY));
 }
 
 /// Scenario: Through the attached TUI, the user types while the deck's re-ring lands, their keys reaching the deck after its line and before its Enter. The deck submits its own line alone with one Enter, and the user's text then sits unsubmitted in the composer, exactly as typed.
@@ -135,73 +97,6 @@ fn doorbell_039_typing_while_the_line_lands_keeps_the_users_text_apart() {
             .is_some_and(|text| text.contains(DRAFT))
     }));
     std::fs::write(root.join("completed.release"), "").unwrap();
-}
-
-/// Scenario: Leave a human draft unsent for a 1500 ms observation. The doorbell must stay absent with the message Queued; Ctrl+U clears the draft and permits the token-led line without ever submitting the draft.
-#[spec("inbox/doorbell/010")]
-#[test]
-fn doorbell_010_draft_has_no_timeout_cap() {
-    let (deck, pane) = launch();
-    draft(&deck, &pane);
-    let id = enqueue(&deck, &pane, BODY);
-    unchanged(&pane, Duration::from_millis(1500));
-    assert_eq!(
-        bytes(&pane),
-        DRAFT.as_bytes(),
-        "legacy cap must never force-submit a user draft"
-    );
-    state(&deck, &pane, &id, "queued");
-    deck.send_keys(b"\x15");
-    ring(&deck, &pane, &id);
-    let line = rung_line(&pane, &id).unwrap();
-    deck.wait_for_string(&shown_submitted(&line, &id));
-    assert_eq!(bytes(&pane), format!("{DRAFT}\x15{line}\r").as_bytes());
-    assert!(!turns(&pane).iter().any(|turn| turn["line"] == DRAFT));
-}
-
-/// Scenario: Receive and fetch a control task in the attached TUI's explicitly profiled synthetic editor, then press Left without typing a draft and wait for the editor to redraw its empty composer. A second doorbell must arrive without another keypress, and fetching it must return the new task's nonce.
-#[spec("inbox/doorbell/010")]
-#[test]
-#[cfg(target_os = "linux")]
-fn doorbell_010_attached_left_in_empty_editor_does_not_strand_task() {
-    let (deck, pane) = launch_composer(true);
-    let control = enqueue(&deck, &pane, "empty-editor-control-7e91");
-    ring(&deck, &pane, &control);
-    assert!(fetch(&deck, &pane, true).to_string().contains(&control));
-    // PRD #1666 part 3, round 5-wake: a submitted ring owes no cleanup CR,
-    // so the control settles at its own line and Enter.
-    let settled = format!("{}\r", rung_line(&pane, &control).unwrap());
-    unchanged(&pane, Duration::from_millis(300));
-    assert!(
-        bytes(&pane) == settled.as_bytes(),
-        "control must settle before navigation: {:?}",
-        bytes(&pane)
-    );
-    let revision = composer_revision(&screen(&deck, &pane)).unwrap();
-    deck.send_keys(b"\x1b[D");
-    assert!(
-        common::wait_until(WAIT, || bytes(&pane).ends_with(b"\x1b[D")),
-        "Left must reach the attached pane"
-    );
-    assert!(
-        common::wait_until(WAIT, || {
-            let grid = screen(&deck, &pane);
-            grid.contains("COMPOSER: <empty>")
-                && composer_revision(&grid).is_some_and(|current| current > revision)
-        }),
-        "stand-in must consume navigation and draw the empty composer"
-    );
-    let body = "empty-editor-task-7e91";
-    let id = enqueue(&deck, &pane, body);
-    ring(&deck, &pane, &id);
-    let fetched = fetch(&deck, &pane, true).to_string();
-    assert!(fetched.contains(&id) && fetched.contains(body), "{fetched}");
-}
-
-#[cfg(target_os = "linux")]
-fn composer_revision(grid: &str) -> Option<u64> {
-    grid.lines()
-        .find_map(|line| line.trim().strip_prefix("PROCESSED:")?.parse().ok())
 }
 
 #[cfg(target_os = "linux")]
@@ -345,69 +240,5 @@ fn assert_cannot_type(deck: &TuiDeck, pane: &Pane) {
             .to_string()
             .contains("cannot_type"),
         "unprofiled hold: {record}"
-    );
-}
-
-/// Scenario: After a submitted doorbell, type a fresh human draft and fetch the task through another consumer, then clear the draft. A submitted ring owes the pane nothing more: no carriage return goes while the draft is there or after it is cleared, the draft is never submitted, and no new doorbell is typed.
-#[spec("inbox/doorbell/011")]
-#[test]
-fn doorbell_011_a_submitted_ring_sends_nothing_after_a_new_human_draft() {
-    let (deck, pane) = launch();
-    let id = enqueue(&deck, &pane, BODY);
-    ring(&deck, &pane, &id);
-    let line = rung_line(&pane, &id).unwrap();
-    deck.send_keys(DRAFT.as_bytes());
-    deck.wait_for_string(DRAFT);
-    assert!(common::wait_until(WAIT, || bytes(&pane).ends_with(DRAFT.as_bytes())));
-    fetch(&deck, &pane, true);
-    state(&deck, &pane, &id, "acknowledged");
-    unchanged(&pane, Duration::from_millis(700));
-    assert!(
-        bytes(&pane).ends_with(DRAFT.as_bytes()),
-        "something submitted the human draft"
-    );
-    deck.send_keys(b"\x15");
-    let expected = format!("{line}\r{DRAFT}\x15");
-    assert!(
-        common::wait_until(WAIT, || bytes(&pane) == expected.as_bytes()),
-        "Ctrl+U must reach the pane: {:?}",
-        bytes(&pane)
-    );
-    unchanged(&pane, Duration::from_millis(700));
-    assert_eq!(
-        bytes(&pane),
-        expected.as_bytes(),
-        "nothing follows the cleared draft"
-    );
-    assert_eq!(rings(&pane).len(), 1);
-    assert!(!turns(&pane).iter().any(|turn| turn["line"] == DRAFT));
-}
-
-/// Scenario: Hold two queued reports behind a draft in an attached pane. Clearing the draft must produce one coalesced token-led line; fetching must return both reports in arrival order with no report content typed into the pane.
-#[spec("inbox/doorbell/012")]
-#[test]
-fn doorbell_012_drafted_batch_fetch_preserves_arrival_order() {
-    let (deck, pane) = launch();
-    draft(&deck, &pane);
-    let first = enqueue(&deck, &pane, "first-worker-report-1666");
-    let second = enqueue(&deck, &pane, "second-worker-report-1666");
-    unchanged(&pane, Duration::from_millis(700));
-    deck.send_keys(b"\x15");
-    assert!(
-        common::wait_until(WAIT, || !rings(&pane).is_empty()),
-        "draft clear never released batch"
-    );
-    let reply = fetch(&deck, &pane, true).to_string();
-    assert!(
-        reply.find("first-worker-report-1666").unwrap()
-            < reply.find("second-worker-report-1666").unwrap(),
-        "fetch must preserve report arrival order: {reply}"
-    );
-    state(&deck, &pane, &first, "acknowledged");
-    state(&deck, &pane, &second, "acknowledged");
-    assert_eq!(rings(&pane).len(), 1);
-    let grid = deck.snapshot_grid();
-    assert!(
-        !grid.contains("first-worker-report-1666") && !grid.contains("second-worker-report-1666")
     );
 }

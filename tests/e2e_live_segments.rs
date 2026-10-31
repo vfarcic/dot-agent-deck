@@ -419,7 +419,7 @@ fn probe_046_attached_dashboard_shows_clears_and_retires_held_typing() {
     f.stable(b"");
 }
 
-/// Scenario: Invoke the user's editor through the installed helper with and without its report connection, including a run with no added editor delay, and read the epoch around its output pair. The unmatched external edit must move the foreign epoch once without an empty observation clearing it; the test does not order editor exit against the first observer scan.
+/// Scenario: Invoke the user's editor through the installed helper and directly without the helper, including a run with no added editor delay, and read the epoch around its output pair. The unmatched external edit must move the foreign epoch once without an empty observation clearing it; the test does not order editor exit against the first observer scan.
 #[spec("inbox/probe/048")]
 #[test]
 fn probe_048_unreported_and_fast_external_edits_move_the_foreign_epoch() {

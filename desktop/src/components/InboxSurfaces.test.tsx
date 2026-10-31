@@ -54,6 +54,27 @@ function edge(status: HandoffEdge["status"]): HandoffEdge {
 }
 
 describe("inbox cards and handoff rail (S13)", () => {
+  /// Scenario: inbox/probe/037 — a production Absent observer leaves a touched Claude box waiting for an explicit fetch and a touched Codex box waiting for its prompt route. The real bridge and card show each daemon reason and replace a previous possible-draft remedy, then clear the explanation when the prompt takes the mail.
+  it.each([
+    ["claude_code", "needs_fetch"],
+    ["codex", "cannot_type"],
+  ] as const)("inbox/probe/037: Absent %s keeps its %s explanation", (agentType, wakeHold) => {
+    const before = snapshot(1, 0, true);
+    Object.assign(before.agents[0], { agentType });
+    Object.assign(before.agents[0].inbox!, { wakeHold: "possible_draft" });
+    const view = render(card(mapDesktopSnapshot(before).agents[0]));
+    expect(screen.getByRole("article", { name: "Coder" })).toHaveTextContent(words.wakeHolds.possible_draft);
+    const absent = snapshot(1, 0, true);
+    Object.assign(absent.agents[0], { agentType });
+    Object.assign(absent.agents[0].inbox!, { wakeHold });
+    view.rerender(card(mapDesktopSnapshot(absent).agents[0]));
+    const tile = screen.getByRole("article", { name: "Coder" });
+    expect(tile).toHaveTextContent(words.wakeHolds[wakeHold]);
+    expect(tile).not.toHaveTextContent(words.wakeHolds.possible_draft);
+    view.rerender(card(mapDesktopSnapshot(snapshot()).agents[0]));
+    expect(tile).not.toHaveTextContent(words.wakeHolds[wakeHold]);
+  });
+
   /// Scenario: Render the real card from a desktop DTO with queued and fetched messages; both count toward its envelope badge.
   it.each([[2, 0], [0, 2], [1, 1]])("shows ✉2 for %i queued and %i fetched messages", (queued, fetched) => {
     const mapped = mapDesktopSnapshot(snapshot(queued, fetched));
