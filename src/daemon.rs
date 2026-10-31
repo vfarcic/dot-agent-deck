@@ -5057,6 +5057,9 @@ struct ProcessLookups {
     /// A process's arguments, read only for one an OpenCode receiver names
     /// ([`opencode_server_client`]).
     arguments_of: fn(u32) -> Option<Vec<String>>,
+    /// Whether a process's stdin and stdout are both sockets, as an OpenCode
+    /// 2 private server's are ([`opencode_server_client`]).
+    stdio_is_sockets: fn(u32) -> bool,
 }
 
 /// This platform's process table.
@@ -5066,6 +5069,7 @@ const PLATFORM_LOOKUPS: ProcessLookups = ProcessLookups {
     executable_of: crate::platform::proc::executable_of,
     started: crate::platform::proc::process_start_of,
     arguments_of: crate::opencode_mode::arguments_of,
+    stdio_is_sockets: crate::opencode_mode::stdio_is_sockets,
 };
 
 /// Whether the connecting process `peer` may use, for `used_as`, the token of
@@ -5104,6 +5108,7 @@ fn admit_inbox_component_with(
             lookups.parent_of,
             lookups.executable_of,
             lookups.arguments_of,
+            lookups.stdio_is_sockets,
         )),
         (_, admitted) => admitted,
     };
@@ -5129,13 +5134,24 @@ fn admit_inbox_component_with(
 /// pin the client, as on 1.x.
 ///
 /// The pin's protection is kept: the resolution moves a process to its own
-/// client and no further, and only one step. A nested OpenCode the agent starts
-/// through a tool runs under that tool's shell, so its own private server
-/// resolves to the nested client, which is not the pinned one and is refused
-/// by the hub's pin as before. The resolved client is held to what a named
-/// instance is ([`admit_component`]): it must not be above the agent's own
-/// process `root`; when it would be, or anything cannot be read, `instance`
-/// stands.
+/// client and no further, and only one step. What it enforces, and nothing
+/// more:
+///
+/// - `instance` runs an OpenCode executable
+///   ([`crate::opencode_mode::opencode_name`]) whose arguments carry the
+///   tokens `serve` and `--stdio`;
+/// - on Linux, its stdin and stdout are both sockets, as a private server's
+///   are (measured on 2.2.5: a socketpair with its client). A process a tool
+///   starts with `exec opencode serve --stdio` keeps the tool's stdio, which
+///   is pipes or `/dev/null`, so it stands as named. Off Linux this is not
+///   checked;
+/// - its direct parent runs the very same executable and is not above the
+///   agent's own process `root` ([`admit_component`]).
+///
+/// When any of that fails, or cannot be read, `instance` stands. On 2.2.5 a
+/// tool's commands run under the private server, not the client (measured),
+/// so a nested OpenCode a tool starts resolves at most to the pane's private
+/// server, which is not the pinned client, and the hub's pin refuses it.
 fn opencode_server_client(
     instance: u32,
     root: Option<u32>,
@@ -5143,6 +5159,7 @@ fn opencode_server_client(
     parent_of: impl Fn(u32) -> Option<u32>,
     executable_of: impl Fn(u32) -> Option<std::path::PathBuf>,
     arguments_of: impl Fn(u32) -> Option<Vec<String>>,
+    stdio_is_sockets: impl Fn(u32) -> bool,
 ) -> u32 {
     let Some(exe) = executable_of(instance) else {
         return instance;
@@ -5150,14 +5167,13 @@ fn opencode_server_client(
     let opencode = exe
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with("opencode"));
+        .is_some_and(crate::opencode_mode::opencode_name);
     if !opencode {
         return instance;
     }
-    let private_server = arguments_of(instance).is_some_and(|argv| {
-        argv.get(1).map(String::as_str) == Some("serve") && argv.iter().any(|a| a == "--stdio")
-    });
-    if !private_server {
+    let private_server =
+        arguments_of(instance).is_some_and(|argv| crate::opencode_mode::serves_stdio(&argv));
+    if !private_server || !stdio_is_sockets(instance) {
         return instance;
     }
     let Some(client) = parent_of(instance).filter(|&parent| parent > 1) else {
@@ -12861,6 +12877,7 @@ mod hook_ingestion_tests {
                 _ => None,
             },
             arguments_of: |_| None,
+            stdio_is_sockets: |_| true,
         };
         let admit = |peer, claimed, used_as, evidence| {
             admit_inbox_component_with(peer, claimed, Some(10), used_as, evidence, &lookups)
@@ -12944,8 +12961,9 @@ mod hook_ingestion_tests {
     /// (measured on 2.2.5), runs the server plugin. A receiver either names
     /// resolves to the client, in either order, so the hub's first-come pin
     /// holds both. A nested OpenCode a tool starts resolves to its own client,
-    /// which the pin refuses; other OpenCode subcommands, a parent running
-    /// another executable and a client above the agent stand as named.
+    /// which the pin refuses; a `serve --stdio` whose stdio is not sockets,
+    /// other OpenCode subcommands, a parent running another executable and a
+    /// client above the agent stand as named.
     #[test]
     fn opencode_2s_private_server_resolves_to_its_client_as_the_receiver() {
         // 1 ── 9 sh (the pane's wrapper, the agent root)
@@ -12954,14 +12972,15 @@ mod hook_ingestion_tests {
         //              │     └── 14 bash (a tool) ── 15 opencode (nested client)
         //              │                               └── 16 opencode serve --stdio ── 17 CLI
         //              ├── 13 CLI (TUI half's watcher)
-        //              └── 18 opencode run ── 19 CLI
+        //              ├── 18 opencode run ── 19 CLI
+        //              └── 40 opencode serve --stdio (a tool's exec, on pipes) ── 41 CLI
         // 1 ── 30 node ── 31 opencode serve --stdio ── 32 CLI (parent not OpenCode)
         let lookups = ProcessLookups {
             descends: |pid, root| {
                 crate::platform::proc::descends_from_with(pid, root, |pid| match pid {
                     9 | 30 => Some(1),
                     10 => Some(9),
-                    11 | 13 | 18 => Some(10),
+                    11 | 13 | 18 | 40 => Some(10),
                     12 | 14 => Some(11),
                     15 => Some(14),
                     16 => Some(15),
@@ -12969,13 +12988,14 @@ mod hook_ingestion_tests {
                     19 => Some(18),
                     31 => Some(30),
                     32 => Some(31),
+                    41 => Some(40),
                     _ => None,
                 })
             },
             parent_of: |pid| match pid {
                 9 | 30 => Some(1),
                 10 => Some(9),
-                11 | 13 | 18 => Some(10),
+                11 | 13 | 18 | 40 => Some(10),
                 12 | 14 => Some(11),
                 15 => Some(14),
                 16 => Some(15),
@@ -12983,14 +13003,15 @@ mod hook_ingestion_tests {
                 19 => Some(18),
                 31 => Some(30),
                 32 => Some(31),
+                41 => Some(40),
                 _ => None,
             },
             executable_of: |pid| {
                 let exe = match pid {
                     9 => "/bin/sh",
                     14 => "/bin/bash",
-                    10 | 11 | 15 | 16 | 18 | 31 => "/home/u/.opencode/bin/opencode",
-                    12 | 13 | 17 | 19 | 32 => "/opt/dot-agent-deck",
+                    10 | 11 | 15 | 16 | 18 | 31 | 40 => "/home/u/.opencode/bin/opencode",
+                    12 | 13 | 17 | 19 | 32 | 41 => "/opt/dot-agent-deck",
                     30 => "/usr/bin/node",
                     _ => return None,
                 };
@@ -13009,10 +13030,14 @@ mod hook_ingestion_tests {
                     ],
                     15 => &["opencode"],
                     18 => &["opencode", "run", "hi"],
+                    40 => &["opencode", "serve", "--stdio"],
                     _ => return None,
                 };
                 Some(argv.iter().map(|a| a.to_string()).collect())
             },
+            // Pid 40 is `exec opencode serve --stdio` from a tool the client
+            // ran (OpenCode 1.x runs tools in its client): the tool's pipes.
+            stdio_is_sockets: |pid| pid != 40,
         };
         let receiver = |peer: u32, claimed: u32, root: u32| {
             admit_inbox_component_with(
@@ -13048,6 +13073,11 @@ mod hook_ingestion_tests {
             receiver(19, 18, 9),
             Ok(Some(18)),
             "another subcommand stands"
+        );
+        assert_eq!(
+            receiver(41, 40, 9),
+            Ok(Some(40)),
+            "a `serve --stdio` a tool exec'd under the client, on the tool's pipes, stands"
         );
         assert_eq!(
             receiver(32, 31, 30),
