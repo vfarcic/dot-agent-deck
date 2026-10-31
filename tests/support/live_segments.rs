@@ -69,6 +69,15 @@ pub struct Fixture {
     pub kind: &'static str,
     instance: PathBuf,
     exe: PathBuf,
+    launcher: Option<Launcher>,
+}
+
+/// Test-owned launcher histories; these change processes, never daemon state.
+#[derive(Clone, Copy)]
+pub struct Launcher {
+    pub mode: &'static str,
+    pub declared: bool,
+    pub lookalike: bool,
 }
 
 impl Fixture {
@@ -77,16 +86,28 @@ impl Fixture {
     }
 
     pub fn with_env(kind: &'static str, extra: &[(&str, &str)]) -> Self {
-        Self::configured(kind, extra, true)
+        Self::configured(kind, extra, true, None)
     }
 
     /// Production Absent control: no editor-probe assumption or binding seam.
     pub fn absent(kind: &'static str, extra: &[(&str, &str)]) -> Self {
-        Self::configured(kind, extra, false)
+        Self::configured(kind, extra, false, None)
     }
 
-    fn configured(kind: &'static str, extra: &[(&str, &str)], assumed: bool) -> Self {
+    pub fn launcher(kind: &'static str, launcher: Launcher, extra: &[(&str, &str)]) -> Self {
+        Self::configured(kind, extra, true, Some(launcher))
+    }
+
+    fn configured(
+        kind: &'static str,
+        extra: &[(&str, &str)],
+        assumed: bool,
+        launcher: Option<Launcher>,
+    ) -> Self {
         let mut env = vec![("DOT_AGENT_DECK_DOORBELL_TICK_MS", "25")];
+        if launcher.is_some() {
+            env.push(("PATH", "/usr/bin:/bin"));
+        }
         if assumed {
             env.push((
                 "DOT_AGENT_DECK_E2E_ASSUME_EDITOR_PROBE",
@@ -100,6 +121,17 @@ impl Fixture {
         let exe = native.join(kind);
         fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
         fs::set_permissions(&exe, fs::Permissions::from_mode(0o700)).unwrap();
+        if launcher.is_some() {
+            executable(
+                &native.join("launcher"),
+                include_str!("discovery_launcher.py"),
+            );
+            let fake = native.join("lookalike").join(kind);
+            fs::create_dir(fake.parent().unwrap()).unwrap();
+            // Same bytes, name and claimed argv; a different kernel executable.
+            fs::copy(&exe, &fake).unwrap();
+            fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         fs::write(
             native.join("composer_external_edit.py"),
             checked_replace(include_str!("composer_external_edit.py"),
@@ -135,6 +167,16 @@ impl Fixture {
         );
         executable(&native.join("editor"), &editor);
         executable(&native.join("broker"), BROKER);
+        if launcher.is_some() {
+            for name in [
+                "composer.py",
+                "composer_external_edit.py",
+                "editor",
+                "broker",
+            ] {
+                fs::copy(native.join(name), native.join("lookalike").join(name)).unwrap();
+            }
+        }
         let mut f = Self {
             daemon,
             base: PathBuf::new(),
@@ -143,6 +185,7 @@ impl Fixture {
             kind,
             instance: PathBuf::new(),
             exe,
+            launcher,
         };
         f.spawn("first");
         f
@@ -160,25 +203,80 @@ impl Fixture {
             self.exe.parent().unwrap().join("editor").display(),
             self.base.display()
         );
-        let reply = inbox::attach(
-            &self.daemon,
-            json!({
-            "op":"start-agent", "command":format!("{} --live-segments-fixture",quote(&self.exe)), "cwd":self.daemon.home,
-                "rows":40,"cols":140,"display_name":"segment-fixture",
-                "agent_type":if self.kind == "codex" {"codex"} else {"claude_code"},
-                "env":[[MODE,self.base.to_str().unwrap()], ["DOT_AGENT_DECK_PANE_ID",PANE],
-                    ["DAD_LIVE_SEGMENTS_KIND",self.kind], ["VISUAL",editor], ["EDITOR",editor],
-                    ["TMPDIR",self.daemon.home.join("tmp")], ["CODEX_HOME",self.daemon.home.join("codex")]],
-            }),
-        );
+        let command = if self.launcher.is_some() {
+            format!(
+                "{} {}",
+                quote(&self.exe.parent().unwrap().join("launcher")),
+                quote(&self.exe)
+            )
+        } else {
+            format!("{} --live-segments-fixture", quote(&self.exe))
+        };
+        let mut request = json!({
+        "op":"start-agent", "command":command, "cwd":self.daemon.home,
+            "rows":40,"cols":140,"display_name":"segment-fixture",
+            "agent_type":if self.kind == "codex" {"codex"} else {"claude_code"},
+            "env":[[MODE,self.base.to_str().unwrap()], ["DOT_AGENT_DECK_PANE_ID",PANE],
+                ["DAD_LIVE_SEGMENTS_KIND",self.kind], ["VISUAL",editor], ["EDITOR",editor],
+                ["TMPDIR",self.daemon.home.join("tmp")], ["CODEX_HOME",self.daemon.home.join("codex")]],
+        });
+        if let Some(launcher) = self.launcher {
+            if !launcher.declared {
+                request.as_object_mut().unwrap().remove("agent_type");
+            }
+            let env = request["env"].as_array_mut().unwrap();
+            env.extend([
+                json!(["DAD_DISCOVERY_LAUNCH", launcher.mode]),
+                json!([
+                    "DAD_DISCOVERY_LOOKALIKE",
+                    if launcher.lookalike { "1" } else { "0" }
+                ]),
+                json!([
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", self.exe.parent().unwrap().display())
+                ]),
+            ]);
+        }
+        let reply = inbox::attach(&self.daemon, request);
         assert_eq!(reply["ok"], true, "native synthetic spawn: {reply}");
         self.agent = reply["id"].as_str().unwrap().into();
-        let ready = read_json(&self.path("ready"));
+        let ready = read_json(&self.path(if self.launcher.is_some() {
+            "launcher-ready"
+        } else {
+            "ready"
+        }));
         self.generation = ready["generation"]
             .as_u64()
             .expect("installed synthetic generation");
         self.instance = PathBuf::from(ready["instance"].as_str().unwrap());
-        assert_eq!(ready["exe"], json!(self.exe), "native exec acknowledgement");
+        if self.launcher.is_none() {
+            self.wait_screen();
+        }
+    }
+
+    pub fn launch(&self) -> Value {
+        self.flag("launch-go");
+        let ready = read_json(&self.path("ready"));
+        let expected = if self.launcher.is_some_and(|l| l.lookalike) {
+            self.exe.parent().unwrap().join("lookalike").join(self.kind)
+        } else {
+            self.exe.clone()
+        };
+        assert_eq!(ready["exe"], json!(expected), "native exec acknowledgement");
+        assert_eq!(ready["generation"], self.generation);
+        self.wait_screen();
+        ready
+    }
+
+    pub fn instance(&self) -> &Path {
+        &self.instance
+    }
+
+    pub fn native_executable(&self) -> &Path {
+        &self.exe
+    }
+
+    fn wait_screen(&self) {
         assert!(
             common::wait_until(common::child_boot_budget(), || {
                 let screen = common::pane_snapshot_on(&self.daemon.attach_socket, &self.agent);
@@ -194,7 +292,8 @@ impl Fixture {
                         "Claude Code"
                     })
             }),
-            "F2 screen must be visible before any probe assertion"
+            "F2 screen must be visible before any probe assertion: {}",
+            self.screen()
         );
     }
 
@@ -427,6 +526,10 @@ impl Drop for HelperPause {
 impl Drop for Fixture {
     fn drop(&mut self) {
         for suffix in [
+            "native-stop",
+            "wrapper-stop",
+            "launch-go",
+            "reparent-go",
             "editor-go",
             "editor-publish-go",
             "helper-go",
@@ -440,6 +543,22 @@ impl Drop for Fixture {
         }
         let root = self.daemon.home.join("probe-gate");
         let _ = fs::write(root.join("scheduled.release"), "");
+        // Release only this fixture's discovery barriers before StopAgent.
+        let root = self.daemon.home.join("discovery-gate");
+        if let Ok(entries) = fs::read_dir(root) {
+            for entry in entries.flatten() {
+                if let Some(generation) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|s| s.strip_suffix(".arrived"))
+                {
+                    let _ = fs::write(
+                        entry.path().with_file_name(format!("{generation}.release")),
+                        "",
+                    );
+                }
+            }
+        }
         let _ = common::attach_request_on(
             &self.daemon.attach_socket,
             &dot_agent_deck::daemon_protocol::AttachRequest::StopAgent {
@@ -472,6 +591,39 @@ pub fn native_entry() {
     };
     let base = PathBuf::from(base);
     let kind = std::env::var("DAD_LIVE_SEGMENTS_KIND").unwrap();
+    if std::env::args_os().skip(1).any(|arg| arg == "--version") {
+        println!(
+            "{}",
+            if kind == "codex" {
+                "0.164.0"
+            } else {
+                "2.1.310"
+            }
+        );
+        std::process::exit(0);
+    }
+    if std::env::args_os().skip(1).any(|arg| arg == "app-server") {
+        // The wrapper's ordinary hooks/list probe must not start another
+        // composer or overwrite the pane child's readiness acknowledgement.
+        // This synthetic server advertises no hook key or hash to trust.
+        use std::io::BufRead;
+        for line in std::io::stdin().lock().lines() {
+            let request: Value = serde_json::from_str(&line.unwrap()).unwrap();
+            if let Some(id) = request.get("id") {
+                let result = if request["method"] == "hooks/list" {
+                    json!({"hooks":[]})
+                } else {
+                    json!({})
+                };
+                println!("{}", json!({"jsonrpc":"2.0","id":id,"result":result}));
+                std::io::stdout().flush().unwrap();
+                if request["method"] == "hooks/list" {
+                    break;
+                }
+            }
+        }
+        std::process::exit(0);
+    }
     let exe = std::env::current_exe().unwrap();
     let helper = PathBuf::from(std::env::var_os("VISUAL").unwrap());
     let generation = std::env::var("DOT_AGENT_DECK_EDITOR_GEN")
@@ -508,12 +660,22 @@ pub fn native_entry() {
         .unwrap();
     atomic(
         &base.with_extension("ready"),
-        &json!({"pid":std::process::id(),"exe":exe,"generation":generation,"instance":helper.parent().unwrap()}),
+        &json!({"pid":std::process::id(),"exe":exe,"generation":generation,"instance":helper.parent().unwrap(),
+        "editors":{
+            "VISUAL":std::env::var("VISUAL").ok(),
+            "EDITOR":std::env::var("EDITOR").ok(),
+            "DOT_AGENT_DECK_EDITOR_GEN":std::env::var("DOT_AGENT_DECK_EDITOR_GEN").ok(),
+        }}),
     );
     let mut running: Option<Child> = None;
     let mut finished: Option<i32> = None;
     let mut invocation = 0;
     loop {
+        if base.with_extension("native-stop").exists() {
+            let _ = composer.kill();
+            let _ = composer.wait();
+            break;
+        }
         if let Some(child) = running.as_mut()
             && let Some(status) = child.try_wait().unwrap()
         {
@@ -643,5 +805,6 @@ pub fn native_entry() {
         let _ = child.kill();
         let _ = child.wait();
     }
+    fs::write(base.with_extension("native-stopped"), "").unwrap();
     std::process::exit(0);
 }

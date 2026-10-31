@@ -13910,6 +13910,14 @@ PRD #1666 part 3, round 5: where the deck keeps a worker's report, or a dispatch
 - **Does not assert:** permission projection, generation identity publication, or the later helper's dispatch and editor behavior (`inbox/probe/020`, `067`); a runtime directory owned by another user, which the fixture can't make.
 - **Platform coverage:** Linux.
 
+##### inbox/probe/035 — Launchers and learned wrappers bind the attested native agent below the PTY child.
+
+- **Layer:** L2 lane 1 (`tests/e2e_launcher_discovery.rs`, Linux, `feature = "e2e"`).
+- **Agent:** private native copies of the test executable named Claude/Codex, with the F2 composer and real installed helper; a Python launcher; no real agent or credential.
+- **Asserts:** declared launchers in exec and spawn forms and wrappers learned after spawn start Pending, then publish the native pid, birth identity and executable inode in `gen-G`, publish the agent's `kind-G`, become Armable and check a touched empty composer through the real helper. An executable lookalike with identical bytes, name and claimed argv but a different inode gets no identity, permission or check. For declared launchers, learned wrappers and lookalikes, reparenting or exiting the candidate during discovery, forcing the production foreign-uid refusal, and replacing the generation prevent the old candidate from granting permission. A real successor needs its own discovery; an attested successor then checks. Editor variables survive binding. Four fixture controls exercise ordinary unarmed editing through both launcher forms for declared/learned/lookalike commands, and live reparenting, without the new discovery interfaces.
+- **Does not assert:** production installation/activation, an actual process owned by another OS uid (the refusal-only seam covers that validator branch), interpreter-hosted agent attestation, symlink-resolution controls, Q28(b)'s hook-trust transaction, a real agent's readiness, or a mail ring. The assumed read-only status, candidate barrier, refusal-only uid fault and trusted native resolution are documented in the module; Q35-22 must supply them without bypassing validation. These tests are an intentional RED slice on S-20/S-21 until discovery and its observation interface land. The fixture controls do not certify binding.
+- **Platform coverage:** Linux; process identities are read from `/proc` inside isolated harness homes. No macOS claim and no demo-reel marker.
+
 ##### inbox/probe/034 — Claude-style Bash tools recover the original editor state and then source the user's preset.
 
 - **Layer:** L2 lane 1 (`tests/e2e_editor_installation.rs`).
