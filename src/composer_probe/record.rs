@@ -1383,7 +1383,6 @@ impl Records {
         Ok(fact)
     }
 
-    /// A probe published one more liability; `stamp` read after the store.
     /// What [`Self::raise`] would make the count, without recording it:
     /// `Err` exactly when it would refuse.
     pub fn can_raise(&self, generation: u64) -> Result<u32, Refusal> {
@@ -1391,6 +1390,7 @@ impl Records {
         self.history.count().checked_add(1).ok_or(Refusal::Count)
     }
 
+    /// A probe published one more liability; `stamp` read after the store.
     pub fn raise(&mut self, generation: u64, stamp: Instant) -> Result<u32, Refusal> {
         self.check(generation)?;
         let count = self.history.count().checked_add(1).ok_or(Refusal::Count)?;

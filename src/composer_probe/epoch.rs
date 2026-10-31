@@ -52,10 +52,16 @@
 //! ticketed enqueue and inside the output lock at the output hook. Every
 //! method takes it, does its arithmetic and releases it, calling only the
 //! framing, ledger and record code of this module's siblings while it is
-//! held, none of which takes a lock, does I/O or calls back out. The output
-//! and ingress locks aren't ranked, so the checker sees neither of those
-//! edges: that neither is taken under this lock rests on that leaf code, and
-//! a change that adds a callback here reviews those edges again.
+//! held, none of which takes a lock, does I/O or calls back out. The one
+//! callback is the arm's publication ([`GenerationInput::arm_probe`],
+//! [`GenerationInput::raise_published`]), which runs under this lock: its
+//! contract is to take no lock and do no I/O, and the production page
+//! (`GenerationFiles`) keeps it by storing to the mapped page's atomics, so
+//! a page fault on that mapping is the one wait it can add. The output and
+//! ingress locks aren't ranked, so the checker sees neither of those edges:
+//! that neither is taken under this lock rests on that leaf code and that
+//! callback's contract, and a change that adds a callback here, or a page
+//! whose publication breaks the contract, reviews those edges again.
 //!
 //! **The invocation records** ([`super::record::Records`], Q35-07) live under
 //! the same lock once attached ([`GenerationInput::attach_records`]), so a

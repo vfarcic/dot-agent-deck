@@ -776,7 +776,10 @@ pub trait Page {
 
     /// Publish `count` with `seg_seq`, the probe's segment number, in one
     /// publication (Q35-19, R5 §4.2): the helper reads both in the same
-    /// seqlock. A page with no segment word keeps only the count.
+    /// seqlock. A page with no segment word keeps only the count. The arm
+    /// calls it under the generation's input lock
+    /// ([`super::epoch::GenerationInput::arm_probe`]), so it must take no
+    /// lock and do no I/O.
     fn publish_probe(&mut self, count: u32, seg_seq: u64) {
         let _ = seg_seq;
         self.publish(count);
@@ -874,8 +877,10 @@ impl<P: Page> Seam<P> {
     /// section of the generation's input lock ([`GenerationInput::arm_probe`]),
     /// which retirement takes as well (the Q35-19 review's U2), so a
     /// retirement lands before the arm, which then refuses, or after it.
-    /// What the output hook can change in between (`B`, a `Quiet` entry
-    /// latching) could as well land just after the byte. **A refusal
+    /// The output hook takes that lock too, so it can't change `B` or latch
+    /// a `Quiet` entry between admission and the publication; what it
+    /// changes after the section and before the byte could as well land
+    /// just after the byte. **A refusal
     /// publishes nothing and records nothing**: every refusal, retirement's
     /// included, comes before the store. The new count.
     pub fn arm(

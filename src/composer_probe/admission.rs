@@ -162,8 +162,9 @@ pub enum Refusal {
     Surface,
     /// O5: the query-wait estimate is still ahead.
     Estimate(Instant),
-    /// The records refused the arm's raise after admission (retired since,
-    /// or the count can't move).
+    /// The records refused the arm's raise after admission: they belong to
+    /// another generation, or the count can't move. Retirement can't land
+    /// between the two, since the arm admits and raises in one hold.
     Raise(record::Refusal),
 }
 
