@@ -33,6 +33,29 @@ tasks:
       repository: https://github.com/vfarcic/dot-agent-deck.git
       ref: ${{ init.commit-sha }}
 
+  # Issue #2052 — the version the sandbox's builds report, the way CI's builds
+  # get one (issue #326; `.rwx/ci.yml`'s `backend` task and ci.yml's `changes`
+  # job's `version` step): `code` is a shallow clone with no tags, so
+  # `build.rs`'s `git describe` finds none and a build reports the `0.1.0`
+  # placeholder as "version unknown" (`0.1.0+unknown`), and the lane-1 tests
+  # written against a known version (`remote_upgrade_*`, `remote_connect_*`)
+  # fail. The newest vX.Y.Z tag at origin is what a developer's checkout of
+  # `main` reports. `cache: false`: the tags move without the commit moving,
+  # so a cached value would go stale.
+  - key: version
+    use: code
+    cache: false
+    run: |
+      set -euo pipefail
+      dad_version=$(git ls-remote --tags --refs origin 'v*' \
+        | sed -n 's#.*refs/tags/v\([0-9]*\.[0-9]*\.[0-9]*\)$#\1#p' | sort -V | tail -n 1)
+      if [ -z "$dad_version" ]; then
+        echo "no vX.Y.Z release tag found at origin" >&2
+        exit 1
+      fi
+      printf '%s' "$dad_version" > "$RWX_VALUES/dad_version"
+      echo "dad_version=$dad_version"
+
   - key: rust
     call: rust-lang/install 1.1.1
     with:
@@ -67,6 +90,8 @@ tasks:
       disk: 150gb
     env:
       DAD_REQUIRE_GO_TASK: "1"
+      # Issue #2052: see the `version` task.
+      DAD_VERSION: ${{ tasks.version.values.dad_version }}
     # Billed per second while alive, idle included. `affected-checks --run`
     # stops it when it finishes; this is the backstop for everything else (an
     # interrupted run, an ad-hoc `rwx sandbox exec`). A running command counts
