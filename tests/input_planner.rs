@@ -253,30 +253,39 @@ fn boundary_after(bytes: &[u8], grammar: InputGrammar) -> Boundary {
     physical.boundary()
 }
 
-/// Scenario: Feed the writer's tracker, with Claude Code 2.1.310/2.1.312's measured input grammar, the user's `ESC [` then Ctrl+U, `ESC [` then Enter, and `ESC [` then BEL, each as two writes: each C0 aborts the CSI, so the stream is in ground at once. The strict grammar keeps the same bytes inside the CSI, and under the measured one a CSI's parameters, intermediates and private marker keep it open.
+/// Scenario: Feed the writer's tracker, with Claude Code 2.1.310/2.1.312's measured input grammar, the user's `ESC [`, and a CSI holding parameters (`ESC [ 1;2`), an intermediate (`ESC [ 1 space`) or a private marker (`ESC [ ?`), each followed by Ctrl+U, Enter or BEL, as one write and as two. Each prefix alone stays inside the CSI, and each C0 aborts it, so the stream is in ground at once. The strict grammar keeps the same bytes inside the CSI, however they are written.
 #[spec("inbox/probe/076")]
 #[test]
 fn probe_076_the_measured_grammar_aborts_a_csi_on_a_c0() {
-    for c0 in [0x15u8, b'\r', 0x07] {
-        let physical = Physical::default();
-        let mut tracker = PhysicalTracker::default();
-        tracker.written_as(b"\x1b[", &physical, InputGrammar::ClaudeMeasured);
-        assert_eq!(physical.boundary(), Boundary::Inside);
-        tracker.written_as(&[c0], &physical, InputGrammar::ClaudeMeasured);
-        assert_eq!(physical.boundary(), Boundary::Ground, "{c0:#x} aborts it");
-
-        let physical = Physical::default();
-        let mut tracker = PhysicalTracker::default();
-        tracker.written(b"\x1b[", &physical);
-        tracker.written(&[c0], &physical);
-        assert_eq!(physical.boundary(), Boundary::Inside, "{c0:#x}, strict");
-    }
-    for open in [b"\x1b[1;2".as_slice(), b"\x1b[1 ", b"\x1b[?"] {
+    for open in [b"\x1b[".as_slice(), b"\x1b[1;2", b"\x1b[1 ", b"\x1b[?"] {
         assert_eq!(
             boundary_after(open, InputGrammar::ClaudeMeasured),
             Boundary::Inside,
-            "{open:?}: parameters and intermediates stay inside"
+            "{open:?} stays inside"
         );
+        for c0 in [0x15u8, b'\r', 0x07] {
+            let whole = [open, &[c0]].concat();
+            for (grammar, expected) in [
+                (InputGrammar::ClaudeMeasured, Boundary::Ground),
+                (InputGrammar::Strict, Boundary::Inside),
+            ] {
+                assert_eq!(
+                    boundary_after(&whole, grammar),
+                    expected,
+                    "{open:?} then {c0:#x}, one write, {grammar:?}"
+                );
+                let physical = Physical::default();
+                let mut tracker = PhysicalTracker::default();
+                tracker.written_as(open, &physical, grammar);
+                assert_eq!(physical.boundary(), Boundary::Inside, "{open:?}");
+                tracker.written_as(&[c0], &physical, grammar);
+                assert_eq!(
+                    physical.boundary(),
+                    expected,
+                    "{open:?} then {c0:#x}, two writes, {grammar:?}"
+                );
+            }
+        }
     }
 }
 

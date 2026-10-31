@@ -2047,6 +2047,10 @@ pub struct AgentBus {
     /// clear (`inbox/doorbell/034`).
     #[cfg(test)]
     between_resize_and_clear: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Test hook run once by the next push that moves the release capture,
+    /// as soon as its output is published (`inbox/probe/076`).
+    #[cfg(test)]
+    after_latch_published: Mutex<Option<AfterLatchPublished>>,
     /// PRD #1666 part 3 (Q35-06): the generation's input epoch, which the
     /// output hook notes into and the generation's PTY writer moves. Kept
     /// here, outside `state`, so taking it never takes the output lock.
@@ -2059,6 +2063,11 @@ pub struct AgentBus {
     /// input grammar (Q83); `None` keeps it strict.
     spawned_as: Option<AgentType>,
 }
+
+/// Test seam: [`AgentBus`]'s hook for the next push that moves the release
+/// capture, given the pushed bytes.
+#[cfg(test)]
+type AfterLatchPublished = Box<dyn FnOnce(&[u8]) + Send>;
 
 /// What one [`AgentBus::push`] cost under the output lock (plan §9.1). Read
 /// by the budget measurement; production logs the scanner's share per
@@ -2179,6 +2188,8 @@ impl AgentBus {
             label: String::new(),
             #[cfg(test)]
             between_resize_and_clear: Mutex::new(None),
+            #[cfg(test)]
+            after_latch_published: Mutex::new(None),
             input,
             composer_bell,
             spawned_as: None,
@@ -2217,6 +2228,17 @@ impl AgentBus {
         let bus = Self::profiled(profile, rows, cols);
         bus.state.lock().unwrap().release = crate::release_scanner::ReleaseCapture::disabled();
         bus
+    }
+
+    /// Test seam: run once by the next push that moves the release capture,
+    /// with its bytes, as soon as they are published to subscribers, the
+    /// output lock still held: the hook must not take it.
+    #[cfg(test)]
+    fn run_after_latch_published(&self, pushed: &[u8]) {
+        let hook = self.after_latch_published.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook(pushed);
+        }
     }
 
     #[cfg(test)]
@@ -2258,13 +2280,17 @@ impl AgentBus {
         // Q83: the input grammar follows what the capture holds for the
         // generation's own agent after the whole push, so a conflict or
         // another agent's header leaves it strict however the output was
-        // split.
-        let grammar = (!release.is_empty()).then(|| {
-            crate::composer_probe::planner::InputGrammar::latched(
-                self.spawned_as.as_ref(),
-                |agent| state.release.latched_for(agent),
-            )
-        });
+        // split. It is stored here, under the lock that holds the capture
+        // and before the output is published: a write whose tracker loads
+        // the grammar from now on reads the new one, and a write that loaded
+        // the old one loaded it before anything could see the capture move.
+        if !release.is_empty() {
+            self.input
+                .set_input_grammar(crate::composer_probe::planner::InputGrammar::latched(
+                    self.spawned_as.as_ref(),
+                    |agent| state.release.latched_for(agent),
+                ));
+        }
         let scanner = state.release.last_push();
         state.live_modes.feed(&arc);
         state.output_hook.on_output(&arc);
@@ -2278,18 +2304,21 @@ impl AgentBus {
             let evicted: Vec<u8> = state.scrollback.drain(..excess).collect();
             state.ring_start_modes.feed(&evicted);
         }
+        #[cfg(test)]
+        let pushed = Arc::clone(&arc);
         // Lossy on purpose: we don't block the reader thread on slow
         // subscribers. `send` returns Err only when there are zero
         // receivers, which is fine — scrollback still has the bytes.
         let _ = self.tx.send(arc);
+        #[cfg(test)]
+        if !release.is_empty() {
+            self.run_after_latch_published(&pushed);
+        }
         let hold_ns = u64::try_from(held.elapsed().as_nanos()).unwrap_or(u64::MAX);
         drop(state);
+        let latch_changed = !release.is_empty();
         if let Some(transition) = transition {
             log_evidence_transition(&transition, "output");
-        }
-        let latch_changed = !release.is_empty();
-        if let Some(grammar) = grammar {
-            self.input.set_input_grammar(grammar);
         }
         for event in release {
             self.log_release(&event);
@@ -27221,6 +27250,70 @@ mod spawn_tests {
             "past the wait, only the release stops it: {report:?}"
         );
         assert_eq!(editor.typed(), ended);
+        registry.shutdown_all();
+    }
+
+    /// Scenario: The model editor latches Claude Code 2.1.310, so its input is read with the measured grammar, and the user types `ESC [`. The editor then draws 2.1.312's header, and the push that turns the capture into a conflict is paused as soon as its output is published; inside that pause the user types Ctrl+U. The writer reads it with the strict grammar the conflict left, so the CSI stays open, and a ring after the push finishes waits its bound and writes nothing.
+    #[spec("inbox/probe/076")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn probe_076_a_write_inside_a_conflicting_push_reads_the_strict_grammar() {
+        use crate::composer_probe::planner::{Boundary, InputGrammar};
+        use crate::doorbell_txn::{NotTyped, Outcome};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-conflict-window", OnEnter::Submit);
+        registry.set_pty_write_stall_bound_for_test(Duration::from_millis(300));
+        grammar_until(&editor, InputGrammar::ClaudeMeasured).await;
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, b"\x1b[")
+            .await
+            .unwrap();
+        typed_until(&editor, |t| t == b"\x1b[").await;
+        let (reached_tx, reached) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        *editor.bus.after_latch_published.lock().unwrap() = Some(Box::new(move |pushed| {
+            let _ = reached_tx.send(pushed.to_vec());
+            let _ = release_rx.recv();
+        }));
+        let bus = Arc::clone(&editor.bus);
+        let pushing = std::thread::spawn(move || bus.push(claude_header("2.1.312")));
+        let pushed =
+            tokio::task::spawn_blocking(move || reached.recv_timeout(Duration::from_secs(5)))
+                .await
+                .unwrap()
+                .expect("the conflicting push never reached its pause");
+        assert_eq!(pushed, claude_header("2.1.312"), "the paused push");
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, b"\x15")
+            .await
+            .unwrap();
+        let keys = b"\x1b[\x15";
+        typed_until(&editor, |t| t == keys).await;
+        let boundary = registry
+            .writer_target_for_pane(&editor.pane)
+            .unwrap()
+            .writer
+            .lock()
+            .await
+            .physical_boundary();
+        assert_eq!(boundary, Boundary::Inside, "Ctrl+U read strictly");
+        release.send(()).unwrap();
+        pushing.join().unwrap();
+        assert!(matches!(
+            latch(&editor.bus),
+            crate::release_scanner::ScanLatch::Conflict { .. }
+        ));
+        assert_eq!(editor.bus.input().input_grammar(), InputGrammar::Strict);
+        editor
+            .bus
+            .push(claude_screen("", &[], false, EDITOR_COLS as usize));
+        editor.wait_clean();
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::NothingWritten(NotTyped::OffGround)),
+            "{report:?}"
+        );
+        assert_eq!(editor.typed(), keys, "no deck byte written");
         registry.shutdown_all();
     }
 
