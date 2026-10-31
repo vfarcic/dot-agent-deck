@@ -89,6 +89,27 @@ describe("inbox cards and handoff rail (S13)", () => {
     expect(tile).not.toHaveTextContent(words.wakeStalled);
   });
 
+  /// Scenario: inbox/status/030 — Each of the seven release-check holds arrives through the real desktop snapshot mapper. The card uses the same sentence and diagnostic words as the TUI fixture, rather than the older cannot-type fallback.
+  it.each(["running", "differs", "inconclusive", "unavailable", "tripped", "no_reference", "off"] as const)
+  ("shows the shared release-check sentence (%s)", (cause) => {
+    const dto = snapshot(1, 0, true);
+    Object.assign(dto.agents[0], { agentType: cause === "no_reference" ? "codex" : "claude_code" });
+    Object.assign(dto.agents[0].inbox!, {
+      wakeHold: "cannot_type",
+      holdDetail: { cause: `release_check_${cause}`, agent: cause === "no_reference" ? "codex" : "claude",
+        release: "2.1.313", fact: "layout", reason: cause === "unavailable" ? "no_process_containment" : "launch" },
+    });
+    render(card(mapDesktopSnapshot(dto).agents[0]));
+    const expected = words.releaseChecks.card[cause]
+      .replace("{agent}", cause === "no_reference" ? "Codex" : "Claude Code")
+      .replace("{release}", "2.1.313")
+      .replace("{fact}", words.releaseChecks.facts.layout)
+      .replace("{reason}", cause === "unavailable" ? words.releaseChecks.reasons.no_process_containment : words.releaseChecks.reasons.launch);
+    const notice = screen.getByTestId("inbox-notice-7");
+    expect(notice.textContent).toBe(`${words.glyph}1 ${expected}`);
+    expect(notice).not.toHaveTextContent(words.wakeStalled);
+  });
+
   /// Scenario: inbox/probe/018 — each held-typing cause arrives through the snapshot bridge with no waiting messages, while the agent is idle or thinking. The tile shows the shared words and clears them on the next snapshot of the same agent.
   it.each(Object.entries(words.inputHeld).flatMap(([cause, text]) => ["idle", "thinking"].map((status) => [cause, status, text])))
   ("inbox/probe/018: held typing %s while %s (%s)", (cause, status, text) => {
