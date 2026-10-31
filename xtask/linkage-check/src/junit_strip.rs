@@ -13,7 +13,8 @@
 //! and it is the file a contributor attaches to an issue or pastes into a PR
 //! when a live test fails. Run the stripper over it first.
 //!
-//! That is the same shape CLAUDE.md rule 5 records for
+//! That is the same shape `docs/develop/e2e-lanes.md` ("`--workspace` on all three
+//! aliases, and the fast-tier exceptions") records for
 //! `xtask/linkage-check/src/clean_tmp.rs`: a tool whose safety properties are
 //! runtime assertions and nothing else, which is exactly the class that sat
 //! untested through #436 because "building is not linting". So these tests put

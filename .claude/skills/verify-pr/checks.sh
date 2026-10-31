@@ -21,7 +21,7 @@
 #   --only    comma-separated subset of: fmt,clippy,build,test-fast,
 #             linkage-check,windows-cross,audit,e2e (naming `e2e` here implies
 #             --e2e)
-#   --filter  test-name filter passed to the test steps, for rule 6's
+#   --filter  test-name filter passed to the test steps, for CLAUDE.md rule 6's
 #             rerun-one-test loop (e.g. --filter lifecycle_001)
 #
 # RUN THIS IN THE BACKGROUND. The full suite takes far longer than a foreground
@@ -231,19 +231,19 @@ if wanted test-fast; then
     # `--workspace` (issue #489) mirrors the `test-fast` alias and CI. Without
     # it cargo selects the root package alone and the `xtask/*` members' tests
     # never run, so a reviewer's gate would be narrower than the author's.
-    run_step test-fast "cargo nextest run --workspace${test_filter}" "rule 5 fast tier" || true
+    run_step test-fast "cargo nextest run --workspace${test_filter}" "CLAUDE.md rule 5 fast tier" || true
   fi
 else
   skip test-fast "not in --only"
 fi
 
-# Rule 7: catalog<->test linkage, function-name prefixes, no raw sleeps in
+# linkage-check (CLAUDE.md rule 7's gate): catalog<->test linkage, function-name prefixes, no raw sleeps in
 # e2e_*.rs, and the `/// Scenario:` doc comment on every #[spec] test.
 if wanted linkage-check; then
   if [ "$build_ok" != true ]; then
     record linkage-check BLOCKED 0 - "build failed; fix that first"
   else
-    run_step linkage-check "cargo xtask linkage-check" "rule 7" || true
+    run_step linkage-check "cargo xtask linkage-check" "CLAUDE.md rule 7" || true
   fi
 else
   skip linkage-check "not in --only"
@@ -315,7 +315,7 @@ else
   # this in lockstep with the `test-e2e` alias in .cargo/config.toml. Note that
   # alias is lane 1 exactly; `test-e2e-live` is the superset and is not run
   # here.
-  run_step e2e "cargo nextest run --workspace --features e2e --success-output=final${test_filter}" "rule 5 lane 1 (deterministic e2e)" || true
+  run_step e2e "cargo nextest run --workspace --features e2e --success-output=final${test_filter}" "CLAUDE.md rule 5 lane 1 (deterministic e2e)" || true
 
   e2e_log="${logs}/e2e.log"
   if [ -f "$e2e_log" ]; then

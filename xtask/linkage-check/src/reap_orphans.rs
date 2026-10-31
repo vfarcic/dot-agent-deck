@@ -4,7 +4,8 @@
 //! Nothing compiles a shell script, so the never-kill list, the two-part MCP
 //! identification, the `/proc/<pid>/stat` field arithmetic and the pid-reuse
 //! check are invisible to every gate this repository has. That is the argument
-//! CLAUDE.md rule 5 records for `clean_tmp.rs` and `junit_strip.rs` — a deletion
+//! `docs/develop/e2e-lanes.md` ("`--workspace` on all three aliases, and the fast-tier
+//! exceptions") records for `clean_tmp.rs` and `junit_strip.rs` — a deletion
 //! or termination tool whose safety lives only at run time belongs in
 //! `cargo test-fast`, where breaking it reddens the per-task gate rather than
 //! surfacing as a process somebody needed being gone.

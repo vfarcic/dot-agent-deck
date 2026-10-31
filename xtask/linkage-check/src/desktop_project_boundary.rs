@@ -60,8 +60,9 @@
 //!    remove: on a remote daemon it resolves against the wrong filesystem and
 //!    is silently wrong.
 //!
-//! **Measured, not assumed.** Rule 5's note is that linkage-check's assertions
-//! are runtime-only — the compile half is already covered by
+//! **Measured, not assumed.** `docs/develop/e2e-lanes.md`'s note ("`--workspace`
+//! on all three aliases, and the fast-tier exceptions") is that linkage-check's
+//! assertions are runtime-only — the compile half is already covered by
 //! `cargo clippy --workspace --all-targets`, so a rule gutted to `Vec::new()`
 //! stays green. Appending an aliased import, an aliased call, a `format!`-wrapped
 //! `.dot-agent-deck.toml` and a `std::env::current_dir()` to
@@ -843,8 +844,8 @@ fn rust_sources(dir: &Path) -> Vec<PathBuf> {
 mod tests {
     use super::*;
 
-    /// Rule 5's note: linkage-check's assertions are RUNTIME-only — the compile
-    /// half is already covered by `cargo clippy --workspace --all-targets`, so a
+    /// `docs/develop/e2e-lanes.md`'s note: linkage-check's assertions are
+    /// RUNTIME-only — the compile half is already covered by `cargo clippy --workspace --all-targets`, so a
     /// rule gutted to `Vec::new()` stays green without these.
     fn kinds(display: &str, src: &str) -> Vec<(String, String)> {
         violations(display, src)

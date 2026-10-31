@@ -868,7 +868,7 @@ jobs:
       # `e2e-deterministic` below — but this step is still only a type-check and
       # lint: it runs no test and needs no agent or API key, so naming the e2e
       # features here neither duplicates that job nor gives this one a
-      # credential. It just makes the local rule 2 gate something a contributor
+      # credential. It just makes the local CLAUDE.md rule 2 gate something a contributor
       # cannot forget to run.
       #
       # Linux only. build-windows/build-macos below stay on bare `cargo clippy`
@@ -1353,10 +1353,10 @@ jobs:
   # (docs/develop/cross-version-harness.md), run on a runner instead of a
   # contributor's machine. It pairs the PREVIOUS RELEASE with this PR's branch
   # in both directions — the old daemon under the branch's TUI and CLI
-  # (forward, the pairing rule 12 names) and the branch daemon under the old
+  # (forward, the pairing CLAUDE.md rule 12 names) and the branch daemon under the old
   # TUI and CLI (reverse) — and asserts that a delegate still routes and hooks
   # still arrive. Its evidence files are uploaded as the run's artifact, which is
-  # the record rule 12 and `.github/pr-review-rubric.md` ask a PR to carry.
+  # the record CLAUDE.md rule 12 and `.github/pr-review-rubric.md` ask a PR to carry.
   #
   # Why here: the harness wants a disk-backed floor of free space and a host it
   # can start unprivileged bubblewrap namespaces on, and a shared dev box
@@ -1423,7 +1423,7 @@ jobs:
       #
       # And a commit that moves `PROTOCOL_VERSION` is not run at all. The two
       # builds refuse each other by design across a bump — that refusal IS the
-      # outcome rule 12 asks to record, and the harness would report it as a
+      # outcome CLAUDE.md rule 12 asks to record, and the harness would report it as a
       # failing `aborted` tell. The step writes that outcome as an evidence file
       # of its own, so the artifact exists either way.
       - id: plan
@@ -1444,7 +1444,7 @@ jobs:
             exit 1
           fi
           if [ "$old" != "$new" ]; then
-            message="PROTOCOL_VERSION moves from $old ($previous) to $new at $HEAD_SHA, so the two builds refuse each other by design; no cross-version run. Record that refusal as the rule 12 outcome."
+            message="PROTOCOL_VERSION moves from $old ($previous) to $new at $HEAD_SHA, so the two builds refuse each other by design; no cross-version run. Record that refusal as the CLAUDE.md rule 12 outcome."
             echo "::notice::$message"
             mkdir -p .dot-agent-deck/xver-evidence
             printf '# Cross-version check: not run\n\n%s\n' "$message" \
@@ -1471,7 +1471,7 @@ jobs:
       # Exit 3 is a DECLARED BREAK (issue #1596): every tell was measured, and
       # each one that failed failed the way a contract break that the daemon's
       # build declares in `CONTRACT_BREAKS` and the client's does not says it
-      # will, with the daemon's refusal in the run's log. Rule 12 records that
+      # will, with the daemon's refusal in the run's log. CLAUDE.md rule 12 records that
       # as the outcome rather than as a regression, so the job reports it with
       # a warning and passes. Any other non-zero exit, a failure no declared
       # break accounts for included, fails the job.
@@ -1487,7 +1487,7 @@ jobs:
             --direction both --probe generic --allow-build-changes --min-free-gib 15 \
             --runs-root /xr || rc=$?
           if [ "$rc" -eq 3 ]; then
-            echo "::warning title=cross-version declared contract break::$COMMIT against $PREVIOUS: a tell failed exactly as a contract break declared between the two builds says it will. That is the rule 12 outcome to record, not a regression; the job summary and the evidence artifact name the break."
+            echo "::warning title=cross-version declared contract break::$COMMIT against $PREVIOUS: a tell failed exactly as a contract break declared between the two builds says it will. That is the CLAUDE.md rule 12 outcome to record, not a regression; the job summary and the evidence artifact name the break."
             exit 0
           fi
           exit "$rc"

@@ -2120,7 +2120,7 @@ const FIRST_ALLOC_MARKER: &str = "harness-first-alloc=";
 #[test]
 fn the_tempfile_redirect_catches_a_bare_constructor_once_the_root_exists() {
     let root = harness_temp_root();
-    // The bare constructor IS the thing under test here, so rule 8 is opted
+    // The bare constructor IS the thing under test here, so linkage-check rule 8 is opted
     // out of on this one line: linkage-check:allow-bare-tempdir
     let stray = tempfile::tempdir().expect("bare tempdir"); // linkage-check:allow-bare-tempdir
     assert!(

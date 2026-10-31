@@ -42,7 +42,7 @@ const NONE: ShellOverlayState = {};
  * leaves it alone.
  */
 export function useShellOverlays(screen: RailScreen) {
-  // voice-registry-exempt: the overlay booleans themselves; the setter leaves this hook only as `setOverlay`, `closeOverlays` and `deck.set`, which `App.tsx`'s action contexts name, so rule 18 checks the `set*` writes there
+  // voice-registry-exempt: the overlay booleans themselves; the setter leaves this hook only as `setOverlay`, `closeOverlays` and `deck.set`, which `App.tsx`'s action contexts name, so linkage-check rule 18 checks the `set*` writes there
   const [state, setState] = useState<{ screen: RailScreen; open: ShellOverlayState }>({ screen, open: NONE });
   const open = state.screen === screen ? state.open : NONE;
 

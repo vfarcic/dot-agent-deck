@@ -32,7 +32,7 @@ push_trigger_ignore_bot_commits = false
 
 [qodo_describe_agent]
 # Never touch the PR body. Pull request bodies here carry verification evidence
-# (named tests, rule 12's cross-version record) that the agent reviewer reads,
+# (named tests, CLAUDE.md rule 12's cross-version record) that the agent reviewer reads,
 # so the summary goes in a comment of its own. This is Qodo's default; it is
 # pinned so a portal-side change cannot flip it.
 publish_mode = "comment"

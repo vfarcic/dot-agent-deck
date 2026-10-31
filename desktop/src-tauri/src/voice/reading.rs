@@ -1971,7 +1971,7 @@ mod tests {
         assert_eq!(status_turn_event(&status("a", EventType::Idle), "a"), None);
     }
 
-    /// Scenario (rule 20): every agent type the deck runs — Pi included,
+    /// Scenario (CLAUDE.md rule 20): every agent type the deck runs — Pi included,
     /// through the deck's extension — reports its final reply, so none is
     /// refused as a gap.
     #[test]

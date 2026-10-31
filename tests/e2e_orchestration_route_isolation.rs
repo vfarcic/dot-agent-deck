@@ -45,8 +45,8 @@
 //!
 //! Cost: short interactive Haiku turns for two delegates, two one-file tasks
 //! and two quoted report openers, plus orchestration startup. Local-only
-//! (Decision 8 / rule 5): gated on the `e2e` feature so CI's
-//! `cargo test-fast` never compiles it; flaky-tolerant (real LLM) per rule 4 —
+//! (Decision 8 / CLAUDE.md rule 5): gated on the `e2e` feature so CI's
+//! `cargo test-fast` never compiles it; flaky-tolerant (real LLM) per CLAUDE.md rule 4 —
 //! run once, not looped.
 
 mod common;
@@ -64,7 +64,7 @@ use spec::spec;
 /// the tab strip (that they are indistinguishable by name is the whole point).
 const ORCH_NAME: &str = "route-iso";
 
-/// Per-tab sentinel filenames. Uniquely named (rule 4) so the assertion survives
+/// Per-tab sentinel filenames. Uniquely named (CLAUDE.md rule 4) so the assertion survives
 /// LLM phrasing/tool variance: only the literal filename has to come through.
 const SENTINEL_A: &str = "route_alpha_5f3c.txt";
 const SENTINEL_B: &str = "route_beta_9d21.txt";
@@ -457,7 +457,7 @@ fn route_001_two_tabs_same_cwd_do_not_cross_deliver() {
     );
     assert_pane_never_saw(&socket, &reviewer_a, "tab A's reviewer", TASK_REVIEWER);
 
-    // ---- Each worker really did ITS OWN task (rule 4's real-work evidence) ----
+    // ---- Each worker really did ITS OWN task (CLAUDE.md rule 4's real-work evidence) ----
     assert!(
         common::wait_for_path(&cwd.join(SENTINEL_A), Duration::from_secs(150)),
         "tab A's coder never produced its sentinel {SENTINEL_A}.\n\

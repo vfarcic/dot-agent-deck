@@ -2,7 +2,7 @@ import { ArrowRight, CheckCircle2, CircleDashed, RefreshCw, Send, XCircle } from
 import { INBOX_WORDS } from "../lib/inboxWords";
 import type { HandoffEdge } from "../types";
 
-/** PRD #1666: the inbox's words, which the TUI uses for the same states (rule 22). */
+/** PRD #1666: the inbox's words, which the TUI uses for the same states (CLAUDE.md rule 22). */
 const STATUS_LABEL: Record<HandoffEdge["status"], string> = {
   delegated: `delegated · ${INBOX_WORDS.queued}`,
   delivered: `${INBOX_WORDS.delivered} · working`,

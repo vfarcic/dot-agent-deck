@@ -13,7 +13,7 @@
 //! inputs produces byte-identical output. M4.3 simplification —
 //! linkage-check rule 7 no longer byte-diffs the on-disk `.md`
 //! against a fresh regen (the on-disk file may not exist for a fresh
-//! clone). Rule 7 now asserts (a) every `#[spec]` test has a
+//! clone). Linkage-check rule 7 now asserts (a) every `#[spec]` test has a
 //! `/// Scenario:` doc comment with a body and (b) `generate_all`
 //! succeeds against the current source + catalog.
 //!
@@ -205,7 +205,7 @@ pub fn write_all(generated: &[GeneratedDoc]) -> Result<Vec<PathBuf>, String> {
     Ok(paths)
 }
 
-/// M4.3 rule 7 entry point — exercises the generator end-to-end as
+/// M4.3 linkage-check rule 7 entry point — exercises the generator end-to-end as
 /// a smoke test and returns `Ok(())` when every `#[spec]` test under
 /// `tests/` carries a `/// Scenario:` doc comment with a body and
 /// the markdown for each test renders without error.

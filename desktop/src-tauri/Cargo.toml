@@ -140,7 +140,7 @@ reqwest = { version = "0.13", default-features = false, features = [
 # `num-bigint` for the session key exchange). Measured on this branch, 16 cores:
 # building all 59 from a clean slate took 13.9s wall / 66s CPU and produced
 # 210 MiB of artifacts; warm it is a no-op, and neither `cargo test-fast` nor
-# rule 2's clippy command moved. `crypto-rust` is what `keyring` pins for both
+# CLAUDE.md rule 2's clippy command moved. `crypto-rust` is what `keyring` pins for both
 # secret-service backends, so no `openssl` and no `vendored` C build enters the
 # graph.
 keyring = "4"
@@ -159,7 +159,7 @@ keyring = "4"
 # WHY NOT BEHIND A CARGO FEATURE, which is the tempting way to keep it out of
 # the workspace gate: that reproduces the hole class this repo has closed three
 # times (#407, #436, #502) — code behind a feature nobody's gate enables is
-# type-checked by nothing and lints clean by compiling nothing. Rule 2's clippy
+# type-checked by nothing and lints clean by compiling nothing. CLAUDE.md rule 2's clippy
 # command names `e2e,e2e-live` for exactly that reason.
 #
 # DEFAULT FEATURES, which is `default = []` — cpal declares no default feature

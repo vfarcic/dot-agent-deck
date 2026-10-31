@@ -2010,7 +2010,7 @@ pub struct AppState {
     /// `dot-agent-deck wrap` host beside a wrapped agent's native hooks —
     /// changes nothing. [`Self::apply_event`] applies that rule.
     ///
-    /// **Rule 12: issue #532 needs no `PROTOCOL_VERSION` bump and no
+    /// **CLAUDE.md rule 12: issue #532 needs no `PROTOCOL_VERSION` bump and no
     /// `CONTRACT_BREAKS` entry.** The wire is unchanged and each side computes
     /// this value from the same event stream; what moved is when an ordinary
     /// frame may move it, and every old/new pairing is today's behaviour or

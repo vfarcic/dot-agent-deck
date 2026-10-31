@@ -23,7 +23,7 @@
 //! in-process daemon / `daemon serve` with real pi PTYs, asserting on
 //! files/events/broadcasts. They are functionally correct but record NO cast
 //! (only PTY-attached `TuiDeck` runs record a `full-stream.cast`, PRD #180) and
-//! never exercise the live-in-the-pane, rendered-grid surface rule 4 requires.
+//! never exercise the live-in-the-pane, rendered-grid surface CLAUDE.md rule 4 requires.
 //! This test closes that gap: it drives the real binary through the vt100
 //! harness (mirroring `e2e_issue_dispatch_real.rs` / `e2e_chain_smoke_claude.rs`
 //! and the catalog reference `scheduler/dispatch/013`), so the Pi surface a user
@@ -31,7 +31,7 @@
 //!
 //! ## `pi/live/001` scenario: a single live Pi pane (deterministic status)
 //! A reliable single live Pi pane with a visible real status fully satisfies
-//! rule 4 on its own. A single directive-prompted Pi pane's lifecycle
+//! CLAUDE.md rule 4 on its own. A single directive-prompted Pi pane's lifecycle
 //! (`session_start`→Idle, `agent_start`→running/Thinking) is the deterministic
 //! part — it fires regardless of what the model decides — so the status
 //! transition there does not hinge on a multi-agent LLM chain. The heavier orchestrator
@@ -67,7 +67,7 @@
 //! `with_env`. No credential is printed.
 //!
 //! Tier: lane 2 — spawns a real agent, hits a real model. Flaky-tolerant (real
-//! LLM), run once, not looped (rule 4/5). Runtime-skipped (Decision 26) when
+//! LLM), run once, not looped (CLAUDE.md rules 4/5). Runtime-skipped (Decision 26) when
 //! `pi` or its credential is absent; a model the credential refuses fails
 //! instead (`common::check_pi_available`).
 

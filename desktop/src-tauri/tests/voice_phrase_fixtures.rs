@@ -72,12 +72,12 @@ use serde::Deserialize;
 const FIXTURES: &str = include_str!("../src/voice/phrase_fixtures.toml");
 const PARAPHRASES: &str = include_str!("../src/voice/paraphrase_fixtures.toml");
 const REQUIRE_REAL_E2E_ENV: &str = "DOT_AGENT_DECK_REQUIRE_REAL_E2E";
-/// Run only the fixtures whose name contains this text — rule 6's "rerun only
+/// Run only the fixtures whose name contains this text — CLAUDE.md rule 6's "rerun only
 /// the failing test", for manifests with one test function each. The manifest
 /// is still pre-validated in full; only the model calls are narrowed.
 const FIXTURE_FILTER_ENV: &str = "DOT_AGENT_DECK_VOICE_FIXTURE";
 /// The credential the keyed backend authenticates with, as the developer's own
-/// shell already spells it. Rule 5's lane 2: a developer's key on a developer's
+/// shell already spells it. CLAUDE.md rule 5's lane 2: a developer's key on a developer's
 /// machine, and nothing registered on the repository.
 ///
 /// **Keep this matched to the default backend.** It is `OPENAI_API_KEY` because

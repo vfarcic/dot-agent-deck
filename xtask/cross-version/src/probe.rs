@@ -3,7 +3,7 @@
 //!
 //! # Why the generic four tells are not enough in reverse
 //!
-//! The four tells are rule 12's, and they are what every run asserts. But a
+//! The four tells are CLAUDE.md rule 12's, and they are what every run asserts. But a
 //! change to how the daemon logs a hostile id, re-keys a colliding session or
 //! discloses a teardown is not exercised by a delegate and two hooks — those
 //! flows never reach the changed line. A probe is the extra stimulus that does,

@@ -2,12 +2,12 @@
 //!
 //! # What this is
 //!
-//! Rule 12 requires, for any change touching the daemon, the TUI↔daemon
+//! CLAUDE.md rule 12 requires, for any change touching the daemon, the TUI↔daemon
 //! protocol, orchestration or hooks, that you "build the branch, start a daemon
 //! from the previous release with an agent under it, run the branch TUI against
 //! that older daemon, and confirm the core flows still work end to end".
 //!
-//! **The requirement is the SCENARIO, not human fingers.** Rule 12 spells the
+//! **The requirement is the SCENARIO, not human fingers.** CLAUDE.md rule 12 spells the
 //! procedure out in keystrokes because a person was always going to run it, and
 //! four of its paragraphs are about ways a person silently gets it wrong. A
 //! driver that reproduces the same scenario and asserts the same tells
@@ -259,7 +259,7 @@ struct Opts {
 
     /// Which pairing to run.
     ///
-    /// `forward` (the default, and rule 12's pairing): the previous release's
+    /// `forward` (the default, and CLAUDE.md rule 12's pairing): the previous release's
     /// daemon with the branch TUI and CLI. `reverse`: the BRANCH daemon with the
     /// previous release's TUI and CLI — the only pairing that executes a
     /// daemon-side change. `both`: forward, then reverse, each in its own
@@ -362,7 +362,7 @@ enum ProbeArg {
 }
 
 /// The probe a run in `direction` carries, and how it was chosen, for the
-/// output and the evidence file. Forward runs carry none — they are rule 12's
+/// output and the evidence file. Forward runs carry none — they are CLAUDE.md rule 12's
 /// pairing, whose tells are the four — and an explicit probe there is refused
 /// rather than dropped, so nobody reads a forward evidence file as having
 /// measured one. In reverse, `auto` either ties the branch to one probe or
@@ -387,11 +387,11 @@ fn select_probe(
     match (direction, explicit) {
         (Direction::Forward, None | Some(Probe::Generic)) => Ok((
             Probe::Generic,
-            "forward — rule 12's four tells, no probe".to_string(),
+            "forward — CLAUDE.md rule 12's four tells, no probe".to_string(),
         )),
         (Direction::Forward, Some(p)) => Err(format!(
             "the {} probe runs in the reverse direction only — pass `--direction reverse` (or \
-             `both`); a forward run is rule 12's pairing and asserts the four tells",
+             `both`); a forward run is CLAUDE.md rule 12's pairing and asserts the four tells",
             p.name()
         )),
         (Direction::Reverse, Some(p)) => Ok((p, format!("named with `--probe {}`", p.name()))),
@@ -1484,7 +1484,7 @@ fn run(opts: &Opts) -> Result<Outcome, String> {
     let directions = opts.direction.directions();
     // Refuse a probe/direction combination before anything is built. With
     // `both`, an explicit probe belongs to the reverse half and the forward half
-    // stays rule 12's four tells.
+    // stays CLAUDE.md rule 12's four tells.
     let mut probes = Vec::new();
     for d in &directions {
         let arg = if *d == Direction::Forward && opts.direction == DirectionArg::Both {
@@ -2348,7 +2348,7 @@ mod tests {
         assert_eq!(
             select_probe(opts.probe, &opts.branch, Direction::Forward).map(|(p, _)| p),
             Ok(Probe::Generic),
-            "an existing invocation keeps its meaning: rule 12's four tells"
+            "an existing invocation keeps its meaning: CLAUDE.md rule 12's four tells"
         );
     }
 

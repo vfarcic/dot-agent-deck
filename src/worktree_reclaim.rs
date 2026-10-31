@@ -1264,8 +1264,9 @@ mod tests {
         /// `issue_dispatch_run` and `dispatch` pass.
         ///
         /// Real `git` and real repositories rather than a stub, for the reason
-        /// CLAUDE.md rule 5 records for that file's `mod real_git` and rule 14
-        /// records for `clean_tmp.rs`: what is being asserted is which repository
+        /// `docs/develop/e2e-lanes.md` ("`--workspace` on all three aliases, and the
+        /// fast-tier exceptions") records for that file's `mod real_git` and for
+        /// `clean_tmp.rs`: what is being asserted is which repository
         /// a deletion lands in, and no fixture short of a real one can answer
         /// that. Two empty-commit repositories in a `test_temp::tempdir()`, no
         /// network, no sleeps, ~1s wall.
