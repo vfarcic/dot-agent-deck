@@ -16,6 +16,7 @@ compile_error!(
 // Shared by the per-agent hook-config adapters (`codex_hooks_manage`,
 // `devin_hooks_manage`); nothing outside the crate calls it.
 mod agent_hook_config;
+pub mod agent_notice;
 pub mod agent_pty;
 pub mod agent_registry;
 pub mod attach_recovery;
@@ -123,6 +124,7 @@ pub mod login_shell;
 // PRD #1223 M2: what the daemon reports about itself to a new-agent form.
 pub mod new_agent_options;
 pub mod opencode_manage;
+pub mod opencode_mode;
 pub mod opencode_version;
 // Issue #1947: finding and messaging an orchestration's orchestrator.
 pub mod orchestrator_address;

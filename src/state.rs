@@ -6572,6 +6572,10 @@ fn card_inbox_of(event: &AgentEvent) -> Option<crate::inbox_display::CardInbox> 
         .metadata
         .get(crate::inbox_display::CARD_INBOX_ADMISSION_METADATA_KEY)
         .cloned();
+    inbox.agent_notice = event
+        .metadata
+        .get(crate::inbox_display::CARD_INBOX_AGENT_NOTICE_METADATA_KEY)
+        .cloned();
     Some(inbox)
 }
 
@@ -6620,6 +6624,12 @@ fn set_card_inbox(session: &mut SessionState, inbox: crate::inbox_display::CardI
         metadata.insert(
             crate::inbox_display::CARD_INBOX_ADMISSION_METADATA_KEY.to_string(),
             code.clone(),
+        );
+    }
+    if let Some(notice) = &inbox.agent_notice {
+        metadata.insert(
+            crate::inbox_display::CARD_INBOX_AGENT_NOTICE_METADATA_KEY.to_string(),
+            notice.clone(),
         );
     }
     session.recent_events.push_back(AgentEvent {
@@ -6855,6 +6865,12 @@ impl PaneInbox {
             evidence_paused: self.notices.evidence_paused,
             receipts_degraded: self.notices.receipts_degraded.clone(),
             admission_refused: self.notices.admission_refused.clone(),
+            agent_notice: self
+                .notices
+                .agent_notice
+                .as_ref()
+                .map(crate::agent_notice::AgentNotice::display_text)
+                .filter(|text| !text.is_empty()),
         }
     }
 
@@ -20937,6 +20953,45 @@ mod tests {
                 state.apply_inbox_notice(&notice);
             }
         }
+    }
+
+    /// PRD #2050: the daemon sets an OpenCode agent's card notice on the hub;
+    /// an attached client's card shows its sentence in the notice row, ahead
+    /// of the not-connected notice, a client attaching afterwards reads it
+    /// from the summary, and clearing it takes it off both.
+    #[test]
+    fn an_agent_notice_reaches_the_cards_notice_row_and_leaves_it() {
+        let hub = crate::inbox_hub::InboxHub::new(
+            crate::inbox::DeckId::generate(),
+            crate::inbox::InboxLimits::default(),
+            crate::inbox_hub::DEFAULT_KEEPALIVE,
+        );
+        let (mut state, mut rx) = attached_card(&hub);
+        let notice = |state: &AppState| state.sessions["gen-q"].inbox_notice();
+        assert_eq!(notice(&state), None);
+        let shared = crate::agent_notice::AgentNotice::opencode_shared_service();
+        hub.set_agent_notice("pane-q", "agent-q", Some(shared.clone()));
+        follow_notices(&mut state, &mut rx);
+        assert_eq!(notice(&state).as_deref(), Some(shared.text.as_str()));
+        assert_eq!(
+            hub.summary("pane-q", "agent-q").notices.agent_notice,
+            Some(shared.clone())
+        );
+        // The same notice again tells nobody anything.
+        hub.set_agent_notice("pane-q", "agent-q", Some(shared.clone()));
+        assert!(rx.try_recv().is_err(), "an unchanged notice is not re-sent");
+        let mut late = AppState::default();
+        late.register_pane("pane-q".to_string());
+        late.apply_event(quota_event(EventType::SessionStart, 1));
+        late.apply_inbox_summary("pane-q", "agent-q", &hub.summary("pane-q", "agent-q"));
+        assert_eq!(
+            late.sessions["gen-q"].inbox_notice().as_deref(),
+            Some(shared.text.as_str())
+        );
+        hub.set_agent_notice("pane-q", "agent-q", None);
+        follow_notices(&mut state, &mut rx);
+        assert_eq!(notice(&state), None);
+        assert_eq!(hub.summary("pane-q", "agent-q").notices.agent_notice, None);
     }
 
     /// PR #1735 fifth review (B-03): a client that attached with one message

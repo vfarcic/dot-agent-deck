@@ -311,6 +311,9 @@ pub const CARD_INBOX_COMMAND_METADATA_KEY: &str = "inbox_card_command";
 /// Beside [`CARD_INBOX_METADATA_KEY`]: the refusal code of the agent's own
 /// request for its messages, when [`CardInbox::admission_refused`] holds one.
 pub const CARD_INBOX_ADMISSION_METADATA_KEY: &str = "inbox_card_admission";
+/// Beside [`CARD_INBOX_METADATA_KEY`]: the text of the agent's card notice,
+/// when [`CardInbox::agent_notice`] holds one (PRD #2050).
+pub const CARD_INBOX_AGENT_NOTICE_METADATA_KEY: &str = "inbox_card_agent_notice";
 
 /// What a card shows of its agent's inbox.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -342,6 +345,9 @@ pub struct CardInbox {
     /// PRD #1666 part 3 (R-2): the refusal code of this agent's own request
     /// for its deck messages, while messages wait for it.
     pub admission_refused: Option<String>,
+    /// PRD #2050: the daemon's notice about a way the agent runs that the deck
+    /// cannot fully support ([`crate::agent_notice::AgentNotice::display_text`]).
+    pub agent_notice: Option<String>,
 }
 
 impl CardInbox {
@@ -388,6 +394,11 @@ impl CardInbox {
     /// first of all (PRD #1666 part 3, R-2): nothing else reaches it until
     /// that is fixed.
     pub fn notice_text(&self) -> Option<String> {
+        // PRD #2050: first, because it explains why the agent's integration
+        // takes nothing (or reports nothing) and says what to do about it.
+        if let Some(notice) = self.agent_notice.as_deref().filter(|n| !n.is_empty()) {
+            return Some(notice.to_string());
+        }
         if let Some(code) = &self.admission_refused {
             return Some(admission_refused_text(code));
         }

@@ -113,7 +113,8 @@ export function inboxBadge(inbox: AgentInbox | undefined): string | undefined {
 
 /**
  * PRD #1666 §6.5: the card's inbox notice row, when the deck has something to
- * say beyond the badge — the first that holds of: a refused request of the
+ * say beyond the badge — the first that holds of: the daemon's notice about a
+ * way the agent runs that the deck cannot fully support (PRD #2050), a refused request of the
  * agent's own for its messages (part 3, R-2), why the integration takes
  * nothing yet, paused hand-outs, what an uncertain delivery means (what running
  * out of attempts means, when every uncertain one has: its row offers no
@@ -122,6 +123,9 @@ export function inboxBadge(inbox: AgentInbox | undefined): string | undefined {
  */
 export function inboxNotice(inbox: AgentInbox | undefined): string | undefined {
   if (!inbox) return undefined;
+  // PRD #2050: first, because it explains everything below it and says what
+  // to do; daemon text, so both clients show the same sentence.
+  if (inbox.agentNotice) return inbox.agentNotice;
   // PRD #1666 part 3 (R-2): nothing else reaches the agent until this is fixed.
   if (inbox.admissionRefused !== undefined) return admissionRefusedText(inbox.admissionRefused);
   if (inbox.integration === "cli_too_old") return INBOX_WORDS.cliTooOld;

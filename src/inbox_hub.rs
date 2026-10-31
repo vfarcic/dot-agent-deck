@@ -305,6 +305,14 @@ pub struct InboxCardNotices {
     /// skips it, and its absence means no refusal is known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admission_refused: Option<String>,
+    /// PRD #2050: what the deck says about a way this agent runs that it cannot
+    /// fully support ([`crate::agent_notice`]; for OpenCode,
+    /// [`crate::opencode_mode`]), set by the daemon through
+    /// [`InboxHub::set_agent_notice`]. It rides the card's notices because both
+    /// clients already show their row and refresh it on every change. Additive:
+    /// a reader that predates it skips it, and its absence means no notice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_notice: Option<crate::agent_notice::AgentNotice>,
 }
 
 /// The wire spelling of `component`, for [`InboxSummary::component`].
@@ -578,6 +586,10 @@ struct HubState {
     /// at most: only a request the generation's current capability attests
     /// sets one ([`InboxHub::admission_refused`]).
     admission_refused: HashMap<AgentKey, AdmissionEpisode>,
+    /// PRD #2050: each live generation's card notice
+    /// ([`InboxCardNotices::agent_notice`]), until the daemon clears it or the
+    /// generation exits.
+    agent_notices: HashMap<AgentKey, crate::agent_notice::AgentNotice>,
     /// PRD #1666 part 3, round 5 (plan D15): everything this round adds to
     /// the hub, reachable only through [`HubState::guarded_section`] and
     /// [`HubState::guarded_read`], and torn for the rest of the run by a panic
@@ -851,6 +863,7 @@ impl InboxHub {
                 action_presses: HashMap::new(),
                 hooks_remedies: HashMap::new(),
                 admission_refused: HashMap::new(),
+                agent_notices: HashMap::new(),
                 reports: crate::guarded::Guarded::new(
                     crate::report_recovery::ReportState::from_env(),
                 ),
@@ -2057,6 +2070,7 @@ impl InboxHub {
         st.announced.remove(&key);
         st.receivers.remove(&key);
         st.rings.remove(&key);
+        st.agent_notices.remove(&key);
         // A waiter can outlive its agent (a hook process the agent left
         // behind). It is told it was superseded, and dropping its sender
         // closes its channel even when that signal finds it full, so its
@@ -3382,6 +3396,46 @@ impl InboxHub {
             engine::broadcast_notices(&mut st, &key, Instant::now());
         }
         self.post_owed_notices();
+    }
+
+    /// PRD #2050: what `agent_id`'s card in `pane_id` says about a way it
+    /// runs that the deck cannot fully support, or `None` to say nothing. Both
+    /// clients are told only when it changes. Ignored for a generation that no
+    /// longer holds its pane.
+    pub fn set_agent_notice(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        notice: Option<crate::agent_notice::AgentNotice>,
+    ) {
+        let mut st = self.lock();
+        let key = (pane_id.to_string(), agent_id.to_string());
+        if notice.is_some()
+            && st
+                .live_agent
+                .as_ref()
+                .is_some_and(|live| !live(pane_id, agent_id))
+        {
+            return;
+        }
+        let changed = match notice {
+            Some(notice) => st.agent_notices.insert(key.clone(), notice.clone()) != Some(notice),
+            None => st.agent_notices.remove(&key).is_some(),
+        };
+        if changed {
+            engine::broadcast_notices(&mut st, &key, Instant::now());
+        }
+    }
+
+    /// PRD #2050: whether a receiver of `agent_id`'s own integration (its
+    /// plugin or extension) has registered for its messages in `pane_id` —
+    /// evidence that the integration loaded in that agent.
+    pub fn integration_registered(&self, pane_id: &str, agent_id: &str) -> bool {
+        self.lock()
+            .receipts
+            .floors
+            .get(&(pane_id.to_string(), agent_id.to_string()))
+            .is_some_and(|floor| floor.registered)
     }
 
     /// PRD #1666 part 3 (R-2): the deck admitted `agent_id`'s own request for

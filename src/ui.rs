@@ -35000,6 +35000,65 @@ mod tests {
         assert!(card.contains("│ORCHESTRATOR "), "{card}");
     }
 
+    /// Scenario: an OpenCode card whose daemon reports it on OpenCode 2's
+    /// shared background service, while its integration has not connected,
+    /// is drawn; the card's notice row says so and names both fixes, in place
+    /// of the not-connected notice (PRD #2050, the desktop tile's row).
+    #[test]
+    fn an_opencode_card_shows_the_daemons_agent_notice() {
+        let mut session = make_session(SessionStatus::Idle);
+        session.agent_type = AgentType::OpenCode;
+        let inbox = crate::inbox_display::CardInbox {
+            integration: Some(crate::inbox_display::IntegrationNotice::NotArmed),
+            agent_notice: Some(crate::agent_notice::OPENCODE_SHARED_SERVICE.to_string()),
+            ..Default::default()
+        };
+        let entry: AgentEvent = serde_json::from_value(serde_json::json!({
+            "session_id": "",
+            "agent_type": "open_code",
+            "event_type": "notification",
+            "timestamp": Utc::now(),
+            "metadata": {
+                crate::inbox_display::CARD_INBOX_METADATA_KEY: inbox.encode(),
+                crate::inbox_display::CARD_INBOX_AGENT_NOTICE_METADATA_KEY:
+                    crate::agent_notice::OPENCODE_SHARED_SERVICE,
+            },
+        }))
+        .unwrap();
+        session.recent_events.push_back(entry);
+        let backend = ratatui::backend::TestBackend::new(240, 8);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let name = "auditor".to_string();
+        terminal
+            .draw(|frame| {
+                render_session_card(
+                    frame,
+                    frame.area(),
+                    &session,
+                    0,
+                    false,
+                    Some(&name),
+                    Some(1),
+                    CardDensity::Compact,
+                    UiMode::Normal,
+                    None,
+                    Utc::now(),
+                    false,
+                );
+            })
+            .unwrap();
+        let drawn = buffer_to_string(terminal.backend().buffer());
+        let row = drawn
+            .lines()
+            .find(|line| line.contains("OpenCode 2 is using"))
+            .unwrap_or_else(|| panic!("no notice row:\n{drawn}"));
+        insta::assert_snapshot!(
+            row.trim_matches(|c| c == '│' || c == ' '),
+            @"OpenCode 2 is using its shared background service, so the deck cannot follow this agent: add --standalone to the agent's command, or run opencode service set disabled true, then restart the agent"
+        );
+        assert!(!drawn.contains(crate::inbox_display::NOT_ARMED), "{drawn}");
+    }
+
     #[test]
     fn bell_on_transition_to_waiting() {
         let mut sessions = HashMap::new();

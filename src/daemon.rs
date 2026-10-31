@@ -1071,6 +1071,17 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         })
     };
 
+    // PRD #2050: unconditional — how an OpenCode agent runs is read from its
+    // pane's process tree, and its card says when the deck cannot fully
+    // support that. Idle unless an OpenCode agent runs.
+    let opencode_mode_handle = {
+        let registry = pty_registry.clone();
+        let monitor_state = state.clone();
+        tokio::spawn(async move {
+            crate::opencode_mode::run_monitor(registry, monitor_state).await;
+        })
+    };
+
     // PRD #1401: unconditional — every agent on a branch with a pull request
     // gets a badge, and this is the only place that answer comes from. It runs
     // `gh` only for a live session on a non-default branch of a GitHub
@@ -1116,6 +1127,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     }
     shell_activity_handle.abort();
     codex_rollout_handle.abort();
+    opencode_mode_handle.abort();
     pull_request_handle.abort();
     scheduler_handle.abort();
     inbox_ticker.abort();

@@ -2027,6 +2027,8 @@ pub(super) fn notices(st: &HubState, key: &AgentKey, now: Instant) -> InboxCardN
             .get(key)
             .filter(|_| super::has_waiting_mail(&st.inbox, &key.0, &key.1))
             .map(|episode| episode.code.clone()),
+        // PRD #2050: set by the daemon whatever the generation's inbox holds.
+        agent_notice: st.agent_notices.get(key).cloned(),
         ..InboxCardNotices::default()
     };
     let Some(generation) = st.receipts.gens.get(key) else {

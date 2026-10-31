@@ -14511,6 +14511,33 @@ impl AgentPtyRegistry {
     /// classification time for the same reason: it is a plain field read on the
     /// child handle, so it is safe under the lock, and resolving it early means
     /// a pane whose pid is unavailable drops out before it can force a sample.
+    /// PRD #2050: the live agents whose pane runs OpenCode — by the type the
+    /// spawn declared or a hook revealed, or else by its command's basename —
+    /// with the pid their process tree hangs from, for the daemon's watch on
+    /// how that OpenCode runs ([`crate::opencode_mode`]).
+    pub fn opencode_watch_list(&self) -> Vec<crate::opencode_mode::Watched> {
+        let inner = self.inner.lock();
+        inner
+            .agents
+            .iter()
+            .filter(|(_, agent)| !agent.exited.load(Ordering::SeqCst))
+            .filter_map(|(agent_id, agent)| {
+                let declared = agent
+                    .agent_type
+                    .as_ref()
+                    .or(agent.spawn_agent_type.as_ref());
+                if !opencode_spawn(declared, agent.spawn_command.as_deref()) {
+                    return None;
+                }
+                Some(crate::opencode_mode::Watched {
+                    pane_id: agent.pane_id_env.clone()?,
+                    agent_id: agent_id.clone(),
+                    root_pid: i32::try_from(agent.child.process_id()?).ok()?,
+                })
+            })
+            .collect()
+    }
+
     pub fn shell_activity_candidates(
         &self,
         shapes: &[crate::platform::proc::ShellToolShape],
