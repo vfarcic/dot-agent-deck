@@ -133,6 +133,10 @@ sha2 = "0.11"
 # copying any of it. Already in the graph as reqwest's own dependency, so
 # naming it adds no new code to the build.
 bytes = "1"
+# Issue #1884: `src/pty_open_retry.rs` implements `portable_pty::PtySystem`,
+# whose `openpty` returns `anyhow::Result`. Already in the graph through
+# `portable-pty` itself, so this adds no crate to the build.
+anyhow = "1"
 
 # Issue #250: `build.rs` validates an injected `DAD_VERSION` with the EXACT
 # parser `src/version.rs` uses (`semver::Version::parse`), so the set of
