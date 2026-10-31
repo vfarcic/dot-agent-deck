@@ -4,6 +4,6 @@ expression: panel(frames.last().unwrap())
 ---
 Release checks
 ▸ Claude Code 2.1.313 · 0123456789abcdef
-Behaved differently from its check. Check its pane.
+Behaved differently from its check: the screen layout changed. Check its pane.
 Progress: complete
 [Re-check R] [Forget f] [Export e] [Close Esc]

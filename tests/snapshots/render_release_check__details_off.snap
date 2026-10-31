@@ -3,5 +3,5 @@ source: tests/render_release_check.rs
 expression: panel(frames.last().unwrap())
 ---
 Release checks
-Release checks are off. Send it a prompt.
+Release checks are off. Turn them on in the agent's settings, or send it a prompt.
 [Close Esc]

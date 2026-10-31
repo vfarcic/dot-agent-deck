@@ -2,4 +2,4 @@
 source: tests/render_release_check.rs
 expression: agent_settings(frames.last().unwrap())
 ---
-Release checks: ask [Change M] [Re-check R] [Details v]
+Release checks: ask (ask before checking) [Change M] [Re-check R] [Details v]

@@ -1,0 +1,9 @@
+---
+source: tests/render_release_check.rs
+expression: panel(&cancelled[index])
+---
+Release checks
+Export Claude Code 2.1.313 (all records)
+trace.txt
+SCRUBBED-TRACE-PREVIEW
+[Back Esc]

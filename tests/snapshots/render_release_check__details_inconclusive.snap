@@ -4,6 +4,6 @@ expression: panel(frames.last().unwrap())
 ---
 Release checks
 ▸ Claude Code 2.1.313 · 0123456789abcdef
-Couldn't complete the check: the check can't be cleaned up safely.
+Couldn't complete the check: it couldn't be started. Try Re-check, or send it a prompt.
 Progress: complete
 [Re-check R] [Forget f] [Export e] [Close Esc]

@@ -1,0 +1,5 @@
+---
+source: tests/render_release_check.rs
+expression: agent_settings(&frames[3])
+---
+Release checks: ask (ask before checking) [Change M] [Re-check R] [Details v]

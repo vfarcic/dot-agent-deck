@@ -1,0 +1,10 @@
+---
+source: tests/render_release_check.rs
+expression: panel(frames.last().unwrap())
+---
+Release checks
+▸ Claude Code 2.1.313 · 0123456789abcdef
+Release checks are off. Turn them on in the agent's settings, or send it a prompt.
+Progress: complete
+Check cancelled.
+[Close Esc]

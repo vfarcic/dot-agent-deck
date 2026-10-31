@@ -1,0 +1,14 @@
+---
+source: tests/render_release_check.rs
+expression: panel(&frames[2])
+---
+Release checks
+Claude Code 2.1.313 · 0123456789abcdef
+▸ Claude Code 2.1.313 · fedcba9876543210
+Claude Code 2.1.310 · aaaaaaaaaaaaaaaa
+Check unavailable: the deck can't isolate the check from your machine here. Send it a prompt.
+Progress: complete
+Re-check uses the agent's current identity.
+Forget all records of 2.1.313.
+Export includes every record of 2.1.313.
+[Re-check R] [Forget f] [Export e] [Close Esc]

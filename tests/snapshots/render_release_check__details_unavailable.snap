@@ -4,6 +4,6 @@ expression: panel(frames.last().unwrap())
 ---
 Release checks
 ▸ Claude Code 2.1.313 · 0123456789abcdef
-Can't check on this machine: the check can't be cleaned up safely.
+Check unavailable: the deck can't isolate the check from your machine here. Send it a prompt.
 Progress: complete
 [Re-check R] [Forget f] [Export e] [Close Esc]

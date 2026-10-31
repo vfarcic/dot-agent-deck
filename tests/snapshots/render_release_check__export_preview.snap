@@ -1,0 +1,11 @@
+---
+source: tests/render_release_check.rs
+expression: panel(frames.last().unwrap())
+---
+Release checks
+Export Claude Code 2.1.313 (all records)
+▸ record.json
+trace.txt
+README
+Inspect these files before sharing. The scrubber only removes patterns it knows.
+[Open Enter] [Continue w] [Cancel Esc]

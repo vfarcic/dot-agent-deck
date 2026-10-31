@@ -4,6 +4,6 @@ expression: panel(frames.last().unwrap())
 ---
 Release checks
 ▸ Claude Code 2.1.313 · 0123456789abcdef
-Didn't pass the deck's check: the screen layout changed.
+Didn't pass the deck's check: the screen layout changed. Send it a prompt.
 Progress: complete
 [Re-check R] [Forget f] [Export e] [Close Esc]

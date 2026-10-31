@@ -4,8 +4,8 @@ expression: release_check_card_notices()
 ---
 running: ✉1 waiting: checking Claude Code 2.1.313 on this machine.
 differs: ✉1 waiting: Claude Code 2.1.313 didn't pass the deck's check (the screen layout changed). Send it a prompt.
-inconclusive: ✉1 waiting: the deck couldn't check Claude Code 2.1.313 (the check couldn't start). Send it a prompt, or check again.
-unavailable: ✉1 waiting: the deck can't check Claude Code 2.1.313 on this machine (the check can't be cleaned up safely). Send it a prompt.
+inconclusive: ✉1 waiting: the deck couldn't check Claude Code 2.1.313 (it couldn't be started). Send it a prompt, or check again.
+unavailable: ✉1 waiting: the deck can't check Claude Code 2.1.313 on this machine (the deck can't isolate the check from your machine here). Send it a prompt.
 tripped: ✉1 waiting: Claude Code 2.1.313 behaved differently from its check. Check its pane.
 no_reference: ✉1 waiting: the deck has no checked release of Codex to compare with. Send it a prompt.
 off: ✉1 waiting: release checks are off. Send it a prompt.

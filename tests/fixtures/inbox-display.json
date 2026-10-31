@@ -6,6 +6,45 @@
   "workDone": "work-done",
   "wakeStalled": "waiting to wake",
   "wakeStalledHint": "send it a prompt",
+  "releaseChecks": {
+    "card": {
+      "running": "waiting: checking {agent} {release} on this machine.",
+      "differs": "waiting: {agent} {release} didn't pass the deck's check ({fact}). Send it a prompt.",
+      "inconclusive": "waiting: the deck couldn't check {agent} {release} ({reason}). Send it a prompt, or check again.",
+      "unavailable": "waiting: the deck can't check {agent} {release} on this machine ({reason}). Send it a prompt.",
+      "tripped": "waiting: {agent} {release} behaved differently from its check. Check its pane.",
+      "no_reference": "waiting: the deck has no checked release of {agent} to compare with. Send it a prompt.",
+      "off": "waiting: release checks are off. Send it a prompt.",
+      "approval_proposal": "waiting: approve the check for {agent} {release} in Details, or send it a prompt."
+    },
+    "facts": {"layout": "the screen layout changed", "other": "something this deck can't explain changed"},
+    "reasons": {
+      "launch": "it couldn't be started",
+      "no_process_containment": "the deck can't isolate the check from your machine here",
+      "runner_stopped": "the check was stopped",
+      "other": "the deck doesn't know why the check stopped"
+    },
+    "details": {
+      "queued": "Waiting to check on this machine.",
+      "running": "Checking on this machine.",
+      "passed": "Passed the deck's check on this machine.",
+      "differs": "Didn't pass the deck's check: {fact}. Send it a prompt.",
+      "inconclusive": "Couldn't complete the check: {reason}. Try Re-check, or send it a prompt.",
+      "unavailable": "Check unavailable: {reason}. Send it a prompt.",
+      "revoked": "Behaved differently from its check: {fact}. Check its pane.",
+      "forgotten": "Record forgotten.",
+      "no_reference": "The deck has no checked release of {agent} to compare with. Send it a prompt.",
+      "off": "Release checks are off. Turn them on in the agent's settings, or send it a prompt.",
+      "forget_release": "Forget all records of {release}.",
+      "recheck_current": "Re-check uses the agent's current identity.",
+      "cancel_running": "Cancel stops the running check.",
+      "export_release": "Export includes every record of {release}."
+    },
+    "modes": {"auto": "auto (check automatically)", "ask": "ask (ask before checking)", "off": "off (checks stopped; local results unused)"},
+    "exportInspection": "Inspect these files before sharing. The scrubber only removes patterns it knows.",
+    "offConfirmation": "Turn release checks off and cancel the running check?",
+    "unsupported": "This daemon doesn't support release checks. Upgrade the deck to use them."
+  },
   "wakeHolds": {
     "possible_draft": "waiting: there may be an unsent draft. Send it, or type x then Ctrl+C.",
     "awaiting_prompt": "not yet taken: the agent may be waiting at a prompt. Check its pane.",

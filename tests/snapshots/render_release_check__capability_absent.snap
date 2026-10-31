@@ -1,0 +1,5 @@
+---
+source: tests/render_release_check.rs
+expression: agent_settings(frames.last().unwrap())
+---
+Release checks: unavailable. This daemon doesn't support release checks. Upgrade the deck to use them.

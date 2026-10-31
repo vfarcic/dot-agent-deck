@@ -1,0 +1,10 @@
+---
+source: tests/render_release_check.rs
+expression: panel(&frames[2])
+---
+Release checks
+▸ Claude Code 2.1.313 · 0123456789abcdef
+Checking on this machine.
+Progress: running
+Queue position: 1
+[Re-check R] [Cancel F3] [Forget f] [Export e] [Close Esc]

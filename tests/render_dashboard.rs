@@ -852,7 +852,7 @@ fn status_030_card_says_why_the_doorbell_holds() {
     }
 }
 
-/// Scenario: An idle agent has one waiting message while its installed release is being checked or held after a check. Render each of the seven self-check causes, including a machine that cannot run the check, and compare the whole visible notice with the design's user words rather than the old generic fetch advice.
+/// Scenario: An idle agent has one waiting message while its installed release is being checked or held after a check. Render each of the seven self-check causes, including a machine that cannot run the check, and compare its notice with the shared words fixture and the expected snapshot.
 #[spec("inbox/status/030")]
 #[test]
 fn status_030_card_names_each_release_check_hold() {
@@ -860,7 +860,8 @@ fn status_030_card_names_each_release_check_hold() {
 }
 
 fn release_check_card_notices() -> String {
-    [
+    let words = inbox_display_words();
+    let (actual, expected): (Vec<_>, Vec<_>) = [
         ("running", "claude", None, None),
         ("differs", "claude", Some("layout"), None),
         ("inconclusive", "claude", None, Some("launch")),
@@ -892,10 +893,38 @@ fn release_check_card_notices() -> String {
             .find(|line| line.starts_with("│✉1"))
             .unwrap_or_else(|| panic!("{cause}: no inbox notice on the card:\n{rendered}"))
             .trim_matches(|c: char| c == '│' || c.is_whitespace());
-        format!("{cause}: {line}")
+        let text = |kind: &str, value: Option<&str>| {
+            value
+                .map(|value| words["releaseChecks"][kind][value].as_str().unwrap())
+                .unwrap_or("")
+        };
+        let expected = words["releaseChecks"]["card"][cause]
+            .as_str()
+            .unwrap()
+            .replace(
+                "{agent}",
+                if agent == "codex" {
+                    "Codex"
+                } else {
+                    "Claude Code"
+                },
+            )
+            .replace("{release}", "2.1.313")
+            .replace("{fact}", text("facts", fact))
+            .replace("{reason}", text("reasons", reason));
+        (
+            format!("{cause}: {line}"),
+            format!("{cause}: ✉1 {expected}"),
+        )
     })
-    .collect::<Vec<_>>()
-    .join("\n")
+    .unzip();
+    let actual = actual.join("\n");
+    assert_eq!(
+        actual,
+        expected.join("\n"),
+        "self-check holds must use the shared user words"
+    );
+    actual
 }
 
 /// Feed real wire snapshots through one client's hydration path, preserving the

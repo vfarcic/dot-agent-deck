@@ -1,5 +1,5 @@
 ---
 source: tests/render_release_check.rs
-expression: agent_settings(frames.last().unwrap())
+expression: agent_settings(&frames[3])
 ---
-Release checks: off [Change M] [Re-check R] [Details v]
+Release checks: off (checks stopped; local results unused) [Change M] [Details v]

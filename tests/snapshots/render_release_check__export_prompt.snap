@@ -1,10 +1,9 @@
 ---
 source: tests/render_release_check.rs
-expression: panel(frames.last().unwrap())
+expression: panel(&cancelled[3])
 ---
 Release checks
-▸ Claude Code 2.1.313 · 0123456789abcdef
-Passed the deck's check on this machine.
-Progress: complete
+Export Claude Code 2.1.313 (all records)
+Files: record.json, trace.txt, README
 Export directory:
 [Export Enter] [Cancel Esc]
