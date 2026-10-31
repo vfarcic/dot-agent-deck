@@ -78,6 +78,14 @@ pub struct Launcher {
     pub mode: &'static str,
     pub declared: bool,
     pub lookalike: bool,
+    pub pins: NativePins,
+}
+
+#[derive(Clone, Copy)]
+pub enum NativePins {
+    Both,
+    Neither,
+    OtherOnly,
 }
 
 impl Fixture {
@@ -136,6 +144,11 @@ impl Fixture {
             let other = native.join(if kind == "codex" { "claude" } else { "codex" });
             fs::copy(&exe, &other).unwrap();
             fs::set_permissions(&other, fs::Permissions::from_mode(0o700)).unwrap();
+            let pins = native.join("spawn-pins");
+            fs::create_dir(&pins).unwrap();
+            if launcher.is_some_and(|l| matches!(l.pins, NativePins::OtherOnly)) {
+                fs::hard_link(&other, pins.join(other.file_name().unwrap())).unwrap();
+            }
         }
         fs::write(
             native.join("composer_external_edit.py"),
@@ -229,6 +242,29 @@ impl Fixture {
                 request.as_object_mut().unwrap().remove("agent_type");
             }
             let env = request["env"].as_array_mut().unwrap();
+            let path_dir = if matches!(launcher.pins, NativePins::Both) {
+                self.exe.parent().unwrap().to_owned()
+            } else {
+                self.exe.parent().unwrap().join("spawn-pins")
+            };
+            let spawn_path = format!("{}:/usr/bin:/bin", path_dir.display());
+            if !matches!(launcher.pins, NativePins::Both) {
+                for name in ["claude", "codex"] {
+                    let resolved = std::env::split_paths(&spawn_path).find_map(|dir| {
+                        let candidate = dir.join(name);
+                        candidate.is_file().then_some(candidate)
+                    });
+                    if name != self.kind && matches!(launcher.pins, NativePins::OtherOnly) {
+                        assert_eq!(
+                            resolved,
+                            Some(path_dir.join(name)),
+                            "only the other pin exists"
+                        );
+                    } else {
+                        assert_eq!(resolved, None, "spawn PATH must lack native name {name}");
+                    }
+                }
+            }
             env.extend([
                 json!(["DAD_DISCOVERY_LAUNCH", launcher.mode]),
                 json!([
@@ -236,9 +272,14 @@ impl Fixture {
                     if launcher.lookalike { "1" } else { "0" }
                 ]),
                 json!([
-                    "PATH",
-                    format!("{}:/usr/bin:/bin", self.exe.parent().unwrap().display())
+                    "DAD_DISCOVERY_ABSOLUTE",
+                    if matches!(launcher.pins, NativePins::Both) {
+                        "0"
+                    } else {
+                        "1"
+                    }
                 ]),
+                json!(["PATH", spawn_path]),
             ]);
         }
         let reply = inbox::attach(&self.daemon, request);
@@ -464,10 +505,14 @@ impl Fixture {
         HelperPause(writer)
     }
     pub fn replace(&mut self) {
+        self.replace_observing_retirement(|_| {});
+    }
+    pub fn replace_observing_retirement(&mut self, retired: impl FnOnce(&Self)) {
         self.flag("editor-go");
         self.flag("helper-go");
         let stopped = inbox::attach(&self.daemon, json!({"op":"stop-agent","id":self.agent}));
         assert_eq!(stopped["ok"], true, "stop fixture generation: {stopped}");
+        retired(self);
         self.spawn("successor");
     }
     pub fn snapshot(&self) -> Value {

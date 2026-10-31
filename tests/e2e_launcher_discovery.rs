@@ -4,8 +4,9 @@
 //!
 //! Assumed interfaces for the coder (not implemented by these tests):
 //! * Q102b makes Q28(b)'s shared D1 resolver concrete: one resolution, at
-//!   spawn, from the pane's saved spawn PATH (the deck's own launch environment,
-//!   not the child's), following symlinks to a kernel identity (dev, ino).
+//!   spawn, from the PATH the deck hands the PTY child when spawning the pane,
+//!   recorded then, never anything the child sets later, following symlinks
+//!   to a kernel identity (dev, ino).
 //!   Every later check compares the candidate's /proc/<pid>/exe identity (plus
 //!   birth identity, uid and ancestry) with that pinned pair and never looks
 //!   a name up again. For an undeclared pane, independently pin the Claude and
@@ -18,7 +19,8 @@
 //! * e2e-only `binding-status` returns read-only `composer_binding` with
 //!   `generation`, `permission` ("pending", "armable", "inert") and `reason`
 //!   (a refusal string pinned below). It cannot settle permission.
-//!   Refusals distinguish "executable differs: expected <agent_type>",
+//!   Refusals distinguish "executable not resolved: expected <agent_type>",
+//!   "executable differs: expected <agent_type>",
 //!   "candidate left its parent", "candidate exited", "foreign owner" and
 //!   "generation retired". Lifecycle/owner failures take precedence over an
 //!   executable mismatch when the candidate is also a lookalike; a type claim
@@ -53,13 +55,13 @@ mod live;
 
 use dot_agent_deck::composer_probe::classifier::Identity;
 use dot_agent_deck::composer_probe::instance::decode_identity;
-use live::{Fixture, Launcher, WAIT};
+use live::{Fixture, Launcher, NativePins, WAIT};
 use serde_json::{Value, json};
 use spec::spec;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 ctor::declarative::ctor! {
     #[ctor(unsafe)]
@@ -94,6 +96,17 @@ impl Route {
 }
 
 fn fixture(kind: &'static str, route: Route, mode: &'static str, gate: bool, uid: bool) -> Fixture {
+    fixture_with_pins(kind, route, mode, gate, uid, NativePins::Both)
+}
+
+fn fixture_with_pins(
+    kind: &'static str,
+    route: Route,
+    mode: &'static str,
+    gate: bool,
+    uid: bool,
+    pins: NativePins,
+) -> Fixture {
     let mut env = Vec::new();
     if gate {
         env.push(("DOT_AGENT_DECK_E2E_DISCOVERY_GATE", "discovery-gate"));
@@ -107,6 +120,7 @@ fn fixture(kind: &'static str, route: Route, mode: &'static str, gate: bool, uid
             mode,
             declared: !route.learned(),
             lookalike: route.lookalike(),
+            pins,
         },
         &env,
     );
@@ -427,7 +441,35 @@ fn negative(kind: &'static str, route: Route, change: Change) {
             let old_release = gate_root(&f).join(format!("{old_generation}.release"));
             let old_completed = gate_root(&f).join(format!("{old_generation}.completed"));
             let old_timed_out = gate_root(&f).join(format!("{old_generation}.timed-out"));
-            f.replace();
+            let retirement_budget =
+                common::load_scaled(Duration::from_secs(3)).min(Duration::from_secs(12));
+            // Include the synchronous stop request; successor startup must
+            // never give a slow cancellation extra, unmeasured time.
+            let retirement_started = Instant::now();
+            let retirement_deadline = retirement_started + retirement_budget;
+            f.replace_observing_retirement(|_| {
+                assert!(!old_release.exists(), "old discovery gate must stay closed");
+                assert!(
+                    common::wait_until(
+                        retirement_deadline.saturating_duration_since(Instant::now()),
+                        || old_completed.exists()
+                    ) && Instant::now() <= retirement_deadline,
+                    "retired discovery must finish or cancel before release within {retirement_budget:?} of retirement, below the 15-second gate expiry; elapsed {:?}",
+                    retirement_started.elapsed()
+                );
+                assert!(!old_release.exists(), "completion must not depend on release");
+                let retired = live::read_json(&old_completed);
+                assert_eq!(retired["generation"], old_generation);
+                assert_eq!(retired["reason"], "generation retired");
+                assert!(
+                    !old_timed_out.exists(),
+                    "retirement must cancel the paused discovery without waiting for its timeout"
+                );
+                assert!(
+                    !old_instance.join(format!("gen-{old_generation}")).exists(),
+                    "retired candidate cannot publish its old gen-G"
+                );
+            });
             assert_ne!(
                 f.generation, old_generation,
                 "replace must create a real successor"
@@ -435,22 +477,6 @@ fn negative(kind: &'static str, route: Route, change: Change) {
             pending(&f, route);
             let successor = launch(&f);
             arrived(&f, &successor);
-            assert!(!old_release.exists(), "old discovery gate must stay closed");
-            assert!(
-                common::wait_until(Duration::from_secs(3), || old_completed.exists()),
-                "retired discovery must finish or cancel before release, within the 15-second gate expiry"
-            );
-            assert!(
-                !old_release.exists(),
-                "completion must not depend on release"
-            );
-            let retired = live::read_json(&old_completed);
-            assert_eq!(retired["generation"], old_generation);
-            assert_eq!(retired["reason"], "generation retired");
-            assert!(
-                !old_timed_out.exists(),
-                "retirement must cancel the paused discovery without waiting for its timeout"
-            );
             assert_eq!(
                 f.control_for(old_generation, "binding-status")["ok"],
                 false,
@@ -513,6 +539,99 @@ fn lookalike(kind: &'static str, route: Route) {
     }
     release(&f);
     denied(&f, true, &mismatch_reason(claimed_kind));
+}
+
+fn missing_pin(kind: &'static str, route: Route, pins: NativePins, assert_refusal: bool) {
+    // No candidate barrier is required: a missing pin may be refused before
+    // discovery finds a candidate. The genuine process still makes its claim.
+    let f = fixture_with_pins(kind, route, "spawn", false, false, pins);
+    let ready = launch(&f);
+    let actual = executable_identity(format!("/proc/{}/exe", ready["pid"].as_u64().unwrap()));
+    assert_eq!(
+        actual,
+        executable_identity(f.native_executable()),
+        "the genuine native copy claims its own kind"
+    );
+    let wrapper = live::read_json(&f.path("launcher-ready"));
+    let spawn_path = wrapper["spawn_path"].as_str().unwrap();
+    for name in ["claude", "codex"] {
+        let resolved = std::env::split_paths(spawn_path).find_map(|dir| {
+            let candidate = dir.join(name);
+            candidate.is_file().then_some(candidate)
+        });
+        if name != kind && matches!(pins, NativePins::OtherOnly) {
+            assert_eq!(
+                executable_identity(resolved.expect("the unclaimed agent's pin exists")),
+                executable_identity(f.native_executable().with_file_name(name)),
+                "only the other agent's genuine identity resolves"
+            );
+        } else {
+            assert_eq!(resolved, None, "the PTY child's spawn PATH lacks {name}");
+        }
+    }
+    if assert_refusal {
+        let reason = format!(
+            "executable not resolved: expected {}",
+            if kind == "codex" {
+                "codex"
+            } else {
+                "claude_code"
+            }
+        );
+        assert!(
+            common::wait_until(WAIT, || status(&f)["reason"] == reason),
+            "the missing spawn-time pin must have its own refusal reason: {}",
+            status(&f)
+        );
+        denied(&f, true, &reason);
+    } else {
+        // Keep this control runnable while the read-only seam is still RED.
+        let mut human = f.connect();
+        human.write("MISSING-PIN-FIXTURE-ALIVE");
+        f.expect(b"MISSING-PIN-FIXTURE-ALIVE");
+    }
+}
+
+/// Scenario: Start a declared launcher with neither agent name on the PATH the deck passes to the PTY child at spawn, then launch the genuine claude native copy by absolute path and claim its own kind. The missing pin must retain its distinct refusal reason with no Armable permission, gen-G identity or helper check.
+#[spec("inbox/probe/035")]
+#[test]
+fn probe_035_claude_declared_missing_pin_cannot_get_permission() {
+    missing_pin("claude", Route::Launcher, NativePins::Neither, true);
+}
+
+/// Scenario: Start an undeclared wrapper with neither agent name on the PATH the deck passes to the PTY child at spawn, then launch the genuine claude native copy by absolute path and claim its own kind. The missing pin must retain its distinct refusal reason with no Armable permission, gen-G identity or helper check.
+#[spec("inbox/probe/035")]
+#[test]
+fn probe_035_claude_learned_missing_pin_cannot_get_permission() {
+    missing_pin("claude", Route::Learned, NativePins::Neither, true);
+}
+
+/// Scenario: Start an undeclared wrapper with only the other agent name on the PATH the deck passes to the PTY child at spawn, then launch the genuine claude native copy by absolute path and claim its own kind. The missing pin must retain its distinct refusal reason with no Armable permission, gen-G identity or helper check.
+#[spec("inbox/probe/035")]
+#[test]
+fn probe_035_claude_learned_other_pin_missing_pin_cannot_get_permission() {
+    missing_pin("claude", Route::Learned, NativePins::OtherOnly, true);
+}
+
+/// Scenario: Start a declared launcher with neither agent name on the PATH the deck passes to the PTY child at spawn, then launch the genuine codex native copy by absolute path and claim its own kind. The missing pin must retain its distinct refusal reason with no Armable permission, gen-G identity or helper check.
+#[spec("inbox/probe/035")]
+#[test]
+fn probe_035_codex_declared_missing_pin_cannot_get_permission() {
+    missing_pin("codex", Route::Launcher, NativePins::Neither, true);
+}
+
+/// Scenario: Start an undeclared wrapper with neither agent name on the PATH the deck passes to the PTY child at spawn, then launch the genuine codex native copy by absolute path and claim its own kind. The missing pin must retain its distinct refusal reason with no Armable permission, gen-G identity or helper check.
+#[spec("inbox/probe/035")]
+#[test]
+fn probe_035_codex_learned_missing_pin_cannot_get_permission() {
+    missing_pin("codex", Route::Learned, NativePins::Neither, true);
+}
+
+/// Scenario: Start an undeclared wrapper with only the other agent name on the PATH the deck passes to the PTY child at spawn, then launch the genuine codex native copy by absolute path and claim its own kind. The missing pin must retain its distinct refusal reason with no Armable permission, gen-G identity or helper check.
+#[spec("inbox/probe/035")]
+#[test]
+fn probe_035_codex_learned_other_pin_missing_pin_cannot_get_permission() {
+    missing_pin("codex", Route::Learned, NativePins::OtherOnly, true);
 }
 
 #[derive(Clone, Copy)]
@@ -908,7 +1027,7 @@ fn probe_035_codex_lookalike_rejects_replaced_generation() {
     negative("codex", Route::Lookalike, Change::Generation);
 }
 
-/// Scenario: Start declared and learned claude wrappers, including same-kind and other-kind lookalike claims, in spawn and exec forms without a discovery seam, then invoke Ctrl+G with a human draft. The installed helper must run the user's editor and following input must reach the composer. Same-path inode replacements must retain a running old process, reach the new inode before delayed exec, and reach the new inode in a fresh generation, with human input still visible in each case.
+/// Scenario: Start declared and learned claude wrappers, including same-kind and other-kind lookalike claims, in spawn and exec forms without a discovery seam, then invoke Ctrl+G with a human draft. The installed helper must run the user's editor and following input must reach the composer. Same-path updates and genuine absolute-path launches with missing spawn-time pins must preserve a live composer accepting human input.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_fixture_claude_wrappers_preserve_unarmed_editor() {
@@ -949,7 +1068,9 @@ fn probe_035_fixture_claude_wrappers_preserve_unarmed_editor() {
         for update in [Update::Running, Update::BeforeExec, Update::Fresh] {
             update_history("claude", route, update, false);
         }
+        missing_pin("claude", route, NativePins::Neither, false);
     }
+    missing_pin("claude", Route::Learned, NativePins::OtherOnly, false);
 }
 
 /// Scenario: Start a private intermediate wrapper with a native claude child and release only that intermediate parent. The native process must leave the captured parent, remain visible and accept human input before its owned fixture is stopped.
@@ -979,7 +1100,7 @@ fn probe_035_fixture_claude_can_reparent_a_live_candidate() {
     f.wait("native-stopped");
 }
 
-/// Scenario: Start declared and learned codex wrappers, including same-kind and other-kind lookalike claims, in spawn and exec forms without a discovery seam, then invoke Ctrl+G with a human draft. The installed helper must run the user's editor and following input must reach the composer. Same-path inode replacements must retain a running old process, reach the new inode before delayed exec, and reach the new inode in a fresh generation, with human input still visible in each case.
+/// Scenario: Start declared and learned codex wrappers, including same-kind and other-kind lookalike claims, in spawn and exec forms without a discovery seam, then invoke Ctrl+G with a human draft. The installed helper must run the user's editor and following input must reach the composer. Same-path updates and genuine absolute-path launches with missing spawn-time pins must preserve a live composer accepting human input.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_fixture_codex_wrappers_preserve_unarmed_editor() {
@@ -1020,7 +1141,9 @@ fn probe_035_fixture_codex_wrappers_preserve_unarmed_editor() {
         for update in [Update::Running, Update::BeforeExec, Update::Fresh] {
             update_history("codex", route, update, false);
         }
+        missing_pin("codex", route, NativePins::Neither, false);
     }
+    missing_pin("codex", Route::Learned, NativePins::OtherOnly, false);
 }
 
 /// Scenario: Start a private intermediate wrapper with a native codex child and release only that intermediate parent. The native process must leave the captured parent, remain visible and accept human input before its owned fixture is stopped.
