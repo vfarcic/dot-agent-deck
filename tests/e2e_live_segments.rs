@@ -12,7 +12,16 @@
 //!   after refusal or the probe's physical write, not after helper completion;
 //!   a refusal is `ok:true` (the operation ran), with no arm/fence/epoch move.
 //!   `probe-request:retry` and `probe-request:lapse` ask the corresponding
-//!   production paths, with their normal eligibility checks. These never
+//!   production paths, with their normal eligibility checks. First and retry
+//!   requests consult the generation's persistent production `Schedule`: a
+//!   due attempt refused by admission counts as `Schedule::failed` (initial
+//!   backoff 30 s). Before it is due, either spelling returns
+//!   `composer_probe: {outcome: "not_due"}` without scheduling a job, changing
+//!   that schedule, publishing an arm, closing a fence or moving the epoch.
+//!   Due requests report `outcome: "refused"` or `"written"` in that object.
+//!   The lapse spelling keeps the production Claude-only, no-held-input
+//!   exception; it is not a way to retry an admission refusal early. Requests
+//!   neither create a fresh Schedule nor reset its failure accounting. These never
 //!   manufacture a record, ignore permission, or act as `publish`/`fence`.
 //! * `DOT_AGENT_DECK_E2E_PROBE_GATE=<single component under fixture HOME>`:
 //!   a bounded `scheduled` barrier before the writer revalidates admission;
@@ -272,7 +281,7 @@ fn probe_031_dropped_trigger_holds_human_input_through_retirement() {
     f.stable(b"");
 }
 
-/// Scenario: Enter a native candidate while a CPR is outstanding, then ask the live first and retry paths for a probe after the quiet timeout. The latched candidate must prohibit new probe bytes even after a CPR response; a fresh generation is the positive admission control.
+/// Scenario: Enter a native candidate while a CPR is outstanding, request a first probe and an immediate retry, then request again after a CPR response and the quiet timeout. No probe may be written in these histories; a fresh generation is the positive admission control, while the ordinary retry backoff can also prohibit the intervening requests.
 #[spec("inbox/probe/032")]
 #[test]
 fn probe_032_native_backlog_latch_refuses_first_and_retry_then_respawn_recovers() {
@@ -302,7 +311,7 @@ fn probe_032_native_backlog_latch_refuses_first_and_retry_then_respawn_recovers(
     f.expect(b"\x07");
 }
 
-/// Scenario: Fill the outstanding query history before a native candidate and request both first and retry probes. The overflowed history must refuse those attempts without a page publication; an otherwise identical saturated ledger without a native candidate must still allow the control probe.
+/// Scenario: Fill the outstanding query history with and without a native candidate and request a first probe. The native hazard must refuse that attempt without a page publication; the saturated ledger without a native candidate must still allow the control probe.
 #[spec("inbox/probe/032")]
 #[test]
 fn probe_032_overflow_refuses_only_when_native_history_is_hazardous() {
@@ -410,7 +419,7 @@ fn probe_046_attached_dashboard_shows_clears_and_retires_held_typing() {
     f.stable(b"");
 }
 
-/// Scenario: Invoke the user's editor without the installed helper, including a no-delay editor that exits before an observer scan, and read the epoch around its output pair. The fallback must move the foreign epoch once for that unmatched edit, without a hook or synthetic observation clearing it.
+/// Scenario: Invoke the user's editor through the installed helper with and without its report connection, including a run with no added editor delay, and read the epoch around its output pair. The unmatched external edit must move the foreign epoch once without an empty observation clearing it; the test does not order editor exit against the first observer scan.
 #[spec("inbox/probe/048")]
 #[test]
 fn probe_048_unreported_and_fast_external_edits_move_the_foreign_epoch() {
@@ -526,18 +535,29 @@ fn probe_059_live_page_retains_segment_across_count_and_native_publications() {
         first.seg_seq > 0,
         "a real probe must publish its segment before its byte"
     );
+    assert_eq!(first.count, 0, "the helper consumed its probe liability");
     f.control("publish");
     let raised = f.page();
+    assert_eq!(raised.count, 1, "count-only raise publishes one liability");
     assert_eq!(
         raised.seg_seq, first.seg_seq,
         "count-only raise retains segment"
     );
+    assert_eq!(raised.native_seq, first.native_seq);
     f.control("withdraw");
+    let withdrawn = f.page();
+    assert_eq!(withdrawn.count, 0, "withdraw publishes no liability");
+    assert_eq!(withdrawn.seg_seq, first.seg_seq);
+    assert_eq!(withdrawn.native_seq, first.native_seq);
     f.flag("edit-drop");
     let mut human = f.connect();
     human.write("\x07");
     f.expect(b"\x07\x07");
     let native = f.page();
+    assert_eq!(
+        native.count, 0,
+        "native publication retains the withdrawn count"
+    );
     assert_eq!(
         native.seg_seq, first.seg_seq,
         "native publication retains probe segment"
@@ -548,7 +568,7 @@ fn probe_059_live_page_retains_segment_across_count_and_native_publications() {
     );
 }
 
-/// Scenario: Accept a genuine native BEL under an OSC colour-reply history, with retained, dropped, whole and split BEL/ST replies, then ask the live probe path. A non-exempt BEL prohibits the check during its quiet period; a whole solicited report or an ST reply leaves the control probe eligible, and expiry recovers the quiet native case.
+/// Scenario: Send whole retained OSC 10 BEL/ST replies or a raw native BEL, then request a first probe. The report controls admit immediately; the native case refuses, first/retry requests stay not due even after the quiet period, and an ordinary retry writes exactly one probe after the production backoff without a generation reset.
 #[spec("inbox/probe/061")]
 #[test]
 fn probe_061_live_admission_reads_actual_osc_reply_and_native_histories() {
@@ -563,19 +583,53 @@ fn probe_061_live_admission_reads_actual_osc_reply_and_native_histories() {
         let mut human = f.connect();
         human.write(reply);
         f.expect(reply.as_bytes());
-        f.probe();
+        let page = f.page();
+        let first = f.probe();
         if native {
+            assert_eq!(first["composer_probe"]["outcome"], "refused", "{first}");
+            let refused_at = Instant::now();
+            let epoch = f.epoch();
+            assert_eq!(f.page(), page, "a refused attempt must not publish an arm");
+            for operation in ["probe-request", "probe-request:retry"] {
+                let early = f.control(operation);
+                assert_eq!(early["composer_probe"]["outcome"], "not_due", "{early}");
+            }
             f.stable(reply.as_bytes());
             wait_span(
                 dot_agent_deck::composer_probe::query_ledger::T_TRIGGER + Duration::from_millis(50),
             );
-            f.probe();
+            let early = f.control("probe-request:retry");
+            assert_eq!(
+                early["composer_probe"]["outcome"], "not_due",
+                "quiet-period expiry must not bypass the persistent schedule: {early}"
+            );
+            f.stable(reply.as_bytes());
+            assert_eq!(f.page(), page, "not-due requests must not publish an arm");
+            assert_eq!(f.epoch(), epoch, "not-due requests must not move the epoch");
+            assert!(!has_held(&f.snapshot()));
+            assert_eq!(f.control("fence-status")["composer_fence"]["fenced"], false);
+            let due_after =
+                dot_agent_deck::composer_probe::probe::BACKOFF[0] + Duration::from_millis(100);
+            wait_span(due_after.saturating_sub(refused_at.elapsed()));
+            let eligible = f.control("probe-request:retry");
+            assert_eq!(
+                eligible["composer_probe"]["outcome"], "written",
+                "not-due requests must not restart the refusal backoff: {eligible}"
+            );
+        } else {
+            assert_eq!(first["composer_probe"]["outcome"], "written", "{first}");
         }
-        f.expect(&[reply.as_bytes(), b"\x07"].concat());
+        let expected = [reply.as_bytes(), b"\x07"].concat();
+        f.expect(&expected);
+        f.stable(&expected);
+        assert!(
+            f.page().seg_seq > 0,
+            "eligible probes publish their segment"
+        );
     }
 }
 
-/// Scenario: Queue ordinary mail for an idle synthetic agent whose empty box has been touched by a harmless key. The production doorbell tick must submit a probe through the installed helper without a test request; this checks the automatic integration rather than requiring mail delivery from the later authority switch.
+/// Scenario: Queue ordinary mail for an idle synthetic agent whose empty box has been touched by a harmless key, with its next edit trigger configured to be ignored. Without a test request, the production tick must write a probe byte and publish a nonzero segment; this witnesses submission, without helper completion or mail delivery.
 #[spec("inbox/probe/059")]
 #[test]
 fn probe_059_automatic_tick_submits_a_real_probe() {
