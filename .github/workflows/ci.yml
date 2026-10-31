@@ -212,11 +212,14 @@ jobs:
           echo "linux_backend=$backend" | tee -a "$GITHUB_OUTPUT"
       # The path classification lives in scripts/ci-changes.sh, which
       # `.rwx/ci.yml` runs too, so the two CI systems skip the same jobs for the
-      # same change. Its header has the reasoning for each output.
+      # same change. Its header has the reasoning for each output. The
+      # `version` step below runs scripts/latest-release-version.sh.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-          sparse-checkout: scripts/ci-changes.sh
+          sparse-checkout: |
+            scripts/ci-changes.sh
+            scripts/latest-release-version.sh
           sparse-checkout-cone-mode: false
       - id: detect
         env:
@@ -247,24 +250,24 @@ jobs:
       # one, refuses on an unknown one. So the jobs that run what they build
       # take `DAD_VERSION` from here: the newest `vX.Y.Z` tag, which is what
       # `git describe --tags --abbrev=0` reports in a developer's checkout of
-      # `main`. `git ls-remote` reads the tags without the history, which a
-      # deep fetch would download. A failure fails this job, and with it the
+      # `main`. scripts/latest-release-version.sh does the lookup, with
+      # `git ls-remote`, which reads the tags without the history a deep fetch
+      # would download. A failure fails this job, and with it the
       # run, rather than sending every build down the placeholder path. It
       # runs only when a job here will build (the same conditions those jobs
       # carry; `linux_backend` reads `rwx` only on a pull request, where
       # `build-macos` does not run), so an RWX-owned or lock-only PR cannot
       # go red over a tag it would not use. `.rwx/ci.yml`'s `backend` task
-      # does the same for RWX.
+      # runs the same script for RWX, and `.rwx/sandbox.yml`'s `version` task
+      # for the sandbox (issue #2052).
       - id: version
         if: steps.detect.outputs.devbox_only != 'true' && steps.detect.outputs.flake_only != 'true' && steps.backend.outputs.linux_backend != 'rwx'
         env:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          version=$(git ls-remote --tags --refs "https://github.com/$REPO.git" 'v*' \
-            | sed -n 's#.*refs/tags/v\([0-9]*\.[0-9]*\.[0-9]*\)$#\1#p' | sort -V | tail -n 1)
-          if [ -z "$version" ]; then
-            echo "::error::no vX.Y.Z release tag found in $REPO"
+          if ! version=$(scripts/latest-release-version.sh "https://github.com/$REPO.git"); then
+            echo "::error::no vX.Y.Z release tag could be read from $REPO"
             exit 1
           fi
           echo "dad_version=$version" | tee -a "$GITHUB_OUTPUT"
