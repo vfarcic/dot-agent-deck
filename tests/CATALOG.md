@@ -3089,7 +3089,7 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 
 ##### hooks/install/023 — An OpenCode agent a headless daemon starts from a scheduled task loads a plugin pinned to the daemon, even when OpenCode was set up after the daemon started (PRD #190).
 - **Layer:** L2 headless e2e (`tests/e2e_daemon_plugin_refresh.rs`), the real `daemon serve` from `common::spawn_daemon_serve` with a durable `~/.local/bin/dot-agent-deck` in an isolated HOME; no TUI is started.
-- **Agent:** none; a stand-in `opencode` script, run as a scheduled task's command through `RunNow`, records each plugin's `BINARY_PATH` the moment it starts.
+- **Agent:** none; a stand-in `opencode` script, run as a scheduled task's command through `RunNow`, records each plugin's `BINARY_PATH` the moment it starts. It answers `--version` with `1.18.35` and exits without recording, because the deck probes `<opencode> --version` before each OpenCode spawn and ahead of the per-spawn install (PRD #2050); a stand-in that recorded on that probe would record the stale pins.
 - **Asserts:** with no OpenCode folder at daemon start, no plugin is written; after both layouts (`~/.config/opencode`, `~/.opencode`) are created holding a plugin pinned to a deleted copy of the deck, the scheduled OpenCode agent finds both plugins pinned to the daemon's `~/.local/bin/dot-agent-deck` as it starts.
 - **Does not assert:** a plugin folder the deck cannot write, and the card notice that follows (`inbox/boundary/025`); a plugin pinned to another live install, which is kept (`inbox/boundary/025`); the plugin template's integration level (`inbox/boundary/025`); the daemon's startup install (`hooks/install/009`); Claude Code's hooks, which the daemon installs only when it starts (decision on issue #190); a real OpenCode.
 - **Platform coverage:** mac+linux.
@@ -12599,6 +12599,30 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Asserts:** a typed prompt that writes a uniquely named sentinel with the shell (a path relative to the project, so the deck's shortened tool detail still names it) turns the card Working, arrives as an OpenCode prompt event and a ToolStart whose detail names the sentinel, shows that detail on the card, writes the sentinel, and ends in an Idle event with the card reading Idle and still showing the prompt; then a genuine orchestrator delegate is acted on (a second sentinel), reads acknowledged, and the card settles Idle.
 - **Does not assert:** Blocked, question forms, `mini`, busy queues, telemetry operations, or the desktop app's rendering of the same card.
 - **Cost:** cheap real-agent turns, sequential locally with strict preflight.
+
+##### inbox/opencode/061 — OpenCode 2 on its shared background service is named on its card; a standalone OpenCode 2 is not (PRD #2050).
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_opencode_card_notice.rs`), a real deck and daemon with two panes started over the attach socket (`start-agent`, `agent_type = "open_code"`), each running a wrapper shell script the deck cannot see into, so the deck adds no `--standalone` itself and watches the pane only because it is declared OpenCode.
+- **Agent:** none. A native `opencode` stand-in built with `cc` at test time (a `#!/bin/sh` script is not detected: the daemon keys on the executable's file name and runs `<executable> --version`). It prints `opencode v2.2.5` for `--version` and, given `--standalone`, starts itself again as `opencode serve --stdio --port 0`, the private-server child real 2.2.5 runs (shape measured by the coder on 2.2.5). Each wrapper first reports one native `session.created` event through `hook --agent opencode`, so neither pane is "not working".
+- **Asserts:** within the shared-service grace plus four of the daemon's five-second looks, the shared pane's `daemon status --json` record carries `inbox.agent_notice` `{kind: "opencode_shared_service"}` with the full sentence (add `--standalone`, or `opencode service set disabled true`, then restart), and exactly one card on the rendered dashboard shows its start; the standalone pane carries no notice from start until the grace plus two looks have passed, and the shared line stays on one card only.
+- **Does not assert:** a real OpenCode binary or its shared service; `opencode mini` (the same client shape, unit-tested in `opencode_mode::tests`); a pane the deck can see into (`hooks/install/025` covers the `--standalone` the deck adds there); `opencode service set disabled true`; the desktop app's rendering, which reads the same `agent_notice` (`data-testid="inbox-notice-<agentId>"`, covered by the vitest `desktop/src/components/AgentNotice.test.tsx` and `dto::tests::agent_mapping_carries_the_agent_notice_sentence`).
+- **Platform coverage:** linux (the stand-in and the daemon's `/proc` sampling; this test does not run the macOS sampling path).
+- **Cost:** none; about 20 s. Lane 1 in CI runs it rather than skipping it: it needs `cc` and no OpenCode, and the GitHub `ubuntu-latest` runners ship gcc while the RWX configs install `build-essential`; a missing `cc` fails it loudly rather than skipping.
+
+##### inbox/opencode/062 — An OpenCode whose deck integration never reports is named on its card after the grace; an idle healthy one is not (PRD #2050).
+- **Layer:** as `inbox/opencode/061`.
+- **Agent:** the `inbox/opencode/061` stand-in at `opencode v2.2.5`, both panes `--standalone`. The silent pane's wrapper reports nothing, which is what the daemon sees when OpenCode cannot find the deck's plugin (the coder's live case was `OPENCODE_CONFIG_DIR=<empty dir>` on real 2.2.5); the healthy pane's wrapper reports one native `session.created` event and then the pane sits idle.
+- **Asserts:** the silent pane carries no notice for the first 35 s; by the 45 s grace plus five looks its record carries `{kind: "opencode_not_reporting"}` with the full sentence (`hooks install --agent opencode`, restart, `docs troubleshooting`) and exactly one card shows its start; the idle healthy pane carries no notice throughout, until one more look after the silent one's notice.
+- **Does not assert:** evidence from the inbox receiver arming (the other half of "reporting", unit-tested in `opencode_mode::tests` and `state::tests`); a half-broken 2.x full TUI whose TUI half loaded but whose server plugin did not, which the deck does not detect (coder's known limit); a real OpenCode; the desktop app (as `inbox/opencode/061`).
+- **Platform coverage:** linux, as `inbox/opencode/061`.
+- **Cost:** none; about 60 s, the daemon's fixed 45 s grace.
+
+##### inbox/opencode/063 — An OpenCode older than the deck supports is named on its card at once; a supported 1.x without `--standalone` is not (PRD #2050).
+- **Layer:** as `inbox/opencode/061`.
+- **Agent:** two builds of the `inbox/opencode/061` stand-in, printing `1.18.28` and `1.18.35`, neither given `--standalone`; both wrappers report one native event.
+- **Asserts:** within two looks (load-scaled) of starting, the 1.18.28 pane's record carries `{kind: "opencode_unsupported_version"}` with the sentence naming 1.18.28 and the 1.18.29 floor, and exactly one card shows its start; the 1.18.35 pane carries no notice until the shared-service grace plus two looks have passed, since a 1.x client is never called "shared service".
+- **Does not assert:** the real `opencode-ai@1.18.28` package (the coder measured it live); whether 1.18.29 is the right floor (the coder measured 1.18.28 loading the deck's module, and the floor is under review); a version the stand-in cannot report; the desktop app (as `inbox/opencode/061`).
+- **Platform coverage:** linux, as `inbox/opencode/061`.
+- **Cost:** none; about 20 s.
 
 #### inbox/pi
 

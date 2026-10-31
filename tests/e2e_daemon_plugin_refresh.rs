@@ -87,7 +87,12 @@ fn install_023_a_scheduled_opencode_agent_loads_a_plugin_pinned_to_the_daemon() 
     }
 
     // A stand-in OpenCode that records what each plugin pins as it starts,
-    // then waits to be reaped with the daemon's process group.
+    // then waits to be reaped with the daemon's process group. It answers
+    // `--version` (as a 1.x OpenCode, the layout this test was written for)
+    // and exits before recording: the deck runs `<opencode> --version` before
+    // each OpenCode spawn, ahead of the per-spawn install (PRD #2050), so a
+    // stand-in that recorded on that probe would record the stale pins, and
+    // one that slept on it would stall the spawn on the probe's bound.
     let quoted: Vec<_> = plugins
         .iter()
         .map(|plugin| format!("'{}'", plugin.display()))
@@ -95,7 +100,7 @@ fn install_023_a_scheduled_opencode_agent_loads_a_plugin_pinned_to_the_daemon() 
     std::fs::write(
         &standin,
         format!(
-            "#!/bin/sh\ngrep -H 'BINARY_PATH = ' {plugins} > '{seen}.tmp'\nmv '{seen}.tmp' '{seen}'\nexec sleep 600\n",
+            "#!/bin/sh\ncase \"$1\" in --version|-v) echo '{V1}'; exit 0;; esac\ngrep -H 'BINARY_PATH = ' {plugins} > '{seen}.tmp'\nmv '{seen}.tmp' '{seen}'\nexec sleep 600\n",
             plugins = quoted.join(" "),
             seen = seen.display(),
         ),
