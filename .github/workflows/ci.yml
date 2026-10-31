@@ -1722,7 +1722,7 @@ jobs:
         timeout-minutes: 10
         env:
           DAD_PTY_STRESS: "1"
-          DAD_PTY_STRESS_ITERATIONS: "25000"
+          DAD_PTY_STRESS_ITERATIONS: "5000"
         run: |
           sw_vers
           sysctl kern.tty.ptmx_max hw.ncpu

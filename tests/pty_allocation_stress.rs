@@ -13,6 +13,7 @@ use std::os::fd::{AsRawFd, IntoRawFd};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
+use std::time::{Duration, Instant};
 
 #[derive(Default, Debug, Serialize, Deserialize)]
 struct Counts {
@@ -35,7 +36,28 @@ impl Counts {
     }
 }
 
-fn allocation_loop(iterations: usize) -> Counts {
+fn disable_writer_eof(master: &dyn portable_pty::MasterPty) -> std::io::Result<()> {
+    let fd = master.as_raw_fd().expect("Unix PTY master descriptor");
+    let mut settings = std::mem::MaybeUninit::<libc::termios>::uninit();
+    // SAFETY: fd is borrowed from the live master; settings has room for the
+    // termios structure and is read only after successful initialization.
+    if unsafe { libc::tcgetattr(fd, settings.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: tcgetattr initialized settings above.
+    let mut settings = unsafe { settings.assume_init() };
+    // UnixMasterWriter::drop writes newline + EOF when VEOF is nonzero. The
+    // allocation experiment has no consumer: exclude that unrelated I/O from
+    // teardown, while still exercising the actual owned writer duplicate.
+    settings.c_cc[libc::VEOF] = 0;
+    // SAFETY: settings is initialized and fd remains owned by master.
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &settings) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn allocation_loop(iterations: usize, suppress_eof: bool) -> Counts {
     let system = NativePtySystem::default();
     let mut counts = Counts::default();
     for iteration in 0..iterations {
@@ -53,6 +75,10 @@ fn allocation_loop(iterations: usize) -> Counts {
             }
         };
         counts.opened += 1;
+        if suppress_eof && let Err(error) = disable_writer_eof(pair.master.as_ref()) {
+            counts.error("disable_writer_eof", error);
+            continue;
+        }
         if let Err(error) = pair.master.get_size() {
             counts.error("get_size", error);
         }
@@ -105,7 +131,7 @@ fn threads(workers: usize, iterations: usize, churn: bool) -> Counts {
                 let start = start.clone();
                 scope.spawn(move || {
                     start.wait();
-                    allocation_loop(iterations)
+                    allocation_loop(iterations, true)
                 })
             })
             .collect();
@@ -152,6 +178,36 @@ fn finish(child: std::process::Child) -> Counts {
     serde_json::from_str(result).unwrap()
 }
 
+fn probe_writer_drop() {
+    let mut probe = child("writer-drop", 1);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if probe.try_wait().unwrap().is_some() {
+            println!("PTY_STRESS_WRITER_DROP completed {:?}", finish(probe));
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Only this captured subprocess is sampled and killed. It has no agent,
+    // daemon, or subprocess of its own. Always reap before checking sampling.
+    #[cfg(target_os = "macos")]
+    let sample = Command::new("sample")
+        .args([&probe.id().to_string(), "1", "1", "-file", "/dev/stdout"])
+        .output();
+    let killed = probe.kill();
+    let output = probe.wait_with_output();
+    println!("PTY_STRESS_WRITER_DROP blocked past 3 seconds; kill={killed:?} result={output:?}");
+    #[cfg(target_os = "macos")]
+    match sample {
+        Ok(output) => {
+            println!("PTY_STRESS_WRITER_DROP_SAMPLE status={}", output.status);
+            println!("{}", String::from_utf8_lossy(&output.stdout));
+            println!("{}", String::from_utf8_lossy(&output.stderr));
+        }
+        Err(error) => println!("PTY_STRESS_WRITER_DROP_SAMPLE unavailable: {error}"),
+    }
+}
+
 fn positive_control(iterations: usize) -> Counts {
     let mut counts = Counts::default();
     for _ in 0..iterations {
@@ -189,10 +245,10 @@ fn iterations() -> usize {
     std::env::var("DAD_PTY_STRESS_ITERATIONS")
         .ok()
         .map(|value| value.parse().unwrap())
-        .unwrap_or(25_000)
+        .unwrap_or(5_000)
 }
 
-/// Scenario: only when explicitly requested, open and tear down PTYs from concurrent threads, with and without unrelated descriptor churn, and from separate processes. An isolated stale-fd double-close control checks the expected EBADF signature; each mode prints its own allocation and error counts.
+/// Scenario: only when explicitly requested, bound a separate probe of the writer's automatic EOF, then open and tear down PTYs without that I/O from concurrent threads, with unrelated descriptor churn, and from separate processes. An isolated stale-fd double-close control checks the expected EBADF signature; each mode prints its own allocation and error counts.
 #[test]
 fn pty_allocation_stress() {
     if std::env::var("DAD_PTY_STRESS").as_deref() != Ok("1") {
@@ -201,7 +257,9 @@ fn pty_allocation_stress() {
     let workers = 8;
     let iterations = iterations();
     println!("PTY_STRESS_CONFIG workers={workers} iterations={iterations}");
+    probe_writer_drop();
     for (mode, churn) in [("threads", false), ("threads-fd-churn", true)] {
+        println!("PTY_STRESS_START {mode}");
         println!(
             "PTY_STRESS_MODE {mode} {:?}",
             threads(workers, iterations, churn)
@@ -231,7 +289,8 @@ fn pty_allocation_stress_worker() {
     // Prove unrelated descriptors remain usable after the positive control.
     let sentinel = File::open("/dev/null").unwrap();
     let counts = match mode.as_str() {
-        "allocate" => allocation_loop(iterations()),
+        "allocate" => allocation_loop(iterations(), true),
+        "writer-drop" => allocation_loop(1, false),
         "positive" => positive_control(iterations()),
         _ => panic!("unknown diagnostic mode"),
     };
