@@ -165,11 +165,8 @@ fn config_dir_from(
     xdg_config_home: Option<&std::ffi::OsStr>,
     home: Option<&str>,
 ) -> Option<PathBuf> {
-    if let Some(xdg) = xdg_config_home {
-        let xdg = Path::new(xdg);
-        if xdg.is_absolute() {
-            return Some(xdg.join("devin"));
-        }
+    if let Some(xdg) = crate::platform::paths::absolute_dir_from_env(xdg_config_home) {
+        return Some(xdg.join("devin"));
     }
     let home = home.filter(|h| !h.is_empty())?;
     Some(Path::new(home).join(".config").join("devin"))
