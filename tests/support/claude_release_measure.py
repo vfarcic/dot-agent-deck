@@ -134,7 +134,7 @@ class Recorder:
         self.pump(1)
         self.snap('empty')
         assert self.modes[-1]['bits'] == [False, False], self.modes
-        if kind == 'menus':
+        if kind.startswith('menus'):
             for name, key in [('slash', '/'), ('at', '@'), ('bang', '!')]:
                 self.send(key)
                 self.pump(1)
@@ -158,7 +158,12 @@ class Recorder:
             self.wait(lambda: (self.out / 'hook.jsonl').exists())
             self.pump(1)
             self.snap('quotation-echo')
-            self.send('\x15')
+            # Ctrl+U clears only the last visual line on a narrow composer.
+            # Remove the whole restored draft without submitting it again.
+            for _ in quotation:
+                self.send(BS)
+                self.pump(.01)
+            self.wait(lambda: not self.composer().strip())
             self.pump(.5)
             self.snap('transcript-quotation')
             self.send(L)
@@ -286,6 +291,7 @@ class Recorder:
         (self.out / 'index.json').write_text(json.dumps(index, indent=2))
         result = {'sha256': self.sha256, 'release': self.release, 'pid': pid, 'error': error, 'reads': self.reads,
                   'executable': self.executable, 'model': 'haiku',
+                  'theme': self.theme,
                   'events': self.events, 'modes': self.modes, 'keys': self.keys}
         (self.out / 'result.json').write_text(json.dumps(result, indent=2))
         (self.out / 'frames.json').write_text(json.dumps(self.frames, indent=2, ensure_ascii=False))
@@ -304,17 +310,27 @@ def main():
     assert Path(os.environ['DOT_AGENT_DECK_ATTACH_SOCKET']).parent == home.parent, 'requires private endpoint'
     binary = Path(shutil.which('claude')).resolve(strict=True)
     digest = hashlib.sha256(binary.read_bytes()).hexdigest()
-    assert digest in (PINS.values() if kind == 'menus' else [SHA]), 'executable pin changed'
+    assert digest in (PINS.values() if kind.startswith('menus') else [SHA]), 'executable pin changed'
     release = subprocess.check_output([str(binary), '--version'], text=True).split()[0]
-    expected = PINS[release] if kind == 'menus' else SHA
+    expected = PINS[release] if kind.startswith('menus') else SHA
     assert digest == expected, 'executable pin changed'
     recorder = Recorder(out, rows, cols)
     recorder.executable = str(binary)
     recorder.release, recorder.sha256 = release, expected
+    # Claude's own theme preference, confined to TuiDeck's disposable HOME.
+    preferences = home / '.claude.json'
+    preference_data = json.loads(preferences.read_text())
+    if kind.startswith('menus'):
+        preference_data['theme'] = 'light' if kind == 'menus-light' else 'dark'
+        preferences.write_text(json.dumps(preference_data))
+    recorder.theme = preference_data.get('theme', 'dark')
     # Only the harness's disposable HOME is writable by this controller.
     settings = home / '.claude/settings.json'
     hook = ' '.join(shlex.quote(x) for x in [sys.executable, str(Path(__file__).resolve()), '--block-hook', str(out)])
     configuration = json.loads(settings.read_text()) if settings.exists() else {}
+    if kind.startswith('menus'):
+        # User settings override the legacy .claude.json theme preference.
+        configuration['theme'] = recorder.theme
     configuration['autoUpdates'] = False
     configuration['hooks'] = {'UserPromptSubmit': [{'hooks': [{'type': 'command', 'command': hook}]}]}
     settings.write_text(json.dumps(configuration))

@@ -300,7 +300,7 @@ fn measure_with_path(kind: &str, rows: u16, cols: u16, path: Option<&str>) -> Ca
     capture
 }
 
-/// Scenario: Open the slash menu, file menu, shell mode, exit warning and background overview in isolated real Claude Code 2.1.310 and 2.1.312 composers. Capture their raw bytes and rendered frames, including a normal composer with warning phrases quoted in a real user transcript echo whose submission is blocked before a model turn.
+/// Scenario: Open the slash menu, file menu, shell mode, exit warning and background overview in isolated real Claude Code 2.1.310 and 2.1.312 composers at 24×80, 40×120 and 50×200 in the default dark theme, and at 50×200 in the light theme. Capture their raw bytes and rendered frames, including a normal composer with warning phrases quoted in a real user transcript echo whose submission is blocked before a model turn.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_live_release_menu_frames() {
@@ -319,65 +319,114 @@ fn doorbell_036_live_release_menu_frames() {
             root.path().display(),
             std::env::var("PATH").unwrap()
         );
-        let capture = measure_with_path("menus", 50, 200, Some(&path));
-        assert_eq!(capture.result["release"], release);
-        assert!(
-            capture
-                .parser(capture.point("overview"))
-                .screen()
-                .contents()
-                .lines()
-                .any(|row| {
-                    row.starts_with('❯') && row.contains("describe a task for a new session")
-                }),
-            "{release}: overview must show its own composer, beyond the transcript quotation"
-        );
-        for (point, signature) in [
-            ("slash", "/add-dir"),
-            ("at", ".dot-agent-deck.toml"),
-            ("bang", "! for shell mode"),
-            ("exit-warning", "Press Ctrl-C again to exit"),
-            ("overview", "describe a task for a new session"),
-            (
-                "transcript-quotation",
-                "Original prompt: Quoted UI phrases:",
-            ),
+        let mut dark_shell_colour = None;
+        for (kind, rows, cols) in [
+            ("menus", 24, 80),
+            ("menus", 40, 120),
+            ("menus", 50, 200),
+            ("menus-light", 50, 200),
         ] {
+            let capture = measure_with_path(kind, rows, cols, Some(&path));
+            eprintln!(
+                "{release} {kind} {rows}x{cols} capture: {}",
+                capture.root.display()
+            );
+            assert_eq!(capture.result["release"], release);
+            let bang = capture.parser(capture.point("bang"));
+            let shell_colour = bang.screen().cell(rows - 3, 0).unwrap().fgcolor();
+            if kind == "menus" && rows == 50 {
+                dark_shell_colour = Some(shell_colour);
+            } else if kind == "menus-light" {
+                assert_ne!(
+                    Some(shell_colour),
+                    dark_shell_colour,
+                    "light theme must visibly change the shell palette"
+                );
+            }
+            let quotation = capture.parser(capture.point("transcript-quotation"));
             assert!(
-                capture
-                    .parser(capture.point(point))
+                quotation
                     .screen()
                     .contents()
-                    .contains(signature),
-                "{release} {point}: missing real screen signature {signature:?}"
+                    .lines()
+                    .any(|row| row.trim() == "❯"),
+                "the quoted transcript's main composer must have no retained draft"
+            );
+            assert!(
+                capture
+                    .parser(capture.point("overview"))
+                    .screen()
+                    .contents()
+                    .lines()
+                    .any(|row| {
+                        row.starts_with('❯') && row.contains("describe a task for a new session")
+                    }),
+                "{release}: overview must show its own composer, beyond the transcript quotation"
+            );
+            for (point, signature) in [
+                ("slash", "/add-dir"),
+                ("at", ".dot-agent-deck.toml"),
+                ("bang", "! for shell mode"),
+                ("exit-warning", "Press Ctrl-C again to exit"),
+                ("overview", "describe a task for a new session"),
+                (
+                    "transcript-quotation",
+                    "Original prompt: Quoted UI phrases:",
+                ),
+            ] {
+                assert!(
+                    capture
+                        .parser(capture.point(point))
+                        .screen()
+                        .contents()
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .contains(signature),
+                    "{release} {point}: missing real screen signature {signature:?}"
+                );
+            }
+            let mut rendered = String::new();
+            for point in [
+                "empty",
+                "slash",
+                "at",
+                "bang",
+                "exit-warning",
+                "transcript-quotation",
+                "overview",
+            ] {
+                let parser = capture.parser(capture.point(point));
+                eprintln!("{release} {point}:\n{}", parser.screen().contents());
+                rendered.push_str(&format!(
+                    "{release} {point} offset={} cursor={:?}\n{}\n\n",
+                    capture.point(point),
+                    parser.screen().cursor_position(),
+                    parser.screen().contents()
+                ));
+                let palette: Vec<_> = (0..rows)
+                    .filter_map(|row| {
+                        let cell = parser.screen().cell(row, 0)?;
+                        matches!(cell.contents(), "❯" | "─" | "!").then(|| {
+                            format!(
+                                "row {row}: {:?} fg={:?} bg={:?}",
+                                cell.contents(),
+                                cell.fgcolor(),
+                                cell.bgcolor()
+                            )
+                        })
+                    })
+                    .collect();
+                rendered.push_str(&format!("{}\n\n", palette.join("\n")));
+            }
+            std::fs::write(capture.root.join("rendered.txt"), rendered).unwrap();
+            let hooks = std::fs::read_to_string(capture.root.join("hook.jsonl")).unwrap();
+            assert_eq!(
+                hooks.lines().count(),
+                1,
+                "one blocked submission; no model turn"
             );
         }
-        let mut rendered = String::new();
-        for point in [
-            "empty",
-            "slash",
-            "at",
-            "bang",
-            "exit-warning",
-            "transcript-quotation",
-            "overview",
-        ] {
-            let parser = capture.parser(capture.point(point));
-            eprintln!("{release} {point}:\n{}", parser.screen().contents());
-            rendered.push_str(&format!(
-                "{release} {point} offset={} cursor={:?}\n{}\n\n",
-                capture.point(point),
-                parser.screen().cursor_position(),
-                parser.screen().contents()
-            ));
-        }
-        std::fs::write(capture.root.join("rendered.txt"), rendered).unwrap();
-        let hooks = std::fs::read_to_string(capture.root.join("hook.jsonl")).unwrap();
-        assert_eq!(
-            hooks.lines().count(),
-            1,
-            "one blocked submission; no model turn"
-        );
     }
 }
 
