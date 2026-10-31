@@ -193,6 +193,9 @@ fn doorbell_010_draft_has_no_timeout_cap() {
 #[spec("inbox/doorbell/010")]
 #[test]
 fn doorbell_010_attached_left_in_empty_editor_does_not_strand_task() {
+    // Core R3 §3.2 (coder-p3-q35-design-rev3.md:184): every
+    // byte-carrying PtyOp touches; Left is not a D3/D3′ report exemption.
+    // The production implementation is src/composer_probe/epoch.rs:15-25.
     let f = fixture("claude");
     let tui = attached(&f);
     tui.send_keys(b"1");
@@ -206,7 +209,7 @@ fn doorbell_010_attached_left_in_empty_editor_does_not_strand_task() {
     f.expect(format!("{first}\r\x1b[D\x07{second}\r").as_bytes());
 }
 
-/// Scenario: Deliver a first notice, then type a fresh draft through the attached TUI and clear it after the message has been fetched. The completed ring sends no further byte, the human draft is not submitted, and a later message requires a new check rather than reusing the earlier ring's observation.
+/// Scenario: Submit a first notice with the composer's fetch paused, type a fresh draft through the attached TUI, and independently fetch and acknowledge the queued mail while that draft remains present. Fetching and then clearing send no cleanup byte, the draft is never submitted, and a later message requires a fresh check before delivery.
 #[spec("inbox/doorbell/011")]
 #[test]
 fn doorbell_011_a_submitted_ring_sends_nothing_after_a_new_human_draft() {
@@ -214,16 +217,35 @@ fn doorbell_011_a_submitted_ring_sends_nothing_after_a_new_human_draft() {
     let tui = attached(&f);
     tui.send_keys(b"1");
     tui.wait_for_string("Claude Code");
+    f.flag("fetch-paused");
     let id = f.enqueue();
-    let first = delivered(&f, &id);
+    assert!(common::wait_until(WAIT, || mail_turns(&f, &id).len() == 1));
+    let first = mail_turns(&f, &id).remove(0);
+    f.expect(format!("{first}\r").as_bytes());
+    assert_eq!(f.snapshot()["inbox"]["queued"], 1);
+    assert!(handovers(&f).is_empty());
     tui.send_keys(inbox::DRAFT.as_bytes());
     let typed = format!("{first}\r{}", inbox::DRAFT);
     f.expect(typed.as_bytes());
     f.stable(typed.as_bytes());
+    assert!(f.screen().contains(inbox::DRAFT));
+    let fetched = f.command(json!({"action":"fetch"}));
+    assert_eq!(fetched["ok"], true, "{fetched}");
+    assert!(
+        fetched["stdout"].as_str().unwrap().contains(&id),
+        "{fetched}"
+    );
+    assert!(common::wait_until(WAIT, || {
+        let record = f.snapshot();
+        record["inbox"]["queued"] == 0 && record["inbox"]["last_acked_at"].is_string()
+    }));
+    f.stable(typed.as_bytes());
+    assert!(f.screen().contains(inbox::DRAFT));
     tui.send_keys(b"\x15");
     let cleared = format!("{typed}\x15");
     f.expect(cleared.as_bytes());
     f.stable(cleared.as_bytes());
+    f.remove("fetch-paused");
     let next = f.enqueue();
     let line = delivered(&f, &next);
     f.expect(format!("{cleared}\x07{line}\r").as_bytes());
@@ -274,40 +296,62 @@ fn doorbell_012_drafted_batch_fetch_preserves_arrival_order() {
     );
 }
 
-/// Scenario: Send two Escape keys while Claude is working, then complete the physical key sequence with a typed-and-deleted character and report the turn idle. The Escapes keep the box touched, so the waiting message requires a real empty check before its notice is submitted.
+/// Scenario: Send two Escape keys while synthetic Claude and Codex are working, then complete the physical key sequence with a typed-and-deleted character and report the turn idle. The Escapes keep the box touched, so the waiting message requires a real empty check before its notice is submitted.
 #[spec("inbox/doorbell/019")]
 #[test]
-fn doorbell_019_an_interrupts_escapes_do_not_hold_doorbell() {
-    let f = fixture("claude");
-    f.hook_event("thinking");
-    let mut human = f.connect();
-    human.write("\x1b");
-    f.expect(b"\x1b");
-    human.write("\x1bx\x7f");
-    f.expect(b"\x1b\x1bx\x7f");
-    f.hook_event("idle");
-    let id = f.enqueue();
-    let line = delivered(&f, &id);
-    f.expect(format!("\x1b\x1bx\x7f\x07{line}\r").as_bytes());
+fn doorbell_019_claude_and_codex_interrupts_require_an_empty_check() {
+    for kind in ["claude", "codex"] {
+        let f = fixture(kind);
+        f.hook_event("thinking");
+        let mut human = f.connect();
+        human.write("\x1b");
+        f.expect(b"\x1b");
+        human.write("\x1bx\x7f");
+        f.expect(b"\x1b\x1bx\x7f");
+        f.hook_event("idle");
+        let id = f.enqueue();
+        let line = delivered(&f, &id);
+        f.expect(format!("\x1b\x1bx\x7f\x07{line}\r").as_bytes());
+    }
 }
 
-/// Scenario: Leave text followed by Escape keys in Claude's composer and report repeated idle events. A real check must retain the draft and withhold the notice; clearing the draft requires another check before delivery, regardless of the repeated idle reports.
+/// Scenario: Retain text typed before and after Escape keys while Claude is busy, then report Idle and queue mail; both drafts must survive a non-empty check and hold the notice until cleared and checked again. Separately, Escapes on an already-Idle Claude followed by duplicate Idle reports require an empty check before delivery.
 #[spec("inbox/doorbell/019")]
 #[test]
-fn doorbell_019_drafts_hold_doorbell_and_an_idle_agents_escapes_defer_to_its_screen() {
-    let f = fixture("claude");
-    let mut human = f.connect();
-    human.write("unsent\x1b\x1bx\x7f");
-    f.expect(b"unsent\x1b\x1bx\x7f");
-    f.hook_event("idle");
-    f.hook_event("idle");
-    let id = f.enqueue();
-    f.wait("helper-exited-1");
-    f.stable(b"unsent\x1b\x1bx\x7f\x07");
-    assert!(mail_turns(&f, &id).is_empty());
-    human.write("\x15");
-    let line = delivered(&f, &id);
-    f.expect(format!("unsent\x1b\x1bx\x7f\x07\x15\x07{line}\r").as_bytes());
+fn doorbell_019_claude_retained_draft_orders_and_idle_escapes_require_checks() {
+    for (while_busy, once_idle) in [
+        ("unsent\x1b\x1bx\x7f", ""),
+        ("\x1b\x1bunsent", ""),
+        ("", "\x1b\x1bx\x7f"),
+    ] {
+        let f = fixture("claude");
+        f.hook_event("thinking");
+        let mut human = f.connect();
+        if !while_busy.is_empty() {
+            human.write(while_busy);
+            f.expect(while_busy.as_bytes());
+        }
+        f.hook_event("idle");
+        if !once_idle.is_empty() {
+            human.write(once_idle);
+            f.expect(once_idle.as_bytes());
+            f.hook_event("idle");
+            f.hook_event("idle");
+        }
+        let id = f.enqueue();
+        if !once_idle.is_empty() {
+            let line = delivered(&f, &id);
+            f.expect(format!("{once_idle}\x07{line}\r").as_bytes());
+            continue;
+        }
+        f.wait("helper-exited-1");
+        let checked = format!("{while_busy}\x07");
+        f.stable(checked.as_bytes());
+        assert!(mail_turns(&f, &id).is_empty());
+        human.write("\x15");
+        let line = delivered(&f, &id);
+        f.expect(format!("{checked}\x15\x07{line}\r").as_bytes());
+    }
 }
 
 /// Scenario: Let the real helper read a retained Claude draft, then complete doorbell policy ticks at controlled ages of 5 seconds, 10 seconds, just under a day and a day. Those ages must submit no notice; clearing the draft still requires a fresh empty check before one actual delivery.
@@ -544,6 +588,8 @@ fn probe_032_native_query_hazard_projects_cannot_check_on_the_card() {
 #[spec("inbox/probe/037")]
 #[test]
 fn probe_037_absent_claude_holds_with_needs_fetch_until_a_prompt() {
+    // Deliberately waiter-less, including after Q35-25 installs the native
+    // waiter: this control's no-waiter precondition must remain explicit.
     absent("claude", "needs_fetch");
 }
 
@@ -591,83 +637,6 @@ fn absent(kind: &'static str, reason: &str) {
         !f.input().contains(&7),
         "production Absent must not send a probe"
     );
-}
-
-/// Scenario: Type and delete text in OpenCode and Pi panes with their native receipt streams registered, then queue a message. Each native stream must hand over its message without a probe or notice, and its card must not acquire a composer-check reason.
-#[spec("inbox/probe/037")]
-#[test]
-fn probe_037_absent_opencode_and_pi_keep_native_delivery() {
-    for (kind, component) in [("open_code", "opencode_plugin"), ("pi", "pi_extension")] {
-        let daemon = inbox::daemon_unbound(&[]);
-        let pane = inbox::pane_with(&daemon, kind, json!({"agent_type":kind,"profile":false}));
-        inbox::status(&daemon, &pane, "idle", kind);
-        let _human = inbox::input(&daemon, &pane, "x\x7f");
-        let mut stream = inbox::receipt_stream_as(&daemon, &pane, component);
-        let id = inbox::enqueue(&daemon, &pane, inbox::BODY);
-        let message = inbox::receipt_handout(&mut stream, &id);
-        assert_eq!(message["id"], id);
-        assert!(message.to_string().contains(inbox::BODY));
-        let records = inbox::attach(&daemon, json!({"op":"list-agents"}));
-        let record = records["agent_records"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|row| row["id"] == pane.agent)
-            .unwrap();
-        assert_eq!(record["inbox"]["wake"], "native", "{record}");
-        assert!(record["inbox"]["wake_hold"].is_null(), "{record}");
-        inbox::unchanged(&pane, Duration::from_millis(250));
-        assert_eq!(inbox::bytes(&pane), b"x\x7f");
-    }
-}
-
-/// Scenario: Type and delete text in a Devin pane with no editor observer, queue mail, then fetch it through the ordinary CLI receipt path. Its existing prompt route and cannot-type reason must remain available without any check or notice being typed.
-#[spec("inbox/probe/037")]
-#[test]
-fn probe_037_absent_devin_keeps_its_prompt_fetch_route() {
-    let daemon = inbox::daemon_unbound(&[("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "100")]);
-    let pane = inbox::pane_with(
-        &daemon,
-        "devin-absent",
-        json!({"agent_type":"devin","profile":false}),
-    );
-    inbox::status(&daemon, &pane, "idle", "devin");
-    let mut announcement = inbox::request(&pane, "inbox_announce");
-    announcement["component"] = json!("devin_hooks");
-    announcement["component_version"] = json!("synthetic-absent");
-    announcement["wake"] = json!("turn_end");
-    announcement["pid"] = json!(pane.pid);
-    assert_eq!(inbox::hook(&daemon, announcement)["accepted"], true);
-    let _human = inbox::input(&daemon, &pane, "x\x7f");
-    let id = inbox::enqueue(&daemon, &pane, inbox::BODY);
-    assert!(
-        common::wait_until(WAIT, || {
-            let records = inbox::attach(&daemon, json!({"op":"list-agents"}));
-            records["agent_records"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|r| r["id"] == pane.agent && r["inbox"]["wake_hold"] == "cannot_type")
-        }),
-        "Devin's prompt route must retain cannot_type"
-    );
-    let records = inbox::attach(&daemon, json!({"op":"list-agents"}));
-    let record = records["agent_records"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|r| r["id"] == pane.agent)
-        .unwrap();
-    assert_eq!(record["inbox"]["wake"], "turn_end", "{record}");
-    assert!(
-        !matches!(
-            record["inbox"]["wake_hold"].as_str(),
-            Some("needs_fetch" | "cannot_check")
-        ),
-        "{record}"
-    );
-    assert!(inbox::fetch(&daemon, &pane, true).to_string().contains(&id));
-    assert_eq!(inbox::bytes(&pane), b"x\x7f");
 }
 
 /// Scenario: Interrupt a real notice after its line by replacing its screen with an unrecognised frame, making the attempt suspend. A user clear and, separately, a user submit must recover the doorbell, but the next automatic notice still needs a real check of the touched empty box.
@@ -741,6 +710,10 @@ fn probe_048_external_edit_requires_the_next_attempt_to_check_again() {
         f.wait("helper-exited-1");
         f.wait_open();
         let before = f.epoch();
+        assert_eq!(
+            before.1, before.0,
+            "the initial check must establish a valid empty observation: {before:?}"
+        );
         f.setting("editor-mode", "preserve");
         if !reported {
             f.flag("lost-ipc");
@@ -753,6 +726,15 @@ fn probe_048_external_edit_requires_the_next_attempt_to_check_again() {
         assert!(
             common::wait_until(WAIT, || f.epoch().0 > before.0),
             "the real external edit must be observed before mail is queued"
+        );
+        let after = f.epoch();
+        assert_eq!(
+            after.1, before.1,
+            "external editing must leave the earlier observation behind: {before:?} -> {after:?}"
+        );
+        assert_ne!(
+            after.0, after.1,
+            "the external edit must invalidate that observation: {after:?}"
         );
         f.remove("lost-ipc");
         f.stable(b"\x07");
@@ -778,7 +760,10 @@ fn probe_048_external_edit_fixture_preserves_empty_without_human_input() {
         f.wait("editor-finished");
         f.wait("helper-exited-1");
         f.wait("external-edit-returned");
-        // An OSC title is inert display output, not a mode marker or query.
+        // epoch::output_notes (src/composer_probe/epoch.rs:280-288) accepts
+        // only OSC 10/11 queries and ignores OSC 0. PrivateModeScanner
+        // (src/terminal_modes.rs:98-100) skips ESC ] as a non-CSI prefix.
+        // This literal title contains no embedded escape/mode directive.
         // Seeing it in the bus orders the composer's preceding redraw too.
         f.emit(b"\x1b]0;external-edit-cycle-finished\x07");
         assert!(

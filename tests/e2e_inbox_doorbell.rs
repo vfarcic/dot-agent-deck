@@ -829,3 +829,111 @@ fn dispatch_023_terminal_reports_do_not_hold_doorbell() {
     );
     assert!(screen(&daemon, &pane).contains("waiting, run: dot-agent-deck inbox fetch"));
 }
+
+/// Scenario: Type and delete text in OpenCode and Pi panes with their native receipt streams registered, then queue a message. Each native stream must hand over its message without a probe or notice, and its card must not acquire a composer-check reason.
+#[spec("inbox/probe/037")]
+#[test]
+fn probe_037_absent_opencode_and_pi_keep_native_delivery() {
+    for (kind, component) in [("open_code", "opencode_plugin"), ("pi", "pi_extension")] {
+        let daemon = inbox::daemon_unbound(&[]);
+        let pane = inbox::pane_with(&daemon, kind, json!({"agent_type":kind,"profile":false}));
+        inbox::status(&daemon, &pane, "idle", kind);
+        let _human = inbox::input(&daemon, &pane, "x\x7f");
+        let mut stream = inbox::receipt_stream_as(&daemon, &pane, component);
+        let id = inbox::enqueue(&daemon, &pane, inbox::BODY);
+        let message = inbox::receipt_handout(&mut stream, &id);
+        assert_eq!(message["id"], id);
+        assert!(message.to_string().contains(inbox::BODY));
+        let records = inbox::attach(&daemon, json!({"op":"list-agents"}));
+        let record = records["agent_records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == pane.agent)
+            .unwrap();
+        assert_eq!(record["inbox"]["wake"], "native", "{record}");
+        assert!(record["inbox"]["wake_hold"].is_null(), "{record}");
+        inbox::unchanged(&pane, Duration::from_millis(250));
+        assert_eq!(inbox::bytes(&pane), b"x\x7f");
+    }
+}
+
+/// Scenario: Announce Devin's ordinary turn-end receipt route without typing into its pane, queue mail, and fetch it through the ordinary CLI receipt path. Its existing cannot-type reason and prompt route remain available without a check or notice being typed.
+#[spec("inbox/probe/037")]
+#[test]
+fn probe_037_absent_devin_keeps_its_prompt_fetch_route() {
+    let daemon = inbox::daemon_unbound(&[("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "100")]);
+    let pane = inbox::pane_with(
+        &daemon,
+        "devin-absent",
+        json!({"agent_type":"devin","profile":false}),
+    );
+    inbox::status(&daemon, &pane, "idle", "devin");
+    let mut announcement = inbox::request(&pane, "inbox_announce");
+    announcement["component"] = json!("devin_hooks");
+    announcement["component_version"] = json!("synthetic-absent");
+    announcement["wake"] = json!("turn_end");
+    announcement["pid"] = json!(pane.pid);
+    assert_eq!(inbox::hook(&daemon, announcement)["accepted"], true);
+    let id = inbox::enqueue(&daemon, &pane, inbox::BODY);
+    assert!(
+        common::wait_until(WAIT, || {
+            let records = inbox::attach(&daemon, json!({"op":"list-agents"}));
+            records["agent_records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["id"] == pane.agent && r["inbox"]["wake_hold"] == "cannot_type")
+        }),
+        "Devin's untouched prompt route must retain cannot_type: {}",
+        inbox::attach(&daemon, json!({"op":"list-agents"}))
+    );
+    let records = inbox::attach(&daemon, json!({"op":"list-agents"}));
+    let record = records["agent_records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == pane.agent)
+        .unwrap();
+    assert_eq!(record["inbox"]["wake"], "turn_end", "{record}");
+    assert!(
+        !matches!(
+            record["inbox"]["wake_hold"].as_str(),
+            Some("needs_fetch" | "cannot_check")
+        ),
+        "{record}"
+    );
+    assert!(inbox::fetch(&daemon, &pane, true).to_string().contains(&id));
+    assert_eq!(inbox::bytes(&pane), b"");
+}
+
+/// Scenario: Interrupt working OpenCode and Pi panes with two Escapes, and separately press Escapes while they are already Idle and repeat their Idle reports. Their registered native streams still deliver queued mail once without a typed fallback.
+#[spec("inbox/doorbell/019")]
+#[test]
+fn doorbell_019_native_opencode_and_pi_deliver_after_escapes() {
+    for (kind, component) in [("open_code", "opencode_plugin"), ("pi", "pi_extension")] {
+        for already_idle in [false, true] {
+            let daemon = inbox::daemon_unbound(&[]);
+            let pane = inbox::pane_with(&daemon, kind, json!({"agent_type":kind,"profile":false}));
+            inbox::status(
+                &daemon,
+                &pane,
+                if already_idle { "idle" } else { "thinking" },
+                kind,
+            );
+            let mut human = inbox::input(&daemon, &pane, "\x1b");
+            inbox::unchanged(&pane, Duration::from_millis(300));
+            human.write("\x1bx\x7f");
+            assert!(common::wait_until(WAIT, || inbox::bytes(&pane) == b"\x1b\x1bx\x7f"));
+            inbox::status(&daemon, &pane, "idle", kind);
+            inbox::status(&daemon, &pane, "idle", kind);
+            let mut stream = inbox::receipt_stream_as(&daemon, &pane, component);
+            let id = inbox::enqueue(&daemon, &pane, inbox::BODY);
+            let delivered = inbox::receipt_handout(&mut stream, &id);
+            assert_eq!(delivered["id"], id);
+            assert!(delivered.to_string().contains(inbox::BODY));
+            inbox::unchanged(&pane, Duration::from_millis(250));
+            assert_eq!(inbox::bytes(&pane), b"\x1b\x1bx\x7f");
+        }
+    }
+}

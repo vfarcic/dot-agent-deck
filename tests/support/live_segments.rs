@@ -50,6 +50,17 @@ fn executable(path: &Path, contents: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
+fn checked_replace(source: &str, needle: &str, replacement: &str) -> String {
+    assert_eq!(
+        source.matches(needle).count(),
+        1,
+        "fixture patch anchor: {needle}"
+    );
+    let patched = source.replace(needle, replacement);
+    assert_ne!(patched, source, "fixture patch must apply: {needle}");
+    patched
+}
+
 pub struct Fixture {
     pub daemon: common::DaemonProc,
     pub base: PathBuf,
@@ -91,7 +102,7 @@ impl Fixture {
         fs::set_permissions(&exe, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(
             native.join("composer_external_edit.py"),
-            include_str!("composer_external_edit.py").replace(
+            checked_replace(include_str!("composer_external_edit.py"),
                 "# M31: keys unread by an editor during suspension disappear.",
                 "# Optional adversarial post-enable flush witness, local to S-20.\n                if self.path('.gate-flush').exists():\n                    os.write(1, b'\\x1b[?2004h')\n                    self.path('.flush-arrived').touch()\n                    while not self.path('.flush-go').exists(): time.sleep(.005)\n                # M31: keys unread by an editor during suspension disappear.",
             ),
@@ -100,19 +111,25 @@ impl Fixture {
         let composer = if kind == "codex" {
             include_str!("codex_composer.py").to_owned()
         } else {
-            include_str!("claude_composer.py").replace(
+            checked_replace(
+                include_str!("claude_composer.py"),
                 "            result = subprocess.run([deck, 'inbox', 'fetch']",
-                "            if os.path.exists(base + '.fetch-notice-only') and b'dot-agent-deck: message ' not in line:\n                continue\n            result = subprocess.run([deck, 'inbox', 'fetch']",
+                "            if os.path.exists(base + '.fetch-paused') or (os.path.exists(base + '.fetch-notice-only') and b'dot-agent-deck: message ' not in line):\n                continue\n            result = subprocess.run([deck, 'inbox', 'fetch']",
             )
-        }.replace(
+        };
+        let composer = checked_replace(
+            &composer,
             "    if not select.select([0], [], [], 0.025)[0]:",
             "    if os.path.exists(base + '.external-edit-request'):\n        os.remove(base + '.external-edit-request')\n        external_edit.invoke(composer)\n        redraw()\n        open(base + '.external-edit-returned', 'w').close()\n    if not select.select([0], [], [], 0.025)[0]:",
         );
         fs::write(native.join("composer.py"), composer).unwrap();
-        let editor = include_str!("composer_test_editor.py").replace(
+        let editor = checked_replace(
+            include_str!("composer_test_editor.py"),
             "mode, base, *args = sys.argv[1:]",
             "mode, base, *args = sys.argv[1:]\nmode_file = Path(base + '.editor-mode')\nif mode_file.exists(): mode = mode_file.read_text().strip()",
-        ).replace(
+        );
+        let editor = checked_replace(
+            &editor,
             "path.write_bytes(b'EDITED   \\n' if mode == 'trim' else b'EDITED')",
             "if mode != 'preserve':\n    path.write_bytes(b'EDITED   \\n' if mode == 'trim' else b'EDITED')",
         );
@@ -585,6 +602,24 @@ pub fn native_entry() {
         if let Ok(data) = fs::read(base.with_extension("command")) {
             fs::remove_file(base.with_extension("command")).unwrap();
             let cmd: Value = serde_json::from_slice(&data).unwrap();
+            if cmd["action"] == "fetch" {
+                // An independent ordinary CLI consumer, with this sandbox
+                // pane's own environment; no input goes to its composer.
+                let output = Command::new(common::contained_deck_binary())
+                    .args(["inbox", "fetch"])
+                    .envs(env.clone())
+                    .output()
+                    .unwrap();
+                atomic(
+                    &base.with_extension("response"),
+                    &json!({
+                        "ok":output.status.success(),
+                        "stdout":String::from_utf8(output.stdout).unwrap(),
+                        "stderr":String::from_utf8(output.stderr).unwrap(),
+                    }),
+                );
+                continue;
+            }
             if cmd["action"] == "emit" {
                 let bytes: Vec<u8> = serde_json::from_value(cmd["bytes"].clone()).unwrap();
                 std::io::stdout().write_all(&bytes).unwrap();
