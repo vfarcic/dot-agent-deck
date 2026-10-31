@@ -523,9 +523,16 @@ fn probe_032_native_query_hazard_projects_cannot_check_on_the_card() {
     let id = f.enqueue();
     wait_hold(&f, "cannot_check");
     let words: Value = serde_json::from_str(include_str!("fixtures/inbox-display.json")).unwrap();
-    let expected = words["wakeHolds"]["cannot_check"].as_str().unwrap();
+    // Sidebar cards truncate notice rows. Check the diagnostic prefix here;
+    // status/030 and the desktop card tests cover the full shared wording.
+    let expected: String = words["wakeHolds"]["cannot_check"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .take(40)
+        .collect();
     assert!(
-        common::wait_until(WAIT, || tui.snapshot_grid().contains(expected)),
+        common::wait_until(WAIT, || tui.snapshot_grid().contains(&expected)),
         "{}",
         tui.snapshot_grid()
     );
@@ -556,9 +563,14 @@ fn absent(kind: &'static str, reason: &str) {
     let id = f.enqueue();
     wait_hold(&f, reason);
     let words: Value = serde_json::from_str(include_str!("fixtures/inbox-display.json")).unwrap();
-    let expected = words["wakeHolds"][reason].as_str().unwrap();
+    let expected: String = words["wakeHolds"][reason]
+        .as_str()
+        .unwrap()
+        .chars()
+        .take(40)
+        .collect();
     assert!(
-        common::wait_until(WAIT, || tui.snapshot_grid().contains(expected)),
+        common::wait_until(WAIT, || tui.snapshot_grid().contains(&expected)),
         "{}",
         tui.snapshot_grid()
     );
