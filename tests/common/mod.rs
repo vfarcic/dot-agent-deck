@@ -596,7 +596,15 @@ impl TuiDeckBuilder {
     /// or other user configuration into a recorded real-agent run.
     pub fn with_imported_opencode_credentials(mut self) -> Self {
         self.credential_imports.push(CredentialImport::OpenCode);
-        self
+        // Issue #2044: OpenCode 1.x (measured on 1.18.35) npm-installs its
+        // plugin SDK into a config dir whose tui.json lists a plugin (the
+        // deck's) before it draws the composer, which in this fresh HOME is a
+        // registry download. The deck's plugins import only Node builtins, and
+        // with npm offline the install fails at once and OpenCode carries on.
+        // OpenCode 2.2.5 runs no such install for the deck's plugins: it loads
+        // local-path plugins straight from disk and reaches npm only for a
+        // package-name plugin, which this harness never configures.
+        self.with_env("npm_config_offline", "true")
     }
 
     /// Import the host user's Codex `auth.json` into the isolated per-test HOME
