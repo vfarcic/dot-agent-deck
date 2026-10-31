@@ -1,0 +1,8 @@
+---
+source: tests/render_release_check.rs
+expression: panel(&asked[4])
+---
+Release checks
+Forget the saved checks for 2.1.313? These records will be removed.
+Forget all records of 2.1.313.
+[Forget records Enter] [Keep records Esc]

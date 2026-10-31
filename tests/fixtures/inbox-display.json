@@ -43,6 +43,9 @@
     "modes": {"auto": "auto (check automatically)", "ask": "ask (ask before checking)", "off": "off (checks stopped; local results unused)"},
     "exportInspection": "Inspect these files before sharing. The scrubber only removes patterns it knows.",
     "offConfirmation": "Turn release checks off and cancel the running check?",
+    "cancelConfirmation": "Cancel the running release check? Its unfinished work will be discarded.",
+    "forgetConfirmation": "Forget the saved checks for {release}? These records will be removed.",
+    "previewTruncated": "Preview truncated; export still contains the whole file ({bytes} bytes).",
     "unsupported": "This daemon doesn't support release checks. Upgrade the deck to use them."
   },
   "wakeHolds": {

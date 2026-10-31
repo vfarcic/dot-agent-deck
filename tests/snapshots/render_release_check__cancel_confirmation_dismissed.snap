@@ -1,0 +1,13 @@
+---
+source: tests/render_release_check.rs
+expression: panel(&dismissed[4])
+---
+Release checks
+Claude Code 2.1.313 · 0123456789abcdef
+▸ Claude Code 2.1.310 · aaaaaaaaaaaaaaaa
+Passed the deck's check on this machine.
+Progress: complete
+Re-check uses the agent's current identity.
+Cancel stops the running check.
+Export includes every record of 2.1.310.
+[Re-check R] [Cancel c] [Forget f] [Export e] [Close Esc]
