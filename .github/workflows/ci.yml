@@ -1716,6 +1716,18 @@ jobs:
       # test-only lint can't fail macOS-only and be unreproducible on the Linux
       # pre-push gate.
       - run: cargo clippy -- -D warnings
+      # TEMPORARY #1884 diagnostic branch only. Do not merge this step.
+      - name: Diagnose concurrent PTY allocation (temporary, issue 1884)
+        if: github.ref == 'refs/heads/agent/p3-1884'
+        timeout-minutes: 10
+        env:
+          DAD_PTY_STRESS: "1"
+          DAD_PTY_STRESS_ITERATIONS: "25000"
+        run: |
+          sw_vers
+          sysctl kern.tty.ptmx_max hw.ncpu
+          cargo clippy --test pty_allocation_stress -- -D warnings
+          cargo test --test pty_allocation_stress -- --exact pty_allocation_stress --nocapture --test-threads=1
       # `--workspace` (issue #489), for the reason spelled out on the
       # build-windows step: the `test-fast` alias carries the flag on every
       # platform, so this job must run the xtask tests to keep "green locally"
