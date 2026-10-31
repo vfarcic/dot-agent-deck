@@ -384,7 +384,7 @@ impl Backend {
     }
 }
 
-/// Scenario: Re-check from the hold line and from the agent's detail view, including approval in ask mode, then select an older record and re-check the pane's current identity. Cancel from that older selection stops the running check; accepted replies must change the visible progress or display the cancellation answer.
+/// Scenario: Re-check from the hold line and from Details, including ask approval and an older selected record; the current identity starts checking. Cancel from the older selection asks first: Escape preserves the running check and Enter confirms, displaying the cancellation answer.
 #[spec("inbox/release-check/004")]
 #[test]
 fn release_check_004_recheck_approve_and_cancel_have_visible_results() {
@@ -437,7 +437,27 @@ fn release_check_004_recheck_approve_and_cancel_have_visible_results() {
         json!("passed"),
         "complete",
     ));
-    let frames = backend.run("running", &[key('v'), key('j'), key('c'), key('k')]);
+    let asked = backend.run("running", &[key('v'), key('j'), key('c')]);
+    assert!(
+        backend.calls.is_empty(),
+        "Cancel must ask before sending an operation"
+    );
+    assert!(panel(&asked[3]).contains(shared_words()["cancelConfirmation"].as_str().unwrap()));
+    insta::assert_snapshot!("cancel_confirmation", panel(&asked[3]));
+    let dismissed = backend.run("running", &[key('v'), key('j'), key('c'), esc()]);
+    assert!(
+        backend.calls.is_empty(),
+        "Escape must keep the check running"
+    );
+    assert_eq!(
+        dismissed[2], dismissed[4],
+        "Escape restores the selected Details row"
+    );
+    insta::assert_snapshot!("cancel_confirmation_dismissed", panel(&dismissed[4]));
+    let frames = backend.run(
+        "running",
+        &[key('v'), key('j'), key('c'), enter(), key('k')],
+    );
     assert_eq!(backend.calls.len(), 1, "one accepted cancellation");
     insta::assert_snapshot!("cancelled", panel(frames.last().unwrap()));
 
@@ -459,7 +479,7 @@ fn release_check_004_recheck_approve_and_cancel_have_visible_results() {
     );
 }
 
-/// Scenario: Open a release with one identity and then one with two identities beside an older release; show the release-wide Forget explanation only for the latter. Forget from its second identity, browse both forgotten records and the untouched older release, and see only Re-check and Close on the forgotten records.
+/// Scenario: Open a release with one identity and then one with two identities beside an older release; show the release-wide Forget explanation only for the latter. Forget asks before acting: Escape preserves the records and Enter confirms, after which both selected-release records are forgotten and the other release stays passed.
 #[spec("inbox/release-check/004")]
 #[test]
 fn release_check_004_forget_acts_on_the_selected_release() {
@@ -476,6 +496,16 @@ fn release_check_004_forget_acts_on_the_selected_release() {
         "one identity does not need the release-wide Forget explanation:\n{single_panel}"
     );
     assert!(backend.calls.is_empty());
+    let single_asked = backend.run("differs", &[key('v'), key('f')]);
+    assert!(backend.calls.is_empty(), "single-identity Forget also asks");
+    assert!(
+        panel(&single_asked[2]).contains(
+            &shared_words()["forgetConfirmation"]
+                .as_str()
+                .unwrap()
+                .replace("{release}", "2.1.313")
+        )
+    );
     backend.records.insert(
         0,
         row("2.1.310", "aaaaaaaaaaaaaaaa", json!("passed"), "complete"),
@@ -486,9 +516,27 @@ fn release_check_004_forget_acts_on_the_selected_release() {
         json!("passed"),
         "complete",
     ));
+    let asked = backend.run("differs", &[key('v'), key('j'), key('j'), key('f')]);
+    assert!(
+        backend.calls.is_empty(),
+        "Forget must ask before sending an operation"
+    );
+    insta::assert_snapshot!("forget_confirmation", panel(&asked[4]));
+    let dismissed = backend.run("differs", &[key('v'), key('j'), key('j'), key('f'), esc()]);
+    assert!(backend.calls.is_empty(), "Escape must preserve the records");
+    assert_eq!(dismissed[3], dismissed[5]);
+    insta::assert_snapshot!("forget_confirmation_dismissed", panel(&dismissed[5]));
     let frames = backend.run(
         "differs",
-        &[key('v'), key('j'), key('j'), key('f'), key('k'), key('k')],
+        &[
+            key('v'),
+            key('j'),
+            key('j'),
+            key('f'),
+            enter(),
+            key('k'),
+            key('k'),
+        ],
     );
     assert_eq!(backend.calls.len(), 1);
     assert!(
@@ -496,9 +544,9 @@ fn release_check_004_forget_acts_on_the_selected_release() {
         "several identities must show the release-wide Forget explanation"
     );
     insta::assert_snapshot!("forget_release_scope", panel(&frames[3]));
-    insta::assert_snapshot!("forgot_selected", panel(&frames[4]));
-    insta::assert_snapshot!("forgot_other_identity", panel(&frames[5]));
-    insta::assert_snapshot!("forgot_preserves_other_release", panel(&frames[6]));
+    insta::assert_snapshot!("forgot_selected", panel(&frames[5]));
+    insta::assert_snapshot!("forgot_other_identity", panel(&frames[6]));
+    insta::assert_snapshot!("forgot_preserves_other_release", panel(&frames[7]));
 
     // A stale f/e binding on an already-forgotten row must be inert.
     let mut backend = Backend::new(json!("forgotten"), "complete");
@@ -507,7 +555,7 @@ fn release_check_004_forget_acts_on_the_selected_release() {
     assert_eq!(frames[1], frames[3]);
 }
 
-/// Scenario: Select either of two identities of one release, open Export's file list and inspect each file before choosing a destination. Inspect a trace containing terminal escapes and C0/C1 controls as printable escapes, with unchanged surrounding rows and no control-bearing buffer cell; cancel without writing, then separately continue and confirm a destination once.
+/// Scenario: Select either of two identities, open Export's file list and inspect each file before choosing a destination; Escape writes nothing and Enter confirms once. Recorded controls and invisible Unicode appear as printable escapes, and a long preview stays within 16,384 code points after escaping, with a marker stating the full exported file's byte count.
 #[spec("inbox/release-check/004")]
 #[test]
 fn release_check_004_export_asks_for_a_directory_and_can_be_cancelled() {
@@ -656,9 +704,133 @@ fn release_check_004_export_asks_for_a_directory_and_can_be_cancelled() {
             "escaping trace controls must preserve the dialog and surrounding rows"
         );
     }
+
+    // Category-based rule shared with SC-11: Cc except LF; Cf; Zl/Zp;
+    // Zs except ASCII space; and Default_Ignorable_Code_Point (including
+    // marks/variation selectors and Hangul fillers). Rust strings contain no
+    // lone surrogates; the desktop pins those separately for UTF-16 input.
+    for (raw, printable) in [
+        (
+            "a\u{061c}\u{200e}\u{200f}\u{202a}\u{202e}\u{2066}\u{2069}z",
+            "a\\u{61c}\\u{200e}\\u{200f}\\u{202a}\\u{202e}\\u{2066}\\u{2069}z",
+        ),
+        (
+            "a\u{200b}\u{200c}\u{200d}\u{2060}\u{feff}z",
+            "a\\u{200b}\\u{200c}\\u{200d}\\u{2060}\\u{feff}z",
+        ),
+        (
+            "a\u{00ad}\u{e0001}\u{e0061}\u{e007f}z",
+            "a\\u{ad}\\u{e0001}\\u{e0061}\\u{e007f}z",
+        ),
+        (
+            "a\u{2061}\u{2062}\u{2063}\u{2064}\u{206a}\u{206f}z",
+            "a\\u{2061}\\u{2062}\\u{2063}\\u{2064}\\u{206a}\\u{206f}z",
+        ),
+        (
+            "a\u{fff9}\u{fffa}\u{fffb}z",
+            "a\\u{fff9}\\u{fffa}\\u{fffb}z",
+        ),
+        ("a\u{2028}b\u{2029}z", "a\\u{2028}b\\u{2029}z"),
+        (
+            "a\u{034f}\u{fe0f}\u{e0100}z",
+            "a\\u{34f}\\u{fe0f}\\u{e0100}z",
+        ),
+        (
+            "a\u{115f}\u{1160}\u{3164}\u{ffa0}z",
+            "a\\u{115f}\\u{1160}\\u{3164}\\u{ffa0}z",
+        ),
+        (
+            "a\u{00a0}\u{1680}\u{2000}\u{2007}\u{202f}\u{205f}\u{3000}z",
+            "a\\u{a0}\\u{1680}\\u{2000}\\u{2007}\\u{202f}\\u{205f}\\u{3000}z",
+        ),
+        ("é界🙂\\literal\nsecond", "é界🙂\\literal\nsecond"),
+    ] {
+        let inspect = |text: &str| {
+            let mut backend = Backend::new(json!("passed"), "complete");
+            backend.trace_preview = text.into();
+            let frames = backend.run("running", &[key('v'), key('e'), key('j'), enter()]);
+            assert_eq!(backend.calls.len(), 1, "inspection is read-only");
+            assert!(backend.exported_to.is_none());
+            frames.last().unwrap().clone()
+        };
+        let actual = inspect(raw);
+        let displayed = panel(&actual);
+        for line in printable.lines() {
+            assert!(
+                displayed.contains(line),
+                "missing inert Unicode line {line:?}:\n{displayed}"
+            );
+        }
+        assert_eq!(
+            actual,
+            inspect(printable),
+            "inert Unicode must preserve surrounding rows"
+        );
+        for y in actual.area.y..actual.area.bottom() {
+            for x in actual.area.x..actual.area.right() {
+                let symbol = actual[(x, y)].symbol();
+                assert!(
+                    !symbol.chars().any(char::is_control),
+                    "control-bearing cell ({x},{y}): {symbol:?}"
+                );
+                for invisible in raw.chars().filter(|c| !printable.contains(*c)) {
+                    assert!(
+                        !symbol.contains(invisible),
+                        "invisible character in cell ({x},{y}): {symbol:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    let mut backend = Backend::new(json!("passed"), "complete");
+    backend.trace_preview = format!("\u{202e}{}END_OF_HOSTILE_TRACE", "界".repeat(1_000_000));
+    let full_bytes = backend.trace_preview.len();
+    let initial = snapshot(&backend.records);
+    // Room for the bounded inspection, including line wrapping. Requiring the
+    // marker prevents viewport clipping from masquerading as truncation.
+    let frames = render_release_check_key_sequence_to_buffers(
+        &KeybindingConfig::default(),
+        &state("running"),
+        SESSION,
+        &["release_check"],
+        &initial,
+        "auto",
+        &[],
+        &[key('v'), key('e'), key('j'), enter()],
+        (240, 512),
+        &mut |request| backend.execute(request),
+    );
+    let displayed = panel(frames.last().unwrap());
+    let marker = shared_words()["previewTruncated"]
+        .as_str()
+        .unwrap()
+        .replace("{bytes}", &full_bytes.to_string());
+    let unwrapped = displayed.lines().collect::<String>();
+    let readable = displayed.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        unwrapped.contains("\\u{202e}"),
+        "escaped prefix must be visible"
+    );
+    assert!(
+        readable.contains(&marker),
+        "full-file marker missing: {displayed}"
+    );
+    assert!(!displayed.contains("END_OF_HOSTILE_TRACE"));
+    // Exclude known dialog chrome; the budget includes the marker itself.
+    let content = unwrapped
+        .strip_prefix("Release checksExport Claude Code 2.1.313 (all records)trace.txt")
+        .and_then(|text| text.strip_suffix("[Back Esc]"))
+        .expect("inspection chrome surrounds the bounded text");
+    assert!(
+        content.chars().count() <= 16_384,
+        "inspection exceeds 16,384 Unicode code points after escaping"
+    );
+    assert_eq!(backend.calls.len(), 1);
+    assert!(backend.exported_to.is_none());
 }
 
-/// Scenario: Change auto to ask in the agent's settings and read what ask means, then attempt off during a running check. Cancel that confirmation without stopping anything, explicitly confirm off, inspect the stopped check, switch back to auto and read a refused Re-check without a false success message.
+/// Scenario: Change auto to ask, then attempt off during a running check; Escape preserves it and Enter accepts off and displays the stopped result. A queued check turns off without asking, matching the desktop; switch back to auto and read a refused Re-check without a false success message.
 #[spec("inbox/release-check/004")]
 #[test]
 fn release_check_004_mode_settings_and_refusal_are_visible() {
@@ -706,6 +878,23 @@ fn release_check_004_mode_settings_and_refusal_are_visible() {
         },
     );
     insta::assert_snapshot!("refused", panel(frames.last().unwrap()));
+
+    let mut queued = Backend::new(Value::Null, "queued");
+    queued.mode = "ask".into();
+    let frames = queued.run("running", &[key('p'), key('M'), esc(), key('v')]);
+    assert_eq!(
+        queued.calls,
+        [json!({"op":"release-check-mode","mode":"off"})],
+        "only running checks require Off confirmation"
+    );
+    assert!(agent_settings(&frames[2]).contains("off (checks stopped; local results unused)"));
+    assert!(
+        panel(frames.last().unwrap()).contains(
+            shared_words()["reasons"]["runner_stopped"]
+                .as_str()
+                .unwrap()
+        )
+    );
 }
 
 /// Scenario: Connect to a daemon that does not advertise release checks and press the default Details, Re-check and mode keys on its held card and agent settings. Keep the ordinary card and an upgrade explanation visible without attempting any external operation.
@@ -740,7 +929,7 @@ fn release_check_004_absent_capability_withholds_controls() {
     }
 }
 
-/// Scenario: Seed a dismissible restart notice, remap Details and its Cancel key, and press their old and new keys. The modal's old `c` must preserve the notice after closing, while `c` on the dashboard visibly dismisses it; configured keys and hints must still open Details and cancel the check.
+/// Scenario: Seed a restart notice, remap Details and Cancel, and press their old and new keys. The remapped Cancel asks and Enter confirms; old c stays inert in Details, while c after closing Details visibly dismisses the notice as a positive control.
 #[spec("inbox/release-check/004")]
 #[test]
 fn release_check_004_keys_are_remappable_and_modal() {
@@ -797,6 +986,7 @@ fn release_check_004_keys_are_remappable_and_modal() {
             KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE),
             key('c'),
             KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE),
+            enter(),
             esc(),
             KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE),
             key('c'),
@@ -811,20 +1001,21 @@ fn release_check_004_keys_are_remappable_and_modal() {
     );
     assert_eq!(backend.calls, [json!({"op":"release-check-cancel"})]);
     insta::assert_snapshot!("details_remapped_cancel", panel(&frames[2]));
-    insta::assert_snapshot!("cancelled_remapped", panel(&frames[4]));
+    assert!(panel(&frames[4]).contains(shared_words()["cancelConfirmation"].as_str().unwrap()));
+    insta::assert_snapshot!("cancelled_remapped", panel(&frames[5]));
     assert_eq!(
-        frames[5], frames[6],
+        frames[6], frames[7],
         "modal-only F3 cannot cancel behind Details"
     );
     let notice = "The deck restarted; these agents were stopped: SC10-BACKGROUND-NOTICE.";
-    for index in [0, 5, 6] {
+    for index in [0, 6, 7] {
         assert!(
             buffer_text(&frames[index]).contains(notice),
             "background notice must survive modal c through closing Details, frame {index}"
         );
     }
     assert!(
-        !buffer_text(&frames[7]).contains(notice),
+        !buffer_text(&frames[8]).contains(notice),
         "positive control: dashboard c must dismiss the seeded notice"
     );
 }
