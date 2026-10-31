@@ -130,10 +130,10 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Platform coverage:** mac+linux.
 
 ##### telemetry/otlp/010 — Natural exit retains the final published status.
-- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
+- **Layer:** unit with real PTYs (`src/agent_pty.rs`) plus L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
 - **Agent:** synthetic shell waiting on an exit gate, with synthesized hooks.
-- **Asserts:** after visible Thinking, a final Working hook is published immediately before natural exit; the completed run says exited with code zero and includes the Working child interval and status-change event. A second case holds the reader after EOF publication and before telemetry completion, closes the already-exited pane, then requires exited and the original zero or seven exit code in the exported run (#2028). Deliberate-close control: telemetry/otlp/002 still exports closed.
-- **Does not assert:** a deliberately paused exporter subscriber, real-agent hooks, respawn during the EOF hold, daemon shutdown or forced Linux plain-reader fallback. The delayed case assumes the e2e-only DOT_AGENT_DECK_E2E_EXIT_GATE hold point documented in the test; until implemented, its RED is the absent hold acknowledgement, not a reproduced wrong end reason.
+- **Asserts:** after visible Thinking, a final Working hook is published immediately before natural exit; the completed run says exited with code zero and includes the Working child interval and status-change event. A second L2 case uses the e2e-only DOT_AGENT_DECK_E2E_EXIT_GATE to hold the reader after EOF publication and before telemetry completion, closes the already-exited pane, then requires exited and the original zero or seven exit code in the exported run (#2028). Unit cases require exited with code seven while close or respawn is held after record removal and before reap, past the reader's exit-code wait; respawn also covers the successor's run opening before the old reader continues. Deliberate-close control: telemetry/otlp/002 still exports closed.
+- **Does not assert:** a deliberately paused exporter subscriber, real-agent hooks, daemon shutdown or forced Linux plain-reader fallback.
 - **Platform coverage:** mac+linux.
 
 ##### telemetry/otlp/011 — Respawning an orchestration worker mints a new run identity.
