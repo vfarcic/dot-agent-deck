@@ -251,8 +251,9 @@ impl Fixture {
             e["last_foreign"].as_u64().expect("foreign number"),
         )
     }
-    /// Submit one ordinary probe job through scheduling and writer-thread
-    /// admission, never publishing an arm or closing a fence directly.
+    /// Request a first probe against this generation's persistent production
+    /// schedule. A not-due request leaves it unchanged; an admitted attempt
+    /// reaches writer-thread admission, never a direct arm/fence publication.
     pub fn probe(&self) -> Value {
         self.control("probe-request")
     }
