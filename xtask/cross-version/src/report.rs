@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::probe::Probe;
 use crate::sandbox::Direction;
 
-/// Rule 12's four tells. A run that reached the scenario and found the daemon
+/// CLAUDE.md rule 12's four tells. A run that reached the scenario and found the daemon
 /// records every one of them, in either direction.
 pub const CONTRACT_TELLS: [&str; 4] = ["tell-1", "tell-2", "tell-3", "tell-4"];
 
@@ -162,7 +162,7 @@ pub enum RunVerdict {
     OldClientCannotDiscover(String),
     /// Every tell was measured, and every one that failed failed in the way a
     /// contract break declared by one build and not the other says it will:
-    /// the intended outcome of that break, recorded as rule 12 asks, not a
+    /// the intended outcome of that break, recorded as CLAUDE.md rule 12 asks, not a
     /// regression (issue #1596). Which break, and which tell, is the payload.
     DeclaredBreak(String),
 }
@@ -358,7 +358,7 @@ impl Evidence {
     /// The tells this run must have recorded, by id: the COMPLETE set for its
     /// direction and probe, never merely the ones that happen to be present.
     ///
-    /// * Found the daemon — rule 12's four ([`CONTRACT_TELLS`]); in reverse
+    /// * Found the daemon — CLAUDE.md rule 12's four ([`CONTRACT_TELLS`]); in reverse
     ///   also [`ROLE_SET_TELL`] where the probe asserts it and the probe's own
     ///   tell where it has a stimulus ([`Probe::tell_id`]).
     /// * Reverse, the old client did not find the branch daemon
@@ -503,7 +503,7 @@ impl Evidence {
                  against it over a PTY. When that TUI finds the branch daemon, its build-version \
                  prompt is declined, the previous release's CLI issues every pane command, and the \
                  run asserts the same four tells, pinned to the branch daemon, plus the \
-                 branch-specific probe named below. Rule 12 prescribes the forward pairing, which \
+                 branch-specific probe named below. CLAUDE.md rule 12 prescribes the forward pairing, which \
                  for a daemon-side change runs the previous release's daemon code and never \
                  executes a changed line; this pairing is the one that does. Stand-in agents, not \
                  real ones: the runtime scenario is given no AGENT credential and invokes no \
@@ -575,7 +575,7 @@ impl Evidence {
             if reverse {
                 "reverse — BRANCH daemon, previous-release TUI and CLI"
             } else {
-                "forward — previous-release daemon, branch TUI and CLI (rule 12's pairing)"
+                "forward — previous-release daemon, branch TUI and CLI (CLAUDE.md rule 12's pairing)"
             }
         );
         if reverse {

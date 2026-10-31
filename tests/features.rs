@@ -13,7 +13,7 @@
 // crate-internal resolver is `#[path]`-included instead, at two extra test
 // executions rather than the harness's ~530. The two scratch dirs here hold a
 // throwaway `.dot-agent-deck.toml`, so they are tiny — but a file with two
-// conventions invites the wrong one, and rule 8 now covers all of `tests/`.
+// conventions invites the wrong one, and linkage-check rule 8 now covers all of `tests/`.
 // This is the one file in the group that is not `#![cfg(unix)]`; the resolver's
 // non-Unix arm falls back to the OS temp dir, which is what this call site did
 // before. See `docs/develop/e2e-temp-dirs.md`.

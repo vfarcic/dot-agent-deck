@@ -32,7 +32,7 @@
 //! 500ms poll catch the rising edge well before the command finishes.
 //!
 //! Cost note (Decision 23): one Haiku-4.5 interactive turn, one Bash tool
-//! call. Local-only (Decision 8) and real-agent (rule 5 exception (a)):
+//! call. Local-only (Decision 8) and real-agent (lane 2, CLAUDE.md rule 5):
 //! gated on the `e2e` feature so CI's `cargo test-fast` never compiles it,
 //! and this file's real-agent tier has no CI credentials, so a local run is
 //! the only way to exercise it at all.

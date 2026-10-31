@@ -144,6 +144,12 @@ fn status_blocked_023_real_opencode_api_error_is_forwarded_not_blocked() {
     let viewer = TuiDeck::builder()
         .with_pty_size(120, 40)
         .with_imported_opencode_credentials()
+        // Issue #2044: a config dir whose tui.json lists a plugin (the deck's)
+        // makes OpenCode npm-install @opencode-ai/plugin into it before its
+        // first frame. In this fresh HOME that is a registry download that
+        // overran the prompt wait. The deck's plugins import no SDK, and
+        // OpenCode logs a failed install and carries on, so fail it at once.
+        .with_env("npm_config_offline", "true")
         .launch_with_fixture("minimal");
     viewer.wait_for_string("No active agents");
     let control = attached_control(&viewer);

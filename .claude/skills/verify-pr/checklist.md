@@ -11,7 +11,7 @@ Cite findings as `file_path:line`. For each finding, decide and record: **blocki
 - [ ] Nothing was silently **removed**. Deleted tests, dropped `#[spec]` annotations, and orphaned `tests/CATALOG.md` entries are the specific shape that has broken `main` here before: a revert removed two `#[spec]` tests, left their catalog entries dangling, and linkage-check went red on `main` because nothing ran it. Diff `git log --diff-filter=D` and check test counts before/after.
 - [ ] If it closes a PRD, the PRD's acceptance criteria are actually met, not just its checkboxes ticked.
 
-## B. Tests — rule 4's ladder
+## B. Tests — CLAUDE.md rule 4's ladder
 
 Applies when the diff changes user-visible TUI behaviour (panes, statuses, prompts, focus, layout, modes, embedded panes, hook delivery). Pure refactors with no observable behaviour change need no new tests.
 
@@ -20,15 +20,15 @@ Applies when the diff changes user-visible TUI behaviour (panes, statuses, promp
 - [ ] For a **major user-facing feature**: at least one **real-agent** test on a cheap model (Haiku / a mini model), driving the genuine spawn→agent→work path, with a directive prompt plus a uniquely-named **sentinel file** so the assertion survives LLM phrasing variance. A stand-in (`cat`, scripted echo, synthesized hook events) proves plumbing, never that an agent runs against the cloned/worktree state.
 - [ ] The bar: **at least one test validates the feature as a user actually uses and sees it** — a live interactive agent working in the pane with real status. `claude -p` print mode and stand-ins do not clear this bar. `scheduler/dispatch/013` is the reference implementation; "headless is hard" is not an accepted reason where it is achievable.
 - [ ] `[reel]` marker on the `tests/CATALOG.md` entry only if the clip genuinely spins up a real agent. A cast alone does not make a clip demo-reel-eligible.
-- [ ] Rule 3: no milestone/PRD prefixes in new filenames (`tests/event_forwarding.rs`, never `tests/m2_17_event_forwarding.rs` or `src/prd76_*.rs`).
-- [ ] Rule 7: every new/modified `#[spec(...)]` test carries a 1–3 sentence `/// Scenario:` doc comment. `linkage-check` enforces this, but read the comment anyway — a comment that does not describe what the test does passes the gate and fails the reader.
-- [ ] Test names follow `<sub-area>_<NNN>_<suffix>` (Decision 17) so rule 6's single-test filter picks exactly one.
+- [ ] CLAUDE.md rule 3: no milestone/PRD prefixes in new filenames (`tests/event_forwarding.rs`, never `tests/m2_17_event_forwarding.rs` or `src/prd76_*.rs`).
+- [ ] CLAUDE.md rule 7: every new/modified `#[spec(...)]` test carries a 1–3 sentence `/// Scenario:` doc comment. `linkage-check` enforces this, but read the comment anyway — a comment that does not describe what the test does passes the gate and fails the reader.
+- [ ] Test names follow `<sub-area>_<NNN>_<suffix>` (Decision 17) so CLAUDE.md rule 6's single-test filter picks exactly one.
 
 ## C. Snapshots
 
 - [ ] Read every changed `.snap` under `tests/snapshots/` as a rendered screen — each line is one row of the parsed dashboard grid. Accept only if the new rendering matches the catalog entry's prose. A snapshot updated to match a regression is how a visual bug lands green.
 
-## D. Rule 12 — the cross-version contract
+## D. CLAUDE.md rule 12 — the cross-version contract
 
 Applies when the diff touches the daemon, the TUI↔daemon protocol, orchestration, or hooks (`scan.sh` reports `RULE_12_TRIGGERED=true`).
 
@@ -38,7 +38,7 @@ Applies when the diff touches the daemon, the TUI↔daemon protocol, orchestrati
 - [ ] The cross-version manual test was run, or is recorded as unverified: previous-release daemon with an agent under it, branch TUI against it, confirm a **delegate** still routes and **hooks** (work-done, status) still arrive.
 - [ ] Bump policy respected — while `0.x`, breaking → minor, feature/bugfix → patch. See `docs/develop/versioning.md`.
 
-## E. Rule 9 — the experimental flag
+## E. CLAUDE.md rule 9 — the experimental flag
 
 - [ ] A new user-visible surface (pane, field, command, tab, footer, keybinding) either ships behind `experimental` or was a deliberate visible-by-default decision.
 - [ ] If gated: exactly **one** wrapper in `src/features.rs` (`show_<feature>()`), and it is checked **only at the render / input-binding seam**. Business logic, daemon protocols, and hook handling must not branch on the flag — it is a presentation switch (M3.2).
@@ -46,8 +46,8 @@ Applies when the diff touches the daemon, the TUI↔daemon protocol, orchestrati
 
 ## F. Docs and changelog
 
-- [ ] Rule 10: prose paragraphs are single lines. A PR that hard-wraps at 72/80 columns changes nothing in the rendered output and makes every future diff noisier.
-- [ ] Rule 11: contributor-facing docs are under `docs/develop/` and are linked from `CONTRIBUTING.md`, never from a published page. A new user-facing page under `docs/` has a `[[page]]` entry in `docs/published.toml` whose `title` equals the page's first `#` heading, and its relative `.md` links resolve (`cargo xtask site <out-dir>` runs the link check). Published pages carry no front matter or MDX components: they are served and printed by `dot-agent-deck docs` as plain Markdown.
+- [ ] CLAUDE.md rule 10: prose paragraphs are single lines. A PR that hard-wraps at 72/80 columns changes nothing in the rendered output and makes every future diff noisier.
+- [ ] CLAUDE.md rule 11: contributor-facing docs are under `docs/develop/` and are linked from `CONTRIBUTING.md`, never from a published page. A new user-facing page under `docs/` has a `[[page]]` entry in `docs/published.toml` whose `title` equals the page's first `#` heading, and its relative `.md` links resolve (`cargo xtask site <out-dir>` runs the link check). Published pages carry no front matter or MDX components: they are served and printed by `dot-agent-deck docs` as plain Markdown.
 - [ ] A `changelog.d/<issue>.<type>.md` fragment exists for anything user-visible, with the right type (`breaking` / `feature` / `bugfix`).
 - [ ] User-facing behaviour changes are reflected in the published docs, not only in the PRD.
 
@@ -80,6 +80,6 @@ State these explicitly in the report rather than letting them read as verified:
 
 - **macOS and Windows** — `checks.sh`'s `windows-cross` step is a type-check only (and fails outright without an MSVC cross-toolchain), and there is no local macOS proxy. Neither has a PR-time signal now: `build-macos` runs a real build + clippy + `cargo nextest run` on macOS on pushes to `main`, not on pull requests, and `build-windows` is `if: false`. So both are unverified on the PR; macOS is checked by `main`'s run after the merge, which the merger watches (`/merge-pr`) and `tag-release.yml` requires to be green. A macOS-only break is not hypothetical: the `libc` `openpty`/`ioctl` pointer-type differences in `src/wrap.rs` broke the v0.34.0 release build.
 - **Real-agent coverage that skipped** — see `e2e-skips.txt`. Skipped real-agent tests count as PASSED.
-- **The rule 12 manual cross-version test**, unless you actually ran it.
-- **Flake vs defect** — a single e2e failure is not a verdict until it has been rerun in isolation (rule 6).
+- **The CLAUDE.md rule 12 manual cross-version test**, unless you actually ran it.
+- **Flake vs defect** — a single e2e failure is not a verdict until it has been rerun in isolation (CLAUDE.md rule 6).
 - **No red test is left merely tracked** (#908) — the lane must be green before the PR is done: each failure is either fixed in the PR or quarantined with a named owner and an expiry issue.

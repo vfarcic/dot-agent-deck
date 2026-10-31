@@ -433,7 +433,7 @@ export function AgentTile({
   };
 
   // The daemon's `error` is merged into `failed` for grouping; the card says
-  // what the daemon said, the word the TUI's card uses (rule 22).
+  // what the daemon said, the word the TUI's card uses (CLAUDE.md rule 22).
   const tileStatusLabel = agent.daemonStatus === "error" ? "error" : statusLabel(agent.status);
   /*
     Issue #2001 — the line under the title says what the agent IS, each fact

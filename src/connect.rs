@@ -1038,6 +1038,38 @@ fn maybe_nudge_upgrade<R: BufRead, W: Write>(
     input: &mut R,
     output: &mut W,
 ) -> Result<Option<UpgradeOutcome>, RemoteConnectError> {
+    // A build that does not know its version (issue #326) is neither older
+    // nor newer than anything, so it is never nudged and never nudges: read
+    // as the `0.1.0` it carries, a remote built that way would be offered an
+    // upgrade on every connect. The remote's case is said once per connect,
+    // so it reads as a version that cannot be resolved rather than as skew.
+    if crate::version::is_unknown_version(local_version) {
+        return Ok(None);
+    }
+    if crate::version::is_unknown_version(remote_version) {
+        if is_tty {
+            let shown = crate::untrusted_text::display_line(
+                remote_version,
+                crate::untrusted_text::REMOTE_NAME_MAX_BYTES,
+            );
+            // The bare command installs this build's own version, which
+            // `remote upgrade` refuses when it carries other build metadata,
+            // so it is named only when it would work.
+            let fix = if crate::remote::validate_version_string(local_version).is_ok() {
+                format!("`dot-agent-deck remote upgrade {name}` installs {local_version} there.")
+            } else {
+                format!(
+                    "`dot-agent-deck remote upgrade {name} --version <x.y.z>` installs a release there."
+                )
+            };
+            writeln!(
+                output,
+                "Remote '{name}' runs a dot-agent-deck build that does not know its own version ({shown}), so no upgrade is offered. {fix}"
+            )?;
+            output.flush()?;
+        }
+        return Ok(None);
+    }
     // Newer-only: never suggest a downgrade or a same-version no-op.
     if !client_is_newer(local_version, remote_version) {
         return Ok(None);
@@ -3322,6 +3354,106 @@ mod tests {
             upgrader.calls().is_empty(),
             "equal version runs no upgrade even with 'y' on stdin"
         );
+    }
+
+    #[test]
+    fn nudge_reads_an_unknown_version_as_unknown_rather_than_ancient() {
+        // Issue #326: a build that does not know its version reports
+        // `0.1.0+unknown`. Ordered as a release that is the oldest one there
+        // is, so a remote built that way was offered an upgrade on every
+        // connect. With 'y' queued, no upgrade may run on either side.
+        for (remote, local) in [("0.1.0+unknown", "0.49.3"), ("0.49.3", "0.1.0+unknown")] {
+            let upgrader = RecordingUpgrader::new();
+            let mut input: &[u8] = b"y\n";
+            let mut output: Vec<u8> = Vec::new();
+            let outcome = maybe_nudge_upgrade(
+                &upgrader,
+                "prod",
+                remote,
+                local,
+                None,
+                true,
+                &mut input,
+                &mut output,
+            )
+            .expect("nudge");
+            let shown = String::from_utf8(output).unwrap();
+            assert!(outcome.is_none(), "remote {remote}, laptop {local}");
+            assert!(
+                upgrader.calls().is_empty(),
+                "remote {remote}, laptop {local}: no upgrade runs"
+            );
+            assert!(
+                !shown.contains("[y/N]"),
+                "remote {remote}, laptop {local}: no prompt: {shown}"
+            );
+        }
+
+        // The remote's case says why nothing was offered, and how to fix it.
+        let upgrader = RecordingUpgrader::new();
+        let mut input: &[u8] = b"";
+        let mut output: Vec<u8> = Vec::new();
+        maybe_nudge_upgrade(
+            &upgrader,
+            "prod",
+            "0.1.0+unknown",
+            "0.49.3",
+            None,
+            true,
+            &mut input,
+            &mut output,
+        )
+        .expect("nudge");
+        let shown = String::from_utf8(output).unwrap();
+        assert!(
+            shown.contains("does not know its own version (0.1.0+unknown)"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("`dot-agent-deck remote upgrade prod` installs 0.49.3 there."),
+            "{shown}"
+        );
+
+        // A laptop version `remote upgrade` would refuse as its default
+        // (build metadata) is not promised; the user is told to pick one.
+        let upgrader = RecordingUpgrader::new();
+        let mut input: &[u8] = b"";
+        let mut output: Vec<u8> = Vec::new();
+        maybe_nudge_upgrade(
+            &upgrader,
+            "prod",
+            "0.1.0+unknown",
+            "0.49.3+nix",
+            None,
+            true,
+            &mut input,
+            &mut output,
+        )
+        .expect("nudge");
+        let shown = String::from_utf8(output).unwrap();
+        assert!(
+            shown.contains("`dot-agent-deck remote upgrade prod --version <x.y.z>`"),
+            "{shown}"
+        );
+        assert!(!shown.contains("installs 0.49.3+nix"), "{shown}");
+
+        // A genuine 0.1.0 (a real release) is still older, and still nudged.
+        let upgrader = RecordingUpgrader::new();
+        let mut input: &[u8] = b"\n";
+        let mut output: Vec<u8> = Vec::new();
+        maybe_nudge_upgrade(
+            &upgrader,
+            "prod",
+            "0.1.0",
+            "0.49.3",
+            None,
+            true,
+            &mut input,
+            &mut output,
+        )
+        .expect("nudge");
+        let shown = String::from_utf8(output).unwrap();
+        assert!(shown.contains("Upgrade and connect? [y/N]"), "{shown}");
     }
 
     #[test]

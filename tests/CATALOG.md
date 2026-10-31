@@ -2892,6 +2892,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** how long the event was held, beyond that bound (the exact wait is pinned by the `hook_event_order` unit test with paused time); the `debug!` line the wait writes when it gives up.
 - **Platform coverage:** mac+linux (Unix-domain socket).
 
+##### hooks/ingest/011 — A line provenance refuses or cannot attest does not hold back a genuine event of another pane (issue #2043).
+- **Layer:** L1 (as `hooks/ingest/009`, with three `/bin/sh` agents spawned in the registry so their events carry an attested token, and the 60s predecessor wait).
+- **Agent:** none (synthetic `inbox_announce` and raw event lines).
+- **Asserts:** a genuine `session_start` is applied within 10s, far short of the predecessor wait, when it is accepted behind an open connection whose `inbox_announce` names a pane the daemon never spawned; the same behind an announce presenting a well-formed token the daemon never minted, and an outside agent's event behind that refused announce is applied too, so the refused announce gave up its place; control: a genuine session's `session_start` written late on the earlier connection is still applied ahead of its `quota_blocked`.
+- **Does not assert:** a refused or unattested raw event taking no place ahead of a genuine one, and an attested announce holding back only its own pane, which the `hook_event_order` unit tests cover with paused time; a silent connection, which still holds a genuine event for up to the predecessor wait (`hooks/ingest/010`).
+- **Platform coverage:** mac+linux (Unix-domain socket).
+
 #### hooks/install
 
 ##### hooks/install/001 — Launching the deck with `~/.claude/` present writes hook entries into `~/.claude/settings.json` idempotently.

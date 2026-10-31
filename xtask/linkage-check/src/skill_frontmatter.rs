@@ -12,7 +12,8 @@
 //! permissive reader is the one contributors run all day: a malformed
 //! description round-trips through Claude Code looking fine and only breaks in
 //! a different agent harness, possibly weeks later. That is the same argument
-//! CLAUDE.md rule 5 records for `clean_tmp.rs`, `junit_strip.rs` and
+//! `docs/develop/e2e-lanes.md` ("`--workspace` on all three aliases, and the fast-tier
+//! exceptions") records for `clean_tmp.rs`, `junit_strip.rs` and
 //! `pin_lockstep.rs` — a property that exists only at run time, in repository
 //! files, guarded by a test because no compile step can see it.
 //!

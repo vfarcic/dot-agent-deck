@@ -16,7 +16,7 @@
 //! already pins the plumbing deterministically; this test pins the thing a
 //! stand-in never can. Per Design Decision #7 the real-agent tier is sized to
 //! CONFIDENCE, not token cost — generous per-step timeouts, a directive prompt,
-//! and a distinctive sentinel. Run the scoped lane-2 cases locally (rule 4/5).
+//! and a distinctive sentinel. Run the scoped lane-2 cases locally (CLAUDE.md rules 4/5).
 //!
 //! ## Structure (mirrors `e2e_delegate_work_done_chain.rs`)
 //! An in-process daemon (`common::spawn_inprocess_daemon` — its hook loop ingests

@@ -1,8 +1,8 @@
 //! `cargo xtask affected-checks` (issue #1575): which of CLAUDE.md rule 2's and
 //! rule 5's gates a change actually needs.
 //!
-//! Rule 2 asks for `cargo fmt --check` and the e2e-featured clippy command
-//! before a commit, and rule 5 for `cargo test-fast` per task. For a change to
+//! CLAUDE.md rule 2 asks for `cargo fmt --check` and the e2e-featured clippy command
+//! before a commit, and CLAUDE.md rule 5 for `cargo test-fast` per task. For a change to
 //! Rust or to anything that feeds a build, those stay mandatory and this helper
 //! says so. For a change that touches only text — a PRD, `CLAUDE.md`, a skill,
 //! a workflow, a docs page — rustfmt and clippy have nothing to check, and most

@@ -64,9 +64,11 @@ fn main() {
     if version.source == VersionSource::Placeholder {
         println!(
             "cargo:warning=No version available: neither DAD_VERSION nor a git tag resolved, so \
-             this build reports the CARGO_PKG_VERSION placeholder `{}` (issue #250). Version \
-             negotiation, the upgrade nudge and `remote add` will all misbehave against it. Set \
-             DAD_VERSION=<x.y.z> in the build environment, or build from a checkout with tags.",
+             this build reports the CARGO_PKG_VERSION placeholder as `{}` (issues #250, #326). \
+             The daemon upgrade offer, the upgrade notices and `remote add` treat it as a build \
+             whose version is unknown: no upgrade is offered for it, and `remote add` / `remote \
+             upgrade` need an explicit --version. Set DAD_VERSION=<x.y.z> in the build \
+             environment, or build from a checkout with tags.",
             version.value
         );
     }

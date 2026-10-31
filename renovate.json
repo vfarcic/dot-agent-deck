@@ -102,7 +102,7 @@
     },
     {
       "customType": "regex",
-      "description": "The RWX configs (`.rwx/ci.yml`, `.rwx/sandbox.yml`, docs/develop/rwx.md) are a third place the toolchain is pinned, in their own syntax, so the workflow managers above do not match them. This one reads `nodejs/install`'s `node-version: \"<X.Y.Z>\"` (the package needs an exact version). The workflows' `actions/setup-node` and devbox.json's `nodejs_24` follow major 24 rather than pin a release, so there is nothing to keep in lockstep; a new major is held by the `major` rule.",
+      "description": "The RWX configs (`.rwx/ci.yml`, `.rwx/sandbox.yml`, docs/develop/rwx.md) are a third place the toolchain is pinned, in their own syntax, so the workflow managers above do not match them. This one reads `nodejs/install`'s `node-version: \"<X.Y.Z>\"` (the package needs an exact version). The workflows' `actions/setup-node` and devbox.json's `nodejs_26` follow major 26 rather than pin a release, so there is nothing to keep in lockstep; a new major is held by the `major` rule.",
       "managerFilePatterns": ["/^\\.rwx/[^/]+\\.ya?ml$/"],
       "matchStrings": ["node-version:\\s*\"(?<currentValue>\\d+\\.\\d+\\.\\d+)\""],
       "datasourceTemplate": "node-version",

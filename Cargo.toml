@@ -138,6 +138,10 @@ sha2 = "0.11"
 # copying any of it. Already in the graph as reqwest's own dependency, so
 # naming it adds no new code to the build.
 bytes = "1"
+# Issue #1884: `src/pty_open_retry.rs` implements `portable_pty::PtySystem`,
+# whose `openpty` returns `anyhow::Result`. Already in the graph through
+# `portable-pty` itself, so this adds no crate to the build.
+anyhow = "1"
 
 # Issue #250: `build.rs` validates an injected `DAD_VERSION` with the EXACT
 # parser `src/version.rs` uses (`semver::Version::parse`), so the set of
@@ -275,7 +279,7 @@ e2e = []
 # spawning `claude` spends a credential with no environment variable
 # involved. Credential handling for a LOCAL lane-2 run is issue #785.
 #
-# One CI job does still compile these files, and it is the only one: rule 2's
+# One CI job does still compile these files, and it is the only one: CLAUDE.md rule 2's
 # `cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D
 # warnings`. Do not "simplify" `e2e-live` out of that command — it is all that
 # stands between these files and a type error nobody sees until someone runs

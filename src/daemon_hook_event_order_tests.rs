@@ -32,6 +32,11 @@ impl Drop for Loop {
 
 impl Loop {
     async fn start(limits: HookLoopLimits) -> Self {
+        Self::start_with(limits, Arc::new(AgentPtyRegistry::new())).await
+    }
+
+    /// [`Self::start`], serving the panes `registry` spawned.
+    async fn start_with(limits: HookLoopLimits, registry: Arc<AgentPtyRegistry>) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         tokio::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
             .await
@@ -52,7 +57,7 @@ impl Loop {
                     listener,
                     state,
                     event_tx,
-                    Arc::new(AgentPtyRegistry::new()),
+                    registry,
                     Arc::new(Notify::new()),
                     crate::issue_dispatch_run::new_worktree_registry(),
                     limits,
@@ -286,4 +291,150 @@ async fn ingest_010_a_silent_earlier_connection_holds_later_events_only_briefly(
          connection has had its predecessor wait"
     );
     drop(silent);
+}
+
+/// One raw OpenCode event line for `session` in `pane`, carrying `token`.
+fn event_in(session: &str, event_type: &str, pane: &str, token: &str) -> String {
+    let line = serde_json::json!({
+        "session_id": session, "agent_type": "open_code",
+        "event_type": event_type, "timestamp": "2026-10-30T12:00:00Z",
+        "metadata": {}, "pane_id": pane, "token": token,
+    });
+    format!("{line}\n")
+}
+
+/// One raw OpenCode event line for `session` in `pane`, a pane this daemon
+/// never spawned, carrying no token: an outside agent's.
+fn outside_event(session: &str, event_type: &str, pane: &str) -> String {
+    let line = serde_json::json!({
+        "session_id": session, "agent_type": "open_code",
+        "event_type": event_type, "timestamp": "2026-10-30T12:00:00Z",
+        "metadata": {}, "pane_id": pane,
+    });
+    format!("{line}\n")
+}
+
+/// An `inbox_announce` claiming `pane`, presenting `token`.
+fn announce_for(pane: &str, token: Option<String>) -> String {
+    let line = serde_json::to_string(&DaemonMessage::InboxAnnounce(
+        crate::event::InboxAnnounceRequest {
+            pane_id: pane.to_string(),
+            agent_id: None,
+            token,
+            component: crate::event::InboxComponent::ClaudeHooks,
+            component_version: None,
+            wake: crate::event::InboxWake::TurnEnd,
+            pid: None,
+        },
+    ))
+    .expect("serialize an inbox_announce");
+    format!("{line}\n")
+}
+
+/// Scenario: Drive the hook loop over a real socket for panes the daemon spawned, so their events carry an attested token. Another peer sends an `inbox_announce` the daemon cannot attest and keeps its connection open; a genuine `session_start` of a spawned pane, accepted after it, must be applied straight away rather than after the predecessor wait. The same holds behind an announce whose token provenance refuses, and an unattested event behind that refused announce goes ahead too; as a control, a genuine pane's own two events are still applied in the order they were sent.
+#[spec("hooks/ingest/011")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ingest_011_an_unproven_line_does_not_hold_back_a_genuine_event_of_another_pane() {
+    use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+    use crate::event::EventType::{QuotaBlocked, SessionStart};
+    let registry = Arc::new(AgentPtyRegistry::new());
+    // One spawned pane per case, so each case's genuine session is the only
+    // one its pane has had.
+    let spawn = |pane: &str| {
+        let agent = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+                agent_type: None,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn a genuine pane's agent");
+        registry
+            .hook_token_of(&agent)
+            .expect("the pane's capability")
+    };
+    let (token_1, token_2, token_3) = (spawn("pane-1"), spawn("pane-2"), spawn("pane-3"));
+    // Far short of the 60 s predecessor wait `limits()` pins, so an event
+    // held back by the earlier connection cannot be applied within it.
+    let promptly = Duration::from_secs(10);
+    let deck = Loop::start_with(limits(), registry.clone()).await;
+
+    // An announce for a pane this daemon never spawned: provenance admits it
+    // as unattested, and its connection stays open with no event after it.
+    let mut unattested = deck.connect().await;
+    unattested
+        .write_all(announce_for("pane-outside", None).as_bytes())
+        .await
+        .expect("write the unattested announce");
+    send(
+        deck.connect().await,
+        &event_in("genuine-1", "session_start", "pane-1", &token_1),
+    )
+    .await;
+    assert!(
+        deck.wait_applied("genuine-1", 1, promptly).await,
+        "a genuine event of one pane was held back by an unattested announce of another pane"
+    );
+    drop(unattested);
+
+    // An announce provenance refuses: a well-formed token this daemon never
+    // minted. It must give up its place, so neither a genuine event nor an
+    // unattested one waits behind it.
+    let mut refused = deck.connect().await;
+    refused
+        .write_all(announce_for("pane-elsewhere", Some(crate::hook_provenance::mint())).as_bytes())
+        .await
+        .expect("write the refused announce");
+    send(
+        deck.connect().await,
+        &event_in("genuine-2", "session_start", "pane-2", &token_2),
+    )
+    .await;
+    send(
+        deck.connect().await,
+        &outside_event("outside-2", "session_start", "pane-outside-2"),
+    )
+    .await;
+    assert!(
+        deck.wait_applied("genuine-2", 1, promptly).await,
+        "a genuine event was held back by an announce that provenance refused"
+    );
+    assert!(
+        deck.wait_applied("outside-2", 1, promptly).await,
+        "an announce that provenance refused kept its place in line"
+    );
+    drop(refused);
+
+    // Control: the genuine pane's own events, with the earlier connection
+    // written late, are still applied in the order they were accepted.
+    let first = deck.connect().await;
+    let second = deck.connect().await;
+    send(
+        second,
+        &event_in("genuine-3", "quota_blocked", "pane-3", &token_3),
+    )
+    .await;
+    let overtook = deck
+        .wait_applied("genuine-3", 1, Duration::from_secs(1))
+        .await;
+    send(
+        first,
+        &event_in("genuine-3", "session_start", "pane-3", &token_3),
+    )
+    .await;
+    assert!(
+        deck.wait_applied("genuine-3", 2, promptly).await,
+        "both of the genuine session's events must be applied, got {:?}",
+        deck.applied("genuine-3").await
+    );
+    assert_eq!(
+        deck.applied("genuine-3").await,
+        vec![SessionStart, QuotaBlocked],
+        "one genuine session's events must still be applied in the order they were sent"
+    );
+    assert!(
+        !overtook,
+        "the genuine quota_blocked overtook its session_start"
+    );
+    registry.shutdown_all();
 }

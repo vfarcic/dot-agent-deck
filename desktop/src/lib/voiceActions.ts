@@ -68,7 +68,7 @@ import { clearDashboardFilter, setDashboardFilter, type DashboardFilter } from "
  *
  * # What the guard needs from this file, and what it will refuse
  *
- * `xtask/linkage-check` rule 13 reads this file as text, the way
+ * `xtask/linkage-check` rule 14 reads this file as text, the way
  * `desktop_settings_secrets.rs` already reads `bridge.ts`. That is only sound
  * while the literal below is **statically readable**, so the rule refuses a
  * computed key or a spread among the entries — exactly the refusal
@@ -93,7 +93,7 @@ import { clearDashboardFilter, setDashboardFilter, type DashboardFilter } from "
  * `desktop/src` when this was written. Reading the guard as completeness is
  * PRD #802's own named risk.
  *
- * Issue #1701 narrowed that gap without closing it: rule 14's control-site
+ * Issue #1701 narrowed that gap without closing it: linkage-check rule 14's control-site
  * ratchet lists each `onClick`-family handler that is not a single
  * `VOICE_ACTIONS` dispatch (and does more than stop its event) in
  * `xtask/linkage-check/voice-control-sites.toml`, with a reason, and fails the
@@ -1482,11 +1482,11 @@ export type VoiceDispatchTarget = AgentViewTarget & {
  * What a host offers a voice dispatch: `navigate` and `closeAgentView` always,
  * plus whatever else that host happens to have.
  *
- * # The absent members are checked now, and rule 13 still does not check them
+ * # The absent members are checked now, and linkage-check rule 14 still does not check them
  *
  * The guard proves an `invoke` names an entry and that the entry is classified.
  * It says nothing about whether the HOST can serve the context that entry's `run`
- * reads — those are different questions, and rule 13 answers only the first. What
+ * reads — those are different questions, and linkage-check rule 14 answers only the first. What
  * answers the second is {@link VoiceActionEntry.needs}, read by
  * {@link dispatchVoiceAction} before the call: a host that cannot serve an entry
  * gets a refusal it can report, rather than a `TypeError` whose message reaches
@@ -1649,7 +1649,7 @@ export type VoiceContextChannel = { current: VoiceScreenContext | undefined };
  * thing to the caller: nothing ran.**
  *
  * The first is an `invoke` naming no entry. That should be unreachable —
- * `xtask/linkage-check` rule 13 fails the build on an `invoke` that resolves to
+ * `xtask/linkage-check` rule 14 fails the build on an `invoke` that resolves to
  * nothing, and the Rust pipeline refuses an action outside the table before it
  * ever gets here — so the boolean is not a second validation. It is what stops
  * the residual being *silence*: the surface can say the command did not run,

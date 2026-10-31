@@ -944,8 +944,15 @@ pub fn release_channel(installation: &Installation) -> ReleaseChannel {
 }
 
 /// Whether `latest` is a newer release than `current` (both with or without a
-/// leading `v`). An unparseable version is never newer.
+/// leading `v`). An unparseable version is never newer, and nothing is newer
+/// than a `current` that does not know its own version.
 pub fn is_newer(current: &str, latest: &str) -> bool {
+    // Issue #326: a build that does not know its own version carries the
+    // `0.1.0` placeholder marked `+unknown`. Read as `0.1.0` it would be
+    // offered every release, on every check, forever.
+    if crate::version::is_unknown_version(current) {
+        return false;
+    }
     let Ok(current) = semver::Version::parse(current.strip_prefix('v').unwrap_or(current)) else {
         return false;
     };

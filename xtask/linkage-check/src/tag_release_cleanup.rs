@@ -6,8 +6,9 @@
 //! a directory a live process is working in must never be offered, a stray's
 //! unpushed commits must be named, and a worktree whose branch is still open
 //! must not appear at all. Every one of those is a runtime decision in a shell
-//! script, which no compile step sees — the argument CLAUDE.md rule 5 records
-//! for `clean_tmp.rs` and `reap_orphans.rs`.
+//! script, which no compile step sees — the argument `docs/develop/e2e-lanes.md`
+//! ("`--workspace` on all three aliases, and the fast-tier exceptions")
+//! records for `clean_tmp.rs`, and `reap_orphans.rs` makes for itself.
 //!
 //! So these tests build a throwaway repository with sibling worktrees, tool
 //! caches and stray directories in a `tempfile::tempdir()`, park short-lived
@@ -16,7 +17,7 @@
 //! no test sleeps: a parked process is a `cat` blocked on a pipe the test holds,
 //! killed when its guard drops.
 //!
-//! This module shells out to `git`, which rule 5 asks a fast-tier xtask test to
+//! This module shells out to `git`, which CLAUDE.md rule 5 asks a fast-tier xtask test to
 //! justify. The reason is the one `repo_state.rs`'s `mod real_git` gives: the
 //! script under test is a collector whose whole job is reading worktrees,
 //! branches and remote refs, so hand-written fixtures would test nothing. Every

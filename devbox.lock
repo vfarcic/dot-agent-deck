@@ -533,9 +533,9 @@
         }
       }
     },
-    "github:NixOS/nixpkgs/nixos-26.05#nodejs_24": {
-      "last_modified": "2026-09-26T19:29:38Z",
-      "resolved": "github:NixOS/nixpkgs/5e2305d577ca00acbba631b05cb1094d172b29f3?lastModified=1790450978&narHash=sha256-%2FeLCD%2FX9kaWJqPR47%2BfDozEC87Hjmm3i8gJbYmDAD7g%3D#nodejs_24"
+    "github:NixOS/nixpkgs/nixos-26.05#nodejs_26": {
+      "last_modified": "2026-10-29T17:25:25Z",
+      "resolved": "github:NixOS/nixpkgs/6f06d204d8f2d8761d9da78778745974a3216381?lastModified=1793294725&narHash=sha256-loLMnbbS4KhmG2ln9EY6f0YMNCA273Yx02oWYQ9IMeE%3D#nodejs_26"
     },
     "github:NixOS/nixpkgs/nixpkgs-unstable": {
       "last_modified": "2026-08-01T16:34:20Z",

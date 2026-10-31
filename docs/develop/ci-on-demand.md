@@ -70,7 +70,7 @@ So "run CI instead" is never a thing anyone does here, and a task text that impl
 
 **Never as the per-edit gate.** CLAUDE.md rule 2's `cargo fmt --check` plus `cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings` and rule 5's `cargo test-fast` stay local. Warm, that clippy is **9.3–10.4s** (rule 2, measured 2026-08-31 on 16 cores) against a CI round trip whose median is **9.5 minutes** — 40 to 60 times slower, depending on how loaded the box is when you measure the local side (14.3s warm here on 2026-09-15 under load, against rule 2's 9.3–10.4s on a quiet box). Nothing about a remote gate makes an inner loop that slow acceptable, and a unit that dispatches CI after each edit will spend its whole run waiting.
 
-**Never as a substitute for rule 2 or rule 5.** It cannot be one, per the section above, and a task text that reads as though it could is worse than saying nothing — it hands a unit a licence to commit without the gate that is supposed to precede the commit.
+**Never as a substitute for CLAUDE.md rule 2 or rule 5.** It cannot be one, per the section above, and a task text that reads as though it could is worse than saying nothing — it hands a unit a licence to commit without the gate that is supposed to precede the commit.
 
 **The expensive half is compiling, not testing**, so "just run the tests in CI" fixes little. Warm, `cargo test-fast`'s entire wall clock is the 25–30s CLAUDE.md rule 5 measures, because the build in front of the tests is then a no-op; cold, it is minutes, and the tests are still seconds of them. And lane 1 of the e2e tier is already off this box — issue #502 moved it to CI on every PR precisely because N units each running it was self-defeating.
 
@@ -83,9 +83,9 @@ Everything in this table was either measured for issue #896 on 2026-09-15 or is 
 | a `ci.yml` run, median | **9.5 min** | the 37 completed runs among the last 60 listed, 2026-09-15: `gh run list --workflow ci.yml --limit 60 --json conclusion,createdAt,updatedAt` |
 | the same: min / p90 / max | 7.3 / 16.4 / 26.7 min | same sample |
 | this page's own dispatch | **8.8 min**, green | run `35025264144`, 2026-09-15 |
-| rule 2's clippy, warm, quiet box | 9.3–10.4 s | CLAUDE.md rule 2, measured 2026-08-31 on 16 cores |
-| rule 2's clippy, warm, this box under load | **14.3 s** | measured for #896, 2026-09-15, same worktree once warm |
-| rule 2's clippy, cold, in a fresh dispatch worktree on a loaded box | **2m42s** | measured for #896, 2026-09-15, no `target/` at all, `/proc/pressure/io` at `full avg60=49.23` |
+| CLAUDE.md rule 2's clippy, warm, quiet box | 9.3–10.4 s | CLAUDE.md rule 2, measured 2026-08-31 on 16 cores |
+| CLAUDE.md rule 2's clippy, warm, this box under load | **14.3 s** | measured for #896, 2026-09-15, same worktree once warm |
+| CLAUDE.md rule 2's clippy, cold, in a fresh dispatch worktree on a loaded box | **2m42s** | measured for #896, 2026-09-15, no `target/` at all, `/proc/pressure/io` at `full avg60=49.23` |
 | `cargo test-fast`, same worktree and box, wall | **4m48s** | measured for #896, 2026-09-15, immediately after that clippy run |
 | the same run: executing the 3118 tests | **37.1 s** | nextest's own summary line from that run |
 | `cargo test-fast`, whole wall clock, warm cache, quiet box | 25–30 s | CLAUDE.md rule 5's own measurements, 2026-08-31 — warm, the build in front of the tests is a no-op |

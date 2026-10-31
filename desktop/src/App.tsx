@@ -2093,7 +2093,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
    * voice dispatch has to be built; but five of the registry's entries reach
    * state that lives here, in this component's `useState` booleans, and the
    * shell cannot see it. Before this, a row naming one of them type-checked,
-   * passed rule 13, and threw at the call — with `context.openOverlay is not a
+   * passed linkage-check rule 14, and threw at the call — with `context.openOverlay is not a
    * function` rendered at the user above the report sentence.
    *
    * **No dependency array, on purpose**, for `useInertBackground`'s reason:

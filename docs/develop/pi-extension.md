@@ -111,7 +111,7 @@ Read in the installed Pi 0.84.4 (`@earendil-works/pi-coding-agent`, `dist/core/`
 
 A Pi pane installs no Claude Code hook and mutates no `~/.claude/settings.json` — **by construction, with zero gating code.** `hooks_manage::auto_install()` runs only at TUI/dashboard startup, is machine-global, and takes no `AgentType`; the daemon-serve / spawn / scheduler / `agent-event` paths never call it. Design Decision #4 is satisfied without any `AgentType::Pi` branch in `src/hooks_manage.rs`.
 
-## Cross-version contract (rule 12)
+## Cross-version contract (CLAUDE.md rule 12)
 
 Inbox integration shipped with `PROTOCOL_VERSION = 11` (`v0.47.0`), and PRD #1666 part 2 moves it to 12 for a Claude Code notice; Pi's extension wire and `ADAPTER_INTEGRATION` are unchanged by that. Older decks and daemons require a coordinated upgrade. The hook-socket inbox verbs carry the recipient generation and capability. Pi's extension no longer relies on the old `GetSeed` request or a typed fallback. An extension from before the receipt stream is refused by a daemon that has the Pi slice (its stream and its doorbell fetch without `--rx` answer `adapter_too_old`, its `get-seed` no seed), and the card says to restart the agent; a restart refreshes the extension when the deck identifies the agent as Pi. See [Agent messaging](agent-messaging.md#contract-and-validation) and [Versioning](versioning.md) for the current boundary.
 

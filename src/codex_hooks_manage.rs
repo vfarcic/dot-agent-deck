@@ -7,7 +7,7 @@
 //! `dot-agent-deck hook --agent codex` — into the Codex home the spawned `codex`
 //! child reads, so a live interactive session's prompt / tool / turn events ride
 //! the deck's existing raw-`AgentEvent` hook socket (no new wire, no
-//! `PROTOCOL_VERSION` bump — rule 12).
+//! `PROTOCOL_VERSION` bump — CLAUDE.md rule 12).
 //!
 //! It is the Codex analog of [`crate::hooks_manage::auto_install`] (Claude):
 //! **guarded, silent, and SAFE for the user's real `~/.codex`**. Deliberate

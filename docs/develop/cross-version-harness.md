@@ -1,4 +1,4 @@
-# The cross-version harness — running rule 12 as a command
+# The cross-version harness — running CLAUDE.md rule 12 as a command
 
 CLAUDE.md rule 12 requires, for any change touching the daemon, the TUI↔daemon protocol, orchestration or hooks, a **cross-version manual test**: build the branch, start a daemon from the previous release with an agent under it, run the branch TUI against that older daemon, and confirm a delegate still routes and hooks still arrive. `cargo xver` does that, scripted.
 
@@ -12,15 +12,15 @@ cargo xver --branch agent/dispatch-issue-1121
 
 `cargo xver -- --branch …` is accepted too. The alias already ends in `--`, so that spelling used to reach clap as a positional argument and fail; the binary now drops one leading `--`.
 
-That is the **forward** direction, and it is the default. `--direction reverse` runs the opposite pairing — the branch daemon with the previous release's TUI and CLI — and `--direction both` runs one after the other, each in its own sandbox with its own evidence file. [The reverse direction](#the-reverse-direction) says why rule 12's pairing alone leaves a gap and what reverse does and does not close.
+That is the **forward** direction, and it is the default. `--direction reverse` runs the opposite pairing — the branch daemon with the previous release's TUI and CLI — and `--direction both` runs one after the other, each in its own sandbox with its own evidence file. [The reverse direction](#the-reverse-direction) says why CLAUDE.md rule 12's pairing alone leaves a gap and what reverse does and does not close.
 
 **A pairing whose `PROTOCOL_VERSION` differs cannot pass, by design.** The preflight's `compare_hellos` already notes a differing `server_version`. Since [#405](https://github.com/vfarcic/dot-agent-deck/issues/405) a TUI carrying that issue's check refuses to attach across the difference: in a forward run the branch TUI prints its mismatch prompt, the decline exits with `error: daemon speaks attach protocol vN, but this binary speaks vM` instead of attaching, and the run stops on a failing `aborted` tell whose detail says so, with the refusal recorded as an excerpt, leaving the old daemon and its roles running until teardown. No delegate or hook is sent, because there is no attached session to send one through. Read that outcome as the intended result of a `PROTOCOL_VERSION` bump, not as a semantic break. A reverse run pairs the branch daemon with the previous release's TUI, which refuses only if that release carries the check itself.
 
 ## Why this exists
 
-Rule 12's procedure is written in keystrokes because a person was always going to run it, and four of its paragraphs are about ways a person silently gets it wrong. That had a consequence nobody intended: a dispatched agent reading rule 12 concludes it cannot type into two full-screen TUIs, declines the check, and leaves the review thread open. Eight green, mergeable pull requests were blocked on exactly that one thread at the time this was written.
+CLAUDE.md rule 12's procedure is written in keystrokes because a person was always going to run it, and four of its paragraphs are about ways a person silently gets it wrong. That had a consequence nobody intended: a dispatched agent reading CLAUDE.md rule 12 concludes it cannot type into two full-screen TUIs, declines the check, and leaves the review thread open. Eight green, mergeable pull requests were blocked on exactly that one thread at the time this was written.
 
-**Rule 12's requirement is the scenario, not human fingers.** A driver that reproduces the same scenario and asserts the same tells discharges the same obligation — and unlike a person's recollection, it leaves a file a reviewer can read afterwards.
+**CLAUDE.md rule 12's requirement is the scenario, not human fingers.** A driver that reproduces the same scenario and asserts the same tells discharges the same obligation — and unlike a person's recollection, it leaves a file a reviewer can read afterwards.
 
 ## In CI
 
@@ -36,7 +36,7 @@ cargo xver --repo <this repository> --branch <head SHA> --previous <tag> \
 
 - `--branch <head SHA>`: the pull request's head commit, or the dispatched commit. A SHA rather than `pull/<n>/head` or a branch name, because a ref can move between the job's protocol check and the harness's own fetch, and then the harness would build a commit nothing checked. GitHub serves a fetch by SHA for any commit its refs reach, which covers a fork's pull request through `refs/pull/<n>/head`.
 - `--previous` is the nearest stable tag the pull request's head can reach (`git describe --tags --abbrev=0 --exclude '*-*'`), so a branch cut before the newest release is paired with the release it was cut after ([Which release is "previous"](#which-release-is-previous)).
-- `--direction both` runs forward, the pairing rule 12 names, and reverse, the only one that runs the branch's daemon code.
+- `--direction both` runs forward, the pairing CLAUDE.md rule 12 names, and reverse, the only one that runs the branch's daemon code.
 - `--probe generic`, because a SHA carries no `dispatch-issue-<n>` component for `auto` to select a probe from.
 - `--allow-build-changes`, because the review the flag asks for protects a host with something on it, which the runner is not.
 - `--min-free-gib 15`, because the default floor of 100 is sized for a dev box shared with other builds; a run writes one debug build of the binary, its crates and one release asset.
@@ -49,14 +49,14 @@ Two things happen before the harness starts: the job installs `bubblewrap` and s
 The job tells three results apart, by the harness's exit status (issue #1596):
 
 - **pass** (exit 0): every tell held in both directions.
-- **declared break** (exit 3): every tell was measured, and each one that failed failed the way a contract break says it will — a break one build declares in `CONTRACT_BREAKS` and the other does not (usually the daemon's build), with that break's record found for the operation it acts on: the daemon's log line for it, written while that operation ran, or, for a break the client declares and refuses before sending anything, the client's own output in that operation's pane ([When a declared break explains a failure](#when-a-declared-break-explains-a-failure)). The job raises a `cross-version declared contract break` warning annotation and **passes**: rule 12 records a declared break as the outcome, not as a regression.
+- **declared break** (exit 3): every tell was measured, and each one that failed failed the way a contract break says it will — a break one build declares in `CONTRACT_BREAKS` and the other does not (usually the daemon's build), with that break's record found for the operation it acts on: the daemon's log line for it, written while that operation ran, or, for a break the client declares and refuses before sending anything, the client's own output in that operation's pane ([When a declared break explains a failure](#when-a-declared-break-explains-a-failure)). The job raises a `cross-version declared contract break` warning annotation and **passes**: CLAUDE.md rule 12 records a declared break as the outcome, not as a regression.
 - **fail** (any other exit): a tell failed with no break declared between the two builds, or with one declared that does not account for that failure, or the run was INCOMPLETE.
 
-A `Summarise the verdicts` step writes each evidence file's verdict line into the job summary, so which of the three it was, and which break, reads without downloading anything. The evidence files (both directions' when the harness ran, the refusal file when it did not) are uploaded as the run's `xver-evidence-attempt-<n>` artifact. A passing job with that artifact is rule 12's cross-version run for the pull request's head — including one that passed on a declared break, whose break is then the outcome to record; link the run in the pull request body.
+A `Summarise the verdicts` step writes each evidence file's verdict line into the job summary, so which of the three it was, and which break, reads without downloading anything. The evidence files (both directions' when the harness ran, the refusal file when it did not) are uploaded as the run's `xver-evidence-attempt-<n>` artifact. A passing job with that artifact is CLAUDE.md rule 12's cross-version run for the pull request's head — including one that passed on a declared break, whose break is then the outcome to record; link the run in the pull request body.
 
 The first run, on PR #1524 (run [`37141330180`](https://github.com/vfarcic/dot-agent-deck/actions/runs/37141330180)), passed both directions against `v0.45.0`: the job took 4.5 minutes, of which `cargo xver` was 3m39s, the cold build of the binary 89s, and the runner reported 84 GiB free.
 
-**The reverse pairing stays in the job.** It is the only pairing that runs the branch's daemon code ([The gap in rule 12's pairing](#the-gap-in-rule-12s-pairing)), which is most of what rule 12's trigger list names, and the red it produced after #1559 landed was not noise about the pairing: it was the harness correctly measuring #318's declared break and having no way to say so. With that outcome classified, dropping reverse would trade a false red for a blind spot.
+**The reverse pairing stays in the job.** It is the only pairing that runs the branch's daemon code ([The gap in CLAUDE.md rule 12's pairing](#the-gap-in-claudemd-rule-12s-pairing)), which is most of what CLAUDE.md rule 12's trigger list names, and the red it produced after #1559 landed was not noise about the pairing: it was the harness correctly measuring #318's declared break and having no way to say so. With that outcome classified, dropping reverse would trade a false red for a blind spot.
 
 **The job stays advisory.** Within a day of landing it went red on pull requests, #1595 among them, for a reason the harness could not yet classify, and a required check that goes red for a classification gap blocks every merge until someone fixes the harness. Making it required is a `REQUIRED_CHECKS` change made with `scripts/apply-branch-protection.sh`, worth proposing once its run history on pull requests is passes and declared breaks with no unexplained red.
 
@@ -102,7 +102,7 @@ Tell 2's `ss -xlp` runs inside the namespace, so the pids it names are the run's
 
 ## The five false greens, and where each one is handled
 
-Rule 12 documents four ways this procedure silently measures nothing; PR #1179 added a fifth. A false green here is worse than not running the check at all, because it clears a gate with nothing behind it.
+CLAUDE.md rule 12 documents four ways this procedure silently measures nothing; PR #1179 added a fifth. A false green here is worse than not running the check at all, because it clears a gate with nothing behind it.
 
 1. **No agents under the old daemon.** With zero agents the branch TUI takes `MismatchAction::SilentRestart` — it SIGTERMs the old daemon and lazy-spawns its own, with no prompt and no output. The scenario's orchestration step is what avoids it, and the missing mismatch prompt is what catches it: the harness treats "no prompt" as a hard failure of the run rather than as a pass, because the prompt appearing *is* the proof the scenario was reached.
 2. **The 30-second idle window.** `DEFAULT_IDLE_SHUTDOWN_SECS` is 30, so more than 30 s between `daemon serve` and the first attach and the daemon exits and gets replaced. Every process of the runtime scenario — the inner half, the daemon, both TUIs, the panes and every deck client — carries `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0`, which is the documented "always on" production value rather than a test hook.
@@ -124,9 +124,9 @@ The evidence records the unlock as a step. When it could not be confirmed, that 
 
 ## The reverse direction
 
-### The gap in rule 12's pairing
+### The gap in CLAUDE.md rule 12's pairing
 
-Rule 12 prescribes exactly one pairing: a **previous-release daemon** with the **branch TUI**. That proves the branch client can drive an old daemon, which is a real property and the one the rule asks for. But most of what rule 12's trigger list names — daemon, orchestration, hooks — is code that runs **in the daemon**, and in the forward pairing the daemon is the previous release. For a daemon-side change the forward run therefore executes **none of the changed lines**: it passes against the old daemon's code and says nothing about the new. This is a gap in the rule as written, not in any one run.
+CLAUDE.md rule 12 prescribes exactly one pairing: a **previous-release daemon** with the **branch TUI**. That proves the branch client can drive an old daemon, which is a real property and the one the rule asks for. But most of what CLAUDE.md rule 12's trigger list names — daemon, orchestration, hooks — is code that runs **in the daemon**, and in the forward pairing the daemon is the previous release. For a daemon-side change the forward run therefore executes **none of the changed lines**: it passes against the old daemon's code and says nothing about the new. This is a gap in the rule as written, not in any one run.
 
 `--direction reverse` is the pairing that does execute them: the **branch daemon**, with the orchestration stood up under it by the branch's own TUI, then the **previous release's TUI** started against it. When that TUI finds the branch daemon, its mismatch prompt is declined and the **previous release's CLI** issues every pane command, and the changed daemon code runs against the old client's traffic. When it does not find the daemon, none of that happens: the run measures what the old TUI reached instead, and its verdict says only that (see [the cannot-discover outcome](#what-is-genuinely-different-in-reverse) below). It models a downgrade, or a stale binary left on disk beside a newer daemon. Everything else about a run is unchanged: the same namespace, environment allowlist, pre-connect assertion before every client, teardown by verified identity and postconditions, in both directions.
 
@@ -143,7 +143,7 @@ For the eight branches this was first run on, the direction that executes the ch
 | #1188 | #1129 | the CLI's acknowledgement wait, and the daemon's acknowledgement write | both |
 | #1190 | #1181 | git children the daemon spawns | reverse |
 
-Reverse does not replace forward. Rule 12 asks for the forward run for every one of them; reverse is the additional run that reaches the daemon half.
+Reverse does not replace forward. CLAUDE.md rule 12 asks for the forward run for every one of them; reverse is the additional run that reaches the daemon half.
 
 ### What is genuinely different in reverse
 
@@ -157,7 +157,7 @@ Reverse does not replace forward. Rule 12 asks for the forward run for every one
 
 ### Branch-specific probes
 
-The four tells are rule 12's and reverse asserts them. They are not enough on their own, because a delegate and two hooks never reach, say, the line that escapes a hostile id in a log record. A reverse run therefore also carries a **probe**: the minimal stimulus that reaches the branch's changed arm, with an assertion on what the branch daemon then did. It is named with `--probe`, or selected by `--probe auto`, the default, from the branch's issue number — read only from a path component that starts `dispatch-issue-<n>`, as in `agent/dispatch-issue-1181` or a slugged `agent/dispatch-issue-1181-v2`. The issue numbers a component names are the all-digit `-`-separated segments after `dispatch-issue-`, up to the first segment that is not all digits, which starts the slug; a number later in the slug is never taken as the issue, but a slug whose first word is all digits (`dispatch-issue-1181-404-fix`) reads as a second issue and is refused like a coupled unit, and an all-digit segment too large to be an issue number is refused. Auto never falls back: a branch with no such component (`main`), one that names more than one issue — a coupled unit's `agent/dispatch-issue-1109-1121`, or two `dispatch-issue-` components — or naming an issue no probe was written for is refused before anything is built, and the refusal names any issue with a probe that the branch name mentions. `--probe generic` is how to ask for no stimulus on purpose: it adds one tell, `role-set`. The run prints the probe and how it was chosen, and the evidence file's probe row says the same. Probes run only in reverse, and an explicit probe with `--direction forward` is refused rather than dropped. `generic` runs in every endpoint mode; `discovery-fallback` needs `resolved` with `--unset-xdg-runtime-dir`; every other probe needs `sandbox-sockets`, the mode it was written against.
+The four tells are CLAUDE.md rule 12's and reverse asserts them. They are not enough on their own, because a delegate and two hooks never reach, say, the line that escapes a hostile id in a log record. A reverse run therefore also carries a **probe**: the minimal stimulus that reaches the branch's changed arm, with an assertion on what the branch daemon then did. It is named with `--probe`, or selected by `--probe auto`, the default, from the branch's issue number — read only from a path component that starts `dispatch-issue-<n>`, as in `agent/dispatch-issue-1181` or a slugged `agent/dispatch-issue-1181-v2`. The issue numbers a component names are the all-digit `-`-separated segments after `dispatch-issue-`, up to the first segment that is not all digits, which starts the slug; a number later in the slug is never taken as the issue, but a slug whose first word is all digits (`dispatch-issue-1181-404-fix`) reads as a second issue and is refused like a coupled unit, and an all-digit segment too large to be an issue number is refused. Auto never falls back: a branch with no such component (`main`), one that names more than one issue — a coupled unit's `agent/dispatch-issue-1109-1121`, or two `dispatch-issue-` components — or naming an issue no probe was written for is refused before anything is built, and the refusal names any issue with a probe that the branch name mentions. `--probe generic` is how to ask for no stimulus on purpose: it adds one tell, `role-set`. The run prints the probe and how it was chosen, and the evidence file's probe row says the same. Probes run only in reverse, and an explicit probe with `--direction forward` is refused rather than dropped. `generic` runs in every endpoint mode; `discovery-fallback` needs `resolved` with `--unset-xdg-runtime-dir`; every other probe needs `sandbox-sockets`, the mode it was written against.
 
 Every stimulus is issued by the previous release's CLI from **inside** a pane the branch daemon spawned, so it carries that pane's genuine identity and capability rather than one the harness copied, and each is preceded by the pre-connect assertion. No probe needs an agent credential: where a real agent's producer behaviour matters, the exact payload is injected through `dot-agent-deck hook` on stdin, or produced by a synthetic stand-in.
 
@@ -310,7 +310,7 @@ For issue #1121 the invocation is both levers together:
 cargo xver --branch agent/dispatch-issue-1121 --endpoint-mode resolved --unset-xdg-runtime-dir
 ```
 
-In that mode a forward run against a flat-pair old daemon also records whether the branch build created an endpoint directory of its own (`/tmp/dot-agent-deck-<uid>` inside, `$S/fallback-tmp/dot-agent-deck-<uid>` outside) while it was attached to the old daemon at the legacy address. That is an observation rather than a fifth tell: it checks one change's claim about itself — that its compatibility read is read-only — where the four tells are what rule 12 asks of every change.
+In that mode a forward run against a flat-pair old daemon also records whether the branch build created an endpoint directory of its own (`/tmp/dot-agent-deck-<uid>` inside, `$S/fallback-tmp/dot-agent-deck-<uid>` outside) while it was attached to the old daemon at the legacy address. That is an observation rather than a fifth tell: it checks one change's claim about itself — that its compatibility read is read-only — where the four tells are what CLAUDE.md rule 12 asks of every change.
 
 ## The build namespace
 
@@ -464,7 +464,7 @@ The sandbox is removed after a clean pass and kept after anything else; `--keep-
 
 ## What it covers, and what it does not
 
-Forward covers the pairing rule 12 and [`versioning.md`](versioning.md) exist for: a **newer TUI against an older daemon**, over the real attach protocol, with real orchestration state in the old daemon's memory, asserting on payloads rather than on exit codes. Reverse covers the opposite pairing for the same flows plus one branch-specific stimulus each; [What reverse covers, and what it does not](#what-reverse-covers-and-what-it-does-not) states that narrowly.
+Forward covers the pairing CLAUDE.md rule 12 and [`versioning.md`](versioning.md) exist for: a **newer TUI against an older daemon**, over the real attach protocol, with real orchestration state in the old daemon's memory, asserting on payloads rather than on exit codes. Reverse covers the opposite pairing for the same flows plus one branch-specific stimulus each; [What reverse covers, and what it does not](#what-reverse-covers-and-what-it-does-not) states that narrowly.
 
 It does not cover:
 
@@ -473,7 +473,7 @@ It does not cover:
 - **The desktop GUI.** `classify_handshake` compares `PROTOCOL_VERSION` and `CONTRACT_BREAKS` and is a different code path from the TUI's build-version handshake; nothing here exercises it.
 - **More than one previous release per run.** `--previous` takes one tag.
 - **Anything that is not Linux.** `/proc`, bubblewrap, `ss(8)` and `statvfs` are all assumed, and only the `linux-amd64` release asset is fetched. On any other target the crate still builds — it is a workspace member, and the Windows and macOS CI jobs build `--workspace` — but only to a stub that prints that `cargo xver` runs on Linux only and exits non-zero.
-- **Flows other than the two rule 12 names, in forward.** A delegate and the two hook kinds are what a forward run drives; a contract break that touches neither would not be seen. A reverse run adds its probe's one stimulus and nothing more.
+- **Flows other than the two CLAUDE.md rule 12 names, in forward.** A delegate and the two hook kinds are what a forward run drives; a contract break that touches neither would not be seen. A reverse run adds its probe's one stimulus and nothing more.
 
 ## Options worth knowing
 
@@ -486,7 +486,7 @@ It does not cover:
 | `--endpoint-mode` | `sandbox-sockets` (default) or `resolved` |
 | `--unset-xdg-runtime-dir` | false green 5 |
 | `--experimental` | turn the experimental feature flag on for the run; the harness then unlocks command entry into worker panes before typing into one ([above](#--experimental-and-the-command-entry-lock)) |
-| `--direction` | `forward` (default, rule 12's pairing), `reverse` (branch daemon, previous-release TUI and CLI) or `both` |
+| `--direction` | `forward` (default, CLAUDE.md rule 12's pairing), `reverse` (branch daemon, previous-release TUI and CLI) or `both` |
 | `--probe` | the reverse run's branch-specific stimulus: `auto` (default: from the issue number in the branch's `dispatch-issue-<n>` or `dispatch-issue-<n>-<slug>` path component, refusing a branch it cannot tie to exactly one probe, which includes a coupled unit's `dispatch-issue-<a>-<b>`), `generic` (no stimulus: the four tells plus `role-set`, in any endpoint mode — how [the #1179 control](#negative-controls) runs), or a probe's name; `discovery-fallback` needs `resolved` with `--unset-xdg-runtime-dir`, the rest `sandbox-sockets` |
 | `--skip-build` | reuse whatever is already in the target dir; for iterating on the harness itself. The evidence file then records that the binary was not rebuilt, and which commit its build id names, if any. Nothing is built and no trust domain is prepared; the binary comes from the gate's domain's target dir when that holds one, else from `--target-dir`, and the **Build** section says which |
 | `--keep-sandbox` | keep the sandbox even on a pass |
@@ -529,4 +529,4 @@ Once the previous release itself declares the break, the two builds no longer di
 
 ## When a run finds a real break
 
-Report it and do not paper over it. A failing tell, or a missing mismatch prompt, is the harness saying the branch and the previous release did not interoperate — which is precisely the question rule 12 asks, and a `FAIL` here is the most valuable outcome a run can have.
+Report it and do not paper over it. A failing tell, or a missing mismatch prompt, is the harness saying the branch and the previous release did not interoperate — which is precisely the question CLAUDE.md rule 12 asks, and a `FAIL` here is the most valuable outcome a run can have.

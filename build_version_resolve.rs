@@ -165,8 +165,37 @@ pub fn resolve_version(
         };
     }
     ResolvedVersion {
-        value: cargo_pkg_version.trim().to_string(),
+        value: placeholder_version(cargo_pkg_version),
         source: VersionSource::Placeholder,
+    }
+}
+
+/// The SemVer build metadata a build that could not determine its own version
+/// carries (issue #326). `src/version.rs` keeps the same value as
+/// `UNKNOWN_VERSION_METADATA`, and `tests/build_version.rs` checks the two
+/// agree.
+pub const UNKNOWN_VERSION_METADATA: &str = "unknown";
+
+/// The value a build with no injected version and no git tag reports: the
+/// `CARGO_PKG_VERSION` placeholder marked `+unknown` (issue #326).
+///
+/// Without the mark that build reported a bare `0.1.0`, which every
+/// version-aware consumer read as a genuine, very old release — and `v0.1.0`
+/// is a real published tag, so the bare value cannot say "unknown" on its own.
+/// Build metadata keeps the value valid SemVer, so `src/version.rs`'s
+/// `.expect()` holds, and SemVer precedence ignores it, so a build that does
+/// not look for the mark orders the value exactly as it ordered `0.1.0`.
+pub fn placeholder_version(cargo_pkg_version: &str) -> String {
+    let placeholder = cargo_pkg_version.trim();
+    match Version::parse(placeholder) {
+        Ok(mut version) => {
+            version.build = semver::BuildMetadata::new(UNKNOWN_VERSION_METADATA)
+                .expect("`unknown` is valid build metadata");
+            version.to_string()
+        }
+        // Cargo validates `package.version` as SemVer, so this is not reached
+        // by a real build; emit the value unchanged rather than invent one.
+        Err(_) => placeholder.to_string(),
     }
 }
 

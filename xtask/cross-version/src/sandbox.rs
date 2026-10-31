@@ -285,8 +285,8 @@ pub enum EndpointMode {
 
 /// Which build serves the daemon and which one attaches to it.
 ///
-/// Rule 12 prescribes exactly one pairing, `Forward`. For a change that lives in
-/// the DAEMON — most of what rule 12's trigger list names — that pairing runs the
+/// CLAUDE.md rule 12 prescribes exactly one pairing, `Forward`. For a change that lives in
+/// the DAEMON — most of what CLAUDE.md rule 12's trigger list names — that pairing runs the
 /// previous release's daemon code and never executes a changed line: it proves
 /// the branch client can drive an old daemon, which is real and is what the rule
 /// asks, and says nothing about the branch's own daemon. `Reverse` is the pairing
@@ -294,7 +294,7 @@ pub enum EndpointMode {
 /// to it — the downgrade, or a stale binary left on disk beside a new daemon.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Direction {
-    /// Previous-release daemon, branch TUI and CLI. Rule 12's pairing.
+    /// Previous-release daemon, branch TUI and CLI. CLAUDE.md rule 12's pairing.
     #[default]
     Forward,
     /// Branch daemon, previous-release TUI and CLI.

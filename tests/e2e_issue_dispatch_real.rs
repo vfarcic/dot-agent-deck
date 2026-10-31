@@ -74,9 +74,9 @@
 //!
 //! Decision 23 cost: two short interactive Haiku turns (orchestrator delegates,
 //! worker lists a handful of files) — well under the <$0.05/run bound.
-//! Local-only (Decision 8 / rule 5): gated on the `e2e` feature so CI's
+//! Local-only (Decision 8 / CLAUDE.md rule 5): gated on the `e2e` feature so CI's
 //! `cargo test-fast` never compiles it; flaky-tolerant (real LLM + real network)
-//! per rule 4 — it is NOT looped for flakiness.
+//! per CLAUDE.md rule 4 — it is NOT looped for flakiness.
 
 mod common;
 
