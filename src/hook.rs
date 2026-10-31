@@ -1901,6 +1901,11 @@ fn opencode_question(
     let properties = properties?;
     match event {
         "permission.asked" => crate::question::opencode_permission_asked(properties, raised_at_ms),
+        // PRD #2050: an OpenCode 2 form, which the deck's 2.x TUI plugin
+        // passes whole as `form`; 1.x's `questions` list otherwise.
+        "question.asked" if properties.get("form").is_some() => {
+            crate::question::opencode_form_asked(properties, raised_at_ms)
+        }
         "question.asked" => crate::question::opencode_question_asked(properties, raised_at_ms),
         _ => None,
     }
@@ -6292,6 +6297,107 @@ mod question_tests {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    /// PRD #2050: an OpenCode 2 form, as the deck's 2.x TUI plugin hands it to
+    /// `await-answer` (the field model read from `@opencode/client@2.2.5`'s
+    /// `FormInfo`), becomes a held form with one question per field, and the
+    /// deck's answer maps back onto `session.form.reply`'s answer by field key
+    /// — a choice's `value`, a boolean, a number, a list, the user's words.
+    #[test]
+    fn opencode_await_answer_builds_and_maps_a_v2_form() {
+        let form = serde_json::json!({
+            "id": "frm_1", "sessionID": "ses_2", "title": "Set up the release",
+            "fields": [
+                {"key": "channel", "type": "string", "title": "Channel",
+                 "options": [{"value": "stable", "label": "Stable"}, {"value": "beta", "label": "Beta"}],
+                 "custom": true},
+                {"key": "notify", "type": "boolean", "title": "Notify the team?"},
+                {"key": "retries", "type": "integer", "title": "Retries"},
+                {"key": "targets", "type": "multiselect", "title": "Targets",
+                 "options": [{"value": "linux", "label": "Linux"}, {"value": "mac", "label": "macOS"}]},
+                {"key": "note", "type": "string"}
+            ]
+        });
+        let raw = serde_json::json!({
+            "session_id": "ses_2",
+            "event": "question.asked",
+            "properties": {"id": "frm_1", "sessionID": "ses_2", "title": "Set up the release", "form": form},
+            "cwd": "/work",
+        });
+        let (event, q, props) = opencode_question_event(&raw.to_string()).unwrap();
+        assert_eq!(event.event_type, EventType::WaitingForInput);
+        assert_eq!(q.id, "frm_1");
+        assert_eq!(q.channel, AnswerChannel::Held);
+        assert_eq!(
+            labels(&q, 0),
+            vec!["Stable", "Beta", "Type your own answer"]
+        );
+        assert_eq!(labels(&q, 1), vec!["Yes", "No"]);
+        assert_eq!(labels(&q, 2), vec!["Type your own answer"]);
+        assert!(q.questions[3].multi_select);
+        assert_eq!(
+            q.questions[4].prompt, "note",
+            "a field with no title is named by its key"
+        );
+        assert_eq!(q.questions[0].header.as_deref(), Some("Set up the release"));
+        let reply = QuestionReply::answered(
+            &q.id,
+            resolved(
+                &q,
+                &[
+                    (0, &[2], None),
+                    (1, &[2], None),
+                    (2, &[1], Some("3")),
+                    (3, &[1, 2], None),
+                    (4, &[1], Some("ship it")),
+                ],
+            ),
+        );
+        assert_eq!(
+            crate::question::opencode_reply(&q, &props, &reply),
+            Some(serde_json::json!({
+                "kind": "form",
+                "request_id": "frm_1",
+                "body": {"sessionID": "ses_2", "answer": {
+                    "channel": "beta", "notify": false, "retries": 3,
+                    "targets": ["linux", "mac"], "note": "ship it"
+                }}
+            }))
+        );
+        // Typed words that are not a number do not become a reply.
+        let bad = QuestionReply::answered(
+            &q.id,
+            resolved(
+                &q,
+                &[
+                    (0, &[3], Some("nightly")),
+                    (1, &[1], None),
+                    (2, &[1], Some("three")),
+                    (3, &[1], None),
+                    (4, &[1], Some("x")),
+                ],
+            ),
+        );
+        assert_eq!(crate::question::opencode_reply(&q, &props, &bad), None);
+    }
+
+    /// PRD #2050: a form the deck cannot answer whole — a field shown only
+    /// `when` another has a value, or one it cannot express — is shown but
+    /// keyboard-only, so the card says it is answered in OpenCode.
+    #[test]
+    fn an_opencode_2_form_the_deck_cannot_express_is_keyboard_only() {
+        for field in [
+            serde_json::json!({"key": "a", "type": "string", "when": [{"key": "b", "op": "eq", "value": true}]}),
+            serde_json::json!({"key": "a", "type": "external", "url": "https://example.com"}),
+            serde_json::json!({"key": "a", "type": "string", "hidden": true}),
+        ] {
+            let props = serde_json::json!({"id": "frm_9", "form": {"id": "frm_9", "sessionID": "s", "title": "t", "fields": [field]}});
+            let q = crate::question::opencode_form_asked(&props, 0).unwrap();
+            assert_eq!(q.channel, AnswerChannel::Unsupported, "{field}");
+        }
+        let empty = serde_json::json!({"id": "frm_9", "form": {"id": "frm_9", "fields": []}});
+        assert!(crate::question::opencode_form_asked(&empty, 0).is_none());
     }
 
     /// The OpenCode half of `await-answer`: OpenCode's captured `question.asked`

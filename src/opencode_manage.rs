@@ -1885,16 +1885,25 @@ const v2TranslateOne = (event, directory) => {
   }
 };
 
-// A question form (`form.*`). 2.x's server context has no form reply, so a
-// form is reported plainly — the card shows it — and answered in OpenCode;
-// its reply or cancellation clears it.
+// A question form (`form.*`). 2.x's server context has no form reply. In the
+// full TUI the deck's TUI plugin holds a new form through `await-answer` and
+// answers it (PRD #2050), so `form.created` is left to it here. Anywhere else
+// — `opencode mini` loads no TUI plugin — the form is reported plainly, the
+// card saying it is answered in OpenCode. Its reply or cancellation clears it
+// either way.
+const V2_FORM_IN_OPENCODE = "answer this form in OpenCode";
 const v2FormEvent = (event, directory) => {
   const data = event?.data ?? {};
+  if (event.type === "form.created" && v2ClientMode() === "tui") return;
   const form = event.type === "form.created" ? data.form ?? {} : data;
   const sessionID = form.sessionID;
   const requestID = form.id;
   const name = event.type === "form.created" ? "question.asked" : event.type === "form.replied" ? "question.replied" : "question.rejected";
-  const props = { sessionID, id: requestID, title: form.title };
+  const title =
+    name === "question.asked"
+      ? (typeof form.title === "string" && form.title ? `${V2_FORM_IN_OPENCODE}: ${form.title}` : V2_FORM_IN_OPENCODE)
+      : form.title;
+  const props = { sessionID, id: requestID, title };
   if (isChildSession(sessionID)) {
     const payload = subagentPayload(undefined, sessionID, directory, { event: name, prompt: permissionPrompt(props) });
     if (name !== "question.asked") payload.request_id = requestID;
@@ -3058,6 +3067,110 @@ const setup = async (api) => {
       }
       pending.delete(data.inboxID);
     });
+    // PRD #2050: OpenCode 2's question forms. Only this plugin, in the
+    // process that draws the full TUI, can answer one (`data.session.form`;
+    // the server plugin's context has no form API), so it holds each through
+    // `await-answer`, as 1.x's server plugin holds a question, and replies
+    // with the deck's answer. The server plugin leaves `form.created` to it
+    // here, and still reports a form's reply or cancellation.
+    const heldForms = new Map();
+    const settledForms = new Set();
+    const stopForm = (formID) => {
+      const child = heldForms.get(formID);
+      heldForms.delete(formID);
+      try {
+        child?.kill();
+      } catch (_) {}
+    };
+    const reportPlainly = (payload) => {
+      try {
+        const child = spawn(hookBinary(), ["hook", "--agent", "opencode"], { stdio: ["pipe", "ignore", "ignore"] });
+        child.on("error", () => {});
+        child.stdin?.on("error", () => {});
+        child.stdin?.end(JSON.stringify(payload));
+      } catch (_) {}
+    };
+    const replyToForm = async (answer) => {
+      const refused = (detail) => ({ delivered: false, detail: String(detail).slice(0, 200) });
+      if (answer?.kind !== "form" || typeof answer.request_id !== "string") return refused("the answer is not a form reply");
+      const input = { sessionID: answer.body?.sessionID, formID: answer.request_id, answer: answer.body?.answer ?? {} };
+      try {
+        const forms = api.data?.session?.form;
+        if (typeof forms?.reply === "function") await forms.reply(input);
+        else await api.client.session.form.reply(input);
+        return { delivered: true };
+      } catch (error) {
+        return refused(error?.message ?? "the reply could not be sent");
+      }
+    };
+    const holdForm = (form) => {
+      const formID = form?.id;
+      const sessionID = form?.sessionID;
+      if (typeof formID !== "string" || typeof sessionID !== "string" || !instance.active) return;
+      let root = sessionID;
+      try {
+        root = api.data?.session?.root?.(sessionID) || sessionID;
+      } catch (_) {}
+      const cwd = process.cwd();
+      const plain = { session_id: root, event: "question.asked", prompt: form.title ?? "", cwd, request_id: formID };
+      const payload = {
+        session_id: root,
+        event: "question.asked",
+        cwd,
+        properties: { id: formID, sessionID, title: form.title, form },
+      };
+      stopForm(formID);
+      settledForms.delete(formID);
+      let child;
+      try {
+        child = spawn(hookBinary(), ["await-answer", "--agent", "opencode", "--ack"], { stdio: ["pipe", "pipe", "ignore"] });
+      } catch (_) {
+        reportPlainly(plain);
+        return;
+      }
+      heldForms.set(formID, child);
+      let out = "";
+      let answered = false;
+      const failedEarly = (code, signal) => {
+        if (answered || heldForms.get(formID) !== child) return;
+        heldForms.delete(formID);
+        if (code !== 0 || signal) reportPlainly(plain);
+      };
+      child.stdin?.on("error", () => {});
+      child.stdout?.on("data", async (chunk) => {
+        if (answered) return;
+        out += chunk;
+        const newline = out.indexOf("\n");
+        if (newline < 0) return;
+        answered = true;
+        if (heldForms.get(formID) === child) heldForms.delete(formID);
+        let ack;
+        try {
+          ack = await replyToForm(JSON.parse(out.slice(0, newline)));
+        } catch (_) {
+          ack = { delivered: false, detail: "the deck's answer could not be read" };
+        }
+        try {
+          child.stdin?.end(JSON.stringify(ack) + "\n");
+        } catch (_) {}
+        if (!ack.delivered && instance.active && !settledForms.has(formID)) holdForm(form);
+      });
+      child.on("error", () => failedEarly(null, "error"));
+      child.on("close", (code, signal) => failedEarly(code, signal));
+      try {
+        child.stdin?.write(JSON.stringify(payload) + "\n");
+      } catch (_) {}
+    };
+    on("form.created", (data) => holdForm(data.form));
+    for (const type of ["form.replied", "form.cancelled"]) {
+      on(type, (data) => {
+        const formID = data.id ?? data.formID ?? data.form?.id;
+        if (typeof formID !== "string") return;
+        settledForms.add(formID);
+        if (settledForms.size > 256) settledForms.delete(settledForms.values().next().value);
+        stopForm(formID);
+      });
+    }
     for (const type of ["session.status", "session.idle"]) {
       on(type, (data) => {
         const idle = type === "session.idle" || data.status?.type === "idle";
@@ -3070,6 +3183,7 @@ const setup = async (api) => {
     receiver.start();
     return () => {
       instance.active = false;
+      for (const formID of [...heldForms.keys()]) stopForm(formID);
       for (const off of unsubscribe.splice(0)) {
         try {
           off();
@@ -10098,9 +10212,20 @@ const ctx = {
     /// as a standalone server's plugin, outside a deck pane.
     #[cfg(unix)]
     fn run_v2_driver(body: &str) -> Option<(Vec<serde_json::Value>, Vec<serde_json::Value>)> {
+        run_v2_driver_as(r#""serve", "--stdio""#, body)
+    }
+
+    /// [`run_v2_driver`], with the plugin process's own arguments `args` (a
+    /// JavaScript argument list): `"mini"` makes it read as `opencode mini`,
+    /// nothing as the full TUI, since the client mode is read from a process's
+    /// own arguments unless it is a `serve`.
+    fn run_v2_driver_as(
+        args: &str,
+        body: &str,
+    ) -> Option<(Vec<serde_json::Value>, Vec<serde_json::Value>)> {
         run_plugin_driver_with_awaits(
             &format!(
-                "{FAKE_V2_CTX_JS}\ndelete process.env.DOT_AGENT_DECK_PANE_ID;\ndelete process.env.DOT_AGENT_DECK_USAGE_FILE;\nprocess.argv.push(\"serve\", \"--stdio\");\nconst cleanup = await pluginModule.setup(ctx);\n{body}\nprocess.exit(0);\n"
+                "{FAKE_V2_CTX_JS}\ndelete process.env.DOT_AGENT_DECK_PANE_ID;\ndelete process.env.DOT_AGENT_DECK_USAGE_FILE;\nprocess.argv.push({args});\nconst cleanup = await pluginModule.setup(ctx);\n{body}\nprocess.exit(0);\n"
             ),
             &[],
         )
@@ -10241,7 +10366,9 @@ await sleep(50);"#,
     #[cfg(unix)]
     #[test]
     fn opencode_v2_setup_reports_blocked_prompts_and_forms() {
-        let Some((payloads, awaits)) = run_v2_driver(
+        // `opencode mini`: no TUI plugin, so the server plugin reports forms.
+        let Some((payloads, awaits)) = run_v2_driver_as(
+            r#""mini""#,
             r#"await sleep(50);
 await emit("session.created", { sessionID: "s1", location: { directory: "/work" }, slug: "a", version: "2.2.5" });
 await emit("permission.asked", { id: "per-1", sessionID: "s1", action: "bash", resources: ["rm -rf build"], save: ["rm *"], metadata: { command: "rm -rf build" }, source: { type: "tool", messageID: "a1", id: "call-9" } });
@@ -10277,7 +10404,10 @@ await emit("form.cancelled", { id: "form-2", sessionID: "s1" });"#,
             .filter(|p| p["event"] == "question.asked")
             .collect();
         assert_eq!(asked.len(), 2, "{payloads:#?}");
-        assert_eq!(asked[0]["prompt"], "Which branch?");
+        assert_eq!(
+            asked[0]["prompt"],
+            "answer this form in OpenCode: Which branch?"
+        );
         assert!(
             asked[0].get("properties").is_none(),
             "a form is shown, not held"
@@ -10551,6 +10681,149 @@ process.exit(0);
         let written = std::fs::read_to_string(&controls).unwrap_or_default();
         assert!(written.contains("\"handed\""), "{written}");
         assert!(written.contains("\"committed\""), "{written}");
+    }
+
+    /// Scenario: OpenCode 2's TUI half, driven with a fake 2.x TUI context,
+    /// sees a question form created in a subagent's session. It hands the form
+    /// to `await-answer --ack` under the root session, replies with the deck's
+    /// answer through `data.session.form.reply`, and acknowledges OpenCode's
+    /// outcome to the child; a second form that OpenCode reports answered
+    /// before the deck does stops its child (PRD #2050, rule 20).
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_tui_holds_a_form_and_replies_with_the_decks_answer() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let awaits = dir.path().join("awaits.log");
+        let acks = dir.path().join("acks.log");
+        let recorder = dir.path().join("recorder.sh");
+        crate::test_isolation::write_script(
+            &recorder,
+            format!(
+                r#"#!/bin/sh
+echo "call $*" >> '{calls}'
+if [ "$1" = "await-answer" ]; then
+  IFS= read -r input
+  printf '%s\n' "$input" >> '{awaits}'
+  case "$input" in
+    *frm_1*)
+      printf '%s\n' '{{"kind":"form","request_id":"frm_1","body":{{"sessionID":"child","answer":{{"ok":true}}}}}}'
+      IFS= read -r ack
+      printf '%s\n' "$ack" >> '{acks}';;
+    *) exec sleep 37;;
+  esac
+  exit 0
+fi
+cat > /dev/null
+exit 0
+"#,
+                awaits = awaits.display(),
+                acks = acks.display(),
+                calls = dir.path().join("calls.log").display(),
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let plugin = dir.path().join("tui.mjs");
+        std::fs::write(&plugin, tui_v2_template(&recorder.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                r#"import {{ execSync }} from "child_process";
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const replies = [];
+const handlers = new Map();
+const api = {{
+  data: {{
+    session: {{
+      get: (id) => ({{ id }}),
+      root: (id) => (id === "child" ? "rootA" : id),
+      form: {{ reply: async (input) => {{ replies.push(input); }} }},
+    }},
+    on: (type, fn) => {{ handlers.set(type, fn); return () => handlers.delete(type); }},
+  }},
+  keymap: {{ mode: {{ current: () => "base" }} }},
+  ui: {{ router: {{ current: () => ({{ type: "home" }}), navigate: () => {{}} }} }},
+  client: {{ session: {{ create: async () => ({{ id: "x" }}), prompt: async () => ({{}}) }} }},
+}};
+const {{ default: mod }} = await import("{plugin}");
+const cleanup = await mod.setup(api);
+const emit = (type, data) => handlers.get(type)?.({{ type, data }});
+emit("form.created", {{ form: {{ id: "frm_1", sessionID: "child", title: "Go?", fields: [{{ key: "ok", type: "boolean" }}] }} }});
+for (let n = 0; n < 200 && !replies.length; n++) await sleep(20);
+emit("form.created", {{ form: {{ id: "frm_2", sessionID: "rootA", title: "Later", fields: [{{ key: "x", type: "string" }}] }} }});
+await sleep(400);
+emit("form.replied", {{ id: "frm_2", sessionID: "rootA", answer: {{ x: "typed" }} }});
+await sleep(400);
+const sleepers = execSync("ps -eo args").toString().split(String.fromCharCode(10)).filter((l) => l.includes("sleep 37")).length;
+cleanup?.();
+console.log(JSON.stringify({{ replies, sleepers }}));
+process.exit(0);
+"#,
+                plugin = plugin.display()
+            ),
+        )
+        .unwrap();
+        let result = run_inbox_driver(&driver);
+        assert_eq!(
+            result["replies"],
+            serde_json::json!([{"sessionID": "child", "formID": "frm_1", "answer": {"ok": true}}]),
+            "{result}; recorder calls: {:?}",
+            std::fs::read_to_string(dir.path().join("calls.log")),
+        );
+        let awaited: Vec<serde_json::Value> = std::fs::read_to_string(&awaits)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(awaited.len(), 2, "{awaited:?}");
+        assert_eq!(awaited[0]["event"], "question.asked");
+        assert_eq!(awaited[0]["session_id"], "rootA", "filed under the root");
+        assert_eq!(awaited[0]["properties"]["id"], "frm_1");
+        assert_eq!(awaited[0]["properties"]["sessionID"], "child");
+        assert_eq!(
+            awaited[0]["properties"]["form"]["fields"][0]["type"],
+            "boolean"
+        );
+        let acked = std::fs::read_to_string(&acks).unwrap_or_default();
+        assert!(acked.contains("\"delivered\":true"), "{acked}");
+        assert_eq!(
+            result["sleepers"], 0,
+            "the answered form's child was stopped: {result}"
+        );
+    }
+
+    /// Scenario: in the full TUI the server plugin leaves a new form to the
+    /// TUI half (which holds it), and still reports the form's reply and
+    /// cancellation so the card clears (PRD #2050). Under `opencode mini` it
+    /// reports it itself (`opencode_v2_setup_reports_blocked_prompts_and_forms`).
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_server_leaves_a_new_form_to_the_tui_half_in_the_full_tui() {
+        let Some((payloads, awaits)) = run_v2_driver_as(
+            "",
+            r#"await sleep(50);
+await emit("session.created", { sessionID: "s1", location: { directory: "/work" }, slug: "a", version: "2.2.5" });
+await emit("form.created", { form: { id: "form-1", sessionID: "s1", title: "Which branch?", fields: [] } });
+await emit("form.replied", { id: "form-1", sessionID: "s1", answer: {} });
+await sleep(200);"#,
+        ) else {
+            return;
+        };
+        assert!(awaits.is_empty(), "{awaits:?}");
+        let events: Vec<_> = payloads
+            .iter()
+            .map(|p| p["event"].as_str().unwrap_or(""))
+            .collect();
+        assert!(!events.contains(&"question.asked"), "{payloads:#?}");
+        assert!(events.contains(&"question.replied"), "{payloads:#?}");
     }
 
     /// The event stream real OpenCode 2.2.5 sends (measured with `opencode
