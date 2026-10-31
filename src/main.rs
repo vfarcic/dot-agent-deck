@@ -286,11 +286,11 @@ enum Commands {
         #[arg(long, value_name = "NAME", conflicts_with = "name")]
         orchestration: Option<String>,
         /// Only the standalone agents with this name (the NAME column).
-        #[arg(long, value_name = "NAME")]
+        #[arg(long, value_name = "NAME", allow_hyphen_values = true)]
         name: Option<String>,
         /// Only the standalone agent or orchestrator in this pane (the PANE
         /// column).
-        #[arg(long, value_name = "PANE")]
+        #[arg(long, value_name = "PANE", allow_hyphen_values = true)]
         pane: Option<String>,
     },
     /// Acknowledge a message the deck delivered to you (`m-…`). Exits non-zero
@@ -912,11 +912,12 @@ enum InboxAction {
         orchestration: Option<String>,
         /// The standalone agent with this name (the NAME column of
         /// `dot-agent-deck roles`), such as one of two in the same folder.
-        #[arg(long, value_name = "NAME")]
+        /// A name may start with `-`.
+        #[arg(long, value_name = "NAME", allow_hyphen_values = true)]
         name: Option<String>,
         /// The standalone agent, or orchestration's orchestrator, in this pane
         /// (the PANE column of `dot-agent-deck roles`). Never a worker.
-        #[arg(long, value_name = "PANE")]
+        #[arg(long, value_name = "PANE", allow_hyphen_values = true)]
         pane: Option<String>,
         #[command(flatten)]
         body: InboxBody,
@@ -4424,6 +4425,65 @@ mod tests {
     /// `dispatch --orchestration my-unit --task "…"` bound the UNIT NAME as the
     /// orchestration and aborted for a missing positional. A required value makes
     /// both orderings unambiguous.
+    /// Issue #2053 (Qodo and Greptile on PR #2055): an agent's name may start
+    /// with `-`, so `--name` and `--pane` take such a value whether it is
+    /// typed as the next word or as `--name=…`, the form the reply command the
+    /// deck prints uses.
+    #[test]
+    fn name_and_pane_take_a_value_that_starts_with_a_hyphen() {
+        for argv in [
+            &[
+                "dot-agent-deck",
+                "inbox",
+                "send",
+                "--name",
+                "-docs",
+                "--text",
+                "t",
+            ][..],
+            &[
+                "dot-agent-deck",
+                "inbox",
+                "send",
+                "--folder=/w",
+                "--name=--builder",
+                "--text",
+                "t",
+            ],
+            &[
+                "dot-agent-deck",
+                "inbox",
+                "send",
+                "--pane",
+                "-p",
+                "--text",
+                "t",
+            ],
+            &["dot-agent-deck", "roles", "--name", "-docs", "--pane", "-p"],
+        ] {
+            let parsed = Cli::try_parse_from(argv.iter().copied());
+            let (name, pane) = match parsed.map(|cli| cli.command) {
+                Ok(Some(Commands::Inbox {
+                    action: InboxAction::Send { name, pane, .. },
+                })) => (name, pane),
+                Ok(Some(Commands::Roles { name, pane, .. })) => (name, pane),
+                Ok(_) => panic!("{argv:?}: parsed as another command"),
+                Err(error) => panic!("{argv:?}: {error}"),
+            };
+            let given = |flag: &str| {
+                argv.iter()
+                    .position(|a| *a == flag)
+                    .map(|i| argv[i + 1].to_string())
+                    .or_else(|| {
+                        argv.iter()
+                            .find_map(|a| a.strip_prefix(&format!("{flag}=")).map(str::to_string))
+                    })
+            };
+            assert_eq!(name, given("--name"), "{argv:?}");
+            assert_eq!(pane, given("--pane"), "{argv:?}");
+        }
+    }
+
     #[test]
     fn orchestration_value_is_required_so_it_cannot_eat_the_unit_name() {
         // Flag-first with a name still binds correctly: `probe` is the VALUE, and

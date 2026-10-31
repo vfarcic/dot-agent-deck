@@ -340,7 +340,7 @@ fn a_reply_to_one_of_two_standalone_agents_in_a_folder_names_it() {
     assert_eq!(reply, address(Some("/w/deck"), Some("dispatcher"), None));
     let text = attribution(Some(caller), "p-d", Some(&reply));
     assert!(
-        text.contains("reply with: dot-agent-deck inbox send --folder /w/deck --name dispatcher --text '<your reply>'"),
+        text.contains("reply with: dot-agent-deck inbox send --folder /w/deck --name=dispatcher --text '<your reply>'"),
         "{text}"
     );
     // A folder alone is still preferred when it reaches the sender alone.
@@ -350,4 +350,27 @@ fn a_reply_to_one_of_two_standalone_agents_in_a_folder_names_it() {
         .unwrap();
     let reply = reply_address(&records, &as_spelled, lone, "p-seat").expect("a reply address");
     assert_eq!(reply, address(Some("/w/elsewhere"), None, None));
+}
+
+/// Qodo and Greptile on PR #2055: a name may start with `-`, so the reply
+/// command prints it as one argv word, `--name=<name>`, which the CLI never
+/// reads as a flag; and that address still reaches the sender alone.
+#[test]
+fn a_reply_to_a_sender_whose_name_starts_with_a_hyphen_is_one_argv_word() {
+    let mut records = records();
+    records.push(record("p-dash", "--builder", "/w/deck", None));
+    let sender = records.last().unwrap().clone();
+    let reply = reply_address(&records, &as_spelled, &sender, "p-seat").expect("a reply address");
+    assert_eq!(reply, address(Some("/w/deck"), Some("--builder"), None));
+    let text = attribution(Some(&sender), "p-dash", Some(&reply));
+    assert!(
+        text.contains("inbox send --folder /w/deck --name=--builder --text"),
+        "{text}"
+    );
+    assert_eq!(
+        resolve(&records, &reply, &as_spelled, "p-seat")
+            .map(|r| r.target().id.clone())
+            .unwrap(),
+        "agent-p-dash"
+    );
 }

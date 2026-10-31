@@ -315,7 +315,7 @@ fn orchestration_address_006_name_and_pane_reach_one_of_two_standalone_agents() 
         .lines()
         .find_map(|line| line.trim().strip_prefix("reply with: "))
         .unwrap_or_else(|| panic!("no reply command in the delivered message\n{message}"));
-    assert!(reply.contains("--name caller"), "{reply}");
+    assert!(reply.contains("--name=caller"), "{reply}");
     let words = shell_words(reply.replace("'<your reply>'", "REPLY_2053_e5").as_str());
     assert_eq!(words[0], "dot-agent-deck");
     let args: Vec<&str> = words[1..].iter().map(String::as_str).collect();

@@ -802,10 +802,12 @@ pub fn attribution(
             let named = orchestration
                 .as_deref()
                 .map(|name| format!(" --orchestration {}", quote(name)))
+                // One argv word, so a name that starts with `-` is not read as a
+                // flag (Qodo and Greptile on PR #2055).
                 .or_else(|| {
                     agent
                         .as_deref()
-                        .map(|name| format!(" --name {}", quote(name)))
+                        .map(|name| format!(" --name={}", quote(name)))
                 })
                 .unwrap_or_default();
             format!(
@@ -1578,7 +1580,7 @@ mod tests {
             assert_eq!(
                 reply_line(&body),
                 format!(
-                    "reply with: dot-agent-deck inbox send --folder {caller_dir} --name name-solo \
+                    "reply with: dot-agent-deck inbox send --folder {caller_dir} --name=name-solo \
                      --text '<your reply>'"
                 ),
                 "{caller_dir}: {body}"
