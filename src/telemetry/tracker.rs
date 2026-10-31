@@ -1017,7 +1017,7 @@ impl RunTracker {
                 self.replaced.push(ReplacedRun { run: old, at: now });
                 if self.replaced.len() > MAX_REPLACED_RUNS {
                     let oldest = self.replaced.remove(0);
-                    self.finish(oldest.run, EndReason::Unknown, None, oldest.at);
+                    self.retire_unended(oldest);
                 }
             } else {
                 self.finish(old, EndReason::Unknown, None, now);
@@ -1635,8 +1635,20 @@ impl RunTracker {
             .partition(|r| now.saturating_sub(r.at) >= REPLACED_RUN_GRACE_NANOS);
         self.replaced = waiting;
         for r in expired {
-            self.finish(r.run, EndReason::Unknown, None, r.at);
+            self.retire_unended(r);
         }
+    }
+
+    /// End replaced run `r`, whose own end did not come, as
+    /// [`EndReason::Unknown`] at the time it was replaced, and forget its
+    /// generation's note ([`EndedByThemselves`]): with its run gone there is
+    /// nothing left for the note to keep open, and the end that would have
+    /// forgotten it may never come.
+    fn retire_unended(&mut self, r: ReplacedRun) {
+        if let Some(agent_id) = r.run.start_info.agent_id.clone() {
+            self.forget_ended_by_itself(&agent_id);
+        }
+        self.finish(r.run, EndReason::Unknown, None, r.at);
     }
 
     /// Finish `run`'s spans: its held-back input counted, its open status
@@ -3262,6 +3274,50 @@ pub(crate) mod tests {
             (AttrValue::Str("closed".into()), 14),
             "a generation nothing noted still ends with its close"
         );
+    }
+
+    /// Issue #2028 (review U3): a noted generation whose own end never comes
+    /// loses its note when its replaced run is retired without it, once its
+    /// grace passes or when too many runs wait, and a still-waiting
+    /// generation's note is kept.
+    #[test]
+    fn a_retired_replaced_run_takes_its_note_with_it() {
+        let mut tracker = RunTracker::new();
+        let noted = tracker.ended_by_themselves();
+        let is_noted = |agent_id: &str| noted.lock().unwrap().contains(agent_id);
+
+        // Grace expiry.
+        tracker.begin_run(generation("p1", "a1"), 0);
+        tracker.begin_run(generation("p1", "a2"), 10);
+        noted.lock().unwrap().insert("a1".into());
+        tracker.end_agent_run(
+            "p2",
+            Some("x"),
+            EndReason::Exited,
+            None,
+            10 + REPLACED_RUN_GRACE_NANOS,
+        );
+        assert_eq!(
+            end_of(&tracker.take_finished(), "run-p1-a1"),
+            (AttrValue::Str("unknown".into()), 10)
+        );
+        assert!(!is_noted("a1"), "the expired run took its note with it");
+
+        // Capacity eviction: the oldest waiting run goes, and its note with
+        // it; a later one, still waiting, keeps its own.
+        let now = 20 + REPLACED_RUN_GRACE_NANOS;
+        for n in 0..=MAX_REPLACED_RUNS {
+            tracker.begin_run(generation("p3", &format!("c{n}")), now);
+        }
+        noted.lock().unwrap().insert("c0".into());
+        noted.lock().unwrap().insert("c1".into());
+        tracker.begin_run(generation("p3", "last"), now);
+        assert_eq!(
+            end_of(&tracker.take_finished(), "run-p3-c0"),
+            (AttrValue::Str("unknown".into()), now)
+        );
+        assert!(!is_noted("c0"), "the evicted run took its note with it");
+        assert!(is_noted("c1"), "a run still waiting keeps its note");
     }
 
     /// Qodo item 18: a replaced run whose own end never arrives is still

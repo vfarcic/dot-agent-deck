@@ -2835,6 +2835,70 @@ async fn run_exporter(mut sender: Sender, mut rx: mpsc::Receiver<ExportMsg>) {
     }
 }
 
+/// Issue #2028 test seam, for tests outside this module: an exporting
+/// telemetry handle whose finished spans land in the returned
+/// [`CapturedSpans`] instead of an HTTP exporter, with its per-run files in
+/// `config_dir`. Needs a tokio runtime, as the daemon's does.
+#[cfg(all(test, unix))]
+pub(crate) fn capturing_for_test(config_dir: PathBuf) -> (Arc<Telemetry>, CapturedSpans) {
+    let (sink, rx) = mpsc::channel(QUEUE_CAPACITY);
+    let env: EnvMap = [(
+        "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
+        "http://127.0.0.1:9".to_string(),
+    )]
+    .into_iter()
+    .collect();
+    let telemetry = Telemetry::start_with(
+        &env,
+        Settings {
+            config_dir: Some(config_dir),
+            sink: Some(sink),
+            ..Settings::default()
+        },
+    );
+    assert!(telemetry.is_exporting());
+    (Arc::new(telemetry), CapturedSpans(rx))
+}
+
+/// The spans a [`capturing_for_test`] handle finished.
+#[cfg(all(test, unix))]
+pub(crate) struct CapturedSpans(mpsc::Receiver<ExportMsg>);
+
+#[cfg(all(test, unix))]
+impl CapturedSpans {
+    /// How each `agent.run` on `pane_id` that reached the sink since the last
+    /// call ended: its end reason and its exit code, if it has one.
+    pub(crate) fn run_ends(&mut self, pane_id: &str) -> Vec<(String, Option<i64>)> {
+        use super::AttrKey;
+        use super::span::AttrValue;
+        let mut ends = Vec::new();
+        while let Ok(msg) = self.0.try_recv() {
+            let ExportMsg::Span(span) = msg else {
+                continue;
+            };
+            let value = |key: AttrKey| {
+                span.attributes
+                    .iter()
+                    .find(|a| a.key == key)
+                    .map(|a| a.value.clone())
+            };
+            if span.name != super::SPAN_AGENT_RUN
+                || value(AttrKey::PaneId) != Some(AttrValue::Str(pane_id.to_string()))
+            {
+                continue;
+            }
+            if let Some(AttrValue::Str(reason)) = value(AttrKey::EndReason) {
+                let code = match value(AttrKey::ExitCode) {
+                    Some(AttrValue::Int(code)) => Some(code),
+                    _ => None,
+                };
+                ends.push((reason, code));
+            }
+        }
+        ends
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

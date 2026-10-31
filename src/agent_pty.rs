@@ -2855,9 +2855,24 @@ const TERMINATION_WAIT: Duration = Duration::from_millis(200);
 pub(crate) struct RemovalEvidence {
     removal: AtomicU8,
     /// Issue #2028: the child's exit status as the close or respawn that
-    /// removed the generation reaped it, so an exit the reader saw before the
-    /// removal keeps its code.
+    /// removed the generation found it, so an exit the reader saw before the
+    /// removal keeps its code. Set in the lock hold that removes the record
+    /// when the child had exited by then ([`Self::note_child_at_removal`]),
+    /// and otherwise once the remover reaped it ([`Self::record_reaped`]).
     reaped: std::sync::OnceLock<portable_pty::ExitStatus>,
+    /// Issue #2028 (review): what the record knew of its child when a close
+    /// or respawn removed it, so a generation that ended by itself is still
+    /// told by its own child after the removal.
+    child_at_removal: std::sync::OnceLock<RemovedChild>,
+}
+
+/// What a removed generation's record knew of its child
+/// ([`RemovalEvidence::note_child_at_removal`]).
+#[derive(Debug, Clone)]
+struct RemovedChild {
+    role: ChildRole,
+    /// The wrapper's report of the command it ran, if it gave one.
+    report: Option<String>,
 }
 
 /// What [`RemovalEvidence`] records.
@@ -2911,7 +2926,27 @@ impl RemovalEvidence {
         );
     }
 
-    /// The remover reaped `child`: its status, once it has one.
+    /// Issue #2028 (review): called in the lock hold that removes the
+    /// generation's record, so its reader, which reads the record under that
+    /// lock, finds either the record or this: the child's status when it has
+    /// already exited, and its role and wrapper report.
+    fn note_child_at_removal(
+        &self,
+        child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+        role: ChildRole,
+        report: Option<String>,
+    ) {
+        self.record_reaped(child);
+        let _ = self.child_at_removal.set(RemovedChild { role, report });
+    }
+
+    /// What [`Self::note_child_at_removal`] kept of the child.
+    fn child_at_removal(&self) -> Option<RemovedChild> {
+        self.child_at_removal.get().cloned()
+    }
+
+    /// The remover reaped `child`: its status, once it has one. The first
+    /// status recorded stands.
     fn record_reaped(&self, child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
         if let Ok(Some(status)) = child.try_wait() {
             let _ = self.reaped.set(status);
@@ -3166,6 +3201,21 @@ fn pump_reader(
     if let Some(gate) = exit_gate {
         gate.hold(&agent_id);
     }
+    // And its unit-test counterpart (see
+    // [`AgentPtyRegistry::hold_exit_telemetry_for_test`]).
+    #[cfg(test)]
+    if let Some(registry) = registry.upgrade() {
+        let hold = registry
+            .exit_telemetry_holds
+            .lock()
+            .unwrap()
+            .remove(&agent_id);
+        drop(registry);
+        if let Some((reached, release)) = hold {
+            let _ = reached.send(());
+            let _ = release.recv();
+        }
+    }
     // PRD #1741: this generation's telemetry run ends with its PTY.
     if let Some(registry) = registry.upgrade() {
         crate::telemetry::agent_exited(
@@ -3174,15 +3224,7 @@ fn pump_reader(
             &agent_id,
             registry.is_shutting_down(),
             registered_at_eof,
-            // Issue #2028: once a close or respawn removed the record, the
-            // status it reaped.
-            || {
-                let mut inner = registry.inner.lock();
-                match inner.agents.get_mut(&agent_id) {
-                    Some(agent) => agent.child.try_wait().ok()?,
-                    None => removal.reaped(),
-                }
-            },
+            || registry.exit_status_after_eof(&agent_id, &removal),
         );
     }
     // PRD #1666 part 3, round 5-wake (plan rev 2 §6): what the deck observed
@@ -8156,6 +8198,16 @@ pub struct AgentPtyRegistry {
     /// Test-only pauses before a generation's termination observation starts.
     #[cfg(test)]
     termination_holds: Mutex<HashMap<String, StdPause>>,
+    /// Issue #2028 test seam: closes that wait after removing a generation's
+    /// record and before terminating and reaping its child — see
+    /// [`Self::hold_close_before_reap_for_test`].
+    #[cfg(test)]
+    close_reap_holds: Mutex<HashMap<String, StdPause>>,
+    /// Issue #2028 test seam: readers that wait, once their generation's exit
+    /// is published and before its telemetry run ends — see
+    /// [`Self::hold_exit_telemetry_for_test`].
+    #[cfg(test)]
+    exit_telemetry_holds: Mutex<HashMap<String, StdPause>>,
     /// PRD #1666 §2.8 test seam: panes whose next published generation waits
     /// before handing the inbox over — see [`Self::hold_next_handover_for_test`].
     #[cfg(test)]
@@ -10264,6 +10316,10 @@ impl AgentPtyRegistry {
             terminations: Mutex::new(HashMap::new()),
             #[cfg(test)]
             termination_holds: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            close_reap_holds: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            exit_telemetry_holds: Mutex::new(HashMap::new()),
             #[cfg(test)]
             handover_holds: Mutex::new(HashMap::new()),
             #[cfg(test)]
@@ -12830,6 +12886,23 @@ impl AgentPtyRegistry {
             .map(|agent| Arc::clone(&agent.ingress))
     }
 
+    /// Issue #2028: generation `agent_id`'s child's exit status, for its
+    /// reader's telemetry: the record's while the registry holds it, and once
+    /// a close or respawn removed it, the status that removal found, in the
+    /// same lock hold, or later reaped. Read under the registry lock, so a
+    /// child that had exited by its removal is never missed in between.
+    fn exit_status_after_eof(
+        &self,
+        agent_id: &str,
+        removal: &RemovalEvidence,
+    ) -> Option<portable_pty::ExitStatus> {
+        let mut inner = self.inner.lock();
+        match inner.agents.get_mut(agent_id) {
+            Some(agent) => agent.child.try_wait().ok().flatten(),
+            None => removal.reaped(),
+        }
+    }
+
     /// PRD #1666 part 3, round 5-wake (plan rev 2 §6): what ended
     /// `agent_id`'s output. A generation the registry still held at its EOF
     /// (`registered_at_eof`) ended on its own: its child's status, polled for
@@ -12866,12 +12939,17 @@ impl AgentPtyRegistry {
     /// [`TERMINATION_WAIT`]: a wrapper's report of the command it ran wins
     /// over the wrapper's own status, which is used, as the deck's, only when
     /// no report came by the bound; a pane command's status is the deck's.
-    /// Neither by the bound is the connection ending. A generation removed
-    /// first was replaced when the respawn that removed it published its
-    /// successor, closed when a close or shutdown removed it, pending while
-    /// the respawn has done neither by the bound, and failed once it returned
-    /// without a successor. The bound is one [`TERMINATION_WAIT`] for the
-    /// whole capture, removal included.
+    /// Neither by the bound is the connection ending. A close or respawn
+    /// that removes such a generation, before the poll or during it, changes
+    /// none of this (issue #2028): what the record knew of its child at the
+    /// removal, and the status the removal found or reaped, stand in for the
+    /// record. A generation removed before its stream ended was replaced when
+    /// the respawn that removed it published its successor, closed when a
+    /// close or shutdown removed it, pending while the respawn has done
+    /// neither by the bound, and failed once it returned without a successor;
+    /// so is one that ended by itself and that a shutdown drain then removed.
+    /// The bound is one [`TERMINATION_WAIT`] for the whole capture, removal
+    /// included.
     fn observe_termination(
         &self,
         agent_id: &str,
@@ -12895,6 +12973,16 @@ impl AgentPtyRegistry {
                         (status, agent.child_role, agent.wrapper_child_exit.clone())
                     })
                 };
+                // Removed after its own end: the removal's account of the
+                // child (written in the hold that removed the record, so it
+                // is there once the record is not). Only a shutdown drain
+                // removes a record without one, and it reads as closed below.
+                let seen = seen.or_else(|| {
+                    removal.child_at_removal().map(|child| {
+                        let status = exited.is_none().then(|| removal.reaped()).flatten();
+                        (status, child.role, child.report)
+                    })
+                });
                 let Some((status, role, report)) = seen else {
                     break;
                 };
@@ -14722,11 +14810,17 @@ impl AgentPtyRegistry {
         let mut closed_pane = None;
         let mut agent = {
             let mut inner = self.inner.lock();
-            let agent = inner
+            let mut agent = inner
                 .agents
                 .remove(id)
                 .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
             agent.removal.closed();
+            // Issue #2028 (review): in the removing hold, so a reader that no
+            // longer finds the record finds what it knew of its child.
+            let report = agent.wrapper_child_exit.clone();
+            agent
+                .removal
+                .note_child_at_removal(&mut agent.child, agent.child_role, report);
             // Before the pane-state lock below — see [`PaneWriter::retired`].
             agent.pane_retired.store(true, Ordering::SeqCst);
             // PRD #1666 part 3, round 5-wake: the retired generation's ledger
@@ -14756,6 +14850,14 @@ impl AgentPtyRegistry {
         // Outside the registry lock: the hub takes its own.
         if let Some(pane) = closed_pane {
             self.inbox().forget_pane_history(&pane);
+        }
+        #[cfg(test)]
+        {
+            let hold = self.close_reap_holds.lock().unwrap().remove(id);
+            if let Some((reached, release)) = hold {
+                let _ = reached.send(());
+                let _ = release.recv();
+            }
         }
         crate::platform::proc::terminate_child_with_grace_and_wait(
             &mut agent.child,
@@ -15034,7 +15136,7 @@ impl AgentPtyRegistry {
             if inner.closing_generations.contains(&agent_id) {
                 return Err(AgentPtyError::Spawn(GENERATION_CLOSING_REASON.into()));
             }
-            let removed = inner
+            let mut removed = inner
                 .agents
                 .remove(&agent_id)
                 .expect("agent_id was just located inside the same lock hold");
@@ -15042,6 +15144,11 @@ impl AgentPtyRegistry {
             // PRD #1666 part 3, round 5-wake: under the lock hold that lifts the
             // record out; the ticket settles it.
             removed.removal.respawning();
+            // Issue #2028 (review): and what the record knew of its child.
+            let report = removed.wrapper_child_exit.clone();
+            removed
+                .removal
+                .note_child_at_removal(&mut removed.child, removed.child_role, report);
             // Issue #542: the old generation's launcher standing leaves with
             // it. The pane-keyed clocks stay — the pane is not going away, and
             // `spawn_agent` resets what a new occupant must not inherit. The
@@ -19263,6 +19370,42 @@ impl AgentPtyRegistry {
                 return Err(RespawnsInFlight);
             }
         }
+    }
+
+    /// Issue #2028 test seam: the next close of `agent_id` reports (on the
+    /// returned receiver) once it removed the record and released the
+    /// registry lock, then waits for the returned sender to send or drop
+    /// before it terminates and reaps the child.
+    #[cfg(all(test, unix))]
+    pub(crate) fn hold_close_before_reap_for_test(
+        &self,
+        agent_id: &str,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        self.close_reap_holds
+            .lock()
+            .unwrap()
+            .insert(agent_id.to_string(), (reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
+    /// Issue #2028 test seam, the unit tests' counterpart of the e2e exit
+    /// gate: `agent_id`'s reader, once its exit is published and before its
+    /// telemetry run ends, reports on the returned receiver and waits for the
+    /// returned sender to send or drop. It holds no registry lock meanwhile.
+    #[cfg(all(test, unix))]
+    pub(crate) fn hold_exit_telemetry_for_test(
+        &self,
+        agent_id: &str,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        self.exit_telemetry_holds
+            .lock()
+            .unwrap()
+            .insert(agent_id.to_string(), (reached_tx, release_rx));
+        (reached_rx, release_tx)
     }
 
     /// PRD #1666 §2.8 (auditor R9S-A01) test seam: when `agent_id`'s reader
@@ -31570,6 +31713,150 @@ mod spawn_tests {
             Some(7),
             "the close must keep the code of the exit it reaped"
         );
+    }
+
+    /// Issue #2028 (review U2): spawn `sh -c 'sleep 1; exit 7'` on `pane`
+    /// with telemetry capturing, and hold its reader once its exit is
+    /// published and before its telemetry run ends. Returns the agent, its
+    /// removal evidence, and the hold's release, once the reader reached it.
+    async fn natural_exit_held_before_telemetry(
+        registry: &Arc<AgentPtyRegistry>,
+        pane: &str,
+    ) -> (String, Arc<RemovalEvidence>, std::sync::mpsc::Sender<()>) {
+        let agent = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("sh -c 'sleep 1; exit 7'"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn a naturally-exiting agent");
+        let (reached, release) = registry.hold_exit_telemetry_for_test(&agent);
+        let removal = Arc::clone(&registry.inner.lock().agents[&agent].removal);
+        tokio::task::spawn_blocking(move || {
+            reached
+                .recv_timeout(Duration::from_secs(20))
+                .expect("the reader reached its exit telemetry")
+        })
+        .await
+        .unwrap();
+        assert!(
+            registry.is_agent_still_registered(&agent),
+            "test prerequisite: the generation ended by itself"
+        );
+        (agent, removal, release)
+    }
+
+    /// How the first run to end on `pane` ended, once one has.
+    async fn first_run_end(
+        telemetry: &crate::telemetry::Telemetry,
+        spans: &mut crate::telemetry::exporter::CapturedSpans,
+        pane: &str,
+    ) -> (String, Option<i64>) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            telemetry.settled().await;
+            if let Some(end) = spans.run_ends(pane).into_iter().next() {
+                return end;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no run ended on {pane}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Scenario: An agent exits with code 7 by itself, and a close removes its pane while the agent's reader is still on its way to ending the telemetry run. The close is held after it removed the agent and before it terminates and reaps the child, past the reader's exit-code wait; the run must still end as exited with code 7.
+    #[spec("telemetry/otlp/010")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn otlp_010_a_close_held_before_its_reap_keeps_the_exit_code() {
+        let config = tempfile::tempdir().expect("telemetry config dir");
+        let (telemetry, mut spans) =
+            crate::telemetry::exporter::capturing_for_test(config.path().to_path_buf());
+        let registry = Arc::new(AgentPtyRegistry::new());
+        registry.set_telemetry(Arc::clone(&telemetry));
+        let pane = "exit-code-close-pane";
+        let (agent, removal, release_reader) =
+            natural_exit_held_before_telemetry(&registry, pane).await;
+        let (close_reached, release_close) = registry.hold_close_before_reap_for_test(&agent);
+        let closer = std::thread::spawn({
+            let registry = Arc::clone(&registry);
+            let agent = agent.clone();
+            move || registry.close_agent(&agent)
+        });
+        tokio::task::spawn_blocking(move || {
+            close_reached
+                .recv_timeout(Duration::from_secs(20))
+                .expect("the close removed the record")
+        })
+        .await
+        .unwrap();
+        assert!(!registry.is_agent_still_registered(&agent));
+        let looked_up = registry
+            .exit_status_after_eof(&agent, &removal)
+            .map(|status| status.exit_code());
+        release_reader.send(()).expect("release the reader");
+        let end = first_run_end(&telemetry, &mut spans, pane).await;
+        release_close.send(()).expect("release the close");
+        closer.join().unwrap().expect("close");
+        assert_eq!(end, ("exited".to_string(), Some(7)));
+        assert_eq!(
+            looked_up,
+            Some(7),
+            "the removal itself keeps the status of a child that had exited"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Scenario: An agent exits with code 7 by itself, and a respawn of its pane removes it before its reader ends the telemetry run. Once with the respawn held after the removal and before it terminates and reaps the old child, and once with the respawn finished and the successor's run open first; the old run must end as exited with code 7 either way.
+    #[spec("telemetry/otlp/010")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn otlp_010_a_respawn_after_a_natural_exit_keeps_the_exit_code() {
+        let config = tempfile::tempdir().expect("telemetry config dir");
+        let (telemetry, mut spans) =
+            crate::telemetry::exporter::capturing_for_test(config.path().to_path_buf());
+        let registry = Arc::new(AgentPtyRegistry::new());
+        registry.set_telemetry(Arc::clone(&telemetry));
+
+        // Held between the removal and the reap.
+        let pane = "exit-code-respawn-held-pane";
+        let (agent, removal, release_reader) =
+            natural_exit_held_before_telemetry(&registry, pane).await;
+        let (respawn_reached, release_respawn) = registry.pause_next_respawn_for_test();
+        let respawn = tokio::spawn({
+            let registry = Arc::clone(&registry);
+            async move { registry.respawn_agent_for_pane(pane, "sleep 30").await }
+        });
+        respawn_reached
+            .await
+            .expect("the respawn removed the record");
+        assert!(!registry.is_agent_still_registered(&agent));
+        let looked_up = registry
+            .exit_status_after_eof(&agent, &removal)
+            .map(|status| status.exit_code());
+        release_reader.send(()).expect("release the reader");
+        let end = first_run_end(&telemetry, &mut spans, pane).await;
+        release_respawn.send(()).expect("release the respawn");
+        let successor = respawn.await.unwrap().expect("respawn");
+        assert_ne!(successor, agent);
+        assert_eq!(end, ("exited".to_string(), Some(7)));
+        assert_eq!(looked_up, Some(7));
+
+        // Finished first: the old run is replaced when its own end comes.
+        let pane = "exit-code-respawn-done-pane";
+        let (agent, _removal, release_reader) =
+            natural_exit_held_before_telemetry(&registry, pane).await;
+        let successor = registry
+            .respawn_agent_for_pane(pane, "sleep 30")
+            .await
+            .expect("respawn");
+        assert_ne!(successor, agent);
+        release_reader.send(()).expect("release the reader");
+        assert_eq!(
+            first_run_end(&telemetry, &mut spans, pane).await,
+            ("exited".to_string(), Some(7))
+        );
+        registry.shutdown_all();
     }
 
     /// `is_agent_still_registered` is `pump_reader`'s only way to tell a

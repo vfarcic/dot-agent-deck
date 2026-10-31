@@ -575,3 +575,178 @@ fn status_032_a_removal_nothing_recorded_is_unknown() {
     assert_eq!(termination, Termination::Unknown);
     assert_eq!(termination.wire(), PaneTermination::Unknown);
 }
+
+/// Issue #2028 (review U2): spawn `sh -c 'sleep 1; exit 7'` on `pane`, as the
+/// deck's wrapper with `report` noted for it when `wrapper` is set, and hold
+/// its reader before its capture. Returns once the reader reached that hold,
+/// with the generation ended by itself, and the hold's release.
+fn ended_by_itself(
+    registry: &Arc<AgentPtyRegistry>,
+    pane: &str,
+    wrapper: Option<Option<&str>>,
+) -> (String, std::sync::mpsc::Sender<()>) {
+    let agent = spawn_on(registry, pane, "sh -c 'sleep 1; exit 7'");
+    let (reached, release) = hold_capture(registry, &agent);
+    if let Some(report) = wrapper {
+        registry
+            .inner
+            .lock()
+            .agents
+            .get_mut(&agent)
+            .expect("registered")
+            .child_role = ChildRole::Wrapper;
+        if let Some(report) = report {
+            registry.note_wrapper_child_exit(pane, &agent, report);
+        }
+    }
+    reached
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the reader reached its capture");
+    assert!(
+        registry.is_agent_still_registered(&agent),
+        "test prerequisite: the generation ended by itself"
+    );
+    (agent, release)
+}
+
+/// Close `agent` and capture its termination while the close is held after
+/// removing the record and before terminating and reaping the child.
+fn capture_under_held_close(
+    registry: &Arc<AgentPtyRegistry>,
+    agent: &str,
+    release_capture: std::sync::mpsc::Sender<()>,
+) -> Termination {
+    let (close_reached, release_close) = registry.hold_close_before_reap_for_test(agent);
+    let closer = std::thread::spawn({
+        let registry = Arc::clone(registry);
+        let agent = agent.to_string();
+        move || registry.close_agent(&agent)
+    });
+    close_reached
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the close removed the record");
+    assert!(!registry.is_agent_still_registered(agent));
+    release_capture.send(()).expect("release the capture");
+    let termination = captured(registry, agent);
+    release_close.send(()).expect("release the close");
+    closer.join().unwrap().expect("close");
+    termination
+}
+
+/// Scenario: A pane command exits with code 7 by itself, and a close removes the pane before the reader captures how it ended, held after the removal and before it terminates and reaps the child. The capture must say the command exited with 7, not that the pane was closed. A wrapper's report, or the wrapper's own status without one, is kept the same way; a close of a running command, under the same hold, still reads as closed.
+#[spec("inbox/status/032")]
+#[test]
+fn status_032_a_close_after_a_natural_exit_keeps_how_it_ended() {
+    let registry = Arc::new(AgentPtyRegistry::new());
+    let (agent, release) = ended_by_itself(&registry, "termination-eof-close-pane", None);
+    assert_eq!(
+        capture_under_held_close(&registry, &agent, release),
+        Termination::PaneCommandExited {
+            code: 7,
+            role: ChildRole::PaneCommand,
+            reported_by: TerminationSource::Deck,
+        }
+    );
+
+    let (agent, release) =
+        ended_by_itself(&registry, "termination-eof-close-report", Some(Some("5")));
+    assert_eq!(
+        capture_under_held_close(&registry, &agent, release),
+        Termination::PaneCommandExited {
+            code: 5,
+            role: ChildRole::Wrapper,
+            reported_by: TerminationSource::Wrapper,
+        },
+        "the wrapper's report survives the removal"
+    );
+
+    let (agent, release) = ended_by_itself(&registry, "termination-eof-close-wrapper", Some(None));
+    assert_eq!(
+        capture_under_held_close(&registry, &agent, release),
+        Termination::PaneCommandExited {
+            code: 7,
+            role: ChildRole::Wrapper,
+            reported_by: TerminationSource::Deck,
+        },
+        "without a report, the wrapper's own status, as the deck's"
+    );
+
+    // Control: a close of a running command is the close.
+    let live = spawn_on(&registry, "termination-live-close-pane", "sleep 30");
+    let (reached, release) = hold_capture(&registry, &live);
+    let (close_reached, release_close) = registry.hold_close_before_reap_for_test(&live);
+    let closer = std::thread::spawn({
+        let registry = Arc::clone(&registry);
+        let live = live.clone();
+        move || registry.close_agent(&live)
+    });
+    close_reached
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the close removed the record");
+    // The running child is terminated only once the close is released, so
+    // its reader's end, and its capture, come after.
+    release_close.send(()).expect("release the close");
+    closer.join().unwrap().expect("close");
+    reached
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the closed generation's reader reached its capture");
+    release.send(()).expect("release the capture");
+    assert_eq!(captured(&registry, &live), Termination::Closed);
+    registry.shutdown_all();
+}
+
+/// Scenario: A pane command exits with code 7 by itself, and a respawn removes it before the reader captures how it ended, held after the removal and before it terminates and reaps the old child. The capture must say the command exited with 7, not that it was replaced; a respawn of a running command, in the same pane, still reads as replaced.
+#[spec("inbox/status/032")]
+#[tokio::test(flavor = "multi_thread")]
+async fn status_032_a_respawn_after_a_natural_exit_keeps_how_it_ended() {
+    let registry = Arc::new(AgentPtyRegistry::new());
+    let pane = "termination-eof-respawn-pane";
+    let (agent, release_capture) = tokio::task::spawn_blocking({
+        let registry = Arc::clone(&registry);
+        move || ended_by_itself(&registry, pane, None)
+    })
+    .await
+    .unwrap();
+    let (respawn_reached, release_respawn) = registry.pause_next_respawn_for_test();
+    let respawn = tokio::spawn({
+        let registry = Arc::clone(&registry);
+        async move { registry.respawn_agent_for_pane(pane, "sleep 30").await }
+    });
+    respawn_reached
+        .await
+        .expect("the respawn removed the record");
+    assert!(!registry.is_agent_still_registered(&agent));
+    release_capture.send(()).expect("release the capture");
+    let termination = tokio::task::spawn_blocking({
+        let registry = Arc::clone(&registry);
+        let agent = agent.clone();
+        move || captured(&registry, &agent)
+    })
+    .await
+    .unwrap();
+    release_respawn.send(()).expect("release the respawn");
+    let successor = respawn.await.unwrap().expect("respawn");
+    assert_eq!(
+        termination,
+        Termination::PaneCommandExited {
+            code: 7,
+            role: ChildRole::PaneCommand,
+            reported_by: TerminationSource::Deck,
+        }
+    );
+
+    // Control: the running successor, respawned in turn, was replaced.
+    let next = registry
+        .respawn_agent_for_pane(pane, "sleep 30")
+        .await
+        .expect("respawn the running successor");
+    assert_ne!(next, successor);
+    let replaced = tokio::task::spawn_blocking({
+        let registry = Arc::clone(&registry);
+        move || captured(&registry, &successor)
+    })
+    .await
+    .unwrap();
+    assert_eq!(replaced, Termination::Replaced);
+    registry.shutdown_all();
+}
