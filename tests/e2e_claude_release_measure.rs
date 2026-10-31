@@ -300,10 +300,40 @@ fn measure_with_path(kind: &str, rows: u16, cols: u16, path: Option<&str>) -> Ca
     capture
 }
 
-/// Scenario: Open the slash menu, file menu, shell mode, exit warning and background overview in isolated real Claude Code 2.1.310 and 2.1.312 composers at 24×80, 40×120 and 50×200 in the default dark theme, and at 50×200 in the light theme. Capture their raw bytes and rendered frames, including a normal composer with warning phrases quoted in a real user transcript echo whose submission is blocked before a model turn.
+fn assert_empty_menu_composer(capture: &Capture) {
+    // Check the complete bounded editor independently of the ready recogniser.
+    let parser = capture.parser(capture.point("transcript-quotation"));
+    let screen = parser.screen();
+    let (rows, cols) = screen.size();
+    let (rows, cols) = (rows.get(), cols.get());
+    let prompt = (1..rows)
+        .rev()
+        .find(|&row| screen.cell(row, 0).unwrap().contents() == "❯")
+        .expect("quotation must leave a main composer");
+    assert_eq!(screen.cell(prompt - 1, 0).unwrap().contents(), "─");
+    let bottom = (prompt + 1..rows)
+        .find(|&row| screen.cell(row, 0).unwrap().contents() == "─")
+        .expect("main composer must have a lower rule");
+    for row in prompt..bottom {
+        for col in 0..cols {
+            if (row, col) != (prompt, 0) {
+                assert!(
+                    screen.cell(row, col).unwrap().contents().trim().is_empty(),
+                    "retained quotation draft at ({row},{col}): {}",
+                    screen.contents()
+                );
+            }
+        }
+    }
+    assert_eq!(screen.cursor_position(), (prompt, 2));
+}
+
+/// Scenario: Open the slash menu, file menu, shell mode, exit warning and background overview in isolated real Claude Code 2.1.310 and 2.1.312 composers at 24×80, 40×120 and 50×200 in the indexed dark theme, at 50×200 in the indexed light theme, and at 50×200 in truecolor dark/light and indexed dark-ansi/light-ansi/dark-daltonized themes. Capture their raw bytes and rendered frames, including a normal composer with warning phrases quoted in a real user transcript echo whose submission is blocked before a model turn.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_live_release_menu_frames() {
+    use vt100::Color::{self, Idx, Rgb};
+
     skip_unless!(common::check_claude_available());
     for release in ["2.1.310", "2.1.312"] {
         let key = format!("DOT_AGENT_DECK_CLAUDE_MENU_{}", release.replace('.', "_"));
@@ -319,12 +349,61 @@ fn doorbell_036_live_release_menu_frames() {
             root.path().display(),
             std::env::var("PATH").unwrap()
         );
-        let mut dark_shell_colour = None;
-        for (kind, rows, cols) in [
-            ("menus", 24, 80),
-            ("menus", 40, 120),
-            ("menus", 50, 200),
-            ("menus-light", 50, 200),
+        // Measured foregrounds: the main composer's upper rule, the shell
+        // glyph and the overview's own prompt glyph.
+        let indexed_dark = (Idx(244), Idx(211), Idx(246));
+        for (kind, rows, cols, theme, colorterm, (rule, shell, overview)) in [
+            ("menus", 24, 80, "dark", None, indexed_dark),
+            ("menus", 40, 120, "dark", None, indexed_dark),
+            ("menus", 50, 200, "dark", None, indexed_dark),
+            (
+                "menus-light",
+                50,
+                200,
+                "light",
+                None,
+                (Idx(245), Idx(199), Idx(241)),
+            ),
+            (
+                "menus-truecolor-dark",
+                50,
+                200,
+                "dark",
+                Some("truecolor"),
+                (Rgb(136, 136, 136), Rgb(253, 93, 177), Rgb(153, 153, 153)),
+            ),
+            (
+                "menus-truecolor-light",
+                50,
+                200,
+                "light",
+                Some("truecolor"),
+                (Rgb(138, 138, 138), Rgb(255, 0, 135), Rgb(102, 102, 102)),
+            ),
+            (
+                "menus-dark-ansi",
+                50,
+                200,
+                "dark-ansi",
+                None,
+                (Idx(7), Idx(13), Idx(7)),
+            ),
+            (
+                "menus-light-ansi",
+                50,
+                200,
+                "light-ansi",
+                None,
+                (Idx(7), Idx(5), Idx(8)),
+            ),
+            (
+                "menus-dark-daltonized",
+                50,
+                200,
+                "dark-daltonized",
+                None,
+                (Idx(244), Idx(75), Idx(246)),
+            ),
         ] {
             let capture = measure_with_path(kind, rows, cols, Some(&path));
             eprintln!(
@@ -332,26 +411,37 @@ fn doorbell_036_live_release_menu_frames() {
                 capture.root.display()
             );
             assert_eq!(capture.result["release"], release);
-            let bang = capture.parser(capture.point("bang"));
-            let shell_colour = bang.screen().cell(rows - 3, 0).unwrap().fgcolor();
-            if kind == "menus" && rows == 50 {
-                dark_shell_colour = Some(shell_colour);
-            } else if kind == "menus-light" {
-                assert_ne!(
-                    Some(shell_colour),
-                    dark_shell_colour,
-                    "light theme must visibly change the shell palette"
-                );
-            }
-            let quotation = capture.parser(capture.point("transcript-quotation"));
-            assert!(
-                quotation
+            assert_eq!(capture.result["theme"], theme);
+            assert_eq!(capture.result["colorterm"], serde_json::json!(colorterm));
+            let foreground = |point: &str, row| {
+                capture
+                    .parser(capture.point(point))
                     .screen()
-                    .contents()
-                    .lines()
-                    .any(|row| row.trim() == "❯"),
-                "the quoted transcript's main composer must have no retained draft"
+                    .cell(row, 0)
+                    .unwrap()
+                    .fgcolor()
+            };
+            assert_eq!(foreground("empty", rows - 4), rule, "{kind} main rule");
+            assert_eq!(foreground("bang", rows - 3), shell, "{kind} shell glyph");
+            assert_eq!(
+                foreground("overview", rows - 3),
+                overview,
+                "{kind} overview glyph"
             );
+            // The structural premise the recogniser reads, beyond the palette:
+            // the main composer has a coloured rule and a Default prompt, the
+            // overview a Default rule and a coloured prompt.
+            assert_eq!(
+                foreground("empty", rows - 3),
+                Color::Default,
+                "{kind} main prompt"
+            );
+            assert_eq!(
+                foreground("overview", rows - 4),
+                Color::Default,
+                "{kind} overview rule"
+            );
+            assert_empty_menu_composer(&capture);
             assert!(
                 capture
                     .parser(capture.point("overview"))

@@ -420,7 +420,7 @@ fn doorbell_036_codex_composer_over_real_frames() {
     }
 }
 
-/// Scenario: Replay Claude Code 2.1.310 and 2.1.312 at the empty composer, while holding a line, after submission and after clearing, then replay their overview, slash menu, file menu, shell mode and exit warning at 24×80, 40×120 and 50×200 in the dark theme and 50×200 in the light theme. The profile accepts the main composer even with warning phrases quoted in the transcript, refuses the other surfaces, and recognises the submitted user line. Replay 2.1.312's compound-key capture too: marker insertion reveals the retained two spaces, and blank Enter after non-ASCII deletion preserves the draft.
+/// Scenario: Replay Claude Code 2.1.310 and 2.1.312 at the empty composer, while holding a line, after submission and after clearing, then open each release's recorded overview, slash menu, file menu, shell mode and exit warning at 24×80, 40×120 and 50×200 in the indexed dark theme, at 50×200 in the indexed light theme, and at 50×200 in truecolor dark/light and dark-ansi/light-ansi/dark-daltonized palettes. The profile accepts the main composer even with warning phrases quoted in the transcript, refuses the other surfaces, and recognises the submitted user line. Replay 2.1.312's compound-key capture too: marker insertion reveals the retained two spaces, and blank Enter after non-ASCII deletion preserves the draft.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_claude_composer_over_real_frames() {
@@ -471,10 +471,18 @@ fn doorbell_036_claude_composer_over_real_frames() {
 
     let mut wrong_surfaces = Vec::new();
     for release in ["2.1.310", "2.1.312"] {
-        for variant in ["50x200", "24x80", "40x120", "light-50x200"] {
-            let trace = fixture(&format!(
-                "claude-inbox/r5wake/claude-{release}-menus-{variant}"
-            ));
+        for set in [
+            "50x200",
+            "24x80",
+            "40x120",
+            "light-50x200",
+            "truecolor-dark-50x200",
+            "truecolor-light-50x200",
+            "dark-ansi-50x200",
+            "light-ansi-50x200",
+            "dark-daltonized-50x200",
+        ] {
+            let trace = fixture(&format!("claude-inbox/r5wake/claude-{release}-menus-{set}"));
             for (point, expected) in [
                 ("empty", true),
                 ("transcript-quotation", true),
@@ -488,18 +496,18 @@ fn doorbell_036_claude_composer_over_real_frames() {
                 let ready = (CLAUDE_PROFILE.ready)(&grid);
                 let empty_and_ready = CLAUDE_PROFILE.empty_and_ready(&grid);
                 eprintln!(
-                    "Claude {release} {variant} {point}: ready={ready}, empty_and_ready={empty_and_ready}, expected {expected}"
+                    "Claude {release} {set} {point}: ready={ready}, empty_and_ready={empty_and_ready}, expected {expected}"
                 );
-                if ready != expected || (expected && !empty_and_ready) {
-                    let cost = if expected {
+                if ready != expected || empty_and_ready != expected {
+                    let failure = if expected {
                         "wrong refusal (availability)"
                     } else {
                         "wrong acceptance (safety)"
                     };
                     wrong_surfaces.push(format!(
-                    "Claude {release} {variant} {point}: {cost}; ready={ready}, empty_and_ready={empty_and_ready}, expected {expected}\n{}",
-                    trace.parser_upto(trace.points[point]).screen().contents()
-                ));
+                        "Claude {release} {set} {point}: {failure}: ready={ready}, empty_and_ready={empty_and_ready}, expected {expected}\n{}",
+                        trace.parser_upto(trace.points[point]).screen().contents()
+                    ));
                 }
             }
             let quotation = trace

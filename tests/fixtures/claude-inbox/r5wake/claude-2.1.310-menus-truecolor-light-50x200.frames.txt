@@ -1,0 +1,391 @@
+2.1.310 empty offset=2039 cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-2574762-pw5kZZ/.tmpXLD1bq
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                                    ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Try "fix typecheck errors"
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents
+
+row 46: "─" fg=Rgb(138, 138, 138) bg=Default
+row 47: "❯" fg=Default bg=Default
+row 48: "─" fg=Rgb(138, 138, 138) bg=Default
+
+2.1.310 slash offset=2619 cursor=(47, 3)
+
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-2574762-pw5kZZ/.tmpXLD1bq
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ❯ /loop                             Repeat a prompt or command on an interval (e.g. /loop 5m /foo)
+    /add-dir                          Add a new working directory
+    /advisor                          Let Claude consult a stronger model at key moments
+    /artifacts                        Browse your published and shared artifacts
+    /auto-mode-setup                  Teach auto mode about your environment, plus optional rule tweaks
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ /
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+row 46: "─" fg=Rgb(138, 138, 138) bg=Default
+row 47: "❯" fg=Default bg=Default
+row 48: "─" fg=Rgb(138, 138, 138) bg=Default
+
+2.1.310 at offset=3225 cursor=(47, 3)
+
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-2574762-pw5kZZ/.tmpXLD1bq
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    + .dot-agent-deck.toml
+    + .git/
+    + attach.sock
+    + session.toml
+    + hook.sock
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ @
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+row 46: "─" fg=Rgb(138, 138, 138) bg=Default
+row 47: "❯" fg=Default bg=Default
+row 48: "─" fg=Rgb(138, 138, 138) bg=Default
+
+2.1.310 bang offset=4800 cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-2574762-pw5kZZ/.tmpXLD1bq
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                                    ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+! Try "fix typecheck errors"
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ! for shell mode
+
+row 46: "─" fg=Rgb(255, 0, 135) bg=Default
+row 47: "!" fg=Rgb(255, 0, 135) bg=Default
+row 48: "─" fg=Rgb(255, 0, 135) bg=Default
+
+2.1.310 exit-warning offset=6294 cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-2574762-pw5kZZ/.tmpXLD1bq
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                                    ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Try "fix typecheck errors"
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Press Ctrl-C again to exit
+
+row 46: "─" fg=Rgb(138, 138, 138) bg=Default
+row 47: "❯" fg=Default bg=Default
+row 48: "─" fg=Rgb(138, 138, 138) bg=Default
+
+2.1.310 transcript-quotation offset=13601 cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-2574762-pw5kZZ/.tmpXLD1bq
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: Quoted UI phrases: Your conversation moved to the background; describe a task for a new session; Press Ctrl-C again to exit; /help; @file; ! shell mode.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                        You've used 81% of your weekly limit · resets Nov 2, 9pm (UTC)
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+row 46: "─" fg=Rgb(138, 138, 138) bg=Default
+row 47: "❯" fg=Default bg=Default
+row 48: "─" fg=Rgb(138, 138, 138) bg=Default
+
+2.1.310 overview offset=17126 cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.310
+▝▜██████▀  New sessions: Opus 5.5 · high effort · /var/tmp/dad-e2e-1000/dad-tests-2574762-pw5kZZ/.tmpXLD1bq
+ ▝▝   ▝▝   1 awaiting input · 0 working · 0 completed
+
+Your conversation moved to the background — enter opens it · esc returns to it · ctrl+c twice quits
+
+Needs input
+ Sessions that have a question or need your decision land here
+ ✻ current session  .tmpXLD1bq                                                                                                                                                                        0s
+
+Working
+ Sessions Claude is actively working on — they keep running even if you close the terminal
+
+Completed
+ Finished sessions wait here for you to review
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ A different way to work with Claude: hand off a bigger task than you would chat through, and Claude organizes it in the sections above so you know when it needs you.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ describe a task for a new session
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode · enter to return · space to reply · ctrl+x to delete · ? for shortcuts
+
+row 46: "─" fg=Default bg=Default
+row 47: "❯" fg=Rgb(102, 102, 102) bg=Default
+row 48: "─" fg=Default bg=Default

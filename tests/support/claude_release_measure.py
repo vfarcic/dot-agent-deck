@@ -158,7 +158,7 @@ class Recorder:
             self.wait(lambda: (self.out / 'hook.jsonl').exists())
             self.pump(1)
             self.snap('quotation-echo')
-            # Ctrl+U clears only the last visual line on a narrow composer.
+            # Ctrl+U clears only the last visual line on a wrapped composer.
             # Remove the whole restored draft without submitting it again.
             for _ in quotation:
                 self.send(BS)
@@ -291,7 +291,7 @@ class Recorder:
         (self.out / 'index.json').write_text(json.dumps(index, indent=2))
         result = {'sha256': self.sha256, 'release': self.release, 'pid': pid, 'error': error, 'reads': self.reads,
                   'executable': self.executable, 'model': 'haiku',
-                  'theme': self.theme,
+                  'theme': self.theme, 'term': 'xterm-256color', 'colorterm': self.colorterm,
                   'events': self.events, 'modes': self.modes, 'keys': self.keys}
         (self.out / 'result.json').write_text(json.dumps(result, indent=2))
         (self.out / 'frames.json').write_text(json.dumps(self.frames, indent=2, ensure_ascii=False))
@@ -317,13 +317,22 @@ def main():
     recorder = Recorder(out, rows, cols)
     recorder.executable = str(binary)
     recorder.release, recorder.sha256 = release, expected
+    menu_settings = {
+        'menus': ('dark', None),
+        'menus-light': ('light', None),
+        'menus-truecolor-dark': ('dark', 'truecolor'),
+        'menus-truecolor-light': ('light', 'truecolor'),
+        'menus-dark-ansi': ('dark-ansi', None),
+        'menus-light-ansi': ('light-ansi', None),
+        'menus-dark-daltonized': ('dark-daltonized', None),
+    }
+    recorder.theme, recorder.colorterm = menu_settings[kind] if kind.startswith('menus') else ('dark', None)
     # Claude's own theme preference, confined to TuiDeck's disposable HOME.
-    preferences = home / '.claude.json'
-    preference_data = json.loads(preferences.read_text())
     if kind.startswith('menus'):
-        preference_data['theme'] = 'light' if kind == 'menus-light' else 'dark'
+        preferences = home / '.claude.json'
+        preference_data = json.loads(preferences.read_text())
+        preference_data['theme'] = recorder.theme
         preferences.write_text(json.dumps(preference_data))
-    recorder.theme = preference_data.get('theme', 'dark')
     # Only the harness's disposable HOME is writable by this controller.
     settings = home / '.claude/settings.json'
     hook = ' '.join(shlex.quote(x) for x in [sys.executable, str(Path(__file__).resolve()), '--block-hook', str(out)])
@@ -340,6 +349,8 @@ def main():
         # M1's original clear environment advertised xterm-256color without
         # COLORTERM. TuiDeck advertises truecolor for its own outer screen.
         os.environ.pop('COLORTERM', None)
+        if recorder.colorterm:
+            os.environ['COLORTERM'] = recorder.colorterm
         os.environ['TERM'] = 'xterm-256color'
         os.environ['LANG'] = 'C.UTF-8'
         os.environ['DISABLE_AUTOUPDATER'] = '1'
