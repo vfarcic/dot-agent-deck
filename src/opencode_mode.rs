@@ -240,7 +240,7 @@ pub fn sample(roots: &[i32]) -> Option<Vec<ProcRow>> {
 
 /// Process `pid`'s arguments.
 #[cfg(target_os = "linux")]
-fn arguments_of(pid: u32) -> Option<Vec<String>> {
+pub(crate) fn arguments_of(pid: u32) -> Option<Vec<String>> {
     let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     let argv: Vec<String> = raw
         .split(|b| *b == 0)
@@ -253,7 +253,7 @@ fn arguments_of(pid: u32) -> Option<Vec<String>> {
 /// Process `pid`'s arguments, split on whitespace (`ps` joins them), which is
 /// enough for the words this module looks for.
 #[cfg(all(unix, not(target_os = "linux")))]
-fn arguments_of(pid: u32) -> Option<Vec<String>> {
+pub(crate) fn arguments_of(pid: u32) -> Option<Vec<String>> {
     let out = std::process::Command::new("ps")
         .args(["-o", "args=", "-p", &pid.to_string()])
         .stdin(std::process::Stdio::null())
@@ -268,7 +268,7 @@ fn arguments_of(pid: u32) -> Option<Vec<String>> {
 }
 
 #[cfg(not(unix))]
-fn arguments_of(_pid: u32) -> Option<Vec<String>> {
+pub(crate) fn arguments_of(_pid: u32) -> Option<Vec<String>> {
     None
 }
 
