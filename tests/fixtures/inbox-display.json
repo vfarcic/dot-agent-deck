@@ -46,6 +46,9 @@
     "cancelConfirmation": "Cancel the running release check? Its unfinished work will be discarded.",
     "forgetConfirmation": "Forget the saved checks for {release}? These records will be removed.",
     "previewTruncated": "Preview truncated; export still contains the whole file ({bytes} bytes).",
+    "displayTruncated": "Display truncated.",
+    "confirmDismiss": "Back",
+    "invalidDirectory": "The export directory contains control characters. Choose another directory.",
     "unsupported": "This daemon doesn't support release checks. Upgrade the deck to use them."
   },
   "wakeHolds": {
