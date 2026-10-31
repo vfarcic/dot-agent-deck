@@ -5,16 +5,15 @@
 //! each passing on rerun, and an allocation-only stress probe on a macOS runner
 //! saw errno `-6` from the same call; whether the two share a cause is not
 //! established, and neither is the cause itself. This is a mitigation: the
-//! allocation alone is tried up to [`ATTEMPTS`] times with [`DELAY`] between
+//! allocation alone is tried up to `ATTEMPTS` times with `DELAY` between
 //! retryable failures, and what a caller does with the pair afterwards, spawning
 //! the child included, still happens once. Every other error, and the last
 //! attempt's, reaches the caller unchanged.
 //!
-//! A failed attempt leaves nothing to close: portable-pty adopts the two
-//! descriptors only once `openpty` has succeeded, and `wrap`'s inner PTY does
-//! the same, so the retry drops nothing but the error value. Closing the output
-//! integers of a failed call would be wrong, since they may be unset or already
-//! reused by another thread.
+//! A failed attempt is not closed by the caller: it owns neither descriptor
+//! of a call that returned an error, so the retry drops nothing but the error
+//! value. Closing the output integers of a failed call would be wrong, since
+//! they may be unset or already reused by another thread.
 //!
 //! Other platforms allocate exactly once, as before.
 
