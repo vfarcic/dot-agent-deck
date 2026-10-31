@@ -53,7 +53,7 @@
  * provider voice (an OpenAI-compatible connection) is what works regardless.
  */
 
-import type { DeckBridge, SpeechPlanDto } from "./bridge";
+import type { SpeechPlanDto } from "./bridge";
 
 /**
  * One way of saying a sentence. Resolves when it has been said or stopped.
@@ -421,14 +421,4 @@ export function providerVoice(
       });
     },
   };
-}
-
-/** The queue reading mode uses, wired to the bridge and the real voices. */
-export function createSpeechQueue(bridge: DeckBridge, onProblem?: (reason: string) => void): SpeechQueue {
-  return new SpeechQueue({
-    plan: () => bridge.voiceSpeechPlan(),
-    provider: providerVoice((text) => bridge.voiceSpeechAudio(text)),
-    system: systemVoice(),
-    onProblem,
-  });
 }

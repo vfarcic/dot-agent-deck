@@ -2482,6 +2482,9 @@ struct HookLoopLimits {
     hold_deadline: Duration,
     max_holds: usize,
     ack_wait: Duration,
+    /// Issue #1664: how long an earlier connection that has sent nothing can
+    /// hold back a later event ([`crate::hook_event_order::PREDECESSOR_WAIT`]).
+    event_order_wait: Duration,
 }
 
 impl HookLoopLimits {
@@ -2492,6 +2495,7 @@ impl HookLoopLimits {
             hold_deadline: QUESTION_HOLD_DEADLINE,
             max_holds: MAX_HELD_QUESTIONS,
             ack_wait: HELD_REPLY_ACK_WAIT,
+            event_order_wait: crate::hook_event_order::PREDECESSOR_WAIT,
         }
     }
 }
@@ -2507,6 +2511,9 @@ struct QuestionConnection<'a, R, W> {
     slot: &'a mut Option<tokio::sync::OwnedSemaphorePermit>,
     holds: &'a Arc<tokio::sync::Semaphore>,
     hold_deadline: Duration,
+    /// The bound on the `held` line's write: the connection's idle timeout,
+    /// as for every other reply on it (issue #1976).
+    write_timeout: Duration,
 }
 
 /// PRD #1631: apply a producer's [`crate::event::QuestionSignal`] and, for a
@@ -2546,7 +2553,8 @@ struct QuestionConnection<'a, R, W> {
 ///
 /// Returns the reply line to write — with, for an answer, where to report
 /// what became of it ([`crate::agent_pty::ReplyDelivery`]) — or `None` when
-/// the producer's connection closed while it waited: the producer is gone, so
+/// the producer's connection closed while it waited, or its `held` line could
+/// not be written within `write_timeout` (issue #1976): the producer is gone, so
 /// the question goes too (Claude Code kills its hook when the keyboard answers
 /// No or Esc [observed]); the status is left for the next event to decide.
 async fn handle_question_signal<R, W>(
@@ -2634,16 +2642,26 @@ where
     // Held: the hook-pool slot goes back, so this wait never queues another
     // producer's hook (audit A6). `_budget` bounds it instead.
     drop(conn.slot.take());
-    if confirm_hold && let Ok(json) = serde_json::to_string(&QuestionReply::held(&id)) {
-        // A failed write means the producer is gone, which the read below
-        // sees as well.
-        let _ = async {
-            conn.writer
-                .write_all(format!("{json}\n").as_bytes())
-                .await?;
-            conn.writer.flush().await
-        }
+    if confirm_hold
+        && let Ok(json) = serde_json::to_string(&QuestionReply::held(&id))
+        && write_hook_reply(conn.writer, &format!("{json}\n"), conn.write_timeout)
+            .await
+            .is_err()
+    {
+        // Issue #1976: a producer that cannot be written to within the idle
+        // timeout is released as one that hung up, so it cannot park this
+        // handler, and its hold-budget permit, before the deadline below.
+        drop_held_question(
+            state,
+            event_tx,
+            registry,
+            &pane_id,
+            &id,
+            hold.generation,
+            "the producer did not read its held line",
+        )
         .await;
+        return None;
     }
     // Any read outcome means the producer is gone or misbehaving: a holding
     // producer sends nothing more on this connection.
@@ -5863,6 +5881,9 @@ async fn run_hook_loop_with_limits(
     // PRD #1631 (audit A6): held questions wait under a budget of their own,
     // not in the connection pool above.
     let hold_limit = Arc::new(tokio::sync::Semaphore::new(limits.max_holds));
+    // Issue #1664: the order connections are accepted in, so one session's
+    // events apply in the order they were sent.
+    let event_order = crate::hook_event_order::HookEventOrder::new(limits.event_order_wait);
     // Whether the cap is currently holding, so the warning below fires on the
     // transition into saturation rather than once per waiting connection.
     let mut at_cap = false;
@@ -5887,6 +5908,9 @@ async fn run_hook_loop_with_limits(
             }
             accept_res = accept_hook_connection(&listener, &conn_limit, limits.max_connections, &mut at_cap) => match accept_res {
             Ok((permit, stream)) => {
+                // Issue #1664: taken here, in accept order, before the task
+                // that may run ahead of an earlier connection's is spawned.
+                let mut event_order_ticket = Some(event_order.admit());
                 let hold_limit = Arc::clone(&hold_limit);
                 let state = state.clone();
                 let event_tx = event_tx.clone();
@@ -6059,6 +6083,16 @@ async fn run_hook_loop_with_limits(
                                 break;
                             }
                         };
+                        // Issue #1664: a raw event waits for the events of its
+                        // session or pane accepted ahead of it, and holds its
+                        // turn until this line is handled; an `inbox_announce`
+                        // keeps the place for the event after it, and anything
+                        // else gives it up. See `crate::hook_event_order`.
+                        let _event_turn = crate::hook_event_order::turn_for_line(
+                            &mut event_order_ticket,
+                            &line,
+                        )
+                        .await;
                         if let Ok(msg) = serde_json::from_str::<DaemonMessage>(&line) {
                             // Issue #1077: ONE provenance gate for every verb on
                             // this socket, ahead of the match rather than inside
@@ -7644,6 +7678,7 @@ async fn run_hook_loop_with_limits(
                                             slot: &mut permit,
                                             holds: &hold_limit,
                                             hold_deadline: limits.hold_deadline,
+                                            write_timeout: idle_timeout,
                                         },
                                     )
                                     .await
@@ -9419,6 +9454,7 @@ mod hook_ingestion_tests {
                 slot: &mut slot,
                 holds: &holds,
                 hold_deadline: Duration::from_secs(5),
+                write_timeout: Duration::from_secs(5),
             },
         )
         .await;
@@ -21213,3 +21249,15 @@ mod hook_reply_deadline_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "daemon_composer_reader_tests.rs"]
 mod composer_reader_tests;
+
+// Unix-only, like `question_hold_tests`, which it sits beside.
+#[cfg(all(test, unix))]
+#[path = "daemon_held_confirmation_deadline_tests.rs"]
+mod held_confirmation_deadline_tests;
+
+// Issue #1664: one session's hook events apply in the order they were sent.
+// Unix-only, like `hook_reply_deadline_tests`: it drives the loop over a Unix
+// socket.
+#[cfg(all(test, unix))]
+#[path = "daemon_hook_event_order_tests.rs"]
+mod hook_event_order_tests;
