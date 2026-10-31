@@ -556,7 +556,8 @@ fn assert_claude_corpus_decisions() {
     let mut actual = String::from(
         "# Production Grid at recorded PTY read boundaries; resizes apply before the next byte.\n\
          # Frame = fixture/read-number@end-offset:rowsxcols; columns = ready empty-and-ready.\n\
-         # Characterisation of this corpus only; no claim about arbitrary splits or unknown screens.\n",
+         # Characterisation of current production decisions, not an independent verdict per row; no claim about arbitrary splits or unknown screens.\n\
+         # Update only with a reviewed recogniser change; name the moved frames in the PR or report.\n",
     );
     for stem in &stems {
         let trace = fixture(&format!("claude-inbox/r5wake/{stem}"));
@@ -601,22 +602,25 @@ fn assert_claude_corpus_decisions() {
     if actual != expected {
         // A separate candidate never updates the oracle. Review its frame-level
         // diff before explicitly replacing the committed expectations.
-        let candidate = base.join("claude-ready.actual.txt");
-        std::fs::write(&candidate, &actual).unwrap();
+        let artifact_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+        let candidate = artifact_dir.join("claude-ready.actual.txt");
+        let saved = std::fs::create_dir_all(&artifact_dir)
+            .and_then(|()| std::fs::write(&candidate, &actual));
         let first = actual
             .lines()
             .zip(expected.lines())
             .position(|(a, e)| a != e)
             .unwrap_or_else(|| actual.lines().count().min(expected.lines().count()));
         panic!(
-            "Claude corpus decision changed at ledger line {}: expected {:?}, actual {:?}; expected {} lines, actual {} lines over {} fixtures; review {}",
+            "Claude corpus decision changed at ledger line {}: expected {:?}, actual {:?}; expected {} lines, actual {} lines over {} fixtures; candidate {}: {:?}",
             first + 1,
             expected.lines().nth(first),
             actual.lines().nth(first),
             expected.lines().count(),
             actual.lines().count(),
             stems.len(),
-            candidate.display()
+            candidate.display(),
+            saved
         );
     }
 }

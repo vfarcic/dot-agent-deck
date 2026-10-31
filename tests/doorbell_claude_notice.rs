@@ -10,6 +10,12 @@ use spec::spec;
 /// The grid of the recorded `stem` at its named `point`. The menu captures
 /// have no resize, so the prefix parses at the recorded size.
 fn frame(stem: &str, point: &str) -> Grid {
+    recorded_frame(stem, |index| {
+        index["points"][point].as_u64().unwrap() as usize
+    })
+}
+
+fn recorded_frame(stem: &str, offset: impl FnOnce(&serde_json::Value) -> usize) -> Grid {
     let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude-inbox/r5wake");
     let bytes = std::fs::read(base.join(format!("{stem}.bin"))).expect("fixture bytes");
     let index: serde_json::Value =
@@ -19,7 +25,7 @@ fn frame(stem: &str, point: &str) -> Grid {
         index["edges"].as_array().unwrap().is_empty(),
         "{stem} resizes"
     );
-    let upto = index["points"][point].as_u64().unwrap() as usize;
+    let upto = offset(&index);
     Grid::parse(
         &bytes[..upto],
         index["rows"].as_u64().unwrap() as u16,
@@ -72,7 +78,7 @@ fn right_aligned(grid: &Grid, text: &str) -> usize {
     usize::from(grid.cols) - 2 - text.chars().count()
 }
 
-/// Scenario: Take both recorded Claude releases' 24×80 and 40×120 composers and redraw the notice row and preceding rows into suggestion-list near-misses, including changed dim and inverse cells; every near-miss is refused. The unchanged notices, a uniformly dim notice, a blank row and a single run starting right of the list indent stay ready. The genuine right-half effort notice stays ready with an occupied row above it at right insets zero, one and two, while a uniformly inverse notice is refused.
+/// Scenario: Take both recorded Claude releases' 24×80 and 40×120 composers and redraw the notice row and preceding rows into suggestion-list near-misses, including changed dim and inverse cells; every near-miss is refused. The unchanged notices, a uniformly dim notice, a blank row and a single run starting right of the list indent stay ready. The genuine right-half effort notice stays ready with its recorded working-spinner row above it at right insets zero, one and two, while a uniformly inverse notice is refused.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_a_notice_is_told_from_a_list_by_its_shape() {
@@ -204,20 +210,42 @@ fn doorbell_036_a_notice_is_told_from_a_list_by_its_shape() {
                 .trim_end()
                 .to_string();
             let effort_style = row[effort_first].clone();
+            // Recorded read boundaries with the working spinner immediately
+            // above the effort notice, before the quotation's reply arrives.
+            let working_read = match (release, size) {
+                ("2.1.310", "24x80") | ("2.1.312", "40x120") => 24,
+                _ => 23,
+            };
+            let working = recorded_frame(&stem, |index| {
+                index["read_lens"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .take(working_read)
+                    .map(|len| len.as_u64().unwrap() as usize)
+                    .sum()
+            });
+            let spinner_row = upper_rule(&working) - 2;
+            assert!(
+                working
+                    .text_from(spinner_row, 0)
+                    .contains("running UserPromptSubmit hook"),
+                "{stem}: read {working_read} must contain the recorded working spinner"
+            );
             cases.push(("the effort notice", true, empty.clone()));
             for inset in [0, 1, 2] {
                 let mut g = empty.clone();
                 let start = usize::from(g.cols) - inset - effort.chars().count();
                 assert!(start >= usize::from(g.cols / 2), "{stem}");
                 draw(&mut g, effort_row, start, &effort, &effort_style);
-                g.cells[effort_row as usize - 1] = list_rows[1].clone();
+                g.cells[effort_row as usize - 1] = working.cells[spinner_row as usize].clone();
                 cases.push((
                     match inset {
                         0 => {
-                            "the right-half effort notice at inset zero with an occupied row above"
+                            "the right-half effort notice at inset zero with its working spinner above"
                         }
-                        1 => "the right-half effort notice at inset one with an occupied row above",
-                        _ => "the right-half effort notice at inset two with an occupied row above",
+                        1 => "the right-half effort notice at inset one with its working spinner above",
+                        _ => "the right-half effort notice at inset two with its working spinner above",
                     },
                     true,
                     g,
