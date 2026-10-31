@@ -1,7 +1,5 @@
-//! SC-10's failing-first TUI contract. The proposed, test-only I/O seam and
+//! SC-10's failing-first TUI contract. The proposed I/O seam and
 //! provisional keys/words are documented in fixtures/release-check/tui.md.
-
-#![cfg(debug_assertions)]
 
 use std::collections::HashMap;
 
@@ -35,7 +33,11 @@ fn state(cause: &str) -> AppState {
     state.register_pane("check-pane".into());
     state.apply_event(AgentEvent {
         session_id: SESSION.into(),
-        agent_type: AgentType::ClaudeCode,
+        agent_type: if cause == "no_reference" {
+            AgentType::Codex
+        } else {
+            AgentType::ClaudeCode
+        },
         event_type: EventType::SessionStart,
         tool_name: None,
         tool_detail: None,
@@ -162,6 +164,7 @@ fn draw(cause: &str, records: &[Value], keys: &[KeyEvent]) -> Vec<Buffer> {
         &["release_check"],
         &snapshot(records),
         if cause == "off" { "off" } else { "auto" },
+        &[],
         keys,
         (120, 32),
         &mut |request: Value| -> Result<Value, String> {
@@ -276,6 +279,7 @@ struct Backend {
     calls: Vec<Value>,
     mode: String,
     exported_to: Option<String>,
+    trace_preview: String,
 }
 
 impl Backend {
@@ -285,6 +289,7 @@ impl Backend {
             calls: vec![],
             mode: "auto".into(),
             exported_to: None,
+            trace_preview: "SCRUBBED-TRACE-PREVIEW".into(),
         }
     }
 
@@ -329,7 +334,7 @@ impl Backend {
                 );
                 return Ok(json!({"ok":true,"files":[
                     {"name":"record.json","content":"{\"state\":\"passed\"}"},
-                    {"name":"trace.txt","content":"SCRUBBED-TRACE-PREVIEW"},
+                    {"name":"trace.txt","content":self.trace_preview},
                     {"name":"README","content":shared_words()["exportInspection"]}
                 ]}));
             }
@@ -371,6 +376,7 @@ impl Backend {
             &["release_check"],
             &snapshot,
             &mode,
+            &[],
             keys,
             (120, 32),
             &mut |request: Value| self.execute(request),
@@ -453,11 +459,23 @@ fn release_check_004_recheck_approve_and_cancel_have_visible_results() {
     );
 }
 
-/// Scenario: Select a release with two executable identities beside an older passed release, and read that Forget removes every record of the selected release. Forget from the second identity, browse both forgotten records and the untouched older release, and see only Re-check and Close on the forgotten records.
+/// Scenario: Open a release with one identity and then one with two identities beside an older release; show the release-wide Forget explanation only for the latter. Forget from its second identity, browse both forgotten records and the untouched older release, and see only Re-check and Close on the forgotten records.
 #[spec("inbox/release-check/004")]
 #[test]
 fn release_check_004_forget_acts_on_the_selected_release() {
     let mut backend = Backend::new(json!("differs"), "complete");
+    let scope = shared_words()["details"]["forget_release"]
+        .as_str()
+        .unwrap()
+        .replace("{release}", "2.1.313");
+    let single = backend.run("differs", &[key('v')]);
+    let single_panel = panel(single.last().unwrap());
+    assert!(single_panel.contains("[Forget f]"), "{single_panel}");
+    assert!(
+        !single_panel.contains(&scope),
+        "one identity does not need the release-wide Forget explanation:\n{single_panel}"
+    );
+    assert!(backend.calls.is_empty());
     backend.records.insert(
         0,
         row("2.1.310", "aaaaaaaaaaaaaaaa", json!("passed"), "complete"),
@@ -473,6 +491,10 @@ fn release_check_004_forget_acts_on_the_selected_release() {
         &[key('v'), key('j'), key('j'), key('f'), key('k'), key('k')],
     );
     assert_eq!(backend.calls.len(), 1);
+    assert!(
+        panel(&frames[3]).contains(&scope),
+        "several identities must show the release-wide Forget explanation"
+    );
     insta::assert_snapshot!("forget_release_scope", panel(&frames[3]));
     insta::assert_snapshot!("forgot_selected", panel(&frames[4]));
     insta::assert_snapshot!("forgot_other_identity", panel(&frames[5]));
@@ -485,7 +507,7 @@ fn release_check_004_forget_acts_on_the_selected_release() {
     assert_eq!(frames[1], frames[3]);
 }
 
-/// Scenario: Select either of two identities of one release and open Export's file list before a destination is offered. Open each preview, cancel without writing, then continue to the directory prompt and confirm once; the visible answer must name the chosen directory.
+/// Scenario: Select either of two identities of one release, open Export's file list and inspect each file before choosing a destination. Inspect a trace containing terminal escapes and C0/C1 controls as printable escapes, with unchanged surrounding rows and no control-bearing buffer cell; cancel without writing, then separately continue and confirm a destination once.
 #[spec("inbox/release-check/004")]
 #[test]
 fn release_check_004_export_asks_for_a_directory_and_can_be_cancelled() {
@@ -560,6 +582,80 @@ fn release_check_004_export_asks_for_a_directory_and_can_be_cancelled() {
     );
     assert_eq!(backend.exported_to.as_deref(), Some(dir));
     insta::assert_snapshot!("exported", panel(frames.last().unwrap()));
+
+    let hostile = concat!(
+        "TRACE-BEGIN\n",
+        "ESC:\x1b\n",
+        "CSI:\x1b[2J\x1b[1;1H\x1b[31m\n",
+        "OSC0:\x1b]0;TITLE\x07\n",
+        "OSC52:\x1b]52;c;dGVzdA==\x1b\\\n",
+        "EDIT:BEFORE\x0dAFTER\x08X\x09TAB\n",
+        "C0:\x00\x08\x09\x0b\x0c\x0d\x1f\x7f\n",
+        "C1:\u{0085}\u{009b}2J\u{009d}0;TITLE\u{009c}\n",
+        "TRACE-END"
+    );
+    let escaped = concat!(
+        "TRACE-BEGIN\n",
+        "ESC:\\x1b\n",
+        "CSI:\\x1b[2J\\x1b[1;1H\\x1b[31m\n",
+        "OSC0:\\x1b]0;TITLE\\x07\n",
+        "OSC52:\\x1b]52;c;dGVzdA==\\x1b\\\n",
+        "EDIT:BEFORE\\x0dAFTER\\x08X\\x09TAB\n",
+        "C0:\\x00\\x08\\x09\\x0b\\x0c\\x0d\\x1f\\x7f\n",
+        "C1:\\x85\\x9b2J\\x9d0;TITLE\\x9c\n",
+        "TRACE-END"
+    );
+    // Exercise every C0/C1 byte, including DEL, beyond the named attack cases.
+    let mut all_controls = String::from("TRACE-BEGIN\n");
+    let mut all_escaped = String::from("TRACE-BEGIN\n");
+    for chunk in (0_u8..=0x9f)
+        .filter(|byte| *byte != b'\n' && (*byte <= 0x1f || *byte >= 0x7f))
+        .collect::<Vec<_>>()
+        .chunks(8)
+    {
+        all_controls.push_str("BYTES:");
+        all_escaped.push_str("BYTES:");
+        for byte in chunk {
+            all_controls.push(char::from(*byte));
+            all_escaped.push_str(&format!("\\x{byte:02x}"));
+        }
+        all_controls.push('\n');
+        all_escaped.push('\n');
+    }
+    all_controls.push_str("TRACE-END");
+    all_escaped.push_str("TRACE-END");
+    for (raw, printable) in [(hostile, escaped), (&all_controls, &all_escaped)] {
+        let inspect = |content: &str| {
+            let mut backend = Backend::new(json!("passed"), "complete");
+            backend.trace_preview = content.into();
+            let frames = backend.run("running", &[key('v'), key('e'), key('j'), enter()]);
+            assert_eq!(backend.calls.len(), 1, "inspection is read-only");
+            assert!(backend.exported_to.is_none());
+            frames.last().unwrap().clone()
+        };
+        let control = inspect(printable);
+        let actual = inspect(raw);
+        let displayed = panel(&actual);
+        for line in printable.lines() {
+            assert!(
+                displayed.contains(line),
+                "missing inert trace line {line:?}:\n{displayed}"
+            );
+        }
+        for y in actual.area.y..actual.area.bottom() {
+            for x in actual.area.x..actual.area.right() {
+                let symbol = actual[(x, y)].symbol();
+                assert!(
+                    !symbol.chars().any(char::is_control),
+                    "control character in preview buffer cell ({x}, {y}): {symbol:?}"
+                );
+            }
+        }
+        assert_eq!(
+            actual, control,
+            "escaping trace controls must preserve the dialog and surrounding rows"
+        );
+    }
 }
 
 /// Scenario: Change auto to ask in the agent's settings and read what ask means, then attempt off during a running check. Cancel that confirmation without stopping anything, explicitly confirm off, inspect the stopped check, switch back to auto and read a refused Re-check without a false success message.
@@ -599,6 +695,7 @@ fn release_check_004_mode_settings_and_refusal_are_visible() {
         &["release_check"],
         &initial,
         "auto",
+        &[],
         &[key('v'), key('R')],
         (120, 32),
         &mut |_: Value| -> Result<Value, String> {
@@ -623,6 +720,7 @@ fn release_check_004_absent_capability_withholds_controls() {
             &capabilities,
             &snapshot(&[]),
             "auto",
+            &[],
             &[key('v'), key('R'), key('p'), key('v'), key('R'), key('M')],
             (120, 32),
             &mut |request| -> Result<Value, String> {
@@ -642,7 +740,7 @@ fn release_check_004_absent_capability_withholds_controls() {
     }
 }
 
-/// Scenario: Remap Details and the modal's Cancel key, press their old keys and their new keys, and inspect the resulting dialog. Only the configured keys may open Details or cancel, help in the modal must show the new binding, and the modal's old `c` must not fall through to a dashboard action.
+/// Scenario: Seed a dismissible restart notice, remap Details and its Cancel key, and press their old and new keys. The modal's old `c` must preserve the notice after closing, while `c` on the dashboard visibly dismisses it; configured keys and hints must still open Details and cancel the check.
 #[spec("inbox/release-check/004")]
 #[test]
 fn release_check_004_keys_are_remappable_and_modal() {
@@ -693,6 +791,7 @@ fn release_check_004_keys_are_remappable_and_modal() {
         &["release_check"],
         &initial,
         "auto",
+        &["SC10-BACKGROUND-NOTICE"],
         &[
             key('v'),
             KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE),
@@ -700,6 +799,7 @@ fn release_check_004_keys_are_remappable_and_modal() {
             KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE),
             esc(),
             KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE),
+            key('c'),
         ],
         (120, 32),
         &mut |request| backend.execute(request),
@@ -716,6 +816,29 @@ fn release_check_004_keys_are_remappable_and_modal() {
         frames[5], frames[6],
         "modal-only F3 cannot cancel behind Details"
     );
+    let notice = "The deck restarted; these agents were stopped: SC10-BACKGROUND-NOTICE.";
+    for index in [0, 5, 6] {
+        assert!(
+            buffer_text(&frames[index]).contains(notice),
+            "background notice must survive modal c through closing Details, frame {index}"
+        );
+    }
+    assert!(
+        !buffer_text(&frames[7]).contains(notice),
+        "positive control: dashboard c must dismiss the seeded notice"
+    );
+}
+
+fn buffer_text(buffer: &Buffer) -> String {
+    let area = buffer.area();
+    (area.y..area.bottom())
+        .map(|y| {
+            (area.x..area.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn agent_settings(buffer: &Buffer) -> String {

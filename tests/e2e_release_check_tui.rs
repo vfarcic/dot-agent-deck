@@ -170,6 +170,8 @@ fn release_check_005_driver_refuses_a_non_standin_pane() {
     std::fs::create_dir_all(daemon.home.join("ring-barriers")).unwrap();
     // This is still our harmless Python composer, never a real agent. It has
     // no stand-in profile and must not gain one through the outcome driver.
+    // It already cannot receive doorbells: refusal plus no input here does
+    // not establish that the driver withheld record publication/authority.
     let pane = pane_with(
         &daemon,
         target,

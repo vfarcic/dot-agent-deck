@@ -4,10 +4,9 @@ This test-only slice stacks on SC-08 RED at `d65f47ef`. It uses the accepted opt
 
 ## Input and rendering seam
 
-The proposed entry point follows the existing host-metrics L1 seam but has an explicit build gate, compatible with integration tests:
+The proposed entry point follows the existing host-metrics L1 seam as an unconditionally compiled, hidden public helper, compatible with integration tests in both debug and release profiles:
 
 ```rust
-#[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn render_release_check_key_sequence_to_buffers(
     keys: &KeybindingConfig,
@@ -16,13 +15,14 @@ pub fn render_release_check_key_sequence_to_buffers(
     capabilities: &[&str],
     snapshot: &AttachResponse,
     initial_mode: &str,
+    restart_notice_labels: &[&str],
     input: &[KeyEvent],
     size: (u16, u16),
     execute: &mut dyn FnMut(serde_json::Value) -> Result<serde_json::Value, String>,
 ) -> Vec<ratatui::buffer::Buffer>;
 ```
 
-The integration-test file carries the same `cfg(debug_assertions)` gate. Library `cfg(test)` alone cannot expose a seam to an integration test. Ordinary UI construction must not accept this injected executor; the debug-only seam substitutes the external boundary while invoking production key dispatch, selection, prompt handling, response application and rendering on TestBackend. Release builds exclude the injection entry point. This is an implementation requirement, not a verified property of an entry point that is currently missing.
+The integration-test file has no `cfg(debug_assertions)` gate, and linkage-check must count its annotations. Library `cfg(test)` alone cannot expose a seam to an integration test. Ordinary UI construction must not accept this injected executor; the hidden public seam substitutes the external boundary while invoking production key dispatch, selection, prompt handling, response application and rendering on TestBackend. It remains compiled when debug assertions are off, like the sibling host-metrics and restart-notice seams. This is an implementation requirement, not a verified property of an entry point that is currently missing. The separate e2e outcome driver below remains feature-gated.
 
 Return the initial frame and one frame after each key. Capabilities represent the connected daemon's Hello, independently of whether the snapshot contains records: absent or unrelated capability sets must withhold commands and controls and show upgrade guidance in agent settings. Mode is supplied separately because SC-08's snapshot has no settings field. The selected session provides the current agent/release even when there is no journal row.
 
@@ -36,13 +36,15 @@ Details reads the selected row's diagnostic, never the selected pane's unrelated
 
 - Re-check sends exactly `{"op":"release-check-run","agent":"claude"}`: the current identity for that agent, even when an older row is selected.
 - Cancel sends exactly `{"op":"release-check-cancel"}`: the running check, even when another completed row is selected.
-- Forget sends agent/release and removes every record of that release. When several identities share the selected release, Details says “Forget all records of 2.1.313.” Both identities become forgotten in the accepted synthetic reply; an older release stays passed.
+- Forget sends agent/release and removes every record of that release. Details shows “Forget all records of 2.1.313.” only when several identities share the selected release; a single identity still offers Forget without that scope sentence. The existing Forget test pins both cases explicitly. Both identities become forgotten in the accepted synthetic reply; an older release stays passed.
 - Export operates on the selected release, including its records for both displayed identities.
 - A forgotten row offers Re-check and Close. Forget/Export keys are inert. No-reference offers Close and the §4.5 prompt advice; it does not offer an unusable Re-check. Mode off offers settings/prompt advice and no Re-check until enabled.
 
 The sixteen-hex identity is a display abbreviation, not an authority key. No identity selector is sent. The external adapter enforces exact run/cancel/forget requests and exact preview/write export scope so an accidentally added identity field fails.
 
 Export and mode are local adapter operations, not new daemon request variants. Preview sends `{"op":"release-check-export-preview","agent":"claude","release":"2.1.313"}`, returns `{"ok":true,"files":[{"name":"record.json","content":"…"},…]}`, and writes nothing. Fixture names/content stand in for an export manifest and scrubbed inspection material; the production exporter must supply its actual list. The user sees record.json, trace.txt and README, can select and open each in Details, return to the list, and cancel. The scope line states that the selected release's records are included. Only Continue opens the directory prompt; only its final confirmation calls `release-check-export` with agent/release/dir. Escape from either list/inspection or the directory prompt writes nothing. The preview includes the bounded-scrubber limitation in user words. These tests exercise production UI preview/prompt handlers, not real file loading, the scrubber or persistence.
+
+Inspection treats recorded terminal output as inert text in both clients, independently of secret-pattern scrubbing. Display each C0 control other than LF, DEL, and each C1 control as a printable lowercase two-digit `\xNN` escape: ESC becomes `\x1b`, CR becomes `\x0d`, and C1 CSI becomes `\x9b`. LF delimits content rows and must not appear in a rendered buffer cell. Preserve printable text and literal backslashes; do not interpret CSI cursor/colour/mode sequences, OSC 0 titles, OSC 52 clipboard writes, or other embedded terminal commands. The preview renderer applies this presentation rule to file contents before creating UI text; it is not a claim about scrubbing or modifying exported bytes. SC-11 must apply the same rule to desktop inspection. The extended Export test includes named attack sequences and every C0/C1 control plus DEL, scans the whole buffer for control-bearing cells, and compares each hostile frame with its already escaped control frame so the dialog and surrounding rows stay unchanged.
 
 Mode sends `release-check-mode` with mode; successful replies contain updated release_checks and mode. Choosing off during a running check opens a confirmation; Escape keeps ask/running and issues no operation. Enter accepts off; the adapter returns a stopped inconclusive/runner_stopped record, allowing the renderer to show off and cancellation. Switching back to auto restores the setting. This synthetic reply tests UI response application, not actual cancellation, store preservation or exclusion of local admission; SC-09b must prove those daemon effects.
 
@@ -51,6 +53,8 @@ Mode sends `release-check-mode` with mode; successful replies contain updated re
 Defaults remain v for Details, R for Re-check and p for agent details; M changes the mode in agent settings. The uppercase defaults are proposals; both clients' implementers must check them. These are ActionSpecs, not unconditional character handlers. Proposed dashboard config names are release_check_details, release_check_run, agent_details and release_check_mode, with context gating on the last one.
 
 Details has its own `[release_check_details]` section: move_down=j, move_up=k, recheck=R, cancel=c, forget=f, export=e and close=Esc. Export subviews use the modal's navigation/close bindings and their own ActionSpecs for open=Enter, continue=w and confirm=Enter, active only in the appropriate subview. Register those subview names in a dedicated scope (for example `[release_check_export]`) rather than colliding with dashboard FocusPane. The remap test sets dashboard release_check_details=F2 and modal cancel=F3. Old keys become inert, hints show F3, and F3 outside Details cannot cancel. Test outcomes concern the rendered dialog and accepted external operations, not internal routing enums. The existing dashboard c/e actions must not receive modal keystrokes. Dashboard d stays Back to Pane, r Rename and m Host.
+
+The seam seeds a real restart notice from `restart_notice_labels` (empty for ordinary cases). The remap case names SC10-BACKGROUND-NOTICE, presses old modal `c`, closes Details and requires that notice still visible. A subsequent dashboard `c` must visibly dismiss it as a positive control: accidental modal fallthrough would otherwise be indistinguishable from an inactive background binding.
 
 M cycles auto → ask → off → auto when no check is active. With a running check, ask → off requires the explicit confirmation described above. The off settings line omits Re-check; auto and ask explain their meaning where displayed.
 
@@ -66,9 +70,9 @@ Snapshots are manually authored expected output, not accepted from incorrect ren
 
 ## Stand-in outcome driver and policy barriers (L2)
 
-`DOT_AGENT_DECK_E2E_RELEASE_CHECK_CONTROL=<isolated directory>` is a proposed driver whose definitions and call sites must be compiled only with `#[cfg(feature = "e2e")]`. A normal build ignores the variable and cannot enter that driver. The directory contains scenario.json with schema 1, the exact pane_id, profile standin, canonical agent/release, display identity, progress running and position 1. The driver validates the named pane's actual profile, not the JSON assertion: it must refuse a mismatched pane or a non-stand-in. Refusal logs to the sandbox daemon's log and writes `refused.json` containing `{"reason":"not_standin","pane_id":"…"}` for the negative control. That acknowledgement is test-only, not admission authority.
+`DOT_AGENT_DECK_E2E_RELEASE_CHECK_CONTROL=<isolated directory>` is a proposed driver whose definitions and call sites must be compiled only with `#[cfg(feature = "e2e")]`. A normal build ignores the variable and cannot enter that driver. The directory contains scenario.json with schema 1, the exact pane_id, profile standin, canonical agent/release, display identity, progress running and position 1. The driver validates the named pane's actual profile, not the JSON assertion: it must refuse a mismatched pane or a non-stand-in. Refusal logs to the sandbox daemon's log and writes `refused.json` containing `{"reason":"not_standin","pane_id":"…"}` for the negative control. Keep that filename and its writer inside the e2e-gated driver module, with its call sites gated too; do not introduce an ordinary-build env-controlled acknowledgement writer. That acknowledgement is test-only, not admission authority.
 
-The negative case runs the harmless Python composer with profile=false, never an agent CLI or runner. It requires refusal and zero input through completed policy decisions before and after a synthetic pass. An e2e build must not let this driver admit an actual production-profile generation. Compile-time exclusion from an ordinary build is an implementation requirement to inspect and verify during GREEN; these lane-1 invocations build with e2e and do not certify ordinary-build exclusion.
+The negative case runs the harmless Python composer with profile=false, never an agent CLI or runner. It requires refusal and zero input through completed policy decisions before and after a synthetic pass. This unprofiled composer already cannot receive doorbell input, so refusal/no-input does not prove that no record authority was granted: a broken driver could also publish or admit a record without causing input here. An e2e build must not let this driver admit an actual production-profile generation; implementation verification must check that actual-profile validation returns before publication/admission. Compile-time exclusion from an ordinary build is an implementation requirement to inspect and verify during GREEN; these lane-1 invocations build with e2e and do not certify ordinary-build exclusion.
 
 The positive fixture holds the outcome until result.json appears. It feeds the real queue/admission and snapshot path, never directly edits the TUI summary, injects input or acknowledges an inbox message. The test uses the existing `DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR` controlled clock and `clock_step`: clock-observed acknowledges a completed policy tick plus its spawned attempts, then the recorder drains. Only then is an empty input history meaningful. A second completed policy step with the check still held proves that focus did not type a human byte.
 
