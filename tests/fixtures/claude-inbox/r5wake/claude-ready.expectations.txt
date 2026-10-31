@@ -1,6 +1,7 @@
 # Production Grid at recorded PTY read boundaries; resizes apply before the next byte.
 # Frame = fixture/read-number@end-offset:rowsxcols; columns = ready empty-and-ready.
-# Characterisation of this corpus only; no claim about arbitrary splits or unknown screens.
+# Characterisation of current production decisions, not an independent verdict per row; no claim about arbitrary splits or unknown screens.
+# Update only with a reviewed recogniser change; name the moved frames in the PR or report.
 claude-2.1.310-composer-24x80/4@1289:24x80 ready ready
 claude-2.1.310-composer-24x80/5@1307:24x80 ready ready
 claude-2.1.310-composer-24x80/6@1310:24x80 ready ready
