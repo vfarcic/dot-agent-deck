@@ -1212,7 +1212,8 @@ pub enum UpgradeOffer {
     Current,
     /// The daemon is newer than this client: nothing to offer.
     DaemonNewer { daemon: String },
-    /// The daemon's version is not known or not readable.
+    /// The daemon's version is not known or not readable, or either side is a
+    /// build that does not know its own version (issue #326).
     Unknown,
 }
 
@@ -1227,6 +1228,12 @@ pub fn upgrade_offer_against(client: &str, daemon_version: Option<&str>) -> Upgr
     let Some(daemon) = daemon_version else {
         return UpgradeOffer::Unknown;
     };
+    // A build that does not know its version reports the `0.1.0` placeholder
+    // marked `+unknown`; ordered as a release, it would read as the oldest one
+    // there is (issue #326).
+    if crate::version::is_unknown_version(client) || crate::version::is_unknown_version(daemon) {
+        return UpgradeOffer::Unknown;
+    }
     match (release_version(client), release_version(daemon)) {
         (Some(c), Some(d)) if c > d => UpgradeOffer::Offered {
             from: daemon.to_string(),

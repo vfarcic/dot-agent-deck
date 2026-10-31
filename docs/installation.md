@@ -367,6 +367,8 @@ It prints a plan for the copy you ran, and for the desktop app when one is insta
 
 When a copy is already current it prints, for example, `dot-agent-deck CLI is up to date (v<version>).`
 
+A copy built from source without a version (no `DAD_VERSION` set and no git tags in the checkout) cannot tell which release it is, and its `--version` ends in `+unknown`. No upgrade is offered for it, the footer and the desktop app show no notice for it, and `dot-agent-deck upgrade` prints `dot-agent-deck CLI does not know which release it is (it reports v0.1.0+unknown), so no upgrade is offered.` Install a release, or rebuild with `DAD_VERSION=<x.y.z>` set, to get upgrade notices again.
+
 ### What upgrading does for each install method
 
 Each copy is upgraded the way it was installed. The same plan is shown by `dot-agent-deck upgrade`, the TUI's upgrade dialog and the desktop app's dialog.

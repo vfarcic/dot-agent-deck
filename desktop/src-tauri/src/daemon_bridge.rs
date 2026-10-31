@@ -3991,6 +3991,16 @@ mod tests {
             assert_eq!(connection.daemon_version.as_deref(), daemon_version);
             serde_json::to_value(&connection).unwrap()["upgradeOffer"].clone()
         };
+        assert_eq!(offer(None)["kind"], "unknown");
+        assert_eq!(offer(Some("0.1.0+unknown"))["kind"], "unknown");
+        // Issue #326: a build that does not know its own version (a tagless
+        // checkout, as CI's is) offers nothing either way.
+        if !dot_agent_deck::version::own_version_known() {
+            for daemon in ["0.0.1", CLIENT_VERSION, "999.0.0"] {
+                assert_eq!(offer(Some(daemon))["kind"], "unknown", "{daemon}");
+            }
+            return;
+        }
         assert_eq!(
             offer(Some("0.0.1")),
             serde_json::to_value(UpgradeOffer::Offered {
@@ -4002,7 +4012,6 @@ mod tests {
         assert_eq!(offer(Some("0.0.1"))["kind"], "offered");
         assert_eq!(offer(Some(CLIENT_VERSION))["kind"], "current");
         assert_eq!(offer(Some("999.0.0"))["kind"], "daemon-newer");
-        assert_eq!(offer(None)["kind"], "unknown");
     }
 
     /// Issue #1637: a deck's connection carries the hook-binary notices its
