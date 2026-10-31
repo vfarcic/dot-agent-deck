@@ -1724,9 +1724,21 @@ pub fn opencode_form_asked(props: &Value, raised_at_ms: i64) -> Option<PendingQu
                     (options, kind == "multiselect")
                 }
                 "string" | "number" | "integer" => (vec![free_text(1)], false),
+                // A field the deck cannot express (`external`, a kind newer
+                // than this build) keeps one keyboard-only option, so the
+                // form stays on the card as keyboard-only rather than being
+                // dropped as a question with nothing to show
+                // ([`PendingQuestion::sanitized`] refuses one with no
+                // options; audit I2).
                 _ => {
                     keyboard_only = true;
-                    (Vec::new(), false)
+                    (
+                        vec![QuestionOption {
+                            keyboard_only: true,
+                            ..free_text(1)
+                        }],
+                        false,
+                    )
                 }
             };
             Question {

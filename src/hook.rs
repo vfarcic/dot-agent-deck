@@ -6395,6 +6395,14 @@ mod question_tests {
             let props = serde_json::json!({"id": "frm_9", "form": {"id": "frm_9", "sessionID": "s", "title": "t", "fields": [field]}});
             let q = crate::question::opencode_form_asked(&props, 0).unwrap();
             assert_eq!(q.channel, AnswerChannel::Unsupported, "{field}");
+            // What the card is given: the form survives sanitizing, still
+            // keyboard-only (audit I2: an `external` field once left a
+            // question with no options, which dropped the whole form).
+            let shown = q
+                .sanitized()
+                .unwrap_or_else(|| panic!("{field}: the form vanished from the card"));
+            assert_eq!(shown.channel, AnswerChannel::Unsupported, "{field}");
+            assert_eq!(shown.questions.len(), 1, "{field}");
         }
         let empty = serde_json::json!({"id": "frm_9", "form": {"id": "frm_9", "fields": []}});
         assert!(crate::question::opencode_form_asked(&empty, 0).is_none());

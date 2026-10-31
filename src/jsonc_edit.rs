@@ -91,7 +91,7 @@ pub fn has_entry(text: &str, is_ours: impl Fn(&str) -> bool) -> Result<bool, Ref
     Ok(root.plugin.is_some_and(|(_, elements)| {
         elements
             .iter()
-            .any(|e| e.value.as_str().is_some_and(&is_ours))
+            .any(|e| entry_name(&e.value).is_some_and(&is_ours))
     }))
 }
 
@@ -151,9 +151,23 @@ pub fn remove_entries(
     remove_list_entries(text, TUI_LIST, is_ours)
 }
 
+/// The plugin an element of a plugin list names: a string element itself,
+/// the `package` of an object element (OpenCode 2.x's `{ "package": …,
+/// "options": … }`), or the first item of a `[name, options]` tuple (1.x's
+/// form, which 2.2.5's migration turns into the object; measured). `None`
+/// for anything else.
+pub fn entry_name(value: &Value) -> Option<&str> {
+    match value {
+        Value::String(name) => Some(name),
+        Value::Object(object) => object.get("package").and_then(Value::as_str),
+        Value::Array(items) => items.first().and_then(Value::as_str),
+        _ => None,
+    }
+}
+
 /// [`remove_entries`] for the root's `key` list (`plugins` in OpenCode 2.x's
-/// `cli.json`). Only string elements are ever matched, so an object entry
-/// (`{ "package": …, "options": … }`) is always kept.
+/// `cli.json`). An element is matched by the plugin it names
+/// ([`entry_name`]), in any of its forms (review N5).
 pub fn remove_list_entries(
     text: &str,
     key: &str,
@@ -172,7 +186,7 @@ pub fn remove_list_entries(
         };
         let Some(n) = elements
             .iter()
-            .position(|e| e.value.as_str().is_some_and(&is_ours))
+            .position(|e| entry_name(&e.value).is_some_and(&is_ours))
         else {
             break;
         };
@@ -185,7 +199,7 @@ pub fn remove_list_entries(
     }
     let mut expected = original.value.clone();
     if let Some(list) = expected.get_mut(key).and_then(Value::as_array_mut) {
-        list.retain(|v| !v.as_str().is_some_and(&is_ours));
+        list.retain(|v| !entry_name(v).is_some_and(&is_ours));
     }
     verify(&current, key, &expected)?;
     Ok(Some(current))
@@ -580,6 +594,25 @@ mod tests {
         }
         assert_eq!(remove_entries("{\"plugin\":[\"u\"]}", ours).unwrap(), None);
         assert!(remove_entries("{broken", ours).is_err());
+    }
+
+    /// Review N5: 2.2.5's migration turns a `[name, options]` entry into a
+    /// `{ package, options }` object (measured), so the deck's entry is found
+    /// and removed in either form, and other objects stay.
+    #[test]
+    fn remove_finds_an_entry_in_object_or_tuple_form() {
+        let migrated = "{\n  \"plugins\": [\n    {\n      \"package\": \"/deck/tui.js\",\n      \"options\": {}\n    },\n    {\n      \"package\": \"p\"\n    }\n  ]\n}\n";
+        assert_eq!(
+            remove_list_entries(migrated, "plugins", ours)
+                .unwrap()
+                .as_deref(),
+            Some("{\n  \"plugins\": [\n    {\n      \"package\": \"p\"\n    }\n  ]\n}\n")
+        );
+        let tuple = "{\"plugin\": [[\"/deck/tui.js\", {}], \"u\"]}";
+        assert_eq!(
+            remove_entries(tuple, ours).unwrap().as_deref(),
+            Some("{\"plugin\": [\"u\"]}")
+        );
     }
 
     /// PRD #2050: OpenCode 2.x's `cli.json` holds a `plugins` list, in the
