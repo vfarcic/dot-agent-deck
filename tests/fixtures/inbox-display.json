@@ -84,6 +84,13 @@
   "attentionTitle": "Deck messages",
   "attentionOtherHeld": "other held",
   "attentionHeld": "held",
+  "cardTerminations": {
+    "pane_command_exited": "not delivered: the command started in the agent's pane exited (code {code}) before taking this message",
+    "connection_ended": "not delivered: the deck's connection to the agent's pane ended before it took this message; whether the agent is still running is unknown",
+    "replaced": "not delivered: the agent's pane was replaced before it took this message; the message stays with the previous agent",
+    "closed": "not delivered: the pane was closed before the agent took this message",
+    "unknown": "not delivered: the agent's pane ended before it took this message"
+  },
   "terminations": {
     "pane_command_exited": "the command started in the agent's pane exited (code {code}) before taking this message",
     "connection_ended": "the deck's connection to the agent's pane ended before it took this message; whether the agent is still running is unknown",

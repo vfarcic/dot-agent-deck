@@ -11363,11 +11363,11 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** desktop CSS layout.
 - **Platform coverage:** all.
 
-##### inbox/status/008 — TUI Error card explains an undeliverable inbox message.
-- **Layer:** L1 (`tests/render_dashboard.rs`), delivery_notice event + TestBackend + insta.
+##### inbox/status/008 — Error cards and tiles say how a worker's pane ended.
+- **Layer:** L1 (`tests/render_dashboard.rs`), in-memory InboxHub card-notice sink → delivery_notice event → TestBackend + insta; desktop component (`desktop/src/components/InboxSurfaces.test.tsx`), subscribed bridge and hydrated snapshot → real AgentTile.
 - **Agent:** none.
-- **Asserts:** Error and the not-delivered notice are visible on the card; wording shares the desktop fixture.
-- **Does not assert:** daemon generation of the notice.
+- **Asserts:** Error and the complete not-delivered explanation for exit zero, exit seven, connection ended (without claiming the agent stopped), replaced (retaining the previous-agent distinction), closed and unknown, in `tests/fixtures/inbox-display.json`'s `cardTerminations` words. Both clients read the same seven inputs from `inbox-termination-cards.json`; the TUI's real hub output is compared with reviewed desired-card snapshots and pins each captured daemon notice the desktop consumes. The desktop tile displays that notice through both the subscribed delivery-notice event and the hydrated snapshot. A wrapper-attributed code 23 remains the TUI card's explanation when a close follows the natural-exit settlement; the desktop displays that retained evidence.
+- **Does not assert:** real PTY exit capture, wrapper attribution or #2028's race before hub settlement (`inbox/status/032`); narrow card truncation or CSS layout.
 - **Platform coverage:** all.
 
 ##### inbox/status/009 — TUI prompt line labels deck messages without replacing the last human prompt.

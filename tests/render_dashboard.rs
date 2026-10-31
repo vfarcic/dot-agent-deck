@@ -1448,31 +1448,24 @@ fn status_007_narrow_card_keeps_inbox_status_and_stats() {
     insta::assert_snapshot!(rendered);
 }
 
-/// Scenario: An undeliverable message emits the existing delivery_notice error channel for this pane. Its card must show Error and the complete not-delivered notice instead of keeping the old user prompt as its only explanation.
-#[spec("inbox/status/008")]
-#[test]
-fn status_008_card_shows_not_delivered_error_notice() {
+/// Render the daemon's delivery-notice error channel on the real card.
+fn delivery_notice_card(notice: &str) -> String {
     let session = card_stats_session("/home/dev/api-svc");
     let mut state = AppState::default();
     state.register_pane("pane-card-stats".to_string());
     state.sessions.insert(session.session_id.clone(), session);
-    let words = inbox_display_words();
-    let notice = format!(
-        "{}: review fixture (agent exited)",
-        words["notDelivered"].as_str().unwrap()
-    );
     state.apply_daemon_report_event(AgentEvent {
         session_id: "sess-card-stats".into(),
         agent_type: AgentType::ClaudeCode,
         event_type: EventType::Error,
         tool_name: None,
-        tool_detail: Some(notice.clone()),
+        tool_detail: Some(notice.to_string()),
         cwd: None,
         timestamp: render_now(),
         user_prompt: None,
         metadata: HashMap::from([(
             dot_agent_deck::event::DELIVERY_NOTICE_METADATA_KEY.to_string(),
-            notice.clone(),
+            notice.to_string(),
         )]),
         pane_id: Some("pane-card-stats".into()),
         agent_id: Some("agent-card-stats".into()),
@@ -1491,19 +1484,101 @@ fn status_008_card_shows_not_delivered_error_notice() {
         0,
         render_now(),
         false,
-        80,
+        180,
         CardDensityKind::Normal.rendered_height(),
     );
-    let rendered = buffer_to_text(&buffer);
+    buffer_to_text(&buffer)
+}
+
+/// Scenario: A worker's pending message becomes undeliverable when its pane command exits (zero or nonzero), its connection ends, or its pane is replaced, closed or unknown. The real hub's notice makes the card Error and names that outcome and code in the desktop's shared words; a later close keeps the wrapper-attributed exit instead of replacing it.
+#[spec("inbox/status/008")]
+#[test]
+fn status_008_card_shows_not_delivered_error_notice() {
+    use dot_agent_deck::inbox::{Content, DeckId, InboxLimits, Recipient};
+    use dot_agent_deck::inbox_display::PaneTermination;
+    use dot_agent_deck::inbox_hub::{ExitKind, InboxHub};
+
+    let words = inbox_display_words();
+    let cases: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("fixtures/inbox-termination-cards.json")).unwrap();
+    let mut failures = Vec::new();
+    let mut expected_cards = String::new();
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let expected = words["cardTerminations"][case["wordKey"].as_str().unwrap()]
+            .as_str()
+            .unwrap()
+            .replace("{code}", &case["termination"]["code"].to_string());
+        let hub = InboxHub::new(
+            DeckId::parse("k3xzq2ab").unwrap(),
+            InboxLimits::default(),
+            std::time::Duration::from_secs(30),
+        );
+        let notices = Arc::new(Mutex::new(Vec::new()));
+        let told = Arc::clone(&notices);
+        hub.set_card_notice_sink(Arc::new(move |notice| {
+            told.lock().unwrap().push(notice.detail.to_string());
+        }));
+        hub.post_direct(
+            Recipient::bound("pane-card-stats", "agent-card-stats"),
+            Content::from_deck("test", "review fixture", "inspect the sentinel"),
+        )
+        .unwrap();
+        let termination = serde_json::from_value(case["termination"].clone()).unwrap();
+        hub.agent_exited_as(
+            "pane-card-stats",
+            "agent-card-stats",
+            ExitKind::Natural,
+            Some(termination),
+        );
+        if case["closeAfterExit"] == true {
+            hub.agent_exited_as(
+                "pane-card-stats",
+                "agent-card-stats",
+                ExitKind::Removed,
+                Some(PaneTermination::Closed),
+            );
+        }
+        hub.post_owed_notices();
+        let notices = notices.lock().unwrap();
+        assert_eq!(
+            notices.len(),
+            1,
+            "{name}: one notice for the pending message"
+        );
+        // This captured producer output is what the desktop tests hydrate and
+        // stream. Refresh it with the producer fix; frontend-only edits to
+        // the capture cannot make both clients pass.
+        assert_eq!(
+            notices[0],
+            case["cardNotice"].as_str().unwrap(),
+            "{name}: refresh the captured daemon notice"
+        );
+        let rendered = delivery_notice_card(&notices[0]);
+        let expected_card = delivery_notice_card(&expected);
+        assert!(
+            expected_card.contains(&expected),
+            "test card clipped {name}:\n{expected_card}"
+        );
+        assert!(
+            rendered.contains("Error"),
+            "{name}: card lost Error:\n{rendered}"
+        );
+        expected_cards.push_str(&format!("=== {name} ===\n{expected_card}\n"));
+        if rendered != expected_card {
+            failures.push(format!(
+                "{name}: expected {expected:?}\nactual card:\n{rendered}"
+            ));
+        }
+    }
+    // Approve the desired visible cards, then compare production's cards with
+    // them. Accepting a snapshot can never bless the fixed, code-less notice.
+    insta::assert_snapshot!("status_008_termination_cards", expected_cards);
     assert!(
-        rendered.contains("Error"),
-        "undeliverable message did not make the card Error:\n{rendered}"
+        failures.is_empty(),
+        "termination wording missing from cards:\n{}",
+        failures.join("\n")
     );
-    assert!(
-        rendered.contains(&notice),
-        "Error card lost its not-delivered explanation:\n{rendered}"
-    );
-    insta::assert_snapshot!(rendered);
 }
 
 /// Scenario: After a human prompt, the daemon broadcasts a deck-message prompt labelled with its subject. The card must render that envelope subject, while its user-prompt history still contains only the human's text.

@@ -1,6 +1,7 @@
 import { render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import words from "../../../tests/fixtures/inbox-display.json";
+import terminationCases from "../../../tests/fixtures/inbox-termination-cards.json";
 import { AgentTile } from "./AgentTile";
 import { HandoffRail } from "./HandoffRail";
 import { mapDesktopSnapshot, TauriDeckBridge, type DesktopSnapshotDto } from "../lib/bridge";
@@ -248,8 +249,8 @@ describe("inbox cards and handoff rail (S13)", () => {
     expect(screen.getByRole("article", { name: "Coder" }).textContent).not.toMatch(/✉\d/);
   });
 
-  /// Scenario: Receive an undeliverable broadcast and its delivery_notice event through the real bridge, then show Error and the notice on the card.
-  it("shows Error and the not-delivered notice on the agent card", async () => {
+  /// Scenario: inbox/status/008 — receive each pane-termination broadcast and its captured daemon delivery-notice event through the real subscribed bridge. The tile shows Error and the same complete reason and exit code as the TUI, including a wrapper-attributed exit retained after close.
+  it.each(terminationCases)("shows Error and the pane's termination on the agent card ($name)", async (testCase) => {
     const dto = snapshot();
     invoke.mockResolvedValue(dto);
     const bridge = new TauriDeckBridge();
@@ -257,20 +258,35 @@ describe("inbox cards and handoff rail (S13)", () => {
     try {
       await bridge.subscribe((next) => { fleet = next; }, vi.fn());
       await bridge.connect();
-      const notice = `${words.notDelivered}: review the fixture (agent exited)`;
-      listeners.get("desktop://daemon-event")?.({ payload: inbox("undeliverable", { reason: "agent_exited" }) });
+      const notice = (words.cardTerminations as Record<string, string>)[testCase.wordKey]
+        .replace("{code}", String(testCase.termination.code));
+      listeners.get("desktop://daemon-event")?.({ payload: inbox("undeliverable", {
+        reason: "agent_exited", termination: testCase.termination,
+      }) });
       listeners.get("desktop://daemon-event")?.({ payload: {
         kind: "event", session_id: "session-7", pane_id: "worker", agent_id: "7",
         agent_type: "codex", event_type: "error", timestamp: "2026-10-13T00:00:00Z",
-        tool_detail: notice, metadata: { delivery_notice: notice },
+        tool_detail: testCase.cardNotice, metadata: { delivery_notice: testCase.cardNotice },
       } });
       render(card(fleet[0].agents[0], fleet[0].evidence));
-      const tile = within(screen.getByRole("article", { name: "Coder" }));
-      expect(tile.getByText(/^error$/i)).toBeVisible();
-      expect(tile.getByText(notice)).toBeVisible();
+      const tile = screen.getByRole("article", { name: "Coder" });
+      expect(tile).toHaveTextContent(notice);
+      expect(within(tile).getByText(/^error$/i)).toBeVisible();
     } finally {
       await bridge.dispose();
     }
+  });
+
+  /// Scenario: inbox/status/008 — reconnect to an Error tile whose daemon snapshot holds each captured termination notice, pinned against the real hub by the TUI test. The tile must show the complete reason in the shared words, with no inference that the agent itself exited.
+  it.each(terminationCases)("hydrates the pane's termination on the agent card ($name)", (testCase) => {
+    const notice = (words.cardTerminations as Record<string, string>)[testCase.wordKey]
+      .replace("{code}", String(testCase.termination.code));
+    const dto = snapshot();
+    Object.assign(dto.agents[0], { status: "error", deliveryNotice: testCase.cardNotice });
+    render(card(mapDesktopSnapshot(dto).agents[0]));
+    const tile = screen.getByRole("article", { name: "Coder" });
+    expect(tile).toHaveTextContent(notice);
+    expect(within(tile).getByText(/^error$/i)).toBeVisible();
   });
 
   /// Scenario: Posting a message paints its subject and a queued delegation in the live rail.

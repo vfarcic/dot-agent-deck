@@ -1,0 +1,9 @@
+[
+  { "name": "exit-zero", "wordKey": "pane_command_exited", "termination": { "kind": "pane_command_exited", "code": 0, "reported_by": "deck" }, "cardNotice": "not delivered: the command started in this agent's pane exited before a deck message reached it" },
+  { "name": "exit-seven", "wordKey": "pane_command_exited", "termination": { "kind": "pane_command_exited", "code": 7, "reported_by": "deck" }, "cardNotice": "not delivered: the command started in this agent's pane exited before a deck message reached it" },
+  { "name": "connection-ended", "wordKey": "connection_ended", "termination": { "kind": "connection_ended", "read_end": "eof" }, "cardNotice": "not delivered: the deck's connection to this agent's pane ended before a deck message reached it" },
+  { "name": "replaced", "wordKey": "replaced", "termination": { "kind": "replaced" }, "cardNotice": "not delivered: this agent's pane ended before a deck message reached it" },
+  { "name": "closed", "wordKey": "closed", "termination": { "kind": "closed" }, "cardNotice": "not delivered: this agent's pane ended before a deck message reached it" },
+  { "name": "unknown", "wordKey": "unknown", "termination": { "kind": "unknown" }, "cardNotice": "not delivered: this agent's pane ended before a deck message reached it" },
+  { "name": "wrapper-exit-then-close", "wordKey": "pane_command_exited", "termination": { "kind": "pane_command_exited", "code": 23, "reported_by": "wrapper" }, "closeAfterExit": true, "cardNotice": "not delivered: the command started in this agent's pane exited before a deck message reached it" }
+]
