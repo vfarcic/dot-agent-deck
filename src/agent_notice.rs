@@ -2,12 +2,16 @@
 //! that agent runs which the deck cannot fully support — and what to do about
 //! it.
 //!
-//! The daemon decides ([`crate::opencode_mode`] for OpenCode), keeps the
-//! answer on the agent's record ([`crate::agent_pty::AgentRecord::agent_notice`])
-//! and announces each change with a status-neutral
-//! [`crate::event::EventType::AgentNotice`] event. Both clients show the
-//! notice's [`AgentNotice::text`], which is composed here and nowhere else, so
-//! the TUI card and the desktop tile say the same words (CLAUDE.md rule 22).
+//! The daemon decides ([`crate::opencode_mode`] for OpenCode) and sets the
+//! answer with [`crate::inbox_hub::InboxHub::set_agent_notice`], which keeps it
+//! in the agent's card notices (`InboxCardNotices::agent_notice`) and tells the
+//! clients only of a change. Both clients show the notice's
+//! [`AgentNotice::text`] in the card's notice row, ahead of the inbox's own
+//! notices. The text is composed here and nowhere else, so the TUI card and
+//! the desktop tile say the same words (CLAUDE.md rule 22).
+//!
+//! Each sentence leads with what to do and stays short, so a card narrow
+//! enough to show only its first two rows still shows the remedy.
 
 use serde::{Deserialize, Serialize};
 
@@ -44,10 +48,10 @@ pub struct AgentNotice {
 pub const OPENCODE_SUPPORTED_FLOOR: crate::opencode_version::Version = (1, 18, 29);
 
 /// [`AgentNoticeKind::OpencodeSharedService`]'s sentence.
-pub const OPENCODE_SHARED_SERVICE: &str = "OpenCode 2 is using its shared background service, so the deck cannot follow this agent: add --standalone to the agent's command, or run opencode service set disabled true, then restart the agent";
+pub const OPENCODE_SHARED_SERVICE: &str = "Add --standalone to the command or run opencode service set disabled true, then restart: OpenCode 2's shared service hides this agent";
 
 /// [`AgentNoticeKind::OpencodeNotReporting`]'s sentence.
-pub const OPENCODE_NOT_REPORTING: &str = "the deck's OpenCode integration is not working for this agent: run dot-agent-deck hooks install --agent opencode, then restart the agent (dot-agent-deck docs troubleshooting has more)";
+pub const OPENCODE_NOT_REPORTING: &str = "Run dot-agent-deck hooks install --agent opencode, then restart: the deck's OpenCode plugin is not reporting from this agent";
 
 impl AgentNotice {
     /// OpenCode 2 on its shared background service.
@@ -73,9 +77,8 @@ impl AgentNotice {
         Self {
             kind: AgentNoticeKind::OpencodeUnsupportedVersion,
             text: format!(
-                "OpenCode {major}.{minor}.{patch} is older than the deck supports \
-                 ({floor_major}.{floor_minor}.{floor_patch} or later): upgrade OpenCode, then \
-                 restart the agent"
+                "Upgrade OpenCode to {floor_major}.{floor_minor}.{floor_patch} or later, then \
+                 restart: version {major}.{minor}.{patch} is too old for the deck"
             ),
         }
     }
@@ -130,8 +133,8 @@ mod tests {
         let old = AgentNotice::opencode_unsupported_version((1, 18, 28)).text;
         assert_eq!(
             old,
-            "OpenCode 1.18.28 is older than the deck supports (1.18.29 or later): upgrade \
-             OpenCode, then restart the agent"
+            "Upgrade OpenCode to 1.18.29 or later, then restart: version 1.18.28 is too old for \
+             the deck"
         );
     }
 

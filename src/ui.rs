@@ -22238,7 +22238,20 @@ fn render_session_card(
     // beyond the inbox badge — an integration that takes nothing yet, paused
     // hand-outs, an uncertain delivery, held_long attention, failed receipt
     // storage. Fixed daemon words, the desktop tile's notice row.
+    //
+    // PRD #2050: a notice about how the agent runs (the daemon's agent notice,
+    // shown first in this row) says what to do in a sentence longer than a
+    // card is wide, so it wraps over up to [`CARD_AGENT_NOTICE_ROWS`] rows, as
+    // the desktop tile shows it whole; the other notices keep one row.
+    let mut wrapped_notice: Option<usize> = None;
     if !is_placeholder && let Some(notice) = session.inbox_notice() {
+        let is_agent_notice = session
+            .card_inbox()
+            .and_then(|inbox| inbox.agent_notice)
+            .is_some_and(|agent| !agent.is_empty() && agent == notice);
+        if is_agent_notice {
+            wrapped_notice = Some(attention.len());
+        }
         attention.push((
             notice,
             Style::default().fg(palette::status_color(&SessionStatus::Blocked)),
@@ -22264,18 +22277,36 @@ fn render_session_card(
         Line::from(Span::styled(truncate_with_ellipsis(&text, w), style))
     };
     let shares_row = density == CardDensity::Minimal && !attention.is_empty();
-    let mut attention = attention.into_iter();
+    // The rows the agent notice may take: what the card has left after its
+    // tools and every other status row, between one and
+    // [`CARD_AGENT_NOTICE_ROWS`].
+    let other_rows = attention.len().saturating_sub(1)
+        + usize::from(background.is_some() && !shares_row)
+        + usize::from(seat_row);
+    let notice_rows = (inner.height as usize)
+        .saturating_sub(density.max_tools() + other_rows)
+        .clamp(1, CARD_AGENT_NOTICE_ROWS);
+    let wrapped = |index: usize, (text, style): (String, Style)| -> Vec<Line<'static>> {
+        if wrapped_notice != Some(index) || (shares_row && index == 0) || notice_rows == 1 {
+            return vec![plain((text, style))];
+        }
+        card_wrapped_rows(&text, w, notice_rows)
+            .into_iter()
+            .map(|row| Line::from(Span::styled(row, style)))
+            .collect()
+    };
+    let mut attention = attention.into_iter().enumerate();
     match background {
         Some(text) if shares_row => {
-            let (reason, style) = attention.next().expect("checked non-empty");
+            let (_, (reason, style)) = attention.next().expect("checked non-empty");
             status_lines.push(reason_with_background(&reason, style, &text, w));
-            status_lines.extend(attention.map(plain));
+            status_lines.extend(attention.flat_map(|(i, item)| wrapped(i, item)));
         }
         Some(text) => {
-            status_lines.extend(attention.map(plain));
+            status_lines.extend(attention.flat_map(|(i, item)| wrapped(i, item)));
             status_lines.push(plain((text, text_primary())));
         }
-        None => status_lines.extend(attention.map(plain)),
+        None => status_lines.extend(attention.flat_map(|(i, item)| wrapped(i, item))),
     }
     // Issue #1947: the ORCHESTRATOR badge the title had no room for, after the
     // attention rows, so at Minimal density a reason keeps the one row.
@@ -22332,6 +22363,23 @@ fn render_session_card(
 /// Issue #1947: the orchestrator seat's card badge, at the end of its title or
 /// on a row of its own ([`render_session_card`]).
 const CARD_ORCHESTRATOR_BADGE: &str = "ORCHESTRATOR";
+
+/// PRD #2050: the most rows a card gives the daemon's agent notice, which
+/// leads with what to do (`crate::agent_notice`), so its first two rows carry
+/// the remedy on a card of about 60 columns.
+const CARD_AGENT_NOTICE_ROWS: usize = 3;
+
+/// `text` word-wrapped to `width` columns over at most `max_rows` rows, the
+/// last one cut with `…` when the text runs on.
+fn card_wrapped_rows(text: &str, width: usize, max_rows: usize) -> Vec<String> {
+    let mut rows = crate::upgrade_dialog::wrap(text, width.max(1));
+    if rows.len() > max_rows {
+        let rest = rows[max_rows - 1..].join(" ");
+        rows.truncate(max_rows - 1);
+        rows.push(truncate_with_ellipsis(&rest, width));
+    }
+    rows
+}
 
 /// Title columns a card keeps before its inbox line gives up its words for
 /// the bare count ([`card_inbox_badge`]).
@@ -35000,17 +35048,15 @@ mod tests {
         assert!(card.contains("│ORCHESTRATOR "), "{card}");
     }
 
-    /// Scenario: an OpenCode card whose daemon reports it on OpenCode 2's
-    /// shared background service, while its integration has not connected,
-    /// is drawn; the card's notice row says so and names both fixes, in place
-    /// of the not-connected notice (PRD #2050, the desktop tile's row).
-    #[test]
-    fn an_opencode_card_shows_the_daemons_agent_notice() {
+    /// An OpenCode card carrying the daemon's agent notice `notice` (beside a
+    /// not-connected integration notice it replaces), drawn `width` columns
+    /// wide at `density`'s height (PRD #2050).
+    fn opencode_card_with_agent_notice(notice: &str, width: u16, density: CardDensity) -> String {
         let mut session = make_session(SessionStatus::Idle);
         session.agent_type = AgentType::OpenCode;
         let inbox = crate::inbox_display::CardInbox {
             integration: Some(crate::inbox_display::IntegrationNotice::NotArmed),
-            agent_notice: Some(crate::agent_notice::OPENCODE_SHARED_SERVICE.to_string()),
+            agent_notice: Some(notice.to_string()),
             ..Default::default()
         };
         let entry: AgentEvent = serde_json::from_value(serde_json::json!({
@@ -35020,13 +35066,12 @@ mod tests {
             "timestamp": Utc::now(),
             "metadata": {
                 crate::inbox_display::CARD_INBOX_METADATA_KEY: inbox.encode(),
-                crate::inbox_display::CARD_INBOX_AGENT_NOTICE_METADATA_KEY:
-                    crate::agent_notice::OPENCODE_SHARED_SERVICE,
+                crate::inbox_display::CARD_INBOX_AGENT_NOTICE_METADATA_KEY: notice,
             },
         }))
         .unwrap();
         session.recent_events.push_back(entry);
-        let backend = ratatui::backend::TestBackend::new(240, 8);
+        let backend = ratatui::backend::TestBackend::new(width, density.card_height());
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let name = "auditor".to_string();
         terminal
@@ -35039,7 +35084,7 @@ mod tests {
                     false,
                     Some(&name),
                     Some(1),
-                    CardDensity::Compact,
+                    density,
                     UiMode::Normal,
                     None,
                     Utc::now(),
@@ -35048,15 +35093,99 @@ mod tests {
             })
             .unwrap();
         let drawn = buffer_to_string(terminal.backend().buffer());
-        let row = drawn
-            .lines()
-            .find(|line| line.contains("OpenCode 2 is using"))
-            .unwrap_or_else(|| panic!("no notice row:\n{drawn}"));
-        insta::assert_snapshot!(
-            row.trim_matches(|c| c == '│' || c == ' '),
-            @"OpenCode 2 is using its shared background service, so the deck cannot follow this agent: add --standalone to the agent's command, or run opencode service set disabled true, then restart the agent"
-        );
         assert!(!drawn.contains(crate::inbox_display::NOT_ARMED), "{drawn}");
+        // Only the content rows: the border rows carry the elapsed time.
+        let rows: Vec<&str> = drawn.lines().collect();
+        rows[1..rows.len() - 1]
+            .iter()
+            .map(|row| row.trim_end())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Scenario: an OpenCode card whose daemon reports it on OpenCode 2's
+    /// shared background service, while its integration has not connected,
+    /// is drawn 60 columns wide; the card's notice row wraps over three rows
+    /// and shows the whole sentence, both fixes first, in place of the
+    /// not-connected notice (PRD #2050, as the desktop tile shows it).
+    #[test]
+    fn an_opencode_card_shows_the_daemons_agent_notice() {
+        let card = opencode_card_with_agent_notice(
+            crate::agent_notice::OPENCODE_SHARED_SERVICE,
+            60,
+            CardDensity::Normal,
+        );
+        insta::assert_snapshot!(card, @r"
+        │Dir:  —                                                   │
+        │Add --standalone to the command or run opencode service   │
+        │set disabled true, then restart: OpenCode 2's shared      │
+        │service hides this agent                                  │
+        │                                                          │
+        │                                                          │
+        ");
+    }
+
+    /// Scenario: an OpenCode card whose deck plugin never reported is drawn 60
+    /// columns wide; the notice row wraps and shows the install command and
+    /// the restart before the reason (PRD #2050).
+    #[test]
+    fn an_opencode_card_shows_the_not_reporting_notice_whole() {
+        let card = opencode_card_with_agent_notice(
+            crate::agent_notice::OPENCODE_NOT_REPORTING,
+            60,
+            CardDensity::Normal,
+        );
+        insta::assert_snapshot!(card, @r"
+        │Dir:  —                                                   │
+        │Run dot-agent-deck hooks install --agent opencode, then   │
+        │restart: the deck's OpenCode plugin is not reporting from │
+        │this agent                                                │
+        │                                                          │
+        │                                                          │
+        ");
+    }
+
+    /// Scenario: an OpenCode card running a version older than the deck
+    /// supports is drawn 60 columns wide; the notice row says to upgrade to
+    /// the supported floor and restart, then names the version (PRD #2050).
+    #[test]
+    fn an_opencode_card_shows_the_unsupported_version_notice_whole() {
+        let text = crate::agent_notice::AgentNotice::opencode_unsupported_version((1, 18, 28)).text;
+        let card = opencode_card_with_agent_notice(&text, 60, CardDensity::Normal);
+        insta::assert_snapshot!(card, @r"
+        │Dir:  —                                                   │
+        │Upgrade OpenCode to 1.18.29 or later, then restart:       │
+        │version 1.18.28 is too old for the deck                   │
+        │                                                          │
+        │                                                          │
+        │                                                          │
+        ");
+    }
+
+    /// Scenario: the shared-service notice on a Compact card, which has room
+    /// for two notice rows beside its tool row, and on a Minimal card, which
+    /// has one; the Compact card still shows both fixes and the restart, and
+    /// the Minimal card keeps its single row cut with `…` (PRD #2050).
+    #[test]
+    fn a_narrow_density_card_keeps_the_agent_notice_remedy_in_its_rows() {
+        let compact = opencode_card_with_agent_notice(
+            crate::agent_notice::OPENCODE_SHARED_SERVICE,
+            60,
+            CardDensity::Compact,
+        );
+        insta::assert_snapshot!(compact, @r"
+        │Dir:  —                                                   │
+        │Add --standalone to the command or run opencode service   │
+        │set disabled true, then restart: OpenCode 2's shared serv…│
+        ");
+        let minimal = opencode_card_with_agent_notice(
+            crate::agent_notice::OPENCODE_SHARED_SERVICE,
+            60,
+            CardDensity::Minimal,
+        );
+        insta::assert_snapshot!(minimal, @r"
+        │Add --standalone to the command or run opencode service s…│
+        ");
     }
 
     #[test]

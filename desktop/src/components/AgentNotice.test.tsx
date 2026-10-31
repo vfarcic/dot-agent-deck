@@ -12,7 +12,7 @@ vi.mock("./TerminalViewport", () => ({ TerminalViewport: () => <pre>terminal</pr
 // (`src/agent_notice.rs`) and rides the card's notices, so the tile shows it
 // verbatim in the row the TUI's card prints it in.
 const SHARED_SERVICE =
-  "OpenCode 2 is using its shared background service, so the deck cannot follow this agent: add --standalone to the agent's command, or run opencode service set disabled true, then restart the agent";
+  "Add --standalone to the command or run opencode service set disabled true, then restart: OpenCode 2's shared service hides this agent";
 
 function snapshot(inbox: Record<string, unknown>): DesktopSnapshotDto {
   const agent = {
