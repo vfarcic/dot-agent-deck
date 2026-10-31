@@ -46,7 +46,7 @@ tasks:
       cargo nextest --version
 
   # Some fast-tier tests run `node` (e.g. tests/pi_native_observer.rs); GitHub's
-  # ubuntu-latest image and the devbox shell both ship Node 24, the RWX base
+  # `test` job sets up Node 26 and the devbox shell ships it, the RWX base
   # image does not. Exact X.Y.Z is required by the package.
   - key: node
     call: nodejs/install 1.2.0

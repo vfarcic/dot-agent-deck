@@ -90,6 +90,7 @@ pub mod host_metrics;
 pub(crate) mod git_env;
 pub mod hook;
 pub mod hook_binary;
+mod hook_event_order;
 pub mod hook_provenance;
 pub mod hooks_manage;
 pub mod hooks_refresh;

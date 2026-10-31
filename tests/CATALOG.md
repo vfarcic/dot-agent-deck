@@ -2878,6 +2878,27 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** that a dispatch whose acknowledgement FAILED, rather than timed out, still runs (the unknown pane runs none here); the dispatch itself, which `orchestration/dispatch` owns.
 - **Platform coverage:** mac+linux (Unix-domain socket).
 
+##### hooks/ingest/009 — One session's hook events apply in the order their connections were accepted (issue #1664).
+- **Layer:** L1 (the real `run_hook_loop_with_limits` driven against a real Unix hook socket in-process, with a 60s predecessor wait so the result does not depend on load; no PTY, no deck binary, no agent).
+- **Agent:** none (raw OpenCode `session_start` and `quota_blocked` lines, one per connection).
+- **Asserts:** a control session whose two events are written the ordinary way ends Blocked with both applied in order; then, for a second session, a `session_start` connection is accepted ahead of a `quota_blocked` connection but writes its line only after the `quota_blocked` has been sent and the daemon given a second to apply it. The card must read Blocked, the session's applied events must be `session_start` then `quota_blocked`, and the `quota_blocked` must not have been applied during that second. A third session repeats the reordering with the earlier connection sending an `inbox_announce` first and its `session_start` after it on the same connection, as a `SessionStart` hook with an inbox waiter does; the announce must keep the connection's place, with the same three assertions. Before the fix the later connection's task applied its event first and the `session_start` then reset the card to Idle, the symptom in `status/blocked/019`'s quarantine.
+- **Does not assert:** the ordering of events of different sessions and panes, which do not wait for each other (`hook_event_order` unit tests); the production predecessor wait (2s), which `hooks/ingest/010` exercises at a smaller value; ordering of `DaemonMessage` lines such as `question`, which take no part.
+- **Platform coverage:** mac+linux (Unix-domain socket).
+
+##### hooks/ingest/010 — A connection that never writes holds later events back only for the predecessor wait (issue #1664).
+- **Layer:** L1 (as `hooks/ingest/009`, with a 200ms predecessor wait).
+- **Agent:** none (one silent peer, then one `session_start` on a later connection).
+- **Asserts:** an event accepted behind a connection that stays open and silent is still applied while that connection is open, which is reachable only through the predecessor wait running out, since the silent peer's idle timeout (60s) is far past the test's 20s bound.
+- **Does not assert:** how long the event was held, beyond that bound (the exact wait is pinned by the `hook_event_order` unit test with paused time); the `debug!` line the wait writes when it gives up.
+- **Platform coverage:** mac+linux (Unix-domain socket).
+
+##### hooks/ingest/011 — A line provenance refuses or cannot attest does not hold back a genuine event of another pane (issue #2043).
+- **Layer:** L1 (as `hooks/ingest/009`, with three `/bin/sh` agents spawned in the registry so their events carry an attested token, and the 60s predecessor wait).
+- **Agent:** none (synthetic `inbox_announce` and raw event lines).
+- **Asserts:** a genuine `session_start` is applied within 10s, far short of the predecessor wait, when it is accepted behind an open connection whose `inbox_announce` names a pane the daemon never spawned; the same behind an announce presenting a well-formed token the daemon never minted, and an outside agent's event behind that refused announce is applied too, so the refused announce gave up its place; control: a genuine session's `session_start` written late on the earlier connection is still applied ahead of its `quota_blocked`.
+- **Does not assert:** a refused or unattested raw event taking no place ahead of a genuine one, and an attested announce holding back only its own pane, which the `hook_event_order` unit tests cover with paused time; a silent connection, which still holds a genuine event for up to the predecessor wait (`hooks/ingest/010`).
+- **Platform coverage:** mac+linux (Unix-domain socket).
+
 #### hooks/install
 
 ##### hooks/install/001 — Launching the deck with `~/.claude/` present writes hook entries into `~/.claude/settings.json` idempotently.
@@ -11934,6 +11955,13 @@ The desktop half of answering by voice. These tests live in the desktop crate (`
 - **Does not assert:** a different agent's late frames, which admission refuses before ingest (issue #320).
 - **Platform coverage:** mac+linux.
 
+##### question/hold/024 — A producer that never reads its connection cannot pin a hold (issue #1976).
+- **Layer:** L1/fast unit (`src/daemon_held_confirmation_deadline_tests.rs`, `handle_question_signal` called directly over in-memory duplex pipes).
+- **Agent:** none (a `/bin/sh` stand-in pane).
+- **Asserts:** a held question sent with `confirm_hold` on a connection that stays open but whose write side has no room for the `held` line is released at the connection's idle timeout (300 ms in the test, asserted under 2 s), as a producer that hung up is: the handler returns no reply, the hold-budget permit comes back, the hold is no longer registered and the pane shows no pending question. The control, a producer that reads, is told `held` and released at the hold deadline.
+- **Does not assert:** the stall over a real Unix socket, whose send buffer would have to be filled to within one line of full; the write deadline itself is `write_hook_reply`'s, as for `hooks/ingest/007`.
+- **Platform coverage:** mac+linux.
+
 ##### question/live/001 — A real Haiku permission is answered once and the command completes. [reel]
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_questions.rs`).
 - **Agent:** real interactive Claude Code, pinned Haiku 4.5, imported developer credentials and pre-seeded project trust.
@@ -13378,3 +13406,37 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 - **Asserts:** the daemon's "attach protocol connection error" warning arrives as one OTLP/JSON log record under `service.name=dot-agent-deck` with severity WARN (13), `deck.log.target=dot_agent_deck::daemon_protocol`, `code.file.path=src/daemon_protocol.rs`, a line number and `deck.log.fields=message`, with no body; no received body contains the warning's text; and `deck.log` still records the warning, so the file logger's output is unchanged.
 - **Does not assert:** ERROR records, the dropped-record count under load (unit-tested in `telemetry::logs`), OTLP/protobuf logs, the logs-specific endpoint variables, or delivery when the backend refuses a batch.
 - **Platform coverage:** mac+linux.
+
+## Test Case Catalog — Failed tool calls (issue #1835)
+
+##### hooks/install/024 — Claude Code's `PostToolUseFailure` hook is installed for a Claude Code that accepts it, and only then.
+
+- **Layer:** fast tier (`tests/claude_tool_failure.rs`), `install_to_with_gates` and `uninstall_from` against a temporary `settings.json`.
+- **Agent:** none; the gates come from `ClaudeHookGates::for_version`.
+- **Asserts:** for Claude Code 2.1.78 the install writes one deck `PostToolUseFailure` rule with no matcher beside the user's own rule under that key and leaves unrelated settings alone; for 2.1.77 and for an unknown version the deck's rule is removed and the user's kept; uninstall removes the deck's rule.
+- **Does not assert:** that Claude Code fires the hook (measured on 2.1.78 and 2.1.314 by hand, and covered live by `telemetry/otlp/046`), or the note `hooks install` prints when the gate is closed.
+- **Platform coverage:** mac+linux.
+
+##### status/tool-end/001 — A failed Claude Code tool call ends on the card without turning it to Error.
+
+- **Layer:** fast tier (`tests/claude_tool_failure.rs`), the real `dot-agent-deck hook --agent claude-code` CLI feeding `AppState::apply_event`.
+- **Agent:** none (Claude Code-shaped hook payloads; the `PostToolUseFailure` shape recorded from 2.1.314).
+- **Asserts:** after `SessionStart` and a Bash `PreToolUse`, a `PostToolUseFailure` becomes a `ToolEnd` carrying the call's `tool_use_id`, and the card drops the command as its running tool, counts it and keeps the status a `PostToolUse` (the control) leaves, never Error.
+- **Does not assert:** the rendered card (`telemetry/otlp/045` checks the grid has no Error), subagent calls, or Codex and Devin failed calls, which arrive as a failed `PostToolUse`.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/045 — A failed Claude Code call's operation ends when the call does.
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_failed_operation.rs`); real hook CLI and local OTLP/JSON receiver.
+- **Agent:** none; a `cat` stand-in receives synthetic Claude hooks.
+- **Asserts:** a Bash `PreToolUse` followed by `PostToolUseFailure` exports the shell operation before run end, without `deck.operation.end`, with the card Working and no Error on the grid; after the pane closes it is still the only operation and ends before the run.
+- **Does not assert:** a real agent emitting the hook (`telemetry/otlp/046`), or the operation's duration.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/046 — A command that fails in real interactive Claude Code ends its operation on time. [reel]
+
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_telemetry_failed_operation_live.rs`); local OTLP/JSON receiver.
+- **Agent:** real interactive Claude Code on Haiku, with the hooks the deck installs.
+- **Asserts:** Haiku runs one plain Bash command, `cp <sentinel> <proof>; exit 3`, which copies a unique sentinel and fails; the turn visibly goes Working/Bash → Idle; that command's operation (`deck.operation.program=cp`) exports while the run is open, without `deck.operation.end`, and ends before the run; the grid shows no Error. Skips, with the reason, when the installed Claude Code is below the hook's 2.1.78 floor.
+- **Does not assert:** that Claude Code fired `PostToolUseFailure` rather than another end (the hook is the only end it sends for a failed call, measured by hand on 2.1.314), other operations Haiku might run, or Claude Code's own success flag on its tool-result event.
+- **Platform coverage:** linux (lane 2 runs on a developer's machine).
