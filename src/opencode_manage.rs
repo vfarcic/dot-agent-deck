@@ -238,6 +238,14 @@ fn roots_from(
 /// so these serve either generation, and 2.x, which also scans `~/.opencode`
 /// for a project under `$HOME`, finds no duplicate there. The legacy root
 /// gets a copy only from a layout that positively detected 1.x.
+///
+/// With `$OPENCODE_CONFIG_DIR` set these are the XDG root and that directory,
+/// and neither generation meets a duplicate it refuses (review F6). Measured
+/// on 2.2.5 with a probe plugin in both: `opencode debug config --standalone`
+/// listed `$OPENCODE_CONFIG_DIR` as its only config source, and only that
+/// copy loaded; the XDG copy is the one 1.x's global root needs. OpenCode
+/// 1.18.35 loads both, as it does under [`Layout::V1`], and the module's own
+/// duplicate-load guard keeps one of them inert.
 fn global_roots(roots: &[PathBuf], v2_global: &Path) -> Vec<PathBuf> {
     roots
         .iter()
@@ -1690,9 +1698,12 @@ const v2OpencodeName = (path) => {
   return /^opencode(?:[-.]?\d[\w.-]*)?$/.test(name);
 };
 // The parent of this `serve` process, read once: its arguments (program
-// first) and whether it runs an OpenCode binary, by its executable or, where
-// that cannot be read, its first argument. Undefined when neither can be read
-// (no /proc and no `ps`).
+// first) and whether it runs an OpenCode binary, by its executable or, only
+// where that cannot be read (no /proc: macOS), its first argument. Undefined
+// when its arguments cannot be read (no /proc and no `ps`). On macOS the
+// arguments come from `ps`, split on whitespace, so a program path holding a
+// space splits and its first argument names no OpenCode binary: the plugin
+// then stays inert there (known, untested: no macOS host).
 let v2ParentMemo;
 const v2Parent = () => {
   if (v2ParentMemo !== undefined) return v2ParentMemo || undefined;
@@ -1717,7 +1728,7 @@ const v2Parent = () => {
   try {
     exe = readlinkSync(`/proc/${ppid}/exe`);
   } catch (_) {}
-  v2ParentMemo = { argv, opencode: v2OpencodeName(exe) || v2OpencodeName(argv[0]) };
+  v2ParentMemo = { argv, opencode: v2OpencodeName(exe !== undefined ? exe : argv[0]) };
   return v2ParentMemo;
 };
 // The arguments of the client this plugin serves. In a `serve` process they
@@ -2188,17 +2199,24 @@ const v2NotePending = (inboxID, text) => {
 // the plugin), and draws only that session. So it is found the way mini finds
 // it (2.2.5's mini resolver): `--session <id>` names it; `--continue` takes the
 // newest root session of the directory; otherwise mini created a fresh one,
-// the root session of the directory created since this server started. A
-// `--fork` is a new session too. Undefined while none is found.
+// the root session of the directory created at or after this server started.
+// A `--fork` is a new session too.
 //
-// Sessions live in OpenCode's shared storage, so two minis started in one
-// directory at nearly the same moment each list the other's fresh session
-// too, and 2.2.5 records nothing on a session that names the server or client
-// that created it (measured: its session table has no such column). So a
-// fresh session counts only when it is the ONLY root created since this
-// server started: with two, the plugin cannot tell which is its own and
-// delivers nothing — the message stays with the deck rather than reaching
-// another pane's session.
+// The lookup runs EAGERLY, as the mini receiver starts (v2ResolveMiniTarget),
+// for at most V2_MINI_RESOLVE_MS, and its answer is kept for the server's
+// life. Sessions live in OpenCode's shared storage, and 2.2.5 records nothing
+// on a session that names the server or client that created it (measured: its
+// session table has no such column), so a later root session in the same
+// directory — a second role started there a minute later, the user's own
+// OpenCode, a scheduled `opencode run` — is listed too. Looking at start, and
+// taking the OLDEST fresh root, keeps those out: mini's own session is created
+// within moments of its server starting. Only two fresh roots created within
+// V2_MINI_TIE_MS of this server's start (two minis started together) are
+// ambiguous; then, or when nothing is found in time, the plugin delivers
+// nothing and reports each message not handed, so the deck keeps it and shows
+// it as undelivered rather than it reaching another pane's session.
+const V2_MINI_RESOLVE_MS = 5000;
+const V2_MINI_TIE_MS = 2000;
 const v2ClientFlag = (args, long, short) => {
   for (let n = 0; n < args.length; n++) {
     const arg = args[n];
@@ -2207,46 +2225,85 @@ const v2ClientFlag = (args, long, short) => {
   }
   return undefined;
 };
-const v2FindMiniTarget = async (ctx) => {
+// One look: `{ id }` when mini's session is known, `{ ambiguous: n }` when it
+// cannot be told from another one, undefined while it may still appear.
+const v2FindMiniTarget = async (ctx, started) => {
   const args = v2ClientArgs() ?? [];
   const fork = args.includes("--fork");
   const named = v2ClientFlag(args, "--session", "-s");
-  if (named && !fork) return named;
+  if (named && !fork) return { id: named };
   const directory = ctx?.location?.directory ?? process.cwd();
   const listed = await ctx.session.list({ directory, parentID: null, limit: 20, order: "desc" });
   const roots = (Array.isArray(listed?.data) ? listed.data : []).filter(
     (s) => typeof s?.id === "string" && !s.parentID && (s.location?.directory ?? directory) === directory,
   );
-  if (!fork && (args.includes("--continue") || args.includes("-c"))) return roots[0]?.id;
-  const started = typeof performance === "object" ? performance.timeOrigin : Date.now();
-  const fresh = roots.filter((s) => typeof s.time?.created === "number" && s.time.created >= started);
-  if (fresh.length === 1) return fresh[0].id;
-  if (fresh.length > 1 && !v2MiniAmbiguousNoted) {
-    v2MiniAmbiguousNoted = true;
-    try {
-      console.error(`dot-agent-deck: ${fresh.length} OpenCode sessions started in ${directory} since this mini did; not delivering deck messages until its own session is known`);
-    } catch (_) {}
+  if (!fork && (args.includes("--continue") || args.includes("-c"))) {
+    return roots[0] ? { id: roots[0].id } : undefined;
   }
-  return undefined;
+  const fresh = roots
+    .filter((s) => typeof s.time?.created === "number" && s.time.created >= started)
+    .sort((a, b) => a.time.created - b.time.created);
+  if (!fresh.length) return undefined;
+  const window = started + V2_MINI_TIE_MS;
+  const together = fresh.filter((s) => s.time.created <= window).length;
+  if (together > 1) return { ambiguous: together };
+  // Another mini started with this one may still create its session inside
+  // the window.
+  if (Date.now() <= window) return undefined;
+  return { id: fresh[0].id };
 };
-let v2MiniAmbiguousNoted = false;
+let v2MiniResolution;
+const v2MiniNote = (text) => {
+  try {
+    console.error(`dot-agent-deck: ${text}`);
+  } catch (_) {}
+};
+// Mini's session, looked up once: a promise of its id, or of undefined when
+// it is ambiguous or was not found within V2_MINI_RESOLVE_MS. A
+// `session.created` this plugin sees (observeInboxV2) answers it too.
+const v2ResolveMiniTarget = (ctx) => {
+  if (v2MiniResolution) return v2MiniResolution;
+  v2MiniResolution = (async () => {
+    const started = typeof performance === "object" ? performance.timeOrigin : Date.now();
+    const deadline = Date.now() + V2_MINI_RESOLVE_MS;
+    const directory = ctx?.location?.directory ?? process.cwd();
+    for (;;) {
+      if (miniTarget) return miniTarget;
+      if (typeof ctx?.session?.list === "function") {
+        let found;
+        try {
+          found = await v2FindMiniTarget(ctx, started);
+        } catch (_) {}
+        if (miniTarget) return miniTarget;
+        if (found?.id) {
+          miniTarget = found.id;
+          return miniTarget;
+        }
+        if (found?.ambiguous) {
+          v2MiniNote(`${found.ambiguous} OpenCode sessions started in ${directory} with this mini; deck messages are not delivered to it`);
+          return undefined;
+        }
+      }
+      if (Date.now() >= deadline) {
+        v2MiniNote(`no OpenCode session of this mini found in ${directory}; deck messages are not delivered to it`);
+        return undefined;
+      }
+      await inboxSleep(200);
+    }
+  })();
+  return v2MiniResolution;
+};
 const v2MiniDeliver = async (ctx, message, generation) => {
   const ref = inboxRef(message);
   const receiver = serverReceiver();
   if (!receiver || generation !== inboxGeneration()) return;
   try {
-    for (let n = 0; !miniTarget; n++) {
-      if (generation !== inboxGeneration()) return;
-      if (n % 5 === 0 && typeof ctx?.session?.list === "function") {
-        try {
-          const found = await v2FindMiniTarget(ctx);
-          if (found && !miniTarget) miniTarget = found;
-          continue;
-        } catch (_) {}
-      }
-      await inboxSleep(200);
+    const sessionID = miniTarget ?? (await v2ResolveMiniTarget(ctx)) ?? miniTarget;
+    if (generation !== inboxGeneration()) return;
+    if (!sessionID) {
+      receiver.notHanded(ref);
+      return;
     }
-    const sessionID = miniTarget;
     const text = inboxText(message);
     await inboxHandOver(
       receiver,
@@ -2281,6 +2338,7 @@ const startInboxV2 = (ctx) => {
         });
       } catch (_) {}
     }
+    if (mini) v2ResolveMiniTarget(ctx);
     const receiver = inboxReceiver({
       agent: "opencode-mini",
       doorbellOnly: !mini,
@@ -3620,10 +3678,24 @@ fn write_plugin_reporting(root: &Path, binary_path: &str) -> std::io::Result<(Pa
 /// install, which this install does not regenerate. The marker is a comment,
 /// so the module behaves as before. Nothing changes when `marker` is `None`,
 /// the module is missing or unreadable ([`bounded_module_text`]), or already
-/// carries it. Whether it wrote. Callers hold [`PLUGIN_LOCK`].
+/// carries it, or was rewritten between this read and the write (audit F8:
+/// the module is re-read under the config lock and compared before the
+/// marker is published, as [`remove_cli_entry`] does, so another install's
+/// regeneration is not reverted to the body read first). Whether it wrote.
+/// Callers hold [`PLUGIN_LOCK`].
 fn sync_layout_marker(
     root: &Path,
     marker: Option<crate::opencode_version::Major>,
+) -> std::io::Result<bool> {
+    sync_layout_marker_with(root, marker, || {})
+}
+
+/// [`sync_layout_marker`], running `between` after the module is first read
+/// and before it is re-read under the config lock (a test seam for the race).
+fn sync_layout_marker_with(
+    root: &Path,
+    marker: Option<crate::opencode_version::Major>,
+    between: impl FnOnce(),
 ) -> std::io::Result<bool> {
     let Some(major) = marker else {
         return Ok(false);
@@ -3642,8 +3714,39 @@ fn sync_layout_marker(
         format!("{wanted}\n{js}")
     };
     crate::config_write_guard::ensure_config_write_allowed(&path)?;
+    between();
+    let _lock = crate::agent_hook_config::lock_config(&path)?;
+    if bounded_module_text(&path).as_deref() != Some(js.as_str()) {
+        return Ok(false);
+    }
     crate::agent_hook_config::write_atomic(&root.join("plugin"), &path, updated.as_bytes())?;
     Ok(true)
+}
+
+/// PRD #2050 (review F2): remember `major` as the plugin layout for the next
+/// install that has no command to look at (startup, `hooks refresh`), by
+/// setting the layout marker of the deck's module in each global config root
+/// that holds one ([`sync_layout_marker`]). The daemon's OpenCode watch calls
+/// it once a wrapper-started OpenCode is seen to run a binary whose version a
+/// spawn-time probe recorded, the only way the deck learns the generation a
+/// wrapper runs. Nothing else in the module changes, and a root with no
+/// module gets none. Blocking.
+pub fn remember_layout(major: crate::opencode_version::Major) {
+    remember_layout_in(&candidate_roots(), &v2_global_root(), major);
+}
+
+/// [`remember_layout`] over `roots`, OpenCode 2.x's global root being
+/// `v2_global`.
+fn remember_layout_in(roots: &[PathBuf], v2_global: &Path, major: crate::opencode_version::Major) {
+    let _guard = lock_plugin();
+    for root in global_roots(roots, v2_global) {
+        if let Err(e) = sync_layout_marker(&root, Some(major)) {
+            tracing::warn!(
+                "could not record the OpenCode layout in {}: {e}",
+                plugin_file(&root).display()
+            );
+        }
+    }
 }
 
 fn write_plugin_reporting_for(
@@ -6516,7 +6619,22 @@ await hooks.event({{ event: {{ type: "session.error", properties: {{ sessionID: 
         dir: &std::path::Path,
         delay: Option<&str>,
     ) -> (std::path::PathBuf, std::path::PathBuf) {
+        inbox_recorder_timed(dir, delay, None)
+    }
+
+    /// [`inbox_recorder_granting_after`], also handing over its message only
+    /// `message_delay` seconds (`sleep`'s argument) after registering, when
+    /// given.
+    #[cfg(unix)]
+    fn inbox_recorder_timed(
+        dir: &std::path::Path,
+        delay: Option<&str>,
+        message_delay: Option<&str>,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
         let wait = delay.map(|d| format!("sleep {d}; ")).unwrap_or_default();
+        let message_wait = message_delay
+            .map(|d| format!("    sleep {d}\n"))
+            .unwrap_or_default();
         let controls = dir.join("controls.log");
         let recorder = dir.join("recorder.sh");
         let id = "m-k3xzq2ab-0f3c9a71d2e4b850";
@@ -6536,7 +6654,7 @@ echo "call $*" >> '{c}'
 case "$1 $2" in
   'inbox wait')
     printf '%s\n' '{r}'
-    printf '%s\n' '{m}'
+{message_wait}    printf '%s\n' '{m}'
     while IFS= read -r line; do
       printf '%s\n' "$line" >> '{c}'
       case "$line" in
@@ -6552,6 +6670,7 @@ exit 0
                 r = registered,
                 m = message,
                 wait = wait,
+                message_wait = message_wait,
             ),
         )
         .unwrap();
@@ -8700,17 +8819,35 @@ check(inboxIdsIn("[dot-agent-deck message " + A + " from x]\nhead"), [A], "an un
         run_plugin_driver_under(body, node_args, None)
     }
 
+    /// A copy of `/bin/sh` named `opencode` in `dir`, so a process it runs
+    /// has an executable (and a first argument) named like an OpenCode binary,
+    /// as the 2.x plugin's parent check reads it (audit L5). Copied by a `cp`
+    /// child, so this process never holds the file open for writing when a
+    /// test execs it ([`crate::test_isolation::write_script`] says why).
+    #[cfg(unix)]
+    fn opencode_named_shell(dir: &Path) -> PathBuf {
+        let shell = dir.join("opencode");
+        if !shell.exists() {
+            let status = std::process::Command::new("cp")
+                .arg("/bin/sh")
+                .arg(&shell)
+                .status()
+                .expect("run cp");
+            assert!(status.success(), "copy /bin/sh to {}", shell.display());
+        }
+        shell
+    }
+
     /// A command running `node <driver>` as the child of a shell whose
-    /// arguments read `opencode` (the full TUI's client): the parent a 2.x
-    /// `serve` process must have for its `setup` to report (audit L5).
+    /// executable is named `opencode` (the full TUI's client): the parent a
+    /// 2.x `serve` process must have for its `setup` to report (audit L5).
     #[cfg(unix)]
     fn node_under_opencode(driver: &Path) -> std::process::Command {
         let dir = driver.parent().expect("the driver is in a directory");
         std::fs::write(dir.join("client"), format!("node '{}'\n", driver.display())).unwrap();
-        let mut command = std::process::Command::new("bash");
+        let mut command = std::process::Command::new(opencode_named_shell(dir));
         command
-            .arg("-c")
-            .arg("exec -a opencode sh client")
+            .arg("client")
             .current_dir(dir)
             .envs(crate::test_isolation::unreachable_endpoints());
         command
@@ -8778,9 +8915,9 @@ check(inboxIdsIn("[dot-agent-deck message " + A + " from x]\nhead"), [A], "an un
                     line.push_str(&format!(" '{arg}'"));
                 }
                 std::fs::write(dir.path().join(first), format!("{line}\n")).unwrap();
-                std::process::Command::new("bash")
-                    .arg("-c")
-                    .arg(format!("exec -a opencode sh {first} {rest}"))
+                std::process::Command::new(opencode_named_shell(dir.path()))
+                    .arg(first)
+                    .args(rest.split_whitespace())
                     .current_dir(dir.path())
                     .envs(crate::test_isolation::unreachable_endpoints())
                     .output()
@@ -10445,6 +10582,74 @@ await wait(1500);
         assert!(!plugin_file(f.legacy()).exists());
     }
 
+    /// Review F6: with `$OPENCODE_CONFIG_DIR` naming an existing directory, an
+    /// install that knows no version writes the module to the XDG root (1.x's
+    /// global root) and to that directory (2.x's, the only one 2.2.5 loads
+    /// then, measured), and removes the deck's legacy `~/.opencode` copy, so
+    /// a 2.x started through a wrapper meets one copy.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_unknown_layout_with_opencode_config_dir_leaves_2x_one_copy() {
+        let mut f = LayoutFixture::new();
+        f.roots.push(f._dir.path().join("ocd"));
+        std::fs::create_dir_all(&f.roots[2]).unwrap();
+        write_plugin(f.legacy(), &f.bin).unwrap();
+        assert_eq!(f.install(Layout::Unknown), Vec::<String>::new());
+        assert!(plugin_file(f.global()).exists(), "1.x's global root");
+        assert!(plugin_file(&f.roots[2]).exists(), "2.x's global root");
+        assert!(!plugin_file(f.legacy()).exists(), "no copy 2.x would scan");
+        assert_eq!(f.remembered(), Layout::Unknown, "nothing was detected");
+    }
+
+    /// Review F2: once the daemon's watch sees a wrapper-started OpenCode run
+    /// a probed 2.x binary, the layout is remembered in the module of each
+    /// global root that holds one, so the next install with no command to
+    /// look at writes 2.x's layout; a root with no module gets none, and the
+    /// module is otherwise unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn a_confirmed_generation_is_remembered_for_the_next_install() {
+        let f = LayoutFixture::new();
+        assert_eq!(f.install(Layout::Unknown), Vec::<String>::new());
+        assert_eq!(f.remembered(), Layout::Unknown);
+        let before = std::fs::read_to_string(plugin_file(f.global())).unwrap();
+        remember_layout_in(&f.roots, f.v2_global(), crate::opencode_version::Major::V2);
+        assert_eq!(f.remembered(), Layout::V2);
+        let after = std::fs::read_to_string(plugin_file(f.global())).unwrap();
+        assert_eq!(
+            after.split_once('\n').map(|(_, rest)| rest),
+            Some(before.as_str()),
+            "only the marker line was added"
+        );
+        assert!(!plugin_file(f.legacy()).exists(), "no module created");
+    }
+
+    /// Audit F8: another install that regenerates the module between the
+    /// marker's read and its write is not reverted: the module is read again
+    /// under the lock and the marker is left out when it changed.
+    #[cfg(unix)]
+    #[test]
+    fn the_layout_marker_does_not_revert_a_module_rewritten_meanwhile() {
+        let f = LayoutFixture::new();
+        write_plugin(f.global(), &f.bin).unwrap();
+        let path = plugin_file(f.global());
+        let rewritten = "// another install's newer module\n";
+        let wrote =
+            sync_layout_marker_with(f.global(), Some(crate::opencode_version::Major::V2), || {
+                std::fs::write(&path, rewritten).unwrap()
+            })
+            .unwrap();
+        assert!(!wrote);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), rewritten);
+        // Unchanged meanwhile, it is written.
+        assert!(sync_layout_marker(f.global(), Some(crate::opencode_version::Major::V2)).unwrap());
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .starts_with(LAYOUT_MARKER_PREFIX)
+        );
+    }
+
     /// With only `~/.opencode` present (no global root), a wrapper's spawn
     /// keeps today's fan-out: the module is written and kept there.
     #[cfg(unix)]
@@ -11262,9 +11467,8 @@ await emit("form.cancelled", { id: "form-2", sessionID: "s1" });"#,
             format!("node '{}'\n", driver.display()),
         )
         .unwrap();
-        let out = std::process::Command::new("bash")
-            .arg("-c")
-            .arg("exec -a opencode sh mini")
+        let out = std::process::Command::new(opencode_named_shell(dir.path()))
+            .arg("mini")
             .current_dir(dir.path())
             .envs(crate::test_isolation::unreachable_endpoints())
             .env("DOT_AGENT_DECK_PANE_ID", "pane-1")
@@ -11303,8 +11507,19 @@ await emit("form.cancelled", { id: "form-2", sessionID: "s1" });"#,
     /// The driver's last stdout line, parsed, and the recorder's controls.
     #[cfg(target_os = "linux")]
     fn run_v2_mini_driver(client_args: &str, body: &str) -> (serde_json::Value, String) {
+        run_v2_mini_driver_timed(client_args, body, None)
+    }
+
+    /// [`run_v2_mini_driver`], with the deck's message handed over
+    /// `message_delay` seconds after the receiver registers, when given.
+    #[cfg(target_os = "linux")]
+    fn run_v2_mini_driver_timed(
+        client_args: &str,
+        body: &str,
+        message_delay: Option<&str>,
+    ) -> (serde_json::Value, String) {
         let dir = tempfile::tempdir().unwrap();
-        let (recorder, controls) = inbox_recorder(dir.path());
+        let (recorder, controls) = inbox_recorder_timed(dir.path(), None, message_delay);
         let plugin = dir.path().join("dot-agent-deck.mjs");
         std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
         let driver = dir.path().join("driver.mjs");
@@ -11321,9 +11536,9 @@ await emit("form.cancelled", { id: "form-2", sessionID: "s1" });"#,
             format!("node '{}'\n", driver.display()),
         )
         .unwrap();
-        let out = std::process::Command::new("bash")
-            .arg("-c")
-            .arg(format!("exec -a opencode sh mini {client_args}"))
+        let out = std::process::Command::new(opencode_named_shell(dir.path()))
+            .arg("mini")
+            .args(client_args.split_whitespace())
             .current_dir(dir.path())
             .envs(crate::test_isolation::unreachable_endpoints())
             .env("DOT_AGENT_DECK_PANE_ID", "pane-1")
@@ -11413,58 +11628,132 @@ console.log(JSON.stringify({ prompts, lists: lists.length }));"#;
         }
     }
 
-    /// Scenario (PRD #2050, review B2): two OpenCode 2 minis start in one
-    /// directory within a second, so this mini's server lists the other's
-    /// fresh root session beside its own. The plugin cannot tell which is its
-    /// own, so it prompts neither and the deck's message is not handed over;
-    /// a session created half a second before this server started (inside
-    /// the margin the plugin used to allow) is not a candidate, so beside it
-    /// the one fresh session is still found and delivered to.
+    /// Scenario (PRD #2050, review B2 and the round-3 re-review F1): two
+    /// OpenCode 2 minis start in one directory within a second of each other,
+    /// so this mini's server lists the other's fresh root session beside its
+    /// own, both inside the window after its start. The plugin cannot tell
+    /// which is its own, so it prompts neither and reports the deck's message
+    /// not handed, which leaves it with the deck rather than looping on it.
     #[cfg(target_os = "linux")]
     #[test]
-    fn opencode_v2_two_minis_in_one_directory_never_take_each_others_session() {
+    fn opencode_v2_two_minis_started_together_report_the_message_not_handed() {
         if !node_available() {
             eprintln!("SKIP: node is not available");
             return;
         }
         let (result, written) = run_v2_mini_driver(
             "",
-            r#"sessions = [
-  { id: "ses_other_mini", time: { created: now + 5 }, location: { directory: "/work" } },
-  { id: "ses_this_mini", time: { created: now }, location: { directory: "/work" } },
+            r#"const started = performance.timeOrigin;
+sessions = [
+  { id: "ses_other_mini", time: { created: started + 1500 }, location: { directory: "/work" } },
+  { id: "ses_this_mini", time: { created: started + 100 }, location: { directory: "/work" } },
 ];
 const cleanup = await pluginModule.setup(ctx);
-await sleep(1500);
+await sleep(2500);
 await cleanup();
 console.log(JSON.stringify({ prompts, lists: lists.length }));"#,
         );
         assert_eq!(
             result["prompts"],
             serde_json::json!([]),
-            "two fresh roots are ambiguous: {result}"
-        );
-        assert!(
-            result["lists"].as_u64().unwrap_or(0) >= 2,
-            "it kept looking: {result}"
+            "two roots inside the window are ambiguous: {result}"
         );
         assert!(!written.contains("\"handed\""), "{written}");
+        assert!(
+            written.contains("\"not_handed\""),
+            "the message is reported not handed, not held in a loop: {written}"
+        );
+    }
 
+    /// Scenario (PRD #2050, round-3 re-review F1): two OpenCode 2 minis start
+    /// in one directory three seconds apart, the usual staggered orchestration
+    /// launch. The earlier mini's server lists both fresh roots and takes the
+    /// oldest, its own; the later mini's server lists the earlier one's root
+    /// as created before it started and takes its own. Each delivers into its
+    /// own session.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opencode_v2_two_minis_started_apart_each_take_their_own_session() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        // The earlier mini: its own root just after its start, the later
+        // mini's three seconds after.
         let (result, written) = run_v2_mini_driver(
             "",
             r#"const started = performance.timeOrigin;
 sessions = [
-  { id: "ses_this_mini", time: { created: now }, location: { directory: "/work" } },
-  { id: "ses_just_before", time: { created: started - 500 }, location: { directory: "/work" } },
+  { id: "ses_later_mini", time: { created: started + 3100 }, location: { directory: "/work" } },
+  { id: "ses_earlier_mini", time: { created: started + 100 }, location: { directory: "/work" } },
 ];
 const cleanup = await pluginModule.setup(ctx);
-for (let n = 0; n < 150 && !prompts.length; n++) await sleep(20);
+for (let n = 0; n < 200 && !prompts.length; n++) await sleep(20);
 await sleep(100);
 await cleanup();
 console.log(JSON.stringify({ prompts }));"#,
         );
         let prompts = result["prompts"].as_array().cloned().unwrap_or_default();
         assert_eq!(prompts.len(), 1, "{result}");
+        assert_eq!(prompts[0]["sessionID"], "ses_earlier_mini", "{result}");
+        assert!(written.contains("\"handed\""), "{written}");
+
+        // The later mini: the earlier one's root was created 2.9 s before its
+        // own server started.
+        let (result, written) = run_v2_mini_driver(
+            "",
+            r#"const started = performance.timeOrigin;
+sessions = [
+  { id: "ses_later_mini", time: { created: started + 100 }, location: { directory: "/work" } },
+  { id: "ses_earlier_mini", time: { created: started - 2900 }, location: { directory: "/work" } },
+];
+const cleanup = await pluginModule.setup(ctx);
+for (let n = 0; n < 200 && !prompts.length; n++) await sleep(20);
+await sleep(100);
+await cleanup();
+console.log(JSON.stringify({ prompts }));"#,
+        );
+        let prompts = result["prompts"].as_array().cloned().unwrap_or_default();
+        assert_eq!(prompts.len(), 1, "{result}");
+        assert_eq!(prompts[0]["sessionID"], "ses_later_mini", "{result}");
+        assert!(written.contains("\"handed\""), "{written}");
+    }
+
+    /// Scenario (PRD #2050, round-3 re-review F1): a later root session in the
+    /// directory appears only after this mini's lookup settled (another pane's
+    /// OpenCode, started a minute later). The lookup ran as mini started and
+    /// kept its answer, so the deck's message still starts in mini's own
+    /// session, and the listing is not asked again for the message.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opencode_v2_mini_keeps_the_session_it_found_at_start() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let (result, written) = run_v2_mini_driver_timed(
+            "",
+            r#"const started = performance.timeOrigin;
+sessions = [
+  { id: "ses_this_mini", time: { created: started + 100 }, location: { directory: "/work" } },
+];
+const cleanup = await pluginModule.setup(ctx);
+await sleep(2600);
+sessions = [{ id: "ses_newcomer", time: { created: Date.now() }, location: { directory: "/work" } }, ...sessions];
+const looks = lists.length;
+for (let n = 0; n < 200 && !prompts.length; n++) await sleep(20);
+await sleep(100);
+await cleanup();
+console.log(JSON.stringify({ prompts, looks, lists: lists.length }));"#,
+            Some("3.5"),
+        );
+        let prompts = result["prompts"].as_array().cloned().unwrap_or_default();
+        assert_eq!(prompts.len(), 1, "{result}");
         assert_eq!(prompts[0]["sessionID"], "ses_this_mini", "{result}");
+        assert_eq!(
+            result["looks"], result["lists"],
+            "the answer found at start is kept: {result}"
+        );
         assert!(written.contains("\"handed\""), "{written}");
     }
 
