@@ -3,22 +3,37 @@
 //! Q35-22: discovery below an installed launcher, before production rollout.
 //!
 //! Assumed interfaces for the coder (not implemented by these tests):
-//! * Q28(b)'s shared D1 resolver pins the trusted native executable before
-//!   considering process claims. Here the launch's private PATH resolves the
-//!   explicit native program passed to the wrapper. A candidate's basename,
-//!   argv or header alone is not authority; a different inode must fail.
-//!   No late PATH lookup may rescue that mismatch.
+//! * Q102b makes Q28(b)'s shared D1 resolver concrete: one resolution, at
+//!   spawn, from the pane's saved spawn PATH (the deck's own launch environment,
+//!   not the child's), following symlinks to a kernel identity (dev, ino).
+//!   Every later check compares the candidate's /proc/<pid>/exe identity (plus
+//!   birth identity, uid and ancestry) with that pinned pair and never looks
+//!   a name up again. For an undeclared pane, independently pin the Claude and
+//!   Codex native names at spawn; a later kind claim selects its existing pin.
+//!   Missing resolution stays unavailable, never rescued by candidate claims.
+//!   An old pane retains its old inode across an update, a wrapper exec of a
+//!   different inode after its pin is refused, and a fresh pane pins the update.
+//!   The wrapper is not handed a native executable path. Basename, argv,
+//!   header and the candidate's own PATH cannot replace the independent pin.
 //! * e2e-only `binding-status` returns read-only `composer_binding` with
 //!   `generation`, `permission` ("pending", "armable", "inert") and `reason`
-//!   (a nonempty string when discovery refuses). It cannot settle permission.
+//!   (a refusal string pinned below). It cannot settle permission.
+//!   Refusals distinguish "executable differs: expected <agent_type>",
+//!   "candidate left its parent", "candidate exited", "foreign owner" and
+//!   "generation retired". Lifecycle/owner failures take precedence over an
+//!   executable mismatch when the candidate is also a lookalike; a type claim
+//!   changes the expected agent in the mismatch reason, never its authority.
 //! * e2e-only `DOT_AGENT_DECK_E2E_DISCOVERY_GATE=discovery-gate` names one
 //!   component under the sandbox HOME. With `phase=candidate`, pause after
 //!   finding a name/argv candidate and before validating/publishing it. Write
 //!   `<G>.arrived` JSON {generation,pid}, await `<G>.release` for at most 15 s,
 //!   then perform normal validation (including uid, birth, live ancestry,
 //!   executable and generation rechecks) and write `<G>.completed` after
-//!   validation or retirement cancellation can publish nothing further. Record
-//!   `<G>.timed-out` on expiry; teardown cancels without granting anything.
+//!   validation or retirement cancellation can publish nothing further. On
+//!   retirement its JSON is {generation,reason:"generation retired"}; it must
+//!   complete while .release is absent, rather than await release or expiry.
+//!   Record `<G>.timed-out` on expiry; teardown cancels without granting anything.
+//!   Gate and marker writes are restricted to the e2e sandbox HOME.
 //! * e2e-only `DOT_AGENT_DECK_E2E_DISCOVERY_REJECT_UID=1` forces ONLY the
 //!   foreign-uid refusal at that production validator. It cannot supply an
 //!   accepted uid or skip any other validation. This covers the fail-closed
@@ -44,6 +59,7 @@ use spec::spec;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
+use std::time::Duration;
 
 ctor::declarative::ctor! {
     #[ctor(unsafe)]
@@ -57,6 +73,24 @@ enum Route {
     Launcher,
     Learned,
     Lookalike,
+    LearnedLookalike,
+    LearnedOtherKind,
+}
+
+impl Route {
+    fn learned(self) -> bool {
+        matches!(
+            self,
+            Self::Learned | Self::LearnedLookalike | Self::LearnedOtherKind
+        )
+    }
+
+    fn lookalike(self) -> bool {
+        matches!(
+            self,
+            Self::Lookalike | Self::LearnedLookalike | Self::LearnedOtherKind
+        )
+    }
 }
 
 fn fixture(kind: &'static str, route: Route, mode: &'static str, gate: bool, uid: bool) -> Fixture {
@@ -71,8 +105,8 @@ fn fixture(kind: &'static str, route: Route, mode: &'static str, gate: bool, uid
         kind,
         Launcher {
             mode,
-            declared: !matches!(route, Route::Learned),
-            lookalike: matches!(route, Route::Lookalike),
+            declared: !route.learned(),
+            lookalike: route.lookalike(),
         },
         &env,
     );
@@ -115,7 +149,7 @@ fn kind_file(f: &Fixture) -> Option<String> {
 fn pending(f: &Fixture, route: Route) {
     assert_eq!(status(f)["permission"], "pending", "no native child yet");
     assert!(unpublished(f), "no identity before discovery");
-    if matches!(route, Route::Learned) {
+    if route.learned() {
         assert_eq!(
             kind_file(f),
             None,
@@ -127,11 +161,15 @@ fn pending(f: &Fixture, route: Route) {
 }
 
 fn launch(f: &Fixture) -> Value {
+    launch_as(f, f.kind)
+}
+
+fn launch_as(f: &Fixture, claimed_kind: &str) -> Value {
     let ready = f.launch();
     // Ordinary authenticated hooks, using this fixture's initial capability.
     // A wrapper's type is learned through the same header/hook path as users.
-    f.hook_event("session_start");
-    f.hook_event("idle");
+    f.hook_event_as("session_start", claimed_kind);
+    f.hook_event_as("idle", claimed_kind);
     ready
 }
 
@@ -202,6 +240,15 @@ fn check(f: &Fixture) {
 }
 
 fn bound(f: &Fixture, ready: &Value) {
+    bound_to(f, ready, executable_identity(f.native_executable()));
+}
+
+fn executable_identity(path: impl AsRef<std::path::Path>) -> (u64, u64) {
+    let meta = fs::metadata(path).unwrap();
+    (meta.dev(), meta.ino())
+}
+
+fn bound_to(f: &Fixture, ready: &Value, pinned: (u64, u64)) {
     assert!(
         common::wait_until(WAIT, || status(f)["permission"] == "armable"),
         "the attested native agent must become Armable: {}",
@@ -215,12 +262,12 @@ fn bound(f: &Fixture, ready: &Value) {
         "A is the native agent, not its launcher"
     );
     assert_eq!(a.start, native_start(pid), "pin native birth identity");
-    let meta = fs::metadata(f.native_executable()).unwrap();
     assert_eq!(
         (a.exe.dev, a.exe.ino),
-        (meta.dev(), meta.ino()),
-        "attest the native kernel executable"
+        pinned,
+        "attest the spawn-time pinned kernel executable"
     );
+    assert_eq!(executable_identity(format!("/proc/{pid}/exe")), pinned);
     assert_eq!(kind_file(f), Some(format!("{}\n", f.kind)));
     for prefix in ["gen", "kind"] {
         let mode = fs::metadata(f.instance().join(format!("{prefix}-{}", f.generation)))
@@ -245,15 +292,26 @@ fn bound(f: &Fixture, ready: &Value) {
     );
 }
 
-fn denied(f: &Fixture, native_alive: bool) {
+fn mismatch_reason(kind: &str) -> String {
+    format!(
+        "executable differs: expected {}",
+        if kind == "codex" {
+            "codex"
+        } else {
+            "claude_code"
+        }
+    )
+}
+
+fn denied(f: &Fixture, native_alive: bool, reason: &str) {
     let s = status(f);
     assert!(
         s["permission"] == "pending" || s["permission"] == "inert",
         "unattested candidate must not be Armable: {s}"
     );
-    assert!(
-        s["reason"].as_str().is_some_and(|s| !s.trim().is_empty()),
-        "refused discovery carries its reason: {s}"
+    assert_eq!(
+        s["reason"], reason,
+        "discovery refusal must identify its cause: {s}"
     );
     assert!(unpublished(f), "refused candidate must not publish gen-G");
     if native_alive {
@@ -377,11 +435,18 @@ fn negative(kind: &'static str, route: Route, change: Change) {
             pending(&f, route);
             let successor = launch(&f);
             arrived(&f, &successor);
-            fs::write(old_release, "").unwrap();
+            assert!(!old_release.exists(), "old discovery gate must stay closed");
             assert!(
-                common::wait_until(WAIT, || old_completed.exists()),
-                "retired discovery must finish or cancel before checking for stale publication"
+                common::wait_until(Duration::from_secs(3), || old_completed.exists()),
+                "retired discovery must finish or cancel before release, within the 15-second gate expiry"
             );
+            assert!(
+                !old_release.exists(),
+                "completion must not depend on release"
+            );
+            let retired = live::read_json(&old_completed);
+            assert_eq!(retired["generation"], old_generation);
+            assert_eq!(retired["reason"], "generation retired");
             assert!(
                 !old_timed_out.exists(),
                 "retirement must cancel the paused discovery without waiting for its timeout"
@@ -401,9 +466,11 @@ fn negative(kind: &'static str, route: Route, change: Change) {
                 "old discovery can't grant successor permission"
             );
             assert!(unpublished(&f));
+            // Defensive teardown only, after cancellation and no publication.
+            fs::write(old_release, "").unwrap();
             release(&f);
-            if matches!(route, Route::Lookalike) {
-                denied(&f, true);
+            if route.lookalike() {
+                denied(&f, true, &mismatch_reason(kind));
             } else {
                 bound(&f, &successor);
             }
@@ -411,7 +478,128 @@ fn negative(kind: &'static str, route: Route, change: Change) {
         }
     }
     release(&f);
-    denied(&f, !matches!(change, Change::Exit));
+    let reason = match change {
+        Change::Reparent => "candidate left its parent",
+        Change::Exit => "candidate exited",
+        Change::ForeignUid => "foreign owner",
+        Change::Generation => unreachable!(),
+    };
+    denied(&f, !matches!(change, Change::Exit), reason);
+}
+
+fn lookalike(kind: &'static str, route: Route) {
+    let f = fixture(kind, route, "spawn", true, false);
+    pending(&f, route);
+    let claimed_kind = if matches!(route, Route::LearnedOtherKind) {
+        if kind == "codex" { "claude" } else { "codex" }
+    } else {
+        kind
+    };
+    let ready = launch_as(&f, claimed_kind);
+    arrived(&f, &ready);
+    let actual = executable_identity(format!("/proc/{}/exe", ready["pid"].as_u64().unwrap()));
+    let trusted = executable_identity(f.native_executable());
+    assert_ne!(
+        actual, trusted,
+        "the copy must really have a different inode"
+    );
+    if claimed_kind != kind {
+        let other = f.native_executable().with_file_name(claimed_kind);
+        assert_ne!(
+            actual,
+            executable_identity(other),
+            "the other agent's independent pin also differs"
+        );
+    }
+    release(&f);
+    denied(&f, true, &mismatch_reason(claimed_kind));
+}
+
+#[derive(Clone, Copy)]
+enum Update {
+    Running,
+    BeforeExec,
+    Fresh,
+}
+
+fn replace_native(f: &Fixture) -> (u64, u64) {
+    let original = executable_identity(f.native_executable());
+    let replacement = f.native_executable().with_extension("updated");
+    fs::copy(f.native_executable(), &replacement).unwrap();
+    fs::rename(replacement, f.native_executable()).unwrap();
+    let updated = executable_identity(f.native_executable());
+    assert_ne!(
+        original, updated,
+        "rename a new inode over the same install path"
+    );
+    updated
+}
+
+fn update_history(kind: &'static str, route: Route, update: Update, gate: bool) {
+    let mut f = fixture(kind, route, "spawn", gate, false);
+    let original = executable_identity(f.native_executable());
+    if gate {
+        pending(&f, route);
+    }
+    let updated = if matches!(update, Update::Running) {
+        None
+    } else {
+        Some(replace_native(&f))
+    };
+    if matches!(update, Update::Fresh) {
+        f.replace();
+        if gate {
+            pending(&f, route);
+        }
+    }
+    let ready = launch(&f);
+    let process = format!("/proc/{}/exe", ready["pid"].as_u64().unwrap());
+    let actual = executable_identity(&process);
+    assert_eq!(
+        actual,
+        updated.unwrap_or(original),
+        "the wrapper must exec the current install"
+    );
+    if gate {
+        arrived(&f, &ready);
+    }
+    if matches!(update, Update::Running) {
+        replace_native(&f);
+        assert_eq!(
+            executable_identity(&process),
+            original,
+            "a live old process retains its kernel executable"
+        );
+        assert!(
+            fs::read_link(&process)
+                .unwrap()
+                .as_os_str()
+                .as_encoded_bytes()
+                .ends_with(b" (deleted)"),
+            "the old running inode must really be unlinked by the update"
+        );
+    }
+    if gate {
+        release(&f);
+        if matches!(update, Update::BeforeExec) {
+            denied(&f, true, &mismatch_reason(kind));
+        } else {
+            bound_to(
+                &f,
+                &ready,
+                if matches!(update, Update::Fresh) {
+                    updated.unwrap()
+                } else {
+                    original
+                },
+            );
+        }
+    } else {
+        // Exercise the changed fixture even while binding-status is still RED.
+        let mut human = f.connect();
+        human.write("UPDATE-FIXTURE-ALIVE");
+        f.expect(b"UPDATE-FIXTURE-ALIVE");
+    }
 }
 
 /// Scenario: Start a launcher exec with a delayed native claude stand-in, then let it exec the agent and finish discovery. The native child's identity and kind must be published, its editor environment preserved, and the real installed helper must check its touched empty box.
@@ -439,95 +627,128 @@ fn probe_035_learned_wrapper_binds_native_claude_and_checks() {
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_claude_lookalike_cannot_get_permission() {
-    let f = fixture("claude", Route::Lookalike, "spawn", true, false);
-    pending(&f, Route::Lookalike);
-    let ready = launch(&f);
-    arrived(&f, &ready);
-    let actual = fs::metadata(ready["exe"].as_str().unwrap()).unwrap();
-    let trusted = fs::metadata(f.native_executable()).unwrap();
-    assert_ne!((actual.dev(), actual.ino()), (trusted.dev(), trusted.ino()));
-    release(&f);
-    denied(&f, true);
+    lookalike("claude", Route::Lookalike);
 }
 
-/// Scenario: Pause claude launcher discovery before validation, then make the discovered native candidate leave its parent. Resuming the old discovery must not publish its candidate or run a check; a genuine successor must use its own discovery.
+/// Scenario: An undeclared wrapper launches a claude lookalike and claims Claude through the pane's authenticated hooks. Discovery must refuse the different inode with a Claude-specific reason and send no check bytes.
+#[spec("inbox/probe/035")]
+#[test]
+fn probe_035_claude_learned_lookalike_cannot_get_permission() {
+    lookalike("claude", Route::LearnedLookalike);
+}
+
+/// Scenario: An undeclared wrapper launches a claude lookalike but claims Codex through the pane's authenticated hooks. Discovery must refuse it against the independently pinned Codex executable with a Codex-specific reason and send no check bytes.
+#[spec("inbox/probe/035")]
+#[test]
+fn probe_035_claude_learned_lookalike_cannot_claim_codex() {
+    lookalike("claude", Route::LearnedOtherKind);
+}
+
+/// Scenario: A native claude process is running when an update replaces its installation at the same path. Declared and learned panes must still bind their old pinned inode and check the touched empty composer.
+#[spec("inbox/probe/035")]
+#[test]
+fn probe_035_claude_running_inode_survives_install_update() {
+    for route in [Route::Launcher, Route::Learned] {
+        update_history("claude", route, Update::Running, true);
+    }
+}
+
+/// Scenario: Replace claude at the same installation path after a pane starts but before its wrapper launches the native child. Declared and learned panes must refuse that new inode with an executable-mismatch reason and send no check bytes.
+#[spec("inbox/probe/035")]
+#[test]
+fn probe_035_claude_wrapper_exec_after_update_is_refused() {
+    for route in [Route::Launcher, Route::Learned] {
+        update_history("claude", route, Update::BeforeExec, true);
+    }
+}
+
+/// Scenario: Replace claude at the same installation path, then start a fresh pane generation before launching the native child. Declared and learned panes must bind the new inode and check the touched empty composer.
+#[spec("inbox/probe/035")]
+#[test]
+fn probe_035_claude_fresh_spawn_pins_updated_inode() {
+    for route in [Route::Launcher, Route::Learned] {
+        update_history("claude", route, Update::Fresh, true);
+    }
+}
+
+/// Scenario: Pause claude launcher discovery before validation, then make the discovered native candidate leave its parent. Resuming discovery must refuse with the specific cause, publish no identity and send no check bytes.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_claude_launcher_rejects_reparented() {
     negative("claude", Route::Launcher, Change::Reparent);
 }
 
-/// Scenario: Pause claude launcher discovery before validation, then let the captured native candidate exit. Resuming the old discovery must not publish its candidate or run a check; a genuine successor must use its own discovery.
+/// Scenario: Pause claude launcher discovery before validation, then let the captured native candidate exit. Resuming discovery must refuse with the specific cause, publish no identity and send no check bytes.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_claude_launcher_rejects_exited() {
     negative("claude", Route::Launcher, Change::Exit);
 }
 
-/// Scenario: Pause claude launcher discovery before validation, then force the production validator's foreign-uid refusal. Resuming the old discovery must not publish its candidate or run a check; a genuine successor must use its own discovery.
+/// Scenario: Pause claude launcher discovery before validation, then force the production validator's foreign-uid refusal. Resuming discovery must refuse with the specific cause, publish no identity and send no check bytes.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_claude_launcher_rejects_foreign_uid() {
     negative("claude", Route::Launcher, Change::ForeignUid);
 }
 
-/// Scenario: Pause claude launcher discovery before validation, then replace the pane with a fresh installed generation. Resuming the old discovery must not publish its candidate or run a check; a genuine successor must use its own discovery.
+/// Scenario: Pause claude launcher discovery before validation, then replace the pane with a fresh installed generation. The retired discovery must complete or cancel with a generation-retired reason before its gate is released, without publishing; a genuine successor needs its own discovery.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_claude_launcher_rejects_replaced_generation() {
     negative("claude", Route::Launcher, Change::Generation);
 }
 
-/// Scenario: Pause claude learned wrapper discovery before validation, then make the discovered native candidate leave its parent. Resuming the old discovery must not publish its candidate or run a check; a genuine successor must use its own discovery.
+/// Scenario: Pause claude learned wrapper discovery before validation, then make the discovered native candidate leave its parent. Resuming discovery must refuse with the specific cause, publish no identity and send no check bytes.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_claude_learned_wrapper_rejects_reparented() {
     negative("claude", Route::Learned, Change::Reparent);
 }
 
-/// Scenario: Pause claude learned wrapper discovery before validation, then let the captured native candidate exit. Resuming the old discovery must not publish its candidate or run a check; a genuine successor must use its own discovery.
+/// Scenario: Pause claude learned wrapper discovery before validation, then let the captured native candidate exit. Resuming discovery must refuse with the specific cause, publish no identity and send no check bytes.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_claude_learned_wrapper_rejects_exited() {
     negative("claude", Route::Learned, Change::Exit);
 }
 
-/// Scenario: Pause claude learned wrapper discovery before validation, then force the production validator's foreign-uid refusal. Resuming the old discovery must not publish its candidate or run a check; a genuine successor must use its own discovery.
+/// Scenario: Pause claude learned wrapper discovery before validation, then force the production validator's foreign-uid refusal. Resuming discovery must refuse with the specific cause, publish no identity and send no check bytes.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_claude_learned_wrapper_rejects_foreign_uid() {
     negative("claude", Route::Learned, Change::ForeignUid);
 }
 
-/// Scenario: Pause claude learned wrapper discovery before validation, then replace the pane with a fresh installed generation. Resuming the old discovery must not publish its candidate or run a check; a genuine successor must use its own discovery.
+/// Scenario: Pause claude learned wrapper discovery before validation, then replace the pane with a fresh installed generation. The retired discovery must complete or cancel with a generation-retired reason before its gate is released, without publishing; a genuine successor needs its own discovery.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_claude_learned_wrapper_rejects_replaced_generation() {
     negative("claude", Route::Learned, Change::Generation);
 }
 
-/// Scenario: Pause claude lookalike discovery before validation, then make the discovered native candidate leave its parent. Resuming the old discovery must not publish its candidate or run a check; a genuine successor must use its own discovery.
+/// Scenario: Pause claude lookalike discovery before validation, then make the discovered native candidate leave its parent. Resuming discovery must refuse with the specific cause, publish no identity and send no check bytes.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_claude_lookalike_rejects_reparented() {
     negative("claude", Route::Lookalike, Change::Reparent);
 }
 
-/// Scenario: Pause claude lookalike discovery before validation, then let the captured native candidate exit. Resuming the old discovery must not publish its candidate or run a check; a genuine successor must use its own discovery.
+/// Scenario: Pause claude lookalike discovery before validation, then let the captured native candidate exit. Resuming discovery must refuse with the specific cause, publish no identity and send no check bytes.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_claude_lookalike_rejects_exited() {
     negative("claude", Route::Lookalike, Change::Exit);
 }
 
-/// Scenario: Pause claude lookalike discovery before validation, then force the production validator's foreign-uid refusal. Resuming the old discovery must not publish its candidate or run a check; a genuine successor must use its own discovery.
+/// Scenario: Pause claude lookalike discovery before validation, then force the production validator's foreign-uid refusal. Resuming discovery must refuse with the specific cause, publish no identity and send no check bytes.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_claude_lookalike_rejects_foreign_uid() {
     negative("claude", Route::Lookalike, Change::ForeignUid);
 }
 
-/// Scenario: Pause claude lookalike discovery before validation, then replace the pane with a fresh installed generation. Resuming the old discovery must not publish its candidate or run a check; a genuine successor must use its own discovery.
+/// Scenario: Pause claude lookalike discovery before validation, then replace the pane with a fresh installed generation. The retired discovery must complete or cancel with a generation-retired reason before its gate is released, without publishing; a genuine successor needs its own discovery.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_claude_lookalike_rejects_replaced_generation() {
@@ -559,109 +780,153 @@ fn probe_035_learned_wrapper_binds_native_codex_and_checks() {
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_codex_lookalike_cannot_get_permission() {
-    let f = fixture("codex", Route::Lookalike, "spawn", true, false);
-    pending(&f, Route::Lookalike);
-    let ready = launch(&f);
-    arrived(&f, &ready);
-    let actual = fs::metadata(ready["exe"].as_str().unwrap()).unwrap();
-    let trusted = fs::metadata(f.native_executable()).unwrap();
-    assert_ne!((actual.dev(), actual.ino()), (trusted.dev(), trusted.ino()));
-    release(&f);
-    denied(&f, true);
+    lookalike("codex", Route::Lookalike);
 }
 
-/// Scenario: Pause codex launcher discovery before validation, then make the discovered native candidate leave its parent. Resuming the old discovery must not publish its candidate or run a check; a genuine successor must use its own discovery.
+/// Scenario: An undeclared wrapper launches a codex lookalike and claims Codex through the pane's authenticated hooks. Discovery must refuse the different inode with a Codex-specific reason and send no check bytes.
+#[spec("inbox/probe/035")]
+#[test]
+fn probe_035_codex_learned_lookalike_cannot_get_permission() {
+    lookalike("codex", Route::LearnedLookalike);
+}
+
+/// Scenario: An undeclared wrapper launches a codex lookalike but claims Claude through the pane's authenticated hooks. Discovery must refuse it against the independently pinned Claude executable with a Claude-specific reason and send no check bytes.
+#[spec("inbox/probe/035")]
+#[test]
+fn probe_035_codex_learned_lookalike_cannot_claim_claude() {
+    lookalike("codex", Route::LearnedOtherKind);
+}
+
+/// Scenario: A native codex process is running when an update replaces its installation at the same path. Declared and learned panes must still bind their old pinned inode and check the touched empty composer.
+#[spec("inbox/probe/035")]
+#[test]
+fn probe_035_codex_running_inode_survives_install_update() {
+    for route in [Route::Launcher, Route::Learned] {
+        update_history("codex", route, Update::Running, true);
+    }
+}
+
+/// Scenario: Replace codex at the same installation path after a pane starts but before its wrapper launches the native child. Declared and learned panes must refuse that new inode with an executable-mismatch reason and send no check bytes.
+#[spec("inbox/probe/035")]
+#[test]
+fn probe_035_codex_wrapper_exec_after_update_is_refused() {
+    for route in [Route::Launcher, Route::Learned] {
+        update_history("codex", route, Update::BeforeExec, true);
+    }
+}
+
+/// Scenario: Replace codex at the same installation path, then start a fresh pane generation before launching the native child. Declared and learned panes must bind the new inode and check the touched empty composer.
+#[spec("inbox/probe/035")]
+#[test]
+fn probe_035_codex_fresh_spawn_pins_updated_inode() {
+    for route in [Route::Launcher, Route::Learned] {
+        update_history("codex", route, Update::Fresh, true);
+    }
+}
+
+/// Scenario: Pause codex launcher discovery before validation, then make the discovered native candidate leave its parent. Resuming discovery must refuse with the specific cause, publish no identity and send no check bytes.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_codex_launcher_rejects_reparented() {
     negative("codex", Route::Launcher, Change::Reparent);
 }
 
-/// Scenario: Pause codex launcher discovery before validation, then let the captured native candidate exit. Resuming the old discovery must not publish its candidate or run a check; a genuine successor must use its own discovery.
+/// Scenario: Pause codex launcher discovery before validation, then let the captured native candidate exit. Resuming discovery must refuse with the specific cause, publish no identity and send no check bytes.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_codex_launcher_rejects_exited() {
     negative("codex", Route::Launcher, Change::Exit);
 }
 
-/// Scenario: Pause codex launcher discovery before validation, then force the production validator's foreign-uid refusal. Resuming the old discovery must not publish its candidate or run a check; a genuine successor must use its own discovery.
+/// Scenario: Pause codex launcher discovery before validation, then force the production validator's foreign-uid refusal. Resuming discovery must refuse with the specific cause, publish no identity and send no check bytes.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_codex_launcher_rejects_foreign_uid() {
     negative("codex", Route::Launcher, Change::ForeignUid);
 }
 
-/// Scenario: Pause codex launcher discovery before validation, then replace the pane with a fresh installed generation. Resuming the old discovery must not publish its candidate or run a check; a genuine successor must use its own discovery.
+/// Scenario: Pause codex launcher discovery before validation, then replace the pane with a fresh installed generation. The retired discovery must complete or cancel with a generation-retired reason before its gate is released, without publishing; a genuine successor needs its own discovery.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_codex_launcher_rejects_replaced_generation() {
     negative("codex", Route::Launcher, Change::Generation);
 }
 
-/// Scenario: Pause codex learned wrapper discovery before validation, then make the discovered native candidate leave its parent. Resuming the old discovery must not publish its candidate or run a check; a genuine successor must use its own discovery.
+/// Scenario: Pause codex learned wrapper discovery before validation, then make the discovered native candidate leave its parent. Resuming discovery must refuse with the specific cause, publish no identity and send no check bytes.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_codex_learned_wrapper_rejects_reparented() {
     negative("codex", Route::Learned, Change::Reparent);
 }
 
-/// Scenario: Pause codex learned wrapper discovery before validation, then let the captured native candidate exit. Resuming the old discovery must not publish its candidate or run a check; a genuine successor must use its own discovery.
+/// Scenario: Pause codex learned wrapper discovery before validation, then let the captured native candidate exit. Resuming discovery must refuse with the specific cause, publish no identity and send no check bytes.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_codex_learned_wrapper_rejects_exited() {
     negative("codex", Route::Learned, Change::Exit);
 }
 
-/// Scenario: Pause codex learned wrapper discovery before validation, then force the production validator's foreign-uid refusal. Resuming the old discovery must not publish its candidate or run a check; a genuine successor must use its own discovery.
+/// Scenario: Pause codex learned wrapper discovery before validation, then force the production validator's foreign-uid refusal. Resuming discovery must refuse with the specific cause, publish no identity and send no check bytes.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_codex_learned_wrapper_rejects_foreign_uid() {
     negative("codex", Route::Learned, Change::ForeignUid);
 }
 
-/// Scenario: Pause codex learned wrapper discovery before validation, then replace the pane with a fresh installed generation. Resuming the old discovery must not publish its candidate or run a check; a genuine successor must use its own discovery.
+/// Scenario: Pause codex learned wrapper discovery before validation, then replace the pane with a fresh installed generation. The retired discovery must complete or cancel with a generation-retired reason before its gate is released, without publishing; a genuine successor needs its own discovery.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_codex_learned_wrapper_rejects_replaced_generation() {
     negative("codex", Route::Learned, Change::Generation);
 }
 
-/// Scenario: Pause codex lookalike discovery before validation, then make the discovered native candidate leave its parent. Resuming the old discovery must not publish its candidate or run a check; a genuine successor must use its own discovery.
+/// Scenario: Pause codex lookalike discovery before validation, then make the discovered native candidate leave its parent. Resuming discovery must refuse with the specific cause, publish no identity and send no check bytes.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_codex_lookalike_rejects_reparented() {
     negative("codex", Route::Lookalike, Change::Reparent);
 }
 
-/// Scenario: Pause codex lookalike discovery before validation, then let the captured native candidate exit. Resuming the old discovery must not publish its candidate or run a check; a genuine successor must use its own discovery.
+/// Scenario: Pause codex lookalike discovery before validation, then let the captured native candidate exit. Resuming discovery must refuse with the specific cause, publish no identity and send no check bytes.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_codex_lookalike_rejects_exited() {
     negative("codex", Route::Lookalike, Change::Exit);
 }
 
-/// Scenario: Pause codex lookalike discovery before validation, then force the production validator's foreign-uid refusal. Resuming the old discovery must not publish its candidate or run a check; a genuine successor must use its own discovery.
+/// Scenario: Pause codex lookalike discovery before validation, then force the production validator's foreign-uid refusal. Resuming discovery must refuse with the specific cause, publish no identity and send no check bytes.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_codex_lookalike_rejects_foreign_uid() {
     negative("codex", Route::Lookalike, Change::ForeignUid);
 }
 
-/// Scenario: Pause codex lookalike discovery before validation, then replace the pane with a fresh installed generation. Resuming the old discovery must not publish its candidate or run a check; a genuine successor must use its own discovery.
+/// Scenario: Pause codex lookalike discovery before validation, then replace the pane with a fresh installed generation. The retired discovery must complete or cancel with a generation-retired reason before its gate is released, without publishing; a genuine successor needs its own discovery.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_codex_lookalike_rejects_replaced_generation() {
     negative("codex", Route::Lookalike, Change::Generation);
 }
 
-/// Scenario: Start declared, learned and lookalike claude wrappers in both spawn and exec forms without a discovery seam, then invoke Ctrl+G with a human draft. The genuine installed helper must run the user's editor with that draft, and following input must still reach the composer.
+/// Scenario: Start declared and learned claude wrappers, including same-kind and other-kind lookalike claims, in spawn and exec forms without a discovery seam, then invoke Ctrl+G with a human draft. The installed helper must run the user's editor and following input must reach the composer. Same-path inode replacements must retain a running old process, reach the new inode before delayed exec, and reach the new inode in a fresh generation, with human input still visible in each case.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_fixture_claude_wrappers_preserve_unarmed_editor() {
-    for route in [Route::Launcher, Route::Learned, Route::Lookalike] {
+    for route in [
+        Route::Launcher,
+        Route::Learned,
+        Route::Lookalike,
+        Route::LearnedLookalike,
+        Route::LearnedOtherKind,
+    ] {
         for mode in ["spawn", "exec"] {
             let f = fixture("claude", route, mode, false, false);
-            let ready = launch(&f);
+            let claimed_kind = if matches!(route, Route::LearnedOtherKind) {
+                if f.kind == "codex" { "claude" } else { "codex" }
+            } else {
+                f.kind
+            };
+            let ready = launch_as(&f, claimed_kind);
             let wrapper = live::read_json(&f.path("launcher-ready"));
             assert_eq!(ready["editors"], wrapper["editors"]);
             let mut human = f.connect();
@@ -678,6 +943,11 @@ fn probe_035_fixture_claude_wrappers_preserve_unarmed_editor() {
             );
             human.write("AFTER");
             f.expect(b"human-draft\x07AFTER");
+        }
+    }
+    for route in [Route::Launcher, Route::Learned] {
+        for update in [Update::Running, Update::BeforeExec, Update::Fresh] {
+            update_history("claude", route, update, false);
         }
     }
 }
@@ -709,14 +979,25 @@ fn probe_035_fixture_claude_can_reparent_a_live_candidate() {
     f.wait("native-stopped");
 }
 
-/// Scenario: Start declared, learned and lookalike codex wrappers in both spawn and exec forms without a discovery seam, then invoke Ctrl+G with a human draft. The genuine installed helper must run the user's editor with that draft, and following input must still reach the composer.
+/// Scenario: Start declared and learned codex wrappers, including same-kind and other-kind lookalike claims, in spawn and exec forms without a discovery seam, then invoke Ctrl+G with a human draft. The installed helper must run the user's editor and following input must reach the composer. Same-path inode replacements must retain a running old process, reach the new inode before delayed exec, and reach the new inode in a fresh generation, with human input still visible in each case.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_fixture_codex_wrappers_preserve_unarmed_editor() {
-    for route in [Route::Launcher, Route::Learned, Route::Lookalike] {
+    for route in [
+        Route::Launcher,
+        Route::Learned,
+        Route::Lookalike,
+        Route::LearnedLookalike,
+        Route::LearnedOtherKind,
+    ] {
         for mode in ["spawn", "exec"] {
             let f = fixture("codex", route, mode, false, false);
-            let ready = launch(&f);
+            let claimed_kind = if matches!(route, Route::LearnedOtherKind) {
+                if f.kind == "codex" { "claude" } else { "codex" }
+            } else {
+                f.kind
+            };
+            let ready = launch_as(&f, claimed_kind);
             let wrapper = live::read_json(&f.path("launcher-ready"));
             assert_eq!(ready["editors"], wrapper["editors"]);
             let mut human = f.connect();
@@ -733,6 +1014,11 @@ fn probe_035_fixture_codex_wrappers_preserve_unarmed_editor() {
             );
             human.write("AFTER");
             f.expect(b"human-draft\x07AFTER");
+        }
+    }
+    for route in [Route::Launcher, Route::Learned] {
+        for update in [Update::Running, Update::BeforeExec, Update::Fresh] {
+            update_history("codex", route, update, false);
         }
     }
 }

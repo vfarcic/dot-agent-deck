@@ -3,12 +3,15 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
 
 base = Path(os.environ['DAD_LIVE_SEGMENTS_BASE'])
-native = Path(sys.argv[1])
+# The wrapper resolves its own command normally. No native path is handed to
+# it by the fixture; the daemon's independent authority is its spawn-time pin.
+native = Path(shutil.which(os.environ['DAD_LIVE_SEGMENTS_KIND']))
 mode = os.environ['DAD_DISCOVERY_LAUNCH']
 
 
@@ -35,7 +38,7 @@ def start():
     return subprocess.Popen([str(native), '--live-segments-fixture'], executable=actual)
 
 
-if sys.argv[2:] == ['intermediate']:
+if sys.argv[1:] == ['intermediate']:
     child = start()
     publish('parent-ready', {'pid': os.getpid(), 'child': child.pid})
     wait('reparent-go')
@@ -54,7 +57,7 @@ if mode == 'exec':
     actual = native.parent / 'lookalike' / native.name if os.environ['DAD_DISCOVERY_LOOKALIKE'] == '1' else native
     os.execve(actual, [str(native), '--live-segments-fixture'], os.environ)
 elif mode == 'reparent':
-    child = subprocess.Popen([sys.executable, __file__, str(native), 'intermediate'])
+    child = subprocess.Popen([sys.executable, __file__, 'intermediate'])
     child.wait()
     wait('wrapper-stop')
 elif mode == 'spawn':
