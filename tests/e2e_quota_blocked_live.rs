@@ -157,8 +157,14 @@ fn status_blocked_023_real_opencode_api_error_is_forwarded_not_blocked() {
         name,
         "opencode --model openai/gpt-5.4-mini",
     );
+    let composer_wait = std::time::Instant::now();
+    let composer = control.wait_for_grid_string_within("Ask anything", Duration::from_secs(45));
+    eprintln!(
+        "OpenCode composer ready={composer} after {:?}",
+        composer_wait.elapsed()
+    );
     assert!(
-        control.wait_for_grid_string_within("Ask anything", Duration::from_secs(45)),
+        composer,
         "real OpenCode did not reach its prompt:\n{}",
         control.snapshot_grid()
     );
