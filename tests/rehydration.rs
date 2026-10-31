@@ -3585,12 +3585,12 @@ struct HydrationTrace {
 }
 
 fn hydration_diagnostics_enabled(value: Option<&std::ffi::OsStr>) -> bool {
-    value.is_some()
+    value == Some(std::ffi::OsStr::new("1"))
 }
 
 fn hydration_registry_snapshot(registry: &AgentPtyRegistry) -> String {
     format!(
-        "registry (record, alive)={:?}",
+        "registry (record, observed_exited)={:?}",
         registry.agent_records_including_exited()
     )
 }
@@ -3632,7 +3632,7 @@ fn live_017_diagnostic_registry_labels_live_and_retained_exited_records() {
         assert_eq!(record.1, observed_exited, "control exit flag for {id}");
     }
     let snapshot = hydration_registry_snapshot(&registry);
-    // Stop only the children owned by this registry, before assertions can panic.
+    // Stop the children owned by this registry before checking the printed snapshot.
     registry.shutdown_all();
     assert!(
         snapshot.starts_with("registry (record, observed_exited)="),
