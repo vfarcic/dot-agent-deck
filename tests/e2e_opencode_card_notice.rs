@@ -18,7 +18,7 @@
 //!
 //! Every pane is started the way a wrapper (`devbox run …`, a script) starts
 //! OpenCode: the command is a shell script the deck cannot see into, declared
-//! `agent_type = "opencode"` so the deck watches it.
+//! `agent_type = "open_code"` so the deck watches it.
 //!
 //! Linux only: the stand-in starts its private server through its own
 //! absolute path, and the daemon's process sampling was measured on Linux

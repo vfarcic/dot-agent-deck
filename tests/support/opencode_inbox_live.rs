@@ -28,6 +28,7 @@ pub struct OpenCode {
     diagnostics: PathBuf,
     observer_stop: Arc<AtomicBool>,
     observer: Option<std::thread::JoinHandle<()>>,
+    mini: bool,
 }
 
 /// The binary `DOT_AGENT_DECK_OPENCODE_TEST_BIN` picks answers `--version`
@@ -195,8 +196,21 @@ export default {id:'deck-test-route',tui:async(api)=>{
                 deck.workdir().join("opencode-route.json")
             ]
         ]);
-        // Start through the same public attach operation desktop clients use.
-        let mut worker = json!({"op":"start-agent","command":role_command,"cwd":work,"agent_type":"opencode","rows":40,"cols":140,"env":extra,"display_name":"coder","tab_membership":{"kind":"orchestration","name":"opencode-inbox","role_name":"coder","role_index":1,"is_start_role":false,"orchestration_cwd":work,"orchestration_id":"opencode-inbox-test"}});
+        // Start through the same public attach operation desktop clients use,
+        // declared OpenCode in the wire spelling (`open_code`): `AgentType` has a
+        // `#[serde(other)]` catch-all, so `"opencode"` would be accepted and
+        // silently read as no agent at all, and the deck would neither refresh
+        // the integration and probe the version for this spawn nor watch the
+        // pane for its card notices.
+        //
+        // Except without the TUI watcher: a declared OpenCode spawn reinstalls
+        // the TUI half this fixture just removed (the per-spawn refresh), so that
+        // case stays undeclared, which is how a wrapper the deck cannot see into
+        // starts OpenCode.
+        let mut worker = json!({"op":"start-agent","command":role_command,"cwd":work,"rows":40,"cols":140,"env":extra,"display_name":"coder","tab_membership":{"kind":"orchestration","name":"opencode-inbox","role_name":"coder","role_index":1,"is_start_role":false,"orchestration_cwd":work,"orchestration_id":"opencode-inbox-test"}});
+        if watcher {
+            worker["agent_type"] = json!("open_code");
+        }
         worker["env"]
             .as_array_mut()
             .unwrap()
@@ -273,6 +287,7 @@ export default {id:'deck-test-route',tui:async(api)=>{
             diagnostics,
             observer_stop,
             observer: Some(observer),
+            mini,
         };
         result.wait_screen("Ask anything");
         // Case-blind: 1.x `--mini` prints its mode line as ` BUILD `.
@@ -469,7 +484,7 @@ export default {id:'deck-test-route',tui:async(api)=>{
     }
     pub fn interrupted_cancellable_wait(&self) -> Value {
         let before = self.log().len();
-        let prompt = "Run sleep 30 once in the shell as a disposable, cancellable wait while I prepare your next task. If the wait finishes without interruption, reply only with the concatenation of PRIME-INTERRUPT- and 022, with no spaces. This request lasts only until I interrupt you. An interrupt cancels the wait and completes this request: do not restart it, send a follow-up answer, or carry it into the next task. After interruption, handle the next instruction normally.";
+        let prompt = "Run sleep 30 once in the shell, in the foreground and not in the background, as a disposable, cancellable wait while I prepare your next task. If the wait finishes without interruption, reply only with the concatenation of PRIME-INTERRUPT- and 022, with no spaces. This request lasts only until I interrupt you. An interrupt cancels the wait and completes this request: do not restart it, send a follow-up answer, or carry it into the next task. After interruption, handle the next instruction normally.";
         let mut priming_input = self.input(prompt);
         assert!(
             common::wait_until(BUDGET, || composer::composer_has_prompt(
@@ -500,24 +515,45 @@ export default {id:'deck-test-route',tui:async(api)=>{
             self.evidence()
         );
         let running_call = std::cell::RefCell::new(Value::Null);
+        let backgrounded = std::cell::RefCell::new(Value::Null);
+        let found = common::wait_until(BUDGET, || {
+            let transcript = self.transcript();
+            // OpenCode 2's shell tool takes a `background` option, which
+            // ends the turn at once; the wait this precondition needs is
+            // then never running when the interrupt goes in.
+            if let Some(call) = transcript["part"].as_array().unwrap().iter().find(|p| {
+                p["data"]["type"] == "tool"
+                    && p["data"]["state"]["input"]["command"] == "sleep 30"
+                    && p["data"]["state"]["input"]["background"] == true
+            }) {
+                *backgrounded.borrow_mut() = call.clone();
+                return true;
+            }
+            let call = transcript["part"].as_array().unwrap().iter().find(|p| {
+                p["data"]["type"] == "tool"
+                    && p["data"]["tool"] == "bash"
+                    && p["data"]["state"]["status"] == "running"
+                    && p["data"]["state"]["input"]["command"] == "sleep 30"
+            });
+            let Some(call) = call else { return false };
+            if !composer::sleep_tool_visible(&self.screen())
+                || !composer::sleep_tool_visible(&self.deck.snapshot_grid())
+            {
+                return false;
+            }
+            *running_call.borrow_mut() = call.clone();
+            true
+        });
+        let backgrounded = backgrounded.into_inner();
         assert!(
-            common::wait_until(BUDGET, || {
-                let transcript = self.transcript();
-                let call = transcript["part"].as_array().unwrap().iter().find(|p| {
-                    p["data"]["type"] == "tool"
-                        && p["data"]["tool"] == "bash"
-                        && p["data"]["state"]["status"] == "running"
-                        && p["data"]["state"]["input"]["command"] == "sleep 30"
-                });
-                let Some(call) = call else { return false };
-                if !composer::sleep_tool_visible(&self.screen())
-                    || !composer::sleep_tool_visible(&self.deck.snapshot_grid())
-                {
-                    return false;
-                }
-                *running_call.borrow_mut() = call.clone();
-                true
-            }),
+            backgrounded.is_null(),
+            "precondition: the model ran the priming `sleep 30` in the BACKGROUND despite the \
+             prompt asking for the foreground, so its turn ended at once and there is no running \
+             wait to interrupt (a model flake in setup, before any deck delivery): {backgrounded}; {}",
+            self.evidence()
+        );
+        assert!(
+            found,
             "cancellable bash sleep 30 must be running and visible in both views before interrupt; {}",
             self.evidence()
         );
@@ -696,12 +732,19 @@ export default {id:'deck-test-route',tui:async(api)=>{
             "this delivery must assemble its token in a completed tool result; {}",
             self.evidence()
         );
-        self.wait_screen(token);
-        assert!(
-            self.deck.wait_for_grid_string_within(token, BUDGET),
-            "execution token must be visible in attached deck; {}",
-            self.evidence()
-        );
+        // OpenCode 2.x mini's default display preset hides tool calls and shell
+        // output (`tools: "hide", shell_output: "hide"`, read from 2.2.5), so the
+        // token cannot reach its screen whatever the deck does. The user's
+        // default display is kept; the completed tool result above is what
+        // proves the execution there.
+        if !(self.mini && common::opencode_test_is_v2()) {
+            self.wait_screen(token);
+            assert!(
+                self.deck.wait_for_grid_string_within(token, BUDGET),
+                "execution token must be visible in attached deck; {}",
+                self.evidence()
+            );
+        }
         inbox::state(&self.deck, &self.pane, id, "acknowledged");
         let listing = inbox::listing(&self.deck, &self.pane);
         let message = listing["messages"]

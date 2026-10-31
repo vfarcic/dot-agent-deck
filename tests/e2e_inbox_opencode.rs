@@ -142,7 +142,7 @@ impl OpenCode {
         let pool = config["offerPool"].as_str();
         let delay = config["publishDelayMs"].as_str();
         let mut start = json!({"op":"start-agent","command":command,"cwd":daemon.home,
-            "agent_type":"opencode","rows":40,"cols":140,
+            "agent_type":"open_code","rows":40,"cols":140,
             "env":[["DOT_AGENT_DECK_PANE_ID","opencode-fixture"],["PATH",path]],"display_name":"opencode fixture"});
         if let Some(ms) = delay {
             start["env"]
@@ -2347,7 +2347,7 @@ impl OpenCode2 {
         let reply = attach(
             &daemon,
             json!({"op":"start-agent","command":command,"cwd":daemon.home,
-                "agent_type":"opencode","rows":40,"cols":140,
+                "agent_type":"open_code","rows":40,"cols":140,
                 "env":[["DOT_AGENT_DECK_PANE_ID","opencode2-fixture"],["PATH",path]],
                 "display_name":"opencode 2 fixture"}),
         );
