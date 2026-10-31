@@ -1984,28 +1984,8 @@ async fn a_prepared_start_refuses_a_token_whose_prepared_context_was_replaced() 
     let server = start_server().await;
     let (_dir, project) = mint_project(LAUNCHABLE_PROJECT);
 
-    let prepare = |task: &'static str| {
-        let server = &server;
-        let path = project.to_str().unwrap().to_string();
-        async move {
-            let resp = issue_json_request(
-                server,
-                serde_json::json!({
-                    "op": "prepare-orchestration",
-                    "path": path,
-                    "orchestration": "loop",
-                    "task": task,
-                }),
-            )
-            .await;
-            assert!(resp.ok, "the preparation must succeed: {:?}", resp.error);
-            resp.orchestration_prepared
-                .expect("a PreparedOrchestration")
-        }
-    };
-
-    let first = prepare("Task A: the first client's brief.").await;
-    let second = prepare("Task B: the second client's brief.").await;
+    let first = prepare_loop(&server, &project, "Task A: the first client's brief.").await;
+    let second = prepare_loop(&server, &project, "Task B: the second client's brief.").await;
     assert_ne!(first.token, second.token);
     assert_ne!(
         first.context_path, second.context_path,
@@ -2113,35 +2093,8 @@ async fn a_prepared_start_refuses_spawn_fields_from_another_project() {
     let (_dir_x, project_x) = mint_project(LAUNCHABLE_PROJECT);
     let (_dir_y, project_y) = mint_project(LAUNCHABLE_PROJECT);
 
-    let prepare = |path: String, task: &'static str| {
-        let server = &server;
-        async move {
-            let resp = issue_json_request(
-                server,
-                serde_json::json!({
-                    "op": "prepare-orchestration",
-                    "path": path,
-                    "orchestration": "loop",
-                    "task": task,
-                }),
-            )
-            .await;
-            assert!(resp.ok, "the preparation must succeed: {:?}", resp.error);
-            resp.orchestration_prepared
-                .expect("a PreparedOrchestration")
-        }
-    };
-
-    let x = prepare(
-        project_x.to_str().unwrap().to_string(),
-        "Project X's brief.",
-    )
-    .await;
-    let y = prepare(
-        project_y.to_str().unwrap().to_string(),
-        "Project Y's brief.",
-    )
-    .await;
+    let x = prepare_loop(&server, &project_x, "Project X's brief.").await;
+    let y = prepare_loop(&server, &project_y, "Project Y's brief.").await;
     assert_ne!(
         x.context_path, y.context_path,
         "two projects must publish to two paths, or this would be the staleness case"
@@ -2387,6 +2340,7 @@ fn configured_role_payload(
 async fn prepare_loop(
     server: &Server,
     project: &Path,
+    task: &str,
 ) -> dot_agent_deck::event::PreparedOrchestration {
     let resp = issue_json_request(
         server,
@@ -2394,7 +2348,7 @@ async fn prepare_loop(
             "op": "prepare-orchestration",
             "path": project.to_str().unwrap(),
             "orchestration": "loop",
-            "task": "",
+            "task": task,
         }),
     )
     .await;
@@ -2413,7 +2367,7 @@ async fn prepare_loop(
 async fn a_configured_prepared_start_refuses_a_supplied_command_agent_type_or_seed() {
     let server = start_server().await;
     let (_dir, project) = mint_project(&configured_role_project(false));
-    let prepared = prepare_loop(&server, &project).await;
+    let prepared = prepare_loop(&server, &project, "").await;
 
     for (field, value) in [
         ("command", serde_json::json!("/bin/sh")),
@@ -2499,7 +2453,7 @@ async fn a_configured_prepared_start_refuses_a_supplied_command_agent_type_or_se
 async fn a_configured_prepared_start_refuses_a_missing_invalid_or_duplicated_pane_id() {
     let server = start_server().await;
     let (_dir, project) = mint_project(&configured_role_project(true));
-    let prepared = prepare_loop(&server, &project).await;
+    let prepared = prepare_loop(&server, &project, "").await;
 
     for (shape, env) in [
         ("missing", serde_json::json!([])),
@@ -2576,7 +2530,7 @@ async fn a_configured_prepared_start_seeds_only_a_pi_start_role_with_the_coordin
 
     for pi_start in [true, false] {
         let (_dir, project) = mint_project(&configured_role_project(pi_start));
-        let prepared = prepare_loop(&server, &project).await;
+        let prepared = prepare_loop(&server, &project, "").await;
         assert!(!prepared.prompt.trim().is_empty());
 
         let start_pane = format!("configured-start-{pi_start}");
