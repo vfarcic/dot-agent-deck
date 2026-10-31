@@ -4,4 +4,4 @@ expression: panel(&asked[3])
 ---
 Release checks
 Cancel the running release check? Its unfinished work will be discarded.
-[Cancel check Enter] [Keep checking Esc]
+[Back Enter/Esc] [Cancel check Tab Enter]

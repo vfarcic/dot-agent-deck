@@ -4,4 +4,4 @@ expression: panel(&frames[2])
 ---
 Release checks
 Turn release checks off and cancel the running check?
-[Turn off Enter] [Keep checking Esc]
+[Back Enter/Esc] [Turn off Tab Enter]

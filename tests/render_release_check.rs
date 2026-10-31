@@ -3,13 +3,15 @@
 
 use std::collections::HashMap;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use dot_agent_deck::daemon_protocol::AttachResponse;
 use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
 use dot_agent_deck::inbox_hub::InboxSummary;
 use dot_agent_deck::keybindings::{ACTIONS, KeybindingConfig};
 use dot_agent_deck::state::{AppState, SessionStatus};
-use dot_agent_deck::ui::render_release_check_key_sequence_to_buffers;
+use dot_agent_deck::ui::{
+    render_release_check_event_sequence_to_buffers, render_release_check_key_sequence_to_buffers,
+};
 use ratatui::buffer::Buffer;
 use serde_json::{Value, json};
 use spec::spec;
@@ -26,6 +28,28 @@ fn esc() -> KeyEvent {
 
 fn enter() -> KeyEvent {
     KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+}
+
+fn tab() -> KeyEvent {
+    KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)
+}
+
+fn inert_cells(buffer: &Buffer) {
+    for y in buffer.area.y..buffer.area.bottom() {
+        for x in buffer.area.x..buffer.area.right() {
+            let symbol = buffer[(x, y)].symbol();
+            assert!(
+                !symbol.chars().any(char::is_control),
+                "control-bearing cell ({x},{y}): {symbol:?}"
+            );
+            for invisible in ['\u{202e}', '\u{200b}', '\u{2028}', '\u{2029}'] {
+                assert!(
+                    !symbol.contains(invisible),
+                    "unescaped invisible character in cell ({x},{y}): {symbol:?}"
+                );
+            }
+        }
+    }
 }
 
 fn state(cause: &str) -> AppState {
@@ -280,6 +304,8 @@ struct Backend {
     mode: String,
     exported_to: Option<String>,
     trace_preview: String,
+    file_name: String,
+    error: Option<String>,
 }
 
 impl Backend {
@@ -290,6 +316,8 @@ impl Backend {
             mode: "auto".into(),
             exported_to: None,
             trace_preview: "SCRUBBED-TRACE-PREVIEW".into(),
+            file_name: "record.json".into(),
+            error: None,
         }
     }
 
@@ -315,10 +343,8 @@ impl Backend {
                 running.as_object_mut().unwrap().remove("queue_position");
             }
             "release-check-forget" => {
-                assert_eq!(
-                    request,
-                    json!({"op":"release-check-forget","agent":"claude","release":"2.1.313"})
-                );
+                assert_eq!(request["agent"], "claude");
+                assert!(request.get("identity").is_none());
                 for record in &mut self.records {
                     if record["agent"] == request["agent"]
                         && record["release"] == request["release"]
@@ -328,19 +354,19 @@ impl Backend {
                 }
             }
             "release-check-export-preview" => {
-                assert_eq!(
-                    request,
-                    json!({"op":"release-check-export-preview","agent":"claude","release":"2.1.313"})
-                );
+                assert_eq!(request["agent"], "claude");
+                assert!(request.get("identity").is_none());
+                if let Some(error) = &self.error {
+                    return Err(error.clone());
+                }
                 return Ok(json!({"ok":true,"files":[
-                    {"name":"record.json","content":"{\"state\":\"passed\"}"},
+                    {"name":self.file_name,"content":"{\"state\":\"passed\"}"},
                     {"name":"trace.txt","content":self.trace_preview},
                     {"name":"README","content":shared_words()["exportInspection"]}
                 ]}));
             }
             "release-check-export" => {
                 assert_eq!(request["agent"], "claude");
-                assert_eq!(request["release"], "2.1.313");
                 assert!(request.get("identity").is_none());
                 self.exported_to =
                     Some(request["dir"].as_str().expect("chosen destination").into());
@@ -382,9 +408,25 @@ impl Backend {
             &mut |request: Value| self.execute(request),
         )
     }
+
+    fn events(&mut self, events: &[Event], size: (u16, u16)) -> Vec<Buffer> {
+        let snapshot = snapshot(&self.records);
+        render_release_check_event_sequence_to_buffers(
+            &KeybindingConfig::default(),
+            &state("running"),
+            SESSION,
+            &["release_check"],
+            &snapshot,
+            &self.mode.clone(),
+            &[],
+            events,
+            size,
+            &mut |request| self.execute(request),
+        )
+    }
 }
 
-/// Scenario: Re-check from the hold line and from Details, including ask approval and an older selected record; the current identity starts checking. Cancel from the older selection asks first: Escape preserves the running check and Enter confirms, displaying the cancellation answer.
+/// Scenario: Re-check from the hold line and from Details, including ask approval and an older selected record; the current identity starts checking. Cancel from the older selection asks first: Escape or default Enter preserves the running check, while Tab then Enter confirms and displays the cancellation answer.
 #[spec("inbox/release-check/004")]
 #[test]
 fn release_check_004_recheck_approve_and_cancel_have_visible_results() {
@@ -444,6 +486,13 @@ fn release_check_004_recheck_approve_and_cancel_have_visible_results() {
     );
     assert!(panel(&asked[3]).contains(shared_words()["cancelConfirmation"].as_str().unwrap()));
     insta::assert_snapshot!("cancel_confirmation", panel(&asked[3]));
+    assert!(panel(&asked[3]).contains(shared_words()["confirmDismiss"].as_str().unwrap()));
+    let default = backend.run("running", &[key('v'), key('j'), key('c'), enter()]);
+    assert!(
+        backend.calls.is_empty(),
+        "default Enter must dismiss Cancel"
+    );
+    assert_eq!(default[2], default[4]);
     let dismissed = backend.run("running", &[key('v'), key('j'), key('c'), esc()]);
     assert!(
         backend.calls.is_empty(),
@@ -456,7 +505,7 @@ fn release_check_004_recheck_approve_and_cancel_have_visible_results() {
     insta::assert_snapshot!("cancel_confirmation_dismissed", panel(&dismissed[4]));
     let frames = backend.run(
         "running",
-        &[key('v'), key('j'), key('c'), enter(), key('k')],
+        &[key('v'), key('j'), key('c'), tab(), enter(), key('k')],
     );
     assert_eq!(backend.calls.len(), 1, "one accepted cancellation");
     insta::assert_snapshot!("cancelled", panel(frames.last().unwrap()));
@@ -479,7 +528,7 @@ fn release_check_004_recheck_approve_and_cancel_have_visible_results() {
     );
 }
 
-/// Scenario: Open a release with one identity and then one with two identities beside an older release; show the release-wide Forget explanation only for the latter. Forget asks before acting: Escape preserves the records and Enter confirms, after which both selected-release records are forgotten and the other release stays passed.
+/// Scenario: Open a release with one identity and then one with two identities; show the release-wide Forget explanation only for the latter. Escape or default Enter preserves the records, while Tab then Enter forgets the selected release, including an older release distinct from the pane's current one, and preserves the other release visibly.
 #[spec("inbox/release-check/004")]
 #[test]
 fn release_check_004_forget_acts_on_the_selected_release() {
@@ -522,6 +571,16 @@ fn release_check_004_forget_acts_on_the_selected_release() {
         "Forget must ask before sending an operation"
     );
     insta::assert_snapshot!("forget_confirmation", panel(&asked[4]));
+    assert!(panel(&asked[4]).contains(shared_words()["confirmDismiss"].as_str().unwrap()));
+    let default = backend.run(
+        "differs",
+        &[key('v'), key('j'), key('j'), key('f'), enter()],
+    );
+    assert!(
+        backend.calls.is_empty(),
+        "default Enter must dismiss Forget"
+    );
+    assert_eq!(default[3], default[5]);
     let dismissed = backend.run("differs", &[key('v'), key('j'), key('j'), key('f'), esc()]);
     assert!(backend.calls.is_empty(), "Escape must preserve the records");
     assert_eq!(dismissed[3], dismissed[5]);
@@ -533,20 +592,78 @@ fn release_check_004_forget_acts_on_the_selected_release() {
             key('j'),
             key('j'),
             key('f'),
+            tab(),
             enter(),
             key('k'),
             key('k'),
         ],
     );
-    assert_eq!(backend.calls.len(), 1);
+    assert_eq!(
+        backend.calls,
+        [json!({"op":"release-check-forget","agent":"claude","release":"2.1.313"})]
+    );
     assert!(
         panel(&frames[3]).contains(&scope),
         "several identities must show the release-wide Forget explanation"
     );
     insta::assert_snapshot!("forget_release_scope", panel(&frames[3]));
-    insta::assert_snapshot!("forgot_selected", panel(&frames[5]));
-    insta::assert_snapshot!("forgot_other_identity", panel(&frames[6]));
-    insta::assert_snapshot!("forgot_preserves_other_release", panel(&frames[7]));
+    insta::assert_snapshot!("forgot_selected", panel(&frames[6]));
+    insta::assert_snapshot!("forgot_other_identity", panel(&frames[7]));
+    insta::assert_snapshot!("forgot_preserves_other_release", panel(&frames[8]));
+
+    for several in [false, true] {
+        let mut older = Backend::new(json!("passed"), "complete");
+        older.records.push(row(
+            "2.1.312",
+            "fedcba9876543210",
+            json!("differs"),
+            "complete",
+        ));
+        if several {
+            older.records.push(row(
+                "2.1.312",
+                "aaaaaaaaaaaaaaaa",
+                json!("passed"),
+                "complete",
+            ));
+        }
+        let asked = older.run("running", &[key('v'), key('j'), key('f')]);
+        let question = panel(&asked[3]);
+        assert!(
+            question.contains(
+                &shared_words()["forgetConfirmation"]
+                    .as_str()
+                    .unwrap()
+                    .replace("{release}", "2.1.312")
+            )
+        );
+        let scope = shared_words()["details"]["forget_release"]
+            .as_str()
+            .unwrap()
+            .replace("{release}", "2.1.312");
+        assert_eq!(question.contains(&scope), several);
+        assert!(older.calls.is_empty());
+        let frames = older.run(
+            "running",
+            &[key('v'), key('j'), key('f'), tab(), enter(), key('k')],
+        );
+        assert_eq!(
+            older.calls,
+            [json!({"op":"release-check-forget","agent":"claude","release":"2.1.312"})]
+        );
+        assert!(
+            panel(&frames[5]).contains(shared_words()["details"]["forgotten"].as_str().unwrap())
+        );
+        assert!(panel(&frames[6]).contains(shared_words()["details"]["passed"].as_str().unwrap()));
+        assert!(panel(&frames[6]).contains("2.1.313"));
+        if several {
+            let frames = older.run("running", &[key('v'), key('j'), key('j')]);
+            assert!(
+                panel(&frames[3])
+                    .contains(shared_words()["details"]["forgotten"].as_str().unwrap())
+            );
+        }
+    }
 
     // A stale f/e binding on an already-forgotten row must be inert.
     let mut backend = Backend::new(json!("forgotten"), "complete");
@@ -555,7 +672,7 @@ fn release_check_004_forget_acts_on_the_selected_release() {
     assert_eq!(frames[1], frames[3]);
 }
 
-/// Scenario: Select either of two identities, open Export's file list and inspect each file before choosing a destination; Escape writes nothing and Enter confirms once. Recorded controls and invisible Unicode appear as printable escapes, and a long preview stays within 16,384 code points after escaping, with a marker stating the full exported file's byte count.
+/// Scenario: Select a release, including an older one distinct from the current release, inspect its export files and choose a destination; Escape writes nothing and Enter writes once. Hostile traces, adapter names, errors and directory echoes stay inert and bounded; typed or pasted controls refuse a write, while bidi/zero-width-only paths write with an escaped echo.
 #[spec("inbox/release-check/004")]
 #[test]
 fn release_check_004_export_asks_for_a_directory_and_can_be_cancelled() {
@@ -828,9 +945,189 @@ fn release_check_004_export_asks_for_a_directory_and_can_be_cancelled() {
     );
     assert_eq!(backend.calls.len(), 1);
     assert!(backend.exported_to.is_none());
+
+    // Adapter replies remain raw: presentation must escape them in production.
+    let raw = "<img src=x>\x1b]52;c;xx\x07\u{009b}2J\r\x08\x7f\u{202e}\u{200b}\u{2028}\u{2029}";
+    let printable =
+        "<img src=x>\\x1b]52;c;xx\\x07\\x9b2J\\x0d\\x08\\x7f\\u{202e}\\u{200b}\\u{2028}\\u{2029}";
+    for source in ["name", "error"] {
+        let render = |text: &str| {
+            let mut backend = Backend::new(json!("passed"), "complete");
+            if source == "name" {
+                backend.file_name = text.into();
+            } else {
+                backend.error = Some(text.into());
+            }
+            let frames = backend.events(&[Event::Key(key('v')), Event::Key(key('e'))], (240, 512));
+            assert_eq!(
+                backend.calls,
+                [json!({"op":"release-check-export-preview","agent":"claude","release":"2.1.313"})]
+            );
+            assert!(backend.exported_to.is_none());
+            frames.last().unwrap().clone()
+        };
+        let actual = render(raw);
+        inert_cells(&actual);
+        assert!(
+            panel(&actual).contains(printable),
+            "missing escaped adapter {source}: {}",
+            panel(&actual)
+        );
+        assert_eq!(
+            actual,
+            render(printable),
+            "adapter {source} must preserve the dialog and surrounding rows"
+        );
+        let long = format!("\u{202e}{}END_OF_DIAGNOSTIC", "界".repeat(1_000_000));
+        let frame = render(&long);
+        inert_cells(&frame);
+        let displayed = panel(&frame).lines().collect::<String>();
+        let baseline = panel(&render("BOUND-START")).lines().collect::<String>();
+        assert!(displayed.contains("\\u{202e}"));
+        assert!(displayed.contains(shared_words()["displayTruncated"].as_str().unwrap()));
+        assert!(!displayed.contains("END_OF_DIAGNOSTIC"));
+        assert!(
+            displayed.chars().count() <= baseline.chars().count() - "BOUND-START".len() + 16_384,
+            "adapter {source} exceeds 16,384 code points after escaping (including marker)"
+        );
+    }
+
+    let directory_events = |raw: &str| {
+        vec![
+            Event::Key(key('v')),
+            Event::Key(key('e')),
+            Event::Key(key('w')),
+            Event::Paste(raw.into()),
+        ]
+    };
+    for (raw, printable) in [
+        (
+            "/export/\x1b]52;c;xx\x07\u{009b}2J\x08\x7f\u{202e}\u{200b}\u{2028}\u{2029}",
+            "/export/\\x1b]52;c;xx\\x07\\x9b2J\\x08\\x7f\\u{202e}\\u{200b}\\u{2028}\\u{2029}",
+        ),
+        ("/export/\u{0085}control", "/export/\\x85control"),
+        ("/export/line\nbreak", "/export/line\\x0abreak"),
+    ] {
+        // Exercise both individual Char events and a bracketed-paste payload.
+        for paste in [false, true] {
+            let mut backend = Backend::new(json!("passed"), "complete");
+            let mut events = directory_events("");
+            events.pop();
+            if paste {
+                // Begin from valid input, so dropping only the bad bytes would
+                // wrongly write this previously valid destination.
+                events.extend("/valid/export".chars().map(|c| Event::Key(key(c))));
+                events.push(Event::Paste(raw.into()));
+            } else {
+                events.extend(raw.chars().map(|c| Event::Key(key(c))));
+            }
+            events.push(Event::Key(enter()));
+            let frames = backend.events(&events, (240, 512));
+            for frame in &frames {
+                inert_cells(frame);
+            }
+            let displayed = panel(frames.last().unwrap());
+            assert!(
+                displayed.contains(shared_words()["invalidDirectory"].as_str().unwrap()),
+                "missing invalid-directory explanation: {displayed}"
+            );
+            assert!(backend.exported_to.is_none());
+            assert_eq!(
+                backend.calls,
+                [json!({"op":"release-check-export-preview","agent":"claude","release":"2.1.313"})]
+            );
+            if !paste {
+                assert!(
+                    displayed.contains(printable),
+                    "missing escaped directory: {displayed}"
+                );
+            }
+        }
+    }
+
+    // Non-Cc invisible characters are accepted in a destination, with an
+    // escaped presentation copy. Raw input reaches only the external write.
+    let raw = "/export/\u{202e}\u{200b}";
+    let printable = "/export/\\u{202e}\\u{200b}";
+    let mut backend = Backend::new(json!("passed"), "complete");
+    let mut events = directory_events(raw);
+    events.push(Event::Key(enter()));
+    let frames = backend.events(&events, (240, 512));
+    for frame in &frames {
+        inert_cells(frame);
+    }
+    assert!(panel(&frames[4]).contains(printable));
+    assert!(
+        panel(frames.last().unwrap()).contains(printable),
+        "accepted export also echoes the inert directory"
+    );
+    assert_eq!(
+        backend.calls,
+        [
+            json!({"op":"release-check-export-preview","agent":"claude","release":"2.1.313"}),
+            json!({"op":"release-check-export","agent":"claude","release":"2.1.313","dir":raw}),
+        ]
+    );
+
+    let echo = |raw: &str| {
+        let mut backend = Backend::new(json!("passed"), "complete");
+        let mut events = directory_events(raw);
+        events.push(Event::Key(esc()));
+        let frames = backend.events(&events, (240, 512));
+        assert_eq!(backend.calls.len(), 1);
+        assert!(backend.exported_to.is_none());
+        frames[4].clone()
+    };
+    let frame = echo(&format!(
+        "/export/\u{202e}{}END_OF_DIRECTORY",
+        "界".repeat(1_000_000)
+    ));
+    inert_cells(&frame);
+    let displayed = panel(&frame).lines().collect::<String>();
+    let baseline = panel(&echo("BOUND-START")).lines().collect::<String>();
+    assert!(displayed.contains("/export/\\u{202e}"));
+    assert!(displayed.contains(shared_words()["displayTruncated"].as_str().unwrap()));
+    assert!(!displayed.contains("END_OF_DIRECTORY"));
+    // The editable TUI field is itself visible text and shares the escaped,
+    // bounded echo; unlike a DOM input it cannot contain raw controls.
+    assert!(
+        displayed.chars().count() <= baseline.chars().count() - "BOUND-START".len() + 16_384,
+        "directory presentation exceeds 16,384 code points including marker"
+    );
+
+    let mut older = Backend::new(json!("passed"), "complete");
+    older.records.push(row(
+        "2.1.312",
+        "fedcba9876543210",
+        json!("passed"),
+        "complete",
+    ));
+    older.records.push(row(
+        "2.1.312",
+        "aaaaaaaaaaaaaaaa",
+        json!("passed"),
+        "complete",
+    ));
+    let mut keys = vec![key('v'), key('j'), key('j'), key('e'), key('w')];
+    keys.extend("/sandbox/older".chars().map(key));
+    keys.extend([enter(), key('k'), key('k')]);
+    let frames = older.run("running", &keys);
+    assert_eq!(
+        older.calls,
+        [
+            json!({"op":"release-check-export-preview","agent":"claude","release":"2.1.312"}),
+            json!({"op":"release-check-export","agent":"claude","release":"2.1.312","dir":"/sandbox/older"}),
+        ]
+    );
+    assert!(panel(&frames[4]).contains("2.1.312"));
+    assert!(panel(frames.last().unwrap()).contains("2.1.313"));
+    assert!(
+        panel(frames.last().unwrap())
+            .contains(shared_words()["details"]["passed"].as_str().unwrap())
+    );
 }
 
-/// Scenario: Change auto to ask, then attempt off during a running check; Escape preserves it and Enter accepts off and displays the stopped result. A queued check turns off without asking, matching the desktop; switch back to auto and read a refused Re-check without a false success message.
+/// Scenario: Change auto to ask, then attempt off during a running check; Escape or default Enter preserves it, while Tab then Enter accepts off and displays the stopped result. A queued check turns off without asking, matching the desktop; switch back to auto and read a refused Re-check without a false success message.
 #[spec("inbox/release-check/004")]
 #[test]
 fn release_check_004_mode_settings_and_refusal_are_visible() {
@@ -846,8 +1143,11 @@ fn release_check_004_mode_settings_and_refusal_are_visible() {
     insta::assert_snapshot!("mode_off_confirmation", panel(&frames[2]));
     insta::assert_snapshot!("mode_off_cancelled", agent_settings(&frames[3]));
     insta::assert_snapshot!("mode_off_cancelled_running", panel(frames.last().unwrap()));
-    let frames = backend.run("running", &[key('p'), key('M'), enter(), key('v')]);
-    insta::assert_snapshot!("mode_off", agent_settings(&frames[3]));
+    let default = backend.run("running", &[key('p'), key('M'), enter()]);
+    assert!(backend.calls.is_empty(), "default Enter must dismiss Off");
+    assert_eq!(default[1], default[3]);
+    let frames = backend.run("running", &[key('p'), key('M'), tab(), enter(), key('v')]);
+    insta::assert_snapshot!("mode_off", agent_settings(&frames[4]));
     insta::assert_snapshot!("mode_off_stopped_check", panel(frames.last().unwrap()));
     let frames = backend.run("off", &[key('p'), key('M')]);
     insta::assert_snapshot!("mode_auto", agent_settings(frames.last().unwrap()));
@@ -929,7 +1229,7 @@ fn release_check_004_absent_capability_withholds_controls() {
     }
 }
 
-/// Scenario: Seed a restart notice, remap Details and Cancel, and press their old and new keys. The remapped Cancel asks and Enter confirms; old c stays inert in Details, while c after closing Details visibly dismisses the notice as a positive control.
+/// Scenario: Seed a restart notice, remap Details and Cancel, and press their old and new keys. The remapped Cancel asks and Tab then Enter confirms; old c stays inert in Details, while c after closing Details visibly dismisses the notice as a positive control.
 #[spec("inbox/release-check/004")]
 #[test]
 fn release_check_004_keys_are_remappable_and_modal() {
@@ -986,6 +1286,7 @@ fn release_check_004_keys_are_remappable_and_modal() {
             KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE),
             key('c'),
             KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE),
+            tab(),
             enter(),
             esc(),
             KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE),
@@ -1002,20 +1303,20 @@ fn release_check_004_keys_are_remappable_and_modal() {
     assert_eq!(backend.calls, [json!({"op":"release-check-cancel"})]);
     insta::assert_snapshot!("details_remapped_cancel", panel(&frames[2]));
     assert!(panel(&frames[4]).contains(shared_words()["cancelConfirmation"].as_str().unwrap()));
-    insta::assert_snapshot!("cancelled_remapped", panel(&frames[5]));
+    insta::assert_snapshot!("cancelled_remapped", panel(&frames[6]));
     assert_eq!(
-        frames[6], frames[7],
+        frames[7], frames[8],
         "modal-only F3 cannot cancel behind Details"
     );
     let notice = "The deck restarted; these agents were stopped: SC10-BACKGROUND-NOTICE.";
-    for index in [0, 6, 7] {
+    for index in [0, 7, 8] {
         assert!(
             buffer_text(&frames[index]).contains(notice),
             "background notice must survive modal c through closing Details, frame {index}"
         );
     }
     assert!(
-        !buffer_text(&frames[8]).contains(notice),
+        !buffer_text(&frames[9]).contains(notice),
         "positive control: dashboard c must dismiss the seeded notice"
     );
 }
