@@ -230,6 +230,10 @@ impl Capture {
 }
 
 fn measure(kind: &str, rows: u16, cols: u16) -> Capture {
+    measure_with_path(kind, rows, cols, None)
+}
+
+fn measure_with_path(kind: &str, rows: u16, cols: u16, path: Option<&str>) -> Capture {
     let root = tempfile::Builder::new()
         .prefix("dad-claude-2312-measure-")
         .tempdir_in("/var/tmp")
@@ -248,7 +252,11 @@ fn measure(kind: &str, rows: u16, cols: u16) -> Capture {
         quote(&script),
         quote(&output)
     );
-    let deck = common::TuiDeck::builder()
+    let mut builder = common::TuiDeck::builder();
+    if let Some(path) = path {
+        builder = builder.with_env("PATH", path);
+    }
+    let deck = builder
         .with_env(
             "PYTHONPATH",
             std::env::var("PYTHONPATH").unwrap_or_default(),
@@ -289,6 +297,87 @@ fn measure(kind: &str, rows: u16, cols: u16) -> Capture {
     };
     drop(deck);
     capture
+}
+
+/// Scenario: Open the slash menu, file menu, shell mode, exit warning and background overview in isolated real Claude Code 2.1.310 and 2.1.312 composers. Capture their raw bytes and rendered frames, including a normal composer with warning phrases quoted in a real user transcript echo whose submission is blocked before a model turn.
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_live_release_menu_frames() {
+    skip_unless!(common::check_claude_available());
+    for release in ["2.1.310", "2.1.312"] {
+        let key = format!("DOT_AGENT_DECK_CLAUDE_MENU_{}", release.replace('.', "_"));
+        let binary =
+            std::env::var(&key).unwrap_or_else(|_| panic!("set {key} to the pinned executable"));
+        let root = tempfile::Builder::new()
+            .prefix("dad-claude-menu-bin-")
+            .tempdir_in("/var/tmp")
+            .unwrap();
+        std::os::unix::fs::symlink(&binary, root.path().join("claude")).unwrap();
+        let path = format!(
+            "{}:{}",
+            root.path().display(),
+            std::env::var("PATH").unwrap()
+        );
+        let capture = measure_with_path("menus", 50, 200, Some(&path));
+        assert_eq!(capture.result["release"], release);
+        assert!(
+            capture
+                .parser(capture.point("overview"))
+                .screen()
+                .contents()
+                .lines()
+                .any(|row| {
+                    row.starts_with('❯') && row.contains("describe a task for a new session")
+                }),
+            "{release}: overview must show its own composer, beyond the transcript quotation"
+        );
+        for (point, signature) in [
+            ("slash", "/add-dir"),
+            ("at", ".dot-agent-deck.toml"),
+            ("bang", "! for shell mode"),
+            ("exit-warning", "Press Ctrl-C again to exit"),
+            ("overview", "describe a task for a new session"),
+            (
+                "transcript-quotation",
+                "Original prompt: Quoted UI phrases:",
+            ),
+        ] {
+            assert!(
+                capture
+                    .parser(capture.point(point))
+                    .screen()
+                    .contents()
+                    .contains(signature),
+                "{release} {point}: missing real screen signature {signature:?}"
+            );
+        }
+        let mut rendered = String::new();
+        for point in [
+            "empty",
+            "slash",
+            "at",
+            "bang",
+            "exit-warning",
+            "transcript-quotation",
+            "overview",
+        ] {
+            let parser = capture.parser(capture.point(point));
+            eprintln!("{release} {point}:\n{}", parser.screen().contents());
+            rendered.push_str(&format!(
+                "{release} {point} offset={} cursor={:?}\n{}\n\n",
+                capture.point(point),
+                parser.screen().cursor_position(),
+                parser.screen().contents()
+            ));
+        }
+        std::fs::write(capture.root.join("rendered.txt"), rendered).unwrap();
+        let hooks = std::fs::read_to_string(capture.root.join("hook.jsonl")).unwrap();
+        assert_eq!(
+            hooks.lines().count(),
+            1,
+            "one blocked submission; no model turn"
+        );
+    }
 }
 
 fn preflight() {

@@ -420,7 +420,7 @@ fn doorbell_036_codex_composer_over_real_frames() {
     }
 }
 
-/// Scenario: Read the recorded Claude Code 2.1.310 and 2.1.312 composer sessions at the empty composer, after the deck's line was written, at each read after its Enter, and after a clear. The profile sees the empty ready composer with its suggestion as placeholder, the exact line, the submitted line as a user message on its shaded row while it is drawn, and a cleared composer that is empty but shows no placeholder. Replay 2.1.312's compound-key capture too: marker insertion reveals the reviewer's retained two spaces, and blank Enter after non-ASCII deletion preserves the draft.
+/// Scenario: Replay Claude Code 2.1.310 and 2.1.312 at the empty composer, while holding a line, after submission and after clearing, then open each release's recorded overview, slash menu, file menu, shell mode and exit warning. The profile accepts the main composer even with warning phrases quoted in the transcript, refuses the other surfaces, and recognises the submitted user line. Replay 2.1.312's compound-key capture too: marker insertion reveals the retained two spaces, and blank Enter after non-ASCII deletion preserves the draft.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_claude_composer_over_real_frames() {
@@ -467,6 +467,53 @@ fn doorbell_036_claude_composer_over_real_frames() {
     assert_eq!(
         (CLAUDE_PROFILE.composer)(&before),
         (CLAUDE_PROFILE.composer)(&after)
+    );
+
+    let mut wrong_surfaces = Vec::new();
+    for release in ["2.1.310", "2.1.312"] {
+        let trace = fixture(&format!(
+            "claude-inbox/r5wake/claude-{release}-menus-50x200"
+        ));
+        for (point, expected) in [
+            ("empty", true),
+            ("transcript-quotation", true),
+            ("overview", false),
+            ("slash", false),
+            ("at", false),
+            ("bang", false),
+            ("exit-warning", false),
+        ] {
+            let grid = trace.grid(point);
+            let ready = (CLAUDE_PROFILE.ready)(&grid);
+            if ready != expected {
+                wrong_surfaces.push(format!(
+                    "Claude {release} {point}: ready={ready}, expected {expected}\n{}",
+                    trace.parser_upto(trace.points[point]).screen().contents()
+                ));
+            }
+            if expected {
+                assert!(CLAUDE_PROFILE.empty_and_ready(&grid), "{release} {point}");
+            }
+        }
+        let quotation = trace
+            .parser_upto(trace.points["transcript-quotation"])
+            .screen()
+            .contents();
+        for phrase in [
+            "Your conversation moved to the background",
+            "describe a task for a new session",
+            "Press Ctrl-C again to exit",
+        ] {
+            assert!(
+                quotation.contains(phrase),
+                "missing real transcript quote {phrase:?}"
+            );
+        }
+    }
+    assert!(
+        wrong_surfaces.is_empty(),
+        "Claude must recognise the main composer and refuse other input surfaces:\n{}",
+        wrong_surfaces.join("\n\n")
     );
 }
 
