@@ -47,9 +47,6 @@ import { sanitizeText } from "./displayText";
 
 export { ALL_ENDPOINT_SELECTION, DEFAULT_SSH_PORT, LOCAL_ENDPOINT_SELECTION };
 
-/** `EndpointId`'s bound — `MAX_ENDPOINT_ID_BYTES` in `settings.rs`. */
-export const MAX_ENDPOINT_ID_LENGTH = 64;
-
 /*
  * The five bounds below are `MAX_BYTES` on the five `SshArgumentRules` impls,
  * one constant each — there is deliberately no shared "fields are short"
