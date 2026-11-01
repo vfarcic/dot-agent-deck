@@ -430,7 +430,7 @@ fn probe_032_counted_native_fifo_overflow_never_ages_into_permission() {
     );
 }
 
-/// Scenario: With the real TUI attached to the sandbox daemon, pause the check's real helper before its decision, type and watch the actual card. It must show the shared checking explanation while keys are held, clear it after the helper resumes and releases them, and show the shared not-delivered words if a second hold is retired.
+/// Scenario: With the real TUI attached, pause a real helper and type: the card must show held typing and clear it on release. Wait for that helper's settled drain and a due schedule before forming a second hold; an unsupported export must report Unreadable without an empty observation, then the schedule clock advances its normal recheck wait without typing a key. Retiring that hold must put the earlier generation's loss on the successor record and its card, without delivering those keys to the successor.
 #[spec("inbox/probe/046")]
 #[test]
 fn probe_046_attached_dashboard_shows_clears_and_retires_held_typing() {
@@ -449,8 +449,27 @@ fn probe_046_attached_dashboard_shows_clears_and_retires_held_typing() {
         .launch_with_fixture("minimal");
     let pause = f.pause_helper();
     f.flag("hold-return");
-    f.probe();
+    let before = f.epoch();
+    let first = f.probe();
+    assert_eq!(first["composer_probe"]["outcome"], "written", "{first}");
     f.wait("helper-started");
+    let helper = live::read_json(&f.path("helper-started"));
+    let export = std::path::Path::new(helper["path"].as_str().unwrap());
+    let unsupported = dot_agent_deck::composer_probe::path_rule::verify_export(
+        &mut dot_agent_deck::platform::fsperm::fs_view::LinuxFsView,
+        export,
+        // SAFETY: getuid has no failure mode.
+        unsafe { libc::getuid() },
+    )
+    .err();
+    eprintln!(
+        "probe_046 export-chain branch: {} ({unsupported:?})",
+        if unsupported.is_some() {
+            "unsupported / Unreadable / timed recheck"
+        } else {
+            "supported / Empty / naturally due"
+        }
+    );
     let mut human = f.connect();
     human.write("VISIBLE-HELD");
     f.wait_held();
@@ -474,22 +493,90 @@ fn probe_046_attached_dashboard_shows_clears_and_retires_held_typing() {
         tui.snapshot_grid()
     );
     f.remove("hold-return");
-    f.flag("edit-drop");
-    f.probe();
-    human.write("RETIRED-VISIBLE");
-    f.wait_held();
-    f.replace();
-    let words: Value = serde_json::from_str(include_str!("fixtures/inbox-display.json")).unwrap();
-    let retired = words["notDelivered"].as_str().unwrap();
+    f.wait("composer-return-1");
+    // Clearing the displayed hold proves release, not schedule settlement.
+    // The record-specific drain is published after settlement under the
+    // same generation lock; only then can due be used for the next check.
     assert!(
         common::wait_until(WAIT, || {
-            let grid = tui.snapshot_grid();
-            grid.contains(retired) && grid.contains("typing")
+            f.control("observer-status")["composer_observer"]["drained"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["pid"] == helper["pid"])
         }),
+        "the first helper must settle before the second probe: {}",
+        f.control("observer-status")
+    );
+    let trace = fs::read_to_string(f.path("helper-trace")).unwrap();
+    if let Some(refusal) = &unsupported {
+        assert!(trace.contains("Unreadable"), "{refusal:?}: {trace}");
+        assert_eq!(
+            f.epoch().1,
+            before.1,
+            "an unsupported export must not claim an empty observation"
+        );
+        let schedule = f.control("schedule-status")["composer_schedule"].clone();
+        assert_eq!(schedule["due"], false, "{schedule}");
+        assert_eq!(schedule["failures"], 0, "{schedule}");
+        let page = f.page();
+        let early = f.probe();
+        assert_eq!(early["composer_probe"]["outcome"], "not_due", "{early}");
+        assert_eq!(f.page(), page, "an early recheck must publish no arm");
+        f.stable(b"\x07VISIBLE-HELD");
+        // Exercise the display history even on overlayfs, without pretending
+        // that its export was readable or moving the epoch with a keystroke.
+        // This changes only the pending deadline, not admission or settlement.
+        let recheck = dot_agent_deck::composer_probe::probe::NON_EMPTY_RECHECK.as_millis();
+        f.control(&format!("schedule-advance:{recheck}"));
+    } else {
+        assert!(
+            trace.contains("read: Empty"),
+            "a supported export must have an empty read before its natural recheck: {trace}"
+        );
+    }
+    assert!(
+        common::wait_until(WAIT, || {
+            f.control("schedule-status")["composer_schedule"]["due"] == true
+        }),
+        "the second probe must wait for a due schedule: {}",
+        f.control("schedule-status")
+    );
+    f.flag("edit-drop");
+    let second = f.probe();
+    assert_eq!(second["composer_probe"]["outcome"], "written", "{second}");
+    human.write("RETIRED-VISIBLE");
+    f.wait_held();
+    let retired_generation = f.generation;
+    f.replace();
+    assert!(f.generation > retired_generation);
+    let successor = f.snapshot();
+    let discarded = &successor["input_discarded"];
+    assert_eq!(discarded["generation"], retired_generation, "{successor}");
+    assert_eq!(
+        discarded["held_bytes"],
+        b"RETIRED-VISIBLE".len(),
+        "{successor}"
+    );
+    assert!(discarded["held_ops"].as_u64().unwrap() > 0, "{successor}");
+    let words: Value = serde_json::from_str(include_str!("fixtures/inbox-display.json")).unwrap();
+    let retired = words["inputNotDelivered"]
+        .as_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap();
+    assert!(
+        common::wait_until(WAIT, || tui.snapshot_grid().contains(retired)),
         "retired held keys must be reported in attached TUI:\n{}",
         tui.snapshot_grid()
     );
     f.stable(b"");
+    assert!(
+        unsupported.is_none()
+            || std::env::var("DOT_AGENT_DECK_REQUIRE_REAL_E2E").as_deref() != Ok("1"),
+        "UNVERIFIED: Empty settlement requires a supported export chain: {unsupported:?}"
+    );
 }
 
 /// Scenario: Invoke the user's editor through the installed helper or directly without that helper and read the epoch around its output pair. The unmatched external edit must move the foreign epoch once without an empty observation clearing it; the fast direct row acknowledges no observer pass running before launch and witnesses editor exit and composer return before allowing the first scan.
@@ -573,7 +660,7 @@ fn probe_049_mode_observations_and_malformed_pairs_are_not_release_authority() {
     }
 }
 
-/// Scenario: Hold a human editor's helper after a failed spawn or an injected wait failure following a real editor start. A failed spawn retains the suffix through return and retirement under production Hold; a running user editor reads its released suffix either before the unknown-wait drain or after its PID identifies an acknowledged WaitUnknown drain with that line still parked at the writer. The parked case also queues another trigger and suffix that must stay held through the drain, return and replacement, while the released line reaches the editor's terminal exactly once.
+/// Scenario: Hold a human editor's helper after a failed spawn or an injected wait failure following a real editor start. A failed spawn retains the suffix through return and retirement under production Hold; a running user editor reads its released suffix either before the unknown-wait drain or after its PID and start ticks identify a settled drain marked wait_unknown with that line still parked at the writer. The parked case also queues another trigger and suffix that must stay held through the drain, return and replacement, while the released line reaches the editor's terminal exactly once.
 #[spec("inbox/probe/049")]
 #[test]
 fn probe_049_failed_editor_outcomes_stay_held_under_production_hold() {
@@ -639,11 +726,16 @@ fn probe_049_failed_editor_outcomes_stay_held_under_production_hold() {
                 assert_eq!(observer["passes_held"], true, "{observer}");
                 assert_eq!(observer["pass_running"], false, "{observer}");
                 let drains = observer["drains"].as_u64().unwrap();
+                let started = live::read_json(&f.path("helper-started"));
+                let pid = started["pid"].as_u64().expect("paused helper's pid");
+                let start =
+                    dot_agent_deck::platform::proc::process_start_of(u32::try_from(pid).unwrap())
+                        .expect("paused helper's own start ticks");
                 f.remove("pause-helper");
                 pause.take().unwrap().release();
                 f.wait("helper-exited-2");
                 let helper = live::read_json(&f.path("helper-result-2"));
-                let pid = helper["pid"].as_u64().expect("reaped helper's pid");
+                assert_eq!(helper["pid"], pid, "reaped the paused helper: {helper}");
                 assert!(pid > 0, "{helper}");
                 let trace = fs::read_to_string(f.path("helper-trace")).unwrap();
                 assert!(trace.contains("wait-unknown 10"), "{trace}");
@@ -654,8 +746,8 @@ fn probe_049_failed_editor_outcomes_stay_held_under_production_hold() {
                         .as_array()
                         .expect("record-specific drain acknowledgements")
                         .iter()
-                        .any(|entry| entry["pid"] == pid),
-                    "the held observer must not yet have drained helper {pid}: {observer}"
+                        .any(|entry| entry["pid"] == pid && entry["start"] == start),
+                    "the held observer must not yet have drained helper {pid}/{start}: {observer}"
                 );
                 // Hold already opens scope at Unarmed; neither scope nor a
                 // completed pass proves this record drained. Its PID-bound
@@ -669,9 +761,13 @@ fn probe_049_failed_editor_outcomes_stay_held_under_production_hold() {
                             .as_array()
                             .expect("record-specific drain acknowledgements")
                             .iter()
-                            .any(|entry| entry["pid"] == pid && entry["wait_unknown"] == true)
+                            .any(|entry| {
+                                entry["pid"] == pid
+                                    && entry["start"] == start
+                                    && entry["wait_unknown"] == true
+                            })
                     }),
-                    "helper {pid} must acknowledge its WaitUnknown drain before writer-go: {}",
+                    "helper {pid}/{start} must have a settled drain marked wait_unknown before writer-go: {}",
                     f.control("observer-status")["composer_observer"]
                 );
                 let observer = f.control("observer-status")["composer_observer"].clone();
@@ -680,9 +776,9 @@ fn probe_049_failed_editor_outcomes_stay_held_under_production_hold() {
                     .as_array()
                     .unwrap()
                     .iter()
-                    .find(|entry| entry["pid"] == pid)
+                    .find(|entry| entry["pid"] == pid && entry["start"] == start)
                     .unwrap();
-                assert!(drained["start"].as_u64().unwrap() > 0, "{drained}");
+                assert_eq!(drained["start"], start, "{drained}");
                 assert_eq!(drained["decision"], "unarmed", "{drained}");
                 assert_eq!(drained["report"], "none", "{drained}");
                 assert_eq!(f.scope(), "open");
