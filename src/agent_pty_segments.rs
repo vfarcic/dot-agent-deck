@@ -1182,9 +1182,28 @@ pub(crate) const HELD_SHOWN_AFTER: Duration = Duration::from_millis(300);
 /// that a check is running. Display only: it releases nothing.
 pub(crate) const HELD_EXPLAINED_AFTER: Duration = Duration::from_secs(5);
 
+/// Whether a card shows typing held `age` so far, with `full_waiters` ops
+/// waiting for room (core §7): at the cap at once, since the user's typing is
+/// being paused and they need to know straight away (Q110b.3); otherwise once
+/// it has been held [`HELD_SHOWN_AFTER`], so a check that settles sooner
+/// doesn't flicker. Display only.
+pub(crate) fn held_shown(full_waiters: usize, age: Duration) -> bool {
+    full_waiters > 0 || age >= HELD_SHOWN_AFTER
+}
+
 /// The card's cause for typing held `age` so far, with `full_waiters` ops
 /// waiting for room and `front` the open segment at the front, if any (core
 /// §7). Display only.
+///
+/// Implementation notes on §7's causes:
+/// - `QueueFull` shows at any age, as soon as an op waits for room
+///   ([`held_shown`]).
+/// - `AfterYourCtrlG` shows for a person's Ctrl+G segment at the front at
+///   any stage once the hold is [`HELD_EXPLAINED_AFTER`] old, not only while
+///   it is unmatched: the words stay true while that segment is the front one
+///   (accepted in Q110b.4).
+/// - `CheckBlocked` is not returned here: nothing holds keys in that state
+///   (R5), so no hold reaches this mapping with it.
 pub(crate) fn held_cause(
     full_waiters: usize,
     age: Duration,
@@ -1216,9 +1235,9 @@ pub(crate) fn held_cause(
 
 impl AgentPtyRegistry {
     /// PRD #1666 part 3 (Q35-20, R5 §10.1): what generation `agent_id`'s
-    /// card says of the typing its gate holds: nothing until it has been held
-    /// [`HELD_SHOWN_AFTER`], then its counts, since when, and why (see
-    /// [`held_cause`]). Display only.
+    /// card says of the typing its gate holds: nothing until [`held_shown`]
+    /// (held [`HELD_SHOWN_AFTER`], or at once at the cap), then its counts,
+    /// since when, and why (see [`held_cause`]). Display only.
     pub(crate) fn input_held(&self, agent_id: &str) -> Option<crate::inbox_display::InputHeld> {
         let generation: u64 = agent_id.parse().ok()?;
         let (gate, input) = {
@@ -1230,7 +1249,7 @@ impl AgentPtyRegistry {
         let since = status.held_since?;
         let now = Instant::now();
         let age = now.saturating_duration_since(since);
-        if age < HELD_SHOWN_AFTER {
+        if !held_shown(status.full_waiters, age) {
             return None;
         }
         let view = input.segments_view(now);
@@ -2030,6 +2049,29 @@ mod tests {
         // A hold the card never shows (no numbered generation) runs no timer
         // once past its mark.
         assert_eq!(held_wake(at(400), Some(since), false, false), None);
+    }
+
+    /// Scenario: Ask whether a card shows held typing at ages either side of 300 ms, with and without typing waiting for room. A hold with no waiter is hidden until 300 ms, so a short check doesn't flicker; one at the cap shows at once, from age zero, and the watcher then re-reads it on the shown pace rather than waiting for the 300 ms mark.
+    #[spec("inbox/probe/046")]
+    #[test]
+    fn probe_046_a_full_queue_shows_at_once() {
+        let just_under = HELD_SHOWN_AFTER - Duration::from_millis(1);
+        assert!(!held_shown(0, Duration::ZERO));
+        assert!(!held_shown(0, just_under));
+        assert!(held_shown(0, HELD_SHOWN_AFTER));
+        assert!(held_shown(1, Duration::ZERO), "at the cap at once");
+        assert!(held_shown(3, just_under));
+        assert_eq!(
+            held_cause(1, Duration::ZERO, None),
+            InputHeldCause::QueueFull
+        );
+        let since = Instant::now();
+        let at = |ms: u64| since + Duration::from_millis(ms);
+        assert_eq!(
+            held_wake(at(0), Some(since), held_shown(1, Duration::ZERO), false),
+            Some(at(250)),
+            "a hold shown at the cap is re-read on the shown pace"
+        );
     }
 
     fn update(

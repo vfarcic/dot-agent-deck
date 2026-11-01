@@ -23,7 +23,7 @@
     "check_not_returned": "input held: the agent hasn't come back from the deck's check; your typing is kept until it does. Restarting the agent discards it.",
     "after_your_ctrl_g": "input held: the agent didn't open the editor for your Ctrl+G; your typing is kept. Restarting the agent discards it.",
     "queue_full": "input held: too much typing is waiting; the rest is paused",
-    "check_blocked": "waiting: the deck can't check this input box until you press Ctrl+G",
+    "check_blocked": "waiting: can't check this input box; press Ctrl+G to let the deck check it",
     "unknown": "input held: your typing is kept while the deck checks this input box"
   },
   "inputNotDelivered": "not delivered: your held typing; restarting the agent discarded it. Type it again if you still need it.",

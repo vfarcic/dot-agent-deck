@@ -100,7 +100,7 @@ pub const INPUT_HELD_QUEUE_FULL: &str =
     "input held: too much typing is waiting; the rest is paused";
 /// [`InputHeldCause::CheckBlocked`]'s words.
 pub const INPUT_HELD_CHECK_BLOCKED: &str =
-    "waiting: the deck can't check this input box until you press Ctrl+G";
+    "waiting: can't check this input box; press Ctrl+G to let the deck check it";
 /// [`InputHeldCause::Unknown`]'s words: a cause a newer deck names.
 pub const INPUT_HELD_UNKNOWN: &str =
     "input held: your typing is kept while the deck checks this input box";
