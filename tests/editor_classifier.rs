@@ -552,6 +552,7 @@ fn probe_006_codex_below_its_node_launcher() {
 mod real {
     use std::ffi::OsStr;
     use std::fs;
+    use std::io;
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
     use std::os::unix::process::CommandExt as _;
@@ -559,7 +560,7 @@ mod real {
     use std::process::{Child, Command, Stdio};
 
     use dot_agent_deck::composer_probe::classifier::{
-        Class, FileId, Identity, ProcView as _, classify,
+        Class, FileId, Identity, ProcStat, ProcView, classify,
     };
     use dot_agent_deck::platform::proc::{LinuxProcView, process_start_of};
     use spec::spec;
@@ -670,6 +671,70 @@ mod real {
         }
     }
 
+    /// Throwaway #2011 capture: retain the exact returned observations in
+    /// call order, including both samples, plus nearby raw stat reads.
+    #[derive(Default)]
+    struct Capture {
+        view: LinuxProcView,
+        reads: Vec<String>,
+    }
+
+    impl ProcView for Capture {
+        fn stat(&mut self, pid: u32) -> io::Result<ProcStat> {
+            let result = self.view.stat(pid);
+            let raw = fs::read_to_string(format!("/proc/{pid}/stat"));
+            self.reads.push(format!(
+                "stat({pid}) = {result:?}; auxiliary raw stat immediately after = {raw:?}"
+            ));
+            result
+        }
+
+        fn exe(&mut self, pid: u32) -> io::Result<FileId> {
+            let result = self.view.exe(pid);
+            self.reads
+                .push(format!("metadata(/proc/{pid}/exe) = {result:?}"));
+            result
+        }
+
+        fn exe_path(&mut self, pid: u32) -> io::Result<PathBuf> {
+            let result = self.view.exe_path(pid);
+            self.reads
+                .push(format!("readlink(/proc/{pid}/exe) = {result:?}"));
+            result
+        }
+
+        fn file(&mut self, path: &Path) -> io::Result<FileId> {
+            let result = self.view.file(path);
+            self.reads.push(format!("metadata({path:?}) = {result:?}"));
+            result
+        }
+    }
+
+    fn capture_first_git(identity: &Identity, git: &mut Copy, round: usize) {
+        let mut capture = Capture::default();
+        let class = classify(&mut capture, Some(identity), git.pid());
+        if class != Class::PositivelyTool {
+            eprintln!("#2011 CAPTURE round={round} identity={identity:?} class={class:?}");
+            for (index, read) in capture.reads.iter().enumerate() {
+                eprintln!("observation {index}: {read}");
+            }
+            eprintln!(
+                "child pid={} path={:?} exit={:?} status={:?} stat={:?} exe={:?}",
+                git.pid(),
+                git.path,
+                git.child.try_wait(),
+                fs::read_to_string(format!("/proc/{}/status", git.pid())),
+                fs::read_to_string(format!("/proc/{}/stat", git.pid())),
+                fs::read_link(format!("/proc/{}/exe", git.pid())),
+            );
+        }
+        assert_eq!(
+            class,
+            Class::PositivelyTool,
+            "#2011 first git round {round}"
+        );
+    }
+
     /// Scenario: Read real processes through the Linux view: this test process's parent, start ticks, executable and its link match what the process and its parent report; a child started from a copy of a sleeper named `a) b (c 1 2` reads this process as its parent, a start at or after this process's, and the copy's inode and path, and after the copy is deleted its link reads `(deleted)` with the same inode; once the child is reaped, its stat fails. A copy whose name holds a newline among parentheses and digits reads this process as its parent too, while one whose name isn't UTF-8 has a stat that doesn't read, and classifies `Unknown`. The view reads a directory's `(dev, ino)` as `stat` does.
     #[spec("inbox/probe/006")]
     #[test]
@@ -724,7 +789,7 @@ mod real {
         assert!(view.file(&dir.path().join("missing")).is_err());
     }
 
-    /// Scenario: With this test process standing in as the agent and a `versions` directory recorded as its install root, a sleeper named `2.1.311` started there is `Unknown` (in the family), while a sleeper named `git` elsewhere is a tool. Renaming the root to `versions-moved` makes both sleepers `Unknown`; renaming it back makes `git` a tool again.
+    /// Scenario: With this test process standing in as the agent and a `versions` directory recorded as its install root, repeat the initial tool classification with fresh sleepers for at most 1,000 rounds or 45 seconds, retaining both samples and process diagnostics on failure. A sleeper named `2.1.311` in the root is `Unknown`, while `git` elsewhere is a tool; moving the root makes both `Unknown`, and restoring it makes `git` a tool again.
     #[spec("inbox/probe/006")]
     #[test]
     #[ignore = "quarantined: vfarcic, #2011"]
@@ -738,6 +803,23 @@ mod real {
             install_root_id: file_id(&versions),
             ..me()
         };
+        let started = std::time::Instant::now();
+        let mut rounds = 0;
+        while rounds < 1_000 && started.elapsed() < std::time::Duration::from_secs(45) {
+            let updated = Copy::start_in(&versions, "2.1.311");
+            let mut git = Copy::start("git");
+            assert_eq!(
+                classify(&mut LinuxProcView, Some(&identity), updated.pid()),
+                Class::Unknown
+            );
+            capture_first_git(&identity, &mut git, rounds);
+            drop(updated);
+            rounds += 1;
+        }
+        eprintln!(
+            "#2011 CAPTURE completed {rounds} rounds in {:?}",
+            started.elapsed()
+        );
         let mut view = LinuxProcView;
         let updated = Copy::start_in(&versions, "2.1.311");
         let git = Copy::start("git");
