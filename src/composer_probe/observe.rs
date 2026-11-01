@@ -1155,6 +1155,57 @@ impl Bell {
     }
 }
 
+/// What the observer read of one child of a helper whose decision opened the
+/// user's editor (Q35-20d, the editor identity pin): its parent and start
+/// ticks from a stat read through its pidfd, its executable read after that,
+/// and whether that pidfd still named a live process once the executable was
+/// read, so both reads are that one process's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildFacts {
+    pub ppid: u32,
+    pub start: u64,
+    pub exe: Option<super::classifier::FileId>,
+    pub alive_after: bool,
+}
+
+/// The user's editor among `helper`'s `children` (core §4.6's
+/// `HumanG/Unarmed` row), by its pinned identity: a child held by its pidfd
+/// (`facts`), whose parent is the helper and which started no earlier than
+/// it, running an executable other than the helper copy (`helper_id`), read
+/// while its pidfd named it. That is the editor the helper forked and
+/// exec'd, or a descendant of it the helper took over as subreaper: before
+/// its `execve` the child runs the helper copy, and a failed `execve` exits
+/// as the helper copy too. `helper_alive`, asked after every child was
+/// read, says the helper's own pidfd still names a live process, so the pid
+/// the children and their parent were read by was the helper's throughout:
+/// a process that reused it after the helper exited can't pass its children
+/// for the helper's. `None` when no child is the editor, or the helper may
+/// have gone.
+///
+/// What it doesn't pin: which program the editor is. The helper resolves
+/// the user's editor command itself, and a script's process runs its
+/// interpreter, so the executable is told only from the helper copy.
+pub fn user_editor(
+    helper: RecordKey,
+    helper_id: super::classifier::FileId,
+    children: &[u32],
+    mut facts: impl FnMut(u32) -> Option<ChildFacts>,
+    helper_alive: impl FnOnce() -> bool,
+) -> Option<RecordKey> {
+    let editor = children.iter().find_map(|&pid| {
+        let f = facts(pid)?;
+        (f.alive_after
+            && f.ppid == helper.pid
+            && f.start >= helper.start
+            && f.exe.is_some_and(|exe| exe != helper_id))
+        .then_some(RecordKey {
+            pid,
+            start: f.start,
+        })
+    })?;
+    helper_alive().then_some(editor)
+}
+
 /// The slot an agent's output hook reads its observer's bell from: set once,
 /// when an installed generation's observer starts.
 pub type BellSlot = Arc<OnceLock<Arc<Bell>>>;
@@ -1789,6 +1840,22 @@ mod linux {
         }
     }
 
+    /// `pid` pinned by its pidfd: its parent and start ticks, its
+    /// executable read after them, and whether the pidfd still named a live
+    /// process after that ([`super::ChildFacts`]). `None` when it didn't pin.
+    fn child_facts(pid: u32) -> Option<super::ChildFacts> {
+        let mut kernel = LinuxKernel::default();
+        let pinned = attest::pin(&mut kernel, Sighting::Pid { pid, start: None }).ok()?;
+        let exe = exe_id(pid);
+        let alive_after = matches!(kernel.exited(pinned.pidfd()), Ok(false));
+        Some(super::ChildFacts {
+            ppid: pinned.stat.ppid,
+            start: pinned.start(),
+            exe,
+            alive_after,
+        })
+    }
+
     /// A process's children, from every thread's `children` file.
     fn children(pid: u32) -> Vec<u32> {
         let mut found = Vec::new();
@@ -2063,33 +2130,43 @@ mod linux {
         }
 
         /// A helper record whose decision opened the user's editor (core
-        /// §4.6's `HumanG/Unarmed` row): its editor child, seen running an
-        /// executable other than the helper copy, is reported to the
+        /// §4.6's `HumanG/Unarmed` row): its editor child, pinned as the
+        /// helper's own ([`super::user_editor`], Q35-20d), is reported to the
         /// segments once. Run each pass, with no lock held for the reads.
         fn editors(&self) {
-            let waiting: Vec<RecordKey> = {
+            let waiting: Vec<(RecordKey, Held)> = {
                 let inner = self.lock();
                 inner
                     .watch
                     .pins
-                    .keys()
-                    .copied()
-                    .filter(|key| {
-                        inner.seam.input().record(*key).is_some_and(|r| {
+                    .iter()
+                    .filter(|(key, _)| {
+                        inner.seam.input().record(**key).is_some_and(|r| {
                             r.decision == Some(record::Decision::Unarmed)
                                 && r.exit_observed.is_none()
                         })
                     })
-                    .filter(|key| !inner.watch.editors.contains(key))
+                    .filter(|(key, _)| !inner.watch.editors.contains(key))
+                    .map(|(key, pin)| (*key, Arc::clone(&pin.fd)))
                     .collect()
             };
-            for key in waiting {
-                let running = children(key.pid)
-                    .into_iter()
-                    .any(|pid| exe_id(pid).is_some_and(|id| id != self.helper_id));
-                if !running {
+            for (key, helper) in waiting {
+                let Some(editor) = super::user_editor(
+                    key,
+                    self.helper_id,
+                    &children(key.pid),
+                    child_facts,
+                    || !exited(helper.pidfd()),
+                ) else {
                     continue;
-                }
+                };
+                tracing::debug!(
+                    target: "composer_probe",
+                    helper = key.pid,
+                    editor = editor.pid,
+                    editor_start = editor.start,
+                    "the user's editor runs"
+                );
                 let mut inner = self.lock();
                 inner.watch.editors.push(key);
                 if inner.watch.editors.len() > record::RECORD_CAP {
@@ -3051,5 +3128,96 @@ mod linux {
             drop(observer);
             std::thread::park_timeout(wait);
         }
+    }
+}
+
+#[cfg(test)]
+mod editor_identity_tests {
+    use super::*;
+    use crate::composer_probe::classifier::FileId;
+    use spec::spec;
+
+    const HELPER: RecordKey = RecordKey {
+        pid: 400,
+        start: 1_000,
+    };
+    const HELPER_COPY: FileId = FileId { dev: 1, ino: 7 };
+    const VIM: FileId = FileId { dev: 1, ino: 9 };
+
+    fn child(ppid: u32, start: u64, exe: FileId) -> ChildFacts {
+        ChildFacts {
+            ppid,
+            start,
+            exe: Some(exe),
+            alive_after: true,
+        }
+    }
+
+    fn found(facts: ChildFacts, helper_alive: bool) -> Option<RecordKey> {
+        user_editor(
+            HELPER,
+            HELPER_COPY,
+            &[401],
+            |_| Some(facts),
+            || helper_alive,
+        )
+    }
+
+    /// Scenario: The observer reads the children of a helper whose `Unarmed` decision opened the user's editor. Only a child pinned as the helper's own is the editor: one running another executable, whose parent is the helper and which started after it, read while the helper's pidfd still names it. A child still running the helper copy (forked, not yet exec'd), one read after the helper may have exited (its pid could name another process, whose children aren't the helper's), one whose own pid was reused between its reads, one whose parent isn't the helper and one started before the helper are none of the user's editor.
+    #[spec("inbox/probe/027")]
+    #[test]
+    fn probe_027_the_users_editor_is_the_helpers_pinned_child() {
+        let editor = RecordKey {
+            pid: 401,
+            start: 1_005,
+        };
+        assert_eq!(found(child(400, 1_005, VIM), true), Some(editor));
+        assert_eq!(
+            found(child(400, 1_005, HELPER_COPY), true),
+            None,
+            "forked, not yet exec'd"
+        );
+        assert_eq!(
+            found(child(400, 1_005, VIM), false),
+            None,
+            "the helper's pid may have been reused while it was read"
+        );
+        assert_eq!(
+            found(
+                ChildFacts {
+                    alive_after: false,
+                    ..child(400, 1_005, VIM)
+                },
+                true
+            ),
+            None,
+            "the child's executable may be another process's"
+        );
+        assert_eq!(
+            found(child(77, 1_005, VIM), true),
+            None,
+            "not the helper's child"
+        );
+        assert_eq!(
+            found(child(400, 999, VIM), true),
+            None,
+            "started before the helper"
+        );
+        assert_eq!(
+            found(
+                ChildFacts {
+                    exe: None,
+                    ..child(400, 1_005, VIM)
+                },
+                true
+            ),
+            None,
+            "an executable that didn't read"
+        );
+        assert_eq!(
+            user_editor(HELPER, HELPER_COPY, &[401], |_| None, || true),
+            None,
+            "a child that didn't pin"
+        );
     }
 }
