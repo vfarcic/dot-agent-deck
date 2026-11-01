@@ -510,29 +510,15 @@ fn settle_live(state: &mut State, now: Instant) {
             live.segments.undecide(number);
             continue;
         }
-        settle_probe(
-            live,
+        live.settle_probe(
             &mut state.epoch,
             records,
-            number,
-            key,
-            Some(decision),
-            read,
+            (number, key, Some(decision)),
             now,
         );
     }
-    for (number, key, decision) in live.segments.take_completed_probes() {
-        let read = live.read_of(key);
-        settle_probe(
-            live,
-            &mut state.epoch,
-            records,
-            number,
-            key,
-            decision,
-            read,
-            now,
-        );
+    for probe in live.segments.take_completed_probes() {
+        live.settle_probe(&mut state.epoch, records, probe, now);
     }
     for ended in live.segments.take_ended() {
         live.probes.retain(|p| Some(p.number) != ended.number);
@@ -600,55 +586,54 @@ impl Live {
     }
 }
 
-/// The epoch's settlement of probe `number` from its matched record `key`'s
-/// `decision` and the daemon's `read` of its export (R3 §3.4), once: an
-/// `Armed` empty read that is the deck's own claim applies the observation
-/// and the schedule's empty; another `Armed` is non-empty; anything else,
-/// no decision included, is a failed check.
-#[allow(clippy::too_many_arguments)]
-fn settle_probe(
-    live: &mut Live,
-    epoch: &mut InputEpoch,
-    records: &Records,
-    number: u64,
-    key: RecordKey,
-    decision: Option<Decision>,
-    read: Option<bool>,
-    now: Instant,
-) {
-    let Some(at) = live.probes.iter().position(|p| p.number == number) else {
-        return;
-    };
-    let probe = live.probes.remove(at);
-    // A record already pruned can't show whose claim it read: not applied.
-    let claim_mine = records
-        .get(key)
-        .is_some_and(|r| r.claim.is_none_or(|c| c == record::Claim::Owned));
-    tracing::debug!(
-        target: "composer_probe",
-        number,
-        ?decision,
-        ?read,
-        claim_mine,
-        e0 = ?probe.e0,
-        "probe settled"
-    );
-    match (decision, read) {
-        (Some(Decision::Armed), Some(true)) if claim_mine => {
-            if let Some(e0) = probe.e0 {
-                epoch.apply(&Observation {
-                    probe: probe.job,
-                    admitted_at: e0,
-                    read_empty: true,
-                    retired: false,
-                });
+impl Live {
+    /// The epoch's settlement of probe `number` from its matched record
+    /// `key`'s `decision` and the daemon's read of its export (R3 §3.4),
+    /// once: an `Armed` empty read that is the deck's own claim applies the
+    /// observation and the schedule's empty; another `Armed` is non-empty;
+    /// anything else, no decision included, is a failed check.
+    fn settle_probe(
+        &mut self,
+        epoch: &mut InputEpoch,
+        records: &Records,
+        (number, key, decision): (u64, RecordKey, Option<Decision>),
+        now: Instant,
+    ) {
+        let read = self.read_of(key);
+        let Some(at) = self.probes.iter().position(|p| p.number == number) else {
+            return;
+        };
+        let probe = self.probes.remove(at);
+        // A record already pruned can't show whose claim it read: not applied.
+        let claim_mine = records
+            .get(key)
+            .is_some_and(|r| r.claim.is_none_or(|c| c == record::Claim::Owned));
+        tracing::debug!(
+            target: "composer_probe",
+            number,
+            ?decision,
+            ?read,
+            claim_mine,
+            e0 = ?probe.e0,
+            "probe settled"
+        );
+        match (decision, read) {
+            (Some(Decision::Armed), Some(true)) if claim_mine => {
+                if let Some(e0) = probe.e0 {
+                    epoch.apply(&Observation {
+                        probe: probe.job,
+                        admitted_at: e0,
+                        read_empty: true,
+                        retired: false,
+                    });
+                }
+                self.schedule.empty();
             }
-            live.schedule.empty();
+            (Some(Decision::Armed), _) => {
+                self.schedule.non_empty(now, epoch.epoch());
+            }
+            _ => self.schedule.failed(now),
         }
-        (Some(Decision::Armed), _) => {
-            live.schedule.non_empty(now, epoch.epoch());
-        }
-        _ => live.schedule.failed(now),
     }
 }
 

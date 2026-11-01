@@ -13,8 +13,8 @@ use dot_agent_deck::composer_probe::record::{
     Route, ScopeState, Tree,
 };
 use dot_agent_deck::composer_probe::segments::{
-    Agent, Ended, Front, Kind, Marker, NOT_RETURNED, Outcome, Refusal, ReturnMarkers, ReturnWatch,
-    SEGMENT_CAP, Seen, Segments, Stage, View,
+    Agent, Ended, Front, IN_FLIGHT_MARKERS, Kind, Marker, NOT_RETURNED, Outcome, Refusal,
+    ReturnMarkers, ReturnWatch, SEGMENT_CAP, Seen, Segments, Stage, View,
 };
 use spec::spec;
 
@@ -705,6 +705,90 @@ fn probe_009_a_return_read_before_the_written_report_completes_it() {
         t.s.front(),
         Front::Released,
         "the editor seen first still counts"
+    );
+}
+
+/// Scenario: Release a held Ctrl+G to its helper's running editor, then let the helper drain with no report: the release is cut off for what is still held. The helper's clean report arriving only after that drain (as after a drain that gave up uncertain with its connection still open) doesn't restore the release: the cut-off is the uncertain drain's outcome, and the segment holds until retirement (the audit's U3-3).
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_a_report_after_the_drain_keeps_the_cut_off() {
+    for agent in [Agent::Claude, Agent::Codex] {
+        let mut t = T::new(agent, HOLD);
+        let g = t.s.open_held_trigger().unwrap();
+        t.write(g, 1);
+        t.ipc(1, Decision::Unarmed, g, 2);
+        assert!(t.editor(1, 3));
+        assert_eq!(t.s.front(), Front::Released, "{agent:?}");
+        t.exit(1, 4);
+        assert_eq!(t.s.front(), Front::Held, "{agent:?}: cut off at the drain");
+        t.report(1, Report::Done(Tree::Clean), 5);
+        t.returns(6);
+        assert_eq!(
+            t.s.front(),
+            Front::Held,
+            "{agent:?}: a report after the drain doesn't restore it"
+        );
+    }
+}
+
+/// Scenario: Open a probe and, before its trigger's written report, let its helper decide `Armed` and exit while the agent writes more return markers than a segment keeps in flight. With the real disable and enable among the latest kept, the report completes it. With the disable pushed out by later markers, nothing completes and nothing is released, until a whole return after the report completes it: losing markers past the cap costs availability, never authority. A third probe's trigger is withdrawn with a return in flight: it ends `TakenBack`, and its markers go with it (R-B-U3-01, the audit's U3-6).
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_in_flight_markers_past_the_cap_and_a_withdrawn_trigger() {
+    let frames = |n: usize| FRAME.repeat(n);
+    let mut t = T::new(Agent::Claude, HOLD);
+
+    // Past the cap, the return at the tail: kept, and it completes.
+    let n = t.probe(0);
+    let started = t.m.fed();
+    t.ipc(1, Decision::Armed, n, 1);
+    t.exit(1, 2);
+    t.out(&frames(IN_FLIGHT_MARKERS + 6), 3);
+    t.returns(4);
+    t.s.written(&mut t.r, &mut t.f, n, started, time(t.t, 0), time(t.t, 5))
+        .unwrap();
+    assert_eq!(t.written(), [Some(n)], "the latest markers hold the return");
+
+    // The disable pushed out, on Codex, whose probe holds until its E1F:
+    // nothing completes or releases, until a whole return after the report.
+    let mut c = T::new(Agent::Codex, HOLD);
+    let n = c.probe(6);
+    let started = c.m.fed();
+    c.ipc(2, Decision::Armed, n, 7);
+    c.exit(2, 8);
+    c.out(OFF, 9);
+    c.out(&frames(IN_FLIGHT_MARKERS), 10);
+    c.out(&cat(&[ON, FRAME]), 11);
+    c.s.written(&mut c.r, &mut c.f, n, started, time(c.t, 6), time(c.t, 12))
+        .unwrap();
+    assert!(
+        c.written().is_empty(),
+        "an enable with no disable completes nothing"
+    );
+    assert_eq!(c.s.front(), Front::Held, "and releases nothing");
+    c.returns(13);
+    assert_eq!(
+        c.written(),
+        [Some(n)],
+        "a whole return after the report does"
+    );
+
+    // Withdrawn with a return in flight: it ends, and so do its markers.
+    let n = t.probe(14);
+    t.ipc(3, Decision::Armed, n, 15);
+    t.exit(3, 16);
+    t.returns(17);
+    t.s.withdrawn(n).unwrap();
+    assert_eq!(t.ended(), [(Some(n), Kind::Probe, Outcome::TakenBack)]);
+    assert!(
+        t.s.is_empty(),
+        "nothing kept the withdrawn trigger's return"
+    );
+    let n = t.probe(18);
+    t.write(n, 19);
+    assert!(
+        t.written().is_empty() && t.s.front() == Front::Held,
+        "a later probe owes nothing to the withdrawn one's markers"
     );
 }
 

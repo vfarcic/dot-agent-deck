@@ -131,8 +131,12 @@ pub const SEGMENT_CAP: usize = 64;
 
 /// The most return markers a segment keeps while its trigger is in flight
 /// (R-U2-01): the latest are kept. An E1 needs only the last disable and
-/// the enable after it, so dropping older ones can only hold, never
-/// release.
+/// the enable after it, and an enable with no disable before it counts for
+/// nothing, so dropping older ones can only hold, never release. That is a
+/// cost to availability, not a fast return preserved: a segment whose only
+/// eligible disable was dropped holds until the agent writes another whole
+/// return after the trigger's report, or until retirement (and Codex has no
+/// lapse recovery to end it sooner) (R-B-U3-01).
 pub const IN_FLIGHT_MARKERS: usize = 64;
 
 /// Whose return path a generation's segments wait for.
@@ -522,6 +526,15 @@ pub struct Segments {
     /// them (R-U2-01's kind: the observer reports it once, and a trigger's
     /// written report can still be on its way): a segment that matches one
     /// takes it then. The latest [`super::record::RECORD_CAP`] are kept.
+    ///
+    /// **A past observation (the audit's U3-7).** "Running" is what the
+    /// observer saw when it reported, applied at match time, one report
+    /// later; nothing here, nor the release it allows, checks that the
+    /// editor still runs. An editor that exited in between (a scripted one
+    /// can; a person's session can't end that fast) leaves the segment
+    /// `Released` until its helper's drain shows how it ended (R-U2-06's
+    /// cut-off). Pinning the editor's identity is an activation
+    /// precondition (plan Q104b).
     editors: VecDeque<RecordKey>,
     retired: bool,
 }

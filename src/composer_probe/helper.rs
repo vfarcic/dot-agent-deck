@@ -1544,6 +1544,12 @@ pub mod seam {
         /// test's next byte then released a later pause early (the CI hang of
         /// `probe_067_a_deadline_passing_after_a_ready_poll_skips_the_call`).
         /// The FIFO is opened again and the wait goes on; `pause-eof` is traced.
+        ///
+        /// An open or a read that fails other than by `EINTR` passes the
+        /// pause point with nothing written, so it is traced as
+        /// `pause-failed <point> <call> <errno>`, never as `resume` (the
+        /// audit's U3-10): a test reading the trace sees the pause wasn't
+        /// held.
         pub fn pause(&self, at: Point) {
             let (Some(fifo), true) = (&self.pause, self.pause_at.iter().any(|p| p == at.word()))
             else {
@@ -1564,23 +1570,39 @@ pub mod seam {
                     if fd >= 0 {
                         break fd;
                     }
+                    let errno = std::io::Error::last_os_error().raw_os_error();
                     note(self);
-                    if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                    if errno != Some(libc::EINTR) {
+                        self.trace(&format!(
+                            "pause-failed {} open {}",
+                            at.word(),
+                            errno.unwrap_or(0)
+                        ));
                         return;
                     }
                 };
                 let mut byte = 0u8;
-                let n = loop {
+                let (n, errno) = loop {
                     // SAFETY: the FIFO just opened and one byte of room.
                     let n = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
+                    let errno = (n < 0)
+                        .then(|| std::io::Error::last_os_error().raw_os_error())
+                        .flatten();
                     note(self);
-                    if n >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
-                    {
-                        break n;
+                    if n >= 0 || errno != Some(libc::EINTR) {
+                        break (n, errno);
                     }
                 };
                 // SAFETY: the descriptor opened above, closed once.
                 unsafe { libc::close(fd) };
+                if n < 0 {
+                    self.trace(&format!(
+                        "pause-failed {} read {}",
+                        at.word(),
+                        errno.unwrap_or(0)
+                    ));
+                    return;
+                }
                 if n != 0 {
                     break;
                 }
@@ -1668,6 +1690,50 @@ pub mod seam {
     /// How many threads this process has.
     pub fn tasks() -> usize {
         std::fs::read_dir("/proc/self/task").map_or(0, Iterator::count)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn seams(trace: &std::path::Path, pause: &std::path::Path) -> Seams {
+            Seams {
+                trace: Some(std::fs::File::create(trace).unwrap()),
+                pause: Some(CString::new(pause.to_str().unwrap()).unwrap()),
+                pause_at: vec!["ready".into()],
+                spawn_errno: None,
+                wait_errno: None,
+                sndbuf: None,
+                pad: 0,
+                mutant: false,
+            }
+        }
+
+        /// A pause whose FIFO can't be opened (it doesn't exist) or read (it
+        /// is a directory) passes with nothing written, and says so in the
+        /// trace rather than as `resume` (the audit's U3-10).
+        #[test]
+        fn a_pause_that_cannot_wait_is_traced_as_failed() {
+            let dir = tempfile::tempdir().unwrap();
+            let trace = dir.path().join("trace");
+            for (pause, call) in [
+                (dir.path().join("missing"), "open"),
+                (dir.path().to_path_buf(), "read"),
+            ] {
+                seams(&trace, &pause).pause(Point::Ready);
+                let traced = std::fs::read_to_string(&trace).unwrap();
+                let events: Vec<&str> = traced
+                    .lines()
+                    .map(|l| l.split_once(' ').unwrap().1)
+                    .collect();
+                assert_eq!(events[0], "pause ready", "{call}: {traced}");
+                assert!(
+                    events[1].starts_with(&format!("pause-failed ready {call} ")),
+                    "{call}: {traced}"
+                );
+                assert!(!traced.contains("resume"), "{call}: {traced}");
+            }
+        }
     }
 }
 

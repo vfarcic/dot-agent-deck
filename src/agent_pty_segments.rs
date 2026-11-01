@@ -457,6 +457,65 @@ impl PtyWriterThread {
     }
 }
 
+/// A probe's start condition on the writer thread (R5 §4.2, O-20.2): the
+/// writer's own retirement refuses it; otherwise the gate's arm section
+/// runs `admit` under the gate's lock, with the writer's start facts and
+/// the gate's counts as they stand, and on its `Ok` closes the fence at the
+/// output offset read then: that offset and the writer's instant are the
+/// section's outcome (O-20.7a). Shared by [`AgentPtyRegistry::composer_probe`]
+/// and the release oracle, so the oracle runs this one (the audit's U3-9).
+#[cfg(target_os = "linux")]
+pub(super) fn probe_section(
+    gate: Arc<crate::composer_probe::gate::Gate<UserFrame>>,
+    input: Arc<crate::composer_probe::epoch::GenerationInput>,
+    claim: Arc<crate::doorbell_txn::JobClaim>,
+    admit: impl FnOnce(
+        &crate::doorbell_txn::StartCtx,
+        crate::composer_probe::gate::Status,
+    ) -> Result<(), ProbeRefusal>
+    + Send
+    + 'static,
+) -> impl FnOnce(&crate::doorbell_txn::StartCtx) -> Result<(u64, Instant), ProbeRefusal> + Send + 'static
+{
+    move |ctx| {
+        #[cfg(feature = "e2e")]
+        probe_gate_scheduled();
+        if ctx.retired {
+            return Err(ProbeRefusal::Retired);
+        }
+        let mut at = (0, ctx.now);
+        gate.arm_section(
+            &claim,
+            ProbeRefusal::Retired,
+            ProbeRefusal::TakenBack,
+            |status| admit(ctx, status),
+            || {
+                at.0 = input.output_offset();
+                at.0
+            },
+        )?;
+        Ok(at)
+    }
+}
+
+/// What a probe's job's end tells its segment: written at its offset and
+/// instant, failed, or withdrawn (refused at the writer or taken back).
+/// Shared with the release oracle.
+#[cfg(target_os = "linux")]
+pub(super) fn end_probe_segment(
+    input: &crate::composer_probe::epoch::GenerationInput,
+    number: u64,
+    end: ProbeEnd,
+) {
+    let _ = match end {
+        ProbeEnd::Written { offset, at } => {
+            input.segment_written(number, offset, at, Instant::now())
+        }
+        ProbeEnd::WriteFailed => input.segment_write_failed(number),
+        ProbeEnd::Refused(_) | ProbeEnd::TakenBack => input.segment_withdrawn(number),
+    };
+}
+
 /// PRD #1666 part 3 (Q35-20): an installed generation's release driver. It
 /// ends when the generation retires.
 #[cfg(target_os = "linux")]
@@ -678,57 +737,39 @@ impl AgentPtyRegistry {
         };
         let claim = Arc::new(crate::doorbell_txn::JobClaim::default());
         let section = {
-            let gate = Arc::clone(&h.gate.gate);
             let observer = Arc::clone(&h.observer);
-            let input = Arc::clone(&input);
-            let claim = Arc::clone(&claim);
-            move |ctx: &crate::doorbell_txn::StartCtx| {
-                #[cfg(feature = "e2e")]
-                probe_gate_scheduled();
-                // The writer's own facts (O-20.7a): its boundary, its
-                // retirement, and the gate and epoch as they are now.
-                if ctx.retired {
-                    return Err(ProbeRefusal::Retired);
-                }
-                let mut at = (0, ctx.now);
-                gate.arm_section(
-                    &claim,
-                    ProbeRefusal::Retired,
-                    ProbeRefusal::TakenBack,
-                    |status| {
-                        use crate::composer_probe::admission::Fence;
-                        let fence = match (status.fenced, attempt) {
-                            (false, _) => Fence::Open,
-                            (true, Attempt::Lapse { .. }) if status.held_ops == 0 => Fence::Lapsed,
-                            (true, _) => Fence::Closed,
-                        };
-                        // A lapse retry's own byte moved the epoch at its
-                        // enqueue: nothing else may have since the lapsed
-                        // probe's (R5 §3.2).
-                        let attempt = match attempt {
-                            Attempt::Lapse { lapsed_e0 } => Attempt::Lapse {
-                                lapsed_e0: lapsed_e0.saturating_add(1),
-                            },
-                            other => other,
-                        };
-                        let writer_outside = Outside {
-                            attempt,
-                            boundary: ctx.boundary,
-                            fence,
-                            ..outside
-                        };
-                        observer
-                            .arm_segment(number, &writer_outside, ctx.now)
-                            .map(drop)
-                            .map_err(ProbeRefusal::Admission)
-                    },
-                    || {
-                        at.0 = input.output_offset();
-                        at.0
-                    },
-                )?;
-                Ok(at)
-            }
+            probe_section(
+                Arc::clone(&h.gate.gate),
+                Arc::clone(&input),
+                Arc::clone(&claim),
+                move |ctx, status| {
+                    use crate::composer_probe::admission::Fence;
+                    let fence = match (status.fenced, attempt) {
+                        (false, _) => Fence::Open,
+                        (true, Attempt::Lapse { .. }) if status.held_ops == 0 => Fence::Lapsed,
+                        (true, _) => Fence::Closed,
+                    };
+                    // A lapse retry's own byte moved the epoch at its
+                    // enqueue: nothing else may have since the lapsed
+                    // probe's (R5 §3.2).
+                    let attempt = match attempt {
+                        Attempt::Lapse { lapsed_e0 } => Attempt::Lapse {
+                            lapsed_e0: lapsed_e0.saturating_add(1),
+                        },
+                        other => other,
+                    };
+                    let writer_outside = Outside {
+                        attempt,
+                        boundary: ctx.boundary,
+                        fence,
+                        ..outside
+                    };
+                    observer
+                        .arm_segment(number, &writer_outside, ctx.now)
+                        .map(drop)
+                        .map_err(ProbeRefusal::Admission)
+                },
+            )
         };
         let disarm = {
             let observer = Arc::clone(&h.observer);
@@ -745,13 +786,11 @@ impl AgentPtyRegistry {
             return ProbeOutcome::Refused("the writer is gone".into());
         };
         drop(w);
-        match probe.end().await {
-            ProbeEnd::Written { offset, at } => {
-                let _ = input.segment_written(number, offset, at, Instant::now());
-                ProbeOutcome::Written
-            }
+        let end = probe.end().await;
+        end_probe_segment(&input, number, end);
+        match end {
+            ProbeEnd::Written { .. } => ProbeOutcome::Written,
             ProbeEnd::WriteFailed => {
-                let _ = input.segment_write_failed(number);
                 h.observer.disarm();
                 h.gate.gate.open_if_empty();
                 if ask != ProbeAsk::Lapse {
@@ -767,16 +806,12 @@ impl AgentPtyRegistry {
                     ?refusal,
                     "probe refused at the writer"
                 );
-                let _ = input.segment_withdrawn(number);
                 if ask != ProbeAsk::Lapse {
                     input.probe_failed(Instant::now());
                 }
                 ProbeOutcome::Refused(format!("{refusal:?}"))
             }
-            ProbeEnd::TakenBack => {
-                let _ = input.segment_withdrawn(number);
-                ProbeOutcome::TakenBack
-            }
+            ProbeEnd::TakenBack => ProbeOutcome::TakenBack,
         }
     }
 

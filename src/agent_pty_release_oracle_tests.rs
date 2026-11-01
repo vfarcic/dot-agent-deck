@@ -7,11 +7,14 @@
 //! output hook ([`OutputHook`]), fed from before the segments attach; the
 //! production release driver ([`super::segment_driver::drive_segments`]) as
 //! its own task, woken as production wakes it; a probe queued through
-//! [`PaneWriter::queue_probe`] with the gate's arm section closing its fence,
-//! and its written report given as `composer_probe` gives it. What the
-//! observer would see (a helper's records, its editor running, its report and
-//! exit) reaches the input through the same calls the observer makes. Only
-//! admission is left out: every probe here is admitted.
+//! [`PaneWriter::queue_probe`] with production's arm section
+//! ([`super::segment_driver::probe_section`]) closing its fence, and its
+//! job's end reported to its segment by production's
+//! [`super::segment_driver::end_probe_segment`]. What the observer would see
+//! (a helper's records, the daemon's read of an `Armed` export, its editor
+//! running, its report and exit) reaches the input through the same calls
+//! the observer makes. Only admission is left out: every probe here is
+//! admitted, and the section raises the liability as `arm_segment` does.
 //!
 //! **What judges it is not.** [`Model`] is the release table of core §4.6
 //! and plan §3.7, written from the table, over the generated script alone:
@@ -30,9 +33,35 @@
 //! typing after a release with nothing else moving (03), a deferred
 //! settlement whose segment completes (05) and an unknown wait after a
 //! release to a running editor (06). R-U2-04's paste-pair accounting has its
-//! own generated model below ([`pairs`]). Each trace also has a fixed script.
+//! own generated model below ([`pairs`]). Each trace also has a fixed script,
+//! and so does R-B-U2-02's: a drain that lands inside a driver pass, between
+//! its read of the front segment and its extraction of what is held, forced
+//! there by a test-only seam on the writer.
+//!
+//! **The policy it assumes (the audit's U3-2).** Every generation here runs
+//! [`EcPolicy::Hold`], production's policy, under which `Records::complete`
+//! refuses the EC route: the model has no EC or frontier rows, and no
+//! Authority-policy EC completion is exercised (R-B-U3-02). If the policy
+//! changes (Q76), the model needs those rows and `Records::complete`'s EC
+//! route before this oracle says anything about it.
+//!
+//! **Where its power ends.** It is serial: each step settles before the
+//! next, so a race between the observer and a driver pass in flight is found
+//! only where a fixed script forces it. Its floors count each row of the
+//! release table it reached ([`ROWS`]), each settlement kind and each kind of
+//! step, not every combination. Not exercised here, each its own obligation
+//! and not evidence that it passed (R-B-U3-03): admission (its own tests and
+//! S-20's `e2e_probe_admission`), the observer's `/proc` scan and editor
+//! identity, more than one probe in a script, other Ctrl+G forms and
+//! multi-candidate frames (the planner's own oracle, Q35-16), Codex timing
+//! beyond its markers (M-PF1), and the planner's cut-open path (`hold_cut`
+//! and `cut_open`, typing while a liability is out and no check is open),
+//! which the accounting oracle covers and the activation list carries.
+//! Linux only, as the driver is.
 
-use super::segment_driver::{ProbeEnd, ProbeRefusal, drive_segments};
+use super::segment_driver::{
+    ProbeEnd, ProbeRefusal, drive_segments, end_probe_segment, probe_section,
+};
 use super::*;
 use crate::composer_probe::epoch::GenerationInput;
 use crate::composer_probe::paste_mode::OutputHook;
@@ -164,50 +193,40 @@ impl Rig {
             .collect()
     }
 
-    /// A probe, admitted: its segment opened, its `0x07` queued with the
-    /// gate's arm section closing its fence and raising its liability, and
-    /// its written report given once the job ends, as `composer_probe`
-    /// does. `before` runs between the job's end and that report (R-U2-01).
+    /// A probe, admitted: its segment opened, its `0x07` queued with
+    /// production's arm section ([`probe_section`]) closing its fence, and
+    /// its job's end reported to its segment as `composer_probe` reports it
+    /// ([`end_probe_segment`]). Admission is left out: at the section, the
+    /// liability is raised as the observer's `arm_segment` raises it.
+    /// `before` runs between the job's end and that report (R-U2-01).
     async fn probe(&self, before: impl FnOnce(&Rig)) -> u64 {
         let now = Instant::now();
         let (number, job) = self.input.segment_open_probe(false, now).unwrap();
         let claim = Arc::new(crate::doorbell_txn::JobClaim::default());
         let w = self.writer.lock().await;
         let section = {
-            let gate = Arc::clone(&w.gate.gate);
             let input = Arc::clone(&self.input);
-            let claim = Arc::clone(&claim);
-            move |ctx: &crate::doorbell_txn::StartCtx| {
-                let mut at = (0, ctx.now);
-                gate.arm_section(
-                    &claim,
-                    ProbeRefusal::Retired,
-                    ProbeRefusal::TakenBack,
-                    |_| {
-                        input
-                            .liability_raise(G, ctx.now)
-                            .map(drop)
-                            .map_err(|_| ProbeRefusal::Retired)
-                    },
-                    || {
-                        at.0 = input.output_offset();
-                        at.0
-                    },
-                )?;
-                Ok(at)
-            }
+            probe_section(
+                Arc::clone(&w.gate.gate),
+                Arc::clone(&self.input),
+                Arc::clone(&claim),
+                move |ctx, _| {
+                    input
+                        .liability_raise(G, ctx.now)
+                        .map(drop)
+                        .map_err(|_| ProbeRefusal::Retired)
+                },
+            )
         };
         let probe = w.queue_probe(job, claim, section, || {}).unwrap();
         drop(w);
-        match probe.end().await {
-            ProbeEnd::Written { offset, at } => {
-                before(self);
-                self.input
-                    .segment_written(number, offset, at, Instant::now())
-                    .unwrap();
-            }
-            other => panic!("the probe wasn't written: {other:?}"),
-        }
+        let end = probe.end().await;
+        assert!(
+            matches!(end, ProbeEnd::Written { .. }),
+            "the probe wasn't written: {end:?}"
+        );
+        before(self);
+        end_probe_segment(&self.input, number, end);
         number
     }
 
@@ -229,6 +248,12 @@ impl Rig {
 
     fn observe(&self, r: &MRecord) {
         let now = Instant::now();
+        // The daemon's read of an `Armed` export arrives with the helper's
+        // invocation on IPC, before its record (as `observe.rs` notes it).
+        if let (Channel::Ipc, Some(Decision::Armed), Some(empty)) = (r.channel, r.decision, r.read)
+        {
+            self.input.note_read(key(r.pid), empty);
+        }
         let _ = self.input.record_observe(
             &Observation {
                 generation: G,
@@ -321,7 +346,7 @@ fn key(pid: u32) -> RecordKey {
 // The model: core §4.6's release table over the script alone.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum MKind {
     Probe,
     HumanG,
@@ -336,6 +361,8 @@ struct MRecord {
     seg: Option<u64>,
     decision: Option<Decision>,
     report: Report,
+    /// The daemon's read of an `Armed` export on IPC: whether it was empty.
+    read: Option<bool>,
     drained: bool,
     /// Its editor child was seen running (the observer's one report).
     editor: bool,
@@ -344,8 +371,10 @@ struct MRecord {
     born: u64,
     exited: Option<u64>,
     /// Its completion is no longer pending: a marker route completed it, or
-    /// a later owned invocation subsumed it (A2 §3.2), after which its
-    /// segment holds until retirement.
+    /// a later owned invocation subsumed it (A2 §3.1, as `record.rs`'s
+    /// "Completion" section states it: an `Owned` record born after its
+    /// exit, its editor known to have ended), after which its segment holds
+    /// until retirement (`segments.rs`'s header).
     completed: bool,
     subsumed: bool,
 }
@@ -367,6 +396,8 @@ struct MSeg {
     released: bool,
     cut_off: bool,
     e1: Watch,
+    /// The release-table rows it reached ([`Stats::rows`]), once each.
+    rows: Vec<Row>,
 }
 
 /// The release table's view of one generation.
@@ -382,26 +413,72 @@ struct Model {
     expected: Vec<u8>,
     /// Each HumanG trigger: its number.
     triggers: Vec<u64>,
-    /// The writer scope opened for good (under `Hold`).
+    /// The writer scope opened for good (A3 §4.3, A5 §1.4, A6 §1.3, as
+    /// `record.rs`'s "writer scope" section states it): a decision that
+    /// isn't helper-only (`Unarmed`, a tool, `Unknown`), a decisionless exit
+    /// drain, or an editor-bearing exit with no clean report. Its cause is
+    /// sticky until retirement, so under `Hold` nothing completes after it.
     scope_open: bool,
     /// Output bytes fed so far: the offset the next byte is at.
     fed: u64,
     retired: bool,
     /// The probe's settlement: `None` until it settles.
-    settled: Option<bool>,
+    settled: Option<Settled>,
     stats: Stats,
     /// The model's clock: one tick per birth or exit.
     clock: u64,
 }
 
+/// How a probe settled the schedule (R3 §3.4): an `Armed` empty read of
+/// the deck's own claim; another `Armed`; anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Settled {
+    Empty,
+    NonEmpty,
+    Failed,
+}
+
+/// One row of the release table a matched segment reached (R-B-U3-02):
+/// the agent, the segment's kind, its record's decision, whether its editor
+/// was seen running and whether its start failed, and whether the row
+/// released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Row {
+    agent: &'static str,
+    kind: MKind,
+    decision: &'static str,
+    editor: bool,
+    spawn_failed: bool,
+    releases: bool,
+}
+
 /// How much of the table a run reached: a generator that never releases,
 /// cuts or completes proves nothing.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct Stats {
     released: usize,
     passed: usize,
     cut_off: usize,
     completed: usize,
+    /// Each row reached, and by how many segments.
+    rows: std::collections::BTreeMap<Row, usize>,
+    /// Each kind of settlement reached.
+    settled: std::collections::BTreeMap<Settled, usize>,
+}
+
+impl Stats {
+    fn add(&mut self, other: &Stats) {
+        self.released += other.released;
+        self.passed += other.passed;
+        self.cut_off += other.cut_off;
+        self.completed += other.completed;
+        for (row, n) in &other.rows {
+            *self.rows.entry(*row).or_default() += n;
+        }
+        for (kind, n) in &other.settled {
+            *self.settled.entry(*kind).or_default() += n;
+        }
+    }
 }
 
 impl Model {
@@ -438,6 +515,7 @@ impl Model {
             released: false,
             cut_off: false,
             e1: Watch::default(),
+            rows: Vec::new(),
         });
         self.expected.push(CTRL_G);
         self.step();
@@ -538,8 +616,9 @@ impl Model {
         if self.retired {
             return;
         }
-        // A2 §3.2: an exited, pending record whose editor is known to have
-        // ended is subsumed by any other owned record born after its exit.
+        // A2 §3.1 (`record.rs`, "Completion"): an exited, pending record
+        // whose editor is known to have ended is subsumed by any other owned
+        // record born after its exit.
         for i in 0..self.records.len() {
             let r = &self.records[i];
             let ended = r.decision == Some(Decision::Armed)
@@ -593,7 +672,19 @@ impl Model {
             let unknown_end = r.drained
                 && r.decision != Some(Decision::Armed)
                 && matches!(r.report, Report::None | Report::Unrecognised);
+            let row = Row {
+                agent: agent_name(self.agent),
+                kind: seg.kind,
+                decision: decision_name(r.decision),
+                editor: r.editor,
+                spawn_failed,
+                releases: pass,
+            };
             let seg = self.segs.front_mut().unwrap();
+            if !seg.rows.contains(&row) {
+                seg.rows.push(row);
+                *self.stats.rows.entry(row).or_default() += 1;
+            }
             if pass && !seg.released {
                 seg.released = true;
                 self.stats.released += 1;
@@ -603,13 +694,21 @@ impl Model {
                 self.stats.cut_off += 1;
             }
             // The probe's settlement (R3 §3.4): its matched decision, once
-            // an `Armed` one's read is known or its record drained.
+            // an `Armed` one's read is known or its record drained. Every
+            // matched record is owned with no other claim, so an empty read
+            // is the deck's own.
             if seg.kind == MKind::Probe
                 && self.settled.is_none()
                 && let Some(d) = r.decision
-                && (d != Decision::Armed || r.drained)
+                && (d != Decision::Armed || r.drained || r.read.is_some())
             {
-                self.settled = Some(d == Decision::Armed);
+                let kind = match (d, r.read) {
+                    (Decision::Armed, Some(true)) => Settled::Empty,
+                    (Decision::Armed, _) => Settled::NonEmpty,
+                    _ => Settled::Failed,
+                };
+                self.settled = Some(kind);
+                *self.stats.settled.entry(kind).or_default() += 1;
             }
             let helper_only = r.decision == Some(Decision::Armed) || spawn_failed;
             let returned = match self.agent {
@@ -646,6 +745,7 @@ impl Model {
                     released: false,
                     cut_off: false,
                     e1: Watch::default(),
+                    rows: Vec::new(),
                 });
             }
             Some(seg) if seg.released && !seg.cut_off => {
@@ -665,11 +765,30 @@ impl Model {
     }
 }
 
+fn agent_name(agent: Agent) -> &'static str {
+    match agent {
+        Agent::Claude => "Claude",
+        Agent::Codex => "Codex",
+    }
+}
+
+fn decision_name(decision: Option<Decision>) -> &'static str {
+    match decision {
+        None => "none",
+        Some(Decision::Armed) => "Armed",
+        Some(Decision::Unarmed) => "Unarmed",
+        Some(Decision::Tool) => "Tool",
+        Some(Decision::Unknown) => "Unknown",
+    }
+}
+
 /// The checks after every step: the PTY took exactly what the model allows,
 /// each Ctrl+G alone and after its number; the schedule is due while the
-/// probe is unsettled, and not due as the step that settles it ends (later
-/// typing moves the epoch, which may make it due again).
-fn check(rig: &Rig, model: &Model, settled_before: Option<bool>, what: &str) {
+/// probe is unsettled, and as the step that settles it ends, shows how it
+/// settled (U3-5): an empty read makes it due again at once, a non-empty one
+/// waits with no failure counted, a failed check waits as a retry. Later
+/// steps can move the epoch, which may make it due again.
+fn check(rig: &Rig, model: &Model, settled_before: Option<Settled>, what: &str) {
     let taken = rig.taken();
     assert_eq!(
         String::from_utf8_lossy(&taken),
@@ -708,10 +827,20 @@ fn check(rig: &Rig, model: &Model, settled_before: Option<bool>, what: &str) {
             rig.input.probe_due(Instant::now()),
             "{what}: the probe is unsettled, so its schedule is as it was"
         ),
-        (None, Some(armed)) => assert!(
-            !rig.input.probe_due(Instant::now()),
-            "{what}: the probe settled (armed {armed}), so it isn't due again yet"
-        ),
+        (None, Some(kind)) => {
+            let due = rig.input.probe_due(Instant::now());
+            let retrying = rig.input.probe_retrying();
+            let want = match kind {
+                Settled::Empty => (true, false),
+                Settled::NonEmpty => (false, false),
+                Settled::Failed => (false, true),
+            };
+            assert_eq!(
+                (due, retrying),
+                want,
+                "{what}: the probe settled {kind:?}: (due, retrying)"
+            );
+        }
         (Some(_), Some(_)) => {}
     }
 }
@@ -771,21 +900,100 @@ fn generate(rng: &mut Rng, model: &mut Model, len: usize) -> Vec<Step> {
     // opens the writer scope for good under `Hold`, after which nothing
     // completes, so some scripts keep to `Armed` helpers.
     let editor_rate: u64 = [0, 15, 45, 70][rng.below(4) as usize];
-    for _ in 0..len {
+    // Most scripts open with a directed prelude, since a random script
+    // seldom completes its probe before an editor opens the writer scope:
+    // a Ctrl+G held behind the probe, the probe's own `Armed` helper and
+    // return completing it, so the Ctrl+G becomes the next segment's
+    // trigger, and then that trigger's own helper, deciding `Armed`,
+    // `Unarmed` or a tool, its editor seen running or not, its start failed
+    // or not. Others open with the probe's own helper deciding, for the
+    // probe's rows and its settlements. The model judges every step of
+    // either as any other.
+    let prelude = rng.below(100);
+    if prelude < 25
+        && let Some(probe) = model.front()
+    {
+        next_pid += 1;
+        let decision = [Decision::Armed, Decision::Unarmed, Decision::Tool][rng.below(3) as usize];
+        let mut own = helper(next_pid, probe, decision);
+        if let Step::Observe(r) = &mut own {
+            r.read = (decision == Decision::Armed)
+                .then(|| daemon_read(rng))
+                .flatten();
+        }
+        let mut directed = vec![own];
+        if decision == Decision::Unarmed && rng.chance(50) {
+            directed.push(Step::Editor(next_pid));
+        }
+        for step in directed {
+            apply_model(model, &step, &mut pending);
+            steps.push(step);
+        }
+    } else if prelude < 70
+        && let Some(probe) = model.front()
+    {
+        next_pid += 1;
+        let mut own = helper(next_pid, probe, Decision::Armed);
+        if let Step::Observe(r) = &mut own {
+            r.read = daemon_read(rng);
+        }
+        let mut prelude = vec![
+            Step::Type(vec![b'a', CTRL_G, b'b']),
+            own,
+            Step::Exit(next_pid),
+        ];
+        prelude.extend(fast_return(model.agent).into_iter().map(Step::Out));
+        for step in prelude {
+            apply_model(model, &step, &mut pending);
+            steps.push(step);
+        }
+        if let Some(trigger) = model.front() {
+            next_pid += 1;
+            let decision = [
+                Decision::Armed,
+                Decision::Unarmed,
+                Decision::Unarmed,
+                Decision::Tool,
+            ][rng.below(4) as usize];
+            let mut directed = vec![helper(next_pid, trigger, decision)];
+            if decision == Decision::Unarmed && rng.chance(60) {
+                directed.push(Step::Editor(next_pid));
+            }
+            if rng.chance(25) {
+                directed.push(Step::Report(
+                    next_pid,
+                    Report::SpawnFailed { errno: Some(2) },
+                ));
+            }
+            directed.push(Step::Type(b"cd".to_vec()));
+            for step in directed {
+                apply_model(model, &step, &mut pending);
+                steps.push(step);
+            }
+        }
+    }
+    for i in 0..len {
         if model.retired {
             break;
         }
-        let pick = rng.below(100);
+        // Retirement only in a script's last quarter, so most scripts run
+        // long enough to reach a held Ctrl+G's segment.
+        let pick = if i < len * 3 / 4 {
+            rng.below(98)
+        } else {
+            rng.below(100)
+        };
         if pick < 12
             && let Some(front) = model.front()
         {
             // The front segment's own helper decides `Armed`, exits, and
             // the agent returns: a positive control for completion.
             next_pid += 1;
-            let mut batch = vec![
-                helper(next_pid, front, Decision::Armed),
-                Step::Exit(next_pid),
-            ];
+            let mut own = helper(next_pid, front, Decision::Armed);
+            if let Step::Observe(r) = &mut own {
+                r.read = daemon_read(rng);
+            }
+            let mut batch = vec![own, Step::Exit(next_pid)];
             batch.extend(fast_return(model.agent).into_iter().map(Step::Out));
             // The return before the exit, or after it.
             if rng.chance(50) {
@@ -801,8 +1009,11 @@ fn generate(rng: &mut Rng, model: &mut Model, len: usize) -> Vec<Step> {
         let step = if pick < 30 {
             let n = 1 + rng.below(4) as usize;
             let mut bytes: Vec<u8> = (0..n).map(|_| b'a' + rng.below(26) as u8).collect();
-            // At most one candidate per frame, and none with the fence open.
-            if model.fenced() && rng.chance(35) {
+            // At most one candidate per frame, and only while the gate holds
+            // (a segment open or typing held): a Ctrl+G typed with nothing
+            // out is native and written whole (the model's first
+            // correction), which this generator doesn't script.
+            if model.fenced() && rng.chance(50) {
                 let at = rng.below(n as u64 + 1) as usize;
                 bytes.insert(at, CTRL_G);
             }
@@ -820,17 +1031,21 @@ fn generate(rng: &mut Rng, model: &mut Model, len: usize) -> Vec<Step> {
                 n if n < editor_rate => Decision::Tool,
                 _ => Decision::Armed,
             };
+            let channel = if rng.chance(50) {
+                Channel::Ipc
+            } else {
+                Channel::Marker
+            };
             Step::Observe(MRecord {
                 pid: next_pid,
                 owned: !rng.chance(10),
-                channel: if rng.chance(50) {
-                    Channel::Ipc
-                } else {
-                    Channel::Marker
-                },
+                channel,
                 seg,
                 decision: Some(decision),
                 report: Report::None,
+                read: (channel == Channel::Ipc && decision == Decision::Armed)
+                    .then(|| daemon_read(rng))
+                    .flatten(),
                 drained: false,
                 editor: false,
                 matched: false,
@@ -868,16 +1083,30 @@ fn generate(rng: &mut Rng, model: &mut Model, len: usize) -> Vec<Step> {
                 None => continue,
             }
         } else if pick < 77 {
+            // Half the time, the released front segment's own helper drains
+            // with no report while its editor may still run: the unknown
+            // wait that cuts the release off (R-U2-06), generated directly.
+            let unknown = model
+                .segs
+                .front()
+                .filter(|s| s.released && !s.cut_off)
+                .and_then(|s| s.record)
+                .map(|i| &model.records[i])
+                .filter(|r| {
+                    !r.drained && r.report == Report::None && r.decision != Some(Decision::Armed)
+                })
+                .map(|r| r.pid);
             let open: Vec<u32> = model
                 .records
                 .iter()
                 .filter(|r| !r.drained)
                 .map(|r| r.pid)
                 .collect();
-            if open.is_empty() {
-                continue;
+            match unknown {
+                Some(pid) if rng.chance(50) => Step::Exit(pid),
+                _ if open.is_empty() => continue,
+                _ => Step::Exit(open[rng.below(open.len() as u64) as usize]),
             }
-            Step::Exit(open[rng.below(open.len() as u64) as usize])
         } else if pick < 95 {
             Step::Out(match rng.below(4) {
                 0 => OFF,
@@ -897,6 +1126,12 @@ fn generate(rng: &mut Rng, model: &mut Model, len: usize) -> Vec<Step> {
         steps.push(step);
     }
     steps
+}
+
+/// The daemon's read of an `Armed` export on IPC, when it arrives: empty
+/// or not.
+fn daemon_read(rng: &mut Rng) -> Option<bool> {
+    rng.chance(70).then(|| rng.chance(50))
 }
 
 /// The model's side of `step`. A `Fast` step waits for the next trigger:
@@ -941,6 +1176,7 @@ fn fast_helper(pid: u32, number: u64) -> MRecord {
         seg: Some(number),
         decision: Some(Decision::Unarmed),
         report: Report::None,
+        read: None,
         drained: false,
         editor: false,
         matched: false,
@@ -1042,13 +1278,19 @@ async fn run(agent: Agent, prefix: &[u8], fast_probe: bool, steps: &[Step], what
     model
 }
 
-/// Scenario: Generate scripts against the release table, one generation each, Claude and Codex: a probe whose fence closes in the gate's arm section, then typing with and without a Ctrl+G, helpers that read the open segment's number, a stale one or none, decide `Armed`, `Unarmed` or a tool, run the user's editor, report, and exit, return markers, an agent that answers a trigger before its written report arrives, and retirement, after output that ran before the segments attached. After every step, once the production driver has had its chance, the PTY has taken exactly what the table allows: nothing early, nothing missing, each Ctrl+G alone after its number, nothing after retirement, and the probe's schedule stops being due exactly when its decision settles.
-#[spec("inbox/probe/010")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn probe_010_releases_follow_the_release_table_on_the_production_driver() {
-    let mut reached = Stats::default();
-    let (mut triggers, mut settled, mut retired) = (0, 0, 0);
-    for seed in 1..=200u64 {
+/// What a run of seeds reached.
+#[derive(Debug, Default)]
+struct Reached {
+    stats: Stats,
+    triggers: usize,
+    retired: usize,
+}
+
+/// Generate and run one script per seed in `seeds`, alternating Claude and
+/// Codex.
+async fn run_seeds(seeds: std::ops::RangeInclusive<u64>) -> Reached {
+    let mut reached = Reached::default();
+    for seed in seeds {
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ seed.wrapping_mul(0x2545_f491_4f6c_dd1d));
         let agent = if seed % 2 == 0 {
             Agent::Codex
@@ -1072,30 +1314,102 @@ async fn probe_010_releases_follow_the_release_table_on_the_production_driver() 
         let steps = generate(&mut rng, &mut model, 40);
         let what = format!("seed {seed} {agent:?}");
         let m = run(agent, &prefix, fast_probe, &steps, &what).await;
-        reached.released += m.stats.released;
-        reached.passed += m.stats.passed;
-        reached.cut_off += m.stats.cut_off;
-        reached.completed += m.stats.completed;
-        triggers += m.triggers.len();
-        settled += usize::from(m.settled.is_some());
-        retired += usize::from(m.retired);
+        reached.stats.add(&m.stats);
+        reached.triggers += m.triggers.len();
+        reached.retired += usize::from(m.retired);
     }
-    // The scripts reached every kind of step the table has.
+    reached
+}
+
+/// The release table's rows a run must reach (R-B-U3-02): `(agent, kind,
+/// decision, editor seen, start failed, releases)`. Under `EcPolicy::Hold`
+/// no row completes by EC, and the Authority policy's EC rows are out of
+/// this rig's reach (see the module documentation).
+const ROWS: &[(&str, MKind, &str, bool, bool, bool)] = &[
+    // Claude: a probe releases at either decision; a held Ctrl+G at
+    // `Armed`, and at `Unarmed` once its editor runs.
+    ("Claude", MKind::Probe, "Armed", false, false, true),
+    ("Claude", MKind::Probe, "Unarmed", false, false, true),
+    ("Claude", MKind::HumanG, "Armed", false, false, true),
+    ("Claude", MKind::HumanG, "Unarmed", false, false, false),
+    ("Claude", MKind::HumanG, "Unarmed", true, false, true),
+    // Codex: only a held Ctrl+G whose editor runs releases before E1F.
+    ("Codex", MKind::Probe, "Armed", false, false, false),
+    ("Codex", MKind::Probe, "Unarmed", false, false, false),
+    ("Codex", MKind::HumanG, "Armed", false, false, false),
+    ("Codex", MKind::HumanG, "Unarmed", false, false, false),
+    ("Codex", MKind::HumanG, "Unarmed", true, false, true),
+    // A tool's editor releases nothing, on either agent.
+    ("Claude", MKind::HumanG, "Tool", false, false, false),
+    ("Codex", MKind::HumanG, "Tool", false, false, false),
+    // A failed start releases nothing before its completion, even with the
+    // editor seen running before the failure was reported.
+    ("Codex", MKind::HumanG, "Unarmed", true, true, false),
+    ("Codex", MKind::HumanG, "Tool", false, true, false),
+];
+
+/// Assert that `reached` reached each row of [`ROWS`], each kind of step
+/// and each kind of settlement at least `floor` times.
+fn assert_reached(reached: &Reached, floor: usize) {
+    let r = &reached.stats;
     eprintln!(
-        "reached: {reached:?}, {triggers} triggers, {settled} settlements, {retired} retirements"
+        "reached: {} releases, {} passed, {} cut off, {} completions, {} triggers, \
+         {} retirements, settled {:?}",
+        r.released, r.passed, r.cut_off, r.completed, reached.triggers, reached.retired, r.settled
     );
+    for (row, n) in &r.rows {
+        eprintln!("  row {row:?}: {n}");
+    }
+    for &(agent, kind, decision, editor, spawn_failed, releases) in ROWS {
+        let row = Row {
+            agent,
+            kind,
+            decision,
+            editor,
+            spawn_failed,
+            releases,
+        };
+        let n = r.rows.get(&row).copied().unwrap_or(0);
+        assert!(n >= floor, "only {n} segments reached {row:?}");
+    }
     for (what, n) in [
-        ("releases", reached.released),
-        ("bytes passed to a released segment", reached.passed),
-        ("unknown endings cutting a release off", reached.cut_off),
-        ("completions", reached.completed),
-        ("triggers", triggers),
-        ("probe settlements", settled),
-        ("retirements", retired),
+        ("releases", r.released),
+        ("bytes passed to a released segment", r.passed),
+        ("unknown endings cutting a release off", r.cut_off),
+        ("completions", r.completed),
+        ("triggers", reached.triggers),
+        ("retirements", reached.retired),
     ] {
-        assert!(n >= 5, "only {n} {what} across the seeds");
+        assert!(n >= floor, "only {n} {what} across the seeds");
+    }
+    for kind in [Settled::Empty, Settled::NonEmpty, Settled::Failed] {
+        let n = r.settled.get(&kind).copied().unwrap_or(0);
+        assert!(n >= floor, "only {n} probes settled {kind:?}");
     }
 }
+
+/// Scenario: Generate scripts against the release table, one generation each, Claude and Codex: a probe whose fence closes in production's arm section, then typing with and without a Ctrl+G, helpers that read the open segment's number, a stale one or none, decide `Armed` (with the daemon's read of the box, empty or not, or none), `Unarmed` or a tool, run the user's editor, report, and exit, return markers, an agent that answers a trigger before its written report arrives, and retirement, after output that ran before the segments attached. After every step, once the production driver has had its chance, the PTY has taken exactly what the table allows: nothing early, nothing missing, each Ctrl+G alone after its number, nothing after retirement, and the probe's schedule shows how its decision settled exactly when it does. This is the fast tier's share; lane 1 runs a longer one.
+#[spec("inbox/probe/010")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_010_releases_follow_the_release_table_on_the_production_driver() {
+    let reached = run_seeds(1..=FAST_SEEDS).await;
+    assert_reached(&reached, 1);
+}
+
+/// Scenario: The generated release-table scripts of `probe_010_releases_follow_the_release_table_on_the_production_driver`, over a longer, different run of seeds, each row of the table reached many times over.
+#[cfg(feature = "e2e")]
+#[spec("inbox/probe/010")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_010_the_long_run_follows_the_release_table() {
+    let reached = run_seeds(1_001..=1_000 + LONG_SEEDS).await;
+    assert_reached(&reached, 3);
+}
+
+/// The fast tier's seeds, and lane 1's (the audit's U3-9: each seed takes
+/// about 0.15 s, most of it the settle waits).
+const FAST_SEEDS: u64 = 40;
+#[cfg(feature = "e2e")]
+const LONG_SEEDS: u64 = 240;
 
 /// An owned helper `pid` that read `seg` and decided `decision`.
 fn helper(pid: u32, seg: u64, decision: Decision) -> Step {
@@ -1106,6 +1420,7 @@ fn helper(pid: u32, seg: u64, decision: Decision) -> Step {
         seg: Some(seg),
         decision: Some(decision),
         report: Report::None,
+        read: None,
         drained: false,
         editor: false,
         matched: false,
@@ -1169,6 +1484,7 @@ async fn probe_010_the_review_traces_follow_the_release_table() {
             seg: Some(1),
             decision: Some(Decision::Armed),
             report: Report::None,
+            read: None,
             drained: false,
             editor: false,
             matched: false,

@@ -5290,6 +5290,10 @@ impl PaneWriter {
                         frame.cut = Some(cut);
                         frame.framing = planned.framing;
                         self.hold_cut(frame, len);
+                        // The audit's U3-8: a fence closed since admission
+                        // (a probe's arm section) holds it whole, as any
+                        // held op, so the driver hears of it the same way.
+                        input.held_accepted();
                         Accepted::Held
                     }
                     None => Accepted::Written(
