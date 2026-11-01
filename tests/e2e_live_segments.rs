@@ -455,6 +455,15 @@ fn probe_046_attached_dashboard_shows_clears_and_retires_held_typing() {
     f.wait("helper-started");
     let helper = live::read_json(&f.path("helper-started"));
     let export = std::path::Path::new(helper["path"].as_str().unwrap());
+    // Read while the helper is paused at its start, not after its exit as
+    // `probe_026` does: the composer creates and closes the export before it
+    // runs the editor that invokes the helper, and removes it only after the
+    // editor returns, so the file is complete here. An absent export would
+    // read as an unsupported chain on a supported filesystem, so say so.
+    assert!(
+        export.is_file(),
+        "the export must exist while its helper is paused: {export:?}"
+    );
     let unsupported = dot_agent_deck::composer_probe::path_rule::verify_export(
         &mut dot_agent_deck::platform::fsperm::fs_view::LinuxFsView,
         export,
@@ -728,6 +737,9 @@ fn probe_049_failed_editor_outcomes_stay_held_under_production_hold() {
                 let drains = observer["drains"].as_u64().unwrap();
                 let started = live::read_json(&f.path("helper-started"));
                 let pid = started["pid"].as_u64().expect("paused helper's pid");
+                // Both this value and the witness's `start` below are field 22
+                // of `/proc/<pid>/stat` (clock ticks since boot): the observer's
+                // record key reads it through the same proc view.
                 let start =
                     dot_agent_deck::platform::proc::process_start_of(u32::try_from(pid).unwrap())
                         .expect("paused helper's own start ticks");
@@ -1103,7 +1115,10 @@ fn probe_059_automatic_retry_after_a_due_admission_failure() {
     assert!(!root.join("scheduled.arrived").exists(), "no early retry");
     // Schedule advancement does not age the physical native-key hazard.
     wait_span(dot_agent_deck::composer_probe::query_ledger::T_TRIGGER + Duration::from_millis(50));
-    f.control("schedule-advance:30000");
+    f.control(&format!(
+        "schedule-advance:{}",
+        dot_agent_deck::composer_probe::probe::BACKOFF[0].as_millis()
+    ));
     assert!(
         common::wait_until(WAIT, || root.join("scheduled.arrived").exists()),
         "the automatic retry never reached writer admission; input {:?}",
