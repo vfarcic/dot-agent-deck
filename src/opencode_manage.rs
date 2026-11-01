@@ -4815,8 +4815,8 @@ fn auto_install_layout(
     }
     // A 2.x half left in a root 2.x no longer reads (one written before
     // `$OPENCODE_CONFIG_DIR` moved its root).
-    for root in roots.iter().filter(|root| *root != v2_global) {
-        remove_tui_v2(root, failed);
+    for root in roots.iter().filter(|root| !same_location(root, v2_global)) {
+        remove_tui_v2(root, v2_global, failed);
     }
     // OpenCode 2.x copies the 1.x half's `tui.json` entry into a `cli.json`
     // it creates when there is none, where that entry is dead.
@@ -4912,7 +4912,11 @@ fn auto_install_global_resolved(
         );
         return (Some(binary_path), Vec::new());
     }
-    let legacy = roots.get(1).filter(|legacy| !global.contains(legacy));
+    // A legacy root that is one of the global roots under another name (a
+    // symlinked `~/.opencode`) holds the module just written, not a copy.
+    let legacy = roots
+        .get(1)
+        .filter(|legacy| !global.iter().any(|root| same_location(root, legacy)));
     if let Some(legacy) = legacy {
         for root in global.iter().filter(|root| root.exists()) {
             carry_module_over(root, std::slice::from_ref(legacy));
@@ -4924,18 +4928,40 @@ fn auto_install_global_resolved(
     if let Some(legacy) = legacy
         && pins.iter().any(|(root, _)| root == v2_global)
     {
-        remove_duplicate_module(legacy, failed);
+        remove_duplicate_module(legacy, global, failed);
     }
     (Some(binary_path), pins)
 }
 
+/// Review of PR #2060: whether `a` and `b` name the same file or directory
+/// — the same path, or two that resolve to one place through a symlink (a
+/// `~/.opencode` linked to `~/.config/opencode`, an `$OPENCODE_CONFIG_DIR`
+/// naming the XDG root by another path). A path that does not resolve is
+/// compared as written.
+fn same_location(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
 /// PRD #2050: remove the deck's server module (and any obsolete nested
 /// layout) from `root`, where OpenCode 2.x would load it as a second copy of
-/// the global root's. Only the deck's own file names are touched.
-fn remove_duplicate_module(root: &Path, failed: &mut Vec<String>) {
+/// the global root's. Only the deck's own file names are touched, and none
+/// that is the same file as one in a root of `keep` (the global roots just
+/// written) through a symlinked directory or file ([`same_location`]).
+fn remove_duplicate_module(root: &Path, keep: &[PathBuf], failed: &mut Vec<String>) {
     let _guard = lock_plugin();
-    for artifact in [plugin_file(root), stale_plugin_dir(root)] {
-        if std::fs::symlink_metadata(&artifact).is_err() {
+    for (artifact, in_root) in [
+        (plugin_file(root), plugin_file as fn(&Path) -> PathBuf),
+        (stale_plugin_dir(root), stale_plugin_dir),
+    ] {
+        if std::fs::symlink_metadata(&artifact).is_err()
+            || keep
+                .iter()
+                .any(|kept| same_location(&artifact, &in_root(kept)))
+        {
             continue;
         }
         let removed =
@@ -4981,12 +5007,13 @@ fn write_tui_v2(root: &Path, pin: &str) -> std::io::Result<bool> {
     Ok(true)
 }
 
-/// PRD #2050: remove OpenCode 2.x's TUI half from `root`, for a machine
-/// running 1.x. Only the deck's own directory is touched.
-fn remove_tui_v2(root: &Path, failed: &mut Vec<String>) {
+/// PRD #2050: remove OpenCode 2.x's TUI half from `root`, a root 2.x does
+/// not read. Only the deck's own directory is touched, and not when it is the
+/// half in `keep` (2.x's global root) under another name ([`same_location`]).
+fn remove_tui_v2(root: &Path, keep: &Path, failed: &mut Vec<String>) {
     let _guard = lock_plugin();
     let dir = tui_v2_dir(root);
-    if std::fs::symlink_metadata(&dir).is_err() {
+    if std::fs::symlink_metadata(&dir).is_err() || same_location(&dir, &tui_v2_dir(keep)) {
         return;
     }
     match crate::config_write_guard::ensure_config_write_allowed(&dir)
@@ -10976,6 +11003,81 @@ await wait(1500);
         // A second install changes nothing.
         assert_eq!(f.install(Layout::V2), Vec::<String>::new());
         assert_eq!(std::fs::read_to_string(&cli).unwrap(), after);
+    }
+
+    /// Scenario (review of PR #2060): the config roots name one directory
+    /// by two paths — `~/.opencode` a symlink to `~/.config/opencode`,
+    /// `$OPENCODE_CONFIG_DIR` a symlink to the XDG root, or the legacy
+    /// root's `plugin/` a symlink to the XDG root's. Every layout's install
+    /// leaves the server module and both TUI halves in place, rather than
+    /// removing what it just wrote as a duplicate, and a second install
+    /// changes nothing.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_install_keeps_its_files_when_roots_are_symlinked_together() {
+        use std::os::unix::fs::symlink;
+        // (name, roots for (xdg, legacy, config dir), link) — the link is
+        // made after the XDG root exists.
+        type Link = fn(&Path, &[PathBuf]);
+        let cases: [(&str, bool, Link); 3] = [
+            ("legacy root linked to the XDG root", false, |_, roots| {
+                symlink(&roots[0], &roots[1]).unwrap();
+            }),
+            ("config dir linked to the XDG root", true, |_, roots| {
+                std::fs::create_dir_all(&roots[1]).unwrap();
+                symlink(&roots[0], &roots[2]).unwrap();
+            }),
+            ("legacy plugin/ linked to the XDG one", false, |_, roots| {
+                std::fs::create_dir_all(roots[0].join("plugin")).unwrap();
+                std::fs::create_dir_all(&roots[1]).unwrap();
+                symlink(roots[0].join("plugin"), roots[1].join("plugin")).unwrap();
+            }),
+        ];
+        for (name, config_dir, link) in cases {
+            for layout in [Layout::V1, Layout::V2, Layout::Unknown] {
+                let dir = crate::test_temp::tempdir().unwrap();
+                let mut roots = vec![
+                    dir.path().join("config").join("opencode"),
+                    dir.path().join("home").join(".opencode"),
+                ];
+                if config_dir {
+                    roots.push(dir.path().join("elsewhere").join("opencode"));
+                }
+                std::fs::create_dir_all(&roots[0]).unwrap();
+                std::fs::create_dir_all(roots[1].parent().unwrap()).unwrap();
+                if let Some(cfg) = roots.get(2) {
+                    std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+                }
+                link(dir.path(), &roots);
+                let bin = seed_deck(&dir.path().join("local").join("dot-agent-deck"));
+                let v2_global = roots.get(2).unwrap_or(&roots[0]).clone();
+                let install = || {
+                    let mut failed = Vec::new();
+                    auto_install_layout(&roots, &v2_global, layout, &mut failed, || {
+                        Ok(bin.clone())
+                    });
+                    failed
+                };
+                assert_eq!(install(), Vec::<String>::new(), "{name}, {layout:?}");
+                let installed = || {
+                    (
+                        existing_pin(&plugin_file(&roots[0])),
+                        existing_pin(&tui_v2_file(&v2_global)),
+                        tui_plugin_file(&roots[0]).exists(),
+                    )
+                };
+                let expected = (Some(bin.clone()), Some(bin.clone()), true);
+                assert_eq!(installed(), expected, "{name}, {layout:?}: the first install");
+                let module = file_identity(&plugin_file(&roots[0]));
+                assert_eq!(install(), Vec::<String>::new(), "{name}, {layout:?}");
+                assert_eq!(installed(), expected, "{name}, {layout:?}: the second install");
+                assert_eq!(
+                    file_identity(&plugin_file(&roots[0])),
+                    module,
+                    "{name}, {layout:?}: the module is left as it was"
+                );
+            }
+        }
     }
 
     /// Scenario (audit L2): a FIFO with no writer where OpenCode 2's
