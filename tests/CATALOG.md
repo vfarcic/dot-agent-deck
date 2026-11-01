@@ -10660,6 +10660,8 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 
 ##### inbox/probe/046 — The attached real TUI displays and clears live held typing, then reports retirement loss.
 
+- **S-20c observation barrier:** the helper pauses before its decision until the attached card actually shows held typing. This replaces the 500 ms dispatch-delay window, which could finish before the TUI observed the held state. The strengthened row is RED in a quiet isolated run: keys are positively held while the attached card still shows no checking explanation; its clearing and retirement assertions await the coder's fix.
+
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_live_segments.rs`, `tests/support/live_segments.rs`).
 - **Agent:** native test executable with the reviewed F2 Python composer and real installed helper/editor; no real agent or credential.
 - **Asserts:** A PTY/vt100 TuiDeck attaches to the real sandbox daemon; delayed-dispatch typing produces shared held-input words, release clears them and retirement reports typing as not delivered; the successor capture stays empty.
