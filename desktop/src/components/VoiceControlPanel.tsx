@@ -4810,6 +4810,12 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   */
   const questionQueued = questionForm?.sending === true && !questionForm.cancelling
     && pane?.question?.id === questionForm.target.questionId && pane.question.answerQueued === true;
+  /*
+    Without `inputDiscarded` on purpose (auditor U3-5): these words only say
+    why the answer being sent is queued, and the typing an earlier agent
+    generation held and lost is no reason for that. The card and the tile
+    carry the not-delivered notice, as the TUI card does.
+  */
   const heldWords = inputHeldText(pane?.inputHeld);
   const emptyState = indicator === "on" && dictating === undefined && choice === undefined && pending === undefined && problem === undefined && capture === undefined && result === undefined && questionForm === undefined;
   const reporting = note !== undefined || dictating !== undefined || choice !== undefined || pending !== undefined || problem !== undefined || capture !== undefined || result !== undefined || questionForm !== undefined;

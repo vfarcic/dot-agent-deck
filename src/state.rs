@@ -1749,13 +1749,26 @@ pub struct AppState {
     /// the client has its card; the surfacing start carries them.
     pane_inboxes: HashMap<String, PaneInbox>,
     /// PRD #1666 part 3 (Q35-20e): the daemon's latest word on held typing,
-    /// by pane, at most [`MAX_PENDING_INPUT_HELD`], kept apart from the
-    /// pane's account, which a close drops. A generation that took a pane
-    /// this client is letting go of can be announced before the close
-    /// arrives or after it, and before its card is surfaced; an account
-    /// created later takes the word when it names that generation
-    /// ([`Self::take_pane_inbox`]).
-    pending_input_held: HashMap<String, PaneHeld>,
+    /// by pane, at most [`MAX_PENDING_INPUT_HELD`] (the oldest word goes
+    /// first), kept apart from the pane's account, which a close drops. A
+    /// generation that took a pane this client is letting go of can be
+    /// announced before the close arrives or after it, and before its card
+    /// is surfaced; an account created later takes the word when it names
+    /// that generation ([`Self::take_pane_inbox`]).
+    ///
+    /// R-E-U2-02: kept coherent with what the account shows, so it never
+    /// brings back a word something newer replaced. A snapshot replaces it
+    /// for every pane it lists and drops it for every pane it doesn't
+    /// ([`Self::take_inbox_snapshot`]); an update the account rejects as a
+    /// retired generation's, or one naming an older generation than the
+    /// word kept, never touches it ([`Self::apply_input_held_update`]); an
+    /// account for a later generation drops it (auditor U3-4); and a stream
+    /// from another daemon process clears it, since agent ids are
+    /// daemon-local ([`Self::learn_stream_incarnation`]).
+    pending_input_held: HashMap<String, PendingHeld>,
+    /// The order [`Self::pending_input_held`]'s words arrived in, for its
+    /// bound.
+    pending_input_held_seq: u64,
     /// Issue #1635: what the TUI's last release check found — the plans for
     /// this machine's copies — set by [`crate::upgrade_dialog::run_checker`]
     /// at start and every re-check interval. `None` until a check succeeds.
@@ -6767,9 +6780,22 @@ const MAX_SEEN_INBOX_MESSAGES: usize = 256;
 const MAX_RETIRED_INBOX_AGENTS: usize = 8;
 
 /// PRD #1666 part 3 (Q35-20e): how many panes [`AppState::pending_input_held`]
-/// keeps; past it, one is forgotten to make room. A forgotten one costs its
-/// pane's card the row until the next snapshot or update.
+/// keeps; past it, the oldest word is forgotten to make room. A forgotten
+/// one costs its pane's card the row until the next snapshot or update.
 const MAX_PENDING_INPUT_HELD: usize = 64;
+
+/// PRD #1666 part 3 (Q35-20e): one pane's word in
+/// [`AppState::pending_input_held`], with when it arrived.
+#[derive(Debug, Clone)]
+struct PendingHeld {
+    held: PaneHeld,
+    seq: u64,
+}
+
+/// Whether generation `a` is older than `b`, where both name one.
+fn older_generation(a: &str, b: &str) -> bool {
+    matches!((a.parse::<u64>(), b.parse::<u64>()), (Ok(a), Ok(b)) if a < b)
+}
 
 /// PRD #1666 §2.8: what a client knows of one pane's inbox — the daemon's last
 /// summary, and the messages seen change state since. Keyed by message id, so
@@ -8396,6 +8422,10 @@ impl AppState {
             {
                 let previous = previous.to_string();
                 self.note_process_replaced(previous);
+                // Q35-20e (R-E-U2-02): agent ids are daemon-local, so another
+                // process's words on held typing name generations this one's
+                // ids may reuse.
+                self.pending_input_held.clear();
             }
             self.replaced_processes
                 .retain(|replaced| replaced != process);
@@ -9534,6 +9564,13 @@ impl AppState {
                     .iter()
                     .any(|record| record.pane_id_env.as_deref() == Some(pane.as_str()))
         });
+        // Q35-20e (R-E-U2-02): a word kept for a pane the daemon no longer
+        // lists names a generation that has gone.
+        self.pending_input_held.retain(|pane, _| {
+            records
+                .iter()
+                .any(|record| record.pane_id_env.as_deref() == Some(pane.as_str()))
+        });
         for record in records {
             let Some(pane_id) = record.pane_id_env.as_deref() else {
                 continue;
@@ -9550,12 +9587,14 @@ impl AppState {
                         .live
                         .as_ref()
                         .and_then(|snap| snap.input_held.as_ref()));
+                    let held =
+                        PaneHeld::new(&record.id, input_held, record.input_discarded.as_ref());
+                    // R-E-U2-02: the snapshot's word replaces the one kept for
+                    // its generation, so a later account of that generation
+                    // takes the snapshot's, not an older live update's.
+                    self.keep_input_held(pane_id, held.clone());
                     let next = PaneInbox {
-                        held: Some(PaneHeld::new(
-                            &record.id,
-                            input_held,
-                            record.input_discarded.as_ref(),
-                        )),
+                        held: Some(held),
                         ..PaneInbox::from_summary(&record.id, summary)
                     };
                     self.take_pane_inbox(pane_id, next);
@@ -9596,9 +9635,19 @@ impl AppState {
         // Q35-20e: held typing announced before this account existed.
         if next.held.is_none()
             && let Some(pending) = self.pending_input_held.get(pane_id)
-            && next.agent_id.as_deref() == Some(pending.agent_id.as_str())
+            && next.agent_id.as_deref() == Some(pending.held.agent_id.as_str())
         {
-            next.held = Some(pending.clone());
+            next.held = Some(pending.held.clone());
+        }
+        // Auditor U3-4: a word for a generation older than this account's
+        // can never be taken again.
+        if let Some(agent) = next.agent_id.as_deref()
+            && self
+                .pending_input_held
+                .get(pane_id)
+                .is_some_and(|pending| older_generation(&pending.held.agent_id, agent))
+        {
+            self.pending_input_held.remove(pane_id);
         }
         self.pane_inboxes
             .entry(pane_id.to_string())
@@ -9648,24 +9697,33 @@ impl AppState {
     /// [`Self::apply_inbox_notice`] applies notices to. Bound to the
     /// generation it names: one this pane's account has retired changes
     /// nothing, and one naming a generation the account has not reached yet
-    /// waits for that generation's handover ([`PaneInbox::retire`]). Each is
-    /// also kept apart from the account ([`Self::pending_input_held`]), so a
-    /// pane closed after it, or never managed, still gives it to the account
-    /// its surfacing creates for that generation.
+    /// waits for that generation's handover ([`PaneInbox::retire`]). Each one
+    /// not rejected is also kept apart from the account
+    /// ([`Self::pending_input_held`]), so a pane closed after it, or never
+    /// managed, still gives it to the account its surfacing creates for that
+    /// generation.
     pub fn apply_input_held_update(&mut self, update: &crate::event::InputHeldUpdate) {
         let held = PaneHeld::new(
             &update.agent_id,
             update.input_held.as_ref(),
             update.input_discarded.as_ref(),
         );
-        if self.pending_input_held.len() >= MAX_PENDING_INPUT_HELD
-            && !self.pending_input_held.contains_key(&update.pane_id)
-            && let Some(dropped) = self.pending_input_held.keys().next().cloned()
+        // R-E-U2-02: a retired or older generation's late word is rejected
+        // before it is kept, so it can't displace its successor's.
+        if self.pane_inboxes.get(&update.pane_id).is_some_and(|inbox| {
+            inbox.retired.contains(&update.agent_id)
+                || inbox
+                    .agent_id
+                    .as_deref()
+                    .is_some_and(|agent| older_generation(&update.agent_id, agent))
+        }) || self
+            .pending_input_held
+            .get(&update.pane_id)
+            .is_some_and(|pending| older_generation(&update.agent_id, &pending.held.agent_id))
         {
-            self.pending_input_held.remove(&dropped);
+            return;
         }
-        self.pending_input_held
-            .insert(update.pane_id.clone(), held.clone());
+        self.keep_input_held(&update.pane_id, held.clone());
         let inbox = if self.managed_pane_ids.contains(&update.pane_id) {
             self.pane_inboxes.entry(update.pane_id.clone()).or_default()
         } else {
@@ -9674,14 +9732,40 @@ impl AppState {
                 None => return,
             }
         };
-        if inbox.retired.contains(&update.agent_id) {
-            return;
-        }
         if inbox.agent_id.is_none() {
             inbox.agent_id = Some(update.agent_id.clone());
         }
         inbox.held = Some(held);
         self.refresh_card_inbox(&update.pane_id);
+    }
+
+    /// PRD #1666 part 3 (Q35-20e): keep `held` as `pane_id`'s latest word
+    /// ([`Self::pending_input_held`]), forgetting the oldest pane's past
+    /// [`MAX_PENDING_INPUT_HELD`].
+    fn keep_input_held(&mut self, pane_id: &str, held: PaneHeld) {
+        self.pending_input_held_seq += 1;
+        let seq = self.pending_input_held_seq;
+        self.pending_input_held
+            .insert(pane_id.to_string(), PendingHeld { held, seq });
+        while self.pending_input_held.len() > MAX_PENDING_INPUT_HELD {
+            let Some(oldest) = self
+                .pending_input_held
+                .iter()
+                .min_by_key(|(_, pending)| pending.seq)
+                .map(|(pane, _)| pane.clone())
+            else {
+                break;
+            };
+            self.pending_input_held.remove(&oldest);
+        }
+    }
+
+    /// PRD #1666 part 3 (Q35-20e, R-E-U3-02): the panes
+    /// [`Self::pending_input_held`] keeps a word for, for the bound's tests.
+    pub fn pending_input_held_panes(&self) -> Vec<String> {
+        let mut panes: Vec<String> = self.pending_input_held.keys().cloned().collect();
+        panes.sort();
+        panes
     }
 
     /// PRD #1666 part 3 (R-2): the refusal code of the request `pane_id`'s

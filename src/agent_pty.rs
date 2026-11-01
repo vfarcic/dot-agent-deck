@@ -5137,6 +5137,14 @@ struct PaneDiscard {
     input_seq: u64,
 }
 
+/// PRD #1666 part 3 (R-E-U3-02): how many panes' not-delivered notices the
+/// registry keeps. A notice is pruned once a keystroke ends it, but a pane
+/// closed for good never sees one, and the daemon can't tell that close from
+/// a stop the same pane's successor follows (`probe_046`'s retirement
+/// history), so a closed pane's notice is kept; past this many the oldest
+/// retirement's goes.
+const MAX_PANE_DISCARDS: usize = 64;
+
 /// PRD #1666 part 3 (Q35-15): a generation's fence gate
 /// ([`crate::composer_probe::gate`]) with the writer's in-flight count and
 /// the input epoch it reads, so the registry can close it, read it and retire
@@ -5179,15 +5187,23 @@ impl PaneGate {
     /// The generation retired (R5 §4.6 E4): nothing more is accepted, every
     /// held frame is refused `exited` once, its connection told, and it
     /// leaves the in-flight count once; full waiters wake to see it. Returns
-    /// how many writes and bytes it discarded (Q35-20e).
-    pub(crate) fn retire(&self) -> (usize, usize) {
-        let (held, bytes) = self.gate.retire_counted();
-        let ops = held.len();
+    /// how many writes and bytes of a person's typing it discarded
+    /// (Q35-20e), or `None` when the gate had already retired, which retires
+    /// nothing (R-E-U2-01). A held answer isn't counted (auditor U3-7): the
+    /// successor's card says "your held typing", and the answer's refusal
+    /// already tells its answerer.
+    pub(crate) fn retire(&self) -> Option<(usize, usize)> {
+        let (held, _) = self.gate.retire_counted()?;
+        let (mut ops, mut bytes) = (0, 0);
         for frame in held {
+            if frame.answer.is_none() {
+                ops += 1;
+                bytes += frame.bytes.len();
+            }
             frame.refuse_accepted("exited");
             self.in_flight.leave();
         }
-        (ops, bytes)
+        Some((ops, bytes))
     }
 
     /// PRD #1666 part 3 (Q35-20e): have `notify` told when what the card
@@ -8496,6 +8512,12 @@ mod input_epoch_tests;
 #[path = "agent_pty_fence_tests.rs"]
 mod fence_tests;
 
+/// PRD #1666 part 3 (Q35-20e review): the not-delivered notice over real
+/// generations sharing a pane.
+#[cfg(all(test, unix))]
+#[path = "agent_pty_discard_tests.rs"]
+mod discard_tests;
+
 /// PRD #1666 part 3 (Q35-16): the planner and the physical tracker on the
 /// real pane writer.
 #[cfg(test)]
@@ -10010,10 +10032,12 @@ struct RegistryInner {
     /// auto-advance move that clock underneath the test.
     exit_waiters: HashMap<String, Vec<oneshot::Sender<()>>>,
     /// PRD #1666 part 3 (Q35-20e): typing a pane's retired generation still
-    /// held when it retired, by pane, for its successor's card. Replaced at
-    /// the pane's next retirement (removed when that one held nothing), and
-    /// shown until a person's keystroke reaches the pane after it (see
-    /// [`AgentPtyRegistry::input_discarded`]).
+    /// held when it retired, by pane, for its successor's card. Replaced only
+    /// by a later generation's retirement that held typing too (R-E-U2-01:
+    /// a retirement that held nothing, and an older or already-retired
+    /// record's cleanup, leave it), and shown until a person's keystroke
+    /// reaches the pane after it, when it is pruned (see
+    /// [`AgentPtyRegistry::input_discarded`]). At most [`MAX_PANE_DISCARDS`].
     input_discarded: HashMap<String, PaneDiscard>,
 }
 
@@ -13473,48 +13497,83 @@ impl AgentPtyRegistry {
         self.pane_input.lock().unwrap().forget_pane(pane_id_env);
     }
 
-    /// PRD #1666 part 3 (Q35-20e): `retired_id`, `pane`'s generation retiring
-    /// now under `inner`, discarded `ops` writes of `bytes` held typing.
-    /// Replaces what an earlier retirement left for the pane: a retirement
-    /// that held nothing leaves nothing to report. Takes the pane-input lock
-    /// inside the registry's, the order [`Self::forget_pane_input`] takes.
+    /// PRD #1666 part 3 (Q35-20e): `retired_id`, `pane`'s generation, was
+    /// retired under `inner`, and `retired` is what that retirement discarded:
+    /// `None` when its gate had already retired, so this call retired nothing.
+    /// Takes the pane-input lock inside the registry's, the order
+    /// [`Self::forget_pane_input`] takes.
+    ///
+    /// R-E-U2-01: only a first retirement that held typing writes the pane's
+    /// notice, and only over a notice from an older generation; nothing here
+    /// clears one, so cleaning up an already-retired or older record, in
+    /// whatever order a publish visits the pane's records, can't erase a
+    /// newer generation's notice. A retirement that held nothing leaves an
+    /// earlier notice standing until a keystroke ends it (auditor U3-1). A
+    /// notice a keystroke already ended is pruned here (R-E-U3-02).
     fn note_discard(
         &self,
         inner: &mut RegistryInner,
         pane: &str,
         retired_id: &str,
-        (ops, bytes): (usize, usize),
+        retired: Option<(usize, usize)>,
     ) {
-        match retired_id.parse::<u64>().ok() {
-            Some(generation) if ops > 0 => {
-                let input_seq = self.pane_input.lock().unwrap().input_seq;
-                let at_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-                inner.input_discarded.insert(
-                    pane.to_string(),
-                    PaneDiscard {
-                        shown: crate::inbox_display::InputDiscarded {
-                            generation,
-                            held_ops: u32::try_from(ops).unwrap_or(u32::MAX),
-                            held_bytes: u32::try_from(bytes).unwrap_or(u32::MAX),
-                            at_ms,
-                        },
-                        input_seq,
-                    },
-                );
-            }
-            _ => {
-                inner.input_discarded.remove(pane);
-            }
+        let input = self.pane_input.lock().unwrap();
+        let typed = input.human_input_seq(pane);
+        let input_seq = input.input_seq;
+        drop(input);
+        let mut changed = false;
+        if inner
+            .input_discarded
+            .get(pane)
+            .is_some_and(|discard| typed > discard.input_seq)
+        {
+            inner.input_discarded.remove(pane);
+            changed = true;
         }
-        self.held_display.notify_one();
+        if let (Some(generation), Some((ops, bytes))) = (retired_id.parse::<u64>().ok(), retired)
+            && ops > 0
+            && inner
+                .input_discarded
+                .get(pane)
+                .is_none_or(|discard| discard.shown.generation < generation)
+        {
+            let at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+            inner.input_discarded.insert(
+                pane.to_string(),
+                PaneDiscard {
+                    shown: crate::inbox_display::InputDiscarded {
+                        generation,
+                        held_ops: u32::try_from(ops).unwrap_or(u32::MAX),
+                        held_bytes: u32::try_from(bytes).unwrap_or(u32::MAX),
+                        at_ms,
+                    },
+                    input_seq,
+                },
+            );
+            while inner.input_discarded.len() > MAX_PANE_DISCARDS {
+                let oldest = inner
+                    .input_discarded
+                    .iter()
+                    .min_by_key(|(_, discard)| (discard.input_seq, discard.shown.generation))
+                    .map(|(pane, _)| pane.clone());
+                match oldest {
+                    Some(oldest) => inner.input_discarded.remove(&oldest),
+                    None => break,
+                };
+            }
+            changed = true;
+        }
+        if changed {
+            self.held_display.notify_one();
+        }
     }
 
     /// PRD #1666 part 3 (Q35-20e): what `agent_id`'s card says of typing its
     /// pane's previous generation held when it retired: shown on the pane's
     /// current, later generation until a person's keystroke reaches the pane
-    /// after the retirement. Display only.
+    /// after the retirement, when it is pruned (R-E-U3-02). Display only.
     pub(crate) fn input_discarded(
         &self,
         agent_id: &str,
@@ -13534,7 +13593,27 @@ impl AgentPtyRegistry {
             return None;
         }
         let typed = self.pane_input.lock().unwrap().human_input_seq(&pane);
-        (typed <= discard.input_seq).then_some(discard.shown)
+        if typed > discard.input_seq {
+            // Ended: prune it, unless a later retirement replaced it meanwhile.
+            let mut inner = self.inner.lock();
+            if inner.input_discarded.get(&pane).is_some_and(|now| {
+                now.input_seq == discard.input_seq
+                    && now.shown.generation == discard.shown.generation
+            }) {
+                inner.input_discarded.remove(&pane);
+            }
+            return None;
+        }
+        Some(discard.shown)
+    }
+
+    /// PRD #1666 part 3 (R-E-U3-02): the panes holding a not-delivered
+    /// notice, for the lifetime tests.
+    #[cfg(test)]
+    pub(crate) fn discard_panes(&self) -> Vec<String> {
+        let mut panes: Vec<String> = self.inner.lock().input_discarded.keys().cloned().collect();
+        panes.sort();
+        panes
     }
 
     /// PRD #1666 part 3 (Q35-20e): told whenever a card's held typing may

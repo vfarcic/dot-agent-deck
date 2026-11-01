@@ -601,8 +601,9 @@ mod tests {
 
     /// Scenario: install one agent that has sent no hook, then receive the
     /// daemon's word that its typing is held (PRD #1666 part 3, Q35-20e). The
-    /// word makes the next refresh fetch, and the record from that fetch
-    /// carries the hold to its tile.
+    /// word makes the next refresh fetch; installing the record that fetch
+    /// returns, the view serves it, and mapped for the webview it carries the
+    /// hold's cause as the tile's `inputHeld` (R-E-U3-01).
     #[test]
     fn a_held_typing_update_makes_the_record_carrying_it_fetched() {
         let now = Instant::now();
@@ -618,11 +619,22 @@ mod tests {
             dot_agent_deck::event::InputHeldUpdate {
                 pane_id: "pane-7".into(),
                 agent_id: "7".into(),
-                input_held: Some(held),
+                input_held: Some(held.clone()),
                 input_discarded: None,
             },
         ));
         assert_eq!(view.needs_fetch(now), Some(FetchReason::InputHeld));
+
+        let mut fetched = record("7", "pane-7");
+        fetched.input_held = Some(held);
+        view.install(listing(vec![fetched]), now);
+        let served = view
+            .records()
+            .into_iter()
+            .find(|record| record.id == "7")
+            .expect("the fetched record is served");
+        let tile = serde_json::to_value(crate::dto::map_agent(served)).unwrap();
+        assert_eq!(tile["inputHeld"]["cause"], "checking", "{tile}");
     }
 
     /// Scenario: install one agent, then receive the daemon's inbox notice

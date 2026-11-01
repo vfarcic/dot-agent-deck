@@ -662,15 +662,18 @@ impl<T> Gate<T> {
     /// The generation retired: from now on nothing is accepted, and what was
     /// held comes back, once, to be refused. Waiters are woken to see it.
     pub fn retire(&self) -> Vec<T> {
-        self.retire_counted().0
+        self.retire_counted()
+            .map_or_else(Vec::new, |(held, _)| held)
     }
 
     /// [`Self::retire`], with the bytes of what was held (Q35-20e: the
-    /// successor's card says typing was not delivered).
-    pub fn retire_counted(&self) -> (Vec<T>, usize) {
+    /// successor's card says typing was not delivered). `None` when the gate
+    /// had already retired: this call retired nothing, so it has nothing to
+    /// report, not "held nothing" (R-E-U2-01).
+    pub fn retire_counted(&self) -> Option<(Vec<T>, usize)> {
         let mut inner = self.lock();
         if inner.retired {
-            return (Vec::new(), 0);
+            return None;
         }
         inner.retired = true;
         inner.probe = None;
@@ -679,7 +682,7 @@ impl<T> Gate<T> {
             (fence.held.into_iter().map(|(op, _)| op).collect(), bytes)
         });
         self.moved(&mut inner);
-        (held, bytes)
+        Some((held, bytes))
     }
 
     pub fn retired(&self) -> bool {
