@@ -456,3 +456,119 @@ fn probe_081_an_announcement_before_the_pane_closes_survives_the_close() {
         Some(text.as_str())
     );
 }
+
+/// Scenario: The pane's generation 2 is announced as carrying the not-delivered notice; then a snapshot of generation 2 that carries none clears the card; then the same generation's summary arrives late, and later the pane's account is closed and its card surfaced again. The card stays cleared each time: a snapshot replaces the word the client kept from the live update (R-E-U2-02).
+#[spec("inbox/probe/081")]
+#[test]
+fn probe_081_a_snapshot_that_clears_outlasts_a_later_account_of_its_generation() {
+    let text = words()["inputNotDelivered"].as_str().unwrap().to_owned();
+    let mut state = hydrated("2", record("2", None));
+    state.apply_input_held_update(&InputHeldUpdate {
+        pane_id: PANE.into(),
+        agent_id: "2".into(),
+        input_held: None,
+        input_discarded: Some(discarded(1)),
+    });
+    assert_eq!(
+        card(&state, "2").input_held_notice(),
+        Some(text.as_str()),
+        "precondition: the live update shows the notice"
+    );
+    state.take_inbox_snapshot(&[record("2", None)]);
+    assert_eq!(card(&state, "2").input_held_notice(), None, "cleared");
+    state.apply_inbox_summary(PANE, "2", &record("2", None).inbox.unwrap());
+    assert_eq!(
+        card(&state, "2").input_held_notice(),
+        None,
+        "a later summary of the same generation keeps the snapshot's word"
+    );
+    state.unregister_pane(PANE);
+    state.apply_inbox_summary(PANE, "2", &record("2", None).inbox.unwrap());
+    assert_eq!(
+        card(&state, "2").input_held_notice(),
+        None,
+        "nor does the account a surfacing re-creates bring it back"
+    );
+}
+
+/// Scenario: Generation 2 takes the pane from generation 1 and is announced as carrying the not-delivered notice; then generation 1's late held-typing word arrives and is rejected; then the pane's account is closed and generation 2's card surfaced. The surfaced card shows generation 2's not-delivered words: the rejected word never displaced them (R-E-U2-02).
+#[spec("inbox/probe/081")]
+#[test]
+fn probe_081_a_rejected_late_word_never_displaces_the_successors() {
+    let text = words()["inputNotDelivered"].as_str().unwrap().to_owned();
+    let mut state = hydrated("1", record("1", None));
+    state.sessions.remove("sess-1");
+    let successor = session("2");
+    state
+        .sessions
+        .insert(successor.session_id.clone(), successor);
+    state.apply_inbox_summary(PANE, "2", &record("2", None).inbox.unwrap());
+    state.apply_input_held_update(&InputHeldUpdate {
+        pane_id: PANE.into(),
+        agent_id: "2".into(),
+        input_held: None,
+        input_discarded: Some(discarded(1)),
+    });
+    state.apply_input_held_update(&InputHeldUpdate {
+        pane_id: PANE.into(),
+        agent_id: "1".into(),
+        input_held: Some(held("1", InputHeldCause::Checking)),
+        input_discarded: None,
+    });
+    assert_eq!(
+        card(&state, "2").input_held_notice(),
+        Some(text.as_str()),
+        "the predecessor's late word changes nothing on the card"
+    );
+    state.unregister_pane(PANE);
+    state.apply_inbox_summary(PANE, "2", &record("2", None).inbox.unwrap());
+    assert_eq!(
+        card(&state, "2").input_held_notice(),
+        Some(text.as_str()),
+        "the re-created account takes the successor's word"
+    );
+}
+
+/// Scenario: Live words arrive for one more pane than the client keeps words for, none of them managed. The client keeps the bound's worth, the oldest pane's word forgotten first and the newest kept (R-E-U3-02).
+#[spec("inbox/probe/081")]
+#[test]
+fn probe_081_the_kept_words_are_bounded_oldest_first() {
+    let mut state = AppState::default();
+    for n in 0..65 {
+        state.apply_input_held_update(&InputHeldUpdate {
+            pane_id: format!("pane-{n:02}"),
+            agent_id: "2".into(),
+            input_held: Some(held("2", InputHeldCause::Checking)),
+            input_discarded: None,
+        });
+    }
+    let kept = state.pending_input_held_panes();
+    assert_eq!(kept.len(), 64);
+    assert!(
+        !kept.contains(&"pane-00".to_string()),
+        "oldest goes: {kept:?}"
+    );
+    assert!(kept.contains(&"pane-64".to_string()), "newest stays");
+}
+
+/// Scenario: A live word is kept for a pane this client doesn't manage; then the stream reconnects to another daemon process, whose agent ids start over, and that daemon surfaces a generation with the same id on the pane. Its card shows no held typing: the other process's word was forgotten (R-E-U2-02).
+#[spec("inbox/probe/081")]
+#[test]
+fn probe_081_another_daemon_process_forgets_the_kept_words() {
+    let named = |process: &str| serde_json::from_value(serde_json::json!(process)).unwrap();
+    let mut state = AppState::default();
+    state.learn_stream_incarnation(named("daemon-a"));
+    state.apply_input_held_update(&InputHeldUpdate {
+        pane_id: PANE.into(),
+        agent_id: "2".into(),
+        input_held: None,
+        input_discarded: Some(discarded(1)),
+    });
+    assert_eq!(state.pending_input_held_panes(), vec![PANE.to_string()]);
+    state.learn_stream_incarnation(named("daemon-b"));
+    assert!(state.pending_input_held_panes().is_empty());
+    let surfaced = session("2");
+    state.sessions.insert(surfaced.session_id.clone(), surfaced);
+    state.apply_inbox_summary(PANE, "2", &record("2", None).inbox.unwrap());
+    assert_eq!(card(&state, "2").input_held_notice(), None);
+}
