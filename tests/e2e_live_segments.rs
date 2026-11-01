@@ -126,11 +126,12 @@ fn probe_026_delayed_checks_preserve_typing_under_each_loss_mechanism() {
     }
 }
 
-/// Scenario: Check an untouched empty box with no intervening input, then read the numbers twice and try a stale generation. Only the successfully matched empty check may advance observed; the read-only operation changes none of the three numbers and a stale request is refused.
+/// Scenario: Check an untouched empty box with no intervening input, then read the numbers twice and try a stale generation. A supported export chain permits the matching empty observation; an unsupported chain must report Unreadable and leave observed unchanged, and fails when strict verification is required.
 #[spec("inbox/probe/026")]
 #[test]
 fn probe_026_empty_settlement_and_read_only_epoch_control() {
     let f = Fixture::start("claude");
+    f.flag("hold-return");
     let before = f.epoch();
     assert_eq!(f.epoch(), before, "reading the epoch must be inert");
     let stale = f.control_for(f.generation + 1, "epoch");
@@ -140,14 +141,51 @@ fn probe_026_empty_settlement_and_read_only_epoch_control() {
     );
     f.probe();
     f.wait("helper-exited");
-    assert!(
-        common::wait_until(WAIT, || {
-            let e = f.epoch();
-            e.0 == before.0 + 1 && e.1 == e.0 && e.2 == before.2
-        }),
-        "the matching empty observation should cover exactly its own probe byte"
+    let helper = live::read_json(&f.path("helper-started"));
+    let export = std::path::Path::new(helper["path"].as_str().unwrap());
+    let verified = dot_agent_deck::composer_probe::path_rule::verify_export(
+        &mut dot_agent_deck::platform::fsperm::fs_view::LinuxFsView,
+        export,
+        // SAFETY: getuid has no failure mode.
+        unsafe { libc::getuid() },
     );
+    let unsupported = verified.err();
+    eprintln!(
+        "probe_026 export-chain branch: {} ({unsupported:?})",
+        if unsupported.is_some() {
+            "unsupported / Unreadable"
+        } else {
+            "supported / Empty"
+        }
+    );
+    f.flag("resume-go");
     f.expect(b"\x07");
+    if let Some(refusal) = unsupported {
+        let trace = fs::read_to_string(f.path("helper-trace")).unwrap();
+        assert!(
+            trace.contains("Unreadable"),
+            "refused {refusal:?}, helper trace:\n{trace}"
+        );
+        f.stable(b"\x07");
+        let after = f.epoch();
+        assert_eq!(
+            after,
+            (before.0 + 1, before.1, before.2),
+            "an unreadable export must not claim an empty box"
+        );
+        assert!(
+            std::env::var("DOT_AGENT_DECK_REQUIRE_REAL_E2E").as_deref() != Ok("1"),
+            "UNVERIFIED: Empty settlement requires a supported export chain: {refusal:?}"
+        );
+    } else {
+        assert!(
+            common::wait_until(WAIT, || {
+                let e = f.epoch();
+                e.0 == before.0 + 1 && e.1 == e.0 && e.2 == before.2
+            }),
+            "the matching empty observation should cover exactly its own probe byte"
+        );
+    }
 }
 
 /// Scenario: Hold each sampled invoking Ctrl+G form behind a probe whose helper has exited but whose return is delayed, then type a line for the user's editor in the same frame. Completing the first segment must dispatch the user's candidate separately and deliver the suffix to the actual running editor, including split-read keyboard forms.
@@ -581,6 +619,55 @@ fn probe_049_failed_editor_outcomes_stay_held_under_production_hold() {
     }
 }
 
+/// Scenario: Queue a human Ctrl+G behind a returning check, pause its helper after a short-lived editor starts with an injected wait failure, and type a suffix while that helper is still alive. First witness that the suffix remains held, then drain the helper and return the composer: those undelivered bytes must remain held until generation replacement.
+#[spec("inbox/probe/049")]
+#[test]
+fn probe_049_wait_unknown_at_drain_retains_the_undelivered_suffix() {
+    let mut f = Fixture::start("claude");
+    f.flag("hold-return");
+    f.probe();
+    f.wait("helper-exited-1");
+    let pause = f.pause_helper();
+    f.setting("helper-pause-at", "post-editor");
+    f.flag("wait-unknown-2");
+    // The editor has no input reader and exits immediately. Unlike the
+    // observed-running-editor control above, no suffix belongs to it.
+    fs::copy("/bin/true", f.daemon.home.join("native/editor")).unwrap();
+    let mut human = f.connect();
+    human.write("\x07");
+    f.wait_held();
+    f.flag("resume-go-1");
+    f.wait("helper-started-2");
+    assert!(
+        common::wait_until(WAIT, || fs::read_to_string(f.path("helper-trace"))
+            .unwrap_or_default()
+            .contains("pause post-editor")),
+        "the second helper must pause after its wait failure"
+    );
+    human.write("STILL-HELD-AT-DRAIN");
+    f.wait_held();
+    f.expect(b"\x07\x07");
+    f.stable(b"\x07\x07");
+    assert!(
+        f.held(),
+        "the suffix must still be held before the helper exit drain"
+    );
+    f.remove("pause-helper");
+    pause.release();
+    f.wait("helper-exited-2");
+    let trace = fs::read_to_string(f.path("helper-trace")).unwrap();
+    assert!(trace.contains("wait-unknown 10"), "{trace}");
+    f.flag("resume-go-2");
+    f.wait("composer-return-2");
+    f.stable(b"\x07\x07");
+    assert!(
+        f.held(),
+        "WaitUnknown at drain must retain the undelivered suffix"
+    );
+    f.replace();
+    f.stable(b"");
+}
+
 /// Scenario: Admit a probe through the live writer and read its nonzero segment from the installed mapped page. A following count-only publication and a physical native candidate must retain that segment number while publishing the updated count and native number coherently.
 #[spec("inbox/probe/059")]
 #[test]
@@ -815,6 +902,125 @@ fn probe_061_live_slot_split_and_saturation_permutations() {
     }
 }
 
+/// Scenario: During a delayed live check, send OSC 10/11 replies with retained or saturated-away queries, BEL or ST endings, and whole or split frames, followed by typing. With a second liability present, a candidate's Armed helper and real return must automatically complete HumanG, proven by a following Ctrl+G reaching its user's editor; report controls deliver the typing without a second helper.
+#[spec("inbox/probe/061")]
+#[test]
+fn probe_061_in_check_osc_candidates_complete_without_manual_release() {
+    use dot_agent_deck::composer_probe::query_ledger::LEDGER_SLOTS;
+    for slot in [10, 11] {
+        for retained in [true, false] {
+            for bel in [true, false] {
+                for split in [false, true] {
+                    let f = Fixture::start("claude");
+                    f.flag("hold-return");
+                    f.setting("editor-mode", "read");
+                    f.setting("edit-mechanism", "H-chunk");
+                    f.probe();
+                    f.wait("helper-exited-1");
+                    let query = format!("\x1b]{slot};?\x1b\\");
+                    if retained {
+                        f.emit(query.as_bytes());
+                    }
+                    f.emit(&b"\x1b[c".repeat(LEDGER_SLOTS + 1));
+                    if !retained {
+                        f.emit(query.as_bytes());
+                    }
+                    let reply = format!(
+                        "\x1b]{slot};rgb:1/22/333{}",
+                        if bel { "\x07" } else { "\x1b\\" }
+                    );
+                    let candidate = bel && (split || !retained);
+                    if candidate {
+                        // A real count-only publication makes this HumanG
+                        // helper-only. An Unarmed editor-bearing segment
+                        // intentionally cannot complete under production Hold.
+                        f.control("publish");
+                    }
+                    if bel && !candidate {
+                        // F2 normally treats every BEL as Ctrl+G. Configure
+                        // the report control as an inert terminal reply;
+                        // candidate histories keep its ordinary edit map.
+                        f.setting("reported-osc", &reply);
+                    }
+                    let mut human = f.connect();
+                    if split {
+                        human.write(&reply[..reply.len() - 1]);
+                        f.wait_held();
+                        human.write(&format!("{}OSC-EDITOR\n", &reply[reply.len() - 1..]));
+                    } else if !candidate {
+                        // A whole retained report is one whole attach frame;
+                        // appending text would make its BEL a candidate.
+                        human.write(&reply);
+                        human.write("OSC-EDITOR\n");
+                    } else {
+                        human.write(&format!("{reply}OSC-EDITOR\n"));
+                    }
+                    f.wait_held();
+                    f.flag("resume-go-1");
+                    let context =
+                        format!("slot={slot}, retained={retained}, bel={bel}, split={split}");
+                    if candidate {
+                        f.wait("helper-exited-2");
+                        f.flag("resume-go-2");
+                        f.wait("composer-return-2");
+                        let expected =
+                            [b"\x07".as_slice(), reply.as_bytes(), b"OSC-EDITOR\n"].concat();
+                        f.expect(&expected);
+                        f.stable(&expected);
+                        assert!(
+                            !f.path("editor-started").exists(),
+                            "{context}: Armed runs no user editor"
+                        );
+                        // Ordinary typing could pass even behind a merely
+                        // released segment. A new candidate cannot dispatch
+                        // until the preceding HumanG really completed.
+                        human.write("\x07");
+                        f.wait("editor-started");
+                        human.write("NEXT-EDITOR\n");
+                        f.wait("editor-input");
+                        assert_eq!(
+                            fs::read(f.path("editor-input")).unwrap(),
+                            b"NEXT-EDITOR\n",
+                            "{context}: the next candidate proves automatic completion"
+                        );
+                        f.flag("editor-go");
+                        f.wait("helper-exited-3");
+                        f.flag("resume-go-3");
+                        f.wait("composer-return-3");
+                    } else {
+                        let expected =
+                            [b"\x07".as_slice(), reply.as_bytes(), b"OSC-EDITOR\n"].concat();
+                        f.expect(&expected);
+                        f.stable(&expected);
+                        assert!(
+                            !f.path("helper-started-2").exists(),
+                            "{context}: a report must not invoke an editor"
+                        );
+                    }
+                    human.write("AFTER-OSC");
+                    let expected = if candidate {
+                        [
+                            b"\x07".as_slice(),
+                            reply.as_bytes(),
+                            b"OSC-EDITOR\n\x07AFTER-OSC",
+                        ]
+                        .concat()
+                    } else {
+                        [
+                            b"\x07".as_slice(),
+                            reply.as_bytes(),
+                            b"OSC-EDITOR\nAFTER-OSC",
+                        ]
+                        .concat()
+                    };
+                    f.expect(&expected);
+                    f.stable(&expected);
+                }
+            }
+        }
+    }
+}
+
 /// Scenario: Pause a live probe after scheduling, run the native agent's real unarmed helper until its writer scope is open, then let the writer attempt the probe. The newly unsafe scope must cause refusal without a probe byte, a page change or a surviving fence.
 #[spec("inbox/probe/059")]
 #[test]
@@ -985,4 +1191,97 @@ fn probe_057_e2_does_not_kill_a_running_user_editor() {
         "the real editor/helper return normally: {result}"
     );
     assert_eq!(result["signal"], Value::Null);
+}
+
+/// Scenario: Run an unarmed user editor that either leaves a genuine background descendant alive or loses its already-open report connection when the daemon rejects an oversized report. After the real helper exits and the composer returns, its unresolved scope must refuse a fresh check without writing another probe; the survivor is released by its private fixture file.
+#[spec("inbox/probe/057")]
+#[test]
+fn probe_057_background_survivor_and_lost_report_keep_scope_open() {
+    for history in ["survivor", "lost-report"] {
+        let f = Fixture::start("claude");
+        if history == "survivor" {
+            f.setting("editor-mode", "survivor");
+        } else {
+            // The invocation and response use the genuine helper connection.
+            // Only its later report is oversized: the daemon closes while
+            // reading that bounded frame, rather than bypassing the helper.
+            f.setting("helper-report-sndbuf", "1024");
+            f.setting("helper-report-pad", "1048576");
+        }
+        let mut human = f.connect();
+        human.write("\x07");
+        f.wait("editor-started");
+        f.wait("helper-exited-1");
+        let trace = fs::read_to_string(f.path("helper-trace")).unwrap();
+        assert!(trace.contains("branch Unarmed"), "{history}: {trace}");
+        if history == "survivor" {
+            f.wait("survivor-pid");
+            assert!(trace.contains("tree Survivors"), "{trace}");
+        } else {
+            assert!(
+                trace.contains("report unsent"),
+                "the actual report connection must fail: {trace}"
+            );
+        }
+        assert!(
+            common::wait_until(WAIT, || f.scope() == "open"),
+            "{history}: unresolved scope must remain open"
+        );
+        // Outlast the native candidate's own quiet period: scope, rather
+        // than the key alone, must keep the next check from being admitted.
+        wait_span(
+            dot_agent_deck::composer_probe::query_ledger::T_TRIGGER + Duration::from_millis(50),
+        );
+        let before = f.page();
+        let result = f.probe();
+        assert_eq!(
+            result["composer_probe"]["outcome"], "refused",
+            "{history}: {result}"
+        );
+        f.expect(b"\x07");
+        f.stable(b"\x07");
+        assert_eq!(
+            f.page(),
+            before,
+            "{history}: a refused check publishes no arm"
+        );
+        assert!(
+            !f.path("helper-started-2").exists(),
+            "{history}: refusal runs no second helper"
+        );
+        f.flag("survivor-go");
+    }
+}
+
+/// Scenario: Publish one real liability, then invoke the installed helper under either a shell tool or another copy of the agent executable. Neither non-owned invocation may consume that liability; the tool must run its editor, while the armed unknown-family invocation must refrain from opening one.
+#[spec("inbox/probe/057")]
+#[test]
+fn probe_057_tool_and_unknown_family_helpers_leave_liability_unconsumed() {
+    for parent in ["tool", "unknown"] {
+        let f = Fixture::start("claude");
+        f.setting("helper-parent", parent);
+        f.control("publish");
+        assert_eq!(f.page().count, 1);
+        let mut human = f.connect();
+        human.write("\x07");
+        f.wait("helper-exited-1");
+        let trace = fs::read_to_string(f.path("helper-trace")).unwrap();
+        if parent == "tool" {
+            assert!(
+                trace.contains("branch Tool class PositivelyTool"),
+                "{trace}"
+            );
+            f.wait("editor-finished");
+        } else {
+            assert!(trace.contains("branch Armed class Unknown"), "{trace}");
+            assert!(!f.path("editor-started").exists(), "{trace}");
+        }
+        f.expect(b"\x07");
+        f.stable(b"\x07");
+        assert_eq!(
+            f.page().count,
+            1,
+            "{parent}: a non-owned helper cannot settle the published liability"
+        );
+    }
 }
