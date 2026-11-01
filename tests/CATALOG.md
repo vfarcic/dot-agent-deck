@@ -860,6 +860,13 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** that the real startup runs the install before the daemon (`hooks/install/021`); the exit flush itself (`flush_session_warnings` unit tests).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/status-message/009 — A refused input names why, in the words the desktop shows (PRD #1666 part 3, Q15-2).
+- **Layer:** L1 (in-module `src/ui.rs` test: applies a daemon `KIND_STREAM_REJECT` to a focused pane in typing mode with `apply_stream_rejection_feedback`, then draws the full frame with `render_frame` into a ratatui `TestBackend` and inline-`insta`-snapshots the bottom status row).
+- **Agent:** none.
+- **Asserts:** for `exited` and `write-failed` the deck leaves typing mode and the status row reads ` COMMAND  Input not delivered: the agent has exited` and ` COMMAND  Input not delivered: the agent's terminal did not take it`, each equal to `tests/fixtures/inbox-display.json`'s `inputRejected` word, which the desktop's own test (`stream_rejection_notice_uses_the_words_the_tui_shows` in `desktop/src-tauri/src/terminal.rs`) checks its in-tile notice against.
+- **Does not assert:** that a real daemon sends either reason (the writer's own units in `src/agent_pty.rs`); the desktop's rendering of the notice in xterm.
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/rename
 
 ##### dashboard/rename/001 — `r` on the selected card opens a rename input pre-filled with the current name.

@@ -7385,15 +7385,10 @@ fn non_live_input_feedback(writable: crate::event::Writable) -> Option<&'static 
 }
 
 /// PRD #20 R20-007 (finding #10): human-readable feedback for a typed daemon
-/// stream-rejection `reason` (a `KIND_STREAM_REJECT` frame's payload).
+/// stream-rejection `reason` (a `KIND_STREAM_REJECT` frame's payload), in the
+/// words the desktop shows too (PRD #1666 part 3 Q15-2, CLAUDE.md rule 22).
 fn stream_reject_message(reason: &str) -> String {
-    match reason {
-        "history-only" => "Input not delivered: session is history-only".to_string(),
-        "exited" => "Input not delivered: the agent has exited".to_string(),
-        "write-failed" => "Input not delivered: the agent's terminal did not take it".to_string(),
-        "stale" | "wrong-session" => "Input not delivered: the pane's session changed".to_string(),
-        other => format!("Input not delivered ({other})"),
-    }
+    crate::inbox_display::input_rejected(reason)
 }
 
 /// PRD #20 R20-007 (finding #10): consume a daemon stream-rejection for
@@ -42393,6 +42388,42 @@ mod tests {
             vec![line.to_string(), STARTUP_FIX.to_string()]
         );
         insta::assert_snapshot!(glossary_status_row(&state, &mut ui), @" COMMAND  Claude Code's hooks could not be updated: ~/.claude/settings.json is not valid JSON (left");
+    }
+
+    /// Scenario: Type into a focused pane and have the daemon refuse the input
+    /// because the agent exited, then because its terminal did not take it.
+    /// Each time the deck leaves typing mode and the status line gives the
+    /// reason in the words the desktop's terminal tile shows for the same
+    /// refusal (the shared fixture's `inputRejected`).
+    #[spec("dashboard/status-message/009")]
+    #[test]
+    fn status_message_009_a_refused_input_says_why_in_the_desktops_words() {
+        use tokio::sync::RwLock;
+        let words: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/inbox-display.json")).unwrap();
+        let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+        let now = std::time::Instant::now();
+        let mut rows = Vec::new();
+        for reason in ["exited", "write-failed"] {
+            let mut ui = default_ui();
+            ui.mode = UiMode::PaneInput;
+            assert!(apply_stream_rejection_feedback(
+                &mut ui,
+                Some("p0"),
+                "p0",
+                reason,
+                now
+            ));
+            assert_eq!(ui.mode, UiMode::Normal);
+            assert_eq!(
+                Some(glossary_status_text(&ui).unwrap()),
+                words["inputRejected"][reason].as_str(),
+                "{reason}"
+            );
+            rows.push(glossary_status_row(&state, &mut ui));
+        }
+        insta::assert_snapshot!(rows[0], @" COMMAND  Input not delivered: the agent has exited");
+        insta::assert_snapshot!(rows[1], @" COMMAND  Input not delivered: the agent's terminal did not take it");
     }
 
     /// Drive `Action::Focus` (Enter) on the one card of `snapshot` against `pc`.

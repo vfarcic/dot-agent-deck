@@ -109,6 +109,38 @@ pub const INPUT_HELD_UNKNOWN: &str =
 /// ([`InputDiscarded`]). Its first clause stands alone where a card cuts it.
 pub const INPUT_NOT_DELIVERED: &str = "not delivered: your held typing; restarting the agent discarded it. Type it again if you still need it.";
 
+/// What both clients say when the daemon refuses a pane's typed input
+/// (`KIND_STREAM_REJECT`) for a reason it names: the TUI on its status line,
+/// the desktop inside the terminal tile. One copy, pinned with the desktop's
+/// by `tests/fixtures/inbox-display.json`'s `inputRejected` (CLAUDE.md rule
+/// 22, PRD #1666 part 3 Q15-2).
+pub const INPUT_REJECTED_HISTORY_ONLY: &str = "Input not delivered: session is history-only";
+/// [`input_rejected`]'s words for `exited`.
+pub const INPUT_REJECTED_EXITED: &str = "Input not delivered: the agent has exited";
+/// [`input_rejected`]'s words for `write-failed`: the agent's terminal took
+/// none or only part of it, so it is not reported as the agent exiting.
+pub const INPUT_REJECTED_WRITE_FAILED: &str =
+    "Input not delivered: the agent's terminal did not take it";
+/// [`input_rejected`]'s words for `stale` and `wrong-session`.
+pub const INPUT_REJECTED_SESSION_CHANGED: &str = "Input not delivered: the pane's session changed";
+/// [`input_rejected`]'s words for a refusal that names no reason.
+pub const INPUT_REJECTED_UNNAMED: &str = "Input not delivered";
+
+/// The words for a refusal of typed input whose reason is `reason` (see
+/// [`INPUT_REJECTED_EXITED`]). A reason this deck doesn't know is shown in
+/// brackets after [`INPUT_REJECTED_UNNAMED`], so a newer daemon's reason
+/// still reads as a refusal; the caller makes it safe to display first.
+pub fn input_rejected(reason: &str) -> String {
+    match reason.trim() {
+        "" => INPUT_REJECTED_UNNAMED.to_string(),
+        "history-only" => INPUT_REJECTED_HISTORY_ONLY.to_string(),
+        "exited" => INPUT_REJECTED_EXITED.to_string(),
+        "write-failed" => INPUT_REJECTED_WRITE_FAILED.to_string(),
+        "stale" | "wrong-session" => INPUT_REJECTED_SESSION_CHANGED.to_string(),
+        other => format!("{INPUT_REJECTED_UNNAMED} ({other})"),
+    }
+}
+
 /// PRD #1666 part 3, round 5-wake (Q6): the deck-wide attention item names a
 /// held orchestrator and counts the other held recipients after it
 /// (`· 1 other held`); with no orchestrator held it only counts (`✉ 2 held`).
@@ -1535,6 +1567,29 @@ mod tests {
                 );
             }
         }
+        // Q15-2: a refused input, in the words both clients show.
+        for (reason, expected) in [
+            ("history-only", INPUT_REJECTED_HISTORY_ONLY),
+            ("exited", INPUT_REJECTED_EXITED),
+            ("write-failed", INPUT_REJECTED_WRITE_FAILED),
+            ("stale", INPUT_REJECTED_SESSION_CHANGED),
+            ("wrong-session", INPUT_REJECTED_SESSION_CHANGED),
+            ("", INPUT_REJECTED_UNNAMED),
+        ] {
+            assert_eq!(words["inputRejected"][reason], expected, "{reason:?}");
+            assert_eq!(input_rejected(reason), expected, "{reason:?}");
+        }
+        assert_eq!(
+            words["inputRejected"]
+                .as_object()
+                .map(|reasons| reasons.len()),
+            Some(6),
+            "the fixture lists every refusal the deck names"
+        );
+        assert_eq!(
+            input_rejected("newer-reason"),
+            "Input not delivered (newer-reason)"
+        );
         assert_eq!(
             words["inputHeld"].as_object().map(|causes| causes.len()),
             Some(7)
