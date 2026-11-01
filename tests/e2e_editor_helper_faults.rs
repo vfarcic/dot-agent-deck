@@ -148,6 +148,13 @@ fn probe_067_a_deadline_passing_after_a_ready_poll_skips_the_call() {
     run("ready-past-deadline");
 }
 
+/// Scenario: The seam pauses the helper at every ready poll, and the writer that released its first pause stays open until the helper has opened the pause FIFO for its second, then closes. The helper doesn't take that end of file as a release: it traces `pause-eof`, waits for a byte of its own, and the exchange, the editor's exit 37 and the report then go through, each pause resumed once.
+#[spec("inbox/probe/067")]
+#[test]
+fn probe_067_a_stale_pause_writer_releases_nothing() {
+    run("stale-pause-writer");
+}
+
 /// Scenario: Codex's saved `VISUAL` names the sentinel editor, then a backslash-newline, `--continued`, a comment holding a quote, and `--after` on the next line. The helper splits it as Codex's shlex does, opens the editor with `--continued`, `--after` and the export path, and reports a clean tree.
 #[spec("inbox/probe/067")]
 #[test]

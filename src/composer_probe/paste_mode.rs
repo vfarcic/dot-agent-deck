@@ -130,8 +130,8 @@ impl OutputHook {
     }
 
     /// Test seam: start the count at `fed`, to reach exhaustion with a
-    /// reduced bound.
-    #[cfg(test)]
+    /// reduced bound. The Linux reader's frontier tests are its only users.
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn set_fed(&mut self, fed: u64) {
         self.fed = Some(fed);
     }

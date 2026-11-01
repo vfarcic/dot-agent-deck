@@ -285,6 +285,40 @@ def finish(proc, timeout=8):
         raise AssertionError((CASE, "helper did not exit", trace()))
 
 
+def release(proc, timeout=10):
+    """Write one byte to the pause FIFO once the helper has it open for
+    reading, rather than blocking in open(2) for a reader that never comes:
+    a helper that exited, or a pause that already passed, fails here with
+    the trace instead of hanging the test."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fd = os.open(FIFO, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError as error:
+            if error.errno != errno.ENXIO:
+                raise
+            assert proc.poll() is None, (CASE, "no pause left to release", trace())
+            assert time.monotonic() < deadline, (CASE, "no reader at the pause", trace())
+            time.sleep(0.005)
+            continue
+        try:
+            os.write(fd, b"x")
+        finally:
+            os.close(fd)
+        return
+
+
+def holds_fifo(pid):
+    """Whether process `pid` has the pause FIFO open."""
+    for fd in os.listdir(f"/proc/{pid}/fd"):
+        try:
+            if os.readlink(f"/proc/{pid}/fd/{fd}") == str(FIFO):
+                return True
+        except OSError:
+            pass
+    return False
+
+
 def read_master(fd):
     result = b""
     while select.select([fd], [], [], 0.05)[0]:
@@ -484,8 +518,7 @@ elif CASE == "ready-past-deadline":
             if pauses > released:
                 if any(e.startswith("t0 ") for _, e in rows):
                     break
-                with open(FIFO, "wb") as fifo:
-                    fifo.write(b"x")
+                release(proc)
                 released += 1
             assert proc.poll() is None and time.monotonic() < deadline, (CASE, rows)
             time.sleep(0.005)
@@ -493,8 +526,7 @@ elif CASE == "ready-past-deadline":
         start = t0()
         while mono_ns() < start + D_NS + 300_000_000:
             time.sleep(0.02)
-        with open(FIFO, "wb") as fifo:
-            fifo.write(b"x")
+        release(proc)
 
     rc, peer = pipe_row(extra, post_read_to_eof, during=hold_ready_past_deadline)
     assert rc == 37, rc
@@ -509,6 +541,56 @@ elif CASE == "ready-past-deadline":
     assert "report unsent" in after, rows
     end, _ = event_ns("exit")
     assert end - held < 200_000_000, ("exit follows release at once", end - held)
+elif CASE == "stale-pause-writer":
+    # The CI hang of `ready-past-deadline` (run 41255067763): the writer that
+    # released one pause was still open when the helper opened the FIFO for
+    # its next, so that open succeeded at once and the writer's close read as
+    # end of file. The seam took that as a release, with no byte written.
+    # Here the first pause's writer is held open until the helper holds the
+    # FIFO for its second pause, then closed: the second pause must wait for
+    # a byte of its own.
+    os.mkfifo(FIFO)
+    extra = {"DOT_AGENT_DECK_E2E_HELPER_PAUSE": str(FIFO),
+             "DOT_AGENT_DECK_E2E_HELPER_PAUSE_AT": "ready"}
+
+    BYTE_AT = []
+
+    def count(name):
+        return sum(1 for _, e in trace() if e == name)
+
+    def stale_then_release(proc):
+        wait_event("pause ready")
+        fd = os.open(FIFO, os.O_WRONLY)
+        os.write(fd, b"x")
+        deadline = time.monotonic() + 10
+        while not (count("pause ready") >= 2 and holds_fifo(proc.pid)):
+            assert proc.poll() is None and time.monotonic() < deadline, (CASE, trace())
+            time.sleep(0.005)
+        os.close(fd)
+        wait_event("pause-eof ready", timeout=5)
+        time.sleep(0.3)
+        assert count("resume ready") == 1, ("the second pause passed on end of file", trace())
+        BYTE_AT.append(mono_ns())
+        release(proc)
+        # The rest of the exchange and the report: each pause released once,
+        # counted, since a helper blocked opening the FIFO holds no
+        # descriptor yet.
+        released = 2
+        while proc.poll() is None:
+            if count("pause ready") > released:
+                release(proc)
+                released += 1
+            time.sleep(0.005)
+
+    rc, peer = pipe_row(extra, post_read_to_eof, during=stale_then_release)
+    assert rc == 37, rc
+    rows = trace()
+    assert sum(1 for _, e in rows if e == "pause-eof ready") == 1, rows
+    pauses = sum(1 for _, e in rows if e == "pause ready")
+    assert pauses >= 3 and pauses == sum(1 for _, e in rows if e == "resume ready"), rows
+    second = [ns for ns, e in rows if e == "resume ready"][1]
+    assert second > BYTE_AT[0], ("the second pause resumed on its own byte", second - BYTE_AT[0], rows)
+    assert peer.report.endswith(b"\n"), ("the report still went out", peer.report)
 elif CASE == "continued-command":
     # U2-02: Codex's shlex joins a backslash-newline and drops a comment, so
     # this saved VISUAL opens the editor with two arguments; a quote inside

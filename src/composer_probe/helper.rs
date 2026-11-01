@@ -1536,6 +1536,14 @@ pub mod seam {
         /// Block until the test writes a byte to the pause FIFO, when `at`
         /// is one of the configured points. An interrupted open or read is
         /// retried, and a SIGALRM handled on the way is traced once.
+        ///
+        /// End of file without a byte is not a release: it is the previous
+        /// pause's writer closing after this pause opened the FIFO alongside
+        /// it (its open succeeds at once while that writer is still open).
+        /// Taking it as one let a pause pass with nothing written, and the
+        /// test's next byte then released a later pause early (the CI hang of
+        /// `probe_067_a_deadline_passing_after_a_ready_poll_skips_the_call`).
+        /// The FIFO is opened again and the wait goes on; `pause-eof` is traced.
         pub fn pause(&self, at: Point) {
             let (Some(fifo), true) = (&self.pause, self.pause_at.iter().any(|p| p == at.word()))
             else {
@@ -1549,28 +1557,35 @@ pub mod seam {
                     seams.trace("alarm-handler-ran");
                 }
             };
-            let fd: RawFd = loop {
-                // SAFETY: a NUL-terminated path.
-                let fd = unsafe { libc::open(fifo.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-                if fd >= 0 {
-                    break fd;
-                }
-                note(self);
-                if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-                    return;
-                }
-            };
-            let mut byte = 0u8;
             loop {
-                // SAFETY: the FIFO just opened and one byte of room.
-                let n = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
-                note(self);
-                if n >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                let fd: RawFd = loop {
+                    // SAFETY: a NUL-terminated path.
+                    let fd = unsafe { libc::open(fifo.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+                    if fd >= 0 {
+                        break fd;
+                    }
+                    note(self);
+                    if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                        return;
+                    }
+                };
+                let mut byte = 0u8;
+                let n = loop {
+                    // SAFETY: the FIFO just opened and one byte of room.
+                    let n = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
+                    note(self);
+                    if n >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
+                    {
+                        break n;
+                    }
+                };
+                // SAFETY: the descriptor opened above, closed once.
+                unsafe { libc::close(fd) };
+                if n != 0 {
                     break;
                 }
+                self.trace(&format!("pause-eof {}", at.word()));
             }
-            // SAFETY: the descriptor opened above, closed once.
-            unsafe { libc::close(fd) };
             self.trace(&format!("resume {}", at.word()));
         }
 

@@ -44,11 +44,15 @@
 //! wake.
 
 use super::*;
+#[cfg(target_os = "linux")]
 use crate::composer_probe::framing::Framing;
+#[cfg(target_os = "linux")]
 use crate::composer_probe::gate::{Cutting, Measure};
+#[cfg(target_os = "linux")]
 use crate::composer_probe::segments::Front;
 
 /// Which of the deck's check writes a probe request asks for.
+#[cfg(any(target_os = "linux", feature = "e2e"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProbeAsk {
     First,
@@ -57,6 +61,7 @@ pub(crate) enum ProbeAsk {
 }
 
 /// What a probe request did.
+#[cfg(any(target_os = "linux", feature = "e2e"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProbeOutcome {
     /// Not due by the generation's schedule: nothing was scheduled,
@@ -74,6 +79,7 @@ pub(crate) enum ProbeOutcome {
 }
 
 /// Why the writer refused a probe's job at its arm section.
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProbeRefusal {
     Admission(crate::composer_probe::admission::Refusal),
@@ -82,6 +88,7 @@ pub(crate) enum ProbeRefusal {
 }
 
 /// How a probe's job ended.
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeEnd {
     Written { offset: u64, at: Instant },
@@ -91,6 +98,7 @@ enum ProbeEnd {
 }
 
 /// A probe's job on the writer, from its enqueue to its end.
+#[cfg(target_os = "linux")]
 pub(crate) struct ProbeJob {
     claim: Arc<crate::doorbell_txn::JobClaim>,
     in_flight: Arc<PtyInFlight>,
@@ -101,8 +109,10 @@ pub(crate) struct ProbeJob {
 
 /// What a probe's arm section did, once it ran: the output offset and instant
 /// it closed the fence at, or why it refused.
+#[cfg(target_os = "linux")]
 type SectionOutcome = Arc<Mutex<Option<Result<(u64, Instant), ProbeRefusal>>>>;
 
+#[cfg(target_os = "linux")]
 impl ProbeJob {
     async fn end(mut self) -> ProbeEnd {
         let done = (&mut self.done).await;
@@ -142,12 +152,14 @@ impl ProbeJob {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for ProbeJob {
     fn drop(&mut self) {
         self.reconcile();
     }
 }
 
+#[cfg(target_os = "linux")]
 impl UserFrame {
     /// PRD #1666 part 3 (Q35-20): how far a release may take this held
     /// frame: its last ground point, read from its own acceptance-time
@@ -206,6 +218,7 @@ impl UserFrame {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl PaneWriter {
     /// PRD #1666 part 3 (Q35-20): queue a probe's `0x07` as job `job` under
     /// `claim`, the gate told first so that a person's op accepted before
@@ -385,6 +398,7 @@ impl PaneWriter {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl PtyWriterThread {
     /// [`Self::submit_released`] with a start check and the job's answer
     /// returned (Q35-20's triggers).
@@ -416,6 +430,7 @@ impl PtyWriterThread {
 
 /// PRD #1666 part 3 (Q35-20): an installed generation's release driver. It
 /// ends when the generation retires.
+#[cfg(target_os = "linux")]
 pub(crate) async fn drive_segments(
     writer: Arc<AsyncMutex<PaneWriter>>,
     input: Arc<crate::composer_probe::epoch::GenerationInput>,
@@ -443,7 +458,7 @@ pub(crate) async fn drive_segments(
 /// `scheduled.arrived`, waits up to [`PROBE_GATE_WAIT`] for
 /// `scheduled.release`, and writes `scheduled.timed-out` if that never comes.
 /// It grants no admission and releases nothing.
-#[cfg(feature = "e2e")]
+#[cfg(all(feature = "e2e", target_os = "linux"))]
 fn probe_gate_scheduled() {
     let Some(name) = std::env::var_os("DOT_AGENT_DECK_E2E_PROBE_GATE") else {
         return;
@@ -472,10 +487,11 @@ fn probe_gate_scheduled() {
 
 /// The longest a probe attempt waits for its generation's query-wait
 /// estimate (O5) before it is asked again, rather than refused.
+#[cfg(target_os = "linux")]
 const O5_WAIT: Duration = Duration::from_secs(10);
 
 /// How long the `e2e` build's `scheduled` barrier waits.
-#[cfg(feature = "e2e")]
+#[cfg(all(feature = "e2e", target_os = "linux"))]
 const PROBE_GATE_WAIT: Duration = Duration::from_secs(10);
 
 /// One installed generation's handles for a probe, cloned out of the
@@ -735,7 +751,8 @@ impl AgentPtyRegistry {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    /// No other platform probes: the `e2e` build's request answers that.
+    #[cfg(all(not(target_os = "linux"), feature = "e2e"))]
     pub(crate) async fn composer_probe(
         &self,
         _pane_id: &str,

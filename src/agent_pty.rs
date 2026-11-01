@@ -5731,13 +5731,27 @@ impl Drop for DeckJob {
 enum ByteSource {
     Deck,
     /// PRD #1666 part 3 (Q35-20): a probe's own `0x07`, the deck's, named to
-    /// the epoch as its job's so the probe's settlement can apply.
+    /// the epoch as its job's so the probe's settlement can apply. Linux
+    /// only: no other platform writes a probe.
+    #[cfg(target_os = "linux")]
     Probe(crate::composer_probe::epoch::DeckJobId),
     User,
     /// PRD #1631: a voice answer's keys — recorded as the user's input (they
     /// are the user's answer) without moving the human-input sequence (audit
     /// N1), so the deck's own keys are never mistaken for a human's.
     Answer,
+}
+
+impl ByteSource {
+    /// Whether these are the deck's own bytes rather than a person's.
+    fn is_deck(self) -> bool {
+        match self {
+            ByteSource::Deck => true,
+            #[cfg(target_os = "linux")]
+            ByteSource::Probe(_) => true,
+            ByteSource::User | ByteSource::Answer => false,
+        }
+    }
 }
 
 /// Issue #525: what [`PtyWriterThread`] records into [`PaneInputState`] for the
@@ -5781,7 +5795,9 @@ impl InputRecorder {
         }
         let clears_before = state.user_clears(pane_id);
         match source {
-            ByteSource::Deck | ByteSource::Probe(_) => state.note_deck_bytes(pane_id, accepted),
+            ByteSource::Deck => state.note_deck_bytes(pane_id, accepted),
+            #[cfg(target_os = "linux")]
+            ByteSource::Probe(_) => state.note_deck_bytes(pane_id, accepted),
             ByteSource::User => state.note_user_bytes(pane_id, accepted),
             ByteSource::Answer => state.note_user_bytes_as(pane_id, accepted, false),
         }
@@ -5798,7 +5814,7 @@ impl InputRecorder {
         // intervention; the deck's own never are.
         let telemetry = state.telemetry.clone();
         drop(state);
-        let human = !matches!(source, ByteSource::Deck | ByteSource::Probe(_));
+        let human = !source.is_deck();
         crate::telemetry::observe_pane_input(telemetry, human, pane_id, accepted);
     }
 
@@ -6124,6 +6140,7 @@ impl PtyOp {
         use crate::composer_probe::epoch::Writer;
         let writer = |source: ByteSource| match source {
             ByteSource::Deck => Writer::UnnamedDeck,
+            #[cfg(target_os = "linux")]
             ByteSource::Probe(job) => Writer::Deck(job),
             ByteSource::User => Writer::Human,
             ByteSource::Answer => Writer::Answer,
