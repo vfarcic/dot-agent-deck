@@ -1088,7 +1088,9 @@ fn read_stdin_line_within(wait: std::time::Duration) -> Option<String> {
 /// [`crate::question::ReplyAck`] for what OpenCode's reply API said — and
 /// passes it to the daemon on the held connection, which reports the deck's
 /// answer only once it has it. An answer that cannot be turned into OpenCode's
-/// reply is acknowledged as not taken, and nothing is printed. A missing or
+/// reply is printed as a `{"kind":"refused","detail":…}` line instead, which
+/// the plugin acknowledges as not taken and raises the question again for;
+/// the daemon hears it as not taken either way. A missing or
 /// unreadable acknowledgement is passed on as nothing, which the daemon
 /// reports as unconfirmed.
 fn opencode_await_answer_acked_at(
@@ -1101,6 +1103,10 @@ fn opencode_await_answer_acked_at(
         opencode_hold_acked_at(path, event, &question, &properties, out, ack_line);
     }
 }
+
+/// Why an answer that does not fit its OpenCode question is refused
+/// ([`opencode_hold_acked_at`]).
+const OPENCODE_UNFIT_ANSWER: &str = "the answer could not be turned into OpenCode's reply";
 
 /// [`opencode_await_answer_acked_at`] once the question is built.
 fn opencode_hold_acked_at(
@@ -1118,17 +1124,29 @@ fn opencode_hold_acked_at(
     if reply.answers_for(&question.id).is_none() {
         return;
     }
+    let read_ack = |line: Option<String>| {
+        line.and_then(|line| serde_json::from_str::<crate::question::ReplyAck>(line.trim()).ok())
+    };
     let ack = match crate::question::opencode_reply(question, properties, &reply) {
         Some(line) => {
             let printed = writeln!(out, "{line}").and_then(|()| out.flush()).is_ok();
-            printed.then(ack_line).flatten().and_then(|line| {
-                serde_json::from_str::<crate::question::ReplyAck>(line.trim()).ok()
-            })
+            printed.then(ack_line).and_then(read_ack)
         }
-        None => Some(crate::question::ReplyAck {
-            delivered: false,
-            detail: Some("the answer could not be turned into OpenCode's reply".to_string()),
-        }),
+        // An answer that does not fit its question — typed words for a
+        // number field (review of PR #2060) — is refused like one OpenCode
+        // refused: the plugin is handed the refusal instead of a reply, so it
+        // raises the question again and the deck can be answered anew, and
+        // the daemon hears it as not accepted. Its own refusal stands when
+        // the plugin does not acknowledge.
+        None => {
+            let refusal = crate::question::ReplyAck {
+                delivered: false,
+                detail: Some(OPENCODE_UNFIT_ANSWER.to_string()),
+            };
+            let line = serde_json::json!({"kind": "refused", "detail": OPENCODE_UNFIT_ANSWER});
+            let printed = writeln!(out, "{line}").and_then(|()| out.flush()).is_ok();
+            printed.then(ack_line).and_then(read_ack).or(Some(refusal))
+        }
     };
     if let Some(json) = ack.and_then(|ack| serde_json::to_string(&ack).ok()) {
         let _ = write_request_line(&mut stream, format!("{json}\n").as_bytes());
@@ -6669,6 +6687,77 @@ mod question_tests {
             let (_, acked, printed) = run(silent);
             assert!(!printed.is_empty(), "the reply is still printed");
             assert_eq!(acked, None, "{silent:?}: nothing passed on");
+        }
+    }
+
+    /// Scenario (review of PR #2060): the OpenCode plugin's `await-answer
+    /// --ack` child holds a 2.x form with a number field, and the deck
+    /// answers it with words. The child prints a refusal for the plugin
+    /// rather than a reply, and passes the plugin's not-taken report on to
+    /// the daemon — or its own refusal when the plugin says nothing — so the
+    /// answer is never taken as sent.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_child_refuses_a_form_answer_that_does_not_fit() {
+        use std::io::BufRead as _;
+        let form = serde_json::json!({
+            "id": "frm_n", "sessionID": "ses_2", "title": "How many?",
+            "fields": [{"key": "n", "type": "number", "title": "Retries"}]
+        });
+        let raw = serde_json::json!({
+            "session_id": "ses_2",
+            "event": "question.asked",
+            "properties": {"id": "frm_n", "sessionID": "ses_2", "title": "How many?", "form": form},
+            "cwd": "/work",
+        });
+        let run = |ack: Option<&str>| -> (Option<String>, String) {
+            let (mut event, q, props) = opencode_question_event(&raw.to_string()).unwrap();
+            event.pane_id = Some("pane-oc".into());
+            let reply = QuestionReply::answered(&q.id, resolved(&q, &[(0, &[1], Some("three"))]));
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("hook.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let reply_line = serde_json::to_string(&reply).unwrap();
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut held = String::new();
+                reader.read_line(&mut held).unwrap();
+                writeln!(reader.get_mut(), "{reply_line}").unwrap();
+                let mut acked = String::new();
+                let n = reader.read_line(&mut acked).unwrap();
+                (n > 0).then(|| acked.trim().to_string())
+            });
+            let mut out = Vec::new();
+            let ack = ack.map(str::to_string);
+            opencode_hold_acked_at(&path, event, &q, &props, &mut out, || ack);
+            (server.join().unwrap(), String::from_utf8(out).unwrap())
+        };
+        let not_taken = |acked: Option<String>| {
+            serde_json::from_str::<crate::question::ReplyAck>(&acked.expect("an ack")).unwrap()
+        };
+
+        let (acked, printed) = run(Some(
+            r#"{"delivered":false,"detail":"the answer could not be turned into OpenCode's reply"}"#,
+        ));
+        let printed: Value = serde_json::from_str(printed.trim()).unwrap();
+        assert_eq!(printed["kind"], "refused", "{printed}");
+        assert_eq!(printed["detail"], OPENCODE_UNFIT_ANSWER);
+        assert_eq!(
+            not_taken(acked),
+            crate::question::ReplyAck {
+                delivered: false,
+                detail: Some(OPENCODE_UNFIT_ANSWER.into()),
+            }
+        );
+
+        for silent in [None, Some("not json")] {
+            let (acked, printed) = run(silent);
+            assert!(printed.contains("\"refused\""), "{silent:?}: {printed}");
+            assert!(
+                !not_taken(acked).delivered,
+                "{silent:?}: the child's own refusal is passed on"
+            );
         }
     }
 

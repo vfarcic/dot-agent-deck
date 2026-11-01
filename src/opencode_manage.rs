@@ -480,6 +480,12 @@ const noteResolved = (requestId) => {{
 // (the SDK reports one as `error`, or a response that is not ok, rather than
 // throwing) — which `await-answer --ack` passes to the deck.
 const replyThroughOpenCode = async (client, answer) => {{
+  // An answer `await-answer` could not turn into a reply (typed words for a
+  // number) comes back as a refusal: not taken, so the question is raised
+  // again and can be answered anew.
+  if (answer?.kind === "refused") {{
+    return {{ delivered: false, detail: String(answer.detail ?? "the answer was refused").slice(0, 200) }};
+  }}
   // PRD #2050: on OpenCode 2.x the reply goes through its own API instead
   // (`v2Replier`).
   if (typeof client?.dadReply === "function") {{
@@ -3330,6 +3336,9 @@ const setup = async (api) => {
     };
     const replyToForm = async (answer) => {
       const refused = (detail) => ({ delivered: false, detail: String(detail).slice(0, 200) });
+      // An answer `await-answer` could not turn into the form's reply (typed
+      // words for a number field): not taken, so the form is held again.
+      if (answer?.kind === "refused") return refused(answer.detail ?? "the answer was refused");
       if (answer?.kind !== "form" || typeof answer.request_id !== "string") return refused("the answer is not a form reply");
       const input = { sessionID: answer.body?.sessionID, formID: answer.request_id, answer: answer.body?.answer ?? {} };
       try {
@@ -12300,6 +12309,108 @@ process.exit(0);
         assert_eq!(
             result["sleepers"], 0,
             "the answered form's child was stopped: {result}"
+        );
+    }
+
+    /// Scenario (review of PR #2060): OpenCode 2's TUI half holds a form
+    /// whose number field the user answered with words. `await-answer`
+    /// hands the plugin a refusal instead of a reply; the plugin sends
+    /// OpenCode nothing, acknowledges the answer as not taken with the
+    /// refusal's reason, and holds the form again, so it is pending on the
+    /// deck once more and can be answered anew.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_tui_holds_a_form_again_when_its_answer_is_refused() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let awaits = dir.path().join("awaits.log");
+        let acks = dir.path().join("acks.log");
+        let recorder = dir.path().join("recorder.sh");
+        crate::test_isolation::write_script(
+            &recorder,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "await-answer" ]; then
+  IFS= read -r input
+  printf '%s\n' "$input" >> '{awaits}'
+  if [ ! -e '{awaits}.refused' ]; then
+    : > '{awaits}.refused'
+    printf '%s\n' '{{"kind":"refused","detail":"the answer could not be turned into OpenCode'"'"'s reply"}}'
+    IFS= read -r ack
+    printf '%s\n' "$ack" >> '{acks}'
+    exit 0
+  fi
+  exec sleep 41
+fi
+cat > /dev/null
+exit 0
+"#,
+                awaits = awaits.display(),
+                acks = acks.display(),
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let plugin = dir.path().join("tui.mjs");
+        std::fs::write(&plugin, tui_v2_template(&recorder.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                r#"import {{ readFileSync }} from "fs";
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const replies = [];
+const handlers = new Map();
+const api = {{
+  data: {{
+    session: {{
+      get: (id) => ({{ id }}),
+      root: (id) => id,
+      form: {{ reply: async (input) => {{ replies.push(input); }} }},
+    }},
+    on: (type, fn) => {{ handlers.set(type, fn); return () => handlers.delete(type); }},
+  }},
+  keymap: {{ mode: {{ current: () => "base" }} }},
+  ui: {{ router: {{ current: () => ({{ type: "home" }}), navigate: () => {{}} }} }},
+  client: {{ session: {{ create: async () => ({{ id: "x" }}), prompt: async () => ({{}}) }} }},
+}};
+const {{ default: mod }} = await import("{plugin}");
+const cleanup = await mod.setup(api);
+const emit = (type, data) => handlers.get(type)?.({{ type, data }});
+emit("form.created", {{ form: {{ id: "frm_n", sessionID: "s1", title: "How many?", fields: [{{ key: "n", type: "number" }}] }} }});
+const held = () => {{ try {{ return readFileSync("{awaits}", "utf8").trim().split(String.fromCharCode(10)).length; }} catch (_) {{ return 0; }} }};
+for (let n = 0; n < 250 && held() < 2; n++) await sleep(20);
+cleanup?.();
+console.log(JSON.stringify({{ replies, held: held() }}));
+process.exit(0);
+"#,
+                plugin = plugin.display(),
+                awaits = awaits.display(),
+            ),
+        )
+        .unwrap();
+        let result = run_inbox_driver(&driver);
+        assert_eq!(
+            result["replies"],
+            serde_json::json!([]),
+            "nothing is sent to OpenCode: {result}"
+        );
+        assert_eq!(result["held"], 2, "the form is held again: {result}");
+        let acked = std::fs::read_to_string(&acks).unwrap_or_default();
+        let ack: crate::question::ReplyAck =
+            serde_json::from_str(acked.trim()).unwrap_or_else(|e| panic!("{e}: {acked:?}"));
+        assert_eq!(
+            ack,
+            crate::question::ReplyAck {
+                delivered: false,
+                detail: Some("the answer could not be turned into OpenCode's reply".into()),
+            }
         );
     }
 
