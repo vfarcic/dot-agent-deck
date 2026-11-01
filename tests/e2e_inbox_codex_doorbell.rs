@@ -675,6 +675,13 @@ fn codex_028_a_fresh_codex_is_rung_before_its_first_prompt() {
             .any(|l| l.contains("hook_route=false") && l.contains("staged=true")),
         "rung with no hook route assumed: {attempts:?}"
     );
+    // The fake Codex appends a hook's record only once its `deck hook`
+    // subprocess has returned, and the daemon acknowledges the message while
+    // handling that hook: an acknowledged message does not yet mean a record.
+    assert!(
+        common::wait_until(WAIT, || !codex.hook_events().is_empty()),
+        "no hook record arrived after the acknowledgement"
+    );
     assert_eq!(
         codex.hook_events().first().map(String::as_str),
         Some("UserPromptSubmit"),
