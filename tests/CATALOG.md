@@ -3089,8 +3089,8 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 
 ##### hooks/install/023 — An OpenCode agent a headless daemon starts from a scheduled task loads a plugin pinned to the daemon, even when OpenCode was set up after the daemon started (PRD #190).
 - **Layer:** L2 headless e2e (`tests/e2e_daemon_plugin_refresh.rs`), the real `daemon serve` from `common::spawn_daemon_serve` with a durable `~/.local/bin/dot-agent-deck` in an isolated HOME; no TUI is started.
-- **Agent:** none; a stand-in `opencode` script, run as a scheduled task's command through `RunNow`, records each plugin's `BINARY_PATH` the moment it starts. It answers `--version` with `1.18.35` and exits without recording, because the deck probes `<opencode> --version` before each OpenCode spawn and ahead of the per-spawn install (PRD #2050); a stand-in that recorded on that probe would record the stale pins.
-- **Asserts:** with no OpenCode folder at daemon start, no plugin is written; after both layouts (`~/.config/opencode`, `~/.opencode`) are created holding a plugin pinned to a deleted copy of the deck, the scheduled OpenCode agent finds both plugins pinned to the daemon's `~/.local/bin/dot-agent-deck` as it starts.
+- **Agent:** none; a stand-in `opencode` script, run as a scheduled task's command through `RunNow`, records each plugin's `BINARY_PATH` the moment it starts, or that the plugin is absent. It answers `--version` with `1.18.35` and exits without recording, because the deck probes `<opencode> --version` before each OpenCode spawn and ahead of the per-spawn install (PRD #2050); a stand-in that recorded on that probe would record the stale pins.
+- **Asserts:** with no OpenCode folder at daemon start, no plugin is written; after both layouts (`~/.config/opencode`, `~/.opencode`) are created holding a plugin pinned to a deleted copy of the deck, the scheduled OpenCode agent finds the global root's plugin pinned to the daemon's `~/.local/bin/dot-agent-deck` as it starts, and no deck plugin left in `~/.opencode/plugin/`: since PRD #2050 the deck removes its legacy copy once the global root holds the module.
 - **Does not assert:** a plugin folder the deck cannot write, and the card notice that follows (`inbox/boundary/025`); a plugin pinned to another live install, which is kept (`inbox/boundary/025`); the plugin template's integration level (`inbox/boundary/025`); the daemon's startup install (`hooks/install/009`); Claude Code's hooks, which the daemon installs only when it starts (decision on issue #190); a real OpenCode.
 - **Platform coverage:** mac+linux.
 
@@ -3101,18 +3101,18 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** that a real OpenCode 2.x loads either module (`inbox/opencode/060`); delivery through them (`inbox/opencode/059`); a wrapper command the deck cannot see into; the startup and `hooks install` detection paths.
 - **Platform coverage:** mac+linux.
 
-##### hooks/install/026 — An OpenCode 1.x agent keeps today's layout and gets no `--standalone` (PRD #2050).
+##### hooks/install/026 — An OpenCode 1.x agent gets the same plugin files as a 2.x agent, and no `--standalone` (PRD #2050).
 - **Layer:** as `hooks/install/025`.
 - **Agent:** the same stand-in, answering `--version` with `1.18.35`.
-- **Asserts:** the server module is in both roots and, imported under Node, has a shape OpenCode 1.x loads (a default-exported function, as before PRD #2050, or `{ id, server }`, as the dual-shape module has); there is no 2.x TUI half; the agent's argv carries no `--standalone`. Green before PRD #2050's production change: it guards that the 1.x path stays as it is.
-- **Does not assert:** the 1.x TUI half (`dot-agent-deck-tui.js` and its `tui.json` entry), which the per-spawn install does not own; a real OpenCode 1.x.
+- **Asserts:** the server module is in the global root only (`~/.config/opencode/plugin/dot-agent-deck.js`) and, imported under Node, has a shape OpenCode 1.x loads (a default-exported function, as before PRD #2050, or `{ id, server }`, as the dual-shape module has); there is no deck copy in `~/.opencode/plugin/`, since 1.x loads the global root too; the 2.x TUI half is present, as on 2.x; the agent's argv carries no `--standalone`. So a 1.x spawn sees the same files as a 2.x spawn (`hooks/install/025`) apart from `--standalone`.
+- **Does not assert:** the 1.x TUI half (`dot-agent-deck-tui.js` and its `tui.json` entry), covered by the unit tests `opencode_every_layout_installs_the_same_files` and `opencode_alternating_generations_rewrite_nothing`; a machine with no global root, where 1.x keeps the legacy fan-out until the next install (unit-tested in `opencode_a_legacy_only_machine_converges_on_the_global_root`); a real OpenCode 1.x.
 - **Platform coverage:** mac+linux.
 
-##### hooks/install/027 — Switching OpenCode between 1.x and 2.x repairs the layout on the next spawn (PRD #2050).
+##### hooks/install/027 — Switching OpenCode between 1.x and 2.x rewrites no plugin file, and `--standalone` follows the version (PRD #2050).
 - **Layer:** as `hooks/install/025`, three scheduled tasks fired in turn.
 - **Agent:** the same stand-in, replaced by a new file between spawns (1.x, then 2.x, then 1.x), as an installer replaces the binary, so a version cache keyed on the file sees each change.
-- **Asserts:** each agent starts with its own version's layout as `hooks/install/025`/`026` define it: the upgrade removes the legacy-root copy and adds the 2.x TUI half and `--standalone`; the downgrade restores the server module in both roots and removes the 2.x TUI half and `--standalone`.
-- **Does not assert:** an in-place rewrite of the binary that keeps size, mtime and inode; a version change between two spawns of the same running agent.
+- **Asserts:** each agent starts with the files `hooks/install/025`/`026` define, which are the same for both versions; the server module (`~/.config/opencode/plugin/dot-agent-deck.js`) and the 2.x TUI half keep the same bytes, inode and mtime from the first 1.x spawn through the 2.x spawn and back to 1.x, because OpenCode 2 reloads its plugins whenever the module file changes; `--standalone` is on the 2.x agent's argv once and on neither 1.x agent's.
+- **Does not assert:** the 1.x TUI half and `tui.json` across the switch (unit-tested in `opencode_alternating_generations_rewrite_nothing`); that a real OpenCode 2 reloads on a rewrite; an in-place rewrite of the binary that keeps size, mtime and inode; a version change between two spawns of the same running agent; a daemon of another template revision (`an_older_deck_never_downgrades_a_newer_template`).
 - **Platform coverage:** mac+linux.
 
 #### hooks/stale

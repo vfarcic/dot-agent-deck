@@ -35,8 +35,9 @@ fn pin_line(binary: &Path) -> String {
 /// both layouts (`~/.config/opencode` and `~/.opencode`), each holding a deck
 /// plugin pinned to a copy of the deck that has since been deleted, and fire a
 /// scheduled task whose command is an OpenCode stand-in that records the
-/// plugins' pins the moment it starts. Both plugins must already name the
-/// daemon's own install, not the deleted copy, with no TUI ever started.
+/// plugins' pins the moment it starts. The global root's plugin must already
+/// name the daemon's own install, not the deleted copy, and the legacy copy
+/// must be gone, with no TUI ever started.
 #[spec("hooks/install/023")]
 #[test]
 fn install_023_a_scheduled_opencode_agent_loads_a_plugin_pinned_to_the_daemon() {
@@ -86,13 +87,15 @@ fn install_023_a_scheduled_opencode_agent_loads_a_plugin_pinned_to_the_daemon() 
         std::fs::write(plugin, &stale).expect("seed the stale plugin");
     }
 
-    // A stand-in OpenCode that records what each plugin pins as it starts,
-    // then waits to be reaped with the daemon's process group. It answers
-    // `--version` (as a 1.x OpenCode, the layout this test was written for)
-    // and exits before recording: the deck runs `<opencode> --version` before
-    // each OpenCode spawn, ahead of the per-spawn install (PRD #2050), so a
-    // stand-in that recorded on that probe would record the stale pins, and
-    // one that slept on it would stall the spawn on the probe's bound.
+    // A stand-in OpenCode that records what each plugin pins as it starts
+    // (`<path>:<pin line>`), or `absent=<path>` for a plugin that is not
+    // there, then waits to be reaped with the daemon's process group. It
+    // answers `--version` (as a 1.x OpenCode, the generation this test was
+    // written for; PRD #2050 gives every generation the same files) and exits
+    // before recording: the deck runs `<opencode> --version` before each
+    // OpenCode spawn, ahead of the per-spawn install, so a stand-in that
+    // recorded on that probe would record the stale pins, and one that slept
+    // on it would stall the spawn on the probe's bound.
     let quoted: Vec<_> = plugins
         .iter()
         .map(|plugin| format!("'{}'", plugin.display()))
@@ -100,7 +103,7 @@ fn install_023_a_scheduled_opencode_agent_loads_a_plugin_pinned_to_the_daemon() 
     std::fs::write(
         &standin,
         format!(
-            "#!/bin/sh\ncase \"$1\" in --version|-v) echo '{V1}'; exit 0;; esac\ngrep -H 'BINARY_PATH = ' {plugins} > '{seen}.tmp'\nmv '{seen}.tmp' '{seen}'\nexec sleep 600\n",
+            "#!/bin/sh\ncase \"$1\" in --version|-v) echo '{V1}'; exit 0;; esac\nfor f in {plugins}; do if [ -e \"$f\" ]; then grep -H 'BINARY_PATH = ' \"$f\"; else printf 'absent=%s\\n' \"$f\"; fi; done > '{seen}.tmp'\nmv '{seen}.tmp' '{seen}'\nexec sleep 600\n",
             plugins = quoted.join(" "),
             seen = seen.display(),
         ),
@@ -126,22 +129,34 @@ fn install_023_a_scheduled_opencode_agent_loads_a_plugin_pinned_to_the_daemon() 
             .join("bin")
             .join("dot-agent-deck"),
     );
-    for plugin in &plugins {
-        let line = read
-            .lines()
-            .find(|line| line.starts_with(&format!("{}:", plugin.display())))
-            .unwrap_or_else(|| panic!("no pin recorded for {}:\n{read}", plugin.display()));
-        assert!(
-            line.ends_with(&expected),
-            "the agent loaded {} pinned to something other than the daemon's install \
-             (`{expected}`):\n{read}",
-            plugin.display()
-        );
-    }
+    let [global, legacy] = &plugins[..] else {
+        unreachable!("two roots")
+    };
+    let line = read
+        .lines()
+        .find(|line| line.starts_with(&format!("{}:", global.display())))
+        .unwrap_or_else(|| panic!("no pin recorded for {}:\n{read}", global.display()));
+    assert!(
+        line.ends_with(&expected),
+        "the agent loaded {} pinned to something other than the daemon's install \
+         (`{expected}`):\n{read}",
+        global.display()
+    );
+    // PRD #2050: once the global root holds the module, the deck removes its
+    // legacy copy, which OpenCode 2.x would refuse as a duplicate and 1.x does
+    // not need (it loads the global root too).
+    assert!(
+        read.lines()
+            .any(|line| line == format!("absent={}", legacy.display())),
+        "the agent must start with no deck plugin at {}, now that the global root \
+         holds it; the stand-in saw:\n{read}",
+        legacy.display()
+    );
 }
 
 // ---------------------------------------------------------------------------
-// PRD #2050 — the plugin layout follows the OpenCode version an agent runs.
+// PRD #2050 — every OpenCode version an agent runs gets the same plugin
+// files, and only `--standalone` follows the version.
 //
 // Each test below starts OpenCode agents from scheduled tasks on a headless
 // `daemon serve`, through a stand-in `opencode` that answers `--version` with
@@ -157,7 +172,7 @@ fn install_023_a_scheduled_opencode_agent_loads_a_plugin_pinned_to_the_daemon() 
 const V2: &str = "opencode v2.2.5";
 const V1: &str = "1.18.35";
 
-/// The deck artifacts whose presence the version decides.
+/// The deck artifacts the per-spawn install places (or removes).
 struct Layout {
     /// The server module in the global config root, `~/.config/opencode`.
     global: std::path::PathBuf,
@@ -382,34 +397,42 @@ fn assert_v2_layout(oc: &VersionedOpenCode, record: &[String], when: &str) {
     );
 }
 
-/// The OpenCode 1.x layout as it ships today: the server module in both roots,
-/// no 2.x TUI half, and no `--standalone`.
+/// The OpenCode 1.x agent's files, which since PRD #2050 are the 2.x files
+/// ([`assert_v2_layout`]): the server module in the global root only, in a
+/// shape 1.x loads, no deck copy in the legacy root, the 2.x TUI half present
+/// (2.x's own, which 1.x never reads), and no `--standalone`.
 fn assert_v1_layout(oc: &VersionedOpenCode, record: &[String], when: &str) {
     let layout = &oc.layout;
-    for plugin in [&layout.global, &layout.legacy] {
-        assert!(
-            saw(record, plugin),
-            "{when}: an OpenCode 1.x agent must start with the deck's server module at {}; \
-             the stand-in saw:\n{}",
-            plugin.display(),
-            record.join("\n")
-        );
-        // 1.x loads either shape: a default-exported function (the module as
-        // it shipped before PRD #2050) or `{ id, server }` (1.18.29+, and the
-        // dual-shape module).
-        let export = default_export(plugin);
-        let loadable = export["default"] == "function"
-            || (export["server"] == "function" && export["id"].is_string());
-        assert!(
-            loadable,
-            "{when}: OpenCode 1.x must be able to load {}: {export}",
-            plugin.display()
-        );
-    }
     assert!(
-        !saw(record, &layout.tui_v2),
-        "{when}: no 2.x TUI half on 1.x; the stand-in saw {}",
-        layout.tui_v2.display()
+        saw(record, &layout.global),
+        "{when}: an OpenCode 1.x agent must start with the deck's server module at {}; \
+         the stand-in saw:\n{}",
+        layout.global.display(),
+        record.join("\n")
+    );
+    // 1.x loads either shape: a default-exported function (the module as it
+    // shipped before PRD #2050) or `{ id, server }` (1.18.29+, and the
+    // dual-shape module).
+    let export = default_export(&layout.global);
+    let loadable = export["default"] == "function"
+        || (export["server"] == "function" && export["id"].is_string());
+    assert!(
+        loadable,
+        "{when}: OpenCode 1.x must be able to load {}: {export}",
+        layout.global.display()
+    );
+    assert!(
+        !saw(record, &layout.legacy),
+        "{when}: 1.x loads the global root too, so the deck keeps no copy at {} \
+         (2.x would refuse it as a duplicate); the stand-in saw:\n{}",
+        layout.legacy.display(),
+        record.join("\n")
+    );
+    assert!(
+        saw(record, &layout.tui_v2),
+        "{when}: the 2.x TUI half stays installed on 1.x, so a switch between versions \
+         rewrites nothing; the stand-in saw:\n{}",
+        record.join("\n")
     );
     assert_eq!(
         standalone_count(record),
@@ -418,6 +441,19 @@ fn assert_v1_layout(oc: &VersionedOpenCode, record: &[String], when: &str) {
          the stand-in saw:\n{}",
         record.join("\n")
     );
+}
+
+/// What identifies the file at `path` as the same, unrewritten file: its
+/// bytes, inode and modification time.
+fn file_identity(path: &Path) -> (Vec<u8>, u64, std::time::SystemTime) {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    (
+        bytes,
+        meta.ino(),
+        meta.modified().expect("the platform reports mtime"),
+    )
 }
 
 /// Scenario: Start a headless daemon, then set OpenCode up in both roots and
@@ -436,12 +472,12 @@ fn install_025_an_opencode_2_agent_starts_with_the_2x_layout_and_standalone() {
 
 /// Scenario: Start a headless daemon, then set OpenCode up in both roots and
 /// start an OpenCode agent from a scheduled task whose stand-in `opencode`
-/// reports `1.18.35`. The deck's server module must be in both roots as it is
-/// today, with no 2.x TUI half, and the command line must carry no
-/// `--standalone`.
+/// reports `1.18.35`. The agent must find the same files a 2.x agent does: a
+/// server module 1.x can load in the global root only and the 2.x TUI half,
+/// with no `--standalone` on its command line.
 #[spec("hooks/install/026")]
 #[test]
-fn install_026_an_opencode_1_agent_keeps_todays_layout_and_no_standalone() {
+fn install_026_an_opencode_1_agent_gets_the_same_files_and_no_standalone() {
     let oc = VersionedOpenCode::new(1);
     oc.install(V1);
     let record = oc.spawn(1);
@@ -450,22 +486,50 @@ fn install_026_an_opencode_1_agent_keeps_todays_layout_and_no_standalone() {
 
 /// Scenario: Start an OpenCode agent on a 1.x stand-in, replace the stand-in
 /// with a 2.x one (as an upgrade does) and start another, then go back to 1.x
-/// and start a third. Each agent must find the layout of the version it runs:
-/// the upgrade removes the legacy-root duplicate and adds the 2.x TUI half and
-/// `--standalone`, and the downgrade restores the 1.x layout and drops both.
+/// and start a third. The deck's server module and 2.x TUI half must keep the
+/// same bytes, inode and mtime across all three spawns, since OpenCode 2
+/// reloads its plugins whenever the module file changes, while `--standalone`
+/// appears on the 2.x agent's command line only.
 #[spec("hooks/install/027")]
 #[test]
-fn install_027_switching_opencode_versions_repairs_the_layout_on_the_next_spawn() {
+fn install_027_switching_opencode_versions_rewrites_no_file_and_moves_standalone() {
     let oc = VersionedOpenCode::new(3);
+    let files = [&oc.layout.global, &oc.layout.tui_v2];
+    let identities = || files.map(|path| file_identity(path));
+
     oc.install(V1);
     let first = oc.spawn(1);
     assert_v1_layout(&oc, &first, "before the upgrade (1.x)");
+    let installed = identities();
 
     oc.install(V2);
     let upgraded = oc.spawn(2);
     assert_v2_layout(&oc, &upgraded, "after upgrading to 2.x");
+    let after_upgrade = identities();
 
     oc.install(V1);
     let downgraded = oc.spawn(3);
     assert_v1_layout(&oc, &downgraded, "after going back to 1.x");
+    let after_downgrade = identities();
+
+    for (n, path) in files.iter().enumerate() {
+        for (when, now) in [
+            ("upgrading to 2.x", &after_upgrade[n]),
+            ("going back to 1.x", &after_downgrade[n]),
+        ] {
+            assert!(
+                now.0 == installed[n].0,
+                "{when} changed the bytes of {}; OpenCode 2 reloads its plugins on any \
+                 change to the module",
+                path.display()
+            );
+            assert_eq!(
+                (now.1, now.2),
+                (installed[n].1, installed[n].2),
+                "{when} rewrote {} (inode, mtime) with the same bytes; OpenCode 2 reloads \
+                 its plugins on a rewrite",
+                path.display()
+            );
+        }
+    }
 }
