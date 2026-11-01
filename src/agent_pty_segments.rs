@@ -1271,6 +1271,12 @@ impl AgentPtyRegistry {
     /// PRD #1666 part 3 (Q35-20e): every pane's current generation — the one
     /// its pane hasn't handed over — with what its card shows of held typing,
     /// and when the next timer may change that ([`HeldDisplayPass`]).
+    ///
+    /// Cost (auditor U3-3): each pass takes the registry's lock once and then
+    /// each pane's gate lock and, for the notice, the registry's and the
+    /// pane-input lock again, so a wake costs a few locks per pane. Wakes
+    /// coalesce through the notice; at 64 panes that is cheap. If
+    /// panes grow by an order of magnitude, debounce the passes.
     pub(crate) fn held_display_pass(&self, now: Instant) -> HeldDisplayPass {
         // The gates are read after the registry's lock is let go, as
         // `input_held` reads them.
@@ -1344,6 +1350,15 @@ const HELD_DISPLAY_POLL: Duration = Duration::from_millis(250);
 /// keystroke that ends it.
 const DISCARDED_DISPLAY_POLL: Duration = Duration::from_secs(1);
 
+/// PRD #1666 part 3 (auditor U3-8, R-E-U3-03): how long after a pass a
+/// display notice woke the watcher repeats every pane's word, changed or not.
+/// A client can read a pane's state from a snapshot (a resync's, or the
+/// desktop's list fetch) taken between two of the watcher's passes, which
+/// the watcher never sent and so never corrects by a change; the repeat does.
+/// At most one per this interval, and none while the deck is quiet: an idle
+/// deck still runs no timer.
+pub(crate) const HELD_REPEAT_AFTER: Duration = Duration::from_secs(30);
+
 /// PRD #1666 part 3 (Q35-20e): one read of what every pane's card shows of
 /// held typing ([`AgentPtyRegistry::held_display_pass`]).
 #[derive(Debug, Default)]
@@ -1382,6 +1397,23 @@ impl ShownHeld {
 }
 
 impl HeldDisplayShown {
+    /// The updates `pass` owes clients when the watcher repeats what it
+    /// shows ([`HELD_REPEAT_AFTER`]): what [`Self::changes`] owes, and every
+    /// other pane's current word, whatever it shows, nothing included.
+    pub(crate) fn repeat(&mut self, pass: HeldDisplayPass) -> Vec<crate::event::InputHeldUpdate> {
+        let current = pass.panes.clone();
+        let mut out = self.changes(pass);
+        for update in current {
+            if !out
+                .iter()
+                .any(|sent| sent.pane_id == update.pane_id && sent.agent_id == update.agent_id)
+            {
+                out.push(update);
+            }
+        }
+        out
+    }
+
     /// The updates `pass` owes clients: a pane whose card now shows
     /// something else, and a pane that showed something and has no current
     /// generation now (its last one's, cleared). A generation first seen
@@ -1434,31 +1466,51 @@ impl HeldDisplayShown {
 /// ([`HELD_EXPLAINED_AFTER`], the queue filling, the check moving), when it
 /// ends, and when a generation retired holding typing its successor's card
 /// reports. Waits on the registry's display notice while no timer is due, so
-/// a deck holding nothing runs no timer. Display only: it releases nothing.
+/// a deck holding nothing runs no timer. [`HELD_REPEAT_AFTER`] after a pass a
+/// notice woke, it repeats every pane's word once (auditor U3-8). Display
+/// only: it releases nothing.
 pub async fn watch_input_held(
     registry: Arc<AgentPtyRegistry>,
     event_tx: tokio::sync::broadcast::Sender<crate::event::BroadcastMsg>,
 ) {
     let notify = registry.held_display();
     let mut shown = HeldDisplayShown::default();
+    // On the runtime's clock, which the pass's own instants convert to.
+    let mut repeat_at: Option<tokio::time::Instant> = None;
     loop {
         // Before the pass, so a change made during it leaves a permit.
         let notified = notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
         let pass = registry.held_display_pass(Instant::now());
-        let next = pass.next;
-        for update in shown.changes(pass) {
+        let next = pass.next.map(tokio::time::Instant::from_std);
+        let updates = if repeat_at.is_some_and(|at| at <= tokio::time::Instant::now()) {
+            repeat_at = None;
+            shown.repeat(pass)
+        } else {
+            shown.changes(pass)
+        };
+        for update in updates {
             let _ = event_tx.send(crate::event::BroadcastMsg::InputHeld(update));
         }
-        match next {
+        let wake = match (next, repeat_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let noticed = match wake {
             Some(at) => {
                 tokio::select! {
-                    () = &mut notified => {}
-                    () = tokio::time::sleep_until(at.into()) => {}
+                    () = &mut notified => true,
+                    () = tokio::time::sleep_until(at) => false,
                 }
             }
-            None => notified.await,
+            None => {
+                notified.await;
+                true
+            }
+        };
+        if noticed && repeat_at.is_none() {
+            repeat_at = Some(tokio::time::Instant::now() + HELD_REPEAT_AFTER);
         }
     }
 }
@@ -2143,6 +2195,75 @@ mod tests {
 
     fn pass(panes: Vec<crate::event::InputHeldUpdate>) -> HeldDisplayPass {
         HeldDisplayPass { panes, next: None }
+    }
+
+    /// Scenario: Run the display watcher over a deck with one pane whose card shows nothing, and wake it with a display notice that changes nothing, as a change undone before the watcher's pass leaves it. It sends nothing then; 30 seconds later it repeats the pane's word, so a client that read the undone change from a snapshot is corrected; and it repeats nothing more while the deck stays quiet (auditor U3-8).
+    #[spec("inbox/probe/046")]
+    #[tokio::test(start_paused = true)]
+    async fn probe_046_the_watcher_repeats_every_word_after_activity() {
+        use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+        use tokio::sync::broadcast::error::TryRecvError;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let pane = "probe-046-repeat";
+        let agent = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn a generation");
+        let (tx, mut rx) = tokio::sync::broadcast::channel(64);
+        let watcher = tokio::spawn(watch_input_held(Arc::clone(&registry), tx));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "nothing shows"
+        );
+        registry.held_display().notify_one();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "an unchanged pass sends nothing"
+        );
+        tokio::time::sleep(HELD_REPEAT_AFTER).await;
+        match rx.try_recv() {
+            Ok(crate::event::BroadcastMsg::InputHeld(update)) => assert_eq!(
+                update,
+                crate::event::InputHeldUpdate {
+                    pane_id: pane.into(),
+                    agent_id: agent.clone(),
+                    input_held: None,
+                    input_discarded: None,
+                }
+            ),
+            other => panic!("the watcher must repeat the pane's word: {other:?}"),
+        }
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        tokio::time::sleep(HELD_REPEAT_AFTER * 3).await;
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "a quiet deck repeats nothing more"
+        );
+        watcher.abort();
+        registry.shutdown_all();
+    }
+
+    /// Scenario: Ask the display watcher's change detector for a repeat over two panes, one showing a hold it has announced and one showing nothing. The repeat sends both panes' words, unchanged, once each; a pane whose generation left is cleared as a change would clear it (auditor U3-8).
+    #[spec("inbox/probe/046")]
+    #[test]
+    fn probe_046_a_repeat_sends_every_current_word_once() {
+        let mut shown = HeldDisplayShown::default();
+        let held = update("p", "7", Some(InputHeldCause::Checking), None);
+        let quiet = update("q", "8", None, None);
+        let gone = update("r", "9", Some(InputHeldCause::QueueFull), None);
+        assert_eq!(
+            shown.changes(pass(vec![held.clone(), quiet.clone(), gone.clone()])),
+            vec![held.clone(), gone]
+        );
+        assert_eq!(
+            shown.repeat(pass(vec![held.clone(), quiet.clone()])),
+            vec![update("r", "9", None, None), held, quiet]
+        );
     }
 
     /// Scenario: Feed the display watcher's change detector a sequence of passes over two panes. A generation first seen holding nothing is not announced; a hold, a change of cause and its end are each announced once; counts that move under the same cause are not; a pane whose generation is gone is cleared under that generation; a successor that shows nothing clears its predecessor's hold, and a successor carrying the not-delivered notice is announced.
