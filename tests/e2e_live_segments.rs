@@ -45,7 +45,7 @@ use live::{Fixture, WAIT};
 use serde_json::{Value, json};
 use spec::spec;
 use std::fs;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 ctor::declarative::ctor! {
     // The fixture child is selected by its private environment before libtest
@@ -58,9 +58,10 @@ ctor::declarative::ctor! {
 
 fn wait_span(span: Duration) {
     let start = Instant::now();
-    assert!(common::wait_until(span + Duration::from_secs(1), || start
-        .elapsed()
-        >= span));
+    assert!(common::wait_until(
+        span + common::load_scaled(WAIT),
+        || start.elapsed() >= span
+    ));
 }
 
 fn held_words() -> String {
@@ -798,11 +799,11 @@ fn probe_059_automatic_tick_submits_a_real_probe() {
     );
 }
 
-/// Scenario: Leave a draft and let a physical native Ctrl+G make the first probe refuse, then queue mail and leave the agent idle through the real retry backoff. Without another probe request or a generation reset, the production tick must retry, write one check byte and run its real installed helper.
+/// Scenario: Leave a draft and let a physical native Ctrl+G make the first probe refuse, then queue mail and leave the agent idle through the real retry backoff. Without another probe request or a generation reset, the production tick must reach writer admission after the backoff, write one check byte and run its real installed helper. This relies on today's draft mail hold and must be re-oracled at Q35-21.
 #[spec("inbox/probe/059")]
 #[test]
 fn probe_059_automatic_retry_after_a_due_admission_failure() {
-    let f = Fixture::start("claude");
+    let f = Fixture::with_env("claude", &[("DOT_AGENT_DECK_E2E_PROBE_GATE", "probe-gate")]);
     f.hook_event("session_start");
     f.hook_event("idle");
     f.flag("edit-drop");
@@ -811,25 +812,45 @@ fn probe_059_automatic_retry_after_a_due_admission_failure() {
     // asserts retry submission, not that the new epoch already gates rings.
     human.write("draft\x07");
     f.expect(b"draft\x07");
+    // The failure happens within this request, so its start is a conservative
+    // lower bound; starting after the response would charge IPC time twice.
+    let requested_at = SystemTime::now();
     let first = f.probe();
     assert_eq!(first["composer_probe"]["outcome"], "refused", "{first}");
-    let refused_at = Instant::now();
     assert_eq!(f.page().seg_seq, 0, "a refused check publishes no segment");
+    let root = f.daemon.home.join("probe-gate");
+    fs::create_dir(&root).unwrap();
+    // Record the writer's arrival before its admission check without pausing
+    // it. The marker's event time survives late polling or helper startup.
+    fs::write(root.join("scheduled.release"), "").unwrap();
+    fs::write(root.join("phase"), "scheduled").unwrap();
     f.remove("edit-drop");
     f.enqueue();
     f.stable(b"draft\x07");
     assert!(
         common::wait_until(
-            dot_agent_deck::composer_probe::probe::BACKOFF[0] + WAIT,
-            || { f.path("helper-exited-1").exists() }
+            dot_agent_deck::composer_probe::probe::BACKOFF[0] + common::load_scaled(WAIT),
+            || root.join("scheduled.arrived").exists()
         ),
-        "the automatic retry never ran the helper; input {:?}",
+        "the automatic retry never reached writer admission; input {:?}",
         f.input()
     );
+    let submitted_at = fs::metadata(root.join("scheduled.arrived"))
+        .unwrap()
+        .modified()
+        .unwrap();
     assert!(
-        refused_at.elapsed() >= dot_agent_deck::composer_probe::probe::BACKOFF[0],
-        "automatic retry bypassed the production failure backoff"
+        submitted_at
+            .duration_since(requested_at)
+            .unwrap_or_default()
+            >= dot_agent_deck::composer_probe::probe::BACKOFF[0],
+        "automatic retry bypassed the production failure backoff: request {requested_at:?}, writer arrival {submitted_at:?}"
     );
+    assert!(
+        !root.join("scheduled.timed-out").exists(),
+        "the observation must not delay writer admission"
+    );
+    f.wait("helper-exited-1");
     f.expect(b"draft\x07\x07");
     f.stable(b"draft\x07\x07");
     assert!(
