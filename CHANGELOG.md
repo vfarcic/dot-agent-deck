@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.49.5] - 2026-11-01
+
+### Added
+
+- **OpenCode 2 Support**
+  The deck now works with OpenCode 2 as well as OpenCode 1.x (1.18.29 and later). OpenCode 2 does not load plugins written for 1.x, so before this release an OpenCode 2 agent showed no status, no prompt or tool detail and received no deck messages. An OpenCode 2 agent now gets the same card, deck messages and delegated tasks as a 1.x agent, in the TUI and the desktop app.
+  You do not tell the deck which version you run: the deck installs its plugin so that OpenCode 1.x and 2 both load it, so upgrading OpenCode from 1.x to 2, going back, or running both on one machine needs no manual step. OpenCode 2 has to run with its own server in each pane, so the deck adds `--standalone` when the agent's command runs `opencode` directly. A command that starts OpenCode through a wrapper, such as a script or `devbox run …`, has to add `--standalone` itself, or you can run `opencode service set disabled true` once; declare `agent = "opencode"` on such a role so the deck knows it runs OpenCode.
+  When the deck can tell that an OpenCode agent runs in a way it cannot fully support, the agent's card says what is wrong and what to do, in both clients: OpenCode 2 on its shared background service, a deck plugin that never reported in, or an OpenCode older than 1.18.29. OpenCode 2's question forms can be answered by voice in the desktop app from OpenCode's full interface; forms in `opencode mini`, and forms with questions that depend on earlier answers, are answered in OpenCode, and the card says so. Deck messages reach OpenCode 2's `mini` without disturbing what you were typing (a `mini` agent may not receive them when another OpenCode session starts in the same directory while that mini is starting; start such agents a few seconds apart), and a message that opens a new session from OpenCode 2's home screen carries your unsent text into it.
+  See [OpenCode 1.x and 2.x](https://agent-deck.devopstoolkit.ai/docs/installation.md) and [Troubleshooting](https://agent-deck.devopstoolkit.ai/docs/troubleshooting.md) for each card message and its fix.
+
+### Fixed
+
+- **An Empty or Relative `XDG_CONFIG_HOME` Is Ignored**
+  An `XDG_CONFIG_HOME` that is empty or not an absolute path is now ignored, as the XDG base-directory specification says, and the deck falls back to `~/.config`. Before, an empty value made the OpenCode plugin install write an `opencode` directory into whatever directory the deck was started from, and a relative value put the default schedules file and the daemon's systemd unit relative to the current directory. Set `XDG_CONFIG_HOME` to an absolute path, or leave it unset, to choose where they go.
+  If you ran `dot-agent-deck daemon install` or kept a schedules file while `XDG_CONFIG_HOME` held a relative path, those files are where that path pointed, and the deck now looks under `~/.config` instead: move the schedules file to `~/.config/dot-agent-deck/schedules.toml`, and delete the old unit file by hand. `dot-agent-deck daemon uninstall` says where systemd loads the deck's unit from when that is not the file it removes.
+- **Upgrading the Desktop App Also Upgrades the CLI on This Machine**
+  Upgrading the desktop app from the Dashboard banner's **Upgrade…** or from the rail's upgrade button now also upgrades the `dot-agent-deck` CLI on this machine when that is behind too, as the **Local daemon** section's **Upgrade** already did. Before, those two buttons upgraded only the app, and after the relaunch the app told you that your agents' hooks still ran the older CLI and asked you to upgrade it by hand.
+  The dialog shows the CLI's plan under the app's and asks about each one separately, each with its own **Cancel**. The CLI is upgraded the way it was installed: with `brew upgrade` for Homebrew, on a Mac or on Linux, or with a checked download for a downloaded binary, behind your system's password prompt on Linux, where the system has one, when its folder is not yours to write. When the app cannot upgrade the CLI, such as one installed with Nix, built from source or installed by another system package, the dialog says what to run or do instead. When the only `dot-agent-deck` on the machine is the one inside the app, there is no CLI step. After a relaunch, the app restarts an older daemon on this machine onto the new release, asking first when agents are running.
+
+
+
 ## [0.49.4] - 2026-10-31
 
 ### Fixed

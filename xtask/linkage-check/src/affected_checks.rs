@@ -537,9 +537,12 @@ fn execute(root: &Path, plan: &[Vec<String>], trace: &mut gate_telemetry::RunTra
 /// nothing, and a sandbox command pays a sync.
 pub(crate) const REMOTE_ENV: &str = "DAD_REMOTE_EXEC";
 
-/// `1` leaves the sandbox running after `--run`, for several runs in a row. By
-/// default it is stopped, because a sandbox is billed per second while active,
-/// idle included.
+/// `0` stops the sandbox when `--run` finishes. By default it is left running,
+/// and `.rwx/sandbox.yml`'s `--inactivity-timeout` stops it after five idle
+/// minutes: one unit's coder and tester share their worktree's sandbox, so a
+/// stop at the end of one agent's run killed the command the other was running
+/// in it (2026-10-31: "container does not exist", "cannot exec in a stopped
+/// container"), and every run after a stop started cold.
 pub(crate) const REMOTE_KEEP_ENV: &str = "DAD_REMOTE_EXEC_KEEP";
 
 /// The sandbox definition `rwx sandbox exec` uses, relative to the root.
@@ -769,6 +772,12 @@ pub(crate) fn sandbox_state(listing: Option<(bool, &str)>, config: &str) -> Sand
     }
 }
 
+/// Whether `--run` stops the sandbox it used: only when `DAD_REMOTE_EXEC_KEEP`
+/// says `0` (see [`REMOTE_KEEP_ENV`]).
+pub(crate) fn stops_sandbox(used_sandbox: bool, keep: Option<&str>) -> bool {
+    used_sandbox && keep.is_some_and(|v| v.trim() == "0")
+}
+
 /// Stops this checkout's sandbox. `rwx sandbox stop` has been seen to time out
 /// and leave the sandbox running (2026-10-19), so the listing is checked and
 /// the stop repeated once; a sandbox that is still active after that, or whose
@@ -923,8 +932,7 @@ pub(crate) fn run(root: &Path, args: &[String]) -> ExitCode {
         let used_sandbox = plan
             .iter()
             .any(|c| c.first().map(String::as_str) == Some("rwx"));
-        let keep = std::env::var(REMOTE_KEEP_ENV).is_ok_and(|v| v.trim() == "1");
-        if used_sandbox && !keep {
+        if stops_sandbox(used_sandbox, std::env::var(REMOTE_KEEP_ENV).ok().as_deref()) {
             stop_sandbox(root);
         }
         return send_trace(status, trace);
@@ -1776,6 +1784,16 @@ mod tests {
                 argv(&["cargo", "nextest"])[..]
             );
         }
+    }
+
+    #[test]
+    fn the_sandbox_is_left_running_unless_keep_says_0() {
+        assert!(!stops_sandbox(true, None));
+        assert!(!stops_sandbox(true, Some("1")));
+        assert!(!stops_sandbox(true, Some("")));
+        assert!(stops_sandbox(true, Some("0")));
+        assert!(stops_sandbox(true, Some(" 0\n")));
+        assert!(!stops_sandbox(false, Some("0")));
     }
 
     #[test]

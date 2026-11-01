@@ -133,9 +133,10 @@ fn status_blocked_022_real_claude_api_failure_ends_error_not_thinking() {
     assert_error_card(&viewer, name);
 }
 
-/// Scenario: Start a genuine interactive OpenCode session with an unsupported
-/// model, submit one prompt, and observe the real plugin's session.error as an
-/// Error event and Error card. The non-quota failure must not show Blocked.
+/// Scenario: Start a genuine interactive OpenCode session whose provider rejects
+/// the turn (an unsupported model on 1.x, a rejected API key on 2.x), submit
+/// one prompt, and observe the real plugin's error as an Error event and Error
+/// card. The non-quota failure must not show Blocked.
 #[spec("status/blocked/023")]
 #[test]
 fn status_blocked_023_real_opencode_api_error_is_forwarded_not_blocked() {
@@ -144,12 +145,6 @@ fn status_blocked_023_real_opencode_api_error_is_forwarded_not_blocked() {
     let viewer = TuiDeck::builder()
         .with_pty_size(120, 40)
         .with_imported_opencode_credentials()
-        // Issue #2044: a config dir whose tui.json lists a plugin (the deck's)
-        // makes OpenCode npm-install @opencode-ai/plugin into it before its
-        // first frame. In this fresh HOME that is a registry download that
-        // overran the prompt wait. The deck's plugins import no SDK, and
-        // OpenCode logs a failed install and carries on, so fail it at once.
-        .with_env("npm_config_offline", "true")
         .launch_with_fixture("minimal");
     viewer.wait_for_string("No active agents");
     let control = attached_control(&viewer);
@@ -157,14 +152,41 @@ fn status_blocked_023_real_opencode_api_error_is_forwarded_not_blocked() {
 
     let events = viewer.subscribe_events();
     let name = "opencode-err";
-    let agent_id = start_agent(
-        &control,
-        &viewer,
-        name,
-        "opencode --model openai/gpt-5.4-mini",
+    // An unsupported model is the error this test provokes on 1.x. OpenCode
+    // 2.x's top-level `opencode` takes no `--model`, so on 2.x the model goes
+    // in the scratch HOME's `opencode.json` (PRD #2050,
+    // `common::opencode_interactive_command`) — and there 2.x does not fail on
+    // a model it cannot use: it answered the turn (measured on 2.2.5). So on
+    // 2.x the provider is handed a key it rejects, which fails the turn with
+    // a non-quota `provider.auth` 401 (measured: `finish: "error"`, idle
+    // outcome `failed`) and spends nothing. The deck forwards no
+    // `OPENAI_API_KEY` to a pane (`INHERIT_PASS`).
+    const UNSUPPORTED: &str = "openai/gpt-5.4-mini";
+    let command = if common::opencode_test_is_v2() {
+        std::fs::write(
+            viewer.home_dir().join(".config/opencode/opencode.json"),
+            serde_json::json!({
+                "model": UNSUPPORTED,
+                "provider": {"openai": {"options": {"apiKey": "sk-rejected-status-blocked-023"}}},
+            })
+            .to_string(),
+        )
+        .expect("point the scratch OpenCode config at the unsupported model");
+        common::opencode_interactive_command(false, false, "")
+    } else {
+        format!("opencode --model {UNSUPPORTED}")
+    };
+    let agent_id = start_agent(&control, &viewer, name, &command);
+    let composer_wait = std::time::Instant::now();
+    let composer = control.wait_for_grid_string_within("Ask anything", Duration::from_secs(45))
+        && control
+            .wait_for_grid_string_within(common::OPENCODE_SUBMIT_READY, Duration::from_secs(45));
+    eprintln!(
+        "OpenCode composer ready={composer} after {:?}",
+        composer_wait.elapsed()
     );
     assert!(
-        control.wait_for_grid_string_within("Ask anything", Duration::from_secs(45)),
+        composer,
         "real OpenCode did not reach its prompt:\n{}",
         control.snapshot_grid()
     );

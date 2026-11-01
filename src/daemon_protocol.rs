@@ -11484,6 +11484,7 @@ mod tests {
             display_name: None,
             shell_synthetic_working: false,
             native_hooks_reported: false,
+            last_native_hook_at: None,
             orchestration_orphaned: false,
             subagent_wait: None,
             output_set_status: false,

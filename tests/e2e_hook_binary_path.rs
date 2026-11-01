@@ -128,6 +128,17 @@ fn opencode_binary_path(js: &str) -> Option<String> {
     serde_json::from_str::<String>(literal).ok()
 }
 
+/// The OpenCode server module under each config root the deck may write it
+/// to for this file's HOME: the XDG root (`XDG_CONFIG_HOME` is pinned to
+/// `~/.config` by [`launch_with_home`]) and the legacy `~/.opencode`.
+fn opencode_plugin_files(home: &Path) -> [PathBuf; 2] {
+    [
+        home.join(".config").join("opencode"),
+        home.join(".opencode"),
+    ]
+    .map(|root| root.join("plugin").join("dot-agent-deck.js"))
+}
+
 /// Every directory on `path_value` that actually holds a `dot-agent-deck`. Used
 /// as an explicit pre-flight so neither test can pass because the host's own
 /// installed deck leaked in through an inherited `PATH`.
@@ -315,30 +326,35 @@ fn install_004_durable_path_is_written_not_the_build_artifact() {
     // The OpenCode integration is a GENERATED JAVASCRIPT file, not JSON — the
     // shape difference PRD #381 blames for it being the last of the three to be
     // noticed, so it is checked through its own parse rather than the JSON one.
-    let plugin = home
-        .join(".opencode")
-        .join("plugin")
-        .join("dot-agent-deck.js");
-    match read_if_present(&plugin) {
-        None => problems.push(format!(
-            "OpenCode plugin: absent at {} — `~/.opencode/` was seeded, so the installer \
-             should have written",
-            plugin.display()
-        )),
-        Some(body) => {
-            match opencode_binary_path(&body) {
-                Some(binary_path) if binary_path == durable => {}
-                Some(binary_path) => problems.push(format!(
-                    "OpenCode plugin: BINARY_PATH is `{binary_path}`, not the durable \
-                     executable `{durable}`"
-                )),
-                None => problems.push(format!(
-                    "OpenCode plugin: no `const BINARY_PATH = \"…\";` in {}",
-                    plugin.display()
-                )),
-            }
-            problems.extend(build_artifact_problems("OpenCode plugin", &body));
+    // PRD #2050: the module may sit in either root. The first install on a
+    // legacy-only HOME writes `~/.opencode` and creates the XDG root for the
+    // TUI half; a later install moves the module there and removes the legacy
+    // copy. Every copy present is checked, and at least one must exist.
+    let plugins = opencode_plugin_files(&home);
+    let present: Vec<(PathBuf, String)> = plugins
+        .iter()
+        .filter_map(|plugin| read_if_present(plugin).map(|body| (plugin.clone(), body)))
+        .collect();
+    if present.is_empty() {
+        problems.push(format!(
+            "OpenCode plugin: absent at {plugins:?} — `~/.opencode/` was seeded, so the \
+             installer should have written"
+        ));
+    }
+    for (plugin, body) in &present {
+        match opencode_binary_path(body) {
+            Some(binary_path) if binary_path == durable => {}
+            Some(binary_path) => problems.push(format!(
+                "OpenCode plugin {}: BINARY_PATH is `{binary_path}`, not the durable \
+                 executable `{durable}`",
+                plugin.display()
+            )),
+            None => problems.push(format!(
+                "OpenCode plugin: no `const BINARY_PATH = \"…\";` in {}",
+                plugin.display()
+            )),
         }
+        problems.extend(build_artifact_problems("OpenCode plugin", body));
     }
 
     assert_no_problems(&problems);
@@ -403,17 +419,15 @@ fn install_005_refuses_to_write_when_no_durable_path_exists() {
         ));
     }
 
-    let plugin = home
-        .join(".opencode")
-        .join("plugin")
-        .join("dot-agent-deck.js");
-    if let Some(body) = read_if_present(&plugin) {
-        problems.push(format!(
-            "OpenCode plugin: written at {} with no durable path available; BINARY_PATH = \
-             {:?}",
-            plugin.display(),
-            opencode_binary_path(&body)
-        ));
+    for plugin in opencode_plugin_files(&home) {
+        if let Some(body) = read_if_present(&plugin) {
+            problems.push(format!(
+                "OpenCode plugin: written at {} with no durable path available; \
+                 BINARY_PATH = {:?}",
+                plugin.display(),
+                opencode_binary_path(&body)
+            ));
+        }
     }
 
     assert_no_problems(&problems);

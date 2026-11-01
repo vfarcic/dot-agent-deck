@@ -244,8 +244,8 @@ fn seeds(deck: &TuiDeck, work: &Path, kind: &str, deadline: Instant, doorbell_on
             "exec claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read Write".into()
         }
         "opencode" => format!(
-            "exec opencode --model {} --auto",
-            common::opencode_test_model()
+            "exec {}",
+            common::opencode_interactive_command(false, true, "")
         ),
         "pi" => format!("exec pi {} --approve", common::pi_test_model().cli_args()),
         "codex" => format!(
@@ -255,11 +255,11 @@ fn seeds(deck: &TuiDeck, work: &Path, kind: &str, deadline: Instant, doorbell_on
         _ => unreachable!(),
     };
     let phase = format!("{kind}-seed");
-    let path = format!(
+    let path = common::path_with_opencode_test_bin(&format!(
         "{}:{}",
         deck.home_dir().join(".local/bin").display(),
         std::env::var("PATH").unwrap()
-    );
+    ));
     let reply = inbox::attach(
         deck,
         json!({"op":"start-agent", "command":common::capability_export_command(&command),

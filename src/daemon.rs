@@ -1071,6 +1071,17 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         })
     };
 
+    // PRD #2050: unconditional — how an OpenCode agent runs is read from its
+    // pane's process tree, and its card says when the deck cannot fully
+    // support that. Idle unless an OpenCode agent runs.
+    let opencode_mode_handle = {
+        let registry = pty_registry.clone();
+        let monitor_state = state.clone();
+        tokio::spawn(async move {
+            crate::opencode_mode::run_monitor(registry, monitor_state).await;
+        })
+    };
+
     // PRD #1401: unconditional — every agent on a branch with a pull request
     // gets a badge, and this is the only place that answer comes from. It runs
     // `gh` only for a live session on a non-default branch of a GitHub
@@ -1116,6 +1127,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     }
     shell_activity_handle.abort();
     codex_rollout_handle.abort();
+    opencode_mode_handle.abort();
     pull_request_handle.abort();
     scheduler_handle.abort();
     inbox_ticker.abort();
@@ -5042,6 +5054,12 @@ struct ProcessLookups {
     parent_of: fn(u32) -> Option<u32>,
     executable_of: fn(u32) -> Option<std::path::PathBuf>,
     started: fn(u32) -> Option<u64>,
+    /// A process's arguments, read only for one an OpenCode receiver names
+    /// ([`opencode_server_client`]).
+    arguments_of: fn(u32) -> Option<Vec<String>>,
+    /// Whether a process's stdin and stdout are both sockets, as an OpenCode
+    /// 2 private server's are ([`opencode_server_client`]).
+    stdio_is_sockets: fn(u32) -> bool,
 }
 
 /// This platform's process table.
@@ -5050,6 +5068,8 @@ const PLATFORM_LOOKUPS: ProcessLookups = ProcessLookups {
     parent_of: crate::platform::proc::parent_pid_of,
     executable_of: crate::platform::proc::executable_of,
     started: crate::platform::proc::process_start_of,
+    arguments_of: crate::opencode_mode::arguments_of,
+    stdio_is_sockets: crate::opencode_mode::stdio_is_sockets,
 };
 
 /// Whether the connecting process `peer` may use, for `used_as`, the token of
@@ -5080,10 +5100,97 @@ fn admit_inbox_component_with(
         lookups.parent_of,
         lookups.executable_of,
     )?;
+    let admitted = match (used_as, admitted) {
+        (ComponentUse::Receiver, Some(instance)) => Some(opencode_server_client(
+            instance,
+            root,
+            lookups.descends,
+            lookups.parent_of,
+            lookups.executable_of,
+            lookups.arguments_of,
+            lookups.stdio_is_sockets,
+        )),
+        (_, admitted) => admitted,
+    };
     if let Some(peer) = peer {
         still_the_accepted_peer(peer, lookups.started, evidence)?;
     }
     Ok(admitted)
+}
+
+/// PRD #2050, audit F3: the process an OpenCode 2 receiver is pinned by.
+///
+/// On OpenCode 1.x the deck's server plugin runs in a worker thread of the
+/// process that draws the TUI, so the TUI plugin's stream and the server
+/// plugin's announce and doorbell-only stream all name one process, and the
+/// first to arrive pins the instance the others share. On 2.x a standalone
+/// client (`opencode --standalone`, or `mini`) runs its server as a CHILD,
+/// `opencode serve --stdio --port 0` (measured on 2.2.5), so the two halves
+/// name two processes, and whichever arrived first left the other refused for
+/// the whole generation. So `instance` resolves to its parent when it is that
+/// private server: an OpenCode executable whose arguments are `serve …
+/// --stdio`, whose direct parent runs the very same executable. It is part of
+/// the agent the way a hook shell is ([`receiver_instance`]), so both halves
+/// pin the client, as on 1.x.
+///
+/// The pin's protection is kept: the resolution moves a process to its own
+/// client and no further, and only one step. What it enforces, and nothing
+/// more:
+///
+/// - `instance` runs an OpenCode executable
+///   ([`crate::opencode_mode::exe_is_opencode`], so one replaced in place
+///   since it started, `…/opencode (deleted)`, still counts) whose arguments
+///   carry the tokens `serve` and `--stdio`;
+/// - on Linux, its stdin and stdout are both sockets, as a private server's
+///   are (measured on 2.2.5: a socketpair with its client). This is a
+///   heuristic: a process a tool starts can have sockets on both too
+///   (measured in audit N5: `Bun.spawn` and `node:child_process.spawn` with
+///   `"pipe"` stdio, under the Bun runtimes of 2.2.5 and 1.19.5), so a tool's
+///   piped child passes it ([`crate::opencode_mode::stdio_is_sockets`]). Off
+///   Linux this is not checked;
+/// - its direct parent runs the very same executable and is not above the
+///   agent's own process `root` ([`admit_component`]).
+///
+/// When any of that fails, or cannot be read, `instance` stands. On 2.x the
+/// barrier is the parentage: on 2.2.5 a tool's commands run under the
+/// private server, not the client (measured), so a nested OpenCode a tool
+/// starts resolves at most to the pane's private server, which is not the
+/// pinned client, and the hub's pin refuses it. On 1.x, where tools run in
+/// the client, the socket check is all that stands, and a tool's piped child
+/// passes it; that is a process the agent itself runs (audit D1's accepted
+/// scope).
+fn opencode_server_client(
+    instance: u32,
+    root: Option<u32>,
+    descends: impl Fn(u32, u32) -> Option<bool>,
+    parent_of: impl Fn(u32) -> Option<u32>,
+    executable_of: impl Fn(u32) -> Option<std::path::PathBuf>,
+    arguments_of: impl Fn(u32) -> Option<Vec<String>>,
+    stdio_is_sockets: impl Fn(u32) -> bool,
+) -> u32 {
+    let Some(exe) = executable_of(instance) else {
+        return instance;
+    };
+    if !crate::opencode_mode::exe_is_opencode(&exe) {
+        return instance;
+    }
+    let private_server =
+        arguments_of(instance).is_some_and(|argv| crate::opencode_mode::serves_stdio(&argv));
+    if !private_server || !stdio_is_sockets(instance) {
+        return instance;
+    }
+    let Some(client) = parent_of(instance).filter(|&parent| parent > 1) else {
+        return instance;
+    };
+    if executable_of(client).as_deref() != Some(exe.as_path()) {
+        return instance;
+    }
+    if let Some(root) = root.filter(|&root| root != client)
+        && descends(root, client) != Some(false)
+    {
+        return instance;
+    }
+    client
 }
 
 /// PR #1735 third review (F2): whether `peer.pid` still names the process
@@ -12772,6 +12879,8 @@ mod hook_ingestion_tests {
                 12 => Some(2000),
                 _ => None,
             },
+            arguments_of: |_| None,
+            stdio_is_sockets: |_| true,
         };
         let admit = |peer, claimed, used_as, evidence| {
             admit_inbox_component_with(peer, claimed, Some(10), used_as, evidence, &lookups)
@@ -12847,6 +12956,271 @@ mod hook_ingestion_tests {
             .is_err(),
             "a start time that cannot be read now refuses where evidence is required"
         );
+    }
+
+    /// PRD #2050, audit N2: the OpenCode binary a pane runs was replaced in
+    /// place while it ran (`opencode upgrade`), so Linux reports both its
+    /// client's and its private server's executable as `…/opencode
+    /// (deleted)`. The server plugin's receiver still resolves to the client,
+    /// as it did before the replacement; a `serve --stdio` under a replaced
+    /// binary of another name still stands as named.
+    #[test]
+    fn a_replaced_opencode_binarys_private_server_still_resolves_to_its_client() {
+        let replaced = "/home/u/.opencode/bin/opencode (deleted)";
+        let exe_of = |client: &'static str| {
+            move |pid: u32| match pid {
+                10 => Some(std::path::PathBuf::from(client)),
+                11 => Some(std::path::PathBuf::from(client)),
+                _ => None,
+            }
+        };
+        let server_args = |_: u32| {
+            Some(
+                ["/home/u/.opencode/bin/opencode", "serve", "--stdio"]
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect(),
+            )
+        };
+        let parent = |pid: u32| (pid == 11).then_some(10);
+        let resolved = opencode_server_client(
+            11,
+            Some(9),
+            // The agent root, 9, is the client's parent, not below it.
+            |_, _| Some(false),
+            parent,
+            exe_of(replaced),
+            server_args,
+            |_| true,
+        );
+        assert_eq!(
+            resolved, 10,
+            "the replaced binary's server names its client"
+        );
+        let other = opencode_server_client(
+            11,
+            Some(9),
+            // The agent root, 9, is the client's parent, not below it.
+            |_, _| Some(false),
+            parent,
+            exe_of("/usr/bin/node (deleted)"),
+            server_args,
+            |_| true,
+        );
+        assert_eq!(other, 11, "a replaced binary of another name stands");
+    }
+
+    /// PRD #2050, audit F3: OpenCode 2's two halves pin one receiver. The
+    /// standalone client draws the TUI and runs its TUI plugin; its private
+    /// server, a direct child running the same executable as `serve --stdio`
+    /// (measured on 2.2.5), runs the server plugin. A receiver either names
+    /// resolves to the client, in either order, so the hub's first-come pin
+    /// holds both. A nested OpenCode a tool starts resolves to its own client,
+    /// which the pin refuses; a `serve --stdio` whose stdio is not sockets,
+    /// other OpenCode subcommands, a parent running another executable and a
+    /// client above the agent stand as named.
+    #[test]
+    fn opencode_2s_private_server_resolves_to_its_client_as_the_receiver() {
+        // 1 ── 9 sh (the pane's wrapper, the agent root)
+        //        └── 10 opencode --standalone (client)
+        //              ├── 11 opencode serve --stdio ── 12 CLI (server plugin's watcher)
+        //              │     └── 14 bash (a tool) ── 15 opencode (nested client)
+        //              │                               └── 16 opencode serve --stdio ── 17 CLI
+        //              ├── 13 CLI (TUI half's watcher)
+        //              ├── 18 opencode run ── 19 CLI
+        //              └── 40 opencode serve --stdio (a tool's exec, on pipes) ── 41 CLI
+        // 1 ── 30 node ── 31 opencode serve --stdio ── 32 CLI (parent not OpenCode)
+        let lookups = ProcessLookups {
+            descends: |pid, root| {
+                crate::platform::proc::descends_from_with(pid, root, |pid| match pid {
+                    9 | 30 => Some(1),
+                    10 => Some(9),
+                    11 | 13 | 18 | 40 => Some(10),
+                    12 | 14 => Some(11),
+                    15 => Some(14),
+                    16 => Some(15),
+                    17 => Some(16),
+                    19 => Some(18),
+                    31 => Some(30),
+                    32 => Some(31),
+                    41 => Some(40),
+                    _ => None,
+                })
+            },
+            parent_of: |pid| match pid {
+                9 | 30 => Some(1),
+                10 => Some(9),
+                11 | 13 | 18 | 40 => Some(10),
+                12 | 14 => Some(11),
+                15 => Some(14),
+                16 => Some(15),
+                17 => Some(16),
+                19 => Some(18),
+                31 => Some(30),
+                32 => Some(31),
+                41 => Some(40),
+                _ => None,
+            },
+            executable_of: |pid| {
+                let exe = match pid {
+                    9 => "/bin/sh",
+                    14 => "/bin/bash",
+                    10 | 11 | 15 | 16 | 18 | 31 | 40 => "/home/u/.opencode/bin/opencode",
+                    12 | 13 | 17 | 19 | 32 | 41 => "/opt/dot-agent-deck",
+                    30 => "/usr/bin/node",
+                    _ => return None,
+                };
+                Some(std::path::PathBuf::from(exe))
+            },
+            started: |_| Some(1),
+            arguments_of: |pid| {
+                let argv: &[&str] = match pid {
+                    10 => &["opencode", "--standalone"],
+                    11 | 16 | 31 => &[
+                        "/home/u/.opencode/bin/opencode",
+                        "serve",
+                        "--stdio",
+                        "--port",
+                        "0",
+                    ],
+                    15 => &["opencode"],
+                    18 => &["opencode", "run", "hi"],
+                    40 => &["opencode", "serve", "--stdio"],
+                    _ => return None,
+                };
+                Some(argv.iter().map(|a| a.to_string()).collect())
+            },
+            // Pid 40 is `exec opencode serve --stdio` from a tool the client
+            // ran (OpenCode 1.x runs tools in its client): the tool's pipes.
+            stdio_is_sockets: |pid| pid != 40,
+        };
+        let receiver = |peer: u32, claimed: u32, root: u32| {
+            admit_inbox_component_with(
+                Some(AcceptedPeer {
+                    pid: peer,
+                    started: Some(1),
+                    same_user: Some(true),
+                }),
+                Some(claimed),
+                Some(root),
+                ComponentUse::Receiver,
+                Evidence::Required,
+                &lookups,
+            )
+        };
+        assert_eq!(
+            receiver(12, 11, 9),
+            Ok(Some(10)),
+            "the server plugin names the client"
+        );
+        assert_eq!(receiver(13, 10, 9), Ok(Some(10)), "as the TUI half does");
+        assert_eq!(
+            receiver(12, 11, 10),
+            Ok(Some(10)),
+            "with the client as the agent root"
+        );
+        assert_eq!(
+            receiver(17, 16, 9),
+            Ok(Some(15)),
+            "a nested OpenCode's server names its own client, never the pane's"
+        );
+        assert_eq!(
+            receiver(19, 18, 9),
+            Ok(Some(18)),
+            "another subcommand stands"
+        );
+        assert_eq!(
+            receiver(41, 40, 9),
+            Ok(Some(40)),
+            "a `serve --stdio` a tool exec'd under the client, on the tool's pipes, stands"
+        );
+        assert_eq!(
+            receiver(32, 31, 30),
+            Ok(Some(31)),
+            "a parent of another kind stands"
+        );
+        assert_eq!(
+            receiver(12, 11, 11),
+            Ok(Some(11)),
+            "a client above the agent's own process is never the receiver"
+        );
+        assert_eq!(
+            admit_inbox_component_with(
+                Some(AcceptedPeer {
+                    pid: 12,
+                    started: Some(1),
+                    same_user: Some(true),
+                }),
+                None,
+                Some(9),
+                ComponentUse::Cli,
+                Evidence::Required,
+                &lookups,
+            ),
+            Ok(None),
+            "a CLI verb names no receiver to resolve"
+        );
+        let unreadable = ProcessLookups {
+            arguments_of: |_| None,
+            ..lookups
+        };
+        assert_eq!(
+            admit_inbox_component_with(
+                Some(AcceptedPeer {
+                    pid: 12,
+                    started: Some(1),
+                    same_user: Some(true),
+                }),
+                Some(11),
+                Some(9),
+                ComponentUse::Receiver,
+                Evidence::Required,
+                &unreadable,
+            ),
+            Ok(Some(11)),
+            "arguments that cannot be read leave the named instance"
+        );
+
+        // Both orders through the hub: the two halves share the pin, and the
+        // nested OpenCode is refused.
+        for server_first in [true, false] {
+            let hub = crate::inbox_hub::InboxHub::new(
+                crate::deck_identity::DeckId::parse("k3xzq2ab").unwrap(),
+                crate::inbox::InboxLimits::default(),
+                std::time::Duration::from_secs(30),
+            );
+            let server = receiver(12, 11, 9).unwrap();
+            let tui = receiver(13, 10, 9).unwrap();
+            let order = if server_first {
+                [server, tui]
+            } else {
+                [tui, server]
+            };
+            for instance in order {
+                assert_eq!(
+                    hub.announce(
+                        "p",
+                        "a",
+                        crate::event::InboxWake::Native,
+                        crate::event::InboxComponent::OpenCodePlugin,
+                        instance,
+                    ),
+                    Ok(()),
+                    "server_first={server_first}"
+                );
+            }
+            assert_eq!(
+                hub.announce(
+                    "p",
+                    "a",
+                    crate::event::InboxWake::Native,
+                    crate::event::InboxComponent::OpenCodePlugin,
+                    receiver(17, 16, 9).unwrap(),
+                ),
+                Err(crate::inbox_hub::ArmError::OtherInstance),
+                "server_first={server_first}"
+            );
+        }
     }
 
     /// The real process table: this test process reads its own start time, the

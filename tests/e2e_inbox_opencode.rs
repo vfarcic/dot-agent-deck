@@ -142,7 +142,7 @@ impl OpenCode {
         let pool = config["offerPool"].as_str();
         let delay = config["publishDelayMs"].as_str();
         let mut start = json!({"op":"start-agent","command":command,"cwd":daemon.home,
-            "agent_type":"opencode","rows":40,"cols":140,
+            "agent_type":"open_code","rows":40,"cols":140,
             "env":[["DOT_AGENT_DECK_PANE_ID","opencode-fixture"],["PATH",path]],"display_name":"opencode fixture"});
         if let Some(ms) = delay {
             start["env"]
@@ -2257,5 +2257,214 @@ fn opencode_052_a_cancelled_tasks_commit_survives_its_watcher_killed_mid_publish
         read.iter()
             .all(|line| !line.contains("\"caps\"") && !line.contains("\"commit\":\"")),
         "a cap reached the plugin: {read:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PRD #2050 — delivery to an OpenCode 2.x pane through the installed 2.x
+// halves, in `fixtures/opencode-inbox/api-v2.mjs`'s fake 2.x host.
+// ---------------------------------------------------------------------------
+
+/// A stand-in `opencode` that answers `--version` like OpenCode 2.2.5, first on
+/// the installer's and the daemon's `PATH`, so the deck installs for 2.x.
+fn opencode_2_standin(home: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = home.join("oc2-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let standin = bin.join("opencode");
+    std::fs::write(
+        &standin,
+        "#!/bin/sh\ncase \"$1\" in --version|-v) echo 'opencode v2.2.5'; exit 0;; esac\nexec sleep 600\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&standin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+struct OpenCode2 {
+    pane: Pane,
+    daemon: common::DaemonProc,
+    base: PathBuf,
+    // Last, so the daemon goes before the stand-in it may still be running.
+    _scratch: tempfile::TempDir,
+}
+
+impl OpenCode2 {
+    fn new(route: &str, config: Value) -> Self {
+        let scratch = common::harness_tempdir().unwrap();
+        let stub_dir = opencode_2_standin(scratch.path());
+        let path = format!("{}:{}", stub_dir.display(), std::env::var("PATH").unwrap());
+        let daemon = daemon(&[("PATH", path.as_str())]);
+        let installed = daemon.home.join(".local/bin/dot-agent-deck");
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        if !installed.exists()
+            && std::fs::hard_link(env!("CARGO_BIN_EXE_dot-agent-deck"), &installed).is_err()
+        {
+            std::fs::copy(env!("CARGO_BIN_EXE_dot-agent-deck"), &installed).unwrap();
+        }
+        let root = daemon.home.join(".config/opencode");
+        std::fs::create_dir_all(&root).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+            .env_clear()
+            .env("HOME", &daemon.home)
+            .env("PATH", &path)
+            .env("XDG_CONFIG_HOME", daemon.home.join(".config"))
+            .env("DOT_AGENT_DECK_TEST_CONFIG_WRITE", "1")
+            .env("DOT_AGENT_DECK_TEST_CONFIG_ROOT", &daemon.home)
+            .args(["hooks", "install", "--agent", "opencode"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "installer: {output:?}");
+        let server = root.join("plugin/dot-agent-deck.js");
+        let tui = root.join("plugins/dot-agent-deck-tui/tui.js");
+        for (half, file) in [("server module", &server), ("2.x TUI half", &tui)] {
+            assert!(
+                file.is_file(),
+                "`hooks install --agent opencode` with OpenCode 2.x on PATH must write the {half} \
+                 at {}; the installer said: {}{}",
+                file.display(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        // Loaded as ES modules beside the originals, so any relative import
+        // they make still resolves.
+        let server_module = server.with_extension("fixture.mjs");
+        let tui_module = tui.with_extension("fixture.mjs");
+        std::fs::copy(&server, &server_module).unwrap();
+        std::fs::copy(&tui, &tui_module).unwrap();
+        let driver = daemon.home.join("api-v2.mjs");
+        std::fs::write(&driver, include_str!("fixtures/opencode-inbox/api-v2.mjs")).unwrap();
+        let base = daemon.home.join("opencode2-fixture");
+        std::fs::write(base.with_extension("config"), config.to_string()).unwrap();
+        let command = common::capability_export_command(&format!(
+            "exec node '{}' '{}' '{}' '{}' '{route}'",
+            driver.display(),
+            server_module.display(),
+            tui_module.display(),
+            base.display()
+        ));
+        let reply = attach(
+            &daemon,
+            json!({"op":"start-agent","command":command,"cwd":daemon.home,
+                "agent_type":"open_code","rows":40,"cols":140,
+                "env":[["DOT_AGENT_DECK_PANE_ID","opencode2-fixture"],["PATH",path]],
+                "display_name":"opencode 2 fixture"}),
+        );
+        assert_eq!(reply["ok"], true, "plugin host: {reply}");
+        let agent = reply["id"].as_str().unwrap().to_string();
+        let token = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(common::recorded_hook_capability(&daemon.home, &agent))
+            .unwrap();
+        let op = Self {
+            pane: Pane {
+                id: "opencode2-fixture".into(),
+                agent,
+                token,
+                pid: 0,
+                capture: base.with_extension("bytes"),
+                attach_socket: daemon.attach_socket.clone(),
+            },
+            daemon,
+            base,
+            _scratch: scratch,
+        };
+        assert!(
+            common::wait_until(WAIT, || op.events().iter().any(|e| e["kind"] == "ready")),
+            "both installed 2.x halves must set up in the 2.x host; events={}\nPane:{}",
+            op.diagnostics(),
+            screen(&op.daemon, &op.pane)
+        );
+        op
+    }
+    fn events(&self) -> Vec<Value> {
+        std::fs::read_to_string(self.base.with_extension("events"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+    /// The host's log without the noisy stdin/stdout lines, for failures.
+    fn diagnostics(&self) -> String {
+        self.events()
+            .into_iter()
+            .filter(|e| !matches!(e["kind"].as_str(), Some("stdin" | "stdout")))
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    fn prompts(&self) -> Vec<Value> {
+        self.events()
+            .into_iter()
+            .filter(|e| e["kind"] == "prompt")
+            .collect()
+    }
+    fn control(&self, value: Value) {
+        writeln!(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.base.with_extension("control"))
+                .unwrap(),
+            "{value}"
+        )
+        .unwrap();
+    }
+}
+
+/// Scenario: Install the deck's OpenCode plugins with a 2.x `opencode` on PATH,
+/// load both installed 2.x halves in a fake OpenCode 2.x host showing an idle
+/// session, and post one inbox message to that pane. The message must be
+/// prompted once into the shown session through OpenCode 2.x's session API
+/// without touching the composer, and must read acknowledged once the
+/// session's turn for it runs and goes idle.
+#[spec("inbox/opencode/059")]
+#[test]
+fn opencode_059_an_opencode_2_pane_receives_an_inbox_message_through_its_2x_plugin() {
+    let op = OpenCode2::new("session", json!({}));
+    armed(&op.daemon, &op.pane, 1);
+    let id = enqueue(&op.daemon, &op.pane, BODY);
+    assert!(
+        common::wait_until(WAIT, || op.prompts().len() == 1),
+        "the message must be prompted into OpenCode 2.x; host log:\n{}",
+        op.diagnostics()
+    );
+    let prompt = op.prompts().remove(0);
+    let request = &prompt["request"];
+    assert_eq!(
+        request["sessionID"], "shown",
+        "into the shown session: {prompt}"
+    );
+    let text = request["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("[dot-agent-deck message m-") && text.contains(BODY),
+        "the prompt carries the framed message: {prompt}"
+    );
+    let inbox_id = {
+        let user = || {
+            op.events()
+                .into_iter()
+                .find(|e| e["kind"] == "user-message")
+                .and_then(|e| e["id"].as_str().map(str::to_owned))
+        };
+        assert!(
+            common::wait_until(WAIT, || user().is_some()),
+            "the host queued the prompt; host log:\n{}",
+            op.diagnostics()
+        );
+        user().unwrap()
+    };
+    op.control(json!({"finish": inbox_id}));
+    state(&op.daemon, &op.pane, &id, "acknowledged");
+    assert!(
+        !common::wait_until(Duration::from_millis(1500), || op.prompts().len() != 1),
+        "an acknowledged message is never prompted again; host log:\n{}",
+        op.diagnostics()
+    );
+    assert!(
+        !op.events().iter().any(|e| e["kind"] == "COMPOSER-TOUCHED"),
+        "delivery must never type into the composer; host log:\n{}",
+        op.diagnostics()
     );
 }

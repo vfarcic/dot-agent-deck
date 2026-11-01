@@ -151,6 +151,10 @@ pub(super) struct Floor {
     /// by this instant the card says it has not connected yet.
     pub(super) arm_by: Option<Instant>,
     pub(super) registered: bool,
+    /// PRD #2050: when the integration last registered, so a check for a
+    /// running agent's integration counts a registration from that agent's
+    /// current process and not one from before it restarted.
+    pub(super) registered_at: Option<Instant>,
     /// The capability probe proved the agent's CLI lacks the flag.
     pub(super) cli_too_old: bool,
     /// A registration declared a missing or lower integration.
@@ -567,6 +571,7 @@ pub(super) fn register(
     if registrant == Registrant::Integration {
         let floor = st.receipts.floors.entry(key.clone()).or_default();
         floor.registered = true;
+        floor.registered_at = Some(now);
         floor.adapter_too_old = false;
         floor.hooks_too_old = false;
         floor.hooks_too_old_agent = None;
@@ -2027,6 +2032,8 @@ pub(super) fn notices(st: &HubState, key: &AgentKey, now: Instant) -> InboxCardN
             .get(key)
             .filter(|_| super::has_waiting_mail(&st.inbox, &key.0, &key.1))
             .map(|episode| episode.code.clone()),
+        // PRD #2050: set by the daemon whatever the generation's inbox holds.
+        agent_notice: st.agent_notices.get(key).cloned(),
         ..InboxCardNotices::default()
     };
     let Some(generation) = st.receipts.gens.get(key) else {

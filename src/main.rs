@@ -4144,6 +4144,10 @@ async fn run_daemon_serve_cli(
     let restart_control = Arc::new(dot_agent_deck::daemon_restart::RestartControl::new(
         dot_agent_deck::daemon_restart::InstallRecord::capture(),
     ));
+    // PRD #2050 (auditor M2): likewise this binary's file identity, which the
+    // OpenCode plugin install compares with the file at its pin to tell an
+    // older daemon still running after an upgrade from a rolled-back deck.
+    dot_agent_deck::opencode_manage::note_own_executable();
     let refresh_state = state.clone();
     let daemon = Daemon::with_attach(state, attach_path.clone())
         .with_restart_control(restart_control.clone());

@@ -28,20 +28,17 @@ pub struct OpenCode {
     diagnostics: PathBuf,
     observer_stop: Arc<AtomicBool>,
     observer: Option<std::thread::JoinHandle<()>>,
+    mini: bool,
 }
 
+/// The binary `DOT_AGENT_DECK_OPENCODE_TEST_BIN` picks answers `--version`
+/// (PRD #2050: the same binary, and so the same major version, every command
+/// line below is built for).
 pub fn available() -> Result<(), String> {
     common::install_credential_redaction();
-    let result = Command::new("opencode")
-        .arg("--version")
-        .current_dir(std::env::temp_dir())
-        .output()
-        .map_err(|e| format!("OpenCode unavailable: {e}"))?;
-    if result.status.success() {
-        Ok(())
-    } else {
-        Err("OpenCode --version failed".into())
-    }
+    common::opencode_test_version()
+        .map(|_| ())
+        .map_err(|e| format!("OpenCode unavailable: {e}"))
 }
 
 impl OpenCode {
@@ -74,11 +71,11 @@ impl OpenCode {
         {
             std::fs::copy(common::contained_deck_binary(), &installed).unwrap();
         }
-        let path = format!(
+        let path = common::path_with_opencode_test_bin(&format!(
             "{}:{}",
             installed.parent().unwrap().display(),
             std::env::var("PATH").unwrap()
-        );
+        ));
         let mut install = Self::command(&deck, "dot-agent-deck");
         install.args(["hooks", "install", "--agent", "opencode"]);
         let output = install.output().unwrap();
@@ -86,9 +83,32 @@ impl OpenCode {
         let root = deck.home_dir().join(".config/opencode");
         if !watcher {
             std::fs::write(root.join("tui.json"), "{}").unwrap();
+            // OpenCode 2.x reads no `tui.json` entry: its TUI half is a
+            // `plugins/<name>/` directory (PRD #2050).
+            let _ = std::fs::remove_dir_all(root.join("plugins/dot-agent-deck-tui"));
         }
         // Observe the actual route and expose navigation for the child-view
         // precondition. This fixture neither delivers nor acknowledges tasks.
+        // OpenCode 2.x loads a TUI plugin only from `plugins/<name>/tui.js`
+        // exporting `{ id, setup }`, and names routes `{type, sessionID}`; the
+        // observer maps that back to 1.x's `{name, params}` so every reader of
+        // the route file stays version-blind (PRD #2050).
+        if common::opencode_test_is_v2() {
+            let dir = root.join("plugins/deck-test-route");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("tui.js"), r#"import {readFileSync,writeFileSync,renameSync,unlinkSync} from 'node:fs';
+export default {id:'deck-test-route',setup:async(api)=>{
+ const base=process.env.DECK_TEST_ROUTE;
+ const timer=setInterval(()=>{try{
+  const r=api.ui.router.current();
+  const route=r.type==='session'?{name:'session',params:{sessionID:r.sessionID}}:{name:r.type,params:r.data??{}};
+  writeFileSync(base+'.tmp',JSON.stringify({route,pid:process.pid}));renameSync(base+'.tmp',base);
+  try {const id=readFileSync(base+'.navigate','utf8');unlinkSync(base+'.navigate');api.ui.router.navigate({type:'session',sessionID:id});}catch{}
+ }catch{}},100);
+ return ()=>clearInterval(timer);
+}};
+"#).unwrap();
+        }
         let observer = root.join("test-route-observer.js");
         std::fs::write(&observer, r#"import {readFileSync,writeFileSync,renameSync,unlinkSync} from 'node:fs';
 export default {id:'deck-test-route',tui:async(api)=>{
@@ -113,14 +133,10 @@ export default {id:'deck-test-route',tui:async(api)=>{
         std::fs::write(config_path, config.to_string()).unwrap();
         for _ in 0..older {
             let output = Self::command(&deck, "timeout")
-                .args([
-                    "120",
-                    "opencode",
-                    "run",
-                    "--model",
-                    common::opencode_test_model(),
+                .args(["120", "opencode"])
+                .args(common::opencode_run_args(
                     "Reply with only the number equal to 800 plus 31. Do not use tools.",
-                ])
+                ))
                 .output()
                 .unwrap();
             assert!(
@@ -145,11 +161,7 @@ export default {id:'deck-test-route',tui:async(api)=>{
             deck.workdir().into(),
             work.clone(),
         );
-        let command = format!(
-            "opencode --model {} --auto {}",
-            common::opencode_test_model(),
-            if mini { "--mini" } else { "" }
-        );
+        let command = common::opencode_interactive_command(mini, true, "");
         let command = if launcher {
             let script = work.join("run-worker.sh");
             std::fs::write(&script, format!("#!/bin/sh\nexec {command}\n")).unwrap();
@@ -184,8 +196,21 @@ export default {id:'deck-test-route',tui:async(api)=>{
                 deck.workdir().join("opencode-route.json")
             ]
         ]);
-        // Start through the same public attach operation desktop clients use.
-        let mut worker = json!({"op":"start-agent","command":role_command,"cwd":work,"agent_type":"opencode","rows":40,"cols":140,"env":extra,"display_name":"coder","tab_membership":{"kind":"orchestration","name":"opencode-inbox","role_name":"coder","role_index":1,"is_start_role":false,"orchestration_cwd":work,"orchestration_id":"opencode-inbox-test"}});
+        // Start through the same public attach operation desktop clients use,
+        // declared OpenCode in the wire spelling (`open_code`): `AgentType` has a
+        // `#[serde(other)]` catch-all, so `"opencode"` would be accepted and
+        // silently read as no agent at all, and the deck would neither refresh
+        // the integration and probe the version for this spawn nor watch the
+        // pane for its card notices.
+        //
+        // Except without the TUI watcher: a declared OpenCode spawn reinstalls
+        // the TUI half this fixture just removed (the per-spawn refresh), so that
+        // case stays undeclared, which is how a wrapper the deck cannot see into
+        // starts OpenCode.
+        let mut worker = json!({"op":"start-agent","command":role_command,"cwd":work,"rows":40,"cols":140,"env":extra,"display_name":"coder","tab_membership":{"kind":"orchestration","name":"opencode-inbox","role_name":"coder","role_index":1,"is_start_role":false,"orchestration_cwd":work,"orchestration_id":"opencode-inbox-test"}});
+        if watcher {
+            worker["agent_type"] = json!("open_code");
+        }
         worker["env"]
             .as_array_mut()
             .unwrap()
@@ -262,8 +287,19 @@ export default {id:'deck-test-route',tui:async(api)=>{
             diagnostics,
             observer_stop,
             observer: Some(observer),
+            mini,
         };
         result.wait_screen("Ask anything");
+        // Case-blind: 1.x `--mini` prints its mode line as ` BUILD `.
+        assert!(
+            common::wait_until(BUDGET, || result
+                .screen()
+                .to_lowercase()
+                .contains(&common::OPENCODE_SUBMIT_READY.to_lowercase())),
+            "OpenCode must show its mode line ({:?}) before a prompt is typed; {}",
+            common::OPENCODE_SUBMIT_READY,
+            result.evidence()
+        );
         result
             .startup
             .trace
@@ -304,11 +340,11 @@ export default {id:'deck-test-route',tui:async(api)=>{
             .env("HOME", deck.home_dir())
             .env(
                 "PATH",
-                format!(
+                common::path_with_opencode_test_bin(&format!(
                     "{}:{}",
                     deck.home_dir().join(".local/bin").display(),
                     std::env::var("PATH").unwrap()
-                ),
+                )),
             )
             .env("XDG_CONFIG_HOME", deck.home_dir().join(".config"))
             .env("XDG_DATA_HOME", deck.home_dir().join(".local/share"))
@@ -421,7 +457,17 @@ export default {id:'deck-test-route',tui:async(api)=>{
     }
     pub fn prompt(&self, text: &str) {
         let mut input = self.input(text);
-        self.wait_screen(text);
+        // A prompt longer than the composer is wide wraps across its rows
+        // (inbox/opencode/060's sentinel path does at 140 columns), so a plain
+        // substring check of the screen never finds it.
+        assert!(
+            common::wait_until(BUDGET, || {
+                let shown = self.screen();
+                shown.contains(text) || composer::composer_has_prompt(&shown, text)
+            }),
+            "OpenCode's composer must show {text:?}; {}",
+            self.evidence()
+        );
         input.write("\r");
     }
     pub fn prior(&self) {
@@ -438,7 +484,7 @@ export default {id:'deck-test-route',tui:async(api)=>{
     }
     pub fn interrupted_cancellable_wait(&self) -> Value {
         let before = self.log().len();
-        let prompt = "Run sleep 30 once in the shell as a disposable, cancellable wait while I prepare your next task. If the wait finishes without interruption, reply only with the concatenation of PRIME-INTERRUPT- and 022, with no spaces. This request lasts only until I interrupt you. An interrupt cancels the wait and completes this request: do not restart it, send a follow-up answer, or carry it into the next task. After interruption, handle the next instruction normally.";
+        let prompt = "Run sleep 30 once in the shell, in the foreground and not in the background, as a disposable, cancellable wait while I prepare your next task. If the wait finishes without interruption, reply only with the concatenation of PRIME-INTERRUPT- and 022, with no spaces. This request lasts only until I interrupt you. An interrupt cancels the wait and completes this request: do not restart it, send a follow-up answer, or carry it into the next task. After interruption, handle the next instruction normally.";
         let mut priming_input = self.input(prompt);
         assert!(
             common::wait_until(BUDGET, || composer::composer_has_prompt(
@@ -469,24 +515,45 @@ export default {id:'deck-test-route',tui:async(api)=>{
             self.evidence()
         );
         let running_call = std::cell::RefCell::new(Value::Null);
+        let backgrounded = std::cell::RefCell::new(Value::Null);
+        let found = common::wait_until(BUDGET, || {
+            let transcript = self.transcript();
+            // OpenCode 2's shell tool takes a `background` option, which
+            // ends the turn at once; the wait this precondition needs is
+            // then never running when the interrupt goes in.
+            if let Some(call) = transcript["part"].as_array().unwrap().iter().find(|p| {
+                p["data"]["type"] == "tool"
+                    && p["data"]["state"]["input"]["command"] == "sleep 30"
+                    && p["data"]["state"]["input"]["background"] == true
+            }) {
+                *backgrounded.borrow_mut() = call.clone();
+                return true;
+            }
+            let call = transcript["part"].as_array().unwrap().iter().find(|p| {
+                p["data"]["type"] == "tool"
+                    && p["data"]["tool"] == "bash"
+                    && p["data"]["state"]["status"] == "running"
+                    && p["data"]["state"]["input"]["command"] == "sleep 30"
+            });
+            let Some(call) = call else { return false };
+            if !composer::sleep_tool_visible(&self.screen())
+                || !composer::sleep_tool_visible(&self.deck.snapshot_grid())
+            {
+                return false;
+            }
+            *running_call.borrow_mut() = call.clone();
+            true
+        });
+        let backgrounded = backgrounded.into_inner();
         assert!(
-            common::wait_until(BUDGET, || {
-                let transcript = self.transcript();
-                let call = transcript["part"].as_array().unwrap().iter().find(|p| {
-                    p["data"]["type"] == "tool"
-                        && p["data"]["tool"] == "bash"
-                        && p["data"]["state"]["status"] == "running"
-                        && p["data"]["state"]["input"]["command"] == "sleep 30"
-                });
-                let Some(call) = call else { return false };
-                if !composer::sleep_tool_visible(&self.screen())
-                    || !composer::sleep_tool_visible(&self.deck.snapshot_grid())
-                {
-                    return false;
-                }
-                *running_call.borrow_mut() = call.clone();
-                true
-            }),
+            backgrounded.is_null(),
+            "precondition: the model ran the priming `sleep 30` in the BACKGROUND despite the \
+             prompt asking for the foreground, so its turn ended at once and there is no running \
+             wait to interrupt (a model flake in setup, before any deck delivery): {backgrounded}; {}",
+            self.evidence()
+        );
+        assert!(
+            found,
             "cancellable bash sleep 30 must be running and visible in both views before interrupt; {}",
             self.evidence()
         );
@@ -665,12 +732,19 @@ export default {id:'deck-test-route',tui:async(api)=>{
             "this delivery must assemble its token in a completed tool result; {}",
             self.evidence()
         );
-        self.wait_screen(token);
-        assert!(
-            self.deck.wait_for_grid_string_within(token, BUDGET),
-            "execution token must be visible in attached deck; {}",
-            self.evidence()
-        );
+        // OpenCode 2.x mini's default display preset hides tool calls and shell
+        // output (`tools: "hide", shell_output: "hide"`, read from 2.2.5), so the
+        // token cannot reach its screen whatever the deck does. The user's
+        // default display is kept; the completed tool result above is what
+        // proves the execution there.
+        if !(self.mini && common::opencode_test_is_v2()) {
+            self.wait_screen(token);
+            assert!(
+                self.deck.wait_for_grid_string_within(token, BUDGET),
+                "execution token must be visible in attached deck; {}",
+                self.evidence()
+            );
+        }
         inbox::state(&self.deck, &self.pane, id, "acknowledged");
         let listing = inbox::listing(&self.deck, &self.pane);
         let message = listing["messages"]
@@ -854,30 +928,15 @@ export default {id:'deck-test-route',tui:async(api)=>{
             .and_then(|s| serde_json::from_slice(&s).ok())
             .unwrap_or(Value::Null)
     }
+    /// OpenCode's own record of every session, as `session`, `message` and
+    /// `part` arrays in OpenCode 1.x's shape, whichever major wrote it.
     pub fn transcript(&self) -> Value {
-        let script = r#"import json,sqlite3,sys
-c=sqlite3.connect(sys.argv[1]);c.row_factory=sqlite3.Row
-out={}
-for table in ('session','message','part'):
- rows=[]
- for row in c.execute('select * from '+table):
-  r=dict(row)
-  if 'data' in r:r['data']=json.loads(r['data'])
-  rows.append(r)
- out[table]=rows
-print(json.dumps(out))
-"#;
-        let output = Command::new("python3")
-            .args(["-c", script])
-            .arg(
-                self.deck
-                    .home_dir()
-                    .join(".local/share/opencode/opencode.db"),
-            )
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "transcript: {output:?}");
-        serde_json::from_slice(&output.stdout).unwrap()
+        transcript_of(
+            &self
+                .deck
+                .home_dir()
+                .join(".local/share/opencode/opencode.db"),
+        )
     }
     pub fn roots(&self) -> Vec<Value> {
         self.transcript()["session"]
@@ -954,6 +1013,95 @@ impl Drop for OpenCode {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.save_diagnostics()));
         eprintln!("OpenCode run diagnostics: {}", self.diagnostics.display());
     }
+}
+
+/// Read OpenCode's database at `db` into `session`, `message` and `part`
+/// arrays shaped as OpenCode 1.x stores them, so the readers above stay
+/// version-blind (PRD #2050).
+///
+/// OpenCode 1.x keeps exactly those tables. 2.x has none of them: it keeps
+/// `session_v2`, and `session_message` rows whose `type` is the role (`user`,
+/// `assistant`, plus bookkeeping rows such as `idle`) with the user's text in
+/// `data.text` and an assistant's parts inline in `data.content`. Measured on
+/// 2.2.5 in a throwaway HOME: `session_part` stayed empty through a turn with
+/// a subagent and a running `sleep`, a running tool is written into its
+/// message as `state.status: "running"` and rewritten when it completes, the
+/// shell tool is named `shell` with its output in `state.content[].text`, and
+/// no row links an assistant message to the user message it answers. So the
+/// 2.x rows are mapped: `type` becomes `data.role`; an assistant's `parentID`
+/// is the latest user message before it in its session by `seq`; `shell`
+/// becomes `bash` with its text output as `state.output`; a model
+/// `{id, providerID}` gains 1.x's `modelID`; and a user message, which
+/// carries no model on 2.x, takes the model of the first reply to it, else
+/// its session's. The raw 2.x tables stay in the output for diagnostics.
+///
+/// A missing database or table reads as empty rather than failing:
+/// `evidence()` reads this on every failure, and a panic here would hide the
+/// assertion that failed.
+pub fn transcript_of(db: &std::path::Path) -> Value {
+    let script = r#"import json,os,sqlite3,sys
+out={'session':[],'message':[],'part':[]}
+if not os.path.exists(sys.argv[1]):
+ print(json.dumps(out));sys.exit(0)
+c=sqlite3.connect(sys.argv[1]);c.row_factory=sqlite3.Row
+def load(v):
+ if isinstance(v,str):
+  try:return json.loads(v)
+  except ValueError:pass
+ return v
+have={r[0] for r in c.execute("select name from sqlite_master where type='table'")}
+for table in ('session','message','part','session_v2','session_message','session_part'):
+ if table not in have: continue
+ rows=[]
+ for row in c.execute('select * from '+table):
+  r=dict(row)
+  for k in ('data','model'):
+   if k in r: r[k]=load(r[k])
+  rows.append(r)
+ out[table]=rows
+def model(m):
+ if not isinstance(m,dict): return m
+ m=dict(m);m.setdefault('modelID',m.get('id'));return m
+if 'session_v2' in have and 'session' not in have:
+ out['session']=[dict(s) for s in out['session_v2']]
+ by_session={s['id']:model(s.get('model')) for s in out['session_v2']}
+ rows=sorted((m for m in out.get('session_message',[]) if m['type'] in ('user','assistant')),key=lambda m:(m['session_id'],m['seq']))
+ last_user={};messages=[];parts=[]
+ for m in rows:
+  d=m['data'] if isinstance(m['data'],dict) else {}
+  nd={k:v for k,v in d.items() if k not in ('content','text','files')}
+  nd['role']=m['type']
+  if 'model' in nd: nd['model']=model(nd['model'])
+  if m['type']=='user': last_user[m['session_id']]=m['id']
+  else: nd['parentID']=last_user.get(m['session_id'])
+  messages.append({'id':m['id'],'session_id':m['session_id'],'seq':m['seq'],'time_created':m['time_created'],'time_updated':m['time_updated'],'data':nd})
+  base={'message_id':m['id'],'session_id':m['session_id'],'time_created':m['time_created']}
+  if m['type']=='user':
+   parts.append(dict(base,id=m['id']+'/0',data={'type':'text','text':d.get('text') or ''}))
+   continue
+  for i,item in enumerate(d.get('content') or []):
+   if not isinstance(item,dict): continue
+   data=dict(item)
+   if item.get('type')=='tool':
+    state=dict(item.get('state') or {})
+    state.setdefault('output',''.join(x.get('text','') for x in state.get('content') or [] if isinstance(x,dict)))
+    name=item.get('name')
+    data={'type':'tool','tool':'bash' if name=='shell' else name,'callID':item.get('id'),'state':state}
+   parts.append(dict(base,id=item.get('id') or m['id']+'/'+str(i),data=data))
+ for u in messages:
+  if u['data']['role']!='user' or u['data'].get('model'): continue
+  reply=next((a for a in messages if a['data'].get('parentID')==u['id'] and a['data'].get('model')),None)
+  u['data']['model']=reply['data']['model'] if reply else by_session.get(u['session_id'])
+ out['message']=messages;out['part']=parts
+print(json.dumps(out))
+"#;
+    let output = Command::new("python3")
+        .args(["-I", "-c", script])
+        .arg(db)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "transcript: {output:?}");
+    serde_json::from_slice(&output.stdout).unwrap()
 }
 
 fn completed_reply(transcript: &Value, id: &str) -> Option<String> {
@@ -1187,6 +1335,79 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(250),
             "diagnostic observer teardown must be bounded, took {elapsed:?}"
+        );
+    }
+
+    /// Scenario: Build a database in OpenCode 2.x's layout, with rows shaped as
+    /// 2.2.5 writes them (a root and a child session, a user prompt, a shell tool
+    /// turn and a stop), and read it. The transcript must come back in 1.x's
+    /// `session`/`message`/`part` shape with roles, `parentID`, `bash` and the
+    /// model filled in; a missing database must read as empty.
+    #[test]
+    fn transcript_reads_opencode_2_rows_in_the_1x_shape() {
+        let scratch = common::harness_tempdir().expect("transcript fixture");
+        assert_eq!(
+            transcript_of(&scratch.path().join("absent.db")),
+            json!({"session":[],"message":[],"part":[]})
+        );
+        let db = scratch.path().join("opencode.db");
+        let seed = r#"import sqlite3,sys,json
+c=sqlite3.connect(sys.argv[1])
+c.execute('create table session_v2 (id text primary key, parent_id text, model text, time_created integer)')
+c.execute('create table session_message (id text primary key, session_id text, type text, seq integer, time_created integer, time_updated integer, data text)')
+c.execute('create table session_part (message_id text, session_id text, ordinal integer, type text, data text)')
+m=json.dumps({"id":"big-pickle","providerID":"opencode","variant":"default"})
+c.execute("insert into session_v2 values ('root',null,?,1)",(m,))
+c.execute("insert into session_v2 values ('child','root',?,2)",(m,))
+rows=[('u1','root','user',4,{"text":"run it","files":[]}),
+ ('a1','root','assistant',5,{"model":json.loads(m),"finish":"tool-calls","content":[{"type":"tool","id":"call_1","name":"shell","state":{"status":"completed","input":{"command":"echo hi"},"content":[{"type":"text","text":"hi\n"}]}}]}),
+ ('a2','root','assistant',9,{"model":json.loads(m),"finish":"stop","content":[{"type":"text","text":"927"}]}),
+ ('i1','root','idle',10,{"outcome":"succeeded"})]
+for (i,s,t,q,d) in rows:
+ c.execute('insert into session_message values (?,?,?,?,?,?,?)',(i,s,t,q,q,q,json.dumps(d)))
+c.commit()
+"#;
+        let output = Command::new("python3")
+            .args(["-I", "-c", seed])
+            .arg(&db)
+            .output()
+            .expect("seed the 2.x fixture database");
+        assert!(output.status.success(), "seed: {output:?}");
+        let transcript = transcript_of(&db);
+        let sessions = transcript["session"].as_array().unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(
+            sessions
+                .iter()
+                .any(|s| s["id"] == "child" && s["parent_id"] == "root")
+        );
+        let messages = transcript["message"].as_array().unwrap();
+        assert_eq!(
+            messages.iter().map(|m| m["id"].clone()).collect::<Vec<_>>(),
+            [json!("u1"), json!("a1"), json!("a2")],
+            "only user and assistant rows are messages: {transcript}"
+        );
+        assert_eq!(messages[0]["data"]["role"], "user");
+        assert_eq!(messages[0]["data"]["model"]["providerID"], "opencode");
+        assert_eq!(messages[0]["data"]["model"]["modelID"], "big-pickle");
+        assert_eq!(messages[2]["data"]["parentID"], "u1");
+        assert_eq!(messages[2]["data"]["finish"], "stop");
+        let parts = transcript["part"].as_array().unwrap();
+        assert!(parts.iter().any(
+            |p| p["message_id"] == "u1" && p["data"] == json!({"type":"text","text":"run it"})
+        ));
+        let tool = parts
+            .iter()
+            .find(|p| p["data"]["type"] == "tool")
+            .expect("the shell call is a tool part");
+        assert_eq!(tool["id"], "call_1");
+        assert_eq!(tool["data"]["tool"], "bash");
+        assert_eq!(tool["data"]["state"]["input"]["command"], "echo hi");
+        assert_eq!(tool["data"]["state"]["output"], "hi\n");
+        assert!(
+            parts.iter().any(
+                |p| p["message_id"] == "a2" && p["data"] == json!({"type":"text","text":"927"})
+            )
         );
     }
 

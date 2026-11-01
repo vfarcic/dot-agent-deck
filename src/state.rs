@@ -913,6 +913,13 @@ pub struct SessionState {
     /// guards against would then end that turn again. A respawned agent gets a
     /// new card, so its predecessor's hooks do not speak for it. Process-local.
     pub native_hooks_reported: bool,
+    /// PRD #2050 (review F3/F9): when the newest frame that set
+    /// [`Self::native_hooks_reported`] arrived, on the monotonic clock. The
+    /// daemon's OpenCode watch ([`crate::opencode_mode`]) reads it as the
+    /// plugin's last sign of life, rather than `last_activity`, which wrapper
+    /// and daemon-synthetic frames also move and which follows the wall
+    /// clock. `None` until a native frame arrives. Process-local.
+    pub last_native_hook_at: Option<std::time::Instant>,
     /// Issue #770: this session's pane is an ORPHANED orchestration role pane —
     /// the daemon holds no orchestration role for it, so
     /// `dot-agent-deck delegate` from it is refused and no worker can be
@@ -6572,6 +6579,10 @@ fn card_inbox_of(event: &AgentEvent) -> Option<crate::inbox_display::CardInbox> 
         .metadata
         .get(crate::inbox_display::CARD_INBOX_ADMISSION_METADATA_KEY)
         .cloned();
+    inbox.agent_notice = event
+        .metadata
+        .get(crate::inbox_display::CARD_INBOX_AGENT_NOTICE_METADATA_KEY)
+        .cloned();
     Some(inbox)
 }
 
@@ -6620,6 +6631,12 @@ fn set_card_inbox(session: &mut SessionState, inbox: crate::inbox_display::CardI
         metadata.insert(
             crate::inbox_display::CARD_INBOX_ADMISSION_METADATA_KEY.to_string(),
             code.clone(),
+        );
+    }
+    if let Some(notice) = &inbox.agent_notice {
+        metadata.insert(
+            crate::inbox_display::CARD_INBOX_AGENT_NOTICE_METADATA_KEY.to_string(),
+            notice.clone(),
         );
     }
     session.recent_events.push_back(AgentEvent {
@@ -6855,6 +6872,12 @@ impl PaneInbox {
             evidence_paused: self.notices.evidence_paused,
             receipts_degraded: self.notices.receipts_degraded.clone(),
             admission_refused: self.notices.admission_refused.clone(),
+            agent_notice: self
+                .notices
+                .agent_notice
+                .as_ref()
+                .map(crate::agent_notice::AgentNotice::display_text)
+                .filter(|text| !text.is_empty()),
         }
     }
 
@@ -8765,6 +8788,7 @@ impl AppState {
                 display_name: None,
                 shell_synthetic_working: false,
                 native_hooks_reported: false,
+                last_native_hook_at: None,
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 output_set_status: false,
@@ -13528,6 +13552,7 @@ impl AppState {
                 display_name: None,
                 shell_synthetic_working: false,
                 native_hooks_reported: false,
+                last_native_hook_at: None,
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 output_set_status: false,
@@ -13825,6 +13850,7 @@ impl AppState {
             && !event.is_daemon_synthetic()
         {
             session.native_hooks_reported = true;
+            session.last_native_hook_at = Some(std::time::Instant::now());
         }
         // Issue #714: a `Blocked` card is STICKY. The provider has refused the
         // agent, and the frames that typically trail that refusal — OpenCode's
@@ -17448,6 +17474,53 @@ mod tests {
         );
     }
 
+    /// PRD #2050 (review F3/F9): the instant of the agent's last native hook
+    /// frame moves only with a native frame: a daemon-synthetic frame (the
+    /// shell-activity pair) landing on the same card later moves
+    /// `last_activity` but leaves it where it was, so it cannot vouch for an
+    /// OpenCode whose plugin stopped reporting.
+    #[test]
+    fn only_a_native_frame_moves_the_last_native_hook_instant() {
+        let event = |event_type| AgentEvent {
+            session_id: "s1".to_string(),
+            agent_type: AgentType::OpenCode,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: Some("worker".to_string()),
+            agent_id: Some("agent-1".to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            background: None,
+            background_revision: None,
+        };
+        let mut state = AppState::default();
+        let before = std::time::Instant::now();
+        state.apply_event(event(EventType::SessionStart));
+        let native = state.sessions["s1"]
+            .last_native_hook_at
+            .expect("a native frame records its instant");
+        assert!(native >= before);
+        let activity = state.sessions["s1"].last_activity;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        state.apply_event(event(EventType::ShellBusy));
+        state.apply_event(event(EventType::ShellIdle));
+        assert_eq!(
+            state.sessions["s1"].last_native_hook_at,
+            Some(native),
+            "a daemon-synthetic frame is not the agent's hook"
+        );
+        assert!(
+            state.sessions["s1"].last_activity >= activity,
+            "the synthetic frame still counts as activity"
+        );
+    }
+
     /// PRD #370 M2: the whole point of the feature — `ShellBusy` fills a
     /// stale `Idle`/`Unknown` gap with `Working`, and the paired `ShellIdle`
     /// reverts it, WITHOUT either one ever clobbering a real, agent-emitted
@@ -18969,6 +19042,7 @@ mod tests {
                 display_name: None,
                 shell_synthetic_working: false,
                 native_hooks_reported: false,
+                last_native_hook_at: None,
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 output_set_status: false,
@@ -20937,6 +21011,45 @@ mod tests {
                 state.apply_inbox_notice(&notice);
             }
         }
+    }
+
+    /// PRD #2050: the daemon sets an OpenCode agent's card notice on the hub;
+    /// an attached client's card shows its sentence in the notice row, ahead
+    /// of the not-connected notice, a client attaching afterwards reads it
+    /// from the summary, and clearing it takes it off both.
+    #[test]
+    fn an_agent_notice_reaches_the_cards_notice_row_and_leaves_it() {
+        let hub = crate::inbox_hub::InboxHub::new(
+            crate::inbox::DeckId::generate(),
+            crate::inbox::InboxLimits::default(),
+            crate::inbox_hub::DEFAULT_KEEPALIVE,
+        );
+        let (mut state, mut rx) = attached_card(&hub);
+        let notice = |state: &AppState| state.sessions["gen-q"].inbox_notice();
+        assert_eq!(notice(&state), None);
+        let shared = crate::agent_notice::AgentNotice::opencode_shared_service();
+        hub.set_agent_notice("pane-q", "agent-q", Some(shared.clone()));
+        follow_notices(&mut state, &mut rx);
+        assert_eq!(notice(&state).as_deref(), Some(shared.text.as_str()));
+        assert_eq!(
+            hub.summary("pane-q", "agent-q").notices.agent_notice,
+            Some(shared.clone())
+        );
+        // The same notice again tells nobody anything.
+        hub.set_agent_notice("pane-q", "agent-q", Some(shared.clone()));
+        assert!(rx.try_recv().is_err(), "an unchanged notice is not re-sent");
+        let mut late = AppState::default();
+        late.register_pane("pane-q".to_string());
+        late.apply_event(quota_event(EventType::SessionStart, 1));
+        late.apply_inbox_summary("pane-q", "agent-q", &hub.summary("pane-q", "agent-q"));
+        assert_eq!(
+            late.sessions["gen-q"].inbox_notice().as_deref(),
+            Some(shared.text.as_str())
+        );
+        hub.set_agent_notice("pane-q", "agent-q", None);
+        follow_notices(&mut state, &mut rx);
+        assert_eq!(notice(&state), None);
+        assert_eq!(hub.summary("pane-q", "agent-q").notices.agent_notice, None);
     }
 
     /// PR #1735 fifth review (B-03): a client that attached with one message
