@@ -248,6 +248,61 @@ fn probe_082_the_bound_lets_go_of_the_oldest_retirement_not_the_lowest_generatio
     );
 }
 
+/// Scenario: The registry holds as many notices as it keeps, recorded with no keystroke between them, and one more retirement that held typing is recorded. The first retirement's notice is the one let go, both when every held notice was stamped in one millisecond and when the wall clock stepped back before the last one (review U3-d's tie).
+#[spec("inbox/probe/082")]
+#[test]
+fn probe_082_the_bound_holds_retirement_order_within_one_millisecond() {
+    let fill = |registry: &AgentPtyRegistry, at_ms: u64| {
+        for n in 0..MAX_PANE_DISCARDS {
+            let mut inner = registry.inner.lock();
+            registry.note_discard(
+                &mut inner,
+                &format!("probe-082-ms-{n:03}"),
+                &(n + 1).to_string(),
+                Some((1, 1)),
+            );
+        }
+        // Stamp every held notice with one wall-clock millisecond: an
+        // instant before the next retirement's, or after it once the clock
+        // steps back.
+        let mut inner = registry.inner.lock();
+        for discard in inner.input_discarded.values_mut() {
+            discard.shown.at_ms = at_ms;
+        }
+    };
+    let last = format!("probe-082-ms-{MAX_PANE_DISCARDS:03}");
+    let record_last = |registry: &AgentPtyRegistry| {
+        let mut inner = registry.inner.lock();
+        registry.note_discard(&mut inner, &last, "999", Some((1, 1)));
+    };
+    // A tie is broken in whatever order a map visits its entries, which
+    // differs per map, so several registries each get a chance to show it.
+    for round in 0..16 {
+        let registry = AgentPtyRegistry::new();
+        fill(&registry, 0);
+        record_last(&registry);
+        let kept = registry.discard_panes();
+        assert_eq!(kept.len(), MAX_PANE_DISCARDS);
+        assert!(
+            !kept.contains(&"probe-082-ms-000".to_string()),
+            "round {round}: one millisecond, the first retirement goes: {kept:?}"
+        );
+    }
+    let registry = AgentPtyRegistry::new();
+    fill(&registry, u64::MAX);
+    record_last(&registry);
+    let kept = registry.discard_panes();
+    assert_eq!(kept.len(), MAX_PANE_DISCARDS);
+    assert!(
+        !kept.contains(&"probe-082-ms-000".to_string()),
+        "the clock stepped back, the first retirement goes: {kept:?}"
+    );
+    assert!(
+        kept.contains(&last),
+        "the clock stepped back, the one just recorded stays: {kept:?}"
+    );
+}
+
 /// Scenario: Generation A exits holding only a voice answer's keys, and B takes the pane: B's card reports no not-delivered typing. Then A2 exits holding the person's typed keys beside an answer, and B2 takes its pane: B2's card counts the typing alone (auditor U3-7).
 #[spec("inbox/probe/082")]
 #[tokio::test(flavor = "multi_thread")]

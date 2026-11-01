@@ -5135,6 +5135,9 @@ enum Acceptance {
 struct PaneDiscard {
     shown: crate::inbox_display::InputDiscarded,
     input_seq: u64,
+    /// The registry's count of notices recorded when this one was
+    /// ([`RegistryInner::discard_seq`]): its place in retirement order.
+    retired_seq: u64,
 }
 
 /// PRD #1666 part 3 (R-E-U3-02): how many panes' not-delivered notices the
@@ -10039,6 +10042,10 @@ struct RegistryInner {
     /// reaches the pane after it, when it is pruned (see
     /// [`AgentPtyRegistry::input_discarded`]). At most [`MAX_PANE_DISCARDS`].
     input_discarded: HashMap<String, PaneDiscard>,
+    /// Review U3-d: how many notices [`Self::input_discarded`] has recorded,
+    /// each one's [`PaneDiscard::retired_seq`]. Bumped under the registry
+    /// lock, so it orders retirements as they happened.
+    discard_seq: u64,
 }
 
 /// Issue #454: RAII holder for a [`RegistryInner::pending_spawns`] entry.
@@ -10526,6 +10533,7 @@ impl AgentPtyRegistry {
                 cleanup_holds: HashSet::new(),
                 exit_waiters: HashMap::new(),
                 input_discarded: HashMap::new(),
+                discard_seq: 0,
             }),
             dispatch_mutexes: Mutex::new(HashMap::new()),
             dispatch_order_mutexes: Mutex::new(HashMap::new()),
@@ -13540,6 +13548,8 @@ impl AgentPtyRegistry {
             let at_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+            inner.discard_seq += 1;
+            let retired_seq = inner.discard_seq;
             inner.input_discarded.insert(
                 pane.to_string(),
                 PaneDiscard {
@@ -13550,18 +13560,20 @@ impl AgentPtyRegistry {
                         at_ms,
                     },
                     input_seq,
+                    retired_seq,
                 },
             );
             while inner.input_discarded.len() > MAX_PANE_DISCARDS {
                 // Oldest first: by the keystroke count at retirement, then by
-                // when it retired. Retirements with no keystroke between them
-                // share `input_seq`, and the generation is not retirement
-                // order, so it would let a notice just recorded go first
-                // (review U3-d).
+                // the registry's own count of retirements. Retirements with no
+                // keystroke between them share `input_seq`; the generation is
+                // not retirement order, and the wall clock ties within a
+                // millisecond and can step back, so either would let a notice
+                // just recorded go first (review U3-d).
                 let oldest = inner
                     .input_discarded
                     .iter()
-                    .min_by_key(|(_, discard)| (discard.input_seq, discard.shown.at_ms))
+                    .min_by_key(|(_, discard)| (discard.input_seq, discard.retired_seq))
                     .map(|(pane, _)| pane.clone());
                 match oldest {
                     Some(oldest) => inner.input_discarded.remove(&oldest),
