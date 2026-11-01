@@ -3350,9 +3350,15 @@ const setup = async (api) => {
         root = api.data?.session?.root?.(sessionID) || sessionID;
       } catch (_) {}
       const cwd = process.cwd();
-      const plain = { session_id: root, event: "question.asked", prompt: form.title ?? "", cwd, request_id: formID };
+      // A child session's form is its subagent's, filed under the root with
+      // the child's id, as the server plugin files a child's permission
+      // prompt: the deck then releases that subagent's wait when the form is
+      // answered, instead of leaving the card on Needs Input.
+      const subagent = root !== sessionID ? { subagent_id: sessionID } : {};
+      const plain = { session_id: root, ...subagent, event: "question.asked", prompt: form.title ?? "", cwd, request_id: formID };
       const payload = {
         session_id: root,
+        ...subagent,
         event: "question.asked",
         cwd,
         properties: { id: formID, sessionID, title: form.title, form },
@@ -12263,6 +12269,26 @@ process.exit(0);
         assert_eq!(awaited.len(), 2, "{awaited:?}");
         assert_eq!(awaited[0]["event"], "question.asked");
         assert_eq!(awaited[0]["session_id"], "rootA", "filed under the root");
+        assert_eq!(
+            awaited[0]["subagent_id"], "child",
+            "a child session's form is its subagent's, so answering it releases that subagent's wait"
+        );
+        assert!(
+            awaited[1].get("subagent_id").is_none(),
+            "the root's own form is no subagent's: {}",
+            awaited[1]
+        );
+        // What the deck makes of the held payload: the subagent's ask, which
+        // the answer releases (state::release_subagent_wait).
+        let (asked_event, question) = crate::hook::build_opencode_event_with_question(
+            serde_json::from_value(awaited[0].clone()).unwrap(),
+        )
+        .expect("an event");
+        assert!(asked_event.is_from_subagent(), "the form is the subagent's");
+        assert_eq!(
+            question.expect("a held form").subagent_id.as_deref(),
+            Some("child")
+        );
         assert_eq!(awaited[0]["properties"]["id"], "frm_1");
         assert_eq!(awaited[0]["properties"]["sessionID"], "child");
         assert_eq!(
