@@ -40,8 +40,25 @@ const CLAUDE_MODEL: &str = "claude-haiku-4-5-20251001";
 const CLAUDE_SENTINEL: &str = "prd249-claude-respawn-4d37c1.txt";
 const CLAUDE_SENTINEL_CONTENT: &str = "PRD249_CLAUDE_RESPAWN_OK";
 
+/// Written by [`ORCHESTRATOR_BODY`] when [`DELEGATE_TRIGGER`] never appeared.
+const DELEGATE_TRIGGER_EXPIRED: &str = "delegate-now-expired";
+
+/// The orchestrator gives up on [`DELEGATE_TRIGGER`] after 300 s, logging why,
+/// so a missed release ends with a reason instead of a script left waiting.
+/// The test releases it right after the worker's 120 s input-ready wait plus
+/// the deck's own bounded steps before it, so a run that is going to pass is
+/// never near this bound.
 const ORCHESTRATOR_BODY: &str = r#"#!/bin/sh
-while [ ! -f delegate-now ]; do sleep 0.2; done
+deadline=$(( $(date +%s) + 300 ))
+while [ ! -f delegate-now ]; do
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+        echo 'delegate trigger delegate-now never appeared within 300s; no delegate sent' \
+            >> orchestrator-delegate.log
+        : > delegate-now-expired
+        exit 1
+    fi
+    sleep 0.2
+done
 dot-agent-deck delegate --to coder --task-file delegate-task.md \
     >> orchestrator-delegate.log 2>&1
 printf 'delegate exit=%s\n' "$?" >> orchestrator-delegate.log
@@ -216,6 +233,12 @@ fn run_real_clear_true_delegate(deck: &TuiDeck, worker_command: &str, case: Real
     // predicate could match a pre-delegate event and measure nonsense.
     let delegate_released_at = chrono::Utc::now();
     std::fs::write(work.join(DELEGATE_TRIGGER), "").expect("release delegate trigger");
+    assert!(
+        !work.join(DELEGATE_TRIGGER_EXPIRED).exists(),
+        "the orchestrator script gave up waiting for {DELEGATE_TRIGGER} before the test released \
+         it, so no delegate was sent; orchestrator_log={:?}",
+        std::fs::read_to_string(work.join(ORCHESTRATOR_LOG)).unwrap_or_default()
+    );
 
     // Real native status on the user-visible card: prompt submission enters
     // Thinking, the requested shell operation enters Working, and its tool name
@@ -373,11 +396,34 @@ fn delegate_015_real_opencode_worker_acts_on_clear_true_delegate() {
 fn delegate_046_real_opencode_consumes_boot_queued_task_in_place() {
     skip_unless!(opencode_live::available());
     let mut op = opencode_live::OpenCode::with_clear(false, 0, true, true, true);
+    let boot_delay = std::env::var("DOT_AGENT_DECK_TEST_OPENCODE_BOOT_DELAY_SECS")
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .expect("OpenCode boot delay must be seconds")
+        })
+        .unwrap_or(0);
+    // The launcher gives up on boot-release after the hold plus 180 s, leaving
+    // a marker the test checks right after releasing it, so a missed release
+    // fails on that reason instead of on the reply wait's budget. The steps
+    // between the launcher starting and the release are each bounded well
+    // inside that margin.
+    let release_bound = boot_delay + 180;
     let script = op.work.join("run-worker.sh");
     std::fs::write(
         &script,
         format!(
-            "#!/bin/sh\nwhile [ ! -f boot-release ]; do sleep 0.1; done\nexec {}\n",
+            "#!/bin/sh\n\
+             deadline=$(( $(date +%s) + {release_bound} ))\n\
+             while [ ! -f boot-release ]; do\n\
+             \x20   if [ \"$(date +%s)\" -ge \"$deadline\" ]; then\n\
+             \x20       echo 'boot-release never appeared within {release_bound}s' >&2\n\
+             \x20       : > boot-release-expired\n\
+             \x20       exit 1\n\
+             \x20   fi\n\
+             \x20   sleep 0.1\n\
+             done\n\
+             exec {}\n",
             common::opencode_interactive_command(false, true, "")
         ),
     )
@@ -391,13 +437,6 @@ fn delegate_046_real_opencode_consumes_boot_queued_task_in_place() {
     let id = op.clear_delegate(&body);
     let replacement = op.pane.agent.clone();
     inbox::state(&op.deck, &op.pane, &id, "queued");
-    let boot_delay = std::env::var("DOT_AGENT_DECK_TEST_OPENCODE_BOOT_DELAY_SECS")
-        .map(|value| {
-            value
-                .parse::<u64>()
-                .expect("OpenCode boot delay must be seconds")
-        })
-        .unwrap_or(0);
     eprintln!("delegate-046: holding the real OpenCode replacement boot for {boot_delay}s");
     // Like inbox::unchanged, observe a forbidden change through the harness's
     // bounded waiter. The scratch launcher stays gated until this hold ends.
@@ -415,6 +454,12 @@ fn delegate_046_real_opencode_consumes_boot_queued_task_in_place() {
         inbox::listing(&op.deck, &op.pane)
     );
     std::fs::write(op.work.join("boot-release"), "").unwrap();
+    assert!(
+        !op.work.join("boot-release-expired").exists(),
+        "the replacement's launcher gave up waiting for boot-release ({release_bound}s) before \
+         the test released it, so OpenCode never booted: {}",
+        op.evidence()
+    );
     op.done(&id, name);
     op.idle();
     assert_eq!(
