@@ -389,7 +389,7 @@ fn probe_032_counted_native_fifo_overflow_never_ages_into_permission() {
     );
 }
 
-/// Scenario: With the real TUI attached to the sandbox daemon, type in the delayed check window and watch the actual card. It must show the shared checking explanation, clear it after the check releases the keys, and show the shared not-delivered words if a second hold is retired.
+/// Scenario: With the real TUI attached to the sandbox daemon, pause the check's real helper before its decision, type and watch the actual card. It must show the shared checking explanation while keys are held, clear it after the helper resumes and releases them, and show the shared not-delivered words if a second hold is retired.
 #[spec("inbox/probe/046")]
 #[test]
 fn probe_046_attached_dashboard_shows_clears_and_retires_held_typing() {
@@ -406,18 +406,25 @@ fn probe_046_attached_dashboard_shows_clears_and_retires_held_typing() {
             f.daemon.hook_socket.to_string_lossy(),
         )
         .launch_with_fixture("minimal");
-    f.flag("edit-delay");
+    let pause = f.pause_helper();
     f.flag("hold-return");
     f.probe();
-    f.wait("edit-dispatched");
+    f.wait("helper-started");
     let mut human = f.connect();
     human.write("VISIBLE-HELD");
-    let checking = held_words();
+    f.wait_held();
+    // The card is narrower than the full sentence. Check its identifying
+    // clause, which fits the card, rather than requiring an unwrapped tail.
+    let checking = held_words().split(';').next().unwrap().to_owned();
     assert!(
         common::wait_until(WAIT, || tui.snapshot_grid().contains(&checking)),
-        "attached card never showed held-input words:\n{}",
+        "attached card never showed held-input words; gate held={}, snapshot input_held={:?}:\n{}",
+        f.held(),
+        f.snapshot().get("input_held"),
         tui.snapshot_grid()
     );
+    f.remove("pause-helper");
+    pause.release();
     f.flag("resume-go");
     f.expect(b"\x07VISIBLE-HELD");
     assert!(
@@ -426,7 +433,6 @@ fn probe_046_attached_dashboard_shows_clears_and_retires_held_typing() {
         tui.snapshot_grid()
     );
     f.remove("hold-return");
-    f.remove("edit-delay");
     f.flag("edit-drop");
     f.probe();
     human.write("RETIRED-VISIBLE");
