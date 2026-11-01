@@ -434,6 +434,8 @@ fn probe_032_counted_native_fifo_overflow_never_ages_into_permission() {
 #[spec("inbox/probe/046")]
 #[test]
 fn probe_046_attached_dashboard_shows_clears_and_retires_held_typing() {
+    // .config/nextest.toml selects this exact function name to show which
+    // export-chain branch ran; update that override if this test is renamed.
     let mut f = Fixture::start("claude");
     f.hook_event("session_start");
     let tui = common::TuiDeck::builder()
