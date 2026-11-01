@@ -641,6 +641,8 @@ pub fn native_entry() {
                 // The composer is blocked in its editor broker until the
                 // fixture releases the return. Inspect its actual tty queue
                 // without consuming keys or allowing the return through.
+                // Canonical-mode line discipline counts only complete lines;
+                // callers expecting an exact count end their typing in '\n'.
                 let mut pending: libc::c_int = 0;
                 // SAFETY: stdin is this sandbox agent's slave terminal and
                 // FIONREAD writes one c_int to the valid output pointer.
