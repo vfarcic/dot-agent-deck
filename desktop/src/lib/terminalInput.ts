@@ -73,8 +73,9 @@ export function terminalInputState(agent: AgentSession): TerminalInputState {
   }
 
   // Checked after the pane, not before it: for an agent that is both finished
-  // and paneless, "the agent has no live pane" is the sentence that explains
-  // why typing cannot work, which is what #1042 asked the terminal to say.
+  // and paneless, "this agent has no live terminal" is the sentence that
+  // explains why typing cannot work, which is what #1042 asked the terminal
+  // to say.
   const statusReason = agentStatusInputReason(agent);
   if (statusReason) return { state: undefined, readOnly: true, tone: "blocked", notice: statusReason };
 
