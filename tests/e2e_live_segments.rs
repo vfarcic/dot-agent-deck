@@ -492,7 +492,7 @@ fn probe_046_attached_dashboard_shows_clears_and_retires_held_typing() {
     f.stable(b"");
 }
 
-/// Scenario: Invoke the user's editor through the installed helper or directly without that helper and read the epoch around its output pair. The unmatched external edit must move the foreign epoch once without an empty observation clearing it; the fast direct row requests an observer hold but cannot establish exit before the first scan until that control acknowledges quiescence.
+/// Scenario: Invoke the user's editor through the installed helper or directly without that helper and read the epoch around its output pair. The unmatched external edit must move the foreign epoch once without an empty observation clearing it; the fast direct row acknowledges no observer pass running before launch and witnesses editor exit and composer return before allowing the first scan.
 #[spec("inbox/probe/048")]
 #[test]
 fn probe_048_unreported_and_fast_external_edits_move_the_foreign_epoch() {
@@ -502,13 +502,10 @@ fn probe_048_unreported_and_fast_external_edits_move_the_foreign_epoch() {
             f.flag("lost-ipc");
         }
         let held_passes = fast.then(|| {
-            f.control("observer-hold");
-            // Provisional: elapsed time cannot acknowledge quiescence. The
-            // exit-before-first-scan claim remains UNVERIFIED in the catalog.
-            wait_span(Duration::from_millis(200));
-            f.control("observer-status")["composer_observer"]["passes"]
-                .as_u64()
-                .unwrap()
+            let held = f.control("observer-hold")["composer_observer"].clone();
+            assert_eq!(held["passes_held"], true, "{held}");
+            assert_eq!(held["pass_running"], false, "acknowledged quiet: {held}");
+            held["passes"].as_u64().unwrap()
         });
         f.flag("hold-return");
         let before = f.epoch();
@@ -522,10 +519,12 @@ fn probe_048_unreported_and_fast_external_edits_move_the_foreign_epoch() {
         f.flag("resume-go");
         f.wait("composer-return-1");
         if let Some(passes) = held_passes {
-            let status = f.control("observer-status");
+            let status = f.control("observer-status")["composer_observer"].clone();
+            assert_eq!(status["passes_held"], true, "{status}");
+            assert_eq!(status["pass_running"], false, "{status}");
             assert_eq!(
-                status["composer_observer"]["passes"], passes,
-                "no observer pass completed during the measured editor interval: {status}"
+                status["passes"], passes,
+                "editor exited and composer returned before the first scan after launch: {status}"
             );
             f.control("observer-go");
         }
@@ -1091,7 +1090,10 @@ fn probe_061_in_check_osc_candidates_complete_without_manual_release() {
                         // The matching decision has arrived, but its return
                         // is still withheld. The composer cannot read while
                         // its broker waits, so inspect the real tty queue now
-                        // and verify the exact capture after its return.
+                        // and verify the exact capture after its return. This
+                        // exact FIONREAD count relies on canonical-mode line
+                        // discipline: OSC-EDITOR ends with a newline, making
+                        // the complete line available to the pending read.
                         assert_eq!(f.input(), b"\x07");
                         let pending = expected.len() - 1;
                         assert!(
@@ -1433,7 +1435,7 @@ fn probe_057_tool_and_unknown_family_helpers_leave_liability_unconsumed() {
     }
 }
 
-/// Scenario: Select Authority policy and a one-record cap before observation, then keep a real unarmed editor/helper alive in that slot while a second native or tool helper arrives. A dropped undecided sighting or tool decision opens the writer scope, each one-slot cap refuses a new probe with RecordCap without a check byte, and a two-slot control keeps the undecided sighting Pending. The Armed-only ordering remains provisional until the observer hold acknowledges quiescence and a status witness distinguishes dropping its decision from retaining it.
+/// Scenario: Select Authority policy and a one-record cap before observation, then keep a real unarmed editor/helper alive in that slot while a second native or tool helper arrives. A dropped undecided sighting or tool decision opens the writer scope, each one-slot cap refuses a new probe with RecordCap without a check byte, and a two-slot control keeps the undecided sighting Pending. For Armed, acknowledge observer quiescence before launch and require an Armed cap-drop counter increase with exactly one record retained before sampling Closed.
 #[spec("inbox/probe/057")]
 #[test]
 fn probe_057_live_cap_dropped_undecided_tool_and_armed_helpers() {
@@ -1455,14 +1457,17 @@ fn probe_057_live_cap_dropped_undecided_tool_and_armed_helpers() {
                 "Authority keeps the first observed running editor's scope closed"
             );
             let pause = (history == "undecided").then(|| f.pause_helper());
-            // Publish a liability to enable the real census. For the Armed-only
-            // row, request scans held while IPC provides the no-editor fact;
-            // ordering still needs the quiescence control noted below.
-            if history == "armed" {
-                f.control("observer-hold");
-                // Provisional until observer-hold acknowledges quiescence.
-                wait_span(Duration::from_millis(200));
-            }
+            // Publish a liability to enable the real census. For Armed,
+            // acknowledge no pass running before the helper exists: only IPC
+            // can supply its decision until observer-go, never an undecided scan.
+            let armed_baseline = (history == "armed").then(|| {
+                let held = f.control("observer-hold")["composer_observer"].clone();
+                assert_eq!(held["passes_held"], true, "{held}");
+                assert_eq!(held["pass_running"], false, "acknowledged quiet: {held}");
+                assert_eq!(held["records_retained"], 1, "first helper kept: {held}");
+                assert_eq!(held["records_cap"], 1, "{held}");
+                held
+            });
             f.control("publish");
             let first = live::read_json(&f.path("editor-started"));
             let export = std::path::Path::new(first["path"].as_str().unwrap())
@@ -1503,7 +1508,24 @@ fn probe_057_live_cap_dropped_undecided_tool_and_armed_helpers() {
                             .contains("armed Some(")),
                         "Armed helper must receive the daemon's invocation reply"
                     );
-                    assert_eq!(f.scope(), "closed", "{history}");
+                    let baseline = armed_baseline.as_ref().unwrap();
+                    let before = baseline["cap_dropped"]["armed"].as_u64().unwrap();
+                    assert!(
+                        common::wait_until(WAIT, || {
+                            let status = f.control("observer-status")["composer_observer"].clone();
+                            assert_eq!(status["records_retained"], 1, "{status}");
+                            status["cap_dropped"]["armed"].as_u64().unwrap() > before
+                        }),
+                        "Armed decision must be processed and dropped at cap: {}",
+                        f.control("observer-status")
+                    );
+                    let processed = f.control("observer-status")["composer_observer"].clone();
+                    assert!(processed["cap_dropped"]["armed"].as_u64().unwrap() > before);
+                    assert_eq!(processed["records_retained"], 1, "{processed}");
+                    assert_eq!(processed["passes_held"], true, "{processed}");
+                    assert_eq!(processed["pass_running"], false, "{processed}");
+                    assert_eq!(processed["passes"], baseline["passes"], "{processed}");
+                    assert_eq!(processed["scope"], "closed", "Armed cap drop: {processed}");
                 }
             }
             // Once the native key's quiet deadline is past, this capped
