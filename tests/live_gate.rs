@@ -8,16 +8,17 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use dot_agent_deck::composer_probe::epoch::GenerationInput;
+use dot_agent_deck::composer_probe::epoch::{GenerationInput, Writer};
 use dot_agent_deck::composer_probe::framing::Framing;
 use dot_agent_deck::composer_probe::gate::{Admission, Cutting, FENCE_CAP, Gate, Measure};
+use dot_agent_deck::composer_probe::paste_mode::OutputHook;
 use dot_agent_deck::composer_probe::planner::{Cut, first_cut, next_cut};
 use dot_agent_deck::composer_probe::probe;
 use dot_agent_deck::composer_probe::query_ledger::CprWaitEnd;
 use dot_agent_deck::composer_probe::record::{
     Attribution, Channel, Decision, EcPolicy, NotOwned, Observation, RecordKey, Records,
 };
-use dot_agent_deck::composer_probe::segments::Agent;
+use dot_agent_deck::composer_probe::segments::{Agent, Front, ReturnMarkers};
 use dot_agent_deck::doorbell_txn::{ClaimState, JobClaim, Start, StartCtx};
 use spec::spec;
 
@@ -401,8 +402,7 @@ fn live_input() -> GenerationInput {
     input
 }
 
-fn helper(input: &GenerationInput, pid: u32, attribution: Attribution) {
-    let now = Instant::now();
+fn helper(input: &GenerationInput, pid: u32, attribution: Attribution, born: Instant) {
     let _ = input.record_observe(
         &Observation {
             generation: 9,
@@ -413,10 +413,22 @@ fn helper(input: &GenerationInput, pid: u32, attribution: Attribution) {
             decision: Some(Decision::Unarmed),
             seg_seen: None,
             native_seen: None,
-            birth_floor: now,
+            birth_floor: born,
         },
-        now,
+        born,
     );
+}
+
+/// The generation's output as its hook reads it: one marker reader over
+/// every byte, in order.
+struct Output(ReturnMarkers);
+
+impl Output {
+    fn push(&mut self, input: &GenerationInput, bytes: &[u8], at: Instant) {
+        let mut seen = Vec::new();
+        self.0.feed(bytes, &mut seen);
+        input.on_return_markers(&seen, at);
+    }
 }
 
 /// Scenario: On an installed generation's input, read a complete bracketed-paste pair with no record made, a pair after an owned helper's record (before and after its disable), a pair after only a tool's record, a lone disable and a stale enable. Only the unexplained pairs move the epoch, once each and as foreign, the explained pair moves nothing whichever side the record came, and neither a lone disable nor an enable with no disable before it moves anything.
@@ -425,28 +437,30 @@ fn helper(input: &GenerationInput, pid: u32, attribution: Attribution) {
 fn probe_048_an_unexplained_paste_pair_moves_the_epoch_once() {
     const OFF: &[u8] = b"\x1b[?2004l";
     const ON: &[u8] = b"\x1b[?2004h";
-    let now = Instant::now();
+    let t = Instant::now();
+    let at = |ms: u64| t + std::time::Duration::from_millis(ms);
     let input = live_input();
-    input.on_output_bytes(ON, now);
+    let mut out = Output(ReturnMarkers::default());
+    out.push(&input, ON, at(0));
     assert_eq!(input.epoch().epoch(), 0, "an enable alone is no pair");
-    input.on_output_bytes(&[OFF, ON].concat(), now);
+    out.push(&input, &[OFF, ON].concat(), at(1));
     let e = input.epoch();
     assert_eq!(
         (e.epoch(), e.last_foreign()),
         (1, 1),
         "an unreported editor"
     );
-    helper(&input, 41, Attribution::Owned);
-    input.on_output_bytes(&[OFF, ON].concat(), now);
+    helper(&input, 41, Attribution::Owned, at(2));
+    out.push(&input, &[OFF, ON].concat(), at(3));
     assert_eq!(input.epoch().epoch(), 1, "the record explains the pair");
-    input.on_output_bytes(OFF, now);
-    helper(&input, 42, Attribution::Owned);
-    input.on_output_bytes(ON, now);
+    out.push(&input, OFF, at(4));
+    helper(&input, 42, Attribution::Owned, at(5));
+    out.push(&input, ON, at(6));
     assert_eq!(input.epoch().epoch(), 1, "whichever arrives first");
-    helper(&input, 43, Attribution::NotOwned(NotOwned::Tool));
-    input.on_output_bytes(&[OFF, ON].concat(), now);
+    helper(&input, 43, Attribution::NotOwned(NotOwned::Tool), at(7));
+    out.push(&input, &[OFF, ON].concat(), at(8));
     assert_eq!(input.epoch().epoch(), 2, "a tool's record explains nothing");
-    input.on_output_bytes(OFF, now);
+    out.push(&input, OFF, at(9));
     assert_eq!(input.epoch().epoch(), 2, "a lone disable");
 }
 
@@ -487,4 +501,139 @@ fn probe_010_a_segment_release_wakes_a_full_waiter() {
             tokio::time::timeout(std::time::Duration::from_secs(1), waiter.changed()).await
         })
         .expect("the release wakes the waiting op");
+}
+
+const OFF: &[u8] = b"\x1b[?2004l";
+const ON: &[u8] = b"\x1b[?2004h";
+
+/// An owned helper `pid` of generation 9 on `channel` that read segment
+/// `seg` and decided `decision`, born at `born`.
+fn owned(
+    input: &GenerationInput,
+    pid: u32,
+    channel: Channel,
+    decision: Decision,
+    seg: Option<u64>,
+    born: Instant,
+) {
+    input
+        .record_observe(
+            &Observation {
+                generation: 9,
+                key: RecordKey { pid, start: 1 },
+                channel,
+                attribution: Attribution::Owned,
+                claim: None,
+                decision: Some(decision),
+                seg_seen: seg,
+                native_seen: None,
+                birth_floor: born,
+            },
+            born,
+        )
+        .unwrap();
+}
+
+/// Helper `pid`'s exit, observed and drained at `at`.
+fn exits(input: &GenerationInput, pid: u32, at: Instant) {
+    let key = RecordKey { pid, start: 1 };
+    input.record_exit(9, key, at, at).unwrap();
+    input.record_drained(9, key, at).unwrap();
+}
+
+/// A Claude probe on `input`, its own byte enqueued and its trigger reported
+/// written at the output offset as it stands: its number.
+fn written_probe(input: &GenerationInput, now: Instant) -> u64 {
+    input.liability_raise(9, now).unwrap();
+    let (n, job) = input.segment_open_probe(false, now).unwrap();
+    input.enqueue(Writer::Deck(job), &[0x07]);
+    input
+        .segment_written(n, input.output_offset(), now, now)
+        .unwrap();
+    n
+}
+
+/// Scenario: Let an agent's output run before the generation's segments are attached, ending part-way through an escape sequence, and keep going as they attach. A probe's trigger is then written at the output offset counted from the generation's birth, its helper decides `Armed` with its number and exits, and Claude's return follows: the segment completes, its markers read at that same coordinate and in a framing that saw every byte (R-U2-02).
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_return_markers_count_from_the_generations_birth() {
+    let now = Instant::now();
+    let input = Arc::new(GenerationInput::new(CprWaitEnd::Counted));
+    assert!(input.attach_records(Records::new(9, EcPolicy::Hold, now)));
+    let mut hook = OutputHook::new(Arc::clone(&input));
+    hook.on_output(&[b"x".repeat(4096).as_slice(), b"\x1b[?20"].concat());
+    assert!(input.attach_segments(9, Agent::Claude));
+    hook.on_output(b"04h ready");
+    let n = written_probe(&input, now);
+    owned(&input, 41, Channel::Ipc, Decision::Armed, Some(n), now);
+    exits(&input, 41, now);
+    assert_eq!(input.segments_view(now).len(), 1, "no return yet");
+    hook.on_output(&[OFF, ON].concat());
+    assert!(
+        input.segments_view(now).is_empty(),
+        "the return completes it: {:?}",
+        input.segments_view(now)
+    );
+    assert_eq!(input.segments_front(), Some(Front::None));
+}
+
+/// Scenario: On an installed generation's input, a complete bracketed-paste pair is read before the record of the helper whose session it was (its helper born before the pair ended), so it moves the epoch; then that record is made, and then an unrelated editor's pair with no record. The late record accounts for the pair it was, banking nothing, so the unrelated pair still moves the epoch as foreign; a record whose helper was born after every such pair still explains its own pair (R-U2-04).
+#[spec("inbox/probe/048")]
+#[test]
+fn probe_048_a_late_record_lends_nothing_to_a_later_pair() {
+    let born = Instant::now();
+    let input = Arc::new(GenerationInput::new(CprWaitEnd::Counted));
+    assert!(input.attach_records(Records::new(9, EcPolicy::Hold, born)));
+    assert!(input.attach_segments(9, Agent::Claude));
+    let mut hook = OutputHook::new(Arc::clone(&input));
+    hook.on_output(&[OFF, ON].concat());
+    assert_eq!(input.epoch().last_foreign(), 1, "a pair with no record yet");
+    owned(&input, 41, Channel::Ipc, Decision::Unarmed, None, born);
+    hook.on_output(&[OFF, ON].concat());
+    let e = input.epoch();
+    assert_eq!(
+        (e.epoch(), e.last_foreign()),
+        (2, 2),
+        "the late record lent its explanation to an unrelated pair"
+    );
+    let after = Instant::now() + std::time::Duration::from_secs(1);
+    owned(&input, 42, Channel::Ipc, Decision::Unarmed, None, after);
+    hook.on_output(&[OFF, ON].concat());
+    assert_eq!(
+        input.epoch().epoch(),
+        2,
+        "a record born after explains its own"
+    );
+}
+
+/// Scenario: A Claude probe's helper decides `Armed` with its number on a marker before its own invocation, which would carry the daemon's read of its export, so its settlement waits; that invocation never comes. Claude's return then completes the segment as its exit is drained, in either order. The settlement still runs: the schedule records an `Armed` check with no empty read, and isn't due again until the epoch moves, and the segment is gone (R-U2-05).
+#[spec("inbox/probe/010")]
+#[test]
+fn probe_010_a_completion_keeps_a_deferred_settlement() {
+    for return_first in [true, false] {
+        let now = Instant::now();
+        let input = Arc::new(GenerationInput::new(CprWaitEnd::Counted));
+        assert!(input.attach_records(Records::new(9, EcPolicy::Hold, now)));
+        assert!(input.attach_segments(9, Agent::Claude));
+        let mut hook = OutputHook::new(Arc::clone(&input));
+        let n = written_probe(&input, now);
+        assert!(input.probe_due(now), "{return_first}: no check yet");
+        owned(&input, 41, Channel::Marker, Decision::Armed, Some(n), now);
+        assert!(input.probe_due(now), "{return_first}: waits for the read");
+        if return_first {
+            hook.on_output(&[OFF, ON].concat());
+            exits(&input, 41, now);
+        } else {
+            exits(&input, 41, now);
+            hook.on_output(&[OFF, ON].concat());
+        }
+        assert!(
+            input.segments_view(now).is_empty(),
+            "{return_first}: complete"
+        );
+        assert!(
+            !input.probe_due(now),
+            "{return_first}: the settlement was lost with the segment"
+        );
+    }
 }

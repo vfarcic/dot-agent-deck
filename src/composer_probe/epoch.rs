@@ -109,7 +109,7 @@ use super::record::{
     self, Attribution, Channel, Decision, Drained, ExitFact, FirstStop, FrontierOutcome, Hold,
     NotOwned, Record, RecordKey, Recorded, Records, Refusal, Reported, Route, WriterScope,
 };
-use super::segments::{self, Front, Marker, ReturnMarkers, Seen, Segments};
+use super::segments::{self, Front, Marker, Seen, Segments};
 use crate::lock_rank::{R6, RankedMutex};
 
 /// A deck job the epoch can name: a probe's, or a ring transaction's.
@@ -376,14 +376,18 @@ const READS_KEPT: usize = record::RECORD_CAP;
 #[derive(Debug)]
 struct Live {
     segments: Segments,
-    /// The output read for return markers, every byte from attachment on.
-    markers: ReturnMarkers,
     /// `ExternalEdit`'s second producer (PR U3-11): a `?2004l` was read and
     /// no `?2004h` has followed it yet.
     pair_open: bool,
     /// Records made since the last pair that may account for one: an editor
     /// session the deck saw, so its pair isn't an unreported one.
     explained: u8,
+    /// When each pair that completed with no record to account for it (so
+    /// it moved the epoch) ended, oldest first (R-U2-04). A record made
+    /// later whose helper may have been born by then may be that pair's
+    /// session: it accounts for that pair and banks nothing, so it can't
+    /// lend an explanation to a later, unrelated pair.
+    unexplained: std::collections::VecDeque<Instant>,
     /// When the deck may try a probe again (R2 §6.8, R5's continuing
     /// retries). Its `broken` bit is presentation only (O-20.6).
     schedule: Schedule,
@@ -457,7 +461,9 @@ fn enqueue_locked(state: &mut State, writer: Writer, bytes: &[u8]) -> Enqueued {
 
 /// Q35-20: settle what a step allows the segments (match, release,
 /// completion), then the epoch's settlement of each probe whose matched
-/// record decided (R3 §3.4), in the caller's hold of the lock.
+/// record decided (R3 §3.4), in the caller's hold of the lock. A probe its
+/// completion removed before its settlement ran is settled here too, before
+/// its ending deletes its entry (R-U2-05).
 fn settle_live(state: &mut State, now: Instant) {
     let (Some(live), Some(records), false) =
         (state.live.as_mut(), state.records.as_mut(), state.retired)
@@ -466,18 +472,10 @@ fn settle_live(state: &mut State, now: Instant) {
     };
     live.segments.settle(records, &mut state.hazards, now);
     for (number, key, decision) in live.segments.take_decided_probes(records) {
-        let Some(at) = live.probes.iter().position(|p| p.number == number) else {
-            continue;
-        };
-        let read = live
-            .reads
-            .iter()
-            .rev()
-            .find(|(k, _)| *k == key)
-            .map(|(_, empty)| *empty);
+        let read = live.read_of(key);
         // An `Armed` decision can reach the records on a marker before the
         // helper's own invocation, which carries the daemon's read: wait for
-        // the read, until the record drained.
+        // the read, until the record drained or the segment completed.
         if decision == Decision::Armed
             && read.is_none()
             && records.get(key).is_some_and(|r| !r.drained)
@@ -485,40 +483,96 @@ fn settle_live(state: &mut State, now: Instant) {
             live.segments.undecide(number);
             continue;
         }
-        let probe = live.probes.remove(at);
-        let claim_mine = records
-            .get(key)
-            .is_none_or(|r| r.claim.is_none_or(|c| c == record::Claim::Owned));
-        tracing::debug!(
-            target: "composer_probe",
+        settle_probe(
+            live,
+            &mut state.epoch,
+            records,
             number,
-            ?decision,
-            ?read,
-            claim_mine,
-            e0 = ?probe.e0,
-            "probe settled"
+            key,
+            Some(decision),
+            read,
+            now,
         );
-        match (decision, read) {
-            (Decision::Armed, Some(true)) if claim_mine => {
-                if let Some(e0) = probe.e0 {
-                    state.epoch.apply(&Observation {
-                        probe: probe.job,
-                        admitted_at: e0,
-                        read_empty: true,
-                        retired: false,
-                    });
-                }
-                live.schedule.empty();
-            }
-            (Decision::Armed, _) => {
-                live.schedule.non_empty(now, state.epoch.epoch());
-            }
-            _ => live.schedule.failed(now),
-        }
+    }
+    for (number, key, decision) in live.segments.take_completed_probes() {
+        let read = live.read_of(key);
+        settle_probe(
+            live,
+            &mut state.epoch,
+            records,
+            number,
+            key,
+            decision,
+            read,
+            now,
+        );
     }
     for ended in live.segments.take_ended() {
         live.probes.retain(|p| Some(p.number) != ended.number);
         tracing::debug!(target: "composer_probe", ?ended, "segment ended");
+    }
+}
+
+impl Live {
+    /// The daemon's latest read of record `key`'s export, if any.
+    fn read_of(&self, key: RecordKey) -> Option<bool> {
+        self.reads
+            .iter()
+            .rev()
+            .find(|(k, _)| *k == key)
+            .map(|(_, empty)| *empty)
+    }
+}
+
+/// The epoch's settlement of probe `number` from its matched record `key`'s
+/// `decision` and the daemon's `read` of its export (R3 §3.4), once: an
+/// `Armed` empty read that is the deck's own claim applies the observation
+/// and the schedule's empty; another `Armed` is non-empty; anything else,
+/// no decision included, is a failed check.
+#[allow(clippy::too_many_arguments)]
+fn settle_probe(
+    live: &mut Live,
+    epoch: &mut InputEpoch,
+    records: &Records,
+    number: u64,
+    key: RecordKey,
+    decision: Option<Decision>,
+    read: Option<bool>,
+    now: Instant,
+) {
+    let Some(at) = live.probes.iter().position(|p| p.number == number) else {
+        return;
+    };
+    let probe = live.probes.remove(at);
+    // A record already pruned can't show whose claim it read: not applied.
+    let claim_mine = records
+        .get(key)
+        .is_some_and(|r| r.claim.is_none_or(|c| c == record::Claim::Owned));
+    tracing::debug!(
+        target: "composer_probe",
+        number,
+        ?decision,
+        ?read,
+        claim_mine,
+        e0 = ?probe.e0,
+        "probe settled"
+    );
+    match (decision, read) {
+        (Some(Decision::Armed), Some(true)) if claim_mine => {
+            if let Some(e0) = probe.e0 {
+                epoch.apply(&Observation {
+                    probe: probe.job,
+                    admitted_at: e0,
+                    read_empty: true,
+                    retired: false,
+                });
+            }
+            live.schedule.empty();
+        }
+        (Some(Decision::Armed), _) => {
+            live.schedule.non_empty(now, epoch.epoch());
+        }
+        _ => live.schedule.failed(now),
     }
 }
 
@@ -1034,9 +1088,9 @@ impl GenerationInput {
         }
         state.live = Some(Live {
             segments: Segments::new(generation, agent),
-            markers: ReturnMarkers::default(),
             pair_open: false,
             explained: 0,
+            unexplained: std::collections::VecDeque::new(),
             schedule: Schedule::default(),
             probes: Vec::new(),
             reads: std::collections::VecDeque::new(),
@@ -1055,9 +1109,21 @@ impl GenerationInput {
         &self.moved
     }
 
-    /// The output hook's bytes, for the return markers and the second
-    /// `ExternalEdit` producer (Q35-20, PR U3-11): every byte the agent
-    /// wrote, in order, at `now`. Nothing without segments attached.
+    /// The gate held one more op (R-U2-03): the release driver is woken, so
+    /// a segment that has already released passes it on as far as the next
+    /// held candidate, rather than leaving it held until something else
+    /// moves the segments. Called with the gate's lock and this one released.
+    pub fn held_accepted(&self) {
+        if self.has_segments() {
+            self.moved.notify_one();
+        }
+    }
+
+    /// The return markers the output hook read in one push, in output order
+    /// and at offsets counted from the generation's birth, for the segments
+    /// and the second `ExternalEdit` producer (Q35-20, PR U3-11), at `now`.
+    /// Nothing without segments attached: a marker read before attachment
+    /// can belong to no segment, and no record yet accounts for a pair.
     ///
     /// **The second producer.** A complete `?2004l` … `?2004h` pair, the
     /// shape of an editor session, that no record the deck made accounts for
@@ -1068,19 +1134,17 @@ impl GenerationInput {
     /// different paths. A mode observation alone, or the tracker's boolean,
     /// releases and grants nothing (the Q35-02 condition): only the
     /// segments' own watch, after a trigger's written offset, is E1.
-    pub fn on_output_bytes(&self, bytes: &[u8], now: Instant) {
+    pub fn on_return_markers(&self, seen: &[Seen], now: Instant) {
+        if seen.is_empty() {
+            return;
+        }
         let mut guard = self.state.lock_recovering();
         let state = &mut *guard;
         let (Some(live), false) = (state.live.as_mut(), state.retired) else {
             return;
         };
-        let mut seen: Vec<Seen> = Vec::new();
-        live.markers.feed(bytes, &mut seen);
-        if seen.is_empty() {
-            return;
-        }
         tracing::debug!(target: "composer_probe", ?seen, "return markers");
-        for s in &seen {
+        for s in seen {
             match s.marker {
                 Marker::PasteOff => live.pair_open = true,
                 Marker::PasteOn if live.pair_open => {
@@ -1089,6 +1153,10 @@ impl GenerationInput {
                         live.explained -= 1;
                     } else {
                         state.epoch.record(None);
+                        if live.unexplained.len() == usize::from(EXPLAINED_CAP) {
+                            live.unexplained.pop_front();
+                        }
+                        live.unexplained.push_back(now);
                     }
                 }
                 _ => {}
@@ -1096,7 +1164,7 @@ impl GenerationInput {
         }
         if let Some(records) = state.records.as_mut() {
             live.segments
-                .on_output(records, &mut state.hazards, &seen, now);
+                .on_output(records, &mut state.hazards, seen, now);
         }
         settle_live(state, now);
         drop(guard);
@@ -1299,10 +1367,20 @@ impl GenerationInput {
         &self,
         step: impl FnOnce(&mut Records, &mut HazardFifo) -> Result<T, Refusal>,
     ) -> Result<T, Refusal> {
+        self.with_records_live(|records, fifo, _| step(records, fifo))
+    }
+
+    /// [`Self::with_records`], the step also handed the generation's
+    /// segments and what they read, when attached: one hold for a record's
+    /// transition and what it means to them.
+    fn with_records_live<T>(
+        &self,
+        step: impl FnOnce(&mut Records, &mut HazardFifo, Option<&mut Live>) -> Result<T, Refusal>,
+    ) -> Result<T, Refusal> {
         let mut guard = self.state.lock_recovering();
         let state = &mut *guard;
         let result = match (state.retired, state.records.as_mut()) {
-            (false, Some(records)) => step(records, &mut state.hazards),
+            (false, Some(records)) => step(records, &mut state.hazards, state.live.as_mut()),
             _ => return Err(Refusal::Stale),
         };
         // Q35-20 (O-20.3): what the step allows the segments, in the same
@@ -1324,23 +1402,39 @@ impl GenerationInput {
         obs: &record::Observation,
         now: Instant,
     ) -> Result<Recorded, Refusal> {
-        let made = std::cell::Cell::new(false);
-        let recorded = self.with_records(|r, fifo| {
+        // An editor session the deck saw accounts for one bracketed-paste
+        // pair (PR U3-11's second producer), in the same hold that made its
+        // record, so no pair can be read between the two (R-U2-04). A pair
+        // that ended once its helper may have been born, read before the
+        // record, already moved the epoch: the record accounts for that one
+        // and banks nothing for a later pair. A tool's helper isn't the
+        // composer's, so it explains none.
+        let explains = obs.attribution != Attribution::NotOwned(NotOwned::Tool);
+        self.with_records_live(|r, fifo, live| {
             let before = r.get(obs.key).is_some();
             let recorded = r.observe(fifo, obs, now);
-            made.set(!before && r.get(obs.key).is_some());
-            recorded
-        });
-        // An editor session the deck saw accounts for one bracketed-paste
-        // pair (PR U3-11's second producer). A tool's helper isn't the
-        // composer's, so it explains none.
-        if made.get() && obs.attribution != Attribution::NotOwned(NotOwned::Tool) {
-            let mut state = self.state.lock_recovering();
-            if let Some(live) = state.live.as_mut() {
-                live.explained = live.explained.saturating_add(1).min(EXPLAINED_CAP);
+            if explains
+                && !before
+                && r.get(obs.key).is_some()
+                && let Some(live) = live
+            {
+                // Its helper was born at or after its floor: a pair that
+                // ended before that floor wasn't its session.
+                match live
+                    .unexplained
+                    .iter()
+                    .position(|&ended| ended >= obs.birth_floor)
+                {
+                    Some(at) => {
+                        live.unexplained.remove(at);
+                    }
+                    None => {
+                        live.explained = live.explained.saturating_add(1).min(EXPLAINED_CAP);
+                    }
+                }
             }
-        }
-        recorded
+            recorded
+        })
     }
 
     /// See [`Records::refused_identity`].

@@ -952,3 +952,27 @@ fn spawn_on(registry: &Arc<AgentPtyRegistry>, pane: &str, command: &str) -> Stri
         })
         .expect("spawn on the pane")
 }
+
+/// Scenario: On a generation with segments attached, close the fence and hand the pane writer three frames, one at a time, with no segment, marker or record moving in between. Each is held, and each wakes the generation's release driver as it is held, so a segment that has already released to a running editor passes it on rather than leaving it held until something else happens (R-U2-03).
+#[spec("inbox/probe/010")]
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_010_held_typing_wakes_the_release_driver() {
+    use crate::composer_probe::record::{EcPolicy, Records};
+    use crate::composer_probe::segments::Agent;
+    let rig = Rig::new(true, None);
+    assert!(
+        rig.input
+            .attach_records(Records::new(1, EcPolicy::Hold, Instant::now()))
+    );
+    assert!(rig.input.attach_segments(1, Agent::Claude));
+    rig.fence();
+    for bytes in [b"a", b"b", b"c"] {
+        let woken = rig.input.segments_moved().notified();
+        tokio::pin!(woken);
+        woken.as_mut().enable();
+        assert!(matches!(rig.offer(bytes).await.0, Accepted::Held));
+        tokio::time::timeout(Duration::from_secs(1), woken)
+            .await
+            .expect("the held frame wakes the driver");
+    }
+}

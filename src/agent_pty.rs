@@ -5304,7 +5304,12 @@ impl PaneWriter {
                         .await,
                 )
             }
-            Admission::Held => Accepted::Held,
+            Admission::Held => {
+                // R-U2-03: a released segment's driver may now have bytes
+                // to pass; with the gate's and the epoch's locks released.
+                input.held_accepted();
+                Accepted::Held
+            }
             Admission::Settled(frame) => {
                 input.enqueue(Writer::Human, &[]);
                 if let Some(ticket) = frame.ticket {
@@ -5534,6 +5539,7 @@ impl PaneWriter {
         let frame = match admitted {
             Admission::Open(frame) => frame,
             Admission::Held => {
+                input.held_accepted();
                 return Ok(AnswerWrite::Held(HeldAnswerWrite {
                     at: self.state.lock().unwrap().input_seq,
                     done,

@@ -50,6 +50,7 @@ use std::time::Instant;
 use super::epoch::{GenerationInput, OutputNote, output_notes};
 use super::framing::{Csi, Event, Framing, Token};
 use super::observe::BellSlot;
+use super::segments::{Seen, seen_ending_at};
 
 /// DEC private mode 2004: bracketed paste.
 const BRACKETED_PASTE: u32 = 2004;
@@ -90,12 +91,23 @@ impl OutputHook {
     pub fn on_output(&mut self, bytes: &[u8]) {
         let mut notes: Vec<OutputNote> = Vec::new();
         let mut paste_off = false;
-        self.paste_mode.feed_observing(bytes, |token, modes| {
-            if let Event::Csi(csi) = token.event
-                && csi.final_byte == b'l'
-                && modes.contains(&BRACKETED_PASTE)
-            {
-                paste_off = true;
+        // Q35-20 (R-U2-02): the return markers are read here, in this
+        // framing and this count, both from the generation's birth: the same
+        // coordinate its triggers' offsets and drain frontiers are in, and a
+        // framing that was never started mid-sequence.
+        let mut markers: Vec<Seen> = Vec::new();
+        let base = self.fed;
+        self.paste_mode.feed_observing(bytes, |token, modes, at| {
+            if let Event::Csi(csi) = token.event {
+                if csi.final_byte == b'l' && modes.contains(&BRACKETED_PASTE) {
+                    paste_off = true;
+                }
+                if let Some(seen) = base
+                    .and_then(|base| base.checked_add(at as u64))
+                    .and_then(|end| seen_ending_at(token, &csi, end))
+                {
+                    markers.push(seen);
+                }
             }
             output_notes(token, modes, &mut notes)
         });
@@ -111,10 +123,12 @@ impl OutputHook {
         if !notes.is_empty() {
             self.input.on_output(&notes, now);
         }
-        // Q35-20: an installed generation's segments read the same bytes
-        // for their return markers, after the notes, under the same output
-        // lock. Nothing without segments attached.
-        self.input.on_output_bytes(bytes, now);
+        // Q35-20: an installed generation's segments read the push's return
+        // markers, after the notes, under the same output lock. Nothing
+        // without segments attached.
+        if !markers.is_empty() {
+            self.input.on_return_markers(&markers, now);
+        }
         // An agent writes `?2004l` as it runs its editor: scan for the
         // helper while it is starting (R5 §3.3). Ringing takes no lock.
         if paste_off && let Some(bell) = self.bell.get() {
@@ -162,18 +176,19 @@ impl Default for PasteModeTracker {
 impl PasteModeTracker {
     /// Read the next bytes of the output, in order, however they were split.
     pub fn feed(&mut self, bytes: &[u8]) {
-        self.feed_observing(bytes, |_, _| {});
+        self.feed_observing(bytes, |_, _, _| {});
     }
 
-    /// [`Self::feed`], handing `observe` every token and, for a `CSI ? … h`
-    /// or `l`, the whole parameter values `vte` keeps (empty otherwise).
+    /// [`Self::feed`], handing `observe` every token, for a `CSI ? … h` or
+    /// `l` the whole parameter values `vte` keeps (empty otherwise), and the
+    /// index in `bytes` of the byte that completed it.
     pub(super) fn feed_observing(
         &mut self,
         bytes: &[u8],
-        mut observe: impl FnMut(&Token<'_>, &[u32]),
+        mut observe: impl FnMut(&Token<'_>, &[u32], usize),
     ) {
         let Self { framing, on } = self;
-        for &byte in bytes {
+        for (at, &byte) in bytes.iter().enumerate() {
             framing.feed(byte, |token| {
                 let modes = match token.event {
                     Event::Csi(csi)
@@ -190,7 +205,7 @@ impl PasteModeTracker {
                     Event::Escape(b'c') => *on = false,
                     _ => {}
                 }
-                observe(&token, &modes);
+                observe(&token, &modes, at);
             });
         }
     }

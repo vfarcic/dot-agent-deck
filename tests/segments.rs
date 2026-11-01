@@ -13,7 +13,7 @@ use dot_agent_deck::composer_probe::record::{
     Route, ScopeState, Tree,
 };
 use dot_agent_deck::composer_probe::segments::{
-    Agent, Ended, Kind, Marker, NOT_RETURNED, Outcome, Refusal, ReturnMarkers, ReturnWatch,
+    Agent, Ended, Front, Kind, Marker, NOT_RETURNED, Outcome, Refusal, ReturnMarkers, ReturnWatch,
     SEGMENT_CAP, Seen, Segments, Stage, View,
 };
 use spec::spec;
@@ -624,6 +624,88 @@ fn probe_009_wait_unknown_and_an_unseen_editor_hold() {
     assert_eq!(t.stages(5), [Stage::AwaitingReturn], "EC needs the frame");
     t.out(FRAME, 6);
     assert_eq!(t.written(), [Some(n)]);
+}
+
+/// Scenario: Release a person's Ctrl+G to its running editor (`Unarmed`, the editor child seen running), then let its helper exit with no report, its wait having failed. Once that unknown ending is drained the segment no longer lets anything still held go: the front reads held and the view `AwaitingReturn`, while the same release with a clean report keeps passing typing to the editor until its return (R-U2-06).
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_an_unknown_wait_withdraws_a_running_editors_release() {
+    for agent in [Agent::Claude, Agent::Codex] {
+        for report in [None, Some(Report::Done(Tree::Clean))] {
+            let mut t = T::new(agent, HOLD);
+            let g = t.s.open_held_trigger().unwrap();
+            t.write(g, 1);
+            t.ipc(1, Decision::Unarmed, g, 2);
+            assert!(t.editor(1, 3));
+            assert_eq!(
+                t.s.front(),
+                Front::Released,
+                "{agent:?}: the editor reads it"
+            );
+            if let Some(report) = report {
+                t.report(1, report, 4);
+            }
+            t.exit(1, 5);
+            let (front, stage) = (t.s.front(), t.stages(5)[0]);
+            match report {
+                None => {
+                    assert_eq!(front, Front::Held, "{agent:?}: what is still held stays");
+                    assert_eq!(stage, Stage::AwaitingReturn, "{agent:?}");
+                }
+                Some(_) => {
+                    assert_eq!(front, Front::Released, "{agent:?}: a known ending");
+                    assert_eq!(stage, Stage::Released, "{agent:?}");
+                }
+            }
+            t.returns(6);
+            assert_eq!(
+                t.s.front() == Front::Released,
+                report.is_some(),
+                "{agent:?}: a return doesn't restore it"
+            );
+        }
+    }
+}
+
+/// Scenario: Open a probe and publish its number, then, before the writer's report of its trigger reaches the segments, let its own helper read the number and decide `Armed`, exit, and Claude write its whole return. Reported written afterwards, at the offset its job started at, the segment completes from the return it kept. A second probe's trigger fails after the same in-flight return: it ends `WriteFailed`, and the markers it kept complete and release nothing. A held Ctrl+G whose helper decides `Unarmed` and whose editor is seen running before its trigger's report releases once that report arrives (R-U2-01).
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_a_return_read_before_the_written_report_completes_it() {
+    let mut t = T::new(Agent::Claude, HOLD);
+    let n = t.probe(0);
+    let started = t.m.fed();
+    t.ipc(1, Decision::Armed, n, 2);
+    t.returns(3);
+    t.exit(1, 4);
+    assert!(t.written().is_empty(), "nothing before the report");
+    t.s.written(&mut t.r, &mut t.f, n, started, time(t.t, 1), time(t.t, 5))
+        .unwrap();
+    assert_eq!(t.written(), [Some(n)], "the kept return completes it");
+    assert_eq!(t.s.front(), Front::None);
+
+    let n = t.probe(6);
+    t.ipc(2, Decision::Armed, n, 7);
+    t.returns(8);
+    t.exit(2, 9);
+    t.s.write_failed(n).unwrap();
+    assert_eq!(t.ended(), [(Some(n), Kind::Probe, Outcome::WriteFailed)]);
+    assert_eq!(t.s.front(), Front::None);
+    assert!(
+        t.s.is_empty(),
+        "no segment kept the failed trigger's return"
+    );
+
+    // The same for a fact the observer reports once: a held Ctrl+G's helper
+    // and its running editor seen before its trigger's report arrives.
+    let g = t.s.open_held_trigger().unwrap();
+    t.ipc(3, Decision::Unarmed, g, 10);
+    assert!(!t.editor(3, 11), "no segment has matched it yet");
+    t.write(g, 12);
+    assert_eq!(
+        t.s.front(),
+        Front::Released,
+        "the editor seen first still counts"
+    );
 }
 
 /// Scenario: Write a held Ctrl+G whose helper decides `Armed`. On Claude it passes through at the decision and completes at E1; on Codex it holds until E1F. A matched helper that decided `Unarmed` and then failed to start the editor holds until E1 on Claude and E1F on Codex under `Authority`, and for good under `Hold`.

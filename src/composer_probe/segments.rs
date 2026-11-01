@@ -32,7 +32,11 @@
 //! match nothing. A record matched by its birth that later names another
 //! number holds its segment for good ([`Stage::Mismatched`]).
 //!
-//! **The return markers.** [`ReturnMarkers`] reads the output through the
+//! **The return markers.** The output hook (`super::paste_mode::OutputHook`)
+//! reads them in its own framing, every byte from the generation's birth, so
+//! a marker's offset is in the coordinate its triggers and frontiers are in
+//! (R-U2-02); [`ReturnMarkers`] is the same reading on its own, for a caller
+//! that holds no hook. Either reads the output through the
 //! output grammar and reports `ESC [ ? 2004 l`, `ESC [ ? 2004 h` and
 //! `ESC [ ? 2026 h`, each spelled exactly, with the offset of its ESC: the
 //! frame is [`super::epoch`]'s marker predicate itself, and the two paste
@@ -66,7 +70,13 @@
 //! - Claude `HumanG` stage 2 `Armed`: released at the decision; complete at
 //!   E1.
 //! - `HumanG` stage 2 `Unarmed`: released once the decision is `Unarmed` and
-//!   the editor child was observed running; complete at EC.
+//!   the editor child was observed running; complete at EC. When its record
+//!   then drains `WaitUnknown`, that release ends for what is still held
+//!   (R-U2-06): only retirement ends it.
+//! - A segment's return markers read while its trigger is in flight (after
+//!   its number is published, before the writer's report reaches here) are
+//!   kept, and read once the trigger is reported written; a failed or
+//!   withdrawn trigger discards them (R-U2-01).
 //! - A record whose report is `SpawnFailed` before its release: released at
 //!   completion (E1 on Claude, E1F on Codex). `WaitUnknown` (an
 //!   editor-bearing decision with no report at the drain) opens the writer
@@ -118,6 +128,12 @@ pub const NOT_RETURNED: Duration = Duration::from_secs(5);
 /// The most segments a generation keeps; the planner refuses an op that
 /// would open more.
 pub const SEGMENT_CAP: usize = 64;
+
+/// The most return markers a segment keeps while its trigger is in flight
+/// (R-U2-01): the latest are kept. An E1 needs only the last disable and
+/// the enable after it, so dropping older ones can only hold, never
+/// release.
+pub const IN_FLIGHT_MARKERS: usize = 64;
 
 /// Whose return path a generation's segments wait for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +211,14 @@ impl Default for ReturnMarkers {
     }
 }
 
+/// The return marker a whole output CSI is, with the offset of its ESC,
+/// when the byte that completed it is at output offset `end`.
+pub fn seen_ending_at(token: &Token<'_>, csi: &Csi<'_>, end: u64) -> Option<Seen> {
+    let marker = return_marker(token, csi)?;
+    let start = end.checked_sub(MARKER_LEN - 1)?;
+    Some(Seen { marker, start })
+}
+
 impl ReturnMarkers {
     /// Read the next output bytes, appending each marker they complete.
     pub fn feed(&mut self, bytes: &[u8], out: &mut Vec<Seen>) {
@@ -205,10 +229,9 @@ impl ReturnMarkers {
             let at = self.fed;
             self.framing.feed(byte, |token| {
                 if let Event::Csi(csi) = token.event
-                    && let Some(marker) = return_marker(&token, &csi)
-                    && let Some(start) = at.checked_sub(MARKER_LEN - 1)
+                    && let Some(seen) = seen_ending_at(&token, &csi, at)
                 {
-                    out.push(Seen { marker, start });
+                    out.push(seen);
                 }
             });
             match self.fed.checked_add(1) {
@@ -419,6 +442,13 @@ struct Segment {
     number: Option<u64>,
     /// The output offset and instant its trigger was reported accepted.
     written: Option<(u64, Instant)>,
+    /// Return markers read while its trigger was in flight: numbered, its
+    /// write not yet reported (R-U2-01). The agent can read the trigger and
+    /// answer before the writer's report reaches here, so they are kept,
+    /// and read once it is reported written, against its offset; a trigger
+    /// that fails or is withdrawn takes them with it. The latest
+    /// [`IN_FLIGHT_MARKERS`] are kept.
+    in_flight: VecDeque<Seen>,
     record: Option<RecordKey>,
     mismatched: bool,
     fact: Option<ExitFact>,
@@ -430,6 +460,12 @@ struct Segment {
     /// When its record was first seen drained (E5's origin).
     drained_at: Option<Instant>,
     released: bool,
+    /// Its release has been withdrawn for what is still held (R-U2-06): it
+    /// released to the user's editor while that ran, and its record then
+    /// drained `WaitUnknown`, an editor-bearing decision with no report.
+    /// What went before stays the editor's; what is still held waits for
+    /// retirement (Q104b's OQ5).
+    cut_off: bool,
     /// A probe whose matched decision was handed to the epoch's settlement
     /// ([`Segments::take_decided_probes`]).
     decided: bool,
@@ -442,6 +478,7 @@ impl Segment {
             op,
             number,
             written: None,
+            in_flight: VecDeque::new(),
             record: None,
             mismatched: false,
             fact: None,
@@ -451,6 +488,7 @@ impl Segment {
             enabled_at: None,
             drained_at: None,
             released: false,
+            cut_off: false,
             decided: false,
         }
     }
@@ -474,6 +512,17 @@ pub struct Segments {
     /// The last number published; 0 before the first.
     last: u64,
     ended: Vec<Ended>,
+    /// Probes that completed before their decision was handed to the epoch's
+    /// settlement, or after it was handed back ([`Self::undecide`]): their
+    /// number, record and decision, for [`Self::take_completed_probes`]
+    /// (R-U2-05). A completion removes the segment, so it would otherwise
+    /// take the settlement with it.
+    completed: Vec<(u64, RecordKey, Option<Decision>)>,
+    /// Records whose editor child was seen running before a segment matched
+    /// them (R-U2-01's kind: the observer reports it once, and a trigger's
+    /// written report can still be on its way): a segment that matches one
+    /// takes it then. The latest [`super::record::RECORD_CAP`] are kept.
+    editors: VecDeque<RecordKey>,
     retired: bool,
 }
 
@@ -485,6 +534,8 @@ impl Segments {
             segments: VecDeque::new(),
             last: 0,
             ended: Vec::new(),
+            completed: Vec::new(),
+            editors: VecDeque::new(),
             retired: false,
         }
     }
@@ -576,7 +627,7 @@ impl Segments {
         match self.segments.front() {
             None => Front::None,
             Some(seg) if seg.number.is_none() => Front::Trigger,
-            Some(seg) if seg.released => Front::Released,
+            Some(seg) if seg.released && !seg.cut_off => Front::Released,
             Some(_) => Front::Held,
         }
     }
@@ -619,6 +670,14 @@ impl Segments {
             }
         }
         decided
+    }
+
+    /// The probes that completed with their settlement still to do, each
+    /// once (R-U2-05): its number, matched record and decision, `None` when
+    /// none was ever known. Their records have drained, so nothing they wait
+    /// for is still coming.
+    pub fn take_completed_probes(&mut self) -> Vec<(u64, RecordKey, Option<Decision>)> {
+        std::mem::take(&mut self.completed)
     }
 
     /// Hand probe `number`'s decision to [`Self::take_decided_probes`] again
@@ -678,6 +737,14 @@ impl Segments {
         let seg = &mut self.segments[i];
         seg.written = Some((offset, at));
         seg.e1 = Some(ReturnWatch::e1(offset));
+        // What the agent wrote while the report was on its way: read now,
+        // the watch's own bound deciding what counts (R-U2-01).
+        let kept = std::mem::take(&mut seg.in_flight);
+        if i == 0 {
+            for s in kept {
+                Self::feed_front(seg, records, s, now);
+            }
+        }
         self.evaluate(records, fifo, now);
         Ok(())
     }
@@ -747,31 +814,43 @@ impl Segments {
             return;
         }
         for &s in seen {
-            if let Some(seg) = self.segments.front_mut()
-                && seg.written.is_some()
-            {
-                // The caller publishes the frontier before it feeds the
-                // output after it (amendment 4 §7.2). One learned later
-                // counts only the markers fed after it, which holds.
-                if seg.ec.is_none()
-                    && let Some(r) = seg.record.and_then(|k| records.get(k))
-                    && let Frontier::Taken { offset } = r.frontier
-                {
-                    seg.ec = Some(ReturnWatch::ec(offset));
-                }
-                if let Some(w) = seg.e1.as_mut() {
-                    w.feed(s);
-                    seg.enabled_at = match (w.enabled(), seg.enabled_at) {
-                        (true, None) => Some(now),
-                        (true, at) => at,
-                        (false, _) => None,
-                    };
-                }
-                if let Some(w) = seg.ec.as_mut() {
-                    w.feed(s);
+            if let Some(seg) = self.segments.front_mut() {
+                if seg.written.is_some() {
+                    Self::feed_front(seg, records, s, now);
+                } else if seg.number.is_some() {
+                    // Its trigger is in flight: kept until it is reported.
+                    if seg.in_flight.len() == IN_FLIGHT_MARKERS {
+                        seg.in_flight.pop_front();
+                    }
+                    seg.in_flight.push_back(s);
                 }
             }
             self.evaluate(records, fifo, now);
+        }
+    }
+
+    /// One return marker for the front segment, whose trigger was reported
+    /// written.
+    fn feed_front(seg: &mut Segment, records: &Records, s: Seen, now: Instant) {
+        // The caller publishes the frontier before it feeds the output after
+        // it (amendment 4 §7.2). One learned later counts only the markers
+        // fed after it, which holds.
+        if seg.ec.is_none()
+            && let Some(r) = seg.record.and_then(|k| records.get(k))
+            && let Frontier::Taken { offset } = r.frontier
+        {
+            seg.ec = Some(ReturnWatch::ec(offset));
+        }
+        if let Some(w) = seg.e1.as_mut() {
+            w.feed(s);
+            seg.enabled_at = match (w.enabled(), seg.enabled_at) {
+                (true, None) => Some(now),
+                (true, at) => at,
+                (false, _) => None,
+            };
+        }
+        if let Some(w) = seg.ec.as_mut() {
+            w.feed(s);
         }
     }
 
@@ -823,6 +902,12 @@ impl Segments {
         }
         self.evaluate(records, fifo, now);
         let Some(seg) = self.segments.iter_mut().find(|s| s.record == Some(key)) else {
+            if !self.editors.contains(&key) {
+                if self.editors.len() == record::RECORD_CAP {
+                    self.editors.pop_front();
+                }
+                self.editors.push_back(key);
+            }
             return false;
         };
         seg.editor_running = true;
@@ -884,7 +969,7 @@ impl Segments {
         if seg.mismatched {
             return (Stage::Mismatched, None);
         }
-        if seg.released {
+        if seg.released && !seg.cut_off {
             return (Stage::Released, None);
         }
         if seg.record.is_none() {
@@ -921,6 +1006,14 @@ impl Segments {
             if let Some(fact) = seg.record.and_then(|k| records.fact(k)) {
                 seg.fact = Some(fact);
             }
+            // A release before an unknown ending was the running editor's;
+            // once the ending is known unknown, it releases nothing more.
+            if seg.released
+                && let Some(fact) = seg.fact
+                && wait_unknown(fact.decision, fact.report)
+            {
+                seg.cut_off = true;
+            }
         }
         while let Some(seg) = self.segments.front_mut() {
             let (Some(number), Some((_, written_at))) = (seg.number, seg.written) else {
@@ -932,6 +1025,10 @@ impl Segments {
                 && records.match_segment(self.generation, key, number).is_ok()
             {
                 seg.record = Some(key);
+                if let Some(at) = self.editors.iter().position(|k| *k == key) {
+                    self.editors.remove(at);
+                    seg.editor_running = true;
+                }
             }
             let Some(key) = seg.record else {
                 return;
@@ -966,6 +1063,16 @@ impl Segments {
                 Err(_) => return,
             }
             if let Some(seg) = self.segments.pop_front() {
+                if seg.kind == Kind::Probe
+                    && !seg.decided
+                    && let (Some(number), Some(key)) = (seg.number, seg.record)
+                {
+                    let decision = records
+                        .get(key)
+                        .and_then(|r| r.decision)
+                        .or_else(|| seg.fact.and_then(|f| f.decision));
+                    self.completed.push((number, key, decision));
+                }
                 self.ended.push(seg.end(Outcome::Written));
             }
         }
@@ -1003,6 +1110,14 @@ fn early_release(agent: Agent, seg: &Segment, r: &Record) -> bool {
         (_, Kind::HumanG, Some(Decision::Unarmed)) => seg.editor_running,
         _ => false,
     }
+}
+
+/// Whether a drained record's ending is `WaitUnknown`: an editor-bearing
+/// decision (or none) and no report the helper recognisably sent, so
+/// nothing says when, or whether, its editor stopped reading.
+fn wait_unknown(decision: Option<Decision>, report: Report) -> bool {
+    !decision.is_some_and(Decision::helper_only)
+        && matches!(report, Report::None | Report::Unrecognised)
 }
 
 /// [`Record::helper_only`], from the facts kept at the drain.
