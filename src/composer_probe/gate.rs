@@ -345,6 +345,11 @@ impl<T> Gate<T> {
     /// when no segment is outstanding; otherwise it stays closed, holding the
     /// rest. Both closures run under the gate's lock and must take no lock.
     /// Empty when no fence was closed.
+    ///
+    /// It asks no authority: production releases through
+    /// [`Self::release_until_if`] with the segments' check, and this
+    /// always-allowed form is for callers that model no segments (the gate's
+    /// own tests).
     pub fn release_until(
         &self,
         measure: impl FnMut(&T) -> Measure,
@@ -356,11 +361,23 @@ impl<T> Gate<T> {
 
     /// [`Self::release_until`] under `authority`, asked first, under the
     /// gate's lock, whether the segments still allow the release
-    /// (R-B-U2-02): a fact that withdraws it (an unknown wait's cut-off, a
-    /// retirement of the input) is either published before that read, and
-    /// nothing is taken, or after the ops are taken, when they are already
-    /// released. It may take the epoch's lock (R6), which the arm section
-    /// takes under this one too; nothing takes this lock under R6.
+    /// (R-B-U2-02).
+    ///
+    /// **The linearization point is that read.** A successful authority read
+    /// commits the release logically: what it releases is decided by the
+    /// held set as it stands at the read, and the gate's lock, held from
+    /// before the read until the ops are taken, keeps every acceptance and
+    /// retirement from changing that set in between. A fact that withdraws
+    /// the release (an unknown wait's cut-off, a retirement of the input) is
+    /// published under R6, which the read also takes, so it is ordered
+    /// either before the read, which then refuses and nothing is taken, or
+    /// after it, and so after the logical release. The ops are physically
+    /// taken after the read, and R6 is not held through that; a withdrawal
+    /// published in that window is still ordered after the release, which is
+    /// what makes taking them correct, not the physical timing.
+    ///
+    /// `authority` may take R6, which the arm section takes under this lock
+    /// too; nothing takes this lock under R6.
     pub fn release_until_if(
         &self,
         authority: impl FnOnce() -> bool,

@@ -1711,7 +1711,10 @@ pub mod seam {
 
         /// A pause whose FIFO can't be opened (it doesn't exist) or read (it
         /// is a directory) passes with nothing written, and says so in the
-        /// trace rather than as `resume` (the audit's U3-10).
+        /// trace rather than as `resume` (the audit's U3-10). The seam, and
+        /// so this unit, compiles only with the `e2e` feature: it runs in
+        /// lane 1 (`cargo test-e2e`, which CI's `e2e-deterministic` runs
+        /// from its whole archive), not in `cargo test-fast`.
         #[test]
         fn a_pause_that_cannot_wait_is_traced_as_failed() {
             let dir = tempfile::tempdir().unwrap();

@@ -47,9 +47,13 @@
 //!
 //! **Where its power ends.** It is serial: each step settles before the
 //! next, so a race between the observer and a driver pass in flight is found
-//! only where a fixed script forces it. Its floors count each row of the
-//! release table it reached ([`ROWS`]), each settlement kind and each kind of
-//! step, not every combination. Not exercised here, each its own obligation
+//! only where a fixed script forces it. Its floors require a selection of the
+//! release table's tuples ([`ROWS`], 14 when written), each settlement kind
+//! and each kind of step, not every combination and not the whole table: no
+//! Claude failed-start tuple and no tuple without a decision is required,
+//! and a tuple's key does not tell an ending by a drain or an unknown wait
+//! from a running editor (the cut-off has its own floor). Each is counted
+//! once per segment that reached it, not per evaluation. Not exercised here, each its own obligation
 //! and not evidence that it passed (R-B-U3-03): admission (its own tests and
 //! S-20's `e2e_probe_admission`), the observer's `/proc` scan and editor
 //! identity, more than one probe in a script, other Ctrl+G forms and
@@ -1321,8 +1325,9 @@ async fn run_seeds(seeds: std::ops::RangeInclusive<u64>) -> Reached {
     reached
 }
 
-/// The release table's rows a run must reach (R-B-U3-02): `(agent, kind,
-/// decision, editor seen, start failed, releases)`. Under `EcPolicy::Hold`
+/// The release-table tuples a run must reach (R-B-U3-02): `(agent, kind,
+/// decision, editor seen, start failed, releases)`, a selection of the
+/// table, not all of it (see the module documentation). Under `EcPolicy::Hold`
 /// no row completes by EC, and the Authority policy's EC rows are out of
 /// this rig's reach (see the module documentation).
 const ROWS: &[(&str, MKind, &str, bool, bool, bool)] = &[
@@ -1348,7 +1353,7 @@ const ROWS: &[(&str, MKind, &str, bool, bool, bool)] = &[
     ("Codex", MKind::HumanG, "Tool", false, true, false),
 ];
 
-/// Assert that `reached` reached each row of [`ROWS`], each kind of step
+/// Assert that `reached` reached each tuple of [`ROWS`], each kind of step
 /// and each kind of settlement at least `floor` times.
 fn assert_reached(reached: &Reached, floor: usize) {
     let r = &reached.stats;
@@ -1396,7 +1401,7 @@ async fn probe_010_releases_follow_the_release_table_on_the_production_driver() 
     assert_reached(&reached, 1);
 }
 
-/// Scenario: The generated release-table scripts of `probe_010_releases_follow_the_release_table_on_the_production_driver`, over a longer, different run of seeds, each row of the table reached many times over.
+/// Scenario: The generated release-table scripts of `probe_010_releases_follow_the_release_table_on_the_production_driver`, over a longer, different run of seeds, each release-table tuple the oracle requires reached at least three times.
 #[cfg(feature = "e2e")]
 #[spec("inbox/probe/010")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1648,6 +1653,40 @@ mod pairs {
         );
     }
 
+    /// Scenario: One more editor session than the accounting remembers pairs for, with each helper born after the previous session's bracketed-paste pair ended and every record arriving late, oldest first. Each pair moves the epoch; the late records move nothing; and an unrelated pair read after them still moves the epoch, because the oldest record may be the forgotten pair's session and so spends no newer session's debt (R-B-U2-01, staggered births).
+    #[spec("inbox/probe/048")]
+    #[test]
+    fn probe_048_staggered_births_past_the_cap_lend_nothing_to_a_later_pair() {
+        let (input, _hook) = generation();
+        let pair = pair_markers();
+        let base = Instant::now();
+        let at = |n: u64| base + Duration::from_millis(n);
+        let sessions = u64::from(crate::composer_probe::epoch::EXPLAINED_CAP) + 1;
+        // b1 < p1 < b2 < p2 < … : helper `s` is born at 2s, its pair ends at
+        // 2s + 1, and no record has arrived yet.
+        for s in 1..=sessions {
+            input.on_return_markers(&pair, at(2 * s + 1));
+        }
+        assert_eq!(input.epoch().last_foreign(), sessions);
+        let late = at(2 * sessions + 10);
+        for s in 1..=sessions {
+            input
+                .record_observe(&session(s as u32, at(2 * s)), late)
+                .unwrap();
+        }
+        assert_eq!(
+            input.epoch().last_foreign(),
+            sessions,
+            "a late record moves nothing"
+        );
+        input.on_return_markers(&pair, at(2 * sessions + 11));
+        assert_eq!(
+            input.epoch().last_foreign(),
+            sessions + 1,
+            "an unrelated pair after the staggered late records moves the epoch"
+        );
+    }
+
     /// The return markers of one whole bracketed-paste pair.
     fn pair_markers() -> [crate::composer_probe::segments::Seen; 2] {
         use crate::composer_probe::segments::{Marker, Seen};
@@ -1663,7 +1702,7 @@ mod pairs {
         ]
     }
 
-    /// Scenario: A helper's record is made, so its session may account for one bracketed-paste pair, but its pair never comes (the agent dropped it). While the helper runs, and for a grace after its drain, a pair read is still taken as its session's; once the grace is over, its credit is gone, and an unrelated pair moves the epoch (the audit's U3-4). A session that never drains keeps its credit however long its editor runs.
+    /// Scenario: A helper's record is made, so its session may account for one bracketed-paste pair, but its pair never comes (the agent dropped it). While the helper runs, and for a grace after its drain, a pair read is still taken as its session's; once the grace is over, its credit is gone, and an unrelated pair moves the epoch (the audit's U3-4). A session's own pair delivered after the grace (a paused or backlogged output reader) also moves the epoch, once: the grace is a conservative policy, not a bound on output delivery. A session that never drains keeps its credit however long its editor runs.
     #[spec("inbox/probe/048")]
     #[test]
     fn probe_048_a_drained_record_whose_pair_never_came_lends_nothing() {
@@ -1701,6 +1740,29 @@ mod pairs {
         input.record_observe(&session(1, born), born).unwrap();
         input.on_return_markers(&pair, past(past(Instant::now())));
         assert_eq!(input.epoch().last_foreign(), 0, "a long editor session");
+
+        // Control: its own pair, delayed past the grace after its drain, is
+        // read as an external edit, once; an unrelated pair after it moves
+        // the epoch too, so nothing is left banked by the late one.
+        let (input, _hook) = generation();
+        let born = Instant::now();
+        input.record_observe(&session(1, born), born).unwrap();
+        let drained = Instant::now();
+        input.record_exit(G, key(1), drained, drained).unwrap();
+        input.record_drained(G, key(1), drained).unwrap();
+        let late = past(drained);
+        input.on_return_markers(&pair, late);
+        assert_eq!(
+            input.epoch().last_foreign(),
+            1,
+            "its own pair, delivered after the grace, costs one more epoch"
+        );
+        input.on_return_markers(&pair, late + Duration::from_millis(1));
+        assert_eq!(
+            input.epoch().last_foreign(),
+            2,
+            "an unrelated pair after it"
+        );
     }
 
     /// One event of an interleaved pair script.
@@ -1716,22 +1778,55 @@ mod pairs {
         Drain(usize),
         /// A pair no record accounts for.
         Foreign,
+        /// The clock moves past [`CREDIT_AFTER_DRAIN`].
+        ///
+        /// [`CREDIT_AFTER_DRAIN`]: crate::composer_probe::epoch::CREDIT_AFTER_DRAIN
+        Wait,
     }
 
-    /// Scenario: Generate scripts in which editor sessions overlap rather than following one another: each helper is born, then its record and its bracketed-paste pair arrive in either order, interleaved with other sessions' and with pairs no record accounts for; some scripts read a backlog of pairs past what the accounting remembers before any of their records, and most end with an unrelated pair. Every pair no record accounts for moves the epoch, then or later: from any point in the script, the epoch moves at least once for each such pair read from there on (R-B-U2-01).
-    #[spec("inbox/probe/048")]
-    #[test]
-    fn probe_048_interleaved_sessions_and_backlogs_keep_every_foreign_pair() {
-        let cap = usize::from(crate::composer_probe::epoch::EXPLAINED_CAP);
-        let mut backlogs = 0;
-        for seed in 1..=300u64 {
-            let mut rng = Rng(0x2545_f491_4f6c_dd1d ^ seed.wrapping_mul(0xd1b5_4a32_d192_ed03));
-            let sessions = rng.below(10) as usize;
-            let foreign = rng.below(4) as usize;
-            let delayed = rng.chance(40);
-            let events = if delayed {
+    /// The script shapes [`probe_048_interleaved_sessions_and_backlogs_keep_every_foreign_pair`]
+    /// generates, and how many of each it ran.
+    #[derive(Debug, Default)]
+    struct Shapes {
+        /// More pairs read before their records than the accounting
+        /// remembers.
+        backlogs: usize,
+        /// A backlog past the cap in which a helper was born after an
+        /// earlier pair had ended: R-B-U2-01's staggered births.
+        staggered: usize,
+        /// A session whose pair never comes.
+        pairless: usize,
+        /// Ended with every session drained, the grace over, and a final
+        /// unrelated pair.
+        quiescent: usize,
+        /// A session whose pair is read after its credit expired.
+        late_own: usize,
+    }
+
+    /// One generated script: its events, and which sessions have no pair.
+    fn script(rng: &mut Rng, cap: usize) -> (Vec<Event>, Vec<bool>) {
+        let shape = rng.below(3);
+        let sessions = if shape == 2 {
+            cap + 1 + rng.below(5) as usize
+        } else {
+            rng.below(10) as usize
+        };
+        let foreign = rng.below(4) as usize;
+        // In one script in three, one or two sessions whose pair never comes
+        // (the agent exited, or the pair was lost).
+        let mut pairless = vec![false; sessions];
+        if sessions > 0 && rng.chance(33) {
+            for _ in 0..=usize::from(rng.chance(30)) {
+                pairless[rng.below(sessions as u64) as usize] = true;
+            }
+        }
+        let mut events = match shape {
+            0 => {
                 // Every pair, the foreign ones among them, before any record.
-                let mut pairs: Vec<Event> = (0..sessions).map(Event::Pair).collect();
+                let mut pairs: Vec<Event> = (0..sessions)
+                    .filter(|&s| !pairless[s])
+                    .map(Event::Pair)
+                    .collect();
                 for _ in 0..foreign {
                     let at = rng.below(pairs.len() as u64 + 1) as usize;
                     pairs.insert(at, Event::Foreign);
@@ -1745,13 +1840,16 @@ mod pairs {
                     }
                 }
                 events
-            } else {
+            }
+            1 => {
                 // Each session's own order, interleaved at random with the
                 // others'.
                 let mut lanes: Vec<VecDeque<Event>> = (0..sessions)
                     .map(|s| {
                         let mut lane = VecDeque::from([Event::Born(s)]);
-                        let mut rest = if rng.chance(50) {
+                        let mut rest = if pairless[s] {
+                            vec![Event::Record(s)]
+                        } else if rng.chance(50) {
                             vec![Event::Record(s), Event::Pair(s)]
                         } else {
                             vec![Event::Pair(s), Event::Record(s)]
@@ -1769,47 +1867,150 @@ mod pairs {
                     })
                     .collect();
                 lanes.extend((0..foreign).map(|_| VecDeque::from([Event::Foreign])));
-                let mut events = Vec::new();
-                while lanes.iter().any(|l| !l.is_empty()) {
-                    let open: Vec<usize> =
-                        (0..lanes.len()).filter(|&i| !lanes[i].is_empty()).collect();
-                    let lane = open[rng.below(open.len() as u64) as usize];
-                    events.push(lanes[lane].pop_front().unwrap());
+                interleave(rng, lanes)
+            }
+            _ => {
+                // R-B-U2-01's shape: births staggered across earlier pairs'
+                // endings (each helper born, then its pair, interleaved with
+                // the other sessions'), every record late, read after its own
+                // pair and interleaved with later births and pairs.
+                let mut lanes: Vec<VecDeque<Event>> = (0..sessions)
+                    .map(|s| {
+                        if pairless[s] {
+                            VecDeque::from([Event::Born(s)])
+                        } else {
+                            VecDeque::from([Event::Born(s), Event::Pair(s)])
+                        }
+                    })
+                    .collect();
+                lanes.extend((0..foreign).map(|_| VecDeque::from([Event::Foreign])));
+                let mut events = interleave(rng, lanes);
+                for (s, &missing) in pairless.iter().enumerate() {
+                    let after = events
+                        .iter()
+                        .position(|e| {
+                            *e == if missing {
+                                Event::Born(s)
+                            } else {
+                                Event::Pair(s)
+                            }
+                        })
+                        .unwrap()
+                        + 1;
+                    // Late, and most often after every pair.
+                    let at = if rng.chance(60) {
+                        events.len()
+                    } else {
+                        after + rng.below((events.len() - after) as u64 + 1) as usize
+                    };
+                    events.insert(at, Event::Record(s));
+                    if rng.chance(50) {
+                        let after = at + 1;
+                        let at = after + rng.below((events.len() - after) as u64 + 1) as usize;
+                        events.insert(at, Event::Drain(s));
+                    }
                 }
                 events
-            };
-            let mut events = events;
-            if rng.chance(70) {
+            }
+        };
+        // The clock passes the grace now and then, mid-script.
+        if rng.chance(30) {
+            for _ in 0..=rng.below(2) {
+                let at = rng.below(events.len() as u64 + 1) as usize;
+                events.insert(at, Event::Wait);
+            }
+        }
+        (events, pairless)
+    }
+
+    /// Lanes popped from the front in a random order.
+    fn interleave(rng: &mut Rng, mut lanes: Vec<VecDeque<Event>>) -> Vec<Event> {
+        let mut events = Vec::new();
+        while lanes.iter().any(|l| !l.is_empty()) {
+            let open: Vec<usize> = (0..lanes.len()).filter(|&i| !lanes[i].is_empty()).collect();
+            let lane = open[rng.below(open.len() as u64) as usize];
+            events.push(lanes[lane].pop_front().unwrap());
+        }
+        events
+    }
+
+    /// Scenario: Generate scripts in which editor sessions overlap rather than following one another: each helper is born, then its record and its bracketed-paste pair arrive in either order, interleaved with other sessions' and with pairs no record accounts for. Some scripts read a backlog of pairs past what the accounting remembers before any of their records; some stagger the helpers' births across earlier pairs' endings, with every record late (R-B-U2-01's shape); some have a session whose pair never comes; the clock passes the credit's grace now and then; and most end with an unrelated pair, after every session drained and the grace passed when a session's pair never came. From any point in a script, the epoch moves at least once for each pair no record accounts for read from there on, less one for each session whose pair never came, and the final unrelated pair after the grace always moves it (R-B-U2-01, the audit's U3-1).
+    #[spec("inbox/probe/048")]
+    #[test]
+    fn probe_048_interleaved_sessions_and_backlogs_keep_every_foreign_pair() {
+        use crate::composer_probe::epoch::CREDIT_AFTER_DRAIN;
+        let cap = usize::from(crate::composer_probe::epoch::EXPLAINED_CAP);
+        let mut shapes = Shapes::default();
+        for seed in 1..=600u64 {
+            let mut rng = Rng(0x2545_f491_4f6c_dd1d ^ seed.wrapping_mul(0xd1b5_4a32_d192_ed03));
+            let (mut events, pairless) = script(&mut rng, cap);
+            let sessions = pairless.len();
+            let missing = pairless.iter().filter(|&&p| p).count();
+            let quiescent = missing > 0 || rng.chance(30);
+            if quiescent {
+                // Every helper exits, the grace passes, and an unrelated
+                // pair is read: no credit is left to explain it.
+                let drained: Vec<usize> = events
+                    .iter()
+                    .filter_map(|e| match e {
+                        Event::Drain(s) => Some(*s),
+                        _ => None,
+                    })
+                    .collect();
+                events.extend(
+                    (0..sessions)
+                        .filter(|s| !drained.contains(s))
+                        .map(Event::Drain),
+                );
+                events.extend([Event::Wait, Event::Foreign]);
+            } else if rng.chance(70) {
                 events.push(Event::Foreign);
             }
-            let (input, mut hook) = generation();
-            let pair = [OFF, ON].concat();
-            let mut born = vec![Instant::now(); sessions];
+            // A virtual clock, so a helper's birth, a pair's ending and the
+            // grace are ordered exactly as scripted.
+            let (input, _hook) = generation();
+            let pair = pair_markers();
+            let mut clock = Instant::now();
+            let mut born = vec![clock; sessions];
             let mut recorded = vec![false; sessions];
+            let mut drained_at: Vec<Option<Instant>> = vec![None; sessions];
             let mut early = 0usize;
+            let mut staggered = false;
+            let mut any_pair = false;
+            let mut late_own = false;
             // Each pair read: whether no record accounts for it, and whether
             // it moved the epoch.
             let mut pairs: Vec<(bool, bool)> = Vec::new();
             for &event in &events {
+                clock += Duration::from_millis(1);
                 let before = input.epoch().last_foreign();
                 match event {
-                    Event::Born(s) => born[s] = Instant::now(),
+                    Event::Born(s) => {
+                        born[s] = clock;
+                        staggered |= any_pair;
+                    }
                     Event::Record(s) => {
                         recorded[s] = true;
                         input
-                            .record_observe(&session(s as u32 + 1, born[s]), Instant::now())
+                            .record_observe(&session(s as u32 + 1, born[s]), clock)
                             .unwrap();
                     }
                     Event::Drain(s) => {
-                        let now = Instant::now();
-                        input.record_exit(G, key(s as u32 + 1), now, now).unwrap();
-                        input.record_drained(G, key(s as u32 + 1), now).unwrap();
+                        drained_at[s] = Some(clock);
+                        input
+                            .record_exit(G, key(s as u32 + 1), clock, clock)
+                            .unwrap();
+                        input.record_drained(G, key(s as u32 + 1), clock).unwrap();
                     }
                     Event::Pair(s) => {
+                        any_pair = true;
                         early += usize::from(!recorded[s]);
-                        hook.on_output(&pair);
+                        late_own |= drained_at[s]
+                            .is_some_and(|d| clock.duration_since(d) >= CREDIT_AFTER_DRAIN);
+                        input.on_return_markers(&pair, clock);
                     }
-                    Event::Foreign => hook.on_output(&pair),
+                    Event::Foreign => input.on_return_markers(&pair, clock),
+                    Event::Wait => clock += CREDIT_AFTER_DRAIN,
                 }
                 let moved = input.epoch().last_foreign() - before;
                 assert!(
@@ -1823,21 +2024,50 @@ mod pairs {
                 }
             }
             if early > cap {
-                backlogs += 1;
+                shapes.backlogs += 1;
+                shapes.staggered += usize::from(staggered);
             }
+            shapes.pairless += usize::from(missing > 0);
+            shapes.late_own += usize::from(late_own);
+            // A count over suffixes, not prompt invalidation: credits are
+            // consumed oldest first, so a foreign pair read while another
+            // session's credit is live moves the epoch at that session's own
+            // pair instead (the audit's U3-1), and a session whose pair never
+            // comes may leave one foreign pair unmoved until its grace ends.
             for from in 0..pairs.len() {
                 let foreign = pairs[from..].iter().filter(|p| p.0).count();
                 let moves = pairs[from..].iter().filter(|p| p.1).count();
                 assert!(
-                    moves >= foreign,
+                    moves + missing >= foreign,
                     "seed {seed}: from pair {from} on, {foreign} pairs no record accounts for \
-                     moved the epoch only {moves} times\nevents {events:?}\npairs {pairs:?}"
+                     moved the epoch only {moves} times, with {missing} sessions whose pair \
+                     never came\nevents {events:?}\npairs {pairs:?}"
+                );
+            }
+            if quiescent {
+                shapes.quiescent += 1;
+                assert_eq!(
+                    pairs.last(),
+                    Some(&(true, true)),
+                    "seed {seed}: an unrelated pair after every session drained and the grace \
+                     passed moved nothing\nevents {events:?}\npairs {pairs:?}"
                 );
             }
         }
+        eprintln!("probe_048 interleaved shapes over 600 seeds: {shapes:?}");
         assert!(
-            backlogs >= 10,
-            "only {backlogs} scripts read more early pairs than the accounting remembers"
+            shapes.backlogs >= 20,
+            "too few backlogs past the cap: {shapes:?}"
         );
+        assert!(
+            shapes.staggered >= 20,
+            "too few staggered backlogs: {shapes:?}"
+        );
+        assert!(
+            shapes.pairless >= 20,
+            "too few pairless scripts: {shapes:?}"
+        );
+        assert!(shapes.quiescent >= 20, "too few quiescent ends: {shapes:?}");
+        assert!(shapes.late_own >= 5, "too few late own pairs: {shapes:?}");
     }
 }

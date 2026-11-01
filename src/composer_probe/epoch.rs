@@ -369,12 +369,19 @@ struct State {
 /// epoch once more, never once less (R-B-U2-01).
 pub(crate) const EXPLAINED_CAP: u8 = 4;
 
-/// How long a record's credit outlives its drain (the audit's U3-4). The
-/// agent re-enables bracketed paste once its editor command, the helper, has
-/// exited, so a session's pair ends just after its helper drains; a credit
-/// whose pair hasn't come by then never will (the agent exited, or the pair
-/// was lost), and must not be lent to a later, unrelated pair. A credit that
-/// expires early costs that session's pair one more epoch, never one less.
+/// How long a record's credit outlives its drain (the audit's U3-4): a
+/// policy, not a bound on output delivery. The agent re-enables bracketed
+/// paste once its editor command, the helper, has exited, so a session's
+/// pair usually ends soon after its helper drains; but the helper's drain
+/// and the agent's output reach the daemon on independent paths, and a
+/// paused or backlogged output reader can deliver a session's own pair
+/// later than this. The grace only stops a credit whose pair has not come
+/// (the agent exited, the pair was lost, or it is merely late) from being
+/// lent to a later, unrelated pair indefinitely. Expiring is conservative
+/// for that session: its own pair, if it comes after the grace, moves the
+/// epoch as an external edit, one more epoch and never one less. That extra
+/// epoch is not invisible: it can withhold an in-flight empty observation
+/// or cost one more check.
 pub(crate) const CREDIT_AFTER_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The most daemon reads of an `Armed` export kept for the epoch's
@@ -540,19 +547,51 @@ impl Live {
     }
 
     /// A new record of a helper born no earlier than `birth_floor` may
-    /// account for one pair: the oldest unexplained one that ended once it
-    /// may have been born, which it repays; else, when a forgotten one may
-    /// have been its session's, nothing; else a credit for its pair still
-    /// to come, while there is room.
+    /// account for one pair. When a forgotten pair may have been its
+    /// session's, it does nothing: it neither repays a remembered pair nor
+    /// banks. Else it repays the oldest unexplained pair that ended once it
+    /// may have been born; else it banks a credit for its pair still to
+    /// come, while there is room.
+    ///
+    /// **The invariant (R-B-U2-01).** Compare an accounting that forgets
+    /// nothing, in which each record repays the oldest unrepaid pair that
+    /// ended at or after its floor, or else banks. Every pair that
+    /// accounting still owes and that ended after [`Self::forgotten`] is in
+    /// [`Self::unexplained`], and every credit banked here is one it banks
+    /// too. So a pair moves the epoch here whenever it moves it there.
+    ///
+    /// It holds for any interleaving, step by step. A pair consumes the
+    /// oldest credit or moves the epoch and is owed, in both accountings;
+    /// with fewer credits here, a pair can only move the epoch here and not
+    /// there, which adds a debt here only. Forgetting raises the watermark
+    /// past every entry it drops. Drains and the grace drop the same credits
+    /// from both. A record whose floor is at or before the watermark does
+    /// nothing here, while the other repays one debt or banks: either keeps
+    /// the relation. A record whose floor is after the watermark sees here
+    /// every debt the other can use, all remembered; it repays the oldest
+    /// of them here, at or before the one the other repays, and the one
+    /// taken here, when older, is one the other no longer owes; when there
+    /// is none here there is none there, and both bank. Checking the
+    /// watermark first is what makes this hold: repaying a remembered pair
+    /// for a record that may be a forgotten pair's session shifts that debt
+    /// onto a later record, which then finds none and banks a credit for a
+    /// pair that already moved the epoch.
+    ///
+    /// The accounting that forgets nothing is the reference, not proof that
+    /// a credit is the record's own: credits are consumed oldest first, so a
+    /// pair no record accounts for, read while another session's credit is
+    /// live, takes that credit, and the epoch moves at that session's own
+    /// pair instead (the audit's U3-1).
     fn explain(&mut self, key: RecordKey, birth_floor: Instant) {
-        if let Some(at) = self
+        if self.forgotten.is_some_and(|f| f >= birth_floor) {
+            // Fail closed: it may repay a debt the queue forgot, so it
+            // spends no debt a later record may need.
+        } else if let Some(at) = self
             .unexplained
             .iter()
             .position(|&ended| ended >= birth_floor)
         {
             self.unexplained.remove(at);
-        } else if self.forgotten.is_some_and(|f| f >= birth_floor) {
-            // Fail closed: it may repay a debt the queue forgot.
         } else if self.explained.len() < usize::from(EXPLAINED_CAP) {
             self.explained.push_back(Credit { key, drained: None });
         }
@@ -568,7 +607,8 @@ impl Live {
     }
 
     /// Drop each credit whose record drained [`CREDIT_AFTER_DRAIN`] or more
-    /// before `now` (the audit's U3-4): its pair never came.
+    /// before `now` (the audit's U3-4): its pair has not come in the grace,
+    /// and a late one moves the epoch.
     fn expire_credits(&mut self, now: Instant) {
         self.explained.retain(|c| {
             c.drained
