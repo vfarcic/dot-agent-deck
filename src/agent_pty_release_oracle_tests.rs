@@ -100,6 +100,8 @@ struct Rig {
     react: Mutex<Option<React>>,
     ledger: Arc<IngressLedger>,
     retired: Arc<AtomicBool>,
+    /// How many mid-pass facts fired inside a driver pass (R-B-U2-02).
+    mid_fired: std::sync::atomic::AtomicUsize,
 }
 
 impl Rig {
@@ -132,6 +134,7 @@ impl Rig {
             react: Mutex::new(None),
             ledger: IngressLedger::new(),
             retired,
+            mid_fired: std::sync::atomic::AtomicUsize::new(0),
         });
         let _ = slot.set(Arc::downgrade(&rig));
         let log = Arc::downgrade(&rig);
@@ -260,6 +263,25 @@ impl Rig {
         let now = Instant::now();
         let _ = self.input.record_exit(G, key(pid), now, now);
         let _ = self.input.record_drained(G, key(pid), now);
+    }
+
+    /// Arm helper `pid`'s drain with no report to land inside the next
+    /// driver pass that finds typing held, between its read of the front
+    /// segment and its extraction of what is held (R-B-U2-02).
+    async fn exit_mid_pass(self: &Arc<Self>, pid: u32) {
+        let weak = Arc::downgrade(self);
+        let w = self.writer.lock().await;
+        let gate = w.gate();
+        w.set_mid_pass(Box::new(move || {
+            if !gate.gate.holds_any(|_| true) {
+                return false;
+            }
+            if let Some(rig) = weak.upgrade() {
+                rig.exit(pid);
+                rig.mid_fired.fetch_add(1, Ordering::SeqCst);
+            }
+            true
+        }));
     }
 
     async fn retire(&self) {
@@ -705,6 +727,10 @@ enum Step {
     Editor(u32),
     Report(u32, Report),
     Exit(u32),
+    /// Helper `pid` drains with no report inside the next driver pass that
+    /// finds typing held, after the pass read the front segment and before
+    /// it takes what is held (R-B-U2-02). For the model, it drains now.
+    ExitMidPass(u32),
     Out(&'static [u8]),
     /// The agent answers the next trigger inside its write: its return, and
     /// when `helper` is set a helper that reads its number, decides
@@ -882,7 +908,7 @@ fn apply_model(model: &mut Model, step: &Step, pending: &mut Option<Option<u32>>
         Step::Observe(r) => model.observe(r.clone()),
         Step::Editor(pid) => model.editor(*pid),
         Step::Report(pid, report) => model.report(*pid, *report),
-        Step::Exit(pid) => model.exit(*pid),
+        Step::Exit(pid) | Step::ExitMidPass(pid) => model.exit(*pid),
         Step::Out(b) => model.out(b),
         Step::Fast { helper } => *pending = Some(*helper),
         Step::Retire => model.retire(),
@@ -969,6 +995,7 @@ async fn run(agent: Agent, prefix: &[u8], fast_probe: bool, steps: &[Step], what
             Step::Editor(pid) => rig.editor(*pid),
             Step::Report(pid, report) => rig.report(*pid, *report),
             Step::Exit(pid) => rig.exit(*pid),
+            Step::ExitMidPass(pid) => rig.exit_mid_pass(*pid).await,
             Step::Out(b) => rig.out(b),
             Step::Fast { helper } => {
                 let helper = *helper;
@@ -1003,6 +1030,15 @@ async fn run(agent: Agent, prefix: &[u8], fast_probe: bool, steps: &[Step], what
     }
     tokio::time::sleep(Duration::from_millis(20)).await;
     check(&rig, &model, model.settled, &format!("{what}: at rest"));
+    let armed = steps
+        .iter()
+        .filter(|s| matches!(s, Step::ExitMidPass(_)))
+        .count();
+    assert_eq!(
+        rig.mid_fired.load(Ordering::SeqCst),
+        armed,
+        "{what}: each mid-pass drain landed inside a driver pass with typing held"
+    );
     model
 }
 
@@ -1147,6 +1183,29 @@ async fn probe_010_the_review_traces_follow_the_release_table() {
     }
 }
 
+/// Scenario: A held Ctrl+G's trigger is answered by a helper that runs the user's editor, so the segment releases and typing goes on to the editor; then, for Claude and Codex, more typing is held and the release driver is stopped between reading that the segment released and taking what is held, while the helper drains with no report (an unknown wait). The bytes still held when the unknown wait became known stay held: the PTY takes nothing more (R-B-U2-02).
+#[spec("inbox/probe/010")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_010_an_unknown_wait_inside_a_driver_pass_keeps_what_is_held() {
+    for agent in [Agent::Claude, Agent::Codex] {
+        let mut steps = vec![
+            Step::Type(b"\x07".to_vec()),
+            helper(41, 1, Decision::Armed),
+            Step::Exit(41),
+        ];
+        steps.extend(fast_return(agent).into_iter().map(Step::Out));
+        steps.extend([
+            helper(42, 2, Decision::Unarmed),
+            Step::Editor(42),
+            Step::Type(b"gh".to_vec()),
+            Step::ExitMidPass(42),
+            Step::Type(b"ij".to_vec()),
+            Step::Type(b"kl".to_vec()),
+        ]);
+        run(agent, b"", false, &steps, &format!("R-B-U2-02 {agent:?}")).await;
+    }
+}
+
 /// R-U2-04's model: paste pairs and the records that account for them.
 mod pairs {
     use super::*;
@@ -1219,5 +1278,250 @@ mod pairs {
                 );
             }
         }
+    }
+
+    fn generation() -> (Arc<GenerationInput>, OutputHook) {
+        let input = Arc::new(GenerationInput::default());
+        assert!(input.attach_records(Records::new(G, EcPolicy::Hold, Instant::now())));
+        assert!(input.attach_segments(G, Agent::Claude));
+        let hook = OutputHook::new(Arc::clone(&input));
+        (input, hook)
+    }
+
+    fn session(pid: u32, born: Instant) -> Observation {
+        Observation {
+            generation: G,
+            key: key(pid),
+            channel: Channel::Ipc,
+            attribution: Attribution::Owned,
+            claim: None,
+            decision: Some(Decision::Unarmed),
+            seg_seen: None,
+            native_seen: None,
+            birth_floor: born,
+        }
+    }
+
+    /// Scenario: One more editor session than the accounting remembers pairs for: each session's bracketed-paste pair is read before its record, so each moves the epoch, and then all their records arrive late, every helper born before the first pair ended. A later, unrelated pair still moves the epoch: no late record banks credit for a pair that already moved it (R-B-U2-01, the audit's U3-4).
+    #[spec("inbox/probe/048")]
+    #[test]
+    fn probe_048_a_backlog_past_the_cap_lends_nothing_to_a_later_pair() {
+        let (input, mut hook) = generation();
+        let pair = [OFF, ON].concat();
+        let born = Instant::now();
+        let sessions = u32::from(crate::composer_probe::epoch::EXPLAINED_CAP) + 1;
+        for _ in 0..sessions {
+            hook.on_output(&pair);
+        }
+        assert_eq!(input.epoch().last_foreign(), u64::from(sessions));
+        for pid in 1..=sessions {
+            input
+                .record_observe(&session(pid, born), Instant::now())
+                .unwrap();
+        }
+        assert_eq!(
+            input.epoch().last_foreign(),
+            u64::from(sessions),
+            "a late record moves nothing"
+        );
+        hook.on_output(&pair);
+        assert_eq!(
+            input.epoch().last_foreign(),
+            u64::from(sessions) + 1,
+            "an unrelated pair after the late records moves the epoch"
+        );
+    }
+
+    /// The return markers of one whole bracketed-paste pair.
+    fn pair_markers() -> [crate::composer_probe::segments::Seen; 2] {
+        use crate::composer_probe::segments::{Marker, Seen};
+        [
+            Seen {
+                marker: Marker::PasteOff,
+                start: 0,
+            },
+            Seen {
+                marker: Marker::PasteOn,
+                start: 8,
+            },
+        ]
+    }
+
+    /// Scenario: A helper's record is made, so its session may account for one bracketed-paste pair, but its pair never comes (the agent dropped it). While the helper runs, and for a grace after its drain, a pair read is still taken as its session's; once the grace is over, its credit is gone, and an unrelated pair moves the epoch (the audit's U3-4). A session that never drains keeps its credit however long its editor runs.
+    #[spec("inbox/probe/048")]
+    #[test]
+    fn probe_048_a_drained_record_whose_pair_never_came_lends_nothing() {
+        use crate::composer_probe::epoch::CREDIT_AFTER_DRAIN;
+        let pair = pair_markers();
+        let past = |at: Instant| at + CREDIT_AFTER_DRAIN + Duration::from_millis(1);
+
+        // Drained, and the grace is over: the pair is an external edit.
+        let (input, _hook) = generation();
+        let born = Instant::now();
+        input.record_observe(&session(1, born), born).unwrap();
+        let drained = Instant::now();
+        input.record_exit(G, key(1), drained, drained).unwrap();
+        input.record_drained(G, key(1), drained).unwrap();
+        input.on_return_markers(&pair, past(Instant::now()));
+        assert_eq!(
+            input.epoch().last_foreign(),
+            1,
+            "a credit outlives its drained record by the grace only"
+        );
+
+        // Control: drained, the pair read inside the grace is its session's.
+        let (input, _hook) = generation();
+        let born = Instant::now();
+        input.record_observe(&session(1, born), born).unwrap();
+        let drained = Instant::now();
+        input.record_exit(G, key(1), drained, drained).unwrap();
+        input.record_drained(G, key(1), drained).unwrap();
+        input.on_return_markers(&pair, Instant::now());
+        assert_eq!(input.epoch().last_foreign(), 0, "its own pair, just after");
+
+        // Control: still running, however long: its pair is still to come.
+        let (input, _hook) = generation();
+        let born = Instant::now();
+        input.record_observe(&session(1, born), born).unwrap();
+        input.on_return_markers(&pair, past(past(Instant::now())));
+        assert_eq!(input.epoch().last_foreign(), 0, "a long editor session");
+    }
+
+    /// One event of an interleaved pair script.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Event {
+        /// Session `s`'s helper is born.
+        Born(usize),
+        /// Its record is made.
+        Record(usize),
+        /// Its pair is read.
+        Pair(usize),
+        /// Its helper exits and drains.
+        Drain(usize),
+        /// A pair no record accounts for.
+        Foreign,
+    }
+
+    /// Scenario: Generate scripts in which editor sessions overlap rather than following one another: each helper is born, then its record and its bracketed-paste pair arrive in either order, interleaved with other sessions' and with pairs no record accounts for; some scripts read a backlog of pairs past what the accounting remembers before any of their records, and most end with an unrelated pair. Every pair no record accounts for moves the epoch, then or later: from any point in the script, the epoch moves at least once for each such pair read from there on (R-B-U2-01).
+    #[spec("inbox/probe/048")]
+    #[test]
+    fn probe_048_interleaved_sessions_and_backlogs_keep_every_foreign_pair() {
+        let cap = usize::from(crate::composer_probe::epoch::EXPLAINED_CAP);
+        let mut backlogs = 0;
+        for seed in 1..=300u64 {
+            let mut rng = Rng(0x2545_f491_4f6c_dd1d ^ seed.wrapping_mul(0xd1b5_4a32_d192_ed03));
+            let sessions = rng.below(10) as usize;
+            let foreign = rng.below(4) as usize;
+            let delayed = rng.chance(40);
+            let events = if delayed {
+                // Every pair, the foreign ones among them, before any record.
+                let mut pairs: Vec<Event> = (0..sessions).map(Event::Pair).collect();
+                for _ in 0..foreign {
+                    let at = rng.below(pairs.len() as u64 + 1) as usize;
+                    pairs.insert(at, Event::Foreign);
+                }
+                let mut events: Vec<Event> = (0..sessions).map(Event::Born).collect();
+                events.extend(pairs);
+                for s in 0..sessions {
+                    events.push(Event::Record(s));
+                    if rng.chance(50) {
+                        events.push(Event::Drain(s));
+                    }
+                }
+                events
+            } else {
+                // Each session's own order, interleaved at random with the
+                // others'.
+                let mut lanes: Vec<VecDeque<Event>> = (0..sessions)
+                    .map(|s| {
+                        let mut lane = VecDeque::from([Event::Born(s)]);
+                        let mut rest = if rng.chance(50) {
+                            vec![Event::Record(s), Event::Pair(s)]
+                        } else {
+                            vec![Event::Pair(s), Event::Record(s)]
+                        };
+                        if rng.chance(60) {
+                            // Its drain, after its record, before or after
+                            // its pair.
+                            let record = rest.iter().position(|e| *e == Event::Record(s));
+                            let at = record.unwrap() + 1;
+                            let at = at + rng.below((rest.len() - at) as u64 + 1) as usize;
+                            rest.insert(at, Event::Drain(s));
+                        }
+                        lane.extend(rest);
+                        lane
+                    })
+                    .collect();
+                lanes.extend((0..foreign).map(|_| VecDeque::from([Event::Foreign])));
+                let mut events = Vec::new();
+                while lanes.iter().any(|l| !l.is_empty()) {
+                    let open: Vec<usize> =
+                        (0..lanes.len()).filter(|&i| !lanes[i].is_empty()).collect();
+                    let lane = open[rng.below(open.len() as u64) as usize];
+                    events.push(lanes[lane].pop_front().unwrap());
+                }
+                events
+            };
+            let mut events = events;
+            if rng.chance(70) {
+                events.push(Event::Foreign);
+            }
+            let (input, mut hook) = generation();
+            let pair = [OFF, ON].concat();
+            let mut born = vec![Instant::now(); sessions];
+            let mut recorded = vec![false; sessions];
+            let mut early = 0usize;
+            // Each pair read: whether no record accounts for it, and whether
+            // it moved the epoch.
+            let mut pairs: Vec<(bool, bool)> = Vec::new();
+            for &event in &events {
+                let before = input.epoch().last_foreign();
+                match event {
+                    Event::Born(s) => born[s] = Instant::now(),
+                    Event::Record(s) => {
+                        recorded[s] = true;
+                        input
+                            .record_observe(&session(s as u32 + 1, born[s]), Instant::now())
+                            .unwrap();
+                    }
+                    Event::Drain(s) => {
+                        let now = Instant::now();
+                        input.record_exit(G, key(s as u32 + 1), now, now).unwrap();
+                        input.record_drained(G, key(s as u32 + 1), now).unwrap();
+                    }
+                    Event::Pair(s) => {
+                        early += usize::from(!recorded[s]);
+                        hook.on_output(&pair);
+                    }
+                    Event::Foreign => hook.on_output(&pair),
+                }
+                let moved = input.epoch().last_foreign() - before;
+                assert!(
+                    moved <= 1,
+                    "seed {seed}: {event:?} moved the epoch {moved} times"
+                );
+                if matches!(event, Event::Pair(_) | Event::Foreign) {
+                    pairs.push((event == Event::Foreign, moved == 1));
+                } else {
+                    assert_eq!(moved, 0, "seed {seed}: {event:?} moved the epoch");
+                }
+            }
+            if early > cap {
+                backlogs += 1;
+            }
+            for from in 0..pairs.len() {
+                let foreign = pairs[from..].iter().filter(|p| p.0).count();
+                let moves = pairs[from..].iter().filter(|p| p.1).count();
+                assert!(
+                    moves >= foreign,
+                    "seed {seed}: from pair {from} on, {foreign} pairs no record accounts for \
+                     moved the epoch only {moves} times\nevents {events:?}\npairs {pairs:?}"
+                );
+            }
+        }
+        assert!(
+            backlogs >= 10,
+            "only {backlogs} scripts read more early pairs than the accounting remembers"
+        );
     }
 }

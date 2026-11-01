@@ -360,10 +360,22 @@ struct State {
     retired: bool,
 }
 
-/// The most explanations [`Live::explained`] banks: each `Owned` record
+/// The most explanations [`Live::explained`] banks, and the most unexplained
+/// pair endings [`Live::unexplained`] remembers: each `Owned` record
 /// accounts for one bracketed-paste pair, and more than a few outstanding
-/// would only let a later unreported editor go unnoticed.
-const EXPLAINED_CAP: u8 = 4;
+/// would only let a later unreported editor go unnoticed. Past the cap the
+/// accounting fails closed: a credit not banked, or a pair's ending
+/// forgotten into [`Live::forgotten`], can only make a later pair move the
+/// epoch once more, never once less (R-B-U2-01).
+pub(crate) const EXPLAINED_CAP: u8 = 4;
+
+/// How long a record's credit outlives its drain (the audit's U3-4). The
+/// agent re-enables bracketed paste once its editor command, the helper, has
+/// exited, so a session's pair ends just after its helper drains; a credit
+/// whose pair hasn't come by then never will (the agent exited, or the pair
+/// was lost), and must not be lent to a later, unrelated pair. A credit that
+/// expires early costs that session's pair one more epoch, never one less.
+pub(crate) const CREDIT_AFTER_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The most daemon reads of an `Armed` export kept for the epoch's
 /// settlement ([`Live::reads`]).
@@ -379,15 +391,22 @@ struct Live {
     /// `ExternalEdit`'s second producer (PR U3-11): a `?2004l` was read and
     /// no `?2004h` has followed it yet.
     pair_open: bool,
-    /// Records made since the last pair that may account for one: an editor
-    /// session the deck saw, so its pair isn't an unreported one.
-    explained: u8,
+    /// Records made since the last pair that may account for one, oldest
+    /// first: an editor session the deck saw, so its pair isn't an
+    /// unreported one. Each is kept by its record, and expires
+    /// [`CREDIT_AFTER_DRAIN`] after that record drained (or went).
+    explained: std::collections::VecDeque<Credit>,
     /// When each pair that completed with no record to account for it (so
     /// it moved the epoch) ended, oldest first (R-U2-04). A record made
     /// later whose helper may have been born by then may be that pair's
     /// session: it accounts for that pair and banks nothing, so it can't
     /// lend an explanation to a later, unrelated pair.
     unexplained: std::collections::VecDeque<Instant>,
+    /// The latest ending of a pair [`Self::unexplained`] had no room to keep
+    /// (R-B-U2-01). A record whose helper may have been born by then may be
+    /// that pair's session, whose debt the queue no longer shows: it banks
+    /// nothing. A forgotten debt never becomes credit.
+    forgotten: Option<Instant>,
     /// When the deck may try a probe again (R2 §6.8, R5's continuing
     /// retries). Its `broken` bit is presentation only (O-20.6).
     schedule: Schedule,
@@ -397,6 +416,14 @@ struct Live {
     /// The daemon's read of an `Armed` invocation's export: whether it was
     /// empty, for the epoch's settlement of the probe it matches.
     reads: std::collections::VecDeque<(RecordKey, bool)>,
+}
+
+/// One record's explanation of a pair still to come ([`Live::explained`]).
+#[derive(Debug, Clone, Copy)]
+struct Credit {
+    key: RecordKey,
+    /// When the deck first saw its record drained or gone.
+    drained: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -514,6 +541,55 @@ fn settle_live(state: &mut State, now: Instant) {
 }
 
 impl Live {
+    /// A pair that ended at `ended` moved the epoch with no record to account
+    /// for it: remember it, and when the queue is full, fold its oldest entry
+    /// into [`Self::forgotten`] rather than dropping it (R-B-U2-01).
+    fn owe(&mut self, ended: Instant) {
+        if self.unexplained.len() == usize::from(EXPLAINED_CAP)
+            && let Some(oldest) = self.unexplained.pop_front()
+        {
+            self.forgotten = Some(self.forgotten.map_or(oldest, |f| f.max(oldest)));
+        }
+        self.unexplained.push_back(ended);
+    }
+
+    /// A new record of a helper born no earlier than `birth_floor` may
+    /// account for one pair: the oldest unexplained one that ended once it
+    /// may have been born, which it repays; else, when a forgotten one may
+    /// have been its session's, nothing; else a credit for its pair still
+    /// to come, while there is room.
+    fn explain(&mut self, key: RecordKey, birth_floor: Instant) {
+        if let Some(at) = self
+            .unexplained
+            .iter()
+            .position(|&ended| ended >= birth_floor)
+        {
+            self.unexplained.remove(at);
+        } else if self.forgotten.is_some_and(|f| f >= birth_floor) {
+            // Fail closed: it may repay a debt the queue forgot.
+        } else if self.explained.len() < usize::from(EXPLAINED_CAP) {
+            self.explained.push_back(Credit { key, drained: None });
+        }
+    }
+
+    /// Note when each credit's record was first seen drained or gone.
+    fn note_drained(&mut self, records: &Records, now: Instant) {
+        for credit in &mut self.explained {
+            if credit.drained.is_none() && records.get(credit.key).is_none_or(|r| r.drained) {
+                credit.drained = Some(now);
+            }
+        }
+    }
+
+    /// Drop each credit whose record drained [`CREDIT_AFTER_DRAIN`] or more
+    /// before `now` (the audit's U3-4): its pair never came.
+    fn expire_credits(&mut self, now: Instant) {
+        self.explained.retain(|c| {
+            c.drained
+                .is_none_or(|d| now.saturating_duration_since(d) < CREDIT_AFTER_DRAIN)
+        });
+    }
+
     /// The daemon's latest read of record `key`'s export, if any.
     fn read_of(&self, key: RecordKey) -> Option<bool> {
         self.reads
@@ -1101,8 +1177,9 @@ impl GenerationInput {
         state.live = Some(Live {
             segments: Segments::new(generation, agent),
             pair_open: false,
-            explained: 0,
+            explained: std::collections::VecDeque::new(),
             unexplained: std::collections::VecDeque::new(),
+            forgotten: None,
             schedule: Schedule::default(),
             probes: Vec::new(),
             reads: std::collections::VecDeque::new(),
@@ -1161,14 +1238,10 @@ impl GenerationInput {
                 Marker::PasteOff => live.pair_open = true,
                 Marker::PasteOn if live.pair_open => {
                     live.pair_open = false;
-                    if live.explained > 0 {
-                        live.explained -= 1;
-                    } else {
+                    live.expire_credits(now);
+                    if live.explained.pop_front().is_none() {
                         state.epoch.record(None);
-                        if live.unexplained.len() == usize::from(EXPLAINED_CAP) {
-                            live.unexplained.pop_front();
-                        }
-                        live.unexplained.push_back(now);
+                        live.owe(now);
                     }
                 }
                 _ => {}
@@ -1429,11 +1502,17 @@ impl GenerationInput {
             (false, Some(records)) => step(records, &mut state.hazards, state.live.as_mut()),
             _ => return Err(Refusal::Stale),
         };
+        let now = Instant::now();
+        // The audit's U3-4: a credit's life after its record drained or went
+        // starts at the step that did it.
+        if let (Some(live), Some(records)) = (state.live.as_mut(), state.records.as_ref()) {
+            live.note_drained(records, now);
+        }
         // Q35-20 (O-20.3): what the step allows the segments, in the same
         // hold.
         let live = state.live.is_some();
         if live {
-            settle_live(state, Instant::now());
+            settle_live(state, now);
         }
         drop(guard);
         if live {
@@ -1466,18 +1545,7 @@ impl GenerationInput {
             {
                 // Its helper was born at or after its floor: a pair that
                 // ended before that floor wasn't its session.
-                match live
-                    .unexplained
-                    .iter()
-                    .position(|&ended| ended >= obs.birth_floor)
-                {
-                    Some(at) => {
-                        live.unexplained.remove(at);
-                    }
-                    None => {
-                        live.explained = live.explained.saturating_add(1).min(EXPLAINED_CAP);
-                    }
-                }
+                live.explain(obs.key, obs.birth_floor);
             }
             recorded
         })

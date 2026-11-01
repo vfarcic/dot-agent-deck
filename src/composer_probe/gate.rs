@@ -347,6 +347,23 @@ impl<T> Gate<T> {
     /// Empty when no fence was closed.
     pub fn release_until(
         &self,
+        measure: impl FnMut(&T) -> Measure,
+        split: impl FnMut(&mut T, usize) -> T,
+        open: bool,
+    ) -> Vec<T> {
+        self.release_until_if(|| true, measure, split, open)
+    }
+
+    /// [`Self::release_until`] under `authority`, asked first, under the
+    /// gate's lock, whether the segments still allow the release
+    /// (R-B-U2-02): a fact that withdraws it (an unknown wait's cut-off, a
+    /// retirement of the input) is either published before that read, and
+    /// nothing is taken, or after the ops are taken, when they are already
+    /// released. It may take the epoch's lock (R6), which the arm section
+    /// takes under this one too; nothing takes this lock under R6.
+    pub fn release_until_if(
+        &self,
+        authority: impl FnOnce() -> bool,
         mut measure: impl FnMut(&T) -> Measure,
         mut split: impl FnMut(&mut T, usize) -> T,
         open: bool,
@@ -355,6 +372,9 @@ impl<T> Gate<T> {
         let Some(fence) = inner.fence.as_mut() else {
             return Vec::new();
         };
+        if !authority() {
+            return Vec::new();
+        }
         // The last ground point before the first candidate: (op, offset).
         let mut stop = (0usize, 0usize);
         let mut candidate = false;

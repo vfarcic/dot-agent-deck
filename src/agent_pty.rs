@@ -5192,6 +5192,11 @@ pub struct PaneWriter {
     /// (the registry can still hold an exited agent): a release checks it,
     /// and carries it to the writer thread with every job it submits.
     exited: Arc<AtomicBool>,
+    /// Test-only (R-B-U2-02's forced interleave): run by a release driver
+    /// pass between its read of the front segment and its extraction of
+    /// held input, until it returns `true`.
+    #[cfg(all(test, target_os = "linux"))]
+    mid_pass: Mutex<Option<Box<dyn FnMut() -> bool + Send>>>,
 }
 
 impl PaneWriter {
@@ -5227,6 +5232,8 @@ impl PaneWriter {
             retired,
             gate,
             exited,
+            #[cfg(all(test, target_os = "linux"))]
+            mid_pass: Mutex::new(None),
         }
     }
 

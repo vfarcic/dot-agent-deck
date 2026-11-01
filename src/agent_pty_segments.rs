@@ -32,7 +32,9 @@
 //! ```text
 //! probe request: pane writer (async) ─> gate (probe_queued) ; submit job
 //! writer thread: arm section: gate ─> seam ─> input (R6) ─> page stores
-//! driver:        pane writer (async) ─> gate (release_until / release_cut)
+//! driver:        pane writer (async) ─> gate (release_until_if / release_cut)
+//!                pane writer (async) ─> gate ─> input (R6) (release_until_if's
+//!                                       re-read of the front, R-B-U2-02)
 //!                pane writer (async) ─> seam (publish a HumanG's number)
 //!                input (R6) read with nothing else held
 //! observer:      seam ─> input (R6) ─> segments (settle, under R6) ; notify
@@ -277,11 +279,14 @@ impl PaneWriter {
     /// do.
     pub(crate) fn drive_segments(&self, publish: &dyn Fn(u64)) {
         let input = Arc::clone(&self.pty.input);
-        match input.segments_front() {
+        let front = input.segments_front();
+        #[cfg(test)]
+        self.mid_pass();
+        match front {
             None | Some(Front::Held | Front::Trigger) => {}
             Some(Front::Released) => {
                 if self.gate.gate.segment_fenced() {
-                    self.release_held(false);
+                    self.release_held(Front::Released);
                 }
             }
             Some(Front::None) => {
@@ -290,7 +295,7 @@ impl PaneWriter {
                 if !self.gate.gate.segment_fenced() {
                     return;
                 }
-                self.release_held(true);
+                self.release_held(Front::None);
                 if !self.gate.gate.holds_any(|frame| frame.cut.is_some()) {
                     return;
                 }
@@ -303,21 +308,45 @@ impl PaneWriter {
         }
     }
 
+    /// Test-only: arm `hook` to run in a later driver pass between its read
+    /// of the front segment and its extraction of held input, until it
+    /// returns `true` (R-B-U2-02's forced interleave).
+    #[cfg(test)]
+    pub(super) fn set_mid_pass(&self, hook: Box<dyn FnMut() -> bool + Send>) {
+        *self.mid_pass.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn mid_pass(&self) {
+        let mut slot = self.mid_pass.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hook) = slot.as_mut()
+            && hook()
+        {
+            *slot = None;
+        }
+    }
+
     /// Release the held input as far as the next held candidate
-    /// ([`crate::composer_probe::gate::Gate::release_until`]); with `open`,
-    /// no segment being outstanding, all of it when none is held. A target
-    /// that exited refuses what comes back, as a release does.
-    fn release_held(&self, open: bool) -> usize {
+    /// ([`crate::composer_probe::gate::Gate::release_until_if`]) under the
+    /// authority of the front segment this pass read, `front`: `Released`,
+    /// or `None`, no segment being outstanding, which takes all of it when
+    /// no candidate is held. The gate asks the segments again under its own
+    /// lock, so a fact that withdraws the release after this pass read the
+    /// front (R-B-U2-02: an unknown wait's cut-off) leaves everything held.
+    /// A target that exited refuses what comes back, as a release does.
+    fn release_held(&self, front: Front) -> usize {
         let in_flight = &self.pty.in_flight;
+        let input = &self.pty.input;
         let mut carry: Option<Framing> = None;
-        let frames = self.gate.gate.release_until(
+        let frames = self.gate.gate.release_until_if(
+            || input.segments_front() == Some(front),
             |frame| frame.measure(&mut carry),
             |frame, n| {
                 // One more sub-op in flight: the rest stays held.
                 in_flight.count.fetch_add(1, Ordering::SeqCst);
                 frame.split_at(n)
             },
-            open,
+            front == Front::None,
         );
         let mut submitted = 0;
         for frame in frames {
