@@ -609,6 +609,10 @@ mod real {
         fn start_in(dir: &Path, name: impl AsRef<OsStr>) -> Copy {
             let path = dir.join(name.as_ref());
             fs::copy(std::env::current_exe().unwrap(), &path).unwrap();
+            Self::start_existing(path)
+        }
+
+        fn start_existing(path: PathBuf) -> Copy {
             // Another test thread forking while the copy was open for writing
             // holds it open until its child execs: `ETXTBSY` until then.
             let mut tries = 0;
@@ -671,52 +675,91 @@ mod real {
         }
     }
 
-    /// Throwaway #2011 capture: retain the exact returned observations in
-    /// call order, including both samples, plus nearby raw stat reads.
-    #[derive(Default)]
+    type Read<T> = Result<T, Option<i32>>;
+
+    enum Observation {
+        Stat(u32, Read<ProcStat>, Read<String>),
+        Exe(u32, Read<FileId>),
+        Path(u32, Read<PathBuf>),
+        File(PathBuf, Read<FileId>),
+    }
+
+    fn observed<T: Clone>(result: &io::Result<T>) -> Read<T> {
+        result.as_ref().cloned().map_err(io::Error::raw_os_error)
+    }
+
+    /// Throwaway #2011 capture: retain observations in call order without
+    /// formatting or auxiliary /proc reads between the classifier's reads.
     struct Capture {
         view: LinuxProcView,
-        reads: Vec<String>,
+        reads: Vec<Observation>,
     }
 
     impl ProcView for Capture {
         fn stat(&mut self, pid: u32) -> io::Result<ProcStat> {
-            let result = self.view.stat(pid);
+            // The same read and parser as LinuxProcView::stat, retaining the
+            // actual raw input instead of doing a second, perturbing read.
             let raw = fs::read_to_string(format!("/proc/{pid}/stat"));
-            self.reads.push(format!(
-                "stat({pid}) = {result:?}; auxiliary raw stat immediately after = {raw:?}"
+            let result = match &raw {
+                Ok(stat) => (|| {
+                    let mut fields = stat[stat.rfind(')')? + 1..].split_whitespace();
+                    let ppid = fields.nth(1)?.parse().ok()?;
+                    let start = fields.nth(17)?.parse().ok()?;
+                    Some(ProcStat { ppid, start })
+                })()
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL)),
+                Err(error) => Err(match error.raw_os_error() {
+                    Some(errno) => io::Error::from_raw_os_error(errno),
+                    None => io::Error::from(error.kind()),
+                }),
+            };
+            self.reads.push(Observation::Stat(
+                pid,
+                observed(&result),
+                raw.map_err(|error| error.raw_os_error()),
             ));
             result
         }
 
         fn exe(&mut self, pid: u32) -> io::Result<FileId> {
             let result = self.view.exe(pid);
-            self.reads
-                .push(format!("metadata(/proc/{pid}/exe) = {result:?}"));
+            self.reads.push(Observation::Exe(pid, observed(&result)));
             result
         }
 
         fn exe_path(&mut self, pid: u32) -> io::Result<PathBuf> {
             let result = self.view.exe_path(pid);
-            self.reads
-                .push(format!("readlink(/proc/{pid}/exe) = {result:?}"));
+            self.reads.push(Observation::Path(pid, observed(&result)));
             result
         }
 
         fn file(&mut self, path: &Path) -> io::Result<FileId> {
             let result = self.view.file(path);
-            self.reads.push(format!("metadata({path:?}) = {result:?}"));
+            self.reads
+                .push(Observation::File(path.to_owned(), observed(&result)));
             result
         }
     }
 
-    fn capture_first_git(identity: &Identity, git: &mut Copy, round: usize) {
-        let mut capture = Capture::default();
-        let class = classify(&mut capture, Some(identity), git.pid());
+    fn capture_first_git(capture: &mut Capture, identity: &Identity, git: &mut Copy, round: usize) {
+        let class = classify(capture, Some(identity), git.pid());
         if class != Class::PositivelyTool {
             eprintln!("#2011 CAPTURE round={round} identity={identity:?} class={class:?}");
             for (index, read) in capture.reads.iter().enumerate() {
-                eprintln!("observation {index}: {read}");
+                match read {
+                    Observation::Stat(pid, result, raw) => {
+                        eprintln!("observation {index}: stat({pid}) = {result:?}; raw = {raw:?}");
+                    }
+                    Observation::Exe(pid, result) => {
+                        eprintln!("observation {index}: metadata(/proc/{pid}/exe) = {result:?}");
+                    }
+                    Observation::Path(pid, result) => {
+                        eprintln!("observation {index}: readlink(/proc/{pid}/exe) = {result:?}");
+                    }
+                    Observation::File(path, result) => {
+                        eprintln!("observation {index}: metadata({path:?}) = {result:?}");
+                    }
+                }
             }
             eprintln!(
                 "child pid={} path={:?} exit={:?} status={:?} stat={:?} exe={:?}",
@@ -789,7 +832,7 @@ mod real {
         assert!(view.file(&dir.path().join("missing")).is_err());
     }
 
-    /// Scenario: With this test process standing in as the agent and a `versions` directory recorded as its install root, repeat the initial tool classification with fresh sleepers for at most 50,000 rounds or 45 seconds, retaining both samples and process diagnostics on failure. A sleeper named `2.1.311` in the root is `Unknown`, while `git` elsewhere is a tool; moving the root makes both `Unknown`, and restoring it makes `git` a tool again.
+    /// Scenario: With this test process standing in as the agent and a `versions` directory recorded as its install root, prepare copied executables once and repeat the initial tool classification with fresh sleeper processes for at most 50,000 rounds or 45 seconds, retaining both samples and process diagnostics on failure. A sleeper named `2.1.311` in the root is `Unknown`, while `git` elsewhere is a tool; moving the root makes both `Unknown`, and restoring it makes `git` a tool again.
     #[spec("inbox/probe/006")]
     #[test]
     fn probe_006_a_real_moved_install_root_is_unknown() {
@@ -802,16 +845,27 @@ mod real {
             install_root_id: file_id(&versions),
             ..me()
         };
+        let git_dir = tempdir();
+        let updated_path = versions.join("2.1.311");
+        let git_path = git_dir.path().join("git");
+        for path in [&updated_path, &git_path] {
+            fs::copy(std::env::current_exe().unwrap(), path).unwrap();
+        }
+        let mut capture = Capture {
+            view: LinuxProcView,
+            reads: Vec::with_capacity(96),
+        };
         let started = std::time::Instant::now();
         let mut rounds = 0;
         while rounds < 50_000 && started.elapsed() < std::time::Duration::from_secs(45) {
-            let updated = Copy::start_in(&versions, "2.1.311");
-            let mut git = Copy::start("git");
+            capture.reads.clear();
+            let updated = Copy::start_existing(updated_path.clone());
+            let mut git = Copy::start_existing(git_path.clone());
             assert_eq!(
                 classify(&mut LinuxProcView, Some(&identity), updated.pid()),
                 Class::Unknown
             );
-            capture_first_git(&identity, &mut git, rounds);
+            capture_first_git(&mut capture, &identity, &mut git, rounds);
             drop(updated);
             rounds += 1;
         }
