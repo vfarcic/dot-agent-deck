@@ -194,6 +194,12 @@ fail-fast = false
 [profile.default.junit]
 path = "junit.xml"
 
+# Show which export-chain branch ran in CI even when this synthetic control
+# passes. Keep successful output storage in JUnit at its default of false.
+[[profile.default.overrides]]
+filter = 'test(=probe_026_empty_settlement_and_read_only_epoch_control)'
+success-output = "immediate"
+
 # `orchestration/delegate/012` compares a 650 ms stand-in readiness window
 # against a 1000 ms buffer, with a strict 500–900 ms measurement precondition.
 # A contended fast run observed 2.895 s with 88% I/O starvation; the same
