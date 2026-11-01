@@ -881,13 +881,60 @@ fn surface_shows_composer(
     }
 }
 
+/// What the doorbell tick does for an `Armable` generation whose box was
+/// touched (Q35-20, U3-02).
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TickProbe {
+    /// A check is outstanding: ring nothing, ask nothing.
+    Outstanding,
+    /// Nothing outstanding and no attempt due: the tick goes on as today.
+    NotDue,
+    /// Ask this probe.
+    Ask(ProbeAsk),
+}
+
+/// The tick's decision from the generation's input and its gate's status at
+/// `now`: a check outstanding rings nothing, and asks the retry of its own
+/// lapsed Claude probe once the schedule allows it; with nothing
+/// outstanding, the schedule's first attempt or retry when one is due.
+#[cfg(target_os = "linux")]
+pub(crate) fn tick_probe(
+    input: &crate::composer_probe::epoch::GenerationInput,
+    status: crate::composer_probe::gate::Status,
+    now: Instant,
+) -> TickProbe {
+    let outstanding = status.fenced
+        || input
+            .segments_front()
+            .is_some_and(|front| front != Front::None);
+    if outstanding {
+        // U3-02: its own lapsed Claude probe, alone with nothing held
+        // behind it, is superseded by the schedule's retry once due.
+        if input.lapse_due(status.held_ops, now) {
+            return TickProbe::Ask(ProbeAsk::Lapse);
+        }
+        return TickProbe::Outstanding;
+    }
+    if !input.probe_due(now) {
+        return TickProbe::NotDue;
+    }
+    // A due attempt after a failure is the schedule's retry.
+    TickProbe::Ask(if input.probe_retrying() {
+        ProbeAsk::Retry
+    } else {
+        ProbeAsk::First
+    })
+}
+
 impl AgentPtyRegistry {
     /// PRD #1666 part 3 (Q35-20): the doorbell tick's check of an
-    /// `Armable` generation whose box was touched. Starts a first probe when
-    /// one is due, off the tick; `true` while one is started or a check is
-    /// outstanding (the tick then rings nothing this time), `false` when the
-    /// tick goes on as it does today: not `Armable`, untouched, or no probe
-    /// due.
+    /// `Armable` generation whose box was touched ([`tick_probe`]). Starts
+    /// the probe it asks, off the tick, one request at a time; `true` while
+    /// one is started or on its way or a check is outstanding (the tick then
+    /// rings nothing this time), `false` when the tick goes on as it does
+    /// today: not `Armable`, untouched, or no probe due. A refused retry of
+    /// a lapsed probe counts as a failure, as a refused due attempt does.
     pub(crate) fn composer_probe_tick(self: &Arc<Self>, pane_id: &str, agent_id: &str) -> bool {
         #[cfg(target_os = "linux")]
         {
@@ -901,29 +948,26 @@ impl AgentPtyRegistry {
             {
                 return false;
             }
-            let outstanding = h.gate.gate.status().fenced
-                || input
-                    .segments_front()
-                    .is_some_and(|front| front != Front::None);
-            if outstanding {
+            let ask = match tick_probe(input, h.gate.gate.status(), Instant::now()) {
+                TickProbe::Outstanding => return true,
+                TickProbe::NotDue => return false,
+                TickProbe::Ask(ask) => ask,
+            };
+            let Some(request) = input.begin_probe_request() else {
                 return true;
-            }
-            if !input.probe_due(Instant::now()) {
-                return false;
-            }
+            };
             let Ok(runtime) = tokio::runtime::Handle::try_current() else {
                 return false;
             };
-            // A due attempt after a failure is the schedule's retry.
-            let ask = if input.probe_retrying() {
-                ProbeAsk::Retry
-            } else {
-                ProbeAsk::First
-            };
             let registry = Arc::clone(self);
+            let input = Arc::clone(input);
             let (pane, agent) = (pane_id.to_string(), agent_id.to_string());
             runtime.spawn(async move {
+                let _request = request;
                 let outcome = registry.composer_probe(&pane, &agent, ask).await;
+                if ask == ProbeAsk::Lapse && matches!(outcome, ProbeOutcome::Refused(_)) {
+                    input.probe_failed(Instant::now());
+                }
                 tracing::info!(
                     target: "composer_probe",
                     pane_id = %pane,
@@ -1035,6 +1079,96 @@ mod tests {
             ec: false,
             not_returned: false,
         }
+    }
+
+    /// An installed generation of `agent` with its records and segments.
+    fn live(
+        agent: crate::composer_probe::segments::Agent,
+    ) -> Arc<crate::composer_probe::epoch::GenerationInput> {
+        use crate::composer_probe::record::{EcPolicy, Records};
+        let input = Arc::new(crate::composer_probe::epoch::GenerationInput::default());
+        assert!(input.attach_records(Records::new(5, EcPolicy::Hold, Instant::now())));
+        assert!(input.attach_segments(5, agent));
+        input
+    }
+
+    /// Scenario: The doorbell tick finds its own Claude probe written more than the trigger's wait ago with no helper seen: lapsed, alone, nothing held behind it. The first tick counts the lapse as a failed attempt and asks nothing; once the schedule's backoff has passed it asks the lapse retry, and asks it again on the next tick without counting the same lapse twice. With typing held behind the lapsed probe it never asks; a Codex probe written as long ago never lapses; and while one request is on its way the tick can start no other.
+    #[cfg(target_os = "linux")]
+    #[spec("inbox/probe/030")]
+    #[test]
+    fn probe_030_the_tick_retries_its_own_lapsed_claude_probe() {
+        use crate::composer_probe::gate::Status;
+        use crate::composer_probe::probe::BACKOFF;
+        use crate::composer_probe::query_ledger::T_TRIGGER;
+        use crate::composer_probe::segments::Agent;
+        let now = Instant::now();
+        let Some(at) = now.checked_sub(T_TRIGGER + Duration::from_secs(1)) else {
+            return;
+        };
+        let fenced = Status {
+            fenced: true,
+            ..Status::default()
+        };
+        let held = Status {
+            held_ops: 1,
+            held_bytes: 1,
+            ..fenced
+        };
+        for agent in [Agent::Claude, Agent::Codex] {
+            let input = live(agent);
+            let (number, _) = input.segment_open_probe(false, now).unwrap();
+            input.segment_written(number, 0, at, now).unwrap();
+            assert_eq!(
+                tick_probe(&input, fenced, now),
+                TickProbe::Outstanding,
+                "{agent:?}: a lapse is a failed attempt first"
+            );
+            input.advance_schedule_for_e2e(BACKOFF[0], now);
+            assert_eq!(
+                tick_probe(&input, held, now),
+                TickProbe::Outstanding,
+                "{agent:?}: typing waits behind it"
+            );
+            let retry = match agent {
+                Agent::Claude => TickProbe::Ask(ProbeAsk::Lapse),
+                _ => TickProbe::Outstanding,
+            };
+            assert_eq!(tick_probe(&input, fenced, now), retry, "{agent:?}");
+            assert_eq!(
+                tick_probe(&input, fenced, now),
+                retry,
+                "{agent:?}: the same lapse counts once"
+            );
+        }
+        let input = live(Agent::Claude);
+        let request = input.begin_probe_request().expect("the first request");
+        assert!(input.begin_probe_request().is_none(), "one at a time");
+        drop(request);
+        assert!(
+            input.begin_probe_request().is_some(),
+            "free once it answered"
+        );
+    }
+
+    /// Scenario: A generation's probe attempts fail three times in a row, so its observer is broken and its next attempt waits the backoff. A person types a key: one fresh attempt is due at once. A terminal's report alone, or an empty op, makes none due.
+    #[spec("inbox/probe/030")]
+    #[test]
+    fn probe_030_a_persons_key_makes_a_broken_observers_attempt_due() {
+        use crate::composer_probe::epoch::Writer;
+        use crate::composer_probe::segments::Agent;
+        let input = live(Agent::Claude);
+        let now = Instant::now();
+        for _ in 0..crate::composer_probe::probe::BROKEN_AFTER {
+            input.probe_failed(now);
+        }
+        assert!(!input.probe_due(now), "broken, waiting its backoff");
+        input.enqueue(Writer::Human, b"");
+        assert!(!input.probe_due(now), "an empty op is no typing");
+        input.enqueue(Writer::Human, b"x");
+        assert!(
+            input.probe_due(now),
+            "a person's key: one attempt due at once"
+        );
     }
 
     /// Scenario: Map held typing to the card's cause across ages, waiters and the front segment's kind and stage. A full queue says so at any age; under five seconds it says a check is running; after that a probe not yet opened, one opened and not returned, and a person's own Ctrl+G each get their own words, and with no segment it still says checking.

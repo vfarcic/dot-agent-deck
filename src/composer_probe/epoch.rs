@@ -420,6 +420,9 @@ struct Live {
     /// Each open probe: its segment number, its job, and `E0`, the epoch
     /// just before its own byte moved it (set at its enqueue).
     probes: Vec<Probe>,
+    /// The lapsed Claude probe whose lapse the schedule counted as a failure
+    /// (U3-02): each lapse is counted once.
+    lapse_counted: Option<u64>,
     /// The daemon's read of an `Armed` invocation's export: whether it was
     /// empty, for the epoch's settlement of the probe it matches.
     reads: std::collections::VecDeque<(RecordKey, bool)>,
@@ -772,6 +775,16 @@ fn plan_locked(state: &mut State, writer: Writer, bytes: &[u8], plan: Option<Pla
             }
         }
     }
+    // R2 §6.8 (U3-02): a person's op gives a broken observer one fresh
+    // attempt, due at once. A report a terminal sends isn't typing.
+    if person
+        && exempt.is_none()
+        && !bytes.is_empty()
+        && !state.retired
+        && let Some(live) = state.live.as_mut()
+    {
+        live.schedule.person();
+    }
     let enqueued = match exempt {
         Some(report) => Enqueued::Exempt(report),
         None => {
@@ -819,6 +832,9 @@ pub struct GenerationInput {
     /// Where native numbers are published (Q35-16): called with no lock of
     /// this module held.
     native_page: NativePage,
+    /// A probe request is on its way (U3-02): the doorbell tick starts no
+    /// other until it answers ([`Self::begin_probe_request`]).
+    probe_request: std::sync::atomic::AtomicBool,
     /// The drain frontier's requests and its reader's wake (Q35-20a).
     frontier: FrontierQueue,
     /// How the agent's input reader frames what it reads, as its release
@@ -833,6 +849,15 @@ pub struct GenerationInput {
     /// and a fault plan, reached without the pane writer's lock.
     #[cfg(any(test, feature = "e2e"))]
     writer_e2e: Arc<crate::e2e_controls::WriterE2e>,
+}
+
+/// A probe request on its way ([`GenerationInput::begin_probe_request`]).
+pub struct ProbeRequest(Arc<GenerationInput>);
+
+impl Drop for ProbeRequest {
+    fn drop(&mut self) {
+        self.0.probe_request.store(false, Ordering::SeqCst);
+    }
 }
 
 /// The generation's native-number publisher, once its observer runs.
@@ -892,6 +917,7 @@ impl GenerationInput {
             moved: tokio::sync::Notify::new(),
             output_offset: AtomicU64::new(0),
             native_page: NativePage::default(),
+            probe_request: std::sync::atomic::AtomicBool::new(false),
             frontier: FrontierQueue::default(),
             input_grammar: AtomicU8::new(0),
             #[cfg(test)]
@@ -1247,6 +1273,7 @@ impl GenerationInput {
             schedule: Schedule::default(),
             probes: Vec::new(),
             reads: std::collections::VecDeque::new(),
+            lapse_counted: None,
         });
         true
     }
@@ -1401,6 +1428,41 @@ impl GenerationInput {
             retained: r.len(),
             witness: r.witness(),
         })
+    }
+
+    /// The doorbell tick's own lapsed probe (U3-02, core §4.7): whether its
+    /// retry is due at `now`. A lone Claude probe that lapsed with nothing
+    /// held behind it (`held_ops`, the gate's) is a failed attempt (R2
+    /// §6.8): the schedule counts it once, so its retry waits the backoff a
+    /// failure waits, and is then due when the schedule is. `false` for
+    /// anything else, Codex included (only a Claude probe lapses).
+    pub fn lapse_due(&self, held_ops: usize, now: Instant) -> bool {
+        let mut guard = self.state.lock_recovering();
+        let state = &mut *guard;
+        if state.retired || held_ops > 0 {
+            return false;
+        }
+        let epoch = state.epoch.epoch();
+        let Some(live) = state.live.as_mut() else {
+            return false;
+        };
+        let Some(number) = live.segments.lapsed_number(now) else {
+            return false;
+        };
+        if live.lapse_counted != Some(number) {
+            live.lapse_counted = Some(number);
+            live.schedule.failed(now);
+        }
+        live.schedule.due(now, epoch)
+    }
+
+    /// Start a probe request (U3-02): `None` while another is on its way.
+    /// The request is over when the guard drops.
+    pub fn begin_probe_request(self: &Arc<Self>) -> Option<ProbeRequest> {
+        self.probe_request
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| ProbeRequest(Arc::clone(self)))
     }
 
     /// Whether the last attempt failed, so a due one is the schedule's

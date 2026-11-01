@@ -653,6 +653,14 @@ impl Segments {
         self.segments.len() == 1 && self.segments.front().is_some_and(|s| self.lapsed(s, now))
     }
 
+    /// The lone lapsed Claude probe's number ([`Self::lapsed_alone`]).
+    pub fn lapsed_number(&self, now: Instant) -> Option<u64> {
+        if !self.lapsed_alone(now) {
+            return None;
+        }
+        self.segments.front().and_then(|s| s.number)
+    }
+
     /// The open segments' count.
     pub fn len(&self) -> usize {
         self.segments.len()
