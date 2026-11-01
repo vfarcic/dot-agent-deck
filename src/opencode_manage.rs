@@ -2245,13 +2245,17 @@ const v2MiniNote = (text) => {
     console.error(`dot-agent-deck: ${text}`);
   } catch (_) {}
 };
-// Mini's session, looked up once, from the moment the mini receiver starts
-// (`setupAt`): a promise of its id, or of undefined when it is ambiguous or
-// was not found within V2_MINI_RESOLVE_MS. A `session.created` this plugin
-// sees (observeInboxV2) answers it too.
+// Mini's session, looked up once per module, from the moment the mini
+// receiver first started in this process (`setupAt`, kept with the session
+// across a re-import: miniBinding): a promise of its id, or of undefined when
+// it is ambiguous or was not found within V2_MINI_RESOLVE_MS. A
+// `session.created` this plugin sees (observeInboxV2) answers it too.
 const v2ResolveMiniTarget = (ctx) => {
   if (v2MiniResolution) return v2MiniResolution;
-  const setupAt = Date.now();
+  // The first setup in this process, kept across a re-import (miniBinding).
+  const binding = miniBinding();
+  if (typeof binding.setupAt !== "number") binding.setupAt = Date.now();
+  const setupAt = binding.setupAt;
   v2MiniResolution = (async () => {
     const started = typeof performance === "object" ? performance.timeOrigin : setupAt;
     const deadline = setupAt + V2_MINI_RESOLVE_MS;
@@ -2265,7 +2269,7 @@ const v2ResolveMiniTarget = (ctx) => {
         } catch (_) {}
         if (miniTarget) return miniTarget;
         if (found?.id) {
-          miniTarget = found.id;
+          bindMiniTarget(found.id);
           return miniTarget;
         }
         if (found?.ambiguous) {
@@ -2356,7 +2360,7 @@ const observeInboxV2 = (event) => {
     const type = event?.type;
     const data = event?.data ?? {};
     if (type === "session.created") {
-      if (data.sessionID && !data.parentID) miniTarget = data.sessionID;
+      if (data.sessionID && !data.parentID) bindMiniTarget(data.sessionID);
       return;
     }
     if (!receiver) return;
@@ -2833,10 +2837,30 @@ const INBOX_HANDLED =
 const INBOX_RECEIVER = "__dotAgentDeckReceiver";
 const INBOX_GENERATION = "__dotAgentDeckGeneration";
 const INBOX_ANNOUNCED = "__dotAgentDeckAnnounced";
+const INBOX_MINI_BINDING = "__dotAgentDeckMiniBinding";
 // --mini: the last root session this process created, which OpenCode user
 // message carries which deck message ids, and the sessions running a deck
 // turn.
-let miniTarget = undefined;
+//
+// Mini's session, and when the 2.x mini receiver first started (`setupAt`,
+// v2ResolveMiniTarget), are kept per process on globalThis, not in this
+// module: OpenCode 2 reloads the plugin when the module file changes (a deck
+// upgrade rewrites it), and a re-import in the same process starts with fresh
+// module variables. Re-resolving then would take the reload as `setupAt`, so
+// the window would cover every root session of the directory since the
+// server started, and a mini sharing its directory with any later session
+// would go dark as ambiguous. Not measured: whether 2.2.5's reload re-imports
+// the module in the same process or starts a new server; a new server keeps
+// nothing here, and a mini whose session predates it is then not found.
+const miniBinding = () => {
+  if (!globalThis[INBOX_MINI_BINDING]) globalThis[INBOX_MINI_BINDING] = {};
+  return globalThis[INBOX_MINI_BINDING];
+};
+let miniTarget = miniBinding().target;
+const bindMiniTarget = (id) => {
+  miniTarget = id;
+  miniBinding().target = id;
+};
 const miniPending = new Map();
 const miniTurns = new Set();
 let miniQueue = Promise.resolve();
@@ -2970,7 +2994,7 @@ const observeInbox = (event) => {
     inboxObserveUsers(inboxUsers, event, intercepted, miniPending);
     if (type === "session.created") {
       const info = properties?.info;
-      if (info?.id && !info.parentID) miniTarget = info.id;
+      if (info?.id && !info.parentID) bindMiniTarget(info.id);
     } else if (type === "message.part.updated") {
       const part = properties?.part;
       if (part?.type !== "text" || !part.messageID || !receiver) return;
@@ -10703,7 +10727,7 @@ await wait(1500);
         use sha2::Digest;
         const RECORDED: (u32, &str) = (
             1,
-            "f6a4829c9a062dad209e70ebd5ffe39ff92e1111fd5e499ac6bc3efd52900bcd",
+            "035ed0de20f3b21daa63df10c95b00bd56829aac6abe152121a976d31d126a33",
         );
         let digest = sha2::Sha256::digest(plugin_template("/opt/dot-agent-deck").as_bytes());
         let digest: String = digest.iter().map(|b| format!("{b:02x}")).collect();
@@ -11556,7 +11580,7 @@ await emit("form.cancelled", { id: "form-2", sessionID: "s1" });"#,
         std::fs::write(
             &driver,
             format!(
-                "import pluginModule from {plugin};\n{FAKE_V2_CTX_JS}\nconst lists = [];\nlet sessions = [];\nctx.session.list = async (input) => {{ lists.push(input); return {{ data: sessions, cursor: {{}} }}; }};\nconst now = Date.now();\nprocess.argv.push(\"serve\", \"--stdio\");\n{body}\nprocess.exit(0);\n",
+                "import pluginModule from {plugin};\n{FAKE_V2_CTX_JS}\nconst lists = [];\nlet sessions = [];\nctx.session.list = async (input) => {{ lists.push(input); return {{ data: sessions, cursor: {{}} }}; }};\nconst now = Date.now();\nconst pluginURL = (await import(\"url\")).pathToFileURL({plugin}).href;\nprocess.argv.push(\"serve\", \"--stdio\");\n{body}\nprocess.exit(0);\n",
                 plugin = serde_json::to_string(&plugin.display().to_string()).unwrap(),
             ),
         )
@@ -11761,6 +11785,53 @@ console.log(JSON.stringify({ prompts }));"#,
         assert_eq!(prompts.len(), 1, "{result}");
         assert_eq!(prompts[0]["sessionID"], "ses_this_mini", "{result}");
         assert!(written.contains("\"handed\""), "{written}");
+    }
+
+    /// Scenario (PRD #2050, audit M1): an OpenCode 2 mini found its session
+    /// and took a deck message there; later another root session is created
+    /// in the same directory, and the deck's module is re-imported in the same
+    /// server process (OpenCode 2 reloads the plugin when the module file
+    /// changes). The next deck message still starts in the mini's own session
+    /// rather than being refused as ambiguous.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opencode_v2_mini_keeps_its_session_across_a_plugin_reload() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let (result, written) = run_v2_mini_driver(
+            "",
+            r#"const started = performance.timeOrigin;
+sessions = [
+  { id: "ses_this_mini", time: { created: started + 100 }, location: { directory: "/work" } },
+];
+const cleanup = await pluginModule.setup(ctx);
+for (let n = 0; n < 200 && !prompts.length; n++) await sleep(20);
+const first = prompts.length;
+await sleep(700);
+sessions = [{ id: "ses_later", time: { created: Date.now() }, location: { directory: "/work" } }, ...sessions];
+await cleanup();
+const reloaded = (await import(pluginURL + "?reload=1")).default;
+const cleanupReloaded = await reloaded.setup(ctx);
+for (let n = 0; n < 200 && prompts.length < 2; n++) await sleep(20);
+await sleep(100);
+await cleanupReloaded();
+console.log(JSON.stringify({ first, prompts }));"#,
+        );
+        assert_eq!(
+            result["first"], 1,
+            "the first message reached mini: {result}"
+        );
+        let prompts = result["prompts"].as_array().cloned().unwrap_or_default();
+        assert_eq!(
+            prompts.len(),
+            2,
+            "the reloaded plugin delivers too: {result}"
+        );
+        assert_eq!(prompts[0]["sessionID"], "ses_this_mini", "{result}");
+        assert_eq!(prompts[1]["sessionID"], "ses_this_mini", "{result}");
+        assert!(!written.contains("\"not_handed\""), "{written}");
     }
 
     /// Scenario (PRD #2050, round-3 re-review F1): two OpenCode 2 minis start
