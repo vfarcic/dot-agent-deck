@@ -574,19 +574,23 @@ fn probe_049_mode_observations_and_malformed_pairs_are_not_release_authority() {
     }
 }
 
-/// Scenario: Hold a human editor's helper after a failed spawn or an injected wait failure following a real editor start. A failed spawn retains the suffix through return and retirement under production Hold; an observed running user editor reads its released suffix before the wait-unknown exit drain, and those bytes must never reach the composer or its successor.
+/// Scenario: Hold a human editor's helper after a failed spawn or an injected wait failure following a real editor start. A failed spawn retains the suffix through return and retirement under production Hold; a running user editor reads its released suffix either before the unknown-wait drain or after the writer parks it across that drain. The parked case also queues another trigger and suffix that must stay held through the drain, return and replacement, while the released line reaches the editor's terminal exactly once.
 #[spec("inbox/probe/049")]
 #[test]
 fn probe_049_failed_editor_outcomes_stay_held_under_production_hold() {
-    for outcome in ["spawn-failed", "wait-unknown"] {
+    for (outcome, parked) in [
+        ("spawn-failed", false),
+        ("wait-unknown", false),
+        ("wait-unknown", true),
+    ] {
         let mut f = Fixture::start("claude");
         f.flag("hold-return");
         f.probe();
         f.wait("helper-exited");
         // Q104b: a positively observed running user editor owns bytes
         // released before WaitUnknown is learned at the helper's exit drain.
-        // Keep the helper alive at post-editor until that reader acknowledges
-        // the suffix, so the positive release is witnessed, not inferred.
+        // Keep the helper alive at post-editor until the reader acknowledges
+        // the suffix or the writer positively parks it after gate release.
         let pause = if outcome == "wait-unknown" {
             f.setting("editor-mode", "read");
             f.setting("helper-pause-at", "post-editor");
@@ -596,7 +600,9 @@ fn probe_049_failed_editor_outcomes_stay_held_under_production_hold() {
         };
         let mut human = f.connect();
         // A HumanG segment follows the already-complete probe.
-        human.write(if pause.is_some() {
+        human.write(if parked {
+            "\x07"
+        } else if pause.is_some() {
             "\x07OQ5-HELD\n"
         } else {
             "\x07OQ5-HELD"
@@ -605,16 +611,88 @@ fn probe_049_failed_editor_outcomes_stay_held_under_production_hold() {
         f.flag(&format!("{outcome}-2"));
         f.flag("resume-go-1");
         if let Some(pause) = pause {
+            let mut pause = Some(pause);
+            if parked {
+                f.wait("editor-started");
+                f.expect(b"\x07\x07");
+                f.control("writer-hold");
+                let before = f.control("writer-status")["composer_writer"]["dequeued"]
+                    .as_u64()
+                    .unwrap();
+                human.write("OQ5-HELD\n");
+                assert!(
+                    common::wait_until(WAIT, || {
+                        f.control("writer-status")["composer_writer"]["parked"] == true
+                    }),
+                    "the running editor's released line must park before delivery"
+                );
+                let writer = f.control("writer-status")["composer_writer"].clone();
+                assert_eq!(writer["dequeued"], before + 1, "{writer}");
+                assert!(!f.held(), "the parked line has already left the gate");
+                assert!(!f.path("editor-input").exists());
+                // A further candidate stops release at its boundary. This
+                // suffix is still in the gate when the unknown wait drains.
+                human.write("\x07STILL-IN-GATE\n");
+                f.wait_held();
+                let fence = f.control("fence-status")["composer_fence"].clone();
+                assert_eq!(fence["held_bytes"], b"\x07STILL-IN-GATE\n".len(), "{fence}");
+                let observer = f.control("observer-hold")["composer_observer"].clone();
+                assert_eq!(observer["passes_held"], true, "{observer}");
+                assert_eq!(observer["pass_running"], false, "{observer}");
+                let passes = observer["passes"].as_u64().unwrap();
+                f.remove("pause-helper");
+                pause.take().unwrap().release();
+                f.wait("helper-exited-2");
+                let trace = fs::read_to_string(f.path("helper-trace")).unwrap();
+                assert!(trace.contains("wait-unknown 10"), "{trace}");
+                // Hold already opens scope at Unarmed. A completed observer
+                // pass after the witnessed exit, rather than scope alone,
+                // establishes that the helper's exit was available to drain.
+                f.control("observer-go");
+                assert!(common::wait_until(WAIT, || {
+                    f.control("observer-status")["composer_observer"]["passes"]
+                        .as_u64()
+                        .unwrap()
+                        > passes
+                }));
+                assert_eq!(f.scope(), "open");
+                assert!(f.held(), "the next trigger and suffix stay in the gate");
+                assert_eq!(
+                    f.control("fence-status")["composer_fence"]["held_bytes"],
+                    b"\x07STILL-IN-GATE\n".len(),
+                    "the drain must retain the complete later trigger and suffix"
+                );
+                assert_eq!(
+                    f.control("writer-status")["composer_writer"]["parked"],
+                    true,
+                    "released bytes must still be undelivered at the drain"
+                );
+                assert!(!f.path("editor-input").exists());
+                f.control("writer-go");
+            }
             f.wait("editor-input");
             assert_eq!(
                 fs::read(f.path("editor-input")).unwrap(),
                 b"OQ5-HELD\n",
                 "the released suffix belongs to the running user editor"
             );
+            if parked {
+                f.stable(b"\x07\x07");
+                // The editor has consumed its complete canonical line and
+                // now waits for editor-go. No duplicate or held suffix may
+                // remain readable in that same terminal's input queue.
+                assert_eq!(
+                    f.command(json!({"action":"input-pending"}))["pending_bytes"],
+                    0
+                );
+                assert!(f.held());
+            }
             f.flag("editor-go");
             f.wait("editor-finished");
-            f.remove("pause-helper");
-            pause.release();
+            if !parked {
+                f.remove("pause-helper");
+                pause.take().unwrap().release();
+            }
         }
         // Distinct witnesses and releases separate the second quick failure
         // from the first helper's completed return.
@@ -633,6 +711,13 @@ fn probe_049_failed_editor_outcomes_stay_held_under_production_hold() {
             "the complete real return must be visible before the negative watch"
         );
         f.stable(b"\x07\x07");
+        if parked {
+            assert_eq!(
+                f.control("fence-status")["composer_fence"]["held_bytes"],
+                b"\x07STILL-IN-GATE\n".len(),
+                "the matching return must retain what was still held at drain"
+            );
+        }
         f.probe();
         f.stable(b"\x07\x07");
         f.replace();
