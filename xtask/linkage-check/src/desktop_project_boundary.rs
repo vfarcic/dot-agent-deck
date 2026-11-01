@@ -207,6 +207,16 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     // "root-crate wrapper with an innocuous name" residual this file's header
     // already admits: nothing here would catch it.
     "features",
+    // PRD #1666 part 3 (Q15-2), argued rather than added quietly. The desktop
+    // names ONE item here, `input_rejected`: the words both clients show when
+    // the daemon refuses a pane's typed input (CLAUDE.md rule 22). A
+    // desktop-side copy would be a second list of those words, the drift the
+    // shared `tests/fixtures/inbox-display.json` exists to catch. Checked
+    // against this rule's lines: the module is display words and their
+    // mapping, reads no file, resolves no project, names no FORBIDDEN_SYMBOL
+    // or project-state literal, and contains no `std::env::current_dir` —
+    // all zero for it.
+    "inbox_display",
     // Issue #1635, argued rather than added quietly, with `self_upgrade`
     // below. The desktop names ONE item here, `capture_login_shell_path`: a
     // GUI app's own `PATH` usually lacks the user's shell setup, so finding the
