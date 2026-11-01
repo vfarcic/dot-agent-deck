@@ -299,11 +299,15 @@ fn existing_plugin_artifacts() -> Vec<PathBuf> {
 /// `the_template_revision_is_bumped_with_the_template` fails until it is.
 ///
 /// An automatic install leaves a module of a later revision than this one
-/// alone while the pin it carries is usable (audit N4): after a deck upgrade, the older daemon still running would
-/// otherwise write its older template back on its next OpenCode spawn, since
-/// its pin is the same path, and OpenCode 2 reloads its plugins on every such
-/// write. Only a daemon built with this check keeps from downgrading: one
-/// built before it writes its own template as it always did.
+/// alone while the pin it carries is usable and is either another install or
+/// this install replaced under a running process (audit N4,
+/// [`running_other_than`]): after a deck upgrade, the older daemon still
+/// running would otherwise write its older template back on its next
+/// OpenCode spawn, since its pin is the same path, and OpenCode 2 reloads its
+/// plugins on every such write. A deck rolled back at the same path is the
+/// file at its pin, so it writes its own template. Only a daemon built with
+/// this check keeps from downgrading: one built before it writes its own
+/// template as it always did.
 const PLUGIN_TEMPLATE_REVISION: u32 = 1;
 
 /// Render the plugin JavaScript with `BINARY_PATH` pinned to `binary_path`.
@@ -3975,6 +3979,63 @@ fn newer_template(file: &Path) -> bool {
     template_revision(file).is_some_and(|n| n > PLUGIN_TEMPLATE_REVISION)
 }
 
+/// The file identity of the executable this process runs: on Linux the file
+/// `/proc/self/exe` resolves to, which is still the running image after an
+/// upgrade replaced the file at its path (the link then reads `… (deleted)`,
+/// and `stat` follows it to the old file). Elsewhere, the identity the file
+/// at `current_exe()` had the first time this was asked, which `daemon serve`
+/// does at startup ([`note_own_executable`]); a process that never asks
+/// before its file is replaced takes the new file for its own.
+fn own_executable_key() -> Option<crate::opencode_version::FileKey> {
+    #[cfg(test)]
+    if let Some(path) = RUNNING_EXE_FOR_TEST.with(|p| p.borrow().clone()) {
+        return crate::opencode_version::FileKey::of(&path);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        crate::opencode_version::FileKey::of(Path::new("/proc/self/exe"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        static AT_START: std::sync::OnceLock<Option<crate::opencode_version::FileKey>> =
+            std::sync::OnceLock::new();
+        AT_START
+            .get_or_init(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| crate::opencode_version::FileKey::of(&exe))
+            })
+            .clone()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the executable [`own_executable_key`] takes as this process's.
+    static RUNNING_EXE_FOR_TEST: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Record this process's executable now, at startup, for the platforms where
+/// [`own_executable_key`] cannot read the running image after its file is
+/// replaced. A no-op on Linux.
+pub fn note_own_executable() {
+    let _ = own_executable_key();
+}
+
+/// Auditor M2: whether this process runs an executable other than the file
+/// now at `pin`, i.e. it is an older deck still running after the install at
+/// `pin` was replaced. `false` when either identity cannot be read.
+fn running_other_than(pin: &str) -> bool {
+    match (
+        own_executable_key(),
+        crate::opencode_version::FileKey::of(Path::new(pin)),
+    ) {
+        (Some(running), Some(at_pin)) => running != at_pin,
+        _ => false,
+    }
+}
+
 /// [`auto_install_to_reporting`]: what every automatic install of the server
 /// module runs.
 fn auto_install_to_reporting_for(
@@ -4028,18 +4089,28 @@ fn auto_install_to_reporting_for(
         let mut taking_over = None;
         let (pinned, repairing) = match existing_binary_path(root) {
             Some(existing) if crate::agent_hook_config::auto_install_keeps(&existing) => {
-                if newer_template(&plugin_file(root)) {
+                let this_install =
+                    crate::agent_hook_config::executables_match(&existing, binary_path);
+                if newer_template(&plugin_file(root))
+                    && (!this_install || running_other_than(&existing))
+                {
                     // Audit N4: a module a newer deck wrote, around a pin
-                    // that is usable, is left as it is, whatever it pins: the
-                    // same install's older daemon, still running after an
-                    // upgrade, would otherwise put its older template back,
-                    // and each rewrite reloads every live OpenCode 2 pane's
-                    // plugin. `hooks install --agent opencode` still writes
-                    // this binary's template when asked to.
+                    // that is usable, is left as it is when it pins another
+                    // install, or this install while this process is the
+                    // older deck still running after an upgrade replaced it:
+                    // that process would otherwise put its older template
+                    // back, and each rewrite reloads every live OpenCode 2
+                    // pane's plugin. When the file at the pin is the one this
+                    // process runs (auditor M2: a deliberate rollback, or a
+                    // config synced from a machine with a newer deck), this
+                    // install's template is written as before, since a newer
+                    // template may call what this build lacks. `hooks install
+                    // --agent opencode` writes this binary's template either
+                    // way.
                     pins.push((root.clone(), existing));
                     continue;
                 }
-                if crate::agent_hook_config::executables_match(&existing, binary_path) {
+                if this_install {
                     // This very install: refresh the template, keep the pin's
                     // spelling.
                     (existing, false)
@@ -10648,17 +10719,23 @@ await wait(1500);
         );
     }
 
-    /// Scenario (PRD #2050, audit N4): a deck upgrade wrote a module of a
-    /// later template revision, and the older daemon, still running, starts
-    /// an OpenCode agent. Its automatic install, of any layout, leaves the
-    /// newer module exactly as it is, though it pins this very install; a
-    /// module of this revision or an earlier one is still refreshed, and
-    /// `hooks install --agent opencode` writes this binary's template when
-    /// asked to.
+    /// Scenario (PRD #2050, audit N4): a deck upgrade replaced the install
+    /// and wrote a module of a later template revision, and the older daemon,
+    /// still running the replaced file, starts an OpenCode agent. Its
+    /// automatic install, of any layout, leaves the newer module exactly as
+    /// it is, though it pins this very install; a module of this revision or
+    /// an earlier one is still refreshed, and `hooks install --agent
+    /// opencode` writes this binary's template when asked to.
     #[cfg(unix)]
     #[test]
     fn an_older_deck_never_downgrades_a_newer_template() {
         let f = LayoutFixture::new();
+        // The image this daemon runs: the install's file before the upgrade
+        // replaced it, kept here as a separate file.
+        let replaced = f._dir.path().join("replaced-dot-agent-deck");
+        std::fs::copy(&f.bin, &replaced).unwrap();
+        RUNNING_EXE_FOR_TEST.with(|p| *p.borrow_mut() = Some(replaced.clone()));
+        assert!(running_other_than(&f.bin));
         let ours = plugin_template(&f.bin);
         let marker = format!("const DAD_TEMPLATE_REVISION = {PLUGIN_TEMPLATE_REVISION};");
         assert!(ours.contains(&marker), "the template declares its revision");
@@ -10707,6 +10784,41 @@ await wait(1500);
             ours,
             "an explicit install writes this template"
         );
+        RUNNING_EXE_FOR_TEST.with(|p| *p.borrow_mut() = None);
+    }
+
+    /// Scenario (PRD #2050, auditor M2): the user rolled the deck back to an
+    /// older release at the same path (or synced an OpenCode config from a
+    /// machine with a newer deck), so the module is of a later template
+    /// revision and pins this install, and the file at the pin is the one
+    /// this process runs. Its automatic install, of any layout, writes its
+    /// own template, which this build can run.
+    #[cfg(unix)]
+    #[test]
+    fn a_rolled_back_deck_writes_its_own_template_over_a_newer_one() {
+        let f = LayoutFixture::new();
+        RUNNING_EXE_FOR_TEST.with(|p| *p.borrow_mut() = Some(PathBuf::from(&f.bin)));
+        assert!(!running_other_than(&f.bin));
+        let ours = plugin_template(&f.bin);
+        let marker = format!("const DAD_TEMPLATE_REVISION = {PLUGIN_TEMPLATE_REVISION};");
+        let newer = ours.replace(
+            &marker,
+            &format!(
+                "const DAD_TEMPLATE_REVISION = {};\n// a later deck's template",
+                PLUGIN_TEMPLATE_REVISION + 1
+            ),
+        );
+        std::fs::create_dir_all(plugin_file(f.global()).parent().unwrap()).unwrap();
+        for layout in [Layout::V1, Layout::V2, Layout::Unknown] {
+            std::fs::write(plugin_file(f.global()), &newer).unwrap();
+            assert_eq!(f.install(layout), Vec::<String>::new(), "{layout:?}");
+            assert_eq!(
+                std::fs::read_to_string(plugin_file(f.global())).unwrap(),
+                ours,
+                "{layout:?} left a newer template over the install this process runs"
+            );
+        }
+        RUNNING_EXE_FOR_TEST.with(|p| *p.borrow_mut() = None);
     }
 
     /// [`template_revision`] of module text `js`.
