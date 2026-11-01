@@ -1289,6 +1289,99 @@ mod tests {
         );
     }
 
+    /// Scenario: A Claude probe is written with no helper seen and nothing held, and lapses: the tick counts the lapse as one failed attempt, so the retry waits the first backoff step. Then a late record for that same probe arrives with a failed check (Unarmed, Tool or an unknown decision): the one attempt still counts once, with the first step's deadline. A late record whose export the deck read still settles it: read empty, the schedule is due again at once; read non-empty, the failure is cleared and the recheck waits on the box (R-D-U2-02).
+    #[cfg(target_os = "linux")]
+    #[spec("inbox/probe/030")]
+    #[test]
+    fn probe_030_a_lapsed_probes_late_failed_record_counts_its_one_attempt_once() {
+        use crate::composer_probe::gate::Status;
+        use crate::composer_probe::probe::BACKOFF;
+        use crate::composer_probe::query_ledger::T_TRIGGER;
+        use crate::composer_probe::record::{
+            Attribution, Channel, Decision, Observation, RecordKey,
+        };
+        use crate::composer_probe::segments::Agent;
+        let now = Instant::now();
+        let Some(at) = now.checked_sub(T_TRIGGER + Duration::from_secs(1)) else {
+            return;
+        };
+        let fenced = Status {
+            fenced: true,
+            ..Status::default()
+        };
+        let failures = |input: &crate::composer_probe::epoch::GenerationInput| {
+            input
+                .advance_schedule_for_e2e(Duration::ZERO, now)
+                .expect("a live schedule")
+                .1
+        };
+        // A late record of `decision` for the lapsed probe; an `Armed` one
+        // with the daemon's read of its export, `empty` or not.
+        let late = |input: &crate::composer_probe::epoch::GenerationInput,
+                    number: u64,
+                    decision: Decision,
+                    empty: bool| {
+            let key = RecordKey {
+                pid: 4242,
+                start: 1,
+            };
+            if decision == Decision::Armed {
+                input.note_read(key, empty);
+            }
+            let _ = input.record_observe(
+                &Observation {
+                    generation: 5,
+                    key,
+                    channel: Channel::Ipc,
+                    attribution: Attribution::Owned,
+                    claim: None,
+                    decision: Some(decision),
+                    seg_seen: Some(number),
+                    native_seen: None,
+                    birth_floor: at,
+                },
+                now,
+            );
+        };
+        let lapsed = || {
+            let input = live(Agent::Claude);
+            let (number, _) = input.segment_open_probe(false, now).unwrap();
+            input.segment_written(number, 0, at, now).unwrap();
+            assert_eq!(tick_probe(&input, fenced, now), TickProbe::Outstanding);
+            assert_eq!(failures(&input), 1, "the lapse is one failure");
+            (input, number)
+        };
+        for decision in [Decision::Unarmed, Decision::Tool, Decision::Unknown] {
+            let (input, number) = lapsed();
+            late(&input, number, decision, false);
+            assert_eq!(
+                failures(&input),
+                1,
+                "{decision:?}: the lapsed attempt's late failed check counts it once, not twice"
+            );
+            assert!(
+                !input.probe_due(now + BACKOFF[0] - Duration::from_millis(1)),
+                "{decision:?}: not due before the first step's deadline"
+            );
+            assert!(
+                input.probe_due(now + BACKOFF[0]),
+                "{decision:?}: due at the first step's deadline, not the second's"
+            );
+        }
+        // The controls: a late read still settles it, empty or not.
+        let (input, number) = lapsed();
+        late(&input, number, Decision::Armed, true);
+        assert_eq!(failures(&input), 0, "a late empty read settles the probe");
+        assert!(input.probe_due(now), "empty: due again at once");
+        let (input, number) = lapsed();
+        late(&input, number, Decision::Armed, false);
+        assert_eq!(failures(&input), 0, "a late non-empty read settles it too");
+        assert!(
+            !input.probe_due(now + BACKOFF[0]),
+            "non-empty: its recheck waits on the box, not the failure's backoff"
+        );
+    }
+
     /// Scenario: A generation's probe attempts fail three times in a row, so its observer is broken and its next attempt waits the backoff. A person types a key: one fresh attempt is due at once. A terminal's report alone, or an empty op, makes none due.
     #[spec("inbox/probe/030")]
     #[test]

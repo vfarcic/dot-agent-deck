@@ -668,7 +668,8 @@ impl Live {
     /// `key`'s `decision` and the daemon's read of its export (R3 §3.4),
     /// once: an `Armed` empty read that is the deck's own claim applies the
     /// observation and the schedule's empty; another `Armed` is non-empty;
-    /// anything else, no decision included, is a failed check.
+    /// anything else, no decision included, is a failed check, counted
+    /// unless the probe's lapse was counted already (R-D-U2-02).
     fn settle_probe(
         &mut self,
         epoch: &mut InputEpoch,
@@ -709,6 +710,11 @@ impl Live {
             (Some(Decision::Armed), _) => {
                 self.schedule.non_empty(now, epoch.epoch());
             }
+            // R-D-U2-02: a probe whose lapse the schedule already counted
+            // (`lapse_due`) was one attempt; its late failed check is that
+            // same failure, not a second one. A late read still settles it
+            // (the arms above).
+            _ if self.lapse_counted == Some(number) => {}
             _ => self.schedule.failed(now),
         }
     }
