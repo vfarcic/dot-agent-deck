@@ -214,7 +214,8 @@ impl Rig {
                 Arc::clone(&w.gate.gate),
                 Arc::clone(&self.input),
                 Arc::clone(&claim),
-                move |ctx, _| {
+                || true,
+                move |ctx, _, _| {
                     input
                         .liability_raise(G, ctx.now)
                         .map(drop)

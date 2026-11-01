@@ -28,10 +28,33 @@
 //! activation commit, so outside the `e2e` build's assumption no probe is
 //! ever admitted, no fence closes and the driver finds nothing to do.
 //!
+//! **Where each fact admission reads is read (O-20.7, U3-03).** A probe is
+//! asked twice: when scheduled, under the pane writer's lock, and on the
+//! writer thread at its arm section, under the gate's lock. The second ask
+//! reads for itself what can change between the two:
+//! - the permission: the seam's own, under the seam's lock, both times;
+//! - the records, scope, hazards, estimate, epoch and retirement: under the
+//!   input's lock (R6), in the hold that publishes the arm;
+//! - the gate's fence and held ops: under the gate's lock;
+//! - the written stream's boundary: the writer's own;
+//! - a person's ticket: the ledger read again under the gate's lock;
+//! - the screen: the frame read when scheduled stands only while the bus
+//!   has taken no output since it (its `out_seq`), read on the writer thread
+//!   just before the gate's lock, as the output hook's facts are: output
+//!   after it and before the byte could as well land just after the byte.
+//!
+//! The keymap is file I/O and is read with no lock held: after a pending
+//! permission is settled, and again after an O5 wait, so nothing read before
+//! a sleep stands after it. Between its last read and the byte, a change to
+//! the agent's key bindings is not seen: its re-check at settlement
+//! (O-20.7b) is an activation blocker (`plan-p3.md`'s activation list).
+//!
 //! **Lock order.**
 //! ```text
 //! probe request: pane writer (async) ─> gate (probe_queued) ; submit job
-//! writer thread: arm section: gate ─> seam ─> input (R6) ─> page stores
+//! writer thread: bus (the screen's `out_seq`, released) ; then
+//!                arm section: gate ─> ledger (released) ; gate ─> seam ─>
+//!                input (R6) ─> page stores
 //! driver:        pane writer (async) ─> gate (release_until_if / release_cut)
 //!                pane writer (async) ─> gate ─> input (R6) (release_until_if's
 //!                                       re-read of the front, R-B-U2-02)
@@ -458,20 +481,26 @@ impl PtyWriterThread {
 }
 
 /// A probe's start condition on the writer thread (R5 §4.2, O-20.2): the
-/// writer's own retirement refuses it; otherwise the gate's arm section
-/// runs `admit` under the gate's lock, with the writer's start facts and
-/// the gate's counts as they stand, and on its `Ok` closes the fence at the
-/// output offset read then: that offset and the writer's instant are the
-/// section's outcome (O-20.7a). Shared by [`AgentPtyRegistry::composer_probe`]
-/// and the release oracle, so the oracle runs this one (the audit's U3-9).
+/// writer's own retirement refuses it; otherwise `fresh` is read, then the
+/// gate's arm section runs `admit` under the gate's lock, with the writer's
+/// start facts, the gate's counts as they stand and what `fresh` said, and
+/// on its `Ok` closes the fence at the output offset read then: that offset
+/// and the writer's instant are the section's outcome (O-20.7a). `fresh` is
+/// the screen's freshness (U3-03), read here, before the gate's lock, as
+/// the output hook's facts are: output after it and before the byte could
+/// as well land just after the byte. Shared by
+/// [`AgentPtyRegistry::composer_probe`] and the release oracle, so the
+/// oracle runs this one (the audit's U3-9).
 #[cfg(target_os = "linux")]
 pub(super) fn probe_section(
     gate: Arc<crate::composer_probe::gate::Gate<UserFrame>>,
     input: Arc<crate::composer_probe::epoch::GenerationInput>,
     claim: Arc<crate::doorbell_txn::JobClaim>,
+    fresh: impl FnOnce() -> bool + Send + 'static,
     admit: impl FnOnce(
         &crate::doorbell_txn::StartCtx,
         crate::composer_probe::gate::Status,
+        bool,
     ) -> Result<(), ProbeRefusal>
     + Send
     + 'static,
@@ -483,18 +512,59 @@ pub(super) fn probe_section(
         if ctx.retired {
             return Err(ProbeRefusal::Retired);
         }
+        let fresh = fresh();
         let mut at = (0, ctx.now);
         gate.arm_section(
             &claim,
             ProbeRefusal::Retired,
             ProbeRefusal::TakenBack,
-            |status| admit(ctx, status),
+            |status| admit(ctx, status, fresh),
             || {
                 at.0 = input.output_offset();
                 at.0
             },
         )?;
         Ok(at)
+    }
+}
+
+/// The facts the writer asks admission with at a probe's arm section
+/// (O-20.7, U3-03), from those `scheduled` asked with when it was scheduled:
+/// its own boundary (`ctx`), the fence as the gate's counts (`status`) show
+/// it, a person's ticket as the ledger shows it now (`human_ticket`, read
+/// under the gate's lock), and the screen only while no output was taken
+/// since the frame it was read from (`screen_unchanged`). A lapse retry's
+/// own byte moved the epoch at its enqueue, which nothing else may have
+/// since the lapsed probe's (R5 §3.2). The permission is the seam's own at
+/// the arm ([`crate::composer_probe::observe::Seam::arm`]); the keymap is
+/// the one read when scheduled.
+#[cfg(target_os = "linux")]
+pub(super) fn writer_outside(
+    scheduled: crate::composer_probe::admission::Outside,
+    ctx: &crate::doorbell_txn::StartCtx,
+    status: crate::composer_probe::gate::Status,
+    human_ticket: bool,
+    screen_unchanged: bool,
+) -> crate::composer_probe::admission::Outside {
+    use crate::composer_probe::admission::{Attempt, Fence, Outside};
+    let fence = match (status.fenced, scheduled.attempt) {
+        (false, _) => Fence::Open,
+        (true, Attempt::Lapse { .. }) if status.held_ops == 0 => Fence::Lapsed,
+        (true, _) => Fence::Closed,
+    };
+    let attempt = match scheduled.attempt {
+        Attempt::Lapse { lapsed_e0 } => Attempt::Lapse {
+            lapsed_e0: lapsed_e0.saturating_add(1),
+        },
+        other => other,
+    };
+    Outside {
+        attempt,
+        boundary: ctx.boundary,
+        fence,
+        human_ticket,
+        surface: scheduled.surface && screen_unchanged,
+        ..scheduled
     }
 }
 
@@ -643,20 +713,24 @@ impl AgentPtyRegistry {
         if ask != ProbeAsk::Lapse && !input.probe_due(Instant::now()) {
             return ProbeOutcome::NotDue;
         }
-        // The keymap and the screen are read with no lock held.
-        let keymap = {
-            let observer = Arc::clone(&h.observer);
-            tokio::task::spawn_blocking(move || observer.keymap())
-                .await
-                .unwrap_or(Err(crate::composer_probe::keymap::Hold::Unmeasured))
-        };
         if h.observer.permission() == crate::composer_probe::Permission::Pending {
-            // Settle it now rather than at the observer's next sweep.
+            // Settle it now rather than at the observer's next sweep, and
+            // before the keymap read below, which an unsettled generation
+            // answers `Unmeasured` (U3-03).
             let observer = Arc::clone(&h.observer);
             let _ = tokio::task::spawn_blocking(move || observer.settle()).await;
         }
         let mut waited = false;
-        let w = loop {
+        let (w, keymap) = loop {
+            // The keymap and the screen are read with no lock held, and read
+            // again after an O5 wait: nothing read before it stands after it
+            // (U3-03).
+            let keymap = {
+                let observer = Arc::clone(&h.observer);
+                tokio::task::spawn_blocking(move || observer.keymap())
+                    .await
+                    .unwrap_or(Err(crate::composer_probe::keymap::Hold::Unmeasured))
+            };
             let surface = surface_shows_composer(h.agent.as_ref(), h.bus.clean_frame());
             let w = h.writer.lock().await;
             let now = Instant::now();
@@ -690,10 +764,14 @@ impl AgentPtyRegistry {
                     tokio::time::sleep_until(at.into()).await;
                     continue;
                 }
-                _ => break w,
+                _ => break (w, keymap),
             }
         };
-        let surface = surface_shows_composer(h.agent.as_ref(), h.bus.clean_frame());
+        // The frame the screen is read from, and its place in the output:
+        // the writer refuses the screen if output was taken since (U3-03).
+        let frame = h.bus.clean_frame();
+        let seen = frame.as_ref().map(|grid| grid.out_seq);
+        let surface = surface_shows_composer(h.agent.as_ref(), frame);
         let now = Instant::now();
         let status = h.gate.gate.status();
         let (fence, lapsed_e0) = input.admission_fence(status.fenced, status.held_ops, now);
@@ -738,32 +816,20 @@ impl AgentPtyRegistry {
         let claim = Arc::new(crate::doorbell_txn::JobClaim::default());
         let section = {
             let observer = Arc::clone(&h.observer);
+            let (bus, ledger) = (Arc::clone(&h.bus), Arc::clone(&h.ledger));
             probe_section(
                 Arc::clone(&h.gate.gate),
                 Arc::clone(&input),
                 Arc::clone(&claim),
-                move |ctx, status| {
-                    use crate::composer_probe::admission::Fence;
-                    let fence = match (status.fenced, attempt) {
-                        (false, _) => Fence::Open,
-                        (true, Attempt::Lapse { .. }) if status.held_ops == 0 => Fence::Lapsed,
-                        (true, _) => Fence::Closed,
-                    };
-                    // A lapse retry's own byte moved the epoch at its
-                    // enqueue: nothing else may have since the lapsed
-                    // probe's (R5 §3.2).
-                    let attempt = match attempt {
-                        Attempt::Lapse { lapsed_e0 } => Attempt::Lapse {
-                            lapsed_e0: lapsed_e0.saturating_add(1),
-                        },
-                        other => other,
-                    };
-                    let writer_outside = Outside {
-                        attempt,
-                        boundary: ctx.boundary,
-                        fence,
-                        ..outside
-                    };
+                move || seen.is_some_and(|seq| bus.evidence().2 == seq),
+                move |ctx, status, screen_unchanged| {
+                    let writer_outside = writer_outside(
+                        outside,
+                        ctx,
+                        status,
+                        ledger.any_outstanding(),
+                        screen_unchanged,
+                    );
                     observer
                         .arm_segment(number, &writer_outside, ctx.now)
                         .map(drop)
@@ -1169,6 +1235,67 @@ mod tests {
             input.probe_due(now),
             "a person's key: one attempt due at once"
         );
+    }
+
+    /// Scenario: A probe was scheduled with no person's ticket outstanding and the main composer on screen. When the writer comes to its arm section, a person's op has been admitted to the ledger and the agent has drawn output since that frame: the writer asks admission with the ticket it reads now and with no main composer, so admission refuses. With neither change it asks with the scheduled facts, its own boundary and the gate's fence (U3-03, O-20.7's writer facts).
+    #[cfg(target_os = "linux")]
+    #[spec("inbox/probe/059")]
+    #[test]
+    fn probe_059_the_writer_asks_admission_with_the_facts_it_reads_itself() {
+        use crate::composer_probe::admission::{Attempt, Fence, Outside};
+        use crate::composer_probe::gate::Status;
+        use crate::composer_probe::planner::Boundary;
+        let scheduled = Outside {
+            attempt: Attempt::First,
+            permission: crate::composer_probe::Permission::Armable,
+            fence: Fence::Open,
+            human_ticket: false,
+            boundary: Boundary::Inside,
+            keymap: Ok(()),
+            surface: true,
+        };
+        let ctx = crate::doorbell_txn::StartCtx {
+            boundary: Boundary::Ground,
+            retired: false,
+            now: Instant::now(),
+        };
+        let open = Status::default();
+        let same = writer_outside(scheduled, &ctx, open, false, true);
+        assert_eq!(same.boundary, Boundary::Ground, "the writer's own boundary");
+        assert_eq!(same.fence, Fence::Open);
+        assert!(!same.human_ticket && same.surface && same.keymap.is_ok());
+        let now = writer_outside(scheduled, &ctx, open, true, true);
+        assert!(now.human_ticket, "a ticket admitted since scheduling");
+        let drawn = writer_outside(scheduled, &ctx, open, false, false);
+        assert!(
+            !drawn.surface,
+            "output since the frame the screen was read from"
+        );
+    }
+
+    /// Scenario: Read the probe request's source: a pending permission is settled before the keymap is read, and the keymap is read inside the loop that waits for the agent's redraw estimate, so an attempt that waited asks admission with a keymap read after its wait, not before it (U3-03).
+    #[cfg(target_os = "linux")]
+    #[spec("inbox/probe/059")]
+    #[test]
+    fn probe_059_the_keymap_is_read_after_settlement_and_after_the_redraw_wait() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/agent_pty_segments.rs"),
+        )
+        .unwrap();
+        let request = source
+            .split("pub(crate) async fn composer_probe(")
+            .nth(1)
+            .and_then(|rest| rest.split("let claim = Arc::new(").next())
+            .expect("the probe request");
+        let settle = request.find("observer.settle()").expect("the settlement");
+        let keymap = request.find("observer.keymap()").expect("the keymap read");
+        let wait = request.find("loop {").expect("the redraw wait");
+        assert!(
+            settle < keymap,
+            "the permission is settled before the keymap read"
+        );
+        assert!(wait < keymap, "the keymap is read again after a wait");
+        assert_eq!(request.matches("observer.keymap()").count(), 1);
     }
 
     /// Scenario: Map held typing to the card's cause across ages, waiters and the front segment's kind and stage. A full queue says so at any age; under five seconds it says a check is running; after that a probe not yet opened, one opened and not returned, and a person's own Ctrl+G each get their own words, and with no segment it still says checking.
