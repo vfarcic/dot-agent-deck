@@ -226,9 +226,23 @@ impl FencedPane {
     /// An attached connection that declared a viewport, so it registers a
     /// viewer.
     async fn attach(&self) -> tokio::net::UnixStream {
+        self.attach_with(
+            serde_json::json!({"op": "attach-stream", "id": self.id, "rows": 24, "cols": 80}),
+        )
+        .await
+    }
+
+    /// [`Self::attach`] as client `client_id`, whose test controls
+    /// ([`crate::e2e_controls::attach_control`]) then reach the connection.
+    async fn attach_as(&self, client_id: &str) -> tokio::net::UnixStream {
+        self.attach_with(serde_json::json!({
+            "op": "attach-stream", "id": self.id, "rows": 24, "cols": 80, "client_id": client_id,
+        }))
+        .await
+    }
+
+    async fn attach_with(&self, request: serde_json::Value) -> tokio::net::UnixStream {
         let mut stream = tokio::net::UnixStream::connect(&self.sock).await.unwrap();
-        let request =
-            serde_json::json!({"op": "attach-stream", "id": self.id, "rows": 24, "cols": 80});
         write_frame(
             &mut stream,
             KIND_REQ,
@@ -478,5 +492,84 @@ async fn probe_011_a_frame_behind_a_full_one_is_read_after_the_release() {
     })
     .await;
     drop(client);
+    pane.stop();
+}
+
+/// Scenario: Close a pane's fence and fill it, degrade the peer watch of one attach client, and from that client's connection send a frame, which waits for room; shut the connection for writing, which would otherwise end the wait. The frame keeps waiting, since the degraded watch never sees the client leave and nothing retired; then end the connection's output task, as a broken socket would. That alone ends the wait: its place leaves the queue, its ticket settles cancelled once, its viewer is released, the pane's generation is still live with its fence closed, and after the release the PTY takes only what the fence held (Q15-1, core §8.2's output-end-only cause).
+#[spec("inbox/probe/011")]
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_011_with_the_peer_watch_degraded_only_the_output_end_stops_a_full_wait() {
+    use tokio::io::AsyncWriteExt;
+    let pane = FencedPane::new("probe-011-output-end-only").await;
+    let client_id = "probe-011-output-end-only-client";
+    let control = crate::e2e_controls::attach_control(client_id);
+    control.degrade_peer_watch();
+    assert!(pane.gate().fence());
+    let filler = pane.ledger.admit();
+    let accepted = pane
+        .writer()
+        .lock()
+        .await
+        .accept(
+            UserFrame::new(vec![b'h'; FENCE_CAP], Some(filler), None),
+            None,
+        )
+        .await;
+    assert!(matches!(accepted, Accepted::Held));
+    let mut client = pane.attach_as(client_id).await;
+    assert_eq!(pane.registry.viewers_of(&pane.id).len(), 1);
+    write_frame(&mut client, KIND_STREAM_IN, b"parked")
+        .await
+        .unwrap();
+    pane.until("the frame waits for room", || {
+        pane.gate().status().full_waiters == 1
+    })
+    .await;
+    client.shutdown().await.unwrap();
+    // The undegraded watch ends this wait at once
+    // (`probe_011_a_connection_shut_for_writing_while_full_gives_up_its_place`).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        pane.gate().status().full_waiters,
+        1,
+        "a degraded peer watch doesn't see the client leave"
+    );
+    assert!(pane.ledger.any_outstanding(), "nothing settled yet");
+    control.end_output();
+    pane.until("the waiter leaves", || {
+        pane.gate().status().full_waiters == 0
+    })
+    .await;
+    let cancelled = || {
+        pane.ledger
+            .settled()
+            .into_iter()
+            .filter(|(_, how)| *how == Settlement::Cancelled)
+            .count()
+    };
+    pane.until("the waiting frame settles", || cancelled() == 1)
+        .await;
+    pane.until("the viewer is released", || {
+        pane.registry.viewers_of(&pane.id).is_empty()
+    })
+    .await;
+    let status = pane.gate().status();
+    assert!(status.fenced, "no retirement: the fence is still closed");
+    assert_eq!(status.held_ops, 1, "nothing released yet");
+    assert_eq!(
+        pane.registry.pane_current_agent_id(pane.pane).as_deref(),
+        Some(pane.id.as_str()),
+        "the generation is still the pane's"
+    );
+    assert_eq!(pane.writer().lock().await.release_fence(Ok(())), 1);
+    pane.until("the fence's frame is written", || {
+        pane.taken().len() >= FENCE_CAP
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let taken = pane.taken();
+    assert_eq!(taken.len(), FENCE_CAP);
+    assert!(!contains(&taken, b"parked"));
+    assert_eq!(cancelled(), 1, "settled once");
     pane.stop();
 }

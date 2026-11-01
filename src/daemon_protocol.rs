@@ -4031,6 +4031,17 @@ pub struct AttachResponse {
     #[cfg(feature = "e2e")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub composer_probe: Option<ComposerProbeStatus>,
+    /// PRD #1666 part 3 (Q105b.2): the `e2e` build's answer to the writer
+    /// controls, `writer-hold`, `writer-go`, `writer-fault:…` and
+    /// `writer-status`.
+    #[cfg(feature = "e2e")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer_writer: Option<ComposerWriterStatus>,
+    /// PRD #1666 part 3 (Q105b.2): the `e2e` build's answer to
+    /// `schedule-advance:<ms>` and `schedule-status`.
+    #[cfg(feature = "e2e")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer_schedule: Option<ComposerScheduleStatus>,
     /// PRD #1589: the answer to [`AttachRequest::CloseAgents`]. `None` on every
     /// other response. A refusal is a report, answered `ok: true`; `ok: false`
     /// is reserved for a request the daemon could not process at all. Additive
@@ -4660,6 +4671,36 @@ pub struct ComposerEpochStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComposerObserverStatus {
     pub scope: String,
+    /// Q105b.2: whether `observer-hold` holds the observer's passes.
+    #[serde(default)]
+    pub passes_held: bool,
+    /// Q105b.2: how many passes the observer thread has finished.
+    #[serde(default)]
+    pub passes: u64,
+}
+
+/// PRD #1666 part 3 (Q105b.2): a generation's PTY writer thread under the
+/// `e2e` build's controls. `held`: `writer-hold` is in force; `parked`: the
+/// thread is waiting at it with a job dequeued; `dequeued`: jobs the thread
+/// has taken off its queue; `failed_writes`: writes the fault plan failed.
+#[cfg(feature = "e2e")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerWriterStatus {
+    pub held: bool,
+    pub parked: bool,
+    pub dequeued: u64,
+    pub failed_writes: usize,
+}
+
+/// PRD #1666 part 3 (Q105b.2): a generation's probe schedule, the `e2e`
+/// build's `schedule-advance` and `schedule-status` answer, read at the
+/// answer: whether an attempt is due, the failures in a row and `broken`.
+#[cfg(feature = "e2e")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerScheduleStatus {
+    pub due: bool,
+    pub failures: u32,
+    pub broken: bool,
 }
 
 /// PRD #1666 part 3 (Q35-20): what a probe request did, the `e2e` build's
@@ -4722,6 +4763,13 @@ async fn e2e_composer_control(
 ) -> AttachResponse {
     if operation == "frontier-enqueue" || operation.starts_with("frontier-status:") {
         return e2e_composer_frontier(registry, pane_id, generation, operation);
+    }
+    if operation.starts_with("writer-")
+        || operation.starts_with("schedule-")
+        || operation.starts_with("records-")
+        || operation.starts_with("attach-")
+    {
+        return e2e_composer_q105b_control(registry, pane_id, generation, operation);
     }
     if matches!(operation, "epoch" | "observer-status") || operation.starts_with("probe-request") {
         return e2e_composer_probe_control(registry, pane_id, generation, operation).await;
@@ -4811,6 +4859,129 @@ fn e2e_composer_frontier(
     }
 }
 
+/// PRD #1666 part 3 (Q105b.2): the controls S-20b and S-20c asked for, each
+/// refused unless `generation` is the pane's current one. None writes a byte,
+/// arms, releases or completes anything; each withholds, fails or reorders
+/// what the production path does ([`crate::e2e_controls`]).
+///
+/// - `writer-hold` / `writer-go`: park the generation's PTY writer thread
+///   before its next job, and let it go on; `writer-status` reads it.
+/// - `writer-fault:jobs=<any|answer>,skip=<K>,accept=<N>`: after `K`
+///   matching jobs, the PTY accepts `N` more bytes of matching jobs and then
+///   fails each matching write; `writer-fault:off` clears it.
+/// - `schedule-advance:<ms>`: the probe schedule's pending wait ends `ms`
+///   earlier, as if that much time passed; `schedule-status` reads it.
+/// - `records-policy:<hold|authority>`, `records-cap:<n>`: this generation's
+///   EC policy and record cap, only before its first observation.
+/// - `attach-degrade-peer-watch:<client_id>`, `attach-end-output:<client_id>`:
+///   that client's attach connections stop watching their peer, and their
+///   output tasks end (Q15-1).
+#[cfg(feature = "e2e")]
+fn e2e_composer_q105b_control(
+    registry: &Arc<AgentPtyRegistry>,
+    pane_id: &str,
+    generation: u64,
+    operation: &str,
+) -> AttachResponse {
+    let Some(input) = registry
+        .pane_current_agent_id(pane_id)
+        .filter(|agent| *agent == generation.to_string())
+        .and_then(|agent| registry.composer_input(&agent))
+    else {
+        return AttachResponse::err("e2e-composer-control: not the pane's current generation");
+    };
+    let writer = || {
+        let w = input.writer_e2e();
+        AttachResponse {
+            ok: true,
+            composer_writer: Some(ComposerWriterStatus {
+                held: w.is_held(),
+                parked: w.parked(),
+                dequeued: w.dequeued(),
+                failed_writes: w.failed_writes(),
+            }),
+            ..Default::default()
+        }
+    };
+    let unknown = || AttachResponse::err("e2e-composer-control: unknown operation");
+    let (op, arg) = operation.split_once(':').unwrap_or((operation, ""));
+    match op {
+        "writer-hold" => {
+            input.writer_e2e().hold();
+            writer()
+        }
+        "writer-go" => {
+            input.writer_e2e().go();
+            writer()
+        }
+        "writer-status" => writer(),
+        "writer-fault" => {
+            let plan = if arg == "off" {
+                None
+            } else {
+                match crate::e2e_controls::FaultPlan::parse(arg) {
+                    Some(plan) => Some(plan),
+                    None => return unknown(),
+                }
+            };
+            input.writer_e2e().set_faults(plan);
+            writer()
+        }
+        "schedule-advance" | "schedule-status" => {
+            let by = if op == "schedule-advance" {
+                match arg.parse() {
+                    Ok(ms) => Duration::from_millis(ms),
+                    Err(_) => return unknown(),
+                }
+            } else {
+                Duration::ZERO
+            };
+            match input.advance_schedule_for_e2e(by, std::time::Instant::now()) {
+                Some((due, failures, broken)) => AttachResponse {
+                    ok: true,
+                    composer_schedule: Some(ComposerScheduleStatus {
+                        due,
+                        failures,
+                        broken,
+                    }),
+                    ..Default::default()
+                },
+                None => AttachResponse::err("e2e-composer-control: no probe schedule"),
+            }
+        }
+        "records-policy" | "records-cap" => {
+            use crate::composer_probe::record::EcPolicy;
+            let result = if op == "records-policy" {
+                let policy = match arg {
+                    "hold" => EcPolicy::Hold,
+                    "authority" => EcPolicy::Authority,
+                    _ => return unknown(),
+                };
+                input.configure_records_for_e2e(Some(policy), None)
+            } else {
+                match arg.parse() {
+                    Ok(cap) => input.configure_records_for_e2e(None, Some(cap)),
+                    Err(_) => return unknown(),
+                }
+            };
+            match result {
+                Ok(()) => AttachResponse::ok(),
+                Err(why) => AttachResponse::err(format!("e2e-composer-control: {why}")),
+            }
+        }
+        "attach-degrade-peer-watch" | "attach-end-output" if !arg.is_empty() => {
+            let control = crate::e2e_controls::attach_control(arg);
+            if op == "attach-end-output" {
+                control.end_output();
+            } else {
+                control.degrade_peer_watch();
+            }
+            AttachResponse::ok()
+        }
+        _ => unknown(),
+    }
+}
+
 /// PRD #1666 part 3 (Q35-20): the probe half of [`e2e_composer_control`],
 /// refused unless `generation` is the pane's current one. `epoch` and
 /// `observer-status` read and change nothing. `probe-request`, with
@@ -4865,10 +5036,18 @@ async fn e2e_composer_probe_control(
                 ScopeState::Pending => "pending",
                 ScopeState::Open(_) => "open",
             };
+            #[cfg(target_os = "linux")]
+            let (passes_held, passes) = registry
+                .composer_observer(&agent)
+                .map_or((false, 0), |observer| observer.passes_for_e2e());
+            #[cfg(not(target_os = "linux"))]
+            let (passes_held, passes) = (false, 0);
             AttachResponse {
                 ok: true,
                 composer_observer: Some(ComposerObserverStatus {
                     scope: scope.to_string(),
+                    passes_held,
+                    passes,
                 }),
                 ..Default::default()
             }
@@ -4915,15 +5094,22 @@ async fn e2e_composer_observer_control(
 ) -> AttachResponse {
     use crate::composer_probe::observe::ControlOp;
     let op = match operation {
-        "publish" => ControlOp::Publish,
-        "withdraw" => ControlOp::Withdraw,
+        "publish" => Some(ControlOp::Publish),
+        "withdraw" => Some(ControlOp::Withdraw),
+        "observer-hold" | "observer-go" => None,
         _ => return AttachResponse::err("e2e-composer-control: unknown operation"),
     };
     let Some(observer) = registry
         .pane_current_agent_id(pane_id)
+        .filter(|agent| op.is_some() || *agent == generation.to_string())
         .and_then(|agent| registry.composer_observer(&agent))
     else {
         return AttachResponse::err("e2e-composer-control: no installed generation on that pane");
+    };
+    // Q105b.2: the observer's pass barrier, for the generation named only.
+    let Some(op) = op else {
+        observer.hold_passes_for_e2e(operation == "observer-hold");
+        return AttachResponse::ok();
     };
     match tokio::task::spawn_blocking(move || observer.control(generation, op)).await {
         Ok(Ok(_count)) => AttachResponse::ok(),
@@ -9072,6 +9258,56 @@ fn enqueue_reject(tx: &tokio::sync::mpsc::Sender<Vec<u8>>, reason: &'static [u8]
     }
 }
 
+/// PRD #1666 part 3 (Q105b.2, Q15-1): an attach connection's test and `e2e`
+/// controls, found by the client id its `attach-stream` carried
+/// ([`crate::e2e_controls::AttachControl`]). A release build has none: its
+/// peer watch is the platform's and its output task ends only as it always
+/// did.
+#[derive(Clone, Default)]
+struct AttachE2e {
+    #[cfg(any(test, feature = "e2e"))]
+    control: Option<Arc<crate::e2e_controls::AttachControl>>,
+}
+
+impl AttachE2e {
+    #[cfg(any(test, feature = "e2e"))]
+    fn of(client_id: Option<&str>) -> Self {
+        Self {
+            control: client_id.map(crate::e2e_controls::attach_control),
+        }
+    }
+
+    #[cfg(not(any(test, feature = "e2e")))]
+    fn of(_client_id: Option<&str>) -> Self {
+        Self::default()
+    }
+
+    /// Resolves when a test ends this connection's output task; never in a
+    /// release build.
+    async fn output_ended(&self) {
+        #[cfg(any(test, feature = "e2e"))]
+        if let Some(control) = &self.control {
+            control.output_ended().await;
+            return;
+        }
+        std::future::pending::<()>().await;
+    }
+
+    /// The input loop's peer watch: the platform's, unless a test degraded
+    /// it, when it never resolves.
+    async fn peer_closed(&self, rd: &crate::platform::ipc::IpcReadHalf) {
+        #[cfg(any(test, feature = "e2e"))]
+        if self
+            .control
+            .as_ref()
+            .is_some_and(|c| c.peer_watch_degraded())
+        {
+            std::future::pending::<()>().await;
+        }
+        crate::platform::ipc::peer_closed(rd).await;
+    }
+}
+
 async fn handle_attach_stream(
     stream: IpcStream,
     registry: Arc<AgentPtyRegistry>,
@@ -9213,12 +9449,18 @@ async fn handle_attach_stream(
     // read it as end-of-stream. A legacy attach gets a receiver that is never
     // ready, which parks that arm forever without affecting the others.
     let mut geometry_rx = handle.geometry_rx;
+    let attach_e2e = AttachE2e::of(client_id.as_deref());
+    let output_e2e = attach_e2e.clone();
     let mut output_task = tokio::spawn(async move {
         loop {
             tokio::select! {
                 // Bias toward output so heavy PTY traffic isn't starved by
                 // the (rare) reject path; both are still serviced.
                 biased;
+                // PRD #1666 part 3 (Q105b.2, Q15-1): a test ended this
+                // output task, as a broken socket would; first, so output
+                // can't starve it. Never ready in a release build.
+                () = output_e2e.output_ended() => break,
                 // PRD #882: the applied geometry moved — because another client
                 // attached, detached or resized — so tell this viewer before the
                 // bytes drawn for the new grid reach it. Ordering against the
@@ -9505,7 +9747,7 @@ async fn handle_attach_stream(
                             // loop releases this viewer.
                             let ended = tokio::select! {
                                 biased;
-                                () = crate::platform::ipc::peer_closed(&rd) => true,
+                                () = attach_e2e.peer_closed(&rd) => true,
                                 _ = &mut output_task => true,
                                 () = place.changed() => false,
                             };

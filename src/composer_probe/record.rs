@@ -855,6 +855,9 @@ pub struct Records {
     stopped: Option<Stop>,
     episodes: Vec<Episode>,
     episodes_uncounted: u32,
+    /// The most records kept: [`RECORD_CAP`], lower only in a test or `e2e`
+    /// build that asked for it before the first observation (Q105b.2).
+    cap: usize,
 }
 
 impl Records {
@@ -873,7 +876,41 @@ impl Records {
             stopped: None,
             episodes: Vec::new(),
             episodes_uncounted: 0,
+            cap: RECORD_CAP,
         }
+    }
+
+    /// The test and `e2e` builds' generation-bound override (Q105b.2): this
+    /// generation's EC policy and a record cap at most [`RECORD_CAP`], set
+    /// only while it has made no record, kept no history entry and opened no
+    /// episode, so no decision was ever read under another policy or cap.
+    #[cfg(any(test, feature = "e2e"))]
+    pub fn configure_for_e2e(
+        &mut self,
+        policy: Option<EcPolicy>,
+        cap: Option<usize>,
+    ) -> Result<(), &'static str> {
+        if self.retired {
+            return Err("the generation retired");
+        }
+        if !self.records.is_empty() || !self.episodes.is_empty() || self.pending_since.is_some() {
+            return Err("the generation already observed a helper");
+        }
+        if let Some(cap) = cap {
+            if cap == 0 || cap > RECORD_CAP {
+                return Err("the record cap must be between 1 and RECORD_CAP");
+            }
+            self.cap = cap;
+        }
+        if let Some(policy) = policy {
+            self.policy = policy;
+        }
+        Ok(())
+    }
+
+    /// This generation's EC policy.
+    pub fn policy(&self) -> EcPolicy {
+        self.policy
     }
 
     pub fn scope(&self) -> WriterScope {
@@ -943,7 +980,7 @@ impl Records {
         let before = self.scope.state();
         let i = match self.index(obs.key) {
             Ok(i) => i,
-            Err(_) if self.records.len() >= RECORD_CAP => {
+            Err(_) if self.records.len() >= self.cap => {
                 self.dropped(obs.decision);
                 self.transition(
                     before,
@@ -1415,7 +1452,7 @@ impl Records {
         if self.retired {
             return Err(Hold::Retired);
         }
-        if self.records.len() >= RECORD_CAP {
+        if self.records.len() >= self.cap {
             return Err(Hold::RecordCap);
         }
         if self.history.len() >= HISTORY_CAP {

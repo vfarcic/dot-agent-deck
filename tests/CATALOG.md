@@ -10528,6 +10528,14 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** the writer thread, the pane writer or the tick calling any of this (Q35-20), or where Q35-20 closes the fence relative to the probe's submission; the real arm page's seqlock (`inbox/probe/007`); a real helper reading what is published.
 - **Platform coverage:** all.
 
+##### inbox/probe/079 — The `e2e` build's composer controls reach the live generation they name, act only on the production path they name, and refuse anything else.
+
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_composer_controls.rs`, with `tests/support/live_segments.rs`): the real daemon, a native Claude stand-in with the reviewed F2 composer, and `e2e-composer-control`'s Q105b.2 operations (`src/e2e_controls.rs`, `src/daemon_protocol.rs`).
+- **Agent:** native test executable; no real agent or credential.
+- **Asserts:** before any observation, the generation's EC policy and record cap are set, a cap of zero is refused, and a control addressed to another generation is refused; `observer-hold` stops the observer's pass count until `observer-go`; `schedule-status` reads a first attempt due with no failures, and `schedule-advance` keeps it due; under `writer-hold` typed keys are dequeued by the writer thread and not written until `writer-go`, then written once; a fault plan accepting one byte lets the PTY take one of two typed bytes and fails the write; an unknown plan is refused.
+- **Does not assert:** the rows the controls exist for (S-20b, S-20c): an answer's Partial/WriteFailed outcomes, retries through `Broken`, the Authority-policy matrix, the exit-before-first-scan ordering or a cap-dropped live helper; the attach controls, whose Q15-1 row is the private `inbox/probe/011` test `probe_011_with_the_peer_watch_degraded_only_the_output_end_stops_a_full_wait`.
+- **Platform coverage:** Linux.
+
 ##### inbox/probe/009 — A segment's held bytes are released and its successor's trigger written only by its own matched invocation's decision or return, on its agent's row, and every segment ends with an outcome that says what happened.
 - **Layer:** Fast (`tests/segments.rs`), pure: a generation's segments (`src/composer_probe/segments.rs`) driving the real invocation records and hazard FIFO (`src/composer_probe/record.rs`, `query_ledger.rs`), with scripted observations, output bytes read through the real return-marker reader, and times.
 - **Agent:** none (Claude's and Codex's return rules as declared).

@@ -1376,6 +1376,13 @@ mod linux {
         /// with no lock held.
         #[cfg(test)]
         drain_park: std::sync::Mutex<Option<DrainPark>>,
+        /// The test and `e2e` builds' pass barrier (Q105b.2): while set,
+        /// the thread runs no pass, so no scan, marker read, exit or drain.
+        #[cfg(any(test, feature = "e2e"))]
+        passes_held: std::sync::atomic::AtomicBool,
+        /// Passes the thread has finished.
+        #[cfg(any(test, feature = "e2e"))]
+        passes: std::sync::atomic::AtomicU64,
     }
 
     #[cfg(test)]
@@ -1817,6 +1824,10 @@ mod linux {
                 keymap: std::sync::OnceLock::new(),
                 #[cfg(test)]
                 drain_park: std::sync::Mutex::new(None),
+                #[cfg(any(test, feature = "e2e"))]
+                passes_held: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(any(test, feature = "e2e"))]
+                passes: std::sync::atomic::AtomicU64::new(0),
             });
             let weak = Arc::downgrade(&observer);
             // Q35-16: the planner's native numbers go to this generation's
@@ -1835,6 +1846,22 @@ mod linux {
             bell.bind(thread.thread().clone());
             let _ = slot.set(bell);
             Some(observer)
+        }
+
+        /// The test and `e2e` builds' pass barrier (Q105b.2): `true` holds
+        /// the thread before its next pass, `false` lets it run one now.
+        #[cfg(any(test, feature = "e2e"))]
+        pub fn hold_passes_for_e2e(&self, hold: bool) {
+            self.passes_held
+                .store(hold, std::sync::atomic::Ordering::SeqCst);
+            self.bell.ring();
+        }
+
+        /// Whether passes are held, and how many the thread has finished.
+        #[cfg(any(test, feature = "e2e"))]
+        pub fn passes_for_e2e(&self) -> (bool, u64) {
+            use std::sync::atomic::Ordering::SeqCst;
+            (self.passes_held.load(SeqCst), self.passes.load(SeqCst))
         }
 
         /// The generation left its pane: the thread ends at its next wake.
@@ -2923,7 +2950,20 @@ mod linux {
             {
                 return;
             }
+            #[cfg(any(test, feature = "e2e"))]
+            if observer
+                .passes_held
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                drop(observer);
+                std::thread::park_timeout(Duration::from_millis(10));
+                continue;
+            }
             observer.pass();
+            #[cfg(any(test, feature = "e2e"))]
+            observer
+                .passes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let wait = if observer.active() {
                 SCAN_PERIOD
             } else {

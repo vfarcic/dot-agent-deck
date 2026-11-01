@@ -6283,7 +6283,7 @@ impl PtyWriterThread {
     /// [`Self::spawn`], counting its jobs in `in_flight` — kept across a writer
     /// swap so a handle taken from the old thread reports on the new one.
     fn spawn_reporting_to(
-        mut inner: Box<dyn std::io::Write + Send>,
+        inner: Box<dyn std::io::Write + Send>,
         recorder: InputRecorder,
         in_flight: Arc<PtyInFlight>,
         input: Arc<crate::composer_probe::epoch::GenerationInput>,
@@ -6293,6 +6293,18 @@ impl PtyWriterThread {
         let thread_in_flight = in_flight.clone();
         let thread_input = Arc::clone(&input);
         let thread_physical = Arc::clone(&physical);
+        // PRD #1666 part 3 (Q105b.2): the test and `e2e` builds put the
+        // generation's fault plan in front of the PTY, and park at its hold.
+        #[cfg(any(test, feature = "e2e"))]
+        let thread_controls = Arc::clone(input.writer_e2e());
+        #[cfg(not(any(test, feature = "e2e")))]
+        let mut inner = inner;
+        #[cfg(any(test, feature = "e2e"))]
+        let mut inner: Box<dyn std::io::Write + Send> =
+            Box::new(crate::e2e_controls::FaultableWriter {
+                inner,
+                controls: Arc::clone(&thread_controls),
+            });
         std::thread::Builder::new()
             .name("pty-writer".to_string())
             .spawn(move || {
@@ -6310,6 +6322,8 @@ impl PtyWriterThread {
                         natives,
                         part,
                     } = job;
+                    #[cfg(any(test, feature = "e2e"))]
+                    thread_controls.at_dequeue(&recorder.retired);
                     // PRD #1666 part 3 (Q35-16, I-8): a job with a start
                     // condition starts only if it holds against what this
                     // thread knows now, in the same serialization as the
@@ -6384,6 +6398,8 @@ impl PtyWriterThread {
                         input: &thread_input,
                     };
                     let len = op.len();
+                    #[cfg(any(test, feature = "e2e"))]
+                    thread_controls.begin_job(matches!(op, PtyOp::Answer(..)));
                     let done = match op {
                         PtyOp::Write(buf, source) => {
                             match write_once_recorded(

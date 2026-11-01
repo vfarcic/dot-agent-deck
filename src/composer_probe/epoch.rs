@@ -717,6 +717,10 @@ pub struct GenerationInput {
     /// becoming visible, so a test can see the one before the other.
     #[cfg(test)]
     accept_park: std::sync::Mutex<Option<AcceptPark>>,
+    /// The test and `e2e` builds' writer-thread controls (Q105b.2): a hold
+    /// and a fault plan, reached without the pane writer's lock.
+    #[cfg(any(test, feature = "e2e"))]
+    writer_e2e: Arc<crate::e2e_controls::WriterE2e>,
 }
 
 /// The generation's native-number publisher, once its observer runs.
@@ -780,7 +784,15 @@ impl GenerationInput {
             input_grammar: AtomicU8::new(0),
             #[cfg(test)]
             accept_park: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "e2e"))]
+            writer_e2e: Arc::default(),
         }
+    }
+
+    /// The writer thread's test and `e2e` controls (Q105b.2).
+    #[cfg(any(test, feature = "e2e"))]
+    pub fn writer_e2e(&self) -> &Arc<crate::e2e_controls::WriterE2e> {
+        &self.writer_e2e
     }
 
     /// The output hook read `len` more bytes; called before it hands over
@@ -1198,6 +1210,40 @@ impl GenerationInput {
     pub fn probe_failed(&self, now: Instant) {
         if let Some(live) = self.state.lock_recovering().live.as_mut() {
             live.schedule.failed(now);
+        }
+    }
+
+    /// The test and `e2e` builds' schedule clock offset (Q105b.2): the
+    /// pending wait ends `by` earlier. Answers the schedule as it then is,
+    /// `(due, failures, broken)` at `now`; `None` with no live schedule.
+    #[cfg(any(test, feature = "e2e"))]
+    pub fn advance_schedule_for_e2e(
+        &self,
+        by: std::time::Duration,
+        now: Instant,
+    ) -> Option<(bool, u32, bool)> {
+        let mut state = self.state.lock_recovering();
+        let epoch = state.epoch.epoch();
+        let live = state.live.as_mut()?;
+        live.schedule.advance(by);
+        Some((
+            live.schedule.due(now, epoch),
+            live.schedule.failures(),
+            live.schedule.broken(),
+        ))
+    }
+
+    /// The test and `e2e` builds' generation-bound records override
+    /// (Q105b.2, [`Records::configure_for_e2e`]).
+    #[cfg(any(test, feature = "e2e"))]
+    pub fn configure_records_for_e2e(
+        &self,
+        policy: Option<record::EcPolicy>,
+        cap: Option<usize>,
+    ) -> Result<(), &'static str> {
+        match self.state.lock_recovering().records.as_mut() {
+            Some(records) => records.configure_for_e2e(policy, cap),
+            None => Err("no records attached"),
         }
     }
 

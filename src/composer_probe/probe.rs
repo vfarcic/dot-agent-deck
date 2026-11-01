@@ -159,6 +159,22 @@ impl Schedule {
         *self = Self::default();
     }
 
+    /// The test and `e2e` builds' clock offset (Q105b.2): the pending wait
+    /// ends `by` earlier, as if `by` had passed. Nothing else moves: the
+    /// failures, `broken` and an epoch wait's epoch stay as they are.
+    #[cfg(any(test, feature = "e2e"))]
+    pub fn advance(&mut self, by: std::time::Duration) {
+        let earlier = |at: Instant| at.checked_sub(by).unwrap_or_else(Instant::now);
+        self.wait = match self.wait {
+            Wait::Until(at) => Wait::Until(earlier(at)),
+            Wait::Epoch { from, until } => Wait::Epoch {
+                from,
+                until: earlier(until),
+            },
+            other => other,
+        };
+    }
+
     /// A person's op: a broken observer gets one fresh attempt, due at once.
     /// It stays broken until an attempt reads the box.
     pub fn person(&mut self) {
