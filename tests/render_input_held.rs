@@ -55,6 +55,7 @@ fn session(agent: &str) -> SessionState {
         display_name: Some("api-svc".to_string()),
         shell_synthetic_working: false,
         native_hooks_reported: false,
+        last_native_hook_at: None,
         orchestration_orphaned: false,
         subagent_wait: None,
         output_set_status: false,

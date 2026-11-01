@@ -1842,6 +1842,7 @@ pub fn opencode_form_asked(props: &Value, raised_at_ms: i64) -> Option<PendingQu
         },
         subagent_id: None,
         revision: None,
+        answer_queued: false,
     })
 }
 
