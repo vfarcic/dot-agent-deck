@@ -103,11 +103,23 @@ fn file_name(path: &Path) -> Option<&str> {
     path.file_name()?.to_str()
 }
 
-/// Whether `row` runs an OpenCode binary: by its executable, or by its first
-/// argument when the executable could not be read.
+/// Whether `exe`, a process's executable as the system reports it, is an
+/// OpenCode binary ([`opencode_name`]). On Linux the link of a process whose
+/// binary was replaced in place since it started (`opencode upgrade`,
+/// OpenCode's own update, a reinstall) reads `…/opencode (deleted)`; that
+/// suffix is not part of the file's name, so it is dropped before matching,
+/// as `is_shell` in `src/daemon.rs` does.
+pub fn exe_is_opencode(exe: &Path) -> bool {
+    file_name(exe)
+        .is_some_and(|name| opencode_name(name.strip_suffix(" (deleted)").unwrap_or(name)))
+}
+
+/// Whether `row` runs an OpenCode binary: by its executable
+/// ([`exe_is_opencode`]), or by its first argument when the executable could
+/// not be read.
 pub fn is_opencode(row: &ProcRow) -> bool {
     match &row.exe {
-        Some(exe) => file_name(exe).is_some_and(opencode_name),
+        Some(exe) => exe_is_opencode(exe),
         None => row
             .argv
             .as_ref()
@@ -142,14 +154,16 @@ fn private_server(row: &ProcRow) -> bool {
 
 /// Whether process `pid`'s stdin and stdout are both sockets. An OpenCode 2
 /// private server's are, a socketpair with its client (measured on 2.2.5).
-/// This is a heuristic, not a binding: under OpenCode's Bun runtime a child
-/// started with piped stdio gets a socket on stdin and a pipe on stdout
-/// (measured on 1.18.35 and 2.2.5), so for a process a tool started the check
-/// rests on stdout alone, and a tool that redirects its stdio defeats it. On
-/// 2.x what keeps a tool's process from passing for the client's server is
-/// that tools run under the private server (measured), so their processes
-/// resolve to it; on 1.x, where tools run in the client, this check is all
-/// there is. Read from `/proc`; `false` when either cannot be read.
+/// This is a heuristic, not a binding: a process a tool starts can have
+/// sockets on both descriptors too (measured in audit N5 under the Bun
+/// runtimes embedded in 2.2.5 and 1.19.5: a child started by `Bun.spawn` or
+/// `node:child_process.spawn` with `"pipe"` stdio has a socket on stdin and on
+/// stdout alike), so a tool's child passes it without any redirect. On 2.x
+/// what keeps a tool's process from passing for the client's server is that
+/// tools run under the private server (measured), so their processes resolve
+/// to it; on 1.x, where tools run in the client, this check is all there is
+/// (audit D1's accepted scope). Read from `/proc`; `false` when either cannot
+/// be read.
 #[cfg(target_os = "linux")]
 pub fn stdio_is_sockets(pid: u32) -> bool {
     [0, 1].iter().all(|fd| {
@@ -274,12 +288,7 @@ pub fn sample(roots: &[i32]) -> Option<Vec<ProcRow>> {
             continue;
         };
         row.exe = crate::platform::proc::executable_of(pid);
-        if row
-            .exe
-            .as_deref()
-            .and_then(file_name)
-            .is_some_and(opencode_name)
-        {
+        if row.exe.as_deref().is_some_and(exe_is_opencode) {
             row.argv = arguments_of(pid);
         }
     }
@@ -340,7 +349,7 @@ pub struct Watched {
 /// current client, so a notice that needs time waits for it, and a new client
 /// (OpenCode restarted inside the pane) starts the wait again; and which
 /// wrapper-started clients' generations it has already passed on to be
-/// remembered as the plugin layout ([`Watch::take_confirmed`]).
+/// remembered ([`Watch::take_confirmed`]).
 #[derive(Debug, Default)]
 pub struct Watch {
     first_seen: HashMap<String, (i32, std::time::Instant)>,
@@ -392,7 +401,7 @@ impl Watch {
     }
 
     /// The generations wrapper-started clients were newly seen to run since
-    /// the last call, oldest first: the plugin layout to remember for the
+    /// the last call, oldest first: the generation to remember for the
     /// next install that has no command to look at
     /// ([`crate::opencode_manage::remember_layout`]).
     pub fn take_confirmed(&mut self) -> Vec<Major> {
@@ -476,7 +485,7 @@ pub fn evaluate(
 /// stalls this watch and nothing else, and never starts a second one. It
 /// never runs a binary it finds: versions come only from the spawn-time
 /// probe's record ([`evaluate`]). A wrapper-started client whose version that
-/// record gives has its generation remembered as the plugin layout
+/// record gives has its generation remembered
 /// ([`crate::opencode_manage::remember_layout`], in the deck's own state, not
 /// in OpenCode's config), for the next install that has no command to look
 /// at.
@@ -667,6 +676,32 @@ mod tests {
         assert!(!is_opencode(&other));
     }
 
+    /// Scenario (PRD #2050, audit N2): the OpenCode binary a pane runs was
+    /// replaced in place while it ran (an `opencode upgrade`), so Linux
+    /// reports its executable as `…/opencode (deleted)`. It is still that
+    /// pane's OpenCode client, and its private server still a private
+    /// server; a replaced binary of another name is still not OpenCode.
+    #[test]
+    fn a_replaced_opencode_binary_is_still_opencode() {
+        assert!(exe_is_opencode(Path::new("/usr/bin/opencode (deleted)")));
+        assert!(exe_is_opencode(Path::new("/x/opencode-1.18.35 (deleted)")));
+        assert!(!exe_is_opencode(Path::new("/usr/bin/bash (deleted)")));
+        assert!(!exe_is_opencode(Path::new("/usr/bin/opencode (deleted) x")));
+        let rows = vec![
+            row(100, 1, "/bin/bash", &["bash"]),
+            row(101, 100, "/opt/opencode (deleted)", &["opencode"]),
+            row(
+                102,
+                101,
+                "/opt/opencode (deleted)",
+                &["/opt/opencode", "serve", "--stdio", "--port", "0"],
+            ),
+        ];
+        let client = find_client(&rows, 100).expect("the replaced client is found");
+        assert_eq!(client.pid, 101);
+        assert!(client.private_server, "{client:?}");
+    }
+
     #[test]
     fn subtree_terminates_on_a_cycle() {
         let rows = vec![row(1, 2, "/a", &[]), row(2, 1, "/b", &[])];
@@ -795,9 +830,9 @@ mod tests {
 
     /// Scenario (review F2): a wrapper pane's client runs the file the deck
     /// probed on the pane's PATH, so its version is known; its generation is
-    /// queued once, to be remembered as the plugin layout, and again only
-    /// for a new client. A direct pane's generation is never queued: its
-    /// spawn already wrote that layout.
+    /// queued once, to be remembered, and again only for a new client. A
+    /// direct pane's generation is never queued: its spawn already
+    /// remembered it.
     #[test]
     fn a_wrapper_clients_known_generation_is_queued_once_per_client() {
         let rows = wrapped(&["opencode"], None);

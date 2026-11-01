@@ -5138,15 +5138,16 @@ fn admit_inbox_component_with(
 /// more:
 ///
 /// - `instance` runs an OpenCode executable
-///   ([`crate::opencode_mode::opencode_name`]) whose arguments carry the
-///   tokens `serve` and `--stdio`;
+///   ([`crate::opencode_mode::exe_is_opencode`], so one replaced in place
+///   since it started, `…/opencode (deleted)`, still counts) whose arguments
+///   carry the tokens `serve` and `--stdio`;
 /// - on Linux, its stdin and stdout are both sockets, as a private server's
 ///   are (measured on 2.2.5: a socketpair with its client). This is a
-///   heuristic: under OpenCode's Bun runtime a tool's child started with
-///   piped stdio has a socket on stdin and a pipe on stdout (measured on
-///   1.18.35 and 2.2.5), so for a process a tool starts it rests on stdout,
-///   and a tool that redirects its stdio (`exec opencode serve --stdio
-///   1>&0`) passes it. Off Linux this is not checked;
+///   heuristic: a process a tool starts can have sockets on both too
+///   (measured in audit N5: `Bun.spawn` and `node:child_process.spawn` with
+///   `"pipe"` stdio, under the Bun runtimes of 2.2.5 and 1.19.5), so a tool's
+///   piped child passes it ([`crate::opencode_mode::stdio_is_sockets`]). Off
+///   Linux this is not checked;
 /// - its direct parent runs the very same executable and is not above the
 ///   agent's own process `root` ([`admit_component`]).
 ///
@@ -5155,8 +5156,9 @@ fn admit_inbox_component_with(
 /// private server, not the client (measured), so a nested OpenCode a tool
 /// starts resolves at most to the pane's private server, which is not the
 /// pinned client, and the hub's pin refuses it. On 1.x, where tools run in
-/// the client, the socket check is all that stands, and a redirect defeats
-/// it; that is a process the agent itself runs (audit D1's accepted scope).
+/// the client, the socket check is all that stands, and a tool's piped child
+/// passes it; that is a process the agent itself runs (audit D1's accepted
+/// scope).
 fn opencode_server_client(
     instance: u32,
     root: Option<u32>,
@@ -5169,11 +5171,7 @@ fn opencode_server_client(
     let Some(exe) = executable_of(instance) else {
         return instance;
     };
-    let opencode = exe
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(crate::opencode_mode::opencode_name);
-    if !opencode {
+    if !crate::opencode_mode::exe_is_opencode(&exe) {
         return instance;
     }
     let private_server =
@@ -12958,6 +12956,58 @@ mod hook_ingestion_tests {
             .is_err(),
             "a start time that cannot be read now refuses where evidence is required"
         );
+    }
+
+    /// PRD #2050, audit N2: the OpenCode binary a pane runs was replaced in
+    /// place while it ran (`opencode upgrade`), so Linux reports both its
+    /// client's and its private server's executable as `…/opencode
+    /// (deleted)`. The server plugin's receiver still resolves to the client,
+    /// as it did before the replacement; a `serve --stdio` under a replaced
+    /// binary of another name still stands as named.
+    #[test]
+    fn a_replaced_opencode_binarys_private_server_still_resolves_to_its_client() {
+        let replaced = "/home/u/.opencode/bin/opencode (deleted)";
+        let exe_of = |client: &'static str| {
+            move |pid: u32| match pid {
+                10 => Some(std::path::PathBuf::from(client)),
+                11 => Some(std::path::PathBuf::from(client)),
+                _ => None,
+            }
+        };
+        let server_args = |_: u32| {
+            Some(
+                ["/home/u/.opencode/bin/opencode", "serve", "--stdio"]
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect(),
+            )
+        };
+        let parent = |pid: u32| (pid == 11).then_some(10);
+        let resolved = opencode_server_client(
+            11,
+            Some(9),
+            // The agent root, 9, is the client's parent, not below it.
+            |_, _| Some(false),
+            parent,
+            exe_of(replaced),
+            server_args,
+            |_| true,
+        );
+        assert_eq!(
+            resolved, 10,
+            "the replaced binary's server names its client"
+        );
+        let other = opencode_server_client(
+            11,
+            Some(9),
+            // The agent root, 9, is the client's parent, not below it.
+            |_, _| Some(false),
+            parent,
+            exe_of("/usr/bin/node (deleted)"),
+            server_args,
+            |_| true,
+        );
+        assert_eq!(other, 11, "a replaced binary of another name stands");
     }
 
     /// PRD #2050, audit F3: OpenCode 2's two halves pin one receiver. The

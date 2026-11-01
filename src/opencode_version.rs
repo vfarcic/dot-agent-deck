@@ -1,7 +1,7 @@
 //! PRD #2050: which OpenCode a spawn will run, and what that changes about
 //! how the deck starts it.
 //!
-//! OpenCode 1.x and 2.x load different plugin layouts (see
+//! OpenCode 1.x and 2.x load their plugins from different places (see
 //! [`crate::opencode_manage`]) and 2.x runs server plugins in a shared
 //! background service unless it is started with `--standalone`. So before an
 //! OpenCode agent starts, the deck resolves the binary its command names,
@@ -25,7 +25,7 @@ use std::time::Duration;
 /// A parsed `opencode --version`: (major, minor, patch).
 pub type Version = (u32, u32, u32);
 
-/// The OpenCode generations the deck installs a different layout for.
+/// The OpenCode generations the deck tells apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Major {
     /// OpenCode 1.x (and 0.x, which loads plugins the 1.x way).
@@ -357,21 +357,28 @@ fn run_version_within(
 #[cfg(unix)]
 fn leader_exited(child: &mut std::process::Child) -> std::io::Result<bool> {
     let pid = libc::id_t::try_from(child.id()).map_err(std::io::Error::other)?;
-    // SAFETY: a zeroed `siginfo_t` is a valid out-parameter for `waitid`,
-    // which only writes into it; `si_pid` reads the field `waitid` filled
-    // (it stays 0 when no child changed state, per POSIX for `WNOHANG`).
-    unsafe {
-        let mut info: libc::siginfo_t = std::mem::zeroed();
-        let rc = libc::waitid(
-            libc::P_PID,
-            pid,
-            &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        );
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
+    // A signal arriving during the call (`EINTR`) is retried, so the probe is
+    // not abandoned unreaped and unkilled for it.
+    loop {
+        // SAFETY: a zeroed `siginfo_t` is a valid out-parameter for `waitid`,
+        // which only writes into it; `si_pid` reads the field `waitid` filled
+        // (it stays 0 when no child changed state, per POSIX for `WNOHANG`).
+        unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            let rc = libc::waitid(
+                libc::P_PID,
+                pid,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            );
+            if rc == 0 {
+                return Ok(info.si_pid() != 0);
+            }
         }
-        Ok(info.si_pid() != 0)
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
 }
 

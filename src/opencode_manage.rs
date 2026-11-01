@@ -1727,9 +1727,12 @@ const v2Parent = () => {
     } catch (_) {}
   }
   if (!argv?.length) return undefined;
+  // A binary replaced in place since the parent started (`opencode upgrade`,
+  // OpenCode's own update, a reinstall) reads `…/opencode (deleted)` here on
+  // Linux; the suffix is not part of the file's name.
   let exe;
   try {
-    exe = readlinkSync(`/proc/${ppid}/exe`);
+    exe = String(readlinkSync(`/proc/${ppid}/exe`)).replace(/ \(deleted\)$/, "");
   } catch (_) {}
   v2ParentMemo = { argv, opencode: v2OpencodeName(exe !== undefined ? exe : argv[0]) };
   return v2ParentMemo;
@@ -11162,6 +11165,47 @@ const ctx = {
                 "{client:?}: subscribes"
             );
         }
+    }
+
+    /// Scenario (PRD #2050, audit N2): the OpenCode binary the client runs
+    /// is replaced in place while it runs (`opencode upgrade`), so Linux
+    /// reads its executable as `…/opencode (deleted)`. A `serve` under it
+    /// still recognises its client as OpenCode, and its `setup` reports as
+    /// before the replacement rather than going inert.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opencode_v2_setup_reports_under_a_replaced_opencode_binary() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = dir.path().join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template("/opt/dot-agent-deck")).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                "import pluginModule from {plugin};\nimport {{ readlinkSync }} from \"fs\";\n{FAKE_V2_CTX_JS}\ndelete process.env.DOT_AGENT_DECK_PANE_ID;\nconst parent = readlinkSync(`/proc/${{process.ppid}}/exe`);\nif (!parent.endsWith(\"/opencode (deleted)\")) {{ console.log(parent); process.exit(12); }}\nprocess.argv.push(\"serve\", \"--stdio\");\nawait pluginModule.setup(ctx);\nawait sleep(50);\nprocess.exit(subscribed ? 0 : 11);\n",
+                plugin = serde_json::to_string(&plugin.display().to_string()).unwrap(),
+            ),
+        )
+        .unwrap();
+        let shell = opencode_named_shell(dir.path());
+        // The client removes its own binary before starting the server, as
+        // an in-place upgrade leaves it.
+        std::fs::write(
+            dir.path().join("client"),
+            format!("rm -f '{}'\nnode '{}'\n", shell.display(), driver.display()),
+        )
+        .unwrap();
+        let out = std::process::Command::new(&shell)
+            .arg("client")
+            .current_dir(dir.path())
+            .envs(crate::test_isolation::unreachable_endpoints())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
     }
 
     /// The module both generations load: `{ id, server, setup }`, the 1.x
