@@ -5,9 +5,11 @@
 //! service, an integration that never reports, and a version older than the
 //! deck supports.
 //!
-//! The daemon learns an OpenCode's version only from the probe it runs as it
-//! starts a pane whose command invokes an OpenCode binary directly
-//! (`<binary> --version`, recorded by the binary's file identity). Its watch
+//! The daemon learns an OpenCode's version only from the probes it runs as it
+//! starts a pane (`<binary> --version`, recorded by the binary's file
+//! identity): of the binary a direct command invokes, or, for a wrapper
+//! command it cannot see into, of the file `opencode` resolves to on the
+//! pane's PATH (else the daemon's). Its watch
 //! then reads the pane's process tree: the topmost process whose EXECUTABLE
 //! file name is an OpenCode name is the client, its version is whatever the
 //! spawn-time probe recorded for that same file (the watch never runs a
@@ -20,12 +22,15 @@
 //! credential or real OpenCode is involved, so CI runs these for real rather
 //! than skipping them.
 //!
-//! A pane is started one of two ways, both declared
+//! A pane is started one of three ways, all declared
 //! `agent_type = "open_code"`: directly, the command being the stand-in's
 //! absolute path, which the deck probes (and, for 2.x, rewrites to add
-//! `--standalone`); or through a wrapper script the deck cannot see into, the
-//! way `devbox run …` or a script starts OpenCode, whose binary's version is
-//! known only when the deck probed that same file for another pane.
+//! `--standalone`); through a wrapper script the deck cannot see into, the
+//! way a script starts OpenCode by a path, whose binary's version is known
+//! only when the deck probed that same file for another pane; or through a
+//! wrapper that runs `opencode` by name with the stand-in's directory first
+//! on the pane's PATH, the way `devbox run …` starts it, whose binary the
+//! deck probes because it is the `opencode` that PATH names.
 //!
 //! Linux only: the stand-in starts its private server through its own
 //! absolute path, and the daemon's process sampling was measured on Linux
@@ -61,10 +66,15 @@ const SILENT_GRACE: Duration = Duration::from_secs(45);
 /// sentence is asserted through `daemon status --json`.
 const SHARED_LINE: &str = "Add --standalone to the command or run opencode";
 const NOT_WORKING_LINE: &str = "Run dot-agent-deck hooks install --agent opencode";
+const MAYBE_SHARED_LINE: &str = "Add --standalone to the command (OpenCode 2) or run";
 const TOO_OLD_LINE: &str = "Upgrade OpenCode to 1.18.29 or later";
 
 const SHARED_TEXT: &str = "Add --standalone to the command or run opencode service set disabled true, then restart: OpenCode 2's shared service hides this agent";
 const NOT_WORKING_TEXT: &str = "Run dot-agent-deck hooks install --agent opencode, then restart: the deck's OpenCode plugin is not reporting from this agent";
+/// The not-reporting sentence for a client whose version the deck does not
+/// know and which runs no private server: it may be an OpenCode 2 on the
+/// shared service, so both fixes are named.
+const MAYBE_SHARED_TEXT: &str = "Add --standalone to the command (OpenCode 2) or run dot-agent-deck hooks install --agent opencode, then restart: the deck's OpenCode plugin is not reporting";
 const TOO_OLD_TEXT: &str =
     "Upgrade OpenCode to 1.18.29 or later, then restart: version 1.18.28 is too old for the deck";
 
@@ -191,10 +201,16 @@ enum Via {
     /// deck resolves it, probes its version and records it, and rewrites a
     /// 2.x command to add `--standalone`.
     Direct,
-    /// The command runs a wrapper script that runs the stand-in with the
-    /// given arguments; the deck sees only the script, so it neither probes
-    /// nor rewrites anything.
+    /// The command runs a wrapper script that runs the stand-in by its
+    /// absolute path with the given arguments; the deck sees only the script,
+    /// so it rewrites nothing and probes only the `opencode` on PATH, which
+    /// is not this stand-in.
     Wrapper(&'static [&'static str]),
+    /// As [`Via::Wrapper`], but the script runs `opencode` by name, and the
+    /// pane's start environment puts the stand-in's directory first on its
+    /// PATH, so the `opencode` the deck probes for a wrapper is this
+    /// stand-in.
+    WrapperOnPath(&'static [&'static str]),
 }
 
 /// How a stand-in pane runs.
@@ -233,6 +249,10 @@ fn start(deck: &TuiDeck, launch: &Launch) -> String {
         format!("{report}: > {started}\n", started = quote(&started)),
     )
     .expect("write the boot script");
+    let mut env = vec![
+        json!(["DOT_AGENT_DECK_PANE_ID", launch.name]),
+        json!([BOOT_ENV, boot]),
+    ];
     let command = match launch.via {
         Via::Direct => {
             let path = launch.opencode.to_str().expect("a UTF-8 stand-in path");
@@ -244,16 +264,29 @@ fn start(deck: &TuiDeck, launch: &Launch) -> String {
             );
             path.to_string()
         }
-        Via::Wrapper(args) => {
+        Via::Wrapper(args) | Via::WrapperOnPath(args) => {
             let args: Vec<String> = args.iter().map(|a| format!("'{a}'")).collect();
+            let program = if let Via::WrapperOnPath(_) = launch.via {
+                assert_eq!(
+                    launch.opencode.file_name().and_then(|n| n.to_str()),
+                    Some("opencode"),
+                    "precondition: PATH resolves the stand-in by the name opencode"
+                );
+                let stand_in_dir = launch.opencode.parent().expect("the stand-in's directory");
+                let mut path = std::ffi::OsString::from(stand_in_dir);
+                if let Some(inherited) = std::env::var_os("PATH") {
+                    path.push(":");
+                    path.push(inherited);
+                }
+                env.push(json!(["PATH", path.to_str().expect("a UTF-8 PATH")]));
+                "opencode".to_string()
+            } else {
+                quote(launch.opencode)
+            };
             let wrapper = dir.join("run-opencode.sh");
             std::fs::write(
                 &wrapper,
-                format!(
-                    "#!/bin/sh\n{opencode} {args}\n",
-                    opencode = quote(launch.opencode),
-                    args = args.join(" "),
-                ),
+                format!("#!/bin/sh\n{program} {args}\n", args = args.join(" ")),
             )
             .expect("write the wrapper");
             std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
@@ -265,7 +298,7 @@ fn start(deck: &TuiDeck, launch: &Launch) -> String {
         deck,
         json!({"op": "start-agent", "command": command, "cwd": deck.workdir(),
             "agent_type": "open_code", "rows": 20, "cols": 100,
-            "env": [["DOT_AGENT_DECK_PANE_ID", launch.name], [BOOT_ENV, boot]],
+            "env": env,
             "display_name": launch.name}),
     );
     assert_eq!(reply["ok"], true, "{} spawn: {reply}", launch.name);
@@ -364,23 +397,29 @@ fn no_notice_until(deck: &TuiDeck, agent: &str, until: Instant) {
     );
 }
 
-/// The rendered dashboard shows `line` on exactly one card.
-fn shown_on_one_card(deck: &TuiDeck, line: &str) {
+/// The rendered dashboard shows `line` on exactly `cards` cards.
+fn shown_on_cards(deck: &TuiDeck, line: &str, cards: usize) {
     let budget = common::load_scaled(Duration::from_secs(10));
     assert!(
-        deck.wait_for_grid_predicate_within(budget, |grid| grid.matches(line).count() == 1),
-        "exactly one card must show {line:?}:\n{}",
+        deck.wait_for_grid_predicate_within(budget, |grid| grid.matches(line).count() == cards),
+        "exactly {cards} card(s) must show {line:?}:\n{}",
         deck.snapshot_grid()
     );
 }
 
-/// Scenario: Start an OpenCode 2 pane directly by its binary's path, which the deck probes and starts with `--standalone`, then a wrapper-script pane running that same binary on the shared background service, and a wrapper-script pane running a second OpenCode 2 binary the deck never probed. After the deck's grace, the shared pane's card tells the user to add `--standalone` or disable the shared service, while the standalone pane and the never-probed one (whose version the deck does not know and will not run it to find out) say nothing over the same window.
+/// The rendered dashboard shows `line` on exactly one card.
+fn shown_on_one_card(deck: &TuiDeck, line: &str) {
+    shown_on_cards(deck, line, 1);
+}
+
+/// Scenario: Start an OpenCode 2 pane directly by its binary's path, which the deck probes and starts with `--standalone`, a wrapper-script pane running that same binary on the shared background service, a wrapper-script pane running a second OpenCode 2 binary the deck never probed, and a wrapper-script pane running `opencode` by name from a third OpenCode 2 binary first on that pane's PATH, which nothing starts directly. After the deck's grace, the shared pane's and the PATH pane's cards tell the user to add `--standalone` or disable the shared service, while the standalone pane and the never-probed one (whose version the deck does not know and will not run it to find out) say nothing over the same window.
 #[spec("inbox/opencode/061")]
 #[test]
 fn opencode_061_opencode_2_on_the_shared_service_is_named_on_its_card_and_standalone_is_not() {
     let deck = deck();
     let opencode = native_opencode(&deck.home_dir().join("opencode-v2"), V2);
     let unprobed = native_opencode(&deck.home_dir().join("opencode-v2-unprobed"), V2);
+    let on_path = native_opencode(&deck.home_dir().join("opencode-v2-on-path"), V2);
     let standalone = start(
         &deck,
         &Launch {
@@ -408,24 +447,37 @@ fn opencode_061_opencode_2_on_the_shared_service_is_named_on_its_card_and_standa
             reports: true,
         },
     );
-    let started = Instant::now();
-    wait_notice(
+    // Started last, so the PATH probe of its `opencode` is the only way its
+    // binary's version reaches the deck: no pane runs that file directly.
+    let path_shared = start(
         &deck,
-        &shared,
-        "opencode_shared_service",
-        SHARED_TEXT,
-        SHARED_GRACE + 4 * POLL,
+        &Launch {
+            name: "oc-path-shared",
+            opencode: &on_path,
+            via: Via::WrapperOnPath(&[]),
+            reports: true,
+        },
     );
-    shown_on_one_card(&deck, SHARED_LINE);
+    let started = Instant::now();
+    for agent in [&shared, &path_shared] {
+        wait_notice(
+            &deck,
+            agent,
+            "opencode_shared_service",
+            SHARED_TEXT,
+            SHARED_GRACE + 4 * POLL,
+        );
+    }
+    shown_on_cards(&deck, SHARED_LINE, 2);
     // The other two panes have been watched at least as long as the shared
-    // one needed, plus two more looks.
+    // ones needed, plus two more looks.
     let window = started + SHARED_GRACE + 2 * POLL;
     no_notice_until(&deck, &standalone, window);
     no_notice_until(&deck, &never_probed, window);
-    shown_on_one_card(&deck, SHARED_LINE);
+    shown_on_cards(&deck, SHARED_LINE, 2);
 }
 
-/// Scenario: Start two `opencode --standalone` panes through wrapper scripts: one whose integration never reports to the deck, as when OpenCode cannot find the deck's plugin, and one that reports once as it starts and then sits idle. After the deck's grace, the silent one's card tells the user to run `dot-agent-deck hooks install --agent opencode` and restart, and the idle healthy one's card says nothing over the same window.
+/// Scenario: Start three OpenCode 2 panes through wrapper scripts, whose binary the deck never probed: an `opencode --standalone` whose integration never reports to the deck (as when OpenCode cannot find the deck's plugin), a plain `opencode` that never reports either, and an `opencode --standalone` that reports once as it starts and then sits idle. After the deck's grace, the silent standalone card tells the user to run `dot-agent-deck hooks install --agent opencode` and restart, the silent plain card names both `--standalone` (OpenCode 2) and that command, since the deck cannot tell whether it is an OpenCode 2 on the shared service, and the idle healthy card says nothing over the same window.
 #[spec("inbox/opencode/062")]
 #[test]
 fn opencode_062_a_silent_integration_is_named_on_its_card_and_an_idle_healthy_one_is_not() {
@@ -449,9 +501,26 @@ fn opencode_062_a_silent_integration_is_named_on_its_card_and_an_idle_healthy_on
             reports: false,
         },
     );
+    // No `--standalone`, so no private server, and a binary whose version
+    // the deck does not know: the `opencode` it probes on PATH is not this
+    // stand-in.
+    let silent_maybe_shared = start(
+        &deck,
+        &Launch {
+            name: "oc-silent-plain",
+            opencode: &opencode,
+            via: Via::Wrapper(&[]),
+            reports: false,
+        },
+    );
     let started = Instant::now();
     // Nothing is said while the grace runs.
     no_notice_until(&deck, &silent, started + SILENT_GRACE - 2 * POLL);
+    no_notice_until(
+        &deck,
+        &silent_maybe_shared,
+        started + SILENT_GRACE - 2 * POLL,
+    );
     wait_notice(
         &deck,
         &silent,
@@ -459,13 +528,22 @@ fn opencode_062_a_silent_integration_is_named_on_its_card_and_an_idle_healthy_on
         NOT_WORKING_TEXT,
         5 * POLL,
     );
+    wait_notice(
+        &deck,
+        &silent_maybe_shared,
+        "opencode_not_reporting",
+        MAYBE_SHARED_TEXT,
+        5 * POLL,
+    );
     shown_on_one_card(&deck, NOT_WORKING_LINE);
+    shown_on_one_card(&deck, MAYBE_SHARED_LINE);
     no_notice_until(
         &deck,
         &healthy,
         Instant::now() + POLL + Duration::from_secs(1),
     );
     shown_on_one_card(&deck, NOT_WORKING_LINE);
+    shown_on_one_card(&deck, MAYBE_SHARED_LINE);
 }
 
 /// Scenario: Start two OpenCode 1.x panes directly by their binaries' paths, which the deck probes: one 1.18.28 and one supported 1.18.35, neither given `--standalone`. The 1.18.28 card at once tells the user to upgrade OpenCode to 1.18.29 or later, and the 1.18.35 card says nothing, since OpenCode 1 has no shared service.
