@@ -236,12 +236,17 @@ fn probe_051_codex_enable_before_a_gated_real_flush_cannot_release_typing() {
     f.stable(b"\x07AFTER-THE-REAL-FLUSH");
 }
 
-/// Scenario: Ignore a Claude check once, let it lapse, and request its one retry with and without held human input. With nothing held the second probe is written and its real helper runs; held keys prohibit that retry and stay pending.
+/// Scenario: Ignore a Claude or Codex check once, let it lapse, and request a retry with and without held human input. Only Claude with nothing held may write a second probe and run its real helper; Codex and held-key cases retain the original unresolved check.
 #[spec("inbox/probe/030")]
 #[test]
 fn probe_030_lapse_retry_depends_on_whether_keys_wait_behind_it() {
-    for held in [false, true] {
-        let f = Fixture::start("claude");
+    for (kind, held) in [
+        ("claude", false),
+        ("claude", true),
+        ("codex", false),
+        ("codex", true),
+    ] {
+        let f = Fixture::start(kind);
         f.flag("edit-ignore-next");
         f.probe();
         f.expect(b"\x07");
@@ -253,9 +258,17 @@ fn probe_030_lapse_retry_depends_on_whether_keys_wait_behind_it() {
         wait_span(
             dot_agent_deck::composer_probe::query_ledger::T_TRIGGER + Duration::from_millis(50),
         );
-        f.control("probe-request:lapse");
-        if held {
+        let reply = f.control("probe-request:lapse");
+        if held || kind == "codex" {
+            assert_ne!(
+                reply["composer_probe"]["outcome"], "written",
+                "{kind}, held={held}: {reply}"
+            );
             f.stable(b"\x07");
+            assert!(
+                !f.path("helper-started").exists(),
+                "{kind}, held={held}: a refused lapse must not invoke the helper"
+            );
         } else {
             f.wait("helper-exited");
             f.expect(b"\x07\x07");
@@ -281,7 +294,7 @@ fn probe_031_dropped_trigger_holds_human_input_through_retirement() {
     f.stable(b"");
 }
 
-/// Scenario: Enter a native candidate while a CPR is outstanding, request a first probe and an immediate retry, then request again after a CPR response and the quiet timeout. No probe may be written in these histories; a fresh generation is the positive admission control, while the ordinary retry backoff can also prohibit the intervening requests.
+/// Scenario: Enter a native candidate while a CPR is outstanding, request a first probe and an immediate retry, then answer CPR and wait through the production retry backoff. Even the due retry must refuse without writing or publishing an arm because the candidate was latched during CPR; a fresh generation admits the positive control.
 #[spec("inbox/probe/032")]
 #[test]
 fn probe_032_native_backlog_latch_refuses_first_and_retry_then_respawn_recovers() {
@@ -292,7 +305,9 @@ fn probe_032_native_backlog_latch_refuses_first_and_retry_then_respawn_recovers(
     human.write("\x07");
     f.expect(b"\x07");
     let page = f.page();
-    f.probe();
+    let first = f.probe();
+    assert_eq!(first["composer_probe"]["outcome"], "refused", "{first}");
+    let refused_at = Instant::now();
     f.control("probe-request:retry");
     f.stable(b"\x07");
     assert_eq!(
@@ -305,6 +320,17 @@ fn probe_032_native_backlog_latch_refuses_first_and_retry_then_respawn_recovers(
     wait_span(dot_agent_deck::composer_probe::query_ledger::T_TRIGGER + Duration::from_millis(50));
     f.probe();
     f.stable(b"\x07\x1b[1;1R");
+    wait_span(
+        (dot_agent_deck::composer_probe::probe::BACKOFF[0] + Duration::from_millis(100))
+            .saturating_sub(refused_at.elapsed()),
+    );
+    let due = f.control("probe-request:retry");
+    assert_eq!(
+        due["composer_probe"]["outcome"], "refused",
+        "a due retry must reach admission and find the CPR latch: {due}"
+    );
+    f.stable(b"\x07\x1b[1;1R");
+    assert_eq!(f.page(), page, "the due refusal must publish no arm");
     f.replace();
     f.probe();
     f.wait("helper-exited");
@@ -419,7 +445,7 @@ fn probe_046_attached_dashboard_shows_clears_and_retires_held_typing() {
     f.stable(b"");
 }
 
-/// Scenario: Invoke the user's editor through the installed helper with and without its report connection, including a run with no added editor delay, and read the epoch around its output pair. The unmatched external edit must move the foreign epoch once without an empty observation clearing it; the test does not order editor exit against the first observer scan.
+/// Scenario: Invoke the user's editor through the installed helper or directly without that helper, including a run with no added editor delay, and read the epoch around its output pair. The unmatched external edit must move the foreign epoch once without an empty observation clearing it; the test does not order editor exit against the first observer scan or exercise a lost helper report connection.
 #[spec("inbox/probe/048")]
 #[test]
 fn probe_048_unreported_and_fast_external_edits_move_the_foreign_epoch() {
@@ -483,7 +509,7 @@ fn probe_049_mode_observations_and_malformed_pairs_are_not_release_authority() {
     }
 }
 
-/// Scenario: Hold a human editor's helper after a failed spawn or an injected wait failure following a real editor start. Under production Hold policy, exit and even a full return must leave the suffix held; replacing the generation must discard it without sending it to the successor.
+/// Scenario: Hold a human editor's helper after a failed spawn or an injected wait failure following a real editor start. A failed spawn retains the suffix through return and retirement under production Hold; an observed running user editor reads its released suffix before the wait-unknown exit drain, and those bytes must never reach the composer or its successor.
 #[spec("inbox/probe/049")]
 #[test]
 fn probe_049_failed_editor_outcomes_stay_held_under_production_hold() {
@@ -492,12 +518,39 @@ fn probe_049_failed_editor_outcomes_stay_held_under_production_hold() {
         f.flag("hold-return");
         f.probe();
         f.wait("helper-exited");
+        // Q104b: a positively observed running user editor owns bytes
+        // released before WaitUnknown is learned at the helper's exit drain.
+        // Keep the helper alive at post-editor until that reader acknowledges
+        // the suffix, so the positive release is witnessed, not inferred.
+        let pause = if outcome == "wait-unknown" {
+            f.setting("editor-mode", "read");
+            f.setting("helper-pause-at", "post-editor");
+            Some(f.pause_helper())
+        } else {
+            None
+        };
         let mut human = f.connect();
         // A HumanG segment follows the already-complete probe.
-        human.write("\x07OQ5-HELD");
+        human.write(if pause.is_some() {
+            "\x07OQ5-HELD\n"
+        } else {
+            "\x07OQ5-HELD"
+        });
         f.wait_held();
         f.flag(&format!("{outcome}-2"));
         f.flag("resume-go-1");
+        if let Some(pause) = pause {
+            f.wait("editor-input");
+            assert_eq!(
+                fs::read(f.path("editor-input")).unwrap(),
+                b"OQ5-HELD\n",
+                "the released suffix belongs to the running user editor"
+            );
+            f.flag("editor-go");
+            f.wait("editor-finished");
+            f.remove("pause-helper");
+            pause.release();
+        }
         // Distinct witnesses and releases separate the second quick failure
         // from the first helper's completed return.
         f.wait("helper-exited-2");
@@ -650,6 +703,110 @@ fn probe_059_automatic_tick_submits_a_real_probe() {
         f.page().seg_seq > 0,
         "automatic checks publish a nonzero segment"
     );
+}
+
+/// Scenario: Leave a draft and let a physical native Ctrl+G make the first probe refuse, then queue mail and leave the agent idle through the real retry backoff. Without another probe request or a generation reset, the production tick must retry, write one check byte and run its real installed helper.
+#[spec("inbox/probe/059")]
+#[test]
+fn probe_059_automatic_retry_after_a_due_admission_failure() {
+    let f = Fixture::start("claude");
+    f.hook_event("session_start");
+    f.hook_event("idle");
+    f.flag("edit-drop");
+    let mut human = f.connect();
+    // Keep ordinary mail held by the pre-Q35-21 draft policy. This row
+    // asserts retry submission, not that the new epoch already gates rings.
+    human.write("draft\x07");
+    f.expect(b"draft\x07");
+    let first = f.probe();
+    assert_eq!(first["composer_probe"]["outcome"], "refused", "{first}");
+    let refused_at = Instant::now();
+    assert_eq!(f.page().seg_seq, 0, "a refused check publishes no segment");
+    f.remove("edit-drop");
+    f.enqueue();
+    f.stable(b"draft\x07");
+    assert!(
+        common::wait_until(
+            dot_agent_deck::composer_probe::probe::BACKOFF[0] + WAIT,
+            || { f.path("helper-exited-1").exists() }
+        ),
+        "the automatic retry never ran the helper; input {:?}",
+        f.input()
+    );
+    assert!(
+        refused_at.elapsed() >= dot_agent_deck::composer_probe::probe::BACKOFF[0],
+        "automatic retry bypassed the production failure backoff"
+    );
+    f.expect(b"draft\x07\x07");
+    f.stable(b"draft\x07\x07");
+    assert!(
+        f.page().seg_seq > 0,
+        "the automatic retry publishes its own segment"
+    );
+}
+
+/// Scenario: Send OSC 10 and 11 reports, whole or byte-split and BEL- or ST-ended, before requesting a live probe, with each query retained before ledger saturation or dropped after it. A split or unretained BEL is a physical native candidate and refuses the first check without publication; other reports permit exactly one real probe byte.
+#[spec("inbox/probe/061")]
+#[test]
+fn probe_061_live_slot_split_and_saturation_permutations() {
+    use dot_agent_deck::composer_probe::query_ledger::LEDGER_SLOTS;
+    for slot in [10, 11] {
+        for retained in [true, false] {
+            for bel in [true, false] {
+                for split in [true, false] {
+                    let f = Fixture::start("claude");
+                    f.flag("edit-drop");
+                    let query = format!("\x1b]{slot};?\x1b\\");
+                    if retained {
+                        f.emit(query.as_bytes());
+                    }
+                    f.emit(&b"\x1b[c".repeat(LEDGER_SLOTS + 1));
+                    if !retained {
+                        f.emit(query.as_bytes());
+                    }
+                    let reply = format!(
+                        "\x1b]{slot};rgb:1/22/333{}",
+                        if bel { "\x07" } else { "\x1b\\" }
+                    );
+                    let mut human = f.connect();
+                    if split {
+                        for (index, byte) in reply.as_bytes().iter().enumerate() {
+                            human.write(std::str::from_utf8(std::slice::from_ref(byte)).unwrap());
+                            // Physical-write acknowledgement forces separate acceptance
+                            // and write histories even when the socket could coalesce.
+                            f.expect(&reply.as_bytes()[..=index]);
+                        }
+                    } else {
+                        human.write(&reply);
+                        f.expect(reply.as_bytes());
+                    }
+                    let before = f.page();
+                    let result = f.probe();
+                    let candidate = bel && (split || !retained);
+                    assert_eq!(
+                        result["composer_probe"]["outcome"],
+                        if candidate { "refused" } else { "written" },
+                        "slot={slot}, retained={retained}, bel={bel}, split={split}: {result}"
+                    );
+                    let expected = if candidate {
+                        reply.into_bytes()
+                    } else {
+                        [reply.as_bytes(), b"\x07"].concat()
+                    };
+                    f.expect(&expected);
+                    f.stable(&expected);
+                    if candidate {
+                        assert_eq!(f.page(), before, "a native hazard publishes no arm");
+                    } else {
+                        assert!(
+                            f.page().seg_seq > before.seg_seq,
+                            "an admitted report control publishes its segment"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Scenario: Pause a live probe after scheduling, run the native agent's real unarmed helper until its writer scope is open, then let the writer attempt the probe. The newly unsafe scope must cause refusal without a probe byte, a page change or a surviving fence.
