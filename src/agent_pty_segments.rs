@@ -38,10 +38,13 @@
 //! - the gate's fence and held ops: under the gate's lock;
 //! - the written stream's boundary: the writer's own;
 //! - a person's ticket: the ledger read again under the gate's lock;
-//! - the screen: the frame read when scheduled stands only while the bus
-//!   has taken no output since it (its `out_seq`), read on the writer thread
-//!   just before the gate's lock, as the output hook's facts are: output
-//!   after it and before the byte could as well land just after the byte.
+//! - the screen: the frame read when scheduled, with its layout epoch and
+//!   output position in the same hold, stands only while the evidence is
+//!   still Clean in that epoch with no output taken since (R-D-U2-01: a
+//!   layout edge or an unknown geometry invalidates it without moving the
+//!   output), read on the writer thread just before the gate's lock, as the
+//!   output hook's facts are: output after it and before the byte could as
+//!   well land just after the byte.
 //!
 //! The keymap is file I/O and is read with no lock held: after a pending
 //! permission is settled, and again after an O5 wait, so nothing read before
@@ -52,7 +55,7 @@
 //! **Lock order.**
 //! ```text
 //! probe request: pane writer (async) ─> gate (probe_queued) ; submit job
-//! writer thread: bus (the screen's `out_seq`, released) ; then
+//! writer thread: bus (the screen's status, epoch and `out_seq`, released) ; then
 //!                arm section: gate ─> ledger (released) ; gate ─> seam ─>
 //!                input (R6) ─> page stores
 //! driver:        pane writer (async) ─> gate (release_until_if / release_cut)
@@ -568,6 +571,55 @@ pub(super) fn writer_outside(
     }
 }
 
+/// Whether the Clean frame the screen was read from when the probe was
+/// scheduled (`mark`, read with it in one hold) still stands on `bus`: the
+/// state still Clean, in the same layout epoch, with no output taken since
+/// (U3-03, R-D-U2-01). A layout edge, a failed nudge restore or a learned
+/// profile invalidates the frame without moving the output position; an
+/// elapsed O5 estimate is no replacement frame. No frame, none stands.
+#[cfg(target_os = "linux")]
+pub(super) fn screen_fresh(bus: &AgentBus, mark: Option<crate::evidence_state::FrameMark>) -> bool {
+    mark.is_some_and(|mark| bus.frame_unchanged(mark))
+}
+
+/// The writer's own reads at a probe's arm section, as
+/// [`AgentPtyRegistry::composer_probe`] hands them to [`probe_section`]
+/// (O-20.7, U3-03, the audit's U3-7): `fresh`, the screen's freshness on
+/// `bus` against the scheduled frame's `mark` ([`screen_fresh`]), read on
+/// the writer thread before the gate's lock; and `facts`, which, under the
+/// gate's lock, reads a person's ticket from `ledger` and asks
+/// [`writer_outside`] for the outside facts the arm asks admission with.
+#[cfg(target_os = "linux")]
+#[allow(clippy::type_complexity)]
+pub(super) fn writer_facts(
+    bus: Arc<AgentBus>,
+    mark: Option<crate::evidence_state::FrameMark>,
+    ledger: Arc<crate::ingress_ledger::IngressLedger>,
+    scheduled: crate::composer_probe::admission::Outside,
+) -> (
+    impl FnOnce() -> bool + Send + 'static,
+    impl FnOnce(
+        &crate::doorbell_txn::StartCtx,
+        crate::composer_probe::gate::Status,
+        bool,
+    ) -> crate::composer_probe::admission::Outside
+    + Send
+    + 'static,
+) {
+    (
+        move || screen_fresh(&bus, mark),
+        move |ctx: &crate::doorbell_txn::StartCtx, status, screen_unchanged| {
+            writer_outside(
+                scheduled,
+                ctx,
+                status,
+                ledger.any_outstanding(),
+                screen_unchanged,
+            )
+        },
+    )
+}
+
 /// What a probe's job's end tells its segment: written at its offset and
 /// instant, failed, or withdrawn (refused at the writer or taken back).
 /// Shared with the release oracle.
@@ -815,11 +867,12 @@ impl AgentPtyRegistry {
                 _ => break (w, keymap),
             }
         };
-        // The frame the screen is read from, and its place in the output:
-        // the writer refuses the screen if output was taken since (U3-03).
-        let frame = h.bus.clean_frame();
-        let seen = frame.as_ref().map(|grid| grid.out_seq);
-        let surface = surface_shows_composer(h.agent.as_ref(), frame);
+        // The frame the screen is read from, with its layout epoch and place
+        // in the output, in one hold: the writer refuses the screen unless it
+        // still stands (U3-03, R-D-U2-01).
+        let marked = h.bus.clean_frame_marked();
+        let mark = marked.as_ref().map(|(_, mark)| *mark);
+        let surface = surface_shows_composer(h.agent.as_ref(), marked.map(|(grid, _)| grid));
         let now = Instant::now();
         let status = h.gate.gate.status();
         let (fence, lapsed_e0) = input.admission_fence(status.fenced, status.held_ops, now);
@@ -864,22 +917,16 @@ impl AgentPtyRegistry {
         let claim = Arc::new(crate::doorbell_txn::JobClaim::default());
         let section = {
             let observer = Arc::clone(&h.observer);
-            let (bus, ledger) = (Arc::clone(&h.bus), Arc::clone(&h.ledger));
+            let (fresh, facts) =
+                writer_facts(Arc::clone(&h.bus), mark, Arc::clone(&h.ledger), outside);
             probe_section(
                 Arc::clone(&h.gate.gate),
                 Arc::clone(&input),
                 Arc::clone(&claim),
-                move || seen.is_some_and(|seq| bus.evidence().2 == seq),
+                fresh,
                 move |ctx, status, screen_unchanged| {
-                    let writer_outside = writer_outside(
-                        outside,
-                        ctx,
-                        status,
-                        ledger.any_outstanding(),
-                        screen_unchanged,
-                    );
                     observer
-                        .arm_segment(number, &writer_outside, ctx.now)
+                        .arm_segment(number, &facts(ctx, status, screen_unchanged), ctx.now)
                         .map(drop)
                         .map_err(ProbeRefusal::Admission)
                 },
@@ -1296,6 +1343,125 @@ mod tests {
         assert!(
             !drawn.surface,
             "output since the frame the screen was read from"
+        );
+    }
+
+    /// A Claude Code frame at `cols`: the full-width rules around an empty
+    /// composer, after Claude Code's full-redraw marker.
+    #[cfg(target_os = "linux")]
+    fn claude_frame(cols: u16) -> Vec<u8> {
+        let rule = "─".repeat(cols as usize);
+        format!("\x1b[2J\x1b[H\x1b[20;1H{rule}\x1b[21;1H❯\u{a0}\x1b[22;1H{rule}\x1b[23;3Hstatus\x1b[21;3H")
+            .into_bytes()
+    }
+
+    /// One probe scheduled from a Clean Claude Code frame on a real bus, then
+    /// `between` run before its arm section, which runs as the live writer
+    /// runs it ([`probe_section`] with [`writer_facts`]) once the O5
+    /// estimate, if the generation has one, has elapsed. The seam's arm is
+    /// stood in for by the generation's own admission (`admit_probe`), which
+    /// it asks first. The section's outcome and whether the fence closed.
+    #[cfg(target_os = "linux")]
+    fn arm_after(
+        between: impl FnOnce(&AgentBus, &Arc<crate::ingress_ledger::IngressLedger>),
+    ) -> (Result<(u64, Instant), ProbeRefusal>, bool) {
+        use crate::composer_probe::admission::{Attempt, Fence, Outside};
+        use crate::composer_probe::planner::Boundary;
+        use crate::composer_probe::record::{EcPolicy, Records};
+        let bus = Arc::new(AgentBus::profiled(
+            Some(&crate::doorbell_screen::CLAUDE_PROFILE),
+            24,
+            80,
+        ));
+        let input = Arc::clone(bus.input());
+        assert!(input.attach_records(Records::new(5, EcPolicy::Hold, Instant::now())));
+        bus.push(claude_frame(80));
+        // Scheduled: the frame and where it stands, in one hold.
+        let (grid, mark) = bus.clean_frame_marked().expect("a Clean frame");
+        let scheduled = Outside {
+            attempt: Attempt::First,
+            permission: crate::composer_probe::Permission::Armable,
+            fence: Fence::Open,
+            human_ticket: false,
+            boundary: Boundary::Ground,
+            keymap: Ok(()),
+            surface: surface_shows_composer(Some(&AgentType::ClaudeCode), Some(grid)),
+        };
+        assert!(scheduled.surface, "scheduled at the main composer");
+        let ledger = crate::ingress_ledger::IngressLedger::new();
+        between(&bus, &ledger);
+        let now = Instant::now();
+        let at = input.query_wait_estimate().map_or(now, |due| due.max(now));
+        let gate = Arc::new(crate::composer_probe::gate::Gate::<UserFrame>::default());
+        let (fresh, facts) = writer_facts(Arc::clone(&bus), Some(mark), ledger, scheduled);
+        let admits = Arc::clone(&input);
+        let section = probe_section(
+            Arc::clone(&gate),
+            input,
+            Arc::new(crate::doorbell_txn::JobClaim::default()),
+            fresh,
+            move |ctx, status, screen_unchanged| {
+                admits
+                    .admit_probe(&facts(ctx, status, screen_unchanged), ctx.now)
+                    .map_err(ProbeRefusal::Admission)
+            },
+        );
+        let outcome = section(&crate::doorbell_txn::StartCtx {
+            boundary: Boundary::Ground,
+            retired: false,
+            now: at,
+        });
+        (outcome, gate.status().fenced)
+    }
+
+    /// Scenario: Schedule a probe from a Clean frame showing Claude Code's main composer, then, before the writer's arm section, invalidate that frame by its layout alone, with no output: a resize, a nudge's shrink, a failed nudge restore. The writer comes to the section after the generation's redraw estimate (O5) has run out, and refuses the screen, closing no fence: an elapsed estimate is no replacement frame. With nothing changed, or a person's ticket admitted meanwhile, the same section admits, or refuses that ticket (R-D-U2-01, the audit's U3-7).
+    #[cfg(target_os = "linux")]
+    #[spec("inbox/probe/059")]
+    #[test]
+    fn probe_059_a_layout_edge_since_the_frame_refuses_the_screen_at_the_arm() {
+        use crate::composer_probe::admission::Refusal;
+        use crate::evidence_state::EdgeReason;
+        let (unchanged, fenced) = arm_after(|_, _| {});
+        assert!(unchanged.is_ok(), "nothing since the frame: {unchanged:?}");
+        assert!(fenced, "the admitted section closes the fence");
+        type Edge = fn(&AgentBus);
+        let edges: [(&str, Edge); 3] = [
+            ("a resize", |bus| {
+                bus.resize_and_clear(30, 100, || Ok::<(), ()>(())).unwrap();
+            }),
+            ("a nudge's shrink", |bus| {
+                bus.resize_and_mark_edge(EdgeReason::NudgeShrink, 24, 79, || Ok::<(), ()>(()))
+                    .unwrap();
+            }),
+            ("a failed nudge restore", |bus| {
+                let _ = bus.resize_and_mark_edge(EdgeReason::NudgeRestore, 24, 80, || Err(()));
+            }),
+        ];
+        for (what, edge) in edges {
+            let (refused, fenced) = arm_after(|bus, _| {
+                let seq = bus.evidence().2;
+                edge(bus);
+                assert_eq!(bus.evidence().2, seq, "{what}: layout only, no output");
+            });
+            assert_eq!(
+                refused,
+                Err(ProbeRefusal::Admission(Refusal::Surface)),
+                "{what} since the frame, the estimate elapsed"
+            );
+            assert!(!fenced, "{what}: no fence closed");
+        }
+        let (output, _) = arm_after(|bus, _| bus.push(b"x".to_vec()));
+        assert_eq!(
+            output,
+            Err(ProbeRefusal::Admission(Refusal::Surface)),
+            "output since the frame"
+        );
+        let mut ticket = None;
+        let (ticketed, _) = arm_after(|_, ledger| ticket = Some(ledger.admit()));
+        assert_eq!(
+            ticketed,
+            Err(ProbeRefusal::Admission(Refusal::HumanTicket)),
+            "a ticket admitted since scheduling, read by the writer"
         );
     }
 

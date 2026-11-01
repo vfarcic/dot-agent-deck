@@ -140,6 +140,15 @@ pub struct Transition {
     pub marker_seq: Option<u64>,
 }
 
+/// Where a Clean frame stood when it was read (R-D-U2-01): its layout epoch
+/// and its place in the output. A layout edge or an unknown geometry moves
+/// the epoch and invalidates the frame without moving the output position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameMark {
+    pub layout_epoch: u64,
+    pub out_seq: u64,
+}
+
 /// One agent's evidence state. See the module documentation.
 pub struct EvidenceState {
     profile: Option<&'static ScreenProfile>,
@@ -219,6 +228,32 @@ impl EvidenceState {
 
     pub fn geometry(&self) -> (u16, u16) {
         (self.rows, self.cols)
+    }
+
+    /// The current frame, read losslessly, while the state is Clean, with
+    /// where it stands (R-D-U2-01): its layout epoch and output position,
+    /// read with it.
+    pub fn clean_frame_marked(&self) -> Option<(Grid, FrameMark)> {
+        let grid = self.clean_frame()?;
+        Some((
+            grid,
+            FrameMark {
+                layout_epoch: self.layout_epoch,
+                out_seq: self.out_seq,
+            },
+        ))
+    }
+
+    /// Whether the Clean frame `mark` was read from still stands
+    /// (R-D-U2-01): the state is Clean now, in the same layout epoch, with
+    /// no output taken since. Comparing the output position alone misses a
+    /// layout edge or an unknown geometry, which invalidate the frame
+    /// without moving it.
+    pub fn frame_unchanged(&self, mark: FrameMark) -> bool {
+        matches!(self.status, EvidenceStatus::Clean { .. })
+            && self.parser.is_some()
+            && self.layout_epoch == mark.layout_epoch
+            && self.out_seq == mark.out_seq
     }
 
     /// The current frame, read losslessly, while the state is Clean.

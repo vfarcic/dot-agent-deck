@@ -2605,6 +2605,23 @@ impl AgentBus {
         )
     }
 
+    /// The current frame and where it stands, read in one hold, while the
+    /// evidence state is Clean (R-D-U2-01).
+    pub fn clean_frame_marked(
+        &self,
+    ) -> Option<(
+        crate::doorbell_screen::Grid,
+        crate::evidence_state::FrameMark,
+    )> {
+        self.state.lock().unwrap().evidence.clean_frame_marked()
+    }
+
+    /// Whether the Clean frame `mark` was read from still stands, read in
+    /// one hold (R-D-U2-01).
+    pub fn frame_unchanged(&self, mark: crate::evidence_state::FrameMark) -> bool {
+        self.state.lock().unwrap().evidence.frame_unchanged(mark)
+    }
+
     /// The current frame, read losslessly, while the evidence state is Clean.
     pub fn clean_frame(&self) -> Option<crate::doorbell_screen::Grid> {
         self.state.lock().unwrap().evidence.clean_frame()
