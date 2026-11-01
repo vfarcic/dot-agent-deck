@@ -45,7 +45,7 @@ use live::{Fixture, WAIT};
 use serde_json::{Value, json};
 use spec::spec;
 use std::fs;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 ctor::declarative::ctor! {
     // The fixture child is selected by its private environment before libtest
@@ -131,6 +131,8 @@ fn probe_026_delayed_checks_preserve_typing_under_each_loss_mechanism() {
 #[spec("inbox/probe/026")]
 #[test]
 fn probe_026_empty_settlement_and_read_only_epoch_control() {
+    // .config/nextest.toml selects this exact function name to show which
+    // export-chain branch ran; update that override if this test is renamed.
     let f = Fixture::start("claude");
     f.flag("hold-return");
     let before = f.epoch();
@@ -490,7 +492,7 @@ fn probe_046_attached_dashboard_shows_clears_and_retires_held_typing() {
     f.stable(b"");
 }
 
-/// Scenario: Invoke the user's editor through the installed helper or directly without that helper, including a run with no added editor delay, and read the epoch around its output pair. The unmatched external edit must move the foreign epoch once without an empty observation clearing it; the test does not order editor exit against the first observer scan or exercise a lost helper report connection.
+/// Scenario: Invoke the user's editor through the installed helper or directly without that helper and read the epoch around its output pair. In the fast direct case, hold observer passes until the editor and native parent have acknowledged exit and return; the unmatched external edit must still move the foreign epoch once without an empty observation clearing it.
 #[spec("inbox/probe/048")]
 #[test]
 fn probe_048_unreported_and_fast_external_edits_move_the_foreign_epoch() {
@@ -499,6 +501,14 @@ fn probe_048_unreported_and_fast_external_edits_move_the_foreign_epoch() {
         if !reported {
             f.flag("lost-ipc");
         }
+        let held_passes = fast.then(|| {
+            f.control("observer-hold");
+            // An already-running pass may finish after hold is requested.
+            wait_span(Duration::from_millis(200));
+            f.control("observer-status")["composer_observer"]["passes"]
+                .as_u64()
+                .unwrap()
+        });
         f.flag("hold-return");
         let before = f.epoch();
         let mut human = f.connect();
@@ -509,6 +519,15 @@ fn probe_048_unreported_and_fast_external_edits_move_the_foreign_epoch() {
         }
         f.wait("helper-exited");
         f.flag("resume-go");
+        f.wait("composer-return-1");
+        if let Some(passes) = held_passes {
+            let status = f.control("observer-status");
+            assert_eq!(
+                status["composer_observer"]["passes"], passes,
+                "the editor exited before an observer pass: {status}"
+            );
+            f.control("observer-go");
+        }
         assert!(
             common::wait_until(WAIT, || f.epoch().0 >= before.0 + 2),
             "native key and unmatched external edit must each count, including early exit"
@@ -669,6 +688,48 @@ fn probe_049_wait_unknown_at_drain_retains_the_undelivered_suffix() {
     f.stable(b"");
 }
 
+/// Scenario: For Claude and Codex under Hold and test-selected Authority, queue a human editor trigger and suffix behind a real returning check, then fail the editor's spawn. Each retains the suffix through helper exit; Authority releases it once after the matching return, while Hold retains it through replacement.
+#[spec("inbox/probe/049")]
+#[test]
+fn probe_049_authority_failed_start_releases_only_after_the_matching_return() {
+    for kind in ["claude", "codex"] {
+        for policy in ["hold", "authority"] {
+            let mut f = Fixture::start(kind);
+            f.control(&format!("records-policy:{policy}"));
+            f.flag("hold-return");
+            f.probe();
+            f.wait("helper-exited-1");
+            f.flag("spawn-failed-2");
+            let mut human = f.connect();
+            human.write("\x07AFTER-FAILED-START");
+            f.wait_held();
+            f.flag("resume-go-1");
+            f.wait("helper-exited-2");
+            f.stable(b"\x07\x07");
+            let trace = fs::read_to_string(f.path("helper-trace")).unwrap();
+            assert!(trace.contains("branch Unarmed"), "{kind}/{policy}: {trace}");
+            assert!(
+                !f.path("editor-started").exists(),
+                "a failed spawn has no editor reader"
+            );
+            f.flag("resume-go-2");
+            f.wait("composer-return-2");
+            if policy == "authority" {
+                f.expect(b"\x07\x07AFTER-FAILED-START");
+                f.stable(b"\x07\x07AFTER-FAILED-START");
+                human.write("-NEXT");
+                f.expect(b"\x07\x07AFTER-FAILED-START-NEXT");
+                f.stable(b"\x07\x07AFTER-FAILED-START-NEXT");
+            } else {
+                f.stable(b"\x07\x07");
+                assert!(f.held(), "{kind}/{policy}: the return grants no release");
+                f.replace();
+                f.stable(b"");
+            }
+        }
+    }
+}
+
 /// Scenario: Admit a probe through the live writer and read its nonzero segment from the installed mapped page. A following count-only publication and a physical native candidate must retain that segment number while publishing the updated count and native number coherently.
 #[spec("inbox/probe/059")]
 #[test]
@@ -799,7 +860,7 @@ fn probe_059_automatic_tick_submits_a_real_probe() {
     );
 }
 
-/// Scenario: Leave a draft and let a physical native Ctrl+G make the first probe refuse, then queue mail and leave the agent idle through the real retry backoff. Without another probe request or a generation reset, the production tick must reach writer admission after the backoff, write one check byte and run its real installed helper. This relies on today's draft mail hold and must be re-oracled at Q35-21.
+/// Scenario: Leave a draft and let a physical native Ctrl+G make the first probe refuse, then queue mail and witness its pending retry deadline. Advance that monotonic deadline with the schedule control; without another probe request or a generation reset, the production tick must reach writer admission, write one check byte and run its real installed helper.
 #[spec("inbox/probe/059")]
 #[test]
 fn probe_059_automatic_retry_after_a_due_admission_failure() {
@@ -812,9 +873,6 @@ fn probe_059_automatic_retry_after_a_due_admission_failure() {
     // asserts retry submission, not that the new epoch already gates rings.
     human.write("draft\x07");
     f.expect(b"draft\x07");
-    // The failure happens within this request, so its start is a conservative
-    // lower bound; starting after the response would charge IPC time twice.
-    let requested_at = SystemTime::now();
     let first = f.probe();
     assert_eq!(first["composer_probe"]["outcome"], "refused", "{first}");
     assert_eq!(f.page().seg_seq, 0, "a refused check publishes no segment");
@@ -827,24 +885,17 @@ fn probe_059_automatic_retry_after_a_due_admission_failure() {
     f.remove("edit-drop");
     f.enqueue();
     f.stable(b"draft\x07");
+    let schedule = f.control("schedule-status");
+    assert_eq!(schedule["composer_schedule"]["due"], false, "{schedule}");
+    assert_eq!(schedule["composer_schedule"]["failures"], 1, "{schedule}");
+    assert!(!root.join("scheduled.arrived").exists(), "no early retry");
+    // Schedule advancement does not age the physical native-key hazard.
+    wait_span(dot_agent_deck::composer_probe::query_ledger::T_TRIGGER + Duration::from_millis(50));
+    f.control("schedule-advance:30000");
     assert!(
-        common::wait_until(
-            dot_agent_deck::composer_probe::probe::BACKOFF[0] + common::load_scaled(WAIT),
-            || root.join("scheduled.arrived").exists()
-        ),
+        common::wait_until(WAIT, || root.join("scheduled.arrived").exists()),
         "the automatic retry never reached writer admission; input {:?}",
         f.input()
-    );
-    let submitted_at = fs::metadata(root.join("scheduled.arrived"))
-        .unwrap()
-        .modified()
-        .unwrap();
-    assert!(
-        submitted_at
-            .duration_since(requested_at)
-            .unwrap_or_default()
-            >= dot_agent_deck::composer_probe::probe::BACKOFF[0],
-        "automatic retry bypassed the production failure backoff: request {requested_at:?}, writer arrival {submitted_at:?}"
     );
     assert!(
         !root.join("scheduled.timed-out").exists(),
@@ -856,6 +907,56 @@ fn probe_059_automatic_retry_after_a_due_admission_failure() {
     assert!(
         f.page().seg_seq > 0,
         "the automatic retry publishes its own segment"
+    );
+}
+
+/// Scenario: Queue ordinary mail behind a draft and fail the live writer's check bytes, advancing each pending retry deadline through the third failure and one more. The production tick must continue attempting checks while Broken, then write one probe and run its helper when the fault is cleared and the next deadline is advanced.
+#[spec("inbox/probe/059")]
+#[test]
+fn probe_059_automatic_retries_continue_through_broken() {
+    let f = Fixture::start("claude");
+    f.hook_event("session_start");
+    f.hook_event("idle");
+    let mut human = f.connect();
+    human.write("draft");
+    f.expect(b"draft");
+    f.control("writer-fault:jobs=any,skip=0,accept=0");
+    let first = f.probe();
+    assert_eq!(first["composer_probe"]["outcome"], "refused", "{first}");
+    assert_eq!(
+        first["composer_probe"]["reason"], "the probe's write failed",
+        "{first}"
+    );
+    f.enqueue();
+    for (failures, delay) in [(1, 30000), (2, 120000), (3, 600000), (4, 1800000)] {
+        assert!(common::wait_until(
+            WAIT,
+            || f.control("schedule-status")["composer_schedule"]["failures"] == failures
+        ));
+        let status = f.control("schedule-status");
+        assert_eq!(
+            status["composer_schedule"]["broken"],
+            failures >= 3,
+            "{status}"
+        );
+        assert_eq!(status["composer_schedule"]["due"], false, "{status}");
+        assert_eq!(
+            f.control("writer-status")["composer_writer"]["failed_writes"],
+            failures,
+            "each due retry must actually reach the writer"
+        );
+        f.stable(b"draft");
+        if failures == 4 {
+            f.control("writer-fault:off");
+        }
+        f.control(&format!("schedule-advance:{delay}"));
+    }
+    f.wait("helper-exited-1");
+    f.expect(b"draft\x07");
+    f.stable(b"draft\x07");
+    assert!(
+        f.page().seg_seq > 0,
+        "the repaired writer publishes its actual probe"
     );
 }
 
@@ -966,7 +1067,6 @@ fn probe_061_in_check_osc_candidates_complete_without_manual_release() {
                     let mut human = f.connect();
                     if split {
                         human.write(&reply[..reply.len() - 1]);
-                        f.wait_held();
                         human.write(&format!("{}OSC-EDITOR\n", &reply[reply.len() - 1..]));
                     } else if !candidate {
                         // A whole retained report is one whole attach frame;
@@ -976,7 +1076,12 @@ fn probe_061_in_check_osc_candidates_complete_without_manual_release() {
                     } else {
                         human.write(&format!("{reply}OSC-EDITOR\n"));
                     }
-                    f.wait_held();
+                    // §3.7: the matched Claude decision already released
+                    // ordinary typing, including a split report's prefix.
+                    // Only the next candidate must wait for this return.
+                    if candidate {
+                        f.wait_held();
+                    }
                     f.flag("resume-go-1");
                     let context =
                         format!("slot={slot}, retained={retained}, bel={bel}, split={split}");
@@ -1214,7 +1319,7 @@ fn probe_057_e2_does_not_kill_a_running_user_editor() {
     assert_eq!(result["signal"], Value::Null);
 }
 
-/// Scenario: Run an unarmed user editor that either leaves a genuine background descendant alive or loses its already-open report connection when the daemon rejects an oversized report. After the real helper exits and the composer returns, its unresolved scope must refuse a fresh check without writing another probe; the survivor exits on its private fixture file or a 120-second deadline. Hold policy already opens scope at the Unarmed decision, so these assertions do not isolate the later Survivors report or missing-report drain as the cause of scope remaining open.
+/// Scenario: Run an unarmed user editor that either leaves a genuine background descendant alive or loses its already-open report connection when the daemon rejects an oversized report. After the real helper exits and the composer returns, its unresolved scope must refuse a fresh check without writing another probe; the survivor exits on its private fixture file or a 30-second deadline. Hold policy already opens scope at the Unarmed decision, so these assertions do not isolate the later Survivors report or missing-report drain as the cause of scope remaining open.
 #[spec("inbox/probe/057")]
 #[test]
 fn probe_057_background_survivor_and_lost_report_keep_scope_open() {
@@ -1304,5 +1409,94 @@ fn probe_057_tool_and_unknown_family_helpers_leave_liability_unconsumed() {
             1,
             "{parent}: a non-owned helper cannot settle the published liability"
         );
+    }
+}
+
+/// Scenario: Select Authority policy and a one-record cap before observation, then keep a real unarmed editor/helper alive in that slot while a second native or tool helper arrives. A dropped undecided sighting or tool decision opens the writer scope, whereas an Armed helper-only decision leaves it closed; each live cap must refuse a new probe without a check byte, and a two-slot control keeps the undecided sighting Pending instead of opening scope.
+#[spec("inbox/probe/057")]
+#[test]
+fn probe_057_live_cap_dropped_undecided_tool_and_armed_helpers() {
+    for history in ["undecided", "tool", "armed"] {
+        for cap in if history == "undecided" {
+            &[1, 2][..]
+        } else {
+            &[1][..]
+        } {
+            let f = Fixture::start("claude");
+            f.control("records-policy:authority");
+            f.control(&format!("records-cap:{cap}"));
+            f.setting("editor-mode", "wait");
+            let mut human = f.connect();
+            human.write("\x07");
+            f.wait("editor-started");
+            assert!(
+                common::wait_until(WAIT, || f.scope() == "closed"),
+                "Authority keeps the first observed running editor's scope closed"
+            );
+            let pause = (history == "undecided").then(|| f.pause_helper());
+            // Publish a liability to enable the real census. For the Armed-only
+            // row, let IPC provide that no-editor fact before any scan could
+            // drop an undecided sighting of this same helper.
+            if history == "armed" {
+                f.control("observer-hold");
+                wait_span(Duration::from_millis(200));
+            }
+            f.control("publish");
+            let first = live::read_json(&f.path("editor-started"));
+            let export = std::path::Path::new(first["path"].as_str().unwrap())
+                .with_file_name("claude-prompt-00000000-0000-4000-8000-000000000057.md");
+            fs::write(&export, "second helper").unwrap();
+            let reply = f.command(json!({"action":"parallel-helper", "path":export,
+            "tool":history == "tool", "pause":history == "undecided"}));
+            assert!(
+                reply["pid"].as_u64().is_some(),
+                "a second real child: {reply}"
+            );
+            if history == "undecided" {
+                let expected = if *cap == 1 { "open" } else { "pending" };
+                assert!(
+                    common::wait_until(WAIT, || f.scope() == expected),
+                    "cap {cap}: the undecided scan must be {expected}"
+                );
+            } else {
+                assert!(
+                    common::wait_until(WAIT, || fs::read_to_string(f.path("parallel-trace"))
+                        .unwrap_or_default()
+                        .contains(if history == "tool" {
+                            "branch Tool"
+                        } else {
+                            "branch Armed"
+                        })),
+                    "{history}: second helper must reach its actual decision"
+                );
+                assert_eq!(
+                    f.scope(),
+                    if history == "tool" { "open" } else { "closed" },
+                    "{history}"
+                );
+            }
+            // Once the native key's quiet deadline is past, this capped
+            // history must still refuse a check while its first helper waits.
+            wait_span(
+                dot_agent_deck::composer_probe::query_ledger::T_TRIGGER + Duration::from_millis(50),
+            );
+            let before = f.page();
+            let probe = f.probe();
+            assert_eq!(
+                probe["composer_probe"]["outcome"], "refused",
+                "{history}: {probe}"
+            );
+            assert_eq!(f.page(), before, "{history}: refusal publishes no probe");
+            f.stable(b"\x07");
+            assert!(!f.path("helper-started-2").exists());
+            if let Some(pause) = pause {
+                f.remove("pause-helper");
+                pause.release();
+            }
+            f.flag("editor-go");
+            f.wait("parallel-result");
+            f.control("observer-go");
+            f.wait("helper-exited-1");
+        }
     }
 }

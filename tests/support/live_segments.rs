@@ -122,7 +122,7 @@ impl Fixture {
         let editor = checked_replace(
             &editor,
             "path.write_bytes(b'EDITED",
-            "if mode == 'survivor':\n    survivor = os.fork()\n    if survivor == 0:\n        deadline = time.monotonic() + 120\n        while not Path(base + '.survivor-go').exists() and time.monotonic() < deadline: time.sleep(.005)\n        os._exit(0)\n    Path(base + '.survivor-pid').write_text(str(survivor))\npath.write_bytes(b'EDITED",
+            "if mode == 'survivor':\n    survivor = os.fork()\n    if survivor == 0:\n        deadline = time.monotonic() + 30\n        while not Path(base + '.survivor-go').exists() and time.monotonic() < deadline: time.sleep(.005)\n        os._exit(0)\n    Path(base + '.survivor-pid').write_text(str(survivor))\npath.write_bytes(b'EDITED",
         );
         executable(&native.join("editor"), &editor);
         executable(&native.join("broker"), BROKER);
@@ -506,7 +506,17 @@ pub fn native_entry() {
     let mut running: Option<Child> = None;
     let mut finished: Option<i32> = None;
     let mut invocation = 0;
+    let mut parallel: Option<Child> = None;
     loop {
+        if let Some(child) = parallel.as_mut()
+            && let Some(status) = child.try_wait().unwrap()
+        {
+            atomic(
+                &base.with_extension("parallel-result"),
+                &json!({"code":status.code(),"signal":status.signal()}),
+            );
+            parallel = None;
+        }
         if let Some(child) = running.as_mut()
             && let Some(status) = child.try_wait().unwrap()
         {
@@ -621,6 +631,7 @@ pub fn native_entry() {
         if let Ok(data) = fs::read(base.with_extension("command")) {
             fs::remove_file(base.with_extension("command")).unwrap();
             let cmd: Value = serde_json::from_slice(&data).unwrap();
+            let mut reply = json!({"ok":true});
             if cmd["action"] == "emit" {
                 let bytes: Vec<u8> = serde_json::from_value(cmd["bytes"].clone()).unwrap();
                 std::io::stdout().write_all(&bytes).unwrap();
@@ -633,7 +644,38 @@ pub fn native_entry() {
                 assert!(path.starts_with(std::env::var_os("HOME").unwrap()));
                 atomic(&base.with_extension("invoke"), &json!({"path":path}));
             }
-            atomic(&base.with_extension("response"), &json!({"ok":true}));
+            if cmd["action"] == "parallel-helper" {
+                // Keep the first real helper alive while a second helper
+                // reaches the observer's actual record cap. Its parent is
+                // this native stand-in, or an explicit tool shell.
+                assert!(parallel.is_none());
+                let path = PathBuf::from(cmd["path"].as_str().unwrap());
+                assert!(path.starts_with(std::env::var_os("HOME").unwrap()));
+                let mut command = if cmd["tool"] == true {
+                    let mut command = Command::new("/bin/sh");
+                    command.args(["-c", "\"$@\"; code=$?; exit \"$code\"", "parallel-tool"]);
+                    command.arg(&helper);
+                    command
+                } else {
+                    Command::new(&helper)
+                };
+                command.envs(env.clone()).env(
+                    "DOT_AGENT_DECK_E2E_HELPER_TRACE",
+                    base.with_extension("parallel-trace"),
+                );
+                if cmd["pause"] == true {
+                    command
+                        .env(
+                            "DOT_AGENT_DECK_E2E_HELPER_PAUSE",
+                            base.with_extension("helper-fifo"),
+                        )
+                        .env("DOT_AGENT_DECK_E2E_HELPER_PAUSE_AT", "start");
+                }
+                let child = command.arg(path).spawn().unwrap();
+                reply["pid"] = json!(child.id());
+                parallel = Some(child);
+            }
+            atomic(&base.with_extension("response"), &reply);
         }
         if composer.try_wait().unwrap().is_some() {
             break;
@@ -641,6 +683,10 @@ pub fn native_entry() {
         std::thread::sleep(Duration::from_millis(5));
     }
     if let Some(mut child) = running {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    if let Some(mut child) = parallel {
         let _ = child.kill();
         let _ = child.wait();
     }

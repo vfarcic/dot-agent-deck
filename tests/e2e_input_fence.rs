@@ -47,12 +47,17 @@ fn released_hashes() {
 }
 
 fn ask_recorder(f: &Fixture, id: &str) -> question::PendingQuestion {
-    let q = serde_json::json!({
+    ask_recorder_count(f, id, 1)
+}
+
+fn ask_recorder_count(f: &Fixture, id: &str, count: usize) -> question::PendingQuestion {
+    let mut q = serde_json::json!({
         "id": id, "kind": "choice", "channel": "keys", "raised_at_ms": 1,
         "questions": [{"prompt": "Which colour?", "multi_select": false,
             "options": [{"index": 1, "label": "Green", "role": "choice"},
                         {"index": 2, "label": "Blue", "role": "choice"}]}],
     });
+    q["questions"] = serde_json::json!(vec![q["questions"][0].clone(); count]);
     assert!(
         serde_json::from_value::<question::PendingQuestion>(q.clone())
             .unwrap()
@@ -631,6 +636,140 @@ fn question_answer_023_a_full_fence_refuses_the_answer_without_a_digit() {
 }
 
 // tester: S-20 end
+
+/// Scenario: Accept a tokened three-key answer behind a real daemon fence, then fail the writer before any byte, after a one-byte budget, or after the first completed key job. Check the exact terminal prefix, one matching WriteFailed or Partial settlement and cleared queued state; with nothing written the same question must accept a retry, while an earlier completed key makes the old question keyboard-only and a fresh question remains answerable.
+#[spec("question/answer/023")]
+#[test]
+fn question_answer_023_held_faults_settle_the_exact_written_prefix() {
+    for (plan, prefix, outcome) in [
+        (
+            "skip=0,accept=0",
+            b"".as_slice(),
+            question::SettlementOutcome::WriteFailed,
+        ),
+        (
+            "skip=0,accept=1",
+            b"1".as_slice(),
+            question::SettlementOutcome::Partial,
+        ),
+        (
+            "skip=1,accept=0",
+            b"1".as_slice(),
+            question::SettlementOutcome::Partial,
+        ),
+    ] {
+        let f = Fixture::questions();
+        let _attached = f.connect();
+        f.hook_event("session_start", None);
+        let q = ask_recorder_count(&f, "held-writer-fault", 3);
+        f.fence();
+        let socket = f.answer_socket();
+        let id = f.agent_id().to_owned();
+        let old_revision = q.revision;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let task = runtime.spawn(async move {
+            dot_agent_deck::daemon_client::DaemonClient::new(socket)
+                .answer_question_with_token_while(
+                    || true,
+                    &id,
+                    &q.id,
+                    q.revision,
+                    (0..3)
+                        .map(|question_index| question::QuestionAnswer {
+                            question_index,
+                            option_indices: vec![1],
+                            text: None,
+                        })
+                        .collect(),
+                    false,
+                    Some(3723),
+                )
+                .await
+        });
+        f.wait_held(1, 0);
+        assert!(f.live().unwrap().pending_question.unwrap().answer_queued);
+        f.require_control(&format!("writer-fault:jobs=answer,{plan}"));
+        f.release();
+        let reply = runtime
+            .block_on(async { tokio::time::timeout(common::child_boot_budget(), task).await })
+            .expect("the failed held answer must complete")
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                reply,
+                dot_agent_deck::daemon_client::AnswerReport::Refused(
+                    question::AnswerRefusal::WriteFailed { .. }
+                )
+            ),
+            "{plan}: {reply:?}"
+        );
+        f.expect_input(prefix);
+        f.expect_stable_input(prefix);
+        let live = f.live().unwrap();
+        let own: Vec<_> = live
+            .answer_settlements
+            .iter()
+            .filter(|s| s.client_token == 3723)
+            .collect();
+        assert_eq!(own.len(), 1, "{plan}: exactly one token settlement");
+        assert_eq!(own[0].question_id, "held-writer-fault");
+        assert_eq!(Some(own[0].revision), old_revision);
+        assert_eq!(own[0].outcome, outcome, "{plan}");
+        let pending = live.pending_question.unwrap();
+        assert!(!pending.answer_queued, "{plan}: queued flag cleared");
+        assert_eq!(
+            pending.channel == question::AnswerChannel::Unsupported,
+            !prefix.is_empty(),
+            "{plan}: an earlier completed key makes the remaining question keyboard-only"
+        );
+        f.require_control("writer-fault:off");
+        // Retry the exact same question/revision when nothing was written:
+        // registering a replacement could itself discard a stale reservation.
+        let fresh = if prefix.is_empty() {
+            pending
+        } else {
+            ask_recorder(&f, "after-held-writer-fault")
+        };
+        let report = runtime
+            .block_on(
+                dot_agent_deck::daemon_client::DaemonClient::new(f.answer_socket())
+                    .answer_question_with_token_while(
+                        || true,
+                        f.agent_id(),
+                        &fresh.id,
+                        fresh.revision,
+                        (0..fresh.questions.len() as u32)
+                            .map(|question_index| question::QuestionAnswer {
+                                question_index,
+                                option_indices: vec![1],
+                                text: None,
+                            })
+                            .collect(),
+                        false,
+                        Some(3724),
+                    ),
+            )
+            .unwrap();
+        assert_eq!(
+            report,
+            dot_agent_deck::daemon_client::AnswerReport::Answered,
+            "{plan}: the old reservation must not block the retry/fresh question"
+        );
+        let expected = [prefix, vec![b'1'; fresh.questions.len()].as_slice()].concat();
+        f.expect_input(&expected);
+        f.expect_stable_input(&expected);
+        assert_eq!(
+            f.live()
+                .unwrap()
+                .answer_settlements
+                .iter()
+                .filter(|s| s.client_token == 3723)
+                .count(),
+            1
+        );
+    }
+}
 
 // S-16's oracle is OSC syntax plus the script's query history, not the
 // production tokenizer or the paste-mode tracker's parity with vt100.
