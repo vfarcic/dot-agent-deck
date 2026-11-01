@@ -88,6 +88,21 @@ export const INBOX_WORDS = {
    */
   inputNotDelivered: "not delivered: your held typing; restarting the agent discarded it. Type it again if you still need it.",
   /**
+   * PRD #1666 part 3 (Q15-2): a refused input's words, by the daemon's
+   * reason (`""` for none). The tile's notice is written into the terminal
+   * by the desktop's Rust side from `inbox_display::input_rejected`, the
+   * TUI's status line from the same function; they are listed here because
+   * this table mirrors the whole shared fixture.
+   */
+  inputRejected: {
+    "history-only": "Input not delivered: session is history-only",
+    exited: "Input not delivered: the agent has exited",
+    "write-failed": "Input not delivered: the agent's terminal did not take it",
+    stale: "Input not delivered: the pane's session changed",
+    "wrong-session": "Input not delivered: the pane's session changed",
+    "": "Input not delivered",
+  },
+  /**
    * The two holds that warn even with nothing waiting, in the words they
    * take then.
    */
