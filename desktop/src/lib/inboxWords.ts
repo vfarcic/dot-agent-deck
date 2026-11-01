@@ -325,9 +325,17 @@ export function deckAttentionText(agents: readonly AgentSession[]): string | und
   return others > 0 ? `${INBOX_WORDS.glyph} ${others} ${INBOX_WORDS.attentionHeld}` : undefined;
 }
 
-/** Whether the notice row is the hold's, so the badge keeps only the count. */
+/**
+ * Whether the notice row is the hold's, so the badge keeps only the count:
+ * `inboxHoldText` has words and none of the checks `inboxNotice` makes before
+ * it holds — the agent notice, a refused request, an integration notice,
+ * paused hand-outs, uncertain, not-started and held-long messages. One added
+ * to `inboxNotice` ahead of the hold belongs here too (and in the TUI's
+ * `CardInbox::hold_in_notice`), or the hold's words show nowhere.
+ */
 function holdInNotice(inbox: AgentInbox): boolean {
   return inboxHoldText(inbox) !== undefined
+    && !inbox.agentNotice
     && inbox.admissionRefused === undefined
     && inbox.integration === undefined
     && inbox.evidencePaused === undefined

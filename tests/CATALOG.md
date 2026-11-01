@@ -11673,6 +11673,13 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** a released binary run against this one (the cross-version job), or new recovery/voice controls.
 - **Platform coverage:** all.
 
+##### inbox/status/035 — An agent notice on the card leaves the held doorbell's words on the inbox line.
+- **Layer:** L1 (`tests/render_dashboard.rs`), TestBackend card render from the daemon's record seam; Fast (`src/inbox_display.rs`, `card_cases_match_the_shared_fixture`); desktop (`desktop/src/lib/inboxWords.test.ts`, the same cases from `tests/fixtures/inbox-card-cases.json`; `desktop/src/components/AgentNotice.test.tsx`, the tile).
+- **Agent:** none.
+- **Asserts:** an idle card with two waiting messages, a `cannot_type` hold and the daemon's agent notice shows the agent notice on its notice row and `✉2 queued` on its inbox line, not the bare `✉2`, in the TUI card and the desktop tile; with the hold stalled as well the line reads `✉3 waiting to wake: send it a prompt`. Without the agent notice, or with an empty one, the notice row says why the doorbell holds and the line keeps only the count (control). The TUI and the desktop read the same cases from the shared fixture.
+- **Does not assert:** when the daemon sets an agent notice (`inbox/opencode/061`–`063`), or the header's attention item, which gives the hold's words whatever the card's notice row shows.
+- **Platform coverage:** all.
+
 ##### inbox/claude/001 — Supported Claude installs one status handler and one day-long native waiter per managed event.
 - **Layer:** Fast CLI (`tests/inbox_claude.rs`), isolated HOME and version stub, no daemon or credential.
 - **Agent:** none.

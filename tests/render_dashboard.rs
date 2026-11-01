@@ -850,6 +850,42 @@ fn status_030_card_says_why_the_doorbell_holds() {
     }
 }
 
+/// Scenario: Render an idle card whose daemon summary has two waiting messages, a held doorbell (`cannot_type`) and the daemon's agent notice about the way the agent runs. The notice row shows the agent notice and the status line keeps the queued words, as the desktop tile does; without the agent notice the row says why the doorbell holds and the line keeps only the count.
+#[spec("inbox/status/035")]
+#[test]
+fn status_035_an_agent_notice_leaves_the_hold_its_line() {
+    let words = inbox_display_words();
+    let glyph = words["glyph"].as_str().unwrap();
+    let notice = dot_agent_deck::agent_notice::OPENCODE_SHARED_SERVICE;
+    let held = serde_json::json!({"queued": 2, "wake_hold": "cannot_type"});
+    let mut with_notice = held.clone();
+    with_notice["agent_notice"] =
+        serde_json::json!({"kind": "opencode_shared_service", "text": notice});
+    let queued_line = format!("{glyph}2 {}", words["queued"].as_str().unwrap());
+    let hold_row = format!(
+        "{glyph}2 {}",
+        words["wakeHolds"]["cannot_type"].as_str().unwrap()
+    );
+    let rendered = probe_card_updates(&[(serde_json::json!({}), with_notice.clone())]).remove(0);
+    assert!(
+        rendered.contains(notice),
+        "the notice row shows the agent notice:\n{rendered}"
+    );
+    assert!(
+        rendered.contains(&queued_line),
+        "the line keeps the hold's words, {queued_line:?}, not the bare count:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains(&hold_row),
+        "the agent notice has the row:\n{rendered}"
+    );
+    // Control: the same hold without the agent notice keeps the row.
+    let control = probe_card_updates(&[(serde_json::json!({}), held)]).remove(0);
+    assert!(control.contains(&hold_row), "{control}");
+    assert!(!control.contains(&queued_line), "{control}");
+    insta::assert_snapshot!(inbox_hold_card(with_notice));
+}
+
 /// Feed real wire snapshots through one client's hydration path, preserving the
 /// same card between updates so clearing a field must clear its visible copy.
 fn probe_card_updates(updates: &[(serde_json::Value, serde_json::Value)]) -> Vec<String> {

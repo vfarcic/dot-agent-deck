@@ -1133,10 +1133,17 @@ impl CardInbox {
         )
     }
 
-    /// Whether the notice row is the hold's ([`Self::notice_text`] reaches
-    /// [`Self::hold_text`]), so the inbox line keeps only the count.
+    /// Whether the notice row is the hold's, so the inbox line keeps only the
+    /// count: [`Self::hold_text`] has words and none of the checks
+    /// [`Self::notice_text`] makes before it holds — the agent notice
+    /// (absent or empty), a refused request, an integration notice, paused
+    /// hand-outs, uncertain, not-started and held-long messages. Those
+    /// checks are repeated here in the same order; one added to
+    /// `notice_text` ahead of the hold belongs here too (and in the
+    /// desktop's `holdInNotice`), or the hold's words show nowhere.
     fn hold_in_notice(&self) -> bool {
         self.hold_text().is_some()
+            && self.agent_notice.as_deref().is_none_or(str::is_empty)
             && self.admission_refused.is_none()
             && self.integration.is_none()
             && self.evidence_paused.is_none()
@@ -1522,6 +1529,37 @@ mod tests {
             exited.words(),
             "the command started in the agent's pane exited (code 7) before taking this message"
         );
+    }
+
+    /// PRD #1666 part 3 (merge review U2): the card's line and notice row for
+    /// each case of `tests/fixtures/inbox-card-cases.json`, which the
+    /// desktop's `inboxWords.test.ts` reads too (CLAUDE.md rule 22). An agent
+    /// notice takes the row ahead of a held doorbell, so the line keeps the
+    /// hold's words instead of the bare count.
+    #[test]
+    fn card_cases_match_the_shared_fixture() {
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/inbox-card-cases.json")).unwrap();
+        let cases = cases.as_array().unwrap();
+        assert!(!cases.is_empty());
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let card = CardInbox {
+                pending: case["pending"].as_u64().unwrap() as usize,
+                stalled: case["stalled"].as_bool().unwrap_or(false),
+                hold: case
+                    .get("hold")
+                    .map(|hold| serde_json::from_value(hold.clone()).unwrap()),
+                agent_notice: case["agentNotice"].as_str().map(str::to_string),
+                ..CardInbox::default()
+            };
+            assert_eq!(card.full_text().as_deref(), case["line"].as_str(), "{name}");
+            assert_eq!(
+                card.notice_text().as_deref(),
+                case["notice"].as_str(),
+                "{name}"
+            );
+        }
     }
 
     /// The words are the ones the desktop reads from the shared fixture.
