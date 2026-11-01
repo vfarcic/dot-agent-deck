@@ -492,7 +492,7 @@ fn probe_046_attached_dashboard_shows_clears_and_retires_held_typing() {
     f.stable(b"");
 }
 
-/// Scenario: Invoke the user's editor through the installed helper or directly without that helper and read the epoch around its output pair. In the fast direct case, hold observer passes until the editor and native parent have acknowledged exit and return; the unmatched external edit must still move the foreign epoch once without an empty observation clearing it.
+/// Scenario: Invoke the user's editor through the installed helper or directly without that helper and read the epoch around its output pair. The unmatched external edit must move the foreign epoch once without an empty observation clearing it; the fast direct row requests an observer hold but cannot establish exit before the first scan until that control acknowledges quiescence.
 #[spec("inbox/probe/048")]
 #[test]
 fn probe_048_unreported_and_fast_external_edits_move_the_foreign_epoch() {
@@ -503,7 +503,8 @@ fn probe_048_unreported_and_fast_external_edits_move_the_foreign_epoch() {
         }
         let held_passes = fast.then(|| {
             f.control("observer-hold");
-            // An already-running pass may finish after hold is requested.
+            // Provisional: elapsed time cannot acknowledge quiescence. The
+            // exit-before-first-scan claim remains UNVERIFIED in the catalog.
             wait_span(Duration::from_millis(200));
             f.control("observer-status")["composer_observer"]["passes"]
                 .as_u64()
@@ -524,7 +525,7 @@ fn probe_048_unreported_and_fast_external_edits_move_the_foreign_epoch() {
             let status = f.control("observer-status");
             assert_eq!(
                 status["composer_observer"]["passes"], passes,
-                "the editor exited before an observer pass: {status}"
+                "no observer pass completed during the measured editor interval: {status}"
             );
             f.control("observer-go");
         }
@@ -910,10 +911,12 @@ fn probe_059_automatic_retry_after_a_due_admission_failure() {
     );
 }
 
-/// Scenario: Queue ordinary mail behind a draft and fail the live writer's check bytes, advancing each pending retry deadline through the third failure and one more. The production tick must continue attempting checks while Broken, then write one probe and run its helper when the fault is cleared and the next deadline is advanced.
+/// Scenario: Queue ordinary mail behind a draft and fail the live writer's check bytes, advancing each pending retry deadline through the production backoff steps and their final repeated delay. The production tick must continue attempting checks while Broken, then write one probe and run its helper when the fault is cleared and the next deadline is advanced.
 #[spec("inbox/probe/059")]
 #[test]
 fn probe_059_automatic_retries_continue_through_broken() {
+    use dot_agent_deck::composer_probe::probe::{BACKOFF, BACKOFF_LAST, BROKEN_AFTER};
+
     let f = Fixture::start("claude");
     f.hook_event("session_start");
     f.hook_event("idle");
@@ -928,7 +931,8 @@ fn probe_059_automatic_retries_continue_through_broken() {
         "{first}"
     );
     f.enqueue();
-    for (failures, delay) in [(1, 30000), (2, 120000), (3, 600000), (4, 1800000)] {
+    for (index, delay) in BACKOFF.into_iter().chain([BACKOFF_LAST]).enumerate() {
+        let failures = u32::try_from(index + 1).unwrap();
         assert!(common::wait_until(
             WAIT,
             || f.control("schedule-status")["composer_schedule"]["failures"] == failures
@@ -936,7 +940,7 @@ fn probe_059_automatic_retries_continue_through_broken() {
         let status = f.control("schedule-status");
         assert_eq!(
             status["composer_schedule"]["broken"],
-            failures >= 3,
+            failures >= BROKEN_AFTER,
             "{status}"
         );
         assert_eq!(status["composer_schedule"]["due"], false, "{status}");
@@ -946,10 +950,10 @@ fn probe_059_automatic_retries_continue_through_broken() {
             "each due retry must actually reach the writer"
         );
         f.stable(b"draft");
-        if failures == 4 {
+        if index == BACKOFF.len() {
             f.control("writer-fault:off");
         }
-        f.control(&format!("schedule-advance:{delay}"));
+        f.control(&format!("schedule-advance:{}", delay.as_millis()));
     }
     f.wait("helper-exited-1");
     f.expect(b"draft\x07");
@@ -1024,7 +1028,7 @@ fn probe_061_live_slot_split_and_saturation_permutations() {
     }
 }
 
-/// Scenario: During a delayed live check, send OSC 10/11 replies with retained or saturated-away queries, BEL or ST endings, and whole or split frames, followed by typing. With a second liability present, a candidate's Armed helper and real return must automatically complete HumanG, proven by a following Ctrl+G reaching its user's editor; report controls deliver the typing without a second helper.
+/// Scenario: During a delayed live check, send OSC 10/11 replies with retained or saturated-away queries, BEL or ST endings, and whole or split frames, followed by typing. With a second liability present, a candidate's Armed helper and real return must automatically complete HumanG, proven by a following Ctrl+G reaching its user's editor; report controls deliver the typing before the first return without a second helper.
 #[spec("inbox/probe/061")]
 #[test]
 fn probe_061_in_check_osc_candidates_complete_without_manual_release() {
@@ -1081,6 +1085,23 @@ fn probe_061_in_check_osc_candidates_complete_without_manual_release() {
                     // Only the next candidate must wait for this return.
                     if candidate {
                         f.wait_held();
+                    } else {
+                        let expected =
+                            [b"\x07".as_slice(), reply.as_bytes(), b"OSC-EDITOR\n"].concat();
+                        // The matching decision has arrived, but its return
+                        // is still withheld. The composer cannot read while
+                        // its broker waits, so inspect the real tty queue now
+                        // and verify the exact capture after its return.
+                        assert_eq!(f.input(), b"\x07");
+                        let pending = expected.len() - 1;
+                        assert!(
+                            common::wait_until(WAIT, || {
+                                f.command(json!({"action":"input-pending"}))["pending_bytes"]
+                                    == pending
+                            }),
+                            "report and ordinary typing must reach the tty before resume-go-1"
+                        );
+                        assert!(!f.path("composer-return-1").exists());
                     }
                     f.flag("resume-go-1");
                     let context =
@@ -1412,7 +1433,7 @@ fn probe_057_tool_and_unknown_family_helpers_leave_liability_unconsumed() {
     }
 }
 
-/// Scenario: Select Authority policy and a one-record cap before observation, then keep a real unarmed editor/helper alive in that slot while a second native or tool helper arrives. A dropped undecided sighting or tool decision opens the writer scope, whereas an Armed helper-only decision leaves it closed; each live cap must refuse a new probe without a check byte, and a two-slot control keeps the undecided sighting Pending instead of opening scope.
+/// Scenario: Select Authority policy and a one-record cap before observation, then keep a real unarmed editor/helper alive in that slot while a second native or tool helper arrives. A dropped undecided sighting or tool decision opens the writer scope, each one-slot cap refuses a new probe with RecordCap without a check byte, and a two-slot control keeps the undecided sighting Pending. The Armed-only ordering remains provisional until the observer hold acknowledges quiescence and a status witness distinguishes dropping its decision from retaining it.
 #[spec("inbox/probe/057")]
 #[test]
 fn probe_057_live_cap_dropped_undecided_tool_and_armed_helpers() {
@@ -1435,10 +1456,11 @@ fn probe_057_live_cap_dropped_undecided_tool_and_armed_helpers() {
             );
             let pause = (history == "undecided").then(|| f.pause_helper());
             // Publish a liability to enable the real census. For the Armed-only
-            // row, let IPC provide that no-editor fact before any scan could
-            // drop an undecided sighting of this same helper.
+            // row, request scans held while IPC provides the no-editor fact;
+            // ordering still needs the quiescence control noted below.
             if history == "armed" {
                 f.control("observer-hold");
+                // Provisional until observer-hold acknowledges quiescence.
                 wait_span(Duration::from_millis(200));
             }
             f.control("publish");
@@ -1469,11 +1491,20 @@ fn probe_057_live_cap_dropped_undecided_tool_and_armed_helpers() {
                         })),
                     "{history}: second helper must reach its actual decision"
                 );
-                assert_eq!(
-                    f.scope(),
-                    if history == "tool" { "open" } else { "closed" },
-                    "{history}"
-                );
+                if history == "tool" {
+                    assert!(
+                        common::wait_until(WAIT, || f.scope() == "open"),
+                        "Tool's processed decision must open scope"
+                    );
+                } else {
+                    assert!(
+                        common::wait_until(WAIT, || fs::read_to_string(f.path("parallel-trace"))
+                            .unwrap_or_default()
+                            .contains("armed Some(")),
+                        "Armed helper must receive the daemon's invocation reply"
+                    );
+                    assert_eq!(f.scope(), "closed", "{history}");
+                }
             }
             // Once the native key's quiet deadline is past, this capped
             // history must still refuse a check while its first helper waits.
@@ -1486,6 +1517,12 @@ fn probe_057_live_cap_dropped_undecided_tool_and_armed_helpers() {
                 probe["composer_probe"]["outcome"], "refused",
                 "{history}: {probe}"
             );
+            if *cap == 1 {
+                assert_eq!(
+                    probe["composer_probe"]["reason"], "Records(RecordCap)",
+                    "{history}: the one-slot cap must cause the refusal: {probe}"
+                );
+            }
             assert_eq!(f.page(), before, "{history}: refusal publishes no probe");
             f.stable(b"\x07");
             assert!(!f.path("helper-started-2").exists());

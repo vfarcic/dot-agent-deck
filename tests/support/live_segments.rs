@@ -637,6 +637,21 @@ pub fn native_entry() {
                 std::io::stdout().write_all(&bytes).unwrap();
                 std::io::stdout().flush().unwrap();
             }
+            if cmd["action"] == "input-pending" {
+                // The composer is blocked in its editor broker until the
+                // fixture releases the return. Inspect its actual tty queue
+                // without consuming keys or allowing the return through.
+                let mut pending: libc::c_int = 0;
+                // SAFETY: stdin is this sandbox agent's slave terminal and
+                // FIONREAD writes one c_int to the valid output pointer.
+                assert_eq!(
+                    unsafe { libc::ioctl(0, libc::FIONREAD, &mut pending) },
+                    0,
+                    "pending tty bytes: {}",
+                    std::io::Error::last_os_error()
+                );
+                reply["pending_bytes"] = json!(pending);
+            }
             if cmd["action"] == "invoke" {
                 // This is real helper work by the native fixture, not an
                 // injected daemon record. The path belongs to its HOME.
