@@ -2204,25 +2204,33 @@ const v2NotePending = (inboxID, text) => {
 // session existed 0.2 s before `setup` ran, and no `session.created` reached
 // the plugin), and draws only that session. So it is found the way mini finds
 // it (2.2.5's mini resolver): `--session <id>` names it; `--continue` takes the
-// newest root session of the directory; otherwise mini created a fresh one,
-// the root session of the directory created at or after this server started.
+// newest root session of the directory; otherwise mini created a fresh one.
 // A `--fork` is a new session too.
 //
-// The lookup runs EAGERLY, as the mini receiver starts (v2ResolveMiniTarget),
-// for at most V2_MINI_RESOLVE_MS, and its answer is kept for the server's
-// life. Sessions live in OpenCode's shared storage, and 2.2.5 records nothing
-// on a session that names the server or client that created it (measured: its
-// session table has no such column), so a later root session in the same
-// directory — a second role started there a minute later, the user's own
-// OpenCode, a scheduled `opencode run` — is listed too. Looking at start, and
-// taking the OLDEST fresh root, keeps those out: mini's own session is created
-// within moments of its server starting. Only two fresh roots created within
-// V2_MINI_TIE_MS of this server's start (two minis started together) are
-// ambiguous; then, or when nothing is found in time, the plugin delivers
-// nothing and reports each message not handed, so the deck keeps it and shows
-// it as undelivered rather than it reaching another pane's session.
+// A fresh session is bound by WHEN it was created, not by its order:
+// sessions live in OpenCode's shared storage, and 2.2.5 records nothing on a
+// session that names the server or client that created it (measured: its
+// session table has no such column), so another root session in the same
+// directory (a second mini, the user's own OpenCode, a scheduled `opencode
+// run`) is listed too. The candidates are the root sessions of the directory
+// created between this server's start and the moment the mini receiver
+// started (`setupAt`, v2ResolveMiniTarget), plus V2_MINI_SLACK_MS. Mini's own
+// session falls there because mini creates it before `setup` (the 0.2 s
+// above), whatever the box's load. Exactly one candidate is mini's session.
+// More than one (another mini started in the same directory while this one
+// booted) cannot be told apart: the plugin delivers nothing and reports each
+// message not handed, so the deck keeps it and shows it as undelivered rather
+// than it reaching another pane's session. None found within
+// V2_MINI_RESOLVE_MS: no root is taken by age; a `session.created` this
+// plugin observes (observeInboxV2) still names mini's session.
+//
+// The residual, not measured: a sibling created inside the same window is
+// indistinguishable from mini's own, which is why it is refused rather than
+// guessed; and a mini whose own session is listed only after
+// V2_MINI_RESOLVE_MS, or created later than V2_MINI_SLACK_MS after `setup`,
+// gets no deck messages until it restarts.
 const V2_MINI_RESOLVE_MS = 5000;
-const V2_MINI_TIE_MS = 2000;
+const V2_MINI_SLACK_MS = 500;
 const v2ClientFlag = (args, long, short) => {
   for (let n = 0; n < args.length; n++) {
     const arg = args[n];
@@ -2233,7 +2241,8 @@ const v2ClientFlag = (args, long, short) => {
 };
 // One look: `{ id }` when mini's session is known, `{ ambiguous: n }` when it
 // cannot be told from another one, undefined while it may still appear.
-const v2FindMiniTarget = async (ctx, started) => {
+// `started` is this server's start, `setupAt` the mini receiver's.
+const v2FindMiniTarget = async (ctx, started, setupAt) => {
   const args = v2ClientArgs() ?? [];
   const fork = args.includes("--fork");
   const named = v2ClientFlag(args, "--session", "-s");
@@ -2246,17 +2255,14 @@ const v2FindMiniTarget = async (ctx, started) => {
   if (!fork && (args.includes("--continue") || args.includes("-c"))) {
     return roots[0] ? { id: roots[0].id } : undefined;
   }
-  const fresh = roots
-    .filter((s) => typeof s.time?.created === "number" && s.time.created >= started)
-    .sort((a, b) => a.time.created - b.time.created);
-  if (!fresh.length) return undefined;
-  const window = started + V2_MINI_TIE_MS;
-  const together = fresh.filter((s) => s.time.created <= window).length;
-  if (together > 1) return { ambiguous: together };
-  // Another mini started with this one may still create its session inside
-  // the window.
-  if (Date.now() <= window) return undefined;
-  return { id: fresh[0].id };
+  const closes = setupAt + V2_MINI_SLACK_MS;
+  const candidates = roots.filter(
+    (s) => typeof s.time?.created === "number" && s.time.created >= started && s.time.created <= closes,
+  );
+  if (candidates.length > 1) return { ambiguous: candidates.length };
+  // A session created inside the window may still be listed until it closes.
+  if (candidates.length === 1 && Date.now() > closes) return { id: candidates[0].id };
+  return undefined;
 };
 let v2MiniResolution;
 const v2MiniNote = (text) => {
@@ -2264,21 +2270,23 @@ const v2MiniNote = (text) => {
     console.error(`dot-agent-deck: ${text}`);
   } catch (_) {}
 };
-// Mini's session, looked up once: a promise of its id, or of undefined when
-// it is ambiguous or was not found within V2_MINI_RESOLVE_MS. A
-// `session.created` this plugin sees (observeInboxV2) answers it too.
+// Mini's session, looked up once, from the moment the mini receiver starts
+// (`setupAt`): a promise of its id, or of undefined when it is ambiguous or
+// was not found within V2_MINI_RESOLVE_MS. A `session.created` this plugin
+// sees (observeInboxV2) answers it too.
 const v2ResolveMiniTarget = (ctx) => {
   if (v2MiniResolution) return v2MiniResolution;
+  const setupAt = Date.now();
   v2MiniResolution = (async () => {
-    const started = typeof performance === "object" ? performance.timeOrigin : Date.now();
-    const deadline = Date.now() + V2_MINI_RESOLVE_MS;
+    const started = typeof performance === "object" ? performance.timeOrigin : setupAt;
+    const deadline = setupAt + V2_MINI_RESOLVE_MS;
     const directory = ctx?.location?.directory ?? process.cwd();
     for (;;) {
       if (miniTarget) return miniTarget;
       if (typeof ctx?.session?.list === "function") {
         let found;
         try {
-          found = await v2FindMiniTarget(ctx, started);
+          found = await v2FindMiniTarget(ctx, started, setupAt);
         } catch (_) {}
         if (miniTarget) return miniTarget;
         if (found?.id) {
@@ -11730,12 +11738,12 @@ console.log(JSON.stringify({ prompts, lists: lists.length }));"#;
         }
     }
 
-    /// Scenario (PRD #2050, review B2 and the round-3 re-review F1): two
-    /// OpenCode 2 minis start in one directory within a second of each other,
-    /// so this mini's server lists the other's fresh root session beside its
-    /// own, both inside the window after its start. The plugin cannot tell
-    /// which is its own, so it prompts neither and reports the deck's message
-    /// not handed, which leaves it with the deck rather than looping on it.
+    /// Scenario (PRD #2050, review B2): two OpenCode 2 minis start in one
+    /// directory, and both create their sessions, 1.4 s apart, before this
+    /// mini's receiver starts (a slow boot). Both are candidates, so the
+    /// plugin cannot tell which is its own: it prompts neither and reports
+    /// the deck's message not handed, which leaves it with the deck rather
+    /// than looping on it.
     #[cfg(target_os = "linux")]
     #[test]
     fn opencode_v2_two_minis_started_together_report_the_message_not_handed() {
@@ -11750,15 +11758,16 @@ sessions = [
   { id: "ses_other_mini", time: { created: started + 1500 }, location: { directory: "/work" } },
   { id: "ses_this_mini", time: { created: started + 100 }, location: { directory: "/work" } },
 ];
+await sleep(Math.max(0, started + 1600 - Date.now()));
 const cleanup = await pluginModule.setup(ctx);
-await sleep(2500);
+await sleep(1500);
 await cleanup();
 console.log(JSON.stringify({ prompts, lists: lists.length }));"#,
         );
         assert_eq!(
             result["prompts"],
             serde_json::json!([]),
-            "two roots inside the window are ambiguous: {result}"
+            "two roots created before setup are ambiguous: {result}"
         );
         assert!(!written.contains("\"handed\""), "{written}");
         assert!(
@@ -11767,12 +11776,79 @@ console.log(JSON.stringify({ prompts, lists: lists.length }));"#,
         );
     }
 
+    /// Scenario (PRD #2050, review R2 and audit N1): this mini's server is
+    /// slow to boot, so its own session is created 2.5 s after the server
+    /// started, while a sibling mini started a second later in the same
+    /// directory created its session at 1.3 s. This mini's receiver starts
+    /// after both. The sibling's session is older, but the plugin never takes
+    /// a session by age: it cannot tell the two apart, so it prompts neither,
+    /// and the deck's message is reported not handed instead of reaching the
+    /// sibling's session.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opencode_v2_a_slow_mini_never_takes_a_siblings_earlier_session() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let (result, written) = run_v2_mini_driver(
+            "",
+            r#"const started = performance.timeOrigin;
+sessions = [
+  { id: "ses_this_mini", time: { created: started + 2500 }, location: { directory: "/work" } },
+  { id: "ses_sibling", time: { created: started + 1300 }, location: { directory: "/work" } },
+];
+await sleep(Math.max(0, started + 2700 - Date.now()));
+const cleanup = await pluginModule.setup(ctx);
+await sleep(1500);
+await cleanup();
+console.log(JSON.stringify({ prompts }));"#,
+        );
+        assert_eq!(
+            result["prompts"],
+            serde_json::json!([]),
+            "nothing reaches the sibling's session: {result}"
+        );
+        assert!(!written.contains("\"handed\""), "{written}");
+        assert!(written.contains("\"not_handed\""), "{written}");
+    }
+
+    /// Scenario (PRD #2050, review R2): two OpenCode 2 minis start in one
+    /// directory 1.4 s apart, and this one's receiver started before the
+    /// other created its session. Only this mini's session falls in its
+    /// window, so the deck's message starts there.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opencode_v2_a_sibling_created_after_setup_is_not_a_candidate() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let (result, written) = run_v2_mini_driver(
+            "",
+            r#"const started = performance.timeOrigin;
+sessions = [
+  { id: "ses_this_mini", time: { created: started }, location: { directory: "/work" } },
+];
+const cleanup = await pluginModule.setup(ctx);
+sessions = [{ id: "ses_other_mini", time: { created: Date.now() + 1400 }, location: { directory: "/work" } }, ...sessions];
+for (let n = 0; n < 200 && !prompts.length; n++) await sleep(20);
+await sleep(100);
+await cleanup();
+console.log(JSON.stringify({ prompts }));"#,
+        );
+        let prompts = result["prompts"].as_array().cloned().unwrap_or_default();
+        assert_eq!(prompts.len(), 1, "{result}");
+        assert_eq!(prompts[0]["sessionID"], "ses_this_mini", "{result}");
+        assert!(written.contains("\"handed\""), "{written}");
+    }
+
     /// Scenario (PRD #2050, round-3 re-review F1): two OpenCode 2 minis start
     /// in one directory three seconds apart, the usual staggered orchestration
-    /// launch. The earlier mini's server lists both fresh roots and takes the
-    /// oldest, its own; the later mini's server lists the earlier one's root
-    /// as created before it started and takes its own. Each delivers into its
-    /// own session.
+    /// launch. The earlier mini's server lists both fresh roots, and only its
+    /// own was created before its receiver started; the later mini's server
+    /// lists the earlier one's root as created before it started. Each
+    /// delivers into its own session.
     #[cfg(target_os = "linux")]
     #[test]
     fn opencode_v2_two_minis_started_apart_each_take_their_own_session() {
