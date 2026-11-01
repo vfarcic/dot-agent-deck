@@ -4727,6 +4727,8 @@ pub struct ComposerDrained {
     /// `none`, `done-clean`, `done-survivors`, `done-unknown`,
     /// `spawn-failed` or `unrecognised`.
     pub report: String,
+    /// The ending reads as `WaitUnknown`; it doesn't show that a cut-off
+    /// was applied to anything held.
     pub wait_unknown: bool,
 }
 

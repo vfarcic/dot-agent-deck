@@ -602,8 +602,11 @@ impl Live {
     ///    since the boot clock counts suspend and `Instant` does not. The
     ///    output hook reads a pair's `now` after it fed the push that held
     ///    the `?2004h` (`paste_mode`), so at or after the pair's real ending.
-    ///    `probe_069` (tests/editor_observer.rs) and `tests/invocation_record.rs`
-    ///    check the two conversions; nothing checks a live helper's floor
+    ///    `probe_069_the_floor_the_refusal_the_prune_and_the_bell`
+    ///    (tests/editor_observer.rs: ticks to an `Instant`, erring early) and
+    ///    `probe_008_the_birth_floor_refuses_within_a_tick`
+    ///    (tests/invocation_record.rs: ticks to boot-clock nanoseconds,
+    ///    floored) check the two conversions; nothing checks a live helper's floor
     ///    against its birth. A floor later than the birth would let a record
     ///    miss its own pair read earlier and bank a credit for it.
     /// 2. [`Self::unexplained`] is sorted by ending: pairs reach
@@ -2184,5 +2187,68 @@ mod tests {
         assert!(!is_marker(None, b'h'), "no private marker");
         assert!(!is_marker(Some(b'>'), b'h'), "another private marker");
         assert!(!is_marker(Some(b'?'), b'l'), "another final byte");
+    }
+
+    /// Scenario: A Claude probe is written with no helper seen and lapses, and the doorbell tick counts the lapse as one failed attempt. The probe then completes with no decision ever known (the deferred settlement a completion hands over), and its settlement adds no second failure: the schedule keeps one failure and the first backoff step's deadline. A probe that never lapsed, settled the same way, counts its failure (the control).
+    #[cfg(target_os = "linux")]
+    #[spec("inbox/probe/030")]
+    #[test]
+    fn probe_030_a_lapsed_probes_completion_with_no_decision_counts_its_attempt_once() {
+        use crate::composer_probe::probe::BACKOFF;
+        use crate::composer_probe::query_ledger::T_TRIGGER;
+        use crate::composer_probe::record::{EcPolicy, RecordKey, Records};
+        let now = Instant::now();
+        let Some(at) = now.checked_sub(T_TRIGGER + std::time::Duration::from_secs(1)) else {
+            return;
+        };
+        let key = RecordKey {
+            pid: 4242,
+            start: 1,
+        };
+        let settle_undecided = |input: &GenerationInput, number: u64| {
+            let mut guard = input.state.lock_recovering();
+            let State {
+                live,
+                records,
+                epoch,
+                ..
+            } = &mut *guard;
+            live.as_mut().unwrap().settle_probe(
+                epoch,
+                records.as_ref().unwrap(),
+                (number, key, None),
+                now,
+            );
+        };
+        let failures = |input: &GenerationInput| {
+            input
+                .advance_schedule_for_e2e(std::time::Duration::ZERO, now)
+                .unwrap()
+                .1
+        };
+        let probe = |written: Instant| {
+            let input = GenerationInput::default();
+            assert!(input.attach_records(Records::new(5, EcPolicy::Hold, now)));
+            assert!(input.attach_segments(5, segments::Agent::Claude));
+            let (number, _) = input.segment_open_probe(false, now).unwrap();
+            input.segment_written(number, 0, written, now).unwrap();
+            (input, number)
+        };
+
+        let (input, number) = probe(at);
+        assert!(!input.lapse_due(0, now), "the lapse is a failure first");
+        assert_eq!(failures(&input), 1);
+        settle_undecided(&input, number);
+        assert_eq!(
+            failures(&input),
+            1,
+            "its no-decision completion is that failure"
+        );
+        assert!(!input.probe_due(now + BACKOFF[0] - std::time::Duration::from_millis(1)));
+        assert!(input.probe_due(now + BACKOFF[0]));
+
+        let (control, number) = probe(now);
+        settle_undecided(&control, number);
+        assert_eq!(failures(&control), 1, "an unlapsed probe's failure counts");
     }
 }

@@ -35,7 +35,7 @@ fn schedule(f: &Fixture, operation: &str) -> serde_json::Value {
     f.control(operation)["composer_schedule"].clone()
 }
 
-/// Scenario: Start a native Claude stand-in under the daemon and, before any observation, set its generation's EC policy to `authority` and its record cap to 1, and read both back; refuse a cap of zero and any control addressed to another generation. Hold the observer's passes: the hold answers with no pass running, and the finished count stays put until the go, then moves. Fail every PTY write and request a probe: its write fails, the schedule waits its first backoff and is not due a millisecond short of it, and is due once advanced by the rest, its failure kept. Hold the PTY writer, type, and see the keys parked unwritten until the go; then set a fault plan letting the PTY take one byte, type two, and see one written and the write failed.
+/// Scenario: Start a native Claude stand-in under the daemon, set its generation's EC policy to `authority` and its record cap to 1 before any observation and read both back, and see a cap of zero and a control addressed to another generation refused. Hold the observer's passes and then the PTY writer: no pass finishes and typed keys stay parked unwritten until each go, and a fault plan letting the PTY take one byte writes one of two typed keys and fails the write. Fail every PTY write and request a probe: its write fails, an advance short of the backoff left keeps the schedule waiting, and a whole backoff more makes it due with its failure kept.
 #[spec("inbox/probe/079")]
 #[test]
 fn probe_079_the_composer_controls_reach_a_live_generation() {
@@ -121,6 +121,9 @@ fn probe_079_the_composer_controls_reach_a_live_generation() {
         "{first}"
     );
     f.control("writer-fault:jobs=any,skip=0,accept=0");
+    // The failure is at or after this, so the wait it leaves is at least
+    // the backoff less what has passed since.
+    let before_failure = std::time::Instant::now();
     let probe = f.probe();
     assert_eq!(probe["composer_probe"]["outcome"], "refused", "{probe}");
     assert!(
@@ -131,13 +134,17 @@ fn probe_079_the_composer_controls_reach_a_live_generation() {
     f.control("writer-fault:off");
     let waiting = schedule(&f, "schedule-status");
     assert_eq!(waiting["due"], false, "the first backoff: {waiting}");
-    let backoff = u64::try_from(BACKOFF[0].as_millis()).unwrap();
-    // Half the backoff leaves it waiting, since far less than half of it
-    // passed between the failure and here; the other half makes it due.
-    let short = schedule(&f, &format!("schedule-advance:{}", backoff / 2));
-    assert_eq!(short["due"], false, "half the backoff: {short}");
-    let due = schedule(&f, &format!("schedule-advance:{}", backoff / 2));
-    assert_eq!(due["due"], true, "the whole backoff: {due}");
+    // An advance short of the least the wait can have left keeps it
+    // waiting, with a margin for the control's own round trip; a whole
+    // backoff more makes it due, however long this test has taken.
+    let margin = std::time::Duration::from_secs(5);
+    let short_by = BACKOFF[0]
+        .checked_sub(before_failure.elapsed() + margin)
+        .expect("the test reached the short advance within the backoff less its margin");
+    let short = schedule(&f, &format!("schedule-advance:{}", short_by.as_millis()));
+    assert_eq!(short["due"], false, "short of the backoff left: {short}");
+    let due = schedule(&f, &format!("schedule-advance:{}", BACKOFF[0].as_millis()));
+    assert_eq!(due["due"], true, "a whole backoff more: {due}");
     assert_eq!(
         (&due["failures"], &due["broken"]),
         (&1.into(), &false.into()),

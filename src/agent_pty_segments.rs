@@ -495,6 +495,8 @@ impl PtyWriterThread {
 /// alone refused it, if one did). O5 is availability, not safety (A1 §4.4):
 /// a pass refused only by an estimate within [`O5_WAIT`] sleeps to it, once,
 /// and passes again, so no keymap read before the sleep stands after it.
+/// The [`O5_WAIT`] bound is measured from after the ask returned, not from
+/// the instant the ask read its facts (the Q35-20dfix audit's U3-3).
 /// The last pass's answer and the keymap it asked with.
 #[cfg(target_os = "linux")]
 pub(super) async fn scheduling_reads<K, T, RF, AF>(
@@ -1831,6 +1833,31 @@ mod tests {
         (outcome, gate.status().fenced)
     }
 
+    /// Scenario: Push a Claude Code frame to a generation with no screen profile: it shows no Clean frame, so none can be marked, and learning the profile leaves it Dirty until a redraw. Push the same frame to a profiled generation and mark it: learning a profile again changes nothing and the mark still stands. So a learned profile never invalidates a marked frame, and the frame check needs no case for it (the Q35-20dfix audit's U3-4).
+    #[cfg(target_os = "linux")]
+    #[spec("inbox/probe/059")]
+    #[test]
+    fn probe_059_a_learned_profile_moves_no_marked_frame() {
+        use crate::doorbell_screen::{CLAUDE_PROFILE, CODEX_PROFILE};
+        let unprofiled = AgentBus::profiled(None, 24, 80);
+        unprofiled.push(claude_frame(80));
+        assert!(
+            unprofiled.clean_frame_marked().is_none(),
+            "no frame to mark"
+        );
+        unprofiled.adopt_profile(&CLAUDE_PROFILE);
+        assert!(
+            unprofiled.clean_frame_marked().is_none(),
+            "Dirty until a redraw"
+        );
+
+        let profiled = AgentBus::profiled(Some(&CLAUDE_PROFILE), 24, 80);
+        profiled.push(claude_frame(80));
+        let (_, mark) = profiled.clean_frame_marked().expect("a Clean frame");
+        profiled.adopt_profile(&CODEX_PROFILE);
+        assert!(profiled.frame_unchanged(mark), "a profile is kept once had");
+    }
+
     /// Scenario: Schedule a probe from a Clean frame showing Claude Code's main composer, then, before the writer's arm section, invalidate that frame by its layout alone, with no output: a resize, a nudge's shrink, a failed nudge restore. The writer comes to the section after the generation's redraw estimate (O5) has run out, and refuses the screen, closing no fence: an elapsed estimate is no replacement frame. With nothing changed, or a person's ticket admitted meanwhile, the same section admits, or refuses that ticket (R-D-U2-01, the audit's U3-7).
     #[cfg(target_os = "linux")]
     #[spec("inbox/probe/059")]
@@ -1882,7 +1909,7 @@ mod tests {
         );
     }
 
-    /// Scenario: Run the probe request's scheduling reads with a stand-in observer. With the permission pending, the settlement runs before the first keymap read, so the keymap reads settled (a keymap read before it would read Unmeasured); with nothing to settle the same read reads Unmeasured. When the first pass is refused only by the redraw estimate (O5), the request waits for it and reads the keymap again: a key binding changed during the wait is what it asks with and answers, not the one read before the wait. A second estimate refusal is answered as it is, with no second wait (R-D-U3-01, the audit's U3-6).
+    /// Scenario: Run the probe request's scheduling reads with a stand-in observer. With the permission pending, the settlement runs before the first keymap read, so the keymap reads settled (a keymap read before it would read Unmeasured); with nothing to settle the same read reads Unmeasured. When the first pass is refused only by the redraw estimate (O5), the request waits for it and reads the keymap again: a key binding changed while it waits is what it asks with and answers, not the one read before the wait. A second estimate refusal is answered as it is, with no second wait (R-D-U3-01, the audit's U3-6).
     #[cfg(target_os = "linux")]
     #[spec("inbox/probe/059")]
     #[tokio::test]
@@ -1922,34 +1949,49 @@ mod tests {
             assert_eq!(*reads.lock().unwrap(), [expected], "pending: {pending}");
             assert_eq!((asked, keymap), (expected, expected), "pending: {pending}");
         }
-        // A binding changed across the O5 wait: the second read stands.
+        // A binding changed during the O5 wait: the read after it stands.
+        // The test's runtime has one thread, so the changer, woken by the
+        // first ask, runs only once the request yields, and its only yield
+        // after that ask is the wait itself (R-DF-U3-01): a request that
+        // read the keymap again before sleeping would miss the change.
         for estimates in [1, 2] {
             let binding = Arc::new(Mutex::new(Ok::<(), Hold>(())));
+            let reads = Arc::new(AtomicUsize::new(0));
             let passes = Arc::new(AtomicUsize::new(0));
+            let first_asked = Arc::new(tokio::sync::Notify::new());
             let started = Instant::now();
-            let (asked, keymap) = scheduling_reads(
+            let request = scheduling_reads(
                 None::<std::future::Ready<()>>,
                 || {
-                    let binding = Arc::clone(&binding);
-                    async move { *binding.lock().unwrap() }
+                    let (binding, reads) = (Arc::clone(&binding), Arc::clone(&reads));
+                    async move {
+                        reads.fetch_add(1, Ordering::SeqCst);
+                        *binding.lock().unwrap()
+                    }
                 },
                 |keymap| {
-                    let (binding, passes) = (Arc::clone(&binding), Arc::clone(&passes));
+                    let (passes, first_asked) = (Arc::clone(&passes), Arc::clone(&first_asked));
                     async move {
                         let pass = passes.fetch_add(1, Ordering::SeqCst);
+                        if pass == 0 {
+                            first_asked.notify_one();
+                        }
                         // Refused by the estimate on the first `estimates`
-                        // passes; the binding changes during the first wait.
+                        // passes.
                         let estimate =
                             (pass < estimates).then(|| Instant::now() + Duration::from_millis(20));
-                        if pass == 0 {
-                            *binding.lock().unwrap() = Err(Hold::Changed);
-                        }
                         (keymap, estimate)
                     }
                 },
-            )
-            .await;
+            );
+            let changer = async {
+                first_asked.notified().await;
+                assert_eq!(reads.load(Ordering::SeqCst), 1, "waiting, not read again");
+                *binding.lock().unwrap() = Err(Hold::Changed);
+            };
+            let ((asked, keymap), ()) = tokio::join!(request, changer);
             assert_eq!(passes.load(Ordering::SeqCst), 2, "one wait, then once more");
+            assert_eq!(reads.load(Ordering::SeqCst), 2);
             assert!(started.elapsed() >= Duration::from_millis(20), "it waited");
             assert_eq!(
                 (asked, keymap),

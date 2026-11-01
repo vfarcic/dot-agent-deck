@@ -510,6 +510,45 @@ mod tests {
             assert_eq!(r.policy(), EcPolicy::Authority);
         }
 
+        /// The Q35-20c fix review's U3-2: each observation the record cap
+        /// drops counts once in its decision's bucket, and an observation of
+        /// a record already kept counts in none.
+        #[test]
+        fn each_drop_at_the_cap_counts_in_its_decisions_bucket() {
+            let t = Instant::now();
+            let mut r = Records::new(G, EcPolicy::Hold, t);
+            let mut fifo = HazardFifo::default();
+            r.configure_for_e2e(None, Some(1)).unwrap();
+            let kept = observation(t, Some(Decision::Armed));
+            r.observe(&mut fifo, &kept, t).unwrap();
+            let decisions = [
+                None,
+                Some(Decision::Armed),
+                Some(Decision::Armed),
+                Some(Decision::Unarmed),
+                Some(Decision::Tool),
+                Some(Decision::Unknown),
+            ];
+            for (pid, decision) in (100u32..).zip(decisions) {
+                let mut dropped = observation(t, decision);
+                dropped.key.pid = pid;
+                r.observe(&mut fifo, &dropped, t).unwrap();
+            }
+            r.observe(&mut fifo, &kept, t).unwrap();
+            assert_eq!(r.len(), 1);
+            let w = r.witness();
+            assert_eq!(
+                (
+                    w.cap_dropped_undecided,
+                    w.cap_dropped_armed,
+                    w.cap_dropped_unarmed,
+                    w.cap_dropped_tool,
+                    w.cap_dropped_unknown
+                ),
+                (1, 2, 1, 1, 1)
+            );
+        }
+
         /// The override before any observation takes effect, within its
         /// bounds: a cap of 0 or past `RECORD_CAP` is refused, as is a
         /// retired generation.
@@ -524,6 +563,12 @@ mod tests {
                 .unwrap();
             assert_eq!(r.policy(), EcPolicy::Authority);
             assert_eq!(r.cap(), 2);
+            r.retire(t);
+            assert_eq!(
+                r.configure_for_e2e(None, Some(1)),
+                Err("the generation retired")
+            );
+            assert_eq!(r.cap(), 2, "a refused override changes nothing");
         }
 
         /// The S-20e follow-up review's U2-1: the witness names each record's

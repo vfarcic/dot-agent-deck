@@ -1464,15 +1464,21 @@ mod linux {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         }
 
-        /// The thread's side, before a pass: `true`, the pass marked
-        /// running, when not held; `false` when held.
-        fn enter(&self) -> bool {
+        /// The thread's side, before a pass: the pass marked running, when
+        /// not held; `None` when held. The pass is running until the guard
+        /// goes: [`Running::finish`] counts it finished, and a pass that
+        /// unwinds instead stops running without being counted, so a later
+        /// hold isn't left waiting on it (the Q35-20c fix audit's U3-4).
+        fn enter(&self) -> Option<Running<'_>> {
             let mut passes = self.lock();
             if passes.held {
-                return false;
+                return None;
             }
             passes.running = true;
-            true
+            Some(Running {
+                barrier: self,
+                finished: false,
+            })
         }
 
         /// The thread's side while held: wait up to `poll` for a go.
@@ -1486,12 +1492,55 @@ mod linux {
             }
         }
 
-        /// The thread's side, after a pass.
-        fn leave(&self) {
+        /// See [`Observer::hold_passes_for_e2e`]: set the hold, and when it
+        /// holds, wait up to `bound` for a running pass to finish.
+        fn hold(&self, hold: bool, bound: Duration) -> Result<Passes, Passes> {
             let mut passes = self.lock();
-            passes.running = false;
-            passes.finished += 1;
+            passes.held = hold;
             self.changed.notify_all();
+            if !hold {
+                return Ok(*passes);
+            }
+            let until = Instant::now() + bound;
+            while passes.running {
+                let left = until.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(*passes);
+                }
+                passes = self
+                    .changed
+                    .wait_timeout(passes, left)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .0;
+            }
+            Ok(*passes)
+        }
+    }
+
+    /// A pass [`PassBarrier::enter`] let start: running until dropped.
+    #[cfg(any(test, feature = "e2e"))]
+    struct Running<'a> {
+        barrier: &'a PassBarrier,
+        finished: bool,
+    }
+
+    #[cfg(any(test, feature = "e2e"))]
+    impl Running<'_> {
+        /// The pass finished: it is counted as it stops running.
+        fn finish(mut self) {
+            self.finished = true;
+        }
+    }
+
+    #[cfg(any(test, feature = "e2e"))]
+    impl Drop for Running<'_> {
+        fn drop(&mut self) {
+            let mut passes = self.barrier.lock();
+            passes.running = false;
+            if self.finished {
+                passes.finished += 1;
+            }
+            self.barrier.changed.notify_all();
         }
     }
 
@@ -1981,28 +2030,12 @@ mod linux {
         /// lets the thread run a pass now, and answers at once.
         #[cfg(any(test, feature = "e2e"))]
         pub fn hold_passes_for_e2e(&self, hold: bool, bound: Duration) -> Result<Passes, Passes> {
-            let mut passes = self.barrier.lock();
-            passes.held = hold;
-            self.barrier.changed.notify_all();
+            let passes = self.barrier.hold(hold, bound);
             if !hold {
-                drop(passes);
                 self.bell.ring();
                 return Ok(self.passes_for_e2e());
             }
-            let until = Instant::now() + bound;
-            while passes.running {
-                let left = until.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    return Err(*passes);
-                }
-                passes = self
-                    .barrier
-                    .changed
-                    .wait_timeout(passes, left)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .0;
-            }
-            Ok(*passes)
+            passes
         }
 
         /// The thread's passes, read under the barrier's lock.
@@ -3112,16 +3145,16 @@ mod linux {
             #[cfg(any(test, feature = "e2e"))]
             let barrier = Arc::clone(&observer.barrier);
             #[cfg(any(test, feature = "e2e"))]
-            if !barrier.enter() {
+            let Some(running) = barrier.enter() else {
                 // Held: wait for a go without keeping the observer alive,
                 // then look again at its stop and retirement.
                 drop(observer);
                 barrier.wait_go(Duration::from_millis(10));
                 continue;
-            }
+            };
             observer.pass();
             #[cfg(any(test, feature = "e2e"))]
-            barrier.leave();
+            running.finish();
             let wait = if observer.active() {
                 SCAN_PERIOD
             } else {
@@ -3139,7 +3172,30 @@ mod linux {
         use super::*;
         use spec::spec;
 
-        /// Scenario: The test process stands in for a helper and starts a real child (`sleep`). The pin's own reads name it: the test's own children list it, its pidfd stat reads the test as its parent and a start no earlier than the test's own, its executable is another file than the test's, and its pidfd still names a live process after the reads, so the decision over those real reads picks it as the editor while the test's own pidfd is alive. Once the child is killed and not yet reaped, its reads say it exited and the decision picks nothing; once reaped, its pid pins nothing that is the test's child.
+        /// A child killed and reaped when it goes, so a failed assertion
+        /// leaves nothing running or unreaped (R-DF-U3-02).
+        struct Reaped(Option<std::process::Child>);
+
+        impl Reaped {
+            fn child(&mut self) -> &mut std::process::Child {
+                self.0.as_mut().expect("not yet reaped")
+            }
+        }
+
+        impl Drop for Reaped {
+            fn drop(&mut self) {
+                if let Some(child) = self.0.as_mut() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        /// How long the test waits for the child's exec, and for its kill to
+        /// read as exited: generous, since only a stall reaches it.
+        const CHILD_WAIT: Duration = Duration::from_secs(30);
+
+        /// Scenario: The test process stands in for a helper and starts a real child, `sleep` found on `PATH` (the test needs one), killed and reaped by a guard whatever happens. The pin's own reads name it: the children list holds it, its pidfd stat reads the test as its parent and a start no earlier than the test's own, its executable is another file and its pidfd names a live process after the reads, so the decision over those real reads picks it as the editor. Killed and not yet reaped it reads exited and the decision picks nothing; once reaped, its pid no longer pins the process with its start ticks.
         #[spec("inbox/probe/027")]
         #[test]
         fn probe_027_the_pins_proc_reads_name_the_helpers_live_child() {
@@ -3158,16 +3214,18 @@ mod linux {
                 start: helper.start(),
             };
             let helper_id = exe_id(me).expect("the test's executable");
-            let mut child = std::process::Command::new("sleep")
-                .arg("30")
-                .spawn()
-                .expect("a child");
-            let pid = child.id();
+            let mut child = Reaped(Some(
+                std::process::Command::new("sleep")
+                    .arg("600")
+                    .spawn()
+                    .expect("a child: this test needs `sleep` on PATH"),
+            ));
+            let pid = child.child().id();
             // `sleep` runs once its exec is done: wait for the child's
             // executable to leave the test's.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while exe_id(pid) == Some(helper_id) && std::time::Instant::now() < deadline {
-                std::thread::sleep(std::time::Duration::from_millis(5));
+            let deadline = Instant::now() + CHILD_WAIT;
+            while exe_id(pid) == Some(helper_id) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
             }
             assert!(children(me).contains(&pid), "the children file lists it");
             let facts = child_facts(pid).expect("a live child pins");
@@ -3188,12 +3246,10 @@ mod linux {
                 "the editor, by the real reads"
             );
             // Killed, not reaped: a zombie is exited.
-            child.kill().expect("kill the child");
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while child_facts(pid).is_some_and(|f| f.alive_after)
-                && std::time::Instant::now() < deadline
-            {
-                std::thread::sleep(std::time::Duration::from_millis(5));
+            child.child().kill().expect("kill the child");
+            let deadline = Instant::now() + CHILD_WAIT;
+            while child_facts(pid).is_some_and(|f| f.alive_after) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
             }
             assert!(
                 child_facts(pid).is_none_or(|f| !f.alive_after),
@@ -3206,12 +3262,99 @@ mod linux {
                 None,
                 "no editor once it exited"
             );
-            child.wait().expect("reap it");
-            // Reaped, its pid is free: it pins nothing, or (reused at once)
-            // another process that isn't the helper's child.
+            child.0.take().unwrap().wait().expect("reap it");
+            // Reaped, its pid is free: it pins nothing, or (reused) another
+            // process, whose start ticks aren't the child's.
             assert!(
-                child_facts(pid).is_none_or(|f| f.ppid != me),
-                "a reaped pid doesn't pin as the helper's child"
+                child_facts(pid).is_none_or(|f| f.start != facts.start),
+                "a reaped pid doesn't pin the reaped child"
+            );
+        }
+    }
+
+    /// The pass barrier's own hold, against a pass this test runs
+    /// (the Q35-20c fix review's U3-2, its audit's U3-4).
+    #[cfg(test)]
+    mod barrier {
+        use super::*;
+        use spec::spec;
+
+        /// Scenario: Start a pass on the barrier and, while it runs, ask for a hold from another thread: the hold has set itself but doesn't answer while the pass runs, and answers with it finished once the pass finishes; no pass can start until the go. Ask again while a second pass runs with a short bound: the hold is refused with the pass still running, and stays held.
+        #[spec("inbox/probe/079")]
+        #[test]
+        fn probe_079_a_hold_waits_for_the_running_pass_and_refuses_at_its_bound() {
+            let barrier = Arc::new(PassBarrier::default());
+            let running = barrier.enter().expect("not held");
+            let (answered, answer) = std::sync::mpsc::channel();
+            let holder = {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    answered
+                        .send(barrier.hold(true, Duration::from_secs(60)))
+                        .unwrap();
+                })
+            };
+            while !barrier.lock().held {
+                std::thread::yield_now();
+            }
+            assert!(
+                matches!(
+                    answer.recv_timeout(Duration::from_millis(100)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ),
+                "no answer while the pass runs"
+            );
+            running.finish();
+            let held = answer.recv().unwrap().expect("answered once it finished");
+            assert_eq!(
+                held,
+                Passes {
+                    held: true,
+                    running: false,
+                    finished: 1
+                }
+            );
+            holder.join().unwrap();
+            assert!(barrier.enter().is_none(), "no pass starts while held");
+
+            assert_eq!(
+                barrier.hold(false, Duration::ZERO),
+                Ok(Passes {
+                    held: false,
+                    running: false,
+                    finished: 1
+                })
+            );
+            let _running = barrier.enter().expect("a go lets one start");
+            assert_eq!(
+                barrier.hold(true, Duration::from_millis(20)),
+                Err(Passes {
+                    held: true,
+                    running: true,
+                    finished: 1
+                }),
+                "refused at its bound, the pass still running"
+            );
+            assert!(barrier.lock().held, "the hold stays");
+        }
+
+        /// Scenario: Start a pass on the barrier and let it panic. It stops running without being counted finished, so a hold asked afterwards answers at once rather than waiting out its bound for a pass that will never finish.
+        #[spec("inbox/probe/079")]
+        #[test]
+        fn probe_079_a_pass_that_panics_leaves_no_hold_waiting() {
+            let barrier = PassBarrier::default();
+            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _running = barrier.enter().expect("not held");
+                panic!("the pass panics");
+            }));
+            assert!(unwound.is_err());
+            assert_eq!(
+                barrier.hold(true, Duration::from_secs(60)),
+                Ok(Passes {
+                    held: true,
+                    running: false,
+                    finished: 0
+                })
             );
         }
     }

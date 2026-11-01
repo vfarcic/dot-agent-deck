@@ -248,7 +248,9 @@ impl EvidenceState {
     /// (R-D-U2-01): the state is Clean now, in the same layout epoch, with
     /// no output taken since. Comparing the output position alone misses a
     /// layout edge or an unknown geometry, which invalidate the frame
-    /// without moving it.
+    /// without moving it. [`Self::adopt`] moves the layout epoch too, but
+    /// never under a mark: only a state with a profile is ever Clean, and
+    /// `adopt` changes only one with none.
     pub fn frame_unchanged(&self, mark: FrameMark) -> bool {
         matches!(self.status, EvidenceStatus::Clean { .. })
             && self.parser.is_some()

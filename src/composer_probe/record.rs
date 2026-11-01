@@ -903,8 +903,10 @@ pub struct DrainWitness {
     pub complete: bool,
     pub decision: Option<Decision>,
     pub report: Report,
-    /// The segments read this ending as `WaitUnknown`: an editor-bearing
-    /// decision, or none, and no report the helper recognisably sent.
+    /// The ending reads as `WaitUnknown` (an editor-bearing decision, or
+    /// none, and no report the helper recognisably sent): what the segments
+    /// were handed. It doesn't show that a cut-off was applied to anything
+    /// held.
     pub wait_unknown: bool,
 }
 

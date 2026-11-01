@@ -1315,7 +1315,7 @@ async fn hold_passes(observer: &Arc<Observer>) -> u64 {
     passes.finished
 }
 
-/// Scenario: A bound deck's scan records a live helper copy `Owned` with no decision, and the observer's passes are then held with no pass running. The helper's report arrives on its own registered connection before any decision: it is kept and changes neither the missing decision nor the pending writer scope. In one variant the helper's `unarmed` marker is then read by the next pass, so its decision comes after its report and opens the scope as an unchecked return; in the other no decision ever comes. The helper is killed while passes are held, so its exit is first seen by the pass after the go, which drains it: with no decision the scope ends open as unconfirmed; with the late decision and a clean report it stays an unchecked return.
+/// Scenario: A bound deck's scan records a live helper copy `Owned` with no decision, the observer's passes are held, and the helper's report arrives on its own registered connection before any decision: it is kept and changes neither the missing decision nor the pending writer scope. In one variant the helper's `unarmed` marker is read by the next pass, so the decision comes after the report and opens the scope as an unchecked return; in the other no decision ever comes. The helper is killed while passes are held and the pass after the go drains it: with no decision the scope ends open as unconfirmed, and with the late decision and a clean report it stays an unchecked return.
 #[spec("inbox/probe/057")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn probe_057_a_report_before_the_decision_then_the_exit_drain() {
@@ -1334,8 +1334,16 @@ async fn probe_057_a_report_before_the_decision_then_the_exit_drain() {
             Ok(1)
         );
         let input = deck.observer.input();
-        // Born after the publication, past its start ticks' granularity.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Born after the publication, past its start ticks' granularity: the
+        // boot clock has moved into a later tick than the publication's.
+        let published = crate::composer_probe::master_holders::boot_ticks().unwrap();
+        assert!(
+            wait_for(SETTLE, || {
+                crate::composer_probe::master_holders::boot_ticks().unwrap() > published
+            })
+            .await,
+            "the boot clock moves a tick"
+        );
         let (helper, _) = deck.owned_helper("early-report", 0).await;
         let key = key_of(helper);
         deck.scanned_owned(key).await;
