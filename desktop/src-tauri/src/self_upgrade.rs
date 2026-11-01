@@ -109,9 +109,10 @@ pub(crate) struct CheckDto {
     pub latest: String,
     /// Whether the app is behind it and can still be offered. The notice
     /// shows then, and while a relaunch is pending. A CLI that is behind is
-    /// not counted (issue #1753): it is offered on the Dashboard's Local
-    /// daemon section, from [`Self::cli`], so the app-wide notice never reads
-    /// as a statement about the daemon.
+    /// not counted (issue #1753): while the app is current it is offered on
+    /// the Dashboard's Local daemon section, from [`Self::cli`], so the
+    /// app-wide notice never reads as a statement about the daemon. Once the
+    /// notice's dialog is open, it offers that CLI after the app (issue #2062).
     pub update_available: bool,
     /// The notice's text: the app's headline while it is behind — the same
     /// words as the TUI's badge uses for it — or, once the app's own copy was
@@ -2322,5 +2323,246 @@ mod tests {
             .filter_map(|line| line["text"].as_str())
             .collect();
         assert!(texts.contains(&agent_hooks::NOT_INSTALLED), "{answer}");
+    }
+
+    /// One CLI install method beside the app, on one platform: the machine,
+    /// and the plan the check must report for that CLI.
+    #[cfg(unix)]
+    struct CliCase {
+        name: &'static str,
+        host: Fake,
+        /// `None` when no CLI beside the app is found: only the bundled copy.
+        action: Option<&'static str>,
+        actionable: bool,
+        /// What the plan tells the user, where the app cannot do it.
+        says: &'static str,
+    }
+
+    /// Issue #2062 — the app's notice, the Dashboard banner's Upgrade… and the
+    /// rail's upgrade button, now runs the Local daemon section's flow, which
+    /// offers the CLI after the app whenever the check reports the CLI behind.
+    /// So for each install method a platform detects, a check made while the
+    /// app is behind must report the CLI beside it with the plan its install
+    /// method calls for (a file another system package owns is detected
+    /// through `dpkg`, so that case is the Linux one's): one the app upgrades behind its own Upgrade,
+    /// or one that says what to do instead, and no CLI at all when the only
+    /// copy is the one bundled in the app.
+    #[cfg(unix)]
+    fn assert_cli_cases(app: &str, platform: Platform, cases: Vec<CliCase>) {
+        for case in cases {
+            let dto = check(&case.host, app, platform);
+            assert!(
+                dto.update_available,
+                "{}: the app is behind, so the notice shows",
+                case.name
+            );
+            let Some(action) = case.action else {
+                assert_eq!(dto.cli, None, "{}: no CLI step", case.name);
+                continue;
+            };
+            let cli = dto
+                .cli
+                .unwrap_or_else(|| panic!("{}: the CLI beside the app is found", case.name));
+            assert_eq!(cli.action, action, "{}", case.name);
+            assert_eq!(cli.actionable, case.actionable, "{}", case.name);
+            assert_eq!(
+                cli.confirm_question.is_some(),
+                case.actionable,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                cli.headline, "dot-agent-deck CLI: update available: v0.47.0 (current: v0.46.0)",
+                "{}",
+                case.name
+            );
+            let text = texts(&cli.lines).join("\n");
+            assert!(text.contains(case.says), "{}: {text}", case.name);
+        }
+    }
+
+    // Unix install layout: native Windows is unsupported (#164).
+    #[cfg(unix)]
+    #[test]
+    fn self_upgrade_040_every_cli_install_method_beside_the_dmg_app() {
+        let mac = || dmg_machine(true, Some("ABCDE12345"));
+        let keg = "/opt/homebrew/Cellar/dot-agent-deck/0.46.0/bin/dot-agent-deck";
+        let store = "/nix/store/abc-dot-agent-deck-0.46.0/bin/dot-agent-deck";
+        let built = "/Users/u/code/dot-agent-deck/target/release/dot-agent-deck";
+        assert_cli_cases(
+            DMG_APP,
+            Platform::MacosArm64,
+            vec![
+                CliCase {
+                    name: "Homebrew",
+                    host: mac()
+                        .on_path("/opt/homebrew/bin")
+                        .exe("/opt/homebrew/bin/brew")
+                        .link("/opt/homebrew/bin/dot-agent-deck", keg)
+                        .deck(keg, CURRENT),
+                    action: Some("brew-upgrade"),
+                    actionable: true,
+                    says: "brew upgrade dot-agent-deck",
+                },
+                CliCase {
+                    name: "Homebrew without its brew",
+                    host: mac()
+                        .on_path("/opt/homebrew/bin")
+                        .link("/opt/homebrew/bin/dot-agent-deck", keg)
+                        .deck(keg, CURRENT),
+                    action: Some("show-command"),
+                    actionable: false,
+                    says: "`brew` was not found",
+                },
+                CliCase {
+                    name: "downloaded, writable",
+                    host: mac()
+                        .on_path("/Users/u/.local/bin")
+                        .deck("/Users/u/.local/bin/dot-agent-deck", CURRENT)
+                        .writable("/Users/u/.local/bin"),
+                    action: Some("replace-binary"),
+                    actionable: true,
+                    says: "/Users/u/.local/bin/dot-agent-deck",
+                },
+                CliCase {
+                    name: "downloaded, not writable",
+                    host: mac()
+                        .on_path("/usr/local/bin")
+                        .deck("/usr/local/bin/dot-agent-deck", CURRENT),
+                    action: Some("staged-install"),
+                    actionable: true,
+                    says: "is shown once the download is verified",
+                },
+                CliCase {
+                    name: "Nix",
+                    host: mac()
+                        .on_path("/Users/u/.nix-profile/bin")
+                        .link("/Users/u/.nix-profile/bin/dot-agent-deck", store)
+                        .deck(store, CURRENT),
+                    action: Some("notify-only"),
+                    actionable: false,
+                    says: "Installed with Nix",
+                },
+                CliCase {
+                    name: "built from source",
+                    host: mac()
+                        .on_path("/Users/u/code/dot-agent-deck/target/release")
+                        .deck(built, CURRENT)
+                        .writable("/Users/u/code/dot-agent-deck/target/release"),
+                    action: Some("notify-only"),
+                    actionable: false,
+                    says: "Built from source",
+                },
+                CliCase {
+                    // The CLI inside the bundle answers on `PATH`, and is
+                    // skipped because it upgrades with the app (Qodo, PR #2063).
+                    name: "only the copy bundled in the app",
+                    host: mac()
+                        .on_path("/Applications/Agent Deck.app/Contents/MacOS")
+                        .deck(
+                            "/Applications/Agent Deck.app/Contents/MacOS/dot-agent-deck",
+                            CURRENT,
+                        ),
+                    action: None,
+                    actionable: false,
+                    says: "",
+                },
+            ],
+        );
+    }
+
+    // Unix install layout: native Windows is unsupported (#164).
+    #[cfg(unix)]
+    #[test]
+    fn self_upgrade_041_every_cli_install_method_beside_the_deb_app() {
+        let linux = || deb_machine().exe("/usr/bin/pkexec");
+        let keg = "/home/linuxbrew/.linuxbrew/Cellar/dot-agent-deck/0.46.0/bin/dot-agent-deck";
+        let store = "/nix/store/abc-dot-agent-deck-0.46.0/bin/dot-agent-deck";
+        let built = "/home/u/code/dot-agent-deck/target/release/dot-agent-deck";
+        assert_cli_cases(
+            DEB_APP,
+            Platform::LinuxAmd64,
+            vec![
+                CliCase {
+                    name: "Linuxbrew",
+                    host: linux()
+                        .on_path("/home/linuxbrew/.linuxbrew/bin")
+                        .exe("/home/linuxbrew/.linuxbrew/bin/brew")
+                        .link("/home/linuxbrew/.linuxbrew/bin/dot-agent-deck", keg)
+                        .deck(keg, CURRENT),
+                    action: Some("brew-upgrade"),
+                    actionable: true,
+                    says: "brew upgrade dot-agent-deck",
+                },
+                CliCase {
+                    name: "downloaded, writable",
+                    host: linux()
+                        .on_path("/home/u/.local/bin")
+                        .deck("/home/u/.local/bin/dot-agent-deck", CURRENT)
+                        .writable("/home/u/.local/bin"),
+                    action: Some("replace-binary"),
+                    actionable: true,
+                    says: "/home/u/.local/bin/dot-agent-deck",
+                },
+                CliCase {
+                    name: "downloaded, not writable, with a password prompt",
+                    host: linux()
+                        .on_path("/usr/local/bin")
+                        .deck("/usr/local/bin/dot-agent-deck", CURRENT),
+                    action: Some("staged-install"),
+                    actionable: true,
+                    says: "asks for your password",
+                },
+                CliCase {
+                    name: "downloaded, not writable, without a password prompt",
+                    host: deb_machine()
+                        .on_path("/usr/local/bin")
+                        .deck("/usr/local/bin/dot-agent-deck", CURRENT),
+                    action: Some("staged-install"),
+                    actionable: true,
+                    says: "is shown once the download is verified",
+                },
+                CliCase {
+                    name: "Nix",
+                    host: linux()
+                        .on_path("/home/u/.nix-profile/bin")
+                        .link("/home/u/.nix-profile/bin/dot-agent-deck", store)
+                        .deck(store, CURRENT),
+                    action: Some("notify-only"),
+                    actionable: false,
+                    says: "Installed with Nix",
+                },
+                CliCase {
+                    name: "built from source",
+                    host: linux()
+                        .on_path("/home/u/code/dot-agent-deck/target/release")
+                        .deck(built, CURRENT)
+                        .writable("/home/u/code/dot-agent-deck/target/release"),
+                    action: Some("notify-only"),
+                    actionable: false,
+                    says: "Built from source",
+                },
+                CliCase {
+                    name: "owned by another system package",
+                    host: linux()
+                        .on_path("/usr/local/bin")
+                        .deck("/usr/local/bin/dot-agent-deck", CURRENT)
+                        .answer(
+                            "/usr/bin/dpkg-query -S /usr/local/bin/dot-agent-deck",
+                            ok("dot-agent-deck-cli: /usr/local/bin/dot-agent-deck\n"),
+                        ),
+                    action: Some("notify-only"),
+                    actionable: false,
+                    says: "Installed by the system package `dot-agent-deck-cli`",
+                },
+                CliCase {
+                    name: "only the copy bundled in the .deb",
+                    host: linux(),
+                    action: None,
+                    actionable: false,
+                    says: "",
+                },
+            ],
+        );
     }
 }

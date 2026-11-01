@@ -29,8 +29,9 @@ export const SELF_UPGRADE_RUNNING_CLOSE_BLOCKED = "An upgrade is still running. 
 /**
  * Issue #1635 — upgrading this machine's copies of Agent Deck: the app, and the
  * `dot-agent-deck` CLI when one is installed beside it. Since issue #1753 each
- * place that opens it names the copies it covers: the banner and the rail
- * button the app, and the Dashboard's Local daemon section the CLI.
+ * place that opens it names the copies it covers; since issue #2062 every
+ * entry point opens it through `LocalUpgradeFlow`, which picks them
+ * (`upgradeCopies`).
  *
  * It shows each covered copy's plan in the crate's own words, then offers the
  * ones that can be upgraded from here one at a time, the app first, each behind its
