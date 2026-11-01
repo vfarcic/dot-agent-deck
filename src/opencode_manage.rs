@@ -97,43 +97,6 @@ impl Layout {
     }
 }
 
-/// PRD #2050: the first line of a server module an earlier build of this
-/// branch wrote for a known OpenCode generation, followed by `1` or `2`. No
-/// module carries it any more: it was part of the module's bytes, so a change
-/// of generation rewrote the module and reloaded every live 2.x pane's plugin.
-/// It is still read ([`remembered_major`]) as the generation for an install
-/// with no command to look at on a machine whose deck's state directory
-/// records none ([`remembered_major_now`]).
-const LAYOUT_MARKER_PREFIX: &str = "// dot-agent-deck OpenCode layout: ";
-
-/// The generation the server module under `root` was last written for, from
-/// its marker line; `None` with no module or no marker.
-fn remembered_major(root: &Path) -> Option<crate::opencode_version::Major> {
-    let js = bounded_module_text(&plugin_file(root))?;
-    match js.lines().next()?.strip_prefix(LAYOUT_MARKER_PREFIX)? {
-        "1" => Some(crate::opencode_version::Major::V1),
-        "2" => Some(crate::opencode_version::Major::V2),
-        _ => None,
-    }
-}
-
-/// The generation an older build of this branch recorded on a module: the
-/// marker of the module in OpenCode 2.x's global root `v2_global`, else that
-/// of `roots`' first (1.x's global) root.
-fn remembered_major_in(
-    roots: &[PathBuf],
-    v2_global: &Path,
-) -> Option<crate::opencode_version::Major> {
-    remembered_major(v2_global).or_else(|| roots.first().and_then(|root| remembered_major(root)))
-}
-
-/// The layout an older build's marker records ([`remembered_major_in`]),
-/// else [`Layout::Unknown`].
-#[cfg(test)]
-fn remembered_layout(roots: &[PathBuf], v2_global: &Path) -> Layout {
-    Layout::for_major(remembered_major_in(roots, v2_global))
-}
-
 /// PRD #2050: OpenCode 2.x's TUI plugin directory under a config root. A
 /// directory, because 2.x resolves a TUI half only from a directory plugin;
 /// it holds no `server.js`/`index.js`, so 2.x does not load it as a server
@@ -3741,13 +3704,9 @@ fn detected_major_at(path: &Path) -> Option<crate::opencode_version::Major> {
 }
 
 /// The generation an install with no command to look at goes by: the one the
-/// deck last saw an agent run ([`remember_layout`]), else the one an older
-/// build's module marker records ([`remembered_major_in`]).
-fn remembered_major_now(
-    roots: &[PathBuf],
-    v2_global: &Path,
-) -> Option<crate::opencode_version::Major> {
-    detected_major_at(&detected_layout_file()).or_else(|| remembered_major_in(roots, v2_global))
+/// deck last saw an agent run ([`remember_layout`]).
+fn remembered_major_now() -> Option<crate::opencode_version::Major> {
+    detected_major_at(&detected_layout_file())
 }
 
 /// PRD #2050 (review F2): remember `major`, the OpenCode generation an agent
@@ -4741,7 +4700,7 @@ pub fn refresh_install() -> crate::hooks_refresh::InstallAttempt {
 pub fn refresh_for_spawn(
     major: Option<crate::opencode_version::Major>,
 ) -> (Vec<crate::hook_binary::HookPin>, Vec<String>) {
-    let major = major.or_else(|| remembered_major_now(&candidate_roots(), &v2_global_root()));
+    let major = major.or_else(remembered_major_now);
     auto_install_reporting_for(Layout::for_major(major))
 }
 
@@ -4792,6 +4751,15 @@ fn auto_install_layout(
     resolve: impl FnOnce() -> Result<String, String>,
 ) -> (Option<String>, Vec<(PathBuf, String)>) {
     let global = global_roots(roots, v2_global);
+    // Auditor L2: the XDG root the TUI half below creates whenever any root
+    // exists is created first, so a machine with only `~/.opencode` gets the
+    // module in the global root in this install, not after the next one
+    // moves it there.
+    let any_root = roots.iter().any(|root| root.exists()) || v2_global.exists();
+    let mut xdg_refused = false;
+    if any_root && let Some(xdg) = roots.first().filter(|xdg| !xdg.exists()) {
+        xdg_refused = !ensure_root(xdg, &tui_plugin_file(xdg), failed);
+    }
     let (binary_path, pins) = if layout == Layout::V2 || global.iter().any(|root| root.exists()) {
         auto_install_global_resolved(
             roots,
@@ -4822,10 +4790,12 @@ fn auto_install_layout(
     let Some(xdg) = roots.first() else {
         return (Some(binary_path.to_string()), pins);
     };
-    if ensure_root(xdg, &tui_plugin_file(xdg), failed) {
+    if !xdg_refused && ensure_root(xdg, &tui_plugin_file(xdg), failed) {
         auto_install_tui(xdg, binary_path, failed);
     }
-    if ensure_root(v2_global, &tui_v2_file(v2_global), failed) {
+    if (!xdg_refused || v2_global != xdg.as_path())
+        && ensure_root(v2_global, &tui_v2_file(v2_global), failed)
+    {
         auto_install_tui_v2(v2_global, binary_path, failed);
     }
     // A 2.x half left in a root 2.x no longer reads (one written before
@@ -5128,7 +5098,7 @@ pub fn install() -> std::io::Result<()> {
     let v2_global = v2_global_root();
     // As the automatic install for a detected 2.x does: 2.x's global root is
     // created when the deck last saw an agent run OpenCode 2.
-    if remembered_major_now(&roots, &v2_global) == Some(Major::V2) {
+    if remembered_major_now() == Some(Major::V2) {
         crate::config_write_guard::ensure_config_write_allowed(&plugin_file(&v2_global))?;
         std::fs::create_dir_all(&v2_global)?;
     }
@@ -10372,9 +10342,6 @@ await wait(1500);
         fn v2_global(&self) -> &Path {
             self.roots.get(2).unwrap_or(&self.roots[0])
         }
-        fn remembered(&self) -> Layout {
-            remembered_layout(&self.roots, self.v2_global())
-        }
         fn global(&self) -> &Path {
             &self.roots[0]
         }
@@ -10424,7 +10391,6 @@ await wait(1500);
                 plugin_template(&f.bin),
                 "{layout:?}: no layout marker in the module"
             );
-            assert_eq!(remembered_major(f.global()), None, "{layout:?}");
             assert_eq!(
                 existing_pin(&tui_v2_file(f.global())).as_deref(),
                 Some(f.bin.as_str()),
@@ -10458,10 +10424,12 @@ await wait(1500);
         std::fs::create_dir_all(plugin_file(f.global()).parent().unwrap()).unwrap();
         std::fs::write(
             plugin_file(f.global()),
-            format!("{LAYOUT_MARKER_PREFIX}1\n{}", plugin_template(&f.bin)),
+            format!(
+                "// dot-agent-deck OpenCode layout: 1\n{}",
+                plugin_template(&f.bin)
+            ),
         )
         .unwrap();
-        assert_eq!(f.remembered(), Layout::V1, "an older marker is still read");
         f.install(Layout::V2);
         assert_eq!(
             std::fs::read_to_string(plugin_file(f.global())).unwrap(),
@@ -10482,8 +10450,6 @@ await wait(1500);
             Layout::V1,
             Layout::Unknown,
             Layout::V2,
-            // A TUI launch, `hooks refresh`: the layout recorded, or none.
-            f.remembered(),
         ] {
             assert_eq!(f.install(layout), Vec::<String>::new(), "{layout:?}");
             let after: Vec<_> = watched.iter().map(|p| file_identity(p)).collect();
@@ -10494,28 +10460,28 @@ await wait(1500);
         }
     }
 
-    /// Scenario (PRD #2050): with only `~/.opencode` present, a detected
-    /// OpenCode 2 creates its global root and puts the module there, removing
-    /// the legacy copy, which 2.x would refuse for a project under `$HOME`
-    /// and not load at all for one outside it; an install that knows no 2.x
-    /// keeps the fan-out, and the next one, with the XDG root the TUI half
-    /// created, moves the module there once.
+    /// Scenario (PRD #2050, auditor L2): with only `~/.opencode` present, an
+    /// install of any layout creates the global root, which the TUI half
+    /// needs anyway, before placing the module, so the module lands there in
+    /// one step and the deck's legacy copy is removed: OpenCode 2 would
+    /// refuse that copy for a project under `$HOME` and not load it at all
+    /// for one outside it. A second install writes nothing.
     #[cfg(unix)]
     #[test]
     fn opencode_a_legacy_only_machine_converges_on_the_global_root() {
-        let v2 = LayoutFixture::new();
-        std::fs::remove_dir_all(v2.global()).unwrap();
-        assert_eq!(v2.install(Layout::V2), Vec::<String>::new());
-        assert_eq!(v2.state(), (true, false, true, true));
-
-        let v1 = LayoutFixture::new();
-        std::fs::remove_dir_all(v1.global()).unwrap();
-        assert_eq!(v1.install(Layout::V1), Vec::<String>::new());
-        assert!(plugin_file(v1.legacy()).exists());
-        assert!(!plugin_file(v1.global()).exists());
-        assert!(tui_plugin_file(v1.global()).exists() && tui_v2_file(v1.global()).exists());
-        assert_eq!(v1.install(Layout::V1), Vec::<String>::new());
-        assert_eq!(v1.state(), (true, false, true, true), "moved once");
+        for layout in [Layout::V2, Layout::V1, Layout::Unknown] {
+            let f = LayoutFixture::new();
+            std::fs::remove_dir_all(f.global()).unwrap();
+            write_plugin(f.legacy(), &f.bin).unwrap();
+            assert_eq!(f.install(layout), Vec::<String>::new(), "{layout:?}");
+            assert_eq!(f.state(), (true, false, true, true), "{layout:?}: one step");
+            let before = file_identity(&plugin_file(f.global()));
+            assert_eq!(f.install(layout), Vec::<String>::new(), "{layout:?}");
+            assert!(
+                file_identity(&plugin_file(f.global())) == before,
+                "{layout:?}: the second install rewrote the module"
+            );
+        }
     }
 
     /// With nothing remembered (no module yet, or one from before PRD #2050),
@@ -10527,10 +10493,8 @@ await wait(1500);
     #[test]
     fn opencode_unknown_layout_installs_both_tui_halves() {
         let f = LayoutFixture::new();
-        assert_eq!(f.remembered(), Layout::Unknown);
         assert_eq!(f.install(Layout::Unknown), Vec::<String>::new());
         assert_eq!(f.state(), (true, false, true, true));
-        assert_eq!(remembered_major(f.global()), None);
         assert_eq!(
             std::fs::read_to_string(plugin_file(f.global())).unwrap(),
             plugin_template(&f.bin),
@@ -10553,7 +10517,6 @@ await wait(1500);
         std::fs::write(stale_plugin_dir(f.legacy()).join("index.js"), "x").unwrap();
         let other = f.legacy().join("plugin").join("someone-else.js");
         std::fs::write(&other, "export default {}").unwrap();
-        assert_eq!(f.remembered(), Layout::Unknown);
 
         assert_eq!(f.install(Layout::Unknown), Vec::<String>::new());
         let (global, legacy, tui, tui_v2) = f.state();
@@ -10568,7 +10531,6 @@ await wait(1500);
             existing_binary_path(f.global()).as_deref(),
             Some(f.bin.as_str())
         );
-        assert_eq!(f.remembered(), Layout::Unknown);
     }
 
     /// A pin to another live install that only the legacy copy held is
@@ -10625,24 +10587,18 @@ await wait(1500);
         assert!(plugin_file(f.global()).exists(), "1.x's global root");
         assert!(plugin_file(&f.roots[2]).exists(), "2.x's global root");
         assert!(!plugin_file(f.legacy()).exists(), "no copy 2.x would scan");
-        assert_eq!(f.remembered(), Layout::Unknown, "nothing was detected");
     }
 
     /// Review F2: the generation an agent was seen to run is recorded in the
-    /// deck's own state file, written only when it changes, and an install
-    /// with no command to look at goes by it before the modules' markers;
-    /// nothing in OpenCode's config is touched by recording it.
+    /// deck's own state file, written only when it changes, for an install
+    /// with no command to look at; nothing in OpenCode's config is touched by
+    /// recording it.
     #[cfg(unix)]
     #[test]
     fn a_detected_generation_is_remembered_outside_opencodes_config() {
         use crate::opencode_version::Major;
         let f = LayoutFixture::new();
         assert_eq!(f.install(Layout::V1), Vec::<String>::new());
-        std::fs::write(
-            plugin_file(f.global()),
-            format!("{LAYOUT_MARKER_PREFIX}1\n{}", plugin_template(&f.bin)),
-        )
-        .unwrap();
         let module = std::fs::read(plugin_file(f.global())).unwrap();
         let state = f._dir.path().join("state").join(DETECTED_LAYOUT_FILE);
         assert_eq!(detected_major_at(&state), None);
@@ -10654,29 +10610,8 @@ await wait(1500);
             module,
             "OpenCode's module is untouched"
         );
-        assert_eq!(
-            detected_major_at(&state).or_else(|| remembered_major_in(&f.roots, f.v2_global())),
-            Some(Major::V2),
-            "the detection wins over an older build's marker"
-        );
         assert!(remember_layout_at(&state, Major::V1).unwrap());
         assert_eq!(detected_major_at(&state), Some(Major::V1));
-    }
-
-    /// With only `~/.opencode` present (no global root), a wrapper's spawn
-    /// keeps today's fan-out: the module is written and kept there.
-    #[cfg(unix)]
-    #[test]
-    fn opencode_unknown_layout_with_only_the_legacy_root_fans_out() {
-        let f = LayoutFixture::new();
-        std::fs::remove_dir_all(f.global()).unwrap();
-        assert_eq!(f.install(Layout::Unknown), Vec::<String>::new());
-        assert!(plugin_file(f.legacy()).exists());
-        assert!(!plugin_file(f.global()).exists());
-        assert_eq!(
-            existing_binary_path(f.legacy()).as_deref(),
-            Some(f.bin.as_str())
-        );
     }
 
     /// The upgrade to 2.x keeps a pin to another live install that only the
