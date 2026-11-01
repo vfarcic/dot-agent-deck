@@ -5517,8 +5517,8 @@ impl PaneWriter {
         Ok(())
     }
 
-    /// PRD #1631 (audit N1): write a voice answer's keys, like
-    /// [`Self::write_user`] but as [`ByteSource::Answer`], and return the
+    /// PRD #1631 (audit N1): write a voice answer's keys, like a person's
+    /// write but as [`ByteSource::Answer`], and return the
     /// human-input counter as it stood once the PTY took them — read while the
     /// caller still holds this writer, which every human keystroke also needs,
     /// so no keystroke can fall between the write and the value. A later human
@@ -12810,6 +12810,11 @@ impl AgentPtyRegistry {
     /// them, as the attach loop reads on. With no room behind the fence it
     /// waits for its place with the writer's lock dropped, checking the
     /// generation again before each offer.
+    ///
+    /// **`Ok` means accepted, not written** (the audit's U3-1): the bytes may
+    /// still be held behind a fence, to be written by a later release or
+    /// dropped unwritten if the generation retires first. A caller that
+    /// needs the PTY to have taken them must not read `Ok` as that.
     pub async fn write_user_bytes(
         &self,
         pane_id: &str,

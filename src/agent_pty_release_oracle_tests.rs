@@ -133,9 +133,12 @@ impl std::io::Write for Pty {
             let fault = rig.fault.lock().unwrap().take();
             if let Some((fault, typed)) = fault {
                 // A person's keys, typed while the probe's byte is at the
-                // PTY: behind the fence its arm section closed.
-                let held = Arc::clone(&rig);
-                rig.runtime.block_on(async move { held.typed(typed).await });
+                // PTY: behind the fence its arm section closed. None for an
+                // empty `typed` (the audit's U3-8).
+                if !typed.is_empty() {
+                    let held = Arc::clone(&rig);
+                    rig.runtime.block_on(async move { held.typed(typed).await });
+                }
                 return match fault {
                     ProbeFault::Error => Err(std::io::Error::from_raw_os_error(libc::EIO)),
                     ProbeFault::Zero => Ok(0),
@@ -308,6 +311,7 @@ impl Rig {
         probe_ended(
             &self.input,
             &gate,
+            "oracle",
             number,
             end,
             ProbeAsk::First,
@@ -2455,6 +2459,50 @@ async fn probe_010_a_failed_probe_write_undoes_its_arm_and_releases_what_it_held
                 !status.fenced && status.held_ops == 0,
                 "{what}: the fence open, nothing held: {status:?}"
             );
+            assert_eq!(
+                w.pty.in_flight.count.load(Ordering::SeqCst),
+                0,
+                "{what}: nothing left in flight"
+            );
+        }
+    }
+}
+
+/// Scenario: For Claude and Codex, a probe is admitted and its fence closed in production's arm section, and the PTY fails its byte, with an error and by taking none of it, while nobody types. The probe ends refused for its failed write, its arm undone and its schedule backing off, and its fence opens at once with nothing held behind it: no release is coming to open it (the audit's U3-8, O-20.5).
+#[spec("inbox/probe/010")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_010_a_failed_probe_write_with_nothing_held_opens_its_fence() {
+    for agent in [Agent::Claude, Agent::Codex] {
+        for fault in [ProbeFault::Error, ProbeFault::Zero] {
+            let what = format!("{} {fault:?}", agent_name(agent));
+            let rig = Rig::new(agent, b"");
+            let outcome = rig.probe_faulted(fault, b"").await;
+            assert_eq!(
+                outcome,
+                ProbeOutcome::Refused(PROBE_WRITE_FAILED.into()),
+                "{what}"
+            );
+            // Its fence opened by the probe's own end, not by a release.
+            let w = rig.writer.lock().await;
+            let status = w.gate.gate.status();
+            assert!(
+                !status.fenced && status.held_ops == 0,
+                "{what}: the fence open, nothing held: {status:?}"
+            );
+            drop(w);
+            rig.settle(b"").await;
+            assert!(rig.taken().is_empty(), "{what}: no probe byte");
+            assert_eq!(
+                rig.input.liability_count(),
+                Some(0),
+                "{what}: the arm undone"
+            );
+            assert!(
+                !rig.input.probe_due(Instant::now()),
+                "{what}: a failure's backoff"
+            );
+            let w = rig.writer.lock().await;
+            assert!(!w.gate.gate.status().fenced, "{what}: still open");
             assert_eq!(
                 w.pty.in_flight.count.load(Ordering::SeqCst),
                 0,

@@ -816,7 +816,12 @@ fn plan_locked(state: &mut State, writer: Writer, bytes: &[u8], plan: Option<Pla
         }
     }
     // R2 §6.8 (U3-02): a person's op gives a broken observer one fresh
-    // attempt, due at once. A report a terminal sends isn't typing.
+    // attempt, due at once. A report the deck exempts (an enabled mode's, or
+    // a whole reply to a query it saw asked) isn't typing; a terminal reply
+    // it can't exempt (unsolicited, a duplicate, split) is, as the planner
+    // reads it. Every such op makes the attempt due again, so a person typing
+    // while the observer stays broken gets at most one attempt per doorbell
+    // tick (the tick asks one request at a time), each failure backing off.
     if person
         && exempt.is_none()
         && !bytes.is_empty()

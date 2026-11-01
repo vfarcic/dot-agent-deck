@@ -70,7 +70,10 @@
 //! epoch (`R6`, the top rank), and the arm section's, which takes the seam's
 //! lock and the epoch's. Acceptance and release run under the pane
 //! writer's own lock, so they are serialised with each other; retirement and
-//! the status read take only this one.
+//! the status read take only this one. It is a plain mutex, not one
+//! [`crate::lock_rank`] ranks: its order (below the pane writer's lock,
+//! above the seam's and `R6`) is written in `agent_pty_segments.rs`'s lock
+//! order, and no debug build checks it.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};

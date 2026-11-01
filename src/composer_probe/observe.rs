@@ -2404,10 +2404,10 @@ mod linux {
                 (PaneClass::Direct(ProbeAgent::Claude), Some(child)) => child,
                 // Q89: the `e2e` build's assumption may bind a direct native
                 // Codex stand-in as `A`; production binds Codex below the
-                // deck's wrapper or a launcher only at Q35-22.
-                (PaneClass::Direct(ProbeAgent::Codex), Some(child))
-                    if cfg!(feature = "e2e") && !self.assumed.is_empty() =>
-                {
+                // deck's wrapper or a launcher only at Q35-22. A release
+                // build has no such arm at all (the audit's U3-9a).
+                #[cfg(feature = "e2e")]
+                (PaneClass::Direct(ProbeAgent::Codex), Some(child)) if !self.assumed.is_empty() => {
                     child
                 }
                 _ => return Err(false),
@@ -2445,11 +2445,12 @@ mod linux {
                     (pid, kernel.stat(pid).map_err(|_| false)?.start, facts)
                 }
             };
-            // Q89 (`e2e` only): a direct Codex runs below the deck's own
-            // `wrap --agent codex -- <program> <args>`; its `A` is the
-            // wrapper's one child running that program with those args.
+            // Q89 (`e2e` only, compiled out of a release build): a direct
+            // Codex runs below the deck's own `wrap --agent codex --
+            // <program> <args>`; its `A` is the wrapper's one child running
+            // that program with those args.
+            #[cfg(feature = "e2e")]
             let (pid, start, facts) = if matches!(self.class, PaneClass::Direct(ProbeAgent::Codex))
-                && cfg!(feature = "e2e")
             {
                 self.below_deck_wrapper(&mut kernel, pid, start, facts)?
             } else {
@@ -2496,6 +2497,7 @@ mod linux {
         /// running `<program>`'s executable with exactly `<program> <args>`;
         /// otherwise `pid` itself. Anything else below a wrapper binds
         /// nothing (`Err(false)`): launchers are Q35-22's.
+        #[cfg(feature = "e2e")]
         fn below_deck_wrapper(
             &self,
             kernel: &mut LinuxKernel,
@@ -3127,6 +3129,90 @@ mod linux {
             };
             drop(observer);
             std::thread::park_timeout(wait);
+        }
+    }
+
+    /// The pin's own `/proc` reads against the real kernel (the audit's
+    /// U3-3); the decision over them is `editor_identity_tests`'.
+    #[cfg(test)]
+    mod pin_reads {
+        use super::*;
+        use spec::spec;
+
+        /// Scenario: The test process stands in for a helper and starts a real child (`sleep`). The pin's own reads name it: the test's own children list it, its pidfd stat reads the test as its parent and a start no earlier than the test's own, its executable is another file than the test's, and its pidfd still names a live process after the reads, so the decision over those real reads picks it as the editor while the test's own pidfd is alive. Once the child is killed and not yet reaped, its reads say it exited and the decision picks nothing; once reaped, its pid pins nothing that is the test's child.
+        #[spec("inbox/probe/027")]
+        #[test]
+        fn probe_027_the_pins_proc_reads_name_the_helpers_live_child() {
+            let me = std::process::id();
+            let mut kernel = LinuxKernel::default();
+            let helper = attest::pin(
+                &mut kernel,
+                Sighting::Pid {
+                    pid: me,
+                    start: None,
+                },
+            )
+            .expect("the test process pins");
+            let helper_key = RecordKey {
+                pid: me,
+                start: helper.start(),
+            };
+            let helper_id = exe_id(me).expect("the test's executable");
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("a child");
+            let pid = child.id();
+            // `sleep` runs once its exec is done: wait for the child's
+            // executable to leave the test's.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while exe_id(pid) == Some(helper_id) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(children(me).contains(&pid), "the children file lists it");
+            let facts = child_facts(pid).expect("a live child pins");
+            assert_eq!(facts.ppid, me, "its parent, read through its pidfd");
+            assert!(facts.start >= helper_key.start, "started after the helper");
+            assert!(
+                facts.exe.is_some_and(|exe| exe != helper_id),
+                "another executable"
+            );
+            assert!(facts.alive_after, "alive after the reads");
+            let alive = || !exited(helper.pidfd());
+            assert_eq!(
+                super::super::user_editor(helper_key, helper_id, &[pid], child_facts, alive),
+                Some(RecordKey {
+                    pid,
+                    start: facts.start
+                }),
+                "the editor, by the real reads"
+            );
+            // Killed, not reaped: a zombie is exited.
+            child.kill().expect("kill the child");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while child_facts(pid).is_some_and(|f| f.alive_after)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(
+                child_facts(pid).is_none_or(|f| !f.alive_after),
+                "a zombie reads exited"
+            );
+            assert_eq!(
+                super::super::user_editor(helper_key, helper_id, &[pid], child_facts, || {
+                    !exited(helper.pidfd())
+                }),
+                None,
+                "no editor once it exited"
+            );
+            child.wait().expect("reap it");
+            // Reaped, its pid is free: it pins nothing, or (reused at once)
+            // another process that isn't the helper's child.
+            assert!(
+                child_facts(pid).is_none_or(|f| f.ppid != me),
+                "a reaped pid doesn't pin as the helper's child"
+            );
         }
     }
 }

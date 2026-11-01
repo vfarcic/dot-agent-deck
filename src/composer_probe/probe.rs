@@ -176,7 +176,9 @@ impl Schedule {
     }
 
     /// A person's op: a broken observer gets one fresh attempt, due at once.
-    /// It stays broken until an attempt reads the box.
+    /// It stays broken until an attempt reads the box. Each op makes it due
+    /// again: while a person types and the observer stays broken, the tick
+    /// asks at most one attempt per tick.
     pub fn person(&mut self) {
         if self.broken {
             self.wait = Wait::None;

@@ -67,6 +67,11 @@
 //! output hook:   output lock ─> input (R6) ─> segments ; notify
 //! ```
 //! Nothing takes the gate under the seam or R6, nor the seam under R6.
+//! The gate's mutex is a plain mutex: [`crate::lock_rank`] doesn't rank or
+//! check it, so its place above (under the pane writer's async lock, before
+//! the seam and R6, the ledger a leaf under it) is this diagram's word, not
+//! a debug-build check (the audit's U3-9d; ranking it is on the activation
+//! list).
 //! Retirement: the registry retires the input (segments end `Retired`) and
 //! the gate (held ops refused `exited` once), and the driver ends at its next
 //! wake.
@@ -483,6 +488,43 @@ impl PtyWriterThread {
     }
 }
 
+/// The probe request's reads when it is scheduled (U3-03, O-20.7b): a
+/// pending permission is settled first (`settle`); then each pass reads the
+/// keymap (`read`, file I/O with no lock held) and asks with it (`ask`, which
+/// reads the rest and answers with what it holds and the O5 estimate that
+/// alone refused it, if one did). O5 is availability, not safety (A1 §4.4):
+/// a pass refused only by an estimate within [`O5_WAIT`] sleeps to it, once,
+/// and passes again, so no keymap read before the sleep stands after it.
+/// The last pass's answer and the keymap it asked with.
+#[cfg(target_os = "linux")]
+pub(super) async fn scheduling_reads<K, T, RF, AF>(
+    settle: Option<impl std::future::Future<Output = ()>>,
+    mut read: impl FnMut() -> RF,
+    mut ask: impl FnMut(K) -> AF,
+) -> (T, K)
+where
+    K: Copy,
+    RF: std::future::Future<Output = K>,
+    AF: std::future::Future<Output = (T, Option<Instant>)>,
+{
+    if let Some(settle) = settle {
+        settle.await;
+    }
+    let mut waited = false;
+    loop {
+        let keymap = read().await;
+        let (answer, estimate) = ask(keymap).await;
+        match estimate {
+            Some(at) if !waited && at.saturating_duration_since(Instant::now()) <= O5_WAIT => {
+                waited = true;
+                drop(answer);
+                tokio::time::sleep_until(at.into()).await;
+            }
+            _ => return (answer, keymap),
+        }
+    }
+}
+
 /// A probe's start condition on the writer thread (R5 §4.2, O-20.2): the
 /// writer's own retirement refuses it; otherwise `fresh` is read, then the
 /// gate's arm section runs `admit` under the gate's lock, with the writer's
@@ -650,6 +692,7 @@ pub(super) fn end_probe_segment(
 pub(super) fn probe_ended(
     input: &crate::composer_probe::epoch::GenerationInput,
     gate: &crate::composer_probe::gate::Gate<UserFrame>,
+    agent_id: &str,
     number: u64,
     end: ProbeEnd,
     ask: ProbeAsk,
@@ -669,6 +712,7 @@ pub(super) fn probe_ended(
         ProbeEnd::Refused(refusal) => {
             tracing::debug!(
                 target: "composer_probe",
+                agent_id,
                 ?ask,
                 ?refusal,
                 "probe refused at the writer"
@@ -813,60 +857,57 @@ impl AgentPtyRegistry {
         if ask != ProbeAsk::Lapse && !input.probe_due(Instant::now()) {
             return ProbeOutcome::NotDue;
         }
-        if h.observer.permission() == crate::composer_probe::Permission::Pending {
-            // Settle it now rather than at the observer's next sweep, and
-            // before the keymap read below, which an unsettled generation
-            // answers `Unmeasured` (U3-03).
-            let observer = Arc::clone(&h.observer);
-            let _ = tokio::task::spawn_blocking(move || observer.settle()).await;
-        }
-        let mut waited = false;
-        let (w, keymap) = loop {
-            // The keymap and the screen are read with no lock held, and read
-            // again after an O5 wait: nothing read before it stands after it
-            // (U3-03).
-            let keymap = {
+        // Settle a pending permission now rather than at the observer's next
+        // sweep, and before the keymap read, which an unsettled generation
+        // answers `Unmeasured` (U3-03).
+        let settle =
+            (h.observer.permission() == crate::composer_probe::Permission::Pending).then(|| {
                 let observer = Arc::clone(&h.observer);
-                tokio::task::spawn_blocking(move || observer.keymap())
-                    .await
-                    .unwrap_or(Err(crate::composer_probe::keymap::Hold::Unmeasured))
-            };
-            let surface = surface_shows_composer(h.agent.as_ref(), h.bus.clean_frame());
-            let w = h.writer.lock().await;
-            let now = Instant::now();
-            let status = h.gate.gate.status();
-            let (fence, lapsed_e0) = input.admission_fence(status.fenced, status.held_ops, now);
-            let attempt = match ask {
-                ProbeAsk::First => Attempt::First,
-                ProbeAsk::Retry => Attempt::Retry,
-                ProbeAsk::Lapse => Attempt::Lapse {
-                    lapsed_e0: lapsed_e0.unwrap_or(u64::MAX),
-                },
-            };
-            let outside = Outside {
-                attempt,
-                permission: h.observer.permission(),
-                fence,
-                human_ticket: h.ledger.any_outstanding(),
-                boundary: w.physical_boundary(),
-                keymap,
-                surface,
-            };
-            match h.observer.admits(&outside, now) {
-                // O5 is availability, not safety (A1 §4.4): an attempt due
-                // before the agent's own redraw waits run out is scheduled
-                // at the estimate, once, rather than refused.
-                Err(crate::composer_probe::admission::Refusal::Estimate(at))
-                    if !waited && at.saturating_duration_since(now) <= O5_WAIT =>
-                {
-                    waited = true;
-                    drop(w);
-                    tokio::time::sleep_until(at.into()).await;
-                    continue;
+                async move {
+                    let _ = tokio::task::spawn_blocking(move || observer.settle()).await;
                 }
-                _ => break (w, keymap),
-            }
-        };
+            });
+        let (hr, inp) = (&h, &input);
+        let (w, keymap) = scheduling_reads(
+            settle,
+            || {
+                let observer = Arc::clone(&hr.observer);
+                async move {
+                    tokio::task::spawn_blocking(move || observer.keymap())
+                        .await
+                        .unwrap_or(Err(crate::composer_probe::keymap::Hold::Unmeasured))
+                }
+            },
+            move |keymap| async move {
+                let surface = surface_shows_composer(hr.agent.as_ref(), hr.bus.clean_frame());
+                let w = hr.writer.lock().await;
+                let now = Instant::now();
+                let status = hr.gate.gate.status();
+                let (fence, lapsed_e0) = inp.admission_fence(status.fenced, status.held_ops, now);
+                let attempt = match ask {
+                    ProbeAsk::First => Attempt::First,
+                    ProbeAsk::Retry => Attempt::Retry,
+                    ProbeAsk::Lapse => Attempt::Lapse {
+                        lapsed_e0: lapsed_e0.unwrap_or(u64::MAX),
+                    },
+                };
+                let outside = Outside {
+                    attempt,
+                    permission: hr.observer.permission(),
+                    fence,
+                    human_ticket: hr.ledger.any_outstanding(),
+                    boundary: w.physical_boundary(),
+                    keymap,
+                    surface,
+                };
+                let estimate = match hr.observer.admits(&outside, now) {
+                    Err(crate::composer_probe::admission::Refusal::Estimate(at)) => Some(at),
+                    _ => None,
+                };
+                (w, estimate)
+            },
+        )
+        .await;
         // The frame the screen is read from, with its layout epoch and place
         // in the output, in one hold: the writer refuses the screen unless it
         // still stands (U3-03, R-D-U2-01).
@@ -949,9 +990,17 @@ impl AgentPtyRegistry {
         drop(w);
         let end = probe.end().await;
         let observer = Arc::clone(&h.observer);
-        probe_ended(&input, &h.gate.gate, number, end, ask, move || {
-            observer.disarm();
-        })
+        probe_ended(
+            &input,
+            &h.gate.gate,
+            agent_id,
+            number,
+            end,
+            ask,
+            move || {
+                observer.disarm();
+            },
+        )
     }
 
     /// No other platform probes: the `e2e` build's request answers that.
@@ -1382,20 +1431,82 @@ mod tests {
         );
     }
 
-    /// Scenario: A generation's probe attempts fail three times in a row, so its observer is broken and its next attempt waits the backoff. A person types a key: one fresh attempt is due at once. A terminal's report alone, or an empty op, makes none due.
+    /// Scenario: For Claude and Codex, a probe is written past the trigger's wait with no helper seen and nothing held behind it, and the agent may be waiting for a cursor report (`B` holds). Only Claude's reads as lapsed, so only Claude's lapse retry reaches admission's lapse checks, where `B` refuses it; Codex's is refused as having no lapsed probe to supersede, before any lapse check, whatever `B` says (O-20.7c: the lapse retry's checks are Claude's alone, though an attempt carries no agent).
+    #[cfg(target_os = "linux")]
+    #[spec("inbox/probe/030")]
+    #[test]
+    fn probe_030_only_a_claude_probe_reaches_the_lapse_retrys_checks() {
+        use crate::composer_probe::admission::{Attempt, Outside, Refusal};
+        use crate::composer_probe::epoch::OutputNote;
+        use crate::composer_probe::planner::Boundary;
+        use crate::composer_probe::query_ledger::{QueryKind, T_TRIGGER};
+        use crate::composer_probe::segments::Agent;
+        let now = Instant::now();
+        let Some(at) = now.checked_sub(T_TRIGGER + Duration::from_secs(1)) else {
+            return;
+        };
+        for (agent, refusal) in [
+            (Agent::Claude, Refusal::Backlog),
+            (Agent::Codex, Refusal::NotLapsed),
+        ] {
+            let input = live(agent);
+            let (number, job) = input.segment_open_probe(false, now).unwrap();
+            // Its own byte, through the input, as the writer enqueues it.
+            input.enqueue(crate::composer_probe::epoch::Writer::Deck(job), b"\x07");
+            input.segment_written(number, 0, at, now).unwrap();
+            input.on_output(&[OutputNote::Query(QueryKind::Cpr)], now);
+            assert!(input.backlog(), "{agent:?}: `B` holds");
+            let (fence, lapsed_e0) = input.admission_fence(true, 0, now);
+            let lapse = Outside {
+                attempt: Attempt::Lapse {
+                    lapsed_e0: lapsed_e0.unwrap_or(u64::MAX),
+                },
+                permission: crate::composer_probe::Permission::Armable,
+                fence,
+                human_ticket: false,
+                boundary: Boundary::Ground,
+                keymap: Ok(()),
+                surface: true,
+            };
+            assert_eq!(input.admit_probe(&lapse, now), Err(refusal), "{agent:?}");
+        }
+    }
+
+    /// Scenario: A generation's probe attempts fail three times in a row, so its observer is broken and its next attempt waits the backoff. An empty op makes none due, nor does a terminal's whole reply to a query the deck saw the agent ask (an exempt report). A person's key makes one fresh attempt due at once; so does a terminal reply the deck can't exempt (a duplicate of one it already answered), which counts as typing.
     #[spec("inbox/probe/030")]
     #[test]
     fn probe_030_a_persons_key_makes_a_broken_observers_attempt_due() {
-        use crate::composer_probe::epoch::Writer;
+        use crate::composer_probe::epoch::{Enqueued, OutputNote, Writer};
+        use crate::composer_probe::query_ledger::QueryKind;
         use crate::composer_probe::segments::Agent;
-        let input = live(Agent::Claude);
-        let now = Instant::now();
-        for _ in 0..crate::composer_probe::probe::BROKEN_AFTER {
-            input.probe_failed(now);
-        }
-        assert!(!input.probe_due(now), "broken, waiting its backoff");
+        const DA1_REPLY: &[u8] = b"\x1b[?62;22c";
+        let broken = || {
+            let input = live(Agent::Claude);
+            let now = Instant::now();
+            for _ in 0..crate::composer_probe::probe::BROKEN_AFTER {
+                input.probe_failed(now);
+            }
+            assert!(!input.probe_due(now), "broken, waiting its backoff");
+            (input, now)
+        };
+        let (input, now) = broken();
         input.enqueue(Writer::Human, b"");
         assert!(!input.probe_due(now), "an empty op is no typing");
+        input.on_output(&[OutputNote::Query(QueryKind::Da1)], now);
+        assert!(
+            matches!(input.enqueue(Writer::Human, DA1_REPLY), Enqueued::Exempt(_)),
+            "the control: the reply is exempt"
+        );
+        assert!(!input.probe_due(now), "an exempt report is no typing");
+        assert!(
+            matches!(input.enqueue(Writer::Human, DA1_REPLY), Enqueued::Moved(_)),
+            "a duplicate reply isn't exempt"
+        );
+        assert!(
+            input.probe_due(now),
+            "an unexempt terminal reply counts as typing: one attempt due"
+        );
+        let (input, now) = broken();
         input.enqueue(Writer::Human, b"x");
         assert!(
             input.probe_due(now),
@@ -1558,7 +1669,84 @@ mod tests {
         );
     }
 
-    /// Scenario: Read the probe request's source: a pending permission is settled before the keymap is read, and the keymap is read inside the loop that waits for the agent's redraw estimate, so an attempt that waited asks admission with a keymap read after its wait, not before it (U3-03).
+    /// Scenario: Run the probe request's scheduling reads with a stand-in observer. With the permission pending, the settlement runs before the first keymap read, so the keymap reads settled (a keymap read before it would read Unmeasured); with nothing to settle the same read reads Unmeasured. When the first pass is refused only by the redraw estimate (O5), the request waits for it and reads the keymap again: a key binding changed during the wait is what it asks with and answers, not the one read before the wait. A second estimate refusal is answered as it is, with no second wait (R-D-U3-01, the audit's U3-6).
+    #[cfg(target_os = "linux")]
+    #[spec("inbox/probe/059")]
+    #[tokio::test]
+    async fn probe_059_the_keymap_is_read_after_settlement_and_again_after_the_redraw_wait() {
+        use crate::composer_probe::keymap::Hold;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        // Pending -> settled: the read after the settlement sees it.
+        for pending in [true, false] {
+            let settled = Arc::new(AtomicBool::new(false));
+            let settle = pending.then(|| {
+                let settled = Arc::clone(&settled);
+                async move { settled.store(true, Ordering::SeqCst) }
+            });
+            let reads = Arc::new(Mutex::new(Vec::new()));
+            let (asked, keymap) = scheduling_reads(
+                settle,
+                || {
+                    let (settled, reads) = (Arc::clone(&settled), Arc::clone(&reads));
+                    async move {
+                        let read: Result<(), Hold> = if settled.load(Ordering::SeqCst) {
+                            Ok(())
+                        } else {
+                            Err(Hold::Unmeasured)
+                        };
+                        reads.lock().unwrap().push(read);
+                        read
+                    }
+                },
+                |keymap| async move { (keymap, None) },
+            )
+            .await;
+            let expected = if pending {
+                Ok(())
+            } else {
+                Err(Hold::Unmeasured)
+            };
+            assert_eq!(*reads.lock().unwrap(), [expected], "pending: {pending}");
+            assert_eq!((asked, keymap), (expected, expected), "pending: {pending}");
+        }
+        // A binding changed across the O5 wait: the second read stands.
+        for estimates in [1, 2] {
+            let binding = Arc::new(Mutex::new(Ok::<(), Hold>(())));
+            let passes = Arc::new(AtomicUsize::new(0));
+            let started = Instant::now();
+            let (asked, keymap) = scheduling_reads(
+                None::<std::future::Ready<()>>,
+                || {
+                    let binding = Arc::clone(&binding);
+                    async move { *binding.lock().unwrap() }
+                },
+                |keymap| {
+                    let (binding, passes) = (Arc::clone(&binding), Arc::clone(&passes));
+                    async move {
+                        let pass = passes.fetch_add(1, Ordering::SeqCst);
+                        // Refused by the estimate on the first `estimates`
+                        // passes; the binding changes during the first wait.
+                        let estimate =
+                            (pass < estimates).then(|| Instant::now() + Duration::from_millis(20));
+                        if pass == 0 {
+                            *binding.lock().unwrap() = Err(Hold::Changed);
+                        }
+                        (keymap, estimate)
+                    }
+                },
+            )
+            .await;
+            assert_eq!(passes.load(Ordering::SeqCst), 2, "one wait, then once more");
+            assert!(started.elapsed() >= Duration::from_millis(20), "it waited");
+            assert_eq!(
+                (asked, keymap),
+                (Err(Hold::Changed), Err(Hold::Changed)),
+                "the keymap read after the wait, not before it ({estimates} estimates)"
+            );
+        }
+    }
+
+    /// Scenario: A source-order check, not a behaviour check: read the probe request's source and find that it routes its scheduling reads through the function the behavioural test above runs, handing it the observer's settlement before its keymap read. It stands until the request itself runs under a test (A-20d-1 and A-20d-2's composed rig).
     #[cfg(target_os = "linux")]
     #[spec("inbox/probe/059")]
     #[test]
@@ -1573,14 +1761,16 @@ mod tests {
             .and_then(|rest| rest.split("let claim = Arc::new(").next())
             .expect("the probe request");
         let settle = request.find("observer.settle()").expect("the settlement");
+        let reads = request
+            .find("scheduling_reads(")
+            .expect("the scheduling reads");
         let keymap = request.find("observer.keymap()").expect("the keymap read");
-        let wait = request.find("loop {").expect("the redraw wait");
         assert!(
-            settle < keymap,
-            "the permission is settled before the keymap read"
+            settle < reads && reads < keymap,
+            "the settlement and the keymap read are handed to the scheduling reads"
         );
-        assert!(wait < keymap, "the keymap is read again after a wait");
         assert_eq!(request.matches("observer.keymap()").count(), 1);
+        assert_eq!(request.matches("scheduling_reads(").count(), 1);
     }
 
     /// Scenario: Map held typing to the card's cause across ages, waiters and the front segment's kind and stage. A full queue says so at any age; under five seconds it says a check is running; after that a probe not yet opened, one opened and not returned, and a person's own Ctrl+G each get their own words, and with no segment it still says checking.
