@@ -2911,7 +2911,20 @@ const HYDRATE_ATTACH_TIMEOUT: Duration = Duration::from_secs(3);
 /// which is heavier than `list_agents` but should still complete within a
 /// few seconds on a healthy host. Without this bound a wedged same-UID
 /// daemon would pin the TUI's blocking `block_on` indefinitely.
-const CREATE_PANE_START_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const CREATE_PANE_START_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What an OpenCode start's reply may spend outside its `--version` probe
+/// ([`crate::opencode_version::PROBE_TIMEOUT`]) and still arrive inside
+/// [`CREATE_PANE_START_TIMEOUT`]: the `Hello`, the integration refresh and the
+/// PTY spawn (PRD #2050, session/restore/014).
+const START_REPLY_HEADROOM: Duration = Duration::from_secs(2);
+
+// The daemon holds an OpenCode start's reply for the probe, so a probe that
+// runs its whole bound must still leave the TUI time to hear the reply.
+const _: () = assert!(
+    crate::opencode_version::PROBE_TIMEOUT.as_millis() + START_REPLY_HEADROOM.as_millis()
+        <= CREATE_PANE_START_TIMEOUT.as_millis()
+);
 
 /// PRD #1666 S5: how long a post of a deck-generated message may take. A post
 /// writes nothing to a pane, so the daemon answers it at once.

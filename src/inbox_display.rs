@@ -385,14 +385,16 @@ impl CardInbox {
     }
 
     /// The card's inbox notice row, the same words in both clients, when the
-    /// deck has something to say beyond the line: why the integration takes
-    /// nothing yet, paused hand-outs, what an uncertain delivery means (what
-    /// running out of attempts means, when every uncertain one has: its row
-    /// offers no Retry), what a message the agent may not have received
-    /// means, held_long attention, then failed receipt storage — the first
-    /// that holds. A refused request of the agent's own for its messages comes
-    /// first of all (PRD #1666 part 3, R-2): nothing else reaches it until
-    /// that is fixed.
+    /// deck has something to say beyond the line — the first that holds of:
+    /// the daemon's notice about a way the agent runs that the deck cannot
+    /// fully support (`agent_notice`, PRD #2050), which explains everything
+    /// below it; a refused request of the agent's own for its messages (PRD
+    /// #1666 part 3, R-2), since nothing else reaches it until that is fixed;
+    /// why the integration takes nothing yet; paused hand-outs; what an
+    /// uncertain delivery means (what running out of attempts means, when
+    /// every uncertain one has: its row offers no Retry); what a message the
+    /// agent may not have received means; held_long attention; then failed
+    /// receipt storage.
     pub fn notice_text(&self) -> Option<String> {
         // PRD #2050: first, because it explains why the agent's integration
         // takes nothing (or reports nothing) and says what to do about it.

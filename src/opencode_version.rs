@@ -176,7 +176,15 @@ const MAX_CACHE_ENTRIES: usize = 64;
 
 /// How long `--version` may take. Measured on this project's dev box: 2.x
 /// answers in 0.2–0.4 s and 1.x in 1.0–1.3 s.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// A spawn's reply waits for this probe, so it must fit inside the shortest
+/// bound a client puts on a start: the TUI's
+/// [`crate::embedded_pane::CREATE_PANE_START_TIMEOUT`] (5 s), asserted there.
+/// At 5 s a binary whose `--version` hung timed the TUI's start out, and the
+/// agent came up on the dashboard unattached and without the name it was
+/// started under (session/restore/014). A probe that runs out of time leaves
+/// the version unknown, which starts the program as given.
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The most of `--version`'s output the probe reads.
 const PROBE_OUTPUT_LIMIT: u64 = 4096;
@@ -1145,6 +1153,39 @@ mod tests {
             "/bin/opencode{}",
             MAX_CACHE_ENTRIES + 9
         ))));
+    }
+
+    /// Scenario: a spawn whose `opencode` hangs on `--version` gets its answer
+    /// (the program, version unknown) within [`PROBE_TIMEOUT`], which leaves
+    /// the TUI's start budget room to hear the reply — at 5 s it did not, and a
+    /// restored pane came up unnamed and unattached (session/restore/014).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hanging_version_probe_answers_a_spawn_inside_the_tui_start_budget() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let hanging = dir.path().join("opencode");
+        crate::test_isolation::write_script(&hanging, b"#!/bin/sh\nsleep 600\n").unwrap();
+        std::fs::set_permissions(
+            &hanging,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+        let path_env = std::ffi::OsString::from("/usr/bin:/bin");
+        let command = hanging.to_str().unwrap().to_string();
+        let started = std::time::Instant::now();
+        let target = spawn_target(Some(&command), Some(&path_env), Some(dir.path()));
+        let elapsed = started.elapsed();
+        assert_eq!(
+            target,
+            SpawnTarget::Direct {
+                program: hanging.clone(),
+                version: None,
+            }
+        );
+        assert!(
+            elapsed + Duration::from_secs(1) < crate::embedded_pane::CREATE_PANE_START_TIMEOUT,
+            "the probe held the spawn for {elapsed:?}"
+        );
     }
 
     /// Scenario: a `--version` that prints a version and exits while a

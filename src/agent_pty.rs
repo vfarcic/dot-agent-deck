@@ -14546,26 +14546,6 @@ impl AgentPtyRegistry {
         Some(Self::classify_shell_activity(&candidates, &table))
     }
 
-    /// The live panes a shell-activity sample could say something about, each
-    /// already paired with the argv shapes that apply to *its* agent kind
-    /// (PRD #386 M3 / issue #493).
-    ///
-    /// This is the **lock half** of the snapshot, split out so the caller can
-    /// answer "is there anything to classify?" *before* paying for a process
-    /// table. It is the whole fix for issue #493: `process_table()` used to be
-    /// the first statement of [`Self::shell_foreground_busy_snapshot`], so a
-    /// daemon with zero panes still forked `ps -A` twice a second (plus a
-    /// `getsid(2)` per row) to classify nobody — and the daemon's idle shutdown
-    /// does not bound that, since it requires no clients *and* no agents, so a
-    /// TUI attached with no panes open polled forever for no possible benefit.
-    ///
-    /// Every field is **owned**, so the registry lock is released the moment
-    /// this returns and the sample (a fork/exec) runs with no lock held — the
-    /// property the original sample-first ordering existed to guarantee, now
-    /// guaranteed by the drop instead. `shell_pid` is read here rather than at
-    /// classification time for the same reason: it is a plain field read on the
-    /// child handle, so it is safe under the lock, and resolving it early means
-    /// a pane whose pid is unavailable drops out before it can force a sample.
     /// PRD #2050: the live agents whose pane runs OpenCode — by the type the
     /// spawn declared or a hook revealed, or else by its command's basename —
     /// with the pid their process tree hangs from, for the daemon's watch on
@@ -14594,6 +14574,26 @@ impl AgentPtyRegistry {
             .collect()
     }
 
+    /// The live panes a shell-activity sample could say something about, each
+    /// already paired with the argv shapes that apply to *its* agent kind
+    /// (PRD #386 M3 / issue #493).
+    ///
+    /// This is the **lock half** of the snapshot, split out so the caller can
+    /// answer "is there anything to classify?" *before* paying for a process
+    /// table. It is the whole fix for issue #493: `process_table()` used to be
+    /// the first statement of [`Self::shell_foreground_busy_snapshot`], so a
+    /// daemon with zero panes still forked `ps -A` twice a second (plus a
+    /// `getsid(2)` per row) to classify nobody — and the daemon's idle shutdown
+    /// does not bound that, since it requires no clients *and* no agents, so a
+    /// TUI attached with no panes open polled forever for no possible benefit.
+    ///
+    /// Every field is **owned**, so the registry lock is released the moment
+    /// this returns and the sample (a fork/exec) runs with no lock held — the
+    /// property the original sample-first ordering existed to guarantee, now
+    /// guaranteed by the drop instead. `shell_pid` is read here rather than at
+    /// classification time for the same reason: it is a plain field read on the
+    /// child handle, so it is safe under the lock, and resolving it early means
+    /// a pane whose pid is unavailable drops out before it can force a sample.
     pub fn shell_activity_candidates(
         &self,
         shapes: &[crate::platform::proc::ShellToolShape],

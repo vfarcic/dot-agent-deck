@@ -329,6 +329,9 @@ pub(crate) fn arguments_of(pid: u32) -> Option<Vec<String>> {
     (!argv.is_empty()).then_some(argv)
 }
 
+// On Windows `process_table` and `executable_of` are stubs that answer `None`,
+// so [`sample`] produces no sample and the watch sets no notice there; that is
+// left as it is because the deck does not ship for Windows yet.
 #[cfg(not(unix))]
 pub(crate) fn arguments_of(_pid: u32) -> Option<Vec<String>> {
     None
