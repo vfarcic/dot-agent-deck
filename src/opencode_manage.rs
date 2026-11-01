@@ -271,7 +271,7 @@ fn existing_plugin_artifacts() -> Vec<PathBuf> {
 /// file at its pin, so it writes its own template. Only a daemon built with
 /// this check keeps from downgrading: one built before it writes its own
 /// template as it always did.
-const PLUGIN_TEMPLATE_REVISION: u32 = 1;
+const PLUGIN_TEMPLATE_REVISION: u32 = 2;
 
 /// Render the plugin JavaScript with `BINARY_PATH` pinned to `binary_path`.
 ///
@@ -10848,8 +10848,8 @@ await wait(1500);
     fn the_template_revision_is_bumped_with_the_template() {
         use sha2::Digest;
         const RECORDED: (u32, &str) = (
-            1,
-            "035ed0de20f3b21daa63df10c95b00bd56829aac6abe152121a976d31d126a33",
+            2,
+            "4539aee833d48aed338e7d42d4c9dc24210cb54bf27782a5ea2a64da241d4a38",
         );
         let digest = sha2::Sha256::digest(plugin_template("/opt/dot-agent-deck").as_bytes());
         let digest: String = digest.iter().map(|b| format!("{b:02x}")).collect();
