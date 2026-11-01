@@ -432,3 +432,26 @@ fn probe_081_an_announcement_before_the_pane_is_surfaced_waits_for_its_account()
         );
     }
 }
+
+/// Scenario: The successor's not-delivered announcement arrives while this client still manages the stopped generation's pane and holds its account; then the pane's close arrives and drops that account, and the daemon surfaces the successor's card. The surfaced card shows the shared not-delivered words.
+#[spec("inbox/probe/081")]
+#[test]
+fn probe_081_an_announcement_before_the_pane_closes_survives_the_close() {
+    let text = words()["inputNotDelivered"].as_str().unwrap().to_owned();
+    let mut state = hydrated("1", record("1", None));
+    state.apply_input_held_update(&InputHeldUpdate {
+        pane_id: PANE.into(),
+        agent_id: "2".into(),
+        input_held: None,
+        input_discarded: Some(discarded(1)),
+    });
+    state.unregister_pane(PANE);
+    state.sessions.remove("sess-1");
+    let card = session("2");
+    state.sessions.insert(card.session_id.clone(), card);
+    state.apply_inbox_summary(PANE, "2", &record("2", None).inbox.unwrap());
+    assert_eq!(
+        state.sessions["sess-2"].input_held_notice(),
+        Some(text.as_str())
+    );
+}

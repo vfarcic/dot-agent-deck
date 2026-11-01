@@ -1741,12 +1741,13 @@ pub struct AppState {
     /// a failed integration refresh among them — while it spawns it, before
     /// the client has its card; the surfacing start carries them.
     pane_inboxes: HashMap<String, PaneInbox>,
-    /// PRD #1666 part 3 (Q35-20e): the daemon's latest word on held typing
-    /// for a pane this client neither manages nor has an account of yet, by
-    /// pane, at most [`MAX_PENDING_INPUT_HELD`]. A generation that took a
-    /// pane this client let go of is announced before its card is surfaced;
-    /// the account that surfacing gives takes it when it names that
-    /// generation ([`Self::take_pane_inbox`]).
+    /// PRD #1666 part 3 (Q35-20e): the daemon's latest word on held typing,
+    /// by pane, at most [`MAX_PENDING_INPUT_HELD`], kept apart from the
+    /// pane's account, which a close drops. A generation that took a pane
+    /// this client is letting go of can be announced before the close
+    /// arrives or after it, and before its card is surfaced; an account
+    /// created later takes the word when it names that generation
+    /// ([`Self::take_pane_inbox`]).
     pending_input_held: HashMap<String, PaneHeld>,
     /// Issue #1635: what the TUI's last release check found — the plans for
     /// this machine's copies — set by [`crate::upgrade_dialog::run_checker`]
@@ -9569,11 +9570,11 @@ impl AppState {
     /// ([`PaneInbox::retire`]), and drawn on its card.
     fn take_pane_inbox(&mut self, pane_id: &str, mut next: PaneInbox) {
         // Q35-20e: held typing announced before this account existed.
-        if let Some(pending) = self.pending_input_held.remove(pane_id)
-            && next.held.is_none()
+        if next.held.is_none()
+            && let Some(pending) = self.pending_input_held.get(pane_id)
             && next.agent_id.as_deref() == Some(pending.agent_id.as_str())
         {
-            next.held = Some(pending);
+            next.held = Some(pending.clone());
         }
         self.pane_inboxes
             .entry(pane_id.to_string())
@@ -9623,30 +9624,30 @@ impl AppState {
     /// [`Self::apply_inbox_notice`] applies notices to. Bound to the
     /// generation it names: one this pane's account has retired changes
     /// nothing, and one naming a generation the account has not reached yet
-    /// waits for that generation's handover ([`PaneInbox::retire`]). One for
-    /// a pane with neither waits for the account the pane's surfacing gives
-    /// ([`Self::pending_input_held`]).
+    /// waits for that generation's handover ([`PaneInbox::retire`]). Each is
+    /// also kept apart from the account ([`Self::pending_input_held`]), so a
+    /// pane closed after it, or never managed, still gives it to the account
+    /// its surfacing creates for that generation.
     pub fn apply_input_held_update(&mut self, update: &crate::event::InputHeldUpdate) {
         let held = PaneHeld::new(
             &update.agent_id,
             update.input_held.as_ref(),
             update.input_discarded.as_ref(),
         );
+        if self.pending_input_held.len() >= MAX_PENDING_INPUT_HELD
+            && !self.pending_input_held.contains_key(&update.pane_id)
+            && let Some(dropped) = self.pending_input_held.keys().next().cloned()
+        {
+            self.pending_input_held.remove(&dropped);
+        }
+        self.pending_input_held
+            .insert(update.pane_id.clone(), held.clone());
         let inbox = if self.managed_pane_ids.contains(&update.pane_id) {
             self.pane_inboxes.entry(update.pane_id.clone()).or_default()
         } else {
             match self.pane_inboxes.get_mut(&update.pane_id) {
                 Some(inbox) => inbox,
-                None => {
-                    if self.pending_input_held.len() >= MAX_PENDING_INPUT_HELD
-                        && !self.pending_input_held.contains_key(&update.pane_id)
-                        && let Some(dropped) = self.pending_input_held.keys().next().cloned()
-                    {
-                        self.pending_input_held.remove(&dropped);
-                    }
-                    self.pending_input_held.insert(update.pane_id.clone(), held);
-                    return;
-                }
+                None => return,
             }
         };
         if inbox.retired.contains(&update.agent_id) {
