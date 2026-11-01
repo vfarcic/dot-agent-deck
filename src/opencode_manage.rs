@@ -11120,6 +11120,7 @@ const ctx = {
     /// JavaScript argument list): `"mini"` makes it read as `opencode mini`,
     /// nothing as the full TUI, since the client mode is read from a process's
     /// own arguments unless it is a `serve`.
+    #[cfg(unix)]
     fn run_v2_driver_as(
         args: &str,
         body: &str,
