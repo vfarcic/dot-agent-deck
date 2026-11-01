@@ -572,3 +572,50 @@ fn probe_081_another_daemon_process_forgets_the_kept_words() {
     state.apply_inbox_summary(PANE, "2", &record("2", None).inbox.unwrap());
     assert_eq!(card(&state, "2").input_held_notice(), None);
 }
+
+/// Scenario: A managed pane's card belongs to generation 12 under one daemon process. The stream reconnects to another process, whose agent ids start over, and its generation 3 is announced holding typing before its handover reaches the pane; once the handover arrives the card shows the held-typing words at once: the replaced process's generation 12 does not reject the new process's word as older. Control: the same word with no reconnect is rejected as an older generation's, and the card shows nothing (review U3-a).
+#[spec("inbox/probe/081")]
+#[test]
+fn probe_081_another_process_account_rejects_no_new_word() {
+    let text = words()["inputHeld"]["checking"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let run = |reconnect: bool| {
+        let named = |process: &str| serde_json::from_value(serde_json::json!(process)).unwrap();
+        let mut state = AppState::default();
+        state.learn_stream_incarnation(named("daemon-a"));
+        state.register_pane(PANE.to_string());
+        let old = session("12");
+        state.sessions.insert(old.session_id.clone(), old);
+        state.take_inbox_snapshot(&[record("12", None)]);
+        if reconnect {
+            state.learn_stream_incarnation(named("daemon-b"));
+        }
+        state.apply_input_held_update(&InputHeldUpdate {
+            pane_id: PANE.into(),
+            agent_id: "3".into(),
+            input_held: Some(held("3", InputHeldCause::Checking)),
+            input_discarded: None,
+        });
+        state.sessions.remove("sess-12");
+        let surfaced = session("3");
+        state.sessions.insert(surfaced.session_id.clone(), surfaced);
+        state.apply_inbox_handover(&InboxHandover {
+            pane_id: PANE.into(),
+            agent_id: "3".into(),
+            summary: record("3", None).inbox.unwrap(),
+        });
+        card(&state, "3").input_held_notice().map(str::to_owned)
+    };
+    assert_eq!(
+        run(false),
+        None,
+        "control: under the same process an older generation's word is rejected"
+    );
+    assert_eq!(
+        run(true),
+        Some(text),
+        "another process's generation 12 does not reject the new process's generation 3"
+    );
+}

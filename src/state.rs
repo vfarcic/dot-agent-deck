@@ -6851,6 +6851,14 @@ struct PaneInbox {
     /// from the summary and from each attention notice, which carries them
     /// whole.
     notices: crate::inbox_hub::InboxCardNotices,
+    /// Review U3-a: the stream has moved to another daemon process since
+    /// this account was taken ([`AppState::learn_stream_incarnation`]).
+    /// Agent ids are daemon-local, so its [`Self::agent_id`] and
+    /// [`Self::retired`] name generations of the replaced process: they fence
+    /// no held-typing word from the new one
+    /// ([`AppState::apply_input_held_update`]), and the next account of the
+    /// pane carries none of them ([`Self::retire`]).
+    from_replaced_process: bool,
 }
 
 /// PRD #1666 part 3 (Q35-20e): what the daemon last said of the typing it
@@ -6942,6 +6950,7 @@ impl PaneInbox {
             hold_detail: summary.hold_detail.clone(),
             held: None,
             notices: summary.notices.clone(),
+            from_replaced_process: false,
         }
     }
 
@@ -6951,6 +6960,11 @@ impl PaneInbox {
     /// its own joins them when `next` names another.
     fn retire(&mut self, mut next: PaneInbox) {
         let mut retired = std::mem::take(&mut self.retired);
+        if self.from_replaced_process {
+            // U3-a: another process's ids; this process may reuse them.
+            retired.clear();
+            self.agent_id = None;
+        }
         if let Some(previous) = self.agent_id.take()
             && next.agent_id.as_ref() != Some(&previous)
         {
@@ -8424,8 +8438,12 @@ impl AppState {
                 self.note_process_replaced(previous);
                 // Q35-20e (R-E-U2-02): agent ids are daemon-local, so another
                 // process's words on held typing name generations this one's
-                // ids may reuse.
+                // ids may reuse; and its accounts' generations fence nothing
+                // from this one (review U3-a).
                 self.pending_input_held.clear();
+                for inbox in self.pane_inboxes.values_mut() {
+                    inbox.from_replaced_process = true;
+                }
             }
             self.replaced_processes
                 .retain(|replaced| replaced != process);
@@ -9709,13 +9727,16 @@ impl AppState {
             update.input_discarded.as_ref(),
         );
         // R-E-U2-02: a retired or older generation's late word is rejected
-        // before it is kept, so it can't displace its successor's.
+        // before it is kept, so it can't displace its successor's. An account
+        // taken under a replaced daemon process names that process's
+        // generations, which say nothing of this one's (review U3-a).
         if self.pane_inboxes.get(&update.pane_id).is_some_and(|inbox| {
-            inbox.retired.contains(&update.agent_id)
-                || inbox
-                    .agent_id
-                    .as_deref()
-                    .is_some_and(|agent| older_generation(&update.agent_id, agent))
+            !inbox.from_replaced_process
+                && (inbox.retired.contains(&update.agent_id)
+                    || inbox
+                        .agent_id
+                        .as_deref()
+                        .is_some_and(|agent| older_generation(&update.agent_id, agent)))
         }) || self
             .pending_input_held
             .get(&update.pane_id)
