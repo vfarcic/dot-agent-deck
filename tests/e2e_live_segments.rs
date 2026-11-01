@@ -127,7 +127,7 @@ fn probe_026_delayed_checks_preserve_typing_under_each_loss_mechanism() {
     }
 }
 
-/// Scenario: Check an untouched empty box with no intervening input, then read the numbers twice and try a stale generation. A supported export chain permits the matching empty observation; an unsupported chain must report Unreadable and leave observed unchanged, and fails when strict verification is required.
+/// Scenario: Check an untouched empty box with no intervening input, then read the numbers twice and try a stale generation. A supported export chain permits the matching empty observation; an unsupported chain must report Unreadable and leave observed unchanged, and fails when strict verification is required. This empty control queues no producer, so it does not establish retention of pending typing or mail on an unsupported export.
 #[spec("inbox/probe/026")]
 #[test]
 fn probe_026_empty_settlement_and_read_only_epoch_control() {
@@ -1214,7 +1214,7 @@ fn probe_057_e2_does_not_kill_a_running_user_editor() {
     assert_eq!(result["signal"], Value::Null);
 }
 
-/// Scenario: Run an unarmed user editor that either leaves a genuine background descendant alive or loses its already-open report connection when the daemon rejects an oversized report. After the real helper exits and the composer returns, its unresolved scope must refuse a fresh check without writing another probe; the survivor is released by its private fixture file.
+/// Scenario: Run an unarmed user editor that either leaves a genuine background descendant alive or loses its already-open report connection when the daemon rejects an oversized report. After the real helper exits and the composer returns, its unresolved scope must refuse a fresh check without writing another probe; the survivor exits on its private fixture file or a 120-second deadline. Hold policy already opens scope at the Unarmed decision, so these assertions do not isolate the later Survivors report or missing-report drain as the cause of scope remaining open.
 #[spec("inbox/probe/057")]
 #[test]
 fn probe_057_background_survivor_and_lost_report_keep_scope_open() {

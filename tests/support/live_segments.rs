@@ -50,6 +50,15 @@ fn executable(path: &Path, contents: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
+fn checked_replace(source: &str, anchor: &str, replacement: &str) -> String {
+    assert_eq!(
+        source.matches(anchor).count(),
+        1,
+        "live-segments fixture patch must match exactly once: {anchor:?}"
+    );
+    source.replacen(anchor, replacement, 1)
+}
+
 pub struct Fixture {
     pub daemon: common::DaemonProc,
     pub base: PathBuf,
@@ -80,20 +89,22 @@ impl Fixture {
         let exe = native.join(kind);
         fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
         fs::set_permissions(&exe, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::write(
-            native.join("composer_external_edit.py"),
-            include_str!("composer_external_edit.py").replace(
-                "# M31: keys unread by an editor during suspension disappear.",
-                "# Optional adversarial post-enable flush witness, local to S-20.\n                if self.path('.gate-flush').exists():\n                    os.write(1, b'\\x1b[?2004h')\n                    self.path('.flush-arrived').touch()\n                    while not self.path('.flush-go').exists(): time.sleep(.005)\n                # M31: keys unread by an editor during suspension disappear.",
-            ).replace(
-                "    def tokens(self, chunk):\n",
-                "    def tokens(self, chunk):\n        # A configured whole terminal report is inert to this stand-in.\n        # Candidate histories deliberately retain F2's normal Ctrl+G map.\n        report = self.path('.reported-osc')\n        if report.exists(): chunk = chunk.replace(report.read_bytes(), b'')\n",
-            ).replace(
-                "            path.unlink(missing_ok=True)\n            os.write(1, b'\\x1b[?2004h')",
-                "            path.unlink(missing_ok=True)\n            os.write(1, b'\\x1b[?2004h')\n            self.return_count = getattr(self, 'return_count', 0) + 1\n            self.path(f'.composer-return-{self.return_count}').touch()",
-            ),
-        )
-        .unwrap();
+        let composer = checked_replace(
+            include_str!("composer_external_edit.py"),
+            "# M31: keys unread by an editor during suspension disappear.",
+            "# Optional adversarial post-enable flush witness, local to S-20.\n                if self.path('.gate-flush').exists():\n                    os.write(1, b'\\x1b[?2004h')\n                    self.path('.flush-arrived').touch()\n                    while not self.path('.flush-go').exists(): time.sleep(.005)\n                # M31: keys unread by an editor during suspension disappear.",
+        );
+        let composer = checked_replace(
+            &composer,
+            "    def tokens(self, chunk):\n",
+            "    def tokens(self, chunk):\n        # A configured whole terminal report is inert to this stand-in.\n        # Candidate histories deliberately retain F2's normal Ctrl+G map.\n        report = self.path('.reported-osc')\n        if report.exists(): chunk = chunk.replace(report.read_bytes(), b'')\n",
+        );
+        let composer = checked_replace(
+            &composer,
+            "            path.unlink(missing_ok=True)\n            os.write(1, b'\\x1b[?2004h')",
+            "            path.unlink(missing_ok=True)\n            os.write(1, b'\\x1b[?2004h')\n            self.return_count = getattr(self, 'return_count', 0) + 1\n            self.path(f'.composer-return-{self.return_count}').touch()",
+        );
+        fs::write(native.join("composer_external_edit.py"), composer).unwrap();
         fs::write(
             native.join("composer.py"),
             if kind == "codex" {
@@ -103,12 +114,15 @@ impl Fixture {
             },
         )
         .unwrap();
-        let editor = include_str!("composer_test_editor.py").replace(
+        let editor = checked_replace(
+            include_str!("composer_test_editor.py"),
             "mode, base, *args = sys.argv[1:]",
             "mode, base, *args = sys.argv[1:]\nmode_file = Path(base + '.editor-mode')\nif mode_file.exists(): mode = mode_file.read_text().strip()",
-        ).replace(
+        );
+        let editor = checked_replace(
+            &editor,
             "path.write_bytes(b'EDITED",
-            "if mode == 'survivor':\n    survivor = os.fork()\n    if survivor == 0:\n        while not Path(base + '.survivor-go').exists(): time.sleep(.005)\n        os._exit(0)\n    Path(base + '.survivor-pid').write_text(str(survivor))\npath.write_bytes(b'EDITED",
+            "if mode == 'survivor':\n    survivor = os.fork()\n    if survivor == 0:\n        deadline = time.monotonic() + 120\n        while not Path(base + '.survivor-go').exists() and time.monotonic() < deadline: time.sleep(.005)\n        os._exit(0)\n    Path(base + '.survivor-pid').write_text(str(survivor))\npath.write_bytes(b'EDITED",
         );
         executable(&native.join("editor"), &editor);
         executable(&native.join("broker"), BROKER);
