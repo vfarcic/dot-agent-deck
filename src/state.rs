@@ -9761,7 +9761,10 @@ impl AppState {
     }
 
     /// PRD #1666 part 3 (Q35-20e, R-E-U3-02): the panes
-    /// [`Self::pending_input_held`] keeps a word for, for the bound's tests.
+    /// [`Self::pending_input_held`] keeps a word for, for the bound's tests
+    /// in `tests/render_input_held.rs` (an integration test, so it can't be
+    /// `cfg(test)`); no production caller.
+    #[doc(hidden)]
     pub fn pending_input_held_panes(&self) -> Vec<String> {
         let mut panes: Vec<String> = self.pending_input_held.keys().cloned().collect();
         panes.sort();
