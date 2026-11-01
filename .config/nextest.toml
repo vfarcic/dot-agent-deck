@@ -200,6 +200,13 @@ path = "junit.xml"
 filter = 'test(=probe_026_empty_settlement_and_read_only_epoch_control)'
 success-output = "immediate"
 
+# The same for `inbox/probe/046`, whose supported-export branch runs only on a
+# supported temp filesystem (GitHub Actions' lane 1), so a passing run shows
+# which branch it passed.
+[[profile.default.overrides]]
+filter = 'test(=probe_046_attached_dashboard_shows_clears_and_retires_held_typing)'
+success-output = "immediate"
+
 # `orchestration/delegate/012` compares a 650 ms stand-in readiness window
 # against a 1000 ms buffer, with a strict 500–900 ms measurement precondition.
 # A contended fast run observed 2.895 s with 88% I/O starvation; the same
