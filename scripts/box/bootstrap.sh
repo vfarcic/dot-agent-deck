@@ -306,21 +306,50 @@ eval "$(awk -v po="$PATH_OPEN" -v pc="$PATH_CLOSE" '$0 == po { on = 1 } on { pri
 step "agents"
 [ -x "$HOME/.local/bin/claude" ]    || curl -fsSL https://claude.ai/install.sh | bash
 # OpenCode 2.x on PATH (PRD #2050): this repo's agents run OpenCode 2.
-# https://opencode.ai/install installs OpenCode 1 only (it refuses a 2.x
-# version), so 2.x comes from its own installer, which writes the same
-# ~/.opencode/bin/opencode. It is pinned to the release the deck's OpenCode 2
-# support was measured on (the installer's `--version`), not the latest.
-# 2.x prints `opencode v2.2.5`, 1.x prints `1.19.5`. The installer runs only
-# when there is no binary or the one there positively reports 1.x: a binary
-# that answers nothing readable is reported, not replaced, since a broken 2.x
-# cannot be told from anything else that way.
+# Installed from npm, pinned to the release the deck's OpenCode 2 support was
+# measured on, so npm checks each tarball against the registry's integrity
+# hash (no unverified `curl | bash`). `@opencode/cli`'s postinstall puts the
+# platform binary from its pinned optional dependency in place and runs it
+# `--version`. It goes under its own prefix, and ~/.opencode/bin/opencode —
+# already on PATH — becomes a link to it. 2.x prints `opencode v2.2.5`, 1.x
+# prints `1.19.5`. The link is made only when there is no binary there, the
+# one there positively reports 1.x, or it is already this link: a 2.x
+# installed some other way is left alone, and a binary that answers nothing
+# readable is reported, not replaced, since a broken 2.x cannot be told from
+# anything else that way.
 OPENCODE_2_VERSION=2.2.5
+OPENCODE_2_DIR="$HOME/.local/share/dot-agent-deck/opencode-2"
+OPENCODE_2_BIN="$OPENCODE_2_DIR/node_modules/.bin/opencode"
 OC_BIN="$HOME/.opencode/bin/opencode"
 oc_major() { "$OC_BIN" --version 2>/dev/null | head -n1 | sed 's/^opencode //; s/^v//; s/\..*//'; }
-if [ ! -e "$OC_BIN" ] || [ "$(oc_major)" = 0 ] || [ "$(oc_major)" = 1 ]; then
-  curl -fsSL https://opencode.ai/v2/install | bash -s -- --version "$OPENCODE_2_VERSION"
+oc2_version() { "$OPENCODE_2_BIN" --version 2>/dev/null | head -n1 | sed 's/^opencode //; s/^v//'; }
+install_opencode_2() {
+  if [ "$(oc2_version)" != "$OPENCODE_2_VERSION" ]; then
+    mkdir -p "$OPENCODE_2_DIR"
+    npm install --prefix "$OPENCODE_2_DIR" --no-fund --no-audit --no-save "@opencode/cli@$OPENCODE_2_VERSION"
+    # As for 1.x below: an npm that holds install scripts back leaves the
+    # package's placeholder; the user's `ignore-scripts` policy is honoured
+    # and reported, not overridden.
+    if [ "$(oc2_version)" != "$OPENCODE_2_VERSION" ]; then
+      if [ "$(npm config get ignore-scripts 2>/dev/null)" = true ]; then
+        echo "  warning: npm's ignore-scripts is set, so @opencode/cli's postinstall did not run; to finish the OpenCode $OPENCODE_2_VERSION install, run it yourself: (cd $OPENCODE_2_DIR/node_modules/@opencode/cli && node ./postinstall.mjs)"
+      else
+        (cd "$OPENCODE_2_DIR/node_modules/@opencode/cli" && node ./postinstall.mjs)
+      fi
+    fi
+  fi
+  if [ "$(oc2_version)" = "$OPENCODE_2_VERSION" ]; then
+    mkdir -p "$(dirname "$OC_BIN")"
+    ln -sfn "$OPENCODE_2_BIN" "$OC_BIN"
+  else
+    echo "  warning: $OPENCODE_2_BIN is not OpenCode $OPENCODE_2_VERSION; $OC_BIN left as it is"
+  fi
+}
+if [ ! -e "$OC_BIN" ] || [ "$(readlink "$OC_BIN" 2>/dev/null)" = "$OPENCODE_2_BIN" ] \
+   || [ "$(oc_major)" = 0 ] || [ "$(oc_major)" = 1 ]; then
+  install_opencode_2
 elif ! [ "$(oc_major)" -ge 2 ] 2>/dev/null; then
-  echo "  warning: $OC_BIN does not report a version; left as it is (reinstall OpenCode 2 with: curl -fsSL https://opencode.ai/v2/install | bash -s -- --version $OPENCODE_2_VERSION)"
+  echo "  warning: $OC_BIN does not report a version; left as it is (to replace it with OpenCode $OPENCODE_2_VERSION, remove it and run this script again)"
 fi
 # OpenCode 1.x, pinned and kept OFF PATH, for the lane-2 tests that keep the
 # deck's OpenCode 1 support verifiable (PRD #2050). The binary they run is
