@@ -10795,15 +10795,15 @@ impl AgentPtyRegistry {
         //
         // PRD #2050: which OpenCode the command starts is asked first (its
         // binary resolved on the child's PATH, then `--version`, cached by the
-        // binary's file identity), so the refresh writes the plugin layout
-        // that version loads; a wrapper the deck cannot see into gets the
-        // layout for either. A directly started 2.x gets `--standalone`, so
+        // binary's file identity) and remembered for the installs that have
+        // no command to look at. The refresh installs the same files for
+        // either generation wherever OpenCode's global config root exists
+        // (`opencode_manage::Layout`). A directly started 2.x gets `--standalone`, so
         // its server plugins run with this pane's environment rather than in
         // OpenCode's shared background service, and its program word becomes
         // the absolute path that was probed.
         //
-        // A wrapper (`devbox run oc`, a script) is not seen into, and its
-        // layout stays the one for either generation. But the `opencode` its
+        // A wrapper (`devbox run oc`, a script) is not seen into. But the `opencode` its
         // environment resolves to — on the pane's PATH, else the daemon's
         // login-shell PATH — is the file the deck would itself run, so it is
         // asked `--version` the same way and the answer recorded by file
