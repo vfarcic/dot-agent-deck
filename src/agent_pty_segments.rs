@@ -586,6 +586,54 @@ pub(super) fn end_probe_segment(
     };
 }
 
+/// What a probe request does once its job ended (O-20.5): the end told to
+/// its segment ([`end_probe_segment`]); a failed write (an error, or none of
+/// its one byte taken) undoes its arm with `disarm`, which lowers the
+/// liability, opens a fence nothing is held behind (the driver releases what
+/// is, its segment gone) and counts a failure, as an attempt refused at the
+/// writer does. A failed write answers its own reason, never an admission
+/// refusal's. A lapse retry counts no failure here: its asker decides.
+/// Shared with the release oracle.
+#[cfg(target_os = "linux")]
+pub(super) fn probe_ended(
+    input: &crate::composer_probe::epoch::GenerationInput,
+    gate: &crate::composer_probe::gate::Gate<UserFrame>,
+    number: u64,
+    end: ProbeEnd,
+    ask: ProbeAsk,
+    disarm: impl FnOnce(),
+) -> ProbeOutcome {
+    end_probe_segment(input, number, end);
+    match end {
+        ProbeEnd::Written { .. } => ProbeOutcome::Written,
+        ProbeEnd::WriteFailed => {
+            disarm();
+            gate.open_if_empty();
+            if ask != ProbeAsk::Lapse {
+                input.probe_failed(Instant::now());
+            }
+            ProbeOutcome::Refused(PROBE_WRITE_FAILED.into())
+        }
+        ProbeEnd::Refused(refusal) => {
+            tracing::debug!(
+                target: "composer_probe",
+                ?ask,
+                ?refusal,
+                "probe refused at the writer"
+            );
+            if ask != ProbeAsk::Lapse {
+                input.probe_failed(Instant::now());
+            }
+            ProbeOutcome::Refused(format!("{refusal:?}"))
+        }
+        ProbeEnd::TakenBack => ProbeOutcome::TakenBack,
+    }
+}
+
+/// Why a probe whose byte the PTY didn't take is refused.
+#[cfg(target_os = "linux")]
+pub(super) const PROBE_WRITE_FAILED: &str = "the probe's write failed";
+
 /// PRD #1666 part 3 (Q35-20): an installed generation's release driver. It
 /// ends when the generation retires.
 #[cfg(target_os = "linux")]
@@ -853,32 +901,10 @@ impl AgentPtyRegistry {
         };
         drop(w);
         let end = probe.end().await;
-        end_probe_segment(&input, number, end);
-        match end {
-            ProbeEnd::Written { .. } => ProbeOutcome::Written,
-            ProbeEnd::WriteFailed => {
-                h.observer.disarm();
-                h.gate.gate.open_if_empty();
-                if ask != ProbeAsk::Lapse {
-                    input.probe_failed(Instant::now());
-                }
-                ProbeOutcome::Refused("the probe's write failed".into())
-            }
-            ProbeEnd::Refused(refusal) => {
-                tracing::debug!(
-                    target: "composer_probe",
-                    agent_id,
-                    ?ask,
-                    ?refusal,
-                    "probe refused at the writer"
-                );
-                if ask != ProbeAsk::Lapse {
-                    input.probe_failed(Instant::now());
-                }
-                ProbeOutcome::Refused(format!("{refusal:?}"))
-            }
-            ProbeEnd::TakenBack => ProbeOutcome::TakenBack,
-        }
+        let observer = Arc::clone(&h.observer);
+        probe_ended(&input, &h.gate.gate, number, end, ask, move || {
+            observer.disarm();
+        })
     }
 
     /// No other platform probes: the `e2e` build's request answers that.

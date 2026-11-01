@@ -38,6 +38,15 @@
 //! its read of the front segment and its extraction of what is held, forced
 //! there by a test-only seam on the writer.
 //!
+//! **A probe byte the PTY fails (O-20.5).** A fixed script per agent makes
+//! the PTY fail a probe's byte, with an error and by taking none of it,
+//! while a person types behind its fence, and ends the probe with
+//! production's own handling ([`super::segment_driver::probe_ended`]): the
+//! arm undone, the segment gone, the failure counted, the typing released
+//! with nothing outstanding and nothing left in flight. Retirement landing
+//! between a live arm section and its byte is not forced here (the
+//! activation list carries it).
+//!
 //! **The policy it assumes (the audit's U3-2).** Every generation here runs
 //! [`EcPolicy::Hold`], production's policy, under which `Records::complete`
 //! refuses the EC route: the model has no EC or frontier rows, and no
@@ -64,7 +73,8 @@
 //! Linux only, as the driver is.
 
 use super::segment_driver::{
-    ProbeEnd, ProbeRefusal, drive_segments, end_probe_segment, probe_section,
+    PROBE_WRITE_FAILED, ProbeAsk, ProbeEnd, ProbeOutcome, ProbeRefusal, drive_segments,
+    end_probe_segment, probe_ended, probe_section,
 };
 use super::*;
 use crate::composer_probe::epoch::GenerationInput;
@@ -104,11 +114,34 @@ struct Pty {
     rig: Arc<std::sync::OnceLock<std::sync::Weak<Rig>>>,
 }
 
+/// How the PTY fails a probe's byte (O-20.5). A probe's job is its one byte,
+/// so a partial write is one that took none of it.
+#[derive(Debug, Clone, Copy)]
+enum ProbeFault {
+    /// `write` fails.
+    Error,
+    /// `write` takes nothing.
+    Zero,
+}
+
 impl std::io::Write for Pty {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let Some(rig) = self.rig.get().and_then(std::sync::Weak::upgrade) else {
             return Ok(buf.len());
         };
+        if buf == [CTRL_G] {
+            let fault = rig.fault.lock().unwrap().take();
+            if let Some((fault, typed)) = fault {
+                // A person's keys, typed while the probe's byte is at the
+                // PTY: behind the fence its arm section closed.
+                let held = Arc::clone(&rig);
+                rig.runtime.block_on(async move { held.typed(typed).await });
+                return match fault {
+                    ProbeFault::Error => Err(std::io::Error::from_raw_os_error(libc::EIO)),
+                    ProbeFault::Zero => Ok(0),
+                };
+            }
+        }
         rig.seen.lock().unwrap().push(Seen::Took(buf.to_vec()));
         if buf.contains(&CTRL_G) {
             let react = rig.react.lock().unwrap().take();
@@ -135,6 +168,11 @@ struct Rig {
     retired: Arc<AtomicBool>,
     /// How many mid-pass facts fired inside a driver pass (R-B-U2-02).
     mid_fired: std::sync::atomic::AtomicUsize,
+    /// The next probe byte's fault, and what a person types meanwhile
+    /// (O-20.5).
+    fault: Mutex<Option<(ProbeFault, &'static [u8])>>,
+    /// The test's runtime, for what the PTY's writer thread types.
+    runtime: tokio::runtime::Handle,
 }
 
 impl Rig {
@@ -168,6 +206,8 @@ impl Rig {
             ledger: IngressLedger::new(),
             retired,
             mid_fired: std::sync::atomic::AtomicUsize::new(0),
+            fault: Mutex::new(None),
+            runtime: tokio::runtime::Handle::current(),
         });
         let _ = slot.set(Arc::downgrade(&rig));
         let log = Arc::downgrade(&rig);
@@ -233,6 +273,48 @@ impl Rig {
         before(self);
         end_probe_segment(&self.input, number, end);
         number
+    }
+
+    /// A probe as [`Self::probe`] queues it, whose byte the PTY fails with
+    /// `fault` while a person types `typed`, its end handled as
+    /// `composer_probe` handles it ([`probe_ended`]): the arm undone by
+    /// lowering the liability, as the observer's `disarm` does.
+    async fn probe_faulted(&self, fault: ProbeFault, typed: &'static [u8]) -> ProbeOutcome {
+        *self.fault.lock().unwrap() = Some((fault, typed));
+        let now = Instant::now();
+        let (number, job) = self.input.segment_open_probe(false, now).unwrap();
+        let claim = Arc::new(crate::doorbell_txn::JobClaim::default());
+        let w = self.writer.lock().await;
+        let gate = Arc::clone(&w.gate.gate);
+        let section = {
+            let input = Arc::clone(&self.input);
+            probe_section(
+                Arc::clone(&gate),
+                Arc::clone(&self.input),
+                Arc::clone(&claim),
+                || true,
+                move |ctx, _, _| {
+                    input
+                        .liability_raise(G, ctx.now)
+                        .map(drop)
+                        .map_err(|_| ProbeRefusal::Retired)
+                },
+            )
+        };
+        let probe = w.queue_probe(job, claim, section, || {}).unwrap();
+        drop(w);
+        let end = probe.end().await;
+        let input = Arc::clone(&self.input);
+        probe_ended(
+            &self.input,
+            &gate,
+            number,
+            end,
+            ProbeAsk::First,
+            move || {
+                let _ = input.liability_lower(G, Instant::now());
+            },
+        )
     }
 
     async fn typed(&self, bytes: &[u8]) {
@@ -2070,5 +2152,54 @@ mod pairs {
         );
         assert!(shapes.quiescent >= 20, "too few quiescent ends: {shapes:?}");
         assert!(shapes.late_own >= 5, "too few late own pairs: {shapes:?}");
+    }
+}
+
+/// Scenario: For Claude and Codex, a probe is admitted and its fence closed in production's arm section; a person types while its byte is at the PTY, and the PTY fails that byte, once with an error and once by taking none of it (a probe's job is its one byte, so a partial write takes nothing). The probe ends refused for its failed write, not for an admission refusal; its liability is lowered, its segment is gone and its schedule backs off; the PTY took no probe byte, and the release driver lets the held typing go with nothing outstanding, the fence opening behind it and nothing left in flight (O-20.5).
+#[spec("inbox/probe/010")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_010_a_failed_probe_write_undoes_its_arm_and_releases_what_it_held() {
+    for agent in [Agent::Claude, Agent::Codex] {
+        for fault in [ProbeFault::Error, ProbeFault::Zero] {
+            let what = format!("{} {fault:?}", agent_name(agent));
+            let rig = Rig::new(agent, b"");
+            let outcome = rig.probe_faulted(fault, b"ab").await;
+            assert_eq!(
+                outcome,
+                ProbeOutcome::Refused(PROBE_WRITE_FAILED.into()),
+                "{what}"
+            );
+            rig.settle(b"ab").await;
+            assert_eq!(
+                rig.taken(),
+                b"ab",
+                "{what}: no probe byte, the typing released"
+            );
+            assert_eq!(
+                rig.input.liability_count(),
+                Some(0),
+                "{what}: the arm undone"
+            );
+            assert_eq!(
+                rig.input.segments_front(),
+                Some(crate::composer_probe::segments::Front::None),
+                "{what}: its segment gone"
+            );
+            assert!(
+                !rig.input.probe_due(Instant::now()),
+                "{what}: a failure's backoff"
+            );
+            let w = rig.writer.lock().await;
+            let status = w.gate.gate.status();
+            assert!(
+                !status.fenced && status.held_ops == 0,
+                "{what}: the fence open, nothing held: {status:?}"
+            );
+            assert_eq!(
+                w.pty.in_flight.count.load(Ordering::SeqCst),
+                0,
+                "{what}: nothing left in flight"
+            );
+        }
     }
 }
