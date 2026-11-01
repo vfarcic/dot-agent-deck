@@ -520,12 +520,13 @@ pub fn native_entry() {
         if let Some(child) = running.as_mut()
             && let Some(status) = child.try_wait().unwrap()
         {
+            let pid = child.id();
             finished = Some(status.code().unwrap_or(127));
             running = None;
             fs::write(base.with_extension("helper-exited"), "").unwrap();
             atomic(
                 &base.with_extension(format!("helper-result-{invocation}")),
-                &json!({"code":status.code(),"signal":status.signal()}),
+                &json!({"pid":pid,"code":status.code(),"signal":status.signal()}),
             );
             fs::write(
                 base.with_extension(format!("helper-exited-{invocation}")),
