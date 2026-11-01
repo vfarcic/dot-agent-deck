@@ -1667,7 +1667,8 @@ pub fn opencode_question_asked(props: &Value, raised_at_ms: i64) -> Option<Pendi
 /// The form is keyboard-only ([`AnswerChannel::Unsupported`]) when the deck
 /// cannot answer it whole: a field it cannot express (`external`, a `hidden`
 /// one, an unknown type), a field shown only `when` another has a value, more
-/// than [`MAX_OPTIONS`] options, or an option it cannot read. `None` when the
+/// than [`MAX_OPTIONS`] options, an option it cannot read, or an option list
+/// with nothing to choose from and no custom value. `None` when the
 /// payload names no form id or no fields.
 pub fn opencode_form_asked(props: &Value, raised_at_ms: i64) -> Option<PendingQuestion> {
     let form = props.get("form")?;
@@ -1720,6 +1721,19 @@ pub fn opencode_form_asked(props: &Value, raised_at_ms: i64) -> Option<PendingQu
                     let mut options = payload.options;
                     if custom {
                         options.push(free_text(next));
+                    }
+                    // An `options` key with no entry the deck could read and
+                    // no custom value leaves nothing to answer with: keep the
+                    // field as one keyboard-only option, as for a kind the
+                    // deck cannot express, so the form stays on the card
+                    // rather than being dropped by
+                    // [`PendingQuestion::sanitized`].
+                    if options.is_empty() {
+                        keyboard_only = true;
+                        options.push(QuestionOption {
+                            keyboard_only: true,
+                            ..free_text(1)
+                        });
                     }
                     (options, kind == "multiselect")
                 }

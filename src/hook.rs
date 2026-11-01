@@ -6391,6 +6391,11 @@ mod question_tests {
             serde_json::json!({"key": "a", "type": "string", "when": [{"key": "b", "op": "eq", "value": true}]}),
             serde_json::json!({"key": "a", "type": "external", "url": "https://example.com"}),
             serde_json::json!({"key": "a", "type": "string", "hidden": true}),
+            // An option list with nothing the deck can read, and no custom
+            // value to type instead (review of PR #2060).
+            serde_json::json!({"key": "a", "type": "string", "options": []}),
+            serde_json::json!({"key": "a", "type": "multiselect", "options": [{"value": 1}]}),
+            serde_json::json!({"key": "a", "type": "string", "options": null, "custom": false}),
         ] {
             let props = serde_json::json!({"id": "frm_9", "form": {"id": "frm_9", "sessionID": "s", "title": "t", "fields": [field]}});
             let q = crate::question::opencode_form_asked(&props, 0).unwrap();
