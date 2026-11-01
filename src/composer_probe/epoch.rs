@@ -429,7 +429,7 @@ struct Live {
 }
 
 /// [`GenerationInput::pair_accounting`]'s answer.
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PairAccounting {
     pub credits: Vec<(RecordKey, Option<Instant>)>,
@@ -1774,7 +1774,7 @@ impl GenerationInput {
     /// seen drained or gone; the remembered unexplained pair endings, oldest
     /// first; and the watermark of the forgotten ones. `None` without
     /// segments attached.
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) fn pair_accounting(&self) -> Option<PairAccounting> {
         let state = self.state.lock_recovering();
         state.live.as_ref().map(|live| PairAccounting {

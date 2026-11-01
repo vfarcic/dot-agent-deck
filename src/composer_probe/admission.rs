@@ -234,6 +234,7 @@ mod tests {
         Attribution, Cause, Channel, Decision, EcPolicy, NotOwned, Observation, RecordKey, Records,
         ScopeState,
     };
+    use crate::composer_probe::segments::Agent;
     use crate::composer_probe::stamp_park::{StampPoint, park_at};
     use crate::composer_probe::{InertCause, Permission};
     use crate::doorbell_screen::CODEX_PROFILE;
@@ -748,17 +749,23 @@ mod tests {
         feeder.join().unwrap();
     }
 
-    /// Scenario: Feed a Codex-profiled generation's real output hook one push holding a cursor position query and a bracketed-paste off, parking it once after the push's offset advanced and once after its notes were handed over. At the first park the offset counts the push and nothing is noted; at the second the query already holds `B`; the redraw estimate the query started shows the hook's stamp was taken after the first park, not before the offset moved.
+    /// Scenario: Feed a Codex-profiled generation with records and segments attached one push to its real output hook: a cursor position query, then a bracketed-paste off and on that no record accounts for, parking the hook once after the push's offset advanced and once after its notes were handed over. At the first park the offset counts the push and nothing is noted; at the second the query already holds `B` and the segments have read no marker; once released, the unexplained pair has ended at exactly the stamp the query's redraw estimate started from, which was taken after the first park, not before the offset moved.
     #[spec("inbox/probe/052")]
     #[test]
     fn probe_052_the_output_hook_stamps_after_its_offset_and_notes_before_its_markers() {
-        const PUSH: &[u8] = b"\x1b[6n\x1b[?2004l";
+        const PUSH: &[u8] = b"\x1b[6n\x1b[?2004l\x1b[?2004h";
         let redraw = &CODEX_PROFILE.redraw;
+        let spawn = Instant::now();
         let input = Arc::new(GenerationInput::profiled(
             CprWaitEnd::SyncBegin,
             Some(redraw),
-            Instant::now(),
+            spawn,
         ));
+        // Segments attached, so the hook's return markers reach them
+        // (rev-q843 U2-1): without, `on_return_markers` returns at once and
+        // no order of the two blocks is observable.
+        assert!(input.attach_records(Records::new(G, EcPolicy::Hold, spawn)));
+        assert!(input.attach_segments(G, Agent::Codex));
         let (park, reached, go) = park_at(&[StampPoint::OutputAdvanced, StampPoint::OutputNoted]);
         input.park_feeder_for_test(park);
         let feeder = {
@@ -779,6 +786,17 @@ mod tests {
             input.backlog(),
             "the push's query is noted before its return markers are handed over"
         );
+        assert_eq!(
+            input
+                .pair_accounting()
+                .expect("segments attached")
+                .unexplained,
+            Vec::<Instant>::new(),
+            "the segments have read none of the push's return markers at the notes' park"
+        );
+        // Released later than the stamp, so a marker path that took its own
+        // stamp would end the pair after it.
+        std::thread::sleep(Duration::from_millis(2));
         go.send(()).unwrap();
         feeder.join().unwrap();
 
@@ -788,21 +806,49 @@ mod tests {
             stamp >= advanced,
             "the stamp ({stamp:?}) is taken after the offset moved ({advanced:?})"
         );
+        assert_eq!(
+            input
+                .pair_accounting()
+                .expect("segments attached")
+                .unexplained,
+            vec![stamp],
+            "the unexplained pair ends at the push's one stamp, the notes' own"
+        );
     }
 
-    /// Scenario: Accept a native Ctrl+G on a running quiet clock, then feed the real output hook a cursor position query and park it after it took its stamp while admission reads the hazard FIFO nine seconds after the acceptance; release the hook with its earlier stamp. The latch lands at the later read's time, before the entry's ten quiet seconds, so the entry is latched long after; in a second history the read comes eleven seconds after the acceptance, the entry has left, and the released hook finds nothing to latch.
+    /// Scenario: Accept a native Ctrl+G on a running quiet clock of a Codex-profiled generation, then feed the real output hook a cursor position query and park it after it took its stamp while admission reads the hazard FIFO nine seconds after the acceptance; release the hook with its earlier stamp. The redraw estimate the query started shows the stamp was taken before the park was reached; the latch lands at the later read's time, before the entry's ten quiet seconds, so the entry is latched long after; in a second history the read comes eleven seconds after the acceptance, the entry has left, and the released hook finds nothing to latch.
     #[spec("inbox/probe/052")]
     #[test]
     fn probe_052_a_hooks_early_stamp_latches_at_the_racing_reads_time() {
         const CPR: &[u8] = b"\x1b[6n";
         let t0 = Instant::now();
         let at = |s: u64| t0 + Duration::from_secs(s);
+        let redraw = &CODEX_PROFILE.redraw;
 
-        let input = Arc::new(GenerationInput::new(CprWaitEnd::Counted));
+        let input = Arc::new(GenerationInput::profiled(
+            CprWaitEnd::Counted,
+            Some(redraw),
+            t0,
+        ));
         let seq = input.accept_native(t0).unwrap();
+        let mut parked_at = None;
         hook_parked_at(&input, StampPoint::OutputStamped, CPR, |input| {
+            parked_at = Some(Instant::now());
+            // Released later than the park, so a stamp taken after it would
+            // read later than `parked_at`.
+            std::thread::sleep(Duration::from_millis(2));
             assert!(!input.hazards_clear(at(9)));
         });
+        // The racing read's times are synthetic futures, so where the stamp
+        // sits against the park is read from the redraw estimate the query
+        // started (rev-q843 U3-1).
+        let parked_at = parked_at.expect("the race ran");
+        let estimate = input.query_wait_estimate().expect("the query's wait");
+        let stamp = estimate - redraw.margin - redraw.per_size_change;
+        assert!(
+            stamp <= parked_at,
+            "the stamp ({stamp:?}) is taken before the hook parks ({parked_at:?})"
+        );
         assert!(input.backlog());
         assert_eq!(input.hazards(at(100)).0, vec![EntryView::Latched { seq }]);
         assert!(!input.hazards_clear(at(100)));
