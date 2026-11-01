@@ -4699,6 +4699,35 @@ pub struct ComposerObserverStatus {
     /// Q105b.2: observations the record cap dropped, by their decision.
     #[serde(default)]
     pub cap_dropped: ComposerCapDrops,
+    /// How many records' exit drains have run (each record's first drain,
+    /// complete or given up), read in the same hold as the records.
+    #[serde(default)]
+    pub drains: u64,
+    /// The latest exit drains (at most `record::DRAINS_KEPT`), oldest first:
+    /// a test waits for its helper's entry here, not for a finished pass,
+    /// to know that record drained (the S-20e follow-up review's U2-1).
+    #[serde(default)]
+    pub drained: Vec<ComposerDrained>,
+}
+
+/// One record's exit drain in [`ComposerObserverStatus::drained`]: the
+/// helper's pid and start ticks, whether every channel was read, its
+/// decision and report as the drain read them, and whether the segments
+/// read the ending as `WaitUnknown`. The drain and the segments' settlement
+/// of it are one hold of the generation's lock, so an entry here is a
+/// settled drain.
+#[cfg(feature = "e2e")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerDrained {
+    pub pid: u32,
+    pub start: u64,
+    pub complete: bool,
+    /// `armed`, `unarmed`, `tool`, `unknown`, or `none`.
+    pub decision: String,
+    /// `none`, `done-clean`, `done-survivors`, `done-unknown`,
+    /// `spawn-failed` or `unrecognised`.
+    pub report: String,
+    pub wait_unknown: bool,
 }
 
 /// PRD #1666 part 3 (Q105b.2): observations a generation's record cap
@@ -4725,7 +4754,7 @@ fn composer_observer_status(
     registry: &Arc<AgentPtyRegistry>,
     agent: &str,
 ) -> Option<ComposerObserverStatus> {
-    use crate::composer_probe::record::{EcPolicy, ScopeState};
+    use crate::composer_probe::record::{Decision, EcPolicy, Report, ScopeState, Tree};
     let records = registry
         .composer_input(agent)
         .and_then(|input| input.records_for_e2e())?;
@@ -4764,6 +4793,33 @@ fn composer_observer_status(
             tool: w.cap_dropped_tool,
             unknown: w.cap_dropped_unknown,
         },
+        drains: w.drains,
+        drained: w
+            .drained()
+            .map(|d| ComposerDrained {
+                pid: d.key.pid,
+                start: d.key.start,
+                complete: d.complete,
+                decision: match d.decision {
+                    Some(Decision::Armed) => "armed",
+                    Some(Decision::Unarmed) => "unarmed",
+                    Some(Decision::Tool) => "tool",
+                    Some(Decision::Unknown) => "unknown",
+                    None => "none",
+                }
+                .to_string(),
+                report: match d.report {
+                    Report::None => "none",
+                    Report::Done(Tree::Clean) => "done-clean",
+                    Report::Done(Tree::Survivors) => "done-survivors",
+                    Report::Done(Tree::Unknown) => "done-unknown",
+                    Report::SpawnFailed { .. } => "spawn-failed",
+                    Report::Unrecognised => "unrecognised",
+                }
+                .to_string(),
+                wait_unknown: d.wait_unknown,
+            })
+            .collect(),
     })
 }
 

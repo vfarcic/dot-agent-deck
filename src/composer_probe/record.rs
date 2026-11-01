@@ -877,6 +877,45 @@ pub struct E2eWitness {
     pub cap_dropped_unarmed: u64,
     pub cap_dropped_tool: u64,
     pub cap_dropped_unknown: u64,
+    /// How many records' exit drains have run, complete or given up: each
+    /// record's first drain counts once.
+    pub drains: u64,
+    /// The latest [`DRAINS_KEPT`] of those drains, at index `n % DRAINS_KEPT`
+    /// for the `n`th (from 0): [`Self::drained`] lists them in drain order.
+    pub drained_ring: [Option<DrainWitness>; DRAINS_KEPT],
+}
+
+/// How many recent exit drains [`E2eWitness`] keeps.
+#[cfg(any(test, feature = "e2e"))]
+pub const DRAINS_KEPT: usize = 8;
+
+/// One record's exit drain as [`E2eWitness`] keeps it: whose it was, and its
+/// ending as the drain read it, in the same hold of the epoch's lock in
+/// which the segments settled it (O-20.3). It lets an e2e test wait for one
+/// helper's record to have drained, not merely for an observer pass to have
+/// finished (the S-20e follow-up review's U2-1).
+#[cfg(any(test, feature = "e2e"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrainWitness {
+    pub key: RecordKey,
+    /// Every channel was read ([`Records::drained`]), or the drain gave up
+    /// with evidence unread ([`Records::drained_uncertain`]).
+    pub complete: bool,
+    pub decision: Option<Decision>,
+    pub report: Report,
+    /// The segments read this ending as `WaitUnknown`: an editor-bearing
+    /// decision, or none, and no report the helper recognisably sent.
+    pub wait_unknown: bool,
+}
+
+#[cfg(any(test, feature = "e2e"))]
+impl E2eWitness {
+    /// The kept exit drains, oldest first.
+    pub fn drained(&self) -> impl Iterator<Item = DrainWitness> + '_ {
+        let kept = self.drains.min(DRAINS_KEPT as u64);
+        (self.drains - kept..self.drains)
+            .filter_map(|n| self.drained_ring[(n % DRAINS_KEPT as u64) as usize])
+    }
 }
 
 impl Records {
@@ -1359,6 +1398,19 @@ impl Records {
             if complete && self.records[i].attribution == Attribution::Owned {
                 let r = &mut self.records[i];
                 fifo.pop_at_drain(&mut r.hazard_pop, r.birth_floor, now);
+            }
+            #[cfg(any(test, feature = "e2e"))]
+            {
+                let r = &self.records[i];
+                let w = &mut self.witness;
+                w.drained_ring[(w.drains % DRAINS_KEPT as u64) as usize] = Some(DrainWitness {
+                    key: r.key,
+                    complete,
+                    decision: r.decision,
+                    report: r.report,
+                    wait_unknown: super::segments::wait_unknown(r.decision, r.report),
+                });
+                w.drains += 1;
             }
         }
         self.subsume();

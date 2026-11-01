@@ -1136,7 +1136,7 @@ fn early_release(agent: Agent, seg: &Segment, r: &Record) -> bool {
 /// Whether a drained record's ending is `WaitUnknown`: an editor-bearing
 /// decision (or none) and no report the helper recognisably sent, so
 /// nothing says when, or whether, its editor stopped reading.
-fn wait_unknown(decision: Option<Decision>, report: Report) -> bool {
+pub(crate) fn wait_unknown(decision: Option<Decision>, report: Report) -> bool {
     !decision.is_some_and(Decision::helper_only)
         && matches!(report, Report::None | Report::Unrecognised)
 }

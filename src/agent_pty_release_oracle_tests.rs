@@ -1868,22 +1868,126 @@ mod pairs {
     }
 
     /// The script shapes [`probe_048_interleaved_sessions_and_backlogs_keep_every_foreign_pair`]
-    /// generates, and how many of each it ran.
+    /// generates, and how many scripts of each it ran.
     #[derive(Debug, Default)]
     struct Shapes {
-        /// More pairs read before their records than the accounting
-        /// remembers.
+        /// At some moment, more sessions whose pair was read and whose record
+        /// had not yet come than the accounting remembers pairs for: a peak
+        /// outstanding late-session debt past the cap.
         backlogs: usize,
-        /// A backlog past the cap in which a helper was born after an
-        /// earlier pair had ended: R-B-U2-01's staggered births.
+        /// At such a moment, the outstanding sessions' floors staggered: one
+        /// of them born after another's pair had ended (R-B-U2-01's shape).
         staggered: usize,
+        /// The most outstanding sessions born after the oldest outstanding
+        /// pair ended, at a moment past the cap, over the run.
+        staggered_floors_peak: usize,
         /// A session whose pair never comes.
         pairless: usize,
         /// Ended with every session drained, the grace over, and a final
         /// unrelated pair.
         quiescent: usize,
-        /// A session whose pair is read after its credit expired.
+        /// A session's own pair read after its credit's grace, counted from
+        /// its drain on the same clock, was over.
         late_own: usize,
+        /// R-C-U2-01's interleave: a session's own pair read inside its
+        /// grace, its drain after the clock passed a grace once already,
+        /// while the reference still held its credit.
+        own_after_wait: usize,
+        /// The bounded accounting held fewer credits than the reference.
+        fewer_credits: usize,
+        /// The bounded accounting forgot a debt.
+        forgot: usize,
+    }
+
+    /// The pair accounting that forgets nothing, the reference of the
+    /// invariant on `Live::explain`: every pair that moved the epoch and no
+    /// record has repaid, and every credit, with no cap on either, and the
+    /// same grace after a drain.
+    #[derive(Debug, Default)]
+    struct Reference {
+        credits: Vec<(RecordKey, Option<Instant>)>,
+        unpaid: Vec<Instant>,
+    }
+
+    impl Reference {
+        /// A new record of a helper born no earlier than `floor`: it repays
+        /// the oldest unrepaid pair that ended at or after `floor`, or banks.
+        fn record(&mut self, key: RecordKey, floor: Instant) {
+            match self.unpaid.iter().position(|&ended| ended >= floor) {
+                Some(at) => {
+                    self.unpaid.remove(at);
+                }
+                None => self.credits.push((key, None)),
+            }
+        }
+
+        /// Record `key` drained at `now`.
+        fn drain(&mut self, key: RecordKey, now: Instant) {
+            for credit in &mut self.credits {
+                if credit.0 == key && credit.1.is_none() {
+                    credit.1 = Some(now);
+                }
+            }
+        }
+
+        /// A pair is read at `now`: first the credits whose grace is over go.
+        fn expire(&mut self, now: Instant) {
+            use crate::composer_probe::epoch::CREDIT_AFTER_DRAIN;
+            self.credits.retain(|c| {
+                c.1.is_none_or(|d| now.saturating_duration_since(d) < CREDIT_AFTER_DRAIN)
+            });
+        }
+
+        /// Then it takes the oldest credit, or moves the epoch and is owed:
+        /// whether it moved the epoch.
+        fn take(&mut self, now: Instant) -> bool {
+            if self.credits.is_empty() {
+                self.unpaid.push(now);
+                true
+            } else {
+                self.credits.remove(0);
+                false
+            }
+        }
+    }
+
+    /// The invariant on `Live::explain`, read from both accountings: the
+    /// bounded credits are an ordered subsequence of the reference's, each
+    /// with the same drain stamp, and every pair the reference still owes
+    /// that ended after the watermark is remembered, in order.
+    fn included(
+        bounded: &crate::composer_probe::epoch::PairAccounting,
+        reference: &Reference,
+        base: Instant,
+    ) -> Result<(), String> {
+        let at = |i: Instant| i.saturating_duration_since(base);
+        let mut theirs = reference.credits.iter();
+        for credit in &bounded.credits {
+            if !theirs.any(|r| r == credit) {
+                return Err(format!(
+                    "a credit for {:?} drained at {:?} that the reference does not bank, in \
+                     that order with that stamp",
+                    credit.0,
+                    credit.1.map(at)
+                ));
+            }
+        }
+        let mut kept = bounded.unexplained.iter();
+        for &ended in reference
+            .unpaid
+            .iter()
+            .filter(|&&e| bounded.forgotten.is_none_or(|f| e > f))
+        {
+            if !kept.any(|&k| k == ended) {
+                return Err(format!(
+                    "a debt for a pair that ended at {:?}, after the watermark {:?}, is not \
+                     remembered",
+                    at(ended),
+                    bounded.forgotten.map(at)
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// One generated script: its events, and which sessions have no pair.
@@ -2017,11 +2121,157 @@ mod pairs {
         events
     }
 
-    /// Scenario: Generate scripts in which editor sessions overlap rather than following one another: each helper is born, then its record and its bracketed-paste pair arrive in either order, interleaved with other sessions' and with pairs no record accounts for. Some scripts read a backlog of pairs past what the accounting remembers before any of their records; some stagger the helpers' births across earlier pairs' endings, with every record late (R-B-U2-01's shape); some have a session whose pair never comes; the clock passes the credit's grace now and then; and most end with an unrelated pair, after every session drained and the grace passed when a session's pair never came. From any point in a script, the epoch moves at least once for each pair no record accounts for read from there on, less one for each session whose pair never came, and the final unrelated pair after the grace always moves it (R-B-U2-01, the audit's U3-1).
+    /// One run of a generated script against the bounded accounting and the
+    /// reference: each pair as read (whether no record accounts for it,
+    /// whether the reference moved the epoch, whether production did), and
+    /// before each pair, whether the script had settled (below), and the
+    /// shapes it reached; or the first step at which the invariant broke.
+    struct Run {
+        pairs: Vec<(bool, bool, bool)>,
+        settled: Vec<bool>,
+        shapes: Shapes,
+    }
+
+    fn run(
+        events: &[Event],
+        sessions: usize,
+        pairless: &[bool],
+        cap: usize,
+    ) -> Result<Run, String> {
+        use crate::composer_probe::epoch::CREDIT_AFTER_DRAIN;
+        // A virtual clock for every stamp: the pairs' `now`, the records'
+        // floors and steps, and, through the step clock, the instant a
+        // drain stamps a credit with (R-C-U2-01).
+        let (input, _hook) = generation();
+        let pair = pair_markers();
+        let base = Instant::now();
+        let mut clock = base;
+        let mut reference = Reference::default();
+        let mut born = vec![clock; sessions];
+        let mut pair_end: Vec<Option<Instant>> = vec![None; sessions];
+        let mut recorded = vec![false; sessions];
+        let mut drained_at: Vec<Option<Instant>> = vec![None; sessions];
+        let mut waited = false;
+        let mut wait_before_drain = vec![false; sessions];
+        let mut outstanding: Vec<usize> = Vec::new();
+        let mut shapes = Shapes::default();
+        let (mut backlog, mut staggered, mut late_own, mut own_after_wait) =
+            (false, false, false, false);
+        let (mut fewer, mut forgot) = (false, false);
+        let mut out = Run {
+            pairs: Vec::new(),
+            settled: Vec::new(),
+            shapes: Shapes::default(),
+        };
+        for (i, &event) in events.iter().enumerate() {
+            clock += Duration::from_millis(1);
+            input.set_step_clock(Some(clock));
+            let before = input.epoch().last_foreign();
+            let mut theirs = None;
+            match event {
+                Event::Born(s) => born[s] = clock,
+                Event::Record(s) => {
+                    recorded[s] = true;
+                    outstanding.retain(|&o| o != s);
+                    input
+                        .record_observe(&session(s as u32 + 1, born[s]), clock)
+                        .unwrap();
+                    reference.record(key(s as u32 + 1), born[s]);
+                }
+                Event::Drain(s) => {
+                    drained_at[s] = Some(clock);
+                    wait_before_drain[s] = waited;
+                    input
+                        .record_exit(G, key(s as u32 + 1), clock, clock)
+                        .unwrap();
+                    input.record_drained(G, key(s as u32 + 1), clock).unwrap();
+                    reference.drain(key(s as u32 + 1), clock);
+                }
+                Event::Pair(_) | Event::Foreign => {
+                    reference.expire(clock);
+                    // Settled: no credit live, every pairless session's
+                    // record made, and every session whose pair was read
+                    // has its record. Nothing a pairless session's record
+                    // displaced can still be lent from here on.
+                    out.settled.push(
+                        reference.credits.is_empty()
+                            && (0..sessions)
+                                .all(|s| recorded[s] || (!pairless[s] && pair_end[s].is_none())),
+                    );
+                    if let Event::Pair(s) = event {
+                        pair_end[s] = Some(clock);
+                        if !recorded[s] {
+                            outstanding.push(s);
+                        }
+                        let in_grace =
+                            drained_at[s].map(|d| clock.duration_since(d) < CREDIT_AFTER_DRAIN);
+                        late_own |= in_grace == Some(false);
+                        own_after_wait |= in_grace == Some(true)
+                            && wait_before_drain[s]
+                            && reference.credits.iter().any(|c| c.0 == key(s as u32 + 1));
+                    }
+                    theirs = Some(reference.take(clock));
+                    input.on_return_markers(&pair, clock);
+                }
+                Event::Wait => {
+                    clock += CREDIT_AFTER_DRAIN;
+                    waited = true;
+                }
+            }
+            let moved = input.epoch().last_foreign() - before;
+            if moved > 1 {
+                return Err(format!(
+                    "step {i}, {event:?}, moved the epoch {moved} times"
+                ));
+            }
+            match theirs {
+                Some(theirs) => {
+                    if theirs && moved == 0 {
+                        return Err(format!(
+                            "step {i}, {event:?}: the reference moved the epoch and production \
+                             did not"
+                        ));
+                    }
+                    out.pairs
+                        .push((event == Event::Foreign, theirs, moved == 1));
+                }
+                None if moved != 0 => {
+                    return Err(format!("step {i}, {event:?}, moved the epoch"));
+                }
+                None => {}
+            }
+            let bounded = input.pair_accounting().unwrap();
+            included(&bounded, &reference, base)
+                .map_err(|e| format!("after step {i}, {event:?}: {e}"))?;
+            fewer |= bounded.credits.len() < reference.credits.len();
+            forgot |= bounded.forgotten.is_some();
+            if outstanding.len() > cap {
+                backlog = true;
+                let oldest = outstanding
+                    .iter()
+                    .filter_map(|&o| pair_end[o])
+                    .min()
+                    .unwrap();
+                let floors = outstanding.iter().filter(|&&o| born[o] > oldest).count();
+                staggered |= floors > 0;
+                shapes.staggered_floors_peak = shapes.staggered_floors_peak.max(floors);
+            }
+        }
+        shapes.backlogs = usize::from(backlog);
+        shapes.staggered = usize::from(staggered);
+        shapes.late_own = usize::from(late_own);
+        shapes.own_after_wait = usize::from(own_after_wait);
+        shapes.fewer_credits = usize::from(fewer);
+        shapes.forgot = usize::from(forgot);
+        shapes.pairless = usize::from(pairless.iter().any(|&p| p));
+        out.shapes = shapes;
+        Ok(out)
+    }
+
+    /// Scenario: Generate scripts in which editor sessions overlap rather than following one another: each helper is born, then its record and its bracketed-paste pair arrive in either order, interleaved with other sessions' and with pairs no record accounts for; some read a backlog of pairs past what the accounting remembers before their records, some stagger the helpers' births across earlier pairs' endings with every record late, some have a session whose pair never comes, the clock passes the credit's grace now and then, and most end with an unrelated pair after every session drained and the grace passed. Every stamp is on one virtual clock, the drains' included. After every step the accounting banks no credit, and forgets no debt after its watermark, that an accounting forgetting nothing would not, and it moves the epoch at every pair where that reference does; from any point at which nothing is left to lend, and from any point in a script whose every session's pair comes, the epoch moves at least once per pair no record accounts for (R-B-U2-01, R-C-U2-01, the audit's U3-1).
     #[spec("inbox/probe/048")]
     #[test]
     fn probe_048_interleaved_sessions_and_backlogs_keep_every_foreign_pair() {
-        use crate::composer_probe::epoch::CREDIT_AFTER_DRAIN;
         let cap = usize::from(crate::composer_probe::epoch::EXPLAINED_CAP);
         let mut shapes = Shapes::default();
         for seed in 1..=600u64 {
@@ -2049,93 +2299,45 @@ mod pairs {
             } else if rng.chance(70) {
                 events.push(Event::Foreign);
             }
-            // A virtual clock, so a helper's birth, a pair's ending and the
-            // grace are ordered exactly as scripted.
-            let (input, _hook) = generation();
-            let pair = pair_markers();
-            let mut clock = Instant::now();
-            let mut born = vec![clock; sessions];
-            let mut recorded = vec![false; sessions];
-            let mut drained_at: Vec<Option<Instant>> = vec![None; sessions];
-            let mut early = 0usize;
-            let mut staggered = false;
-            let mut any_pair = false;
-            let mut late_own = false;
-            // Each pair read: whether no record accounts for it, and whether
-            // it moved the epoch.
-            let mut pairs: Vec<(bool, bool)> = Vec::new();
-            for &event in &events {
-                clock += Duration::from_millis(1);
-                let before = input.epoch().last_foreign();
-                match event {
-                    Event::Born(s) => {
-                        born[s] = clock;
-                        staggered |= any_pair;
-                    }
-                    Event::Record(s) => {
-                        recorded[s] = true;
-                        input
-                            .record_observe(&session(s as u32 + 1, born[s]), clock)
-                            .unwrap();
-                    }
-                    Event::Drain(s) => {
-                        drained_at[s] = Some(clock);
-                        input
-                            .record_exit(G, key(s as u32 + 1), clock, clock)
-                            .unwrap();
-                        input.record_drained(G, key(s as u32 + 1), clock).unwrap();
-                    }
-                    Event::Pair(s) => {
-                        any_pair = true;
-                        early += usize::from(!recorded[s]);
-                        late_own |= drained_at[s]
-                            .is_some_and(|d| clock.duration_since(d) >= CREDIT_AFTER_DRAIN);
-                        input.on_return_markers(&pair, clock);
-                    }
-                    Event::Foreign => input.on_return_markers(&pair, clock),
-                    Event::Wait => clock += CREDIT_AFTER_DRAIN,
-                }
-                let moved = input.epoch().last_foreign() - before;
-                assert!(
-                    moved <= 1,
-                    "seed {seed}: {event:?} moved the epoch {moved} times"
-                );
-                if matches!(event, Event::Pair(_) | Event::Foreign) {
-                    pairs.push((event == Event::Foreign, moved == 1));
-                } else {
-                    assert_eq!(moved, 0, "seed {seed}: {event:?} moved the epoch");
-                }
-            }
-            if early > cap {
-                shapes.backlogs += 1;
-                shapes.staggered += usize::from(staggered);
-            }
-            shapes.pairless += usize::from(missing > 0);
-            shapes.late_own += usize::from(late_own);
-            // A count over suffixes, not prompt invalidation: credits are
-            // consumed oldest first, so a foreign pair read while another
-            // session's credit is live moves the epoch at that session's own
-            // pair instead (the audit's U3-1), and a session whose pair never
-            // comes may leave one foreign pair unmoved until its grace ends.
+            let run = run(&events, sessions, &pairless, cap)
+                .unwrap_or_else(|e| panic!("seed {seed}: {e}\nevents {events:?}"));
+            let pairs = &run.pairs;
+            // An absolute count over suffixes, on the reference (production
+            // moves at least where it does): credits are consumed oldest
+            // first, so a foreign pair read while another session's credit
+            // is live moves the epoch at that session's own pair instead
+            // (the audit's U3-1). Only a session whose pair never comes, or
+            // what its record displaced, can leave a foreign pair unmoved,
+            // and only until nothing is left to lend: from a settled point,
+            // or in a script with no such session, no allowance.
             for from in 0..pairs.len() {
                 let foreign = pairs[from..].iter().filter(|p| p.0).count();
                 let moves = pairs[from..].iter().filter(|p| p.1).count();
-                assert!(
-                    moves + missing >= foreign,
-                    "seed {seed}: from pair {from} on, {foreign} pairs no record accounts for \
-                     moved the epoch only {moves} times, with {missing} sessions whose pair \
-                     never came\nevents {events:?}\npairs {pairs:?}"
-                );
+                if missing == 0 || run.settled[from] {
+                    assert!(
+                        moves >= foreign,
+                        "seed {seed}: from pair {from} on, {foreign} pairs no record accounts \
+                         for moved the reference only {moves} times\nevents {events:?}\n\
+                         pairs {pairs:?}\nsettled {:?}",
+                        run.settled
+                    );
+                }
             }
             if quiescent {
                 shapes.quiescent += 1;
                 assert_eq!(
                     pairs.last(),
-                    Some(&(true, true)),
+                    Some(&(true, true, true)),
                     "seed {seed}: an unrelated pair after every session drained and the grace \
                      passed moved nothing\nevents {events:?}\npairs {pairs:?}"
                 );
+                assert_eq!(
+                    run.settled.last(),
+                    Some(&true),
+                    "seed {seed}: the quiescent end is settled\nevents {events:?}"
+                );
             }
+            shapes.add(&run.shapes);
         }
         eprintln!("probe_048 interleaved shapes over 600 seeds: {shapes:?}");
         assert!(
@@ -2147,11 +2349,69 @@ mod pairs {
             "too few staggered backlogs: {shapes:?}"
         );
         assert!(
+            shapes.staggered_floors_peak >= cap,
+            "no staggered backlog with a floor per remembered pair: {shapes:?}"
+        );
+        assert!(
             shapes.pairless >= 20,
             "too few pairless scripts: {shapes:?}"
         );
         assert!(shapes.quiescent >= 20, "too few quiescent ends: {shapes:?}");
         assert!(shapes.late_own >= 5, "too few late own pairs: {shapes:?}");
+        assert!(
+            shapes.own_after_wait >= 5,
+            "too few own pairs inside a grace after a wait: {shapes:?}"
+        );
+        assert!(
+            shapes.fewer_credits >= 20 && shapes.forgot >= 20,
+            "too few scripts where the bounds bit: {shapes:?}"
+        );
+    }
+
+    impl Shapes {
+        fn add(&mut self, run: &Shapes) {
+            self.backlogs += run.backlogs;
+            self.staggered += run.staggered;
+            self.staggered_floors_peak = self.staggered_floors_peak.max(run.staggered_floors_peak);
+            self.pairless += run.pairless;
+            self.late_own += run.late_own;
+            self.own_after_wait += run.own_after_wait;
+            self.fewer_credits += run.fewer_credits;
+            self.forgot += run.forgot;
+        }
+    }
+
+    /// Scenario: On one virtual clock, a helper is born and its record made, the clock passes a whole grace, then its helper drains and its bracketed-paste pair is read a millisecond later: inside the grace counted from the drain, so the pair is its session's and moves nothing. An unrelated pair read after it moves the epoch once (R-C-U2-01).
+    #[spec("inbox/probe/048")]
+    #[test]
+    fn probe_048_an_own_pair_inside_the_grace_after_a_wait_moves_nothing() {
+        use crate::composer_probe::epoch::CREDIT_AFTER_DRAIN;
+        let (input, _hook) = generation();
+        let pair = pair_markers();
+        let born = Instant::now();
+        input.set_step_clock(Some(born));
+        input.record_observe(&session(1, born), born).unwrap();
+        let drained = born + CREDIT_AFTER_DRAIN + Duration::from_millis(1);
+        input.set_step_clock(Some(drained));
+        input.record_exit(G, key(1), drained, drained).unwrap();
+        input.record_drained(G, key(1), drained).unwrap();
+        assert_eq!(
+            input.pair_accounting().unwrap().credits,
+            vec![(key(1), Some(drained))],
+            "the credit's grace starts at the drain's step, on the test's clock"
+        );
+        input.on_return_markers(&pair, drained + Duration::from_millis(1));
+        assert_eq!(
+            input.epoch().last_foreign(),
+            0,
+            "its own pair, read inside the grace counted from its drain"
+        );
+        input.on_return_markers(&pair, drained + Duration::from_millis(2));
+        assert_eq!(
+            input.epoch().last_foreign(),
+            1,
+            "an unrelated pair after it"
+        );
     }
 }
 

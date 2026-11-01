@@ -428,6 +428,15 @@ struct Live {
     reads: std::collections::VecDeque<(RecordKey, bool)>,
 }
 
+/// [`GenerationInput::pair_accounting`]'s answer.
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PairAccounting {
+    pub credits: Vec<(RecordKey, Option<Instant>)>,
+    pub unexplained: Vec<Instant>,
+    pub forgotten: Option<Instant>,
+}
+
 /// One record's explanation of a pair still to come ([`Live::explained`]).
 #[derive(Debug, Clone, Copy)]
 struct Credit {
@@ -579,6 +588,31 @@ impl Live {
     /// for a record that may be a forgotten pair's session shifts that debt
     /// onto a later record, which then finds none and banks a credit for a
     /// pair that already moved the epoch.
+    ///
+    /// **What the argument assumes** (the audit's U3-2 and U3-3), none of it
+    /// established here:
+    ///
+    /// 1. `birth_floor` is at or before the helper's real birth, on the
+    ///    clock a pair's ending is read on. The observer derives it
+    ///    (`observe::birth_floor`, called at attestation) from the helper's
+    ///    start ticks floored to their tick (`record::birth_floor_ns`), and
+    ///    maps that boot-clock time onto [`Instant`] by reading `Instant`
+    ///    first and the boot clock after it, so the mapping errs early; a
+    ///    suspend between the birth and the mapping moves it earlier still,
+    ///    since the boot clock counts suspend and `Instant` does not. The
+    ///    output hook reads a pair's `now` after it fed the push that held
+    ///    the `?2004h` (`paste_mode`), so at or after the pair's real ending.
+    ///    `probe_069` (tests/editor_observer.rs) and `tests/invocation_record.rs`
+    ///    check the two conversions; nothing checks a live helper's floor
+    ///    against its birth. A floor later than the birth would let a record
+    ///    miss its own pair read earlier and bank a credit for it.
+    /// 2. [`Self::unexplained`] is sorted by ending: pairs reach
+    ///    [`GenerationInput::on_return_markers`] in output order, from the
+    ///    output hook under the output lock, each push's `now` read after
+    ///    the last one's, so [`Self::owe`] pushes in order and its fold drops
+    ///    the oldest.
+    /// 3. Credits are consumed first in, first out, which preserves the
+    ///    count but not whose pair a credit explained: the next paragraph.
     ///
     /// The accounting that forgets nothing is the reference, not proof that
     /// a credit is the record's own: credits are consumed oldest first, so a
@@ -845,6 +879,13 @@ pub struct GenerationInput {
     /// becoming visible, so a test can see the one before the other.
     #[cfg(test)]
     accept_park: std::sync::Mutex<Option<AcceptPark>>,
+    /// Test seam (R-C-U2-01): the clock a records step stamps its drains
+    /// and settles the segments at, in place of the wall clock, so a test on
+    /// a virtual clock orders a credit's grace against the pairs it passes to
+    /// [`Self::on_return_markers`] exactly. `None`, the wall clock, unless a
+    /// test set it; a release build has no field and reads the wall clock.
+    #[cfg(test)]
+    step_clock: std::sync::Mutex<Option<Instant>>,
     /// The test and `e2e` builds' writer-thread controls (Q105b.2): a hold
     /// and a fault plan, reached without the pane writer's lock.
     #[cfg(any(test, feature = "e2e"))]
@@ -922,6 +963,8 @@ impl GenerationInput {
             input_grammar: AtomicU8::new(0),
             #[cfg(test)]
             accept_park: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            step_clock: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "e2e"))]
             writer_e2e: Arc::default(),
         }
@@ -1647,7 +1690,7 @@ impl GenerationInput {
             (false, Some(records)) => step(records, &mut state.hazards, state.live.as_mut()),
             _ => return Err(Refusal::Stale),
         };
-        let now = Instant::now();
+        let now = self.step_now();
         // The audit's U3-4: a credit's life after its record drained or went
         // starts at the step that did it.
         if let (Some(live), Some(records)) = (state.live.as_mut(), state.records.as_ref()) {
@@ -1664,6 +1707,45 @@ impl GenerationInput {
             self.moved.notify_one();
         }
         result
+    }
+
+    /// When a records step happened: the wall clock, or in a test the clock
+    /// it set ([`Self::set_step_clock`]).
+    fn step_now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = *self
+            .step_clock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            return now;
+        }
+        Instant::now()
+    }
+
+    /// Test seam (R-C-U2-01): stamp each later records step at `now` rather
+    /// than the wall clock, `None` to go back to it.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn set_step_clock(&self, now: Option<Instant>) {
+        *self
+            .step_clock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = now;
+    }
+
+    /// Test read of the pair accounting (R-C-U2-01, the audit's U3-1): the
+    /// banked credits, oldest first, with when each one's record was first
+    /// seen drained or gone; the remembered unexplained pair endings, oldest
+    /// first; and the watermark of the forgotten ones. `None` without
+    /// segments attached.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn pair_accounting(&self) -> Option<PairAccounting> {
+        let state = self.state.lock_recovering();
+        state.live.as_ref().map(|live| PairAccounting {
+            credits: live.explained.iter().map(|c| (c.key, c.drained)).collect(),
+            unexplained: live.unexplained.iter().copied().collect(),
+            forgotten: live.forgotten,
+        })
     }
 
     /// See [`Records::observe`].

@@ -525,6 +525,64 @@ mod tests {
             assert_eq!(r.policy(), EcPolicy::Authority);
             assert_eq!(r.cap(), 2);
         }
+
+        /// The S-20e follow-up review's U2-1: the witness names each record's
+        /// exit drain, once, with its ending: an `Unarmed` helper that sent
+        /// no report drains as `WaitUnknown`, an `Armed` one does not, one
+        /// given up is not complete, a second drain of the same record adds
+        /// nothing, and only the latest `DRAINS_KEPT` are kept, oldest first.
+        #[test]
+        fn the_witness_names_each_drain_and_its_ending() {
+            use crate::composer_probe::record::{DRAINS_KEPT, Report};
+            let t = Instant::now();
+            let mut r = Records::new(G, EcPolicy::Hold, t);
+            let mut fifo = HazardFifo::default();
+            let helper = |pid: u32, decision: Decision| Observation {
+                key: RecordKey { pid, start: 9 },
+                attribution: Attribution::Owned,
+                ..observation(t, Some(decision))
+            };
+            let unknown = helper(1, Decision::Unarmed);
+            r.observe(&mut fifo, &unknown, t).unwrap();
+            assert_eq!(r.witness().drains, 0, "observed, not drained");
+            r.exit(&mut fifo, G, unknown.key, t, t).unwrap();
+            assert_eq!(r.witness().drains, 0, "exited, not drained");
+            r.drained(&mut fifo, G, unknown.key, t).unwrap();
+            r.drained(&mut fifo, G, unknown.key, t).unwrap();
+            let w = r.witness();
+            assert_eq!(w.drains, 1, "a second drain adds nothing");
+            let first = w.drained().next().unwrap();
+            assert_eq!(first.key, unknown.key);
+            assert!(first.complete && first.wait_unknown, "{first:?}");
+            assert_eq!(
+                (first.decision, first.report),
+                (Some(Decision::Unarmed), Report::None)
+            );
+
+            let armed = helper(2, Decision::Armed);
+            r.observe(&mut fifo, &armed, t).unwrap();
+            r.exit(&mut fifo, G, armed.key, t, t).unwrap();
+            r.drained_uncertain(&mut fifo, G, armed.key, t).unwrap();
+            let last = r.witness().drained().last().unwrap();
+            assert_eq!(last.key, armed.key);
+            assert!(!last.complete && !last.wait_unknown, "{last:?}");
+
+            r.configure_for_e2e(None, None).unwrap_err();
+            for pid in 3..3 + DRAINS_KEPT as u32 {
+                let h = helper(pid, Decision::Unarmed);
+                r.observe(&mut fifo, &h, t).unwrap();
+                r.exit(&mut fifo, G, h.key, t, t).unwrap();
+                r.drained(&mut fifo, G, h.key, t).unwrap();
+            }
+            let w = r.witness();
+            assert_eq!(w.drains, 2 + DRAINS_KEPT as u64);
+            let pids: Vec<u32> = w.drained().map(|d| d.key.pid).collect();
+            assert_eq!(
+                pids,
+                (3..3 + DRAINS_KEPT as u32).collect::<Vec<_>>(),
+                "the latest, oldest first"
+            );
+        }
     }
 
     /// Wait, at most `bound`, for `done`: whether it came.
