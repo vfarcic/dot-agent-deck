@@ -33,6 +33,25 @@ tasks:
       repository: https://github.com/vfarcic/dot-agent-deck.git
       ref: ${{ init.commit-sha }}
 
+  # Issue #2052 — the version the sandbox's builds report, the way CI's builds
+  # get one (issue #326; `.rwx/ci.yml`'s `backend` task and ci.yml's `changes`
+  # job's `version` step): `code` is a shallow clone with no tags, so
+  # `build.rs`'s `git describe` finds none and a build reports the `0.1.0`
+  # placeholder as "version unknown" (`0.1.0+unknown`), and the lane-1 tests
+  # written against a known version (`remote_upgrade_*`, `remote_connect_*`)
+  # fail. The newest vX.Y.Z tag at origin, which
+  # scripts/latest-release-version.sh reads as both CI systems do, is what a
+  # developer's checkout of `main` reports. `cache: false`: the tags move without the commit moving,
+  # so a cached value would go stale.
+  - key: version
+    use: code
+    cache: false
+    run: |
+      set -euo pipefail
+      dad_version=$(scripts/latest-release-version.sh origin)
+      printf '%s' "$dad_version" > "$RWX_VALUES/dad_version"
+      echo "dad_version=$dad_version"
+
   - key: rust
     call: rust-lang/install 1.1.1
     with:
@@ -53,6 +72,21 @@ tasks:
     with:
       node-version: "26.13.0"
 
+  # cargo-mutants, for `/code-cleanup`'s tests mode
+  # (`.claude/skills/code-cleanup/find-targets.sh tests`), so a mutation run,
+  # one rebuild and test run per mutant, leaves the shared dev box too. The
+  # version is find-targets.sh's pin, written again here in the layout the
+  # Renovate customManager for that script reads, so one bump moves both;
+  # find-targets.sh refuses any other version, and
+  # code_cleanup_018_the_sandbox_installs_the_pinned_cargo_mutants fails a drift.
+  - key: cargo-mutants
+    use: rust
+    run: |
+      # renovate: datasource=crate depName=cargo-mutants
+      CARGO_MUTANTS_VERSION=27.1.0
+      cargo install cargo-mutants --locked --version "$CARGO_MUTANTS_VERSION" --root "$HOME/.cargo"
+      "$HOME/.cargo/bin/cargo-mutants" mutants --version
+
   - key: go-task
     run: |
       curl -LsSf https://github.com/go-task/task/releases/download/v3.53.1/task_linux_amd64.tar.gz \
@@ -60,16 +94,19 @@ tasks:
       task --version
 
   - key: sandbox
-    use: [system-packages, code, rust, nextest, go-task, node]
+    use: [system-packages, code, rust, nextest, cargo-mutants, go-task, node]
     runner:
       cpus: 16
       memory: 64gb
       disk: 150gb
     env:
       DAD_REQUIRE_GO_TASK: "1"
-    # Billed per second while alive, idle included. `affected-checks --run`
-    # stops it when it finishes; this is the backstop for everything else (an
-    # interrupted run, an ad-hoc `rwx sandbox exec`). A running command counts
+      # Issue #2052: see the `version` task.
+      DAD_VERSION: ${{ tasks.version.values.dad_version }}
+    # Billed per second while alive, idle included. Nothing stops it after a
+    # command by default (`affected-checks --run` included, unless
+    # DAD_REMOTE_EXEC_KEEP=0): one unit's agents share it, and a stop killed a
+    # teammate's running command (2026-10-31). This timeout is what stops it. A running command counts
     # as activity (measured 2026-10-22: a 3-minute command survived a 1-minute
     # timeout), so a short timeout cannot cut a long test run off.
     run: rwx-sandbox --inactivity-timeout 5m
