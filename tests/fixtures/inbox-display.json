@@ -28,12 +28,16 @@
   },
   "inputNotDelivered": "not delivered: your held typing; restarting the agent discarded it. Type it again if you still need it.",
   "inputRejected": {
-    "history-only": "Input not delivered: session is history-only",
+    "history-only": "Input not delivered: this agent has no live terminal",
     "exited": "Input not delivered: the agent has exited",
     "write-failed": "Input not delivered: the agent's terminal did not take it",
-    "stale": "Input not delivered: the pane's session changed",
-    "wrong-session": "Input not delivered: the pane's session changed",
+    "stale": "Input not delivered: the agent in this pane was replaced or closed",
+    "wrong-session": "Input not delivered: the agent in this pane was replaced or closed",
     "": "Input not delivered"
+  },
+  "inputUnavailable": {
+    "history-only": "Terminal input unavailable: this agent has no live terminal, only its history",
+    "none": "Terminal input unavailable: this agent has no live terminal"
   },
   "cannotCheckDetail": "waiting: the deck can't check this agent's input box: {cause}. {remedy}",
   "holdCauses": {

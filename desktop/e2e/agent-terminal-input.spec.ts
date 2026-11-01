@@ -167,7 +167,7 @@ test.describe("agent terminal input", () => {
     await expect(historyOnly).toHaveAttribute("aria-disabled", "true");
     await expect(page.getByTestId("terminal-input-status-11")).toHaveAttribute("role", "status");
     await expect(page.getByTestId("terminal-input-status-11")).toHaveText(
-      "Terminal input unavailable — the agent has no live pane — only its history remains.",
+      "Terminal input unavailable: this agent has no live terminal, only its history",
     );
 
     const noLiveTarget = page.getByTestId("terminal-15");
@@ -175,7 +175,7 @@ test.describe("agent terminal input", () => {
     await expect(noLiveTarget).toHaveAttribute("aria-disabled", "true");
     await expect(page.getByTestId("terminal-input-status-15")).toHaveAttribute("role", "status");
     await expect(page.getByTestId("terminal-input-status-15")).toHaveText(
-      "Terminal input unavailable — there is nothing live to write to.",
+      "Terminal input unavailable: this agent has no live terminal",
     );
 
     const applied = page.getByTestId("terminal-2");

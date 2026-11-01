@@ -479,11 +479,11 @@ describe("ControlDeck", () => {
    * region explains the exact non-delivery instead of accepting keystrokes.
    */
   it.each([
-    ["history-only", "read", "the agent has no live pane — only its history remains"],
-    ["no-live-target", "none", "there is nothing live to write to"],
+    ["history-only", "read", "Terminal input unavailable: this agent has no live terminal, only its history"],
+    ["no-live-target", "none", "Terminal input unavailable: this agent has no live terminal"],
   ] satisfies [SendResult, AgentSession["writeLease"], string][])(
     "marks and disables terminal input for %s",
-    (inputState, writeLease, reason) => {
+    (inputState, writeLease, notice) => {
       const id = `input-${inputState}`;
       const snapshot = liveSnapshot([{ ...agentIn(id, "/tmp/project"), status: "running", writeLease }]);
       render(<ControlDeck runtime={runtime({ mode: "live", snapshot })} />);
@@ -495,7 +495,7 @@ describe("ControlDeck", () => {
       const status = screen.queryByTestId(`terminal-input-status-${id}`);
       expect(status, `missing terminal-input-status-${id}`).not.toBeNull();
       expect(status!).toHaveAttribute("role", "status");
-      expect(status!).toHaveTextContent(`Terminal input unavailable — ${reason}.`);
+      expect(status!).toHaveTextContent(notice);
     },
   );
 

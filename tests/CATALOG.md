@@ -863,7 +863,7 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 ##### dashboard/status-message/009 — A refused input names why, in the words the desktop shows (PRD #1666 part 3, Q15-2).
 - **Layer:** L1 (in-module `src/ui.rs` test: applies a daemon `KIND_STREAM_REJECT` to a focused pane in typing mode with `apply_stream_rejection_feedback`, then draws the full frame with `render_frame` into a ratatui `TestBackend` and inline-`insta`-snapshots the bottom status row).
 - **Agent:** none.
-- **Asserts:** for `exited` and `write-failed` the deck leaves typing mode and the status row reads ` COMMAND  Input not delivered: the agent has exited` and ` COMMAND  Input not delivered: the agent's terminal did not take it`, each equal to `tests/fixtures/inbox-display.json`'s `inputRejected` word, which the desktop's own test (`stream_rejection_notice_uses_the_words_the_tui_shows` in `desktop/src-tauri/src/terminal.rs`) checks its in-tile notice against.
+- **Asserts:** for `exited` and `write-failed` the deck leaves typing mode and the status row reads ` COMMAND  Input not delivered: the agent has exited` and ` COMMAND  Input not delivered: the agent's terminal did not take it`, each equal to `tests/fixtures/inbox-display.json`'s `inputRejected` word, which the desktop's own test (`stream_rejection_notice_uses_the_words_the_tui_shows` in `desktop/src-tauri/src/terminal.rs`) checks its in-tile notice against. For `history-only`, `stale` and `wrong-session` likewise: ` COMMAND  Input not delivered: this agent has no live terminal`, and ` COMMAND  Input not delivered: the agent in this pane was replaced or closed` for both of the others. Trying to type into a history-only or view-only card gives the fixture's `inputUnavailable` words (`Terminal input unavailable: this agent has no live terminal, only its history`, `Terminal input unavailable: this agent has no live terminal`), which the desktop tile's standing notice reads from the same fixture (`desktop/src/lib/terminalInput.test.ts`, `desktop/src/App.test.tsx`).
 - **Does not assert:** that a real daemon sends either reason (the writer's own units in `src/agent_pty.rs`); the desktop's rendering of the notice in xterm.
 - **Platform coverage:** mac+linux+windows.
 
@@ -2102,7 +2102,7 @@ Issue #1794: a daemon must not be left half-alive — hook endpoint up, no attac
 ##### prompt/pane-input/004 — Entering a history-only card surfaces feedback instead of silently dropping input (PRD #20 M3/M4).
 - **Layer:** L2 (real spawned TUI + daemon in the PTY/vt100 harness; synthetic pane and hook event, no LLM).
 - **Agent:** synthetic wrapped Codex session backed by `cat`, declared `writable = history-only` through `AgentEvent.live_target`.
-- **Asserts:** attempting to enter the card renders `History-only session cannot accept live input`, and the refusal does not remove the Codex card.
+- **Asserts:** attempting to enter the card renders `Terminal input unavailable: this agent has no live terminal, only its history` (the shared fixture's `inputUnavailable` words, which the desktop tile shows as its standing notice for the same card), and the refusal does not remove the Codex card.
 - **Does not assert:** real Codex execution or wrapper stdout classification (covered by `codex/live/001` and `codex/wrap/001`).
 - **Platform coverage:** mac+linux.
 

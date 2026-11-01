@@ -1419,19 +1419,6 @@ export interface DeckActionResult {
   agentIncarnation?: string;
 }
 
-/** Operator-facing explanation of a non-delivered outcome. */
-export function sendResultReason(result: SendResult | undefined): string {
-  switch (result) {
-    case "stale": return "the daemon's view of that pane had already moved on";
-    case "wrong-session": return "the pane handle no longer maps to that agent's session";
-    case "history-only": return "the agent has no live pane — only its history remains";
-    case "no-live-target": return "there is nothing live to write to";
-    case "ambiguous": return "the write started but did not complete; some of it may already have landed, so it was not retried";
-    case "unknown": return "the daemon reported an outcome this build does not recognise";
-    default: return "the daemon did not confirm delivery";
-  }
-}
-
 export interface OrchestrationLaunchRole {
   role: string;
   command: string;

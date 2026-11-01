@@ -113,18 +113,43 @@ pub const INPUT_NOT_DELIVERED: &str = "not delivered: your held typing; restarti
 /// (`KIND_STREAM_REJECT`) for a reason it names: the TUI on its status line,
 /// the desktop inside the terminal tile. One copy, pinned with the desktop's
 /// by `tests/fixtures/inbox-display.json`'s `inputRejected` (CLAUDE.md rule
-/// 22, PRD #1666 part 3 Q15-2).
-pub const INPUT_REJECTED_HISTORY_ONLY: &str = "Input not delivered: session is history-only";
+/// 22, PRD #1666 part 3 Q15-2). `history-only` is the daemon's reason for a
+/// target that takes no live input, history-only or view-only alike.
+pub const INPUT_REJECTED_HISTORY_ONLY: &str =
+    "Input not delivered: this agent has no live terminal";
 /// [`input_rejected`]'s words for `exited`.
 pub const INPUT_REJECTED_EXITED: &str = "Input not delivered: the agent has exited";
 /// [`input_rejected`]'s words for `write-failed`: the agent's terminal took
 /// none or only part of it, so it is not reported as the agent exiting.
 pub const INPUT_REJECTED_WRITE_FAILED: &str =
     "Input not delivered: the agent's terminal did not take it";
-/// [`input_rejected`]'s words for `stale` and `wrong-session`.
-pub const INPUT_REJECTED_SESSION_CHANGED: &str = "Input not delivered: the pane's session changed";
+/// [`input_rejected`]'s words for `stale` (the pane has no agent now) and
+/// `wrong-session` (another agent generation has the pane now).
+pub const INPUT_REJECTED_REPLACED_OR_CLOSED: &str =
+    "Input not delivered: the agent in this pane was replaced or closed";
 /// [`input_rejected`]'s words for a refusal that names no reason.
 pub const INPUT_REJECTED_UNNAMED: &str = "Input not delivered";
+
+/// What both clients say about a terminal that takes no input, before
+/// anything is typed into it: the TUI when the user tries to type into the
+/// card, the desktop as the tile's standing notice. Pinned with the
+/// desktop's by `tests/fixtures/inbox-display.json`'s `inputUnavailable`
+/// (CLAUDE.md rule 22, merge review U3-2). For a history-only target.
+pub const INPUT_UNAVAILABLE_HISTORY_ONLY: &str =
+    "Terminal input unavailable: this agent has no live terminal, only its history";
+/// [`input_unavailable`]'s words for a view-only target.
+pub const INPUT_UNAVAILABLE_NO_LIVE_TERMINAL: &str =
+    "Terminal input unavailable: this agent has no live terminal";
+
+/// The words for a terminal whose input target is `writable`, when it takes
+/// no input; `None` for a live one.
+pub fn input_unavailable(writable: crate::event::Writable) -> Option<&'static str> {
+    match writable {
+        crate::event::Writable::Live => None,
+        crate::event::Writable::HistoryOnly => Some(INPUT_UNAVAILABLE_HISTORY_ONLY),
+        crate::event::Writable::None => Some(INPUT_UNAVAILABLE_NO_LIVE_TERMINAL),
+    }
+}
 
 /// The words for a refusal of typed input whose reason is `reason` (see
 /// [`INPUT_REJECTED_EXITED`]). A reason this deck doesn't know is shown in
@@ -136,7 +161,7 @@ pub fn input_rejected(reason: &str) -> String {
         "history-only" => INPUT_REJECTED_HISTORY_ONLY.to_string(),
         "exited" => INPUT_REJECTED_EXITED.to_string(),
         "write-failed" => INPUT_REJECTED_WRITE_FAILED.to_string(),
-        "stale" | "wrong-session" => INPUT_REJECTED_SESSION_CHANGED.to_string(),
+        "stale" | "wrong-session" => INPUT_REJECTED_REPLACED_OR_CLOSED.to_string(),
         other => format!("{INPUT_REJECTED_UNNAMED} ({other})"),
     }
 }
@@ -1623,8 +1648,8 @@ mod tests {
             ("history-only", INPUT_REJECTED_HISTORY_ONLY),
             ("exited", INPUT_REJECTED_EXITED),
             ("write-failed", INPUT_REJECTED_WRITE_FAILED),
-            ("stale", INPUT_REJECTED_SESSION_CHANGED),
-            ("wrong-session", INPUT_REJECTED_SESSION_CHANGED),
+            ("stale", INPUT_REJECTED_REPLACED_OR_CLOSED),
+            ("wrong-session", INPUT_REJECTED_REPLACED_OR_CLOSED),
             ("", INPUT_REJECTED_UNNAMED),
         ] {
             assert_eq!(words["inputRejected"][reason], expected, "{reason:?}");
@@ -1636,6 +1661,30 @@ mod tests {
                 .map(|reasons| reasons.len()),
             Some(6),
             "the fixture lists every refusal the deck names"
+        );
+        // Merge review U3-2: the state both clients show before anything is
+        // typed into a terminal that takes no input.
+        for (writable, value, expected) in [
+            (
+                crate::event::Writable::HistoryOnly,
+                "history-only",
+                INPUT_UNAVAILABLE_HISTORY_ONLY,
+            ),
+            (
+                crate::event::Writable::None,
+                "none",
+                INPUT_UNAVAILABLE_NO_LIVE_TERMINAL,
+            ),
+        ] {
+            assert_eq!(words["inputUnavailable"][value], expected, "{value}");
+            assert_eq!(input_unavailable(writable), Some(expected), "{value}");
+        }
+        assert_eq!(input_unavailable(crate::event::Writable::Live), None);
+        assert_eq!(
+            words["inputUnavailable"]
+                .as_object()
+                .map(|states| states.len()),
+            Some(2)
         );
         assert_eq!(
             input_rejected("newer-reason"),
