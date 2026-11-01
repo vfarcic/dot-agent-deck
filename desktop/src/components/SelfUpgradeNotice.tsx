@@ -7,10 +7,12 @@ import type { SelfUpgradeCheck } from "../lib/selfUpgrade";
  * Issue #1635 — the app's equivalent of the TUI's `Update available: vX
  * (current: vY)` badge, in the crate's own words (`UpgradePlan::headline`).
  *
- * Two places, both opening the same dialog, about the app alone (issue
- * #1753): a CLI that is behind is offered on the Dashboard's Local daemon
- * section instead, so this notice never reads as one about the daemon. The
- * rail button is the app's chrome, on every screen, for as long as the app is
+ * Two places, both opening the same flow. The notice appears only for the app
+ * (issue #1753): a CLI that is behind while the app is current is offered on
+ * the Dashboard's Local daemon section instead, so this notice never reads as
+ * one about the daemon. Once open, the flow is the Local daemon section's
+ * (issue #2062): the app, then the CLI when it is behind too, then the local
+ * daemon. The rail button is the app's chrome, on every screen, for as long as the app is
  * behind. The banner is at the top of the dashboard, where the text can be
  * read without hovering, and can be dismissed; the rail button stays.
  *

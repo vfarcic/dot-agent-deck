@@ -181,7 +181,8 @@ desktopScenario("daemon-upgrade", async (page) => {
 // newer-release banner and the rail's upgrade button, and the dialog the
 // banner opens, stopped at its question. The fixture's stand-in plays a
 // `.dmg` app and a Homebrew CLI on v0.46.0 with v0.47.0 out; since issue
-// #1753 the banner's dialog covers the app alone. Nothing is installed.
+// #2062 the banner's dialog covers the CLI too, after the app. Nothing is
+// installed.
 desktopScenario("self-upgrade", async (page) => {
   await page.goto("/?fixture=1&state=docs&selfupgrade=1");
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
@@ -191,7 +192,8 @@ desktopScenario("self-upgrade", async (page) => {
   await page.getByTestId("self-upgrade-banner-open").click();
   await expect(page.getByTestId("self-upgrade-dialog")).toHaveAttribute("data-phase", "confirm");
   await expect(page.getByTestId("self-upgrade-confirm")).toHaveAttribute("data-copy", "app");
-  await expect(page.getByTestId("self-upgrade-plan-cli")).toHaveCount(0);
+  await expect(page.getByTestId("self-upgrade-plan-cli")).toBeVisible();
+  await expect(page.getByTestId("self-upgrade-then")).toBeVisible();
 });
 
 // Issue #1753 — upgrading this machine's CLI from the Local daemon section:

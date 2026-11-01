@@ -159,7 +159,7 @@ When the reason ends with `and it is still the daemon that was asked to restart`
 
 ## Upgrade the CLI and the daemon on this machine
 
-Two things on this machine can fall behind: the `dot-agent-deck` CLI on your `PATH`, which the TUI, your terminal commands and agent hooks run, and the daemon. The **Local daemon** section of the Dashboard offers **Upgrade** whenever either is behind, as a remote daemon's section does for that machine. Hovering it shows what is behind, for example `dot-agent-deck CLI: update available: v0.47.0 (current: v0.46.0)`. The banner at the top of the Dashboard and the rail's upgrade button are about the app alone ([Desktop App → Upgrade the app](index.md#upgrade-the-app)).
+Two things on this machine can fall behind: the `dot-agent-deck` CLI on your `PATH`, which the TUI, your terminal commands and agent hooks run, and the daemon. The **Local daemon** section of the Dashboard offers **Upgrade** whenever either is behind, as a remote daemon's section does for that machine. Hovering it shows what is behind, for example `dot-agent-deck CLI: update available: v0.47.0 (current: v0.46.0)`. When the app itself is behind, the banner at the top of the Dashboard and the rail's upgrade button appear too, and they run this same upgrade, starting with the app ([Desktop App → Upgrade the app](index.md#upgrade-the-app)).
 
 **TUI:**
 

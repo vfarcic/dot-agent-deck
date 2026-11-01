@@ -69,8 +69,9 @@ export interface SelfUpgradeCheck {
   latest: string;
   /**
    * Whether the app itself is behind and can still be offered. A CLI that is
-   * behind does not count (issue #1753): the Local daemon section offers it,
-   * from `cli`, so the app-wide notice is about the app alone.
+   * behind does not count (issue #1753): while the app is current, the Local
+   * daemon section offers it, from `cli`. Once the app's notice is open, its
+   * dialog offers a CLI that is behind too (issue #2062).
    */
   updateAvailable: boolean;
   /** The notice's text: the app's headline, the TUI badge's words, or, once the app itself was installed, the relaunch prompt. */
@@ -133,8 +134,8 @@ export function newerCheck(current: SelfUpgradeCheck | undefined, answer: SelfUp
 }
 
 /**
- * The plans a dialog about `copies` shows, app first: the banner's dialog
- * shows the app's, and the Local daemon section's the CLI's (issue #1753).
+ * The plans a dialog about `copies` shows, app first. Which copies an entry
+ * point covers is `upgradeCopies` in `LocalUpgradeFlow` (issue #2062).
  */
 export function plansOf(check: SelfUpgradeCheck, copies: readonly SelfCopy[] = ["app", "cli"]): SelfUpgradePlan[] {
   return (check.cli ? [check.app, check.cli] : [check.app]).filter((plan) => copies.includes(plan.copy));
