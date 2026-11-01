@@ -87,8 +87,8 @@ describe("Upgrade on the Local daemon section while the app is behind (issue #19
     expect(deck.upgradeDaemon).not.toHaveBeenCalled();
   });
 
-  /** Scenario: The app's upgrade fails, the CLI is then upgraded: with no relaunch waiting, closing the dialog goes on to restart the older local daemon, as it does when the app is current. */
-  it("local_upgrade_013 an app that was not replaced goes on to the daemon after the CLI", async () => {
+  /** Scenario: The app's upgrade fails, the CLI is then upgraded: with no relaunch waiting, closing the dialog goes on to the older local daemon, and asks before restarting it, since the dialog had said the relaunched app would. */
+  it("local_upgrade_013 an app that was not replaced goes on to the daemon after the CLI, asking first", async () => {
     const failed: SelfUpgradeResult = { copy: "app", ok: false, installed: false, relaunch: false, lines: [{ text: "Cannot download Agent Deck.", command: null }] };
     const api = { check: vi.fn(), run: vi.fn(async (copy: string) => (copy === "app" ? failed : brewed)), relaunch: vi.fn() };
     const deck = runtime();
@@ -99,6 +99,9 @@ describe("Upgrade on the Local daemon section while the app is behind (issue #19
     await screen.findByTestId("self-upgrade-result-cli");
     expect(screen.queryByTestId("self-upgrade-relaunch")).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId("self-upgrade-close"));
+    await screen.findByTestId("upgrade-confirm-body");
+    expect(deck.upgradeDaemon).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("upgrade-start"));
     await waitFor(() => expect(deck.upgradeDaemon).toHaveBeenCalledWith("local", expect.any(Function)));
   });
 
@@ -284,8 +287,8 @@ describe("Upgrade from the app's notice covers the CLI too (issue #2062)", () =>
     }
   });
 
-  /** Scenario: The app's upgrade from its notice fails, and the CLI is upgraded: with no relaunch waiting, closing the dialog goes on to restart the older local daemon, as the Local daemon section's Upgrade does. */
-  it("notice_upgrade_004 an app that was not replaced goes on to the daemon after the CLI", async () => {
+  /** Scenario: The app's upgrade from its notice fails, and the CLI is upgraded: with no relaunch waiting, closing the dialog goes on to the older local daemon and asks before restarting it, as the dialog had said the relaunched app would restart it. */
+  it("notice_upgrade_004 an app that was not replaced goes on to the daemon after the CLI, asking first", async () => {
     const failed: SelfUpgradeResult = { copy: "app", ok: false, installed: false, relaunch: false, lines: [text("Cannot download Agent Deck.")] };
     const brewed: SelfUpgradeResult = { copy: "cli", ok: true, installed: true, relaunch: false, lines: [text("`brew upgrade dot-agent-deck` finished; it now reports v0.45.0.")] };
     const api = { check: vi.fn(), run: vi.fn(async (copy: string) => (copy === "app" ? failed : brewed)), relaunch: vi.fn() };
@@ -296,6 +299,9 @@ describe("Upgrade from the app's notice covers the CLI too (issue #2062)", () =>
     fireEvent.click(screen.getByTestId("self-upgrade-start"));
     await screen.findByTestId("self-upgrade-result-cli");
     fireEvent.click(screen.getByTestId("self-upgrade-close"));
+    await screen.findByTestId("upgrade-confirm-body");
+    expect(deck.upgradeDaemon).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("upgrade-start"));
     await waitFor(() => expect(deck.upgradeDaemon).toHaveBeenCalledWith("local", expect.any(Function)));
   });
 

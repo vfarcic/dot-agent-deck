@@ -2454,8 +2454,15 @@ mod tests {
                     says: "Built from source",
                 },
                 CliCase {
+                    // The CLI inside the bundle answers on `PATH`, and is
+                    // skipped because it upgrades with the app (Qodo, PR #2063).
                     name: "only the copy bundled in the app",
-                    host: mac(),
+                    host: mac()
+                        .on_path("/Applications/Agent Deck.app/Contents/MacOS")
+                        .deck(
+                            "/Applications/Agent Deck.app/Contents/MacOS/dot-agent-deck",
+                            CURRENT,
+                        ),
                     action: None,
                     actionable: false,
                     says: "",

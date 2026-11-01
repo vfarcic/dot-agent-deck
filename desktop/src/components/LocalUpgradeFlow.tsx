@@ -93,9 +93,11 @@ export function afterCopies(check: SelfUpgradeCheck, copies: readonly SelfCopy[]
  *    local flow, with its question naming every agent and role a restart
  *    would stop, defaulting to Keep current daemon. It starts at once when the
  *    user has just installed the CLI, which they did knowing this step follows
- *    (the dialog says so); otherwise — a CLI that could not be upgraded from
- *    here, a failed upgrade, or a download whose install command is still to
- *    run — it asks first, as Upgrade on its own does.
+ *    (the dialog said so, {@link restartAfterCli}); otherwise — a CLI that
+ *    could not be upgraded from here, a failed upgrade, a download whose
+ *    install command is still to run, or an app that led and was not replaced,
+ *    where the dialog said the relaunched app restarts the daemon — it asks
+ *    first, as Upgrade on its own does.
  *
  * Issue #1959 — when the app itself is behind, or was upgraded and still runs
  * the old build, the dialog covers the app as well, app first, and says why
@@ -113,6 +115,8 @@ export function LocalUpgradeFlow({ daemon, copies, entry = "local", runtime, onC
   if (step.step === "copies" && copies) {
     /* The daemon follows only an upgrade that covered the CLI: the app alone is followed by its relaunch. */
     const next = covered.includes("cli") ? daemon : undefined;
+    /* Whether the dialog said the daemon is restarted next, rather than by the relaunched app (Qodo, PR #2063). */
+    const restartSaid = !(covered.includes("app") && appFirst(copies.check));
     return (
       <SelfUpgradeDialog
         check={copies.check}
@@ -120,7 +124,7 @@ export function LocalUpgradeFlow({ daemon, copies, entry = "local", runtime, onC
         copies={covered}
         then={afterCopies(copies.check, covered, daemon, entry)}
         onClose={(closed) => {
-          if (closed && next && !closed.relaunch) setStep({ step: "daemon", autoStart: closed.installed });
+          if (closed && next && !closed.relaunch) setStep({ step: "daemon", autoStart: closed.installed && restartSaid });
           else onClose();
         }}
       />
