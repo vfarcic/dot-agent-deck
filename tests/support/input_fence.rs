@@ -167,7 +167,7 @@ impl Fixture {
         )
     }
 
-    fn require_control(&self, operation: &str) -> Value {
+    pub fn require_control(&self, operation: &str) -> Value {
         let reply = self.control(self.generation, operation);
         assert_eq!(
             reply["ok"], true,
