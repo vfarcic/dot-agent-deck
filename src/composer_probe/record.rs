@@ -857,7 +857,26 @@ pub struct Records {
     episodes_uncounted: u32,
     /// The most records kept: [`RECORD_CAP`], lower only in a test or `e2e`
     /// build that asked for it before the first observation (Q105b.2).
+    #[cfg(any(test, feature = "e2e"))]
     cap: usize,
+    /// The test and `e2e` builds' read-only witness (Q105b.2).
+    #[cfg(any(test, feature = "e2e"))]
+    witness: E2eWitness,
+}
+
+/// The test and `e2e` builds' read-only witness of what a generation's
+/// records were shown (Q105b.2): whether any observation ever reached them,
+/// a dropped or refused one included, which latches for good, and how many
+/// observations the record cap dropped, by the decision each named.
+#[cfg(any(test, feature = "e2e"))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct E2eWitness {
+    pub observed: bool,
+    pub cap_dropped_undecided: u64,
+    pub cap_dropped_armed: u64,
+    pub cap_dropped_unarmed: u64,
+    pub cap_dropped_tool: u64,
+    pub cap_dropped_unknown: u64,
 }
 
 impl Records {
@@ -876,14 +895,20 @@ impl Records {
             stopped: None,
             episodes: Vec::new(),
             episodes_uncounted: 0,
+            #[cfg(any(test, feature = "e2e"))]
             cap: RECORD_CAP,
+            #[cfg(any(test, feature = "e2e"))]
+            witness: E2eWitness::default(),
         }
     }
 
     /// The test and `e2e` builds' generation-bound override (Q105b.2): this
-    /// generation's EC policy and a record cap at most [`RECORD_CAP`], set
-    /// only while it has made no record, kept no history entry and opened no
-    /// episode, so no decision was ever read under another policy or cap.
+    /// generation's EC policy and a record cap from 1 to [`RECORD_CAP`], set
+    /// only before any observation ever reached the records (R-C-U2-02: a
+    /// latch that never reopens, not the emptiness of what they retain, which
+    /// a prune can restore), so no decision was ever read under another
+    /// policy or cap. `Authority` is a policy production does not run: what a
+    /// generation does under it is not production behaviour.
     #[cfg(any(test, feature = "e2e"))]
     pub fn configure_for_e2e(
         &mut self,
@@ -893,7 +918,11 @@ impl Records {
         if self.retired {
             return Err("the generation retired");
         }
-        if !self.records.is_empty() || !self.episodes.is_empty() || self.pending_since.is_some() {
+        if self.witness.observed
+            || !self.records.is_empty()
+            || !self.episodes.is_empty()
+            || self.pending_since.is_some()
+        {
             return Err("the generation already observed a helper");
         }
         if let Some(cap) = cap {
@@ -911,6 +940,26 @@ impl Records {
     /// This generation's EC policy.
     pub fn policy(&self) -> EcPolicy {
         self.policy
+    }
+
+    /// The most records this generation keeps: [`RECORD_CAP`] in a release
+    /// build, where nothing can lower it.
+    #[cfg(any(test, feature = "e2e"))]
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
+    /// The most records this generation keeps: [`RECORD_CAP`] in a release
+    /// build, where nothing can lower it.
+    #[cfg(not(any(test, feature = "e2e")))]
+    pub fn cap(&self) -> usize {
+        RECORD_CAP
+    }
+
+    /// The test and `e2e` builds' read-only witness (Q105b.2).
+    #[cfg(any(test, feature = "e2e"))]
+    pub fn witness(&self) -> E2eWitness {
+        self.witness
     }
 
     pub fn scope(&self) -> WriterScope {
@@ -977,10 +1026,25 @@ impl Records {
         now: Instant,
     ) -> Result<Recorded, Refusal> {
         self.check(obs.generation)?;
+        #[cfg(any(test, feature = "e2e"))]
+        {
+            self.witness.observed = true;
+        }
         let before = self.scope.state();
         let i = match self.index(obs.key) {
             Ok(i) => i,
-            Err(_) if self.records.len() >= self.cap => {
+            Err(_) if self.records.len() >= self.cap() => {
+                #[cfg(any(test, feature = "e2e"))]
+                {
+                    let w = &mut self.witness;
+                    *match obs.decision {
+                        None => &mut w.cap_dropped_undecided,
+                        Some(Decision::Armed) => &mut w.cap_dropped_armed,
+                        Some(Decision::Unarmed) => &mut w.cap_dropped_unarmed,
+                        Some(Decision::Tool) => &mut w.cap_dropped_tool,
+                        Some(Decision::Unknown) => &mut w.cap_dropped_unknown,
+                    } += 1;
+                }
                 self.dropped(obs.decision);
                 self.transition(
                     before,
@@ -1097,6 +1161,10 @@ impl Records {
         now: Instant,
     ) -> Result<(), Refusal> {
         self.check(generation)?;
+        #[cfg(any(test, feature = "e2e"))]
+        {
+            self.witness.observed = true;
+        }
         let before = self.scope.state();
         if let Some(decision) = decision.filter(|d| !d.helper_only())
             && channel != Channel::Scan
@@ -1452,7 +1520,7 @@ impl Records {
         if self.retired {
             return Err(Hold::Retired);
         }
-        if self.records.len() >= self.cap {
+        if self.records.len() >= self.cap() {
             return Err(Hold::RecordCap);
         }
         if self.history.len() >= HISTORY_CAP {

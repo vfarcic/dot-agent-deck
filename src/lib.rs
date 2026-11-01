@@ -43,12 +43,12 @@ pub mod daemon_restart;
 pub mod daemon_service;
 // Issue #1490: why a deck is not connected, and starting its daemon.
 pub mod daemon_start;
-// PRD #1666 part 3 (Q105b.2): the test and `e2e` builds' writer and attach
-// controls; a release build has none.
 pub mod daemon_status;
 pub mod daemon_stop;
 pub mod daemon_upgrade;
 pub mod deck_list;
+// PRD #1666 part 3 (Q105b.2): the test and `e2e` builds' writer and attach
+// controls; a release build has none.
 #[cfg(any(test, feature = "e2e"))]
 pub mod e2e_controls;
 // PRD #1666: the deck's persistent id, carried in inbox addresses and message ids.

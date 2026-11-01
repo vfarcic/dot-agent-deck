@@ -4665,8 +4665,10 @@ pub struct ComposerEpochStatus {
 }
 
 /// PRD #1666 part 3 (Q35-20): a generation's observer, the `e2e` build's
-/// read-only `observer-status` answer: its writer scope, `pending`,
-/// `closed` or `open`.
+/// read-only `observer-status` answer, and `observer-hold`'s and
+/// `observer-go`'s: its writer scope, `pending`, `closed` or `open`, and
+/// (Q105b.2) its records and pass barrier. The records' fields are read in
+/// one hold of their lock, the barrier's in one hold of its own.
 #[cfg(feature = "e2e")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComposerObserverStatus {
@@ -4677,6 +4679,105 @@ pub struct ComposerObserverStatus {
     /// Q105b.2: how many passes the observer thread has finished.
     #[serde(default)]
     pub passes: u64,
+    /// Q105b.2: whether a pass is running now. Held and not running: the
+    /// observer is quiet, and no pass can start until `observer-go`.
+    #[serde(default)]
+    pub pass_running: bool,
+    /// Q105b.2: the records' EC policy, `hold` or `authority`.
+    #[serde(default)]
+    pub records_policy: String,
+    /// Q105b.2: the most records kept.
+    #[serde(default)]
+    pub records_cap: usize,
+    /// Q105b.2: the records kept now.
+    #[serde(default)]
+    pub records_retained: usize,
+    /// Q105b.2: whether any observation ever reached the records; once it
+    /// has, `records-policy` and `records-cap` are refused for good.
+    #[serde(default)]
+    pub records_observed: bool,
+    /// Q105b.2: observations the record cap dropped, by their decision.
+    #[serde(default)]
+    pub cap_dropped: ComposerCapDrops,
+}
+
+/// PRD #1666 part 3 (Q105b.2): observations a generation's record cap
+/// dropped, counted by the decision each named; `undecided` named none.
+#[cfg(feature = "e2e")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerCapDrops {
+    pub undecided: u64,
+    pub armed: u64,
+    pub unarmed: u64,
+    pub tool: u64,
+    pub unknown: u64,
+}
+
+/// How long `observer-hold` waits for a pass already running to finish
+/// before answering that it hasn't (Q105b.2).
+#[cfg(feature = "e2e")]
+const OBSERVER_HOLD_BOUND: Duration = Duration::from_secs(30);
+
+/// PRD #1666 part 3 (Q105b.2): `agent`'s observer status, read and
+/// changing nothing; `None` with no records attached or once retired.
+#[cfg(feature = "e2e")]
+fn composer_observer_status(
+    registry: &Arc<AgentPtyRegistry>,
+    agent: &str,
+) -> Option<ComposerObserverStatus> {
+    use crate::composer_probe::record::{EcPolicy, ScopeState};
+    let records = registry
+        .composer_input(agent)
+        .and_then(|input| input.records_for_e2e())?;
+    #[cfg(target_os = "linux")]
+    let passes = registry
+        .composer_observer(agent)
+        .map(|observer| observer.passes_for_e2e())
+        .unwrap_or_default();
+    #[cfg(target_os = "linux")]
+    let (passes_held, pass_running, passes) = (passes.held, passes.running, passes.finished);
+    #[cfg(not(target_os = "linux"))]
+    let (passes_held, pass_running, passes) = (false, false, 0);
+    let w = records.witness;
+    Some(ComposerObserverStatus {
+        scope: match records.scope {
+            ScopeState::Closed => "closed",
+            ScopeState::Pending => "pending",
+            ScopeState::Open(_) => "open",
+        }
+        .to_string(),
+        passes_held,
+        passes,
+        pass_running,
+        records_policy: match records.policy {
+            EcPolicy::Hold => "hold",
+            EcPolicy::Authority => "authority",
+        }
+        .to_string(),
+        records_cap: records.cap,
+        records_retained: records.retained,
+        records_observed: w.observed,
+        cap_dropped: ComposerCapDrops {
+            undecided: w.cap_dropped_undecided,
+            armed: w.cap_dropped_armed,
+            unarmed: w.cap_dropped_unarmed,
+            tool: w.cap_dropped_tool,
+            unknown: w.cap_dropped_unknown,
+        },
+    })
+}
+
+/// The status as an `ok` answer, or the refusal.
+#[cfg(feature = "e2e")]
+fn composer_observer_answer(registry: &Arc<AgentPtyRegistry>, agent: &str) -> AttachResponse {
+    match composer_observer_status(registry, agent) {
+        Some(status) => AttachResponse {
+            ok: true,
+            composer_observer: Some(status),
+            ..Default::default()
+        },
+        None => AttachResponse::err("e2e-composer-control: no observer on that pane"),
+    }
 }
 
 /// PRD #1666 part 3 (Q105b.2): a generation's PTY writer thread under the
@@ -4861,18 +4962,24 @@ fn e2e_composer_frontier(
 
 /// PRD #1666 part 3 (Q105b.2): the controls S-20b and S-20c asked for, each
 /// refused unless `generation` is the pane's current one. None writes a byte,
-/// arms, releases or completes anything; each withholds, fails or reorders
-/// what the production path does ([`crate::e2e_controls`]).
+/// arms, releases or completes anything itself. The writer and attach
+/// controls withhold, fail or reorder what the production path does
+/// ([`crate::e2e_controls`]); `schedule-advance` makes the schedule's own
+/// tick due sooner, and the attempt it then starts goes through admission as
+/// any does; `records-policy:authority` selects a policy production does not
+/// run, so what a generation does under it is not production behaviour.
 ///
 /// - `writer-hold` / `writer-go`: park the generation's PTY writer thread
 ///   before its next job, and let it go on; `writer-status` reads it.
 /// - `writer-fault:jobs=<any|answer>,skip=<K>,accept=<N>`: after `K`
-///   matching jobs, the PTY accepts `N` more bytes of matching jobs and then
+///   matching jobs (an answer is one job per key entry it writes), the PTY
+///   takes `N` more bytes of matching jobs, counted by what it took, and then
 ///   fails each matching write; `writer-fault:off` clears it.
 /// - `schedule-advance:<ms>`: the probe schedule's pending wait ends `ms`
 ///   earlier, as if that much time passed; `schedule-status` reads it.
 /// - `records-policy:<hold|authority>`, `records-cap:<n>`: this generation's
-///   EC policy and record cap, only before its first observation.
+///   EC policy and record cap, only before any observation ever reached its
+///   records; `observer-status` reads them back.
 /// - `attach-degrade-peer-watch:<client_id>`, `attach-end-output:<client_id>`:
 ///   that client's attach connections stop watching their peer, and their
 ///   output tasks end (Q15-1).
@@ -5021,37 +5128,7 @@ async fn e2e_composer_probe_control(
                 ..Default::default()
             }
         }
-        "observer-status" => {
-            let Some(input) = registry.composer_input(&agent) else {
-                return AttachResponse::err(
-                    "e2e-composer-control: not the pane's current generation",
-                );
-            };
-            use crate::composer_probe::record::ScopeState;
-            let Some(scope) = input.writer_scope() else {
-                return AttachResponse::err("e2e-composer-control: no observer on that pane");
-            };
-            let scope = match scope.state() {
-                ScopeState::Closed => "closed",
-                ScopeState::Pending => "pending",
-                ScopeState::Open(_) => "open",
-            };
-            #[cfg(target_os = "linux")]
-            let (passes_held, passes) = registry
-                .composer_observer(&agent)
-                .map_or((false, 0), |observer| observer.passes_for_e2e());
-            #[cfg(not(target_os = "linux"))]
-            let (passes_held, passes) = (false, 0);
-            AttachResponse {
-                ok: true,
-                composer_observer: Some(ComposerObserverStatus {
-                    scope: scope.to_string(),
-                    passes_held,
-                    passes,
-                }),
-                ..Default::default()
-            }
-        }
+        "observer-status" => composer_observer_answer(registry, &agent),
         _ => {
             use crate::agent_pty::{ProbeAsk, ProbeOutcome};
             let ask = match operation {
@@ -5099,17 +5176,28 @@ async fn e2e_composer_observer_control(
         "observer-hold" | "observer-go" => None,
         _ => return AttachResponse::err("e2e-composer-control: unknown operation"),
     };
-    let Some(observer) = registry
+    let Some((agent, observer)) = registry
         .pane_current_agent_id(pane_id)
         .filter(|agent| op.is_some() || *agent == generation.to_string())
-        .and_then(|agent| registry.composer_observer(&agent))
+        .and_then(|agent| Some((agent.clone(), registry.composer_observer(&agent)?)))
     else {
         return AttachResponse::err("e2e-composer-control: no installed generation on that pane");
     };
     // Q105b.2: the observer's pass barrier, for the generation named only.
+    // A hold answers once no pass is running, so none can run until a go.
     let Some(op) = op else {
-        observer.hold_passes_for_e2e(operation == "observer-hold");
-        return AttachResponse::ok();
+        let hold = operation == "observer-hold";
+        let held = tokio::task::spawn_blocking(move || {
+            observer.hold_passes_for_e2e(hold, OBSERVER_HOLD_BOUND)
+        })
+        .await;
+        return match held {
+            Ok(Ok(_)) => composer_observer_answer(registry, &agent),
+            Ok(Err(_)) => AttachResponse::err(
+                "e2e-composer-control: a pass still running past the hold's bound",
+            ),
+            Err(_) => AttachResponse::err("e2e-composer-control: the control failed"),
+        };
     };
     match tokio::task::spawn_blocking(move || observer.control(generation, op)).await {
         Ok(Ok(_count)) => AttachResponse::ok(),
@@ -9260,43 +9348,34 @@ fn enqueue_reject(tx: &tokio::sync::mpsc::Sender<Vec<u8>>, reason: &'static [u8]
 
 /// PRD #1666 part 3 (Q105b.2, Q15-1): an attach connection's test and `e2e`
 /// controls, found by the client id its `attach-stream` carried
-/// ([`crate::e2e_controls::AttachControl`]). A release build has none: its
-/// peer watch is the platform's and its output task ends only as it always
-/// did.
-#[derive(Clone, Default)]
+/// ([`crate::e2e_controls::AttachControl`]). Compiled only into a test or
+/// `e2e` build: a release build's attach loop calls the platform's peer
+/// watch and runs its output task as it always did, with no extra arm.
+#[cfg(any(test, feature = "e2e"))]
+#[derive(Clone)]
 struct AttachE2e {
-    #[cfg(any(test, feature = "e2e"))]
     control: Option<Arc<crate::e2e_controls::AttachControl>>,
 }
 
+#[cfg(any(test, feature = "e2e"))]
 impl AttachE2e {
-    #[cfg(any(test, feature = "e2e"))]
     fn of(client_id: Option<&str>) -> Self {
         Self {
             control: client_id.map(crate::e2e_controls::attach_control),
         }
     }
 
-    #[cfg(not(any(test, feature = "e2e")))]
-    fn of(_client_id: Option<&str>) -> Self {
-        Self::default()
-    }
-
-    /// Resolves when a test ends this connection's output task; never in a
-    /// release build.
+    /// Resolves when a test ends this connection's output task.
     async fn output_ended(&self) {
-        #[cfg(any(test, feature = "e2e"))]
-        if let Some(control) = &self.control {
-            control.output_ended().await;
-            return;
+        match &self.control {
+            Some(control) => control.output_ended().await,
+            None => std::future::pending::<()>().await,
         }
-        std::future::pending::<()>().await;
     }
 
     /// The input loop's peer watch: the platform's, unless a test degraded
     /// it, when it never resolves.
     async fn peer_closed(&self, rd: &crate::platform::ipc::IpcReadHalf) {
-        #[cfg(any(test, feature = "e2e"))]
         if self
             .control
             .as_ref()
@@ -9449,18 +9528,14 @@ async fn handle_attach_stream(
     // read it as end-of-stream. A legacy attach gets a receiver that is never
     // ready, which parks that arm forever without affecting the others.
     let mut geometry_rx = handle.geometry_rx;
+    #[cfg(any(test, feature = "e2e"))]
     let attach_e2e = AttachE2e::of(client_id.as_deref());
-    let output_e2e = attach_e2e.clone();
-    let mut output_task = tokio::spawn(async move {
+    let output_loop = async move {
         loop {
             tokio::select! {
                 // Bias toward output so heavy PTY traffic isn't starved by
                 // the (rare) reject path; both are still serviced.
                 biased;
-                // PRD #1666 part 3 (Q105b.2, Q15-1): a test ended this
-                // output task, as a broken socket would; first, so output
-                // can't starve it. Never ready in a release build.
-                () = output_e2e.output_ended() => break,
                 // PRD #882: the applied geometry moved — because another client
                 // attached, detached or resized — so tell this viewer before the
                 // bytes drawn for the new grid reach it. Ordering against the
@@ -9548,7 +9623,22 @@ async fn handle_attach_stream(
                 },
             }
         }
-    });
+    };
+    // PRD #1666 part 3 (Q105b.2, Q15-1): in a test or `e2e` build a test can
+    // end this output task, as a broken socket would; first, so output can't
+    // starve it. A release build spawns the loop alone.
+    #[cfg(any(test, feature = "e2e"))]
+    let output_loop = {
+        let output_e2e = attach_e2e.clone();
+        async move {
+            tokio::select! {
+                biased;
+                () = output_e2e.output_ended() => {}
+                () = output_loop => {}
+            }
+        }
+    };
+    let mut output_task = tokio::spawn(output_loop);
 
     // Input loop: STREAM_IN bytes are forwarded to the shared PTY writer;
     // DETACH (or unknown frame / EOF) ends the loop.
@@ -9745,9 +9835,13 @@ async fn handle_attach_stream(
                             // `Cancelled`, once, its place leaves the queue
                             // and passes to the next waiter, and leaving the
                             // loop releases this viewer.
+                            #[cfg(any(test, feature = "e2e"))]
+                            let peer_closed = attach_e2e.peer_closed(&rd);
+                            #[cfg(not(any(test, feature = "e2e")))]
+                            let peer_closed = crate::platform::ipc::peer_closed(&rd);
                             let ended = tokio::select! {
                                 biased;
-                                () = attach_e2e.peer_closed(&rd) => true,
+                                () = peer_closed => true,
                                 _ = &mut output_task => true,
                                 () = place.changed() => false,
                             };

@@ -1244,3 +1244,131 @@ async fn probe_074_a_scan_after_a_connection_pins_its_hold() {
     deck.kill(helper);
     deck.stop().await;
 }
+
+/// Hold the observer's passes and wait, bounded, for the hold's
+/// acknowledgement: no pass running, so none runs until the go.
+async fn hold_passes(observer: &Arc<Observer>) -> u64 {
+    let observer = Arc::clone(observer);
+    let passes = tokio::task::spawn_blocking(move || observer.hold_passes_for_e2e(true, SETTLE))
+        .await
+        .unwrap()
+        .expect("no pass still running at the hold's bound");
+    assert!(passes.held && !passes.running, "{passes:?}");
+    passes.finished
+}
+
+/// Scenario: A bound deck's scan records a live helper copy `Owned` with no decision, and the observer's passes are then held with no pass running. The helper's report arrives on its own registered connection before any decision: it is kept and changes neither the missing decision nor the pending writer scope. In one variant the helper's `unarmed` marker is then read by the next pass, so its decision comes after its report and opens the scope as an unchecked return; in the other no decision ever comes. The helper is killed while passes are held, so its exit is first seen by the pass after the go, which drains it: with no decision the scope ends open as unconfirmed; with the late decision and a clean report it stays an unchecked return.
+#[spec("inbox/probe/057")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_057_a_report_before_the_decision_then_the_exit_drain() {
+    use crate::composer_probe::helper::marker_name;
+    use crate::composer_probe::record::{Cause, ScopeState};
+    use crate::event::{EditorReport, EditorTree};
+    for later_decision in [false, true] {
+        let mut deck = Deck::start_bound().await;
+        assert!(
+            wait_for(SETTLE, || deck.observer.permission() == Permission::Armable).await,
+            "{:?}",
+            deck.observer.permission()
+        );
+        assert_eq!(
+            deck.observer.control(deck.generation, ControlOp::Publish),
+            Ok(1)
+        );
+        let input = deck.observer.input();
+        // Born after the publication, past its start ticks' granularity.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (helper, _) = deck.owned_helper("early-report", 0).await;
+        let key = key_of(helper);
+        deck.scanned_owned(key).await;
+        assert_eq!(
+            input.writer_scope().map(|s| s.state()),
+            Some(ScopeState::Pending),
+            "an undecided record"
+        );
+
+        let held = hold_passes(&deck.observer).await;
+        let conn = deck
+            .observer
+            .connect(Ok(Some(pidfd(helper))))
+            .expect("admitted");
+        deck.observer.report(
+            &conn,
+            EditorReport::EditorDone {
+                tree: EditorTree::Clean,
+            },
+        );
+        let record = input.record(key).expect("kept");
+        assert_eq!(
+            record.report,
+            Report::Done(Tree::Clean),
+            "the report is kept"
+        );
+        assert_eq!(record.decision, None, "the report is no decision");
+        assert_eq!(
+            input.writer_scope().map(|s| s.state()),
+            Some(ScopeState::Pending),
+            "the report before a decision clears nothing"
+        );
+
+        let mut quiet = held;
+        if later_decision {
+            let marker = marker_name(key.pid, key.start, ComposerDecision::Unarmed, None);
+            crate::composer_probe::instance::InstanceReader::open(deck.instance.dir())
+                .unwrap()
+                .create_marker(&deck.generation.to_string(), &marker)
+                .unwrap();
+            assert_eq!(
+                deck.observer.passes_for_e2e().finished,
+                held,
+                "no pass while held"
+            );
+            assert_eq!(input.record(key).unwrap().decision, None);
+            deck.observer.hold_passes_for_e2e(false, SETTLE).unwrap();
+            assert!(
+                wait_for(SETTLE, || input
+                    .record(key)
+                    .is_some_and(|r| r.decision == Some(Decision::Unarmed)))
+                .await,
+                "the next pass reads the marker's decision"
+            );
+            assert_eq!(
+                input.writer_scope().map(|s| s.state()),
+                Some(ScopeState::Open(Cause::EditorReturnUnchecked)),
+                "a decision after the report opens the scope as at any decision"
+            );
+            quiet = hold_passes(&deck.observer).await;
+        }
+
+        drop(conn);
+        deck.kill(helper);
+        assert_eq!(
+            deck.observer.passes_for_e2e().finished,
+            quiet,
+            "no pass while held"
+        );
+        assert!(
+            input.record(key).is_some_and(|r| !r.drained),
+            "not drained while held"
+        );
+        deck.observer.hold_passes_for_e2e(false, SETTLE).unwrap();
+        assert!(
+            wait_for(SETTLE, || deck.observer.exit_fact(key).is_some()).await,
+            "the pass after the go sees the exit and drains it"
+        );
+        let fact = deck.observer.exit_fact(key).unwrap();
+        assert_eq!(fact.report, Report::Done(Tree::Clean));
+        let (decision, cause) = if later_decision {
+            (Some(Decision::Unarmed), Cause::EditorReturnUnchecked)
+        } else {
+            (None, Cause::EditorUnconfirmed)
+        };
+        assert_eq!(fact.decision, decision);
+        assert_eq!(
+            input.writer_scope().map(|s| s.state()),
+            Some(ScopeState::Open(cause)),
+            "later_decision={later_decision}: the scope after the drain"
+        );
+        deck.stop().await;
+    }
+}

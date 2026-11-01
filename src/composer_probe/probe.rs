@@ -591,4 +591,59 @@ mod tests {
         far.failed(end);
         assert!(!far.due(end, 0), "past the clock's range");
     }
+
+    /// Q105b.2: the e2e clock offset moves only the pending wait, `Until`
+    /// and `Epoch` alike, by exactly what it is given; the failures,
+    /// `broken`, an epoch wait's epoch and the other waits stay as they are.
+    #[test]
+    fn advance_moves_only_the_pending_wait() {
+        let t = Instant::now();
+        let ms = Duration::from_millis;
+
+        let mut s = Schedule::default();
+        s.failed(t);
+        assert!(!s.due(t, 0));
+        s.advance(BACKOFF[0] - ms(1));
+        assert!(!s.due(t, 0), "a millisecond short of the backoff");
+        assert_eq!((s.failures(), s.broken()), (1, false));
+        s.advance(ms(1));
+        assert!(s.due(t, 0), "the whole backoff");
+        assert_eq!(s.wait, Wait::Until(t));
+
+        let mut broken = Schedule::default();
+        for _ in 0..BROKEN_AFTER {
+            broken.failed(t);
+        }
+        broken.advance(BACKOFF_LAST);
+        assert!(broken.due(t, 0));
+        assert_eq!((broken.failures(), broken.broken()), (BROKEN_AFTER, true));
+
+        let mut epoch = Schedule::default();
+        epoch.non_empty(t, 5);
+        epoch.advance(NON_EMPTY_RECHECK - ms(1));
+        assert!(!epoch.due(t, 5), "same epoch, a millisecond short");
+        assert!(epoch.due(t, 6), "the epoch moving still ends it");
+        epoch.advance(ms(1));
+        assert!(epoch.due(t, 5));
+        assert_eq!(epoch.wait, Wait::Epoch { from: 5, until: t });
+
+        for wait in [Wait::None, Wait::Never] {
+            let mut other = Schedule {
+                wait,
+                failures: 2,
+                broken: false,
+            };
+            other.advance(BACKOFF_LAST);
+            assert_eq!(other.wait, wait, "{wait:?} is no pending instant");
+            assert_eq!(other.failures(), 2);
+        }
+
+        let mut far = Schedule::default();
+        far.failed(t);
+        far.advance(Duration::MAX);
+        assert!(
+            far.due(Instant::now(), 0),
+            "an offset past the clock is now"
+        );
+    }
 }

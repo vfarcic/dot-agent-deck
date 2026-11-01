@@ -752,6 +752,17 @@ fn plan_locked(state: &mut State, writer: Writer, bytes: &[u8], plan: Option<Pla
     }
 }
 
+/// [`GenerationInput::records_for_e2e`]'s answer.
+#[cfg(any(test, feature = "e2e"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordsForE2e {
+    pub scope: record::ScopeState,
+    pub policy: record::EcPolicy,
+    pub cap: usize,
+    pub retained: usize,
+    pub witness: record::E2eWitness,
+}
+
 /// One generation's input epoch, query ledger, `B`, hazard FIFO and redraw
 /// estimate, under one leaf lock. See the module documentation.
 #[derive(Debug)]
@@ -1303,6 +1314,25 @@ impl GenerationInput {
             Some(records) => records.configure_for_e2e(policy, cap),
             None => Err("no records attached"),
         }
+    }
+
+    /// The test and `e2e` builds' read-only view of this generation's
+    /// records (Q105b.2), read in one hold of the lock and moving nothing:
+    /// the writer scope, the policy and cap, how many records are retained,
+    /// and the witness. `None` with no records attached or once retired.
+    #[cfg(any(test, feature = "e2e"))]
+    pub fn records_for_e2e(&self) -> Option<RecordsForE2e> {
+        let state = self.state.lock_recovering();
+        if state.retired {
+            return None;
+        }
+        state.records.as_ref().map(|r| RecordsForE2e {
+            scope: r.scope().state(),
+            policy: r.policy(),
+            cap: r.cap(),
+            retained: r.len(),
+            witness: r.witness(),
+        })
     }
 
     /// Whether the last attempt failed, so a due one is the schedule's

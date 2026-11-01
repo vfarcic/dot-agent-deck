@@ -1161,6 +1161,8 @@ pub type BellSlot = Arc<OnceLock<Arc<Bell>>>;
 
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use linux::HeldForTest;
+#[cfg(all(target_os = "linux", any(test, feature = "e2e")))]
+pub use linux::Passes;
 #[cfg(target_os = "linux")]
 pub use linux::{Connection, Observer, Spawned, read_line};
 
@@ -1376,13 +1378,70 @@ mod linux {
         /// with no lock held.
         #[cfg(test)]
         drain_park: std::sync::Mutex<Option<DrainPark>>,
-        /// The test and `e2e` builds' pass barrier (Q105b.2): while set,
-        /// the thread runs no pass, so no scan, marker read, exit or drain.
+        /// The test and `e2e` builds' pass barrier (Q105b.2): while held,
+        /// the thread starts no pass, so no scan, marker read, exit or drain.
         #[cfg(any(test, feature = "e2e"))]
-        passes_held: std::sync::atomic::AtomicBool,
-        /// Passes the thread has finished.
-        #[cfg(any(test, feature = "e2e"))]
-        passes: std::sync::atomic::AtomicU64,
+        barrier: Arc<PassBarrier>,
+    }
+
+    /// The observer thread's passes as the test and `e2e` builds' barrier
+    /// sees them, all read under one lock: whether passes are held, whether
+    /// one is running now, and how many have finished.
+    #[cfg(any(test, feature = "e2e"))]
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct Passes {
+        pub held: bool,
+        pub running: bool,
+        pub finished: u64,
+    }
+
+    /// See [`Observer::hold_passes_for_e2e`]. The thread starts a pass only
+    /// while not held, marking it running under the same lock, so a hold
+    /// that reads no pass running knows none can start until a go.
+    #[cfg(any(test, feature = "e2e"))]
+    #[derive(Default)]
+    struct PassBarrier {
+        passes: std::sync::Mutex<Passes>,
+        changed: std::sync::Condvar,
+    }
+
+    #[cfg(any(test, feature = "e2e"))]
+    impl PassBarrier {
+        fn lock(&self) -> std::sync::MutexGuard<'_, Passes> {
+            self.passes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        /// The thread's side, before a pass: `true`, the pass marked
+        /// running, when not held; `false` when held.
+        fn enter(&self) -> bool {
+            let mut passes = self.lock();
+            if passes.held {
+                return false;
+            }
+            passes.running = true;
+            true
+        }
+
+        /// The thread's side while held: wait up to `poll` for a go.
+        fn wait_go(&self, poll: Duration) {
+            let passes = self.lock();
+            if passes.held {
+                let _ = self
+                    .changed
+                    .wait_timeout_while(passes, poll, |p| p.held)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+
+        /// The thread's side, after a pass.
+        fn leave(&self) {
+            let mut passes = self.lock();
+            passes.running = false;
+            passes.finished += 1;
+            self.changed.notify_all();
+        }
     }
 
     #[cfg(test)]
@@ -1825,9 +1884,7 @@ mod linux {
                 #[cfg(test)]
                 drain_park: std::sync::Mutex::new(None),
                 #[cfg(any(test, feature = "e2e"))]
-                passes_held: std::sync::atomic::AtomicBool::new(false),
-                #[cfg(any(test, feature = "e2e"))]
-                passes: std::sync::atomic::AtomicU64::new(0),
+                barrier: Arc::default(),
             });
             let weak = Arc::downgrade(&observer);
             // Q35-16: the planner's native numbers go to this generation's
@@ -1848,20 +1905,43 @@ mod linux {
             Some(observer)
         }
 
-        /// The test and `e2e` builds' pass barrier (Q105b.2): `true` holds
-        /// the thread before its next pass, `false` lets it run one now.
+        /// The test and `e2e` builds' pass barrier (Q105b.2). `true` holds
+        /// the thread before its next pass and answers once no pass is
+        /// running: from then until a go, none can start, so the observer
+        /// is quiet (no scan, marker read, exit or drain; a connection's
+        /// reader still applies what it reads). `Err` when a pass already
+        /// running hasn't finished within `bound`; the hold stays. `false`
+        /// lets the thread run a pass now, and answers at once.
         #[cfg(any(test, feature = "e2e"))]
-        pub fn hold_passes_for_e2e(&self, hold: bool) {
-            self.passes_held
-                .store(hold, std::sync::atomic::Ordering::SeqCst);
-            self.bell.ring();
+        pub fn hold_passes_for_e2e(&self, hold: bool, bound: Duration) -> Result<Passes, Passes> {
+            let mut passes = self.barrier.lock();
+            passes.held = hold;
+            self.barrier.changed.notify_all();
+            if !hold {
+                drop(passes);
+                self.bell.ring();
+                return Ok(self.passes_for_e2e());
+            }
+            let until = Instant::now() + bound;
+            while passes.running {
+                let left = until.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(*passes);
+                }
+                passes = self
+                    .barrier
+                    .changed
+                    .wait_timeout(passes, left)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .0;
+            }
+            Ok(*passes)
         }
 
-        /// Whether passes are held, and how many the thread has finished.
+        /// The thread's passes, read under the barrier's lock.
         #[cfg(any(test, feature = "e2e"))]
-        pub fn passes_for_e2e(&self) -> (bool, u64) {
-            use std::sync::atomic::Ordering::SeqCst;
-            (self.passes_held.load(SeqCst), self.passes.load(SeqCst))
+        pub fn passes_for_e2e(&self) -> Passes {
+            *self.barrier.lock()
         }
 
         /// The generation left its pane: the thread ends at its next wake.
@@ -2951,19 +3031,18 @@ mod linux {
                 return;
             }
             #[cfg(any(test, feature = "e2e"))]
-            if observer
-                .passes_held
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
+            let barrier = Arc::clone(&observer.barrier);
+            #[cfg(any(test, feature = "e2e"))]
+            if !barrier.enter() {
+                // Held: wait for a go without keeping the observer alive,
+                // then look again at its stop and retirement.
                 drop(observer);
-                std::thread::park_timeout(Duration::from_millis(10));
+                barrier.wait_go(Duration::from_millis(10));
                 continue;
             }
             observer.pass();
             #[cfg(any(test, feature = "e2e"))]
-            observer
-                .passes
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            barrier.leave();
             let wait = if observer.active() {
                 SCAN_PERIOD
             } else {
