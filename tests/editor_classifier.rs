@@ -586,6 +586,7 @@ mod real {
     /// Set in a copy of this test binary started as a sleeper: the copy runs
     /// [`probe_006_real_processes_classify`], which sleeps instead.
     const SLEEPER: &str = "DAD_CLASSIFIER_SLEEPER";
+    const READY: &str = "DAD_CLASSIFIER_READY_FILE";
 
     /// A sleeper, copied to `name` in a fresh directory under the target
     /// directory, or in a directory of the test's, started for a minute.
@@ -613,6 +614,7 @@ mod real {
         }
 
         fn start_existing(path: PathBuf) -> Copy {
+            let ready = tempfile::NamedTempFile::new_in(path.parent().unwrap()).unwrap();
             // Another test thread forking while the copy was open for writing
             // holds it open until its child execs: `ETXTBSY` until then.
             let mut tries = 0;
@@ -627,6 +629,7 @@ mod real {
                         "--test-threads=1",
                     ])
                     .env(SLEEPER, "1")
+                    .env(READY, ready.path())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .spawn();
@@ -638,11 +641,24 @@ mod real {
                     spawned => break spawned.unwrap(),
                 }
             };
-            Copy {
+            let mut copy = Copy {
                 _dir: None,
                 path,
                 child,
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while fs::read(ready.path()).unwrap() != b"ready" {
+                if let Some(status) = copy.child.try_wait().unwrap() {
+                    panic!("sleeper {:?} exited before readiness: {status}", copy.path);
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "sleeper {:?} did not acknowledge readiness",
+                    copy.path
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
+            copy
         }
 
         fn pid(&self) -> u32 {
@@ -832,7 +848,7 @@ mod real {
         assert!(view.file(&dir.path().join("missing")).is_err());
     }
 
-    /// Scenario: With this test process standing in as the agent and a `versions` directory recorded as its install root, prepare copied executables once and repeat the initial tool classification with fresh sleeper processes for at most 50,000 rounds or 45 seconds, retaining both samples and process diagnostics on failure. A sleeper named `2.1.311` in the root is `Unknown`, while `git` elsewhere is a tool; moving the root makes both `Unknown`, and restoring it makes `git` a tool again.
+    /// Scenario: With this test process standing in as the agent and a `versions` directory recorded as its install root, prepare copied executables once and repeat the initial tool classification with fresh sleeper processes acknowledging readiness for at most 50,000 rounds or 45 seconds, retaining both samples and process diagnostics on failure. A sleeper named `2.1.311` in the root is `Unknown`, while `git` elsewhere is a tool; moving the root makes both `Unknown`, and restoring it makes `git` a tool again.
     #[spec("inbox/probe/006")]
     #[test]
     fn probe_006_a_real_moved_install_root_is_unknown() {
@@ -896,11 +912,13 @@ mod real {
         assert!(updated.running() && git.running());
     }
 
-    /// Scenario: Classify real processes, with this test process standing in as the agent (and, in a copy started as a sleeper, sleeping instead): itself is `Owned`; a child running a copy of a sleeper named `git` is a tool; a copy named `claude`, or named as this test binary, is `Unknown`; and with no identity, `Unknown`.
+    /// Scenario: Classify real processes, with this test process standing in as the agent (and, in a copy started as a sleeper, acknowledging readiness before sleeping): itself is `Owned`; a child running a copy of a sleeper named `git` is a tool; a copy named `claude`, or named as this test binary, is `Unknown`; and with no identity, `Unknown`.
     #[spec("inbox/probe/006")]
     #[test]
     fn probe_006_real_processes_classify() {
         if std::env::var_os(SLEEPER).is_some() {
+            let ready = std::env::var_os(READY).expect("sleeper readiness file");
+            fs::write(ready, b"ready").unwrap();
             std::thread::sleep(std::time::Duration::from_secs(60));
             return;
         }
