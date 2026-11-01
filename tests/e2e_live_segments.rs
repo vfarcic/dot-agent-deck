@@ -574,7 +574,7 @@ fn probe_049_mode_observations_and_malformed_pairs_are_not_release_authority() {
     }
 }
 
-/// Scenario: Hold a human editor's helper after a failed spawn or an injected wait failure following a real editor start. A failed spawn retains the suffix through return and retirement under production Hold; a running user editor reads its released suffix either before the unknown-wait drain or after the writer parks it across that drain. The parked case also queues another trigger and suffix that must stay held through the drain, return and replacement, while the released line reaches the editor's terminal exactly once.
+/// Scenario: Hold a human editor's helper after a failed spawn or an injected wait failure following a real editor start. A failed spawn retains the suffix through return and retirement under production Hold; a running user editor reads its released suffix either before the unknown-wait drain or after its PID identifies an acknowledged WaitUnknown drain with that line still parked at the writer. The parked case also queues another trigger and suffix that must stay held through the drain, return and replacement, while the released line reaches the editor's terminal exactly once.
 #[spec("inbox/probe/049")]
 #[test]
 fn probe_049_failed_editor_outcomes_stay_held_under_production_hold() {
@@ -639,22 +639,53 @@ fn probe_049_failed_editor_outcomes_stay_held_under_production_hold() {
                 let observer = f.control("observer-hold")["composer_observer"].clone();
                 assert_eq!(observer["passes_held"], true, "{observer}");
                 assert_eq!(observer["pass_running"], false, "{observer}");
-                let passes = observer["passes"].as_u64().unwrap();
+                let drains = observer["drains"].as_u64().unwrap();
                 f.remove("pause-helper");
                 pause.take().unwrap().release();
                 f.wait("helper-exited-2");
+                let helper = live::read_json(&f.path("helper-result-2"));
+                let pid = helper["pid"].as_u64().expect("reaped helper's pid");
+                assert!(pid > 0, "{helper}");
                 let trace = fs::read_to_string(f.path("helper-trace")).unwrap();
                 assert!(trace.contains("wait-unknown 10"), "{trace}");
-                // Hold already opens scope at Unarmed. A completed observer
-                // pass after the witnessed exit, rather than scope alone,
-                // establishes that the helper's exit was available to drain.
+                let observer = f.control("observer-status")["composer_observer"].clone();
+                assert_eq!(observer["drains"], drains, "{observer}");
+                assert!(
+                    !observer["drained"]
+                        .as_array()
+                        .expect("record-specific drain acknowledgements")
+                        .iter()
+                        .any(|entry| entry["pid"] == pid),
+                    "the held observer must not yet have drained helper {pid}: {observer}"
+                );
+                // Hold already opens scope at Unarmed; neither scope nor a
+                // completed pass proves this record drained. Its PID-bound
+                // witness is read after the drain and segment settlement in
+                // the same generation-lock hold, while the writer stays parked.
                 f.control("observer-go");
-                assert!(common::wait_until(WAIT, || {
-                    f.control("observer-status")["composer_observer"]["passes"]
-                        .as_u64()
-                        .unwrap()
-                        > passes
-                }));
+                assert!(
+                    common::wait_until(WAIT, || {
+                        let observer = f.control("observer-status")["composer_observer"].clone();
+                        observer["drained"]
+                            .as_array()
+                            .expect("record-specific drain acknowledgements")
+                            .iter()
+                            .any(|entry| entry["pid"] == pid && entry["wait_unknown"] == true)
+                    }),
+                    "helper {pid} must acknowledge its WaitUnknown drain before writer-go: {}",
+                    f.control("observer-status")["composer_observer"]
+                );
+                let observer = f.control("observer-status")["composer_observer"].clone();
+                assert!(observer["drains"].as_u64().unwrap() > drains, "{observer}");
+                let drained = observer["drained"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry["pid"] == pid)
+                    .unwrap();
+                assert!(drained["start"].as_u64().unwrap() > 0, "{drained}");
+                assert_eq!(drained["decision"], "unarmed", "{drained}");
+                assert_eq!(drained["report"], "none", "{drained}");
                 assert_eq!(f.scope(), "open");
                 assert!(f.held(), "the next trigger and suffix stay in the gate");
                 assert_eq!(
