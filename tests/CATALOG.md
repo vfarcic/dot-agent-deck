@@ -5860,6 +5860,12 @@ without depending on the config struct API.
 - **Asserts:** the recipient visibly announces readiness and completes its startup turn before the runtime marker is chosen; no sentinel exists before the directive; native Bash tool events from the caller's pane and agent record roles and inbox send commands; the recipient's retained untrusted inbox body contains that marker attributed to the expected caller pane and agent; the caller visibly acknowledges sending; the real orchestrator writes `address_received_1947_7b91.txt` containing the exact runtime marker and visibly acknowledges receipt in its pane.
 - **Does not assert:** agent model parity, reply delivery or concurrent real-agent routing isolation.
 
+##### orchestration/address/006 — `--name` and `--pane` reach one of two standalone agents in a folder; the reply names its sender.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_inbox_send_by_name.rs`, `orchestration_address_006_name_and_pane_reach_one_of_two_standalone_agents`).
+- **Agent:** none; identity-recording Python probes that emit a synthetic Claude SessionStart hook and wait in cat. Not demo-reel-eligible.
+- **Asserts:** with a caller, `dispatcher` and `observability` open as standalone agents in one folder, `inbox send --folder` is refused as ambiguous, naming both panes and `--name`; `--folder … --name dispatcher` and `--pane <observability>` each deliver to that agent alone; an unknown `--name` is refused and delivers nothing; `roles --json --name dispatcher` lists only the dispatcher; the reply command the deck wrote into the dispatcher's message carries `--name=caller`, and running it from the dispatcher's pane delivers to the caller alone.
+- **Does not assert:** an older daemon withholding the fields (`daemon_client::tests::an_address_naming_one_agent_is_withheld_from_a_daemon_without_the_field`); orchestrator-by-pane and worker refusals (`tests/orchestrator_address_agent.rs`); a real agent.
+
 #### orchestration/route
 
 ##### orchestration/route/001 — Two tabs of the SAME orchestration opened in the SAME directory are separate routing groups: each orchestrator's delegate reaches only its own worker and each worker's work-done reaches only its own orchestrator, with no cross-delivery in either direction (PRD #140 M5.1). [reel]
