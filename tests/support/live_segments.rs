@@ -135,11 +135,17 @@ impl Fixture {
             instance: PathBuf::new(),
             exe,
         };
-        f.spawn("first");
+        f.spawn("first", false);
         f
     }
 
-    fn spawn(&mut self, name: &str) {
+    /// `after_stop` is set only when the pane's previous generation was just
+    /// stopped: `StopAgent` replies before it drops its pane-cleanup hold
+    /// (#1218), so a spawn into the same pane straight after it can be
+    /// refused with `Duplicate pane id`. That exact refusal is retried,
+    /// bounded by `WAIT`; any other reply, and the same refusal once the
+    /// bound is spent, still fails the spawn.
+    fn spawn(&mut self, name: &str, after_stop: bool) {
         self.base = self.daemon.home.join(name);
         assert!(
             self.exe.is_file(),
@@ -151,17 +157,26 @@ impl Fixture {
             self.exe.parent().unwrap().join("editor").display(),
             self.base.display()
         );
-        let reply = inbox::attach(
-            &self.daemon,
-            json!({
-            "op":"start-agent", "command":format!("{} --live-segments-fixture",quote(&self.exe)), "cwd":self.daemon.home,
-                "rows":40,"cols":140,"display_name":"segment-fixture",
-                "agent_type":if self.kind == "codex" {"codex"} else {"claude_code"},
-                "env":[[MODE,self.base.to_str().unwrap()], ["DOT_AGENT_DECK_PANE_ID",PANE],
-                    ["DAD_LIVE_SEGMENTS_KIND",self.kind], ["VISUAL",editor], ["EDITOR",editor],
-                    ["TMPDIR",self.daemon.home.join("tmp")], ["CODEX_HOME",self.daemon.home.join("codex")]],
-            }),
-        );
+        let request = json!({
+        "op":"start-agent", "command":format!("{} --live-segments-fixture",quote(&self.exe)), "cwd":self.daemon.home,
+            "rows":40,"cols":140,"display_name":"segment-fixture",
+            "agent_type":if self.kind == "codex" {"codex"} else {"claude_code"},
+            "env":[[MODE,self.base.to_str().unwrap()], ["DOT_AGENT_DECK_PANE_ID",PANE],
+                ["DAD_LIVE_SEGMENTS_KIND",self.kind], ["VISUAL",editor], ["EDITOR",editor],
+                ["TMPDIR",self.daemon.home.join("tmp")], ["CODEX_HOME",self.daemon.home.join("codex")]],
+        });
+        let duplicate = format!("Duplicate pane id: {PANE}");
+        let deadline = std::time::Instant::now() + WAIT;
+        let reply = loop {
+            let reply = inbox::attach(&self.daemon, request.clone());
+            if !after_stop
+                || reply["error"] != duplicate.as_str()
+                || std::time::Instant::now() >= deadline
+            {
+                break reply;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
         assert_eq!(reply["ok"], true, "native synthetic spawn: {reply}");
         self.agent = reply["id"].as_str().unwrap().into();
         let ready = read_json(&self.path("ready"));
@@ -355,7 +370,7 @@ impl Fixture {
         self.flag("helper-go");
         let stopped = inbox::attach(&self.daemon, json!({"op":"stop-agent","id":self.agent}));
         assert_eq!(stopped["ok"], true, "stop fixture generation: {stopped}");
-        self.spawn("successor");
+        self.spawn("successor", true);
     }
     pub fn snapshot(&self) -> Value {
         let r = inbox::attach(&self.daemon, json!({"op":"list-agents"}));
