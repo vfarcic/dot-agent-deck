@@ -28,7 +28,11 @@ temporary.replace(base + '.editor-started')
 if mode in ('wait', 'hang', 'read', 'late-hang'):
     if mode == 'read':
         data = os.read(0, 1024)
-        Path(base + '.editor-input').write_bytes(data)
+        # Atomic, like .editor-started: a reader that waits for the name
+        # must not find it created but not yet written.
+        temporary = Path(base + '.editor-input.tmp')
+        temporary.write_bytes(data)
+        temporary.replace(base + '.editor-input')
     while not os.path.exists(base + '.editor-go'):
         time.sleep(0.005)
 path.write_bytes(b'EDITED   \n' if mode == 'trim' else b'EDITED')
