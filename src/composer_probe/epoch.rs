@@ -992,6 +992,34 @@ impl GenerationInput {
         plan_locked(&mut self.state.lock_recovering(), writer, bytes, Some(plan))
     }
 
+    /// [`Self::enqueue_planned`], unless the planner would cut the op
+    /// (Q16-1): then `Err` with where, and nothing changed. The decision and
+    /// the acceptance are one hold of this lock, so no liability raised or
+    /// segment opened between a separate read and the acceptance can give
+    /// the op a cut its caller refused to take (a voice answer, whose keys
+    /// are never split away from their gate).
+    pub fn enqueue_planned_uncut(
+        &self,
+        writer: Writer,
+        bytes: &[u8],
+        plan: Plan,
+    ) -> Result<Planned, usize> {
+        let mut state = self.state.lock_recovering();
+        let cutting = matches!(writer, Writer::Human | Writer::Answer)
+            && match plan {
+                Plan::Held => true,
+                Plan::Open => liability_out(&state),
+                Plan::Bypass => false,
+            };
+        if cutting {
+            let solicited = solicited_reply(&state, writer, bytes);
+            if let Some(cut) = first_cut(&state.framing, bytes, solicited) {
+                return Err(cut.at);
+            }
+        }
+        Ok(plan_locked(&mut state, writer, bytes, Some(plan)))
+    }
+
     /// Where `bytes` from `writer` would be cut, read from the framing as it
     /// stands, while a segment is open (`segment_open`) or a liability is
     /// out: the end of their first candidate. `None` when nothing cuts.

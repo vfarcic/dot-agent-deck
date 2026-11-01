@@ -5197,6 +5197,11 @@ pub struct PaneWriter {
     /// held input, until it returns `true`.
     #[cfg(all(test, target_os = "linux"))]
     mid_pass: Mutex<Option<Box<dyn FnMut() -> bool + Send>>>,
+    /// Test-only (Q16-1's forced interleave): run once by
+    /// [`Self::write_answer`] after its acceptance-time read of whether the
+    /// planner would cut the answer and before the gate takes it.
+    #[cfg(test)]
+    answer_decided: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl PaneWriter {
@@ -5234,7 +5239,20 @@ impl PaneWriter {
             exited,
             #[cfg(all(test, target_os = "linux"))]
             mid_pass: Mutex::new(None),
+            #[cfg(test)]
+            answer_decided: Mutex::new(None),
         }
+    }
+
+    /// Test-only: run `hook` once in the next [`Self::write_answer`],
+    /// between its read of whether the planner would cut the answer and the
+    /// gate's acceptance of it (Q16-1).
+    #[cfg(test)]
+    pub(crate) fn set_answer_decided(&self, hook: Box<dyn FnOnce() + Send>) {
+        *self
+            .answer_decided
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(hook);
     }
 
     /// PRD #1666 part 3 (Q35-15): this generation's fence gate.
@@ -5330,6 +5348,7 @@ impl PaneWriter {
             }
             Admission::Full(frame, waiter) => Accepted::Full(frame, waiter),
             Admission::Retired(frame) => Accepted::Retired(frame),
+            Admission::Refused(_) => unreachable!("a person's held frame is never refused"),
         }
     }
 
@@ -5511,7 +5530,15 @@ impl PaneWriter {
         use crate::composer_probe::epoch::{Plan, Writer};
         use crate::composer_probe::gate::Admission;
         // Q35-16 (core §4.3): an answer the planner would cut is refused at
-        // acceptance, whole, rather than split.
+        // acceptance, whole, rather than split. This read decides for an
+        // answer the gate lets through with no fence, which is written
+        // unplanned: a liability out with no fence closed refuses it here.
+        // Outside the `e2e` build's control verb, a liability goes out only
+        // in a probe's arm section, which closes the fence under the gate's
+        // lock; the caller holds this writer, so no probe is queued until the
+        // answer's job reaches the writer, and the gate takes back one queued
+        // before. An arm section that runs after this read finds the answer
+        // held, and the gate decides that case again under its lock (Q16-1).
         if self
             .pty
             .input
@@ -5524,6 +5551,15 @@ impl PaneWriter {
             queued();
             return Ok(AnswerWrite::Refused);
         }
+        #[cfg(test)]
+        if let Some(hook) = self
+            .answer_decided
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            hook();
+        }
         let (reply, done) = oneshot::channel();
         let frame = UserFrame {
             answer: Some(HeldAnswer { gate, reply }),
@@ -5531,7 +5567,7 @@ impl PaneWriter {
         };
         let input = &self.pty.input;
         let in_flight = &self.pty.in_flight;
-        let admitted = self.gate.gate.admit(
+        let admitted = self.gate.gate.admit_unless(
             frame,
             bytes.len(),
             None,
@@ -5539,12 +5575,21 @@ impl PaneWriter {
             |_, _| false,
             |frame| {
                 // As a person's held frame: in flight and its epoch moved
-                // from acceptance. Its candidates were refused above, so
-                // nothing cuts it.
-                let planned = input.enqueue_planned(Writer::Answer, &frame.bytes, Plan::Held);
-                frame.cut = planned.cut;
-                frame.framing = planned.framing;
-                in_flight.count.fetch_add(1, Ordering::SeqCst);
+                // from acceptance. Q16-1: whether the planner cuts it is
+                // decided again here, in the same hold of the epoch's lock
+                // as its acceptance and under the gate's, so an arm section
+                // that closed this fence and raised a liability after the
+                // read above can't give it a cut a release would split away
+                // from its gate: it is refused whole instead.
+                match input.enqueue_planned_uncut(Writer::Answer, &frame.bytes, Plan::Held) {
+                    Ok(planned) => {
+                        debug_assert!(planned.cut.is_none(), "refused when cut");
+                        frame.framing = planned.framing;
+                        in_flight.count.fetch_add(1, Ordering::SeqCst);
+                        true
+                    }
+                    Err(_) => false,
+                }
             },
         );
         let frame = match admitted {
@@ -5571,6 +5616,14 @@ impl PaneWriter {
                 }
                 queued();
                 return Ok(AnswerWrite::Full);
+            }
+            Admission::Refused(frame) => {
+                // Q16-1: a liability went out after the read above.
+                if let Some(ticket) = frame.ticket {
+                    ticket.refuse(ANSWER_HOLDS_CTRL_G);
+                }
+                queued();
+                return Ok(AnswerWrite::Refused);
             }
             Admission::PassAhead(_) | Admission::Settled(_) => {
                 unreachable!("an answer passes no fence and its keys carry bytes")

@@ -116,6 +116,9 @@ pub enum Admission<T> {
     Full(T, Waiter<T>),
     /// The generation retired.
     Retired(T),
+    /// Fenced, and the caller's `hold` refused it under the gate's lock
+    /// (Q16-1): handed back, not accepted, nothing held.
+    Refused(T),
 }
 
 /// One held op as [`Gate::release_until`] reads it (Q35-20).
@@ -226,14 +229,34 @@ impl<T> Gate<T> {
     /// `hold(op)` runs just before the gate takes it, to move the epoch, plan
     /// the op's cuts into it (Q35-16) and count it in flight. Both run under
     /// the gate's lock. A zero-byte op the gate settles isn't held, so `hold`
-    /// doesn't run for it.
+    /// doesn't run for it. It never answers [`Admission::Refused`]: an op that
+    /// may be refused at its acceptance is offered by [`Self::admit_unless`].
     pub fn admit(
+        self: &Arc<Self>,
+        op: T,
+        len: usize,
+        waiter: Option<Waiter<T>>,
+        passes: impl FnOnce(&T, u64) -> bool,
+        hold: impl FnOnce(&mut T),
+    ) -> Admission<T> {
+        self.admit_unless(op, len, waiter, passes, |op| {
+            hold(op);
+            true
+        })
+    }
+
+    /// [`Self::admit`], with `hold` also able to refuse the op (Q16-1):
+    /// `false` hands it back [`Admission::Refused`], in which case `hold` must
+    /// have changed nothing. `hold` runs under the gate's lock, so what it
+    /// decides holds for the fence as it stands when the op is taken: no arm
+    /// section can close or reuse the fence in between.
+    pub fn admit_unless(
         self: &Arc<Self>,
         mut op: T,
         len: usize,
         waiter: Option<Waiter<T>>,
         passes: impl FnOnce(&T, u64) -> bool,
-        hold: impl FnOnce(&mut T),
+        hold: impl FnOnce(&mut T) -> bool,
     ) -> Admission<T> {
         let mut inner = self.lock();
         if inner.retired {
@@ -275,7 +298,11 @@ impl<T> Gate<T> {
             let waiter = waiter.unwrap_or_else(|| self.wait_in(&mut inner));
             return Admission::Full(op, waiter);
         }
-        hold(&mut op);
+        if !hold(&mut op) {
+            drop(inner);
+            drop(waiter);
+            return Admission::Refused(op);
+        }
         if fence.held.is_empty() {
             fence.since = Some(std::time::Instant::now());
         }

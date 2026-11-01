@@ -846,6 +846,66 @@ async fn probe_010_an_answer_holding_a_candidate_is_refused_while_a_liability_is
     assert_eq!(rig.taken(), b"1\x07");
 }
 
+/// A voice answer's gate on question `q` of pane `p`, still raised.
+fn answer_gate() -> AnswerGate {
+    AnswerGate {
+        raised: Arc::new(Mutex::new(HashMap::from([(
+            "p".to_string(),
+            RaisedQuestion {
+                id: "q".into(),
+                revision: None,
+                input_seq: 0,
+            },
+        )]))),
+        pane_id: "p".into(),
+        question_id: "q".into(),
+        revision: None,
+        reservation: None,
+        pause: None,
+    }
+}
+
+/// Scenario: Offer a voice answer whose keys hold a BEL with no check open and no liability out, and stop it after it has read that nothing would cut it and before the gate takes it; there a probe's arm section closes the fence and raises a liability. The answer is refused whole at its acceptance, as if the liability had been out when it was offered: nothing is held for a release to split away from its answer gate, nothing reaches the PTY even after a release, its ticket settles refused once and the epoch doesn't move (Q16-1).
+#[spec("inbox/probe/010")]
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_010_an_answer_decided_before_an_arm_and_accepted_after_it_is_refused_whole() {
+    let rig = Rig::new(true, None);
+    let (input, gate) = (Arc::clone(&rig.input), rig.writer.gate());
+    rig.writer.set_answer_decided(Box::new(move || {
+        // A probe's arm section, landing between the two.
+        assert!(gate.fence());
+        input.liability_raise(G, Instant::now()).expect("raised");
+    }));
+    let ticket = rig.ledger.admit();
+    let id = ticket.ticket();
+    let mut queued = false;
+    let out = rig
+        .writer
+        .write_answer(b"1\x07", answer_gate(), || queued = true, Some(ticket))
+        .await
+        .unwrap();
+    let what = match &out {
+        AnswerWrite::Refused => "refused",
+        AnswerWrite::Held(_) => "held, with a cut a release would split it at",
+        AnswerWrite::Written(_) => "written",
+        _ => "something else",
+    };
+    assert!(
+        matches!(out, AnswerWrite::Refused),
+        "an answer the planner cuts is refused whole at acceptance, but it was {what}"
+    );
+    assert!(queued);
+    assert_eq!(
+        rig.settled(id),
+        [Settlement::Refused(crate::agent_pty::ANSWER_HOLDS_CTRL_G)]
+    );
+    assert_eq!(rig.held(), (true, 0, 0), "nothing of it is held");
+    assert_eq!(rig.input.epoch().epoch(), 0, "refused before acceptance");
+    rig.release();
+    rig.idle().await;
+    assert_eq!(rig.taken(), b"", "a release has nothing of it to write");
+}
+
 /// Scenario: With no liability and no check, offer a frame with two BELs through a PTY that is shut. Both are numbered at acceptance and the last number is on the page before the writer has the job, while the hazard FIFO is still empty; once the PTY takes the bytes, both enter the FIFO, in order. A later frame continues the numbering.
 #[spec("inbox/probe/010")]
 #[tokio::test(flavor = "multi_thread")]
