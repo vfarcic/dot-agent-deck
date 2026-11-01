@@ -10798,7 +10798,10 @@ impl AgentPtyRegistry {
         // binary's file identity) and remembered for the installs that have
         // no command to look at. The refresh installs the same files for
         // either generation wherever OpenCode's global config root exists
-        // (`opencode_manage::Layout`). A directly started 2.x gets `--standalone`, so
+        // (`opencode_manage::Layout`), and creates OpenCode's XDG config root
+        // first on a machine with none, so the first session loads the plugin.
+        // A relative program path is taken from the pane's working directory.
+        // A directly started 2.x gets `--standalone`, so
         // its server plugins run with this pane's environment rather than in
         // OpenCode's shared background service, and its program word becomes
         // the absolute path that was probed.
@@ -10817,20 +10820,32 @@ impl AgentPtyRegistry {
                 .map(std::ffi::OsString::from)
                 .or_else(|| daemon_path.clone());
             let command = spawn_command.clone();
+            let cwd = opts.cwd.map(std::path::PathBuf::from);
             let (target, refreshed) = crate::inbox_hub::off_the_executor(move || {
-                let target =
-                    crate::opencode_version::spawn_target(command.as_deref(), path_env.as_deref());
-                match target.major() {
-                    Some(major) => crate::opencode_manage::remember_layout(major),
+                let target = crate::opencode_version::spawn_target(
+                    command.as_deref(),
+                    path_env.as_deref(),
+                    cwd.as_deref(),
+                );
+                // A wrapper's probe is a hint for this refresh only: whether
+                // the wrapper runs that file is learnt from the watch, which
+                // alone records it.
+                let probed = match target.major() {
+                    Some(major) => {
+                        crate::opencode_manage::remember_layout(major);
+                        None
+                    }
                     None if target == crate::opencode_version::SpawnTarget::Wrapper => {
                         crate::opencode_version::probe_path_opencode(
                             path_env.as_deref(),
                             daemon_path.as_deref(),
-                        );
+                        )
+                        .and_then(|(_, version)| version)
+                        .map(crate::opencode_version::Major::of)
                     }
-                    None => {}
-                }
-                let refreshed = crate::opencode_manage::refresh_for_spawn(target.major());
+                    None => None,
+                };
+                let refreshed = crate::opencode_manage::refresh_for_spawn(target.major(), probed);
                 (target, refreshed)
             });
             if let crate::opencode_version::SpawnTarget::Direct { version, .. } = &target {

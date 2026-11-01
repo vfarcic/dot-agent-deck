@@ -4711,24 +4711,41 @@ pub fn refresh_install() -> crate::hooks_refresh::InstallAttempt {
 ///
 /// PRD #2050: `major` is the generation the spawn's command runs, when the
 /// deck could tell; with none (a wrapper), the one the deck last saw an agent
-/// run ([`remembered_major_now`]), as for an install with no command at all.
+/// run ([`remembered_major_now`]), as for an install with no command at all,
+/// and failing that `probed`, the version of the `opencode` a wrapper's PATH
+/// resolves to, which the wrapper may or may not run.
+///
+/// Unlike an install with no OpenCode to start (startup, `hooks install`), a
+/// spawn's ends with the module in a global root even on a machine where
+/// OpenCode has never run and no config root exists yet: the XDG root is
+/// created first ([`create_root_for_spawn`]), as the OpenCode about to start
+/// would create it itself, so its first session loads the plugin.
 pub fn refresh_for_spawn(
     major: Option<crate::opencode_version::Major>,
+    probed: Option<crate::opencode_version::Major>,
 ) -> (Vec<crate::hook_binary::HookPin>, Vec<String>) {
-    let major = major.or_else(remembered_major_now);
-    auto_install_reporting_for(Layout::for_major(major))
+    let major = major.or_else(remembered_major_now).or(probed);
+    auto_install_reporting_for(Layout::for_major(major), true)
 }
 
 fn auto_install_reporting() -> (Vec<crate::hook_binary::HookPin>, Vec<String>) {
-    refresh_for_spawn(None)
+    auto_install_reporting_for(Layout::for_major(remembered_major_now()), false)
 }
 
 /// PRD #2050: the automatic install for `layout`, over the real config roots,
-/// pinned to this deck's durable binary.
-fn auto_install_reporting_for(layout: Layout) -> (Vec<crate::hook_binary::HookPin>, Vec<String>) {
+/// pinned to this deck's durable binary; `for_spawn` when an OpenCode is
+/// about to start ([`refresh_for_spawn`]).
+fn auto_install_reporting_for(
+    layout: Layout,
+    for_spawn: bool,
+) -> (Vec<crate::hook_binary::HookPin>, Vec<String>) {
     let mut failed = Vec::new();
     let roots = candidate_roots();
-    let (_, pins) = auto_install_layout(&roots, &v2_global_root(), layout, &mut failed, || {
+    let v2_global = v2_global_root();
+    if for_spawn {
+        create_root_for_spawn(&roots, &v2_global, &mut failed);
+    }
+    let (_, pins) = auto_install_layout(&roots, &v2_global, layout, &mut failed, || {
         crate::platform::paths::durable_binary_path()
     });
     // One pin per binary: the roots of one machine name the same install.
@@ -4824,6 +4841,22 @@ fn auto_install_layout(
     (Some(binary_path.to_string()), pins)
 }
 
+/// Review of PR #2060: for an OpenCode about to start on a machine with no
+/// OpenCode config root at all, create the XDG root (`roots[0]`,
+/// `$XDG_CONFIG_HOME/opencode`), which OpenCode creates itself on any run
+/// (measured on 1.18.35) and which both generations load the module from
+/// unless `$OPENCODE_CONFIG_DIR` moves 2.x's. With any root present nothing
+/// is created here, so the files land where they would after OpenCode's own
+/// first run. A refusal is added to `failed`.
+fn create_root_for_spawn(roots: &[PathBuf], v2_global: &Path, failed: &mut Vec<String>) {
+    if roots.iter().any(|root| root.exists()) || v2_global.exists() {
+        return;
+    }
+    if let Some(xdg) = roots.first() {
+        ensure_root(xdg, &plugin_file(xdg), failed);
+    }
+}
+
 /// Create the config root `root` for `file` the deck is about to write, when
 /// the config guard allows it; whether it may go ahead. A refusal is added to
 /// `failed` and logged.
@@ -4835,8 +4868,8 @@ fn ensure_root(root: &Path, file: &Path, failed: &mut Vec<String>) -> bool {
         Err(e) => {
             failed.push(format!("{}: {e}", root.display()));
             tracing::warn!(
-                "auto-install: could not create the OpenCode config root {} for its TUI \
-                 plugin: {e}; deck messages will reach OpenCode by the doorbell instead",
+                "auto-install: could not create the OpenCode config root {} for the deck's \
+                 plugin: {e}",
                 root.display()
             );
             false
@@ -11005,6 +11038,92 @@ await wait(1500);
         assert_eq!(std::fs::read_to_string(&cli).unwrap(), after);
     }
 
+    /// Scenario (review of PR #2060): an OpenCode — named directly, or
+    /// behind a wrapper whose generation the deck cannot tell — is about to
+    /// start on a machine where OpenCode has never run, so no config root
+    /// exists. The spawn's refresh creates the XDG root, as OpenCode would,
+    /// and installs the module and both TUI halves there in that one step,
+    /// for every layout; with `$OPENCODE_CONFIG_DIR` set a detected 2.x also
+    /// gets its own root. A startup install on the same machine creates
+    /// nothing, and once a root exists the spawn's refresh creates no other.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_spawn_refresh_installs_into_a_fresh_xdg_root() {
+        let spawn = |roots: &[PathBuf], v2_global: &Path, layout: Layout, bin: &str| {
+            let mut failed = Vec::new();
+            create_root_for_spawn(roots, v2_global, &mut failed);
+            auto_install_layout(
+                roots,
+                v2_global,
+                layout,
+                &mut failed,
+                || Ok(bin.to_string()),
+            );
+            failed
+        };
+        for layout in [Layout::V1, Layout::V2, Layout::Unknown] {
+            let dir = crate::test_temp::tempdir().unwrap();
+            let roots = vec![
+                dir.path().join("config").join("opencode"),
+                dir.path().join("home").join(".opencode"),
+            ];
+            let bin = seed_deck(&dir.path().join("local").join("dot-agent-deck"));
+            // Startup: nothing is created on a machine with no root.
+            let mut failed = Vec::new();
+            auto_install_layout(&roots, &roots[0], Layout::Unknown, &mut failed, || {
+                Ok(bin.clone())
+            });
+            assert!(!roots[0].exists(), "{layout:?}: startup creates no root");
+            assert_eq!(spawn(&roots, &roots[0], layout, &bin), Vec::<String>::new());
+            assert_eq!(
+                existing_pin(&plugin_file(&roots[0])).as_deref(),
+                Some(bin.as_str()),
+                "{layout:?}: the module is in the fresh XDG root"
+            );
+            assert!(tui_plugin_file(&roots[0]).exists(), "{layout:?}");
+            assert!(tui_v2_file(&roots[0]).exists(), "{layout:?}");
+            assert!(!roots[1].exists(), "{layout:?}: no legacy root is created");
+        }
+        // `$OPENCODE_CONFIG_DIR` set: the XDG root for 1.x, and 2.x's own
+        // root when a 2.x is detected (or hinted by a wrapper's probe).
+        for (layout, config_dir_created) in [
+            (Layout::V2, true),
+            (Layout::V1, false),
+            (Layout::Unknown, false),
+        ] {
+            let dir = crate::test_temp::tempdir().unwrap();
+            let roots = vec![
+                dir.path().join("config").join("opencode"),
+                dir.path().join("home").join(".opencode"),
+                dir.path().join("elsewhere").join("opencode"),
+            ];
+            let bin = seed_deck(&dir.path().join("local").join("dot-agent-deck"));
+            assert_eq!(spawn(&roots, &roots[2], layout, &bin), Vec::<String>::new());
+            assert_eq!(
+                existing_pin(&plugin_file(&roots[0])).as_deref(),
+                Some(bin.as_str()),
+                "{layout:?}"
+            );
+            assert_eq!(
+                existing_pin(&plugin_file(&roots[2])).is_some(),
+                config_dir_created,
+                "{layout:?}"
+            );
+        }
+        // A machine with only the legacy root: nothing beyond what the
+        // install already creates.
+        let dir = crate::test_temp::tempdir().unwrap();
+        let roots = vec![
+            dir.path().join("config").join("opencode"),
+            dir.path().join("home").join(".opencode"),
+            dir.path().join("elsewhere").join("opencode"),
+        ];
+        std::fs::create_dir_all(&roots[1]).unwrap();
+        let mut failed = Vec::new();
+        create_root_for_spawn(&roots, &roots[2], &mut failed);
+        assert!(failed.is_empty() && !roots[0].exists() && !roots[2].exists());
+    }
+
     /// Scenario (review of PR #2060): the config roots name one directory
     /// by two paths — `~/.opencode` a symlink to `~/.config/opencode`,
     /// `$OPENCODE_CONFIG_DIR` a symlink to the XDG root, or the legacy
@@ -11051,13 +11170,14 @@ await wait(1500);
                 link(dir.path(), &roots);
                 let bin = seed_deck(&dir.path().join("local").join("dot-agent-deck"));
                 let v2_global = roots.get(2).unwrap_or(&roots[0]).clone();
-                let install = || {
-                    let mut failed = Vec::new();
-                    auto_install_layout(&roots, &v2_global, layout, &mut failed, || {
-                        Ok(bin.clone())
-                    });
-                    failed
-                };
+                let install =
+                    || {
+                        let mut failed = Vec::new();
+                        auto_install_layout(&roots, &v2_global, layout, &mut failed, || {
+                            Ok(bin.clone())
+                        });
+                        failed
+                    };
                 assert_eq!(install(), Vec::<String>::new(), "{name}, {layout:?}");
                 let installed = || {
                     (
@@ -11067,10 +11187,18 @@ await wait(1500);
                     )
                 };
                 let expected = (Some(bin.clone()), Some(bin.clone()), true);
-                assert_eq!(installed(), expected, "{name}, {layout:?}: the first install");
+                assert_eq!(
+                    installed(),
+                    expected,
+                    "{name}, {layout:?}: the first install"
+                );
                 let module = file_identity(&plugin_file(&roots[0]));
                 assert_eq!(install(), Vec::<String>::new(), "{name}, {layout:?}");
-                assert_eq!(installed(), expected, "{name}, {layout:?}: the second install");
+                assert_eq!(
+                    installed(),
+                    expected,
+                    "{name}, {layout:?}: the second install"
+                );
                 assert_eq!(
                     file_identity(&plugin_file(&roots[0])),
                     module,

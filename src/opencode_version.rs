@@ -478,13 +478,34 @@ fn opencode_program(command: &str) -> Option<&str> {
     opencode_name(name).then_some(program)
 }
 
-/// The file `program` resolves to: itself when it names a path, otherwise
-/// the first executable file of that name on `path_env` (the child's
-/// `PATH`).
-fn resolve_program(program: &str, path_env: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+/// The file `program` resolves to: itself when it names a path — a
+/// relative one (`./opencode`, `bin/opencode`) taken from `cwd`, the
+/// directory the child starts in, as its shell would, and from this
+/// process's own directory when the child inherits it — otherwise the first
+/// executable file of that name on `path_env` (the child's `PATH`). Always
+/// an absolute path, so a command rewritten to name it
+/// ([`with_standalone_at`]) runs the file that was probed.
+fn resolve_program(
+    program: &str,
+    path_env: Option<&std::ffi::OsStr>,
+    cwd: Option<&Path>,
+) -> Option<PathBuf> {
     let is_file = |p: &Path| std::fs::metadata(p).is_ok_and(|m| m.is_file());
     if program.contains('/') {
         let path = PathBuf::from(program);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            let base = match cwd {
+                Some(cwd) => cwd.to_path_buf(),
+                None => std::env::current_dir().ok()?,
+            };
+            // `./` adds nothing to the path the child runs.
+            base.join(path)
+                .components()
+                .filter(|part| !matches!(part, std::path::Component::CurDir))
+                .collect()
+        };
         return (path.is_absolute() && is_file(&path)).then_some(path);
     }
     std::env::split_paths(path_env?)
@@ -504,18 +525,20 @@ fn is_executable(_path: &Path) -> bool {
     true
 }
 
-/// What `command` starts, resolving its program on `path_env` and asking it
-/// `--version` through `detect` (cached). Blocking: call it off the async
-/// executor.
+/// What `command` starts in the working directory `cwd` (`None`: this
+/// process's), resolving its program on `path_env` or, for a relative path,
+/// from `cwd` ([`resolve_program`]), and asking it `--version` through
+/// `detect` (cached). Blocking: call it off the async executor.
 pub fn spawn_target_with(
     command: Option<&str>,
     path_env: Option<&std::ffi::OsStr>,
+    cwd: Option<&Path>,
     detect: impl FnOnce(&Path) -> Option<Version>,
 ) -> SpawnTarget {
     let Some(program) = command.and_then(opencode_program) else {
         return SpawnTarget::Wrapper;
     };
-    match resolve_program(program, path_env) {
+    match resolve_program(program, path_env, cwd) {
         Some(path) => {
             let version = detect(&path);
             SpawnTarget::Direct {
@@ -528,8 +551,12 @@ pub fn spawn_target_with(
 }
 
 /// [`spawn_target_with`], asking the real binary.
-pub fn spawn_target(command: Option<&str>, path_env: Option<&std::ffi::OsStr>) -> SpawnTarget {
-    spawn_target_with(command, path_env, |program| detect(program, path_env))
+pub fn spawn_target(
+    command: Option<&str>,
+    path_env: Option<&std::ffi::OsStr>,
+    cwd: Option<&Path>,
+) -> SpawnTarget {
+    spawn_target_with(command, path_env, cwd, |program| detect(program, path_env))
 }
 
 /// PRD #2050 (review F2): for a spawn whose command is a wrapper, the file
@@ -546,9 +573,11 @@ pub fn probe_path_opencode_with(
     fallback_path: Option<&std::ffi::OsStr>,
     detect: impl FnOnce(&Path, Option<&std::ffi::OsStr>) -> Option<Version>,
 ) -> Option<(PathBuf, Option<Version>)> {
-    let (path, path_env) = resolve_program("opencode", spawn_path)
+    let (path, path_env) = resolve_program("opencode", spawn_path, None)
         .map(|path| (path, spawn_path))
-        .or_else(|| resolve_program("opencode", fallback_path).map(|path| (path, fallback_path)))?;
+        .or_else(|| {
+            resolve_program("opencode", fallback_path, None).map(|path| (path, fallback_path))
+        })?;
     let version = detect(&path, path_env);
     Some((path, version))
 }
@@ -930,8 +959,9 @@ mod tests {
             .unwrap();
         }
         let path_env = std::ffi::OsString::from(bin_dir.as_os_str());
-        let target =
-            |command: &str| spawn_target_with(Some(command), Some(&path_env), |_| Some((2, 2, 5)));
+        let target = |command: &str| {
+            spawn_target_with(Some(command), Some(&path_env), None, |_| Some((2, 2, 5)))
+        };
         assert_eq!(
             target("opencode mini -m openai/gpt-5-mini"),
             SpawnTarget::Direct {
@@ -954,13 +984,87 @@ mod tests {
             "not on PATH: unresolved"
         );
         assert_eq!(
-            spawn_target_with(None, Some(&path_env), |_| panic!("probed")),
+            spawn_target_with(None, Some(&path_env), None, |_| panic!("probed")),
             SpawnTarget::Wrapper
         );
         // A version that cannot be read is direct with no version.
-        let unknown = spawn_target_with(Some("opencode"), Some(&path_env), |_| None);
+        let unknown = spawn_target_with(Some("opencode"), Some(&path_env), None, |_| None);
         assert_eq!(unknown.major(), None);
         assert!(matches!(unknown, SpawnTarget::Direct { version: None, .. }));
+    }
+
+    /// Scenario (review of PR #2060): a pane whose command names OpenCode by
+    /// a relative path (`./opencode`, `bin/opencode`) starts in the directory
+    /// holding it. The deck resolves the path from the pane's working
+    /// directory, as the pane's shell does, so the spawn is direct — probed,
+    /// and named by its absolute path — rather than a wrapper; a relative path
+    /// that names no file there, or not an OpenCode binary, is still a
+    /// wrapper.
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_program_path_resolves_from_the_panes_directory() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(work.join("bin")).unwrap();
+        for path in [
+            work.join("opencode"),
+            work.join("bin").join("opencode"),
+            work.join("bin").join("oc-wrapper"),
+        ] {
+            crate::test_isolation::write_script(&path, b"#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(
+                &path,
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        let empty_path = std::ffi::OsString::from(dir.path().join("nothing").as_os_str());
+        let mut probed = Vec::new();
+        let mut target = |command: &str, cwd: &Path| {
+            spawn_target_with(Some(command), Some(&empty_path), Some(cwd), |program| {
+                probed.push(program.to_path_buf());
+                Some((2, 2, 5))
+            })
+        };
+        assert_eq!(
+            target("./opencode mini", &work),
+            SpawnTarget::Direct {
+                program: work.join("opencode"),
+                version: Some((2, 2, 5))
+            }
+        );
+        assert_eq!(
+            target("bin/opencode", &work),
+            SpawnTarget::Direct {
+                program: work.join("bin/opencode"),
+                version: Some((2, 2, 5))
+            }
+        );
+        assert_eq!(
+            target("./opencode", dir.path()),
+            SpawnTarget::Wrapper,
+            "no such file in the pane's directory"
+        );
+        assert_eq!(
+            target("bin/oc-wrapper", &work),
+            SpawnTarget::Wrapper,
+            "not an OpenCode binary's name"
+        );
+        let SpawnTarget::Direct { program, .. } = target("./opencode", &work) else {
+            panic!("direct")
+        };
+        let rewritten = with_standalone_at("./opencode mini", &program).unwrap_or_default();
+        assert!(
+            rewritten.contains("--standalone")
+                && rewritten.contains(&*program.to_string_lossy())
+                && !rewritten.contains("./opencode"),
+            "a 2.x started by a relative path gets --standalone, naming the probed file: \
+             {rewritten:?}"
+        );
+        assert!(
+            probed.iter().all(|p| p.is_absolute()),
+            "only absolute paths are probed: {probed:?}"
+        );
     }
 
     #[test]
