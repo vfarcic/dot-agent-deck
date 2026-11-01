@@ -7373,15 +7373,11 @@ fn drawn_clusters<'a>(span: &'a Span<'a>) -> impl Iterator<Item = (&'a str, usiz
 /// non-live card. Input can't reach a history-only / view-only session, so the
 /// dashboard surfaces this and stays on the dashboard rather than entering
 /// PaneInput and silently dropping keystrokes. `None` for a live session, where
-/// entry proceeds normally.
+/// entry proceeds normally. The words are the ones the desktop's tile shows
+/// for the same card ([`crate::inbox_display::input_unavailable`], merge
+/// review U3-2).
 fn non_live_input_feedback(writable: crate::event::Writable) -> Option<&'static str> {
-    match writable {
-        crate::event::Writable::Live => None,
-        crate::event::Writable::HistoryOnly => {
-            Some("History-only session cannot accept live input")
-        }
-        crate::event::Writable::None => Some("View-only session cannot accept live input"),
-    }
+    crate::inbox_display::input_unavailable(writable)
 }
 
 /// PRD #20 R20-007 (finding #10): human-readable feedback for a typed daemon
@@ -42643,6 +42639,61 @@ mod tests {
         }
         insta::assert_snapshot!(rows[0], @" COMMAND  Input not delivered: the agent has exited");
         insta::assert_snapshot!(rows[1], @" COMMAND  Input not delivered: the agent's terminal did not take it");
+    }
+
+    /// Scenario: The daemon refuses typing into the focused pane for each of
+    /// its other reasons (history-only, stale, wrong-session): the deck leaves
+    /// typing mode and the status row reads the shared fixture's words.
+    /// Trying to type into a history-only or view-only card says the
+    /// fixture's `inputUnavailable` words, the notice the desktop tile shows
+    /// for the same card (merge review U3-2).
+    #[spec("dashboard/status-message/009")]
+    #[test]
+    fn status_message_009_every_refusal_reason_says_why_in_the_desktops_words() {
+        use tokio::sync::RwLock;
+        let words: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/inbox-display.json")).unwrap();
+        let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+        let now = std::time::Instant::now();
+        let mut rows = Vec::new();
+        for reason in ["history-only", "stale", "wrong-session"] {
+            let mut ui = default_ui();
+            ui.mode = UiMode::PaneInput;
+            assert!(apply_stream_rejection_feedback(
+                &mut ui,
+                Some("p0"),
+                "p0",
+                reason,
+                now
+            ));
+            assert_eq!(ui.mode, UiMode::Normal);
+            assert_eq!(
+                Some(glossary_status_text(&ui).unwrap()),
+                words["inputRejected"][reason].as_str(),
+                "{reason}"
+            );
+            rows.push(glossary_status_row(&state, &mut ui));
+        }
+        assert_eq!(
+            rows[0].trim_end(),
+            " COMMAND  Input not delivered: this agent has no live terminal"
+        );
+        assert_eq!(
+            rows[1].trim_end(),
+            " COMMAND  Input not delivered: the agent in this pane was replaced or closed"
+        );
+        assert_eq!(rows[1], rows[2], "stale and wrong-session read the same");
+        for (writable, value) in [
+            (crate::event::Writable::HistoryOnly, "history-only"),
+            (crate::event::Writable::None, "none"),
+        ] {
+            assert_eq!(
+                non_live_input_feedback(writable),
+                words["inputUnavailable"][value].as_str(),
+                "{value}"
+            );
+        }
+        assert_eq!(non_live_input_feedback(crate::event::Writable::Live), None);
     }
 
     /// Drive `Action::Focus` (Enter) on the one card of `snapshot` against `pc`.

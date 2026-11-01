@@ -9239,8 +9239,8 @@ async fn handle_subscribe_events_with_snapshot(
     // change the watcher broadcast before this read is in the reply as well.
     // A word the watcher read before this one and sent after it lands over
     // it; the watcher sends again only on a later display change, or in the
-    // repeat 30 s after a pass a change woke, which corrects it (R-E-U3-03,
-    // auditor U3-8).
+    // repeat 30 s after a pass a display notice woke, which corrects it
+    // (R-E-U3-03, auditor U3-8).
     crate::agent_pty::attach_input_held(registry, &mut records);
     let mut resp = AttachResponse::agent_records(records);
     // Issue #1637: read under the same guard as the receiver, so a notice

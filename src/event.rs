@@ -3122,11 +3122,12 @@ pub enum BroadcastMsg {
     /// began, or as the check moved), it ended, or the generation took the pane
     /// from one whose held typing was discarded. Carries the whole state,
     /// which replaces what a client holds for that generation. Sent on a
-    /// change of what the card shows, not while it stays the same, so a lost
-    /// or stale one is corrected by the pane's next display change, by a
-    /// resubscription's snapshot, or by the repeat of every pane's word the
-    /// watcher sends 30 s after a pass a change woke
-    /// ([`crate::agent_pty::watch_input_held`], R-E-U3-03).
+    /// change of what the card shows, and once more for every pane, changed
+    /// or not, 30 s after a pass a display notice woke the watcher
+    /// ([`crate::agent_pty::watch_input_held`], R-E-U3-03); not otherwise
+    /// while it stays the same. So a lost or stale one is corrected by the
+    /// pane's next display change, by a resubscription's snapshot, or by
+    /// that repeat.
     ///
     /// No [`crate::daemon_protocol::PROTOCOL_VERSION`] bump, for
     /// [`Self::HookBinaryNotice`]'s and [`Self::InboxHandover`]'s reason: every

@@ -1,6 +1,6 @@
-import { sendResultReason } from "../types";
 import type { AgentSession, SendResult } from "../types";
 import type { ActivityDisplay } from "./displayText";
+import { INBOX_WORDS } from "./inboxWords";
 
 /**
  * Issue #1042 — whether an agent's terminal will accept what is typed into it,
@@ -66,7 +66,9 @@ export function terminalInputState(agent: AgentSession): TerminalInputState {
       state: lease,
       readOnly: true,
       tone: "blocked",
-      notice: `Terminal input unavailable — ${sendResultReason(lease)}.`,
+      // The words the TUI shows when you try to type into the same card
+      // (CLAUDE.md rule 22, merge review U3-2).
+      notice: lease === "history-only" ? INBOX_WORDS.inputUnavailable["history-only"] : INBOX_WORDS.inputUnavailable.none,
     };
   }
 

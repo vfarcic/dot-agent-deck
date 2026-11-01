@@ -215,6 +215,39 @@ fn probe_082_the_notices_are_bounded_oldest_first() {
     assert!(kept.contains(&format!("probe-082-cap-{MAX_PANE_DISCARDS:03}")));
 }
 
+/// Scenario: Retirements that held typing are recorded on one more pane than the registry keeps notices for, with no keystroke between any of them and the later ones naming lower generations than the first. The first retirement's notice is the one let go, and the one just recorded stays: retirement order, not the generation number, decides which is oldest (review U3-d).
+#[spec("inbox/probe/082")]
+#[test]
+fn probe_082_the_bound_lets_go_of_the_oldest_retirement_not_the_lowest_generation() {
+    let registry = AgentPtyRegistry::new();
+    let record = |n: usize, generation: usize| {
+        let mut inner = registry.inner.lock();
+        registry.note_discard(
+            &mut inner,
+            &format!("probe-082-tie-{n:03}"),
+            &generation.to_string(),
+            Some((1, 1)),
+        );
+    };
+    // The first retirement names the highest generation, and the clock moves
+    // on before the rest, so its `at_ms` is the oldest.
+    record(0, 10_000);
+    std::thread::sleep(Duration::from_millis(5));
+    for n in 1..=MAX_PANE_DISCARDS {
+        record(n, 10_000 - n);
+    }
+    let kept = registry.discard_panes();
+    assert_eq!(kept.len(), MAX_PANE_DISCARDS);
+    assert!(
+        !kept.contains(&"probe-082-tie-000".to_string()),
+        "the first retirement goes: {kept:?}"
+    );
+    assert!(
+        kept.contains(&format!("probe-082-tie-{MAX_PANE_DISCARDS:03}")),
+        "the one just recorded stays: {kept:?}"
+    );
+}
+
 /// Scenario: Generation A exits holding only a voice answer's keys, and B takes the pane: B's card reports no not-delivered typing. Then A2 exits holding the person's typed keys beside an answer, and B2 takes its pane: B2's card counts the typing alone (auditor U3-7).
 #[spec("inbox/probe/082")]
 #[tokio::test(flavor = "multi_thread")]

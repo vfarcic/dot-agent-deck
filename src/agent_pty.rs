@@ -13553,10 +13553,15 @@ impl AgentPtyRegistry {
                 },
             );
             while inner.input_discarded.len() > MAX_PANE_DISCARDS {
+                // Oldest first: by the keystroke count at retirement, then by
+                // when it retired. Retirements with no keystroke between them
+                // share `input_seq`, and the generation is not retirement
+                // order, so it would let a notice just recorded go first
+                // (review U3-d).
                 let oldest = inner
                     .input_discarded
                     .iter()
-                    .min_by_key(|(_, discard)| (discard.input_seq, discard.shown.generation))
+                    .min_by_key(|(_, discard)| (discard.input_seq, discard.shown.at_ms))
                     .map(|(pane, _)| pane.clone());
                 match oldest {
                     Some(oldest) => inner.input_discarded.remove(&oldest),

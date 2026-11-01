@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AgentInbox, AgentSession, WakeHold } from "../types";
+import cardCases from "../../../tests/fixtures/inbox-card-cases.json";
 import { deckAttentionText, holdDetailText, holdDetailWords, inboxAttentionWords, inboxBadge, inboxNotice, inputHeldText, INBOX_WORDS, MAX_HOLD_DETAIL_CHARS } from "./inboxWords";
 
 function inbox(queued: number, wakeHold?: WakeHold): AgentInbox {
@@ -77,5 +78,22 @@ describe("cannot-check detail words", () => {
     expect(inboxBadge({ ...base, wakeHold: "cannot_check" })).toBe(`${INBOX_WORDS.glyph}1`);
     expect(inputHeldText("queue_full")).toBe(INBOX_WORDS.inputHeld.queue_full);
     expect(inputHeldText(undefined)).toBeUndefined();
+  });
+});
+
+// PRD #1666 part 3 (merge review U2): the card's badge and notice row for each
+// case of `tests/fixtures/inbox-card-cases.json`, which the TUI's
+// `card_cases_match_the_shared_fixture` reads too (CLAUDE.md rule 22).
+describe("card cases shared with the TUI", () => {
+  /// Scenario: For each case in the shared fixture (a held doorbell with and without the daemon's agent notice, an empty notice, a stalled hold), the badge and the notice row give the strings the TUI's card gives.
+  it.each(cardCases.map((c) => [c.name, c] as const))("%s", (_name, c) => {
+    const agentInbox: AgentInbox = {
+      queued: c.pending, fetched: 0, undeliverable: 0, wake: "doorbell",
+      wakeHold: c.hold as WakeHold,
+      ...("stalled" in c ? { wakeStalled: c.stalled } : {}),
+      ...("agentNotice" in c ? { agentNotice: c.agentNotice } : {}),
+    };
+    expect(inboxBadge(agentInbox)).toBe(c.line);
+    expect(inboxNotice(agentInbox)).toBe(c.notice);
   });
 });

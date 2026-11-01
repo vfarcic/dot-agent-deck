@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createFixtureSnapshot } from "../data/fixture";
-import { sendResultReason } from "../types";
+import words from "../../../tests/fixtures/inbox-display.json";
 import type { AgentSession, SendResult } from "../types";
 import { agentStatusInputReason, terminalInputState, unreachableDeckTerminalState } from "./terminalInput";
 import { displayActivity } from "./displayText";
@@ -32,20 +32,21 @@ describe("terminalInputState", () => {
 
   /**
    * Scenario: the two conditions the snapshot alone proves. Each disables the
-   * terminal and states the reason in the vocabulary `sendResultReason` already
-   * owns, rather than in a second set of strings that could drift from it.
+   * terminal and states the reason in the words the TUI shows when you try to
+   * type into the same card: the shared fixture's `inputUnavailable`
+   * (CLAUDE.md rule 22, merge review U3-2).
    */
   it.each([
-    ["read", "history-only"],
-    ["none", "no-live-target"],
-  ] satisfies [AgentSession["writeLease"], SendResult][])(
-    "blocks a %s lease as %s with the shared reason",
-    (writeLease, state) => {
+    ["read", "history-only", words.inputUnavailable["history-only"]],
+    ["none", "no-live-target", words.inputUnavailable.none],
+  ] satisfies [AgentSession["writeLease"], SendResult, string][])(
+    "blocks a %s lease as %s with the TUI's words",
+    (writeLease, state, notice) => {
       expect(terminalInputState(pane(writeLease))).toEqual({
         state,
         readOnly: true,
         tone: "blocked",
-        notice: `Terminal input unavailable — ${sendResultReason(state)}.`,
+        notice,
       });
     },
   );

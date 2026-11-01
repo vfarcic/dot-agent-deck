@@ -95,12 +95,22 @@ export const INBOX_WORDS = {
    * this table mirrors the whole shared fixture.
    */
   inputRejected: {
-    "history-only": "Input not delivered: session is history-only",
+    "history-only": "Input not delivered: this agent has no live terminal",
     exited: "Input not delivered: the agent has exited",
     "write-failed": "Input not delivered: the agent's terminal did not take it",
-    stale: "Input not delivered: the pane's session changed",
-    "wrong-session": "Input not delivered: the pane's session changed",
+    stale: "Input not delivered: the agent in this pane was replaced or closed",
+    "wrong-session": "Input not delivered: the agent in this pane was replaced or closed",
     "": "Input not delivered",
+  },
+  /**
+   * Merge review U3-2: a terminal that takes no input, by the daemon's
+   * `writable` value, before anything is typed — the tile's standing notice
+   * (`terminalInputState`), and the TUI's words when you try to type into the
+   * same card (`inbox_display::input_unavailable`).
+   */
+  inputUnavailable: {
+    "history-only": "Terminal input unavailable: this agent has no live terminal, only its history",
+    none: "Terminal input unavailable: this agent has no live terminal",
   },
   /**
    * The two holds that warn even with nothing waiting, in the words they
@@ -325,9 +335,17 @@ export function deckAttentionText(agents: readonly AgentSession[]): string | und
   return others > 0 ? `${INBOX_WORDS.glyph} ${others} ${INBOX_WORDS.attentionHeld}` : undefined;
 }
 
-/** Whether the notice row is the hold's, so the badge keeps only the count. */
+/**
+ * Whether the notice row is the hold's, so the badge keeps only the count:
+ * `inboxHoldText` has words and none of the checks `inboxNotice` makes before
+ * it holds — the agent notice, a refused request, an integration notice,
+ * paused hand-outs, uncertain, not-started and held-long messages. One added
+ * to `inboxNotice` ahead of the hold belongs here too (and in the TUI's
+ * `CardInbox::hold_in_notice`), or the hold's words show nowhere.
+ */
 function holdInNotice(inbox: AgentInbox): boolean {
   return inboxHoldText(inbox) !== undefined
+    && !inbox.agentNotice
     && inbox.admissionRefused === undefined
     && inbox.integration === undefined
     && inbox.evidencePaused === undefined
