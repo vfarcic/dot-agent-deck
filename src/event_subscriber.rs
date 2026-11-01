@@ -153,6 +153,11 @@ pub async fn run(client: DaemonClient, state: SharedState, config: SubscriberCon
                     Ok(Some(BroadcastMsg::InboxHandover(handover))) => {
                         state.write().await.apply_inbox_handover(&handover);
                     }
+                    // PRD #1666 part 3 (Q35-20e): what a card shows of the
+                    // typing the deck holds for its pane changed.
+                    Ok(Some(BroadcastMsg::InputHeld(update))) => {
+                        state.write().await.apply_input_held_update(&update);
+                    }
                     // Issue #1637: the daemon's hook-binary notices changed.
                     // The whole list replaces what the dashboard footer shows.
                     Ok(Some(BroadcastMsg::HookBinaryNotice(payload))) => {

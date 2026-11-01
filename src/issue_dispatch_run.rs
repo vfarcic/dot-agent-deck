@@ -4961,6 +4961,7 @@ mod tests {
     fn record(cwd: Option<&str>, membership: Option<TabMembership>) -> AgentRecord {
         AgentRecord {
             input_held: None,
+            input_discarded: None,
             id: "a1".into(),
             pane_id_env: None,
             display_name: None,

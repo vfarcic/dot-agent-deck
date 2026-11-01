@@ -100,6 +100,24 @@ describe("inbox cards and handoff rail (S13)", () => {
     expect(screen.getByRole("article", { name: "Coder" })).not.toHaveTextContent(text);
   });
 
+  /// Scenario: inbox/probe/080 — the agent that replaced one whose typing was held arrives through the snapshot bridge saying that typing was discarded. Its tile shows the shared not-delivered words, a hold of its own takes their place, and the next snapshot without either clears the row.
+  it("inbox/probe/080: the successor's tile says held typing was not delivered", () => {
+    const dto = snapshot();
+    Object.assign(dto.agents[0], { inputDiscarded: true });
+    const view = render(card(mapDesktopSnapshot(dto).agents[0]));
+    const tile = screen.getByRole("article", { name: "Coder" });
+    expect(tile).toHaveTextContent(words.inputNotDelivered);
+    expect(words.inputNotDelivered.startsWith(words.notDelivered)).toBe(true);
+    const held = snapshot();
+    Object.assign(held.agents[0], { inputDiscarded: true, inputHeld: { generation: 7, cause: "checking", heldOps: 1, heldBytes: 2, sinceMs: 1 } });
+    view.rerender(card(mapDesktopSnapshot(held).agents[0]));
+    expect(tile).toHaveTextContent(words.inputHeld.checking);
+    expect(tile).not.toHaveTextContent(words.inputNotDelivered);
+    view.rerender(card(mapDesktopSnapshot(snapshot()).agents[0]));
+    expect(tile).not.toHaveTextContent(words.inputNotDelivered);
+    expect(INBOX_WORDS.inputNotDelivered).toBe(words.inputNotDelivered);
+  });
+
   /// Scenario: inbox/probe/018 — a cannot-check detail names the refused path and its cause. Replacing the reason with needs-fetch and then clearing it removes the old path from the same tile.
   it.each(["filesystem", "writable_directory", "foreign_owner", "acl", "export_file", "io"])
   ("inbox/probe/018: displays and clears %s detail", (cause) => {

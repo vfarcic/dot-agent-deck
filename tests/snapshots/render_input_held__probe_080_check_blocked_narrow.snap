@@ -1,0 +1,12 @@
+---
+source: tests/render_input_held.rs
+expression: narrow
+---
+┌ 1 ClaudeCode · api-svc ───────────────────────────────────────── ● Idle ┐
+│Dir:  api-svc                                                            │
+│waiting: the deck can't check this input box until you press Ctrl+G      │
+│                                                                         │
+│                                                                         │
+│                                                                         │
+│                                                                         │
+└───────────────────────────────────────────────────── Last: 1h  Tools: 3 ┘

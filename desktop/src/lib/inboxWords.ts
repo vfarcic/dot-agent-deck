@@ -83,6 +83,11 @@ export const INBOX_WORDS = {
     unknown: "input held: your typing is kept while the deck checks this input box",
   },
   /**
+   * PRD #1666 part 3 (Q35-20e, Q104b): the successor's card, when the agent
+   * generation it replaced still held typing as it retired.
+   */
+  inputNotDelivered: "not delivered: your held typing; restarting the agent discarded it. Type it again if you still need it.",
+  /**
    * The two holds that warn even with nothing waiting, in the words they
    * take then.
    */
@@ -261,11 +266,13 @@ export function holdDetailWords(detail: HoldDetail): string | undefined {
 
 /**
  * PRD #1666 part 3 (Q35, core §7): the row saying the deck holds what the
- * user typed into the agent's pane, and why, whatever else the card shows.
- * The TUI's `CardInbox::input_held_text`.
+ * user typed into the agent's pane, and why, whatever else the card shows;
+ * with nothing held, that the previous generation's held typing was not
+ * delivered (Q35-20e). The TUI's `CardInbox::input_held_text`.
  */
-export function inputHeldText(cause: InputHeldCause | undefined): string | undefined {
-  return cause === undefined ? undefined : INBOX_WORDS.inputHeld[cause];
+export function inputHeldText(cause: InputHeldCause | undefined, discarded = false): string | undefined {
+  if (cause !== undefined) return INBOX_WORDS.inputHeld[cause];
+  return discarded ? INBOX_WORDS.inputNotDelivered : undefined;
 }
 
 /**

@@ -789,11 +789,17 @@ pub struct DesktopAgent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_question: Option<DesktopPendingQuestion>,
     /// PRD #1666 part 3 (Q35): the deck is holding what the user typed into
-    /// this agent's pane (`SessionSnapshot.input_held`), copied through: its
+    /// this agent's pane (`AgentRecord.input_held`, which the record carries
+    /// whether or not the agent has sent a hook, Q35-20e), copied through: its
     /// cause is a wire value the webview words, and the rest are numbers.
     /// Absent while it holds nothing, and from a daemon predating the field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_held: Option<DesktopInputHeld>,
+    /// PRD #1666 part 3 (Q35-20e): typing the deck held for this pane's
+    /// previous agent generation was discarded when it retired
+    /// (`AgentRecord.input_discarded`). Absent while there is none to report.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub input_discarded: bool,
     /// PRD #1666 part 3 (Q35): the outcomes of this agent's recently held
     /// answers that carried a client token
     /// (`SessionSnapshot.answer_settlements`), which the voice panel reads for
@@ -2443,8 +2449,16 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
     let pending_question = live
         .and_then(|snapshot| snapshot.pending_question.as_ref())
         .map(map_pending_question);
-    let input_held = live
-        .and_then(|snapshot| snapshot.input_held.as_ref())
+    // Q35-20e (U3-04): from the record, which carries it for a generation
+    // that has sent no hook; the live snapshot's copy is the same value.
+    // Bound to the record's own generation where its id names one, as the
+    // TUI binds it (`PaneHeld::new`).
+    let generation: Option<u64> = record.id.parse().ok();
+    let input_held = record
+        .input_held
+        .as_ref()
+        .or(live.and_then(|snapshot| snapshot.input_held.as_ref()))
+        .filter(|held| generation.is_none_or(|generation| held.generation == generation))
         .map(|held| DesktopInputHeld {
             generation: held.generation,
             cause: wire_name(held.cause),
@@ -2452,6 +2466,13 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
             held_bytes: held.held_bytes,
             since_ms: held.since_ms,
         });
+    // Q35-20e: never a generation's own: the notice names the one it
+    // replaced.
+    let input_discarded = record
+        .input_discarded
+        .as_ref()
+        .zip(generation)
+        .is_some_and(|(discarded, generation)| discarded.generation < generation);
     let answer_settlements = live
         .map(|snapshot| {
             snapshot
@@ -2491,6 +2512,7 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         delivery_notice,
         pending_question,
         input_held,
+        input_discarded,
         answer_settlements,
         pull_request,
         tab,
@@ -4195,6 +4217,7 @@ mod tests {
     fn fixture_record() -> AgentRecord {
         AgentRecord {
             input_held: None,
+            input_discarded: None,
             id: "agent-7".into(),
             pane_id_env: Some("pane-7".into()),
             display_name: Some("builder".into()),
@@ -4317,6 +4340,31 @@ mod tests {
         assert!(value["inbox"].get("wakeHold").is_none(), "{value}");
     }
 
+    /// Scenario: Map daemon records for an agent that has sent no hook (no live snapshot) and whose pane's typing is held, or whose predecessor's held typing was discarded. The hold reaches the webview from the record alone; one naming another generation than the record's, and a discarded notice naming the record's own generation or a later one, reach it as nothing.
+    #[test]
+    fn agent_mapping_reads_held_typing_from_a_record_with_no_hook() {
+        let mut record = fixture_record();
+        record.id = "12".into();
+        record.live = None;
+        record.input_held = serde_json::from_value(serde_json::json!({
+            "generation": 12, "cause": "check_not_opened", "held_ops": 1, "held_bytes": 4, "since_ms": 3
+        }))
+        .unwrap();
+        record.input_discarded = serde_json::from_value(serde_json::json!({
+            "generation": 11, "held_ops": 1, "held_bytes": 4, "at_ms": 3
+        }))
+        .unwrap();
+        let value = serde_json::to_value(map_agent(record.clone())).unwrap();
+        assert_eq!(value["inputHeld"]["cause"], "check_not_opened", "{value}");
+        assert_eq!(value["inputDiscarded"], true, "{value}");
+        record.input_held.as_mut().unwrap().generation = 11;
+        record.input_discarded.as_mut().unwrap().generation = 12;
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        for absent in ["inputHeld", "inputDiscarded"] {
+            assert!(value.get(absent).is_none(), "{absent}: {value}");
+        }
+    }
+
     /// Scenario: Map a daemon record whose snapshot holds the user's typing, queues an answer, settles two earlier ones and says why it can't check the input box into the desktop DTO; each reaches the webview by its wire spelling, a value a newer daemon names reads as `unknown`, the detail's strings keep their controls for the tile to escape, bounded, and a record with none of them sends none.
     #[test]
     fn agent_mapping_carries_held_typing_check_details_and_settlements() {
@@ -4371,7 +4419,7 @@ mod tests {
         assert_eq!(value["pendingQuestion"]["answerQueued"], true);
 
         let value = serde_json::to_value(map_agent(fixture_record())).unwrap();
-        for absent in ["inputHeld", "answerSettlements"] {
+        for absent in ["inputHeld", "inputDiscarded", "answerSettlements"] {
             assert!(value.get(absent).is_none(), "{absent}: {value}");
         }
         let mut record = fixture_record();

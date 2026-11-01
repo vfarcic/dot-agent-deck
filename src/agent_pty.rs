@@ -4232,6 +4232,12 @@ pub struct AgentRecord {
     /// [`Self::inbox`] precedent: an older reader ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_held: Option<crate::inbox_display::InputHeld>,
+    /// PRD #1666 part 3 (Q35-20e): typing the deck held for this pane's
+    /// previous generation, discarded when it retired, on its successor's
+    /// record until a person's keystroke reaches the pane after it.
+    /// Additive and optional, as [`Self::input_held`] is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_discarded: Option<crate::inbox_display::InputDiscarded>,
 }
 
 impl AgentRecord {
@@ -4296,6 +4302,7 @@ pub fn attach_input_held(registry: &AgentPtyRegistry, records: &mut [AgentRecord
             live.input_held = held.clone();
         }
         record.input_held = held;
+        record.input_discarded = registry.input_discarded(&record.id);
     }
 }
 
@@ -5112,6 +5119,15 @@ enum Acceptance {
     Released(Released, Option<SubOpRun>),
 }
 
+/// PRD #1666 part 3 (Q35-20e): typing a pane's retired generation held,
+/// for the successor's card, with the human-input counter at the retirement:
+/// a person's keystroke reaching the pane after it ends the notice.
+#[derive(Debug, Clone)]
+struct PaneDiscard {
+    shown: crate::inbox_display::InputDiscarded,
+    input_seq: u64,
+}
+
 /// PRD #1666 part 3 (Q35-15): a generation's fence gate
 /// ([`crate::composer_probe::gate`]) with the writer's in-flight count and
 /// the input epoch it reads, so the registry can close it, read it and retire
@@ -5153,12 +5169,27 @@ impl PaneGate {
 
     /// The generation retired (R5 §4.6 E4): nothing more is accepted, every
     /// held frame is refused `exited` once, its connection told, and it
-    /// leaves the in-flight count once; full waiters wake to see it.
-    pub(crate) fn retire(&self) {
-        for frame in self.gate.retire() {
+    /// leaves the in-flight count once; full waiters wake to see it. Returns
+    /// how many writes and bytes it discarded (Q35-20e).
+    pub(crate) fn retire(&self) -> (usize, usize) {
+        let (held, bytes) = self.gate.retire_counted();
+        let ops = held.len();
+        for frame in held {
             frame.refuse_accepted("exited");
             self.in_flight.leave();
         }
+        (ops, bytes)
+    }
+
+    /// PRD #1666 part 3 (Q35-20e): have `notify` told when what the card
+    /// shows of this gate may have changed.
+    pub(crate) fn watch_display(&self, notify: Arc<Notify>) {
+        self.gate.watch_display(notify);
+    }
+
+    /// PRD #1666 part 3 (Q35-20e): the gate's counts, for the card.
+    pub(crate) fn held_status(&self) -> crate::composer_probe::gate::Status {
+        self.gate.status()
     }
 }
 
@@ -8207,6 +8238,11 @@ pub struct AgentPtyRegistry {
     /// is what makes the record atomic with respect to writer handoff (H1). See
     /// [`PaneInputState`].
     pane_input: Arc<Mutex<PaneInputState>>,
+    /// PRD #1666 part 3 (Q35-20e): told by every published generation's fence
+    /// gate when what its card shows of held typing may have changed, and by
+    /// each retirement; the display watcher waits on it
+    /// ([`crate::agent_pty::watch_input_held`]).
+    held_display: Arc<Notify>,
     /// Issue #525: how long a guarded delivery waits on one PTY write before
     /// it stops waiting — [`PTY_WRITE_STALL_BOUND`], lowered by tests. In
     /// milliseconds so a test can change it through the `Arc` every caller
@@ -8497,6 +8533,7 @@ mod segment_driver;
 #[path = "agent_pty_release_oracle_tests.rs"]
 mod release_oracle_tests;
 pub use doorbell_ring::{RingOutcome, RingReport};
+pub use segment_driver::watch_input_held;
 #[cfg(feature = "e2e")]
 pub(crate) use segment_driver::{ProbeAsk, ProbeOutcome};
 
@@ -9963,6 +10000,12 @@ struct RegistryInner {
     /// Tokio clock a polling task's `sleep` would let the runtime's
     /// auto-advance move that clock underneath the test.
     exit_waiters: HashMap<String, Vec<oneshot::Sender<()>>>,
+    /// PRD #1666 part 3 (Q35-20e): typing a pane's retired generation still
+    /// held when it retired, by pane, for its successor's card. Replaced at
+    /// the pane's next retirement (removed when that one held nothing), and
+    /// shown until a person's keystroke reaches the pane after it (see
+    /// [`AgentPtyRegistry::input_discarded`]).
+    input_discarded: HashMap<String, PaneDiscard>,
 }
 
 /// Issue #454: RAII holder for a [`RegistryInner::pending_spawns`] entry.
@@ -10449,6 +10492,7 @@ impl AgentPtyRegistry {
                 respawning_members: HashMap::new(),
                 cleanup_holds: HashSet::new(),
                 exit_waiters: HashMap::new(),
+                input_discarded: HashMap::new(),
             }),
             dispatch_mutexes: Mutex::new(HashMap::new()),
             dispatch_order_mutexes: Mutex::new(HashMap::new()),
@@ -10459,6 +10503,7 @@ impl AgentPtyRegistry {
             shutting_down: AtomicBool::new(false),
             admission_frozen: AtomicBool::new(false),
             pane_input: Arc::new(Mutex::new(PaneInputState::default())),
+            held_display: Arc::new(Notify::new()),
             pty_write_stall_bound_ms: AtomicU64::new(PTY_WRITE_STALL_BOUND.as_millis() as u64),
             repaint_nudges: Mutex::new(HashMap::new()),
             doorbell_txns: Mutex::new(HashMap::new()),
@@ -13419,6 +13464,76 @@ impl AgentPtyRegistry {
         self.pane_input.lock().unwrap().forget_pane(pane_id_env);
     }
 
+    /// PRD #1666 part 3 (Q35-20e): `retired_id`, `pane`'s generation retiring
+    /// now under `inner`, discarded `ops` writes of `bytes` held typing.
+    /// Replaces what an earlier retirement left for the pane: a retirement
+    /// that held nothing leaves nothing to report. Takes the pane-input lock
+    /// inside the registry's, the order [`Self::forget_pane_input`] takes.
+    fn note_discard(
+        &self,
+        inner: &mut RegistryInner,
+        pane: &str,
+        retired_id: &str,
+        (ops, bytes): (usize, usize),
+    ) {
+        match retired_id.parse::<u64>().ok() {
+            Some(generation) if ops > 0 => {
+                let input_seq = self.pane_input.lock().unwrap().input_seq;
+                let at_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+                inner.input_discarded.insert(
+                    pane.to_string(),
+                    PaneDiscard {
+                        shown: crate::inbox_display::InputDiscarded {
+                            generation,
+                            held_ops: u32::try_from(ops).unwrap_or(u32::MAX),
+                            held_bytes: u32::try_from(bytes).unwrap_or(u32::MAX),
+                            at_ms,
+                        },
+                        input_seq,
+                    },
+                );
+            }
+            _ => {
+                inner.input_discarded.remove(pane);
+            }
+        }
+        self.held_display.notify_one();
+    }
+
+    /// PRD #1666 part 3 (Q35-20e): what `agent_id`'s card says of typing its
+    /// pane's previous generation held when it retired: shown on the pane's
+    /// current, later generation until a person's keystroke reaches the pane
+    /// after the retirement. Display only.
+    pub(crate) fn input_discarded(
+        &self,
+        agent_id: &str,
+    ) -> Option<crate::inbox_display::InputDiscarded> {
+        let generation = agent_id.parse::<u64>().ok()?;
+        let (pane, discard) = {
+            let inner = self.inner.lock();
+            let agent = inner.agents.get(agent_id)?;
+            if agent.pane_retired.load(Ordering::SeqCst) {
+                return None;
+            }
+            let pane = agent.pane_id_env.clone()?;
+            let discard = inner.input_discarded.get(&pane)?.clone();
+            (pane, discard)
+        };
+        if discard.shown.generation >= generation {
+            return None;
+        }
+        let typed = self.pane_input.lock().unwrap().human_input_seq(&pane);
+        (typed <= discard.input_seq).then_some(discard.shown)
+    }
+
+    /// PRD #1666 part 3 (Q35-20e): told whenever a card's held typing may
+    /// have changed; see [`crate::agent_pty::watch_input_held`].
+    pub(crate) fn held_display(&self) -> Arc<Notify> {
+        Arc::clone(&self.held_display)
+    }
+
     /// PRD #1487 audit A2 test seam: park the next spawn after its child is
     /// forked and before it takes the lock that publishes it. The first
     /// receiver yields once the spawn is parked; sending on (or dropping) the
@@ -14360,7 +14475,8 @@ impl AgentPtyRegistry {
             // before it exited and records only now would otherwise land in
             // this agent's fresh stream and settle it against the
             // predecessor's turn count, releasing this agent's Escapes.
-            for agent in inner.agents.values() {
+            let mut retired_discards = Vec::new();
+            for (retired_id, agent) in inner.agents.iter() {
                 if agent.pane_id_env.as_deref() == Some(claimed.as_str()) {
                     agent.pane_retired.store(true, Ordering::SeqCst);
                     // PRD #1666 part 3, round 5-wake: the retired generation's
@@ -14368,7 +14484,8 @@ impl AgentPtyRegistry {
                     agent.ingress.close();
                     // PRD #1666 part 3 (Q35-15): and its fence gate, whose
                     // held frames are refused once.
-                    agent.gate.retire();
+                    let discarded = agent.gate.retire();
+                    retired_discards.push((retired_id.clone(), discarded));
                     // PRD #1666 part 3 (Q35-06): and its input epoch's
                     // structures; with its invocation records, M-FIRST's
                     // event is taken in the same section (Q35-14b).
@@ -14388,6 +14505,10 @@ impl AgentPtyRegistry {
                         .bus
                         .close_release(crate::release_scanner::WindowClose::Retired);
                 }
+            }
+            // Q35-20e: what a predecessor still held, for this successor's card.
+            for (retired_id, discarded) in retired_discards {
+                self.note_discard(&mut inner, claimed, &retired_id, discarded);
             }
             self.forget_pane_input(claimed);
             if busy_before_publication {
@@ -14644,7 +14765,12 @@ impl AgentPtyRegistry {
             agent.spawn_command.clone(),
             agent.spawn_env.clone(),
         );
+        // PRD #1666 part 3 (Q35-20e): its card follows its held typing, and
+        // the display watcher looks at it now: it may carry a predecessor's
+        // discarded typing.
+        agent.gate.watch_display(Arc::clone(&self.held_display));
         inner.agents.insert(id.clone(), agent);
+        self.held_display.notify_one();
         // PRD #1666 part 3, round 5-wake: a respawn's successor is published,
         // so the generation it lifted out was replaced, under the lock hold
         // that publishes it.
@@ -15060,7 +15186,10 @@ impl AgentPtyRegistry {
             // and doorbell cell.
             agent.ingress.close();
             // PRD #1666 part 3 (Q35-15): and its fence gate.
-            agent.gate.retire();
+            let discarded = agent.gate.retire();
+            if let Some(pane) = agent.pane_id_env.as_deref() {
+                self.note_discard(&mut inner, pane, id, discarded);
+            }
             // PRD #1666 part 3 (Q35-06): and its input epoch's structures.
             agent.bus.input().retire();
             agent.doorbell.retire();
@@ -15392,7 +15521,10 @@ impl AgentPtyRegistry {
             // and doorbell cell.
             removed.ingress.close();
             // PRD #1666 part 3 (Q35-15): and its fence gate.
-            removed.gate.retire();
+            let discarded = removed.gate.retire();
+            if let Some(pane) = removed.pane_id_env.as_deref() {
+                self.note_discard(&mut inner, pane, &agent_id, discarded);
+            }
             // PRD #1666 part 3 (Q35-06): and its input epoch's structures.
             removed.bus.input().retire();
             removed.doorbell.retire();
@@ -17530,6 +17662,7 @@ impl AgentPtyRegistry {
             authoring_kind: agent.authoring_kind,
             inbox: None,
             input_held: None,
+            input_discarded: None,
         }
     }
 
@@ -17912,6 +18045,7 @@ impl AgentPtyRegistry {
                 authoring_kind: agent.authoring_kind,
                 inbox: None,
                 input_held: None,
+                input_discarded: None,
             })
             .collect();
         records.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));
@@ -24629,6 +24763,7 @@ mod spawn_tests {
     ) -> AgentRecord {
         AgentRecord {
             input_held: None,
+            input_discarded: None,
             id: "1".into(),
             pane_id_env: None,
             display_name: None,
@@ -24878,6 +25013,7 @@ mod spawn_tests {
             authoring_kind: None,
             inbox: None,
             input_held: None,
+            input_discarded: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -30556,6 +30692,7 @@ mod spawn_tests {
             authoring_kind: None,
             inbox: None,
             input_held: None,
+            input_discarded: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();

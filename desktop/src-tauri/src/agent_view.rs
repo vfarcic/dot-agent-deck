@@ -168,6 +168,11 @@ pub(crate) enum FetchReason {
     /// re-reads them — one `ListAgents` per coalescing window at most, as for
     /// any other mark.
     Inbox,
+    /// PRD #1666 part 3 (Q35-20e): what a pane's card shows of the typing the
+    /// deck holds for it changed. That rides the record
+    /// (`AgentRecord::input_held`, `AgentRecord::input_discarded`), as the
+    /// inbox counts do, so the next refresh re-reads it.
+    InputHeld,
     /// The periodic reconciliation, which is the only thing that catches a
     /// silent removal.
     Reconcile,
@@ -302,6 +307,9 @@ impl AgentView {
             BroadcastMsg::Inbox(_) | BroadcastMsg::InboxHandover(_) => {
                 self.mark(FetchReason::Inbox)
             }
+            // PRD #1666 part 3 (Q35-20e): the held-typing row rides the
+            // record; see `FetchReason::InputHeld`.
+            BroadcastMsg::InputHeld(_) => self.mark(FetchReason::InputHeld),
             // Issue #1637: the notices ride the `Hello` reply, which the held
             // link captured once; re-read it, and the list with it.
             BroadcastMsg::HookBinaryNotice(_) => {
@@ -512,6 +520,7 @@ mod tests {
     fn record(id: &str, pane_id: &str) -> AgentRecord {
         AgentRecord {
             input_held: None,
+            input_discarded: None,
             id: id.into(),
             pane_id_env: Some(pane_id.into()),
             display_name: Some(format!("worker-{id}")),
@@ -588,6 +597,32 @@ mod tests {
             "the fold must have moved the rendered status"
         );
         assert_eq!(view.fetch_count(), 1, "only the install fetched");
+    }
+
+    /// Scenario: install one agent that has sent no hook, then receive the
+    /// daemon's word that its typing is held (PRD #1666 part 3, Q35-20e). The
+    /// word makes the next refresh fetch, and the record from that fetch
+    /// carries the hold to its tile.
+    #[test]
+    fn a_held_typing_update_makes_the_record_carrying_it_fetched() {
+        let now = Instant::now();
+        let mut view = AgentView::default();
+        view.install(listing(vec![record("7", "pane-7")]), now);
+        assert_eq!(view.needs_fetch(now), None);
+        let held: dot_agent_deck::inbox_display::InputHeld =
+            serde_json::from_value(serde_json::json!({
+                "generation": 7, "cause": "checking", "held_ops": 1, "held_bytes": 2, "since_ms": 3
+            }))
+            .unwrap();
+        view.apply(&BroadcastMsg::InputHeld(
+            dot_agent_deck::event::InputHeldUpdate {
+                pane_id: "pane-7".into(),
+                agent_id: "7".into(),
+                input_held: Some(held),
+                input_discarded: None,
+            },
+        ));
+        assert_eq!(view.needs_fetch(now), Some(FetchReason::InputHeld));
     }
 
     /// Scenario: install one agent, then receive the daemon's inbox notice

@@ -1741,6 +1741,13 @@ pub struct AppState {
     /// a failed integration refresh among them — while it spawns it, before
     /// the client has its card; the surfacing start carries them.
     pane_inboxes: HashMap<String, PaneInbox>,
+    /// PRD #1666 part 3 (Q35-20e): the daemon's latest word on held typing
+    /// for a pane this client neither manages nor has an account of yet, by
+    /// pane, at most [`MAX_PENDING_INPUT_HELD`]. A generation that took a
+    /// pane this client let go of is announced before its card is surfaced;
+    /// the account that surfacing gives takes it when it names that
+    /// generation ([`Self::take_pane_inbox`]).
+    pending_input_held: HashMap<String, PaneHeld>,
     /// Issue #1635: what the TUI's last release check found — the plans for
     /// this machine's copies — set by [`crate::upgrade_dialog::run_checker`]
     /// at start and every re-check interval. `None` until a check succeeds.
@@ -6619,6 +6626,9 @@ fn card_inbox_of(event: &AgentEvent) -> Option<crate::inbox_display::CardInbox> 
         .metadata
         .get(crate::inbox_display::CARD_INBOX_INPUT_HELD_METADATA_KEY)
         .and_then(|cause| serde_json::from_value(serde_json::Value::String(cause.clone())).ok());
+    inbox.input_discarded = event
+        .metadata
+        .contains_key(crate::inbox_display::CARD_INBOX_INPUT_DISCARDED_METADATA_KEY);
     Some(inbox)
 }
 
@@ -6688,6 +6698,12 @@ fn set_card_inbox(session: &mut SessionState, inbox: crate::inbox_display::CardI
             cause,
         );
     }
+    if inbox.input_discarded {
+        metadata.insert(
+            crate::inbox_display::CARD_INBOX_INPUT_DISCARDED_METADATA_KEY.to_string(),
+            String::new(),
+        );
+    }
     session.recent_events.push_back(AgentEvent {
         session_id: session.session_id.clone(),
         agent_type: session.agent_type.clone(),
@@ -6732,6 +6748,11 @@ const MAX_SEEN_INBOX_MESSAGES: usize = 256;
 /// Bound on [`PaneInbox::retired`]; the oldest goes first.
 const MAX_RETIRED_INBOX_AGENTS: usize = 8;
 
+/// PRD #1666 part 3 (Q35-20e): how many panes [`AppState::pending_input_held`]
+/// keeps; past it, one is forgotten to make room. A forgotten one costs its
+/// pane's card the row until the next snapshot or update.
+const MAX_PENDING_INPUT_HELD: usize = 64;
+
 /// PRD #1666 §2.8: what a client knows of one pane's inbox — the daemon's last
 /// summary, and the messages seen change state since. Keyed by message id, so
 /// a frame repeated or a hand-back (`fetched` → `queued`) counts nothing twice.
@@ -6773,15 +6794,61 @@ struct PaneInbox {
     /// box, carried and replaced with [`Self::hold`], so a later hold never
     /// keeps an earlier one's path.
     hold_detail: Option<crate::inbox_display::HoldDetail>,
-    /// PRD #1666 part 3 (Q35): why the deck holds what the user typed into
-    /// the pane, from the daemon's last snapshot of the agent
-    /// ([`AppState::take_inbox_snapshot`]); a new account of the pane starts
-    /// without it.
-    input_held: Option<crate::inbox_display::InputHeldCause>,
+    /// PRD #1666 part 3 (Q35, Q35-20e): what the daemon last said of the
+    /// typing it holds for the pane, from its snapshot of the agent
+    /// ([`AppState::take_inbox_snapshot`]) or its live update
+    /// ([`AppState::apply_input_held_update`]). Bound to the generation it
+    /// names: the card shows it only while that generation is this account's
+    /// ([`Self::card`]), and a new account keeps it only when it names the
+    /// new account's generation, which an update sent before the generation's
+    /// handover does ([`Self::retire`]).
+    held: Option<PaneHeld>,
     /// PRD #1666 §6.5: the items waiting on the user and the card's notices,
     /// from the summary and from each attention notice, which carries them
     /// whole.
     notices: crate::inbox_hub::InboxCardNotices,
+}
+
+/// PRD #1666 part 3 (Q35-20e): what the daemon last said of the typing it
+/// holds for one agent generation's pane ([`PaneInbox::held`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaneHeld {
+    /// The generation it is about.
+    agent_id: String,
+    /// Why the deck holds what the user typed, while it shows a hold.
+    cause: Option<crate::inbox_display::InputHeldCause>,
+    /// The typing the pane's previous generation held was not delivered.
+    discarded: bool,
+}
+
+impl PaneHeld {
+    /// `agent_id`'s held typing from the daemon's word on it. A discarded
+    /// notice counts only when it names an earlier generation than the one it
+    /// rides, so a retired generation's own notice never shows on it.
+    fn new(
+        agent_id: &str,
+        held: Option<&crate::inbox_display::InputHeld>,
+        discarded: Option<&crate::inbox_display::InputDiscarded>,
+    ) -> Self {
+        Self {
+            agent_id: agent_id.to_string(),
+            // Bound where the id names a generation, as the desktop's
+            // `map_agent` binds it.
+            cause: held
+                .filter(|held| {
+                    agent_id
+                        .parse::<u64>()
+                        .ok()
+                        .is_none_or(|generation| generation == held.generation)
+                })
+                .map(|held| held.cause),
+            discarded: discarded.is_some_and(|discarded| {
+                agent_id
+                    .parse::<u64>()
+                    .is_ok_and(|generation| discarded.generation < generation)
+            }),
+        }
+    }
 }
 
 /// PRD #1666 §2.8: the inbox a card-surfacing start carries
@@ -6829,7 +6896,7 @@ impl PaneInbox {
             stalled: summary.wake_stalled,
             hold: summary.wake_hold,
             hold_detail: summary.hold_detail.clone(),
-            input_held: None,
+            held: None,
             notices: summary.notices.clone(),
         }
     }
@@ -6848,6 +6915,16 @@ impl PaneInbox {
         }
         if let Some(current) = next.agent_id.as_ref() {
             retired.retain(|agent| agent != current);
+        }
+        // Q35-20e: a live update for the new generation that came before its
+        // handover stays with it.
+        if next.held.is_none()
+            && self
+                .held
+                .as_ref()
+                .is_some_and(|held| next.agent_id.as_deref() == Some(held.agent_id.as_str()))
+        {
+            next.held = self.held.take();
         }
         if retired.len() > MAX_RETIRED_INBOX_AGENTS {
             retired.drain(..retired.len() - MAX_RETIRED_INBOX_AGENTS);
@@ -6903,6 +6980,13 @@ impl PaneInbox {
         }
     }
 
+    /// Q35-20e: [`Self::held`], when it names this account's generation.
+    fn current_held(&self) -> Option<&PaneHeld> {
+        self.held
+            .as_ref()
+            .filter(|held| self.agent_id.as_deref() == Some(held.agent_id.as_str()))
+    }
+
     fn claimed(&self) -> usize {
         self.seen
             .values()
@@ -6933,7 +7017,8 @@ impl PaneInbox {
             stalled: self.stalled,
             hold: self.hold,
             hold_detail: self.hold_detail.clone(),
-            input_held: self.input_held,
+            input_held: self.current_held().and_then(|held| held.cause),
+            input_discarded: self.current_held().is_some_and(|held| held.discarded),
             uncertain: count(AttentionKind::uncertain),
             out_of_attempts: count(|kind| kind == AttentionKind::OutOfAttempts),
             not_started: count(|kind| kind == AttentionKind::NotStarted),
@@ -9432,14 +9517,20 @@ impl AppState {
                 Some(summary) => {
                     // PRD #1666 part 3 (Q35): the record's held typing rides
                     // the pane's new account, so the card shows it and a
-                    // snapshot without it clears it.
-                    let input_held = record
+                    // snapshot without it clears it. Read from the record,
+                    // which carries it whether or not the agent has sent a
+                    // hook (Q35-20e, U3-04); the live snapshot's copy, the
+                    // same value, from a daemon that sets only that one.
+                    let input_held = record.input_held.as_ref().or(record
                         .live
                         .as_ref()
-                        .and_then(|snap| snap.input_held.as_ref())
-                        .map(|held| held.cause);
+                        .and_then(|snap| snap.input_held.as_ref()));
                     let next = PaneInbox {
-                        input_held,
+                        held: Some(PaneHeld::new(
+                            &record.id,
+                            input_held,
+                            record.input_discarded.as_ref(),
+                        )),
                         ..PaneInbox::from_summary(&record.id, summary)
                     };
                     self.take_pane_inbox(pane_id, next);
@@ -9476,7 +9567,14 @@ impl AppState {
 
     /// `next` as `pane_id`'s account, retiring the one it replaces
     /// ([`PaneInbox::retire`]), and drawn on its card.
-    fn take_pane_inbox(&mut self, pane_id: &str, next: PaneInbox) {
+    fn take_pane_inbox(&mut self, pane_id: &str, mut next: PaneInbox) {
+        // Q35-20e: held typing announced before this account existed.
+        if let Some(pending) = self.pending_input_held.remove(pane_id)
+            && next.held.is_none()
+            && next.agent_id.as_deref() == Some(pending.agent_id.as_str())
+        {
+            next.held = Some(pending);
+        }
         self.pane_inboxes
             .entry(pane_id.to_string())
             .or_default()
@@ -9517,6 +9615,48 @@ impl AppState {
         };
         inbox.fold(notice);
         self.refresh_card_inbox(&notice.pane_id);
+    }
+
+    /// PRD #1666 part 3 (Q35-20e): the daemon's live word on the typing it
+    /// holds for one agent generation's pane
+    /// ([`crate::event::BroadcastMsg::InputHeld`]). Applied to the panes
+    /// [`Self::apply_inbox_notice`] applies notices to. Bound to the
+    /// generation it names: one this pane's account has retired changes
+    /// nothing, and one naming a generation the account has not reached yet
+    /// waits for that generation's handover ([`PaneInbox::retire`]). One for
+    /// a pane with neither waits for the account the pane's surfacing gives
+    /// ([`Self::pending_input_held`]).
+    pub fn apply_input_held_update(&mut self, update: &crate::event::InputHeldUpdate) {
+        let held = PaneHeld::new(
+            &update.agent_id,
+            update.input_held.as_ref(),
+            update.input_discarded.as_ref(),
+        );
+        let inbox = if self.managed_pane_ids.contains(&update.pane_id) {
+            self.pane_inboxes.entry(update.pane_id.clone()).or_default()
+        } else {
+            match self.pane_inboxes.get_mut(&update.pane_id) {
+                Some(inbox) => inbox,
+                None => {
+                    if self.pending_input_held.len() >= MAX_PENDING_INPUT_HELD
+                        && !self.pending_input_held.contains_key(&update.pane_id)
+                        && let Some(dropped) = self.pending_input_held.keys().next().cloned()
+                    {
+                        self.pending_input_held.remove(&dropped);
+                    }
+                    self.pending_input_held.insert(update.pane_id.clone(), held);
+                    return;
+                }
+            }
+        };
+        if inbox.retired.contains(&update.agent_id) {
+            return;
+        }
+        if inbox.agent_id.is_none() {
+            inbox.agent_id = Some(update.agent_id.clone());
+        }
+        inbox.held = Some(held);
+        self.refresh_card_inbox(&update.pane_id);
     }
 
     /// PRD #1666 part 3 (R-2): the refusal code of the request `pane_id`'s
@@ -9590,16 +9730,67 @@ impl AppState {
     }
 
     /// Draw `pane_id`'s inbox on its card.
+    ///
+    /// PRD #1666 part 3 (Q35-20e): while the pane's current generation has
+    /// no card of its own — one that has sent no hook, after its predecessor's
+    /// card was restored as the pane's placeholder — its held-typing row goes
+    /// on the card that predecessor left ([`Self::retired_card_id`]), the
+    /// pane's only card, and nothing else of the account does. Once the
+    /// generation has its own card, that row leaves the predecessor's.
     fn refresh_card_inbox(&mut self, pane_id: &str) {
         let Some(inbox) = self.pane_inboxes.get(pane_id).map(PaneInbox::card) else {
             return;
         };
-        let Some(card_id) = self.inbox_card_id(pane_id) else {
+        let card_id = self.inbox_card_id(pane_id);
+        if let Some(left) = self
+            .retired_card_id(pane_id)
+            .filter(|left| card_id.as_ref() != Some(left))
+            && let Some(card) = self.sessions.get_mut(&left)
+        {
+            let (input_held, input_discarded) = if card_id.is_some() {
+                (None, false)
+            } else {
+                (inbox.input_held, inbox.input_discarded)
+            };
+            let current = card.card_inbox().unwrap_or_default();
+            if current.input_held != input_held || current.input_discarded != input_discarded {
+                set_card_inbox(
+                    card,
+                    crate::inbox_display::CardInbox {
+                        input_held,
+                        input_discarded,
+                        ..current
+                    },
+                );
+            }
+        }
+        let Some(card_id) = card_id else {
             return;
         };
         if let Some(card) = self.sessions.get_mut(&card_id) {
             set_card_inbox(card, inbox);
         }
+    }
+
+    /// PRD #1666 part 3 (Q35-20e): `pane_id`'s newest card belonging to a
+    /// generation its account retired, such as the placeholder a stopped
+    /// generation's card was restored as.
+    fn retired_card_id(&self, pane_id: &str) -> Option<String> {
+        let inbox = self.pane_inboxes.get(pane_id)?;
+        self.sessions
+            .values()
+            .filter(|s| {
+                s.pane_id.as_deref() == Some(pane_id)
+                    && s.agent_id
+                        .as_ref()
+                        .is_some_and(|agent| inbox.retired.contains(agent))
+            })
+            .max_by(|a, b| {
+                a.last_activity
+                    .cmp(&b.last_activity)
+                    .then_with(|| a.session_id.cmp(&b.session_id))
+            })
+            .map(|s| s.session_id.clone())
     }
 
     /// After an event for `pane_id`: a card the pane's inbox is not drawn on
@@ -9609,6 +9800,10 @@ impl AppState {
             return;
         }
         let Some(card_id) = self.inbox_card_id(pane_id) else {
+            // Q35-20e: a card a retired generation left, minted after the
+            // pane's current generation's held typing was learned, takes
+            // its row (`refresh_card_inbox`).
+            self.refresh_card_inbox(pane_id);
             return;
         };
         if self

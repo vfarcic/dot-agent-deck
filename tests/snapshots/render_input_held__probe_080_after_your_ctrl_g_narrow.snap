@@ -1,0 +1,12 @@
+---
+source: tests/render_input_held.rs
+expression: narrow
+---
+┌ 1 ClaudeCode · api-svc ────────────────────────────────── ● Idle ┐
+│Dir:  api-svc                                                     │
+│input held: the agent didn't open the editor for your Ctrl+G; you…│
+│                                                                  │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+└────────────────────────────────────────────── Last: 1h  Tools: 3 ┘

@@ -1044,6 +1044,12 @@ export interface AgentSession {
    */
   inputHeld?: InputHeldCause;
   /**
+   * HONEST. PRD #1666 part 3 (Q35-20e): typing the deck held for this pane's
+   * previous agent generation was discarded when it retired
+   * (`AgentRecord.input_discarded`). Absent while there is none to report.
+   */
+  inputDiscarded?: boolean;
+  /**
    * HONEST. PRD #1666 part 3 (Q35): the outcomes of this agent's recently held
    * answers that carried a client token (`SessionSnapshot.answer_settlements`).
    * The voice panel reads only the one naming its own token.

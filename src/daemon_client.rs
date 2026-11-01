@@ -2029,6 +2029,7 @@ impl DaemonClient {
                 .into_iter()
                 .map(|id| AgentRecord {
                     input_held: None,
+                    input_discarded: None,
                     id,
                     pane_id_env: None,
                     display_name: None,
@@ -8436,6 +8437,7 @@ start = true
         // string on this record with no scrub here at all.
         let mut rec = AgentRecord {
             input_held: None,
+            input_discarded: None,
             id: "9".into(),
             pane_id_env: None,
             display_name: Some(format!("de\x1bplo\u{202e}yer\0 {}", "\u{3bc}".repeat(400))),
@@ -8502,6 +8504,7 @@ start = true
         // agent is still real and lands on the dashboard.
         let mut rec = AgentRecord {
             input_held: None,
+            input_discarded: None,
             id: "7".into(),
             pane_id_env: None,
             display_name: None,
@@ -8527,6 +8530,7 @@ start = true
         // And a valid record round-trips untouched.
         let mut ok = AgentRecord {
             input_held: None,
+            input_discarded: None,
             id: "8".into(),
             pane_id_env: None,
             display_name: None,

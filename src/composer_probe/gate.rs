@@ -180,6 +180,11 @@ struct Inner<T> {
 pub struct Gate<T> {
     inner: Mutex<Inner<T>>,
     changed: Notify,
+    /// PRD #1666 part 3 (Q35-20e): told whenever what a card shows of this
+    /// gate may have changed: a hold starts, a full op starts waiting, or
+    /// anything a waiter waits for moves. Set once, by the registry that
+    /// publishes the generation ([`Self::watch_display`]).
+    display: std::sync::OnceLock<Arc<Notify>>,
 }
 
 impl<T> Default for Gate<T> {
@@ -194,6 +199,7 @@ impl<T> Default for Gate<T> {
                 version: 0,
             }),
             changed: Notify::new(),
+            display: std::sync::OnceLock::new(),
         }
     }
 }
@@ -206,6 +212,22 @@ impl<T> Gate<T> {
     fn moved(&self, inner: &mut Inner<T>) {
         inner.version = inner.version.wrapping_add(1);
         self.changed.notify_waiters();
+        self.display_changed();
+    }
+
+    /// PRD #1666 part 3 (Q35-20e): have `notify` told whenever what a card
+    /// shows of this gate may have changed. The first call wins: a
+    /// generation is published by one registry.
+    pub fn watch_display(&self, notify: Arc<Notify>) {
+        let _ = self.display.set(notify);
+    }
+
+    /// Tell the display watcher, if one is set. `notify_one` keeps a permit,
+    /// so a change made while the watcher is busy is seen on its next wait.
+    fn display_changed(&self) {
+        if let Some(notify) = self.display.get() {
+            notify.notify_one();
+        }
     }
 
     /// Close the fence at output offset `trigger`. `false` once retired; a
@@ -306,12 +328,16 @@ impl<T> Gate<T> {
             drop(waiter);
             return Admission::Refused(op);
         }
-        if fence.held.is_empty() {
+        let starts = fence.held.is_empty();
+        if starts {
             fence.since = Some(std::time::Instant::now());
         }
         fence.held_bytes += len;
         fence.held.push_back((op, len));
         drop(inner);
+        if starts {
+            self.display_changed();
+        }
         drop(waiter);
         Admission::Held
     }
@@ -320,6 +346,7 @@ impl<T> Gate<T> {
         let id = inner.next_waiter;
         inner.next_waiter = inner.next_waiter.wrapping_add(1);
         inner.waiters.push_back(id);
+        self.display_changed();
         Waiter {
             gate: Arc::clone(self),
             id,
@@ -635,19 +662,24 @@ impl<T> Gate<T> {
     /// The generation retired: from now on nothing is accepted, and what was
     /// held comes back, once, to be refused. Waiters are woken to see it.
     pub fn retire(&self) -> Vec<T> {
+        self.retire_counted().0
+    }
+
+    /// [`Self::retire`], with the bytes of what was held (Q35-20e: the
+    /// successor's card says typing was not delivered).
+    pub fn retire_counted(&self) -> (Vec<T>, usize) {
         let mut inner = self.lock();
         if inner.retired {
-            return Vec::new();
+            return (Vec::new(), 0);
         }
         inner.retired = true;
         inner.probe = None;
-        let held = inner
-            .fence
-            .take()
-            .map(|fence| fence.held.into_iter().map(|(op, _)| op).collect())
-            .unwrap_or_default();
+        let (held, bytes) = inner.fence.take().map_or((Vec::new(), 0), |fence| {
+            let bytes = fence.held_bytes;
+            (fence.held.into_iter().map(|(op, _)| op).collect(), bytes)
+        });
         self.moved(&mut inner);
-        held
+        (held, bytes)
     }
 
     pub fn retired(&self) -> bool {

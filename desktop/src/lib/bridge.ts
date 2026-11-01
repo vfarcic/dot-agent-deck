@@ -413,6 +413,12 @@ export interface DesktopAgentDto {
    */
   inputHeld?: { generation: number; cause: string; heldOps: number; heldBytes: number; sinceMs: number };
   /**
+   * PRD #1666 part 3 (Q35-20e): typing the deck held for this pane's previous
+   * agent generation was discarded when it retired
+   * (`AgentRecord.input_discarded`). Absent while there is none to report.
+   */
+  inputDiscarded?: boolean;
+  /**
    * PRD #1666 part 3 (Q35): the outcomes of this agent's recently held answers
    * that carried a client token (`SessionSnapshot.answer_settlements`).
    */
@@ -2715,6 +2721,7 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
       : {}),
     ...(agent.pendingQuestion ? { pendingQuestion: agent.pendingQuestion } : {}),
     ...(inputHeld ? { inputHeld } : {}),
+    ...(agent.inputDiscarded === true ? { inputDiscarded: true } : {}),
     ...(answerSettlements.length > 0 ? { answerSettlements } : {}),
     // PRD #1401 — the badge. Checked, not copied: see `pullRequestFromDto`.
     ...(pullRequest ? { pullRequest } : {}),

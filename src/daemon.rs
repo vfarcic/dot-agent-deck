@@ -1074,6 +1074,18 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         })
     };
 
+    // PRD #1666 part 3 (Q35-20e): unconditional — every attached client's
+    // card follows the typing the deck holds for its pane. Waits on the
+    // registry's display notice, so it runs no timer while nothing is held.
+    let input_held_handle = {
+        let registry = pty_registry.clone();
+        let monitor_event_tx = event_tx.clone();
+        tokio::spawn(crate::agent_pty::watch_input_held(
+            registry,
+            monitor_event_tx,
+        ))
+    };
+
     // PRD #1401: unconditional — every agent on a branch with a pull request
     // gets a badge, and this is the only place that answer comes from. It runs
     // `gh` only for a live session on a non-default branch of a GitHub
@@ -1119,6 +1131,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     }
     shell_activity_handle.abort();
     codex_rollout_handle.abort();
+    input_held_handle.abort();
     pull_request_handle.abort();
     scheduler_handle.abort();
     inbox_ticker.abort();

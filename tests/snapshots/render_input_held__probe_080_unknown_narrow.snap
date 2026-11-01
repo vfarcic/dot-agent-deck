@@ -1,0 +1,12 @@
+---
+source: tests/render_input_held.rs
+expression: narrow
+---
+┌ 1 ClaudeCode · api-svc ────────────────────────────────────────── ● Idle ┐
+│Dir:  api-svc                                                             │
+│input held: your typing is kept while the deck checks this input box      │
+│                                                                          │
+│                                                                          │
+│                                                                          │
+│                                                                          │
+└────────────────────────────────────────────────────── Last: 1h  Tools: 3 ┘

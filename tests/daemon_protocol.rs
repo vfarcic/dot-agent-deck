@@ -701,6 +701,7 @@ fn start_agent_round_trips_explicit_agent_type() {
 fn agent_record_round_trips_explicit_agent_type() {
     let rec = AgentRecord {
         input_held: None,
+        input_discarded: None,
         id: "11".into(),
         pane_id_env: Some("pid-11".into()),
         display_name: Some("coder".into()),
@@ -730,6 +731,7 @@ fn agent_record_round_trips_explicit_agent_type() {
 fn agent_record_omits_agent_type_when_none() {
     let rec = AgentRecord {
         input_held: None,
+        input_discarded: None,
         id: "12".into(),
         pane_id_env: None,
         display_name: None,
@@ -858,6 +860,7 @@ fn running_agents_summary_from_records_uses_display_name_then_id() {
     let records = vec![
         AgentRecord {
             input_held: None,
+            input_discarded: None,
             id: "7".into(),
             pane_id_env: None,
             display_name: Some("coder".into()),
@@ -877,6 +880,7 @@ fn running_agents_summary_from_records_uses_display_name_then_id() {
         },
         AgentRecord {
             input_held: None,
+            input_discarded: None,
             id: "9".into(),
             pane_id_env: None,
             display_name: None,

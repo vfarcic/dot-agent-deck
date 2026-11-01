@@ -1073,6 +1073,7 @@ mod tests {
     fn agent(id: &str, pane: Option<&str>, label: Option<&str>, cwd: Option<&str>) -> AgentRecord {
         AgentRecord {
             input_held: None,
+            input_discarded: None,
             id: id.to_string(),
             pane_id_env: pane.map(str::to_string),
             display_name: label.map(str::to_string),

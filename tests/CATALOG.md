@@ -10528,6 +10528,22 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** the writer thread, the pane writer or the tick calling any of this (Q35-20), or where Q35-20 closes the fence relative to the probe's submission; the real arm page's seqlock (`inbox/probe/007`); a real helper reading what is published.
 - **Platform coverage:** all.
 
+##### inbox/probe/080 — The card shows each held-typing cause and the not-delivered notice in the shared words, in both clients.
+
+- **Layer:** L1 (`tests/render_input_held.rs`, `TestBackend` + `insta`); desktop vitest (`desktop/src/components/InboxSurfaces.test.tsx`).
+- **Agent:** none.
+- **Asserts:** a card hydrated from a daemon record that holds typing and carries no live hook snapshot (U3-04) shows each of the seven causes' words from `tests/fixtures/inbox-display.json` (snapshots `probe_080_<cause>`); drawn just wider than each sentence's first clause, the card keeps that clause whole and cuts only after it (`probe_080_<cause>_narrow`); a live update that the hold ended clears the row (`probe_080_cleared`) and another shows it again; the successor card that took the pane shows `inputNotDelivered`, which starts with `notDelivered` and names typing (`probe_080_not_delivered`, `_narrow`), until an update ends it. The desktop tile shows the same words from `inputDiscarded`, a hold of its own replacing them, and clears them on the next snapshot.
+- **Does not assert:** that a running daemon sends any of these (`inbox/probe/046`); the voice panel's queued answer.
+- **Platform coverage:** all.
+
+##### inbox/probe/081 — Held typing on the TUI card is bound to the generation the daemon names, and hydrated from the record.
+
+- **Layer:** L1 (`tests/render_input_held.rs`, `AppState` only); desktop Rust units (`desktop/src-tauri/src/dto.rs`, `desktop/src-tauri/src/agent_view.rs`).
+- **Agent:** none.
+- **Asserts:** a successor's update that arrives before its inbox handover shows once the handover lands; the predecessor's late update changes nothing; a hold naming another generation than its update, and a not-delivered notice naming the generation it rides, show nothing; hydration reads `AgentRecord.input_held` / `input_discarded`, not the hook snapshot, and follows each new snapshot; after a reported generation's session ends and its card is restored as the pane's placeholder, a successor with no hook gets the not-delivered words on that card, whichever of the update and the handover comes first, and they move to the successor's own card once it reports; an update for a pane the client has let go of waits for the account the pane's surfacing gives, and shows only when it names the surfaced generation. Desktop: `map_agent` maps a record with no live snapshot to `inputHeld` and `inputDiscarded`, dropping a hold for another generation and a notice naming the record's own or a later one; a `BroadcastMsg::InputHeld` marks the agent list for a fetch.
+- **Does not assert:** the daemon's watcher (`inbox/probe/046`'s fast units) or the wire's older readers (rule 12's cross-version run).
+- **Platform coverage:** all.
+
 ##### inbox/probe/079 — The `e2e` build's composer controls reach the live generation they name, take effect there, and refuse anything else.
 
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_composer_controls.rs`, with `tests/support/live_segments.rs`): the real daemon, a native Claude stand-in with the reviewed F2 composer, and `e2e-composer-control`'s Q105b.2 operations (`src/e2e_controls.rs`, `src/daemon_protocol.rs`).
@@ -10679,6 +10695,8 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 ##### inbox/probe/046 — The attached real TUI displays and clears live held typing, then reports retirement loss.
 
 - **S-20c observation barrier:** the helper pauses before its decision until the attached card actually shows held typing. This replaces the 500 ms dispatch-delay window, which could finish before the TUI observed the held state. The strengthened row is RED in a quiet isolated run: keys are positively held while the attached card still shows no checking explanation; its clearing and retirement assertions await the coder's fix.
+
+- **Q35-20e live channel (coder):** the daemon's display watcher (`watch_input_held`, `src/agent_pty_segments.rs`) broadcasts `BroadcastMsg::InputHeld` when a pane's held-typing display changes; the attached TUI applies it per generation. In RWX the row's display and clearing halves pass; its second hold does not form there, because RWX's overlayfs temp base leaves the first check's read of the box unproven (RED 1), so the schedule waits for typing before the next check and `RETIRED-VISIBLE` is written straight through. A supported temp filesystem (GitHub's runners) is where the whole row runs. Fast units in the same file: `probe_046_the_display_timers_wake_at_300_ms_then_5_s` (the watcher wakes exactly at a hold's 300 ms mark, at least every 250 ms and by its 5 s mark while it shows, every second while a not-delivered notice shows, and never with nothing to show) and `probe_046_the_watcher_announces_only_what_a_card_shows_differently` (a first sighting showing nothing, counts moving under one cause, and an unchanged pass announce nothing; a hold, a cause change, its end, a successor's notice, a gone generation's clear and a predecessor's clear under a successor showing nothing are each announced once).
 
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_live_segments.rs`, `tests/support/live_segments.rs`).
 - **Agent:** native test executable with the reviewed F2 Python composer and real installed helper/editor; no real agent or credential.

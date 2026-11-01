@@ -458,7 +458,7 @@ export function AgentTile({
   ].filter((part): part is string => Boolean(part));
   const badge = inboxBadge(agent.inbox);
   const inboxNoticeRow = inboxNotice(agent.inbox);
-  const inputHeldRow = inputHeldText(agent.inputHeld);
+  const inputHeldRow = inputHeldText(agent.inputHeld, agent.inputDiscarded === true);
   const attention = agent.inbox?.attention ?? [];
 
   return (

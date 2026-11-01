@@ -104,6 +104,10 @@ pub const INPUT_HELD_CHECK_BLOCKED: &str =
 /// [`InputHeldCause::Unknown`]'s words: a cause a newer deck names.
 pub const INPUT_HELD_UNKNOWN: &str =
     "input held: your typing is kept while the deck checks this input box";
+/// PRD #1666 part 3 (Q35-20e, Q104b): the successor's card, when the
+/// generation it replaced still held typing as it retired
+/// ([`InputDiscarded`]). Its first clause stands alone where a card cuts it.
+pub const INPUT_NOT_DELIVERED: &str = "not delivered: your held typing; restarting the agent discarded it. Type it again if you still need it.";
 
 /// PRD #1666 part 3, round 5-wake (Q6): the deck-wide attention item names a
 /// held orchestrator and counts the other held recipients after it
@@ -787,6 +791,23 @@ pub struct InputHeld {
     pub since_ms: u64,
 }
 
+/// PRD #1666 part 3 (Q35-20e, Q104b): the typing the deck held for a pane's
+/// previous agent generation when that generation retired, which never
+/// reached it. Carried on the pane's later generation, whose card says so
+/// ([`INPUT_NOT_DELIVERED`]); bound to the retired `generation`, so it never
+/// shows on that generation's own card. Additive: an older client ignores it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InputDiscarded {
+    /// The retired generation that held it.
+    pub generation: u64,
+    /// Writes discarded.
+    pub held_ops: u32,
+    /// Bytes discarded.
+    pub held_bytes: u32,
+    /// When it retired, in milliseconds since the Unix epoch.
+    pub at_ms: u64,
+}
+
 /// Why an [`InputHeld`] holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -882,6 +903,9 @@ pub const CARD_INBOX_HOLD_DETAIL_METADATA_KEY: &str = "inbox_card_hold_detail";
 /// Beside [`CARD_INBOX_METADATA_KEY`]: [`CardInbox::input_held`], its wire
 /// value.
 pub const CARD_INBOX_INPUT_HELD_METADATA_KEY: &str = "inbox_card_input_held";
+/// Beside [`CARD_INBOX_METADATA_KEY`]: present when
+/// [`CardInbox::input_discarded`] is set.
+pub const CARD_INBOX_INPUT_DISCARDED_METADATA_KEY: &str = "inbox_card_input_discarded";
 
 /// What a card shows of its agent's inbox.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -922,6 +946,9 @@ pub struct CardInbox {
     /// PRD #1666 part 3 (Q35): why the deck holds what the user typed into
     /// the agent's pane, from the daemon's last snapshot of it.
     pub input_held: Option<InputHeldCause>,
+    /// PRD #1666 part 3 (Q35-20e): typing the pane's previous generation held
+    /// was discarded when it retired ([`InputDiscarded`]).
+    pub input_discarded: bool,
 }
 
 impl CardInbox {
@@ -1037,9 +1064,12 @@ impl CardInbox {
 
     /// PRD #1666 part 3 (Q35, core §7): the row saying the deck holds what
     /// the user typed, and why ([`InputHeldCause::words`]), whatever else the
-    /// card shows.
+    /// card shows; with nothing held, that the previous generation's held
+    /// typing was not delivered ([`INPUT_NOT_DELIVERED`], Q35-20e).
     pub fn input_held_text(&self) -> Option<&'static str> {
-        self.input_held.map(InputHeldCause::words)
+        self.input_held
+            .map(InputHeldCause::words)
+            .or(self.input_discarded.then_some(INPUT_NOT_DELIVERED))
     }
 
     /// PRD #1666 part 3, round 5-wake (Q6): the words the deck-wide attention
@@ -1301,6 +1331,21 @@ mod tests {
         assert_eq!(held.full_text(), None);
         assert_eq!(held.notice_text(), None);
         assert_eq!(CardInbox::default().input_held_text(), None);
+        // Q35-20e: the predecessor's discarded typing, until the successor
+        // holds typing of its own.
+        let discarded = CardInbox {
+            input_discarded: true,
+            ..CardInbox::default()
+        };
+        assert_eq!(discarded.input_held_text(), Some(INPUT_NOT_DELIVERED));
+        assert_eq!(
+            CardInbox {
+                input_held: Some(InputHeldCause::Checking),
+                ..discarded
+            }
+            .input_held_text(),
+            Some(INPUT_HELD_CHECKING)
+        );
     }
 
     /// The overdue notice names the new holds too, and nothing for one this
@@ -1494,6 +1539,7 @@ mod tests {
             words["inputHeld"].as_object().map(|causes| causes.len()),
             Some(7)
         );
+        assert_eq!(words["inputNotDelivered"], INPUT_NOT_DELIVERED);
         assert_eq!(words["cannotCheckDetail"], CANNOT_CHECK_DETAIL);
         assert_eq!(words["holdPathUnnamed"], HOLD_PATH_UNNAMED);
         assert_eq!(words["holdFilesystemUnnamed"], HOLD_FILESYSTEM_UNNAMED);

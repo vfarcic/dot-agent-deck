@@ -1246,6 +1246,200 @@ impl AgentPtyRegistry {
             since_ms,
         })
     }
+
+    /// PRD #1666 part 3 (Q35-20e): every pane's current generation — the one
+    /// its pane hasn't handed over — with what its card shows of held typing,
+    /// and when the next timer may change that ([`HeldDisplayPass`]).
+    pub(crate) fn held_display_pass(&self, now: Instant) -> HeldDisplayPass {
+        // The gates are read after the registry's lock is let go, as
+        // `input_held` reads them.
+        let current: Vec<(String, String, Arc<PaneGate>)> = {
+            let inner = self.inner.lock();
+            inner
+                .agents
+                .iter()
+                .filter(|(_, agent)| !agent.pane_retired.load(Ordering::SeqCst))
+                .filter_map(|(id, agent)| {
+                    agent
+                        .pane_id_env
+                        .clone()
+                        .map(|pane| (pane, id.clone(), Arc::clone(&agent.gate)))
+                })
+                .collect()
+        };
+        let mut pass = HeldDisplayPass::default();
+        for (pane, agent_id, gate) in current {
+            let since = gate.held_status().held_since;
+            let held = self.input_held(&agent_id);
+            let discarded = self.input_discarded(&agent_id);
+            let wake = held_wake(now, since, held.is_some(), discarded.is_some());
+            pass.next = match (pass.next, wake) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            pass.panes.push(crate::event::InputHeldUpdate {
+                pane_id: pane,
+                agent_id,
+                input_held: held,
+                input_discarded: discarded,
+            });
+        }
+        pass
+    }
+}
+
+/// PRD #1666 part 3 (Q35-20e): when a timer may next change what a card
+/// shows of a generation's held typing, held since `since` (`None` while
+/// nothing is), with a hold `shown` and a not-delivered notice `discarded` on
+/// it as of `now`: when a hold reaches [`HELD_SHOWN_AFTER`], then
+/// [`HELD_EXPLAINED_AFTER`], with [`HELD_DISPLAY_POLL`] while it shows and
+/// [`DISCARDED_DISPLAY_POLL`] while the notice does. `None` when only a gate's
+/// move can change it.
+fn held_wake(
+    now: Instant,
+    since: Option<Instant>,
+    shown: bool,
+    discarded: bool,
+) -> Option<Instant> {
+    let age = since.map(|since| (since, now.saturating_duration_since(since)));
+    match age {
+        Some((since, age)) if !shown && age < HELD_SHOWN_AFTER => Some(since + HELD_SHOWN_AFTER),
+        Some((since, age)) if shown && age < HELD_EXPLAINED_AFTER => {
+            Some((since + HELD_EXPLAINED_AFTER).min(now + HELD_DISPLAY_POLL))
+        }
+        // The check's stage moves the cause without moving the gate.
+        _ if shown => Some(now + HELD_DISPLAY_POLL),
+        // A keystroke reaching the pane ends the notice.
+        _ if discarded => Some(now + DISCARDED_DISPLAY_POLL),
+        _ => None,
+    }
+}
+
+/// While a hold shows, how often its cause is read again: the check's stage
+/// can change it without the gate moving.
+const HELD_DISPLAY_POLL: Duration = Duration::from_millis(250);
+
+/// While a not-delivered notice shows, how often the pane is checked for a
+/// keystroke that ends it.
+const DISCARDED_DISPLAY_POLL: Duration = Duration::from_secs(1);
+
+/// PRD #1666 part 3 (Q35-20e): one read of what every pane's card shows of
+/// held typing ([`AgentPtyRegistry::held_display_pass`]).
+#[derive(Debug, Default)]
+pub(crate) struct HeldDisplayPass {
+    /// Each pane's current generation and what its card shows.
+    pub(crate) panes: Vec<crate::event::InputHeldUpdate>,
+    /// When a timer may next change what a card shows; `None` when only a
+    /// gate's move can ([`AgentPtyRegistry::held_display`]).
+    pub(crate) next: Option<Instant>,
+}
+
+/// PRD #1666 part 3 (Q35-20e): what a client was last told of a pane's held
+/// typing, by the pane.
+#[derive(Debug, Default)]
+pub(crate) struct HeldDisplayShown(HashMap<String, ShownHeld>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShownHeld {
+    agent_id: String,
+    cause: Option<crate::inbox_display::InputHeldCause>,
+    discarded: Option<u64>,
+}
+
+impl ShownHeld {
+    fn of(update: &crate::event::InputHeldUpdate) -> Self {
+        Self {
+            agent_id: update.agent_id.clone(),
+            cause: update.input_held.as_ref().map(|held| held.cause),
+            discarded: update.input_discarded.as_ref().map(|d| d.generation),
+        }
+    }
+
+    fn shows(&self) -> bool {
+        self.cause.is_some() || self.discarded.is_some()
+    }
+}
+
+impl HeldDisplayShown {
+    /// The updates `pass` owes clients: a pane whose card now shows
+    /// something else, and a pane that showed something and has no current
+    /// generation now (its last one's, cleared). A generation first seen
+    /// showing nothing owes nothing.
+    pub(crate) fn changes(&mut self, pass: HeldDisplayPass) -> Vec<crate::event::InputHeldUpdate> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for update in pass.panes {
+            let now = ShownHeld::of(&update);
+            seen.insert(update.pane_id.clone());
+            let before = self.0.insert(update.pane_id.clone(), now.clone());
+            match before {
+                Some(before) if before == now => {}
+                Some(before) if !now.shows() && before.shows() => {
+                    out.push(crate::event::InputHeldUpdate {
+                        pane_id: update.pane_id.clone(),
+                        agent_id: before.agent_id.clone(),
+                        input_held: None,
+                        input_discarded: None,
+                    });
+                    if before.agent_id != now.agent_id {
+                        out.push(update);
+                    }
+                }
+                None if !now.shows() => {}
+                _ => out.push(update),
+            }
+        }
+        self.0.retain(|pane, before| {
+            if seen.contains(pane) {
+                return true;
+            }
+            if before.shows() {
+                out.push(crate::event::InputHeldUpdate {
+                    pane_id: pane.clone(),
+                    agent_id: before.agent_id.clone(),
+                    input_held: None,
+                    input_discarded: None,
+                });
+            }
+            false
+        });
+        out
+    }
+}
+
+/// PRD #1666 part 3 (Q35-20e): tell attached clients, through `event_tx`,
+/// whenever what a pane's card shows of the typing the deck holds changes:
+/// when a hold has lasted [`HELD_SHOWN_AFTER`], when its cause changes
+/// ([`HELD_EXPLAINED_AFTER`], the queue filling, the check moving), when it
+/// ends, and when a generation retired holding typing its successor's card
+/// reports. Waits on the registry's display notice while no timer is due, so
+/// a deck holding nothing runs no timer. Display only: it releases nothing.
+pub async fn watch_input_held(
+    registry: Arc<AgentPtyRegistry>,
+    event_tx: tokio::sync::broadcast::Sender<crate::event::BroadcastMsg>,
+) {
+    let notify = registry.held_display();
+    let mut shown = HeldDisplayShown::default();
+    loop {
+        // Before the pass, so a change made during it leaves a permit.
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let pass = registry.held_display_pass(Instant::now());
+        let next = pass.next;
+        for update in shown.changes(pass) {
+            let _ = event_tx.send(crate::event::BroadcastMsg::InputHeld(update));
+        }
+        match next {
+            Some(at) => {
+                tokio::select! {
+                    () = &mut notified => {}
+                    () = tokio::time::sleep_until(at.into()) => {}
+                }
+            }
+            None => notified.await,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1811,6 +2005,123 @@ mod tests {
         assert_eq!(
             held_cause(0, late, Some(&view(Kind::HumanG, Stage::Matched))),
             InputHeldCause::AfterYourCtrlG
+        );
+    }
+
+    /// Scenario: Ask when the display watcher must next read a pane's held typing, as a hold ages and while a not-delivered notice shows. A new hold wakes it exactly when the hold reaches 300 ms; a shown hold is read again at least every 250 ms and no later than its 5 s mark; past 5 s it keeps that pace; a not-delivered notice is checked every second; with nothing held and nothing shown no timer runs.
+    #[spec("inbox/probe/046")]
+    #[test]
+    fn probe_046_the_display_timers_wake_at_300_ms_then_5_s() {
+        let since = Instant::now();
+        let at = |ms: u64| since + Duration::from_millis(ms);
+        assert_eq!(held_wake(at(0), Some(since), false, false), Some(at(300)));
+        assert_eq!(held_wake(at(299), Some(since), false, false), Some(at(300)));
+        assert_eq!(held_wake(at(300), Some(since), true, false), Some(at(550)));
+        assert_eq!(
+            held_wake(at(4_900), Some(since), true, false),
+            Some(at(5_000))
+        );
+        assert_eq!(
+            held_wake(at(6_000), Some(since), true, false),
+            Some(at(6_250))
+        );
+        assert_eq!(held_wake(at(10), None, false, true), Some(at(1_010)));
+        assert_eq!(held_wake(at(10), None, false, false), None);
+        // A hold the card never shows (no numbered generation) runs no timer
+        // once past its mark.
+        assert_eq!(held_wake(at(400), Some(since), false, false), None);
+    }
+
+    fn update(
+        pane: &str,
+        agent: &str,
+        cause: Option<InputHeldCause>,
+        discarded: Option<u64>,
+    ) -> crate::event::InputHeldUpdate {
+        crate::event::InputHeldUpdate {
+            pane_id: pane.into(),
+            agent_id: agent.into(),
+            input_held: cause.map(|cause| crate::inbox_display::InputHeld {
+                generation: agent.parse().unwrap(),
+                cause,
+                held_ops: 1,
+                held_bytes: 3,
+                since_ms: 7,
+            }),
+            input_discarded: discarded.map(|generation| crate::inbox_display::InputDiscarded {
+                generation,
+                held_ops: 1,
+                held_bytes: 3,
+                at_ms: 9,
+            }),
+        }
+    }
+
+    fn pass(panes: Vec<crate::event::InputHeldUpdate>) -> HeldDisplayPass {
+        HeldDisplayPass { panes, next: None }
+    }
+
+    /// Scenario: Feed the display watcher's change detector a sequence of passes over two panes. A generation first seen holding nothing is not announced; a hold, a change of cause and its end are each announced once; counts that move under the same cause are not; a pane whose generation is gone is cleared under that generation; a successor that shows nothing clears its predecessor's hold, and a successor carrying the not-delivered notice is announced.
+    #[spec("inbox/probe/046")]
+    #[test]
+    fn probe_046_the_watcher_announces_only_what_a_card_shows_differently() {
+        let mut shown = HeldDisplayShown::default();
+        assert!(
+            shown
+                .changes(pass(vec![
+                    update("p", "7", None, None),
+                    update("q", "8", None, None)
+                ]))
+                .is_empty()
+        );
+        let checking = update("p", "7", Some(InputHeldCause::Checking), None);
+        assert_eq!(
+            shown.changes(pass(vec![checking.clone(), update("q", "8", None, None)])),
+            vec![checking.clone()]
+        );
+        let mut more = checking.clone();
+        more.input_held.as_mut().unwrap().held_ops = 4;
+        assert!(
+            shown
+                .changes(pass(vec![more, update("q", "8", None, None)]))
+                .is_empty()
+        );
+        let explained = update("p", "7", Some(InputHeldCause::CheckNotReturned), None);
+        assert_eq!(
+            shown.changes(pass(vec![explained.clone(), update("q", "8", None, None)])),
+            vec![explained]
+        );
+        // The pane's generation retires holding typing; its successor
+        // carries the notice.
+        let successor = update("p", "9", None, Some(7));
+        assert_eq!(
+            shown.changes(pass(vec![successor.clone(), update("q", "8", None, None)])),
+            vec![successor]
+        );
+        // A keystroke ends the notice.
+        assert_eq!(
+            shown.changes(pass(vec![
+                update("p", "9", None, None),
+                update("q", "8", None, None)
+            ])),
+            vec![update("p", "9", None, None)]
+        );
+        // A hold on a pane whose generation then leaves is cleared under it.
+        let held = update("q", "8", Some(InputHeldCause::QueueFull), None);
+        assert_eq!(
+            shown.changes(pass(vec![update("p", "9", None, None), held.clone()])),
+            vec![held]
+        );
+        assert_eq!(
+            shown.changes(pass(vec![update("p", "9", None, None)])),
+            vec![update("q", "8", None, None)]
+        );
+        // A successor showing nothing clears its predecessor's hold.
+        let held = update("p", "9", Some(InputHeldCause::Checking), None);
+        assert_eq!(shown.changes(pass(vec![held.clone()])), vec![held]);
+        assert_eq!(
+            shown.changes(pass(vec![update("p", "10", None, None)])),
+            vec![update("p", "9", None, None), update("p", "10", None, None)]
         );
     }
 }

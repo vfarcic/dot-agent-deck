@@ -9219,6 +9219,11 @@ async fn handle_subscribe_events_with_snapshot(
     .await
     .map_err(io::Error::other)?;
     crate::agent_pty::attach_cli_names(&mut records);
+    // PRD #1666 part 3 (Q35-20e): held typing, so a client attaching while
+    // typing is held shows it at once. Read after the receiver opened: a
+    // change the watcher broadcast before this read is in the reply as well,
+    // and one it found stale is corrected by its next broadcast.
+    crate::agent_pty::attach_input_held(registry, &mut records);
     let mut resp = AttachResponse::agent_records(records);
     // Issue #1637: read under the same guard as the receiver, so a notice
     // change is either in this reply or on the stream.
@@ -12190,6 +12195,7 @@ mod tests {
             authoring_kind: None,
             inbox: None,
             input_held: None,
+            input_discarded: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: AgentRecord = serde_json::from_str(&json).unwrap();
@@ -12216,6 +12222,7 @@ mod tests {
             authoring_kind: None,
             inbox: None,
             input_held: None,
+            input_discarded: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
@@ -12373,6 +12380,7 @@ mod tests {
         // (b) An AgentRecord carrying a live snapshot round-trips with live == Some.
         let rec = AgentRecord {
             input_held: None,
+            input_discarded: None,
             id: "9".into(),
             pane_id_env: Some("pane-9".into()),
             display_name: None,
@@ -12779,6 +12787,7 @@ mod tests {
             authoring_kind: None,
             inbox: None,
             input_held: None,
+            input_discarded: None,
         };
         let value: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).expect("serializes"))

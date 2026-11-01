@@ -1,0 +1,12 @@
+---
+source: tests/render_input_held.rs
+expression: wide
+---
+┌ 1 ClaudeCode · api-svc ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── ● Idle ┐
+│Dir:  api-svc                                                                                                                                                 │
+│input held: the deck is checking the input box; your typing will appear in a moment                                                                           │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── Last: 1h  Tools: 3 ┘

@@ -1,0 +1,12 @@
+---
+source: tests/render_input_held.rs
+expression: narrow
+---
+┌ 1 ClaudeCode · api-svc ───── ● Idle ┐
+│Dir:  api-svc                        │
+│not delivered: your held typing; res…│
+│                                     │
+│                                     │
+│                                     │
+│                                     │
+└───────────────── Last: 1h  Tools: 3 ┘

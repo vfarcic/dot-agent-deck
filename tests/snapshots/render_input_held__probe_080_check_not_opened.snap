@@ -1,0 +1,12 @@
+---
+source: tests/render_input_held.rs
+expression: wide
+---
+┌ 1 ClaudeCode · api-svc ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── ● Idle ┐
+│Dir:  api-svc                                                                                                                                                 │
+│input held: the agent hasn't opened the deck's check yet; your typing is kept until it does. Restarting the agent discards it.                                │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── Last: 1h  Tools: 3 ┘

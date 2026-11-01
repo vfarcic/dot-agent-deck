@@ -3116,6 +3116,22 @@ pub enum BroadcastMsg {
     /// client ever received it.
     #[serde(rename = "hook_binary_notice")]
     HookBinaryNotice(crate::hook_binary::HookBinaryNotices),
+    /// PRD #1666 part 3 (Q35-20e): what a pane's card says of the typing the
+    /// deck holds for its current agent generation changed — a hold began
+    /// showing (300 ms after it began), its cause changed (5 s after it
+    /// began, or as the check moved), it ended, or the generation took the pane
+    /// from one whose held typing was discarded. Carries the whole state,
+    /// which replaces what a client holds for that generation, so a lost or
+    /// stale one is corrected by the next.
+    ///
+    /// No [`crate::daemon_protocol::PROTOCOL_VERSION`] bump, for
+    /// [`Self::HookBinaryNotice`]'s and [`Self::InboxHandover`]'s reason: every
+    /// client that can attach to this protocol version reads an unknown kind
+    /// as [`Self::Unknown`]. A TUI that predates it ignores it; a desktop that
+    /// predates it re-reads its agent list, which carries
+    /// [`crate::agent_pty::AgentRecord::input_held`] it does not read either.
+    #[serde(rename = "input_held")]
+    InputHeld(InputHeldUpdate),
     /// A `kind` tag this build has never heard of (issue #801 item 3, applied
     /// by PRD #741 M8).
     ///
@@ -3164,6 +3180,24 @@ pub enum BroadcastMsg {
     /// makes the NEXT `BroadcastMsg` variant additive.
     #[serde(other)]
     Unknown,
+}
+
+/// PRD #1666 part 3 (Q35-20e): the payload of [`BroadcastMsg::InputHeld`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InputHeldUpdate {
+    /// The pane whose card it is.
+    pub pane_id: String,
+    /// The agent generation it is about: a client that has moved the pane's
+    /// account past it ignores it.
+    pub agent_id: String,
+    /// The typing the deck holds for that generation, once it shows; absent
+    /// when nothing is shown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_held: Option<crate::inbox_display::InputHeld>,
+    /// Typing the pane's previous generation held was discarded when it
+    /// retired; absent once a person's keystroke reached the pane after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_discarded: Option<crate::inbox_display::InputDiscarded>,
 }
 
 /// PRD #1666 §2.8: the payload of [`BroadcastMsg::InboxHandover`].

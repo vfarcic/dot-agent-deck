@@ -26,6 +26,7 @@
     "check_blocked": "waiting: the deck can't check this input box until you press Ctrl+G",
     "unknown": "input held: your typing is kept while the deck checks this input box"
   },
+  "inputNotDelivered": "not delivered: your held typing; restarting the agent discarded it. Type it again if you still need it.",
   "cannotCheckDetail": "waiting: the deck can't check this agent's input box: {cause}. {remedy}",
   "holdCauses": {
     "filesystem": "{path} is on {filesystem}, which the check doesn't support",
