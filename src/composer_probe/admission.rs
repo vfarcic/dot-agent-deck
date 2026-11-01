@@ -225,17 +225,20 @@ pub fn o5(estimate: Option<Instant>, now: Instant) -> Result<(), Refusal> {
 mod tests {
     use super::*;
     use crate::composer_probe::epoch::{GenerationInput, OutputNote};
+    use crate::composer_probe::paste_mode::OutputHook;
     use crate::composer_probe::planner::{Physical, PhysicalTracker};
     use crate::composer_probe::query_ledger::{
         CprWaitEnd, EntryView, LEDGER_SLOTS, QueryKind, T_TRIGGER,
     };
     use crate::composer_probe::record::{
-        Attribution, Cause, Channel, Completion, Decision, EcPolicy, NotOwned, Observation,
-        RecordKey, Records, ScopeState,
+        Attribution, Cause, Channel, Decision, EcPolicy, NotOwned, Observation, RecordKey, Records,
+        ScopeState,
     };
+    use crate::composer_probe::stamp_park::{StampPoint, park_at};
     use crate::composer_probe::{InertCause, Permission};
     use crate::doorbell_screen::CODEX_PROFILE;
     use spec::spec;
+    use std::sync::Arc;
     use std::time::Duration;
 
     const G: u64 = 7;
@@ -725,115 +728,88 @@ mod tests {
         );
     }
 
-    /// Run `feed` on its own thread with a stamp it takes first, paused
-    /// between taking the stamp and entering the generation's lock until
-    /// `race` has run on this thread (Q84-3): the schedule of a feeder whose
-    /// timestamp was taken before a racing caller's, which enters first.
-    fn feeder_paused_after_its_stamp(
-        input: &std::sync::Arc<GenerationInput>,
-        stamp: Instant,
-        feed: impl FnOnce(&GenerationInput, Instant) + Send + 'static,
+    /// The real output hook for `input`, fed `push` on its own thread and
+    /// parked once at `point` while `race` runs on this thread (Q84-3).
+    fn hook_parked_at(
+        input: &Arc<GenerationInput>,
+        point: StampPoint,
+        push: &'static [u8],
         race: impl FnOnce(&GenerationInput),
     ) {
-        let (stamped, wait_stamp) = std::sync::mpsc::channel();
-        let (go, wait_go) = std::sync::mpsc::channel::<()>();
+        let (park, reached, go) = park_at(&[point]);
+        input.park_feeder_for_test(park);
         let feeder = {
-            let input = std::sync::Arc::clone(input);
-            std::thread::spawn(move || {
-                // The stamp is published before the lock is taken.
-                stamped.send(stamp).unwrap();
-                wait_go.recv().unwrap();
-                feed(&input, stamp);
-            })
+            let mut hook = OutputHook::new(Arc::clone(input));
+            std::thread::spawn(move || hook.on_output(push))
         };
-        assert_eq!(wait_stamp.recv().unwrap(), stamp);
+        assert_eq!(reached.recv_timeout(Duration::from_secs(5)), Ok(point));
         race(input);
         go.send(()).unwrap();
         feeder.join().unwrap();
     }
 
-    /// Scenario: With a helper's record pending while its attribution is unknown, accept a native Ctrl+G, then let the record feeder take its stamp for the IPC observation that names the helper a tool's, and pause it there while admission reads the hazard FIFO four seconds later; release the feeder with its earlier stamp. The record stops being required, and the quiet clock resumes from the later read, not the feeder's stamp, so the entry stays through ten seconds of quiet time and leaves only after them; a feeder that resumed from its own stamp would count the paused interval and let the entry leave early.
+    /// Scenario: Feed a Codex-profiled generation's real output hook one push holding a cursor position query and a bracketed-paste off, parking it once after the push's offset advanced and once after its notes were handed over. At the first park the offset counts the push and nothing is noted; at the second the query already holds `B`; the redraw estimate the query started shows the hook's stamp was taken after the first park, not before the offset moved.
     #[spec("inbox/probe/052")]
     #[test]
-    fn probe_052_a_feeders_early_stamp_resumes_the_quiet_clock_no_earlier_than_a_racing_read() {
-        let t0 = Instant::now();
-        let at = |s: u64| t0 + Duration::from_secs(s);
-        let input = std::sync::Arc::new(generation());
-        let key = RecordKey { pid: 42, start: 1 };
-        let scanned = Observation {
-            channel: Channel::Scan,
-            decision: None,
-            ..ipc(42, Attribution::Pending, Decision::Tool, t0)
+    fn probe_052_the_output_hook_stamps_after_its_offset_and_notes_before_its_markers() {
+        const PUSH: &[u8] = b"\x1b[6n\x1b[?2004l";
+        let redraw = &CODEX_PROFILE.redraw;
+        let input = Arc::new(GenerationInput::profiled(
+            CprWaitEnd::SyncBegin,
+            Some(redraw),
+            Instant::now(),
+        ));
+        let (park, reached, go) = park_at(&[StampPoint::OutputAdvanced, StampPoint::OutputNoted]);
+        input.park_feeder_for_test(park);
+        let feeder = {
+            let mut hook = OutputHook::new(Arc::clone(&input));
+            std::thread::spawn(move || hook.on_output(PUSH))
         };
-        input.record_observe(&scanned, t0).unwrap();
-        assert!(
-            input
-                .record(key)
-                .is_some_and(|r| r.completion == Completion::Pending)
-        );
-        let seq = input.accept_native(t0).unwrap();
-        assert_eq!(
-            input.hazards(at(1)).0,
-            vec![EntryView::Quiet { seq, paused: true }],
-            "the clock is paused while the record is pending"
-        );
+        let bound = Duration::from_secs(5);
 
-        // The feeder's stamp, at 5 s, is taken before admission's read at
-        // 9 s, which enters the lock first.
-        let tool = ipc(
-            42,
-            Attribution::NotOwned(NotOwned::Tool),
-            Decision::Tool,
-            t0,
-        );
-        feeder_paused_after_its_stamp(
-            &input,
-            at(5),
-            move |input, stamp| {
-                input.record_observe(&tool, stamp).unwrap();
-            },
-            |input| assert!(!input.hazards_clear(at(9))),
-        );
-        assert!(
-            input
-                .record(key)
-                .is_some_and(|r| r.completion == Completion::NotRequired),
-            "a tool's record isn't required, so the clock runs again"
-        );
+        assert_eq!(reached.recv_timeout(bound), Ok(StampPoint::OutputAdvanced));
+        assert_eq!(input.output_offset(), PUSH.len() as u64, "the offset moved");
+        assert!(!input.backlog(), "nothing noted yet");
+        let advanced = Instant::now();
+        std::thread::sleep(Duration::from_millis(2));
+        go.send(()).unwrap();
 
-        // Resumed at 9 s: ten seconds of quiet time are reached at 19 s, and
-        // the tie still counts as quiet.
-        assert_eq!(
-            input.hazards(at(18)).0,
-            vec![EntryView::Quiet { seq, paused: false }],
-            "the paused interval between the feeder's stamp and the read isn't counted"
+        assert_eq!(reached.recv_timeout(bound), Ok(StampPoint::OutputNoted));
+        assert!(
+            input.backlog(),
+            "the push's query is noted before its return markers are handed over"
         );
-        assert!(!input.hazards_clear(at(19)), "the tie goes to the hazard");
-        assert!(input.hazards_clear(at(20)));
+        go.send(()).unwrap();
+        feeder.join().unwrap();
+
+        let estimate = input.query_wait_estimate().expect("the query's wait");
+        let stamp = estimate - redraw.margin - redraw.per_size_change;
+        assert!(
+            stamp >= advanced,
+            "the stamp ({stamp:?}) is taken after the offset moved ({advanced:?})"
+        );
     }
 
-    /// Scenario: Accept a native Ctrl+G on a running quiet clock, then let the output hook take its stamp for a CPR query at four seconds and pause it there while admission reads the hazard FIFO at nine; release the hook with its earlier stamp. The hook's latch lands at the later read's time, before the entry's ten quiet seconds, so the entry latches and admission is refused long after; a stamp taken earlier can't reach back past what a racing read already let leave, which the second history shows: a hook stamped before the entry's quiet period ended, entering after a read past it, finds nothing to latch.
+    /// Scenario: Accept a native Ctrl+G on a running quiet clock, then feed the real output hook a cursor position query and park it after it took its stamp while admission reads the hazard FIFO nine seconds after the acceptance; release the hook with its earlier stamp. The latch lands at the later read's time, before the entry's ten quiet seconds, so the entry is latched long after; in a second history the read comes eleven seconds after the acceptance, the entry has left, and the released hook finds nothing to latch.
     #[spec("inbox/probe/052")]
     #[test]
     fn probe_052_a_hooks_early_stamp_latches_at_the_racing_reads_time() {
+        const CPR: &[u8] = b"\x1b[6n";
         let t0 = Instant::now();
         let at = |s: u64| t0 + Duration::from_secs(s);
-        let cpr = |input: &GenerationInput, stamp: Instant| {
-            input.on_output(&[OutputNote::Query(QueryKind::Cpr)], stamp);
-        };
 
-        let input = std::sync::Arc::new(GenerationInput::new(CprWaitEnd::Counted));
+        let input = Arc::new(GenerationInput::new(CprWaitEnd::Counted));
         let seq = input.accept_native(t0).unwrap();
-        feeder_paused_after_its_stamp(&input, at(4), cpr, |input| {
+        hook_parked_at(&input, StampPoint::OutputStamped, CPR, |input| {
             assert!(!input.hazards_clear(at(9)));
         });
         assert!(input.backlog());
         assert_eq!(input.hazards(at(100)).0, vec![EntryView::Latched { seq }]);
         assert!(!input.hazards_clear(at(100)));
 
-        let late = std::sync::Arc::new(GenerationInput::new(CprWaitEnd::Counted));
+        let late = Arc::new(GenerationInput::new(CprWaitEnd::Counted));
         late.accept_native(t0).unwrap();
-        feeder_paused_after_its_stamp(&late, at(9), cpr, |input| {
+        hook_parked_at(&late, StampPoint::OutputStamped, CPR, |input| {
             assert!(
                 input.hazards_clear(at(11)),
                 "the entry's quiet period ended"

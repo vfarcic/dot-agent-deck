@@ -900,6 +900,10 @@ pub struct GenerationInput {
     /// test set it; a release build has no field and reads the wall clock.
     #[cfg(test)]
     step_clock: std::sync::Mutex<Option<Instant>>,
+    /// Test seam (Q84-3): where the output hook parks between taking its
+    /// stamp and publishing it ([`Self::park_feeder_for_test`]).
+    #[cfg(test)]
+    stamp_park: super::stamp_park::StampPark,
     /// The test and `e2e` builds' writer-thread controls (Q105b.2): a hold
     /// and a fault plan, reached without the pane writer's lock.
     #[cfg(any(test, feature = "e2e"))]
@@ -979,6 +983,8 @@ impl GenerationInput {
             accept_park: std::sync::Mutex::new(None),
             #[cfg(test)]
             step_clock: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            stamp_park: Default::default(),
             #[cfg(any(test, feature = "e2e"))]
             writer_e2e: Arc::default(),
         }
@@ -994,6 +1000,22 @@ impl GenerationInput {
     /// that push's notes, so a query is noted at the end of its push.
     pub fn advance_output(&self, len: usize) {
         self.output_offset.fetch_add(len as u64, Ordering::SeqCst);
+    }
+
+    /// Test seam (Q84-3): park the output hook at each
+    /// [`StampPoint`](super::stamp_park::StampPoint) it reaches.
+    #[cfg(test)]
+    pub(crate) fn park_feeder_for_test(
+        &self,
+        park: impl Fn(super::stamp_park::StampPoint) + Send + Sync + 'static,
+    ) {
+        self.stamp_park.set(park);
+    }
+
+    /// The output hook's side of [`Self::park_feeder_for_test`].
+    #[cfg(test)]
+    pub(crate) fn feeder_at(&self, point: super::stamp_park::StampPoint) {
+        self.stamp_park.at(point);
     }
 
     /// The output offset as of now: a fence closed now has this trigger,

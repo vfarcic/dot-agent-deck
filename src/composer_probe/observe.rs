@@ -1429,6 +1429,10 @@ mod linux {
         /// with no lock held.
         #[cfg(test)]
         drain_park: std::sync::Mutex<Option<DrainPark>>,
+        /// A test's park in the marker path (Q84-3), between its stamp and
+        /// the locks it publishes the stamp under.
+        #[cfg(test)]
+        stamp_park: crate::composer_probe::stamp_park::StampPark,
         /// The test and `e2e` builds' pass barrier (Q105b.2): while held,
         /// the thread starts no pass, so no scan, marker read, exit or drain.
         #[cfg(any(test, feature = "e2e"))]
@@ -1749,6 +1753,15 @@ mod linux {
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(park));
         }
 
+        /// Call `park` at each point the marker path reaches (Q84-3), with
+        /// no lock held.
+        pub(crate) fn park_stamps_for_test(
+            &self,
+            park: impl Fn(crate::composer_probe::stamp_park::StampPoint) + Send + Sync + 'static,
+        ) {
+            self.stamp_park.set(park);
+        }
+
         fn parked(&self, key: RecordKey) {
             let park = self
                 .drain_park
@@ -1999,6 +2012,8 @@ mod linux {
                 keymap: std::sync::OnceLock::new(),
                 #[cfg(test)]
                 drain_park: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                stamp_park: Default::default(),
                 #[cfg(any(test, feature = "e2e"))]
                 barrier: Arc::default(),
             });
@@ -2821,7 +2836,12 @@ mod linux {
                 }),
                 (Err(_), None) => None,
             };
+            // Stamped before the observer's lock and the generation's: a
+            // caller holding either may publish a later stamp first.
             let now = Instant::now();
+            #[cfg(test)]
+            self.stamp_park
+                .at(crate::composer_probe::stamp_park::StampPoint::MarkerStamped);
             let late = {
                 let mut inner = self.lock();
                 let late = evidence.is_some() && inner.seam.late(marker.key);

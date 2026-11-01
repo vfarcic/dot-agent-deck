@@ -1438,3 +1438,92 @@ async fn probe_057_a_report_before_the_decision_then_the_exit_drain() {
         deck.stop().await;
     }
 }
+
+/// Scenario: Record a live helper copy as the child scan does before it can attribute it, so its completion is pending and a native Ctrl+G accepted then waits on a paused quiet clock; write an `armed` marker for it and park the observer's real marker path after it took its stamp, before either lock, while admission reads the hazard FIFO nine seconds later. Released, the marker attributes the helper as not the composer's, so the clock runs again from the read's time, not the marker's earlier stamp: the entry stays through ten seconds of quiet time and leaves only after them, and the record keeps the stamp taken before the park as its first `Armed` sighting.
+#[spec("inbox/probe/052")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_052_a_markers_early_stamp_resumes_the_quiet_clock_no_earlier_than_a_racing_read() {
+    use crate::composer_probe::helper::marker_name;
+    use crate::composer_probe::instance::InstanceReader;
+    use crate::composer_probe::observe::scan_observation;
+    use crate::composer_probe::query_ledger::EntryView;
+    use crate::composer_probe::record::Completion;
+    use crate::composer_probe::stamp_park::{StampPoint, park_at};
+    let mut deck = Deck::start().await;
+    let input = deck.observer.input();
+    let (helper, _) = deck.helper("early-stamp", 0).await;
+    let key = key_of(helper);
+
+    let t0 = Instant::now();
+    let at = |s: u64| t0 + Duration::from_secs(s);
+    input
+        .record_observe(
+            &scan_observation(deck.generation, key, Attribution::Pending, t0),
+            t0,
+        )
+        .unwrap();
+    assert_eq!(input.record(key).unwrap().completion, Completion::Pending);
+    let seq = input.accept_native(t0).expect("a native number");
+    assert_eq!(
+        input.hazards(at(1)).0,
+        vec![EntryView::Quiet { seq, paused: true }],
+        "the clock is paused while the record is pending"
+    );
+
+    let (park, reached, go) = park_at(&[StampPoint::MarkerStamped]);
+    deck.observer.park_stamps_for_test(park);
+    InstanceReader::open(deck.instance.dir())
+        .unwrap()
+        .create_marker(
+            &deck.generation.to_string(),
+            &marker_name(key.pid, key.start, ComposerDecision::Armed, None),
+        )
+        .unwrap();
+    assert_eq!(
+        tokio::task::block_in_place(|| reached.recv_timeout(SETTLE)),
+        Ok(StampPoint::MarkerStamped),
+        "the next pass reads the marker and parks after its stamp"
+    );
+    let parked = Instant::now();
+    assert_eq!(
+        input.record(key).unwrap().decision,
+        None,
+        "stamped, not yet observed"
+    );
+    assert!(
+        !input.hazards_clear(at(9)),
+        "admission's read: the entry is still paused"
+    );
+    std::thread::sleep(Duration::from_millis(2));
+    go.send(()).unwrap();
+
+    assert!(
+        wait_for(SETTLE, || input
+            .record(key)
+            .is_some_and(|r| r.decision == Some(Decision::Armed)))
+        .await,
+        "the released marker is observed"
+    );
+    let record = input.record(key).unwrap();
+    assert_eq!(
+        record.completion,
+        Completion::NotRequired,
+        "the marker's attribution names the helper not the composer's: {record:?}"
+    );
+    let stamp = record.first_armed_seen.expect("an Armed sighting");
+    assert!(
+        stamp <= parked,
+        "the stamp ({stamp:?}) is taken before the park ({parked:?}), not under a lock after it"
+    );
+    // Resumed at 9 s: ten seconds of quiet time are reached at 19 s, and
+    // the tie still counts as quiet.
+    assert_eq!(
+        input.hazards(at(18)).0,
+        vec![EntryView::Quiet { seq, paused: false }],
+        "the paused interval between the marker's stamp and the read isn't counted"
+    );
+    assert!(!input.hazards_clear(at(19)), "the tie goes to the hazard");
+    assert!(input.hazards_clear(at(20)));
+    deck.kill(helper);
+    deck.stop().await;
+}

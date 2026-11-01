@@ -51,6 +51,8 @@ use super::epoch::{GenerationInput, OutputNote, output_notes};
 use super::framing::{Csi, Event, Framing, Token};
 use super::observe::BellSlot;
 use super::segments::{Seen, seen_ending_at};
+#[cfg(test)]
+use super::stamp_park::StampPoint;
 
 /// DEC private mode 2004: bracketed paste.
 const BRACKETED_PASTE: u32 = 2004;
@@ -119,10 +121,20 @@ impl OutputHook {
                 .ok()
                 .and_then(|n| fed.checked_add(n))
         });
+        // The stamp is taken after the push's offset advanced, so it is no
+        // earlier than the offset's move (Q84-3).
+        #[cfg(test)]
+        self.input.feeder_at(StampPoint::OutputAdvanced);
         let now = Instant::now();
+        // Test seam (Q84-3): a racing caller may take the generation's lock
+        // with a later stamp before this one is published.
+        #[cfg(test)]
+        self.input.feeder_at(StampPoint::OutputStamped);
         if !notes.is_empty() {
             self.input.on_output(&notes, now);
         }
+        #[cfg(test)]
+        self.input.feeder_at(StampPoint::OutputNoted);
         // Q35-20: an installed generation's segments read the push's return
         // markers, after the notes, under the same output lock. Nothing
         // without segments attached.

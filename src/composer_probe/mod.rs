@@ -73,6 +73,8 @@ pub mod query_ledger;
 pub mod query_wait;
 pub mod record;
 pub mod segments;
+#[cfg(test)]
+pub(crate) mod stamp_park;
 
 use crate::doorbell_activation::{LatchedRelease, Measurement, ReleaseRecord};
 use crate::event::AgentType;
