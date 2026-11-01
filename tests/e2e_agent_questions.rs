@@ -303,12 +303,20 @@ fn question_live_005_opencode_permission_and_multiselect_reply() {
     skip_unless!(common::check_opencode_available());
     let config = common::harness_tempdir().unwrap();
     let settings = config.path().join("opencode.json");
+    // PRD #2050: the model rides in the config too, because OpenCode 2.x's
+    // top-level `opencode` takes no `--model`
+    // (`common::opencode_interactive_command`).
     std::fs::write(
         &settings,
-        r#"{"$schema":"https://opencode.ai/config.json","permission":{"bash":"ask"}}"#,
+        serde_json::json!({
+            "$schema": "https://opencode.ai/config.json",
+            "model": common::opencode_test_model(),
+            "permission": {"bash": "ask"},
+        })
+        .to_string(),
     )
     .unwrap();
-    let command = format!("opencode --model {}", quote(common::opencode_test_model()));
+    let command = common::opencode_interactive_command(false, false, "");
     let deck = TuiDeck::builder()
         .with_pty_size(200, 50)
         .with_env("PATH", path())
@@ -325,6 +333,7 @@ fn question_live_005_opencode_permission_and_multiselect_reply() {
     let sentinel = deck.workdir().join("question_opencode_542c01e8.txt");
     let id = agent_id(&deck);
     visible(&deck, "Ask anything");
+    visible(&deck, common::OPENCODE_SUBMIT_READY);
     submit(
         &deck,
         &format!(
@@ -344,7 +353,17 @@ fn question_live_005_opencode_permission_and_multiselect_reply() {
         ["Allow once", "Allow always", "Reject"]
     );
     visible(&deck, "Allow once");
-    visible(&deck, "Allow always");
+    // OpenCode's own dialog: 2.x labels the second option `Always allow`
+    // (measured on 2.2.5) where 1.x said `Allow always`; the deck's labels
+    // asserted above are the deck's, not OpenCode's.
+    visible(
+        &deck,
+        if common::opencode_test_is_v2() {
+            "Always allow"
+        } else {
+            "Allow always"
+        },
+    );
     assert!(!sentinel.exists());
     assert_eq!(
         answer(&deck, &id, &q, vec![selection(0, &[1])]),

@@ -1654,6 +1654,220 @@ pub fn opencode_question_asked(props: &Value, raised_at_ms: i64) -> Option<Pendi
     })
 }
 
+/// PRD #2050: OpenCode 2's question form (`form.created`'s `form`, which the
+/// deck's 2.x TUI plugin passes as `properties.form`) → a held
+/// [`QuestionKind::Choice`] form, one question per field, in field order:
+///
+/// - `boolean` → Yes / No;
+/// - `string` with `options`, or `multiselect` → those options (by label; the
+///   reply sends each one's `value`), plus "Type your own answer" when the
+///   field allows `custom` values;
+/// - `string` without options, `number`, `integer` → "Type your own answer".
+///
+/// The form is keyboard-only ([`AnswerChannel::Unsupported`]) when the deck
+/// cannot answer it whole: a field it cannot express (`external`, a `hidden`
+/// one, an unknown type), a field shown only `when` another has a value, more
+/// than [`MAX_OPTIONS`] options, an option it cannot read, or an option list
+/// with nothing to choose from and no custom value. `None` when the
+/// payload names no form id or no fields.
+pub fn opencode_form_asked(props: &Value, raised_at_ms: i64) -> Option<PendingQuestion> {
+    let form = props.get("form")?;
+    let id = str_field(form, "id")
+        .or_else(|| str_field(props, "id"))?
+        .to_string();
+    let fields = form.get("fields")?.as_array()?;
+    if fields.is_empty() {
+        return None;
+    }
+    let free_text = |index: u32| QuestionOption {
+        index,
+        label: FORM_FREE_TEXT_LABEL.to_string(),
+        description: None,
+        role: OptionRole::FreeText,
+        keyboard_only: false,
+        scope: None,
+        maybe_hidden: false,
+    };
+    let choice = |index: u32, label: &str| QuestionOption {
+        index,
+        label: label.to_string(),
+        description: None,
+        role: OptionRole::Choice,
+        keyboard_only: false,
+        scope: None,
+        maybe_hidden: false,
+    };
+    let mut keyboard_only = false;
+    let title = str_field(form, "title").or_else(|| str_field(props, "title"));
+    let questions = fields
+        .iter()
+        .map(|field| {
+            let kind = str_field(field, "type").unwrap_or("");
+            if field.get("hidden").and_then(Value::as_bool) == Some(true)
+                || field
+                    .get("when")
+                    .and_then(Value::as_array)
+                    .is_some_and(|when| !when.is_empty())
+            {
+                keyboard_only = true;
+            }
+            let custom = field.get("custom").and_then(Value::as_bool) == Some(true);
+            let (options, multi_select) = match kind {
+                "boolean" => (vec![choice(1, "Yes"), choice(2, "No")], false),
+                "string" | "multiselect" if field.get("options").is_some() => {
+                    let payload = payload_options(field);
+                    keyboard_only |= !own_options_fit(payload.listed) || !payload.all_read();
+                    let next = payload.listed as u32 + 1;
+                    let mut options = payload.options;
+                    if custom {
+                        options.push(free_text(next));
+                    }
+                    // An `options` key with no entry the deck could read and
+                    // no custom value leaves nothing to answer with: keep the
+                    // field as one keyboard-only option, as for a kind the
+                    // deck cannot express, so the form stays on the card
+                    // rather than being dropped by
+                    // [`PendingQuestion::sanitized`].
+                    if options.is_empty() {
+                        keyboard_only = true;
+                        options.push(QuestionOption {
+                            keyboard_only: true,
+                            ..free_text(1)
+                        });
+                    }
+                    (options, kind == "multiselect")
+                }
+                "string" | "number" | "integer" => (vec![free_text(1)], false),
+                // A field the deck cannot express (`external`, a kind newer
+                // than this build) keeps one keyboard-only option, so the
+                // form stays on the card as keyboard-only rather than being
+                // dropped as a question with nothing to show
+                // ([`PendingQuestion::sanitized`] refuses one with no
+                // options; audit I2).
+                _ => {
+                    keyboard_only = true;
+                    (
+                        vec![QuestionOption {
+                            keyboard_only: true,
+                            ..free_text(1)
+                        }],
+                        false,
+                    )
+                }
+            };
+            Question {
+                prompt: str_field(field, "title")
+                    .or_else(|| str_field(field, "key"))
+                    .unwrap_or("")
+                    .to_string(),
+                header: title.map(str::to_string),
+                options,
+                multi_select,
+            }
+        })
+        .collect();
+    Some(PendingQuestion {
+        id,
+        kind: QuestionKind::Choice,
+        questions,
+        raised_at_ms,
+        tool: None,
+        channel: if keyboard_only {
+            AnswerChannel::Unsupported
+        } else {
+            AnswerChannel::Held
+        },
+        subagent_id: None,
+        revision: None,
+    })
+}
+
+/// The label of a form field's free-text option ([`opencode_form_asked`]).
+pub const FORM_FREE_TEXT_LABEL: &str = "Type your own answer";
+
+/// PRD #2050: an answer to an OpenCode 2 form ([`opencode_form_asked`]) as the
+/// reply the deck's TUI plugin sends through `session.form.reply`:
+/// `{"kind":"form","request_id":<form id>,"body":{"sessionID",
+/// "answer":{<field key>: <value>}}}`. A choice sends its option's `value`
+/// (its label when it has none), a boolean `true` / `false`, a number field
+/// the typed text as a number, a multiselect a list. `None` when a field is
+/// left unanswered or an answer does not fit its field.
+fn opencode_form_reply(
+    question: &PendingQuestion,
+    props: &Value,
+    answers: &[ResolvedAnswer],
+) -> Option<Value> {
+    let form = props.get("form")?;
+    let fields = form.get("fields")?.as_array()?;
+    if fields.len() != question.questions.len() {
+        return None;
+    }
+    let session_id = str_field(form, "sessionID").or_else(|| str_field(props, "sessionID"))?;
+    let mut answer = serde_json::Map::new();
+    for resolved in answers {
+        let field = fields.get(resolved.question_index as usize)?;
+        let key = str_field(field, "key")?;
+        let kind = str_field(field, "type")?;
+        let option_value = |index: u32| -> Option<Value> {
+            let option = field
+                .get("options")?
+                .as_array()?
+                .get((index as usize).checked_sub(1)?)?;
+            option
+                .as_str()
+                .or_else(|| str_field(option, "value"))
+                .or_else(|| str_field(option, "label"))
+                .map(|v| Value::String(v.to_string()))
+        };
+        let value = match kind {
+            "boolean" => Value::Bool(match resolved.option_indices.as_slice() {
+                [1] => true,
+                [2] => false,
+                _ => return None,
+            }),
+            "number" | "integer" => {
+                let text = resolved.text.as_deref()?.trim();
+                if kind == "integer" {
+                    Value::from(text.parse::<i64>().ok()?)
+                } else {
+                    let n: f64 = text.parse().ok()?;
+                    Value::from(serde_json::Number::from_f64(n)?)
+                }
+            }
+            "multiselect" => {
+                let mut values = resolved
+                    .option_indices
+                    .iter()
+                    // The free-text option has no value of its own: its
+                    // text is the answer, below.
+                    .filter_map(|i| option_value(*i))
+                    .collect::<Vec<_>>();
+                if let Some(text) = &resolved.text {
+                    values.push(Value::String(text.clone()));
+                }
+                Value::Array(values)
+            }
+            "string" => match &resolved.text {
+                Some(text) => Value::String(text.clone()),
+                None => match resolved.option_indices.as_slice() {
+                    [index] => option_value(*index)?,
+                    _ => return None,
+                },
+            },
+            _ => return None,
+        };
+        answer.insert(key.to_string(), value);
+    }
+    if answer.len() != fields.len() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "kind": "form",
+        "request_id": question.id,
+        "body": {"sessionID": session_id, "answer": answer},
+    }))
+}
+
 /// What the OpenCode plugin does with an answer: POST `body` to
 /// `/permission/{request_id}/reply` or `/question/{request_id}/reply`.
 ///
@@ -1685,6 +1899,9 @@ pub fn opencode_reply(
                 "request_id": question.id,
                 "body": {"reply": reply},
             }))
+        }
+        QuestionKind::Choice if props.get("form").is_some() => {
+            opencode_form_reply(question, props, answers)
         }
         QuestionKind::Choice => {
             let payload_questions = props.get("questions")?.as_array()?;

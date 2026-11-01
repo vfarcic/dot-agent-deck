@@ -1082,6 +1082,10 @@ fn restore_013_custom_orchestration_tab_title_is_preserved_on_restore() {
 fn restore_014_recognized_agent_is_idle_before_first_hook() {
     let session_dir = common::race_safe_tempdir();
     let fake_opencode = session_dir.path().join("opencode");
+    // It also hangs when the daemon asks it `--version` before the spawn (PRD
+    // #2050), and that is kept on purpose: the probe's bound must leave the
+    // TUI's start time to hear the reply, or the restored pane comes up
+    // without its saved name, which the first wait below catches.
     std::fs::write(&fake_opencode, "#!/bin/sh\nsleep 600\n")
         .expect("write fake opencode executable");
     #[cfg(unix)]

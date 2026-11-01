@@ -2658,7 +2658,7 @@ pub fn config_dir() -> PathBuf {
     }
 }
 
-/// `$XDG_CONFIG_HOME` when set and non-empty, else `None`.
+/// `$XDG_CONFIG_HOME` when set to an absolute path, else `None`.
 ///
 /// Windows always returns `None`: the XDG spec has no Windows analogue, and
 /// [`config_dir`] already resolves the platform's own per-user config root, so
@@ -2667,15 +2667,27 @@ pub fn config_dir() -> PathBuf {
 pub fn xdg_config_home() -> Option<PathBuf> {
     #[cfg(unix)]
     {
-        match std::env::var("XDG_CONFIG_HOME") {
-            Ok(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
-            _ => None,
-        }
+        absolute_dir_from_env(std::env::var_os("XDG_CONFIG_HOME").as_deref())
     }
     #[cfg(windows)]
     {
         None
     }
+}
+
+/// A directory named by an environment variable's `value`, as the XDG
+/// base-directory spec reads one: an unset, empty or relative value is
+/// ignored (`None`), so the caller falls back to its default. A relative
+/// value would otherwise resolve against whatever the current directory
+/// happens to be, which is how `XDG_CONFIG_HOME=` once made the OpenCode
+/// install write `opencode/` into the directory the command was run from.
+///
+/// Pure, so the rule is testable without mutating the process environment,
+/// and shared by every resolver of a config root the deck writes into (its
+/// own `$XDG_CONFIG_HOME` above, OpenCode's, Devin's).
+pub fn absolute_dir_from_env(value: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let path = Path::new(value?);
+    path.is_absolute().then(|| path.to_path_buf())
 }
 
 /// Platform default root for the daemon's per-endpoint lock files
@@ -3537,6 +3549,14 @@ mod tests {
         }
         assert_eq!(xdg_config_home(), None);
 
+        // So is a relative one (XDG base-directory spec), rather than resolving
+        // against the current directory.
+        // SAFETY: same lock held.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", "relative/config");
+        }
+        assert_eq!(xdg_config_home(), None);
+
         // SAFETY: same lock held; restoring the previous value.
         unsafe {
             match prev_xdg {
@@ -3544,6 +3564,23 @@ mod tests {
                 None => std::env::remove_var("XDG_CONFIG_HOME"),
             }
         }
+    }
+
+    /// Scenario: a directory variable read the XDG way — unset, empty or
+    /// relative is ignored, so the caller uses its default; only an absolute
+    /// path is taken.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_variable_counts_only_when_it_is_absolute() {
+        use std::ffi::OsStr;
+        assert_eq!(absolute_dir_from_env(None), None);
+        assert_eq!(absolute_dir_from_env(Some(OsStr::new(""))), None);
+        assert_eq!(absolute_dir_from_env(Some(OsStr::new("opencode"))), None);
+        assert_eq!(absolute_dir_from_env(Some(OsStr::new("./cfg"))), None);
+        assert_eq!(
+            absolute_dir_from_env(Some(OsStr::new("/x/config"))),
+            Some(PathBuf::from("/x/config"))
+        );
     }
 
     /// PRD #163 review: the two third-party-tool config writers historically fell

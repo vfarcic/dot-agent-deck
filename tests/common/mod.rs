@@ -596,7 +596,15 @@ impl TuiDeckBuilder {
     /// or other user configuration into a recorded real-agent run.
     pub fn with_imported_opencode_credentials(mut self) -> Self {
         self.credential_imports.push(CredentialImport::OpenCode);
-        self
+        // Issue #2044: OpenCode 1.x (measured on 1.18.35) npm-installs its
+        // plugin SDK into a config dir whose tui.json lists a plugin (the
+        // deck's) before it draws the composer, which in this fresh HOME is a
+        // registry download. The deck's plugins import only Node builtins, and
+        // with npm offline the install fails at once and OpenCode carries on.
+        // OpenCode 2.2.5 runs no such install for the deck's plugins: it loads
+        // local-path plugins straight from disk and reaches npm only for a
+        // package-name plugin, which this harness never configures.
+        self.with_env("npm_config_offline", "true")
     }
 
     /// Import the host user's Codex `auth.json` into the isolated per-test HOME
@@ -1404,6 +1412,17 @@ impl TuiDeck {
         {
             let contained = contain_path(path);
             final_env.insert("PATH".into(), contained);
+        }
+        // PRD #2050: a real-OpenCode deck runs the binary
+        // `DOT_AGENT_DECK_OPENCODE_TEST_BIN` picks; unset, this changes nothing.
+        if builder
+            .credential_imports
+            .iter()
+            .any(|import| matches!(import, CredentialImport::OpenCode))
+            && let Some(path) = final_env.get("PATH")
+        {
+            let chosen = path_with_opencode_test_bin(path);
+            final_env.insert("PATH".into(), chosen);
         }
         // PRD #91: start from the deck's hooks already installed, so the TUI's
         // startup install finds nothing to change and puts no note over the
@@ -6478,9 +6497,18 @@ pub fn claude_oauth_usable(oauth: &serde_json::Value, now_ms: i64) -> Result<(),
 /// way.
 pub fn check_opencode_available() -> Result<(), String> {
     install_credential_redaction();
-    if !cli_invocable("opencode") {
-        return Err("OpenCode CLI not installed (could not invoke `opencode --version`)".into());
+    // PRD #2050: the binary `DOT_AGENT_DECK_OPENCODE_TEST_BIN` picks, and its
+    // version read once, so every gated test learns which command line to use.
+    let Some(bin) = opencode_test_bin() else {
+        return Err(opencode_test_bin_missing());
+    };
+    if !cli_invocable(&bin.to_string_lossy()) {
+        return Err(format!(
+            "OpenCode CLI not installed (could not invoke `opencode --version`; \
+             {OPENCODE_TEST_BIN_ENV} names another binary)"
+        ));
     }
+    opencode_test_version()?;
     let home = host_home();
     let candidates = [
         home.join(".local")
@@ -6566,8 +6594,36 @@ fn opencode_model_probe() -> Result<(), String> {
         .as_file()
         .try_clone()
         .map_err(|e| format!("could not open the OpenCode probe output file: {e}"))?;
-    let mut child = std::process::Command::new("opencode")
-        .args(["run", "--model", model, OPENCODE_PROBE_PROMPT])
+    // PRD #2050: the chosen binary, with `--standalone` on 2.x
+    // ([`opencode_run_args`]): without it a 2.x probe joins the machine's shared
+    // background service, which carries the developer's environment and
+    // plugins, and the only measured probe hang on 2.2.5 (65 s,
+    // `status_blocked_023`) happened with that service holding its port.
+    let bin = opencode_test_bin().ok_or("OpenCode CLI not installed")?;
+    // PRD #2050: a data directory of the probe's own, holding only a copy of
+    // the host's OpenCode credentials. The probe used to write its session into
+    // the developer's real `~/.local/share/opencode`, and that directory is one
+    // major's: OpenCode 1.18.35 refuses a database 2.x has migrated (`Database
+    // is not empty and has no session table`, measured), so with
+    // `DOT_AGENT_DECK_OPENCODE_TEST_BIN` pointing at a 1.x the probe failed on a
+    // machine whose PATH OpenCode is 2.x. 2.x imports the copied `auth.json`
+    // into its fresh database (`import_legacy_credentials`, measured).
+    let data = harness_tempdir()
+        .map_err(|e| format!("could not create the OpenCode probe data directory: {e}"))?;
+    match import_opencode_credentials_from(&host_home(), data.path()) {
+        Ok(_) => {}
+        // No auth file: an env key may authorise the model, and otherwise the
+        // probe's own failure names what is missing.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "could not stage OpenCode credentials for the probe: {e}"
+            ));
+        }
+    }
+    let mut child = std::process::Command::new(bin)
+        .env("XDG_DATA_HOME", data.path().join(".local").join("share"))
+        .args(opencode_run_args(OPENCODE_PROBE_PROMPT))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(out))
         .stderr(std::process::Stdio::from(err))
@@ -7160,6 +7216,283 @@ pub fn opencode_test_model() -> &'static str {
             .filter(|model| !model.is_empty())
             .unwrap_or_else(|| OPENCODE_TEST_MODEL_DEFAULT.to_string())
     })
+}
+
+/// Env var naming the OpenCode binary the real-agent tests run (PRD #2050), so
+/// one machine can run them against OpenCode 1.x and 2.x side by side: the 2.x
+/// curl installer writes to the same `~/.opencode/bin/opencode` the 1.x one
+/// did, so whichever is on `PATH` is only one of the two. An absolute path, or
+/// a name looked up on `PATH`; unset or empty means `opencode` from `PATH`.
+/// The value [`OPENCODE_TEST_BIN_V1`] names the pinned OpenCode 1.x that
+/// `scripts/box/bootstrap.sh` installs off `PATH`.
+///
+/// It reaches a real-agent pane through [`opencode_test_bin_dir`]: a directory
+/// holding an `opencode` link to the chosen binary, which
+/// [`TuiDeckBuilder::with_imported_opencode_credentials`] puts first on the
+/// deck's `PATH` and [`path_with_opencode_test_bin`] puts first on a `PATH` a
+/// test builds itself. It is deliberately NOT applied by [`contain_path`]:
+/// `cargo test-e2e-live` is a superset run, and a lane-1 test that puts a stub
+/// `opencode` on its `PATH` must keep finding the stub.
+pub const OPENCODE_TEST_BIN_ENV: &str = "DOT_AGENT_DECK_OPENCODE_TEST_BIN";
+
+/// The [`OPENCODE_TEST_BIN_ENV`] value naming the pinned OpenCode 1.x
+/// ([`OPENCODE_PINNED_V1`]), so a run on the 1.x half needs no path:
+/// `DOT_AGENT_DECK_OPENCODE_TEST_BIN=v1 cargo test-e2e-live <filter>`.
+pub const OPENCODE_TEST_BIN_V1: &str = "v1";
+
+/// Where `scripts/box/bootstrap.sh` installs the pinned OpenCode 1.x, off
+/// `PATH`, relative to the home directory (PRD #2050). OpenCode 2's installer
+/// owns `~/.opencode/bin/opencode`, so the 1.x half lives here.
+pub const OPENCODE_PINNED_V1: &str = ".local/share/dot-agent-deck/opencode-1/bin/opencode";
+
+/// The OpenCode binary [`OPENCODE_TEST_BIN_ENV`] selects, resolved to a path:
+/// the variable's value (looked up on `PATH` when it has no `/`), else the
+/// first `opencode` on `PATH`. `None` when nothing resolves, which the
+/// preflights report with [`opencode_test_bin_missing`].
+pub fn opencode_test_bin() -> Option<&'static Path> {
+    static BIN: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    BIN.get_or_init(|| {
+        resolve_opencode_test_bin(
+            &opencode_test_bin_choice(),
+            &host_home(),
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )
+    })
+    .as_deref()
+}
+
+/// [`OPENCODE_TEST_BIN_ENV`]'s value, trimmed; `opencode` when unset or empty.
+fn opencode_test_bin_choice() -> String {
+    std::env::var(OPENCODE_TEST_BIN_ENV)
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+        .unwrap_or_else(|| "opencode".to_string())
+}
+
+/// [`opencode_test_bin`]'s resolution with its inputs passed in: `v1` is the
+/// pinned 1.x under `home`, a value with a `/` is a path, and anything else is
+/// a name looked up on `path`. Only an existing file resolves.
+pub(crate) fn resolve_opencode_test_bin(
+    chosen: &str,
+    home: &Path,
+    path: &std::ffi::OsStr,
+) -> Option<PathBuf> {
+    if chosen == OPENCODE_TEST_BIN_V1 {
+        let pinned = home.join(OPENCODE_PINNED_V1);
+        return pinned.is_file().then_some(pinned);
+    }
+    if chosen.contains('/') {
+        let path = PathBuf::from(chosen);
+        return path.is_file().then_some(path);
+    }
+    std::env::split_paths(path)
+        .map(|dir| dir.join(chosen))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Why [`opencode_test_bin`] found nothing, for a preflight's `SKIP:`: for
+/// `v1`, where the pinned 1.x belongs and the script that installs it.
+pub fn opencode_test_bin_missing() -> String {
+    if opencode_test_bin_choice() == OPENCODE_TEST_BIN_V1 {
+        format!(
+            "the pinned OpenCode 1.x that {OPENCODE_TEST_BIN_ENV}={OPENCODE_TEST_BIN_V1} names is \
+             not installed at ~/{OPENCODE_PINNED_V1}; install it with scripts/box/bootstrap.sh"
+        )
+    } else {
+        format!(
+            "OpenCode CLI not installed (no `opencode` on PATH, or {OPENCODE_TEST_BIN_ENV} names \
+             a binary that does not exist)"
+        )
+    }
+}
+
+/// Parse what `opencode --version` prints into `(major, minor, patch)`: 2.x
+/// prints `opencode v2.2.5`, 1.x prints `1.18.35` (both measured 2026-10-31).
+pub fn parse_opencode_version(text: &str) -> Option<(u32, u32, u32)> {
+    let line = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let version = line.strip_prefix("opencode").unwrap_or(line).trim_start();
+    let version = version.strip_prefix('v').unwrap_or(version);
+    let mut parts = version.splitn(3, '.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch: String = parts
+        .next()?
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    Some((major, minor, patch.parse().ok()?))
+}
+
+/// The version of [`opencode_test_bin`], asked once per test process.
+/// `--version` starts no service and writes no session on either version.
+pub fn opencode_test_version() -> Result<(u32, u32, u32), String> {
+    static VERSION: std::sync::OnceLock<Result<(u32, u32, u32), String>> =
+        std::sync::OnceLock::new();
+    VERSION
+        .get_or_init(|| {
+            let bin = opencode_test_bin().ok_or_else(opencode_test_bin_missing)?;
+            let output = std::process::Command::new(bin)
+                .arg("--version")
+                .current_dir(std::env::temp_dir())
+                .stdin(std::process::Stdio::null())
+                .output()
+                .map_err(|e| format!("could not run `{} --version`: {e}", bin.display()))?;
+            let text = String::from_utf8_lossy(&output.stdout);
+            if !output.status.success() {
+                return Err(format!(
+                    "`{} --version` failed ({})",
+                    bin.display(),
+                    output.status
+                ));
+            }
+            parse_opencode_version(&text).ok_or_else(|| {
+                format!(
+                    "could not read a version from `{} --version`: {:?}",
+                    bin.display(),
+                    text.trim()
+                )
+            })
+        })
+        .clone()
+}
+
+/// Whether [`opencode_test_bin`] is OpenCode 2.x or later, whose top-level
+/// `opencode` takes no `--model`, has `mini` as a subcommand rather than a
+/// flag, and joins a shared background service unless given `--standalone`.
+/// False when the version cannot be read, so a broken binary keeps the 1.x
+/// command line and fails in the preflight that reads the version.
+pub fn opencode_test_is_v2() -> bool {
+    opencode_test_version().is_ok_and(|(major, _, _)| major >= 2)
+}
+
+/// Preflight for a test that needs one OpenCode major version (PRD #2050). Use
+/// with [`skip_unless!`]: on another version it SKIPS naming the binary, the
+/// version it found and the knob that picks another, and
+/// `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` turns that skip into a failure.
+pub fn require_opencode_major(major: u32) -> Result<(), String> {
+    let (found, minor, patch) = opencode_test_version()?;
+    if found == major {
+        return Ok(());
+    }
+    Err(format!(
+        "this test needs OpenCode {major}.x, but {} is {found}.{minor}.{patch}; point \
+         {OPENCODE_TEST_BIN_ENV} at an OpenCode {major}.x binary",
+        opencode_test_bin().map_or_else(|| "opencode".into(), |p| p.display().to_string())
+    ))
+}
+
+/// A directory whose only entry is an `opencode` link to [`opencode_test_bin`],
+/// created once per test process, or `None` when [`OPENCODE_TEST_BIN_ENV`] is
+/// unset (the `opencode` already on `PATH` is the one chosen) or names nothing.
+pub fn opencode_test_bin_dir() -> Option<&'static Path> {
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        std::env::var(OPENCODE_TEST_BIN_ENV)
+            .ok()
+            .filter(|raw| !raw.trim().is_empty())?;
+        let bin = std::fs::canonicalize(opencode_test_bin()?).ok()?;
+        // Kept for the process's lifetime: every pane started from it needs it.
+        let dir = harness_tempdir()
+            .expect("create the OpenCode test-binary directory")
+            .keep();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&bin, dir.join("opencode"))
+            .expect("link the chosen OpenCode binary");
+        #[cfg(not(unix))]
+        std::fs::copy(&bin, dir.join("opencode")).expect("copy the chosen OpenCode binary");
+        Some(dir)
+    })
+    .as_deref()
+}
+
+/// `path` with [`opencode_test_bin_dir`] first, for a `PATH` a real-agent
+/// OpenCode test builds itself; `path` unchanged when no override is set.
+pub fn path_with_opencode_test_bin(path: &str) -> String {
+    let Some(dir) = opencode_test_bin_dir() else {
+        return path.to_string();
+    };
+    std::env::join_paths(std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(path)))
+        .expect("PATH entries join")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// What an interactive OpenCode shows once a prompt typed into it can be
+/// submitted: its mode line (`Build auto · <model>` under the full TUI's
+/// composer on both majors, `Build · <model>` in 2.x mini's footer, ` BUILD `
+/// in 1.x `--mini`, so compare case-blind there), which follows the
+/// composer's `Ask anything` placeholder by about 0.2 s. Wait for it before
+/// typing.
+///
+/// PRD #2050, measured on OpenCode 2.2.5 in a raw PTY outside the deck: a
+/// prompt typed the moment `Ask anything` appeared, then submitted once it was
+/// on screen, was dropped with no session written in 2 of 3 trials (and in
+/// `inbox/opencode/016`, `018`, `019`, `status/blocked/023` and
+/// `telemetry/otlp/007`, which typed at that moment); gated on this line, 6 of
+/// 6 were submitted. 1.x draws the line too (uppercase in `--mini`).
+pub const OPENCODE_SUBMIT_READY: &str = "Build";
+
+/// The command line that starts an interactive OpenCode on [`opencode_test_model`]
+/// for whichever major version [`opencode_test_bin`] is, with `extra` appended
+/// (shell words, e.g. `--prompt '…'`):
+///
+/// - **1.x:** `opencode --model M [--auto] [--mini]`, as every lane-2 OpenCode
+///   test ran before PRD #2050.
+/// - **2.x:** `opencode [mini] --standalone [--auto]`. The model comes from the
+///   `model` key [`import_opencode_credentials`] writes into the test HOME's
+///   `opencode.json` (2.x reads `model` as `provider/model`,
+///   `packages/schema/src/config/model.ts` at tag v2.2.5; measured: with it
+///   `opencode run` answered on `claude-haiku-4-5-20251001`, without it on a
+///   free default), because top-level `opencode` rejects `--model` (`ERROR
+///   Unrecognized flag: --model`). `--standalone` keeps the test off the
+///   machine's shared background service (`opencode serve --service`, fixed
+///   port 127.0.0.1:49374, which a per-test HOME does not isolate). It is
+///   written here, not left to the deck, because a wrapper script the deck
+///   cannot see into gets no `--standalone` from it, and a test client that
+///   joined the developer's service would run in the developer's HOME. `mini`
+///   takes no `--auto` on 2.x (`opencode mini --help`), so it is dropped there.
+pub fn opencode_interactive_command(mini: bool, auto: bool, extra: &str) -> String {
+    let mut words: Vec<String> = vec!["opencode".into()];
+    if opencode_test_is_v2() {
+        if mini {
+            words.push("mini".into());
+        }
+        words.push("--standalone".into());
+        if auto && !mini {
+            words.push("--auto".into());
+        }
+    } else {
+        words.push("--model".into());
+        words.push(opencode_test_model().into());
+        if auto {
+            words.push("--auto".into());
+        }
+        if mini {
+            words.push("--mini".into());
+        }
+    }
+    if !extra.trim().is_empty() {
+        words.push(extra.trim().into());
+    }
+    words.join(" ")
+}
+
+/// Arguments after `opencode` for one non-interactive turn on
+/// [`opencode_test_model`]: `run --model M PROMPT` on 1.x, plus `--standalone`
+/// on 2.x for the reason [`opencode_interactive_command`] gives (`run` keeps
+/// `--model` on 2.x, and refuses an unknown id: `Model unavailable: …`).
+pub fn opencode_run_args(prompt: &str) -> Vec<String> {
+    let mut args = vec!["run".to_string()];
+    if opencode_test_is_v2() {
+        args.push("--standalone".into());
+    }
+    args.extend([
+        "--model".to_string(),
+        opencode_test_model().to_string(),
+        prompt.to_string(),
+    ]);
+    args
 }
 
 /// Upper bound on [`check_codex_available`]'s two `codex` calls together — the
@@ -8593,7 +8926,17 @@ fn opencode_recording_redactions(
     Ok(values)
 }
 
-pub(crate) const MINIMAL_OPENCODE_CONFIG: &str = "{}\n";
+/// The isolated `opencode.json` every seeded HOME gets: only the `model` key,
+/// set to [`opencode_test_model`], and nothing from the host. OpenCode 2.x
+/// takes an interactive session's model from it, because its top-level
+/// `opencode` has no `--model` (PRD #2050, [`opencode_interactive_command`]);
+/// 1.x reads the same key, and its tests still pass `--model`, which wins.
+pub(crate) fn minimal_opencode_config() -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({ "model": opencode_test_model() })
+    )
+}
 
 /// Copy only the host user's OpenCode `auth.json` credentials into the per-test
 /// HOME and synthesize a minimal config. Host `opencode.json(c)`, plugins, MCP
@@ -8679,12 +9022,13 @@ pub(crate) fn import_opencode_credentials_from(
     Ok(recording_redactions)
 }
 
-/// The isolated OpenCode config every seeded HOME gets: empty, so no host
-/// plugin, MCP command or provider block can follow the credentials in.
+/// The isolated OpenCode config every seeded HOME gets: the test model and
+/// nothing else, so no host plugin, MCP command or provider block can follow
+/// the credentials in.
 fn write_minimal_opencode_config(test_home: &Path) -> std::io::Result<()> {
     let dst_cfg_dir = test_home.join(".config").join("opencode");
     std::fs::create_dir_all(&dst_cfg_dir)?;
-    std::fs::write(dst_cfg_dir.join("opencode.json"), MINIMAL_OPENCODE_CONFIG)
+    std::fs::write(dst_cfg_dir.join("opencode.json"), minimal_opencode_config())
 }
 
 fn import_opencode_credentials(test_home: &Path) -> std::io::Result<Vec<String>> {

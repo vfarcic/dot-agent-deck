@@ -6,6 +6,7 @@ mod inbox;
 #[path = "support/opencode_inbox_live.rs"]
 mod live;
 
+use dot_agent_deck::event::{AgentType, EventType};
 use live::{BUDGET, OpenCode};
 use spec::spec;
 
@@ -100,7 +101,7 @@ fn opencode_017_live_fresh_launch_avoids_older_roots_and_uses_argv_model() {
     );
 }
 
-/// Scenario: While OpenCode executes a slow real shell tool, delegate an append task. The TUI must show QUEUED and the delegated task must append only after the current tool, then visibly reply and acknowledge the inbox delivery.
+/// Scenario: While OpenCode executes a slow real shell tool, delegate an append task. The TUI must show QUEUED (OpenCode 1.x; 2.x draws no such label) and the delegated task must append only after the current tool, then visibly reply and acknowledge the inbox delivery.
 #[spec("inbox/opencode/018")]
 #[test]
 fn opencode_018_live_busy_delegates_show_queued_and_execute_in_order() {
@@ -115,7 +116,13 @@ fn opencode_018_live_busy_delegates_show_queued_and_execute_in_order() {
         "Use the shell to run exactly: printf '1\\n' >> '{}/order.txt'. Then reply FIRST-DONE.",
         path.display()
     ));
-    op.wait_screen("QUEUED");
+    // OpenCode 1.x labels a prompt waiting behind a running turn `QUEUED`;
+    // 2.x draws no such label (measured on 2.2.5: no "queue" text on screen
+    // after a second prompt was submitted mid-turn), so on 2.x the order the
+    // work lands in below is what shows the task waited.
+    if !common::opencode_test_is_v2() {
+        op.wait_screen("QUEUED");
+    }
     common::wait_for_file_trimmed_eq(&path.join("order.txt"), "0\n1", BUDGET)
         .unwrap_or_else(|why| panic!("queued order: {why}; {}", op.evidence()));
     op.wait_reply(&first);
@@ -265,5 +272,117 @@ fn opencode_022_live_unarmed_doorbell_is_intercepted_before_model() {
                     .as_str()
                     .is_some_and(|t| t.contains("waiting, run: dot-agent-deck inbox fetch"))),
         "saved prompt must contain injected block, not doorbell"
+    );
+}
+
+/// Scenario: Start a live interactive OpenCode 2.x on the cheap test model in a
+/// deck pane and type a prompt that writes a uniquely named sentinel file with
+/// the shell. Its card must visibly go Working with the command as tool detail,
+/// write the sentinel, and settle Idle still showing the prompt; then a genuine
+/// orchestrator delegate must reach the same agent, be acted on (a second
+/// sentinel) and read acknowledged.
+#[spec("inbox/opencode/060")]
+#[test]
+fn opencode_060_live_opencode_2_shows_status_and_runs_a_delegate() {
+    skip_unless!(common::require_opencode_major(2));
+    skip_unless!(common::check_opencode_available());
+    let op = OpenCode::new(false, 0, true);
+    let events = op.deck.subscribe_events();
+    let (agent, pane) = (op.pane.agent.clone(), op.pane.id.clone());
+    // This pane's OpenCode, by agent id or, where a hook carried none, pane id.
+    let from_agent = |event: &dot_agent_deck::event::AgentEvent| {
+        event.agent_type == AgentType::OpenCode
+            && (event.agent_id.as_deref() == Some(agent.as_str())
+                || event.pane_id.as_deref() == Some(pane.as_str()))
+    };
+
+    // A prompt the user types, as they would in the pane. The path is
+    // relative to OpenCode's working directory (the project) so the command
+    // names the sentinel within the deck's shortened tool detail, which an
+    // absolute scratch path pushes past its cut.
+    const PROMPTED: &str = "opencode2-prompt-5e81b4.txt";
+    let prompt = format!(
+        "Use the shell to run exactly: printf '{}' > {PROMPTED}; sleep 3. Then reply DONE and end your turn.",
+        live::CONTENT,
+    );
+    op.prompt(&prompt);
+    op.deck.send_bytes(b"\x04");
+    op.deck.wait_for_string("[New Agent n/Ctrl+N]");
+    assert!(
+        op.deck.wait_for_grid_string_within("Working", BUDGET),
+        "the OpenCode 2 card must visibly go Working; {}",
+        op.evidence()
+    );
+    events.wait_for(
+        |event| {
+            from_agent(event)
+                && event
+                    .user_prompt
+                    .as_deref()
+                    .is_some_and(|text| text.contains(PROMPTED))
+        },
+        BUDGET,
+    );
+    let tool = events.wait_for(
+        |event| {
+            from_agent(event)
+                && event.event_type == EventType::ToolStart
+                && event
+                    .tool_detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains(PROMPTED))
+        },
+        BUDGET,
+    );
+    assert!(
+        op.deck.wait_for_grid_string_within(PROMPTED, BUDGET),
+        "the card must show the command ({:?}) as tool detail; {}",
+        tool.tool_name,
+        op.evidence()
+    );
+    common::wait_for_file_trimmed_eq(&op.work.join(PROMPTED), live::CONTENT, BUDGET)
+        .unwrap_or_else(|why| {
+            panic!(
+                "real OpenCode 2 must act on the prompt: {why}; {}",
+                op.evidence()
+            )
+        });
+    events.wait_for(
+        |event| {
+            from_agent(event)
+                && event.event_type == EventType::Idle
+                && event.timestamp > tool.timestamp
+        },
+        BUDGET,
+    );
+    op.idle();
+    assert!(
+        op.deck
+            .wait_for_grid_predicate_within(BUDGET, |grid| grid.contains("Idle")
+                && grid.contains(PROMPTED)),
+        "the settled card must read Idle and still show the last prompt; {}",
+        op.evidence()
+    );
+
+    // A genuine `dot-agent-deck delegate` from the orchestrator role.
+    const DELEGATED: &str = "opencode2-delegate-9c27d0.txt";
+    let id = op.delegate_body(&format!(
+        "Use the shell to run exactly: printf '{}' > '{}'. Then reply DONE and end your turn.",
+        live::CONTENT,
+        op.work.join(DELEGATED).display()
+    ));
+    common::wait_for_file_trimmed_eq(&op.work.join(DELEGATED), live::CONTENT, BUDGET)
+        .unwrap_or_else(|why| {
+            panic!(
+                "real OpenCode 2 must act on the delegate: {why}; {}",
+                op.evidence()
+            )
+        });
+    inbox::state(&op.deck, &op.pane, &id, "acknowledged");
+    op.idle();
+    assert!(
+        op.deck.wait_for_grid_string_within("Idle", BUDGET),
+        "the worker card must settle Idle after the delegate; {}",
+        op.evidence()
     );
 }

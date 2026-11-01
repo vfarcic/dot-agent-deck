@@ -408,7 +408,7 @@ fn reading_reply_004_real_opencode_delivers_sentinel_once_to_subscribed_client()
         ready: "Ask anything",
         resubmit_until_empty: false,
     };
-    let command = format!("opencode --model {}", common::opencode_test_model());
+    let command = common::opencode_interactive_command(false, false, "");
     let builder = TuiDeck::builder().with_imported_opencode_credentials();
     let (deck, agent_id, _) = launch_agent(builder, "minimal", &launch, &command, SENTINEL);
     exercise_reading_reply(
@@ -974,7 +974,7 @@ fn prompt_voice_keys_005_opencode_honours_the_served_keys() {
         ready: "Ask anything",
         resubmit_until_empty: false,
     };
-    let command = format!("opencode --model {}", common::opencode_test_model());
+    let command = common::opencode_interactive_command(false, false, "");
     let builder = TuiDeck::builder().with_imported_opencode_credentials();
     let (deck, agent_id, keys) = launch_agent(builder, "minimal", &launch, &command, SENTINEL);
     assert_eq!(

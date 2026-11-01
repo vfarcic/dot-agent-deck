@@ -556,24 +556,19 @@ fn telemetry_otlp_007_real_opencode_telemetry_joins_deck_run() {
         .with_imported_opencode_credentials()
         .with_env("PATH", common::path_with_binary_dir())
         .with_env("OPENCODE_DISABLE_AUTOUPDATE", "1")
-        // Issue #2022: a config dir whose tui.json lists a plugin (the deck's)
-        // makes OpenCode npm-install @opencode-ai/plugin into it before its
-        // first frame. In this fresh HOME that is a registry download that
-        // overran the composer wait. The deck's plugins import no SDK, and
-        // OpenCode logs a failed install and carries on, so fail it at once.
-        .with_env("npm_config_offline", "true")
         .with_env("OTEL_EXPORTER_OTLP_ENDPOINT", &receiver.endpoint)
         .with_env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json")
         .with_continue_session(
             "telemetry-opencode-mini",
-            format!("opencode --model {} --auto", common::opencode_test_model()),
+            common::opencode_interactive_command(false, true, ""),
         )
         .launch_with_fixture("minimal");
     const SENTINEL: &str = "telemetry_opencode_sentinel_7c31.txt";
     const PROOF: &str = "telemetry_opencode_proof_7c31.txt";
     std::fs::write(deck.workdir().join(SENTINEL), "TELEMETRY_OPENCODE_OK\n").unwrap();
     let composer_wait = std::time::Instant::now();
-    let composer = deck.wait_for_grid_string_within("Ask anything", Duration::from_secs(60));
+    let composer = deck.wait_for_grid_string_within("Ask anything", Duration::from_secs(60))
+        && deck.wait_for_grid_string_within(common::OPENCODE_SUBMIT_READY, Duration::from_secs(60));
     let agent = common::agent_records_on(deck.attach_socket_path())
         .into_iter()
         .find(|agent| agent.display_name.as_deref() == Some("telemetry-opencode-mini"));
