@@ -5262,7 +5262,7 @@ impl PaneWriter {
 
     /// PRD #1666 part 3 (Q35-15; R5 §4.3): hand an attach frame to the
     /// generation's fence gate. With no fence, it is written now and
-    /// awaited, as [`Self::write_user_ticketed`] writes it; a reply that
+    /// awaited, as `write_user_ticketed` writes it; a reply that
     /// passes ahead of one is too, accepted by the gate's decision itself and
     /// not classified again at its enqueue. While a fence holds input, it is
     /// held, ticket and all, and the caller reads its next frame; a zero-byte
@@ -5461,6 +5461,7 @@ impl PaneWriter {
     /// [`Self::write_user`] for a human operation admitted to the
     /// generation's ledger: the job carrying the bytes takes `ticket` over and
     /// settles it when it ends (PRD #1666 part 3, round 5-wake).
+    #[cfg(test)]
     pub(crate) async fn write_user_ticketed(
         &self,
         bytes: &[u8],
@@ -5470,7 +5471,7 @@ impl PaneWriter {
             .await
     }
 
-    /// [`Self::write_user_ticketed`] for a frame whose acceptance is
+    /// `write_user_ticketed` for a frame whose acceptance is
     /// `acceptance`.
     async fn write_user_accepted(
         &self,
@@ -5936,7 +5937,9 @@ struct PtyWritePauseArm {
 
 /// Issue #525: one job for [`PtyWriterThread`].
 enum PtyOp {
-    /// One `write` call, as [`std::io::Write::write`] makes it.
+    /// One `write` call, as [`std::io::Write::write`] makes it: the test
+    /// build's blocking writer only (Q16-2).
+    #[cfg(test)]
     Write(Vec<u8>, ByteSource),
     /// Every byte, retrying `Interrupted` and stopping at the first error —
     /// [`write_all_tracked`]'s loop, run where the PTY can block. With `true`,
@@ -5949,6 +5952,7 @@ enum PtyOp {
     /// [`Self::WriteAll`] as [`ByteSource::Answer`], written only if its
     /// [`AnswerGate`] still holds when the thread comes to it.
     Answer(Vec<u8>, AnswerGate),
+    #[cfg(test)]
     Flush,
     /// Test seam: hand the PTY writer back and stop the thread — see
     /// [`AgentPtyRegistry::replace_agent_writer_for_test`].
@@ -5985,6 +5989,8 @@ enum PtyJobOutcome {
 
 enum PtyReply {
     Async(oneshot::Sender<PtyJobDone>),
+    /// The test build's blocking writer and seams (Q16-2).
+    #[cfg(test)]
     Blocking(std::sync::mpsc::SyncSender<PtyJobDone>),
 }
 
@@ -6216,10 +6222,11 @@ impl PtyOp {
             ByteSource::Answer => Writer::Answer,
         };
         match self {
-            PtyOp::Write(buf, source) | PtyOp::WriteAll(buf, source, _) => {
-                Some((writer(*source), buf))
-            }
+            #[cfg(test)]
+            PtyOp::Write(buf, source) => Some((writer(*source), buf)),
+            PtyOp::WriteAll(buf, source, _) => Some((writer(*source), buf)),
             PtyOp::Answer(buf, _) => Some((writer(ByteSource::Answer), buf)),
+            #[cfg(test)]
             PtyOp::Flush => None,
             #[cfg(test)]
             PtyOp::Surrender(_) => None,
@@ -6229,7 +6236,10 @@ impl PtyOp {
     /// How many bytes the job hands the PTY.
     fn len(&self) -> usize {
         match self {
-            PtyOp::Write(buf, _) | PtyOp::WriteAll(buf, _, _) | PtyOp::Answer(buf, _) => buf.len(),
+            PtyOp::WriteAll(buf, _, _) | PtyOp::Answer(buf, _) => buf.len(),
+            #[cfg(test)]
+            PtyOp::Write(buf, _) => buf.len(),
+            #[cfg(test)]
             PtyOp::Flush => 0,
             #[cfg(test)]
             PtyOp::Surrender(_) => 0,
@@ -6465,6 +6475,7 @@ impl PtyWriterThread {
                     #[cfg(any(test, feature = "e2e"))]
                     thread_controls.begin_job(matches!(op, PtyOp::Answer(..)));
                     let done = match op {
+                        #[cfg(test)]
                         PtyOp::Write(buf, source) => {
                             match write_once_recorded(
                                 inner.as_mut(),
@@ -6517,6 +6528,7 @@ impl PtyWriterThread {
                                 }
                             }
                         }
+                        #[cfg(test)]
                         PtyOp::Flush => PtyJobDone {
                             accepted: 0,
                             result: inner.flush(),
@@ -6579,6 +6591,7 @@ impl PtyWriterThread {
                         PtyReply::Async(tx) => {
                             let _ = tx.send(done);
                         }
+                        #[cfg(test)]
                         PtyReply::Blocking(tx) => {
                             let _ = tx.send(done);
                         }
@@ -6602,12 +6615,13 @@ impl PtyWriterThread {
         )
     }
 
+    #[cfg(test)]
     fn submit(&self, op: PtyOp, reply: PtyReply) -> Option<Arc<crate::doorbell_txn::JobClaim>> {
         self.submit_claimed(op, reply, None, Arc::default())
             .map(|(state, _)| state)
     }
 
-    /// [`Self::submit`], carrying a human operation's ticket: its ownership
+    /// `submit`, carrying a human operation's ticket: its ownership
     /// moves into the job, and the ledger's job mark with it, in one hold of
     /// the ledger around the queueing (PRD #1666 part 3, round 5-wake).
     fn submit_ticketed(
@@ -6874,8 +6888,10 @@ impl PtyWriterThread {
         outcome
     }
 
-    /// The blocking counterpart of [`Self::run`], for [`std::io::Write`]: no
+    /// The blocking counterpart of [`Self::run`], for the test build's
+    /// [`std::io::Write`]: no
     /// bound, and the calling thread waits as it did when it wrote itself.
+    #[cfg(test)]
     fn run_blocking(&self, op: PtyOp) -> Option<PtyJobDone> {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         self.submit(op, PtyReply::Blocking(tx))?;
@@ -7072,6 +7088,12 @@ fn write_all_recorded(
 /// through the candidate and returns that short count, which
 /// [`std::io::Write`] allows, and the caller's next call carries the rest,
 /// which the planner reads then, once. Nothing cuts otherwise.
+///
+/// Test-only (Q16-2): it writes past the fence gate, so no production path
+/// may type through it. A person's bytes reach the PTY through
+/// [`PaneWriter::accept`] (the attach loop, `write_user_bytes`) or
+/// [`PaneWriter::write_answer`], both of which pass the gate.
+#[cfg(test)]
 impl std::io::Write for PaneWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let cut = self
@@ -12763,6 +12785,14 @@ impl AgentPtyRegistry {
     /// pane's live generation: one human operation admitted to its ledger,
     /// the generation checked again under its writer before the write, and
     /// nothing written for any other. Answers how far it got.
+    ///
+    /// PRD #1666 part 3 (Q16-2): the bytes pass the generation's fence gate
+    /// as an attach frame does ([`PaneWriter::accept`]): written now with no
+    /// fence, cut by the planner while a liability is out, and held while a
+    /// fence holds input, in which case this answers `Ok` once the gate owns
+    /// them, as the attach loop reads on. With no room behind the fence it
+    /// waits for its place with the writer's lock dropped, checking the
+    /// generation again before each offer.
     pub async fn write_user_bytes(
         &self,
         pane_id: &str,
@@ -12773,26 +12803,43 @@ impl AgentPtyRegistry {
         let owner = |target: &PaneWriterTarget| {
             target.agent_id == agent_id && !target.exited.load(Ordering::SeqCst)
         };
-        let Some(target) = self.writer_target_for_pane(pane_id).filter(owner) else {
-            if let Some(ticket) = ticket {
-                ticket.refuse("not the pane's generation");
+        let mut frame = UserFrame::new(bytes.to_vec(), ticket, None);
+        let mut waiter = None;
+        let mut noted = false;
+        loop {
+            let Some(target) = self.writer_target_for_pane(pane_id).filter(owner) else {
+                frame.refuse("not the pane's generation");
+                return Err("not the pane's generation");
+            };
+            let w = target.writer.lock().await;
+            if !self
+                .writer_target_for_pane(pane_id)
+                .is_some_and(|t| owner(&t))
+            {
+                drop(w);
+                frame.refuse("not the pane's generation");
+                return Err("not the pane's generation");
             }
-            return Err("not the pane's generation");
-        };
-        let w = target.writer.lock().await;
-        if !self
-            .writer_target_for_pane(pane_id)
-            .is_some_and(|t| owner(&t))
-        {
-            if let Some(ticket) = ticket {
-                ticket.refuse("not the pane's generation");
+            if !noted {
+                w.note_user_input(pane_id);
+                noted = true;
             }
-            return Err("not the pane's generation");
+            match w.accept(frame, waiter.take()).await {
+                Accepted::Written(result) => return result.map_err(|_| "the write failed"),
+                Accepted::Held => return Ok(()),
+                Accepted::Full(back, mut place) => {
+                    drop(w);
+                    place.changed().await;
+                    frame = back;
+                    waiter = Some(place);
+                }
+                Accepted::Retired(back) => {
+                    drop(w);
+                    back.refuse("exited");
+                    return Err("not the pane's generation");
+                }
+            }
         }
-        w.note_user_input(pane_id);
-        w.write_user_ticketed(bytes, ticket)
-            .await
-            .map_err(|_| "the write failed")
     }
 
     /// PRD #1666 part 3, round 5-wake (plan §2.1′): admit one human operation
@@ -26781,6 +26828,38 @@ mod spawn_tests {
             RingOutcome::Txn(Outcome::Submitted),
             "control"
         );
+        registry.shutdown_all();
+    }
+
+    /// Scenario: Close a live generation's fence and type a person's keys through the registry's `write_user_bytes`, as the deck's test paths do. The keys are held behind the fence, ticket and all, and nothing reaches the pane; once the fence is released they are written once, in order (Q16-2: no path writes a person's bytes past the gate).
+    #[spec("inbox/probe/011")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn probe_011_typing_through_the_registry_waits_behind_a_closed_fence() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-registry-typing-fenced", OnEnter::Submit);
+        let (gate, writer) = registry
+            .composer_fence(&editor.id)
+            .expect("the generation's gate");
+        assert!(gate.fence());
+        let ledger = registry.ingress_ledger(&editor.id).unwrap();
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, b"HELD")
+            .await
+            .expect("accepted");
+        let status = gate.status();
+        assert_eq!(
+            (status.held_ops, status.held_bytes),
+            (1, 4),
+            "the gate holds the keys"
+        );
+        assert!(ledger.any_outstanding(), "its ticket stays with the gate");
+        assert!(
+            editor.typed().is_empty(),
+            "nothing past the fence: {:?}",
+            String::from_utf8_lossy(&editor.typed())
+        );
+        assert_eq!(writer.lock().await.release_fence(Ok(())), 1);
+        typed_until(&editor, |typed| typed == b"HELD").await;
         registry.shutdown_all();
     }
 

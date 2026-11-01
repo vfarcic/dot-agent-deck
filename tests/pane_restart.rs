@@ -1188,8 +1188,6 @@ fn pane_restart_015_draft_wait_does_not_block_restart_or_lose_delegate() {
         .build()
         .expect("build draft-and-restart runtime")
         .block_on(async {
-            use std::io::Write as _;
-
             const DRAFT: &str = "restart-draft-must-stay-with-old-worker";
             let fx = fixture("cat").await;
             tokio::fs::write(
@@ -1199,18 +1197,13 @@ fn pane_restart_015_draft_wait_does_not_block_restart_or_lose_delegate() {
             .await
             .expect("configure delivery to the current worker");
 
-            let handle = fx
-                .daemon
+            // Typed as a person's keys, through the generation's fence gate
+            // (PRD #1666 part 3, Q16-2: the blocking writer is test-only).
+            fx.daemon
                 .registry
-                .subscribe(&fx.worker_agent_id)
-                .expect("subscribe to worker input");
-            {
-                let mut writer = handle.writer.lock().await;
-                writer
-                    .write_all(DRAFT.as_bytes())
-                    .expect("type worker draft");
-                writer.flush().expect("flush worker draft");
-            }
+                .write_user_bytes(WORKER_PANE, &fx.worker_agent_id, DRAFT.as_bytes())
+                .await
+                .expect("type worker draft");
             assert!(
                 fx.daemon.registry.draft_pending(WORKER_PANE),
                 "precondition: the worker has no unsent draft"
