@@ -90,7 +90,7 @@ pub(crate) enum ProbeRefusal {
 /// How a probe's job ended.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProbeEnd {
+pub(super) enum ProbeEnd {
     Written { offset: u64, at: Instant },
     WriteFailed,
     Refused(ProbeRefusal),
@@ -114,7 +114,7 @@ type SectionOutcome = Arc<Mutex<Option<Result<(u64, Instant), ProbeRefusal>>>>;
 
 #[cfg(target_os = "linux")]
 impl ProbeJob {
-    async fn end(mut self) -> ProbeEnd {
+    pub(super) async fn end(mut self) -> ProbeEnd {
         let done = (&mut self.done).await;
         let section = *self.section.lock().unwrap_or_else(|e| e.into_inner());
         match (done, section) {

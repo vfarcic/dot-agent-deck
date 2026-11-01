@@ -8371,6 +8371,12 @@ mod doorbell_ring;
 /// live gate: the probe job and the release driver.
 #[path = "agent_pty_segments.rs"]
 mod segment_driver;
+
+/// PRD #1666 part 3 (Q35-20b, plan §3.7, X-3): the release-authority oracle
+/// on the production driver.
+#[cfg(all(test, target_os = "linux"))]
+#[path = "agent_pty_release_oracle_tests.rs"]
+mod release_oracle_tests;
 pub use doorbell_ring::{RingOutcome, RingReport};
 #[cfg(feature = "e2e")]
 pub(crate) use segment_driver::{ProbeAsk, ProbeOutcome};
