@@ -16,6 +16,17 @@
 //!    caller. Several are ambiguous, and an orchestration's worker is never
 //!    reached this way either.
 //!
+//! Issue #2053 adds two narrower keys, so two standalone agents in one folder
+//! can be told apart. `name` matches a standalone agent's name exactly (the
+//! NAME column of `dot-agent-deck roles`), and never an orchestration member,
+//! so it cannot be combined with `orchestration`. `pane` matches the one agent
+//! in that pane: a standalone agent, or an orchestration's orchestrator seat,
+//! never a worker. Either intersects with `folder` (by the same nearest-ancestor
+//! rule) and with the other, and several matches are still ambiguous. A client
+//! sends either only to a daemon that advertises
+//! [`crate::daemon_protocol::CAP_ADDRESSED_MESSAGE_AGENT`], since an older one
+//! would drop the field and resolve the rest of the address without it.
+//!
 //! The same [`select`] filters `dot-agent-deck roles`, on the client, so a
 //! listing previews what a send would reach.
 //!
@@ -65,6 +76,31 @@ pub struct MessageAddress {
     /// An orchestration's config name or display title, matched exactly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestration: Option<String>,
+    /// Issue #2053: a standalone agent's name ([`agent_name`]), matched
+    /// exactly. Never combined with `orchestration`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Issue #2053: the pane of a standalone agent or of an orchestration's
+    /// orchestrator, matched exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<String>,
+}
+
+impl MessageAddress {
+    /// Whether this address names one agent (issue #2053), which a client
+    /// sends only to a daemon advertising
+    /// [`crate::daemon_protocol::CAP_ADDRESSED_MESSAGE_AGENT`].
+    pub fn names_an_agent(&self) -> bool {
+        self.name.is_some() || self.pane.is_some()
+    }
+
+    /// Whether this address names anything at all.
+    pub fn is_empty(&self) -> bool {
+        self.folder.is_none()
+            && self.orchestration.is_none()
+            && self.name.is_none()
+            && self.pane.is_none()
+    }
 }
 
 /// The answer to [`crate::daemon_protocol::AttachRequest::AddressedMessage`],
@@ -298,6 +334,9 @@ pub fn select<'a>(
     exclude_pane: Option<&str>,
 ) -> Selection<'a> {
     let target = address.folder.as_deref().map(key);
+    if address.names_an_agent() {
+        return select_agent(records, address, target.as_deref(), key, exclude_pane);
+    }
     let mut found = orchestrations(records);
     if let Some(name) = address.orchestration.as_deref() {
         found.retain(|o| o.name == name || o.title == name);
@@ -326,6 +365,62 @@ pub fn select<'a>(
     Selection::Nothing
 }
 
+/// [`select`] for an address that names one agent by `name` and/or `pane`
+/// (issue #2053). A worker is never selected; `name` selects only standalone
+/// agents; `pane` also selects the orchestration whose orchestrator holds it.
+fn select_agent<'a>(
+    records: &'a [AgentRecord],
+    address: &MessageAddress,
+    target: Option<&str>,
+    key: &dyn Fn(&str) -> String,
+    exclude_pane: Option<&str>,
+) -> Selection<'a> {
+    let pane = address.pane.as_deref();
+    if address.name.is_none()
+        && let Some(pane) = pane
+    {
+        let mut found = orchestrations(records);
+        found.retain(|o| {
+            o.orchestrator
+                .is_some_and(|seat| seat.pane_id_env.as_deref() == Some(pane))
+        });
+        if let Some(name) = address.orchestration.as_deref() {
+            found.retain(|o| o.name == name || o.title == name);
+        }
+        if let Some(target) = target {
+            found = by_folder(found, target, |o| key(o.folder));
+        }
+        if !found.is_empty() {
+            return Selection::Orchestrations(found);
+        }
+    }
+    if address.orchestration.is_some() {
+        return Selection::Nothing;
+    }
+    let mut standalone: Vec<&AgentRecord> = records
+        .iter()
+        .filter(|r| !is_member(r))
+        .filter(|r| r.pane_id_env.is_some() && r.pane_id_env.as_deref() != exclude_pane)
+        .filter(|r| pane.is_none_or(|pane| r.pane_id_env.as_deref() == Some(pane)))
+        .filter(|r| {
+            address
+                .name
+                .as_deref()
+                .is_none_or(|name| agent_name(r) == name)
+        })
+        .collect();
+    if let Some(target) = target {
+        standalone = by_folder(standalone, target, |r| {
+            r.cwd.as_deref().map(key).unwrap_or_default()
+        });
+    }
+    if standalone.is_empty() {
+        Selection::Nothing
+    } else {
+        Selection::Standalone(standalone)
+    }
+}
+
 /// The one recipient an address resolved to.
 #[derive(Debug)]
 pub enum Resolution<'a> {
@@ -350,6 +445,12 @@ fn describe(address: &MessageAddress) -> String {
     if let Some(name) = &address.orchestration {
         parts.push(format!("named {}", shown(name)));
     }
+    if let Some(name) = &address.name {
+        parts.push(format!("whose agent name is {}", shown(name)));
+    }
+    if let Some(pane) = &address.pane {
+        parts.push(format!("in pane {}", shown(pane)));
+    }
     if let Some(folder) = &address.folder {
         parts.push(format!("in or above {}", shown(folder)));
     }
@@ -368,6 +469,20 @@ pub fn resolve<'a>(
     caller_pane: &str,
 ) -> Result<Resolution<'a>, Refusal> {
     match select(records, address, key, Some(caller_pane)) {
+        Selection::Nothing if address.names_an_agent() => Err(Refusal::new(
+            AddressRefusalReason::NoMatch,
+            format!(
+                "refused: no live {} {}; nothing to message there, and nothing was sent. \
+                 A worker, and your own pane, are never reached this way. Run \
+                 `dot-agent-deck roles` to see what is live.",
+                if address.name.is_some() {
+                    "standalone agent"
+                } else {
+                    "standalone agent or orchestrator"
+                },
+                describe(address)
+            ),
+        )),
         Selection::Nothing => Err(Refusal::new(
             AddressRefusalReason::NoMatch,
             format!(
@@ -454,12 +569,22 @@ pub fn resolve<'a>(
         }
         Selection::Standalone(found) => Err(Refusal {
             reason: AddressRefusalReason::Ambiguous,
-            message: format!(
-                "refused: ambiguous: no orchestration is {}, and {} standalone agents are; \
-                 nothing was sent.",
-                describe(address),
-                found.len()
-            ),
+            message: if address.names_an_agent() {
+                format!(
+                    "refused: ambiguous: {} standalone agents are {}; nothing was sent. Narrow \
+                     the address with --folder, or name one agent with --pane.",
+                    found.len(),
+                    describe(address)
+                )
+            } else {
+                format!(
+                    "refused: ambiguous: no orchestration is {}, and {} standalone agents are; \
+                     nothing was sent. Name one with --name or --pane, as \
+                     `dot-agent-deck roles` lists them.",
+                    describe(address),
+                    found.len()
+                )
+            },
             candidates: found
                 .iter()
                 .map(|r| AddressCandidate {
@@ -482,8 +607,25 @@ pub fn validate(address: &MessageAddress) -> Result<(), Refusal> {
             format!("refused: {message}; nothing was sent."),
         ))
     };
-    if address.folder.is_none() && address.orchestration.is_none() {
-        return invalid("give --folder, --orchestration, or both");
+    if address.is_empty() {
+        return invalid("give --folder, --orchestration, --name or --pane");
+    }
+    if address.name.is_some() && address.orchestration.is_some() {
+        return invalid(
+            "--name names a standalone agent, and --orchestration an orchestration's \
+             orchestrator; give one or the other",
+        );
+    }
+    let malformed = |value: &str| {
+        value.trim().is_empty()
+            || value.len() > MAX_NAME_BYTES
+            || value.chars().any(char::is_control)
+    };
+    if address.name.as_deref().is_some_and(malformed) {
+        return invalid("--name must be an agent's name, as `dot-agent-deck roles` lists it");
+    }
+    if address.pane.as_deref().is_some_and(malformed) {
+        return invalid("--pane must be a pane id, as `dot-agent-deck roles` lists it");
     }
     if let Some(folder) = &address.folder
         && !crate::agent_pty::is_valid_orchestration_cwd(folder)
@@ -582,7 +724,7 @@ pub fn reply_target<'a>(
 /// The address an `inbox send` run from `recipient_pane` reaches `reply_to`
 /// by, as the resolver answers it over `records`: `reply_to`'s folder, with
 /// its orchestration's name or title added when the folder alone is not
-/// unique. `None` when no such address resolves to `reply_to` alone, or when
+/// unique, or, for a standalone agent, its name (issue #2053). `None` when no such address resolves to `reply_to` alone, or when
 /// a value it would print would not reach the recipient exactly as written
 /// ([`shown_exactly`]), so a printed command never routes elsewhere.
 pub fn reply_address(
@@ -594,7 +736,7 @@ pub fn reply_address(
     let folder = record_folder(reply_to).filter(|folder| shown_exactly(folder))?;
     let mut addresses = vec![MessageAddress {
         folder: Some(folder.to_string()),
-        orchestration: None,
+        ..MessageAddress::default()
     }];
     if let Some(TabMembership::Orchestration {
         name,
@@ -607,9 +749,16 @@ pub fn reply_address(
                 addresses.push(MessageAddress {
                     folder: Some(folder.to_string()),
                     orchestration: Some(named.clone()),
+                    ..MessageAddress::default()
                 });
             }
         }
+    } else if shown_exactly(agent_name(reply_to)) {
+        addresses.push(MessageAddress {
+            folder: Some(folder.to_string()),
+            name: Some(agent_name(reply_to).to_string()),
+            ..MessageAddress::default()
+        });
     }
     addresses.into_iter().find(|address| {
         validate(address).is_ok()
@@ -647,10 +796,19 @@ pub fn attribution(
         Some(MessageAddress {
             folder: Some(reply_folder),
             orchestration,
+            name: agent,
+            ..
         }) => {
             let named = orchestration
                 .as_deref()
                 .map(|name| format!(" --orchestration {}", quote(name)))
+                // One argv word, so a name that starts with `-` is not read as a
+                // flag (Qodo and Greptile on PR #2055).
+                .or_else(|| {
+                    agent
+                        .as_deref()
+                        .map(|name| format!(" --name={}", quote(name)))
+                })
                 .unwrap_or_default();
             format!(
                 "dot-agent-deck inbox send --folder {}{named} --text '<your reply>'",
@@ -995,6 +1153,7 @@ mod tests {
         MessageAddress {
             folder: folder.map(str::to_string),
             orchestration: name.map(str::to_string),
+            ..MessageAddress::default()
         }
     }
 
@@ -1403,9 +1562,11 @@ mod tests {
     /// Qodo/Greptile on PR #1956: a standalone sender in the folder an
     /// orchestration owns, or below it, cannot be reached by `--folder`: the
     /// resolver picks the orchestration first, and for its own orchestrator
-    /// that is a refusal. No command is offered; the line points at `roles`.
+    /// that is a refusal. Issue #2053: the reply names the sender with
+    /// `--name`, which never matches an orchestration, so it reaches the
+    /// sender alone.
     #[test]
-    fn a_standalone_sender_at_or_below_an_orchestrations_folder_gets_no_command() {
+    fn a_standalone_sender_at_or_below_an_orchestrations_folder_is_named() {
         for caller_dir in ["/w/team", "/w/team/sub"] {
             let mut records = team("cfg", Some("cfg · t"), "t", "/w/team");
             records.push(record("solo", caller_dir, None));
@@ -1418,11 +1579,18 @@ mod tests {
             let body = content_among(&records, &records[2], "t-o", "hi").body;
             assert_eq!(
                 reply_line(&body),
-                "reply with: run dot-agent-deck roles and find pane solo \
-                 (no address reaches it alone)",
+                format!(
+                    "reply with: dot-agent-deck inbox send --folder {caller_dir} --name=name-solo \
+                     --text '<your reply>'"
+                ),
                 "{caller_dir}: {body}"
             );
-            assert!(!body.contains("--folder"), "{caller_dir}: {body}");
+            let named = MessageAddress {
+                name: Some("name-solo".to_string()),
+                ..by(Some(caller_dir), None)
+            };
+            let target = resolve(&records, &named, &same, "t-o").map(|r| r.target().id.clone());
+            assert_eq!(target.unwrap(), "agent-solo", "{caller_dir}");
         }
     }
 

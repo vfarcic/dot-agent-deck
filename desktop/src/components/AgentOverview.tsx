@@ -1318,7 +1318,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     const cli = cliPlan && selfUpgrade?.check && selfUpgrade.api ? { check: selfUpgrade.check, api: selfUpgrade.api } : undefined;
     if (!cli) return daemon ? { onUpgrade: () => setUpgrade(daemon), upgradeTitle: daemonTitle } : {};
     return {
-      onUpgrade: () => setLocalUpgrade({ daemon, cli }),
+      onUpgrade: () => setLocalUpgrade({ daemon, copies: cli }),
       upgradeLabel: daemon ? "Upgrade the CLI and the daemon on this machine" : "Upgrade the CLI on this machine",
       upgradeTitle: [displayText(cliPlan!.headline, DISPLAY_LIMITS.message), daemon ? daemonTitle : undefined].filter(Boolean).join(" "),
     };

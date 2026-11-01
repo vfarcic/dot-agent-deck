@@ -350,7 +350,7 @@ One file per user holds every schedule on a machine:
 
 | Platform | Path |
 |---|---|
-| Linux, macOS | `$XDG_CONFIG_HOME/dot-agent-deck/schedules.toml`, or `~/.config/dot-agent-deck/schedules.toml` when `XDG_CONFIG_HOME` is unset or empty |
+| Linux, macOS | `$XDG_CONFIG_HOME/dot-agent-deck/schedules.toml`, or `~/.config/dot-agent-deck/schedules.toml` when `XDG_CONFIG_HOME` is unset, empty or not an absolute path |
 | Windows | `%APPDATA%\dot-agent-deck\schedules.toml` |
 
 `DOT_AGENT_DECK_SCHEDULES` replaces the whole path. The CLI and the daemon each read it from their own environment, so set it for both or for neither. A missing file means no schedules. The deck writes the file with owner-only permissions (`0600` on Unix), because prompts may contain secrets.
@@ -447,5 +447,5 @@ Every subcommand that changes the file (`add`, `update`, `remove`, `enable`, `di
 | Variable | Read by | Effect |
 |---|---|---|
 | `DOT_AGENT_DECK_SCHEDULES` | CLI, TUI, daemon | Path of the schedules file. |
-| `XDG_CONFIG_HOME` | CLI, TUI, daemon (Linux, macOS) | Base directory of the default schedules file path. |
+| `XDG_CONFIG_HOME` | CLI, TUI, daemon (Linux, macOS) | Base directory of the default schedules file path. An empty or relative value is ignored. |
 | `DOT_AGENT_DECK_STATE_DIR` | daemon | Where `daemon.log` goes. |

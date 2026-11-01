@@ -152,6 +152,32 @@ test.describe("Upgrade the CLI from the Local daemon section (issue #1753)", () 
   });
 });
 
+test.describe("Upgrade the app and the CLI from the app's notice (issue #2062)", () => {
+  /** Scenario: with the app and this machine's Homebrew CLI one release behind, open the dialog from the Dashboard banner's Upgrade… or from the rail's upgrade button; it shows the app's plan above the CLI's, upgrades the app, then asks about the CLI and upgrades it too, ending at Relaunch with nothing left for the user to upgrade by hand. */
+  for (const entry of ["banner", "rail"] as const) {
+    test(`upgrades the CLI after the app from the ${entry}`, async ({ page }) => {
+      await page.goto("/?fixture=1&state=upgrade&selfupgrade=1");
+      await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+      await page.getByTestId("open-overview").click();
+      await expect(page.getByTestId("daemon-group")).toHaveCount(3);
+
+      await page.getByTestId(entry === "banner" ? "self-upgrade-banner-open" : "self-upgrade-rail").click();
+      const dialog = page.getByTestId("self-upgrade-dialog");
+      await expect(dialog).toHaveAttribute("data-phase", "confirm");
+      await expect(page.getByTestId("self-upgrade-plan-app")).toContainText("Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0)");
+      await expect(page.getByTestId("self-upgrade-plan-cli")).toContainText("dot-agent-deck CLI: update available: v0.47.0 (current: v0.46.0)");
+      await expect(page.getByTestId("self-upgrade-question")).toHaveText("Upgrade Agent Deck (desktop app) to v0.47.0?");
+      await page.getByTestId("self-upgrade-start").click();
+      await expect(page.getByTestId("self-upgrade-result-app")).toContainText("Quit and reopen Agent Deck");
+
+      await expect(page.getByTestId("self-upgrade-question")).toHaveText("Upgrade dot-agent-deck CLI to v0.47.0?");
+      await page.getByTestId("self-upgrade-start").click();
+      await expect(page.getByTestId("self-upgrade-result-cli")).toContainText("it now reports v0.47.0");
+      await expect(page.getByTestId("self-upgrade-relaunch")).toBeVisible();
+    });
+  }
+});
+
 test.describe("Upgrade from the Daemons screen's banner", () => {
   /** Scenario: use Upgrade in the incompatible-daemon banner and read its success; the remedy disappears once the deck is current. */
   test("offers Upgrade beside the other remedies and runs it", async ({ page }) => {

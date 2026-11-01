@@ -938,6 +938,9 @@ pub const CARD_INBOX_INPUT_HELD_METADATA_KEY: &str = "inbox_card_input_held";
 /// Beside [`CARD_INBOX_METADATA_KEY`]: present when
 /// [`CardInbox::input_discarded`] is set.
 pub const CARD_INBOX_INPUT_DISCARDED_METADATA_KEY: &str = "inbox_card_input_discarded";
+/// Beside [`CARD_INBOX_METADATA_KEY`]: the text of the agent's card notice,
+/// when [`CardInbox::agent_notice`] holds one (PRD #2050).
+pub const CARD_INBOX_AGENT_NOTICE_METADATA_KEY: &str = "inbox_card_agent_notice";
 
 /// What a card shows of its agent's inbox.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -981,6 +984,9 @@ pub struct CardInbox {
     /// PRD #1666 part 3 (Q35-20e): typing the pane's previous generation held
     /// was discarded when it retired ([`InputDiscarded`]).
     pub input_discarded: bool,
+    /// PRD #2050: the daemon's notice about a way the agent runs that the deck
+    /// cannot fully support ([`crate::agent_notice::AgentNotice::display_text`]).
+    pub agent_notice: Option<String>,
 }
 
 impl CardInbox {
@@ -1023,15 +1029,22 @@ impl CardInbox {
     }
 
     /// The card's inbox notice row, the same words in both clients, when the
-    /// deck has something to say beyond the line: why the integration takes
-    /// nothing yet, paused hand-outs, what an uncertain delivery means (what
-    /// running out of attempts means, when every uncertain one has: its row
-    /// offers no Retry), what a message the agent may not have received
-    /// means, held_long attention, then failed receipt storage — the first
-    /// that holds. A refused request of the agent's own for its messages comes
-    /// first of all (PRD #1666 part 3, R-2): nothing else reaches it until
-    /// that is fixed.
+    /// deck has something to say beyond the line — the first that holds of:
+    /// the daemon's notice about a way the agent runs that the deck cannot
+    /// fully support (`agent_notice`, PRD #2050), which explains everything
+    /// below it; a refused request of the agent's own for its messages (PRD
+    /// #1666 part 3, R-2), since nothing else reaches it until that is fixed;
+    /// why the integration takes nothing yet; paused hand-outs; what an
+    /// uncertain delivery means (what running out of attempts means, when
+    /// every uncertain one has: its row offers no Retry); what a message the
+    /// agent may not have received means; held_long attention; then failed
+    /// receipt storage.
     pub fn notice_text(&self) -> Option<String> {
+        // PRD #2050: first, because it explains why the agent's integration
+        // takes nothing (or reports nothing) and says what to do about it.
+        if let Some(notice) = self.agent_notice.as_deref().filter(|n| !n.is_empty()) {
+            return Some(notice.to_string());
+        }
         if let Some(code) = &self.admission_refused {
             return Some(admission_refused_text(code));
         }

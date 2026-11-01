@@ -270,10 +270,10 @@ enum Commands {
     /// which one is each orchestration's orchestrator — the agent to message
     /// with `inbox send`.
     ///
-    /// --folder and --orchestration select what `inbox send` would address
-    /// with the same flags (all the agents of each matching orchestration)
-    /// when run on the same machine as the deck, which is how agents in deck
-    /// panes run it, and combine as an intersection.
+    /// --folder, --orchestration, --name and --pane select what `inbox send`
+    /// would address with the same flags (all the agents of each matching
+    /// orchestration) when run on the same machine as the deck, which is how
+    /// agents in deck panes run it, and combine as an intersection.
     Roles {
         /// Print a JSON array instead of the table.
         #[arg(long)]
@@ -283,8 +283,15 @@ enum Commands {
         #[arg(long, value_name = "PATH")]
         folder: Option<String>,
         /// Only the orchestrations with this config name or title.
-        #[arg(long, value_name = "NAME")]
+        #[arg(long, value_name = "NAME", conflicts_with = "name")]
         orchestration: Option<String>,
+        /// Only the standalone agents with this name (the NAME column).
+        #[arg(long, value_name = "NAME", allow_hyphen_values = true)]
+        name: Option<String>,
+        /// Only the standalone agent or orchestrator in this pane (the PANE
+        /// column).
+        #[arg(long, value_name = "PANE", allow_hyphen_values = true)]
+        pane: Option<String>,
     },
     /// Acknowledge a message the deck delivered to you (`m-…`). Exits non-zero
     /// only when the deck says it holds no such message for you; any other
@@ -885,22 +892,33 @@ enum InboxAction {
     /// Message an orchestration's orchestrator from outside it, by folder,
     /// orchestration name, or both. With a folder alone that holds no
     /// orchestration, the one standalone agent there is messaged instead,
-    /// which is how an orchestrator answers a standalone agent. Your text
+    /// which is how an orchestrator answers a standalone agent. --name and
+    /// --pane reach one standalone agent (or, by pane, an orchestrator) as
+    /// `dot-agent-deck roles` lists it, combined with --folder. Your text
     /// arrives as UNTRUSTED data, with the deck naming your pane and how to
     /// reply. A worker reports to its own orchestrator with `work-done`.
     ///
     /// Exit status: 0 sent; 1 refused (nothing matched, the address was
     /// ambiguous, or the orchestrator is not live); 2 the running daemon is
     /// too old for `inbox send`; 3 no daemon is running.
-    #[command(group(clap::ArgGroup::new("address").required(true).multiple(true).args(["folder", "orchestration"])))]
+    #[command(group(clap::ArgGroup::new("address").required(true).multiple(true).args(["folder", "orchestration", "name", "pane"])))]
     Send {
         /// The orchestration in this folder or, when none is, in its nearest
         /// parent folder that has one.
         #[arg(long, value_name = "PATH")]
         folder: Option<String>,
         /// The orchestration with this config name or title.
-        #[arg(long, value_name = "NAME")]
+        #[arg(long, value_name = "NAME", conflicts_with = "name")]
         orchestration: Option<String>,
+        /// The standalone agent with this name (the NAME column of
+        /// `dot-agent-deck roles`), such as one of two in the same folder.
+        /// A name may start with `-`.
+        #[arg(long, value_name = "NAME", allow_hyphen_values = true)]
+        name: Option<String>,
+        /// The standalone agent, or orchestration's orchestrator, in this pane
+        /// (the PANE column of `dot-agent-deck roles`). Never a worker.
+        #[arg(long, value_name = "PANE", allow_hyphen_values = true)]
+        pane: Option<String>,
         #[command(flatten)]
         body: InboxBody,
     },
@@ -1959,8 +1977,10 @@ fn main() -> ExitCode {
             InboxAction::Send {
                 folder,
                 orchestration,
+                name,
+                pane,
                 body,
-            } => run_inbox_send_cli(folder, orchestration, body),
+            } => run_inbox_send_cli(absolute_address(folder, orchestration, name, pane), body),
             InboxAction::Complete { id } => dot_agent_deck::inbox_cli::settle(&id, true),
             InboxAction::Release { id } => dot_agent_deck::inbox_cli::settle(&id, false),
         },
@@ -2095,7 +2115,9 @@ fn main() -> ExitCode {
             json,
             folder,
             orchestration,
-        }) => run_roles_cli(json, folder, orchestration),
+            name,
+            pane,
+        }) => run_roles_cli(json, absolute_address(folder, orchestration, name, pane)),
         Some(Commands::Close {
             units,
             unit_ids,
@@ -3897,11 +3919,15 @@ async fn run_close_cli(args: dot_agent_deck::close_cli::CloseArgs) -> ExitCode {
 fn absolute_address(
     folder: Option<String>,
     orchestration: Option<String>,
+    name: Option<String>,
+    pane: Option<String>,
 ) -> dot_agent_deck::orchestrator_address::MessageAddress {
     let cwd = std::env::current_dir().unwrap_or_default();
     dot_agent_deck::orchestrator_address::MessageAddress {
         folder: folder.map(|f| dot_agent_deck::roles_cli::absolute_folder(&f, &cwd)),
         orchestration,
+        name,
+        pane,
     }
 }
 
@@ -3915,11 +3941,9 @@ fn print_cli_output(output: dot_agent_deck::roles_cli::CliOutput) -> ExitCode {
 #[tokio::main]
 async fn run_roles_cli(
     json: bool,
-    folder: Option<String>,
-    orchestration: Option<String>,
+    address: dot_agent_deck::orchestrator_address::MessageAddress,
 ) -> ExitCode {
     let client = DaemonClient::new(client_attach_socket_path());
-    let address = absolute_address(folder, orchestration);
     print_cli_output(dot_agent_deck::roles_cli::run_roles(&client, json, &address).await)
 }
 
@@ -3928,8 +3952,7 @@ async fn run_roles_cli(
 /// nobody.
 #[tokio::main]
 async fn run_inbox_send_cli(
-    folder: Option<String>,
-    orchestration: Option<String>,
+    address: dot_agent_deck::orchestrator_address::MessageAddress,
     body: InboxBody,
 ) -> ExitCode {
     let identity = match dot_agent_deck::close_cli::ambient_identity() {
@@ -3950,7 +3973,6 @@ async fn run_inbox_send_cli(
         }
     };
     let client = DaemonClient::new(client_attach_socket_path());
-    let address = absolute_address(folder, orchestration);
     print_cli_output(dot_agent_deck::roles_cli::run_send(&client, &identity, address, text).await)
 }
 
@@ -4137,6 +4159,10 @@ async fn run_daemon_serve_cli(
     let restart_control = Arc::new(dot_agent_deck::daemon_restart::RestartControl::new(
         dot_agent_deck::daemon_restart::InstallRecord::capture(),
     ));
+    // PRD #2050 (auditor M2): likewise this binary's file identity, which the
+    // OpenCode plugin install compares with the file at its pin to tell an
+    // older daemon still running after an upgrade from a rolled-back deck.
+    dot_agent_deck::opencode_manage::note_own_executable();
     let refresh_state = state.clone();
     let daemon = Daemon::with_attach(state, attach_path.clone())
         .with_restart_control(restart_control.clone());
@@ -4418,6 +4444,65 @@ mod tests {
     /// `dispatch --orchestration my-unit --task "…"` bound the UNIT NAME as the
     /// orchestration and aborted for a missing positional. A required value makes
     /// both orderings unambiguous.
+    /// Issue #2053 (Qodo and Greptile on PR #2055): an agent's name may start
+    /// with `-`, so `--name` and `--pane` take such a value whether it is
+    /// typed as the next word or as `--name=…`, the form the reply command the
+    /// deck prints uses.
+    #[test]
+    fn name_and_pane_take_a_value_that_starts_with_a_hyphen() {
+        for argv in [
+            &[
+                "dot-agent-deck",
+                "inbox",
+                "send",
+                "--name",
+                "-docs",
+                "--text",
+                "t",
+            ][..],
+            &[
+                "dot-agent-deck",
+                "inbox",
+                "send",
+                "--folder=/w",
+                "--name=--builder",
+                "--text",
+                "t",
+            ],
+            &[
+                "dot-agent-deck",
+                "inbox",
+                "send",
+                "--pane",
+                "-p",
+                "--text",
+                "t",
+            ],
+            &["dot-agent-deck", "roles", "--name", "-docs", "--pane", "-p"],
+        ] {
+            let parsed = Cli::try_parse_from(argv.iter().copied());
+            let (name, pane) = match parsed.map(|cli| cli.command) {
+                Ok(Some(Commands::Inbox {
+                    action: InboxAction::Send { name, pane, .. },
+                })) => (name, pane),
+                Ok(Some(Commands::Roles { name, pane, .. })) => (name, pane),
+                Ok(_) => panic!("{argv:?}: parsed as another command"),
+                Err(error) => panic!("{argv:?}: {error}"),
+            };
+            let given = |flag: &str| {
+                argv.iter()
+                    .position(|a| *a == flag)
+                    .map(|i| argv[i + 1].to_string())
+                    .or_else(|| {
+                        argv.iter()
+                            .find_map(|a| a.strip_prefix(&format!("{flag}=")).map(str::to_string))
+                    })
+            };
+            assert_eq!(name, given("--name"), "{argv:?}");
+            assert_eq!(pane, given("--pane"), "{argv:?}");
+        }
+    }
+
     #[test]
     fn orchestration_value_is_required_so_it_cannot_eat_the_unit_name() {
         // Flag-first with a name still binds correctly: `probe` is the VALUE, and

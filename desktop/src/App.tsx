@@ -47,7 +47,7 @@ import { SettingsSheet } from "./components/SettingsSheet";
 import { VoiceControlPanel, type AgentIncarnation, type VoicePane } from "./components/VoiceControlPanel";
 import { PullRequestBrowser, pullRequestBrowserCovered, type PullRequestBrowserSession } from "./components/PullRequestBrowser";
 import { OpenPullRequest, PrBrowserHostContext } from "./lib/prBrowser";
-import { SelfUpgradeDialog } from "./components/SelfUpgradeDialog";
+import { LocalUpgradeFlow } from "./components/LocalUpgradeFlow";
 import { SelfUpgradeBanner, SelfUpgradeRailButton, noticeOf } from "./components/SelfUpgradeNotice";
 import { tauriSelfUpgradeApi } from "./lib/selfUpgrade";
 import { fixtureSelfUpgradeApi } from "./data/fixture";
@@ -56,7 +56,7 @@ import { SettingsBridgeProvider } from "./lib/settingsBridge";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayText, sanitizeText } from "./lib/displayText";
 import { voicePaneAgent } from "./lib/promptKeys";
 import { CONNECT_ANYWAY_BODY, disconnectedDetails, disconnectedRemedy, incompatibleRemedy, startDaemonConfirmCopy } from "./lib/connectionRemedy";
-import { upgradeKindOf, upgradeOffered } from "./lib/upgrade";
+import { localUpgradeAtStart, upgradeKindOf, upgradeOffered } from "./lib/upgrade";
 import { ConnectionDetail } from "./components/ConnectionDetail";
 import { HookBinaryNotices } from "./components/HookBinaryNotice";
 import { ORCHESTRATION_TITLE_TAKEN, liveOrchestrationDirectories, liveOrchestrationTitles } from "./lib/newAgent";
@@ -281,9 +281,21 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     [runtime.mode],
   );
   const { check: selfUpgrade, recheck: recheckSelfUpgrade } = useSelfUpgradeCheck(selfUpgradeApi);
-  const [selfUpgradeOpen, setSelfUpgradeOpen] = useState(false); // voice-registry-exempt: the newer-release dialog (issue #1635) — opened only by the rail button and the dashboard banner, and it asks before upgrading anything
+  const [selfUpgradeDaemon, setSelfUpgradeDaemon] = useState<{ daemon?: UpgradeTarget }>(); // voice-registry-exempt: the newer-release dialog (issue #1635) — opened only by the rail button and the dashboard banner, and it asks before upgrading anything
+  const selfUpgradeOpen = selfUpgradeDaemon !== undefined;
   const [dismissedSelfUpgrade, setDismissedSelfUpgrade] = useState<string>(); // voice-registry-exempt: which newer-release banner was dismissed — it hides a notice and opens nothing
-  const openSelfUpgrade = useCallback(() => setSelfUpgradeOpen(true), []);
+  /*
+    Issue #2062 — the notice runs the Local daemon section's flow: the app,
+    then this machine's CLI when it is behind, then the local daemon's restart
+    when it runs an older release than this app. The daemon is read when the
+    dialog opens, as the Local daemon section reads it when Upgrade is pressed.
+  */
+  const fleet = runtime.fleet;
+  const upgradeDaemon = runtime.upgradeDaemon;
+  const openSelfUpgrade = useCallback(() => {
+    const local = upgradeDaemon ? localUpgradeAtStart(fleet)?.connection : undefined;
+    setSelfUpgradeDaemon({ daemon: local && { deckId: local.deckId, deckName: deckName(local), kind: upgradeKindOf(local), offer: local.upgradeOffer } });
+  }, [fleet, upgradeDaemon]);
   /**
    * The settings document and the zoom keys live HERE, not in the deck,
    * because both are the app's and not one screen's — and `DeckShell` is the
@@ -1336,7 +1348,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
         {/* voice-registry-exempt: the rail's shortcut-sheet button — the sheet is a `ShellOverlay`, not a `DeckOverlay`, and no registry entry opens it */}
         <NavigationRail screen={screen} overlays={overlaysOpen} context={railContext} connection={runtime.snapshot.connection} features={features} onShowShortcuts={screen === "deck" ? () => setOverlay("deck", "shortcuts", true) : undefined} update={<SelfUpgradeRailButton check={selfUpgrade} onOpen={openSelfUpgrade} />} />
         {screenNode}
-        {selfUpgradeOpen && selfUpgrade && selfUpgradeApi && <SelfUpgradeDialog check={selfUpgrade} api={selfUpgradeApi} copies={["app"]} onClose={() => { setSelfUpgradeOpen(false); recheckSelfUpgrade(); }} />}
+        {selfUpgradeDaemon && selfUpgrade && selfUpgradeApi && <LocalUpgradeFlow entry="notice" copies={{ check: selfUpgrade, api: selfUpgradeApi }} daemon={selfUpgradeDaemon.daemon} runtime={runtime} onClose={() => { setSelfUpgradeDaemon(undefined); recheckSelfUpgrade(); }} />}
         {/* The newer-release dialog asks before upgrading anything, so it counts as a confirmation for voice too (issue #1635). */}
         {/* PRD #1401: with the pull request browser open, voice is on the browser's screen. */}
         <VoiceControlPanel runtime={runtime} screen={prBrowser ? "pull_request" : view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} fleet={runtime.fleet} selectedDeckId={selectedDeckId} confirmationOpen={confirmationOpen || selfUpgradeOpen} reading={settings.loaded ? readingSwitch : undefined} readingAgents={readingAgents} readingDecks={readingDecks} onReadingSwitch={switchReading} onReadingNoticeShown={readingNoticeShown} onVoiceChange={setVoiceOn} agentIncarnations={readAgentIncarnations} numbered={readNumbered} pages={readPager} onChoiceChange={setChoiceOpen} keyboard={panelKeyboard} />

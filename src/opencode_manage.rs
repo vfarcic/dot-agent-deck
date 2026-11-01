@@ -54,6 +54,62 @@ fn stale_plugin_dir(root: &Path) -> PathBuf {
     root.join("plugin").join("dot-agent-deck")
 }
 
+/// PRD #2050: the OpenCode generation an install is for, when it is known.
+///
+/// What it installs does not depend on it wherever a global config root
+/// exists, so that a machine running both generations side by side, or a
+/// spawn of each in turn, rewrites nothing: OpenCode 2 reloads its plugins
+/// when the module file changes, which ends a live 2.x pane's turn (measured
+/// on 2.2.5, [`remember_layout`]). In every layout:
+///
+/// - the server module, one file whose default export carries both
+///   generations' implementations, goes in the existing global roots
+///   ([`global_roots`]: `$XDG_CONFIG_HOME/opencode`, which 1.x loads, and
+///   `$OPENCODE_CONFIG_DIR`, 2.x's global root when set), and the deck's own
+///   copy in `~/.opencode` is removed once 2.x's global root holds the module,
+///   since 2.x also scans `~/.opencode` for a project under `$HOME` and
+///   refuses a second copy of the same plugin id (`Duplicate plugin ID`);
+/// - both TUI halves are installed (the 1.x file listed in `tui.json`, the
+///   2.x directory `plugins/dot-agent-deck-tui/`), which do not see each
+///   other.
+///
+/// The one difference: when no global root exists yet, [`Layout::V2`]
+/// creates 2.x's (a 2.x was detected, so OpenCode is installed and creates it
+/// itself, and 2.x would not load a module only in `~/.opencode` for a project
+/// outside `$HOME`), while [`Layout::V1`] and [`Layout::Unknown`] keep the
+/// fan-out into every existing root. The TUI halves create the global root on
+/// that install, so the next one moves the module there, once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    V1,
+    V2,
+    Unknown,
+}
+
+impl Layout {
+    /// The layout for a detected generation, [`Layout::Unknown`] for none.
+    pub fn for_major(major: Option<crate::opencode_version::Major>) -> Self {
+        match major {
+            Some(crate::opencode_version::Major::V1) => Layout::V1,
+            Some(crate::opencode_version::Major::V2) => Layout::V2,
+            None => Layout::Unknown,
+        }
+    }
+}
+
+/// PRD #2050: OpenCode 2.x's TUI plugin directory under a config root. A
+/// directory, because 2.x resolves a TUI half only from a directory plugin;
+/// it holds no `server.js`/`index.js`, so 2.x does not load it as a server
+/// plugin, and OpenCode 1.x's one-level file glob does not see it.
+fn tui_v2_dir(root: &Path) -> PathBuf {
+    root.join("plugins").join("dot-agent-deck-tui")
+}
+
+/// The 2.x TUI plugin file, `<root>/plugins/dot-agent-deck-tui/tui.js`.
+fn tui_v2_file(root: &Path) -> PathBuf {
+    tui_v2_dir(root).join("tui.js")
+}
+
 /// PRD #163 M1: route the home lookup through the platform seam instead of
 /// reading `$HOME` directly, so that on Windows — where `$HOME` is normally
 /// unset — the OpenCode plugin roots resolve under `%USERPROFILE%` instead of
@@ -67,10 +123,90 @@ fn home_dir() -> PathBuf {
     crate::platform::paths::home_dir_with_tmp_fallback()
 }
 
+/// `$XDG_CONFIG_HOME`, else `~/.config`. An empty or relative value is
+/// ignored, as the XDG base-directory spec says
+/// ([`crate::platform::paths::absolute_dir_from_env`]): taken literally, an
+/// empty `XDG_CONFIG_HOME=` made the install write `opencode/` into the
+/// current directory. (OpenCode itself, 1.18.35 and 2.2.5 alike, ignores an
+/// empty value too, but resolves a relative one against its own working
+/// directory, which the deck cannot know, so a relative value has no root
+/// the deck could write into.) Read on every platform, as OpenCode reads it.
 fn xdg_config_root(home: &Path) -> PathBuf {
-    std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| home.join(".config"))
+    xdg_config_root_from(home, std::env::var_os("XDG_CONFIG_HOME").as_deref())
+}
+
+/// [`xdg_config_root`] for an explicit `XDG_CONFIG_HOME` value.
+fn xdg_config_root_from(home: &Path, xdg_config_home: Option<&std::ffi::OsStr>) -> PathBuf {
+    crate::platform::paths::absolute_dir_from_env(xdg_config_home)
+        .unwrap_or_else(|| home.join(".config"))
+}
+
+/// PRD #2050: `$OPENCODE_CONFIG_DIR`, when it names an absolute directory.
+///
+/// Measured: OpenCode 2.2.5 takes it as its global config root instead of
+/// `$XDG_CONFIG_HOME/opencode` (`opencode debug paths`), so the server module,
+/// the 2.x TUI half and `cli.json` live there. OpenCode 1.18.35 keeps
+/// `$XDG_CONFIG_HOME/opencode` as its global root and scans this directory as
+/// an extra one, for plugins (`plugin/`) and `tui.json` alike, so for 1.x it
+/// is one more root of the fan-out ([`candidate_roots`]). Both ignore an
+/// empty value; a relative one is ignored here for the reason
+/// [`xdg_config_root`] gives.
+fn opencode_config_dir() -> Option<std::ffi::OsString> {
+    std::env::var_os("OPENCODE_CONFIG_DIR")
+}
+
+/// PRD #2050: OpenCode 2.x's global config root: `$OPENCODE_CONFIG_DIR`, else
+/// `$XDG_CONFIG_HOME/opencode` ([`opencode_config_dir`]).
+fn v2_global_root() -> PathBuf {
+    roots_from(
+        &home_dir(),
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        opencode_config_dir().as_deref(),
+    )
+    .1
+}
+
+/// The OpenCode config roots for `home` and the values of `XDG_CONFIG_HOME`
+/// and `OPENCODE_CONFIG_DIR`: the roots every install considers
+/// ([`candidate_roots`]), and OpenCode 2.x's global root ([`v2_global_root`]).
+fn roots_from(
+    home: &Path,
+    xdg_config_home: Option<&std::ffi::OsStr>,
+    config_dir: Option<&std::ffi::OsStr>,
+) -> (Vec<PathBuf>, PathBuf) {
+    let xdg = xdg_config_root_from(home, xdg_config_home).join("opencode");
+    let config_dir = crate::platform::paths::absolute_dir_from_env(config_dir);
+    let mut roots = vec![xdg.clone(), home.join(".opencode")];
+    if let Some(dir) = &config_dir
+        && !roots.contains(dir)
+    {
+        roots.push(dir.clone());
+    }
+    (roots, config_dir.unwrap_or(xdg))
+}
+
+/// PRD #2050, review S3: the roots an install that knows no OpenCode version
+/// writes the server module to: every root of `roots` but the legacy
+/// `~/.opencode` (`roots[1]`, [`roots_from`]), unless that is also 2.x's
+/// global root `v2_global`. OpenCode 1.x loads the XDG global root as well,
+/// so these serve either generation, and 2.x, which also scans `~/.opencode`
+/// for a project under `$HOME`, finds no duplicate there. The legacy root
+/// gets a copy only from a layout that positively detected 1.x.
+///
+/// With `$OPENCODE_CONFIG_DIR` set these are the XDG root and that directory,
+/// and neither generation meets a duplicate it refuses (review F6). Measured
+/// on 2.2.5 with a probe plugin in both: `opencode debug config --standalone`
+/// listed `$OPENCODE_CONFIG_DIR` as its only config source, and only that
+/// copy loaded; the XDG copy is the one 1.x's global root needs. OpenCode
+/// 1.18.35 loads both, as it does under [`Layout::V1`], and the module's own
+/// duplicate-load guard keeps one of them inert.
+fn global_roots(roots: &[PathBuf], v2_global: &Path) -> Vec<PathBuf> {
+    roots
+        .iter()
+        .enumerate()
+        .filter(|(n, root)| *n != 1 || root.as_path() == v2_global)
+        .map(|(_, root)| root.clone())
+        .collect()
 }
 
 /// The XDG-default OpenCode config root (`$XDG_CONFIG_HOME/opencode`, defaulting
@@ -87,12 +223,18 @@ fn xdg_default_root() -> PathBuf {
 /// existence — that is the caller's job. This is the single source of truth for which
 /// layouts we touch, shared by `existing_plugin_artifacts` (uninstall), `auto_install`,
 /// and `install`. Adding a future layout is a one-line change here.
+///
+/// PRD #2050: `$OPENCODE_CONFIG_DIR` ([`opencode_config_dir`]) comes last when
+/// it names another directory, since OpenCode 1.x loads plugins from it too.
+/// The first root stays `$XDG_CONFIG_HOME/opencode`, 1.x's global root, where
+/// the 1.x TUI half goes; OpenCode 2.x's global root is [`v2_global_root`].
 fn candidate_roots() -> Vec<PathBuf> {
-    let home = home_dir();
-    vec![
-        xdg_config_root(&home).join("opencode"),
-        home.join(".opencode"),
-    ]
+    roots_from(
+        &home_dir(),
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        opencode_config_dir().as_deref(),
+    )
+    .0
 }
 
 /// All plugin artifacts that currently exist on disk across candidate roots (XDG
@@ -113,6 +255,23 @@ fn existing_plugin_artifacts() -> Vec<PathBuf> {
     }
     artifacts
 }
+
+/// PRD #2050 (audit N4): the revision of the server module's template, which
+/// the module declares as `DAD_TEMPLATE_REVISION` ([`template_revision`]).
+/// **Bump it whenever the template's output changes**:
+/// `the_template_revision_is_bumped_with_the_template` fails until it is.
+///
+/// An automatic install leaves a module of a later revision than this one
+/// alone while the pin it carries is usable and is either another install or
+/// this install replaced under a running process (audit N4,
+/// [`running_other_than`]): after a deck upgrade, the older daemon still
+/// running would otherwise write its older template back on its next
+/// OpenCode spawn, since its pin is the same path, and OpenCode 2 reloads its
+/// plugins on every such write. A deck rolled back at the same path is the
+/// file at its pin, so it writes its own template. Only a daemon built with
+/// this check keeps from downgrading: one built before it writes its own
+/// template as it always did.
+const PLUGIN_TEMPLATE_REVISION: u32 = 2;
 
 /// Render the plugin JavaScript with `BINARY_PATH` pinned to `binary_path`.
 ///
@@ -135,11 +294,13 @@ fn existing_plugin_artifacts() -> Vec<PathBuf> {
 fn plugin_template(binary_path: &str) -> String {
     let binary_path_json =
         serde_json::to_string(binary_path).expect("serializing a &str to a String is infallible");
-    let inbox = inbox_js(SERVER_INBOX_JS);
+    let inbox = inbox_js(&format!("{SERVER_INBOX_JS}{SERVER_INBOX_V2_JS}"));
     let usage = USAGE_FILE_JS;
+    let entry = format!("{SERVER_ENTRY_JS}{SERVER_V2_JS}");
+    let revision = PLUGIN_TEMPLATE_REVISION;
     format!(
         r#"import {{ execFile, execFileSync, spawn }} from "child_process";
-import {{ closeSync, constants as fsConstants, fstatSync, openSync, writeSync }} from "fs";
+import {{ closeSync, constants as fsConstants, fstatSync, openSync, readFileSync, readlinkSync, writeSync }} from "fs";
 import {{ isMainThread }} from "worker_threads";
 
 // Duplicate-load guard. The installer fans out to EVERY candidate config root
@@ -156,6 +317,9 @@ const DAD_GUARD = "__dotAgentDeckPluginLoaded";
 const DAD_ALREADY_LOADED = globalThis[DAD_GUARD] === true;
 globalThis[DAD_GUARD] = true;
 
+// Which template this is (PLUGIN_TEMPLATE_REVISION in the deck's source): an
+// automatic install leaves a module of a later revision alone.
+const DAD_TEMPLATE_REVISION = {revision};
 const BINARY_PATH = {binary_path_json};
 const knownSessions = new Map();
 // Pending user messages, by message id, until their text part arrives: at most
@@ -316,6 +480,17 @@ const noteResolved = (requestId) => {{
 // (the SDK reports one as `error`, or a response that is not ok, rather than
 // throwing) — which `await-answer --ack` passes to the deck.
 const replyThroughOpenCode = async (client, answer) => {{
+  // An answer `await-answer` could not turn into a reply (typed words for a
+  // number) comes back as a refusal: not taken, so the question is raised
+  // again and can be answered anew.
+  if (answer?.kind === "refused") {{
+    return {{ delivered: false, detail: String(answer.detail ?? "the answer was refused").slice(0, 200) }};
+  }}
+  // PRD #2050: on OpenCode 2.x the reply goes through its own API instead
+  // (`v2Replier`).
+  if (typeof client?.dadReply === "function") {{
+    return client.dadReply(answer);
+  }}
   const refused = (detail) => ({{ delivered: false, detail: String(detail).slice(0, 200) }});
   const http = client?._client;
   if (!http || typeof http.post !== "function") {{
@@ -1212,194 +1387,1002 @@ const handleMessagePartUpdated = (event, directory) => {{
 
 {inbox}
 {usage}
-export const DotAgentDeckPlugin = async (ctx) => {{
+{entry}
+"#
+    )
+}
+
+/// The server plugin's entry points, after its shared state and helpers
+/// ([`plugin_template`]): the event handler both OpenCode generations feed
+/// (1.x hands it its own events; 2.x's events are translated into the same
+/// shape first, [`SERVER_V2_JS`]), the tool-call reports, and the 1.x
+/// factory, whose behaviour is unchanged by PRD #2050. The module's default
+/// export, at the end of [`SERVER_V2_JS`], carries both generations.
+const SERVER_ENTRY_JS: &str = r#"// One OpenCode event, in OpenCode 1.x's shape (`{ type, properties }`), as
+// the deck reports it. `client` is what a held question's answer is replied
+// through (awaitAnswer).
+const handleEvent = async (event, directory, client) => {
+  const eventType = event?.type ?? "";
+  if (
+    eventType === "message.created" ||
+    eventType === "message.updated"
+  ) {
+    recordUserMessage(event, directory);
+    return;
+  }
+  if (eventType === "message.part.updated") {
+    handleMessagePartUpdated(event, directory);
+    return;
+  }
+  if (eventType === "message.part.delta") {
+    recordReplyDelta(event?.properties);
+    return;
+  }
+  if (
+    eventType === "permission.asked" ||
+    eventType === "permission.replied" ||
+    eventType === "question.asked" ||
+    eventType === "question.replied" ||
+    eventType === "question.rejected"
+  ) {
+    // Issue #1678: a child session's prompt is its subagent's, filed under
+    // the root with the child's id, like its tool calls. PRD #1631: and,
+    // like the root's, the ask goes through `await-answer` so the deck can
+    // answer it, and the reply names the request it answers. A question
+    // form is the subagent's in the same way as a permission prompt.
+    const props = event?.properties ?? {};
+    const askingId = props.sessionID ?? props.sessionId;
+    if (isChildSession(askingId)) {
+      const payload = subagentPayload(undefined, askingId, directory, {
+        event: eventType,
+        prompt: permissionPrompt(props),
+      });
+      if (eventType === "permission.asked" || eventType === "question.asked") {
+        awaitAnswer(client, { ...payload, properties: props }, () => sendEvent(payload));
+        return;
+      }
+      payload.request_id = props.requestID ?? props.id;
+      noteResolved(payload.request_id);
+      stopHeldAnswer(payload.request_id);
+      sendEvent(payload);
+      return;
+    }
+  }
+  if (eventType === "permission.asked" || eventType === "question.asked") {
+    // PRD #1631: reported through `await-answer`, which also waits for
+    // the deck's answer. A prompt that cannot be held, or whose child
+    // fails before it is done with it, is reported plainly, with no
+    // `properties`, so the card still shows it.
+    const payload = questionPayload(event, directory);
+    ensureSessionRegistered(payload.session_id, payload.cwd);
+    const plain = permissionPayload(event, directory);
+    awaitAnswer(client, payload, () => sendEvent(plain));
+    return;
+  }
+  if (
+    eventType === "permission.replied" ||
+    eventType === "question.replied" ||
+    eventType === "question.rejected"
+  ) {
+    const payload = permissionPayload(event, directory);
+    noteResolved(payload.request_id);
+    stopHeldAnswer(payload.request_id);
+    ensureSessionRegistered(payload.session_id, payload.cwd);
+    sendEvent(payload);
+    return;
+  }
+  if (eventType === "server.instance.disposed") {
+    flushSessions();
+    return;
+  }
+  if (!event?.type?.startsWith("session.")) {
+    return;
+  }
+  if (eventType === "session.created" || eventType === "session.updated") {
+    noteSessionAncestry(event?.properties?.info);
+  }
+  const ownId = event?.properties?.sessionID ?? event?.properties?.info?.id;
+  if (isChildSession(ownId)) {
+    handleChildSessionEvent(event, ownId, directory);
+    return;
+  }
+  const payload = sessionPayload(event, directory);
+  if (event?.type === "session.deleted") {
+    const deletedId = event?.properties?.info?.id ?? event?.properties?.sessionID;
+    if (deletedId) {
+      forgetReplyState(deletedId);
+      sessionParents.delete(sessionKey(deletedId));
+      cancelAncestryLookup(deletedId);
+    }
+    closeSession(payload.session_id, payload.cwd, false, false);
+    return;
+  }
+  ensureSessionRegistered(
+    payload.session_id,
+    payload.cwd,
+    payload.status,
+    event?.type !== "session.created"
+  );
+  const rawSessionId = event?.properties?.sessionID;
+  if (event?.type === "session.error") {
+    recordTurnError(rawSessionId, event?.properties?.error);
+  }
+  sendEvent(isIdleReport(payload) ? { ...payload, ...takeReply(rawSessionId) } : payload);
+};
+
+// A tool call's start or end (`tool.execute.before` / `tool.execute.after`),
+// as the deck reports it. A child session's call is its subagent's.
+const reportTool = (eventName, sessionID, tool, args, callID, directory) => {
+  if (isChildSession(sessionID)) {
+    sendEvent(
+      subagentPayload(undefined, sessionID, directory, {
+        event: eventName,
+        tool_name: tool,
+        tool_input: args,
+        call_id: callID,
+      })
+    );
+    return;
+  }
+  const sessionId = normalizeSessionId(defaultSessionId(sessionID), directory);
+  ensureSessionRegistered(sessionId, directory);
+  sendEvent({
+    session_id: sessionId,
+    event: eventName,
+    tool_name: tool,
+    tool_input: args,
+    call_id: callID,
+    cwd: directory,
+  });
+};
+
+// PRD #2050: an OpenCode 1.x loader that predates the `{ id, server }`
+// default object calls every function export, deduplicated by export value,
+// so it may call this factory twice — once as `DotAgentDeckPlugin`, once as
+// the default object's `server` — with the same context. The second call
+// with a context already seen returns inert hooks. A later instance (OpenCode
+// re-running the plugin after disposing one) gets a new context and loads.
+// 1.18.35 takes `default.server` alone (measured), so this never fires there.
+const DAD_SEEN_CONTEXTS = typeof WeakSet === "function" ? new WeakSet() : undefined;
+const V1_SERVER_CALLED = "__dotAgentDeckV1ServerCalled";
+
+export const DotAgentDeckPlugin = async (ctx) => {
+  // PRD #2050: this process runs OpenCode 1.x, which calls `server`. 1.19.5
+  // also calls the module's 2.x `setup` (measured: after `server`, in the
+  // full TUI's worker and in `--mini` once its first session exists), which
+  // must then stay inert (setupV2).
+  globalThis[V1_SERVER_CALLED] = true;
   // A second copy of this plugin in the same OpenCode process returns inert
   // hooks, so one real action produces one event. See DAD_GUARD above.
-  if (DAD_ALREADY_LOADED) {{
-    return {{ event: async () => {{}} }};
-  }}
+  if (DAD_ALREADY_LOADED) {
+    return { event: async () => {} };
+  }
+  if (ctx && typeof ctx === "object" && DAD_SEEN_CONTEXTS) {
+    if (DAD_SEEN_CONTEXTS.has(ctx)) {
+      return { event: async () => {} };
+    }
+    DAD_SEEN_CONTEXTS.add(ctx);
+  }
 
   const directory = ctx?.directory ?? process.cwd();
   sessionClient = ctx?.client;
   startInbox(ctx?.client);
 
-  return {{
+  return {
     "chat.message": async (input, output) => interceptDoorbell(input, output),
-    event: async (input) => {{
+    event: async (input) => {
       const event = input?.event;
       const eventType = event?.type ?? "";
       observeInbox(event);
-      if (eventType === "message.updated") {{
+      if (eventType === "message.updated") {
         recordUsage(event?.properties?.info);
-      }}
-      if (eventType === "message.part.updated") {{
+      }
+      if (eventType === "message.part.updated") {
         recordUsageStep(event?.properties?.part);
-      }}
-      if (
-        eventType === "message.created" ||
-        eventType === "message.updated"
-      ) {{
-        recordUserMessage(event, directory);
-        return;
-      }}
-      if (eventType === "message.part.updated") {{
-        handleMessagePartUpdated(event, directory);
-        return;
-      }}
-      if (eventType === "message.part.delta") {{
-        recordReplyDelta(event?.properties);
-        return;
-      }}
-      if (
-        eventType === "permission.asked" ||
-        eventType === "permission.replied" ||
-        eventType === "question.asked" ||
-        eventType === "question.replied" ||
-        eventType === "question.rejected"
-      ) {{
-        // Issue #1678: a child session's prompt is its subagent's, filed under
-        // the root with the child's id, like its tool calls. PRD #1631: and,
-        // like the root's, the ask goes through `await-answer` so the deck can
-        // answer it, and the reply names the request it answers. A question
-        // form is the subagent's in the same way as a permission prompt.
-        const props = event?.properties ?? {{}};
-        const askingId = props.sessionID ?? props.sessionId;
-        if (isChildSession(askingId)) {{
-          const payload = subagentPayload(undefined, askingId, directory, {{
-            event: eventType,
-            prompt: permissionPrompt(props),
-          }});
-          if (eventType === "permission.asked" || eventType === "question.asked") {{
-            awaitAnswer(ctx?.client, {{ ...payload, properties: props }}, () => sendEvent(payload));
-            return;
-          }}
-          payload.request_id = props.requestID ?? props.id;
-          noteResolved(payload.request_id);
-          stopHeldAnswer(payload.request_id);
-          sendEvent(payload);
-          return;
-        }}
-      }}
-      if (eventType === "permission.asked" || eventType === "question.asked") {{
-        // PRD #1631: reported through `await-answer`, which also waits for
-        // the deck's answer. A prompt that cannot be held, or whose child
-        // fails before it is done with it, is reported plainly, with no
-        // `properties`, so the card still shows it.
-        const payload = questionPayload(event, directory);
-        ensureSessionRegistered(payload.session_id, payload.cwd);
-        const plain = permissionPayload(event, directory);
-        awaitAnswer(ctx?.client, payload, () => sendEvent(plain));
-        return;
-      }}
-      if (
-        eventType === "permission.replied" ||
-        eventType === "question.replied" ||
-        eventType === "question.rejected"
-      ) {{
-        const payload = permissionPayload(event, directory);
-        noteResolved(payload.request_id);
-        stopHeldAnswer(payload.request_id);
-        ensureSessionRegistered(payload.session_id, payload.cwd);
-        sendEvent(payload);
-        return;
-      }}
-      if (eventType === "server.instance.disposed") {{
-        flushSessions();
-        return;
-      }}
-      if (!event?.type?.startsWith("session.")) {{
-        return;
-      }}
-      if (eventType === "session.created" || eventType === "session.updated") {{
-        noteSessionAncestry(event?.properties?.info);
-      }}
-      const ownId = event?.properties?.sessionID ?? event?.properties?.info?.id;
-      if (isChildSession(ownId)) {{
-        handleChildSessionEvent(event, ownId, directory);
-        return;
-      }}
-      const payload = sessionPayload(event, directory);
-      if (event?.type === "session.deleted") {{
-        const deletedId = event?.properties?.info?.id ?? event?.properties?.sessionID;
-        if (deletedId) {{
-          forgetReplyState(deletedId);
-          sessionParents.delete(sessionKey(deletedId));
-          cancelAncestryLookup(deletedId);
-        }}
-        closeSession(payload.session_id, payload.cwd, false, false);
-        return;
-      }}
-      ensureSessionRegistered(
-        payload.session_id,
-        payload.cwd,
-        payload.status,
-        event?.type !== "session.created"
-      );
-      const rawSessionId = event?.properties?.sessionID;
-      if (event?.type === "session.error") {{
-        recordTurnError(rawSessionId, event?.properties?.error);
-      }}
-      sendEvent(isIdleReport(payload) ? {{ ...payload, ...takeReply(rawSessionId) }} : payload);
-    }},
-    "tool.execute.before": async (input, output) => {{
-      if (isChildSession(input?.sessionID)) {{
-        sendEvent(
-          subagentPayload(undefined, input.sessionID, directory, {{
-            event: "tool.execute.before",
-            tool_name: input?.tool,
-            tool_input: output?.args,
-            call_id: input?.callID,
-          }})
-        );
-        return;
-      }}
-      const sessionId = normalizeSessionId(
-        defaultSessionId(input?.sessionID),
-        directory
-      );
-      ensureSessionRegistered(sessionId, directory);
-      sendEvent({{
-        session_id: sessionId,
-        event: "tool.execute.before",
-        tool_name: input?.tool,
-        tool_input: output?.args,
-        call_id: input?.callID,
-        cwd: directory,
-      }});
-    }},
-    "tool.execute.after": async (input) => {{
-      if (isChildSession(input?.sessionID)) {{
-        sendEvent(
-          subagentPayload(undefined, input.sessionID, directory, {{
-            event: "tool.execute.after",
-            tool_name: input?.tool,
-            tool_input: input?.args,
-            call_id: input?.callID,
-          }})
-        );
-        return;
-      }}
-      const sessionId = normalizeSessionId(
-        defaultSessionId(input?.sessionID),
-        directory
-      );
-      ensureSessionRegistered(sessionId, directory);
-      sendEvent({{
-        session_id: sessionId,
-        event: "tool.execute.after",
-        tool_name: input?.tool,
-        tool_input: input?.args,
-        call_id: input?.callID,
-        cwd: directory,
-      }});
-    }},
-  }};
-}};
+      }
+      await handleEvent(event, directory, ctx?.client);
+    },
+    "tool.execute.before": async (input, output) =>
+      reportTool("tool.execute.before", input?.sessionID, input?.tool, output?.args, input?.callID, directory),
+    "tool.execute.after": async (input) =>
+      reportTool("tool.execute.after", input?.sessionID, input?.tool, input?.args, input?.callID, directory),
+  };
+};
 
-export default DotAgentDeckPlugin;
-"#
-    )
-}
+"#;
+
+/// PRD #2050: the server plugin's OpenCode 2.x implementation, the default
+/// export's `setup`. OpenCode 2.x has no 1.x-style hooks object: it hands
+/// `setup` a context whose `event.subscribe` streams `{ type, data,
+/// location }` events, and whose `tool.hook` / `session.hook` register
+/// callbacks. Each event the deck reports is translated into the 1.x shape
+/// and fed to the same handler 1.x uses ([`SERVER_ENTRY_JS`]), so the deck
+/// receives the same `hook --agent opencode` payloads from either generation
+/// and nothing in the daemon's protocol changes.
+///
+/// It never reports from OpenCode 2.x's shared background service (`serve
+/// --service`), whose environment is not the pane's; the deck starts a 2.x it
+/// can see with `--standalone`, whose private server inherits the pane's.
+const SERVER_V2_JS: &str = r#"// --- OpenCode 2.x (PRD #2050) ---
+//
+// Where this runs, measured on 2.2.5: `opencode --standalone` (and `mini`,
+// `run` with it) starts its own server as a child, `opencode serve --stdio
+// --port 0`, which inherits the client's environment, so DOT_AGENT_DECK_PANE_ID
+// and the deck's other variables are the pane's. Without `--standalone` the
+// client attaches to the shared background service (`opencode serve
+// --service`, read from 2.2.5's service launcher), started once with
+// whichever environment came first and shared by every pane and project:
+// there `process.env` is NOT the pane's, and every report would name the
+// wrong pane or none. So this implementation stays inert in the background
+// service, and reports everywhere else.
+const v2ServerArgs = () => process.argv.slice(2);
+const V2_SERVICE = () => v2ServerArgs().includes("--service");
+// OpenCode 2.x's subcommands (2.2.5 `--help`); any other first word of the
+// client's arguments is the top-level TUI (a flag, or a directory argument).
+const V2_SUBCOMMANDS = new Set(["upgrade", "update", "uninstall", "acp", "api", "debug", "auth",
+  "mcp", "plugin", "models", "stats", "mini", "run", "session", "service", "reload", "pair", "serve"]);
+// Flags that take the next word as their value (2.2.5 `--help`); every other
+// flag is a switch. Flags may come before the subcommand (`opencode --auto
+// mini`, accepted by 2.2.5), so the subcommand is the first word that is
+// neither (the deck's Rust reads it the same way: opencode_version's
+// first_positional).
+const V2_VALUE_FLAGS = new Set(["--server", "--session", "-s", "--prompt", "--log-level",
+  "--completions", "--model", "-m", "--agent", "--replay-limit", "--port", "--hostname"]);
+const v2FirstPositional = (args) => {
+  for (let n = 0; n < args.length; n++) {
+    const arg = args[n];
+    if (typeof arg !== "string") return undefined;
+    if (arg === "--") return args[n + 1];
+    if (arg.startsWith("-") && arg.length > 1) {
+      if (!arg.includes("=") && V2_VALUE_FLAGS.has(arg)) n++;
+      continue;
+    }
+    return arg;
+  }
+  return undefined;
+};
+// An OpenCode binary's file name: `opencode`, or `opencode` and a version
+// (`opencode2`, `opencode-1.18.35`), optionally `.exe` (opencode_version's
+// opencode_name).
+const v2OpencodeName = (path) => {
+  const name = String(path ?? "").split("/").pop().replace(/\.exe$/, "");
+  return /^opencode(?:[-.]?\d[\w.-]*)?$/.test(name);
+};
+// The parent of this `serve` process, read once: its arguments (program
+// first) and whether it runs an OpenCode binary, by its executable or, only
+// where that cannot be read (no /proc: macOS), its first argument. Undefined
+// when its arguments cannot be read (no /proc and no `ps`). On macOS the
+// arguments come from `ps`, split on whitespace, so a program path holding a
+// space splits and its first argument names no OpenCode binary: the plugin
+// then stays inert there (known, untested: no macOS host).
+let v2ParentMemo;
+const v2Parent = () => {
+  if (v2ParentMemo !== undefined) return v2ParentMemo || undefined;
+  v2ParentMemo = null;
+  const ppid = process.ppid;
+  if (!ppid || ppid <= 1) return undefined;
+  let argv;
+  try {
+    argv = readFileSync(`/proc/${ppid}/cmdline`, "utf8").split("\0").filter(Boolean);
+  } catch (_) {
+    try {
+      const text = execFileSync("ps", ["-o", "args=", "-p", String(ppid)], {
+        timeout: 2000,
+        stdio: ["ignore", "pipe", "ignore"],
+        encoding: "utf8",
+      });
+      argv = text.trim().split(/\s+/).filter(Boolean);
+    } catch (_) {}
+  }
+  if (!argv?.length) return undefined;
+  // A binary replaced in place since the parent started (`opencode upgrade`,
+  // OpenCode's own update, a reinstall) reads `…/opencode (deleted)` here on
+  // Linux; the suffix is not part of the file's name.
+  let exe;
+  try {
+    exe = String(readlinkSync(`/proc/${ppid}/exe`)).replace(/ \(deleted\)$/, "");
+  } catch (_) {}
+  v2ParentMemo = { argv, opencode: v2OpencodeName(exe !== undefined ? exe : argv[0]) };
+  return v2ParentMemo;
+};
+// The arguments of the client this plugin serves. In a `serve` process they
+// are its parent's (measured on 2.2.5: a standalone server's parent is the
+// `opencode` / `opencode mini` / `opencode run` the user started); in any
+// other process, its own. Undefined when the parent's cannot be read.
+const v2ClientArgs = () => {
+  const own = v2ServerArgs();
+  if (v2FirstPositional(own) !== "serve") return own;
+  return v2Parent()?.argv.slice(1);
+};
+// "tui" (the full TUI), a subcommand name, or undefined when the client's
+// arguments cannot be read.
+const v2ClientMode = () => {
+  const args = v2ClientArgs();
+  if (!args) return undefined;
+  const first = v2FirstPositional(args);
+  return typeof first === "string" && V2_SUBCOMMANDS.has(first) ? first : "tui";
+};
+// Audit L5: whether this process serves a pane's own OpenCode session, the
+// only place the plugin reports from. A `serve` process does only when its
+// parent runs an OpenCode binary in a session mode (the full TUI, `mini` or
+// `run`): a `serve` a shell started (a server shared with `--server`), the
+// background service under whatever argv a release gives it, or a parent
+// that cannot be read is not one, and the plugin stays inert there. Any other
+// process is a client running the plugin itself.
+const V2_SESSION_MODES = new Set(["tui", "mini", "run"]);
+const v2ServesPaneSession = () => {
+  if (V2_SERVICE()) return false;
+  if (v2FirstPositional(v2ServerArgs()) !== "serve") return true;
+  const parent = v2Parent();
+  return !!parent?.opencode && V2_SESSION_MODES.has(v2ClientMode());
+};
+
+// The 2.x shell tool is `shell`; 1.x called it `bash`, and the deck reads a
+// tool named `shell` as Codex's joined argv (telemetry::operation). Its input
+// is `{ command, workdir, timeout, background }` (measured on 2.2.5's tool
+// list), the key `bash` carried in 1.x, so it is reported as `bash`.
+const v2ToolName = (tool) => (tool === "shell" ? "bash" : tool);
+
+// Issue #714 on 2.x: a failed provider response's allow-listed headers, by
+// session, from `session.hook("http.response")` — 2.x's error no longer
+// carries them. Only the headers errorFields forwards are kept, at most
+// MAX_REPLY_SESSIONS sessions' worth.
+const v2FailedHeaders = new Map();
+const v2NoteResponse = (input) => {
+  const response = input?.response;
+  if (!response || response.ok !== false || !idFits(input?.sessionID)) return;
+  const kept = {};
+  let count = 0;
+  try {
+    response.headers?.forEach?.((value, name) => {
+      const key = String(name).toLowerCase();
+      if (count < 32 && typeof value === "string" && (ERROR_HEADER_ALLOW.has(key) || key.startsWith(ERROR_HEADER_PREFIX))) {
+        kept[key] = value.slice(0, 200);
+        count += 1;
+      }
+    });
+  } catch (_) {}
+  rememberBounded(v2FailedHeaders, input.sessionID, kept);
+};
+
+// Permission requests' sessions, by request id: 2.x's reply names both.
+const v2PermissionSessions = new Map();
+
+// What a held question's answer is replied through on 2.x (awaitAnswer's
+// `client`): `permission.reply`, a public API, replaces 1.x's POST through
+// the SDK internal. 2.x's server context has no form reply, so a form is
+// never held (v2FormEvent) and never answered here.
+const v2Replier = (ctx) => ({
+  dadReply: async (answer) => {
+    const refused = (detail) => ({ delivered: false, detail: String(detail).slice(0, 200) });
+    if (answer?.kind !== "permission") return refused("only permission prompts are answered on OpenCode 2");
+    const requestID = answer.request_id;
+    const sessionID = v2PermissionSessions.get(requestID);
+    const decision = answer.body?.reply;
+    if (typeof requestID !== "string" || !sessionID) return refused("the answer names no known request");
+    if (decision !== "once" && decision !== "always" && decision !== "reject") return refused("the answer is not a permission reply");
+    try {
+      await ctx.permission.reply({ sessionID, requestID, decision });
+      return { delivered: true };
+    } catch (error) {
+      return refused(error?.message ?? "the reply could not be sent");
+    }
+  },
+});
+
+// Usage (PRD #1858) on 2.x: each step reports its own counts on
+// `session.step.ended`, and its model on `session.step.started`. A message's
+// cost is the sum of its steps', as 1.x's message cost was.
+const v2StepModels = new Map();
+const v2StepCounts = new Map();
+const v2Costs = new Map();
+const v2RecordStepStarted = (data) => {
+  if (!USAGE_FILE_ON || !idFits(data?.assistantMessageID)) return;
+  rememberBounded(v2StepModels, data.assistantMessageID, data.model?.id, MAX_USAGE_MESSAGES);
+};
+const v2RecordStepEnded = (data, failed) => {
+  if (!USAGE_FILE_ON || !idFits(data?.assistantMessageID)) return;
+  const id = data.assistantMessageID;
+  const n = (v2StepCounts.get(id) ?? 0) + 1;
+  rememberBounded(v2StepCounts, id, n, MAX_USAGE_MESSAGES);
+  const cost = typeof data.cost === "number" && Number.isFinite(data.cost) ? data.cost : 0;
+  const total = (v2Costs.get(id) ?? 0) + cost;
+  rememberBounded(v2Costs, id, total, MAX_USAGE_MESSAGES);
+  if (!failed) recordUsageStep({ type: "step-finish", messageID: id, id: `${id}:${n}`, tokens: data.tokens });
+  recordUsage({
+    role: "assistant",
+    id,
+    modelID: v2StepModels.get(id),
+    sessionID: data.sessionID,
+    tokens: failed ? undefined : data.tokens,
+    cost: total,
+    finish: failed ? undefined : data.finish,
+    error: failed ? { name: data.error?.type, data: { statusCode: data.error?.status } } : undefined,
+    time: failed ? {} : { completed: 1 },
+  });
+};
+
+// Sessions reported working since they were last reported idle. Measured on
+// 2.2.5 (`opencode run`): the event stream carries no `session.created`,
+// `session.status` or `session.idle` at all; a turn is `session.execution.started`
+// and ends `succeeded`, `failed` or `interrupted`. So a turn's start is
+// reported as 1.x's `busy` status and its end as 1.x's `idle` status (after
+// the error report for a failed or interrupted turn, as 1.x's `session.error`
+// was followed by idle), once per turn: a session not in this set is not
+// ended again, so a real idle event and an execution end cannot both end it.
+const v2Busy = new Set();
+
+// Measured on 2.2.5: no `session.created` reaches the plugin, so whether a
+// session is a subagent's child is asked of OpenCode (`session.get`, at most
+// V2_ANCESTRY_MS) the first time it reports, before its report is made.
+const V2_ANCESTRY_MS = 1000;
+const v2Ancestry = async (ctx, sessionID) => {
+  const key = sessionKey(sessionID);
+  if (key === undefined || sessionParents.has(key) || typeof ctx?.session?.get !== "function") return;
+  let timer;
+  try {
+    const info = await Promise.race([
+      Promise.resolve(ctx.session.get({ sessionID })),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(undefined), V2_ANCESTRY_MS);
+        timer?.unref?.();
+      }),
+    ]);
+    const answer = info?.data ?? info;
+    if (answer?.id === sessionID && !sessionParents.has(key)) {
+      noteSessionAncestry({ id: sessionID, parentID: answer.parentID });
+    }
+  } catch (_) {
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+// A 2.x event's directory: where it happened, else where the server runs.
+const v2Directory = (event, ctx) =>
+  event?.location?.directory ?? event?.data?.location?.directory ?? ctx?.location?.directory ?? process.cwd();
+
+// A 2.x event as the 1.x-shaped events handleEvent reports, in order (none
+// for an event the deck takes no report from).
+const v2Translate = (event, directory) => {
+  const data = event?.data ?? {};
+  const sessionID = data.sessionID;
+  const idle = () =>
+    v2Busy.has(sessionID) ? [{ type: "session.status", properties: { sessionID, status: { type: "idle" } } }] : [];
+  switch (event?.type) {
+    case "session.execution.succeeded":
+      return idle();
+    case "session.execution.failed":
+    case "session.execution.interrupted":
+      return [v2TranslateOne(event, directory), ...idle()];
+    default: {
+      const one = v2TranslateOne(event, directory);
+      return one ? [one] : [];
+    }
+  }
+};
+
+// One 2.x event in 1.x's shape; undefined for one with no 1.x counterpart.
+const v2TranslateOne = (event, directory) => {
+  const data = event?.data ?? {};
+  const sessionID = data.sessionID;
+  switch (event?.type) {
+    case "session.created":
+      return { type: "session.created", properties: { info: { id: sessionID, parentID: data.parentID, directory } } };
+    case "session.status":
+      return { type: "session.status", properties: { sessionID, status: data.status } };
+    case "session.idle":
+      return { type: "session.idle", properties: { sessionID } };
+    case "session.deleted":
+      return { type: "session.deleted", properties: { sessionID, info: { id: sessionID } } };
+    case "session.execution.started":
+      return v2Busy.has(sessionID)
+        ? undefined
+        : { type: "session.status", properties: { sessionID, status: { type: "busy" } } };
+    case "session.execution.failed": {
+      // Issue #714: the same error fields 1.x's `session.error` carried, so
+      // the deck classifies a quota or credit refusal the same way. 2.x
+      // names the error `type` where 1.x had `name`.
+      const error = data.error ?? {};
+      const headers = v2FailedHeaders.get(sessionID);
+      v2FailedHeaders.delete(sessionID);
+      return {
+        type: "session.error",
+        properties: {
+          sessionID,
+          error: {
+            name: error.type,
+            data: { message: error.message, responseBody: error.response?.body, responseHeaders: headers },
+          },
+        },
+      };
+    }
+    case "session.execution.interrupted":
+      // An interrupted turn is 1.x's aborted message: the turn ending, which
+      // the deck reads as Idle, not Error.
+      return { type: "session.error", properties: { sessionID, error: { name: "MessageAbortedError" } } };
+    case "permission.asked":
+      if (typeof data.id === "string" && idFits(sessionID)) {
+        rememberBounded(v2PermissionSessions, data.id, sessionID);
+      }
+      // 2.x renamed the properties the deck reads (`permission` → `action`,
+      // `patterns` → `resources`, `always` → `save`, `tool.callID` →
+      // `source.id`); they are given back their 1.x names, so the deck's
+      // question builder reads either generation's prompt.
+      return {
+        type: "permission.asked",
+        properties: {
+          id: data.id,
+          sessionID,
+          permission: data.action,
+          patterns: Array.isArray(data.resources) ? data.resources : [],
+          always: Array.isArray(data.save) ? data.save : [],
+          metadata: data.metadata,
+          message: data.message,
+          ...(data.source?.id ? { tool: { callID: data.source.id, messageID: data.source.messageID } } : {}),
+        },
+      };
+    case "permission.replied":
+      v2PermissionSessions.delete(data.requestID);
+      return { type: "permission.replied", properties: { sessionID, requestID: data.requestID, reply: data.reply } };
+    default:
+      return undefined;
+  }
+};
+
+// A question form (`form.*`). 2.x's server context has no form reply. In the
+// full TUI the deck's TUI plugin holds a new form through `await-answer` and
+// answers it (PRD #2050), so `form.created` is left to it here. Anywhere else
+// — `opencode mini` loads no TUI plugin — the form is reported plainly, the
+// card saying it is answered in OpenCode. Its reply or cancellation clears it
+// either way.
+const V2_FORM_IN_OPENCODE = "answer this form in OpenCode";
+const v2FormEvent = (event, directory) => {
+  const data = event?.data ?? {};
+  if (event.type === "form.created" && v2ClientMode() === "tui") return;
+  const form = event.type === "form.created" ? data.form ?? {} : data;
+  const sessionID = form.sessionID;
+  const requestID = form.id;
+  const name = event.type === "form.created" ? "question.asked" : event.type === "form.replied" ? "question.replied" : "question.rejected";
+  const title =
+    name === "question.asked"
+      ? (typeof form.title === "string" && form.title ? `${V2_FORM_IN_OPENCODE}: ${form.title}` : V2_FORM_IN_OPENCODE)
+      : form.title;
+  const props = { sessionID, id: requestID, title };
+  if (isChildSession(sessionID)) {
+    const payload = subagentPayload(undefined, sessionID, directory, { event: name, prompt: permissionPrompt(props) });
+    if (name !== "question.asked") payload.request_id = requestID;
+    sendEvent(payload);
+    return;
+  }
+  const payload = permissionPayload({ type: name, properties: props }, directory);
+  ensureSessionRegistered(payload.session_id, payload.cwd);
+  sendEvent(payload);
+};
+
+// Assistant text (PRD #1497's reply) on 2.x: each text block's final text
+// arrives on `session.text.ended`, numbered within its message by `ordinal`.
+const v2RecordText = (data) => {
+  if (!idFits(data?.assistantMessageID) || !idFits(data?.sessionID)) return;
+  recordAssistantMessage({ id: data.assistantMessageID, sessionID: data.sessionID });
+  recordReplyPart({
+    type: "text",
+    id: `${data.assistantMessageID}:${data.ordinal}`,
+    messageID: data.assistantMessageID,
+    sessionID: data.sessionID,
+    text: data.text,
+  });
+};
+
+// One 2.x event: its usage, inbox and reply bookkeeping, then the deck's
+// report through the 1.x handler.
+const v2HandleEvent = async (event, ctx, replier) => {
+  const type = event?.type ?? "";
+  const data = event?.data ?? {};
+  const directory = v2Directory(event, ctx);
+  observeInboxV2(event);
+  if (data.sessionID && type !== "session.created" && type !== "session.deleted") {
+    await v2Ancestry(ctx, data.sessionID);
+  }
+  if (type === "session.status") {
+    if (data.status?.type === "idle") v2Busy.delete(data.sessionID);
+    else if (data.sessionID) rememberBounded(v2Busy, data.sessionID);
+  } else if (type === "session.idle" || type === "session.deleted") {
+    v2Busy.delete(data.sessionID);
+  } else if (type === "session.step.started") {
+    v2RecordStepStarted(data);
+  } else if (type === "session.step.ended") {
+    v2RecordStepEnded(data, false);
+  } else if (type === "session.step.failed") {
+    v2RecordStepEnded(data, true);
+  } else if (type === "session.text.ended") {
+    v2RecordText(data);
+    return;
+  } else if (type === "form.created" || type === "form.replied" || type === "form.cancelled") {
+    v2FormEvent(event, directory);
+    return;
+  } else if (type === "location.shutdown") {
+    flushSessions();
+    return;
+  }
+  for (const translated of v2Translate(event, directory)) {
+    const status = translated.type === "session.status" ? translated.properties.status?.type : undefined;
+    if (status === "busy") rememberBounded(v2Busy, translated.properties.sessionID);
+    else if (status === "idle") v2Busy.delete(translated.properties.sessionID);
+    await handleEvent(translated, directory, replier);
+  }
+};
+
+// The default export's `setup`: OpenCode 2.x's plugin entry point. Returns
+// the cleanup 2.x runs when it unloads the plugin (measured on 2.2.5: on
+// server shutdown).
+const setupV2 = async (ctx) => {
+  if (!v2ServesPaneSession()) {
+    return () => {};
+  }
+  // OpenCode 1.19.5 calls `setup` too, after `server`, with a context of its
+  // own (`options`, `agent`, `catalog`, …: no `event`, no `session`; measured).
+  // The 1.x implementation already serves this process: run here as well and
+  // the 2.x inbox would read `--mini` as the full TUI, announce, and replace
+  // mini's receiver with a doorbell-only one.
+  if (globalThis[V1_SERVER_CALLED] || typeof ctx?.event?.subscribe !== "function") {
+    return () => {};
+  }
+  // 2.x may load the plugin again in this module after unloading it (its
+  // cleanup ran handleShutdown): the new instance reports again.
+  shuttingDown = false;
+  const directory = ctx?.location?.directory ?? process.cwd();
+  const replier = v2Replier(ctx);
+  // The ancestry lookup's client (lookUpAncestry), in 1.x's call shape.
+  sessionClient = {
+    session: {
+      get: ({ path }) => ctx.session.get({ sessionID: path?.id }),
+    },
+  };
+  const registrations = [];
+  const register = async (domain, name, callback) => {
+    try {
+      const registration = await domain?.hook?.(name, callback);
+      if (registration) registrations.push(registration);
+    } catch (_) {}
+  };
+  await register(ctx.session, "prompt", async (input) => {
+    try {
+      await interceptDoorbellV2(input);
+      const sessionID = input?.sessionID;
+      if (!sessionID) return;
+      await v2Ancestry(ctx, sessionID);
+      if (isChildSession(sessionID)) return;
+      emitUserPrompt(normalizeSessionId(sessionID, directory), input?.prompt?.text, directory);
+    } catch (_) {}
+  });
+  await register(ctx.session, "http.response", (input) => v2NoteResponse(input));
+  await register(ctx.tool, "execute.before", async (input) => {
+    await v2Ancestry(ctx, input?.sessionID);
+    reportTool("tool.execute.before", input?.sessionID, v2ToolName(input?.tool), input?.input, input?.id, directory);
+  });
+  // A failed call ends like a completed one (`status: "error"`), so the
+  // card's tool ends either way, as it did on 1.x.
+  await register(ctx.tool, "execute.after", async (input) => {
+    await v2Ancestry(ctx, input?.sessionID);
+    reportTool("tool.execute.after", input?.sessionID, v2ToolName(input?.tool), input?.input, input?.id, directory);
+  });
+  startInboxV2(ctx);
+  const subscription = typeof AbortController === "function" ? new AbortController() : undefined;
+  let stopped = false;
+  (async () => {
+    try {
+      const stream = ctx.event.subscribe(subscription ? { signal: subscription.signal } : undefined);
+      for await (const event of stream) {
+        if (stopped) break;
+        try {
+          await v2HandleEvent(event, ctx, replier);
+        } catch (_) {}
+      }
+    } catch (_) {}
+  })();
+  return async () => {
+    stopped = true;
+    try {
+      subscription?.abort();
+    } catch (_) {}
+    stopInboxV2();
+    for (const registration of registrations.splice(0)) {
+      try {
+        await registration.dispose();
+      } catch (_) {}
+    }
+    handleShutdown();
+  };
+};
+
+// Both generations from one module (PRD #2050): OpenCode 1.x (1.18.29+)
+// takes `{ id, server }` and calls `server`; OpenCode 2.x takes `{ id, setup }`
+// and calls `setup`. Measured: 1.18.35 called `server` once and never `setup`,
+// and 2.2.5 called `setup` and never `server`; 1.19.5 calls `server` and then
+// `setup` too, which the V1_SERVER_CALLED guard at the top of `setupV2` keeps
+// inert. Versions not measured may call either or both.
+export default { id: "dot-agent-deck", server: DotAgentDeckPlugin, setup: setupV2 };
+"#;
+
+/// PRD #2050: the server plugin's inbox roles on OpenCode 2.x, after the 1.x
+/// ones ([`SERVER_INBOX_JS`]) and sharing their state.
+///
+/// - Under the full TUI (whose own TUI plugin is handed the deck's messages,
+///   [`TUI_V2_JS`]) it announces, keeps a doorbell-only receiver, and catches
+///   a submitted doorbell line before the model sees it.
+/// - Under `opencode mini`, which loads no TUI plugin (measured on 2.2.5), it
+///   arms its own stream and starts each message in mini's session with
+///   `session.prompt`.
+/// - Under `run`, `session` or another subcommand it does nothing: that is
+///   not the pane's interactive OpenCode.
+///
+/// Which client it serves is read from its parent's argv (`v2ClientMode`).
+const SERVER_INBOX_V2_JS: &str = r#"// --- OpenCode 2.x inbox (PRD #2050) ---
+let v2InboxStarted = false;
+const v2InboxInteractive = () => {
+  const mode = v2ClientMode();
+  return mode === undefined || mode === "tui" || mode === "mini";
+};
+const v2InboxMini = () => v2ClientMode() === "mini";
+// A 2.x client call in the shape inboxHandOver reads: what it returned, or,
+// when it threw an error naming an HTTP status, `{ error, response: { status } }`
+// so a refusal before acceptance (4xx) is told apart from a lost call.
+const v2Call = (call) => async () => {
+  try {
+    return await call();
+  } catch (error) {
+    const status = error?.status ?? error?.response?.status ?? error?.cause?.status;
+    if (typeof status === "number") return { error, response: { status } };
+    throw error;
+  }
+};
+// Record which deck message ids an OpenCode inbox item carries.
+const v2NotePending = (inboxID, text) => {
+  const receiver = serverReceiver();
+  if (!receiver || !inboxID) return;
+  const ids = inboxIdsIn(text).filter((id) => receiver.of(id).length > 0);
+  if (ids.length) {
+    inboxRemember(miniPending, inboxID, [...new Set([...(miniPending.get(inboxID) ?? []), ...ids])]);
+  }
+};
+// The session `opencode mini` shows, when this plugin did not see it created.
+// 2.x mini creates (or resumes) its session as it starts, through the server
+// API, before this plugin's event stream is subscribed (measured on 2.2.5: the
+// session existed 0.2 s before `setup` ran, and no `session.created` reached
+// the plugin), and draws only that session. So it is found the way mini finds
+// it (2.2.5's mini resolver): `--session <id>` names it; `--continue` takes the
+// newest root session of the directory; otherwise mini created a fresh one.
+// A `--fork` is a new session too.
+//
+// A fresh session is bound by WHEN it was created, not by its order:
+// sessions live in OpenCode's shared storage, and 2.2.5 records nothing on a
+// session that names the server or client that created it (measured: its
+// session table has no such column), so another root session in the same
+// directory (a second mini, the user's own OpenCode, a scheduled `opencode
+// run`) is listed too. The candidates are the root sessions of the directory
+// created between this server's start and the moment the mini receiver
+// started (`setupAt`, v2ResolveMiniTarget), plus V2_MINI_SLACK_MS. Mini's own
+// session falls there because mini creates it before `setup` (the 0.2 s
+// above), whatever the box's load. Exactly one candidate is mini's session.
+// More than one (another mini started in the same directory while this one
+// booted) cannot be told apart: the plugin delivers nothing and reports each
+// message not handed, so the deck keeps it and shows it as undelivered rather
+// than it reaching another pane's session. None found within
+// V2_MINI_RESOLVE_MS: no root is taken by age; a `session.created` this
+// plugin observes (observeInboxV2) still names mini's session.
+//
+// The residual, not measured: a sibling created inside the same window is
+// indistinguishable from mini's own, which is why it is refused rather than
+// guessed; and a mini whose own session is listed only after
+// V2_MINI_RESOLVE_MS, or created later than V2_MINI_SLACK_MS after `setup`,
+// gets no deck messages until it restarts.
+const V2_MINI_RESOLVE_MS = 5000;
+const V2_MINI_SLACK_MS = 500;
+const v2ClientFlag = (args, long, short) => {
+  for (let n = 0; n < args.length; n++) {
+    const arg = args[n];
+    if (arg === long || (short && arg === short)) return args[n + 1];
+    if (typeof arg === "string" && arg.startsWith(long + "=")) return arg.slice(long.length + 1);
+  }
+  return undefined;
+};
+// One look: `{ id }` when mini's session is known, `{ ambiguous: n }` when it
+// cannot be told from another one, undefined while it may still appear.
+// `started` is this server's start, `setupAt` the mini receiver's.
+const v2FindMiniTarget = async (ctx, started, setupAt) => {
+  const args = v2ClientArgs() ?? [];
+  const fork = args.includes("--fork");
+  const named = v2ClientFlag(args, "--session", "-s");
+  if (named && !fork) return { id: named };
+  const directory = ctx?.location?.directory ?? process.cwd();
+  const listed = await ctx.session.list({ directory, parentID: null, limit: 20, order: "desc" });
+  const roots = (Array.isArray(listed?.data) ? listed.data : []).filter(
+    (s) => typeof s?.id === "string" && !s.parentID && (s.location?.directory ?? directory) === directory,
+  );
+  if (!fork && (args.includes("--continue") || args.includes("-c"))) {
+    return roots[0] ? { id: roots[0].id } : undefined;
+  }
+  const closes = setupAt + V2_MINI_SLACK_MS;
+  const candidates = roots.filter(
+    (s) => typeof s.time?.created === "number" && s.time.created >= started && s.time.created <= closes,
+  );
+  if (candidates.length > 1) return { ambiguous: candidates.length };
+  // A session created inside the window may still be listed until it closes.
+  if (candidates.length === 1 && Date.now() > closes) return { id: candidates[0].id };
+  return undefined;
+};
+let v2MiniResolution;
+const v2MiniNote = (text) => {
+  try {
+    console.error(`dot-agent-deck: ${text}`);
+  } catch (_) {}
+};
+// Mini's session, looked up once per module, from the moment the mini
+// receiver first started in this process (`setupAt`, kept with the session
+// across a re-import: miniBinding): a promise of its id, or of undefined when
+// it is ambiguous or was not found within V2_MINI_RESOLVE_MS. A
+// `session.created` this plugin sees (observeInboxV2) answers it too.
+const v2ResolveMiniTarget = (ctx) => {
+  if (v2MiniResolution) return v2MiniResolution;
+  // The first setup in this process, kept across a re-import (miniBinding).
+  const binding = miniBinding();
+  if (typeof binding.setupAt !== "number") binding.setupAt = Date.now();
+  const setupAt = binding.setupAt;
+  v2MiniResolution = (async () => {
+    const started = typeof performance === "object" ? performance.timeOrigin : setupAt;
+    const deadline = setupAt + V2_MINI_RESOLVE_MS;
+    const directory = ctx?.location?.directory ?? process.cwd();
+    for (;;) {
+      if (miniTarget) return miniTarget;
+      if (typeof ctx?.session?.list === "function") {
+        let found;
+        try {
+          found = await v2FindMiniTarget(ctx, started, setupAt);
+        } catch (_) {}
+        if (miniTarget) return miniTarget;
+        if (found?.id) {
+          bindMiniTarget(found.id);
+          return miniTarget;
+        }
+        if (found?.ambiguous) {
+          v2MiniNote(`${found.ambiguous} OpenCode sessions started in ${directory} with this mini; deck messages are not delivered to it`);
+          return undefined;
+        }
+      }
+      if (Date.now() >= deadline) {
+        v2MiniNote(`no OpenCode session of this mini found in ${directory}; deck messages are not delivered to it`);
+        return undefined;
+      }
+      await inboxSleep(200);
+    }
+  })();
+  return v2MiniResolution;
+};
+const v2MiniDeliver = async (ctx, message, generation) => {
+  const ref = inboxRef(message);
+  const receiver = serverReceiver();
+  if (!receiver || generation !== inboxGeneration()) return;
+  try {
+    const sessionID = miniTarget ?? (await v2ResolveMiniTarget(ctx)) ?? miniTarget;
+    if (generation !== inboxGeneration()) return;
+    if (!sessionID) {
+      receiver.notHanded(ref);
+      return;
+    }
+    const text = inboxText(message);
+    await inboxHandOver(
+      receiver,
+      ref,
+      sessionID,
+      v2Call(async () => {
+        const item = await ctx.session.prompt({ sessionID, text });
+        if (item?.id) v2NotePending(item.id, text);
+        return item;
+      }),
+      () => generation === inboxGeneration() && miniTarget === sessionID,
+    );
+  } catch (_) {
+    if (generation === inboxGeneration()) receiver.notHanded(ref);
+  }
+};
+const startInboxV2 = (ctx) => {
+  try {
+    if (!inboxInPane() || !v2InboxInteractive()) return;
+    v2InboxStarted = true;
+    const generation = inboxGeneration() + 1;
+    globalThis[INBOX_GENERATION] = generation;
+    serverReceiver()?.stop();
+    globalThis[INBOX_RECEIVER] = undefined;
+    const mini = v2InboxMini() && typeof ctx?.session?.prompt === "function";
+    if (!mini && !globalThis[INBOX_ANNOUNCED]) {
+      globalThis[INBOX_ANNOUNCED] = true;
+      try {
+        execFileSync(hookBinary(), ["inbox", "announce", "--agent", "opencode"], {
+          timeout: 5000,
+          stdio: ["ignore", "ignore", "ignore"],
+        });
+      } catch (_) {}
+    }
+    if (mini) v2ResolveMiniTarget(ctx);
+    const receiver = inboxReceiver({
+      agent: "opencode-mini",
+      doorbellOnly: !mini,
+      active: () => generation === inboxGeneration(),
+      deliver: mini
+        ? (message) => {
+            miniQueue = miniQueue.then(() => v2MiniDeliver(ctx, message, generation));
+          }
+        : undefined,
+    });
+    globalThis[INBOX_RECEIVER] = receiver;
+    receiver.start();
+  } catch (_) {}
+};
+const stopInboxV2 = () => {
+  if (!v2InboxStarted) return;
+  try {
+    globalThis[INBOX_GENERATION] = inboxGeneration() + 1;
+    serverReceiver()?.stop();
+    globalThis[INBOX_RECEIVER] = undefined;
+  } catch (_) {}
+};
+const observeInboxV2 = (event) => {
+  try {
+    const receiver = serverReceiver();
+    const type = event?.type;
+    const data = event?.data ?? {};
+    if (type === "session.created") {
+      if (data.sessionID && !data.parentID) bindMiniTarget(data.sessionID);
+      return;
+    }
+    if (!receiver) return;
+    if (type === "session.inbox.enqueued") {
+      if (data.item?.type === "user") v2NotePending(data.inboxID, data.item.payload?.text);
+    } else if (type === "session.inbox.delivered") {
+      // OpenCode took the item into a turn: every attempt it carries is
+      // committed.
+      const refs = intercepted.get(data.inboxID) ?? [];
+      intercepted.delete(data.inboxID);
+      if (refs.length) receiver.committed(refs);
+      const mini = [];
+      for (const id of miniPending.get(data.inboxID) ?? []) mini.push(...receiver.of(id));
+      miniPending.delete(data.inboxID);
+      if (mini.length) {
+        if (data.sessionID) miniTurns.add(data.sessionID);
+        receiver.committed(mini);
+        receiver.send({ repaint: true });
+      }
+    } else if (type === "session.inbox.cancelled") {
+      // A withdrawn prompt: its attempts are lost, not released — the deck
+      // may repeat them, marked as possible repeats.
+      for (const id of miniPending.get(data.inboxID) ?? []) {
+        for (const ref of receiver.of(id)) receiver.lost(ref);
+      }
+      for (const ref of intercepted.get(data.inboxID) ?? []) receiver.lost(ref);
+      miniPending.delete(data.inboxID);
+      intercepted.delete(data.inboxID);
+    } else if (type === "session.idle" || (type === "session.status" && data.status?.type === "idle")) {
+      if (!data.sessionID) return;
+      for (const ref of receiver.inSession(data.sessionID)) receiver.lost(ref);
+      if (miniTurns.delete(data.sessionID)) receiver.send({ repaint: true });
+    }
+  } catch (_) {}
+};
+// The doorbell on 2.x: `session.hook("prompt")` hands over the prompt before
+// it is queued, and its text is replaced in place, as 1.x's `chat.message`
+// parts were. Only under the pane's interactive OpenCode.
+const interceptDoorbellV2 = async (input) => {
+  if (!inboxInPane() || !v2InboxInteractive() || typeof input?.prompt?.text !== "string") return;
+  const parts = [{ type: "text", text: input.prompt.text }];
+  await interceptDoorbell(
+    { sessionID: input.sessionID, messageID: input.messageID },
+    { parts },
+    true,
+  );
+  input.prompt.text = parts[0].text;
+};
+"#;
 
 /// PRD #1858: the plugin's half of the deck's usage file. Each update of an
 /// assistant message, and each step of one that finishes, appends one line of
@@ -1827,10 +2810,30 @@ const INBOX_HANDLED =
 const INBOX_RECEIVER = "__dotAgentDeckReceiver";
 const INBOX_GENERATION = "__dotAgentDeckGeneration";
 const INBOX_ANNOUNCED = "__dotAgentDeckAnnounced";
+const INBOX_MINI_BINDING = "__dotAgentDeckMiniBinding";
 // --mini: the last root session this process created, which OpenCode user
 // message carries which deck message ids, and the sessions running a deck
 // turn.
-let miniTarget = undefined;
+//
+// Mini's session, and when the 2.x mini receiver first started (`setupAt`,
+// v2ResolveMiniTarget), are kept per process on globalThis, not in this
+// module: OpenCode 2 reloads the plugin when the module file changes (a deck
+// upgrade rewrites it), and a re-import in the same process starts with fresh
+// module variables. Re-resolving then would take the reload as `setupAt`, so
+// the window would cover every root session of the directory since the
+// server started, and a mini sharing its directory with any later session
+// would go dark as ambiguous. Not measured: whether 2.2.5's reload re-imports
+// the module in the same process or starts a new server; a new server keeps
+// nothing here, and a mini whose session predates it is then not found.
+const miniBinding = () => {
+  if (!globalThis[INBOX_MINI_BINDING]) globalThis[INBOX_MINI_BINDING] = {};
+  return globalThis[INBOX_MINI_BINDING];
+};
+let miniTarget = miniBinding().target;
+const bindMiniTarget = (id) => {
+  miniTarget = id;
+  miniBinding().target = id;
+};
 const miniPending = new Map();
 const miniTurns = new Set();
 let miniQueue = Promise.resolve();
@@ -1964,7 +2967,7 @@ const observeInbox = (event) => {
     inboxObserveUsers(inboxUsers, event, intercepted, miniPending);
     if (type === "session.created") {
       const info = properties?.info;
-      if (info?.id && !info.parentID) miniTarget = info.id;
+      if (info?.id && !info.parentID) bindMiniTarget(info.id);
     } else if (type === "message.part.updated") {
       const part = properties?.part;
       if (part?.type !== "text" || !part.messageID || !receiver) return;
@@ -1997,9 +3000,11 @@ const observeInbox = (event) => {
 // the full TUI, whose server plugin runs in a worker thread, or `--mini` — never
 // in `run`, `serve` or another subcommand an agent starts inside its pane.
 const inboxInteractive = () => !isMainThread || isMini();
-const interceptDoorbell = async (input, output) => {
+// `v2`: called by OpenCode 2.x's prompt hook (interceptDoorbellV2), which has
+// already checked that this is the pane's interactive OpenCode.
+const interceptDoorbell = async (input, output, v2 = false) => {
   try {
-    if (!inboxInPane() || !inboxInteractive() || !Array.isArray(output?.parts)) return;
+    if (!inboxInPane() || !(v2 || inboxInteractive()) || !Array.isArray(output?.parts)) return;
     const receiver = serverReceiver();
     for (const part of output.parts) {
       if (part?.type !== "text" || typeof part.text !== "string") continue;
@@ -2074,6 +3079,380 @@ fn tui_plugin_template(binary_path: &str) -> String {
         inbox_js(TUI_INBOX_JS)
     )
 }
+
+/// PRD #2050: OpenCode 2.x's TUI plugin, `<root>/plugins/dot-agent-deck-tui/tui.js`
+/// ([`tui_v2_file`]), with `BINARY_PATH` pinned like the others.
+///
+/// OpenCode 2.x loads `tui.js` from a directory under a config root's
+/// `plugins/` in the process that draws the full TUI (measured on 2.2.5: the
+/// client process, with the pane's environment; `opencode mini` loads none).
+/// The directory has no `server.js` or `index.js`, so 2.x's server-plugin
+/// scan skips it, and OpenCode 1.x's one-level file glob never sees it.
+fn tui_v2_template(binary_path: &str) -> String {
+    let binary_path_json =
+        serde_json::to_string(binary_path).expect("serializing a &str to a String is infallible");
+    format!(
+        "// dot-agent-deck's OpenCode 2 TUI plugin, generated by `dot-agent-deck hooks install`.\n\
+         // Regenerated on every install; edits are overwritten.\n\
+         import {{ execFile, spawn }} from \"child_process\";\n\n\
+         const BINARY_PATH = {binary_path_json};\n\n{}{}",
+        TUI_HOOK_BINARY_JS,
+        inbox_js(TUI_V2_JS)
+    )
+}
+
+/// PRD #2050: the 1.x TUI plugin's behaviour on OpenCode 2.x's TUI API: arm
+/// the deck's stream and start each message in the session on screen — in
+/// place in a root session, in the root of a subagent's session (shown
+/// first), and in a new session, shown, from the home screen, carrying the
+/// home screen's unsent draft into that session's composer — waiting while a
+/// dialog is open and re-reading the screen after every wait.
+///
+/// What moved: the route is `ui.router.current()` (`{ type, sessionID }`),
+/// sessions are `data.session.get`, a prompt is `client.session.prompt({
+/// sessionID, text })`, which keeps the session's own model and agent, and a
+/// prompt's progress is reported on `session.inbox.*` events naming the
+/// inbox item that call returned. OpenCode 2.x exposes no "dialog open" flag:
+/// one is taken to be open while the keymap's mode is neither the base mode
+/// nor the composer (measured: `base` with no dialog on 2.2.5; the modes a
+/// dialog pushes are unmeasured).
+const TUI_V2_JS: &str = r#"const TUI_GUARD = "__dotAgentDeckTuiLoaded";
+
+const setup = async (api) => {
+  try {
+    if (globalThis[TUI_GUARD]?.active || !inboxInPane()) return;
+    const instance = { active: true };
+    globalThis[TUI_GUARD] = instance;
+    let queue = Promise.resolve();
+    // Which OpenCode inbox item carries which deck message ids.
+    const pending = new Map();
+    const unsubscribe = [];
+
+    const sessionOf = (id) => {
+      try {
+        return api.data?.session?.get?.(id);
+      } catch (_) {
+        return undefined;
+      }
+    };
+    const dialogOpen = () => {
+      try {
+        const mode = api.keymap?.mode?.current?.();
+        return typeof mode === "string" && mode !== "base" && mode !== "composer";
+      } catch (_) {
+        return false;
+      }
+    };
+    const untilNoDialog = async () => {
+      while (instance.active && dialogOpen()) await inboxSleep(100);
+    };
+    const rootOf = (id) => {
+      let current = id;
+      for (let n = 0; n < 64; n++) {
+        const parent = sessionOf(current)?.parentID;
+        if (!parent) return current;
+        current = parent;
+      }
+      return current;
+    };
+    const shownSession = () => {
+      try {
+        const route = api.ui?.router?.current?.();
+        return route?.type === "session" ? route.sessionID : undefined;
+      } catch (_) {
+        return undefined;
+      }
+    };
+    const show = (sessionID) => api.ui.router.navigate({ type: "session", sessionID });
+    class Retired extends Error {}
+    const stillActive = () => {
+      if (!instance.active) throw new Retired();
+    };
+    const target = async () => {
+      await untilNoDialog();
+      stillActive();
+      const shown = shownSession();
+      if (shown) {
+        const root = rootOf(shown);
+        if (root !== shown) show(root);
+        return root;
+      }
+      const created = await api.client.session.create({});
+      stillActive();
+      const sessionID = created?.id ?? created?.data?.id;
+      if (!sessionID) throw new Error("no session was created");
+      if (shownSession()) throw new Error("the person opened a session meanwhile");
+      const stashed = await stashDraft();
+      show(sessionID);
+      if (stashed) await restoreDraft(sessionID);
+      return sessionID;
+    };
+    // The person's unsent draft on the home screen. 2.x gives home and each
+    // session a composer of its own, so opening the new session would leave
+    // the draft behind, where 1.x carried it along. The plugin API reads no
+    // composer, but the TUI's own `prompt.stash` / `prompt.stash.pop` commands
+    // move a whole prompt (text, files, pasted parts) and are dispatchable:
+    // stash on home, then pop once the session's composer is mounted
+    // (measured on 2.2.5: `prompt.stash.pop` is reachable again, with
+    // `session.compact`, about 0.1 s after navigating, and the popped prompt
+    // leaves OpenCode's stash empty). A pop that never becomes reachable
+    // leaves the draft in OpenCode's stash list, not lost.
+    const command = (id) => {
+      try {
+        const found = api.keymap?.commands?.().find((c) => c?.id === id);
+        if (!found) return undefined;
+        const enabled = typeof found.enabled === "function" ? found.enabled() : found.enabled;
+        return enabled === false ? undefined : found;
+      } catch (_) {
+        return undefined;
+      }
+    };
+    // Whether the draft went to the stash: `prompt.stash` is reachable only
+    // while the composer holds text, and the stash empties it.
+    const stashDraft = async () => {
+      if (!command("prompt.stash")) return false;
+      try {
+        api.keymap.dispatch("prompt.stash");
+      } catch (_) {
+        return false;
+      }
+      for (let n = 0; n < 10; n++) {
+        if (!command("prompt.stash")) return true;
+        await inboxSleep(10);
+      }
+      return false;
+    };
+    const restoreDraft = async (sessionID) => {
+      for (let n = 0; n < 100 && instance.active; n++) {
+        if (shownSession() !== sessionID) return;
+        if (command("session.compact") && command("prompt.stash.pop")) {
+          try {
+            api.keymap.dispatch("prompt.stash.pop");
+          } catch (_) {}
+          return;
+        }
+        await inboxSleep(20);
+      }
+    };
+    const notePending = (inboxID, text) => {
+      if (!inboxID) return;
+      const ids = inboxIdsIn(text).filter((id) => receiver.of(id).length > 0);
+      if (ids.length) inboxRemember(pending, inboxID, [...new Set([...(pending.get(inboxID) ?? []), ...ids])]);
+    };
+    let receiver;
+    const deliver = async (message) => {
+      const ref = inboxRef(message);
+      try {
+        stillActive();
+        const sessionID = await target();
+        const text = inboxText(message);
+        const onTarget = () => {
+          const now = shownSession();
+          return now === undefined || rootOf(now) === sessionID;
+        };
+        stillActive();
+        if (!onTarget()) throw new Error("the session changed");
+        await inboxHandOver(
+          receiver,
+          ref,
+          sessionID,
+          async () => {
+            try {
+              const item = await api.client.session.prompt({ sessionID, text });
+              notePending(item?.id ?? item?.data?.id, text);
+              return item;
+            } catch (error) {
+              const status = error?.status ?? error?.response?.status ?? error?.cause?.status;
+              if (typeof status === "number") return { error, response: { status } };
+              throw error;
+            }
+          },
+          () => instance.active && !dialogOpen() && onTarget(),
+        );
+      } catch (error) {
+        if (!(error instanceof Retired)) receiver.notHanded(ref);
+      }
+    };
+    receiver = inboxReceiver({
+      agent: "opencode",
+      active: () => instance.active,
+      deliver: (message) => {
+        queue = queue.then(() => deliver(message));
+      },
+    });
+
+    const on = (type, handler) => {
+      try {
+        const off = api.data?.on?.(type, (event) => {
+          try {
+            handler(event?.data ?? {});
+          } catch (_) {}
+        });
+        if (typeof off === "function") unsubscribe.push(off);
+      } catch (_) {}
+    };
+    on("session.inbox.enqueued", (data) => {
+      if (data.item?.type === "user") notePending(data.inboxID, data.item.payload?.text);
+    });
+    on("session.inbox.delivered", (data) => {
+      const refs = [];
+      for (const id of pending.get(data.inboxID) ?? []) refs.push(...receiver.of(id));
+      pending.delete(data.inboxID);
+      receiver.committed(refs);
+    });
+    on("session.inbox.cancelled", (data) => {
+      // A withdrawn prompt: lost, not released.
+      for (const id of pending.get(data.inboxID) ?? []) {
+        for (const ref of receiver.of(id)) receiver.lost(ref);
+      }
+      pending.delete(data.inboxID);
+    });
+    // PRD #2050: OpenCode 2's question forms. Only this plugin, in the
+    // process that draws the full TUI, can answer one (`data.session.form`;
+    // the server plugin's context has no form API), so it holds each through
+    // `await-answer`, as 1.x's server plugin holds a question, and replies
+    // with the deck's answer. The server plugin leaves `form.created` to it
+    // here, and still reports a form's reply or cancellation.
+    const heldForms = new Map();
+    const settledForms = new Set();
+    // At most this many forms held at once, each an `await-answer` child
+    // (audit I2): past it, a form is reported plainly, so the card says it is
+    // answered in OpenCode, rather than starting a child per form.
+    const MAX_HELD_FORMS = 16;
+    const stopForm = (formID) => {
+      const child = heldForms.get(formID);
+      heldForms.delete(formID);
+      try {
+        child?.kill();
+      } catch (_) {}
+    };
+    const reportPlainly = (payload) => {
+      try {
+        const child = spawn(hookBinary(), ["hook", "--agent", "opencode"], { stdio: ["pipe", "ignore", "ignore"] });
+        child.on("error", () => {});
+        child.stdin?.on("error", () => {});
+        child.stdin?.end(JSON.stringify(payload));
+      } catch (_) {}
+    };
+    const replyToForm = async (answer) => {
+      const refused = (detail) => ({ delivered: false, detail: String(detail).slice(0, 200) });
+      // An answer `await-answer` could not turn into the form's reply (typed
+      // words for a number field): not taken, so the form is held again.
+      if (answer?.kind === "refused") return refused(answer.detail ?? "the answer was refused");
+      if (answer?.kind !== "form" || typeof answer.request_id !== "string") return refused("the answer is not a form reply");
+      const input = { sessionID: answer.body?.sessionID, formID: answer.request_id, answer: answer.body?.answer ?? {} };
+      try {
+        const forms = api.data?.session?.form;
+        if (typeof forms?.reply === "function") await forms.reply(input);
+        else await api.client.session.form.reply(input);
+        return { delivered: true };
+      } catch (error) {
+        return refused(error?.message ?? "the reply could not be sent");
+      }
+    };
+    const holdForm = (form) => {
+      const formID = form?.id;
+      const sessionID = form?.sessionID;
+      if (typeof formID !== "string" || typeof sessionID !== "string" || !instance.active) return;
+      let root = sessionID;
+      try {
+        root = api.data?.session?.root?.(sessionID) || sessionID;
+      } catch (_) {}
+      const cwd = process.cwd();
+      // A child session's form is its subagent's, filed under the root with
+      // the child's id, as the server plugin files a child's permission
+      // prompt: the deck then releases that subagent's wait when the form is
+      // answered, instead of leaving the card on Needs Input.
+      const subagent = root !== sessionID ? { subagent_id: sessionID } : {};
+      const plain = { session_id: root, ...subagent, event: "question.asked", prompt: form.title ?? "", cwd, request_id: formID };
+      const payload = {
+        session_id: root,
+        ...subagent,
+        event: "question.asked",
+        cwd,
+        properties: { id: formID, sessionID, title: form.title, form },
+      };
+      stopForm(formID);
+      settledForms.delete(formID);
+      if (heldForms.size >= MAX_HELD_FORMS) {
+        reportPlainly(plain);
+        return;
+      }
+      let child;
+      try {
+        child = spawn(hookBinary(), ["await-answer", "--agent", "opencode", "--ack"], { stdio: ["pipe", "pipe", "ignore"] });
+      } catch (_) {
+        reportPlainly(plain);
+        return;
+      }
+      heldForms.set(formID, child);
+      let out = "";
+      let answered = false;
+      const failedEarly = (code, signal) => {
+        if (answered || heldForms.get(formID) !== child) return;
+        heldForms.delete(formID);
+        if (code !== 0 || signal) reportPlainly(plain);
+      };
+      child.stdin?.on("error", () => {});
+      child.stdout?.on("data", async (chunk) => {
+        if (answered) return;
+        out += chunk;
+        const newline = out.indexOf("\n");
+        if (newline < 0) return;
+        answered = true;
+        if (heldForms.get(formID) === child) heldForms.delete(formID);
+        let ack;
+        try {
+          ack = await replyToForm(JSON.parse(out.slice(0, newline)));
+        } catch (_) {
+          ack = { delivered: false, detail: "the deck's answer could not be read" };
+        }
+        try {
+          child.stdin?.end(JSON.stringify(ack) + "\n");
+        } catch (_) {}
+        if (!ack.delivered && instance.active && !settledForms.has(formID)) holdForm(form);
+      });
+      child.on("error", () => failedEarly(null, "error"));
+      child.on("close", (code, signal) => failedEarly(code, signal));
+      try {
+        child.stdin?.write(JSON.stringify(payload) + "\n");
+      } catch (_) {}
+    };
+    on("form.created", (data) => holdForm(data.form));
+    for (const type of ["form.replied", "form.cancelled"]) {
+      on(type, (data) => {
+        const formID = data.id ?? data.formID ?? data.form?.id;
+        if (typeof formID !== "string") return;
+        settledForms.add(formID);
+        if (settledForms.size > 256) settledForms.delete(settledForms.values().next().value);
+        stopForm(formID);
+      });
+    }
+    for (const type of ["session.status", "session.idle"]) {
+      on(type, (data) => {
+        const idle = type === "session.idle" || data.status?.type === "idle";
+        if (!idle || !data.sessionID) return;
+        // Idle with an attempt handed and not started on: the turn was
+        // aborted. Lost, so the deck may repeat it.
+        for (const ref of receiver.inSession(data.sessionID)) receiver.lost(ref);
+      });
+    }
+    receiver.start();
+    return () => {
+      instance.active = false;
+      for (const formID of [...heldForms.keys()]) stopForm(formID);
+      for (const off of unsubscribe.splice(0)) {
+        try {
+          off();
+        } catch (_) {}
+      }
+      receiver.stop();
+    };
+  } catch (_) {}
+};
+
+export default { id: "dot-agent-deck-tui", setup };
+"#;
 
 /// The TUI plugin's copy of the server plugin's `hookBinary` (PRD #1497's
 /// `DOT_AGENT_DECK_BIN` override, absolute paths only).
@@ -2274,6 +3653,7 @@ export default { id: "dot-agent-deck", tui };
 /// obsolete nested `dot-agent-deck/` directory (see [`stale_plugin_dir`]) so an
 /// upgrade migrates the layout in place. Shared by every install path
 /// (auto + explicit + test seam).
+#[cfg(test)]
 fn write_plugin(root: &Path, binary_path: &str) -> std::io::Result<PathBuf> {
     write_plugin_reporting(root, binary_path).map(|(path, _)| path)
 }
@@ -2316,6 +3696,76 @@ fn write_plugin_reporting(root: &Path, binary_path: &str) -> std::io::Result<(Pa
     crate::agent_hook_config::write_atomic(&plugin_dir, &path, content.as_bytes())?;
 
     Ok((path, true))
+}
+
+/// PRD #2050 (review F2): the file, in the deck's state directory, holding
+/// the OpenCode generation the deck last saw an agent run: `1` or `2`.
+const DETECTED_LAYOUT_FILE: &str = "opencode-layout";
+
+/// [`DETECTED_LAYOUT_FILE`] under the deck's state directory.
+fn detected_layout_file() -> PathBuf {
+    crate::platform::paths::state_dir().join(DETECTED_LAYOUT_FILE)
+}
+
+/// The generation recorded at `path` ([`remember_layout_at`]); `None` when
+/// there is none or it cannot be read.
+fn detected_major_at(path: &Path) -> Option<crate::opencode_version::Major> {
+    let text = crate::bounded_read::read_config_file(path, 16).ok()??;
+    match text.trim() {
+        "1" => Some(crate::opencode_version::Major::V1),
+        "2" => Some(crate::opencode_version::Major::V2),
+        _ => None,
+    }
+}
+
+/// The generation an install with no command to look at goes by: the one the
+/// deck last saw an agent run ([`remember_layout`]).
+fn remembered_major_now() -> Option<crate::opencode_version::Major> {
+    detected_major_at(&detected_layout_file())
+}
+
+/// PRD #2050 (review F2): remember `major`, the OpenCode generation an agent
+/// was just seen to run, for the next install that has no command to look at
+/// (startup, `hooks install`, a wrapper's spawn). Called by a spawn that
+/// detected the version of the binary its command names, and by the daemon's
+/// OpenCode watch once a wrapper-started OpenCode is seen to run a binary
+/// whose version a spawn-time probe recorded, the only way the deck learns
+/// the generation a wrapper runs; so the record is normally the latest
+/// detection (the spawn's thread and the watch's job can race, and the last
+/// write wins). What it changes is only whether 2.x's global root is created
+/// on a machine that has none ([`Layout`]).
+///
+/// It goes to the deck's own state directory, not into OpenCode's config:
+/// OpenCode 2 reloads its plugins when the module file changes, and a rewrite
+/// while an agent runs ended that agent's session in the middle of a turn
+/// (measured on 2.2.5 in lane 2: a `SessionEnd` and a new `SessionStart`, and
+/// the turn's idle never reported). Blocking.
+pub fn remember_layout(major: crate::opencode_version::Major) {
+    let path = detected_layout_file();
+    if let Err(e) = remember_layout_at(&path, major) {
+        tracing::debug!(
+            "could not record the OpenCode generation in {}: {e}",
+            path.display()
+        );
+    }
+}
+
+/// [`remember_layout`] into `path`. Whether it wrote.
+fn remember_layout_at(path: &Path, major: crate::opencode_version::Major) -> std::io::Result<bool> {
+    if detected_major_at(path) == Some(major) {
+        return Ok(false);
+    }
+    crate::config_write_guard::ensure_config_write_allowed(path)?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("the state file has no directory"))?;
+    std::fs::create_dir_all(dir)?;
+    let text = match major {
+        crate::opencode_version::Major::V1 => "1\n",
+        crate::opencode_version::Major::V2 => "2\n",
+    };
+    crate::agent_hook_config::write_atomic(dir, path, text.as_bytes())?;
+    Ok(true)
 }
 
 /// The `BINARY_PATH` an already-installed plugin under `root` pins, or `None`
@@ -2365,6 +3815,16 @@ fn binary_path_literal(js: &str) -> Option<String> {
         .filter_map(|line| line.strip_prefix("const BINARY_PATH = "))
         .filter_map(|rest| rest.strip_suffix(';'))
         .find_map(|literal| serde_json::from_str::<String>(literal).ok())
+}
+
+/// The text of the plugin module at `path`, read as the pins are
+/// ([`crate::bounded_read::read_config_file`]): `None` when it is missing,
+/// unreadable, not a regular file (a FIFO, or a symlink to one, included) or
+/// longer than `MAX_HOOK_CONFIG_BYTES`.
+fn bounded_module_text(path: &Path) -> Option<String> {
+    crate::bounded_read::read_config_file(path, crate::agent_hook_config::MAX_HOOK_CONFIG_BYTES)
+        .ok()
+        .flatten()
 }
 
 /// What the OpenCode plugin is pinned to now, read back from every root's
@@ -2465,7 +3925,94 @@ fn below_floor(file: &Path) -> bool {
 }
 
 /// [`auto_install_to`], adding each root it could not write to `failed`.
+#[cfg(test)]
 fn auto_install_to_reporting(
+    roots: &[PathBuf],
+    binary_path: &str,
+    failed: &mut Vec<String>,
+) -> Vec<(PathBuf, String)> {
+    auto_install_to_reporting_for(roots, binary_path, failed)
+}
+
+/// The template revision the module at `file` declares
+/// ([`PLUGIN_TEMPLATE_REVISION`]), `0` for one that declares none (one
+/// written before revisions existed) and `None` when there is no module to
+/// read. Read bounded and without blocking ([`bounded_module_text`]).
+fn template_revision(file: &Path) -> Option<u32> {
+    let text = bounded_module_text(file)?;
+    let declared = text
+        .lines()
+        .find_map(|line| line.strip_prefix("const DAD_TEMPLATE_REVISION = "))
+        .and_then(|rest| rest.trim_end_matches(';').trim().parse::<u32>().ok());
+    Some(declared.unwrap_or(0))
+}
+
+/// Audit N4: whether the module at `file` is of a later template revision
+/// than this binary writes, which an automatic install leaves alone.
+fn newer_template(file: &Path) -> bool {
+    template_revision(file).is_some_and(|n| n > PLUGIN_TEMPLATE_REVISION)
+}
+
+/// The file identity of the executable this process runs: on Linux the file
+/// `/proc/self/exe` resolves to, which is still the running image after an
+/// upgrade replaced the file at its path (the link then reads `… (deleted)`,
+/// and `stat` follows it to the old file). Elsewhere, the identity the file
+/// at `current_exe()` had the first time this was asked, which `daemon serve`
+/// does at startup ([`note_own_executable`]); a process that never asks
+/// before its file is replaced takes the new file for its own.
+fn own_executable_key() -> Option<crate::opencode_version::FileKey> {
+    #[cfg(test)]
+    if let Some(path) = RUNNING_EXE_FOR_TEST.with(|p| p.borrow().clone()) {
+        return crate::opencode_version::FileKey::of(&path);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        crate::opencode_version::FileKey::of(Path::new("/proc/self/exe"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        static AT_START: std::sync::OnceLock<Option<crate::opencode_version::FileKey>> =
+            std::sync::OnceLock::new();
+        AT_START
+            .get_or_init(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| crate::opencode_version::FileKey::of(&exe))
+            })
+            .clone()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the executable [`own_executable_key`] takes as this process's.
+    static RUNNING_EXE_FOR_TEST: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Record this process's executable now, at startup, for the platforms where
+/// [`own_executable_key`] cannot read the running image after its file is
+/// replaced. A no-op on Linux.
+pub fn note_own_executable() {
+    let _ = own_executable_key();
+}
+
+/// Auditor M2: whether this process runs an executable other than the file
+/// now at `pin`, i.e. it is an older deck still running after the install at
+/// `pin` was replaced. `false` when either identity cannot be read.
+fn running_other_than(pin: &str) -> bool {
+    match (
+        own_executable_key(),
+        crate::opencode_version::FileKey::of(Path::new(pin)),
+    ) {
+        (Some(running), Some(at_pin)) => running != at_pin,
+        _ => false,
+    }
+}
+
+/// [`auto_install_to_reporting`]: what every automatic install of the server
+/// module runs.
+fn auto_install_to_reporting_for(
     roots: &[PathBuf],
     binary_path: &str,
     failed: &mut Vec<String>,
@@ -2516,7 +4063,28 @@ fn auto_install_to_reporting(
         let mut taking_over = None;
         let (pinned, repairing) = match existing_binary_path(root) {
             Some(existing) if crate::agent_hook_config::auto_install_keeps(&existing) => {
-                if crate::agent_hook_config::executables_match(&existing, binary_path) {
+                let this_install =
+                    crate::agent_hook_config::executables_match(&existing, binary_path);
+                if newer_template(&plugin_file(root))
+                    && (!this_install || running_other_than(&existing))
+                {
+                    // Audit N4: a module a newer deck wrote, around a pin
+                    // that is usable, is left as it is when it pins another
+                    // install, or this install while this process is the
+                    // older deck still running after an upgrade replaced it:
+                    // that process would otherwise put its older template
+                    // back, and each rewrite reloads every live OpenCode 2
+                    // pane's plugin. When the file at the pin is the one this
+                    // process runs (auditor M2: a deliberate rollback, or a
+                    // config synced from a machine with a newer deck), this
+                    // install's template is written as before, since a newer
+                    // template may call what this build lacks. `hooks install
+                    // --agent opencode` writes this binary's template either
+                    // way.
+                    pins.push((root.clone(), existing));
+                    continue;
+                }
+                if this_install {
                     // This very install: refresh the template, keep the pin's
                     // spelling.
                     (existing, false)
@@ -2601,7 +4169,18 @@ fn auto_install_to_reporting(
 /// probe. Each successful write emits one `Installed OpenCode plugin: <path>` line to
 /// `out`. Every target is attempted even if an earlier one fails; the first error (if
 /// any) is returned so the caller surfaces it.
+#[cfg(test)]
 fn install_to_roots(
+    roots: &[PathBuf],
+    fallback_root: impl FnOnce() -> PathBuf,
+    binary_path: &str,
+    out: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    install_to_roots_for(roots, fallback_root, binary_path, out)
+}
+
+/// [`install_to_roots`]: what `hooks install --agent opencode` runs.
+fn install_to_roots_for(
     roots: &[PathBuf],
     fallback_root: impl FnOnce() -> PathBuf,
     binary_path: &str,
@@ -2623,8 +4202,8 @@ fn install_to_roots(
 
     let mut first_err: Option<std::io::Error> = None;
     for root in &targets {
-        match write_plugin(root, binary_path) {
-            Ok(path) => {
+        match write_plugin_reporting(root, binary_path) {
+            Ok((path, _)) => {
                 let _ = writeln!(out, "Installed OpenCode plugin: {}", path.display());
             }
             Err(e) => {
@@ -2676,11 +4255,24 @@ fn fresh_tui_config(file: &Path) -> String {
 /// under a candidate root, as a plain path or a `file://` URL. Anything else,
 /// even an entry that mentions `dot-agent-deck`, is the user's.
 fn is_deck_tui_entry(entry: &str) -> bool {
-    candidate_roots().iter().any(|root| {
-        let file = tui_plugin_file(root);
-        let path = file.to_string_lossy();
-        entry == path || entry.strip_prefix("file://") == Some(&*path)
-    })
+    candidate_roots()
+        .iter()
+        .any(|root| names_tui_file(entry, root))
+}
+
+/// Whether `entry` names the deck's TUI file under `root`, as a plain path or
+/// a `file://` URL.
+fn names_tui_file(entry: &str, root: &Path) -> bool {
+    let file = tui_plugin_file(root);
+    let path = file.to_string_lossy();
+    entry == path || entry.strip_prefix("file://") == Some(&*path)
+}
+
+/// [`is_deck_tui_entry`], also accepting the TUI file under any of `roots`
+/// (the roots an edit was handed, which are the candidate roots outside a
+/// test).
+fn is_deck_tui_entry_under(entry: &str, roots: &[&Path]) -> bool {
+    roots.iter().any(|root| names_tui_file(entry, root)) || is_deck_tui_entry(entry)
 }
 
 /// A TUI config's text, `None` when the file does not exist, or why it may
@@ -2789,7 +4381,8 @@ fn install_tui_half(root: &Path, pin: Option<&str>) -> std::io::Result<TuiEntry>
         .collect();
     for (path, text) in &configs {
         if let Ok(Some(text)) = text
-            && crate::jsonc_edit::has_entry(text, is_deck_tui_entry).unwrap_or(false)
+            && crate::jsonc_edit::has_entry(text, |e| is_deck_tui_entry_under(e, &[root]))
+                .unwrap_or(false)
         {
             return Ok(TuiEntry::Present(path.clone()));
         }
@@ -2866,11 +4459,11 @@ fn auto_install_tui(root: &Path, binary_path: &str, failed: &mut Vec<String>) {
 }
 
 /// Remove the deck's entry from `root`'s TUI configs (deleting one the
-/// installer created from nothing), then the TUI file. A config that cannot
-/// be edited safely, while the deck's TUI plugin may be listed in it, stops
-/// here with nothing deleted, so OpenCode is never left listing a plugin file
-/// that is gone.
-fn uninstall_tui_half(root: &Path) -> std::io::Result<()> {
+/// installer created from nothing), then the TUI file, telling `say` what
+/// was removed. A config that cannot be edited safely, while the deck's TUI
+/// plugin may be listed in it, stops here with nothing deleted, so OpenCode
+/// is never left listing a plugin file that is gone.
+fn uninstall_tui_half(root: &Path, say: &mut dyn FnMut(String)) -> std::io::Result<()> {
     let file = tui_plugin_file(root);
     let _lock = lock_tui_configs(root)?;
     let file_exists = std::fs::symlink_metadata(&file).is_ok();
@@ -2880,18 +4473,18 @@ fn uninstall_tui_half(root: &Path) -> std::io::Result<()> {
         let text = match read_tui_config(&path) {
             Ok(None) => continue,
             Ok(Some(text)) => text,
-            Err(why) if file_exists => return Err(left_unchanged(&path, &file, &why)),
+            Err(why) if file_exists => return Err(left_unchanged(&path, &file, &why, say)),
             Err(_) => continue,
         };
         if text == fresh_tui_config(&file) {
             edits.push((path, text, None));
             continue;
         }
-        match crate::jsonc_edit::remove_entries(&text, is_deck_tui_entry) {
+        match crate::jsonc_edit::remove_entries(&text, |e| is_deck_tui_entry_under(e, &[root])) {
             Ok(None) => {}
             Ok(Some(updated)) => edits.push((path, text, Some(updated))),
             Err(why) if file_exists || text.contains("dot-agent-deck-tui.js") => {
-                return Err(left_unchanged(&path, &file, &why.to_string()));
+                return Err(left_unchanged(&path, &file, &why.to_string(), say));
             }
             Err(_) => {}
         }
@@ -2906,37 +4499,179 @@ fn uninstall_tui_half(root: &Path) -> std::io::Result<()> {
     // read, by a writer outside the deck's lock.
     for (path, text, _) in &edits {
         if read_tui_config(path).ok().flatten().as_ref() != Some(text) {
-            return Err(left_unchanged(path, &file, CHANGED_DURING_EDIT));
+            return Err(left_unchanged(path, &file, CHANGED_DURING_EDIT, say));
         }
     }
     for (path, _, updated) in edits {
         match updated {
             Some(updated) => {
                 crate::agent_hook_config::write_atomic(root, &path, updated.as_bytes())?;
-                println!("Removed the OpenCode TUI plugin from {}", path.display());
+                crate::agent_hook_config::note_config_change();
+                say(format!(
+                    "Removed the OpenCode TUI plugin from {}",
+                    path.display()
+                ));
             }
             None => {
                 std::fs::remove_file(&path)?;
-                println!("Removed {}", path.display());
+                crate::agent_hook_config::note_config_change();
+                say(format!("Removed {}", path.display()));
             }
         }
     }
     if file_exists {
         std::fs::remove_file(&file)?;
-        println!("Removed OpenCode TUI plugin: {}", file.display());
+        crate::agent_hook_config::note_config_change();
+        say(format!("Removed OpenCode TUI plugin: {}", file.display()));
     }
     Ok(())
 }
 
-fn left_unchanged(config: &Path, file: &Path, why: &str) -> std::io::Error {
-    println!(
+fn left_unchanged(
+    config: &Path,
+    file: &Path,
+    why: &str,
+    say: &mut dyn FnMut(String),
+) -> std::io::Error {
+    say(format!(
         "Left {} unchanged: {why}. Kept {} so OpenCode does not list a missing plugin. \
          Remove {} from its \"plugin\" list, then run the uninstall again.",
         config.display(),
         file.display(),
         tui_entry_literal(file)
-    );
+    ));
     std::io::Error::other(format!("left {} unchanged: {why}", config.display()))
+}
+
+/// PRD #2050: OpenCode 2.x's CLI config file, `<root>/cli.json`. 2.x creates
+/// it when it starts with none, copying 1.x's `<root>/tui.json` `plugin` list
+/// into its `plugins` list (measured on 2.2.5; source: `cli.config.migrate`,
+/// which reads `tui.json` only while `cli.json` is absent, so the copy is
+/// made once per missing `cli.json`, not on every start). The deck's 1.x TUI
+/// entry copied there names a file, which 2.x does not load as a TUI plugin.
+const CLI_CONFIG_FILE: &str = "cli.json";
+
+/// The list in [`CLI_CONFIG_FILE`] that holds the copied entries.
+const CLI_PLUGIN_LIST: &str = "plugins";
+
+/// The roots whose `cli.json` the deck cleans: OpenCode 2.x's global root,
+/// and the XDG root when `$OPENCODE_CONFIG_DIR` moved it elsewhere.
+fn cli_roots(xdg: &Path, v2_global: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![v2_global.to_path_buf()];
+    if xdg != v2_global {
+        roots.push(xdg.to_path_buf());
+    }
+    roots
+}
+
+/// PRD #2050: remove the deck's own 1.x TUI entry ([`is_deck_tui_entry`])
+/// from `<root>/cli.json`'s `plugins` list, keeping every other entry and
+/// byte of the file ([`crate::jsonc_edit`]). A missing `cli.json` is never
+/// created. `Ok(Some(path))` when an entry was removed, `Ok(None)` when there
+/// was nothing to remove, and `Err` with the reason when the file holds the
+/// entry (or may: it mentions the deck's TUI file) but could not be edited.
+///
+/// OpenCode 1.x never reads `cli.json`, so the entry serves no generation and
+/// goes whatever layout is being installed.
+fn remove_cli_entry(root: &Path, tui_roots: &[&Path]) -> Result<Option<PathBuf>, String> {
+    let path = root.join(CLI_CONFIG_FILE);
+    if std::fs::symlink_metadata(&path).is_err() {
+        return Ok(None);
+    }
+    // Asked only of a file the edit refused (a symlink, not a regular file,
+    // too large, unparsable), to tell a refusal worth reporting from one that
+    // concerns no entry of the deck's. Audit L2: bounded and non-blocking
+    // ([`crate::bounded_read::read_config_file`]), so a FIFO or a symlink to
+    // `/dev/zero` cannot hang or flood the spawn; a file it cannot read that
+    // way may hold the entry, so the refusal is reported.
+    let mentions_deck = || {
+        crate::bounded_read::read_config_file(&path, MAX_TUI_CONFIG_BYTES).map_or(true, |text| {
+            text.is_some_and(|text| text.contains("dot-agent-deck-tui.js"))
+        })
+    };
+    let text = match read_tui_config(&path) {
+        Ok(None) => return Ok(None),
+        Ok(Some(text)) => text,
+        Err(why) if mentions_deck() => return Err(why),
+        Err(_) => return Ok(None),
+    };
+    let updated = match crate::jsonc_edit::remove_list_entries(&text, CLI_PLUGIN_LIST, |e| {
+        is_deck_tui_entry_under(e, tui_roots)
+    }) {
+        Ok(None) => return Ok(None),
+        Ok(Some(updated)) => updated,
+        Err(why) if mentions_deck() => return Err(why.to_string()),
+        Err(_) => return Ok(None),
+    };
+    crate::config_write_guard::ensure_config_write_allowed(&path).map_err(|e| e.to_string())?;
+    let _lock = crate::agent_hook_config::lock_config(&path).map_err(|e| e.to_string())?;
+    // Hardening M5, as for `tui.json`: OpenCode or an editor may have saved
+    // the file since it was read; publishing the splice would undo that save.
+    if read_tui_config(&path) != Ok(Some(text)) {
+        return Err(CHANGED_DURING_EDIT.to_string());
+    }
+    crate::agent_hook_config::write_atomic(root, &path, updated.as_bytes())
+        .map_err(|e| e.to_string())?;
+    crate::agent_hook_config::note_config_change();
+    Ok(Some(path))
+}
+
+/// [`remove_cli_entry`] for every root of `roots` (which are also the roots
+/// the deck's TUI file may be named under), as the automatic install does
+/// it: quiet on stdout, a refusal added to `failed`.
+fn auto_remove_cli_entries(roots: &[PathBuf], failed: &mut Vec<String>) {
+    let tui_roots: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
+    for root in roots {
+        match remove_cli_entry(root, &tui_roots) {
+            Ok(Some(path)) => tracing::info!(
+                "auto-install: removed the deck's OpenCode 1.x TUI plugin entry from {}, \
+                 where OpenCode 2 copied it from tui.json and cannot load it",
+                path.display()
+            ),
+            Ok(None) => {}
+            Err(why) => {
+                let path = root.join(CLI_CONFIG_FILE);
+                failed.push(format!("{}: {why}", path.display()));
+                tracing::warn!(
+                    "auto-install: left {} unchanged: {why}; remove the entry naming \
+                     dot-agent-deck-tui.js from its \"plugins\" list, which OpenCode 2 cannot \
+                     load",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+/// [`remove_cli_entry`] for every root of `roots`, as `hooks install` and
+/// `hooks uninstall` do it: each outcome printed, the first refusal returned.
+fn remove_cli_entries_printing(roots: &[PathBuf]) -> std::io::Result<()> {
+    let tui_roots: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
+    let mut first_err = None;
+    for root in roots {
+        let path = root.join(CLI_CONFIG_FILE);
+        match remove_cli_entry(root, &tui_roots) {
+            Ok(Some(path)) => println!(
+                "Removed the OpenCode 1.x TUI plugin entry from {}",
+                path.display()
+            ),
+            Ok(None) => {}
+            Err(why) => {
+                println!(
+                    "Left {} unchanged: {why}. Remove the entry naming dot-agent-deck-tui.js \
+                     from its \"plugins\" list: OpenCode 2 cannot load it.",
+                    path.display()
+                );
+                first_err.get_or_insert_with(|| {
+                    std::io::Error::other(format!("left {} unchanged: {why}", path.display()))
+                });
+            }
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Silently install OpenCode plugin into every existing layout, and the TUI
@@ -2973,40 +4708,46 @@ pub fn refresh_install() -> crate::hooks_refresh::InstallAttempt {
 /// before its child does, so the agent loads the integration this deck checks
 /// it against. Returns the pins and every integration file it could not
 /// write, for the card to say so.
-pub fn refresh_for_spawn() -> (Vec<crate::hook_binary::HookPin>, Vec<String>) {
-    auto_install_reporting()
+///
+/// PRD #2050: `major` is the generation the spawn's command runs, when the
+/// deck could tell; with none (a wrapper), the one the deck last saw an agent
+/// run ([`remembered_major_now`]), as for an install with no command at all,
+/// and failing that `probed`, the version of the `opencode` a wrapper's PATH
+/// resolves to, which the wrapper may or may not run.
+///
+/// Unlike an install with no OpenCode to start (startup, `hooks install`), a
+/// spawn's ends with the module in a global root even on a machine where
+/// OpenCode has never run and no config root exists yet: the XDG root is
+/// created first ([`create_root_for_spawn`]), as the OpenCode about to start
+/// would create it itself, so its first session loads the plugin.
+pub fn refresh_for_spawn(
+    major: Option<crate::opencode_version::Major>,
+    probed: Option<crate::opencode_version::Major>,
+) -> (Vec<crate::hook_binary::HookPin>, Vec<String>) {
+    let major = major.or_else(remembered_major_now).or(probed);
+    auto_install_reporting_for(Layout::for_major(major), true)
 }
 
 fn auto_install_reporting() -> (Vec<crate::hook_binary::HookPin>, Vec<String>) {
+    auto_install_reporting_for(Layout::for_major(remembered_major_now()), false)
+}
+
+/// PRD #2050: the automatic install for `layout`, over the real config roots,
+/// pinned to this deck's durable binary; `for_spawn` when an OpenCode is
+/// about to start ([`refresh_for_spawn`]).
+fn auto_install_reporting_for(
+    layout: Layout,
+    for_spawn: bool,
+) -> (Vec<crate::hook_binary::HookPin>, Vec<String>) {
     let mut failed = Vec::new();
     let roots = candidate_roots();
-    let (binary_path, pins) = auto_install_resolved(&roots, &mut failed, || {
+    let v2_global = v2_global_root();
+    if for_spawn {
+        create_root_for_spawn(&roots, &v2_global, &mut failed);
+    }
+    let (_, pins) = auto_install_layout(&roots, &v2_global, layout, &mut failed, || {
         crate::platform::paths::durable_binary_path()
     });
-    // PRD #1666 S8: the TUI plugin, into the XDG root, from the same resolved
-    // binary the server plugin was installed with. OpenCode reads `tui.json`
-    // from the XDG root only, so a legacy-only layout gets its TUI half there
-    // too (PR #1735 review): OpenCode creates that root itself on any run
-    // (measured on 1.18.35, `opencode --version` included), so creating it for
-    // an installed OpenCode is not speculative. With no root at all nothing is
-    // created.
-    if let Some(binary_path) = binary_path
-        && roots.iter().any(|root| root.exists())
-    {
-        let xdg = &roots[0];
-        match crate::config_write_guard::ensure_config_write_allowed(&tui_plugin_file(xdg))
-            .and_then(|()| std::fs::create_dir_all(xdg))
-        {
-            Ok(()) => auto_install_tui(xdg, &binary_path, &mut failed),
-            Err(e) => {
-                failed.push(format!("{}: {e}", xdg.display()));
-                tracing::warn!(
-                    "auto-install: could not create the OpenCode config root {} for its TUI                      plugin: {e}; deck messages will reach OpenCode by the doorbell instead",
-                    xdg.display()
-                );
-            }
-        }
-    }
     // One pin per binary: the roots of one machine name the same install.
     let mut out: Vec<crate::hook_binary::HookPin> = Vec::new();
     for (root, binary) in pins {
@@ -3019,6 +4760,347 @@ fn auto_install_reporting() -> (Vec<crate::hook_binary::HookPin>, Vec<String>) {
         }
     }
     (out, failed)
+}
+
+/// PRD #2050: the automatic install of `layout` over `roots` (1.x's global
+/// root first, then the legacy one, then `$OPENCODE_CONFIG_DIR` when it names
+/// another directory) and OpenCode 2.x's global root `v2_global`, with the
+/// binary resolution injected. Returns the binary resolved and the pin each
+/// root holds afterwards.
+///
+/// The same files whatever `layout` says, wherever a global root exists
+/// ([`Layout`]): the module in the existing global roots with the deck's
+/// legacy copy removed ([`auto_install_global_resolved`]), both TUI halves,
+/// and the deck's dead entry removed from OpenCode 2.x's `cli.json`
+/// ([`auto_remove_cli_entries`]). So installs for alternating generations
+/// write nothing once the first has run, and the module's bytes change only
+/// when its template or pin does.
+fn auto_install_layout(
+    roots: &[PathBuf],
+    v2_global: &Path,
+    layout: Layout,
+    failed: &mut Vec<String>,
+    resolve: impl FnOnce() -> Result<String, String>,
+) -> (Option<String>, Vec<(PathBuf, String)>) {
+    let global = global_roots(roots, v2_global);
+    // Auditor L2: the XDG root the TUI half below creates whenever any root
+    // exists is created first, so a machine with only `~/.opencode` gets the
+    // module in the global root in this install, not after the next one
+    // moves it there.
+    let any_root = roots.iter().any(|root| root.exists()) || v2_global.exists();
+    let mut xdg_refused = false;
+    if any_root && let Some(xdg) = roots.first().filter(|xdg| !xdg.exists()) {
+        xdg_refused = !ensure_root(xdg, &tui_plugin_file(xdg), failed);
+    }
+    let (binary_path, pins) = if layout == Layout::V2 || global.iter().any(|root| root.exists()) {
+        auto_install_global_resolved(
+            roots,
+            v2_global,
+            &global,
+            layout == Layout::V2,
+            failed,
+            resolve,
+        )
+    } else {
+        auto_install_resolved_for(roots, failed, resolve)
+    };
+    // PRD #1666 S8: the TUI plugin, into the XDG root, from the same resolved
+    // binary the server plugin was installed with. OpenCode reads `tui.json`
+    // from the XDG root only, so a legacy-only layout gets its TUI half there
+    // too (PR #1735 review): OpenCode creates that root itself on any run
+    // (measured on 1.18.35, `opencode --version` included), so creating it for
+    // an installed OpenCode is not speculative. With no root at all nothing is
+    // created. PRD #2050: OpenCode 2.x reads its TUI plugins from its own
+    // global root, as a `plugins/` directory. Both halves, whatever the
+    // generation: each is invisible to the other generation.
+    let Some(binary_path) = binary_path.as_deref() else {
+        return (None, pins);
+    };
+    if !roots.iter().any(|root| root.exists()) && !v2_global.exists() {
+        return (Some(binary_path.to_string()), pins);
+    }
+    let Some(xdg) = roots.first() else {
+        return (Some(binary_path.to_string()), pins);
+    };
+    if !xdg_refused && ensure_root(xdg, &tui_plugin_file(xdg), failed) {
+        auto_install_tui(xdg, binary_path, failed);
+    }
+    if (!xdg_refused || v2_global != xdg.as_path())
+        && ensure_root(v2_global, &tui_v2_file(v2_global), failed)
+    {
+        auto_install_tui_v2(v2_global, binary_path, failed);
+    }
+    // A 2.x half left in a root 2.x no longer reads (one written before
+    // `$OPENCODE_CONFIG_DIR` moved its root).
+    for root in roots.iter().filter(|root| !same_location(root, v2_global)) {
+        remove_tui_v2(root, v2_global, failed);
+    }
+    // OpenCode 2.x copies the 1.x half's `tui.json` entry into a `cli.json`
+    // it creates when there is none, where that entry is dead.
+    auto_remove_cli_entries(&cli_roots(xdg, v2_global), failed);
+    (Some(binary_path.to_string()), pins)
+}
+
+/// Review of PR #2060: for an OpenCode about to start on a machine with no
+/// OpenCode config root at all, create the XDG root (`roots[0]`,
+/// `$XDG_CONFIG_HOME/opencode`), which OpenCode creates itself on any run
+/// (measured on 1.18.35) and which both generations load the module from
+/// unless `$OPENCODE_CONFIG_DIR` moves 2.x's. With any root present nothing
+/// is created here, so the files land where they would after OpenCode's own
+/// first run. A refusal is added to `failed`.
+fn create_root_for_spawn(roots: &[PathBuf], v2_global: &Path, failed: &mut Vec<String>) {
+    if roots.iter().any(|root| root.exists()) || v2_global.exists() {
+        return;
+    }
+    if let Some(xdg) = roots.first() {
+        ensure_root(xdg, &plugin_file(xdg), failed);
+    }
+}
+
+/// Create the config root `root` for `file` the deck is about to write, when
+/// the config guard allows it; whether it may go ahead. A refusal is added to
+/// `failed` and logged.
+fn ensure_root(root: &Path, file: &Path, failed: &mut Vec<String>) -> bool {
+    match crate::config_write_guard::ensure_config_write_allowed(file)
+        .and_then(|()| std::fs::create_dir_all(root))
+    {
+        Ok(()) => true,
+        Err(e) => {
+            failed.push(format!("{}: {e}", root.display()));
+            tracing::warn!(
+                "auto-install: could not create the OpenCode config root {} for the deck's \
+                 plugin: {e}",
+                root.display()
+            );
+            false
+        }
+    }
+}
+
+/// PRD #2050: when `global` has no server module yet, copy the first pinned
+/// module found in `legacy` there, so that a pin to another live install
+/// which only a legacy copy held is judged by the usual pin rules
+/// ([`auto_install_to_reporting_for`]) before that legacy copy is removed.
+fn carry_module_over(global: &Path, legacy: &[PathBuf]) {
+    let global_file = plugin_file(global);
+    let _guard = lock_plugin();
+    // Audit L2: read bounded and without blocking on a FIFO
+    // ([`bounded_module_text`]), since this holds `PLUGIN_LOCK`, which every
+    // other OpenCode install waits on.
+    if std::fs::symlink_metadata(&global_file).is_err()
+        && let Some(js) = legacy
+            .iter()
+            .find_map(|root| bounded_module_text(&plugin_file(root)))
+            .filter(|js| binary_path_literal(js).is_some())
+    {
+        let dir = global.join("plugin");
+        if let Err(e) = crate::config_write_guard::ensure_config_write_allowed(&global_file)
+            .and_then(|()| std::fs::create_dir_all(&dir))
+            .and_then(|()| {
+                crate::agent_hook_config::write_atomic(&dir, &global_file, js.as_bytes())
+            })
+        {
+            tracing::warn!(
+                "auto-install: could not carry the OpenCode plugin over to {}: {e}",
+                global_file.display()
+            );
+        }
+    }
+}
+
+/// PRD #2050, review S3: the module in the existing global roots `global`
+/// ([`global_roots`]), and the deck's own copy removed from the legacy
+/// `~/.opencode` once OpenCode 2.x's global root `v2_global` holds the module.
+/// OpenCode 2.x would refuse that copy as a duplicate for a project under
+/// `$HOME`, and 1.x loads the XDG global root as well, so neither generation
+/// needs it. With `create_v2_root` (a 2.x was detected), `v2_global` is
+/// created first when missing. A legacy pin is carried over first
+/// ([`carry_module_over`]). Only the deck's file names are removed
+/// ([`remove_duplicate_module`]).
+fn auto_install_global_resolved(
+    roots: &[PathBuf],
+    v2_global: &Path,
+    global: &[PathBuf],
+    create_v2_root: bool,
+    failed: &mut Vec<String>,
+    resolve: impl FnOnce() -> Result<String, String>,
+) -> (Option<String>, Vec<(PathBuf, String)>) {
+    let binary_path = match resolve() {
+        Ok(binary_path) => binary_path,
+        Err(e) => {
+            tracing::warn!("auto-install: {e}");
+            failed.push(e);
+            return (None, Vec::new());
+        }
+    };
+    if create_v2_root
+        && let Err(e) =
+            crate::config_write_guard::ensure_config_write_allowed(&plugin_file(v2_global))
+                .and_then(|()| std::fs::create_dir_all(v2_global))
+    {
+        failed.push(format!("{}: {e}", plugin_file(v2_global).display()));
+        tracing::warn!(
+            "auto-install: could not create the OpenCode config root {}: {e}",
+            v2_global.display()
+        );
+        return (Some(binary_path), Vec::new());
+    }
+    // A legacy root that is one of the global roots under another name (a
+    // symlinked `~/.opencode`) holds the module just written, not a copy.
+    let legacy = roots
+        .get(1)
+        .filter(|legacy| !global.iter().any(|root| same_location(root, legacy)));
+    if let Some(legacy) = legacy {
+        for root in global.iter().filter(|root| root.exists()) {
+            carry_module_over(root, std::slice::from_ref(legacy));
+        }
+    }
+    let pins = auto_install_to_reporting_for(global, &binary_path, failed);
+    // Removed only once 2.x's global copy is in place, so a failed write never
+    // leaves OpenCode with no module at all.
+    if let Some(legacy) = legacy
+        && pins.iter().any(|(root, _)| root == v2_global)
+    {
+        remove_duplicate_module(legacy, global, failed);
+    }
+    (Some(binary_path), pins)
+}
+
+/// Review of PR #2060: whether `a` and `b` name the same file or directory
+/// — the same path, or two that resolve to one place through a symlink (a
+/// `~/.opencode` linked to `~/.config/opencode`, an `$OPENCODE_CONFIG_DIR`
+/// naming the XDG root by another path). A path that does not resolve is
+/// compared as written.
+fn same_location(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
+/// PRD #2050: remove the deck's server module (and any obsolete nested
+/// layout) from `root`, where OpenCode 2.x would load it as a second copy of
+/// the global root's. Only the deck's own file names are touched, and none
+/// that is the same file as one in a root of `keep` (the global roots just
+/// written) through a symlinked directory or file ([`same_location`]).
+fn remove_duplicate_module(root: &Path, keep: &[PathBuf], failed: &mut Vec<String>) {
+    let _guard = lock_plugin();
+    for (artifact, in_root) in [
+        (plugin_file(root), plugin_file as fn(&Path) -> PathBuf),
+        (stale_plugin_dir(root), stale_plugin_dir),
+    ] {
+        if std::fs::symlink_metadata(&artifact).is_err()
+            || keep
+                .iter()
+                .any(|kept| same_location(&artifact, &in_root(kept)))
+        {
+            continue;
+        }
+        let removed =
+            crate::config_write_guard::ensure_config_write_allowed(&artifact).and_then(|()| {
+                if artifact.is_dir() {
+                    std::fs::remove_dir_all(&artifact)
+                } else {
+                    std::fs::remove_file(&artifact)
+                }
+            });
+        match removed {
+            Ok(()) => tracing::info!(
+                "auto-install: removed {}: OpenCode 2 loads the deck's plugin from the global \
+                 config root, and would refuse this copy as a duplicate",
+                artifact.display()
+            ),
+            Err(e) => {
+                failed.push(format!("{}: {e}", artifact.display()));
+                tracing::warn!(
+                    "auto-install: could not remove {}, which OpenCode 2 would load as a \
+                     duplicate plugin: {e}",
+                    artifact.display()
+                );
+            }
+        }
+    }
+}
+
+/// PRD #2050: write OpenCode 2.x's TUI plugin under `root` pinned to `pin`,
+/// leaving a file that already holds those bytes untouched. Whether it
+/// changed anything. Callers hold [`PLUGIN_LOCK`].
+fn write_tui_v2(root: &Path, pin: &str) -> std::io::Result<bool> {
+    let file = tui_v2_file(root);
+    crate::config_write_guard::ensure_config_write_allowed(&file)?;
+    let content = tui_v2_template(pin);
+    if std::fs::read(&file).ok().as_deref() == Some(content.as_bytes()) {
+        return Ok(false);
+    }
+    let dir = tui_v2_dir(root);
+    std::fs::create_dir_all(&dir)?;
+    crate::agent_hook_config::write_atomic(&dir, &file, content.as_bytes())?;
+    crate::agent_hook_config::note_config_change();
+    Ok(true)
+}
+
+/// PRD #2050: remove OpenCode 2.x's TUI half from `root`, a root 2.x does
+/// not read. Only the deck's own directory is touched, and not when it is the
+/// half in `keep` (2.x's global root) under another name ([`same_location`]).
+fn remove_tui_v2(root: &Path, keep: &Path, failed: &mut Vec<String>) {
+    let _guard = lock_plugin();
+    let dir = tui_v2_dir(root);
+    if std::fs::symlink_metadata(&dir).is_err() || same_location(&dir, &tui_v2_dir(keep)) {
+        return;
+    }
+    match crate::config_write_guard::ensure_config_write_allowed(&dir)
+        .and_then(|()| std::fs::remove_dir_all(&dir))
+    {
+        Ok(()) => tracing::info!(
+            "auto-install: removed the OpenCode 2 TUI plugin at {}: this OpenCode is 1.x",
+            dir.display()
+        ),
+        Err(e) => {
+            failed.push(format!("{}: {e}", dir.display()));
+            tracing::warn!("auto-install: could not remove {}: {e}", dir.display());
+        }
+    }
+}
+
+/// PRD #2050: the automatic install's 2.x TUI half, its pin following the
+/// same rules as the 1.x half's ([`auto_install_tui`]).
+fn auto_install_tui_v2(root: &Path, binary_path: &str, failed: &mut Vec<String>) {
+    let _guard = lock_plugin();
+    let file = tui_v2_file(root);
+    let takeover = crate::hook_binary::Takeover::current();
+    let pin = match existing_pin(&file) {
+        Some(existing) if crate::agent_hook_config::auto_install_keeps(&existing) => {
+            if crate::agent_hook_config::executables_match(&existing, binary_path) {
+                Some(existing)
+            } else if takeover.supersedes(&existing) {
+                Some(binary_path.to_string())
+            } else if below_floor(&file) {
+                Some(existing)
+            } else {
+                None
+            }
+        }
+        _ => Some(binary_path.to_string()),
+    };
+    let Some(pin) = pin else {
+        return;
+    };
+    match write_tui_v2(root, &pin) {
+        Ok(true) => tracing::info!(
+            "auto-install: installed the OpenCode 2 TUI plugin at {}",
+            file.display()
+        ),
+        Ok(false) => {}
+        Err(e) => {
+            failed.push(format!("{}: {e}", file.display()));
+            tracing::warn!(
+                "auto-install: failed to install the OpenCode 2 TUI plugin at {}: {e}; deck \
+                 messages will reach OpenCode by the doorbell instead",
+                file.display()
+            );
+        }
+    }
 }
 
 /// [`auto_install`] with the binary-path resolution injected, so the PRD #381 M6
@@ -3038,7 +5120,18 @@ fn auto_install_reporting() -> (Vec<crate::hook_binary::HookPin>, Vec<String>) {
 ///
 /// Returns the binary path it resolved (`None` when it installed nothing) and
 /// the pin each existing root holds afterwards.
+#[cfg(test)]
 fn auto_install_resolved(
+    roots: &[PathBuf],
+    failed: &mut Vec<String>,
+    resolve: impl FnOnce() -> Result<String, String>,
+) -> (Option<String>, Vec<(PathBuf, String)>) {
+    auto_install_resolved_for(roots, failed, resolve)
+}
+
+/// [`auto_install_resolved`]: the module in every existing root, for a
+/// machine with no global root yet ([`Layout`]).
+fn auto_install_resolved_for(
     roots: &[PathBuf],
     failed: &mut Vec<String>,
     resolve: impl FnOnce() -> Result<String, String>,
@@ -3048,7 +5141,7 @@ fn auto_install_resolved(
     }
     match resolve() {
         Ok(binary_path) => {
-            let pins = auto_install_to_reporting(roots, &binary_path, failed);
+            let pins = auto_install_to_reporting_for(roots, &binary_path, failed);
             (Some(binary_path), pins)
         }
         Err(e) => {
@@ -3061,21 +5154,64 @@ fn auto_install_resolved(
 
 /// `dot-agent-deck hooks install --agent opencode`. Unlike [`auto_install`],
 /// this ALWAYS writes the freshly resolved path: the user asked for this
-/// install by name, so an existing pin is not preserved (PRD #381 M5).
+/// install by name, so an existing pin is not preserved (PRD #381 M5), and a
+/// module of a later template revision is replaced too ([`newer_template`]).
+///
+/// PRD #2050: the same files as the automatic install ([`Layout`]): the
+/// module in the existing global roots ([`global_roots`]), 2.x's created
+/// first when the deck last saw an agent run OpenCode 2
+/// ([`remembered_major_now`]), with the deck's own `~/.opencode` copy removed
+/// once 2.x's global root holds it; with no global root, every existing root,
+/// or the XDG default with no root at all; and both TUI halves. Every install removes the
+/// deck's entry from OpenCode 2.x's `cli.json` ([`remove_cli_entry`]).
 pub fn install() -> std::io::Result<()> {
+    use crate::opencode_version::Major;
     let binary_path =
         crate::platform::paths::durable_binary_path().map_err(std::io::Error::other)?;
-
-    install_to_roots(
-        &candidate_roots(),
+    let roots = candidate_roots();
+    let root = xdg_default_root();
+    let v2_global = v2_global_root();
+    // As the automatic install for a detected 2.x does: 2.x's global root is
+    // created when the deck last saw an agent run OpenCode 2.
+    if remembered_major_now() == Some(Major::V2) {
+        crate::config_write_guard::ensure_config_write_allowed(&plugin_file(&v2_global))?;
+        std::fs::create_dir_all(&v2_global)?;
+    }
+    let global = global_roots(&roots, &v2_global);
+    let targets = if global.iter().any(|root| root.exists()) {
+        global
+    } else {
+        roots.clone()
+    };
+    install_to_roots_for(
+        &targets,
         xdg_default_root,
         &binary_path,
         &mut std::io::stdout(),
     )?;
-    // PRD #1666 S8: the TUI plugin, in the XDG root only (design §7.2).
-    let root = xdg_default_root();
+    // Review S3: OpenCode 2.x's global root now holds the module, so the
+    // deck's own copy in `~/.opencode`, which 2.x would refuse as a
+    // duplicate, goes; 1.x loads the XDG root as well.
+    if plugin_file(&v2_global).exists()
+        && let Some(legacy) = roots.get(1).filter(|legacy| !targets.contains(legacy))
+    {
+        for artifact in [plugin_file(legacy), stale_plugin_dir(legacy)] {
+            if std::fs::symlink_metadata(&artifact).is_ok() {
+                uninstall_impl(&artifact)?;
+            }
+        }
+    }
     let _guard = lock_plugin();
+    // PRD #2050: OpenCode 2.x's TUI half, a directory 1.x never sees.
+    std::fs::create_dir_all(&v2_global)?;
+    write_tui_v2(&v2_global, &binary_path)?;
+    println!(
+        "Installed OpenCode 2 TUI plugin: {}",
+        tui_v2_file(&v2_global).display()
+    );
+    remove_cli_entries_printing(&cli_roots(&root, &v2_global))?;
     std::fs::create_dir_all(&root)?;
+    // PRD #1666 S8: the TUI plugin, in the XDG root only (design §7.2).
     let tui_file = tui_plugin_file(&root);
     match install_tui_half(&root, Some(&binary_path))? {
         TuiEntry::Added(file) => {
@@ -3104,10 +5240,20 @@ pub fn install() -> std::io::Result<()> {
 }
 
 pub fn uninstall() -> std::io::Result<()> {
+    // PRD #2050: the deck's entry OpenCode 2.x copied into its `cli.json`.
+    let roots = candidate_roots();
+    remove_cli_entries_printing(&cli_roots(&xdg_default_root(), &v2_global_root()))?;
     // PRD #1666 S8: the TUI plugin's entry and file first, so a config that
     // cannot be edited safely stops the uninstall before anything is deleted.
-    for root in candidate_roots() {
-        uninstall_tui_half(&root)?;
+    for root in roots {
+        uninstall_tui_half(&root, &mut |line| println!("{line}"))?;
+        // PRD #2050: OpenCode 2.x's TUI half, a directory of the deck's own.
+        let dir = tui_v2_dir(&root);
+        if std::fs::symlink_metadata(&dir).is_ok() {
+            crate::config_write_guard::ensure_config_write_allowed(&dir)?;
+            std::fs::remove_dir_all(&dir)?;
+            println!("Removed OpenCode 2 TUI plugin: {}", dir.display());
+        }
     }
     let artifacts = existing_plugin_artifacts();
     if artifacts.is_empty() {
@@ -3611,8 +5757,10 @@ pub(crate) mod tests {
         assert!(content.contains("const permissionPayload"));
         assert!(content.contains("\"permission.asked\""));
         // PR #1698 review: both tool hooks, root and child session, forward the
-        // call's id, which a `permission.asked` names as `tool.callID`.
-        assert_eq!(content.matches("call_id: input?.callID,").count(), 4);
+        // call's id, which a `permission.asked` names as `tool.callID`
+        // (PRD #2050: through the one report both generations share).
+        assert_eq!(content.matches("call_id: callID,").count(), 2);
+        assert_eq!(content.matches("input?.callID, directory)").count(), 2);
     }
 
     /// The installer intentionally fans out to every existing OpenCode config
@@ -4384,7 +6532,8 @@ pub(crate) mod tests {
         std::fs::write(
             &driver,
             format!(
-                r#"import plugin from "{}";
+                r#"import pluginModule from "{}";
+const plugin = pluginModule.server;
 const hooks = await plugin({{ directory: "/work" }});
 await hooks.event({{ event: {{ type: "session.error", properties: {{ sessionID: "s1", error: "boom" }} }} }});
 "#,
@@ -4507,7 +6656,22 @@ await hooks.event({{ event: {{ type: "session.error", properties: {{ sessionID: 
         dir: &std::path::Path,
         delay: Option<&str>,
     ) -> (std::path::PathBuf, std::path::PathBuf) {
+        inbox_recorder_timed(dir, delay, None)
+    }
+
+    /// [`inbox_recorder_granting_after`], also handing over its message only
+    /// `message_delay` seconds (`sleep`'s argument) after registering, when
+    /// given.
+    #[cfg(unix)]
+    fn inbox_recorder_timed(
+        dir: &std::path::Path,
+        delay: Option<&str>,
+        message_delay: Option<&str>,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
         let wait = delay.map(|d| format!("sleep {d}; ")).unwrap_or_default();
+        let message_wait = message_delay
+            .map(|d| format!("    sleep {d}\n"))
+            .unwrap_or_default();
         let controls = dir.join("controls.log");
         let recorder = dir.join("recorder.sh");
         let id = "m-k3xzq2ab-0f3c9a71d2e4b850";
@@ -4527,7 +6691,7 @@ echo "call $*" >> '{c}'
 case "$1 $2" in
   'inbox wait')
     printf '%s\n' '{r}'
-    printf '%s\n' '{m}'
+{message_wait}    printf '%s\n' '{m}'
     while IFS= read -r line; do
       printf '%s\n' "$line" >> '{c}'
       case "$line" in
@@ -4543,6 +6707,7 @@ exit 0
                 r = registered,
                 m = message,
                 wait = wait,
+                message_wait = message_wait,
             ),
         )
         .unwrap();
@@ -4713,7 +6878,7 @@ const client = {{ session: {{
   messages: () => new Promise((r) => {{ releaseMessages = r; }}),
   promptAsync: async (req) => {{ prompts.push(req.path.id); return {{}}; }},
 }} }};
-const {{ default: plugin }} = await import("{}");
+const {{ default: {{ server: plugin }} }} = await import("{}");
 const hooks = await plugin({{ directory: "/work", client }});
 await hooks.event({{ event: {{ type: "session.created", properties: {{ info: {{ id: "s1" }} }} }} }});
 for (let n = 0; n < 100 && !releaseMessages; n++) await sleep(20);
@@ -4739,6 +6904,81 @@ process.exit(0);
             written.contains("\"not_handed\""),
             "positively not handed: {written}"
         );
+    }
+
+    /// Scenario (PRD #2050, inbox/opencode/020 on 1.19.5): OpenCode 1.x runs
+    /// `opencode --mini`, calls the module's `server`, creates mini's first
+    /// session, and then — as 1.19.5 does — calls the 2.x `setup` too, once
+    /// with its own context (no `event`, no `session`) and once with a
+    /// 2.x-shaped one. `setup` stays inert both times: nothing is announced,
+    /// no doorbell-only receiver replaces mini's, nothing is subscribed, and
+    /// the deck's message still starts in mini's session as 1.x's mini
+    /// receiver delivers it.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_1x_mini_stays_the_receiver_when_1x_also_calls_setup() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (recorder, controls) = inbox_recorder(dir.path());
+        let plugin = dir.path().join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                r#"process.argv = [process.argv[0], "opencode", "--mini"];
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const prompts = [];
+let subscribed = false;
+const client = {{ session: {{
+  messages: async () => ({{ data: [] }}),
+  promptAsync: async (req) => {{ prompts.push(req.path.id); return {{}}; }},
+}} }};
+const {{ default: mod }} = await import("{}");
+const hooks = await mod.server({{ directory: "/work", client }});
+await hooks.event({{ event: {{ type: "session.created", properties: {{ info: {{ id: "s1" }} }} }} }});
+const own = await mod.setup({{ options: {{}}, agent: {{}}, aisdk: {{}}, catalog: {{}}, command: {{}}, integration: {{}}, plugin: {{}}, reference: {{}}, skill: {{}} }});
+const shaped = await mod.setup({{
+  location: {{ directory: "/work" }},
+  event: {{ subscribe: () => {{ subscribed = true; return {{ [Symbol.asyncIterator]: () => ({{ next: () => new Promise(() => {{}}) }}) }}; }} }},
+  session: {{ hook: async () => undefined, prompt: async () => ({{}}) }},
+  tool: {{ hook: async () => undefined }},
+}});
+for (let n = 0; n < 150 && !prompts.length; n++) await sleep(20);
+await sleep(300);
+console.log(JSON.stringify({{ prompts, subscribed, cleanups: [typeof own, typeof shaped] }}));
+process.exit(0);
+"#,
+                plugin.display()
+            ),
+        )
+        .unwrap();
+        let result = run_inbox_driver(&driver);
+        assert_eq!(result["prompts"], serde_json::json!(["s1"]), "{result}");
+        assert_eq!(result["subscribed"], false, "{result}");
+        assert_eq!(
+            result["cleanups"],
+            serde_json::json!(["function", "function"]),
+            "{result}"
+        );
+        let written = std::fs::read_to_string(&controls).unwrap_or_default();
+        assert!(
+            !written.contains("call inbox announce"),
+            "mini is the receiver itself, it does not announce: {written}"
+        );
+        assert!(
+            !written.contains("--doorbell-only"),
+            "no doorbell-only receiver replaces mini's: {written}"
+        );
+        assert_eq!(
+            written.matches("call inbox wait").count(),
+            1,
+            "one receiver, mini's: {written}"
+        );
+        assert!(written.contains("\"handed\""), "{written}");
     }
 
     /// PRD #1858: each update of an assistant message appends its usage to
@@ -4775,7 +7015,7 @@ process.exit(0);
         std::fs::write(
             &driver,
             format!(
-                r#"const {{ default: plugin }} = await import("{}");
+                r#"const {{ default: {{ server: plugin }} }} = await import("{}");
 const hooks = await plugin({{ directory: "/work", client: {{}} }});
 const updated = (info) => hooks.event({{ event: {{ type: "message.updated", properties: {{ info }} }} }});
 await hooks.event({{ event: {{ type: "session.created", properties: {{ info: {{ id: "s1", directory: "/work" }} }} }} }});
@@ -4903,7 +7143,7 @@ process.exit(0);
             &driver,
             format!(
                 r#"import {{ chmodSync }} from "fs";
-const {{ default: plugin }} = await import("{}");
+const {{ default: {{ server: plugin }} }} = await import("{}");
 const hooks = await plugin({{ directory: "/work", client: {{}} }});
 const send = (type, properties) => hooks.event({{ event: {{ type, properties }} }});
 const updated = (info) => send("message.updated", {{ info }});
@@ -5134,7 +7374,7 @@ console.log(JSON.stringify({{
         std::fs::write(
             &driver,
             format!(
-                r#"const {{ default: plugin }} = await import("{}");
+                r#"const {{ default: {{ server: plugin }} }} = await import("{}");
 const hooks = await plugin({{ directory: "/work", client: {{}} }});
 const send = (type, properties) => hooks.event({{ event: {{ type, properties }} }});
 const updated = (info) => send("message.updated", {{ info }});
@@ -5232,7 +7472,7 @@ process.exit(0);
             &driver,
             format!(
                 r#"import {{ copyFileSync }} from "fs";
-const {{ default: plugin }} = await import("{}");
+const {{ default: {{ server: plugin }} }} = await import("{}");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const asked = [];
 let answer;
@@ -5958,7 +8198,7 @@ const client = {{ session: {{
   messages: async () => ({{ data: [] }}),
   promptAsync: async (req) => {{ prompts.push(req.path.id); return {{}}; }},
 }} }};
-const {{ default: plugin }} = await import("{plugin}");
+const {{ default: {{ server: plugin }} }} = await import("{plugin}");
 const hooks = await plugin({{ directory: "/work", client }});
 await hooks.event({{ event: {{ type: "session.created", properties: {{ info: {{ id: "s1" }} }} }} }});
 for (let n = 0; n < 150 && !asked(); n++) await sleep(20);
@@ -6114,7 +8354,7 @@ check(called, [1], "never reaches OpenCode");
                 &driver,
                 format!(
                     r#"process.argv = [process.argv[0], "opencode", ...{argv}];
-const {{ default: plugin }} = await import("{}");
+const {{ default: {{ server: plugin }} }} = await import("{}");
 const hooks = await plugin({{ directory: "/work" }});
 // PRD #1666 §4: the substitution needs this context's receiver registered.
 await new Promise((r) => setTimeout(r, 500));
@@ -6190,7 +8430,8 @@ process.exit(0);
         std::fs::write(
             &driver,
             format!(
-                r#"import plugin from "{}";
+                r#"import pluginModule from "{}";
+const plugin = pluginModule.server;
 const hooks = await plugin({{ directory: "/work" }});
 await hooks.event({{ event: {{ type: "session.error", properties: {{ sessionID: "s1", error: {{
   name: "APIError",
@@ -6329,7 +8570,8 @@ await hooks.event({{ event: {{ type: "session.error", properties: {{ sessionID: 
         std::fs::write(
             &driver,
             format!(
-                r#"import plugin from "{}";
+                r#"import pluginModule from "{}";
+const plugin = pluginModule.server;
 const hooks = await plugin({{ directory: "/work" }});
 const send = (type, properties) => hooks.event({{ event: {{ type, properties }} }});
 const part = (sessionID, messageID, id, type, text) =>
@@ -6611,6 +8853,52 @@ check(inboxIdsIn("[dot-agent-deck message " + A + " from x]\nhead"), [A], "an un
         body: &str,
         node_args: &[&str],
     ) -> Option<(Vec<serde_json::Value>, Vec<serde_json::Value>)> {
+        run_plugin_driver_under(body, node_args, None)
+    }
+
+    /// A copy of `/bin/sh` named `opencode` in `dir`, so a process it runs
+    /// has an executable (and a first argument) named like an OpenCode binary,
+    /// as the 2.x plugin's parent check reads it (audit L5). Copied by a `cp`
+    /// child, so this process never holds the file open for writing when a
+    /// test execs it ([`crate::test_isolation::write_script`] says why).
+    #[cfg(unix)]
+    fn opencode_named_shell(dir: &Path) -> PathBuf {
+        let shell = dir.join("opencode");
+        if !shell.exists() {
+            let status = std::process::Command::new("cp")
+                .arg("/bin/sh")
+                .arg(&shell)
+                .status()
+                .expect("run cp");
+            assert!(status.success(), "copy /bin/sh to {}", shell.display());
+        }
+        shell
+    }
+
+    /// A command running `node <driver>` as the child of a shell whose
+    /// executable is named `opencode` (the full TUI's client): the parent a
+    /// 2.x `serve` process must have for its `setup` to report (audit L5).
+    #[cfg(unix)]
+    fn node_under_opencode(driver: &Path) -> std::process::Command {
+        let dir = driver.parent().expect("the driver is in a directory");
+        std::fs::write(dir.join("client"), format!("node '{}'\n", driver.display())).unwrap();
+        let mut command = std::process::Command::new(opencode_named_shell(dir));
+        command
+            .arg("client")
+            .current_dir(dir)
+            .envs(crate::test_isolation::unreachable_endpoints());
+        command
+    }
+
+    /// [`run_plugin_driver_with_awaits`], with node started as the child of a
+    /// shell whose arguments read `opencode <client_args>` when `client_args`
+    /// is given: the parent a 2.x `serve` process reads its client from.
+    #[cfg(unix)]
+    fn run_plugin_driver_under(
+        body: &str,
+        node_args: &[&str],
+        client_args: Option<&str>,
+    ) -> Option<(Vec<serde_json::Value>, Vec<serde_json::Value>)> {
         if std::process::Command::new("node")
             .arg("--version")
             .output()
@@ -6642,17 +8930,37 @@ check(inboxIdsIn("[dot-agent-deck message " + A + " from x]\nhead"), [A], "an un
         std::fs::write(
             &driver,
             format!(
-                "import plugin from {plugin};\nimport {{ existsSync as awaitsExist, readFileSync as readAwaits }} from \"fs\";\nconst awaited = async (n) => {{\n  for (let i = 0; i < 1600; i += 1) {{\n    if (awaitsExist({awaits}) && readAwaits({awaits}, \"utf8\").split(\"\\n\").filter(Boolean).length >= n) return;\n    await new Promise((r) => setTimeout(r, 25));\n  }}\n  throw new Error(\"await-answer was not handed \" + n);\n}};\n{body}",
+                "import pluginModule from {plugin};\nconst plugin = pluginModule.server;\nimport {{ existsSync as awaitsExist, readFileSync as readAwaits }} from \"fs\";\nconst awaited = async (n) => {{\n  for (let i = 0; i < 1600; i += 1) {{\n    if (awaitsExist({awaits}) && readAwaits({awaits}, \"utf8\").split(\"\\n\").filter(Boolean).length >= n) return;\n    await new Promise((r) => setTimeout(r, 25));\n  }}\n  throw new Error(\"await-answer was not handed \" + n);\n}};\n{body}",
                 plugin = serde_json::to_string(&plugin.display().to_string()).unwrap(),
                 awaits = serde_json::to_string(&awaits.display().to_string()).unwrap(),
             ),
         )
         .unwrap();
-        let output = std::process::Command::new("node")
-            .args(node_args)
-            .arg(&driver)
-            .output()
-            .expect("run node");
+        let output = match client_args {
+            None => std::process::Command::new("node")
+                .args(node_args)
+                .arg(&driver)
+                .output(),
+            Some(client_args) => {
+                // The shell reads its script from a file named after the
+                // client's first word, so its arguments read `opencode
+                // <client_args>` (`client` stands in for none: the full TUI).
+                let (first, rest) = client_args.split_once(' ').unwrap_or((client_args, ""));
+                let first = if first.is_empty() { "client" } else { first };
+                let mut line = String::from("node");
+                for arg in node_args.iter().copied().chain([driver.to_str().unwrap()]) {
+                    line.push_str(&format!(" '{arg}'"));
+                }
+                std::fs::write(dir.path().join(first), format!("{line}\n")).unwrap();
+                std::process::Command::new(opencode_named_shell(dir.path()))
+                    .arg(first)
+                    .args(rest.split_whitespace())
+                    .current_dir(dir.path())
+                    .envs(crate::test_isolation::unreachable_endpoints())
+                    .output()
+            }
+        }
+        .expect("run node");
         assert!(
             output.status.success(),
             "the plugin driver failed: {}",
@@ -7701,7 +10009,8 @@ fi
         std::fs::write(
             &driver,
             format!(
-                r#"import plugin from "{plugin}";
+                r#"import pluginModule from "{plugin}";
+const plugin = pluginModule.server;
 import {{ existsSync, readFileSync, writeFileSync }} from "fs";
 const posts = [];
 let refuseNext = false;
@@ -8015,7 +10324,8 @@ fi
         std::fs::write(
             &driver,
             format!(
-                r#"import plugin from "{plugin}";
+                r#"import pluginModule from "{plugin}";
+const plugin = pluginModule.server;
 const hooks = await plugin({{ directory: "/work", client: {{}} }});
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const asked = {permission};
@@ -8076,6 +10386,2460 @@ await wait(1500);
             crate::hook::build_opencode_event(plain).map(|e| e.event_type),
             Some(crate::event::EventType::WaitingForInput),
             "the plain question reads as Needs Input"
+        );
+    }
+
+    // --- PRD #2050: OpenCode 2.x ---
+
+    /// The paths a layout test reads, under `fixture`: the global (XDG) root
+    /// and the legacy one, both present, as on a machine where OpenCode has run.
+    #[cfg(unix)]
+    struct LayoutFixture {
+        _dir: tempfile::TempDir,
+        roots: Vec<PathBuf>,
+        bin: String,
+    }
+
+    #[cfg(unix)]
+    impl LayoutFixture {
+        fn new() -> Self {
+            let dir = crate::test_temp::tempdir().unwrap();
+            let roots = vec![
+                dir.path().join("config").join("opencode"),
+                dir.path().join("home").join(".opencode"),
+            ];
+            for root in &roots {
+                std::fs::create_dir_all(root).unwrap();
+            }
+            let bin = seed_deck(&dir.path().join("local").join("dot-agent-deck"));
+            LayoutFixture {
+                _dir: dir,
+                roots,
+                bin,
+            }
+        }
+        fn install(&self, layout: Layout) -> Vec<String> {
+            let mut failed = Vec::new();
+            auto_install_layout(&self.roots, self.v2_global(), layout, &mut failed, || {
+                Ok(self.bin.clone())
+            });
+            failed
+        }
+        /// OpenCode 2.x's global root: the XDG root, or the third root when
+        /// the fixture has one (`$OPENCODE_CONFIG_DIR`).
+        fn v2_global(&self) -> &Path {
+            self.roots.get(2).unwrap_or(&self.roots[0])
+        }
+        fn global(&self) -> &Path {
+            &self.roots[0]
+        }
+        fn legacy(&self) -> &Path {
+            &self.roots[1]
+        }
+        /// What is installed: (module in global, module in legacy, 1.x TUI
+        /// half, 2.x TUI half).
+        fn state(&self) -> (bool, bool, bool, bool) {
+            (
+                plugin_file(self.global()).exists(),
+                plugin_file(self.legacy()).exists(),
+                tui_plugin_file(self.global()).exists(),
+                tui_v2_file(self.global()).exists(),
+            )
+        }
+    }
+
+    /// (inode, mtime in ns, bytes) of `path`, to tell an untouched file from
+    /// one rewritten with the same bytes.
+    #[cfg(unix)]
+    fn file_identity(path: &Path) -> (u64, i64, i64, Vec<u8>) {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        (
+            meta.ino(),
+            meta.mtime(),
+            meta.mtime_nsec(),
+            std::fs::read(path).unwrap(),
+        )
+    }
+
+    /// Scenario (PRD #2050, review R1, audit N3): every generation gets the
+    /// same files: one unmarked dual-shape module in the global root, none in
+    /// `~/.opencode` (which OpenCode 2 would refuse as a duplicate), and both
+    /// TUI halves, which do not see each other.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_every_layout_installs_the_same_files() {
+        for layout in [Layout::V1, Layout::V2, Layout::Unknown] {
+            let f = LayoutFixture::new();
+            write_plugin(f.legacy(), &f.bin).unwrap();
+            assert_eq!(f.install(layout), Vec::<String>::new(), "{layout:?}");
+            assert_eq!(f.state(), (true, false, true, true), "{layout:?}");
+            assert_eq!(
+                std::fs::read_to_string(plugin_file(f.global())).unwrap(),
+                plugin_template(&f.bin),
+                "{layout:?}: no layout marker in the module"
+            );
+            assert_eq!(
+                existing_pin(&tui_v2_file(f.global())).as_deref(),
+                Some(f.bin.as_str()),
+                "{layout:?}"
+            );
+            assert!(
+                std::fs::read_to_string(f.global().join("tui.json"))
+                    .unwrap()
+                    .contains("dot-agent-deck-tui.js"),
+                "{layout:?}"
+            );
+            let module = std::fs::read_to_string(plugin_file(f.global())).unwrap();
+            assert!(module.contains(
+                "export default { id: \"dot-agent-deck\", server: DotAgentDeckPlugin, setup: setupV2 };"
+            ));
+        }
+    }
+
+    /// Scenario (PRD #2050, review R1, audit N3): a machine running OpenCode
+    /// 1.x and 2.x side by side spawns one generation, then the other, then a
+    /// wrapper, in any order, and the deck starts with each generation's
+    /// startup install (the layout it last recorded, or none). Once the first
+    /// install has run, none of them touches the server module (same bytes,
+    /// inode and mtime, so a live OpenCode 2 is not made to reload it), the
+    /// TUI halves or `tui.json`. A module carrying an older build's layout
+    /// marker is rewritten once, without it.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_alternating_generations_rewrite_nothing() {
+        let f = LayoutFixture::new();
+        std::fs::create_dir_all(plugin_file(f.global()).parent().unwrap()).unwrap();
+        std::fs::write(
+            plugin_file(f.global()),
+            format!(
+                "// dot-agent-deck OpenCode layout: 1\n{}",
+                plugin_template(&f.bin)
+            ),
+        )
+        .unwrap();
+        f.install(Layout::V2);
+        assert_eq!(
+            std::fs::read_to_string(plugin_file(f.global())).unwrap(),
+            plugin_template(&f.bin),
+            "the old marker goes with the first install"
+        );
+        let watched = [
+            plugin_file(f.global()),
+            tui_plugin_file(f.global()),
+            tui_v2_file(f.global()),
+            f.global().join("tui.json"),
+        ];
+        let before: Vec<_> = watched.iter().map(|p| file_identity(p)).collect();
+        for layout in [
+            Layout::V1,
+            Layout::V2,
+            Layout::Unknown,
+            Layout::V1,
+            Layout::Unknown,
+            Layout::V2,
+        ] {
+            assert_eq!(f.install(layout), Vec::<String>::new(), "{layout:?}");
+            let after: Vec<_> = watched.iter().map(|p| file_identity(p)).collect();
+            for ((path, b), a) in watched.iter().zip(&before).zip(&after) {
+                assert!(b == a, "{layout:?} rewrote {}", path.display());
+            }
+            assert!(!plugin_file(f.legacy()).exists(), "{layout:?}");
+        }
+    }
+
+    /// Scenario (PRD #2050, auditor L2): with only `~/.opencode` present, an
+    /// install of any layout creates the global root, which the TUI half
+    /// needs anyway, before placing the module, so the module lands there in
+    /// one step and the deck's legacy copy is removed: OpenCode 2 would
+    /// refuse that copy for a project under `$HOME` and not load it at all
+    /// for one outside it. A second install writes nothing.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_a_legacy_only_machine_converges_on_the_global_root() {
+        for layout in [Layout::V2, Layout::V1, Layout::Unknown] {
+            let f = LayoutFixture::new();
+            std::fs::remove_dir_all(f.global()).unwrap();
+            write_plugin(f.legacy(), &f.bin).unwrap();
+            assert_eq!(f.install(layout), Vec::<String>::new(), "{layout:?}");
+            assert_eq!(f.state(), (true, false, true, true), "{layout:?}: one step");
+            let before = file_identity(&plugin_file(f.global()));
+            assert_eq!(f.install(layout), Vec::<String>::new(), "{layout:?}");
+            assert!(
+                file_identity(&plugin_file(f.global())) == before,
+                "{layout:?}: the second install rewrote the module"
+            );
+        }
+    }
+
+    /// With nothing remembered (no module yet, or one from before PRD #2050),
+    /// an install that cannot tell the version writes the module into the
+    /// global root only — not `~/.opencode`, where OpenCode 2 would meet a
+    /// second copy (review S3) — and both TUI halves, which work under either
+    /// generation.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_unknown_layout_installs_both_tui_halves() {
+        let f = LayoutFixture::new();
+        assert_eq!(f.install(Layout::Unknown), Vec::<String>::new());
+        assert_eq!(f.state(), (true, false, true, true));
+        assert_eq!(
+            std::fs::read_to_string(plugin_file(f.global())).unwrap(),
+            plugin_template(&f.bin),
+            "unmarked: the same bytes as before PRD #2050's markers"
+        );
+    }
+
+    /// Review S3 follow-up: a wrapper's spawn (nothing remembered) on a
+    /// machine that still has the deck's copy in `~/.opencode` from an older
+    /// deck removes that copy, and its obsolete nested layout, once the global
+    /// root holds the module, so OpenCode 2 meets no `Duplicate plugin ID`
+    /// after an upgrade with no manual step. Other files in that directory
+    /// are left alone.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_unknown_layout_removes_the_decks_legacy_copy() {
+        let f = LayoutFixture::new();
+        write_plugin(f.legacy(), &f.bin).unwrap();
+        std::fs::create_dir_all(stale_plugin_dir(f.legacy())).unwrap();
+        std::fs::write(stale_plugin_dir(f.legacy()).join("index.js"), "x").unwrap();
+        let other = f.legacy().join("plugin").join("someone-else.js");
+        std::fs::write(&other, "export default {}").unwrap();
+
+        assert_eq!(f.install(Layout::Unknown), Vec::<String>::new());
+        let (global, legacy, tui, tui_v2) = f.state();
+        assert_eq!((global, legacy, tui, tui_v2), (true, false, true, true));
+        assert!(!stale_plugin_dir(f.legacy()).exists());
+        assert_eq!(
+            std::fs::read_to_string(&other).unwrap(),
+            "export default {}",
+            "only the deck's own files are removed"
+        );
+        assert_eq!(
+            existing_binary_path(f.global()).as_deref(),
+            Some(f.bin.as_str())
+        );
+    }
+
+    /// A pin to another live install that only the legacy copy held is
+    /// carried to the global root before the legacy copy goes, as the 2.x
+    /// layout does.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_unknown_layout_carries_a_legacy_pin_over() {
+        let f = LayoutFixture::new();
+        let other = seed_deck(&f._dir.path().join("homebrew").join("dot-agent-deck"));
+        write_plugin(f.legacy(), &other).unwrap();
+        assert_eq!(f.install(Layout::Unknown), Vec::<String>::new());
+        assert!(!plugin_file(f.legacy()).exists());
+        assert_eq!(
+            existing_binary_path(f.global()).as_deref(),
+            Some(other.as_str())
+        );
+    }
+
+    /// With `$OPENCODE_CONFIG_DIR` moving OpenCode 2.x's global root, the
+    /// legacy copy stays until that root holds the module: a module only in
+    /// the XDG root is not what 2.x loads.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_unknown_layout_keeps_the_legacy_copy_until_2s_global_root_has_the_module() {
+        let mut f = LayoutFixture::new();
+        f.roots.push(f._dir.path().join("ocd"));
+        write_plugin(f.legacy(), &f.bin).unwrap();
+        assert_eq!(f.install(Layout::Unknown), Vec::<String>::new());
+        assert!(plugin_file(f.global()).exists());
+        assert!(
+            plugin_file(f.legacy()).exists(),
+            "2.x's global root does not exist, so the legacy copy is kept"
+        );
+        std::fs::create_dir_all(&f.roots[2]).unwrap();
+        assert_eq!(f.install(Layout::Unknown), Vec::<String>::new());
+        assert!(plugin_file(&f.roots[2]).exists());
+        assert!(!plugin_file(f.legacy()).exists());
+    }
+
+    /// Review F6: with `$OPENCODE_CONFIG_DIR` naming an existing directory, an
+    /// install that knows no version writes the module to the XDG root (1.x's
+    /// global root) and to that directory (2.x's, the only one 2.2.5 loads
+    /// then, measured), and removes the deck's legacy `~/.opencode` copy, so
+    /// a 2.x started through a wrapper meets one copy.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_unknown_layout_with_opencode_config_dir_leaves_2x_one_copy() {
+        let mut f = LayoutFixture::new();
+        f.roots.push(f._dir.path().join("ocd"));
+        std::fs::create_dir_all(&f.roots[2]).unwrap();
+        write_plugin(f.legacy(), &f.bin).unwrap();
+        assert_eq!(f.install(Layout::Unknown), Vec::<String>::new());
+        assert!(plugin_file(f.global()).exists(), "1.x's global root");
+        assert!(plugin_file(&f.roots[2]).exists(), "2.x's global root");
+        assert!(!plugin_file(f.legacy()).exists(), "no copy 2.x would scan");
+    }
+
+    /// Review F2: the generation an agent was seen to run is recorded in the
+    /// deck's own state file, written only when it changes, for an install
+    /// with no command to look at; nothing in OpenCode's config is touched by
+    /// recording it.
+    #[cfg(unix)]
+    #[test]
+    fn a_detected_generation_is_remembered_outside_opencodes_config() {
+        use crate::opencode_version::Major;
+        let f = LayoutFixture::new();
+        assert_eq!(f.install(Layout::V1), Vec::<String>::new());
+        let module = std::fs::read(plugin_file(f.global())).unwrap();
+        let state = f._dir.path().join("state").join(DETECTED_LAYOUT_FILE);
+        assert_eq!(detected_major_at(&state), None);
+        assert!(remember_layout_at(&state, Major::V2).unwrap());
+        assert!(!remember_layout_at(&state, Major::V2).unwrap(), "unchanged");
+        assert_eq!(detected_major_at(&state), Some(Major::V2));
+        assert_eq!(
+            std::fs::read(plugin_file(f.global())).unwrap(),
+            module,
+            "OpenCode's module is untouched"
+        );
+        assert!(remember_layout_at(&state, Major::V1).unwrap());
+        assert_eq!(detected_major_at(&state), Some(Major::V1));
+    }
+
+    /// The upgrade to 2.x keeps a pin to another live install that only the
+    /// legacy root's copy held: the copy is carried to the global root under
+    /// the usual pin rules before the legacy one is removed.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_layout_carries_a_legacy_pin_over() {
+        let f = LayoutFixture::new();
+        let other = seed_deck(&f._dir.path().join("homebrew").join("dot-agent-deck"));
+        write_plugin(f.legacy(), &other).unwrap();
+        assert_eq!(f.install(Layout::V2), Vec::<String>::new());
+        assert!(!plugin_file(f.legacy()).exists());
+        assert_eq!(
+            existing_binary_path(f.global()).as_deref(),
+            Some(other.as_str())
+        );
+    }
+
+    /// Review N6, R1: a module pinned to another live install is not
+    /// regenerated by any layout, and not marked either: its bytes are left
+    /// exactly as they were.
+    #[cfg(unix)]
+    #[test]
+    fn a_module_pinned_elsewhere_is_left_alone_by_every_layout() {
+        let f = LayoutFixture::new();
+        let other = seed_deck(&f._dir.path().join("homebrew").join("dot-agent-deck"));
+        write_plugin(f.global(), &other).unwrap();
+        let before = file_identity(&plugin_file(f.global()));
+        for layout in [Layout::V1, Layout::Unknown, Layout::V2] {
+            f.install(layout);
+            assert!(
+                file_identity(&plugin_file(f.global())) == before,
+                "{layout:?} touched another install's module"
+            );
+        }
+        assert_eq!(
+            existing_binary_path(f.global()).as_deref(),
+            Some(other.as_str())
+        );
+    }
+
+    /// Scenario (PRD #2050, audit N4): a deck upgrade replaced the install
+    /// and wrote a module of a later template revision, and the older daemon,
+    /// still running the replaced file, starts an OpenCode agent. Its
+    /// automatic install, of any layout, leaves the newer module exactly as
+    /// it is, though it pins this very install; a module of this revision or
+    /// an earlier one is still refreshed, and `hooks install --agent
+    /// opencode` writes this binary's template when asked to.
+    #[cfg(unix)]
+    #[test]
+    fn an_older_deck_never_downgrades_a_newer_template() {
+        let f = LayoutFixture::new();
+        // The image this daemon runs: the install's file before the upgrade
+        // replaced it, kept here as a separate file.
+        let replaced = f._dir.path().join("replaced-dot-agent-deck");
+        std::fs::copy(&f.bin, &replaced).unwrap();
+        RUNNING_EXE_FOR_TEST.with(|p| *p.borrow_mut() = Some(replaced.clone()));
+        assert!(running_other_than(&f.bin));
+        let ours = plugin_template(&f.bin);
+        let marker = format!("const DAD_TEMPLATE_REVISION = {PLUGIN_TEMPLATE_REVISION};");
+        assert!(ours.contains(&marker), "the template declares its revision");
+        let newer = ours.replace(
+            &marker,
+            &format!(
+                "const DAD_TEMPLATE_REVISION = {};\n// a later deck's template",
+                PLUGIN_TEMPLATE_REVISION + 1
+            ),
+        );
+        std::fs::create_dir_all(plugin_file(f.global()).parent().unwrap()).unwrap();
+        std::fs::write(plugin_file(f.global()), &newer).unwrap();
+        assert_eq!(
+            template_revision(&plugin_file(f.global())),
+            Some(PLUGIN_TEMPLATE_REVISION + 1)
+        );
+        let before = file_identity(&plugin_file(f.global()));
+        for layout in [Layout::V1, Layout::V2, Layout::Unknown] {
+            assert_eq!(f.install(layout), Vec::<String>::new(), "{layout:?}");
+            assert!(
+                file_identity(&plugin_file(f.global())) == before,
+                "{layout:?} downgraded the module"
+            );
+        }
+
+        let older = ours.replace(&marker, "");
+        assert_eq!(template_revision_of(&older), 0, "no revision: before them");
+        std::fs::write(plugin_file(f.global()), &older).unwrap();
+        f.install(Layout::Unknown);
+        assert_eq!(
+            std::fs::read_to_string(plugin_file(f.global())).unwrap(),
+            ours,
+            "an older template is refreshed"
+        );
+
+        std::fs::write(plugin_file(f.global()), &newer).unwrap();
+        install_to_roots(
+            &[f.global().to_path_buf()],
+            || unreachable!(),
+            &f.bin,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(plugin_file(f.global())).unwrap(),
+            ours,
+            "an explicit install writes this template"
+        );
+        RUNNING_EXE_FOR_TEST.with(|p| *p.borrow_mut() = None);
+    }
+
+    /// Scenario (PRD #2050, auditor M2): the user rolled the deck back to an
+    /// older release at the same path (or synced an OpenCode config from a
+    /// machine with a newer deck), so the module is of a later template
+    /// revision and pins this install, and the file at the pin is the one
+    /// this process runs. Its automatic install, of any layout, writes its
+    /// own template, which this build can run.
+    #[cfg(unix)]
+    #[test]
+    fn a_rolled_back_deck_writes_its_own_template_over_a_newer_one() {
+        let f = LayoutFixture::new();
+        RUNNING_EXE_FOR_TEST.with(|p| *p.borrow_mut() = Some(PathBuf::from(&f.bin)));
+        assert!(!running_other_than(&f.bin));
+        let ours = plugin_template(&f.bin);
+        let marker = format!("const DAD_TEMPLATE_REVISION = {PLUGIN_TEMPLATE_REVISION};");
+        let newer = ours.replace(
+            &marker,
+            &format!(
+                "const DAD_TEMPLATE_REVISION = {};\n// a later deck's template",
+                PLUGIN_TEMPLATE_REVISION + 1
+            ),
+        );
+        std::fs::create_dir_all(plugin_file(f.global()).parent().unwrap()).unwrap();
+        for layout in [Layout::V1, Layout::V2, Layout::Unknown] {
+            std::fs::write(plugin_file(f.global()), &newer).unwrap();
+            assert_eq!(f.install(layout), Vec::<String>::new(), "{layout:?}");
+            assert_eq!(
+                std::fs::read_to_string(plugin_file(f.global())).unwrap(),
+                ours,
+                "{layout:?} left a newer template over the install this process runs"
+            );
+        }
+        RUNNING_EXE_FOR_TEST.with(|p| *p.borrow_mut() = None);
+    }
+
+    /// [`template_revision`] of module text `js`.
+    #[cfg(unix)]
+    fn template_revision_of(js: &str) -> u32 {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let file = dir.path().join("m.js");
+        std::fs::write(&file, js).unwrap();
+        template_revision(&file).unwrap()
+    }
+
+    /// Audit N4: [`PLUGIN_TEMPLATE_REVISION`] moves with the template. The
+    /// digest is of the module this build writes; when the template changes,
+    /// this fails until the revision is bumped and the new digest recorded
+    /// here, so a newer deck's module is never taken for an older one's.
+    #[test]
+    fn the_template_revision_is_bumped_with_the_template() {
+        use sha2::Digest;
+        const RECORDED: (u32, &str) = (
+            2,
+            "4539aee833d48aed338e7d42d4c9dc24210cb54bf27782a5ea2a64da241d4a38",
+        );
+        let digest = sha2::Sha256::digest(plugin_template("/opt/dot-agent-deck").as_bytes());
+        let digest: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            (PLUGIN_TEMPLATE_REVISION, digest.as_str()),
+            RECORDED,
+            "the OpenCode plugin template changed: bump PLUGIN_TEMPLATE_REVISION, \
+             then record the new revision and digest here"
+        );
+    }
+
+    /// Scenario: the config roots are resolved from `HOME`,
+    /// `XDG_CONFIG_HOME` and `OPENCODE_CONFIG_DIR`. An empty or relative
+    /// `XDG_CONFIG_HOME` is ignored (XDG spec), so nothing lands in the
+    /// current directory; `OPENCODE_CONFIG_DIR` becomes OpenCode 2.x's global
+    /// root and one more 1.x root, and is likewise ignored when empty or
+    /// relative.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_roots_follow_xdg_config_home_and_opencode_config_dir() {
+        use std::ffi::OsStr;
+        let home = Path::new("/h");
+        let default = (
+            vec![
+                PathBuf::from("/h/.config/opencode"),
+                PathBuf::from("/h/.opencode"),
+            ],
+            PathBuf::from("/h/.config/opencode"),
+        );
+        assert_eq!(roots_from(home, None, None), default);
+        for ignored in ["", "opencode-cfg", "./cfg"] {
+            assert_eq!(
+                roots_from(home, Some(OsStr::new(ignored)), None),
+                default,
+                "XDG_CONFIG_HOME={ignored:?}"
+            );
+            assert_eq!(
+                roots_from(home, None, Some(OsStr::new(ignored))),
+                default,
+                "OPENCODE_CONFIG_DIR={ignored:?}"
+            );
+        }
+        assert_eq!(
+            roots_from(home, Some(OsStr::new("/x")), None),
+            (
+                vec![PathBuf::from("/x/opencode"), PathBuf::from("/h/.opencode")],
+                PathBuf::from("/x/opencode"),
+            )
+        );
+        assert_eq!(
+            roots_from(home, None, Some(OsStr::new("/ocd"))),
+            (
+                vec![
+                    PathBuf::from("/h/.config/opencode"),
+                    PathBuf::from("/h/.opencode"),
+                    PathBuf::from("/ocd"),
+                ],
+                PathBuf::from("/ocd"),
+            )
+        );
+        assert_eq!(
+            roots_from(home, None, Some(OsStr::new("/h/.config/opencode"))),
+            default,
+            "a config dir that is the XDG root is not a second root"
+        );
+    }
+
+    /// A [`LayoutFixture`] with `$OPENCODE_CONFIG_DIR` set, as its third root.
+    #[cfg(unix)]
+    fn config_dir_fixture() -> LayoutFixture {
+        let mut f = LayoutFixture::new();
+        let dir = f._dir.path().join("ocd");
+        std::fs::create_dir_all(&dir).unwrap();
+        f.roots.push(dir);
+        f
+    }
+
+    /// Scenario: with `$OPENCODE_CONFIG_DIR` set, every layout puts the
+    /// server module in the XDG root (1.x's global root) and in that
+    /// directory (2.x's, the only one 2.2.5 loads then), the 2.x TUI half in
+    /// that directory only, and the 1.x half in the XDG root; the deck's
+    /// legacy copy goes. Alternating generations then rewrite nothing.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_layout_follows_opencode_config_dir() {
+        let f = config_dir_fixture();
+        let ocd = f.roots[2].clone();
+        write_plugin(f.legacy(), &f.bin).unwrap();
+        write_tui_v2(f.global(), &f.bin).unwrap();
+        assert_eq!(f.install(Layout::V1), Vec::<String>::new());
+        assert!(plugin_file(&ocd).exists());
+        assert!(plugin_file(f.global()).exists());
+        assert!(!plugin_file(f.legacy()).exists(), "legacy copy removed");
+        assert!(tui_v2_file(&ocd).exists());
+        assert!(
+            !tui_v2_file(f.global()).exists(),
+            "a 2.x half where 2.x no longer reads goes"
+        );
+        assert!(tui_plugin_file(f.global()).exists());
+        assert_eq!(existing_binary_path(&ocd).as_deref(), Some(f.bin.as_str()));
+        let before: Vec<_> = [
+            plugin_file(&ocd),
+            plugin_file(f.global()),
+            tui_v2_file(&ocd),
+        ]
+        .iter()
+        .map(|p| file_identity(p))
+        .collect();
+        for layout in [Layout::V2, Layout::Unknown, Layout::V1] {
+            assert_eq!(f.install(layout), Vec::<String>::new());
+            let after: Vec<_> = [
+                plugin_file(&ocd),
+                plugin_file(f.global()),
+                tui_v2_file(&ocd),
+            ]
+            .iter()
+            .map(|p| file_identity(p))
+            .collect();
+            assert!(before == after, "{layout:?} rewrote a file");
+        }
+    }
+
+    /// `cli.json` as OpenCode 2.2.5 writes it after migrating `tui.json`
+    /// (`JSON.stringify(…, null, 2)`), holding `entries` in `plugins`.
+    #[cfg(unix)]
+    fn migrated_cli_json(entries: &[&str]) -> String {
+        let value = serde_json::json!({
+            "$schema": "https://opencode.ai/cli.json",
+            "plugins": entries,
+            "theme": {"name": "opencode"},
+        });
+        serde_json::to_string_pretty(&value).unwrap() + "\n"
+    }
+
+    /// Scenario: a machine upgraded from OpenCode 1.x, where 2.x copied the
+    /// deck's 1.x TUI entry from `tui.json` into `cli.json`'s `plugins`
+    /// (where 2.x cannot load it). The next install removes only the deck's
+    /// entry from `cli.json`, keeping the user's entries, an object entry,
+    /// every other member and OpenCode's file mode; the 1.x TUI half and its
+    /// `tui.json` entry stay, for the 1.x side of the machine.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_layout_removes_the_migrated_cli_entry() {
+        let f = LayoutFixture::new();
+        f.install(Layout::V1);
+        let entry = tui_plugin_file(f.global()).to_string_lossy().into_owned();
+        let tui_json = f.global().join("tui.json");
+        assert!(std::fs::read_to_string(&tui_json).unwrap().contains(&entry));
+        // What 2.2.5's migration writes: the user's plugin, the deck's, and
+        // an object entry (a `[name, options]` tuple in `tui.json`).
+        let cli = f.global().join("cli.json");
+        let before = migrated_cli_json(&["user-tui-plugin", &entry]).replace(
+            "\"plugins\": [",
+            "\"plugins\": [\n    {\n      \"package\": \"pkg\",\n      \"options\": {\n        \"a\": 1\n      }\n    },",
+        );
+        std::fs::write(&cli, &before).unwrap();
+        std::fs::set_permissions(&cli, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+
+        assert_eq!(f.install(Layout::V2), Vec::<String>::new());
+        let after = std::fs::read_to_string(&cli).unwrap();
+        assert_eq!(
+            after,
+            before.replace(
+                &format!(",\n    {}", serde_json::to_string(&entry).unwrap()),
+                ""
+            ),
+            "only the deck's entry goes"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(parsed["plugins"][1], "user-tui-plugin");
+        assert_eq!(parsed["plugins"][0]["package"], "pkg");
+        assert_eq!(parsed["theme"]["name"], "opencode");
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(
+                &std::fs::metadata(&cli).unwrap().permissions()
+            ) & 0o777,
+            0o600,
+            "OpenCode's owner-only mode is kept"
+        );
+        assert!(std::fs::read_to_string(&tui_json).unwrap().contains(&entry));
+        assert!(tui_plugin_file(f.global()).exists());
+
+        // A second install changes nothing.
+        assert_eq!(f.install(Layout::V2), Vec::<String>::new());
+        assert_eq!(std::fs::read_to_string(&cli).unwrap(), after);
+    }
+
+    /// Scenario (review of PR #2060): an OpenCode — named directly, or
+    /// behind a wrapper whose generation the deck cannot tell — is about to
+    /// start on a machine where OpenCode has never run, so no config root
+    /// exists. The spawn's refresh creates the XDG root, as OpenCode would,
+    /// and installs the module and both TUI halves there in that one step,
+    /// for every layout; with `$OPENCODE_CONFIG_DIR` set a detected 2.x also
+    /// gets its own root. A startup install on the same machine creates
+    /// nothing, and once a root exists the spawn's refresh creates no other.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_spawn_refresh_installs_into_a_fresh_xdg_root() {
+        let spawn = |roots: &[PathBuf], v2_global: &Path, layout: Layout, bin: &str| {
+            let mut failed = Vec::new();
+            create_root_for_spawn(roots, v2_global, &mut failed);
+            auto_install_layout(
+                roots,
+                v2_global,
+                layout,
+                &mut failed,
+                || Ok(bin.to_string()),
+            );
+            failed
+        };
+        for layout in [Layout::V1, Layout::V2, Layout::Unknown] {
+            let dir = crate::test_temp::tempdir().unwrap();
+            let roots = vec![
+                dir.path().join("config").join("opencode"),
+                dir.path().join("home").join(".opencode"),
+            ];
+            let bin = seed_deck(&dir.path().join("local").join("dot-agent-deck"));
+            // Startup: nothing is created on a machine with no root.
+            let mut failed = Vec::new();
+            auto_install_layout(&roots, &roots[0], Layout::Unknown, &mut failed, || {
+                Ok(bin.clone())
+            });
+            assert!(!roots[0].exists(), "{layout:?}: startup creates no root");
+            assert_eq!(spawn(&roots, &roots[0], layout, &bin), Vec::<String>::new());
+            assert_eq!(
+                existing_pin(&plugin_file(&roots[0])).as_deref(),
+                Some(bin.as_str()),
+                "{layout:?}: the module is in the fresh XDG root"
+            );
+            assert!(tui_plugin_file(&roots[0]).exists(), "{layout:?}");
+            assert!(tui_v2_file(&roots[0]).exists(), "{layout:?}");
+            assert!(!roots[1].exists(), "{layout:?}: no legacy root is created");
+        }
+        // `$OPENCODE_CONFIG_DIR` set: the XDG root for 1.x, and 2.x's own
+        // root when a 2.x is detected (or hinted by a wrapper's probe).
+        for (layout, config_dir_created) in [
+            (Layout::V2, true),
+            (Layout::V1, false),
+            (Layout::Unknown, false),
+        ] {
+            let dir = crate::test_temp::tempdir().unwrap();
+            let roots = vec![
+                dir.path().join("config").join("opencode"),
+                dir.path().join("home").join(".opencode"),
+                dir.path().join("elsewhere").join("opencode"),
+            ];
+            let bin = seed_deck(&dir.path().join("local").join("dot-agent-deck"));
+            assert_eq!(spawn(&roots, &roots[2], layout, &bin), Vec::<String>::new());
+            assert_eq!(
+                existing_pin(&plugin_file(&roots[0])).as_deref(),
+                Some(bin.as_str()),
+                "{layout:?}"
+            );
+            assert_eq!(
+                existing_pin(&plugin_file(&roots[2])).is_some(),
+                config_dir_created,
+                "{layout:?}"
+            );
+        }
+        // A machine with only the legacy root: nothing beyond what the
+        // install already creates.
+        let dir = crate::test_temp::tempdir().unwrap();
+        let roots = vec![
+            dir.path().join("config").join("opencode"),
+            dir.path().join("home").join(".opencode"),
+            dir.path().join("elsewhere").join("opencode"),
+        ];
+        std::fs::create_dir_all(&roots[1]).unwrap();
+        let mut failed = Vec::new();
+        create_root_for_spawn(&roots, &roots[2], &mut failed);
+        assert!(failed.is_empty() && !roots[0].exists() && !roots[2].exists());
+    }
+
+    /// Scenario (review of PR #2060): the config roots name one directory
+    /// by two paths — `~/.opencode` a symlink to `~/.config/opencode`,
+    /// `$OPENCODE_CONFIG_DIR` a symlink to the XDG root, or the legacy
+    /// root's `plugin/` a symlink to the XDG root's. Every layout's install
+    /// leaves the server module and both TUI halves in place, rather than
+    /// removing what it just wrote as a duplicate, and a second install
+    /// changes nothing.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_install_keeps_its_files_when_roots_are_symlinked_together() {
+        use std::os::unix::fs::symlink;
+        // (name, roots for (xdg, legacy, config dir), link) — the link is
+        // made after the XDG root exists.
+        type Link = fn(&Path, &[PathBuf]);
+        let cases: [(&str, bool, Link); 3] = [
+            ("legacy root linked to the XDG root", false, |_, roots| {
+                symlink(&roots[0], &roots[1]).unwrap();
+            }),
+            ("config dir linked to the XDG root", true, |_, roots| {
+                std::fs::create_dir_all(&roots[1]).unwrap();
+                symlink(&roots[0], &roots[2]).unwrap();
+            }),
+            ("legacy plugin/ linked to the XDG one", false, |_, roots| {
+                std::fs::create_dir_all(roots[0].join("plugin")).unwrap();
+                std::fs::create_dir_all(&roots[1]).unwrap();
+                symlink(roots[0].join("plugin"), roots[1].join("plugin")).unwrap();
+            }),
+        ];
+        for (name, config_dir, link) in cases {
+            for layout in [Layout::V1, Layout::V2, Layout::Unknown] {
+                let dir = crate::test_temp::tempdir().unwrap();
+                let mut roots = vec![
+                    dir.path().join("config").join("opencode"),
+                    dir.path().join("home").join(".opencode"),
+                ];
+                if config_dir {
+                    roots.push(dir.path().join("elsewhere").join("opencode"));
+                }
+                std::fs::create_dir_all(&roots[0]).unwrap();
+                std::fs::create_dir_all(roots[1].parent().unwrap()).unwrap();
+                if let Some(cfg) = roots.get(2) {
+                    std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+                }
+                link(dir.path(), &roots);
+                let bin = seed_deck(&dir.path().join("local").join("dot-agent-deck"));
+                let v2_global = roots.get(2).unwrap_or(&roots[0]).clone();
+                let install =
+                    || {
+                        let mut failed = Vec::new();
+                        auto_install_layout(&roots, &v2_global, layout, &mut failed, || {
+                            Ok(bin.clone())
+                        });
+                        failed
+                    };
+                assert_eq!(install(), Vec::<String>::new(), "{name}, {layout:?}");
+                let installed = || {
+                    (
+                        existing_pin(&plugin_file(&roots[0])),
+                        existing_pin(&tui_v2_file(&v2_global)),
+                        tui_plugin_file(&roots[0]).exists(),
+                    )
+                };
+                let expected = (Some(bin.clone()), Some(bin.clone()), true);
+                assert_eq!(
+                    installed(),
+                    expected,
+                    "{name}, {layout:?}: the first install"
+                );
+                let module = file_identity(&plugin_file(&roots[0]));
+                assert_eq!(install(), Vec::<String>::new(), "{name}, {layout:?}");
+                assert_eq!(
+                    installed(),
+                    expected,
+                    "{name}, {layout:?}: the second install"
+                );
+                assert_eq!(
+                    file_identity(&plugin_file(&roots[0])),
+                    module,
+                    "{name}, {layout:?}: the module is left as it was"
+                );
+            }
+        }
+    }
+
+    /// Scenario (audit L2): a FIFO with no writer where OpenCode 2's
+    /// `cli.json` would be, and another where the legacy root's module would
+    /// be carried over from under the plugin lock. An OpenCode 2 install
+    /// completes without blocking on either: the `cli.json` refusal is
+    /// reported, and nothing is carried over from the FIFO.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_install_never_blocks_on_a_fifo_config() {
+        let f = LayoutFixture::new();
+        let fifo = |path: &Path| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: a NUL-terminated path and a mode.
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "{path:?}");
+        };
+        let cli = f.global().join("cli.json");
+        fifo(&cli);
+        fifo(&plugin_file(f.legacy()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let roots = f.roots.clone();
+        let v2_global = f.v2_global().to_path_buf();
+        let bin = f.bin.clone();
+        std::thread::spawn(move || {
+            let mut failed = Vec::new();
+            auto_install_layout(&roots, &v2_global, Layout::V2, &mut failed, || Ok(bin));
+            let _ = tx.send(failed);
+        });
+        let failed = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the install blocked on a FIFO");
+        assert!(
+            failed.iter().any(|f| f.contains("cli.json")),
+            "the cli.json refusal is reported: {failed:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(plugin_file(f.global()))
+                .ok()
+                .map(|js| js.contains(&f.bin)),
+            Some(true),
+            "the global module is the deck's own, not the FIFO's"
+        );
+    }
+
+    /// Scenario: `cli.json` is OpenCode 2.x's own file. No install creates
+    /// it; every layout — 1.x (which never reads it) and unknown included —
+    /// removes the deck's dead entry from it, so a wrapper's spawn on a 2.x
+    /// machine cannot leave it behind; and with `$OPENCODE_CONFIG_DIR` set the
+    /// entry is removed from the `cli.json` there.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_cli_json_is_never_created_and_every_layout_cleans_it() {
+        for layout in [Layout::V1, Layout::V2, Layout::Unknown] {
+            let f = LayoutFixture::new();
+            assert_eq!(f.install(layout), Vec::<String>::new());
+            assert!(
+                !f.global().join("cli.json").exists(),
+                "{layout:?} must not create cli.json"
+            );
+
+            let entry = tui_plugin_file(f.global()).to_string_lossy().into_owned();
+            let cli = f.global().join("cli.json");
+            std::fs::write(&cli, migrated_cli_json(&[&entry, "user-tui-plugin"])).unwrap();
+            assert_eq!(f.install(layout), Vec::<String>::new());
+            assert_eq!(
+                std::fs::read_to_string(&cli).unwrap(),
+                migrated_cli_json(&["user-tui-plugin"]),
+                "{layout:?}"
+            );
+        }
+
+        let f = config_dir_fixture();
+        let ocd = f.roots[2].clone();
+        let entry = tui_plugin_file(f.global()).to_string_lossy().into_owned();
+        let cli = ocd.join("cli.json");
+        std::fs::write(&cli, migrated_cli_json(&[&format!("file://{entry}")])).unwrap();
+        assert_eq!(f.install(Layout::V2), Vec::<String>::new());
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cli).unwrap()).unwrap();
+        assert_eq!(after["plugins"], serde_json::json!([]));
+        assert_eq!(after["theme"]["name"], "opencode");
+        assert!(!f.global().join("cli.json").exists());
+    }
+
+    /// Scenario: a `cli.json` the deck cannot edit safely. One that names the
+    /// deck's TUI file but is not valid JSONC is left as it is and reported
+    /// as a failure (so the card can say so); one that does not mention the
+    /// deck at all is nobody's business and reports nothing.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_an_uneditable_cli_json_is_reported_only_when_it_names_the_deck() {
+        let f = LayoutFixture::new();
+        let cli = f.global().join("cli.json");
+        std::fs::write(&cli, "{\"plugins\": [\"x\"").unwrap();
+        assert_eq!(f.install(Layout::V2), Vec::<String>::new());
+        assert_eq!(
+            std::fs::read_to_string(&cli).unwrap(),
+            "{\"plugins\": [\"x\""
+        );
+
+        let broken = format!(
+            "{{\"plugins\": [{}",
+            serde_json::to_string(&tui_plugin_file(f.global()).to_string_lossy()).unwrap()
+        );
+        std::fs::write(&cli, &broken).unwrap();
+        let failed = f.install(Layout::V2);
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert!(failed[0].contains("cli.json"), "{failed:?}");
+        assert_eq!(std::fs::read_to_string(&cli).unwrap(), broken);
+    }
+
+    /// A drive of the generated module's OpenCode 2.x `setup` under Node with
+    /// a fake 2.x context: an event stream of `{ type, data, location }`,
+    /// `tool.hook`, `session.hook`, `session.get`/`prompt` and
+    /// `permission.reply`. `body` runs after `setup` with `emit(type, data)`,
+    /// `hooks` (the registered callbacks), `prompts`, `replies` and `cleanup`.
+    const FAKE_V2_CTX_JS: &str = r#"const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const queue = [];
+let wake;
+let subscribed = false;
+const stream = { [Symbol.asyncIterator]() { return { next: async () => {
+  while (!queue.length) await new Promise((r) => { wake = r; });
+  return { value: queue.shift(), done: false };
+} }; } };
+const emit = async (type, data, directory = "/work") => {
+  queue.push({ id: "evt", created: Date.now(), type, data, location: { directory } });
+  wake?.();
+  await sleep(40);
+};
+const hooks = { tool: {}, session: {} };
+const prompts = [];
+const replies = [];
+const parents = {};
+const registration = (domain, name) => ({ dispose: async () => { delete hooks[domain][name]; } });
+const ctx = {
+  location: { directory: "/work" },
+  event: { subscribe: () => { subscribed = true; return stream; } },
+  tool: { hook: async (name, cb) => { hooks.tool[name] = cb; return registration("tool", name); } },
+  session: {
+    hook: async (name, cb) => { hooks.session[name] = cb; return registration("session", name); },
+    get: async ({ sessionID }) => ({ id: sessionID, parentID: parents[sessionID] }),
+    prompt: async (input) => { prompts.push(input); return { id: "inbox-" + prompts.length }; },
+  },
+  permission: { reply: async (input) => { replies.push(input); } },
+};
+"#;
+
+    /// Run `body` against the module's 2.x `setup` (see [`FAKE_V2_CTX_JS`]),
+    /// as a standalone server's plugin, outside a deck pane.
+    #[cfg(unix)]
+    fn run_v2_driver(body: &str) -> Option<(Vec<serde_json::Value>, Vec<serde_json::Value>)> {
+        run_v2_driver_as(r#""serve", "--stdio""#, body)
+    }
+
+    /// [`run_v2_driver`], with the plugin process's own arguments `args` (a
+    /// JavaScript argument list): `"mini"` makes it read as `opencode mini`,
+    /// nothing as the full TUI, since the client mode is read from a process's
+    /// own arguments unless it is a `serve`.
+    #[cfg(unix)]
+    fn run_v2_driver_as(
+        args: &str,
+        body: &str,
+    ) -> Option<(Vec<serde_json::Value>, Vec<serde_json::Value>)> {
+        // A `serve` runs under the full TUI's client, `opencode`.
+        let client = args.contains("\"serve\"").then_some("");
+        run_plugin_driver_under(
+            &format!(
+                "{FAKE_V2_CTX_JS}\ndelete process.env.DOT_AGENT_DECK_PANE_ID;\ndelete process.env.DOT_AGENT_DECK_USAGE_FILE;\nprocess.argv.push({args});\nconst cleanup = await pluginModule.setup(ctx);\n{body}\nprocess.exit(0);\n"
+            ),
+            &[],
+            client,
+        )
+    }
+
+    /// Scenario (audit L5): the 2.x `setup` reports only from a `serve` whose
+    /// parent is an OpenCode client in a session mode. A `serve --stdio`
+    /// under a parent that is not OpenCode (a shell sharing a server), or
+    /// under an OpenCode running a non-session subcommand, subscribes to
+    /// nothing; under `opencode mini`, `opencode run` and the full TUI it
+    /// subscribes.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_setup_reports_only_under_an_opencode_session_client() {
+        let body = |args: &str| {
+            format!(
+                "{FAKE_V2_CTX_JS}\nprocess.argv.push({args});\nconst cleanup = await pluginModule.setup(ctx);\nawait sleep(50);\nconsole.log(JSON.stringify({{ subscribed }}));\nprocess.exit(subscribed ? 10 : 0);\n"
+            )
+        };
+        for client in [None, Some("session list"), Some("plugin list")] {
+            assert!(
+                run_plugin_driver_under(&body(r#""serve", "--stdio""#), &[], client).is_some(),
+                "{client:?}: inert, so it exits 0"
+            );
+        }
+        for client in ["mini", "run hi", ""] {
+            let driver = format!(
+                "{FAKE_V2_CTX_JS}\nprocess.argv.push(\"serve\", \"--stdio\");\nconst cleanup = await pluginModule.setup(ctx);\nawait sleep(50);\nprocess.exit(subscribed ? 0 : 11);\n"
+            );
+            assert!(
+                run_plugin_driver_under(&driver, &[], Some(client)).is_some(),
+                "{client:?}: subscribes"
+            );
+        }
+    }
+
+    /// Scenario (PRD #2050, audit N2): the OpenCode binary the client runs
+    /// is replaced in place while it runs (`opencode upgrade`), so Linux
+    /// reads its executable as `…/opencode (deleted)`. A `serve` under it
+    /// still recognises its client as OpenCode, and its `setup` reports as
+    /// before the replacement rather than going inert.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opencode_v2_setup_reports_under_a_replaced_opencode_binary() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = dir.path().join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template("/opt/dot-agent-deck")).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                "import pluginModule from {plugin};\nimport {{ readlinkSync }} from \"fs\";\n{FAKE_V2_CTX_JS}\ndelete process.env.DOT_AGENT_DECK_PANE_ID;\nconst parent = readlinkSync(`/proc/${{process.ppid}}/exe`);\nif (!parent.endsWith(\"/opencode (deleted)\")) {{ console.log(parent); process.exit(12); }}\nprocess.argv.push(\"serve\", \"--stdio\");\nawait pluginModule.setup(ctx);\nawait sleep(50);\nprocess.exit(subscribed ? 0 : 11);\n",
+                plugin = serde_json::to_string(&plugin.display().to_string()).unwrap(),
+            ),
+        )
+        .unwrap();
+        let shell = opencode_named_shell(dir.path());
+        // The client removes its own binary before starting the server, as
+        // an in-place upgrade leaves it.
+        std::fs::write(
+            dir.path().join("client"),
+            format!("rm -f '{}'\nnode '{}'\n", shell.display(), driver.display()),
+        )
+        .unwrap();
+        let out = std::process::Command::new(&shell)
+            .arg("client")
+            .current_dir(dir.path())
+            .envs(crate::test_isolation::unreachable_endpoints())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+    }
+
+    /// The module both generations load: `{ id, server, setup }`, the 1.x
+    /// factory as `server` (also still a named export), and a `setup` that
+    /// stays inert — subscribes to nothing, registers nothing — outside a
+    /// standalone server, where `process.env` is not the pane's.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_module_exports_both_shapes_and_v2_stays_inert_in_a_shared_service() {
+        let Some((payloads, _)) = run_plugin_driver_with_awaits(
+            &format!(
+                "{FAKE_V2_CTX_JS}\nimport * as named from {module};\nconst shape = {{ id: pluginModule.id, server: typeof pluginModule.server, setup: typeof pluginModule.setup, same: named.DotAgentDeckPlugin === pluginModule.server }};\nprocess.argv.push(\"serve\", \"--service\");\nconst cleanup = await pluginModule.setup(ctx);\nawait sleep(50);\nconsole.log(JSON.stringify(shape));\nif (subscribed || Object.keys(hooks.tool).length || Object.keys(hooks.session).length || typeof cleanup !== \"function\") process.exit(3);\nif (shape.id !== \"dot-agent-deck\" || shape.server !== \"function\" || shape.setup !== \"function\" || !shape.same) process.exit(4);\nprocess.exit(0);\n",
+                module = "\"./dot-agent-deck.mjs\""
+            ),
+            &[],
+        ) else {
+            return;
+        };
+        assert!(payloads.is_empty(), "{payloads:?}");
+    }
+
+    /// Scenario-level drive of 2.x `setup`: a session starts, the user's
+    /// prompt arrives through `session.hook("prompt")`, the turn starts, a
+    /// `shell` call runs and FAILS, a `read` call completes, a subagent's
+    /// child session works and stops, the assistant replies, and the turn goes
+    /// idle; a later turn fails on a provider quota and another is
+    /// interrupted; unloading flushes the session. The deck receives the same
+    /// `hook --agent opencode` payloads it gets from 1.x, with `shell`
+    /// reported as `bash`.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_setup_reports_the_1x_payload_vocabulary() {
+        let Some((payloads, _)) = run_v2_driver(
+            r#"await sleep(50);
+await emit("session.created", { sessionID: "s1", location: { directory: "/work" }, slug: "a", version: "2.2.5" });
+await hooks.session.prompt({ sessionID: "s1", messageID: "msg-1", prompt: { text: "  list the files  " }, delivery: "steer" });
+await emit("session.execution.started", { sessionID: "s1" });
+await hooks.tool["execute.before"]({ tool: "shell", sessionID: "s1", agent: "build", messageID: "a1", id: "call-1", input: { command: "ls -la" } });
+await hooks.tool["execute.after"]({ tool: "shell", sessionID: "s1", agent: "build", messageID: "a1", id: "call-1", input: { command: "ls -la" }, status: "error", error: { message: "exit 2" } });
+await hooks.tool["execute.before"]({ tool: "read", sessionID: "s1", agent: "build", messageID: "a1", id: "call-2", input: { path: "a.txt" } });
+await hooks.tool["execute.after"]({ tool: "read", sessionID: "s1", agent: "build", messageID: "a1", id: "call-2", input: { path: "a.txt" }, status: "completed", result: {} });
+await emit("session.created", { sessionID: "c1", parentID: "s1", location: { directory: "/work" }, slug: "b", version: "2.2.5" });
+await hooks.session.prompt({ sessionID: "c1", messageID: "msg-2", prompt: { text: "subagent task" }, delivery: "queue" });
+await emit("session.status", { sessionID: "c1", status: { type: "busy" } });
+await hooks.tool["execute.before"]({ tool: "grep", sessionID: "c1", agent: "explore", messageID: "a2", id: "call-3", input: { pattern: "x" } });
+await emit("session.idle", { sessionID: "c1" });
+await emit("session.text.ended", { sessionID: "s1", assistantMessageID: "a1", ordinal: 0, text: "Here are the files." });
+await emit("session.status", { sessionID: "s1", status: { type: "idle" } });
+await emit("session.execution.started", { sessionID: "s1" });
+await hooks.session["http.response"]({ sessionID: "s1", response: { ok: false, headers: new Map([["Retry-After", "30"], ["x-other", "no"]]) } });
+await emit("session.execution.failed", { sessionID: "s1", error: { type: "APIError", message: "You exceeded your quota", status: 429, response: { body: JSON.stringify({ error: { type: "usage_limit_reached", resets_at: 1790001000 } }) } } });
+await emit("session.execution.interrupted", { sessionID: "s1", reason: "user" });
+await cleanup();
+await sleep(50);"#,
+        ) else {
+            return;
+        };
+        let events: Vec<&str> = payloads
+            .iter()
+            .map(|p| p["event"].as_str().unwrap_or(""))
+            .collect();
+        let find = |event: &str| -> Vec<&serde_json::Value> {
+            payloads.iter().filter(|p| p["event"] == event).collect()
+        };
+        assert_eq!(
+            find("session.created")[0]["session_id"],
+            "s1",
+            "{payloads:#?}"
+        );
+        let prompts = find("session.prompt");
+        assert_eq!(
+            prompts.len(),
+            1,
+            "only the user's prompt, not the subagent's: {payloads:#?}"
+        );
+        assert_eq!(prompts[0]["prompt"], "list the files");
+        let busy = payloads
+            .iter()
+            .find(|p| p["event"] == "session.status" && p["status"] == "busy")
+            .expect("the turn's start reads as working");
+        assert_eq!(busy["session_id"], "s1");
+        let starts = find("tool.execute.before");
+        assert_eq!(
+            starts[0]["tool_name"], "bash",
+            "2.x `shell` is reported as `bash`"
+        );
+        assert_eq!(starts[0]["tool_input"]["command"], "ls -la");
+        assert_eq!(starts[0]["call_id"], "call-1");
+        assert_eq!(starts[1]["tool_name"], "read");
+        let ends = find("tool.execute.after");
+        assert_eq!(ends[0]["tool_name"], "bash", "the failed call still ends");
+        assert_eq!(ends[0]["call_id"], "call-1");
+        assert_eq!(ends[1]["call_id"], "call-2");
+        let start = &find("subagent.start")[0];
+        assert_eq!(
+            (&start["session_id"], &start["subagent_id"]),
+            (&"s1".into(), &"c1".into())
+        );
+        let child_tool = starts.iter().find(|p| p["call_id"] == "call-3").unwrap();
+        assert_eq!(child_tool["subagent_id"], "c1");
+        assert_eq!(find("subagent.stop")[0]["subagent_id"], "c1");
+        let idle = payloads
+            .iter()
+            .find(|p| p["event"] == "session.status" && p["status"] == "idle")
+            .unwrap();
+        assert_eq!(idle["reply"], "Here are the files.", "{payloads:#?}");
+        let errors = find("session.error");
+        assert_eq!(errors[0]["error_name"], "APIError");
+        assert_eq!(errors[0]["error_message"], "You exceeded your quota");
+        assert_eq!(
+            errors[0]["response_markers"]["error"]["type"],
+            "usage_limit_reached"
+        );
+        assert_eq!(
+            errors[0]["response_headers"],
+            serde_json::json!({"retry-after": "30"}),
+            "allow-listed headers from session.hook(\"http.response\")"
+        );
+        assert_eq!(
+            errors[1]["error_name"], "MessageAbortedError",
+            "an interrupted turn ends as 1.x's abort"
+        );
+        assert_eq!(
+            events.last(),
+            Some(&"session.deleted"),
+            "unloading flushes the session: {events:?}"
+        );
+    }
+
+    /// Scenario (review S2): the client's subcommand is found past leading
+    /// flags. `opencode --log-level info mini` is mini, so the server plugin
+    /// reports a new form itself; `opencode --session mini` names a session
+    /// called `mini` in the full TUI, which leaves the form to the TUI half.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_reads_the_subcommand_past_leading_flags() {
+        let body = r#"await sleep(50);
+await emit("session.created", { sessionID: "s1", location: { directory: "/work" }, slug: "a", version: "2.2.5" });
+await emit("form.created", { form: { id: "form-1", sessionID: "s1", title: "Which branch?", fields: [] } });
+await sleep(100);"#;
+        for (args, reported) in [
+            (r#""--log-level", "info", "mini""#, true),
+            (r#""--auto", "mini""#, true),
+            (r#""--session", "mini""#, false),
+        ] {
+            let Some((payloads, _)) = run_v2_driver_as(args, body) else {
+                return;
+            };
+            let asked = payloads
+                .iter()
+                .filter(|p| p["event"] == "question.asked")
+                .count();
+            assert_eq!(asked, usize::from(reported), "{args}: {payloads:#?}");
+        }
+    }
+
+    /// 2.x's `permission.asked` is held through `await-answer` like 1.x's,
+    /// with its properties given back their 1.x names so the deck's question
+    /// builder reads them; its `permission.replied` names the request. A
+    /// question form is reported plainly (2.x's server context has no form
+    /// reply) and cleared by its reply or cancellation.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_setup_reports_blocked_prompts_and_forms() {
+        // `opencode mini`: no TUI plugin, so the server plugin reports forms.
+        let Some((payloads, awaits)) = run_v2_driver_as(
+            r#""mini""#,
+            r#"await sleep(50);
+await emit("session.created", { sessionID: "s1", location: { directory: "/work" }, slug: "a", version: "2.2.5" });
+await emit("permission.asked", { id: "per-1", sessionID: "s1", action: "bash", resources: ["rm -rf build"], save: ["rm *"], metadata: { command: "rm -rf build" }, source: { type: "tool", messageID: "a1", id: "call-9" } });
+await awaited(1);
+await emit("permission.replied", { sessionID: "s1", requestID: "per-1", reply: "once" });
+await emit("form.created", { form: { id: "form-1", sessionID: "s1", title: "Which branch?", fields: [] } });
+await emit("form.replied", { id: "form-1", sessionID: "s1", answer: {} });
+await emit("form.created", { form: { id: "form-2", sessionID: "s1", title: "Proceed?", fields: [] } });
+await emit("form.cancelled", { id: "form-2", sessionID: "s1" });"#,
+        ) else {
+            return;
+        };
+        assert_eq!(awaits.len(), 1, "{awaits:?}");
+        let props = &awaits[0]["properties"];
+        assert_eq!(awaits[0]["event"], "permission.asked");
+        assert_eq!(awaits[0]["session_id"], "s1");
+        assert_eq!(props["id"], "per-1");
+        assert_eq!(props["permission"], "bash");
+        assert_eq!(props["patterns"], serde_json::json!(["rm -rf build"]));
+        assert_eq!(props["always"], serde_json::json!(["rm *"]));
+        assert_eq!(props["metadata"]["command"], "rm -rf build");
+        assert_eq!(props["tool"]["callID"], "call-9");
+        let question = crate::question::opencode_permission_asked(props, 0)
+            .expect("the deck builds its question from the renamed properties");
+        assert_eq!(question.id, "per-1");
+        let replied: Vec<_> = payloads
+            .iter()
+            .filter(|p| p["event"] == "permission.replied")
+            .collect();
+        assert_eq!(replied[0]["request_id"], "per-1");
+        let asked: Vec<_> = payloads
+            .iter()
+            .filter(|p| p["event"] == "question.asked")
+            .collect();
+        assert_eq!(asked.len(), 2, "{payloads:#?}");
+        assert_eq!(
+            asked[0]["prompt"],
+            "answer this form in OpenCode: Which branch?"
+        );
+        assert!(
+            asked[0].get("properties").is_none(),
+            "a form is shown, not held"
+        );
+        let cleared: Vec<_> = payloads
+            .iter()
+            .filter(|p| p["event"] == "question.replied" || p["event"] == "question.rejected")
+            .map(|p| {
+                (
+                    p["event"].as_str().unwrap(),
+                    p["request_id"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            cleared,
+            vec![
+                ("question.replied", "form-1"),
+                ("question.rejected", "form-2")
+            ]
+        );
+    }
+
+    /// The deck's answer to a 2.x permission prompt goes back through 2.x's
+    /// own `permission.reply`, with the session the prompt came from, and its
+    /// outcome is acknowledged to `await-answer`.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_permission_answer_replies_through_the_permission_api() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let acks = dir.path().join("acks.jsonl");
+        let recorder = dir.path().join("recorder.sh");
+        crate::test_isolation::write_script(
+            &recorder,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"await-answer\" ]; then\n  IFS= read -r input\n  printf '%s\\n' '{{\"kind\":\"permission\",\"request_id\":\"per-1\",\"body\":{{\"reply\":\"always\"}}}}'\n  IFS= read -r ack\n  printf '%s\\n' \"$ack\" >> '{acks}'\nfi\ncat > /dev/null\nexit 0\n",
+                acks = acks.display(),
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let plugin = dir.path().join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                "import pluginModule from {plugin};\n{FAKE_V2_CTX_JS}\ndelete process.env.DOT_AGENT_DECK_PANE_ID;\nprocess.argv.push(\"serve\", \"--stdio\");\nawait pluginModule.setup(ctx);\nawait sleep(50);\nawait emit(\"permission.asked\", {{ id: \"per-1\", sessionID: \"s1\", action: \"bash\", resources: [\"ls\"], save: [\"ls\"] }});\nfor (let n = 0; n < 200 && !replies.length; n++) await sleep(20);\nawait sleep(200);\nconsole.log(JSON.stringify(replies));\nprocess.exit(0);\n",
+                plugin = serde_json::to_string(&plugin.display().to_string()).unwrap(),
+            ),
+        )
+        .unwrap();
+        let out = node_under_opencode(&driver).output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let replies: serde_json::Value =
+            serde_json::from_str(stdout.lines().last().unwrap_or("null")).unwrap();
+        assert_eq!(
+            replies,
+            serde_json::json!([{"sessionID": "s1", "requestID": "per-1", "decision": "always"}])
+        );
+        let ack = std::fs::read_to_string(&acks).unwrap_or_default();
+        assert!(ack.contains("\"delivered\":true"), "{ack}");
+    }
+
+    /// PRD #1858 on 2.x: each step's counts (`session.step.ended`) and model
+    /// (`session.step.started`) are written to the deck's usage file as one
+    /// assistant message's usage line, the message's steps summed and its
+    /// cost added up across them.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_setup_writes_step_usage() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = crate::test_temp::tempdir().unwrap();
+        let usage = dir.path().join("usage.jsonl");
+        std::fs::write(&usage, b"").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&usage, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let recorder = dir.path().join("recorder.sh");
+        crate::test_isolation::write_script(&recorder, b"#!/bin/sh\ncat > /dev/null\nexit 0\n")
+            .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let plugin = dir.path().join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                "import pluginModule from {plugin};\n{FAKE_V2_CTX_JS}\ndelete process.env.DOT_AGENT_DECK_PANE_ID;\nprocess.argv.push(\"serve\", \"--stdio\");\nawait pluginModule.setup(ctx);\nawait sleep(50);\nconst tokens = (i, o) => ({{ input: i, output: o, reasoning: 1, cache: {{ read: 2, write: 0 }} }});\nawait emit(\"session.created\", {{ sessionID: \"s1\", location: {{ directory: \"/work\" }}, slug: \"a\", version: \"2.2.5\" }});\nawait emit(\"session.step.started\", {{ sessionID: \"s1\", assistantMessageID: \"a1\", agent: \"build\", model: {{ id: \"claude-haiku-4-5\", providerID: \"anthropic\" }}, started: 1 }});\nawait emit(\"session.step.ended\", {{ sessionID: \"s1\", assistantMessageID: \"a1\", finish: \"tool-calls\", cost: 0.25, tokens: tokens(10, 5) }});\nawait emit(\"session.step.ended\", {{ sessionID: \"s1\", assistantMessageID: \"a1\", finish: \"stop\", cost: 0.5, tokens: tokens(20, 7) }});\nprocess.exit(0);\n",
+                plugin = serde_json::to_string(&plugin.display().to_string()).unwrap(),
+            ),
+        )
+        .unwrap();
+        let out = node_under_opencode(&driver)
+            .env("DOT_AGENT_DECK_USAGE_FILE", &usage)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let text = std::fs::read_to_string(&usage).unwrap();
+        let last: serde_json::Value =
+            serde_json::from_str(text.lines().last().expect("a usage line")).unwrap();
+        assert_eq!(last["id"], "a1", "{text}");
+        assert_eq!(last["model"], "claude-haiku-4-5");
+        assert_eq!(last["input"], 30, "the steps' counts are summed: {text}");
+        assert_eq!(last["output"], 14, "output includes reasoning: {text}");
+        assert_eq!(last["cache_read"], 4);
+        assert_eq!(last["cost_usd"], 0.75);
+        assert_eq!(last["stop"], "stop");
+    }
+
+    /// Under `opencode mini` (2.x loads no TUI plugin there, measured on
+    /// 2.2.5), the server plugin is the deck's receiver: a message the deck
+    /// hands over starts in mini's session through `session.prompt`, and the
+    /// inbox item that call returns is committed when OpenCode delivers it.
+    /// Which client the server serves is read from its parent's argv, here a
+    /// shell named `opencode mini`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opencode_v2_mini_delivers_through_session_prompt() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (recorder, controls) = inbox_recorder(dir.path());
+        let plugin = dir.path().join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                "import pluginModule from {plugin};\n{FAKE_V2_CTX_JS}\nprocess.argv.push(\"serve\", \"--stdio\");\nconst cleanup = await pluginModule.setup(ctx);\nawait sleep(50);\nawait emit(\"session.created\", {{ sessionID: \"s1\", location: {{ directory: \"/work\" }}, slug: \"a\", version: \"2.2.5\" }});\nfor (let n = 0; n < 150 && !prompts.length; n++) await sleep(20);\nawait sleep(100);\nawait emit(\"session.inbox.delivered\", {{ sessionID: \"s1\", inboxID: \"inbox-1\" }});\nawait sleep(300);\nawait cleanup();\nconsole.log(JSON.stringify({{ prompts }}));\nprocess.exit(0);\n",
+                plugin = serde_json::to_string(&plugin.display().to_string()).unwrap(),
+            ),
+        )
+        .unwrap();
+        // The server's parent: a shell whose argv is `opencode mini`.
+        std::fs::write(
+            dir.path().join("mini"),
+            format!("node '{}'\n", driver.display()),
+        )
+        .unwrap();
+        let out = std::process::Command::new(opencode_named_shell(dir.path()))
+            .arg("mini")
+            .current_dir(dir.path())
+            .envs(crate::test_isolation::unreachable_endpoints())
+            .env("DOT_AGENT_DECK_PANE_ID", "pane-1")
+            .env("DOT_AGENT_DECK_PANE_CAPABILITY", "a".repeat(64))
+            .env("DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS", "3600000")
+            .output()
+            .expect("run node");
+        assert!(out.status.success(), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let result: serde_json::Value =
+            serde_json::from_str(stdout.lines().last().unwrap_or("null")).unwrap();
+        let prompts = result["prompts"].as_array().cloned().unwrap_or_default();
+        assert_eq!(prompts.len(), 1, "{result}");
+        assert_eq!(prompts[0]["sessionID"], "s1");
+        let text = prompts[0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("[dot-agent-deck message m-k3xzq2ab-0f3c9a71d2e4b850"),
+            "the deck's framed message: {text}"
+        );
+        let written = std::fs::read_to_string(&controls).unwrap_or_default();
+        assert!(written.contains("\"handed\""), "{written}");
+        assert!(
+            written.contains("\"committed\""),
+            "delivered, so committed: {written}"
+        );
+        assert!(
+            !written.contains("call inbox announce"),
+            "mini is the receiver itself, it does not announce: {written}"
+        );
+    }
+
+    /// Run a 2.x mini driver: `body` after the module's `setup` with
+    /// [`FAKE_V2_CTX_JS`] plus `ctx.session.list` answering `sessions` (newest
+    /// first, as `order: "desc"` does) and recording each input in `lists`,
+    /// under a server whose parent's argv is `opencode mini <client_args>`.
+    /// The driver's last stdout line, parsed, and the recorder's controls.
+    #[cfg(target_os = "linux")]
+    fn run_v2_mini_driver(client_args: &str, body: &str) -> (serde_json::Value, String) {
+        run_v2_mini_driver_timed(client_args, body, None)
+    }
+
+    /// [`run_v2_mini_driver`], with the deck's message handed over
+    /// `message_delay` seconds after the receiver registers, when given.
+    #[cfg(target_os = "linux")]
+    fn run_v2_mini_driver_timed(
+        client_args: &str,
+        body: &str,
+        message_delay: Option<&str>,
+    ) -> (serde_json::Value, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let (recorder, controls) = inbox_recorder_timed(dir.path(), None, message_delay);
+        let plugin = dir.path().join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                "import pluginModule from {plugin};\n{FAKE_V2_CTX_JS}\nconst lists = [];\nlet sessions = [];\nctx.session.list = async (input) => {{ lists.push(input); return {{ data: sessions, cursor: {{}} }}; }};\nconst now = Date.now();\nconst pluginURL = (await import(\"url\")).pathToFileURL({plugin}).href;\nprocess.argv.push(\"serve\", \"--stdio\");\n{body}\nprocess.exit(0);\n",
+                plugin = serde_json::to_string(&plugin.display().to_string()).unwrap(),
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("mini"),
+            format!("node '{}'\n", driver.display()),
+        )
+        .unwrap();
+        let out = std::process::Command::new(opencode_named_shell(dir.path()))
+            .arg("mini")
+            .args(client_args.split_whitespace())
+            .current_dir(dir.path())
+            .envs(crate::test_isolation::unreachable_endpoints())
+            .env("DOT_AGENT_DECK_PANE_ID", "pane-1")
+            .env("DOT_AGENT_DECK_PANE_CAPABILITY", "a".repeat(64))
+            .env("DOT_AGENT_DECK_INBOX_WATCHER_BACKOFF_MS", "3600000")
+            .output()
+            .expect("run node");
+        assert!(out.status.success(), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let result = serde_json::from_str(stdout.lines().last().unwrap_or("null")).unwrap();
+        (
+            result,
+            std::fs::read_to_string(&controls).unwrap_or_default(),
+        )
+    }
+
+    /// Scenario (PRD #2050, inbox/opencode/020 on 2.2.5): a fresh `opencode
+    /// mini` created its session before the deck's server plugin subscribed,
+    /// so no `session.created` reaches the plugin. A message the deck hands
+    /// over still starts in mini's session: the plugin finds it the way mini
+    /// does — the newest root session of the directory created since this
+    /// server started — and passes over an older root and a newer subagent
+    /// session. Mini's own session appears in the listing only after the
+    /// message arrives, and is found on a later look.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opencode_v2_mini_delivers_into_the_session_it_started_with() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let (result, written) = run_v2_mini_driver(
+            "",
+            r#"sessions = [
+  { id: "ses_child", parentID: "ses_mini", time: { created: now + 5 }, location: { directory: "/work" } },
+  { id: "ses_old", time: { created: now - 3600000 }, location: { directory: "/work" } },
+];
+const cleanup = await pluginModule.setup(ctx);
+await sleep(700);
+const early = prompts.length;
+sessions = [sessions[0], { id: "ses_mini", time: { created: now }, location: { directory: "/work" } }, sessions[1]];
+for (let n = 0; n < 150 && !prompts.length; n++) await sleep(20);
+await sleep(100);
+await cleanup();
+console.log(JSON.stringify({ early, prompts, lists }));"#,
+        );
+        assert_eq!(result["early"], 0, "no older root is mini's: {result}");
+        let prompts = result["prompts"].as_array().cloned().unwrap_or_default();
+        assert_eq!(prompts.len(), 1, "{result}");
+        assert_eq!(prompts[0]["sessionID"], "ses_mini", "{result}");
+        assert_eq!(
+            result["lists"][0],
+            serde_json::json!({"directory": "/work", "parentID": null, "limit": 20, "order": "desc"}),
+            "{result}"
+        );
+        assert!(written.contains("\"handed\""), "{written}");
+    }
+
+    /// Scenario (PRD #2050): `opencode mini --session <id>` shows that session
+    /// and `--continue` the newest root session of the directory, which is
+    /// where the deck's message starts when the plugin saw neither created.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opencode_v2_mini_delivers_into_a_named_or_continued_session() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let body = r#"sessions = [
+  { id: "ses_newest", time: { created: now - 60000 }, location: { directory: "/work" } },
+  { id: "ses_older", time: { created: now - 3600000 }, location: { directory: "/work" } },
+];
+const cleanup = await pluginModule.setup(ctx);
+for (let n = 0; n < 150 && !prompts.length; n++) await sleep(20);
+await sleep(100);
+await cleanup();
+console.log(JSON.stringify({ prompts, lists: lists.length }));"#;
+        for (args, expected) in [
+            ("--session ses_named", "ses_named"),
+            ("-s ses_named", "ses_named"),
+            ("--continue", "ses_newest"),
+        ] {
+            let (result, _) = run_v2_mini_driver(args, body);
+            let prompts = result["prompts"].as_array().cloned().unwrap_or_default();
+            assert_eq!(prompts.len(), 1, "{args}: {result}");
+            assert_eq!(prompts[0]["sessionID"], expected, "{args}: {result}");
+        }
+    }
+
+    /// Scenario (PRD #2050, review B2): two OpenCode 2 minis start in one
+    /// directory, and both create their sessions, 1.4 s apart, before this
+    /// mini's receiver starts (a slow boot). Both are candidates, so the
+    /// plugin cannot tell which is its own: it prompts neither and reports
+    /// the deck's message not handed, which leaves it with the deck rather
+    /// than looping on it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opencode_v2_two_minis_started_together_report_the_message_not_handed() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let (result, written) = run_v2_mini_driver(
+            "",
+            r#"const started = performance.timeOrigin;
+sessions = [
+  { id: "ses_other_mini", time: { created: started + 1500 }, location: { directory: "/work" } },
+  { id: "ses_this_mini", time: { created: started + 100 }, location: { directory: "/work" } },
+];
+await sleep(Math.max(0, started + 1600 - Date.now()));
+const cleanup = await pluginModule.setup(ctx);
+await sleep(1500);
+await cleanup();
+console.log(JSON.stringify({ prompts, lists: lists.length }));"#,
+        );
+        assert_eq!(
+            result["prompts"],
+            serde_json::json!([]),
+            "two roots created before setup are ambiguous: {result}"
+        );
+        assert!(!written.contains("\"handed\""), "{written}");
+        assert!(
+            written.contains("\"not_handed\""),
+            "the message is reported not handed, not held in a loop: {written}"
+        );
+    }
+
+    /// Scenario (PRD #2050, review R2 and audit N1): this mini's server is
+    /// slow to boot, so its own session is created 2.5 s after the server
+    /// started, while a sibling mini started a second later in the same
+    /// directory created its session at 1.3 s. This mini's receiver starts
+    /// after both. The sibling's session is older, but the plugin never takes
+    /// a session by age: it cannot tell the two apart, so it prompts neither,
+    /// and the deck's message is reported not handed instead of reaching the
+    /// sibling's session.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opencode_v2_a_slow_mini_never_takes_a_siblings_earlier_session() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let (result, written) = run_v2_mini_driver(
+            "",
+            r#"const started = performance.timeOrigin;
+sessions = [
+  { id: "ses_this_mini", time: { created: started + 2500 }, location: { directory: "/work" } },
+  { id: "ses_sibling", time: { created: started + 1300 }, location: { directory: "/work" } },
+];
+await sleep(Math.max(0, started + 2700 - Date.now()));
+const cleanup = await pluginModule.setup(ctx);
+await sleep(1500);
+await cleanup();
+console.log(JSON.stringify({ prompts }));"#,
+        );
+        assert_eq!(
+            result["prompts"],
+            serde_json::json!([]),
+            "nothing reaches the sibling's session: {result}"
+        );
+        assert!(!written.contains("\"handed\""), "{written}");
+        assert!(written.contains("\"not_handed\""), "{written}");
+    }
+
+    /// Scenario (PRD #2050, review R2): two OpenCode 2 minis start in one
+    /// directory 1.4 s apart, and this one's receiver started before the
+    /// other created its session. Only this mini's session falls in its
+    /// window, so the deck's message starts there.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opencode_v2_a_sibling_created_after_setup_is_not_a_candidate() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let (result, written) = run_v2_mini_driver(
+            "",
+            r#"const started = performance.timeOrigin;
+sessions = [
+  { id: "ses_this_mini", time: { created: started }, location: { directory: "/work" } },
+];
+const cleanup = await pluginModule.setup(ctx);
+sessions = [{ id: "ses_other_mini", time: { created: Date.now() + 1400 }, location: { directory: "/work" } }, ...sessions];
+for (let n = 0; n < 200 && !prompts.length; n++) await sleep(20);
+await sleep(100);
+await cleanup();
+console.log(JSON.stringify({ prompts }));"#,
+        );
+        let prompts = result["prompts"].as_array().cloned().unwrap_or_default();
+        assert_eq!(prompts.len(), 1, "{result}");
+        assert_eq!(prompts[0]["sessionID"], "ses_this_mini", "{result}");
+        assert!(written.contains("\"handed\""), "{written}");
+    }
+
+    /// Scenario (PRD #2050, audit M1): an OpenCode 2 mini found its session
+    /// and took a deck message there; later another root session is created
+    /// in the same directory, and the deck's module is re-imported in the same
+    /// server process (OpenCode 2 reloads the plugin when the module file
+    /// changes). The next deck message still starts in the mini's own session
+    /// rather than being refused as ambiguous.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opencode_v2_mini_keeps_its_session_across_a_plugin_reload() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let (result, written) = run_v2_mini_driver(
+            "",
+            r#"const started = performance.timeOrigin;
+sessions = [
+  { id: "ses_this_mini", time: { created: started + 100 }, location: { directory: "/work" } },
+];
+const cleanup = await pluginModule.setup(ctx);
+for (let n = 0; n < 200 && !prompts.length; n++) await sleep(20);
+const first = prompts.length;
+await sleep(700);
+sessions = [{ id: "ses_later", time: { created: Date.now() }, location: { directory: "/work" } }, ...sessions];
+await cleanup();
+const reloaded = (await import(pluginURL + "?reload=1")).default;
+const cleanupReloaded = await reloaded.setup(ctx);
+for (let n = 0; n < 200 && prompts.length < 2; n++) await sleep(20);
+await sleep(100);
+await cleanupReloaded();
+console.log(JSON.stringify({ first, prompts }));"#,
+        );
+        assert_eq!(
+            result["first"], 1,
+            "the first message reached mini: {result}"
+        );
+        let prompts = result["prompts"].as_array().cloned().unwrap_or_default();
+        assert_eq!(
+            prompts.len(),
+            2,
+            "the reloaded plugin delivers too: {result}"
+        );
+        assert_eq!(prompts[0]["sessionID"], "ses_this_mini", "{result}");
+        assert_eq!(prompts[1]["sessionID"], "ses_this_mini", "{result}");
+        assert!(!written.contains("\"not_handed\""), "{written}");
+    }
+
+    /// Scenario (PRD #2050, round-3 re-review F1): two OpenCode 2 minis start
+    /// in one directory three seconds apart, the usual staggered orchestration
+    /// launch. The earlier mini's server lists both fresh roots, and only its
+    /// own was created before its receiver started; the later mini's server
+    /// lists the earlier one's root as created before it started. Each
+    /// delivers into its own session.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opencode_v2_two_minis_started_apart_each_take_their_own_session() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        // The earlier mini: its own root just after its start, the later
+        // mini's three seconds after.
+        let (result, written) = run_v2_mini_driver(
+            "",
+            r#"const started = performance.timeOrigin;
+sessions = [
+  { id: "ses_later_mini", time: { created: started + 3100 }, location: { directory: "/work" } },
+  { id: "ses_earlier_mini", time: { created: started + 100 }, location: { directory: "/work" } },
+];
+const cleanup = await pluginModule.setup(ctx);
+for (let n = 0; n < 200 && !prompts.length; n++) await sleep(20);
+await sleep(100);
+await cleanup();
+console.log(JSON.stringify({ prompts }));"#,
+        );
+        let prompts = result["prompts"].as_array().cloned().unwrap_or_default();
+        assert_eq!(prompts.len(), 1, "{result}");
+        assert_eq!(prompts[0]["sessionID"], "ses_earlier_mini", "{result}");
+        assert!(written.contains("\"handed\""), "{written}");
+
+        // The later mini: the earlier one's root was created 2.9 s before its
+        // own server started.
+        let (result, written) = run_v2_mini_driver(
+            "",
+            r#"const started = performance.timeOrigin;
+sessions = [
+  { id: "ses_later_mini", time: { created: started + 100 }, location: { directory: "/work" } },
+  { id: "ses_earlier_mini", time: { created: started - 2900 }, location: { directory: "/work" } },
+];
+const cleanup = await pluginModule.setup(ctx);
+for (let n = 0; n < 200 && !prompts.length; n++) await sleep(20);
+await sleep(100);
+await cleanup();
+console.log(JSON.stringify({ prompts }));"#,
+        );
+        let prompts = result["prompts"].as_array().cloned().unwrap_or_default();
+        assert_eq!(prompts.len(), 1, "{result}");
+        assert_eq!(prompts[0]["sessionID"], "ses_later_mini", "{result}");
+        assert!(written.contains("\"handed\""), "{written}");
+    }
+
+    /// Scenario (PRD #2050, round-3 re-review F1): a later root session in the
+    /// directory appears only after this mini's lookup settled (another pane's
+    /// OpenCode, started a minute later). The lookup ran as mini started and
+    /// kept its answer, so the deck's message still starts in mini's own
+    /// session, and the listing is not asked again for the message.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opencode_v2_mini_keeps_the_session_it_found_at_start() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let (result, written) = run_v2_mini_driver_timed(
+            "",
+            r#"const started = performance.timeOrigin;
+sessions = [
+  { id: "ses_this_mini", time: { created: started + 100 }, location: { directory: "/work" } },
+];
+const cleanup = await pluginModule.setup(ctx);
+await sleep(2600);
+sessions = [{ id: "ses_newcomer", time: { created: Date.now() }, location: { directory: "/work" } }, ...sessions];
+const looks = lists.length;
+for (let n = 0; n < 200 && !prompts.length; n++) await sleep(20);
+await sleep(100);
+await cleanup();
+console.log(JSON.stringify({ prompts, looks, lists: lists.length }));"#,
+            Some("3.5"),
+        );
+        let prompts = result["prompts"].as_array().cloned().unwrap_or_default();
+        assert_eq!(prompts.len(), 1, "{result}");
+        assert_eq!(prompts[0]["sessionID"], "ses_this_mini", "{result}");
+        assert_eq!(
+            result["looks"], result["lists"],
+            "the answer found at start is kept: {result}"
+        );
+        assert!(written.contains("\"handed\""), "{written}");
+    }
+
+    /// Scenario (PRD #2050, inbox/opencode/016 on 2.2.5): the person has an
+    /// unsent draft on OpenCode 2's home screen when the deck hands over a
+    /// message. The TUI half stashes the draft with OpenCode's own
+    /// `prompt.stash`, opens a new session for the message, and once that
+    /// session's composer is reachable pops the draft into it, so the draft
+    /// survives as on 1.x. With no draft, nothing is stashed or popped.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_tui_carries_the_home_draft_into_the_new_session() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        for draft in ["DRAFT-KEEP-71b3", ""] {
+            let dir = tempfile::tempdir().unwrap();
+            let (recorder, controls) = inbox_recorder(dir.path());
+            let plugin = dir.path().join("tui.mjs");
+            std::fs::write(&plugin, tui_v2_template(&recorder.to_string_lossy())).unwrap();
+            let driver = dir.path().join("driver.mjs");
+            std::fs::write(
+                &driver,
+                format!(
+                    r#"const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const prompts = [];
+const navigations = [];
+const dispatched = [];
+const handlers = new Map();
+let route = {{ type: "home" }};
+// The composers: home's, then the new session's, which mounts a few looks
+// after navigating (measured: about 0.1 s), and OpenCode's stash.
+const composer = {{ home: {draft}, session: "" }};
+const stash = [];
+let looksSinceNavigate = 0;
+const mounted = () => route.type === "home" ? "home" : (++looksSinceNavigate > 3 ? "session" : undefined);
+const api = {{
+  data: {{
+    session: {{ get: (id) => ({{ id }}) }},
+    on: (type, fn) => {{ handlers.set(type, fn); return () => handlers.delete(type); }},
+  }},
+  keymap: {{
+    mode: {{ current: () => "base" }},
+    commands: () => {{
+      const where = mounted();
+      const list = [{{ id: "session.new" }}];
+      if (route.type === "session") list.push({{ id: "session.compact" }});
+      if (where) {{
+        list.push({{ id: "prompt.stash", enabled: !!composer[where] }});
+        list.push({{ id: "prompt.stash.pop", enabled: stash.length > 0 }});
+      }}
+      return list;
+    }},
+    dispatch: (id) => {{
+      dispatched.push(id);
+      const where = mounted();
+      if (!where) return;
+      if (id === "prompt.stash" && composer[where]) {{ stash.push(composer[where]); composer[where] = ""; }}
+      if (id === "prompt.stash.pop" && stash.length) composer[where] = stash.pop();
+    }},
+  }},
+  ui: {{ router: {{
+    current: () => route,
+    navigate: (to) => {{ navigations.push(to.sessionID); route = to; looksSinceNavigate = 0; }},
+  }} }},
+  client: {{ session: {{
+    create: async () => ({{ id: "fresh" }}),
+    prompt: async (input) => {{ prompts.push(input); return {{ id: "inbox-1", sessionID: input.sessionID, type: "user" }}; }},
+  }} }},
+}};
+const {{ default: mod }} = await import("{plugin}");
+const cleanup = await mod.setup(api);
+for (let n = 0; n < 150 && !prompts.length; n++) await sleep(20);
+await sleep(200);
+cleanup?.();
+console.log(JSON.stringify({{ prompts, navigations, dispatched, composer, stash }}));
+process.exit(0);
+"#,
+                    draft = serde_json::to_string(draft).unwrap(),
+                    plugin = plugin.display()
+                ),
+            )
+            .unwrap();
+            let result = run_inbox_driver(&driver);
+            assert_eq!(
+                result["navigations"],
+                serde_json::json!(["fresh"]),
+                "{result}"
+            );
+            let prompts = result["prompts"].as_array().cloned().unwrap_or_default();
+            assert_eq!(prompts.len(), 1, "{result}");
+            assert_eq!(prompts[0]["sessionID"], "fresh", "{result}");
+            assert_eq!(result["stash"], serde_json::json!([]), "{result}");
+            if draft.is_empty() {
+                assert_eq!(result["dispatched"], serde_json::json!([]), "{result}");
+            } else {
+                assert_eq!(
+                    result["dispatched"],
+                    serde_json::json!(["prompt.stash", "prompt.stash.pop"]),
+                    "{result}"
+                );
+                assert_eq!(result["composer"]["session"], draft, "{result}");
+            }
+            let written = std::fs::read_to_string(&controls).unwrap_or_default();
+            assert!(written.contains("\"handed\""), "{written}");
+        }
+    }
+
+    /// OpenCode 2.x's TUI half, driven with a fake 2.x TUI API: a message the
+    /// deck hands over while a subagent's session is on screen waits for the
+    /// open dialog to close, then starts in that session's root (shown
+    /// first) through `client.session.prompt`, and is committed when OpenCode
+    /// delivers the inbox item that call returned.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_tui_delivers_to_the_root_and_commits_on_delivery() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (recorder, controls) = inbox_recorder(dir.path());
+        let plugin = dir.path().join("tui.mjs");
+        std::fs::write(&plugin, tui_v2_template(&recorder.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                r#"const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const prompts = [];
+const navigations = [];
+const handlers = new Map();
+let mode = "dialog";
+let route = {{ type: "session", sessionID: "child" }};
+const sessions = {{ child: {{ id: "child", parentID: "rootA" }}, rootA: {{ id: "rootA" }} }};
+const api = {{
+  data: {{
+    session: {{ get: (id) => sessions[id] }},
+    on: (type, fn) => {{ handlers.set(type, fn); return () => handlers.delete(type); }},
+  }},
+  keymap: {{ mode: {{ current: () => mode }} }},
+  ui: {{ router: {{
+    current: () => route,
+    navigate: (to) => {{ navigations.push(to.sessionID); route = to; }},
+  }} }},
+  client: {{ session: {{
+    create: async () => ({{ id: "fresh" }}),
+    prompt: async (input) => {{ prompts.push(input); return {{ id: "inbox-1", sessionID: input.sessionID, type: "user" }}; }},
+  }} }},
+}};
+const {{ default: mod }} = await import("{plugin}");
+if (mod.id !== "dot-agent-deck-tui" || typeof mod.setup !== "function") process.exit(5);
+const cleanup = await mod.setup(api);
+await sleep(500);
+const heldByDialog = prompts.length === 0;
+mode = "base";
+for (let n = 0; n < 150 && !prompts.length; n++) await sleep(20);
+handlers.get("session.inbox.delivered")?.({{ type: "session.inbox.delivered", data: {{ sessionID: "rootA", inboxID: "inbox-1" }} }});
+await sleep(300);
+cleanup?.();
+console.log(JSON.stringify({{ heldByDialog, prompts, navigations }}));
+process.exit(0);
+"#,
+                plugin = plugin.display()
+            ),
+        )
+        .unwrap();
+        let result = run_inbox_driver(&driver);
+        assert_eq!(result["heldByDialog"], true, "{result}");
+        assert_eq!(
+            result["navigations"],
+            serde_json::json!(["rootA"]),
+            "{result}"
+        );
+        let prompts = result["prompts"].as_array().cloned().unwrap_or_default();
+        assert_eq!(prompts.len(), 1, "{result}");
+        assert_eq!(prompts[0]["sessionID"], "rootA");
+        assert!(
+            prompts[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("m-k3xzq2ab-0f3c9a71d2e4b850")
+        );
+        let written = std::fs::read_to_string(&controls).unwrap_or_default();
+        assert!(written.contains("\"handed\""), "{written}");
+        assert!(written.contains("\"committed\""), "{written}");
+    }
+
+    /// Scenario: OpenCode 2's TUI half, driven with a fake 2.x TUI context,
+    /// sees a question form created in a subagent's session. It hands the form
+    /// to `await-answer --ack` under the root session, replies with the deck's
+    /// answer through `data.session.form.reply`, and acknowledges OpenCode's
+    /// outcome to the child; a second form that OpenCode reports answered
+    /// before the deck does stops its child (PRD #2050, rule 20).
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_tui_holds_a_form_and_replies_with_the_decks_answer() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let awaits = dir.path().join("awaits.log");
+        let acks = dir.path().join("acks.log");
+        let recorder = dir.path().join("recorder.sh");
+        crate::test_isolation::write_script(
+            &recorder,
+            format!(
+                r#"#!/bin/sh
+echo "call $*" >> '{calls}'
+if [ "$1" = "await-answer" ]; then
+  IFS= read -r input
+  printf '%s\n' "$input" >> '{awaits}'
+  case "$input" in
+    *frm_1*)
+      printf '%s\n' '{{"kind":"form","request_id":"frm_1","body":{{"sessionID":"child","answer":{{"ok":true}}}}}}'
+      IFS= read -r ack
+      printf '%s\n' "$ack" >> '{acks}';;
+    *) exec sleep 37;;
+  esac
+  exit 0
+fi
+cat > /dev/null
+exit 0
+"#,
+                awaits = awaits.display(),
+                acks = acks.display(),
+                calls = dir.path().join("calls.log").display(),
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let plugin = dir.path().join("tui.mjs");
+        std::fs::write(&plugin, tui_v2_template(&recorder.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                r#"import {{ execSync }} from "child_process";
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const replies = [];
+const handlers = new Map();
+const api = {{
+  data: {{
+    session: {{
+      get: (id) => ({{ id }}),
+      root: (id) => (id === "child" ? "rootA" : id),
+      form: {{ reply: async (input) => {{ replies.push(input); }} }},
+    }},
+    on: (type, fn) => {{ handlers.set(type, fn); return () => handlers.delete(type); }},
+  }},
+  keymap: {{ mode: {{ current: () => "base" }} }},
+  ui: {{ router: {{ current: () => ({{ type: "home" }}), navigate: () => {{}} }} }},
+  client: {{ session: {{ create: async () => ({{ id: "x" }}), prompt: async () => ({{}}) }} }},
+}};
+const {{ default: mod }} = await import("{plugin}");
+const cleanup = await mod.setup(api);
+const emit = (type, data) => handlers.get(type)?.({{ type, data }});
+emit("form.created", {{ form: {{ id: "frm_1", sessionID: "child", title: "Go?", fields: [{{ key: "ok", type: "boolean" }}] }} }});
+for (let n = 0; n < 200 && !replies.length; n++) await sleep(20);
+emit("form.created", {{ form: {{ id: "frm_2", sessionID: "rootA", title: "Later", fields: [{{ key: "x", type: "string" }}] }} }});
+await sleep(400);
+emit("form.replied", {{ id: "frm_2", sessionID: "rootA", answer: {{ x: "typed" }} }});
+await sleep(400);
+const sleepers = execSync("ps -eo args").toString().split(String.fromCharCode(10)).filter((l) => l.includes("sleep 37")).length;
+cleanup?.();
+console.log(JSON.stringify({{ replies, sleepers }}));
+process.exit(0);
+"#,
+                plugin = plugin.display()
+            ),
+        )
+        .unwrap();
+        let result = run_inbox_driver(&driver);
+        assert_eq!(
+            result["replies"],
+            serde_json::json!([{"sessionID": "child", "formID": "frm_1", "answer": {"ok": true}}]),
+            "{result}; recorder calls: {:?}",
+            std::fs::read_to_string(dir.path().join("calls.log")),
+        );
+        let awaited: Vec<serde_json::Value> = std::fs::read_to_string(&awaits)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(awaited.len(), 2, "{awaited:?}");
+        assert_eq!(awaited[0]["event"], "question.asked");
+        assert_eq!(awaited[0]["session_id"], "rootA", "filed under the root");
+        assert_eq!(
+            awaited[0]["subagent_id"], "child",
+            "a child session's form is its subagent's, so answering it releases that subagent's wait"
+        );
+        assert!(
+            awaited[1].get("subagent_id").is_none(),
+            "the root's own form is no subagent's: {}",
+            awaited[1]
+        );
+        // What the deck makes of the held payload: the subagent's ask, which
+        // the answer releases (state::release_subagent_wait).
+        let (asked_event, question) = crate::hook::build_opencode_event_with_question(
+            serde_json::from_value(awaited[0].clone()).unwrap(),
+        )
+        .expect("an event");
+        assert!(asked_event.is_from_subagent(), "the form is the subagent's");
+        assert_eq!(
+            question.expect("a held form").subagent_id.as_deref(),
+            Some("child")
+        );
+        assert_eq!(awaited[0]["properties"]["id"], "frm_1");
+        assert_eq!(awaited[0]["properties"]["sessionID"], "child");
+        assert_eq!(
+            awaited[0]["properties"]["form"]["fields"][0]["type"],
+            "boolean"
+        );
+        let acked = std::fs::read_to_string(&acks).unwrap_or_default();
+        assert!(acked.contains("\"delivered\":true"), "{acked}");
+        assert_eq!(
+            result["sleepers"], 0,
+            "the answered form's child was stopped: {result}"
+        );
+    }
+
+    /// Scenario (review of PR #2060): OpenCode 2's TUI half holds a form
+    /// whose number field the user answered with words. `await-answer`
+    /// hands the plugin a refusal instead of a reply; the plugin sends
+    /// OpenCode nothing, acknowledges the answer as not taken with the
+    /// refusal's reason, and holds the form again, so it is pending on the
+    /// deck once more and can be answered anew.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_tui_holds_a_form_again_when_its_answer_is_refused() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let awaits = dir.path().join("awaits.log");
+        let acks = dir.path().join("acks.log");
+        let recorder = dir.path().join("recorder.sh");
+        crate::test_isolation::write_script(
+            &recorder,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "await-answer" ]; then
+  IFS= read -r input
+  printf '%s\n' "$input" >> '{awaits}'
+  if [ ! -e '{awaits}.refused' ]; then
+    : > '{awaits}.refused'
+    printf '%s\n' '{{"kind":"refused","detail":"the answer could not be turned into OpenCode'"'"'s reply"}}'
+    IFS= read -r ack
+    printf '%s\n' "$ack" >> '{acks}'
+    exit 0
+  fi
+  exec sleep 41
+fi
+cat > /dev/null
+exit 0
+"#,
+                awaits = awaits.display(),
+                acks = acks.display(),
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let plugin = dir.path().join("tui.mjs");
+        std::fs::write(&plugin, tui_v2_template(&recorder.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                r#"import {{ readFileSync }} from "fs";
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const replies = [];
+const handlers = new Map();
+const api = {{
+  data: {{
+    session: {{
+      get: (id) => ({{ id }}),
+      root: (id) => id,
+      form: {{ reply: async (input) => {{ replies.push(input); }} }},
+    }},
+    on: (type, fn) => {{ handlers.set(type, fn); return () => handlers.delete(type); }},
+  }},
+  keymap: {{ mode: {{ current: () => "base" }} }},
+  ui: {{ router: {{ current: () => ({{ type: "home" }}), navigate: () => {{}} }} }},
+  client: {{ session: {{ create: async () => ({{ id: "x" }}), prompt: async () => ({{}}) }} }},
+}};
+const {{ default: mod }} = await import("{plugin}");
+const cleanup = await mod.setup(api);
+const emit = (type, data) => handlers.get(type)?.({{ type, data }});
+emit("form.created", {{ form: {{ id: "frm_n", sessionID: "s1", title: "How many?", fields: [{{ key: "n", type: "number" }}] }} }});
+const held = () => {{ try {{ return readFileSync("{awaits}", "utf8").trim().split(String.fromCharCode(10)).length; }} catch (_) {{ return 0; }} }};
+for (let n = 0; n < 250 && held() < 2; n++) await sleep(20);
+cleanup?.();
+console.log(JSON.stringify({{ replies, held: held() }}));
+process.exit(0);
+"#,
+                plugin = plugin.display(),
+                awaits = awaits.display(),
+            ),
+        )
+        .unwrap();
+        let result = run_inbox_driver(&driver);
+        assert_eq!(
+            result["replies"],
+            serde_json::json!([]),
+            "nothing is sent to OpenCode: {result}"
+        );
+        assert_eq!(result["held"], 2, "the form is held again: {result}");
+        let acked = std::fs::read_to_string(&acks).unwrap_or_default();
+        let ack: crate::question::ReplyAck =
+            serde_json::from_str(acked.trim()).unwrap_or_else(|e| panic!("{e}: {acked:?}"));
+        assert_eq!(
+            ack,
+            crate::question::ReplyAck {
+                delivered: false,
+                detail: Some("the answer could not be turned into OpenCode's reply".into()),
+            }
+        );
+    }
+
+    /// Scenario (audit I2): a model creates twenty question forms at once in
+    /// OpenCode 2's full TUI. The TUI half holds at most sixteen through
+    /// `await-answer` children and reports the rest plainly, so the card still
+    /// lists them as answered in OpenCode; unloading stops every child.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_tui_caps_the_forms_it_holds_at_once() {
+        if !node_available() {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let calls = dir.path().join("calls.log");
+        let recorder = dir.path().join("recorder.sh");
+        crate::test_isolation::write_script(
+            &recorder,
+            format!(
+                "#!/bin/sh\necho \"$1\" >> '{calls}'\nif [ \"$1\" = \"await-answer\" ]; then\n  IFS= read -r input\n  exec sleep 39\nfi\ncat > /dev/null\nexit 0\n",
+                calls = calls.display(),
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let plugin = dir.path().join("tui.mjs");
+        std::fs::write(&plugin, tui_v2_template(&recorder.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                r#"import {{ execSync }} from "child_process";
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const handlers = new Map();
+const api = {{
+  data: {{
+    session: {{ get: (id) => ({{ id }}), root: (id) => id, form: {{ reply: async () => {{}} }} }},
+    on: (type, fn) => {{ handlers.set(type, fn); return () => handlers.delete(type); }},
+  }},
+  keymap: {{ mode: {{ current: () => "base" }} }},
+  ui: {{ router: {{ current: () => ({{ type: "home" }}), navigate: () => {{}} }} }},
+  client: {{ session: {{ create: async () => ({{ id: "x" }}), prompt: async () => ({{}}) }} }},
+}};
+const {{ default: mod }} = await import("{plugin}");
+const cleanup = await mod.setup(api);
+for (let n = 1; n <= 20; n++) {{
+  handlers.get("form.created")?.({{ type: "form.created", data: {{ form: {{ id: "frm_" + n, sessionID: "s1", title: "Q" + n, fields: [{{ key: "ok", type: "boolean" }}] }} }} }});
+}}
+await sleep(1500);
+const count = () => execSync("ps -eo args").toString().split(String.fromCharCode(10)).filter((l) => l.includes("sleep 39")).length;
+const held = count();
+cleanup?.();
+await sleep(500);
+console.log(JSON.stringify({{ held, after: count() }}));
+process.exit(0);
+"#,
+                plugin = plugin.display()
+            ),
+        )
+        .unwrap();
+        let result = run_inbox_driver(&driver);
+        let logged = std::fs::read_to_string(&calls).unwrap_or_default();
+        let awaits = logged.lines().filter(|l| *l == "await-answer").count();
+        let plain = logged.lines().filter(|l| *l == "hook").count();
+        assert_eq!(awaits, 16, "{logged}");
+        assert_eq!(plain, 4, "{logged}");
+        assert_eq!(result["held"], 16, "{result}");
+        assert_eq!(result["after"], 0, "{result}");
+    }
+
+    /// Scenario: in the full TUI the server plugin leaves a new form to the
+    /// TUI half (which holds it), and still reports the form's reply and
+    /// cancellation so the card clears (PRD #2050). Under `opencode mini` it
+    /// reports it itself (`opencode_v2_setup_reports_blocked_prompts_and_forms`).
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_server_leaves_a_new_form_to_the_tui_half_in_the_full_tui() {
+        let Some((payloads, awaits)) = run_v2_driver_as(
+            "",
+            r#"await sleep(50);
+await emit("session.created", { sessionID: "s1", location: { directory: "/work" }, slug: "a", version: "2.2.5" });
+await emit("form.created", { form: { id: "form-1", sessionID: "s1", title: "Which branch?", fields: [] } });
+await emit("form.replied", { id: "form-1", sessionID: "s1", answer: {} });
+await sleep(200);"#,
+        ) else {
+            return;
+        };
+        assert!(awaits.is_empty(), "{awaits:?}");
+        let events: Vec<_> = payloads
+            .iter()
+            .map(|p| p["event"].as_str().unwrap_or(""))
+            .collect();
+        assert!(!events.contains(&"question.asked"), "{payloads:#?}");
+        assert!(events.contains(&"question.replied"), "{payloads:#?}");
+    }
+
+    /// The event stream real OpenCode 2.2.5 sends (measured with `opencode
+    /// run --standalone`): no `session.created`, no `session.status`, no
+    /// `session.idle`; a turn is `session.execution.started` … `succeeded`.
+    /// The deck still gets the session, the prompt, working, and the turn's
+    /// end with its reply; and a subagent's session, known only by asking
+    /// `session.get`, is reported as the subagent's, its prompt not as the
+    /// user's.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_v2_setup_reads_turns_from_execution_events() {
+        let Some((payloads, _)) = run_v2_driver(
+            r#"parents.c9 = "s1";
+await sleep(50);
+await hooks.session.prompt({ sessionID: "s1", messageID: "msg-1", prompt: { text: "Reply with exactly PONG." }, delivery: "steer" });
+await emit("session.inbox.enqueued", { sessionID: "s1", inboxID: "msg-1", item: { type: "user", payload: { text: "Reply with exactly PONG." }, delivery: "steer" } });
+await emit("session.execution.started", { sessionID: "s1" });
+await emit("session.inbox.delivered", { sessionID: "s1", inboxID: "msg-1" });
+await hooks.session.prompt({ sessionID: "c9", messageID: "msg-2", prompt: { text: "explore the repo" }, delivery: "steer" });
+await emit("session.execution.started", { sessionID: "c9" });
+await emit("session.execution.succeeded", { sessionID: "c9" });
+await emit("session.step.started", { sessionID: "s1", assistantMessageID: "a1", agent: "build", model: { id: "big-pickle", providerID: "opencode" }, started: 1 });
+await emit("session.text.ended", { sessionID: "s1", assistantMessageID: "a1", ordinal: 0, text: "PONG" });
+await emit("session.step.ended", { sessionID: "s1", assistantMessageID: "a1", finish: "stop", cost: 0, tokens: { input: 82, output: 3, reasoning: 0, cache: { read: 5914, write: 0 } } });
+await emit("session.execution.succeeded", { sessionID: "s1" });
+await emit("session.idle", { sessionID: "s1" });
+await emit("location.shutdown", {});"#,
+        ) else {
+            return;
+        };
+        let events: Vec<(String, String)> = payloads
+            .iter()
+            .map(|p| {
+                (
+                    p["event"].as_str().unwrap_or("").to_string(),
+                    p["status"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(payloads[0]["event"], "session.created", "{events:?}");
+        let prompts: Vec<_> = payloads
+            .iter()
+            .filter(|p| p["event"] == "session.prompt")
+            .collect();
+        assert_eq!(
+            prompts.len(),
+            1,
+            "the subagent's prompt is not the user's: {events:?}"
+        );
+        assert_eq!(prompts[0]["prompt"], "Reply with exactly PONG.");
+        let start = payloads
+            .iter()
+            .find(|p| p["event"] == "subagent.start")
+            .expect("subagent start");
+        assert_eq!(
+            (&start["session_id"], &start["subagent_id"]),
+            (&"s1".into(), &"c9".into())
+        );
+        assert!(
+            payloads
+                .iter()
+                .any(|p| p["event"] == "subagent.stop" && p["subagent_id"] == "c9")
+        );
+        let idles: Vec<_> = payloads
+            .iter()
+            .filter(|p| {
+                p["session_id"] == "s1" && (p["status"] == "idle" || p["event"] == "session.idle")
+            })
+            .collect();
+        assert_eq!(
+            idles[0]["reply"], "PONG",
+            "the turn's end carries its reply: {events:?}"
+        );
+        assert!(
+            idles.iter().skip(1).all(|p| p.get("reply").is_none()),
+            "the reply is sent once: {events:?}"
+        );
+        assert!(
+            payloads.iter().any(|p| p["event"] == "session.status"
+                && p["status"] == "busy"
+                && p["session_id"] == "s1"),
+            "{events:?}"
+        );
+        assert_eq!(
+            events.last().map(|e| e.0.as_str()),
+            Some("session.deleted"),
+            "{events:?}"
         );
     }
 }

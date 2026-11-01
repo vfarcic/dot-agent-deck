@@ -183,6 +183,62 @@ fn launched_program(
     })
 }
 
+/// The program a script line runs, as the shell reads it: the first word after
+/// any leading `NAME=value` environment assignments, whose value may be quoted,
+/// spaces and all. PRD #2050's OpenCode 2 scripts set their model inline,
+/// `OPENCODE_CONFIG_CONTENT='{…}' opencode --standalone`, and the program there
+/// is `opencode`.
+fn program_word(line: &str) -> Option<&str> {
+    let mut rest = line.trim_start();
+    loop {
+        let end = shell_word_end(rest);
+        let word = &rest[..end];
+        if word.is_empty() {
+            return None;
+        }
+        let assignment = word.split_once('=').is_some_and(|(name, _)| {
+            name.starts_with(|c: char| c == '_' || c.is_ascii_alphabetic())
+                && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+        });
+        if !assignment {
+            return Some(word);
+        }
+        rest = rest[end..].trim_start();
+    }
+}
+
+/// Where the shell word that starts `text` ends: the first unquoted whitespace.
+fn shell_word_end(text: &str) -> usize {
+    let mut quote = None;
+    for (at, c) in text.char_indices() {
+        match quote {
+            Some(open) if c == open => quote = None,
+            Some(_) => {}
+            None if c == '\'' || c == '"' => quote = Some(c),
+            None if c.is_whitespace() => return at,
+            None => {}
+        }
+    }
+    text.len()
+}
+
+/// The program word skips leading environment assignments, quoted values with
+/// spaces included, and is the first word of a line that has none.
+#[test]
+fn program_word_skips_leading_environment_assignments() {
+    assert_eq!(program_word("claude --model x"), Some("claude"));
+    assert_eq!(
+        program_word(r#"OPENCODE_CONFIG_CONTENT='{"model":"a/b"}' opencode --standalone"#),
+        Some("opencode")
+    );
+    assert_eq!(
+        program_word(r#"A=1 B="two words" codex exec"#),
+        Some("codex")
+    );
+    assert_eq!(program_word("./run=me --flag"), Some("./run=me"));
+    assert_eq!(program_word("   "), None);
+}
+
 /// Every role command resolves to a devbox script that exists.
 #[test]
 fn every_role_command_names_a_devbox_script_that_exists() {
@@ -220,7 +276,7 @@ fn each_single_provider_variant_launches_only_that_provider() {
                 )
             });
             assert!(
-                launched.split_whitespace().next() == Some(program),
+                program_word(&launched) == Some(program),
                 "'{variant}' role '{}' runs `{}` -> `{launched}`, which is not {program}. A \
                  single-provider orchestration with one foreign role is worse than no variant at \
                  all: it fails partway through a run, on the credential the contributor picked \
@@ -298,7 +354,7 @@ fn mixed_actually_spans_more_than_one_launcher() {
         .roles
         .iter()
         .filter_map(|r| launched_program(&scripts, &r.command))
-        .filter_map(|p| p.split_whitespace().next().map(str::to_string))
+        .filter_map(|p| program_word(&p).map(str::to_string))
         .collect();
     assert!(
         programs.len() > 1,

@@ -18,7 +18,7 @@
 #   4. PATH (and, with --use-vals, USE_VALS; with --relay, OTEL_EXPORTER_OTLP_ENDPOINT)
 #      for non-interactive shells and systemd --user,
 #      so the deck daemon finds every agent and every agent inherits the same environment
-#   5. agents (claude, opencode, codex, pi, devin), sem, dot-agent-deck, `hooks install`
+#   5. agents (claude, opencode 2.x, codex, pi, devin; a pinned opencode 1.x off PATH for tests), sem, dot-agent-deck, `hooks install`
 #   6. the optional repo
 #   7. which agents still need logging in
 #
@@ -305,7 +305,77 @@ eval "$(awk -v po="$PATH_OPEN" -v pc="$PATH_CLOSE" '$0 == po { on = 1 } on { pri
 
 step "agents"
 [ -x "$HOME/.local/bin/claude" ]    || curl -fsSL https://claude.ai/install.sh | bash
-[ -x "$HOME/.opencode/bin/opencode" ] || curl -fsSL https://opencode.ai/install | bash
+# OpenCode 2.x on PATH (PRD #2050): this repo's agents run OpenCode 2.
+# Installed from npm, pinned to the release the deck's OpenCode 2 support was
+# measured on, so npm checks each tarball against the registry's integrity
+# hash (no unverified `curl | bash`). `@opencode/cli`'s postinstall puts the
+# platform binary from its pinned optional dependency in place and runs it
+# `--version`. It goes under its own prefix, and ~/.opencode/bin/opencode —
+# already on PATH — becomes a link to it. 2.x prints `opencode v2.2.5`, 1.x
+# prints `1.19.5`. The link is made only when there is no binary there, the
+# one there positively reports 1.x, or it is already this link: a 2.x
+# installed some other way is left alone, and a binary that answers nothing
+# readable is reported, not replaced, since a broken 2.x cannot be told from
+# anything else that way.
+OPENCODE_2_VERSION=2.2.5
+OPENCODE_2_DIR="$HOME/.local/share/dot-agent-deck/opencode-2"
+OPENCODE_2_BIN="$OPENCODE_2_DIR/node_modules/.bin/opencode"
+OC_BIN="$HOME/.opencode/bin/opencode"
+oc_major() { "$OC_BIN" --version 2>/dev/null | head -n1 | sed 's/^opencode //; s/^v//; s/\..*//'; }
+oc2_version() { "$OPENCODE_2_BIN" --version 2>/dev/null | head -n1 | sed 's/^opencode //; s/^v//'; }
+install_opencode_2() {
+  if [ "$(oc2_version)" != "$OPENCODE_2_VERSION" ]; then
+    mkdir -p "$OPENCODE_2_DIR"
+    npm install --prefix "$OPENCODE_2_DIR" --no-fund --no-audit --no-save "@opencode/cli@$OPENCODE_2_VERSION"
+    # As for 1.x below: an npm that holds install scripts back leaves the
+    # package's placeholder; the user's `ignore-scripts` policy is honoured
+    # and reported, not overridden.
+    if [ "$(oc2_version)" != "$OPENCODE_2_VERSION" ]; then
+      if [ "$(npm config get ignore-scripts 2>/dev/null)" = true ]; then
+        echo "  warning: npm's ignore-scripts is set, so @opencode/cli's postinstall did not run; to finish the OpenCode $OPENCODE_2_VERSION install, run it yourself: (cd $OPENCODE_2_DIR/node_modules/@opencode/cli && node ./postinstall.mjs)"
+      else
+        (cd "$OPENCODE_2_DIR/node_modules/@opencode/cli" && node ./postinstall.mjs)
+      fi
+    fi
+  fi
+  if [ "$(oc2_version)" = "$OPENCODE_2_VERSION" ]; then
+    mkdir -p "$(dirname "$OC_BIN")"
+    ln -sfn "$OPENCODE_2_BIN" "$OC_BIN"
+  else
+    echo "  warning: $OPENCODE_2_BIN is not OpenCode $OPENCODE_2_VERSION; $OC_BIN left as it is"
+  fi
+}
+if [ ! -e "$OC_BIN" ] || [ "$(readlink "$OC_BIN" 2>/dev/null)" = "$OPENCODE_2_BIN" ] \
+   || [ "$(oc_major)" = 0 ] || [ "$(oc_major)" = 1 ]; then
+  install_opencode_2
+elif ! [ "$(oc_major)" -ge 2 ] 2>/dev/null; then
+  echo "  warning: $OC_BIN does not report a version; left as it is (to replace it with OpenCode $OPENCODE_2_VERSION, remove it and run this script again)"
+fi
+# OpenCode 1.x, pinned and kept OFF PATH, for the lane-2 tests that keep the
+# deck's OpenCode 1 support verifiable (PRD #2050). The binary they run is
+#   ~/.local/share/dot-agent-deck/opencode-1/bin/opencode
+# (select it with DOT_AGENT_DECK_OPENCODE_TEST_BIN): a stable link into npm's
+# layout under that prefix, which no PATH includes.
+OPENCODE_1_VERSION=1.19.5
+OPENCODE_1_DIR="$HOME/.local/share/dot-agent-deck/opencode-1"
+oc1_version() { "$OPENCODE_1_DIR/bin/opencode" --version 2>/dev/null | head -n1; }
+if [ "$(oc1_version)" != "$OPENCODE_1_VERSION" ]; then
+  mkdir -p "$OPENCODE_1_DIR/bin"
+  npm install --prefix "$OPENCODE_1_DIR" --no-fund --no-audit --no-save "opencode-ai@$OPENCODE_1_VERSION"
+  ln -sfn ../node_modules/.bin/opencode "$OPENCODE_1_DIR/bin/opencode"
+  # The package's postinstall puts the platform binary in place. An npm that
+  # holds install scripts back leaves its placeholder; when that is the
+  # user's `ignore-scripts` policy it is honoured and reported, not overridden.
+  if [ "$(oc1_version)" != "$OPENCODE_1_VERSION" ]; then
+    if [ "$(npm config get ignore-scripts 2>/dev/null)" = true ]; then
+      echo "  warning: npm's ignore-scripts is set, so opencode-ai's postinstall did not run; to finish the OpenCode $OPENCODE_1_VERSION install, run it yourself: (cd $OPENCODE_1_DIR/node_modules/opencode-ai && node ./postinstall.mjs)"
+    else
+      (cd "$OPENCODE_1_DIR/node_modules/opencode-ai" && node ./postinstall.mjs)
+    fi
+  fi
+  [ "$(oc1_version)" = "$OPENCODE_1_VERSION" ] ||
+    echo "  warning: $OPENCODE_1_DIR/bin/opencode is not OpenCode $OPENCODE_1_VERSION; the OpenCode 1.x lane-2 tests will skip"
+fi
 npm_missing=()
 have codex || npm_missing+=(@openai/codex)
 have pi    || npm_missing+=(@earendil-works/pi-coding-agent)

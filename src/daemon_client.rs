@@ -3545,7 +3545,9 @@ impl DaemonClient {
     /// [`crate::daemon_protocol::CAP_ADDRESSED_MESSAGE`] is a HARD error
     /// ([`CloseAgentsError::TooOld`])**, with nothing sent. An agent told its
     /// message went nowhere can say so; one told nothing would believe it
-    /// arrived.
+    /// arrived. An address that names one agent (issue #2053) also needs
+    /// [`crate::daemon_protocol::CAP_ADDRESSED_MESSAGE_AGENT`]: a daemon
+    /// without it would drop the `name` / `pane` and resolve the rest.
     pub async fn addressed_message(
         &self,
         address: crate::orchestrator_address::MessageAddress,
@@ -3577,6 +3579,8 @@ impl DaemonClient {
         let capabilities = DaemonCapabilities::from_hello(&hello);
         if !capabilities.supports(crate::daemon_protocol::CAP_ADDRESSED_MESSAGE)
             || !capabilities.supports(crate::daemon_protocol::CAP_HELLO_FOLLOW_ON)
+            || (address.names_an_agent()
+                && !capabilities.supports(crate::daemon_protocol::CAP_ADDRESSED_MESSAGE_AGENT))
         {
             return Err(CloseAgentsError::TooOld {
                 daemon_version: hello.daemon_version.or(hello.build_version),
@@ -5860,13 +5864,58 @@ mod tests {
                 Some(&[crate::daemon_protocol::CAP_CLOSE_AGENTS][..]),
                 Some(&[crate::daemon_protocol::CAP_ADDRESSED_MESSAGE][..]),
             ] {
-                addressed_message_withheld_inner(advertised).await;
+                addressed_message_withheld_inner(advertised, folder_address()).await;
             }
         });
     }
 
     #[cfg(unix)]
-    async fn addressed_message_withheld_inner(advertised: Option<&'static [&'static str]>) {
+    fn folder_address() -> crate::orchestrator_address::MessageAddress {
+        crate::orchestrator_address::MessageAddress {
+            folder: Some("/w".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Issue #2053 — an address naming one agent (`--name` / `--pane`) goes
+    /// only to a daemon that advertises `addressed-message-agent`: one that
+    /// offers `addressed-message` alone would drop the field and resolve the
+    /// folder without it, so it is the same hard error, with nothing sent.
+    #[cfg(unix)]
+    #[test]
+    fn an_address_naming_one_agent_is_withheld_from_a_daemon_without_the_field() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build older-daemon runtime");
+        runtime.block_on(async {
+            let advertised = Some(
+                &[
+                    crate::daemon_protocol::CAP_ADDRESSED_MESSAGE,
+                    crate::daemon_protocol::CAP_HELLO_FOLLOW_ON,
+                ][..],
+            );
+            for address in [
+                crate::orchestrator_address::MessageAddress {
+                    name: Some("dispatcher".to_string()),
+                    ..folder_address()
+                },
+                crate::orchestrator_address::MessageAddress {
+                    pane: Some("p-1".to_string()),
+                    ..Default::default()
+                },
+            ] {
+                addressed_message_withheld_inner(advertised, address).await;
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    async fn addressed_message_withheld_inner(
+        advertised: Option<&'static [&'static str]>,
+        address: crate::orchestrator_address::MessageAddress,
+    ) {
         let (dir, path, listener) = {
             let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
             let dir = tempfile::tempdir().unwrap();
@@ -5923,10 +5972,7 @@ mod tests {
         let client = DaemonClient::new(path);
         let err = client
             .addressed_message(
-                crate::orchestrator_address::MessageAddress {
-                    folder: Some("/w".to_string()),
-                    orchestration: None,
-                },
+                address,
                 crate::daemon_protocol::CallerClaim {
                     pane_id: "p".to_string(),
                     token: "t".to_string(),

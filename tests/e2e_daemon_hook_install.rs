@@ -79,7 +79,8 @@ fn bundled_sidecar(root: &Path) -> PathBuf {
 /// that binary as `daemon serve` by absolute path — exactly how the packaged
 /// desktop starts its sidecar, with no TUI involved. Once the daemon binds its
 /// attach socket, `~/.claude/settings.json` must carry deck hook commands and
-/// the OpenCode plugin must exist, and both must name the sidecar itself.
+/// the OpenCode plugin must exist in the XDG root (`~/.config/opencode/`, which
+/// the daemon creates) and not in `~/.opencode/`, and both must name the sidecar.
 #[spec("hooks/install/009")]
 #[test]
 fn install_009_a_headless_daemon_installs_claude_hooks_and_the_opencode_plugin() {
@@ -120,12 +121,20 @@ fn install_009_a_headless_daemon_installs_claude_hooks_and_the_opencode_plugin()
     let bound = common::wait_until(Duration::from_secs(15), || attach_socket.exists());
 
     let settings = home.join(".claude").join("settings.json");
+    // With only `~/.opencode` present the daemon creates the XDG root and puts
+    // the module there in one step, leaving nothing in the legacy root.
     let plugin = home
-        .join(".opencode")
+        .join(".config")
+        .join("opencode")
         .join("plugin")
         .join("dot-agent-deck.js");
     let settings_body = std::fs::read_to_string(&settings);
     let plugin_body = std::fs::read_to_string(&plugin);
+    let legacy_plugin = home
+        .join(".opencode")
+        .join("plugin")
+        .join("dot-agent-deck.js");
+    let legacy_written = legacy_plugin.exists();
 
     // Teardown by this daemon's own pid before asserting, so a failed assertion
     // cannot leak it (CLAUDE.md rule 12's teardown bullet).
@@ -198,5 +207,11 @@ fn install_009_a_headless_daemon_installs_claude_hooks_and_the_opencode_plugin()
     assert!(
         plugin_body.contains(&expected),
         "the OpenCode plugin does not pin the sidecar (`{expected}`):\n{plugin_body}"
+    );
+    assert!(
+        !legacy_written,
+        "the OpenCode plugin was also written to the legacy root at {}; with only `~/.opencode` \
+         present it belongs in the XDG root alone.\nlog:\n{log}",
+        legacy_plugin.display()
     );
 }

@@ -186,7 +186,7 @@ The deck learns each agent's status (Thinking, Working, Needs Input, and so on) 
 | Agent | Installed when | What is written |
 |---|---|---|
 | Claude Code | `~/.claude` exists | Hook entries in `~/.claude/settings.json`. The `StopFailure` hook (used for **Error** and **Blocked**) and the `PostToolUseFailure` hook (which tells the deck that a tool call that failed has ended) only when `claude --version` reports 2.1.78 or newer. |
-| OpenCode | `$XDG_CONFIG_HOME/opencode` (default `~/.config/opencode`) or `~/.opencode` exists; checked again every time the deck starts an OpenCode agent | The plugin file `plugin/dot-agent-deck.js` under that directory. |
+| OpenCode | `$XDG_CONFIG_HOME/opencode` (default `~/.config/opencode`, also when `XDG_CONFIG_HOME` is empty or not an absolute path), `~/.opencode` or `$OPENCODE_CONFIG_DIR` exists; and every time the deck starts an OpenCode agent, even on a machine where OpenCode has never run | The plugin file `plugin/dot-agent-deck.js` in `$XDG_CONFIG_HOME/opencode`, which the deck creates if it is missing, and in `$OPENCODE_CONFIG_DIR` when that exists; `dot-agent-deck-tui.js` and `plugins/dot-agent-deck-tui/` for OpenCode's interface. See [OpenCode 1.x and 2.x](#opencode-1x-and-2x). |
 | Codex | `codex` is on the daemon's `PATH` | Hooks in `$CODEX_HOME/hooks.json` (default `~/.codex`), and trust for those hooks. |
 | Devin | `devin` is on the daemon's `PATH` | Hook entries in `$XDG_CONFIG_HOME/devin/config.json` (default `~/.config/devin/config.json`). |
 | Pi | Every time the deck starts a Pi pane | A bundled extension; nothing to install. |
@@ -236,6 +236,34 @@ A copy so old that it does not report its version is named as one that "predates
 If you open the desktop app on macOS straight from its disk image, or before moving it out of Downloads (macOS then runs it from a temporary location), and no other copy of `dot-agent-deck` is installed in `~/.local/bin` or on your `PATH`, it installs no hooks, and both clients say `Agent hooks are off` with `Move Agent Deck to /Applications and reopen it to turn agent hooks on.` Do that, and the hooks are installed when the app starts again.
 
 Pi is not affected: its extension always runs the copy that started the pane.
+
+### OpenCode 1.x and 2.x
+
+The deck works with OpenCode 1.18.29 and later 1.x releases, and with OpenCode 2. An OpenCode 2 agent gets the same card, deck messages and delegated tasks as an OpenCode 1.x agent, in the TUI and the desktop app, except for the differences in this section.
+
+**You do not tell the deck which version you run.** The deck sets its plugin up so that OpenCode 1.x and OpenCode 2 both load it: in `$XDG_CONFIG_HOME/opencode` (default `~/.config/opencode`), and in `$OPENCODE_CONFIG_DIR` when you set it, removing the deck's own older copy from `~/.opencode`, which OpenCode 2 would otherwise refuse as a duplicate plugin. So upgrading OpenCode from 1.x to 2, going back, or running both on one machine needs nothing from you; restart OpenCode agents that were already running when you upgraded. Before it starts an OpenCode agent, the deck also asks the OpenCode that the agent's command runs for its version, to start OpenCode 2 the way it needs and to tell you about a version it does not support.
+
+**OpenCode older than 1.18.29 is not supported.** When the deck knows the version the agent runs, the agent's card says so, for example `Upgrade OpenCode to 1.18.29 or later, then restart: version 1.18.28 is too old for the deck`. [Troubleshooting](troubleshooting.md#an-opencode-card-says-to-add---standalone-to-install-the-plugin-or-to-upgrade) says when the deck knows it for an agent started through a wrapper.
+
+**OpenCode 2 has to run with its own server in each pane.** By default OpenCode 2 connects every `opencode` you start to one shared background service, and in that service the deck cannot tell one pane's agent from another's. Its `--standalone` flag gives each OpenCode its own server instead.
+
+- When the agent's command runs `opencode` directly, for example `opencode`, `opencode mini`, `opencode --continue`, `/usr/local/bin/opencode` or `./opencode` (found from the agent's working directory), the deck adds `--standalone` for you when it finds OpenCode 2. It adds the flag only as it starts the agent: the command you configured stays as you wrote it. A command that already says `--standalone` or `--server` is left alone.
+- When the command starts OpenCode through a wrapper, such as a script, an alias or `devbox run oc`, the deck cannot add the flag. Add `--standalone` to the `opencode` command inside the wrapper, or run `opencode service set disabled true` once, which makes every OpenCode 2 on the machine run with its own server. Also declare the agent, `agent = "opencode"`, on the role ([Declaring the agent behind a launcher command](orchestration.md#declaring-the-agent-behind-a-launcher-command)), so the deck knows the pane runs OpenCode and can warn you on its card when something is wrong.
+
+If an OpenCode 2 agent runs on the shared service anyway, its card says `Add --standalone to the command or run opencode service set disabled true, then restart: OpenCode 2's shared service hides this agent` when the deck knows the agent runs OpenCode 2; when it does not, the card's not-reporting notice names `--standalone` as the first fix. [An OpenCode card says to add --standalone, to install the plugin, or to upgrade](troubleshooting.md#an-opencode-card-says-to-add---standalone-to-install-the-plugin-or-to-upgrade) lists each OpenCode card message and what to do.
+
+**Choosing the model on OpenCode 2.** OpenCode 2's full interface (`opencode`) refuses the `--model` flag, so a command such as `opencode --model gpt-4o` written for OpenCode 1.x does not start on OpenCode 2. Set the model in OpenCode's configuration instead, or start `opencode mini --model <provider/model>`.
+
+**Questions and forms.** When OpenCode 2 asks you something with a form, its card shows **Needs Input** in both clients. In OpenCode's full interface (`opencode`), the deck knows the form's questions and options, so in the desktop app you can [answer it by voice](desktop/voice.md#answering-an-agents-question), as you can on OpenCode 1.x; in the TUI, which has no voice control, you answer it in the pane. These forms are answered in OpenCode's pane in both clients:
+
+- every form in `opencode mini`: the card shows `answer this form in OpenCode: <the form's title>`;
+- a form with a question that appears only after another one is answered, a hidden field, or a field OpenCode fills in from elsewhere.
+
+**Deck messages in `opencode mini`.** A deck message or delegated task reaches OpenCode 2's `mini` and leaves what you were typing in place. An `opencode mini` agent may not receive deck messages when another OpenCode session starts in the same directory while that mini is starting, for example a second `opencode mini` started at the same moment, or your own `opencode` or `opencode run` there: the deck cannot tell the two sessions apart, so it delivers to neither, and shows those messages as not delivered. Start `opencode mini` agents a few seconds apart from each other and from other OpenCode sessions in that directory, give each its own directory, or start each with `--session <id>`. By default, OpenCode 2's `mini` does not show the commands the agent runs or their output, so a delegated task's work can look shorter in the pane than it was; that is OpenCode's own display setting, not the deck's.
+
+**A message that arrives on OpenCode 2's home screen.** When a deck message opens a new session from OpenCode 2's home screen while you have unsent text there, the text moves into the new session's prompt, so you do not lose it.
+
+**Going back from OpenCode 2 to 1.x.** OpenCode 1.x cannot open the data OpenCode 2 has used, and stops with `Database is not empty and has no session table`. This is OpenCode's behaviour, with or without the deck; see OpenCode's documentation before you downgrade.
 
 ## Desktop app
 
@@ -331,8 +359,8 @@ The daemon owns the agents. Quitting the TUI with **Detach** leaves them running
 
 Both clients tell you when a newer release exists:
 
-- **TUI**: it checks when it starts and every 6 hours while it runs. When this machine's CLI or desktop app is behind, the right end of the footer shows a notice naming the copy, such as `dot-agent-deck CLI: update available: v0.47.0 (current: v0.46.0) · u to upgrade` or `Agent Deck (desktop app): update available: …`. Press `u` in command mode, or click the notice, to open the upgrade dialog ([Upgrade from the TUI](#upgrade-from-the-tui)). `dot-agent-deck upgrade` in another terminal works too.
-- **Desktop app**: it checks when it starts and every 6 hours while it runs. When the app is behind, an upgrade button (an arrow in a circle) appears at the bottom of the rail on every screen, and a banner such as `Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0)` with an **Upgrade…** button appears at the top of the Dashboard. Either one opens the app's upgrade dialog ([Desktop App → Upgrade the app](desktop/index.md#upgrade-the-app)). Dismissing the banner hides it until a newer release appears or the app restarts; the rail button stays. Once the app has upgraded itself, the notice says `Agent Deck v<new> is installed. Relaunch to run it.` until the app restarts, and the dialog it opens offers **Relaunch**. When this machine's CLI is behind, the banner and the rail button do not appear for it: the Dashboard's **Local daemon** section offers **Upgrade** instead, which upgrades the CLI and, when the daemon on this machine is older than the app, restarts it ([Desktop App → Daemons → Upgrade the CLI and the daemon on this machine](desktop/daemons.md#upgrade-the-cli-and-the-daemon-on-this-machine)).
+- **TUI**: it checks when it starts and every 6 hours while it runs. When this machine's CLI or desktop app is behind, the right end of the footer shows a notice naming the copy, such as `dot-agent-deck CLI: update available: v0.47.0 (current: v0.46.0) · u to upgrade` or `Agent Deck (desktop app): update available: …`. Press `u` in command mode, or click the notice, to open the upgrade dialog, which covers both copies when both are behind: the desktop app first, then the CLI ([Upgrade from the TUI](#upgrade-from-the-tui)). `dot-agent-deck upgrade` in another terminal works too.
+- **Desktop app**: it checks when it starts and every 6 hours while it runs. When the app is behind, an upgrade button (an arrow in a circle) appears at the bottom of the rail on every screen, and a banner such as `Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0)` with an **Upgrade…** button appears at the top of the Dashboard. Either one opens the upgrade dialog, which upgrades the app and, when this machine's `dot-agent-deck` CLI is behind too, the CLI after it ([Desktop App → Upgrade the app](desktop/index.md#upgrade-the-app)). Dismissing the banner hides it until a newer release appears or the app restarts; the rail button stays. Once the app has upgraded itself, the notice says `Agent Deck v<new> is installed. Relaunch to run it.` until the app restarts, and the dialog it opens offers **Relaunch**. When only this machine's CLI is behind, the banner and the rail button do not appear: the Dashboard's **Local daemon** section offers **Upgrade** instead, which upgrades the CLI and, when the daemon on this machine is older than the app, restarts it ([Desktop App → Daemons → Upgrade the CLI and the daemon on this machine](desktop/daemons.md#upgrade-the-cli-and-the-daemon-on-this-machine)).
 
 Neither client upgrades anything until you confirm. If the check cannot reach GitHub, nothing new is shown, and both clients try again later.
 
@@ -342,7 +370,7 @@ Neither client upgrades anything until you confirm. If the check cannot reach Gi
 
 **Desktop:**
 
-![The Upgrade to v0.47.0 dialog over the Dashboard, whose banner reads Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0) beside an Upgrade… button, with the upgrade button lit at the bottom of the rail: the plan for the app installed from a .dmg in /Applications, saying what upgrading downloads and checks, and below it the question Upgrade Agent Deck (desktop app) to v0.47.0? with Cancel and Upgrade buttons](/img/self-upgrade-desktop.png)
+![The Upgrade to v0.47.0 dialog over the Dashboard, whose banner reads Agent Deck (desktop app): update available: v0.47.0 (current: v0.46.0) beside an Upgrade… button, with the upgrade button lit at the bottom of the rail: the plan for the app installed from a .dmg in /Applications, saying what upgrading downloads and checks, below it the plan for the dot-agent-deck CLI installed with Homebrew, saying upgrading runs brew update, then brew upgrade dot-agent-deck, the line The dot-agent-deck CLI here is behind too, so it follows Agent Deck, and the question Upgrade Agent Deck (desktop app) to v0.47.0? with Cancel and Upgrade buttons](/img/self-upgrade-desktop.png)
 
 ### Upgrade from the TUI
 
@@ -584,4 +612,4 @@ brew uninstall dot-agent-deck                  # Homebrew; or delete the downloa
 sudo apt remove agent-deck                     # desktop app on Linux; on macOS delete /Applications/Agent Deck.app
 ```
 
-Your settings, keybindings, saved workspace and registered remotes are in `~/.config/dot-agent-deck/`, and schedules are in `$XDG_CONFIG_HOME/dot-agent-deck/schedules.toml` when `XDG_CONFIG_HOME` is set (otherwise the same directory). Delete them to remove your configuration too.
+Your settings, keybindings, saved workspace and registered remotes are in `~/.config/dot-agent-deck/`, and schedules are in `$XDG_CONFIG_HOME/dot-agent-deck/schedules.toml` when `XDG_CONFIG_HOME` is set to an absolute path (otherwise the same directory). Delete them to remove your configuration too.

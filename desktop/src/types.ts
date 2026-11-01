@@ -92,6 +92,12 @@ export type AgentInbox = {
   evidencePaused?: number;
   /** PRD #1666 part 3 (R-2): the refusal code the deck gave the agent's own request for its waiting messages. */
   admissionRefused?: string;
+  /**
+   * PRD #2050: the daemon's sentence about a way the agent runs that the deck
+   * cannot fully support, and what to do about it — the same words the TUI's
+   * card prints.
+   */
+  agentNotice?: string;
 };
 /** PRD #1666 part 3, round 5-wake: the daemon's `WakeHold` wire values. */
 export type WakeHold =

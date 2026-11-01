@@ -15,7 +15,7 @@ This page is the reference for the files and environment variables that configur
 | `session.toml` | the TUI's saved session (panes to restore, and its copy of the last command used) | the TUI | `~/.config/dot-agent-deck/session.toml` | `DOT_AGENT_DECK_SESSION` |
 | `config-gen-state.json`, `star-prompt-state.json` | small TUI state files | the TUI | beside `config.toml` | `DOT_AGENT_DECK_CONFIG_GEN_STATE`, `DOT_AGENT_DECK_STAR_PROMPT` |
 
-`~/.config/dot-agent-deck/` is used on macOS and Linux whatever `XDG_CONFIG_HOME` says; of the files above, only `schedules.toml` consults `XDG_CONFIG_HOME`. On Windows the directory is `%APPDATA%\dot-agent-deck`. Every override variable takes the full path of the file, not a directory.
+`~/.config/dot-agent-deck/` is used on macOS and Linux whatever `XDG_CONFIG_HOME` says; of the files above, only `schedules.toml` consults `XDG_CONFIG_HOME`, and only when it is an absolute path: an empty or relative value is ignored. On Windows the directory is `%APPDATA%\dot-agent-deck`. Every override variable takes the full path of the file, not a directory.
 
 A daemon on a remote host reads the files on *that* host. When you `connect` to a remote, the TUI you see also runs on the remote host, so it reads the remote's `config.toml` and `keybindings.toml`, not yours.
 

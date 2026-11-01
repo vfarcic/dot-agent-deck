@@ -877,6 +877,12 @@ pub struct DesktopInbox {
     /// (`inbox_peer_unidentified`, …), a display copy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub admission_refused: Option<String>,
+    /// PRD #2050: the daemon's notice about a way the agent runs that the
+    /// deck cannot fully support (OpenCode 2 on its shared service, a silent
+    /// plugin, an OpenCode too old), as the sentence both clients show
+    /// (`dot_agent_deck::agent_notice::AgentNotice::display_text`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_notice: Option<String>,
 }
 
 /// PRD #1666 part 3 (Q35): the webview's view of a `HoldDetail`.
@@ -2440,6 +2446,12 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
             .admission_refused
             .as_deref()
             .map(safe_display_text),
+        agent_notice: summary
+            .notices
+            .agent_notice
+            .as_ref()
+            .map(|notice| safe_display_text(notice.display_text()))
+            .filter(|text| !text.is_empty()),
     });
     let delivery_notice = live
         .filter(|snapshot| snapshot.status == SessionStatus::Error)
@@ -4433,6 +4445,31 @@ mod tests {
         let value = serde_json::to_value(map_agent(record)).unwrap();
         assert_eq!(value["inbox"]["wakeHold"], "needs_fetch");
         assert!(value["inbox"].get("holdDetail").is_none(), "{value}");
+    }
+
+    /// Scenario: Map a daemon record whose card notices carry the daemon's OpenCode notice — and one of a kind this build does not know, with a control character in it — into the desktop DTO; the tile gets each sentence as a display copy (PRD #2050).
+    #[test]
+    fn agent_mapping_carries_the_agent_notice_sentence() {
+        let notice = |json: serde_json::Value| {
+            let mut record = fixture_record();
+            record.inbox = Some(
+                serde_json::from_value(serde_json::json!({
+                    "queued": 0, "fetched": 0, "undeliverable": 0, "wake": "none",
+                    "agent_notice": json,
+                }))
+                .unwrap(),
+            );
+            serde_json::to_value(map_agent(record)).unwrap()["inbox"]["agentNotice"].clone()
+        };
+        let shared = dot_agent_deck::agent_notice::AgentNotice::opencode_shared_service();
+        assert_eq!(
+            notice(serde_json::to_value(&shared).unwrap()),
+            dot_agent_deck::agent_notice::OPENCODE_SHARED_SERVICE
+        );
+        assert_eq!(
+            notice(serde_json::json!({"kind": "newer_kind", "text": "do\u{1b}[31m this"})),
+            "do[31m this"
+        );
     }
 
     /// Scenario: Map a daemon record whose inbox summary lists an uncertain delivery, an integration notice, failed receipts, paused hand-outs and a refused request of the agent's own into the desktop DTO; each survives, by its wire spelling, for the tile's notice row and its Retry and Cancel rows.
