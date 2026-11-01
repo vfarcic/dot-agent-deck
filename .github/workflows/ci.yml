@@ -1028,10 +1028,6 @@ jobs:
       # BUILT those tests, which is why only their runtime assertions were
       # inert and the gap survived #436. Costs nothing measurable: all 48 are
       # under 40ms and the tier's wall clock is set by its slowest test.
-      - name: Capture quarantined classifier first git on GitHub (#2011)
-        run: cargo nextest run --workspace --test editor_classifier --run-ignored ignored-only -E 'test(real::probe_006_a_real_moved_install_root_is_unknown)' --success-output immediate
-        env:
-          CARGO_PROFILE_DEV_DEBUG: line-tables-only
       - run: cargo nextest run --workspace
         env:
           # Issue #324: see the go-task step above.

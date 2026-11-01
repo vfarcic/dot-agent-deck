@@ -789,10 +789,9 @@ mod real {
         assert!(view.file(&dir.path().join("missing")).is_err());
     }
 
-    /// Scenario: With this test process standing in as the agent and a `versions` directory recorded as its install root, repeat the initial tool classification with fresh sleepers for at most 1,000 rounds or 45 seconds, retaining both samples and process diagnostics on failure. A sleeper named `2.1.311` in the root is `Unknown`, while `git` elsewhere is a tool; moving the root makes both `Unknown`, and restoring it makes `git` a tool again.
+    /// Scenario: With this test process standing in as the agent and a `versions` directory recorded as its install root, repeat the initial tool classification with fresh sleepers for at most 50,000 rounds or 45 seconds, retaining both samples and process diagnostics on failure. A sleeper named `2.1.311` in the root is `Unknown`, while `git` elsewhere is a tool; moving the root makes both `Unknown`, and restoring it makes `git` a tool again.
     #[spec("inbox/probe/006")]
     #[test]
-    #[ignore = "quarantined: vfarcic, #2011"]
     fn probe_006_a_real_moved_install_root_is_unknown() {
         let dir = tempdir();
         let versions = dir.path().join("versions");
@@ -805,7 +804,7 @@ mod real {
         };
         let started = std::time::Instant::now();
         let mut rounds = 0;
-        while rounds < 1_000 && started.elapsed() < std::time::Duration::from_secs(45) {
+        while rounds < 50_000 && started.elapsed() < std::time::Duration::from_secs(45) {
             let updated = Copy::start_in(&versions, "2.1.311");
             let mut git = Copy::start("git");
             assert_eq!(

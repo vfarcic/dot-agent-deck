@@ -160,6 +160,7 @@
 [profile.default]
 retries = 0
 slow-timeout = { period = "60s", terminate-after = 3 }
+
 fail-fast = false
 
 # Issue #564: `path` is resolved RELATIVE TO the profile's store directory
@@ -193,6 +194,11 @@ fail-fast = false
 #     applies to any future job that uploads this file while holding a secret.
 [profile.default.junit]
 path = "junit.xml"
+
+# Throwaway #2011 capture branch: report the loop's actual count even on green.
+[[profile.default.overrides]]
+filter = 'binary(editor_classifier) & test(real::probe_006_a_real_moved_install_root_is_unknown)'
+success-output = "immediate"
 
 # Show which export-chain branch ran in CI even when this synthetic control
 # passes. Keep successful output storage in JUnit at its default of false.
