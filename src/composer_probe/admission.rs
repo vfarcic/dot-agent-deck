@@ -226,10 +226,12 @@ mod tests {
     use super::*;
     use crate::composer_probe::epoch::{GenerationInput, OutputNote};
     use crate::composer_probe::planner::{Physical, PhysicalTracker};
-    use crate::composer_probe::query_ledger::{CprWaitEnd, LEDGER_SLOTS, QueryKind, T_TRIGGER};
+    use crate::composer_probe::query_ledger::{
+        CprWaitEnd, EntryView, LEDGER_SLOTS, QueryKind, T_TRIGGER,
+    };
     use crate::composer_probe::record::{
-        Attribution, Cause, Channel, Decision, EcPolicy, NotOwned, Observation, RecordKey, Records,
-        ScopeState,
+        Attribution, Cause, Channel, Completion, Decision, EcPolicy, NotOwned, Observation,
+        RecordKey, Records, ScopeState,
     };
     use crate::composer_probe::{InertCause, Permission};
     use crate::doorbell_screen::CODEX_PROFILE;
@@ -721,5 +723,124 @@ mod tests {
             Err(Refusal::Records(Hold::Retired)),
             "a generation with no records attached admits nothing"
         );
+    }
+
+    /// Run `feed` on its own thread with a stamp it takes first, paused
+    /// between taking the stamp and entering the generation's lock until
+    /// `race` has run on this thread (Q84-3): the schedule of a feeder whose
+    /// timestamp was taken before a racing caller's, which enters first.
+    fn feeder_paused_after_its_stamp(
+        input: &std::sync::Arc<GenerationInput>,
+        stamp: Instant,
+        feed: impl FnOnce(&GenerationInput, Instant) + Send + 'static,
+        race: impl FnOnce(&GenerationInput),
+    ) {
+        let (stamped, wait_stamp) = std::sync::mpsc::channel();
+        let (go, wait_go) = std::sync::mpsc::channel::<()>();
+        let feeder = {
+            let input = std::sync::Arc::clone(input);
+            std::thread::spawn(move || {
+                // The stamp is published before the lock is taken.
+                stamped.send(stamp).unwrap();
+                wait_go.recv().unwrap();
+                feed(&input, stamp);
+            })
+        };
+        assert_eq!(wait_stamp.recv().unwrap(), stamp);
+        race(input);
+        go.send(()).unwrap();
+        feeder.join().unwrap();
+    }
+
+    /// Scenario: With a helper's record pending while its attribution is unknown, accept a native Ctrl+G, then let the record feeder take its stamp for the IPC observation that names the helper a tool's, and pause it there while admission reads the hazard FIFO four seconds later; release the feeder with its earlier stamp. The record stops being required, and the quiet clock resumes from the later read, not the feeder's stamp, so the entry stays through ten seconds of quiet time and leaves only after them; a feeder that resumed from its own stamp would count the paused interval and let the entry leave early.
+    #[spec("inbox/probe/052")]
+    #[test]
+    fn probe_052_a_feeders_early_stamp_resumes_the_quiet_clock_no_earlier_than_a_racing_read() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let input = std::sync::Arc::new(generation());
+        let key = RecordKey { pid: 42, start: 1 };
+        let scanned = Observation {
+            channel: Channel::Scan,
+            decision: None,
+            ..ipc(42, Attribution::Pending, Decision::Tool, t0)
+        };
+        input.record_observe(&scanned, t0).unwrap();
+        assert!(
+            input
+                .record(key)
+                .is_some_and(|r| r.completion == Completion::Pending)
+        );
+        let seq = input.accept_native(t0).unwrap();
+        assert_eq!(
+            input.hazards(at(1)).0,
+            vec![EntryView::Quiet { seq, paused: true }],
+            "the clock is paused while the record is pending"
+        );
+
+        // The feeder's stamp, at 5 s, is taken before admission's read at
+        // 9 s, which enters the lock first.
+        let tool = ipc(
+            42,
+            Attribution::NotOwned(NotOwned::Tool),
+            Decision::Tool,
+            t0,
+        );
+        feeder_paused_after_its_stamp(
+            &input,
+            at(5),
+            move |input, stamp| {
+                input.record_observe(&tool, stamp).unwrap();
+            },
+            |input| assert!(!input.hazards_clear(at(9))),
+        );
+        assert!(
+            input
+                .record(key)
+                .is_some_and(|r| r.completion == Completion::NotRequired),
+            "a tool's record isn't required, so the clock runs again"
+        );
+
+        // Resumed at 9 s: ten seconds of quiet time are reached at 19 s, and
+        // the tie still counts as quiet.
+        assert_eq!(
+            input.hazards(at(18)).0,
+            vec![EntryView::Quiet { seq, paused: false }],
+            "the paused interval between the feeder's stamp and the read isn't counted"
+        );
+        assert!(!input.hazards_clear(at(19)), "the tie goes to the hazard");
+        assert!(input.hazards_clear(at(20)));
+    }
+
+    /// Scenario: Accept a native Ctrl+G on a running quiet clock, then let the output hook take its stamp for a CPR query at four seconds and pause it there while admission reads the hazard FIFO at nine; release the hook with its earlier stamp. The hook's latch lands at the later read's time, before the entry's ten quiet seconds, so the entry latches and admission is refused long after; a stamp taken earlier can't reach back past what a racing read already let leave, which the second history shows: a hook stamped before the entry's quiet period ended, entering after a read past it, finds nothing to latch.
+    #[spec("inbox/probe/052")]
+    #[test]
+    fn probe_052_a_hooks_early_stamp_latches_at_the_racing_reads_time() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let cpr = |input: &GenerationInput, stamp: Instant| {
+            input.on_output(&[OutputNote::Query(QueryKind::Cpr)], stamp);
+        };
+
+        let input = std::sync::Arc::new(GenerationInput::new(CprWaitEnd::Counted));
+        let seq = input.accept_native(t0).unwrap();
+        feeder_paused_after_its_stamp(&input, at(4), cpr, |input| {
+            assert!(!input.hazards_clear(at(9)));
+        });
+        assert!(input.backlog());
+        assert_eq!(input.hazards(at(100)).0, vec![EntryView::Latched { seq }]);
+        assert!(!input.hazards_clear(at(100)));
+
+        let late = std::sync::Arc::new(GenerationInput::new(CprWaitEnd::Counted));
+        late.accept_native(t0).unwrap();
+        feeder_paused_after_its_stamp(&late, at(9), cpr, |input| {
+            assert!(
+                input.hazards_clear(at(11)),
+                "the entry's quiet period ended"
+            );
+        });
+        assert!(late.backlog());
+        assert!(late.hazards(at(12)).0.is_empty());
+        assert!(late.hazards_clear(at(12)));
     }
 }

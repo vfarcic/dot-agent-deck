@@ -637,6 +637,64 @@ async fn probe_074_a_report_whole_is_applied_and_one_cut_drains_uncertain() {
     deck.stop().await;
 }
 
+/// A whole `editor_done` report line of exactly `bytes` bytes before its
+/// newline: the JSON padded with spaces, which the parse trims.
+fn report_line(bytes: usize) -> Vec<u8> {
+    let json = b"{\"report\":\"editor_done\",\"tree\":\"clean\"}";
+    let mut line = json.to_vec();
+    line.resize(bytes, b' ');
+    line.push(b'\n');
+    line
+}
+
+/// Scenario: Two helper copies each register their connection on the real hook socket and declare `Unarmed`; one sends a whole report line exactly at the report cap, the other a line one byte over it, and both are killed. The report at the cap is applied to the record of the helper the socket's peer names and that exit settles with it, while the line over the cap is refused, so that helper's exit drains only to the uncertain outcome with no report (Q84-2: a report applied through the real registered socket, and the cap that socket read enforces).
+#[spec("inbox/probe/074")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_074_a_report_at_the_cap_is_applied_from_its_registered_connection() {
+    use crate::composer_probe::observe::REPORT_BYTES;
+    let mut deck = Deck::start().await;
+
+    let (at_cap, mut peers) = deck.helper("at-cap", 1).await;
+    let at_cap_key = key_of(at_cap);
+    let mut at_cap_peer = peers.pop().unwrap();
+    let (over, mut peers) = deck.helper("over-cap", 1).await;
+    let over_key = key_of(over);
+    let mut over_peer = peers.pop().unwrap();
+    for (peer, key) in [(&mut at_cap_peer, at_cap_key), (&mut over_peer, over_key)] {
+        deck.register(peer).await;
+        deck.unarmed(peer, key).await;
+    }
+
+    at_cap_peer.send(&report_line(REPORT_BYTES)).await;
+    over_peer.send(&report_line(REPORT_BYTES + 1)).await;
+    deck.kill(at_cap);
+    deck.kill(over);
+    for peer in [&mut at_cap_peer, &mut over_peer] {
+        tokio::time::timeout(SETTLE, peer.closed())
+            .await
+            .expect("closed");
+    }
+
+    assert!(
+        wait_for(SETTLE, || deck.settled(at_cap_key)).await,
+        "a report at the cap is applied and the exit settles"
+    );
+    let fact = deck.observer.exit_fact(at_cap_key).unwrap();
+    assert_eq!(fact.report, Report::Done(Tree::Clean));
+    assert_eq!(fact.decision, Some(Decision::Unarmed));
+
+    assert!(
+        wait_for(SETTLE, || deck.uncertain(over_key)).await,
+        "a line over the cap is refused and the exit drains uncertain"
+    );
+    assert_eq!(
+        deck.observer.exit_fact(over_key).unwrap().report,
+        Report::None,
+        "the refused line is no report"
+    );
+    deck.stop().await;
+}
+
 /// Scenario: A helper copy declares `Unarmed` and is killed without sending anything more, its connection held open by the test: the connection closes no sooner than the read deadline after the instant the observer recorded the exit, and the exit settles in the ordinary way, its record pruned and its exit facts kept with no report.
 #[spec("inbox/probe/074")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
