@@ -10579,6 +10579,14 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** the daemon's watcher (`inbox/probe/046`'s fast units) or the wire's older readers (rule 12's cross-version run).
 - **Platform coverage:** all.
 
+##### inbox/probe/082 — The daemon writes a pane's not-delivered notice only at a generation's first retirement that held a person's typing, and keeps it until a keystroke.
+
+- **Layer:** Fast (`src/agent_pty_discard_tests.rs`): the real registry over spawned `/usr/bin/true` and `/bin/sh` generations sharing a pane, their real fence gates holding frames.
+- **Agent:** none.
+- **Asserts:** with an already-retired record and an exited one holding typing both on the pane, a third generation's publish reports the exited one's typing whichever of the two the publish visits first (fresh registries until both orders occur); closing an old predecessor's lingering record leaves its successor's notice; a stop then a spawn into the same pane keeps the notice for the successor (`probe_046`'s history), a later retirement that held nothing leaves it standing, and a person's keystroke on the pane ends it and prunes the entry; past 64 panes the oldest retirement's notice goes; a held voice answer isn't counted as typing, alone or beside typed keys (R-E-U2-01, R-E-U3-02, auditor U3-1, U3-2, U3-7).
+- **Does not assert:** the watcher broadcasting the notice (`inbox/probe/046`) or either client's display of it (`inbox/probe/080`, `081`); a pane closed for good, which the daemon can't tell from a stop its successor follows, so the bound is what limits it.
+- **Platform coverage:** Unix.
+
 ##### inbox/probe/079 — The `e2e` build's composer controls reach the live generation they name, take effect there, and refuse anything else.
 
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_composer_controls.rs`, with `tests/support/live_segments.rs`): the real daemon, a native Claude stand-in with the reviewed F2 composer, and `e2e-composer-control`'s Q105b.2 operations (`src/e2e_controls.rs`, `src/daemon_protocol.rs`).
