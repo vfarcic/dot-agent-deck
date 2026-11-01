@@ -85,6 +85,12 @@ impl Fixture {
             include_str!("composer_external_edit.py").replace(
                 "# M31: keys unread by an editor during suspension disappear.",
                 "# Optional adversarial post-enable flush witness, local to S-20.\n                if self.path('.gate-flush').exists():\n                    os.write(1, b'\\x1b[?2004h')\n                    self.path('.flush-arrived').touch()\n                    while not self.path('.flush-go').exists(): time.sleep(.005)\n                # M31: keys unread by an editor during suspension disappear.",
+            ).replace(
+                "    def tokens(self, chunk):\n",
+                "    def tokens(self, chunk):\n        # A configured whole terminal report is inert to this stand-in.\n        # Candidate histories deliberately retain F2's normal Ctrl+G map.\n        report = self.path('.reported-osc')\n        if report.exists(): chunk = chunk.replace(report.read_bytes(), b'')\n",
+            ).replace(
+                "            path.unlink(missing_ok=True)\n            os.write(1, b'\\x1b[?2004h')",
+                "            path.unlink(missing_ok=True)\n            os.write(1, b'\\x1b[?2004h')\n            self.return_count = getattr(self, 'return_count', 0) + 1\n            self.path(f'.composer-return-{self.return_count}').touch()",
             ),
         )
         .unwrap();
@@ -100,6 +106,9 @@ impl Fixture {
         let editor = include_str!("composer_test_editor.py").replace(
             "mode, base, *args = sys.argv[1:]",
             "mode, base, *args = sys.argv[1:]\nmode_file = Path(base + '.editor-mode')\nif mode_file.exists(): mode = mode_file.read_text().strip()",
+        ).replace(
+            "path.write_bytes(b'EDITED",
+            "if mode == 'survivor':\n    survivor = os.fork()\n    if survivor == 0:\n        while not Path(base + '.survivor-go').exists(): time.sleep(.005)\n        os._exit(0)\n    Path(base + '.survivor-pid').write_text(str(survivor))\npath.write_bytes(b'EDITED",
         );
         executable(&native.join("editor"), &editor);
         executable(&native.join("broker"), BROKER);
@@ -391,6 +400,7 @@ impl Drop for Fixture {
             "helper-go",
             "resume-go",
             "flush-go",
+            "survivor-go",
         ] {
             let _ = fs::write(self.path(suffix), "");
         }
@@ -451,6 +461,16 @@ pub fn native_entry() {
                 .then(|| (k.to_owned(), v.to_owned()))
         })
         .collect();
+    if std::env::var_os("DAD_LIVE_SEGMENTS_FAMILY_PARENT").is_some() {
+        // This second copy remains the helper's real parent. Its F1 is
+        // the agent's, but its PID is not A, so attribution is Unknown.
+        let status = Command::new(&helper)
+            .envs(env)
+            .args(std::env::args_os().skip(2))
+            .status()
+            .unwrap();
+        std::process::exit(status.code().unwrap_or(127));
+    }
     let mut composer = Command::new("python3")
         .arg(exe.parent().unwrap().join("composer.py"))
         .arg(&base)
@@ -511,8 +531,34 @@ pub fn native_entry() {
             } else {
                 helper.clone()
             };
-            let mut command = Command::new(target);
+            let mut command = match fs::read_to_string(base.with_extension("helper-parent"))
+                .unwrap_or_default()
+                .as_str()
+            {
+                "tool" => {
+                    let mut command = Command::new("/bin/sh");
+                    command.args(["-c", "\"$@\"; code=$?; exit \"$code\"", "fixture-tool"]);
+                    command.arg(&target);
+                    command
+                }
+                "unknown" => {
+                    let mut command = Command::new(&exe);
+                    command
+                        .arg("--live-segments-parent")
+                        .env("DAD_LIVE_SEGMENTS_FAMILY_PARENT", "1");
+                    command
+                }
+                _ => Command::new(&target),
+            };
             command.envs(env.clone());
+            for (suffix, variable) in [
+                ("helper-report-pad", "DOT_AGENT_DECK_E2E_HELPER_PAD"),
+                ("helper-report-sndbuf", "DOT_AGENT_DECK_E2E_HELPER_SNDBUF"),
+            ] {
+                if let Ok(value) = fs::read_to_string(base.with_extension(suffix)) {
+                    command.env(variable, value.trim());
+                }
+            }
             if base.with_extension("lost-ipc").exists() {
                 command.arg("fast").arg(&base);
             }
@@ -549,7 +595,7 @@ pub fn native_entry() {
             let child = command.arg(req["path"].as_str().unwrap()).spawn().unwrap();
             atomic(
                 &base.with_extension("helper-started"),
-                &json!({"pid":child.id()}),
+                &json!({"pid":child.id(),"path":req["path"]}),
             );
             running = Some(child);
             fs::write(
