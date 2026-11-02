@@ -415,9 +415,11 @@ export interface DesktopAgentDto {
    */
   inputHeld?: { generation: number; cause: string; heldOps: number; heldBytes: number; sinceMs: number };
   /**
-   * PRD #1666 part 3 (Q35-20e): typing the deck held for this pane's previous
-   * agent generation was discarded when it retired
-   * (`AgentRecord.input_discarded`). Absent while there is none to report.
+   * PRD #1666 part 3 (Q35-20e): typing the deck held for one of this pane's
+   * earlier agent generations was discarded when it retired
+   * (`AgentRecord.input_discarded`). Absent while there is none to report:
+   * the person's next keystroke into the pane ends it, and a retirement that
+   * held nothing leaves it (efix review U3-e).
    */
   inputDiscarded?: boolean;
   /**

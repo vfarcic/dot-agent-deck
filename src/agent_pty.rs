@@ -4241,9 +4241,11 @@ pub struct AgentRecord {
     /// [`Self::inbox`] precedent: an older reader ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_held: Option<crate::inbox_display::InputHeld>,
-    /// PRD #1666 part 3 (Q35-20e): typing the deck held for this pane's
-    /// previous generation, discarded when it retired, on its successor's
-    /// record until a person's keystroke reaches the pane after it.
+    /// PRD #1666 part 3 (Q35-20e): typing the deck held for one of this
+    /// pane's earlier generations, discarded when it retired, on the record
+    /// of the pane's current, later generation until a person's keystroke
+    /// reaches the pane after it. Retirements that held nothing leave it, however many there are,
+    /// so it can name a generation two or more back (efix review U3-e).
     /// Additive and optional, as [`Self::input_held`] is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_discarded: Option<crate::inbox_display::InputDiscarded>,
@@ -5442,12 +5444,19 @@ impl PaneWriter {
     /// through the cut, alone; the rest stays held behind that segment until
     /// its matched helper's row releases it. Nothing of the frame reaches the
     /// writer from here, so no trigger goes before its number. If the segment
-    /// can't be opened (the generation retired under the call), the fence is
-    /// still the driver's: with no segment open it writes what precedes the
-    /// candidate, then the candidate alone after its own number, or
-    /// retirement refuses it all. A fence closed since the frame was let
-    /// through (a probe's arm section that started before the take-back)
-    /// takes it whole and opens nothing.
+    /// can't be opened, the fence is still the driver's, and which refusal it
+    /// was decides the rest (revc23 review U3-2): on `Full` (the generation
+    /// already keeps `SEGMENT_CAP` segments) the driver, with no segment
+    /// open, writes what precedes the candidate, then the candidate alone
+    /// after its own number; on `Retired` (the generation retired under the
+    /// call) the driver writes nothing, since retirement refuses the op. A
+    /// fence closed since the frame was let through takes it whole and opens
+    /// nothing. A probe's arm section can't be that fence: admission takes a
+    /// queued probe back under the gate's lock, the lock the arm section
+    /// checks its claim under, so one that started first would have closed
+    /// the fence before admission read it and the op would be held, not let
+    /// through; what reaches it in practice is the `e2e` control's fence
+    /// (revc23 review U3-3).
     ///
     /// **With none** (no release driver runs for such a generation, so
     /// nothing would number and write a held trigger), the prefix through
@@ -5465,7 +5474,7 @@ impl PaneWriter {
                         tracing::debug!(
                             target: "composer_probe",
                             ?refusal,
-                            "a cut's HumanG wasn't opened; the driver writes its candidate alone"
+                            "a cut's HumanG wasn't opened; on Full the driver writes its candidate alone, and on Retired the op is refused"
                         );
                     }
                 }
@@ -6414,8 +6423,13 @@ impl WithdrawUnlessAnswered<'_> {
         withdrawn
     }
 
-    /// The job's reply closed unanswered: the job was dropped, so the writer
-    /// thread is gone. A job the thread never started (one still in the queue
+    /// The job's reply closed unanswered. For the jobs this guard covers (no
+    /// start condition, not released, no part), that means the job was
+    /// dropped, so the writer thread is gone. That rests on those jobs'
+    /// shape: the writer's `continue` paths close a reply unanswered with the
+    /// thread alive for a released job, a later sub-op of a failed cut, a job
+    /// its start condition refused, and a job already withdrawn (revptyfix
+    /// review U3-1). A job the thread never started (one still in the queue
     /// when the thread ended, PRD #1666 part 3) is taken back here and leaves
     /// the in-flight count it entered; one the thread started and unwound in
     /// is left counted. Its ticket is not touched here: the job's own
@@ -13664,10 +13678,12 @@ impl AgentPtyRegistry {
         }
     }
 
-    /// PRD #1666 part 3 (Q35-20e): what `agent_id`'s card says of typing its
-    /// pane's previous generation held when it retired: shown on the pane's
-    /// current, later generation until a person's keystroke reaches the pane
-    /// after the retirement, when it is pruned (R-E-U3-02). Display only.
+    /// PRD #1666 part 3 (Q35-20e): what `agent_id`'s card says of typing one
+    /// of its pane's earlier generations held when it retired: shown on the
+    /// pane's current, later generation until a person's keystroke reaches
+    /// the pane after the retirement, when it is pruned (R-E-U3-02). A
+    /// retirement that held nothing doesn't end it, so the generation it
+    /// names can be two or more back (efix review U3-e). Display only.
     pub(crate) fn input_discarded(
         &self,
         agent_id: &str,

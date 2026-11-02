@@ -3199,8 +3199,9 @@ pub struct InputHeldUpdate {
     /// when nothing is shown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_held: Option<crate::inbox_display::InputHeld>,
-    /// Typing the pane's previous generation held was discarded when it
-    /// retired; absent once a person's keystroke reached the pane after it.
+    /// Typing one of the pane's earlier generations held was discarded when
+    /// it retired; absent once a person's keystroke reached the pane after
+    /// it. A retirement that held nothing leaves it (efix review U3-e).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_discarded: Option<crate::inbox_display::InputDiscarded>,
 }

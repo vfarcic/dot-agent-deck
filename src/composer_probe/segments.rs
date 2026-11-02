@@ -468,9 +468,11 @@ impl EditorPin {
     }
 
     /// `key` with no check of its own, which [`Self::running`] answers as
-    /// running: for the test-only reports alone
-    /// ([`Segments::editor_pinned_for_test`]), so no production report can
-    /// carry one (the revb21 review's U3-4).
+    /// running: built by the test-only reports alone
+    /// ([`Segments::editor_pinned_for_test`]), so a production report could
+    /// carry one only through a `_for_test` method, which stays `pub` and is
+    /// kept from production callers by its name and `#[doc(hidden)]` alone
+    /// (the revb21 review's U3-4, narrowed by the revc21 review's U3-a).
     fn unchecked(key: RecordKey) -> Self {
         Self { key, running: None }
     }

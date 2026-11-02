@@ -984,7 +984,7 @@ fn probe_017_held_typing_is_visible_and_clears() {
         }
     }
     assert!(missing.is_empty(), "{}", missing.join("\n"));
-    insta::assert_snapshot!(checking_line, @"input held: the deck is checking the input box; your typing will appear in a moment");
+    insta::assert_snapshot!(checking_line, @"input held: the deck is checking the input box; what you typed or answered will appear in a moment");
 }
 
 /// Scenario: Render both new holds and each cannot-check detail from a daemon snapshot, then replace the reason on the same card. Causes show distinct explanations and path remedies, while a stale detail never follows the new reason.

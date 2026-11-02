@@ -86,15 +86,18 @@ pub const HOLD_REMEDY_REREAD: &str =
     "Check that you can read it, or point TMPDIR (or CODEX_HOME) at another directory.";
 
 /// PRD #1666 part 3 (Q35, core §7): the card's words for each
-/// [`InputHeldCause`], shown while the deck holds what the user typed.
-pub const INPUT_HELD_CHECKING: &str =
-    "input held: the deck is checking the input box; your typing will appear in a moment";
+/// [`InputHeldCause`], shown while the deck holds what the user typed or an
+/// answer the deck is sending for them. The wire doesn't say which a hold
+/// carries, and the desktop's voice panel quotes these words after "Answer
+/// queued", so the words that name what is held say "what you typed or
+/// answered" (efix review U3-c).
+pub const INPUT_HELD_CHECKING: &str = "input held: the deck is checking the input box; what you typed or answered will appear in a moment";
 /// [`InputHeldCause::CheckNotOpened`]'s words.
-pub const INPUT_HELD_CHECK_NOT_OPENED: &str = "input held: the agent hasn't opened the deck's check yet; your typing is kept until it does. Restarting the agent discards it.";
+pub const INPUT_HELD_CHECK_NOT_OPENED: &str = "input held: the agent hasn't opened the deck's check yet; what you typed or answered is kept until it does. Restarting the agent discards it.";
 /// [`InputHeldCause::CheckNotReturned`]'s words.
-pub const INPUT_HELD_CHECK_NOT_RETURNED: &str = "input held: the agent hasn't come back from the deck's check; your typing is kept until it does. Restarting the agent discards it.";
+pub const INPUT_HELD_CHECK_NOT_RETURNED: &str = "input held: the agent hasn't come back from the deck's check; what you typed or answered is kept until it does. Restarting the agent discards it.";
 /// [`InputHeldCause::AfterYourCtrlG`]'s words.
-pub const INPUT_HELD_AFTER_YOUR_CTRL_G: &str = "input held: the agent didn't open the editor for your Ctrl+G; your typing is kept. Restarting the agent discards it.";
+pub const INPUT_HELD_AFTER_YOUR_CTRL_G: &str = "input held: the agent didn't open the editor for your Ctrl+G; what you typed or answered is kept. Restarting the agent discards it.";
 /// [`InputHeldCause::QueueFull`]'s words.
 pub const INPUT_HELD_QUEUE_FULL: &str =
     "input held: too much typing is waiting; the rest is paused";
@@ -103,10 +106,12 @@ pub const INPUT_HELD_CHECK_BLOCKED: &str =
     "waiting: can't check this input box; press Ctrl+G to let the deck check it";
 /// [`InputHeldCause::Unknown`]'s words: a cause a newer deck names.
 pub const INPUT_HELD_UNKNOWN: &str =
-    "input held: your typing is kept while the deck checks this input box";
-/// PRD #1666 part 3 (Q35-20e, Q104b): the successor's card, when the
-/// generation it replaced still held typing as it retired
+    "input held: what you typed or answered is kept while the deck checks this input box";
+/// PRD #1666 part 3 (Q35-20e, Q104b): a later generation's card, when a
+/// generation the pane ran before it still held typing as it retired
 /// ([`InputDiscarded`]). Its first clause stands alone where a card cuts it.
+/// It counts typing alone: an answer held when the generation retired is
+/// refused, and that refusal tells its answerer (`PaneGate::retire`).
 pub const INPUT_NOT_DELIVERED: &str = "not delivered: your held typing; restarting the agent discarded it. Type it again if you still need it.";
 
 /// What both clients say when the daemon refuses a pane's typed input
@@ -848,11 +853,17 @@ pub struct InputHeld {
     pub since_ms: u64,
 }
 
-/// PRD #1666 part 3 (Q35-20e, Q104b): the typing the deck held for a pane's
-/// previous agent generation when that generation retired, which never
+/// PRD #1666 part 3 (Q35-20e, Q104b): the typing the deck held for one of a
+/// pane's earlier agent generations when that generation retired, which never
 /// reached it. Carried on the pane's later generation, whose card says so
 /// ([`INPUT_NOT_DELIVERED`]); bound to the retired `generation`, so it never
 /// shows on that generation's own card. Additive: an older client ignores it.
+///
+/// On purpose (efix review U3-e, the auditor's U3-1 decision), a person's
+/// keystroke into the pane ends it, and a later retirement that held typing
+/// replaces it; a retirement that held nothing leaves it, however many
+/// follow. So a card can say "not delivered" about typing held two or more
+/// generations back, until the person types into the pane.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct InputDiscarded {
     /// The retired generation that held it.
@@ -1133,9 +1144,10 @@ impl CardInbox {
     }
 
     /// PRD #1666 part 3 (Q35, core §7): the row saying the deck holds what
-    /// the user typed, and why ([`InputHeldCause::words`]), whatever else the
-    /// card shows; with nothing held, that the previous generation's held
-    /// typing was not delivered ([`INPUT_NOT_DELIVERED`], Q35-20e).
+    /// the user typed or an answer it is sending for them, and why
+    /// ([`InputHeldCause::words`]), whatever else the card shows; with
+    /// nothing held, that typing an earlier generation of the pane held was
+    /// not delivered ([`INPUT_NOT_DELIVERED`], Q35-20e).
     pub fn input_held_text(&self) -> Option<&'static str> {
         self.input_held
             .map(InputHeldCause::words)
