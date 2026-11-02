@@ -24,8 +24,8 @@
 //! held, and nothing here is a deadline.
 //!
 //! **Claude Code** ([`ClaudeKeymap`], R6 §9.1) reads `keybindings.json`. The
-//! deck records it at spawn and reads it again before each admission and at
-//! each settlement ([`ClaudeKeymap::check`]); any difference from the spawn read holds the
+//! deck records it before the spawn ([`KeymapBaseline`]) and reads it again
+//! before each admission and at each settlement ([`ClaudeKeymap::check`]); any difference from the spawn read holds the
 //! rest of the generation ([`Hold::Changed`], CL-9t), even if a later read
 //! matches again. With an unchanged file, P-KB1 (the release loads its
 //! bindings before its first ready frame, M49b) is what makes the spawn
@@ -41,8 +41,12 @@
 //! **Codex** ([`CodexSources`], R6 §9.2, R5 §7.1) reads `$CODEX_HOME/config.toml`,
 //! the selected profile's `$CODEX_HOME/<name>.config.toml`, the trusted
 //! project files for the pane's cwd, and each `-c key=value`. The deck reads
-//! them before the spawn and again after the first ready frame; any
-//! difference holds the generation. Otherwise the sources are merged in the
+//! them before the spawn ([`CodexBaseline`]) and again after the first ready
+//! frame; any difference holds the generation, and so does a bound agent
+//! that launched with other sources than the spawn's. For the project files
+//! the deck reads every `.codex/config.toml` Codex's root and trust rules
+//! could pick ([`codex_project_files`]) and holds when one of them has a
+//! keymap ([`codex_projects_guard`]). Otherwise the sources are merged in the
 //! release record's precedence ([`KeymapSource`] order, a later source
 //! winning key by key) and the effective `tui.keymap` is checked: a probe
 //! is allowed only when `open_external_editor` is Ctrl+G (by default or
@@ -243,9 +247,20 @@ pub struct ClaudeKeymap {
 }
 
 impl ClaudeKeymap {
-    /// Reads `path` at spawn, for a release whose record is `probe`.
+    /// Reads `path` now as the spawn read, for a release whose record is
+    /// `probe`.
     pub fn at_spawn(path: PathBuf, probe: &EditorProbe<'_>) -> ClaudeKeymap {
         let at_spawn = read_source(&path);
+        ClaudeKeymap::from_spawn_read(path, at_spawn, probe)
+    }
+
+    /// `path` as it was read before the spawn, `at_spawn` (the generation's
+    /// [`KeymapBaseline`], A-20d-1b), for a release whose record is `probe`.
+    pub fn from_spawn_read(
+        path: PathBuf,
+        at_spawn: SourceRead,
+        probe: &EditorProbe<'_>,
+    ) -> ClaudeKeymap {
         ClaudeKeymap {
             path,
             at_spawn,
@@ -609,6 +624,178 @@ pub fn codex_keymap(
         }
     }
     codex_bindings(&merged)
+}
+
+/// Where Codex keeps its home, from the agent's environment `env`:
+/// `$CODEX_HOME`, else `$HOME/.codex`.
+pub fn codex_home(env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    env("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env("HOME").map(|home| PathBuf::from(home).join(".codex")))
+}
+
+/// The project files Codex may read for a launch in `cwd` (A-20d-1b, R6
+/// §9.2's trusted project file), lowest precedence first: `.codex/config.toml`
+/// in `cwd` and in each of its ancestors, the root's first, leaving out the
+/// one whose `.codex` is `codex_home` (Codex reads that as its own config).
+///
+/// It is a superset, on purpose. Both pinned releases read a project's
+/// `.codex/config.toml` in each directory from the project root down to the
+/// cwd, the root found by markers its config may set (`.git` by default),
+/// and ignore one in a directory whose project isn't trusted (`rust-v0.160.0`
+/// and `rust-v0.164.0`, `codex-rs/config/src/loader/mod.rs`'s
+/// `discover_project_layers`, :1639 and :1838; the CODEX_HOME skip at :1684
+/// and :1883). The deck resolves neither the root nor the trust, so it reads
+/// every directory those rules could pick, and [`codex_projects_guard`]
+/// holds wherever which of them Codex loads could matter.
+///
+/// The `codex_home` comparison is by the path as written: one that differs
+/// from Codex's own only through a symlink is kept, which can only hold
+/// more. [`Hold::Unmeasured`] for a relative `cwd`: where Codex then looks
+/// isn't known.
+pub fn codex_project_files(cwd: &Path, codex_home: &Path) -> Result<Vec<PathBuf>, Hold> {
+    if !cwd.is_absolute() {
+        return Err(Hold::Unmeasured);
+    }
+    let mut files: Vec<PathBuf> = cwd
+        .ancestors()
+        .filter(|dir| dir.join(".codex") != codex_home)
+        .map(|dir| dir.join(".codex").join("config.toml"))
+        .collect();
+    files.reverse();
+    Ok(files)
+}
+
+/// Whether a Codex launch's arguments move its working directory (`-C`,
+/// `--cd`, in their separate, `=` and attached forms; nothing after `--`):
+/// its project files are then read from a directory the deck doesn't
+/// follow.
+pub fn codex_moves_cwd(args: &[OsString]) -> bool {
+    for arg in args {
+        let arg = arg.to_string_lossy();
+        if arg == "--" {
+            return false;
+        }
+        if arg == "--cd" || arg.starts_with("--cd=") || arg.starts_with("-C") {
+            return true;
+        }
+    }
+    false
+}
+
+/// The project-file half of a Codex read (A-20d-1b): a project file that
+/// can't be read or parsed holds as such, and one whose table has a
+/// `tui.keymap` holds as [`Hold::Unpinned`], since whether Codex loads it
+/// depends on the project root and trust the deck doesn't resolve
+/// ([`codex_project_files`]). With no keymap in any of them, the project
+/// layer can't move a binding whichever of them Codex loads, so merging
+/// them all ([`codex_keymap`]) reads what Codex reads. Absent files allow.
+pub fn codex_projects_guard(read: &CodexRead) -> Result<(), Hold> {
+    for project in &read.projects {
+        match project {
+            SourceRead::Absent => {}
+            SourceRead::Unreadable(why) => return Err(Hold::Unreadable(*why)),
+            SourceRead::Present { contents, .. } => {
+                let text = std::str::from_utf8(contents).map_err(|_| Hold::Unparsable)?;
+                let table: toml::Table = text.parse().map_err(|_| Hold::Unparsable)?;
+                if table
+                    .get("tui")
+                    .and_then(toml::Value::as_table)
+                    .is_some_and(|tui| tui.contains_key("keymap"))
+                {
+                    return Err(Hold::Unpinned);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A Codex launch's sources and their read, taken before its spawn
+/// (A-20d-1b, R5 §7.1: "the deck reads them before the spawn").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexBaseline {
+    pub sources: CodexSources,
+    pub read: CodexRead,
+}
+
+impl CodexBaseline {
+    /// The sources of a launch with `args` (after the program) in `cwd`,
+    /// with `codex_home`, read now. File I/O: no lock held. A launch that
+    /// moves its cwd holds as [`Hold::Unpinned`].
+    pub fn at_spawn(
+        codex_home: &Path,
+        args: &[OsString],
+        cwd: &Path,
+    ) -> Result<CodexBaseline, Hold> {
+        let sources = codex_launch(codex_home, args, cwd)?;
+        let read = sources.read();
+        Ok(CodexBaseline { sources, read })
+    }
+
+    /// The baseline against the launch the bound agent actually made, with
+    /// `args` in `cwd`: the same sources, or [`Hold::Changed`] (a launcher
+    /// that passed other flags, or started Codex in another directory).
+    pub fn bound(&self, codex_home: &Path, args: &[OsString], cwd: &Path) -> Result<(), Hold> {
+        if codex_launch(codex_home, args, cwd)? == self.sources {
+            Ok(())
+        } else {
+            Err(Hold::Changed)
+        }
+    }
+}
+
+/// [`CodexSources::from_launch`] with the project files for `cwd`.
+fn codex_launch(codex_home: &Path, args: &[OsString], cwd: &Path) -> Result<CodexSources, Hold> {
+    if codex_moves_cwd(args) {
+        return Err(Hold::Unpinned);
+    }
+    CodexSources::from_launch(codex_home, args, codex_project_files(cwd, codex_home)?)
+}
+
+/// A generation's key-binding sources read before its spawn (A-20d-1b): what
+/// each later read is compared with, so a change made after the spawn and
+/// before the deck first reads them is seen, rather than becoming the
+/// baseline. One per agent the generation may turn out to be: a wrapper's
+/// agent is learned only after its spawn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeymapBaseline {
+    /// Claude Code's `keybindings.json` and its read.
+    pub claude: Result<(PathBuf, SourceRead), Hold>,
+    pub codex: Result<CodexBaseline, Hold>,
+}
+
+impl KeymapBaseline {
+    /// Read now, before the spawn, for the agents named: the spawn's
+    /// environment `env` (its own variables over the daemon's), its
+    /// arguments `args` (after the program) and its working directory
+    /// `cwd`. An agent not named is [`Hold::Unmeasured`]. File I/O: no lock
+    /// held.
+    pub fn at_spawn(
+        claude: bool,
+        codex: bool,
+        env: impl Fn(&str) -> Option<OsString>,
+        args: &[OsString],
+        cwd: &Path,
+    ) -> KeymapBaseline {
+        KeymapBaseline {
+            claude: if claude {
+                claude_keybindings_path(&env).map(|path| {
+                    let read = read_source(&path);
+                    (path, read)
+                })
+            } else {
+                Err(Hold::Unmeasured)
+            },
+            codex: if codex {
+                codex_home(&env)
+                    .ok_or(Hold::Unmeasured)
+                    .and_then(|home| CodexBaseline::at_spawn(&home, args, cwd))
+            } else {
+                Err(Hold::Unmeasured)
+            },
+        }
+    }
 }
 
 fn layer(merged: &mut toml::Table, read: &SourceRead) -> Result<(), Hold> {

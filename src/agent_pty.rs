@@ -14510,6 +14510,19 @@ impl AgentPtyRegistry {
         if let Some(installation) = &composer_install {
             installation.apply_env(&mut opts.env);
         }
+        // PRD #1666 part 3 (A-20d-1b): the generation's key-binding sources,
+        // read before the child exists, as the command it runs will see
+        // them: what the observer compares every later read with. Off the
+        // executor: it is file I/O.
+        #[cfg(target_os = "linux")]
+        let composer_install = composer_install.map(|mut installation| {
+            let command = installed_command.as_deref().or(opts.command);
+            let (env, cwd) = (&opts.env, opts.cwd);
+            crate::inbox_hub::off_the_executor(|| {
+                installation.read_keymap_baseline(command, env, cwd);
+            });
+            installation
+        });
         let opts = SpawnOptions {
             command: installed_command.as_deref().or(opts.command),
             ..opts

@@ -1355,8 +1355,8 @@ mod linux {
         watch: Watch,
     }
 
-    /// Q35-20 (O-20.7b): a generation's keymap sources as read when its
-    /// permission settled, and what an admission compares a fresh read with.
+    /// Q35-20 (O-20.7b): a generation's keymap sources as read before its
+    /// spawn (A-20d-1b), which every later read is compared with.
     enum KeymapEvidence {
         Claude(crate::composer_probe::keymap::ClaudeKeymap),
         Codex {
@@ -1376,7 +1376,15 @@ mod linux {
                     before,
                     precedence,
                 } => {
-                    crate::composer_probe::keymap::codex_keymap(before, &sources.read(), precedence)
+                    use crate::composer_probe::keymap;
+                    let after = sources.read();
+                    if **before != after {
+                        return Err(keymap::Hold::Changed);
+                    }
+                    // A-20d-1b: the project files are a superset of what
+                    // Codex loads; a keymap in any of them holds.
+                    keymap::codex_projects_guard(before)?;
+                    keymap::codex_keymap(before, &after, precedence)
                 }
                 KeymapEvidence::Held(hold) => Err(*hold),
             }
@@ -1424,9 +1432,13 @@ mod linux {
         lost: Arc<Pool>,
         bell: Arc<Bell>,
         stopped: std::sync::atomic::AtomicBool,
-        /// Q35-20 (O-20.7b): the keymap sources as read when the
-        /// permission settled `Armable`.
+        /// Q35-20 (O-20.7b): the keymap evidence the permission settled
+        /// `Armable` with, built from [`Self::keymap_baseline`].
         keymap: std::sync::OnceLock<KeymapEvidence>,
+        /// The key-binding sources as the spawn path read them before the
+        /// child existed (A-20d-1b). `None` (an installation no spawn path
+        /// read for) gives no evidence: the keymap holds as unmeasured.
+        keymap_baseline: Option<crate::composer_probe::keymap::KeymapBaseline>,
         /// A test's park in the drain (Q91), called with each exited
         /// record's key between the drain's snapshot and its settlement,
         /// with no lock held.
@@ -1953,7 +1965,7 @@ mod linux {
         /// bell in `slot`. `None` when its name isn't a number, which every
         /// generation the daemon spawns has, or its instance can't be read.
         pub fn start(
-            installation: Installation,
+            mut installation: Installation,
             spawned: Spawned,
             slot: &super::BellSlot,
         ) -> Option<Arc<Observer>> {
@@ -1972,6 +1984,7 @@ mod linux {
             let reader = InstanceReader::open(installation.instance_dir()).ok()?;
             let helper_id = installation.helper_id();
             let launch = installation.launch().to_vec();
+            let keymap_baseline = installation.take_keymap_baseline();
             if !spawned
                 .input
                 .attach_records(Records::new(generation, EC_POLICY, Instant::now()))
@@ -2020,6 +2033,7 @@ mod linux {
                 bell: Arc::clone(&bell),
                 stopped: std::sync::atomic::AtomicBool::new(false),
                 keymap: std::sync::OnceLock::new(),
+                keymap_baseline,
                 #[cfg(test)]
                 drain_park: std::sync::Mutex::new(None),
                 #[cfg(test)]
@@ -2142,44 +2156,61 @@ mod linux {
             }
         }
 
-        /// The keymap evidence for `agent` under `probe` (O-20.7b): Claude's
-        /// `keybindings.json` read now; Codex's launch sources (its config,
-        /// profile and the overrides on `args`, the bound agent's own
-        /// arguments) read now. Codex's trusted project files and its
-        /// pre-spawn read aren't read here.
+        /// The keymap evidence for `agent` under `probe` (O-20.7b), built
+        /// from the sources read before the spawn (A-20d-1b), so a change
+        /// made between the spawn and this settlement holds rather than
+        /// becoming what later reads are compared with. Claude Code's
+        /// `keybindings.json` read then, at the path the agent's environment
+        /// still names. Codex's sources read then, only when the bound agent
+        /// launched with the same ones: its own arguments `args` (a direct
+        /// Codex's `-c` overrides and profile are on its argv), its own
+        /// working directory `cwd` for the project files, and the same
+        /// home; otherwise it holds as changed. No baseline, or no `cwd` for
+        /// Codex, holds as unmeasured.
         fn keymap_evidence(
             &self,
             agent: &AgentType,
             probe: &EditorProbe<'static>,
             args: &[OsString],
+            cwd: Option<&std::path::Path>,
         ) -> KeymapEvidence {
             use crate::composer_probe::keymap;
+            let Some(baseline) = self.keymap_baseline.as_ref() else {
+                return KeymapEvidence::Held(keymap::Hold::Unmeasured);
+            };
             let env = |name: &str| self.env_value(name);
             match agent {
-                AgentType::ClaudeCode => match keymap::claude_keybindings_path(env) {
-                    Ok(path) => KeymapEvidence::Claude(keymap::ClaudeKeymap::at_spawn(path, probe)),
-                    Err(hold) => KeymapEvidence::Held(hold),
-                },
+                AgentType::ClaudeCode => {
+                    let (path, read) = match &baseline.claude {
+                        Ok(spawn) => spawn,
+                        Err(hold) => return KeymapEvidence::Held(*hold),
+                    };
+                    match keymap::claude_keybindings_path(env) {
+                        Ok(now) if now == *path => {
+                            KeymapEvidence::Claude(keymap::ClaudeKeymap::from_spawn_read(
+                                path.clone(),
+                                read.clone(),
+                                probe,
+                            ))
+                        }
+                        Ok(_) => KeymapEvidence::Held(keymap::Hold::Changed),
+                        Err(hold) => KeymapEvidence::Held(hold),
+                    }
+                }
                 AgentType::Codex => {
-                    let home = self
-                        .env_value("CODEX_HOME")
-                        .map(std::path::PathBuf::from)
-                        .or_else(|| {
-                            self.env_value("HOME")
-                                .map(|h| std::path::PathBuf::from(h).join(".codex"))
-                        });
-                    let Some(home) = home else {
+                    let codex = match &baseline.codex {
+                        Ok(codex) => codex,
+                        Err(hold) => return KeymapEvidence::Held(*hold),
+                    };
+                    let (Some(home), Some(cwd)) = (keymap::codex_home(env), cwd) else {
                         return KeymapEvidence::Held(keymap::Hold::Unmeasured);
                     };
-                    match keymap::CodexSources::from_launch(&home, args, Vec::new()) {
-                        Ok(sources) => {
-                            let before = Box::new(sources.read());
-                            KeymapEvidence::Codex {
-                                sources,
-                                before,
-                                precedence: probe.keymap_sources,
-                            }
-                        }
+                    match codex.bound(&home, args, cwd) {
+                        Ok(()) => KeymapEvidence::Codex {
+                            sources: codex.sources.clone(),
+                            before: Box::new(codex.read.clone()),
+                            precedence: probe.keymap_sources,
+                        },
                         Err(hold) => KeymapEvidence::Held(hold),
                     }
                 }
@@ -2645,9 +2676,10 @@ mod linux {
                 );
                 permission = Permission::Inert(InertCause::Unbound);
             }
-            // Q35-20 (O-20.7b): the generation's keymap sources, read now,
-            // with no lock held, for its release's record: what each
-            // admission compares a fresh read with.
+            // Q35-20 (O-20.7b): the generation's keymap evidence for its
+            // release's record, from the sources read before its spawn
+            // (A-20d-1b), checked with no lock held: what each admission and
+            // settlement compares a fresh read with.
             if permission == Permission::Armable
                 && let Some(LatchedRelease::Known(release)) = header.as_ref()
                 && let Some(probe) = records
@@ -2666,7 +2698,13 @@ mod linux {
                     .and_then(|a| proc_facts(a.pid))
                     .map(|f| f.argv.get(1..).unwrap_or_default().to_vec())
                     .unwrap_or_default();
-                let _ = self.keymap.set(self.keymap_evidence(agent, &probe, &args));
+                // Its working directory, for Codex's project files.
+                let cwd = identity
+                    .as_ref()
+                    .and_then(|a| std::fs::read_link(format!("/proc/{}/cwd", a.pid)).ok());
+                let _ = self
+                    .keymap
+                    .set(self.keymap_evidence(agent, &probe, &args, cwd.as_deref()));
             }
             let won = {
                 let mut inner = self.lock();

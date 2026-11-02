@@ -914,3 +914,114 @@ fn probe_014_a_present_source_the_record_doesnt_list_holds() {
         "the full order"
     );
 }
+
+/// Scenario: List the project files a Codex launch in a nested cwd may read, with Codex's home inside one of its ancestors and with it elsewhere, and from a relative cwd. Every ancestor's `.codex/config.toml` is listed, the root's first and the cwd's last, except the one that is Codex's own home; a relative cwd holds as unmeasured (A-20d-1b).
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_codex_project_files_are_every_ancestors_but_its_home() {
+    use dot_agent_deck::composer_probe::keymap::codex_project_files;
+    let files = codex_project_files(Path::new("/w/repo/sub"), Path::new("/w/.codex")).unwrap();
+    assert_eq!(
+        files,
+        vec![
+            PathBuf::from("/.codex/config.toml"),
+            PathBuf::from("/w/repo/.codex/config.toml"),
+            PathBuf::from("/w/repo/sub/.codex/config.toml"),
+        ],
+        "the home's own `.codex` is Codex's config, not a project's"
+    );
+    let all = codex_project_files(Path::new("/w/repo"), Path::new("/elsewhere/.codex")).unwrap();
+    assert_eq!(all.len(), 3, "/, /w and /w/repo: {all:?}");
+    assert_eq!(
+        codex_project_files(Path::new("repo"), Path::new("/h/.codex")),
+        Err(Hold::Unmeasured)
+    );
+}
+
+/// Scenario: Read a Codex launch whose project files sit in the cwd and in an ancestor, through the project guard. With no keymap in any of them the probe is allowed, even where the files would rebind if read; a keymap in either one, binding the editor away or even to Ctrl+G, holds as unpinned, since whether Codex loads it depends on the root and trust the deck doesn't resolve; a project file that isn't TOML holds as unparsable and a directory in its place as unreadable (A-20d-1b).
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_a_keymap_in_any_codex_project_file_holds() {
+    use dot_agent_deck::composer_probe::keymap::{CodexBaseline, codex_projects_guard};
+    let dir = test_temp::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let cwd = dir.path().join("repo/sub");
+    std::fs::create_dir_all(cwd.join(".codex")).unwrap();
+    std::fs::create_dir_all(dir.path().join("repo/.codex")).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let guard = || codex_projects_guard(&CodexBaseline::at_spawn(&home, &[], &cwd).unwrap().read);
+
+    assert_eq!(guard(), Ok(()), "no project file at all");
+    write(&cwd.join(".codex/config.toml"), "model = \"o3\"\n");
+    write(
+        &dir.path().join("repo/.codex/config.toml"),
+        "[tui]\nalt_screen = false\n",
+    );
+    assert_eq!(guard(), Ok(()), "project files without a keymap");
+    for (file, contents) in [
+        (cwd.join(".codex/config.toml"), editor_on("f6")),
+        (
+            dir.path().join("repo/.codex/config.toml"),
+            editor_on("ctrl-g"),
+        ),
+    ] {
+        let before = std::fs::read(&file).unwrap();
+        std::fs::write(&file, contents).unwrap();
+        assert_eq!(guard(), Err(Hold::Unpinned), "{}", file.display());
+        std::fs::write(&file, before).unwrap();
+    }
+    write(&cwd.join(".codex/config.toml"), "not = [toml");
+    assert_eq!(guard(), Err(Hold::Unparsable));
+    std::fs::remove_file(cwd.join(".codex/config.toml")).unwrap();
+    std::fs::create_dir(cwd.join(".codex/config.toml")).unwrap();
+    assert!(matches!(guard(), Err(Hold::Unreadable(_))));
+}
+
+/// Scenario: Take a Codex launch's baseline before its spawn, then compare it with the launch the bound agent made. The same flags in the same cwd match; another `-c`, another profile or another cwd hold as changed; `-C`/`--cd` in any form, before `--`, holds as unpinned at the spawn and at the binding. A project file changed between the spawn's read and a later read holds as changed (A-20d-1b).
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_codex_launches_are_compared_with_the_spawns_baseline() {
+    use dot_agent_deck::composer_probe::keymap::{CodexBaseline, codex_moves_cwd};
+    let dir = test_temp::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let cwd = dir.path().join("repo");
+    let other = dir.path().join("other");
+    for d in [&home, &cwd.join(".codex"), &other] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let launch = args(&["-c", "model=\"o3\"", "-p", "work"]);
+    let baseline = CodexBaseline::at_spawn(&home, &launch, &cwd).unwrap();
+    assert_eq!(baseline.bound(&home, &launch, &cwd), Ok(()));
+    assert_eq!(
+        baseline.bound(&home, &args(&["-c", "model=\"o4\"", "-p", "work"]), &cwd),
+        Err(Hold::Changed)
+    );
+    assert_eq!(
+        baseline.bound(&home, &args(&["-c", "model=\"o3\""]), &cwd),
+        Err(Hold::Changed)
+    );
+    assert_eq!(baseline.bound(&home, &launch, &other), Err(Hold::Changed));
+    for moved in [&["-C", "/x"][..], &["-C/x"], &["--cd", "/x"], &["--cd=/x"]] {
+        assert!(codex_moves_cwd(&args(moved)), "{moved:?}");
+        assert_eq!(
+            CodexBaseline::at_spawn(&home, &args(moved), &cwd),
+            Err(Hold::Unpinned)
+        );
+        assert_eq!(
+            baseline.bound(&home, &args(moved), &cwd),
+            Err(Hold::Unpinned)
+        );
+    }
+    assert!(!codex_moves_cwd(&args(&["--", "-C", "/x"])));
+    assert!(!codex_moves_cwd(&args(&["-c", "k=v"])));
+
+    write(&cwd.join(".codex/config.toml"), "model = \"o3\"\n");
+    let fresh = CodexBaseline::at_spawn(&home, &launch, &cwd).unwrap();
+    std::thread::sleep(TICK);
+    write(&cwd.join(".codex/config.toml"), "model = \"o4\"\n");
+    assert_eq!(
+        codex_keymap(&fresh.read, &fresh.sources.read(), CODEX_ORDER),
+        Err(Hold::Changed),
+        "a project file changed since the spawn"
+    );
+}

@@ -154,6 +154,10 @@ struct Deck {
     token: String,
     handle: tokio::task::JoinHandle<Result<(), DaemonError>>,
     started: Vec<Child>,
+    /// A bound deck's release latch reports the release once this is set,
+    /// and nothing before, so the permission waits (set at the start
+    /// unless the deck was started with its latch held back).
+    latched: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Deck {
@@ -174,11 +178,23 @@ impl Deck {
     /// ([`Deck::keybindings`]), so the generation's keymap is read from a
     /// file the test owns rather than from the user's own.
     async fn start_bound_at_home() -> Deck {
-        Deck::start_with_home(true, true).await
+        Deck::start_with_home(true, true, true).await
+    }
+
+    /// [`Deck::start_bound_at_home`] whose release latch reports nothing
+    /// until [`Deck::latch`], so its permission stays pending until then.
+    async fn start_bound_at_home_latched_later() -> Deck {
+        Deck::start_with_home(true, true, false).await
+    }
+
+    /// Let a deck started with its latch held back see its release.
+    fn latch(&self) {
+        self.latched
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     async fn start_with(bound: bool) -> Deck {
-        Deck::start_with_home(bound, false).await
+        Deck::start_with_home(bound, false, true).await
     }
 
     /// The Claude `keybindings.json` of a deck started at home.
@@ -186,7 +202,8 @@ impl Deck {
         self.dir.path().join("home/.claude/keybindings.json")
     }
 
-    async fn start_with_home(bound: bool, home: bool) -> Deck {
+    async fn start_with_home(bound: bool, home: bool, latched: bool) -> Deck {
+        let latched = Arc::new(std::sync::atomic::AtomicBool::new(latched));
         let registry = Arc::new(AgentPtyRegistry::new());
         let id = registry
             .spawn_agent(SpawnOptions {
@@ -244,14 +261,28 @@ impl Deck {
                 "the test binary runs by an absolute path: {launch:?}"
             );
             installation.set_launch(launch);
+            if home {
+                let claude = dir.path().join("home/.claude");
+                std::fs::create_dir_all(&claude).unwrap();
+                std::fs::write(claude.join("keybindings.json"), "{}").unwrap();
+                // What the spawn path reads before the child exists
+                // (A-20d-1b), with the agent's own `HOME`.
+                let home_dir = dir.path().join("home");
+                installation.set_keymap_baseline(
+                    crate::composer_probe::keymap::KeymapBaseline::at_spawn(
+                        true,
+                        false,
+                        |name| (name == "HOME").then(|| home_dir.clone().into_os_string()),
+                        &[],
+                        dir.path(),
+                    ),
+                );
+            }
             let mut env = vec![(
                 "TMPDIR".to_string(),
                 dir.path().to_str().unwrap().to_string(),
             )];
             if home {
-                let claude = dir.path().join("home/.claude");
-                std::fs::create_dir_all(&claude).unwrap();
-                std::fs::write(claude.join("keybindings.json"), "{}").unwrap();
                 env.push((
                     "HOME".to_string(),
                     dir.path().join("home").to_str().unwrap().to_string(),
@@ -263,7 +294,16 @@ impl Deck {
                 env,
                 child: Some((me, start_of(me))),
                 input: Arc::new(GenerationInput::default()),
-                latch: Box::new(|_| LatchedRelease::Known(release())),
+                latch: Box::new({
+                    let latched = Arc::clone(&latched);
+                    move |_| {
+                        if latched.load(std::sync::atomic::Ordering::SeqCst) {
+                            LatchedRelease::Known(release())
+                        } else {
+                            LatchedRelease::Unseen
+                        }
+                    }
+                }),
                 assumed: assumed(),
             }
         } else {
@@ -315,6 +355,7 @@ impl Deck {
             token,
             handle,
             started: Vec::new(),
+            latched,
         }
     }
 
@@ -1728,4 +1769,41 @@ async fn probe_014_a_generation_retired_inside_the_reread_window_applies_nothing
         "the allowing verdict applied nothing to the retired generation"
     );
     deck.stop().await;
+}
+
+/// Scenario: A bound deck at home is spawned with an empty `keybindings.json`, its release latch held back so its permission waits. The binding file changes after the spawn and before the deck sees the agent's release; then the release is latched and the permission settles `Armable`. The keymap reads `Changed`: the read the generation is compared with is the one taken before its spawn, which the agent loaded, not one taken at settlement. Left unchanged (the control), the keymap allows (A-20d-1b, the pre-spawn baseline).
+#[spec("inbox/probe/014")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_014_a_binding_changed_between_the_spawn_and_the_permission_holds() {
+    use crate::composer_probe::keymap::Hold;
+    for changed in [false, true] {
+        let deck = Deck::start_bound_at_home_latched_later().await;
+        let observer = Arc::clone(&deck.observer);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            observer.permission(),
+            Permission::Pending,
+            "no release seen yet"
+        );
+        if changed {
+            std::fs::write(deck.keybindings(), r#"{"bindings": []}"#).unwrap();
+        }
+        deck.latch();
+        assert!(
+            wait_for(SETTLE, || observer.permission() == Permission::Armable).await,
+            "the permission settles once the release is seen"
+        );
+        let keymap = tokio::task::spawn_blocking({
+            let observer = Arc::clone(&observer);
+            move || observer.keymap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            keymap,
+            if changed { Err(Hold::Changed) } else { Ok(()) },
+            "changed: {changed}"
+        );
+        deck.stop().await;
+    }
 }
