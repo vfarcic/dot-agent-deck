@@ -6376,6 +6376,18 @@ impl WithdrawUnlessAnswered<'_> {
         }
         withdrawn
     }
+
+    /// The job's reply closed unanswered: the job was dropped, so the writer
+    /// thread is gone. A job the thread never started (one still in the queue
+    /// when the thread ended, PRD #1666 part 3) is taken back here and leaves
+    /// the in-flight count it entered; one the thread started and unwound in
+    /// is left counted. Its ticket is not touched here: the job's own
+    /// `JobTicket`, dropped with the job, settles it.
+    fn gone(&mut self) -> PtyJobOutcome {
+        self.in_flight.withdraw(self.state);
+        self.armed = false;
+        PtyJobOutcome::Gone
+    }
 }
 
 impl Drop for WithdrawUnlessAnswered<'_> {
@@ -6502,6 +6514,11 @@ impl PtyWriterThread {
                             }
                             thread_in_flight.leave();
                         }
+                        // The claim goes before the reply closes, so whoever
+                        // the closed reply wakes finds this thread no longer
+                        // holding it.
+                        drop(state);
+                        drop(reply);
                         continue;
                     }
                     // PRD #1666 part 3 (A-20d-4, Q118b): a probe's job is
@@ -6933,11 +6950,11 @@ impl PtyWriterThread {
         let outcome = match bound {
             None => match (&mut rx).await {
                 Ok(done) => PtyJobOutcome::Done(done),
-                Err(_) => PtyJobOutcome::Gone,
+                Err(_) => guard.gone(),
             },
             Some(bound) => match within_real_time(bound, &mut rx).await {
                 Some(Ok(done)) => PtyJobOutcome::Done(done),
-                Some(Err(_)) => PtyJobOutcome::Gone,
+                Some(Err(_)) => guard.gone(),
                 None if guard.withdraw() => PtyJobOutcome::Withdrawn,
                 // Started: it may have finished in the instant since the
                 // alarm rang, in which case its answer is the truth.
@@ -6981,7 +6998,7 @@ impl PtyWriterThread {
         };
         let outcome = match rx.await {
             Ok(done) => PtyJobOutcome::Done(done),
-            Err(_) => PtyJobOutcome::Gone,
+            Err(_) => guard.gone(),
         };
         guard.armed = false;
         outcome

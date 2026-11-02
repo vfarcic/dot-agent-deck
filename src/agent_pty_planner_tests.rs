@@ -18,7 +18,9 @@ const G: u64 = 7;
 /// per-call cap a call takes at most that many (a short write), and with
 /// `shut_after` the call after that many calls finds it shut. With
 /// `panic_on` that call (counted from 0) takes its bytes and then panics
-/// before it returns, unwinding the writer thread.
+/// before it returns, unwinding the writer thread; with `hold_unwind` too,
+/// that unwind waits inside the write, before the writer thread drops its
+/// job queue, until the hold's sender sends or is dropped.
 struct Scripted {
     chunks: Arc<Mutex<Vec<Vec<u8>>>>,
     open: Arc<(Mutex<bool>, std::sync::Condvar)>,
@@ -27,7 +29,20 @@ struct Scripted {
     per_call: Option<usize>,
     shut_after: Option<usize>,
     panic_on: Option<usize>,
+    hold_unwind: Option<std::sync::mpsc::Receiver<()>>,
     calls: usize,
+}
+
+/// Holds a [`Scripted`] writer's unwind where it is dropped, until its
+/// receiver hears from the test.
+struct UnwindHold(Option<std::sync::mpsc::Receiver<()>>);
+
+impl Drop for UnwindHold {
+    fn drop(&mut self) {
+        if let Some(hold) = self.0.take() {
+            let _ = hold.recv();
+        }
+    }
 }
 
 impl std::io::Write for Scripted {
@@ -55,6 +70,7 @@ impl std::io::Write for Scripted {
         };
         self.chunks.lock().unwrap().push(buf[..n].to_vec());
         if self.panic_on == Some(self.calls - 1) {
+            let _hold = UnwindHold(self.hold_unwind.take());
             panic!("the scripted PTY writer unwinds after taking {n} bytes");
         }
         Ok(n)
@@ -92,6 +108,7 @@ struct Script {
     per_call: Option<usize>,
     shut_after: Option<usize>,
     panic_on: Option<usize>,
+    hold_unwind: Option<std::sync::mpsc::Receiver<()>>,
     pane: bool,
 }
 
@@ -129,6 +146,7 @@ impl Rig {
                 per_call: script.per_call,
                 shut_after: script.shut_after,
                 panic_on: script.panic_on,
+                hold_unwind: script.hold_unwind,
                 calls: 0,
             }),
             script.pane.then(|| PANE.to_string()),
@@ -713,6 +731,88 @@ async fn probe_010_a_writer_unwinding_before_it_counts_a_prefix_settles_the_rest
         Some(b"exited".as_slice())
     );
     assert!(rig.notices.try_recv().is_err(), "told once");
+}
+
+/// Scenario: Behind a check, hold `ab`, BEL and `cd` on a shut PTY, release once, retire the generation and open the PTY, so the writer thread panics after the PTY takes the prefix; its unwind is held before the thread drops its job queue. A person's write, a bounded write and a queued write are sent into that still-open queue, then the unwind finishes: each finds the writer gone and leaves the in-flight count it entered, so only the unwound prefix stays counted, and the frame's ticket settles once, refused `exited`.
+#[spec("inbox/probe/010")]
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_010_a_job_queued_to_a_writer_still_unwinding_leaves_the_count_when_it_goes() {
+    let (release_unwind, hold) = std::sync::mpsc::channel();
+    let rig = Arc::new(Rig::scripted(
+        false,
+        Script {
+            panic_on: Some(0),
+            hold_unwind: Some(hold),
+            ..Script::default()
+        },
+    ));
+    rig.fence();
+    let (_, ticket) = rig.offer(b"ab\x07cd").await;
+    rig.release();
+    rig.write_entered().await;
+    rig.writer.gate().retire();
+    rig.open();
+    rig.taken_becomes(b"ab\x07").await;
+    let before = rig.in_flight();
+    assert_eq!(before, 1, "the prefix, which the unwind never counts out");
+    let user = tokio::spawn({
+        let rig = Arc::clone(&rig);
+        async move { rig.writer.write_user(b"z").await }
+    });
+    let bounded = tokio::spawn({
+        let rig = Arc::clone(&rig);
+        async move {
+            rig.writer
+                .pty
+                .run(
+                    PtyOp::WriteAll(b"y".to_vec(), ByteSource::User, true),
+                    Some(Duration::from_secs(60)),
+                )
+                .await
+        }
+    });
+    let queued = tokio::spawn({
+        let rig = Arc::clone(&rig);
+        async move {
+            rig.writer
+                .pty
+                .run_queued(
+                    PtyOp::WriteAll(b"x".to_vec(), ByteSource::User, true),
+                    || {},
+                    None,
+                )
+                .await
+        }
+    });
+    // All three are in the queue the held unwind has not dropped yet.
+    rig.flight(before + 3).await;
+    release_unwind.send(()).unwrap();
+    let user = tokio::time::timeout(Duration::from_secs(8), user)
+        .await
+        .expect("a job in a dead writer's queue answers")
+        .unwrap();
+    let bounded = tokio::time::timeout(Duration::from_secs(8), bounded)
+        .await
+        .expect("a job in a dead writer's queue answers")
+        .unwrap();
+    let queued = tokio::time::timeout(Duration::from_secs(8), queued)
+        .await
+        .expect("a job in a dead writer's queue answers")
+        .unwrap();
+    assert!(user.is_err(), "the writer is gone");
+    assert!(matches!(bounded, PtyJobOutcome::Gone));
+    assert!(matches!(queued, PtyJobOutcome::Gone));
+    assert_eq!(
+        rig.in_flight(),
+        before,
+        "each job that went with the queue left the count it entered"
+    );
+    assert_eq!(rig.taken(), b"ab\x07", "none of them was written");
+    assert_eq!(
+        rig.settles(ticket).await,
+        [Settlement::Refused("exited")],
+        "the held frame still settles once"
+    );
 }
 
 /// Scenario: Behind a check, hold `ab`, BEL and `cd` on a PTY that takes two bytes and then fails; release once, so the prefix writes `ab` and fails and its connection is told. Then the writer thread leaves and the rest is released, so its job can't be queued. The connection isn't told a second time, and the ticket settles once, as two bytes written in part.
