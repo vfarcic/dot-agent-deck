@@ -250,9 +250,18 @@ fn probe_029_codex_requires_the_complete_matched_return() {
     // CAPTURE BRANCH ONLY (agent/dispatch-p029-capture, never merged): repeat
     // the scenario and, on a miss, print what the probe answered and what the
     // daemon and fixture saw.
-    for i in 0..30 {
-        probe_029_capture_once(i);
+    // Run 2: three fixtures at once per round, until 140 s have passed.
+    let begin = Instant::now();
+    let mut round = 0;
+    while begin.elapsed() < Duration::from_secs(140) {
+        std::thread::scope(|s| {
+            for lane in 0..3 {
+                s.spawn(move || probe_029_capture_once(round * 3 + lane));
+            }
+        });
+        round += 1;
     }
+    eprintln!("capture done: {} iterations", round * 3);
 }
 
 fn probe_029_capture_once(i: u32) {

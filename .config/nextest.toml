@@ -893,4 +893,8 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 # five-second hold, and the kept-draft case runs three decks in turn.
 [[profile.default.overrides]]
 filter = 'test(/^doorbell_010_live_(kept_draft|spaces_only|spaces_moved_back|blanks_enter|reviewer_sequence)/)'
+# CAPTURE BRANCH ONLY (agent/dispatch-p029-capture): show every iteration.
+[[profile.default.overrides]]
+filter = 'test(=probe_029_codex_requires_the_complete_matched_return)'
+success-output = "immediate"
 slow-timeout = { period = "60s", terminate-after = 5 }
