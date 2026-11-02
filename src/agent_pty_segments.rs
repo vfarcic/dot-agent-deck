@@ -48,9 +48,14 @@
 //!
 //! The keymap is file I/O and is read with no lock held: after a pending
 //! permission is settled, and again after an O5 wait, so nothing read before
-//! a sleep stands after it. Between its last read and the byte, a change to
-//! the agent's key bindings is not seen: its re-check at settlement
-//! (O-20.7b) is an activation blocker (`plan-p3.md`'s activation list).
+//! a sleep stands after it. A change to the agent's key bindings between
+//! that read and the byte is seen at the probe's settlement (O-20.7b,
+//! A-20d-1a): an `Armed` empty read is decided under R6 and parked, the
+//! observer reads the keymap again with no lock held, and the settlement
+//! applies the read under R6 only with that later read allowing it, and
+//! only while the generation that parked it hasn't retired
+//! (`GenerationInput::settle_keymap_recheck`). A change after that last
+//! read is the next admission's to see.
 //!
 //! **Lock order.**
 //! ```text
@@ -1118,10 +1123,13 @@ pub(crate) fn tick_probe(
     status: crate::composer_probe::gate::Status,
     now: Instant,
 ) -> TickProbe {
+    // An empty read waiting for its keymap re-read (A-20d-1a) is a check
+    // still outstanding.
     let outstanding = status.fenced
         || input
             .segments_front()
-            .is_some_and(|front| front != Front::None);
+            .is_some_and(|front| front != Front::None)
+        || input.settling();
     if outstanding {
         // U3-02: its own lapsed Claude probe, alone with nothing held
         // behind it, is superseded by the schedule's retry once due.

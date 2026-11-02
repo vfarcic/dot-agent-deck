@@ -1,6 +1,9 @@
 //! Test seam (Q84-3): park a real feeder at a named point between taking
 //! its timestamp and publishing it, so a test can run a racing caller in
-//! that window and then let the feeder go on with its earlier stamp.
+//! that window and then let the feeder go on with its earlier stamp. The
+//! observer's keymap re-read parks here too (A-20d-1a,
+//! [`StampPoint::KeymapRecheck`]), between reading what it settles and
+//! reading the keymap.
 //!
 //! The module is compiled only under `cfg(test)`, and so is every call to
 //! [`StampPark::at`] in the feeders (`OutputHook::on_output`, the observer's
@@ -26,6 +29,11 @@ pub enum StampPoint {
     /// lock nor the generation's taken yet. Linux only, as the observer is.
     #[cfg(target_os = "linux")]
     MarkerStamped,
+    /// The observer's keymap re-read at an empty read's settlement
+    /// (A-20d-1a): which parked reads it settles read, the keymap not yet
+    /// read. Not a stamp: the same park serves this window. Linux only.
+    #[cfg(target_os = "linux")]
+    KeymapRecheck,
 }
 
 type Park = Arc<dyn Fn(StampPoint) + Send + Sync>;

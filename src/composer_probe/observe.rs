@@ -104,6 +104,9 @@
 //!                                                     └─> seam (Mutex) ─> input (R6)
 //!                                                                  └─> arm page stores
 //! settle claim (atomic, held across bind and the gen-G write, no lock) ─> seam
+//! keymap re-read (A-20d-1a): input (R6, which parked reads, released) ; keymap
+//!                files read (no lock) ; input (R6, settle them)
+//! parked read's wake: under R6 ─> Bell (atomics, unpark)
 //! output lock (bus) ─> Bell (atomics, unpark)
 //! observer exit observed ─> Departure (once-set instant, notify) ─> hook task's read deadline
 //! retirement: R4 ─> R6 (retire_taking_first_stop); Observer::stop (atomics)
@@ -1983,10 +1986,17 @@ mod linux {
                 Some(AgentType::Codex) => Some(crate::composer_probe::segments::Agent::Codex),
                 _ => None,
             };
+            let bell = Arc::new(Bell::default());
             if let Some(segments_agent) = segments_agent {
                 spawned.input.attach_segments(generation, segments_agent);
+                // Q35-21 (A-20d-1a): an empty read's settlement waits for
+                // the keymap read this observer's next pass takes; the wake
+                // is the bell's unpark, which takes no lock.
+                let wake = Arc::clone(&bell);
+                spawned
+                    .input
+                    .recheck_keymap_at_settlement(Arc::new(move || wake.ring()));
             }
-            let bell = Arc::new(Bell::default());
             let observer = Arc::new(Observer {
                 agent_id: spawned.agent_id,
                 generation,
@@ -2720,6 +2730,26 @@ mod linux {
             self.exits();
             self.drains(&mut budget);
             self.kills();
+            self.recheck_keymap();
+        }
+
+        /// Q35-21 (A-20d-1a, O-20.7b): the keymap re-read an `Armed` empty
+        /// read's settlement waits for. Which parked reads it settles is read
+        /// under R6 first; the keymap is then read with no lock held, after
+        /// every one of them parked; and the verdict goes back under R6,
+        /// where it settles them only if this generation hasn't retired in
+        /// between. Last in the pass, so a read its drains parked is settled
+        /// in the same pass.
+        fn recheck_keymap(&self) {
+            let input = self.input();
+            let Some(through) = input.keymap_recheck_due() else {
+                return;
+            };
+            #[cfg(test)]
+            self.stamp_park
+                .at(crate::composer_probe::stamp_park::StampPoint::KeymapRecheck);
+            let keymap = self.keymap();
+            input.settle_keymap_recheck(through, keymap, Instant::now());
         }
 
         /// The child scan: this instance's helper copies among `A`'s

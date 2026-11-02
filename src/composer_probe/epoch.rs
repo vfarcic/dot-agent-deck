@@ -426,6 +426,35 @@ struct Live {
     /// The daemon's read of an `Armed` invocation's export: whether it was
     /// empty, for the epoch's settlement of the probe it matches.
     reads: std::collections::VecDeque<(RecordKey, bool)>,
+    /// Q35-21 (A-20d-1a, O-20.7b): what wakes the off-lock keymap re-read an
+    /// empty read's settlement waits for ([`GenerationInput::recheck_keymap_at_settlement`]).
+    /// `None` applies an empty read at once: a generation no observer
+    /// re-reads for, which only the tests that model no observer make.
+    recheck: Option<Recheck>,
+    /// Empty reads whose settlement waits for that re-read, oldest first.
+    parked: Vec<Parked>,
+    /// The ticket the next parked read gets: tickets only grow, so a
+    /// re-read that started before a read parked can't settle it.
+    next_ticket: u64,
+}
+
+/// Q35-21 (A-20d-1a): the wake [`Live::recheck`] holds. It takes no lock
+/// (the observer's is an unpark), so it is called under R6.
+#[derive(Clone)]
+struct Recheck(Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for Recheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Recheck")
+    }
+}
+
+/// Q35-21 (A-20d-1a): an `Armed` empty read's settlement, decided under R6
+/// and waiting for a keymap read taken after it ([`Live::parked`]).
+#[derive(Debug, Clone, Copy)]
+struct Parked {
+    ticket: u64,
+    probe: Probe,
 }
 
 /// [`GenerationInput::pair_accounting`]'s answer.
@@ -670,7 +699,9 @@ impl Live {
     /// The epoch's settlement of probe `number` from its matched record
     /// `key`'s `decision` and the daemon's read of its export (R3 §3.4),
     /// once: an `Armed` empty read that is the deck's own claim applies the
-    /// observation and the schedule's empty; another `Armed` is non-empty;
+    /// observation and the schedule's empty, or, where the keymap is
+    /// re-read at settlement ([`Self::recheck`], A-20d-1a), is parked for a
+    /// keymap read taken after this decision; another `Armed` is non-empty;
     /// anything else, no decision included, is a failed check, counted
     /// unless the probe's lapse was counted already (R-D-U2-02).
     fn settle_probe(
@@ -699,17 +730,19 @@ impl Live {
             "probe settled"
         );
         match (decision, read) {
-            (Some(Decision::Armed), Some(true)) if claim_mine => {
-                if let Some(e0) = probe.e0 {
-                    epoch.apply(&Observation {
-                        probe: probe.job,
-                        admitted_at: e0,
-                        read_empty: true,
-                        retired: false,
-                    });
+            // Q35-21 (A-20d-1a): parked for a keymap read taken after it,
+            // the observer's, which settles it under this lock.
+            (Some(Decision::Armed), Some(true)) if claim_mine && self.recheck.is_some() => {
+                self.next_ticket = self.next_ticket.wrapping_add(1);
+                self.parked.push(Parked {
+                    ticket: self.next_ticket,
+                    probe,
+                });
+                if let Some(Recheck(wake)) = &self.recheck {
+                    wake();
                 }
-                self.schedule.empty();
             }
+            (Some(Decision::Armed), Some(true)) if claim_mine => self.apply_empty(epoch, probe),
             (Some(Decision::Armed), _) => {
                 self.schedule.non_empty(now, epoch.epoch());
             }
@@ -720,6 +753,23 @@ impl Live {
             _ if self.lapse_counted == Some(number) => {}
             _ => self.schedule.failed(now),
         }
+    }
+}
+
+impl Live {
+    /// An empty read the deck may apply: the epoch's apply rule (R3 §3.4),
+    /// which refuses a read the epoch has moved past, then the schedule's
+    /// empty.
+    fn apply_empty(&mut self, epoch: &mut InputEpoch, probe: Probe) {
+        if let Some(e0) = probe.e0 {
+            epoch.apply(&Observation {
+                probe: probe.job,
+                admitted_at: e0,
+                read_empty: true,
+                retired: false,
+            });
+        }
+        self.schedule.empty();
     }
 }
 
@@ -1353,8 +1403,99 @@ impl GenerationInput {
             probes: Vec::new(),
             reads: std::collections::VecDeque::new(),
             lapse_counted: None,
+            recheck: None,
+            parked: Vec::new(),
+            next_ticket: 0,
         });
         true
+    }
+
+    /// Q35-21 (A-20d-1a, O-20.7b): from now on an `Armed` empty read's
+    /// settlement doesn't apply the read at once. It is decided under the
+    /// lock, as before, and parked with a ticket, and `wake` is called (under
+    /// the lock: it must take none) so the observer reads the keymap again
+    /// with no lock held and hands the verdict to
+    /// [`Self::settle_keymap_recheck`]. `false`, changing nothing, with no
+    /// segments attached or once retired.
+    pub fn recheck_keymap_at_settlement(&self, wake: Arc<dyn Fn() + Send + Sync>) -> bool {
+        let mut state = self.state.lock_recovering();
+        if state.retired {
+            return false;
+        }
+        match state.live.as_mut() {
+            Some(live) => {
+                live.recheck = Some(Recheck(wake));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Q35-21 (A-20d-1a): the newest ticket of an empty read waiting for a
+    /// keymap re-read, if any. A re-read taken after this answer settles
+    /// every read parked through that ticket and none parked after it.
+    /// `None` once retired.
+    pub fn keymap_recheck_due(&self) -> Option<u64> {
+        let state = self.state.lock_recovering();
+        if state.retired {
+            return None;
+        }
+        state
+            .live
+            .as_ref()
+            .and_then(|live| live.parked.last())
+            .map(|parked| parked.ticket)
+    }
+
+    /// Whether an empty read's settlement is waiting for its keymap
+    /// re-read: a check still outstanding, so no new attempt is due.
+    pub fn settling(&self) -> bool {
+        let state = self.state.lock_recovering();
+        !state.retired && state.live.as_ref().is_some_and(|l| !l.parked.is_empty())
+    }
+
+    /// Q35-21 (A-20d-1a, O-20.7b): the keymap re-read's verdict, `keymap`,
+    /// read with no lock held after [`Self::keymap_recheck_due`] answered
+    /// `through`. Under the lock, and only while the generation that parked
+    /// them hasn't retired, each read parked through that ticket settles:
+    /// with the keymap allowed it applies as an empty read does (the epoch's
+    /// apply rule, then the schedule's empty); held, it is a failed check,
+    /// counted unless the probe's lapse was counted already (R-D-U2-02).
+    /// A read parked after `through` waits for a re-read of its own. How
+    /// many settled.
+    pub fn settle_keymap_recheck(
+        &self,
+        through: u64,
+        keymap: Result<(), super::keymap::Hold>,
+        now: Instant,
+    ) -> usize {
+        let mut guard = self.state.lock_recovering();
+        let state = &mut *guard;
+        if state.retired {
+            return 0;
+        }
+        let Some(live) = state.live.as_mut() else {
+            return 0;
+        };
+        let (due, waiting): (Vec<Parked>, Vec<Parked>) =
+            live.parked.drain(..).partition(|p| p.ticket <= through);
+        live.parked = waiting;
+        for parked in &due {
+            let probe = parked.probe;
+            tracing::debug!(
+                target: "composer_probe",
+                number = probe.number,
+                ticket = parked.ticket,
+                ?keymap,
+                "empty read settled after its keymap re-read"
+            );
+            match keymap {
+                Ok(()) => live.apply_empty(&mut state.epoch, probe),
+                Err(_) if live.lapse_counted == Some(probe.number) => {}
+                Err(_) => live.schedule.failed(now),
+            }
+        }
+        due.len()
     }
 
     /// Whether the generation has segments attached (and hasn't retired).
@@ -1445,7 +1586,7 @@ impl GenerationInput {
         state
             .live
             .as_ref()
-            .is_some_and(|live| live.schedule.due(now, epoch))
+            .is_some_and(|live| live.parked.is_empty() && live.schedule.due(now, epoch))
     }
 
     /// A due attempt failed at `now`: refused by admission, or its job
@@ -2126,6 +2267,7 @@ impl GenerationInput {
             live.segments.retire();
             let _ = live.segments.take_ended();
             live.probes.clear();
+            live.parked.clear();
         }
         state.retired = true;
         state.ledger = QueryLedger::default();
@@ -2350,5 +2492,123 @@ mod tests {
             !settled(Some(Claim::Unknown)),
             "an unknown claim reads non-empty"
         );
+    }
+
+    /// Scenario: A generation whose empty reads wait for a keymap re-read. Two probes' `Armed` empty reads are settled one after the other; each is parked with a newer ticket, wakes the observer once, and while any is parked no new attempt is due. A re-read whose tickets were read before the second parked settles only the first; the second waits for a re-read of its own, which, holding, counts one failed check. A read parked on a generation that then retires is settled by nothing (A-20d-1a's ownership across the I/O).
+    #[spec("inbox/probe/014")]
+    #[test]
+    fn probe_014_a_parked_empty_read_settles_only_by_a_reread_after_it() {
+        use crate::composer_probe::keymap::Hold as KeymapHold;
+        use crate::composer_probe::query_ledger::HazardFifo;
+        use crate::composer_probe::record::{Channel, Claim, EcPolicy, Observation, Records};
+        use std::sync::atomic::AtomicUsize;
+        let now = Instant::now();
+        let generation = || {
+            let input = GenerationInput::default();
+            assert!(input.attach_records(Records::new(5, EcPolicy::Hold, now)));
+            assert!(input.attach_segments(5, segments::Agent::Claude));
+            let wakes = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&wakes);
+            assert!(input.recheck_keymap_at_settlement(Arc::new(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+            })));
+            input
+                .state
+                .lock_recovering()
+                .records
+                .as_mut()
+                .unwrap()
+                .raise(5, now)
+                .unwrap();
+            (input, wakes)
+        };
+        // Probe `number`'s helper decided `Armed` and its export read empty:
+        // its settlement, as `settle_live` runs it under the lock.
+        let settle_empty = |input: &GenerationInput, number: u64| {
+            let key = RecordKey {
+                pid: 4000 + u32::try_from(number).unwrap(),
+                start: 1,
+            };
+            let mut guard = input.state.lock_recovering();
+            let State {
+                live,
+                records,
+                epoch,
+                ..
+            } = &mut *guard;
+            let records = records.as_mut().unwrap();
+            records
+                .observe(
+                    &mut HazardFifo::default(),
+                    &Observation {
+                        generation: 5,
+                        key,
+                        channel: Channel::Ipc,
+                        attribution: Attribution::Owned,
+                        claim: Some(Claim::Owned),
+                        decision: Some(Decision::Armed),
+                        seg_seen: Some(number),
+                        native_seen: None,
+                        birth_floor: now,
+                    },
+                    now,
+                )
+                .unwrap();
+            let live = live.as_mut().unwrap();
+            live.probes.push(Probe {
+                number,
+                job: DeckJobId(number),
+                e0: None,
+            });
+            live.reads.push_back((key, true));
+            live.settle_probe(epoch, records, (number, key, Some(Decision::Armed)), now);
+        };
+        let failures = |input: &GenerationInput| {
+            input
+                .advance_schedule_for_e2e(std::time::Duration::ZERO, now)
+                .unwrap()
+                .1
+        };
+
+        let (input, wakes) = generation();
+        input.probe_failed(now);
+        input.advance_schedule_for_e2e(crate::composer_probe::probe::BACKOFF[0], now);
+        assert!(input.probe_due(now), "due before anything parks");
+        settle_empty(&input, 1);
+        assert_eq!(wakes.load(Ordering::SeqCst), 1, "the observer is woken");
+        assert!(input.settling());
+        assert!(
+            !input.probe_due(now),
+            "a parked read is a check outstanding"
+        );
+        assert_eq!(failures(&input), 1, "parked, not yet applied");
+        let through = input.keymap_recheck_due().expect("one parked");
+        // The second parks while the first re-read is reading the keymap.
+        settle_empty(&input, 2);
+        assert_eq!(wakes.load(Ordering::SeqCst), 2);
+        assert_eq!(input.settle_keymap_recheck(through, Ok(()), now), 1);
+        assert_eq!(failures(&input), 0, "the first applied");
+        assert!(input.settling(), "the second waits for its own re-read");
+        assert!(!input.probe_due(now));
+        let second = input.keymap_recheck_due().expect("the second");
+        assert!(second > through);
+        assert_eq!(
+            input.settle_keymap_recheck(second, Err(KeymapHold::Changed), now),
+            1
+        );
+        assert_eq!(failures(&input), 1, "a held keymap is a failed check");
+        assert!(!input.settling());
+        assert_eq!(input.keymap_recheck_due(), None);
+
+        let (input, _) = generation();
+        settle_empty(&input, 1);
+        let through = input.keymap_recheck_due().expect("parked");
+        input.retire();
+        assert_eq!(
+            input.settle_keymap_recheck(through, Ok(()), now),
+            0,
+            "a retired generation's parked read settles nothing"
+        );
+        assert!(!input.settling());
     }
 }
