@@ -3,6 +3,10 @@
     "honeycomb": {
       "type": "http",
       "url": "https://mcp.honeycomb.io/mcp"
+    },
+    "dash0": {
+      "type": "http",
+      "url": "https://api.us-west-2.aws.dash0.com/mcp"
     }
   }
 }
