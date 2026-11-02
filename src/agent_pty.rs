@@ -6504,6 +6504,29 @@ impl PtyWriterThread {
                         }
                         continue;
                     }
+                    // PRD #1666 part 3 (A-20d-4, Q118b): a probe's job is
+                    // checked for retirement once, in its start condition
+                    // above (this writer's retirement flag, then the gate's
+                    // arm section under the gate's lock, then admission
+                    // under R6), and not again before its write: it carries
+                    // no `released`, so the check below is not its. A
+                    // retirement (close, restart, a spawn over an exited
+                    // agent) that lands after a successful arm section and
+                    // before the write lets the probe's Ctrl+G reach this
+                    // generation's own PTY master; a successor has its own
+                    // master and writer thread. It releases no held typing:
+                    // the retired gate refuses what it held, `exited`. The
+                    // arm page keeps the count the section published
+                    // (retirement drops the records, so `Seam::sync` has no
+                    // count to publish, and the file stays while this daemon
+                    // runs), so a helper the retiring agent runs for that
+                    // byte reads the arm present and takes the armed path:
+                    // it opens no editor, and prints its one notice into the
+                    // dying pane. Closing the window would hold the gate's
+                    // lock across a PTY write that can block; the decision
+                    // and the helper's branch are in
+                    // docs/develop/doorbell-admission.md (Accepted
+                    // residuals).
                     // PRD #1666 part 3 (Q35-15, core §8.1): a held op
                     // released before its generation retired or its target
                     // exited, and reached after, ends unwritten: refused
