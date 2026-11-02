@@ -65,22 +65,25 @@
 //! the next held candidate ([`Gate::release_until`]), and a trigger through
 //! the next cut ([`Gate::release_cut`]).
 //!
-//! **The lock.** One mutex, a leaf: nothing calls out of it but the
-//! closures [`Gate::admit`] is given, which classify against and move the
-//! epoch (`R6`, the top rank), and the arm section's, which takes the seam's
-//! lock and the epoch's. Acceptance and release run under the pane
-//! writer's own lock, so they are serialised with each other; retirement and
-//! the status read take only this one. It is a plain mutex, not one
-//! [`crate::lock_rank`] ranks: its order (below the pane writer's lock,
-//! above the seam's and `R6`) is written in `agent_pty_segments.rs`'s lock
-//! order, and no debug build checks it.
+//! **The lock.** One mutex at rank [`crate::lock_rank::GATE`]: nothing calls
+//! out of it but the closures [`Gate::admit`] is given, which classify
+//! against and move the epoch (`R6`, the top rank), and the arm section's,
+//! which takes the seam's lock and the epoch's. Acceptance and release run
+//! under the pane writer's own lock, so they are serialised with each other;
+//! retirement (under the registry's record table, `R4`) and the status read
+//! take only this one. A debug build checks its place against the other
+//! ranked locks: above `R1`–`R5`, below `R6`. What it doesn't check is the
+//! order against the unranked locks `agent_pty_segments.rs`'s lock order
+//! names: the pane writer's async lock above it, and the seam's lock and the
+//! ingress ledger below it.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
 use tokio::sync::Notify;
 
 use crate::doorbell_txn::{ClaimState, JobClaim};
+use crate::lock_rank::{GATE, OnPoison, RankedGuard, RankedMutex};
 
 /// The most bytes a fence holds, unless one op alone is larger (R6 §5.1).
 pub const FENCE_CAP: usize = 1024 * 1024;
@@ -178,7 +181,7 @@ struct Inner<T> {
 /// One generation's fence gate. See the module documentation.
 #[derive(Debug)]
 pub struct Gate<T> {
-    inner: Mutex<Inner<T>>,
+    inner: RankedMutex<{ GATE }, Inner<T>>,
     changed: Notify,
     /// PRD #1666 part 3 (Q35-20e): told whenever what a card shows of this
     /// gate may have changed: a hold starts, a full op starts waiting, or
@@ -190,7 +193,7 @@ pub struct Gate<T> {
 impl<T> Default for Gate<T> {
     fn default() -> Self {
         Self {
-            inner: Mutex::new(Inner {
+            inner: RankedMutex::new(Inner {
                 fence: None,
                 retired: false,
                 probe: None,
@@ -205,8 +208,8 @@ impl<T> Default for Gate<T> {
 }
 
 impl<T> Gate<T> {
-    fn lock(&self) -> MutexGuard<'_, Inner<T>> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock(&self) -> RankedGuard<'_, { GATE }, Inner<T>> {
+        self.inner.lock_recovering()
     }
 
     fn moved(&self, inner: &mut Inner<T>) {
@@ -740,7 +743,12 @@ impl<T> Waiter<T> {
 
 impl<T> Drop for Waiter<T> {
     fn drop(&mut self) {
-        let mut inner = self.gate.lock();
+        // A destructor's form (plan D15): it never panics. In a release build
+        // it always answers, recovering poison as `lock` does; only a debug
+        // build's rank violation skips, leaving this place queued.
+        let Some(mut inner) = self.gate.inner.lock_in_drop(OnPoison::Recover) else {
+            return;
+        };
         if let Some(at) = inner.waiters.iter().position(|&w| w == self.id) {
             inner.waiters.remove(at);
             self.gate.moved(&mut inner);

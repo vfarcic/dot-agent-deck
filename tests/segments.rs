@@ -1386,3 +1386,40 @@ fn probe_009_a_decided_probe_is_handed_out_once_until_handed_back() {
         "and once more only"
     );
 }
+
+/// Scenario: Write a held Ctrl+G whose helper decides `Unarmed`, and report its editor running with the identity the observer pinned, once after the record matched the segment and once before it did. Either way the segment's view names that editor process, `(pid, start)`, so a release can ask whether the same process still runs; an editor reported with no identity names none until a pinned report comes (A-20d-6).
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_the_segment_keeps_the_pinned_editors_identity() {
+    let editor = RecordKey {
+        pid: 4321,
+        start: 99,
+    };
+    for pinned_first in [false, true] {
+        let mut t = T::new(Agent::Claude, AUTH);
+        let n = t.probe(0);
+        t.s.open_human_g(1).unwrap();
+        t.write(n, 1);
+        t.ipc(1, Decision::Armed, n, 2);
+        t.exit(1, 3);
+        t.returns(4);
+        let g = t.s.next_trigger().unwrap();
+        t.write(g, 5);
+        if pinned_first {
+            assert!(
+                !t.s.editor_pinned(&mut t.r, &mut t.f, key(2), Some(editor), time(t.t, 5)),
+                "no segment has matched its record yet"
+            );
+        }
+        t.ipc(2, Decision::Unarmed, g, 6);
+        if !pinned_first {
+            assert_eq!(t.view(6)[0].editor, None, "nothing pinned yet");
+            assert!(t.editor(2, 6), "a report with no identity");
+            assert_eq!(t.view(6)[0].editor, None, "it names no process");
+            assert!(t.s.editor_pinned(&mut t.r, &mut t.f, key(2), Some(editor), time(t.t, 7)));
+        }
+        let v = t.view(7);
+        assert_eq!(v[0].stage, Stage::Released, "pinned first: {pinned_first}");
+        assert_eq!(v[0].editor, Some(editor), "pinned first: {pinned_first}");
+    }
+}

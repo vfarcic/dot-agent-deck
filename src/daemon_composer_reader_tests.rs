@@ -154,6 +154,10 @@ struct Deck {
     token: String,
     handle: tokio::task::JoinHandle<Result<(), DaemonError>>,
     started: Vec<Child>,
+    /// A bound deck's release latch reports the release once this is set,
+    /// and nothing before, so the permission waits (set at the start
+    /// unless the deck was started with its latch held back).
+    latched: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Deck {
@@ -169,7 +173,37 @@ impl Deck {
         Deck::start_with(true).await
     }
 
+    /// [`Deck::start_bound`] whose agent's `HOME` is the deck's own
+    /// `home` directory, holding an empty Claude `keybindings.json`
+    /// ([`Deck::keybindings`]), so the generation's keymap is read from a
+    /// file the test owns rather than from the user's own.
+    async fn start_bound_at_home() -> Deck {
+        Deck::start_with_home(true, true, true).await
+    }
+
+    /// [`Deck::start_bound_at_home`] whose release latch reports nothing
+    /// until [`Deck::latch`], so its permission stays pending until then.
+    async fn start_bound_at_home_latched_later() -> Deck {
+        Deck::start_with_home(true, true, false).await
+    }
+
+    /// Let a deck started with its latch held back see its release.
+    fn latch(&self) {
+        self.latched
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     async fn start_with(bound: bool) -> Deck {
+        Deck::start_with_home(bound, false, true).await
+    }
+
+    /// The Claude `keybindings.json` of a deck started at home.
+    fn keybindings(&self) -> PathBuf {
+        self.dir.path().join("home/.claude/keybindings.json")
+    }
+
+    async fn start_with_home(bound: bool, home: bool, latched: bool) -> Deck {
+        let latched = Arc::new(std::sync::atomic::AtomicBool::new(latched));
         let registry = Arc::new(AgentPtyRegistry::new());
         let id = registry
             .spawn_agent(SpawnOptions {
@@ -227,16 +261,49 @@ impl Deck {
                 "the test binary runs by an absolute path: {launch:?}"
             );
             installation.set_launch(launch);
+            if home {
+                let claude = dir.path().join("home/.claude");
+                std::fs::create_dir_all(&claude).unwrap();
+                std::fs::write(claude.join("keybindings.json"), "{}").unwrap();
+                // What the spawn path reads before the child exists
+                // (A-20d-1b), with the agent's own `HOME`.
+                let home_dir = dir.path().join("home");
+                installation.set_keymap_baseline(
+                    crate::composer_probe::keymap::KeymapBaseline::at_spawn(
+                        true,
+                        false,
+                        |name| (name == "HOME").then(|| home_dir.clone().into_os_string()),
+                        &[],
+                        dir.path(),
+                    ),
+                );
+            }
+            let mut env = vec![(
+                "TMPDIR".to_string(),
+                dir.path().to_str().unwrap().to_string(),
+            )];
+            if home {
+                env.push((
+                    "HOME".to_string(),
+                    dir.path().join("home").to_str().unwrap().to_string(),
+                ));
+            }
             Spawned {
                 agent_id: id.clone(),
                 agent: Some(AgentType::ClaudeCode),
-                env: vec![(
-                    "TMPDIR".to_string(),
-                    dir.path().to_str().unwrap().to_string(),
-                )],
+                env,
                 child: Some((me, start_of(me))),
                 input: Arc::new(GenerationInput::default()),
-                latch: Box::new(|_| LatchedRelease::Known(release())),
+                latch: Box::new({
+                    let latched = Arc::clone(&latched);
+                    move |_| {
+                        if latched.load(std::sync::atomic::Ordering::SeqCst) {
+                            LatchedRelease::Known(release())
+                        } else {
+                            LatchedRelease::Unseen
+                        }
+                    }
+                }),
                 assumed: assumed(),
             }
         } else {
@@ -288,6 +355,7 @@ impl Deck {
             token,
             handle,
             started: Vec::new(),
+            latched,
         }
     }
 
@@ -1526,4 +1594,216 @@ async fn probe_052_a_markers_early_stamp_resumes_the_quiet_clock_no_earlier_than
     assert!(input.hazards_clear(at(20)));
     deck.kill(helper);
     deck.stop().await;
+}
+
+/// Drive one probe on `deck`'s generation to an `Armed` empty read and its
+/// settlement through the generation's public steps: a probe segment opened,
+/// its liability raised and its byte written, a failure first (so that only
+/// an empty settlement makes the next attempt due at once), then the
+/// daemon's read of the export and the helper's `Armed` invocation on IPC,
+/// matched to the segment by the number it read. `between` runs after the
+/// probe was scheduled and before the read reaches the settlement.
+fn empty_read_settled(deck: &Deck, pid: u32, between: impl FnOnce()) {
+    use crate::composer_probe::record::{Channel, Claim, Observation};
+    let input = deck.observer.input();
+    let now = Instant::now();
+    let (number, _) = input.segment_open_probe(false, now).unwrap();
+    input.liability_raise(deck.generation, now).unwrap();
+    input.segment_written(number, 0, now, now).unwrap();
+    input.probe_failed(now);
+    between();
+    let key = RecordKey { pid, start: 1 };
+    input.note_read(key, true);
+    input
+        .record_observe(
+            &Observation {
+                generation: deck.generation,
+                key,
+                channel: Channel::Ipc,
+                attribution: Attribution::Owned,
+                claim: Some(Claim::Owned),
+                decision: Some(Decision::Armed),
+                seg_seen: Some(number),
+                native_seen: None,
+                birth_floor: now,
+            },
+            now,
+        )
+        .unwrap();
+}
+
+/// `(due now, failures in a row)` of `deck`'s generation's probe schedule.
+fn schedule(deck: &Deck) -> (bool, u32) {
+    let (due, failures, _) = deck
+        .observer
+        .input()
+        .advance_schedule_for_e2e(Duration::ZERO, Instant::now())
+        .expect("a live schedule");
+    (due, failures)
+}
+
+/// Scenario: A bound deck whose agent reads its `keybindings.json` from a `HOME` the test owns; its permission settles with the file empty. A probe is scheduled, after one failed attempt, and its helper decides `Armed` with the daemon reading the export empty. When the binding file changes after the probe was scheduled and before the read's settlement, the read is not applied: the settlement counts a second failure, the next attempt waits its backoff, and the keymap reads `Changed`. With the file left alone (the control) the same settlement applies the read: the failures reset and the next attempt is due at once (A-20d-1a, O-20.7b).
+#[spec("inbox/probe/014")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_014_a_binding_changed_before_an_empty_reads_settlement_withholds_the_read() {
+    use crate::composer_probe::keymap::Hold;
+    for changed in [false, true] {
+        let deck = Deck::start_bound_at_home().await;
+        let observer = Arc::clone(&deck.observer);
+        assert!(
+            wait_for(SETTLE, || observer.permission() == Permission::Armable).await,
+            "the bound deck's permission settles Armable"
+        );
+        assert_eq!(
+            tokio::task::spawn_blocking({
+                let observer = Arc::clone(&observer);
+                move || observer.keymap()
+            })
+            .await
+            .unwrap(),
+            Ok(()),
+            "the deck's own empty keybindings.json allows (a CLAUDE_CONFIG_DIR in the test's \
+             environment would hold it)"
+        );
+        let path = deck.keybindings();
+        empty_read_settled(&deck, 4545, || {
+            if changed {
+                std::fs::write(&path, r#"{"bindings": []}"#).unwrap();
+            }
+        });
+        if changed {
+            assert!(
+                wait_for(SETTLE, || schedule(&deck) == (false, 2)).await,
+                "the read is withheld and counted a failed check: {:?}",
+                schedule(&deck)
+            );
+            let keymap = tokio::task::spawn_blocking({
+                let observer = Arc::clone(&observer);
+                move || observer.keymap()
+            })
+            .await
+            .unwrap();
+            assert_eq!(keymap, Err(Hold::Changed));
+        } else {
+            assert!(
+                wait_for(SETTLE, || schedule(&deck) == (true, 0)).await,
+                "the read is applied: {:?}",
+                schedule(&deck)
+            );
+        }
+        deck.stop().await;
+    }
+}
+
+/// A bound deck at home whose permission settled `Armable` and whose
+/// keymap allows, with its observer parked at its next keymap re-read: the
+/// park's `reached` and `go`.
+async fn parked_at_the_reread(
+    deck: &Deck,
+) -> (
+    std::sync::mpsc::Receiver<crate::composer_probe::stamp_park::StampPoint>,
+    std::sync::mpsc::Sender<()>,
+) {
+    use crate::composer_probe::stamp_park::{StampPoint, park_at};
+    let observer = Arc::clone(&deck.observer);
+    assert!(
+        wait_for(SETTLE, || observer.permission() == Permission::Armable).await,
+        "the bound deck's permission settles Armable"
+    );
+    let (park, reached, go) = park_at(&[StampPoint::KeymapRecheck]);
+    deck.observer.park_stamps_for_test(park);
+    (reached, go)
+}
+
+/// Scenario: A bound deck at home; its observer is parked inside its keymap re-read, after it read which empty reads it settles and before it reads the file. A probe's `Armed` empty read settles and parks; while the observer is parked there the binding file changes; then the observer goes on. Its read is the one taken after the change, so the empty read is withheld and counted a failed check (A-20d-1c: a change inside the re-read's window is seen).
+#[spec("inbox/probe/014")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_014_a_binding_changed_inside_the_reread_window_withholds_the_read() {
+    use crate::composer_probe::stamp_park::StampPoint;
+    let deck = Deck::start_bound_at_home().await;
+    let (reached, go) = parked_at_the_reread(&deck).await;
+    empty_read_settled(&deck, 4646, || {});
+    let at = tokio::task::spawn_blocking(move || reached.recv_timeout(SETTLE))
+        .await
+        .unwrap()
+        .expect("the observer reaches its re-read");
+    assert_eq!(at, StampPoint::KeymapRecheck);
+    assert!(deck.observer.input().settling(), "parked, not applied");
+    assert_eq!(schedule(&deck), (false, 1));
+    std::fs::write(deck.keybindings(), r#"{"bindings": []}"#).unwrap();
+    go.send(()).unwrap();
+    assert!(
+        wait_for(SETTLE, || schedule(&deck) == (false, 2)).await,
+        "the read taken after the change withholds it: {:?}",
+        schedule(&deck)
+    );
+    deck.stop().await;
+}
+
+/// Scenario: A bound deck at home; a probe's `Armed` empty read parks and the observer stops inside its keymap re-read, with the binding file unchanged. The generation retires there; then the observer goes on, reads a keymap that allows, and hands the verdict back. Nothing is applied to the retired generation: its schedule keeps the failure it had and the read never reads as settled empty (A-20d-1c: ownership across the I/O).
+#[spec("inbox/probe/014")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_014_a_generation_retired_inside_the_reread_window_applies_nothing() {
+    let deck = Deck::start_bound_at_home().await;
+    let (reached, go) = parked_at_the_reread(&deck).await;
+    empty_read_settled(&deck, 4747, || {});
+    tokio::task::spawn_blocking(move || reached.recv_timeout(SETTLE))
+        .await
+        .unwrap()
+        .expect("the observer reaches its re-read");
+    let input = deck.observer.input();
+    let before = deck.observer.passes_for_e2e().finished;
+    input.retire();
+    go.send(()).unwrap();
+    assert!(
+        wait_for(SETTLE, || {
+            let passes = deck.observer.passes_for_e2e();
+            !passes.running && passes.finished > before
+        })
+        .await,
+        "the parked pass finishes"
+    );
+    assert_eq!(
+        schedule(&deck),
+        (false, 1),
+        "the allowing verdict applied nothing to the retired generation"
+    );
+    deck.stop().await;
+}
+
+/// Scenario: A bound deck at home is spawned with an empty `keybindings.json`, its release latch held back so its permission waits. The binding file changes after the spawn and before the deck sees the agent's release; then the release is latched and the permission settles `Armable`. The keymap reads `Changed`: the read the generation is compared with is the one taken before its spawn, which the agent loaded, not one taken at settlement. Left unchanged (the control), the keymap allows (A-20d-1b, the pre-spawn baseline).
+#[spec("inbox/probe/014")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_014_a_binding_changed_between_the_spawn_and_the_permission_holds() {
+    use crate::composer_probe::keymap::Hold;
+    for changed in [false, true] {
+        let deck = Deck::start_bound_at_home_latched_later().await;
+        let observer = Arc::clone(&deck.observer);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            observer.permission(),
+            Permission::Pending,
+            "no release seen yet"
+        );
+        if changed {
+            std::fs::write(deck.keybindings(), r#"{"bindings": []}"#).unwrap();
+        }
+        deck.latch();
+        assert!(
+            wait_for(SETTLE, || observer.permission() == Permission::Armable).await,
+            "the permission settles once the release is seen"
+        );
+        let keymap = tokio::task::spawn_blocking({
+            let observer = Arc::clone(&observer);
+            move || observer.keymap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            keymap,
+            if changed { Err(Hold::Changed) } else { Ok(()) },
+            "changed: {changed}"
+        );
+        deck.stop().await;
+    }
 }

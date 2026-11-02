@@ -376,6 +376,10 @@ pub struct Installation {
     /// spawned: the launch provenance that binds `A` (Q84).
     #[cfg(target_os = "linux")]
     launch: Vec<OsString>,
+    /// The generation's key-binding sources as read before its spawn
+    /// (A-20d-1b): what the observer compares each later read with.
+    #[cfg(target_os = "linux")]
+    keymap_baseline: Option<super::keymap::KeymapBaseline>,
 }
 
 impl Installation {
@@ -422,6 +426,64 @@ impl Installation {
     #[cfg(target_os = "linux")]
     pub fn launch(&self) -> &[OsString] {
         &self.launch
+    }
+
+    /// Read the generation's key-binding sources now, before its spawn
+    /// (A-20d-1b), for the agents its class may run: the spawn's own
+    /// variables `env` over the daemon's, the arguments of `command` (the
+    /// command the pane will run, this installation's arguments included)
+    /// and the working directory `cwd` (the daemon's own when `None`). File
+    /// I/O: call it off the executor, with no lock held.
+    #[cfg(target_os = "linux")]
+    pub fn read_keymap_baseline(
+        &mut self,
+        command: Option<&str>,
+        env: &[(String, String)],
+        cwd: Option<&str>,
+    ) {
+        let (claude, codex) = match self.class {
+            PaneClass::Direct(ProbeAgent::Claude) | PaneClass::Launcher(ProbeAgent::Claude) => {
+                (true, false)
+            }
+            PaneClass::Direct(ProbeAgent::Codex) | PaneClass::Launcher(ProbeAgent::Codex) => {
+                (false, true)
+            }
+            PaneClass::Wrapper => (true, true),
+            PaneClass::Unprobed | PaneClass::Shell => (false, false),
+        };
+        let args: Vec<OsString> = command
+            .and_then(super::observe::shell_words)
+            .map(|words| words.into_iter().skip(1).map(OsString::from).collect())
+            .unwrap_or_default();
+        let here = std::env::current_dir().unwrap_or_default();
+        let cwd = cwd.map_or_else(|| here.clone(), |dir| here.join(dir));
+        // As the kernel names it (what Codex's `getcwd` and the bound
+        // agent's `/proc/<pid>/cwd` read), so a symlink in the spawn's path
+        // isn't a different project chain.
+        let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+        let lookup = |name: &str| {
+            env.iter()
+                .rev()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| OsString::from(v))
+                .or_else(|| std::env::var_os(name))
+        };
+        self.keymap_baseline = Some(super::keymap::KeymapBaseline::at_spawn(
+            claude, codex, lookup, &args, &cwd,
+        ));
+    }
+
+    /// Set the baseline the spawn path reads ([`Self::read_keymap_baseline`]),
+    /// for a test that builds an installation without spawning.
+    #[cfg(all(test, target_os = "linux"))]
+    pub fn set_keymap_baseline(&mut self, baseline: super::keymap::KeymapBaseline) {
+        self.keymap_baseline = Some(baseline);
+    }
+
+    /// The baseline read before the spawn, taken by the observer.
+    #[cfg(target_os = "linux")]
+    pub fn take_keymap_baseline(&mut self) -> Option<super::keymap::KeymapBaseline> {
+        self.keymap_baseline.take()
     }
 
     /// `env` with the editor variables replaced by this installation's.
@@ -543,6 +605,7 @@ pub fn install(
         instance_dir: instance.dir().to_path_buf(),
         helper_id: instance.helper_id(),
         launch: Vec::new(),
+        keymap_baseline: None,
     })
 }
 

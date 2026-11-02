@@ -48,9 +48,14 @@
 //!
 //! The keymap is file I/O and is read with no lock held: after a pending
 //! permission is settled, and again after an O5 wait, so nothing read before
-//! a sleep stands after it. Between its last read and the byte, a change to
-//! the agent's key bindings is not seen: its re-check at settlement
-//! (O-20.7b) is an activation blocker (`plan-p3.md`'s activation list).
+//! a sleep stands after it. A change to the agent's key bindings between
+//! that read and the byte is seen at the probe's settlement (O-20.7b,
+//! A-20d-1a): an `Armed` empty read is decided under R6 and parked, the
+//! observer reads the keymap again with no lock held, and the settlement
+//! applies the read under R6 only with that later read allowing it, and
+//! only while the generation that parked it hasn't retired
+//! (`GenerationInput::settle_keymap_recheck`). A change after that last
+//! read is the next admission's to see.
 //!
 //! **Lock order.**
 //! ```text
@@ -67,11 +72,12 @@
 //! output hook:   output lock ─> input (R6) ─> segments ; notify
 //! ```
 //! Nothing takes the gate under the seam or R6, nor the seam under R6.
-//! The gate's mutex is a plain mutex: [`crate::lock_rank`] doesn't rank or
-//! check it, so its place above (under the pane writer's async lock, before
-//! the seam and R6, the ledger a leaf under it) is this diagram's word, not
-//! a debug-build check (the audit's U3-9d; ranking it is on the activation
-//! list).
+//! The gate's mutex is ranked ([`crate::lock_rank::GATE`], above `R4`, under
+//! which retirement takes it, and below `R6`), so a debug build checks those
+//! two edges. The pane writer's async lock, the seam's and the ledger are
+//! unranked: their places above (the pane writer's over the gate, the seam
+//! and the ledger under it) are this diagram's word, not a debug-build
+//! check.
 //! Retirement: the registry retires the input (segments end `Retired`) and
 //! the gate (held ops refused `exited` once), and the driver ends at its next
 //! wake.
@@ -791,6 +797,29 @@ fn probe_gate_scheduled() {
 
 /// The longest a probe attempt waits for its generation's query-wait
 /// estimate (O5) before it is asked again, rather than refused.
+///
+/// **One constant, not a bound per generation (A-20d-8).** What this bounds
+/// is how long one request stays outstanding: while it does, the doorbell
+/// tick rings nothing for that generation ([`AgentPtyRegistry::composer_probe_tick`]
+/// answers `true` from the request's start to its end, the sleep included).
+/// A generation's own estimate is already bounded by its profile: it never
+/// runs further ahead of the update that moved it than `cap + margin`
+/// (`QueryWaitEstimate`). So:
+/// - Claude Code's profile (5 s) is inside this bound: a Claude request
+///   refused only by O5 always waits once, and never counts an O5 failure
+///   for being too far off. A bound per generation would change nothing.
+/// - Codex's (120.5 s, a resize storm chaining 2 s CPR waits) is not. A
+///   bound taken from its profile would let one request keep the doorbell
+///   silent for two minutes; this one keeps it to about ten seconds, and
+///   then the refusal counts one failure: the next attempt waits the first
+///   backoff step (30 s, `crate::composer_probe::probe::BACKOFF`), or comes
+///   at once on a person's op, and the waits continue. Broken after three
+///   is presentation only. O5 is availability, not safety (A1 §4.4), so
+///   neither choice moves what may be typed.
+///
+/// `probe_059_an_estimate_past_the_o5_bound_is_answered_without_a_wait`
+/// pins both halves: the bound against each profile, and a request past it
+/// answering at once.
 #[cfg(target_os = "linux")]
 const O5_WAIT: Duration = Duration::from_secs(10);
 
@@ -1094,10 +1123,13 @@ pub(crate) fn tick_probe(
     status: crate::composer_probe::gate::Status,
     now: Instant,
 ) -> TickProbe {
+    // An empty read waiting for its keymap re-read (A-20d-1a) is a check
+    // still outstanding.
     let outstanding = status.fenced
         || input
             .segments_front()
-            .is_some_and(|front| front != Front::None);
+            .is_some_and(|front| front != Front::None)
+        || input.settling();
     if outstanding {
         // U3-02: its own lapsed Claude probe, alone with nothing held
         // behind it, is superseded by the schedule's retry once due.
@@ -1533,6 +1565,7 @@ mod tests {
             scope: ScopeState::Closed,
             ec: false,
             not_returned: false,
+            editor: None,
         }
     }
 
@@ -2169,6 +2202,46 @@ mod tests {
         );
         assert_eq!(request.matches("observer.keymap()").count(), 1);
         assert_eq!(request.matches("scheduling_reads(").count(), 1);
+    }
+
+    /// Scenario: Compare the O5 wait's one bound with how far ahead each screen profile's redraw estimate can run, then run the scheduling reads with a first pass refused by an estimate just past the bound. Claude Code's estimate always fits inside the bound and Codex's can run past it, and a request refused past the bound answers that refusal at once, asking once and sleeping not at all (A-20d-8's decision, written at `O5_WAIT`).
+    #[cfg(target_os = "linux")]
+    #[spec("inbox/probe/059")]
+    #[tokio::test]
+    async fn probe_059_an_estimate_past_the_o5_bound_is_answered_without_a_wait() {
+        use crate::doorbell_screen::{CLAUDE_PROFILE, CODEX_PROFILE};
+        let ahead = |t: &crate::composer_probe::query_wait::RedrawTiming| t.cap + t.margin;
+        assert!(
+            ahead(&CLAUDE_PROFILE.redraw) <= O5_WAIT,
+            "a Claude request refused only by O5 always waits once"
+        );
+        assert!(
+            ahead(&CODEX_PROFILE.redraw) > O5_WAIT,
+            "Codex's estimate can run past the bound, where the request is refused"
+        );
+
+        let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let past = Instant::now() + O5_WAIT + Duration::from_secs(1);
+        let started = Instant::now();
+        let (asked, ()) = scheduling_reads(
+            None::<std::future::Ready<()>>,
+            || std::future::ready(()),
+            |()| {
+                let passes = Arc::clone(&passes);
+                async move {
+                    passes.fetch_add(1, Ordering::SeqCst);
+                    (Some(past), Some(past))
+                }
+            },
+        )
+        .await;
+        assert_eq!(asked, Some(past), "the refusal is the answer");
+        assert_eq!(passes.load(Ordering::SeqCst), 1, "asked once, no wait");
+        assert!(
+            started.elapsed() < O5_WAIT,
+            "answered without sleeping: {:?}",
+            started.elapsed()
+        );
     }
 
     /// Scenario: Map held typing to the card's cause across ages, waiters and the front segment's kind and stage. A full queue says so at any age; under five seconds it says a check is running; after that a probe not yet opened, one opened and not returned, and a person's own Ctrl+G each get their own words, and with no segment it still says checking.

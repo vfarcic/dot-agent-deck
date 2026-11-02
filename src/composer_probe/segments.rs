@@ -416,6 +416,11 @@ pub struct View {
     pub ec: bool,
     /// E5 or E5′: [`NOT_RETURNED`] has passed in this stage.
     pub not_returned: bool,
+    /// The user's editor its matched record's helper runs, as the observer
+    /// pinned it (A-20d-6): the editor process's `(pid, start)`, kept so a
+    /// release can ask whether that same process still runs. `None` until
+    /// one is pinned, and for an editor reported with no identity.
+    pub editor: Option<RecordKey>,
 }
 
 /// Why a step was refused.
@@ -457,6 +462,9 @@ struct Segment {
     mismatched: bool,
     fact: Option<ExitFact>,
     editor_running: bool,
+    /// The editor's pinned identity, when the report of it carried one
+    /// (A-20d-6).
+    editor: Option<RecordKey>,
     e1: Option<ReturnWatch>,
     ec: Option<ReturnWatch>,
     /// When E1's enable followed (E5′'s origin).
@@ -487,6 +495,7 @@ impl Segment {
             mismatched: false,
             fact: None,
             editor_running: false,
+            editor: None,
             e1: None,
             ec: None,
             enabled_at: None,
@@ -535,7 +544,7 @@ pub struct Segments {
     /// `Released` until its helper's drain shows how it ended (R-U2-06's
     /// cut-off). Pinning the editor's identity is an activation
     /// precondition (plan Q104b).
-    editors: VecDeque<RecordKey>,
+    editors: VecDeque<(RecordKey, Option<RecordKey>)>,
     retired: bool,
 }
 
@@ -918,20 +927,38 @@ impl Segments {
         key: RecordKey,
         now: Instant,
     ) -> bool {
+        self.editor_pinned(records, fifo, key, None, now)
+    }
+
+    /// [`Self::editor_running`], with the editor's own identity as the
+    /// observer pinned it (A-20d-6), kept with the segment its record
+    /// matches, now or when it matches later.
+    pub fn editor_pinned(
+        &mut self,
+        records: &mut Records,
+        fifo: &mut HazardFifo,
+        key: RecordKey,
+        editor: Option<RecordKey>,
+        now: Instant,
+    ) -> bool {
         if self.retired {
             return false;
         }
         self.evaluate(records, fifo, now);
         let Some(seg) = self.segments.iter_mut().find(|s| s.record == Some(key)) else {
-            if !self.editors.contains(&key) {
-                if self.editors.len() == record::RECORD_CAP {
-                    self.editors.pop_front();
+            match self.editors.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, known)) => *known = editor.or(*known),
+                None => {
+                    if self.editors.len() == record::RECORD_CAP {
+                        self.editors.pop_front();
+                    }
+                    self.editors.push_back((key, editor));
                 }
-                self.editors.push_back(key);
             }
             return false;
         };
         seg.editor_running = true;
+        seg.editor = editor.or(seg.editor);
         self.evaluate(records, fifo, now);
         true
     }
@@ -969,6 +996,7 @@ impl Segments {
                     ec: seg.ec.is_some_and(|w| w.returned(self.agent)),
                     not_returned: since
                         .is_some_and(|at| now.saturating_duration_since(at) >= NOT_RETURNED),
+                    editor: seg.editor,
                 }
             })
             .collect()
@@ -1046,9 +1074,10 @@ impl Segments {
                 && records.match_segment(self.generation, key, number).is_ok()
             {
                 seg.record = Some(key);
-                if let Some(at) = self.editors.iter().position(|k| *k == key) {
-                    self.editors.remove(at);
+                if let Some(at) = self.editors.iter().position(|(k, _)| *k == key) {
+                    let (_, editor) = self.editors.remove(at).unwrap_or((key, None));
                     seg.editor_running = true;
+                    seg.editor = editor;
                 }
             }
             let Some(key) = seg.record else {
