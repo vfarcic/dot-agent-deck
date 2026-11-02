@@ -5,8 +5,9 @@
 //! A probe sends Ctrl+G, so the deck may send it only while the binding the
 //! agent loaded is the default one. This module reads the sources and says
 //! [`Hold`] when it can't establish that; it never makes the deck send a
-//! rebound key. Nothing calls it yet: Q35-19's admission and Q35-20's
-//! settlement are its readers.
+//! rebound key. Its readers are the daemon's: the spawn path's read before the
+//! child exists, the observer's evidence when the permission settles, and
+//! each probe's admission and settlement (`super::observe`).
 //!
 //! **A source's identity** ([`Identity`]) is `(dev, ino, size, mtime_ns,
 //! ctime_ns)` of the opened file and a SHA-256 of its contents, read from one
