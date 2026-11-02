@@ -1764,6 +1764,38 @@ fn reentrant_lookup<T>(
     }
 }
 
+/// `uid`'s home directory from the account database (`getpwuid_r`'s
+/// `pw_dir`), `None` when it has no entry or the lookup fails.
+#[cfg(unix)]
+pub(crate) fn passwd_home(uid: u32) -> Option<std::ffi::OsString> {
+    use std::os::unix::ffi::OsStringExt;
+    reentrant_lookup(|buf| {
+        let mut record = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: as in `user_record`.
+        let rc = unsafe {
+            libc::getpwuid_r(
+                uid,
+                record.as_mut_ptr(),
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut found,
+            )
+        };
+        if rc != 0 {
+            return Err(rc);
+        }
+        if found.is_null() {
+            return Ok(None);
+        }
+        // SAFETY: a non-null `found` means the call filled `record`, whose
+        // `pw_dir` points into `buf`, still alive here.
+        let record = unsafe { record.assume_init() };
+        let dir = unsafe { std::ffi::CStr::from_ptr(record.pw_dir) };
+        Ok(Some(std::ffi::OsString::from_vec(dir.to_bytes().to_vec())))
+    })
+}
+
 /// `uid`'s login name and primary gid.
 #[cfg(unix)]
 fn user_record(uid: u32) -> Option<(Vec<u8>, u32)> {

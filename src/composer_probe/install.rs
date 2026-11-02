@@ -630,8 +630,10 @@ pub fn install(
 /// (portable-pty 0.8.1, `CommandBuilder::as_command`; the reva21 review's
 /// U2-1): `cwd` when it names a directory, relative to the daemon's own
 /// `here`; otherwise the child's `HOME` (`lookup`: the spawn's variables
-/// over the daemon's) when it is UTF-8, otherwise the user's home as the
-/// daemon finds it, otherwise `/`. As the kernel names it (what Codex's
+/// over the daemon's) when it is UTF-8, otherwise the daemon user's home
+/// from the account database (as the builder's `get_home_dir` looks it up,
+/// never the daemon's own `HOME`; the revb21 review's U3-3), otherwise `/`.
+/// As the kernel names it (what Codex's
 /// `getcwd` and the bound agent's `/proc/<pid>/cwd` read), so a symlink in
 /// the path isn't a different project chain.
 #[cfg(target_os = "linux")]
@@ -646,8 +648,11 @@ pub(crate) fn spawn_start_dir(
         .unwrap_or_else(|| {
             lookup("HOME")
                 .filter(|home| home.to_str().is_some())
+                .or_else(|| {
+                    // SAFETY: getuid can't fail.
+                    crate::platform::paths::passwd_home(unsafe { libc::getuid() })
+                })
                 .map(std::path::PathBuf::from)
-                .or_else(std::env::home_dir)
                 .unwrap_or_else(|| std::path::PathBuf::from("/"))
         });
     std::fs::canonicalize(&dir).unwrap_or(dir)
@@ -757,6 +762,48 @@ mod tests {
             spawn_start_dir(Some("../file"), lookup, &daemon),
             home,
             "not a directory: the child's HOME"
+        );
+    }
+
+    /// Scenario: Work out where a spawn with no directory starts when the child's `HOME` isn't UTF-8, with the daemon's own `HOME` naming another directory. The PTY builder then goes straight to the password database, so the start directory is the account's passwd home, not the daemon's `HOME` (the revb21 review's U3-3).
+    #[spec("inbox/probe/014")]
+    #[test]
+    fn probe_014_a_non_utf8_home_starts_in_the_passwd_home() {
+        use std::os::unix::ffi::OsStringExt;
+        struct Restore(Option<OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                // SAFETY: `STATE_DIR_ENV_LOCK` is held for this guard's life.
+                unsafe {
+                    match self.0.take() {
+                        Some(home) => std::env::set_var("HOME", home),
+                        None => std::env::remove_var("HOME"),
+                    }
+                }
+            }
+        }
+        // SAFETY: getuid can't fail.
+        let uid = unsafe { libc::getuid() };
+        let Some(passwd) = crate::platform::paths::passwd_home(uid) else {
+            eprintln!("SKIP: no passwd entry for uid {uid}");
+            return;
+        };
+        let passwd = std::path::PathBuf::from(passwd);
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let daemon_home = root.join("daemon-home");
+        std::fs::create_dir_all(&daemon_home).unwrap();
+        let _lock = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _restore = Restore(std::env::var_os("HOME"));
+        // SAFETY: `STATE_DIR_ENV_LOCK` held; `_restore` puts it back.
+        unsafe { std::env::set_var("HOME", &daemon_home) };
+        let lookup = |name: &str| (name == "HOME").then(|| OsString::from_vec(b"/h\xff".to_vec()));
+        assert_eq!(
+            spawn_start_dir(None, lookup, &root),
+            std::fs::canonicalize(&passwd).unwrap_or(passwd),
+            "a non-UTF-8 HOME: the passwd home, not the daemon's HOME"
         );
     }
 }
