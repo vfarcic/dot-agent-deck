@@ -6870,7 +6870,8 @@ struct PaneHeld {
     agent_id: String,
     /// Why the deck holds what the user typed, while it shows a hold.
     cause: Option<crate::inbox_display::InputHeldCause>,
-    /// The typing the pane's previous generation held was not delivered.
+    /// The typing one of the pane's earlier generations held was not
+    /// delivered.
     discarded: bool,
 }
 

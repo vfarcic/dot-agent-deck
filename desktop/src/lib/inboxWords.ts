@@ -74,13 +74,13 @@ export const INBOX_WORDS = {
    * into the agent's pane, by the daemon's `InputHeldCause`.
    */
   inputHeld: {
-    checking: "input held: the deck is checking the input box; your typing will appear in a moment",
-    check_not_opened: "input held: the agent hasn't opened the deck's check yet; your typing is kept until it does. Restarting the agent discards it.",
-    check_not_returned: "input held: the agent hasn't come back from the deck's check; your typing is kept until it does. Restarting the agent discards it.",
-    after_your_ctrl_g: "input held: the agent didn't open the editor for your Ctrl+G; your typing is kept. Restarting the agent discards it.",
+    checking: "input held: the deck is checking the input box; what you typed or answered will appear in a moment",
+    check_not_opened: "input held: the agent hasn't opened the deck's check yet; what you typed or answered is kept until it does. Restarting the agent discards it.",
+    check_not_returned: "input held: the agent hasn't come back from the deck's check; what you typed or answered is kept until it does. Restarting the agent discards it.",
+    after_your_ctrl_g: "input held: the agent didn't open the editor for your Ctrl+G; what you typed or answered is kept. Restarting the agent discards it.",
     queue_full: "input held: too much typing is waiting; the rest is paused",
     check_blocked: "waiting: can't check this input box; press Ctrl+G to let the deck check it",
-    unknown: "input held: your typing is kept while the deck checks this input box",
+    unknown: "input held: what you typed or answered is kept while the deck checks this input box",
   },
   /**
    * PRD #1666 part 3 (Q35-20e, Q104b): the successor's card, when the agent
@@ -291,9 +291,10 @@ export function holdDetailWords(detail: HoldDetail): string | undefined {
 
 /**
  * PRD #1666 part 3 (Q35, core §7): the row saying the deck holds what the
- * user typed into the agent's pane, and why, whatever else the card shows;
- * with nothing held, that the previous generation's held typing was not
- * delivered (Q35-20e). The TUI's `CardInbox::input_held_text`.
+ * user typed into the agent's pane, or an answer it is sending for them, and
+ * why, whatever else the card shows; with nothing held, that typing an
+ * earlier generation of the pane held was not delivered (Q35-20e). The TUI's
+ * `CardInbox::input_held_text`.
  */
 export function inputHeldText(cause: InputHeldCause | undefined, discarded = false): string | undefined {
   if (cause !== undefined) return INBOX_WORDS.inputHeld[cause];

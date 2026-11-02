@@ -4,7 +4,7 @@ expression: wide
 ---
 ┌ 1 ClaudeCode · api-svc ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── ● Idle ┐
 │Dir:  api-svc                                                                                                                                                 │
-│input held: the agent hasn't opened the deck's check yet; your typing is kept until it does. Restarting the agent discards it.                                │
+│input held: the agent hasn't opened the deck's check yet; what you typed or answered is kept until it does. Restarting the agent discards it.                 │
 │                                                                                                                                                              │
 │                                                                                                                                                              │
 │                                                                                                                                                              │

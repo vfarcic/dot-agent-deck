@@ -4,7 +4,7 @@ expression: wide
 ---
 ┌ 1 ClaudeCode · api-svc ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── ● Idle ┐
 │Dir:  api-svc                                                                                                                                                 │
-│input held: the agent didn't open the editor for your Ctrl+G; your typing is kept. Restarting the agent discards it.                                          │
+│input held: the agent didn't open the editor for your Ctrl+G; what you typed or answered is kept. Restarting the agent discards it.                           │
 │                                                                                                                                                              │
 │                                                                                                                                                              │
 │                                                                                                                                                              │

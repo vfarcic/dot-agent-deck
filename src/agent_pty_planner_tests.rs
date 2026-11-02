@@ -784,7 +784,11 @@ async fn probe_010_a_job_queued_to_a_writer_still_unwinding_leaves_the_count_whe
                 .await
         }
     });
-    // All three are in the queue the held unwind has not dropped yet.
+    // All three have counted in. That is not proof each was sent: a job
+    // counts in before its send (`submit_job`), so in a rare interleaving the
+    // unwind drops the queue before a send, that job takes the send-failure
+    // path, and the run covers `gone()` for fewer than three jobs (revptyfix
+    // review U3-2).
     rig.flight(before + 3).await;
     release_unwind.send(()).unwrap();
     let user = tokio::time::timeout(Duration::from_secs(8), user)

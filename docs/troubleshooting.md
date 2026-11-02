@@ -646,6 +646,24 @@ The TUI gets here only after trying to reconnect. The status message says which 
 
 If neither fits, capture a log ([Enabling Debug Logs](#enabling-debug-logs); the TUI's side is enough here) and search it for `giving up on this pane`. The line's `reason` field is one of `empty-sessions` (the agent kept exiting), `no-live-agent` (the daemon answered and had no agent for the pane), `daemon-unreachable` (the daemon stopped answering) or `attach-failing` (the daemon had the agent but attaching to it kept failing). Include that line and the reconnect attempts before it when you report the problem.
 
+### A card says `input held: …`
+
+*Applies to the TUI and the desktop app, in Claude Code and Codex panes.*
+
+Before the deck types into a Claude Code or Codex agent's input box, it checks that the box is empty. While a check runs, the deck keeps what you type into that agent's pane, and an answer it is sending to the agent's question for you, and passes it on when the check ends, so your keys and the deck's don't mix. A check that ends within a moment shows nothing. One that takes longer shows one of these lines on the agent's TUI card and desktop tile, in the same words in both:
+
+| The card says | What to do |
+| --- | --- |
+| `input held: the deck is checking the input box; what you typed or answered will appear in a moment` | Nothing: it goes away when the check ends. |
+| `input held: the agent hasn't opened the deck's check yet; …` | Wait. The agent may be busy, and the check goes ahead when it is ready. |
+| `input held: the agent hasn't come back from the deck's check; …` | Wait. If it stays, look at the agent's pane; for a Codex agent, see below. |
+| `input held: the agent didn't open the editor for your Ctrl+G; …` | You pressed `Ctrl+G` and the agent didn't open its editor for it. Look at the agent's pane. |
+| `input held: too much typing is waiting; the rest is paused` | Stop typing until the line goes away. What you type meanwhile waits too. |
+
+**If the agent's pane is closed or the agent is replaced while something is held, the held typing never reaches it.** Type it again in the agent that takes the pane. When the deck replaces the agent in the same pane, for example an orchestration worker with `clear = true` taking its next task, the new agent's card and tile say `not delivered: your held typing; restarting the agent discarded it. Type it again if you still need it.` That line counts only what you typed, not an answer. It goes away when you type into that pane. Replacing the agent again while nothing is held doesn't clear it, however many times that happens, so it can be about typing you did for an agent two or more replacements back.
+
+**A Codex agent can hold your typing until it is replaced.** Rarely, a Codex agent comes back from the deck's check in a way the deck doesn't recognise. Its card then keeps saying `input held: the agent hasn't come back from the deck's check; …`, and what you type in its pane, `Ctrl+C` included, keeps waiting. The deck can't end this hold for a Codex agent, so it can last until the agent in that pane is replaced. To get the pane back, close it and start the agent again: in the TUI, press `Ctrl+D` to leave the pane, then `Ctrl+W`, and choose **Close**; in the desktop app, press the stop control on the agent's row and then **Close agent**. Then type again what you had typed.
+
 ### The deck restarted and its agents disappeared
 
 *Applies to the TUI and the desktop app.*

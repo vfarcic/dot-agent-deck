@@ -4,7 +4,7 @@ expression: wide
 ---
 ┌ 1 ClaudeCode · api-svc ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── ● Idle ┐
 │Dir:  api-svc                                                                                                                                                 │
-│input held: your typing is kept while the deck checks this input box                                                                                          │
+│input held: what you typed or answered is kept while the deck checks this input box                                                                           │
 │                                                                                                                                                              │
 │                                                                                                                                                              │
 │                                                                                                                                                              │

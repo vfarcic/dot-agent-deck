@@ -645,8 +645,10 @@ impl<T> Gate<T> {
     /// published, and the rest stays held behind that segment. `Ok(true)`
     /// when this closed the fence; `Ok(false)` when a fence was closed since
     /// the op was let through, which it joins, held whole, as
-    /// [`Self::cut_open`] joins it, opening no segment of its own. `Err(op)`
-    /// once retired.
+    /// [`Self::cut_open`] joins it, opening no segment of its own (a probe's
+    /// arm section can't be that fence, since admission takes a queued probe
+    /// back under this lock; in practice it is the `e2e` control's, revc23
+    /// review U3-3). `Err(op)` once retired.
     pub fn cut_hold(&self, op: T, len: usize, trigger: u64) -> Result<bool, T> {
         let mut inner = self.lock();
         if inner.retired {
