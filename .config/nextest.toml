@@ -777,3 +777,12 @@ slow-timeout = { period = "60s", terminate-after = 12 }
 [[profile.default.overrides]]
 filter = 'test(question_live_006_pi_extension_select_without_model)'
 slow-timeout = { period = "60s", terminate-after = 6 }
+
+# PRD #1666 part 3 (A-20d-7): the screen-freshness measurement watches a
+# real Claude Code idle for a minute, then asks 75 probes one at a time, each
+# after the last one's redraws stopped and a random wait of up to 2.5 s;
+# measured at about 250 s. Its daemon's self-exit cap is 900 s, above this
+# 840 s window.
+[[profile.default.overrides]]
+filter = 'test(probe_083_claude_idle_screen_freshness_refusal_rate)'
+slow-timeout = { period = "60s", terminate-after = 14 }

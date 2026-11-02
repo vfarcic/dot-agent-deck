@@ -10591,6 +10591,14 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** the watcher broadcasting the notice (`inbox/probe/046`) or either client's display of it (`inbox/probe/080`, `081`); a pane closed for good, which the daemon can't tell from a stop its successor follows, so the bound is what limits it.
 - **Platform coverage:** Unix.
 
+##### inbox/probe/083 — Measured: how often the writer refuses a probe's screen on a real Claude Code idle at its composer.
+
+- **Layer:** L2 real agent, lane 2 (`tests/e2e_probe_freshness_live.rs`): the deck's TUI harness with its own HOME, Claude Code 2.1.312 from the host's versions directory behind a `claude` symlink, the `e2e` build's editor-probe assumption, and `e2e-composer-control`'s `probe-request`, `schedule-status`, `schedule-advance` and `fence-status`, with the `scheduled` barrier (`DOT_AGENT_DECK_E2E_PROBE_GATE`) to widen the measured interval.
+- **Agent:** real Claude Code 2.1.312 at its empty composer; no prompt is submitted, so no model turn starts.
+- **Asserts:** the harness measured something: in each condition (the writer's own interval, then held 100 ms and 1 s after the frame was read) at least half of the probes reached the writer and at least one was written; and the control, five probes held 1 s while the test resizes the pane, has at least one refused as `Admission(Surface)`, so a zero in the other conditions is one the harness could have seen otherwise. The refusal rate itself is reported, not asserted: the summary line `PROBE-FRESHNESS` (and `DAD_PROBE_FRESHNESS_OUT`, when set) gives each condition's written and refused counts, the idle output cadence for the minute before the first probe and between probes, and each probe's request-to-answer time. A writer refusal of the screen reaches the requester as `Admission(Surface)`; a refusal when scheduled is counted apart.
+- **Does not assert:** a rate bound, the interval's own width (no production line reports it; the request-to-answer time bounds it from above), other releases, or redraws a user's own terminal causes (a resize, a focus report). Codex: a real Codex 0.164.0 under the deck's `wrap` stays `NotArmable(Pending)` in the `e2e` build, while the native stand-in binds, so no Codex row is measured until real Codex binds (Q35-22).
+- **Platform coverage:** Linux.
+
 ##### inbox/probe/079 — The `e2e` build's composer controls reach the live generation they name, take effect there, and refuse anything else.
 
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_composer_controls.rs`, with `tests/support/live_segments.rs`): the real daemon, a native Claude stand-in with the reviewed F2 composer, and `e2e-composer-control`'s Q105b.2 operations (`src/e2e_controls.rs`, `src/daemon_protocol.rs`).
