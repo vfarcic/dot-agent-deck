@@ -777,3 +777,9 @@ slow-timeout = { period = "60s", terminate-after = 12 }
 [[profile.default.overrides]]
 filter = 'test(question_live_006_pi_extension_select_without_model)'
 slow-timeout = { period = "60s", terminate-after = 6 }
+
+# CAPTURE BRANCH ONLY (agent/dispatch-p029-capture): show every iteration.
+[[profile.default.overrides]]
+filter = 'test(=probe_029_codex_requires_the_complete_matched_return)'
+success-output = "immediate"
+slow-timeout = { period = "60s", terminate-after = 5 }
