@@ -11141,6 +11141,7 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Layer:** Fast (`src/inbox_engine_tests.rs`), the hub over in-memory duplexes and a real spool.
 - **Agent:** none.
 - **Asserts:** an offer whose Pi hand-out lapses unpossessed is never back in its pool while it lapses; Pi's positive not-handed returns it and it goes to OpenCode; Pi's late report then settles nothing of OpenCode's copy.
+- **Lapse window (PRD #1666 part 3 mutation run, 2026-11-02):** the test reads Pi's attempts only once the lapse has run 600 ms and the message reads uncertain (its automatic repeats spent, after which no attempt is issued), so the not-handed report names every attempt; a fixed 600 ms read missed a repeat issued later on a slow runner, which rightly kept the offer from its pool (one macOS CI timeout, run 41345662274).
 - **Does not assert:** the uncertain notice a lapse can end in (inbox/boundary/021).
 - **Platform coverage:** all.
 

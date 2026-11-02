@@ -3408,8 +3408,23 @@ async fn boundary_035_a_lapsed_pi_offer_is_never_returned_from_a_lapse() {
     let handed = pi.handout().await;
     pi.send(serde_json::json!({"possess": {"seq": 1, "seen": attempt(&handed[0]).d, "held": []}}))
         .await;
+    // The lapse runs at least 600 ms, and until Pi's automatic repeats are
+    // spent and the message reads uncertain, after which no attempt is
+    // issued: the not-handed report below then names every attempt. A slow
+    // runner issues the last repeat later, and one left out of the report
+    // rightly keeps the offer from its pool.
+    let spent = || {
+        hub.lock().receipts.gens[&("pi".to_string(), "b".to_string())]
+            .model
+            .delivery(id.as_str())
+            .is_some_and(|d| matches!(d.state, crate::inbox_attempts::MessageState::Uncertain(_)))
+    };
     let started = Instant::now();
-    while started.elapsed() < Duration::from_millis(600) {
+    while started.elapsed() < Duration::from_millis(600) || !spent() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "timed out waiting for Pi's repeats to be spent"
+        );
         hub.tick();
         assert!(
             !hub.lock().inbox.unassigned_offers().contains(&id),
