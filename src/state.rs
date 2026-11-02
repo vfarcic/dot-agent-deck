@@ -6845,7 +6845,8 @@ struct PaneInbox {
     /// names: the card shows it only while that generation is this account's
     /// ([`Self::card`]), and a new account keeps it only when it names the
     /// new account's generation, which an update sent before the generation's
-    /// handover does ([`Self::retire`]).
+    /// handover does ([`Self::retire`]). A stream that moves to another daemon
+    /// process clears it ([`AppState::learn_stream_incarnation`]).
     held: Option<PaneHeld>,
     /// PRD #1666 §6.5: the items waiting on the user and the card's notices,
     /// from the summary and from each attention notice, which carries them
@@ -8450,10 +8451,13 @@ impl AppState {
                 // Q35-20e (R-E-U2-02): agent ids are daemon-local, so another
                 // process's words on held typing name generations this one's
                 // ids may reuse; and its accounts' generations fence nothing
-                // from this one (review U3-a).
+                // from this one (review U3-a). An account's own word is that
+                // process's too, so a reused id cannot carry it onto this
+                // process's generation (review rev-tidy2 U3-1).
                 self.pending_input_held.clear();
                 for inbox in self.pane_inboxes.values_mut() {
                     inbox.from_replaced_process = true;
+                    inbox.held = None;
                 }
             }
             self.replaced_processes
@@ -21353,6 +21357,70 @@ mod tests {
             run(true, "12"),
             Some(1),
             "process B's reused id 12 starts them over too"
+        );
+    }
+
+    /// PRD #1666 part 3 (review rev-tidy2 U3-1): under daemon process A the
+    /// deck holds typing for the pane's generation 12 and says the typing of
+    /// its generation 11 was discarded. The stream moves to process B, whose
+    /// own generation reuses the id 12, and a notice of B's reaches the pane.
+    /// B's card shows neither of A's words: A's held-typing word is about A's
+    /// process, whatever id B's generation reuses. Control, under one process:
+    /// generation 12's own card keeps both words.
+    #[test]
+    fn a_replaced_processs_held_typing_word_does_not_ride_onto_a_reused_id() {
+        use crate::inbox::StateName::Queued;
+        use crate::inbox_display::{InputDiscarded, InputHeld, InputHeldCause};
+        let named = |process: &str| -> Incarnation {
+            serde_json::from_value(serde_json::json!(process)).unwrap()
+        };
+        let run = |reconnect: bool| {
+            let mut state = AppState::default();
+            state.learn_stream_incarnation(named("daemon-a"));
+            state.register_pane("pane-q".to_string());
+            state.take_inbox_snapshot(&[inbox_record("pane-q", "12", Some(held_summary(0, None)))]);
+            state.apply_input_held_update(&crate::event::InputHeldUpdate {
+                pane_id: "pane-q".to_string(),
+                agent_id: "12".to_string(),
+                input_held: Some(InputHeld {
+                    generation: 12,
+                    cause: InputHeldCause::Checking,
+                    held_ops: 1,
+                    held_bytes: 1,
+                    since_ms: 0,
+                }),
+                input_discarded: Some(InputDiscarded {
+                    generation: 11,
+                    held_ops: 1,
+                    held_bytes: 1,
+                    at_ms: 0,
+                }),
+            });
+            if reconnect {
+                state.learn_stream_incarnation(named("daemon-b"));
+            }
+            state.apply_event(AgentEvent {
+                session_id: "gen-12".to_string(),
+                agent_id: Some("12".to_string()),
+                ..quota_event(EventType::SessionStart, 1)
+            });
+            state.apply_inbox_notice(&crate::event::InboxNotice {
+                agent_id: Some("12".to_string()),
+                ..inbox_notice("pane-q", "m-new", Queued)
+            });
+            state.sessions["gen-12"]
+                .card_inbox()
+                .map(|inbox| (inbox.input_held, inbox.input_discarded))
+        };
+        assert_eq!(
+            run(false),
+            Some((Some(InputHeldCause::Checking), true)),
+            "control: under one process generation 12 keeps its own words"
+        );
+        assert_eq!(
+            run(true),
+            Some((None, false)),
+            "process B's reused id 12 carries none of process A's words"
         );
     }
 
