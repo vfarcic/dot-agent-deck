@@ -9,10 +9,13 @@
 //! | [`R3`] | the inbox hub's state |
 //! | [`R4`] | the registry's record table (`inner`) |
 //! | [`R5`] | the retained-report store |
+//! | [`GATE`] | a generation's fence gate (PRD #1666 part 3, Q35-15) |
 //! | [`R6`] | a generation's input epoch (PRD #1666 part 3, Q35-06), with no ranked lock taken under it |
 //! | [`LEAF`] | the registry's dispatched units, taken with none of the above held |
 //!
-//! A thread holding rank *n* may take only a rank above *n*. `AppState`'s
+//! A thread holding rank *n* may take only a rank above *n*. The names are the
+//! plan's; only the values' order means anything, which is why [`GATE`],
+//! ranked after the others were named, sits between [`R5`] and [`R6`]. `AppState`'s
 //! `tokio` `RwLock` (R0) is outermost by convention and is **not** seen here:
 //! a thread-local stack is not sound for a guard held across an `.await`, which
 //! R0's callers do. What keeps R0 outermost is that no ranked guard is held
@@ -74,10 +77,16 @@ pub const R3: u8 = 3;
 pub const R4: u8 = 4;
 /// The retained-report store.
 pub const R5: u8 = 5;
+/// A generation's fence gate (`crate::composer_probe::gate`): taken under
+/// the registry's record table ([`R4`]) when a generation retires, and under
+/// the pane writer's async lock (not seen here) for acceptance and release.
+/// The input epoch ([`R6`]) is taken under it; the seam's lock and the
+/// ingress ledger, plain mutexes, are too, and neither is seen here.
+pub const GATE: u8 = 6;
 /// A generation's input epoch (`crate::composer_probe::epoch`): it may be
-/// taken while any of [`R1`]–[`R5`] is held, and no ranked lock may be taken
-/// under it.
-pub const R6: u8 = 6;
+/// taken while any of [`R1`]–[`R5`] or [`GATE`] is held, and no ranked lock
+/// may be taken under it.
+pub const R6: u8 = 7;
 /// The registry's dispatched units: taken with no other ranked lock held, and
 /// nothing ranked is taken under it.
 pub const LEAF: u8 = u8::MAX;

@@ -258,3 +258,53 @@ async fn probe_011_a_waiter_wakes_at_retirement_and_when_the_head_leaves() {
     drop(again);
     assert_eq!(gate.status().full_waiters, 0);
 }
+
+/// Scenario: On one thread, take the gate where its lock order puts it and where it forbids it: under the registry's rank (R4), with the input epoch's rank (R6) taken inside its acceptance, and with R6 already held. The first two run; asking the gate anything with R6 held panics in a debug build, naming the ranks held, instead of being taken silently out of order.
+#[cfg(debug_assertions)]
+#[spec("inbox/probe/011")]
+#[test]
+fn probe_011_a_debug_build_checks_the_gates_place_in_the_lock_order() {
+    use dot_agent_deck::lock_rank::{R4, R6, RankedMutex, held_ranks};
+
+    let registry = RankedMutex::<R4, ()>::new(());
+    let epoch = RankedMutex::<R6, ()>::new(());
+    let gate: G = Arc::default();
+    gate.fence(0);
+
+    // Allowed: the gate under R4 (retirement runs under the registry's
+    // lock), and R6 under the gate (acceptance moves the epoch).
+    {
+        let _registry = registry.lock();
+        let admitted = gate.admit(
+            "key",
+            1,
+            None,
+            |_, _| {
+                let _epoch = epoch.lock();
+                false
+            },
+            |_| {
+                let _epoch = epoch.lock();
+            },
+        );
+        assert!(matches!(admitted, Admission::Held));
+        assert_eq!(gate.retire(), vec!["key"]);
+    }
+    assert!(held_ranks().is_empty());
+
+    // Forbidden: nothing takes the gate under R6.
+    let gate: G = Arc::default();
+    let held = epoch.lock();
+    let violation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gate.status()))
+        .expect_err("the gate under R6 is out of order");
+    let message = violation
+        .downcast_ref::<String>()
+        .expect("a formatted message");
+    assert!(
+        message.contains("lock rank violation") && message.contains(&format!("[{R6}]")),
+        "{message}"
+    );
+    drop(held);
+    assert!(held_ranks().is_empty());
+    assert!(!gate.status().fenced, "taken in order, it answers");
+}

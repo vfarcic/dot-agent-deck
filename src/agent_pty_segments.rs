@@ -67,11 +67,12 @@
 //! output hook:   output lock ─> input (R6) ─> segments ; notify
 //! ```
 //! Nothing takes the gate under the seam or R6, nor the seam under R6.
-//! The gate's mutex is a plain mutex: [`crate::lock_rank`] doesn't rank or
-//! check it, so its place above (under the pane writer's async lock, before
-//! the seam and R6, the ledger a leaf under it) is this diagram's word, not
-//! a debug-build check (the audit's U3-9d; ranking it is on the activation
-//! list).
+//! The gate's mutex is ranked ([`crate::lock_rank::GATE`], above `R4`, under
+//! which retirement takes it, and below `R6`), so a debug build checks those
+//! two edges. The pane writer's async lock, the seam's and the ledger are
+//! unranked: their places above (the pane writer's over the gate, the seam
+//! and the ledger under it) are this diagram's word, not a debug-build
+//! check.
 //! Retirement: the registry retires the input (segments end `Retired`) and
 //! the gate (held ops refused `exited` once), and the driver ends at its next
 //! wake.
