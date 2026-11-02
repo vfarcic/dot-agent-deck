@@ -444,6 +444,49 @@ pub enum Refusal {
     NotSubmitted,
 }
 
+/// The user's editor a segment's helper runs, as the observer pinned it
+/// (A-20d-6): its `(pid, start)`, and a check of whether that very process
+/// still runs, which a release asks before it hands held typing to the
+/// editor. The observer's check polls the editor's pidfd, held since the
+/// pin, so it can't answer for another process that reused the pid. An
+/// editor reported with an identity but no check (tests only) is taken as
+/// running.
+#[derive(Clone)]
+pub struct EditorPin {
+    pub key: RecordKey,
+    running: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
+}
+
+impl EditorPin {
+    /// `key`, with `running` answering whether it still runs. Called under
+    /// the generation's lock: it must not block or take a lock.
+    pub fn new(key: RecordKey, running: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self {
+            key,
+            running: Some(std::sync::Arc::new(running)),
+        }
+    }
+
+    /// `key` with no check of its own.
+    pub fn unchecked(key: RecordKey) -> Self {
+        Self { key, running: None }
+    }
+
+    /// Whether the pinned editor still runs; `true` with no check.
+    pub fn running(&self) -> bool {
+        self.running.as_ref().is_none_or(|running| running())
+    }
+}
+
+impl std::fmt::Debug for EditorPin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EditorPin")
+            .field("key", &self.key)
+            .field("checked", &self.running.is_some())
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Segment {
     kind: Kind,
@@ -464,7 +507,7 @@ struct Segment {
     editor_running: bool,
     /// The editor's pinned identity, when the report of it carried one
     /// (A-20d-6).
-    editor: Option<RecordKey>,
+    editor: Option<EditorPin>,
     e1: Option<ReturnWatch>,
     ec: Option<ReturnWatch>,
     /// When E1's enable followed (E5′'s origin).
@@ -536,15 +579,17 @@ pub struct Segments {
     /// written report can still be on its way): a segment that matches one
     /// takes it then. The latest [`super::record::RECORD_CAP`] are kept.
     ///
-    /// **A past observation (the audit's U3-7).** "Running" is what the
-    /// observer saw when it reported, applied at match time, one report
-    /// later; nothing here, nor the release it allows, checks that the
-    /// editor still runs. An editor that exited in between (a scripted one
-    /// can; a person's session can't end that fast) leaves the segment
-    /// `Released` until its helper's drain shows how it ended (R-U2-06's
-    /// cut-off). Pinning the editor's identity is an activation
-    /// precondition (plan Q104b).
-    editors: VecDeque<(RecordKey, Option<RecordKey>)>,
+    /// **A past observation (the audit's U3-7), re-checked at release
+    /// (A-20d-6).** "Running" is what the observer saw when it reported,
+    /// applied at match time, one report later. The observer's report
+    /// carries the editor's pin ([`EditorPin`]), and the early release asks
+    /// it, under this lock, whether that process still runs: one that
+    /// exited before the release is decided releases nothing early. An
+    /// editor that exits after the release was decided still leaves the
+    /// segment `Released` until its helper's drain shows how it ended
+    /// (R-U2-06's cut-off). A report with no check (tests only) is taken
+    /// as running.
+    editors: VecDeque<(RecordKey, Option<EditorPin>)>,
     retired: bool,
 }
 
@@ -941,13 +986,41 @@ impl Segments {
         editor: Option<RecordKey>,
         now: Instant,
     ) -> bool {
+        self.editor_report(records, fifo, key, editor.map(EditorPin::unchecked), now)
+    }
+
+    /// [`Self::editor_pinned`], with the observer's check of whether the
+    /// pinned editor still runs, which the release asks (A-20d-6).
+    pub fn editor_pinned_with(
+        &mut self,
+        records: &mut Records,
+        fifo: &mut HazardFifo,
+        key: RecordKey,
+        editor: EditorPin,
+        now: Instant,
+    ) -> bool {
+        self.editor_report(records, fifo, key, Some(editor), now)
+    }
+
+    fn editor_report(
+        &mut self,
+        records: &mut Records,
+        fifo: &mut HazardFifo,
+        key: RecordKey,
+        editor: Option<EditorPin>,
+        now: Instant,
+    ) -> bool {
         if self.retired {
             return false;
         }
         self.evaluate(records, fifo, now);
         let Some(seg) = self.segments.iter_mut().find(|s| s.record == Some(key)) else {
             match self.editors.iter_mut().find(|(k, _)| *k == key) {
-                Some((_, known)) => *known = editor.or(*known),
+                Some((_, known)) => {
+                    if editor.is_some() {
+                        *known = editor;
+                    }
+                }
                 None => {
                     if self.editors.len() == record::RECORD_CAP {
                         self.editors.pop_front();
@@ -958,7 +1031,9 @@ impl Segments {
             return false;
         };
         seg.editor_running = true;
-        seg.editor = editor.or(seg.editor);
+        if editor.is_some() {
+            seg.editor = editor;
+        }
         self.evaluate(records, fifo, now);
         true
     }
@@ -996,7 +1071,7 @@ impl Segments {
                     ec: seg.ec.is_some_and(|w| w.returned(self.agent)),
                     not_returned: since
                         .is_some_and(|at| now.saturating_duration_since(at) >= NOT_RETURNED),
-                    editor: seg.editor,
+                    editor: seg.editor.as_ref().map(|e| e.key),
                 }
             })
             .collect()
@@ -1157,7 +1232,14 @@ fn early_release(agent: Agent, seg: &Segment, r: &Record) -> bool {
     match (agent, seg.kind, r.decision) {
         (Agent::Claude, Kind::Probe, Some(Decision::Armed | Decision::Unarmed)) => true,
         (Agent::Claude, Kind::HumanG, Some(Decision::Armed)) => true,
-        (_, Kind::HumanG, Some(Decision::Unarmed)) => seg.editor_running,
+        // A-20d-6, option (a): released to the user's editor only while
+        // the editor pinned for it still runs; one that already exited is
+        // gone, and the segment waits for its helper's completion as one
+        // whose editor never ran (fail closed: typing held longer, never
+        // handed to an editor that isn't there).
+        (_, Kind::HumanG, Some(Decision::Unarmed)) => {
+            seg.editor_running && seg.editor.as_ref().is_none_or(EditorPin::running)
+        }
         _ => false,
     }
 }

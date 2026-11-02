@@ -1423,3 +1423,40 @@ fn probe_009_the_segment_keeps_the_pinned_editors_identity() {
         assert_eq!(v[0].editor, Some(editor), "pinned first: {pinned_first}");
     }
 }
+
+/// Scenario: Write a held Ctrl+G whose helper decides `Unarmed`, and report its editor running, pinned with a check of whether that very process still runs. While the check says it runs, the held typing is released to it; when the pinned editor has already exited by the time the release would be decided, nothing is released early: the segment waits as one whose editor never ran, for its helper's completion (A-20d-6, option (a)).
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_a_release_rechecks_that_the_pinned_editor_still_runs() {
+    use dot_agent_deck::composer_probe::segments::EditorPin;
+    let editor = RecordKey {
+        pid: 4321,
+        start: 99,
+    };
+    for running in [true, false] {
+        let mut t = T::new(Agent::Claude, AUTH);
+        let n = t.probe(0);
+        t.s.open_human_g(1).unwrap();
+        t.write(n, 1);
+        t.ipc(1, Decision::Armed, n, 2);
+        t.exit(1, 3);
+        t.returns(4);
+        let g = t.s.next_trigger().unwrap();
+        t.write(g, 5);
+        t.ipc(2, Decision::Unarmed, g, 6);
+        assert!(t.s.editor_pinned_with(
+            &mut t.r,
+            &mut t.f,
+            key(2),
+            EditorPin::new(editor, move || running),
+            time(t.t, 7)
+        ));
+        let v = t.view(7);
+        assert_eq!(v[0].editor, Some(editor));
+        if running {
+            assert_eq!(v[0].stage, Stage::Released, "the editor runs");
+        } else {
+            assert_ne!(v[0].stage, Stage::Released, "the editor already exited");
+        }
+    }
+}

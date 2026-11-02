@@ -1775,6 +1775,21 @@ impl GenerationInput {
         .unwrap_or(false)
     }
 
+    /// [`Self::segment_editor_pinned`] with the observer's check of whether
+    /// the pinned editor still runs, which an early release to it asks
+    /// under this input's lock (A-20d-6): the check must not block.
+    pub fn segment_editor_pinned_with(
+        &self,
+        key: RecordKey,
+        editor: segments::EditorPin,
+        now: Instant,
+    ) -> bool {
+        self.segment_step(now, |seg, records, fifo| {
+            Ok(seg.editor_pinned_with(records, fifo, key, editor, now))
+        })
+        .unwrap_or(false)
+    }
+
     /// A held Ctrl+G at the front of the held input, with no segment open:
     /// its number, to publish before its trigger is written alone.
     pub fn segment_trigger(&self) -> Result<u64, segments::Refusal> {

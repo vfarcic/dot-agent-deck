@@ -108,6 +108,8 @@
 //! keymap re-read (A-20d-1a): input (R6, which parked reads, released) ; keymap
 //!                files read (no lock) ; input (R6, settle them)
 //! parked read's wake: under R6 ─> Bell (atomics, unpark)
+//! early release to a pinned editor (A-20d-6): under R6 ─> poll of the
+//!                editor's pidfd (held, zero timeout, no lock)
 //! output lock (bus) ─> Bell (atomics, unpark)
 //! observer exit observed ─> Departure (once-set instant, notify) ─> hook task's read deadline
 //! retirement: R4 ─> R6 (retire_taking_first_stop); Observer::stop (atomics)
@@ -1228,9 +1230,23 @@ pub struct ChildFacts {
 /// for the helper's. `None` when no child is the editor, or the helper may
 /// have gone.
 ///
-/// What it doesn't pin: which program the editor is. The helper resolves
-/// the user's editor command itself, and a script's process runs its
-/// interpreter, so the executable is told only from the helper copy.
+/// Of several that qualify, the earliest-started is the editor (lowest pid
+/// on a tie; A-20d-6, the reva21 review's item 5). The helper is a
+/// subreaper, so an orphaned descendant of the editor is re-parented to it
+/// and qualifies too; it started after the editor, so while the editor
+/// runs it is never the one taken.
+///
+/// What it doesn't pin: which program the editor is (A-20d-6's option (a),
+/// Q118b). The helper resolves the user's editor command itself, and a
+/// script's process runs its interpreter, `env VAR=x vim` runs `env` first,
+/// `code --wait` is a script that ends in node, and snap or flatpak shims
+/// stand in front: matching the executable against the editor command
+/// would refuse all of them. So the executable is told only from the
+/// helper copy. **The residual this leaves:** once the editor itself has
+/// exited, an adopted descendant of it still running is the earliest
+/// qualifying child and is taken for the editor. It is a process the
+/// user's own editor started, and what a release hands it is the person's
+/// own held typing, which goes to the pane's PTY either way.
 pub fn user_editor(
     helper: RecordKey,
     helper_id: super::classifier::FileId,
@@ -1238,17 +1254,20 @@ pub fn user_editor(
     mut facts: impl FnMut(u32) -> Option<ChildFacts>,
     helper_alive: impl FnOnce() -> bool,
 ) -> Option<RecordKey> {
-    let editor = children.iter().find_map(|&pid| {
-        let f = facts(pid)?;
-        (f.alive_after
-            && f.ppid == helper.pid
-            && f.start >= helper.start
-            && f.exe.is_some_and(|exe| exe != helper_id))
-        .then_some(RecordKey {
-            pid,
-            start: f.start,
+    let editor = children
+        .iter()
+        .filter_map(|&pid| {
+            let f = facts(pid)?;
+            (f.alive_after
+                && f.ppid == helper.pid
+                && f.start >= helper.start
+                && f.exe.is_some_and(|exe| exe != helper_id))
+            .then_some(RecordKey {
+                pid,
+                start: f.start,
+            })
         })
-    })?;
+        .min_by_key(|editor| (editor.start, editor.pid))?;
     helper_alive().then_some(editor)
 }
 
@@ -2366,6 +2385,24 @@ mod linux {
                 ) else {
                     continue;
                 };
+                // Held by its pidfd from here (A-20d-6), opened and then
+                // checked against the start read with it, so the release's
+                // re-check polls this very process. One that exited or
+                // whose pid was reused in between isn't reported, and the
+                // next pass looks again.
+                let Ok(pinned) = attest::pin(
+                    &mut LinuxKernel::default(),
+                    Sighting::Pid {
+                        pid: editor.pid,
+                        start: Some(editor.start),
+                    },
+                ) else {
+                    continue;
+                };
+                let pidfd = pinned.into_pidfd();
+                let pin = crate::composer_probe::segments::EditorPin::new(editor, move || {
+                    !exited(&pidfd)
+                });
                 tracing::debug!(
                     target: "composer_probe",
                     helper = key.pid,
@@ -2381,8 +2418,9 @@ mod linux {
                 let input = Arc::clone(inner.seam.input());
                 drop(inner);
                 // A-20d-6: the editor's pinned identity stays with the
-                // segment, not only a boolean that one ran.
-                input.segment_editor_pinned(key, Some(editor), Instant::now());
+                // segment, not only a boolean that one ran, with its pidfd,
+                // which the release asks whether it still runs.
+                input.segment_editor_pinned_with(key, pin, Instant::now());
             }
         }
 
@@ -3679,6 +3717,36 @@ mod editor_identity_tests {
             user_editor(HELPER, HELPER_COPY, &[401], |_| None, || true),
             None,
             "a child that didn't pin"
+        );
+    }
+
+    /// Scenario: The helper, a subreaper, has two children that both qualify as its editor: the editor it exec'd, and an orphaned descendant of that editor re-parented to it, which started later but has the lower pid. The observer takes the earliest-started one, the editor itself, whichever order the children are listed in; two that started in the same tick are taken by the lower pid (A-20d-6, the reva21 review's item 5).
+    #[spec("inbox/probe/027")]
+    #[test]
+    fn probe_027_the_earliest_started_qualifying_child_is_the_editor() {
+        let facts = |pid: u32| match pid {
+            402 => Some(child(400, 1_005, VIM)),
+            401 => Some(child(400, 1_050, VIM)),
+            403 => Some(child(400, 1_005, VIM)),
+            _ => None,
+        };
+        for children in [&[401, 402][..], &[402, 401]] {
+            assert_eq!(
+                user_editor(HELPER, HELPER_COPY, children, facts, || true),
+                Some(RecordKey {
+                    pid: 402,
+                    start: 1_005
+                }),
+                "{children:?}"
+            );
+        }
+        assert_eq!(
+            user_editor(HELPER, HELPER_COPY, &[403, 402, 401], facts, || true),
+            Some(RecordKey {
+                pid: 402,
+                start: 1_005
+            }),
+            "a tie in start goes to the lower pid"
         );
     }
 }
