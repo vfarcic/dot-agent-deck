@@ -437,8 +437,9 @@ impl Installation {
     /// (A-20d-1b), for the agents its class may run: the spawn's own
     /// variables `env` over the daemon's, the arguments of `command` (the
     /// command the pane will run, this installation's arguments included)
-    /// and the working directory `cwd` (the daemon's own when `None`). File
-    /// I/O: call it off the executor, with no lock held.
+    /// and the directory the child starts in ([`spawn_start_dir`]: `cwd`,
+    /// or the child's `HOME` when `cwd` is `None` or isn't a directory).
+    /// File I/O: call it off the executor, with no lock held.
     #[cfg(target_os = "linux")]
     pub fn read_keymap_baseline(
         &mut self,
@@ -460,12 +461,6 @@ impl Installation {
             .and_then(super::observe::shell_words)
             .map(|words| words.into_iter().skip(1).map(OsString::from).collect())
             .unwrap_or_default();
-        let here = std::env::current_dir().unwrap_or_default();
-        let cwd = cwd.map_or_else(|| here.clone(), |dir| here.join(dir));
-        // As the kernel names it (what Codex's `getcwd` and the bound
-        // agent's `/proc/<pid>/cwd` read), so a symlink in the spawn's path
-        // isn't a different project chain.
-        let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
         let lookup = |name: &str| {
             env.iter()
                 .rev()
@@ -473,6 +468,8 @@ impl Installation {
                 .map(|(_, v)| OsString::from(v))
                 .or_else(|| std::env::var_os(name))
         };
+        let here = std::env::current_dir().unwrap_or_default();
+        let cwd = spawn_start_dir(cwd, lookup, &here);
         self.keymap_baseline = Some(super::keymap::KeymapBaseline::at_spawn(
             claude, codex, lookup, &args, &cwd,
         ));
@@ -629,6 +626,33 @@ pub fn install(
     })
 }
 
+/// The directory a spawn's child starts in, as the PTY builder picks it
+/// (portable-pty 0.8.1, `CommandBuilder::as_command`; the reva21 review's
+/// U2-1): `cwd` when it names a directory, relative to the daemon's own
+/// `here`; otherwise the child's `HOME` (`lookup`: the spawn's variables
+/// over the daemon's) when it is UTF-8, otherwise the user's home as the
+/// daemon finds it, otherwise `/`. As the kernel names it (what Codex's
+/// `getcwd` and the bound agent's `/proc/<pid>/cwd` read), so a symlink in
+/// the path isn't a different project chain.
+#[cfg(target_os = "linux")]
+pub(crate) fn spawn_start_dir(
+    cwd: Option<&str>,
+    lookup: impl Fn(&str) -> Option<OsString>,
+    here: &Path,
+) -> std::path::PathBuf {
+    let dir = cwd
+        .map(|dir| here.join(dir))
+        .filter(|dir| dir.is_dir())
+        .unwrap_or_else(|| {
+            lookup("HOME")
+                .filter(|home| home.to_str().is_some())
+                .map(std::path::PathBuf::from)
+                .or_else(std::env::home_dir)
+                .unwrap_or_else(|| std::path::PathBuf::from("/"))
+        });
+    std::fs::canonicalize(&dir).unwrap_or(dir)
+}
+
 /// The daemon's instance, made by the first installed spawn.
 #[cfg(target_os = "linux")]
 fn daemon_instance() -> Result<&'static Instance, SetupError> {
@@ -698,5 +722,41 @@ pub fn at_spawn(
     {
         let _ = (generation, env);
         Err(NotInstalled::Platform)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::spawn_start_dir;
+    use spec::spec;
+    use std::ffi::OsString;
+
+    /// Scenario: Work out where a spawn's child starts, for the key-binding baseline read before it (Codex's project files are its directory's chain). A spawn naming a directory starts there, relative to the daemon's own; one naming none, or naming something that isn't a directory, starts in the child's `HOME` (the spawn's over the daemon's), as the PTY builder starts it, not in the daemon's directory (the reva21 review's U2-1).
+    #[spec("inbox/probe/014")]
+    #[test]
+    fn probe_014_a_spawn_with_no_directory_starts_in_its_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let (home, daemon, repo) = (root.join("home"), root.join("daemon"), root.join("repo"));
+        for d in [&home, &daemon, &repo] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(root.join("file"), "").unwrap();
+        let lookup = |name: &str| (name == "HOME").then(|| OsString::from(&home));
+        assert_eq!(spawn_start_dir(Some("../repo"), lookup, &daemon), repo);
+        assert_eq!(
+            spawn_start_dir(Some(repo.to_str().unwrap()), lookup, &daemon),
+            repo
+        );
+        assert_eq!(
+            spawn_start_dir(None, lookup, &daemon),
+            home,
+            "no directory: the child's HOME"
+        );
+        assert_eq!(
+            spawn_start_dir(Some("../file"), lookup, &daemon),
+            home,
+            "not a directory: the child's HOME"
+        );
     }
 }
