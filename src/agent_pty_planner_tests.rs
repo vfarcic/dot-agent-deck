@@ -1497,6 +1497,19 @@ async fn probe_075_a_deck_line_starts_only_at_a_boundary_of_a_live_generation() 
     assert_eq!(rig.in_flight(), 0);
 }
 
+/// Wait until nothing but the caller holds `claim`, at most 8 seconds.
+async fn only_we_hold(claim: &Arc<JobClaim>) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Arc::strong_count(claim) != 1 {
+        assert!(
+            Instant::now() < deadline,
+            "{} still hold the claim",
+            Arc::strong_count(claim)
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
 /// Scenario: Queue a job behind one the shut PTY is blocking, take the queued one back, and also queue a deck line the writer will refuse; then open the PTY. When the writer comes to them, each is dropped at its dequeue: its reply channel closes and nothing else holds its claim.
 #[spec("inbox/probe/075")]
 #[tokio::test(flavor = "multi_thread")]
@@ -1536,7 +1549,15 @@ async fn probe_075_a_job_the_writer_does_not_start_is_dropped_at_its_dequeue() {
     rig.idle().await;
     drop(taken_back);
     drop(off);
+    // The writer drops a job it does not start field by field, its reply
+    // channel before its claim, so `off.done()` and `idle()` can both
+    // return while the writer still holds the refused job's claim for a
+    // few instructions more. Wait, within a bound, for it to let go: the
+    // claim is still dropped at its dequeue, by the running writer, not
+    // kept until the thread ends. `withdrawn`'s job was dropped whole
+    // before the writer dequeued `off`, so it needs no wait.
     assert_eq!(Arc::strong_count(&withdrawn), 1, "nothing else holds it");
+    only_we_hold(&refused).await;
     assert_eq!(Arc::strong_count(&refused), 1);
     assert_eq!(rig.taken(), b"\x1b[");
     assert_eq!(rig.in_flight(), 0);
