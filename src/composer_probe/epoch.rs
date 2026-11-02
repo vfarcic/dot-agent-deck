@@ -1654,8 +1654,9 @@ impl GenerationInput {
     /// retry is due at `now`. A lone Claude probe that lapsed with nothing
     /// held behind it (`held_ops`, the gate's) is a failed attempt (R2
     /// §6.8): the schedule counts it once, so its retry waits the backoff a
-    /// failure waits, and is then due when the schedule is. `false` for
-    /// anything else, Codex included (only a Claude probe lapses).
+    /// failure waits, and is then due when the schedule is and no empty
+    /// read is parked for its keymap re-read. `false` for anything else,
+    /// Codex included (only a Claude probe lapses).
     pub fn lapse_due(&self, held_ops: usize, now: Instant) -> bool {
         let mut guard = self.state.lock_recovering();
         let state = &mut *guard;
@@ -1673,7 +1674,11 @@ impl GenerationInput {
             live.lapse_counted = Some(number);
             live.schedule.failed(now);
         }
-        live.schedule.due(now, epoch)
+        // An empty read parked for its keymap re-read is a check still
+        // outstanding, as `probe_due` reads it: a lapse retry started under
+        // it could lapse in turn and leave the parked read's held verdict
+        // counting a second failure (the reva21 review's U3-1).
+        live.parked.is_empty() && live.schedule.due(now, epoch)
     }
 
     /// Start a probe request (U3-02): `None` while another is on its way.
@@ -2427,6 +2432,55 @@ mod tests {
         let (control, number) = probe(now);
         settle_undecided(&control, number);
         assert_eq!(failures(&control), 1, "an unlapsed probe's failure counts");
+    }
+
+    /// Scenario: A Claude probe lapses with nothing held behind it, its lapse is counted, and its backoff passes, so its lapse retry is due. An earlier probe's `Armed` empty read is then parked for its keymap re-read: while it is parked the lapse retry is not due, as a first attempt isn't, so one failure can't be counted twice (the reva21 review's U3-1); once the re-read settles it, the retry is due again.
+    #[cfg(target_os = "linux")]
+    #[spec("inbox/probe/030")]
+    #[test]
+    fn probe_030_a_lapse_retry_waits_while_an_empty_read_is_parked() {
+        use crate::composer_probe::probe::BACKOFF;
+        use crate::composer_probe::query_ledger::T_TRIGGER;
+        use crate::composer_probe::record::{EcPolicy, Records};
+        let now = Instant::now();
+        let Some(at) = now.checked_sub(T_TRIGGER + std::time::Duration::from_secs(1)) else {
+            return;
+        };
+        let input = GenerationInput::default();
+        assert!(input.attach_records(Records::new(5, EcPolicy::Hold, now)));
+        assert!(input.attach_segments(5, segments::Agent::Claude));
+        assert!(input.recheck_keymap_at_settlement(Arc::new(|| {})));
+        let (number, _) = input.segment_open_probe(false, now).unwrap();
+        input.segment_written(number, 0, at, now).unwrap();
+        assert!(!input.lapse_due(0, now), "the lapse is a failure first");
+        let later = now + BACKOFF[0];
+        assert!(
+            input.lapse_due(0, later),
+            "its retry is due after the backoff"
+        );
+        {
+            let mut state = input.state.lock_recovering();
+            let live = state.live.as_mut().unwrap();
+            let ticket = live.next_ticket;
+            live.next_ticket += 1;
+            live.parked.push(Parked {
+                ticket,
+                probe: Probe {
+                    number: 0,
+                    job: DeckJobId(0),
+                    e0: None,
+                },
+            });
+        }
+        assert!(input.settling());
+        assert!(
+            !input.lapse_due(0, later),
+            "no lapse retry while an empty read is parked"
+        );
+        let through = input.keymap_recheck_due().expect("parked");
+        input.settle_keymap_recheck(through, Ok(()), later);
+        assert!(!input.settling());
+        assert!(input.lapse_due(0, later), "due again once it settled");
     }
 
     /// Scenario: A probe's helper decides `Armed` and the daemon reads its export empty. When the helper's claim on the composer is the deck's own, or the record has no claim, the empty read settles the box empty and the next attempt is due at once; when the claim is a tool's or `Claim::Unknown`, the read is not the deck's to apply, so the box reads non-empty and the next attempt waits.
