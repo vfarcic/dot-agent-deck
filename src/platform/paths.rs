@@ -1765,8 +1765,9 @@ fn reentrant_lookup<T>(
 }
 
 /// `uid`'s home directory from the account database (`getpwuid_r`'s
-/// `pw_dir`), `None` when it has no entry or the lookup fails.
-#[cfg(unix)]
+/// `pw_dir`), `None` when it has no entry or the lookup fails. Linux-only
+/// because its one caller is (`composer_probe::install::spawn_start_dir`).
+#[cfg(target_os = "linux")]
 pub(crate) fn passwd_home(uid: u32) -> Option<std::ffi::OsString> {
     use std::os::unix::ffi::OsStringExt;
     reentrant_lookup(|buf| {
