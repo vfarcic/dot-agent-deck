@@ -180,7 +180,7 @@ impl T {
 
     fn editor(&mut self, pid: u32, at: u64) -> bool {
         self.s
-            .editor_running(&mut self.r, &mut self.f, key(pid), time(self.t, at))
+            .editor_running_for_test(&mut self.r, &mut self.f, key(pid), time(self.t, at))
     }
 
     fn view(&self, at: u64) -> Vec<View> {
@@ -1407,7 +1407,7 @@ fn probe_009_the_segment_keeps_the_pinned_editors_identity() {
         t.write(g, 5);
         if pinned_first {
             assert!(
-                !t.s.editor_pinned(&mut t.r, &mut t.f, key(2), Some(editor), time(t.t, 5)),
+                !t.s.editor_pinned_for_test(&mut t.r, &mut t.f, key(2), Some(editor), time(t.t, 5)),
                 "no segment has matched its record yet"
             );
         }
@@ -1416,7 +1416,13 @@ fn probe_009_the_segment_keeps_the_pinned_editors_identity() {
             assert_eq!(t.view(6)[0].editor, None, "nothing pinned yet");
             assert!(t.editor(2, 6), "a report with no identity");
             assert_eq!(t.view(6)[0].editor, None, "it names no process");
-            assert!(t.s.editor_pinned(&mut t.r, &mut t.f, key(2), Some(editor), time(t.t, 7)));
+            assert!(t.s.editor_pinned_for_test(
+                &mut t.r,
+                &mut t.f,
+                key(2),
+                Some(editor),
+                time(t.t, 7)
+            ));
         }
         let v = t.view(7);
         assert_eq!(v[0].stage, Stage::Released, "pinned first: {pinned_first}");

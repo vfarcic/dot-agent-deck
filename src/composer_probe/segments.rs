@@ -467,8 +467,11 @@ impl EditorPin {
         }
     }
 
-    /// `key` with no check of its own.
-    pub fn unchecked(key: RecordKey) -> Self {
+    /// `key` with no check of its own, which [`Self::running`] answers as
+    /// running: for the test-only reports alone
+    /// ([`Segments::editor_pinned_for_test`]), so no production report can
+    /// carry one (the revb21 review's U3-4).
+    fn unchecked(key: RecordKey) -> Self {
         Self { key, running: None }
     }
 
@@ -967,22 +970,30 @@ impl Segments {
         Ok(())
     }
 
-    /// Record `key`'s editor child was observed running an executable other
-    /// than the helper. Whether a segment matched to it took it.
-    pub fn editor_running(
+    /// Tests only: record `key`'s editor child was observed running an
+    /// executable other than the helper, with no check of whether it still
+    /// runs, which an early release then takes as running. Whether a
+    /// segment matched to it took it. The observer reports through
+    /// [`Self::editor_pinned_with`]; the `_for_test` name keeps a
+    /// production caller from reaching for this one (the revb21 review's
+    /// U3-4).
+    #[doc(hidden)]
+    pub fn editor_running_for_test(
         &mut self,
         records: &mut Records,
         fifo: &mut HazardFifo,
         key: RecordKey,
         now: Instant,
     ) -> bool {
-        self.editor_pinned(records, fifo, key, None, now)
+        self.editor_pinned_for_test(records, fifo, key, None, now)
     }
 
-    /// [`Self::editor_running`], with the editor's own identity as the
-    /// observer pinned it (A-20d-6), kept with the segment its record
-    /// matches, now or when it matches later.
-    pub fn editor_pinned(
+    /// Tests only: [`Self::editor_running_for_test`], with the editor's own
+    /// identity as the observer pinned it (A-20d-6), kept with the segment
+    /// its record matches, now or when it matches later; with no check of
+    /// whether it still runs.
+    #[doc(hidden)]
+    pub fn editor_pinned_for_test(
         &mut self,
         records: &mut Records,
         fifo: &mut HazardFifo,
@@ -993,8 +1004,12 @@ impl Segments {
         self.editor_report(records, fifo, key, editor.map(EditorPin::unchecked), now)
     }
 
-    /// [`Self::editor_pinned`], with the observer's check of whether the
-    /// pinned editor still runs, which the release asks (A-20d-6).
+    /// Record `key`'s editor child was observed running an executable other
+    /// than the helper, with its identity as the observer pinned it and the
+    /// observer's check of whether that pinned editor still runs, which the
+    /// release asks (A-20d-6). Kept with the segment its record matches,
+    /// now or when it matches later. Whether a segment matched to it took
+    /// it.
     pub fn editor_pinned_with(
         &mut self,
         records: &mut Records,
