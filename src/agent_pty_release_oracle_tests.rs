@@ -13,8 +13,14 @@
 //! [`super::segment_driver::end_probe_segment`]. What the observer would see
 //! (a helper's records, the daemon's read of an `Armed` export, its editor
 //! running, its report and exit) reaches the input through the same calls
-//! the observer makes. Only admission is left out: every probe here is
-//! admitted, and the section raises the liability as `arm_segment` does.
+//! the observer makes. The generated scripts leave admission out: every
+//! probe there is admitted, and the section raises the liability as
+//! `arm_segment` does. One rig asks it ([`Rig::probe_admitted`], A-20d-2):
+//! its output goes through a real `AgentBus` with Claude Code's screen
+//! profile, the probe is scheduled through the generation's own admission
+//! with `composer_probe`'s reads, and its arm section asks again with the
+//! writer's own facts (`writer_facts`), raising the liability in the same
+//! hold, as the seam's arm does.
 //!
 //! **What judges it is not.** [`Model`] is the release table of core §4.6
 //! and plan §3.7, written from the table, over the generated script alone:
@@ -36,7 +42,24 @@
 //! own generated model below ([`pairs`]). Each trace also has a fixed script,
 //! and so does R-B-U2-02's: a drain that lands inside a driver pass, between
 //! its read of the front segment and its extraction of what is held, forced
-//! there by a test-only seam on the writer.
+//! there by a test-only seam on the writer. That seam also lands any other
+//! observation inside a pass (A-20d-3, O-20.3, [`Step::MidPass`]): a
+//! helper's decision, its keymap re-read (A-20d-1a, registered on those
+//! rigs), a second sighting of one helper, an exit or a return marker, each
+//! script run with it before, inside and after the pass and required to end
+//! the same.
+//!
+//! **A liability out with no segment (A-20d-5).** The model counts the
+//! liability (one per probe armed, one less per owned `Armed` decision while
+//! one is out), and every check compares it with the records'. With one out
+//! and no segment open (a phantom raised for it, or Claude's lapsed probe
+//! superseded by a retry that completed), a person's Ctrl+G cuts their op
+//! and opens a `HumanG` whose number is published before its trigger write,
+//! the bytes through the candidate (core §4.3, §4.5), the rest held behind
+//! it. Production holds the rest without opening a segment: the release
+//! half of that row is quarantined, and only its authority half
+//! ([`Judged::NothingEarly`]) runs. The generator scripts no phantom until
+//! the release half passes.
 //!
 //! **A probe byte the PTY fails (O-20.5).** A fixed script per agent makes
 //! the PTY fail a probe's byte, with an error and by taking none of it,
@@ -58,27 +81,31 @@
 //! next, so a race between the observer and a driver pass in flight is found
 //! only where a fixed script forces it. Its floors require a selection of the
 //! release table's tuples ([`ROWS`], 14 when written), each settlement kind
-//! and each kind of step, not every combination and not the whole table: no
+//! and each kind of generated step (a phantom, a keymap re-read, a mid-pass
+//! step and a lapse retry are the fixed scripts' only), not every combination and not the whole table: no
 //! Claude failed-start tuple and no tuple without a decision is required,
 //! and a tuple's key does not tell an ending by a drain or an unknown wait
 //! from a running editor (the cut-off has its own floor). Each is counted
 //! once per segment that reached it, not per evaluation. Not exercised here, each its own obligation
-//! and not evidence that it passed (R-B-U3-03): admission (its own tests and
-//! S-20's `e2e_probe_admission`), the observer's `/proc` scan and editor
-//! identity, more than one probe in a script, other Ctrl+G forms and
-//! multi-candidate frames (the planner's own oracle, Q35-16), Codex timing
-//! beyond its markers (M-PF1), and the planner's cut-open path (`hold_cut`
-//! and `cut_open`, typing while a liability is out and no check is open),
-//! which the accounting oracle covers and the activation list carries.
+//! and not evidence that it passed (R-B-U3-03): admission beyond
+//! [`Rig::probe_admitted`]'s Claude rig (its own tests and S-20's
+//! `e2e_probe_admission`; `composer_probe` itself and the observer's seam
+//! are not called, and what lands after the job is queued and before the
+//! writer thread reaches its section is not forced), the observer's `/proc`
+//! scan and editor identity, more than one probe in a script beyond Claude's
+//! lapse retry, other Ctrl+G forms and multi-candidate frames (the planner's
+//! own oracle, Q35-16), Codex timing beyond its markers (M-PF1), and the
+//! cut-open path's release half, quarantined (A-20d-5).
 //! Linux only, as the driver is.
 
 use super::segment_driver::{
     PROBE_WRITE_FAILED, ProbeAsk, ProbeEnd, ProbeOutcome, ProbeRefusal, drive_segments,
-    end_probe_segment, probe_ended, probe_section,
+    end_probe_segment, probe_ended, probe_section, scheduling_reads, writer_facts,
 };
 use super::*;
 use crate::composer_probe::epoch::GenerationInput;
 use crate::composer_probe::paste_mode::OutputHook;
+use crate::composer_probe::query_ledger::T_TRIGGER;
 use crate::composer_probe::record::{
     Attribution, Channel, Decision, EcPolicy, NotOwned, Observation, RecordKey, Records, Report,
     Tree,
@@ -164,7 +191,14 @@ impl std::io::Write for Pty {
 struct Rig {
     writer: Arc<AsyncMutex<PaneWriter>>,
     input: Arc<GenerationInput>,
-    hook: Mutex<OutputHook>,
+    /// The output hook, fed directly; `None` on a rig whose output goes
+    /// through [`Self::bus`].
+    hook: Mutex<Option<OutputHook>>,
+    /// A-20d-2: the generation's real output bus, with Claude Code's screen
+    /// profile, when the rig asks admission as `composer_probe` does: its
+    /// output is pushed through the bus, whose own output hook feeds the
+    /// input, and its screen is read from the bus's marked Clean frame.
+    bus: Option<Arc<AgentBus>>,
     seen: Mutex<Vec<Seen>>,
     react: Mutex<Option<React>>,
     ledger: Arc<IngressLedger>,
@@ -182,10 +216,35 @@ impl Rig {
     /// A generation of `agent` whose output ran `prefix` before its
     /// segments attached (R-U2-02), with its driver running.
     fn new(agent: Agent, prefix: &[u8]) -> Arc<Rig> {
-        let input = Arc::new(GenerationInput::default());
+        Self::build(agent, prefix, false)
+    }
+
+    /// [`Self::new`], its output through a real [`AgentBus`] with Claude
+    /// Code's screen profile when `on_bus` (A-20d-2).
+    fn build(agent: Agent, prefix: &[u8], on_bus: bool) -> Arc<Rig> {
+        let bus = on_bus.then(|| {
+            Arc::new(AgentBus::profiled(
+                Some(&crate::doorbell_screen::CLAUDE_PROFILE),
+                24,
+                80,
+            ))
+        });
+        let input = bus.as_ref().map_or_else(
+            || Arc::new(GenerationInput::default()),
+            |bus| Arc::clone(bus.input()),
+        );
         assert!(input.attach_records(Records::new(G, EcPolicy::Hold, Instant::now())));
-        let mut hook = OutputHook::new(Arc::clone(&input));
-        hook.on_output(prefix);
+        let hook = match &bus {
+            Some(bus) => {
+                bus.push(prefix.to_vec());
+                None
+            }
+            None => {
+                let mut hook = OutputHook::new(Arc::clone(&input));
+                hook.on_output(prefix);
+                Some(hook)
+            }
+        };
         assert!(input.attach_segments(G, agent));
         let slot = Arc::new(std::sync::OnceLock::new());
         let retired = Arc::new(AtomicBool::new(false));
@@ -204,6 +263,7 @@ impl Rig {
             writer: Arc::new(AsyncMutex::new(writer)),
             input,
             hook: Mutex::new(hook),
+            bus,
             seen: Mutex::new(Vec::new()),
             react: Mutex::new(None),
             ledger: IngressLedger::new(),
@@ -247,7 +307,13 @@ impl Rig {
     /// liability is raised as the observer's `arm_segment` raises it.
     /// `before` runs between the job's end and that report (R-U2-01).
     async fn probe(&self, before: impl FnOnce(&Rig)) -> u64 {
-        let now = Instant::now();
+        self.probe_opened_at(Instant::now(), before).await
+    }
+
+    /// [`Self::probe`], its segment opened as if at `now`: a `now` past
+    /// [`T_TRIGGER`] since a lone Claude probe's byte opens its lapse retry,
+    /// which supersedes it (core §4.7) while its liability stays out.
+    async fn probe_opened_at(&self, now: Instant, before: impl FnOnce(&Rig)) -> u64 {
         let (number, job) = self.input.segment_open_probe(false, now).unwrap();
         let claim = Arc::new(crate::doorbell_txn::JobClaim::default());
         let w = self.writer.lock().await;
@@ -321,6 +387,112 @@ impl Rig {
         )
     }
 
+    /// A probe asked as `composer_probe` asks it, on a rig whose output goes
+    /// through its bus (A-20d-2): its scheduling reads
+    /// ([`scheduling_reads`], the bindings unchanged) asking the
+    /// generation's own admission with the facts read under this writer's
+    /// lock, then again with the frame and its mark read in one hold, a
+    /// person's ticket as the ledger shows it, the gate's fence and the
+    /// writer's boundary; the segment opened; the arm section
+    /// ([`probe_section`]) with the writer's own facts ([`writer_facts`]:
+    /// the screen's freshness against the mark, the ticket read under the
+    /// gate's lock), asking admission again and raising the liability in
+    /// one hold ([`GenerationInput::arm_probe`], the seam's arm); and its
+    /// end handled by [`probe_ended`]. `between` runs after the scheduled
+    /// admission and before the job is queued, the writer's lock held, as
+    /// `composer_probe` holds it: what lands there lands between
+    /// scheduling and the arm section. Answers the outcome, or the
+    /// scheduled refusal.
+    async fn probe_admitted(&self, between: impl FnOnce(&Rig)) -> ProbeOutcome {
+        use crate::composer_probe::admission::{Attempt, Outside};
+        let bus = Arc::clone(self.bus.as_ref().expect("a rig on a bus"));
+        let gate = Arc::clone(&self.writer.lock().await.gate.gate);
+        let outside = |w: &PaneWriter, surface: bool, now: Instant| {
+            let status = gate.status();
+            let (fence, _) = self
+                .input
+                .admission_fence(status.fenced, status.held_ops, now);
+            Outside {
+                attempt: Attempt::First,
+                permission: crate::composer_probe::Permission::Armable,
+                fence,
+                human_ticket: self.ledger.any_outstanding(),
+                boundary: w.physical_boundary(),
+                keymap: Ok(()),
+                surface,
+            }
+        };
+        let (this, on_bus, asked) = (self, &bus, &outside);
+        let (w, ()) = scheduling_reads(
+            None::<std::future::Ready<()>>,
+            || std::future::ready(()),
+            move |()| async move {
+                let surface = shows_composer(on_bus.clean_frame());
+                let w = this.writer.lock().await;
+                let now = Instant::now();
+                let estimate = match this.input.admit_probe(&asked(&w, surface, now), now) {
+                    Err(crate::composer_probe::admission::Refusal::Estimate(at)) => Some(at),
+                    _ => None,
+                };
+                (w, estimate)
+            },
+        )
+        .await;
+        let marked = bus.clean_frame_marked();
+        let mark = marked.as_ref().map(|(_, mark)| *mark);
+        let now = Instant::now();
+        let scheduled = outside(&w, shows_composer(marked.map(|(grid, _)| grid)), now);
+        if let Err(refusal) = self.input.admit_probe(&scheduled, now) {
+            self.input.probe_failed(now);
+            return ProbeOutcome::Refused(format!("{refusal:?}"));
+        }
+        between(self);
+        let held = gate.status().held_ops > 0;
+        let (number, job) = self.input.segment_open_probe(held, now).unwrap();
+        let claim = Arc::new(crate::doorbell_txn::JobClaim::default());
+        let section = {
+            let input = Arc::clone(&self.input);
+            let (fresh, facts) =
+                writer_facts(Arc::clone(&bus), mark, Arc::clone(&self.ledger), scheduled);
+            probe_section(
+                Arc::clone(&gate),
+                Arc::clone(&self.input),
+                Arc::clone(&claim),
+                fresh,
+                move |ctx, status, screen_unchanged| {
+                    input
+                        .arm_probe(G, &facts(ctx, status, screen_unchanged), ctx.now, |_| {})
+                        .map(drop)
+                        .map_err(ProbeRefusal::Admission)
+                },
+            )
+        };
+        let disarm = {
+            let input = Arc::clone(&self.input);
+            let gate = Arc::clone(&gate);
+            move || {
+                let _ = input.liability_lower(G, Instant::now());
+                let _ = input.segment_withdrawn(number);
+                gate.open_if_empty();
+            }
+        };
+        let probe = w.queue_probe(job, claim, section, disarm).unwrap();
+        drop(w);
+        let end = probe.end().await;
+        let input = Arc::clone(&self.input);
+        probe_ended(
+            &self.input,
+            &gate,
+            "oracle",
+            number,
+            end,
+            ProbeAsk::First,
+            move || {
+                let _ = input.liability_lower(G, Instant::now());
+            },
+        )
+    }
+
     async fn typed(&self, bytes: &[u8]) {
         let frame = UserFrame::new(bytes.to_vec(), Some(self.ledger.admit()), None);
         let accepted = self.writer.lock().await.accept(frame, None).await;
@@ -334,7 +506,112 @@ impl Rig {
     }
 
     fn out(&self, bytes: &[u8]) {
-        self.hook.lock().unwrap().on_output(bytes);
+        match &self.bus {
+            Some(bus) => bus.push(bytes.to_vec()),
+            None => self
+                .hook
+                .lock()
+                .unwrap()
+                .as_mut()
+                .expect("a rig with no bus has its own output hook")
+                .on_output(bytes),
+        }
+    }
+
+    /// A liability out with no segment for it (A-20d-5): the phantom
+    /// liability core §4.7 says a lapsed Claude probe leaves once its retry
+    /// superseded it (CL-10), raised here as the arm raises one.
+    fn phantom(&self) {
+        self.input
+            .liability_raise(G, Instant::now())
+            .expect("a live generation raises");
+    }
+
+    /// From now on an `Armed` empty read's settlement waits for its keymap
+    /// re-read (A-20d-1a), as `Observer::start` registers it; the re-read
+    /// is the script's [`Step::Recheck`].
+    fn recheck_at_settlement(&self) {
+        assert!(self.input.recheck_keymap_at_settlement(Arc::new(|| {})));
+    }
+
+    /// The observer's keymap re-read with no lock held, as
+    /// `Observer::recheck_keymap` runs it: the tickets parked so far, then
+    /// the verdict (the bindings unchanged) under the input's lock.
+    fn recheck(&self) {
+        if let Some(through) = self.input.keymap_recheck_due() {
+            self.input
+                .settle_keymap_recheck(through, Ok(()), Instant::now());
+        }
+    }
+
+    /// A step that can land inside a driver pass, run as the observer or
+    /// the output hook would run it there: no await, no writer lock.
+    fn apply_sync(&self, step: &Step) {
+        match step {
+            Step::Observe(r) => self.observe(r),
+            Step::Editor(pid) => self.editor(*pid),
+            Step::Report(pid, report) => self.report(*pid, *report),
+            Step::Exit(pid) => self.exit(*pid),
+            Step::Out(b) => self.out(b),
+            Step::Recheck => self.recheck(),
+            other => panic!("{other:?} can't land inside a driver pass"),
+        }
+    }
+
+    /// Arm `step` to land inside the next driver pass that finds the op
+    /// `on_held` held, between its read of the front segment and its
+    /// extraction of what is held (A-20d-3, O-20.3; R-B-U2-02's seam).
+    async fn mid_pass(self: &Arc<Self>, on_held: Vec<u8>, step: Step) {
+        let weak = Arc::downgrade(self);
+        let w = self.writer.lock().await;
+        let gate = w.gate();
+        let mut step = Some(step);
+        w.set_mid_pass(Box::new(move || {
+            if !gate.gate.holds_any(|frame| frame.bytes == on_held) {
+                return false;
+            }
+            if let (Some(rig), Some(step)) = (weak.upgrade(), step.take()) {
+                rig.apply_sync(&step);
+                rig.mid_fired.fetch_add(1, Ordering::SeqCst);
+            }
+            true
+        }));
+    }
+
+    /// What the generation shows once a script is over, for comparing
+    /// orders (A-20d-3): the bytes taken and numbers published, the
+    /// liability count, the schedule (due, failures, broken), the open
+    /// segments, the epoch and its foreign count, and the gate.
+    async fn snapshot(&self) -> Snapshot {
+        let now = Instant::now();
+        let status = self.writer.lock().await.gate.gate.status();
+        let published = self
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|s| match s {
+                Seen::Published(n) => Some(*n),
+                Seen::Took(_) => None,
+            })
+            .collect();
+        Snapshot {
+            taken: self.taken(),
+            published,
+            liability: self.input.liability_count(),
+            schedule: self.input.advance_schedule_for_e2e(Duration::ZERO, now),
+            segments: self
+                .input
+                .segments_view(now)
+                .iter()
+                .map(|v| (v.number, v.stage, v.record))
+                .collect(),
+            epoch: (
+                self.input.epoch().epoch(),
+                self.input.epoch().last_foreign(),
+            ),
+            gate: (status.fenced, status.held_ops, status.held_bytes),
+        }
     }
 
     fn observe(&self, r: &MRecord) {
@@ -410,7 +687,12 @@ impl Rig {
     /// has taken that much, and no trigger's report is still on its way.
     /// Then a moment more, so a late release shows.
     async fn settle(&self, expected: &[u8]) {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        self.settle_within(expected, Duration::from_secs(3)).await;
+    }
+
+    /// [`Self::settle`], waiting at most `patience` for the bytes.
+    async fn settle_within(&self, expected: &[u8], patience: Duration) {
+        let deadline = Instant::now() + patience;
         loop {
             let submitted = self
                 .input
@@ -431,6 +713,43 @@ impl Rig {
 
 fn key(pid: u32) -> RecordKey {
     RecordKey { pid, start: 1 }
+}
+
+/// What a rig showed at the end of a script ([`Rig::snapshot`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Snapshot {
+    taken: Vec<u8>,
+    published: Vec<u64>,
+    liability: Option<u32>,
+    schedule: Option<(bool, u32, bool)>,
+    segments: Vec<(Option<u64>, Stage, Option<RecordKey>)>,
+    epoch: (u64, u64),
+    gate: (bool, usize, usize),
+}
+
+/// Whether `frame` shows Claude Code's main composer, as admission's screen
+/// conjunct reads it: a test copy of the driver's private
+/// `surface_shows_composer` for Claude Code (its positive identity: the
+/// ready screen, no dialog over it, at a measured width), which
+/// `probe_059`'s arm rig runs itself.
+fn shows_composer(frame: Option<crate::doorbell_screen::Grid>) -> bool {
+    let profile = &crate::doorbell_screen::CLAUDE_PROFILE;
+    frame.is_some_and(|grid| {
+        grid.cols >= profile.min_cols
+            && (profile.dialog)(&grid).is_none()
+            && (profile.ready)(&grid)
+            && (profile.composer)(&grid).is_some()
+    })
+}
+
+/// A Claude Code frame at `cols`: the full-width rules around an empty
+/// composer, after Claude Code's full-redraw marker (as `probe_059`'s).
+fn claude_frame(cols: u16) -> Vec<u8> {
+    let rule = "─".repeat(cols as usize);
+    format!(
+        "\x1b[2J\x1b[H\x1b[20;1H{rule}\x1b[21;1H❯\u{a0}\x1b[22;1H{rule}\x1b[23;3Hstatus\x1b[21;3H"
+    )
+    .into_bytes()
 }
 
 // ---------------------------------------------------------------------------
@@ -504,6 +823,23 @@ struct Model {
     expected: Vec<u8>,
     /// Each HumanG trigger: its number.
     triggers: Vec<u64>,
+    /// Each HumanG trigger's write, in order: the Ctrl+G alone when the
+    /// driver writes it, the bytes through the candidate when a cut opens it
+    /// (core §4.3).
+    trigger_writes: Vec<Vec<u8>>,
+    /// The probes written, each one Ctrl+G before any trigger's.
+    probes: usize,
+    /// The liability count: one per probe armed and per phantom, one less
+    /// per owned `Armed` decision while one is out (core §2.4).
+    liability: u32,
+    /// An `Armed` empty read's settlement waits for its keymap re-read
+    /// (A-20d-1a): the rig registered it.
+    parks: bool,
+    /// The probe's empty read is parked, waiting for that re-read.
+    parked: bool,
+    /// A step armed to land inside the driver pass that finds `.0` held,
+    /// which the model applies right after the step that typed it.
+    deferred: Option<(Vec<u8>, Step)>,
     /// The writer scope opened for good (A3 §4.3, A5 §1.4, A6 §1.3, as
     /// `record.rs`'s "writer scope" section states it): a decision that
     /// isn't helper-only (`Unarmed`, a tool, `Unknown`), a decisionless exit
@@ -582,6 +918,12 @@ impl Model {
             held: VecDeque::new(),
             expected: Vec::new(),
             triggers: Vec::new(),
+            trigger_writes: Vec::new(),
+            probes: 0,
+            liability: 0,
+            parks: false,
+            parked: false,
+            deferred: None,
             scope_open: false,
             fed: prefix as u64,
             retired: false,
@@ -597,6 +939,8 @@ impl Model {
     }
 
     fn probe(&mut self) {
+        self.probes += 1;
+        self.liability += 1;
         self.last += 1;
         self.segs.push_back(MSeg {
             kind: MKind::Probe,
@@ -616,10 +960,66 @@ impl Model {
         if self.retired {
             return;
         }
+        let candidate = bytes.iter().position(|&b| b == CTRL_G);
         if self.fenced() {
             self.held.extend(bytes);
+        } else if let Some(at) = candidate.filter(|_| self.liability > 0) {
+            // A-20d-5, core §4.3 and §4.5 (A1 §3.3: a person's Ctrl+G with
+            // a liability out opens a `HumanG`, and isn't native): with no
+            // segment open and a liability out, the op is cut after its
+            // first candidate, which opens a `HumanG` segment. Its number is
+            // published before its trigger write, the bytes through the
+            // candidate; the rest is held behind it.
+            self.last += 1;
+            self.triggers.push(self.last);
+            self.trigger_writes.push(bytes[..=at].to_vec());
+            self.expected.extend(&bytes[..=at]);
+            self.segs.push_back(MSeg {
+                kind: MKind::HumanG,
+                number: self.last,
+                written: self.fed,
+                record: None,
+                released: false,
+                cut_off: false,
+                e1: Watch::default(),
+                rows: Vec::new(),
+            });
+            self.held.extend(&bytes[at + 1..]);
         } else {
             self.expected.extend(bytes);
+        }
+        self.step();
+    }
+
+    /// The lone, unmatched Claude probe lapsed and its retry superseded it
+    /// (core §4.7): it ends, its liability still out, and the retry is the
+    /// next segment.
+    fn lapse_retry(&mut self) {
+        let lapsed = self.segs.pop_front().expect("a lapsed probe");
+        assert!(
+            self.agent == Agent::Claude
+                && lapsed.kind == MKind::Probe
+                && lapsed.record.is_none()
+                && self.segs.is_empty()
+                && self.held.is_empty(),
+            "only a lone, unmatched Claude probe with nothing held lapses"
+        );
+        self.probe();
+    }
+
+    /// A liability out with no segment for it ([`Rig::phantom`]).
+    fn phantom(&mut self) {
+        self.liability += 1;
+        self.step();
+    }
+
+    /// The observer's keymap re-read, the bindings unchanged: a parked
+    /// empty read settles as one.
+    fn recheck(&mut self) {
+        if self.parked {
+            self.parked = false;
+            self.settled = Some(Settled::Empty);
+            *self.stats.settled.entry(Settled::Empty).or_default() += 1;
         }
         self.step();
     }
@@ -651,6 +1051,17 @@ impl Model {
     }
 
     fn observe(&mut self, mut r: MRecord) {
+        // The same helper seen again, on another channel: one record, its
+        // first decision kept; a second changes nothing (core §2.4).
+        if self.records.iter().any(|known| known.pid == r.pid) {
+            self.step();
+            return;
+        }
+        // Settlement (core §2.4): an owned `Armed` decision consumes a
+        // liability while one is out.
+        if r.owned && r.decision == Some(Decision::Armed) && self.liability > 0 {
+            self.liability -= 1;
+        }
         self.clock += 1;
         r.born = self.clock;
         if let Some(d) = r.decision
@@ -790,6 +1201,7 @@ impl Model {
             // is the deck's own.
             if seg.kind == MKind::Probe
                 && self.settled.is_none()
+                && !self.parked
                 && let Some(d) = r.decision
                 && (d != Decision::Armed || r.drained || r.read.is_some())
             {
@@ -798,8 +1210,12 @@ impl Model {
                     (Decision::Armed, _) => Settled::NonEmpty,
                     _ => Settled::Failed,
                 };
-                self.settled = Some(kind);
-                *self.stats.settled.entry(kind).or_default() += 1;
+                if kind == Settled::Empty && self.parks {
+                    self.parked = true;
+                } else {
+                    self.settled = Some(kind);
+                    *self.stats.settled.entry(kind).or_default() += 1;
+                }
             }
             let helper_only = r.decision == Some(Decision::Armed) || spawn_failed;
             let returned = match self.agent {
@@ -828,6 +1244,7 @@ impl Model {
                 self.expected.push(CTRL_G);
                 self.last += 1;
                 self.triggers.push(self.last);
+                self.trigger_writes.push(vec![CTRL_G]);
                 self.segs.push_back(MSeg {
                     kind: MKind::HumanG,
                     number: self.last,
@@ -873,47 +1290,100 @@ fn decision_name(decision: Option<Decision>) -> &'static str {
     }
 }
 
-/// The checks after every step: the PTY took exactly what the model allows,
-/// each Ctrl+G alone and after its number; the schedule is due while the
-/// probe is unsettled, and as the step that settles it ends, shows how it
-/// settled (U3-5): an empty read makes it due again at once, a non-empty one
-/// waits with no failure counted, a failed check waits as a retry. Later
-/// steps can move the epoch, which may make it due again.
-fn check(rig: &Rig, model: &Model, settled_before: Option<Settled>, what: &str) {
+impl Judged {
+    /// How long a step waits for the bytes the model allows: a byte the
+    /// table allows that never comes fails `Exactly` once that wait is over,
+    /// and costs `NothingEarly` that wait at every step.
+    fn patience(self) -> Duration {
+        match self {
+            Judged::Exactly => Duration::from_secs(3),
+            Judged::NothingEarly => Duration::from_millis(100),
+        }
+    }
+}
+
+/// How [`check_as`] judges what the PTY took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Judged {
+    /// Exactly what the table allows, each trigger after its own number:
+    /// nothing early and nothing missing.
+    Exactly,
+    /// Authority alone: nothing the table doesn't allow yet. A byte still
+    /// missing, or a trigger whose number was never published, passes.
+    NothingEarly,
+}
+
+/// The checks after every step: the PTY took what the model allows, as
+/// `judged` says, each trigger as the model writes it and after its number
+/// (either way a Ctrl+G is written only as the end of a write: alone, or as
+/// the end of a cut's trigger write); the liability count is the model's;
+/// the schedule is due while the probe is unsettled (and not while its
+/// empty read is parked for its keymap re-read), and as the step that
+/// settles it ends, shows how it settled (U3-5): an empty read makes it due
+/// again at once, a non-empty one waits with no failure counted, a failed
+/// check waits as a retry. Later steps can move the epoch, which may make it
+/// due again.
+fn check_as(rig: &Rig, model: &Model, settled_before: Option<Settled>, judged: Judged, what: &str) {
     let taken = rig.taken();
-    assert_eq!(
+    let allowed = match judged {
+        Judged::Exactly => taken == model.expected,
+        Judged::NothingEarly => model.expected.starts_with(&taken),
+    };
+    assert!(
+        allowed,
+        "{what}: the PTY took {:?} where the release table allows {:?} ({judged:?})\n\
+         segments {:#?}\ngate {:?}\nmodel {:#?}",
         String::from_utf8_lossy(&taken),
         String::from_utf8_lossy(&model.expected),
-        "{what}: the PTY took {} bytes where the release table allows {}\n\
-         segments {:#?}\ngate {:?}\nmodel {:#?}",
-        taken.len(),
-        model.expected.len(),
         rig.input.segments_view(Instant::now()),
         rig.input.segments_front(),
         model.segs,
     );
     let seen = rig.seen.lock().unwrap().clone();
     let mut published = Vec::new();
-    let mut triggers = Vec::new();
+    let mut writes = Vec::new();
     for s in &seen {
         match s {
             Seen::Published(n) => published.push(*n),
             Seen::Took(b) if b.contains(&CTRL_G) => {
-                assert_eq!(b, &[CTRL_G], "{what}: a Ctrl+G went with other bytes");
-                triggers.push(published.last().copied());
+                assert!(
+                    b.iter().filter(|&&c| c == CTRL_G).count() == 1 && b.ends_with(&[CTRL_G]),
+                    "{what}: a Ctrl+G went with bytes after it: {b:?}"
+                );
+                writes.push((b.clone(), published.last().copied()));
             }
             Seen::Took(_) => {}
         }
     }
-    // The first Ctrl+G is the probe's own; each after it is a trigger,
-    // written after its own number was published.
-    let humang: Vec<_> = triggers.iter().skip(1).copied().collect();
-    let want: Vec<_> = model.triggers.iter().map(|&n| Some(n)).collect();
-    assert_eq!(humang, want, "{what}: each trigger after its own number");
+    // The first Ctrl+Gs are the probes' own, each alone; each after them is
+    // a trigger, written as the model says, after its own number was
+    // published.
+    for (probe, _) in writes.iter().take(model.probes) {
+        assert_eq!(probe, &[CTRL_G], "{what}: a probe's byte goes alone");
+    }
+    let humang: Vec<_> = writes.iter().skip(model.probes).cloned().collect();
+    let want: Vec<_> = model
+        .trigger_writes
+        .iter()
+        .cloned()
+        .zip(model.triggers.iter().map(|&n| Some(n)))
+        .collect();
+    if judged == Judged::Exactly {
+        assert_eq!(humang, want, "{what}: each trigger after its own number");
+    }
     if model.retired {
         return;
     }
+    assert_eq!(
+        rig.input.liability_count(),
+        Some(model.liability),
+        "{what}: the liability count"
+    );
     match (settled_before, model.settled) {
+        (_, None) if model.parked => assert!(
+            !rig.input.probe_due(Instant::now()) && rig.input.settling(),
+            "{what}: an empty read parked for its keymap re-read is a check outstanding"
+        ),
         (_, None) => assert!(
             rig.input.probe_due(Instant::now()),
             "{what}: the probe is unsettled, so its schedule is as it was"
@@ -959,6 +1429,23 @@ enum Step {
         helper: Option<u32>,
     },
     Retire,
+    /// A liability out with no segment for it (A-20d-5, [`Rig::phantom`]).
+    Phantom,
+    /// The lone Claude probe has lapsed: its retry is opened past
+    /// [`T_TRIGGER`] and written, superseding it (core §4.7), its liability
+    /// still out ([`Rig::probe_opened_at`]).
+    LapseRetry,
+    /// The observer's keymap re-read settles the empty reads parked so far
+    /// (A-20d-1a, [`Rig::recheck`]).
+    Recheck,
+    /// `step` lands inside the next driver pass that finds the op `on_held`
+    /// held, between its read of the front segment and its extraction of
+    /// what is held (A-20d-3). For the model, it lands right after the step
+    /// that typed `on_held`.
+    MidPass {
+        on_held: Vec<u8>,
+        step: Box<Step>,
+    },
 }
 
 struct Rng(u64);
@@ -1238,8 +1725,20 @@ fn apply_model(model: &mut Model, step: &Step, pending: &mut Option<Option<u32>>
         Step::Out(b) => model.out(b),
         Step::Fast { helper } => *pending = Some(*helper),
         Step::Retire => model.retire(),
+        Step::Phantom => model.phantom(),
+        Step::LapseRetry => model.lapse_retry(),
+        Step::Recheck => model.recheck(),
+        Step::MidPass { on_held, step } => {
+            model.deferred = Some((on_held.clone(), (**step).clone()));
+        }
     }
     fast_answers(model, before, pending);
+    if let Step::Type(typed) = step
+        && model.deferred.as_ref().is_some_and(|(on, _)| on == typed)
+        && let Some((_, inner)) = model.deferred.take()
+    {
+        apply_model(model, &inner, pending);
+    }
 }
 
 /// A trigger cut while a `Fast` answer waits: the agent's return and helper,
@@ -1287,6 +1786,38 @@ fn fast_return(agent: Agent) -> Vec<&'static [u8]> {
 
 /// Run `steps` on a fresh rig and model, checking after each.
 async fn run(agent: Agent, prefix: &[u8], fast_probe: bool, steps: &[Step], what: &str) -> Model {
+    run_with(Opts::default(), agent, prefix, fast_probe, steps, what)
+        .await
+        .0
+}
+
+/// How [`run_with`] sets a rig up and judges it.
+#[derive(Debug, Clone, Copy)]
+struct Opts {
+    /// An empty read's settlement waits for its keymap re-read (A-20d-1a).
+    recheck: bool,
+    judged: Judged,
+}
+
+impl Default for Opts {
+    fn default() -> Self {
+        Self {
+            recheck: false,
+            judged: Judged::Exactly,
+        }
+    }
+}
+
+/// [`run`] as `opts` says, answering the model and what the rig showed at
+/// the end.
+async fn run_with(
+    opts: Opts,
+    agent: Agent,
+    prefix: &[u8],
+    fast_probe: bool,
+    steps: &[Step],
+    what: &str,
+) -> (Model, Snapshot) {
     if std::env::var_os("DAD_ORACLE_TRACE").is_some() {
         eprintln!("{what}: fast probe {fast_probe}, prefix {prefix:?}");
         for (i, step) in steps.iter().enumerate() {
@@ -1295,6 +1826,10 @@ async fn run(agent: Agent, prefix: &[u8], fast_probe: bool, steps: &[Step], what
     }
     let rig = Rig::new(agent, prefix);
     let mut model = Model::new(agent, prefix.len());
+    if opts.recheck {
+        rig.recheck_at_settlement();
+        model.parks = true;
+    }
     let mut pending: Option<Option<u32>> = None;
     // The probe; with `fast_probe`, Claude's return is read before its
     // written report (R-U2-01).
@@ -1314,7 +1849,13 @@ async fn run(agent: Agent, prefix: &[u8], fast_probe: bool, steps: &[Step], what
         }
     }
     rig.settle(&model.expected).await;
-    check(&rig, &model, None, &format!("{what}: the probe"));
+    check_as(
+        &rig,
+        &model,
+        None,
+        opts.judged,
+        &format!("{what}: the probe"),
+    );
     for (i, step) in steps.iter().enumerate() {
         match step {
             Step::Type(b) => rig.typed(b).await,
@@ -1349,24 +1890,50 @@ async fn run(agent: Agent, prefix: &[u8], fast_probe: bool, steps: &[Step], what
                 }));
             }
             Step::Retire => rig.retire().await,
+            Step::Phantom => rig.phantom(),
+            Step::LapseRetry => {
+                rig.probe_opened_at(
+                    Instant::now() + T_TRIGGER + Duration::from_millis(1),
+                    |_| {},
+                )
+                .await;
+            }
+            Step::Recheck => rig.recheck(),
+            Step::MidPass { on_held, step } => {
+                rig.mid_pass(on_held.clone(), (**step).clone()).await;
+            }
         }
         let settled = model.settled;
         apply_model(&mut model, step, &mut pending);
-        rig.settle(&model.expected).await;
-        check(&rig, &model, settled, &format!("{what}: step {i} {step:?}"));
+        rig.settle_within(&model.expected, opts.judged.patience())
+            .await;
+        check_as(
+            &rig,
+            &model,
+            settled,
+            opts.judged,
+            &format!("{what}: step {i} {step:?}"),
+        );
     }
     tokio::time::sleep(Duration::from_millis(20)).await;
-    check(&rig, &model, model.settled, &format!("{what}: at rest"));
+    check_as(
+        &rig,
+        &model,
+        model.settled,
+        opts.judged,
+        &format!("{what}: at rest"),
+    );
     let armed = steps
         .iter()
-        .filter(|s| matches!(s, Step::ExitMidPass(_)))
+        .filter(|s| matches!(s, Step::ExitMidPass(_) | Step::MidPass { .. }))
         .count();
     assert_eq!(
         rig.mid_fired.load(Ordering::SeqCst),
         armed,
-        "{what}: each mid-pass drain landed inside a driver pass with typing held"
+        "{what}: each mid-pass step landed inside a driver pass with its op held"
     );
-    model
+    let snapshot = rig.snapshot().await;
+    (model, snapshot)
 }
 
 /// What a run of seeds reached.
@@ -2508,6 +3075,360 @@ async fn probe_010_a_failed_probe_write_with_nothing_held_opens_its_fence() {
                 0,
                 "{what}: nothing left in flight"
             );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A-20d-2: the writer's facts against what lands between scheduling and the
+// arm section, through the generation's own admission.
+// ---------------------------------------------------------------------------
+
+/// A Claude Code generation on a bus showing its main composer, and one
+/// probe asked as `composer_probe` asks it ([`Rig::probe_admitted`]), with
+/// `between` run between its scheduled admission and its arm section. The
+/// rig, the probe's outcome, and the ticket `between` admitted, if any,
+/// still outstanding.
+async fn arm_after(
+    between: impl FnOnce(&Rig) -> Option<crate::ingress_ledger::TicketGuard>,
+) -> (
+    Arc<Rig>,
+    ProbeOutcome,
+    Option<crate::ingress_ledger::TicketGuard>,
+) {
+    let rig = Rig::build(Agent::Claude, b"", true);
+    rig.out(&claude_frame(80));
+    let mut kept = None;
+    let outcome = rig.probe_admitted(|rig| kept = between(rig)).await;
+    (rig, outcome, kept)
+}
+
+/// Scenario: A Claude Code generation shows its main composer on a real bus, and a probe is asked as the deck's probe request asks it: scheduled through the generation's own admission, its arm section on the real writer thread asking admission again with the writer's own reads. Between scheduling and the arm section the agent writes output, or a person's ticket is admitted, or both: the arm refuses (the screen is no longer the frame it was scheduled from, or a person is typing), the PTY takes no byte, no fence closes, no liability is raised and one failure is counted, and the person's typing then goes straight through. With nothing between, the same probe is written and closes its fence (A-20d-2).
+#[spec("inbox/probe/084")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_084_what_lands_between_scheduling_and_the_arm_refuses_it_and_writes_nothing() {
+    let (rig, written, _) = arm_after(|_| None).await;
+    assert_eq!(
+        written,
+        ProbeOutcome::Written,
+        "nothing between: the control"
+    );
+    rig.settle(&[CTRL_G]).await;
+    assert_eq!(rig.taken(), [CTRL_G], "the control's probe byte");
+    let status = rig.writer.lock().await.gate.gate.status();
+    assert!(status.fenced, "the control closes its fence");
+    assert_eq!(
+        rig.input.liability_count(),
+        Some(1),
+        "and raises its liability"
+    );
+
+    type Between = fn(&Rig) -> Option<crate::ingress_ledger::TicketGuard>;
+    let cases: [(&str, Between, &str); 3] = [
+        (
+            "output taken",
+            |rig| {
+                rig.out(b"x");
+                None
+            },
+            "Admission(Surface)",
+        ),
+        (
+            "a ticket admitted",
+            |rig| Some(rig.ledger.admit()),
+            "Admission(HumanTicket)",
+        ),
+        (
+            "output taken and a ticket admitted",
+            |rig| {
+                rig.out(b"x");
+                Some(rig.ledger.admit())
+            },
+            "Admission(HumanTicket)",
+        ),
+    ];
+    for (what, between, refusal) in cases {
+        let (rig, outcome, ticket) = arm_after(between).await;
+        assert_eq!(
+            outcome,
+            ProbeOutcome::Refused(refusal.to_string()),
+            "{what} between scheduling and the arm section"
+        );
+        assert!(rig.taken().is_empty(), "{what}: no byte written");
+        let status = rig.writer.lock().await.gate.gate.status();
+        assert!(!status.fenced, "{what}: no fence closed");
+        assert_eq!(rig.input.liability_count(), Some(0), "{what}: none raised");
+        assert!(
+            rig.input.segments_view(Instant::now()).is_empty(),
+            "{what}: the probe's segment withdrawn"
+        );
+        let schedule = rig
+            .input
+            .advance_schedule_for_e2e(Duration::ZERO, Instant::now());
+        assert_eq!(
+            schedule.map(|(_, failures, _)| failures),
+            Some(1),
+            "{what}: one failure counted"
+        );
+        // The person's typing, behind no fence, goes straight to the PTY.
+        let frame = UserFrame::new(
+            b"ab".to_vec(),
+            ticket.or_else(|| Some(rig.ledger.admit())),
+            None,
+        );
+        let accepted = rig.writer.lock().await.accept(frame, None).await;
+        assert!(
+            matches!(accepted, Accepted::Written(Ok(()))),
+            "{what}: typing after the refusal is written"
+        );
+        assert_eq!(rig.taken(), b"ab", "{what}: and only it");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A-20d-3 (O-20.3): an observation landing inside a driver pass.
+// ---------------------------------------------------------------------------
+
+/// The three orders of one script: `step` before the op `on_held` is
+/// typed, inside the driver pass that typing wakes (between its read of
+/// the front segment and its extraction of what is held), and after it.
+fn three_orders(
+    head: &[Step],
+    on_held: &[u8],
+    step: Step,
+    tail: &[Step],
+) -> [(&'static str, Vec<Step>); 3] {
+    let typed = Step::Type(on_held.to_vec());
+    let with = |middle: Vec<Step>| {
+        let mut steps = head.to_vec();
+        steps.extend(middle);
+        steps.extend_from_slice(tail);
+        steps
+    };
+    [
+        ("before", with(vec![step.clone(), typed.clone()])),
+        (
+            "inside",
+            with(vec![
+                Step::MidPass {
+                    on_held: on_held.to_vec(),
+                    step: Box::new(step.clone()),
+                },
+                typed.clone(),
+            ]),
+        ),
+        ("after", with(vec![typed, step])),
+    ]
+}
+
+/// A helper `pid` that read `seg` and decided `decision` on `channel`, with
+/// the daemon's read of an `Armed` export (`read`).
+fn seen(pid: u32, seg: u64, decision: Decision, channel: Channel, read: Option<bool>) -> Step {
+    let Step::Observe(mut r) = helper(pid, seg, decision) else {
+        unreachable!()
+    };
+    r.channel = channel;
+    r.read = read;
+    Step::Observe(r)
+}
+
+/// One of [`probe_085_an_observation_inside_a_driver_pass_ends_as_before_or_after_it`]'s
+/// scripts: its name, the steps before the held op, the observation, the
+/// steps after, how the probe settles and the failures it counts.
+type Interleaved = (&'static str, Vec<Step>, Step, Vec<Step>, Settled, u32);
+
+/// Scenario: For Claude and Codex, run each of six scripts three ways, an observation landing before a held op's driver pass, inside it (between the pass's read of the front segment and its extraction of what is held) or after it: the probe's own helper deciding `Armed` with an empty box (matching, consuming the liability and settling, its keymap re-read parked), that re-read itself, the same helper seen again on its marker deciding `Armed` or `Unarmed`, its exit completing the segment while typing with a Ctrl+G is held, and the agent's return marker completing it. Each order is judged step by step by the release table, and all three end the same: the same bytes taken and numbers published, the same liability count, the same schedule with no failure counted twice and no settlement lost, the same segments, epoch and gate (A-20d-3, O-20.3).
+#[spec("inbox/probe/085")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_085_an_observation_inside_a_driver_pass_ends_as_before_or_after_it() {
+    let zz = b"zz";
+    for agent in [Agent::Claude, Agent::Codex] {
+        let ret: Vec<Step> = fast_return(agent).into_iter().map(Step::Out).collect();
+        let (last, first) = ret.split_last().unwrap();
+        let empty = seen(61, 1, Decision::Armed, Channel::Ipc, Some(true));
+        let full = seen(61, 1, Decision::Armed, Channel::Ipc, Some(false));
+        let done = {
+            let mut tail = vec![Step::Exit(61)];
+            tail.extend(ret.clone());
+            tail.push(Step::Type(b"cd".to_vec()));
+            tail
+        };
+        let next = {
+            let mut tail = vec![helper(62, 2, Decision::Armed), Step::Exit(62)];
+            tail.extend(ret.clone());
+            tail.push(Step::Type(b"cd".to_vec()));
+            tail
+        };
+        let mut completing = vec![full.clone(), Step::Exit(61)];
+        completing.extend(first.iter().cloned());
+        completing.push(Step::Type(b"a\x07b".to_vec()));
+        let mut released = vec![full];
+        released.extend(ret.clone());
+        released.push(Step::Type(b"a\x07b".to_vec()));
+        let scripts: [Interleaved; 6] = [
+            (
+                "matching and settlement",
+                vec![Step::Type(b"ab".to_vec())],
+                empty.clone(),
+                [vec![Step::Recheck], done.clone()].concat(),
+                Settled::Empty,
+                0,
+            ),
+            (
+                "the keymap re-read",
+                vec![Step::Type(b"ab".to_vec()), empty.clone()],
+                Step::Recheck,
+                done.clone(),
+                Settled::Empty,
+                0,
+            ),
+            (
+                "the same `Armed` helper on its marker",
+                vec![Step::Type(b"ab".to_vec()), empty, Step::Recheck],
+                seen(61, 1, Decision::Armed, Channel::Marker, None),
+                done.clone(),
+                Settled::Empty,
+                0,
+            ),
+            (
+                "the same `Unarmed` helper on its marker",
+                vec![
+                    Step::Type(b"ab".to_vec()),
+                    seen(61, 1, Decision::Unarmed, Channel::Ipc, None),
+                ],
+                seen(61, 1, Decision::Unarmed, Channel::Marker, None),
+                vec![Step::Type(b"cd".to_vec())],
+                Settled::Failed,
+                1,
+            ),
+            (
+                "the exit that completes",
+                released,
+                Step::Exit(61),
+                next.clone(),
+                Settled::NonEmpty,
+                0,
+            ),
+            (
+                "the return that completes",
+                completing,
+                last.clone(),
+                next,
+                Settled::NonEmpty,
+                0,
+            ),
+        ];
+        for (name, head, step, tail, settled, failures) in scripts {
+            let mut ends = Vec::new();
+            for (order, steps) in three_orders(&head, zz, step.clone(), &tail) {
+                let what = format!("{agent:?}, {name}, {order}");
+                let opts = Opts {
+                    recheck: true,
+                    judged: Judged::Exactly,
+                };
+                let (model, snapshot) = run_with(opts, agent, b"", false, &steps, &what).await;
+                assert_eq!(model.settled, Some(settled), "{what}: settled once, as");
+                assert_eq!(
+                    model.stats.settled.values().sum::<usize>(),
+                    1,
+                    "{what}: one settlement"
+                );
+                assert_eq!(
+                    snapshot.schedule.map(|(_, f, _)| f),
+                    Some(failures),
+                    "{what}: failures counted"
+                );
+                ends.push((order, model.expected.clone(), snapshot));
+            }
+            let (_, expected, end) = &ends[0];
+            for (order, other_expected, other) in &ends[1..] {
+                assert_eq!(
+                    other_expected, expected,
+                    "{agent:?}, {name}: the table allows the same bytes {order} as before"
+                );
+                assert_eq!(other, end, "{agent:?}, {name}: {order} ends as before");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A-20d-5: the cut-open path, typing with a liability out and no segment.
+// ---------------------------------------------------------------------------
+
+/// The cut-open scripts for `agent`, each with its name: a liability out
+/// with no segment, reached two ways (a phantom raised once the probe
+/// completed; and, for Claude, production's own route, a lapsed probe
+/// whose retry completed while its liability stays out, core §4.7's
+/// CL-10), then typing with no candidate, then with one, then more; and the
+/// `HumanG` its candidate opens ending two ways: its helper decides
+/// `Armed` (the phantom's notice path), or `Unarmed` and runs the user's
+/// editor.
+fn cut_open_scripts(agent: Agent) -> Vec<(String, Vec<Step>)> {
+    let ret: Vec<Step> = fast_return(agent).into_iter().map(Step::Out).collect();
+    let mut routes = vec![("a phantom", {
+        let mut steps = vec![helper(51, 1, Decision::Armed), Step::Exit(51)];
+        steps.extend(ret.clone());
+        steps.push(Step::Phantom);
+        (steps, 2)
+    })];
+    if agent == Agent::Claude {
+        routes.push(("a lapsed probe's", {
+            let mut steps = vec![
+                Step::LapseRetry,
+                helper(51, 2, Decision::Armed),
+                Step::Exit(51),
+            ];
+            steps.extend(ret.clone());
+            (steps, 3)
+        }));
+    }
+    let mut scripts = Vec::new();
+    for (route, (head, n)) in routes {
+        let typed = [
+            Step::Type(b"xy".to_vec()),
+            Step::Type(b"a\x07b".to_vec()),
+            Step::Type(b"cd".to_vec()),
+        ];
+        let mut armed = vec![helper(52, n, Decision::Armed), Step::Exit(52)];
+        armed.extend(ret.clone());
+        armed.push(Step::Type(b"ef".to_vec()));
+        let editor = vec![
+            helper(52, n, Decision::Unarmed),
+            Step::Editor(52),
+            Step::Type(b"ef".to_vec()),
+        ];
+        for (end, stage2) in [("`Armed`", armed), ("the user's editor", editor)] {
+            let steps = [head.clone(), typed.to_vec(), stage2].concat();
+            scripts.push((format!("{agent:?}, {route} liability, {end}"), steps));
+        }
+    }
+    scripts
+}
+
+/// Scenario: With a liability out and no segment open, reached by raising a phantom liability after the probe completed and, for Claude, by a lapsed probe whose retry completed while its liability stayed out, a person types with no Ctrl+G, then with one, then more, and the `HumanG` that Ctrl+G opens is answered by a helper deciding `Armed` or running the user's editor. After every step the PTY has taken nothing the release table doesn't allow yet: typing with no candidate goes straight through, the bytes after a candidate stay held, and no Ctrl+G is written with bytes after it; the liability count is the table's at every step (A-20d-5, its authority half).
+#[spec("inbox/probe/086")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_086_a_cut_with_a_liability_out_and_no_segment_releases_nothing_early() {
+    for agent in [Agent::Claude, Agent::Codex] {
+        for (what, steps) in cut_open_scripts(agent) {
+            let opts = Opts {
+                recheck: false,
+                judged: Judged::NothingEarly,
+            };
+            run_with(opts, agent, b"", false, &steps, &what).await;
+        }
+    }
+}
+
+/// Scenario: The scripts of `probe_086_a_cut_with_a_liability_out_and_no_segment_releases_nothing_early`, judged exactly: the Ctrl+G that the cut opens a `HumanG` with is written as the bytes through it, after its number was published, and once that segment's helper decides `Armed` or runs the user's editor, what was held behind it goes on, so nothing stays held for good (core §4.3, §4.5 and §4.6, A-20d-5's release half). Quarantined: production writes that Ctrl+G with no number published and holds the rest behind a fence the release driver never opens.
+#[spec("inbox/probe/086")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "quarantined: vfarcic, #1666"]
+async fn probe_086_a_cut_with_a_liability_out_and_no_segment_opens_a_humang() {
+    for agent in [Agent::Claude, Agent::Codex] {
+        for (what, steps) in cut_open_scripts(agent) {
+            run_with(Opts::default(), agent, b"", false, &steps, &what).await;
         }
     }
 }
