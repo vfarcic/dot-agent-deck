@@ -628,11 +628,20 @@ pub fn codex_keymap(
 }
 
 /// Where Codex keeps its home, from the agent's environment `env`:
-/// `$CODEX_HOME`, else `$HOME/.codex`.
+/// `$CODEX_HOME`, else `$HOME/.codex`. `None` when the value chosen is
+/// empty or relative (the revb21 review's U1-1b), as
+/// [`claude_keybindings_path`] holds for Claude Code: Codex doesn't read
+/// such a value as the deck would (an empty one falls back to another
+/// home, and a relative one resolves against Codex's own directory), so
+/// the files the deck would read needn't be the ones Codex loads.
+/// Comparing the spawn's value with the bound agent's can't catch that,
+/// since both sides carry the same string.
 pub fn codex_home(env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-    env("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env("HOME").map(|home| PathBuf::from(home).join(".codex")))
+    let home = match env("CODEX_HOME") {
+        Some(codex_home) => PathBuf::from(codex_home),
+        None => PathBuf::from(env("HOME")?).join(".codex"),
+    };
+    home.is_absolute().then_some(home)
 }
 
 /// The project files Codex may read for a launch in `cwd` (A-20d-1b, R6
