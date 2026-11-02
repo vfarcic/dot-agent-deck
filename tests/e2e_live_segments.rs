@@ -247,9 +247,67 @@ fn probe_028_an_ignored_candidate_holds_until_generation_replacement() {
 #[spec("inbox/probe/029")]
 #[test]
 fn probe_029_codex_requires_the_complete_matched_return() {
-    let f = Fixture::start("codex");
+    // CAPTURE BRANCH ONLY (agent/dispatch-p029-capture, never merged): repeat
+    // the scenario and, on a miss, print what the probe answered and what the
+    // daemon and fixture saw.
+    for i in 0..30 {
+        probe_029_capture_once(i);
+    }
+}
+
+fn probe_029_capture_once(i: u32) {
+    let logdir = common::race_safe_tempdir();
+    let log = logdir.path().join("deck.log");
+    let log_s = log.to_str().unwrap().to_owned();
+    let t0 = Instant::now();
+    let f = live::Fixture::with_env(
+        "codex",
+        &[
+            ("DOT_AGENT_DECK_LOG", log_s.as_str()),
+            ("RUST_LOG", "composer_probe=debug,dot_agent_deck=debug"),
+        ],
+    );
+    let started = t0.elapsed();
     f.flag("hold-return");
-    f.probe();
+    let reply = f.probe();
+    let probed = t0.elapsed();
+    let reached = common::wait_until(common::child_boot_budget(), || {
+        f.path("helper-exited").exists()
+    });
+    eprintln!(
+        "capture iter {i}: start {started:?} probe@{probed:?} reached={reached} reply={reply}"
+    );
+    if !reached {
+        let mut files: Vec<String> = fs::read_dir(&f.daemon.home)
+            .map(|d| {
+                d.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        files.sort();
+        let read = |s: &str| {
+            String::from_utf8_lossy(&fs::read(f.path(s)).unwrap_or_default()).into_owned()
+        };
+        let logtext = fs::read_to_string(&log).unwrap_or_else(|e| format!("<no log: {e}>"));
+        let tail: Vec<&str> = logtext.lines().rev().take(400).collect();
+        let tail: Vec<&str> = tail.into_iter().rev().collect();
+        panic!(
+            "CAPTURED miss at iter {i}\nreply: {reply}\npost observer: {}\npost fence: {}\nepoch: {:?}\ninput: {:?}\ninputs: {}\nhelper-started: {}\nhelper-trace: {}\nhooks: {}\nhome files: {files:?}\nscreen:\n{}\nsnapshot: {}\n---- daemon log tail ({} lines total) ----\n{}",
+            f.control_for(f.generation, "observer-status"),
+            f.control_for(f.generation, "fence-status"),
+            f.control_for(f.generation, "epoch"),
+            f.input(),
+            read("inputs"),
+            read("helper-started"),
+            read("helper-trace"),
+            read("hooks"),
+            f.screen(),
+            f.snapshot(),
+            logtext.lines().count(),
+            tail.join("\n"),
+        );
+    }
     f.wait("helper-exited");
     let mut human = f.connect();
     human.write("AFTER-CODEX-E1");
