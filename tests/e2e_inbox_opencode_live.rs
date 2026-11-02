@@ -218,7 +218,7 @@ fn opencode_021_live_watcher_respawns_and_next_delegate_is_native() {
     assert!(!op.log().contains("doorbell rang"), "{}", op.evidence());
 }
 
-/// Scenario: Remove the deck entry from scratch tui.json so no TUI watcher arms, bring real OpenCode to a genuine Idle with an empty composer through an explicitly cancelled shell wait, and delegate a sentinel task. The deck types into no OpenCode release: the agent's card must hold the task as cannot_type, and over a further ten seconds no doorbell is attempted or typed, the task stays queued with no delivery, and no sentinel is written.
+/// Scenario: Remove the deck entry from scratch tui.json, and on OpenCode 2.x the deck's `plugins/dot-agent-deck-tui` too, so no TUI watcher arms, bring real OpenCode to a genuine Idle with an empty composer through an explicitly cancelled shell wait, and delegate a sentinel task. The deck types into no OpenCode release: the agent's card must hold the task as cannot_type, and over a further ten seconds no doorbell is attempted or typed, the task stays queued with no delivery, and no sentinel is written.
 #[spec("inbox/opencode/022")]
 #[test]
 fn opencode_022_live_unarmed_is_held_without_typing() {
