@@ -690,7 +690,9 @@ pub fn codex_moves_cwd(args: &[OsString]) -> bool {
 /// depends on the project root and trust the deck doesn't resolve
 /// ([`codex_project_files`]). With no keymap in any of them, the project
 /// layer can't move a binding whichever of them Codex loads, so merging
-/// them all ([`codex_keymap`]) reads what Codex reads. Absent files allow.
+/// them all ([`codex_keymap`]) gives the same effective `tui.keymap` as
+/// Codex's own layers, though it includes files Codex doesn't load. Absent
+/// files allow.
 pub fn codex_projects_guard(read: &CodexRead) -> Result<(), Hold> {
     for project in &read.projects {
         match project {
