@@ -3185,7 +3185,7 @@ async fn arm_after(
     (rig, outcome, kept)
 }
 
-/// Scenario: A Claude Code generation shows its main composer on a real bus, and a probe is asked as the deck's probe request asks it: scheduled through the generation's own admission, its arm section on the real writer thread asking admission again with the writer's own reads. Between scheduling and the arm section the agent writes output, or a person's ticket is admitted, or both: the arm refuses (the screen is no longer the frame it was scheduled from, or a person is typing), the PTY takes no byte, no fence closes, no liability is raised and one failure is counted, and the person's typing then goes straight through. With nothing between, the same probe is written and closes its fence (A-20d-2).
+/// Scenario: A Claude Code generation shows its main composer on a real bus, and a probe is asked as the deck's probe request asks it: scheduled through the generation's own admission, its arm section on the real writer thread asking admission again with the writer's own reads. Between scheduling and the arm section the agent writes output, or a person's ticket is admitted, or both: the arm refuses (the screen is no longer the frame it was scheduled from, or a person is typing), the PTY takes no byte, no fence closes and no liability is raised; a person's ticket counts one failure and the screen alone counts none (A-20d-11), and the person's typing then goes straight through. With nothing between, the same probe is written and closes its fence (A-20d-2).
 #[spec("inbox/probe/084")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn probe_084_what_lands_between_scheduling_and_the_arm_refuses_it_and_writes_nothing() {
@@ -3247,10 +3247,13 @@ async fn probe_084_what_lands_between_scheduling_and_the_arm_refuses_it_and_writ
         let schedule = rig
             .input
             .advance_schedule_for_e2e(Duration::ZERO, Instant::now());
+        // A-20d-11: the screen's freshness refusal counts none; a ticket's
+        // counts one.
+        let counted = u32::from(refusal != "Admission(Surface)");
         assert_eq!(
             schedule.map(|(_, failures, _)| failures),
-            Some(1),
-            "{what}: one failure counted"
+            Some(counted),
+            "{what}: {counted} failure(s) counted"
         );
         // The person's typing, behind no fence, goes straight to the PTY.
         let frame = UserFrame::new(
@@ -3265,6 +3268,52 @@ async fn probe_084_what_lands_between_scheduling_and_the_arm_refuses_it_and_writ
         );
         assert_eq!(rig.taken(), b"ab", "{what}: and only it");
     }
+}
+
+/// Scenario: A Claude Code generation shows its main composer, and a probe is asked as the deck's probe request asks it. The agent writes output between its scheduling and its arm section, so the writer refuses the screen and nothing is written; that refusal counts no failure, so the schedule is due again at once, not broken, and once the agent redraws its composer the next probe, with nothing between, is written. A person's ticket admitted between scheduling and the arm still counts its one failure (A-20d-11).
+#[spec("inbox/probe/084")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_084_a_screen_that_moved_before_the_arm_counts_no_failure() {
+    let schedule = |rig: &Rig| {
+        rig.input
+            .advance_schedule_for_e2e(Duration::ZERO, Instant::now())
+    };
+    let (rig, outcome, _) = arm_after(|rig| {
+        rig.out(b"x");
+        None
+    })
+    .await;
+    assert_eq!(
+        outcome,
+        ProbeOutcome::Refused("Admission(Surface)".to_string()),
+        "output between scheduling and the arm"
+    );
+    assert!(rig.taken().is_empty(), "no byte written");
+    assert_eq!(
+        schedule(&rig),
+        Some((true, 0, false)),
+        "due again at once, no failure counted, not broken"
+    );
+    rig.out(&claude_frame(80));
+    assert_eq!(
+        rig.probe_admitted(|_| {}).await,
+        ProbeOutcome::Written,
+        "the next probe, from the redrawn composer"
+    );
+    rig.settle(&[CTRL_G]).await;
+    assert_eq!(rig.taken(), [CTRL_G], "its byte alone");
+
+    // The control: a person's ticket says the box may have changed.
+    let (rig, outcome, _ticket) = arm_after(|rig| Some(rig.ledger.admit())).await;
+    assert_eq!(
+        outcome,
+        ProbeOutcome::Refused("Admission(HumanTicket)".to_string())
+    );
+    assert_eq!(
+        schedule(&rig).map(|(_, failures, _)| failures),
+        Some(1),
+        "a ticket's refusal still counts"
+    );
 }
 
 // ---------------------------------------------------------------------------
