@@ -70,6 +70,15 @@
 //! between a live arm section and its byte is not forced here (the
 //! activation list carries it).
 //!
+//! **An editor that ended before it was seen running (A-20d-15).** The
+//! model releases a Claude `HumanG` whose `Unarmed` helper's clean report
+//! was in when its exit drained, as production does. The generated scripts
+//! seldom reach that row (the front segment's helper is rarely an undrained
+//! `Unarmed` one when a report is scripted), so no floor requires it; the
+//! fixed script [`probe_010_typing_behind_an_editor_that_ended_unseen_follows_the_release_table`]
+//! reaches it on Claude and holds on Codex, whose release also needs its
+//! return past the drain frontier, which this rig never takes.
+//!
 //! **The policy it assumes (the audit's U3-2).** Every generation here runs
 //! [`EcPolicy::Hold`], production's policy, under which `Records::complete`
 //! refuses the EC route: the model has no EC or frontier rows, and no
@@ -773,6 +782,11 @@ struct MRecord {
     /// The daemon's read of an `Armed` export on IPC: whether it was empty.
     read: Option<bool>,
     drained: bool,
+    /// Its report, when its exit drained, said the helper reaped its editor
+    /// and accounted for the tree (`Done`, `Clean` or `Survivors`): the
+    /// editor's end is known (A-20d-15). A report after the drain doesn't
+    /// set it.
+    done_at_drain: bool,
     /// Its editor child was seen running (the observer's one report).
     editor: bool,
     matched: bool,
@@ -1096,6 +1110,9 @@ impl Model {
     fn exit(&mut self, pid: u32) {
         self.clock += 1;
         if let Some(r) = self.records.iter_mut().find(|r| r.pid == pid) {
+            if !r.drained {
+                r.done_at_drain = matches!(r.report, Report::Done(Tree::Clean | Tree::Survivors));
+            }
             r.drained = true;
             r.exited = Some(self.clock);
             let editor_bearing = r.decision != Some(Decision::Armed);
@@ -1172,6 +1189,14 @@ impl Model {
                         true
                     }
                     (Agent::Claude, MKind::HumanG, Some(Decision::Armed)) => true,
+                    // Once its editor runs, or, on Claude, once its helper
+                    // reported the editor's end and drained (A-20d-15).
+                    // Codex's needs its return past the drain frontier,
+                    // which this rig never takes (no frontier rows), so
+                    // there it holds.
+                    (Agent::Claude, MKind::HumanG, Some(Decision::Unarmed)) => {
+                        r.editor || r.done_at_drain
+                    }
                     (_, MKind::HumanG, Some(Decision::Unarmed)) => r.editor,
                     _ => false,
                 };
@@ -1630,6 +1655,7 @@ fn generate(rng: &mut Rng, model: &mut Model, len: usize) -> Vec<Step> {
                     .then(|| daemon_read(rng))
                     .flatten(),
                 drained: false,
+                done_at_drain: false,
                 editor: false,
                 matched: false,
                 born: 0,
@@ -1777,6 +1803,7 @@ fn fast_helper(pid: u32, number: u64) -> MRecord {
         report: Report::None,
         read: None,
         drained: false,
+        done_at_drain: false,
         editor: false,
         matched: false,
         born: 0,
@@ -2098,6 +2125,7 @@ fn helper(pid: u32, seg: u64, decision: Decision) -> Step {
         report: Report::None,
         read: None,
         drained: false,
+        done_at_drain: false,
         editor: false,
         matched: false,
         born: 0,
@@ -2162,6 +2190,7 @@ async fn probe_010_the_review_traces_follow_the_release_table() {
             report: Report::None,
             read: None,
             drained: false,
+            done_at_drain: false,
             editor: false,
             matched: false,
             born: 0,
@@ -2172,6 +2201,42 @@ async fn probe_010_the_review_traces_follow_the_release_table() {
         u05.extend(ret.clone());
         u05.push(Step::Exit(31));
         run(agent, b"", false, &u05, &format!("R-U2-05 {agent:?}")).await;
+    }
+}
+
+/// Scenario: For Claude and Codex, a held Ctrl+G's trigger is answered by a helper that runs the person's editor, which ends before it is seen running: typing is held behind it, its helper reports the editor ended clean while more is typed, then exits, and more is typed after. Judged step by step by the release table: on Claude what was held goes at the helper's drained exit and later typing follows it; on Codex, whose return past the drain frontier this rig never takes, it all stays held (A-20d-15).
+#[spec("inbox/probe/010")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_010_typing_behind_an_editor_that_ended_unseen_follows_the_release_table() {
+    for agent in [Agent::Claude, Agent::Codex] {
+        let mut steps = vec![
+            Step::Type(b"\x07".to_vec()),
+            helper(71, 1, Decision::Armed),
+            Step::Exit(71),
+        ];
+        steps.extend(fast_return(agent).into_iter().map(Step::Out));
+        steps.extend([
+            helper(72, 2, Decision::Unarmed),
+            Step::Type(b"gh".to_vec()),
+            Step::Report(72, Report::Done(Tree::Clean)),
+            Step::Type(b"ij".to_vec()),
+            Step::Exit(72),
+            Step::Type(b"kl".to_vec()),
+        ]);
+        let model = run(agent, b"", false, &steps, &format!("A-20d-15 {agent:?}")).await;
+        let released = Row {
+            agent: agent_name(agent),
+            kind: MKind::HumanG,
+            decision: "Unarmed",
+            editor: false,
+            spawn_failed: false,
+            releases: true,
+        };
+        assert_eq!(
+            model.stats.rows.contains_key(&released),
+            agent == Agent::Claude,
+            "{agent:?}: the release at the drain is Claude's alone here"
+        );
     }
 }
 
