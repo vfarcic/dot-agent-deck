@@ -380,6 +380,11 @@ pub struct Installation {
     /// (A-20d-1b): what the observer compares each later read with.
     #[cfg(target_os = "linux")]
     keymap_baseline: Option<super::keymap::KeymapBaseline>,
+    /// A test's stand-in for the bound agent's `/proc/<pid>/environ`
+    /// (reva21 U1-1): the test binds `A` to its own process, whose
+    /// environment is the test runner's, not the one the deck's spawn gave.
+    #[cfg(all(test, target_os = "linux"))]
+    bound_environ: Option<Vec<(OsString, OsString)>>,
 }
 
 impl Installation {
@@ -478,6 +483,19 @@ impl Installation {
     #[cfg(all(test, target_os = "linux"))]
     pub fn set_keymap_baseline(&mut self, baseline: super::keymap::KeymapBaseline) {
         self.keymap_baseline = Some(baseline);
+    }
+
+    /// Read `environ` as the bound agent's environment rather than its
+    /// `/proc/<pid>/environ`, for a test whose `A` is its own process.
+    #[cfg(all(test, target_os = "linux"))]
+    pub fn set_bound_environ_for_test(&mut self, environ: Vec<(OsString, OsString)>) {
+        self.bound_environ = Some(environ);
+    }
+
+    /// The test's stand-in environment, taken by the observer.
+    #[cfg(all(test, target_os = "linux"))]
+    pub fn take_bound_environ_for_test(&mut self) -> Option<Vec<(OsString, OsString)>> {
+        self.bound_environ.take()
     }
 
     /// The baseline read before the spawn, taken by the observer.
@@ -606,6 +624,8 @@ pub fn install(
         helper_id: instance.helper_id(),
         launch: Vec::new(),
         keymap_baseline: None,
+        #[cfg(all(test, target_os = "linux"))]
+        bound_environ: None,
     })
 }
 

@@ -801,8 +801,37 @@ impl KeymapBaseline {
     }
 }
 
+/// The variables that pick an agent's key-binding files (the reva21
+/// review's U1-1): Claude Code's `HOME` and `CLAUDE_CONFIG_DIR`, Codex's
+/// `HOME` and `CODEX_HOME`.
+pub const KEYMAP_ENV: [&str; 3] = ["HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME"];
+
+/// A lookup over a process's own environment `environ`, as
+/// `/proc/<pid>/environ` lists it, for the variables in [`KEYMAP_ENV`]: the
+/// first value a name has, as `getenv` answers. A name in [`KEYMAP_ENV`]
+/// listed twice with different values holds as [`Hold::Unmeasured`]: which
+/// one the agent's runtime reads isn't measured.
+pub fn environ_lookup(
+    environ: &[(OsString, OsString)],
+) -> Result<impl Fn(&str) -> Option<OsString> + '_, Hold> {
+    for name in KEYMAP_ENV {
+        let mut values = environ.iter().filter(|(k, _)| k == name).map(|(_, v)| v);
+        if let Some(first) = values.next()
+            && values.any(|v| v != first)
+        {
+            return Err(Hold::Unmeasured);
+        }
+    }
+    Ok(move |name: &str| {
+        environ
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+    })
+}
+
 impl KeymapBaseline {
-    /// Claude Code's spawn read, when the bound agent's environment `env`
+    /// Claude Code's spawn read, when the bound agent's own environment `env`
     /// still names the file it was read from; [`Hold::Changed`] when it
     /// names another, and the path's own hold when it names none.
     pub fn claude_bound(
@@ -819,7 +848,8 @@ impl KeymapBaseline {
 
     /// Codex's spawn baseline, when the bound agent launched with the same
     /// sources ([`CodexBaseline::bound`]): its arguments `args` after the
-    /// program, its working directory `cwd` and the home `env` names. No
+    /// program, its working directory `cwd` and the home its own
+    /// environment `env` names ([`environ_lookup`]). No
     /// home, no `cwd`, or arguments that couldn't be read (`None`: an
     /// unreadable or over-long command line, which may carry a `-c`
     /// override the deck never saw) hold as unmeasured.

@@ -1319,6 +1319,10 @@ mod linux {
     /// The most bytes of a process's argv binding reads.
     const ARGV_BYTES: u64 = 128 << 10;
 
+    /// The most bytes of a bound agent's environment the keymap's
+    /// settlement reads; a longer one holds the keymap as unmeasured.
+    const ENVIRON_BYTES: u64 = 1 << 20;
+
     /// A helper held by its pidfd (Q87): one per helper, shared by its
     /// connections, its connected watch (`peers`), its lost mark (`unread`)
     /// and its pin, so a watch never depends on duplicating a descriptor.
@@ -1482,6 +1486,10 @@ mod linux {
         /// child existed (A-20d-1b). `None` (an installation no spawn path
         /// read for) gives no evidence: the keymap holds as unmeasured.
         keymap_baseline: Option<crate::composer_probe::keymap::KeymapBaseline>,
+        /// A test's stand-in for the bound agent's environment
+        /// ([`Installation::set_bound_environ_for_test`]).
+        #[cfg(test)]
+        bound_environ: Option<Vec<(OsString, OsString)>>,
         /// A test's park in the drain (Q91), called with each exited
         /// record's key between the drain's snapshot and its settlement,
         /// with no lock held.
@@ -1890,6 +1898,37 @@ mod linux {
 
     /// `pid`'s executable and argv, `None` when either can't be read or the
     /// argv is longer than [`ARGV_BYTES`].
+    /// `/proc/<pid>/environ` as `(name, value)` pairs in its order, or
+    /// `None` when it can't be read or is longer than [`ENVIRON_BYTES`]. An
+    /// entry with no `=` is kept as a name with an empty value.
+    fn proc_environ(pid: u32) -> Option<Vec<(OsString, OsString)>> {
+        let mut bytes = Vec::new();
+        std::fs::File::open(format!("/proc/{pid}/environ"))
+            .ok()?
+            .take(ENVIRON_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() as u64 > ENVIRON_BYTES {
+            return None;
+        }
+        Some(
+            bytes
+                .split(|b| *b == 0)
+                .filter(|entry| !entry.is_empty())
+                .map(|entry| {
+                    let (name, value) = match entry.iter().position(|b| *b == b'=') {
+                        Some(at) => (&entry[..at], &entry[at + 1..]),
+                        None => (entry, &[][..]),
+                    };
+                    (
+                        OsStr::from_bytes(name).to_os_string(),
+                        OsStr::from_bytes(value).to_os_string(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
     fn proc_facts(pid: u32) -> Option<ProcFacts> {
         let exe = exe_id(pid)?;
         let mut bytes = Vec::new();
@@ -2028,6 +2067,8 @@ mod linux {
             let helper_id = installation.helper_id();
             let launch = installation.launch().to_vec();
             let keymap_baseline = installation.take_keymap_baseline();
+            #[cfg(test)]
+            let bound_environ = installation.take_bound_environ_for_test();
             if !spawned
                 .input
                 .attach_records(Records::new(generation, EC_POLICY, Instant::now()))
@@ -2077,6 +2118,8 @@ mod linux {
                 stopped: std::sync::atomic::AtomicBool::new(false),
                 keymap: std::sync::OnceLock::new(),
                 keymap_baseline,
+                #[cfg(test)]
+                bound_environ,
                 #[cfg(test)]
                 drain_park: std::sync::Mutex::new(None),
                 #[cfg(test)]
@@ -2233,19 +2276,27 @@ mod linux {
         /// The keymap evidence for `agent` under `probe` (O-20.7b), built
         /// from the sources read before the spawn (A-20d-1b), so a change
         /// made between the spawn and this settlement holds rather than
-        /// becoming what later reads are compared with. Claude Code's
-        /// `keybindings.json` read then, at the path the agent's environment
-        /// still names. Codex's sources read then, only when the bound agent
-        /// launched with the same ones: its own arguments `args` (a direct
-        /// Codex's `-c` overrides and profile are on its argv), its own
-        /// working directory `cwd` for the project files, and the same
-        /// home; otherwise it holds as changed. No baseline, or for Codex no
-        /// `cwd` or arguments it couldn't read (`args` is `None`), holds as
-        /// unmeasured.
+        /// becoming what later reads are compared with. The files are the
+        /// ones the bound agent's own environment `environ` names (its
+        /// `HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`: the reva21 review's
+        /// U1-1), which a command that sets its own (`CODEX_HOME=/x codex`)
+        /// moves away from the spawn's: another file than the one read then
+        /// holds as changed. Claude Code's `keybindings.json` read then, at
+        /// the path the agent's environment still names. Codex's sources
+        /// read then, only when the bound agent launched with the same
+        /// ones: its own arguments `args` (a direct Codex's `-c` overrides
+        /// and profile are on its argv), its own working directory `cwd`
+        /// for the project files, and the home its environment names;
+        /// otherwise it holds as changed. No baseline, an environment that
+        /// couldn't be read (`environ` is `None`), or for Codex no `cwd` or
+        /// arguments it couldn't read (`args` is `None`), holds as
+        /// unmeasured. Variables outside these three, and Codex's system and
+        /// managed layers, are not compared.
         fn keymap_evidence(
             &self,
             agent: &AgentType,
             probe: &EditorProbe<'static>,
+            environ: Option<&[(OsString, OsString)]>,
             args: Option<&[OsString]>,
             cwd: Option<&std::path::Path>,
         ) -> KeymapEvidence {
@@ -2253,9 +2304,15 @@ mod linux {
             let Some(baseline) = self.keymap_baseline.as_ref() else {
                 return KeymapEvidence::Held(keymap::Hold::Unmeasured);
             };
-            let env = |name: &str| self.env_value(name);
+            let Some(environ) = environ else {
+                return KeymapEvidence::Held(keymap::Hold::Unmeasured);
+            };
+            let env = match keymap::environ_lookup(environ) {
+                Ok(env) => env,
+                Err(hold) => return KeymapEvidence::Held(hold),
+            };
             match agent {
-                AgentType::ClaudeCode => match baseline.claude_bound(env) {
+                AgentType::ClaudeCode => match baseline.claude_bound(&env) {
                     Ok((path, read)) => {
                         KeymapEvidence::Claude(keymap::ClaudeKeymap::from_spawn_read(
                             path.to_path_buf(),
@@ -2265,7 +2322,7 @@ mod linux {
                     }
                     Err(hold) => KeymapEvidence::Held(hold),
                 },
-                AgentType::Codex => match baseline.codex_bound(env, args, cwd) {
+                AgentType::Codex => match baseline.codex_bound(&env, args, cwd) {
                     Ok(codex) => KeymapEvidence::Codex {
                         sources: codex.sources.clone(),
                         before: Box::new(codex.read.clone()),
@@ -2361,6 +2418,18 @@ mod linux {
 
         /// A variable as the agent sees it: the spawn's own, else the
         /// daemon's.
+        /// The bound agent `pid`'s environment as it was exec'd
+        /// (`/proc/<pid>/environ`, which the agent's own later `setenv`
+        /// doesn't change), or `None` when it can't be read or is longer
+        /// than [`ENVIRON_BYTES`]. A test's stand-in replaces it.
+        fn bound_environ(&self, pid: u32) -> Option<Vec<(OsString, OsString)>> {
+            #[cfg(test)]
+            if let Some(environ) = &self.bound_environ {
+                return Some(environ.clone());
+            }
+            proc_environ(pid)
+        }
+
         fn env_value(&self, name: &str) -> Option<OsString> {
             match self.env.iter().rev().find(|(k, _)| k == name) {
                 Some((_, v)) => Some(v.into()),
@@ -2771,9 +2840,12 @@ mod linux {
                 let cwd = identity
                     .as_ref()
                     .and_then(|a| std::fs::read_link(format!("/proc/{}/cwd", a.pid)).ok());
+                // Its environment, which picks the key-binding files.
+                let environ = identity.as_ref().and_then(|a| self.bound_environ(a.pid));
                 let _ = self.keymap.set(self.keymap_evidence(
                     agent,
                     &probe,
+                    environ.as_deref(),
                     args.as_deref(),
                     cwd.as_deref(),
                 ));

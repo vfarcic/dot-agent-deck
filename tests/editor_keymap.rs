@@ -1046,3 +1046,63 @@ fn probe_014_an_unread_bound_codex_argv_holds() {
         "an unread argv is not an empty one"
     );
 }
+
+/// Scenario: Take a generation's key-binding baseline before its spawn with the spawn's `HOME`, then compare it with the bound agent's own environment, as a command that sets its own variables (`CODEX_HOME=/x codex`, `HOME=/y claude`) leaves it. The same `HOME` matches for both agents, and so does a `CODEX_HOME` naming the home the spawn's `HOME` already gave Codex (the deck's wrapper pins it so); another `HOME` or `CODEX_HOME` holds as changed, and a `CLAUDE_CONFIG_DIR` as unmeasured. An environment that lists one of these names twice with different values holds as unmeasured (the reva21 review's U1-1).
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_the_bound_agents_environment_is_compared_with_the_spawns() {
+    use dot_agent_deck::composer_probe::keymap::{KeymapBaseline, environ_lookup};
+    let dir = test_temp::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let cwd = dir.path().join("repo");
+    for d in [&home, &cwd] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let spawn = |name: &str| (name == "HOME").then(|| home.clone().into_os_string());
+    let baseline = KeymapBaseline::at_spawn(true, true, spawn, &[], &cwd);
+    let environ = |pairs: &[(&str, &Path)]| -> Vec<(OsString, OsString)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (OsString::from(k), v.as_os_str().to_os_string()))
+            .collect()
+    };
+    let claude = |pairs: &[(&str, &Path)]| {
+        let environ = environ(pairs);
+        let env = environ_lookup(&environ).unwrap();
+        baseline.claude_bound(&env).map(|_| ())
+    };
+    let codex = |pairs: &[(&str, &Path)]| {
+        let environ = environ(pairs);
+        let env = environ_lookup(&environ).unwrap();
+        baseline
+            .codex_bound(&env, Some(&[]), Some(&cwd))
+            .map(|_| ())
+    };
+    let other = dir.path().join("other");
+    assert_eq!(claude(&[("HOME", &home)]), Ok(()));
+    assert_eq!(codex(&[("HOME", &home)]), Ok(()));
+    assert_eq!(
+        codex(&[("HOME", &home), ("CODEX_HOME", &home.join(".codex"))]),
+        Ok(()),
+        "the wrapper's pin names the same home"
+    );
+    assert_eq!(claude(&[("HOME", &other)]), Err(Hold::Changed));
+    assert_eq!(codex(&[("HOME", &other)]), Err(Hold::Changed));
+    assert_eq!(
+        codex(&[("HOME", &home), ("CODEX_HOME", &other)]),
+        Err(Hold::Changed)
+    );
+    assert_eq!(
+        claude(&[("HOME", &home), ("CLAUDE_CONFIG_DIR", &other)]),
+        Err(Hold::Unmeasured)
+    );
+    assert_eq!(claude(&[]), Err(Hold::Unmeasured), "no HOME");
+
+    let twice = environ(&[("HOME", &home), ("HOME", &other)]);
+    assert_eq!(environ_lookup(&twice).err(), Some(Hold::Unmeasured));
+    let same = environ(&[("HOME", &home), ("HOME", &home)]);
+    assert_eq!(
+        environ_lookup(&same).unwrap()("HOME"),
+        Some(home.clone().into_os_string())
+    );
+}

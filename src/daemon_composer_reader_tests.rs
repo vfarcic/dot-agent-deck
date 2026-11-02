@@ -113,6 +113,17 @@ async fn wait_for(budget: Duration, mut done: impl FnMut() -> bool) -> bool {
     done()
 }
 
+/// How a [`Deck`] starts: whether its observer binds `A`, whether its
+/// agent's `HOME` is the deck's own, whether its release is latched from
+/// the start, and the bound agent's own environment when it isn't the
+/// spawn's (names to paths under the deck's directory).
+struct DeckStart {
+    bound: bool,
+    home: bool,
+    latched: bool,
+    agent_env: Option<Vec<(String, String)>>,
+}
+
 /// One composer connection, held by the test.
 struct Peer {
     reader: tokio::io::BufReader<OwnedReadHalf>,
@@ -162,7 +173,7 @@ struct Deck {
 
 impl Deck {
     async fn start() -> Deck {
-        Deck::start_with(false).await
+        Deck::start_with_bound(false).await
     }
 
     /// A deck whose observer binds `A` to this test process (Q87): its
@@ -170,7 +181,7 @@ impl Deck {
     /// editor-probe record, and its `TMPDIR` the deck's directory, so the
     /// permission settles `Armable` and a liability can be published.
     async fn start_bound() -> Deck {
-        Deck::start_with(true).await
+        Deck::start_with_bound(true).await
     }
 
     /// [`Deck::start_bound`] whose agent's `HOME` is the deck's own
@@ -179,6 +190,25 @@ impl Deck {
     /// file the test owns rather than from the user's own.
     async fn start_bound_at_home() -> Deck {
         Deck::start_with_home(true, true, true).await
+    }
+
+    /// [`Deck::start_bound_at_home`] whose bound agent's own environment
+    /// is `agent_env` (a name to a path under the deck's directory), not
+    /// the `HOME` its spawn gave it: an agent started through a command
+    /// that set its own (`HOME=/elsewhere claude`).
+    async fn start_bound_at_home_as(agent_env: &[(&str, &str)]) -> Deck {
+        Deck::start_with(DeckStart {
+            bound: true,
+            home: true,
+            latched: true,
+            agent_env: Some(
+                agent_env
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            ),
+        })
+        .await
     }
 
     /// [`Deck::start_bound_at_home`] whose release latch reports nothing
@@ -193,7 +223,7 @@ impl Deck {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    async fn start_with(bound: bool) -> Deck {
+    async fn start_with_bound(bound: bool) -> Deck {
         Deck::start_with_home(bound, false, true).await
     }
 
@@ -203,6 +233,22 @@ impl Deck {
     }
 
     async fn start_with_home(bound: bool, home: bool, latched: bool) -> Deck {
+        Deck::start_with(DeckStart {
+            bound,
+            home,
+            latched,
+            agent_env: None,
+        })
+        .await
+    }
+
+    async fn start_with(start: DeckStart) -> Deck {
+        let DeckStart {
+            bound,
+            home,
+            latched,
+            agent_env,
+        } = start;
         let latched = Arc::new(std::sync::atomic::AtomicBool::new(latched));
         let registry = Arc::new(AgentPtyRegistry::new());
         let id = registry
@@ -288,6 +334,18 @@ impl Deck {
                     dir.path().join("home").to_str().unwrap().to_string(),
                 ));
             }
+            // The bound agent is this test process, whose environment is
+            // the runner's: what the observer reads as the agent's is the
+            // spawn's own, or the one the test names under the deck's
+            // directory.
+            let environ: Vec<(std::ffi::OsString, std::ffi::OsString)> = match &agent_env {
+                Some(agent_env) => agent_env
+                    .iter()
+                    .map(|(k, v)| (k.into(), dir.path().join(v).into_os_string()))
+                    .collect(),
+                None => env.iter().map(|(k, v)| (k.into(), v.into())).collect(),
+            };
+            installation.set_bound_environ_for_test(environ);
             Spawned {
                 agent_id: id.clone(),
                 agent: Some(AgentType::ClaudeCode),
@@ -1769,6 +1827,40 @@ async fn probe_014_a_generation_retired_inside_the_reread_window_applies_nothing
         "the allowing verdict applied nothing to the retired generation"
     );
     deck.stop().await;
+}
+
+/// Scenario: A bound deck at home, its spawn's `HOME` the deck's own home with an empty `keybindings.json`, while the agent it bound runs with another environment, as one started by `HOME=/elsewhere claude` or `CLAUDE_CONFIG_DIR=/x claude` does. With the agent's `HOME` naming a home whose `keybindings.json` moves Ctrl+G, the keymap holds as changed; with the agent's `CLAUDE_CONFIG_DIR` set, as unmeasured. The deck reads the files the agent's own environment names, not its spawn's (the reva21 review's U1-1).
+#[spec("inbox/probe/014")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_014_the_bound_agents_own_environment_picks_its_key_bindings() {
+    use crate::composer_probe::keymap::Hold;
+    let cases: [(&[(&str, &str)], Hold); 2] = [
+        (&[("HOME", "elsewhere")], Hold::Changed),
+        (
+            &[("HOME", "home"), ("CLAUDE_CONFIG_DIR", "config")],
+            Hold::Unmeasured,
+        ),
+    ];
+    for (agent_env, held) in cases {
+        let deck = Deck::start_bound_at_home_as(agent_env).await;
+        let claude = deck.dir.path().join("elsewhere/.claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("keybindings.json"),
+            r#"{"bindings": [{"context": "Chat", "bindings": {"ctrl+g": "chat:submit"}}]}"#,
+        )
+        .unwrap();
+        let observer = Arc::clone(&deck.observer);
+        assert!(
+            wait_for(SETTLE, || observer.permission() == Permission::Armable).await,
+            "the bound deck's permission settles Armable"
+        );
+        let keymap = tokio::task::spawn_blocking(move || observer.keymap())
+            .await
+            .unwrap();
+        assert_eq!(keymap, Err(held), "{agent_env:?}");
+        deck.stop().await;
+    }
 }
 
 /// A bound deck at home whose release latch was held back and is now let
