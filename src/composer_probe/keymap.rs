@@ -636,10 +636,18 @@ pub fn codex_keymap(
 /// the files the deck would read needn't be the ones Codex loads.
 /// Comparing the spawn's value with the bound agent's can't catch that,
 /// since both sides carry the same string.
+///
+/// `None` too when the value chosen isn't UTF-8 (the revc21 review's
+/// U1-1c): Codex reads `CODEX_HOME` through `std::env::var`, which
+/// refuses such a value, and falls back to `$HOME/.codex` (as
+/// `codex_hooks_manage::codex_home` records), so the path as written
+/// isn't the one Codex loads. A non-UTF-8 `HOME` holds the same way:
+/// how Codex reads one isn't recorded, and holding costs nothing a real
+/// home needs.
 pub fn codex_home(env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     let home = match env("CODEX_HOME") {
-        Some(codex_home) => PathBuf::from(codex_home),
-        None => PathBuf::from(env("HOME")?).join(".codex"),
+        Some(codex_home) => PathBuf::from(codex_home.into_string().ok()?),
+        None => PathBuf::from(env("HOME")?.into_string().ok()?).join(".codex"),
     };
     home.is_absolute().then_some(home)
 }
