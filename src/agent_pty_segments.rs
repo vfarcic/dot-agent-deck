@@ -715,8 +715,10 @@ pub(super) fn end_probe_segment(
 /// its one byte taken) undoes its arm with `disarm`, which lowers the
 /// liability, opens a fence nothing is held behind (the driver releases what
 /// is, its segment gone) and counts a failure, as an attempt refused at the
-/// writer does. A failed write answers its own reason, never an admission
-/// refusal's. A lapse retry counts no failure here: its asker decides.
+/// writer does, unless the writer refused only the screen's freshness
+/// ([`writer_refusal_counts`], A-20d-11). A failed write answers its own
+/// reason, never an admission refusal's. A lapse retry counts no failure
+/// here: its asker decides.
 /// Shared with the release oracle.
 #[cfg(target_os = "linux")]
 pub(super) fn probe_ended(
@@ -747,13 +749,31 @@ pub(super) fn probe_ended(
                 ?refusal,
                 "probe refused at the writer"
             );
-            if ask != ProbeAsk::Lapse {
+            if ask != ProbeAsk::Lapse && writer_refusal_counts(refusal) {
                 input.probe_failed(Instant::now());
             }
             ProbeOutcome::Refused(format!("{refusal:?}"))
         }
         ProbeEnd::TakenBack => ProbeOutcome::TakenBack,
     }
+}
+
+/// Whether a probe the writer refused at its arm section counts as a failed
+/// attempt on the schedule (A-20d-11). The screen's freshness refusal
+/// (`Admission(Surface)` at the writer) counts none: the probe passed the
+/// screen when it was scheduled, so at the writer only output or a layout
+/// change since that frame takes it away, which says the agent drew in
+/// between, not that the box can't be checked. The schedule then stays as
+/// it was, due, and the next request schedules from a newer frame. Every
+/// other refusal at the writer counts, as before. A lapse retry's refusal
+/// is counted by its asker, the doorbell tick, which sees only that it was
+/// refused, so a lapse retry refused for the screen still counts.
+#[cfg(target_os = "linux")]
+fn writer_refusal_counts(refusal: ProbeRefusal) -> bool {
+    !matches!(
+        refusal,
+        ProbeRefusal::Admission(crate::composer_probe::admission::Refusal::Surface)
+    )
 }
 
 /// Why a probe whose byte the PTY didn't take is refused.

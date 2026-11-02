@@ -1454,7 +1454,7 @@ fn probe_009_the_segment_keeps_the_pinned_editors_identity() {
     }
 }
 
-/// Scenario: Write a held Ctrl+G whose helper decides `Unarmed`, and report its editor running, pinned with a check of whether that very process still runs. While the check says it runs, the held typing is released to it; when the pinned editor has already exited by the time the release would be decided, nothing is released early: the segment is held as one whose editor never ran, until its helper's completion under `Authority` and, under `Hold`, through a full return until retirement (A-20d-6, option (a); the revb21 review's U2-1).
+/// Scenario: Write a held Ctrl+G whose helper decides `Unarmed`, and report its editor running, pinned with a check of whether that very process still runs. While the check says it runs, the held typing is released to it; when the pinned editor has already exited by the time the release would be decided, nothing is released early: the segment is held as one whose editor never ran, until its helper's completion under `Authority` and, under `Hold`, until its helper's clean report is in at its drained exit, after which it releases while the Ctrl+G behind it waits for retirement (A-20d-6, option (a); the revb21 review's U2-1; A-20d-15).
 #[spec("inbox/probe/009")]
 #[test]
 fn probe_009_a_release_rechecks_that_the_pinned_editor_still_runs() {
@@ -1490,10 +1490,12 @@ fn probe_009_a_release_rechecks_that_the_pinned_editor_still_runs() {
         }
     }
 
-    // Under `Hold` (production's policy) the segment never completes, so an
+    // Under `Hold` (production's policy) the segment never completes. An
     // editor found gone holds the typing behind it through the helper's
-    // clean report, its exit and the agent's full return, until the
-    // generation retires (the revb21 review's U2-1, ruling (a)).
+    // clean report alone; once that report was in at the helper's drained
+    // exit, the editor's end is known and it is released (A-20d-15,
+    // replacing the revb21 review's U2-1 ruling (a), under which it held
+    // until retirement). The Ctrl+G behind it still waits for retirement.
     let mut t = T::new(Agent::Claude, HOLD);
     let n = t.probe(0);
     t.s.open_human_g(1).unwrap();
@@ -1520,7 +1522,11 @@ fn probe_009_a_release_rechecks_that_the_pinned_editor_still_runs() {
     t.out(&cat(&[ON, FRAME]), 10);
     t.returns(11);
     let v = t.view(11);
-    assert_ne!(v[0].stage, Stage::Released, "held through a full return");
+    assert_eq!(
+        v[0].stage,
+        Stage::Released,
+        "released once its helper reported the editor's end and drained (A-20d-15)"
+    );
     assert!(t.written().is_empty(), "Hold completes nothing");
     assert_eq!(t.s.next_trigger(), None, "the Ctrl+G behind it stays held");
     t.s.retire();
@@ -1532,4 +1538,127 @@ fn probe_009_a_release_rechecks_that_the_pinned_editor_still_runs() {
         ],
         "only retirement ends it"
     );
+}
+
+/// Scenario: For Claude and Codex under `Hold`, write a held Ctrl+G whose helper decides `Unarmed` and runs the person's editor, which is either pinned and already gone when the release is decided or never seen running, with a second Ctrl+G held behind it. Nothing goes while the helper runs, nor on its clean report alone; once that report was in when the helper's exit drained, Claude's segment releases at the drain and Codex's only after its return past the drain frontier (`?2004h`, then `?2026h`). The segment stays open, so under `Hold` the second Ctrl+G is never written. A helper that reported survivors releases Claude's too, but on Codex takes no frontier and holds; a helper that drained with no report, whose clean report arrived only after its drain, or that couldn't account for the editor's tree holds on both until retirement (A-20d-15).
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_typing_behind_an_editor_that_ended_goes_once_its_helper_reported_the_end() {
+    use dot_agent_deck::composer_probe::segments::EditorPin;
+    let editor = RecordKey {
+        pid: 4321,
+        start: 99,
+    };
+    // A held Ctrl+G with a second one behind it, its helper `Unarmed`, and
+    // the editor pinned gone (`pinned`) or never reported.
+    let start = |agent: Agent, pinned: bool| {
+        let mut t = T::new(agent, HOLD);
+        let g = t.s.open_held_trigger().unwrap();
+        t.s.open_human_g(2).unwrap();
+        t.write(g, 1);
+        t.ipc(1, Decision::Unarmed, g, 2);
+        if pinned {
+            assert!(t.s.editor_pinned_with(
+                &mut t.r,
+                &mut t.f,
+                key(1),
+                EditorPin::new(editor, || false),
+                time(t.t, 3)
+            ));
+        }
+        assert_eq!(
+            t.s.front(),
+            Front::Held,
+            "{agent:?} {pinned}: no editor runs"
+        );
+        t
+    };
+    for agent in [Agent::Claude, Agent::Codex] {
+        for pinned in [true, false] {
+            let mut t = start(agent, pinned);
+            t.report(1, Report::Done(Tree::Clean), 4);
+            assert_eq!(
+                t.s.front(),
+                Front::Held,
+                "{agent:?} {pinned}: the report alone, the helper still running"
+            );
+            t.exit(1, 5);
+            t.frontier(1);
+            if agent == Agent::Codex {
+                assert_eq!(t.s.front(), Front::Held, "Codex: not before its return");
+                t.out(ON, 6);
+                assert_eq!(t.s.front(), Front::Held, "Codex: the enable alone");
+                t.out(FRAME, 7);
+            }
+            assert_eq!(
+                t.s.front(),
+                Front::Released,
+                "{agent:?} {pinned}: the editor ended, by its helper's own report"
+            );
+            assert_eq!(t.stages(8)[0], Stage::Released, "{agent:?} {pinned}");
+            t.returns(9);
+            assert_eq!(t.s.front(), Front::Released, "{agent:?} {pinned}: it stays");
+            assert!(
+                t.written().is_empty(),
+                "{agent:?} {pinned}: Hold completes nothing"
+            );
+            assert_eq!(
+                t.s.next_trigger(),
+                None,
+                "{agent:?} {pinned}: the second Ctrl+G stays behind it under Hold"
+            );
+        }
+
+        // Survivors: the helper reaped its editor and found its tree still
+        // running. Claude releases at the drain; Codex takes no frontier.
+        let mut t = start(agent, true);
+        t.report(1, Report::Done(Tree::Survivors), 4);
+        t.exit(1, 5);
+        t.returns(6);
+        let survivors = t.s.front();
+        assert_eq!(
+            survivors == Front::Released,
+            agent == Agent::Claude,
+            "{agent:?}: survivors"
+        );
+
+        // The controls: no report at the drain, one only after it, and a
+        // tree the helper couldn't account for.
+        for (late, report) in [
+            (false, None),
+            (true, Some(Report::Done(Tree::Clean))),
+            (false, Some(Report::Done(Tree::Unknown))),
+        ] {
+            let mut t = start(agent, true);
+            if let (false, Some(report)) = (late, report) {
+                t.report(1, report, 3);
+            }
+            t.exit(1, 4);
+            if let (true, Some(report)) = (late, report) {
+                t.report(1, report, 5);
+            }
+            t.frontier(1);
+            t.returns(6);
+            t.out(&cat(&[ON, FRAME]), 7);
+            assert_eq!(
+                t.s.front(),
+                Front::Held,
+                "{agent:?} {report:?} late={late}: no known end at the drain"
+            );
+            assert_ne!(
+                t.stages(7)[0],
+                Stage::Released,
+                "{agent:?} {report:?} late={late}"
+            );
+            t.s.retire();
+            assert_eq!(
+                t.ended(),
+                [
+                    (Some(1), Kind::HumanG, Outcome::Retired),
+                    (None, Kind::HumanG, Outcome::Retired)
+                ],
+                "{agent:?} {report:?} late={late}: only retirement ends it"
+            );
+        }
+    }
 }

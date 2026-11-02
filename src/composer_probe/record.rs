@@ -384,6 +384,12 @@ pub struct Record {
     pub matched: Option<u64>,
     pub exit_observed: Option<Instant>,
     pub drained: bool,
+    /// The report as it stood when its exit drained; `None` before the
+    /// drain. A report delivered only after the drain (one a drain that gave
+    /// up uncertain left behind) changes [`Self::report`], not this, so a
+    /// release that needs the helper's own account of its editor's end at
+    /// its drain doesn't take a late one (A-20d-15).
+    pub drained_report: Option<Report>,
     pub settlement: Settlement,
     pub completion: Completion,
     pub hazard_pop: HazardPop,
@@ -1117,6 +1123,7 @@ impl Records {
                     matched: None,
                     exit_observed: None,
                     drained: false,
+                    drained_report: None,
                     settlement: Settlement::Open,
                     completion: Completion::Pending,
                     hazard_pop: HazardPop::Unspent,
@@ -1369,6 +1376,7 @@ impl Records {
         let mut consumed = false;
         if !r.drained {
             r.drained = true;
+            r.drained_report = Some(r.report);
             if r.decision != Some(Decision::Armed) && r.frontier == Frontier::NotApplicable {
                 r.frontier = Frontier::Missing;
             }
