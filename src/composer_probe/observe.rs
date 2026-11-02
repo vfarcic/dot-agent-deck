@@ -1233,8 +1233,10 @@ pub struct ChildFacts {
 /// Of several that qualify, the earliest-started is the editor (lowest pid
 /// on a tie; A-20d-6, the reva21 review's item 5). The helper is a
 /// subreaper, so an orphaned descendant of the editor is re-parented to it
-/// and qualifies too; it started after the editor, so while the editor
-/// runs it is never the one taken.
+/// and qualifies too; it started no earlier than the editor, so while the
+/// editor runs it is taken only when it started in the editor's own clock
+/// tick (start times are in ticks) and has the lower pid, which a pid
+/// wrap between the two forks can give it (the revb21 review's U3-2).
 ///
 /// What it doesn't pin: which program the editor is (A-20d-6's option (a),
 /// Q118b). The helper resolves the user's editor command itself, and a
