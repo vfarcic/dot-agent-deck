@@ -1866,7 +1866,7 @@ mod tests {
         assert_eq!(read(closed, gate(false, 0)), (Attempt::First, Fence::Open));
     }
 
-    /// Scenario: Run the display watcher over a deck with one pane whose card shows nothing, wake it with a display notice that changes nothing, and wake it again with another 20 seconds later. The repeat still comes 30 seconds after the first notice: a later notice does not push a pending repeat back, so notices arriving more often than every 30 seconds cannot hold the repeat off (auditor U3-8).
+    /// Scenario: Run the display watcher over a deck with one pane whose card shows nothing, wake it with a display notice that changes nothing, and wake it again with another two thirds of the repeat's period later (20 seconds of today's 30). The repeat still comes one period after the first notice: a later notice does not push a pending repeat back, so notices arriving more often than the repeat's period cannot hold the repeat off (auditor U3-8).
     #[spec("inbox/probe/046")]
     #[tokio::test(start_paused = true)]
     async fn probe_046_a_later_notice_does_not_postpone_the_repeat() {
@@ -1886,7 +1886,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
         registry.held_display().notify_one();
         tokio::time::sleep(Duration::from_millis(10)).await;
-        let later = Duration::from_secs(20);
+        // Before the repeat is due, whatever the repeat's period.
+        let later = HELD_REPEAT_AFTER * 2 / 3;
         tokio::time::sleep(later).await;
         registry.held_display().notify_one();
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1899,7 +1900,9 @@ mod tests {
             Ok(crate::event::BroadcastMsg::InputHeld(update)) => {
                 assert_eq!((update.pane_id, update.agent_id), (pane.to_string(), agent));
             }
-            other => panic!("the repeat is due 30 seconds after the first notice: {other:?}"),
+            other => {
+                panic!("the repeat is due HELD_REPEAT_AFTER after the first notice: {other:?}")
+            }
         }
         watcher.abort();
         registry.shutdown_all();

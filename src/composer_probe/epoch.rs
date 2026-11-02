@@ -2274,7 +2274,7 @@ mod tests {
         assert_eq!(failures(&control), 1, "an unlapsed probe's failure counts");
     }
 
-    /// Scenario: A probe's helper decides `Armed` and the daemon reads its export empty. When the helper's claim on the composer is the deck's own, or no claim is known, the empty read settles the box empty and the next attempt is due at once; when the claim is a tool's, the read is not the deck's to apply, so the box reads non-empty and the next attempt waits.
+    /// Scenario: A probe's helper decides `Armed` and the daemon reads its export empty. When the helper's claim on the composer is the deck's own, or the record has no claim, the empty read settles the box empty and the next attempt is due at once; when the claim is a tool's or `Claim::Unknown`, the read is not the deck's to apply, so the box reads non-empty and the next attempt waits.
     #[spec("inbox/probe/030")]
     #[test]
     fn probe_030_an_armed_empty_read_settles_empty_only_on_the_decks_own_claim() {
