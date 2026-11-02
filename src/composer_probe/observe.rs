@@ -3438,7 +3438,9 @@ mod linux {
     }
 
     /// The pin's own `/proc` reads against the real kernel (the audit's
-    /// U3-3); the decision over them is `editor_identity_tests`'.
+    /// U3-3); the decision over them is `editor_identity_tests`'. Also the
+    /// bound agent's environment read, `proc_environ` (the revb21 review's
+    /// U3-5).
     #[cfg(test)]
     mod pin_reads {
         use super::*;
@@ -3541,6 +3543,160 @@ mod linux {
                 child_facts(pid).is_none_or(|f| f.start != facts.start),
                 "a reaped pid doesn't pin the reaped child"
             );
+        }
+
+        /// `sleep` exec'd with exactly `envp` as its environment: the
+        /// arrays are built before the fork, and the child's `pre_exec`
+        /// only calls `execve` with them, so the test controls what
+        /// `std::process::Command` can't express (a name listed twice, an
+        /// entry with no `=`).
+        fn sleep_with_environ(envp: &[Vec<u8>]) -> std::io::Result<Reaped> {
+            use std::ffi::CString;
+            use std::os::unix::process::CommandExt;
+            struct Exec {
+                _owned: Vec<CString>,
+                path: *const libc::c_char,
+                argv: Vec<*const libc::c_char>,
+                envp: Vec<*const libc::c_char>,
+            }
+            // SAFETY: the pointers point into `_owned`'s heap buffers, which
+            // move with it and are never written; the child only reads them.
+            unsafe impl Send for Exec {}
+            unsafe impl Sync for Exec {}
+            impl Exec {
+                /// Returns only when the exec failed.
+                fn exec(&self) -> std::io::Error {
+                    // SAFETY: null-terminated arrays of NUL-terminated
+                    // strings, alive in `self`.
+                    unsafe { libc::execve(self.path, self.argv.as_ptr(), self.envp.as_ptr()) };
+                    std::io::Error::last_os_error()
+                }
+            }
+            let sleep = std::env::var_os("PATH")
+                .and_then(|path| {
+                    std::env::split_paths(&path)
+                        .map(|dir| dir.join("sleep"))
+                        .find(|p| p.is_file())
+                })
+                .expect("this test needs `sleep` on PATH");
+            let path = CString::new(sleep.as_os_str().as_bytes()).unwrap();
+            let args = [c"sleep".to_owned(), c"600".to_owned()];
+            let vars: Vec<CString> = envp
+                .iter()
+                .map(|e| CString::new(e.clone()).unwrap())
+                .collect();
+            let null = std::iter::once(std::ptr::null());
+            let exec = Exec {
+                path: path.as_ptr(),
+                argv: args
+                    .iter()
+                    .map(|a| a.as_ptr())
+                    .chain(null.clone())
+                    .collect(),
+                envp: vars.iter().map(|v| v.as_ptr()).chain(null).collect(),
+                _owned: std::iter::once(path).chain(args).chain(vars).collect(),
+            };
+            let mut command = std::process::Command::new(&sleep);
+            // SAFETY: the hook calls only `execve`, which is
+            // async-signal-safe, over arrays built before the fork; it
+            // returns only when the exec failed.
+            unsafe {
+                command.pre_exec(move || Err(exec.exec()));
+            }
+            let child = Reaped(Some(command.spawn()?));
+            // Until its exec the child still has the test's environment.
+            let me = exe_id(std::process::id()).expect("the test's executable");
+            let pid = child.0.as_ref().unwrap().id();
+            let deadline = Instant::now() + CHILD_WAIT;
+            while exe_id(pid) == Some(me) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(child)
+        }
+
+        /// Scenario: Start real `sleep` children with environments the test writes byte for byte, and read each back through `proc_environ`, the read the deck takes of a bound agent's `/proc/<pid>/environ` (the revb21 review's U3-5). Entries come back in order, split at their first `=`, a name listed twice twice, and an entry with no `=` as an empty value, which `HOME` then reads as and Codex's home holds on; an environment of exactly `ENVIRON_BYTES` reads whole and one byte more reads as `None`.
+        #[spec("inbox/probe/014")]
+        #[test]
+        fn probe_014_proc_environ_reads_a_real_childs_environment() {
+            use crate::composer_probe::keymap::{Hold, codex_home, environ_lookup};
+            let pairs = |environ: Vec<(OsString, OsString)>| -> Vec<(String, String)> {
+                environ
+                    .into_iter()
+                    .map(|(k, v)| (k.into_string().unwrap(), v.into_string().unwrap()))
+                    .collect()
+            };
+            let owned = |entries: &[&str]| -> Vec<Vec<u8>> {
+                entries.iter().map(|e| e.as_bytes().to_vec()).collect()
+            };
+            let child = sleep_with_environ(&owned(&[
+                "DAD_KNOWN=v=1",
+                "HOME=/h",
+                "DAD_NOEQ",
+                "HOME=/other",
+                "DAD_EMPTY=",
+            ]))
+            .expect("spawn sleep");
+            let environ = proc_environ(child.0.as_ref().unwrap().id()).expect("read whole");
+            assert_eq!(
+                pairs(environ.clone()),
+                [
+                    ("DAD_KNOWN", "v=1"),
+                    ("HOME", "/h"),
+                    ("DAD_NOEQ", ""),
+                    ("HOME", "/other"),
+                    ("DAD_EMPTY", ""),
+                ]
+                .map(|(k, v)| (k.to_string(), v.to_string())),
+                "in order, split at the first `=`"
+            );
+            assert_eq!(
+                environ_lookup(&environ).err(),
+                Some(Hold::Unmeasured),
+                "HOME listed twice with different values"
+            );
+            drop(child);
+
+            let child = sleep_with_environ(&owned(&["HOME"])).expect("spawn sleep");
+            let environ = proc_environ(child.0.as_ref().unwrap().id()).expect("read whole");
+            assert_eq!(pairs(environ.clone()), [("HOME".into(), String::new())]);
+            let env = environ_lookup(&environ).unwrap();
+            assert_eq!(env("HOME"), Some(OsString::new()));
+            assert_eq!(codex_home(&env), None, "an empty HOME names no Codex home");
+            drop(child);
+
+            // The bound: 16 entries of 64 KiB each, NULs included, is
+            // exactly `ENVIRON_BYTES`; each stays under the kernel's
+            // per-string limit.
+            const ENTRIES: usize = 16;
+            let entry = (ENVIRON_BYTES as usize) / ENTRIES;
+            let environ_of = |extra: usize| -> Vec<Vec<u8>> {
+                (0..ENTRIES)
+                    .map(|i| {
+                        let mut e = format!("DAD_BIG_{i:02}=").into_bytes();
+                        let len = entry - 1 + if i == 0 { extra } else { 0 };
+                        e.resize(len, b'x');
+                        e
+                    })
+                    .collect()
+            };
+            for (extra, whole) in [(0, true), (1, false)] {
+                let child = match sleep_with_environ(&environ_of(extra)) {
+                    Err(e) if e.raw_os_error() == Some(libc::E2BIG) => {
+                        eprintln!("SKIP: this host's argument limit refuses a 1 MiB environment");
+                        return;
+                    }
+                    child => child.expect("spawn sleep"),
+                };
+                let read = proc_environ(child.0.as_ref().unwrap().id());
+                if whole {
+                    let read = read.expect("exactly ENVIRON_BYTES reads");
+                    assert_eq!(read.len(), ENTRIES);
+                    let bytes: usize = read.iter().map(|(k, v)| k.len() + 1 + v.len() + 1).sum();
+                    assert_eq!(bytes as u64, ENVIRON_BYTES);
+                } else {
+                    assert_eq!(read, None, "one byte past ENVIRON_BYTES");
+                }
+            }
         }
     }
 
