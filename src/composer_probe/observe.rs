@@ -103,7 +103,8 @@
 //!                                                     (no lock)
 //!                                                     └─> seam (Mutex) ─> input (R6)
 //!                                                                  └─> arm page stores
-//! settle claim (atomic, held across bind and the gen-G write, no lock) ─> seam
+//! settle claim (a leaf flag, held across bind and the gen-G write, no lock;
+//!               a probe request's settlement waits on it, Q116b) ─> seam
 //! keymap re-read (A-20d-1a): input (R6, which parked reads, released) ; keymap
 //!                files read (no lock) ; input (R6, settle them)
 //! parked read's wake: under R6 ─> Bell (atomics, unpark)
@@ -188,6 +189,14 @@ pub const MARKER_NAMES_PER_PASS: usize = 256;
 
 /// How long the control verb waits for a pending permission to settle.
 pub const CONTROL_PERMISSION_WAIT: Duration = Duration::from_secs(2);
+
+/// How long a probe request's settlement waits for a settlement of the same
+/// generation already in flight (Q116b) before it gives up and reads what
+/// stands. A settlement is `/proc` reads, one small file write and the
+/// keymap check, milliseconds even on a loaded runner; the bound only keeps
+/// a stuck one from holding the request, which runs on a blocking thread
+/// and keeps the doorbell quiet for its generation while it is outstanding.
+pub const SETTLE_WAIT: Duration = Duration::from_secs(1);
 
 // ---------------------------------------------------------------------------
 // Budgets.
@@ -519,10 +528,17 @@ where
 /// The one settler of a generation's permission at a time (Q84): the
 /// observer's pass and the control verb both settle it, and whichever takes
 /// this claim first computes, writes `gen-G` and publishes; the other
-/// returns, and finds the permission settled or settles it later itself.
+/// returns, and finds the permission settled or settles it later itself. A
+/// probe request's settlement waits for the holder instead ([`Self::claim_by`],
+/// Q116b), so what it reads after it is what that settlement published.
+///
+/// The flag is behind a leaf mutex taken only to read or flip it, never
+/// held across a settlement or under another lock; a waiter waits on the
+/// condition variable, which releases it.
 #[derive(Debug, Default)]
 pub struct SettleClaim {
-    held: AtomicBool,
+    held: std::sync::Mutex<bool>,
+    released: std::sync::Condvar,
 }
 
 /// A held [`SettleClaim`], released when dropped.
@@ -532,20 +548,47 @@ pub struct Settling<'a> {
 }
 
 impl SettleClaim {
+    fn held(&self) -> std::sync::MutexGuard<'_, bool> {
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// The claim, unless another settler holds it.
     pub fn claim(&self) -> Option<Settling<'_>> {
-        self.held
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-            // Lazily: a guard built for a failed claim would release the
-            // holder's when dropped.
-            .then(|| Settling { claim: self })
+        let mut held = self.held();
+        if *held {
+            return None;
+        }
+        *held = true;
+        Some(Settling { claim: self })
+    }
+
+    /// The claim once no other settler holds it, waiting for the holder to
+    /// let go until `deadline` at the latest (Q116b): `None` if it is still
+    /// held then. Blocks: call it from a thread that may wait, holding no
+    /// lock.
+    pub fn claim_by(&self, deadline: Instant) -> Option<Settling<'_>> {
+        let mut held = self.held();
+        while *held {
+            let left = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|left| !left.is_zero())?;
+            held = self
+                .released
+                .wait_timeout(held, left)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        *held = true;
+        Some(Settling { claim: self })
     }
 }
 
 impl Drop for Settling<'_> {
     fn drop(&mut self) {
-        self.claim.held.store(false, Ordering::Release);
+        *self.claim.held() = false;
+        self.claim.released.notify_all();
     }
 }
 
@@ -1235,8 +1278,8 @@ mod linux {
         ATTESTATIONS, ATTESTATIONS_PER_PASS, Bell, Bound, CONNECTIONS, CONNECTIONS_PER_GENERATION,
         CONTROL_PERMISSION_WAIT, ControlOp, ControlRefusal, Departure, DrainStep, Evidence,
         IDLE_SWEEP, LOST, LOST_PER_GENERATION, MARKER_NAMES_PER_PASS, Page, Pool, ProcFacts,
-        SCAN_PERIOD, Seam, SettleClaim, Slot, bound_agent, drain_step, e2_due, marker_observation,
-        read_before, scan_observation,
+        SCAN_PERIOD, SETTLE_WAIT, Seam, SettleClaim, Slot, bound_agent, drain_step, e2_due,
+        marker_observation, read_before, scan_observation,
     };
     use crate::composer_probe::attest::{
         self, Agent, Kernel, LinuxKernel, Pinned, Sighting, attribute, read_export,
@@ -2124,8 +2167,39 @@ mod linux {
         /// Settle the generation's permission now, if it can be (plan
         /// §1.2): a probe request asks rather than wait for the next sweep.
         /// Reads `/proc` and writes `gen-G` with no lock held.
+        ///
+        /// **Invariant (Q116b):** when this returns, no settlement of this
+        /// generation's permission that was running when it was called is
+        /// still running, unless [`SETTLE_WAIT`] ran out first. A settlement
+        /// sets the keymap evidence before it publishes `Armable`, so a
+        /// keymap read after this sees the evidence of every `Armable` a
+        /// settlement in flight at the call published: a probe request is
+        /// not refused `Keymap(Unmeasured)` for evidence the sweep that was
+        /// already settling was about to set. If the claim is held, this
+        /// waits for its holder (blocking: it runs on a blocking thread),
+        /// then settles itself, which finds a settled permission and
+        /// returns, or settles one still pending.
         pub fn settle(&self) {
-            self.settle_permission();
+            debug_assert!(crate::lock_rank::held_ranks().is_empty());
+            let settling = match self.settling.claim() {
+                Some(settling) => settling,
+                None => {
+                    #[cfg(test)]
+                    self.stamp_park
+                        .at(crate::composer_probe::stamp_park::StampPoint::SettleWaiting);
+                    let Some(settling) = self.settling.claim_by(Instant::now() + SETTLE_WAIT)
+                    else {
+                        tracing::debug!(
+                            target: "composer_probe",
+                            agent_id = %self.agent_id,
+                            "a probe request's settlement waited out its bound"
+                        );
+                        return;
+                    };
+                    settling
+                }
+            };
+            self.settle_claimed(settling);
         }
 
         /// The take-back of an arm a withdrawal won (`probe::start`).
@@ -2644,9 +2718,14 @@ mod linux {
         /// identity file is written once, by the one settlement that wins,
         /// and nothing replaces what it published.
         fn settle_permission(&self) {
-            let Some(_settling) = self.settling.claim() else {
-                return;
-            };
+            if let Some(settling) = self.settling.claim() {
+                self.settle_claimed(settling);
+            }
+        }
+
+        /// [`Self::settle_permission`] under a claim already taken, held
+        /// until this returns.
+        fn settle_claimed(&self, _settling: super::Settling<'_>) {
             if self.lock().seam.permission() != Permission::Pending {
                 return;
             }
@@ -2693,6 +2772,9 @@ mod linux {
                         _ => None,
                     })
             {
+                #[cfg(test)]
+                self.stamp_park
+                    .at(crate::composer_probe::stamp_park::StampPoint::SettleEvidence);
                 // The bound agent's own arguments: a direct Codex's `-c`
                 // overrides and profile are on its argv, not on the deck's
                 // launch line.

@@ -1771,6 +1771,108 @@ async fn probe_014_a_generation_retired_inside_the_reread_window_applies_nothing
     deck.stop().await;
 }
 
+/// A bound deck at home whose release latch was held back and is now let
+/// go, with its observer parked inside the settlement that computed
+/// `Armable`: it holds the settle claim, its keymap evidence not set and the
+/// permission not published. The park tells `waiting` when a probe
+/// request's settlement finds the claim held, and the observer goes on at
+/// `go`.
+async fn parked_in_the_settlement(
+    deck: &Deck,
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    use crate::composer_probe::stamp_park::StampPoint;
+    let (settling, settled_at) = std::sync::mpsc::channel();
+    let (waiting_tx, waiting) = std::sync::mpsc::channel();
+    let (go, go_rx) = std::sync::mpsc::channel::<()>();
+    let go_rx = std::sync::Mutex::new(go_rx);
+    deck.observer.park_stamps_for_test(move |at| match at {
+        StampPoint::SettleEvidence => {
+            let _ = settling.send(());
+            let _ = go_rx.lock().unwrap().recv();
+        }
+        StampPoint::SettleWaiting => {
+            let _ = waiting_tx.send(());
+        }
+        _ => {}
+    });
+    deck.latch();
+    tokio::task::spawn_blocking(move || settled_at.recv_timeout(SETTLE))
+        .await
+        .unwrap()
+        .expect("the observer settles once the release is seen");
+    assert_eq!(
+        deck.observer.permission(),
+        Permission::Pending,
+        "parked before it publishes"
+    );
+    (waiting, go)
+}
+
+/// Scenario: A bound deck at home, its release held back so its permission waits; the release is let go and the observer is parked inside its own settlement, after it computed `Armable` and before it set the keymap evidence and published. A probe request's settlement then runs, finds the observer holding the claim, and the observer is let go only once the request is waiting for it. The request's settlement returns after the observer's, so the keymap read after it allows and the permission reads `Armable`; a settlement that returned at once would read `Unmeasured` with the permission still pending, and the probe would be refused (Q116b, the race `probe_029` caught on GitHub's runners).
+#[spec("inbox/probe/059")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_059_a_requests_settlement_waits_for_the_one_in_flight() {
+    let deck = Deck::start_bound_at_home_latched_later().await;
+    let (waiting, go) = parked_in_the_settlement(&deck).await;
+    let release = go.clone();
+    // Let the observer go once the request waits for it; never, if it
+    // doesn't wait.
+    let releaser = std::thread::spawn(move || {
+        if waiting.recv_timeout(SETTLE).is_ok() {
+            let _ = release.send(());
+        }
+    });
+    let request = tokio::task::spawn_blocking({
+        let observer = Arc::clone(&deck.observer);
+        move || {
+            observer.settle();
+            (observer.permission(), observer.keymap())
+        }
+    });
+    let read = tokio::time::timeout(SETTLE, request).await;
+    let _ = go.send(());
+    releaser.join().unwrap();
+    let read = read.expect("the request's settlement returns").unwrap();
+    assert_eq!(
+        read,
+        (Permission::Armable, Ok(())),
+        "the request read after the settlement in flight, not before it"
+    );
+    deck.stop().await;
+}
+
+/// Scenario: As above, but the observer parked inside its settlement is never let go while the probe request's settlement waits. The request's settlement gives up after its bound, well inside the test's budget, with the permission still pending: it waits for a settlement in flight, not forever (Q116b).
+#[spec("inbox/probe/059")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_059_a_requests_settlement_waits_no_longer_than_its_bound() {
+    let deck = Deck::start_bound_at_home_latched_later().await;
+    let (waiting, go) = parked_in_the_settlement(&deck).await;
+    let started = Instant::now();
+    let request = tokio::task::spawn_blocking({
+        let observer = Arc::clone(&deck.observer);
+        move || {
+            observer.settle();
+            observer.permission()
+        }
+    });
+    let read = tokio::time::timeout(SETTLE, request).await;
+    let elapsed = started.elapsed();
+    let _ = go.send(());
+    assert_eq!(
+        read.expect("the request's settlement gives up").unwrap(),
+        Permission::Pending
+    );
+    assert!(
+        waiting.try_recv().is_ok(),
+        "the request found the claim held"
+    );
+    assert!(
+        elapsed >= crate::composer_probe::observe::SETTLE_WAIT,
+        "it waited its bound: {elapsed:?}"
+    );
+    deck.stop().await;
+}
+
 /// Scenario: A bound deck at home is spawned with an empty `keybindings.json`, its release latch held back so its permission waits. The binding file changes after the spawn and before the deck sees the agent's release; then the release is latched and the permission settles `Armable`. The keymap reads `Changed`: the read the generation is compared with is the one taken before its spawn, which the agent loaded, not one taken at settlement. Left unchanged (the control), the keymap allows (A-20d-1b, the pre-spawn baseline).
 #[spec("inbox/probe/014")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

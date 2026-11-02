@@ -3,7 +3,9 @@
 //! that window and then let the feeder go on with its earlier stamp. The
 //! observer's keymap re-read parks here too (A-20d-1a,
 //! [`StampPoint::KeymapRecheck`]), between reading what it settles and
-//! reading the keymap.
+//! reading the keymap, and so do a settlement of the permission and a probe
+//! request's settlement waiting for it (Q116b, [`StampPoint::SettleEvidence`],
+//! [`StampPoint::SettleWaiting`]).
 //!
 //! The module is compiled only under `cfg(test)`, and so is every call to
 //! [`StampPark::at`] in the feeders (`OutputHook::on_output`, the observer's
@@ -34,6 +36,16 @@ pub enum StampPoint {
     /// read. Not a stamp: the same park serves this window. Linux only.
     #[cfg(target_os = "linux")]
     KeymapRecheck,
+    /// The observer's settlement of a generation's permission (Q116b): it
+    /// holds the settle claim and computed `Armable`, its keymap evidence
+    /// not yet set and the permission not yet published. Not a stamp: the
+    /// same park serves this window. Linux only.
+    #[cfg(target_os = "linux")]
+    SettleEvidence,
+    /// A probe request's settlement (Q116b) that found another settler
+    /// holding the claim, before it waits for it. Linux only.
+    #[cfg(target_os = "linux")]
+    SettleWaiting,
 }
 
 type Park = Arc<dyn Fn(StampPoint) + Send + Sync>;

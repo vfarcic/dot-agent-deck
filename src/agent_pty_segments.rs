@@ -890,7 +890,10 @@ impl AgentPtyRegistry {
         }
         // Settle a pending permission now rather than at the observer's next
         // sweep, and before the keymap read, which an unsettled generation
-        // answers `Unmeasured` (U3-03).
+        // answers `Unmeasured` (U3-03). A settlement already in flight (the
+        // sweep's) is waited for, bounded, not skipped (Q116b): skipped, the
+        // keymap was read before the evidence it was about to set, and the
+        // probe was refused on it once it published `Armable`.
         let settle =
             (h.observer.permission() == crate::composer_probe::Permission::Pending).then(|| {
                 let observer = Arc::clone(&h.observer);
