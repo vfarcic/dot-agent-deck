@@ -470,10 +470,10 @@ fn probe_004_the_hook_feeds_the_tracker() {
     assert!(!hook.paste_mode().on());
 }
 
-/// Scenario: Give the output hook an observer's bell, then feed it output through `OutputHook::on_output`: text, bracketed paste turned on, then turned off (once whole, once split over two calls, once among other modes). Only the output that turns bracketed paste off asks the observer for a child scan, once for each time it is turned off.
+/// Scenario: Give the output hook an observer's bell, then feed it output through `OutputHook::on_output`: text, the bracketed-paste enable, then the bracketed-paste disable (whole, split over two calls, and among other modes while paste is already off), then other modes' disables. Each push carrying a bracketed-paste disable asks the observer for a child scan, whether or not paste was on, and the request is taken once; text, the enable and other modes' disables ask for nothing.
 #[spec("inbox/probe/069")]
 #[test]
-fn probe_069_output_turning_bracketed_paste_off_rings_for_a_scan() {
+fn probe_069_a_bracketed_paste_disable_rings_for_a_scan() {
     use std::sync::Arc;
 
     use dot_agent_deck::composer_probe::observe::Bell;

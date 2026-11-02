@@ -66,7 +66,8 @@ pub struct OutputHook {
     paste_mode: PasteModeTracker,
     input: Arc<GenerationInput>,
     /// The generation's observer, once it has one (Q35-14b): rung for a
-    /// child scan when the output turns bracketed paste off.
+    /// child scan when the output carries a bracketed-paste disable
+    /// (`?2004l`), whether or not paste was on.
     bell: BellSlot,
     /// How many bytes it has read, `None` once that can't advance: the drain
     /// frontier's `o` (Q35-20a, A5 §3.2), read under the output lock.
