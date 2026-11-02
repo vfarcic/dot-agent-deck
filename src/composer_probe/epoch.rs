@@ -1751,8 +1751,21 @@ impl GenerationInput {
     /// Record `key`'s editor child was observed running an executable other
     /// than the helper (core §4.6's `HumanG/Unarmed` row).
     pub fn segment_editor_running(&self, key: RecordKey, now: Instant) -> bool {
+        self.segment_editor_pinned(key, None, now)
+    }
+
+    /// [`Self::segment_editor_running`] with the editor's identity as the
+    /// observer pinned it, `(pid, start)` (A-20d-6): kept with the segment
+    /// its record matches, and shown in its [`segments::View`], so a
+    /// release can ask whether that same process still runs.
+    pub fn segment_editor_pinned(
+        &self,
+        key: RecordKey,
+        editor: Option<RecordKey>,
+        now: Instant,
+    ) -> bool {
         self.segment_step(now, |seg, records, fifo| {
-            Ok(seg.editor_running(records, fifo, key, now))
+            Ok(seg.editor_pinned(records, fifo, key, editor, now))
         })
         .unwrap_or(false)
     }

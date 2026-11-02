@@ -1565,6 +1565,7 @@ mod tests {
             scope: ScopeState::Closed,
             ec: false,
             not_returned: false,
+            editor: None,
         }
     }
 

@@ -2221,7 +2221,8 @@ mod linux {
         /// A helper record whose decision opened the user's editor (core
         /// §4.6's `HumanG/Unarmed` row): its editor child, pinned as the
         /// helper's own ([`super::user_editor`], Q35-20d), is reported to the
-        /// segments once. Run each pass, with no lock held for the reads.
+        /// segments once, with its `(pid, start)`, which the segment keeps
+        /// (A-20d-6). Run each pass, with no lock held for the reads.
         fn editors(&self) {
             let waiting: Vec<(RecordKey, Held)> = {
                 let inner = self.lock();
@@ -2263,7 +2264,9 @@ mod linux {
                 }
                 let input = Arc::clone(inner.seam.input());
                 drop(inner);
-                input.segment_editor_running(key, Instant::now());
+                // A-20d-6: the editor's pinned identity stays with the
+                // segment, not only a boolean that one ran.
+                input.segment_editor_pinned(key, Some(editor), Instant::now());
             }
         }
 
