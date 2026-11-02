@@ -68,7 +68,7 @@ describe("terminalInputState", () => {
 
   /**
    * Scenario: an agent that is both finished and paneless. The pane's own fact
-   * wins, because "the agent has no live pane" is what explains why typing
+   * wins, because "this agent has no live terminal" is what explains why typing
    * cannot work — which is what #1042 asked the terminal to say.
    */
   it("prefers the pane's reason over the status gate when both apply", () => {

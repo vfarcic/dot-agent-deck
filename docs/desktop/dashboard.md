@@ -108,8 +108,8 @@ Between the header and the terminal, the pane shows the agent's assignment and t
 What can go wrong in the pane:
 
 - **"No terminal here: the desktop has no live connection to <daemon>…"**: the agent's daemon stopped answering. The header then shows the last status the app saw. The terminal comes back on its own when the daemon answers again.
-- **"Terminal input unavailable — <reason>."**: the daemon refused input to this pane, and the reason says why. What you type is not sent.
-- **"Delivery was not confirmed — <reason>."**: the input may or may not have reached the agent. Check the terminal before typing it again.
+- **"Terminal input unavailable: this agent has no live terminal, only its history"**, or **"Terminal input unavailable: this agent has no live terminal"**: the pane shows the agent's output but cannot take typing, so the terminal is read-only and this line stays under it. In the TUI, the same words appear in the status line when you press `Enter` or the card's number on that agent's card, and the dashboard stays where it is.
+- **"[agent-deck] Input not delivered: <why>"**, written into the terminal: the daemon turned down what you just typed, so it did not reach the agent. The reason says why, for example `the agent has exited` or `the agent in this pane was replaced or closed`. In the TUI, the same words appear in the status line and the TUI goes back to command mode, so the keys you press next are not sent to the pane.
 
 ## Pull requests
 

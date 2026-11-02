@@ -6995,8 +6995,19 @@ impl PaneInbox {
     /// agent generation than the counts belong to changes nothing when the
     /// daemon established those counts' generation ([`Self::owned`]) or the
     /// pane's retained history names it ([`Self::retired`]); otherwise it
-    /// starts the counts over.
+    /// starts the counts over. On an account taken under a replaced daemon
+    /// process ([`Self::from_replaced_process`]) any notice naming a
+    /// generation starts them over, the same id included: that process's ids
+    /// fence nothing from this one's (review U3-a).
     fn fold(&mut self, notice: &crate::event::InboxNotice) {
+        if self.from_replaced_process
+            && let Some(named) = notice.agent_id.as_ref()
+        {
+            self.retire(PaneInbox {
+                agent_id: Some(named.clone()),
+                ..PaneInbox::default()
+            });
+        }
         if notice
             .agent_id
             .as_ref()
@@ -21285,6 +21296,64 @@ mod tests {
             state.apply_inbox_notice(&notice(id, step, requeued));
             assert_eq!(pending(&state), Some(shown), "{what}");
         }
+    }
+
+    /// PRD #1666 part 3 (review U3-a, `fold`'s half): a managed pane's
+    /// account of generation 12, three messages pending, was taken under
+    /// daemon process A. The stream moves to process B, whose ids start over;
+    /// B's generation reports on the pane, and a notice of B's queues a
+    /// message before any account of B's reaches it. B's card counts that one
+    /// message, whether B's generation has another id or reuses 12. Controls,
+    /// under one process: another generation's notice is late and changes
+    /// nothing, and the same generation's counts on top of its account.
+    #[test]
+    fn a_replaced_processs_account_fences_no_notice_from_the_new_one() {
+        use crate::inbox::StateName::Queued;
+        let named = |process: &str| -> Incarnation {
+            serde_json::from_value(serde_json::json!(process)).unwrap()
+        };
+        let run = |reconnect: bool, agent: &str| {
+            let mut state = AppState::default();
+            state.learn_stream_incarnation(named("daemon-a"));
+            state.register_pane("pane-q".to_string());
+            state.take_inbox_snapshot(&[inbox_record("pane-q", "12", Some(held_summary(3, None)))]);
+            if reconnect {
+                state.learn_stream_incarnation(named("daemon-b"));
+            }
+            let card = format!("gen-{agent}");
+            state.apply_event(AgentEvent {
+                session_id: card.clone(),
+                agent_id: Some(agent.to_string()),
+                ..quota_event(EventType::SessionStart, 1)
+            });
+            state.apply_inbox_notice(&crate::event::InboxNotice {
+                agent_id: Some(agent.to_string()),
+                ..inbox_notice("pane-q", "m-new", Queued)
+            });
+            state.sessions[&card]
+                .card_inbox()
+                .map(|inbox| inbox.pending)
+        };
+        assert_eq!(
+            run(false, "3"),
+            None,
+            "control: under one process another generation's notice is late"
+        );
+        assert_eq!(
+            run(false, "12"),
+            Some(4),
+            "control: under one process the same generation's counts on top"
+        );
+        assert_eq!(
+            run(true, "3"),
+            Some(1),
+            "process B's generation 3 starts the counts over"
+        );
+        assert_eq!(
+            run(true, "12"),
+            Some(1),
+            "process B's reused id 12 starts them over too"
+        );
     }
 
     /// PRD #1666 §2.8 (auditor R9Q-A03): a new agent's surfacing start reaches
