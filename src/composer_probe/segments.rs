@@ -674,6 +674,25 @@ impl Segments {
         Ok(())
     }
 
+    /// A person's Ctrl+G the planner cut from an op the gate let through
+    /// with no fence closed, a liability being out (core §4.3; A1 §3.3: with
+    /// a count above 0 it opens a `HumanG` and isn't native; A-20d-5). It
+    /// waits, unnumbered, behind whatever is still open (a probe whose job
+    /// that op took back ends shortly after), and with nothing open it is the
+    /// front at once, asking for its trigger ([`Front::Trigger`]): the caller
+    /// numbers it with [`Self::next_trigger`], publishes the number and only
+    /// then submits the trigger, the op's bytes through the cut. It carries
+    /// no op: nothing else is cut from that op before its trigger is written.
+    pub fn open_cut(&mut self) -> Result<(), Refusal> {
+        self.live()?;
+        if self.segments.len() >= SEGMENT_CAP {
+            return Err(Refusal::Full);
+        }
+        self.segments
+            .push_back(Segment::new(Kind::HumanG, None, None));
+        Ok(())
+    }
+
     /// A person's Ctrl+G a release reached at the front of the held input
     /// with no segment open (Q35-20): every segment ahead of it has ended,
     /// so it is a `HumanG` whose trigger may be written now, numbered here.

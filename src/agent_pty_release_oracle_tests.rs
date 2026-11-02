@@ -56,10 +56,10 @@
 //! superseded by a retry that completed), a person's Ctrl+G cuts their op
 //! and opens a `HumanG` whose number is published before its trigger write,
 //! the bytes through the candidate (core §4.3, §4.5), the rest held behind
-//! it. Production holds the rest without opening a segment: the release
-//! half of that row is quarantined, and only its authority half
-//! ([`Judged::NothingEarly`]) runs. The generator scripts no phantom until
-//! the release half passes.
+//! it. Both halves run: its authority half ([`Judged::NothingEarly`]) and
+//! its exact half, the release once the `HumanG`'s helper answers. The
+//! generator scripts phantoms too, and a Ctrl+G typed while a liability is
+//! out, so its seeds reach the cut-open row (a floor counts it).
 //!
 //! **A probe byte the PTY fails (O-20.5).** A fixed script per agent makes
 //! the PTY fail a probe's byte, with an error and by taking none of it,
@@ -81,8 +81,8 @@
 //! next, so a race between the observer and a driver pass in flight is found
 //! only where a fixed script forces it. Its floors require a selection of the
 //! release table's tuples ([`ROWS`], 14 when written), each settlement kind
-//! and each kind of generated step (a phantom, a keymap re-read, a mid-pass
-//! step and a lapse retry are the fixed scripts' only), not every combination and not the whole table: no
+//! and each kind of generated step (a keymap re-read, a mid-pass step and a
+//! lapse retry are the fixed scripts' only), not every combination and not the whole table: no
 //! Claude failed-start tuple and no tuple without a decision is required,
 //! and a tuple's key does not tell an ending by a drain or an unknown wait
 //! from a running editor (the cut-off has its own floor). Each is counted
@@ -94,8 +94,7 @@
 //! writer thread reaches its section is not forced), the observer's `/proc`
 //! scan and editor identity, more than one probe in a script beyond Claude's
 //! lapse retry, other Ctrl+G forms and multi-candidate frames (the planner's
-//! own oracle, Q35-16), Codex timing beyond its markers (M-PF1), and the
-//! cut-open path's release half, quarantined (A-20d-5).
+//! own oracle, Q35-16) and Codex timing beyond its markers (M-PF1).
 //! Linux only, as the driver is.
 
 use super::segment_driver::{
@@ -887,6 +886,9 @@ struct Stats {
     passed: usize,
     cut_off: usize,
     completed: usize,
+    /// `HumanG`s a cut opened with a liability out and no segment
+    /// (A-20d-5).
+    cut_opened: usize,
     /// Each row reached, and by how many segments.
     rows: std::collections::BTreeMap<Row, usize>,
     /// Each kind of settlement reached.
@@ -899,6 +901,7 @@ impl Stats {
         self.passed += other.passed;
         self.cut_off += other.cut_off;
         self.completed += other.completed;
+        self.cut_opened += other.cut_opened;
         for (row, n) in &other.rows {
             *self.rows.entry(*row).or_default() += n;
         }
@@ -985,6 +988,7 @@ impl Model {
                 rows: Vec::new(),
             });
             self.held.extend(&bytes[at + 1..]);
+            self.stats.cut_opened += 1;
         } else {
             self.expected.extend(bytes);
         }
@@ -1588,10 +1592,11 @@ fn generate(rng: &mut Rng, model: &mut Model, len: usize) -> Vec<Step> {
             let n = 1 + rng.below(4) as usize;
             let mut bytes: Vec<u8> = (0..n).map(|_| b'a' + rng.below(26) as u8).collect();
             // At most one candidate per frame, and only while the gate holds
-            // (a segment open or typing held): a Ctrl+G typed with nothing
-            // out is native and written whole (the model's first
-            // correction), which this generator doesn't script.
-            if model.fenced() && rng.chance(50) {
+            // (a segment open or typing held) or a liability is out (the
+            // cut-open path, A-20d-5): a Ctrl+G typed with nothing out is
+            // native and written whole (the model's first correction),
+            // which this generator doesn't script.
+            if (model.fenced() || model.liability > 0) && rng.chance(50) {
                 let at = rng.below(n as u64 + 1) as usize;
                 bytes.insert(at, CTRL_G);
             }
@@ -1685,6 +1690,10 @@ fn generate(rng: &mut Rng, model: &mut Model, len: usize) -> Vec<Step> {
                 _ if open.is_empty() => continue,
                 _ => Step::Exit(open[rng.below(open.len() as u64) as usize]),
             }
+        } else if (92..95).contains(&pick) {
+            // A phantom: a liability out with no segment for it (A-20d-5),
+            // so a later Ctrl+G typed with no segment open cuts its op.
+            Step::Phantom
         } else if pick < 95 {
             Step::Out(match rng.below(4) {
                 0 => OFF,
@@ -2013,8 +2022,15 @@ fn assert_reached(reached: &Reached, floor: usize) {
     let r = &reached.stats;
     eprintln!(
         "reached: {} releases, {} passed, {} cut off, {} completions, {} triggers, \
-         {} retirements, settled {:?}",
-        r.released, r.passed, r.cut_off, r.completed, reached.triggers, reached.retired, r.settled
+         {} cut-opened, {} retirements, settled {:?}",
+        r.released,
+        r.passed,
+        r.cut_off,
+        r.completed,
+        reached.triggers,
+        r.cut_opened,
+        reached.retired,
+        r.settled
     );
     for (row, n) in &r.rows {
         eprintln!("  row {row:?}: {n}");
@@ -2037,6 +2053,7 @@ fn assert_reached(reached: &Reached, floor: usize) {
         ("unknown endings cutting a release off", r.cut_off),
         ("completions", r.completed),
         ("triggers", reached.triggers),
+        ("HumanGs a cut opened", r.cut_opened),
         ("retirements", reached.retired),
     ] {
         assert!(n >= floor, "only {n} {what} across the seeds");
@@ -2047,7 +2064,7 @@ fn assert_reached(reached: &Reached, floor: usize) {
     }
 }
 
-/// Scenario: Generate scripts against the release table, one generation each, Claude and Codex: a probe whose fence closes in production's arm section, then typing with and without a Ctrl+G, helpers that read the open segment's number, a stale one or none, decide `Armed` (with the daemon's read of the box, empty or not, or none), `Unarmed` or a tool, run the user's editor, report, and exit, return markers, an agent that answers a trigger before its written report arrives, and retirement, after output that ran before the segments attached. After every step, once the production driver has had its chance, the PTY has taken exactly what the table allows: nothing early, nothing missing, each Ctrl+G alone after its number, nothing after retirement, and the probe's schedule shows how its decision settled exactly when it does. This is the fast tier's share; lane 1 runs a longer one.
+/// Scenario: Generate scripts against the release table, one generation each, Claude and Codex: a probe whose fence closes in production's arm section, then typing with and without a Ctrl+G, a liability raised with no segment for it (a phantom) so that a Ctrl+G typed with no segment open opens a `HumanG` from its cut, helpers that read the open segment's number, a stale one or none, decide `Armed` (with the daemon's read of the box, empty or not, or none), `Unarmed` or a tool, run the user's editor, report, and exit, return markers, an agent that answers a trigger before its written report arrives, and retirement, after output that ran before the segments attached. After every step, once the production driver has had its chance, the PTY has taken exactly what the table allows: nothing early, nothing missing, each Ctrl+G alone after its number, nothing after retirement, and the probe's schedule shows how its decision settled exactly when it does. This is the fast tier's share; lane 1 runs a longer one.
 #[spec("inbox/probe/010")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn probe_010_releases_follow_the_release_table_on_the_production_driver() {
@@ -3421,10 +3438,9 @@ async fn probe_086_a_cut_with_a_liability_out_and_no_segment_releases_nothing_ea
     }
 }
 
-/// Scenario: The scripts of `probe_086_a_cut_with_a_liability_out_and_no_segment_releases_nothing_early`, judged exactly: the Ctrl+G that the cut opens a `HumanG` with is written as the bytes through it, after its number was published, and once that segment's helper decides `Armed` or runs the user's editor, what was held behind it goes on, so nothing stays held for good (core §4.3, §4.5 and §4.6, A-20d-5's release half). Quarantined: production writes that Ctrl+G with no number published and holds the rest behind a fence the release driver never opens.
+/// Scenario: The scripts of `probe_086_a_cut_with_a_liability_out_and_no_segment_releases_nothing_early`, judged exactly: the Ctrl+G that the cut opens a `HumanG` with is written as the bytes through it, after its number was published, and once that segment's helper decides `Armed` or runs the user's editor, what was held behind it goes on, so nothing stays held for good (core §4.3, §4.5 and §4.6, A-20d-5's release half).
 #[spec("inbox/probe/086")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "quarantined: vfarcic, #1666"]
 async fn probe_086_a_cut_with_a_liability_out_and_no_segment_opens_a_humang() {
     for agent in [Agent::Claude, Agent::Codex] {
         for (what, steps) in cut_open_scripts(agent) {

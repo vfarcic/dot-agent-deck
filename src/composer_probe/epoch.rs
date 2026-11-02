@@ -1804,6 +1804,25 @@ impl GenerationInput {
         self.segment_step(Instant::now(), |seg, _, _| seg.open_held_trigger())
     }
 
+    /// A person's Ctrl+G the planner cut from an op the gate let through
+    /// with no fence closed, a liability being out (A-20d-5): it opens a
+    /// `HumanG`, unnumbered until [`Self::segment_next_trigger`]
+    /// ([`Segments::open_cut`]).
+    pub fn segment_cut(&self) -> Result<(), segments::Refusal> {
+        self.segment_step(Instant::now(), |seg, _, _| seg.open_cut())
+    }
+
+    /// The front `HumanG`'s number, once every segment ahead of it has
+    /// ended: to publish before its trigger is submitted
+    /// ([`Segments::next_trigger`]). `None` when the front isn't an
+    /// unnumbered `HumanG`, or once retired.
+    pub fn segment_next_trigger(&self) -> Option<u64> {
+        self.segment_step(Instant::now(), |seg, _, _| {
+            seg.next_trigger().ok_or(segments::Refusal::NoSegment)
+        })
+        .ok()
+    }
+
     fn segment_step<T>(
         &self,
         now: Instant,

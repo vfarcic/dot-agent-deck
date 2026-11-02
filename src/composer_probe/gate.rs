@@ -53,7 +53,10 @@
 //! ([`Gate::release_cut`]): the prefix through it is written, and the
 //! candidate opens the next segment, the fence staying closed behind it with
 //! the rest held in order. An op the gate lets through with no fence, cut
-//! because a liability is out, closes one at its cut ([`Gate::cut_open`]).
+//! because a liability is out, closes one: on a generation with segments,
+//! holding the op whole for the release driver to write its trigger once
+//! the `HumanG` it opens is numbered and published ([`Gate::cut_hold`],
+//! A-20d-5); with none, at its cut ([`Gate::cut_open`]).
 //! Each cut makes one more sub-op, held in the queue's place of the op, so
 //! sub-ops count against [`FENCE_OPS_CAP`] as the op did, and a frame full of
 //! candidates is split one cut at a time.
@@ -159,9 +162,10 @@ struct Fence<T> {
     held_bytes: usize,
     /// When its held queue last went from empty to holding.
     since: Option<std::time::Instant>,
-    /// A probe's arm section closed it (Q35-20): the segments' release
-    /// driver owns its opening. A fence closed any other way isn't the
-    /// driver's to open.
+    /// A probe's arm section closed it (Q35-20), or a cut on a generation
+    /// with segments did ([`Gate::cut_hold`], A-20d-5): the segments'
+    /// release driver owns its opening. A fence closed any other way isn't
+    /// the driver's to open.
     segmented: bool,
 }
 
@@ -497,8 +501,9 @@ impl<T> Gate<T> {
         out
     }
 
-    /// Whether a probe's arm section closed the fence that is closed now
-    /// (Q35-20): only such a fence is the segments' to open.
+    /// Whether a probe's arm section, or a cut on a generation with
+    /// segments ([`Self::cut_hold`]), closed the fence that is closed now
+    /// (Q35-20, A-20d-5): only such a fence is the segments' to open.
     pub fn segment_fenced(&self) -> bool {
         self.lock().fence.as_ref().is_some_and(|f| f.segmented)
     }
@@ -630,6 +635,38 @@ impl<T> Gate<T> {
         }
         self.moved(&mut inner);
         Ok(out)
+    }
+
+    /// [`Self::cut_open`] for a generation whose segments own the cut
+    /// (A-20d-5, core §4.3 and §4.5): nothing of `op` comes back here. The
+    /// fence closes at `trigger`, segmented, holding `op` whole, so its
+    /// trigger write (the bytes through the cut) is the release driver's to
+    /// submit once the `HumanG` the cut opens is numbered and its number
+    /// published, and the rest stays held behind that segment. `Ok(true)`
+    /// when this closed the fence; `Ok(false)` when a fence was closed since
+    /// the op was let through, which it joins, held whole, as
+    /// [`Self::cut_open`] joins it, opening no segment of its own. `Err(op)`
+    /// once retired.
+    pub fn cut_hold(&self, op: T, len: usize, trigger: u64) -> Result<bool, T> {
+        let mut inner = self.lock();
+        if inner.retired {
+            return Err(op);
+        }
+        let opened = inner.fence.is_none();
+        let fence = inner.fence.get_or_insert(Fence {
+            trigger,
+            held: VecDeque::new(),
+            held_bytes: 0,
+            since: None,
+            segmented: true,
+        });
+        if fence.held.is_empty() {
+            fence.since = Some(std::time::Instant::now());
+        }
+        fence.held_bytes += len;
+        fence.held.push_back((op, len));
+        self.moved(&mut inner);
+        Ok(opened)
     }
 
     /// Take `fence`'s held ops, in order, through the first one `split`

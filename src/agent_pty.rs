@@ -5430,16 +5430,53 @@ impl PaneWriter {
 
     /// PRD #1666 part 3 (Q35-16, core §4.3): a frame the gate let through
     /// whose planner cut it, a liability being out: it is accepted, its epoch
-    /// moved, and the gate now owns it, as it owns a held frame. The prefix
-    /// through its cut is submitted, as a release submits, and the rest is
-    /// held behind the segment its Ctrl+G candidate opens. Its connection
-    /// reads on, and hears of a refusal or a failed write as a released
-    /// frame's does.
+    /// moved, and the gate now owns it, as it owns a held frame. Its
+    /// connection reads on, and hears of a refusal or a failed write as a
+    /// released frame's does.
+    ///
+    /// **With segments attached (A-20d-5; core §4.3, §4.5, §4.6; A1 §3.3).**
+    /// The Ctrl+G candidate opens a `HumanG`: the gate holds the frame whole
+    /// behind a segmented fence, the segment is opened unnumbered, and the
+    /// release driver, woken by the caller's `held_accepted`, numbers it,
+    /// publishes the number and only then submits the trigger, the bytes
+    /// through the cut, alone; the rest stays held behind that segment until
+    /// its matched helper's row releases it. Nothing of the frame reaches the
+    /// writer from here, so no trigger goes before its number. If the segment
+    /// can't be opened (the generation retired under the call), the fence is
+    /// still the driver's: with no segment open it writes what precedes the
+    /// candidate, then the candidate alone after its own number, or
+    /// retirement refuses it all. A fence closed since the frame was let
+    /// through (a probe's arm section that started before the take-back)
+    /// takes it whole and opens nothing.
+    ///
+    /// **With none** (no release driver runs for such a generation, so
+    /// nothing would number and write a held trigger), the prefix through
+    /// the cut is submitted, as a release submits, and the rest is held
+    /// behind the fence it closes.
     fn hold_cut(&self, frame: UserFrame, len: usize) {
         let in_flight = &self.pty.in_flight;
         // In flight from acceptance, as a held frame is.
         in_flight.count.fetch_add(1, Ordering::SeqCst);
         let trigger = self.pty.input.output_offset();
+        if self.pty.input.has_segments() {
+            match self.gate.gate.cut_hold(frame, len, trigger) {
+                Ok(true) => {
+                    if let Err(refusal) = self.pty.input.segment_cut() {
+                        tracing::debug!(
+                            target: "composer_probe",
+                            ?refusal,
+                            "a cut's HumanG wasn't opened; the driver writes its candidate alone"
+                        );
+                    }
+                }
+                Ok(false) => {}
+                Err(frame) => {
+                    frame.refuse_accepted("exited");
+                    in_flight.leave();
+                }
+            }
+            return;
+        }
         let split = |frame: &mut UserFrame| {
             let cutting = frame.split();
             if matches!(cutting, crate::composer_probe::gate::Cutting::Split(..)) {

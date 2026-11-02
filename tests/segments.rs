@@ -1351,6 +1351,30 @@ fn probe_009_an_unnumbered_ctrl_g_at_the_front_asks_for_its_trigger() {
     );
 }
 
+/// Scenario: For Claude and Codex, open a `HumanG` from a person's cut Ctrl+G with nothing open: it is the front at once, asking for its trigger, and numbered it holds. Then open one behind a probe that is still open: it waits unnumbered, the front holding, until the probe's trigger is withdrawn, after which it asks for its trigger and takes the next number (A-20d-5).
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_a_cut_ctrl_g_opens_a_humang_that_asks_for_its_trigger() {
+    for agent in [Agent::Claude, Agent::Codex] {
+        let mut t = T::new(agent, HOLD);
+        t.s.open_cut().unwrap();
+        assert_eq!(t.s.front(), Front::Trigger, "{agent:?}: alone, it asks");
+        assert_eq!(t.s.next_trigger(), Some(1), "{agent:?}");
+        assert_eq!(t.s.front(), Front::Held, "{agent:?}: numbered, it holds");
+        assert_eq!(t.s.next_trigger(), None, "{agent:?}: numbered once");
+
+        let mut t = T::new(agent, HOLD);
+        let n = t.probe(0);
+        t.s.open_cut().unwrap();
+        assert_eq!(t.s.front(), Front::Held, "{agent:?}: behind the probe");
+        assert_eq!(t.s.next_trigger(), None, "{agent:?}: the probe is open");
+        t.s.withdrawn(n).unwrap();
+        assert_eq!(t.ended(), [(Some(n), Kind::Probe, Outcome::TakenBack)]);
+        assert_eq!(t.s.front(), Front::Trigger, "{agent:?}: now it asks");
+        assert_eq!(t.s.next_trigger(), Some(n + 1), "{agent:?}");
+    }
+}
+
 /// Scenario: On Claude, open a probe, write it and let its own helper decide `Armed`. The decided probe is handed to the epoch's settlement once; handing it back for probe numbers it does not carry changes nothing, and handing it back by its own number hands it out once more.
 #[spec("inbox/probe/009")]
 #[test]
