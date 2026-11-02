@@ -584,7 +584,11 @@ pub struct Segments {
     /// applied at match time, one report later. The observer's report
     /// carries the editor's pin ([`EditorPin`]), and the early release asks
     /// it, under this lock, whether that process still runs: one that
-    /// exited before the release is decided releases nothing early. An
+    /// exited before the release is decided releases nothing early, and its
+    /// segment is held until the generation retires under `Hold`
+    /// (production's policy, which completes no editor-bearing segment) or,
+    /// under `Authority`, until its helper's completion (the revb21
+    /// review's U2-1). An
     /// editor that exits after the release was decided still leaves the
     /// segment `Released` until its helper's drain shows how it ended
     /// (R-U2-06's cut-off). A report with no check (tests only) is taken
@@ -1234,9 +1238,11 @@ fn early_release(agent: Agent, seg: &Segment, r: &Record) -> bool {
         (Agent::Claude, Kind::HumanG, Some(Decision::Armed)) => true,
         // A-20d-6, option (a): released to the user's editor only while
         // the editor pinned for it still runs; one that already exited is
-        // gone, and the segment waits for its helper's completion as one
-        // whose editor never ran (fail closed: typing held longer, never
-        // handed to an editor that isn't there).
+        // gone, and the segment is held as one whose editor never ran:
+        // under `Hold` (production's `EC_POLICY`) until the generation
+        // retires, since `Hold` completes no editor-bearing segment, and
+        // under `Authority` until its helper's completion (fail closed:
+        // typing held longer, never handed to an editor that isn't there).
         (_, Kind::HumanG, Some(Decision::Unarmed)) => {
             seg.editor_running && seg.editor.as_ref().is_none_or(EditorPin::running)
         }
