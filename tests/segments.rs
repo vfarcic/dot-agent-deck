@@ -1321,3 +1321,68 @@ fn probe_058_hold_completes_nothing_by_ec() {
         "the policy refuses before the route's own checks"
     );
 }
+
+/// Scenario: On Codex, open a probe and hold a person's Ctrl+G behind it. While the probe is outstanding the front holds; once the probe completes at E1F the unnumbered Ctrl+G at the front asks for its trigger, and once it is numbered it holds again until its own segment releases.
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_an_unnumbered_ctrl_g_at_the_front_asks_for_its_trigger() {
+    let mut t = T::new(Agent::Codex, HOLD);
+    assert_eq!(t.s.front(), Front::None);
+    let n = t.probe(0);
+    t.s.open_human_g(40).unwrap();
+    assert_eq!(t.s.front(), Front::Held, "the probe is outstanding");
+    t.write(n, 1);
+    t.ipc(1, Decision::Armed, n, 5);
+    t.out(OFF, 6);
+    t.exit(1, 7);
+    t.out(ON, 8);
+    t.out(FRAME, 9);
+    assert_eq!(t.written(), [Some(n)]);
+    assert_eq!(
+        t.s.front(),
+        Front::Trigger,
+        "the Ctrl+G behind the completed probe asks for its trigger"
+    );
+    assert_eq!(t.s.next_trigger(), Some(2));
+    assert_eq!(
+        t.s.front(),
+        Front::Held,
+        "numbered, it holds until it releases"
+    );
+}
+
+/// Scenario: On Claude, open a probe, write it and let its own helper decide `Armed`. The decided probe is handed to the epoch's settlement once; handing it back for probe numbers it does not carry changes nothing, and handing it back by its own number hands it out once more.
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_a_decided_probe_is_handed_out_once_until_handed_back() {
+    let mut t = T::new(Agent::Claude, AUTH);
+    let n = t.probe(0);
+    t.s.open_human_g(40).unwrap();
+    t.write(n, 1);
+    assert!(
+        t.s.take_decided_probes(&t.r).is_empty(),
+        "nothing decided yet"
+    );
+    t.ipc(1, Decision::Armed, n, 5);
+    assert_eq!(
+        t.s.take_decided_probes(&t.r),
+        [(n, key(1), Decision::Armed)]
+    );
+    assert!(t.s.take_decided_probes(&t.r).is_empty(), "once");
+    t.s.undecide(n + 1);
+    t.s.undecide(n + 100);
+    assert!(
+        t.s.take_decided_probes(&t.r).is_empty(),
+        "another number hands back nothing"
+    );
+    t.s.undecide(n);
+    assert_eq!(
+        t.s.take_decided_probes(&t.r),
+        [(n, key(1), Decision::Armed)],
+        "handed back, it is handed out again"
+    );
+    assert!(
+        t.s.take_decided_probes(&t.r).is_empty(),
+        "and once more only"
+    );
+}

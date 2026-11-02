@@ -469,3 +469,29 @@ fn probe_004_the_hook_feeds_the_tracker() {
     hook.on_output(b"\x1bc");
     assert!(!hook.paste_mode().on());
 }
+
+/// Scenario: Give the output hook an observer's bell, then feed it output through `OutputHook::on_output`: text, bracketed paste turned on, then turned off (once whole, once split over two calls, once among other modes). Only the output that turns bracketed paste off asks the observer for a child scan, once for each time it is turned off.
+#[spec("inbox/probe/069")]
+#[test]
+fn probe_069_output_turning_bracketed_paste_off_rings_for_a_scan() {
+    use std::sync::Arc;
+
+    use dot_agent_deck::composer_probe::observe::Bell;
+
+    let mut hook = OutputHook::default();
+    let bell = Arc::new(Bell::default());
+    assert!(hook.bell_slot().set(Arc::clone(&bell)).is_ok());
+    hook.on_output(b"text\x1b[?2004h more text");
+    assert!(!bell.take_scan(), "no scan for text or paste turned on");
+    hook.on_output(b"\x1b[?2004l");
+    assert!(bell.take_scan(), "paste turned off asks for a scan");
+    assert!(!bell.take_scan(), "once");
+    hook.on_output(b"\x1b[?2004h\x1b[?20");
+    assert!(!bell.take_scan(), "not before the sequence ends");
+    hook.on_output(b"04l");
+    assert!(bell.take_scan(), "a split sequence rings when it ends");
+    hook.on_output(b"\x1b[?1;2004l");
+    assert!(bell.take_scan(), "among other modes");
+    hook.on_output(b"\x1b[?1l\x1b[?2026l");
+    assert!(!bell.take_scan(), "other modes turned off ask for nothing");
+}

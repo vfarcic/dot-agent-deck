@@ -278,3 +278,65 @@ async fn probe_082_a_held_answer_is_not_reported_as_held_typing() {
     );
     registry.shutdown_all();
 }
+
+/// Scenario: A person types on another pane, then generation A is stopped on this pane while holding typed keys, B is spawned onto the pane and exits holding nothing, and C takes the pane. C's card still reports A's typing: a keystroke elsewhere is not a keystroke on this pane, so the later retirements do not prune the notice (R-E-U3-02).
+#[spec("inbox/probe/082")]
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_082_a_keystroke_elsewhere_does_not_end_the_notice() {
+    let registry = Arc::new(AgentPtyRegistry::new());
+    let pane = "probe-082-elsewhere-first";
+    registry.note_user_input("probe-082-another-pane");
+    let a = spawn_exited(&registry, pane).await;
+    hold_typing(&registry, &a, b"A-TYPED");
+    registry.close_agent(&a).expect("stop A");
+    let generation: u64 = a.parse().unwrap();
+    let b = spawn_exited(&registry, pane).await;
+    assert_eq!(
+        registry.input_discarded(&b).map(|d| d.generation),
+        Some(generation),
+        "precondition: B shows A's notice"
+    );
+    let c = registry
+        .spawn_agent(opts(pane, "/bin/sh"))
+        .expect("C takes the pane");
+    assert_eq!(
+        registry.input_discarded(&c).map(|d| d.generation),
+        Some(generation),
+        "no keystroke on this pane yet, so A's notice stands"
+    );
+    registry.note_user_input(pane);
+    assert_eq!(
+        registry.input_discarded(&c),
+        None,
+        "a keystroke here ends it"
+    );
+    registry.shutdown_all();
+}
+
+/// Scenario: Generation A exits holding typed keys and B takes the pane, so B's card says A's typing wasn't delivered; with no keystroke since, B too exits holding typed keys and C takes the pane. C's card reports B's typing: a newer retirement's notice replaces an older one's (R-E-U2-01).
+#[spec("inbox/probe/082")]
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_082_a_newer_retirement_replaces_the_older_notice() {
+    let registry = Arc::new(AgentPtyRegistry::new());
+    let pane = "probe-082-newer-replaces";
+    let a = spawn_exited(&registry, pane).await;
+    hold_typing(&registry, &a, b"A-TYPED");
+    let b = spawn_exited(&registry, pane).await;
+    assert_eq!(
+        registry.input_discarded(&b).map(|d| d.generation),
+        Some(a.parse().unwrap()),
+        "precondition: B shows A's notice"
+    );
+    hold_typing(&registry, &b, b"B-TYPED-MORE");
+    let c = registry
+        .spawn_agent(opts(pane, "/bin/sh"))
+        .expect("C takes the pane");
+    assert_eq!(
+        registry
+            .input_discarded(&c)
+            .map(|d| (d.generation, d.held_bytes)),
+        Some((b.parse().unwrap(), 12)),
+        "C's card reports B's typing, the newer retirement's"
+    );
+    registry.shutdown_all();
+}

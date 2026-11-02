@@ -619,3 +619,81 @@ fn probe_081_another_process_account_rejects_no_new_word() {
         "another process's generation 12 does not reject the new process's generation 3"
     );
 }
+
+/// Scenario: A pane's agent ids name no generation number, so their order is unknown. Its first agent hands the pane to a second, whose live update says typing is held; then the first agent's late update says its hold ended. The second agent's card keeps showing the hold: a retired agent's word is rejected by its retirement alone.
+#[spec("inbox/probe/081")]
+#[test]
+fn probe_081_a_retired_agents_late_word_is_rejected_without_a_generation_order() {
+    let checking = words()["inputHeld"]["checking"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut state = hydrated("first", record("first", None));
+    let successor = session("second");
+    state
+        .sessions
+        .insert(successor.session_id.clone(), successor);
+    state.apply_inbox_handover(&InboxHandover {
+        pane_id: PANE.into(),
+        agent_id: "second".into(),
+        summary: record("second", None).inbox.unwrap(),
+    });
+    state.apply_input_held_update(&InputHeldUpdate {
+        pane_id: PANE.into(),
+        agent_id: "second".into(),
+        input_held: Some(InputHeld {
+            generation: 7,
+            cause: InputHeldCause::Checking,
+            held_ops: 2,
+            held_bytes: 12,
+            since_ms: 1_767_225_600_000,
+        }),
+        input_discarded: None,
+    });
+    assert_eq!(
+        card(&state, "second").input_held_notice(),
+        Some(checking.as_str())
+    );
+    state.apply_input_held_update(&InputHeldUpdate {
+        pane_id: PANE.into(),
+        agent_id: "first".into(),
+        input_held: None,
+        input_discarded: None,
+    });
+    assert_eq!(
+        card(&state, "second").input_held_notice(),
+        Some(checking.as_str()),
+        "the retired agent's word changes nothing"
+    );
+}
+
+/// Scenario: For a pane this client does not manage and holds no inbox account for, deliver generation 42's held-typing update, then a late one from generation 41, then the account for generation 42. The card shows 42's hold: the kept word is 42's, and the older generation's late word did not replace it.
+#[spec("inbox/probe/081")]
+#[test]
+fn probe_081_a_kept_word_is_not_replaced_by_an_older_generations() {
+    let checking = words()["inputHeld"]["checking"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut state = AppState::default();
+    let card42 = session("42");
+    state.sessions.insert(card42.session_id.clone(), card42);
+    state.apply_input_held_update(&InputHeldUpdate {
+        pane_id: PANE.into(),
+        agent_id: "42".into(),
+        input_held: Some(held("42", InputHeldCause::Checking)),
+        input_discarded: None,
+    });
+    state.apply_input_held_update(&InputHeldUpdate {
+        pane_id: PANE.into(),
+        agent_id: "41".into(),
+        input_held: Some(held("41", InputHeldCause::QueueFull)),
+        input_discarded: None,
+    });
+    state.apply_inbox_summary(PANE, "42", &record("42", None).inbox.unwrap());
+    assert_eq!(
+        card(&state, "42").input_held_notice(),
+        Some(checking.as_str()),
+        "the account takes 42's kept word"
+    );
+}

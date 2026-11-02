@@ -1817,6 +1817,94 @@ mod tests {
         );
     }
 
+    /// Scenario: A Claude lapse retry was scheduled while the gate looked open. When the writer comes to its arm section the gate's fence is closed: with nothing held behind the lapsed probe the writer reads it as the lapsed fence, with input held behind it as a closed one, and with the fence open as open; a first probe reads a closed fence as closed whatever is held. The retry's lapsed epoch is the scheduled one plus the retry's own byte.
+    #[cfg(target_os = "linux")]
+    #[spec("inbox/probe/059")]
+    #[test]
+    fn probe_059_the_writer_reads_the_fence_from_the_gate_at_its_arm() {
+        use crate::composer_probe::admission::{Attempt, Fence, Outside};
+        use crate::composer_probe::gate::Status;
+        use crate::composer_probe::planner::Boundary;
+        let lapse = Outside {
+            attempt: Attempt::Lapse { lapsed_e0: 7 },
+            permission: crate::composer_probe::Permission::Armable,
+            fence: Fence::Open,
+            human_ticket: false,
+            boundary: Boundary::Ground,
+            keymap: Ok(()),
+            surface: true,
+        };
+        let first = Outside {
+            attempt: Attempt::First,
+            ..lapse
+        };
+        let ctx = crate::doorbell_txn::StartCtx {
+            boundary: Boundary::Ground,
+            retired: false,
+            now: Instant::now(),
+        };
+        let gate = |fenced: bool, held_ops: usize| Status {
+            fenced,
+            held_ops,
+            held_bytes: held_ops,
+            ..Status::default()
+        };
+        let read = |scheduled: Outside, status: Status| {
+            let out = writer_outside(scheduled, &ctx, status, false, true);
+            (out.attempt, out.fence)
+        };
+        let retried = Attempt::Lapse { lapsed_e0: 8 };
+        assert_eq!(read(lapse, gate(true, 0)), (retried, Fence::Lapsed));
+        assert_eq!(read(lapse, gate(true, 2)), (retried, Fence::Closed));
+        assert_eq!(read(lapse, gate(false, 0)), (retried, Fence::Open));
+        assert_eq!(read(first, gate(true, 0)), (Attempt::First, Fence::Closed));
+        assert_eq!(read(first, gate(true, 2)), (Attempt::First, Fence::Closed));
+        let closed = Outside {
+            fence: Fence::Closed,
+            ..first
+        };
+        assert_eq!(read(closed, gate(false, 0)), (Attempt::First, Fence::Open));
+    }
+
+    /// Scenario: Run the display watcher over a deck with one pane whose card shows nothing, wake it with a display notice that changes nothing, and wake it again with another 20 seconds later. The repeat still comes 30 seconds after the first notice: a later notice does not push a pending repeat back, so notices arriving more often than every 30 seconds cannot hold the repeat off (auditor U3-8).
+    #[spec("inbox/probe/046")]
+    #[tokio::test(start_paused = true)]
+    async fn probe_046_a_later_notice_does_not_postpone_the_repeat() {
+        use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+        use tokio::sync::broadcast::error::TryRecvError;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let pane = "probe-046-postpone";
+        let agent = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn a generation");
+        let (tx, mut rx) = tokio::sync::broadcast::channel(64);
+        let watcher = tokio::spawn(watch_input_held(Arc::clone(&registry), tx));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        registry.held_display().notify_one();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let later = Duration::from_secs(20);
+        tokio::time::sleep(later).await;
+        registry.held_display().notify_one();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "unchanged passes send nothing"
+        );
+        tokio::time::sleep(HELD_REPEAT_AFTER - later).await;
+        match rx.try_recv() {
+            Ok(crate::event::BroadcastMsg::InputHeld(update)) => {
+                assert_eq!((update.pane_id, update.agent_id), (pane.to_string(), agent));
+            }
+            other => panic!("the repeat is due 30 seconds after the first notice: {other:?}"),
+        }
+        watcher.abort();
+        registry.shutdown_all();
+    }
+
     /// A Claude Code frame at `cols`: the full-width rules around an empty
     /// composer, after Claude Code's full-redraw marker.
     #[cfg(target_os = "linux")]

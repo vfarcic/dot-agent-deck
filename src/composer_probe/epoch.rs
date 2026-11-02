@@ -2273,4 +2273,82 @@ mod tests {
         settle_undecided(&control, number);
         assert_eq!(failures(&control), 1, "an unlapsed probe's failure counts");
     }
+
+    /// Scenario: A probe's helper decides `Armed` and the daemon reads its export empty. When the helper's claim on the composer is the deck's own, or no claim is known, the empty read settles the box empty and the next attempt is due at once; when the claim is a tool's, the read is not the deck's to apply, so the box reads non-empty and the next attempt waits.
+    #[spec("inbox/probe/030")]
+    #[test]
+    fn probe_030_an_armed_empty_read_settles_empty_only_on_the_decks_own_claim() {
+        use crate::composer_probe::query_ledger::HazardFifo;
+        use crate::composer_probe::record::{
+            Attribution, Channel, Claim, EcPolicy, Observation, RecordKey, Records,
+        };
+        let now = Instant::now();
+        let key = RecordKey {
+            pid: 4343,
+            start: 1,
+        };
+        let settled = |claim: Option<Claim>| {
+            let input = GenerationInput::default();
+            assert!(input.attach_records(Records::new(5, EcPolicy::Hold, now)));
+            assert!(input.attach_segments(5, segments::Agent::Claude));
+            let (number, _) = input.segment_open_probe(false, now).unwrap();
+            input.segment_written(number, 0, now, now).unwrap();
+            {
+                let mut guard = input.state.lock_recovering();
+                let records = guard.records.as_mut().unwrap();
+                records.raise(5, now).unwrap();
+                records
+                    .observe(
+                        &mut HazardFifo::default(),
+                        &Observation {
+                            generation: 5,
+                            key,
+                            channel: Channel::Ipc,
+                            attribution: Attribution::Owned,
+                            claim,
+                            decision: Some(Decision::Armed),
+                            seg_seen: Some(number),
+                            native_seen: None,
+                            birth_floor: now,
+                        },
+                        now,
+                    )
+                    .unwrap();
+                assert_eq!(records.get(key).unwrap().claim, claim, "{claim:?}");
+            }
+            input.note_read(key, true);
+            // A failure first, so that only an empty settlement makes the
+            // next attempt due at once.
+            input.probe_failed(now);
+            assert!(!input.probe_due(now));
+            let mut guard = input.state.lock_recovering();
+            let State {
+                live,
+                records,
+                epoch,
+                ..
+            } = &mut *guard;
+            live.as_mut().unwrap().settle_probe(
+                epoch,
+                records.as_ref().unwrap(),
+                (number, key, Some(Decision::Armed)),
+                now,
+            );
+            drop(guard);
+            input.probe_due(now)
+        };
+        assert!(
+            settled(Some(Claim::Owned)),
+            "the deck's own claim reads empty"
+        );
+        assert!(settled(None), "no claim known reads empty");
+        assert!(
+            !settled(Some(Claim::Tool)),
+            "a tool's claim reads non-empty"
+        );
+        assert!(
+            !settled(Some(Claim::Unknown)),
+            "an unknown claim reads non-empty"
+        );
+    }
 }
