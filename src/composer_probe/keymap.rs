@@ -819,9 +819,10 @@ impl KeymapBaseline {
 
     /// Codex's spawn baseline, when the bound agent launched with the same
     /// sources ([`CodexBaseline::bound`]): its arguments `args` after the
-    /// program (`None` when they couldn't be read, taken as none), its
-    /// working directory `cwd` and the home `env` names. No home or no
-    /// `cwd` holds as unmeasured.
+    /// program, its working directory `cwd` and the home `env` names. No
+    /// home, no `cwd`, or arguments that couldn't be read (`None`: an
+    /// unreadable or over-long command line, which may carry a `-c`
+    /// override the deck never saw) hold as unmeasured.
     pub fn codex_bound(
         &self,
         env: impl Fn(&str) -> Option<OsString>,
@@ -829,12 +830,10 @@ impl KeymapBaseline {
         cwd: Option<&Path>,
     ) -> Result<&CodexBaseline, Hold> {
         let codex = self.codex.as_ref().map_err(|hold| *hold)?;
-        let (Some(home), Some(cwd)) = (codex_home(env), cwd) else {
+        let (Some(home), Some(args), Some(cwd)) = (codex_home(env), args, cwd) else {
             return Err(Hold::Unmeasured);
         };
-        codex
-            .bound(&home, args.unwrap_or_default(), cwd)
-            .map(|()| codex)
+        codex.bound(&home, args, cwd).map(|()| codex)
     }
 }
 

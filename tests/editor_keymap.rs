@@ -1025,3 +1025,24 @@ fn probe_014_codex_launches_are_compared_with_the_spawns_baseline() {
         "a project file changed since the spawn"
     );
 }
+
+/// Scenario: Take a generation's key-binding baseline before a Codex spawn, then compare it with what the deck read of the bound agent's launch. The same flags, cwd and home match; a bound agent whose arguments couldn't be read (unreadable, or a command line over the deck's bound) holds as unmeasured rather than counting as no arguments, so an override the deck never saw can't pass (the reva21 review's U2-2).
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_an_unread_bound_codex_argv_holds() {
+    use dot_agent_deck::composer_probe::keymap::KeymapBaseline;
+    let dir = test_temp::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let cwd = dir.path().join("repo");
+    for d in [&home, &cwd] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let env = |name: &str| (name == "HOME").then(|| home.clone().into_os_string());
+    let baseline = KeymapBaseline::at_spawn(false, true, env, &[], &cwd);
+    assert!(baseline.codex_bound(env, Some(&[]), Some(&cwd)).is_ok());
+    assert_eq!(
+        baseline.codex_bound(env, None, Some(&cwd)).err(),
+        Some(Hold::Unmeasured),
+        "an unread argv is not an empty one"
+    );
+}

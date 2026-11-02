@@ -2239,8 +2239,9 @@ mod linux {
         /// launched with the same ones: its own arguments `args` (a direct
         /// Codex's `-c` overrides and profile are on its argv), its own
         /// working directory `cwd` for the project files, and the same
-        /// home; otherwise it holds as changed. No baseline, or no `cwd` for
-        /// Codex, holds as unmeasured.
+        /// home; otherwise it holds as changed. No baseline, or for Codex no
+        /// `cwd` or arguments it couldn't read (`args` is `None`), holds as
+        /// unmeasured.
         fn keymap_evidence(
             &self,
             agent: &AgentType,
