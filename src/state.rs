@@ -21307,7 +21307,9 @@ mod tests {
     /// daemon process A. The stream moves to process B, whose ids start over;
     /// B's generation reports on the pane, and a notice of B's queues a
     /// message before any account of B's reaches it. B's card counts that one
-    /// message, whether B's generation has another id or reuses 12. Controls,
+    /// message, whether B's generation has another id or reuses 12, and a
+    /// second notice of B's counts on top: the account is B's from the first
+    /// one on, so the counts start over only once. Controls,
     /// under one process: another generation's notice is late and changes
     /// nothing, and the same generation's counts on top of its account.
     #[test]
@@ -21330,33 +21332,35 @@ mod tests {
                 agent_id: Some(agent.to_string()),
                 ..quota_event(EventType::SessionStart, 1)
             });
-            state.apply_inbox_notice(&crate::event::InboxNotice {
-                agent_id: Some(agent.to_string()),
-                ..inbox_notice("pane-q", "m-new", Queued)
-            });
-            state.sessions[&card]
-                .card_inbox()
-                .map(|inbox| inbox.pending)
+            ["m-new", "m-new2"].map(|message| {
+                state.apply_inbox_notice(&crate::event::InboxNotice {
+                    agent_id: Some(agent.to_string()),
+                    ..inbox_notice("pane-q", message, Queued)
+                });
+                state.sessions[&card]
+                    .card_inbox()
+                    .map(|inbox| inbox.pending)
+            })
         };
         assert_eq!(
             run(false, "3"),
-            None,
-            "control: under one process another generation's notice is late"
+            [None, None],
+            "control: under one process another generation's notices are late"
         );
         assert_eq!(
             run(false, "12"),
-            Some(4),
-            "control: under one process the same generation's counts on top"
+            [Some(4), Some(5)],
+            "control: under one process the same generation's count on top"
         );
         assert_eq!(
             run(true, "3"),
-            Some(1),
-            "process B's generation 3 starts the counts over"
+            [Some(1), Some(2)],
+            "process B's generation 3 starts the counts over, once"
         );
         assert_eq!(
             run(true, "12"),
-            Some(1),
-            "process B's reused id 12 starts them over too"
+            [Some(1), Some(2)],
+            "process B's reused id 12 starts them over too, once"
         );
     }
 
