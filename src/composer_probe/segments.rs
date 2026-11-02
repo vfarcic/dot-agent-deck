@@ -467,8 +467,11 @@ impl EditorPin {
         }
     }
 
-    /// `key` with no check of its own.
-    pub fn unchecked(key: RecordKey) -> Self {
+    /// `key` with no check of its own, which [`Self::running`] answers as
+    /// running: for the test-only reports alone
+    /// ([`Segments::editor_pinned_for_test`]), so no production report can
+    /// carry one (the revb21 review's U3-4).
+    fn unchecked(key: RecordKey) -> Self {
         Self { key, running: None }
     }
 
@@ -584,7 +587,11 @@ pub struct Segments {
     /// applied at match time, one report later. The observer's report
     /// carries the editor's pin ([`EditorPin`]), and the early release asks
     /// it, under this lock, whether that process still runs: one that
-    /// exited before the release is decided releases nothing early. An
+    /// exited before the release is decided releases nothing early, and its
+    /// segment is held until the generation retires under `Hold`
+    /// (production's policy, which completes no editor-bearing segment) or,
+    /// under `Authority`, until its helper's completion (the revb21
+    /// review's U2-1). An
     /// editor that exits after the release was decided still leaves the
     /// segment `Released` until its helper's drain shows how it ended
     /// (R-U2-06's cut-off). A report with no check (tests only) is taken
@@ -963,22 +970,30 @@ impl Segments {
         Ok(())
     }
 
-    /// Record `key`'s editor child was observed running an executable other
-    /// than the helper. Whether a segment matched to it took it.
-    pub fn editor_running(
+    /// Tests only: record `key`'s editor child was observed running an
+    /// executable other than the helper, with no check of whether it still
+    /// runs, which an early release then takes as running. Whether a
+    /// segment matched to it took it. The observer reports through
+    /// [`Self::editor_pinned_with`]; the `_for_test` name keeps a
+    /// production caller from reaching for this one (the revb21 review's
+    /// U3-4).
+    #[doc(hidden)]
+    pub fn editor_running_for_test(
         &mut self,
         records: &mut Records,
         fifo: &mut HazardFifo,
         key: RecordKey,
         now: Instant,
     ) -> bool {
-        self.editor_pinned(records, fifo, key, None, now)
+        self.editor_pinned_for_test(records, fifo, key, None, now)
     }
 
-    /// [`Self::editor_running`], with the editor's own identity as the
-    /// observer pinned it (A-20d-6), kept with the segment its record
-    /// matches, now or when it matches later.
-    pub fn editor_pinned(
+    /// Tests only: [`Self::editor_running_for_test`], with the editor's own
+    /// identity as the observer pinned it (A-20d-6), kept with the segment
+    /// its record matches, now or when it matches later; with no check of
+    /// whether it still runs.
+    #[doc(hidden)]
+    pub fn editor_pinned_for_test(
         &mut self,
         records: &mut Records,
         fifo: &mut HazardFifo,
@@ -989,8 +1004,12 @@ impl Segments {
         self.editor_report(records, fifo, key, editor.map(EditorPin::unchecked), now)
     }
 
-    /// [`Self::editor_pinned`], with the observer's check of whether the
-    /// pinned editor still runs, which the release asks (A-20d-6).
+    /// Record `key`'s editor child was observed running an executable other
+    /// than the helper, with its identity as the observer pinned it and the
+    /// observer's check of whether that pinned editor still runs, which the
+    /// release asks (A-20d-6). Kept with the segment its record matches,
+    /// now or when it matches later. Whether a segment matched to it took
+    /// it.
     pub fn editor_pinned_with(
         &mut self,
         records: &mut Records,
@@ -1234,9 +1253,11 @@ fn early_release(agent: Agent, seg: &Segment, r: &Record) -> bool {
         (Agent::Claude, Kind::HumanG, Some(Decision::Armed)) => true,
         // A-20d-6, option (a): released to the user's editor only while
         // the editor pinned for it still runs; one that already exited is
-        // gone, and the segment waits for its helper's completion as one
-        // whose editor never ran (fail closed: typing held longer, never
-        // handed to an editor that isn't there).
+        // gone, and the segment is held as one whose editor never ran:
+        // under `Hold` (production's `EC_POLICY`) until the generation
+        // retires, since `Hold` completes no editor-bearing segment, and
+        // under `Authority` until its helper's completion (fail closed:
+        // typing held longer, never handed to an editor that isn't there).
         (_, Kind::HumanG, Some(Decision::Unarmed)) => {
             seg.editor_running && seg.editor.as_ref().is_none_or(EditorPin::running)
         }

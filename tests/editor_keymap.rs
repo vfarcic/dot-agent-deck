@@ -1047,7 +1047,7 @@ fn probe_014_an_unread_bound_codex_argv_holds() {
     );
 }
 
-/// Scenario: Take a generation's key-binding baseline before its spawn with the spawn's `HOME`, then compare it with the bound agent's own environment, as a command that sets its own variables (`CODEX_HOME=/x codex`, `HOME=/y claude`) leaves it. The same `HOME` matches for both agents, and so does a `CODEX_HOME` naming the home the spawn's `HOME` already gave Codex (the deck's wrapper pins it so); another `HOME` or `CODEX_HOME` holds as changed, and a `CLAUDE_CONFIG_DIR` as unmeasured. An environment that lists one of these names twice with different values holds as unmeasured (the reva21 review's U1-1).
+/// Scenario: Take a generation's key-binding baseline before its spawn with the spawn's `HOME`, then compare it with the bound agent's own environment, as a command that sets its own variables (`CODEX_HOME=/x codex`, `HOME=/y claude`) leaves it. The same `HOME` matches for both agents, and so does a `CODEX_HOME` naming the home the spawn's `HOME` already gave Codex (the deck's wrapper pins it so); another `HOME` or `CODEX_HOME` holds as changed, and a `CLAUDE_CONFIG_DIR` as unmeasured. An environment that lists one of these names twice with different values holds as unmeasured (the reva21 review's U1-1), and so does an empty or relative `CODEX_HOME` or `HOME` for Codex, even when the spawn and the agent carry the same one (the revb21 review's U1-1b).
 #[spec("inbox/probe/014")]
 #[test]
 fn probe_014_the_bound_agents_environment_is_compared_with_the_spawns() {
@@ -1105,4 +1105,37 @@ fn probe_014_the_bound_agents_environment_is_compared_with_the_spawns() {
         environ_lookup(&same).unwrap()("HOME"),
         Some(home.clone().into_os_string())
     );
+
+    // An empty or relative home, the same at spawn and bound (the revb21
+    // review's U1-1b): two equal strings, while Codex reads `~/.codex` or
+    // resolves the relative path itself, so the deck's read can't be the
+    // file Codex loads. `HOME=""` is also what an environ entry `HOME`
+    // with no `=` reads as.
+    let both = |pairs: &[(&str, &str)]| {
+        let environ: Vec<(OsString, OsString)> = pairs
+            .iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+            .collect();
+        let env = environ_lookup(&environ).unwrap();
+        let baseline = KeymapBaseline::at_spawn(false, true, &env, &[], &cwd);
+        baseline
+            .codex_bound(&env, Some(&[]), Some(&cwd))
+            .map(|_| ())
+    };
+    let home_str = home.to_str().unwrap();
+    for (row, pairs) in [
+        (
+            "CODEX_HOME=\"\"",
+            &[("HOME", home_str), ("CODEX_HOME", "")][..],
+        ),
+        (
+            "CODEX_HOME=rel",
+            &[("HOME", home_str), ("CODEX_HOME", "rel")][..],
+        ),
+        ("HOME=\"\"", &[("HOME", "")][..]),
+        ("HOME=rel", &[("HOME", "rel")][..]),
+    ] {
+        assert_eq!(both(pairs), Err(Hold::Unmeasured), "{row} on both sides");
+    }
+    assert_eq!(both(&[("HOME", home_str)]), Ok(()), "the control");
 }

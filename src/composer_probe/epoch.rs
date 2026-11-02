@@ -1754,15 +1754,19 @@ impl GenerationInput {
     }
 
     /// Record `key`'s editor child was observed running an executable other
-    /// than the helper (core §4.6's `HumanG/Unarmed` row).
+    /// than the helper (core §4.6's `HumanG/Unarmed` row), with no check of
+    /// whether it still runs: tests only (the revb21 review's U3-4).
+    #[cfg(test)]
     pub fn segment_editor_running(&self, key: RecordKey, now: Instant) -> bool {
         self.segment_editor_pinned(key, None, now)
     }
 
     /// [`Self::segment_editor_running`] with the editor's identity as the
     /// observer pinned it, `(pid, start)` (A-20d-6): kept with the segment
-    /// its record matches, and shown in its [`segments::View`], so a
-    /// release can ask whether that same process still runs.
+    /// its record matches, and shown in its [`segments::View`]. Tests
+    /// only, with no check of whether it still runs; the observer reports
+    /// through [`Self::segment_editor_pinned_with`].
+    #[cfg(test)]
     pub fn segment_editor_pinned(
         &self,
         key: RecordKey,
@@ -1770,14 +1774,18 @@ impl GenerationInput {
         now: Instant,
     ) -> bool {
         self.segment_step(now, |seg, records, fifo| {
-            Ok(seg.editor_pinned(records, fifo, key, editor, now))
+            Ok(seg.editor_pinned_for_test(records, fifo, key, editor, now))
         })
         .unwrap_or(false)
     }
 
-    /// [`Self::segment_editor_pinned`] with the observer's check of whether
-    /// the pinned editor still runs, which an early release to it asks
-    /// under this input's lock (A-20d-6): the check must not block.
+    /// Record `key`'s editor child was observed running an executable other
+    /// than the helper (core §4.6's `HumanG/Unarmed` row), with its identity
+    /// as the observer pinned it, `(pid, start)`, kept with the segment its
+    /// record matches and shown in its [`segments::View`], and the
+    /// observer's check of whether the pinned editor still runs, which an
+    /// early release to it asks under this input's lock (A-20d-6): the
+    /// check must not block.
     pub fn segment_editor_pinned_with(
         &self,
         key: RecordKey,

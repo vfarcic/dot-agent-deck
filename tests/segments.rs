@@ -180,7 +180,7 @@ impl T {
 
     fn editor(&mut self, pid: u32, at: u64) -> bool {
         self.s
-            .editor_running(&mut self.r, &mut self.f, key(pid), time(self.t, at))
+            .editor_running_for_test(&mut self.r, &mut self.f, key(pid), time(self.t, at))
     }
 
     fn view(&self, at: u64) -> Vec<View> {
@@ -1407,7 +1407,7 @@ fn probe_009_the_segment_keeps_the_pinned_editors_identity() {
         t.write(g, 5);
         if pinned_first {
             assert!(
-                !t.s.editor_pinned(&mut t.r, &mut t.f, key(2), Some(editor), time(t.t, 5)),
+                !t.s.editor_pinned_for_test(&mut t.r, &mut t.f, key(2), Some(editor), time(t.t, 5)),
                 "no segment has matched its record yet"
             );
         }
@@ -1416,7 +1416,13 @@ fn probe_009_the_segment_keeps_the_pinned_editors_identity() {
             assert_eq!(t.view(6)[0].editor, None, "nothing pinned yet");
             assert!(t.editor(2, 6), "a report with no identity");
             assert_eq!(t.view(6)[0].editor, None, "it names no process");
-            assert!(t.s.editor_pinned(&mut t.r, &mut t.f, key(2), Some(editor), time(t.t, 7)));
+            assert!(t.s.editor_pinned_for_test(
+                &mut t.r,
+                &mut t.f,
+                key(2),
+                Some(editor),
+                time(t.t, 7)
+            ));
         }
         let v = t.view(7);
         assert_eq!(v[0].stage, Stage::Released, "pinned first: {pinned_first}");
@@ -1424,7 +1430,7 @@ fn probe_009_the_segment_keeps_the_pinned_editors_identity() {
     }
 }
 
-/// Scenario: Write a held Ctrl+G whose helper decides `Unarmed`, and report its editor running, pinned with a check of whether that very process still runs. While the check says it runs, the held typing is released to it; when the pinned editor has already exited by the time the release would be decided, nothing is released early: the segment waits as one whose editor never ran, for its helper's completion (A-20d-6, option (a)).
+/// Scenario: Write a held Ctrl+G whose helper decides `Unarmed`, and report its editor running, pinned with a check of whether that very process still runs. While the check says it runs, the held typing is released to it; when the pinned editor has already exited by the time the release would be decided, nothing is released early: the segment is held as one whose editor never ran, until its helper's completion under `Authority` and, under `Hold`, through a full return until retirement (A-20d-6, option (a); the revb21 review's U2-1).
 #[spec("inbox/probe/009")]
 #[test]
 fn probe_009_a_release_rechecks_that_the_pinned_editor_still_runs() {
@@ -1459,4 +1465,47 @@ fn probe_009_a_release_rechecks_that_the_pinned_editor_still_runs() {
             assert_ne!(v[0].stage, Stage::Released, "the editor already exited");
         }
     }
+
+    // Under `Hold` (production's policy) the segment never completes, so an
+    // editor found gone holds the typing behind it through the helper's
+    // clean report, its exit and the agent's full return, until the
+    // generation retires (the revb21 review's U2-1, ruling (a)).
+    let mut t = T::new(Agent::Claude, HOLD);
+    let n = t.probe(0);
+    t.s.open_human_g(1).unwrap();
+    t.s.open_human_g(2).unwrap();
+    t.write(n, 1);
+    t.ipc(1, Decision::Armed, n, 2);
+    t.exit(1, 3);
+    t.returns(4);
+    assert_eq!(t.written(), [Some(n)]);
+    let g = t.s.next_trigger().unwrap();
+    t.write(g, 5);
+    t.ipc(2, Decision::Unarmed, g, 6);
+    assert!(t.s.editor_pinned_with(
+        &mut t.r,
+        &mut t.f,
+        key(2),
+        EditorPin::new(editor, || false),
+        time(t.t, 7)
+    ));
+    assert_ne!(t.stages(7)[0], Stage::Released, "the editor already exited");
+    t.report(2, Report::Done(Tree::Clean), 8);
+    t.exit(2, 9);
+    t.frontier(2);
+    t.out(&cat(&[ON, FRAME]), 10);
+    t.returns(11);
+    let v = t.view(11);
+    assert_ne!(v[0].stage, Stage::Released, "held through a full return");
+    assert!(t.written().is_empty(), "Hold completes nothing");
+    assert_eq!(t.s.next_trigger(), None, "the Ctrl+G behind it stays held");
+    t.s.retire();
+    assert_eq!(
+        t.ended(),
+        [
+            (Some(g), Kind::HumanG, Outcome::Retired),
+            (None, Kind::HumanG, Outcome::Retired)
+        ],
+        "only retirement ends it"
+    );
 }
