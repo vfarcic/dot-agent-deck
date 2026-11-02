@@ -17,9 +17,12 @@
 //! output's return markers, a trigger written) wakes it; it takes the pane
 //! writer's lock, so a release is ordered against acceptance, and does what
 //! the front segment allows: nothing while it holds; the held input as far
-//! as the next held Ctrl+G candidate once it has released; and with no
+//! as the next held Ctrl+G candidate once it has released; with no
 //! segment open, everything up to that candidate, whose bytes then go alone
-//! as the next segment's trigger, its number published first. Nothing here
+//! as the next segment's trigger, its number published first; and with a
+//! `HumanG` a cut opened at the front (a person's Ctrl+G in an op the gate
+//! let through while a liability was out, A-20d-5), the held input through
+//! that cut as its trigger, its number published first. Nothing here
 //! releases on a timer: the segments decide (core §4.6).
 //!
 //! **What it doesn't decide** (R35PLAN2-U2-01): whether a ring follows a
@@ -63,6 +66,8 @@
 //! writer thread: bus (the screen's status, epoch and `out_seq`, released) ; then
 //!                arm section: gate ─> ledger (released) ; gate ─> seam ─>
 //!                input (R6) ─> page stores
+//! cut:           pane writer (async) ─> gate (cut_hold, released) ; then
+//!                input (R6) (segment_cut)
 //! driver:        pane writer (async) ─> gate (release_until_if / release_cut)
 //!                pane writer (async) ─> gate ─> input (R6) (release_until_if's
 //!                                       re-read of the front, R-B-U2-02)
@@ -320,15 +325,32 @@ impl PaneWriter {
         #[cfg(test)]
         self.mid_pass();
         match front {
-            None | Some(Front::Held | Front::Trigger) => {}
+            None | Some(Front::Held) => {}
+            Some(Front::Trigger) => {
+                // A-20d-5 (core §4.3, §4.5): a `HumanG` a cut opened, every
+                // segment ahead of it ended. Its trigger is the held input
+                // through the first cut, the bytes before the candidate
+                // with it, written alone once its number is published.
+                if !self.gate.gate.segment_fenced()
+                    || !self.gate.gate.holds_any(|frame| frame.cut.is_some())
+                {
+                    return;
+                }
+                let Some(number) = input.segment_next_trigger() else {
+                    return;
+                };
+                publish(number);
+                self.submit_trigger(number);
+            }
             Some(Front::Released) => {
                 if self.gate.gate.segment_fenced() {
                     self.release_held(Front::Released);
                 }
             }
             Some(Front::None) => {
-                // Only a fence a probe closed is the driver's to open: one
-                // the `e2e` control or a liability's cut closed isn't.
+                // Only a fence a probe or a cut on this generation closed is
+                // the driver's to open (A-20d-5): one the `e2e` control
+                // closed isn't.
                 if !self.gate.gate.segment_fenced() {
                     return;
                 }
