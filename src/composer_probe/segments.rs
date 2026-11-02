@@ -72,7 +72,13 @@
 //! - `HumanG` stage 2 `Unarmed`: released once the decision is `Unarmed` and
 //!   the editor child was observed running; complete at EC. When its record
 //!   then drains `WaitUnknown`, that release ends for what is still held
-//!   (R-U2-06): only retirement ends it.
+//!   (R-U2-06): only retirement ends it. A release goes to the pane, not to
+//!   an editor as such: whatever reads the terminal then takes the bytes.
+//!   An editor that reads the terminal does; one that opens its own window
+//!   (a GUI editor) doesn't, so the bytes wait in the terminal for the
+//!   agent's return, where Claude keeps them (P-CRF, which M-PF2 is to
+//!   confirm) and Codex discards them as it returns (M31), as each does
+//!   with keys typed while its editor is open without the deck (A-20d-12).
 //! - A segment's return markers read while its trigger is in flight (after
 //!   its number is published, before the writer's report reaches here) are
 //!   kept, and read once the trigger is reported written; a failed or
@@ -519,10 +525,10 @@ struct Segment {
     drained_at: Option<Instant>,
     released: bool,
     /// Its release has been withdrawn for what is still held (R-U2-06): it
-    /// released to the user's editor while that ran, and its record then
-    /// drained `WaitUnknown`, an editor-bearing decision with no report.
-    /// What went before stays the editor's; what is still held waits for
-    /// retirement (Q104b's OQ5).
+    /// released while the user's editor ran, and its record then drained
+    /// `WaitUnknown`, an editor-bearing decision with no report. What went
+    /// before stays the pane's; what is still held waits for retirement
+    /// (Q104b's OQ5).
     cut_off: bool,
     /// A probe whose matched decision was handed to the epoch's settlement
     /// ([`Segments::take_decided_probes`]).
@@ -1270,8 +1276,9 @@ fn early_release(agent: Agent, seg: &Segment, r: &Record) -> bool {
     match (agent, seg.kind, r.decision) {
         (Agent::Claude, Kind::Probe, Some(Decision::Armed | Decision::Unarmed)) => true,
         (Agent::Claude, Kind::HumanG, Some(Decision::Armed)) => true,
-        // A-20d-6, option (a): released to the user's editor only while
-        // the editor pinned for it still runs; one that already exited is
+        // A-20d-6, option (a): released to the pane while the editor
+        // pinned for it still runs (A-20d-12: the editor takes the bytes
+        // only if it reads the terminal); one that already exited is
         // gone, and the segment is held as one whose editor never ran:
         // under `Hold` (production's `EC_POLICY`) until the generation
         // retires, since `Hold` completes no editor-bearing segment, and
