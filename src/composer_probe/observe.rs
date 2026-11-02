@@ -2245,7 +2245,7 @@ mod linux {
             &self,
             agent: &AgentType,
             probe: &EditorProbe<'static>,
-            args: &[OsString],
+            args: Option<&[OsString]>,
             cwd: Option<&std::path::Path>,
         ) -> KeymapEvidence {
             use crate::composer_probe::keymap;
@@ -2254,40 +2254,24 @@ mod linux {
             };
             let env = |name: &str| self.env_value(name);
             match agent {
-                AgentType::ClaudeCode => {
-                    let (path, read) = match &baseline.claude {
-                        Ok(spawn) => spawn,
-                        Err(hold) => return KeymapEvidence::Held(*hold),
-                    };
-                    match keymap::claude_keybindings_path(env) {
-                        Ok(now) if now == *path => {
-                            KeymapEvidence::Claude(keymap::ClaudeKeymap::from_spawn_read(
-                                path.clone(),
-                                read.clone(),
-                                probe,
-                            ))
-                        }
-                        Ok(_) => KeymapEvidence::Held(keymap::Hold::Changed),
-                        Err(hold) => KeymapEvidence::Held(hold),
+                AgentType::ClaudeCode => match baseline.claude_bound(env) {
+                    Ok((path, read)) => {
+                        KeymapEvidence::Claude(keymap::ClaudeKeymap::from_spawn_read(
+                            path.to_path_buf(),
+                            read.clone(),
+                            probe,
+                        ))
                     }
-                }
-                AgentType::Codex => {
-                    let codex = match &baseline.codex {
-                        Ok(codex) => codex,
-                        Err(hold) => return KeymapEvidence::Held(*hold),
-                    };
-                    let (Some(home), Some(cwd)) = (keymap::codex_home(env), cwd) else {
-                        return KeymapEvidence::Held(keymap::Hold::Unmeasured);
-                    };
-                    match codex.bound(&home, args, cwd) {
-                        Ok(()) => KeymapEvidence::Codex {
-                            sources: codex.sources.clone(),
-                            before: Box::new(codex.read.clone()),
-                            precedence: probe.keymap_sources,
-                        },
-                        Err(hold) => KeymapEvidence::Held(hold),
-                    }
-                }
+                    Err(hold) => KeymapEvidence::Held(hold),
+                },
+                AgentType::Codex => match baseline.codex_bound(env, args, cwd) {
+                    Ok(codex) => KeymapEvidence::Codex {
+                        sources: codex.sources.clone(),
+                        before: Box::new(codex.read.clone()),
+                        precedence: probe.keymap_sources,
+                    },
+                    Err(hold) => KeymapEvidence::Held(hold),
+                },
                 _ => KeymapEvidence::Held(keymap::Hold::Unmeasured),
             }
         }
@@ -2781,15 +2765,17 @@ mod linux {
                 let args = identity
                     .as_ref()
                     .and_then(|a| proc_facts(a.pid))
-                    .map(|f| f.argv.get(1..).unwrap_or_default().to_vec())
-                    .unwrap_or_default();
+                    .map(|f| f.argv.get(1..).unwrap_or_default().to_vec());
                 // Its working directory, for Codex's project files.
                 let cwd = identity
                     .as_ref()
                     .and_then(|a| std::fs::read_link(format!("/proc/{}/cwd", a.pid)).ok());
-                let _ = self
-                    .keymap
-                    .set(self.keymap_evidence(agent, &probe, &args, cwd.as_deref()));
+                let _ = self.keymap.set(self.keymap_evidence(
+                    agent,
+                    &probe,
+                    args.as_deref(),
+                    cwd.as_deref(),
+                ));
             }
             let won = {
                 let mut inner = self.lock();

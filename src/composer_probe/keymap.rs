@@ -801,6 +801,43 @@ impl KeymapBaseline {
     }
 }
 
+impl KeymapBaseline {
+    /// Claude Code's spawn read, when the bound agent's environment `env`
+    /// still names the file it was read from; [`Hold::Changed`] when it
+    /// names another, and the path's own hold when it names none.
+    pub fn claude_bound(
+        &self,
+        env: impl Fn(&str) -> Option<OsString>,
+    ) -> Result<(&Path, &SourceRead), Hold> {
+        let (path, read) = self.claude.as_ref().map_err(|hold| *hold)?;
+        match claude_keybindings_path(env) {
+            Ok(now) if now == *path => Ok((path, read)),
+            Ok(_) => Err(Hold::Changed),
+            Err(hold) => Err(hold),
+        }
+    }
+
+    /// Codex's spawn baseline, when the bound agent launched with the same
+    /// sources ([`CodexBaseline::bound`]): its arguments `args` after the
+    /// program (`None` when they couldn't be read, taken as none), its
+    /// working directory `cwd` and the home `env` names. No home or no
+    /// `cwd` holds as unmeasured.
+    pub fn codex_bound(
+        &self,
+        env: impl Fn(&str) -> Option<OsString>,
+        args: Option<&[OsString]>,
+        cwd: Option<&Path>,
+    ) -> Result<&CodexBaseline, Hold> {
+        let codex = self.codex.as_ref().map_err(|hold| *hold)?;
+        let (Some(home), Some(cwd)) = (codex_home(env), cwd) else {
+            return Err(Hold::Unmeasured);
+        };
+        codex
+            .bound(&home, args.unwrap_or_default(), cwd)
+            .map(|()| codex)
+    }
+}
+
 fn layer(merged: &mut toml::Table, read: &SourceRead) -> Result<(), Hold> {
     match read {
         SourceRead::Absent => Ok(()),
