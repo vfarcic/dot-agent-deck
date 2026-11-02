@@ -1915,8 +1915,6 @@ mod linux {
             })
     }
 
-    /// `pid`'s executable and argv, `None` when either can't be read or the
-    /// argv is longer than [`ARGV_BYTES`].
     /// `/proc/<pid>/environ` as `(name, value)` pairs in its order, or
     /// `None` when it can't be read or is longer than [`ENVIRON_BYTES`]. An
     /// entry with no `=` is kept as a name with an empty value.
@@ -1948,6 +1946,8 @@ mod linux {
         )
     }
 
+    /// `pid`'s executable and argv, `None` when either can't be read or the
+    /// argv is longer than [`ARGV_BYTES`].
     fn proc_facts(pid: u32) -> Option<ProcFacts> {
         let exe = exe_id(pid)?;
         let mut bytes = Vec::new();
@@ -2454,8 +2454,6 @@ mod linux {
             self.generation.to_string()
         }
 
-        /// A variable as the agent sees it: the spawn's own, else the
-        /// daemon's.
         /// The bound agent `pid`'s environment as it was exec'd
         /// (`/proc/<pid>/environ`, which the agent's own later `setenv`
         /// doesn't change), or `None` when it can't be read or is longer
@@ -2468,6 +2466,8 @@ mod linux {
             proc_environ(pid)
         }
 
+        /// A variable as the agent sees it: the spawn's own, else the
+        /// daemon's.
         fn env_value(&self, name: &str) -> Option<OsString> {
             match self.env.iter().rev().find(|(k, _)| k == name) {
                 Some((_, v)) => Some(v.into()),
