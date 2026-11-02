@@ -1047,7 +1047,7 @@ fn probe_014_an_unread_bound_codex_argv_holds() {
     );
 }
 
-/// Scenario: Take a generation's key-binding baseline before its spawn with the spawn's `HOME`, then compare it with the bound agent's own environment, as a command that sets its own variables (`CODEX_HOME=/x codex`, `HOME=/y claude`) leaves it. The same `HOME` matches for both agents, and so does a `CODEX_HOME` naming the home the spawn's `HOME` already gave Codex (the deck's wrapper pins it so); another `HOME` or `CODEX_HOME` holds as changed, and a `CLAUDE_CONFIG_DIR` as unmeasured. An environment that lists one of these names twice with different values holds as unmeasured (the reva21 review's U1-1), and so does an empty or relative `CODEX_HOME` or `HOME` for Codex, even when the spawn and the agent carry the same one (the revb21 review's U1-1b).
+/// Scenario: Take a generation's key-binding baseline before its spawn with the spawn's `HOME`, then compare it with the bound agent's own environment, as a command that sets its own variables (`CODEX_HOME=/x codex`, `HOME=/y claude`) leaves it. The same `HOME` matches for both agents, and so does a `CODEX_HOME` naming the home the spawn's `HOME` already gave Codex (the deck's wrapper pins it so); another `HOME` or `CODEX_HOME` holds as changed, and a `CLAUDE_CONFIG_DIR` as unmeasured. An environment that lists one of these names twice with different values holds as unmeasured (the reva21 review's U1-1), and so does an empty or relative `CODEX_HOME` or `HOME` for Codex, even when the spawn and the agent carry the same one (the revb21 review's U1-1b), as does a `CODEX_HOME` or `HOME` that isn't UTF-8, the same on both sides (the revc21 review's U1-1c).
 #[spec("inbox/probe/014")]
 #[test]
 fn probe_014_the_bound_agents_environment_is_compared_with_the_spawns() {
@@ -1138,4 +1138,38 @@ fn probe_014_the_bound_agents_environment_is_compared_with_the_spawns() {
         assert_eq!(both(pairs), Err(Hold::Unmeasured), "{row} on both sides");
     }
     assert_eq!(both(&[("HOME", home_str)]), Ok(()), "the control");
+
+    // A home that isn't UTF-8, the same at spawn and bound (the revc21
+    // review's U1-1c): Codex reads `CODEX_HOME` through `std::env::var`,
+    // which refuses such a value and falls back to `$HOME/.codex`, so the
+    // path the deck would read isn't the one Codex loads. A non-UTF-8
+    // `HOME` holds too.
+    use std::os::unix::ffi::OsStringExt;
+    let non_utf8 = |value: &[u8]| OsString::from_vec(value.to_vec());
+    let both_os = |environ: Vec<(OsString, OsString)>| {
+        let env = environ_lookup(&environ).unwrap();
+        let baseline = KeymapBaseline::at_spawn(false, true, &env, &[], &cwd);
+        baseline
+            .codex_bound(&env, Some(&[]), Some(&cwd))
+            .map(|_| ())
+    };
+    for (row, environ) in [
+        (
+            "CODEX_HOME=b\"/abs\\xff\"",
+            vec![
+                (OsString::from("HOME"), home.clone().into_os_string()),
+                (OsString::from("CODEX_HOME"), non_utf8(b"/abs\xff")),
+            ],
+        ),
+        (
+            "HOME=b\"/abs\\xff\"",
+            vec![(OsString::from("HOME"), non_utf8(b"/abs\xff"))],
+        ),
+    ] {
+        assert_eq!(
+            both_os(environ),
+            Err(Hold::Unmeasured),
+            "{row} on both sides"
+        );
+    }
 }
