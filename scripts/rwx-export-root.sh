@@ -83,7 +83,12 @@ mount)
   # Root, inside the private mount namespace.
   root=$(mktemp -d "$DAD_EXPORT_ROOT_BASE/dad-export-root.XXXXXX")
   chmod 0755 "$root"
-  mounted=()
+  # A mount of its own, so `/` inside it is a mount point as everywhere else:
+  # code that finds a path's filesystem in /proc/mounts finds none for a
+  # chroot that is a plain directory (xtask-cross-version's
+  # the_root_filesystem_is_identified). Every bind below hangs off it, so
+  # one recursive unmount detaches them all.
+  mount --bind "$root" "$root"
 
   # Mirror every entry of SRC into DEST except the names after it.
   mirror() {
@@ -100,25 +105,20 @@ mount)
       elif [ -d "$path" ]; then
         mkdir "$dest/$name"
         mount --rbind "$path" "$dest/$name"
-        mounted+=("$dest/$name")
       else
         touch "$dest/$name"
         mount --bind "$path" "$dest/$name"
-        mounted+=("$dest/$name")
       fi
     done
     shopt -u nullglob dotglob
   }
 
-  # Unmount every bind, then remove the root only if nothing is left mounted
-  # under it: removing it with a bind still in place would delete the task's
-  # own files through that bind.
+  # Unmount the root and every bind under it, then remove it only if nothing
+  # is left mounted there: removing it with a bind still in place would
+  # delete the task's own files through that bind.
   cleanup() {
-    local target ok=1
-    for target in "${mounted[@]}"; do
-      umount -R "$target" 2>/dev/null || umount -R -l "$target" 2>/dev/null || ok=0
-    done
-    if [ "$ok" = 1 ] && ! findmnt -rn -o TARGET | grep -q -F -- "$root/"; then
+    umount -R "$root" 2>/dev/null || umount -R -l "$root" 2>/dev/null || true
+    if ! findmnt -rn -o TARGET | grep -q -F -- "$root"; then
       rm -rf --one-file-system -- "$root"
     else
       echo "rwx-export-root: left $root in place: a mount under it did not detach" >&2
