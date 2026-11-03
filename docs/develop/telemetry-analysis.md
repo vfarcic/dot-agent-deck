@@ -117,8 +117,8 @@ Honeycomb `query_url`s expire with the data, so these are written as specs: they
 | --- | --- | --- |
 | gate failure rate per gate run | `dot-agent-deck` | `affected_checks.run` spans; `COUNT` by the span's outcome and `gates.runner.used`; raw rows with `deck.run.id` for gate runs per agent run; per-command failures from `affected_checks.command`'s `gates.command.outcome` / `gates.command.exit_code` |
 | gate command durations | `dot-agent-deck` | `affected_checks.command`; `P50`/`P90(duration_ms)` by `gates.command`, `gates.command.runner` |
-| runs open at once, by period | `dot-agent-deck` | `agent.run` roots plus the open runs' children (first/last child timestamp by `deck.run.id`), sampled per minute locally |
-| interventions per orchestrator hour | `dot-agent-deck` | `deck.intervention` events by `trace.parent_id` and kind, joined to `agent.run` via `deck.run.id` ↔ `trace.span_id` |
+| runs open at once, by period | `dot-agent-deck` | `agent.run` roots plus the open runs' children (first/last child timestamp by `deck.run.id`), sampled per minute locally. A run with no root is counted only up to its last exported child, so an open run that sat idle until the window's end is undercounted: for open runs this is a lower bound |
+| interventions per orchestrator hour | `dot-agent-deck` | `deck.intervention` events by `trace.parent_id` and kind; match each event's `trace.parent_id` to the `trace.span_id` of its `agent.run` span, which carries the run's `deck.run.id` and duration (a separate query listing `agent.run`'s `trace.span_id` and `deck.run.id`) |
 | hand-off outcomes and latency | `dot-agent-deck` | `agent.handoff` by outcome; `deck.handoff.taken` events; delegate → taken from raw rows |
 | status changes per run, per agent | `dot-agent-deck` | `agent.status` `COUNT` by `deck.agent`, `deck.run.id` |
 | shell spans with no program; `run_end` share | `dot-agent-deck` | `agent.operation` `COUNT` and `SUM(duration_ms)` by `deck.agent`, `deck.operation.program exists`, `deck.operation.end` |
@@ -135,11 +135,13 @@ GitHub and RWX, as commands:
 ```sh
 # CI runs on main (push) and their per-attempt jobs
 gh api "repos/vfarcic/dot-agent-deck/actions/workflows/ci.yml/runs?branch=main&event=push&created=<from>..<to>" --paginate
-gh api "repos/vfarcic/dot-agent-deck/actions/runs/<run-id>/jobs?filter=all&per_page=100"
+gh api "repos/vfarcic/dot-agent-deck/actions/runs/<run-id>/jobs?filter=all&per_page=100" --paginate
 # reviewer cadence
 gh api "repos/vfarcic/dot-agent-deck/actions/workflows/pr-review-batch.yml/runs?created=<from>..<to>" --paginate --jq '.workflow_runs[]|[.event,.conclusion]|@tsv'
-# RWX PR CI
-rwx runs list --repository dot-agent-deck --definition .rwx/ci.yml --limit 100 --json
+# RWX PR CI: one page of at most 100 runs, newest first. Pass the result's NextCursor as
+# --cursor and keep paging until the oldest run listed is older than the window's start,
+# or the window is incomplete
+rwx runs list --repository dot-agent-deck --definition .rwx/ci.yml --limit 100 --json [--cursor <NextCursor>]
 rwx results <run-id> --json
 rwx logs <task-attempt-id> --output <dir>
 ```
