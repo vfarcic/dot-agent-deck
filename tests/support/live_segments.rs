@@ -75,13 +75,22 @@ impl Fixture {
     }
 
     pub fn with_env(kind: &'static str, extra: &[(&str, &str)]) -> Self {
-        let mut env = vec![
-            (
+        Self::configured(kind, extra, true)
+    }
+
+    /// Production Absent control: no editor-probe assumption or binding seam.
+    pub fn absent(kind: &'static str, extra: &[(&str, &str)]) -> Self {
+        Self::configured(kind, extra, false)
+    }
+
+    fn configured(kind: &'static str, extra: &[(&str, &str)], assumed: bool) -> Self {
+        let mut env = vec![("DOT_AGENT_DECK_DOORBELL_TICK_MS", "25")];
+        if assumed {
+            env.push((
                 "DOT_AGENT_DECK_E2E_ASSUME_EDITOR_PROBE",
                 "claude@2.1.310,codex@0.164.0",
-            ),
-            ("DOT_AGENT_DECK_DOORBELL_TICK_MS", "25"),
-        ];
+            ));
+        }
         env.extend_from_slice(extra);
         let daemon = common::spawn_daemon_serve_with_env(None, "0", &env);
         let native = daemon.home.join("native");
@@ -105,15 +114,21 @@ impl Fixture {
             "            path.unlink(missing_ok=True)\n            os.write(1, b'\\x1b[?2004h')\n            self.return_count = getattr(self, 'return_count', 0) + 1\n            self.path(f'.composer-return-{self.return_count}').touch()",
         );
         fs::write(native.join("composer_external_edit.py"), composer).unwrap();
-        fs::write(
-            native.join("composer.py"),
-            if kind == "codex" {
-                include_str!("codex_composer.py")
-            } else {
-                include_str!("claude_composer.py")
-            },
-        )
-        .unwrap();
+        let composer = if kind == "codex" {
+            include_str!("codex_composer.py").to_owned()
+        } else {
+            checked_replace(
+                include_str!("claude_composer.py"),
+                "            result = subprocess.run([deck, 'inbox', 'fetch']",
+                "            if os.path.exists(base + '.fetch-paused') or (os.path.exists(base + '.fetch-notice-only') and b'dot-agent-deck: message ' not in line):\n                continue\n            result = subprocess.run([deck, 'inbox', 'fetch']",
+            )
+        };
+        let composer = checked_replace(
+            &composer,
+            "    if not select.select([0], [], [], 0.025)[0]:",
+            "    if os.path.exists(base + '.external-edit-request'):\n        os.remove(base + '.external-edit-request')\n        external_edit.invoke(composer)\n        redraw()\n        open(base + '.external-edit-returned', 'w').close()\n    if not select.select([0], [], [], 0.025)[0]:",
+        );
+        fs::write(native.join("composer.py"), composer).unwrap();
         let editor = checked_replace(
             include_str!("composer_test_editor.py"),
             "mode, base, *args = sys.argv[1:]",
@@ -123,6 +138,11 @@ impl Fixture {
             &editor,
             "path.write_bytes(b'EDITED",
             "if mode == 'survivor':\n    survivor = os.fork()\n    if survivor == 0:\n        deadline = time.monotonic() + 30\n        while not Path(base + '.survivor-go').exists() and time.monotonic() < deadline: time.sleep(.005)\n        os._exit(0)\n    Path(base + '.survivor-pid').write_text(str(survivor))\npath.write_bytes(b'EDITED",
+        );
+        let editor = checked_replace(
+            &editor,
+            "path.write_bytes(b'EDITED   \\n' if mode == 'trim' else b'EDITED')",
+            "if mode != 'preserve':\n    path.write_bytes(b'EDITED   \\n' if mode == 'trim' else b'EDITED')",
         );
         executable(&native.join("editor"), &editor);
         executable(&native.join("broker"), BROKER);
@@ -425,15 +445,19 @@ impl Fixture {
             .unwrap()
             .clone()
     }
-    pub fn enqueue(&self) {
+    pub fn enqueue(&self) -> String {
+        self.enqueue_body("TEST-ONLY-WAITING-MAIL")
+    }
+    pub fn enqueue_body(&self, body: &str) -> String {
         let r = inbox::attach(
             &self.daemon,
-            json!({"op":"post-message","pane_id":PANE,"expected_agent_id":self.agent,"subject":"segment admission","body":"TEST-ONLY-WAITING-MAIL","origin":"seed"}),
+            json!({"op":"post-message","pane_id":PANE,"expected_agent_id":self.agent,"subject":"segment admission","body":body,"origin":"seed"}),
         );
         assert_eq!(
             r["ok"], true,
             "post ordinary mail to exercise the live tick: {r}"
         );
+        r["id"].as_str().expect("queued message id").into()
     }
     pub fn hook_event(&self, event: &str) {
         let pid = read_json(&self.path("ready"))["pid"].as_u64().unwrap();
@@ -443,7 +467,12 @@ impl Fixture {
             .find_map(|e| e.strip_prefix(b"DOT_AGENT_DECK_PANE_CAPABILITY="))
             .map(|v| std::str::from_utf8(v).unwrap())
             .expect("own native fixture capability");
-        let request = json!({"session_id":format!("segment-session-{}",self.generation),"pane_id":PANE,"agent_id":self.agent,"token":token,"deck_build":"","event_type":event,"agent_type":if self.kind=="codex" {"codex"} else {"claude_code"},"timestamp":chrono::Utc::now(),"cwd":self.daemon.home,"metadata":{}});
+        let session = if self.kind == "codex" {
+            format!("{}-session", self.agent)
+        } else {
+            format!("segment-session-{}", self.generation)
+        };
+        let request = json!({"session_id":session,"pane_id":PANE,"agent_id":self.agent,"token":token,"deck_build":"","event_type":event,"agent_type":if self.kind=="codex" {"codex"} else {"claude_code"},"timestamp":chrono::Utc::now(),"cwd":self.daemon.home,"metadata":{}});
         let mut stream = inbox::connect(&self.daemon, &request).into_inner();
         stream.shutdown(std::net::Shutdown::Write).unwrap();
         use std::io::Read;
@@ -553,7 +582,7 @@ pub fn native_entry() {
     let exe = std::env::current_exe().unwrap();
     let helper = PathBuf::from(std::env::var_os("VISUAL").unwrap());
     let generation = std::env::var("DOT_AGENT_DECK_EDITOR_GEN")
-        .unwrap()
+        .unwrap_or_else(|_| "0".into())
         .parse::<u64>()
         .unwrap();
     fs::create_dir_all(std::env::var_os("TMPDIR").unwrap()).unwrap();
@@ -727,6 +756,24 @@ pub fn native_entry() {
         if let Ok(data) = fs::read(base.with_extension("command")) {
             fs::remove_file(base.with_extension("command")).unwrap();
             let cmd: Value = serde_json::from_slice(&data).unwrap();
+            if cmd["action"] == "fetch" {
+                // An independent ordinary CLI consumer, with this sandbox
+                // pane's own environment; no input goes to its composer.
+                let output = Command::new(common::contained_deck_binary())
+                    .args(["inbox", "fetch"])
+                    .envs(env.clone())
+                    .output()
+                    .unwrap();
+                atomic(
+                    &base.with_extension("response"),
+                    &json!({
+                        "ok":output.status.success(),
+                        "stdout":String::from_utf8(output.stdout).unwrap(),
+                        "stderr":String::from_utf8(output.stderr).unwrap(),
+                    }),
+                );
+                continue;
+            }
             let mut reply = json!({"ok":true});
             if cmd["action"] == "emit" {
                 let bytes: Vec<u8> = serde_json::from_value(cmd["bytes"].clone()).unwrap();

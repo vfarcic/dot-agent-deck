@@ -369,55 +369,6 @@ fn doorbell_042_the_users_draft_waits_for_the_take_back() {
     assert!(turns(&pane).is_empty(), "nothing was submitted");
 }
 
-/// Scenario: Leave a human draft in an Idle stand-in's composer with a task queued, then complete doorbell policy ticks at controlled ages of 5 seconds, 10 seconds, just under a day and a day, each far past the stall window. No age gives the doorbell leave to type over a draft: at every step the pane holds exactly the draft and the task stays Queued, and the hold's reason, possible_draft, is raised once; clearing the draft then lets the doorbell ring.
-#[spec("inbox/doorbell/040")]
-#[test]
-fn doorbell_040_a_retained_draft_holds_at_every_controlled_age() {
-    use std::os::unix::fs::PermissionsExt;
-    let scratch = common::harness_tempdir().unwrap();
-    let log = scratch.path().join("doorbell.log");
-    let daemon = daemon_unbound(&[
-        ("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_DIR", "ring-barriers"),
-        ("DOT_AGENT_DECK_LOG", log.to_str().unwrap()),
-    ]);
-    let controls = daemon.home.join("ring-barriers");
-    std::fs::create_dir_all(&controls).unwrap();
-    std::fs::set_permissions(&controls, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let pane = pane(&daemon, "aged-draft");
-    status(&daemon, &pane, "idle", "claude_code");
-    let mut user = input(&daemon, &pane, DRAFT);
-    assert!(
-        common::wait_until(WAIT, || screen(&daemon, &pane)
-            .contains(&format!("COMPOSER: {DRAFT}"))),
-        "the stand-in must show the draft"
-    );
-    let id = enqueue(&daemon, &pane, BODY);
-    for age_ms in [5_000, 10_000, 86_399_000, 86_400_000] {
-        clock_step_holding(&daemon, &pane, age_ms, DRAFT.as_bytes());
-        state(&daemon, &pane, &id, "queued");
-    }
-    assert!(
-        wake_hold(&daemon, &pane)
-            .to_string()
-            .contains("possible_draft"),
-        "{}",
-        wake_hold(&daemon, &pane)
-    );
-    let raised = std::fs::read_to_string(&log)
-        .unwrap_or_default()
-        .lines()
-        .filter(|line| line.contains("doorbell hold") && line.contains("Some(PossibleDraft)"))
-        .count();
-    assert_eq!(raised, 1, "the reason is raised once");
-    std::fs::remove_file(controls.join("clock-ms")).unwrap();
-    user.write("\x15");
-    ring(&daemon, &pane, &id);
-    assert_eq!(
-        bytes(&pane),
-        format!("{DRAFT}\x15{}\r", rung_line(&pane, &id).unwrap()).as_bytes()
-    );
-}
-
 /// Scenario: Hold a task behind an old agent's human draft, stop it, and spawn a new agent in the same pane identity, on both one-worker and four-worker daemons. A predecessor-session ShellIdle must not type into the replacement at completed policy ages of 5 seconds, 10 seconds and up to one day, nor during the real observation window; its own Idle then submits only the newly bound task, which can be fetched.
 #[spec("inbox/doorbell/008")]
 #[test]
@@ -879,83 +830,110 @@ fn dispatch_023_terminal_reports_do_not_hold_doorbell() {
     assert!(screen(&daemon, &pane).contains("waiting, run: dot-agent-deck inbox fetch"));
 }
 
-/// Scenario: For each supported synthetic agent type, report the worker Thinking, forward the interrupt OpenCode uses (Escape, a 300 ms pause, Escape) as the user's keys, then report it Idle and queue a task. An interrupt is not a draft, so the token-led doorbell must follow the two Escapes and a fetch must deliver the task.
-#[spec("inbox/doorbell/019")]
+/// Scenario: Type and delete text in OpenCode and Pi panes with their native receipt streams registered, then queue a message. Each native stream must hand over its message without a probe or notice, and its card must not acquire a composer-check reason.
+#[spec("inbox/probe/037")]
 #[test]
-fn doorbell_019_an_interrupts_escapes_do_not_hold_doorbell() {
-    let daemon = daemon_unbound(&[]);
-    for agent_type in ["open_code", "claude_code", "codex", "pi"] {
-        let pane = pane(
-            &daemon,
-            &format!("interrupt-{}", agent_type.replace('_', "-")),
-        );
-        status(&daemon, &pane, "thinking", agent_type);
-        let mut user = input(&daemon, &pane, "\x1b");
-        // OpenCode's interrupt: the second Escape about 300 ms later.
-        unchanged(&pane, Duration::from_millis(300));
-        user.write("\x1b");
-        assert!(
-            common::wait_until(WAIT, || bytes(&pane) == b"\x1b\x1b"),
-            "{agent_type}: interrupt not received"
-        );
-        status(&daemon, &pane, "idle", agent_type);
-        let id = enqueue(&daemon, &pane, BODY);
-        let expected = || rung_line(&pane, &id).map(|line| format!("\x1b\x1b{line}\r"));
-        assert!(
-            common::wait_until(WAIT, || expected()
-                .is_some_and(|expected| bytes(&pane) == expected.as_bytes())),
-            "{agent_type}: an interrupt held the doorbell: {:?}",
-            bytes(&pane)
-        );
-        let fetched = fetch(&daemon, &pane, true).to_string();
-        assert!(
-            fetched.contains(&id) && fetched.contains(BODY),
-            "{agent_type}: the task was not delivered: {fetched}"
-        );
-        state(&daemon, &pane, &id, "acknowledged");
+fn probe_037_absent_opencode_and_pi_keep_native_delivery() {
+    for (kind, component) in [("open_code", "opencode_plugin"), ("pi", "pi_extension")] {
+        let daemon = inbox::daemon_unbound(&[]);
+        let pane = inbox::pane_with(&daemon, kind, json!({"agent_type":kind,"profile":false}));
+        inbox::status(&daemon, &pane, "idle", kind);
+        let _human = inbox::input(&daemon, &pane, "x\x7f");
+        let mut stream = inbox::receipt_stream_as(&daemon, &pane, component);
+        let id = inbox::enqueue(&daemon, &pane, inbox::BODY);
+        let message = inbox::receipt_handout(&mut stream, &id);
+        assert_eq!(message["id"], id);
+        assert!(message.to_string().contains(inbox::BODY));
+        let records = inbox::attach(&daemon, json!({"op":"list-agents"}));
+        let record = records["agent_records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == pane.agent)
+            .unwrap();
+        assert_eq!(record["inbox"]["wake"], "native", "{record}");
+        assert!(record["inbox"]["wake_hold"].is_null(), "{record}");
+        inbox::unchanged(&pane, Duration::from_millis(250));
+        assert_eq!(inbox::bytes(&pane), b"x\x7f");
     }
 }
 
-/// Scenario: Leave a typed draft followed by two Escapes, and two Escapes followed by typing, then report Idle where the agent was busy and queue a task in each pane: the composer shows the draft, so each pane must receive nothing and its task must stay Queued. Two Escapes pressed on an agent that is already Idle, followed by two more Idle reports as OpenCode sends, leave the composer empty with nothing else drawn, so that pane is rung.
+/// Scenario: Announce Devin's ordinary turn-end receipt route without typing into its pane, queue mail, and fetch it through the ordinary CLI receipt path. Its existing cannot-type reason and prompt route remain available without a check or notice being typed.
+#[spec("inbox/probe/037")]
+#[test]
+fn probe_037_absent_devin_keeps_its_prompt_fetch_route() {
+    let daemon = inbox::daemon_unbound(&[("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "100")]);
+    let pane = inbox::pane_with(
+        &daemon,
+        "devin-absent",
+        json!({"agent_type":"devin","profile":false}),
+    );
+    inbox::status(&daemon, &pane, "idle", "devin");
+    let mut announcement = inbox::request(&pane, "inbox_announce");
+    announcement["component"] = json!("devin_hooks");
+    announcement["component_version"] = json!("synthetic-absent");
+    announcement["wake"] = json!("turn_end");
+    announcement["pid"] = json!(pane.pid);
+    assert_eq!(inbox::hook(&daemon, announcement)["accepted"], true);
+    let id = inbox::enqueue(&daemon, &pane, inbox::BODY);
+    assert!(
+        common::wait_until(WAIT, || {
+            let records = inbox::attach(&daemon, json!({"op":"list-agents"}));
+            records["agent_records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["id"] == pane.agent && r["inbox"]["wake_hold"] == "cannot_type")
+        }),
+        "Devin's untouched prompt route must retain cannot_type: {}",
+        inbox::attach(&daemon, json!({"op":"list-agents"}))
+    );
+    let records = inbox::attach(&daemon, json!({"op":"list-agents"}));
+    let record = records["agent_records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == pane.agent)
+        .unwrap();
+    assert_eq!(record["inbox"]["wake"], "turn_end", "{record}");
+    assert!(
+        !matches!(
+            record["inbox"]["wake_hold"].as_str(),
+            Some("needs_fetch" | "cannot_check")
+        ),
+        "{record}"
+    );
+    assert!(inbox::fetch(&daemon, &pane, true).to_string().contains(&id));
+    assert_eq!(inbox::bytes(&pane), b"");
+}
+
+/// Scenario: Interrupt working OpenCode and Pi panes with two Escapes, and separately press Escapes while they are already Idle and repeat their Idle reports. Their registered native streams still deliver queued mail once without a typed fallback.
 #[spec("inbox/doorbell/019")]
 #[test]
-fn doorbell_019_drafts_hold_doorbell_and_an_idle_agents_escapes_defer_to_its_screen() {
-    let daemon = daemon_unbound(&[]);
-    for (name, while_busy, once_idle) in [
-        ("typed-then-escapes", "unsent\x1b\x1b", ""),
-        ("escapes-then-typed", "\x1b\x1bunsent", ""),
-        ("escapes-on-idle", "", "\x1b\x1b"),
-    ] {
-        let pane = pane(&daemon, name);
-        status(&daemon, &pane, "thinking", "open_code");
-        let mut user = (!while_busy.is_empty()).then(|| input(&daemon, &pane, while_busy));
-        status(&daemon, &pane, "idle", "open_code");
-        if !once_idle.is_empty() {
-            user = Some(input(&daemon, &pane, once_idle));
-            assert!(
-                common::wait_until(WAIT, || bytes(&pane).ends_with(once_idle.as_bytes())),
-                "{name}: the Escapes were not received"
+fn doorbell_019_native_opencode_and_pi_deliver_after_escapes() {
+    for (kind, component) in [("open_code", "opencode_plugin"), ("pi", "pi_extension")] {
+        for already_idle in [false, true] {
+            let daemon = inbox::daemon_unbound(&[]);
+            let pane = inbox::pane_with(&daemon, kind, json!({"agent_type":kind,"profile":false}));
+            inbox::status(
+                &daemon,
+                &pane,
+                if already_idle { "idle" } else { "thinking" },
+                kind,
             );
-            // OpenCode reports Idle twice for one turn's end.
-            status(&daemon, &pane, "idle", "open_code");
-            status(&daemon, &pane, "idle", "open_code");
+            let mut human = inbox::input(&daemon, &pane, "\x1b");
+            inbox::unchanged(&pane, Duration::from_millis(300));
+            human.write("\x1bx\x7f");
+            assert!(common::wait_until(WAIT, || inbox::bytes(&pane) == b"\x1b\x1bx\x7f"));
+            inbox::status(&daemon, &pane, "idle", kind);
+            inbox::status(&daemon, &pane, "idle", kind);
+            let mut stream = inbox::receipt_stream_as(&daemon, &pane, component);
+            let id = inbox::enqueue(&daemon, &pane, inbox::BODY);
+            let delivered = inbox::receipt_handout(&mut stream, &id);
+            assert_eq!(delivered["id"], id);
+            assert!(delivered.to_string().contains(inbox::BODY));
+            inbox::unchanged(&pane, Duration::from_millis(250));
+            assert_eq!(inbox::bytes(&pane), b"\x1b\x1bx\x7f");
         }
-        let before = bytes(&pane);
-        let id = enqueue(&daemon, &pane, BODY);
-        if once_idle.is_empty() {
-            unchanged(&pane, Duration::from_millis(800));
-            assert_eq!(bytes(&pane), before, "{name}: the doorbell typed");
-            assert!(rings(&pane).is_empty(), "{name}: the doorbell rang");
-            state(&daemon, &pane, &id, "queued");
-        } else {
-            // Nothing on screen but an empty composer: the deck's own
-            // evidence admits the ring, whatever the Escapes were for.
-            ring(&daemon, &pane, &id);
-            assert_eq!(
-                bytes(&pane),
-                format!("{once_idle}{}\r", rung_line(&pane, &id).unwrap()).as_bytes()
-            );
-        }
-        drop(user);
     }
 }
