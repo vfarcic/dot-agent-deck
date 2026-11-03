@@ -622,6 +622,9 @@ pub fn scheduled(reuse_case: Option<u8>) {
         &[
             ("DOT_AGENT_DECK_DOORBELL_TICK_MS", "25"),
             ("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "30000"),
+            // The card names a hold once it outlasts this (Q35-21's re-oracle
+            // reads it), not after the default two minutes.
+            ("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "100"),
         ],
     );
     daemon.run_now("route-scheduled").unwrap();

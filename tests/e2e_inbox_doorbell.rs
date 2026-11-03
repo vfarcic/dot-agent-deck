@@ -786,7 +786,7 @@ fn assert_ack_fences_rering(phase: &str, settle: Settle) {
 #[spec("scheduler/dispatch/023")]
 #[test]
 fn dispatch_023_doorbell_waits_for_unsent_worker_draft() {
-    let daemon = daemon_unbound(&[]);
+    let daemon = daemon_unbound(&[("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "100")]);
     let pane = pane(&daemon, "worker-draft");
     status(&daemon, &pane, "idle", "codex");
     let mut user = input(&daemon, &pane, DRAFT);
@@ -833,7 +833,7 @@ fn dispatch_023_doorbell_waits_for_unsent_worker_draft() {
 #[spec("scheduler/dispatch/023")]
 #[test]
 fn dispatch_023_unrequested_terminal_reports_hold_with_their_reason() {
-    let daemon = daemon_unbound(&[]);
+    let daemon = daemon_unbound(&[("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "100")]);
     let pane = pane(&daemon, "terminal-reports");
     status(&daemon, &pane, "idle", "codex");
     let reports =
