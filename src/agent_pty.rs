@@ -4399,6 +4399,25 @@ pub struct PaneInputHold {
     pub turns: u64,
 }
 
+impl PaneInputHold {
+    /// PRD #1666 part 3 (Q35-21p): the hold one pane's input stream shows,
+    /// with its box read as `semantics` edits it (Q32); the default for a
+    /// pane nothing was written to. Every reader of the hold decision comes
+    /// here ([`PaneInputState::input_hold`]), so Q35-21's switch to the
+    /// epoch changes this one function.
+    fn of(
+        stream: Option<&PaneInputStream>,
+        semantics: Option<crate::composer_model::Semantics>,
+    ) -> Self {
+        stream.map_or_else(Self::default, |stream| Self {
+            paste_open: stream.in_paste,
+            draft: stream.draft.pending()
+                || stream.composer.proof(semantics) != crate::composer_model::InputProof::Empty,
+            turns: stream.turns,
+        })
+    }
+}
+
 /// Issue #424 S1 (both reviewers): where one pane's user-input stream is, as far
 /// as telling a submission apart from a draft needs to know.
 ///
@@ -4814,14 +4833,7 @@ impl PaneInputState {
         pane_id_env: &str,
         semantics: Option<crate::composer_model::Semantics>,
     ) -> PaneInputHold {
-        self.input
-            .get(pane_id_env)
-            .map_or_else(PaneInputHold::default, |stream| PaneInputHold {
-                paste_open: stream.in_paste,
-                draft: stream.draft.pending()
-                    || stream.composer.proof(semantics) != crate::composer_model::InputProof::Empty,
-                turns: stream.turns,
-            })
+        PaneInputHold::of(self.input.get(pane_id_env), semantics)
     }
 
     /// PRD #1666 part 3, round 5-wake (R6-4): what the bytes written into
