@@ -567,13 +567,31 @@ impl Fixture {
     /// a probe was or wasn't admitted. Asserts nothing.
     fn print_log(&self) {
         let text = fs::read_to_string(&self.log).unwrap_or_default();
-        let lines: Vec<&str> = text
+        // A line repeated but for its timestamp is shown once, with a count,
+        // so a tick's repeated refusal doesn't push the start out of view.
+        let body = |l: &str| l.split_once(' ').map_or(l, |(_, rest)| rest).to_owned();
+        let mut lines: Vec<String> = Vec::new();
+        let mut repeats = 0usize;
+        for l in text
             .lines()
             .filter(|l| l.contains("composer_probe") || l.contains("doorbell"))
-            .collect();
+        {
+            if lines.last().is_some_and(|last| body(last) == body(l)) {
+                repeats += 1;
+                continue;
+            }
+            if repeats > 0 {
+                lines.push(format!("    (the line above {repeats} more times)"));
+                repeats = 0;
+            }
+            lines.push(l.to_owned());
+        }
+        if repeats > 0 {
+            lines.push(format!("    (the line above {repeats} more times)"));
+        }
         let skip = lines.len().saturating_sub(LOG_LINES_PRINTED);
         let mut out = format!(
-            "---- fixture deck log ({}; {} matching lines, {} omitted from the start) ----\n",
+            "---- fixture deck log ({}; {} lines after collapsing repeats, {} omitted from the start) ----\n",
             self.log.display(),
             lines.len(),
             skip

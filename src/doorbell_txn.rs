@@ -1122,6 +1122,18 @@ impl<'c> Txn<'c> {
         self.after_cr
     }
 
+    /// Why a withdrawal started, if one did (diagnosis: the attempt's log
+    /// line names it).
+    pub fn withdrawal_cause(&self) -> Option<Cause> {
+        self.withdrawal.map(|(_, cause)| cause)
+    }
+
+    /// Whether the caller's admission re-check said no after the line was
+    /// written (diagnosis, as above).
+    pub fn admission_was_lost(&self) -> bool {
+        self.admission_lost
+    }
+
     pub fn phase(&self) -> Phase {
         self.phase
     }

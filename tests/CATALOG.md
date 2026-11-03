@@ -10695,6 +10695,7 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_probe_delivery.rs`, native F2 fixture).
 - **Agent:** native synthetic Claude and Codex; no real agent or credential.
 - **Asserts:** typing and deleting text requires one physical BEL check before one token-led notice and its actual CLI/prompt-hook inbox hand-over; the message body is not typed into the pane.
+- **Also (Fast, `src/agent_pty_segments.rs`, Q35-21):** the doorbell tick's decision for an `Armable` generation: an untouched box with no check under way asks nothing and lets the ring go ahead; an untouched box with a check's segment still open, or behind a closed fence, rings nothing (the empty read applies before the segment ends, and a ring then is refused at the writer and touches the box again); a touched box with nothing outstanding asks its first check.
 - **Does not assert:** launcher binding, activation, a real agent or a measured Codex head-echo premise. The e2e observer assumption and Codex head-echo assumption are explicit.
 - **Platform coverage:** Linux.
 
