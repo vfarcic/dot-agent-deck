@@ -1678,7 +1678,7 @@ fn probe_009_typing_behind_an_editor_that_ended_goes_once_its_helper_reported_th
 
 // ---- inbox/probe/087: a segment that can never complete ----
 
-/// Scenario: For Claude and Codex under `Hold`, a held Ctrl+G is written as its own trigger and its helper decides `Unarmed` and runs the person's editor, with two more Ctrl+G presses waiting behind it. The segment releases and the writer scope opens, so it can never complete: it reads stranded, and refusing what waits behind it ends both waiting Ctrl+G presses `Refused`, unwritten, while the front stays released and open. A second refusal finds nothing more; with the editor's helper drained, it is still stranded; only retirement ends the front.
+/// Scenario: For Claude and Codex under `Hold`, a held Ctrl+G is written as its own trigger and its helper decides `Unarmed` and runs the person's editor, with two more Ctrl+G presses waiting behind it. The segment releases and the writer scope opens, so it can never complete, but while the helper runs it isn't stranded and nothing is refused; once the helper reported the editor's end and exited it reads stranded, and refusing what waits behind it ends both waiting Ctrl+G presses `Refused`, unwritten, while the front stays released and open. A second refusal finds nothing more; only retirement ends the front.
 #[spec("inbox/probe/087")]
 #[test]
 fn probe_087_a_released_segment_whose_scope_is_open_is_stranded() {
@@ -1699,9 +1699,15 @@ fn probe_087_a_released_segment_whose_scope_is_open_is_stranded() {
             "{agent:?}: an `Unarmed` decision opens the scope under Hold"
         );
         assert!(
-            t.s.stranded(&t.r),
-            "{agent:?}: released, and never to complete"
+            !t.s.stranded(&t.r),
+            "{agent:?}: its helper runs, so a cut-off may still come"
         );
+        assert!(!t.s.refuse_behind(&t.r), "{agent:?}: nothing refused yet");
+        assert!(t.ended().is_empty(), "{agent:?}");
+        t.report(1, Report::Done(Tree::Clean), 4);
+        t.exit(1, 5);
+        t.returns(6);
+        assert!(t.s.stranded(&t.r), "{agent:?}: drained, never to complete");
         assert!(t.s.refuse_behind(&t.r), "{agent:?}");
         assert_eq!(
             t.ended(),
@@ -1716,13 +1722,6 @@ fn probe_087_a_released_segment_whose_scope_is_open_is_stranded() {
         assert_eq!(t.s.next_trigger(), None, "{agent:?}: no trigger");
         assert!(t.s.refuse_behind(&t.r), "{agent:?}: still stranded");
         assert!(t.ended().is_empty(), "{agent:?}: nothing more to refuse");
-        t.report(1, Report::Done(Tree::Clean), 4);
-        t.exit(1, 5);
-        t.returns(6);
-        assert!(
-            t.s.stranded(&t.r),
-            "{agent:?}: drained, still never to complete"
-        );
         t.s.retire();
         assert!(!t.s.stranded(&t.r), "{agent:?}: retired");
         assert_eq!(

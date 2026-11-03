@@ -25,9 +25,10 @@
 //! that cut as its trigger, its number published first. Nothing here
 //! releases on a timer: the segments decide (core §4.6).
 //!
-//! **A front that can never complete** (`Segments::stranded`: it released
-//! and the writer scope is open, as a person's Ctrl+G answered by their
-//! editor during a check leaves it under `Hold`). Once the release has gone
+//! **A front that can never complete** (`Segments::stranded`: it released,
+//! the writer scope is open and its helper drained with a known end, as a
+//! person's Ctrl+G answered by their editor during a check leaves it under
+//! `Hold` once the editor's helper is gone). Once the release has gone
 //! as far as the next held Ctrl+G, the driver refuses that Ctrl+G and
 //! everything held after it ([`PaneWriter::refuse_stranded`]): each op's
 //! connection is told [`CTRL_G_REFUSED`], its ticket settles refused, and

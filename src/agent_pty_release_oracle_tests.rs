@@ -81,14 +81,14 @@
 //!
 //! **A later Ctrl+G behind a segment that can never complete** (R-HOLD's
 //! bounded refusal, the user's ruling of 2026-11-03). Once a released
-//! segment's writer scope is open, nothing completes it, so the model
-//! refuses the Ctrl+G first in what is held behind it, with everything held
-//! after it, once the release has gone up to it: those bytes are never
-//! expected. Its own fixed script is
+//! segment's writer scope is open, nothing completes it, so, once its
+//! helper has drained with a known end, the model refuses the Ctrl+G first
+//! in what is held behind it, with everything held after it, once the
+//! release has gone up to it: those bytes are never expected. Its own fixed script is
 //! [`probe_087_a_later_ctrl_g_behind_an_editor_segment_is_refused_and_typing_goes_on`],
 //! which also checks the notice, the ticket and the doorbell's tick; the
 //! generated runs reach the row too, which a floor requires
-//! ([`Stats::refused`]: 43 in the fast tier's 40 seeds and 185 in lane 1's
+//! ([`Stats::refused`]: 32 in the fast tier's 40 seeds and 93 in lane 1's
 //! 240 when it was added).
 //!
 //! **The policy it assumes (the audit's U3-2).** Every generation here runs
@@ -1321,10 +1321,17 @@ impl Model {
                 }
                 self.expected.extend(self.held.drain(..upto));
                 // R-HOLD's bounded refusal (the user's ruling, 2026-11-03):
-                // with the scope open this segment never completes, so the
-                // Ctrl+G now first in what is held, and everything after it,
-                // is refused and never written.
-                if candidate.is_some() && self.scope_open {
+                // with the scope open this segment never completes, so once
+                // its helper drained with a known end (no cut-off can follow)
+                // the Ctrl+G now first in what is held, and everything after
+                // it, is refused and never written.
+                let ended = seg.record.is_some_and(|ri| {
+                    let r = &self.records[ri];
+                    r.drained
+                        && !(r.decision != Some(Decision::Armed)
+                            && matches!(r.report, Report::None | Report::Unrecognised))
+                });
+                if candidate.is_some() && self.scope_open && ended {
                     self.held.clear();
                     self.stats.refused += 1;
                 }
@@ -3617,7 +3624,7 @@ fn record(pid: u32, seg: u64, decision: Decision) -> MRecord {
     }
 }
 
-/// Scenario: For Claude and Codex, a person's Ctrl+G is held behind the deck's check and, once the check ends, written as its own trigger, which its helper answers by running the person's editor: the segment releases and the person's typing goes on to the pane, while the editor runs or after its helper reported it ended and exited. Under `Hold` that segment can never complete, so the person then presses Ctrl+G again with more typing after it, in one write: that Ctrl+G and what follows it are refused at once, their connection told `ctrl-g-refused`, none of it reaches the PTY and nothing stays held; what the person types next goes straight on, and the doorbell's tick no longer reads a check outstanding.
+/// Scenario: For Claude and Codex, a person's Ctrl+G is held behind the deck's check and, once the check ends, written as its own trigger, which its helper answers by running the person's editor: the segment releases and the person's typing goes on to the pane. Under `Hold` that segment can never complete, so the person then presses Ctrl+G again with more typing after it, in one write. While the editor's helper still runs, that write waits behind the segment and the doorbell's tick reads a check outstanding; once the helper has reported the editor's end and exited (before or after that write), the write is refused, its connection told `ctrl-g-refused`, none of it reaches the PTY and nothing stays held; what the person types next goes straight on, and the doorbell's tick no longer reads a check outstanding.
 #[spec("inbox/probe/087")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn probe_087_a_later_ctrl_g_behind_an_editor_segment_is_refused_and_typing_goes_on() {
@@ -3654,6 +3661,23 @@ async fn probe_087_a_later_ctrl_g_behind_an_editor_segment_is_refused_and_typing
             );
             let (tx, mut notice) = tokio::sync::mpsc::channel(4);
             rig.typed_with(b"\x07cd", Some(tx)).await;
+            if !ended {
+                // The helper still runs: a cut-off may still come at its
+                // drain, so nothing is refused yet.
+                rig.settle(b"\x07\x07ab").await;
+                let status = rig.writer.lock().await.gate.gate.status();
+                assert_eq!(
+                    status.held_ops, 1,
+                    "{what}: held while the editor's helper runs"
+                );
+                assert_eq!(
+                    tick_probe(&rig.input, status, Instant::now()),
+                    TickProbe::Outstanding,
+                    "{what}: the helper still runs"
+                );
+                rig.report(72, Report::Done(Tree::Clean));
+                rig.exit(72);
+            }
             let told = tokio::time::timeout(Duration::from_secs(3), notice.recv()).await;
             let status = rig.writer.lock().await.gate.gate.status();
             assert_eq!(

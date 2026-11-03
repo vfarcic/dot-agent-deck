@@ -96,12 +96,14 @@
 //!   scope, so only retirement ends its segment.
 //!
 //! **A segment that can never complete** ([`Segments::stranded`]): a front
-//! segment that released while the writer scope is open. No step but
+//! segment that released while the writer scope is open, once its helper's
+//! exit has drained with a known end, so no cut-off can follow. No step but
 //! retirement closes an open scope, and [`Records::complete`] refuses every
 //! route while it is open, so no Ctrl+G behind it can ever be written as a
 //! trigger. Under `Hold` an `Unarmed` decision is what opens it, so a
 //! person's Ctrl+G during a check whose segment released to their editor
-//! leaves one. A later Ctrl+G behind it would wait for retirement and be
+//! leaves one once its helper has drained. A later Ctrl+G behind it would
+//! wait for retirement and be
 //! discarded there, with what was typed after it, so the release driver
 //! refuses it instead, with what the gate holds after it, once the release
 //! has gone as far as it ([`Segments::refuse_behind`], R-HOLD's bounded
@@ -778,17 +780,26 @@ impl Segments {
         self.segments.front().and_then(|s| s.number)
     }
 
-    /// Whether the front segment can never complete (see the module
-    /// documentation): it released, its release wasn't cut off, and the
-    /// writer scope is open, which only retirement undoes. Everything behind
-    /// it would then wait for retirement.
+    /// Whether the front segment can never complete and its release can no
+    /// longer change (see the module documentation): it released, the
+    /// writer scope is open, which only retirement undoes, and its matched
+    /// record's exit has drained with an end that isn't an unknown wait, so
+    /// no cut-off can follow (a record's report is set once, and its
+    /// decision too). Everything behind it would then wait for retirement.
+    /// While its helper still runs it isn't stranded yet: a later Ctrl+G
+    /// waits behind it, and the drain decides between a refusal and a
+    /// cut-off (R-U2-06), which keeps it held.
     pub fn stranded(&self, records: &Records) -> bool {
         !self.retired
             && matches!(records.scope().state(), ScopeState::Open(_))
-            && self
-                .segments
-                .front()
-                .is_some_and(|seg| seg.number.is_some() && seg.released && !seg.cut_off)
+            && self.segments.front().is_some_and(|seg| {
+                seg.number.is_some()
+                    && seg.released
+                    && !seg.cut_off
+                    && seg
+                        .fact
+                        .is_some_and(|f| !wait_unknown(f.decision, f.report))
+            })
     }
 
     /// The release driver refuses the person's Ctrl+G held behind a
