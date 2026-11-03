@@ -204,7 +204,7 @@ impl World {
             composer,
             user_cells: self.user_cells.clone(),
             text: self.user_cells.join("\n"),
-            input: Default::default(),
+            ..Frame::default()
         }
     }
 

@@ -672,9 +672,9 @@ fn doorbell_036_blanks_and_blank_lines_the_claude_screen_cannot_show() {
         Grid::parse(&bytes, trace.rows, trace.cols)
     };
     let ready = |grid: &Grid, input: InputProof| {
-        let mut f = frame(p, grid, 0, true, None);
-        f.input = input;
-        f.empty_and_ready()
+        frame(p, grid, 0, true, None)
+            .with_input(input)
+            .empty_and_ready()
     };
     // The cleared composer: prompt on row 22 (one-based), its rules on 21
     // and 23. Three spaces, then Left three times, as Claude Code redraws

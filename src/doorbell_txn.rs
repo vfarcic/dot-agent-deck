@@ -594,6 +594,14 @@ impl Frame {
             })
     }
 
+    /// PRD #1666 part 3 (Q35-21p): this frame, read with `input` as what the
+    /// bytes written into the pane say its box holds. The one way tests set
+    /// a frame's input, so Q35-21's switch (the input becomes `touched`)
+    /// changes the tests in one place.
+    pub fn with_input(self, input: crate::composer_model::InputProof) -> Self {
+        Self { input, ..self }
+    }
+
     /// The composer holds exactly `text`, the cursor right after it.
     pub fn holds_exactly(&self, text: &str) -> bool {
         self.composer
