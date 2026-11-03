@@ -314,7 +314,7 @@ tasks:
   - key: rustup
     if: ${{ tasks.backend.values.active == 'true' }}
     env:
-      RUSTUP_VERSION: 1.29.2
+      RUSTUP_VERSION: 1.29.3
     run: |
       # `rust-src` up front: `cross` adds it otherwise, into the toolchain, and
       # a warm tool cache then restores that copy over this layer's and
