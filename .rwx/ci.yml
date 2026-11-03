@@ -297,7 +297,14 @@ tasks:
       fi
       # Extracted into the workspace, so `target/` lands where the tests'
       # compile-time paths (`env!("CARGO_BIN_EXE_dot-agent-deck")`) point.
-      cargo nextest run --archive-file e2e.tar.zst --workspace-remap . \
+      # Under scripts/rwx-export-root.sh: a task's `/` is overlayfs, which the
+      # composer probe's export path rule refuses, so without it no test here
+      # could see an input box proved empty. It puts `/`, `/var`, `/tmp` and
+      # `/var/tmp` on a tmpfs, which the rule accepts, for this command only
+      # (docs/develop/rwx.md, "The export chain"). GitHub's runners need no
+      # such step (their root is ext4), so ci.yml runs the tier without it.
+      scripts/rwx-export-root.sh \
+        cargo nextest run --archive-file e2e.tar.zst --workspace-remap . \
         --extract-to . --extract-overwrite --retries 1 "$@"
     outputs:
       # Nothing uses a partition's filesystem; uploading it cost 5 minutes.
