@@ -671,7 +671,7 @@ fn probe_049_mode_observations_and_malformed_pairs_are_not_release_authority() {
     }
 }
 
-/// Scenario: Hold a human editor's helper after a failed spawn or an injected wait failure following a real editor start. A failed spawn retains the suffix through return and retirement under production Hold; a running user editor reads its released suffix either before the unknown-wait drain or after its PID and start ticks identify a settled drain marked wait_unknown with that line still parked at the writer. The parked case also queues another trigger and suffix that must stay held through the drain, return and replacement, while the released line reaches the editor's terminal exactly once.
+/// Scenario: Hold a human editor's helper after a failed spawn or an injected wait failure following a real editor start. A failed spawn retains the suffix through return and retirement under production Hold; a running user editor reads its released suffix either before the unknown-wait drain or after its PID and start ticks identify a settled drain marked wait_unknown with that line still parked at the writer. In the parked case the editor's segment can never complete under Hold, so a further Ctrl+G and suffix typed behind it is refused at once with `ctrl-g-refused` and none of it is held, handed to the writer or written to the PTY through the drain, return and replacement, while the released line reaches the editor's terminal exactly once.
 #[spec("inbox/probe/049")]
 #[test]
 fn probe_049_failed_editor_outcomes_stay_held_under_production_hold() {
@@ -727,12 +727,32 @@ fn probe_049_failed_editor_outcomes_stay_held_under_production_hold() {
                 assert_eq!(writer["dequeued"], before + 1, "{writer}");
                 assert!(!f.held(), "the parked line has already left the gate");
                 assert!(!f.path("editor-input").exists());
-                // A further candidate stops release at its boundary. This
-                // suffix is still in the gate when the unknown wait drains.
-                human.write("\x07STILL-IN-GATE\n");
-                f.wait_held();
+                // R-HOLD's bounded refusal: the person's editor segment has
+                // released with its scope open, so it can never complete. A
+                // further Ctrl+G and what follows it is refused at once, its
+                // connection told `ctrl-g-refused`: none of it is held, none
+                // reaches the writer, and so none can be released after the
+                // unknown wait below.
+                let mut later = f.connect_watching_refusals();
+                later.write("\x07STILL-IN-GATE\n");
+                assert!(
+                    common::wait_until(WAIT, || later
+                        .refusals()
+                        .iter()
+                        .any(|r| r == b"ctrl-g-refused")),
+                    "the later Ctrl+G and its suffix must be refused with ctrl-g-refused: {:?}",
+                    later.refusals()
+                );
+                assert_eq!(later.refusals().len(), 1, "one notice for the one write");
                 let fence = f.control("fence-status")["composer_fence"].clone();
-                assert_eq!(fence["held_bytes"], b"\x07STILL-IN-GATE\n".len(), "{fence}");
+                assert_eq!(fence["held_ops"], 0, "nothing refused stays held: {fence}");
+                assert_eq!(fence["held_bytes"], 0, "{fence}");
+                let writer = f.control("writer-status")["composer_writer"].clone();
+                assert_eq!(
+                    writer["dequeued"],
+                    before + 1,
+                    "nothing of the refused write reached the writer: {writer}"
+                );
                 let observer = f.control("observer-hold")["composer_observer"].clone();
                 assert_eq!(observer["passes_held"], true, "{observer}");
                 assert_eq!(observer["pass_running"], false, "{observer}");
@@ -796,11 +816,16 @@ fn probe_049_failed_editor_outcomes_stay_held_under_production_hold() {
                 assert_eq!(drained["decision"], "unarmed", "{drained}");
                 assert_eq!(drained["report"], "none", "{drained}");
                 assert_eq!(f.scope(), "open");
-                assert!(f.held(), "the next trigger and suffix stay in the gate");
+                assert!(!f.held(), "the refused trigger and suffix stay refused");
                 assert_eq!(
                     f.control("fence-status")["composer_fence"]["held_bytes"],
-                    b"\x07STILL-IN-GATE\n".len(),
-                    "the drain must retain the complete later trigger and suffix"
+                    0,
+                    "the drain must bring back nothing of the refused write"
+                );
+                assert_eq!(
+                    f.control("writer-status")["composer_writer"]["dequeued"],
+                    before + 1,
+                    "the drain hands the writer nothing more"
                 );
                 assert_eq!(
                     f.control("writer-status")["composer_writer"]["parked"],
@@ -819,13 +844,13 @@ fn probe_049_failed_editor_outcomes_stay_held_under_production_hold() {
             if parked {
                 f.stable(b"\x07\x07");
                 // The editor has consumed its complete canonical line and
-                // now waits for editor-go. No duplicate or held suffix may
-                // remain readable in that same terminal's input queue.
+                // now waits for editor-go. No duplicate or refused suffix
+                // may be readable in that same terminal's input queue.
                 assert_eq!(
                     f.command(json!({"action":"input-pending"}))["pending_bytes"],
                     0
                 );
-                assert!(f.held());
+                assert!(!f.held(), "nothing refused came back to the gate");
             }
             f.flag("editor-go");
             f.wait("editor-finished");
@@ -854,8 +879,14 @@ fn probe_049_failed_editor_outcomes_stay_held_under_production_hold() {
         if parked {
             assert_eq!(
                 f.control("fence-status")["composer_fence"]["held_bytes"],
-                b"\x07STILL-IN-GATE\n".len(),
-                "the matching return must retain what was still held at drain"
+                0,
+                "the matching return must release nothing of the refused write"
+            );
+            assert!(
+                !f.input()
+                    .windows(b"STILL-IN-GATE".len())
+                    .any(|w| w == b"STILL-IN-GATE"),
+                "the refused suffix must never reach the PTY"
             );
         }
         f.probe();

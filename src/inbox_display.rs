@@ -132,6 +132,11 @@ pub const INPUT_REJECTED_WRITE_FAILED: &str =
 /// `wrong-session` (another agent generation has the pane now).
 pub const INPUT_REJECTED_REPLACED_OR_CLOSED: &str =
     "Input not delivered: the agent in this pane was replaced or closed";
+/// [`input_rejected`]'s words for `ctrl-g-refused` (PRD #1666 part 3,
+/// R-HOLD's bounded refusal): a person's Ctrl+G, and what was typed after
+/// it, behind a check their editor answered earlier in the same agent run,
+/// which the deck can no longer serialise a Ctrl+G behind.
+pub const INPUT_REJECTED_CTRL_G_REFUSED: &str = "Input not delivered: your Ctrl+G and what you typed after it; the deck passes no more Ctrl+G to this agent until it restarts";
 /// [`input_rejected`]'s words for a refusal that names no reason.
 pub const INPUT_REJECTED_UNNAMED: &str = "Input not delivered";
 
@@ -167,8 +172,18 @@ pub fn input_rejected(reason: &str) -> String {
         "exited" => INPUT_REJECTED_EXITED.to_string(),
         "write-failed" => INPUT_REJECTED_WRITE_FAILED.to_string(),
         "stale" | "wrong-session" => INPUT_REJECTED_REPLACED_OR_CLOSED.to_string(),
+        "ctrl-g-refused" => INPUT_REJECTED_CTRL_G_REFUSED.to_string(),
         other => format!("{INPUT_REJECTED_UNNAMED} ({other})"),
     }
+}
+
+/// Whether a refusal of typed input for `reason` leaves the agent live and
+/// writable, so a client keeps the person typing into its pane: `true` for
+/// `ctrl-g-refused` alone, whose agent takes what is typed next (R-HOLD's
+/// bounded refusal). The TUI leaves its pane-input mode for every other
+/// reason; the desktop keeps the tile's input for every reason.
+pub fn input_rejection_keeps_typing(reason: &str) -> bool {
+    reason.trim() == "ctrl-g-refused"
 }
 
 /// PRD #1666 part 3, round 5-wake (Q6): the deck-wide attention item names a
@@ -1662,6 +1677,7 @@ mod tests {
             ("write-failed", INPUT_REJECTED_WRITE_FAILED),
             ("stale", INPUT_REJECTED_REPLACED_OR_CLOSED),
             ("wrong-session", INPUT_REJECTED_REPLACED_OR_CLOSED),
+            ("ctrl-g-refused", INPUT_REJECTED_CTRL_G_REFUSED),
             ("", INPUT_REJECTED_UNNAMED),
         ] {
             assert_eq!(words["inputRejected"][reason], expected, "{reason:?}");
@@ -1671,7 +1687,7 @@ mod tests {
             words["inputRejected"]
                 .as_object()
                 .map(|reasons| reasons.len()),
-            Some(6),
+            Some(7),
             "the fixture lists every refusal the deck names"
         );
         // Merge review U3-2: the state both clients show before anything is

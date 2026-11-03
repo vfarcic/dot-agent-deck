@@ -79,6 +79,18 @@
 //! reaches it on Claude and holds on Codex, whose release also needs its
 //! return past the drain frontier, which this rig never takes.
 //!
+//! **A later Ctrl+G behind a segment that can never complete** (R-HOLD's
+//! bounded refusal, the user's ruling of 2026-11-03). Once a released
+//! segment's writer scope is open, nothing completes it, so the model
+//! refuses the Ctrl+G first in what is held behind it, with everything held
+//! after it, once the release has gone up to it: those bytes are never
+//! expected. Its own fixed script is
+//! [`probe_087_a_later_ctrl_g_behind_an_editor_segment_is_refused_and_typing_goes_on`],
+//! which also checks the notice, the ticket and the doorbell's tick; the
+//! generated runs reach the row too, which a floor requires
+//! ([`Stats::refused`]: 43 in the fast tier's 40 seeds and 185 in lane 1's
+//! 240 when it was added).
+//!
 //! **The policy it assumes (the audit's U3-2).** Every generation here runs
 //! [`EcPolicy::Hold`], production's policy, under which `Records::complete`
 //! refuses the EC route: the model has no EC or frontier rows, and no
@@ -502,7 +514,13 @@ impl Rig {
     }
 
     async fn typed(&self, bytes: &[u8]) {
-        let frame = UserFrame::new(bytes.to_vec(), Some(self.ledger.admit()), None);
+        self.typed_with(bytes, None).await;
+    }
+
+    /// [`Self::typed`], its connection told of a refusal through `notice`,
+    /// as the attach loop's rejection route tells it.
+    async fn typed_with(&self, bytes: &[u8], notice: Option<tokio::sync::mpsc::Sender<Vec<u8>>>) {
+        let frame = UserFrame::new(bytes.to_vec(), Some(self.ledger.admit()), notice);
         let accepted = self.writer.lock().await.accept(frame, None).await;
         let what = match accepted {
             Accepted::Held | Accepted::Written(Ok(())) => return,
@@ -903,6 +921,9 @@ struct Stats {
     /// `HumanG`s a cut opened with a liability out and no segment
     /// (A-20d-5).
     cut_opened: usize,
+    /// Held Ctrl+G presses refused, with what followed them, behind a
+    /// released segment that can never complete (R-HOLD's bounded refusal).
+    refused: usize,
     /// Each row reached, and by how many segments.
     rows: std::collections::BTreeMap<Row, usize>,
     /// Each kind of settlement reached.
@@ -916,6 +937,7 @@ impl Stats {
         self.cut_off += other.cut_off;
         self.completed += other.completed;
         self.cut_opened += other.cut_opened;
+        self.refused += other.refused;
         for (row, n) in &other.rows {
             *self.rows.entry(*row).or_default() += n;
         }
@@ -1103,6 +1125,13 @@ impl Model {
             && r.report == Report::None
         {
             r.report = report;
+            // `Records::report`: a tree the helper left running or couldn't
+            // account for opens the scope when it is reported, before any
+            // exit (which the refusal above reads; completion reads it only
+            // after the drain, where the exit's rule below agrees).
+            if matches!(report, Report::Done(Tree::Survivors | Tree::Unknown)) {
+                self.scope_open = true;
+            }
         }
         self.step();
     }
@@ -1291,6 +1320,14 @@ impl Model {
                     self.stats.passed += 1;
                 }
                 self.expected.extend(self.held.drain(..upto));
+                // R-HOLD's bounded refusal (the user's ruling, 2026-11-03):
+                // with the scope open this segment never completes, so the
+                // Ctrl+G now first in what is held, and everything after it,
+                // is refused and never written.
+                if candidate.is_some() && self.scope_open {
+                    self.held.clear();
+                    self.stats.refused += 1;
+                }
             }
             Some(_) => {}
         }
@@ -2049,13 +2086,14 @@ fn assert_reached(reached: &Reached, floor: usize) {
     let r = &reached.stats;
     eprintln!(
         "reached: {} releases, {} passed, {} cut off, {} completions, {} triggers, \
-         {} cut-opened, {} retirements, settled {:?}",
+         {} cut-opened, {} refused, {} retirements, settled {:?}",
         r.released,
         r.passed,
         r.cut_off,
         r.completed,
         reached.triggers,
         r.cut_opened,
+        r.refused,
         reached.retired,
         r.settled
     );
@@ -2081,6 +2119,10 @@ fn assert_reached(reached: &Reached, floor: usize) {
         ("completions", r.completed),
         ("triggers", reached.triggers),
         ("HumanGs a cut opened", r.cut_opened),
+        (
+            "Ctrl+G presses refused behind a segment that can never complete",
+            r.refused,
+        ),
         ("retirements", reached.retired),
     ] {
         assert!(n >= floor, "only {n} {what} across the seeds");
@@ -3560,5 +3602,156 @@ async fn probe_086_a_cut_with_a_liability_out_and_no_segment_opens_a_humang() {
         for (what, steps) in cut_open_scripts(agent) {
             run_with(Opts::default(), agent, b"", false, &steps, &what).await;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// R-HOLD's limit as a bounded refusal (the user's ruling, 2026-11-03).
+// ---------------------------------------------------------------------------
+
+/// Helper `pid`'s record as [`helper`] scripts it.
+fn record(pid: u32, seg: u64, decision: Decision) -> MRecord {
+    match helper(pid, seg, decision) {
+        Step::Observe(r) => r,
+        other => unreachable!("{other:?}"),
+    }
+}
+
+/// Scenario: For Claude and Codex, a person's Ctrl+G is held behind the deck's check and, once the check ends, written as its own trigger, which its helper answers by running the person's editor: the segment releases and the person's typing goes on to the pane, while the editor runs or after its helper reported it ended and exited. Under `Hold` that segment can never complete, so the person then presses Ctrl+G again with more typing after it, in one write: that Ctrl+G and what follows it are refused at once, their connection told `ctrl-g-refused`, none of it reaches the PTY and nothing stays held; what the person types next goes straight on, and the doorbell's tick no longer reads a check outstanding.
+#[spec("inbox/probe/087")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_087_a_later_ctrl_g_behind_an_editor_segment_is_refused_and_typing_goes_on() {
+    use super::segment_driver::{TickProbe, tick_probe};
+    for agent in [Agent::Claude, Agent::Codex] {
+        for ended in [false, true] {
+            let what = format!("{} ended={ended}", agent_name(agent));
+            let rig = Rig::new(agent, b"");
+            rig.probe(|_| {}).await;
+            rig.typed(b"\x07").await;
+            rig.observe(&record(71, 1, Decision::Armed));
+            rig.exit(71);
+            for m in fast_return(agent) {
+                rig.out(m);
+            }
+            rig.settle(&[CTRL_G, CTRL_G]).await;
+            assert_eq!(
+                rig.taken(),
+                [CTRL_G, CTRL_G],
+                "{what}: the probe, then the person's Ctrl+G as its own trigger"
+            );
+            rig.observe(&record(72, 2, Decision::Unarmed));
+            rig.editor(72);
+            if ended {
+                rig.report(72, Report::Done(Tree::Clean));
+                rig.exit(72);
+            }
+            rig.typed(b"ab").await;
+            rig.settle(b"\x07\x07ab").await;
+            assert_eq!(
+                rig.taken(),
+                b"\x07\x07ab",
+                "{what}: typing goes to the pane behind the person's editor"
+            );
+            let (tx, mut notice) = tokio::sync::mpsc::channel(4);
+            rig.typed_with(b"\x07cd", Some(tx)).await;
+            let told = tokio::time::timeout(Duration::from_secs(3), notice.recv()).await;
+            let status = rig.writer.lock().await.gate.gate.status();
+            assert_eq!(
+                status.held_ops, 0,
+                "{what}: the later Ctrl+G and what follows it aren't held: {status:?}"
+            );
+            assert_eq!(
+                told.ok().flatten().as_deref(),
+                Some(&b"ctrl-g-refused"[..]),
+                "{what}: its connection told why"
+            );
+            rig.typed(b"ef").await;
+            rig.settle(b"\x07\x07abef").await;
+            assert_eq!(
+                rig.taken(),
+                b"\x07\x07abef",
+                "{what}: nothing of the refused write, and what is typed after it goes on"
+            );
+            assert!(
+                !rig.ledger.any_outstanding(),
+                "{what}: the refused write's ticket settled"
+            );
+            let status = rig.writer.lock().await.gate.gate.status();
+            assert_eq!(
+                tick_probe(&rig.input, status, Instant::now()),
+                TickProbe::NotDue,
+                "{what}: no check outstanding, so the doorbell's tick goes on"
+            );
+            assert_eq!(
+                rig.writer
+                    .lock()
+                    .await
+                    .pty
+                    .in_flight
+                    .count
+                    .load(Ordering::SeqCst),
+                0,
+                "{what}: nothing left in flight"
+            );
+        }
+    }
+}
+
+/// Scenario: A Claude Code generation shows its main composer on a real bus, and a probe is asked as the deck's probe request asks it; each time, the agent writes output between the probe's scheduling and its arm section, so the writer refuses it for the screen (`Admission(Surface)`). The first three refusals in a row count no failure and leave the schedule due; the fourth counts one, so the schedule backs off (A-20d-11 bounded, the revd21 review's U3-1). A counted failure starts the run over: after a person's ticket refuses one, three more refusals for the screen count nothing more.
+#[spec("inbox/probe/084")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_084_a_screen_that_keeps_moving_before_the_arm_backs_off() {
+    let schedule = |rig: &Rig| {
+        rig.input
+            .advance_schedule_for_e2e(Duration::ZERO, Instant::now())
+    };
+    let moved = |rig: &Arc<Rig>| {
+        let rig = Arc::clone(rig);
+        async move {
+            rig.out(&claude_frame(80));
+            rig.probe_admitted(|rig| rig.out(b"x")).await
+        }
+    };
+    let rig = Rig::build(Agent::Claude, b"", true);
+    for i in 1..=4u32 {
+        assert_eq!(
+            moved(&rig).await,
+            ProbeOutcome::Refused("Admission(Surface)".to_string()),
+            "refusal {i}"
+        );
+        let expected = if i < 4 {
+            Some((true, 0, false))
+        } else {
+            Some((false, 1, false))
+        };
+        assert_eq!(schedule(&rig), expected, "after refusal {i} in a row");
+    }
+    assert!(rig.taken().is_empty(), "no byte written");
+
+    // A ticket's refusal counts, and starts the run over.
+    let rig = Rig::build(Agent::Claude, b"", true);
+    rig.out(&claude_frame(80));
+    let mut kept = None;
+    let outcome = rig
+        .probe_admitted(|rig| kept = Some(rig.ledger.admit()))
+        .await;
+    assert_eq!(
+        outcome,
+        ProbeOutcome::Refused("Admission(HumanTicket)".to_string())
+    );
+    // The person's write settles, so the next probes see no ticket.
+    drop(kept);
+    assert_eq!(schedule(&rig).map(|(_, failures, _)| failures), Some(1));
+    for i in 1..=3u32 {
+        assert_eq!(
+            moved(&rig).await,
+            ProbeOutcome::Refused("Admission(Surface)".to_string()),
+            "refusal {i} after the ticket"
+        );
+        assert_eq!(
+            schedule(&rig).map(|(_, failures, _)| failures),
+            Some(1),
+            "refusal {i} after the ticket counts nothing more"
+        );
     }
 }

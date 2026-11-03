@@ -7406,7 +7406,12 @@ fn apply_stream_rejection_feedback(
         return false;
     }
     ui.status_message = Some((stream_reject_message(reason), now));
-    ui.mode = UiMode::Normal;
+    // PRD #1666 part 3 (R-HOLD's bounded refusal): a refused Ctrl+G leaves
+    // the agent live, and what the person types next goes to it, so the
+    // pane keeps its input, as the desktop's tile keeps it.
+    if !crate::inbox_display::input_rejection_keeps_typing(reason) {
+        ui.mode = UiMode::Normal;
+    }
     true
 }
 
@@ -40663,6 +40668,29 @@ mod tests {
         let acted =
             apply_stream_rejection_feedback(&mut ui, Some("focused"), "focused", "exited", now);
         assert!(!acted, "a rejection while not in PaneInput must be ignored");
+    }
+
+    /// Scenario: The focused pane is in PaneInput when the daemon refuses the person's Ctrl+G and what they typed after it (`ctrl-g-refused`, the agent still live). The TUI's status line shows the refusal in the words the desktop shows, and the pane keeps its input, so what the person types next still goes to the agent.
+    #[spec::spec("inbox/probe/087")]
+    #[test]
+    fn probe_087_a_refused_ctrl_g_keeps_the_pane_typing() {
+        let now = std::time::Instant::now();
+        let mut ui = default_ui();
+        ui.mode = UiMode::PaneInput;
+        let acted = apply_stream_rejection_feedback(
+            &mut ui,
+            Some("focused"),
+            "focused",
+            "ctrl-g-refused",
+            now,
+        );
+        assert!(acted, "a refusal for the focused pane acts");
+        assert_eq!(ui.mode, UiMode::PaneInput, "the pane keeps its input");
+        assert_eq!(
+            ui.status_message.as_ref().map(|(m, _)| m.as_str()),
+            Some(crate::inbox_display::INPUT_REJECTED_CTRL_G_REFUSED),
+            "the refusal shown in the shared words"
+        );
     }
 
     // -----------------------------------------------------------------------
