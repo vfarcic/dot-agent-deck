@@ -454,6 +454,42 @@ fn codex_027_a_draft_kept_on_enter_holds_the_doorbell() {
     );
 }
 
+/// Scenario: Deliver one message to an idle native Codex stand-in by its ring, then type that ring's own line back into Codex's composer, as a user would, and queue another. The deck adds no byte for 4 seconds, not even a check (the typed line hides Codex's placeholder) and the message stays held with its reason. After the user clears the composer, a check reads it empty and the deck rings once more, with a fresh token rather than the one the user typed back.
+#[spec("inbox/codex/027")]
+#[test]
+fn codex_027_the_decks_own_line_typed_back_gets_no_byte_and_the_next_ring_a_fresh_token() {
+    // Q128b ruling (iv): the second half of
+    // `codex_027_a_doorbell_shaped_line_the_deck_did_not_type_gets_no_byte`,
+    // through the route that still types a deck line after a user's keys:
+    // an observer's check.
+    let f = fixture("codex");
+    let first = f.enqueue();
+    let line = delivered(&f, &first);
+    f.expect(format!("{line}\r").as_bytes());
+    let mut human = f.connect();
+    human.write(&line);
+    let typed_back = format!("{line}\r{line}");
+    f.expect(typed_back.as_bytes());
+    let second = f.enqueue();
+    wait_hold(&f, "cannot_check");
+    assert!(
+        !common::wait_until(Duration::from_secs(4), || f.input()
+            != typed_back.as_bytes()),
+        "nothing added to the deck's own line typed back: {:?}",
+        f.input()
+    );
+    assert!(mail_turns(&f, &second).is_empty());
+    human.write("\x15");
+    let cleared = format!("{typed_back}\x15");
+    f.expect(cleared.as_bytes());
+    // The refused check backs the schedule off; advance its clock rather
+    // than wait it out. It moves no epoch number and grants nothing.
+    f.control(&format!("schedule-advance:{}", BACKOFF[0].as_millis()));
+    let again = delivered(&f, &second);
+    assert_ne!(again[..8], line[..8], "a fresh token");
+    f.expect(format!("{cleared}\x07{again}\r").as_bytes());
+}
+
 /// Scenario: Type and delete a draft in an idle Claude composer, then queue mail. The real check must precede the single submitted notice and its real inbox fetch; deleting the draft alone is not permission to ring.
 #[spec("inbox/probe/024")]
 #[test]

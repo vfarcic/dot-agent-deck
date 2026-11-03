@@ -491,7 +491,7 @@ fn codex_027_a_dialog_on_the_head_gets_nothing_more() {
     );
 }
 
-/// Scenario: Type a doorbell-shaped line naming another message into measured Codex 0.164.0's composer, as a user would, and queue a task: the deck adds no byte (no line, no Enter, no delete) through its settle window and well past it. Then deliver a task, type that ring's own old line back into the composer and queue another: again nothing is added. Clearing the composer lets the doorbell ring and deliver.
+/// Scenario: Type a doorbell-shaped line naming another message into measured Codex 0.164.0's composer, as a user would, and queue a task: the deck adds no byte (no line, no Enter, no delete) through its settle window and well past it. Clearing the composer leaves a box no check can read, so the task stays held with its reason and nothing is typed; the user's own prompt hands it over. The deck's own old line typed back is `codex_027_the_decks_own_line_typed_back_gets_no_byte_and_the_next_ring_a_fresh_token`, where a check can read the box.
 #[spec("inbox/codex/027")]
 #[test]
 fn codex_027_a_doorbell_shaped_line_the_deck_did_not_type_gets_no_byte() {
@@ -512,21 +512,28 @@ fn codex_027_a_doorbell_shaped_line_the_deck_did_not_type_gets_no_byte() {
     );
     state(&deck.daemon, &codex.pane, &id, "queued");
 
+    // Q35-21 (Q128b rulings (ii) and (iv)): the cleared box is one no check
+    // can read on this stand-in, so it holds with its reason and the
+    // prompt route delivers.
     user.write("\x15");
-    let line = delivered(&deck, &codex, &id);
-    assert_eq!(codex.typed(), format!("{foreign}\x15{line}\r"));
-
-    // The deck's own earlier line, typed back by the user.
-    let before = codex.typed();
-    user.write(&line);
-    assert!(common::wait_until(WAIT, || codex.typed().len() == before.len() + line.len()));
-    let second = enqueue(&deck.daemon, &codex.pane, "SECOND-TASK-027");
-    unchanged(&codex.pane, Duration::from_secs(4));
-    assert_eq!(codex.typed(), format!("{before}{line}"));
-    state(&deck.daemon, &codex.pane, &second, "queued");
-    user.write("\x15");
-    let again = delivered(&deck, &codex, &second);
-    assert_ne!(head(&again), head(&line), "a fresh token");
+    let cleared = format!("{foreign}\x15");
+    assert!(common::wait_until(WAIT, || codex.typed() == cleared));
+    assert!(
+        common::wait_until(WAIT, || deck.record(&codex)["inbox"]["wake_hold"]
+            == "cannot_type"),
+        "{}",
+        deck.record(&codex)
+    );
+    unchanged(&codex.pane, Duration::from_millis(600));
+    assert_eq!(codex.typed(), cleared, "nothing typed into the cleared box");
+    state(&deck.daemon, &codex.pane, &id, "queued");
+    user.write("user-prompt\r");
+    state(&deck.daemon, &codex.pane, &id, "acknowledged");
+    assert!(
+        codex.rung(&id).is_none(),
+        "the prompt route, not a ring: {:?}",
+        codex.typed()
+    );
 }
 
 /// Scenario: Start the scripted Codex screen with no agent type, under a command the deck does not recognise, drawing measured release 0.164.0's header; its own hooks then report it as Codex and it redraws. The deck takes the type from its hooks and the release from its header, and rings it: an absent spawn type is no reason to hold it.
