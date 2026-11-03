@@ -13,24 +13,32 @@
 # task passes and the deck, correctly, never claims the box empty. The rule is
 # not the thing to change; the task's root is.
 #
-# What it does: in a private mount namespace (only this command and its
-# children see it), it builds a new root on one fresh tmpfs. `/` and `/var` are
-# plain directories on it, owned by root and 0755; `/tmp` and `/var/tmp` are
-# empty directories on it, owned by root and 1777, as on a stock Linux box.
-# Every other entry of `/` and of `/var` is the task's own, bind-mounted
-# (recursively) or re-created as the same symlink, so the workspace, `$HOME`,
-# the toolchain, `/proc`, `/dev` and `/sys` are where they were. It then
-# chroots into that root as the calling user, with the calling user's groups,
-# working directory and exact environment, and runs the command. Nothing the
-# command writes under `/tmp` or `/var/tmp` outlives it (the tmpfs is
-# RAM-backed and goes with the namespace).
+# What it does: it makes a directory on the task's disk-backed XFS mount (the
+# parent of `$RWX_ARTIFACTS`, `/opt/rwx/task-data/<task id>`, which RWX backs
+# with the same disk as the task's overlay), and in a private mount namespace,
+# which only this command and its children see, builds a new root there. `/`
+# and `/var` are plain directories on it, owned by root and 0755; `/tmp` and
+# `/var/tmp` are empty directories on it, owned by root and 1777, as on a stock
+# Linux box. Every other entry of `/` and of `/var` is the task's own,
+# bind-mounted (recursively) or re-created as the same symlink, so the
+# workspace, `$HOME`, the toolchain, `/proc`, `/dev` and `/sys` are where they
+# were. It then chroots into that root as the calling user, with the calling
+# user's groups, working directory and exact environment, and runs the
+# command. When the command exits it unmounts every bind, and removes the
+# directory only once nothing is mounted under it.
+#
+# Not a tmpfs: one e2e shard leaves gigabytes of test roots under `/var/tmp`,
+# which filled an 8 GB tmpfs (RWX run 01a1a2c522be782eb2580f0d1d1e6f3b), and
+# code that refuses to put scratch on a RAM-backed `/` (CLAUDE.md rule 14)
+# refused it.
 #
 # It needs passwordless `sudo` with CAP_SYS_ADMIN and CAP_SYS_CHROOT, which an
 # RWX task's sudo has (measured 2026-11-03), and refuses to run anywhere `RWX`
 # is not `true`: on a developer's box or a GitHub runner `/` is already on a
 # supported filesystem, and this is not something to run with sudo there.
 #
-# DAD_EXPORT_ROOT_SIZE sets the tmpfs's size (default 50%, of RAM).
+# DAD_EXPORT_ROOT_BASE overrides the directory the root is made in; it must be
+# on ext2/3/4, XFS or Btrfs.
 
 set -euo pipefail
 
@@ -47,26 +55,35 @@ outer)
   [ "$(uname -s)" = Linux ] || die "Linux only"
   [ "${RWX:-}" = true ] || die "RWX is not 'true': this is for RWX tasks and sandboxes only"
   sudo -n true 2>/dev/null || die "needs passwordless sudo"
+  base=${DAD_EXPORT_ROOT_BASE:-}
+  if [ -z "$base" ]; then
+    [ -n "${RWX_ARTIFACTS:-}" ] || die "RWX_ARTIFACTS is unset; set DAD_EXPORT_ROOT_BASE"
+    base=$(dirname "$RWX_ARTIFACTS")
+  fi
+  case $(stat -f -c %T "$base") in
+  xfs | ext2/ext3 | btrfs) ;;
+  *) die "$base is on $(stat -f -c %T "$base"), not a disk-backed filesystem the export path rule accepts" ;;
+  esac
   # The exact environment, NUL-separated, restored after the chroot: sudo
   # resets PATH and HOME and drops what its env_delete list names.
   envfile=$(mktemp)
   env -0 > "$envfile"
   exec sudo -n env \
     DAD_EXPORT_ROOT_STAGE=mount \
+    DAD_EXPORT_ROOT_BASE="$base" \
     DAD_EXPORT_ROOT_ENV="$envfile" \
     DAD_EXPORT_ROOT_UID="$(id -u)" \
     DAD_EXPORT_ROOT_GID="$(id -g)" \
     DAD_EXPORT_ROOT_GROUPS="$(id -G | tr ' ' ,)" \
     DAD_EXPORT_ROOT_CWD="$PWD" \
-    DAD_EXPORT_ROOT_SIZE="${DAD_EXPORT_ROOT_SIZE:-50%}" \
     unshare --mount --propagation private -- "$script" "$@"
   ;;
 
 mount)
   # Root, inside the private mount namespace.
-  root=/.dad-export-root
-  mkdir -p "$root"
-  mount -t tmpfs -o "mode=0755,size=$DAD_EXPORT_ROOT_SIZE,nosuid,nodev,exec" dad-export-root "$root"
+  root=$(mktemp -d "$DAD_EXPORT_ROOT_BASE/dad-export-root.XXXXXX")
+  chmod 0755 "$root"
+  mounted=()
 
   # Mirror every entry of SRC into DEST except the names after it.
   mirror() {
@@ -83,15 +100,32 @@ mount)
       elif [ -d "$path" ]; then
         mkdir "$dest/$name"
         mount --rbind "$path" "$dest/$name"
+        mounted+=("$dest/$name")
       else
         touch "$dest/$name"
         mount --bind "$path" "$dest/$name"
+        mounted+=("$dest/$name")
       fi
     done
     shopt -u nullglob dotglob
   }
 
-  mirror "" "$root" "${root#/}" tmp var
+  # Unmount every bind, then remove the root only if nothing is left mounted
+  # under it: removing it with a bind still in place would delete the task's
+  # own files through that bind.
+  cleanup() {
+    local target ok=1
+    for target in "${mounted[@]}"; do
+      umount -R "$target" 2>/dev/null || umount -R -l "$target" 2>/dev/null || ok=0
+    done
+    if [ "$ok" = 1 ] && ! findmnt -rn -o TARGET | grep -q -F -- "$root/"; then
+      rm -rf --one-file-system -- "$root"
+    else
+      echo "rwx-export-root: left $root in place: a mount under it did not detach" >&2
+    fi
+  }
+
+  mirror "" "$root" tmp var
   mkdir -m 0755 "$root/var"
   mirror /var "$root/var" tmp
   mkdir -m 1777 "$root/tmp" "$root/var/tmp"
@@ -103,13 +137,16 @@ mount)
     "$DAD_EXPORT_ROOT_ENV" "$root$inner_env"
   rm -f -- "$DAD_EXPORT_ROOT_ENV"
 
-  exec chroot --userspec="$DAD_EXPORT_ROOT_UID:$DAD_EXPORT_ROOT_GID" \
+  status=0
+  chroot --userspec="$DAD_EXPORT_ROOT_UID:$DAD_EXPORT_ROOT_GID" \
     --groups="$DAD_EXPORT_ROOT_GROUPS" "$root" \
     /usr/bin/env -i \
     DAD_EXPORT_ROOT_STAGE=run \
     DAD_EXPORT_ROOT_ENV="$inner_env" \
     DAD_EXPORT_ROOT_CWD="$DAD_EXPORT_ROOT_CWD" \
-    /bin/bash "$script" "$@"
+    /bin/bash "$script" "$@" || status=$?
+  cleanup
+  exit "$status"
   ;;
 
 run)
