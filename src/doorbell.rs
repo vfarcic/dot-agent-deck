@@ -325,11 +325,32 @@ pub(crate) fn ring_admission_check(
                     .zip(now)
                     .is_some_and(|(decided, now)| decided.still_holds(&now))
                 {
+                    debug!(
+                        target: "doorbell",
+                        pane_id = %pane,
+                        agent_id = %agent,
+                        decided = ?admission,
+                        ?now,
+                        "doorbell still admitted? no: the pane's admission moved"
+                    );
                     return false;
                 }
                 if let Some(facts) = registry.inbox().try_doorbell_facts(&pane, &agent) {
-                    return facts.queued.contains(&selected)
-                        && ring_still_admitted(&facts, &config, Instant::now());
+                    let queued = facts.queued.contains(&selected);
+                    let still = ring_still_admitted(&facts, &config, Instant::now());
+                    if !(queued && still) {
+                        debug!(
+                        target: "doorbell",
+                            pane_id = %pane,
+                            agent_id = %agent,
+                            queued,
+                            blocked = facts.blocked,
+                            armed = facts.armed,
+                            native_announced = facts.native_announced_at.is_some(),
+                            "doorbell still admitted? no: the inbox's facts"
+                        );
+                    }
+                    return queued && still;
                 }
                 tokio::time::sleep(crate::doorbell_txn::SEAM_RETRY).await;
             }

@@ -572,10 +572,12 @@ impl Fixture {
         let body = |l: &str| l.split_once(' ').map_or(l, |(_, rest)| rest).to_owned();
         let mut lines: Vec<String> = Vec::new();
         let mut repeats = 0usize;
-        for l in text
-            .lines()
-            .filter(|l| l.contains("composer_probe") || l.contains("doorbell"))
-        {
+        for l in text.lines().filter(|l| {
+            l.contains("composer_probe")
+                || l.contains("doorbell")
+                || l.contains("Received ")
+                || l.contains("inbox")
+        }) {
             if lines.last().is_some_and(|last| body(last) == body(l)) {
                 repeats += 1;
                 continue;
