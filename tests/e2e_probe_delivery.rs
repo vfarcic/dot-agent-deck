@@ -413,24 +413,45 @@ fn doorbell_040_a_retained_draft_holds_at_every_controlled_age() {
     f.expect(&expected);
 }
 
-/// Scenario: Make Codex keep a typed draft when Enter is pressed, then queue a message. Its real helper must read the retained draft and leave mail held; after the user clears the draft, a second completed check must precede the staged notice and actual prompt-hook delivery.
+/// Scenario: Make Codex keep a typed draft when Enter is pressed, then queue a message. The kept draft hides Codex's placeholder, so admission allows no check: the card says the box cannot be checked, the deck types nothing and the mail stays held. When the user's own Enter submits the draft, Codex's prompt hook hands the message over once, still with no deck byte.
 #[spec("inbox/codex/027")]
 #[test]
 fn codex_027_a_draft_kept_on_enter_holds_the_doorbell() {
     let f = fixture("codex");
     f.flag("keep");
     let mut human = f.connect();
-    human.write(&format!("{}\r", inbox::DRAFT));
-    f.expect(format!("{}\r", inbox::DRAFT).as_bytes());
+    let kept = format!("{}\r", inbox::DRAFT);
+    human.write(&kept);
+    f.expect(kept.as_bytes());
     let id = f.enqueue();
-    f.wait("helper-exited-1");
-    let checked = format!("{}\r\x07", inbox::DRAFT);
-    f.stable(checked.as_bytes());
+    // Admission's surface conjunct (R3 §2.3 item 4) needs Codex's dim
+    // placeholder, which a kept draft hides: the check is refused, never
+    // run, and the card names the hold (Q128b ruling (c)).
+    wait_hold(&f, "cannot_check");
+    f.stable(kept.as_bytes());
     assert!(mail_turns(&f, &id).is_empty());
     f.remove("keep");
-    human.write("\x15");
-    let line = delivered(&f, &id);
-    f.expect(format!("{checked}\x15\x07{line}\r").as_bytes());
+    human.write("\r");
+    let submitted = format!("{kept}\r");
+    f.expect(submitted.as_bytes());
+    assert!(
+        common::wait_until(WAIT, || handovers(&f)
+            .iter()
+            .any(|row| row.to_string().contains(&id)
+                && row.to_string().contains("TEST-ONLY-WAITING-MAIL"))),
+        "the user's own prompt must hand over the held mail: {:?}",
+        handovers(&f)
+    );
+    f.stable(submitted.as_bytes());
+    assert!(mail_turns(&f, &id).is_empty(), "the deck typed no notice");
+    assert_eq!(
+        handovers(&f)
+            .iter()
+            .filter(|row| row.to_string().contains(&id))
+            .count(),
+        1,
+        "the message must occur in one actual hand-over"
+    );
 }
 
 /// Scenario: Type and delete a draft in an idle Claude composer, then queue mail. The real check must precede the single submitted notice and its real inbox fetch; deleting the draft alone is not permission to ring.
@@ -722,48 +743,50 @@ fn probe_047_submit_and_clear_recover_suspension_but_do_not_grant_empty() {
     }
 }
 
-/// Scenario: Establish an empty observation, then ask the synthetic composer to run an actual external edit through the helper and, separately, directly without reporting; the editor preserves its empty export. No human byte intervenes, so the foreign edit alone must void the observation and require another physical check before mail is delivered.
+/// Scenario: Establish an empty observation, then ask the synthetic composer to run an actual external editor directly, without the helper, so nothing reports it; the editor preserves its empty export. No human byte intervenes, so the foreign edit alone must void the observation and require another physical check before mail is delivered.
 #[spec("inbox/probe/048")]
 #[test]
 fn probe_048_external_edit_requires_the_next_attempt_to_check_again() {
-    for reported in [true, false] {
-        let f = fixture("claude");
-        f.probe();
-        f.wait("helper-exited-1");
-        f.wait_open();
-        let before = f.epoch();
-        assert_eq!(
-            before.1, before.0,
-            "the initial check must establish a valid empty observation: {before:?}"
-        );
-        f.setting("editor-mode", "preserve");
-        if !reported {
-            f.flag("lost-ipc");
-        }
-        f.flag("external-edit-request");
-        f.wait("editor-finished");
-        f.wait("helper-exited-2");
-        f.wait("external-edit-returned");
-        f.emit(b"\x1b]0;external-edit-cycle-finished\x07");
-        assert!(
-            common::wait_until(WAIT, || f.epoch().0 > before.0),
-            "the real external edit must be observed before mail is queued"
-        );
-        let after = f.epoch();
-        assert_eq!(
-            after.1, before.1,
-            "external editing must leave the earlier observation behind: {before:?} -> {after:?}"
-        );
-        assert_ne!(
-            after.0, after.1,
-            "the external edit must invalidate that observation: {after:?}"
-        );
-        f.remove("lost-ipc");
-        f.stable(b"\x07");
-        let id = f.enqueue();
-        let line = delivered(&f, &id);
-        f.expect(format!("\x07\x07{line}\r").as_bytes());
-    }
+    // Only the unreported edit (Q128b ruling (d)). An edit run through the
+    // helper is an `Unarmed` editor run, which under `EC_POLICY = Hold`
+    // opens the writer scope until retirement (amendment 6 §1.3), so no
+    // next attempt could check at all: a different scenario from this
+    // test's claim. Both forms moving the epoch is S-20's
+    // `probe_048_unreported_and_fast_external_edits_move_the_foreign_epoch`.
+    let f = fixture("claude");
+    f.probe();
+    f.wait("helper-exited-1");
+    f.wait_open();
+    let before = f.epoch();
+    assert_eq!(
+        before.1, before.0,
+        "the initial check must establish a valid empty observation: {before:?}"
+    );
+    f.setting("editor-mode", "preserve");
+    f.flag("lost-ipc");
+    f.flag("external-edit-request");
+    f.wait("editor-finished");
+    f.wait("helper-exited-2");
+    f.wait("external-edit-returned");
+    f.emit(b"\x1b]0;external-edit-cycle-finished\x07");
+    assert!(
+        common::wait_until(WAIT, || f.epoch().0 > before.0),
+        "the real external edit must be observed before mail is queued"
+    );
+    let after = f.epoch();
+    assert_eq!(
+        after.1, before.1,
+        "external editing must leave the earlier observation behind: {before:?} -> {after:?}"
+    );
+    assert_ne!(
+        after.0, after.1,
+        "the external edit must invalidate that observation: {after:?}"
+    );
+    f.remove("lost-ipc");
+    f.stable(b"\x07");
+    let id = f.enqueue();
+    let line = delivered(&f, &id);
+    f.expect(format!("\x07\x07{line}\r").as_bytes());
 }
 
 /// Scenario: Ask the synthetic composer to invoke the user's actual editor through the installed helper and directly without it, without sending any terminal input. The preserve-mode editor must receive an empty export, finish successfully and return an empty composer, establishing the fixture used by the delivery-authority test.
