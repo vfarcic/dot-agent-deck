@@ -7160,6 +7160,15 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Platform coverage:** mac+linux (chain-smoke is local-only per Decision 8).
 - **Cost note:** one short interactive Haiku turn with one Bash call.
 
+##### chain-smoke/claude/002 — A delegate reaches a Claude worker whose input box the user typed into and cleared only after the deck's check reads the box empty, and is delivered once. [reel]
+- **Layer:** L2 real agent, lane 2 (`tests/e2e_chain_smoke_claude.rs`, Linux only, as the check is), attached PTY: the orchestration is opened from the TUI's new-pane form and the user types into the focused worker through the TUI. Imported isolated credentials and pre-seeded project trust, as `scheduler/dispatch/013`. The orchestrator is a script that runs the real `dot-agent-deck delegate`; the worker is interactive Claude Code started directly in its pane (`Direct(Claude)`). The worker's native waiter is killed, so the doorbell is its wake path.
+- **Agent:** Claude Code (`claude-haiku-4-5-20251001`).
+- **Asserts:** the worker's editor-probe permission settles `Armable`; the typed draft is drawn and then deleted from the input box; after the delegate the log shows a probe settled with an empty read, the empty read applied, and only then `doorbell rang`; the delegate is acknowledged with exactly one delivery; the sentinel file the test created with `O_EXCL` holds exactly the one uniquely named line; the deleted draft never became a prompt.
+- **Mode switch:** while `INSTALL_ROLLOUT` lacks `Direct(Claude)` (before activation, Q35-28), the test runs the newest recorded, `Go` Claude Code release installed under `~/.local/share/claude/versions` with the `e2e` assumption `DOT_AGENT_DECK_E2E_ASSUME_EDITOR_PROBE=claude@<release>`. Once the rollout holds `Direct(Claude)` it runs the installed `claude` with no assumption, and needs that release's record to be `Go` with a verified `editor_probe`, or it reports SKIP (a failure under `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`).
+- **Does not assert:** a specific frame of Claude Code's redraw for the check (it is in the recording); a real orchestrator model; the worker's `work-done`; any text the agent prints.
+- **Platform coverage:** linux.
+- **Cost note:** one short interactive Haiku turn with one Bash call.
+
 #### chain-smoke/opencode
 
 ##### chain-smoke/opencode/001 — A real OpenCode agent run end-to-end emits the OpenCode plugin's events and drives the card through Thinking → Working → Idle.
