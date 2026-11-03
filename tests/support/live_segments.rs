@@ -67,7 +67,21 @@ pub struct Fixture {
     pub kind: &'static str,
     instance: PathBuf,
     exe: PathBuf,
+    /// The daemon's tracing log, printed when a test fails (diagnosis only:
+    /// nothing asserts on it here).
+    log: PathBuf,
+    _log_dir: Option<tempfile::TempDir>,
 }
+
+/// What a failing test prints of the daemon's log: the probe's and the
+/// doorbell's lines, newest last, at most this many.
+const LOG_LINES_PRINTED: usize = 1500;
+/// The longest line printed whole.
+const LOG_LINE_CHARS: usize = 700;
+
+/// The targets whose lines a failing test prints, and the verbosity the
+/// fixture's daemon logs them at.
+const LOG_FILTER: &str = "composer_probe=debug,doorbell=debug";
 
 impl Fixture {
     pub fn start(kind: &'static str) -> Self {
@@ -91,6 +105,21 @@ impl Fixture {
                 "claude@2.1.310,codex@0.164.0",
             ));
         }
+        // Diagnosis (Q35-21): the daemon logs the probe's and the
+        // doorbell's decisions, and a failing test prints them. A caller
+        // that names its own log keeps it, and its lines are printed.
+        let named = extra
+            .iter()
+            .rev()
+            .find(|(k, _)| *k == "DOT_AGENT_DECK_LOG")
+            .map(|(_, v)| PathBuf::from(v));
+        let log_dir = named
+            .is_none()
+            .then(|| common::harness_tempdir().expect("fixture log dir"));
+        let log = named.unwrap_or_else(|| log_dir.as_ref().unwrap().path().join("deck.log"));
+        let log_value = log.to_str().expect("log path is UTF-8").to_owned();
+        env.push(("RUST_LOG", LOG_FILTER));
+        env.push(("DOT_AGENT_DECK_LOG", &log_value));
         env.extend_from_slice(extra);
         let daemon = common::spawn_daemon_serve_with_env(None, "0", &env);
         let native = daemon.home.join("native");
@@ -154,6 +183,8 @@ impl Fixture {
             kind,
             instance: PathBuf::new(),
             exe,
+            log,
+            _log_dir: log_dir,
         };
         f.spawn("first", false);
         f
@@ -530,8 +561,44 @@ impl Drop for RefusalWatch {
     }
 }
 
+impl Fixture {
+    /// Diagnosis only (Q35-21): print the daemon log's probe and doorbell
+    /// lines, so a red run says which check settled how and why a ring or
+    /// a probe was or wasn't admitted. Asserts nothing.
+    fn print_log(&self) {
+        let text = fs::read_to_string(&self.log).unwrap_or_default();
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("composer_probe") || l.contains("doorbell"))
+            .collect();
+        let skip = lines.len().saturating_sub(LOG_LINES_PRINTED);
+        let mut out = format!(
+            "---- fixture deck log ({}; {} matching lines, {} omitted from the start) ----\n",
+            self.log.display(),
+            lines.len(),
+            skip
+        );
+        for line in &lines[skip..] {
+            let mut cut = line.len().min(LOG_LINE_CHARS);
+            while !line.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            out.push_str(&line[..cut]);
+            if cut < line.len() {
+                out.push_str(" …");
+            }
+            out.push('\n');
+        }
+        out.push_str("---- end of fixture deck log ----\n");
+        eprint!("{}", common::redact_credentials_for_output(&out));
+    }
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.print_log();
+        }
         for suffix in [
             "editor-go",
             "editor-publish-go",

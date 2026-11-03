@@ -685,18 +685,31 @@ impl Live {
     /// live, takes that credit, and the epoch moves at that session's own
     /// pair instead (the audit's U3-1).
     fn explain(&mut self, key: RecordKey, birth_floor: Instant) {
-        if self.forgotten.is_some_and(|f| f >= birth_floor) {
+        let outcome = if self.forgotten.is_some_and(|f| f >= birth_floor) {
             // Fail closed: it may repay a debt the queue forgot, so it
             // spends no debt a later record may need.
+            "fail-closed"
         } else if let Some(at) = self
             .unexplained
             .iter()
             .position(|&ended| ended >= birth_floor)
         {
             self.unexplained.remove(at);
+            "repaid a pair that already moved the epoch"
         } else if self.explained.len() < usize::from(EXPLAINED_CAP) {
             self.explained.push_back(Credit { key, drained: None });
-        }
+            "banked a credit"
+        } else {
+            "no room to bank"
+        };
+        tracing::debug!(
+            target: "composer_probe",
+            ?key,
+            outcome,
+            unexplained = self.unexplained.len(),
+            credits = self.explained.len(),
+            "record explains a pair"
+        );
     }
 
     /// Note when each credit's record was first seen drained or gone.
@@ -794,14 +807,25 @@ impl Live {
     /// which refuses a read the epoch has moved past, then the schedule's
     /// empty.
     fn apply_empty(&mut self, epoch: &mut InputEpoch, probe: Probe) {
-        if let Some(e0) = probe.e0 {
+        let applied = probe.e0.map(|e0| {
             epoch.apply(&Observation {
                 probe: probe.job,
                 admitted_at: e0,
                 read_empty: true,
                 retired: false,
-            });
-        }
+            })
+        });
+        tracing::debug!(
+            target: "composer_probe",
+            number = probe.number,
+            e0 = ?probe.e0,
+            ?applied,
+            epoch = epoch.epoch(),
+            observed = epoch.observed(),
+            last_foreign = epoch.last_foreign(),
+            owner = ?epoch.owner(),
+            "empty read applied"
+        );
         self.schedule.empty();
     }
 }
@@ -923,7 +947,15 @@ fn plan_locked(state: &mut State, writer: Writer, bytes: &[u8], plan: Option<Pla
                 Writer::Deck(job) => Some(job),
                 Writer::UnnamedDeck | Writer::Human | Writer::Answer => None,
             };
-            Enqueued::Moved(state.epoch.record(owner))
+            let moved_to = state.epoch.record(owner);
+            tracing::debug!(
+                target: "composer_probe",
+                ?writer,
+                len = bytes.len(),
+                moved_to,
+                "an op moved the epoch"
+            );
+            Enqueued::Moved(moved_to)
         }
     };
     Planned {
@@ -1254,7 +1286,9 @@ impl GenerationInput {
     /// An edit the deck learned of from outside the PTY (an editor session
     /// that isn't the deck's): a foreign move with no op.
     pub fn external_edit(&self) -> u64 {
-        self.state.lock_recovering().epoch.record(None)
+        let moved_to = self.state.lock_recovering().epoch.record(None);
+        tracing::debug!(target: "composer_probe", moved_to, "an external edit moved the epoch");
+        moved_to
     }
 
     /// The ring's `Submitted` reconcile ([`InputEpoch::reconcile_ring`]);
@@ -1593,8 +1627,19 @@ impl GenerationInput {
                     live.pair_open = false;
                     live.expire_credits(now);
                     if live.explained.pop_front().is_none() {
-                        state.epoch.record(None);
+                        let moved_to = state.epoch.record(None);
                         live.owe(now);
+                        tracing::debug!(
+                            target: "composer_probe",
+                            moved_to,
+                            unexplained = live.unexplained.len(),
+                            "an unexplained pair moved the epoch"
+                        );
+                    } else {
+                        tracing::debug!(
+                            target: "composer_probe",
+                            "a pair spent a record's credit"
+                        );
                     }
                 }
                 _ => {}
