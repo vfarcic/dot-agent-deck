@@ -10,6 +10,7 @@ mod inbox;
 #[path = "support/live_segments.rs"]
 mod live;
 
+use dot_agent_deck::composer_probe::{probe::BACKOFF, query_ledger::T_TRIGGER};
 use live::{Fixture, WAIT};
 use serde_json::{Value, json};
 use spec::spec;
@@ -532,6 +533,16 @@ fn probe_030_an_unattended_claude_lapse_still_delivers_once() {
     f.flag("edit-ignore-next");
     let id = f.enqueue();
     f.expect(b"x\x7f\x07");
+    // The production schedule counts the dropped check as a lapse at
+    // T_TRIGGER and makes its retry due after the first backoff step, so the
+    // retry's own check is awaited for that long rather than inside
+    // `delivered`'s window, which it would otherwise exhaust.
+    let lapse = T_TRIGGER + BACKOFF[0] + live::WAIT;
+    assert!(
+        common::wait_until(lapse, || f.input().starts_with(b"x\x7f\x07\x07")),
+        "the lapse retry must write its own check without another keypress: {:?}",
+        f.input()
+    );
     let line = delivered(&f, &id);
     f.expect(format!("x\x7f\x07\x07{line}\r").as_bytes());
 }
@@ -559,6 +570,17 @@ fn probe_031_mail_waits_for_e1_then_delivers_once() {
 fn probe_032_native_query_hazard_projects_cannot_check_on_the_card() {
     let f = fixture("claude");
     let tui = attached(&f);
+    // The attached TUI resizes the pane, and a resize drops the replay ring
+    // the emit barrier reads (`AgentBus::resize`), so emit only after it.
+    let spawned = (json!(40), json!(140));
+    assert!(
+        common::wait_until(WAIT, || {
+            let s = f.snapshot();
+            (s["rows"].clone(), s["cols"].clone()) != spawned
+        }),
+        "the attached TUI must resize the pane before the query is emitted: {}",
+        f.snapshot()
+    );
     f.flag("edit-drop");
     f.emit(b"\x1b[6n");
     let mut human = f.connect();
