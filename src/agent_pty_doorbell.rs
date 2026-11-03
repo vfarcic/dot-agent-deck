@@ -1042,6 +1042,8 @@ impl AgentPtyRegistry {
             cr_reached = txn.cr_reached(),
             withdrawal = ?txn.withdrawal_cause(),
             admission_lost = txn.admission_was_lost(),
+            unresolved_at = ?txn.unresolved_at(),
+            marks = ?generation.ledger.marks(),
             "doorbell attempt ended"
         );
         let report = RingReport {

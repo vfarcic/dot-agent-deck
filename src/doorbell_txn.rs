@@ -1017,6 +1017,9 @@ pub struct Txn<'c> {
     /// The generation stopped being fit for the ring after the first byte;
     /// acted on once the echo can say whether the line is the deck's alone.
     admission_lost: bool,
+    /// Diagnosis only: the step and check that last unresolved the attempt,
+    /// with the composer it read then.
+    unresolved_at: Option<String>,
 }
 
 /// Step 1 and step 2 (plan §1.1): admit an attempt or say why not. On
@@ -1090,6 +1093,7 @@ pub fn admit<'c>(
         withdrawal: None,
         after_cr: false,
         admission_lost: false,
+        unresolved_at: None,
     })
 }
 
@@ -1132,6 +1136,16 @@ impl<'c> Txn<'c> {
     /// written (diagnosis, as above).
     pub fn admission_was_lost(&self) -> bool {
         self.admission_lost
+    }
+
+    /// Which step and check last unresolved the attempt (diagnosis only).
+    pub fn unresolved_at(&self) -> Option<&str> {
+        self.unresolved_at.as_deref()
+    }
+
+    /// Diagnosis only: note `what` with the composer as last read.
+    fn note_unresolved(&mut self, what: &str) {
+        self.unresolved_at = Some(format!("{what}; composer {:?}", self.frame.composer));
     }
 
     pub fn phase(&self) -> Phase {
@@ -1505,7 +1519,10 @@ impl<'c> Txn<'c> {
             SeamVerdict::Layout => vec![Action::WakeAt(self.next_wake(now))],
             SeamVerdict::Mode(_) => self.unresolve(Cause::ModeChanged, seam, now),
             SeamVerdict::Closed => self.retired(now),
-            _ => self.unresolve(Cause::EchoMismatch, seam, now),
+            _ => {
+                self.note_unresolved("try_line: later stage's seam");
+                self.unresolve(Cause::EchoMismatch, seam, now)
+            }
         }
     }
 
@@ -1570,6 +1587,7 @@ impl<'c> Txn<'c> {
             return self.try_line(1, seam, now);
         }
         if now >= self.phase_since + ECHO_WAIT {
+            self.note_unresolved("head_echo: wait ended");
             return self.unresolve(Cause::EchoMismatch, seam, now);
         }
         vec![Action::WakeAt(self.next_wake(now))]
@@ -1587,6 +1605,7 @@ impl<'c> Txn<'c> {
         }
         if self.frame.holds_prefix(&self.line, self.accepted) {
             self.admission_lost = false;
+            self.note_unresolved("cancel_after_head: admission lost");
             return self.unresolve(Cause::EchoMismatch, seam, now);
         }
         if now >= self.phase_since + ECHO_WAIT {
@@ -1620,6 +1639,7 @@ impl<'c> Txn<'c> {
         }
         let done = self.line_done_at.unwrap_or(self.phase_since);
         if now >= done + ECHO_WAIT {
+            self.note_unresolved("echo: wait ended");
             return self.unresolve(Cause::EchoMismatch, seam, now);
         }
         vec![Action::WakeAt(self.next_wake(now))]
@@ -1640,6 +1660,7 @@ impl<'c> Txn<'c> {
                     return self.unresolve(Cause::DialogBeforeSubmit, seam, now);
                 }
                 if !frame.holds_exactly(&self.line) {
+                    self.note_unresolved("pre_cr: the frame does not hold exactly the line");
                     return self.unresolve(Cause::EchoMismatch, seam, now);
                 }
                 self.enqueue(JobKind::Cr, Job::Cr, Phase::CrJob, now)
@@ -1648,7 +1669,12 @@ impl<'c> Txn<'c> {
             SeamVerdict::Mode(_) => self.unresolve(Cause::ModeChanged, seam, now),
             SeamVerdict::Closed => self.retired(now),
             SeamVerdict::Expired => self.end(End::Expire, now),
-            SeamVerdict::Human | SeamVerdict::JobMark => {
+            SeamVerdict::Human => {
+                self.note_unresolved("pre_cr: seam watermark moved");
+                self.unresolve(Cause::EchoMismatch, seam, now)
+            }
+            SeamVerdict::JobMark => {
+                self.note_unresolved("pre_cr: seam job mark moved");
                 self.unresolve(Cause::EchoMismatch, seam, now)
             }
         }
@@ -1712,6 +1738,7 @@ impl<'c> Txn<'c> {
         {
             if self.caps.delete_key && self.caps.placeholder {
                 if let Some(deletes) = self.strict() {
+                    self.note_unresolved("cancel_after_line: admission lost");
                     self.withdrawal = Some((deletes, Cause::EchoMismatch));
                     self.enter(Phase::Withdrawing, now);
                     return self.try_deletes(seam, now);
