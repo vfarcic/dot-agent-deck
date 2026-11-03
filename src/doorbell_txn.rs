@@ -575,21 +575,19 @@ impl Frame {
     /// hidden in its region, and only while the epoch says nothing touched
     /// the box since it was last observed empty: spaces with the cursor
     /// moved back to the start draw exactly the empty composer, and a
-    /// placeholder on screen can predate the keys that replaced it. Only a
-    /// check that reads the box empty, or the deck's own submitted line,
-    /// makes a touched box untouched again.
+    /// placeholder on screen can predate the keys that replaced it. Three
+    /// things make a touched box untouched again: a check that reads it
+    /// empty, the deck's own submitted line, and the deck's own withdrawn
+    /// line, which ends only once the agent drew its placeholder again over
+    /// an empty box. Both lines go through the ring's reconcile
+    /// (`GenerationInput::reconcile_ring`: R3 §3.5 for the submitted line,
+    /// the Q35-21 ruling for the withdrawn one).
     pub fn empty_and_ready(&self) -> bool {
         !self.touched
             && self.dialog.is_none()
             && self.composer.as_ref().is_some_and(|c| {
                 c.placeholder || (!c.hidden && c.text.is_empty() && c.cursor_at_end)
             })
-    }
-
-    /// PRD #1666 part 3 (Q35-21p, Q35-21): this frame, read with `touched`
-    /// as the box's input epoch says. The one way tests set it.
-    pub fn with_touched(self, touched: bool) -> Self {
-        Self { touched, ..self }
     }
 
     /// The composer holds exactly `text`, the cursor right after it.
@@ -1018,7 +1016,9 @@ pub struct Txn<'c> {
     /// acted on once the echo can say whether the line is the deck's alone.
     admission_lost: bool,
     /// Diagnosis only: the step and check that last unresolved the attempt,
-    /// with the composer it read then.
+    /// with the length of the composer text it read then. Never the text:
+    /// it is logged at the default level, and the box can hold whatever the
+    /// user typed or pasted.
     unresolved_at: Option<String>,
 }
 
@@ -1143,9 +1143,11 @@ impl<'c> Txn<'c> {
         self.unresolved_at.as_deref()
     }
 
-    /// Diagnosis only: note `what` with the composer as last read.
+    /// Diagnosis only: note `what` with the length of the composer text as
+    /// last read (in characters; none when no composer was on screen).
     fn note_unresolved(&mut self, what: &str) {
-        self.unresolved_at = Some(format!("{what}; composer {:?}", self.frame.composer));
+        let length = self.frame.composer.as_ref().map(|c| c.text.chars().count());
+        self.unresolved_at = Some(format!("{what}; composer text length {length:?}"));
     }
 
     pub fn phase(&self) -> Phase {

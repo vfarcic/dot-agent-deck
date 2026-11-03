@@ -8816,7 +8816,7 @@ mod hook_ingestion_tests {
     use tokio::io::AsyncWriteExt;
     use tokio::net::{UnixListener, UnixStream};
 
-    /// Scenario: PRD #1666 part 3 (Q35-21; 059's prompt-report cases, moved to 002). Type into a live Claude Code pane's agent, so its box is touched, then ingest that agent's own hook events through the daemon: a thinking report, its prompt hook's report of a prompt it took, the deck's own line it recognised, and the turn ending. None of them moves the box's input epoch, so the box stays touched and only a check can read it empty.
+    /// Scenario: PRD #1666 part 3 (Q35-21; 059's prompt-report cases, moved to 002). Type into a live Claude Code pane's agent, so its box is touched, then ingest hook events for that pane through the daemon: the agent's thinking report, a tool starting, its prompt hook's report of a prompt it took, the deck's own line it recognised and the turn ending, a prompt report from the pane's previous generation, and a subagent's prompt report. None of them moves the box's input epoch, so the box stays touched and only a check can read it empty.
     #[spec("inbox/probe/002")]
     #[tokio::test]
     async fn probe_002_the_daemons_prompt_reports_never_move_the_epoch() {
@@ -8844,7 +8844,7 @@ mod hook_ingestion_tests {
             event.user_prompt = prompt.map(str::to_string);
             event
         };
-        use crate::event::EventType::{Idle, Thinking};
+        use crate::event::EventType::{Idle, Thinking, ToolStart};
         registry
             .write_user_bytes(pane, &owner, b"\x1b[A\r")
             .await
@@ -8865,6 +8865,20 @@ mod hook_ingestion_tests {
             ),
             ("the deck's own line", deck),
             ("the turn ending", event(Idle, None)),
+            ("a tool starting", event(ToolStart, None)),
+            ("a predecessor's prompt", {
+                let mut frame = event(Thinking, Some("old prompt"));
+                frame.agent_id = Some("a-predecessor".to_string());
+                frame
+            }),
+            ("a subagent's prompt", {
+                let mut frame = event(Thinking, Some("sub prompt"));
+                frame.metadata.insert(
+                    crate::event::SUBAGENT_ID_METADATA_KEY.to_string(),
+                    "sub-1".to_string(),
+                );
+                frame
+            }),
         ] {
             ingest_event(&state, &event_tx, &registry, frame).await;
             assert_eq!(input.epoch(), typed, "{what}: the epoch is unchanged");

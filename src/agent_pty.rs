@@ -4445,22 +4445,25 @@ impl PaneInputHold {
 /// TUI in paste mode stores them without submitting anything. That is what
 /// `matched` / `is_start` / `in_paste` track.
 ///
-/// **The keypress behind the byte.** Outside a paste, whether a byte submits is
-/// not this module's call to make: it is fixed by the deck's own forwarding
-/// contract, so it is asked of [`crate::ui::user_byte_submits_input_box`], which
-/// sits next to the encoder that produced the byte. `Ctrl+J` is forwarded as
-/// exactly an LF and `Alt+Enter` as exactly `ESC` `CR`, both of which are
-/// NEWLINE keys the user pressed to keep typing — reading them as submissions
-/// would clear the draft of a box a plain draft, with no paste and no attacker
-/// anywhere near it, still holds.
+/// **The keypress behind the byte: test builds only.** Whether a byte outside
+/// a paste submits the box is fixed by the deck's own forwarding contract,
+/// asked of [`crate::ui::user_byte_submits_input_box`] beside the encoder
+/// that produced it: `Ctrl+J` is forwarded as exactly an LF and `Alt+Enter`
+/// as exactly `ESC` `CR`, NEWLINE keys the user pressed to keep typing.
+/// Since PRD #1666 part 3 (Q35-21) nothing in the daemon reads that decision
+/// (it fed `DraftTracker`, deleted with the switch), so the scan is compiled
+/// into test builds only, where the issue #544 tests keep pinning the
+/// contract against the real encoder. The submit or clear that lifts a
+/// suspended doorbell is [`crate::composer_probe::recovery`]'s, over
+/// Q35-01's tokenizer, and the two grammars differ: that tokenizer reads
+/// `ESC` `CR` as a newline, which the table in `ui.rs` records as a submit
+/// for Pi.
 ///
 /// The state is carried ACROSS calls because a paste — and equally an
 /// `Alt+Enter` — arrives as however many writes the client happens to make; a
 /// marker or a two-byte frame split between two of them still matches.
 /// Interleaving from two attached clients can leave `in_paste` stuck true or
-/// misattribute one client's ESC to another's CR. Both of those miss a
-/// submission rather than invent one, so the box reads as holding a draft for
-/// longer than it does, never for shorter.
+/// misattribute one client's ESC to another's CR.
 ///
 /// **One stream, both senders** (issue #544, PR #1398 finding #16). The PTY
 /// reads ONE interleaved byte stream, so this is fed all of it: the user's
@@ -4480,11 +4483,15 @@ struct PaneInputStream {
     /// Once the fifth byte disambiguates, whether it is the START marker.
     is_start: bool,
     in_paste: bool,
-    /// The byte before the one being fed, which is all
+    /// Test builds only: the byte before the one being fed, which is all
     /// [`crate::ui::user_byte_submits_input_box`] needs to tell a plain `Enter`
     /// from the ESC-prefixed `Alt+Enter`. `None` only at the very start of the
     /// stream, where no prefix can have been sent.
+    #[cfg(test)]
     preceding: Option<u8>,
+    /// Test builds only: how many bytes the submit scan read as a submit.
+    #[cfg(test)]
+    submits: u64,
     /// PRD #1666 part 3 (Q35-21, OQ2): the user's own submits and clears in
     /// the bytes the PTY took, which lift a suspended doorbell. Fed every
     /// byte this stream sees, both senders', so its framing is the agent's.
@@ -4500,38 +4507,51 @@ struct PaneInputStream {
 }
 
 impl PaneInputStream {
-    /// Feed the user's bytes; `true` if any of them submits the input box.
-    fn feed(&mut self, bytes: &[u8]) -> bool {
-        self.feed_as(bytes, crate::composer_probe::recovery::Origin::User)
-    }
-
-    /// Feed bytes `origin` wrote; `true` if any of them submits the input box.
+    /// Feed bytes `origin` wrote, in the order the PTY took them: the paste
+    /// framing and the user's own submits and clears
+    /// ([`crate::composer_probe::recovery`]).
     ///
     /// Every byte is fed, deliberately: this is a state machine, so a
     /// short-circuiting `any` would stop tracking paste state at the first
     /// terminator and mis-read the rest of the buffer.
-    fn feed_as(&mut self, bytes: &[u8], origin: crate::composer_probe::recovery::Origin) -> bool {
+    fn record(&mut self, bytes: &[u8], origin: crate::composer_probe::recovery::Origin) {
         self.recovery.feed(bytes, origin);
-        let mut submitted = false;
-        for byte in bytes {
-            submitted |= self.feed_byte(*byte);
+        for &byte in bytes {
+            // Every byte is somebody's predecessor, including the ones
+            // consumed as part of a paste marker.
+            #[cfg(test)]
+            let preceding = self.preceding.replace(byte);
+            let keypress = self.frame_byte(byte);
+            #[cfg(test)]
+            if keypress && !self.in_paste && crate::ui::user_byte_submits_input_box(preceding, byte)
+            {
+                self.submits += 1;
+            }
+            #[cfg(not(test))]
+            let _ = keypress;
         }
-        submitted
     }
 
-    /// Feed one byte; `true` if it submits, OUTSIDE a bracketed paste:
-    /// paste framing, then the keypress behind the byte.
-    fn feed_byte(&mut self, byte: u8) -> bool {
-        self.scan_submit(byte)
+    /// Test builds only: feed the user's bytes; `true` if the submit scan
+    /// read any of them as a submit.
+    #[cfg(test)]
+    fn feed(&mut self, bytes: &[u8]) -> bool {
+        self.feed_as(bytes, crate::composer_probe::recovery::Origin::User)
     }
 
-    /// [`Self::feed_byte`]'s paste framing, then the keypress behind the
-    /// byte.
-    fn scan_submit(&mut self, byte: u8) -> bool {
-        // Unconditional, and before the marker matcher's early returns: every
-        // byte is somebody's predecessor, including the ones consumed as part
-        // of a paste marker.
-        let preceding = self.preceding.replace(byte);
+    /// Test builds only: [`Self::record`]; `true` if the submit scan read
+    /// any of the bytes as a submit.
+    #[cfg(test)]
+    fn feed_as(&mut self, bytes: &[u8], origin: crate::composer_probe::recovery::Origin) -> bool {
+        let before = self.submits;
+        self.record(bytes, origin);
+        self.submits != before
+    }
+
+    /// The paste framing of one byte: `false` when it was consumed as part of
+    /// a paste marker, `true` when it is a keypress's byte (inside or outside
+    /// a paste).
+    fn frame_byte(&mut self, byte: u8) -> bool {
         loop {
             if self.matched < PASTE_MARKER_PREFIX.len() {
                 if PASTE_MARKER_PREFIX[self.matched] == byte {
@@ -4550,13 +4570,12 @@ impl PaneInputStream {
                 return false;
             }
             if self.matched == 0 {
-                break;
+                return true;
             }
             // Not a marker after all. Restart the match at this byte — no
             // marker byte repeats its own prefix, so one retry is enough.
             self.matched = 0;
         }
-        !self.in_paste && crate::ui::user_byte_submits_input_box(preceding, byte)
     }
 
     /// PRD #1666: apply a turn edge the pane's own agent reported. Only an
@@ -4665,15 +4684,9 @@ impl PaneInputState {
     }
 
     /// Record the user's actual bytes — the human-input sequence above, plus
-    /// what the bytes themselves tell us: the pane's input stream.
-    ///
-    /// Issue #424 S1: "a submission" is decided by [`PaneInputStream`] — paste
-    /// framing here, the keypress behind the byte in
-    /// [`crate::ui::user_byte_submits_input_box`] — and never by scanning for a
-    /// raw CR/LF. A multi-line paste carries newlines the agent's editor STORES,
-    /// and so do the `Ctrl+J` and `Alt+Enter` the deck deliberately forwards as
-    /// newline keys; reading any of them as a submission would clear the draft
-    /// of a box that still holds it.
+    /// what the bytes themselves tell us: the pane's input stream (its paste
+    /// framing, and the user's own submits and clears that lift a suspended
+    /// doorbell, [`crate::composer_probe::recovery`]).
     fn note_user_bytes(&mut self, pane_id_env: &str, bytes: &[u8]) {
         self.note_user_bytes_as(pane_id_env, bytes, true);
     }
@@ -4699,7 +4712,7 @@ impl PaneInputState {
         self.input
             .entry(pane_id_env.to_string())
             .or_default()
-            .feed(bytes);
+            .record(bytes, crate::composer_probe::recovery::Origin::User);
     }
 
     /// Drop everything recorded for `pane_id_env` — a different agent now owns
@@ -4776,8 +4789,8 @@ impl PaneInputState {
     /// Issue #544 (PR #1398 finding #16): bytes the DECK just wrote into
     /// `pane_id_env`, fed into the same stream as the user's and in the same
     /// order the PTY received them — see [`PaneInputStream`]. They move the
-    /// paste framing and the submit scan exactly as they move the agent's
-    /// own; none of them is the user's submit or clear.
+    /// paste framing exactly as they move the agent's own; none of them is
+    /// the user's submit or clear.
     ///
     /// Deliberately NOT a user keystroke: the human-input sequence does not
     /// move.
@@ -4788,7 +4801,7 @@ impl PaneInputState {
         self.input
             .entry(pane_id_env.to_string())
             .or_default()
-            .feed_as(bytes, crate::composer_probe::recovery::Origin::Deck);
+            .record(bytes, crate::composer_probe::recovery::Origin::Deck);
     }
 }
 
@@ -27227,7 +27240,7 @@ mod spawn_tests {
         registry.shutdown_all();
     }
 
-    /// Scenario: Q19's admission snapshot: the deck rings the model editor while nothing is outstanding, and once the ring holds the writer and has seen the generation's earlier writes drained, a human write arrives, its operation admitted and waiting for the writer, before admission reads the ledger. The ring ends with nothing written (human input), no deck byte reaches the pane, and the human's text is written first; the next ring follows it.
+    /// Scenario: Q19's admission snapshot: the deck rings the model editor while nothing is outstanding, and once the ring holds the writer and has seen the generation's earlier writes drained, a human write arrives, its operation admitted and waiting for the writer, before admission reads the ledger. The ring ends with nothing written (human input), no deck byte reaches the pane, and the human's text is written first; the next ring follows it. A check reading the box empty is simulated before the ring that follows the user's keys (`checked_empty()`), since the model editor has no observer.
     #[spec("inbox/doorbell/050")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn doorbell_050_a_ticket_outstanding_at_the_admission_snapshot_refuses_the_ring() {
@@ -27700,7 +27713,7 @@ mod spawn_tests {
         registry.shutdown_all();
     }
 
-    /// Scenario: The user types an unfinished escape sequence (`ESC [`) into the model editor, then a ring starts. The ring waits for the sequence to finish rather than typing into it, writing nothing; once its bound passes it ends with nothing written, the pane holding only the user's bytes. The user finishes the sequence (`C`, cursor right), the editor redraws its empty composer, and the next ring types and submits its line after them.
+    /// Scenario: The user types an unfinished escape sequence (`ESC [`) into the model editor, then a ring starts. The ring waits for the sequence to finish rather than typing into it, writing nothing; once its bound passes it ends with nothing written, the pane holding only the user's bytes. The user finishes the sequence (`C`, cursor right), the editor redraws its empty composer, and the next ring types and submits its line after them. A check reading the box empty is simulated before the ring that follows the user's keys (`checked_empty()`), since the model editor has no observer.
     #[spec("inbox/probe/076")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn probe_076_a_ring_waits_for_the_users_escape_sequence_to_finish() {
@@ -27763,7 +27776,7 @@ mod spawn_tests {
     /// 2 s for one that may be a terminal's reply), with room to spare.
     const PAST_THE_AGENTS_WAITS: Duration = Duration::from_millis(2500);
 
-    /// Scenario: The model editor latches Claude Code 2.1.310, so its input is read with the measured grammar. The user types an unfinished DCS (`ESC P`) and Ctrl+U, which stays inside it, and the editor shows its empty composer. 2.5 s later, past Claude Code's own waits for an unfinished sequence, a ring still waits its bound, writes nothing and ends with nothing written. The user's BEL ends the string, as the measured grammar reads it, and the next ring types and submits its line after the user's bytes.
+    /// Scenario: The model editor latches Claude Code 2.1.310, so its input is read with the measured grammar. The user types an unfinished DCS (`ESC P`) and Ctrl+U, which stays inside it, and the editor shows its empty composer. 2.5 s later, past Claude Code's own waits for an unfinished sequence, a ring still waits its bound, writes nothing and ends with nothing written. The user's BEL ends the string, as the measured grammar reads it, and the next ring types and submits its line after the user's bytes. A check reading the box empty is simulated before the ring that follows the user's keys (`checked_empty()`), since the model editor has no observer.
     #[spec("inbox/probe/076")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn probe_076_a_measured_release_holds_an_unfinished_string_until_a_key_ends_it() {
@@ -28007,28 +28020,28 @@ mod spawn_tests {
         );
     }
 
-    /// Scenario: Deliver a control doorbell, then type ESC [ and Ctrl+U into the model editor. After the agent recovers its parser and redraws an empty prompt, a doorbell must be typed and submitted within three attempt bounds without another user key.
+    /// Scenario: Deliver a control doorbell, then type ESC [ and Ctrl+U into the model editor. After the agent recovers its parser and redraws an empty prompt, a doorbell must be typed and submitted within three attempt bounds without another user key. A check reading the box empty is simulated before the ring that follows the user's keys (`checked_empty()`), since the model editor has no observer.
     #[spec("inbox/probe/076")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn probe_076_csi_ctrl_u_recovery_releases_delivery() {
         ring_after_agent_input_recovery("csi-ctrl-u", b"\x1b[\x15").await;
     }
 
-    /// Scenario: Deliver a control doorbell, then type ESC [ and Enter into the model editor. Once the agent recovers and shows its empty prompt, the waiting doorbell must submit within three attempt bounds with no finishing key from the user.
+    /// Scenario: Deliver a control doorbell, then type ESC [ and Enter into the model editor. Once the agent recovers and shows its empty prompt, the waiting doorbell must submit within three attempt bounds with no finishing key from the user. A check reading the box empty is simulated before the ring that follows the user's keys (`checked_empty()`), since the model editor has no observer.
     #[spec("inbox/probe/076")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn probe_076_csi_enter_recovery_releases_delivery() {
         ring_after_agent_input_recovery("csi-enter", b"\x1b[\r").await;
     }
 
-    /// Scenario: Deliver a control doorbell, then type ESC ] and Ctrl+U into the model editor and restore its empty prompt. After 2.5 seconds, a new doorbell stays held and writes nothing; the user's BEL ends the OSC, and the next doorbell is typed and submitted within three attempt bounds.
+    /// Scenario: Deliver a control doorbell, then type ESC ] and Ctrl+U into the model editor and restore its empty prompt. After 2.5 seconds, a new doorbell stays held and writes nothing; the user's BEL ends the OSC, and the next doorbell is typed and submitted within three attempt bounds. A check reading the box empty is simulated before the ring that follows the user's keys (`checked_empty()`), since the model editor has no observer.
     #[spec("inbox/probe/076")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn probe_076_osc_ctrl_u_recovery_releases_delivery() {
         ring_after_agent_input_recovery_then_key("osc-ctrl-u", b"\x1b]\x15", b"\x07").await;
     }
 
-    /// Scenario: Deliver a control doorbell, then type ESC ] and Enter into the model editor and restore its empty prompt. After 2.5 seconds, a new doorbell stays held and writes nothing; the user's BEL ends the OSC, and the next doorbell is typed and submitted within three attempt bounds.
+    /// Scenario: Deliver a control doorbell, then type ESC ] and Enter into the model editor and restore its empty prompt. After 2.5 seconds, a new doorbell stays held and writes nothing; the user's BEL ends the OSC, and the next doorbell is typed and submitted within three attempt bounds. A check reading the box empty is simulated before the ring that follows the user's keys (`checked_empty()`), since the model editor has no observer.
     #[spec("inbox/probe/076")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn probe_076_osc_enter_recovery_releases_delivery() {
@@ -28201,7 +28214,7 @@ mod spawn_tests {
         registry.shutdown_all();
     }
 
-    /// Scenario: (e) A human writes into the model editor's pane after the deck's line is typed and before its Enter, the human's operation admitted while the transaction holds the writer. The Enter still goes, the ring is submitted, and the human's bytes are written after the release, in order: the line, the Enter, then the human's text. (g) A second human write waits for the writer and its caller is dropped: its operation settles cancelled, the transaction is unaffected, and the next ring is admitted.
+    /// Scenario: (e) A human writes into the model editor's pane after the deck's line is typed and before its Enter, the human's operation admitted while the transaction holds the writer. The Enter still goes, the ring is submitted, and the human's bytes are written after the release, in order: the line, the Enter, then the human's text. (g) A second human write waits for the writer and its caller is dropped: its operation settles cancelled, the transaction is unaffected, and the next ring is admitted. A check reading the box empty is simulated before the ring that follows the user's keys (`checked_empty()`), since the model editor has no observer.
     #[spec("inbox/doorbell/050")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn doorbell_050_human_frames_after_the_line_wait_and_follow_in_order() {
@@ -28335,7 +28348,7 @@ mod spawn_tests {
             .wake_hold
     }
 
-    /// Scenario: (m) With the re-projection publisher running, a ring ends unresolved: the card shows uncertain_input and one wake update carries it; the user's own Enter then clears it. (i) With the publisher held at a gate, a ring ends unresolved and the user clears before the gate opens: once it runs, the cell is the user's, the card shows nothing and no update ever carried uncertain_input. (l) Held again, a ring ends unresolved, the generation is closed and a successor starts in the pane: the old request touches nothing of the successor's.
+    /// Scenario: (m) With the re-projection publisher running, a ring ends unresolved: the card shows uncertain_input and one wake update carries it; the user's own Enter then clears it. (i) With the publisher held at a gate, a ring ends unresolved and the user clears before the gate opens: once it runs, the cell is the user's, the card shows nothing and no update ever carried uncertain_input. (l) Held again, a ring ends unresolved, the generation is closed and a successor starts in the pane: the old request touches nothing of the successor's. A check reading the box empty is simulated before the ring that follows the user's keys (`checked_empty()`), since the model editor has no observer.
     #[spec("inbox/doorbell/050")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn doorbell_050_publication_shows_the_cell_as_it_is_when_it_runs() {

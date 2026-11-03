@@ -6,8 +6,9 @@
 //! daemon: the admission's inputs read from the generation (its activation,
 //! its input-mode evidence, its ledger, its Clean frame, its settle window),
 //! the final seam read under `try_lock`s that stay held across the job's
-//! enqueue, each job queued under the transaction's own claim
-//! ([`PaneWriter::queue_deck_job`]), and the writer's answers, the hook's
+//! enqueue, each job queued under the transaction's own claim and named to
+//! the input epoch as the ring's (`queue_ring_job`), and the writer's
+//! answers, the hook's
 //! ring evidence and the passing time fed back as events. Dropping the
 //! caller detaches it; the task ends at a terminal state or the deadline, and
 //! only then releases the writer, so the human frames queued behind it are
@@ -178,7 +179,10 @@ impl txn::Seam for DaemonSeam<'_> {
         let bus = self.generation.bus.state.try_lock().ok()?;
         let mode = self.generation.mode.try_lock().ok()?;
         // Q35-21: read inside the ledger's hold, which keeps every person's
-        // op out until the job is enqueued, so the epoch can't move under it.
+        // op out until the job is enqueued, so no person's op moves the epoch
+        // under it. An external edit (`GenerationInput::external_edit`) can
+        // still move it without the ledger; the ring's reconcile refuses that
+        // case by `last_foreign <= E_admit`.
         let touched = self.generation.bus.input().touched();
         let marks = ledger.marks();
         let read = txn::SeamRead {

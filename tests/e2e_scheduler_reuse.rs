@@ -180,7 +180,7 @@ fn reuse_002_new_tab_per_fire_opens_distinct_tabs() {
 #[spec("scheduler/reuse/003")]
 #[test]
 #[cfg(unix)]
-fn reuse_003_deliver_on_idle_debounce() {
+fn reuse_003_a_cleared_draft_still_holds_and_the_agents_fetch_delivers() {
     route::scheduled(Some(3));
 }
 

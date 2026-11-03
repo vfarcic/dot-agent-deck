@@ -124,6 +124,25 @@ mod tests {
         assert_eq!(recovery.clears(), 1);
     }
 
+    /// Scenario: The user sends half a key sequence (`ESC [`), then the deck's notice line and its Enter go into the same stream, then the user presses Enter. The deck's first letter completes the user's sequence, so its Enter is the deck's and counts nothing; the user's Enter after it is the user's own submit (the mixed-origin case issue #544's split test covered for the deleted draft bit).
+    #[spec("inbox/probe/047")]
+    #[test]
+    fn probe_047_a_users_half_sequence_completed_by_the_decks_line_counts_only_the_users_enter() {
+        use Origin::{Deck, User};
+        let mut recovery = Recovery::default();
+        assert!(!recovery.feed(b"\x1b[", User));
+        assert!(
+            !recovery.feed(b"NOTICE\r", Deck),
+            "the deck's Enter is not the user's"
+        );
+        assert_eq!(recovery.clears(), 0);
+        assert!(
+            recovery.feed(b"\r", User),
+            "the user's Enter after it submits"
+        );
+        assert_eq!(recovery.clears(), 1);
+    }
+
     /// Scenario: Split the user's Ctrl+U across a CSI the user began and abandoned, and feed a Ctrl+C that arrives inside an OSC string. A control byte inside a sequence or string is no edit; once the stream is back in ground the user's clear counts.
     #[spec("inbox/probe/047")]
     #[test]
