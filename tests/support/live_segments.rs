@@ -71,6 +71,52 @@ pub struct Fixture {
     /// nothing asserts on it here).
     log: PathBuf,
     _log_dir: Option<tempfile::TempDir>,
+    _codex_bin: Option<tempfile::TempDir>,
+    /// A Codex pane's own `PATH` and `hooks/list` answer (Q129b item 0).
+    codex_pane: Option<CodexPaneEnv>,
+}
+
+/// What a Codex pane is spawned with beyond the common environment: the
+/// `codex app-server` stand-in first on its `PATH`, and the stand-in's
+/// `hooks/list` answer.
+struct CodexPaneEnv {
+    path: String,
+    hook_list: String,
+}
+
+/// Q129b item 0: record the deck's scoped trust for its own Codex hooks in
+/// the pane's `$CODEX_HOME` before the first spawn, through the real
+/// `hooks install --agent codex`, as an install the user ran earlier would
+/// have. The deck takes the keymap identity of `$CODEX_HOME/config.toml`
+/// at spawn (R6 §9.2), so it then already holds the records, and the
+/// wrapper's own trust write at spawn finds them in place and writes
+/// nothing (`codex_hooks_manage::edit_trust_state`: an edit that changes
+/// nothing is not a write).
+fn seed_codex_trust(daemon: &common::DaemonProc, pane: &CodexPaneEnv) {
+    let codex_home = daemon.home.join("codex");
+    let mut command = Command::new(common::contained_deck_binary());
+    command
+        .args(["hooks", "install", "--agent", "codex"])
+        .current_dir(&daemon.home)
+        .env_clear()
+        .env("PATH", &pane.path)
+        .env("HOME", &daemon.home)
+        .env("CODEX_HOME", &codex_home)
+        .env("CODEX_HOOK_LIST_RESPONSE", &pane.hook_list);
+    for (key, value) in common::config_containment_env() {
+        command.env(key, value);
+    }
+    let out = command.output().expect("run hooks install --agent codex");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("Trusted hooks: 6"),
+        "seeding the deck's Codex hook trust: {out:?}"
+    );
+    assert!(
+        fs::read_to_string(codex_home.join("config.toml"))
+            .is_ok_and(|toml| toml.contains("trusted_hash")),
+        "the trust records are in the pane's config.toml before the spawn"
+    );
 }
 
 /// What a failing test prints of the daemon's log: the probe's and the
@@ -120,8 +166,46 @@ impl Fixture {
         let log_value = log.to_str().expect("log path is UTF-8").to_owned();
         env.push(("RUST_LOG", LOG_FILTER));
         env.push(("DOT_AGENT_DECK_LOG", &log_value));
+        // Codex's hooks are trusted, as for a Codex the deck could set up:
+        // the deck's wrapper asks `codex app-server` for its hooks' trust
+        // hashes, which the copied native fixture (named `codex`) can't
+        // answer. Without trust the wrapper would report every redraw as the
+        // card's status (issue #1493's degraded mode), and a ring's own echo
+        // would turn the card busy mid-ring. The stand-in is the one
+        // `tests/e2e_inbox_codex_doorbell.rs` uses, copied out of the
+        // checkout: the harness drops every `PATH` entry inside it.
+        //
+        // It goes on the PANE's `PATH` only (Q129b item 0). On the daemon's,
+        // its startup install would write trust into `$HOME/.codex` from a
+        // thread of its own, and for a pane launched in `$HOME` that file is
+        // one of Codex's project layers, which are keymap sources (R6 §9.2):
+        // a write after the spawn's keymap identity refuses every check
+        // `Keymap(Changed)`.
+        let codex_bin = (kind == "codex").then(|| {
+            let dir = common::harness_tempdir().expect("codex stand-in dir");
+            let to = dir.path().join("codex");
+            fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex-synthetic/codex"),
+                &to,
+            )
+            .expect("copy the codex app-server stand-in");
+            fs::set_permissions(&to, fs::Permissions::from_mode(0o755)).unwrap();
+            dir
+        });
         env.extend_from_slice(extra);
         let daemon = common::spawn_daemon_serve_with_env(None, "0", &env);
+        let codex_pane_env = codex_bin.as_ref().map(|dir| {
+            let pane = CodexPaneEnv {
+                path: common::contain_path(&format!(
+                    "{}:{}",
+                    dir.path().display(),
+                    std::env::var("PATH").unwrap_or_default()
+                )),
+                hook_list: codex_hook_list_response(),
+            };
+            seed_codex_trust(&daemon, &pane);
+            pane
+        });
         let native = daemon.home.join("native");
         fs::create_dir(&native).unwrap();
         let exe = native.join(kind);
@@ -185,6 +269,8 @@ impl Fixture {
             exe,
             log,
             _log_dir: log_dir,
+            _codex_bin: codex_bin,
+            codex_pane: codex_pane_env,
         };
         f.spawn("first", false);
         f
@@ -208,13 +294,25 @@ impl Fixture {
             self.exe.parent().unwrap().join("editor").display(),
             self.base.display()
         );
+        let mut env = json!([
+            [MODE, self.base.to_str().unwrap()],
+            ["DOT_AGENT_DECK_PANE_ID", PANE],
+            ["DAD_LIVE_SEGMENTS_KIND", self.kind],
+            ["VISUAL", editor],
+            ["EDITOR", editor],
+            ["TMPDIR", self.daemon.home.join("tmp")],
+            ["CODEX_HOME", self.daemon.home.join("codex")]
+        ]);
+        if let Some(pane) = &self.codex_pane {
+            let env = env.as_array_mut().unwrap();
+            env.push(json!(["PATH", pane.path]));
+            env.push(json!(["CODEX_HOOK_LIST_RESPONSE", pane.hook_list]));
+        }
         let request = json!({
         "op":"start-agent", "command":format!("{} --live-segments-fixture",quote(&self.exe)), "cwd":self.daemon.home,
             "rows":40,"cols":140,"display_name":"segment-fixture",
             "agent_type":if self.kind == "codex" {"codex"} else {"claude_code"},
-            "env":[[MODE,self.base.to_str().unwrap()], ["DOT_AGENT_DECK_PANE_ID",PANE],
-                ["DAD_LIVE_SEGMENTS_KIND",self.kind], ["VISUAL",editor], ["EDITOR",editor],
-                ["TMPDIR",self.daemon.home.join("tmp")], ["CODEX_HOME",self.daemon.home.join("codex")]],
+            "env":env,
         });
         let duplicate = format!("Duplicate pane id: {PANE}");
         let deadline = std::time::Instant::now() + WAIT;
@@ -575,6 +673,7 @@ impl Fixture {
         for l in text.lines().filter(|l| {
             l.contains("composer_probe")
                 || l.contains("doorbell")
+                || l.contains("codex")
                 || l.contains("Received ")
                 || l.contains("inbox")
         }) {
@@ -641,6 +740,31 @@ impl Drop for Fixture {
             },
         );
     }
+}
+
+/// What the `codex app-server` stand-in answers to `hooks/list`: the deck's
+/// own hooks, by the command the install wrote (as
+/// `tests/e2e_inbox_codex_doorbell.rs` and `tests/e2e_codex_status.rs` answer).
+fn codex_hook_list_response() -> String {
+    let entry = |event: &str, camel: &str| {
+        json!({
+            "key": format!("__CODEX_HOME__/hooks.json:{event}:0:0"),
+            "eventName": camel, "handlerType": "command", "matcher": null,
+            "command": "__DECK_COMMAND__", "timeoutSec": 600, "statusMessage": null,
+            "sourcePath": "__CODEX_HOME__/hooks.json", "source": "user", "pluginId": null,
+            "displayOrder": 0, "enabled": true, "isManaged": false,
+            "currentHash": format!("sha256:{event}"), "trustStatus": "untrusted"
+        })
+    };
+    json!({"id": 2, "result": {"data": [{"cwd": "/workspace", "hooks": [
+        entry("session_start", "sessionStart"),
+        entry("user_prompt_submit", "userPromptSubmit"),
+        entry("pre_tool_use", "preToolUse"),
+        entry("post_tool_use", "postToolUse"),
+        entry("permission_request", "permissionRequest"),
+        entry("stop", "stop"),
+    ], "warnings": [], "errors": []}]}})
+    .to_string()
 }
 
 // The bridge changes only ancestry, not F2's parsing or key-loss mechanisms.
