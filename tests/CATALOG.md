@@ -10102,46 +10102,30 @@ S-21 re-oracles the attached draft/no-cap and empty-navigation functions in `tes
 - **Layer:** L2 lane 1 (`tests/e2e_probe_delivery.rs`, `tests/e2e_inbox_doorbell.rs`), real binary, daemon-owned PTY and attach input stream.
 - **Agent:** native synthetic Claude and Codex with the F2 Python composers and real installed helper; OpenCode/Pi native receipt stand-ins; no real agent or credential.
 - **Asserts:** Claude and Codex interrupt Escapes touch the box even when followed by Idle; completing the physical sequence with a typed-and-deleted character requires a check before the notice. Claude drafts typed before and after Escapes while busy remain held after the turn becomes Idle and a real non-empty read; clearing requires another check. Escapes on an already-Idle Claude followed by duplicate Idle reports also require a check. OpenCode and Pi retain native-stream delivery after interrupted and already-Idle Escapes, with no typed fallback.
-- **Does not assert:** a real agent's interrupt or menu screen, an Idle from an agent that has since been replaced (`inbox/doorbell/020`), or an Idle racing the PTY write (`inbox/doorbell/022`, `inbox/doorbell/023`).
+- **Does not assert:** a real agent's interrupt or menu screen, an Idle from an agent that has since been replaced (`inbox/doorbell/020`), or an Idle racing the PTY write (retired with the keystroke model in Q35-21: no turn edge moves the input epoch).
 - **Platform coverage:** Linux (Claude/Codex native F2); mac+linux (OpenCode/Pi native-stream controls).
 - **Cost:** none.
 
-##### inbox/doorbell/020 — A replaced agent's Idle cannot release its successor's Escapes.
+##### inbox/doorbell/020 — A replaced agent's Idle ends no turn on its successor's clock.
 - **Layer:** Fast (`src/daemon.rs`, `hook_provenance_audit_tests`), the production ingest path against a real registry and stand-in PTYs.
 - **Agent:** none (`/usr/bin/true` replaced by `cat` on one pane), events typed as Claude Code, Codex, OpenCode and Pi.
-- **Asserts:** with the successor's Escape pair recorded while it is Thinking, an Idle naming the replaced agent and an untagged Idle attested to its token each leave the doorbell held, and the successor's own Idle releases the pair; after a second pair on the Idle successor, the replaced agent's Thinking then Idle, and the successor's own Idle with no Thinking of its before it, leave it held; the successor's Thinking then Idle releases it.
-- **Does not assert:** a successor published concurrently with the old agent's Idle (the owner check and the change are one registry hold; there is no seam between them to park at), or an Idle racing the PTY write (`inbox/doorbell/022`, `inbox/doorbell/023`).
+- **Asserts:** (Q35-21, re-oracled to the turn clock, `PaneInputHold::turns`; the Escape-release half retired with the keystroke model) with the successor Thinking and an Escape pair recorded, an Idle naming the replaced agent and an untagged Idle attested to its token each end no turn on the successor's clock, and the successor's own Idle ends one; after a second pair on the Idle successor, the replaced agent's Thinking then Idle, and the successor's own Idle with no Thinking of its before it, end none; the successor's Thinking then Idle ends a second.
+- **Does not assert:** a successor published concurrently with the old agent's Idle (the owner check and the change are one registry hold; there is no seam between them to park at). An Idle racing the PTY write no longer decides anything: since Q35-21 the box's emptiness is the input epoch's, which no turn edge moves (`inbox/probe/002`).
 - **Platform coverage:** mac+linux.
 - **Cost:** none.
 
-##### inbox/doorbell/021 — A repeated Idle releases no menu's Escapes.
+##### inbox/doorbell/021 — A repeated Idle ends no turn.
 - **Layer:** Fast (`src/daemon.rs`, `hook_provenance_audit_tests`), the production ingest path against a real registry and a stand-in PTY.
 - **Agent:** none (`cat`), events typed as Claude Code, Codex, OpenCode and Pi.
-- **Asserts:** after a turn (Thinking, Idle), two Escapes pressed on the Idle agent and two more Idle reports leave the doorbell held; the agent's next Thinking then Idle releases them.
+- **Asserts:** (Q35-21, re-audited against the turn clock; the Escape-release half retired) after a turn (Thinking, Idle) counts one, two Escapes pressed on the Idle agent and two more Idle reports end no turn; the agent's next Thinking then Idle ends the second.
 - **Does not assert:** the doorbell ringing (`inbox/doorbell/019`'s duplicate-Idle control), or a real OpenCode's two Idle events.
-- **Platform coverage:** mac+linux.
-- **Cost:** none.
-
-##### inbox/doorbell/022 — An interrupt recorded after the Idle that ended its turn holds nothing.
-- **Layer:** Fast (`src/daemon.rs`, `hook_provenance_audit_tests`), real registry and PTY writer thread, parked by `pause_next_pty_write_for_test` after the write returned and its turn count was read.
-- **Agent:** none (`cat`), events typed as OpenCode.
-- **Asserts:** with the agent Thinking, two Escapes the PTY took before the Idle was ingested, but recorded after it, do not hold the doorbell.
-- **Does not assert:** an Idle ingested between the write and its turn-count reading, which holds (`inbox/doorbell/027`).
-- **Platform coverage:** mac+linux.
-- **Cost:** none.
-
-##### inbox/doorbell/023 — Escapes written after the Idle keep the menu held.
-- **Layer:** Fast (`src/daemon.rs`, `hook_provenance_audit_tests`), real registry and PTY writer thread: parked before the write by `pause_next_pty_write_for_test`, and a stand-in writer that takes one byte, then parks its second call.
-- **Agent:** none (`cat`, then the stand-in writer), events typed as OpenCode.
-- **Asserts:** with the agent Thinking, two Escapes whose write was parked before the PTY while the Idle was ingested hold the doorbell; so do the two Escapes of a three-Escape write the PTY took after the Idle, its first byte having gone before.
-- **Does not assert:** an agent that emits Idle before reading Escapes the daemon wrote first (the daemon orders by its own observation).
 - **Platform coverage:** mac+linux.
 - **Cost:** none.
 
 ##### inbox/doorbell/024 — A first turn reported before any input is a turn.
 - **Layer:** Fast (`src/daemon.rs`, `hook_provenance_audit_tests`), the production ingest path.
 - **Agent:** none (`cat`), events typed as Claude Code, Codex, OpenCode and Pi.
-- **Asserts:** a freshly spawned agent's Thinking, reported before any byte reached its pane, then two Escapes and Idle: the doorbell is not held.
+- **Asserts:** (Q35-21, re-oracled to the turn clock) a freshly spawned agent's Thinking, reported before any byte reached its pane, then two Escapes and Idle: the turn counts.
 - **Does not assert:** a Thinking reported before the agent is published (`inbox/doorbell/025`).
 - **Platform coverage:** mac+linux.
 - **Cost:** none.
@@ -10149,31 +10133,15 @@ S-21 re-oracles the attached draft/no-cap and empty-navigation functions in `tes
 ##### inbox/doorbell/025 — A turn reported before publication is kept.
 - **Layer:** Fast (`src/daemon.rs`, `hook_provenance_audit_tests`), real spawn parked before publication by `pause_next_publish_for_test`.
 - **Agent:** none (a shell script that writes its agent id, then `cat`), events typed as OpenCode.
-- **Asserts:** a Thinking from the reserved, unpublished agent, then publication, two Escapes and Idle: the doorbell is not held.
+- **Asserts:** (Q35-21, re-oracled to the turn clock) a Thinking from the reserved, unpublished agent, then publication, two Escapes and Idle: the turn counts.
 - **Does not assert:** a token-attested report (the event names the agent).
-- **Platform coverage:** mac+linux.
-- **Cost:** none.
-
-##### inbox/doorbell/026 — Split Escapes pair only within one turn.
-- **Layer:** Fast (`src/daemon.rs`, `hook_provenance_audit_tests`), real registry and PTY writer thread.
-- **Agent:** none (`cat`), events typed as OpenCode.
-- **Asserts:** an interrupt sent as two separate Escape writes while Thinking, then Idle, holds nothing; two separate Escape writes on the Idle agent hold; an Escape the PTY took before the Idle but recorded after it does not pair with the Escape written after the Idle, so nothing holds.
-- **Does not assert:** a real agent's interrupt timing.
-- **Platform coverage:** mac+linux.
-- **Cost:** none.
-
-##### inbox/doorbell/027 — An Idle between the write and its turn-count reading holds the doorbell.
-- **Layer:** Fast (`src/daemon.rs`, `hook_provenance_audit_tests`), real registry and PTY writer thread, parked by `pause_next_pty_write_for_test` after the write returned and before its turn count is read.
-- **Agent:** none (`cat`), events typed as OpenCode.
-- **Asserts:** with the agent Thinking, two Escapes the PTY took, with the Idle ingested before their turn count was read, hold the doorbell — the deliberate side of the ambiguous window; two Enters release it.
-- **Does not assert:** that the agent read the Escapes before or after its Idle (the daemon cannot observe it), or a time bound on the hold (there is none).
 - **Platform coverage:** mac+linux.
 - **Cost:** none.
 
 ##### inbox/doorbell/028 — A replaced agent's late keys do not reach its successor's input.
 - **Layer:** Fast (`src/daemon.rs`, `hook_provenance_audit_tests`), real registry and PTY writer thread, parked by `pause_next_pty_write_for_test` after the write returned and its turn count was read.
 - **Agent:** none (a shell script that exits when the test asks, replaced by `cat` on one pane), events typed as OpenCode.
-- **Asserts:** with agent A's two Escapes taken by its PTY and not yet recorded, A exits on its own and B is published on the pane; after B's Thinking, Idle and an Escape pair on Idle B, A's Escapes recorded late leave B's doorbell held; text A's PTY took and that is recorded only after B is published leaves B with nothing pending.
+- **Asserts:** with agent A's two Escapes taken by its PTY and not yet recorded, A exits on its own and B is published on the pane; after B's Thinking, Idle and an Escape pair on Idle B, A's Escapes recorded late leave B's box touched; text A's PTY took and that is recorded only after B is published leaves B's box untouched. (Since Q35-21, "held" reads the generation's input epoch, `AgentPtyRegistry::input_touched`, so A's late keys reach only A's.)
 - **Does not assert:** a predecessor removed by close or respawn (its writer was already retired, issue #542), or what the agent processes read.
 - **Platform coverage:** mac+linux.
 - **Cost:** none.
@@ -10181,7 +10149,7 @@ S-21 re-oracles the attached draft/no-cap and empty-navigation functions in `tes
 ##### inbox/doorbell/029 — A wrapper-classified Idle ends no turn the agent reported.
 - **Layer:** Fast (`src/daemon.rs`, `hook_provenance_audit_tests`), the production ingest path against a real registry and a stand-in PTY.
 - **Agent:** none (`cat`), events typed as Claude Code, Codex, OpenCode and Pi.
-- **Asserts:** with the agent Thinking and two Escapes recorded, an Idle carrying the `dot-agent-deck wrap` output-classified mark (what a wrapped Codex's quiet output sends) leaves the doorbell held; the agent's own Idle then releases it.
+- **Asserts:** (Q35-21, re-oracled to the turn clock; provenance kept) with the agent Thinking and two Escapes recorded, an Idle carrying the `dot-agent-deck wrap` output-classified mark (what a wrapped Codex's quiet output sends) ends no turn; the agent's own Idle then ends it.
 - **Does not assert:** the wrapper producing that Idle (`src/wrap.rs`'s quiet-output tests), or an unclassified Idle the wrapper sends at process exit.
 - **Platform coverage:** mac+linux.
 - **Cost:** none.
@@ -10189,7 +10157,7 @@ S-21 re-oracles the attached draft/no-cap and empty-navigation functions in `tes
 ##### inbox/doorbell/030 — A late ToolEnd starts no turn.
 - **Layer:** Fast (`src/daemon.rs`, `hook_provenance_audit_tests`), the production ingest path against a real registry and a stand-in PTY.
 - **Agent:** none (`cat`), events typed as Claude Code, Codex, OpenCode and Pi.
-- **Asserts:** after a turn (Thinking, Idle), two Escapes pressed on the Idle agent, then a ToolEnd and another Idle, leave the doorbell held; the agent's next Thinking then Idle releases them.
+- **Asserts:** (Q35-21, re-oracled to the turn clock; provenance kept) after a turn (Thinking, Idle), two Escapes pressed on the Idle agent, then a ToolEnd and another Idle, end no turn; the agent's next Thinking then Idle ends the second.
 - **Does not assert:** a real agent delivering a ToolEnd after its Idle (the daemon cannot tell a late one from a timely one, so none starts a turn).
 - **Platform coverage:** mac+linux.
 - **Cost:** none.
@@ -10399,13 +10367,6 @@ S-21 re-oracles the attached draft/no-cap and empty-navigation functions in `tes
 - **Agent:** none (a model editor).
 - **Asserts:** the first job is exactly `(xxxxxx)`, its bytes the parentheses and token letters, and the rest is queued only once the head's echo is on screen (the screen lagging 300 ms), then one Enter, Submitted; an unstaged line is one job. A dialog opening as the head is written (the head's bytes reach it), a dialog opening after the head's echo was seen and before the rest's seam, and another token on screen at that seam each end Unresolved with only the head written. A head never shown, another token's head shown, or only part of it shown ends Unresolved (`echo_mismatch`) with nothing deleted; part of it first and the whole head 200 ms later carries on and is Submitted. The writer taking 1 to 7 bytes of the head ends Unresolved (`partial_write`) with nothing deleted and nothing more written, none of it is nothing written, a whole head with a failed flush is withdrawn with eight deletes and the placeholder's confirmation, and a whole head with the admission lost while its echo is awaited is withdrawn the same way with the rest never typed. The rest's job queued until the deadline is taken back and never written; claimed by the writer at the deadline with its reports after it, it is accounted for as written; its end first heard at the deadline or a millisecond after, whether the writer took its bytes or none, suspends the cell. Every case releases by the deadline, and none after the head is in ends as nothing written.
 - **Does not assert:** a real agent's staged echo (`inbox/doorbell/036` replays the recorded series; `inbox/codex/027` drives the real writer), or which releases stage (`inbox/doorbell/053`).
-- **Platform coverage:** all.
-
-##### inbox/doorbell/059 — The input box model follows a pane's input per measured agent, so blanks the screen cannot show are a draft and nothing is guessed.
-- **Layer:** Fast (`src/composer_model.rs`), pure: the model fed through the real paste framing and submit scan of a pane's input stream (`DraftTestStream` in `src/agent_pty.rs`); no PTY or daemon. One case (`src/daemon.rs`, `hook_ingestion_tests`) ingests hook events through the daemon into a `cat` pane's stream.
-- **Agent:** none (the keys and sequences measured on real Claude Code 2.1.310, Codex 0.164.0 and Codex 0.160.0 sessions, 2026-10-26).
-- **Asserts:** Per agent, with the measured contents as the oracle: the tester's 19 compound sequences, 30 line-boundary probes (Home, End, `Ctrl+A`, `Ctrl+E` pressed again at a line's start or end in every encoding, `Ctrl+U` and Delete at line edges, Enter on blanks with the cursor inside them) and End then `Ctrl+U` over ten boxes each leave the model holding exactly what the real box held, `Empty` only where it was empty; a letter then `Ctrl+C` empties every one of those boxes. Named regressions: the reviewer's sequence (`61620a20201b5b48151b5b487f1b5b337e1b5b337e15`) holds two spaces on both agents, since `Ctrl+U` at a later line's start joins it to the line above; three spaces, Enter, `x`, `Ctrl+U` (`2020200d7815`) holds three spaces on Codex, whose blank Enter keeps the blanks with its cursor at the start, and is empty on Claude Code. A property check drives 4,000 random sequences per agent of the measured keys, mixed with Tab, Up and a non-ASCII letter that do something picked at random, turns starting and ending and the agent's delayed prompt reports, through the model and a reference editor written from the measurements: the model never says `Empty` over a held box, and whenever it says it knows the box it holds exactly the reference's text and cursor. Single-line edits: spaces are a draft whatever the cursor does afterwards; `End` then `Ctrl+U` empties one line; `Ctrl+U` kills only what is before the cursor; a delete applies where the cursor is; keys that edit nothing leave an empty box empty; Enter on blanks keeps them and on text empties the box; an Enter after a backslash is unknown. A line break alone and blanks on another line are drafts; Up and Down are unknown; pasted text of up to 256 characters and three lines is followed, a longer one or one of four lines is unknown. Tab, Up, non-ASCII text, a word-move, Shift+Enter, Alt+x, Alt+Enter, `Ctrl+W`, `Ctrl+K`, an escape inside a paste and PageUp each leave the box unknown; `Ctrl+C` proves each empty, and `End` then `Ctrl+U` adjacent does only when the key cannot have broken a line; otherwise it proves only the cursor's line empty on Claude Code (`LineEmpty`) and nothing on Codex, and Backspace, Left, Right, Delete or `Ctrl+U` past what was typed since, or Claude Code's Home key moving on, loses it. The property check also asserts that whenever the model says `LineEmpty` the reference box is empty or is not one line with the cursor at its start. `Ctrl+C` during a turn with something in the box is unknown, on an empty box empty. An Enter on text with an `@`, or on a leading `!`, `#`, `/` or `?` with only blanks after it, is unknown until its own report. Tab may have submitted, so its report is its own and does not confirm a later Enter. An Enter on an unknown box stays unknown through turns starting and ending and is proven empty only by a prompt report no earlier submit owns: a report of a prompt sent before it (late, cut short, or two queued prompts reported as one) and the deck's own line's report confirm nothing, a report that came before the Enter was recorded leaves it held until `Ctrl+C` or a prompt typed and sent, a report inside a busy turn confirms it, and a second Enter with nothing typed since awaits the same report; what is typed after it is followed. An unknown Enter settled before its report by `Ctrl+C`, `End` then `Ctrl+U` on one line or a prompt sent still owes that report, so the next unowned report is its, until a turn has ended (two inside a busy turn). After it, Left, Backspace or `Ctrl+U` at the start of what was typed since, Home on its first two lines, Right or Delete at its end, or End on its last two lines gives it up (unknown, and no report proves it empty), and the composed non-ASCII character, Backspace, Enter, space, `Ctrl+J`, End, `Ctrl+U`, Backspace, `Ctrl+A` stays unknown until `x` then `Ctrl+C`. A lone ESC keeps the box as it was; an unfinished or unrecognised CSI, SS3, UTF-8, X10, OSC or DCS sequence is unknown, and `End` then `Ctrl+U` recovers each. Through the daemon, working reports without a prompt, the turn ending, a predecessor's or a subagent's prompt report and the deck's own line leave an unknown Enter unknown, and the live agent's own prompt report proves the box empty. Terminal reports edit nothing in an empty box, a draft or an unknown box, and do not separate End from `Ctrl+U`. The deck's own line is a draft until its Enter empties the box, its deletes empty it, the doorbell's verified submit proves an unknown box empty, and a box past 4096 characters is unknown.
-- **Does not assert:** that a key the model follows does what was measured on any other release or agent, a key the agent never received (a dialog taking it), or text the agent puts into its own box.
 - **Platform coverage:** all.
 
 #### inbox/probe

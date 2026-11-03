@@ -558,48 +558,38 @@ pub struct Frame {
     pub user_cells: Vec<String>,
     /// The frame's cells as text, for the token's redraw rule.
     pub text: String,
-    /// What the bytes written into the pane say its input box holds, read
-    /// with the frame (R6-4). The screen cannot show blanks the agent does
-    /// not draw, so a blank composer is empty only when this says so too.
-    pub input: crate::composer_model::InputProof,
+    /// PRD #1666 part 3 (Q35-21, R3 §3.6): something entered the input box
+    /// since the last observation that proved it empty (the generation's
+    /// input epoch, read with the frame). The screen cannot show blanks the
+    /// agent does not draw, so a blank composer is empty only while nothing
+    /// touched the box; a touched one is empty only once a check reads it so.
+    pub touched: bool,
 }
 
 impl Frame {
     /// The empty ready composer and no dialog (step 2).
     ///
-    /// The screen and the input written into the pane both have to say so
-    /// (R6-4). A blank composer counts only with the cursor where an empty
-    /// one keeps it and nothing hidden in its region, and only while the
-    /// input proves the box empty: spaces with the cursor moved back to the
-    /// start draw exactly the empty composer. When the input proves only the
-    /// cursor's line empty (Claude Code, after `End` then `Ctrl+U` on a box
-    /// it did not know), a blank composer still proves the box empty: Claude
-    /// Code draws every line as a row, a blank one included, and its
-    /// recogniser marks such a row hidden. The agent's placeholder is
-    /// drawn only over an empty box, so it is proof enough while the input
-    /// cannot say; it does not outweigh input that says the box holds
-    /// something, since the frame may predate that input.
+    /// The screen and the box's input epoch both have to say so (R6-4,
+    /// Q35-21). A composer counts while its placeholder shows, or while it
+    /// is blank with the cursor where an empty one keeps it and nothing
+    /// hidden in its region, and only while the epoch says nothing touched
+    /// the box since it was last observed empty: spaces with the cursor
+    /// moved back to the start draw exactly the empty composer, and a
+    /// placeholder on screen can predate the keys that replaced it. Only a
+    /// check that reads the box empty, or the deck's own submitted line,
+    /// makes a touched box untouched again.
     pub fn empty_and_ready(&self) -> bool {
-        use crate::composer_model::InputProof;
-        self.dialog.is_none()
+        !self.touched
+            && self.dialog.is_none()
             && self.composer.as_ref().is_some_and(|c| {
-                let blank = !c.hidden && c.text.is_empty() && c.cursor_at_end;
-                match self.input {
-                    // A blank composer is one empty row with the cursor at
-                    // its start, so the line the input proves empty is all.
-                    InputProof::Empty | InputProof::LineEmpty => c.placeholder || blank,
-                    InputProof::Unknown => c.placeholder,
-                    InputProof::Draft => false,
-                }
+                c.placeholder || (!c.hidden && c.text.is_empty() && c.cursor_at_end)
             })
     }
 
-    /// PRD #1666 part 3 (Q35-21p): this frame, read with `input` as what the
-    /// bytes written into the pane say its box holds. The one way tests set
-    /// a frame's input, so Q35-21's switch (the input becomes `touched`)
-    /// changes the tests in one place.
-    pub fn with_input(self, input: crate::composer_model::InputProof) -> Self {
-        Self { input, ..self }
+    /// PRD #1666 part 3 (Q35-21p, Q35-21): this frame, read with `touched`
+    /// as the box's input epoch says. The one way tests set it.
+    pub fn with_touched(self, touched: bool) -> Self {
+        Self { touched, ..self }
     }
 
     /// The composer holds exactly `text`, the cursor right after it.

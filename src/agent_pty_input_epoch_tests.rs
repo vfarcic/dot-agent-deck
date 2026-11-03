@@ -104,6 +104,8 @@ fn constructor(op: &PtyOp) -> usize {
         PtyOp::WriteAll(_, ByteSource::Deck | ByteSource::User | ByteSource::Answer, _) => 1,
         #[cfg(target_os = "linux")]
         PtyOp::WriteAll(_, ByteSource::Probe(_), _) => 1,
+        PtyOp::Write(_, ByteSource::Ring(_)) => 0,
+        PtyOp::WriteAll(_, ByteSource::Ring(_), _) => 1,
         PtyOp::Answer(..) => 2,
         PtyOp::Flush => 3,
         PtyOp::Surrender(_) => 4,
@@ -119,6 +121,9 @@ fn every_op(answers: &QuestionAnswers) -> Vec<(String, PtyOp)> {
     let sources = sources.chain([ByteSource::Probe(crate::composer_probe::epoch::DeckJobId(
         7,
     ))]);
+    let sources = sources.chain([ByteSource::Ring(
+        crate::composer_probe::epoch::DeckJobId::ring(3),
+    )]);
     for source in sources {
         ops.push((
             format!("Write {source:?}"),
@@ -150,6 +155,7 @@ fn expected_writer(op: &PtyOp) -> Option<Writer> {
             ByteSource::Deck => Writer::UnnamedDeck,
             #[cfg(target_os = "linux")]
             ByteSource::Probe(job) => Writer::Deck(*job),
+            ByteSource::Ring(job) => Writer::Deck(*job),
             ByteSource::User => Writer::Human,
             ByteSource::Answer => Writer::Answer,
         }),
@@ -158,7 +164,7 @@ fn expected_writer(op: &PtyOp) -> Option<Writer> {
     }
 }
 
-/// Scenario: Queue every PTY op the daemon builds, with every byte source, on a writer thread still busy with an earlier write, then let it run. Each op that carries bytes has moved the epoch, as foreign input, by the time its submit returns, while it is still queued; a flush moves nothing; and the writer finds the moved epoch when it writes the op's bytes.
+/// Scenario: Queue every PTY op the daemon builds, with every byte source, on a writer thread still busy with an earlier write, then let it run. Each op that carries bytes has moved the epoch by the time its submit returns, while it is still queued, as foreign input unless a probe's or a ring's job names it; a flush moves nothing; and the writer finds the moved epoch when it writes the op's bytes.
 #[spec("inbox/probe/001")]
 #[test]
 fn probe_001_every_op_moves_the_epoch_before_the_writer_sees_it() {
@@ -222,7 +228,7 @@ fn probe_001_every_op_moves_the_epoch_before_the_writer_sees_it() {
     }
 }
 
-/// Scenario: Write through each of the pane writer's paths: a person's frame with and without an ingress ticket, the `std::io::Write` impl, a voice answer and a doorbell transaction's deck job. Each moves the epoch once, as foreign input, before the writer takes its bytes.
+/// Scenario: Write through each of the pane writer's paths: a person's frame with and without an ingress ticket, the `std::io::Write` impl, a voice answer, an unnamed deck job and a doorbell transaction's ring job. Each moves the epoch once before the writer takes its bytes: as foreign input, except the ring's, which is its own job's.
 #[spec("inbox/probe/001")]
 #[tokio::test(flavor = "multi_thread")]
 async fn probe_001_every_pane_writer_path_moves_the_epoch() {
@@ -271,6 +277,19 @@ async fn probe_001_every_pane_writer_path_moves_the_epoch() {
         (epoch.epoch(), epoch.last_foreign(), epoch.owner()),
         (5, 5, None)
     );
+    // Q35-21 (R3 §3.5): the doorbell's own job names its ring, so it moves
+    // the epoch once as that job's and not as foreign input.
+    let ring = crate::composer_probe::epoch::DeckJobId::ring(1);
+    let mut job = writer
+        .queue_ring_job(b"ring".to_vec(), Arc::default(), ring)
+        .expect("the writer thread runs");
+    job.done().await.expect("the ring's job ran");
+    assert_eq!(w.seen_at(b"ring"), Some(6));
+    let epoch = w.input.epoch();
+    assert_eq!(
+        (epoch.epoch(), epoch.last_foreign(), epoch.owner()),
+        (6, 5, Some(ring))
+    );
 }
 
 /// Scenario: Queue a person's write behind one the PTY isn't taking, with a bound that runs out, so the job is taken back before it starts. The epoch moved when it was queued and stays moved, though its bytes are never written.
@@ -300,12 +319,11 @@ async fn probe_001_a_withdrawn_job_still_moved_the_epoch() {
     assert!(w.input.touched());
 }
 
-/// Scenario: Through the registry, type into a real `cat` pane's agent, then deliver that agent's prompt report and turn edges; on a second pane deliver the hooks first and type after. The box is touched after the typing in both orders, and no hook changes the epoch.
+/// Scenario: Through the registry, type into a real `cat` pane's agent, then deliver that agent's turn edges; on a second pane deliver the hooks first and type after. The box is touched after the typing in both orders, and no hook changes the epoch. The daemon's own ingest of prompt hooks is `probe_002_the_daemons_prompt_reports_never_move_the_epoch`.
 #[cfg(unix)]
 #[spec("inbox/probe/002")]
 #[tokio::test]
 async fn probe_002_a_prompt_hook_never_empties_a_touched_box() {
-    use crate::composer_model::PromptReport;
     let registry = Arc::new(AgentPtyRegistry::new());
     for (pane, hooks_first) in [
         ("probe-002-touch-first", false),
@@ -314,9 +332,7 @@ async fn probe_002_a_prompt_hook_never_empties_a_touched_box() {
         let id = spawn_on(&registry, pane, "/bin/cat");
         let input = Arc::clone(registry.inner.lock().agents[&id].bus.input());
         let hooks = || {
-            registry.note_prompt_report(pane, &id, PromptReport::User("typed"));
             registry.note_turn(pane, &id, TurnEdge::Started);
-            registry.note_prompt_report(pane, &id, PromptReport::Deck);
             registry.note_turn(pane, &id, TurnEdge::Ended);
         };
         if hooks_first {

@@ -1265,6 +1265,22 @@ pub(crate) fn tick_probe(
 }
 
 impl AgentPtyRegistry {
+    /// PRD #1666 part 3 (Q35-21): whether the last check the deck tried on
+    /// generation `agent_id` failed (refused, lapsed or uncertain) and the
+    /// schedule is backing off before the next: the card then says the deck
+    /// can't check the box, rather than that a check read it non-empty.
+    /// `false` for a generation with no segments.
+    pub(crate) fn composer_probe_failing(&self, agent_id: &str) -> bool {
+        let input = {
+            let inner = self.inner.lock();
+            inner
+                .agents
+                .get(agent_id)
+                .map(|agent| Arc::clone(agent.bus.input()))
+        };
+        input.is_some_and(|input| input.has_segments() && input.probe_retrying())
+    }
+
     /// PRD #1666 part 3 (Q35-20): the doorbell tick's check of an
     /// `Armable` generation whose box was touched ([`tick_probe`]). Starts
     /// the probe it asks, off the tick, one request at a time; `true` while

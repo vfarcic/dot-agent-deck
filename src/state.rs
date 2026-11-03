@@ -3920,6 +3920,12 @@ fn arm_idle_worker_watch_for_delegation(
     Some(seq)
 }
 
+/// How often the idle-worker watch re-reads a delegation whose task is still
+/// queued or not yet acknowledged ([`wait_out_pointer_deferral`]). Issue #544
+/// introduced it as the poll of a deferred first write; PRD #1666 removed
+/// those writes, and part 3 (Q35-21) the module it lived in.
+const POINTER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// Issue #544 (PR #1398 review): keep the idle-worker watch's clock off the
 /// time the delegation's task spent posted but not yet acknowledged by the
 /// worker (PRD #1666; before it, the time a typed pointer waited for the
@@ -3955,7 +3961,7 @@ async fn wait_out_pointer_deferral(
             return true;
         };
         let wait = if clock.pointer_queued || clock.pointer_in_progress {
-            crate::draft_deferral::DRAFT_POLL_INTERVAL
+            POINTER_POLL_INTERVAL
         } else {
             let due = clock.armed_at + timeout + clock.pointer_queued_for + clock.pointer_deferred;
             match due.checked_duration_since(std::time::Instant::now()) {

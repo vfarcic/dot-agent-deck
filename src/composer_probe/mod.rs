@@ -72,6 +72,7 @@ pub mod probe;
 pub mod query_ledger;
 pub mod query_wait;
 pub mod record;
+pub mod recovery;
 pub mod segments;
 #[cfg(test)]
 pub(crate) mod stamp_park;

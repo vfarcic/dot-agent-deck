@@ -17,8 +17,10 @@
 //! thread, so the writer can't start a job whose move isn't visible (R3
 //! §3.2); for an op a closed fence holds (`super::gate`), when it enters the
 //! held queue, before anything can release it, and not again when it does.
-//! A deck write with no job named ([`Writer::UnnamedDeck`], which every deck
-//! write in the daemon is as of this commit) counts as foreign. Exempt reports
+//! A deck write names its job: a probe's `0x07` and a ring transaction's
+//! line, Enter and take-back are their jobs' ([`Writer::Deck`],
+//! [`DeckJobId::ring`], Q35-21). One with no job named
+//! ([`Writer::UnnamedDeck`], which only tests write) counts as foreign. Exempt reports
 //! don't move it: a whole focus or SGR mouse report while the agent has that
 //! report mode on (D3), and a whole DA1 or OSC 10/11 reply to a query the
 //! ledger keeps (D3′). A CPR reply is never exempt (OQ3). Whether an op is
@@ -32,9 +34,10 @@
 //! retry's "nothing since the lapsed byte", and the schedule's
 //! epoch-moved wait. A probe's settlement applies to `observed` here (R3
 //! §3.4), and the second `ExternalEdit` producer moves it
-//! ([`GenerationInput::on_output_bytes`]). The card and the ring's reconcile
-//! read them from Q35-21 on; existing doorbell behaviour reads
-//! `PaneInputState` as before. The ledger is read by a closed fence's
+//! ([`GenerationInput::on_output_bytes`]). From Q35-21 the doorbell reads
+//! them too: the card's hold reason and the ring's admission frame read
+//! [`InputEpoch::touched`], and the ring's `Submitted` reconcile moves
+//! `observed` ([`GenerationInput::reconcile_ring`], R3 §3.5). The ledger is read by a closed fence's
 //! acceptance, for whether a reply may pass ahead
 //! ([`GenerationInput::pass_ahead`]).
 //!
@@ -115,6 +118,19 @@ use crate::lock_rank::{R6, RankedMutex};
 /// A deck job the epoch can name: a probe's, or a ring transaction's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DeckJobId(pub u64);
+
+impl DeckJobId {
+    /// The high bit marks a ring transaction's job, so it never equals a
+    /// probe's, whose number is its segment's (counted from 1).
+    const RING: u64 = 1 << 63;
+
+    /// PRD #1666 part 3 (Q35-21, R3 §3.5): the job of a ring transaction's
+    /// attempt `attempt`, unique within its generation since attempt
+    /// numbers are.
+    pub fn ring(attempt: u32) -> Self {
+        Self(Self::RING | u64::from(attempt))
+    }
+}
 
 /// Who wrote an op's bytes, as the epoch reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,6 +215,22 @@ impl InputEpoch {
             && self.last_foreign <= obs.admitted_at
             && obs.read_empty
             && !obs.retired;
+        if applies {
+            self.observed = self.epoch;
+        }
+        applies
+    }
+
+    /// PRD #1666 part 3 (Q35-21, R3 §3.5): the ring's `Submitted`
+    /// reconcile. The box becomes empty through the ring's last op iff that
+    /// op is `ring`'s and nothing foreign entered since its admission at
+    /// `admitted_at`: the agent took the deck's line alone from a box the
+    /// epoch said was empty at admission. Whether it applied.
+    pub fn reconcile_ring(&mut self, ring: DeckJobId, admitted_at: u64) -> bool {
+        let applies = !self.exhausted
+            && self.owner == Some(ring)
+            && self.last_foreign <= admitted_at
+            && self.observed == admitted_at;
         if applies {
             self.observed = self.epoch;
         }
@@ -1224,6 +1256,15 @@ impl GenerationInput {
         self.state.lock_recovering().epoch.record(None)
     }
 
+    /// The ring's `Submitted` reconcile ([`InputEpoch::reconcile_ring`]);
+    /// refused once retired. The caller holds the generation's ingress
+    /// ledger across this call (R3 §3.5), so no person's op is admitted
+    /// between its check and this update.
+    pub fn reconcile_ring(&self, ring: DeckJobId, admitted_at: u64) -> bool {
+        let mut state = self.state.lock_recovering();
+        !state.retired && state.epoch.reconcile_ring(ring, admitted_at)
+    }
+
     /// Apply a probe's observation (R3 §3.4); refused once retired.
     pub fn apply(&self, obs: &Observation) -> bool {
         let mut state = self.state.lock_recovering();
@@ -1992,6 +2033,16 @@ impl GenerationInput {
             return now;
         }
         Instant::now()
+    }
+
+    /// Test seam (Q35-21): the box observed empty through the epoch as it
+    /// stands, as a probe that read it empty settles it (R3 §3.4), for a
+    /// test about something other than how a box is observed: a ring's
+    /// ticket, framing or ordering on a generation with no observer.
+    #[cfg(test)]
+    pub(crate) fn observe_empty_for_test(&self) {
+        let mut state = self.state.lock_recovering();
+        state.epoch.observed = state.epoch.epoch;
     }
 
     /// Test seam (R-C-U2-01): stamp each later records step at `now` rather
