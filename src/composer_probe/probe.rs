@@ -25,7 +25,9 @@
 //! it wants one; after a read that found the box non-empty, the next waits
 //! until the epoch moves or [`NON_EMPTY_RECHECK`] passes; after a failure
 //! (a refusal, an uncertain or lapsed check) the next waits [`BACKOFF`]'s
-//! step, then every [`BACKOFF_LAST`]. After [`BROKEN_AFTER`] failures in a
+//! step, then every [`BACKOFF_LAST`]. A refusal at the writer only because
+//! the screen moved since scheduling counts as a failure only once
+//! [`MOVED_PER_FAILURE`] of them come in a row ([`Schedule::moved`]). After [`BROKEN_AFTER`] failures in a
 //! row the generation's observer is broken, which its caller shows and logs;
 //! the waits go on as above, and a person's op makes one fresh attempt due
 //! at once, so a repaired daemon or a transient failure recovers. R2 §6.8's
@@ -80,6 +82,16 @@ pub const BACKOFF_LAST: Duration = Duration::from_secs(30 * 60);
 /// Failures in a row after which the observer is broken.
 pub const BROKEN_AFTER: u32 = 3;
 
+/// How many probes in a row the writer may refuse only because the screen
+/// moved between their scheduling and their arm section before one counts
+/// as a failure ([`Schedule::moved`], the revd21 review's U3-1). One such
+/// refusal says the agent drew in between, so it counts nothing and the
+/// next request schedules from a newer frame (A-20d-11); this many in a row
+/// says it draws inside every window it was given, so the last of them
+/// backs the schedule off as any failure does, rather than leaving such an
+/// agent asked at every doorbell tick for as long as it draws.
+pub const MOVED_PER_FAILURE: u32 = 4;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Wait {
     /// Due now.
@@ -98,6 +110,9 @@ pub struct Schedule {
     wait: Wait,
     failures: u32,
     broken: bool,
+    /// Writer refusals for the screen alone since the last failure or read
+    /// ([`Self::moved`]).
+    moved: u32,
 }
 
 impl Default for Schedule {
@@ -106,6 +121,7 @@ impl Default for Schedule {
             wait: Wait::None,
             failures: 0,
             broken: false,
+            moved: 0,
         }
     }
 }
@@ -131,8 +147,23 @@ impl Schedule {
         self.failures
     }
 
+    /// The writer refused an attempt at `now` only because the screen moved
+    /// since its scheduling (A-20d-11): nothing counts, and the schedule
+    /// stays as it was, unless it is the [`MOVED_PER_FAILURE`]th such
+    /// refusal since the last failure or read, which counts as one
+    /// ([`Self::failed`]). Whether it counted.
+    pub fn moved(&mut self, now: Instant) -> bool {
+        self.moved = self.moved.saturating_add(1);
+        if self.moved < MOVED_PER_FAILURE {
+            return false;
+        }
+        self.failed(now);
+        true
+    }
+
     /// An attempt failed at `now`: refused, uncertain, or lapsed.
     pub fn failed(&mut self, now: Instant) {
+        self.moved = 0;
         self.failures = self.failures.saturating_add(1);
         if self.failures >= BROKEN_AFTER {
             self.broken = true;
@@ -147,6 +178,7 @@ impl Schedule {
 
     /// A probe read the box non-empty at `now`, with the epoch at `epoch`.
     pub fn non_empty(&mut self, now: Instant, epoch: u64) {
+        self.moved = 0;
         self.failures = 0;
         self.broken = false;
         self.wait = now
@@ -634,6 +666,7 @@ mod tests {
                 wait,
                 failures: 2,
                 broken: false,
+                moved: 0,
             };
             other.advance(BACKOFF_LAST);
             assert_eq!(other.wait, wait, "{wait:?} is no pending instant");

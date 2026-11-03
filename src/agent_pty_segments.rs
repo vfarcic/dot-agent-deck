@@ -25,6 +25,17 @@
 //! that cut as its trigger, its number published first. Nothing here
 //! releases on a timer: the segments decide (core §4.6).
 //!
+//! **A front that can never complete** (`Segments::stranded`: it released
+//! and the writer scope is open, as a person's Ctrl+G answered by their
+//! editor during a check leaves it under `Hold`). Once the release has gone
+//! as far as the next held Ctrl+G, the driver refuses that Ctrl+G and
+//! everything held after it ([`PaneWriter::refuse_stranded`]): each op's
+//! connection is told [`CTRL_G_REFUSED`], its ticket settles refused, and
+//! no byte of it is written. The fence stays closed, so each later Ctrl+G
+//! is cut and refused the same way while that front stays released, and
+//! other typing goes on to the pane as the release lets it; and the doorbell's tick no longer reads that
+//! front as a check outstanding ([`tick_probe`]).
+//!
 //! **What it doesn't decide** (R35PLAN2-U2-01): whether a ring follows a
 //! check, the card's hold reason and delivery after a check stay on today's
 //! code until Q35-21. No production generation is `Armable` before an
@@ -345,6 +356,7 @@ impl PaneWriter {
             Some(Front::Released) => {
                 if self.gate.gate.segment_fenced() {
                     self.release_held(Front::Released);
+                    self.refuse_stranded();
                 }
             }
             Some(Front::None) => {
@@ -418,6 +430,36 @@ impl PaneWriter {
             }
         }
         submitted
+    }
+
+    /// R-HOLD's bounded refusal (the user's ruling, 2026-11-03): with the
+    /// front segment unable to complete (`Segments::stranded`), refuse the
+    /// held op holding the next Ctrl+G candidate and every op held after it,
+    /// which would otherwise wait for retirement and be discarded there.
+    /// The gate asks the segments under its own lock, as a release does, and
+    /// the segments waiting behind the front end `Refused` in the same hold
+    /// of the input's lock. Each refused op's connection is told
+    /// [`CTRL_G_REFUSED`] and its ticket settles refused; none of it reaches
+    /// the PTY. How many ops it refused.
+    fn refuse_stranded(&self) -> usize {
+        let input = &self.pty.input;
+        let frames = self.gate.gate.refuse_held_if(
+            || input.segment_refuse_behind(),
+            |frame: &UserFrame| frame.cut.is_some(),
+        );
+        let refused = frames.len();
+        for frame in frames {
+            frame.refuse_accepted(CTRL_G_REFUSED);
+            self.pty.in_flight.leave();
+        }
+        if refused > 0 {
+            tracing::info!(
+                target: "composer_probe",
+                refused,
+                "a person's Ctrl+G behind a segment that can never complete refused, with what was held after it"
+            );
+        }
+        refused
     }
 
     /// Submit segment `number`'s trigger, the held bytes through the first
@@ -716,7 +758,9 @@ pub(super) fn end_probe_segment(
 /// liability, opens a fence nothing is held behind (the driver releases what
 /// is, its segment gone) and counts a failure, as an attempt refused at the
 /// writer does, unless the writer refused only the screen's freshness
-/// ([`writer_refusal_counts`], A-20d-11). A failed write answers its own
+/// ([`writer_refusal_counts`], A-20d-11), which counts one failure only for
+/// every [`crate::composer_probe::probe::MOVED_PER_FAILURE`]th such refusal
+/// in a row. A failed write answers its own
 /// reason, never an admission refusal's. A lapse retry counts no failure
 /// here: its asker decides.
 /// Shared with the release oracle.
@@ -749,8 +793,12 @@ pub(super) fn probe_ended(
                 ?refusal,
                 "probe refused at the writer"
             );
-            if ask != ProbeAsk::Lapse && writer_refusal_counts(refusal) {
-                input.probe_failed(Instant::now());
+            if ask != ProbeAsk::Lapse {
+                if writer_refusal_counts(refusal) {
+                    input.probe_failed(Instant::now());
+                } else {
+                    input.probe_moved(Instant::now());
+                }
             }
             ProbeOutcome::Refused(format!("{refusal:?}"))
         }
@@ -760,14 +808,18 @@ pub(super) fn probe_ended(
 
 /// Whether a probe the writer refused at its arm section counts as a failed
 /// attempt on the schedule (A-20d-11). The screen's freshness refusal
-/// (`Admission(Surface)` at the writer) counts none: the probe passed the
-/// screen when it was scheduled, so at the writer only output or a layout
-/// change since that frame takes it away, which says the agent drew in
-/// between, not that the box can't be checked. The schedule then stays as
-/// it was, due, and the next request schedules from a newer frame. Every
-/// other refusal at the writer counts, as before. A lapse retry's refusal
-/// is counted by its asker, the doorbell tick, which sees only that it was
-/// refused, so a lapse retry refused for the screen still counts.
+/// (`Admission(Surface)` at the writer) doesn't, by itself: the probe passed
+/// the screen when it was scheduled, so at the writer only output or a
+/// layout change since that frame takes it away, which says the agent drew
+/// in between, not that the box can't be checked. The schedule then stays
+/// as it was, due, and the next request schedules from a newer frame; but
+/// only [`crate::composer_probe::probe::MOVED_PER_FAILURE`] such refusals in
+/// a row, the last of which counts one failure, so an agent that draws
+/// inside every window is backed off rather than asked at every tick (the
+/// revd21 review's U3-1, `Schedule::moved`). Every other refusal at the
+/// writer counts, as before. A lapse retry's refusal is counted by its
+/// asker, the doorbell tick, which sees only that it was refused, so a
+/// lapse retry refused for the screen still counts.
 #[cfg(target_os = "linux")]
 fn writer_refusal_counts(refusal: ProbeRefusal) -> bool {
     !matches!(
@@ -775,6 +827,14 @@ fn writer_refusal_counts(refusal: ProbeRefusal) -> bool {
         ProbeRefusal::Admission(crate::composer_probe::admission::Refusal::Surface)
     )
 }
+
+/// PRD #1666 part 3 (R-HOLD's bounded refusal): the typed rejection a
+/// person's Ctrl+G, and what was held after it, gets when it waits behind a
+/// segment that can never complete ([`PaneWriter::refuse_stranded`]). Both
+/// clients word it through `inbox_display::input_rejected`; an older client
+/// shows it in brackets after its unnamed refusal.
+#[cfg(target_os = "linux")]
+pub(crate) const CTRL_G_REFUSED: &str = "ctrl-g-refused";
 
 /// Why a probe whose byte the PTY didn't take is refused.
 #[cfg(target_os = "linux")]
@@ -1162,18 +1222,28 @@ pub(crate) enum TickProbe {
 /// `now`: a check outstanding rings nothing, and asks the retry of its own
 /// lapsed Claude probe once the schedule allows it; with nothing
 /// outstanding, the schedule's first attempt or retry when one is due.
+///
+/// A front segment that can never complete (`Segments::stranded`) is no
+/// check outstanding, nor is the fence it keeps closed: nothing will end
+/// it before retirement, so counting it would ring nothing for the rest of
+/// the generation (the revd21 review's item 2(b)). Nor can any probe open a
+/// segment behind it, so the tick asks none: it answers `NotDue` and goes
+/// on as today. What it goes on to doesn't type into that box: the deck's
+/// own line is refused at the writer while a fence is closed (CX-H).
 #[cfg(target_os = "linux")]
 pub(crate) fn tick_probe(
     input: &crate::composer_probe::epoch::GenerationInput,
     status: crate::composer_probe::gate::Status,
     now: Instant,
 ) -> TickProbe {
+    let stranded = input.segments_stranded();
     // An empty read waiting for its keymap re-read (A-20d-1a) is a check
     // still outstanding.
-    let outstanding = status.fenced
-        || input
-            .segments_front()
-            .is_some_and(|front| front != Front::None)
+    let outstanding = (!stranded
+        && (status.fenced
+            || input
+                .segments_front()
+                .is_some_and(|front| front != Front::None)))
         || input.settling();
     if outstanding {
         // U3-02: its own lapsed Claude probe, alone with nothing held
@@ -1183,7 +1253,7 @@ pub(crate) fn tick_probe(
         }
         return TickProbe::Outstanding;
     }
-    if !input.probe_due(now) {
+    if stranded || !input.probe_due(now) {
         return TickProbe::NotDue;
     }
     // A due attempt after a failure is the schedule's retry.

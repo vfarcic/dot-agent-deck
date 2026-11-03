@@ -73,7 +73,7 @@ By amendment 5's decision rule, P-DRN stands: the semaphore's writers are reacha
 
 **What it costs.**
 
-- **Yield.** Any same-user process that can't be read and started after an agent's spawn makes that agent's frontiers `Missing` while it lives. On the development box this was measured on, those are `sshd-session` processes, one per SSH login. Neither review found a sound narrower discriminator (name, ancestry, session and uid aren't provenance), so they stay `Unknown` (Q85/Q86). Under `Hold` that changes nothing a user sees; it lowers how often M-FR-X gets a frontier.
+- **Yield.** Any same-user process that can't be read and started after an agent's spawn makes that agent's frontiers `Missing` while it lives. On the development box this was measured on, those are `sshd-session` processes, one per SSH login. Neither review found a sound narrower discriminator (name, ancestry, session and uid aren't provenance), so they stay `Unknown` (Q85/Q86). Under `Hold` that changes nothing a user sees, since there a frontier completes no segment and, with A-20d-15's release after an editor's end Claude's alone and reading none, releases no held typing either (the revd21 review's U2-1); it lowers how often M-FR-X gets a frontier.
 - **Reader time.** The census runs on the pane's reader thread, outside the bus lock, once per zero poll that finds the master empty with a request pending, and the pane's output waits while it runs. Measured on the development box on 2026-10-30 (`census_latency`, debug build, 403 processes, 892 tasks, load 2.8), 30 runs each:
 
 | Census | p50 | p90 | max |

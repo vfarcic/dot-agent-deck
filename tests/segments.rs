@@ -1491,11 +1491,14 @@ fn probe_009_a_release_rechecks_that_the_pinned_editor_still_runs() {
     }
 
     // Under `Hold` (production's policy) the segment never completes. An
-    // editor found gone holds the typing behind it through the helper's
-    // clean report alone; once that report was in at the helper's drained
-    // exit, the editor's end is known and it is released (A-20d-15,
-    // replacing the revb21 review's U2-1 ruling (a), under which it held
-    // until retirement). The Ctrl+G behind it still waits for retirement.
+    // editor found gone releases nothing on its pin; once the helper's
+    // clean report was in at its drained exit, the editor's end is known and
+    // it is released (A-20d-15, replacing the revb21 review's U2-1 ruling
+    // (a), under which it held until retirement). This arm asserts nothing
+    // between the report and the exit: the report alone holding is
+    // `probe_009_typing_behind_an_editor_that_ended_goes_once_its_helper_reported_the_end`'s.
+    // The Ctrl+G behind it still waits for retirement here, where nothing
+    // drives a refusal (`inbox/probe/087`).
     let mut t = T::new(Agent::Claude, HOLD);
     let n = t.probe(0);
     t.s.open_human_g(1).unwrap();
@@ -1540,7 +1543,7 @@ fn probe_009_a_release_rechecks_that_the_pinned_editor_still_runs() {
     );
 }
 
-/// Scenario: For Claude and Codex under `Hold`, write a held Ctrl+G whose helper decides `Unarmed` and runs the person's editor, which is either pinned and already gone when the release is decided or never seen running, with a second Ctrl+G held behind it. Nothing goes while the helper runs, nor on its clean report alone; once that report was in when the helper's exit drained, Claude's segment releases at the drain and Codex's only after its return past the drain frontier (`?2004h`, then `?2026h`). The segment stays open, so under `Hold` the second Ctrl+G is never written. A helper that reported survivors releases Claude's too, but on Codex takes no frontier and holds; a helper that drained with no report, whose clean report arrived only after its drain, or that couldn't account for the editor's tree holds on both until retirement (A-20d-15).
+/// Scenario: For Claude and Codex under `Hold`, write a held Ctrl+G whose helper decides `Unarmed` and runs the person's editor, which is either pinned and already gone when the release is decided or never seen running, with a second Ctrl+G held behind it. Nothing goes while the helper runs, nor on its clean report alone; once that report was in when the helper's exit drained, Claude's segment releases at the drain, while Codex's holds even after its return past the drain frontier (`?2004h`, then `?2026h`), since that frontier isn't premise-backed (the revd21 review's U2-1). The segment stays open, so under `Hold` the second Ctrl+G is never written. A helper that reported survivors releases Claude's too and holds Codex's; a helper that drained with no report, whose clean report arrived only after its drain, or that couldn't account for the editor's tree holds on both until retirement (A-20d-15).
 #[spec("inbox/probe/009")]
 #[test]
 fn probe_009_typing_behind_an_editor_that_ended_goes_once_its_helper_reported_the_end() {
@@ -1590,14 +1593,24 @@ fn probe_009_typing_behind_an_editor_that_ended_goes_once_its_helper_reported_th
                 assert_eq!(t.s.front(), Front::Held, "Codex: the enable alone");
                 t.out(FRAME, 7);
             }
+            // U2-1: the release is Claude's alone; Codex holds through its
+            // return past a frontier E-MF's scan took.
+            let want = match agent {
+                Agent::Claude => Front::Released,
+                Agent::Codex => Front::Held,
+            };
             assert_eq!(
                 t.s.front(),
-                Front::Released,
+                want,
                 "{agent:?} {pinned}: the editor ended, by its helper's own report"
             );
-            assert_eq!(t.stages(8)[0], Stage::Released, "{agent:?} {pinned}");
+            assert_eq!(
+                t.stages(8)[0] == Stage::Released,
+                agent == Agent::Claude,
+                "{agent:?} {pinned}"
+            );
             t.returns(9);
-            assert_eq!(t.s.front(), Front::Released, "{agent:?} {pinned}: it stays");
+            assert_eq!(t.s.front(), want, "{agent:?} {pinned}: it stays");
             assert!(
                 t.written().is_empty(),
                 "{agent:?} {pinned}: Hold completes nothing"
@@ -1660,5 +1673,110 @@ fn probe_009_typing_behind_an_editor_that_ended_goes_once_its_helper_reported_th
                 "{agent:?} {report:?} late={late}: only retirement ends it"
             );
         }
+    }
+}
+
+// ---- inbox/probe/087: a segment that can never complete ----
+
+/// Scenario: For Claude and Codex under `Hold`, a held Ctrl+G is written as its own trigger and its helper decides `Unarmed` and runs the person's editor, with two more Ctrl+G presses waiting behind it. The segment releases and the writer scope opens, so it can never complete: it reads stranded, and refusing what waits behind it ends both waiting Ctrl+G presses `Refused`, unwritten, while the front stays released and open. A second refusal finds nothing more; with the editor's helper drained, it is still stranded; only retirement ends the front.
+#[spec("inbox/probe/087")]
+#[test]
+fn probe_087_a_released_segment_whose_scope_is_open_is_stranded() {
+    for agent in [Agent::Claude, Agent::Codex] {
+        let mut t = T::new(agent, HOLD);
+        let g = t.s.open_held_trigger().unwrap();
+        t.s.open_human_g(2).unwrap();
+        t.s.open_human_g(3).unwrap();
+        t.write(g, 1);
+        assert!(!t.s.stranded(&t.r), "{agent:?}: unmatched, it holds");
+        t.ipc(1, Decision::Unarmed, g, 2);
+        assert!(!t.s.stranded(&t.r), "{agent:?}: no editor seen, it holds");
+        assert!(!t.s.refuse_behind(&t.r), "{agent:?}: so nothing is refused");
+        assert!(t.editor(1, 3));
+        assert_eq!(t.s.front(), Front::Released, "{agent:?}");
+        assert!(
+            matches!(t.r.scope().state(), ScopeState::Open(_)),
+            "{agent:?}: an `Unarmed` decision opens the scope under Hold"
+        );
+        assert!(
+            t.s.stranded(&t.r),
+            "{agent:?}: released, and never to complete"
+        );
+        assert!(t.s.refuse_behind(&t.r), "{agent:?}");
+        assert_eq!(
+            t.ended(),
+            [
+                (None, Kind::HumanG, Outcome::Refused),
+                (None, Kind::HumanG, Outcome::Refused)
+            ],
+            "{agent:?}: both waiting presses refused, unnumbered"
+        );
+        assert_eq!(t.s.len(), 1, "{agent:?}: the front stays");
+        assert_eq!(t.s.front(), Front::Released, "{agent:?}");
+        assert_eq!(t.s.next_trigger(), None, "{agent:?}: no trigger");
+        assert!(t.s.refuse_behind(&t.r), "{agent:?}: still stranded");
+        assert!(t.ended().is_empty(), "{agent:?}: nothing more to refuse");
+        t.report(1, Report::Done(Tree::Clean), 4);
+        t.exit(1, 5);
+        t.returns(6);
+        assert!(
+            t.s.stranded(&t.r),
+            "{agent:?}: drained, still never to complete"
+        );
+        t.s.retire();
+        assert!(!t.s.stranded(&t.r), "{agent:?}: retired");
+        assert_eq!(
+            t.ended(),
+            [(Some(g), Kind::HumanG, Outcome::Retired)],
+            "{agent:?}: only retirement ends the front"
+        );
+    }
+}
+
+/// Scenario: The controls for a stranded front. On Claude, a probe answered `Armed` releases at its decision with the writer scope closed: it can still complete, so it isn't stranded and nothing waiting behind it is refused, and its return completes it and numbers the next. Under `Authority` an `Unarmed` decision opens no scope, so a released editor segment isn't stranded either. A release cut off by an unknown wait (its helper drained with no report) holds, so it isn't stranded, though the scope is open.
+#[spec("inbox/probe/087")]
+#[test]
+fn probe_087_a_front_that_can_still_complete_or_holds_is_not_stranded() {
+    let mut t = T::new(Agent::Claude, HOLD);
+    let n = t.probe(0);
+    t.s.open_human_g(1).unwrap();
+    t.write(n, 1);
+    t.ipc(1, Decision::Armed, n, 2);
+    assert_eq!(t.s.front(), Front::Released);
+    assert_eq!(t.r.scope().state(), ScopeState::Closed);
+    assert!(!t.s.stranded(&t.r), "it can still complete");
+    assert!(!t.s.refuse_behind(&t.r));
+    assert!(t.ended().is_empty(), "nothing refused");
+    t.exit(1, 3);
+    t.returns(4);
+    assert_eq!(t.written(), [Some(n)], "it completes");
+    assert_eq!(t.s.next_trigger(), Some(2), "and the next goes");
+
+    let mut t = T::new(Agent::Claude, AUTH);
+    let g = t.s.open_held_trigger().unwrap();
+    t.s.open_human_g(2).unwrap();
+    t.write(g, 1);
+    t.ipc(1, Decision::Unarmed, g, 2);
+    assert!(t.editor(1, 3));
+    assert_eq!(t.s.front(), Front::Released);
+    assert_eq!(t.r.scope().state(), ScopeState::Closed, "Authority");
+    assert!(!t.s.stranded(&t.r), "EC can still complete it");
+
+    for agent in [Agent::Claude, Agent::Codex] {
+        let mut t = T::new(agent, HOLD);
+        let g = t.s.open_held_trigger().unwrap();
+        t.s.open_human_g(2).unwrap();
+        t.write(g, 1);
+        t.ipc(1, Decision::Unarmed, g, 2);
+        assert!(t.editor(1, 3));
+        t.exit(1, 4);
+        assert_eq!(t.s.front(), Front::Held, "{agent:?}: cut off");
+        assert!(
+            matches!(t.r.scope().state(), ScopeState::Open(_)),
+            "{agent:?}"
+        );
+        assert!(!t.s.stranded(&t.r), "{agent:?}: it holds, so not stranded");
+        assert!(!t.s.refuse_behind(&t.r), "{agent:?}");
+        assert!(t.ended().is_empty(), "{agent:?}: nothing refused");
     }
 }

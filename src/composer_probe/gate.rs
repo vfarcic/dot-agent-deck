@@ -501,6 +501,42 @@ impl<T> Gate<T> {
         out
     }
 
+    /// Refuse what a release can't let go (R-HOLD's bounded refusal): the
+    /// held ops from the first one holding a Ctrl+G candidate (`candidate`)
+    /// to the last, in acceptance order, for the caller to refuse, under
+    /// `authority`, asked first under this lock, as
+    /// [`Self::release_until_if`] asks it. The ops before that one stay held
+    /// (a release takes them), and so does the fence: it is the segments'
+    /// to open. `authority` may take R6, as a release's does. Empty when no
+    /// fence is closed, no held op holds a candidate, or `authority`
+    /// refuses.
+    pub fn refuse_held_if(
+        &self,
+        authority: impl FnOnce() -> bool,
+        candidate: impl Fn(&T) -> bool,
+    ) -> Vec<T> {
+        let mut inner = self.lock();
+        let Some(fence) = inner.fence.as_mut() else {
+            return Vec::new();
+        };
+        let Some(first) = fence.held.iter().position(|(op, _)| candidate(op)) else {
+            return Vec::new();
+        };
+        if !authority() {
+            return Vec::new();
+        }
+        let out: Vec<T> = fence
+            .held
+            .drain(first..)
+            .map(|(op, len)| {
+                fence.held_bytes -= len;
+                op
+            })
+            .collect();
+        self.moved(&mut inner);
+        out
+    }
+
     /// Whether a probe's arm section, or a cut on a generation with
     /// segments ([`Self::cut_hold`]), closed the fence that is closed now
     /// (Q35-20, A-20d-5): only such a fence is the segments' to open.

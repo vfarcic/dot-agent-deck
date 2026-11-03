@@ -79,10 +79,13 @@
 //!   agent's return, where Claude keeps them (P-CRF, which M-PF2 is to
 //!   confirm) and Codex discards them as it returns (M31), as each does
 //!   with keys typed while its editor is open without the deck (A-20d-12).
-//!   An editor not seen running (gone before the pin, or before the
-//!   release asks the pin) releases once its helper's `Done` report
-//!   (`Clean` or `Survivors`) was in at its drained exit, and on Codex
-//!   once Codex has also returned past the drain frontier (A-20d-15).
+//!   On Claude, an editor not seen running (gone before the pin, or before
+//!   the release asks the pin) releases once its helper's `Done` report
+//!   (`Clean` or `Survivors`) was in at its drained exit (A-20d-15). On
+//!   Codex it holds: Codex's release would rest on a `Taken` drain
+//!   frontier, which no review accepts as premise-backed (E-MF is
+//!   unverified, Q86), so it waits for retirement (the revd21 review's
+//!   U2-1).
 //! - A segment's return markers read while its trigger is in flight (after
 //!   its number is published, before the writer's report reaches here) are
 //!   kept, and read once the trigger is reported written; a failed or
@@ -91,6 +94,22 @@
 //!   completion (E1 on Claude, E1F on Codex). `WaitUnknown` (an
 //!   editor-bearing decision with no report at the drain) opens the writer
 //!   scope, so only retirement ends its segment.
+//!
+//! **A segment that can never complete** ([`Segments::stranded`]): a front
+//! segment that released while the writer scope is open. No step but
+//! retirement closes an open scope, and [`Records::complete`] refuses every
+//! route while it is open, so no Ctrl+G behind it can ever be written as a
+//! trigger. Under `Hold` an `Unarmed` decision is what opens it, so a
+//! person's Ctrl+G during a check whose segment released to their editor
+//! leaves one. A later Ctrl+G behind it would wait for retirement and be
+//! discarded there, with what was typed after it, so the release driver
+//! refuses it instead, with what the gate holds after it, once the release
+//! has gone as far as it ([`Segments::refuse_behind`], R-HOLD's bounded
+//! refusal, the user's ruling of 2026-11-03): what is typed afterwards goes
+//! on to the pane as the release lets it. The segment itself stays open, so
+//! each later Ctrl+G is refused the same way while it stays released (an
+//! unknown wait's cut-off makes it hold everything instead), and no probe
+//! can open another segment in that generation.
 //!
 //! A `Tool` or unknown decision on a matched record releases nothing before
 //! completion. Nothing here releases or completes on a timer: the lapse
@@ -373,6 +392,10 @@ pub enum Outcome {
     WriteFailed,
     /// Its op's write failed at an earlier trigger.
     Gone,
+    /// A person's Ctrl+G behind a segment that can never complete
+    /// ([`Segments::refuse_behind`]): refused, with what was held after
+    /// it, and never written.
+    Refused,
 }
 
 /// One segment's ending.
@@ -600,8 +623,9 @@ pub struct Segments {
     /// carries the editor's pin ([`EditorPin`]), and the early release asks
     /// it, under this lock, whether that process still runs: one that
     /// exited before the release is decided releases nothing on the pin,
-    /// and its segment is held until its helper's report of the editor's
-    /// end is in at its drained exit (A-20d-15), and short of that until
+    /// and its segment is held until, on Claude, its helper's report of the
+    /// editor's end is in at its drained exit (A-20d-15), and short of that
+    /// (on Codex, always) until
     /// the generation retires under `Hold` (production's policy, which
     /// completes no editor-bearing segment) or, under `Authority`, until
     /// its helper's completion (the revb21 review's U2-1). An
@@ -752,6 +776,37 @@ impl Segments {
             return None;
         }
         self.segments.front().and_then(|s| s.number)
+    }
+
+    /// Whether the front segment can never complete (see the module
+    /// documentation): it released, its release wasn't cut off, and the
+    /// writer scope is open, which only retirement undoes. Everything behind
+    /// it would then wait for retirement.
+    pub fn stranded(&self, records: &Records) -> bool {
+        !self.retired
+            && matches!(records.scope().state(), ScopeState::Open(_))
+            && self
+                .segments
+                .front()
+                .is_some_and(|seg| seg.number.is_some() && seg.released && !seg.cut_off)
+    }
+
+    /// The release driver refuses the person's Ctrl+G held behind a
+    /// [stranded](Self::stranded) front, with what is held after it: every
+    /// segment waiting behind the front ends [`Outcome::Refused`], and the
+    /// front stays. Whether the front is stranded, so the caller may refuse
+    /// what the gate holds from that Ctrl+G on. Nothing behind the front is
+    /// numbered (a number goes only to the front), so none of these had a
+    /// trigger written.
+    pub fn refuse_behind(&mut self, records: &Records) -> bool {
+        if !self.stranded(records) {
+            return false;
+        }
+        let behind: VecDeque<Segment> = self.segments.drain(1..).collect();
+        for seg in behind {
+            self.ended.push(seg.end(Outcome::Refused));
+        }
+        true
     }
 
     /// The open segments' count.
@@ -1286,50 +1341,53 @@ fn early_release(agent: Agent, seg: &Segment, r: &Record) -> bool {
         // A-20d-6, option (a): released to the pane while the editor
         // pinned for it still runs (A-20d-12: the editor takes the bytes
         // only if it reads the terminal). One that already exited, or that
-        // was never seen running, releases nothing here until its helper
-        // has reported the editor's end and drained ([`editor_ended`],
-        // A-20d-15); short of that the segment holds: under `Hold`
+        // was never seen running, releases nothing here until, on Claude,
+        // its helper has reported the editor's end and drained
+        // ([`editor_ended`], A-20d-15; Codex holds, U2-1); short of that the
+        // segment holds: under `Hold`
         // (production's `EC_POLICY`) until the generation retires, since
         // `Hold` completes no editor-bearing segment, and under `Authority`
         // until its helper's completion (fail closed: typing held longer,
         // never handed to an editor that isn't there).
         (_, Kind::HumanG, Some(Decision::Unarmed)) => {
             (seg.editor_running && seg.editor.as_ref().is_none_or(EditorPin::running))
-                || editor_ended(agent, seg, r)
+                || editor_ended(agent, r)
         }
         _ => false,
     }
 }
 
-/// A-20d-15: a person's `Unarmed` Ctrl+G whose editor is known to have
-/// ended, by its helper's own account: the helper reaped the editor and
-/// accounted for its tree (a `Done` report with a `Clean` or `Survivors`
-/// tree), and that report was in when the helper's exit drained, so the
-/// helper is gone too.
-/// What is held then goes to the agent, which reads the pane again:
-/// - Claude keeps queued input through its return (P-CRF), so the drain is
-///   enough.
-/// - Codex discards queued input as it returns (M31), so on Codex the
-///   release also waits for its return past the drain frontier, EC's
-///   `?2004h` then `?2026h`, which a `Clean` report's frontier arms. With no
-///   frontier (a `Survivors` report, one found missing) it holds.
+/// A-20d-15: a person's `Unarmed` Ctrl+G on Claude whose editor is known
+/// to have ended, by its helper's own account: the helper reaped the editor
+/// and accounted for its tree (a `Done` report with a `Clean` or
+/// `Survivors` tree), and that report was in when the helper's exit
+/// drained, so the helper is gone too. What is held then goes to Claude,
+/// which reads the pane again and keeps queued input through its return
+/// (P-CRF), so the drain is enough. A drain that gave up uncertain keeps
+/// the report it had ([`Record::drained_report`] is taken at the first
+/// drain, whichever way it ended), so a `Done(Clean)` report in by then
+/// releases too: the uncertainty is about settlement, not about the
+/// editor's end.
 ///
-/// No timer releases anything here, and Codex's markers only delay a
-/// release the helper's account already allows: they never cause one. A
-/// drain with no report, an unknown tree, a report delivered only after the
-/// drain ([`Record::drained_report`]) and a failed start release nothing
-/// here. The segment still doesn't complete under `Hold`.
-fn editor_ended(agent: Agent, seg: &Segment, r: &Record) -> bool {
-    let ended = r.drained
+/// Codex holds (the revd21 review's U2-1): Codex discards queued input as
+/// it returns (M31), so its release would also wait for Codex's return past
+/// the drain frontier (EC's `?2004h` then `?2026h`), and that frontier is
+/// one E-MF's scan took, which no review accepts as premise-backed (Q86). A
+/// holder of the terminal the scan missed could write those markers while
+/// Codex is still away and lose the bytes into its discard; held, they are
+/// refused at retirement with the card showing them instead.
+///
+/// This release runs on no timer. A drain with no report, an unknown tree,
+/// a report delivered only after the drain ([`Record::drained_report`]) and
+/// a failed start release nothing here. The segment still doesn't complete
+/// under `Hold`.
+fn editor_ended(agent: Agent, r: &Record) -> bool {
+    agent == Agent::Claude
+        && r.drained
         && matches!(
             r.drained_report,
             Some(Report::Done(Tree::Clean | Tree::Survivors))
-        );
-    ended
-        && match agent {
-            Agent::Claude => true,
-            Agent::Codex => seg.ec.is_some_and(|w| w.returned(Agent::Codex)),
-        }
+        )
 }
 
 /// Whether a drained record's ending is `WaitUnknown`: an editor-bearing

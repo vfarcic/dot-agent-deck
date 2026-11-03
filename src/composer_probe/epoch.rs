@@ -1597,6 +1597,16 @@ impl GenerationInput {
         }
     }
 
+    /// The writer refused a due attempt at `now` only because the screen
+    /// moved since its scheduling ([`super::probe::Schedule::moved`]): a
+    /// failure only for every [`super::probe::MOVED_PER_FAILURE`]th in a
+    /// row.
+    pub fn probe_moved(&self, now: Instant) {
+        if let Some(live) = self.state.lock_recovering().live.as_mut() {
+            live.schedule.moved(now);
+        }
+    }
+
     /// The test and `e2e` builds' schedule clock offset (Q105b.2): the
     /// pending wait ends `by` earlier. Answers the schedule as it then is,
     /// `(due, failures, broken)` at `now`; `None` with no live schedule.
@@ -1850,6 +1860,30 @@ impl GenerationInput {
             (false, Some(live)) => Some(live.segments.front()),
             _ => None,
         }
+    }
+
+    /// Whether the front segment can never complete
+    /// ([`Segments::stranded`]); `false` with no segments attached or once
+    /// retired.
+    pub fn segments_stranded(&self) -> bool {
+        let state = self.state.lock_recovering();
+        match (state.retired, state.live.as_ref(), state.records.as_ref()) {
+            (false, Some(live), Some(records)) => live.segments.stranded(records),
+            _ => false,
+        }
+    }
+
+    /// The release driver's authority to refuse a person's Ctrl+G held
+    /// behind a front segment that can never complete, with what is held
+    /// after it ([`Segments::refuse_behind`]): whether the front is
+    /// stranded, read and acted on in one hold of this lock, the segments
+    /// waiting behind it ended `Refused`. Asked under the gate's lock, as a
+    /// release's authority is.
+    pub fn segment_refuse_behind(&self) -> bool {
+        self.segment_step(Instant::now(), |seg, records, _| {
+            Ok(seg.refuse_behind(records))
+        })
+        .unwrap_or(false)
     }
 
     /// The open segments, as of `now`.
