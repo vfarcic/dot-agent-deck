@@ -1205,8 +1205,8 @@ fn pane_restart_015_draft_wait_does_not_block_restart_or_lose_delegate() {
                 .await
                 .expect("type worker draft");
             assert!(
-                fx.daemon.registry.draft_pending(WORKER_PANE),
-                "precondition: the worker has no unsent draft"
+                fx.daemon.registry.input_touched(&fx.worker_agent_id),
+                "precondition: the worker's draft touched its input box"
             );
 
             let queued = delegate_to_worker(&fx, false).await;

@@ -5742,8 +5742,15 @@ fn keyevent_to_pane_bytes(key: &KeyEvent, application_cursor: bool) -> Option<Ve
 /// Issue #424 S1: does this user-input byte SUBMIT the agent's input box, given
 /// the byte that immediately preceded it in the same stream?
 ///
+/// **Test builds only** since PRD #1666 part 3 (Q35-21): no daemon code
+/// reads the answer any more (it fed the draft tracker the switch deleted),
+/// and the issue #544 tests keep it pinned against the encoder so the
+/// contract below stays written down. The doorbell's suspension recovery
+/// counts the user's submits over Q35-01's tokenizer instead
+/// (`composer_probe::recovery`), which reads `ESC` `CR` as a newline.
+///
 /// This lives beside [`keyevent_to_bytes`] because it is that function read
-/// backwards. The daemon's submit drain
+/// backwards. The daemon's input stream
 /// (`PaneInputState::note_user_bytes`) never sees a `KeyEvent` — it sees only
 /// the bytes this encoder produced — so it has to recover which keypress made
 /// them. It used to answer "any CR or LF", which contradicts the encoder
@@ -5760,17 +5767,14 @@ fn keyevent_to_pane_bytes(key: &KeyEvent, application_cursor: bool) -> Option<Ve
 /// | `CR` | plain `Enter` (`:5169`) — and `Ctrl+M`, the same byte by the caret rule | submit | submit |
 ///
 /// Exactly one row submits on every supported agent, and it is the only one
-/// this returns `true` for. `ESC` `CR` is the row that matters: it is a genuine
-/// AMBIGUITY rather than an oversight, and it resolves the way every unknown
-/// here has to. A *missed* drain fails CLOSED — a later same-payload delivery is
-/// refused, which is reported and bounded by the record TTL. A *false* drain
-/// fails OPEN — the replacement stops recognizing itself as a repeat and
-/// submits the user's half-typed draft sandwiched between two copies of the
-/// payload. `ESC[13;{m}u` needs no arm at all: it carries neither byte.
+/// this returns `true` for. `ESC` `CR` is a genuine AMBIGUITY rather than an
+/// oversight, and it resolves toward reading no submit, the direction that
+/// never takes a box holding a draft for an empty one. `ESC[13;{m}u` needs
+/// no arm at all: it carries neither byte.
 ///
 /// `keyevent_submit_classification_matches_prd_227_matrix` (in `agent_pty`)
-/// pins every row against the real encoder and the real stream scanner, so a
-/// change to the forwarding contract cannot silently desynchronize the drain.
+/// pins every row against the real encoder and the test-only stream scanner.
+#[cfg(test)]
 pub(crate) fn user_byte_submits_input_box(preceding: Option<u8>, byte: u8) -> bool {
     /// The ESC the ALT prefix adds at `:5207`.
     const ESC: u8 = 0x1b;

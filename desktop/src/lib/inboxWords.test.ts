@@ -20,7 +20,7 @@ describe("deck attention words", () => {
       agent("Coder", false, inbox(1, "not_taken")),
       agent("Captain", true, inbox(1, "possible_draft")),
       agent("Quiet", false, inbox(3)),
-    ])).toBe("✉ Captain: waiting: there may be an unsent draft. Send it, or type x then Ctrl+C. · 1 other held");
+    ])).toBe("✉ Captain: waiting: there may be an unsent draft. Send it or clear it. · 1 other held");
     expect(deckAttentionText([agent("Captain", true, inbox(1, "paste_open"))]))
       .toBe("✉ Captain: waiting: a paste into its input has not finished.");
     expect(deckAttentionText([agent("A", false, inbox(1, "cannot_type")), agent("B", false, inbox(2, "awaiting_prompt"))])).toBe("✉ 2 held");

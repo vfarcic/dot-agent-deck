@@ -558,48 +558,36 @@ pub struct Frame {
     pub user_cells: Vec<String>,
     /// The frame's cells as text, for the token's redraw rule.
     pub text: String,
-    /// What the bytes written into the pane say its input box holds, read
-    /// with the frame (R6-4). The screen cannot show blanks the agent does
-    /// not draw, so a blank composer is empty only when this says so too.
-    pub input: crate::composer_model::InputProof,
+    /// PRD #1666 part 3 (Q35-21, R3 §3.6): something entered the input box
+    /// since the last observation that proved it empty (the generation's
+    /// input epoch, read with the frame). The screen cannot show blanks the
+    /// agent does not draw, so a blank composer is empty only while nothing
+    /// touched the box; a touched one is empty only once a check reads it so.
+    pub touched: bool,
 }
 
 impl Frame {
     /// The empty ready composer and no dialog (step 2).
     ///
-    /// The screen and the input written into the pane both have to say so
-    /// (R6-4). A blank composer counts only with the cursor where an empty
-    /// one keeps it and nothing hidden in its region, and only while the
-    /// input proves the box empty: spaces with the cursor moved back to the
-    /// start draw exactly the empty composer. When the input proves only the
-    /// cursor's line empty (Claude Code, after `End` then `Ctrl+U` on a box
-    /// it did not know), a blank composer still proves the box empty: Claude
-    /// Code draws every line as a row, a blank one included, and its
-    /// recogniser marks such a row hidden. The agent's placeholder is
-    /// drawn only over an empty box, so it is proof enough while the input
-    /// cannot say; it does not outweigh input that says the box holds
-    /// something, since the frame may predate that input.
+    /// The screen and the box's input epoch both have to say so (R6-4,
+    /// Q35-21). A composer counts while its placeholder shows, or while it
+    /// is blank with the cursor where an empty one keeps it and nothing
+    /// hidden in its region, and only while the epoch says nothing touched
+    /// the box since it was last observed empty: spaces with the cursor
+    /// moved back to the start draw exactly the empty composer, and a
+    /// placeholder on screen can predate the keys that replaced it. Three
+    /// things make a touched box untouched again: a check that reads it
+    /// empty, the deck's own submitted line, and the deck's own withdrawn
+    /// line, which ends only once the agent drew its placeholder again over
+    /// an empty box. Both lines go through the ring's reconcile
+    /// (`GenerationInput::reconcile_ring`: R3 §3.5 for the submitted line,
+    /// the Q35-21 ruling for the withdrawn one).
     pub fn empty_and_ready(&self) -> bool {
-        use crate::composer_model::InputProof;
-        self.dialog.is_none()
+        !self.touched
+            && self.dialog.is_none()
             && self.composer.as_ref().is_some_and(|c| {
-                let blank = !c.hidden && c.text.is_empty() && c.cursor_at_end;
-                match self.input {
-                    // A blank composer is one empty row with the cursor at
-                    // its start, so the line the input proves empty is all.
-                    InputProof::Empty | InputProof::LineEmpty => c.placeholder || blank,
-                    InputProof::Unknown => c.placeholder,
-                    InputProof::Draft => false,
-                }
+                c.placeholder || (!c.hidden && c.text.is_empty() && c.cursor_at_end)
             })
-    }
-
-    /// PRD #1666 part 3 (Q35-21p): this frame, read with `input` as what the
-    /// bytes written into the pane say its box holds. The one way tests set
-    /// a frame's input, so Q35-21's switch (the input becomes `touched`)
-    /// changes the tests in one place.
-    pub fn with_input(self, input: crate::composer_model::InputProof) -> Self {
-        Self { input, ..self }
     }
 
     /// The composer holds exactly `text`, the cursor right after it.
@@ -1027,6 +1015,11 @@ pub struct Txn<'c> {
     /// The generation stopped being fit for the ring after the first byte;
     /// acted on once the echo can say whether the line is the deck's alone.
     admission_lost: bool,
+    /// Diagnosis only: the step and check that last unresolved the attempt,
+    /// with the length of the composer text it read then. Never the text:
+    /// it is logged at the default level, and the box can hold whatever the
+    /// user typed or pasted.
+    unresolved_at: Option<String>,
 }
 
 /// Step 1 and step 2 (plan §1.1): admit an attempt or say why not. On
@@ -1100,6 +1093,7 @@ pub fn admit<'c>(
         withdrawal: None,
         after_cr: false,
         admission_lost: false,
+        unresolved_at: None,
     })
 }
 
@@ -1130,6 +1124,30 @@ impl<'c> Txn<'c> {
     /// agent did not take.
     pub fn cr_reached(&self) -> bool {
         self.after_cr
+    }
+
+    /// Why a withdrawal started, if one did (diagnosis: the attempt's log
+    /// line names it).
+    pub fn withdrawal_cause(&self) -> Option<Cause> {
+        self.withdrawal.map(|(_, cause)| cause)
+    }
+
+    /// Whether the caller's admission re-check said no after the line was
+    /// written (diagnosis, as above).
+    pub fn admission_was_lost(&self) -> bool {
+        self.admission_lost
+    }
+
+    /// Which step and check last unresolved the attempt (diagnosis only).
+    pub fn unresolved_at(&self) -> Option<&str> {
+        self.unresolved_at.as_deref()
+    }
+
+    /// Diagnosis only: note `what` with the length of the composer text as
+    /// last read (in characters; none when no composer was on screen).
+    fn note_unresolved(&mut self, what: &str) {
+        let length = self.frame.composer.as_ref().map(|c| c.text.chars().count());
+        self.unresolved_at = Some(format!("{what}; composer text length {length:?}"));
     }
 
     pub fn phase(&self) -> Phase {
@@ -1503,7 +1521,10 @@ impl<'c> Txn<'c> {
             SeamVerdict::Layout => vec![Action::WakeAt(self.next_wake(now))],
             SeamVerdict::Mode(_) => self.unresolve(Cause::ModeChanged, seam, now),
             SeamVerdict::Closed => self.retired(now),
-            _ => self.unresolve(Cause::EchoMismatch, seam, now),
+            _ => {
+                self.note_unresolved("try_line: later stage's seam");
+                self.unresolve(Cause::EchoMismatch, seam, now)
+            }
         }
     }
 
@@ -1568,6 +1589,7 @@ impl<'c> Txn<'c> {
             return self.try_line(1, seam, now);
         }
         if now >= self.phase_since + ECHO_WAIT {
+            self.note_unresolved("head_echo: wait ended");
             return self.unresolve(Cause::EchoMismatch, seam, now);
         }
         vec![Action::WakeAt(self.next_wake(now))]
@@ -1585,6 +1607,7 @@ impl<'c> Txn<'c> {
         }
         if self.frame.holds_prefix(&self.line, self.accepted) {
             self.admission_lost = false;
+            self.note_unresolved("cancel_after_head: admission lost");
             return self.unresolve(Cause::EchoMismatch, seam, now);
         }
         if now >= self.phase_since + ECHO_WAIT {
@@ -1618,6 +1641,7 @@ impl<'c> Txn<'c> {
         }
         let done = self.line_done_at.unwrap_or(self.phase_since);
         if now >= done + ECHO_WAIT {
+            self.note_unresolved("echo: wait ended");
             return self.unresolve(Cause::EchoMismatch, seam, now);
         }
         vec![Action::WakeAt(self.next_wake(now))]
@@ -1638,6 +1662,7 @@ impl<'c> Txn<'c> {
                     return self.unresolve(Cause::DialogBeforeSubmit, seam, now);
                 }
                 if !frame.holds_exactly(&self.line) {
+                    self.note_unresolved("pre_cr: the frame does not hold exactly the line");
                     return self.unresolve(Cause::EchoMismatch, seam, now);
                 }
                 self.enqueue(JobKind::Cr, Job::Cr, Phase::CrJob, now)
@@ -1646,7 +1671,12 @@ impl<'c> Txn<'c> {
             SeamVerdict::Mode(_) => self.unresolve(Cause::ModeChanged, seam, now),
             SeamVerdict::Closed => self.retired(now),
             SeamVerdict::Expired => self.end(End::Expire, now),
-            SeamVerdict::Human | SeamVerdict::JobMark => {
+            SeamVerdict::Human => {
+                self.note_unresolved("pre_cr: seam watermark moved");
+                self.unresolve(Cause::EchoMismatch, seam, now)
+            }
+            SeamVerdict::JobMark => {
+                self.note_unresolved("pre_cr: seam job mark moved");
                 self.unresolve(Cause::EchoMismatch, seam, now)
             }
         }
@@ -1710,6 +1740,7 @@ impl<'c> Txn<'c> {
         {
             if self.caps.delete_key && self.caps.placeholder {
                 if let Some(deletes) = self.strict() {
+                    self.note_unresolved("cancel_after_line: admission lost");
                     self.withdrawal = Some((deletes, Cause::EchoMismatch));
                     self.enter(Phase::Withdrawing, now);
                     return self.try_deletes(seam, now);

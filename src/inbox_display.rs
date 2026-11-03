@@ -30,10 +30,10 @@ pub const WAKE_STALLED: &str = "waiting to wake";
 pub const WAKE_STALLED_HINT: &str = "send it a prompt";
 /// PRD #1666 part 3, round 5-wake (plan §5.2): the card's words for
 /// [`WakeHold::PossibleDraft`], after the glyph and the pending count.
-/// The `x` makes sure `Ctrl+C` has something to clear: on an empty box
-/// Claude Code asks for a second one to exit, and Codex exits (measured).
+/// Shown only for a box the deck can check (Q35-21): a check reads it
+/// again once the user has sent or cleared it, by whatever keys.
 pub const WAKE_HOLD_POSSIBLE_DRAFT: &str =
-    "waiting: there may be an unsent draft. Send it, or type x then Ctrl+C.";
+    "waiting: there may be an unsent draft. Send it or clear it.";
 /// The card's words for [`WakeHold::AwaitingPrompt`].
 pub const WAKE_HOLD_AWAITING_PROMPT: &str =
     "not yet taken: the agent may be waiting at a prompt. Check its pane.";
@@ -1130,8 +1130,8 @@ impl CardInbox {
 
     /// PRD #1666 part 3, round 5-wake (plan §5.2): why the deck holds the
     /// doorbell, with the pending count, while messages wait:
-    /// `✉2 waiting: there may be an unsent draft. Send it, or type x then
-    /// Ctrl+C.`. With nothing pending, only the two warnings that stand on their
+    /// `✉2 waiting: there may be an unsent draft. Send it or clear it.`.
+    /// With nothing pending, only the two warnings that stand on their
     /// own (the deck's line may be in the input, a dialog may have taken its
     /// keys); `None` otherwise and for a hold this build does not know.
     pub fn hold_text(&self) -> Option<String> {
@@ -1288,7 +1288,7 @@ mod tests {
         assert_eq!(
             deck_attention_text(Some(("Captain", WAKE_HOLD_POSSIBLE_DRAFT)), 1).as_deref(),
             Some(
-                "✉ Captain: waiting: there may be an unsent draft. Send it, or type x then Ctrl+C. · 1 other held"
+                "✉ Captain: waiting: there may be an unsent draft. Send it or clear it. · 1 other held"
             )
         );
         assert_eq!(

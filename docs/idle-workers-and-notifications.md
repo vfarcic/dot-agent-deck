@@ -35,7 +35,7 @@ What each report means for the orchestrator's next step:
 
 The exited, never-came-up, respawn-failed and blocked reports name the worker by its pane id, not by its role. The pane id usually contains a form of the orchestration's name. The [daemon log](troubleshooting.md#enabling-debug-logs) line written beside each report names the role and, where there is one, the error.
 
-Native delivery leaves your input box alone. If the doorbell is needed, it waits until you send or clear your draft; see [A deck prompt waits while you have an unsent draft](orchestration.md#a-deck-prompt-waits-while-you-have-an-unsent-draft).
+Native delivery leaves your input box alone. If the doorbell is needed, it waits while anything typed into the input box hasn't been checked; see [A deck prompt waits while you have an unsent draft](orchestration.md#a-deck-prompt-waits-while-you-have-an-unsent-draft).
 
 ## Change how long a worker may take
 

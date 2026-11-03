@@ -176,15 +176,15 @@ fn reuse_002_new_tab_per_fire_opens_distinct_tabs() {
     );
 }
 
-/// Scenario: Fire a schedule into a reused pane holding a human draft. Posting occurs immediately, the doorbell waits for draft clearance, and the pane then fetches exactly one additional message without spawning another agent.
+/// Scenario: Fire a schedule into a reused pane holding a human draft. Posting occurs immediately and nothing is typed while the draft is there; after Ctrl+U clears it the box is still one no check can read, so it holds with its reason (`cannot_type`) and nothing is typed, and the agent's own fetch takes exactly one additional message without spawning another agent.
 #[spec("scheduler/reuse/003")]
 #[test]
 #[cfg(unix)]
-fn reuse_003_deliver_on_idle_debounce() {
+fn reuse_003_a_cleared_draft_still_holds_and_the_agents_fetch_delivers() {
     route::scheduled(Some(3));
 }
 
-/// Scenario: Hold an unsent draft in a reused scheduled pane beyond the old debounce. The new prompt stays Queued in the inbox and no doorbell or prompt bytes are typed until Ctrl+U clears the draft.
+/// Scenario: Hold an unsent draft in a reused scheduled pane beyond the old debounce. The new prompt stays Queued in the inbox and no doorbell or prompt bytes are typed; after Ctrl+U clears the draft it still waits with its reason (`cannot_type`), nothing is typed, and the agent's own fetch takes it.
 #[spec("scheduler/reuse/005")]
 #[test]
 #[cfg(unix)]

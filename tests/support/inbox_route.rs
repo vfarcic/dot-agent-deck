@@ -622,6 +622,9 @@ pub fn scheduled(reuse_case: Option<u8>) {
         &[
             ("DOT_AGENT_DECK_DOORBELL_TICK_MS", "25"),
             ("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "30000"),
+            // The card names a hold once it outlasts this (Q35-21's re-oracle
+            // reads it), not after the default two minutes.
+            ("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "100"),
         ],
     );
     daemon.run_now("route-scheduled").unwrap();
@@ -667,6 +670,40 @@ pub fn scheduled(reuse_case: Option<u8>) {
             inbox::state(&daemon, &pane, id, "undeliverable");
         } else {
             input.write("\u{15}");
+            // Q35-21: clearing leaves a box no check has read. With no
+            // check available here it holds with its reason and nothing is
+            // typed; the agent's own fetch, as a prompt would run it, still
+            // takes exactly the one new message.
+            let cleared = [before.as_slice(), b"\x15"].concat();
+            assert!(
+                common::wait_until(WAIT, || inbox::bytes(&pane) == cleared),
+                "the clear reaches the pane: {:?}",
+                inbox::bytes(&pane)
+            );
+            fetch_enable(&pane);
+            inbox::status(&daemon, &pane, "idle", "codex");
+            let hold = || {
+                inbox::attach(&daemon, json!({"op":"list-agents"}))["agent_records"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|record| record["id"] == pane.agent)
+                    .map(|record| record["inbox"]["wake_hold"].clone())
+                    .unwrap_or_default()
+            };
+            assert!(
+                common::wait_until(WAIT, || hold() == "cannot_type"),
+                "a cleared box no check can read holds with its reason: {}",
+                hold()
+            );
+            inbox::unchanged(&pane, Duration::from_millis(600));
+            assert_eq!(
+                inbox::bytes(&pane),
+                cleared,
+                "nothing may be typed into a box no check read"
+            );
+            inbox::state(&daemon, &pane, id, "queued");
+            std::fs::write(pane.capture.with_extension("fetch-now"), "").unwrap();
             fetched(
                 &daemon,
                 &pane,

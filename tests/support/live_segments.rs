@@ -67,7 +67,67 @@ pub struct Fixture {
     pub kind: &'static str,
     instance: PathBuf,
     exe: PathBuf,
+    /// The daemon's tracing log, printed when a test fails (diagnosis only:
+    /// nothing asserts on it here).
+    log: PathBuf,
+    _log_dir: Option<tempfile::TempDir>,
+    _codex_bin: Option<tempfile::TempDir>,
+    /// A Codex pane's own `PATH` and `hooks/list` answer (Q129b item 0).
+    codex_pane: Option<CodexPaneEnv>,
 }
+
+/// What a Codex pane is spawned with beyond the common environment: the
+/// `codex app-server` stand-in first on its `PATH`, and the stand-in's
+/// `hooks/list` answer.
+struct CodexPaneEnv {
+    path: String,
+    hook_list: String,
+}
+
+/// Q129b item 0: record the deck's scoped trust for its own Codex hooks in
+/// the pane's `$CODEX_HOME` before the first spawn, through the real
+/// `hooks install --agent codex`, as an install the user ran earlier would
+/// have. The deck takes the keymap identity of `$CODEX_HOME/config.toml`
+/// at spawn (R6 §9.2), so it then already holds the records, and the
+/// wrapper's own trust write at spawn finds them in place and writes
+/// nothing (`codex_hooks_manage::edit_trust_state`: an edit that changes
+/// nothing is not a write).
+fn seed_codex_trust(daemon: &common::DaemonProc, pane: &CodexPaneEnv) {
+    let codex_home = daemon.home.join("codex");
+    let mut command = Command::new(common::contained_deck_binary());
+    command
+        .args(["hooks", "install", "--agent", "codex"])
+        .current_dir(&daemon.home)
+        .env_clear()
+        .env("PATH", &pane.path)
+        .env("HOME", &daemon.home)
+        .env("CODEX_HOME", &codex_home)
+        .env("CODEX_HOOK_LIST_RESPONSE", &pane.hook_list);
+    for (key, value) in common::config_containment_env() {
+        command.env(key, value);
+    }
+    let out = command.output().expect("run hooks install --agent codex");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("Trusted hooks: 6"),
+        "seeding the deck's Codex hook trust: {out:?}"
+    );
+    assert!(
+        fs::read_to_string(codex_home.join("config.toml"))
+            .is_ok_and(|toml| toml.contains("trusted_hash")),
+        "the trust records are in the pane's config.toml before the spawn"
+    );
+}
+
+/// What a failing test prints of the daemon's log: the probe's and the
+/// doorbell's lines, newest last, at most this many.
+const LOG_LINES_PRINTED: usize = 1500;
+/// The longest line printed whole.
+const LOG_LINE_CHARS: usize = 700;
+
+/// The targets whose lines a failing test prints, and the verbosity the
+/// fixture's daemon logs them at.
+const LOG_FILTER: &str = "composer_probe=debug,doorbell=debug";
 
 impl Fixture {
     pub fn start(kind: &'static str) -> Self {
@@ -75,15 +135,77 @@ impl Fixture {
     }
 
     pub fn with_env(kind: &'static str, extra: &[(&str, &str)]) -> Self {
-        let mut env = vec![
-            (
+        Self::configured(kind, extra, true)
+    }
+
+    /// Production Absent control: no editor-probe assumption or binding seam.
+    pub fn absent(kind: &'static str, extra: &[(&str, &str)]) -> Self {
+        Self::configured(kind, extra, false)
+    }
+
+    fn configured(kind: &'static str, extra: &[(&str, &str)], assumed: bool) -> Self {
+        let mut env = vec![("DOT_AGENT_DECK_DOORBELL_TICK_MS", "25")];
+        if assumed {
+            env.push((
                 "DOT_AGENT_DECK_E2E_ASSUME_EDITOR_PROBE",
                 "claude@2.1.310,codex@0.164.0",
-            ),
-            ("DOT_AGENT_DECK_DOORBELL_TICK_MS", "25"),
-        ];
+            ));
+        }
+        // Diagnosis (Q35-21): the daemon logs the probe's and the
+        // doorbell's decisions, and a failing test prints them. A caller
+        // that names its own log keeps it, and its lines are printed.
+        let named = extra
+            .iter()
+            .rev()
+            .find(|(k, _)| *k == "DOT_AGENT_DECK_LOG")
+            .map(|(_, v)| PathBuf::from(v));
+        let log_dir = named
+            .is_none()
+            .then(|| common::harness_tempdir().expect("fixture log dir"));
+        let log = named.unwrap_or_else(|| log_dir.as_ref().unwrap().path().join("deck.log"));
+        let log_value = log.to_str().expect("log path is UTF-8").to_owned();
+        env.push(("RUST_LOG", LOG_FILTER));
+        env.push(("DOT_AGENT_DECK_LOG", &log_value));
+        // Codex's hooks are trusted, as for a Codex the deck could set up:
+        // the deck's wrapper asks `codex app-server` for its hooks' trust
+        // hashes, which the copied native fixture (named `codex`) can't
+        // answer. Without trust the wrapper would report every redraw as the
+        // card's status (issue #1493's degraded mode), and a ring's own echo
+        // would turn the card busy mid-ring. The stand-in is the one
+        // `tests/e2e_inbox_codex_doorbell.rs` uses, copied out of the
+        // checkout: the harness drops every `PATH` entry inside it.
+        //
+        // It goes on the PANE's `PATH` only (Q129b item 0). On the daemon's,
+        // its startup install would write trust into `$HOME/.codex` from a
+        // thread of its own, and for a pane launched in `$HOME` that file is
+        // one of Codex's project layers, which are keymap sources (R6 §9.2):
+        // a write after the spawn's keymap identity refuses every check
+        // `Keymap(Changed)`.
+        let codex_bin = (kind == "codex").then(|| {
+            let dir = common::harness_tempdir().expect("codex stand-in dir");
+            let to = dir.path().join("codex");
+            fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex-synthetic/codex"),
+                &to,
+            )
+            .expect("copy the codex app-server stand-in");
+            fs::set_permissions(&to, fs::Permissions::from_mode(0o755)).unwrap();
+            dir
+        });
         env.extend_from_slice(extra);
         let daemon = common::spawn_daemon_serve_with_env(None, "0", &env);
+        let codex_pane_env = codex_bin.as_ref().map(|dir| {
+            let pane = CodexPaneEnv {
+                path: common::contain_path(&format!(
+                    "{}:{}",
+                    dir.path().display(),
+                    std::env::var("PATH").unwrap_or_default()
+                )),
+                hook_list: codex_hook_list_response(),
+            };
+            seed_codex_trust(&daemon, &pane);
+            pane
+        });
         let native = daemon.home.join("native");
         fs::create_dir(&native).unwrap();
         let exe = native.join(kind);
@@ -105,15 +227,21 @@ impl Fixture {
             "            path.unlink(missing_ok=True)\n            os.write(1, b'\\x1b[?2004h')\n            self.return_count = getattr(self, 'return_count', 0) + 1\n            self.path(f'.composer-return-{self.return_count}').touch()",
         );
         fs::write(native.join("composer_external_edit.py"), composer).unwrap();
-        fs::write(
-            native.join("composer.py"),
-            if kind == "codex" {
-                include_str!("codex_composer.py")
-            } else {
-                include_str!("claude_composer.py")
-            },
-        )
-        .unwrap();
+        let composer = if kind == "codex" {
+            include_str!("codex_composer.py").to_owned()
+        } else {
+            checked_replace(
+                include_str!("claude_composer.py"),
+                "            result = subprocess.run([deck, 'inbox', 'fetch']",
+                "            if os.path.exists(base + '.fetch-paused') or (os.path.exists(base + '.fetch-notice-only') and b'dot-agent-deck: message ' not in line):\n                continue\n            result = subprocess.run([deck, 'inbox', 'fetch']",
+            )
+        };
+        let composer = checked_replace(
+            &composer,
+            "    if not select.select([0], [], [], 0.025)[0]:",
+            "    if os.path.exists(base + '.external-edit-request'):\n        os.remove(base + '.external-edit-request')\n        external_edit.invoke(composer)\n        redraw()\n        open(base + '.external-edit-returned', 'w').close()\n    if not select.select([0], [], [], 0.025)[0]:",
+        );
+        fs::write(native.join("composer.py"), composer).unwrap();
         let editor = checked_replace(
             include_str!("composer_test_editor.py"),
             "mode, base, *args = sys.argv[1:]",
@@ -123,6 +251,11 @@ impl Fixture {
             &editor,
             "path.write_bytes(b'EDITED",
             "if mode == 'survivor':\n    survivor = os.fork()\n    if survivor == 0:\n        deadline = time.monotonic() + 30\n        while not Path(base + '.survivor-go').exists() and time.monotonic() < deadline: time.sleep(.005)\n        os._exit(0)\n    Path(base + '.survivor-pid').write_text(str(survivor))\npath.write_bytes(b'EDITED",
+        );
+        let editor = checked_replace(
+            &editor,
+            "path.write_bytes(b'EDITED   \\n' if mode == 'trim' else b'EDITED')",
+            "if mode != 'preserve':\n    path.write_bytes(b'EDITED   \\n' if mode == 'trim' else b'EDITED')",
         );
         executable(&native.join("editor"), &editor);
         executable(&native.join("broker"), BROKER);
@@ -134,6 +267,10 @@ impl Fixture {
             kind,
             instance: PathBuf::new(),
             exe,
+            log,
+            _log_dir: log_dir,
+            _codex_bin: codex_bin,
+            codex_pane: codex_pane_env,
         };
         f.spawn("first", false);
         f
@@ -157,13 +294,25 @@ impl Fixture {
             self.exe.parent().unwrap().join("editor").display(),
             self.base.display()
         );
+        let mut env = json!([
+            [MODE, self.base.to_str().unwrap()],
+            ["DOT_AGENT_DECK_PANE_ID", PANE],
+            ["DAD_LIVE_SEGMENTS_KIND", self.kind],
+            ["VISUAL", editor],
+            ["EDITOR", editor],
+            ["TMPDIR", self.daemon.home.join("tmp")],
+            ["CODEX_HOME", self.daemon.home.join("codex")]
+        ]);
+        if let Some(pane) = &self.codex_pane {
+            let env = env.as_array_mut().unwrap();
+            env.push(json!(["PATH", pane.path]));
+            env.push(json!(["CODEX_HOOK_LIST_RESPONSE", pane.hook_list]));
+        }
         let request = json!({
         "op":"start-agent", "command":format!("{} --live-segments-fixture",quote(&self.exe)), "cwd":self.daemon.home,
             "rows":40,"cols":140,"display_name":"segment-fixture",
             "agent_type":if self.kind == "codex" {"codex"} else {"claude_code"},
-            "env":[[MODE,self.base.to_str().unwrap()], ["DOT_AGENT_DECK_PANE_ID",PANE],
-                ["DAD_LIVE_SEGMENTS_KIND",self.kind], ["VISUAL",editor], ["EDITOR",editor],
-                ["TMPDIR",self.daemon.home.join("tmp")], ["CODEX_HOME",self.daemon.home.join("codex")]],
+            "env":env,
         });
         let duplicate = format!("Duplicate pane id: {PANE}");
         let deadline = std::time::Instant::now() + WAIT;
@@ -425,15 +574,19 @@ impl Fixture {
             .unwrap()
             .clone()
     }
-    pub fn enqueue(&self) {
+    pub fn enqueue(&self) -> String {
+        self.enqueue_body("TEST-ONLY-WAITING-MAIL")
+    }
+    pub fn enqueue_body(&self, body: &str) -> String {
         let r = inbox::attach(
             &self.daemon,
-            json!({"op":"post-message","pane_id":PANE,"expected_agent_id":self.agent,"subject":"segment admission","body":"TEST-ONLY-WAITING-MAIL","origin":"seed"}),
+            json!({"op":"post-message","pane_id":PANE,"expected_agent_id":self.agent,"subject":"segment admission","body":body,"origin":"seed"}),
         );
         assert_eq!(
             r["ok"], true,
             "post ordinary mail to exercise the live tick: {r}"
         );
+        r["id"].as_str().expect("queued message id").into()
     }
     pub fn hook_event(&self, event: &str) {
         let pid = read_json(&self.path("ready"))["pid"].as_u64().unwrap();
@@ -443,7 +596,12 @@ impl Fixture {
             .find_map(|e| e.strip_prefix(b"DOT_AGENT_DECK_PANE_CAPABILITY="))
             .map(|v| std::str::from_utf8(v).unwrap())
             .expect("own native fixture capability");
-        let request = json!({"session_id":format!("segment-session-{}",self.generation),"pane_id":PANE,"agent_id":self.agent,"token":token,"deck_build":"","event_type":event,"agent_type":if self.kind=="codex" {"codex"} else {"claude_code"},"timestamp":chrono::Utc::now(),"cwd":self.daemon.home,"metadata":{}});
+        let session = if self.kind == "codex" {
+            format!("{}-session", self.agent)
+        } else {
+            format!("segment-session-{}", self.generation)
+        };
+        let request = json!({"session_id":session,"pane_id":PANE,"agent_id":self.agent,"token":token,"deck_build":"","event_type":event,"agent_type":if self.kind=="codex" {"codex"} else {"claude_code"},"timestamp":chrono::Utc::now(),"cwd":self.daemon.home,"metadata":{}});
         let mut stream = inbox::connect(&self.daemon, &request).into_inner();
         stream.shutdown(std::net::Shutdown::Write).unwrap();
         use std::io::Read;
@@ -501,8 +659,65 @@ impl Drop for RefusalWatch {
     }
 }
 
+impl Fixture {
+    /// Diagnosis only (Q35-21): print the daemon log's probe and doorbell
+    /// lines, so a red run says which check settled how and why a ring or
+    /// a probe was or wasn't admitted. Asserts nothing.
+    fn print_log(&self) {
+        let text = fs::read_to_string(&self.log).unwrap_or_default();
+        // A line repeated but for its timestamp is shown once, with a count,
+        // so a tick's repeated refusal doesn't push the start out of view.
+        let body = |l: &str| l.split_once(' ').map_or(l, |(_, rest)| rest).to_owned();
+        let mut lines: Vec<String> = Vec::new();
+        let mut repeats = 0usize;
+        for l in text.lines().filter(|l| {
+            l.contains("composer_probe")
+                || l.contains("doorbell")
+                || l.contains("codex")
+                || l.contains("Received ")
+                || l.contains("inbox")
+        }) {
+            if lines.last().is_some_and(|last| body(last) == body(l)) {
+                repeats += 1;
+                continue;
+            }
+            if repeats > 0 {
+                lines.push(format!("    (the line above {repeats} more times)"));
+                repeats = 0;
+            }
+            lines.push(l.to_owned());
+        }
+        if repeats > 0 {
+            lines.push(format!("    (the line above {repeats} more times)"));
+        }
+        let skip = lines.len().saturating_sub(LOG_LINES_PRINTED);
+        let mut out = format!(
+            "---- fixture deck log ({}; {} lines after collapsing repeats, {} omitted from the start) ----\n",
+            self.log.display(),
+            lines.len(),
+            skip
+        );
+        for line in &lines[skip..] {
+            let mut cut = line.len().min(LOG_LINE_CHARS);
+            while !line.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            out.push_str(&line[..cut]);
+            if cut < line.len() {
+                out.push_str(" …");
+            }
+            out.push('\n');
+        }
+        out.push_str("---- end of fixture deck log ----\n");
+        eprint!("{}", common::redact_credentials_for_output(&out));
+    }
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.print_log();
+        }
         for suffix in [
             "editor-go",
             "editor-publish-go",
@@ -525,6 +740,31 @@ impl Drop for Fixture {
             },
         );
     }
+}
+
+/// What the `codex app-server` stand-in answers to `hooks/list`: the deck's
+/// own hooks, by the command the install wrote (as
+/// `tests/e2e_inbox_codex_doorbell.rs` and `tests/e2e_codex_status.rs` answer).
+fn codex_hook_list_response() -> String {
+    let entry = |event: &str, camel: &str| {
+        json!({
+            "key": format!("__CODEX_HOME__/hooks.json:{event}:0:0"),
+            "eventName": camel, "handlerType": "command", "matcher": null,
+            "command": "__DECK_COMMAND__", "timeoutSec": 600, "statusMessage": null,
+            "sourcePath": "__CODEX_HOME__/hooks.json", "source": "user", "pluginId": null,
+            "displayOrder": 0, "enabled": true, "isManaged": false,
+            "currentHash": format!("sha256:{event}"), "trustStatus": "untrusted"
+        })
+    };
+    json!({"id": 2, "result": {"data": [{"cwd": "/workspace", "hooks": [
+        entry("session_start", "sessionStart"),
+        entry("user_prompt_submit", "userPromptSubmit"),
+        entry("pre_tool_use", "preToolUse"),
+        entry("post_tool_use", "postToolUse"),
+        entry("permission_request", "permissionRequest"),
+        entry("stop", "stop"),
+    ], "warnings": [], "errors": []}]}})
+    .to_string()
 }
 
 // The bridge changes only ancestry, not F2's parsing or key-loss mechanisms.
@@ -553,7 +793,7 @@ pub fn native_entry() {
     let exe = std::env::current_exe().unwrap();
     let helper = PathBuf::from(std::env::var_os("VISUAL").unwrap());
     let generation = std::env::var("DOT_AGENT_DECK_EDITOR_GEN")
-        .unwrap()
+        .unwrap_or_else(|_| "0".into())
         .parse::<u64>()
         .unwrap();
     fs::create_dir_all(std::env::var_os("TMPDIR").unwrap()).unwrap();
@@ -727,6 +967,24 @@ pub fn native_entry() {
         if let Ok(data) = fs::read(base.with_extension("command")) {
             fs::remove_file(base.with_extension("command")).unwrap();
             let cmd: Value = serde_json::from_slice(&data).unwrap();
+            if cmd["action"] == "fetch" {
+                // An independent ordinary CLI consumer, with this sandbox
+                // pane's own environment; no input goes to its composer.
+                let output = Command::new(common::contained_deck_binary())
+                    .args(["inbox", "fetch"])
+                    .envs(env.clone())
+                    .output()
+                    .unwrap();
+                atomic(
+                    &base.with_extension("response"),
+                    &json!({
+                        "ok":output.status.success(),
+                        "stdout":String::from_utf8(output.stdout).unwrap(),
+                        "stderr":String::from_utf8(output.stderr).unwrap(),
+                    }),
+                );
+                continue;
+            }
             let mut reply = json!({"ok":true});
             if cmd["action"] == "emit" {
                 let bytes: Vec<u8> = serde_json::from_value(cmd["bytes"].clone()).unwrap();
