@@ -21714,7 +21714,7 @@ mod tests {
         assert_eq!(card(&state).full_text().as_deref(), Some("✉1"));
         assert_eq!(
             card(&state).notice_text().as_deref(),
-            Some("✉1 waiting: there may be an unsent draft. Send it, or type x then Ctrl+C.")
+            Some("✉1 waiting: there may be an unsent draft. Send it or clear it.")
         );
         hub.set_wake_hold("pane-q", "agent-q", Some(WakeHold::AwaitingPrompt));
         follow_notices(&mut state, &mut rx);

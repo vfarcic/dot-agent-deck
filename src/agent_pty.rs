@@ -12843,19 +12843,38 @@ impl AgentPtyRegistry {
     /// hold reason and episode ([`PaneInputHold::of`]). A generation that is
     /// gone reads as untouched.
     pub fn pane_input_hold(&self, pane_id_env: &str, agent_id: &str) -> PaneInputHold {
-        let (input, observer) = {
+        let (input, permission) = {
             let inner = self.inner.lock();
             match inner.agents.get(agent_id) {
-                Some(agent) => (Some(Arc::clone(agent.bus.input())), agent.composer.clone()),
+                Some(agent) => (
+                    Some(Arc::clone(agent.bus.input())),
+                    Self::permission_of(agent),
+                ),
                 None => (None, None),
             }
         };
         let touched = input.is_some_and(|input| input.touched());
-        let permission = observer.map(|observer| observer.permission());
         self.pane_input
             .lock()
             .unwrap()
             .input_hold(pane_id_env, touched, permission)
+    }
+
+    /// The permission of `agent`'s observer, `None` with no observer: on
+    /// Linux only an installed generation has one; elsewhere none does.
+    fn permission_of(agent: &RunningAgent) -> Option<crate::composer_probe::Permission> {
+        #[cfg(target_os = "linux")]
+        {
+            agent
+                .composer
+                .as_ref()
+                .map(|observer| observer.permission())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = agent;
+            None
+        }
     }
 
     /// Type `bytes` into `pane_id` as a user would, while `agent_id` is the
