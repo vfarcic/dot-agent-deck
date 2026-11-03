@@ -120,6 +120,25 @@ impl Fixture {
         let log_value = log.to_str().expect("log path is UTF-8").to_owned();
         env.push(("RUST_LOG", LOG_FILTER));
         env.push(("DOT_AGENT_DECK_LOG", &log_value));
+        // Codex's hooks are trusted, as for a Codex the deck could set up:
+        // the deck's wrapper asks `codex app-server` for its hooks' trust
+        // hashes, which the copied native fixture (named `codex`) can't
+        // answer. Without trust the wrapper would report every redraw as the
+        // card's status (issue #1493's degraded mode), and a ring's own echo
+        // would turn the card busy mid-ring. The stand-in is the one
+        // `tests/e2e_inbox_codex_doorbell.rs` uses.
+        let codex_path = format!(
+            "{}:{}",
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/codex-synthetic")
+                .display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let hooks = codex_hook_list_response();
+        if kind == "codex" {
+            env.push(("PATH", &codex_path));
+            env.push(("CODEX_HOOK_LIST_RESPONSE", &hooks));
+        }
         env.extend_from_slice(extra);
         let daemon = common::spawn_daemon_serve_with_env(None, "0", &env);
         let native = daemon.home.join("native");
@@ -641,6 +660,31 @@ impl Drop for Fixture {
             },
         );
     }
+}
+
+/// What the `codex app-server` stand-in answers to `hooks/list`: the deck's
+/// own hooks, by the command the install wrote (as
+/// `tests/e2e_inbox_codex_doorbell.rs` and `tests/e2e_codex_status.rs` answer).
+fn codex_hook_list_response() -> String {
+    let entry = |event: &str, camel: &str| {
+        json!({
+            "key": format!("__CODEX_HOME__/hooks.json:{event}:0:0"),
+            "eventName": camel, "handlerType": "command", "matcher": null,
+            "command": "__DECK_COMMAND__", "timeoutSec": 600, "statusMessage": null,
+            "sourcePath": "__CODEX_HOME__/hooks.json", "source": "user", "pluginId": null,
+            "displayOrder": 0, "enabled": true, "isManaged": false,
+            "currentHash": format!("sha256:{event}"), "trustStatus": "untrusted"
+        })
+    };
+    json!({"id": 2, "result": {"data": [{"cwd": "/workspace", "hooks": [
+        entry("session_start", "sessionStart"),
+        entry("user_prompt_submit", "userPromptSubmit"),
+        entry("pre_tool_use", "preToolUse"),
+        entry("post_tool_use", "postToolUse"),
+        entry("permission_request", "permissionRequest"),
+        entry("stop", "stop"),
+    ], "warnings": [], "errors": []}]}})
+    .to_string()
 }
 
 // The bridge changes only ancestry, not F2's parsing or key-loss mechanisms.
