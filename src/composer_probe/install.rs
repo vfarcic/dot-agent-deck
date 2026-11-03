@@ -114,8 +114,11 @@ pub enum PaneClass {
 pub const SHELLS: &[&str] = &["bash", "zsh", "fish", "sh", "dash", "nu", "pwsh"];
 
 /// The classes installation has rolled out to. Empty until activation:
-/// Q35-28 adds Claude's direct and launcher classes and the wrapper class,
-/// Q35-29 Codex's.
+/// Q35-28 adds `Direct(Claude)` only; `Launcher(Claude)` and `Wrapper` come
+/// with Q35-22, and Codex's classes with Q35-29
+/// (`docs/develop/doorbell-admission.md`). Installation is Linux-only
+/// whatever this holds: [`at_spawn`] returns [`NotInstalled::Platform`]
+/// on any other host.
 pub const INSTALL_ROLLOUT: &[PaneClass] = &[];
 
 /// The class of a pane running `command`, its agent declared as `declared`.

@@ -4455,9 +4455,11 @@ impl PaneInputHold {
 /// into test builds only, where the issue #544 tests keep pinning the
 /// contract against the real encoder. The submit or clear that lifts a
 /// suspended doorbell is [`crate::composer_probe::recovery`]'s, over
-/// Q35-01's tokenizer, and the two grammars differ: that tokenizer reads
-/// `ESC` `CR` as a newline, which the table in `ui.rs` records as a submit
-/// for Pi.
+/// Q35-01's tokenizer. Both read `ESC` `CR` as no submit; they differ on a
+/// `CR` inside an escape sequence, which this scan counts (the `CR` of
+/// `ESC [ CR`) and the tokenizer reads as inside the sequence. Pi submits on
+/// `ESC` `CR` (the table in `ui.rs`), and recovery does not count it, so a
+/// Pi user's `Alt+Enter` does not lift a suspension: fail-closed.
 ///
 /// The state is carried ACROSS calls because a paste — and equally an
 /// `Alt+Enter` — arrives as however many writes the client happens to make; a

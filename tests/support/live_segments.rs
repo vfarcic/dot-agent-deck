@@ -92,6 +92,14 @@ struct CodexPaneEnv {
 /// wrapper's own trust write at spawn finds them in place and writes
 /// nothing (`codex_hooks_manage::edit_trust_state`: an edit that changes
 /// nothing is not a write).
+///
+/// The seeding sidesteps a production case this fixture therefore can't
+/// show: where nothing recorded the trust before the spawn, the wrapper's
+/// own trust write lands after the spawn's keymap identity was taken, and
+/// every check of that pane is refused `Keymap(Changed)` for the whole
+/// generation. That happens for a pane whose `CODEX_HOME` differs from the
+/// daemon's, or a Codex not on the daemon's `PATH` at startup (the daemon's
+/// startup install skips it). Named for Q35-22 / Q35-29.
 fn seed_codex_trust(daemon: &common::DaemonProc, pane: &CodexPaneEnv) {
     let codex_home = daemon.home.join("codex");
     let mut command = Command::new(common::contained_deck_binary());

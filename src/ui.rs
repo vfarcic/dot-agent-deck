@@ -5747,7 +5747,11 @@ fn keyevent_to_pane_bytes(key: &KeyEvent, application_cursor: bool) -> Option<Ve
 /// and the issue #544 tests keep it pinned against the encoder so the
 /// contract below stays written down. The doorbell's suspension recovery
 /// counts the user's submits over Q35-01's tokenizer instead
-/// (`composer_probe::recovery`), which reads `ESC` `CR` as a newline.
+/// (`composer_probe::recovery`). That tokenizer reads `ESC` `CR` as no submit
+/// too, as this does; the two differ on a `CR` inside an escape sequence,
+/// which this counts (`ESC [ CR`) and the tokenizer reads as inside the
+/// sequence. Pi submits on `ESC` `CR` (the table below), which recovery does
+/// not count, so a Pi user's `Alt+Enter` does not lift a suspension.
 ///
 /// This lives beside [`keyevent_to_bytes`] because it is that function read
 /// backwards. The daemon's input stream
