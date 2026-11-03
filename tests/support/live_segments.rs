@@ -226,6 +226,49 @@ impl Fixture {
     pub fn connect(&self) -> common::AttachInput {
         common::AttachInput::attach(&self.daemon.attach_socket, &self.agent)
     }
+    /// The same attach as [`Self::connect`], keeping the refusals it is sent.
+    pub fn connect_watching_refusals(&self) -> RefusalWatch {
+        use dot_agent_deck::daemon_protocol::{AttachRequest, KIND_REQ, KIND_STREAM_REJECT};
+        use std::io::Read;
+        let stream = std::os::unix::net::UnixStream::connect(&self.daemon.attach_socket)
+            .expect("connect to the attach socket");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = stream.try_clone().unwrap();
+        let refusals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = refusals.clone();
+        let reader = std::thread::spawn(move || {
+            loop {
+                let mut header = [0u8; 5];
+                if reader.read_exact(&mut header).is_err() {
+                    break;
+                }
+                let len = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
+                let mut body = vec![0; len];
+                if reader.read_exact(&mut body).is_err() {
+                    break;
+                }
+                if header[0] == KIND_STREAM_REJECT {
+                    log.lock().unwrap().push(body);
+                }
+            }
+        });
+        let mut watch = RefusalWatch {
+            stream,
+            refusals,
+            reader: Some(reader),
+        };
+        let request = AttachRequest::AttachStream {
+            id: self.agent.clone(),
+            rows: None,
+            cols: None,
+            geometry_updates: false,
+            client_id: None,
+        };
+        watch.frame(KIND_REQ, &serde_json::to_vec(&request).unwrap());
+        watch
+    }
     pub fn input(&self) -> Vec<u8> {
         fs::read(self.path("bytes")).unwrap_or_default()
     }
@@ -418,6 +461,43 @@ impl HelperPause {
 impl Drop for HelperPause {
     fn drop(&mut self) {
         let _ = self.0.write_all(b"x");
+    }
+}
+
+/// A person's attach connection that, unlike [`common::AttachInput`], keeps
+/// the input refusals the daemon sends it (`KIND_STREAM_REJECT` bodies), so a
+/// scenario can see which notice its own write was answered with.
+pub struct RefusalWatch {
+    stream: std::os::unix::net::UnixStream,
+    refusals: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+impl RefusalWatch {
+    fn frame(&mut self, kind: u8, bytes: &[u8]) {
+        self.stream.write_all(&[kind]).unwrap();
+        self.stream
+            .write_all(&(bytes.len() as u32).to_be_bytes())
+            .unwrap();
+        self.stream.write_all(bytes).unwrap();
+        self.stream.flush().unwrap();
+    }
+    /// One `KIND_STREAM_IN` frame carrying `bytes`.
+    pub fn write(&mut self, bytes: &str) {
+        self.frame(
+            dot_agent_deck::daemon_protocol::KIND_STREAM_IN,
+            bytes.as_bytes(),
+        );
+    }
+    pub fn refusals(&self) -> Vec<Vec<u8>> {
+        self.refusals.lock().unwrap().clone()
+    }
+}
+impl Drop for RefusalWatch {
+    fn drop(&mut self) {
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
     }
 }
 

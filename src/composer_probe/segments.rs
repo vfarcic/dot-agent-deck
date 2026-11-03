@@ -479,11 +479,15 @@ pub enum Refusal {
 
 /// The user's editor a segment's helper runs, as the observer pinned it
 /// (A-20d-6): its `(pid, start)`, and a check of whether that very process
-/// still runs, which a release asks before it hands held typing to the
-/// editor. The observer's check polls the editor's pidfd, held since the
-/// pin, so it can't answer for another process that reused the pid. An
-/// editor reported with an identity but no check (tests only) is taken as
-/// running.
+/// still runs, which the early release asks before it lets held typing go
+/// on the strength of a running editor. A pin whose editor has exited
+/// releases nothing on the pin: under `Hold`, production's policy, held
+/// typing then goes on Claude once the helper's own report of the editor's
+/// end is in at its drained exit (`editor_ended`, A-20d-15), and on Codex
+/// stays held until the generation retires (the revd21 review's U2-1). The
+/// observer's check polls the editor's pidfd, held since the pin, so it
+/// can't answer for another process that reused the pid. An editor
+/// reported with an identity but no check (tests only) is taken as running.
 #[derive(Clone)]
 pub struct EditorPin {
     pub key: RecordKey,
