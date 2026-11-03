@@ -71,6 +71,7 @@ pub struct Fixture {
     /// nothing asserts on it here).
     log: PathBuf,
     _log_dir: Option<tempfile::TempDir>,
+    _codex_bin: Option<tempfile::TempDir>,
 }
 
 /// What a failing test prints of the daemon's log: the probe's and the
@@ -126,17 +127,29 @@ impl Fixture {
         // answer. Without trust the wrapper would report every redraw as the
         // card's status (issue #1493's degraded mode), and a ring's own echo
         // would turn the card busy mid-ring. The stand-in is the one
-        // `tests/e2e_inbox_codex_doorbell.rs` uses.
-        let codex_path = format!(
-            "{}:{}",
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/codex-synthetic")
-                .display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
+        // `tests/e2e_inbox_codex_doorbell.rs` uses, copied out of the
+        // checkout: the harness drops every `PATH` entry inside it.
+        let codex_bin = (kind == "codex").then(|| {
+            let dir = common::harness_tempdir().expect("codex stand-in dir");
+            let to = dir.path().join("codex");
+            fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex-synthetic/codex"),
+                &to,
+            )
+            .expect("copy the codex app-server stand-in");
+            fs::set_permissions(&to, fs::Permissions::from_mode(0o755)).unwrap();
+            dir
+        });
+        let codex_path = codex_bin.as_ref().map(|dir| {
+            format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            )
+        });
         let hooks = codex_hook_list_response();
-        if kind == "codex" {
-            env.push(("PATH", &codex_path));
+        if let Some(path) = codex_path.as_deref() {
+            env.push(("PATH", path));
             env.push(("CODEX_HOOK_LIST_RESPONSE", &hooks));
         }
         env.extend_from_slice(extra);
@@ -204,6 +217,7 @@ impl Fixture {
             exe,
             log,
             _log_dir: log_dir,
+            _codex_bin: codex_bin,
         };
         f.spawn("first", false);
         f
@@ -594,6 +608,7 @@ impl Fixture {
         for l in text.lines().filter(|l| {
             l.contains("composer_probe")
                 || l.contains("doorbell")
+                || l.contains("codex")
                 || l.contains("Received ")
                 || l.contains("inbox")
         }) {
