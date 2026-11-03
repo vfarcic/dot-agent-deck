@@ -348,8 +348,19 @@ fn probe_089_live_claude_317_ctrl_g_forms() {
     // The pasted BEL is read from the next export, the bytes the editor
     // stand-in read from the file, never from `composer_after`: that is the
     // screen, where a BEL kept in the draft is not drawn, so it reads
-    // `BASEPASTETAIL` whether the BEL was kept or dropped.
-    for row in c.rows("paste-bel") {
+    // `BASEPASTETAIL` whether the BEL was kept or dropped. The 2.1.317
+    // record's comment says "kept as text" (its `pasted_bel_is_text` stays
+    // `Absent`, the safe default), so this test holds that reading: a rerun
+    // that reads "dropped" fails rather than only printing the flip.
+    let pastes = c.rows("paste-bel");
+    for split in [false, true] {
+        assert!(
+            pastes.iter().any(|row| row["split"] == split),
+            "no paste-bel row with split={split}; {}",
+            c.root.display()
+        );
+    }
+    for row in pastes {
         let export = hex_bytes(row["next_export_hex"].as_str().unwrap_or_default());
         let reading = match export.as_slice() {
             b"BASEPASTE\x07TAIL" => "kept as text",
@@ -367,6 +378,12 @@ fn probe_089_live_claude_317_ctrl_g_forms() {
             reading,
             "neither",
             "the next export after the paste is neither reading; {}",
+            c.root.display()
+        );
+        assert_eq!(
+            reading,
+            "kept as text",
+            "2.1.317 was measured keeping the pasted BEL as text; {}",
             c.root.display()
         );
     }

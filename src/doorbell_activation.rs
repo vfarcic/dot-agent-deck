@@ -978,15 +978,24 @@ const CODEX_0160_DIALOGS: &[DialogKeys<'static>] = &[
 /// until the measurement that verifies it is recorded. `parser_cost` is the
 /// release scanner's and the evidence parser's cost on the real push path,
 /// with their work budgets (Q25), replayed from every release's recorded
-/// launches at 50 × 200 and 80 × 300 (`src/agent_pty_scanner_budget.rs`):
-/// at most 501 µs added to a push's lock hold and 5.0 ms of scanner CPU per
-/// generation, no work limit reached (`docs/develop/doorbell-admission.md`).
-/// Of the three, only Claude Code 2.1.310 is `Go`: both Codex releases stage
-/// the line (a digit of a message id answers their update dialog, `n` their
-/// folder-trust dialog), and neither records `head_echo` yet, so both are
-/// `missing_measurement`. No release has its `editor_probe` measured yet, so
-/// the deck checks no input box on any of them.
-pub static RELEASE_RECORDS: [ReleaseRecord<'static>; 4] = [
+/// launches at 50 × 200 and 80 × 300 (`src/agent_pty_scanner_budget.rs`).
+/// The last replay, on 2026-11-03 with Claude Code 2.1.317's launches added,
+/// ran on a contended machine (load average 10.65 on 16 CPUs at its start,
+/// from other work): over every recorded trace, p99 213.9 µs and at most
+/// 2980 µs added to a push's lock hold and at most 14.63 ms of scanner CPU
+/// per generation; 2.1.317's own traces at most 1315.8 µs and 10.95 ms, with
+/// 2.1.312's rows in the same run of the same size. No work limit was
+/// reached, and every trace is within plan §4.6's bounds
+/// (`tests/fixtures/claude-inbox/release-2.1.317/parser-cost-replay.txt`;
+/// the earlier, quieter replay's figures are in
+/// `docs/develop/doorbell-admission.md`). The Claude Code records are `Go`;
+/// both Codex releases stage the line (a digit of a message id answers their
+/// update dialog, `n` their folder-trust dialog), and neither records
+/// `head_echo` yet, so both are `missing_measurement`. No record's
+/// `editor_probe` is verified, so the deck checks no input box on any of
+/// them; 2.1.317's measured one is [`CLAUDE_2_1_317_EDITOR_PROBE`], which
+/// activation (Q35-28) sets.
+pub static RELEASE_RECORDS: [ReleaseRecord<'static>; 5] = [
     // Codex 0.164.0, the release current at measurement. Echo: the exact line
     // in the composer 30 of 30 (20 at 50 × 200, 10 at 24 × 80; ≤ 62 ms after
     // its one write). Submit: the transcript's user message 30 of 30 ≤ 418 ms
@@ -1111,4 +1120,89 @@ pub static RELEASE_RECORDS: [ReleaseRecord<'static>; 4] = [
         transcript_echo: Measurement::Verified(()),
         editor_probe: Measurement::Absent,
     },
+    // Claude Code 2.1.317, the release installed on 2026-11-03, pinned
+    // SHA-256 eb224419e344575faa4a1f39b290b649425a10cd5ee2ef1d003480cd9a
+    // e57eb0 (the official @anthropic-ai/claude-code-linux-x64 package).
+    // M1/Q32 through the private lane-2 TUI harness, every submission blocked
+    // before a model turn: 30/30 exact echoes (<= 64.0 ms), exact blocked
+    // prompt hooks (<= 242.3 ms after the CR) and transcript user echoes
+    // (<= 97.1 ms), across 24x80 and 50x200. Ten fresh launches idle 20 s
+    // each with no post-ready dialog, raw input from the ready composer; the
+    // recorded header latches 2.1.317 byte by byte, at the recorded split and
+    // in one push. Ten resizes and ten nudges draw the measured marker
+    // and width witness (first redraw <= 45.5 ms); six deletes leave no
+    // placeholder. All nineteen Q32 sequences match 2.1.312, and the nine
+    // menu size/palette sets read as 2.1.310's and 2.1.312's do (no wrong
+    // acceptance or refusal in the fast replay). Real push replay: see the
+    // doc comment above (this release's traces at most 1315.8 us added hold
+    // and 10.95 ms scanner CPU per generation, under load). Restoring a
+    // blocked prompt took up to 742 ms after the hook; that is the
+    // measurement's private hook, and nothing here reads it. Evidence:
+    // `tests/fixtures/claude-inbox/r5wake/claude-2.1.317-*` and
+    // `tests/fixtures/claude-inbox/release-2.1.317/`.
+    ReleaseRecord {
+        agent: AgentType::ClaudeCode,
+        release: Version::new(2, 1, 317),
+        profile: "claude-code-2026-10",
+        ready_composer: Measurement::Verified(()),
+        echo: Measurement::Verified(()),
+        submit_route: Measurement::Verified(()),
+        layout: Measurement::Verified(()),
+        key_effects: Measurement::Verified(&[]),
+        first_modal: Measurement::Verified(FirstModal::NoneObserved { launches: 10 }),
+        input_mode: Measurement::Verified(()),
+        release_recogniser: Measurement::Verified(()),
+        parser_cost: Measurement::Verified(()),
+        // Nothing commits in any dialog, so the line is never staged.
+        head_echo: Measurement::Absent,
+        placeholder_empty: Measurement::Failed,
+        delete_key: Measurement::Verified(()),
+        transcript_echo: Measurement::Verified(()),
+        // Measured: [`CLAUDE_2_1_317_EDITOR_PROBE`]. Left absent until
+        // activation (Q35-28) verifies it, so no shipped release is armable
+        // before then (`inbox/doorbell/053`, `inbox/probe/012`).
+        editor_probe: Measurement::Absent,
+    },
 ];
+
+/// Claude Code 2.1.317's external-editor action as measured on 2026-11-03
+/// (`tests/fixtures/claude-inbox/release-2.1.317/`, `inbox/probe/088`,
+/// `089`): the `editor_probe` its record gets at activation (Q35-28). Each
+/// field is verified only as far as it was measured.
+///
+/// - `export`: 5/5 Ctrl+G presses under `VISUAL` handed the editor the draft
+///   in `<TMPDIR>/claude-<uid>/claude-prompt-<uuid>.md` as its last argument,
+///   and reimported the rewritten file.
+/// - `selection`: a set `VISUAL`, split on spaces, before `EDITOR`; an empty
+///   `VISUAL` falls to `EDITOR`; with neither, `code` on `PATH` before `vi`.
+/// - `paste_toggles`: one `?2004l` before the editor and one `?2004h` after
+///   it, 5/5, measured on the `VISUAL` path, which is how the deck's helper
+///   is reached; the `EDITOR` and `PATH` `vi` cells wrote the same, and the
+///   `PATH` `code -w -g` fallback wrote no `?2004` at all.
+/// - `keymap_sources`: the user's `keybindings.json` only; the same file in
+///   the project's `.claude/` had no effect, with user settings only and
+///   with every settings source.
+/// - `keymap_loaded_at_start` (P-KB1, M49b): a Ctrl+G-unbinding file present
+///   at spawn was in force at the first composer frame 5/5, stayed in force
+///   unchanged for ten minutes 10/10, and a file created or removed during a
+///   session took effect by 3.75 s and 2.53 s (sampled, not a race bound).
+/// - `inert_candidates`: none, the M44e safe default. BEL, implicit CSI-u
+///   103/71 and modifyOtherKeys 103/71 open the editor; no form is promoted
+///   to inert.
+/// - `pasted_bel_is_text`: `Absent`, the safe default. Measured, the pasted
+///   BEL is kept as text: a bracketed `PASTE` BEL `TAIL` opened no editor
+///   and the next export held `BASEPASTE\x07TAIL`, 2/2 whole and split, in
+///   two runs (`inbox/probe/089` now fails on any other reading). The first
+///   report's "dropped" read the screen, which draws no BEL.
+pub const CLAUDE_2_1_317_EDITOR_PROBE: EditorProbe<'static> = EditorProbe {
+    export: ExportShape::ClaudeTmpdir,
+    selection: EditorSelection::ClaudeCode,
+    paste_toggles: PasteToggles {
+        disables: 1,
+        enables: 1,
+    },
+    keymap_sources: &[KeymapSource::ClaudeKeybindings],
+    keymap_loaded_at_start: Measurement::Verified(()),
+    inert_candidates: &[],
+    pasted_bel_is_text: Measurement::Absent,
+};
