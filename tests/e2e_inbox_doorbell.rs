@@ -782,7 +782,7 @@ fn assert_ack_fences_rering(phase: &str, settle: Settle) {
     }
 }
 
-/// Scenario: Type a worker draft, queue a task, and keep typing while delivery waits. Enter must submit the human draft separately, after which exactly the token-led doorbell arrives without blocking the user's input.
+/// Scenario: Type a worker draft, queue a task, and keep typing while delivery waits; the user's typing is never blocked. Enter submits the human draft as its own line. The box was touched and no check can read this pane, so the deck types nothing after it and the card says why (`cannot_type`); the in-pane fetch, as a prompt would run it, still hands over the task.
 #[spec("scheduler/dispatch/023")]
 #[test]
 fn dispatch_023_doorbell_waits_for_unsent_worker_draft() {
@@ -801,33 +801,70 @@ fn dispatch_023_doorbell_waits_for_unsent_worker_draft() {
     unchanged(&pane, Duration::from_millis(300));
     assert!(rings(&pane).is_empty());
     user.write("\r");
-    ring(&daemon, &pane, &id);
+    // Q35-21: the user's own submit leaves a box no check has read. With no
+    // check available here, it holds with its reason and the deck types
+    // nothing after the draft; the prompt route still delivers.
+    let submitted = format!("{DRAFT}-still-typing\r");
+    assert!(
+        common::wait_until(WAIT, || bytes(&pane) == submitted.as_bytes()),
+        "the draft must be submitted as its own line: {:?}",
+        bytes(&pane)
+    );
+    assert!(
+        common::wait_until(WAIT, || wake_hold(&daemon, &pane) == "cannot_type"),
+        "a touched box no check can read holds with its reason: {}",
+        wake_hold(&daemon, &pane)
+    );
+    unchanged(&pane, Duration::from_millis(600));
     assert_eq!(
         bytes(&pane),
-        format!("{DRAFT}-still-typing\r{}\r", rung_line(&pane, &id).unwrap()).as_bytes(),
-        "draft and doorbell must be separate submitted lines"
+        submitted.as_bytes(),
+        "nothing may be typed after the user's own line"
+    );
+    assert!(rings(&pane).is_empty());
+    let taken = fetch(&daemon, &pane, true);
+    assert!(
+        taken.to_string().contains(&id),
+        "the prompt route must hand over the task: {taken}"
     );
 }
 
-/// Scenario: Forward only terminal focus, mouse and query-response bytes into an Idle worker pane, then queue a task. These terminal reports must not count as a human draft, so the token-led doorbell reaches the pane without Enter.
+/// Scenario: Forward only terminal focus, mouse and query-response bytes into an Idle worker pane whose agent turned on no report mode, then queue a task. Reports the agent did not ask for may be input to it, so they touch the box: the deck types nothing after them, the card says why (`cannot_type`), and the in-pane fetch, as a prompt would run it, still hands over the task.
 #[spec("scheduler/dispatch/023")]
 #[test]
-fn dispatch_023_terminal_reports_do_not_hold_doorbell() {
+fn dispatch_023_unrequested_terminal_reports_hold_with_their_reason() {
     let daemon = daemon_unbound(&[]);
     let pane = pane(&daemon, "terminal-reports");
     status(&daemon, &pane, "idle", "codex");
     let reports =
         "\x1b[<64;10;5M\x1b[I\x1b[10;5R\x1b[?1;2c\x1b]10;rgb:ffff/ffff/ffff\x07\x1bP1$r0m\x1b\\";
     let _user = input(&daemon, &pane, reports);
-    let id = enqueue(&daemon, &pane, BODY);
-    let expected = || rung_line(&pane, &id).map(|line| format!("{reports}{line}\r"));
     assert!(
-        common::wait_until(WAIT, || expected()
-            .is_some_and(|expected| bytes(&pane) == expected.as_bytes())),
-        "terminal reports must not defer the doorbell: {:?}",
+        common::wait_until(WAIT, || bytes(&pane) == reports.as_bytes()),
+        "the reports reach the pane: {:?}",
         bytes(&pane)
     );
-    assert!(screen(&daemon, &pane).contains("waiting, run: dot-agent-deck inbox fetch"));
+    let id = enqueue(&daemon, &pane, BODY);
+    // Q35-21 (R3 §3.2): reports outside the agent's enabled modes and the
+    // ledger's solicited replies touch the box. With no check available
+    // here it holds with its reason; the prompt route still delivers.
+    assert!(
+        common::wait_until(WAIT, || wake_hold(&daemon, &pane) == "cannot_type"),
+        "unrequested reports hold the doorbell with its reason: {}",
+        wake_hold(&daemon, &pane)
+    );
+    unchanged(&pane, Duration::from_millis(600));
+    assert_eq!(
+        bytes(&pane),
+        reports.as_bytes(),
+        "nothing may be typed after the reports"
+    );
+    assert!(rings(&pane).is_empty());
+    let taken = fetch(&daemon, &pane, true);
+    assert!(
+        taken.to_string().contains(&id),
+        "the prompt route must hand over the task: {taken}"
+    );
 }
 
 /// Scenario: Type and delete text in OpenCode and Pi panes with their native receipt streams registered, then queue a message. Each native stream must hand over its message without a probe or notice, and its card must not acquire a composer-check reason.

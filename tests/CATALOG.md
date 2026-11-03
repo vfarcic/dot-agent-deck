@@ -8142,7 +8142,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 ##### scheduler/dispatch/023 — A human draft holds the inbox doorbell until Enter.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary, daemon-owned PTY and attach input stream.
 - **Agent:** none (the e2e stand-in profile's Python editor (selected by `DOT_AGENT_DECK_TEST_COMPOSER_PROFILE=standin` with `DOT_AGENT_DECK_TEST_COMPOSER_BINARY` naming the executable the pane runs); no agent executable or credential).
-- **Asserts:** while Queued work waits behind a draft the stand-in's composer shows, more human keystrokes reach the pane promptly; Enter submits the draft separately and releases one token-led doorbell, the capture being exactly the draft, its Enter, the line and its Enter. A companion case forwards terminal reports (mouse, focus, cursor-position, device-attribute, OSC and DCS replies) and checks they do not defer the doorbell: the capture is exactly the reports, then the line and its Enter. Ctrl+U/no-cap and identity cancellation are in `inbox/doorbell/008–010`.
+- **Asserts:** while Queued work waits behind a draft the stand-in's composer shows, more human keystrokes reach the pane promptly; Enter submits the draft as its own line. Since Q35-21 the box the user touched is held until a check reads it empty, and none can read this stand-in, so the capture stays exactly the draft and its Enter, the card's hold reads `cannot_type`, no doorbell line is typed, and the in-pane fetch (the prompt route) hands over the task. A companion case forwards terminal reports (mouse, focus, cursor-position, device-attribute, OSC and DCS replies) that the stand-in turned on no mode for: they touch the box (R3 §3.2), so the capture stays exactly the reports, the hold reads `cannot_type`, nothing is typed and the in-pane fetch hands over the task. Ctrl+U/no-cap and identity cancellation are in `inbox/doorbell/008–010`; a check that reads the box empty and then rings is `inbox/probe/024`.
 - **Does not assert:** producer routing from delegate (S5), a real agent editor, or model execution.
 - **Platform coverage:** mac+linux.
 
@@ -8275,10 +8275,10 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** ordering of the two tabs; tab titles.
 - **Platform coverage:** mac+linux.
 
-##### scheduler/reuse/003 — Fire a schedule into a reused pane holding a human draft. Posting occurs immediately, the doorbell waits for draft clearance, and the pane then fetches exactly one additional message without spawning another agent.
+##### scheduler/reuse/003 — Fire a schedule into a reused pane holding a human draft. Posting occurs immediately, nothing is typed into the touched box, and the pane then fetches exactly one additional message without spawning another agent.
 - **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** Fire a schedule into a reused pane holding a human draft. Posting occurs immediately, the doorbell waits for draft clearance, and the pane then fetches exactly one additional message without spawning another agent.
+- **Asserts:** Fire a schedule into a reused pane holding a human draft. Posting occurs immediately and nothing is typed while the draft is there. Since Q35-21 clearing it with Ctrl+U leaves a box no check can read (none can read this stand-in), so the card's hold reads `cannot_type`, nothing is typed after the clear, the message stays Queued, and the agent's own in-pane fetch (the stand-in's `.fetch-now`, a prompt's route) takes exactly one additional message without spawning another agent.
 - **Test:** `reuse_003_deliver_on_idle_debounce` in `tests/e2e_scheduler_reuse.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
@@ -8291,10 +8291,10 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the reuse DECISION that resolves the identity (`decide_reuse_spawns_fresh_when_the_pane_id_was_inherited_by_another_agent`, a pure unit test beside it, and `scheduler/reuse/001` / `/002` for the tab-count surface); the doorbell's draft guard (`scheduler/reuse/005`).
 - **Platform coverage:** mac+linux (the `/bin/cat` byte target is POSIX).
 
-##### scheduler/reuse/005 — Hold an unsent draft in a reused scheduled pane beyond the old debounce. The new prompt stays Queued in the inbox and no doorbell or prompt bytes are typed until Ctrl+U clears the draft.
+##### scheduler/reuse/005 — Hold an unsent draft in a reused scheduled pane beyond the old debounce. The new prompt stays Queued in the inbox and no doorbell or prompt bytes are typed into the touched box.
 - **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** Hold an unsent draft in a reused scheduled pane beyond the old debounce. The new prompt stays Queued in the inbox and no doorbell or prompt bytes are typed until Ctrl+U clears the draft.
+- **Asserts:** Hold an unsent draft in a reused scheduled pane beyond the old debounce. The new prompt stays Queued in the inbox and no doorbell or prompt bytes are typed. Since Q35-21, after Ctrl+U clears the draft the hold reads `cannot_type`, nothing is typed after the clear, and the agent's own in-pane fetch takes the prompt.
 - **Test:** `reuse_005_unsent_draft_outlives_idle_debounce` in `tests/e2e_scheduler_reuse.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
@@ -11717,7 +11717,7 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 ##### inbox/status/031 — Held orchestrators remain prominent across tabs and reconnects.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_status.rs`), attached real TUI and daemon.
 - **Agent:** profiled synthetic editor stand-ins; no real agent or credential.
-- **Asserts:** a worker report waits behind an orchestrator's possible draft while one other recipient is held; dashboard chrome names the orchestrator with the shared hold words and counts that other recipient, also on another tab. Each navigation waits for the destination's distinct recipient card before checking attention, including the reattached Dashboard. Attention survives a tab round-trip and a clean detach/reattach and clears when the drafts are cleared and the messages taken.
+- **Asserts:** a worker report waits behind an orchestrator's unsent draft (held as `cannot_type` since Q35-21: a touched box no check can read) while one other recipient is held; dashboard chrome names the orchestrator with the shared hold words and counts that other recipient, also on another tab. Each navigation waits for the destination's distinct recipient card before checking attention, including the reattached Dashboard. Attention survives a tab round-trip and a clean detach/reattach and clears when the drafts are cleared and the messages taken.
 - **Does not assert:** recovery controls, voice actions or persistence beyond the daemon's lifetime.
 - **Platform coverage:** Unix PTY.
 
