@@ -689,7 +689,7 @@ fn doorbell_053_an_assumed_head_echo_completes_only_that_codex_record() {
     );
 }
 
-/// Scenario: Ask the table about each release the deck carries a record for, as it ships. Claude Code 2.1.310 and 2.1.312 are Go, unstaged, with their editor probes absent, while 2.1.311 remains unmeasured; both Codex releases stage the line and are held as missing_measurement until their head echo is recorded; and every record has its parser cost verified.
+/// Scenario: Ask the table about each release the deck carries a record for, as it ships. Claude Code 2.1.310, 2.1.312 and 2.1.317 are Go, unstaged, with their editor probes absent, while 2.1.311 and 2.1.318 remain unmeasured; both Codex releases stage the line and are held as missing_measurement until their head echo is recorded; and every record has its parser cost verified.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_the_shipped_records_verdicts() {
@@ -702,7 +702,7 @@ fn doorbell_053_the_shipped_records_verdicts() {
         );
         let verdict = exact_verdict(record);
         match (&record.agent, record.release.to_string().as_str()) {
-            (AgentType::ClaudeCode, "2.1.310" | "2.1.312") => assert!(
+            (AgentType::ClaudeCode, "2.1.310" | "2.1.312" | "2.1.317") => assert!(
                 matches!(verdict, Activation::Go { staged: false, .. }),
                 "{verdict:?}"
             ),
@@ -713,7 +713,7 @@ fn doorbell_053_the_shipped_records_verdicts() {
             other => panic!("a record this test does not know: {other:?}"),
         }
     }
-    for release in ["2.1.310", "2.1.312"] {
+    for release in ["2.1.310", "2.1.312", "2.1.317"] {
         let record = RELEASE_RECORDS
             .iter()
             .find(|record| record.agent == CLAUDE && record.release == v(release))
@@ -728,10 +728,47 @@ fn doorbell_053_the_shipped_records_verdicts() {
             exact_verdict(record)
         );
     }
+    for release in ["2.1.311", "2.1.318"] {
+        assert_eq!(
+            verdict(&RELEASE_RECORDS, &CLAUDE, release),
+            Activation::NoGo(NoGo::UnmeasuredRelease)
+        );
+    }
+}
+
+/// Scenario: Read the editor record measured for Claude Code 2.1.317, the one activation sets on its record. It names Claude's export and editor selection, one paste-mode disable and one enable, the user's key-binding file as the only source, the bindings loaded at start, no inert candidate form, and the pasted BEL left absent; and giving it to 2.1.317's record makes that release armable once its root is bound, and changes the ring's verdict for no release.
+#[spec("inbox/doorbell/053")]
+#[test]
+fn doorbell_053_the_measured_2_1_317_editor_record() {
+    use dot_agent_deck::composer_probe::{Binding, Permission, permission};
+    use dot_agent_deck::doorbell_activation::CLAUDE_2_1_317_EDITOR_PROBE;
     assert_eq!(
-        verdict(&RELEASE_RECORDS, &CLAUDE, "2.1.311"),
-        Activation::NoGo(NoGo::UnmeasuredRelease)
+        CLAUDE_2_1_317_EDITOR_PROBE,
+        EditorProbe {
+            export: ExportShape::ClaudeTmpdir,
+            selection: EditorSelection::ClaudeCode,
+            paste_toggles: PasteToggles {
+                disables: 1,
+                enables: 1,
+            },
+            keymap_sources: &[KeymapSource::ClaudeKeybindings],
+            keymap_loaded_at_start: Measurement::Verified(()),
+            inert_candidates: &[],
+            pasted_bel_is_text: Measurement::Absent,
+        }
     );
+    let records = with_assumed_editor_probes(
+        RELEASE_RECORDS.to_vec(),
+        &[(CLAUDE, v("2.1.317"), CLAUDE_2_1_317_EDITOR_PROBE)],
+    );
+    let header = LatchedRelease::Known(v("2.1.317"));
+    assert_eq!(
+        permission(&records, &CLAUDE, Some(&header), Binding::Bound),
+        Permission::Armable
+    );
+    for (with, shipped) in records.iter().zip(RELEASE_RECORDS.iter()) {
+        assert_eq!(exact_verdict(with), exact_verdict(shipped));
+    }
 }
 
 /// A verified editor record, as a measurement of one release would give it.

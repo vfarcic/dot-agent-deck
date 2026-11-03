@@ -115,6 +115,7 @@ Plan §9.1's harness, `scanner_budget_measurement`, replayed every recorded laun
 | trace | added lock hold per push | scanner CPU per generation | outcome |
 | --- | --- | --- | --- |
 | 16 recorded launches at 50 × 200 and 80 × 300 (129 900 pushes) | p99 69 µs, max 501 µs | at most 5.0 ms | no limit reached (the fast tests below) |
+| 2026-11-03 rerun, every recorded launch with Claude Code 2.1.317's added, 50 × 200 and 80 × 300 (n = 345 360), on a contended machine (load average 10.65 on 16 CPUs at the start, from other work) | p99 213.9 µs, max 2980 µs; 2.1.317's own traces at most 1315.8 µs | at most 14.63 ms; 2.1.317's at most 10.95 ms | no limit reached (`tests/fixtures/claude-inbox/release-2.1.317/parser-cost-replay.txt`) |
 | a whole 256 KiB window of recorded launches, 50 × 200 and 80 × 300 | p99 43 µs, max 447 µs | at most 7.8 ms | no limit reached |
 | eight panes at once, 50 × 200 (31 116 pushes) | p99 88 µs, max 963 µs | — | no limit reached |
 | evidence parser, every recorded launch | p99 349 µs, max 484 µs | — | no limit reached |
