@@ -254,9 +254,11 @@ slow-timeout = { period = "60s", terminate-after = 6 }
 # Eighteen sequential menu recordings (two pinned releases; three dark sizes,
 # indexed light and five 50x200 palettes) took about 160s for the eight
 # size/theme recordings and 210s for the ten palette recordings, run apart.
+# A third release (2.1.317, 2026-11-03) makes twenty-seven, about 560s at
+# that rate, so the window is 900s.
 [[profile.default.overrides]]
 filter = 'test(doorbell_036_live_release_menu_frames)'
-slow-timeout = { period = "60s", terminate-after = 10 }
+slow-timeout = { period = "60s", terminate-after = 15 }
 
 # PRD #1631: `codex/hooks/001` drives one real interactive Codex turn, behind
 # `check_codex_available`'s preflight. In that PRD's lane-2 run, on a box with
@@ -786,3 +788,22 @@ slow-timeout = { period = "60s", terminate-after = 6 }
 [[profile.default.overrides]]
 filter = 'test(probe_083_claude_idle_screen_freshness_refusal_rate)'
 slow-timeout = { period = "60s", terminate-after = 14 }
+
+# PRD #1666 part 3, activation: the editor-probe measurements of a pinned
+# Claude Code release (`tests/e2e_claude_editor_measure.rs`, lane 2). The
+# ten-minute keymap sample and the wire-form catalog (six states, twelve
+# forms, whole and split, plus paste cells) are the long ones; the rest
+# launch Claude a few times each.
+[[profile.default.overrides]]
+filter = 'test(/^probe_088_live_claude_317_/)'
+slow-timeout = { period = "60s", terminate-after = 16 }
+
+[[profile.default.overrides]]
+filter = 'test(probe_089_live_claude_317_ctrl_g_forms)'
+slow-timeout = { period = "60s", terminate-after = 28 }
+
+# M59 (`tests/e2e_claude_helper_alarm.rs`, lane 2): ten Ctrl+G trials per
+# cell on a real Claude Code, the unarmed cell's editor sleeping 8 s each.
+[[profile.default.overrides]]
+filter = 'test(/^probe_090_live_claude_317_/)'
+slow-timeout = { period = "60s", terminate-after = 9 }

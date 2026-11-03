@@ -1,0 +1,69 @@
+{
+ "release": "2.1.317",
+ "sha256": "eb224419e344575faa4a1f39b290b649425a10cd5ee2ef1d003480cd9ae57eb0",
+ "source_capture": "/var/tmp/dad-claude-editor-measure-YJ0nYA/capture",
+ "recorder_sha256": "eb742c62971ab2b67fdca0807329b09189bc078953554e33c19bffe548c8bc8d",
+ "error": null,
+ "rows": [
+  {
+   "cell": "keymap-start",
+   "trial": 0,
+   "first_composer_t": 3439278522600873,
+   "ms_from_spawn_to_first_composer": 1361.29563,
+   "ctrlg": {
+    "opened": false
+   },
+   "ctrle": {
+    "opened": true
+   }
+  },
+  {
+   "cell": "keymap-start",
+   "trial": 1,
+   "first_composer_t": 3439283588493695,
+   "ms_from_spawn_to_first_composer": 1254.370001,
+   "ctrlg": {
+    "opened": false
+   },
+   "ctrle": {
+    "opened": true
+   }
+  },
+  {
+   "cell": "keymap-start",
+   "trial": 2,
+   "first_composer_t": 3439288134257567,
+   "ms_from_spawn_to_first_composer": 1135.064657,
+   "ctrlg": {
+    "opened": false
+   },
+   "ctrle": {
+    "opened": true
+   }
+  },
+  {
+   "cell": "keymap-start",
+   "trial": 3,
+   "first_composer_t": 3439292726409428,
+   "ms_from_spawn_to_first_composer": 1129.195031,
+   "ctrlg": {
+    "opened": false
+   },
+   "ctrle": {
+    "opened": true
+   }
+  },
+  {
+   "cell": "keymap-start",
+   "trial": 4,
+   "first_composer_t": 3439297192171295,
+   "ms_from_spawn_to_first_composer": 1122.552661,
+   "ctrlg": {
+    "opened": false
+   },
+   "ctrle": {
+    "opened": true
+   }
+  }
+ ]
+}

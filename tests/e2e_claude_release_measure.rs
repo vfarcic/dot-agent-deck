@@ -15,6 +15,8 @@ use std::time::Duration;
 
 struct Capture {
     root: PathBuf,
+    /// The release the recorder read from the pinned executable.
+    release: String,
     index: Value,
     result: Value,
     bytes: Vec<u8>,
@@ -67,7 +69,7 @@ impl Capture {
             offset = end;
         }
         assert!(
-            matches!(scanner.latch(), ScanLatch::Latched { agent: AgentType::ClaudeCode, release, .. } if release.to_string() == "2.1.312"),
+            matches!(scanner.latch(), ScanLatch::Latched { agent: AgentType::ClaudeCode, release, .. } if release.to_string() == self.release),
             "{:?}; {}",
             scanner.latch(),
             self.root.display()
@@ -229,10 +231,6 @@ impl Capture {
     }
 }
 
-fn measure(kind: &str, rows: u16, cols: u16) -> Capture {
-    measure_with_path(kind, rows, cols, None)
-}
-
 fn measure_with_path(kind: &str, rows: u16, cols: u16, path: Option<&str>) -> Capture {
     let root = tempfile::Builder::new()
         .prefix("dad-claude-2312-measure-")
@@ -291,6 +289,7 @@ fn measure_with_path(kind: &str, rows: u16, cols: u16, path: Option<&str>) -> Ca
         output.display()
     );
     let capture = Capture {
+        release: result["release"].as_str().unwrap().to_string(),
         index: read_json("index.json"),
         result,
         bytes: std::fs::read(output.join("trace.bin")).unwrap(),
@@ -328,27 +327,20 @@ fn assert_empty_menu_composer(capture: &Capture) {
     assert_eq!(screen.cursor_position(), (prompt, 2));
 }
 
-/// Scenario: Open the slash menu, file menu, shell mode, exit warning and background overview in isolated real Claude Code 2.1.310 and 2.1.312 composers at 24×80, 40×120 and 50×200 in the indexed dark theme, at 50×200 in the indexed light theme, and at 50×200 in truecolor dark/light and indexed dark-ansi/light-ansi/dark-daltonized themes. Capture their raw bytes and rendered frames, including a normal composer with warning phrases quoted in a real user transcript echo whose submission is blocked before a model turn.
+/// Scenario: Open the slash menu, file menu, shell mode, exit warning and background overview in isolated real Claude Code 2.1.310, 2.1.312 and 2.1.317 composers at 24×80, 40×120 and 50×200 in the indexed dark theme, at 50×200 in the indexed light theme, and at 50×200 in truecolor dark/light and indexed dark-ansi/light-ansi/dark-daltonized themes. Capture their raw bytes and rendered frames, including a normal composer with warning phrases quoted in a real user transcript echo whose submission is blocked before a model turn.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_live_release_menu_frames() {
     use vt100::Color::{self, Idx, Rgb};
 
     skip_unless!(common::check_claude_available());
-    for release in ["2.1.310", "2.1.312"] {
-        let key = format!("DOT_AGENT_DECK_CLAUDE_MENU_{}", release.replace('.', "_"));
-        let binary =
-            std::env::var(&key).unwrap_or_else(|_| panic!("set {key} to the pinned executable"));
-        let root = tempfile::Builder::new()
-            .prefix("dad-claude-menu-bin-")
-            .tempdir_in("/var/tmp")
-            .unwrap();
-        std::os::unix::fs::symlink(&binary, root.path().join("claude")).unwrap();
-        let path = format!(
-            "{}:{}",
-            root.path().display(),
-            std::env::var("PATH").unwrap()
-        );
+    for release in ["2.1.310", "2.1.312", "2.1.317"] {
+        let (_root, path) = pinned_path(release).unwrap_or_else(|| {
+            panic!(
+                "set DOT_AGENT_DECK_CLAUDE_MENU_{} to the pinned executable",
+                release.replace('.', "_")
+            )
+        });
         // Measured foregrounds: the main composer's upper rule, the shell
         // glyph and the overview's own prompt glyph.
         let indexed_dark = (Idx(244), Idx(211), Idx(246));
@@ -520,7 +512,36 @@ fn doorbell_036_live_release_menu_frames() {
     }
 }
 
-fn preflight() {
+/// A private executable search path whose `claude` is the pinned executable
+/// `DOT_AGENT_DECK_CLAUDE_MENU_<release>` names, outside the checkout. The
+/// directory lives as long as the returned guard.
+fn pinned_path(release: &str) -> Option<(tempfile::TempDir, String)> {
+    let key = format!("DOT_AGENT_DECK_CLAUDE_MENU_{}", release.replace('.', "_"));
+    let binary = std::env::var(&key).ok()?;
+    let root = tempfile::Builder::new()
+        .prefix("dad-claude-menu-bin-")
+        .tempdir_in("/var/tmp")
+        .unwrap();
+    std::os::unix::fs::symlink(&binary, root.path().join("claude")).unwrap();
+    let path = format!(
+        "{}:{}",
+        root.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    Some((root, path))
+}
+
+/// The search path a release's measurement runs under: the pinned executable
+/// when its variable is set, else the host's `claude`, whose version
+/// [`preflight`] then checks.
+fn release_path(release: &str) -> (Option<tempfile::TempDir>, Option<String>) {
+    match pinned_path(release) {
+        Some((root, path)) => (Some(root), Some(path)),
+        None => (None, None),
+    }
+}
+
+fn preflight(release: &str, path: Option<&str>) {
     let python = std::process::Command::new("python3")
         .args(["-c", "import pyte"])
         .output()
@@ -529,21 +550,25 @@ fn preflight() {
         python.status.success(),
         "the measurement controller requires Python pyte"
     );
-    let version = std::process::Command::new("claude")
-        .arg("--version")
-        .output()
-        .unwrap();
+    let mut command = std::process::Command::new("claude");
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    let version = command.arg("--version").output().unwrap();
     assert!(version.status.success());
     assert!(
-        String::from_utf8_lossy(&version.stdout).starts_with("2.1.312 "),
-        "this measurement requires the pinned Claude Code 2.1.312 executable"
+        String::from_utf8_lossy(&version.stdout).starts_with(&format!("{release} ")),
+        "this measurement requires the pinned Claude Code {release} executable: set \
+         DOT_AGENT_DECK_CLAUDE_MENU_{} or put it first on PATH",
+        release.replace('.', "_")
     );
 }
 
-fn startups(count: usize) {
-    preflight();
+fn startups(release: &str, count: usize) {
+    let (_root, path) = release_path(release);
+    preflight(release, path.as_deref());
     for _ in 0..count {
-        let capture = measure("startup", 50, 200);
+        let capture = measure_with_path("startup", 50, 200, path.as_deref());
         capture.verify_start();
         assert!(CLAUDE_PROFILE.empty_and_ready(&capture.grid("end")));
         for sample in 0..200 {
@@ -554,12 +579,18 @@ fn startups(count: usize) {
     }
 }
 
+fn composer(release: &str, rows: u16, cols: u16) {
+    let (_root, path) = release_path(release);
+    preflight(release, path.as_deref());
+    measure_with_path("composer", rows, cols, path.as_deref()).verify_composer();
+}
+
 /// Scenario: Launch four isolated real Haiku composers on pinned Claude Code 2.1.312, leaving each idle for twenty seconds. Each must retain the measured ready composer, raw input mode and recognisable release header without a post-ready dialog.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_live_release_startup_first_four() {
     skip_unless!(common::check_claude_available());
-    startups(4);
+    startups("2.1.312", 4);
 }
 
 /// Scenario: Launch three further isolated real Haiku composers on pinned Claude Code 2.1.312 and observe each for twenty seconds. The recorded profile must still read the ready composer and release.
@@ -567,7 +598,7 @@ fn doorbell_036_live_release_startup_first_four() {
 #[test]
 fn doorbell_036_live_release_startup_next_three() {
     skip_unless!(common::check_claude_available());
-    startups(3);
+    startups("2.1.312", 3);
 }
 
 /// Scenario: Launch the last three of ten isolated real Haiku composers on pinned Claude Code 2.1.312 and observe each for twenty seconds. The recorded profile must still read the ready composer and release.
@@ -575,7 +606,7 @@ fn doorbell_036_live_release_startup_next_three() {
 #[test]
 fn doorbell_036_live_release_startup_last_three() {
     skip_unless!(common::check_claude_available());
-    startups(3);
+    startups("2.1.312", 3);
 }
 
 /// Scenario: Type and submit fifteen token-led doorbell lines into real Haiku at 24 by 80, blocking every submission before a model turn. Replay the raw capture to verify exact composer and hook echoes, transcript user echoes, and the blank composer after clears and deletes.
@@ -583,8 +614,7 @@ fn doorbell_036_live_release_startup_last_three() {
 #[test]
 fn doorbell_036_live_release_small_composer() {
     skip_unless!(common::check_claude_available());
-    preflight();
-    measure("composer", 24, 80).verify_composer();
+    composer("2.1.312", 24, 80);
 }
 
 /// Scenario: Type and submit fifteen token-led doorbell lines into real Haiku at 50 by 200 with model turns blocked, then delete three lines, resize ten times and nudge ten times. Replay the capture to verify the same composer and hook premises, full redraw markers and width witnesses.
@@ -592,8 +622,47 @@ fn doorbell_036_live_release_small_composer() {
 #[test]
 fn doorbell_036_live_release_large_composer_and_layout() {
     skip_unless!(common::check_claude_available());
-    preflight();
-    measure("composer", 50, 200).verify_composer();
+    composer("2.1.312", 50, 200);
+}
+
+/// Scenario: Launch four isolated real Haiku composers on pinned Claude Code 2.1.317, the release installed on 2026-11-03, leaving each idle for twenty seconds. Each must show the measured ready composer, raw input mode and its own release header, with no dialog after it is ready.
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_live_release_317_startup_first_four() {
+    skip_unless!(common::check_claude_available());
+    startups("2.1.317", 4);
+}
+
+/// Scenario: Launch three further isolated real Haiku composers on pinned Claude Code 2.1.317 and observe each for twenty seconds. The recorded profile must still read the ready composer and release.
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_live_release_317_startup_next_three() {
+    skip_unless!(common::check_claude_available());
+    startups("2.1.317", 3);
+}
+
+/// Scenario: Launch the last three of ten isolated real Haiku composers on pinned Claude Code 2.1.317 and observe each for twenty seconds. The recorded profile must still read the ready composer and release.
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_live_release_317_startup_last_three() {
+    skip_unless!(common::check_claude_available());
+    startups("2.1.317", 3);
+}
+
+/// Scenario: Type and submit fifteen token-led doorbell lines into real Haiku on pinned Claude Code 2.1.317 at 24 by 80, blocking every submission before a model turn. Replay the raw capture to verify exact composer and hook echoes, transcript user echoes, and the blank composer after clears and deletes.
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_live_release_317_small_composer() {
+    skip_unless!(common::check_claude_available());
+    composer("2.1.317", 24, 80);
+}
+
+/// Scenario: Type and submit fifteen token-led doorbell lines into real Haiku on pinned Claude Code 2.1.317 at 50 by 200 with model turns blocked, then delete three lines, resize ten times and nudge ten times. Replay the capture to verify the same composer and hook premises, full redraw markers and width witnesses.
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_live_release_317_large_composer_and_layout() {
+    skip_unless!(common::check_claude_available());
+    composer("2.1.317", 50, 200);
 }
 
 /// Scenario: Type the nineteen Q32 compound-key sequences into real Haiku on pinned Claude Code 2.1.312, revealing retained text with harmless markers instead of submitting it. The reviewer's sequence must retain two spaces, Enter after non-ASCII deletion must preserve the two-space draft, and three spaces must remain after Left three times.
@@ -601,8 +670,21 @@ fn doorbell_036_live_release_large_composer_and_layout() {
 #[test]
 fn doorbell_036_live_release_compound_keys() {
     skip_unless!(common::check_claude_available());
-    preflight();
-    let capture = measure("keys", 50, 200);
+    compound_keys("2.1.312");
+}
+
+/// Scenario: Type the nineteen Q32 compound-key sequences into real Haiku on pinned Claude Code 2.1.317, revealing retained text with harmless markers instead of submitting it. Every sequence must leave the composer 2.1.312 left, including two spaces after the reviewer's sequence, the two-space draft after Enter following a non-ASCII deletion, and three spaces after Left three times.
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_live_release_317_compound_keys() {
+    skip_unless!(common::check_claude_available());
+    compound_keys("2.1.317");
+}
+
+fn compound_keys(release: &str) {
+    let (_root, path) = release_path(release);
+    preflight(release, path.as_deref());
+    let capture = measure_with_path("keys", 50, 200, path.as_deref());
     capture.verify_start();
     let expected = [
         "X  Z|",

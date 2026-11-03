@@ -23,10 +23,14 @@ import sys
 import termios
 import time
 
-SHA = '4f4178ce41d83e23341ebfbaecdbcf8ea6bf7baea0690025abe49eeec3a5d01d'
+# Each measured release's executable, by SHA-256. A run measures whichever
+# pinned release `claude` resolves to, and refuses any other executable.
 PINS = {
     '2.1.310': 'b73676430af12f97316a798b8371f81d640f90a58bdcb8f3ce56a835bb47df56',
-    '2.1.312': SHA,
+    '2.1.312': '4f4178ce41d83e23341ebfbaecdbcf8ea6bf7baea0690025abe49eeec3a5d01d',
+    # Official @anthropic-ai/claude-code-linux-x64@2.1.317 (tarball sha512
+    # u19fYJ4l...XBlSA==), byte-identical to the installed 2.1.317.
+    '2.1.317': 'eb224419e344575faa4a1f39b290b649425a10cd5ee2ef1d003480cd9ae57eb0',
 }
 H, E, L, R, BS, D, K = '\x1b[H', '\x1b[F', '\x1b[D', '\x1b[C', '\x7f', '\x1b[3~', '\x15'
 CASES = [
@@ -67,7 +71,7 @@ class Recorder:
         self.reads, self.points, self.edges, self.events, self.modes = [], {}, [], [], []
         self.screen = pyte.Screen(cols, rows)
         self.stream = pyte.ByteStream(self.screen)
-        self.lines, self.keys = [], []
+        self.lines, self.keys, self.restores = [], [], []
         self.frames = {}
         self.fd = None
 
@@ -257,6 +261,16 @@ class Recorder:
             self.send('\r')
             self.wait(lambda: (self.out / 'hook.jsonl').exists()
                       and len((self.out / 'hook.jsonl').read_text().splitlines()) == i)
+            hooked = time.monotonic_ns()
+            # The blocked prompt comes back into the composer. On 2.1.317 it
+            # once came back more than 0.5 s after the hook, so a clear sent
+            # before it left the line in the box: wait for it, bounded.
+            try:
+                self.wait(lambda: 'inboxfetch' in ''.join(self.composer().split()), 5)
+                self.points[f'restored-{i:02}'] = len(self.raw)
+                self.restores.append({'trial': i, 'ms_after_hook': (time.monotonic_ns() - hooked) / 1e6})
+            except RuntimeError:
+                self.restores.append({'trial': i, 'ms_after_hook': None})
             self.pump(.5)
             self.snap(f'after-{i:02}')
             self.send(K * 4)
@@ -292,7 +306,8 @@ class Recorder:
         result = {'sha256': self.sha256, 'release': self.release, 'pid': pid, 'error': error, 'reads': self.reads,
                   'executable': self.executable, 'model': 'haiku',
                   'theme': self.theme, 'term': 'xterm-256color', 'colorterm': self.colorterm,
-                  'events': self.events, 'modes': self.modes, 'keys': self.keys}
+                  'events': self.events, 'modes': self.modes, 'keys': self.keys,
+                  'restores': self.restores}
         (self.out / 'result.json').write_text(json.dumps(result, indent=2))
         (self.out / 'frames.json').write_text(json.dumps(self.frames, indent=2, ensure_ascii=False))
 
@@ -310,9 +325,9 @@ def main():
     assert Path(os.environ['DOT_AGENT_DECK_ATTACH_SOCKET']).parent == home.parent, 'requires private endpoint'
     binary = Path(shutil.which('claude')).resolve(strict=True)
     digest = hashlib.sha256(binary.read_bytes()).hexdigest()
-    assert digest in (PINS.values() if kind.startswith('menus') else [SHA]), 'executable pin changed'
+    assert digest in PINS.values(), 'executable pin changed'
     release = subprocess.check_output([str(binary), '--version'], text=True).split()[0]
-    expected = PINS[release] if kind.startswith('menus') else SHA
+    expected = PINS[release]
     assert digest == expected, 'executable pin changed'
     recorder = Recorder(out, rows, cols)
     recorder.executable = str(binary)

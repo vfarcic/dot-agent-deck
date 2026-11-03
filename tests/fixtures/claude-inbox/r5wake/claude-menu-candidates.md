@@ -52,3 +52,33 @@ The slash menu's description and the overview's footer wrap or truncate at narro
 The live acquisition test now records all four size/theme combinations per release, including the original 50×200 dark control. The existing fast replay test covers the original fixtures plus these six candidates and reports every wrong readiness verdict, distinguishing wrong acceptance (safety) from wrong refusal (availability). Fixture identities and expected readiness remain independent of the current recogniser's verdict.
 
 Against recogniser `6de2f810`, all thirty new negative screens are refused and both releases pass all seven light-theme checks. Both narrow empty-start controls also pass. The four narrow `transcript-quotation` positives are wrongly refused (`ready=false`, `empty_and_ready=false`, expected true): two releases × 24×80 and 40×120. These visibly blank main composers have a right-aligned quota notice starting at column 16 of 80 or column 56 of 120 immediately above the upper rule, inside the recogniser's left-half suggestion region. The 50×200 controls put the notice beyond the midpoint and remain ready. The replay is intentionally RED for these availability failures; no wrong acceptance was observed in the captured set, and no claim about uncaptured colours or layouts follows.
+
+
+## Claude Code 2.1.317
+
+Recorded on 2026-11-03 through the same local lane-2 harness and recorder, with the executable pinned by SHA-256 `eb224419e344575faa4a1f39b290b649425a10cd5ee2ef1d003480cd9ae57eb0`. That executable is the official npm package `@anthropic-ai/claude-code-linux-x64@2.1.317` (tarball integrity `sha512-u19fYJ4llqi+dAGAj6P1BNu/CRSe0rv4O8Mv/5SQPU5oXCYmUssbJgrBI6rWbIFRAE3YcLCzKlwdHbzlSXBlSA==`), byte-identical to the copy the host's installer put in `~/.local/share/claude/versions/2.1.317`. It was copied to private scratch space outside the checkout and exposed through a private `claude` symlink. Every submission was blocked by the private hook before a model turn.
+
+The menu sets are the same seven named screens as the other releases'. The run that recorded them also re-recorded 2.1.310 and 2.1.312 and passed for all three; the committed 2.1.310 and 2.1.312 fixtures were not replaced. In every set, 2.1.317 draws the main rule, shell glyph and overview glyph in the same foregrounds as 2.1.310 and 2.1.312, with the same structural premise (a coloured main rule over a default-colour `❯`, the reverse in the overview).
+
+| Set | Theme | COLORTERM | Bytes | Trace SHA-256 | Source run under `/var/tmp/` |
+| --- | --- | --- | ---: | --- | --- |
+| 24x80 | dark | none | 14994 | `b4a0beeea0c8a19fc6b01a16fd39a7e276027d15e25307f163dc07aec5bd6041` | `dad-claude-2312-measure-eC2mb3/capture` |
+| 40x120 | dark | none | 16937 | `3f24e53c9e532dc63b39d999b67077dd93ae64be25552aedb07baab25a36a245` | `dad-claude-2312-measure-VNXkh4/capture` |
+| 50x200 | dark | none | 17601 | `ae7bb7a8f1f8701fe8b9cb8424c0a93419c88f10438243077105541267e6ae85` | `dad-claude-2312-measure-xNk7Xe/capture` |
+| light-50x200 | light | none | 17715 | `e81d04bc51df0486a083623946ecc156f9c93a1c39847ca5fd84bde2c48e547a` | `dad-claude-2312-measure-5zDrPd/capture` |
+| truecolor-dark-50x200 | dark | truecolor | 18305 | `35c9434b579329a52859c3e879dad187e84996d226485e73f3e952b836caa565` | `dad-claude-2312-measure-sqidBt/capture` |
+| truecolor-light-50x200 | light | truecolor | 18237 | `286defbcdbdb51802f6f5e5f23d285cf4298362a0d097145332a26988b0f6a41` | `dad-claude-2312-measure-RQoe8c/capture` |
+| dark-ansi-50x200 | dark-ansi | none | 17658 | `52588f87dea6b9a06ddd211fd27bdc20433cad90c5b7a140d651879cba16dac5` | `dad-claude-2312-measure-ZgouhY/capture` |
+| light-ansi-50x200 | light-ansi | none | 17091 | `83224e37dc90b369c46aa0b16c055b62066183270c69d174bf1fd7930a958891` | `dad-claude-2312-measure-IyxcMv/capture` |
+| dark-daltonized-50x200 | dark-daltonized | none | 17847 | `2e0e8e0eae10f705901378a8239d7ee9fccaa8b03e2e6a78df9078f01e36dabf` | `dad-claude-2312-measure-9m4KM7/capture` |
+
+The start-up, composer, layout and compound-key captures are committed as the recorder wrote them (index plus raw bytes), like the other releases'. `compound-keys` carries an added `end` point at the trace's length, as 2.1.312's does.
+
+| Fixture | Bytes | Trace SHA-256 |
+| --- | ---: | --- |
+| start-50x200 | 1966 | `e894828c10ee025d2836f62803402bbaeff984d13b44d65a6b5ec53342f966f4` |
+| composer-24x80 | 88233 | `d24c44d80745fc75f207e837769b91cf9af87a885a68c3461f4f8dc539442263` |
+| layout-50x200 | 138500 | `8a24ec2b642094ec39da9e1b3941fe4704d689962097ed5a96b6b3ac102a0d5c` |
+| compound-keys-50x200 | 44390 | `b826c11beca83c8fde680283150b75f9529cd25bdc70b34ad3c3850557d3f28e` |
+
+One difference from 2.1.312 was seen while recording. After the hook blocks a submission, Claude Code puts the prompt back in the composer. In one 50×200 composer run on 2.1.317 it came back more than 0.5 s after the hook, after the recorder had already cleared the box, so the "cleared" frame still held the line. The recorder now waits up to 5 s for the prompt to come back before clearing, and records the wait. Over the reruns, the wait was at most 302 ms at 50×200 and 34 ms at 24×80 on 2.1.317, against 313 ms and 33 ms on 2.1.312, so the late case has not been seen again.

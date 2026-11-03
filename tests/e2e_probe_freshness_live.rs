@@ -11,7 +11,8 @@
 //! only freshness can have taken it away. A refusal when scheduled has no
 //! `Admission(` wrapper and is counted apart.
 //!
-//! The test runs Claude Code 2.1.312, a recorded release, in the harness'
+//! The test runs a recorded Claude Code release (2.1.312 unless
+//! `DAD_PROBE_FRESHNESS_RELEASE` names another), in the harness'
 //! own HOME, never the host's config, under the `e2e` build's editor-probe assumption,
 //! and asks for probes through `e2e-composer-control`'s `probe-request`, the
 //! live tick's own scheduling, writer and arm path. Nothing is submitted, so
@@ -34,6 +35,9 @@
 //! `wrap` never becomes armable in the `e2e` build (its permission stays
 //! `Pending`), while the native stand-in does; real Codex binding is Q35-22's.
 //!
+//! The executable is `DAD_PROBE_FRESHNESS_BINARY` when set, else the host's
+//! `~/.local/share/claude/versions/<release>`.
+//!
 //! `DAD_PROBE_FRESHNESS_OUT` names a file the summary is appended to as one
 //! JSON line; the summary is printed either way.
 
@@ -50,8 +54,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const PANE: &str = "probe-freshness";
-/// The recorded releases the `e2e` build may treat as probe-capable.
-const ASSUMED: &str = "claude@2.1.312";
+/// The release measured when `DAD_PROBE_FRESHNESS_RELEASE` names none. The
+/// `e2e` build treats it as probe-capable, which it accepts only for a
+/// release with a record of its own.
+const DEFAULT_RELEASE: &str = "2.1.312";
+
+fn release() -> String {
+    std::env::var("DAD_PROBE_FRESHNESS_RELEASE").unwrap_or_else(|_| DEFAULT_RELEASE.to_string())
+}
 /// The `scheduled` barrier's root, one component under the deck's HOME.
 const GATE: &str = "probe-gate";
 const BUDGET: Duration = Duration::from_secs(120);
@@ -68,13 +78,19 @@ const CONTROL_MS: u64 = 1000;
 /// The output quiet that counts as the agent idle again after a probe.
 const QUIET: Duration = Duration::from_millis(750);
 
-/// The pinned Claude Code release, from the host's own versions directory.
+/// The pinned Claude Code release: `DAD_PROBE_FRESHNESS_BINARY`, else the
+/// host's own versions directory.
 fn claude_release_binary() -> Result<PathBuf, String> {
-    let home = std::env::var_os("HOME").ok_or("no HOME")?;
-    let path = Path::new(&home).join(".local/share/claude/versions/2.1.312");
+    let release = release();
+    let path = match std::env::var_os("DAD_PROBE_FRESHNESS_BINARY") {
+        Some(path) => PathBuf::from(path),
+        None => Path::new(&std::env::var_os("HOME").ok_or("no HOME")?)
+            .join(".local/share/claude/versions")
+            .join(&release),
+    };
     path.is_file()
         .then_some(path)
-        .ok_or_else(|| "Claude Code 2.1.312 is not in ~/.local/share/claude/versions".into())
+        .ok_or_else(|| format!("Claude Code {release} is not at the pinned path"))
 }
 
 /// One attach request with a bound wide enough for a widened probe.
@@ -494,7 +510,7 @@ fn measure(run: Run) {
         conditions.push(tally);
     }
     let summary = json!({
-        "agent": run.kind, "release": "2.1.312",
+        "agent": run.kind, "release": release(),
         "idle": idle,
         "between_probes": cadence(&gaps_before, gap_time),
         "conditions": conditions.iter().map(Tally::summary).collect::<Vec<_>>(),
@@ -534,7 +550,10 @@ fn measure(run: Run) {
 fn deck() -> common::TuiDeckBuilder {
     common::TuiDeck::builder()
         .with_pty_size(180, 50)
-        .with_env("DOT_AGENT_DECK_E2E_ASSUME_EDITOR_PROBE", ASSUMED)
+        .with_env(
+            "DOT_AGENT_DECK_E2E_ASSUME_EDITOR_PROBE",
+            format!("claude@{}", release()),
+        )
         .with_env("DOT_AGENT_DECK_E2E_PROBE_GATE", GATE)
         .with_env("DOT_AGENT_DECK_LOG", "probe-freshness.log")
         .with_env("RUST_LOG", "info,composer_probe=debug")
@@ -568,8 +587,11 @@ fn probe_083_claude_idle_screen_freshness_refusal_rate() {
     );
     let run = Run::start("claude", deck, command);
     assert!(
-        common::wait_until(BUDGET, || run.screen().contains("Claude Code v2.1.312")),
-        "Claude Code 2.1.312 must start; {}",
+        common::wait_until(BUDGET, || run
+            .screen()
+            .contains(&format!("Claude Code v{}", release()))),
+        "Claude Code {} must start; {}",
+        release(),
         run.screen()
     );
     measure(run);
