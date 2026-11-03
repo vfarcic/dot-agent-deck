@@ -529,28 +529,6 @@ fn codex_027_a_doorbell_shaped_line_the_deck_did_not_type_gets_no_byte() {
     assert_ne!(head(&again), head(&line), "a fresh token");
 }
 
-/// Scenario: Measured Codex 0.164.0 keeps its draft on Enter (its paste-burst Enter). The user types a draft and presses Enter, the draft stays in the composer, and a task is queued: the deck adds no byte, since pressing Enter does not prove the composer emptied. Once the user clears the composer, the doorbell rings and the task is delivered.
-#[spec("inbox/codex/027")]
-#[test]
-fn codex_027_a_draft_kept_on_enter_holds_the_doorbell() {
-    let deck = Deck::new();
-    let codex = deck.codex("codex-027-keep", MEASURED, Some("codex"), &[(".keep", "")]);
-    deck.latched(&codex, MEASURED);
-    deck.idle(&codex);
-    let mut user = common::AttachInput::attach(&deck.daemon.attach_socket, &codex.pane.agent);
-    user.write(&format!("{DRAFT}\r"));
-    assert!(common::wait_until(WAIT, || codex.typed() == format!("{DRAFT}\r")));
-    let id = enqueue(&deck.daemon, &codex.pane, BODY);
-    unchanged(&codex.pane, MEASURED_SETTLE + Duration::from_secs(3));
-    assert_eq!(codex.typed(), format!("{DRAFT}\r"));
-    state(&deck.daemon, &codex.pane, &id, "queued");
-
-    codex.clear(".keep");
-    user.write("\x15");
-    let line = delivered(&deck, &codex, &id);
-    assert_eq!(codex.typed(), format!("{DRAFT}\r\x15{line}\r"));
-}
-
 /// Scenario: Start the scripted Codex screen with no agent type, under a command the deck does not recognise, drawing measured release 0.164.0's header; its own hooks then report it as Codex and it redraws. The deck takes the type from its hooks and the release from its header, and rings it: an absent spawn type is no reason to hold it.
 #[spec("inbox/codex/027")]
 #[test]

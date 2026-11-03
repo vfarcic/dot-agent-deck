@@ -196,9 +196,10 @@ pub struct Facts {
     /// ring by the session's own rules (plan §1 of PRD #1666 S5).
     pub idle: bool,
     /// Something holds the ring this tick whatever the schedule: a paste is
-    /// open, the deck may not type into the generation, its first ring is
-    /// settling, its doorbell is suspended, or the agent did not take the
-    /// deck's last Enter in this episode.
+    /// open, the deck may not type into the generation, its box is touched
+    /// and no check can read it, its first ring is settling, its doorbell is
+    /// suspended, or the agent did not take the deck's last Enter in this
+    /// episode.
     pub held: bool,
 }
 
@@ -324,11 +325,32 @@ pub(crate) fn ring_admission_check(
                     .zip(now)
                     .is_some_and(|(decided, now)| decided.still_holds(&now))
                 {
+                    debug!(
+                        target: "doorbell",
+                        pane_id = %pane,
+                        agent_id = %agent,
+                        decided = ?admission,
+                        ?now,
+                        "doorbell still admitted? no: the pane's admission moved"
+                    );
                     return false;
                 }
                 if let Some(facts) = registry.inbox().try_doorbell_facts(&pane, &agent) {
-                    return facts.queued.contains(&selected)
-                        && ring_still_admitted(&facts, &config, Instant::now());
+                    let queued = facts.queued.contains(&selected);
+                    let still = ring_still_admitted(&facts, &config, Instant::now());
+                    if !(queued && still) {
+                        debug!(
+                        target: "doorbell",
+                            pane_id = %pane,
+                            agent_id = %agent,
+                            queued,
+                            blocked = facts.blocked,
+                            armed = facts.armed,
+                            native_announced = facts.native_announced_at.is_some(),
+                            "doorbell still admitted? no: the inbox's facts"
+                        );
+                    }
+                    return queued && still;
                 }
                 tokio::time::sleep(crate::doorbell_txn::SEAM_RETRY).await;
             }
@@ -427,8 +449,14 @@ pub struct HoldFacts {
     pub waiting_for_input: bool,
     /// A paste into the pane has not finished.
     pub paste_open: bool,
-    /// The user may have an unsent draft in the pane.
+    /// PRD #1666 part 3 (Q35-21): the pane's box is touched and the deck
+    /// checks it: a check is on its way, or the last one read it non-empty.
     pub draft: bool,
+    /// PRD #1666 part 3 (Q35-21): the pane's box is touched and the deck
+    /// can't check it now, with the reason that says what still delivers
+    /// the message (`cannot_type`, `needs_fetch`) or that no check can run
+    /// (`cannot_check`).
+    pub unchecked: Option<crate::inbox_display::WakeHold>,
     /// The deck may not type into the generation: its activation, its
     /// input-mode evidence, its spent attempt numbers or a missing submit
     /// route says no, with this clause.
@@ -458,9 +486,10 @@ pub enum HoldClock {
 /// episode's clock. The first row that holds wins: nothing queued; a native
 /// component armed or due, or an integration notice on the card; the agent
 /// working; the first ring settling; the agent waiting for input
-/// (`awaiting_prompt`); an open paste (`paste_open`); an unsent draft
-/// (`possible_draft`); a generation the deck may not type into
-/// (`cannot_type`); the last try finding no screen to type into, or a screen
+/// (`awaiting_prompt`); an open paste (`paste_open`); a touched box the deck
+/// checks and has not read empty (`possible_draft`), or one it can't check
+/// (its reason: `cannot_type`, `needs_fetch` or `cannot_check`); a generation
+/// the deck may not type into (`cannot_type`); the last try finding no screen to type into, or a screen
 /// that is not Clean (`awaiting_prompt`); an Enter the agent did not take
 /// (`not_taken`); otherwise no reason, the clock running. A suspended
 /// doorbell's reason (`uncertain_input`, `dialog_during_ring`) is the
@@ -477,6 +506,8 @@ pub fn obstacle(facts: &HoldFacts) -> (Option<crate::inbox_display::WakeHold>, H
         (Some(WakeHold::PasteOpen), HoldClock::Runs)
     } else if facts.draft {
         (Some(WakeHold::PossibleDraft), HoldClock::Runs)
+    } else if let Some(hold) = facts.unchecked {
+        (Some(hold), HoldClock::Runs)
     } else if facts.cannot_type.is_some() {
         (Some(WakeHold::CannotType), HoldClock::Runs)
     } else if facts.unrecognised {
@@ -849,8 +880,7 @@ async fn run_tick(
     let now = Instant::now();
     for ((pane, agent), (admission, hooked, status)) in keys.into_iter().zip(admissions) {
         let explained = status_explains_waiting(status.as_ref());
-        let input =
-            registry.pane_input_hold(&pane, registry.doorbell_input_semantics(&pane, &agent));
+        let input = registry.pane_input_hold(&pane, &agent);
         let inbox = hub.doorbell_facts(&pane, &agent);
         let receiver = !ring_still_admitted(&inbox, config, now);
         let queued = !inbox.queued.is_empty();
@@ -906,6 +936,22 @@ async fn run_tick(
                         | crate::state::SessionStatus::WaitingForInput
                 )
             );
+            // PRD #1666 part 3 (Q35-21, R3 §3.6): a touched box holds the
+            // ring until a check reads it empty, so the card says why: a
+            // check under way or one that read it non-empty, or, where no
+            // check can run, the reason and the route that still delivers.
+            // A generation the deck won't type into at all keeps its
+            // `cannot_type` clause.
+            let failing = input.draft && registry.composer_probe_failing(&agent);
+            let unchecked = if refused.is_some() {
+                None
+            } else if failing {
+                Some(crate::inbox_display::WakeHold::CannotCheck)
+            } else {
+                input
+                    .unchecked
+                    .map(|permission| registry.doorbell_unchecked_hold(&pane, &agent, permission))
+            };
             let hold = HoldFacts {
                 queued,
                 receiver,
@@ -913,7 +959,8 @@ async fn run_tick(
                 settling,
                 waiting_for_input: status == Some(crate::state::SessionStatus::WaitingForInput),
                 paste_open: input.paste_open,
-                draft: input.draft,
+                draft: input.draft && !failing,
+                unchecked,
                 cannot_type: refused,
                 unrecognised: slot.unrecognised || dirty,
                 not_taken: slot.not_taken.is_some(),
@@ -933,8 +980,12 @@ async fn run_tick(
                 // Idle presents, only, for an agent that reports nothing
                 // before its first prompt, on its own measured proof (Q28).
                 idle: admission.is_some() && ready,
+                // Q35-21: a touched box no check can read is not typed
+                // into; an `Armable` one is still rung for, so the tick can
+                // ask its check first.
                 held: input.paste_open
                     || refused.is_some()
+                    || input.unchecked.is_some()
                     || settling
                     || suspended
                     || slot.not_taken.is_some(),
@@ -966,12 +1017,13 @@ async fn run_tick(
             debug!(pane_id = %pane, agent_id = %agent, "doorbell evidence-refresh nudge");
             registry.nudge_repaint(&agent);
         }
-        // PRD #1666 part 3 (Q35-20): an `Armable` generation whose box was
-        // touched is checked first: the tick submits a probe when one is
-        // due, and rings nothing while a check is outstanding (its fence
-        // would hold the line anyway). No production generation is
-        // `Armable` before activation; whether a ring follows a check stays
-        // today's decision until Q35-21.
+        // PRD #1666 part 3 (Q35-20, Q35-21): an `Armable` generation whose
+        // box was touched is checked first: the tick submits a probe when one
+        // is due, and rings nothing while a check is outstanding (its fence
+        // would hold the line anyway). A ring follows once a check read the
+        // box empty: the epoch then says untouched, and the ring's admission
+        // frame reads it. No production generation is `Armable` before
+        // activation.
         if matches!(action, Some((Action::Ring { .. }, _)))
             && registry.composer_probe_tick(&pane, &agent)
         {
@@ -1040,7 +1092,7 @@ async fn run_tick(
             if effect.not_taken {
                 // Q9: the agent did not take the deck's Enter. No more rings
                 // until its next turn.
-                slot.not_taken = Some(registry.pane_input_hold(&pane, None).turns);
+                slot.not_taken = Some(registry.pane_input_hold(&pane, &agent).turns);
             }
             use crate::doorbell_txn::Outcome;
             match report.outcome {
@@ -1259,7 +1311,7 @@ mod tests {
         );
     }
 
-    /// Scenario: Check the obstacle table row by row: each fact that holds a ring maps to its reason in priority order (waiting for input, an open paste, a draft, a generation the deck may not type into, no screen to type into, an Enter not taken), an armed component, a working agent and a settling first ring show none with the clock stopped, nothing queued ends the episode, and a pane with nothing in the way runs the clock with no reason. Then check that a try whose admission found no empty ready composer, a dialog or a layout edge holds as awaiting a prompt until a ring writes, and that a try that wrote nothing for another reason leaves that as it was.
+    /// Scenario: Check the obstacle table row by row: each fact that holds a ring maps to its reason in priority order (waiting for input, an open paste, a touched box the deck checks, a touched box it can't check with that box's own reason, a generation the deck may not type into, no screen to type into, an Enter not taken), an armed component, a working agent and a settling first ring show none with the clock stopped, nothing queued ends the episode, and a pane with nothing in the way runs the clock with no reason. Then check that a try whose admission found no empty ready composer, a dialog or a layout edge holds as awaiting a prompt until a ring writes, and that a try that wrote nothing for another reason leaves that as it was.
     #[spec("inbox/doorbell/041")]
     #[test]
     fn doorbell_041_the_obstacle_table_takes_the_first_row_that_holds() {
@@ -1273,6 +1325,7 @@ mod tests {
             waiting_for_input: true,
             paste_open: true,
             draft: true,
+            unchecked: Some(WakeHold::NeedsFetch),
             cannot_type: Some("unmeasured_release"),
             unrecognised: true,
             not_taken: true,
@@ -1323,6 +1376,15 @@ mod tests {
         );
         let all = HoldFacts {
             draft: false,
+            ..all
+        };
+        // Q35-21: a touched box no check can read shows its own reason.
+        assert_eq!(
+            obstacle(&all),
+            (Some(WakeHold::NeedsFetch), HoldClock::Runs)
+        );
+        let all = HoldFacts {
+            unchecked: None,
             ..all
         };
         assert_eq!(

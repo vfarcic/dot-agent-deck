@@ -155,9 +155,6 @@ fn frame_of(
 /// the transaction decided on it, then dropped.
 struct DaemonSeam<'g> {
     generation: &'g Generation,
-    /// Every pane's input state, read for the input proof by `try_lock` and
-    /// not held: the seam's ledger hold already keeps human operations out.
-    pane_input: &'g Mutex<PaneInputState>,
     profile: &'static crate::doorbell_screen::ScreenProfile,
     line: String,
     #[allow(clippy::type_complexity)]
@@ -180,17 +177,15 @@ impl txn::Seam for DaemonSeam<'_> {
         let ledger = self.generation.ledger.try_hold()?;
         let bus = self.generation.bus.state.try_lock().ok()?;
         let mode = self.generation.mode.try_lock().ok()?;
-        let input = self
-            .pane_input
-            .try_lock()
-            .ok()?
-            .input_proof(&self.generation.pane_id, Some(self.profile.input));
+        // Q35-21: read inside the ledger's hold, which keeps every person's
+        // op out until the job is enqueued, so the epoch can't move under it.
+        let touched = self.generation.bus.input().touched();
         let marks = ledger.marks();
         let read = txn::SeamRead {
             watermark: marks.watermark,
             job_mark: marks.job_mark,
             frame: txn::Frame {
-                input,
+                touched,
                 ..frame_of(&bus, self.profile, Some(&self.line))
             },
             mode: self.generation.mode_now(&mode),
@@ -210,6 +205,10 @@ struct AdmissionReads {
     mode: Result<(), &'static str>,
     anchor: Option<u64>,
     nudge_in_flight: bool,
+    /// PRD #1666 part 3 (Q35-21, R3 §3.5): `E_admit`, the box's input epoch
+    /// in the same hold as the frame: what the ring's `Submitted` reconcile
+    /// compares with.
+    epoch: crate::composer_probe::epoch::InputEpoch,
 }
 
 /// The transaction's one job on the writer, from its enqueue until it ends
@@ -400,21 +399,18 @@ impl AgentPtyRegistry {
     /// Admission's reads (plan §1.1 step 1), each lock by `try_lock`: `None`
     /// while any is contended, since the caller holds the writer. The
     /// ledger, the bus state and the mode store are held together, in the
-    /// final seam's order, and the pane input state is read while they are,
-    /// so the frame, the input proof, the mode and the ledger's marks are
+    /// final seam's order, and the input epoch is read while they are, so the
+    /// frame, whether the box is touched, the mode and the ledger's marks are
     /// one moment.
     fn admission_reads(&self, generation: &Generation, hook_route: bool) -> Option<AdmissionReads> {
         let typing = self.doorbell_typing_now(generation, hook_route)?;
         let ledger = generation.ledger.try_hold()?;
         let state = generation.bus.state.try_lock().ok()?;
         let store = generation.mode.try_lock().ok()?;
-        let input = self.pane_input.try_lock().ok()?.input_proof(
-            &generation.pane_id,
-            typing.as_ref().ok().map(|typing| typing.profile.input),
-        );
+        let epoch = generation.bus.input().epoch();
         let frame = match &typing {
             Ok(typing) => txn::Frame {
-                input,
+                touched: epoch.touched(),
                 ..frame_of(&state, typing.profile, None)
             },
             Err(_) => txn::Frame::default(),
@@ -426,6 +422,7 @@ impl AgentPtyRegistry {
             anchor: store.anchor(),
             nudge_in_flight: false,
             typing,
+            epoch,
         };
         drop((store, state, ledger));
         let nudge_in_flight = self
@@ -437,24 +434,6 @@ impl AgentPtyRegistry {
             nudge_in_flight,
             ..reads
         })
-    }
-
-    /// PRD #1666 part 3, Q32: how the input box of `agent_id`'s generation
-    /// in `pane_id` edits, from the screen profile its evidence tracks (the
-    /// e2e build's stand-in editor's own, when it runs one); `None` when the
-    /// generation is gone or has no measured profile.
-    pub fn doorbell_input_semantics(
-        &self,
-        pane_id: &str,
-        agent_id: &str,
-    ) -> Option<crate::composer_model::Semantics> {
-        let generation = self.doorbell_generation(pane_id, agent_id)?;
-        #[cfg(feature = "e2e")]
-        if let Some(profile) = generation.doorbell.standin_profile() {
-            return Some(profile.input);
-        }
-        let state = generation.bus.state.lock().unwrap();
-        state.evidence.profile().map(|profile| profile.input)
     }
 
     /// The clause that holds `agent_id`'s generation in `pane_id` from the
@@ -484,6 +463,34 @@ impl AgentPtyRegistry {
             return Some("no_submit_route");
         }
         None
+    }
+
+    /// PRD #1666 part 3 (Q35-21, R3 §3.6): why the doorbell holds for
+    /// `agent_id`'s generation in `pane_id` when its box is touched and its
+    /// observer, with `permission` (`None`: no observer), can't check it
+    /// ([`PaneInputHold::unchecked`]): `cannot_check` while the permission
+    /// waits for the release's header or the agent's binding; otherwise the
+    /// route that still delivers the message, which no notice of the deck's
+    /// can now: a Claude generation's own fetch (`needs_fetch`: no native
+    /// waiter is armed for it, or the doorbell would not be asked), and every
+    /// other agent's prompt or turn-end hand-over (`cannot_type`).
+    pub fn doorbell_unchecked_hold(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        permission: Option<crate::composer_probe::Permission>,
+    ) -> crate::inbox_display::WakeHold {
+        use crate::inbox_display::WakeHold;
+        if permission == Some(crate::composer_probe::Permission::Pending) {
+            return WakeHold::CannotCheck;
+        }
+        let agent = self
+            .doorbell_generation(pane_id, agent_id)
+            .and_then(|generation| generation.agent);
+        match agent {
+            Some(AgentType::ClaudeCode) => WakeHold::NeedsFetch,
+            _ => WakeHold::CannotType,
+        }
     }
 
     /// PRD #1666 part 3, Q28: whether `agent_id`'s generation in `pane_id`
@@ -526,13 +533,9 @@ impl AgentPtyRegistry {
             return true;
         };
         if !generation.doorbell.wrapped() {
-            let input = self
-                .pane_input
-                .lock()
-                .unwrap()
-                .input_proof(&generation.pane_id, Some(typing.profile.input));
+            let touched = generation.bus.input().touched();
             let ready = txn::Frame {
-                input,
+                touched,
                 ..frame_of(&generation.bus.state.lock().unwrap(), typing.profile, None)
             }
             .empty_and_ready();
@@ -731,6 +734,7 @@ impl AgentPtyRegistry {
             mode,
             anchor,
             nudge_in_flight,
+            epoch: admitted_epoch,
         } = reads;
         // Idle is one snapshot with `W0` and `J0`: a human ticket outstanding
         // in it refuses the ring, and one admitted after it moves the
@@ -980,23 +984,38 @@ impl AgentPtyRegistry {
             pending.push_back(frame.map_or(txn::Event::Tick, txn::Event::Frame));
             next = pending.pop_front();
         };
-        // Submitted, with no human job since admission: the deck's own
-        // verified submit reconciles a stale draft bit, under the writer
-        // (plan §1.4).
-        // The ledger by `try_lock`: contended, a human operation is moving
-        // through it, so the bit is not the deck's to clear. The pane input
-        // state by `try_lock` too: every pane's writes parse their bytes
-        // under it, so it is not waited on under the writer; contended, the
-        // bit stays as it was, which holds a later ring rather than letting
-        // one through.
-        if outcome == txn::Outcome::Submitted
-            && generation
-                .ledger
-                .try_hold()
-                .is_some_and(|ledger| ledger.marks().job_mark == txn.j0())
-            && let Ok(mut input) = self.pane_input.try_lock()
+        // PRD #1666 part 3 (Q35-21, R3 §3.5): Submitted, with no human job
+        // since admission: the deck's own verified submit makes the box
+        // untouched again, under the writer, iff the ring's own op is the
+        // last that entered it and nothing foreign came since admission.
+        // The ledger by `try_lock`, and held across the epoch's update so no
+        // person's op is admitted between the check and the update:
+        // contended, a human operation is moving through it, and the box
+        // stays touched, which a later ring's check reads rather than one
+        // ring letting the next through.
+        //
+        // A withdrawal reconciles the same way: it ends only once the deck
+        // deleted its own line and saw the agent's placeholder again, which
+        // the agent draws only over an empty box (`Txn::confirm_withdrawn`).
+        if matches!(outcome, txn::Outcome::Submitted | txn::Outcome::Withdrawn)
+            && let Some(ledger) = generation.ledger.try_hold()
+            && ledger.marks().job_mark == txn.j0()
         {
-            input.reconcile_deck_submit(&pane);
+            let ring = crate::composer_probe::epoch::DeckJobId::ring(txn.attempt());
+            let reconciled = generation
+                .bus
+                .input()
+                .reconcile_ring(ring, admitted_epoch.epoch());
+            drop(ledger);
+            tracing::debug!(
+                target: "doorbell",
+                pane_id = %pane,
+                agent_id = %agent,
+                attempt = txn.attempt(),
+                reconciled,
+                ?outcome,
+                "doorbell resolved: input epoch"
+            );
         }
         if let txn::Outcome::Unresolved(cause) = outcome {
             tracing::warn!(
@@ -1021,6 +1040,10 @@ impl AgentPtyRegistry {
             attempt = txn.attempt(),
             ?outcome,
             cr_reached = txn.cr_reached(),
+            withdrawal = ?txn.withdrawal_cause(),
+            admission_lost = txn.admission_was_lost(),
+            unresolved_at = ?txn.unresolved_at(),
+            marks = ?generation.ledger.marks(),
             "doorbell attempt ended"
         );
         let report = RingReport {
@@ -1056,7 +1079,6 @@ impl AgentPtyRegistry {
     ) -> (Option<Instant>, Option<txn::Outcome>) {
         let mut seam = DaemonSeam {
             generation,
-            pane_input: &self.pane_input,
             profile,
             line: line.to_string(),
             held: None,
@@ -1085,7 +1107,8 @@ impl AgentPtyRegistry {
                         checked = if job.is_none() && !txn.cr_reached() { "W0 or J0" } else { "J0" },
                         "doorbell seam"
                     );
-                    match guard.queue_deck_job(bytes, claim) {
+                    let ring = crate::composer_probe::epoch::DeckJobId::ring(txn.attempt());
+                    match guard.queue_ring_job(bytes, claim, ring) {
                         Some(queued) => {
                             *job = Some(JobSlot {
                                 job: queued,

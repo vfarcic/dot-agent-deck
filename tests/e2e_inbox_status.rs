@@ -107,18 +107,20 @@ fn status_031_orchestrator_attention_survives_tabs_and_reattach() {
         "worker report accepted"
     );
     enqueue(&daemon, &other, "other held work");
+    // Q35-21: a touched box no check can read holds with its reason, for
+    // this pane `cannot_type`, the hold this attention names.
     assert!(
         common::wait_until(WAIT, || summary(&daemon, &orch)["wake_hold"]
-            == "possible_draft"),
+            == "cannot_type"),
         "precondition: the orchestrator's real inbox is held for its draft: {}",
         summary(&daemon, &orch)
     );
     assert!(common::wait_until(
         WAIT,
-        || summary(&daemon, &other)["wake_hold"] == "possible_draft"
+        || summary(&daemon, &other)["wake_hold"] == "cannot_type"
     ));
     let words: Value = serde_json::from_str(include_str!("fixtures/inbox-display.json")).unwrap();
-    let reason = words["wakeHolds"]["possible_draft"].as_str().unwrap();
+    let reason = words["wakeHolds"]["cannot_type"].as_str().unwrap();
     assert_orchestrator_attention(&deck, reason);
     // Dashboard -> the team's tab -> Dashboard. No focus or selection clears it.
     deck.send_keys(b"\x1b[C");

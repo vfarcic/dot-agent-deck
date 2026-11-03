@@ -4391,30 +4391,38 @@ const PASTE_MARKER_PREFIX: &[u8] = b"\x1b[20";
 pub struct PaneInputHold {
     /// A bracketed paste into the pane has started and not ended.
     pub paste_open: bool,
-    /// The user has sent input since their last submit or clear, or the
-    /// input box is not proven empty by the bytes written into it
-    /// ([`crate::composer_model::InputProof`]).
+    /// PRD #1666 part 3 (Q35-21, R3 §3.6): the box is touched and the deck
+    /// can check it (the generation is `Armable`): something entered it since
+    /// a check last read it empty, and the next ring waits for a check that
+    /// does. A touched box the deck cannot check is [`Self::unchecked`].
     pub draft: bool,
+    /// PRD #1666 part 3 (Q35-21): the box is touched and the generation's
+    /// observer is not `Armable`, with its permission (`None`: the
+    /// generation has no observer). The doorbell projects this generation's
+    /// reason for it rather than `possible_draft`.
+    pub unchecked: Option<Option<crate::composer_probe::Permission>>,
     /// How many of the pane's agent's turns have ended on this stream.
     pub turns: u64,
 }
 
 impl PaneInputHold {
-    /// PRD #1666 part 3 (Q35-21p): the hold one pane's input stream shows,
-    /// with its box read as `semantics` edits it (Q32); the default for a
-    /// pane nothing was written to. Every reader of the hold decision comes
-    /// here ([`PaneInputState::input_hold`]), so Q35-21's switch to the
-    /// epoch changes this one function.
+    /// PRD #1666 part 3 (Q35-21p, Q35-21): the hold one pane's input
+    /// stream shows, with its generation's box `touched` by its input epoch
+    /// and its observer's `permission` (`None`: no observer); the default for
+    /// a pane nothing was written to. Every reader of the hold decision
+    /// comes here ([`PaneInputState::input_hold`]).
     fn of(
         stream: Option<&PaneInputStream>,
-        semantics: Option<crate::composer_model::Semantics>,
+        touched: bool,
+        permission: Option<crate::composer_probe::Permission>,
     ) -> Self {
-        stream.map_or_else(Self::default, |stream| Self {
-            paste_open: stream.in_paste,
-            draft: stream.draft.pending()
-                || stream.composer.proof(semantics) != crate::composer_model::InputProof::Empty,
-            turns: stream.turns,
-        })
+        let armable = permission == Some(crate::composer_probe::Permission::Armable);
+        Self {
+            paste_open: stream.is_some_and(|stream| stream.in_paste),
+            draft: touched && armable,
+            unchecked: (touched && !armable).then_some(permission),
+            turns: stream.map_or(0, |stream| stream.turns),
+        }
     }
 }
 
@@ -4425,8 +4433,12 @@ impl PaneInputHold {
 /// the daemon has is the bytes it forwards. Two separate things make "scan for
 /// a CR or an LF" the wrong answer: each reads a box that still holds the
 /// user's draft as submitted. (Before PRD #1666 that let the typed delivery
-/// submit payload + draft + payload as one turn; today the draft bit it clears
-/// is what the doorbell waits on — see [`AgentPtyRegistry::draft_pending`].)
+/// submit payload + draft + payload as one turn.) Since PRD #1666 part 3
+/// (Q35-21) the box's emptiness is the input epoch's
+/// ([`crate::composer_probe::epoch`]), not this stream's: what this stream
+/// still decides is an open paste, the turn count, and the user's own submit
+/// or clear that lifts a suspended doorbell
+/// ([`crate::composer_probe::recovery`]).
 ///
 /// **Framing.** The real TUI forwards `ESC[200~…\n…ESC[201~` when the child
 /// advertises bracketed paste. Those newlines are EDITOR CONTENT, and an agent
@@ -4459,7 +4471,8 @@ impl PaneInputHold {
 /// behind a byte do not care who sent it: our CR ends the user's half-sent
 /// `ESC`, a multi-line payload's `ESC[201~` closes a paste the user left open,
 /// and a user's partial marker completed by our bytes is a marker. Origin
-/// decides only the draft bit (see [`crate::draft_deferral::DraftTracker`]).
+/// decides only whether a submit or clear is the user's own
+/// ([`crate::composer_probe::recovery::Origin`]).
 #[derive(Default)]
 struct PaneInputStream {
     /// How many bytes of a paste marker have matched so far.
@@ -4472,32 +4485,24 @@ struct PaneInputStream {
     /// from the ESC-prefixed `Alt+Enter`. `None` only at the very start of the
     /// stream, where no prefix can have been sent.
     preceding: Option<u8>,
-    /// Issue #544: whether the user has sent input since their last submit or
-    /// clear — the bit an automatic FIRST write waits on. Fed every byte this
-    /// stream sees, with the submit decision and paste framing above, so the
-    /// two can never disagree about what a byte did. See
-    /// [`crate::draft_deferral::DraftTracker`].
-    draft: crate::draft_deferral::DraftTracker,
-    /// PRD #1666 part 3, round 5-wake (R6-4): what the input box holds, as
-    /// far as the same bytes say. Fed with the draft bit, every byte, so the
-    /// two read one stream. See [`crate::composer_model::ComposerModel`].
-    composer: crate::composer_model::ComposerModel,
+    /// PRD #1666 part 3 (Q35-21, OQ2): the user's own submits and clears in
+    /// the bytes the PTY took, which lift a suspended doorbell. Fed every
+    /// byte this stream sees, both senders', so its framing is the agent's.
+    recovery: crate::composer_probe::recovery::Recovery,
     /// PRD #1666 (r8k R8G-02): the pane's own agent reported a turn starting
     /// ([`TurnEdge::Started`]) and has not reported it ended since. Only an
-    /// Idle that ends such a turn releases anything, so a repeated Idle, or
-    /// an Idle with no busy report before it, releases nothing.
+    /// Idle that ends such a turn counts one, so a repeated Idle, or an Idle
+    /// with no busy report before it, counts nothing.
     busy: bool,
     /// PRD #1666 (r8k R8G-02): how many turns of the pane's own agent have
-    /// ended on this stream — busy, then Idle. A PTY write reads it once the
-    /// write has returned, and its record compares that reading with the
-    /// count then ([`PaneInputState::settle_written_bytes`]).
+    /// ended on this stream — busy, then Idle: the doorbell's turn clock.
     turns: u64,
 }
 
 impl PaneInputStream {
     /// Feed the user's bytes; `true` if any of them submits the input box.
     fn feed(&mut self, bytes: &[u8]) -> bool {
-        self.feed_as(bytes, crate::draft_deferral::ByteOrigin::User)
+        self.feed_as(bytes, crate::composer_probe::recovery::Origin::User)
     }
 
     /// Feed bytes `origin` wrote; `true` if any of them submits the input box.
@@ -4505,35 +4510,23 @@ impl PaneInputStream {
     /// Every byte is fed, deliberately: this is a state machine, so a
     /// short-circuiting `any` would stop tracking paste state at the first
     /// terminator and mis-read the rest of the buffer.
-    fn feed_as(&mut self, bytes: &[u8], origin: crate::draft_deferral::ByteOrigin) -> bool {
+    fn feed_as(&mut self, bytes: &[u8], origin: crate::composer_probe::recovery::Origin) -> bool {
+        self.recovery.feed(bytes, origin);
         let mut submitted = false;
         for byte in bytes {
-            submitted |= self.feed_byte(*byte, origin);
+            submitted |= self.feed_byte(*byte);
         }
         submitted
     }
 
-    /// Feed one byte; `true` if it submits, OUTSIDE a bracketed paste.
-    ///
-    /// Issue #544: the same byte also moves the draft bit, with the submit
-    /// decision just made and the paste framing as it stood BEFORE this byte —
-    /// so the closing marker's bytes are paste content and the opening one's are
-    /// not.
-    fn feed_byte(&mut self, byte: u8, origin: crate::draft_deferral::ByteOrigin) -> bool {
-        let in_paste = self.in_paste;
-        let submits = self.scan_submit(byte);
-        self.draft.feed_byte(byte, submits, in_paste, origin);
-        self.composer.feed_byte(
-            byte,
-            submits,
-            in_paste,
-            origin == crate::draft_deferral::ByteOrigin::Deck,
-        );
-        submits
+    /// Feed one byte; `true` if it submits, OUTSIDE a bracketed paste:
+    /// paste framing, then the keypress behind the byte.
+    fn feed_byte(&mut self, byte: u8) -> bool {
+        self.scan_submit(byte)
     }
 
-    /// The submit half of [`Self::feed_byte`]: paste framing, then the keypress
-    /// behind the byte.
+    /// [`Self::feed_byte`]'s paste framing, then the keypress behind the
+    /// byte.
     fn scan_submit(&mut self, byte: u8) -> bool {
         // Unconditional, and before the marker matcher's early returns: every
         // byte is somebody's predecessor, including the ones consumed as part
@@ -4567,78 +4560,16 @@ impl PaneInputStream {
     }
 
     /// PRD #1666: apply a turn edge the pane's own agent reported. Only an
-    /// Idle that ends a turn under way counts the turn and releases what the
-    /// draft bit was holding for it; the composer model keeps its own count,
-    /// by which an unknown `Enter` it gave up on stops owing a report.
+    /// Idle that ends a turn under way counts the turn.
     fn note_turn(&mut self, edge: TurnEdge) {
         match edge {
-            TurnEdge::Started => {
-                self.busy = true;
-                self.composer.turn_started();
-            }
+            TurnEdge::Started => self.busy = true,
             TurnEdge::Ended => {
                 if std::mem::replace(&mut self.busy, false) {
                     self.turns += 1;
-                    self.draft.turn_ended();
                 }
-                self.composer.turn_ended();
             }
         }
-    }
-}
-
-/// Issue #544: a pane's input stream for `crate::draft_deferral`'s tests,
-/// which drive the draft parser through the real paste framing and submit
-/// scan rather than a copy of them.
-#[cfg(test)]
-#[derive(Default)]
-pub(crate) struct DraftTestStream(PaneInputStream);
-
-#[cfg(test)]
-impl DraftTestStream {
-    /// Feed one byte; `true` if it submits. See [`PaneInputStream::feed_byte`].
-    pub(crate) fn feed_byte(
-        &mut self,
-        byte: u8,
-        origin: crate::draft_deferral::ByteOrigin,
-    ) -> bool {
-        self.0.feed_byte(byte, origin)
-    }
-
-    pub(crate) fn in_paste(&self) -> bool {
-        self.0.in_paste
-    }
-
-    pub(crate) fn draft(&self) -> &crate::draft_deferral::DraftTracker {
-        &self.0.draft
-    }
-
-    pub(crate) fn composer(&self) -> &crate::composer_model::ComposerModel {
-        &self.0.composer
-    }
-
-    /// The pane's own agent reported a turn starting, as
-    /// [`PaneInputState::note_turn`] applies it.
-    pub(crate) fn turn_started(&mut self) {
-        self.0.note_turn(TurnEdge::Started);
-    }
-
-    /// The agent reported Idle after working.
-    pub(crate) fn turn_ended(&mut self) {
-        self.0.note_turn(TurnEdge::Ended);
-    }
-
-    /// The agent's prompt hook reported a prompt, as
-    /// [`PaneInputState::note_prompt_report`] applies it.
-    pub(crate) fn prompt_reported(&mut self, report: crate::composer_model::PromptReport<'_>) {
-        self.0.composer.prompt_reported(report);
-    }
-
-    /// The doorbell's verified submit, as [`PaneInputState::reconcile_deck_submit`]
-    /// applies it.
-    pub(crate) fn reconcile_deck_submit_for_test(&mut self) {
-        self.0.draft.reconcile_deck_submit();
-        self.0.composer.reconcile_deck_submit();
     }
 }
 
@@ -4651,12 +4582,10 @@ pub enum TurnEdge {
     /// pane's stream when it has none yet, so a first turn reported before
     /// any input is still a turn.
     Started,
-    /// The agent reported Idle. When a turn was under way it has ended: what
-    /// a run of the user's Escape keys could have been holding, the interrupt
-    /// of that turn, is released. See
-    /// [`crate::draft_deferral::DraftTracker::turn_ended`]. With no turn under
-    /// way — a repeated Idle, or an agent whose busy reports the deck never
-    /// receives — it releases nothing.
+    /// The agent reported Idle. When a turn was under way it has ended, and
+    /// the pane's turn clock counts it. With no turn under way — a repeated
+    /// Idle, or an agent whose busy reports the deck never receives — it
+    /// counts nothing.
     Ended,
 }
 
@@ -4749,22 +4678,13 @@ impl PaneInputState {
         self.note_user_bytes_as(pane_id_env, bytes, true);
     }
 
-    /// PRD #1666 part 3, round 5-wake (plan §1.4): the doorbell's line was
-    /// proven submitted with no human job since its admission, under the
-    /// pane's writer: the pane's stale draft bit is released.
-    fn reconcile_deck_submit(&mut self, pane_id_env: &str) {
-        if let Some(stream) = self.input.get_mut(pane_id_env) {
-            stream.draft.reconcile_deck_submit();
-            stream.composer.reconcile_deck_submit();
-        }
-    }
-
-    /// PRD #1666 part 3, round 5-wake: how many times the user's own bytes
-    /// have submitted or cleared `pane_id_env`'s box on its current stream.
+    /// PRD #1666 part 3 (Q35-21, OQ2): how many times the user's own bytes
+    /// have submitted or cleared `pane_id_env`'s box on its current stream
+    /// ([`crate::composer_probe::recovery::Recovery`]).
     fn user_clears(&self, pane_id_env: &str) -> u64 {
         self.input
             .get(pane_id_env)
-            .map_or(0, |stream| stream.draft.user_clears())
+            .map_or(0, |stream| stream.recovery.clears())
     }
 
     /// [`Self::note_user_bytes`], for a human's bytes (`human`) or a voice
@@ -4810,45 +4730,26 @@ impl PaneInputState {
         self.human_input_seq.contains_key(pane_id_env) || self.input.contains_key(pane_id_env)
     }
 
-    /// Issue #544: has the user sent input into `pane_id_env` since their last
-    /// submit or clear? See [`crate::draft_deferral::DraftTracker`].
-    ///
-    /// An open paste counts from its opening marker on, before any of its
-    /// content has arrived: a paste split across writes is still one paste, and
-    /// a first write let through between the marker and the content lands in
-    /// the middle of it (PR #1398 finding #14). The marker alone does not set
-    /// the tracker's bit, so an empty paste still leaves nothing pending once it
-    /// closes.
-    fn draft_pending(&self, pane_id_env: &str) -> bool {
-        self.input
-            .get(pane_id_env)
-            .is_some_and(|stream| stream.in_paste || stream.draft.pending())
-    }
-
-    /// PRD #1666 part 3, round 5-wake: what [`Self::draft_pending`] joins,
-    /// apart, with the pane's turn count; the box as `semantics` edits it
-    /// (Q32).
+    /// PRD #1666 part 3 (Q35-21): the pane's open paste and turn count, with
+    /// its generation's box `touched` by the input epoch and its observer's
+    /// `permission` ([`PaneInputHold::of`]).
     fn input_hold(
         &self,
         pane_id_env: &str,
-        semantics: Option<crate::composer_model::Semantics>,
+        touched: bool,
+        permission: Option<crate::composer_probe::Permission>,
     ) -> PaneInputHold {
-        PaneInputHold::of(self.input.get(pane_id_env), semantics)
+        PaneInputHold::of(self.input.get(pane_id_env), touched, permission)
     }
 
-    /// PRD #1666 part 3, round 5-wake (R6-4): what the bytes written into
-    /// `pane_id_env` say its input box holds, as `semantics` edits it (Q32);
-    /// empty for a pane nothing was written to.
-    fn input_proof(
-        &self,
-        pane_id_env: &str,
-        semantics: Option<crate::composer_model::Semantics>,
-    ) -> crate::composer_model::InputProof {
+    /// Issue #544: whether a bracketed paste into `pane_id_env` has opened
+    /// and not closed, from its opening marker on, before any of its content
+    /// has arrived.
+    #[cfg(test)]
+    fn in_paste(&self, pane_id_env: &str) -> bool {
         self.input
             .get(pane_id_env)
-            .map_or(crate::composer_model::InputProof::Empty, |stream| {
-                stream.composer.proof(semantics)
-            })
+            .is_some_and(|stream| stream.in_paste)
     }
 
     /// PRD #1666: apply a turn edge the agent in `pane_id_env` reported. The
@@ -4872,60 +4773,11 @@ impl PaneInputState {
         }
     }
 
-    /// PRD #1666 part 3 (Q30): the agent in `pane_id_env` reported, from its
-    /// prompt hook, a prompt it took — the only evidence that an `Enter` on
-    /// a box the composer model did not know submitted it (see
-    /// [`crate::composer_model::ComposerModel::prompt_reported`]). The
-    /// caller has already checked the report came from the pane's live
-    /// owner — see [`AgentPtyRegistry::note_prompt_report`].
-    fn note_prompt_report(
-        &mut self,
-        pane_id_env: &str,
-        report: crate::composer_model::PromptReport<'_>,
-    ) {
-        if let Some(stream) = self.input.get_mut(pane_id_env) {
-            stream.composer.prompt_reported(report);
-        }
-    }
-
-    /// PRD #1666 (r8k R8G-02): the pane's turn count, read by
-    /// [`InputRecorder::turns_after_write`] once a PTY write has returned.
-    fn turns(&self, pane_id_env: &str) -> u64 {
-        self.input.get(pane_id_env).map_or(0, |stream| stream.turns)
-    }
-
-    /// PRD #1666 (r8k R8G-02): bytes just recorded into `pane_id_env` reached
-    /// the PTY before its turn count read `turns_after_write`. If a turn has
-    /// ended since that reading, it ended AFTER these bytes reached the agent,
-    /// and is applied to them as it was to everything recorded before it: an
-    /// interrupt's Escapes recorded late are released, not held.
-    ///
-    /// A turn that ended between the write and the reading is not known to
-    /// have come after the bytes — it may have come before them, and Escapes
-    /// written to an agent that had just gone Idle open a menu there — so it
-    /// is not applied, and the Escapes hold until the next turn ends or the
-    /// user's Enter. That ambiguous window is decided towards holding.
-    ///
-    /// The count is this stream's, not an identity: a stream reset for a new
-    /// owner since the reading can have counted past it. Bytes of a previous
-    /// owner never reach this, because the handover retires every writer
-    /// still on the pane before it resets the stream (see
-    /// [`PaneWriter::retired`]), and [`InputRecorder::record`] skips a retired
-    /// writer.
-    fn settle_written_bytes(&mut self, pane_id_env: &str, turns_after_write: u64) {
-        if let Some(stream) = self.input.get_mut(pane_id_env)
-            && stream.turns > turns_after_write
-        {
-            stream.draft.turn_ended();
-        }
-    }
-
     /// Issue #544 (PR #1398 finding #16): bytes the DECK just wrote into
     /// `pane_id_env`, fed into the same stream as the user's and in the same
     /// order the PTY received them — see [`PaneInputStream`]. They move the
-    /// paste framing, the submit scan and the draft parser exactly as they
-    /// move the agent's own; a CR of ours that submits clears the draft bit,
-    /// and nothing of ours sets it.
+    /// paste framing and the submit scan exactly as they move the agent's
+    /// own; none of them is the user's submit or clear.
     ///
     /// Deliberately NOT a user keystroke: the human-input sequence does not
     /// move.
@@ -4936,7 +4788,7 @@ impl PaneInputState {
         self.input
             .entry(pane_id_env.to_string())
             .or_default()
-            .feed_as(bytes, crate::draft_deferral::ByteOrigin::Deck);
+            .feed_as(bytes, crate::composer_probe::recovery::Origin::Deck);
     }
 }
 
@@ -5806,16 +5658,37 @@ impl PaneWriter {
     /// where a line may start (in ground, or after a lone ESC) and the
     /// generation hasn't retired; otherwise it is refused there, writes
     /// nothing, and [`DeckJob::refused`] says why.
+    #[cfg(test)]
     pub(crate) fn queue_deck_job(
         &self,
         bytes: Vec<u8>,
         claim: Arc<crate::doorbell_txn::JobClaim>,
     ) -> Option<DeckJob> {
+        self.queue_deck_job_as(bytes, claim, ByteSource::Deck)
+    }
+
+    /// [`Self::queue_deck_job`] for ring transaction `ring`'s job: its bytes
+    /// are that job's in the epoch, not foreign (Q35-21, R3 §3.5).
+    pub(crate) fn queue_ring_job(
+        &self,
+        bytes: Vec<u8>,
+        claim: Arc<crate::doorbell_txn::JobClaim>,
+        ring: crate::composer_probe::epoch::DeckJobId,
+    ) -> Option<DeckJob> {
+        self.queue_deck_job_as(bytes, claim, ByteSource::Ring(ring))
+    }
+
+    fn queue_deck_job_as(
+        &self,
+        bytes: Vec<u8>,
+        claim: Arc<crate::doorbell_txn::JobClaim>,
+        source: ByteSource,
+    ) -> Option<DeckJob> {
         let (tx, done) = oneshot::channel();
         let (refused_tx, refused) = oneshot::channel();
         let gate = Arc::clone(&self.gate.gate);
         let (claim, _) = self.pty.submit_job(
-            PtyOp::WriteAll(bytes, ByteSource::Deck, true),
+            PtyOp::WriteAll(bytes, source, true),
             PtyReply::Async(tx),
             None,
             claim,
@@ -5934,12 +5807,21 @@ impl Drop for DeckJob {
 /// daemon's own, [`PaneInputState::note_user_bytes`] for everybody else's.
 #[derive(Debug, Clone, Copy)]
 enum ByteSource {
+    /// The deck's bytes with no job named, foreign to every job in the
+    /// epoch. Since Q35-21 every deck line is a named ring job
+    /// ([`ByteSource::Ring`]), so only tests write these.
+    #[cfg(test)]
     Deck,
     /// PRD #1666 part 3 (Q35-20): a probe's own `0x07`, the deck's, named to
     /// the epoch as its job's so the probe's settlement can apply. Linux
     /// only: no other platform writes a probe.
     #[cfg(target_os = "linux")]
     Probe(crate::composer_probe::epoch::DeckJobId),
+    /// PRD #1666 part 3 (Q35-21, R3 §3.5): a ring transaction's bytes, the
+    /// deck's, named to the epoch as its job's
+    /// ([`crate::composer_probe::epoch::DeckJobId::ring`]), so the ring's
+    /// `Submitted` reconcile can find its own line the last thing in.
+    Ring(crate::composer_probe::epoch::DeckJobId),
     User,
     /// PRD #1631: a voice answer's keys — recorded as the user's input (they
     /// are the user's answer) without moving the human-input sequence (audit
@@ -5951,9 +5833,11 @@ impl ByteSource {
     /// Whether these are the deck's own bytes rather than a person's.
     fn is_deck(self) -> bool {
         match self {
+            #[cfg(test)]
             ByteSource::Deck => true,
             #[cfg(target_os = "linux")]
             ByteSource::Probe(_) => true,
+            ByteSource::Ring(_) => true,
             ByteSource::User | ByteSource::Answer => false,
         }
     }
@@ -5973,20 +5857,8 @@ struct InputRecorder {
 }
 
 impl InputRecorder {
-    /// PRD #1666 (r8k R8G-02): the pane's turn count, read right after a PTY
-    /// write returned and before its bytes are recorded — see
-    /// [`PaneInputState::settle_written_bytes`]. Read under `state`'s lock,
-    /// which is not held across the write: a write can block for as long as
-    /// the agent does not read (issue #525), and that lock serves every pane.
-    fn turns_after_write(&self) -> u64 {
-        self.pane_id_env
-            .as_deref()
-            .map_or(0, |pane_id| self.state.lock().unwrap().turns(pane_id))
-    }
-
-    /// Record `accepted`, the bytes ONE PTY write took, given the pane's turn
-    /// count read after that write ([`Self::turns_after_write`]).
-    fn record(&self, source: ByteSource, accepted: &[u8], turns_after_write: u64) {
+    /// Record `accepted`, the bytes ONE PTY write took.
+    fn record(&self, source: ByteSource, accepted: &[u8]) {
         if accepted.is_empty() {
             return;
         }
@@ -6000,21 +5872,25 @@ impl InputRecorder {
         }
         let clears_before = state.user_clears(pane_id);
         match source {
+            #[cfg(test)]
             ByteSource::Deck => state.note_deck_bytes(pane_id, accepted),
             #[cfg(target_os = "linux")]
             ByteSource::Probe(_) => state.note_deck_bytes(pane_id, accepted),
+            ByteSource::Ring(_) => state.note_deck_bytes(pane_id, accepted),
             ByteSource::User => state.note_user_bytes(pane_id, accepted),
             ByteSource::Answer => state.note_user_bytes_as(pane_id, accepted, false),
         }
-        // PRD #1666 part 3, round 5-wake: the user's own submit or clear,
-        // in the order the PTY took it, lifts a suspended doorbell.
+        // PRD #1666 part 3 (Q35-21, OQ2): the user's own submit or clear, in
+        // the order the PTY took it, lifts a suspended doorbell
+        // ([`crate::composer_probe::recovery`]). It grants nothing the epoch
+        // doesn't: their keys moved it, so the next attempt still needs a
+        // check that reads the box empty.
         if state.user_clears(pane_id) != clears_before
             && let Some(doorbell) = &self.doorbell
             && let Some(latch) = doorbell.user_cleared()
         {
             tracing::info!(target: "doorbell", pane_id, ?latch, "doorbell latch: user");
         }
-        state.settle_written_bytes(pane_id, turns_after_write);
         // PRD #1741: a person's keys, typed or a voice answer, can be an
         // intervention; the deck's own never are.
         let telemetry = state.telemetry.clone();
@@ -6349,9 +6225,11 @@ impl PtyOp {
     fn epoch_writer(&self) -> Option<(crate::composer_probe::epoch::Writer, &[u8])> {
         use crate::composer_probe::epoch::Writer;
         let writer = |source: ByteSource| match source {
+            #[cfg(test)]
             ByteSource::Deck => Writer::UnnamedDeck,
             #[cfg(target_os = "linux")]
             ByteSource::Probe(job) => Writer::Deck(job),
+            ByteSource::Ring(job) => Writer::Deck(job),
             ByteSource::User => Writer::Human,
             ByteSource::Answer => Writer::Answer,
         };
@@ -7166,14 +7044,7 @@ fn real_time_alarm(after: Duration) -> oneshot::Receiver<()> {
 }
 
 /// Issue #525: one `write` call into the PTY, whose accepted bytes `recorder`
-/// records as `source`'s before this returns.
-///
-/// PRD #1666 (r8k R8G-02): the pane's turn count is read after the write
-/// returns, for THIS write's bytes alone, and handed to the record — so an
-/// agent's Idle ingested while the write was in progress or before the bytes
-/// were recorded is ordered against these bytes, not against the job they
-/// belong to. See [`PaneInputState::settle_written_bytes`] for the rule and
-/// the side its ambiguous window is decided towards.
+/// records as `source`'s before this returns, each write's bytes on their own.
 fn write_once_recorded(
     w: &mut (dyn std::io::Write + Send),
     buf: &[u8],
@@ -7187,10 +7058,9 @@ fn write_once_recorded(
     tracking.written(&buf[..n.min(buf.len())]);
     #[cfg(test)]
     recorder.pause_at(PtyWritePause::AfterWrite);
-    let turns = recorder.turns_after_write();
     #[cfg(test)]
     recorder.pause_at(PtyWritePause::BeforeRecord);
-    recorder.record(source, &buf[..n], turns);
+    recorder.record(source, &buf[..n]);
     Ok(n)
 }
 
@@ -8361,7 +8231,8 @@ pub struct AgentPtyRegistry {
     admission_frozen: AtomicBool,
     /// Issue #424 F1 + PRD #1631: what each pane's input box is holding — the
     /// human-input sequence [`Self::user_typed_since_question`] reads, and each
-    /// pane's input stream, whose draft bit [`Self::draft_pending`] reports.
+    /// pane's input stream, whose paste framing and turn clock
+    /// [`Self::pane_input_hold`] reports.
     /// Both are recorded by the daemon from the bytes it writes, never asserted
     /// by a producer.
     ///
@@ -12950,41 +12821,60 @@ impl AgentPtyRegistry {
         self.pane_input.lock().unwrap().note_user_input(pane_id_env);
     }
 
-    /// Issue #544: has the user sent input into `pane_id_env` since their last
-    /// submit or clear — the draft an automatic first write waits for? See
-    /// [`crate::draft_deferral::DraftTracker`] for what sets and clears it.
-    pub fn draft_pending(&self, pane_id_env: &str) -> bool {
-        self.pane_input.lock().unwrap().draft_pending(pane_id_env)
+    /// PRD #1666 part 3 (Q35-21, R3 §3.6): whether generation `agent_id`'s
+    /// input box is touched: something entered it since a check last read it
+    /// empty or the deck's own line was taken from it
+    /// ([`crate::composer_probe::epoch::InputEpoch::touched`]). `false` for a
+    /// generation that is gone.
+    pub fn input_touched(&self, agent_id: &str) -> bool {
+        let input = {
+            let inner = self.inner.lock();
+            inner
+                .agents
+                .get(agent_id)
+                .map(|agent| Arc::clone(agent.bus.input()))
+        };
+        input.is_some_and(|input| input.touched())
     }
 
-    /// Test seam: what the composer model says `pane_id_env`'s box holds,
-    /// as `semantics` edits it.
-    #[cfg(test)]
-    pub(crate) fn input_proof(
-        &self,
-        pane_id_env: &str,
-        semantics: Option<crate::composer_model::Semantics>,
-    ) -> crate::composer_model::InputProof {
+    /// PRD #1666 part 3 (plan §5.1, Q35-21): the pane's open paste, whether
+    /// generation `agent_id`'s box is touched and whether the deck can check
+    /// it, and how many of its agent's turns have ended, for the doorbell's
+    /// hold reason and episode ([`PaneInputHold::of`]). A generation that is
+    /// gone reads as untouched.
+    pub fn pane_input_hold(&self, pane_id_env: &str, agent_id: &str) -> PaneInputHold {
+        let (input, permission) = {
+            let inner = self.inner.lock();
+            match inner.agents.get(agent_id) {
+                Some(agent) => (
+                    Some(Arc::clone(agent.bus.input())),
+                    Self::permission_of(agent),
+                ),
+                None => (None, None),
+            }
+        };
+        let touched = input.is_some_and(|input| input.touched());
         self.pane_input
             .lock()
             .unwrap()
-            .input_proof(pane_id_env, semantics)
+            .input_hold(pane_id_env, touched, permission)
     }
 
-    /// PRD #1666 part 3, round 5-wake (plan §5.1): the pane's open paste and
-    /// unsent draft, told apart, and how many of its agent's turns have
-    /// ended, for the doorbell's hold reason and episode. The draft is the
-    /// box as `semantics` edits it ([`Self::doorbell_input_semantics`]), or
-    /// as every measured agent does for `None`.
-    pub fn pane_input_hold(
-        &self,
-        pane_id_env: &str,
-        semantics: Option<crate::composer_model::Semantics>,
-    ) -> PaneInputHold {
-        self.pane_input
-            .lock()
-            .unwrap()
-            .input_hold(pane_id_env, semantics)
+    /// The permission of `agent`'s observer, `None` with no observer: on
+    /// Linux only an installed generation has one; elsewhere none does.
+    fn permission_of(agent: &RunningAgent) -> Option<crate::composer_probe::Permission> {
+        #[cfg(target_os = "linux")]
+        {
+            agent
+                .composer
+                .as_ref()
+                .map(|observer| observer.permission())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = agent;
+            None
+        }
     }
 
     /// Type `bytes` into `pane_id` as a user would, while `agent_id` is the
@@ -13481,30 +13371,6 @@ impl AgentPtyRegistry {
         let agent = inner.agents.get_mut(agent_id)?;
         agent.child_role = ChildRole::Wrapper;
         agent.wrapper_child_exit.clone()
-    }
-
-    /// PRD #1666 part 3 (Q30): `agent_id` reported, from its prompt hook, a
-    /// prompt it took on `pane_id_env`, applied to the pane's composer model
-    /// only while `agent_id` is the pane's live owner: a predecessor's, or a
-    /// reservation's, report is not about this input box. Taken before the
-    /// same event's turn edge ([`Self::note_turn`]), under the same locks in
-    /// the same order.
-    pub(crate) fn note_prompt_report(
-        &self,
-        pane_id_env: &str,
-        agent_id: &str,
-        report: crate::composer_model::PromptReport<'_>,
-    ) {
-        let inner = self.inner.lock();
-        let owner = inner.agents.iter().find(|(_, a)| {
-            a.pane_id_env.as_deref() == Some(pane_id_env) && !a.exited.load(Ordering::SeqCst)
-        });
-        if owner.is_some_and(|(id, _)| id == agent_id) {
-            self.pane_input
-                .lock()
-                .unwrap()
-                .note_prompt_report(pane_id_env, report);
-        }
     }
 
     /// PRD #1666: generation `agent_id` reported `edge` of a turn on
@@ -15208,7 +15074,7 @@ impl AgentPtyRegistry {
 
     /// PRD #1666 part 3 (Q35-20a): a generation's input, which holds its
     /// drain-frontier queue, by its agent id.
-    #[cfg(feature = "e2e")]
+    #[cfg(any(test, feature = "e2e"))]
     pub(crate) fn composer_input(
         &self,
         agent_id: &str,
@@ -27036,6 +26902,16 @@ mod spawn_tests {
             std::fs::read(&self.typed).unwrap_or_default()
         }
 
+        /// PRD #1666 part 3 (Q35-21): a check read the editor's box empty,
+        /// as an activated observer's probe would settle it, so a ring after
+        /// a person's keys is admitted. For tests about what a ring does
+        /// once the box is empty (its ticket, the framing it waits for, its
+        /// order against human frames), not about how the box is observed:
+        /// the model editor has no observer, and that is S-21's to assert.
+        fn checked_empty(&self) {
+            self.bus.input().observe_empty_for_test();
+        }
+
         fn wait_clean(&self) {
             let deadline = Instant::now() + Duration::from_secs(8);
             while !matches!(
@@ -27405,6 +27281,7 @@ mod spawn_tests {
             .await
             .unwrap();
         editor.wait_drawn("");
+        editor.checked_empty();
         assert_eq!(
             editor.ring().await.outcome,
             RingOutcome::Txn(Outcome::Submitted),
@@ -27539,7 +27416,7 @@ mod spawn_tests {
         registry.shutdown_all();
     }
 
-    /// Scenario: The user types three spaces into a Claude Code 2.1.310 model editor's empty composer while a message waits and the agent is Idle, so the composer shows no text but its cursor sits past the spaces. The deck types nothing into it, whether the tick rings or the deck rings directly (nothing written: no empty composer), and the card says there may be an unsent draft. The screen is the model editor's, drawn as the profile measured; no session typing spaces into the real agent was recorded.
+    /// Scenario: The user types three spaces into a Claude Code 2.1.310 model editor's empty composer while a message waits and the agent is Idle, so the composer shows no text but its cursor sits past the spaces. The deck types nothing into it, whether the tick rings or the deck rings directly (nothing written: no empty composer), and, with no observer to check the touched box, the card says the agent needs to fetch its messages itself. The screen is the model editor's, drawn as the profile measured; no session typing spaces into the real agent was recorded.
     #[spec("inbox/doorbell/050")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn doorbell_050_a_spaces_only_draft_is_not_an_empty_composer() {
@@ -27575,8 +27452,10 @@ mod spawn_tests {
             state,
             tick_config(Duration::from_millis(150)),
         );
-        until("possible_draft", || {
-            shown_hold(&editor) == Some(WakeHold::PossibleDraft)
+        // Q35-21: no observer checks this generation's box, so the card
+        // names the route that still delivers (Claude's own fetch).
+        until("needs_fetch", || {
+            shown_hold(&editor) == Some(WakeHold::NeedsFetch)
         })
         .await;
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -27776,374 +27655,6 @@ mod spawn_tests {
         registry.shutdown_all();
     }
 
-    /// Wait (bounded) until the model editor's composer shows no text with
-    /// the cursor `cursor` characters in.
-    async fn blank_with_cursor_at(editor: &ModelEditor, cursor: u16) {
-        let deadline = Instant::now() + Duration::from_secs(8);
-        loop {
-            let shown = editor.bus.clean_frame().and_then(|grid| {
-                (crate::doorbell_screen::CLAUDE_PROFILE.composer)(&grid).map(|c| (c, grid.cursor))
-            });
-            if shown
-                .as_ref()
-                .is_some_and(|(c, at)| c.text.is_empty() && !c.dim && at.1 == 2 + cursor)
-            {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "never drawn blank at {cursor}: {shown:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-    }
-
-    /// Scenario: The user leaves blanks in a Claude Code 2.1.310 model editor's composer that its screen cannot show, drawn as Claude Code draws them (no character, the cursor moved): three spaces with the cursor moved back to the start by Left or Ctrl+A, a space left in front of the cursor after Backspace at the start, and a line break the editor does not draw. Each time the composer looks exactly empty, yet the deck types nothing into it (nothing written: no empty composer), and while a message waits the card says there may be an unsent draft. Moving to the end and clearing lets the next ring type its line once; Right, and a word typed and backspaced away, in an empty composer leave the ring free to go.
-    #[spec("inbox/doorbell/050")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-    async fn doorbell_050_blanks_the_screen_cannot_show_hold_the_ring() {
-        use crate::doorbell_txn::{NotTyped, Outcome};
-        use crate::inbox_display::WakeHold;
-        for (case, keys, cursor) in [
-            ("spaces then Left", &b"   \x1b[D\x1b[D\x1b[D"[..], Some(0)),
-            ("spaces then Ctrl+A", &b"   \x01"[..], Some(0)),
-            ("a space, Ctrl+A, Backspace", &b" \x01\x7f"[..], Some(0)),
-            ("a line break", &b"\n"[..], None),
-        ] {
-            let registry = Arc::new(AgentPtyRegistry::new());
-            let editor = ModelEditor::spawn(
-                &registry,
-                &format!("pane-ring-blank-{}", case.len()),
-                OnEnter::Submit,
-            );
-            registry
-                .write_user_bytes(&editor.pane, &editor.id, keys)
-                .await
-                .unwrap();
-            match cursor {
-                Some(cursor) => blank_with_cursor_at(&editor, cursor).await,
-                // The editor does not draw a line break: still its empty
-                // composer, placeholder and all.
-                None => editor.wait_drawn(""),
-            }
-            let report = editor.ring().await;
-            assert_eq!(
-                report.outcome,
-                RingOutcome::Txn(Outcome::NothingWritten(NotTyped::AwaitingPrompt)),
-                "{case}: {report:?}"
-            );
-            let state = idle_with_mail(&editor).await;
-            let bell = crate::doorbell::spawn(
-                registry.clone(),
-                state,
-                tick_config(Duration::from_millis(150)),
-            );
-            until("possible_draft", || {
-                shown_hold(&editor) == Some(WakeHold::PossibleDraft)
-            })
-            .await;
-            bell.abort();
-            assert_eq!(editor.typed(), keys, "{case}: only the user's keys");
-            // Clear from the end: the next ring types its line once.
-            registry
-                .write_user_bytes(&editor.pane, &editor.id, b"\x05\x15")
-                .await
-                .unwrap();
-            if case == "a line break" {
-                // The break is before the cursor's line: Backspace joins it.
-                registry
-                    .write_user_bytes(&editor.pane, &editor.id, b"\x7f")
-                    .await
-                    .unwrap();
-            }
-            editor.wait_drawn("");
-            let report = editor.ring().await;
-            assert_eq!(
-                report.outcome,
-                RingOutcome::Txn(Outcome::Submitted),
-                "{case}: {report:?}"
-            );
-            let typed = editor.typed();
-            let line = typed_line(&typed).expect("the line was typed");
-            assert_eq!(
-                typed
-                    .windows(line.len())
-                    .filter(|w| *w == line.as_bytes())
-                    .count(),
-                1,
-                "{case}: the line once"
-            );
-            registry.shutdown_all();
-        }
-        // Keys that edit nothing in an empty composer do not hold it.
-        for (case, keys) in [
-            ("Right", &b"\x1b[C"[..]),
-            ("typed and backspaced", &b"draft\x7f\x7f\x7f\x7f\x7f"[..]),
-        ] {
-            let registry = Arc::new(AgentPtyRegistry::new());
-            let editor = ModelEditor::spawn(
-                &registry,
-                &format!("pane-ring-clean-{}", case.len()),
-                OnEnter::Submit,
-            );
-            registry
-                .write_user_bytes(&editor.pane, &editor.id, keys)
-                .await
-                .unwrap();
-            assert!(
-                registry.draft_pending(&editor.pane),
-                "{case}: the draft bit is set"
-            );
-            editor.wait_drawn("");
-            let report = editor.ring().await;
-            assert_eq!(
-                report.outcome,
-                RingOutcome::Txn(Outcome::Submitted),
-                "{case}: {report:?}"
-            );
-            registry.shutdown_all();
-        }
-    }
-
-    /// The model editor stops drawing, takes `keys` from the user without
-    /// its Enter submitting anything (a box of blanks keeps them), and shows
-    /// the frame the real agent would: its composer blank with the cursor at
-    /// the start, no placeholder.
-    async fn user_keys_behind_a_blank_frame(editor: &ModelEditor, keys: &[u8]) {
-        {
-            let mut control = editor.control.lock().unwrap();
-            control.drawing = Drawing::Frozen;
-            control.on_enter = OnEnter::Drop;
-        }
-        editor
-            .registry
-            .write_user_bytes(&editor.pane, &editor.id, keys)
-            .await
-            .unwrap();
-        let typed_by = Instant::now() + Duration::from_secs(8);
-        while !editor.typed().ends_with(keys) {
-            assert!(Instant::now() < typed_by, "the keys never reached the pane");
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-        editor
-            .bus
-            .push(claude_screen_at(" ", 0, &[], false, EDITOR_COLS as usize));
-        blank_with_cursor_at(editor, 0).await;
-    }
-
-    /// The model editor draws again and submits the deck's Enter.
-    fn editor_draws_again(editor: &ModelEditor) {
-        let mut control = editor.control.lock().unwrap();
-        control.drawing = Drawing::Composer;
-        control.on_enter = OnEnter::Submit;
-    }
-
-    /// Scenario: PRD #1666 part 3 (Q30). The user leaves blanks in a Claude Code 2.1.310 model editor's composer and presses Enter, which submits nothing, by key paths the input model cannot fully follow, while the screen shows exactly the empty composer with no placeholder: spaces, a non-ASCII character, Backspace and Ctrl+A, then the agent reports an unrelated turn starting and ending, or a late report of a prompt the user sent before; the reviewer's composed sequence (a non-ASCII character and Backspace, Enter, a space, Ctrl+J, End, Ctrl+U, Backspace, Ctrl+A); and, with no Enter at all, the reviewer's sequence that leaves two spaces on both measured agents (ab, Ctrl+J, two spaces, Home, Ctrl+U, Home, Backspace, Delete, Delete, Ctrl+U). The deck types nothing (nothing written: no empty composer) and the card says there may be an unsent draft; the measured remedy, a letter then Ctrl+C, proves the box empty and lets the next ring type once. A positive control: Up then Enter, which really submits, holds the ring only until the agent's prompt hook reports the prompt it took, and then the ring types its line.
-    #[spec("inbox/doorbell/050")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-    async fn doorbell_050_an_unknown_enter_needs_its_own_report() {
-        use crate::composer_model::PromptReport;
-        use crate::doorbell_txn::{NotTyped, Outcome};
-        use crate::inbox_display::WakeHold;
-        let held = RingOutcome::Txn(Outcome::NothingWritten(NotTyped::AwaitingPrompt));
-        let rings_once = |editor: &ModelEditor, report: RingReport, case: &str| {
-            assert_eq!(
-                report.outcome,
-                RingOutcome::Txn(Outcome::Submitted),
-                "{case}: {report:?}"
-            );
-            let typed = editor.typed();
-            let line = typed_line(&typed).expect("the line was typed");
-            assert_eq!(
-                typed
-                    .windows(line.len())
-                    .filter(|w| *w == line.as_bytes())
-                    .count(),
-                1,
-                "{case}: the line once"
-            );
-        };
-        let mut blanks_enter = b"  ".to_vec();
-        blanks_enter.extend_from_slice("\u{e9}".as_bytes());
-        blanks_enter.extend_from_slice(b"\x7f\x01\r");
-        let mut composed = "\u{e9}".as_bytes().to_vec();
-        composed.extend_from_slice(b"\x7f\r \n\x05\x15\x7f\x01");
-        let reviewer = b"ab\n  \x1b[H\x15\x1b[H\x7f\x1b[3~\x1b[3~\x15".to_vec();
-        for (case, keys, before) in [
-            ("an unrelated turn", blanks_enter.clone(), None),
-            ("a late report", blanks_enter, Some("hello")),
-            ("End and Ctrl+U after the Enter", composed, None),
-            ("the reviewer's sequence", reviewer, None),
-        ] {
-            let registry = Arc::new(AgentPtyRegistry::new());
-            let editor = ModelEditor::spawn(
-                &registry,
-                &format!("pane-ring-unknown-enter-{}", case.len()),
-                OnEnter::Submit,
-            );
-            if let Some(prompt) = before {
-                registry
-                    .write_user_bytes(&editor.pane, &editor.id, format!("{prompt}\r").as_bytes())
-                    .await
-                    .unwrap();
-                editor.wait_drawn("");
-            }
-            user_keys_behind_a_blank_frame(&editor, &keys).await;
-            if let Some(prompt) = before {
-                registry.note_prompt_report(&editor.pane, &editor.id, PromptReport::User(prompt));
-            }
-            registry.note_turn(&editor.pane, &editor.id, TurnEdge::Started);
-            registry.note_turn(&editor.pane, &editor.id, TurnEdge::Ended);
-            let before_ring = editor.typed();
-            let report = editor.ring().await;
-            assert_eq!(report.outcome, held, "{case}: {report:?}");
-            let state = idle_with_mail(&editor).await;
-            let bell = crate::doorbell::spawn(
-                registry.clone(),
-                state,
-                tick_config(Duration::from_millis(150)),
-            );
-            until("possible_draft", || {
-                shown_hold(&editor) == Some(WakeHold::PossibleDraft)
-            })
-            .await;
-            bell.abort();
-            assert_eq!(editor.typed(), before_ring, "{case}: no deck byte");
-            // The user's remedy: a letter, then Ctrl+C. The model proves the
-            // box empty, not only the editor's suggestion.
-            editor_draws_again(&editor);
-            registry
-                .write_user_bytes(&editor.pane, &editor.id, b"x\x03")
-                .await
-                .unwrap();
-            editor.wait_drawn("");
-            assert_eq!(
-                registry.input_proof(
-                    &editor.pane,
-                    Some(crate::composer_model::Semantics::ClaudeCode)
-                ),
-                crate::composer_model::InputProof::Empty,
-                "{case}: the remedy empties the box"
-            );
-            rings_once(&editor, editor.ring().await, case);
-            registry.shutdown_all();
-        }
-        // The positive control: history recalled with Up, then Enter.
-        let registry = Arc::new(AgentPtyRegistry::new());
-        let editor = ModelEditor::spawn(&registry, "pane-ring-unknown-enter-up", OnEnter::Submit);
-        editor.control.lock().unwrap().drawing = Drawing::Frozen;
-        registry
-            .write_user_bytes(&editor.pane, &editor.id, b"\x1b[A\r")
-            .await
-            .unwrap();
-        let typed_by = Instant::now() + Duration::from_secs(8);
-        while !editor.typed().ends_with(b"\x1b[A\r") {
-            assert!(Instant::now() < typed_by, "the keys never reached the pane");
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-        // A submitted prompt leaves the composer empty without its
-        // placeholder.
-        editor
-            .bus
-            .push(claude_screen_at(" ", 0, &[], false, EDITOR_COLS as usize));
-        blank_with_cursor_at(&editor, 0).await;
-        // Still frozen: the editor may read the keys only now, and a redraw
-        // of its empty composer would show its suggestion, which proves the
-        // box empty on the screen alone.
-        let report = editor.ring().await;
-        assert_eq!(report.outcome, held, "before the report: {report:?}");
-        editor_draws_again(&editor);
-        registry.note_prompt_report(
-            &editor.pane,
-            &editor.id,
-            PromptReport::User("the recalled prompt"),
-        );
-        registry.note_turn(&editor.pane, &editor.id, TurnEdge::Started);
-        registry.note_turn(&editor.pane, &editor.id, TurnEdge::Ended);
-        rings_once(&editor, editor.ring().await, "Up then Enter");
-        registry.shutdown_all();
-    }
-
-    /// Scenario: PRD #1666 part 3 (Q32), a positive control. On a Claude Code 2.1.310 model editor, type three spaces, Enter (which keeps them), x and Ctrl+U, which on Claude Code takes the whole line, so the box is empty; on Codex the three spaces would stay after its cursor. The ring is admitted and types its line once: the deck reads the box as the pane's own agent edits it.
-    #[spec("inbox/doorbell/050")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-    async fn doorbell_050_the_box_is_read_as_the_panes_agent_edits_it() {
-        use crate::composer_model::{InputProof, Semantics};
-        use crate::doorbell_txn::Outcome;
-        let registry = Arc::new(AgentPtyRegistry::new());
-        let editor = ModelEditor::spawn(&registry, "pane-ring-claude-rules", OnEnter::Submit);
-        user_keys_behind_a_blank_frame(&editor, b"   \rx\x15").await;
-        assert_eq!(
-            registry.input_proof(&editor.pane, Some(Semantics::ClaudeCode)),
-            InputProof::Empty
-        );
-        assert_eq!(
-            registry.input_proof(&editor.pane, Some(Semantics::Codex)),
-            InputProof::Draft
-        );
-        editor_draws_again(&editor);
-        let report = editor.ring().await;
-        assert_eq!(
-            report.outcome,
-            RingOutcome::Txn(Outcome::Submitted),
-            "{report:?}"
-        );
-        let typed = editor.typed();
-        let line = typed_line(&typed).expect("the line was typed");
-        assert_eq!(
-            typed
-                .windows(line.len())
-                .filter(|w| *w == line.as_bytes())
-                .count(),
-            1,
-            "the line once"
-        );
-        registry.shutdown_all();
-    }
-
-    /// Scenario: PRD #1666 part 3 (Q32). On a Claude Code 2.1.310 model editor, recall a prompt with Up, type after it, then press End and Ctrl+U: the input model knows only that the cursor's line is empty, since the recalled prompt may have had other lines. Behind a blank composer row with the cursor at its start, the ring is admitted and types its line once; behind a blank row with the cursor two columns in, where Ctrl+U on an empty line joined it to a line of blanks above, nothing is written.
-    #[spec("inbox/doorbell/050")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-    async fn doorbell_050_end_then_ctrl_u_proves_the_cursors_line_with_the_screen() {
-        use crate::composer_model::{InputProof, Semantics};
-        use crate::doorbell_txn::{NotTyped, Outcome};
-        let keys = b"\x1b[Ahi\x05\x15";
-        let registry = Arc::new(AgentPtyRegistry::new());
-        let editor = ModelEditor::spawn(&registry, "pane-ring-line-empty", OnEnter::Submit);
-        user_keys_behind_a_blank_frame(&editor, keys).await;
-        assert_eq!(
-            registry.input_proof(&editor.pane, Some(Semantics::ClaudeCode)),
-            InputProof::LineEmpty
-        );
-        assert_eq!(
-            registry.input_proof(&editor.pane, Some(Semantics::Codex)),
-            InputProof::Unknown
-        );
-        editor_draws_again(&editor);
-        let report = editor.ring().await;
-        assert_eq!(
-            report.outcome,
-            RingOutcome::Txn(Outcome::Submitted),
-            "{report:?}"
-        );
-        registry.shutdown_all();
-        let registry = Arc::new(AgentPtyRegistry::new());
-        let editor = ModelEditor::spawn(&registry, "pane-ring-line-joined", OnEnter::Submit);
-        user_keys_behind_a_blank_frame(&editor, keys).await;
-        editor
-            .bus
-            .push(claude_screen_at("  ", 2, &[], false, EDITOR_COLS as usize));
-        blank_with_cursor_at(&editor, 2).await;
-        let report = editor.ring().await;
-        assert_eq!(
-            report.outcome,
-            RingOutcome::Txn(Outcome::NothingWritten(NotTyped::AwaitingPrompt)),
-            "{report:?}"
-        );
-        assert_eq!(editor.typed(), keys, "only the user's keys");
-        registry.shutdown_all();
-    }
-
     /// Scenario: The model editor stops drawing, so the deck's line is typed and never echoed and the attempt will end suspended; while that ring holds the writer, a second ring for the same generation is started and waits for the writer. Once the first ring releases the writer with the cell suspended, the second is not admitted (suspended) and types nothing: the pane holds only the first line.
     #[spec("inbox/doorbell/050")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
@@ -28220,6 +27731,7 @@ mod spawn_tests {
             .bus
             .push(claude_screen("", &[], false, EDITOR_COLS as usize));
         editor.wait_clean();
+        editor.checked_empty();
         let report = editor.ring().await;
         assert_eq!(
             report.outcome,
@@ -28285,6 +27797,7 @@ mod spawn_tests {
         let ended = [keys.as_slice(), b"\x07"].concat();
         typed_until(&editor, |t| t == ended).await;
         editor.wait_clean();
+        editor.checked_empty();
         let report = editor.ring().await;
         assert_eq!(
             report.outcome,
@@ -28476,6 +27989,7 @@ mod spawn_tests {
             editor.wait_clean();
         }
 
+        editor.checked_empty();
         let mut reports = Vec::new();
         for _ in 0..3 {
             let report = editor.ring().await;
@@ -28751,14 +28265,15 @@ mod spawn_tests {
             "{:?}",
             ledger.settled()
         );
-        // The human's text is in the composer: cleared, the next ring is
-        // admitted.
+        // The human's text is in the composer: cleared, and a check read it
+        // empty, the next ring is admitted.
         editor.wait_drawn("HUMAN");
         registry
             .write_user_bytes(&editor.pane, &editor.id, b"\x15")
             .await
             .unwrap();
         editor.wait_drawn("");
+        editor.checked_empty();
         assert_eq!(
             editor.ring().await.outcome,
             RingOutcome::Txn(Outcome::Submitted),
@@ -28871,9 +28386,12 @@ mod spawn_tests {
             assert!(Instant::now() < deadline, "{:?}", shown_hold(&editor));
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        // (i) the user clears while the publisher is held.
+        // (i) the user clears while the publisher is held. (Q35-21: the
+        // deck's untaken line and the user's clear touched the box; a check
+        // reads it empty before each ring.)
         let _ = carried(&mut rx);
         registry.hold_publisher(true);
+        editor.checked_empty();
         let report = editor.ring().await;
         assert!(
             matches!(
@@ -28900,6 +28418,7 @@ mod spawn_tests {
         );
         // (l) retirement and a successor while held.
         registry.hold_publisher(true);
+        editor.checked_empty();
         let report = editor.ring().await;
         assert!(
             matches!(
@@ -29170,7 +28689,7 @@ mod spawn_tests {
             .await
             .unwrap();
         assert!(
-            registry.draft_pending(&editor.pane),
+            registry.input_touched(&editor.id),
             "the user's key is a draft"
         );
         assert!(
@@ -29200,7 +28719,7 @@ mod spawn_tests {
         assert!(!registry.doorbell_suspended(&editor.id));
         until("the card clears", || shown_hold(&editor).is_none()).await;
         assert!(
-            registry.draft_pending(&editor.pane),
+            registry.input_touched(&editor.id),
             "late evidence never clears the user's draft"
         );
         registry.shutdown_all();
@@ -31242,7 +30761,7 @@ mod spawn_tests {
         );
     }
 
-    /// Scenario: Run the real doorbell tick, with a 150 ms window, over a pane whose agent reports it waits for input while a message waits for it. The deck's inbox then says the doorbell holds because the agent may be waiting at a prompt, still so once a paste opens in the pane; once the agent is idle it says the paste is unfinished, once the paste closes it says there may be a draft, while the agent works it says nothing, and once the message is taken it says nothing either, the draft still there. The summary both clients read carries the same reason, and no doorbell byte reaches the pane.
+    /// Scenario: Run the real doorbell tick, with a 150 ms window, over a pane whose agent reports it waits for input while a message waits for it. The deck's inbox then says the doorbell holds because the agent may be waiting at a prompt, still so once a paste opens in the pane; once the agent is idle it says the paste is unfinished, once the paste closes it gives the generation's own reason (it can't be typed into, and no check can read its box), while the agent works it says nothing, and once the message is taken it says nothing either, the draft still there. The summary both clients read carries the same reason, and no doorbell byte reaches the pane.
     #[spec("inbox/doorbell/041")]
     #[tokio::test]
     async fn doorbell_041_the_tick_tells_the_inbox_why_it_holds() {
@@ -31301,7 +30820,7 @@ mod spawn_tests {
                         tokio::time::Instant::now() < deadline,
                         "the inbox never said {want:?}; it says {:?}, the pane's input {:?}, its queue {:?}",
                         registry.inbox().wake_hold(PANE, &agent),
-                        registry.pane_input_hold(PANE, None),
+                        registry.pane_input_hold(PANE, &agent),
                         registry.inbox().doorbell_facts(PANE, &agent),
                     );
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -31327,7 +30846,9 @@ mod spawn_tests {
             .apply_event(event(crate::event::EventType::Idle));
         held(Some(WakeHold::PasteOpen)).await;
         writer.lock().await.write_user(b"\x1b[201~").await.unwrap();
-        held(Some(WakeHold::PossibleDraft)).await;
+        // Q35-21: `possible_draft` only for a box the deck can check; this
+        // generation's typed doorbell is refused, and its clause shows.
+        held(Some(WakeHold::CannotType)).await;
 
         state
             .write()
@@ -31338,12 +30859,12 @@ mod spawn_tests {
             .write()
             .await
             .apply_event(event(crate::event::EventType::Idle));
-        held(Some(WakeHold::PossibleDraft)).await;
+        held(Some(WakeHold::CannotType)).await;
 
         let hook = registry.inbox().test_hook_fetch(PANE, &agent, None);
         assert_eq!(hook.deliveries.len(), 1);
         held(None).await;
-        assert!(registry.draft_pending(PANE), "the draft is still there");
+        assert!(registry.input_touched(&agent), "the draft is still there");
         bell.abort();
         assert_eq!(
             String::from_utf8_lossy(&log.lock().unwrap()),
@@ -31702,108 +31223,116 @@ mod spawn_tests {
         assert!(!state.lock().unwrap().tracks_pane(PANE));
     }
 
-    /// Issue #544: the draft bit rides the same stream state as the submit
-    /// drain, so paste framing and the report classifier cannot confuse each
-    /// other — including when a marker or a report is split across writes.
+    /// Issue #544: the user's submits and clears ride the same stream as the
+    /// submit drain, so paste framing and reports cannot confuse them —
+    /// including when a marker or a report is split across writes. (Q35-21:
+    /// the draft bit this pinned went with the keystroke model; the recovery count
+    /// reads the stream now.)
     #[test]
-    fn draft_bit_shares_the_stream_with_paste_framing() {
+    fn submits_and_clears_share_the_stream_with_paste_framing() {
         let mut stream = PaneInputStream::default();
         assert!(
             !stream.feed(b"\x1b[<64;10;5M\x1b[I"),
             "reports submit nothing"
         );
-        assert!(!stream.draft.pending(), "reports are not a draft");
+        assert_eq!(stream.recovery.clears(), 0, "reports clear nothing");
 
         // A paste split mid-marker: its newlines neither submit nor clear.
         assert!(!stream.feed(b"\x1b[20"));
         assert!(!stream.feed(b"0~line one\r"));
         assert!(!stream.feed(b"line two\x1b[201~"));
-        assert!(stream.draft.pending(), "pasted text is a draft");
         // A Ctrl+U INSIDE a paste is content, not a clear.
         assert!(!stream.feed(b"\x1b[200~\x15\x1b[201~"));
-        assert!(stream.draft.pending());
+        assert_eq!(stream.recovery.clears(), 0, "nothing pasted clears");
 
-        // Out of the paste, a report after the draft leaves it pending, and
-        // Enter clears it.
+        // Out of the paste, a report clears nothing, and Enter submits.
         assert!(!stream.feed(b"\x1b[10;5R"));
-        assert!(stream.draft.pending());
+        assert_eq!(stream.recovery.clears(), 0);
         assert!(stream.feed(b"\r"));
-        assert!(!stream.draft.pending());
+        assert_eq!(stream.recovery.clears(), 1);
     }
 
     /// Issue #544 (PR #1398 re-review): a literal `ESC[200~` pasted into an
     /// empty box is content. The stream's paste framing stays in the paste
-    /// across it — a paste cannot nest — and the draft bit, reading the same
-    /// framing, counts it: the two agree that only `ESC[201~` ends the paste.
+    /// across it — a paste cannot nest — so only `ESC[201~` ends the paste.
+    /// (Q35-21: the draft bit that read the same framing went with
+    /// keystroke model; what the box holds is the input epoch's.)
     #[test]
-    fn a_pasted_opening_marker_is_a_draft_and_leaves_the_paste_open() {
+    fn a_pasted_opening_marker_leaves_the_paste_open() {
         let mut stream = PaneInputStream::default();
         assert!(!stream.feed(b"\x1b[200~\x1b[200~"));
         assert!(stream.in_paste, "a nested opening marker left the paste");
-        assert!(stream.draft.pending(), "a pasted ESC[200~ is not a draft");
         // Still in the paste, so this newline is content, not a submit.
         assert!(!stream.feed(b"\r"));
         assert!(!stream.feed(b"\x1b[201~"));
         assert!(!stream.in_paste);
-        assert!(stream.draft.pending());
+        assert_eq!(stream.recovery.clears(), 0, "nothing was submitted");
     }
 
-    /// Issue #544: a pane that changes hands, or closes, starts with no draft.
+    /// Issue #544: a pane that changes hands, or closes, starts with a fresh
+    /// input stream: no paste open and no submit or clear counted.
     #[test]
-    fn draft_bit_is_reset_by_forget_pane_and_forget_closed_pane() {
+    fn the_input_stream_is_reset_by_forget_pane_and_forget_closed_pane() {
         const PANE: &str = "issue-544-forget";
         let mut state = PaneInputState::default();
-        state.note_user_bytes(PANE, b"draft");
-        assert!(state.draft_pending(PANE), "the control");
+        state.note_user_bytes(PANE, b"\x1b[200~draft\x15");
+        assert!(state.in_paste(PANE), "the control");
         state.forget_pane(PANE);
-        assert!(!state.draft_pending(PANE), "forget_pane");
+        assert!(!state.in_paste(PANE), "forget_pane");
+        assert!(!state.input.contains_key(PANE), "forget_pane");
 
-        state.note_user_bytes(PANE, b"draft");
+        state.note_user_bytes(PANE, b"\x1b[200~draft");
         state.forget_closed_pane(PANE);
-        assert!(!state.draft_pending(PANE), "forget_closed_pane");
+        assert!(!state.in_paste(PANE), "forget_closed_pane");
+        assert!(!state.tracks_pane(PANE), "forget_closed_pane");
 
         // Sentinel ids never hold one.
-        state.note_user_bytes("<no-pane>", b"draft");
-        assert!(!state.draft_pending("<no-pane>"));
+        state.note_user_bytes("<no-pane>", b"\x1b[200~draft");
+        assert!(!state.in_paste("<no-pane>"));
     }
 
     /// PR #1398 finding #14: a paste whose opening marker and content arrive
-    /// as separate writes is a draft from the marker on. A first write checking
-    /// in between must wait, or it lands in the middle of the paste. An empty
-    /// paste still leaves nothing pending once it closes.
+    /// as separate writes is open from the marker on, so a first write
+    /// checking in between waits rather than landing in the middle of it. An
+    /// empty paste leaves nothing open once it closes.
     #[test]
-    fn an_open_paste_is_a_pending_draft_before_its_content_arrives() {
+    fn an_open_paste_is_open_before_its_content_arrives() {
         const PANE: &str = "issue-544-split-paste";
         let mut state = PaneInputState::default();
         state.note_user_bytes(PANE, b"\x1b[200~");
         assert!(
-            state.draft_pending(PANE),
-            "an open paste with no content yet is not pending"
+            state.in_paste(PANE),
+            "an open paste with no content yet is not open"
         );
         state.note_user_bytes(PANE, b"pasted");
+        assert!(state.in_paste(PANE), "the pasted text");
         state.note_user_bytes(PANE, b"\x1b[201~");
-        assert!(state.draft_pending(PANE), "the pasted text");
+        assert!(!state.in_paste(PANE), "the paste closed");
 
         let mut state = PaneInputState::default();
         state.note_user_bytes(PANE, b"\x1b[200~");
         state.note_user_bytes(PANE, b"\x1b[201~");
-        assert!(!state.draft_pending(PANE), "an empty paste");
+        assert!(!state.in_paste(PANE), "an empty paste");
     }
 
     /// Sweep (PR #1398 #15's class): a CR of ours written into a paste the
-    /// user still has open is paste CONTENT — it submits nothing — so the draft
-    /// the paste already holds is still in the box afterwards.
+    /// user still has open is paste CONTENT — it submits nothing and the
+    /// paste stays open — and the user's Enter after they close it is theirs.
     #[test]
-    fn a_daemon_submit_inside_an_open_paste_does_not_clear_the_draft() {
+    fn a_daemon_submit_inside_an_open_paste_submits_nothing() {
         const PANE: &str = "issue-544-submit-in-paste";
         let mut state = PaneInputState::default();
         state.note_user_bytes(PANE, b"\x1b[200~abc");
         state.note_deck_bytes(PANE, b"PAYLOAD\r");
+        assert!(state.in_paste(PANE), "a daemon CR inside a paste closed it");
         state.note_user_bytes(PANE, b"\x1b[201~");
-        assert!(
-            state.draft_pending(PANE),
-            "a daemon CR inside a paste cleared the pasted draft"
+        assert_eq!(
+            state.user_clears(PANE),
+            0,
+            "nothing of the user's submitted"
         );
+        state.note_user_bytes(PANE, b"\r");
+        assert_eq!(state.user_clears(PANE), 1, "the user's Enter submits");
     }
 
     /// Sweep (PR #1398 #15's class): after a daemon submit the byte before the
@@ -31812,13 +31341,11 @@ mod spawn_tests {
     /// submits — not the `Alt+Enter` the stale predecessor would make it.
     #[test]
     fn a_daemon_submit_ends_the_users_esc_prefix_for_the_submit_scan() {
-        const PANE: &str = "issue-544-esc-then-submit";
-        let mut state = PaneInputState::default();
-        state.note_user_bytes(PANE, b"\x1b");
-        state.note_deck_bytes(PANE, b"PAYLOAD\r");
-        state.note_user_bytes(PANE, b"\r");
+        let mut stream = PaneInputStream::default();
+        assert!(!stream.feed(b"\x1b"));
+        assert!(stream.feed_as(b"PAYLOAD\r", crate::composer_probe::recovery::Origin::Deck));
         assert!(
-            !state.draft_pending(PANE),
+            stream.feed(b"\r"),
             "the user's Enter after our submit was read as Alt+Enter"
         );
     }
@@ -31834,8 +31361,10 @@ mod spawn_tests {
         state.note_user_bytes(PANE, b"\x1b[20");
         state.note_deck_bytes(PANE, b"PAYLOAD\r");
         state.note_user_bytes(PANE, b"0~abc\r");
-        assert!(
-            !state.draft_pending(PANE),
+        assert!(!state.in_paste(PANE), "a paste nobody opened");
+        assert_eq!(
+            state.user_clears(PANE),
+            1,
             "the user's Enter was read as a newline inside a paste nobody opened"
         );
     }
@@ -31852,27 +31381,28 @@ mod spawn_tests {
         state.note_deck_bytes(PANE, b"PAYLOAD\r");
         assert!(state.input[PANE].in_paste, "our CR is paste content");
         state.note_user_bytes(PANE, b"def\x1b[201~");
-        assert!(state.draft_pending(PANE), "the paste is still in the box");
+        assert_eq!(state.user_clears(PANE), 0, "nothing was submitted");
         state.note_user_bytes(PANE, b"\r");
-        assert!(!state.draft_pending(PANE), "the user's Enter submits it");
+        assert_eq!(state.user_clears(PANE), 1, "the user's Enter submits it");
 
         let mut state = PaneInputState::default();
         state.note_user_bytes(PANE, b"\x1b[200~abc");
         state.note_deck_bytes(PANE, b"\x1b[200~one\ntwo\x1b[201~\n");
         assert!(!state.input[PANE].in_paste, "our closing marker ended it");
-        assert!(state.draft_pending(PANE), "a notice submits nothing");
+        assert_eq!(state.user_clears(PANE), 0, "a notice submits nothing");
         state.note_user_bytes(PANE, b"\r");
-        assert!(
-            !state.draft_pending(PANE),
+        assert_eq!(
+            state.user_clears(PANE),
+            1,
             "the user's Enter after our notice closed the paste is a submit"
         );
     }
 
     /// PR #1398 finding #16, one stream: a deck write right after a lone user
-    /// `ESC`. A lone Escape keypress is not a draft, so neither a multi-line
-    /// submit nor a multi-line notice written after it leaves one; the
-    /// notice's paste is closed by its own marker; and the user's typing
-    /// afterwards is read afresh.
+    /// `ESC`. Neither a multi-line submit nor a multi-line notice written
+    /// after it leaves a paste open, the notice's paste is closed by its own
+    /// marker, and the user's typing afterwards is read afresh: their Enter
+    /// submits.
     #[test]
     fn deck_writes_after_a_lone_user_escape() {
         const PANE: &str = "issue-544-deck-after-esc";
@@ -31885,22 +31415,18 @@ mod spawn_tests {
             state.note_user_bytes(PANE, b"\x1b");
             state.note_deck_bytes(PANE, deck);
             assert!(!state.input[PANE].in_paste, "{why}: paste left open");
-            assert!(
-                !state.draft_pending(PANE),
-                "{why}: a lone Escape is a draft"
-            );
             state.note_user_bytes(PANE, b"]abc");
-            assert!(state.draft_pending(PANE), "{why}: later typing is a draft");
+            assert_eq!(state.user_clears(PANE), 0, "{why}: nothing submitted yet");
             state.note_user_bytes(PANE, b"\r");
-            assert!(!state.draft_pending(PANE), "{why}: the Enter submits");
+            assert_eq!(state.user_clears(PANE), 1, "{why}: the Enter submits");
         }
     }
 
     /// PR #1398 finding #16, one stream: user bytes split around a deck write.
-    /// The PTY sees them in that order, so the model does too — a draft typed
-    /// around our notice is one draft, a user CSI completed by our byte is a
-    /// key, and a paste marker our partial write left half-sent is completed
-    /// by the user's next bytes exactly as the agent's parser completes it.
+    /// The PTY sees them in that order, so the framing does too — a paste
+    /// around our notice is one paste, and a paste marker our partial write
+    /// left half-sent is completed by the user's next bytes exactly as the
+    /// agent's parser completes it, so their Enter inside it is content.
     #[test]
     fn user_bytes_split_around_a_deck_write() {
         const PANE: &str = "issue-544-split-around-deck";
@@ -31908,34 +31434,26 @@ mod spawn_tests {
         state.note_user_bytes(PANE, b"dra");
         state.note_deck_bytes(PANE, b"NOTICE\n");
         state.note_user_bytes(PANE, b"ft");
-        assert!(state.draft_pending(PANE), "the draft around our notice");
         state.note_user_bytes(PANE, b"\r");
-        assert!(!state.draft_pending(PANE));
+        assert_eq!(state.user_clears(PANE), 1, "the user's Enter submits");
 
         let mut state = PaneInputState::default();
         state.note_user_bytes(PANE, b"\x1b[200~ab");
         state.note_deck_bytes(PANE, b"NOTICE\n");
+        assert!(state.input[PANE].in_paste, "the paste around our notice");
         state.note_user_bytes(PANE, b"c\x1b[201~");
         assert!(!state.input[PANE].in_paste);
-        assert!(state.draft_pending(PANE), "the paste around our notice");
-
-        let mut state = PaneInputState::default();
-        state.note_user_bytes(PANE, b"\x1b[");
-        state.note_deck_bytes(PANE, b"NOTICE\n");
-        assert!(
-            state.draft_pending(PANE),
-            "the user's half-sent key, completed by our byte, is an edit"
-        );
 
         // An ambiguous write of ours that stopped inside its own opening
         // marker: the user's next bytes complete it.
         let mut state = PaneInputState::default();
         state.note_deck_bytes(PANE, b"\x1b[20");
-        assert!(!state.draft_pending(PANE));
+        assert!(!state.in_paste(PANE));
         state.note_user_bytes(PANE, b"0~abc\r");
         assert!(state.input[PANE].in_paste, "the marker completed");
-        assert!(
-            state.draft_pending(PANE),
+        assert_eq!(
+            state.user_clears(PANE),
+            0,
             "the user's Enter inside the paste is content"
         );
     }

@@ -258,9 +258,6 @@ pub struct ScreenProfile {
     pub width_witness: fn(&vt100::Screen, &WidthsSeen) -> bool,
     /// The narrowest pane the measurements cover; a narrower one refuses.
     pub min_cols: u16,
-    /// How the agent's input box edits, which the input model follows
-    /// ([`crate::composer_model::Semantics`]).
-    pub input: crate::composer_model::Semantics,
     /// How the agent ends a wait for a cursor position report, which decides
     /// when the generation's `B` turns false (PRD #1666 part 3, Q35-06; A2
     /// §4.2).
@@ -640,7 +637,6 @@ pub static CODEX_PROFILE: ScreenProfile = ScreenProfile {
     redraw_marker: b"\x1b[?2026h\x1b[1;1H\x1b[J",
     width_witness: codex_width_witness,
     min_cols: 80,
-    input: crate::composer_model::Semantics::Codex,
     // P-WE: every production CPR wait in `codex-rs/tui` ends before the next
     // `?2026h` its own control flow writes (M-WE checks it on the binaries).
     cpr_wait_end: crate::composer_probe::query_ledger::CprWaitEnd::SyncBegin,
@@ -712,8 +708,8 @@ fn claude_composer(grid: &Grid) -> Option<Composer> {
     // Blanks written as cells on the prompt row say nothing either way:
     // Claude Code writes typed spaces after a repaint, and clearing them
     // with `End` then `Ctrl+U` writes blanks over them (measured on 2.1.310,
-    // 2026-10-26), so an empty box can draw them. The input model decides
-    // (`crate::composer_model`).
+    // 2026-10-26), so an empty box can draw them. The input epoch decides
+    // (`crate::doorbell_txn::Frame::touched`).
     let mut dim = true;
     let mut any = false;
     for r in prompt_row..=last_row {
@@ -945,7 +941,6 @@ pub static CLAUDE_PROFILE: ScreenProfile = ScreenProfile {
     redraw_marker: b"\x1b[2J\x1b[H",
     width_witness: claude_width_witness,
     min_cols: 80,
-    input: crate::composer_model::Semantics::ClaudeCode,
     cpr_wait_end: crate::composer_probe::query_ledger::CprWaitEnd::Counted,
     // A full redraw within 9 ms of each of the 10 resizes and 10 nudges
     // measured, rounded up; it emits no CPR and waits on no query.
@@ -1093,7 +1088,6 @@ pub static STANDIN_PROFILE: ScreenProfile = ScreenProfile {
     redraw_marker: b"\x1b[2J\x1b[H",
     width_witness: standin_width_witness,
     min_cols: 40,
-    input: crate::composer_model::Semantics::ClaudeCode,
     cpr_wait_end: crate::composer_probe::query_ledger::CprWaitEnd::Counted,
     // The stand-in's contract: it reads its size between 25 ms waits for
     // input, redraws on a change and asks nothing, so Claude Code's values
@@ -1122,7 +1116,6 @@ pub static STANDIN_CPR_PROFILE: ScreenProfile = ScreenProfile {
     redraw_marker: b"\x1b[2J\x1b[H",
     width_witness: standin_width_witness,
     min_cols: 40,
-    input: crate::composer_model::Semantics::ClaudeCode,
     cpr_wait_end: crate::composer_probe::query_ledger::CprWaitEnd::Counted,
     redraw: crate::composer_probe::query_wait::RedrawTiming {
         per_size_change: std::time::Duration::from_millis(2000),
@@ -1359,7 +1352,7 @@ pub fn frame(
         composer,
         user_cells,
         text,
-        input: Default::default(),
+        touched: false,
     }
 }
 

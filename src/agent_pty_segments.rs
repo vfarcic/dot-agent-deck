@@ -1221,7 +1221,18 @@ pub(crate) enum TickProbe {
 /// The tick's decision from the generation's input and its gate's status at
 /// `now`: a check outstanding rings nothing, and asks the retry of its own
 /// lapsed Claude probe once the schedule allows it; with nothing
-/// outstanding, the schedule's first attempt or retry when one is due.
+/// outstanding, the schedule's first attempt or retry when one is due, for
+/// a touched box.
+///
+/// **A check outstanding rings nothing whether or not the box is touched
+/// (Q35-21).** A check's empty read applies as soon as its record decides,
+/// before its segment ends, so the box reads untouched while the probe's
+/// fence is still closed. A ring admitted then has its line accepted, which
+/// moves the epoch, and refused at the writer (`Fenced`): nothing is typed,
+/// but the box reads touched again and the next tick checks again, a probe
+/// per ring for as long as the timing repeats (CI run 41672923398). So the
+/// ring waits for the segment to end, as it waits for anything else that
+/// holds the fence.
 ///
 /// A front segment that can never complete (`Segments::stranded`) is no
 /// check outstanding, nor is the fence it keeps closed: nothing will end
@@ -1253,7 +1264,9 @@ pub(crate) fn tick_probe(
         }
         return TickProbe::Outstanding;
     }
-    if stranded || !input.probe_due(now) {
+    // Q35-21: an untouched box needs no check; with none outstanding the
+    // tick rings as today.
+    if stranded || !input.touched() || !input.probe_due(now) {
         return TickProbe::NotDue;
     }
     // A due attempt after a failure is the schedule's retry.
@@ -1265,12 +1278,29 @@ pub(crate) fn tick_probe(
 }
 
 impl AgentPtyRegistry {
+    /// PRD #1666 part 3 (Q35-21): whether the last check the deck tried on
+    /// generation `agent_id` failed (refused, lapsed or uncertain) and the
+    /// schedule is backing off before the next: the card then says the deck
+    /// can't check the box, rather than that a check read it non-empty.
+    /// `false` for a generation with no segments.
+    pub(crate) fn composer_probe_failing(&self, agent_id: &str) -> bool {
+        let input = {
+            let inner = self.inner.lock();
+            inner
+                .agents
+                .get(agent_id)
+                .map(|agent| Arc::clone(agent.bus.input()))
+        };
+        input.is_some_and(|input| input.has_segments() && input.probe_retrying())
+    }
+
     /// PRD #1666 part 3 (Q35-20): the doorbell tick's check of an
-    /// `Armable` generation whose box was touched ([`tick_probe`]). Starts
-    /// the probe it asks, off the tick, one request at a time; `true` while
-    /// one is started or on its way or a check is outstanding (the tick then
+    /// `Armable` generation ([`tick_probe`]). Starts the probe it asks, off
+    /// the tick, one request at a time; `true` while one is started or on
+    /// its way or a check is outstanding, touched or not (the tick then
     /// rings nothing this time), `false` when the tick goes on as it does
-    /// today: not `Armable`, untouched, or no probe due. A refused retry of
+    /// today: not `Armable`, or nothing outstanding and no probe due (an
+    /// untouched box included). A refused retry of
     /// a lapsed probe counts as a failure, as a refused due attempt does.
     pub(crate) fn composer_probe_tick(self: &Arc<Self>, pane_id: &str, agent_id: &str) -> bool {
         #[cfg(target_os = "linux")]
@@ -1281,7 +1311,6 @@ impl AgentPtyRegistry {
             let input = h.bus.input();
             if !input.has_segments()
                 || h.observer.permission() != crate::composer_probe::Permission::Armable
-                || !input.touched()
             {
                 return false;
             }
@@ -1693,6 +1722,52 @@ mod tests {
         assert!(input.attach_records(Records::new(5, EcPolicy::Hold, Instant::now())));
         assert!(input.attach_segments(5, agent));
         input
+    }
+
+    /// Scenario: The doorbell tick decides for an untouched box with no check under way (nothing to ask; the ring goes ahead), then with a probe's segment still open over that untouched box, as after its empty read applied and before the segment ended (a check outstanding, so no ring the writer's fence would refuse), then for a box a person touched with nothing outstanding (the first check is asked).
+    #[cfg(target_os = "linux")]
+    #[spec("inbox/probe/024")]
+    #[test]
+    fn probe_024_an_untouched_box_rings_only_once_no_check_is_outstanding() {
+        use crate::composer_probe::epoch::Writer;
+        use crate::composer_probe::gate::Status;
+        use crate::composer_probe::segments::Agent;
+        let now = Instant::now();
+        for agent in [Agent::Claude, Agent::Codex] {
+            let input = live(agent);
+            assert!(!input.touched(), "{agent:?}: a fresh box is untouched");
+            assert_eq!(
+                tick_probe(&input, Status::default(), now),
+                TickProbe::NotDue,
+                "{agent:?}: untouched, nothing outstanding: no check, the tick rings"
+            );
+            input.segment_open_probe(false, now).unwrap();
+            assert!(
+                !input.touched(),
+                "{agent:?}: opening a segment types nothing"
+            );
+            assert_eq!(
+                tick_probe(&input, Status::default(), now),
+                TickProbe::Outstanding,
+                "{agent:?}: untouched with a check's segment open: ring nothing"
+            );
+            let fenced = Status {
+                fenced: true,
+                ..Status::default()
+            };
+            assert_eq!(
+                tick_probe(&input, fenced, now),
+                TickProbe::Outstanding,
+                "{agent:?}: untouched behind a closed fence: ring nothing"
+            );
+            let input = live(agent);
+            input.enqueue(Writer::Human, b"x");
+            assert_eq!(
+                tick_probe(&input, Status::default(), now),
+                TickProbe::Ask(ProbeAsk::First),
+                "{agent:?}: touched, nothing outstanding: check first"
+            );
+        }
     }
 
     /// Scenario: The doorbell tick finds its own Claude probe written more than the trigger's wait ago with no helper seen: lapsed, alone, nothing held behind it. The first tick counts the lapse as a failed attempt and asks nothing; once the schedule's backoff has passed it asks the lapse retry, and asks it again on the next tick without counting the same lapse twice. With typing held behind the lapsed probe it never asks; a Codex probe written as long ago never lapses; and while one request is on its way the tick can start no other.
