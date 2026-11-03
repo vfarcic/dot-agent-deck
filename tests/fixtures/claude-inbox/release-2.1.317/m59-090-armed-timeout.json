@@ -1,0 +1,249 @@
+{
+ "release": "2.1.317",
+ "sha256": "eb224419e344575faa4a1f39b290b649425a10cd5ee2ef1d003480cd9ae57eb0",
+ "source_capture": "/var/tmp/dad-m59-Qaa31n/capture",
+ "recorder_sha256": "bbacdcc3830da41c0c59b1a276314605eb27ac62ef560c3d7b2099c671a8ef75",
+ "error": null,
+ "rows": [
+  {
+   "trial": 1,
+   "draft": "M59_DRAFT_1",
+   "editor_rc_planned": 0,
+   "sent_t": 3445351289357682,
+   "helper_pid": 500172,
+   "helper_seen_t": 3445351606765014,
+   "helper_gone_t": 3445355091622335,
+   "zombie_status": {
+    "exited": true,
+    "code": 0,
+    "signal": null,
+    "raw": 0
+   },
+   "helper_life_from_start_s": 3.515345126,
+   "helper_life_from_branch_s": 3.5132319,
+   "helper_life_from_ctrl_g_s": 3.802264653,
+   "notice_in_output": true,
+   "claude_notice_before_end": [],
+   "claude_notice_after_end": [],
+   "composer_after": "M59_DRAFT_1",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "armed None ArmedExit { notice: true, status: 0 }"
+   ],
+   "editor_stages": []
+  },
+  {
+   "trial": 2,
+   "draft": "M59_DRAFT_2",
+   "editor_rc_planned": 0,
+   "sent_t": 3445358680783123,
+   "helper_pid": 500269,
+   "helper_seen_t": 3445358754634369,
+   "helper_gone_t": 3445362239545141,
+   "zombie_status": null,
+   "helper_life_from_start_s": 3.51777894,
+   "helper_life_from_branch_s": 3.515389552,
+   "helper_life_from_ctrl_g_s": 3.558762018,
+   "notice_in_output": true,
+   "claude_notice_before_end": [],
+   "claude_notice_after_end": [],
+   "composer_after": "M59_DRAFT_2",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "armed None ArmedExit { notice: true, status: 0 }"
+   ],
+   "editor_stages": []
+  },
+  {
+   "trial": 3,
+   "draft": "M59_DRAFT_3",
+   "editor_rc_planned": 0,
+   "sent_t": 3445365821972908,
+   "helper_pid": 500359,
+   "helper_seen_t": 3445365885564482,
+   "helper_gone_t": 3445369369818227,
+   "zombie_status": null,
+   "helper_life_from_start_s": 3.517165866,
+   "helper_life_from_branch_s": 3.514955348,
+   "helper_life_from_ctrl_g_s": 3.547845319,
+   "notice_in_output": true,
+   "claude_notice_before_end": [],
+   "claude_notice_after_end": [],
+   "composer_after": "M59_DRAFT_3",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "armed None ArmedExit { notice: true, status: 0 }"
+   ],
+   "editor_stages": []
+  },
+  {
+   "trial": 4,
+   "draft": "M59_DRAFT_4",
+   "editor_rc_planned": 0,
+   "sent_t": 3445372961840340,
+   "helper_pid": 500416,
+   "helper_seen_t": 3445373022478080,
+   "helper_gone_t": 3445376513174393,
+   "zombie_status": null,
+   "helper_life_from_start_s": 3.519037155,
+   "helper_life_from_branch_s": 3.516949204,
+   "helper_life_from_ctrl_g_s": 3.551334053,
+   "notice_in_output": true,
+   "claude_notice_before_end": [],
+   "claude_notice_after_end": [],
+   "composer_after": "M59_DRAFT_4",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "armed None ArmedExit { notice: true, status: 0 }"
+   ],
+   "editor_stages": []
+  },
+  {
+   "trial": 5,
+   "draft": "M59_DRAFT_5",
+   "editor_rc_planned": 0,
+   "sent_t": 3445380100989150,
+   "helper_pid": 500523,
+   "helper_seen_t": 3445380172033136,
+   "helper_gone_t": 3445383646277255,
+   "zombie_status": null,
+   "helper_life_from_start_s": 3.517165683,
+   "helper_life_from_branch_s": 3.514833696,
+   "helper_life_from_ctrl_g_s": 3.545288105,
+   "notice_in_output": true,
+   "claude_notice_before_end": [],
+   "claude_notice_after_end": [],
+   "composer_after": "M59_DRAFT_5",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "armed None ArmedExit { notice: true, status: 0 }"
+   ],
+   "editor_stages": []
+  },
+  {
+   "trial": 6,
+   "draft": "M59_DRAFT_6",
+   "editor_rc_planned": 0,
+   "sent_t": 3445387232478527,
+   "helper_pid": 500699,
+   "helper_seen_t": 3445387303473880,
+   "helper_gone_t": 3445390775564272,
+   "zombie_status": null,
+   "helper_life_from_start_s": 3.517006431,
+   "helper_life_from_branch_s": 3.515051773,
+   "helper_life_from_ctrl_g_s": 3.543085745,
+   "notice_in_output": true,
+   "claude_notice_before_end": [],
+   "claude_notice_after_end": [],
+   "composer_after": "M59_DRAFT_6",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "armed None ArmedExit { notice: true, status: 0 }"
+   ],
+   "editor_stages": []
+  },
+  {
+   "trial": 7,
+   "draft": "M59_DRAFT_7",
+   "editor_rc_planned": 0,
+   "sent_t": 3445394363425732,
+   "helper_pid": 500770,
+   "helper_seen_t": 3445394433776475,
+   "helper_gone_t": 3445397908309954,
+   "zombie_status": {
+    "exited": true,
+    "code": 0,
+    "signal": null,
+    "raw": 0
+   },
+   "helper_life_from_start_s": 3.517994599,
+   "helper_life_from_branch_s": 3.516041338,
+   "helper_life_from_ctrl_g_s": 3.544884222,
+   "notice_in_output": true,
+   "claude_notice_before_end": [],
+   "claude_notice_after_end": [],
+   "composer_after": "M59_DRAFT_7",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "armed None ArmedExit { notice: true, status: 0 }"
+   ],
+   "editor_stages": []
+  },
+  {
+   "trial": 8,
+   "draft": "M59_DRAFT_8",
+   "editor_rc_planned": 0,
+   "sent_t": 3445401498218213,
+   "helper_pid": 500890,
+   "helper_seen_t": 3445401602273718,
+   "helper_gone_t": 3445405039972127,
+   "zombie_status": null,
+   "helper_life_from_start_s": 3.51775371,
+   "helper_life_from_branch_s": 3.516449162,
+   "helper_life_from_ctrl_g_s": 3.541753914,
+   "notice_in_output": true,
+   "claude_notice_before_end": [],
+   "claude_notice_after_end": [],
+   "composer_after": "M59_DRAFT_8",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "armed None ArmedExit { notice: true, status: 0 }"
+   ],
+   "editor_stages": []
+  },
+  {
+   "trial": 9,
+   "draft": "M59_DRAFT_9",
+   "editor_rc_planned": 0,
+   "sent_t": 3445408627294301,
+   "helper_pid": 500934,
+   "helper_seen_t": 3445408693073214,
+   "helper_gone_t": 3445412174429695,
+   "zombie_status": null,
+   "helper_life_from_start_s": 3.519892538,
+   "helper_life_from_branch_s": 3.517861773,
+   "helper_life_from_ctrl_g_s": 3.547135394,
+   "notice_in_output": true,
+   "claude_notice_before_end": [],
+   "claude_notice_after_end": [],
+   "composer_after": "M59_DRAFT_9",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "armed None ArmedExit { notice: true, status: 0 }"
+   ],
+   "editor_stages": []
+  },
+  {
+   "trial": 10,
+   "draft": "M59_DRAFT_10",
+   "editor_rc_planned": 0,
+   "sent_t": 3445415753510945,
+   "helper_pid": 500991,
+   "helper_seen_t": 3445415824627841,
+   "helper_gone_t": 3445419296719682,
+   "zombie_status": null,
+   "helper_life_from_start_s": 3.516784238,
+   "helper_life_from_branch_s": 3.514836843,
+   "helper_life_from_ctrl_g_s": 3.543208737,
+   "notice_in_output": true,
+   "claude_notice_before_end": [],
+   "claude_notice_after_end": [],
+   "composer_after": "M59_DRAFT_10",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "armed None ArmedExit { notice: true, status: 0 }"
+   ],
+   "editor_stages": []
+  }
+ ]
+}

@@ -198,7 +198,7 @@ fn latched(trace: &Trace) -> (AgentType, Version) {
     }
 }
 
-/// Scenario: Replay the recorded start-up of Codex 0.164.0, Codex 0.160.0 and Claude Code 2.1.310 and 2.1.312 through the release scanner at the PTY reader's recorded split, one byte at a time, and as one push. Each latches its own release every way.
+/// Scenario: Replay the recorded start-up of Codex 0.164.0, Codex 0.160.0 and Claude Code 2.1.310, 2.1.312 and 2.1.317 through the release scanner at the PTY reader's recorded split, one byte at a time, and as one push. Each latches its own release every way.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_release_headers_latch_from_real_launches() {
@@ -242,6 +242,16 @@ fn doorbell_036_release_headers_latch_from_real_launches() {
             "claude-inbox/r5wake/claude-2.1.312-composer-24x80",
             AgentType::ClaudeCode,
             "2.1.312",
+        ),
+        (
+            "claude-inbox/r5wake/claude-2.1.317-start-50x200",
+            AgentType::ClaudeCode,
+            "2.1.317",
+        ),
+        (
+            "claude-inbox/r5wake/claude-2.1.317-composer-24x80",
+            AgentType::ClaudeCode,
+            "2.1.317",
         ),
         (
             "codex-inbox/r5wake/codex-0.164.0-deck-tester-fresh-46x130",
@@ -420,11 +430,11 @@ fn doorbell_036_codex_composer_over_real_frames() {
     }
 }
 
-/// Scenario: Replay both Claude releases' composers and menu surfaces at every recorded size and palette; the main composer stays ready with warning phrases quoted in its transcript, while overview, menus, shell mode and exit warning refuse readiness. Compound-key captures reveal retained spaces and preserve the draft after blank Enter. Replay every Claude fixture at every recorded PTY read boundary with production parsing and recorded resizes, pinning each composer-bearing frame's ready and empty-ready decisions in the committed ledger.
+/// Scenario: Replay the recorded Claude releases' composers and menu surfaces at every recorded size and palette; the main composer stays ready with warning phrases quoted in its transcript, while overview, menus, shell mode and exit warning refuse readiness. Compound-key captures reveal retained spaces and preserve the draft after blank Enter. Replay every Claude fixture at every recorded PTY read boundary with production parsing and recorded resizes, pinning each composer-bearing frame's ready and empty-ready decisions in the committed ledger.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_claude_composer_over_real_frames() {
-    for release in ["2.1.310", "2.1.312"] {
+    for release in ["2.1.310", "2.1.312", "2.1.317"] {
         let trace = fixture(&format!(
             "claude-inbox/r5wake/claude-{release}-composer-24x80"
         ));
@@ -453,24 +463,29 @@ fn doorbell_036_claude_composer_over_real_frames() {
             "a blank composer is not the placeholder"
         );
     }
-    let keys = fixture("claude-inbox/r5wake/claude-2.1.312-compound-keys-50x200");
-    for (point, expected) in [("reviewer-reveal", "X  Z"), ("end", "X   Z")] {
+    for release in ["2.1.312", "2.1.317"] {
+        let keys = fixture(&format!(
+            "claude-inbox/r5wake/claude-{release}-compound-keys-50x200"
+        ));
+        for (point, expected) in [("reviewer-reveal", "X  Z"), ("end", "X   Z")] {
+            assert_eq!(
+                (CLAUDE_PROFILE.composer)(&keys.grid(point)).unwrap().text,
+                expected,
+                "{release} {point}"
+            );
+        }
+        let before = keys.grid("blank-enter-before");
+        let after = keys.grid("blank-enter-after");
+        assert_eq!(before.cursor, after.cursor, "{release}");
         assert_eq!(
-            (CLAUDE_PROFILE.composer)(&keys.grid(point)).unwrap().text,
-            expected,
-            "{point}"
+            (CLAUDE_PROFILE.composer)(&before),
+            (CLAUDE_PROFILE.composer)(&after),
+            "{release}"
         );
     }
-    let before = keys.grid("blank-enter-before");
-    let after = keys.grid("blank-enter-after");
-    assert_eq!(before.cursor, after.cursor);
-    assert_eq!(
-        (CLAUDE_PROFILE.composer)(&before),
-        (CLAUDE_PROFILE.composer)(&after)
-    );
 
     let mut wrong_surfaces = Vec::new();
-    for release in ["2.1.310", "2.1.312"] {
+    for release in ["2.1.310", "2.1.312", "2.1.317"] {
         for set in [
             "50x200",
             "24x80",
@@ -866,11 +881,11 @@ fn doorbell_036_dialog_markers_and_false_dialogs() {
     assert_eq!((CLAUDE_PROFILE.dialog)(&claude.grid("empty")), None);
 }
 
-/// Scenario: Parse Claude Code 2.1.310 and 2.1.312 frames and a Codex dialog frame at the width they were drawn at, at one column more and at one column fewer. The width witness holds at the drawn width only; and both Claude releases' recorded resizes each start with the same full-redraw marker.
+/// Scenario: Parse Claude Code 2.1.310, 2.1.312 and 2.1.317 frames and a Codex dialog frame at the width they were drawn at, at one column more and at one column fewer. The width witness holds at the drawn width only; and every recorded Claude release's resizes each start with the same full-redraw marker.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_width_witness_and_redraw_marker() {
-    for release in ["2.1.310", "2.1.312"] {
+    for release in ["2.1.310", "2.1.312", "2.1.317"] {
         let claude = fixture(&format!(
             "claude-inbox/r5wake/claude-{release}-start-50x200"
         ));
@@ -931,7 +946,7 @@ fn doorbell_036_width_witness_and_redraw_marker() {
     // Claude Code's recorded resizes and nudges: each edge's bytes carry its
     // full-redraw marker, and the frame after it is a witness at the width in
     // force and not two columns wider.
-    for release in ["2.1.310", "2.1.312"] {
+    for release in ["2.1.310", "2.1.312", "2.1.317"] {
         let layout = fixture(&format!(
             "claude-inbox/r5wake/claude-{release}-layout-50x200"
         ));
