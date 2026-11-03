@@ -4,7 +4,7 @@ This page is the procedure for the recurring analysis of this project's telemetr
 
 The rounds so far:
 
-- **Round 1: #1980.** Window 2026-10-30 21:15 → 2026-11-03 03:10 UTC. It filed 40 improvements, labelled `telemetry` (#2072–#2111).
+- **Round 1: #1980.** Window 2026-10-30 21:15 → 2026-11-03 03:10 UTC. It filed its improvements as issues labelled `telemetry`, listed in the index comment on #1980.
 - **Round 2: #2112.** It starts once the round 1 improvements have taken effect (rules below).
 
 ## Why it repeats, and when the next round may start
@@ -111,7 +111,7 @@ Round 1's issues also give the cost, the type (which sets when the change takes 
 
 ## Queries worth keeping
 
-Honeycomb `query_url`s expire with the data, so these are written as specs: they name the spans and the shape of the query. Confirm a column's exact name with `get_span_details` or `find_columns` before running one. Each one runs over the window (`start_time`/`end_time`), environment `test`. Round 1's results are the baselines in its improvement issues, #2072–#2111.
+Honeycomb `query_url`s expire with the data, so these are written as specs: they name the spans and the shape of the query. Confirm a column's exact name with `get_span_details` or `find_columns` before running one. Each one runs over the window (`start_time`/`end_time`), environment `test`. Round 1's results are the baselines in its improvement issues.
 
 | measures | dataset | spec |
 | --- | --- | --- |
