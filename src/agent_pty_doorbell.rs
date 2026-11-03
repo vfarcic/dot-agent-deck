@@ -993,7 +993,11 @@ impl AgentPtyRegistry {
         // contended, a human operation is moving through it, and the box
         // stays touched, which a later ring's check reads rather than one
         // ring letting the next through.
-        if outcome == txn::Outcome::Submitted
+        //
+        // A withdrawal reconciles the same way: it ends only once the deck
+        // deleted its own line and saw the agent's placeholder again, which
+        // the agent draws only over an empty box (`Txn::confirm_withdrawn`).
+        if matches!(outcome, txn::Outcome::Submitted | txn::Outcome::Withdrawn)
             && let Some(ledger) = generation.ledger.try_hold()
             && ledger.marks().job_mark == txn.j0()
         {
@@ -1009,7 +1013,8 @@ impl AgentPtyRegistry {
                 agent_id = %agent,
                 attempt = txn.attempt(),
                 reconciled,
-                "doorbell submitted: input epoch"
+                ?outcome,
+                "doorbell resolved: input epoch"
             );
         }
         if let txn::Outcome::Unresolved(cause) = outcome {

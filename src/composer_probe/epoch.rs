@@ -221,8 +221,41 @@ impl InputEpoch {
         applies
     }
 
-    /// PRD #1666 part 3 (Q35-21, R3 §3.5): the ring's `Submitted`
-    /// reconcile. The box becomes empty through the ring's last op iff that
+    /// [`Self::apply`], where `own` are the epoch values of moves the
+    /// probe's own invocation made: its editor session's bracketed-paste
+    /// pair, read before the deck had its record and so moved as an
+    /// external edit, then repaid by that record ([`Live::explain`]). The
+    /// read applies iff every op after the probe's byte is one of those:
+    /// `own` covers `E0 + 2 ..= epoch` exactly, so nothing else entered.
+    /// With no own moves this is [`Self::apply`].
+    pub fn apply_own(&mut self, obs: &Observation, own: &[u64]) -> bool {
+        if own.is_empty() {
+            return self.apply(obs);
+        }
+        let Some(first) = obs.admitted_at.checked_add(2) else {
+            return false;
+        };
+        let mut own = own.to_vec();
+        own.sort_unstable();
+        own.dedup();
+        let covers = own.first() == Some(&first)
+            && own.windows(2).all(|w| w[1] == w[0] + 1)
+            && own.last() == Some(&self.epoch);
+        let applies = !self.exhausted
+            && covers
+            && self.owner.is_none()
+            && self.last_foreign == self.epoch
+            && obs.read_empty
+            && !obs.retired;
+        if applies {
+            self.observed = self.epoch;
+        }
+        applies
+    }
+
+    /// PRD #1666 part 3 (Q35-21, R3 §3.5): the ring's `Submitted` (or
+    /// placeholder-confirmed `Withdrawn`) reconcile. The box becomes empty
+    /// through the ring's last op iff that
     /// op is `ring`'s and nothing foreign entered since its admission at
     /// `admitted_at`: the agent took the deck's line alone from a box the
     /// epoch said was empty at admission. Whether it applied.
@@ -416,6 +449,9 @@ pub(crate) const EXPLAINED_CAP: u8 = 4;
 /// or cost one more check.
 pub(crate) const CREDIT_AFTER_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The most repaid debts [`Live::repaid`] keeps (Q35-21).
+const REPAID_KEPT: usize = 2 * EXPLAINED_CAP as usize;
+
 /// The most daemon reads of an `Armed` export kept for the epoch's
 /// settlement ([`Live::reads`]).
 const READS_KEPT: usize = record::RECORD_CAP;
@@ -441,6 +477,14 @@ struct Live {
     /// session: it accounts for that pair and banks nothing, so it can't
     /// lend an explanation to a later, unrelated pair.
     unexplained: std::collections::VecDeque<Instant>,
+    /// The epoch value each entry of [`Self::unexplained`] moved to, in the
+    /// same order (Q35-21).
+    unexplained_at: std::collections::VecDeque<u64>,
+    /// Q35-21: debts a record repaid, by that record and the epoch value the
+    /// pair had moved to, newest last, at most [`REPAID_KEPT`]: a probe whose
+    /// own record repaid them reads them as its own session's moves
+    /// ([`InputEpoch::apply_own`]).
+    repaid: std::collections::VecDeque<(RecordKey, u64)>,
     /// The latest ending of a pair [`Self::unexplained`] had no room to keep
     /// (R-B-U2-01). A record whose helper may have been born by then may be
     /// that pair's session, whose debt the queue no longer shows: it banks
@@ -487,6 +531,8 @@ impl std::fmt::Debug for Recheck {
 struct Parked {
     ticket: u64,
     probe: Probe,
+    /// The record the probe matched, whose repaid debts are its own moves.
+    key: RecordKey,
 }
 
 /// [`GenerationInput::pair_accounting`]'s answer.
@@ -610,13 +656,15 @@ impl Live {
     /// A pair that ended at `ended` moved the epoch with no record to account
     /// for it: remember it, and when the queue is full, fold its oldest entry
     /// into [`Self::forgotten`] rather than dropping it (R-B-U2-01).
-    fn owe(&mut self, ended: Instant) {
+    fn owe(&mut self, ended: Instant, at: u64) {
         if self.unexplained.len() == usize::from(EXPLAINED_CAP)
             && let Some(oldest) = self.unexplained.pop_front()
         {
+            self.unexplained_at.pop_front();
             self.forgotten = Some(self.forgotten.map_or(oldest, |f| f.max(oldest)));
         }
         self.unexplained.push_back(ended);
+        self.unexplained_at.push_back(at);
     }
 
     /// A new record of a helper born no earlier than `birth_floor` may
@@ -693,6 +741,12 @@ impl Live {
             .position(|&ended| ended >= birth_floor)
         {
             self.unexplained.remove(at);
+            if let Some(moved) = self.unexplained_at.remove(at) {
+                if self.repaid.len() == REPAID_KEPT {
+                    self.repaid.pop_front();
+                }
+                self.repaid.push_back((key, moved));
+            }
         } else if self.explained.len() < usize::from(EXPLAINED_CAP) {
             self.explained.push_back(Credit { key, drained: None });
         }
@@ -769,12 +823,15 @@ impl Live {
                 self.parked.push(Parked {
                     ticket: self.next_ticket,
                     probe,
+                    key,
                 });
                 if let Some(Recheck(wake)) = &self.recheck {
                     wake();
                 }
             }
-            (Some(Decision::Armed), Some(true)) if claim_mine => self.apply_empty(epoch, probe),
+            (Some(Decision::Armed), Some(true)) if claim_mine => {
+                self.apply_empty(epoch, probe, key)
+            }
             (Some(Decision::Armed), _) => {
                 self.schedule.non_empty(now, epoch.epoch());
             }
@@ -790,16 +847,34 @@ impl Live {
 
 impl Live {
     /// An empty read the deck may apply: the epoch's apply rule (R3 §3.4),
-    /// which refuses a read the epoch has moved past, then the schedule's
-    /// empty.
-    fn apply_empty(&mut self, epoch: &mut InputEpoch, probe: Probe) {
+    /// which refuses a read the epoch has moved past, counting as the
+    /// probe's own the moves of its session's pair that its record `key`
+    /// repaid ([`InputEpoch::apply_own`], Q35-21), then the schedule's empty.
+    fn apply_empty(&mut self, epoch: &mut InputEpoch, probe: Probe, key: RecordKey) {
         if let Some(e0) = probe.e0 {
-            epoch.apply(&Observation {
-                probe: probe.job,
-                admitted_at: e0,
-                read_empty: true,
-                retired: false,
-            });
+            let own: Vec<u64> = self
+                .repaid
+                .iter()
+                .filter(|(k, moved)| *k == key && *moved > e0)
+                .map(|(_, moved)| *moved)
+                .collect();
+            let applied = epoch.apply_own(
+                &Observation {
+                    probe: probe.job,
+                    admitted_at: e0,
+                    read_empty: true,
+                    retired: false,
+                },
+                &own,
+            );
+            tracing::debug!(
+                target: "composer_probe",
+                number = probe.number,
+                e0,
+                ?own,
+                applied,
+                "empty read applied"
+            );
         }
         self.schedule.empty();
     }
@@ -1439,6 +1514,8 @@ impl GenerationInput {
             pair_open: false,
             explained: std::collections::VecDeque::new(),
             unexplained: std::collections::VecDeque::new(),
+            unexplained_at: std::collections::VecDeque::new(),
+            repaid: std::collections::VecDeque::new(),
             forgotten: None,
             schedule: Schedule::default(),
             probes: Vec::new(),
@@ -1531,7 +1608,7 @@ impl GenerationInput {
                 "empty read settled after its keymap re-read"
             );
             match keymap {
-                Ok(()) => live.apply_empty(&mut state.epoch, probe),
+                Ok(()) => live.apply_empty(&mut state.epoch, probe, parked.key),
                 Err(_) if live.lapse_counted == Some(probe.number) => {}
                 Err(_) => live.schedule.failed(now),
             }
@@ -1592,8 +1669,8 @@ impl GenerationInput {
                     live.pair_open = false;
                     live.expire_credits(now);
                     if live.explained.pop_front().is_none() {
-                        state.epoch.record(None);
-                        live.owe(now);
+                        let at = state.epoch.record(None);
+                        live.owe(now, at);
                     }
                 }
                 _ => {}
@@ -2451,6 +2528,56 @@ mod tests {
         }));
     }
 
+    /// Scenario: A probe's byte enters at E0+1 and its own editor session's bracketed-paste pair, read before the deck had the session's record, moves the epoch as an external edit at E0+2, which that record then repays. Its empty read applies with that move counted as its own; it doesn't with no own moves named, with a person's key after the pair, with a move named that isn't the last op, or for a read that wasn't empty.
+    #[spec("inbox/probe/024")]
+    #[test]
+    fn probe_024_a_probes_own_late_pair_does_not_void_its_empty_read() {
+        let probe = DeckJobId(1);
+        let obs = Observation {
+            probe,
+            admitted_at: 4,
+            read_empty: true,
+            retired: false,
+        };
+        let touched_at = |e: u64| InputEpoch {
+            epoch: e,
+            observed: e,
+            last_foreign: e,
+            owner: None,
+            exhausted: false,
+        };
+        // E0 = 4: the probe's byte at 5, its own pair at 6.
+        let mut e = touched_at(4);
+        e.record(Some(probe));
+        let pair = e.record(None);
+        assert_eq!(pair, 6);
+        assert!(!e.clone().apply(&obs), "the plain rule refuses it");
+        assert!(!e.clone().apply_own(&obs, &[]), "no own move named");
+        assert!(
+            !e.clone().apply_own(
+                &Observation {
+                    read_empty: false,
+                    ..obs
+                },
+                &[pair]
+            ),
+            "a read that wasn't empty"
+        );
+        let mut own = e.clone();
+        assert!(own.apply_own(&obs, &[pair]));
+        assert!(!own.touched());
+        // A person's key after the pair: not the probe's to explain.
+        let mut keyed = e.clone();
+        keyed.record(None);
+        assert!(!keyed.apply_own(&obs, &[pair]));
+        assert!(keyed.touched());
+        // A probe of its own at 7 after the pair: the pair isn't the last op.
+        let mut later = e;
+        later.record(Some(DeckJobId(2)));
+        assert!(!later.apply_own(&obs, &[pair]));
+        assert!(later.touched());
+    }
+
     /// Scenario: Hand the output classifier the exact `?2026h` token read outside and inside a bracketed paste, which the output grammar never reports but the marker grammar excludes. Only the token outside a paste is a frame.
     #[spec("inbox/probe/060")]
     #[test]
@@ -2597,6 +2724,7 @@ mod tests {
                     job: DeckJobId(0),
                     e0: None,
                 },
+                key: RecordKey { pid: 0, start: 0 },
             });
         }
         assert!(input.settling());
