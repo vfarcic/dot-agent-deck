@@ -511,6 +511,10 @@ fn measure(run: Run) {
     }
     let summary = json!({
         "agent": run.kind, "release": release(),
+        // The deck build measured: the library this test links is built
+        // from the same tree in the same cargo run as the binary it drives,
+        // so a summary names the commit (and `-dirty`) its numbers belong to.
+        "build_id": dot_agent_deck::build_id::local_build_id(),
         "idle": idle,
         "between_probes": cadence(&gaps_before, gap_time),
         "conditions": conditions.iter().map(Tally::summary).collect::<Vec<_>>(),

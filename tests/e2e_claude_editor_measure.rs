@@ -131,6 +131,12 @@ fn measure(mode: &str, wait: Duration) -> Option<Capture> {
     })
 }
 
+fn hex_bytes(hex: &str) -> Vec<u8> {
+    (0..hex.len() / 2)
+        .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap())
+        .collect()
+}
+
 fn count(modes: &Value, wanted: &str) -> usize {
     modes
         .as_array()
@@ -191,8 +197,19 @@ fn probe_088_live_claude_317_editor_export_selection_and_paste_toggles() {
         toggles.iter().all(|t| *t == toggles[0]),
         "the ?2004 writes differ between trials: {toggles:?}"
     );
+    // The value, not only its equality across trials: one `?2004l` before
+    // the editor and one `?2004h` after it, none the other way round. This
+    // is the `VISUAL` path, the one the deck's helper is reached by. The
+    // other cells are printed, not asserted: in 2.1.317's capture the
+    // `EDITOR` and PATH `vi` rows wrote the same, and the PATH `code -w -g`
+    // fallback wrote no `?2004` at all.
+    assert_eq!(
+        toggles[0],
+        (1, 0, 0, 1),
+        "the ?2004 writes on the VISUAL path (before l, before h, after l, after h)"
+    );
     eprintln!(
-        "PASTE-TOGGLES before: {}l {}h; after: {}l {}h",
+        "PASTE-TOGGLES (VISUAL path) before: {}l {}h; after: {}l {}h",
         toggles[0].0, toggles[0].1, toggles[0].2, toggles[0].3
     );
     let rc = c.rows("visual-rc37");
@@ -213,8 +230,13 @@ fn probe_088_live_claude_317_editor_export_selection_and_paste_toggles() {
     ] {
         let row = c.rows(cell)[0];
         eprintln!(
-            "{cell}: opened={} argv={}",
-            row["opened"], row["start"]["argv"]
+            "{cell}: opened={} argv={} ?2004 before l/h {}/{} after l/h {}/{}",
+            row["opened"],
+            row["start"]["argv"],
+            count(&row["modes_before"], "\x1b[?2004l"),
+            count(&row["modes_before"], "\x1b[?2004h"),
+            count(&row["modes_after"], "\x1b[?2004l"),
+            count(&row["modes_after"], "\x1b[?2004h"),
         );
         assert_eq!(row["opened"], true, "{cell}: no editor ran");
         assert_eq!(row["start"]["argv"][3], chosen, "{cell}");
@@ -323,10 +345,29 @@ fn probe_089_live_claude_317_ctrl_g_forms() {
     }
     let bel = table["bel"];
     assert!(bel.1 > 0, "plain BEL must open the editor somewhere");
+    // The pasted BEL is read from the next export, the bytes the editor
+    // stand-in read from the file, never from `composer_after`: that is the
+    // screen, where a BEL kept in the draft is not drawn, so it reads
+    // `BASEPASTETAIL` whether the BEL was kept or dropped.
     for row in c.rows("paste-bel") {
+        let export = hex_bytes(row["next_export_hex"].as_str().unwrap_or_default());
+        let reading = match export.as_slice() {
+            b"BASEPASTE\x07TAIL" => "kept as text",
+            b"BASEPASTETAIL" => "dropped",
+            _ => "neither",
+        };
         eprintln!(
-            "PASTE split={} opened={} next_export={:?}",
-            row["split"], row["opened"], row["next_export_hex"]
+            "PASTE split={} opened={} next_export={:?} BEL {reading} (screen showed {:?})",
+            row["split"],
+            row["opened"],
+            String::from_utf8_lossy(&export),
+            row["composer_after"]
+        );
+        assert_ne!(
+            reading,
+            "neither",
+            "the next export after the paste is neither reading; {}",
+            c.root.display()
         );
     }
 }

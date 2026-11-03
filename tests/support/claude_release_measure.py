@@ -133,6 +133,18 @@ class Recorder:
                     if self.screen.display[i].startswith('─')), self.screen.lines)
         return '\n'.join(row[2:].rstrip() for row in self.screen.display[prompt:end])
 
+    def draft_active(self):
+        """Whether the composer holds a line as an editable draft.
+
+        In 2.1.312's and 2.1.317's captures Claude draws an editable draft as
+        `❯` and a no-break space, and a submitted line still on screen as `❯`
+        and a plain space, so the two tell a restored prompt from the line
+        that was just submitted.
+        """
+        prompt = next((i for i, row in enumerate(self.screen.display) if row.startswith('❯')), None)
+        return (prompt is not None and self.screen.display[prompt].startswith('❯\xa0')
+                and 'inboxfetch' in ''.join(self.composer().split()))
+
     def measure(self, kind):
         self.wait(lambda: any(row.startswith('❯') for row in self.screen.display), 40)
         self.pump(1)
@@ -259,14 +271,19 @@ class Recorder:
             self.pump(.15)
             self.points[f'mark:cr-{i}'] = len(self.raw)
             self.send('\r')
+            # The submitted line can stay on screen until Claude puts the
+            # blocked prompt back as a draft (it does at 24 x 80), so the
+            # restore is the change from the submitted form back to an
+            # editable draft, not the line's text appearing.
+            self.wait(lambda: not self.draft_active(), 5)
             self.wait(lambda: (self.out / 'hook.jsonl').exists()
                       and len((self.out / 'hook.jsonl').read_text().splitlines()) == i)
             hooked = time.monotonic_ns()
-            # The blocked prompt comes back into the composer. On 2.1.317 it
-            # once came back more than 0.5 s after the hook, so a clear sent
-            # before it left the line in the box: wait for it, bounded.
+            # The blocked prompt comes back into the composer, on 2.1.317
+            # once 629 ms after the hook, so a clear sent before it left the
+            # line in the box: wait for it, bounded.
             try:
-                self.wait(lambda: 'inboxfetch' in ''.join(self.composer().split()), 5)
+                self.wait(self.draft_active, 5)
                 self.points[f'restored-{i:02}'] = len(self.raw)
                 self.restores.append({'trial': i, 'ms_after_hook': (time.monotonic_ns() - hooked) / 1e6})
             except RuntimeError:

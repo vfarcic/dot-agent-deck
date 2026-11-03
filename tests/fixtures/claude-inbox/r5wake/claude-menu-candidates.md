@@ -58,6 +58,8 @@ Against recogniser `6de2f810`, all thirty new negative screens are refused and b
 
 Recorded on 2026-11-03 through the same local lane-2 harness and recorder, with the executable pinned by SHA-256 `eb224419e344575faa4a1f39b290b649425a10cd5ee2ef1d003480cd9ae57eb0`. That executable is the official npm package `@anthropic-ai/claude-code-linux-x64@2.1.317` (tarball integrity `sha512-u19fYJ4llqi+dAGAj6P1BNu/CRSe0rv4O8Mv/5SQPU5oXCYmUssbJgrBI6rWbIFRAE3YcLCzKlwdHbzlSXBlSA==`), byte-identical to the copy the host's installer put in `~/.local/share/claude/versions/2.1.317`. It was copied to private scratch space outside the checkout and exposed through a private `claude` symlink. Every submission was blocked by the private hook before a model turn.
 
+The capture directories this file names are `dad-claude-2312-measure-*` whichever release they hold, 2.1.317's included: the recorder's directory prefix carried 2.1.312's number until it was renamed `dad-claude-release-measure-*` after these runs, so the name says nothing about the release a capture holds; its `result.json` does.
+
 The menu sets are the same seven named screens as the other releases'. The run that recorded them also re-recorded 2.1.310 and 2.1.312 and passed for all three; the committed 2.1.310 and 2.1.312 fixtures were not replaced. In every set, 2.1.317 draws the main rule, shell glyph and overview glyph in the same foregrounds as 2.1.310 and 2.1.312, with the same structural premise (a coloured main rule over a default-colour `❯`, the reverse in the overview).
 
 | Set | Theme | COLORTERM | Bytes | Trace SHA-256 | Source run under `/var/tmp/` |

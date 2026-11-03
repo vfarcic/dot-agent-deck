@@ -1,7 +1,7 @@
 {
  "release": "2.1.317",
  "sha256": "eb224419e344575faa4a1f39b290b649425a10cd5ee2ef1d003480cd9ae57eb0",
- "source_capture": "/var/tmp/dad-claude-editor-measure-y49fxC/capture",
+ "source_capture": "/var/tmp/dad-claude-editor-measure-YHelrX/capture",
  "recorder_sha256": "2a4ccb929ef17940c42f66f3e276fde67f884d46031ca6d2679ca31ff3fbf3a8",
  "error": null,
  "rows": [
@@ -10,16 +10,14 @@
    "key_hex": "07",
    "split": false,
    "gap_s": 0.0,
-   "sent_t": 3440515749065616,
-   "sent_off": 2121,
+   "sent_t": 3446048222113894,
+   "sent_off": 2239,
    "opened": true,
    "composer_after": "M317_EDITED_1",
-   "start_off": 3746,
-   "exit_off": 3746,
-   "done_off": 6875,
+   "start_off": 3757,
+   "exit_off": 3757,
+   "done_off": 6886,
    "modes_before": [
-    "\u001b[?25l",
-    "\u001b[?25h",
     "\u001b[?25l",
     "\u001b[?1004l",
     "\u001b[?1006l",
@@ -52,17 +50,17 @@
     "under_tmpdir_claude_uid": true,
     "tmpdir": "/tmp",
     "root": "/tmp/claude-1000",
-    "path": "/tmp/claude-1000/claude-prompt-c5baf9b2-271b-4152-8097-3eabbe1200c7.md"
+    "path": "/tmp/claude-1000/claude-prompt-e2062646-b0b2-4f47-9c89-3f37cdf9d1eb.md"
    },
    "export_had_draft": "M317_DRAFT_1",
    "editor_argv": [
-    "/var/tmp/dad-claude-editor-measure-y49fxC/claude_editor_measure.py",
+    "/var/tmp/dad-claude-editor-measure-YHelrX/claude_editor_measure.py",
     "--editor",
-    "/var/tmp/dad-claude-editor-measure-y49fxC/capture",
+    "/var/tmp/dad-claude-editor-measure-YHelrX/capture",
     "visual",
-    "/tmp/claude-1000/claude-prompt-c5baf9b2-271b-4152-8097-3eabbe1200c7.md"
+    "/tmp/claude-1000/claude-prompt-e2062646-b0b2-4f47-9c89-3f37cdf9d1eb.md"
    ],
-   "export_path": "/tmp/claude-1000/claude-prompt-c5baf9b2-271b-4152-8097-3eabbe1200c7.md",
+   "export_path": "/tmp/claude-1000/claude-prompt-e2062646-b0b2-4f47-9c89-3f37cdf9d1eb.md",
    "export_contents": "M317_DRAFT_1"
   },
   {
@@ -70,13 +68,13 @@
    "key_hex": "07",
    "split": false,
    "gap_s": 0.0,
-   "sent_t": 3440518270444762,
-   "sent_off": 7366,
+   "sent_t": 3446050689520103,
+   "sent_off": 7382,
    "opened": true,
    "composer_after": "M317_EDITED_2",
-   "start_off": 8884,
-   "exit_off": 8884,
-   "done_off": 12013,
+   "start_off": 8900,
+   "exit_off": 8900,
+   "done_off": 12029,
    "modes_before": [
     "\u001b[?25l",
     "\u001b[?1004l",
@@ -110,17 +108,17 @@
     "under_tmpdir_claude_uid": true,
     "tmpdir": "/tmp",
     "root": "/tmp/claude-1000",
-    "path": "/tmp/claude-1000/claude-prompt-b7d94639-16c6-420c-8be9-0287a3cb6585.md"
+    "path": "/tmp/claude-1000/claude-prompt-085a8a80-fb4e-4ee3-8769-fb97e4227d16.md"
    },
    "export_had_draft": "M317_DRAFT_2",
    "editor_argv": [
-    "/var/tmp/dad-claude-editor-measure-y49fxC/claude_editor_measure.py",
+    "/var/tmp/dad-claude-editor-measure-YHelrX/claude_editor_measure.py",
     "--editor",
-    "/var/tmp/dad-claude-editor-measure-y49fxC/capture",
+    "/var/tmp/dad-claude-editor-measure-YHelrX/capture",
     "visual",
-    "/tmp/claude-1000/claude-prompt-b7d94639-16c6-420c-8be9-0287a3cb6585.md"
+    "/tmp/claude-1000/claude-prompt-085a8a80-fb4e-4ee3-8769-fb97e4227d16.md"
    ],
-   "export_path": "/tmp/claude-1000/claude-prompt-b7d94639-16c6-420c-8be9-0287a3cb6585.md",
+   "export_path": "/tmp/claude-1000/claude-prompt-085a8a80-fb4e-4ee3-8769-fb97e4227d16.md",
    "export_contents": "M317_DRAFT_2"
   },
   {
@@ -128,13 +126,13 @@
    "key_hex": "07",
    "split": false,
    "gap_s": 0.0,
-   "sent_t": 3440520437325615,
-   "sent_off": 12504,
+   "sent_t": 3446052845960842,
+   "sent_off": 12525,
    "opened": true,
    "composer_after": "M317_EDITED_3",
-   "start_off": 14022,
-   "exit_off": 14022,
-   "done_off": 17151,
+   "start_off": 14043,
+   "exit_off": 14043,
+   "done_off": 17172,
    "modes_before": [
     "\u001b[?25l",
     "\u001b[?1004l",
@@ -168,17 +166,17 @@
     "under_tmpdir_claude_uid": true,
     "tmpdir": "/tmp",
     "root": "/tmp/claude-1000",
-    "path": "/tmp/claude-1000/claude-prompt-bf0bcf66-2b25-414a-966b-ed6085bf005e.md"
+    "path": "/tmp/claude-1000/claude-prompt-c3d3cf6c-7c38-4ddd-8679-e4e50690c623.md"
    },
    "export_had_draft": "M317_DRAFT_3",
    "editor_argv": [
-    "/var/tmp/dad-claude-editor-measure-y49fxC/claude_editor_measure.py",
+    "/var/tmp/dad-claude-editor-measure-YHelrX/claude_editor_measure.py",
     "--editor",
-    "/var/tmp/dad-claude-editor-measure-y49fxC/capture",
+    "/var/tmp/dad-claude-editor-measure-YHelrX/capture",
     "visual",
-    "/tmp/claude-1000/claude-prompt-bf0bcf66-2b25-414a-966b-ed6085bf005e.md"
+    "/tmp/claude-1000/claude-prompt-c3d3cf6c-7c38-4ddd-8679-e4e50690c623.md"
    ],
-   "export_path": "/tmp/claude-1000/claude-prompt-bf0bcf66-2b25-414a-966b-ed6085bf005e.md",
+   "export_path": "/tmp/claude-1000/claude-prompt-c3d3cf6c-7c38-4ddd-8679-e4e50690c623.md",
    "export_contents": "M317_DRAFT_3"
   },
   {
@@ -186,13 +184,13 @@
    "key_hex": "07",
    "split": false,
    "gap_s": 0.0,
-   "sent_t": 3440522583718011,
-   "sent_off": 17642,
+   "sent_t": 3446055000822053,
+   "sent_off": 17668,
    "opened": true,
    "composer_after": "M317_EDITED_4",
-   "start_off": 19160,
-   "exit_off": 19160,
-   "done_off": 22289,
+   "start_off": 19186,
+   "exit_off": 19186,
+   "done_off": 22315,
    "modes_before": [
     "\u001b[?25l",
     "\u001b[?1004l",
@@ -226,17 +224,17 @@
     "under_tmpdir_claude_uid": true,
     "tmpdir": "/tmp",
     "root": "/tmp/claude-1000",
-    "path": "/tmp/claude-1000/claude-prompt-471d2404-3c1e-4195-aabb-0ada383275bc.md"
+    "path": "/tmp/claude-1000/claude-prompt-a704461c-c22f-49d0-b49f-c2665c63604e.md"
    },
    "export_had_draft": "M317_DRAFT_4",
    "editor_argv": [
-    "/var/tmp/dad-claude-editor-measure-y49fxC/claude_editor_measure.py",
+    "/var/tmp/dad-claude-editor-measure-YHelrX/claude_editor_measure.py",
     "--editor",
-    "/var/tmp/dad-claude-editor-measure-y49fxC/capture",
+    "/var/tmp/dad-claude-editor-measure-YHelrX/capture",
     "visual",
-    "/tmp/claude-1000/claude-prompt-471d2404-3c1e-4195-aabb-0ada383275bc.md"
+    "/tmp/claude-1000/claude-prompt-a704461c-c22f-49d0-b49f-c2665c63604e.md"
    ],
-   "export_path": "/tmp/claude-1000/claude-prompt-471d2404-3c1e-4195-aabb-0ada383275bc.md",
+   "export_path": "/tmp/claude-1000/claude-prompt-a704461c-c22f-49d0-b49f-c2665c63604e.md",
    "export_contents": "M317_DRAFT_4"
   },
   {
@@ -244,13 +242,13 @@
    "key_hex": "07",
    "split": false,
    "gap_s": 0.0,
-   "sent_t": 3440524798958871,
-   "sent_off": 22780,
+   "sent_t": 3446057163980758,
+   "sent_off": 22811,
    "opened": true,
    "composer_after": "M317_EDITED_5",
-   "start_off": 24298,
-   "exit_off": 24298,
-   "done_off": 27427,
+   "start_off": 24329,
+   "exit_off": 24329,
+   "done_off": 27458,
    "modes_before": [
     "\u001b[?25l",
     "\u001b[?1004l",
@@ -284,17 +282,17 @@
     "under_tmpdir_claude_uid": true,
     "tmpdir": "/tmp",
     "root": "/tmp/claude-1000",
-    "path": "/tmp/claude-1000/claude-prompt-6fc6eb64-fc66-44b2-a310-c5d4315fca3f.md"
+    "path": "/tmp/claude-1000/claude-prompt-f917c799-ed39-4b01-894c-733c1862b913.md"
    },
    "export_had_draft": "M317_DRAFT_5",
    "editor_argv": [
-    "/var/tmp/dad-claude-editor-measure-y49fxC/claude_editor_measure.py",
+    "/var/tmp/dad-claude-editor-measure-YHelrX/claude_editor_measure.py",
     "--editor",
-    "/var/tmp/dad-claude-editor-measure-y49fxC/capture",
+    "/var/tmp/dad-claude-editor-measure-YHelrX/capture",
     "visual",
-    "/tmp/claude-1000/claude-prompt-6fc6eb64-fc66-44b2-a310-c5d4315fca3f.md"
+    "/tmp/claude-1000/claude-prompt-f917c799-ed39-4b01-894c-733c1862b913.md"
    ],
-   "export_path": "/tmp/claude-1000/claude-prompt-6fc6eb64-fc66-44b2-a310-c5d4315fca3f.md",
+   "export_path": "/tmp/claude-1000/claude-prompt-f917c799-ed39-4b01-894c-733c1862b913.md",
    "export_contents": "M317_DRAFT_5"
   },
   {
@@ -302,13 +300,13 @@
    "key_hex": "07",
    "split": false,
    "gap_s": 0.0,
-   "sent_t": 3440526928971918,
-   "sent_off": 27919,
+   "sent_t": 3446059271359987,
+   "sent_off": 27955,
    "opened": true,
    "composer_after": "M317_DRAFT_RC",
-   "start_off": 29437,
-   "exit_off": 29437,
-   "done_off": 32566,
+   "start_off": 29473,
+   "exit_off": 29473,
+   "done_off": 32602,
    "modes_before": [
     "\u001b[?25l",
     "\u001b[?1004l",
@@ -336,13 +334,13 @@
    ],
    "cell": "visual-rc37",
    "editor_argv": [
-    "/var/tmp/dad-claude-editor-measure-y49fxC/claude_editor_measure.py",
+    "/var/tmp/dad-claude-editor-measure-YHelrX/claude_editor_measure.py",
     "--editor",
-    "/var/tmp/dad-claude-editor-measure-y49fxC/capture",
+    "/var/tmp/dad-claude-editor-measure-YHelrX/capture",
     "visual",
-    "/tmp/claude-1000/claude-prompt-8ef14e9b-dc93-491b-ade4-6f66c1a1aa1b.md"
+    "/tmp/claude-1000/claude-prompt-d1a89c33-f92b-4f0b-bee1-946850213961.md"
    ],
-   "export_path": "/tmp/claude-1000/claude-prompt-8ef14e9b-dc93-491b-ade4-6f66c1a1aa1b.md",
+   "export_path": "/tmp/claude-1000/claude-prompt-d1a89c33-f92b-4f0b-bee1-946850213961.md",
    "export_contents": "M317_DRAFT_RC"
   },
   {
@@ -350,13 +348,13 @@
    "key_hex": "07",
    "split": false,
    "gap_s": 0.0,
-   "sent_t": 3440530985270544,
-   "sent_off": 2475,
+   "sent_t": 3446063328770750,
+   "sent_off": 2485,
    "opened": true,
    "composer_after": "M317_EEDITED_1",
-   "start_off": 3993,
-   "exit_off": 3993,
-   "done_off": 7323,
+   "start_off": 4003,
+   "exit_off": 4003,
+   "done_off": 7333,
    "modes_before": [
     "\u001b[?25l",
     "\u001b[?1004l",
@@ -385,13 +383,13 @@
    "cell": "editor",
    "trial": 1,
    "editor_argv": [
-    "/var/tmp/dad-claude-editor-measure-y49fxC/claude_editor_measure.py",
+    "/var/tmp/dad-claude-editor-measure-YHelrX/claude_editor_measure.py",
     "--editor",
-    "/var/tmp/dad-claude-editor-measure-y49fxC/capture",
+    "/var/tmp/dad-claude-editor-measure-YHelrX/capture",
     "editor",
-    "/tmp/claude-1000/claude-prompt-9389839d-51cb-467d-a9ab-e7d0b52cab3c.md"
+    "/tmp/claude-1000/claude-prompt-d0a2bc93-1bd8-4bba-a860-d4b730613702.md"
    ],
-   "export_path": "/tmp/claude-1000/claude-prompt-9389839d-51cb-467d-a9ab-e7d0b52cab3c.md",
+   "export_path": "/tmp/claude-1000/claude-prompt-d0a2bc93-1bd8-4bba-a860-d4b730613702.md",
    "export_contents": "M317_EDRAFT_1"
   },
   {
@@ -399,13 +397,13 @@
    "key_hex": "07",
    "split": false,
    "gap_s": 0.0,
-   "sent_t": 3440533403553379,
-   "sent_off": 7815,
+   "sent_t": 3446065736111814,
+   "sent_off": 7830,
    "opened": true,
    "composer_after": "M317_EEDITED_2",
-   "start_off": 9333,
-   "exit_off": 9333,
-   "done_off": 12663,
+   "start_off": 9348,
+   "exit_off": 9348,
+   "done_off": 12678,
    "modes_before": [
     "\u001b[?25l",
     "\u001b[?1004l",
@@ -434,13 +432,13 @@
    "cell": "editor",
    "trial": 2,
    "editor_argv": [
-    "/var/tmp/dad-claude-editor-measure-y49fxC/claude_editor_measure.py",
+    "/var/tmp/dad-claude-editor-measure-YHelrX/claude_editor_measure.py",
     "--editor",
-    "/var/tmp/dad-claude-editor-measure-y49fxC/capture",
+    "/var/tmp/dad-claude-editor-measure-YHelrX/capture",
     "editor",
-    "/tmp/claude-1000/claude-prompt-d254cfd7-b35d-42dd-b4f6-946d714d04b5.md"
+    "/tmp/claude-1000/claude-prompt-0e7ee83d-6350-477d-94f7-98ea21d863ed.md"
    ],
-   "export_path": "/tmp/claude-1000/claude-prompt-d254cfd7-b35d-42dd-b4f6-946d714d04b5.md",
+   "export_path": "/tmp/claude-1000/claude-prompt-0e7ee83d-6350-477d-94f7-98ea21d863ed.md",
    "export_contents": "M317_EDRAFT_2"
   },
   {
@@ -448,13 +446,13 @@
    "key_hex": "07",
    "split": false,
    "gap_s": 0.0,
-   "sent_t": 3440537453815258,
-   "sent_off": 2487,
+   "sent_t": 3446069674337788,
+   "sent_off": 2477,
    "opened": true,
    "composer_after": "M317_PEDITED",
-   "start_off": 4005,
-   "exit_off": 4005,
-   "done_off": 7333,
+   "start_off": 3995,
+   "exit_off": 3995,
+   "done_off": 7323,
    "modes_before": [
     "\u001b[?25l",
     "\u001b[?1004l",
@@ -486,14 +484,14 @@
     "nano"
    ],
    "editor_argv": [
-    "/var/tmp/dad-claude-editor-measure-y49fxC/claude_editor_measure.py",
+    "/var/tmp/dad-claude-editor-measure-YHelrX/claude_editor_measure.py",
     "--editor",
-    "/var/tmp/dad-claude-editor-measure-y49fxC/capture",
+    "/var/tmp/dad-claude-editor-measure-YHelrX/capture",
     "path-vi",
     "+1",
-    "/tmp/claude-1000/claude-prompt-01578427-f263-4b44-9e4e-2f5e695899f0.md"
+    "/tmp/claude-1000/claude-prompt-06a2fb83-8bd8-4118-98e8-9e7103c231e6.md"
    ],
-   "export_path": "/tmp/claude-1000/claude-prompt-01578427-f263-4b44-9e4e-2f5e695899f0.md",
+   "export_path": "/tmp/claude-1000/claude-prompt-06a2fb83-8bd8-4118-98e8-9e7103c231e6.md",
    "export_contents": "M317_PDRAFT"
   },
   {
@@ -501,13 +499,13 @@
    "key_hex": "07",
    "split": false,
    "gap_s": 0.0,
-   "sent_t": 3440541572400315,
-   "sent_off": 2477,
+   "sent_t": 3446073765335799,
+   "sent_off": 2473,
    "opened": true,
    "composer_after": "M317_PDRAFT",
-   "start_off": 3949,
-   "exit_off": 3949,
-   "done_off": 5400,
+   "start_off": 3945,
+   "exit_off": 3945,
+   "done_off": 5396,
    "modes_before": [
     "\u001b[?25l",
     "\u001b[?1006l",
@@ -532,15 +530,15 @@
     "nano"
    ],
    "editor_argv": [
-    "/var/tmp/dad-claude-editor-measure-y49fxC/claude_editor_measure.py",
+    "/var/tmp/dad-claude-editor-measure-YHelrX/claude_editor_measure.py",
     "--editor",
-    "/var/tmp/dad-claude-editor-measure-y49fxC/capture",
+    "/var/tmp/dad-claude-editor-measure-YHelrX/capture",
     "path-code",
     "-w",
     "-g",
-    "/tmp/claude-1000/claude-prompt-8a39bc2c-d8e4-412b-8781-f41e9d2aaaf6.md:1"
+    "/tmp/claude-1000/claude-prompt-62b86722-06cb-4f6a-902c-365f5fe5ad17.md:1"
    ],
-   "export_path": "/tmp/claude-1000/claude-prompt-8a39bc2c-d8e4-412b-8781-f41e9d2aaaf6.md:1",
+   "export_path": "/tmp/claude-1000/claude-prompt-62b86722-06cb-4f6a-902c-365f5fe5ad17.md:1",
    "export_contents": "FileNotFoundError(2, 'No such file or directory')"
   }
  ]

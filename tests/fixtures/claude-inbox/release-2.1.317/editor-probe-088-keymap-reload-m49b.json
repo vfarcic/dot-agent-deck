@@ -1,8 +1,8 @@
 {
  "release": "2.1.317",
  "sha256": "eb224419e344575faa4a1f39b290b649425a10cd5ee2ef1d003480cd9ae57eb0",
- "source_capture": "/var/tmp/dad-claude-editor-measure-9MrIz1/capture",
- "recorder_sha256": "eb742c62971ab2b67fdca0807329b09189bc078953554e33c19bffe548c8bc8d",
+ "source_capture": "/var/tmp/dad-claude-editor-measure-bPIdwN/capture",
+ "recorder_sha256": "2a4ccb929ef17940c42f66f3e276fde67f884d46031ca6d2679ca31ff3fbf3a8",
  "error": null,
  "rows": [
   {
@@ -15,25 +15,25 @@
    "cell": "keymap-reload-created",
    "samples": [
     {
-     "elapsed_s": 1.261157005,
+     "elapsed_s": 1.232489992,
      "ctrlg_opened": true,
      "ctrle_opened": false,
-     "ctrlg_sent_s": 0.000508836,
-     "ctrle_sent_s": 0.567905667
+     "ctrlg_sent_s": 0.000464,
+     "ctrle_sent_s": 0.554691269
     },
     {
-     "elapsed_s": 2.518320882,
+     "elapsed_s": 2.48660732,
      "ctrlg_opened": true,
      "ctrle_opened": false,
-     "ctrlg_sent_s": 1.262134035,
-     "ctrle_sent_s": 1.822213865
+     "ctrlg_sent_s": 1.233220237,
+     "ctrle_sent_s": 1.792888127
     },
     {
-     "elapsed_s": 3.783237596,
+     "elapsed_s": 3.749956179,
      "ctrlg_opened": false,
      "ctrle_opened": true,
-     "ctrlg_sent_s": 2.519288464,
-     "ctrle_sent_s": 3.214140136
+     "ctrlg_sent_s": 2.487577142,
+     "ctrle_sent_s": 3.18294892
     }
    ],
    "flipped": true
@@ -42,18 +42,18 @@
    "cell": "keymap-reload-removed",
    "samples": [
     {
-     "elapsed_s": 1.392664475,
+     "elapsed_s": 1.272461568,
      "ctrlg_opened": false,
-     "ctrle_opened": false,
-     "ctrlg_sent_s": 0.000834688,
-     "ctrle_sent_s": 0.696935648
+     "ctrle_opened": true,
+     "ctrlg_sent_s": 0.002003488,
+     "ctrle_sent_s": 0.705912575
     },
     {
-     "elapsed_s": 2.644912501,
+     "elapsed_s": 2.526255102,
      "ctrlg_opened": true,
      "ctrle_opened": false,
-     "ctrlg_sent_s": 1.393681758,
-     "ctrle_sent_s": 1.950240767
+     "ctrlg_sent_s": 1.273598625,
+     "ctrle_sent_s": 1.835901263
     }
    ],
    "flipped": true

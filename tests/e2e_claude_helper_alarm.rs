@@ -191,14 +191,45 @@ fn branch(trial: &Value) -> String {
         .to_string()
 }
 
+/// The helper's e2e trace events, in order.
+fn events(trial: &Value) -> Vec<&str> {
+    trial["trace"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["event"].as_str())
+        .collect()
+}
+
+/// Claude's own editor notices (`… closed unexpectedly (SIGALRM)`) that it
+/// wrote only after the recorder saw the helper gone: its report of the
+/// wait status it reaped for this press.
+fn claude_notices_after_end(trial: &Value) -> Vec<&str> {
+    let before: Vec<&str> = trial["claude_notice_before_end"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    trial["claude_notice_after_end"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .filter(|n| !before.contains(n))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn summary(trial: &Value) -> String {
     format!(
-        "trial {}: branch={:?} life(from branch)={} s, zombie={} notice={} editors={} composer_after={:?}",
+        "trial {}: branch={:?} life(from branch)={} s, zombie={} notice={} claude_notice={:?} last_trace={:?} editors={} composer_after={:?}",
         trial["trial"],
         branch(trial),
         trial["helper_life_from_branch_s"],
         trial["zombie_status"],
         trial["notice_in_output"],
+        claude_notices_after_end(trial),
+        events(trial).last(),
         trial["editor"].as_array().map_or(0, Vec::len) / 2,
         trial["composer_after"]
     )
@@ -213,6 +244,7 @@ fn probe_090_live_claude_317_armed_helper_alarm_ends_a_stalled_exchange() {
         return;
     };
     assert_eq!(trials(&result).len(), 10);
+    let (mut seen_zombie, mut seen_claude, mut seen_either) = (0, 0, 0);
     for trial in trials(&result) {
         eprintln!("M59a {}", summary(trial));
         assert!(
@@ -230,6 +262,45 @@ fn probe_090_live_claude_317_armed_helper_alarm_ends_a_stalled_exchange() {
         if !trial["zombie_status"].is_null() {
             assert_eq!(trial["zombie_status"]["signal"], 14, "SIGALRM");
         }
+        // The helper wrote nothing after its pause: no orderly armed exit
+        // (row T ends `armed … ArmedExit`) and no `exit`, so it did not end
+        // through any path that traces its own end.
+        let trace = events(trial);
+        assert_eq!(
+            trace.last().copied(),
+            Some("pause ready"),
+            "trial {}: the helper's trace must end at the pause; {trace:?}; {}",
+            trial["trial"],
+            out.display()
+        );
+        assert!(
+            !trace
+                .iter()
+                .any(|e| e.starts_with("armed ") || e.starts_with("exit ")),
+            "trial {}: an orderly end was traced: {trace:?}",
+            trial["trial"]
+        );
+        // Claude's own notice, when it wrote one for this press, must name
+        // the alarm and nothing else.
+        let notices = claude_notices_after_end(trial);
+        assert!(
+            notices
+                .iter()
+                .all(|n| *n == "closed unexpectedly (SIGALRM)"),
+            "trial {}: Claude reported another end: {notices:?}",
+            trial["trial"]
+        );
+        let zombie = trial["zombie_status"]["signal"] == 14;
+        let claude = !notices.is_empty();
+        assert!(
+            zombie || claude,
+            "trial {}: SIGALRM was seen neither in the zombie's wait status nor in Claude's notice; {}",
+            trial["trial"],
+            out.display()
+        );
+        seen_zombie += usize::from(zombie);
+        seen_claude += usize::from(claude);
+        seen_either += usize::from(zombie || claude);
         assert!(
             trial["composer_after"]
                 .as_str()
@@ -240,6 +311,12 @@ fn probe_090_live_claude_317_armed_helper_alarm_ends_a_stalled_exchange() {
             trial["screen_after"]
         );
     }
+    let n = trials(&result).len();
+    eprintln!(
+        "M59a SIGALRM seen directly in {seen_either}/{n} (Claude's notice naming SIGALRM \
+         {seen_claude}/{n}, the zombie's wait status {seen_zombie}/{n}); the rest inferred \
+         from end time and trace"
+    );
 }
 
 /// Scenario: Run pinned Claude Code 2.1.317 with the deck's editor helper as its editor and the arm present, with no stall, against the socket that never answers, and press Ctrl+G on a draft ten times. The helper's exchange runs out first; each time no editor runs, the helper's notice is written to the terminal, it ends before its alarm, and Claude keeps the draft.
@@ -261,6 +338,32 @@ fn probe_090_live_claude_317_armed_helper_unanswered_exchange() {
         assert_eq!(trial["editor"].as_array().unwrap().len(), 0, "no editor");
         let life = trial["helper_life_from_branch_s"].as_f64().unwrap();
         assert!(life < 4.5, "trial {}: lived {life} s", trial["trial"]);
+        // The helper's own orderly armed exit, with its notice, status 0.
+        let trace = events(trial);
+        let last = trace.last().copied().unwrap_or_default();
+        assert!(
+            last.starts_with("armed ") && last.contains("ArmedExit") && last.contains("status: 0"),
+            "trial {}: the trace must end in an orderly armed exit with status 0; {trace:?}",
+            trial["trial"]
+        );
+        assert_eq!(
+            trial["notice_in_output"], true,
+            "trial {}: the helper's notice must reach the terminal",
+            trial["trial"]
+        );
+        if !trial["zombie_status"].is_null() {
+            assert_eq!(
+                trial["zombie_status"]["code"], 0,
+                "trial {}",
+                trial["trial"]
+            );
+        }
+        let notices = claude_notices_after_end(trial);
+        assert!(
+            notices.is_empty(),
+            "trial {}: Claude reported a bad editor end: {notices:?}",
+            trial["trial"]
+        );
         assert!(
             trial["composer_after"]
                 .as_str()

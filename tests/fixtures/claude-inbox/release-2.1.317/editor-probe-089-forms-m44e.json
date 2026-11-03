@@ -1,8 +1,8 @@
 {
  "release": "2.1.317",
  "sha256": "eb224419e344575faa4a1f39b290b649425a10cd5ee2ef1d003480cd9ae57eb0",
- "source_capture": "/var/tmp/dad-claude-editor-measure-Y4zfXf/capture",
- "recorder_sha256": "eb742c62971ab2b67fdca0807329b09189bc078953554e33c19bffe548c8bc8d",
+ "source_capture": "/var/tmp/dad-claude-editor-measure-8xqXpC/capture",
+ "recorder_sha256": "2a4ccb929ef17940c42f66f3e276fde67f884d46031ca6d2679ca31ff3fbf3a8",
  "error": null,
  "opened_of_cells": {
   "bang/bel": "2/2",

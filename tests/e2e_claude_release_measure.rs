@@ -171,12 +171,41 @@ impl Capture {
             assert!(CLAUDE_PROFILE.empty_and_ready(&cleared));
             assert!(!CLAUDE_PROFILE.placeholder_empty(&cleared));
         }
+        // The recorder waits (bounded at 5 s) for the blocked prompt to come
+        // back into the composer before clearing it, and records how long
+        // that took. A prompt that never came back, or came back after the
+        // bound, fails here instead of passing with `null`.
+        let restores = self.result["restores"].as_array().unwrap();
+        assert_eq!(
+            restores.len(),
+            15,
+            "one restore per trial; {}",
+            self.root.display()
+        );
+        let mut max_restore_ms = 0f64;
+        for (i, restore) in restores.iter().enumerate() {
+            assert_eq!(restore["trial"], i + 1);
+            let ms = restore["ms_after_hook"].as_f64().unwrap_or_else(|| {
+                panic!(
+                    "trial {}: the blocked prompt did not come back within the 5 s bound; {}",
+                    i + 1,
+                    self.root.display()
+                )
+            });
+            assert!(
+                ms < 5_500.0,
+                "trial {}: the blocked prompt came back {ms} ms after the hook",
+                i + 1
+            );
+            max_restore_ms = max_restore_ms.max(ms);
+        }
         eprintln!(
-            "{}: 15/15 exact echoes, hook payloads and transcript echoes; maxima ms: echo={:.3}, hook={:.3}, transcript={:.3}",
+            "{}: 15/15 exact echoes, hook payloads and transcript echoes; maxima ms: echo={:.3}, hook={:.3}, transcript={:.3}, prompt restored after hook={:.3}",
             self.root.display(),
             max_echo_ns as f64 / 1e6,
             max_hook_ns as f64 / 1e6,
-            max_transcript_ns as f64 / 1e6
+            max_transcript_ns as f64 / 1e6,
+            max_restore_ms
         );
         for i in 1..=3 {
             let deleted = self.grid(&format!("deleted-{i:02}"));
@@ -233,7 +262,7 @@ impl Capture {
 
 fn measure_with_path(kind: &str, rows: u16, cols: u16, path: Option<&str>) -> Capture {
     let root = tempfile::Builder::new()
-        .prefix("dad-claude-2312-measure-")
+        .prefix("dad-claude-release-measure-")
         .tempdir_in("/var/tmp")
         .unwrap()
         .keep();

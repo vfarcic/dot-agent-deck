@@ -25,6 +25,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import shlex
 import shutil
@@ -38,6 +39,14 @@ import time
 PINS = {'2.1.317': 'eb224419e344575faa4a1f39b290b649425a10cd5ee2ef1d003480cd9ae57eb0'}
 TRIALS = 10
 NOTICE = b'dot-agent-deck: the deck was checking this input box.'
+# Claude's own line when the editor it ran ends badly, naming the signal or
+# exit code it reaped (2.1.317: `<editor> closed unexpectedly (SIGALRM)`,
+# `<editor> quit unexpectedly (exit code 37)`).
+CLAUDE_EDITOR_NOTICE = re.compile(rb'(?:closed|quit) unexpectedly \([^)\r\n]{1,40}\)')
+
+
+def claude_notices(window):
+    return sorted({m.group(0).decode() for m in CLAUDE_EDITOR_NOTICE.finditer(window)})
 
 
 def block_hook(out):
@@ -162,12 +171,14 @@ class Run:
         seen = time.monotonic_ns()
         zombie_exit = None
         gone = None
+        end_off = None
         if helper is not None:
             limit = time.monotonic() + 30
             while time.monotonic() < limit:
                 st = proc_stat(helper)
                 if st is None or st[1] != self.child:
                     gone = time.monotonic_ns()
+                    end_off = len(self.raw)
                     break
                 if st[0] == 'Z' and zombie_exit is None:
                     zombie_exit = st[2]
@@ -199,6 +210,12 @@ class Run:
             'helper_life_from_branch_s': (gone - branch['t']) / 1e9 if gone and branch else None,
             'helper_life_from_ctrl_g_s': (gone - sent) / 1e9 if gone else None,
             'editor': editors, 'notice_in_output': NOTICE in window,
+            # Claude's editor notices, split at the moment the recorder saw
+            # the helper gone: what Claude wrote from the Ctrl+G to then,
+            # and what it wrote after. The test reads a notice that is only
+            # in the second as Claude's report of this helper's end.
+            'claude_notice_before_end': claude_notices(bytes(self.raw[raw_before:end_off])) if end_off is not None else None,
+            'claude_notice_after_end': claude_notices(bytes(self.raw[end_off:])) if end_off is not None else None,
             'composer_after': self.composer(), 'screen_after': self.text()})
 
     def run(self):
