@@ -190,3 +190,150 @@ fn frontier_throughput() {
         );
     }
 }
+
+/// Processes started after the master was opened, the way a long-lived
+/// generation's census sees every process started since its spawn:
+/// `procs` single-threaded sleepers, and `threaded` processes of `threads`
+/// tasks each (a Python interpreter whose threads sleep).
+fn load(procs: usize, threaded: usize, threads: usize) -> Vec<std::process::Child> {
+    let mut children = Vec::new();
+    for _ in 0..procs {
+        match std::process::Command::new("sleep").arg("900").spawn() {
+            Ok(child) => children.push(child),
+            Err(e) => {
+                println!("load: sleeper spawn failed after {}: {e}", children.len());
+                break;
+            }
+        }
+    }
+    let script = format!(
+        "import threading, time\nfor _ in range({}):\n    threading.Thread(target=time.sleep, args=(900,), daemon=True).start()\ntime.sleep(900)\n",
+        threads.saturating_sub(1)
+    );
+    for _ in 0..threaded {
+        match std::process::Command::new("python3")
+            .args(["-c", &script])
+            .spawn()
+        {
+            Ok(child) => children.push(child),
+            Err(e) => {
+                println!("load: threaded spawn failed: {e}");
+                break;
+            }
+        }
+    }
+    // Let every child reach its sleep and every thread start.
+    std::thread::sleep(Duration::from_millis(1500));
+    children
+}
+
+/// `/proc`'s process and task counts, and the load average.
+fn host() -> String {
+    let pids: Vec<u32> = std::fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+        .collect();
+    let tasks: usize = pids
+        .iter()
+        .map(|p| std::fs::read_dir(format!("/proc/{p}/task")).map_or(0, |d| d.count()))
+        .sum();
+    format!(
+        "processes {}, tasks {tasks}, cores {:?}, load {}",
+        pids.len(),
+        std::thread::available_parallelism().ok(),
+        std::fs::read_to_string("/proc/loadavg")
+            .unwrap_or_default()
+            .trim()
+    )
+}
+
+/// PRD #1666 part 3 (Q35-20a, the census reader-stall budget): what a
+/// requested frontier costs on the reader thread of an idle pane, from the
+/// request (the wake's ring) to its outcome, and the `/proc` census alone
+/// inside it, with more and more processes started after the master. Not a
+/// gate: it prints figures, and is run by hand in the release profile:
+///
+/// ```text
+/// cargo test --release --lib frontier_request_latency -- --ignored --nocapture --test-threads 1
+/// ```
+#[test]
+#[ignore = "measurement, run by hand in the release profile (Q35-20a census budget)"]
+fn frontier_request_latency() {
+    use crate::composer_probe::master_holders::{holders, master_id};
+    const REQUESTS: usize = 60;
+    let mut pty = spawn(&["sh", "-c", "stty raw -echo; exec cat"]);
+    let bus = Arc::new(AgentBus::new());
+    let thread_bus = Arc::clone(&bus);
+    let source = pty.master.try_clone_reader().unwrap();
+    let frontier = Frontier::setup(&bus, "7", pty.master.as_raw_fd(), pty.opened, &[])
+        .expect("frontier setup");
+    let thread = std::thread::spawn(move || frontier.run(source, &thread_bus, |_| {}));
+    let id = master_id(pty.master.as_raw_fd().unwrap()).unwrap();
+    let since = pty.opened.unwrap();
+    // Wait out `stty`.
+    std::thread::sleep(Duration::from_millis(300));
+    println!("before any load: {}", host());
+    // The last condition is above the dev box this was written on (380
+    // processes, 702 tasks, 378 descriptors in the user's own processes):
+    // more processes, tasks and same-user descriptors. A sandbox stopped
+    // when 1000 sleepers were added, so larger counts are left out.
+    let conditions: [(&str, usize, usize, usize); 3] = [
+        ("no added process", 0, 0, 0),
+        ("400 sleepers", 400, 0, 0),
+        ("400 sleepers + 40 processes x 16 threads", 400, 40, 16),
+    ];
+    let mut loaded = Vec::new();
+    let mut added = (0, 0);
+    for (label, procs, threaded, threads) in conditions {
+        loaded.extend(load(procs - added.0, threaded - added.1, threads));
+        added = (procs, threaded);
+        let mut census = Vec::new();
+        let mut found = String::new();
+        for _ in 0..30 {
+            let t = Instant::now();
+            found = format!("{:?}", holders(&id, since));
+            census.push(t.elapsed());
+        }
+        census.sort();
+        let mut path = Vec::new();
+        let (mut taken, mut missing) = (0, 0);
+        for _ in 0..REQUESTS {
+            let t = Instant::now();
+            let request = bus.input().request_frontier(7, None);
+            let outcome = loop {
+                if let Some(outcome) = request.outcome() {
+                    break outcome;
+                }
+                assert!(t.elapsed() < Duration::from_secs(30), "no outcome");
+                std::thread::yield_now();
+            };
+            path.push(t.elapsed());
+            match outcome {
+                crate::composer_probe::record::FrontierOutcome::Taken { .. } => taken += 1,
+                _ => missing += 1,
+            }
+        }
+        path.sort();
+        println!("{label}: {}", host());
+        println!(
+            "  census: p50 {:?}, p90 {:?}, max {:?}; {found}",
+            nearest_rank(&census, 50.0),
+            nearest_rank(&census, 90.0),
+            census[census.len() - 1]
+        );
+        println!(
+            "  requested frontier: p50 {:?}, p90 {:?}, p99 {:?}, max {:?}; taken {taken}, missing {missing}",
+            nearest_rank(&path, 50.0),
+            nearest_rank(&path, 90.0),
+            nearest_rank(&path, 99.0),
+            path[path.len() - 1]
+        );
+    }
+    for mut child in loaded {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    pty.child.kill().unwrap();
+    pty.child.wait().unwrap();
+    thread.join().unwrap();
+}
