@@ -1,0 +1,62 @@
+{
+ "release": "2.1.317",
+ "sha256": "eb224419e344575faa4a1f39b290b649425a10cd5ee2ef1d003480cd9ae57eb0",
+ "source_capture": "/var/tmp/dad-claude-editor-measure-9MrIz1/capture",
+ "recorder_sha256": "eb742c62971ab2b67fdca0807329b09189bc078953554e33c19bffe548c8bc8d",
+ "error": null,
+ "rows": [
+  {
+   "cell": "keymap-reload-baseline",
+   "ctrlg": {
+    "opened": true
+   }
+  },
+  {
+   "cell": "keymap-reload-created",
+   "samples": [
+    {
+     "elapsed_s": 1.261157005,
+     "ctrlg_opened": true,
+     "ctrle_opened": false,
+     "ctrlg_sent_s": 0.000508836,
+     "ctrle_sent_s": 0.567905667
+    },
+    {
+     "elapsed_s": 2.518320882,
+     "ctrlg_opened": true,
+     "ctrle_opened": false,
+     "ctrlg_sent_s": 1.262134035,
+     "ctrle_sent_s": 1.822213865
+    },
+    {
+     "elapsed_s": 3.783237596,
+     "ctrlg_opened": false,
+     "ctrle_opened": true,
+     "ctrlg_sent_s": 2.519288464,
+     "ctrle_sent_s": 3.214140136
+    }
+   ],
+   "flipped": true
+  },
+  {
+   "cell": "keymap-reload-removed",
+   "samples": [
+    {
+     "elapsed_s": 1.392664475,
+     "ctrlg_opened": false,
+     "ctrle_opened": false,
+     "ctrlg_sent_s": 0.000834688,
+     "ctrle_sent_s": 0.696935648
+    },
+    {
+     "elapsed_s": 2.644912501,
+     "ctrlg_opened": true,
+     "ctrle_opened": false,
+     "ctrlg_sent_s": 1.393681758,
+     "ctrle_sent_s": 1.950240767
+    }
+   ],
+   "flipped": true
+  }
+ ]
+}

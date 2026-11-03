@@ -1,0 +1,224 @@
+{
+ "release": "2.1.317",
+ "sha256": "eb224419e344575faa4a1f39b290b649425a10cd5ee2ef1d003480cd9ae57eb0",
+ "source_capture": "/var/tmp/dad-m59-52ojo4/capture",
+ "recorder_sha256": "16424cd12d84ccb0b9fc208b3e0123a4d822b6aef24d64463b860041ec9b9e7b",
+ "error": null,
+ "rows": [
+  {
+   "trial": 1,
+   "draft": "M59_DRAFT_1",
+   "editor_rc_planned": 0,
+   "sent_t": 3442176076216474,
+   "helper_pid": 428085,
+   "helper_seen_t": 3442176387973459,
+   "helper_gone_t": 3442181364750985,
+   "zombie_status": {
+    "exited": false,
+    "code": null,
+    "signal": 14,
+    "raw": 14
+   },
+   "helper_life_from_start_s": 5.004220757,
+   "helper_life_from_branch_s": 5.002635184,
+   "helper_life_from_ctrl_g_s": 5.288534511,
+   "notice_in_output": false,
+   "composer_after": "M59_DRAFT_1",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "pause ready"
+   ],
+   "editor_stages": []
+  },
+  {
+   "trial": 2,
+   "draft": "M59_DRAFT_2",
+   "editor_rc_planned": 0,
+   "sent_t": 3442184958793147,
+   "helper_pid": 428351,
+   "helper_seen_t": 3442185030756886,
+   "helper_gone_t": 3442189999494743,
+   "zombie_status": null,
+   "helper_life_from_start_s": 5.004223368,
+   "helper_life_from_branch_s": 5.002378955,
+   "helper_life_from_ctrl_g_s": 5.040701596,
+   "notice_in_output": false,
+   "composer_after": "M59_DRAFT_2",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "pause ready"
+   ],
+   "editor_stages": []
+  },
+  {
+   "trial": 3,
+   "draft": "M59_DRAFT_3",
+   "editor_rc_planned": 0,
+   "sent_t": 3442193595032298,
+   "helper_pid": 428426,
+   "helper_seen_t": 3442193665413335,
+   "helper_gone_t": 3442198633745467,
+   "zombie_status": null,
+   "helper_life_from_start_s": 5.004981826,
+   "helper_life_from_branch_s": 5.003302527,
+   "helper_life_from_ctrl_g_s": 5.038713169,
+   "notice_in_output": false,
+   "composer_after": "M59_DRAFT_3",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "pause ready"
+   ],
+   "editor_stages": []
+  },
+  {
+   "trial": 4,
+   "draft": "M59_DRAFT_4",
+   "editor_rc_planned": 0,
+   "sent_t": 3442202227615512,
+   "helper_pid": 428479,
+   "helper_seen_t": 3442202286336055,
+   "helper_gone_t": 3442207255756853,
+   "zombie_status": null,
+   "helper_life_from_start_s": 5.003106886,
+   "helper_life_from_branch_s": 5.001912049,
+   "helper_life_from_ctrl_g_s": 5.028141341,
+   "notice_in_output": false,
+   "composer_after": "M59_DRAFT_4",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "pause ready"
+   ],
+   "editor_stages": []
+  },
+  {
+   "trial": 5,
+   "draft": "M59_DRAFT_5",
+   "editor_rc_planned": 0,
+   "sent_t": 3442210844330086,
+   "helper_pid": 428559,
+   "helper_seen_t": 3442210920776303,
+   "helper_gone_t": 3442215879340043,
+   "zombie_status": null,
+   "helper_life_from_start_s": 5.004479293,
+   "helper_life_from_branch_s": 5.002023191,
+   "helper_life_from_ctrl_g_s": 5.035009957,
+   "notice_in_output": false,
+   "composer_after": "M59_DRAFT_5",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "pause ready"
+   ],
+   "editor_stages": []
+  },
+  {
+   "trial": 6,
+   "draft": "M59_DRAFT_6",
+   "editor_rc_planned": 0,
+   "sent_t": 3442219471457305,
+   "helper_pid": 428660,
+   "helper_seen_t": 3442219541902887,
+   "helper_gone_t": 3442224503541114,
+   "zombie_status": null,
+   "helper_life_from_start_s": 5.004552595,
+   "helper_life_from_branch_s": 5.002646708,
+   "helper_life_from_ctrl_g_s": 5.032083809,
+   "notice_in_output": false,
+   "composer_after": "M59_DRAFT_6",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "pause ready"
+   ],
+   "editor_stages": []
+  },
+  {
+   "trial": 7,
+   "draft": "M59_DRAFT_7",
+   "editor_rc_planned": 0,
+   "sent_t": 3442228095400519,
+   "helper_pid": 428732,
+   "helper_seen_t": 3442228167758882,
+   "helper_gone_t": 3442233128443537,
+   "zombie_status": null,
+   "helper_life_from_start_s": 5.006147847,
+   "helper_life_from_branch_s": 5.004155864,
+   "helper_life_from_ctrl_g_s": 5.033043018,
+   "notice_in_output": false,
+   "composer_after": "M59_DRAFT_7",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "pause ready"
+   ],
+   "editor_stages": []
+  },
+  {
+   "trial": 8,
+   "draft": "M59_DRAFT_8",
+   "editor_rc_planned": 0,
+   "sent_t": 3442236715425368,
+   "helper_pid": 428799,
+   "helper_seen_t": 3442236787434116,
+   "helper_gone_t": 3442241751932791,
+   "zombie_status": null,
+   "helper_life_from_start_s": 5.003741095,
+   "helper_life_from_branch_s": 5.001802355,
+   "helper_life_from_ctrl_g_s": 5.036507423,
+   "notice_in_output": false,
+   "composer_after": "M59_DRAFT_8",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "pause ready"
+   ],
+   "editor_stages": []
+  },
+  {
+   "trial": 9,
+   "draft": "M59_DRAFT_9",
+   "editor_rc_planned": 0,
+   "sent_t": 3442245338415935,
+   "helper_pid": 428950,
+   "helper_seen_t": 3442245410976391,
+   "helper_gone_t": 3442250370509118,
+   "zombie_status": null,
+   "helper_life_from_start_s": 5.004202763,
+   "helper_life_from_branch_s": 5.002001945,
+   "helper_life_from_ctrl_g_s": 5.032093183,
+   "notice_in_output": false,
+   "composer_after": "M59_DRAFT_9",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "pause ready"
+   ],
+   "editor_stages": []
+  },
+  {
+   "trial": 10,
+   "draft": "M59_DRAFT_10",
+   "editor_rc_planned": 0,
+   "sent_t": 3442253956349526,
+   "helper_pid": 429054,
+   "helper_seen_t": 3442254026501505,
+   "helper_gone_t": 3442258985928383,
+   "zombie_status": null,
+   "helper_life_from_start_s": 5.003909844,
+   "helper_life_from_branch_s": 5.001852812,
+   "helper_life_from_ctrl_g_s": 5.029578857,
+   "notice_in_output": false,
+   "composer_after": "M59_DRAFT_10",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "pause ready"
+   ],
+   "editor_stages": []
+  }
+ ]
+}
