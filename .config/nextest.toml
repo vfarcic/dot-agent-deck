@@ -808,3 +808,23 @@ slow-timeout = { period = "60s", terminate-after = 28 }
 [[profile.default.overrides]]
 filter = 'test(/^probe_090_live_claude_317_/)'
 slow-timeout = { period = "60s", terminate-after = 9 }
+
+# PRD #1666 part 3, Q35-28's lane-2 gates on a real installed Claude Code
+# (`tests/e2e_composer_check_claude_live.rs`, `tests/e2e_editor_installation_claude_live.rs`).
+# `040` launches a fresh deck per trial (20 by default; the late-helper path
+# holds each check 11 s); each deck's daemon has its own 300 s cap. `042` and
+# `044` run one deck each, inside that cap.
+[[profile.default.overrides]]
+filter = 'test(/^probe_040_live_/)'
+slow-timeout = { period = "60s", terminate-after = 20 }
+
+[[profile.default.overrides]]
+filter = 'test(/^probe_04[24]_live_/)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# The five `inbox/doorbell/010` live cases re-oracled to the installed pane's
+# checks (`tests/e2e_inbox_claude_live.rs`): each waits for a check before its
+# five-second hold, and the kept-draft case runs three decks in turn.
+[[profile.default.overrides]]
+filter = 'test(/^doorbell_010_live_(kept_draft|spaces_only|spaces_moved_back|blanks_enter|reviewer_sequence)/)'
+slow-timeout = { period = "60s", terminate-after = 5 }
