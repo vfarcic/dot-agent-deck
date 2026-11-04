@@ -710,6 +710,17 @@ slow-timeout = { period = "60s", terminate-after = 9 }
 filter = 'test(voice_desktop_phrases_001_phrase_fixtures_match_the_default_backend)'
 slow-timeout = { period = "60s", terminate-after = 8 }
 
+# `voice_desktop_phrases_006_a_named_start_target_is_read_by_the_real_judge`
+# (same file) sends 16 sentences x 10 pairs x 2 votes = 320 requests to the
+# real backend, two in flight. Measured 2026-11-04 on `gpt-5-mini`: ~238 of
+# them in the default 3 x 60s, every vote so far correct, so the default
+# killed a run that was passing (twice, in two runs). Like 001 above it
+# reaches a model only with `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` and a key, and
+# 8 x 60s stays bounded. The filter tracks the TEST FUNCTION name.
+[[profile.default.overrides]]
+filter = 'test(voice_desktop_phrases_006_a_named_start_target_is_read_by_the_real_judge)'
+slow-timeout = { period = "60s", terminate-after = 8 }
+
 # `codex/worker/001` drives a REAL Codex orchestration worker through a
 # delegated task and its `work-done`. Alone it takes 26-110s; beside other
 # real-agent tests it was killed at the default 3 x 60s with no diagnostics (met

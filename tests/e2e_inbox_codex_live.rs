@@ -161,13 +161,25 @@ fn codex_022_live_untrusted_hooks_a_model_run_fetch_delivers_on_receipts() {
     let mut input =
         codex.input("Run dot-agent-deck inbox fetch in the shell and do what the messages say.");
     codex.wait_screen("Run dot-agent-deck inbox fetch");
-    input.write("\r");
-    let reached = common::wait_until(BUDGET, || {
+    let fetched = || {
         codex
             .log()
             .lines()
             .any(|line| line.contains("hook receiver's inbox fetch") && line.contains("Cli"))
-    });
+    };
+    // A painted prompt is the positive input barrier, but Codex's paste-burst
+    // debounce must settle before the separate Enter, as in the busy test
+    // above: an Enter written straight after the paint was taken into the
+    // draft and the prompt never submitted (two of two runs on PRD #1666 part
+    // 3, 2026-11-04). The wait doubles as a check that nothing fetched before
+    // the prompt was submitted.
+    assert!(
+        !common::wait_until(Duration::from_secs(2), fetched),
+        "nothing may fetch before the prompt is submitted; {}",
+        codex.evidence()
+    );
+    input.write("\r");
+    let reached = common::wait_until(BUDGET, fetched);
     assert!(
         reached,
         "UNVERIFIED: Codex's model-run `inbox fetch` never reached the deck (a sandbox that refuses the socket is not a pass); {}",

@@ -88,9 +88,14 @@ fn claude_release_binary() -> Result<PathBuf, String> {
             .join(".local/share/claude/versions")
             .join(&release),
     };
-    path.is_file()
-        .then_some(path)
-        .ok_or_else(|| format!("Claude Code {release} is not at the pinned path"))
+    if path.is_file() {
+        return Ok(path);
+    }
+    Err(format!(
+        "Claude Code {release} is not at the pinned path {}: set DAD_PROBE_FRESHNESS_BINARY \
+         to the {release} executable (DAD_PROBE_FRESHNESS_RELEASE names another release)",
+        path.display()
+    ))
 }
 
 /// One attach request with a bound wide enough for a widened probe.
