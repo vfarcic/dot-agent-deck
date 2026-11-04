@@ -190,19 +190,23 @@ pub enum Kind {
     HumanG,
 }
 
-/// Q147b: a byte a terminal out of raw mode may act on rather than queue as
-/// typed: every C0 control but Tab, Line Feed and Escape, and Delete. Under
-/// the line discipline's default settings that covers the signal keys
-/// (Ctrl+C, Ctrl+\ and Ctrl+Z), Enter (which `ICRNL` turns into a line
-/// feed), the erase, kill, word-erase, reprint, literal-next and end-of-file
-/// keys, and Ctrl+S and Ctrl+Q under `IXON`. The other controls in the set
-/// do nothing there, and are held too because the settings an agent
-/// restores for its editor can assign any of them. It is the raw byte,
-/// wherever it sits in the input's framing: the line discipline reads no
-/// escape sequences, so a byte inside a paste or a sequence counts as well
-/// (a release then stops at the last ground point before it).
+/// Q147b: a byte a terminal out of raw mode acts on rather than queueing it
+/// as typed, under the default settings a pane starts with (the deck sets
+/// none, and Claude restores those for its editor): the default control
+/// characters of `termios(3)`, which are Ctrl+C, Ctrl+\ and Ctrl+Z (the
+/// signal keys), Ctrl+D (end of file), Delete (erase), Ctrl+U (kill),
+/// Ctrl+W (word erase), Ctrl+R (reprint), Ctrl+V (literal next), Ctrl+O
+/// (discard), Ctrl+S and Ctrl+Q (flow control), and Enter, which `ICRNL`
+/// turns into a line feed. Other bytes, the BEL ending an OSC reply among
+/// them, are queued unchanged. It is the raw byte, wherever it sits in the
+/// input's framing: the line discipline reads no escape sequences, so a byte
+/// inside a paste or a sequence counts as well (a release then stops at the
+/// last ground point before it).
 pub fn line_discipline_key(byte: u8) -> bool {
-    matches!(byte, 0x00..=0x08 | 0x0b..=0x1a | 0x1c..=0x1f | 0x7f)
+    matches!(
+        byte,
+        0x03 | 0x04 | 0x0d | 0x0f | 0x11 | 0x12 | 0x13 | 0x15 | 0x16 | 0x17 | 0x1a | 0x1c | 0x7f
+    )
 }
 
 /// A return marker in the output.

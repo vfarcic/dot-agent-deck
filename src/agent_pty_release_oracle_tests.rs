@@ -142,13 +142,15 @@ const FRAME: &[u8] = b"\x1b[?2026h";
 const CTRL_G: u8 = 0x07;
 
 /// Q147b, from the line discipline's defaults (`termios(3)`), not from the
-/// implementation: a byte a terminal out of raw mode may act on rather than
-/// queue as typed. Every C0 control but Tab, Line Feed and Escape (among
-/// them the signal keys, Enter under `ICRNL`, the erase, kill, word-erase,
-/// reprint, literal-next, end-of-file and flow-control keys), and Delete
-/// (the erase key).
+/// implementation: a byte a terminal out of raw mode acts on rather than
+/// queue as typed. The default control characters (Ctrl+C, Ctrl+\, Ctrl+Z,
+/// Ctrl+D, Delete, Ctrl+U, Ctrl+W, Ctrl+R, Ctrl+V, Ctrl+O, Ctrl+S, Ctrl+Q)
+/// and Enter, which `ICRNL` rewrites.
 fn line_discipline_key(byte: u8) -> bool {
-    matches!(byte, 0x00..=0x08 | 0x0b..=0x1a | 0x1c..=0x1f | 0x7f)
+    matches!(
+        byte,
+        0x03 | 0x04 | 0x0d | 0x0f | 0x11 | 0x12 | 0x13 | 0x15 | 0x16 | 0x17 | 0x1a | 0x1c | 0x7f
+    )
 }
 
 /// What the PTY and the arm page saw, in order.
