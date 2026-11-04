@@ -995,7 +995,7 @@ const CODEX_0160_DIALOGS: &[DialogKeys<'static>] = &[
 /// `editor_probe` is verified, so the deck checks no input box on any of
 /// them; 2.1.317's measured one is [`CLAUDE_2_1_317_EDITOR_PROBE`], which
 /// activation (Q35-28) sets.
-pub static RELEASE_RECORDS: [ReleaseRecord<'static>; 5] = [
+pub static RELEASE_RECORDS: [ReleaseRecord<'static>; 6] = [
     // Codex 0.164.0, the release current at measurement. Echo: the exact line
     // in the composer 30 of 30 (20 at 50 × 200, 10 at 24 × 80; ≤ 62 ms after
     // its one write). Submit: the transcript's user message 30 of 30 ≤ 418 ms
@@ -1163,6 +1163,55 @@ pub static RELEASE_RECORDS: [ReleaseRecord<'static>; 5] = [
         // before then (`inbox/doorbell/053`, `inbox/probe/012`).
         editor_probe: Measurement::Absent,
     },
+    // Claude Code 2.1.318, the release installed on 2026-11-04, pinned
+    // SHA-256 708c77b204db30086ff6f1ed34577bda03e1be74ced80557cbf7b54249
+    // ebf0bd (the official @anthropic-ai/claude-code-linux-x64 package,
+    // byte-identical to the installed copy). It measured the same as 2.1.317
+    // on every value this record takes, through the same per-release test
+    // bodies, every submission blocked before a model turn: 30/30 exact
+    // echoes (<= 44.2 ms), exact blocked prompt hooks (<= 240.7 ms after the
+    // CR) and transcript user echoes (<= 114.4 ms), across 24x80 and 50x200.
+    // Ten fresh launches idle 20 s each with no post-ready dialog, raw input
+    // from the ready composer; the recorded header latches 2.1.318 byte by
+    // byte, at the recorded split and in one push. Ten resizes and ten
+    // nudges draw the measured marker and width witness (first redraw
+    // <= 58.4 ms); six deletes leave no placeholder. All nineteen Q32
+    // sequences match 2.1.312, and the nine menu size/palette sets read as
+    // 2.1.317's do (63/63 screens in the fast replay). Real push replay, run
+    // in an RWX sandbox (16 cores, load average 6.52 at its start, from its
+    // own build), so not comparable with 2.1.317's run: this release's traces
+    // at most 87.5 us added hold and 3.39 ms scanner CPU per generation; over
+    // the run's 144 recorded-trace rows the aggregate p99 66.1 us and at most
+    // 292.1 us, and every row's own p99 and maximum and every generation's
+    // CPU within plan §4.6's limits, with no work limit reached
+    // (`tests/fixtures/claude-inbox/release-2.1.318/parser-cost-replay.txt`).
+    // Under a recalled prompt's `History i/n` rule the profile read no
+    // composer in any of the 24 such frames per capture. Evidence:
+    // `tests/fixtures/claude-inbox/release-2.1.318/README.md` and
+    // `tests/fixtures/claude-inbox/r5wake/claude-menu-candidates.md`,
+    // "Claude Code 2.1.318".
+    ReleaseRecord {
+        agent: AgentType::ClaudeCode,
+        release: Version::new(2, 1, 318),
+        profile: "claude-code-2026-10",
+        ready_composer: Measurement::Verified(()),
+        echo: Measurement::Verified(()),
+        submit_route: Measurement::Verified(()),
+        layout: Measurement::Verified(()),
+        key_effects: Measurement::Verified(&[]),
+        first_modal: Measurement::Verified(FirstModal::NoneObserved { launches: 10 }),
+        input_mode: Measurement::Verified(()),
+        release_recogniser: Measurement::Verified(()),
+        parser_cost: Measurement::Verified(()),
+        // Nothing commits in any dialog, so the line is never staged.
+        head_echo: Measurement::Absent,
+        placeholder_empty: Measurement::Failed,
+        delete_key: Measurement::Verified(()),
+        transcript_echo: Measurement::Verified(()),
+        // Measured: [`CLAUDE_2_1_318_EDITOR_PROBE`]. Left absent as
+        // 2.1.317's is, until activation verifies it.
+        editor_probe: Measurement::Absent,
+    },
 ];
 
 /// Claude Code 2.1.317's external-editor action as measured on 2026-11-03
@@ -1195,6 +1244,47 @@ pub static RELEASE_RECORDS: [ReleaseRecord<'static>; 5] = [
 ///   two runs (`inbox/probe/089` now fails on any other reading). The first
 ///   report's "dropped" read the screen, which draws no BEL.
 pub const CLAUDE_2_1_317_EDITOR_PROBE: EditorProbe<'static> = EditorProbe {
+    export: ExportShape::ClaudeTmpdir,
+    selection: EditorSelection::ClaudeCode,
+    paste_toggles: PasteToggles {
+        disables: 1,
+        enables: 1,
+    },
+    keymap_sources: &[KeymapSource::ClaudeKeybindings],
+    keymap_loaded_at_start: Measurement::Verified(()),
+    inert_candidates: &[],
+    pasted_bel_is_text: Measurement::Absent,
+};
+
+/// Claude Code 2.1.318's external-editor action as measured on 2026-11-04
+/// (`tests/fixtures/claude-inbox/release-2.1.318/`, `inbox/probe/088`,
+/// `089`, through the same test bodies as 2.1.317's): the `editor_probe` its
+/// record gets at activation, a one-line change. Every value equals
+/// [`CLAUDE_2_1_317_EDITOR_PROBE`]'s, and each field is verified only as far
+/// as it was measured.
+///
+/// - `export`: 5/5 Ctrl+G presses under `VISUAL` handed the editor the draft,
+///   with `TMPDIR` unset, under `/tmp/claude-<uid>/` (as
+///   `claude-prompt-<uuid>.md`) as its last argument, and reimported the
+///   rewritten file; a set `TMPDIR` was not measured.
+/// - `selection`: a set `VISUAL` before `EDITOR`; an empty `VISUAL` falls to
+///   `EDITOR`; with neither, `code` on `PATH` (as `code -w -g`) before `vi`.
+/// - `paste_toggles`: one `?2004l` before the editor and one `?2004h` after
+///   it, 5/5, measured on the `VISUAL` path; the `EDITOR` and `PATH` `vi`
+///   cells wrote the same, and the `PATH` `code -w -g` fallback wrote none.
+/// - `keymap_sources`: the user's `keybindings.json` only; the same file in
+///   the project's `.claude/` had no effect, with user settings only and
+///   with every settings source.
+/// - `keymap_loaded_at_start` (P-KB1, M49b): a Ctrl+G-unbinding file present
+///   at spawn was in force at the first composer frame 5/5, stayed in force
+///   unchanged for ten minutes 10/10, and a file created or removed during a
+///   session took effect by 3.65 s and 3.87 s (sampled, not a race bound).
+/// - `inert_candidates`: none, the M44e safe default; all 73 state/form cells
+///   read as 2.1.317's.
+/// - `pasted_bel_is_text`: `Absent`, the safe default. Measured, the pasted
+///   BEL is kept as text: a bracketed `PASTE` BEL `TAIL` opened no editor
+///   and the next export held `BASEPASTE\x07TAIL`, 2/2 whole and split.
+pub const CLAUDE_2_1_318_EDITOR_PROBE: EditorProbe<'static> = EditorProbe {
     export: ExportShape::ClaudeTmpdir,
     selection: EditorSelection::ClaudeCode,
     paste_toggles: PasteToggles {
