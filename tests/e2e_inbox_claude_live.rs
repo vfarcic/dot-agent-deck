@@ -777,6 +777,9 @@ fn empty_editor_fallback(label: &str, erase_draft: bool) {
 #[cfg(target_os = "linux")]
 fn doorbell_010_live_left_opens_overview_and_the_line_is_not_typed_there() {
     skip_unless!(common::check_claude_available());
+    // Its positive control is delivered by the doorbell, which types only
+    // into a release the deck has measured.
+    skip_unless!(claude_release_measured());
     // util-linux script records every input byte before relaying it to the
     // real interactive Claude PTY. No human keys follow Left, so any later
     // input is automatic, even if a partial token is erased between samples.
