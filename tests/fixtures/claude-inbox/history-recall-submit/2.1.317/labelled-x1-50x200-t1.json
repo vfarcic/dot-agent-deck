@@ -1,0 +1,391 @@
+{
+  "source_run": "capture",
+  "argv0": "claude",
+  "rows": 50,
+  "cols": 200,
+  "read_lens": [
+    13,
+    44,
+    1814,
+    18,
+    3,
+    104,
+    243,
+    162,
+    141,
+    239,
+    20,
+    461,
+    101,
+    546,
+    46,
+    46,
+    46,
+    45,
+    44,
+    20,
+    44,
+    44,
+    44,
+    44,
+    44,
+    20,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    20,
+    44,
+    44,
+    44,
+    44,
+    20,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    20,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    20,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    20,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    20,
+    43,
+    42,
+    89,
+    92,
+    42,
+    42,
+    42,
+    86,
+    101,
+    75,
+    69,
+    72,
+    71,
+    68,
+    67,
+    71,
+    44,
+    71,
+    70,
+    73,
+    106
+  ],
+  "points": {
+    "empty": 1892,
+    "mark:up-1": 1892,
+    "up-1": 1996,
+    "mark:ctrl-u": 1996,
+    "cleared": 2239,
+    "mark:slot-up": 2239,
+    "slot-up": 2401,
+    "mark:slot-down": 2401,
+    "slot-down": 2542,
+    "before-ring": 2542,
+    "mark:line": 2542,
+    "echoed": 2781,
+    "typed": 2781,
+    "mark:cr": 2781,
+    "submitted": 3363,
+    "after-enter": 3909,
+    "mark:clear": 3909,
+    "after-clear": 8250,
+    "mark:walk-up-1": 8250,
+    "walk-up-1": 8351,
+    "mark:walk-up-2": 8351,
+    "walk-up-2": 8426,
+    "mark:walk-up-3": 8426,
+    "walk-up-3": 8495,
+    "mark:walk-up-4": 8495,
+    "walk-up-4": 8567,
+    "mark:walk-up-5": 8567,
+    "walk-up-5": 8638,
+    "mark:walk-up-6": 8638,
+    "walk-up-6": 8706,
+    "mark:walk-up-7": 8706,
+    "walk-up-7": 8706,
+    "mark:walk-up-8": 8706,
+    "walk-up-8": 8706,
+    "mark:walk-down-1": 8706,
+    "walk-down-1": 8773,
+    "mark:walk-down-2": 8773,
+    "walk-down-2": 8888,
+    "mark:walk-down-3": 8888,
+    "walk-down-3": 8959,
+    "mark:walk-down-4": 8959,
+    "walk-down-4": 9029,
+    "mark:walk-down-5": 9029,
+    "walk-down-5": 9102,
+    "mark:walk-down-6": 9102,
+    "walk-down-6": 9208,
+    "mark:walk-down-7": 9208,
+    "walk-down-7": 9208,
+    "mark:walk-down-8": 9208,
+    "walk-down-8": 9208,
+    "mark:walk-down-9": 9208,
+    "walk-down-9": 9208,
+    "end": 9208
+  },
+  "edges": [],
+  "lines": [
+    "(cmvbit) dot-agent-deck: message m-hist319l-0f3c9a71d2e4b811 waiting, run: dot-agent-deck inbox fetch"
+  ],
+  "release": "2.1.317",
+  "executable_sha256": "eb224419e344575faa4a1f39b290b649425a10cd5ee2ef1d003480cd9ae57eb0",
+  "recorder": "tests/support/claude_history_submit_measure.py",
+  "recorder_sha256": "1ae3a1031e3930037534304afc6ed10b2f4b7346e76863cd60109e75e2b3de68",
+  "release_recorder_sha256": "79931911fe27567810448c5f20e876e38782f64b758968bdacb718e7bc51c36e",
+  "trace_sha256": "329460ae69216c074a2559b8848e32f32fbedf975218023ac0156745a7362a40",
+  "hook_prompts": [
+    "(cmvbit) dot-agent-deck: message m-hist319l-0f3c9a71d2e4b811 waiting, run: dot-agent-deck inbox fetch"
+  ],
+  "hook_events": [
+    "UserPromptSubmit"
+  ],
+  "outcome": {
+    "after_clear": {
+      "box": "",
+      "editable": true,
+      "history": false,
+      "point": "after-clear",
+      "rule": "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
+    },
+    "after_clear_empty_and_ready": true,
+    "after_enter": {
+      "box": "(cmvbit) dot-agent-deck: message m-hist319l-0f3c9a71d2e4b811 waiting, run: dot-agent-deck inbox fetch",
+      "editable": true,
+      "history": false,
+      "point": "after-enter",
+      "rule": "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
+    },
+    "after_enter_dialog": "None",
+    "before_ring": {
+      "box": "Try \"create a util logging.py that...\"",
+      "editable": true,
+      "history": true,
+      "point": "before-ring",
+      "rule": "─── History 6/6 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
+    },
+    "before_ring_empty_and_ready": false,
+    "capture": "/var/tmp/dad-claude-release-measure-marezH/capture",
+    "case": "labelled",
+    "cleared": {
+      "box": "Try \"create a util logging.py that...\"",
+      "editable": true,
+      "history": false,
+      "point": "cleared",
+      "rule": "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
+    },
+    "cleared_empty_and_ready": true,
+    "echo_ms": 77.239742,
+    "history_log": [
+      "HISTORYONEalpha",
+      "HISTORYTWObravo",
+      "HISTORYTHREEcharlie",
+      "HISTORYFOURdelta",
+      "HISTORYFIVEecho",
+      "HISTORYSIXfoxtrot"
+    ],
+    "hook_ms": 212.342233,
+    "line": "(cmvbit) dot-agent-deck: message m-hist319l-0f3c9a71d2e4b811 waiting, run: dot-agent-deck inbox fetch",
+    "load": [
+      [
+        1.759765625,
+        4.75244140625,
+        12.08203125
+      ],
+      "some avg10=1.62 avg60=0.65 avg300=2.85 total=204746507242",
+      [
+        2.16796875,
+        4.5673828125,
+        11.78662109375
+      ],
+      "some avg10=0.39 avg60=0.60 avg300=2.63 total=204746826198"
+    ],
+    "presses": 1,
+    "prompts": [
+      "(cmvbit) dot-agent-deck: message m-hist319l-0f3c9a71d2e4b811 waiting, run: dot-agent-deck inbox fetch"
+    ],
+    "reachable": true,
+    "recalled": [
+      "HISTORYSIXfoxtrot",
+      "HISTORYFIVEecho",
+      "HISTORYFOURdelta",
+      "HISTORYTHREEcharlie",
+      "HISTORYTWObravo",
+      "HISTORYONEalpha"
+    ],
+    "release": "2.1.317",
+    "size": "50x200",
+    "slot": "6/6",
+    "slot_down": {
+      "box": "Try \"create a util logging.py that...\"",
+      "editable": true,
+      "history": true,
+      "point": "slot-down",
+      "rule": "─── History 6/6 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
+    },
+    "slot_text": "HISTORYSIXfoxtrot",
+    "slot_up": {
+      "box": "HISTORYFIVEecho",
+      "editable": true,
+      "history": true,
+      "point": "slot-up",
+      "rule": "─── History 5/6 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
+    },
+    "trial": 1,
+    "typed": {
+      "box": "(cmvbit) dot-agent-deck: message m-hist319l-0f3c9a71d2e4b811 waiting, run: dot-agent-deck inbox fetch",
+      "editable": true,
+      "history": false,
+      "point": "typed",
+      "rule": "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
+    },
+    "typed_holds": "Some(Exact)",
+    "walk": [
+      [
+        "─── History 6/6 ────",
+        "HISTORYSIXfoxtrot"
+      ],
+      [
+        "─── History 5/6 ────",
+        "HISTORYFIVEecho"
+      ],
+      [
+        "─── History 4/6 ────",
+        "HISTORYFOURdelta"
+      ],
+      [
+        "─── History 3/6 ────",
+        "HISTORYTHREEcharlie"
+      ],
+      [
+        "─── History 2/6 ────",
+        "HISTORYTWObravo"
+      ],
+      [
+        "─── History 1/6 ────",
+        "HISTORYONEalpha"
+      ],
+      [
+        "─── History 1/6 ────",
+        "HISTORYONEalpha"
+      ],
+      [
+        "─── History 1/6 ────",
+        "HISTORYONEalpha"
+      ],
+      [
+        "─── History 2/6 ────",
+        "HISTORYTWObravo"
+      ],
+      [
+        "─── History 3/6 ────",
+        "HISTORYTHREEcharlie"
+      ],
+      [
+        "─── History 4/6 ────",
+        "HISTORYFOURdelta"
+      ],
+      [
+        "─── History 5/6 ────",
+        "HISTORYFIVEecho"
+      ],
+      [
+        "─── History 6/6 ────",
+        "HISTORYSIXfoxtrot"
+      ],
+      [
+        "────────────────────",
+        ""
+      ],
+      [
+        "────────────────────",
+        ""
+      ],
+      [
+        "────────────────────",
+        ""
+      ],
+      [
+        "────────────────────",
+        ""
+      ]
+    ]
+  },
+  "load": [
+    [
+      1.759765625,
+      4.75244140625,
+      12.08203125
+    ],
+    "some avg10=1.62 avg60=0.65 avg300=2.85 total=204746507242",
+    [
+      2.16796875,
+      4.5673828125,
+      11.78662109375
+    ],
+    "some avg10=0.39 avg60=0.60 avg300=2.63 total=204746826198"
+  ]
+}
