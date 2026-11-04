@@ -689,11 +689,13 @@ fn doorbell_053_an_assumed_head_echo_completes_only_that_codex_record() {
     );
 }
 
-/// Scenario: Ask the table about each release the deck carries a record for, as it ships. Claude Code 2.1.310, 2.1.312, 2.1.317 and 2.1.318 are Go, unstaged, 2.1.317 with its measured editor probe and the others with theirs absent, while 2.1.311 and 2.1.319 remain unmeasured; both Codex releases stage the line and are held as missing_measurement until their head echo is recorded; and every record has its parser cost verified.
+/// Scenario: Ask the table about each release the deck carries a record for, as it ships. Claude Code 2.1.310, 2.1.312, 2.1.317 and 2.1.318 are Go, unstaged, 2.1.317 and 2.1.318 with their measured editor probes and the others with theirs absent, while 2.1.311 and 2.1.319 remain unmeasured; both Codex releases stage the line and are held as missing_measurement until their head echo is recorded; and every record has its parser cost verified.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_the_shipped_records_verdicts() {
-    use dot_agent_deck::doorbell_activation::CLAUDE_2_1_317_EDITOR_PROBE;
+    use dot_agent_deck::doorbell_activation::{
+        CLAUDE_2_1_317_EDITOR_PROBE, CLAUDE_2_1_318_EDITOR_PROBE,
+    };
     for record in &RELEASE_RECORDS {
         assert!(
             matches!(record.parser_cost, Measurement::Verified(())),
@@ -723,6 +725,11 @@ fn doorbell_053_the_shipped_records_verdicts() {
             assert_eq!(
                 record.editor_probe,
                 Measurement::Verified(CLAUDE_2_1_317_EDITOR_PROBE)
+            );
+        } else if release == "2.1.318" {
+            assert_eq!(
+                record.editor_probe,
+                Measurement::Verified(CLAUDE_2_1_318_EDITOR_PROBE)
             );
         } else {
             assert!(matches!(record.editor_probe, Measurement::Absent));
@@ -970,14 +977,18 @@ fn doorbell_053_editor_records_move_no_verdict_in_any_table() {
     assert_eq!(tables, 4usize.pow(5));
 }
 
-/// Scenario: Ask about each record the deck ships, as shipped and with the e2e assumption giving every one of them a verified editor record. Every shipped record's editor record is absent except Claude Code 2.1.317's measured one; the assumption changes that field and nothing else, adds no record, and leaves every verdict, Claude Code 2.1.310's Go and both Codex releases' missing_measurement, as it was.
+/// Scenario: Ask about each record the deck ships, as shipped and with the e2e assumption giving every one of them a verified editor record. Every shipped record's editor record is absent except Claude Code 2.1.317's and 2.1.318's measured ones; the assumption changes that field and nothing else, adds no record, and leaves every verdict, Claude Code 2.1.310's Go and both Codex releases' missing_measurement, as it was.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_the_editor_probe_assumption_moves_no_shipped_verdict() {
-    use dot_agent_deck::doorbell_activation::CLAUDE_2_1_317_EDITOR_PROBE;
+    use dot_agent_deck::doorbell_activation::{
+        CLAUDE_2_1_317_EDITOR_PROBE, CLAUDE_2_1_318_EDITOR_PROBE,
+    };
     for record in &RELEASE_RECORDS {
         let expected = if record.agent == CLAUDE && record.release == v("2.1.317") {
             Measurement::Verified(CLAUDE_2_1_317_EDITOR_PROBE)
+        } else if record.agent == CLAUDE && record.release == v("2.1.318") {
+            Measurement::Verified(CLAUDE_2_1_318_EDITOR_PROBE)
         } else {
             Measurement::Absent
         };
