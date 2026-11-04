@@ -929,6 +929,7 @@ pub(crate) const CTRL_G_REFUSED: &str = "ctrl-g-refused";
 /// while Claude is out of raw mode ([`PaneWriter::refuse_signal`]). Both
 /// clients show it in `inbox_display::input_rejected`'s words and keep the
 /// pane taking input, as for [`CTRL_G_REFUSED`].
+#[cfg(target_os = "linux")]
 pub(crate) const SIGNAL_KEY_REFUSED: &str = "signal-key-refused";
 
 /// Why a probe whose byte the PTY didn't take is refused.
