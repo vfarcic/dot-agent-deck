@@ -557,6 +557,10 @@ struct HubState {
     /// an agent generation's waiting messages, with the message the hold was
     /// last told against ([`InboxHub::set_wake_hold`]).
     wake_hold: HashMap<AgentKey, (crate::inbox_display::WakeHold, String)>,
+    /// PRD #1666 part 3 (Q35-27, OQ1): why a `cannot_check` hold in
+    /// [`Self::wake_hold`] holds, for its card; kept and dropped with it
+    /// ([`InboxHub::set_wake_hold_with_detail`]).
+    wake_hold_detail: HashMap<AgentKey, crate::inbox_display::HoldDetail>,
     /// Whether a bound recipient's agent still holds its pane, asked under
     /// this lock right before a message for it goes in
     /// ([`InboxHub::set_live_agent_check`]); unset, every post is taken as
@@ -876,6 +880,7 @@ impl InboxHub {
                 exiting: None,
                 wake_suspension: HashMap::new(),
                 wake_hold: HashMap::new(),
+                wake_hold_detail: HashMap::new(),
                 live_agent: None,
                 offers: HashMap::new(),
                 pooled: Arc::new(Notify::new()),
@@ -2143,6 +2148,7 @@ impl InboxHub {
         });
         let stall = st.wake_stalled.remove(&key);
         let hold = st.wake_hold.remove(&key).map(|(_, id)| id);
+        st.wake_hold_detail.remove(&key);
         st.typed_refused.remove(&key);
         let suspended = st.wake_suspension.remove(&key).is_some();
         if let Some(id) = stall.or(hold).or_else(|| suspended.then(String::new)) {
@@ -2289,10 +2295,25 @@ impl InboxHub {
         agent_id: &str,
         hold: Option<crate::inbox_display::WakeHold>,
     ) {
+        self.set_wake_hold_with_detail(pane_id, agent_id, hold, None);
+    }
+
+    /// [`Self::set_wake_hold`], with why a `cannot_check` hold holds
+    /// (`detail`, PRD #1666 part 3 Q35-27, OQ1): shown in the summary and the
+    /// wake update while that hold is the one the card shows, and dropped
+    /// with the hold. A detail with any other hold is not kept.
+    pub fn set_wake_hold_with_detail(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        hold: Option<crate::inbox_display::WakeHold>,
+        detail: Option<crate::inbox_display::HoldDetail>,
+    ) {
         let mut st = self.lock();
         let key = (pane_id.to_string(), agent_id.to_string());
+        let detail = detail.filter(|_| hold == Some(crate::inbox_display::WakeHold::CannotCheck));
         let before = st.wake_hold.get(&key).map(|(hold, _)| *hold);
-        if before == hold {
+        if before == hold && st.wake_hold_detail.get(&key) == detail.as_ref() {
             return;
         }
         let oldest = queued_for(&st.inbox, pane_id, agent_id)
@@ -2300,13 +2321,20 @@ impl InboxHub {
             .map(|m| m.id.to_string());
         let (id, now) = match (hold, oldest) {
             (Some(hold), Some(oldest)) => {
-                st.wake_hold.insert(key, (hold, oldest.clone()));
+                st.wake_hold.insert(key.clone(), (hold, oldest.clone()));
+                match detail {
+                    Some(detail) => st.wake_hold_detail.insert(key, detail),
+                    None => st.wake_hold_detail.remove(&key),
+                };
                 (oldest, Some(hold))
             }
-            _ => match st.wake_hold.remove(&key) {
-                Some((_, id)) => (id, None),
-                None => return,
-            },
+            _ => {
+                st.wake_hold_detail.remove(&key);
+                match st.wake_hold.remove(&key) {
+                    Some((_, id)) => (id, None),
+                    None => return,
+                }
+            }
         };
         info!(pane_id, agent_id, message_id = %id, ?before, ?now, "inbox: wake hold");
         broadcast_wake(&st, pane_id, agent_id, &id);
@@ -2852,6 +2880,16 @@ fn shown_hold(st: &HubState, key: &AgentKey) -> Option<crate::inbox_display::Wak
         .or_else(|| st.wake_hold.get(key).map(|(hold, _)| *hold))
 }
 
+/// Why the hold [`shown_hold`] shows holds, when it is the episode's
+/// `cannot_check` and one was told ([`InboxHub::set_wake_hold_with_detail`]);
+/// never with a suspension in front of it.
+fn shown_detail(st: &HubState, key: &AgentKey) -> Option<crate::inbox_display::HoldDetail> {
+    if st.wake_suspension.contains_key(key) {
+        return None;
+    }
+    st.wake_hold_detail.get(key).cloned()
+}
+
 /// PRD #1666 part 3, round 5-wake (Q16): the one choice of a generation's
 /// wake path, for both its summary and the overdue notice. In order: an armed
 /// waiter is native; a turn-end announcement is turn-end; a generation the
@@ -2885,7 +2923,7 @@ fn summary_of(st: &HubState, pane_id: &str, agent_id: &str) -> InboxSummary {
         component: None,
         wake_stalled: st.wake_stalled.contains_key(&key),
         wake_hold: shown_hold(st, &key),
-        hold_detail: None,
+        hold_detail: shown_detail(st, &key),
         notices: engine::notices(st, &key, now),
     };
     let mut last_acked: Option<Instant> = None;
@@ -5130,6 +5168,7 @@ fn broadcast_wake(st: &HubState, pane_id: &str, agent_id: &str, id: &str) {
     let key = (pane_id.to_string(), agent_id.to_string());
     let stalled = st.wake_stalled.contains_key(&key);
     let hold = shown_hold(st, &key);
+    let hold_detail = shown_detail(st, &key);
     let message = st.inbox.get(id, pane_id);
     let _ = tx.send(BroadcastMsg::Inbox(InboxNotice {
         pane_id: pane_id.to_string(),
@@ -5145,7 +5184,7 @@ fn broadcast_wake(st: &HubState, pane_id: &str, agent_id: &str, id: &str) {
         returned: false,
         wake_stalled: stalled,
         wake_hold: hold,
-        hold_detail: None,
+        hold_detail,
         wake_update: true,
         attention_update: false,
         requeued: false,
@@ -7293,6 +7332,80 @@ mod tests {
             "the message the hold was last told against, not the one still waiting"
         );
         assert_eq!(hub.wake_hold("p", "a"), None);
+    }
+
+    /// Scenario: The doorbell holds an agent's waiting message because the deck can't check its input box, and says why: the directory the deck refused. The wake update and the summary carry that detail with the hold; the same told again sends nothing; a suspension shown in front of the hold hides it until the suspension ends; another hold drops it, and a detail told with another hold isn't kept; and the agent exiting clears it with the hold.
+    #[spec("inbox/status/036")]
+    #[test]
+    fn status_036_a_cannot_check_hold_carries_its_detail_and_drops_it_with_the_hold() {
+        use crate::inbox_display::{HoldCause, HoldDetail, WakeHold};
+        let hub = hub();
+        let (tx, mut rx) = broadcast::channel(16);
+        hub.set_broadcast(tx);
+        let detail = HoldDetail::new(
+            HoldCause::WritableDirectory,
+            Some("/home/me/.codex/editor"),
+            None,
+        );
+        hub.post_direct(Recipient::bound("p", "a"), content("first"))
+            .unwrap();
+        while rx.try_recv().is_ok() {}
+        let next = |rx: &mut broadcast::Receiver<BroadcastMsg>| match rx.try_recv() {
+            Ok(BroadcastMsg::Inbox(notice)) => notice,
+            other => panic!("a wake update is broadcast: {other:?}"),
+        };
+        hub.set_wake_hold_with_detail("p", "a", Some(WakeHold::CannotCheck), Some(detail.clone()));
+        let notice = next(&mut rx);
+        assert!(notice.wake_update, "{notice:?}");
+        assert_eq!(notice.wake_hold, Some(WakeHold::CannotCheck));
+        assert_eq!(notice.hold_detail.as_ref(), Some(&detail));
+        assert_eq!(hub.summary("p", "a").hold_detail.as_ref(), Some(&detail));
+        hub.set_wake_hold_with_detail("p", "a", Some(WakeHold::CannotCheck), Some(detail.clone()));
+        assert!(
+            rx.try_recv().is_err(),
+            "an unchanged hold is not told again"
+        );
+
+        assert!(hub.set_wake_suspension("p", "a", Some(WakeHold::UncertainInput)));
+        let summary = hub.summary("p", "a");
+        assert_eq!(summary.wake_hold, Some(WakeHold::UncertainInput));
+        assert_eq!(
+            summary.hold_detail, None,
+            "the suspension shows, without it"
+        );
+        assert!(hub.set_wake_suspension("p", "a", None));
+        assert_eq!(hub.summary("p", "a").hold_detail.as_ref(), Some(&detail));
+        while rx.try_recv().is_ok() {}
+
+        hub.set_wake_hold("p", "a", Some(WakeHold::PossibleDraft));
+        let notice = next(&mut rx);
+        assert_eq!(notice.wake_hold, Some(WakeHold::PossibleDraft));
+        assert_eq!(notice.hold_detail, None, "another hold drops it");
+        assert_eq!(hub.summary("p", "a").hold_detail, None);
+        hub.set_wake_hold_with_detail(
+            "p",
+            "a",
+            Some(WakeHold::PossibleDraft),
+            Some(detail.clone()),
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a detail with another hold isn't kept"
+        );
+        assert_eq!(hub.summary("p", "a").hold_detail, None);
+
+        hub.set_wake_hold_with_detail("p", "a", Some(WakeHold::CannotCheck), Some(detail.clone()));
+        assert_eq!(next(&mut rx).hold_detail.as_ref(), Some(&detail));
+        hub.agent_exited("p", "a");
+        let exited = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|msg| match msg {
+                BroadcastMsg::Inbox(notice) if notice.wake_update => Some(notice),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(exited.len(), 1, "{exited:?}");
+        assert_eq!((exited[0].wake_hold, &exited[0].hold_detail), (None, &None));
+        assert_eq!(hub.summary("p", "a").hold_detail, None);
     }
 
     /// Scenario: A delegated task is overdue while the doorbell holds for its worker because of a possible draft. The orchestrator's notice says so; the reason changing afterwards sends nothing more; a task overdue while nothing holds says nothing about a hold; a notice composed while the orchestrator's inbox is full keeps the reason it was composed with when it is posted later, though the reason changed meanwhile; and the orchestrator's own waiting notices, held themselves, never get a notice of their own.

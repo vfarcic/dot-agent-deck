@@ -473,7 +473,8 @@ impl AgentPtyRegistry {
     /// `agent_id`'s generation in `pane_id` when its box is touched and its
     /// observer, with `permission` (`None`: no observer), can't check it
     /// ([`PaneInputHold::unchecked`]): `cannot_check` while the permission
-    /// waits for the release's header or the agent's binding; otherwise the
+    /// waits for the release's header or the agent's binding, or when the
+    /// deck refused the agent's export directory (Q35-27); otherwise the
     /// route that still delivers the message, which no notice of the deck's
     /// can now: a Claude generation's own fetch (`needs_fetch`: no native
     /// waiter is armed for it, or the doorbell would not be asked), and every
@@ -484,8 +485,14 @@ impl AgentPtyRegistry {
         agent_id: &str,
         permission: Option<crate::composer_probe::Permission>,
     ) -> crate::inbox_display::WakeHold {
+        use crate::composer_probe::{InertCause, Permission};
         use crate::inbox_display::WakeHold;
-        if permission == Some(crate::composer_probe::Permission::Pending) {
+        // Q35-27: a refused export directory holds the box with its own
+        // reason (`doorbell_hold_detail`), whatever the agent.
+        if matches!(
+            permission,
+            Some(Permission::Pending | Permission::Inert(InertCause::ExportDirectory))
+        ) {
             return WakeHold::CannotCheck;
         }
         let agent = self

@@ -6,8 +6,9 @@
 //! to the one before it without following a link, and checks what it opened
 //! rather than the name. [`FsView`] is the seam: the walk is written against
 //! it, a scripted view drives the tests, and the Linux view is
-//! `platform::fsperm::fs_view`. Nothing in the daemon calls it yet (Q35-13
-//! and Q35-14a will).
+//! `platform::fsperm::fs_view`. The daemon reads every export through it
+//! (`super::attest`), and, before a direct Codex starts, prepares Codex's
+//! export directory with it ([`prepare_codex_editor`], option P).
 //!
 //! **What it defends against** (R6 §6.5): another uid, members of the user's
 //! groups included, creating, renaming or rewriting the export or an entry on
@@ -146,6 +147,8 @@ pub trait FsView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     Open,
+    /// `mkdirat`, option P's one write ([`prepare_codex_editor`]).
+    MakeDir,
     Stat,
     FsType,
     Xattr,
@@ -190,6 +193,9 @@ pub enum Cause {
     Links { nlink: u64 },
     /// The export can be written by others who can reach it.
     FileWritable { mode: u32 },
+    /// The `editor` directory option P just created isn't the user's with
+    /// mode 0700 ([`prepare_codex_editor`]).
+    NotPrivate { mode: u32, uid: u32 },
     /// A syscall failed.
     Io { op: Op, errno: Option<i32> },
 }
@@ -220,6 +226,87 @@ impl Refusal {
             },
             _ => Remedy::Relocate,
         }
+    }
+}
+
+impl Remedy {
+    /// The `chmod` mode argument that removes [`Remedy::RemoveWrite`]'s
+    /// bits (`g-w`, `o-w` or `go-w`), for the log; `None` for
+    /// [`Remedy::Relocate`]. The card never joins it to a path (Q35-27).
+    pub fn chmod(self) -> Option<&'static str> {
+        match self {
+            Remedy::RemoveWrite { bits } => match (bits & 0o020 != 0, bits & OTHER_WRITE != 0) {
+                (true, true) => Some("go-w"),
+                (true, false) => Some("g-w"),
+                (false, true) => Some("o-w"),
+                (false, false) => None,
+            },
+            Remedy::Relocate => None,
+        }
+    }
+}
+
+/// Some filesystems the allow-list refuses, by `f_type`, so a card can name
+/// them; any other is named by its number.
+const NAMED_FILESYSTEMS: &[(u32, &str)] = &[
+    (0x6969, "NFS"),
+    (0xFF53_4D42, "CIFS"),
+    (0xFE53_4D42, "SMB"),
+    (0x6573_5546, "FUSE"),
+    (0x794C_7630, "overlayfs"),
+    (0x2FC1_2FC1, "ZFS"),
+    (0x0102_1997, "9p"),
+];
+
+impl Refusal {
+    /// What a card says about this refusal ([`crate::inbox_display::HoldDetail`]):
+    /// the cause the user can act on, the component it stopped at, and, for
+    /// a filesystem, its name. `uid` is the user's: only their own writable
+    /// directory gets [`crate::inbox_display::HoldCause::WritableDirectory`]
+    /// and its `chmod` remedy, as [`Refusal::remedy`] decides.
+    pub fn hold_detail(&self, uid: u32) -> crate::inbox_display::HoldDetail {
+        use crate::inbox_display::{HoldCause, HoldDetail};
+        let cause = match self.cause {
+            Cause::Filesystem { .. } => HoldCause::Filesystem,
+            Cause::Writable { .. } if matches!(self.remedy(uid), Remedy::RemoveWrite { .. }) => {
+                HoldCause::WritableDirectory
+            }
+            Cause::Writable { .. }
+            | Cause::ForeignOwner { .. }
+            | Cause::NotYoursInSticky { .. }
+            | Cause::FileNotYours { .. } => HoldCause::ForeignOwner,
+            Cause::AclWrite
+            | Cause::AclUnsupported
+            | Cause::AclMalformed
+            | Cause::ForeignAcl { .. } => HoldCause::Acl,
+            Cause::Io { .. } => HoldCause::Io,
+            Cause::NotAbsolute
+            | Cause::NoFileName
+            | Cause::Symlink
+            | Cause::TooManySymlinks
+            | Cause::NotADirectory
+            | Cause::NotARegularFile
+            | Cause::Links { .. }
+            | Cause::FileWritable { .. }
+            | Cause::NotPrivate { .. } => HoldCause::ExportFile,
+        };
+        let filesystem = match self.cause {
+            Cause::Filesystem { f_type } => Some(
+                NAMED_FILESYSTEMS
+                    .iter()
+                    .find(|&&(known, _)| known == f_type)
+                    .map_or_else(
+                        || format!("a filesystem of type {f_type:#x}"),
+                        |&(_, name)| name.to_string(),
+                    ),
+            ),
+            _ => None,
+        };
+        HoldDetail::new(
+            cause,
+            Some(&self.at.to_string_lossy()),
+            filesystem.as_deref(),
+        )
     }
 }
 
@@ -383,13 +470,30 @@ pub fn verify_export<V: FsView>(
     let Some(file_name) = path.file_name() else {
         return refuse(path, Cause::NoFileName);
     };
+    let dir = walk(view, path.parent().unwrap_or(Path::new("/")), uid)?;
+    let at = dir.path.join(file_name);
+    let entry = view
+        .open_file(&dir.handle, file_name)
+        .map_err(|error| io_refusal(&at, Op::Open, &error))?;
+    let file = match entry {
+        Entry::Opened(file) => file,
+        Entry::Symlink { .. } => return refuse(&at, Cause::Symlink),
+        Entry::Other => return refuse(&at, Cause::NotARegularFile),
+    };
+    let stat = check_file(view, &file, &at, &dir, uid)?;
+    Ok(Verified { file, stat })
+}
+
+/// Walk the absolute directory `dir` from `/`, every component checked as
+/// [`verify_export`] checks the export's, and return the last one opened.
+fn walk<V: FsView>(view: &mut V, dir: &Path, uid: u32) -> Result<Level<V::Handle>, Refusal> {
     let root = Path::new("/");
     let handle = view
         .open_root()
         .map_err(|error| io_refusal(root, Op::Open, &error))?;
     let first = check_dir(view, handle, root.to_owned(), None, uid)?;
     let mut stack = vec![first];
-    let mut pending: VecDeque<Step> = path.parent().map(steps).into_iter().flatten().collect();
+    let mut pending: VecDeque<Step> = steps(dir).collect();
     let mut hops = 0;
     while let Some(step) = pending.pop_front() {
         let name = match step {
@@ -437,18 +541,103 @@ pub fn verify_export<V: FsView>(
             Entry::Other => return refuse(&at, Cause::NotADirectory),
         }
     }
-    let dir = stack.last().expect("the stack always holds `/`");
-    let at = dir.path.join(file_name);
-    let entry = view
-        .open_file(&dir.handle, file_name)
-        .map_err(|error| io_refusal(&at, Op::Open, &error))?;
-    let file = match entry {
-        Entry::Opened(file) => file,
-        Entry::Symlink { .. } => return refuse(&at, Cause::Symlink),
-        Entry::Other => return refuse(&at, Cause::NotARegularFile),
+    Ok(stack.pop().expect("the stack always holds `/`"))
+}
+
+/// The name of Codex's export directory in its home.
+pub const CODEX_EDITOR_DIR: &str = "editor";
+
+/// The mode option P creates [`CODEX_EDITOR_DIR`] with.
+pub const CODEX_EDITOR_MODE: u32 = 0o700;
+
+/// [`FsView`] with the one write option P makes: `mkdirat`.
+pub trait MakeDir: FsView {
+    /// Create directory `name` in `dir` with `mode` (`mkdirat`), never
+    /// following or replacing what is there: `EEXIST` when anything is.
+    fn make_dir(&mut self, dir: &Self::Handle, name: &OsStr, mode: u32) -> io::Result<()>;
+}
+
+/// What [`prepare_codex_editor`] found or did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Prepared {
+    /// `editor` didn't exist: the deck created it, the user's and 0700.
+    Created,
+    /// `editor` existed and passes the rule; it wasn't touched.
+    Existing,
+    /// Codex's home itself doesn't exist yet. The deck creates nothing in
+    /// it (Codex makes its home on its first start), so the export is left
+    /// to the rule when it is read.
+    HomeAbsent,
+}
+
+/// Option P with option C (R6 §6.6, core §6.2; U-CX12): before a Codex
+/// generation starts, make sure the directory Codex exports its input box
+/// into, `<home>/editor`, is one the rule accepts.
+///
+/// 1. `home`, Codex's home, is walked by the full rule; a component that
+///    doesn't exist is [`Prepared::HomeAbsent`], and nothing is created.
+/// 2. `mkdirat(home, "editor", 0700)` through the walked descriptor.
+/// 3. On `EEXIST` the directory is never touched: it is walked by the full
+///    rule, so one a umask of 002 made 0775 refuses, at `editor`, with
+///    [`Remedy::RemoveWrite`] (option C).
+/// 4. Once created, it is opened without following a link and must be a
+///    directory, pass the rule, be the user's and have mode exactly 0700
+///    ([`Cause::NotPrivate`] otherwise).
+///
+/// M56b measured that Codex 0.160.0 and 0.164.0 export into a pre-created
+/// 0700 `editor` and leave its mode alone.
+pub fn prepare_codex_editor<V: MakeDir>(
+    view: &mut V,
+    home: &Path,
+    uid: u32,
+) -> Result<Prepared, Refusal> {
+    if !home.is_absolute() {
+        return refuse(home, Cause::NotAbsolute);
+    }
+    let parent = match walk(view, home, uid) {
+        Ok(parent) => parent,
+        Err(Refusal {
+            cause:
+                Cause::Io {
+                    op: Op::Open,
+                    errno: Some(libc::ENOENT),
+                },
+            ..
+        }) => return Ok(Prepared::HomeAbsent),
+        Err(refusal) => return Err(refusal),
     };
-    let stat = check_file(view, &file, &at, dir, uid)?;
-    Ok(Verified { file, stat })
+    let name = OsStr::new(CODEX_EDITOR_DIR);
+    let at = parent.path.join(name);
+    match view.make_dir(&parent.handle, name, CODEX_EDITOR_MODE) {
+        Ok(()) => {}
+        Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {
+            walk(view, &home.join(name), uid)?;
+            return Ok(Prepared::Existing);
+        }
+        Err(error) => return Err(io_refusal(&at, Op::MakeDir, &error)),
+    }
+    let handle = match view
+        .open_dir(&parent.handle, name)
+        .map_err(|error| io_refusal(&at, Op::Open, &error))?
+    {
+        Entry::Opened(handle) => handle,
+        Entry::Symlink { .. } => return refuse(&at, Cause::Symlink),
+        Entry::Other => return refuse(&at, Cause::NotADirectory),
+    };
+    let level = check_dir(view, handle, at, Some(parent.trust), uid)?;
+    let stat = view
+        .stat(&level.handle)
+        .map_err(|error| io_refusal(&level.path, Op::Stat, &error))?;
+    if stat.uid != uid || stat.mode != CODEX_EDITOR_MODE {
+        return refuse(
+            &level.path,
+            Cause::NotPrivate {
+                mode: stat.mode,
+                uid: stat.uid,
+            },
+        );
+    }
+    Ok(Prepared::Created)
 }
 
 /// The checks every opened node gets: its kind, its filesystem and its ACLs.

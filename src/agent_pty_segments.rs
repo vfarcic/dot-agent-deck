@@ -1476,6 +1476,26 @@ impl AgentPtyRegistry {
         input.is_some_and(|input| input.has_segments() && input.probe_retrying())
     }
 
+    /// PRD #1666 part 3 (Q35-27): why the deck refused generation
+    /// `agent_id`'s export directory before its spawn, as its card shows it
+    /// with `cannot_check`; `None` when it didn't, or with no observer.
+    pub(crate) fn doorbell_hold_detail(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+    ) -> Option<crate::inbox_display::HoldDetail> {
+        #[cfg(target_os = "linux")]
+        {
+            self.probe_handles(pane_id, agent_id)
+                .and_then(|h| h.observer.export_hold().cloned())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (pane_id, agent_id);
+            None
+        }
+    }
+
     /// PRD #1666 part 3 (Q35-20): the doorbell tick's check of an
     /// `Armable` generation ([`tick_probe`]). Starts the probe it asks, off
     /// the tick, one request at a time; `true` while one is started or on

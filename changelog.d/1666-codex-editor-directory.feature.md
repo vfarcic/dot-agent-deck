@@ -1,0 +1,7 @@
+## Codex's `editor` directory is created private, and a card names one others can write to
+
+When the deck checks a Codex agent's input box, it reads what Codex writes into `editor` in Codex's home directory (`~/.codex` unless you set `CODEX_HOME`), and only when no other user could change that directory. If `editor` doesn't exist yet when the deck starts a Codex agent directly in its pane, the deck now creates it, readable and writable only by you, so a `umask 0002` (the default on Debian and Ubuntu) no longer leaves it writable by your group. The deck never changes an `editor` directory that already exists, and never creates Codex's home directory itself.
+
+If `editor` already exists and your group or others can write to it, the deck doesn't check that agent's box, and once you have typed into the box and messages wait, the TUI card and the desktop tile say `waiting: the deck can't check this agent's input box: others can write to “/home/you/.codex/editor”, a directory you own. Remove the write permission others have on that directory, with chmod g-w (and chmod o-w if others can write too) on it.` The deck log's `codex editor directory held` line names the exact command, for example `chmod g-w '/home/you/.codex/editor'`. Run it, then restart the agent from the deck.
+
+See [Troubleshooting → A Codex agent's card names its `editor` directory](https://agent-deck.devopstoolkit.ai/docs/troubleshooting.md#a-codex-agents-card-names-its-editor-directory).

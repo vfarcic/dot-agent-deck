@@ -111,6 +111,9 @@ pub enum InertCause {
     NoEditorRecord,
     /// `A` was never bound.
     Unbound,
+    /// Codex's export directory was refused before the spawn (Q35-27,
+    /// `install::prepare_codex_export`), so every read of it would be.
+    ExportDirectory,
 }
 
 /// The permission half of plan §1.2, asked when the generation's header

@@ -684,6 +684,12 @@ If a Claude Code agent on Linux, started directly in its pane at a version the d
 
 Remove the group's write access, for example `chmod go-w ~/.local ~/.local/state`, then restart the deck's daemon once its agents have finished (`dot-agent-deck daemon restart`, which stops them) and start the agents again: a daemon decides where to keep the helper at the first agent it starts and doesn't look again until it restarts.
 
+### A Codex agent's card names its `editor` directory
+
+When the deck checks a Codex agent's input box, it reads what Codex writes into `editor` in Codex's home directory (`~/.codex` unless you set `CODEX_HOME`), and only when no other user could change that directory: every directory on its path must belong to you or to root and must not be writable by its group or by others (a shared directory with the sticky bit set is fine), on a local ext4, XFS, Btrfs or tmpfs filesystem. If `editor` doesn't exist yet when the deck starts a Codex agent directly in its pane (its command starts with `codex`), the deck creates it, readable and writable only by you, and Codex uses it as it is. The deck never creates Codex's home directory itself, and never changes an `editor` directory that already exists.
+
+With a `umask 0002`, the default on Debian and Ubuntu, a Codex that created `editor` itself left it writable by your group. The deck then doesn't check that agent's box. Once you have typed into the agent's input box and messages wait for it, the TUI card and the desktop tile say `waiting: the deck can't check this agent's input box: others can write to “/home/you/.codex/editor”, a directory you own. Remove the write permission others have on that directory, with chmod g-w (and chmod o-w if others can write too) on it.`, and the [deck log](#enabling-debug-logs) has a `codex editor directory held` line naming the directory and the exact command, for example `chmod g-w '/home/you/.codex/editor'`. Run that command, then restart the agent from the deck: the deck looks at the directory when it starts the agent. Until then, a prompt you send the agent hands it its waiting messages. If the card names another directory, such as `~/.codex` itself or a directory above it, remove the group's and others' write access there instead, or point `CODEX_HOME` at a directory only you can write.
+
 ### The deck restarted and its agents disappeared
 
 *Applies to the TUI and the desktop app.*

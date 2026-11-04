@@ -2001,3 +2001,92 @@ async fn probe_014_a_binding_changed_between_the_spawn_and_the_permission_holds(
         deck.stop().await;
     }
 }
+
+/// Scenario: Start a direct Codex generation whose export directory the deck refused before its spawn (a `~/.codex/editor` its group can write to, Q35-27). Its observer is inert for that reason from its start, so no check is ever armed; the doorbell's hold for its touched box is `cannot_check`, where another inert generation's is `cannot_type`; and the registry hands the doorbell the refused directory and its cause for the card. A generation with no such refusal has none.
+#[spec("inbox/probe/091")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_091_a_refused_codex_export_directory_holds_its_generation_with_the_detail() {
+    use crate::composer_probe::InertCause;
+    use crate::inbox_display::{HoldCause, HoldDetail, WakeHold};
+    let registry = Arc::new(AgentPtyRegistry::new());
+    let id = registry
+        .spawn_agent(SpawnOptions {
+            command: Some("/bin/sh"),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+            ..SpawnOptions::default()
+        })
+        .expect("spawn shell agent");
+    let dir = tempfile::Builder::new()
+        .prefix("composer-export-hold")
+        .rand_bytes(8)
+        .tempdir_in(std::env::temp_dir())
+        .unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        open_root(dir.path()).is_ok(),
+        "{} passes through a directory another user could change: point TMPDIR at one \
+         that doesn't",
+        dir.path().display()
+    );
+    let me = std::process::id();
+    let instance = Instance::create(
+        &dir.path().join("state").join("editor"),
+        DaemonId {
+            pid: me,
+            start: start_of(me),
+            boot: "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0".to_string(),
+            nonce: "00112233445566778899aabbccddeeff".to_string(),
+        },
+        &mut std::fs::File::open("/bin/sh").unwrap(),
+    )
+    .unwrap();
+    let detail = HoldDetail::new(
+        HoldCause::WritableDirectory,
+        Some("/home/me/.codex/editor"),
+        None,
+    );
+    let mut installation = install(
+        &instance,
+        PaneClass::Direct(ProbeAgent::Codex),
+        &id,
+        &Originals::default(),
+    )
+    .unwrap();
+    assert_eq!(installation.export_hold(), None, "install prepares nothing");
+    installation.set_export_hold_for_test(detail.clone());
+    installation.set_launch(Vec::new());
+    let spawned = Spawned {
+        agent_id: id.clone(),
+        agent: Some(AgentType::Codex),
+        env: vec![],
+        child: None,
+        input: Arc::new(GenerationInput::default()),
+        latch: Box::new(|_| LatchedRelease::Unseen),
+        assumed: &[],
+    };
+    let observer = Observer::start(installation, spawned, &Arc::new(std::sync::OnceLock::new()))
+        .expect("observer");
+    registry.set_composer_observer_for_test(&id, Arc::clone(&observer));
+    assert_eq!(
+        observer.permission(),
+        Permission::Inert(InertCause::ExportDirectory),
+        "inert from its start"
+    );
+    assert_eq!(observer.export_hold(), Some(&detail));
+    assert_eq!(
+        registry.doorbell_unchecked_hold(PANE, &id, Some(observer.permission())),
+        WakeHold::CannotCheck
+    );
+    assert_ne!(
+        registry.doorbell_unchecked_hold(PANE, &id, Some(Permission::Inert(InertCause::Unbound))),
+        WakeHold::CannotCheck,
+        "the control: another inert generation isn't held for its box"
+    );
+    assert_eq!(registry.doorbell_hold_detail(PANE, &id), Some(detail));
+    assert_eq!(
+        registry.doorbell_hold_detail("another-pane", &id),
+        None,
+        "only in the generation's own pane"
+    );
+    observer.stop();
+}
