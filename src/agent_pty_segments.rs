@@ -114,7 +114,9 @@ use crate::composer_probe::framing::Framing;
 #[cfg(target_os = "linux")]
 use crate::composer_probe::gate::{Cutting, Measure};
 #[cfg(target_os = "linux")]
-use crate::composer_probe::segments::{Front, Stop};
+use crate::composer_probe::segments::{COOKED_LINE, Front, Stop, cooked_line_after, line_end};
+#[cfg(target_os = "linux")]
+use std::cell::Cell;
 
 /// Which of the deck's check writes a probe request asks for.
 #[cfg(any(target_os = "linux", feature = "e2e"))]
@@ -232,8 +234,16 @@ impl UserFrame {
     /// `carry`), and before its candidate when it holds one. With `stop`
     /// (Q147b, Q151b), also before its first key that stop names
     /// ([`Self::stop_key`]), which then stops the release as a candidate
-    /// does.
-    fn measure(&self, carry: &mut Option<Framing>, stop: Stop) -> Measure {
+    /// does. With `line` (Q152b, only for [`Stop::Cooked`]: the bytes of a
+    /// line with no end in Claude's cooked terminal, counting the frames
+    /// measured before this one), also before the byte that would make that
+    /// line [`COOKED_LINE`] long, which stops the release the same way.
+    fn measure(
+        &self,
+        carry: &mut Option<Framing>,
+        stop: Stop,
+        line: &Cell<Option<usize>>,
+    ) -> Measure {
         let mut framing = self
             .framing
             .clone()
@@ -242,19 +252,30 @@ impl UserFrame {
         let key = self.stop_key(stop);
         let limit = key.unwrap_or_else(|| self.cut_start());
         let mut ground = framing.at_ground().then_some(0);
+        let mut run = line.get();
+        let mut full = false;
         for (i, &byte) in self.bytes.iter().enumerate() {
             if i >= limit {
                 break;
+            }
+            if let Some(n) = run {
+                let next = if line_end(byte) { 0 } else { n + 1 };
+                if next >= COOKED_LINE {
+                    full = true;
+                    break;
+                }
+                run = Some(next);
             }
             framing.feed(byte, |_| {});
             if framing.at_ground() {
                 ground = Some(i + 1);
             }
         }
+        line.set(run);
         *carry = Some(framing);
         Measure {
             ground,
-            candidate: self.cut.is_some() || key.is_some(),
+            candidate: self.cut.is_some() || key.is_some() || full,
         }
     }
 
@@ -460,9 +481,24 @@ impl PaneWriter {
         let in_flight = &self.pty.in_flight;
         let input = &self.pty.input;
         let mut carry: Option<Framing> = None;
+        // Q152b: into a cooked terminal, the front's number and the line
+        // with no end its release has left there, read with the authority;
+        // a cooked front with none releases nothing.
+        let cooked: Cell<Option<(u64, usize)>> = Cell::new(None);
+        let line: Cell<Option<usize>> = Cell::new(None);
         let frames = self.gate.gate.release_until_if(
-            || input.segments_release() == Some((front, stop)),
-            |frame| frame.measure(&mut carry, stop),
+            || {
+                if input.segments_release() != Some((front, stop)) {
+                    return false;
+                }
+                if stop != Stop::Cooked {
+                    return true;
+                }
+                cooked.set(input.segments_cooked_line());
+                line.set(cooked.get().map(|(_, run)| run));
+                cooked.get().is_some()
+            },
+            |frame| frame.measure(&mut carry, stop, &line),
             |frame, n| {
                 // One more sub-op in flight: the rest stays held.
                 in_flight.count.fetch_add(1, Ordering::SeqCst);
@@ -471,14 +507,21 @@ impl PaneWriter {
             front == Front::None,
         );
         let mut submitted = 0;
+        let mut run = cooked.get();
         for frame in frames {
             if self.exited.load(Ordering::SeqCst) {
                 frame.refuse_accepted("exited");
                 in_flight.leave();
             } else {
+                if let Some((_, n)) = run.as_mut() {
+                    *n = cooked_line_after(*n, &frame.bytes);
+                }
                 self.pty.submit_released(frame, Arc::clone(&self.exited));
                 submitted += 1;
             }
+        }
+        if let Some((number, n)) = run {
+            input.segment_note_cooked_line(number, n);
         }
         submitted
     }

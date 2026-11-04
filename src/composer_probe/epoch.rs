@@ -2057,6 +2057,31 @@ impl GenerationInput {
         }
     }
 
+    /// Q152b: the front's number and the line with no end its release has
+    /// left in Claude's cooked terminal ([`Segments::cooked_line`]); `None`
+    /// unless its release stops at [`segments::Stop::Cooked`], with no
+    /// segments attached, or once retired.
+    pub fn segments_cooked_line(&self) -> Option<(u64, usize)> {
+        let state = self.state.lock_recovering();
+        match (state.retired, state.live.as_ref(), state.records.as_ref()) {
+            (false, Some(live), Some(records)) => live.segments.cooked_line(records),
+            _ => None,
+        }
+    }
+
+    /// Q152b: what the release driver wrote into segment `number`'s cooked
+    /// terminal left `run` bytes of a line with no end there
+    /// ([`Segments::note_cooked_line`]).
+    pub fn segment_note_cooked_line(&self, number: u64, run: usize) {
+        let mut state = self.state.lock_recovering();
+        if state.retired {
+            return;
+        }
+        if let Some(live) = state.live.as_mut() {
+            live.segments.note_cooked_line(number, run);
+        }
+    }
+
     /// Whether the front segment can never complete
     /// ([`Segments::stranded`]); `false` with no segments attached or once
     /// retired.

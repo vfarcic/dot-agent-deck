@@ -229,6 +229,37 @@ pub fn signal_key(byte: u8) -> bool {
     matches!(byte, 0x03 | 0x1a | 0x1c)
 }
 
+/// Q152b (fence29's ruling 4, revfence28's narrower option): how long a
+/// line with no end a release may leave in a Claude terminal out of raw
+/// mode. Linux's canonical-mode line buffer is 4096 bytes, and while it
+/// holds no line end it keeps room for one: bytes past the first 4095 are
+/// dropped or overwrite the last, and nobody reads the terminal during the
+/// check's editor round trip to make room. So a release into it
+/// ([`Stop::Cooked`]) stops before the bytes it has written there since
+/// the last [`line_end`] reach this many, and the rest waits with
+/// everything after it for Claude's return (E1), as a
+/// [`line_discipline_key`] does: a single-line paste longer than this,
+/// held through a check, reaches Claude whole.
+pub const COOKED_LINE: usize = 4095;
+
+/// Q152b: a byte that ends a line in a terminal out of raw mode, under the
+/// default control characters: a line feed, and NUL, which is `VEOL`'s
+/// default value and so ends a line too. Enter's carriage return becomes a
+/// line feed there (`ICRNL`), but it is a [`line_discipline_key`], which a
+/// release stops at anyway.
+pub fn line_end(byte: u8) -> bool {
+    matches!(byte, b'\n' | 0)
+}
+
+/// Q152b: the bytes of a line with no end left after writing `bytes` into
+/// a terminal out of raw mode whose line already had `run` of them.
+pub fn cooked_line_after(run: usize, bytes: &[u8]) -> usize {
+    match bytes.iter().rposition(|&b| line_end(b)) {
+        Some(at) => bytes.len() - at - 1,
+        None => run + bytes.len(),
+    }
+}
+
 /// Where the front segment's release stops short of the next held Ctrl+G
 /// candidate, and what happens to the byte it stops at
 /// ([`Segments::front_stop`]).
@@ -237,7 +268,9 @@ pub enum Stop {
     /// Only at the next held candidate.
     Candidate,
     /// Q147b: also at the first held [`line_discipline_key`], which waits
-    /// with everything after it until Claude's return (E1).
+    /// with everything after it until Claude's return (E1); and, Q152b,
+    /// before the line it leaves in the terminal reaches [`COOKED_LINE`]
+    /// bytes with no end.
     Cooked,
     /// Q151b: also at the first held [`signal_key`], which is refused with
     /// everything held after it.
@@ -624,6 +657,10 @@ struct Segment {
     /// A probe whose matched decision was handed to the epoch's settlement
     /// ([`Segments::take_decided_probes`]).
     decided: bool,
+    /// Q152b: the bytes of a line with no end its release has written into
+    /// Claude's terminal while out of raw mode ([`Stop::Cooked`],
+    /// [`COOKED_LINE`]), as the release driver reports them.
+    cooked_line: usize,
 }
 
 impl Segment {
@@ -646,6 +683,7 @@ impl Segment {
             released: false,
             cut_off: false,
             decided: false,
+            cooked_line: 0,
         }
     }
 
@@ -877,6 +915,30 @@ impl Segments {
     /// Whether `seg`'s E1 has been read, as `self.agent`'s return needs it.
     fn returned(&self, seg: &Segment) -> bool {
         seg.e1.as_ref().is_some_and(|w| w.returned(self.agent))
+    }
+
+    /// Q152b: while the front's release stops at [`Stop::Cooked`], its
+    /// number and the bytes of a line with no end its release has written
+    /// into the terminal so far ([`COOKED_LINE`]); `None` otherwise.
+    pub fn cooked_line(&self, records: &Records) -> Option<(u64, usize)> {
+        if self.front_stop(records) != Stop::Cooked {
+            return None;
+        }
+        let seg = self.segments.front()?;
+        Some((seg.number?, seg.cooked_line))
+    }
+
+    /// Q152b: the release driver wrote into segment `number`'s cooked
+    /// terminal, which now holds `run` bytes of a line with no end
+    /// ([`cooked_line_after`]). Nothing when that segment has ended.
+    pub fn note_cooked_line(&mut self, number: u64, run: usize) {
+        if let Some(seg) = self
+            .segments
+            .iter_mut()
+            .find(|seg| seg.number == Some(number))
+        {
+            seg.cooked_line = run;
+        }
     }
 
     /// The release driver refuses the first held [`signal_key`] behind a
