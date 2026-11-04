@@ -418,9 +418,9 @@ pub(crate) const EXPLAINED_CAP: u8 = 4;
 pub(crate) const CREDIT_AFTER_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The daemon's read of an `Armed` export, as the epoch's settlement reads
-/// it ([`Live::reads`]).
+/// it ([`Live::reads`], [`GenerationInput::export_read`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BoxRead {
+pub enum BoxRead {
     Empty,
     NonEmpty,
     /// The export couldn't be read: the check saw nothing of the box.
@@ -1736,6 +1736,15 @@ impl GenerationInput {
         self.note_box_read(key, BoxRead::Unreadable);
     }
 
+    /// The daemon's latest read of `Armed` record `key`'s export, as the
+    /// epoch's settlement will read it; `None` with none kept, or with no
+    /// segments attached (revfence29 finding 6: what the observer's mapping
+    /// of an [`crate::event::ExportRead`] leaves here).
+    pub fn export_read(&self, key: RecordKey) -> Option<BoxRead> {
+        let state = self.state.lock_recovering();
+        state.live.as_ref().and_then(|live| live.box_read_of(key))
+    }
+
     fn note_box_read(&self, key: RecordKey, read: BoxRead) {
         let mut state = self.state.lock_recovering();
         if let Some(live) = state.live.as_mut() {
@@ -2058,9 +2067,10 @@ impl GenerationInput {
     }
 
     /// Q152b: the front's number and the line with no end its release has
-    /// left in Claude's cooked terminal ([`Segments::cooked_line`]); `None`
-    /// unless its release stops at [`segments::Stop::Cooked`], with no
-    /// segments attached, or once retired.
+    /// left in Claude's terminal out of raw mode ([`Segments::cooked_line`]);
+    /// `None` unless its release stops at [`segments::Stop::Cooked`] or
+    /// [`segments::Stop::Signal`], with no segments attached, or once
+    /// retired.
     pub fn segments_cooked_line(&self) -> Option<(u64, usize)> {
         let state = self.state.lock_recovering();
         match (state.retired, state.live.as_ref(), state.records.as_ref()) {

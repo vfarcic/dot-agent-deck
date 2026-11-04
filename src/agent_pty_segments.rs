@@ -31,7 +31,11 @@
 //! Ctrl+G held behind it, the driver refuses the op holding that Ctrl+G and
 //! everything held after it ([`PaneWriter::refuse_stranded`]), the ops
 //! before it staying as the release leaves them (a key waiting for Claude's
-//! return among them, Q151b): each op's
+//! return among them, Q151b, when it sits in an earlier op: refusals take
+//! whole ops, so one that holds such a key before its Ctrl+G, as
+//! `\x03ab\x07cd` typed in one write does, is refused with what precedes
+//! the Ctrl+G in it, an accepted fail-closed loss, revfence29 finding 1):
+//! each op's
 //! connection is told [`CTRL_G_REFUSED`], its ticket settles refused, and
 //! no byte of it is written. The fence stays closed, so each later Ctrl+G
 //! is cut and refused the same way while that front stays released, and
@@ -234,7 +238,7 @@ impl UserFrame {
     /// `carry`), and before its candidate when it holds one. With `stop`
     /// (Q147b, Q151b), also before its first key that stop names
     /// ([`Self::stop_key`]), which then stops the release as a candidate
-    /// does. With `line` (Q152b, only for [`Stop::Cooked`]: the bytes of a
+    /// does. With `line` (Q152b, for [`Stop::Cooked`] and [`Stop::Signal`]: the bytes of a
     /// line with no end in Claude's cooked terminal, counting the frames
     /// measured before this one), also before the byte that would make that
     /// line [`COOKED_LINE`] long, which stops the release the same way.
@@ -417,7 +421,9 @@ impl PaneWriter {
                 // is refused with what follows it. A Ctrl+G behind a front
                 // that can never complete is refused in the same pass
                 // either way: what is refused starts at the op holding it,
-                // so a key held before it stays held.
+                // so a key held in an earlier op stays held, and one held
+                // before the Ctrl+G in the same op is refused with it
+                // (revfence29 finding 1, accepted: refusals take whole ops).
                 let stop = release.map_or(Stop::Candidate, |(_, stop)| stop);
                 if self.gate.gate.segment_fenced() {
                     self.release_held(Front::Released, stop);
@@ -481,9 +487,10 @@ impl PaneWriter {
         let in_flight = &self.pty.in_flight;
         let input = &self.pty.input;
         let mut carry: Option<Framing> = None;
-        // Q152b: into a cooked terminal, the front's number and the line
-        // with no end its release has left there, read with the authority;
-        // a cooked front with none releases nothing.
+        // Q152b: into Claude's terminal out of raw mode (`Cooked`,
+        // `Signal`), the front's number and the line with no end its release
+        // has left there, read with the authority; such a front with none
+        // releases nothing.
         let cooked: Cell<Option<(u64, usize)>> = Cell::new(None);
         let line: Cell<Option<usize>> = Cell::new(None);
         let frames = self.gate.gate.release_until_if(
@@ -491,7 +498,7 @@ impl PaneWriter {
                 if input.segments_release() != Some((front, stop)) {
                     return false;
                 }
-                if stop != Stop::Cooked {
+                if stop == Stop::Candidate {
                     return true;
                 }
                 cooked.set(input.segments_cooked_line());
@@ -561,9 +568,19 @@ impl PaneWriter {
     /// ([`Stop::Signal`]), refuse the held op holding the first Ctrl+C,
     /// Ctrl+\ or Ctrl+Z and every op held after it, when that key is the
     /// first thing the release stopped at (a Ctrl+G before it is
-    /// [`Self::refuse_stranded`]'s, or waits). The release before this has
-    /// already let go what comes before the key in its op, as far as its
-    /// last ground point. The gate asks the segments under its own lock,
+    /// [`Self::refuse_stranded`]'s, or waits). Refusals take whole ops, so
+    /// what comes before the key in its op is refused with it unless an
+    /// earlier pass's release already let it go: an op accepted between
+    /// this pass's release and this refusal, `ab\x03` say, is refused whole
+    /// (revfence29 finding 4, accepted, fail-closed). A signal key is
+    /// matched wherever it sits in the input's framing, so one inside a
+    /// bracketed paste that began in an earlier op refuses this op, and the
+    /// paste's opening op, still held, later goes on as a paste with no end
+    /// (Claude's box stays in paste mode until the next paste ends);
+    /// holding the op instead would leave every key behind it, the editor's
+    /// own among them, held until the helper's exit, which a terminal
+    /// editor then never reaches, so that rare case (pasted text holding a
+    /// raw Ctrl+C, Ctrl+\ or Ctrl+Z) is accepted. The gate asks the segments under its own lock,
     /// as a release does, and the segments waiting behind the front end
     /// `Refused` in the same hold of the input's lock. Each refused op's
     /// connection is told [`SIGNAL_KEY_REFUSED`] and its ticket settles

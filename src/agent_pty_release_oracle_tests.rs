@@ -172,17 +172,18 @@ fn signal_key(byte: u8) -> bool {
     matches!(byte, 0x03 | 0x1a | 0x1c)
 }
 
-/// Q152b, from Linux's canonical-mode line buffer (4096 bytes, room kept
+/// Q152b, from Linux's canonical-mode read buffer (4096 bytes, room kept
 /// for a line's end), not from the implementation: a release into a
 /// terminal out of raw mode leaves fewer than this many bytes of a line
-/// with no end there, a line feed or a NUL (`VEOL`'s default) ending one.
+/// with no end there, a line feed, or Enter's carriage return under
+/// `ICRNL`, ending one (a NUL is not counted).
 const COOKED_LINE: usize = 4095;
 
 /// The line with no end left after `bytes` follow `run` bytes of one.
 fn cooked_line_after(run: usize, bytes: impl IntoIterator<Item = u8>) -> usize {
     bytes
         .into_iter()
-        .fold(run, |n, b| if b == b'\n' || b == 0 { 0 } else { n + 1 })
+        .fold(run, |n, b| if b == b'\n' || b == b'\r' { 0 } else { n + 1 })
 }
 
 /// What the PTY and the arm page saw, in order.
@@ -1468,9 +1469,11 @@ impl Model {
                 } else {
                     None
                 };
-                // Q152b: and before the line with no end it leaves in the
-                // cooked terminal reaches `COOKED_LINE` bytes.
-                let full = cooked
+                // Q152b: and, cooked or behind an `Unarmed` probe, before the
+                // line with no end it leaves in the terminal reaches
+                // `COOKED_LINE` bytes.
+                let out_of_raw = cooked || signal;
+                let full = out_of_raw
                     .then(|| {
                         let mut run = seg.cooked_line;
                         self.held.iter().position(|&b| {
@@ -1491,7 +1494,7 @@ impl Model {
                 if stopped_at_key && cooked {
                     self.stats.cooked_held += 1;
                 }
-                if cooked {
+                if out_of_raw {
                     let line =
                         cooked_line_after(seg.cooked_line, self.held.iter().take(upto).copied());
                     self.segs.front_mut().expect("the front").cooked_line = line;
@@ -2459,7 +2462,7 @@ async fn probe_010_a_line_discipline_key_goes_at_claudes_return_before_the_exit(
     }
 }
 
-/// Scenario: On Claude, the deck's check writes its Ctrl+G and a person pastes 5000 bytes with no line break, held behind it; the helper decides `Armed`, so the paste is released into a Claude whose terminal is out of raw mode, where a line with no end keeps only its first 4095 bytes. The release stops before that, and the rest of the paste goes once Claude's paste-mode enable is read; a line built from one paste before the decision and one after stops at the same length, while a line feed or a NUL in the paste ends the line, so all of it goes at the decision. Everything typed reaches the pane once, in order (Q152b, fence29's ruling 4).
+/// Scenario: On Claude, the deck's check writes its Ctrl+G and a person pastes 5000 bytes with no line break, held behind it; the helper decides `Armed`, so the paste is released into a Claude whose terminal is out of raw mode, where a line with no end keeps only its first 4095 bytes. The release stops before that, and the rest of the paste goes once Claude's paste-mode enable is read; a line built from one paste before the decision and one after stops at the same length, a NUL in it doesn't end it, and a line feed does, so all of that paste goes at the decision. Everything typed reaches the pane once, in order (Q152b, fence29's ruling 4, revfence29's finding 3).
 #[spec("inbox/probe/010")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn probe_010_a_long_line_into_claudes_cooked_terminal_waits_for_its_return() {
@@ -2476,14 +2479,14 @@ async fn probe_010_a_long_line_into_claudes_cooked_terminal_waits_for_its_return
             COOKED_LINE - 1,
         ),
         (
-            "a line feed in the paste",
-            [&half[..], b"\n", &half[..]].concat(),
-            Vec::new(),
-            6001,
-        ),
-        (
             "a NUL in the paste",
             [&half[..], b"\0", &half[..]].concat(),
+            Vec::new(),
+            COOKED_LINE - 1,
+        ),
+        (
+            "a line feed in the paste",
+            [&half[..], b"\n", &half[..]].concat(),
             Vec::new(),
             6001,
         ),
@@ -2506,6 +2509,42 @@ async fn probe_010_a_long_line_into_claudes_cooked_terminal_waits_for_its_return
         assert_eq!(
             model.expected,
             [&[CTRL_G][..], &before, &after].concat(),
+            "{what}: everything typed, once, in order"
+        );
+    }
+}
+
+/// Scenario: On Claude, the deck's check writes its Ctrl+G and a person pastes 5000 bytes with no line break, held behind it; the helper decides `Unarmed` and runs the person's editor, while Claude's terminal is out of raw mode. The release stops before the line it leaves there reaches 4095 bytes, and the rest goes once the helper has reported the editor's end and exited; an Enter in the paste ends the line there, so all of that paste goes at the decision. Everything typed reaches the pane once, in order (Q152b, revfence29's findings 2 and 3).
+#[spec("inbox/probe/010")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_010_a_long_line_behind_a_checks_unarmed_editor_waits_for_its_exit() {
+    let half = vec![b'h'; 3000];
+    let cases = [
+        ("one long paste", vec![b'p'; 5000], COOKED_LINE - 1),
+        (
+            "an Enter in the paste",
+            [&half[..], b"\r", &half[..]].concat(),
+            6001,
+        ),
+    ];
+    for (what, typed, at_decision) in cases {
+        let decided = vec![
+            Step::Type(typed.clone()),
+            helper(11, 1, Decision::Unarmed),
+            Step::Editor(11),
+        ];
+        let model = run(Agent::Claude, b"", false, &decided, what).await;
+        assert_eq!(
+            model.expected.len(),
+            1 + at_decision,
+            "{what}: what the decision lets go while the editor runs"
+        );
+        let mut steps = decided;
+        steps.extend([Step::Report(11, Report::Done(Tree::Clean)), Step::Exit(11)]);
+        let model = run(Agent::Claude, b"", false, &steps, what).await;
+        assert_eq!(
+            model.expected,
+            [&[CTRL_G][..], &typed].concat(),
             "{what}: everything typed, once, in order"
         );
     }
