@@ -979,6 +979,32 @@ impl Drop for Fixture {
 /// What the `codex app-server` stand-in answers to `hooks/list`: the deck's
 /// own hooks, by the command the install wrote (as
 /// `tests/e2e_inbox_codex_doorbell.rs` and `tests/e2e_codex_status.rs` answer).
+/// The `result` of `tests/fixtures/codex-synthetic/codex`'s `hooks/list`
+/// reply to `canned` (a [`codex_hook_list_response`]): `__CODEX_HOME__`
+/// becomes `$CODEX_HOME`, and `__DECK_COMMAND__` the first hook command in
+/// that home's `hooks.json`, taken still JSON-escaped from the first line
+/// naming one, as the stand-in's `sed` takes it.
+fn stand_in_hook_list(canned: &str) -> Option<Value> {
+    let home = std::env::var("CODEX_HOME").ok()?;
+    let hooks = fs::read_to_string(Path::new(&home).join("hooks.json")).unwrap_or_default();
+    let command = hooks
+        .lines()
+        .find_map(|line| {
+            let rest = &line[line.find("\"command\"")? + "\"command\"".len()..];
+            let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+            let rest = rest.strip_prefix('"')?;
+            Some(rest[..rest.rfind('"')?].to_owned())
+        })
+        .unwrap_or_default();
+    let reply: Value = serde_json::from_str(
+        &canned
+            .replace("__CODEX_HOME__", &home)
+            .replace("__DECK_COMMAND__", &command),
+    )
+    .ok()?;
+    Some(reply["result"].clone())
+}
+
 fn codex_hook_list_response() -> String {
     let entry = |event: &str, camel: &str| {
         json!({
@@ -1038,13 +1064,21 @@ pub fn native_entry() {
     if std::env::args_os().skip(1).any(|arg| arg == "app-server") {
         // The wrapper's ordinary hooks/list probe must not start another
         // composer or overwrite the pane child's readiness acknowledgement.
-        // This synthetic server advertises no hook key or hash to trust.
+        // A Codex pane's spawn environment carries the `hooks/list` answer
+        // part 3's fixture seeds trust from (Q129b item 0), and this answers
+        // it as `tests/fixtures/codex-synthetic/codex` does, so a pane whose
+        // `codex` resolves here is trusted as one whose `codex` resolves to
+        // that stand-in. Without it, this synthetic server advertises no
+        // hook key or hash to trust.
         use std::io::BufRead;
         for line in std::io::stdin().lock().lines() {
             let request: Value = serde_json::from_str(&line.unwrap()).unwrap();
             if let Some(id) = request.get("id") {
                 let result = if request["method"] == "hooks/list" {
-                    json!({"hooks":[]})
+                    std::env::var("CODEX_HOOK_LIST_RESPONSE")
+                        .ok()
+                        .and_then(|canned| stand_in_hook_list(&canned))
+                        .unwrap_or_else(|| json!({"hooks":[]}))
                 } else {
                     json!({})
                 };
