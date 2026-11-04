@@ -659,8 +659,10 @@ pub fn install(
 /// the export path rule when present. `None` when the rule passes it, when
 /// Codex's home doesn't exist yet (nothing is created then), or when the
 /// home can't be resolved as Codex would (`super::keymap::codex_home`): the
-/// export is then left to the rule when it is read. `Some` is the refusal
-/// as the card shows it, and the generation is held.
+/// export is then left to the rule when it is read; so it is, after a log
+/// line, when the rule refuses Codex's home or a directory above it, where
+/// nothing is created. `Some` is a refusal of `editor` itself, as the card
+/// shows it, and the generation is held.
 ///
 /// Only a direct Codex: a launcher may give Codex another home, which the
 /// deck can't see before the spawn.
@@ -704,7 +706,7 @@ pub fn prepare_codex_export_at<V: super::path_rule::MakeDir>(
     home: &Path,
     uid: u32,
 ) -> Option<crate::inbox_display::HoldDetail> {
-    use super::path_rule::{Prepared, Remedy};
+    use super::path_rule::Prepared;
     let dir = home.join(super::path_rule::CODEX_EDITOR_DIR);
     match super::path_rule::prepare_codex_editor(view, home, uid) {
         Ok(Prepared::Created) => {
@@ -731,24 +733,40 @@ pub fn prepare_codex_export_at<V: super::path_rule::MakeDir>(
             );
             None
         }
-        Err(refusal) => {
-            let remedy = refusal.remedy(uid);
-            let remedy = match (remedy, remedy.chmod()) {
-                (Remedy::RemoveWrite { .. }, Some(mode)) => format!(
-                    "chmod {mode} {}, then restart the agent",
-                    shell_quote(&refusal.at.to_string_lossy())
-                ),
-                _ => crate::inbox_display::HOLD_REMEDY_RELOCATE.to_string(),
-            };
+        Ok(Prepared::HomeRefused(refusal)) => {
             tracing::warn!(
                 target: "composer_probe",
                 dir = %refusal.at.display(),
                 cause = ?refusal.cause,
-                remedy = %remedy,
+                remedy = %remedy_text(&refusal, uid),
+                "codex editor directory not created: codex home isn't one the check can read"
+            );
+            None
+        }
+        Err(refusal) => {
+            tracing::warn!(
+                target: "composer_probe",
+                dir = %refusal.at.display(),
+                cause = ?refusal.cause,
+                remedy = %remedy_text(&refusal, uid),
                 "codex editor directory held: the deck can't check this agent's input box"
             );
             Some(refusal.hold_detail(uid))
         }
+    }
+}
+
+/// The log's remedy for `refusal`: the exact `chmod` for the user's own
+/// writable directory, then a restart; otherwise core §6.3's relocation.
+fn remedy_text(refusal: &super::path_rule::Refusal, uid: u32) -> String {
+    use super::path_rule::Remedy;
+    let remedy = refusal.remedy(uid);
+    match (remedy, remedy.chmod()) {
+        (Remedy::RemoveWrite { .. }, Some(mode)) => format!(
+            "chmod {mode} {}, then restart the agent",
+            shell_quote(&refusal.at.to_string_lossy())
+        ),
+        _ => crate::inbox_display::HOLD_REMEDY_RELOCATE.to_string(),
     }
 }
 

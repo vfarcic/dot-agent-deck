@@ -998,16 +998,37 @@ fn codex_home(deck: &Deck) -> PathBuf {
     home
 }
 
-/// The log's `codex editor directory held` lines.
-fn held_lines(deck: &Deck) -> Vec<String> {
+/// The log's lines containing `needle`.
+fn log_lines(deck: &Deck, needle: &str) -> Vec<String> {
     deck.log()
         .lines()
-        .filter(|l| l.contains("codex editor directory held"))
+        .filter(|l| l.contains(needle))
         .map(str::to_string)
         .collect()
 }
 
-/// Scenario: Start a direct Codex 0.164.0 stand-in, its helper installed, with `$CODEX_HOME` a private directory that has no `editor` in it. The deck creates `editor` before the agent starts, the user's and 0700, says so in its log, and holds nothing for it. On a host whose own filesystem the rule refuses (an overlayfs root), the deck instead holds at that directory and creates nothing.
+/// The log's `codex editor directory held` lines.
+fn held_lines(deck: &Deck) -> Vec<String> {
+    log_lines(deck, "codex editor directory held")
+}
+
+/// On a host whose own filesystem the rule refuses: one line saying Codex's
+/// home wasn't prepared, naming that directory, and nothing held.
+fn assert_home_refused_on_host(deck: &Deck, host: &Path) {
+    eprintln!(
+        "SKIP-POSITIVE: this host's {} isn't allow-listed",
+        host.display()
+    );
+    let refused = log_lines(deck, "codex home isn't one the check can read");
+    assert_eq!(refused.len(), 1, "{}", deck.log());
+    assert!(
+        refused[0].contains(&format!("dir={} ", host.display())),
+        "{refused:?}"
+    );
+    assert!(held_lines(deck).is_empty(), "{}", deck.log());
+}
+
+/// Scenario: Start a direct Codex 0.164.0 stand-in, its helper installed, with `$CODEX_HOME` a private directory that has no `editor` in it. The deck creates `editor` before the agent starts, the user's and 0700, says so in its log, and holds nothing for it. On a host whose own filesystem the rule refuses (an overlayfs root), the deck instead logs that Codex's home wasn't prepared, naming that directory, and creates and holds nothing.
 #[spec("inbox/probe/091")]
 #[test]
 fn probe_091_a_direct_codex_gets_a_private_editor_directory() {
@@ -1016,16 +1037,7 @@ fn probe_091_a_direct_codex_gets_a_private_editor_directory() {
     let codex = deck.direct_codex("codex-091-absent", MEASURED);
     let editor = home.join("editor");
     if let Some(host) = host_filesystem_refusal(&home) {
-        eprintln!(
-            "SKIP-POSITIVE: this host's {} isn't allow-listed",
-            host.display()
-        );
-        let held = held_lines(&deck);
-        assert_eq!(held.len(), 1, "{}", deck.log());
-        assert!(
-            held[0].contains(&format!("dir={} ", host.display())),
-            "{held:?}"
-        );
+        assert_home_refused_on_host(&deck, &host);
         assert!(!editor.exists(), "nothing created past a refusal");
         return;
     }
@@ -1053,7 +1065,7 @@ fn probe_091_a_direct_codex_gets_a_private_editor_directory() {
     );
 }
 
-/// Scenario: Start a direct Codex 0.164.0 stand-in whose `$CODEX_HOME/editor` already exists at 0775, as a umask of 002 leaves it. The deck leaves the directory at 0775, logs the directory with the exact `chmod g-w` that fixes it, and, once something is typed into the agent's box and a task waits, holds the task with `cannot_check` and a detail naming that directory as one others can write to, which both clients show with the `chmod g-w` remedy; nothing is typed into the box. On a host whose own filesystem the rule refuses, the hold names that directory and its filesystem instead.
+/// Scenario: Start a direct Codex 0.164.0 stand-in whose `$CODEX_HOME/editor` already exists at 0775, as a umask of 002 leaves it. The deck leaves the directory at 0775, logs the directory with the exact `chmod g-w` that fixes it, and, once something is typed into the agent's box and a task waits, holds the task with `cannot_check` and a detail naming that directory as one others can write to, which both clients show with the `chmod g-w` remedy; nothing is typed into the box. On a host whose own filesystem the rule refuses, the deck logs that Codex's home wasn't prepared, naming that directory, holds nothing and leaves `editor` at 0775.
 #[spec("inbox/probe/091")]
 #[test]
 fn probe_091_a_writable_editor_directory_is_held_with_its_path_and_chmod() {
@@ -1063,30 +1075,25 @@ fn probe_091_a_writable_editor_directory_is_held_with_its_path_and_chmod() {
     std::fs::create_dir(&editor).unwrap();
     std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o775)).unwrap();
     let codex = deck.direct_codex("codex-091-writable", MEASURED);
-    let host = host_filesystem_refusal(&home);
+    let never_touched = || {
+        assert_eq!(
+            std::fs::metadata(&editor).unwrap().permissions().mode() & 0o7777,
+            0o775,
+            "never touched"
+        );
+    };
+    if let Some(host) = host_filesystem_refusal(&home) {
+        assert_home_refused_on_host(&deck, &host);
+        never_touched();
+        return;
+    }
     let held = held_lines(&deck);
     assert_eq!(held.len(), 1, "{}", deck.log());
-    let (cause, at) = match &host {
-        None => {
-            assert!(
-                held[0].contains(&format!("chmod g-w '{}'", editor.display())),
-                "the exact remedy: {held:?}"
-            );
-            ("writable_directory", editor.clone())
-        }
-        Some(host) => {
-            eprintln!(
-                "SKIP-POSITIVE: this host's {} isn't allow-listed",
-                host.display()
-            );
-            ("filesystem", host.clone())
-        }
-    };
-    assert_eq!(
-        std::fs::metadata(&editor).unwrap().permissions().mode() & 0o7777,
-        0o775,
-        "never touched"
+    assert!(
+        held[0].contains(&format!("chmod g-w '{}'", editor.display())),
+        "the exact remedy: {held:?}"
     );
+    never_touched();
     deck.latched(&codex, MEASURED);
     deck.idle(&codex);
     let mut user = common::AttachInput::attach(&deck.daemon.attach_socket, &codex.pane.agent);
@@ -1099,8 +1106,8 @@ fn probe_091_a_writable_editor_directory_is_held_with_its_path_and_chmod() {
         common::wait_until(WAIT, || {
             let inbox = &deck.record(&codex)["inbox"];
             inbox["wake_hold"] == "cannot_check"
-                && inbox["hold_detail"]["cause"] == cause
-                && inbox["hold_detail"]["path_component"] == at.to_str().unwrap()
+                && inbox["hold_detail"]["cause"] == "writable_directory"
+                && inbox["hold_detail"]["path_component"] == editor.to_str().unwrap()
         }),
         "{}",
         deck.record(&codex)

@@ -558,7 +558,7 @@ pub trait MakeDir: FsView {
 }
 
 /// What [`prepare_codex_editor`] found or did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Prepared {
     /// `editor` didn't exist: the deck created it, the user's and 0700.
     Created,
@@ -568,6 +568,10 @@ pub enum Prepared {
     /// it (Codex makes its home on its first start), so the export is left
     /// to the rule when it is read.
     HomeAbsent,
+    /// The rule refuses Codex's home or a directory above it (CX-12r,
+    /// CX-12n). The deck creates nothing there, and the export is left to
+    /// the rule when it is read, which refuses it there too.
+    HomeRefused(Refusal),
 }
 
 /// Option P with option C (R6 §6.6, core §6.2; U-CX12): before a Codex
@@ -575,7 +579,8 @@ pub enum Prepared {
 /// into, `<home>/editor`, is one the rule accepts.
 ///
 /// 1. `home`, Codex's home, is walked by the full rule; a component that
-///    doesn't exist is [`Prepared::HomeAbsent`], and nothing is created.
+///    doesn't exist is [`Prepared::HomeAbsent`], one the rule refuses is
+///    [`Prepared::HomeRefused`], and in either case nothing is created.
 /// 2. `mkdirat(home, "editor", 0700)` through the walked descriptor.
 /// 3. On `EEXIST` the directory is never touched: it is walked by the full
 ///    rule, so one a umask of 002 made 0775 refuses, at `editor`, with
@@ -583,6 +588,9 @@ pub enum Prepared {
 /// 4. Once created, it is opened without following a link and must be a
 ///    directory, pass the rule, be the user's and have mode exactly 0700
 ///    ([`Cause::NotPrivate`] otherwise).
+///
+/// `Err` is a refusal of `editor` itself, from step 3 or 4: the one this
+/// function holds a generation for.
 ///
 /// M56b measured that Codex 0.160.0 and 0.164.0 export into a pre-created
 /// 0700 `editor` and leave its mode alone.
@@ -600,17 +608,19 @@ pub fn prepare_codex_editor<V: MakeDir>(
             cause:
                 Cause::Io {
                     op: Op::Open,
-                    errno: Some(libc::ENOENT),
+                    errno: Some(errno),
                 },
             ..
-        }) => return Ok(Prepared::HomeAbsent),
-        Err(refusal) => return Err(refusal),
+        }) if io::Error::from_raw_os_error(errno).kind() == io::ErrorKind::NotFound => {
+            return Ok(Prepared::HomeAbsent);
+        }
+        Err(refusal) => return Ok(Prepared::HomeRefused(refusal)),
     };
     let name = OsStr::new(CODEX_EDITOR_DIR);
     let at = parent.path.join(name);
     match view.make_dir(&parent.handle, name, CODEX_EDITOR_MODE) {
         Ok(()) => {}
-        Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             walk(view, &home.join(name), uid)?;
             return Ok(Prepared::Existing);
         }
