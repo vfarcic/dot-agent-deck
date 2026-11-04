@@ -6,8 +6,8 @@
 //! class ([`pane_class`]) and the rollout, never a release: no basename,
 //! `PATH` lookup or version subprocess stands in for one, and the release a
 //! generation's header later reports decides only whether the deck may arm
-//! it ([`super::permission`]). The rollout is [`INSTALL_ROLLOUT`], empty
-//! until activation, plus, in the `e2e` build only, the classes of the agents
+//! it ([`super::permission`]). The rollout is [`INSTALL_ROLLOUT`] (since
+//! the Claude activation, `Direct(Claude)`), plus, in the `e2e` build only, the classes of the agents
 //! the e2e assumption names ([`assumed_classes`]). That assumption is read
 //! once, at daemon start ([`capture_assumption`]), where an unknown entry
 //! refuses the whole list and the daemon goes on with no assumption, so no
@@ -113,13 +113,13 @@ pub enum PaneClass {
 /// The shells a pane's first word is never installed under, by basename.
 pub const SHELLS: &[&str] = &["bash", "zsh", "fish", "sh", "dash", "nu", "pwsh"];
 
-/// The classes installation has rolled out to. Empty until activation:
-/// Q35-28 adds `Direct(Claude)` only; `Launcher(Claude)` and `Wrapper` come
-/// with Q35-22, and Codex's classes with Q35-29
+/// The classes installation has rolled out to. The Claude activation
+/// (Q35-28) added `Direct(Claude)` only; `Launcher(Claude)` and `Wrapper`
+/// come with Q35-22, and Codex's classes with Q35-29
 /// (`docs/develop/doorbell-admission.md`). Installation is Linux-only
 /// whatever this holds: [`at_spawn`] returns [`NotInstalled::Platform`]
 /// on any other host.
-pub const INSTALL_ROLLOUT: &[PaneClass] = &[];
+pub const INSTALL_ROLLOUT: &[PaneClass] = &[PaneClass::Direct(ProbeAgent::Claude)];
 
 /// The class of a pane running `command`, its agent declared as `declared`.
 pub fn pane_class(command: Option<&str>, declared: Option<&AgentType>) -> PaneClass {

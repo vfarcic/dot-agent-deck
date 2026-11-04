@@ -148,17 +148,24 @@ fn doorbell_053_permission_needs_the_header_a_verified_record_and_the_root() {
     );
 }
 
-/// Scenario: Ask for the permission to arm on every release the deck ships a record for, with the records as shipped and with no e2e assumption read. None of them is armable: each is inert for its missing editor record, however its root is bound.
+/// Scenario: Ask for the permission to arm on every release the deck ships a record for, with the records as shipped and with no e2e assumption read. Only Claude Code 2.1.317, whose editor record the Claude activation verified, can arm: it waits while its root is looked for, is armable once the root is bound, and is inert when it is never bound. Every other release is inert for its missing editor record, however its root is bound.
 #[spec("inbox/doorbell/053")]
 #[test]
-fn doorbell_053_no_shipped_release_is_armable() {
+fn doorbell_053_only_the_activated_release_is_armable() {
     assert!(assumed_editor_probes().is_empty());
     for record in &RELEASE_RECORDS {
         let header = LatchedRelease::Known(record.release.clone());
+        let activated = record.agent == CLAUDE && record.release == v("2.1.317");
         for binding in [Binding::Waiting, Binding::Bound, Binding::Never] {
+            let expected = match (activated, &binding) {
+                (false, _) => Permission::Inert(InertCause::NoEditorRecord),
+                (true, Binding::Waiting) => Permission::Pending,
+                (true, Binding::Bound) => Permission::Armable,
+                (true, Binding::Never) => Permission::Inert(InertCause::Unbound),
+            };
             assert_eq!(
                 permission(&RELEASE_RECORDS, &record.agent, Some(&header), binding),
-                Permission::Inert(InertCause::NoEditorRecord),
+                expected,
                 "{:?} {}",
                 record.agent,
                 record.release
@@ -167,7 +174,7 @@ fn doorbell_053_no_shipped_release_is_armable() {
     }
 }
 
-/// Scenario: Run this test again in separate subprocesses of a build without the e2e feature, with valid and malformed editor-probe assumption variables set. The production reader ignores both values and leaves every shipped release unable to arm; on Linux, the actual production daemon also starts synthetic commands whose original editor environment and complete argv must survive unchanged.
+/// Scenario: Run this test again in separate subprocesses of a build without the e2e feature, with valid and malformed editor-probe assumption variables set. The production reader ignores both values: only Claude Code 2.1.317, whose editor record the Claude activation verified, can arm, and every other shipped release, those the variable names among them, stays unable to arm. On Linux, the actual production daemon also starts synthetic commands: a direct Claude Code gets the installation the activation rolled out (the deck's helper as its editor and a tool environment file), every other command keeps its original editor environment, whatever the variable names, and every complete argv survives unchanged.
 #[spec("inbox/probe/012")]
 #[test]
 #[cfg(not(feature = "e2e"))]
@@ -182,6 +189,11 @@ fn probe_012_production_reader_ignores_set_editor_assumption() {
         );
         for record in &RELEASE_RECORDS {
             let header = LatchedRelease::Known(record.release.clone());
+            let expected = if record.agent == CLAUDE && record.release == v("2.1.317") {
+                Permission::Armable
+            } else {
+                Permission::Inert(InertCause::NoEditorRecord)
+            };
             assert_eq!(
                 permission(
                     &RELEASE_RECORDS,
@@ -189,8 +201,8 @@ fn probe_012_production_reader_ignores_set_editor_assumption() {
                     Some(&header),
                     Binding::Bound
                 ),
-                Permission::Inert(InertCause::NoEditorRecord),
-                "{:?} {} must remain inert in the production build",
+                expected,
+                "{:?} {}: the production build's own records decide, not the variable",
                 record.agent,
                 record.release
             );
@@ -214,13 +226,27 @@ fn probe_012_production_reader_ignores_set_editor_assumption() {
                     };
                     let spawned =
                         installation::spawn(&daemon, &name, kind, release, original, None, false);
-                    assert_eq!(spawned.report["env"]["VISUAL"], json!(original), "{name}");
-                    assert_eq!(spawned.report["env"]["EDITOR"], json!(original), "{name}");
-                    assert_eq!(
-                        spawned.report["env"]["CLAUDE_ENV_FILE"],
-                        Value::Null,
-                        "{name}"
-                    );
+                    if kind == "claude" {
+                        // The Claude activation's rollout, not the variable.
+                        let helper = installation::installed(&spawned);
+                        assert_eq!(
+                            spawned.report["env"]["EDITOR"],
+                            json!(helper.display().to_string()),
+                            "{name}"
+                        );
+                        assert!(
+                            spawned.report["env"]["CLAUDE_ENV_FILE"].is_string(),
+                            "{name}"
+                        );
+                    } else {
+                        assert_eq!(spawned.report["env"]["VISUAL"], json!(original), "{name}");
+                        assert_eq!(spawned.report["env"]["EDITOR"], json!(original), "{name}");
+                        assert_eq!(
+                            spawned.report["env"]["CLAUDE_ENV_FILE"],
+                            Value::Null,
+                            "{name}"
+                        );
+                    }
                     assert_eq!(spawned.report["argv"], spawned.original_argv, "{name}");
                 }
             }

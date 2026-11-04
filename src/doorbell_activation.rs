@@ -993,10 +993,10 @@ const CODEX_0160_DIALOGS: &[DialogKeys<'static>] = &[
 /// `docs/develop/doorbell-admission.md`). The Claude Code records are `Go`;
 /// both Codex releases stage the line (a digit of a message id answers their
 /// update dialog, `n` their folder-trust dialog), and neither records
-/// `head_echo` yet, so both are `missing_measurement`. No record's
-/// `editor_probe` is verified, so the deck checks no input box on any of
-/// them; 2.1.317's measured one is [`CLAUDE_2_1_317_EDITOR_PROBE`], which
-/// activation (Q35-28) sets.
+/// `head_echo` yet, so both are `missing_measurement`. Only 2.1.317's
+/// `editor_probe` is verified ([`CLAUDE_2_1_317_EDITOR_PROBE`], set by the
+/// Claude activation, Q35-28), so the deck checks the input box of that
+/// release alone; the other records' stay absent.
 pub static RELEASE_RECORDS: [ReleaseRecord<'static>; 5] = [
     // Codex 0.164.0, the release current at measurement. Echo: the exact line
     // in the composer 30 of 30 (20 at 50 × 200, 10 at 24 × 80; ≤ 62 ms after
@@ -1160,17 +1160,17 @@ pub static RELEASE_RECORDS: [ReleaseRecord<'static>; 5] = [
         placeholder_empty: Measurement::Failed,
         delete_key: Measurement::Verified(()),
         transcript_echo: Measurement::Verified(()),
-        // Measured: [`CLAUDE_2_1_317_EDITOR_PROBE`]. Left absent until
-        // activation (Q35-28) verifies it, so no shipped release is armable
-        // before then (`inbox/doorbell/053`, `inbox/probe/012`).
-        editor_probe: Measurement::Absent,
+        // The Claude activation (Q35-28): the measured record, so a
+        // directly spawned 2.1.317 is armable once its root is bound
+        // (`inbox/doorbell/053`, `inbox/probe/012`).
+        editor_probe: Measurement::Verified(CLAUDE_2_1_317_EDITOR_PROBE),
     },
 ];
 
 /// Claude Code 2.1.317's external-editor action as measured on 2026-11-03
 /// (`tests/fixtures/claude-inbox/release-2.1.317/`, `inbox/probe/088`,
-/// `089`): the `editor_probe` its record gets at activation (Q35-28). Each
-/// field is verified only as far as it was measured.
+/// `089`): its record's `editor_probe` since the Claude activation (Q35-28).
+/// Each field is verified only as far as it was measured.
 ///
 /// - `export`: 5/5 Ctrl+G presses under `VISUAL` handed the editor the draft,
 ///   with `TMPDIR` unset, under `/tmp/claude-<uid>/` (as

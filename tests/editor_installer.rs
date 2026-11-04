@@ -243,13 +243,13 @@ fn probe() -> EditorProbe<'static> {
     }
 }
 
-/// Scenario: Decide eligibility from the rollout: production's rollout is empty, so every class, the plain agent commands among them, is not installed and the decision at a spawn says so without making anything; a shell is never installed, even under a rollout naming it; the assumption's agents roll out Claude's direct, launcher and wrapper classes and Codex's direct and launcher classes, each once.
+/// Scenario: Decide eligibility from the rollout: production's rollout holds Claude Code's direct class alone, the Claude activation's, so that class is eligible, and every other class, the plain codex command among them, is not installed and the decision at a spawn says so without making anything; a shell is never installed, even under a rollout naming it; the assumption's agents roll out Claude's direct, launcher and wrapper classes and Codex's direct and launcher classes, each once.
 #[spec("inbox/probe/064")]
 #[test]
 fn probe_064_the_rollout_decides_and_production_installs_nothing() {
-    assert!(INSTALL_ROLLOUT.is_empty());
+    assert_eq!(INSTALL_ROLLOUT, [CLAUDE]);
+    assert_eq!(eligible(CLAUDE, INSTALL_ROLLOUT), Ok(()));
     for class in [
-        CLAUDE,
         CODEX,
         PaneClass::Launcher(ProbeAgent::Claude),
         PaneClass::Wrapper,
@@ -263,7 +263,6 @@ fn probe_064_the_rollout_decides_and_production_installs_nothing() {
         Err(NotInstalled::Shell)
     );
     for (command, why) in [
-        (Some("claude"), NotInstalled::Rollout),
         (Some("codex"), NotInstalled::Rollout),
         (Some("my-wrapper"), NotInstalled::Rollout),
         (Some("bash"), NotInstalled::Shell),
