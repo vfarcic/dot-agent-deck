@@ -637,8 +637,19 @@ def describe_independent_review(evidence):
 # sweep, and it is bounded the same way: by the two scheduled sweeps a day.
 INSUFFICIENT_RETRIES_PER_HEAD = 1
 
+# Issue #1847: the pull request authors, among REVIEW_AUTHORS in
+# pr-review-batch.yml, that gh-aw's integrity filter applies to: accounts
+# without write access to this repository. On a pull request one of them
+# opened, the filter withholds the independent review from the agent's reads,
+# and the rubric's priority 1 then fixes the verdict at INSUFFICIENT; a retry
+# would be one more agent run that can only repeat it. Keep this the one place
+# that names them. `vfarcic` owns the repository and `prageethw` read back
+# `write` on 2026-11-04, so Renovate is the only such author today; an account
+# added to REVIEW_AUTHORS without write access belongs here too.
+INTEGRITY_FILTERED_AUTHORS = frozenset({"app/renovate"})
 
-def insufficient_retry_due(verdicts_at_head, evidence):
+
+def insufficient_retry_due(verdicts_at_head, evidence, author):
     """Should the sweep review a head again although it already has a verdict?
 
     The selector's idempotence skips any head with a verdict, which is right
@@ -655,12 +666,27 @@ def insufficient_retry_due(verdicts_at_head, evidence):
         state of its own -- the verdict comments are the state;
       * an independent review covers the head now (`evidence`), because the
         abstention the rubric REQUIRES is "nothing independent has read this
-        head", and re-running into that answer would spend a call to repeat it.
+        head", and re-running into that answer would spend a call to repeat it;
+      * the pull request's `author` is not one the integrity filter applies to
+        (`retry_can_change_the_verdict`), for the same reason: there the rubric
+        requires the abstention whatever the coverage (#1847).
 
     `verdicts_at_head` must already be filtered to trusted verdicts at this
     head, which is what `trusted_verdicts_at` returns.
     """
-    return bool(evidence) and retry_budget_left(verdicts_at_head)
+    return (
+        bool(evidence)
+        and retry_can_change_the_verdict(author)
+        and retry_budget_left(verdicts_at_head)
+    )
+
+
+def retry_can_change_the_verdict(author):
+    """False for an author whose abstention the rubric fixes (#1847).
+
+    Needs no read at all, so the selector checks it before the evidence reads.
+    """
+    return author not in INTEGRITY_FILTERED_AUTHORS
 
 
 def retry_budget_left(verdicts_at_head):
