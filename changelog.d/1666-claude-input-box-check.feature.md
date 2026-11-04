@@ -1,0 +1,16 @@
+## The deck checks Claude Code's input box before it types its doorbell, on Linux
+
+When you had typed anything into a Claude Code agent's input box, the deck could no longer tell whether the box was empty, so it stopped typing its doorbell into that agent until it restarted. Now, for Claude Code 2.1.317 running on Linux and started directly in its pane (its command starts with `claude`), the deck checks the box first and rings once a check finds it empty, so you can clear the box any way you like. While it checks, Claude Code's input box disappears for a moment and comes back with what it held; anything you type meanwhile appears once the check ends.
+
+To check the box, the deck sets that Claude Code's `VISUAL` and `EDITOR` to a small helper of its own, which still opens your own editor when you press `Ctrl+G`. Claude Code's Bash tool, including background commands and subagents, still sees your own `VISUAL` and `EDITOR`. A Claude Code version the deck hasn't measured gets the same helper but no checks, and Claude Code started through a launcher script gets neither.
+
+What to know:
+
+- Once you open your own editor with `Ctrl+G` in a Claude Code pane, the deck stops checking that pane's input box until the agent restarts; its waiting messages then reach it at your next prompt, and its card says `the deck can't check this agent's input box. Check its pane.`
+- A prompt recalled with the Up arrow can't be checked; the card says the same, and clearing the box lets the next check go ahead.
+- If you change `~/.claude/keybindings.json` while the agent runs so that `Ctrl+G` does something else, a check sent in the next few seconds can run that action once in Claude Code. The deck then stops checking that agent's box until it restarts. Restart Claude Code from the deck after changing its key bindings.
+- The deck reads the box in Claude Code's `dark`, `light`, `dark-ansi`, `light-ansi` and `dark-daltonized` themes; with another theme it may not recognise the box, and then checks and types nothing.
+- If you set `TMPDIR` for Claude Code to a directory that other users could change (for example one created group-writable under a `umask 0002`), the deck reads the box as not empty and its card keeps saying `there may be an unsent draft. Send it or clear it.`; remove that write access with `chmod go-w`, or leave `TMPDIR` unset.
+- macOS and Codex aren't covered yet: there, once you type into the agent's pane, its messages wait until it restarts, as before.
+
+The TUI and the desktop app show the same card words. See [Orchestration → How the deck checks Claude Code's input box](https://agent-deck.devopstoolkit.ai/docs/orchestration.md#how-the-deck-checks-claude-codes-input-box).
