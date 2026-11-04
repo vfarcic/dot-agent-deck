@@ -13,7 +13,8 @@
 //! Real interactive Claude Code (Haiku) in an installed pane
 //! (`support/claude_installed.rs`). No e2e editor-probe assumption. The
 //! unmeasured-release case runs the executable `DAD_PROBE_044_UNMEASURED_CLAUDE`
-//! names (a pinned official build) and is otherwise `SKIP:`; the `e2e`
+//! names, which must be the pinned official 2.1.312 build (its sha256 is
+//! checked), and is otherwise `SKIP:`; the `e2e`
 //! build's `DOT_AGENT_DECK_E2E_UNRECORD_CLAUDE_RELEASES` can't stand in for
 //! one, since it removes a record from the ring's view only, not from the
 //! editor probe's permission.
@@ -195,15 +196,37 @@ fn probe_044_live_tools_see_set_editor_settings() {
     tools_see_the_saved_editor(Saved::Set);
 }
 
+/// The official Claude Code 2.1.312 Linux x64 executable, as its record and
+/// the `tests/fixtures/claude-inbox/r5wake/claude-2.1.312-*` fixtures pin it:
+/// the `claude` binary in the `@anthropic-ai/claude-code-linux-x64@2.1.312`
+/// npm package (fetched with `npm pack` and unpacked). Its record verifies
+/// the ring and leaves `editor_probe` absent, so it is the unmeasured release
+/// this test runs; if a later activation verifies 2.1.312's editor probe,
+/// pin another release here.
+const UNMEASURED_CLAUDE_SHA256: &str =
+    "4f4178ce41d83e23341ebfbaecdbcf8ea6bf7baea0690025abe49eeec3a5d01d";
+
 /// The Claude Code executable whose release the deck has not measured the
-/// editor probe of: `DAD_PROBE_044_UNMEASURED_CLAUDE`, a pinned official
-/// build (for instance 2.1.312, whose record verifies the ring but leaves
-/// `editor_probe` absent). Its release, or why the test cannot run.
+/// editor probe of: `DAD_PROBE_044_UNMEASURED_CLAUDE`, which must be the
+/// pinned build [`UNMEASURED_CLAUDE_SHA256`] names. Its release, or why the
+/// test cannot run.
 fn unmeasured_claude() -> Result<(std::path::PathBuf, String), String> {
     use dot_agent_deck::doorbell_activation::{Measurement, RELEASE_RECORDS};
+    use sha2::{Digest, Sha256};
     let path = std::env::var_os("DAD_PROBE_044_UNMEASURED_CLAUDE")
         .map(std::path::PathBuf::from)
         .ok_or("DAD_PROBE_044_UNMEASURED_CLAUDE names no Claude Code executable")?;
+    let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let sha256: String = Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if sha256 != UNMEASURED_CLAUDE_SHA256 {
+        return Err(format!(
+            "{} has sha256 {sha256}, not the pinned 2.1.312 build's {UNMEASURED_CLAUDE_SHA256}",
+            path.display()
+        ));
+    }
     let out = std::process::Command::new(&path)
         .arg("--version")
         .current_dir(std::env::temp_dir())
@@ -232,7 +255,8 @@ fn unmeasured_claude() -> Result<(std::path::PathBuf, String), String> {
 #[spec("inbox/probe/044")]
 #[test]
 fn probe_044_live_an_unmeasured_release_is_installed_and_never_checked() {
-    skip_unless!(installed::checkable());
+    // It runs its own binary, so the host's release needs no record.
+    skip_unless!(installed::rollout_installs_claude());
     let (binary, release) = match unmeasured_claude() {
         Ok(found) => found,
         Err(why) => {
@@ -344,7 +368,8 @@ fn probe_044_live_an_unmeasured_release_is_installed_and_never_checked() {
 #[spec("inbox/probe/044")]
 #[test]
 fn probe_044_live_a_launcher_is_not_installed() {
-    skip_unless!(installed::checkable());
+    // Only the rollout matters: a launcher isn't installed at any release.
+    skip_unless!(installed::rollout_installs_claude());
     let claude = Installed::launch(&format!("env T042_LAUNCHER=1 {CLAUDE}"), &Saved::Set.env());
     assert_eq!(claude.env("T042_LAUNCHER").as_deref(), Some("1"));
     assert_eq!(

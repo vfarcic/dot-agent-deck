@@ -162,13 +162,24 @@ impl Installed {
         result
     }
 
-    /// [`Self::launch`] of [`CLAUDE`], waiting for its native waiter.
+    /// [`Self::launch`] of [`CLAUDE`], waiting for its native waiter, and
+    /// for the deck to have latched the installed release (what
+    /// `claude --version` says) from the pane's own start-up header.
     pub fn new(extra: &[(&str, &str)]) -> Self {
         let claude = Self::launch(CLAUDE, extra);
         assert!(
             common::wait_until(BUDGET, || claude.listing()["armed"].as_u64().unwrap_or(0)
                 > 0),
             "native SessionStart waiter must arm; {}",
+            claude.evidence()
+        );
+        let release = installed_release().expect("the installed release");
+        let latched = format!("release={release}");
+        assert!(
+            common::wait_until(BUDGET, || claude.log().lines().any(|line| {
+                line.contains("pane release") && line.split_whitespace().any(|w| w == latched)
+            })),
+            "the deck latched the installed release {release} from the pane's header; {}",
             claude.evidence()
         );
         claude.deck.wait_for_string("? for shortcuts");
@@ -248,21 +259,7 @@ impl Installed {
 
     /// The doorbell tick's checks since `since`, each its outcome's text.
     pub fn checks(&self, since: usize) -> Vec<String> {
-        self.log()
-            .get(since..)
-            .unwrap_or("")
-            .lines()
-            .filter(|line| line.contains("doorbell tick probe"))
-            .map(|line| {
-                line.split("outcome=")
-                    .nth(1)
-                    .unwrap_or("")
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .to_string()
-            })
-            .collect()
+        checks_in(self.log().get(since..).unwrap_or(""))
     }
 
     /// The checks since `since` the daemon read the box non-empty or empty:
@@ -477,6 +474,38 @@ pub fn input_box(grid: &str) -> Option<String> {
                 .to_string()
         })
     })
+}
+
+/// The doorbell tick's checks logged in `text`, each its outcome's text
+/// (`Written` for a check the deck wrote), whatever pane they were for.
+pub fn checks_in(text: &str) -> Vec<String> {
+    text.lines()
+        .filter(|line| line.contains("doorbell tick probe"))
+        .map(|line| {
+            line.split("outcome=")
+                .nth(1)
+                .unwrap_or("")
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect()
+}
+
+/// The preflight of a test that needs only the rollout, not a verified
+/// installed release: real Claude Code can run here, and this build installs
+/// `Direct(Claude)` panes. Otherwise the reason, for `SKIP:`.
+pub fn rollout_installs_claude() -> Result<(), String> {
+    use dot_agent_deck::composer_probe::install::{INSTALL_ROLLOUT, PaneClass, ProbeAgent};
+    common::check_claude_available()?;
+    if INSTALL_ROLLOUT.contains(&PaneClass::Direct(ProbeAgent::Claude)) {
+        Ok(())
+    } else {
+        Err(format!(
+            "this build installs no Direct(Claude) pane (INSTALL_ROLLOUT = {INSTALL_ROLLOUT:?})"
+        ))
+    }
 }
 
 /// The last `n` lines of `text`.
