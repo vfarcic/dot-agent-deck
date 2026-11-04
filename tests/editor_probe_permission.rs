@@ -229,11 +229,13 @@ fn probe_012_production_reader_ignores_set_editor_assumption() {
                     if kind == "claude" {
                         // The Claude activation's rollout, not the variable.
                         let helper = installation::installed(&spawned);
-                        assert_eq!(
-                            spawned.report["env"]["EDITOR"],
-                            json!(helper.display().to_string()),
-                            "{name}"
-                        );
+                        for variable in ["VISUAL", "EDITOR"] {
+                            assert_eq!(
+                                spawned.report["env"][variable],
+                                json!(helper.display().to_string()),
+                                "{name}: {variable}"
+                            );
+                        }
                         assert!(
                             spawned.report["env"]["CLAUDE_ENV_FILE"].is_string(),
                             "{name}"

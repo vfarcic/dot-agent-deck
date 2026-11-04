@@ -246,7 +246,7 @@ fn probe() -> EditorProbe<'static> {
 /// Scenario: Decide eligibility from the rollout: production's rollout holds Claude Code's direct class alone, the Claude activation's, so that class is eligible, and every other class, the plain codex command among them, is not installed and the decision at a spawn says so without making anything; a shell is never installed, even under a rollout naming it; the assumption's agents roll out Claude's direct, launcher and wrapper classes and Codex's direct and launcher classes, each once.
 #[spec("inbox/probe/064")]
 #[test]
-fn probe_064_the_rollout_decides_and_production_installs_nothing() {
+fn probe_064_the_rollout_decides_and_production_installs_only_a_direct_claude() {
     assert_eq!(INSTALL_ROLLOUT, [CLAUDE]);
     assert_eq!(eligible(CLAUDE, INSTALL_ROLLOUT), Ok(()));
     for class in [

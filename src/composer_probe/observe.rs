@@ -2602,9 +2602,17 @@ mod linux {
             request: &ComposerInvocationRequest,
         ) -> ComposerOutcome {
             if request.generation != self.generation {
+                tracing::debug!(
+                    target: "composer_probe",
+                    agent_id = %self.agent_id,
+                    pid = conn.helper.pid,
+                    generation = request.generation,
+                    "editor helper invocation for another generation: uncertain"
+                );
                 return ComposerOutcome::Uncertain;
             }
             let evidence = self.attest(&conn.helper, Some(&request.argv));
+            let attested = evidence.is_some();
             let key = key_of(&conn.helper);
             let (outcome, late) = {
                 let mut inner = self.lock();
@@ -2618,6 +2626,18 @@ mod linux {
             if late {
                 self.log_late(key, Channel::Ipc, super::decision(request.decision));
             }
+            // revact28: the IPC invocation's outcome, so a probe that never
+            // settles shows whether its helper was answered at all. No path
+            // or composer text: the outcome names only its class.
+            tracing::debug!(
+                target: "composer_probe",
+                agent_id = %self.agent_id,
+                pid = conn.helper.pid,
+                decision = ?super::decision(request.decision),
+                attested,
+                ?outcome,
+                "editor helper invocation answered"
+            );
             self.bell.ring();
             outcome
         }
