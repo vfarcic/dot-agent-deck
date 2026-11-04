@@ -179,6 +179,18 @@ fn signal_key(byte: u8) -> bool {
 /// `ICRNL`, ending one (a NUL is not counted).
 const COOKED_LINE: usize = 4095;
 
+/// Q160b (revact29 finding 4), from UTF-8 itself: how many bytes the
+/// character a byte leads takes, so the line limit stops before a lead byte
+/// whose whole character would not fit, never between a character's bytes.
+fn utf8_width(byte: u8) -> usize {
+    match byte {
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf7 => 4,
+        _ => 1,
+    }
+}
+
 /// The line with no end left after `bytes` follow `run` bytes of one.
 fn cooked_line_after(run: usize, bytes: impl IntoIterator<Item = u8>) -> usize {
     bytes
@@ -275,6 +287,10 @@ struct Rig {
     fault: Mutex<Option<(ProbeFault, &'static [u8])>>,
     /// The test's runtime, for what the PTY's writer thread types.
     runtime: tokio::runtime::Handle,
+    /// Q160b: the pane's terminal has `ICANON` clear, as a terminal editor
+    /// the check opened leaves it ([`Step::Raw`]); the writer reads it as
+    /// production reads the PTY master's termios.
+    raw: Arc<AtomicBool>,
 }
 
 impl Rig {
@@ -313,7 +329,7 @@ impl Rig {
         assert!(input.attach_segments(G, agent));
         let slot = Arc::new(std::sync::OnceLock::new());
         let retired = Arc::new(AtomicBool::new(false));
-        let writer = PaneWriter::new(
+        let mut writer = PaneWriter::new(
             Box::new(Pty {
                 rig: Arc::clone(&slot),
             }),
@@ -324,6 +340,9 @@ impl Rig {
             None,
             Arc::clone(&input),
         );
+        let raw = Arc::new(AtomicBool::new(false));
+        let mode = Arc::clone(&raw);
+        writer.set_canonical(Box::new(move || Some(!mode.load(Ordering::SeqCst))));
         let rig = Arc::new(Rig {
             writer: Arc::new(AsyncMutex::new(writer)),
             input,
@@ -336,6 +355,7 @@ impl Rig {
             mid_fired: std::sync::atomic::AtomicUsize::new(0),
             fault: Mutex::new(None),
             runtime: tokio::runtime::Handle::current(),
+            raw,
         });
         let _ = slot.set(Arc::downgrade(&rig));
         let log = Arc::downgrade(&rig);
@@ -944,6 +964,8 @@ struct Model {
     stats: Stats,
     /// The model's clock: one tick per birth or exit.
     clock: u64,
+    /// Q160b: the pane's terminal has `ICANON` clear ([`Step::Raw`]).
+    raw: bool,
 }
 
 /// How a probe settled the schedule (R3 §3.4): an `Armed` empty read of
@@ -1039,6 +1061,7 @@ impl Model {
             settled_due: false,
             stats: Stats::default(),
             clock: 0,
+            raw: false,
         }
     }
 
@@ -1471,14 +1494,25 @@ impl Model {
                 };
                 // Q152b: and, cooked or behind an `Unarmed` probe, before the
                 // line with no end it leaves in the terminal reaches
-                // `COOKED_LINE` bytes.
+                // `COOKED_LINE` bytes, before a UTF-8 lead byte whose whole
+                // character wouldn't fit (Q160b, revact29 finding 4). Behind
+                // the `Unarmed` probe only while the terminal is canonical:
+                // a terminal editor that took it raw reads everything, and
+                // what it hasn't read is a line of its own once the terminal
+                // is canonical again, so the line starts afresh (Q160b,
+                // revact29 finding 1).
                 let out_of_raw = cooked || signal;
-                let full = out_of_raw
+                let limited = cooked || (signal && !self.raw);
+                let full = limited
                     .then(|| {
                         let mut run = seg.cooked_line;
                         self.held.iter().position(|&b| {
-                            run = cooked_line_after(run, [b]);
-                            run >= COOKED_LINE
+                            let next = cooked_line_after(run, [b]);
+                            if next + utf8_width(b) > COOKED_LINE {
+                                return true;
+                            }
+                            run = next;
+                            false
                         })
                     })
                     .flatten();
@@ -1495,8 +1529,11 @@ impl Model {
                     self.stats.cooked_held += 1;
                 }
                 if out_of_raw {
-                    let line =
-                        cooked_line_after(seg.cooked_line, self.held.iter().take(upto).copied());
+                    let line = if limited {
+                        cooked_line_after(seg.cooked_line, self.held.iter().take(upto).copied())
+                    } else {
+                        0
+                    };
                     self.segs.front_mut().expect("the front").cooked_line = line;
                 }
                 self.release(upto);
@@ -1692,6 +1729,12 @@ enum Step {
     /// The observer's keymap re-read settles the empty reads parked so far
     /// (A-20d-1a, [`Rig::recheck`]).
     Recheck,
+    /// Q160b: the pane's terminal goes raw (`ICANON` clear), as a terminal
+    /// editor the check opened sets it, or canonical again, and the driver
+    /// is woken. Production has no wake for a termios change: the next key
+    /// typed wakes it, and a pass already pending reads the new mode, so
+    /// the rig wakes it here to keep the model's order.
+    Raw(bool),
     /// `step` lands inside the next driver pass that finds the op `on_held`
     /// held, between its read of the front segment and its extraction of
     /// what is held (A-20d-3). For the model, it lands right after the step
@@ -1998,6 +2041,10 @@ fn apply_model(model: &mut Model, step: &Step, pending: &mut Option<Option<u32>>
         Step::Phantom => model.phantom(),
         Step::LapseRetry => model.lapse_retry(),
         Step::Recheck => model.recheck(),
+        Step::Raw(raw) => {
+            model.raw = *raw;
+            model.step();
+        }
         Step::MidPass { on_held, step } => {
             model.deferred = Some((on_held.clone(), (**step).clone()));
         }
@@ -2170,6 +2217,10 @@ async fn run_with(
                 .await;
             }
             Step::Recheck => rig.recheck(),
+            Step::Raw(raw) => {
+                rig.raw.store(*raw, Ordering::SeqCst);
+                rig.input.segments_moved().notify_one();
+            }
             Step::MidPass { on_held, step } => {
                 rig.mid_pass(on_held.clone(), (**step).clone()).await;
             }
@@ -2547,6 +2598,87 @@ async fn probe_010_a_long_line_behind_a_checks_unarmed_editor_waits_for_its_exit
             [&[CTRL_G][..], &typed].concat(),
             "{what}: everything typed, once, in order"
         );
+    }
+}
+
+/// Scenario: On Claude, the deck's check writes its Ctrl+G and a person pastes 5000 bytes with no line break, held behind it; the helper decides `Unarmed` and runs the person's editor, which, like vim, takes the terminal raw. The decision lets the paste go only as far as a cooked line keeps, but once the terminal is raw the rest goes, and about 4.5 KB of mouse reports and then `:wq` with its Enter all reach the editor at once. When the editor gives the terminal back, the line in it starts afresh, so 3000 bytes typed then go at once too. Everything typed reaches the pane once, in order (Q160b, revact29's finding 1).
+#[spec("inbox/probe/010")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_010_a_terminal_editor_the_check_opened_gets_every_key() {
+    let mouse = b"\x1b[<0;10;5M";
+    let mut steps = vec![
+        Step::Type(vec![b'p'; 5000]),
+        helper(11, 1, Decision::Unarmed),
+        Step::Editor(11),
+        Step::Raw(true),
+    ];
+    steps.extend((0..450).map(|_| Step::Type(mouse.to_vec())));
+    steps.push(Step::Type(b":wq\r".to_vec()));
+    steps.extend([
+        Step::Type(vec![b'a'; 3000]),
+        Step::Raw(false),
+        Step::Type(vec![b'b'; 3000]),
+    ]);
+    let what = "a terminal editor";
+    let model = run(Agent::Claude, b"", false, &steps, what).await;
+    let typed: Vec<u8> = steps
+        .iter()
+        .filter_map(|step| match step {
+            Step::Type(bytes) => Some(bytes.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(
+        model.expected,
+        [&[CTRL_G][..], &typed].concat(),
+        "{what}: everything typed has gone while the editor runs, the closing keys among it"
+    );
+    steps.extend([Step::Report(11, Report::Done(Tree::Clean)), Step::Exit(11)]);
+    let model = run(Agent::Claude, b"", false, &steps, what).await;
+    assert_eq!(
+        model.expected,
+        [&[CTRL_G][..], &typed].concat(),
+        "{what}: everything typed, once, in order"
+    );
+}
+
+/// Scenario: On Claude, the deck's check writes its Ctrl+G and a person pastes a letter and then non-ASCII text (two-, three- and four-byte characters) with no line break, past what a cooked line keeps, held behind it; the helper decides `Armed`, or `Unarmed` with the person's editor running. The release stops before the line reaches 4095 bytes at a character boundary, never between a character's bytes, and the rest goes once Claude is back or the helper has exited. Everything typed reaches the pane once, in order (Q160b, revact29's finding 4).
+#[spec("inbox/probe/010")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_010_the_line_limit_never_splits_a_character() {
+    for character in ["\u{e9}", "\u{20ac}", "\u{1f600}"] {
+        let typed = ["a", &character.repeat(5000 / character.len())].concat();
+        let typed = typed.into_bytes();
+        for decision in [Decision::Armed, Decision::Unarmed] {
+            let what = format!("{character} behind {decision:?}");
+            let mut decided = vec![Step::Type(typed.clone()), helper(11, 1, decision)];
+            let after = if decision == Decision::Armed {
+                vec![Step::Out(OFF), Step::Out(ON), Step::Exit(11)]
+            } else {
+                decided.push(Step::Editor(11));
+                vec![Step::Report(11, Report::Done(Tree::Clean)), Step::Exit(11)]
+            };
+            let model = run(Agent::Claude, b"", false, &decided, &what).await;
+            let released = &model.expected[1..];
+            assert_eq!(
+                released.len(),
+                COOKED_LINE - 2,
+                "{what}: the decision stops before the character that wouldn't fit"
+            );
+            assert!(
+                std::str::from_utf8(released).is_ok(),
+                "{what}: what the decision lets go ends at a character boundary"
+            );
+            let mut steps = decided;
+            steps.extend(after);
+            let model = run(Agent::Claude, b"", false, &steps, &what).await;
+            assert_eq!(
+                model.expected,
+                [&[CTRL_G][..], &typed].concat(),
+                "{what}: everything typed, once, in order"
+            );
+        }
     }
 }
 
