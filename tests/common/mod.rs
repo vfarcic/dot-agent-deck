@@ -7513,8 +7513,10 @@ const CODEX_PREFLIGHT_BASE: Duration = Duration::from_secs(60);
 /// Run one preflight `codex` call to completion or to `deadline`, killing it
 /// there. Output goes to a FILE rather than pipes for the reason
 /// [`opencode_model_probe`] gives. Returns the exit status, or `None` when the
-/// deadline killed it, with stdout and stderr together.
-fn run_codex_preflight(
+/// deadline killed it, with stdout and stderr together. Public so a test file's
+/// own Codex preflight (`codex_live_001`'s sandbox probe) gets the same bounded,
+/// kill-only-this-child wait without a sleep of its own (linkage-check rule 5).
+pub fn run_codex_preflight(
     command: &mut std::process::Command,
     deadline: Instant,
 ) -> Result<(Option<std::process::ExitStatus>, String), String> {
