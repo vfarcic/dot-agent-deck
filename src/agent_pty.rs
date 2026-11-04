@@ -5159,6 +5159,12 @@ pub struct PaneWriter {
     /// planner would cut the answer and before the gate takes it.
     #[cfg(test)]
     answer_decided: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// PRD #1666 part 3 (Q160b): whether the pane's terminal is canonical
+    /// now ([`crate::doorbell_generation::GenerationDoorbell::canonical`]),
+    /// which the release driver reads behind a check's `Unarmed` editor;
+    /// `None` when it can't be read, or with no doorbell.
+    #[cfg(target_os = "linux")]
+    canonical: Box<dyn Fn() -> Option<bool> + Send + Sync>,
 }
 
 impl PaneWriter {
@@ -5171,6 +5177,11 @@ impl PaneWriter {
         doorbell: Option<Arc<crate::doorbell_generation::GenerationDoorbell>>,
         input: Arc<crate::composer_probe::epoch::GenerationInput>,
     ) -> Self {
+        #[cfg(target_os = "linux")]
+        let canonical: Box<dyn Fn() -> Option<bool> + Send + Sync> = match doorbell.clone() {
+            Some(doorbell) => Box::new(move || doorbell.canonical()),
+            None => Box::new(|| None),
+        };
         let pty = PtyWriterThread::spawn(
             inner,
             InputRecorder {
@@ -5198,7 +5209,16 @@ impl PaneWriter {
             mid_pass: Mutex::new(None),
             #[cfg(test)]
             answer_decided: Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            canonical,
         }
+    }
+
+    /// Test-only (Q160b): read the pane's terminal mode from `canonical`
+    /// instead of the PTY master.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn set_canonical(&mut self, canonical: Box<dyn Fn() -> Option<bool> + Send + Sync>) {
+        self.canonical = canonical;
     }
 
     /// Test-only: run `hook` once in the next [`Self::write_answer`],

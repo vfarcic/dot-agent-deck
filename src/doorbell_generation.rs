@@ -249,6 +249,23 @@ impl GenerationDoorbell {
         }
     }
 
+    /// PRD #1666 part 3 (Q160b, revact29 finding 1): whether the pane's
+    /// terminal is canonical (`ICANON` set) now, read from the deck's own
+    /// PTY master. A pty has one termios, so the master reads what the
+    /// slave's last `tcsetattr` set: Claude Code's cooked mode while it runs
+    /// an editor, or the raw mode a terminal editor it ran took
+    /// (`master_canonical_reads_the_slaves_termios` checks it on a real
+    /// pty). `None` for a wrapped pane, whose master is the wrapper's, with
+    /// no master, or when the read fails.
+    #[cfg(target_os = "linux")]
+    pub fn canonical(&self) -> Option<bool> {
+        use std::os::fd::AsRawFd;
+        if self.wrapped {
+            return None;
+        }
+        master_canonical(self.master.as_ref()?.as_raw_fd())
+    }
+
     /// An unwrapped generation's first Clean frame showing the empty ready
     /// composer, at `now_ns`: the settle anchor, set once.
     pub fn note_ready_frame(&self, now_ns: u64) {
@@ -292,6 +309,19 @@ impl GenerationDoorbell {
     pub fn admitted(&self) {
         self.first_admitted.store(true, Ordering::Release);
     }
+}
+
+/// Whether the terminal behind PTY descriptor `fd` is canonical: its
+/// termios has `ICANON` set. `None` when the read fails.
+#[cfg(target_os = "linux")]
+fn master_canonical(fd: std::os::fd::RawFd) -> Option<bool> {
+    // SAFETY: zeroed `termios` is a valid out-parameter, and the caller
+    // holds the descriptor open for the call.
+    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 {
+        return None;
+    }
+    Some(termios.c_lflag & libc::ICANON != 0)
 }
 
 #[cfg(unix)]
@@ -393,6 +423,65 @@ mod tests {
             None,
         );
         assert_eq!(unwrapped.unwrapped_mode(), Err("input_mode_unverified"));
+    }
+
+    /// Q160b: the release driver reads Claude's terminal mode from the
+    /// deck's PTY master, so this pins, on a real pty, that the master's
+    /// `tcgetattr` reads what the slave's `tcsetattr` set, raw and cooked,
+    /// through the generation's duplicate of the master; a wrapped pane's
+    /// master and a missing one read nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn master_canonical_reads_the_slaves_termios() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let (mut master, mut slave) = (-1, -1);
+        // SAFETY: out-parameters for two descriptors, no name, termios or
+        // window size asked for.
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(opened, 0, "openpty");
+        // SAFETY: both descriptors were just opened and are owned here.
+        let (master, slave) =
+            unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+        let set_canonical = |on: bool| {
+            // SAFETY: as in `master_canonical`, on the slave held above.
+            let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut termios) },
+                0
+            );
+            if on {
+                termios.c_lflag |= libc::ICANON;
+            } else {
+                termios.c_lflag &= !libc::ICANON;
+            }
+            assert_eq!(
+                unsafe { libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &termios) },
+                0
+            );
+        };
+        let generation = GenerationDoorbell::new(false, Some(master.as_raw_fd()));
+        let wrapped = GenerationDoorbell::new(true, Some(master.as_raw_fd()));
+        drop(master);
+        set_canonical(true);
+        assert_eq!(generation.canonical(), Some(true), "a cooked slave");
+        set_canonical(false);
+        assert_eq!(generation.canonical(), Some(false), "a raw slave");
+        set_canonical(true);
+        assert_eq!(generation.canonical(), Some(true), "cooked again");
+        assert_eq!(wrapped.canonical(), None, "a wrapper's master");
+        assert_eq!(
+            GenerationDoorbell::new(false, None).canonical(),
+            None,
+            "no master"
+        );
     }
 
     #[test]

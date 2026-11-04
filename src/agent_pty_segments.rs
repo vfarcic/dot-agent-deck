@@ -118,7 +118,9 @@ use crate::composer_probe::framing::Framing;
 #[cfg(target_os = "linux")]
 use crate::composer_probe::gate::{Cutting, Measure};
 #[cfg(target_os = "linux")]
-use crate::composer_probe::segments::{COOKED_LINE, Front, Stop, cooked_line_after, line_end};
+use crate::composer_probe::segments::{
+    COOKED_LINE, Front, Stop, cooked_line_after, line_end, utf8_width,
+};
 #[cfg(target_os = "linux")]
 use std::cell::Cell;
 
@@ -238,10 +240,13 @@ impl UserFrame {
     /// `carry`), and before its candidate when it holds one. With `stop`
     /// (Q147b, Q151b), also before its first key that stop names
     /// ([`Self::stop_key`]), which then stops the release as a candidate
-    /// does. With `line` (Q152b, for [`Stop::Cooked`] and [`Stop::Signal`]: the bytes of a
+    /// does. With `line` (Q152b, for [`Stop::Cooked`], and for
+    /// [`Stop::Signal`] while the terminal is canonical: the bytes of a
     /// line with no end in Claude's cooked terminal, counting the frames
     /// measured before this one), also before the byte that would make that
-    /// line [`COOKED_LINE`] long, which stops the release the same way.
+    /// line [`COOKED_LINE`] long, or before a UTF-8 lead byte whose whole
+    /// character would (Q160b, [`utf8_width`]), which stops the release the
+    /// same way.
     fn measure(
         &self,
         carry: &mut Option<Framing>,
@@ -264,7 +269,7 @@ impl UserFrame {
             }
             if let Some(n) = run {
                 let next = if line_end(byte) { 0 } else { n + 1 };
-                if next >= COOKED_LINE {
+                if next + utf8_width(byte) > COOKED_LINE {
                     full = true;
                     break;
                 }
@@ -490,9 +495,17 @@ impl PaneWriter {
         // Q152b: into Claude's terminal out of raw mode (`Cooked`,
         // `Signal`), the front's number and the line with no end its release
         // has left there, read with the authority; such a front with none
-        // releases nothing.
+        // releases nothing. Q160b (revact29 finding 1): behind `Signal`, the
+        // limit holds only while the terminal reads canonical; a pass that
+        // reads it raw, or can't read it, applies none and leaves the line
+        // empty, since a terminal editor in raw mode reads everything and
+        // what it hasn't read is a line of its own once the terminal is
+        // canonical again. Counting through a terminal editor's raw mode
+        // would hold its own keys, `:wq` and its Enter among them, until the
+        // helper's exit, which then never comes.
         let cooked: Cell<Option<(u64, usize)>> = Cell::new(None);
         let line: Cell<Option<usize>> = Cell::new(None);
+        let unlimited = Cell::new(false);
         let frames = self.gate.gate.release_until_if(
             || {
                 if input.segments_release() != Some((front, stop)) {
@@ -502,7 +515,13 @@ impl PaneWriter {
                     return true;
                 }
                 cooked.set(input.segments_cooked_line());
-                line.set(cooked.get().map(|(_, run)| run));
+                unlimited.set(stop == Stop::Signal && (self.canonical)() != Some(true));
+                line.set(
+                    cooked
+                        .get()
+                        .filter(|_| !unlimited.get())
+                        .map(|(_, run)| run),
+                );
                 cooked.get().is_some()
             },
             |frame| frame.measure(&mut carry, stop, &line),
@@ -514,13 +533,17 @@ impl PaneWriter {
             front == Front::None,
         );
         let mut submitted = 0;
-        let mut run = cooked.get();
+        let mut run = cooked
+            .get()
+            .map(|(number, n)| (number, if unlimited.get() { 0 } else { n }));
         for frame in frames {
             if self.exited.load(Ordering::SeqCst) {
                 frame.refuse_accepted("exited");
                 in_flight.leave();
             } else {
-                if let Some((_, n)) = run.as_mut() {
+                if let Some((_, n)) = run.as_mut()
+                    && !unlimited.get()
+                {
                     *n = cooked_line_after(*n, &frame.bytes);
                 }
                 self.pty.submit_released(frame, Arc::clone(&self.exited));
@@ -565,10 +588,13 @@ impl PaneWriter {
 
     /// Q151b: behind a probe's `Unarmed` release, whose helper runs the
     /// person's editor while Claude is out of raw mode
-    /// ([`Stop::Signal`]), refuse the held op holding the first Ctrl+C,
-    /// Ctrl+\ or Ctrl+Z and every op held after it, when that key is the
-    /// first thing the release stopped at (a Ctrl+G before it is
-    /// [`Self::refuse_stranded`]'s, or waits). Refusals take whole ops, so
+    /// ([`Stop::Signal`]), refuse the first held op that holds a Ctrl+C,
+    /// Ctrl+\ or Ctrl+Z or a Ctrl+G candidate, when it holds such a signal
+    /// key, and every op held after it (when it holds only a Ctrl+G, that
+    /// is [`Self::refuse_stranded`]'s, or waits). The release may have
+    /// stopped before that op, at the line limit ([`COOKED_LINE`]): the ops
+    /// it stopped in and after, up to the refused one, stay held for a
+    /// later release (revact29 finding 6). Refusals take whole ops, so
     /// what comes before the key in its op is refused with it unless an
     /// earlier pass's release already let it go: an op accepted between
     /// this pass's release and this refusal, `ab\x03` say, is refused whole

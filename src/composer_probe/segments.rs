@@ -237,16 +237,35 @@ pub fn signal_key(byte: u8) -> bool {
 /// bytes, and while it holds no complete line it keeps room for one line
 /// end: bytes past the first 4095 are dropped or overwrite the last. So a
 /// release into such a terminal ([`Stop::Cooked`], and [`Stop::Signal`]
-/// behind a probe's `Unarmed` release) stops before the bytes it has
-/// written there since the front's first release, with no [`line_end`]
-/// after them, reach this many, and the rest waits with everything after
-/// it: for Claude's return (E1) behind `Cooked`, for the helper's drained
-/// exit behind `Signal`. The count spans release passes, since nothing
-/// drains the buffer while Claude is blocked in its editor spawn, and
-/// counting what a terminal editor has already read can only stop
-/// earlier. A single-line paste longer than this, held through a check,
-/// reaches Claude whole.
+/// behind a probe's `Unarmed` release while the terminal is canonical)
+/// stops before the bytes it has written there since the front's first
+/// release, with no [`line_end`] after them, reach this many, or before a
+/// UTF-8 lead byte whose whole character would reach it ([`utf8_width`],
+/// Q160b), and the rest waits with everything after it: for Claude's
+/// return (E1) behind `Cooked`, for the helper's drained exit (or the
+/// terminal going raw) behind `Signal`. The count spans release passes,
+/// since nothing drains the buffer while Claude is blocked in its editor
+/// spawn. Behind `Signal` a pass that reads the terminal raw (a terminal
+/// editor the check opened took it) applies no limit and starts the count
+/// afresh (Q160b, revact29 finding 1): a raw reader takes what it is given,
+/// and what it hasn't read when the terminal goes canonical again is a
+/// line of its own there. A single-line paste longer than this, held
+/// through a check, reaches Claude whole.
 pub const COOKED_LINE: usize = 4095;
+
+/// Q160b (revact29 finding 4): how many bytes the UTF-8 character `byte`
+/// leads takes; 1 for any other byte. The line limit stops before a lead
+/// byte whose whole character wouldn't fit, so it never falls between a
+/// well-formed character's bytes ([`Framing`](super::framing::Framing)
+/// reads every byte at or above `0x80` as ground).
+pub fn utf8_width(byte: u8) -> usize {
+    match byte {
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf7 => 4,
+        _ => 1,
+    }
+}
 
 /// Q152b: a byte that ends a line in Claude's terminal while it is out of
 /// raw mode: a line feed, and Enter's carriage return, which Claude's
@@ -283,9 +302,10 @@ pub enum Stop {
     /// bytes with no end.
     Cooked,
     /// Q151b: also at the first held [`signal_key`], which is refused with
-    /// everything held after it; and, Q152b, before the line it leaves in
-    /// the terminal reaches [`COOKED_LINE`] bytes with no end, which waits
-    /// for the helper's drained exit.
+    /// everything held after it; and, Q152b, while the terminal is
+    /// canonical (Q160b), before the line it leaves there reaches
+    /// [`COOKED_LINE`] bytes with no end, which waits for the helper's
+    /// drained exit or for the terminal going raw.
     Signal,
 }
 
@@ -960,8 +980,11 @@ impl Segments {
     /// held after it: every segment waiting behind the front ends
     /// [`Outcome::Refused`], and the front stays. Whether it does, so the
     /// caller may refuse what the gate holds from that key on. The caller
-    /// refuses only when that key is the first thing a release stops at, so
-    /// every `HumanG` waiting here is one of the ops refused.
+    /// refuses from the first held op holding a signal key or a Ctrl+G
+    /// candidate, and only when that op holds a signal key, so every
+    /// `HumanG` waiting here, whose trigger is a held candidate, is one of
+    /// the ops refused; a release may have stopped earlier, at the line
+    /// limit (revact29 finding 6).
     pub fn refuse_signal_behind(&mut self, records: &Records) -> bool {
         if self.front_stop(records) != Stop::Signal {
             return false;

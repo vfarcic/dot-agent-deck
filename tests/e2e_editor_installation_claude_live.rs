@@ -68,7 +68,12 @@ impl Saved {
 }
 
 /// Submit `prompt` as the person, then wait for `file` and for the turn to
-/// end. The file's JSON.
+/// end. The file's JSON. The prompt is submitted with the harness's
+/// `submit_claude_prompt` (revact29 finding 5: an Enter typed straight after
+/// the prompt was once left unsubmitted in the box on 2.1.318), which waits
+/// for the prompt to render before Enter and confirms Claude Code's
+/// `UserPromptSubmit` carried it; its probe is the label `file` names
+/// (`envprobe-<label>.json`), which every prompt here passes to the script.
 fn tool_run(claude: &Installed, prompt: &str, file: &str) -> Value {
     assert!(
         common::wait_until(BUDGET, || claude.record()["live"]["status"] == "Idle"
@@ -76,8 +81,14 @@ fn tool_run(claude: &Installed, prompt: &str, file: &str) -> Value {
         "Claude Code must be ready for the prompt; {}",
         claude.evidence()
     );
-    claude.deck.send_keys(prompt.as_bytes());
-    claude.deck.send_keys(b"\r");
+    let label = file
+        .strip_prefix("envprobe-")
+        .and_then(|rest| rest.strip_suffix(".json"))
+        .expect("an envprobe-<label>.json file");
+    let events = claude.deck.subscribe_events();
+    claude
+        .deck
+        .submit_claude_prompt(&events, &claude.pane.agent, prompt, label);
     let path = claude.deck.workdir().join(file);
     assert!(
         common::wait_until(BUDGET, || std::fs::read(&path)
