@@ -105,6 +105,50 @@ pub struct Fixture {
     _daemon_bin: tempfile::TempDir,
     /// A Codex pane's own `PATH` and `hooks/list` answer (Q129b item 0).
     codex_pane: Option<CodexPaneEnv>,
+    launcher: Option<Launcher>,
+    hosted: Option<Hosted>,
+}
+
+/// Test-owned launcher histories; these change processes, never daemon state.
+#[derive(Clone, Copy)]
+pub struct Launcher {
+    pub mode: &'static str,
+    pub declared: bool,
+    pub lookalike: bool,
+    pub pins: NativePins,
+}
+
+#[derive(Clone, Copy)]
+pub enum NativePins {
+    Both,
+    Neither,
+    OtherOnly,
+}
+
+/// Q35-22's interpreter-hosted installs: what the pane's interpreter-hosted
+/// entrypoint (`discovery_npm_entry.py`) hands its process to before it
+/// spawns the native agent.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Hosted {
+    /// The npm shape itself: the script the spawn PATH names, under the
+    /// interpreter its shebang names.
+    Genuine,
+    /// A byte-identical copy of that script, at another path, under the same
+    /// interpreter.
+    OtherScript,
+    /// The same script under another interpreter: a copy of the same
+    /// `python3` at another inode.
+    OtherInterpreter,
+}
+
+impl Hosted {
+    fn variant(self) -> &'static str {
+        match self {
+            Self::Genuine => "genuine",
+            Self::OtherScript => "other-script",
+            Self::OtherInterpreter => "other-interpreter",
+        }
+    }
 }
 
 /// What a Codex pane is spawned with beyond the common environment: the
@@ -174,15 +218,42 @@ impl Fixture {
     }
 
     pub fn with_env(kind: &'static str, extra: &[(&str, &str)]) -> Self {
-        Self::configured(kind, extra, true)
+        Self::configured(kind, extra, true, None, None)
     }
 
     /// Production Absent control: no editor-probe assumption or binding seam.
     pub fn absent(kind: &'static str, extra: &[(&str, &str)]) -> Self {
-        Self::configured(kind, extra, false)
+        Self::configured(kind, extra, false, None, None)
     }
 
-    fn configured(kind: &'static str, extra: &[(&str, &str)], assumed: bool) -> Self {
+    pub fn launcher(kind: &'static str, launcher: Launcher, extra: &[(&str, &str)]) -> Self {
+        Self::configured(kind, extra, true, Some(launcher), None)
+    }
+
+    /// An npm-shaped install (Q35-22's interpreter-hosted rule): the pane
+    /// starts `kind` by bare name, and the PATH it is spawned with resolves
+    /// that name only to a symlink to an interpreter-hosted script
+    /// (`#!/usr/bin/env python3`, standing in for npm Codex's
+    /// `#!/usr/bin/env node`), which spawns the native agent, kept off that
+    /// PATH, as its child. Declared, so the pane is its agent's direct class,
+    /// and delayed until [`Self::launch`] like a launcher history.
+    pub fn interpreter_hosted(kind: &'static str, hosted: Hosted, extra: &[(&str, &str)]) -> Self {
+        let launcher = Launcher {
+            mode: "spawn",
+            declared: true,
+            lookalike: false,
+            pins: NativePins::Both,
+        };
+        Self::configured(kind, extra, true, Some(launcher), Some(hosted))
+    }
+
+    fn configured(
+        kind: &'static str,
+        extra: &[(&str, &str)],
+        assumed: bool,
+        launcher: Option<Launcher>,
+        hosted: Option<Hosted>,
+    ) -> Self {
         let mut env = vec![("DOT_AGENT_DECK_DOORBELL_TICK_MS", "25")];
         if assumed {
             env.push((
@@ -240,8 +311,14 @@ impl Fixture {
         // every check of a Codex pane was refused `Keymap(Changed)` there,
         // while the same tests passed on GitHub Actions and RWX.
         let daemon_bin = common::harness_tempdir().expect("daemon PATH dir");
+        // A launcher history's daemon gets the fixture-only `/usr/bin:/bin`
+        // (S-22), which this machine's agents are not in.
         let daemon_path = path_without_codex(
-            &common::contain_path(&std::env::var("PATH").unwrap_or_default()),
+            &if launcher.is_some() {
+                "/usr/bin:/bin".to_owned()
+            } else {
+                common::contain_path(&std::env::var("PATH").unwrap_or_default())
+            },
             daemon_bin.path(),
         );
         env.push(("PATH", &daemon_path));
@@ -264,6 +341,27 @@ impl Fixture {
         let exe = native.join(kind);
         fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
         fs::set_permissions(&exe, fs::Permissions::from_mode(0o700)).unwrap();
+        if launcher.is_some() {
+            executable(
+                &native.join("launcher"),
+                include_str!("discovery_launcher.py"),
+            );
+            let fake = native.join("lookalike").join(kind);
+            fs::create_dir(fake.parent().unwrap()).unwrap();
+            // Same bytes, name and claimed argv; a different kernel executable.
+            fs::copy(&exe, &fake).unwrap();
+            fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+            // An undeclared wrapper may claim either agent through its hook.
+            // Give the saved launch PATH independent native identities for both.
+            let other = native.join(if kind == "codex" { "claude" } else { "codex" });
+            fs::copy(&exe, &other).unwrap();
+            fs::set_permissions(&other, fs::Permissions::from_mode(0o700)).unwrap();
+            let pins = native.join("spawn-pins");
+            fs::create_dir(&pins).unwrap();
+            if launcher.is_some_and(|l| matches!(l.pins, NativePins::OtherOnly)) {
+                fs::hard_link(&other, pins.join(other.file_name().unwrap())).unwrap();
+            }
+        }
         let composer = checked_replace(
             include_str!("composer_external_edit.py"),
             "# M31: keys unread by an editor during suspension disappear.",
@@ -312,6 +410,35 @@ impl Fixture {
         );
         executable(&native.join("editor"), &editor);
         executable(&native.join("broker"), BROKER);
+        if launcher.is_some() {
+            for name in [
+                "composer.py",
+                "composer_external_edit.py",
+                "editor",
+                "broker",
+            ] {
+                fs::copy(native.join(name), native.join("lookalike").join(name)).unwrap();
+            }
+        }
+        if hosted.is_some() {
+            // npm's layout: `bin/<kind>` is a symlink to the package's
+            // entrypoint script; the native agent is `native/<kind>`, beside
+            // the package and off the spawn PATH.
+            let package = native.join("npm");
+            for dir in ["bin", "lib", "other"] {
+                fs::create_dir_all(package.join(dir)).unwrap();
+            }
+            let entry = include_str!("discovery_npm_entry.py");
+            executable(&package.join("lib").join("entry.py"), entry);
+            executable(&package.join("other").join("entry.py"), entry);
+            std::os::unix::fs::symlink("../lib/entry.py", package.join("bin").join(kind)).unwrap();
+            // What `/usr/bin/env python3` runs on the spawn PATH, copied to
+            // another inode for the other-interpreter control.
+            let python = fs::canonicalize("/usr/bin/python3").expect("the hosts' /usr/bin/python3");
+            let copy = package.join("other").join("python3");
+            fs::copy(&python, &copy).unwrap();
+            fs::set_permissions(&copy, fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let mut f = Self {
             daemon,
             base: PathBuf::new(),
@@ -325,6 +452,8 @@ impl Fixture {
             _codex_bin: codex_bin,
             _daemon_bin: daemon_bin,
             codex_pane: codex_pane_env,
+            launcher,
+            hosted,
         };
         f.spawn("first", false);
         f
@@ -359,15 +488,78 @@ impl Fixture {
         ]);
         if let Some(pane) = &self.codex_pane {
             let env = env.as_array_mut().unwrap();
-            env.push(json!(["PATH", pane.path]));
+            // A launcher history sets the pane's `PATH` itself, below.
+            if self.launcher.is_none() {
+                env.push(json!(["PATH", pane.path]));
+            }
             env.push(json!(["CODEX_HOOK_LIST_RESPONSE", pane.hook_list]));
         }
-        let request = json!({
-        "op":"start-agent", "command":format!("{} --live-segments-fixture",quote(&self.exe)), "cwd":self.daemon.home,
+        let command = if self.hosted.is_some() {
+            format!("{} --live-segments-fixture", self.kind)
+        } else if self.launcher.is_some() {
+            format!(
+                "{} --discovery-fixture",
+                quote(&self.exe.parent().unwrap().join("launcher"))
+            )
+        } else {
+            format!("{} --live-segments-fixture", quote(&self.exe))
+        };
+        let mut request = json!({
+        "op":"start-agent", "command":command, "cwd":self.daemon.home,
             "rows":40,"cols":140,"display_name":"segment-fixture",
             "agent_type":if self.kind == "codex" {"codex"} else {"claude_code"},
             "env":env,
         });
+        if let Some(launcher) = self.launcher {
+            if !launcher.declared {
+                request.as_object_mut().unwrap().remove("agent_type");
+            }
+            let env = request["env"].as_array_mut().unwrap();
+            let path_dir = if self.hosted.is_some() {
+                self.exe.parent().unwrap().join("npm").join("bin")
+            } else if matches!(launcher.pins, NativePins::Both) {
+                self.exe.parent().unwrap().to_owned()
+            } else {
+                self.exe.parent().unwrap().join("spawn-pins")
+            };
+            let spawn_path = format!("{}:/usr/bin:/bin", path_dir.display());
+            if !matches!(launcher.pins, NativePins::Both) {
+                for name in ["claude", "codex"] {
+                    let resolved = std::env::split_paths(&spawn_path).find_map(|dir| {
+                        let candidate = dir.join(name);
+                        candidate.is_file().then_some(candidate)
+                    });
+                    if name != self.kind && matches!(launcher.pins, NativePins::OtherOnly) {
+                        assert_eq!(
+                            resolved,
+                            Some(path_dir.join(name)),
+                            "only the other pin exists"
+                        );
+                    } else {
+                        assert_eq!(resolved, None, "spawn PATH must lack native name {name}");
+                    }
+                }
+            }
+            env.extend([
+                json!(["DAD_DISCOVERY_LAUNCH", launcher.mode]),
+                json!([
+                    "DAD_DISCOVERY_LOOKALIKE",
+                    if launcher.lookalike { "1" } else { "0" }
+                ]),
+                json!([
+                    "DAD_DISCOVERY_ABSOLUTE",
+                    if matches!(launcher.pins, NativePins::Both) {
+                        "0"
+                    } else {
+                        "1"
+                    }
+                ]),
+                json!(["PATH", spawn_path]),
+            ]);
+            if let Some(hosted) = self.hosted {
+                env.push(json!(["DAD_HOSTED_VARIANT", hosted.variant()]));
+            }
+        }
         let duplicate = format!("Duplicate pane id: {PANE}");
         let deadline = std::time::Instant::now() + WAIT;
         let reply = loop {
@@ -382,12 +574,44 @@ impl Fixture {
         };
         assert_eq!(reply["ok"], true, "native synthetic spawn: {reply}");
         self.agent = reply["id"].as_str().unwrap().into();
-        let ready = read_json(&self.path("ready"));
+        let ready = read_json(&self.path(if self.launcher.is_some() {
+            "launcher-ready"
+        } else {
+            "ready"
+        }));
         self.generation = ready["generation"]
             .as_u64()
             .expect("installed synthetic generation");
         self.instance = PathBuf::from(ready["instance"].as_str().unwrap());
-        assert_eq!(ready["exe"], json!(self.exe), "native exec acknowledgement");
+        if self.launcher.is_none() {
+            assert_eq!(ready["exe"], json!(self.exe), "native exec acknowledgement");
+            self.wait_screen();
+        }
+    }
+
+    pub fn launch(&self) -> Value {
+        self.flag("launch-go");
+        let ready = read_json(&self.path("ready"));
+        let expected = if self.launcher.is_some_and(|l| l.lookalike) {
+            self.exe.parent().unwrap().join("lookalike").join(self.kind)
+        } else {
+            self.exe.clone()
+        };
+        assert_eq!(ready["exe"], json!(expected), "native exec acknowledgement");
+        assert_eq!(ready["generation"], self.generation);
+        self.wait_screen();
+        ready
+    }
+
+    pub fn instance(&self) -> &Path {
+        &self.instance
+    }
+
+    pub fn native_executable(&self) -> &Path {
+        &self.exe
+    }
+
+    fn wait_screen(&self) {
         assert!(
             common::wait_until(common::child_boot_budget(), || {
                 let screen = common::pane_snapshot_on(&self.daemon.attach_socket, &self.agent);
@@ -403,7 +627,8 @@ impl Fixture {
                         "Claude Code"
                     })
             }),
-            "F2 screen must be visible before any probe assertion"
+            "F2 screen must be visible before any probe assertion: {}",
+            self.screen()
         );
     }
 
@@ -612,10 +837,14 @@ impl Fixture {
         HelperPause(writer)
     }
     pub fn replace(&mut self) {
+        self.replace_observing_retirement(|_| {});
+    }
+    pub fn replace_observing_retirement(&mut self, retired: impl FnOnce(&Self)) {
         self.flag("editor-go");
         self.flag("helper-go");
         let stopped = inbox::attach(&self.daemon, json!({"op":"stop-agent","id":self.agent}));
         assert_eq!(stopped["ok"], true, "stop fixture generation: {stopped}");
+        retired(self);
         self.spawn("successor", true);
     }
     pub fn snapshot(&self) -> Value {
@@ -643,6 +872,9 @@ impl Fixture {
         r["id"].as_str().expect("queued message id").into()
     }
     pub fn hook_event(&self, event: &str) {
+        self.hook_event_as(event, self.kind);
+    }
+    pub fn hook_event_as(&self, event: &str, claimed_kind: &str) {
         let pid = read_json(&self.path("ready"))["pid"].as_u64().unwrap();
         let initial = fs::read(format!("/proc/{pid}/environ")).unwrap();
         let token = initial
@@ -650,12 +882,12 @@ impl Fixture {
             .find_map(|e| e.strip_prefix(b"DOT_AGENT_DECK_PANE_CAPABILITY="))
             .map(|v| std::str::from_utf8(v).unwrap())
             .expect("own native fixture capability");
-        let session = if self.kind == "codex" {
+        let session = if claimed_kind == "codex" {
             format!("{}-session", self.agent)
         } else {
             format!("segment-session-{}", self.generation)
         };
-        let request = json!({"session_id":session,"pane_id":PANE,"agent_id":self.agent,"token":token,"deck_build":"","event_type":event,"agent_type":if self.kind=="codex" {"codex"} else {"claude_code"},"timestamp":chrono::Utc::now(),"cwd":self.daemon.home,"metadata":{}});
+        let request = json!({"session_id":session,"pane_id":PANE,"agent_id":self.agent,"token":token,"deck_build":"","event_type":event,"agent_type":if claimed_kind=="codex" {"codex"} else {"claude_code"},"timestamp":chrono::Utc::now(),"cwd":self.daemon.home,"metadata":{}});
         let mut stream = inbox::connect(&self.daemon, &request).into_inner();
         stream.shutdown(std::net::Shutdown::Write).unwrap();
         use std::io::Read;
@@ -773,6 +1005,10 @@ impl Drop for Fixture {
             self.print_log();
         }
         for suffix in [
+            "native-stop",
+            "wrapper-stop",
+            "launch-go",
+            "reparent-go",
             "editor-go",
             "editor-publish-go",
             "helper-go",
@@ -787,6 +1023,22 @@ impl Drop for Fixture {
         }
         let root = self.daemon.home.join("probe-gate");
         let _ = fs::write(root.join("scheduled.release"), "");
+        // Release only this fixture's discovery barriers before StopAgent.
+        let root = self.daemon.home.join("discovery-gate");
+        if let Ok(entries) = fs::read_dir(root) {
+            for entry in entries.flatten() {
+                if let Some(generation) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|s| s.strip_suffix(".arrived"))
+                {
+                    let _ = fs::write(
+                        entry.path().with_file_name(format!("{generation}.release")),
+                        "",
+                    );
+                }
+            }
+        }
         let _ = common::attach_request_on(
             &self.daemon.attach_socket,
             &dot_agent_deck::daemon_protocol::AttachRequest::StopAgent {
@@ -799,6 +1051,32 @@ impl Drop for Fixture {
 /// What the `codex app-server` stand-in answers to `hooks/list`: the deck's
 /// own hooks, by the command the install wrote (as
 /// `tests/e2e_inbox_codex_doorbell.rs` and `tests/e2e_codex_status.rs` answer).
+/// The `result` of `tests/fixtures/codex-synthetic/codex`'s `hooks/list`
+/// reply to `canned` (a [`codex_hook_list_response`]): `__CODEX_HOME__`
+/// becomes `$CODEX_HOME`, and `__DECK_COMMAND__` the first hook command in
+/// that home's `hooks.json`, taken still JSON-escaped from the first line
+/// naming one, as the stand-in's `sed` takes it.
+fn stand_in_hook_list(canned: &str) -> Option<Value> {
+    let home = std::env::var("CODEX_HOME").ok()?;
+    let hooks = fs::read_to_string(Path::new(&home).join("hooks.json")).unwrap_or_default();
+    let command = hooks
+        .lines()
+        .find_map(|line| {
+            let rest = &line[line.find("\"command\"")? + "\"command\"".len()..];
+            let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+            let rest = rest.strip_prefix('"')?;
+            Some(rest[..rest.rfind('"')?].to_owned())
+        })
+        .unwrap_or_default();
+    let reply: Value = serde_json::from_str(
+        &canned
+            .replace("__CODEX_HOME__", &home)
+            .replace("__DECK_COMMAND__", &command),
+    )
+    .ok()?;
+    Some(reply["result"].clone())
+}
+
 fn codex_hook_list_response() -> String {
     let entry = |event: &str, camel: &str| {
         json!({
@@ -844,6 +1122,47 @@ pub fn native_entry() {
     };
     let base = PathBuf::from(base);
     let kind = std::env::var("DAD_LIVE_SEGMENTS_KIND").unwrap();
+    if std::env::args_os().skip(1).any(|arg| arg == "--version") {
+        println!(
+            "{}",
+            if kind == "codex" {
+                "0.164.0"
+            } else {
+                "2.1.310"
+            }
+        );
+        std::process::exit(0);
+    }
+    if std::env::args_os().skip(1).any(|arg| arg == "app-server") {
+        // The wrapper's ordinary hooks/list probe must not start another
+        // composer or overwrite the pane child's readiness acknowledgement.
+        // A Codex pane's spawn environment carries the `hooks/list` answer
+        // part 3's fixture seeds trust from (Q129b item 0), and this answers
+        // it as `tests/fixtures/codex-synthetic/codex` does, so a pane whose
+        // `codex` resolves here is trusted as one whose `codex` resolves to
+        // that stand-in. Without it, this synthetic server advertises no
+        // hook key or hash to trust.
+        use std::io::BufRead;
+        for line in std::io::stdin().lock().lines() {
+            let request: Value = serde_json::from_str(&line.unwrap()).unwrap();
+            if let Some(id) = request.get("id") {
+                let result = if request["method"] == "hooks/list" {
+                    std::env::var("CODEX_HOOK_LIST_RESPONSE")
+                        .ok()
+                        .and_then(|canned| stand_in_hook_list(&canned))
+                        .unwrap_or_else(|| json!({"hooks":[]}))
+                } else {
+                    json!({})
+                };
+                println!("{}", json!({"jsonrpc":"2.0","id":id,"result":result}));
+                std::io::stdout().flush().unwrap();
+                if request["method"] == "hooks/list" {
+                    break;
+                }
+            }
+        }
+        std::process::exit(0);
+    }
     let exe = std::env::current_exe().unwrap();
     let helper = PathBuf::from(std::env::var_os("VISUAL").unwrap());
     let generation = std::env::var("DOT_AGENT_DECK_EDITOR_GEN")
@@ -890,13 +1209,23 @@ pub fn native_entry() {
         .unwrap();
     atomic(
         &base.with_extension("ready"),
-        &json!({"pid":std::process::id(),"exe":exe,"generation":generation,"instance":helper.parent().unwrap()}),
+        &json!({"pid":std::process::id(),"exe":exe,"generation":generation,"instance":helper.parent().unwrap(),
+        "editors":{
+            "VISUAL":std::env::var("VISUAL").ok(),
+            "EDITOR":std::env::var("EDITOR").ok(),
+            "DOT_AGENT_DECK_EDITOR_GEN":std::env::var("DOT_AGENT_DECK_EDITOR_GEN").ok(),
+        }}),
     );
     let mut running: Option<Child> = None;
     let mut finished: Option<i32> = None;
     let mut invocation = 0;
     let mut parallel: Option<Child> = None;
     loop {
+        if base.with_extension("native-stop").exists() {
+            let _ = composer.kill();
+            let _ = composer.wait();
+            break;
+        }
         if let Some(child) = parallel.as_mut()
             && let Some(status) = child.try_wait().unwrap()
         {
@@ -1115,5 +1444,6 @@ pub fn native_entry() {
         let _ = child.kill();
         let _ = child.wait();
     }
+    fs::write(base.with_extension("native-stopped"), "").unwrap();
     std::process::exit(0);
 }
