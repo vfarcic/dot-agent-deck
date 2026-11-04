@@ -111,7 +111,6 @@ mod checked_delegate {
     };
     use dot_agent_deck::event::AgentType;
     use serde_json::{Value, json};
-    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     pub const CHECK_BUDGET: Duration = Duration::from_secs(180);
@@ -122,24 +121,16 @@ mod checked_delegate {
     pub const DRAFT: &str = "half-typed-draft-c4e9a1";
     const ORCHESTRATION: &str = "chain-smoke-002";
 
-    /// How the worker's Claude Code is made checkable. Until activation
-    /// (Q35-28) no production class is installed, so the run uses the `e2e`
-    /// build's editor-probe assumption on a release with a record; once
-    /// `INSTALL_ROLLOUT` holds `Direct(Claude)` the test switches by itself to
-    /// the installed `claude` with no assumption, which is what activation
-    /// must pass.
-    pub enum Mode {
-        /// The production rollout and records: the installed `claude`.
-        Activated { release: String },
-        /// The `e2e` assumption names `release`, run from `binary`.
-        Seam { release: String, binary: PathBuf },
+    /// The worker's Claude Code: the installed `claude`, at a release this
+    /// build checks. Since the Claude activation (Q35-28) the production
+    /// rollout installs `Direct(Claude)`, so no e2e assumption is set.
+    pub struct Mode {
+        release: String,
     }
 
     impl Mode {
         pub fn release(&self) -> &str {
-            match self {
-                Mode::Activated { release } | Mode::Seam { release, .. } => release,
-            }
+            &self.release
         }
     }
 
@@ -176,71 +167,30 @@ mod checked_delegate {
             .ok_or_else(|| format!("`claude --version` printed no release: {text:?}"))
     }
 
-    /// The mode this build runs in, or why it can't run here (a SKIP, which
-    /// `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` turns into a failure).
+    /// The installed release this build checks, or why it can't run here (a
+    /// SKIP, which `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` turns into a failure).
     pub fn mode() -> Result<Mode, String> {
         use dot_agent_deck::composer_probe::install::{INSTALL_ROLLOUT, PaneClass, ProbeAgent};
-        if INSTALL_ROLLOUT.contains(&PaneClass::Direct(ProbeAgent::Claude)) {
-            let release = installed_release()?;
-            return if checkable(&release) {
-                Ok(Mode::Activated { release })
-            } else {
-                Err(format!(
-                    "Claude Code {release} is installed, and this build has no Go record with \
-                     a verified editor_probe for it"
-                ))
-            };
+        if !INSTALL_ROLLOUT.contains(&PaneClass::Direct(ProbeAgent::Claude)) {
+            return Err(format!(
+                "this build installs no Direct(Claude) pane (INSTALL_ROLLOUT = {INSTALL_ROLLOUT:?})"
+            ));
         }
-        // Before activation: the newest recorded, Go Claude Code release that
-        // is installed side by side under Claude Code's versions directory.
-        let versions = Path::new(&std::env::var_os("HOME").ok_or("no HOME")?)
-            .join(".local/share/claude/versions");
-        let mut releases: Vec<semver::Version> = RELEASE_RECORDS
-            .iter()
-            .filter(|r| r.agent == AgentType::ClaudeCode)
-            .map(|r| r.release.clone())
-            .collect();
-        releases.sort();
-        releases
-            .into_iter()
-            .rev()
-            .map(|v| v.to_string())
-            .find(|r| {
-                versions.join(r).is_file()
-                    && matches!(
-                        dot_agent_deck::doorbell_activation::activation(
-                            &RELEASE_RECORDS,
-                            &AgentType::ClaudeCode,
-                            &LatchedRelease::Known(semver::Version::parse(r).unwrap()),
-                        ),
-                        Activation::Go { .. }
-                    )
-            })
-            .map(|release| Mode::Seam {
-                binary: versions.join(&release),
-                release,
-            })
-            .ok_or_else(|| {
-                format!(
-                    "no recorded Claude Code release is installed under {}",
-                    versions.display()
-                )
-            })
+        let release = installed_release()?;
+        if checkable(&release) {
+            Ok(Mode { release })
+        } else {
+            Err(format!(
+                "Claude Code {release} is installed, and this build has no Go record with \
+                 a verified editor_probe for it"
+            ))
+        }
     }
 
     /// The worker's command: a plain argv whose first word is `claude`, so
     /// the pane's class is `Direct(Claude)`.
-    pub fn worker_command(deck: &common::TuiDeck, mode: &Mode) -> String {
-        let claude = match mode {
-            Mode::Activated { .. } => "claude".to_string(),
-            Mode::Seam { binary, .. } => {
-                let dir = deck.home_dir().join("pinned");
-                std::fs::create_dir_all(&dir).unwrap();
-                std::os::unix::fs::symlink(binary, dir.join("claude")).unwrap();
-                dir.join("claude").display().to_string()
-            }
-        };
-        format!("{claude} --model {PINNED_MODEL} --allowedTools Bash Read Write")
+    pub fn worker_command() -> String {
+        format!("claude --model {PINNED_MODEL} --allowedTools Bash Read Write")
     }
 
     /// The orchestration: a scripted orchestrator that runs the real
@@ -375,19 +325,11 @@ fn claude_002_touched_box_checked_then_delegate_delivered_once() {
             return;
         }
     };
-    let assumed = match &mode {
-        Mode::Activated { .. } => None,
-        Mode::Seam { release, .. } => Some(format!("claude@{release}")),
-    };
     eprintln!(
-        "chain-smoke/claude/002: Claude Code {} {}",
-        mode.release(),
-        match &assumed {
-            Some(a) => format!("under the e2e editor-probe assumption {a}"),
-            None => "activated in production (no assumption)".to_string(),
-        }
+        "chain-smoke/claude/002: Claude Code {} activated in production (no assumption)",
+        mode.release()
     );
-    let mut builder = TuiDeck::builder()
+    let deck = TuiDeck::builder()
         .with_pty_size(180, 50)
         .with_imported_claude_credentials()
         .with_claude_trust_workdir()
@@ -396,11 +338,8 @@ fn claude_002_touched_box_checked_then_delegate_delivered_once() {
         .with_env(
             "RUST_LOG",
             "info,composer_probe=debug,dot_agent_deck::doorbell=debug",
-        );
-    if let Some(assumed) = &assumed {
-        builder = builder.with_env("DOT_AGENT_DECK_E2E_ASSUME_EDITOR_PROBE", assumed.clone());
-    }
-    let deck = builder.launch_with_fixture("minimal");
+        )
+        .launch_with_fixture("minimal");
     assert!(deck.wait_for_grid_string_within("No active agents", CHECK_BUDGET));
 
     // A per-run line, so a stale file or a second append is visible.
@@ -421,7 +360,7 @@ fn claude_002_touched_box_checked_then_delegate_delivered_once() {
         .expect("create the sentinel with O_EXCL")
         .flush()
         .unwrap();
-    let worker = worker_command(&deck, &mode);
+    let worker = worker_command();
     write_orchestration(&deck, &worker, &line);
 
     // Open the orchestration from the TUI's new-pane form, then focus the
@@ -586,7 +525,7 @@ fn claude_002_touched_box_checked_then_delegate_delivered_once() {
         evidence(&deck, &agent)
     );
     eprintln!(
-        "chain-smoke/claude/002 PASS: release={} assumed={assumed:?} task={} deliveries={}\n{}{}",
+        "chain-smoke/claude/002 PASS: release={} assumed=None task={} deliveries={}\n{}{}",
         mode.release(),
         task.id,
         task.deliveries,

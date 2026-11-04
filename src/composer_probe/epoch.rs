@@ -450,6 +450,12 @@ struct Live {
     /// When the deck may try a probe again (R2 §6.8, R5's continuing
     /// retries). Its `broken` bit is presentation only (O-20.6).
     schedule: Schedule,
+    /// The epoch the last op entering the input other than a deck job's
+    /// moved it to (a person's key, an answer, an unnamed deck write): not
+    /// an inferred edit (an unexplained pair or an external one), which can
+    /// be a probe's own round trip read before its record. Q147b's
+    /// settlement reads it.
+    last_foreign_op: u64,
     /// Each open probe: its segment number, its job, and `E0`, the epoch
     /// just before its own byte moved it (set at its enqueue).
     probes: Vec<Probe>,
@@ -789,8 +795,18 @@ impl Live {
                 }
             }
             (Some(Decision::Armed), Some(true)) if claim_mine => self.apply_empty(epoch, probe),
+            // Q147b: the read is of the box as the probe's own byte found
+            // it. An op entering the input after that byte (a person's key
+            // held behind the check, or typed after it) isn't in it, so the
+            // next check waits for nothing more: it is due at once.
+            // Otherwise it waits for the epoch to move past where it stands
+            // now, as before.
             (Some(Decision::Armed), _) => {
-                self.schedule.non_empty(now, epoch.epoch());
+                let from = match probe.e0 {
+                    Some(e0) if self.last_foreign_op > e0.saturating_add(1) => e0.saturating_add(1),
+                    _ => epoch.epoch(),
+                };
+                self.schedule.non_empty(now, from);
             }
             // R-D-U2-02: a probe whose lapse the schedule already counted
             // (`lapse_due`) was one attempt; its late failed check is that
@@ -948,6 +964,11 @@ fn plan_locked(state: &mut State, writer: Writer, bytes: &[u8], plan: Option<Pla
                 Writer::UnnamedDeck | Writer::Human | Writer::Answer => None,
             };
             let moved_to = state.epoch.record(owner);
+            if owner.is_none()
+                && let Some(live) = state.live.as_mut()
+            {
+                live.last_foreign_op = moved_to;
+            }
             tracing::debug!(
                 target: "composer_probe",
                 ?writer,
@@ -1476,6 +1497,7 @@ impl GenerationInput {
             unexplained: std::collections::VecDeque::new(),
             forgotten: None,
             schedule: Schedule::default(),
+            last_foreign_op: 0,
             probes: Vec::new(),
             reads: std::collections::VecDeque::new(),
             lapse_counted: None,
@@ -1945,6 +1967,24 @@ impl GenerationInput {
         let state = self.state.lock_recovering();
         match (state.retired, state.live.as_ref()) {
             (false, Some(live)) => Some(live.segments.front()),
+            _ => None,
+        }
+    }
+
+    /// The front segment's release as the driver acts on it: what it lets
+    /// the held input do ([`Self::segments_front`]) and whether it stops at
+    /// a line-discipline key until Claude's return
+    /// ([`Segments::front_cooked`], Q147b), read in one hold of this lock.
+    pub fn segments_release(&self) -> Option<(Front, bool)> {
+        let state = self.state.lock_recovering();
+        match (state.retired, state.live.as_ref()) {
+            (false, Some(live)) => Some((
+                live.segments.front(),
+                state
+                    .records
+                    .as_ref()
+                    .is_some_and(|records| live.segments.front_cooked(records)),
+            )),
             _ => None,
         }
     }

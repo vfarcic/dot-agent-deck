@@ -141,6 +141,18 @@ const ON: &[u8] = b"\x1b[?2004h";
 const FRAME: &[u8] = b"\x1b[?2026h";
 const CTRL_G: u8 = 0x07;
 
+/// Q147b, from the line discipline's defaults (`termios(3)`), not from the
+/// implementation: a byte a terminal out of raw mode acts on rather than
+/// queue as typed. The default control characters (Ctrl+C, Ctrl+\, Ctrl+Z,
+/// Ctrl+D, Delete, Ctrl+U, Ctrl+W, Ctrl+R, Ctrl+V, Ctrl+O, Ctrl+S, Ctrl+Q)
+/// and Enter, which `ICRNL` rewrites.
+fn line_discipline_key(byte: u8) -> bool {
+    matches!(
+        byte,
+        0x03 | 0x04 | 0x0d | 0x0f | 0x11 | 0x12 | 0x13 | 0x15 | 0x16 | 0x17 | 0x1a | 0x1c | 0x7f
+    )
+}
+
 /// What the PTY and the arm page saw, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Seen {
@@ -839,6 +851,9 @@ struct MSeg {
     e1: Watch,
     /// The release-table rows it reached ([`Stats::rows`]), once each.
     rows: Vec<Row>,
+    /// How many of the person's ops had been typed when it was written: a
+    /// probe's non-empty read is of the box before any later one (Q147b).
+    typed_mark: usize,
 }
 
 /// The release table's view of one generation.
@@ -882,6 +897,11 @@ struct Model {
     retired: bool,
     /// The probe's settlement: `None` until it settles.
     settled: Option<Settled>,
+    /// The person's ops typed so far.
+    typed: usize,
+    /// At a non-empty settlement, the next check is due at once: a person
+    /// typed after the probe's byte, so its read missed that (Q147b).
+    settled_due: bool,
     stats: Stats,
     /// The model's clock: one tick per birth or exit.
     clock: u64,
@@ -924,6 +944,9 @@ struct Stats {
     /// Held Ctrl+G presses refused, with what followed them, behind a
     /// released segment that can never complete (R-HOLD's bounded refusal).
     refused: usize,
+    /// Releases that stopped at a line-discipline key, Claude being out of
+    /// raw mode (Q147b).
+    cooked_held: usize,
     /// Each row reached, and by how many segments.
     rows: std::collections::BTreeMap<Row, usize>,
     /// Each kind of settlement reached.
@@ -938,6 +961,7 @@ impl Stats {
         self.completed += other.completed;
         self.cut_opened += other.cut_opened;
         self.refused += other.refused;
+        self.cooked_held += other.cooked_held;
         for (row, n) in &other.rows {
             *self.rows.entry(*row).or_default() += n;
         }
@@ -967,6 +991,8 @@ impl Model {
             fed: prefix as u64,
             retired: false,
             settled: None,
+            typed: 0,
+            settled_due: false,
             stats: Stats::default(),
             clock: 0,
         }
@@ -990,6 +1016,7 @@ impl Model {
             cut_off: false,
             e1: Watch::default(),
             rows: Vec::new(),
+            typed_mark: self.typed,
         });
         self.expected.push(CTRL_G);
         self.step();
@@ -998,6 +1025,9 @@ impl Model {
     fn typed(&mut self, bytes: &[u8]) {
         if self.retired {
             return;
+        }
+        if !bytes.is_empty() {
+            self.typed += 1;
         }
         let candidate = bytes.iter().position(|&b| b == CTRL_G);
         if self.fenced() {
@@ -1022,6 +1052,7 @@ impl Model {
                 cut_off: false,
                 e1: Watch::default(),
                 rows: Vec::new(),
+                typed_mark: self.typed,
             });
             self.held.extend(&bytes[at + 1..]);
             self.stats.cut_opened += 1;
@@ -1271,6 +1302,7 @@ impl Model {
                 if kind == Settled::Empty && self.parks {
                     self.parked = true;
                 } else {
+                    self.settled_due = kind == Settled::NonEmpty && self.typed > seg.typed_mark;
                     self.settled = Some(kind);
                     *self.stats.settled.entry(kind).or_default() += 1;
                 }
@@ -1312,19 +1344,43 @@ impl Model {
                     cut_off: false,
                     e1: Watch::default(),
                     rows: Vec::new(),
+                    typed_mark: self.typed,
                 });
             }
             Some(seg) if seg.released && !seg.cut_off => {
-                let upto = candidate.unwrap_or(self.held.len());
+                // Q147b: a Claude segment released on an `Armed` decision
+                // goes to a Claude whose terminal is out of raw mode until
+                // it returns (its helper drained and its `?2004h` after the
+                // trigger read): there a byte the cooked line discipline
+                // acts on (a Ctrl+C is a SIGINT, an Enter becomes a line
+                // feed, a Backspace erases) waits, with everything after
+                // it, for that return.
+                let cooked = self.agent == Agent::Claude
+                    && seg.record.is_some_and(|ri| {
+                        let r = &self.records[ri];
+                        r.decision == Some(Decision::Armed) && !(r.drained && seg.e1.on)
+                    });
+                let key = cooked
+                    .then(|| self.held.iter().position(|&b| line_discipline_key(b)))
+                    .flatten();
+                let upto = match (candidate, key) {
+                    (Some(c), Some(k)) => c.min(k),
+                    (c, k) => c.or(k).unwrap_or(self.held.len()),
+                };
                 if upto > 0 {
                     self.stats.passed += 1;
+                }
+                if key.is_some_and(|k| k == upto) {
+                    self.stats.cooked_held += 1;
                 }
                 self.expected.extend(self.held.drain(..upto));
                 // R-HOLD's bounded refusal (the user's ruling, 2026-11-03):
                 // with the scope open this segment never completes, so the
                 // Ctrl+G now first in what is held, and everything after it,
-                // is refused and never written.
-                if candidate.is_some() && self.scope_open {
+                // is refused and never written: once the release has gone
+                // up to it, which a held line-discipline key before it
+                // defers until Claude's return.
+                if candidate.is_some() && self.scope_open && !cooked {
                     self.held.clear();
                     self.stats.refused += 1;
                 }
@@ -1459,7 +1515,7 @@ fn check_as(rig: &Rig, model: &Model, settled_before: Option<Settled>, judged: J
             let retrying = rig.input.probe_retrying();
             let want = match kind {
                 Settled::Empty => (true, false),
-                Settled::NonEmpty => (false, false),
+                Settled::NonEmpty => (model.settled_due, false),
                 Settled::Failed => (false, true),
             };
             assert_eq!(
@@ -1652,7 +1708,17 @@ fn generate(rng: &mut Rng, model: &mut Model, len: usize) -> Vec<Step> {
         }
         let step = if pick < 30 {
             let n = 1 + rng.below(4) as usize;
-            let mut bytes: Vec<u8> = (0..n).map(|_| b'a' + rng.below(26) as u8).collect();
+            // Three letters stand for keys the cooked line discipline acts
+            // on (Q147b): a Ctrl+C, an Enter and a Backspace. Mapped, not
+            // drawn, so every seed's draws are what they were before.
+            let mut bytes: Vec<u8> = (0..n)
+                .map(|_| match b'a' + rng.below(26) as u8 {
+                    b'q' => 0x03,
+                    b'r' => b'\r',
+                    b'z' => 0x7f,
+                    letter => letter,
+                })
+                .collect();
             // At most one candidate per frame, and only while the gate holds
             // (a segment open or typing held) or a liability is out (the
             // cut-open path, A-20d-5): a Ctrl+G typed with nothing out is
@@ -2086,7 +2152,7 @@ fn assert_reached(reached: &Reached, floor: usize) {
     let r = &reached.stats;
     eprintln!(
         "reached: {} releases, {} passed, {} cut off, {} completions, {} triggers, \
-         {} cut-opened, {} refused, {} retirements, settled {:?}",
+         {} cut-opened, {} refused, {} line-discipline holds, {} retirements, settled {:?}",
         r.released,
         r.passed,
         r.cut_off,
@@ -2094,6 +2160,7 @@ fn assert_reached(reached: &Reached, floor: usize) {
         reached.triggers,
         r.cut_opened,
         r.refused,
+        r.cooked_held,
         reached.retired,
         r.settled
     );
@@ -2122,6 +2189,10 @@ fn assert_reached(reached: &Reached, floor: usize) {
         (
             "Ctrl+G presses refused behind a segment that can never complete",
             r.refused,
+        ),
+        (
+            "releases stopped at a line-discipline key on a Claude out of raw mode",
+            r.cooked_held,
         ),
         ("retirements", reached.retired),
     ] {
@@ -2175,6 +2246,50 @@ fn helper(pid: u32, seg: u64, decision: Decision) -> Step {
         completed: false,
         subsumed: false,
     })
+}
+
+/// Scenario: On Claude, the deck's check writes its Ctrl+G and a person types a letter and then a Ctrl+C, an Enter or a Backspace (or a letter alone) at each point of the check: before the helper is seen, after it decides `Armed`, after it exits, and after Claude's paste-mode disable but before its enable. The letter goes as the release table lets it, but the Ctrl+C, Enter or Backspace (Claude's terminal being out of raw mode until it returns) stays held until the helper has exited and Claude's enable is read, and is then written once, in order, after the letter; the check completes and settles either way, and when the typing came before its read settled, the next check is due at once (Q147b, the activation's lane-2 failure and the stuck hold behind it).
+#[spec("inbox/probe/010")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_010_a_line_discipline_key_waits_for_claudes_return() {
+    // Where the typing lands in the check's sequence: before step `at` of
+    // the helper's decision, its exit, the disable and the enable.
+    let points = [
+        "before the helper",
+        "after its decision",
+        "after its exit",
+        "after the disable",
+    ];
+    for key in [0x03u8, b'\r', 0x7f, b'y'] {
+        for (at, point) in points.iter().enumerate() {
+            let mut steps = vec![
+                helper(11, 1, Decision::Armed),
+                Step::Exit(11),
+                Step::Out(OFF),
+                Step::Out(ON),
+            ];
+            steps.insert(at, Step::Type(vec![b'x', key]));
+            // Typing after the check is the pane's at once.
+            steps.push(Step::Type(b"z\x03".to_vec()));
+            let what = format!("key {key:#04x} {point}");
+            let model = run(Agent::Claude, b"", false, &steps, &what).await;
+            assert!(model.segs.is_empty(), "{what}: the check completed");
+            assert_eq!(model.settled, Some(Settled::NonEmpty), "{what}: settled");
+            // The read settles at the helper's exit: typing before it isn't
+            // in the box the read saw, so the next check is due at once.
+            assert_eq!(model.settled_due, at < 2, "{what}: the next check due");
+            assert_eq!(
+                model.expected,
+                [&[CTRL_G, b'x', key][..], b"z\x03"].concat(),
+                "{what}: everything typed, once, in order"
+            );
+            assert_eq!(
+                model.stats.cooked_held > 0,
+                key != b'y',
+                "{what}: the model held the key for the return"
+            );
+        }
+    }
 }
 
 /// Scenario: The Q35-20 review's six traces as fixed scripts on the production driver, each judged by the release table: a return read before a probe's written report and a trigger's (R-U2-01), output that ran before the segments attached and ended inside an escape (R-U2-02), typing after a release to a running editor with nothing else moving (R-U2-03), a probe's `Armed` decision whose read never comes while its return and exit complete it (R-U2-05), and an unknown wait after a release to a running editor, with typing before and after it (R-U2-06).

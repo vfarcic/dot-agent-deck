@@ -219,14 +219,25 @@ impl UserFrame {
     /// PRD #1666 part 3 (Q35-20): how far a release may take this held
     /// frame: its last ground point, read from its own acceptance-time
     /// framing (or, for one with none, what the frame before it left in
-    /// `carry`), and before its candidate when it holds one.
-    fn measure(&self, carry: &mut Option<Framing>) -> Measure {
+    /// `carry`), and before its candidate when it holds one. With `cooked`
+    /// (Q147b), also before its first line-discipline key, which then stops
+    /// the release as a candidate does.
+    fn measure(&self, carry: &mut Option<Framing>, cooked: bool) -> Measure {
         let mut framing = self
             .framing
             .clone()
             .or_else(|| carry.take())
             .unwrap_or_default();
-        let limit = self.cut.as_ref().map_or(self.bytes.len(), |cut| cut.start);
+        let cut = self.cut.as_ref().map_or(self.bytes.len(), |cut| cut.start);
+        let key = cooked
+            .then(|| {
+                self.bytes
+                    .iter()
+                    .position(|&b| crate::composer_probe::segments::line_discipline_key(b))
+            })
+            .flatten()
+            .filter(|&at| at < cut);
+        let limit = key.unwrap_or(cut);
         let mut ground = framing.at_ground().then_some(0);
         for (i, &byte) in self.bytes.iter().enumerate() {
             if i >= limit {
@@ -240,7 +251,7 @@ impl UserFrame {
         *carry = Some(framing);
         Measure {
             ground,
-            candidate: self.cut.is_some(),
+            candidate: self.cut.is_some() || key.is_some(),
         }
     }
 
@@ -332,7 +343,8 @@ impl PaneWriter {
     /// do.
     pub(crate) fn drive_segments(&self, publish: &dyn Fn(u64)) {
         let input = Arc::clone(&self.pty.input);
-        let front = input.segments_front();
+        let release = input.segments_release();
+        let front = release.map(|(front, _)| front);
         #[cfg(test)]
         self.mid_pass();
         match front {
@@ -354,9 +366,15 @@ impl PaneWriter {
                 self.submit_trigger(number);
             }
             Some(Front::Released) => {
+                // Q147b: while Claude is out of raw mode, the release stops
+                // at a line-discipline key; a Ctrl+G behind it is refused
+                // once the release can reach it, after Claude's return.
+                let cooked = release.is_some_and(|(_, cooked)| cooked);
                 if self.gate.gate.segment_fenced() {
-                    self.release_held(Front::Released);
-                    self.refuse_stranded();
+                    self.release_held(Front::Released, cooked);
+                    if !cooked {
+                        self.refuse_stranded();
+                    }
                 }
             }
             Some(Front::None) => {
@@ -366,7 +384,7 @@ impl PaneWriter {
                 if !self.gate.gate.segment_fenced() {
                     return;
                 }
-                self.release_held(Front::None);
+                self.release_held(Front::None, false);
                 if !self.gate.gate.holds_any(|frame| frame.cut.is_some()) {
                     return;
                 }
@@ -405,13 +423,17 @@ impl PaneWriter {
     /// lock, so a fact that withdraws the release after this pass read the
     /// front (R-B-U2-02: an unknown wait's cut-off) leaves everything held.
     /// A target that exited refuses what comes back, as a release does.
-    fn release_held(&self, front: Front) -> usize {
+    /// With `cooked` (Q147b, [`crate::composer_probe::segments::Segments::front_cooked`]),
+    /// it also stops before the first held line-discipline key, under the
+    /// same re-read: a release that read the front cooked goes only while it
+    /// still is, and one that read it not cooked only while it still isn't.
+    fn release_held(&self, front: Front, cooked: bool) -> usize {
         let in_flight = &self.pty.in_flight;
         let input = &self.pty.input;
         let mut carry: Option<Framing> = None;
         let frames = self.gate.gate.release_until_if(
-            || input.segments_front() == Some(front),
-            |frame| frame.measure(&mut carry),
+            || input.segments_release() == Some((front, cooked)),
+            |frame| frame.measure(&mut carry, cooked),
             |frame, n| {
                 // One more sub-op in flight: the rest stays held.
                 in_flight.count.fetch_add(1, Ordering::SeqCst);
