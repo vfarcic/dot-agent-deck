@@ -1583,10 +1583,12 @@ fn ctrl_c_inside_check(log: &str, agent: &str) -> bool {
 }
 
 /// The milliseconds from the first check's settled decision in `log` (where
-/// a Claude release went before Q147b) to its segment's end (where a held
-/// line-discipline key goes now): the hold Q147b adds to such a key.
+/// a Claude release went before Q147b) to Claude's `?2004h` after it (E1,
+/// where a held line-discipline key goes since Q151b: the hold it adds to
+/// such a key), and to its segment's end (where Q147b sent it, which also
+/// waits for the helper's exit drain).
 #[cfg(target_os = "linux")]
-fn decision_to_return_ms(log: &str) -> Option<f64> {
+fn decision_to_return_ms(log: &str) -> Option<(Option<f64>, f64)> {
     let at = |line: &str| -> Option<f64> {
         // `2026-11-04T07:01:46.103516Z ...`: seconds of the day.
         let time = line.get(11..26)?;
@@ -1601,9 +1603,19 @@ fn decision_to_return_ms(log: &str) -> Option<f64> {
     let mut lines = log
         .lines()
         .skip_while(|l| !(l.contains("doorbell tick probe") && l.contains("outcome=Written")));
-    let settled = lines.find(|l| l.contains("probe settled"))?;
-    let ended = lines.find(|l| l.contains("segment ended") && l.contains("kind: Probe"))?;
-    Some((at(ended)? - at(settled)?) * 1000.0)
+    let settled = at(lines.find(|l| l.contains("probe settled"))?)?;
+    let after: Vec<&str> = lines.collect();
+    let ended = after
+        .iter()
+        .find(|l| l.contains("segment ended") && l.contains("kind: Probe"))?;
+    let enabled = after
+        .iter()
+        .find(|l| l.contains("return markers") && l.contains("PasteOn"))
+        .and_then(|l| at(l));
+    Some((
+        enabled.map(|e| (e - settled) * 1000.0),
+        (at(ended)? - settled) * 1000.0,
+    ))
 }
 
 /// Scenario: In a pane the deck installs its editor helper into, with real interactive Claude Code of a release whose editor probe the deck has verified, and native delivery disabled, type a letter and post a sentinel task, which a check holds behind that draft; then type a second letter, which starts another check, and press Ctrl+C the moment that check's byte is written, while Claude Code has handed its terminal to the check. Repeated, four trials to a freshly started deck, until twenty Ctrl+C presses have landed inside a check: every time Claude Code keeps running, the Ctrl+C clears the box, and the task is delivered once through the doorbell (Q147b: a Ctrl+C typed during a check had ended the session).
@@ -1706,7 +1718,7 @@ fn ctrl_c_trial(claude: &Claude, trial: usize) -> bool {
     );
     let landed = ctrl_c_inside_check(since, &claude.pane.agent);
     eprintln!(
-        "trial {trial}: Claude kept running; inside the check: {landed}; decision to return: {:?} ms",
+        "trial {trial}: Claude kept running; inside the check: {landed}; decision to Claude's return, to the segment's end: {:?} ms",
         decision_to_return_ms(since)
     );
     // As the control turn: the next native waiter, killed, so the next
