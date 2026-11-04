@@ -562,7 +562,7 @@ fn doorbell_036_claude_composer_over_real_frames() {
     assert_claude_corpus_decisions();
 }
 
-/// Scenario: Replay the history-recall captures of Claude Code 2.1.317 and 2.1.318 at 50×200 and 24×80: Up from the empty composer draws `─── History i/n` in place of the composer's upper rule over the recalled prompt, Ctrl+U on a recalled prompt returns the plain composer, and walking straight back to that cleared prompt draws a History rule over a blank box with the cursor at the indent. The profile reads no composer, no readiness and no empty box in any History-ruled frame, and the two releases draw the same rule and prompt rows after the first frame; were the label read as a rule, the blank-slot frame would be the empty ready composer.
+/// Scenario: Replay the history-recall captures of Claude Code 2.1.317 and 2.1.318 at 50×200 and 24×80: Up from the empty composer draws `─── History i/n` in place of the composer's upper rule over the recalled prompt, Ctrl+U on a recalled prompt draws the plain composer while Claude keeps its history position, and walking straight back to that cleared prompt draws a History rule over a blank box with the cursor at the indent. The profile reads no composer, no readiness and no empty box in any History-ruled frame, and the two releases draw the same rule and prompt rows after the first frame; were the label read as a rule, the blank-slot frame would be the empty ready composer.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_claude_history_recall_frames_are_refused() {
@@ -655,11 +655,14 @@ fn doorbell_036_claude_history_recall_frames_are_refused() {
                     "{release} {size} {blank}: the slot walked back to after Ctrl+U {rule:?} {row:?}"
                 );
             }
-            assert!(!at("after-ctrl-u").0.contains("History"));
-            assert!(p.empty_and_ready(&trace.grid("after-ctrl-u")));
             assert!(
-                history >= 20,
-                "{release} {size}: {history} History-ruled frames"
+                !at("after-ctrl-u").0.contains("History"),
+                "{release} {size}: Ctrl+U on a recalled prompt draws the plain composer (the history position is kept: the next Up recalls the next-older entry)"
+            );
+            assert!(p.empty_and_ready(&trace.grid("after-ctrl-u")));
+            assert_eq!(
+                history, 24,
+                "{release} {size}: History-ruled points (24 in every committed capture)"
             );
             drawn.push(seen);
         }
@@ -668,6 +671,101 @@ fn doorbell_036_claude_history_recall_frames_are_refused() {
             "{size}: 2.1.317 and 2.1.318 draw the same rule and prompt rows at every point after the first"
         );
     }
+}
+
+/// Scenario: Replay the Q143b captures of real Claude Code 2.1.317 and 2.1.318 at 50×200 and 24×80, five trials for each release, size, case and press count: a recalled prompt cleared with one or four Ctrl+U presses, then the deck-shaped line typed in one write and a lone Enter, either straight away (the plain rule) or after Up and Down back onto the cleared slot (`History k/6`). The profile reads the plain-drawn state as empty and ready and the History-labelled one as no composer, reads the typed line as held exactly before the Enter, and each hook payload is the line alone, with the six seeded history entries recalled intact afterwards.
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_claude_history_submit_replay() {
+    use sha2::Digest;
+    let p = &CLAUDE_PROFILE;
+    let seeded = [
+        "HISTORYSIXfoxtrot",
+        "HISTORYFIVEecho",
+        "HISTORYFOURdelta",
+        "HISTORYTHREEcharlie",
+        "HISTORYTWObravo",
+        "HISTORYONEalpha",
+    ];
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/claude-inbox/history-recall-submit");
+    let mut trials = 0;
+    let mut rung = 0;
+    for release in ["2.1.317", "2.1.318"] {
+        let mut stems: Vec<String> = std::fs::read_dir(base.join(release))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .map(|path| path.file_stem().unwrap().to_str().unwrap().to_owned())
+            .collect();
+        stems.sort();
+        for stem in stems {
+            let name = format!("{release}/{stem}");
+            let trace = fixture(&format!("claude-inbox/history-recall-submit/{name}"));
+            let record: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(base.join(format!("{name}.json"))).unwrap())
+                    .unwrap();
+            assert_eq!(record["release"], release, "{name}");
+            assert_eq!(
+                trace.read_lens.iter().sum::<usize>(),
+                trace.bytes.len(),
+                "{name}"
+            );
+            assert_eq!(
+                record["trace_sha256"].as_str().unwrap(),
+                sha2::Sha256::digest(&trace.bytes)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+                "{name}"
+            );
+            trials += 1;
+            let outcome = &record["outcome"];
+            let line = outcome["line"].as_str().unwrap();
+            let labelled = outcome["case"] == "labelled";
+            // The plain-drawn state after Ctrl+U, blank or placeholder, is
+            // the empty ready composer to the profile.
+            assert!(
+                p.empty_and_ready(&trace.grid("cleared")),
+                "{name}: the plain-drawn cleared state reads empty and ready"
+            );
+            if outcome["reachable"] == false {
+                assert_eq!(record["hook_prompts"], serde_json::json!([]), "{name}");
+                continue;
+            }
+            rung += 1;
+            let before = trace.grid("before-ring");
+            if labelled {
+                assert!(
+                    (p.composer)(&before).is_none() && !p.empty_and_ready(&before),
+                    "{name}: the History-labelled cleared slot is refused"
+                );
+            } else {
+                assert!(p.empty_and_ready(&before), "{name}");
+            }
+            assert_eq!(
+                p.holds(&trace.grid("typed"), line),
+                Some(ComposerText::Exact),
+                "{name}: the line held exactly before the Enter"
+            );
+            assert_eq!(
+                record["hook_prompts"],
+                serde_json::json!([line]),
+                "{name}: one submission, the line alone"
+            );
+            assert!(p.empty_and_ready(&trace.grid("after-clear")), "{name}");
+            assert_eq!(
+                outcome["recalled"],
+                serde_json::json!(seeded),
+                "{name}: the history afterwards"
+            );
+        }
+    }
+    assert_eq!(
+        trials, 80,
+        "2 releases × 2 cases × 2 press counts × 2 sizes × 5 trials"
+    );
+    assert!(rung > 0);
 }
 
 /// Characterisation at recorded read boundaries, not at arbitrary byte splits.

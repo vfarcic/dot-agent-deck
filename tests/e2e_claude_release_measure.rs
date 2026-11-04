@@ -10,7 +10,7 @@ use dot_agent_deck::event::AgentType;
 use dot_agent_deck::release_scanner::{HEADER_RECOGNISERS, ReleaseScanner, ScanLatch};
 use serde_json::Value;
 use spec::spec;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 struct Capture {
@@ -261,20 +261,43 @@ impl Capture {
 }
 
 fn measure_with_path(kind: &str, rows: u16, cols: u16, path: Option<&str>) -> Capture {
+    record(None, kind, rows, cols, &[], path)
+}
+
+/// Runs a recorder in the private TUI harness. The committed release
+/// recorder is always written as `measure.py`; `entry`, when given, is a
+/// further recorder (its file name and source) that imports it and is the
+/// one run, with `extra` after the usual `kind out rows cols` arguments.
+fn record(
+    entry: Option<(&str, &str)>,
+    kind: &str,
+    rows: u16,
+    cols: u16,
+    extra: &[String],
+    path: Option<&str>,
+) -> Capture {
     let root = tempfile::Builder::new()
         .prefix("dad-claude-release-measure-")
         .tempdir_in("/var/tmp")
         .unwrap()
         .keep();
     let output = root.join("capture");
-    let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
-    let script = root.join("measure.py");
+    let quote = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
+    let mut script = root.join("measure.py");
     std::fs::write(&script, include_str!("support/claude_release_measure.py")).unwrap();
-    let command = format!(
+    if let Some((name, source)) = entry {
+        script = root.join(name);
+        std::fs::write(&script, source).unwrap();
+    }
+    let mut command = format!(
         "exec python3 {} {kind} {} {rows} {cols}",
-        quote(&script),
-        quote(&output)
+        quote(&script.to_string_lossy()),
+        quote(&output.to_string_lossy())
     );
+    for argument in extra {
+        command.push(' ');
+        command.push_str(&quote(argument));
+    }
     let mut builder = common::TuiDeck::builder();
     if let Some(path) = path {
         builder = builder.with_env("PATH", path);
@@ -289,10 +312,15 @@ fn measure_with_path(kind: &str, rows: u16, cols: u16, path: Option<&str>) -> Ca
         .with_claude_trust_workdir()
         .with_continue_session("release-measure", command)
         .launch_with_fixture("minimal");
+    // A further recorder rewrites result.json after the release recorder's
+    // save, and marks the rewrite done; wait for the mark, not the file.
+    let finished = output.join(if entry.is_some() {
+        "done"
+    } else {
+        "result.json"
+    });
     assert!(
-        common::wait_until(Duration::from_secs(140), || output
-            .join("result.json")
-            .exists()
+        common::wait_until(Duration::from_secs(140), || finished.exists()
             || root.join("launcher-error.json").exists()),
         "measurement did not finish; {}\n{}",
         output.display(),
@@ -898,8 +926,9 @@ fn history_rows(capture: &Capture, point: &str) -> (String, String) {
 /// The history-recall premises, and what the profile reads there: Up from
 /// the empty composer draws `─── History i/n ` in place of the composer's
 /// upper rule over the recalled prompt, a blocked prompt is not recalled,
-/// Ctrl+U returns the plain composer, and the profile reads no composer
-/// under a History rule, whatever the box holds.
+/// Ctrl+U on a recalled prompt draws the plain composer (the history
+/// position is kept: the next Up recalls the next-older entry), and the
+/// profile reads no composer under a History rule, whatever the box holds.
 fn verify_history(capture: &Capture) {
     let (rule, prompt) = history_rows(capture, "up-1");
     assert!(rule.starts_with("─── History 6/6 "), "up-1 rule {rule:?}");
@@ -918,7 +947,7 @@ fn verify_history(capture: &Capture) {
     let cleared = capture.grid("after-ctrl-u");
     assert!(
         !history_rows(capture, "after-ctrl-u").0.contains("History"),
-        "Ctrl+U leaves history recall"
+        "Ctrl+U on a recalled prompt draws the plain composer (the history position is kept: the next Up recalls the next-older entry)"
     );
     assert!(CLAUDE_PROFILE.empty_and_ready(&cleared), "after-ctrl-u");
     let (_, manual) = history_rows(capture, "recalled-before-manual-mode");
@@ -962,4 +991,252 @@ fn verify_history(capture: &Capture) {
         "{} history {}x{}: {history_frames} History-ruled frames, all refused (no composer); blank box under a History rule at {blank_history_frames:?}; manual-mode recall {manual:?}; recall ups {}",
         capture.release, capture.index["rows"], capture.index["cols"], capture.result["keys"]
     );
+}
+
+/// Scenario: In isolated real Haiku composers on pinned Claude Code 2.1.317, at 50×200 and 24×80 and five trials each, seed six prompts from an earlier session, recall slot k with Up, clear it with one and, in other trials, four Ctrl+U presses so Claude draws the plain empty composer, then type a line shaped like the deck's doorbell line in one write and press Enter on its own (blocked by the hook before a model turn). The submitted prompt, the screen after it and the history walked afterwards are recorded with what the screen profile reads at every point.
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_live_release_317_history_submit_plain() {
+    skip_unless!(common::check_claude_available());
+    history_submit("2.1.317", "plain");
+}
+
+/// Scenario: In isolated real Haiku composers on pinned Claude Code 2.1.317, at 50×200 and 24×80 and five trials each, recall slot k, clear it with one or four Ctrl+U presses, press Up and Down back onto it so Claude draws `History k/6` over an empty box (blank or the placeholder) when it kept its position (a trial where it did not rings nothing and is counted), then type a line shaped like the deck's doorbell line in one write and press Enter on its own (blocked by the hook before a model turn). The submitted prompt, the screen after it and the history walked afterwards are recorded with what the screen profile reads at every point.
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_live_release_317_history_submit_labelled() {
+    skip_unless!(common::check_claude_available());
+    history_submit("2.1.317", "labelled");
+}
+
+/// Scenario: The plain-drawn case of `doorbell_036_live_release_317_history_submit_plain`, on pinned Claude Code 2.1.318: recall slot k, one or four Ctrl+U presses, then the deck-shaped line in one write and a lone Enter (blocked before a model turn), five trials at each of 50×200 and 24×80, recording the submitted prompt, the screen after it and the history afterwards.
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_live_release_318_history_submit_plain() {
+    skip_unless!(common::check_claude_available());
+    history_submit("2.1.318", "plain");
+}
+
+/// Scenario: The History-labelled case of `doorbell_036_live_release_317_history_submit_labelled`, on pinned Claude Code 2.1.318: recall slot k, one or four Ctrl+U presses, Up and Down back onto the cleared `History k/6` slot when reachable, then the deck-shaped line in one write and a lone Enter (blocked before a model turn), five trials at each of 50×200 and 24×80, recording the submitted prompt, the screen after it and the history afterwards.
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_live_release_318_history_submit_labelled() {
+    skip_unless!(common::check_claude_available());
+    history_submit("2.1.318", "labelled");
+}
+
+/// The seeded prompts, newest first, as Up recalls them.
+const SEEDED_HISTORY: [&str; 6] = [
+    "HISTORYSIXfoxtrot",
+    "HISTORYFIVEecho",
+    "HISTORYFOURdelta",
+    "HISTORYTHREEcharlie",
+    "HISTORYTWObravo",
+    "HISTORYONEalpha",
+];
+
+/// Q143b: the deck's line plus Enter after Ctrl+U on a recalled prompt, in
+/// `case` (`plain` or `labelled`), with one and with four Ctrl+U presses,
+/// five trials at each size, trial t from slot `7 - t` (`6/6` down to
+/// `2/6`). Every trial is recorded before any outcome is asserted, so one
+/// surprise does not hide the others; a `labelled` trial whose blank
+/// `History k/6` slot is not reachable rings nothing and is counted.
+fn history_submit(release: &str, case: &str) {
+    let (_root, path) = pinned_path(release).unwrap_or_else(|| {
+        panic!(
+            "set DOT_AGENT_DECK_CLAUDE_MENU_{} to the pinned executable",
+            release.replace('.', "_")
+        )
+    });
+    preflight(release, Some(&path));
+    let mut outcomes = Vec::new();
+    for presses in [1usize, 4] {
+        for (rows, cols) in [(50, 200), (24, 80)] {
+            for trial in 1..=5usize {
+                outcomes.push(history_submit_trial(
+                    release, case, presses, rows, cols, trial, &path,
+                ));
+            }
+        }
+    }
+    let mut rung = 0;
+    let mut unreachable = Vec::new();
+    for outcome in &outcomes {
+        let at = outcome["capture"].as_str().unwrap();
+        let label = format!(
+            "{} x{} {} t{}",
+            outcome["case"], outcome["presses"], outcome["size"], outcome["trial"]
+        );
+        if outcome["reachable"] == false {
+            assert_eq!(outcome["prompts"], serde_json::json!([]), "{label}; {at}");
+            unreachable.push(label);
+            continue;
+        }
+        rung += 1;
+        let line = outcome["line"].as_str().unwrap();
+        let slot_text = outcome["slot_text"].as_str().unwrap();
+        assert_eq!(
+            outcome["prompts"],
+            serde_json::json!([line]),
+            "{label}: one submission, the line alone; {at}"
+        );
+        assert!(
+            !outcome["prompts"][0].as_str().unwrap().contains(slot_text),
+            "{label}: {at}"
+        );
+        assert_eq!(
+            outcome["typed_holds"], "Some(Exact)",
+            "{label}: the profile reads the line held exactly before the Enter, as the ring's echo check does; {at}"
+        );
+        assert_eq!(outcome["after_enter_dialog"], "None", "{label}; {at}");
+        assert_eq!(
+            outcome["after_clear_empty_and_ready"], true,
+            "{label}: the composer cleared after the blocked line is empty and ready; {at}"
+        );
+        assert_eq!(
+            outcome["recalled"],
+            serde_json::json!(SEEDED_HISTORY),
+            "{label}: the history afterwards, newest first, slot k's text back and no new or leaked entry; {at}"
+        );
+    }
+    eprintln!(
+        "{release} {case}: {} trials, {rung} rung, each the line alone with the history intact; not reachable: {unreachable:?}",
+        outcomes.len()
+    );
+}
+
+/// One Q143b trial, recorded with what the profile reads at the points the
+/// question turns on.
+fn history_submit_trial(
+    release: &str,
+    case: &str,
+    presses: usize,
+    rows: u16,
+    cols: u16,
+    trial: usize,
+    path: &str,
+) -> Value {
+    let alphabet = dot_agent_deck::doorbell_txn::TOKEN_ALPHABET;
+    let token: String = (0..6)
+        .map(|i| char::from(alphabet[(trial * 3 + i * 5 + presses * 7 + cols as usize) % 16]))
+        .collect();
+    let id = format!("m-hist319{}-0f3c9a71d2e4b8{presses}{trial}", &case[..1]);
+    let line = format!("({token}){}", dot_agent_deck::doorbell::doorbell_line(&id));
+    let capture = record(
+        Some((
+            "history_submit.py",
+            include_str!("support/claude_history_submit_measure.py"),
+        )),
+        case,
+        rows,
+        cols,
+        &[trial.to_string(), presses.to_string(), line.clone()],
+        Some(path),
+    );
+    assert_eq!(capture.result["release"], release);
+    let rendered = render_points(
+        &capture,
+        &format!("{release} {case} x{presses} {rows}x{cols} t{trial}"),
+    );
+    std::fs::write(capture.root.join("rendered.txt"), rendered).unwrap();
+    let prompts: Vec<String> = std::fs::read_to_string(capture.root.join("hook.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|row| {
+            let hook: Value = serde_json::from_str(row).unwrap();
+            hook["payload"]["prompt"].as_str().unwrap_or("").to_string()
+        })
+        .collect();
+    let steps = capture.result["steps"].as_array().unwrap().clone();
+    let step = |name: &str| {
+        steps
+            .iter()
+            .find(|s| s["point"] == name)
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let has = |name: &str| capture.index["points"].get(name).is_some();
+    let empty_and_ready =
+        |name: &str| has(name).then(|| CLAUDE_PROFILE.empty_and_ready(&capture.grid(name)));
+    let walk: Vec<(String, String)> = steps
+        .iter()
+        .filter(|s| s["point"].as_str().unwrap().starts_with("walk-"))
+        .map(|s| {
+            (
+                s["rule"].as_str().unwrap_or("").chars().take(20).collect(),
+                s["box"].as_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect();
+    // The distinct entries the walk recalled under a History rule, in order.
+    let mut recalled: Vec<String> = Vec::new();
+    for (rule, entry) in &walk {
+        if rule.starts_with("─── History ") && !recalled.contains(entry) {
+            recalled.push(entry.clone());
+        }
+    }
+    let outcome = serde_json::json!({
+        "release": release, "case": case, "presses": presses,
+        "size": format!("{rows}x{cols}"), "trial": trial,
+        "slot": format!("{}/6", 7 - trial), "slot_text": SEEDED_HISTORY[trial - 1],
+        "line": line, "prompts": prompts,
+        "reachable": capture.result["reachable"],
+        "cleared": step("cleared"),
+        "cleared_empty_and_ready": empty_and_ready("cleared"),
+        "slot_up": step("slot-up"),
+        "slot_down": step("slot-down"),
+        "before_ring": step("before-ring"),
+        "before_ring_empty_and_ready": empty_and_ready("before-ring"),
+        "typed": step("typed"),
+        "typed_holds": has("typed").then(|| format!("{:?}", CLAUDE_PROFILE.holds(&capture.grid("typed"), &line))),
+        "after_enter": step("after-enter"),
+        "after_enter_dialog": has("after-enter").then(|| format!("{:?}", (CLAUDE_PROFILE.dialog)(&capture.grid("after-enter")))),
+        "after_clear": step("after-clear"),
+        "after_clear_empty_and_ready": empty_and_ready("after-clear"),
+        "walk": walk,
+        "recalled": recalled,
+        "history_log": capture.result["history_log"],
+        "echo_ms": capture.result["echo_ns"].as_f64().map(|ns| ns / 1e6),
+        "hook_ms": capture.result["hook_ns"].as_f64().map(|ns| ns / 1e6),
+        "load": capture.result["load"],
+        "capture": capture.root.display().to_string(),
+    });
+    eprintln!("history-submit outcome: {outcome}");
+    std::fs::write(
+        capture.root.join("outcome.json"),
+        serde_json::to_string_pretty(&outcome).unwrap(),
+    )
+    .unwrap();
+    outcome
+}
+
+/// Every named point of a capture with what the screen profile reads there,
+/// and the screen.
+fn render_points(capture: &Capture, label: &str) -> String {
+    let mut rendered = String::new();
+    let mut points: Vec<(&String, usize)> = capture.index["points"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter(|(name, _)| !name.starts_with("mark:"))
+        .map(|(name, at)| (name, at.as_u64().unwrap() as usize))
+        .collect();
+    points.sort_by_key(|&(name, at)| (at, name.clone()));
+    for (name, at) in points {
+        let parser = capture.parser(at);
+        let grid = Grid::of(parser.screen(), at as u64);
+        let composer = (CLAUDE_PROFILE.composer)(&grid);
+        rendered.push_str(&format!(
+            "{label} {name}@{at}: composer={:?} ready={} empty_and_ready={} dialog={:?}\ncursor={:?}\n{}\n\n",
+            composer
+                .as_ref()
+                .map(|c| (&c.text, c.cursor_at_end, c.hidden)),
+            (CLAUDE_PROFILE.ready)(&grid),
+            CLAUDE_PROFILE.empty_and_ready(&grid),
+            (CLAUDE_PROFILE.dialog)(&grid),
+            parser.screen().cursor_position(),
+            parser.screen().contents()
+        ));
+    }
+    rendered
 }
