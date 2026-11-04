@@ -849,6 +849,9 @@ struct MSeg {
     e1: Watch,
     /// The release-table rows it reached ([`Stats::rows`]), once each.
     rows: Vec<Row>,
+    /// How many of the person's ops had been typed when it was written: a
+    /// probe's non-empty read is of the box before any later one (Q147b).
+    typed_mark: usize,
 }
 
 /// The release table's view of one generation.
@@ -892,6 +895,11 @@ struct Model {
     retired: bool,
     /// The probe's settlement: `None` until it settles.
     settled: Option<Settled>,
+    /// The person's ops typed so far.
+    typed: usize,
+    /// At a non-empty settlement, the next check is due at once: a person
+    /// typed after the probe's byte, so its read missed that (Q147b).
+    settled_due: bool,
     stats: Stats,
     /// The model's clock: one tick per birth or exit.
     clock: u64,
@@ -981,6 +989,8 @@ impl Model {
             fed: prefix as u64,
             retired: false,
             settled: None,
+            typed: 0,
+            settled_due: false,
             stats: Stats::default(),
             clock: 0,
         }
@@ -1004,6 +1014,7 @@ impl Model {
             cut_off: false,
             e1: Watch::default(),
             rows: Vec::new(),
+            typed_mark: self.typed,
         });
         self.expected.push(CTRL_G);
         self.step();
@@ -1012,6 +1023,9 @@ impl Model {
     fn typed(&mut self, bytes: &[u8]) {
         if self.retired {
             return;
+        }
+        if !bytes.is_empty() {
+            self.typed += 1;
         }
         let candidate = bytes.iter().position(|&b| b == CTRL_G);
         if self.fenced() {
@@ -1036,6 +1050,7 @@ impl Model {
                 cut_off: false,
                 e1: Watch::default(),
                 rows: Vec::new(),
+                typed_mark: self.typed,
             });
             self.held.extend(&bytes[at + 1..]);
             self.stats.cut_opened += 1;
@@ -1285,6 +1300,7 @@ impl Model {
                 if kind == Settled::Empty && self.parks {
                     self.parked = true;
                 } else {
+                    self.settled_due = kind == Settled::NonEmpty && self.typed > seg.typed_mark;
                     self.settled = Some(kind);
                     *self.stats.settled.entry(kind).or_default() += 1;
                 }
@@ -1326,6 +1342,7 @@ impl Model {
                     cut_off: false,
                     e1: Watch::default(),
                     rows: Vec::new(),
+                    typed_mark: self.typed,
                 });
             }
             Some(seg) if seg.released && !seg.cut_off => {
@@ -1496,7 +1513,7 @@ fn check_as(rig: &Rig, model: &Model, settled_before: Option<Settled>, judged: J
             let retrying = rig.input.probe_retrying();
             let want = match kind {
                 Settled::Empty => (true, false),
-                Settled::NonEmpty => (false, false),
+                Settled::NonEmpty => (model.settled_due, false),
                 Settled::Failed => (false, true),
             };
             assert_eq!(
@@ -2229,7 +2246,7 @@ fn helper(pid: u32, seg: u64, decision: Decision) -> Step {
     })
 }
 
-/// Scenario: On Claude, the deck's check writes its Ctrl+G and a person types a letter and then a Ctrl+C, an Enter or a Backspace (or a letter alone) at each point of the check: before the helper is seen, after it decides `Armed`, after it exits, and after Claude's paste-mode disable but before its enable. The letter goes as the release table lets it, but the Ctrl+C, Enter or Backspace (Claude's terminal being out of raw mode until it returns) stays held until the helper has exited and Claude's enable is read, and is then written once, in order, after the letter; the check completes and settles either way (Q147b, the activation's lane-2 failure).
+/// Scenario: On Claude, the deck's check writes its Ctrl+G and a person types a letter and then a Ctrl+C, an Enter or a Backspace (or a letter alone) at each point of the check: before the helper is seen, after it decides `Armed`, after it exits, and after Claude's paste-mode disable but before its enable. The letter goes as the release table lets it, but the Ctrl+C, Enter or Backspace (Claude's terminal being out of raw mode until it returns) stays held until the helper has exited and Claude's enable is read, and is then written once, in order, after the letter; the check completes and settles either way, and when the typing came before its read settled, the next check is due at once (Q147b, the activation's lane-2 failure and the stuck hold behind it).
 #[spec("inbox/probe/010")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn probe_010_a_line_discipline_key_waits_for_claudes_return() {
@@ -2256,6 +2273,9 @@ async fn probe_010_a_line_discipline_key_waits_for_claudes_return() {
             let model = run(Agent::Claude, b"", false, &steps, &what).await;
             assert!(model.segs.is_empty(), "{what}: the check completed");
             assert_eq!(model.settled, Some(Settled::NonEmpty), "{what}: settled");
+            // The read settles at the helper's exit: typing before it isn't
+            // in the box the read saw, so the next check is due at once.
+            assert_eq!(model.settled_due, at < 2, "{what}: the next check due");
             assert_eq!(
                 model.expected,
                 [&[CTRL_G, b'x', key][..], b"z\x03"].concat(),

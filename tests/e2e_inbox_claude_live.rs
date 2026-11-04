@@ -1556,6 +1556,153 @@ fn doorbell_010_live_reviewer_sequence_stays_held_until_a_letter_and_ctrl_c() {
     );
 }
 
+/// Where a person's Ctrl+C landed against the first check in `log`
+/// (Q147b): accepted after that check's byte was written and before its
+/// segment ended, i.e. while the check was running.
+#[cfg(target_os = "linux")]
+fn ctrl_c_inside_check(log: &str, agent: &str) -> bool {
+    let lines: Vec<&str> = log.lines().collect();
+    let written = lines
+        .iter()
+        .position(|l| l.contains("doorbell tick probe") && l.contains("outcome=Written"));
+    let ctrl_c = lines.iter().position(|l| {
+        l.contains("STREAM_IN forwarded to PTY writer")
+            && l.contains(&format!("agent_id={agent} "))
+            && l.ends_with("payload=\\x03")
+    });
+    let (Some(written), Some(ctrl_c)) = (written, ctrl_c) else {
+        return false;
+    };
+    let ended = lines
+        .iter()
+        .enumerate()
+        .skip(written)
+        .find(|(_, l)| l.contains("segment ended") && l.contains("kind: Probe"))
+        .map(|(i, _)| i);
+    ctrl_c > written && ended.is_some_and(|ended| ctrl_c < ended)
+}
+
+/// The milliseconds from the first check's settled decision in `log` (where
+/// a Claude release went before Q147b) to its segment's end (where a held
+/// line-discipline key goes now): the hold Q147b adds to such a key.
+#[cfg(target_os = "linux")]
+fn decision_to_return_ms(log: &str) -> Option<f64> {
+    let at = |line: &str| -> Option<f64> {
+        // `2026-11-04T07:01:46.103516Z ...`: seconds of the day.
+        let time = line.get(11..26)?;
+        let (h, rest) = time.split_once(':')?;
+        let (m, sec) = rest.split_once(':')?;
+        Some(
+            h.parse::<f64>().ok()? * 3600.0
+                + m.parse::<f64>().ok()? * 60.0
+                + sec.parse::<f64>().ok()?,
+        )
+    };
+    let mut lines = log
+        .lines()
+        .skip_while(|l| !(l.contains("doorbell tick probe") && l.contains("outcome=Written")));
+    let settled = lines.find(|l| l.contains("probe settled"))?;
+    let ended = lines.find(|l| l.contains("segment ended") && l.contains("kind: Probe"))?;
+    Some((at(ended)? - at(settled)?) * 1000.0)
+}
+
+/// Scenario: In a pane the deck installs its editor helper into, with real interactive Claude Code of a release whose editor probe the deck has verified, and native delivery disabled, type a letter and post a sentinel task, which a check holds behind that draft; then type a second letter, which starts another check, and press Ctrl+C the moment that check's byte is written, while Claude Code has handed its terminal to the check. Repeated until twenty Ctrl+C presses have landed inside a check: every time Claude Code keeps running, the Ctrl+C clears the box, and the task is delivered once through the doorbell (Q147b: a Ctrl+C typed during a check had ended the session).
+#[spec("inbox/doorbell/010")]
+#[test]
+#[cfg(target_os = "linux")]
+fn doorbell_010_live_ctrl_c_during_a_check_leaves_claude_running() {
+    skip_unless!(installed::checkable());
+    let claude = Claude::installed();
+    claude.deck.wait_for_string("? for shortcuts");
+    assert!(
+        claude.pane_grid().contains(&installed_banner()),
+        "the verified release runs; {}",
+        claude.evidence()
+    );
+    let claude = fallback_ready_with(claude, "ctrl-c-check");
+    const LANDED: usize = 20;
+    const MAX_TRIALS: usize = 40;
+    let mut landed = 0;
+    let mut trials = 0;
+    while landed < LANDED && trials < MAX_TRIALS {
+        trials += 1;
+        let start = claude.log().len();
+        claude.deck.send_keys(b"w");
+        claude.expect_composer("w");
+        let name = format!("ctrl-c-check-{trials}-5d2a.txt");
+        let id = claude.post(&claude.directive(&name));
+        assert!(
+            common::wait_until(BUDGET, || claude.record()["inbox"]["wake_hold"]
+                == "possible_draft"
+                && claude.checks(start).iter().any(|c| c == "Written")),
+            "trial {trials}: a check must hold the task behind the draft; {}",
+            claude.evidence()
+        );
+        assert!(
+            common::wait_until(Duration::from_secs(30), || claude
+                .log()
+                .get(start..)
+                .unwrap_or("")
+                .contains("segment ended")
+                && claude.composer().as_deref() == Some("w")),
+            "trial {trials}: the first check ends with the draft kept; {}",
+            claude.evidence()
+        );
+        // The second letter touches the box, so the next tick checks it:
+        // the Ctrl+C goes as soon as that check's byte is in the log.
+        let touch = claude.log().len();
+        claude.deck.send_keys(b"x");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !claude.checks(touch).iter().any(|c| c == "Written") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "trial {trials}: the touch must start a check; {}",
+                claude.evidence()
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        claude.deck.send_keys(b"\x03");
+        claude.done(&id, &name, false);
+        let log = claude.log();
+        let since = log.get(touch..).unwrap_or("");
+        assert!(
+            !since.contains("pane_command_exited") && !since.contains("event_type=SessionEnd"),
+            "trial {trials}: Claude Code must keep running after the Ctrl+C; {}",
+            claude.evidence()
+        );
+        assert!(
+            claude.human_in(touch).starts_with("x\\x03"),
+            "trial {trials}: the letter and the Ctrl+C reached the pane in order: {:?}",
+            claude.human_in(touch)
+        );
+        if ctrl_c_inside_check(since, &claude.pane.agent) {
+            landed += 1;
+        }
+        eprintln!(
+            "trial {trials}: Claude kept running; Ctrl+C inside the check: {landed} so far; \
+             decision to return: {:?} ms",
+            decision_to_return_ms(since)
+        );
+        // As the control turn: the next native waiter, killed, so the next
+        // trial's task is held and delivered by the doorbell.
+        assert!(
+            common::wait_until(BUDGET, || {
+                claude.listing()["armed"].as_u64().unwrap_or(0) > 0
+                    && claude.record()["live"]["status"] == "Idle"
+            }),
+            "trial {trials}: the task's turn must finish; {}",
+            claude.evidence()
+        );
+        kill_trial_waiter(&claude);
+        claude.expect_composer("");
+    }
+    assert!(
+        landed >= LANDED,
+        "only {landed} of {trials} Ctrl+C presses landed inside a check; {}",
+        claude.evidence()
+    );
+}
+
 /// Scenario: In a pane the deck installs its editor helper into, complete a doorbell-delivered control task in real interactive Haiku, send a prompt of your own, then recall it with Up and press Enter, which submits it again, while native delivery is disabled. Once that turn ends, post another sentinel task: a check must read the box empty and the doorbell type the task without another keypress.
 #[spec("inbox/doorbell/010")]
 #[test]
