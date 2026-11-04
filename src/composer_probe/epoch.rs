@@ -588,9 +588,24 @@ fn settle_live(state: &mut State, now: Instant) {
             && read.is_none()
             && records.get(key).is_some_and(|r| !r.drained)
         {
+            // revact28: logged each time, so a probe stuck here (its
+            // record never draining) shows in the log.
+            tracing::debug!(
+                target: "composer_probe",
+                number,
+                ?decision,
+                "probe segment matched; waiting for the daemon's read"
+            );
             live.segments.undecide(number);
             continue;
         }
+        tracing::debug!(
+            target: "composer_probe",
+            number,
+            ?decision,
+            read = read.is_some(),
+            "probe segment matched"
+        );
         live.settle_probe(
             &mut state.epoch,
             records,
@@ -1770,6 +1785,11 @@ impl GenerationInput {
         if live.lapse_counted != Some(number) {
             live.lapse_counted = Some(number);
             live.schedule.failed(now);
+            tracing::debug!(
+                target: "composer_probe",
+                number,
+                "probe segment lapsed unmatched; a retry may replace it"
+            );
         }
         // An empty read parked for its keymap re-read is a check still
         // outstanding, as `probe_due` reads it: a lapse retry started under
@@ -1933,6 +1953,9 @@ impl GenerationInput {
             return Err(segments::Refusal::Retired);
         };
         let result = step(&mut live.segments, records, &mut state.hazards);
+        if let Err(refusal) = &result {
+            tracing::debug!(target: "composer_probe", ?refusal, "segment step refused");
+        }
         settle_live(state, now);
         drop(guard);
         self.moved.notify_one();
