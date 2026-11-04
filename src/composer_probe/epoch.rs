@@ -417,6 +417,16 @@ pub(crate) const EXPLAINED_CAP: u8 = 4;
 /// or cost one more check.
 pub(crate) const CREDIT_AFTER_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The daemon's read of an `Armed` export, as the epoch's settlement reads
+/// it ([`Live::reads`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoxRead {
+    Empty,
+    NonEmpty,
+    /// The export couldn't be read: the check saw nothing of the box.
+    Unreadable,
+}
+
 /// The most daemon reads of an `Armed` export kept for the epoch's
 /// settlement ([`Live::reads`]).
 const READS_KEPT: usize = record::RECORD_CAP;
@@ -450,6 +460,12 @@ struct Live {
     /// When the deck may try a probe again (R2 §6.8, R5's continuing
     /// retries). Its `broken` bit is presentation only (O-20.6).
     schedule: Schedule,
+    /// The epoch the last op entering the input other than a deck job's
+    /// moved it to (a person's key, an answer, an unnamed deck write): not
+    /// an inferred edit (an unexplained pair or an external one), which can
+    /// be a probe's own round trip read before its record. Q147b's
+    /// settlement reads it.
+    last_foreign_op: u64,
     /// Each open probe: its segment number, its job, and `E0`, the epoch
     /// just before its own byte moved it (set at its enqueue).
     probes: Vec<Probe>,
@@ -457,8 +473,9 @@ struct Live {
     /// (U3-02): each lapse is counted once.
     lapse_counted: Option<u64>,
     /// The daemon's read of an `Armed` invocation's export: whether it was
-    /// empty, for the epoch's settlement of the probe it matches.
-    reads: std::collections::VecDeque<(RecordKey, bool)>,
+    /// empty, and whether it read the box at all, for the epoch's settlement
+    /// of the probe it matches.
+    reads: std::collections::VecDeque<(RecordKey, BoxRead)>,
     /// Q35-21 (A-20d-1a, O-20.7b): what wakes the off-lock keymap re-read an
     /// empty read's settlement waits for ([`GenerationInput::recheck_keymap_at_settlement`]).
     /// `None` applies an empty read at once: a generation no observer
@@ -732,12 +749,19 @@ impl Live {
     }
 
     /// The daemon's latest read of record `key`'s export, if any.
+    /// The daemon's read of `key`'s export: whether it was empty, an
+    /// unreadable one counting as not empty, as the settlement has always
+    /// read it.
     fn read_of(&self, key: RecordKey) -> Option<bool> {
+        self.box_read_of(key).map(|read| read == BoxRead::Empty)
+    }
+
+    fn box_read_of(&self, key: RecordKey) -> Option<BoxRead> {
         self.reads
             .iter()
             .rev()
             .find(|(k, _)| *k == key)
-            .map(|(_, empty)| *empty)
+            .map(|(_, read)| *read)
     }
 }
 
@@ -789,8 +813,25 @@ impl Live {
                 }
             }
             (Some(Decision::Armed), Some(true)) if claim_mine => self.apply_empty(epoch, probe),
+            // Q147b: the read is of the box as the probe's own byte found
+            // it. An op entering the input after that byte (a person's key
+            // held behind the check, or typed after it) isn't in it, so the
+            // next check waits for nothing more: it is due at once.
+            // Otherwise it waits for the epoch to move past where it stands
+            // now, as before. So does a check whose export the daemon
+            // couldn't read (Q151b): it saw nothing of the box, and the next
+            // check would see as little (an export on a filesystem the check
+            // doesn't support stays so), so it is a timed recheck, as before
+            // Q147b.
             (Some(Decision::Armed), _) => {
-                self.schedule.non_empty(now, epoch.epoch());
+                let saw_box = self.box_read_of(key) != Some(BoxRead::Unreadable);
+                let from = match probe.e0 {
+                    Some(e0) if saw_box && self.last_foreign_op > e0.saturating_add(1) => {
+                        e0.saturating_add(1)
+                    }
+                    _ => epoch.epoch(),
+                };
+                self.schedule.non_empty(now, from);
             }
             // R-D-U2-02: a probe whose lapse the schedule already counted
             // (`lapse_due`) was one attempt; its late failed check is that
@@ -948,6 +989,11 @@ fn plan_locked(state: &mut State, writer: Writer, bytes: &[u8], plan: Option<Pla
                 Writer::UnnamedDeck | Writer::Human | Writer::Answer => None,
             };
             let moved_to = state.epoch.record(owner);
+            if owner.is_none()
+                && let Some(live) = state.live.as_mut()
+            {
+                live.last_foreign_op = moved_to;
+            }
             tracing::debug!(
                 target: "composer_probe",
                 ?writer,
@@ -1476,6 +1522,7 @@ impl GenerationInput {
             unexplained: std::collections::VecDeque::new(),
             forgotten: None,
             schedule: Schedule::default(),
+            last_foreign_op: 0,
             probes: Vec::new(),
             reads: std::collections::VecDeque::new(),
             lapse_counted: None,
@@ -1657,12 +1704,30 @@ impl GenerationInput {
     /// The daemon read an `Armed` invocation's export (Q35-20): whether it
     /// was empty, for the epoch's settlement of the probe it matches.
     pub fn note_read(&self, key: RecordKey, empty: bool) {
+        self.note_box_read(
+            key,
+            if empty {
+                BoxRead::Empty
+            } else {
+                BoxRead::NonEmpty
+            },
+        );
+    }
+
+    /// The daemon couldn't read an `Armed` invocation's export (Q151b): it
+    /// settles as one read not empty did before Q147b, a timed recheck,
+    /// whatever was typed during its check.
+    pub fn note_unreadable(&self, key: RecordKey) {
+        self.note_box_read(key, BoxRead::Unreadable);
+    }
+
+    fn note_box_read(&self, key: RecordKey, read: BoxRead) {
         let mut state = self.state.lock_recovering();
         if let Some(live) = state.live.as_mut() {
             if live.reads.len() == READS_KEPT {
                 live.reads.pop_front();
             }
-            live.reads.push_back((key, empty));
+            live.reads.push_back((key, read));
         }
     }
 
@@ -1949,6 +2014,26 @@ impl GenerationInput {
         }
     }
 
+    /// The front segment's release as the driver acts on it: what it lets
+    /// the held input do ([`Self::segments_front`]) and where it stops short
+    /// of the next held candidate ([`Segments::front_stop`], Q147b, Q151b),
+    /// read in one hold of this lock.
+    pub fn segments_release(&self) -> Option<(Front, segments::Stop)> {
+        let state = self.state.lock_recovering();
+        match (state.retired, state.live.as_ref()) {
+            (false, Some(live)) => Some((
+                live.segments.front(),
+                state
+                    .records
+                    .as_ref()
+                    .map_or(segments::Stop::Candidate, |records| {
+                        live.segments.front_stop(records)
+                    }),
+            )),
+            _ => None,
+        }
+    }
+
     /// Whether the front segment can never complete
     /// ([`Segments::stranded`]); `false` with no segments attached or once
     /// retired.
@@ -1969,6 +2054,19 @@ impl GenerationInput {
     pub fn segment_refuse_behind(&self) -> bool {
         self.segment_step(Instant::now(), |seg, records, _| {
             Ok(seg.refuse_behind(records))
+        })
+        .unwrap_or(false)
+    }
+
+    /// The release driver's authority to refuse a held Ctrl+C, Ctrl+\ or
+    /// Ctrl+Z, with what is held after it, behind a front whose release
+    /// stops at one ([`Segments::refuse_signal_behind`], Q151b): whether it
+    /// does, read and acted on in one hold of this lock, the segments
+    /// waiting behind it ended `Refused`. Asked under the gate's lock, as a
+    /// release's authority is.
+    pub fn segment_refuse_signal(&self) -> bool {
+        self.segment_step(Instant::now(), |seg, records, _| {
+            Ok(seg.refuse_signal_behind(records))
         })
         .unwrap_or(false)
     }
@@ -2800,7 +2898,7 @@ mod tests {
                 job: DeckJobId(number),
                 e0: None,
             });
-            live.reads.push_back((key, true));
+            live.reads.push_back((key, BoxRead::Empty));
             live.settle_probe(epoch, records, (number, key, Some(Decision::Armed)), now);
         };
         let failures = |input: &GenerationInput| {

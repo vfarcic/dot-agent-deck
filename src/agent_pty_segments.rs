@@ -27,14 +27,24 @@
 //!
 //! **A front that can never complete** (`Segments::stranded`: it released
 //! and the writer scope is open, as a person's Ctrl+G answered by their
-//! editor during a check leaves it under `Hold`). Once the release has gone
-//! as far as the next held Ctrl+G, the driver refuses that Ctrl+G and
-//! everything held after it ([`PaneWriter::refuse_stranded`]): each op's
+//! editor during a check leaves it under `Hold`). In each pass that finds a
+//! Ctrl+G held behind it, the driver refuses the op holding that Ctrl+G and
+//! everything held after it ([`PaneWriter::refuse_stranded`]), the ops
+//! before it staying as the release leaves them (a key waiting for Claude's
+//! return among them, Q151b): each op's
 //! connection is told [`CTRL_G_REFUSED`], its ticket settles refused, and
 //! no byte of it is written. The fence stays closed, so each later Ctrl+G
 //! is cut and refused the same way while that front stays released, and
 //! other typing goes on to the pane as the release lets it; and the doorbell's tick no longer reads that
 //! front as a check outstanding ([`tick_probe`]).
+//!
+//! **A Claude release that stops at a key** (Q147b, Q151b,
+//! `Segments::front_stop`). Behind an `Armed` release, a key the line
+//! discipline acts on waits, with what follows it, until Claude's return
+//! (E1). Behind a probe's `Unarmed` release, until its helper's exit drains,
+//! the driver refuses the op holding the first Ctrl+C, Ctrl+\ or Ctrl+Z
+//! and everything held after it ([`PaneWriter::refuse_signal`]): each op's
+//! connection is told [`SIGNAL_KEY_REFUSED`].
 //!
 //! **What it doesn't decide** (R35PLAN2-U2-01): whether a ring follows a
 //! check, the card's hold reason and delivery after a check stay on today's
@@ -104,7 +114,7 @@ use crate::composer_probe::framing::Framing;
 #[cfg(target_os = "linux")]
 use crate::composer_probe::gate::{Cutting, Measure};
 #[cfg(target_os = "linux")]
-use crate::composer_probe::segments::Front;
+use crate::composer_probe::segments::{Front, Stop};
 
 /// Which of the deck's check writes a probe request asks for.
 #[cfg(any(target_os = "linux", feature = "e2e"))]
@@ -219,14 +229,18 @@ impl UserFrame {
     /// PRD #1666 part 3 (Q35-20): how far a release may take this held
     /// frame: its last ground point, read from its own acceptance-time
     /// framing (or, for one with none, what the frame before it left in
-    /// `carry`), and before its candidate when it holds one.
-    fn measure(&self, carry: &mut Option<Framing>) -> Measure {
+    /// `carry`), and before its candidate when it holds one. With `stop`
+    /// (Q147b, Q151b), also before its first key that stop names
+    /// ([`Self::stop_key`]), which then stops the release as a candidate
+    /// does.
+    fn measure(&self, carry: &mut Option<Framing>, stop: Stop) -> Measure {
         let mut framing = self
             .framing
             .clone()
             .or_else(|| carry.take())
             .unwrap_or_default();
-        let limit = self.cut.as_ref().map_or(self.bytes.len(), |cut| cut.start);
+        let key = self.stop_key(stop);
+        let limit = key.unwrap_or_else(|| self.cut_start());
         let mut ground = framing.at_ground().then_some(0);
         for (i, &byte) in self.bytes.iter().enumerate() {
             if i >= limit {
@@ -240,8 +254,29 @@ impl UserFrame {
         *carry = Some(framing);
         Measure {
             ground,
-            candidate: self.cut.is_some(),
+            candidate: self.cut.is_some() || key.is_some(),
         }
+    }
+
+    /// Where its candidate starts, or its length with none.
+    fn cut_start(&self) -> usize {
+        self.cut.as_ref().map_or(self.bytes.len(), |cut| cut.start)
+    }
+
+    /// Q147b, Q151b: the first of its bytes that `stop` stops a release at
+    /// (a line-discipline key while Claude waits to return, a signal key
+    /// behind a probe's `Unarmed` release), when it comes before its
+    /// candidate; `None` for [`Stop::Candidate`].
+    fn stop_key(&self, stop: Stop) -> Option<usize> {
+        let stops: fn(u8) -> bool = match stop {
+            Stop::Candidate => return None,
+            Stop::Cooked => crate::composer_probe::segments::line_discipline_key,
+            Stop::Signal => crate::composer_probe::segments::signal_key,
+        };
+        self.bytes
+            .iter()
+            .position(|&b| stops(b))
+            .filter(|&at| at < self.cut_start())
     }
 
     /// PRD #1666 part 3 (Q35-20): its first `n` bytes as a sub-op of the
@@ -332,7 +367,8 @@ impl PaneWriter {
     /// do.
     pub(crate) fn drive_segments(&self, publish: &dyn Fn(u64)) {
         let input = Arc::clone(&self.pty.input);
-        let front = input.segments_front();
+        let release = input.segments_release();
+        let front = release.map(|(front, _)| front);
         #[cfg(test)]
         self.mid_pass();
         match front {
@@ -354,8 +390,19 @@ impl PaneWriter {
                 self.submit_trigger(number);
             }
             Some(Front::Released) => {
+                // Q147b, Q151b: while Claude waits to return, the release
+                // stops at a line-discipline key, which stays held; behind a
+                // probe's `Unarmed` release it stops at a signal key, which
+                // is refused with what follows it. A Ctrl+G behind a front
+                // that can never complete is refused in the same pass
+                // either way: what is refused starts at the op holding it,
+                // so a key held before it stays held.
+                let stop = release.map_or(Stop::Candidate, |(_, stop)| stop);
                 if self.gate.gate.segment_fenced() {
-                    self.release_held(Front::Released);
+                    self.release_held(Front::Released, stop);
+                    if stop == Stop::Signal {
+                        self.refuse_signal();
+                    }
                     self.refuse_stranded();
                 }
             }
@@ -366,7 +413,7 @@ impl PaneWriter {
                 if !self.gate.gate.segment_fenced() {
                     return;
                 }
-                self.release_held(Front::None);
+                self.release_held(Front::None, Stop::Candidate);
                 if !self.gate.gate.holds_any(|frame| frame.cut.is_some()) {
                     return;
                 }
@@ -405,13 +452,17 @@ impl PaneWriter {
     /// lock, so a fact that withdraws the release after this pass read the
     /// front (R-B-U2-02: an unknown wait's cut-off) leaves everything held.
     /// A target that exited refuses what comes back, as a release does.
-    fn release_held(&self, front: Front) -> usize {
+    /// With `stop` (Q147b, Q151b, [`crate::composer_probe::segments::Segments::front_stop`]),
+    /// it also stops before the first held key that stop names, under the
+    /// same re-read: a release goes only while the front still stops where
+    /// this pass read it stopping.
+    fn release_held(&self, front: Front, stop: Stop) -> usize {
         let in_flight = &self.pty.in_flight;
         let input = &self.pty.input;
         let mut carry: Option<Framing> = None;
         let frames = self.gate.gate.release_until_if(
-            || input.segments_front() == Some(front),
-            |frame| frame.measure(&mut carry),
+            || input.segments_release() == Some((front, stop)),
+            |frame| frame.measure(&mut carry, stop),
             |frame, n| {
                 // One more sub-op in flight: the rest stays held.
                 in_flight.count.fetch_add(1, Ordering::SeqCst);
@@ -444,7 +495,7 @@ impl PaneWriter {
     fn refuse_stranded(&self) -> usize {
         let input = &self.pty.input;
         let frames = self.gate.gate.refuse_held_if(
-            || input.segment_refuse_behind(),
+            |_| input.segment_refuse_behind(),
             |frame: &UserFrame| frame.cut.is_some(),
         );
         let refused = frames.len();
@@ -457,6 +508,43 @@ impl PaneWriter {
                 target: "composer_probe",
                 refused,
                 "a person's Ctrl+G behind a segment that can never complete refused, with what was held after it"
+            );
+        }
+        refused
+    }
+
+    /// Q151b: behind a probe's `Unarmed` release, whose helper runs the
+    /// person's editor while Claude is out of raw mode
+    /// ([`Stop::Signal`]), refuse the held op holding the first Ctrl+C,
+    /// Ctrl+\ or Ctrl+Z and every op held after it, when that key is the
+    /// first thing the release stopped at (a Ctrl+G before it is
+    /// [`Self::refuse_stranded`]'s, or waits). The release before this has
+    /// already let go what comes before the key in its op, as far as its
+    /// last ground point. The gate asks the segments under its own lock,
+    /// as a release does, and the segments waiting behind the front end
+    /// `Refused` in the same hold of the input's lock. Each refused op's
+    /// connection is told [`SIGNAL_KEY_REFUSED`] and its ticket settles
+    /// refused; none of it reaches the PTY. Fails closed: no timer, and
+    /// keys typed after this pass go on as the release lets them. How many
+    /// ops it refused.
+    fn refuse_signal(&self) -> usize {
+        let input = &self.pty.input;
+        let frames = self.gate.gate.refuse_held_if(
+            |first: &UserFrame| {
+                first.stop_key(Stop::Signal).is_some() && input.segment_refuse_signal()
+            },
+            |frame: &UserFrame| frame.cut.is_some() || frame.stop_key(Stop::Signal).is_some(),
+        );
+        let refused = frames.len();
+        for frame in frames {
+            frame.refuse_accepted(SIGNAL_KEY_REFUSED);
+            self.pty.in_flight.leave();
+        }
+        if refused > 0 {
+            tracing::info!(
+                target: "composer_probe",
+                refused,
+                "a person's Ctrl+C, Ctrl+\\ or Ctrl+Z behind a check's editor refused, with what was held after it"
             );
         }
         refused
@@ -835,6 +923,14 @@ fn writer_refusal_counts(refusal: ProbeRefusal) -> bool {
 /// shows it in brackets after its unnamed refusal.
 #[cfg(target_os = "linux")]
 pub(crate) const CTRL_G_REFUSED: &str = "ctrl-g-refused";
+
+/// Q151b: the reason a held Ctrl+C, Ctrl+\ or Ctrl+Z, with what was typed
+/// after it, is refused behind a check whose helper runs the person's editor
+/// while Claude is out of raw mode ([`PaneWriter::refuse_signal`]). Both
+/// clients show it in `inbox_display::input_rejected`'s words and keep the
+/// pane taking input, as for [`CTRL_G_REFUSED`].
+#[cfg(target_os = "linux")]
+pub(crate) const SIGNAL_KEY_REFUSED: &str = "signal-key-refused";
 
 /// Why a probe whose byte the PTY didn't take is refused.
 #[cfg(target_os = "linux")]

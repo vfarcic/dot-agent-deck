@@ -49,10 +49,30 @@
 //! same-user process that can't be read and started after an agent's spawn,
 //! such as an `sshd-session` per SSH login, makes that agent's frontiers
 //! `Missing` while it lives (Q85/Q86 keep it so).
+//!
+//! **A work bound.** The census reads at most [`CENSUS_TASK_BUDGET`] task
+//! tables; a reading that needs more is `Unknown` with step `budget`, so a
+//! machine with that many of the daemon user's tasks started after a spawn
+//! gets that generation's frontiers `Missing` rather than a longer stall of
+//! its output.
 
 use std::io;
 use std::os::fd::RawFd;
 use std::os::unix::fs::MetadataExt;
+
+/// The most tasks one census reads the descriptor table of. The census runs
+/// on the pane's reader thread, so this bounds how long a requested frontier
+/// can stall the agent's output: past it, the census stops and is
+/// `Unknown { step: "budget" }`, which publishes the frontier `Missing`, as
+/// any other incomplete reading does. A work bound, not a clock, so it means
+/// the same on every machine. Measured in a release build (PRD #1666 part 3,
+/// rec317, `frontier_request_latency` in `agent_pty_frontier_throughput.rs`):
+/// a requested frontier costs the census plus about 10 µs, and the census
+/// about 10 µs per process read plus 5.4 µs per further thread; 477
+/// processes with 1080 tasks took at most 12.7 ms over two runs, where a dev
+/// box's user ran about 700 tasks. 2048 caps one stall at roughly 11–20 ms
+/// on that hardware, about twice the worst figure measured.
+pub const CENSUS_TASK_BUDGET: usize = 2048;
 
 /// `PF_KTHREAD` in `/proc/<pid>/stat`'s flags.
 const PF_KTHREAD: u64 = 0x0020_0000;
@@ -325,8 +345,9 @@ fn holds(procs: &impl Procs, task: Task, master: &MasterId) -> io::Result<bool> 
 }
 
 /// Read every task of every process started at or after boot tick `since`,
-/// other than this process and kernel threads, for `master`. See the module
-/// documentation for what the result does and doesn't say.
+/// other than this process and kernel threads, for `master`, stopping at
+/// [`CENSUS_TASK_BUDGET`] tasks read. See the module documentation for what
+/// the result does and doesn't say.
 pub fn holders(master: &MasterId, since: u64) -> Holders {
     // SAFETY: `getuid` has no memory effects.
     scan(&Proc, master, since, std::process::id(), unsafe {
@@ -340,6 +361,7 @@ fn scan(procs: &impl Procs, master: &MasterId, since: u64, me: u32, uid: u32) ->
         Ok(pids) => pids,
         Err(e) => return Holders::unknown(0, "proc", &e),
     };
+    let mut read = 0usize;
     for pid in pids {
         if pid == me {
             continue;
@@ -357,6 +379,14 @@ fn scan(procs: &impl Procs, master: &MasterId, since: u64, me: u32, uid: u32) ->
             Err(e) => return Holders::unknown(pid, "task", &e),
         };
         for tid in tids {
+            if read == CENSUS_TASK_BUDGET {
+                return Holders::Unknown {
+                    pid,
+                    step: "budget",
+                    errno: None,
+                };
+            }
+            read += 1;
             let task = Task { pid, tid };
             let unreadable = match holds(procs, task, master) {
                 Ok(false) => continue,
@@ -1019,6 +1049,55 @@ mod tests {
         {
             assert_eq!(fake.scan(), Holders::NoneFound, "case {n}");
         }
+    }
+
+    /// The census reads at most [`CENSUS_TASK_BUDGET`] task tables (PRD
+    /// #1666 part 3, the reader-stall bound): the budget's worth of tasks,
+    /// with no holder among them, is still a complete reading; one task more
+    /// is `Unknown { step: "budget" }`, never `NoneFound`, even when that
+    /// task would hold the master; a holder within the budget is found.
+    #[test]
+    fn the_census_stops_after_its_task_budget_and_is_unknown() {
+        let process = |pid: u32, tasks: usize, last: FakeFd| {
+            // The leader's tid is its pid; the census reads its stat.
+            let tid = |n: usize| if n == 0 { pid } else { pid * 10_000 + n as u32 };
+            let scripts = (0..tasks)
+                .map(|n| {
+                    let fd = if n + 1 == tasks {
+                        last.clone()
+                    } else {
+                        plain()
+                    };
+                    (tid(n), vec![live()], Ok(Some(UID)), Ok(vec![fd]))
+                })
+                .collect();
+            Fake::default().with_tasks(pid, scripts)
+        };
+        // Split across processes, so the count is the census's, not a
+        // process's.
+        let two = |a: usize, b: usize, last: FakeFd| {
+            let mut fake = process(70, a, plain());
+            let second = process(71, b, last);
+            fake.order.extend(second.order);
+            fake.tasks.extend(second.tasks);
+            fake.task.extend(second.task);
+            fake
+        };
+        let half = CENSUS_TASK_BUDGET / 2;
+        let rest = CENSUS_TASK_BUDGET - half;
+        assert_eq!(two(half, rest, plain()).scan(), Holders::NoneFound);
+        assert_eq!(two(half, rest, holding()).scan(), Holders::Other(71));
+        let over = Holders::Unknown {
+            pid: 71,
+            step: "budget",
+            errno: None,
+        };
+        assert_eq!(two(half, rest + 1, plain()).scan(), over);
+        assert_eq!(
+            two(half, rest + 1, holding()).scan(),
+            over,
+            "the budget ends the census before the holder is read"
+        );
     }
 
     /// U2-02 in the script: a leader that exited (unreadable, ending) is

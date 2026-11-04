@@ -101,6 +101,7 @@ export const INBOX_WORDS = {
     stale: "Input not delivered: the agent in this pane was replaced or closed",
     "wrong-session": "Input not delivered: the agent in this pane was replaced or closed",
     "ctrl-g-refused": "Input not delivered: your Ctrl+G and what you typed after it; the deck passes no more Ctrl+G to this agent until it restarts",
+    "signal-key-refused": "Input not delivered: your Ctrl+C, Ctrl+Z or Ctrl+\\ and what you typed after it, while the deck's check had your editor open; type it again once the editor has closed",
     "": "Input not delivered",
   },
   /**

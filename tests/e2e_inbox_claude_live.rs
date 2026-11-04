@@ -160,6 +160,12 @@ impl Claude {
         installed::ops_in(self.log().get(since..).unwrap_or(""))
     }
 
+    /// The doorbell tick's checks since byte `since` of the log, each its
+    /// outcome's text.
+    fn checks(&self, since: usize) -> Vec<String> {
+        installed::checks_in(self.log().get(since..).unwrap_or(""))
+    }
+
     /// What the person typed into the pane since byte `since` of the log.
     fn human_in(&self, since: usize) -> String {
         installed::human_in(self.log().get(since..).unwrap_or(""), &self.pane.agent)
@@ -987,8 +993,7 @@ fn recalled_draft_trial(claude: &Claude, draft: &str) -> Value {
         );
         assert_eq!(claude.human_in(since), "", "no input byte of the person's");
         assert!(
-            !claude.log()[since..]
-                .contains("doorbell tick probe pane_id=1 agent_id=1 outcome=Written")
+            !claude.checks(since).iter().any(|c| c == "Written")
                 && !claude.log()[since..].contains("doorbell rang"),
             "no check written and no ring; {}",
             claude.evidence()
@@ -1042,10 +1047,13 @@ fn checked_and_held(
         "a check must read the box non-empty and hold the task; {}",
         claude.evidence()
     );
+    // The tick logs its check once the probe returns, which can be after
+    // the read it applied is on the card.
     assert!(
-        claude.log()[since..]
-            .lines()
-            .any(|l| l.contains("doorbell tick probe") && l.contains("outcome=Written")),
+        common::wait_until(Duration::from_secs(30), || claude
+            .checks(since)
+            .iter()
+            .any(|c| c == "Written")),
         "the hold comes from a check; {}",
         claude.evidence()
     );
@@ -1094,6 +1102,24 @@ fn checked_and_held(
     held
 }
 
+/// After a hold over a whitespace-only draft whose row reads like the empty
+/// box: `End` alone must put the cursor `columns` past `start`, so the draft
+/// survived the check (a check is an editor round trip, and the row alone
+/// can't tell blanks from an empty box). `End` is a touch: the next check
+/// reads the box again and holds the task again.
+#[cfg(target_os = "linux")]
+fn end_reaches(claude: &Claude, start: (u16, u16), columns: u16, what: &str) {
+    claude.deck.send_keys(b"\x05");
+    let end = (start.0, start.1 + columns);
+    assert!(
+        common::wait_until(Duration::from_secs(30), || box_frame(claude)
+            .is_some_and(|f| f.1 == end)),
+        "{what}: End must reach the draft's end at {end:?}, so the draft survived the check; got {:?}; {}",
+        box_frame(claude),
+        claude.evidence()
+    );
+}
+
 /// The installed release's banner, for the tests that name it.
 #[cfg(target_os = "linux")]
 fn installed_banner() -> String {
@@ -1130,9 +1156,10 @@ fn doorbell_010_live_spaces_only_draft_stays_held() {
         "positive control must really use the doorbell; {}",
         claude.evidence()
     );
-    // vt100 trims trailing ASCII blanks from contents(). The cursor's exact
-    // three-column displacement, paired with the unchanged blank row and
-    // the person's ledger, distinguishes three spaces from the empty box.
+    // Here the row's text reads the same with the three spaces as without
+    // them. The cursor's exact three-column displacement, paired with the
+    // unchanged blank row and the person's ledger, distinguishes three spaces
+    // from the empty box.
     let empty = box_frame(&claude).expect("the box is drawn");
     assert!(
         blank_row(&empty),
@@ -1195,7 +1222,7 @@ fn doorbell_010_live_spaces_only_draft_stays_held() {
     );
 }
 
-/// Scenario: In a pane the deck installs its editor helper into, complete a doorbell-delivered control task in real interactive Claude Code of a release whose editor probe the deck has verified, disable its next native waiter, type exactly three spaces and then press Left three times, so the box's row and cursor are exactly those of the empty box again, before posting another sentinel task. A check reads the box non-empty, and Claude Code draws it back exactly as before the check; for five seconds after it the row and cursor stay those of the empty box, the person types nothing, the deck types nothing but its check's byte, the task stays queued with zero deliveries, and the card names the draft hold. Move to the end and clear the spaces; the next check reads the box empty and the original task is delivered once by the doorbell and writes its sentinel once.
+/// Scenario: In a pane the deck installs its editor helper into, complete a doorbell-delivered control task in real interactive Claude Code of a release whose editor probe the deck has verified, disable its next native waiter, type exactly three spaces and then press Left three times, so the box's row and cursor are exactly those of the empty box again, before posting another sentinel task. A check reads the box non-empty, and Claude Code draws it back exactly as before the check; for five seconds after it the row and cursor stay those of the empty box, the person types nothing, the deck types nothing but its check's byte, the task stays queued with zero deliveries, and the card names the draft hold. End alone then puts the cursor three columns on, so the spaces survived the check. Clear them; the next check reads the box empty and the original task is delivered once by the doorbell and writes its sentinel once.
 #[spec("inbox/doorbell/010")]
 #[test]
 #[cfg(target_os = "linux")]
@@ -1269,6 +1296,7 @@ fn doorbell_010_live_spaces_moved_back_draft_stays_held() {
             claude.deck.snapshot_grid()
         ))
     );
+    end_reaches(&claude, empty.1, 3, "the three spaces moved back");
     // Clear from the end: Ctrl+U alone erases only up to the cursor.
     claude.deck.send_keys(b"\x05\x15");
     claude.done(&id, name, false);
@@ -1283,7 +1311,7 @@ fn doorbell_010_live_spaces_moved_back_draft_stays_held() {
     );
 }
 
-/// Scenario: In a pane the deck installs its editor helper into, with real interactive Claude Code of a release whose editor probe the deck has verified and its native waiter armed, type two spaces, a non-ASCII character, Backspace and Ctrl+A, so the box is blank with the cursor at its start, then press Enter, which submits nothing; post a sentinel task that the native wake delivers, so the agent runs a whole turn of its own, then disable its next native waiter and post another. A check reads the box non-empty; for five seconds after it the blanks stay, the person types nothing, the deck types nothing but its check's byte, the task stays queued with zero deliveries and the card names the draft hold. Move to the end and clear the spaces; the next check reads the box empty and the task is delivered once through the doorbell.
+/// Scenario: In a pane the deck installs its editor helper into, with real interactive Claude Code of a release whose editor probe the deck has verified and its native waiter armed, type two spaces, a non-ASCII character, Backspace and Ctrl+A, so the box is blank with the cursor at its start, then press Enter, which submits nothing; post a sentinel task that the native wake delivers, so the agent runs a whole turn of its own, then disable its next native waiter and post another. A check reads the box non-empty; for five seconds after it the blanks stay with the cursor where it was, the person types nothing, the deck types nothing but its check's byte, the task stays queued with zero deliveries and the card names the draft hold. End alone then puts the cursor two columns on, so the blanks survived the check. Clear them; the next check reads the box empty and the task is delivered once through the doorbell.
 #[spec("inbox/doorbell/010")]
 #[test]
 #[cfg(target_os = "linux")]
@@ -1377,6 +1405,12 @@ fn doorbell_010_live_blanks_enter_and_an_unrelated_turn_stay_held() {
         claude.evidence()
     );
     assert_eq!(
+        held.1,
+        before.1,
+        "the check leaves the cursor at the blanks' start; {}",
+        claude.evidence()
+    );
+    assert_eq!(
         claude.record()["inbox"]["wake_hold"],
         "possible_draft",
         "the blanks must report the draft hold; {}",
@@ -1397,6 +1431,7 @@ fn doorbell_010_live_blanks_enter_and_an_unrelated_turn_stay_held() {
             claude.deck.snapshot_grid()
         ))
     );
+    end_reaches(&claude, before.1, 2, "the two blanks after Enter");
     claude.deck.send_keys(b"\x05\x15");
     claude.done(&id, name, false);
     assert!(
@@ -1407,7 +1442,7 @@ fn doorbell_010_live_blanks_enter_and_an_unrelated_turn_stay_held() {
     );
 }
 
-/// Scenario: In a pane the deck installs its editor helper into, with real interactive Claude Code of a release whose editor probe the deck has verified, complete a doorbell-delivered control task with native delivery disabled, then type the reviewer's sequence one key at a time: ab, Ctrl+J, two spaces, Home, Ctrl+U, Home, Backspace, Delete, Delete, Ctrl+U; Claude joins the second line to the first at that Ctrl+U, so two spaces stay in a box that looks empty. Post a sentinel task: a check reads the box non-empty, and for five seconds after it the box is unchanged, the person types nothing, the deck types nothing but its check's byte, the task stays queued with zero deliveries, no ring starts, and the card names the draft hold; then type x and press Ctrl+C once, the remedy the docs name; the next check reads the box empty and the task is delivered once through the doorbell.
+/// Scenario: In a pane the deck installs its editor helper into, with real interactive Claude Code of a release whose editor probe the deck has verified, complete a doorbell-delivered control task with native delivery disabled, then type the reviewer's sequence one key at a time: ab, Ctrl+J, two spaces, Home, Ctrl+U, Home, Backspace, Delete, Delete, Ctrl+U; Claude joins the second line to the first at that Ctrl+U, so two spaces stay in a box that looks empty. Post a sentinel task: a check reads the box non-empty, and for five seconds after it the box is unchanged, the cursor where it was, the person types nothing, the deck types nothing but its check's byte, the task stays queued with zero deliveries, no ring starts, and the card names the draft hold; End alone then puts the cursor two columns on, so the spaces survived the check; then type x and press Ctrl+C once, the remedy the docs name; the next check reads the box empty and the task is delivered once through the doorbell.
 #[spec("inbox/doorbell/010")]
 #[test]
 #[cfg(target_os = "linux")]
@@ -1474,6 +1509,12 @@ fn doorbell_010_live_reviewer_sequence_stays_held_until_a_letter_and_ctrl_c() {
         claude.evidence()
     );
     assert_eq!(
+        held.1,
+        before.1,
+        "the check leaves the cursor at the two spaces' start; {}",
+        claude.evidence()
+    );
+    assert_eq!(
         claude.record()["inbox"]["wake_hold"],
         "possible_draft",
         "the two spaces must report the draft hold; {}",
@@ -1494,6 +1535,7 @@ fn doorbell_010_live_reviewer_sequence_stays_held_until_a_letter_and_ctrl_c() {
             claude.deck.snapshot_grid()
         ))
     );
+    end_reaches(&claude, before.1, 2, "the reviewer sequence's two spaces");
     // The remedy the docs name: a letter, so Ctrl+C has something to clear,
     // then Ctrl+C once.
     let remedy = claude.log().len();
@@ -1512,6 +1554,186 @@ fn doorbell_010_live_reviewer_sequence_stays_held_until_a_letter_and_ctrl_c() {
         "the remedy reached the pane before anything else: {:?}",
         claude.human_in(remedy)
     );
+}
+
+/// Where a person's Ctrl+C landed against the first check in `log`
+/// (Q147b): accepted after that check's byte was written and before its
+/// segment ended, i.e. while the check was running.
+#[cfg(target_os = "linux")]
+fn ctrl_c_inside_check(log: &str, agent: &str) -> bool {
+    let lines: Vec<&str> = log.lines().collect();
+    let written = lines
+        .iter()
+        .position(|l| l.contains("doorbell tick probe") && l.contains("outcome=Written"));
+    let ctrl_c = lines.iter().position(|l| {
+        l.contains("STREAM_IN forwarded to PTY writer")
+            && l.contains(&format!("agent_id={agent} "))
+            && l.ends_with("payload=\\x03")
+    });
+    let (Some(written), Some(ctrl_c)) = (written, ctrl_c) else {
+        return false;
+    };
+    let ended = lines
+        .iter()
+        .enumerate()
+        .skip(written)
+        .find(|(_, l)| l.contains("segment ended") && l.contains("kind: Probe"))
+        .map(|(i, _)| i);
+    ctrl_c > written && ended.is_some_and(|ended| ctrl_c < ended)
+}
+
+/// The milliseconds from the first check's settled decision in `log` (where
+/// a Claude release went before Q147b) to Claude's `?2004h` after it (E1,
+/// where a held line-discipline key goes since Q151b: the hold it adds to
+/// such a key), and to its segment's end (where Q147b sent it, which also
+/// waits for the helper's exit drain).
+#[cfg(target_os = "linux")]
+fn decision_to_return_ms(log: &str) -> Option<(Option<f64>, f64)> {
+    let at = |line: &str| -> Option<f64> {
+        // `2026-11-04T07:01:46.103516Z ...`: seconds of the day.
+        let time = line.get(11..26)?;
+        let (h, rest) = time.split_once(':')?;
+        let (m, sec) = rest.split_once(':')?;
+        Some(
+            h.parse::<f64>().ok()? * 3600.0
+                + m.parse::<f64>().ok()? * 60.0
+                + sec.parse::<f64>().ok()?,
+        )
+    };
+    let mut lines = log
+        .lines()
+        .skip_while(|l| !(l.contains("doorbell tick probe") && l.contains("outcome=Written")));
+    let settled = at(lines.find(|l| l.contains("probe settled"))?)?;
+    let after: Vec<&str> = lines.collect();
+    let ended = after
+        .iter()
+        .find(|l| l.contains("segment ended") && l.contains("kind: Probe"))?;
+    let enabled = after
+        .iter()
+        .find(|l| l.contains("return markers") && l.contains("PasteOn"))
+        .and_then(|l| at(l));
+    Some((
+        enabled.map(|e| (e - settled) * 1000.0),
+        (at(ended)? - settled) * 1000.0,
+    ))
+}
+
+/// Scenario: In a pane the deck installs its editor helper into, with real interactive Claude Code of a release whose editor probe the deck has verified, and native delivery disabled, type a letter and post a sentinel task, which a check holds behind that draft; then type a second letter, which starts another check, and press Ctrl+C the moment that check's byte is written, while Claude Code has handed its terminal to the check. Repeated, four trials to a freshly started deck, until twenty Ctrl+C presses have landed inside a check: every time Claude Code keeps running, the Ctrl+C clears the box, and the task is delivered once through the doorbell (Q147b: a Ctrl+C typed during a check had ended the session).
+#[spec("inbox/doorbell/010")]
+#[test]
+#[cfg(target_os = "linux")]
+fn doorbell_010_live_ctrl_c_during_a_check_leaves_claude_running() {
+    skip_unless!(installed::checkable());
+    const LANDED: usize = 20;
+    const MAX_TRIALS: usize = 32;
+    // A test deck's daemon stops itself after 300 s (the harness's lifetime
+    // cap), and a trial is a Haiku turn of about 40 s: four to a deck.
+    const PER_DECK: usize = 4;
+    let mut landed = 0;
+    let mut trials = 0;
+    let mut decks = 0;
+    while landed < LANDED && trials < MAX_TRIALS {
+        decks += 1;
+        let claude = Claude::installed();
+        claude.deck.wait_for_string("? for shortcuts");
+        assert!(
+            claude.pane_grid().contains(&installed_banner()),
+            "the verified release runs; {}",
+            claude.evidence()
+        );
+        let claude = fallback_ready_with(claude, &format!("ctrl-c-check-{decks}"));
+        for _ in 0..PER_DECK {
+            if landed >= LANDED || trials >= MAX_TRIALS {
+                break;
+            }
+            trials += 1;
+            if ctrl_c_trial(&claude, trials) {
+                landed += 1;
+            }
+            eprintln!("deck {decks}, trial {trials}: Ctrl+C inside the check: {landed} so far");
+        }
+    }
+    assert!(
+        landed >= LANDED,
+        "only {landed} of {trials} Ctrl+C presses landed inside a check"
+    );
+}
+
+/// One trial of `doorbell_010_live_ctrl_c_during_a_check_leaves_claude_running`
+/// on an idle `claude` with native delivery disabled and an empty box:
+/// whether its Ctrl+C landed inside a check. Claude Code must keep running,
+/// the task must be delivered once, and the next waiter is killed again.
+#[cfg(target_os = "linux")]
+fn ctrl_c_trial(claude: &Claude, trial: usize) -> bool {
+    let start = claude.log().len();
+    claude.deck.send_keys(b"w");
+    claude.expect_composer("w");
+    let name = format!("ctrl-c-check-{trial}-5d2a.txt");
+    let id = claude.post(&claude.directive(&name));
+    assert!(
+        common::wait_until(BUDGET, || claude.record()["inbox"]["wake_hold"]
+            == "possible_draft"
+            && claude.checks(start).iter().any(|c| c == "Written")),
+        "trial {trial}: a check must hold the task behind the draft; {}",
+        claude.evidence()
+    );
+    assert!(
+        common::wait_until(Duration::from_secs(30), || claude
+            .log()
+            .get(start..)
+            .unwrap_or("")
+            .contains("segment ended")
+            && claude.composer().as_deref() == Some("w")),
+        "trial {trial}: the first check ends with the draft kept; {}",
+        claude.evidence()
+    );
+    // The second letter touches the box, so the next tick checks it: the
+    // Ctrl+C goes as soon as that check's byte is in the log. Polled with no
+    // pause, since a check runs for tens of milliseconds, under
+    // `wait_until`'s 50 ms step; it spins only until the tick's check.
+    let touch = claude.log().len();
+    claude.deck.send_keys(b"x");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !claude.checks(touch).iter().any(|c| c == "Written") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "trial {trial}: the touch must start a check; {}",
+            claude.evidence()
+        );
+        std::thread::yield_now();
+    }
+    claude.deck.send_keys(b"\x03");
+    claude.done(&id, &name, false);
+    let log = claude.log();
+    let since = log.get(touch..).unwrap_or("");
+    assert!(
+        !since.contains("pane_command_exited") && !since.contains("event_type=SessionEnd"),
+        "trial {trial}: Claude Code must keep running after the Ctrl+C; {}",
+        claude.evidence()
+    );
+    assert!(
+        claude.human_in(touch).starts_with("x\\x03"),
+        "trial {trial}: the letter and the Ctrl+C reached the pane in order: {:?}",
+        claude.human_in(touch)
+    );
+    let landed = ctrl_c_inside_check(since, &claude.pane.agent);
+    eprintln!(
+        "trial {trial}: Claude kept running; inside the check: {landed}; decision to Claude's return, to the segment's end: {:?} ms",
+        decision_to_return_ms(since)
+    );
+    // As the control turn: the next native waiter, killed, so the next
+    // trial's task is held and delivered by the doorbell.
+    assert!(
+        common::wait_until(BUDGET, || {
+            claude.listing()["armed"].as_u64().unwrap_or(0) > 0
+                && claude.record()["live"]["status"] == "Idle"
+        }),
+        "trial {trial}: the task's turn must finish; {}",
+        claude.evidence()
+    );
+    kill_trial_waiter(claude);
+    claude.expect_composer("");
+    landed
 }
 
 /// Scenario: In a pane the deck installs its editor helper into, complete a doorbell-delivered control task in real interactive Haiku, send a prompt of your own, then recall it with Up and press Enter, which submits it again, while native delivery is disabled. Once that turn ends, post another sentinel task: a check must read the box empty and the doorbell type the task without another keypress.

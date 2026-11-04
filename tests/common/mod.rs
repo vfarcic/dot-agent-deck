@@ -10851,6 +10851,38 @@ pub(crate) fn config_containment_env() -> [(&'static str, String); 2] {
     ]
 }
 
+/// The umask every harness process runs under (PRD #1666 part 3, act28):
+/// group and others lose write, so the modes the harness's directories get
+/// don't depend on the developer's umask.
+#[cfg(unix)]
+const HARNESS_UMASK: libc::mode_t = 0o022;
+
+/// Sets the process umask to [`HARNESS_UMASK`], once per test process, from
+/// [`harness_temp_root`]'s initialisation.
+///
+/// The composer probe's path rule (`src/composer_probe/path_rule.rs`) refuses
+/// an export whose directories are group- or other-writable, and the harness
+/// puts the agent's `TMPDIR`, `CODEX_HOME` and their parents under the
+/// per-test HOME. Under a developer's `umask 0002` those directories, the
+/// HOME included, were created `0775`, the path rule refused them, and 25
+/// lane-1 tests in `e2e_probe_delivery` and `e2e_live_segments` failed
+/// locally while passing on RWX for the same tree. Pinning the umask
+/// covers the directories the harness makes and those its daemon's children
+/// (Python and Rust stand-ins) make, which a mode given at each of the
+/// harness's own calls would not reach.
+///
+/// A test that needs another umask still sets and restores its own, as
+/// `tests/context_publish.rs` does; this only replaces the inherited one.
+#[cfg(unix)]
+fn pin_harness_umask() {
+    // SAFETY: `umask(2)` swaps a per-process value and cannot fail. nextest
+    // runs one process per test, and this runs inside a `OnceLock`
+    // initialisation before the harness creates its temp root.
+    unsafe {
+        libc::umask(HARNESS_UMASK);
+    }
+}
+
 pub(crate) fn harness_temp_root() -> &'static Path {
     HARNESS_TEMP_ROOT
         .get_or_init(|| {
@@ -10859,6 +10891,11 @@ pub(crate) fn harness_temp_root() -> &'static Path {
             // is where the panic hook — and with it the load baseline — gets
             // installed for them. Idempotent; a no-op when already installed.
             install_credential_redaction();
+            // Before the first directory the harness makes, so that it, the
+            // daemons it spawns and their stand-ins create everything at the
+            // same modes whatever the developer's umask is.
+            #[cfg(unix)]
+            pin_harness_umask();
             let choice = harness_temp_base();
             for warning in &choice.warnings {
                 eprintln!("[harness] WARNING: {warning}");

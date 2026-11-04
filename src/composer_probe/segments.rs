@@ -64,7 +64,14 @@
 //! subsumed by a later invocation doesn't complete its segment, which then
 //! holds until retirement. The rows:
 //! - Claude `Probe`: released at its record's `Armed` or `Unarmed` decision;
-//!   complete at E1 (helper-only) or EC.
+//!   complete at E1 (helper-only) or EC. An `Armed` release, here and in
+//!   Claude's `HumanG` stage 2 below, stops at the first held
+//!   [`line_discipline_key`] until E1 is read ([`Segments::front_stop`],
+//!   Q147b, Q151b): Claude is out of raw mode until then, so a Ctrl+C would
+//!   be a SIGINT. An `Unarmed` release of a `Probe` (the person never
+//!   pressed Ctrl+G, so the editor it opens is not one they asked for)
+//!   refuses the first held [`signal_key`] and everything after it until its
+//!   helper's exit has drained (Q151b).
 //! - Codex `Probe`, and Codex `HumanG` stage 2 `Armed`: released at
 //!   completion, E1F.
 //! - Claude `HumanG` stage 2 `Armed`: released at the decision; complete at
@@ -103,9 +110,11 @@
 //! person's Ctrl+G during a check whose segment released to their editor
 //! leaves one. A later Ctrl+G behind it would wait for retirement and be
 //! discarded there, with what was typed after it, so the release driver
-//! refuses it instead, with what the gate holds after it, once the release
-//! has gone as far as it ([`Segments::refuse_behind`], R-HOLD's bounded
-//! refusal, the user's ruling of 2026-11-03): what is typed afterwards goes
+//! refuses it instead, with what the gate holds after it, in the pass that
+//! finds it held: a release that stops before it at a key waiting for
+//! Claude's return keeps that key held, since what is refused starts at the
+//! op holding the Ctrl+G ([`Segments::refuse_behind`], R-HOLD's bounded
+//! refusal, the user's ruling of 2026-11-03, Q151b): what is typed afterwards goes
 //! on to the pane as the release lets it. The segment itself stays open, so
 //! each later Ctrl+G is refused the same way while it stays released (an
 //! unknown wait's cut-off makes it hold everything instead), and no probe
@@ -184,6 +193,55 @@ pub enum Kind {
     Probe,
     /// A person's Ctrl+G held behind an earlier segment.
     HumanG,
+}
+
+/// Q147b: a byte a terminal out of raw mode acts on rather than queueing it
+/// as typed, under the control characters a pane starts with: the deck sets
+/// no termios on a pane, so they are the kernel's pts defaults, and Claude
+/// switches only the mode flags for its editor (strace shows the flags; its
+/// `c_cc` array is elided, so the values rest on the defaults and on the
+/// deck setting none). They are the default control characters of
+/// `termios(3)`: Ctrl+C, Ctrl+\ and Ctrl+Z (the [`signal_key`]s), Ctrl+D
+/// (end of file), Backspace (erase, `0x7f`; the forward-Delete key sends an
+/// escape sequence and is not one), Ctrl+U (kill), Ctrl+W (word erase),
+/// Ctrl+R (reprint), Ctrl+V (literal next), Ctrl+O (discard), Ctrl+S and
+/// Ctrl+Q (flow control), and Enter, which `ICRNL` turns into a line feed.
+/// Other bytes, the BEL ending an OSC reply among them, are queued
+/// unchanged. It is the raw byte, wherever it sits in the input's framing:
+/// the line discipline reads no escape sequences, so a byte inside a paste
+/// or a sequence counts as well (a release then stops at the last ground
+/// point before it), and so does one after an Alt's ESC. A wrapper that
+/// remaps these keys with `stty` makes this fixed set wrong for its pane;
+/// and a BSD port would add `VSTATUS` (Ctrl+T) and `VDSUSP` (Ctrl+Y), which
+/// Linux has not (the release driver is Linux only).
+pub fn line_discipline_key(byte: u8) -> bool {
+    matches!(
+        byte,
+        0x03 | 0x04 | 0x0d | 0x0f | 0x11 | 0x12 | 0x13 | 0x15 | 0x16 | 0x17 | 0x1a | 0x1c | 0x7f
+    )
+}
+
+/// Q151b: the [`line_discipline_key`]s a terminal with `ISIG` set turns
+/// into a signal to its foreground process group rather than input, under
+/// the default control characters: Ctrl+C (`VINTR`), Ctrl+\ (`VQUIT`) and
+/// Ctrl+Z (`VSUSP`).
+pub fn signal_key(byte: u8) -> bool {
+    matches!(byte, 0x03 | 0x1a | 0x1c)
+}
+
+/// Where the front segment's release stops short of the next held Ctrl+G
+/// candidate, and what happens to the byte it stops at
+/// ([`Segments::front_stop`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stop {
+    /// Only at the next held candidate.
+    Candidate,
+    /// Q147b: also at the first held [`line_discipline_key`], which waits
+    /// with everything after it until Claude's return (E1).
+    Cooked,
+    /// Q151b: also at the first held [`signal_key`], which is refused with
+    /// everything held after it.
+    Signal,
 }
 
 /// A return marker in the output.
@@ -764,6 +822,79 @@ impl Segments {
             Some(seg) if seg.released && !seg.cut_off => Front::Released,
             Some(_) => Front::Held,
         }
+    }
+
+    /// Where the front segment's release stops short of the next held
+    /// candidate ([`Stop`]). Only a released Claude segment stops anywhere
+    /// else: Codex releases nothing before its return.
+    ///
+    /// - [`Stop::Cooked`] (Q147b, Q151b): released on an `Armed` decision (a
+    ///   `Probe`'s, or a `HumanG`'s second stage), whose E1 hasn't been read.
+    ///   What it releases goes to a Claude that left raw mode to run its
+    ///   editor, here the deck's helper, and Claude's `?2004h` after a
+    ///   `?2004l` after the trigger (E1) is written after it is back in raw
+    ///   mode: Claude's editor spawn blocks it, and strace of 2.1.317 shows
+    ///   the switch back to raw before the write carrying the `?2004h` at
+    ///   each round trip. Until then the line discipline acts on those keys
+    ///   instead of queueing them: a Ctrl+C is a SIGINT to Claude's process
+    ///   group, which ends the session, an Enter is read back as a line
+    ///   feed, a Backspace erases a key queued before it. The ordinary keys
+    ///   M44 measured are kept, so they still go at the release. The
+    ///   helper's exit drain is not waited for: it says nothing more about
+    ///   Claude's mode, and the observer that reports it can be starved.
+    /// - [`Stop::Signal`] (Q151b): a `Probe` released on an `Unarmed`
+    ///   decision whose helper's exit hasn't drained. Its helper runs the
+    ///   person's editor, which the person didn't ask for (they pressed no
+    ///   Ctrl+G), while Claude is out of raw mode; one that never takes raw
+    ///   mode (a GUI editor) leaves the terminal there for the whole edit,
+    ///   so a Ctrl+C, Ctrl+\ or Ctrl+Z would signal Claude. Its helper's
+    ///   drained exit says the editor is gone. A `HumanG`'s `Unarmed`
+    ///   release goes to the editor the person asked for, as it would
+    ///   without the deck, so it stops at the candidate only.
+    pub fn front_stop(&self, records: &Records) -> Stop {
+        let Some(seg) = self.segments.front() else {
+            return Stop::Candidate;
+        };
+        if self.agent != Agent::Claude || !seg.released || seg.cut_off {
+            return Stop::Candidate;
+        }
+        let Some(key) = seg.record else {
+            return Stop::Candidate;
+        };
+        // A matched record deleted by a subsumption leaves its kept facts.
+        let record = records.get(key);
+        let decision = record
+            .and_then(|r| r.decision)
+            .or_else(|| seg.fact.and_then(|f| f.decision));
+        let drained = record.map_or(seg.fact.is_some(), |r| r.drained);
+        match decision {
+            Some(Decision::Armed) if !self.returned(seg) => Stop::Cooked,
+            Some(Decision::Unarmed) if seg.kind == Kind::Probe && !drained => Stop::Signal,
+            _ => Stop::Candidate,
+        }
+    }
+
+    /// Whether `seg`'s E1 has been read, as `self.agent`'s return needs it.
+    fn returned(&self, seg: &Segment) -> bool {
+        seg.e1.as_ref().is_some_and(|w| w.returned(self.agent))
+    }
+
+    /// The release driver refuses the first held [`signal_key`] behind a
+    /// front whose release stops at one ([`Stop::Signal`]), with what is
+    /// held after it: every segment waiting behind the front ends
+    /// [`Outcome::Refused`], and the front stays. Whether it does, so the
+    /// caller may refuse what the gate holds from that key on. The caller
+    /// refuses only when that key is the first thing a release stops at, so
+    /// every `HumanG` waiting here is one of the ops refused.
+    pub fn refuse_signal_behind(&mut self, records: &Records) -> bool {
+        if self.front_stop(records) != Stop::Signal {
+            return false;
+        }
+        let behind: VecDeque<Segment> = self.segments.drain(1..).collect();
+        for seg in behind {
+            self.ended.push(seg.end(Outcome::Refused));
+        }
+        true
     }
 
     /// Whether the only open segment is a Claude probe that lapsed (core

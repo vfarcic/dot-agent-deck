@@ -689,10 +689,11 @@ fn doorbell_053_an_assumed_head_echo_completes_only_that_codex_record() {
     );
 }
 
-/// Scenario: Ask the table about each release the deck carries a record for, as it ships. Claude Code 2.1.310, 2.1.312, 2.1.317 and 2.1.318 are Go, unstaged, with their editor probes absent, while 2.1.311 and 2.1.319 remain unmeasured; both Codex releases stage the line and are held as missing_measurement until their head echo is recorded; and every record has its parser cost verified.
+/// Scenario: Ask the table about each release the deck carries a record for, as it ships. Claude Code 2.1.310, 2.1.312, 2.1.317 and 2.1.318 are Go, unstaged, 2.1.317 with its measured editor probe and the others with theirs absent, while 2.1.311 and 2.1.319 remain unmeasured; both Codex releases stage the line and are held as missing_measurement until their head echo is recorded; and every record has its parser cost verified.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_the_shipped_records_verdicts() {
+    use dot_agent_deck::doorbell_activation::CLAUDE_2_1_317_EDITOR_PROBE;
     for record in &RELEASE_RECORDS {
         assert!(
             matches!(record.parser_cost, Measurement::Verified(())),
@@ -718,7 +719,14 @@ fn doorbell_053_the_shipped_records_verdicts() {
             .iter()
             .find(|record| record.agent == CLAUDE && record.release == v(release))
             .expect("measured Claude release record");
-        assert!(matches!(record.editor_probe, Measurement::Absent));
+        if release == "2.1.317" {
+            assert_eq!(
+                record.editor_probe,
+                Measurement::Verified(CLAUDE_2_1_317_EDITOR_PROBE)
+            );
+        } else {
+            assert!(matches!(record.editor_probe, Measurement::Absent));
+        }
         assert_eq!(
             activation(
                 &RELEASE_RECORDS,
@@ -962,17 +970,18 @@ fn doorbell_053_editor_records_move_no_verdict_in_any_table() {
     assert_eq!(tables, 4usize.pow(5));
 }
 
-/// Scenario: Ask about each record the deck ships, as shipped and with the e2e assumption giving every one of them a verified editor record. Every shipped record's editor record is absent; the assumption changes that field and nothing else, adds no record, and leaves every verdict, Claude Code 2.1.310's Go and both Codex releases' missing_measurement, as it was.
+/// Scenario: Ask about each record the deck ships, as shipped and with the e2e assumption giving every one of them a verified editor record. Every shipped record's editor record is absent except Claude Code 2.1.317's measured one; the assumption changes that field and nothing else, adds no record, and leaves every verdict, Claude Code 2.1.310's Go and both Codex releases' missing_measurement, as it was.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_the_editor_probe_assumption_moves_no_shipped_verdict() {
+    use dot_agent_deck::doorbell_activation::CLAUDE_2_1_317_EDITOR_PROBE;
     for record in &RELEASE_RECORDS {
-        assert_eq!(
-            record.editor_probe,
-            Measurement::Absent,
-            "{}",
-            record.release
-        );
+        let expected = if record.agent == CLAUDE && record.release == v("2.1.317") {
+            Measurement::Verified(CLAUDE_2_1_317_EDITOR_PROBE)
+        } else {
+            Measurement::Absent
+        };
+        assert_eq!(record.editor_probe, expected, "{}", record.release);
     }
     let all: Vec<_> = RELEASE_RECORDS
         .iter()
@@ -985,7 +994,7 @@ fn doorbell_053_the_editor_probe_assumption_moves_no_shipped_verdict() {
         assert_eq!(after.editor_probe, Measurement::Verified(PROBE));
         assert_eq!(
             &ReleaseRecord {
-                editor_probe: Measurement::Absent,
+                editor_probe: before.editor_probe,
                 ..after.clone()
             },
             before
@@ -1009,8 +1018,9 @@ fn doorbell_053_the_editor_probe_assumption_moves_no_shipped_verdict() {
     let one = with_assumed_editor_probes(RELEASE_RECORDS.to_vec(), &[(CODEX, v("0.160.0"), PROBE)]);
     let verified: Vec<String> = one
         .iter()
-        .filter(|r| r.editor_probe != Measurement::Absent)
-        .map(|r| format!("{:?}@{}", r.agent, r.release))
+        .zip(&RELEASE_RECORDS)
+        .filter(|(after, before)| after != before)
+        .map(|(r, _)| format!("{:?}@{}", r.agent, r.release))
         .collect();
     assert_eq!(verified, ["Codex@0.160.0"]);
 }

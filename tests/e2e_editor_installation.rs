@@ -18,12 +18,12 @@ use std::path::Path;
 const ASSUME: &str = "DOT_AGENT_DECK_E2E_ASSUME_EDITOR_PROBE";
 const ENTRIES: &str = "claude@2.1.310,codex@0.164.0";
 
-/// Scenario: Start synthetic Claude, Codex, OpenCode, Pi and wrapper commands with installation disabled, preserving unset, empty and nonempty editor values. Their startup reports must show the original environment and the original positional arguments, with no helper substituted.
+/// Scenario: Start synthetic Codex, OpenCode, Pi and wrapper commands with installation disabled (a direct Claude is installed by the shipped rollout, so it is not among them), preserving unset, empty and nonempty editor values. Their startup reports must show the original environment and the original positional arguments, with no helper substituted.
 #[spec("inbox/probe/012")]
 #[test]
 fn probe_012_disabled_installation_preserves_spawn_environment_and_arguments() {
     let daemon = common::spawn_daemon_serve_with_env(None, "0", &[]);
-    for kind in ["claude", "codex", "opencode", "pi", "wrapper"] {
+    for kind in ["codex", "opencode", "pi", "wrapper"] {
         for (state, original) in [
             ("unset", None),
             ("empty", Some("")),
@@ -54,7 +54,7 @@ fn probe_012_disabled_installation_preserves_spawn_environment_and_arguments() {
     }
 }
 
-/// Scenario: Start the real daemon with installation disabled, a runtime directory of its own, and stale helper variables in its own environment, then start synthetic Claude, Codex, OpenCode, Pi, wrapper, launcher and shell commands. No instance directory appears under the state or runtime directory at startup or after the spawns, no command inherits a variable under the helper's reserved prefix, and each keeps its own editor values and argv.
+/// Scenario: Start the real daemon with installation disabled, a runtime directory of its own, and stale helper variables in its own environment, then start synthetic Codex, OpenCode, Pi, wrapper, launcher and shell commands (not a direct Claude, which the shipped rollout installs). No instance directory appears under the state or runtime directory at startup or after the spawns, no command inherits a variable under the helper's reserved prefix, and each keeps its own editor values and argv.
 #[spec("inbox/probe/012")]
 #[test]
 fn probe_012_a_disabled_spawn_makes_no_files_and_inherits_no_helper_variable() {
@@ -80,9 +80,7 @@ fn probe_012_a_disabled_spawn_makes_no_files_and_inherits_no_helper_variable() {
     };
     no_instance("startup");
     let original = Some("user-editor --literal");
-    for kind in [
-        "claude", "codex", "opencode", "pi", "wrapper", "launcher", "shell",
-    ] {
+    for kind in ["codex", "opencode", "pi", "wrapper", "launcher", "shell"] {
         let spawned = spawn(&daemon, kind, kind, "2.1.310", original, None, false);
         for name in ["VISUAL", "EDITOR"] {
             assert_eq!(
