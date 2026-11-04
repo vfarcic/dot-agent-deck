@@ -1606,103 +1606,122 @@ fn decision_to_return_ms(log: &str) -> Option<f64> {
     Some((at(ended)? - at(settled)?) * 1000.0)
 }
 
-/// Scenario: In a pane the deck installs its editor helper into, with real interactive Claude Code of a release whose editor probe the deck has verified, and native delivery disabled, type a letter and post a sentinel task, which a check holds behind that draft; then type a second letter, which starts another check, and press Ctrl+C the moment that check's byte is written, while Claude Code has handed its terminal to the check. Repeated until twenty Ctrl+C presses have landed inside a check: every time Claude Code keeps running, the Ctrl+C clears the box, and the task is delivered once through the doorbell (Q147b: a Ctrl+C typed during a check had ended the session).
+/// Scenario: In a pane the deck installs its editor helper into, with real interactive Claude Code of a release whose editor probe the deck has verified, and native delivery disabled, type a letter and post a sentinel task, which a check holds behind that draft; then type a second letter, which starts another check, and press Ctrl+C the moment that check's byte is written, while Claude Code has handed its terminal to the check. Repeated, four trials to a freshly started deck, until twenty Ctrl+C presses have landed inside a check: every time Claude Code keeps running, the Ctrl+C clears the box, and the task is delivered once through the doorbell (Q147b: a Ctrl+C typed during a check had ended the session).
 #[spec("inbox/doorbell/010")]
 #[test]
 #[cfg(target_os = "linux")]
 fn doorbell_010_live_ctrl_c_during_a_check_leaves_claude_running() {
     skip_unless!(installed::checkable());
-    let claude = Claude::installed();
-    claude.deck.wait_for_string("? for shortcuts");
-    assert!(
-        claude.pane_grid().contains(&installed_banner()),
-        "the verified release runs; {}",
-        claude.evidence()
-    );
-    let claude = fallback_ready_with(claude, "ctrl-c-check");
     const LANDED: usize = 20;
-    const MAX_TRIALS: usize = 40;
+    const MAX_TRIALS: usize = 32;
+    // A test deck's daemon stops itself after 300 s (the harness's lifetime
+    // cap), and a trial is a Haiku turn of about 40 s: four to a deck.
+    const PER_DECK: usize = 4;
     let mut landed = 0;
     let mut trials = 0;
+    let mut decks = 0;
     while landed < LANDED && trials < MAX_TRIALS {
-        trials += 1;
-        let start = claude.log().len();
-        claude.deck.send_keys(b"w");
-        claude.expect_composer("w");
-        let name = format!("ctrl-c-check-{trials}-5d2a.txt");
-        let id = claude.post(&claude.directive(&name));
+        decks += 1;
+        let claude = Claude::installed();
+        claude.deck.wait_for_string("? for shortcuts");
         assert!(
-            common::wait_until(BUDGET, || claude.record()["inbox"]["wake_hold"]
-                == "possible_draft"
-                && claude.checks(start).iter().any(|c| c == "Written")),
-            "trial {trials}: a check must hold the task behind the draft; {}",
+            claude.pane_grid().contains(&installed_banner()),
+            "the verified release runs; {}",
             claude.evidence()
         );
-        assert!(
-            common::wait_until(Duration::from_secs(30), || claude
-                .log()
-                .get(start..)
-                .unwrap_or("")
-                .contains("segment ended")
-                && claude.composer().as_deref() == Some("w")),
-            "trial {trials}: the first check ends with the draft kept; {}",
-            claude.evidence()
-        );
-        // The second letter touches the box, so the next tick checks it:
-        // the Ctrl+C goes as soon as that check's byte is in the log. Polled
-        // with no pause, since a check runs for tens of milliseconds, under
-        // `wait_until`'s 50 ms step; it spins only until the tick's check.
-        let touch = claude.log().len();
-        claude.deck.send_keys(b"x");
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while !claude.checks(touch).iter().any(|c| c == "Written") {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "trial {trials}: the touch must start a check; {}",
-                claude.evidence()
-            );
-            std::thread::yield_now();
+        let claude = fallback_ready_with(claude, &format!("ctrl-c-check-{decks}"));
+        for _ in 0..PER_DECK {
+            if landed >= LANDED || trials >= MAX_TRIALS {
+                break;
+            }
+            trials += 1;
+            if ctrl_c_trial(&claude, trials) {
+                landed += 1;
+            }
+            eprintln!("deck {decks}, trial {trials}: Ctrl+C inside the check: {landed} so far");
         }
-        claude.deck.send_keys(b"\x03");
-        claude.done(&id, &name, false);
-        let log = claude.log();
-        let since = log.get(touch..).unwrap_or("");
-        assert!(
-            !since.contains("pane_command_exited") && !since.contains("event_type=SessionEnd"),
-            "trial {trials}: Claude Code must keep running after the Ctrl+C; {}",
-            claude.evidence()
-        );
-        assert!(
-            claude.human_in(touch).starts_with("x\\x03"),
-            "trial {trials}: the letter and the Ctrl+C reached the pane in order: {:?}",
-            claude.human_in(touch)
-        );
-        if ctrl_c_inside_check(since, &claude.pane.agent) {
-            landed += 1;
-        }
-        eprintln!(
-            "trial {trials}: Claude kept running; Ctrl+C inside the check: {landed} so far; \
-             decision to return: {:?} ms",
-            decision_to_return_ms(since)
-        );
-        // As the control turn: the next native waiter, killed, so the next
-        // trial's task is held and delivered by the doorbell.
-        assert!(
-            common::wait_until(BUDGET, || {
-                claude.listing()["armed"].as_u64().unwrap_or(0) > 0
-                    && claude.record()["live"]["status"] == "Idle"
-            }),
-            "trial {trials}: the task's turn must finish; {}",
-            claude.evidence()
-        );
-        kill_trial_waiter(&claude);
-        claude.expect_composer("");
     }
     assert!(
         landed >= LANDED,
-        "only {landed} of {trials} Ctrl+C presses landed inside a check; {}",
+        "only {landed} of {trials} Ctrl+C presses landed inside a check"
+    );
+}
+
+/// One trial of `doorbell_010_live_ctrl_c_during_a_check_leaves_claude_running`
+/// on an idle `claude` with native delivery disabled and an empty box:
+/// whether its Ctrl+C landed inside a check. Claude Code must keep running,
+/// the task must be delivered once, and the next waiter is killed again.
+#[cfg(target_os = "linux")]
+fn ctrl_c_trial(claude: &Claude, trial: usize) -> bool {
+    let start = claude.log().len();
+    claude.deck.send_keys(b"w");
+    claude.expect_composer("w");
+    let name = format!("ctrl-c-check-{trial}-5d2a.txt");
+    let id = claude.post(&claude.directive(&name));
+    assert!(
+        common::wait_until(BUDGET, || claude.record()["inbox"]["wake_hold"]
+            == "possible_draft"
+            && claude.checks(start).iter().any(|c| c == "Written")),
+        "trial {trial}: a check must hold the task behind the draft; {}",
         claude.evidence()
     );
+    assert!(
+        common::wait_until(Duration::from_secs(30), || claude
+            .log()
+            .get(start..)
+            .unwrap_or("")
+            .contains("segment ended")
+            && claude.composer().as_deref() == Some("w")),
+        "trial {trial}: the first check ends with the draft kept; {}",
+        claude.evidence()
+    );
+    // The second letter touches the box, so the next tick checks it: the
+    // Ctrl+C goes as soon as that check's byte is in the log. Polled with no
+    // pause, since a check runs for tens of milliseconds, under
+    // `wait_until`'s 50 ms step; it spins only until the tick's check.
+    let touch = claude.log().len();
+    claude.deck.send_keys(b"x");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !claude.checks(touch).iter().any(|c| c == "Written") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "trial {trial}: the touch must start a check; {}",
+            claude.evidence()
+        );
+        std::thread::yield_now();
+    }
+    claude.deck.send_keys(b"\x03");
+    claude.done(&id, &name, false);
+    let log = claude.log();
+    let since = log.get(touch..).unwrap_or("");
+    assert!(
+        !since.contains("pane_command_exited") && !since.contains("event_type=SessionEnd"),
+        "trial {trial}: Claude Code must keep running after the Ctrl+C; {}",
+        claude.evidence()
+    );
+    assert!(
+        claude.human_in(touch).starts_with("x\\x03"),
+        "trial {trial}: the letter and the Ctrl+C reached the pane in order: {:?}",
+        claude.human_in(touch)
+    );
+    let landed = ctrl_c_inside_check(since, &claude.pane.agent);
+    eprintln!(
+        "trial {trial}: Claude kept running; inside the check: {landed}; decision to return: {:?} ms",
+        decision_to_return_ms(since)
+    );
+    // As the control turn: the next native waiter, killed, so the next
+    // trial's task is held and delivered by the doorbell.
+    assert!(
+        common::wait_until(BUDGET, || {
+            claude.listing()["armed"].as_u64().unwrap_or(0) > 0
+                && claude.record()["live"]["status"] == "Idle"
+        }),
+        "trial {trial}: the task's turn must finish; {}",
+        claude.evidence()
+    );
+    kill_trial_waiter(claude);
+    claude.expect_composer("");
+    landed
 }
 
 /// Scenario: In a pane the deck installs its editor helper into, complete a doorbell-delivered control task in real interactive Haiku, send a prompt of your own, then recall it with Up and press Enter, which submits it again, while native delivery is disabled. Once that turn ends, post another sentinel task: a check must read the box empty and the doorbell type the task without another keypress.

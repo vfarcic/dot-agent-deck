@@ -279,12 +279,14 @@ slow-timeout = { period = "60s", terminate-after = 30 }
 
 # Q147b (2026-11-04): `doorbell_010_live_ctrl_c_during_a_check_leaves_claude_running`
 # repeats a held task, a check and a Ctrl+C inside it until twenty Ctrl+C
-# presses have landed (at most forty trials), each trial a Haiku turn: about
-# 40s a trial in its first lane-2 run, where the 180s default stopped it after
-# four. Forty trials are about 1600s, so it gets 1800s.
+# presses have landed (at most thirty-two trials, four to a deck, since a test
+# deck's daemon stops after 300s), each trial a Haiku turn of about 40s plus
+# about 40s to start each deck: the 180s default stopped its first lane-2 run
+# after four trials. Thirty-two trials on eight decks are about 1600s, so it
+# gets 2400s.
 [[profile.default.overrides]]
 filter = 'test(=doorbell_010_live_ctrl_c_during_a_check_leaves_claude_running)'
-slow-timeout = { period = "60s", terminate-after = 30 }
+slow-timeout = { period = "60s", terminate-after = 40 }
 
 # PRD #1631: `codex/hooks/001` drives one real interactive Codex turn, behind
 # `check_codex_available`'s preflight. In that PRD's lane-2 run, on a box with
