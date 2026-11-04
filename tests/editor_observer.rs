@@ -194,6 +194,28 @@ fn probe_069_the_handler_settles_only_an_attested_armed_invocation() {
     assert_eq!(count(&s), 0);
 }
 
+/// Scenario: On a generation with its segments attached, hand the seam `Owned` `Armed` invocations whose export the daemon read empty, not empty, as unknown, as unreadable, or not at all, one liability published for each. The read the epoch keeps for each record's settlement is empty, not empty, not empty, unreadable and unreadable: only a read that saw the box counts as one, so an export the daemon couldn't read, or didn't, settles as a timed recheck (revfence29 finding 6, Q151b).
+#[spec("inbox/probe/069")]
+#[test]
+fn probe_069_the_epoch_keeps_what_the_daemon_read_of_the_export() {
+    use dot_agent_deck::composer_probe::epoch::BoxRead;
+    use dot_agent_deck::composer_probe::segments::Agent;
+    let mut s = seam(Permission::Armable);
+    assert!(s.input().attach_segments(G, Agent::Claude));
+    let now = Instant::now();
+    for (pid, read, kept) in [
+        (21, Some(ExportRead::Empty), BoxRead::Empty),
+        (22, Some(ExportRead::NonEmpty), BoxRead::NonEmpty),
+        (23, Some(ExportRead::Unknown), BoxRead::NonEmpty),
+        (24, Some(ExportRead::Unreadable), BoxRead::Unreadable),
+        (25, None, BoxRead::Unreadable),
+    ] {
+        assert_eq!(s.control(G, ControlOp::Publish), Ok(1), "{read:?}");
+        s.invocation(&armed(), Some(evidence(pid, Attribution::Owned, read)), now);
+        assert_eq!(s.input().export_read(key(pid)), Some(kept), "{read:?}");
+    }
+}
+
 /// Scenario: Hand the seam an `Unarmed`, a `Tool` and an unknown decision, each from its own helper, and an `Armed` one. Each non-`Armed` one moves the generation's input epoch once as an external edit before its outcome comes back, and the writer scope is already open by then, so the reply can't go out first; the `Armed` one moves nothing.
 #[spec("inbox/probe/069")]
 #[test]

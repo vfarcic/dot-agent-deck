@@ -10871,8 +10871,16 @@ const HARNESS_UMASK: libc::mode_t = 0o022;
 /// (Python and Rust stand-ins) make, which a mode given at each of the
 /// harness's own calls would not reach.
 ///
-/// A test that needs another umask still sets and restores its own, as
-/// `tests/context_publish.rs` does; this only replaces the inherited one.
+/// It runs once, so a test that sets another umask after its first harness
+/// call keeps it. (`tests/context_publish.rs` sets and restores its own, but
+/// it doesn't link this harness, so the pin doesn't reach it.)
+///
+/// What the pin also hides: the editor helper's own root falls back from
+/// `<state_dir>/editor` to `$XDG_RUNTIME_DIR` when an ancestor of the state
+/// root is group-writable (`src/composer_probe/instance.rs`), and the
+/// harness's state roots, under its default temp base, no longer are, so
+/// lane 2 doesn't exercise that fallback; lane 1 does
+/// (`tests/e2e_editor_installation.rs`).
 #[cfg(unix)]
 fn pin_harness_umask() {
     // SAFETY: `umask(2)` swaps a per-process value and cannot fail. nextest

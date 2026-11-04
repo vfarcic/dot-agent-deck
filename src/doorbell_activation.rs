@@ -993,10 +993,11 @@ const CODEX_0160_DIALOGS: &[DialogKeys<'static>] = &[
 /// `docs/develop/doorbell-admission.md`). The Claude Code records are `Go`;
 /// both Codex releases stage the line (a digit of a message id answers their
 /// update dialog, `n` their folder-trust dialog), and neither records
-/// `head_echo` yet, so both are `missing_measurement`. Only 2.1.317's
-/// `editor_probe` is verified ([`CLAUDE_2_1_317_EDITOR_PROBE`], set by the
-/// Claude activation, Q35-28), so the deck checks the input box of that
-/// release alone; the other records' stay absent.
+/// `head_echo` yet, so both are `missing_measurement`. 2.1.317's and
+/// 2.1.318's `editor_probe` are verified ([`CLAUDE_2_1_317_EDITOR_PROBE`],
+/// [`CLAUDE_2_1_318_EDITOR_PROBE`], set by the Claude activation, Q35-28),
+/// so the deck checks the input box of those two releases alone; the other
+/// records' stay absent.
 pub static RELEASE_RECORDS: [ReleaseRecord<'static>; 6] = [
     // Codex 0.164.0, the release current at measurement. Echo: the exact line
     // in the composer 30 of 30 (20 at 50 × 200, 10 at 24 × 80; ≤ 62 ms after
@@ -1210,9 +1211,8 @@ pub static RELEASE_RECORDS: [ReleaseRecord<'static>; 6] = [
         placeholder_empty: Measurement::Failed,
         delete_key: Measurement::Verified(()),
         transcript_echo: Measurement::Verified(()),
-        // Measured: [`CLAUDE_2_1_318_EDITOR_PROBE`]. Left absent as
-        // 2.1.317's is, until activation verifies it.
-        editor_probe: Measurement::Absent,
+        // Verified by the Claude activation (Q35-28, act29), as 2.1.317's.
+        editor_probe: Measurement::Verified(CLAUDE_2_1_318_EDITOR_PROBE),
     },
 ];
 

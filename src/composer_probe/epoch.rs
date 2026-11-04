@@ -418,9 +418,9 @@ pub(crate) const EXPLAINED_CAP: u8 = 4;
 pub(crate) const CREDIT_AFTER_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The daemon's read of an `Armed` export, as the epoch's settlement reads
-/// it ([`Live::reads`]).
+/// it ([`Live::reads`], [`GenerationInput::export_read`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BoxRead {
+pub enum BoxRead {
     Empty,
     NonEmpty,
     /// The export couldn't be read: the check saw nothing of the box.
@@ -605,9 +605,24 @@ fn settle_live(state: &mut State, now: Instant) {
             && read.is_none()
             && records.get(key).is_some_and(|r| !r.drained)
         {
+            // revact28: logged each time, so a probe stuck here (its
+            // record never draining) shows in the log.
+            tracing::debug!(
+                target: "composer_probe",
+                number,
+                ?decision,
+                "probe segment matched; waiting for the daemon's read"
+            );
             live.segments.undecide(number);
             continue;
         }
+        tracing::debug!(
+            target: "composer_probe",
+            number,
+            ?decision,
+            read = read.is_some(),
+            "probe segment matched"
+        );
         live.settle_probe(
             &mut state.epoch,
             records,
@@ -1721,6 +1736,15 @@ impl GenerationInput {
         self.note_box_read(key, BoxRead::Unreadable);
     }
 
+    /// The daemon's latest read of `Armed` record `key`'s export, as the
+    /// epoch's settlement will read it; `None` with none kept, or with no
+    /// segments attached (revfence29 finding 6: what the observer's mapping
+    /// of an [`crate::event::ExportRead`] leaves here).
+    pub fn export_read(&self, key: RecordKey) -> Option<BoxRead> {
+        let state = self.state.lock_recovering();
+        state.live.as_ref().and_then(|live| live.box_read_of(key))
+    }
+
     fn note_box_read(&self, key: RecordKey, read: BoxRead) {
         let mut state = self.state.lock_recovering();
         if let Some(live) = state.live.as_mut() {
@@ -1835,6 +1859,11 @@ impl GenerationInput {
         if live.lapse_counted != Some(number) {
             live.lapse_counted = Some(number);
             live.schedule.failed(now);
+            tracing::debug!(
+                target: "composer_probe",
+                number,
+                "probe segment lapsed unmatched; a retry may replace it"
+            );
         }
         // An empty read parked for its keymap re-read is a check still
         // outstanding, as `probe_due` reads it: a lapse retry started under
@@ -1998,6 +2027,9 @@ impl GenerationInput {
             return Err(segments::Refusal::Retired);
         };
         let result = step(&mut live.segments, records, &mut state.hazards);
+        if let Err(refusal) = &result {
+            tracing::debug!(target: "composer_probe", ?refusal, "segment step refused");
+        }
         settle_live(state, now);
         drop(guard);
         self.moved.notify_one();
@@ -2031,6 +2063,32 @@ impl GenerationInput {
                     }),
             )),
             _ => None,
+        }
+    }
+
+    /// Q152b: the front's number and the line with no end its release has
+    /// left in Claude's terminal out of raw mode ([`Segments::cooked_line`]);
+    /// `None` unless its release stops at [`segments::Stop::Cooked`] or
+    /// [`segments::Stop::Signal`], with no segments attached, or once
+    /// retired.
+    pub fn segments_cooked_line(&self) -> Option<(u64, usize)> {
+        let state = self.state.lock_recovering();
+        match (state.retired, state.live.as_ref(), state.records.as_ref()) {
+            (false, Some(live), Some(records)) => live.segments.cooked_line(records),
+            _ => None,
+        }
+    }
+
+    /// Q152b: what the release driver wrote into segment `number`'s cooked
+    /// terminal left `run` bytes of a line with no end there
+    /// ([`Segments::note_cooked_line`]).
+    pub fn segment_note_cooked_line(&self, number: u64, run: usize) {
+        let mut state = self.state.lock_recovering();
+        if state.retired {
+            return;
+        }
+        if let Some(live) = state.live.as_mut() {
+            live.segments.note_cooked_line(number, run);
         }
     }
 

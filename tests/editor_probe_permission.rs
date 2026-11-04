@@ -148,14 +148,15 @@ fn doorbell_053_permission_needs_the_header_a_verified_record_and_the_root() {
     );
 }
 
-/// Scenario: Ask for the permission to arm on every release the deck ships a record for, with the records as shipped and with no e2e assumption read. Only Claude Code 2.1.317, whose editor record the Claude activation verified, can arm: it waits while its root is looked for, is armable once the root is bound, and is inert when it is never bound. Every other release is inert for its missing editor record, however its root is bound.
+/// Scenario: Ask for the permission to arm on every release the deck ships a record for, with the records as shipped and with no e2e assumption read. Only Claude Code 2.1.317 and 2.1.318, whose editor records the Claude activation verified, can arm: each waits while its root is looked for, is armable once the root is bound, and is inert when it is never bound. Every other release is inert for its missing editor record, however its root is bound.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_only_the_activated_release_is_armable() {
     assert!(assumed_editor_probes().is_empty());
     for record in &RELEASE_RECORDS {
         let header = LatchedRelease::Known(record.release.clone());
-        let activated = record.agent == CLAUDE && record.release == v("2.1.317");
+        let activated = record.agent == CLAUDE
+            && (record.release == v("2.1.317") || record.release == v("2.1.318"));
         for binding in [Binding::Waiting, Binding::Bound, Binding::Never] {
             let expected = match (activated, &binding) {
                 (false, _) => Permission::Inert(InertCause::NoEditorRecord),
@@ -174,7 +175,7 @@ fn doorbell_053_only_the_activated_release_is_armable() {
     }
 }
 
-/// Scenario: Run this test again in separate subprocesses of a build without the e2e feature, with valid and malformed editor-probe assumption variables set. The production reader ignores both values: only Claude Code 2.1.317, whose editor record the Claude activation verified, can arm, and every other shipped release, those the variable names among them, stays unable to arm. On Linux, the actual production daemon also starts synthetic commands: a direct Claude Code gets the installation the activation rolled out (the deck's helper as its editor and a tool environment file), every other command keeps its original editor environment, whatever the variable names, and every complete argv survives unchanged.
+/// Scenario: Run this test again in separate subprocesses of a build without the e2e feature, with valid and malformed editor-probe assumption variables set. The production reader ignores both values: only Claude Code 2.1.317 and 2.1.318, whose editor records the Claude activation verified, can arm, and every other shipped release, those the variable names among them, stays unable to arm. On Linux, the actual production daemon also starts synthetic commands: a direct Claude Code gets the installation the activation rolled out (the deck's helper as its editor and a tool environment file), every other command keeps its original editor environment, whatever the variable names, and every complete argv survives unchanged.
 #[spec("inbox/probe/012")]
 #[test]
 #[cfg(not(feature = "e2e"))]
@@ -189,7 +190,9 @@ fn probe_012_production_reader_ignores_set_editor_assumption() {
         );
         for record in &RELEASE_RECORDS {
             let header = LatchedRelease::Known(record.release.clone());
-            let expected = if record.agent == CLAUDE && record.release == v("2.1.317") {
+            let expected = if record.agent == CLAUDE
+                && (record.release == v("2.1.317") || record.release == v("2.1.318"))
+            {
                 Permission::Armable
             } else {
                 Permission::Inert(InertCause::NoEditorRecord)
@@ -229,11 +232,13 @@ fn probe_012_production_reader_ignores_set_editor_assumption() {
                     if kind == "claude" {
                         // The Claude activation's rollout, not the variable.
                         let helper = installation::installed(&spawned);
-                        assert_eq!(
-                            spawned.report["env"]["EDITOR"],
-                            json!(helper.display().to_string()),
-                            "{name}"
-                        );
+                        for variable in ["VISUAL", "EDITOR"] {
+                            assert_eq!(
+                                spawned.report["env"][variable],
+                                json!(helper.display().to_string()),
+                                "{name}: {variable}"
+                            );
+                        }
                         assert!(
                             spawned.report["env"]["CLAUDE_ENV_FILE"].is_string(),
                             "{name}"

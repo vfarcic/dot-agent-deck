@@ -112,8 +112,10 @@
 //! discarded there, with what was typed after it, so the release driver
 //! refuses it instead, with what the gate holds after it, in the pass that
 //! finds it held: a release that stops before it at a key waiting for
-//! Claude's return keeps that key held, since what is refused starts at the
-//! op holding the Ctrl+G ([`Segments::refuse_behind`], R-HOLD's bounded
+//! Claude's return keeps that key held when it sits in an earlier op, since
+//! what is refused starts at the op holding the Ctrl+G (one in the same op
+//! is refused with it: refusals take whole ops, an accepted fail-closed
+//! loss) ([`Segments::refuse_behind`], R-HOLD's bounded
 //! refusal, the user's ruling of 2026-11-03, Q151b): what is typed afterwards goes
 //! on to the pane as the release lets it. The segment itself stays open, so
 //! each later Ctrl+G is refused the same way while it stays released (an
@@ -229,6 +231,45 @@ pub fn signal_key(byte: u8) -> bool {
     matches!(byte, 0x03 | 0x1a | 0x1c)
 }
 
+/// Q152b (fence29's ruling 4, revfence28's narrower option, revfence29's
+/// finding 3): how long a line with no end a release may leave in a Claude
+/// terminal out of raw mode. Linux's canonical-mode read buffer is 4096
+/// bytes, and while it holds no complete line it keeps room for one line
+/// end: bytes past the first 4095 are dropped or overwrite the last. So a
+/// release into such a terminal ([`Stop::Cooked`], and [`Stop::Signal`]
+/// behind a probe's `Unarmed` release) stops before the bytes it has
+/// written there since the front's first release, with no [`line_end`]
+/// after them, reach this many, and the rest waits with everything after
+/// it: for Claude's return (E1) behind `Cooked`, for the helper's drained
+/// exit behind `Signal`. The count spans release passes, since nothing
+/// drains the buffer while Claude is blocked in its editor spawn, and
+/// counting what a terminal editor has already read can only stop
+/// earlier. A single-line paste longer than this, held through a check,
+/// reaches Claude whole.
+pub const COOKED_LINE: usize = 4095;
+
+/// Q152b: a byte that ends a line in Claude's terminal while it is out of
+/// raw mode: a line feed, and Enter's carriage return, which Claude's
+/// cooked mode turns into one (`ICRNL`, in the flags strace shows). Only a
+/// [`Stop::Signal`] release writes a carriage return there: a
+/// [`Stop::Cooked`] one stops at it as a [`line_discipline_key`], so there
+/// a line ends at a line feed alone. Counting Enter matters behind
+/// `Signal`, where the check opened the person's editor and they may type
+/// lines into it for as long as it is open. NUL, `VEOL`'s default, is not
+/// counted (revfence29): not counting it can only stop earlier.
+pub fn line_end(byte: u8) -> bool {
+    matches!(byte, b'\n' | b'\r')
+}
+
+/// Q152b: the bytes of a line with no end left after writing `bytes` into
+/// a terminal out of raw mode whose line already had `run` of them.
+pub fn cooked_line_after(run: usize, bytes: &[u8]) -> usize {
+    match bytes.iter().rposition(|&b| line_end(b)) {
+        Some(at) => bytes.len() - at - 1,
+        None => run + bytes.len(),
+    }
+}
+
 /// Where the front segment's release stops short of the next held Ctrl+G
 /// candidate, and what happens to the byte it stops at
 /// ([`Segments::front_stop`]).
@@ -237,10 +278,14 @@ pub enum Stop {
     /// Only at the next held candidate.
     Candidate,
     /// Q147b: also at the first held [`line_discipline_key`], which waits
-    /// with everything after it until Claude's return (E1).
+    /// with everything after it until Claude's return (E1); and, Q152b,
+    /// before the line it leaves in the terminal reaches [`COOKED_LINE`]
+    /// bytes with no end.
     Cooked,
     /// Q151b: also at the first held [`signal_key`], which is refused with
-    /// everything held after it.
+    /// everything held after it; and, Q152b, before the line it leaves in
+    /// the terminal reaches [`COOKED_LINE`] bytes with no end, which waits
+    /// for the helper's drained exit.
     Signal,
 }
 
@@ -624,6 +669,11 @@ struct Segment {
     /// A probe whose matched decision was handed to the epoch's settlement
     /// ([`Segments::take_decided_probes`]).
     decided: bool,
+    /// Q152b: the bytes of a line with no end its release has written into
+    /// Claude's terminal while out of raw mode ([`Stop::Cooked`],
+    /// [`Stop::Signal`], [`COOKED_LINE`]), as the release driver reports
+    /// them.
+    cooked_line: usize,
 }
 
 impl Segment {
@@ -646,6 +696,7 @@ impl Segment {
             released: false,
             cut_off: false,
             decided: false,
+            cooked_line: 0,
         }
     }
 
@@ -877,6 +928,31 @@ impl Segments {
     /// Whether `seg`'s E1 has been read, as `self.agent`'s return needs it.
     fn returned(&self, seg: &Segment) -> bool {
         seg.e1.as_ref().is_some_and(|w| w.returned(self.agent))
+    }
+
+    /// Q152b: while the front's release goes into Claude's terminal out of
+    /// raw mode ([`Stop::Cooked`] or [`Stop::Signal`]), its number and the
+    /// bytes of a line with no end its release has written there so far
+    /// ([`COOKED_LINE`]); `None` otherwise.
+    pub fn cooked_line(&self, records: &Records) -> Option<(u64, usize)> {
+        if self.front_stop(records) == Stop::Candidate {
+            return None;
+        }
+        let seg = self.segments.front()?;
+        Some((seg.number?, seg.cooked_line))
+    }
+
+    /// Q152b: the release driver wrote into segment `number`'s cooked
+    /// terminal, which now holds `run` bytes of a line with no end
+    /// ([`cooked_line_after`]). Nothing when that segment has ended.
+    pub fn note_cooked_line(&mut self, number: u64, run: usize) {
+        if let Some(seg) = self
+            .segments
+            .iter_mut()
+            .find(|seg| seg.number == Some(number))
+        {
+            seg.cooked_line = run;
+        }
     }
 
     /// The release driver refuses the first held [`signal_key`] behind a
