@@ -50,6 +50,35 @@ fn executable(path: &Path, contents: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
+/// `path` with each entry that holds a `codex` replaced by a directory under
+/// `mirrors` linking every other name in it, so no lookup by name finds a
+/// `codex` while the entry's other programs (`python3`, wherever it lives)
+/// stay where the daemon looks for them. An entry that can't be listed is
+/// dropped rather than kept, since it may hold a `codex`.
+fn path_without_codex(path: &str, mirrors: &Path) -> String {
+    let entries = std::env::split_paths(path)
+        .enumerate()
+        .filter_map(|(i, dir)| {
+            if fs::symlink_metadata(dir.join("codex")).is_err() {
+                return Some(dir);
+            }
+            let mirror = mirrors.join(i.to_string());
+            fs::create_dir(&mirror).expect("create a PATH mirror");
+            for entry in fs::read_dir(&dir).ok()? {
+                let name = entry.ok()?.file_name();
+                if name != "codex" {
+                    std::os::unix::fs::symlink(dir.join(&name), mirror.join(&name))
+                        .expect("link a PATH mirror entry");
+                }
+            }
+            Some(mirror)
+        });
+    std::env::join_paths(entries.collect::<Vec<_>>())
+        .expect("PATH entries rejoin")
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn checked_replace(source: &str, anchor: &str, replacement: &str) -> String {
     assert_eq!(
         source.matches(anchor).count(),
@@ -72,6 +101,8 @@ pub struct Fixture {
     log: PathBuf,
     _log_dir: Option<tempfile::TempDir>,
     _codex_bin: Option<tempfile::TempDir>,
+    /// The mirrors [`path_without_codex`] put on the daemon's `PATH`.
+    _daemon_bin: tempfile::TempDir,
     /// A Codex pane's own `PATH` and `hooks/list` answer (Q129b item 0).
     codex_pane: Option<CodexPaneEnv>,
 }
@@ -200,6 +231,20 @@ impl Fixture {
             fs::set_permissions(&to, fs::Permissions::from_mode(0o755)).unwrap();
             dir
         });
+        // The daemon's own `PATH` carries no `codex`, whatever this machine
+        // has installed (loc10): the comment above holds only while that is
+        // so. A developer's real Codex in a directory such as
+        // `/usr/local/bin` survives `common::contain_path`, so the daemon's
+        // startup install ran that `codex app-server` and wrote trust into
+        // `$HOME/.codex/config.toml` after the spawn's keymap identity, and
+        // every check of a Codex pane was refused `Keymap(Changed)` there,
+        // while the same tests passed on GitHub Actions and RWX.
+        let daemon_bin = common::harness_tempdir().expect("daemon PATH dir");
+        let daemon_path = path_without_codex(
+            &common::contain_path(&std::env::var("PATH").unwrap_or_default()),
+            daemon_bin.path(),
+        );
+        env.push(("PATH", &daemon_path));
         env.extend_from_slice(extra);
         let daemon = common::spawn_daemon_serve_with_env(None, "0", &env);
         let codex_pane_env = codex_bin.as_ref().map(|dir| {
@@ -278,6 +323,7 @@ impl Fixture {
             log,
             _log_dir: log_dir,
             _codex_bin: codex_bin,
+            _daemon_bin: daemon_bin,
             codex_pane: codex_pane_env,
         };
         f.spawn("first", false);
