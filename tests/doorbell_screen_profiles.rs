@@ -1312,7 +1312,7 @@ fn doorbell_036_the_staged_head_reads_through_the_profile() {
     }
 }
 
-/// Scenario: Replay recorded Claude Code 2.1.310 and 2.1.312 composers in indexed and truecolor modes, and the Codex composer, through the frame builder and transaction without a prompt hook. The empty composer admits one line and one Enter, the typed line is held exactly, and its transcript echo confirms Submitted; dirty screens carry no composer or dialog. Both Claude truecolor captures wrap the user message onto a shaded continuation row.
+/// Scenario: Replay recorded Claude Code 2.1.310 and 2.1.312 composers in indexed and truecolor modes, the Claude Code 2.1.318 composer in indexed mode, and the Codex composer, through the frame builder and transaction without a prompt hook. The empty composer admits one line and one Enter, the typed line is held exactly, and its transcript echo confirms Submitted; dirty screens carry no composer or dialog. Both Claude truecolor captures wrap the user message onto a shaded continuation row.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_the_transaction_reads_real_frames_through_the_profile() {
@@ -1326,6 +1326,10 @@ fn doorbell_036_the_transaction_reads_real_frames_through_the_profile() {
         ),
         (
             "claude-inbox/r5wake/claude-2.1.312-composer-24x80",
+            &CLAUDE_PROFILE,
+        ),
+        (
+            "claude-inbox/r5wake/claude-2.1.318-composer-24x80",
             &CLAUDE_PROFILE,
         ),
         (
