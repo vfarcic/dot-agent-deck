@@ -203,7 +203,7 @@ Post exactly one comment on #${{ inputs.pr_number }}: your summary, then a singl
 
 Which independent review covers this head: **${{ inputs.independent_review }}**
 
-That line is the result of `independent_review_at`, the predicate the vote job enforces, computed by the selector from the unfiltered GitHub API. Take it as given and do not re-derive it — the rubric's priority 1 says why, and what to do when the artefact it names is one you cannot read. If the line is empty, nobody computed it: establish coverage yourself as priority 1 describes.
+That line is the result of `independent_review_at`, the predicate the vote job enforces, computed by the selector from the unfiltered GitHub API. Take it as given and do not re-derive it — the rubric's priority 1 says why, and what to do when the artefact it names is one you cannot read. The line names the artefact so that you can report it, not so that you can fetch it: when your reads of this pull request's comments and reviews do not return it, return `INSUFFICIENT` naming it, and do not reach for it by its id, its URL or any other route. If the line is empty, nobody computed it: establish coverage yourself as priority 1 describes.
 
 ## Your budget, and what running out costs
 

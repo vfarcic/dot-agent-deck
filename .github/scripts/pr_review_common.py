@@ -541,15 +541,23 @@ def independent_review_at(sha, comments, review_comments, reviews):
 def independent_review_evidence(sha, comments, review_comments, reviews):
     """Did an independent reviewer look at THIS head, and through what? (issue #1270)
 
-    Returns `{"login", "artefact", "url"}` or None. `artefact` names the shape
-    that matched -- "submitted review", "inline review comment" or "summary
-    comment" -- and `url` is its `html_url` when the caller fetched one.
+    Returns `{"login", "artefact"}` or None. `artefact` names the shape that
+    matched -- "submitted review", "inline review comment" or "summary
+    comment".
 
     Issue #1754 is why the artefact is returned rather than only the login: the
     selector hands this to the agent, which had been re-deriving coverage and
     getting it wrong. On #1751 it read Qodo's one submitted review, anchored at
     the first commit, as Qodo's entire coverage, twice, while Qodo's summary
     comment named the head. Naming the artefact tells it where to look.
+
+    Issue #1847 is why its URL is NOT returned. The URL carries the artefact's
+    id, and on a pull request whose author lacks write access the agent used
+    that id to read a comment gh-aw's integrity filter had withheld from its
+    list read -- a bypass of the filter, which gh-aw's threat detection flagged
+    as prompt injection on #1842. The maintainer chose to close that route
+    rather than widen the filter, so the agent gets what it needs to NAME the
+    artefact in an INSUFFICIENT, and no handle to fetch it by.
 
     Three shapes count, because the two products express it differently:
 
@@ -575,8 +583,8 @@ def independent_review_evidence(sha, comments, review_comments, reviews):
     if not sha:
         return None
 
-    def found(login, artefact, item):
-        return {"login": login, "artefact": artefact, "url": item.get("html_url") or ""}
+    def found(login, artefact):
+        return {"login": login, "artefact": artefact}
 
     for review in reviews or ():
         login = ((review.get("user") or {}).get("login")) or ""
@@ -586,18 +594,18 @@ def independent_review_evidence(sha, comments, review_comments, reviews):
         if review.get("state") == "PENDING":
             continue
         if login in INDEPENDENT_REVIEWERS and review.get("commit_id") == sha:
-            return found(login, "submitted review", review)
+            return found(login, "submitted review")
     for comment in review_comments or ():
         login = ((comment.get("user") or {}).get("login")) or ""
         # `original_commit_id` is where the comment was WRITTEN; `commit_id`
         # follows the head. See the docstring -- reading the latter makes this
         # gate vacuous on any pull request that ever received an inline finding.
         if login in INDEPENDENT_REVIEWERS and comment.get("original_commit_id") == sha:
-            return found(login, "inline review comment", comment)
+            return found(login, "inline review comment")
     for comment in comments or ():
         login = ((comment.get("user") or {}).get("login")) or ""
         if login in INDEPENDENT_REVIEWERS and sha in (comment.get("body") or ""):
-            return found(login, "summary comment", comment)
+            return found(login, "summary comment")
     return None
 
 
@@ -613,8 +621,8 @@ def describe_independent_review(evidence):
             "none: no submitted review, inline review comment or summary comment by "
             f"{' or '.join(INDEPENDENT_REVIEWERS)} covers this head SHA"
         )
-    where = f" ({evidence['url']})" if evidence.get("url") else ""
-    return f"{evidence['login']}, through its {evidence['artefact']}{where}"
+    # No URL, and no id (issue #1847): see `independent_review_evidence`.
+    return f"{evidence['login']}, through its {evidence['artefact']}"
 
 
 # Issue #1629: how many automatic re-reviews one head may get after an
@@ -921,9 +929,8 @@ def pr_reviews(repo, pr_number):
     """
     return gh_json_paginated(
         "api", f"repos/{repo}/pulls/{pr_number}/reviews", "--paginate",
-        # `id` is what a dismissal addresses (`stale_own_rejections`, #1754) and
-        # `html_url` is what the agent is pointed at (`independent_review_evidence`).
-        "--jq", "[.[] | {id, html_url, commit_id, state, user: {login: .user.login, type: .user.type}}]",
+        # `id` is what a dismissal addresses (`stale_own_rejections`, #1754).
+        "--jq", "[.[] | {id, commit_id, state, user: {login: .user.login, type: .user.type}}]",
     )
 
 
@@ -931,7 +938,7 @@ def pr_comments(repo, pr_number):
     """Every issue comment on a pull request, paginated. Same paging reason."""
     return gh_json_paginated(
         "api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate",
-        "--jq", "[.[] | {body, html_url, user: {login: .user.login}}]",
+        "--jq", "[.[] | {body, user: {login: .user.login}}]",
     )
 
 
@@ -948,7 +955,7 @@ def pr_review_comments(repo, pr_number):
     """
     return gh_json_paginated(
         "api", f"repos/{repo}/pulls/{pr_number}/comments", "--paginate",
-        "--jq", "[.[] | {commit_id, original_commit_id, body, html_url, user: {login: .user.login}}]",
+        "--jq", "[.[] | {commit_id, original_commit_id, body, user: {login: .user.login}}]",
     )
 
 
