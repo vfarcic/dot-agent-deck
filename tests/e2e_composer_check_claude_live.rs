@@ -133,6 +133,26 @@ struct Path040 {
     point: &'static str,
     hold: Duration,
     kill: bool,
+    exit: Exit040,
+}
+
+/// How the held check's helper ends on a path: what defines the path.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Exit040 {
+    /// It reports the box it read non-empty, with no notice.
+    Mine,
+    /// Its report fails and it prints its notice.
+    Notice,
+    /// It is killed, so it reports nothing and leaves no exit.
+    Killed,
+}
+
+/// `hex`'s bytes (the editor log's `read_hex`); `None` if it isn't hex.
+fn unhex(hex: &str) -> Option<Vec<u8>> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+        .collect()
 }
 
 /// Each trial in a fresh installed pane: type `BASE`, queue a task so the
@@ -216,6 +236,39 @@ fn overlap_trials(path: Path040) {
             message["deliveries"], 0,
             "trial {trial}: the task waits behind the non-empty box; {row}"
         );
+        // The route, not only the box: Ctrl+G opened the person's editor once,
+        // on the box as typed before it, and LATE reached that editor.
+        assert_eq!(
+            runs.len(),
+            1,
+            "trial {trial}: Ctrl+G opens the person's editor exactly once; {row}"
+        );
+        assert_eq!(
+            runs[0]["initial"], "BASEEARLY",
+            "trial {trial}: the editor opens on the box as typed before Ctrl+G; {row}"
+        );
+        assert_eq!(
+            runs[0]["read_hex"].as_str().and_then(unhex).as_deref(),
+            Some(&b"LATE"[..]),
+            "trial {trial}: LATE reaches the person's editor; {row}"
+        );
+        match path.exit {
+            Exit040::Mine => assert!(
+                killed.is_none()
+                    && armed.len() == 1
+                    && armed[0].contains("Mine { read: NonEmpty }")
+                    && armed[0].contains("notice: false"),
+                "trial {trial}: the held helper reports the box non-empty, with no notice; {row}"
+            ),
+            Exit040::Notice => assert!(
+                killed.is_none() && armed.len() == 1 && armed[0].contains("notice: true"),
+                "trial {trial}: the held helper's report fails and it prints its notice; {row}"
+            ),
+            Exit040::Killed => assert!(
+                killed.is_some() && armed.is_empty(),
+                "trial {trial}: the held helper is killed and leaves no exit; {row}"
+            ),
+        }
         if landed {
             exact += 1;
         }
@@ -263,7 +316,7 @@ fn settle(claude: &Installed, pauser: &Pauser) {
     );
 }
 
-/// Scenario: Type BASE into real interactive Claude Code in an installed pane and queue a task so the deck checks the box, then for each trial touch the box and hold the check's own helper for one second just before its report to the deck, typing EARLY, Ctrl+G and LATE 250 ms apart while it is held. Every trial must end with exactly BASEEARLYLATE in the input box: the typing waits for the check, Ctrl+G then opens the person's own editor, and LATE reaches them.
+/// Scenario: Type BASE into real interactive Claude Code in an installed pane and queue a task so the deck checks the box, then for each trial touch the box and hold the check's own helper for one second just before its report to the deck, typing EARLY, Ctrl+G and LATE 250 ms apart while it is held. Every trial must end with exactly BASEEARLYLATE in the input box: the typing waits for the check, the helper reports the box non-empty, Ctrl+G then opens the person's own editor once, on BASEEARLY, and LATE reaches it.
 #[spec("inbox/probe/040")]
 #[test]
 fn probe_040_live_delayed_report_keeps_overlapping_typing() {
@@ -272,10 +325,11 @@ fn probe_040_live_delayed_report_keeps_overlapping_typing() {
         point: "ready",
         hold: Duration::from_millis(1000),
         kill: false,
+        exit: Exit040::Mine,
     });
 }
 
-/// Scenario: As the delayed case, but the check's helper is held for 2.5 seconds before its report, past its exchange's two-second bound, so the helper gives up on the deck and prints its notice. Every trial must still end with exactly BASEEARLYLATE in the input box.
+/// Scenario: As the delayed case, but the check's helper is held for 2.5 seconds before its report, past its exchange's two-second bound, so the helper gives up on the deck and prints its notice. Every trial must still end with exactly BASEEARLYLATE in the input box, the person's editor having opened once and read LATE.
 #[spec("inbox/probe/040")]
 #[test]
 fn probe_040_live_failed_report_with_notice_keeps_overlapping_typing() {
@@ -284,10 +338,11 @@ fn probe_040_live_failed_report_with_notice_keeps_overlapping_typing() {
         point: "ready",
         hold: Duration::from_millis(2500),
         kill: false,
+        exit: Exit040::Notice,
     });
 }
 
-/// Scenario: As the delayed case, but the check's helper is held for 11 seconds at its very start, before it reads anything, past the ten-second wait after which the deck counts the check's byte as unanswered. Every trial must still end with exactly BASEEARLYLATE in the input box.
+/// Scenario: As the delayed case, but the check's helper is held for 11 seconds at its very start, before it reads anything, past the ten-second wait after which the deck counts the check's byte as unanswered. Every trial must still end with exactly BASEEARLYLATE in the input box, the person's editor having opened once and read LATE, and the helper still reports the box it read non-empty.
 #[spec("inbox/probe/040")]
 #[test]
 fn probe_040_live_late_helper_keeps_overlapping_typing() {
@@ -296,10 +351,11 @@ fn probe_040_live_late_helper_keeps_overlapping_typing() {
         point: "start",
         hold: Duration::from_millis(11_000),
         kill: false,
+        exit: Exit040::Mine,
     });
 }
 
-/// Scenario: As the delayed case, but one second into the hold the check's helper is killed with SIGKILL by its captured pid, so it never reports. Every trial must still end with exactly BASEEARLYLATE in the input box.
+/// Scenario: As the delayed case, but one second into the hold the check's helper is killed with SIGKILL by its captured pid, so it never reports. Every trial must still end with exactly BASEEARLYLATE in the input box, the person's editor having opened once and read LATE.
 #[spec("inbox/probe/040")]
 #[test]
 fn probe_040_live_killed_helper_keeps_overlapping_typing() {
@@ -308,6 +364,7 @@ fn probe_040_live_killed_helper_keeps_overlapping_typing() {
         point: "ready",
         hold: Duration::from_millis(1000),
         kill: true,
+        exit: Exit040::Killed,
     });
 }
 

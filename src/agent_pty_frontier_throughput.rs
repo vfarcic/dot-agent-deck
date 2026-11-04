@@ -195,6 +195,20 @@ fn frontier_throughput() {
 /// generation's census sees every process started since its spawn:
 /// `procs` single-threaded sleepers, and `threaded` processes of `threads`
 /// tasks each (a Python interpreter whose threads sleep).
+/// The load's children, killed and reaped when the measurement ends or a
+/// panic unwinds it: `Child` kills nothing on drop, and a leaked load is up
+/// to 440 processes sleeping for 15 minutes.
+struct Load(Vec<std::process::Child>);
+
+impl Drop for Load {
+    fn drop(&mut self) {
+        for child in &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 fn load(procs: usize, threaded: usize, threads: usize) -> Vec<std::process::Child> {
     let mut children = Vec::new();
     for _ in 0..procs {
@@ -282,10 +296,12 @@ fn frontier_request_latency() {
         ("400 sleepers", 400, 0, 0),
         ("400 sleepers + 40 processes x 16 threads", 400, 40, 16),
     ];
-    let mut loaded = Vec::new();
+    let mut loaded = Load(Vec::new());
     let mut added = (0, 0);
     for (label, procs, threaded, threads) in conditions {
-        loaded.extend(load(procs - added.0, threaded - added.1, threads));
+        loaded
+            .0
+            .extend(load(procs - added.0, threaded - added.1, threads));
         added = (procs, threaded);
         let mut census = Vec::new();
         let mut found = String::new();
@@ -329,10 +345,7 @@ fn frontier_request_latency() {
             path[path.len() - 1]
         );
     }
-    for mut child in loaded {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
+    drop(loaded);
     pty.child.kill().unwrap();
     pty.child.wait().unwrap();
     thread.join().unwrap();
