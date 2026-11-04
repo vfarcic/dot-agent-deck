@@ -1649,7 +1649,9 @@ fn doorbell_010_live_ctrl_c_during_a_check_leaves_claude_running() {
             claude.evidence()
         );
         // The second letter touches the box, so the next tick checks it:
-        // the Ctrl+C goes as soon as that check's byte is in the log.
+        // the Ctrl+C goes as soon as that check's byte is in the log. Polled
+        // with no pause, since a check runs for tens of milliseconds, under
+        // `wait_until`'s 50 ms step; it spins only until the tick's check.
         let touch = claude.log().len();
         claude.deck.send_keys(b"x");
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -1659,7 +1661,7 @@ fn doorbell_010_live_ctrl_c_during_a_check_leaves_claude_running() {
                 "trial {trials}: the touch must start a check; {}",
                 claude.evidence()
             );
-            std::thread::sleep(Duration::from_millis(1));
+            std::thread::yield_now();
         }
         claude.deck.send_keys(b"\x03");
         claude.done(&id, &name, false);
