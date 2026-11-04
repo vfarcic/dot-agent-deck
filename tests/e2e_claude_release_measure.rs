@@ -360,184 +360,198 @@ fn assert_empty_menu_composer(capture: &Capture) {
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_live_release_menu_frames() {
-    use vt100::Color::{self, Idx, Rgb};
-
     skip_unless!(common::check_claude_available());
     for release in ["2.1.310", "2.1.312", "2.1.317"] {
-        let (_root, path) = pinned_path(release).unwrap_or_else(|| {
-            panic!(
-                "set DOT_AGENT_DECK_CLAUDE_MENU_{} to the pinned executable",
-                release.replace('.', "_")
-            )
-        });
-        // Measured foregrounds: the main composer's upper rule, the shell
-        // glyph and the overview's own prompt glyph.
-        let indexed_dark = (Idx(244), Idx(211), Idx(246));
-        for (kind, rows, cols, theme, colorterm, (rule, shell, overview)) in [
-            ("menus", 24, 80, "dark", None, indexed_dark),
-            ("menus", 40, 120, "dark", None, indexed_dark),
-            ("menus", 50, 200, "dark", None, indexed_dark),
+        menu_frames(release);
+    }
+}
+
+/// Scenario: Open the slash menu, file menu, shell mode, exit warning and background overview in isolated real Claude Code 2.1.318 composers, the release installed on 2026-11-04, at the nine sizes and palettes 2.1.310, 2.1.312 and 2.1.317 were recorded at. Each set must draw the same rule, shell and overview foregrounds and the same screen signatures as those releases, with its one submission blocked before a model turn.
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_live_release_318_menu_frames() {
+    skip_unless!(common::check_claude_available());
+    menu_frames("2.1.318");
+}
+
+/// One release's nine menu size/palette recordings, each checked against the
+/// foregrounds and screen signatures measured on 2.1.310 and 2.1.312.
+fn menu_frames(release: &str) {
+    use vt100::Color::{self, Idx, Rgb};
+
+    let (_root, path) = pinned_path(release).unwrap_or_else(|| {
+        panic!(
+            "set DOT_AGENT_DECK_CLAUDE_MENU_{} to the pinned executable",
+            release.replace('.', "_")
+        )
+    });
+    // Measured foregrounds: the main composer's upper rule, the shell
+    // glyph and the overview's own prompt glyph.
+    let indexed_dark = (Idx(244), Idx(211), Idx(246));
+    for (kind, rows, cols, theme, colorterm, (rule, shell, overview)) in [
+        ("menus", 24, 80, "dark", None, indexed_dark),
+        ("menus", 40, 120, "dark", None, indexed_dark),
+        ("menus", 50, 200, "dark", None, indexed_dark),
+        (
+            "menus-light",
+            50,
+            200,
+            "light",
+            None,
+            (Idx(245), Idx(199), Idx(241)),
+        ),
+        (
+            "menus-truecolor-dark",
+            50,
+            200,
+            "dark",
+            Some("truecolor"),
+            (Rgb(136, 136, 136), Rgb(253, 93, 177), Rgb(153, 153, 153)),
+        ),
+        (
+            "menus-truecolor-light",
+            50,
+            200,
+            "light",
+            Some("truecolor"),
+            (Rgb(138, 138, 138), Rgb(255, 0, 135), Rgb(102, 102, 102)),
+        ),
+        (
+            "menus-dark-ansi",
+            50,
+            200,
+            "dark-ansi",
+            None,
+            (Idx(7), Idx(13), Idx(7)),
+        ),
+        (
+            "menus-light-ansi",
+            50,
+            200,
+            "light-ansi",
+            None,
+            (Idx(7), Idx(5), Idx(8)),
+        ),
+        (
+            "menus-dark-daltonized",
+            50,
+            200,
+            "dark-daltonized",
+            None,
+            (Idx(244), Idx(75), Idx(246)),
+        ),
+    ] {
+        let capture = measure_with_path(kind, rows, cols, Some(&path));
+        eprintln!(
+            "{release} {kind} {rows}x{cols} capture: {}",
+            capture.root.display()
+        );
+        assert_eq!(capture.result["release"], release);
+        assert_eq!(capture.result["theme"], theme);
+        assert_eq!(capture.result["colorterm"], serde_json::json!(colorterm));
+        let foreground = |point: &str, row| {
+            capture
+                .parser(capture.point(point))
+                .screen()
+                .cell(row, 0)
+                .unwrap()
+                .fgcolor()
+        };
+        assert_eq!(foreground("empty", rows - 4), rule, "{kind} main rule");
+        assert_eq!(foreground("bang", rows - 3), shell, "{kind} shell glyph");
+        assert_eq!(
+            foreground("overview", rows - 3),
+            overview,
+            "{kind} overview glyph"
+        );
+        // The structural premise the recogniser reads, beyond the palette:
+        // the main composer has a coloured rule and a Default prompt, the
+        // overview a Default rule and a coloured prompt.
+        assert_eq!(
+            foreground("empty", rows - 3),
+            Color::Default,
+            "{kind} main prompt"
+        );
+        assert_eq!(
+            foreground("overview", rows - 4),
+            Color::Default,
+            "{kind} overview rule"
+        );
+        assert_empty_menu_composer(&capture);
+        assert!(
+            capture
+                .parser(capture.point("overview"))
+                .screen()
+                .contents()
+                .lines()
+                .any(|row| {
+                    row.starts_with('❯') && row.contains("describe a task for a new session")
+                }),
+            "{release}: overview must show its own composer, beyond the transcript quotation"
+        );
+        for (point, signature) in [
+            ("slash", "/add-dir"),
+            ("at", ".dot-agent-deck.toml"),
+            ("bang", "! for shell mode"),
+            ("exit-warning", "Press Ctrl-C again to exit"),
+            ("overview", "describe a task for a new session"),
             (
-                "menus-light",
-                50,
-                200,
-                "light",
-                None,
-                (Idx(245), Idx(199), Idx(241)),
-            ),
-            (
-                "menus-truecolor-dark",
-                50,
-                200,
-                "dark",
-                Some("truecolor"),
-                (Rgb(136, 136, 136), Rgb(253, 93, 177), Rgb(153, 153, 153)),
-            ),
-            (
-                "menus-truecolor-light",
-                50,
-                200,
-                "light",
-                Some("truecolor"),
-                (Rgb(138, 138, 138), Rgb(255, 0, 135), Rgb(102, 102, 102)),
-            ),
-            (
-                "menus-dark-ansi",
-                50,
-                200,
-                "dark-ansi",
-                None,
-                (Idx(7), Idx(13), Idx(7)),
-            ),
-            (
-                "menus-light-ansi",
-                50,
-                200,
-                "light-ansi",
-                None,
-                (Idx(7), Idx(5), Idx(8)),
-            ),
-            (
-                "menus-dark-daltonized",
-                50,
-                200,
-                "dark-daltonized",
-                None,
-                (Idx(244), Idx(75), Idx(246)),
+                "transcript-quotation",
+                "Original prompt: Quoted UI phrases:",
             ),
         ] {
-            let capture = measure_with_path(kind, rows, cols, Some(&path));
-            eprintln!(
-                "{release} {kind} {rows}x{cols} capture: {}",
-                capture.root.display()
-            );
-            assert_eq!(capture.result["release"], release);
-            assert_eq!(capture.result["theme"], theme);
-            assert_eq!(capture.result["colorterm"], serde_json::json!(colorterm));
-            let foreground = |point: &str, row| {
+            assert!(
                 capture
                     .parser(capture.point(point))
                     .screen()
-                    .cell(row, 0)
-                    .unwrap()
-                    .fgcolor()
-            };
-            assert_eq!(foreground("empty", rows - 4), rule, "{kind} main rule");
-            assert_eq!(foreground("bang", rows - 3), shell, "{kind} shell glyph");
-            assert_eq!(
-                foreground("overview", rows - 3),
-                overview,
-                "{kind} overview glyph"
-            );
-            // The structural premise the recogniser reads, beyond the palette:
-            // the main composer has a coloured rule and a Default prompt, the
-            // overview a Default rule and a coloured prompt.
-            assert_eq!(
-                foreground("empty", rows - 3),
-                Color::Default,
-                "{kind} main prompt"
-            );
-            assert_eq!(
-                foreground("overview", rows - 4),
-                Color::Default,
-                "{kind} overview rule"
-            );
-            assert_empty_menu_composer(&capture);
-            assert!(
-                capture
-                    .parser(capture.point("overview"))
-                    .screen()
                     .contents()
-                    .lines()
-                    .any(|row| {
-                        row.starts_with('❯') && row.contains("describe a task for a new session")
-                    }),
-                "{release}: overview must show its own composer, beyond the transcript quotation"
-            );
-            for (point, signature) in [
-                ("slash", "/add-dir"),
-                ("at", ".dot-agent-deck.toml"),
-                ("bang", "! for shell mode"),
-                ("exit-warning", "Press Ctrl-C again to exit"),
-                ("overview", "describe a task for a new session"),
-                (
-                    "transcript-quotation",
-                    "Original prompt: Quoted UI phrases:",
-                ),
-            ] {
-                assert!(
-                    capture
-                        .parser(capture.point(point))
-                        .screen()
-                        .contents()
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .contains(signature),
-                    "{release} {point}: missing real screen signature {signature:?}"
-                );
-            }
-            let mut rendered = String::new();
-            for point in [
-                "empty",
-                "slash",
-                "at",
-                "bang",
-                "exit-warning",
-                "transcript-quotation",
-                "overview",
-            ] {
-                let parser = capture.parser(capture.point(point));
-                eprintln!("{release} {point}:\n{}", parser.screen().contents());
-                rendered.push_str(&format!(
-                    "{release} {point} offset={} cursor={:?}\n{}\n\n",
-                    capture.point(point),
-                    parser.screen().cursor_position(),
-                    parser.screen().contents()
-                ));
-                let palette: Vec<_> = (0..rows)
-                    .filter_map(|row| {
-                        let cell = parser.screen().cell(row, 0)?;
-                        matches!(cell.contents(), "❯" | "─" | "!").then(|| {
-                            format!(
-                                "row {row}: {:?} fg={:?} bg={:?}",
-                                cell.contents(),
-                                cell.fgcolor(),
-                                cell.bgcolor()
-                            )
-                        })
-                    })
-                    .collect();
-                rendered.push_str(&format!("{}\n\n", palette.join("\n")));
-            }
-            std::fs::write(capture.root.join("rendered.txt"), rendered).unwrap();
-            let hooks = std::fs::read_to_string(capture.root.join("hook.jsonl")).unwrap();
-            assert_eq!(
-                hooks.lines().count(),
-                1,
-                "one blocked submission; no model turn"
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .contains(signature),
+                "{release} {point}: missing real screen signature {signature:?}"
             );
         }
+        let mut rendered = String::new();
+        for point in [
+            "empty",
+            "slash",
+            "at",
+            "bang",
+            "exit-warning",
+            "transcript-quotation",
+            "overview",
+        ] {
+            let parser = capture.parser(capture.point(point));
+            eprintln!("{release} {point}:\n{}", parser.screen().contents());
+            rendered.push_str(&format!(
+                "{release} {point} offset={} cursor={:?}\n{}\n\n",
+                capture.point(point),
+                parser.screen().cursor_position(),
+                parser.screen().contents()
+            ));
+            let palette: Vec<_> = (0..rows)
+                .filter_map(|row| {
+                    let cell = parser.screen().cell(row, 0)?;
+                    matches!(cell.contents(), "❯" | "─" | "!").then(|| {
+                        format!(
+                            "row {row}: {:?} fg={:?} bg={:?}",
+                            cell.contents(),
+                            cell.fgcolor(),
+                            cell.bgcolor()
+                        )
+                    })
+                })
+                .collect();
+            rendered.push_str(&format!("{}\n\n", palette.join("\n")));
+        }
+        std::fs::write(capture.root.join("rendered.txt"), rendered).unwrap();
+        let hooks = std::fs::read_to_string(capture.root.join("hook.jsonl")).unwrap();
+        assert_eq!(
+            hooks.lines().count(),
+            1,
+            "one blocked submission; no model turn"
+        );
     }
 }
 
@@ -710,6 +724,54 @@ fn doorbell_036_live_release_317_compound_keys() {
     compound_keys("2.1.317");
 }
 
+/// Scenario: Launch four isolated real Haiku composers on pinned Claude Code 2.1.318, the release installed on 2026-11-04, leaving each idle for twenty seconds. Each must show the measured ready composer, raw input mode and its own release header, with no dialog after it is ready.
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_live_release_318_startup_first_four() {
+    skip_unless!(common::check_claude_available());
+    startups("2.1.318", 4);
+}
+
+/// Scenario: Launch three further isolated real Haiku composers on pinned Claude Code 2.1.318 and observe each for twenty seconds. The recorded profile must still read the ready composer and release.
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_live_release_318_startup_next_three() {
+    skip_unless!(common::check_claude_available());
+    startups("2.1.318", 3);
+}
+
+/// Scenario: Launch the last three of ten isolated real Haiku composers on pinned Claude Code 2.1.318 and observe each for twenty seconds. The recorded profile must still read the ready composer and release.
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_live_release_318_startup_last_three() {
+    skip_unless!(common::check_claude_available());
+    startups("2.1.318", 3);
+}
+
+/// Scenario: Type and submit fifteen token-led doorbell lines into real Haiku on pinned Claude Code 2.1.318 at 24 by 80, blocking every submission before a model turn. Replay the raw capture to verify exact composer and hook echoes, transcript user echoes, every blocked prompt's restore within the bound, and the blank composer after clears and deletes.
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_live_release_318_small_composer() {
+    skip_unless!(common::check_claude_available());
+    composer("2.1.318", 24, 80);
+}
+
+/// Scenario: Type and submit fifteen token-led doorbell lines into real Haiku on pinned Claude Code 2.1.318 at 50 by 200 with model turns blocked, then delete three lines, resize ten times and nudge ten times. Replay the capture to verify the same composer and hook premises, full redraw markers and width witnesses.
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_live_release_318_large_composer_and_layout() {
+    skip_unless!(common::check_claude_available());
+    composer("2.1.318", 50, 200);
+}
+
+/// Scenario: Type the nineteen Q32 compound-key sequences into real Haiku on pinned Claude Code 2.1.318, revealing retained text with harmless markers instead of submitting it. Every sequence must leave the composer 2.1.312 left, including two spaces after the reviewer's sequence, the two-space draft after Enter following a non-ASCII deletion, and three spaces after Left three times.
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_live_release_318_compound_keys() {
+    skip_unless!(common::check_claude_available());
+    compound_keys("2.1.318");
+}
+
 fn compound_keys(release: &str) {
     let (_root, path) = release_path(release);
     preflight(release, path.as_deref());
@@ -753,4 +815,151 @@ fn compound_keys(release: &str) {
     }
     assert_eq!(capture.result["keys"][19]["composer"], "X  Z");
     assert_eq!(capture.result["keys"][20]["composer"], "X   Z");
+}
+
+/// Scenario: In isolated real Haiku composers on pinned Claude Code 2.1.317 and 2.1.318, at 50×200 and 24×80, seed six prompts from an earlier session in the disposable HOME's history, submit one line (blocked by the hook before a model turn) and clear it, then walk the prompt history with Up and Down from the empty composer, leave a recalled prompt with Escape, Ctrl+U, Ctrl+C and Enter (blocked again) in turn, and press Up over a typed draft. Every frame is rendered with what the screen profile reads in it, so the history-recall surface can be judged against the profile.
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_live_release_history_recall_frames() {
+    skip_unless!(common::check_claude_available());
+    for release in ["2.1.317", "2.1.318"] {
+        let (_root, path) = pinned_path(release).unwrap_or_else(|| {
+            panic!(
+                "set DOT_AGENT_DECK_CLAUDE_MENU_{} to the pinned executable",
+                release.replace('.', "_")
+            )
+        });
+        preflight(release, Some(&path));
+        for (rows, cols) in [(50, 200), (24, 80)] {
+            let capture = measure_with_path("history", rows, cols, Some(&path));
+            assert_eq!(capture.result["release"], release);
+            let hooks = std::fs::read_to_string(capture.root.join("hook.jsonl")).unwrap();
+            assert_eq!(
+                hooks.lines().count(),
+                2,
+                "two blocked submissions; no model turn; {}",
+                capture.root.display()
+            );
+            let mut rendered = String::new();
+            let mut points: Vec<(&String, usize)> = capture.index["points"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(name, _)| !name.starts_with("mark:"))
+                .map(|(name, at)| (name, at.as_u64().unwrap() as usize))
+                .collect();
+            points.sort_by_key(|&(_, at)| at);
+            for (name, at) in points {
+                let parser = capture.parser(at);
+                let grid = Grid::of(parser.screen(), at as u64);
+                let composer = (CLAUDE_PROFILE.composer)(&grid);
+                let verdict = format!(
+                    "{release} {rows}x{cols} {name}@{at}: composer={:?} ready={} empty_and_ready={} dialog={:?}",
+                    composer
+                        .as_ref()
+                        .map(|c| (&c.text, c.cursor_at_end, c.hidden)),
+                    (CLAUDE_PROFILE.ready)(&grid),
+                    CLAUDE_PROFILE.empty_and_ready(&grid),
+                    (CLAUDE_PROFILE.dialog)(&grid)
+                );
+                eprintln!("{verdict}");
+                rendered.push_str(&format!(
+                    "{verdict}\ncursor={:?}\n{}\n\n",
+                    parser.screen().cursor_position(),
+                    parser.screen().contents()
+                ));
+            }
+            std::fs::write(capture.root.join("rendered.txt"), rendered).unwrap();
+            eprintln!(
+                "{release} history {rows}x{cols} capture: {}",
+                capture.root.display()
+            );
+            verify_history(&capture);
+        }
+    }
+}
+
+/// The row above the last `❯` composer row, and the composer row, as drawn.
+fn history_rows(capture: &Capture, point: &str) -> (String, String) {
+    let parser = capture.parser(capture.point(point));
+    let contents = parser.screen().contents();
+    let lines: Vec<&str> = contents.lines().collect();
+    let prompt = lines
+        .iter()
+        .rposition(|row| row.starts_with('❯'))
+        .unwrap_or_else(|| panic!("{point}: no composer row; {}", capture.root.display()));
+    // Claude draws an editable draft as `❯` and a no-break space.
+    (
+        lines[prompt.saturating_sub(1)].to_string(),
+        lines[prompt].replace('\u{a0}', " ").trim_end().to_string(),
+    )
+}
+
+/// The history-recall premises, and what the profile reads there: Up from
+/// the empty composer draws `─── History i/n ` in place of the composer's
+/// upper rule over the recalled prompt, a blocked prompt is not recalled,
+/// Ctrl+U returns the plain composer, and the profile reads no composer
+/// under a History rule, whatever the box holds.
+fn verify_history(capture: &Capture) {
+    let (rule, prompt) = history_rows(capture, "up-1");
+    assert!(rule.starts_with("─── History 6/6 "), "up-1 rule {rule:?}");
+    assert_eq!(prompt.trim_end(), "❯ HISTORYSIXfoxtrot", "up-1");
+    let (rule, prompt) = history_rows(capture, "up-2");
+    assert!(rule.starts_with("─── History 5/6 "), "up-2 rule {rule:?}");
+    assert_eq!(prompt.trim_end(), "❯ HISTORYFIVEecho", "up-2");
+    for way in ["escape", "ctrl-u", "ctrl-c", "manual-mode", "enter", "slot"] {
+        let (rule, prompt) = history_rows(capture, &format!("recalled-before-{way}"));
+        assert!(
+            rule.starts_with("─── History ") && prompt.trim_end() != "❯",
+            "recalled-before-{way}: no recalled prompt under a History rule {rule:?} {prompt:?}; {}",
+            capture.root.display()
+        );
+    }
+    let cleared = capture.grid("after-ctrl-u");
+    assert!(
+        !history_rows(capture, "after-ctrl-u").0.contains("History"),
+        "Ctrl+U leaves history recall"
+    );
+    assert!(CLAUDE_PROFILE.empty_and_ready(&cleared), "after-ctrl-u");
+    let (_, manual) = history_rows(capture, "recalled-before-manual-mode");
+    let footer = capture
+        .parser(capture.point("recalled-before-manual-mode"))
+        .screen()
+        .contents();
+    assert!(
+        footer.contains("⏸ manual mode on"),
+        "the manual-mode footer under a recalled prompt; {}",
+        capture.root.display()
+    );
+    let mut history_frames = 0;
+    let mut blank_history_frames = Vec::new();
+    for (name, _) in capture.index["points"].as_object().unwrap() {
+        if name.starts_with("mark:") {
+            continue;
+        }
+        let parser = capture.parser(capture.point(name));
+        if !parser.screen().contents().contains('❯') {
+            continue;
+        }
+        let (rule, prompt) = history_rows(capture, name);
+        if !rule.starts_with("─── History ") {
+            continue;
+        }
+        history_frames += 1;
+        if prompt.trim_end() == "❯" {
+            blank_history_frames.push(name.clone());
+        }
+        let grid = capture.grid(name);
+        assert!(
+            (CLAUDE_PROFILE.composer)(&grid).is_none()
+                && !(CLAUDE_PROFILE.ready)(&grid)
+                && !CLAUDE_PROFILE.empty_and_ready(&grid),
+            "{name}: the profile must refuse a History-ruled frame; {}",
+            capture.root.display()
+        );
+    }
+    eprintln!(
+        "{} history {}x{}: {history_frames} History-ruled frames, all refused (no composer); blank box under a History rule at {blank_history_frames:?}; manual-mode recall {manual:?}; recall ups {}",
+        capture.release, capture.index["rows"], capture.index["cols"], capture.result["keys"]
+    );
 }

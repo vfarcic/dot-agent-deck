@@ -261,6 +261,14 @@ slow-timeout = { period = "60s", terminate-after = 6 }
 filter = 'test(doorbell_036_live_release_menu_frames)'
 slow-timeout = { period = "60s", terminate-after = 15 }
 
+# One release's nine menu recordings on its own (2.1.318, 2026-11-04), about
+# 190s at the rate above, and the history-recall acquisition: four recordings
+# (2.1.317 and 2.1.318 at 50x200 and 24x80), 178s in the run that recorded
+# its fixtures. Both are past the 180s default, so each gets 480s.
+[[profile.default.overrides]]
+filter = 'test(doorbell_036_live_release_318_menu_frames) | test(doorbell_036_live_release_history_recall_frames)'
+slow-timeout = { period = "60s", terminate-after = 8 }
+
 # PRD #1631: `codex/hooks/001` drives one real interactive Codex turn, behind
 # `check_codex_available`'s preflight. In that PRD's lane-2 run, on a box with
 # `io full` near 70%, its isolated retry spent over 120s in the preflight, ran
@@ -796,17 +804,17 @@ slow-timeout = { period = "60s", terminate-after = 14 }
 # forms, whole and split, plus paste cells) are the long ones; the rest
 # launch Claude a few times each.
 [[profile.default.overrides]]
-filter = 'test(/^probe_088_live_claude_317_/)'
+filter = 'test(/^probe_088_live_claude_31[78]_/)'
 slow-timeout = { period = "60s", terminate-after = 16 }
 
 [[profile.default.overrides]]
-filter = 'test(probe_089_live_claude_317_ctrl_g_forms)'
+filter = 'test(/^probe_089_live_claude_31[78]_ctrl_g_forms$/)'
 slow-timeout = { period = "60s", terminate-after = 28 }
 
 # M59 (`tests/e2e_claude_helper_alarm.rs`, lane 2): ten Ctrl+G trials per
 # cell on a real Claude Code, the unarmed cell's editor sleeping 8 s each.
 [[profile.default.overrides]]
-filter = 'test(/^probe_090_live_claude_317_/)'
+filter = 'test(/^probe_090_live_claude_31[78]_/)'
 slow-timeout = { period = "60s", terminate-after = 9 }
 
 # PRD #1666 part 3, Q35-28's lane-2 gates on a real installed Claude Code

@@ -35,7 +35,6 @@ use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::time::Duration;
 
-const RELEASE: &str = "2.1.317";
 const GENERATION: &str = "3";
 
 fn identity_of(pid: u32) -> Identity {
@@ -59,8 +58,8 @@ fn identity_of(pid: u32) -> Identity {
     }
 }
 
-fn m59(cell: &str, armed: bool) -> Option<(std::path::PathBuf, Value)> {
-    let key = format!("DOT_AGENT_DECK_CLAUDE_MENU_{}", RELEASE.replace('.', "_"));
+fn m59(release: &str, cell: &str, armed: bool) -> Option<(std::path::PathBuf, Value)> {
+    let key = format!("DOT_AGENT_DECK_CLAUDE_MENU_{}", release.replace('.', "_"));
     let Ok(binary) = std::env::var(&key) else {
         common::_skip_if_err(Err(format!("set {key} to the pinned executable")));
         return None;
@@ -165,7 +164,7 @@ fn m59(cell: &str, armed: bool) -> Option<(std::path::PathBuf, Value)> {
     eprintln!("M59 {cell} evidence: {}", out.display());
     drop(deck);
     drop(generation);
-    assert_eq!(result["release"], RELEASE);
+    assert_eq!(result["release"], release);
     assert!(
         result["error"].is_null(),
         "M59 {cell}: {}; {}",
@@ -240,7 +239,20 @@ fn summary(trial: &Value) -> String {
 #[test]
 fn probe_090_live_claude_317_armed_helper_alarm_ends_a_stalled_exchange() {
     skip_unless!(common::check_claude_available());
-    let Some((out, result)) = m59("armed-stall", true) else {
+    armed_helper_alarm_ends_a_stalled_exchange("2.1.317");
+}
+
+/// Scenario: Run pinned Claude Code 2.1.318 with the deck's editor helper as its editor, the arm present and the helper stalled at its first ready poll, and press Ctrl+G on a draft ten times. Each time the helper must end about five seconds after it chose the armed branch, by its alarm, with no editor run, and Claude must keep the draft.
+#[spec("inbox/probe/090")]
+#[test]
+fn probe_090_live_claude_318_armed_helper_alarm_ends_a_stalled_exchange() {
+    skip_unless!(common::check_claude_available());
+    armed_helper_alarm_ends_a_stalled_exchange("2.1.318");
+}
+
+/// The `probe_090_live_claude_*_armed_helper_alarm_ends_a_stalled_exchange` cell on one pinned release.
+fn armed_helper_alarm_ends_a_stalled_exchange(release: &str) {
+    let Some((out, result)) = m59(release, "armed-stall", true) else {
         return;
     };
     assert_eq!(trials(&result).len(), 10);
@@ -324,7 +336,20 @@ fn probe_090_live_claude_317_armed_helper_alarm_ends_a_stalled_exchange() {
 #[test]
 fn probe_090_live_claude_317_armed_helper_unanswered_exchange() {
     skip_unless!(common::check_claude_available());
-    let Some((out, result)) = m59("armed-timeout", true) else {
+    armed_helper_unanswered_exchange("2.1.317");
+}
+
+/// Scenario: Run pinned Claude Code 2.1.318 with the deck's editor helper as its editor and the arm present, with no stall, against the socket that never answers, and press Ctrl+G on a draft ten times. The helper's exchange runs out first; each time no editor runs, the helper's notice is written to the terminal, it ends before its alarm, and Claude keeps the draft.
+#[spec("inbox/probe/090")]
+#[test]
+fn probe_090_live_claude_318_armed_helper_unanswered_exchange() {
+    skip_unless!(common::check_claude_available());
+    armed_helper_unanswered_exchange("2.1.318");
+}
+
+/// The `probe_090_live_claude_*_armed_helper_unanswered_exchange` cell on one pinned release.
+fn armed_helper_unanswered_exchange(release: &str) {
+    let Some((out, result)) = m59(release, "armed-timeout", true) else {
         return;
     };
     assert_eq!(trials(&result).len(), 10);
@@ -381,7 +406,20 @@ fn probe_090_live_claude_317_armed_helper_unanswered_exchange() {
 #[test]
 fn probe_090_live_claude_317_unarmed_helper_long_edit() {
     skip_unless!(common::check_claude_available());
-    let Some((out, result)) = m59("unarmed-long", false) else {
+    unarmed_helper_long_edit("2.1.317");
+}
+
+/// Scenario: Run pinned Claude Code 2.1.318 with the deck's editor helper as its editor and no arm, the user's editor a stand-in that sleeps eight seconds, writes a sentinel and exits, and press Ctrl+G on a draft ten times, then once more with the editor exiting 37. Each time the helper must take the unarmed branch, outlive its would-be alarm while the editor runs, and end with the editor's status; Claude must show the sentinel after the editor exits zero.
+#[spec("inbox/probe/090")]
+#[test]
+fn probe_090_live_claude_318_unarmed_helper_long_edit() {
+    skip_unless!(common::check_claude_available());
+    unarmed_helper_long_edit("2.1.318");
+}
+
+/// The `probe_090_live_claude_*_unarmed_helper_long_edit` cell on one pinned release.
+fn unarmed_helper_long_edit(release: &str) {
+    let Some((out, result)) = m59(release, "unarmed-long", false) else {
         return;
     };
     assert_eq!(trials(&result).len(), 11);

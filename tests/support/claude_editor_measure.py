@@ -45,6 +45,7 @@ PINS = {
     '2.1.310': 'b73676430af12f97316a798b8371f81d640f90a58bdcb8f3ce56a835bb47df56',
     '2.1.312': '4f4178ce41d83e23341ebfbaecdbcf8ea6bf7baea0690025abe49eeec3a5d01d',
     '2.1.317': 'eb224419e344575faa4a1f39b290b649425a10cd5ee2ef1d003480cd9ae57eb0',
+    '2.1.318': '708c77b204db30086ff6f1ed34577bda03e1be74ced80557cbf7b54249ebf0bd',
 }
 UNBIND = {'bindings': [{'context': 'Chat', 'bindings': {'ctrl+g': None, 'ctrl+e': 'chat:externalEditor'}}]}
 FORMS = [('bel', '\x07'), ('esc-bel', '\x1b\x07')]

@@ -84,3 +84,50 @@ The start-up, composer, layout and compound-key captures are committed as the re
 | compound-keys-50x200 | 44390 | `b826c11beca83c8fde680283150b75f9529cd25bdc70b34ad3c3850557d3f28e` |
 
 One difference from 2.1.312 was seen while recording. After the hook blocks a submission, Claude Code puts the prompt back in the composer. In one 50×200 composer run on 2.1.317 it came back more than 0.5 s after the hook, after the recorder had already cleared the box, so the "cleared" frame still held the line. The recorder now waits up to 5 s for the prompt to come back as an editable draft before clearing, and records the wait. The first figures that wait gave (302 ms and 34 ms) do not stand: it matched the line's text, which at 24 × 80 never left the box, so it returned at once (`../release-2.1.317/README.md`, "The blocked prompt's restore"). With the corrected wait, on 2026-11-03, the largest restore after the hook was 742 ms at 50×200 and 368, 674 and 513 ms at 24×80 (three runs) on 2.1.317, against 726 ms and 445 ms on 2.1.312. So the late case was seen again, on both releases, and every one of those runs passed inside the 5 s bound. Restore latency is a property of the measurement's blocking hook; nothing in the record or in production reads it.
+
+## Claude Code 2.1.318
+
+Recorded on 2026-11-04 through the same local lane-2 harness, with the executable pinned by SHA-256 `708c77b204db30086ff6f1ed34577bda03e1be74ced80557cbf7b54249ebf0bd`. That executable is the official npm package `@anthropic-ai/claude-code-linux-x64@2.1.318` (tarball integrity `sha512-GX+7CUng2R5f7SsA2w0LaXlH2f62fRCFD/Z2SUexoeH3B0KfulKQt5DtY9NeD2Yp3VEBz6/k/xWSbGPUi6NV2A==`, matching the registry's), byte-identical to the copy the host's installer put in `~/.local/share/claude/versions/2.1.318` on 2026-11-04. It was copied to private scratch space outside the checkout and exposed through a private `claude` symlink. Every submission was blocked by the private hook before a model turn. Every 2.1.318 capture here was made by the recorder `tests/support/claude_release_measure.py` at SHA-256 `79931911…`, the revision committed with these fixtures, and copied into the fixture set by `tests/support/claude_fixture_export.py`, whose docstring gives the mapping (it regenerates the committed 2.1.317 `menus-24x80` fixture byte for byte from that capture).
+
+`doorbell_036_live_release_318_menu_frames` recorded the nine menu sets on their own, through the same per-release body as `doorbell_036_live_release_menu_frames`. In every set, 2.1.318 draws the main rule, shell glyph and overview glyph in the same foregrounds as 2.1.310, 2.1.312 and 2.1.317, with the same structural premise and the same screen signatures; the fast replay reads all sixty-three screens right (no wrong acceptance, no wrong refusal). The first attempt ran inside the default 180 s nextest window and was cut off after eight sets; the recorded sets are the rerun's, under the 480 s window it now has.
+
+| Set | Theme | COLORTERM | Bytes | Trace SHA-256 | Source run under `/var/tmp/` |
+| --- | --- | --- | ---: | --- | --- |
+| 24x80 | dark | none | 15573 | `ed6218e18deb55812c991b87cf94df3850df82c62f29dcc82a557edce7b8da37` | `dad-claude-release-measure-5GxWsQ/capture` |
+| 40x120 | dark | none | 17503 | `a046573b3e242bb5dd5c2ed93680f33ad577cd13823edd64e48498168c81ee52` | `dad-claude-release-measure-ZC47u8/capture` |
+| 50x200 | dark | none | 17187 | `a11458467e389a95faffbbffe14d2a7f86bd3ce5f33b9926e948194544ef213c` | `dad-claude-release-measure-l8Pznv/capture` |
+| light-50x200 | light | none | 17362 | `aaf697f8eb769d464dc3881708ab6c7f4697954b971f84b5489e2e82d5a62e5a` | `dad-claude-release-measure-bGPe2W/capture` |
+| truecolor-dark-50x200 | dark | truecolor | 17878 | `f5cc90e9d0f457f5f1bc341e4a5a059d5b685377bc5cc149e26ebe141d9f05c1` | `dad-claude-release-measure-ip3lnh/capture` |
+| truecolor-light-50x200 | light | truecolor | 17402 | `313c9722063822142943bbb507ff2c5809bddde089cc1af46955689eed70d721` | `dad-claude-release-measure-pqU9wh/capture` |
+| dark-ansi-50x200 | dark-ansi | none | 17137 | `9a07afc6b50e3d36199c1b25fc57cc3e40896dc12c02f162e016ca47b33ca7d3` | `dad-claude-release-measure-znnHAP/capture` |
+| light-ansi-50x200 | light-ansi | none | 17493 | `a6e326229908f5509275164783fd0751a6640760b6f9d5aa5f7e6fdaf16df903` | `dad-claude-release-measure-7wn2px/capture` |
+| dark-daltonized-50x200 | dark-daltonized | none | 17936 | `a9931e853af0d1b416ec00b27228b74731a85fd9dfb268ded42c169bc45beaf1` | `dad-claude-release-measure-gpAgXx/capture` |
+
+The start-up, composer, layout and compound-key captures are committed as the recorder wrote them (index plus raw bytes), and `compound-keys` carries an added `end` point at the trace's length, as 2.1.312's and 2.1.317's do. The start-up fixture is the first of the ten 2.1.318 start-ups.
+
+| Fixture | Bytes | Trace SHA-256 |
+| --- | ---: | --- |
+| start-50x200 | 1979 | `25452df782497f94c17b934cd1745c152b0e0afd672c00391c6a1f8a95de02b5` |
+| composer-24x80 | 89277 | `0decdfd1a815fa2b0e9dfcf850c62f32afff4d9d8c7c81ac0db506a9b5002876` |
+| layout-50x200 | 147283 | `6f2596764a5d0e926a871ba97e7b8d867c712bdff922269d90dc0244a1c25a9a` |
+| compound-keys-50x200 | 44504 | `b145c1be33fefbbbfb57595f86cec4e0ffddedf7d21b8b89987101ca4b1184ce` |
+
+The blocked prompt's restore, with the corrected wait, was at most 348.7 ms after the hook at 24×80 and 361.6 ms at 50×200 on 2.1.318, inside the 5 s bound; as for 2.1.317, that is a property of the measurement's blocking hook, which nothing in the record or in production reads.
+
+## History recall (Claude Code 2.1.317 and 2.1.318)
+
+Recorded on 2026-11-04 by `doorbell_036_live_release_history_recall_frames`, with the same recorder (`79931911…`, its `history` kind), pins and hook. A blocked prompt does not enter Claude Code's prompt history (Up after two blocked submissions recalled nothing, on 2.1.317), so the recorder seeds six prompts from an earlier session in this project into the disposable HOME's `.claude/history.jsonl`, in the shape Claude Code keeps them there (`display`, `pastedContents`, `timestamp`, `project`, `sessionId`); it never reads or writes the host's history. Each capture's `.frames.txt` lists every named point with what the profile reads there (composer, ready, empty-and-ready, dialog).
+
+What the captures show, on both releases and at both sizes:
+
+- Up from the empty composer draws `─── History 6/6 ` and the rest of a rule in place of the composer's upper rule, over the newest recalled prompt with the cursor after it; each further Up steps to an older entry (`5/6`, `4/6`), and Down past the newest returns the plain composer. Escape leaves the recalled prompt and its History rule in place; Ctrl+U clears it and returns the plain rule over an empty composer; Ctrl+C clears it too; Enter submits it (blocked again, so Claude puts it back as a draft). Up over a typed draft recalls the newest entry, and Down returns the draft with the cursor at its start.
+- After Shift+Tab, the mode line under a recalled prompt reads `⏸ manual mode on` (in the harness's settings the permission mode starts as `⏵⏵ auto mode on`). The mode line is not what the profile reads: it refuses these frames because the row above the prompt is not a plain full-width rule.
+- **After Ctrl+U clears a recalled prompt, walking Up and Down back to it finds that slot blank.** With nothing else typed in between (`slot-cleared`, then `slot-up-1` … `slot-down-3`), revisiting it (`slot-down-1`, `slot-up-2`, `slot-down-3`) draws `─── History 6/6 ` over a blank box with the cursor at the indent: cell for cell the empty ready composer apart from the rule's label. That is not a lasting edit of the history: earlier in the same captures, prompts cleared the same way were recalled intact after a typed draft and an Enter, so how long a slot stays blank was not measured. (The recorder's own comment in its `history` kind says Ctrl+U "empties that history slot for the session"; that is wider than these captures show, and it is left as written only so the committed recorder stays the file whose SHA-256 the fixtures carry. This paragraph is the reading.)
+- Every History-ruled frame (24 per capture) has no composer, no readiness and no empty box to the profile, and admission's frame builder reads no composer there. 2.1.317 and 2.1.318 draw the same rule and prompt rows at every point after the first (whose `Try "…"` placeholder is chosen at random per launch).
+
+| Release | Size | Bytes | Trace SHA-256 | Source run under `/var/tmp/` |
+| --- | --- | ---: | --- | --- |
+| 2.1.317 | 50x200 | 7396 | `818b106f2268c80258787517fb82d2e987a77657cf6a7d629487188877083139` | `dad-claude-release-measure-F8sAtw/capture` |
+| 2.1.317 | 24x80 | 6542 | `c25bdc2a64d7eaabb9d368178cb9f6d66c5ff0ece3e55dae4c181dd1a38a385a` | `dad-claude-release-measure-mfyWSi/capture` |
+| 2.1.318 | 50x200 | 7457 | `c87ab96fe573fc616bbfff4ab9832f55c1e9afc475bc03986ab4fb9ceb59f329` | `dad-claude-release-measure-YSBO42/capture` |
+| 2.1.318 | 24x80 | 6592 | `2c963a6c617b6b0837d316c7750c5d55ed50691ef829974042a739e0f0c45f30` | `dad-claude-release-measure-3czas6/capture` |

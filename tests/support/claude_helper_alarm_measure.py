@@ -36,7 +36,8 @@ import sys
 import termios
 import time
 
-PINS = {'2.1.317': 'eb224419e344575faa4a1f39b290b649425a10cd5ee2ef1d003480cd9ae57eb0'}
+PINS = {'2.1.317': 'eb224419e344575faa4a1f39b290b649425a10cd5ee2ef1d003480cd9ae57eb0',
+        '2.1.318': '708c77b204db30086ff6f1ed34577bda03e1be74ced80557cbf7b54249ebf0bd',}
 TRIALS = 10
 NOTICE = b'dot-agent-deck: the deck was checking this input box.'
 # Claude's own line when the editor it ran ends badly, naming the signal or
