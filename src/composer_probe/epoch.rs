@@ -1949,6 +1949,24 @@ impl GenerationInput {
         }
     }
 
+    /// The front segment's release as the driver acts on it: what it lets
+    /// the held input do ([`Self::segments_front`]) and whether it stops at
+    /// a line-discipline key until Claude's return
+    /// ([`Segments::front_cooked`], Q147b), read in one hold of this lock.
+    pub fn segments_release(&self) -> Option<(Front, bool)> {
+        let state = self.state.lock_recovering();
+        match (state.retired, state.live.as_ref()) {
+            (false, Some(live)) => Some((
+                live.segments.front(),
+                state
+                    .records
+                    .as_ref()
+                    .is_some_and(|records| live.segments.front_cooked(records)),
+            )),
+            _ => None,
+        }
+    }
+
     /// Whether the front segment can never complete
     /// ([`Segments::stranded`]); `false` with no segments attached or once
     /// retired.

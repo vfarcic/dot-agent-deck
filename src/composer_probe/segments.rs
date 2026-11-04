@@ -64,7 +64,11 @@
 //! subsumed by a later invocation doesn't complete its segment, which then
 //! holds until retirement. The rows:
 //! - Claude `Probe`: released at its record's `Armed` or `Unarmed` decision;
-//!   complete at E1 (helper-only) or EC.
+//!   complete at E1 (helper-only) or EC. An `Armed` release, here and in
+//!   Claude's `HumanG` stage 2 below, stops at the first held
+//!   [`line_discipline_key`] until its helper's exit has drained and E1 is
+//!   read ([`Segments::front_cooked`], Q147b): Claude is out of raw mode
+//!   until then, so a Ctrl+C would be a SIGINT.
 //! - Codex `Probe`, and Codex `HumanG` stage 2 `Armed`: released at
 //!   completion, E1F.
 //! - Claude `HumanG` stage 2 `Armed`: released at the decision; complete at
@@ -184,6 +188,21 @@ pub enum Kind {
     Probe,
     /// A person's Ctrl+G held behind an earlier segment.
     HumanG,
+}
+
+/// Q147b: a byte a terminal out of raw mode may act on rather than queue as
+/// typed: every C0 control but Tab, Line Feed and Escape, and Delete. Under
+/// the line discipline's default settings that covers the signal keys
+/// (Ctrl+C, Ctrl+\ and Ctrl+Z), Enter (which `ICRNL` turns into a line
+/// feed), the erase, kill, word-erase, reprint, literal-next and end-of-file
+/// keys, and Ctrl+S and Ctrl+Q under `IXON`. The other controls in the set
+/// do nothing there, and are held too because the settings an agent
+/// restores for its editor can assign any of them. It is the raw byte,
+/// wherever it sits in the input's framing: the line discipline reads no
+/// escape sequences, so a byte inside a paste or a sequence counts as well
+/// (a release then stops at the last ground point before it).
+pub fn line_discipline_key(byte: u8) -> bool {
+    matches!(byte, 0x00..=0x08 | 0x0b..=0x1a | 0x1c..=0x1f | 0x7f)
 }
 
 /// A return marker in the output.
@@ -764,6 +783,40 @@ impl Segments {
             Some(seg) if seg.released && !seg.cut_off => Front::Released,
             Some(_) => Front::Held,
         }
+    }
+
+    /// Q147b: whether the front segment's release must stop before the first
+    /// held [`line_discipline_key`], which waits with everything after it.
+    /// It is a Claude segment released on an `Armed` decision (a `Probe`'s,
+    /// or a `HumanG`'s second stage): what it releases goes to a Claude
+    /// that left raw mode to run its editor, here the deck's helper, and
+    /// that is not back until the helper's exit has drained and Claude's
+    /// `?2004h` after the trigger is read (E1). Until then the terminal's
+    /// line discipline acts on those keys instead of queueing them: a
+    /// Ctrl+C is a SIGINT to Claude's process group, which ends the session,
+    /// an Enter is read back as a line feed, a Backspace erases a key queued
+    /// before it. The ordinary keys M44 measured are kept, so they still go
+    /// at the release. An `Unarmed` decision's release goes to the user's
+    /// editor, as it would without the deck, and Codex releases nothing
+    /// before its return, so neither stops here.
+    pub fn front_cooked(&self, records: &Records) -> bool {
+        let Some(seg) = self.segments.front() else {
+            return false;
+        };
+        if self.agent != Agent::Claude || !seg.released || seg.cut_off {
+            return false;
+        }
+        let Some(key) = seg.record else {
+            return false;
+        };
+        // A matched record deleted by a subsumption leaves its kept facts.
+        let record = records.get(key);
+        let decision = record
+            .and_then(|r| r.decision)
+            .or_else(|| seg.fact.and_then(|f| f.decision));
+        let drained = record.map_or(seg.fact.is_some(), |r| r.drained);
+        let returned = seg.e1.as_ref().is_some_and(|w| w.returned(self.agent));
+        decision == Some(Decision::Armed) && !(drained && returned)
     }
 
     /// Whether the only open segment is a Claude probe that lapsed (core
