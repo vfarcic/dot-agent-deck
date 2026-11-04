@@ -106,6 +106,7 @@ pub struct Fixture {
     /// A Codex pane's own `PATH` and `hooks/list` answer (Q129b item 0).
     codex_pane: Option<CodexPaneEnv>,
     launcher: Option<Launcher>,
+    hosted: Option<Hosted>,
 }
 
 /// Test-owned launcher histories; these change processes, never daemon state.
@@ -122,6 +123,32 @@ pub enum NativePins {
     Both,
     Neither,
     OtherOnly,
+}
+
+/// Q35-22's interpreter-hosted installs: what the pane's interpreter-hosted
+/// entrypoint (`discovery_npm_entry.py`) hands its process to before it
+/// spawns the native agent.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Hosted {
+    /// The npm shape itself: the script the spawn PATH names, under the
+    /// interpreter its shebang names.
+    Genuine,
+    /// A byte-identical copy of that script, at another path, under the same
+    /// interpreter.
+    OtherScript,
+    /// The same script under another interpreter: a copy of the same
+    /// `python3` at another inode.
+    OtherInterpreter,
+}
+
+impl Hosted {
+    fn variant(self) -> &'static str {
+        match self {
+            Self::Genuine => "genuine",
+            Self::OtherScript => "other-script",
+            Self::OtherInterpreter => "other-interpreter",
+        }
+    }
 }
 
 /// What a Codex pane is spawned with beyond the common environment: the
@@ -191,16 +218,33 @@ impl Fixture {
     }
 
     pub fn with_env(kind: &'static str, extra: &[(&str, &str)]) -> Self {
-        Self::configured(kind, extra, true, None)
+        Self::configured(kind, extra, true, None, None)
     }
 
     /// Production Absent control: no editor-probe assumption or binding seam.
     pub fn absent(kind: &'static str, extra: &[(&str, &str)]) -> Self {
-        Self::configured(kind, extra, false, None)
+        Self::configured(kind, extra, false, None, None)
     }
 
     pub fn launcher(kind: &'static str, launcher: Launcher, extra: &[(&str, &str)]) -> Self {
-        Self::configured(kind, extra, true, Some(launcher))
+        Self::configured(kind, extra, true, Some(launcher), None)
+    }
+
+    /// An npm-shaped install (Q35-22's interpreter-hosted rule): the pane
+    /// starts `kind` by bare name, and the PATH it is spawned with resolves
+    /// that name only to a symlink to an interpreter-hosted script
+    /// (`#!/usr/bin/env python3`, standing in for npm Codex's
+    /// `#!/usr/bin/env node`), which spawns the native agent, kept off that
+    /// PATH, as its child. Declared, so the pane is its agent's direct class,
+    /// and delayed until [`Self::launch`] like a launcher history.
+    pub fn interpreter_hosted(kind: &'static str, hosted: Hosted, extra: &[(&str, &str)]) -> Self {
+        let launcher = Launcher {
+            mode: "spawn",
+            declared: true,
+            lookalike: false,
+            pins: NativePins::Both,
+        };
+        Self::configured(kind, extra, true, Some(launcher), Some(hosted))
     }
 
     fn configured(
@@ -208,6 +252,7 @@ impl Fixture {
         extra: &[(&str, &str)],
         assumed: bool,
         launcher: Option<Launcher>,
+        hosted: Option<Hosted>,
     ) -> Self {
         let mut env = vec![("DOT_AGENT_DECK_DOORBELL_TICK_MS", "25")];
         if assumed {
@@ -375,6 +420,25 @@ impl Fixture {
                 fs::copy(native.join(name), native.join("lookalike").join(name)).unwrap();
             }
         }
+        if hosted.is_some() {
+            // npm's layout: `bin/<kind>` is a symlink to the package's
+            // entrypoint script; the native agent is `native/<kind>`, beside
+            // the package and off the spawn PATH.
+            let package = native.join("npm");
+            for dir in ["bin", "lib", "other"] {
+                fs::create_dir_all(package.join(dir)).unwrap();
+            }
+            let entry = include_str!("discovery_npm_entry.py");
+            executable(&package.join("lib").join("entry.py"), entry);
+            executable(&package.join("other").join("entry.py"), entry);
+            std::os::unix::fs::symlink("../lib/entry.py", package.join("bin").join(kind)).unwrap();
+            // What `/usr/bin/env python3` runs on the spawn PATH, copied to
+            // another inode for the other-interpreter control.
+            let python = fs::canonicalize("/usr/bin/python3").expect("the hosts' /usr/bin/python3");
+            let copy = package.join("other").join("python3");
+            fs::copy(&python, &copy).unwrap();
+            fs::set_permissions(&copy, fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let mut f = Self {
             daemon,
             base: PathBuf::new(),
@@ -389,6 +453,7 @@ impl Fixture {
             _daemon_bin: daemon_bin,
             codex_pane: codex_pane_env,
             launcher,
+            hosted,
         };
         f.spawn("first", false);
         f
@@ -429,7 +494,9 @@ impl Fixture {
             }
             env.push(json!(["CODEX_HOOK_LIST_RESPONSE", pane.hook_list]));
         }
-        let command = if self.launcher.is_some() {
+        let command = if self.hosted.is_some() {
+            format!("{} --live-segments-fixture", self.kind)
+        } else if self.launcher.is_some() {
             format!(
                 "{} --discovery-fixture",
                 quote(&self.exe.parent().unwrap().join("launcher"))
@@ -448,7 +515,9 @@ impl Fixture {
                 request.as_object_mut().unwrap().remove("agent_type");
             }
             let env = request["env"].as_array_mut().unwrap();
-            let path_dir = if matches!(launcher.pins, NativePins::Both) {
+            let path_dir = if self.hosted.is_some() {
+                self.exe.parent().unwrap().join("npm").join("bin")
+            } else if matches!(launcher.pins, NativePins::Both) {
                 self.exe.parent().unwrap().to_owned()
             } else {
                 self.exe.parent().unwrap().join("spawn-pins")
@@ -487,6 +556,9 @@ impl Fixture {
                 ]),
                 json!(["PATH", spawn_path]),
             ]);
+            if let Some(hosted) = self.hosted {
+                env.push(json!(["DAD_HOSTED_VARIANT", hosted.variant()]));
+            }
         }
         let duplicate = format!("Duplicate pane id: {PANE}");
         let deadline = std::time::Instant::now() + WAIT;

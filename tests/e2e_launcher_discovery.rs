@@ -36,6 +36,17 @@
 //!   complete while .release is absent, rather than await release or expiry.
 //!   Record `<G>.timed-out` on expiry; teardown cancels without granting anything.
 //!   Gate and marker writes are restricted to the e2e sandbox HOME.
+//! * Interpreter-hosted entrypoints (plan Q35-14b's npm decision): when the
+//!   name the spawn PATH resolves is a script whose shebang names an
+//!   interpreter (npm Codex's `#!/usr/bin/env node` `codex.js`, through a
+//!   symlink), the process below the deck's wrapper is attested by a
+//!   provenance rule derived from that shebang (expected exe = the
+//!   interpreter, resolved as the kernel and `env` would; expected argv =
+//!   interpreter [+ its argument] + the script path + the launch's
+//!   arguments), and `A` is the native agent it spawns as its child. An
+//!   entrypoint that rule doesn't predict (another script under the same
+//!   interpreter, or another interpreter) is refused
+//!   "executable differs: expected <agent_type>".
 //! * e2e-only `DOT_AGENT_DECK_E2E_DISCOVERY_REJECT_UID=1` forces ONLY the
 //!   foreign-uid refusal at that production validator. It cannot supply an
 //!   accepted uid or skip any other validation. This covers the fail-closed
@@ -55,7 +66,7 @@ mod live;
 
 use dot_agent_deck::composer_probe::classifier::Identity;
 use dot_agent_deck::composer_probe::instance::decode_identity;
-use live::{Fixture, Launcher, NativePins, WAIT};
+use live::{Fixture, Hosted, Launcher, NativePins, WAIT};
 use serde_json::{Value, json};
 use spec::spec;
 use std::fs;
@@ -1171,4 +1182,212 @@ fn probe_035_fixture_codex_can_reparent_a_live_candidate() {
     f.expect(b"ORPHAN-ALIVE");
     f.flag("native-stop");
     f.wait("native-stopped");
+}
+
+// Q35-22's interpreter-hosted rule (plan-p3 Q35-14b's npm decision; the
+// Codex scoping's finding that a real npm-installed Codex never binds): the
+// `codex` the pane's spawn PATH names is npm's shape, a symlink to a script
+// under `#!/usr/bin/env <interpreter>` that spawns the native agent, which
+// is on no PATH, as its child. `A` is that native child. These tests pin
+// the outcome and the plan's two controls, not the mechanism: what attests
+// the native child below an attested entrypoint is the coder's (the native
+// has no spawn-time PATH pin to compare with).
+
+fn hosted_fixture(hosted: Hosted, gate: bool) -> Fixture {
+    let mut env = Vec::new();
+    if gate {
+        env.push(("DOT_AGENT_DECK_E2E_DISCOVERY_GATE", "discovery-gate"));
+    }
+    let f = Fixture::interpreter_hosted("codex", hosted, &env);
+    if gate {
+        fs::create_dir(gate_root(&f)).unwrap();
+        fs::write(gate_root(&f).join("phase"), "candidate").unwrap();
+    }
+    f
+}
+
+fn parent_pid(pid: u64) -> u64 {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    stat[stat.rfind(')').unwrap() + 1..]
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+fn cmdline(pid: u64) -> Vec<String> {
+    fs::read(format!("/proc/{pid}/cmdline"))
+        .unwrap()
+        .split(|b| *b == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| String::from_utf8(arg.to_vec()).unwrap())
+        .collect()
+}
+
+/// The launched history has the shape `hosted` names, checked from `/proc`:
+/// the pane's entrypoint process runs an interpreter on a script, and the
+/// native agent is that process's child, reachable by no name on the spawn
+/// PATH. Certifies the fixture only.
+fn hosted_shape(f: &Fixture, ready: &Value, hosted: Hosted) {
+    let entry = live::read_json(&f.path("launcher-ready"));
+    let entry_pid = entry["pid"].as_u64().unwrap();
+    let native_pid = ready["pid"].as_u64().unwrap();
+    assert_ne!(
+        native_pid, entry_pid,
+        "the native agent is not the entrypoint"
+    );
+    assert_eq!(
+        parent_pid(native_pid),
+        entry_pid,
+        "the native agent is the entrypoint's own child"
+    );
+    let native = executable_identity(f.native_executable());
+    assert_eq!(
+        executable_identity(format!("/proc/{native_pid}/exe")),
+        native,
+        "the genuine native agent runs"
+    );
+    let package = f.native_executable().parent().unwrap().join("npm");
+    let spawn_path = entry["spawn_path"].as_str().unwrap();
+    let resolved = std::env::split_paths(spawn_path).find_map(|dir| {
+        let candidate = dir.join(f.kind);
+        candidate.exists().then_some(candidate)
+    });
+    assert_eq!(
+        resolved,
+        Some(package.join("bin").join(f.kind)),
+        "the spawn PATH names the npm entrypoint"
+    );
+    assert_eq!(
+        fs::read_link(package.join("bin").join(f.kind)).unwrap(),
+        PathBuf::from("../lib/entry.py"),
+        "through npm's symlink"
+    );
+    assert!(
+        std::env::split_paths(spawn_path).all(|dir| {
+            fs::read_dir(dir).map_or(true, |entries| {
+                entries
+                    .flatten()
+                    .all(|e| fs::metadata(e.path()).map_or(true, |m| (m.dev(), m.ino()) != native))
+            })
+        }),
+        "no spawn PATH entry is the native agent"
+    );
+    let genuine = package.join("lib").join("entry.py");
+    assert!(
+        fs::read_to_string(&genuine)
+            .unwrap()
+            .starts_with("#!/usr/bin/env python3\n"),
+        "an interpreter-hosted entrypoint"
+    );
+    let python = executable_identity(fs::canonicalize("/usr/bin/python3").unwrap());
+    let other_python = package.join("other").join("python3");
+    assert_ne!(executable_identity(&other_python), python);
+    let argv = cmdline(entry_pid);
+    let exe = executable_identity(format!("/proc/{entry_pid}/exe"));
+    assert_eq!(argv[0], "python3", "the argv `env` gives an interpreter");
+    let script = PathBuf::from(&argv[1]);
+    match hosted {
+        Hosted::Genuine => {
+            assert_eq!(exe, python, "the shebang's interpreter");
+            assert_eq!(fs::canonicalize(&script).unwrap(), genuine);
+        }
+        Hosted::OtherScript => {
+            assert_eq!(exe, python, "the shebang's interpreter");
+            assert_eq!(script, package.join("other").join("entry.py"));
+            assert_eq!(
+                fs::read(&script).unwrap(),
+                fs::read(&genuine).unwrap(),
+                "another path with the same bytes"
+            );
+        }
+        Hosted::OtherInterpreter => {
+            assert_eq!(
+                exe,
+                executable_identity(&other_python),
+                "another interpreter inode"
+            );
+            assert_eq!(fs::canonicalize(&script).unwrap(), genuine);
+        }
+    }
+    assert!(
+        argv[2..].iter().any(|arg| arg == "--live-segments-fixture"),
+        "the launch's own arguments: {argv:?}"
+    );
+    assert_eq!(
+        cmdline(native_pid)[1..],
+        argv[2..],
+        "the entrypoint passes its arguments to the native agent"
+    );
+}
+
+fn hosted_control(hosted: Hosted) {
+    // No candidate barrier: an entrypoint that doesn't match its shebang may
+    // be refused before discovery finds a candidate below it.
+    let f = hosted_fixture(hosted, false);
+    pending(&f, Route::Launcher);
+    let ready = launch(&f);
+    hosted_shape(&f, &ready, hosted);
+    let reason = mismatch_reason(f.kind);
+    assert!(
+        common::wait_until(WAIT, || status(&f)["reason"] == reason),
+        "an entrypoint the shebang rule doesn't predict is an executable mismatch: {}",
+        status(&f)
+    );
+    denied(&f, true, &reason);
+}
+
+/// Scenario: Start a declared Codex pane by bare name, where the spawn PATH resolves `codex` only to an npm-style symlink to a `#!/usr/bin/env python3` script that spawns the native codex copy (on no PATH) as its child, then pause discovery at the candidate and release it. The native child, not the interpreter, must be published as A with its kind, become Armable, and the real installed helper must check its touched empty box.
+#[spec("inbox/probe/035")]
+#[test]
+fn probe_035_npm_codex_binds_native_below_its_interpreter_and_checks() {
+    let f = hosted_fixture(Hosted::Genuine, true);
+    pending(&f, Route::Launcher);
+    let ready = launch(&f);
+    hosted_shape(&f, &ready, Hosted::Genuine);
+    arrived(&f, &ready);
+    assert_eq!(
+        status(&f)["permission"],
+        "pending",
+        "a discovered candidate isn't yet attested"
+    );
+    release(&f);
+    // Nothing on the spawn PATH is this inode: the expected identity is the
+    // native child's own executable, reached through the entrypoint rule.
+    bound_to(&f, &ready, executable_identity(f.native_executable()));
+}
+
+/// Scenario: Start the same npm-style Codex pane, but its entrypoint process hands itself to a byte-identical copy of the script at another path under the same python3 before spawning the genuine native codex child. The pane must get an executable-mismatch reason, no gen-G identity, no Armable permission and no helper check.
+#[spec("inbox/probe/035")]
+#[test]
+fn probe_035_npm_codex_other_script_cannot_get_permission() {
+    hosted_control(Hosted::OtherScript);
+}
+
+/// Scenario: Start the same npm-style Codex pane, but its entrypoint process hands the genuine script to a copy of python3 at another inode before spawning the genuine native codex child. The pane must get an executable-mismatch reason, no gen-G identity, no Armable permission and no helper check.
+#[spec("inbox/probe/035")]
+#[test]
+fn probe_035_npm_codex_other_interpreter_cannot_get_permission() {
+    hosted_control(Hosted::OtherInterpreter);
+}
+
+/// Scenario: Start the npm-style Codex pane in its genuine, other-script and other-interpreter shapes without any discovery interface, launch each, and type into the pane. Each must show the shape it names in /proc (the native codex copy as the entrypoint's child, on no spawn PATH entry) and a live composer echoing human input.
+#[spec("inbox/probe/035")]
+#[test]
+fn probe_035_fixture_npm_codex_shapes_launch_their_native_child() {
+    for hosted in [
+        Hosted::Genuine,
+        Hosted::OtherScript,
+        Hosted::OtherInterpreter,
+    ] {
+        let f = hosted_fixture(hosted, false);
+        let ready = launch(&f);
+        hosted_shape(&f, &ready, hosted);
+        let entry = live::read_json(&f.path("launcher-ready"));
+        assert_eq!(ready["editors"], entry["editors"]);
+        let mut human = f.connect();
+        human.write("NPM-SHAPE-ALIVE");
+        f.expect(b"NPM-SHAPE-ALIVE");
+    }
 }
