@@ -89,7 +89,8 @@ fn policy_003_a_live_agent_keeps_working_after_another_client_shrinks_it() {
         .build()
         .expect("runtime for the second client");
     let socket_for_attach = socket.clone();
-    let _conn = runtime.block_on(async move {
+    let events = deck.subscribe_events();
+    let (_conn, agent_id) = runtime.block_on(async move {
         let client = DaemonClient::new(socket_for_attach);
         let agents = client.list_agents().await.expect("list agents");
         let agent = agents
@@ -101,10 +102,11 @@ fn policy_003_a_live_agent_keeps_working_after_another_client_shrinks_it() {
                     .is_some_and(|name| name.ends_with(PANE_NAME_SUFFIX))
             })
             .expect("the Claude pane's agent is registered with the daemon");
-        client
+        let conn = client
             .attach_as_viewer(&agent.id, Some((24, 60)))
             .await
-            .expect("second client attaches as a narrow viewer")
+            .expect("second client attaches as a narrow viewer");
+        (conn, agent.id.clone())
     });
 
     // The live agent is now running at a geometry imposed by a client it has no
@@ -125,10 +127,21 @@ fn policy_003_a_live_agent_keeps_working_after_another_client_shrinks_it() {
     // keystrokes are reaching the AGENT and Ctrl+D is how you would leave.
     // Sending Ctrl+D first would hand the directive to the deck instead, which
     // is how the first draft of this test failed against a live Haiku.
-    deck.send_keys(
-        b"List the files in this directory and reply with the name of the only file ending in .txt",
+    //
+    // Submitted through the harness's `submit_claude_prompt`, not as the text
+    // and an Enter written back to back: the Enter written straight after the
+    // text was left in Claude Code's input on every run on 2026-11-04, on
+    // Claude Code 2.1.312 and 2.1.318, on PRD #1666 part 3 and on `main` alike
+    // (the prompt sat in the input, unsubmitted). The helper waits for the
+    // text to render and confirms the submission by its `UserPromptSubmit`
+    // hook, so a lost Enter reads as `PROMPT NOT DELIVERED`, not as the resize
+    // having broken the agent.
+    deck.submit_claude_prompt(
+        &events,
+        &agent_id,
+        "List the files in this directory and reply with the name of the only file ending in .txt",
+        "ending",
     );
-    deck.send_keys(b"\r");
 
     assert!(
         deck.wait_for_grid_string_within(SENTINEL_FILE, Duration::from_secs(120)),
