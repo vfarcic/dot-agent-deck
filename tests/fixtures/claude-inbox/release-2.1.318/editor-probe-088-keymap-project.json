@@ -1,0 +1,31 @@
+{
+ "release": "2.1.318",
+ "sha256": "708c77b204db30086ff6f1ed34577bda03e1be74ced80557cbf7b54249ebf0bd",
+ "source_capture": "/var/tmp/dad-claude-editor-measure-6L1sBF/capture",
+ "recorder_sha256": "b3fa8073603f805d5ae03db2b0d1c1e6031bc7cfa37574b5021a05fb8cc8d0ae",
+ "error": null,
+ "rows": [
+  {
+   "cell": "keymap-project",
+   "setting_sources_user": true,
+   "project_file": "/var/tmp/dad-e2e-1000/dad-tests-1716609-GyreP8/.tmpCcmKQp/.claude/keybindings.json",
+   "ctrlg": {
+    "opened": true
+   },
+   "ctrle": {
+    "opened": false
+   }
+  },
+  {
+   "cell": "keymap-project-all-sources",
+   "setting_sources_user": false,
+   "project_file": "/var/tmp/dad-e2e-1000/dad-tests-1716609-GyreP8/.tmpCcmKQp/.claude/keybindings.json",
+   "ctrlg": {
+    "opened": true
+   },
+   "ctrle": {
+    "opened": false
+   }
+  }
+ ]
+}

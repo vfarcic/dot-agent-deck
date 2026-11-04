@@ -1,0 +1,339 @@
+{
+  "source_run": "capture",
+  "argv0": "claude",
+  "rows": 50,
+  "cols": 200,
+  "read_lens": [
+    13,
+    24,
+    20,
+    1804,
+    21,
+    74,
+    20,
+    411,
+    93,
+    290,
+    140,
+    101,
+    135,
+    69,
+    70,
+    73,
+    150,
+    93,
+    101,
+    76,
+    79,
+    155,
+    86,
+    106,
+    87,
+    160,
+    106,
+    87,
+    50,
+    88,
+    116,
+    76,
+    88,
+    200,
+    99,
+    20,
+    590,
+    59,
+    57,
+    20,
+    273,
+    87,
+    101,
+    151,
+    99,
+    107,
+    94,
+    61,
+    88,
+    88,
+    107,
+    94
+  ],
+  "points": {
+    "empty": 1882,
+    "typed-1": 1956,
+    "mark:cr-1": 1956,
+    "restored-1": 2770,
+    "cleared-1": 2910,
+    "mark:up-1": 2910,
+    "up-1": 3011,
+    "mark:up-2": 3011,
+    "up-2": 3146,
+    "mark:up-3": 3146,
+    "up-3": 3215,
+    "mark:down-1": 3215,
+    "down-1": 3285,
+    "mark:down-2": 3285,
+    "down-2": 3358,
+    "mark:down-3": 3358,
+    "down-3": 3601,
+    "recall-escape-1": 3702,
+    "recalled-before-escape": 3702,
+    "mark:escape": 3702,
+    "after-escape": 3857,
+    "reset-after-escape": 4012,
+    "recall-ctrl-u-1": 4098,
+    "recalled-before-ctrl-u": 4098,
+    "mark:ctrl-u": 4098,
+    "after-ctrl-u": 4204,
+    "reset-after-ctrl-u": 4204,
+    "recall-ctrl-c-1": 4291,
+    "recalled-before-ctrl-c": 4291,
+    "mark:ctrl-c": 4291,
+    "after-ctrl-c": 4557,
+    "reset-after-ctrl-c": 4644,
+    "draft": 4694,
+    "draft-up": 4782,
+    "draft-up-down": 4898,
+    "mode-0": 4974,
+    "recall-manual-mode-1": 5062,
+    "recalled-before-manual-mode": 5062,
+    "reset-after-manual-mode": 5262,
+    "recall-enter-1": 5361,
+    "recalled-before-enter": 5361,
+    "mark:enter": 5361,
+    "after-enter": 6380,
+    "after-enter-cleared": 6467,
+    "recall-slot-1": 6568,
+    "recalled-before-slot": 6568,
+    "slot-cleared": 6719,
+    "mark:slot-up-1": 6719,
+    "slot-up-1": 6818,
+    "mark:slot-down-1": 6818,
+    "slot-down-1": 6925,
+    "mark:slot-down-2": 6925,
+    "slot-down-2": 7019,
+    "mark:slot-up-2": 7019,
+    "slot-up-2": 7080,
+    "mark:slot-up-3": 7080,
+    "slot-up-3": 7256,
+    "mark:slot-down-3": 7256,
+    "slot-down-3": 7363,
+    "mark:slot-down-4": 7363,
+    "slot-down-4": 7457,
+    "mark:slot-down-5": 7457,
+    "slot-down-5": 7457,
+    "end": 7457
+  },
+  "edges": [],
+  "lines": [
+    "HISTORYBLOCKEDgolf"
+  ],
+  "source_capture": "dad-claude-release-measure-YSBO42",
+  "release": "2.1.318",
+  "executable_sha256": "708c77b204db30086ff6f1ed34577bda03e1be74ced80557cbf7b54249ebf0bd",
+  "trace_sha256": "c87ab96fe573fc616bbfff4ab9832f55c1e9afc475bc03986ab4fb9ceb59f329",
+  "theme": "dark",
+  "colorterm": null,
+  "term": "xterm-256color",
+  "recorder_sha256": "79931911fe27567810448c5f20e876e38782f64b758968bdacb718e7bc51c36e",
+  "captured_on": "2026-11-04",
+  "blocked_submissions": 2,
+  "review_status": "candidate",
+  "model": "haiku",
+  "events": [
+    {
+      "t": 3485680594971743,
+      "send": "HISTORYBLOCKEDgolf",
+      "off": 1882
+    },
+    {
+      "t": 3485680981598566,
+      "send": "\r",
+      "off": 1956
+    },
+    {
+      "t": 3485681900897654,
+      "send": "\u0015\u0015\u0015\u0015",
+      "off": 2770
+    },
+    {
+      "t": 3485682456226013,
+      "send": "\u001b[A",
+      "off": 2910
+    },
+    {
+      "t": 3485683475431097,
+      "send": "\u001b[A",
+      "off": 3011
+    },
+    {
+      "t": 3485684493418354,
+      "send": "\u001b[A",
+      "off": 3146
+    },
+    {
+      "t": 3485685514214938,
+      "send": "\u001b[B",
+      "off": 3215
+    },
+    {
+      "t": 3485686533725859,
+      "send": "\u001b[B",
+      "off": 3285
+    },
+    {
+      "t": 3485687554142783,
+      "send": "\u001b[B",
+      "off": 3358
+    },
+    {
+      "t": 3485688571951453,
+      "send": "\u001b[A",
+      "off": 3601
+    },
+    {
+      "t": 3485689664052078,
+      "send": "\u001b",
+      "off": 3702
+    },
+    {
+      "t": 3485691184949708,
+      "send": "\u0015\u0015\u0015\u0015",
+      "off": 3857
+    },
+    {
+      "t": 3485691704302221,
+      "send": "\u001b[A",
+      "off": 4012
+    },
+    {
+      "t": 3485692798944779,
+      "send": "\u0015\u0015\u0015\u0015",
+      "off": 4098
+    },
+    {
+      "t": 3485694317461753,
+      "send": "\u0015\u0015\u0015\u0015",
+      "off": 4204
+    },
+    {
+      "t": 3485694835394633,
+      "send": "\u001b[A",
+      "off": 4204
+    },
+    {
+      "t": 3485695930804143,
+      "send": "\u0003",
+      "off": 4291
+    },
+    {
+      "t": 3485697448495363,
+      "send": "\u0015\u0015\u0015\u0015",
+      "off": 4557
+    },
+    {
+      "t": 3485697965519580,
+      "send": "DRAFThotel",
+      "off": 4644
+    },
+    {
+      "t": 3485698355366386,
+      "send": "\u001b[A",
+      "off": 4694
+    },
+    {
+      "t": 3485699375477624,
+      "send": "\u001b[B",
+      "off": 4782
+    },
+    {
+      "t": 3485700395724056,
+      "send": "\u0015\u0015\u0015\u0015",
+      "off": 4898
+    },
+    {
+      "t": 3485700916587154,
+      "send": "\u001b[Z",
+      "off": 4898
+    },
+    {
+      "t": 3485701753605457,
+      "send": "\u001b[A",
+      "off": 4974
+    },
+    {
+      "t": 3485702856330643,
+      "send": "\u0015\u0015\u0015\u0015",
+      "off": 5062
+    },
+    {
+      "t": 3485703378324281,
+      "send": "\u001b[A",
+      "off": 5262
+    },
+    {
+      "t": 3485704472552219,
+      "send": "\r",
+      "off": 5361
+    },
+    {
+      "t": 3485706165319459,
+      "send": "\u0015\u0015\u0015\u0015",
+      "off": 6380
+    },
+    {
+      "t": 3485706682895345,
+      "send": "\u001b[A",
+      "off": 6467
+    },
+    {
+      "t": 3485707777684962,
+      "send": "\u0015\u0015\u0015\u0015",
+      "off": 6568
+    },
+    {
+      "t": 3485708595804700,
+      "send": "\u001b[A",
+      "off": 6719
+    },
+    {
+      "t": 3485709613316528,
+      "send": "\u001b[B",
+      "off": 6818
+    },
+    {
+      "t": 3485710631154060,
+      "send": "\u001b[B",
+      "off": 6925
+    },
+    {
+      "t": 3485711648623877,
+      "send": "\u001b[A",
+      "off": 7019
+    },
+    {
+      "t": 3485712666415030,
+      "send": "\u001b[A",
+      "off": 7080
+    },
+    {
+      "t": 3485713684152165,
+      "send": "\u001b[B",
+      "off": 7256
+    },
+    {
+      "t": 3485714700893621,
+      "send": "\u001b[B",
+      "off": 7363
+    },
+    {
+      "t": 3485715718583523,
+      "send": "\u001b[B",
+      "off": 7457
+    },
+    {
+      "t": 3485716736282443,
+      "send": "\u0015\u0015\u0015\u0015",
+      "off": 7457
+    }
+  ]
+}

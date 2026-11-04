@@ -31,6 +31,9 @@ PINS = {
     # Official @anthropic-ai/claude-code-linux-x64@2.1.317 (tarball sha512
     # u19fYJ4l...XBlSA==), byte-identical to the installed 2.1.317.
     '2.1.317': 'eb224419e344575faa4a1f39b290b649425a10cd5ee2ef1d003480cd9ae57eb0',
+    # Official @anthropic-ai/claude-code-linux-x64@2.1.318 (tarball sha512
+    # GX+7CUng...6NV2A==), byte-identical to the installed 2.1.318.
+    '2.1.318': '708c77b204db30086ff6f1ed34577bda03e1be74ced80557cbf7b54249ebf0bd',
 }
 H, E, L, R, BS, D, K = '\x1b[H', '\x1b[F', '\x1b[D', '\x1b[C', '\x7f', '\x1b[3~', '\x15'
 CASES = [
@@ -190,6 +193,128 @@ class Recorder:
                                   for row in self.screen.display))
             self.pump(.5)
             self.snap('overview')
+            return
+        if kind == 'history':
+            # Six prompts from an earlier session in this project are seeded
+            # in the disposable HOME's history (`main`), and one line is
+            # submitted here and blocked: a blocked prompt does not enter the
+            # history (2.1.317, 2026-11-04). Up and Down then walk the history
+            # from the empty composer, and the ways out of a recalled prompt
+            # (Escape, Ctrl+U, Ctrl+C, Enter) are taken one at a time.
+            def restored(line):
+                prompt = next((i for i, row in enumerate(self.screen.display) if row.startswith('❯')), None)
+                return (prompt is not None and self.screen.display[prompt].startswith('❯\xa0')
+                        and line in ''.join(self.composer().split()))
+
+            def hooks():
+                path = self.out / 'hook.jsonl'
+                return len(path.read_text().splitlines()) if path.exists() else 0
+
+            line = 'HISTORYBLOCKEDgolf'
+            self.lines.append(line)
+            self.send(line)
+            self.wait(lambda: line in self.text())
+            self.pump(.3)
+            self.snap('typed-1')
+            self.points['mark:cr-1'] = len(self.raw)
+            self.send('\r')
+            self.wait(lambda: hooks() == 1)
+            self.wait(lambda: restored(line), 5)
+            self.pump(.5)
+            self.snap('restored-1')
+            self.send(K * 4)
+            self.pump(.5)
+            self.wait(lambda: not self.composer().strip(), 5)
+            self.snap('cleared-1')
+            for name, key in [('up-1', '\x1b[A'), ('up-2', '\x1b[A'), ('up-3', '\x1b[A'),
+                              ('down-1', '\x1b[B'), ('down-2', '\x1b[B'), ('down-3', '\x1b[B')]:
+                self.points[f'mark:{name}'] = len(self.raw)
+                self.send(key)
+                self.pump(1)
+                self.snap(name)
+            def recall(name):
+                # Up recalls an entry. After Ctrl+U has cleared a recalled
+                # prompt, Up has drawn nothing at all, three presses running
+                # (2.1.317, 2026-11-04), so Down and Up are tried in turn and
+                # the keys it took are recorded with the result.
+                # Ctrl+U on a recalled prompt empties that history slot for
+                # the session (2.1.317 and 2.1.318 then draw `History i/n`
+                # over a blank box there), so Up is pressed until an
+                # untouched, non-empty entry is drawn; every attempt is kept.
+                sent = []
+                for attempt in range(8):
+                    self.send('\x1b[A')
+                    sent.append('Up')
+                    self.pump(1)
+                    self.snap(f'recall-{name}-{attempt + 1}')
+                    if 'History ' in self.text() and self.composer().strip():
+                        break
+                self.keys.append({'case': f'recall-{name}', 'keys': sent,
+                                  'history': 'History ' in self.text(), 'composer': self.composer()})
+                self.snap(f'recalled-before-{name}')
+
+            for way, key in [('escape', '\x1b'), ('ctrl-u', K * 4), ('ctrl-c', '\x03')]:
+                recall(way)
+                self.points[f'mark:{way}'] = len(self.raw)
+                self.send(key)
+                self.pump(1.5)
+                self.snap(f'after-{way}')
+                self.send(K * 4)
+                self.pump(.5)
+                self.snap(f'reset-after-{way}')
+            # A draft in the box, then Up: does Claude recall over a draft?
+            self.send('DRAFThotel')
+            self.wait(lambda: 'DRAFThotel' in self.text())
+            self.pump(.3)
+            self.snap('draft')
+            self.send('\x1b[A')
+            self.pump(1)
+            self.snap('draft-up')
+            self.send('\x1b[B')
+            self.pump(1)
+            self.snap('draft-up-down')
+            self.send(K * 4)
+            self.pump(.5)
+            # The footer t042 saw under a recalled prompt: Shift+Tab cycles
+            # the permission mode until the mode line reads manual mode.
+            for i in range(6):
+                if 'manual mode on' in self.text():
+                    break
+                self.send('\x1b[Z')
+                self.pump(.8)
+                self.snap(f'mode-{i}')
+            recall('manual-mode')
+            self.send(K * 4)
+            self.pump(.5)
+            self.snap('reset-after-manual-mode')
+            # Enter on a recalled prompt submits it (blocked again).
+            recall('enter')
+            self.points['mark:enter'] = len(self.raw)
+            self.send('\r')
+            self.wait(lambda: hooks() == 2)
+            self.pump(1.5)
+            self.snap('after-enter')
+            self.send(K * 4)
+            self.pump(.5)
+            self.snap('after-enter-cleared')
+            # The emptied slot: recall a prompt, clear it with Ctrl+U while
+            # it is recalled, then walk Up and Down across it. Earlier runs
+            # drew `History i/n` over a blank box there (2.1.317 and 2.1.318,
+            # 2026-11-04), the frame a profile must not read as empty.
+            recall('slot')
+            self.send(K * 4)
+            self.pump(.8)
+            self.snap('slot-cleared')
+            for name, key in [('slot-up-1', '\x1b[A'), ('slot-down-1', '\x1b[B'), ('slot-down-2', '\x1b[B'),
+                              ('slot-up-2', '\x1b[A'), ('slot-up-3', '\x1b[A'), ('slot-down-3', '\x1b[B'),
+                              ('slot-down-4', '\x1b[B'), ('slot-down-5', '\x1b[B')]:
+                self.points[f'mark:{name}'] = len(self.raw)
+                self.send(key)
+                self.pump(1)
+                self.snap(name)
+            self.send(K * 4)
+            self.pump(.5)
+            self.snap('end')
             return
         if kind == 'startup':
             for sample in range(200):
@@ -375,6 +500,19 @@ def main():
     configuration['autoUpdates'] = False
     configuration['hooks'] = {'UserPromptSubmit': [{'hooks': [{'type': 'command', 'command': hook}]}]}
     settings.write_text(json.dumps(configuration))
+    if kind == 'history':
+        # Six prompts an earlier session in this project submitted, in the
+        # shape Claude Code's own history log keeps them (one JSON object a
+        # line: display, pastedContents, timestamp in ms, project, sessionId),
+        # confined to the disposable HOME like the settings above.
+        now = int(time.time() * 1000)
+        with (home / '.claude/history.jsonl').open('a') as log:
+            for age, display in [(360_000, 'HISTORYONEalpha'), (300_000, 'HISTORYTWObravo'),
+                                 (240_000, 'HISTORYTHREEcharlie'), (180_000, 'HISTORYFOURdelta'),
+                                 (120_000, 'HISTORYFIVEecho'), (60_000, 'HISTORYSIXfoxtrot')]:
+                log.write(json.dumps({'display': display, 'pastedContents': {}, 'timestamp': now - age,
+                                      'project': str(Path.cwd().resolve()),
+                                      'sessionId': '00000000-0000-4000-8000-000000001666'}) + '\n')
     child, fd = pty.fork()
     if child == 0:
         fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))

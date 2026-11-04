@@ -198,7 +198,7 @@ fn latched(trace: &Trace) -> (AgentType, Version) {
     }
 }
 
-/// Scenario: Replay the recorded start-up of Codex 0.164.0, Codex 0.160.0 and Claude Code 2.1.310, 2.1.312 and 2.1.317 through the release scanner at the PTY reader's recorded split, one byte at a time, and as one push. Each latches its own release every way.
+/// Scenario: Replay the recorded start-up of Codex 0.164.0, Codex 0.160.0 and Claude Code 2.1.310, 2.1.312, 2.1.317 and 2.1.318 through the release scanner at the PTY reader's recorded split, one byte at a time, and as one push. Each latches its own release every way.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_release_headers_latch_from_real_launches() {
@@ -252,6 +252,16 @@ fn doorbell_036_release_headers_latch_from_real_launches() {
             "claude-inbox/r5wake/claude-2.1.317-composer-24x80",
             AgentType::ClaudeCode,
             "2.1.317",
+        ),
+        (
+            "claude-inbox/r5wake/claude-2.1.318-start-50x200",
+            AgentType::ClaudeCode,
+            "2.1.318",
+        ),
+        (
+            "claude-inbox/r5wake/claude-2.1.318-composer-24x80",
+            AgentType::ClaudeCode,
+            "2.1.318",
         ),
         (
             "codex-inbox/r5wake/codex-0.164.0-deck-tester-fresh-46x130",
@@ -434,7 +444,7 @@ fn doorbell_036_codex_composer_over_real_frames() {
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_claude_composer_over_real_frames() {
-    for release in ["2.1.310", "2.1.312", "2.1.317"] {
+    for release in ["2.1.310", "2.1.312", "2.1.317", "2.1.318"] {
         let trace = fixture(&format!(
             "claude-inbox/r5wake/claude-{release}-composer-24x80"
         ));
@@ -463,7 +473,7 @@ fn doorbell_036_claude_composer_over_real_frames() {
             "a blank composer is not the placeholder"
         );
     }
-    for release in ["2.1.312", "2.1.317"] {
+    for release in ["2.1.312", "2.1.317", "2.1.318"] {
         let keys = fixture(&format!(
             "claude-inbox/r5wake/claude-{release}-compound-keys-50x200"
         ));
@@ -485,7 +495,7 @@ fn doorbell_036_claude_composer_over_real_frames() {
     }
 
     let mut wrong_surfaces = Vec::new();
-    for release in ["2.1.310", "2.1.312", "2.1.317"] {
+    for release in ["2.1.310", "2.1.312", "2.1.317", "2.1.318"] {
         for set in [
             "50x200",
             "24x80",
@@ -550,6 +560,114 @@ fn doorbell_036_claude_composer_over_real_frames() {
         wrong_surfaces.join("\n\n")
     );
     assert_claude_corpus_decisions();
+}
+
+/// Scenario: Replay the history-recall captures of Claude Code 2.1.317 and 2.1.318 at 50×200 and 24×80: Up from the empty composer draws `─── History i/n` in place of the composer's upper rule over the recalled prompt, Ctrl+U on a recalled prompt returns the plain composer, and walking straight back to that cleared prompt draws a History rule over a blank box with the cursor at the indent. The profile reads no composer, no readiness and no empty box in any History-ruled frame, and the two releases draw the same rule and prompt rows after the first frame; were the label read as a rule, the blank-slot frame would be the empty ready composer.
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_claude_history_recall_frames_are_refused() {
+    use dot_agent_deck::doorbell_screen::frame;
+    let p = &CLAUDE_PROFILE;
+    for size in ["50x200", "24x80"] {
+        let mut drawn: Vec<Vec<(String, String, String)>> = Vec::new();
+        for release in ["2.1.317", "2.1.318"] {
+            let trace = fixture(&format!(
+                "claude-inbox/r5wake/claude-{release}-history-{size}"
+            ));
+            // The upper-rule row and the prompt row of the last `❯` composer.
+            let rows = |grid: &Grid| -> Option<(u16, String, String)> {
+                let prompt = (1..grid.rows)
+                    .rev()
+                    .find(|&r| grid.cell(r, 0).is_some_and(|c| c.text == "❯"))?;
+                Some((
+                    prompt,
+                    grid.text_from(prompt - 1, 0),
+                    grid.text_from(prompt, 0)
+                        .replace('\u{a0}', " ")
+                        .trim_end()
+                        .to_string(),
+                ))
+            };
+            let mut names: Vec<(&String, &usize)> = trace
+                .points
+                .iter()
+                .filter(|(name, _)| !name.starts_with("mark:"))
+                .collect();
+            names.sort_by_key(|&(name, at)| (*at, name.clone()));
+            let mut seen = Vec::new();
+            let mut history = 0;
+            for (name, _) in names {
+                let grid = trace.grid(name);
+                let Some((prompt, rule, row)) = rows(&grid) else {
+                    continue;
+                };
+                // The fresh composer's `Try "…"` placeholder is chosen at
+                // random per launch, so the first frame is not compared.
+                if name != "empty" {
+                    seen.push((name.clone(), rule.clone(), row.clone()));
+                }
+                if !rule.starts_with("─── History ") {
+                    continue;
+                }
+                history += 1;
+                assert!(
+                    (p.composer)(&grid).is_none() && !(p.ready)(&grid) && !p.empty_and_ready(&grid),
+                    "{release} {size} {name}: a History-ruled frame must be refused"
+                );
+                assert!(
+                    frame(p, &grid, 0, true, None).composer.is_none(),
+                    "{release} {size} {name}: admission reads no composer under a History rule"
+                );
+                if row == "❯" {
+                    assert_eq!(grid.cursor, (prompt, 2), "{release} {size} {name}");
+                    let mut as_rule = grid.clone();
+                    for cell in &mut as_rule.cells[prompt as usize - 1] {
+                        cell.text = "─".to_string();
+                    }
+                    assert!(
+                        p.empty_and_ready(&as_rule),
+                        "{release} {size} {name}: with its label read as a rule, this blank box is the empty ready composer"
+                    );
+                }
+            }
+            let at = |point: &str| {
+                seen.iter()
+                    .find(|(name, ..)| name == point)
+                    .map(|(_, rule, row)| (rule.clone(), row.clone()))
+                    .unwrap_or_else(|| panic!("{release} {size}: no point {point}"))
+            };
+            let (rule, row) = at("up-1");
+            assert!(
+                rule.starts_with("─── History 6/6 "),
+                "{release} {size} up-1 {rule:?}"
+            );
+            assert_eq!(row, "❯ HISTORYSIXfoxtrot");
+            let (rule, row) = at("up-2");
+            assert!(
+                rule.starts_with("─── History 5/6 "),
+                "{release} {size} up-2 {rule:?}"
+            );
+            assert_eq!(row, "❯ HISTORYFIVEecho");
+            for blank in ["slot-down-1", "slot-up-2", "slot-down-3"] {
+                let (rule, row) = at(blank);
+                assert!(
+                    rule.starts_with("─── History ") && row == "❯",
+                    "{release} {size} {blank}: the slot walked back to after Ctrl+U {rule:?} {row:?}"
+                );
+            }
+            assert!(!at("after-ctrl-u").0.contains("History"));
+            assert!(p.empty_and_ready(&trace.grid("after-ctrl-u")));
+            assert!(
+                history >= 20,
+                "{release} {size}: {history} History-ruled frames"
+            );
+            drawn.push(seen);
+        }
+        assert_eq!(
+            drawn[0], drawn[1],
+            "{size}: 2.1.317 and 2.1.318 draw the same rule and prompt rows at every point after the first"
+        );
+    }
 }
 
 /// Characterisation at recorded read boundaries, not at arbitrary byte splits.
@@ -853,11 +971,11 @@ fn doorbell_036_dialog_markers_and_false_dialogs() {
     assert_eq!((CLAUDE_PROFILE.dialog)(&claude.grid("empty")), None);
 }
 
-/// Scenario: Parse Claude Code 2.1.310, 2.1.312 and 2.1.317 frames and a Codex dialog frame at the width they were drawn at, at one column more and at one column fewer. The width witness holds at the drawn width only; and every recorded Claude release's resizes each start with the same full-redraw marker.
+/// Scenario: Parse Claude Code 2.1.310, 2.1.312, 2.1.317 and 2.1.318 frames and a Codex dialog frame at the width they were drawn at, at one column more and at one column fewer. The width witness holds at the drawn width only; and every recorded Claude release's resizes each start with the same full-redraw marker.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_width_witness_and_redraw_marker() {
-    for release in ["2.1.310", "2.1.312", "2.1.317"] {
+    for release in ["2.1.310", "2.1.312", "2.1.317", "2.1.318"] {
         let claude = fixture(&format!(
             "claude-inbox/r5wake/claude-{release}-start-50x200"
         ));
@@ -918,7 +1036,7 @@ fn doorbell_036_width_witness_and_redraw_marker() {
     // Claude Code's recorded resizes and nudges: each edge's bytes carry its
     // full-redraw marker, and the frame after it is a witness at the width in
     // force and not two columns wider.
-    for release in ["2.1.310", "2.1.312", "2.1.317"] {
+    for release in ["2.1.310", "2.1.312", "2.1.317", "2.1.318"] {
         let layout = fixture(&format!(
             "claude-inbox/r5wake/claude-{release}-layout-50x200"
         ));
