@@ -91,6 +91,19 @@
 //! ([`Stats::refused`]: 43 in the fast tier's 40 seeds and 185 in lane 1's
 //! 240 when it was added).
 //!
+//! **A key the line discipline acts on, behind a Claude release (Q147b,
+//! Q151b).** The model holds a held line-discipline key, with what follows
+//! it, behind a Claude segment released on an `Armed` decision until
+//! Claude's `?2004h` after the trigger is read (E1; the helper's drain is
+//! not waited for), and refuses a held signal key, with every op from the
+//! one holding it, behind a Claude probe released on an `Unarmed` decision
+//! until its helper's exit drains. It keeps the held ops' lengths, since a
+//! refusal takes whole ops: R-HOLD's from the op holding the Ctrl+G, in the
+//! same pass, even behind a key waiting for Claude's return, which stays
+//! held. The generated runs reach both rows, which floors require (15
+//! line-discipline holds and 1 signal refusal in the fast tier's 40 seeds,
+//! 33 and 3 in lane 1's 240, when Q151b changed them).
+//!
 //! **The policy it assumes (the audit's U3-2).** Every generation here runs
 //! [`EcPolicy::Hold`], production's policy, under which `Records::complete`
 //! refuses the EC route: the model has no EC or frontier rows, and no
@@ -151,6 +164,12 @@ fn line_discipline_key(byte: u8) -> bool {
         byte,
         0x03 | 0x04 | 0x0d | 0x0f | 0x11 | 0x12 | 0x13 | 0x15 | 0x16 | 0x17 | 0x1a | 0x1c | 0x7f
     )
+}
+
+/// Q151b, from the same defaults: the keys a terminal with `ISIG` set turns
+/// into a signal, Ctrl+C (`VINTR`), Ctrl+\ (`VQUIT`) and Ctrl+Z (`VSUSP`).
+fn signal_key(byte: u8) -> bool {
+    matches!(byte, 0x03 | 0x1a | 0x1c)
 }
 
 /// What the PTY and the arm page saw, in order.
@@ -865,6 +884,9 @@ struct Model {
     last: u64,
     /// Typed bytes the gate holds, in order.
     held: VecDeque<u8>,
+    /// How many of `held`'s bytes each held op has, in order: a refusal
+    /// takes whole ops, from the one holding what it refuses at (Q151b).
+    held_ops: VecDeque<usize>,
     /// What the PTY may have taken by now, in order.
     expected: Vec<u8>,
     /// Each HumanG trigger: its number.
@@ -947,6 +969,9 @@ struct Stats {
     /// Releases that stopped at a line-discipline key, Claude being out of
     /// raw mode (Q147b).
     cooked_held: usize,
+    /// Held signal keys refused, with what followed them, behind a probe's
+    /// `Unarmed` release whose helper hadn't drained (Q151b).
+    signal_refused: usize,
     /// Each row reached, and by how many segments.
     rows: std::collections::BTreeMap<Row, usize>,
     /// Each kind of settlement reached.
@@ -962,6 +987,7 @@ impl Stats {
         self.cut_opened += other.cut_opened;
         self.refused += other.refused;
         self.cooked_held += other.cooked_held;
+        self.signal_refused += other.signal_refused;
         for (row, n) in &other.rows {
             *self.rows.entry(*row).or_default() += n;
         }
@@ -979,6 +1005,7 @@ impl Model {
             segs: VecDeque::new(),
             last: 0,
             held: VecDeque::new(),
+            held_ops: VecDeque::new(),
             expected: Vec::new(),
             triggers: Vec::new(),
             trigger_writes: Vec::new(),
@@ -1031,7 +1058,7 @@ impl Model {
         }
         let candidate = bytes.iter().position(|&b| b == CTRL_G);
         if self.fenced() {
-            self.held.extend(bytes);
+            self.hold(bytes);
         } else if let Some(at) = candidate.filter(|_| self.liability > 0) {
             // A-20d-5, core §4.3 and §4.5 (A1 §3.3: a person's Ctrl+G with
             // a liability out opens a `HumanG`, and isn't native): with no
@@ -1054,7 +1081,7 @@ impl Model {
                 rows: Vec::new(),
                 typed_mark: self.typed,
             });
-            self.held.extend(&bytes[at + 1..]);
+            self.hold(&bytes[at + 1..]);
             self.stats.cut_opened += 1;
         } else {
             self.expected.extend(bytes);
@@ -1190,7 +1217,49 @@ impl Model {
     fn retire(&mut self) {
         self.retired = true;
         self.held.clear();
+        self.held_ops.clear();
         self.segs.clear();
+    }
+
+    /// One op held whole, behind what is held already.
+    fn hold(&mut self, bytes: &[u8]) {
+        if !bytes.is_empty() {
+            self.held.extend(bytes);
+            self.held_ops.push_back(bytes.len());
+        }
+    }
+
+    /// The first `n` held bytes, released: an op they end inside keeps
+    /// its rest held, as a release's split leaves it.
+    fn release(&mut self, n: usize) {
+        self.expected.extend(self.held.drain(..n));
+        let mut left = n;
+        while left > 0 {
+            let first = self.held_ops.front_mut().expect("a held op");
+            if *first <= left {
+                left -= *first;
+                self.held_ops.pop_front();
+            } else {
+                *first -= left;
+                left = 0;
+            }
+        }
+    }
+
+    /// Refuse the held op holding byte `at` and every op held after it;
+    /// the ops before it stay held.
+    fn refuse_from(&mut self, at: usize) {
+        let mut start = 0;
+        let mut kept = 0;
+        for &len in &self.held_ops {
+            if start + len > at {
+                break;
+            }
+            start += len;
+            kept += 1;
+        }
+        self.held.truncate(start);
+        self.held_ops.truncate(kept);
     }
 
     /// Match, release and complete what the script now allows, then what
@@ -1325,12 +1394,19 @@ impl Model {
         match self.segs.front() {
             None => {
                 let upto = candidate.unwrap_or(self.held.len());
-                self.expected.extend(self.held.drain(..upto));
+                self.release(upto);
                 if candidate.is_none() {
                     return;
                 }
-                // The candidate alone, as the next segment's trigger.
+                // The candidate alone, as the next segment's trigger: the
+                // rest of its op stays held as that op.
                 self.held.pop_front();
+                if let Some(first) = self.held_ops.front_mut() {
+                    *first -= 1;
+                    if *first == 0 {
+                        self.held_ops.pop_front();
+                    }
+                }
                 self.expected.push(CTRL_G);
                 self.last += 1;
                 self.triggers.push(self.last);
@@ -1348,21 +1424,31 @@ impl Model {
                 });
             }
             Some(seg) if seg.released && !seg.cut_off => {
-                // Q147b: a Claude segment released on an `Armed` decision
-                // goes to a Claude whose terminal is out of raw mode until
-                // it returns (its helper drained and its `?2004h` after the
-                // trigger read): there a byte the cooked line discipline
-                // acts on (a Ctrl+C is a SIGINT, an Enter becomes a line
-                // feed, a Backspace erases) waits, with everything after
-                // it, for that return.
-                let cooked = self.agent == Agent::Claude
-                    && seg.record.is_some_and(|ri| {
-                        let r = &self.records[ri];
-                        r.decision == Some(Decision::Armed) && !(r.drained && seg.e1.on)
-                    });
-                let key = cooked
-                    .then(|| self.held.iter().position(|&b| line_discipline_key(b)))
-                    .flatten();
+                // Q147b, Q151b: a Claude segment released on an `Armed`
+                // decision goes to a Claude whose terminal is out of raw
+                // mode until it returns (its `?2004h` after the trigger
+                // read): there a byte the cooked line discipline acts on (a
+                // Ctrl+C is a SIGINT, an Enter becomes a line feed, a
+                // Backspace erases) waits, with everything after it, for
+                // that return. A Claude probe released on an `Unarmed`
+                // decision goes to an editor the person didn't ask for,
+                // while Claude is out of raw mode until its helper exits:
+                // until that exit drains, a signal key and everything held
+                // after it is refused.
+                let decided = seg.record.map(|ri| &self.records[ri]);
+                let claude = self.agent == Agent::Claude;
+                let cooked = claude
+                    && decided.is_some_and(|r| r.decision == Some(Decision::Armed) && !seg.e1.on);
+                let signal = claude
+                    && seg.kind == MKind::Probe
+                    && decided.is_some_and(|r| r.decision == Some(Decision::Unarmed) && !r.drained);
+                let key = if cooked {
+                    self.held.iter().position(|&b| line_discipline_key(b))
+                } else if signal {
+                    self.held.iter().position(|&b| signal_key(b))
+                } else {
+                    None
+                };
                 let upto = match (candidate, key) {
                     (Some(c), Some(k)) => c.min(k),
                     (c, k) => c.or(k).unwrap_or(self.held.len()),
@@ -1370,18 +1456,25 @@ impl Model {
                 if upto > 0 {
                     self.stats.passed += 1;
                 }
-                if key.is_some_and(|k| k == upto) {
+                let stopped_at_key = key.is_some_and(|k| k == upto);
+                if stopped_at_key && cooked {
                     self.stats.cooked_held += 1;
                 }
-                self.expected.extend(self.held.drain(..upto));
-                // R-HOLD's bounded refusal (the user's ruling, 2026-11-03):
-                // with the scope open this segment never completes, so the
-                // Ctrl+G now first in what is held, and everything after it,
-                // is refused and never written: once the release has gone
-                // up to it, which a held line-discipline key before it
-                // defers until Claude's return.
-                if candidate.is_some() && self.scope_open && !cooked {
-                    self.held.clear();
+                self.release(upto);
+                if stopped_at_key && signal {
+                    self.refuse_from(0);
+                    self.stats.signal_refused += 1;
+                }
+                // R-HOLD's bounded refusal (the user's ruling, 2026-11-03,
+                // and Q151b): with the scope open this segment never
+                // completes, so the held op holding the next Ctrl+G, and
+                // every op after it, is refused and never written, in the
+                // same pass: an op before it holding a key the release
+                // stopped at stays held.
+                if self.scope_open
+                    && let Some(at) = self.held.iter().position(|&b| b == CTRL_G)
+                {
+                    self.refuse_from(at);
                     self.stats.refused += 1;
                 }
             }
@@ -2152,7 +2245,8 @@ fn assert_reached(reached: &Reached, floor: usize) {
     let r = &reached.stats;
     eprintln!(
         "reached: {} releases, {} passed, {} cut off, {} completions, {} triggers, \
-         {} cut-opened, {} refused, {} line-discipline holds, {} retirements, settled {:?}",
+         {} cut-opened, {} refused, {} line-discipline holds, {} signal keys refused, \
+         {} retirements, settled {:?}",
         r.released,
         r.passed,
         r.cut_off,
@@ -2161,6 +2255,7 @@ fn assert_reached(reached: &Reached, floor: usize) {
         r.cut_opened,
         r.refused,
         r.cooked_held,
+        r.signal_refused,
         reached.retired,
         r.settled
     );
@@ -2193,6 +2288,10 @@ fn assert_reached(reached: &Reached, floor: usize) {
         (
             "releases stopped at a line-discipline key on a Claude out of raw mode",
             r.cooked_held,
+        ),
+        (
+            "signal keys refused behind a probe's `Unarmed` release",
+            r.signal_refused,
         ),
         ("retirements", reached.retired),
     ] {
@@ -2248,7 +2347,7 @@ fn helper(pid: u32, seg: u64, decision: Decision) -> Step {
     })
 }
 
-/// Scenario: On Claude, the deck's check writes its Ctrl+G and a person types a letter and then a Ctrl+C, an Enter or a Backspace (or a letter alone) at each point of the check: before the helper is seen, after it decides `Armed`, after it exits, and after Claude's paste-mode disable but before its enable. The letter goes as the release table lets it, but the Ctrl+C, Enter or Backspace (Claude's terminal being out of raw mode until it returns) stays held until the helper has exited and Claude's enable is read, and is then written once, in order, after the letter; the check completes and settles either way, and when the typing came before its read settled, the next check is due at once (Q147b, the activation's lane-2 failure and the stuck hold behind it).
+/// Scenario: On Claude, the deck's check writes its Ctrl+G and a person types a letter and then a Ctrl+C, an Enter or a Backspace (or a letter alone) at each point of the check: before the helper is seen, after it decides `Armed`, after it exits, and after Claude's paste-mode disable but before its enable. The letter goes as the release table lets it, but the Ctrl+C, Enter or Backspace (Claude's terminal being out of raw mode until it returns) stays held until Claude's enable is read (here after the helper's exit; `probe_010_a_line_discipline_key_goes_at_claudes_return_before_the_exit` reads the enable first), and is then written once, in order, after the letter; the check completes and settles either way, and when the typing came before its read settled, the next check is due at once (Q147b, the activation's lane-2 failure and the stuck hold behind it).
 #[spec("inbox/probe/010")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn probe_010_a_line_discipline_key_waits_for_claudes_return() {
@@ -2289,6 +2388,108 @@ async fn probe_010_a_line_discipline_key_waits_for_claudes_return() {
                 "{what}: the model held the key for the return"
             );
         }
+    }
+}
+
+/// Scenario: On Claude, the deck's check writes its Ctrl+G and its helper decides `Armed`, and Claude's paste-mode disable and then its enable are read before the helper's exit is. A person types a letter and then a Ctrl+C, an Enter or a Backspace after the decision, after the disable or after the enable: the key is written at the enable, Claude being back in raw mode by then, without waiting for the helper's exit, which comes last; everything typed reaches the pane once, in order, and the check completes at the exit (Q151b: the helper's drain is not waited for).
+#[spec("inbox/probe/010")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_010_a_line_discipline_key_goes_at_claudes_return_before_the_exit() {
+    let points = [
+        "after its decision",
+        "after the disable",
+        "after the enable",
+    ];
+    for key in [0x03u8, b'\r', 0x7f] {
+        for (at, point) in points.iter().enumerate() {
+            let mut steps = vec![
+                helper(11, 1, Decision::Armed),
+                Step::Out(OFF),
+                Step::Out(ON),
+            ];
+            steps.insert(at + 1, Step::Type(vec![b'x', key]));
+            // The model is judged after every step, so the key must have
+            // gone by the end of the enable's step, before this exit.
+            steps.push(Step::Exit(11));
+            let what = format!("key {key:#04x} {point}");
+            let model = run(Agent::Claude, b"", false, &steps, &what).await;
+            assert!(model.segs.is_empty(), "{what}: the check completed");
+            assert_eq!(
+                model.expected,
+                [CTRL_G, b'x', key],
+                "{what}: everything typed, once, in order"
+            );
+        }
+    }
+}
+
+/// Scenario: On Claude, the deck's check writes its Ctrl+G and a person types a letter, then a Ctrl+C (or a Ctrl+\ or a Ctrl+Z), then another letter, all held behind it; the check's helper then decides `Unarmed` and runs the person's editor, which the person never asked for. The first letter goes to the pane, but the signal key and the letter after it are refused at once: their connection is told `signal-key-refused`, none of it is written and nothing stays held. While the editor runs, a letter and a second signal key typed together are treated the same way (the letter goes, the key is refused), and ordinary typing goes on. Once the helper has reported the editor's end and exited, a signal key goes to the pane as typed (Q151b).
+#[spec("inbox/probe/010")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_010_a_signal_key_behind_a_checks_unarmed_editor_is_refused() {
+    async fn told(notice: &mut tokio::sync::mpsc::Receiver<Vec<u8>>) -> Option<Vec<u8>> {
+        tokio::time::timeout(Duration::from_secs(3), notice.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+    for key in [0x03u8, 0x1c, 0x1a] {
+        let what = format!("key {key:#04x}");
+        let rig = Rig::new(Agent::Claude, b"");
+        rig.probe(|_| {}).await;
+        let (tx, mut notice) = tokio::sync::mpsc::channel(4);
+        rig.typed_with(&[b'x', key, b'y'], Some(tx)).await;
+        rig.observe(&record(81, 1, Decision::Unarmed));
+        rig.editor(81);
+        rig.settle(b"\x07x").await;
+        assert_eq!(
+            told(&mut notice).await.as_deref(),
+            Some(&b"signal-key-refused"[..]),
+            "{what}: its connection told why"
+        );
+        assert_eq!(
+            rig.taken(),
+            b"\x07x",
+            "{what}: the letter before the key goes, the key and what follows it don't"
+        );
+        let status = rig.writer.lock().await.gate.gate.status();
+        assert_eq!(status.held_ops, 0, "{what}: nothing stays held: {status:?}");
+        let (tx, mut notice) = tokio::sync::mpsc::channel(4);
+        rig.typed_with(&[b'a', key], Some(tx)).await;
+        rig.settle(b"\x07xa").await;
+        assert_eq!(
+            told(&mut notice).await.as_deref(),
+            Some(&b"signal-key-refused"[..]),
+            "{what}: a key typed while the editor runs is refused too"
+        );
+        rig.typed(b"bc").await;
+        rig.settle(b"\x07xabc").await;
+        assert_eq!(rig.taken(), b"\x07xabc", "{what}: ordinary typing goes on");
+        rig.report(81, Report::Done(Tree::Clean));
+        rig.exit(81);
+        rig.typed(&[key, b'd']).await;
+        let after = [&b"\x07xabc"[..], &[key, b'd']].concat();
+        rig.settle(&after).await;
+        assert_eq!(
+            rig.taken(),
+            after,
+            "{what}: once the helper has exited, the key goes as typed"
+        );
+        assert!(
+            !rig.ledger.any_outstanding(),
+            "{what}: every ticket settled"
+        );
+        assert_eq!(
+            rig.writer
+                .lock()
+                .await
+                .pty
+                .in_flight
+                .count
+                .load(Ordering::SeqCst),
+            0,
+            "{what}: nothing left in flight"
+        );
     }
 }
 
@@ -3810,6 +4011,117 @@ async fn probe_087_a_later_ctrl_g_behind_an_editor_segment_is_refused_and_typing
             );
         }
     }
+}
+
+/// Scenario: On Claude, the deck's check's helper decides `Armed`, so its release waits for Claude's return at a Ctrl+C, and another helper's decision then opens the writer scope, so the check can never complete. A person types a letter and a Ctrl+C, then, in a second write, a Ctrl+G with more after it: the letter goes, and the second write is refused at once, its connection told `ctrl-g-refused`, while the Ctrl+C before it stays held, and is written once Claude's paste-mode enable is read (Q151b: refused at once, as Q123b chose, not deferred behind the waiting key).
+#[spec("inbox/probe/087")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_087_a_ctrl_g_behind_a_key_waiting_for_claudes_return_is_refused_at_once() {
+    let rig = Rig::new(Agent::Claude, b"");
+    rig.probe(|_| {}).await;
+    rig.observe(&record(71, 1, Decision::Armed));
+    rig.settle(b"\x07").await;
+    // Another helper's tool decision opens the writer scope for good.
+    rig.observe(&record(72, 999, Decision::Tool));
+    rig.typed(b"a\x03").await;
+    rig.settle(b"\x07a").await;
+    let (tx, mut notice) = tokio::sync::mpsc::channel(4);
+    rig.typed_with(b"\x07cd", Some(tx)).await;
+    let told = tokio::time::timeout(Duration::from_secs(3), notice.recv()).await;
+    assert_eq!(
+        told.ok().flatten().as_deref(),
+        Some(&b"ctrl-g-refused"[..]),
+        "the Ctrl+G's write is refused at once"
+    );
+    let status = rig.writer.lock().await.gate.gate.status();
+    assert_eq!(
+        status.held_ops, 1,
+        "only the Ctrl+C before it stays held: {status:?}"
+    );
+    assert_eq!(
+        rig.taken(),
+        b"\x07a",
+        "the Ctrl+C waits for Claude's return"
+    );
+    rig.out(OFF);
+    rig.out(ON);
+    rig.settle(b"\x07a\x03").await;
+    assert_eq!(
+        rig.taken(),
+        b"\x07a\x03",
+        "the Ctrl+C goes at Claude's return, the refused write never"
+    );
+    assert!(!rig.ledger.any_outstanding(), "every ticket settled");
+}
+
+/// Scenario: On Claude, the deck's check writes its Ctrl+G and a person types a letter behind it; its helper decides `Armed`, exits, and Claude returns. When the daemon couldn't read the check's export (a filesystem the check doesn't support), the check settles as a timed recheck: the next check is not due, though a key came in during it, since the next one would see as little of the box; a person's key after it makes it due. When the daemon read the box non-empty instead, the letter typed during the check makes the next check due at once (Q147b), the control. (Q151b: `probe_046`'s unsupported branch on an overlay filesystem, red since Q147b.)
+#[spec("inbox/probe/010")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_010_an_unreadable_export_with_typing_during_its_check_is_a_timed_recheck() {
+    for unreadable in [true, false] {
+        let what = if unreadable {
+            "unreadable"
+        } else {
+            "non-empty"
+        };
+        let rig = Rig::new(Agent::Claude, b"");
+        rig.probe(|_| {}).await;
+        rig.typed(b"x").await;
+        if unreadable {
+            rig.input.note_unreadable(key(93));
+        } else {
+            rig.input.note_read(key(93), false);
+        }
+        rig.observe(&record(93, 1, Decision::Armed));
+        rig.exit(93);
+        rig.out(OFF);
+        rig.out(ON);
+        rig.settle(b"\x07x").await;
+        assert!(
+            rig.input.segments_view(Instant::now()).is_empty(),
+            "{what}: the check completed"
+        );
+        assert_eq!(
+            rig.input.probe_due(Instant::now()),
+            !unreadable,
+            "{what}: the next check due at once only after a read of the box"
+        );
+        rig.typed(b"y").await;
+        assert!(
+            rig.input.probe_due(Instant::now()),
+            "{what}: a key after the check makes it due"
+        );
+    }
+}
+
+/// Scenario: A Claude Code generation asks a terminal query on its output, then the deck's check writes its Ctrl+G; while the check runs, the terminal's whole reply to that query comes in as input, which the deck exempts (it isn't typing), and the check's helper decides `Armed` and reads the box non-empty. When the check settles, the next check is not due at once: the exempt reply moved nothing in the box, so only a person's key does (Q151b's ruling 6, the case revfence28's finding 7 named).
+#[spec("inbox/probe/010")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_010_an_exempt_terminal_reply_during_a_non_empty_check_makes_no_check_due() {
+    let rig = Rig::new(Agent::Claude, b"");
+    rig.probe(|_| {}).await;
+    rig.out(b"\x1b[c");
+    rig.typed(b"\x1b[?62;22c").await;
+    let mut own = record(91, 1, Decision::Armed);
+    own.read = Some(false);
+    rig.observe(&own);
+    rig.exit(91);
+    rig.out(OFF);
+    rig.out(ON);
+    rig.settle(b"\x07\x1b[?62;22c").await;
+    assert!(
+        rig.input.segments_view(Instant::now()).is_empty(),
+        "the check completed"
+    );
+    assert!(
+        !rig.input.probe_due(Instant::now()),
+        "the exempt reply makes no check due"
+    );
+    rig.typed(b"x").await;
+    assert!(
+        rig.input.probe_due(Instant::now()),
+        "a person's key does (the control)"
+    );
 }
 
 /// Scenario: A Claude Code generation shows its main composer on a real bus, and a probe is asked as the deck's probe request asks it; each time, the agent writes output between the probe's scheduling and its arm section, so the writer refuses it for the screen (`Admission(Surface)`). The first three refusals in a row count no failure and leave the schedule due; the fourth counts one, so the schedule backs off (A-20d-11 bounded, the revd21 review's U3-1). A counted failure starts the run over: after a person's ticket refuses one, three more refusals for the screen count nothing more.

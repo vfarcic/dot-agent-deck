@@ -501,18 +501,18 @@ impl<T> Gate<T> {
         out
     }
 
-    /// Refuse what a release can't let go (R-HOLD's bounded refusal): the
-    /// held ops from the first one holding a Ctrl+G candidate (`candidate`)
-    /// to the last, in acceptance order, for the caller to refuse, under
-    /// `authority`, asked first under this lock, as
+    /// Refuse what a release can't let go (R-HOLD's bounded refusal, and
+    /// Q151b's signal keys): the held ops from the first one `candidate`
+    /// picks (one holding a Ctrl+G candidate, or a signal key) to the last,
+    /// in acceptance order, for the caller to refuse, under `authority`,
+    /// asked first under this lock with that first op, as
     /// [`Self::release_until_if`] asks it. The ops before that one stay held
     /// (a release takes them), and so does the fence: it is the segments'
     /// to open. `authority` may take R6, as a release's does. Empty when no
-    /// fence is closed, no held op holds a candidate, or `authority`
-    /// refuses.
+    /// fence is closed, no held op is picked, or `authority` refuses.
     pub fn refuse_held_if(
         &self,
-        authority: impl FnOnce() -> bool,
+        authority: impl FnOnce(&T) -> bool,
         candidate: impl Fn(&T) -> bool,
     ) -> Vec<T> {
         let mut inner = self.lock();
@@ -522,7 +522,7 @@ impl<T> Gate<T> {
         let Some(first) = fence.held.iter().position(|(op, _)| candidate(op)) else {
             return Vec::new();
         };
-        if !authority() {
+        if !authority(&fence.held[first].0) {
             return Vec::new();
         }
         let out: Vec<T> = fence

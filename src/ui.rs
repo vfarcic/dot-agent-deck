@@ -40701,6 +40701,29 @@ mod tests {
         );
     }
 
+    /// Scenario: The focused pane is in PaneInput when the daemon refuses the person's Ctrl+C (or Ctrl+Z or Ctrl+\) and what they typed after it, typed while a deck check had their editor open (`signal-key-refused`, the agent still live). The TUI's status line shows the refusal in the words the desktop shows, and the pane keeps its input, so what the person types next still goes to the agent.
+    #[spec::spec("inbox/probe/010")]
+    #[test]
+    fn probe_010_a_refused_signal_key_keeps_the_pane_typing() {
+        let now = std::time::Instant::now();
+        let mut ui = default_ui();
+        ui.mode = UiMode::PaneInput;
+        let acted = apply_stream_rejection_feedback(
+            &mut ui,
+            Some("focused"),
+            "focused",
+            "signal-key-refused",
+            now,
+        );
+        assert!(acted, "a refusal for the focused pane acts");
+        assert_eq!(ui.mode, UiMode::PaneInput, "the pane keeps its input");
+        assert_eq!(
+            ui.status_message.as_ref().map(|(m, _)| m.as_str()),
+            Some(crate::inbox_display::INPUT_REJECTED_SIGNAL_KEY_REFUSED),
+            "the refusal shown in the shared words"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // The command-entry lock on Orchestration tabs
     // -----------------------------------------------------------------------

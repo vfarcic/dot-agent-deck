@@ -137,6 +137,11 @@ pub const INPUT_REJECTED_REPLACED_OR_CLOSED: &str =
 /// it, behind a check their editor answered earlier in the same agent run,
 /// which the deck can no longer serialise a Ctrl+G behind.
 pub const INPUT_REJECTED_CTRL_G_REFUSED: &str = "Input not delivered: your Ctrl+G and what you typed after it; the deck passes no more Ctrl+G to this agent until it restarts";
+/// [`input_rejected`]'s words for `signal-key-refused` (PRD #1666 part 3,
+/// Q151b): a person's Ctrl+C, Ctrl+Z or Ctrl+\, and what was typed after
+/// it, behind a check whose helper ran their editor while the agent's
+/// terminal could have turned the key into a signal that ends the agent.
+pub const INPUT_REJECTED_SIGNAL_KEY_REFUSED: &str = "Input not delivered: your Ctrl+C, Ctrl+Z or Ctrl+\\ and what you typed after it, while the deck's check had your editor open; type it again once the editor has closed";
 /// [`input_rejected`]'s words for a refusal that names no reason.
 pub const INPUT_REJECTED_UNNAMED: &str = "Input not delivered";
 
@@ -173,17 +178,19 @@ pub fn input_rejected(reason: &str) -> String {
         "write-failed" => INPUT_REJECTED_WRITE_FAILED.to_string(),
         "stale" | "wrong-session" => INPUT_REJECTED_REPLACED_OR_CLOSED.to_string(),
         "ctrl-g-refused" => INPUT_REJECTED_CTRL_G_REFUSED.to_string(),
+        "signal-key-refused" => INPUT_REJECTED_SIGNAL_KEY_REFUSED.to_string(),
         other => format!("{INPUT_REJECTED_UNNAMED} ({other})"),
     }
 }
 
 /// Whether a refusal of typed input for `reason` leaves the agent live and
 /// writable, so a client keeps the person typing into its pane: `true` for
-/// `ctrl-g-refused` alone, whose agent takes what is typed next (R-HOLD's
-/// bounded refusal). The TUI leaves its pane-input mode for every other
-/// reason; the desktop keeps the tile's input for every reason.
+/// `ctrl-g-refused` (R-HOLD's bounded refusal) and `signal-key-refused`
+/// (Q151b), whose agent takes what is typed next. The TUI leaves its
+/// pane-input mode for every other reason; the desktop keeps the tile's
+/// input for every reason.
 pub fn input_rejection_keeps_typing(reason: &str) -> bool {
-    reason.trim() == "ctrl-g-refused"
+    matches!(reason.trim(), "ctrl-g-refused" | "signal-key-refused")
 }
 
 /// PRD #1666 part 3, round 5-wake (Q6): the deck-wide attention item names a
@@ -1678,6 +1685,7 @@ mod tests {
             ("stale", INPUT_REJECTED_REPLACED_OR_CLOSED),
             ("wrong-session", INPUT_REJECTED_REPLACED_OR_CLOSED),
             ("ctrl-g-refused", INPUT_REJECTED_CTRL_G_REFUSED),
+            ("signal-key-refused", INPUT_REJECTED_SIGNAL_KEY_REFUSED),
             ("", INPUT_REJECTED_UNNAMED),
         ] {
             assert_eq!(words["inputRejected"][reason], expected, "{reason:?}");
@@ -1687,7 +1695,7 @@ mod tests {
             words["inputRejected"]
                 .as_object()
                 .map(|reasons| reasons.len()),
-            Some(7),
+            Some(8),
             "the fixture lists every refusal the deck names"
         );
         // Merge review U3-2: the state both clients show before anything is

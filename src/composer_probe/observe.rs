@@ -1052,8 +1052,15 @@ impl<P: Page> Seam<P> {
         if decided == Decision::Armed
             && let Some(e) = evidence
         {
-            self.input
-                .note_read(e.key, matches!(read, Some(ExportRead::Empty)));
+            match read {
+                Some(ExportRead::Empty) => self.input.note_read(e.key, true),
+                Some(ExportRead::NonEmpty | ExportRead::Unknown) => {
+                    self.input.note_read(e.key, false);
+                }
+                // Q151b: no read of the box, which the helper is answered as
+                // `Unreadable` (`outcome`).
+                Some(ExportRead::Unreadable) | None => self.input.note_unreadable(e.key),
+            }
         }
         let recorded = match evidence {
             Some(e) => self.input.record_observe(
