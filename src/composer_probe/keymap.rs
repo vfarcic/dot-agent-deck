@@ -42,9 +42,12 @@
 //! **Codex** ([`CodexSources`], R6 §9.2, R5 §7.1) reads `$CODEX_HOME/config.toml`,
 //! the selected profile's `$CODEX_HOME/<name>.config.toml`, the trusted
 //! project files for the pane's cwd, and each `-c key=value`. The deck reads
-//! them before the spawn ([`CodexBaseline`]) and again after the first ready
-//! frame; any difference holds the generation, and so does a bound agent
-//! that launched with other sources than the spawn's. For the project files
+//! them before the spawn ([`CodexBaseline`]) and again at each check, each
+//! read compared with the last one accepted ([`CodexReads`]); any difference
+//! holds, except a rewrite of `config.toml` that changes only Codex's own
+//! start-up bookkeeping ([`CODEX_BOOKKEEPING`], [`codex_unchanged`]), and so
+//! does a bound agent that launched with other sources than the spawn's
+//! (the deck wrapper's own `-c` pair left out, [`CodexBaseline::bound`]). For the project files
 //! the deck reads every `.codex/config.toml` Codex's root and trust rules
 //! could pick ([`codex_project_files`]) and holds when one of them has a
 //! keymap ([`codex_projects_guard`]). Otherwise the sources are merged in the
@@ -578,9 +581,7 @@ pub fn codex_keymap(
     after: &CodexRead,
     precedence: &[KeymapSource],
 ) -> Result<(), Hold> {
-    if before != after {
-        return Err(Hold::Changed);
-    }
+    codex_unchanged(before, after)?;
     let present = [
         (
             KeymapSource::CodexConfig,
@@ -625,6 +626,86 @@ pub fn codex_keymap(
         }
     }
     codex_bindings(&merged)
+}
+
+/// Whether `after` is the same launch's sources as `before` (CX-10b), else
+/// [`Hold::Changed`]. Every source compares by its whole read (identity
+/// and bytes, [`read_source`]), except that `$CODEX_HOME/config.toml` may
+/// also differ by Codex's own bookkeeping ([`codex_config_unchanged`]).
+pub fn codex_unchanged(before: &CodexRead, after: &CodexRead) -> Result<(), Hold> {
+    if codex_config_unchanged(&before.config, &after.config)
+        && before.profile == after.profile
+        && before.projects == after.projects
+        && before.overrides == after.overrides
+    {
+        Ok(())
+    } else {
+        Err(Hold::Changed)
+    }
+}
+
+/// The keys Codex writes into its own `$CODEX_HOME/config.toml` as it
+/// starts, under `[tui]`, each with the only shape it writes: the one-time
+/// screen-reader probe's marker, a boolean (`tui/src/screen_reader.rs`,
+/// once per home), and the startup tooltip's shown counts, a table of
+/// model slug to count (`tui/src/app/startup_prompts.rs`, raised on each of
+/// a home's first starts up to `MODEL_AVAILABILITY_NUX_MAX_SHOW_COUNT`, 4).
+/// In both pinned releases (`rust-v0.160.0`, `rust-v0.164.0`) neither has a
+/// reader outside that probe, that tooltip and the settings structs that
+/// carry them: nothing in the key handling or the keymap reads them.
+pub const CODEX_BOOKKEEPING: [&str; 2] = ["screen_reader_detection_done", "model_availability_nux"];
+
+/// Whether `config.toml` read as `after` loads what it did as `before`:
+/// the same read, or (cxkey) a rewrite whose only difference is in Codex's
+/// own bookkeeping ([`CODEX_BOOKKEEPING`]) and which does change it. Both
+/// are parsed; everything but those keys, in those shapes, must be equal,
+/// so any other key, a bookkeeping key of another shape, an unreadable or
+/// unparsable read, and a rewrite that leaves the bookkeeping as it was (a
+/// hand edit undone, a touch) all differ. An absent file loads as an empty
+/// one.
+fn codex_config_unchanged(before: &SourceRead, after: &SourceRead) -> bool {
+    if before == after {
+        return true;
+    }
+    match (codex_config_split(before), codex_config_split(after)) {
+        (Some((before, kept_before)), Some((after, kept_after))) => {
+            before == after && kept_before != kept_after
+        }
+        _ => false,
+    }
+}
+
+/// `config.toml` parsed, and the bookkeeping taken out of it: the rest and
+/// the bookkeeping. `None` when it can't be read or parsed.
+fn codex_config_split(read: &SourceRead) -> Option<(toml::Table, toml::Table)> {
+    let mut table: toml::Table = match read {
+        SourceRead::Absent => toml::Table::new(),
+        SourceRead::Present { contents, .. } => std::str::from_utf8(contents).ok()?.parse().ok()?,
+        SourceRead::Unreadable(_) => return None,
+    };
+    let mut kept = toml::Table::new();
+    if let Some(toml::Value::Table(tui)) = table.get_mut("tui") {
+        if matches!(tui.get(CODEX_BOOKKEEPING[0]), Some(toml::Value::Boolean(_))) {
+            kept.insert(
+                CODEX_BOOKKEEPING[0].into(),
+                tui.remove(CODEX_BOOKKEEPING[0])?,
+            );
+        }
+        if let Some(toml::Value::Table(counts)) = tui.get(CODEX_BOOKKEEPING[1])
+            && counts
+                .values()
+                .all(|count| count.as_integer().is_some_and(|n| u32::try_from(n).is_ok()))
+        {
+            kept.insert(
+                CODEX_BOOKKEEPING[1].into(),
+                tui.remove(CODEX_BOOKKEEPING[1])?,
+            );
+        }
+        if tui.is_empty() {
+            table.remove("tui");
+        }
+    }
+    Some((table, kept))
 }
 
 /// Where Codex keeps its home, from the agent's environment `env`:
@@ -762,6 +843,51 @@ impl CodexBaseline {
         } else {
             Err(Hold::Changed)
         }
+    }
+}
+
+/// A Codex generation's key-binding sources over its life (A-20d-1b,
+/// cxkey): the sources the bound agent launched with, and the last read of
+/// them that was accepted, first the one before the spawn. Each check reads
+/// them again and compares with that last read ([`codex_unchanged`]). An
+/// accepted read becomes the last, so Codex's own bookkeeping write is
+/// accepted once, and a later rewrite that leaves the bookkeeping as it was
+/// (a hand edit undone, which Codex may have reloaded meanwhile) still holds
+/// as changed. A read that holds is not kept.
+#[derive(Debug)]
+pub struct CodexReads {
+    sources: CodexSources,
+    last: std::sync::Mutex<CodexRead>,
+}
+
+impl CodexReads {
+    /// A generation's reads from its spawn baseline.
+    pub fn new(baseline: &CodexBaseline) -> CodexReads {
+        CodexReads {
+            sources: baseline.sources.clone(),
+            last: std::sync::Mutex::new(baseline.read.clone()),
+        }
+    }
+
+    /// Reads the sources now and checks them against the last accepted read,
+    /// the project files ([`codex_projects_guard`]) and the effective
+    /// keymap in `precedence` ([`codex_keymap`]). The file I/O comes before
+    /// its own lock, which guards only the comparison: call it with no lock
+    /// held.
+    pub fn check(&self, precedence: &[KeymapSource]) -> Result<(), Hold> {
+        let now = self.sources.read();
+        {
+            let mut last = self
+                .last
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            codex_unchanged(&last, &now)?;
+            *last = now.clone();
+        }
+        // A-20d-1b: the project files are a superset of what Codex loads; a
+        // keymap in any of them holds.
+        codex_projects_guard(&now)?;
+        codex_keymap(&now, &now, precedence)
     }
 }
 

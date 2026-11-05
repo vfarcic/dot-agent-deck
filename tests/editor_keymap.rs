@@ -1241,3 +1241,183 @@ fn probe_014_the_wrappers_embedded_pair_is_not_a_codex_source() {
         );
     }
 }
+
+/// Codex's `config.toml` as the deck's startup trust write leaves it.
+const TRUSTED: &str = "[projects.\"/w\"]\ntrust_level = \"trusted\"\n";
+
+/// `contents` written to `path` as Codex writes it: a new file renamed over
+/// the old one, so the inode and both times move.
+fn rewrite(path: &Path, contents: &str) {
+    std::thread::sleep(TICK);
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, contents).unwrap();
+    std::fs::rename(&tmp, path).unwrap();
+}
+
+/// Scenario: Read a Codex home's sources before its spawn, then rewrite `config.toml` the way real Codex 0.164.0 rewrote it on a fresh home's first five starts (measured): the screen-reader probe's `[tui] screen_reader_detection_done = true` once, then the startup tooltip's `[tui.model_availability_nux]` count raised from 1 to 4, each written to a new file renamed over the old. Each rewrite reads as the same sources as the spawn's, as does a home that had no `config.toml` before Codex wrote one, so the probe is allowed instead of held as changed.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_codexs_own_startup_writes_are_not_a_change() {
+    let codex = Codex::new();
+    write(&codex.config(), TRUSTED);
+    let sources = codex.sources(&[]);
+    let before = sources.read();
+    let marker = format!("{TRUSTED}\n[tui]\nscreen_reader_detection_done = true\n");
+    rewrite(&codex.config(), &marker);
+    assert_ne!(
+        before,
+        sources.read(),
+        "the rewrite moved the file's identity"
+    );
+    assert_eq!(
+        codex_keymap(&before, &sources.read(), CODEX_ORDER),
+        Ok(()),
+        "the screen-reader marker"
+    );
+    for count in 1..=4 {
+        rewrite(
+            &codex.config(),
+            &format!("{marker}\n[tui.model_availability_nux]\n\"gpt-6.1-sol\" = {count}\n"),
+        );
+        assert_eq!(
+            codex_keymap(&before, &sources.read(), CODEX_ORDER),
+            Ok(()),
+            "the tooltip's count at {count}"
+        );
+    }
+
+    let fresh = Codex::new();
+    let sources = fresh.sources(&[]);
+    let before = sources.read();
+    assert_eq!(before.config, SourceRead::Absent);
+    rewrite(
+        &fresh.config(),
+        "[tui]\nscreen_reader_detection_done = true\n",
+    );
+    assert_eq!(
+        codex_keymap(&before, &sources.read(), CODEX_ORDER),
+        Ok(()),
+        "created by the marker alone"
+    );
+}
+
+/// Scenario: Read a Codex home's sources before its spawn, then rewrite `config.toml` with Codex's own bookkeeping changed and something else beside it. Every other key still holds as changed, and so does a bookkeeping key in a shape Codex doesn't write: Ctrl+G moved in `tui.keymap`, the profile or model selected, `tui.animations` (which the screen-reader probe can also write), the marker as a string, a count that isn't a non-negative 32-bit integer or a nested table of counts, and a file that no longer parses. A rewrite that changes nothing Codex loads and leaves the bookkeeping as it was (a hand edit undone, the same bytes rewritten) holds too, and only `config.toml` is read this way: the same bookkeeping written into the profile file holds.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_only_codexs_bookkeeping_is_left_out_of_the_comparison() {
+    let marker = format!("{TRUSTED}\n[tui]\nscreen_reader_detection_done = true\n");
+    for (row, contents) in [
+        (
+            "Ctrl+G moved",
+            format!("{marker}\n[tui.keymap.global]\nopen_external_editor = \"f6\"\n"),
+        ),
+        (
+            "a profile selected",
+            format!("profile = \"work\"\n{marker}"),
+        ),
+        ("the model", format!("model = \"o4\"\n{marker}")),
+        ("animations", format!("{marker}animations = false\n")),
+        (
+            "the marker as a string",
+            format!("{TRUSTED}\n[tui]\nscreen_reader_detection_done = \"yes\"\n"),
+        ),
+        (
+            "a negative count",
+            format!("{marker}\n[tui.model_availability_nux]\nm = -1\n"),
+        ),
+        (
+            "a count past u32",
+            format!("{marker}\n[tui.model_availability_nux]\nm = 4294967296\n"),
+        ),
+        (
+            "a count as a string",
+            format!("{marker}\n[tui.model_availability_nux]\nm = \"1\"\n"),
+        ),
+        (
+            "nested counts",
+            format!("{marker}\n[tui.model_availability_nux.m]\nn = 1\n"),
+        ),
+        ("unparsable", format!("{marker}\n[tui\n")),
+    ] {
+        let codex = Codex::new();
+        write(&codex.config(), TRUSTED);
+        let sources = codex.sources(&[]);
+        let before = sources.read();
+        rewrite(&codex.config(), &contents);
+        assert_eq!(
+            codex_keymap(&before, &sources.read(), CODEX_ORDER),
+            Err(Hold::Changed),
+            "{row}"
+        );
+    }
+
+    // A rewrite that leaves the bookkeeping as it was.
+    let codex = Codex::new();
+    write(&codex.config(), &marker);
+    let sources = codex.sources(&[]);
+    let before = sources.read();
+    rewrite(&codex.config(), &marker);
+    assert_eq!(
+        codex_keymap(&before, &sources.read(), CODEX_ORDER),
+        Err(Hold::Changed),
+        "the same bytes rewritten"
+    );
+
+    // The profile file is compared whole.
+    let codex = Codex::new();
+    write(&codex.profile(), "model = \"o3\"\n");
+    let sources = codex.sources(&["-p", "work"]);
+    let before = sources.read();
+    rewrite(
+        &codex.profile(),
+        "model = \"o3\"\n\n[tui]\nscreen_reader_detection_done = true\n",
+    );
+    assert_eq!(
+        codex_keymap(&before, &sources.read(), CODEX_ORDER),
+        Err(Hold::Changed),
+        "bookkeeping in the profile file"
+    );
+}
+
+/// Scenario: Follow one Codex generation's reads as the deck's observer does, each check comparing with the last read it accepted. Codex's own marker is accepted once and becomes that read; a hand edit that moves Ctrl+G then holds as changed, and so does undoing it afterwards, since Codex may have reloaded the edit (its `/cd` rebuilds the keymap from disk) and the undone file's bookkeeping is unchanged. The residual is pinned too: an edit made and undone between two checks across which Codex also raised its count is not seen.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_a_codex_generation_compares_with_its_last_accepted_read() {
+    use dot_agent_deck::composer_probe::keymap::{CodexBaseline, CodexReads};
+    let codex = Codex::new();
+    write(&codex.config(), TRUSTED);
+    let cwd = codex.dir.path().join("project");
+    let baseline = CodexBaseline::at_spawn(&codex.home(), &[], &cwd).unwrap();
+    let reads = CodexReads::new(&baseline);
+    assert_eq!(reads.check(CODEX_ORDER), Ok(()), "unchanged");
+
+    let marker = format!("{TRUSTED}\n[tui]\nscreen_reader_detection_done = true\n");
+    rewrite(&codex.config(), &marker);
+    assert_eq!(reads.check(CODEX_ORDER), Ok(()), "Codex's marker");
+    assert_eq!(reads.check(CODEX_ORDER), Ok(()), "read again");
+
+    rewrite(
+        &codex.config(),
+        &format!("{marker}\n[tui.keymap.global]\nopen_external_editor = \"f6\"\n"),
+    );
+    assert_eq!(reads.check(CODEX_ORDER), Err(Hold::Changed), "Ctrl+G moved");
+    rewrite(&codex.config(), &marker);
+    assert_eq!(
+        reads.check(CODEX_ORDER),
+        Err(Hold::Changed),
+        "the edit undone"
+    );
+
+    // The residual: undone within one window that Codex's own write also
+    // fell in.
+    let codex = Codex::new();
+    write(&codex.config(), TRUSTED);
+    let baseline = CodexBaseline::at_spawn(&codex.home(), &[], &cwd).unwrap();
+    let reads = CodexReads::new(&baseline);
+    rewrite(
+        &codex.config(),
+        &format!("{TRUSTED}\n[tui.keymap.global]\nopen_external_editor = \"f6\"\n"),
+    );
+    rewrite(&codex.config(), &marker);
+    assert_eq!(reads.check(CODEX_ORDER), Ok(()), "not seen");
+}
