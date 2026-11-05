@@ -16,7 +16,10 @@
 //! Every fixture the rule accepts must resist every attempt; every one it
 //! refuses must have at least one attempt that succeeds as either account,
 //! apart from the hard-link fixture, which the rule refuses for a second
-//! path it cannot see the reach of (the attempts are printed). Where Docker
+//! path it cannot see the reach of and which resists every attempt. The
+//! group-writable directory and export give way only to the account with
+//! the user's group, and the other-writable directory only to the one
+//! without it (every attempt is printed). Where Docker
 //! or the image isn't available, or `/` or `/var/tmp` isn't on an
 //! allow-listed filesystem, the test skips.
 
@@ -234,7 +237,7 @@ fn preflight() -> Result<(), String> {
     Ok(())
 }
 
-/// Scenario: As the user, build thirteen export fixtures under a fresh directory in `/var/tmp` (private, 0644 in 0755, Claude's 0664 in 0700, a safe symlink, a read-and-execute ACL grant; group-writable, other-writable and user-sticky directories, group- and other-writable files, ACL write grants on the directory and the file, a second hard link) and ask the deck's export rule about each. Then, from a container with no network, as uid 1001 with its own group and again with the user's group, try to write the export, create an entry beside it, rename a file in and rename one over it: everything the rule accepts resists every attempt, and everything it refuses except the hard link gives way to at least one.
+/// Scenario: As the user, build thirteen export fixtures under a fresh directory in `/var/tmp` (private, 0644 in 0755, Claude's 0664 in 0700, a safe symlink, a read-and-execute ACL grant; group-writable, other-writable and user-sticky directories, group- and other-writable files, ACL write grants on the directory and the file, a second hard link) and ask the deck's export rule about each. Then, from a container with no network, as uid 1001 with its own group and again with the user's group, try to write the export, create an entry beside it, rename a file in and rename one over it: everything the rule accepts resists every attempt, everything it refuses except the hard link gives way to at least one, the group-writable directory and export only with the user's group and the other-writable directory only without it, and the hard link to none.
 #[spec("inbox/probe/096")]
 #[test]
 fn probe_096_the_export_rule_against_a_second_account() {
@@ -285,5 +288,27 @@ fn probe_096_the_export_rule_against_a_second_account() {
                 "{name}: refused (accepted={accepted}), yet no attempt succeeded as either account"
             );
         }
+    }
+    // Each account gets exactly the bits that apply to it: the group bits
+    // only with the user's group, the other bits only without it. The hard
+    // link is refused for its second path, not for a bit either account has.
+    let gave = |name: &str, group: u32| {
+        rows.iter()
+            .find(|r| r.0 == name && r.1 == group)
+            .unwrap_or_else(|| panic!("{name}: no row"))
+            .3
+    };
+    for name in ["n1-group-writable-dir", "n5-group-writable-file"] {
+        assert!(
+            gave(name, gid()) > 0,
+            "{name}: held against the user's group"
+        );
+        assert_eq!(gave(name, OTHER), 0, "{name}: gave way to its own group");
+    }
+    let name = "n2-other-writable-dir";
+    assert!(gave(name, OTHER) > 0, "{name}: held against its own group");
+    assert_eq!(gave(name, gid()), 0, "{name}: gave way to the user's group");
+    for group in [OTHER, gid()] {
+        assert_eq!(gave("n8-second-hard-link", group), 0, "group {group}");
     }
 }
