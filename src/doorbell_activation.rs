@@ -501,56 +501,6 @@ pub fn without_unrecorded_claude<'a>(
         .collect()
 }
 
-/// The variable the e2e build reads for [`assumed_codex_head_echo`].
-pub const ASSUME_CODEX_HEAD_ECHO_ENV: &str = "DOT_AGENT_DECK_E2E_ASSUME_CODEX_HEAD_ECHO";
-
-/// PRD #1666 part 3, Q28: the Codex releases whose `head_echo` an e2e run
-/// asks the deck to treat as verified, so a lane-1 test can drive an
-/// activated Codex before the records say so (the Q27 Go change). A
-/// malformed list assumes nothing and is logged as `head echo assumption
-/// refused`.
-#[cfg(feature = "e2e")]
-pub fn assumed_codex_head_echo() -> Vec<Version> {
-    let Ok(list) = std::env::var(ASSUME_CODEX_HEAD_ECHO_ENV) else {
-        return Vec::new();
-    };
-    match parse_unrecorded_claude_releases(&list) {
-        Ok(releases) => releases,
-        Err(why) => {
-            tracing::warn!(target: "doorbell", %why, "head echo assumption refused");
-            Vec::new()
-        }
-    }
-}
-
-/// The production build reads no variable and assumes nothing.
-#[cfg(not(feature = "e2e"))]
-pub fn assumed_codex_head_echo() -> Vec<Version> {
-    Vec::new()
-}
-
-/// `records` with an absent `head_echo` read as verified on the **Codex**
-/// records for `assumed`. Every other field, and every other agent's record,
-/// is kept as it is, so the assumption can only turn a Codex release whose
-/// one missing measurement is `head_echo` into its measured verdict.
-pub fn with_assumed_codex_head_echo<'a>(
-    records: Vec<ReleaseRecord<'a>>,
-    assumed: &[Version],
-) -> Vec<ReleaseRecord<'a>> {
-    records
-        .into_iter()
-        .map(|mut r| {
-            if r.agent == AgentType::Codex
-                && assumed.contains(&r.release)
-                && r.head_echo == Measurement::Absent
-            {
-                r.head_echo = Measurement::Verified(());
-            }
-            r
-        })
-        .collect()
-}
-
 /// The variable the e2e build reads for [`assumed_editor_probes`].
 pub const ASSUME_EDITOR_PROBE_ENV: &str = "DOT_AGENT_DECK_E2E_ASSUME_EDITOR_PROBE";
 
@@ -992,8 +942,9 @@ const CODEX_0160_DIALOGS: &[DialogKeys<'static>] = &[
 /// the earlier, quieter replay's figures are in
 /// `docs/develop/doorbell-admission.md`). The Claude Code records are `Go`;
 /// both Codex releases stage the line (a digit of a message id answers their
-/// update dialog, `n` their folder-trust dialog), and neither records
-/// `head_echo` yet, so both are `missing_measurement`. 2.1.317's and
+/// update dialog, `n` their folder-trust dialog). 0.164.0's `head_echo` is
+/// measured, so it is `Go`, staged; 0.160.0's is not, so it stays
+/// `missing_measurement` (nothing is inherited by version distance). 2.1.317's and
 /// 2.1.318's `editor_probe` are verified ([`CLAUDE_2_1_317_EDITOR_PROBE`],
 /// [`CLAUDE_2_1_318_EDITOR_PROBE`], set by the Claude activation, Q35-28),
 /// so the deck checks the input box of those two releases alone; the other
@@ -1029,7 +980,37 @@ pub static RELEASE_RECORDS: [ReleaseRecord<'static>; 6] = [
         input_mode: Measurement::Verified(()),
         release_recogniser: Measurement::Verified(()),
         parser_cost: Measurement::Verified(()),
-        head_echo: Measurement::Absent,
+        // Codex Go (Q27, measured 2026-11-04): Codex 0.164.0 only, the native
+        // executable with SHA-256 b93f6811d3f653f0fb83be4050d857fb9abbb111df
+        // a2ce160563327daff7f306 run through its npm launcher under
+        // `dot-agent-deck wrap --agent codex`, with TERM=xterm-256color and
+        // COLORTERM=truecolor (every capture ran under both; nothing was
+        // recorded without COLORTERM), at 50 x 200 and 24 x 80, on an
+        // untouched idle composer, with the deck's hooks trusted (30),
+        // switched off (10) or untrusted through a `sh -c` launcher (10).
+        // The token head typed alone in one write was echoed exactly 50 of
+        // 50 times, at most 73.6 ms after its write against the 1500 ms echo
+        // wait; no head byte opened a recognised dialog or submitted
+        // anything; the rest, typed after that echo, was held exactly before
+        // every Enter, and the Enter at the transaction's timing (153-178 ms
+        // after the rest's write returned) submitted the exact line 50 of
+        // 50, read off the transcript within the confirm wait and once in
+        // Codex's own rollout. A whole head was withdrawn with 8 deletes 6
+        // of 6, and the strict recogniser refused partial heads, a second
+        // stage ending in a space, other lines and a line kept by an Enter
+        // in the same burst. Load: QUIET only (1-minute load 1.6-5.3 on 16
+        // CPUs, CPU pressure at most 0.91%). It does NOT cover: another
+        // release or build; another size, or a fresh 24 x 80 Codex before
+        // its first turn (no Clean frame); load; what model turns do; submit
+        // latency with daemon-bound hooks; Codex without COLORTERM; Codex
+        // menus, themes or palettes; a touched box or `editor_probe`; the
+        // deck's own driver, daemon or writer, none of which was in the
+        // loop; an Enter sent with the line or before its echo (kept in the
+        // draft 3 of 3); an Enter margin below about 82 ms; whole-line or
+        // wrapped withdrawal, which rests on `delete_key` and
+        // `placeholder_empty` above, not on this evidence. Evidence:
+        // `tests/fixtures/codex-inbox/release-0.164.0/`.
+        head_echo: Measurement::Verified(()),
         placeholder_empty: Measurement::Verified(()),
         delete_key: Measurement::Verified(()),
         transcript_echo: Measurement::Verified(()),

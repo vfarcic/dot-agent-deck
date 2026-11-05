@@ -1,5 +1,5 @@
 #![cfg(all(feature = "e2e", feature = "e2e-live", unix))]
-//! Real Codex 0.160.0 through the wrapper and inbox hooks in a scratch HOME.
+//! Real Codex through the wrapper and inbox hooks in a scratch HOME.
 mod common;
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
@@ -9,43 +9,47 @@ use live::{BUDGET, Codex};
 use spec::spec;
 use std::time::Duration;
 
-/// Scenario: Leave interactive Codex idle in its deck pane and post a sentinel task. The deck types nothing into Codex: no doorbell rings, the task stays queued and Codex's card says `waiting for the agent to fetch it. Send it a prompt.` Then the test sends Codex a prompt in its pane, as a user would: its real hooks hand the task over at that turn, and Codex acknowledges it and creates the sentinel.
+/// Scenario: Leave interactive Codex idle in its deck pane, at a release the deck has measured (0.164.0), with nothing typed into it, and post a sentinel task. The deck types the doorbell line into Codex once and Codex takes it with no prompt from the test: Codex's real prompt hook hands the task over, Codex creates the sentinel and the task is settled by its receipt. On a Codex release the deck has not measured, the test reports SKIP naming both.
 #[spec("inbox/codex/009")]
 #[test]
-fn codex_009_live_idle_is_held_and_a_prompt_delivers() {
+fn codex_009_live_idle_measured_release_is_rung_and_delivers() {
     skip_unless!(common::check_codex_available());
+    skip_unless!(live::codex_release_measured());
     let codex = Codex::new(false);
     let name = "codex-idle-19cd36.txt";
     let id = codex.post(name);
-    assert!(
-        codex.deck.wait_for_grid_string_within(
-            dot_agent_deck::inbox_display::WAKE_HOLD_CANNOT_TYPE,
-            BUDGET
-        ),
-        "the card holds the task; {}",
-        codex.evidence()
-    );
-    assert!(
-        !codex.log().contains("doorbell rang"),
-        "{}",
-        codex.evidence()
-    );
-    inbox::state(&codex.deck, &codex.pane, &id, "queued");
-    let mut input = codex.input("Check for new deck messages and do what they say.");
-    codex.wait_screen("Check for new deck messages");
-    input.write("\r");
     codex.done(&id, name);
+    let log = codex.log();
     assert!(
-        !codex.log().contains("doorbell rang"),
-        "{}",
+        log.lines()
+            .any(|line| line.contains("pane release") && line.contains("release=0.164.0")),
+        "the deck latched the measured release; {}",
         codex.evidence()
     );
-    // Its prompt hook or its Stop hook at that turn's end.
-    assert!(
-        codex.log().contains("DoorbellHook") || codex.log().contains("TurnEndHook"),
-        "{}",
+    let rang: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("doorbell rang"))
+        .collect();
+    assert_eq!(rang.len(), 1, "one ring; {}", codex.evidence());
+    assert!(rang[0].contains("rings=1"), "{}", codex.evidence());
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.contains("doorbell attempt ended"))
+            .map(|line| line.contains("outcome=Submitted"))
+            .collect::<Vec<_>>(),
+        [true],
+        "one attempt, submitted; {}",
         codex.evidence()
     );
+    for clause in ["missing_measurement", "unmeasured_release"] {
+        assert!(
+            !log.contains(&format!("clause=\"{clause}\"")),
+            "the record admits 0.164.0: no {clause}; {}",
+            codex.evidence()
+        );
+    }
+    // The submitted line's prompt hook handed the task over.
+    assert!(log.contains("DoorbellHook"), "{}", codex.evidence());
 }
 
 /// Scenario: Queue a task while real Codex displays its folder-trust selection. The dialog must stay on the same choice until the user accepts it; the deck then still types nothing into Codex, and once the test sends Codex a prompt, Codex must receive, act on and acknowledge the task.
@@ -150,17 +154,21 @@ fn codex_011_live_busy_stop_hands_over_and_acks() {
     );
 }
 
-/// Scenario: Start interactive Codex with every one of the deck's hooks switched off, so none of them runs, and post a sentinel task while it is idle. The deck types nothing into Codex; the test asks Codex in its pane to run `dot-agent-deck inbox fetch`, and its model runs it inside its own sandbox, that fetch reaches the deck as a one-shot receiver (a sandbox that refuses the socket is UNVERIFIED, not a pass), the sentinel is written once, and the task is settled by its receipt with no hook having fetched.
+/// Scenario: Start interactive Codex with every one of the deck's hooks switched off, so none of them runs, type into its pane a prompt asking it to run `dot-agent-deck inbox fetch`, then post a sentinel task while it is idle. Because its box was typed into, the deck types nothing into Codex; on the prompt's Enter its model runs the fetch inside its own sandbox, that fetch reaches the deck as a one-shot receiver (a sandbox that refuses the socket is UNVERIFIED, not a pass), the sentinel is written once, and the task is settled by its receipt with no hook having fetched.
 #[spec("inbox/codex/022")]
 #[test]
 fn codex_022_live_untrusted_hooks_a_model_run_fetch_delivers_on_receipts() {
     skip_unless!(common::check_codex_available());
     let codex = Codex::with_hooks(false, false);
     let name = "codex-untrusted-4e1c90.txt";
-    let id = codex.post(name);
+    // The prompt is typed before the task is posted: a Codex box something
+    // was typed into is not rung until Codex restarts, so the no-ring
+    // assertion below rests on that rule rather than on the prompt beating
+    // the settle window.
     let mut input =
         codex.input("Run dot-agent-deck inbox fetch in the shell and do what the messages say.");
     codex.wait_screen("Run dot-agent-deck inbox fetch");
+    let id = codex.post(name);
     let fetched = || {
         codex
             .log()

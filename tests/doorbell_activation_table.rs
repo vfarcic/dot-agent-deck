@@ -6,7 +6,7 @@ use dot_agent_deck::doorbell_activation::{
     Activation, DialogKeys, EditorProbe, EditorSelection, ExportShape, FirstModal, KeyEffect,
     KeymapSource, LatchedRelease, Measurement, NoGo, PasteToggles, RELEASE_RECORDS, ReleaseRecord,
     SETTLE_CAP, activation, exact_verdict, first_stage_bytes, parse_unrecorded_claude_releases,
-    with_assumed_codex_head_echo, with_assumed_editor_probes, without_unrecorded_claude,
+    with_assumed_editor_probes, without_unrecorded_claude,
 };
 use dot_agent_deck::doorbell_generation::generation_activation;
 use dot_agent_deck::event::AgentType;
@@ -658,38 +658,7 @@ fn doorbell_053_every_recorded_dialog_leaves_the_token_head_inert() {
     }
 }
 
-/// Scenario: Assume `head_echo` for Codex 0.164.0, as an e2e run asks before the Q27 Go change, over the shipped records. 0.164.0 becomes Go exactly as its other measurements say, staged; 0.160.0, named nowhere, and the Claude Code record, named or not, are unchanged; and a Codex record missing anything besides `head_echo` keeps its own NoGo.
-#[spec("inbox/doorbell/053")]
-#[test]
-fn doorbell_053_an_assumed_head_echo_completes_only_that_codex_record() {
-    let assumed =
-        with_assumed_codex_head_echo(RELEASE_RECORDS.to_vec(), &[v("0.164.0"), v("2.1.310")]);
-    assert!(matches!(
-        verdict(&assumed, &CODEX, "0.164.0"),
-        Activation::Go { staged: true, .. }
-    ));
-    assert_eq!(
-        verdict(&assumed, &CODEX, "0.160.0"),
-        verdict(&RELEASE_RECORDS, &CODEX, "0.160.0")
-    );
-    assert_eq!(
-        verdict(&assumed, &CLAUDE, "2.1.310"),
-        verdict(&RELEASE_RECORDS, &CLAUDE, "2.1.310")
-    );
-    let missing = [incomplete(CODEX, "0.164.0", 2)];
-    let still = with_assumed_codex_head_echo(missing.to_vec(), &[v("0.164.0")]);
-    assert_eq!(
-        verdict(&still, &CODEX, "0.164.0"),
-        verdict(&missing, &CODEX, "0.164.0")
-    );
-    assert!(no_go(&verdict(&still, &CODEX, "0.164.0")).is_some());
-    assert_eq!(
-        with_assumed_codex_head_echo(RELEASE_RECORDS.to_vec(), &[]),
-        RELEASE_RECORDS.to_vec()
-    );
-}
-
-/// Scenario: Ask the table about each release the deck carries a record for, as it ships. Claude Code 2.1.310, 2.1.312, 2.1.317 and 2.1.318 are Go, unstaged, 2.1.317 and 2.1.318 with their measured editor probes and the others with theirs absent, while 2.1.311 and 2.1.319 remain unmeasured; both Codex releases stage the line and are held as missing_measurement until their head echo is recorded; and every record has its parser cost verified.
+/// Scenario: Ask the table about each release the deck carries a record for, as it ships. Claude Code 2.1.310, 2.1.312, 2.1.317 and 2.1.318 are Go, unstaged, 2.1.317 and 2.1.318 with their measured editor probes and the others with theirs absent, while 2.1.311 and 2.1.319 remain unmeasured; Codex 0.164.0, whose head echo is measured, is Go, staged, with its 6.03 s settle window, through the table and through a generation's verdict alike, while Codex 0.160.0, whose head echo is not measured, stays held as missing_measurement and 0.166.0, with no record, as unmeasured_release; and every record has its parser cost verified.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_the_shipped_records_verdicts() {
@@ -709,7 +678,15 @@ fn doorbell_053_the_shipped_records_verdicts() {
                 matches!(verdict, Activation::Go { staged: false, .. }),
                 "{verdict:?}"
             ),
-            (AgentType::Codex, "0.164.0" | "0.160.0") => assert_eq!(
+            (AgentType::Codex, "0.164.0") => assert_eq!(
+                verdict,
+                Activation::Go {
+                    profile: "codex-2026-10",
+                    staged: true,
+                    settle: Duration::from_millis(6030),
+                }
+            ),
+            (AgentType::Codex, "0.160.0") => assert_eq!(
                 verdict,
                 Activation::NoGo(NoGo::MissingMeasurement("head_echo"))
             ),
@@ -747,6 +724,29 @@ fn doorbell_053_the_shipped_records_verdicts() {
         assert_eq!(
             verdict(&RELEASE_RECORDS, &CLAUDE, release),
             Activation::NoGo(NoGo::UnmeasuredRelease)
+        );
+    }
+    // Codex: the production path a generation takes reads the same records.
+    for (release, expected) in [
+        (
+            "0.164.0",
+            Activation::Go {
+                profile: "codex-2026-10",
+                staged: true,
+                settle: Duration::from_millis(6030),
+            },
+        ),
+        (
+            "0.160.0",
+            Activation::NoGo(NoGo::MissingMeasurement("head_echo")),
+        ),
+        ("0.166.0", Activation::NoGo(NoGo::UnmeasuredRelease)),
+    ] {
+        assert_eq!(verdict(&RELEASE_RECORDS, &CODEX, release), expected);
+        assert_eq!(
+            generation_activation(&RELEASE_RECORDS, Some(&CODEX), &known(release)),
+            expected,
+            "{release}"
         );
     }
 }
@@ -977,7 +977,7 @@ fn doorbell_053_editor_records_move_no_verdict_in_any_table() {
     assert_eq!(tables, 4usize.pow(5));
 }
 
-/// Scenario: Ask about each record the deck ships, as shipped and with the e2e assumption giving every one of them a verified editor record. Every shipped record's editor record is absent except Claude Code 2.1.317's and 2.1.318's measured ones; the assumption changes that field and nothing else, adds no record, and leaves every verdict, Claude Code 2.1.310's Go and both Codex releases' missing_measurement, as it was.
+/// Scenario: Ask about each record the deck ships, as shipped and with the e2e assumption giving every one of them a verified editor record. Every shipped record's editor record is absent except Claude Code 2.1.317's and 2.1.318's measured ones; the assumption changes that field and nothing else, adds no record, and leaves every verdict, Claude Code 2.1.310's Go, Codex 0.164.0's Go and Codex 0.160.0's missing_measurement, as it was.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_the_editor_probe_assumption_moves_no_shipped_verdict() {

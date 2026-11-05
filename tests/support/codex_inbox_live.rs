@@ -67,6 +67,57 @@ pub fn prepare(deck: &common::TuiDeck) {
     );
 }
 
+/// The installed Codex release, read from `codex --version`
+/// (`codex-cli 0.164.0`).
+pub fn installed_codex_release() -> Result<String, String> {
+    let output = std::process::Command::new("codex")
+        .arg("--version")
+        .current_dir(std::env::temp_dir())
+        .output()
+        .map_err(|e| format!("`codex --version` did not run: {e}"))?;
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.split_whitespace()
+        .find(|word| semver::Version::parse(word).is_ok())
+        .map(str::to_string)
+        .ok_or_else(|| format!("`codex --version` printed no release: {text:?}"))
+}
+
+/// The preflight of a test that needs the doorbell typed into Codex: the
+/// installed release has a record the deck types into. Otherwise the reason,
+/// so the test reports `SKIP:` (UNVERIFIED under
+/// `DOT_AGENT_DECK_REQUIRE_REAL_E2E`).
+pub fn codex_release_measured() -> Result<(), String> {
+    use dot_agent_deck::doorbell_activation::{
+        Activation, LatchedRelease, RELEASE_RECORDS, activation, measured_releases,
+    };
+    use dot_agent_deck::event::AgentType;
+    let installed = installed_codex_release()?;
+    eprintln!("Codex release under test: {installed}");
+    let go = |release: &semver::Version| {
+        matches!(
+            activation(
+                &RELEASE_RECORDS,
+                &AgentType::Codex,
+                &LatchedRelease::Known(release.clone()),
+            ),
+            Activation::Go { .. }
+        )
+    };
+    let version = semver::Version::parse(&installed).map_err(|e| e.to_string())?;
+    if go(&version) {
+        Ok(())
+    } else {
+        let typed: Vec<String> = measured_releases(&RELEASE_RECORDS, &AgentType::Codex)
+            .into_iter()
+            .filter(|v| go(v))
+            .map(|v| v.to_string())
+            .collect();
+        Err(format!(
+            "Codex {installed} is installed, and the deck types the doorbell only into {typed:?}"
+        ))
+    }
+}
+
 pub struct Codex {
     pub pane: inbox::Pane,
     pub deck: common::TuiDeck,
