@@ -564,7 +564,7 @@ fn codex_027_a_dialog_on_the_head_gets_nothing_more() {
     );
 }
 
-/// Scenario: Type a doorbell-shaped line naming another message into measured Codex 0.164.0's composer, as a user would, and queue a task: the deck adds no byte (no line, no Enter, no delete) through its settle window and well past it. Clearing the composer leaves a box no check can read, so the task stays held with its reason and nothing is typed; the user's own prompt hands it over. The deck's own old line typed back is `codex_027_the_decks_own_line_typed_back_gets_no_byte_and_the_next_ring_a_fresh_token`, where a check can read the box.
+/// Scenario: Type a doorbell-shaped line naming another message into measured Codex 0.164.0's composer, as a user would, and queue a task: the deck adds no byte (no line, no Enter, no delete) through its settle window and well past it. Clearing the composer leaves a box no check can read (the deck never finds a Codex process below this launched stand-in to check it with), so the task stays held, the card saying the box can't be checked, and nothing is typed; the user's own prompt hands it over. The deck's own old line typed back is `codex_027_the_decks_own_line_typed_back_gets_no_byte_and_the_next_ring_a_fresh_token`, where a check can read the box.
 #[spec("inbox/codex/027")]
 #[test]
 fn codex_027_a_doorbell_shaped_line_the_deck_did_not_type_gets_no_byte() {
@@ -587,13 +587,16 @@ fn codex_027_a_doorbell_shaped_line_the_deck_did_not_type_gets_no_byte() {
 
     // Q35-21 (Q128b rulings (ii) and (iv)): the cleared box is one no check
     // can read on this stand-in, so it holds with its reason and the
-    // prompt route delivers.
+    // prompt route delivers. Since the Codex activation a launched Codex is
+    // installed, and its permission waits for a native Codex below the
+    // pane, which this Python stand-in never shows: `cannot_check`
+    // (`cannot_type` before, when the launcher class was not rolled out).
     user.write("\x15");
     let cleared = format!("{foreign}\x15");
     assert!(common::wait_until(WAIT, || codex.typed() == cleared));
     assert!(
         common::wait_until(WAIT, || deck.record(&codex)["inbox"]["wake_hold"]
-            == "cannot_type"),
+            == "cannot_check"),
         "{}",
         deck.record(&codex)
     );
@@ -952,13 +955,10 @@ fn codex_028_a_small_fresh_codex_without_a_width_witness_is_held_visibly() {
     holds(&deck, &codex, "awaiting_prompt");
 }
 
-/// The daemon's environment for Q35-27's tests: installation assumed for
-/// Codex 0.164.0, so a direct Codex gets the helper, and the composer probe's
-/// lines in the log.
-const PREPARED: &[(&str, &str)] = &[
-    ("DOT_AGENT_DECK_E2E_ASSUME_EDITOR_PROBE", "codex@0.164.0"),
-    ("RUST_LOG", "doorbell=debug,composer_probe=info"),
-];
+/// The daemon's environment for Q35-27's tests: the composer probe's lines
+/// in the log. A direct Codex gets the helper from the shipped rollout since
+/// the Codex activation.
+const PREPARED: &[(&str, &str)] = &[("RUST_LOG", "doorbell=debug,composer_probe=info")];
 
 /// The first directory from `/` down to `dir` on a filesystem outside the
 /// export rule's allow-list, where the deck refuses whatever the test sets up

@@ -136,9 +136,27 @@ fn doorbell_053_permission_needs_the_header_a_verified_record_and_the_root() {
             }
         }
     }
-    // The probe must be the generation's own agent's: Codex's facts have none.
+    // The probe must be the generation's own agent's: with Claude Code's
+    // verified and Codex's taken away, a Codex generation has none.
+    let codex_without: Vec<_> = records
+        .iter()
+        .map(|r| AgentFacts {
+            editor_probe: if r.agent == CODEX {
+                Measurement::Absent
+            } else {
+                r.editor_probe
+            },
+            ..r.clone()
+        })
+        .collect();
     assert_eq!(
-        permission(&records, &[], &CODEX, known("2.1.310").as_ref(), Bound),
+        permission(
+            &codex_without,
+            &[],
+            &CODEX,
+            known("2.1.310").as_ref(),
+            Bound
+        ),
         Inert(NoEditorRecord)
     );
     // An agent with no facts.
@@ -164,7 +182,7 @@ fn doorbell_053_permission_needs_the_header_a_verified_record_and_the_root() {
     );
 }
 
-/// Scenario: Ask for the permission to arm on every recorded release and on releases nobody measured, with the facts as shipped and with no e2e assumption read. Every Claude Code release, whose editor probe the Claude activation verified, can arm: each waits while its root is looked for, is armable once the root is bound, and is inert when it is never bound. Every Codex release is inert for its missing editor probe, however its root is bound.
+/// Scenario: Ask for the permission to arm on every recorded release and on releases nobody measured, with the facts as shipped and with no e2e assumption read. Every Claude Code release, whose editor probe the Claude activation verified, and every Codex release, whose editor probe the Codex activation verified (0.160.0, never measured, among them), can arm: each waits while its root is looked for, is armable once the root is bound, and is inert when it is never bound.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_only_the_activated_release_is_armable() {
@@ -176,7 +194,7 @@ fn doorbell_053_only_the_activated_release_is_armable() {
         .collect();
     for (agent, release) in &releases {
         let header = LatchedRelease::Known(release.clone());
-        let activated = *agent == CLAUDE;
+        let activated = *agent == CLAUDE || *agent == CODEX;
         for binding in [Binding::Waiting, Binding::Bound, Binding::Never] {
             let expected = match (activated, &binding) {
                 (false, _) => Permission::Inert(InertCause::NoEditorRecord),
@@ -193,7 +211,7 @@ fn doorbell_053_only_the_activated_release_is_armable() {
     }
 }
 
-/// Scenario: Run this test again in separate subprocesses of a build without the e2e feature, with valid and malformed editor-probe assumption variables set. The production reader ignores both values: every Claude Code release can arm on Claude Code's verified editor-probe fact, and every Codex release, those the variable names among them, stays unable to arm. On Linux, the actual production daemon also starts synthetic commands: a direct Claude Code gets the installation the activation rolled out (the deck's helper as its editor and a tool environment file), every other command keeps its original editor environment, whatever the variable names, and every complete argv survives unchanged.
+/// Scenario: Run this test again in separate subprocesses of a build without the e2e feature, with valid and malformed editor-probe assumption variables set. The production reader ignores both values: every Claude Code and every Codex release can arm on its agent's verified editor-probe fact. On Linux, the actual production daemon also starts synthetic commands: a direct Claude Code gets the installation the Claude activation rolled out (the deck's helper as its editor and a tool environment file), a direct Codex the one the Codex activation rolled out (the helper as its editor, no environment file, and its shell tool's editor settings as arguments after its own for the set values), every other command keeps its original editor environment and its complete argv, whatever the variable names.
 #[spec("inbox/probe/012")]
 #[test]
 #[cfg(not(feature = "e2e"))]
@@ -209,11 +227,7 @@ fn probe_012_production_reader_ignores_set_editor_assumption() {
         for recorded in &RECORDED_RELEASES {
             let agent = &recorded.measured.agent;
             let header = LatchedRelease::Known(recorded.release.clone());
-            let expected = if *agent == CLAUDE {
-                Permission::Armable
-            } else {
-                Permission::Inert(InertCause::NoEditorRecord)
-            };
+            let expected = Permission::Armable;
             assert_eq!(
                 permission(
                     &AGENT_FACTS,
@@ -246,8 +260,8 @@ fn probe_012_production_reader_ignores_set_editor_assumption() {
                     };
                     let spawned =
                         installation::spawn(&daemon, &name, kind, release, original, None, false);
-                    if kind == "claude" {
-                        // The Claude activation's rollout, not the variable.
+                    if kind == "claude" || kind == "codex" {
+                        // The activations' rollout, not the variable.
                         let helper = installation::installed(&spawned);
                         for variable in ["VISUAL", "EDITOR"] {
                             assert_eq!(
@@ -256,10 +270,29 @@ fn probe_012_production_reader_ignores_set_editor_assumption() {
                                 "{name}: {variable}"
                             );
                         }
-                        assert!(
-                            spawned.report["env"]["CLAUDE_ENV_FILE"].is_string(),
-                            "{name}"
-                        );
+                        let mut argv = spawned.original_argv.as_array().unwrap().clone();
+                        if kind == "claude" {
+                            assert!(
+                                spawned.report["env"]["CLAUDE_ENV_FILE"].is_string(),
+                                "{name}"
+                            );
+                        } else {
+                            assert_eq!(
+                                spawned.report["env"]["CLAUDE_ENV_FILE"],
+                                Value::Null,
+                                "{name}"
+                            );
+                            if let Some(value) = original {
+                                for variable in ["VISUAL", "EDITOR"] {
+                                    argv.push(json!("-c"));
+                                    argv.push(json!(format!(
+                                        "shell_environment_policy.set.{variable}=\"{value}\""
+                                    )));
+                                }
+                            }
+                        }
+                        assert_eq!(spawned.report["argv"], Value::Array(argv), "{name}");
+                        continue;
                     } else {
                         assert_eq!(spawned.report["env"]["VISUAL"], json!(original), "{name}");
                         assert_eq!(spawned.report["env"]["EDITOR"], json!(original), "{name}");
@@ -275,7 +308,7 @@ fn probe_012_production_reader_ignores_set_editor_assumption() {
         }
         return;
     }
-    for value in ["claude@2.1.310,codex@0.164.0", "broken"] {
+    for value in ["claude@2.1.310", "codex@0.164.0", "broken"] {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -295,7 +328,7 @@ fn probe_012_production_reader_ignores_set_editor_assumption() {
     }
 }
 
-/// Scenario: Parse e2e assumption lists naming `agent@release` entries, a release nobody recorded and a number from another agent's range among them, and lists with an entry that is not one: another agent, the agent's serialized name, a pre-release or build, a missing agent or release, an empty entry, an entry named twice. A list of valid entries gives exactly those pairs; any other entry refuses the whole list, also next to valid ones.
+/// Scenario: Parse e2e assumption lists naming `claude@release` entries, a release nobody recorded and a number from another agent's range among them, and lists with an entry that is not one: another agent (Codex included, since the Codex activation), the agent's serialized name, a pre-release or build, a missing agent or release, an empty entry, an entry named twice. A list of valid entries gives exactly those pairs; any other entry refuses the whole list, also next to valid ones.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_the_editor_probe_assumption_refuses_unknown_entries() {
@@ -303,22 +336,17 @@ fn doorbell_053_the_editor_probe_assumption_refuses_unknown_entries() {
     assert_eq!(parse(""), Ok(Vec::new()));
     assert_eq!(parse("  "), Ok(Vec::new()));
     assert_eq!(
-        parse("claude@2.1.310, codex@0.164.0,codex@0.160.0"),
-        Ok(vec![
-            (CLAUDE, v("2.1.310")),
-            (CODEX, v("0.164.0")),
-            (CODEX, v("0.160.0")),
-        ])
+        parse("claude@2.1.310, claude@2.1.317"),
+        Ok(vec![(CLAUDE, v("2.1.310")), (CLAUDE, v("2.1.317"))])
     );
     assert_eq!(
-        parse("claude@2.1.399,codex@2.1.310,claude@0.164.0"),
-        Ok(vec![
-            (CLAUDE, v("2.1.399")),
-            (CODEX, v("2.1.310")),
-            (CLAUDE, v("0.164.0")),
-        ])
+        parse("claude@2.1.399,claude@0.164.0"),
+        Ok(vec![(CLAUDE, v("2.1.399")), (CLAUDE, v("0.164.0"))])
     );
     for unknown in [
+        "codex@0.164.0",
+        "codex@0.160.0",
+        "claude@2.1.310, codex@0.164.0",
         "opencode@2.1.310",
         "claude_code@2.1.310",
         "Claude@2.1.310",
@@ -330,24 +358,30 @@ fn doorbell_053_the_editor_probe_assumption_refuses_unknown_entries() {
         "@2.1.310",
         "claude@",
         "claude@2.1.310,",
-        "claude@2.1.310,,codex@0.164.0",
+        "claude@2.1.310,,claude@2.1.317",
         "claude@2.1.310,claude@2.1.310",
     ] {
         assert!(parse(unknown).is_err(), "{unknown:?} was accepted");
-        let mixed = format!("codex@0.164.0,{unknown}");
+        let mixed = format!("claude@2.1.317,{unknown}");
         assert!(parse(&mixed).is_err(), "{mixed:?} was accepted");
     }
 }
 
-/// Scenario: Give Codex 0.164.0 the e2e assumption's verified editor probe (Codex's own facts have none), then ask for the permission to arm on Codex generations whose header has not arrived, latched nothing, latched another release, or latched 0.164.0. The assumption supplies a probe, never a release: only the generation that latched 0.164.0 itself, with its root bound, is armable; Claude Code keeps its own facts' probe.
+/// Scenario: Take Claude Code's editor probe out of the facts, give Claude Code 2.1.310 the e2e assumption's verified editor probe, then ask for the permission to arm on Claude Code generations whose header has not arrived, latched nothing, latched another release, or latched 2.1.310. The assumption supplies a probe, never a release: only the generation that latched 2.1.310 itself, with its root bound, is armable; Codex keeps its own facts' probe.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_the_editor_probe_assumption_never_supplies_a_release() {
-    let named = parse_assumed_editor_probes("codex@0.164.0").unwrap();
+    let named = parse_assumed_editor_probes("claude@2.1.310").unwrap();
     let assumed: Vec<_> = named.into_iter().map(|(a, r)| (a, r, PROBE)).collect();
-    let facts = &AGENT_FACTS;
+    let facts = &[
+        AgentFacts {
+            editor_probe: Measurement::Absent,
+            ..CLAUDE_FACTS
+        },
+        CODEX_FACTS,
+    ];
     assert_eq!(
-        permission(facts, &assumed, &CODEX, None, Binding::Bound),
+        permission(facts, &assumed, &CLAUDE, None, Binding::Bound),
         Permission::Pending
     );
     for latch in [
@@ -357,17 +391,17 @@ fn doorbell_053_the_editor_probe_assumption_never_supplies_a_release() {
         LatchedRelease::ScannerBudget,
     ] {
         assert_eq!(
-            permission(facts, &assumed, &CODEX, Some(&latch), Binding::Bound),
+            permission(facts, &assumed, &CLAUDE, Some(&latch), Binding::Bound),
             Permission::Inert(InertCause::UnknownRelease),
             "{latch:?}"
         );
     }
-    for other in ["0.165.0", "0.160.0", "1.0.0"] {
+    for other in ["2.1.311", "2.1.300", "3.0.0"] {
         assert_eq!(
             permission(
                 facts,
                 &assumed,
-                &CODEX,
+                &CLAUDE,
                 Some(&LatchedRelease::Known(v(other))),
                 Binding::Bound
             ),
@@ -375,24 +409,24 @@ fn doorbell_053_the_editor_probe_assumption_never_supplies_a_release() {
             "{other}"
         );
     }
-    // Claude Code is armable on its own facts, named or not.
+    // Codex is armable on its own facts, named or not.
     assert_eq!(
         permission(
             facts,
             &assumed,
-            &CLAUDE,
-            Some(&LatchedRelease::Known(v("0.164.0"))),
+            &CODEX,
+            Some(&LatchedRelease::Known(v("2.1.310"))),
             Binding::Bound
         ),
         Permission::Armable
     );
-    let own = LatchedRelease::Known(v("0.164.0"));
+    let own = LatchedRelease::Known(v("2.1.310"));
     assert_eq!(
-        permission(facts, &assumed, &CODEX, Some(&own), Binding::Waiting),
+        permission(facts, &assumed, &CLAUDE, Some(&own), Binding::Waiting),
         Permission::Pending
     );
     assert_eq!(
-        permission(facts, &assumed, &CODEX, Some(&own), Binding::Bound),
+        permission(facts, &assumed, &CLAUDE, Some(&own), Binding::Bound),
         Permission::Armable
     );
 }

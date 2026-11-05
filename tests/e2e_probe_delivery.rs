@@ -690,11 +690,15 @@ fn probe_037_launcher_claude_holds_with_needs_fetch_until_a_prompt() {
     );
 }
 
-/// Scenario: Without an editor-probe or head-echo assumption, type and delete text in a measured Codex composer and queue mail. The daemon and attached TUI must retain the turn-end/prompt route's cannot-type explanation, with no check or notice; an actual user prompt can still fetch the message.
+/// Scenario: In a deck whose Codex doorbell is turned off (`DOT_AGENT_DECK_DOORBELL_CODEX=0`), so the Codex composer gets no helper and no check (since the Codex activation, that is what leaves a direct Codex unchecked), type and delete text in it and queue mail. The daemon and attached TUI must retain the turn-end/prompt route's cannot-type explanation, with no check or notice; an actual user prompt can still fetch the message.
 #[spec("inbox/probe/037")]
 #[test]
-fn probe_037_absent_codex_holds_with_its_prompt_route_reason() {
-    absent("codex", &[], "cannot_type");
+fn probe_037_turned_off_codex_holds_with_its_prompt_route_reason() {
+    absent(
+        "codex",
+        &[(dot_agent_deck::doorbell_switch::CODEX_ENV, "0")],
+        "cannot_type",
+    );
 }
 
 fn absent(kind: &'static str, extra: &[(&str, &str)], reason: &str) {

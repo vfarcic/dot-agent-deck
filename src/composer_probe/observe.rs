@@ -93,9 +93,9 @@
 //! undeclared wrapper's `kind-G` is written with its `gen-G`. One
 //! settler at a time ([`SettleClaim`]) computes it, and only a settlement
 //! that moves it out of `Pending` publishes `A` with it, so `gen-G` is
-//! written once. Nothing in production publishes a liability: installation
-//! rolls out to no class until activation, and the only publisher is the
-//! `e2e` build's control verb ([`Seam::control`]).
+//! written once. In production, installation rolls out to the classes in
+//! [`super::install::INSTALL_ROLLOUT`] (a direct Claude Code since the Claude
+//! activation; a direct or launched Codex since the Codex activation).
 //!
 //! **Lock order.** No lock is held while a file is read or written:
 //! ```text
