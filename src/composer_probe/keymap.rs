@@ -915,6 +915,11 @@ impl CodexBaseline {
 /// accepted per generation, each a step forward from the last accepted read
 /// ([`codex_bookkeeping_forward`]); a further one holds.
 ///
+/// Reads are numbered as they begin, and only a read newer than the last one
+/// adopted is adopted ([`CodexReads::settle`]), so two checks that read
+/// concurrently and take the lock in the other order can't wind the last
+/// accepted read back.
+///
 /// The first comparison that fails latches (the revcxkey review's H1): it is
 /// returned by that check and every later one of the generation, whatever
 /// they read, as [`ClaudeKeymap::check`] holds. A held read is never adopted.
@@ -925,13 +930,17 @@ impl CodexBaseline {
 #[derive(Debug)]
 pub struct CodexReads {
     sources: CodexSources,
+    /// The number the next read takes ([`CodexReads::read`]).
+    next: std::sync::atomic::AtomicU64,
     state: std::sync::Mutex<CodexReadsState>,
 }
 
 #[derive(Debug)]
 struct CodexReadsState {
-    /// The last read accepted, first the one before the spawn.
+    /// The last read adopted, first the one before the spawn.
     last: CodexRead,
+    /// `last`'s number; the spawn's read is 0.
+    last_seq: u64,
     /// The first comparison that failed, returned by every later check.
     held: Option<Hold>,
     /// How many bookkeeping rewrites this generation has accepted.
@@ -950,8 +959,10 @@ impl CodexReads {
     pub fn new(baseline: &CodexBaseline) -> CodexReads {
         CodexReads {
             sources: baseline.sources.clone(),
+            next: std::sync::atomic::AtomicU64::new(1),
             state: std::sync::Mutex::new(CodexReadsState {
                 last: baseline.read.clone(),
+                last_seq: 0,
                 held: None,
                 rewrites: 0,
             }),
@@ -960,11 +971,38 @@ impl CodexReads {
 
     /// Reads the sources now and checks them against the last accepted read
     /// (or the latched hold), the project files ([`codex_projects_guard`])
-    /// and the effective keymap in `precedence` ([`codex_keymap`]). The file
-    /// I/O comes before its own lock, which guards only the comparison: call
-    /// it with no lock held.
+    /// and the effective keymap in `precedence` ([`codex_keymap`]):
+    /// [`CodexReads::read`] then [`CodexReads::settle`]. The file I/O comes
+    /// before its own lock, which guards only the comparison: call it with
+    /// no lock held.
     pub fn check(&self, precedence: &[KeymapSource]) -> Result<(), Hold> {
-        let now = self.sources.read();
+        self.settle(self.read(), precedence)
+    }
+
+    /// Reads the sources now, numbered in the order the reads began. File
+    /// I/O: no lock held.
+    pub fn read(&self) -> CodexTicket {
+        // Numbered before the files are read, so a read that began later
+        // carries the higher number, whichever finishes first.
+        let seq = self.next.fetch_add(1, Ordering::SeqCst);
+        CodexTicket {
+            seq,
+            read: self.sources.read(),
+        }
+    }
+
+    /// Checks `ticket`'s read (the half of [`CodexReads::check`] after the
+    /// I/O). A read newer than the last one adopted is compared with it and,
+    /// when accepted, adopted. One older than that (the revcxkey review's
+    /// M2: the daemon's two callers, admission and the observer's re-read,
+    /// read outside the lock and may take it in the other order) is still
+    /// compared, but is never adopted, so the last accepted read can't wind
+    /// back to an earlier one: it must be a read the adopted one could have
+    /// followed, the same or a step back in Codex's bookkeeping alone
+    /// ([`codex_unchanged`] with the two swapped). A read that saw anything
+    /// else, an edit included, holds and latches like any other.
+    pub fn settle(&self, ticket: CodexTicket, precedence: &[KeymapSource]) -> Result<(), Hold> {
+        let CodexTicket { seq, read: now } = ticket;
         {
             let mut state = self
                 .state
@@ -973,27 +1011,43 @@ impl CodexReads {
             if let Some(hold) = state.held {
                 return Err(hold);
             }
-            let compared = codex_unchanged(&state.last, &now).and_then(|()| {
-                if state.last == now {
-                    Ok(())
-                } else if state.rewrites < CODEX_REWRITES_PER_GENERATION {
-                    state.rewrites += 1;
-                    Ok(())
-                } else {
-                    Err(Hold::Changed)
-                }
-            });
+            let fresh = seq > state.last_seq;
+            let compared = if fresh {
+                codex_unchanged(&state.last, &now).and_then(|()| {
+                    if state.last == now {
+                        Ok(())
+                    } else if state.rewrites < CODEX_REWRITES_PER_GENERATION {
+                        state.rewrites += 1;
+                        Ok(())
+                    } else {
+                        Err(Hold::Changed)
+                    }
+                })
+            } else {
+                codex_unchanged(&now, &state.last)
+            };
             if let Err(hold) = compared {
                 state.held = Some(hold);
                 return Err(hold);
             }
-            state.last = now.clone();
+            if fresh {
+                state.last = now.clone();
+                state.last_seq = seq;
+            }
         }
         // A-20d-1b: the project files are a superset of what Codex loads; a
         // keymap in any of them holds.
         codex_projects_guard(&now)?;
         codex_keymap(&now, &now, precedence)
     }
+}
+
+/// One read of a Codex generation's sources ([`CodexReads::read`]), numbered
+/// in the order the reads began.
+#[derive(Debug)]
+pub struct CodexTicket {
+    seq: u64,
+    read: CodexRead,
 }
 
 /// [`CodexSources::from_launch`] with the project files for `cwd`, for

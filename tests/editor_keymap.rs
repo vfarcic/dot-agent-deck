@@ -1681,3 +1681,54 @@ fn probe_014_a_codex_generation_accepts_at_most_two_bookkeeping_rewrites() {
     rewrite(&codex.config(), &count("2"));
     assert_eq!(next.check(CODEX_ORDER), Ok(()), "the next start's count");
 }
+
+/// Scenario: Two checks of one Codex generation read `config.toml` on either side of Codex's own marker write and take the comparison's lock in the other order, as admission and the observer's re-read can: the later read settles first and is adopted, and the earlier one, compared afterwards, is accepted but not adopted, so the same marker rewritten again with nothing moved still holds as changed against the later read. A read that loses the race is still compared: one that saw an edit moving Ctrl+G, settled after the undo was accepted, holds and latches.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_a_codex_read_that_loses_the_race_is_not_adopted() {
+    use dot_agent_deck::composer_probe::keymap::{CodexBaseline, CodexReads};
+    let marker = bookkeeping(Some("true"), None);
+    let cwd = Path::new("/nonexistent-cxkey2-project");
+
+    let codex = Codex::new();
+    write(&codex.config(), TRUSTED);
+    let reads = CodexReads::new(&CodexBaseline::at_spawn(&codex.home(), &[], cwd).unwrap());
+    let early = reads.read();
+    rewrite(&codex.config(), &marker);
+    let late = reads.read();
+    assert_eq!(reads.settle(late, CODEX_ORDER), Ok(()), "the later read");
+    assert_eq!(
+        reads.settle(early, CODEX_ORDER),
+        Ok(()),
+        "the earlier read, settled second"
+    );
+    rewrite(&codex.config(), &marker);
+    assert_eq!(
+        reads.check(CODEX_ORDER),
+        Err(Hold::Changed),
+        "the marker rewritten with nothing moved, against the later read"
+    );
+
+    // The read that loses the race saw an edit.
+    let codex = Codex::new();
+    write(&codex.config(), TRUSTED);
+    let reads = CodexReads::new(&CodexBaseline::at_spawn(&codex.home(), &[], cwd).unwrap());
+    rewrite(
+        &codex.config(),
+        &format!("{TRUSTED}\n[tui.keymap.global]\nopen_external_editor = \"f6\"\n"),
+    );
+    let edited = reads.read();
+    rewrite(&codex.config(), &marker);
+    let undone = reads.read();
+    assert_eq!(
+        reads.settle(undone, CODEX_ORDER),
+        Ok(()),
+        "the undo with Codex's marker (the residual)"
+    );
+    assert_eq!(
+        reads.settle(edited, CODEX_ORDER),
+        Err(Hold::Changed),
+        "the earlier read that saw the edit"
+    );
+    assert_eq!(reads.check(CODEX_ORDER), Err(Hold::Changed), "latched");
+}
