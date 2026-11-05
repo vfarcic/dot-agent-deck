@@ -10891,11 +10891,11 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** The desktop client, S-21's mail hold reason, unreadable-export retention of mail, timing of the display thresholds, or a real-agent reel clip. The unsupported branch advances a recheck deadline, so it does not prove natural Empty settlement there.
 - **Platform coverage:** Linux.
 
-##### inbox/probe/037 — Production Absent holds touched Claude and Codex boxes with their delivery-route explanations.
+##### inbox/probe/037 — Touched Claude and Codex boxes the deck doesn't check hold with their delivery-route explanations.
 
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_probe_delivery.rs` for Claude/Codex; `tests/e2e_inbox_doorbell.rs` for OpenCode/Pi/Devin); desktop bridge/card display control in `desktop/src/components/InboxSurfaces.test.tsx`.
-- **Agent:** native synthetic Claude and Codex without editor-probe or head-echo assumptions; synthetic native components in the route controls; no real agent or credential.
-- **Asserts:** the daemon's Absent hold and attached TUI name needs-fetch for Claude without a waiter and cannot-type for Codex's prompt route; a further clear permits neither probe nor notice, while a real prompt still hands over mail. OpenCode/Pi retain native-stream delivery and null wake-hold after typed edits. Untouched Devin retains its existing turn-end route and cannot-type explanation. The deliberately waiter-less Claude fixture must remain waiter-less after Q35-25. Desktop cards render synthetic snapshot reasons without possible-draft remedies; this display control passes before the switch and does not prove daemon production of the reasons.
+- **Agent:** native synthetic Claude, its doorbell turned off with `DOT_AGENT_DECK_DOORBELL_CLAUDE=0` (since PRD #1666 part 3's `gaterm` unit every Claude Code release has a verified editor probe, so no release leaves Claude's box unchecked), and Codex without editor-probe or head-echo assumptions; synthetic native components in the route controls; no real agent or credential.
+- **Asserts:** the daemon's hold and attached TUI name cannot-type for the turned-off Claude without a waiter and for Codex's prompt route; a further clear permits neither probe nor notice, while a real prompt still hands over mail. OpenCode/Pi retain native-stream delivery and null wake-hold after typed edits. Untouched Devin retains its existing turn-end route and cannot-type explanation. The deliberately waiter-less Claude fixture must remain waiter-less after Q35-25. Desktop cards render synthetic snapshot reasons without possible-draft remedies; this display control passes before the switch and does not prove daemon production of the reasons.
 - **Does not assert:** an activated observer, launcher binding, a native desktop window, or a real agent.
 - **Platform coverage:** Linux (Claude/Codex daemon/TUI); mac+linux (OpenCode/Pi/Devin controls); desktop vitest.
 

@@ -662,24 +662,30 @@ fn probe_032_native_query_hazard_projects_cannot_check_on_the_card() {
     assert!(mail_turns(&f, &id).is_empty());
 }
 
-/// Scenario: Without an editor-probe assumption, type and delete text in a measured Claude composer and queue mail. The daemon and attached TUI must show needs-fetch, and further clearing must not authorize a check or a notice before a prompt fetches the message.
+/// Scenario: In a deck whose Claude Code doorbell is turned off (`DOT_AGENT_DECK_DOORBELL_CLAUDE=0`), so the Claude composer gets no helper and no check, type and delete text in it and queue mail. The daemon and attached TUI must show the cannot-type hold, and further clearing must not authorize a check or a notice before a prompt fetches the message.
 #[spec("inbox/probe/037")]
 #[test]
-fn probe_037_absent_claude_holds_with_needs_fetch_until_a_prompt() {
+fn probe_037_turned_off_claude_holds_with_cannot_type_until_a_prompt() {
     // Deliberately waiter-less, including after Q35-25 installs the native
     // waiter: this control's no-waiter precondition must remain explicit.
-    absent("claude", "needs_fetch");
+    absent(
+        "claude",
+        &[(dot_agent_deck::doorbell_switch::CLAUDE_ENV, "0")],
+        "cannot_type",
+    );
 }
 
 /// Scenario: Without an editor-probe or head-echo assumption, type and delete text in a measured Codex composer and queue mail. The daemon and attached TUI must retain the turn-end/prompt route's cannot-type explanation, with no check or notice; an actual user prompt can still fetch the message.
 #[spec("inbox/probe/037")]
 #[test]
 fn probe_037_absent_codex_holds_with_its_prompt_route_reason() {
-    absent("codex", "cannot_type");
+    absent("codex", &[], "cannot_type");
 }
 
-fn absent(kind: &'static str, reason: &str) {
-    let f = Fixture::absent(kind, &[("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "100")]);
+fn absent(kind: &'static str, extra: &[(&str, &str)], reason: &str) {
+    let mut env = vec![("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "100")];
+    env.extend_from_slice(extra);
+    let f = Fixture::absent(kind, &env);
     f.hook_event("session_start");
     f.hook_event("idle");
     let tui = attached(&f);
