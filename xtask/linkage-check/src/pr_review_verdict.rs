@@ -1265,9 +1265,17 @@ fn the_rubric_forbids_fetching_a_withheld_artefact_by_another_route() {
             ".github/pr-review-rubric.md",
             "An artefact is withheld when the issue-comments, reviews or review-comments list for this pull request does not return it",
         ),
+        // The sanctioned reads, pinned through the closing period so that a
+        // fourth read added to the list turns this red. `gh pr view --json
+        // comments` was on this list once and is GraphQL, which returned the
+        // withheld comment on #1606 (run 37691901791).
         (
             ".github/pr-review-rubric.md",
-            "The pull request's timeline (`issues/<n>/timeline`), a read by id, a search, a repository-wide comments list, GraphQL or any other route that returns a withheld artefact is the withheld case, not permission",
+            "You read an independent review through these three reads and no others (on any pull request): `gh api repos/<repo>/issues/<n>/comments`, `gh api repos/<repo>/pulls/<n>/reviews` and `gh api repos/<repo>/pulls/<n>/comments`.",
+        ),
+        (
+            ".github/pr-review-rubric.md",
+            "The pull request's web page (WebFetch or any other fetch of github.com), its timeline (`issues/<n>/timeline`), `gh pr view --json comments`, `gh pr view --json reviews`, `gh pr view --comments` or any other GraphQL query, a read by id, a search, a repository-wide comments list or any other route that returns a withheld artefact is the withheld case, not permission",
         ),
         (
             ".github/pr-review-rubric.md",
@@ -1279,12 +1287,39 @@ fn the_rubric_forbids_fetching_a_withheld_artefact_by_another_route() {
         ),
         (
             ".github/workflows/pr-review.md",
-            "do not reach for it through the pull request's timeline, by its id, by its URL or by any other route",
+            "(the three reads the rubric's priority 1 names) do not return it",
+        ),
+        (
+            ".github/workflows/pr-review.md",
+            "do not reach for it through `gh pr view --json comments` or `gh pr view --json reviews`, the pull request's timeline or its web page, by its id, by its URL or by any other route",
         ),
     ] {
         assert!(
             flat(rel).contains(sentence),
             "{rel} no longer says {sentence:?}; issue #1847's no-fetch rule is gone from the reviewer's instructions"
+        );
+    }
+    // The count went from four to three when the GraphQL read left the list;
+    // a stale "four reads" anywhere would contradict the list it describes.
+    for rel in [
+        ".github/pr-review-rubric.md",
+        ".github/workflows/pr-review.md",
+        "docs/develop/governance.md",
+    ] {
+        assert!(
+            !flat(rel).contains("four reads"),
+            "{rel} still says \"four reads\"; the sanctioned reads are the three REST lists"
+        );
+    }
+    // Pinning the list's sentence does not stop the GraphQL read coming back
+    // as a sanctioned read in a sentence of its own.
+    for rel in [
+        ".github/pr-review-rubric.md",
+        ".github/workflows/pr-review.md",
+    ] {
+        assert!(
+            !flat(rel).contains("--json comments,reviews"),
+            "{rel} names `gh pr view --json comments,reviews` again; it is GraphQL and returned #1606's withheld comment"
         );
     }
 }
