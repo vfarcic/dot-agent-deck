@@ -1,0 +1,639 @@
+{
+ "cell": "armed-timeout",
+ "release": "0.164.0",
+ "sha256": "b93f6811d3f653f0fb83be4050d857fb9abbb111dfa2ce160563327daff7f306",
+ "error": null,
+ "codex_pid": 1098689,
+ "trials": [
+  {
+   "trial": 1,
+   "draft": "M59_DRAFT_1",
+   "editor_rc_planned": 0,
+   "sent_t": 3599233762245916,
+   "helper_pid": 1098857,
+   "helper_parent_is_codex": true,
+   "helper_seen_t": 3599233838157766,
+   "helper_gone_t": 3599237306937695,
+   "zombie_status": null,
+   "trace": [
+    {
+     "t": 3599233789043099,
+     "event": "start"
+    },
+    {
+     "t": 3599233791351553,
+     "event": "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }"
+    },
+    {
+     "t": 3599233792058218,
+     "event": "poll 4 2000"
+    },
+    {
+     "t": 3599233792101816,
+     "event": "polled 1"
+    },
+    {
+     "t": 3599233792148692,
+     "event": "send 53"
+    },
+    {
+     "t": 3599233792182957,
+     "event": "sent 53"
+    },
+    {
+     "t": 3599233792214331,
+     "event": "poll 1 2000"
+    },
+    {
+     "t": 3599235794374471,
+     "event": "polled 0"
+    },
+    {
+     "t": 3599235794545298,
+     "event": "armed None ArmedExit { notice: true, status: 1 }"
+    }
+   ],
+   "helper_life_from_start_s": 3.517894596,
+   "helper_life_from_branch_s": 3.515586142,
+   "helper_life_from_ctrl_g_s": 3.544691779,
+   "editor": [],
+   "notice_in_output": true,
+   "codex_error_line": "■ Failed to open editor: editor exited with status exit status: 1",
+   "codex_error_after_end": true,
+   "sent_off": 9661,
+   "end_off": 11917,
+   "done_off": 14184,
+   "composer_after": "M59_DRAFT_1"
+  },
+  {
+   "trial": 2,
+   "draft": "M59_DRAFT_2",
+   "editor_rc_planned": 0,
+   "sent_t": 3599240306464655,
+   "helper_pid": 1098899,
+   "helper_parent_is_codex": true,
+   "helper_seen_t": 3599240382997309,
+   "helper_gone_t": 3599243854669012,
+   "zombie_status": null,
+   "trace": [
+    {
+     "t": 3599240333086565,
+     "event": "start"
+    },
+    {
+     "t": 3599240335332730,
+     "event": "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }"
+    },
+    {
+     "t": 3599240336067467,
+     "event": "poll 4 2000"
+    },
+    {
+     "t": 3599240336111171,
+     "event": "polled 1"
+    },
+    {
+     "t": 3599240336162059,
+     "event": "send 53"
+    },
+    {
+     "t": 3599240336195036,
+     "event": "sent 53"
+    },
+    {
+     "t": 3599240336219465,
+     "event": "poll 1 2000"
+    },
+    {
+     "t": 3599242338912002,
+     "event": "polled 0"
+    },
+    {
+     "t": 3599242339035321,
+     "event": "armed None ArmedExit { notice: true, status: 1 }"
+    }
+   ],
+   "helper_life_from_start_s": 3.521582447,
+   "helper_life_from_branch_s": 3.519336282,
+   "helper_life_from_ctrl_g_s": 3.548204357,
+   "editor": [],
+   "notice_in_output": true,
+   "codex_error_line": "■ Failed to open editor: editor exited with status exit status: 1",
+   "codex_error_after_end": true,
+   "sent_off": 15147,
+   "end_off": 17506,
+   "done_off": 19752,
+   "composer_after": "M59_DRAFT_2"
+  },
+  {
+   "trial": 3,
+   "draft": "M59_DRAFT_3",
+   "editor_rc_planned": 0,
+   "sent_t": 3599246862616373,
+   "helper_pid": 1098970,
+   "helper_parent_is_codex": true,
+   "helper_seen_t": 3599246937212080,
+   "helper_gone_t": 3599250406648685,
+   "zombie_status": {
+    "code": 1,
+    "signal": null,
+    "raw": 256
+   },
+   "trace": [
+    {
+     "t": 3599246885887841,
+     "event": "start"
+    },
+    {
+     "t": 3599246888257365,
+     "event": "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }"
+    },
+    {
+     "t": 3599246888976363,
+     "event": "poll 4 2000"
+    },
+    {
+     "t": 3599246889039713,
+     "event": "polled 1"
+    },
+    {
+     "t": 3599246889073915,
+     "event": "send 53"
+    },
+    {
+     "t": 3599246889114602,
+     "event": "sent 53"
+    },
+    {
+     "t": 3599246889161553,
+     "event": "poll 1 2000"
+    },
+    {
+     "t": 3599248891328334,
+     "event": "polled 0"
+    },
+    {
+     "t": 3599248891460804,
+     "event": "armed None ArmedExit { notice: true, status: 1 }"
+    }
+   ],
+   "helper_life_from_start_s": 3.520760844,
+   "helper_life_from_branch_s": 3.51839132,
+   "helper_life_from_ctrl_g_s": 3.544032312,
+   "editor": [],
+   "notice_in_output": true,
+   "codex_error_line": "■ Failed to open editor: editor exited with status exit status: 1",
+   "codex_error_after_end": true,
+   "sent_off": 20715,
+   "end_off": 23215,
+   "done_off": 25494,
+   "composer_after": "M59_DRAFT_3"
+  },
+  {
+   "trial": 4,
+   "draft": "M59_DRAFT_4",
+   "editor_rc_planned": 0,
+   "sent_t": 3599253416642347,
+   "helper_pid": 1099011,
+   "helper_parent_is_codex": true,
+   "helper_seen_t": 3599253498117421,
+   "helper_gone_t": 3599256956661472,
+   "zombie_status": null,
+   "trace": [
+    {
+     "t": 3599253439497013,
+     "event": "start"
+    },
+    {
+     "t": 3599253441187548,
+     "event": "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }"
+    },
+    {
+     "t": 3599253441832258,
+     "event": "poll 4 2000"
+    },
+    {
+     "t": 3599253441862117,
+     "event": "polled 1"
+    },
+    {
+     "t": 3599253441885547,
+     "event": "send 53"
+    },
+    {
+     "t": 3599253441916016,
+     "event": "sent 53"
+    },
+    {
+     "t": 3599253441939620,
+     "event": "poll 1 2000"
+    },
+    {
+     "t": 3599255444131325,
+     "event": "polled 0"
+    },
+    {
+     "t": 3599255444349584,
+     "event": "armed None ArmedExit { notice: true, status: 1 }"
+    }
+   ],
+   "helper_life_from_start_s": 3.517164459,
+   "helper_life_from_branch_s": 3.515473924,
+   "helper_life_from_ctrl_g_s": 3.540019125,
+   "editor": [],
+   "notice_in_output": true,
+   "codex_error_line": "■ Failed to open editor: editor exited with status exit status: 1",
+   "codex_error_after_end": true,
+   "sent_off": 26457,
+   "end_off": 28990,
+   "done_off": 31410,
+   "composer_after": "M59_DRAFT_4"
+  },
+  {
+   "trial": 5,
+   "draft": "M59_DRAFT_5",
+   "editor_rc_planned": 0,
+   "sent_t": 3599259960130731,
+   "helper_pid": 1099076,
+   "helper_parent_is_codex": true,
+   "helper_seen_t": 3599260037497038,
+   "helper_gone_t": 3599263508475432,
+   "zombie_status": {
+    "code": 1,
+    "signal": null,
+    "raw": 256
+   },
+   "trace": [
+    {
+     "t": 3599259986669620,
+     "event": "start"
+    },
+    {
+     "t": 3599259988970274,
+     "event": "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }"
+    },
+    {
+     "t": 3599259989820098,
+     "event": "poll 4 2000"
+    },
+    {
+     "t": 3599259989860357,
+     "event": "polled 1"
+    },
+    {
+     "t": 3599259989889886,
+     "event": "send 53"
+    },
+    {
+     "t": 3599259989921043,
+     "event": "sent 53"
+    },
+    {
+     "t": 3599259989951360,
+     "event": "poll 1 2000"
+    },
+    {
+     "t": 3599261992117847,
+     "event": "polled 0"
+    },
+    {
+     "t": 3599261992311836,
+     "event": "armed None ArmedExit { notice: true, status: 1 }"
+    }
+   ],
+   "helper_life_from_start_s": 3.521805812,
+   "helper_life_from_branch_s": 3.519505158,
+   "helper_life_from_ctrl_g_s": 3.548344701,
+   "editor": [],
+   "notice_in_output": true,
+   "codex_error_line": "■ Failed to open editor: editor exited with status exit status: 1",
+   "codex_error_after_end": true,
+   "sent_off": 32373,
+   "end_off": 35131,
+   "done_off": 37500,
+   "composer_after": "M59_DRAFT_5"
+  },
+  {
+   "trial": 6,
+   "draft": "M59_DRAFT_6",
+   "editor_rc_planned": 0,
+   "sent_t": 3599266517121702,
+   "helper_pid": 1099116,
+   "helper_parent_is_codex": true,
+   "helper_seen_t": 3599266592772422,
+   "helper_gone_t": 3599270063651406,
+   "zombie_status": null,
+   "trace": [
+    {
+     "t": 3599266542275101,
+     "event": "start"
+    },
+    {
+     "t": 3599266544605661,
+     "event": "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }"
+    },
+    {
+     "t": 3599266545375113,
+     "event": "poll 4 2000"
+    },
+    {
+     "t": 3599266545423291,
+     "event": "polled 1"
+    },
+    {
+     "t": 3599266545461189,
+     "event": "send 53"
+    },
+    {
+     "t": 3599266545501344,
+     "event": "sent 53"
+    },
+    {
+     "t": 3599266545531050,
+     "event": "poll 1 2000"
+    },
+    {
+     "t": 3599268548055341,
+     "event": "polled 0"
+    },
+    {
+     "t": 3599268548193757,
+     "event": "armed None ArmedExit { notice: true, status: 1 }"
+    }
+   ],
+   "helper_life_from_start_s": 3.521376305,
+   "helper_life_from_branch_s": 3.519045745,
+   "helper_life_from_ctrl_g_s": 3.546529704,
+   "editor": [],
+   "notice_in_output": true,
+   "codex_error_line": "■ Failed to open editor: editor exited with status exit status: 1",
+   "codex_error_after_end": true,
+   "sent_off": 38463,
+   "end_off": 41279,
+   "done_off": 43764,
+   "composer_after": "M59_DRAFT_6"
+  },
+  {
+   "trial": 7,
+   "draft": "M59_DRAFT_7",
+   "editor_rc_planned": 0,
+   "sent_t": 3599273067528769,
+   "helper_pid": 1099155,
+   "helper_parent_is_codex": true,
+   "helper_seen_t": 3599273145204155,
+   "helper_gone_t": 3599276613143709,
+   "zombie_status": {
+    "code": 1,
+    "signal": null,
+    "raw": 256
+   },
+   "trace": [
+    {
+     "t": 3599273092789201,
+     "event": "start"
+    },
+    {
+     "t": 3599273095152707,
+     "event": "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }"
+    },
+    {
+     "t": 3599273096082644,
+     "event": "poll 4 2000"
+    },
+    {
+     "t": 3599273096134737,
+     "event": "polled 1"
+    },
+    {
+     "t": 3599273096199354,
+     "event": "send 53"
+    },
+    {
+     "t": 3599273096241467,
+     "event": "sent 53"
+    },
+    {
+     "t": 3599273096281469,
+     "event": "poll 1 2000"
+    },
+    {
+     "t": 3599275098502896,
+     "event": "polled 0"
+    },
+    {
+     "t": 3599275098711134,
+     "event": "armed None ArmedExit { notice: true, status: 1 }"
+    }
+   ],
+   "helper_life_from_start_s": 3.520354508,
+   "helper_life_from_branch_s": 3.517991002,
+   "helper_life_from_ctrl_g_s": 3.54561494,
+   "editor": [],
+   "notice_in_output": true,
+   "codex_error_line": "■ Failed to open editor: editor exited with status exit status: 1",
+   "codex_error_after_end": true,
+   "sent_off": 44727,
+   "end_off": 47621,
+   "done_off": 50202,
+   "composer_after": "M59_DRAFT_7"
+  },
+  {
+   "trial": 8,
+   "draft": "M59_DRAFT_8",
+   "editor_rc_planned": 0,
+   "sent_t": 3599279620440709,
+   "helper_pid": 1099239,
+   "helper_parent_is_codex": true,
+   "helper_seen_t": 3599279692821727,
+   "helper_gone_t": 3599283162815645,
+   "zombie_status": {
+    "code": 1,
+    "signal": null,
+    "raw": 256
+   },
+   "trace": [
+    {
+     "t": 3599279643856179,
+     "event": "start"
+    },
+    {
+     "t": 3599279646249598,
+     "event": "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }"
+    },
+    {
+     "t": 3599279647718611,
+     "event": "poll 4 2000"
+    },
+    {
+     "t": 3599279647778764,
+     "event": "polled 1"
+    },
+    {
+     "t": 3599279647820662,
+     "event": "send 53"
+    },
+    {
+     "t": 3599279647867994,
+     "event": "sent 53"
+    },
+    {
+     "t": 3599279647911068,
+     "event": "poll 1 2000"
+    },
+    {
+     "t": 3599281649093629,
+     "event": "polled 0"
+    },
+    {
+     "t": 3599281649258925,
+     "event": "armed None ArmedExit { notice: true, status: 1 }"
+    }
+   ],
+   "helper_life_from_start_s": 3.518959466,
+   "helper_life_from_branch_s": 3.516566047,
+   "helper_life_from_ctrl_g_s": 3.542374936,
+   "editor": [],
+   "notice_in_output": true,
+   "codex_error_line": "■ Failed to open editor: editor exited with status exit status: 1",
+   "codex_error_after_end": true,
+   "sent_off": 51165,
+   "end_off": 54046,
+   "done_off": 56814,
+   "composer_after": "M59_DRAFT_8"
+  },
+  {
+   "trial": 9,
+   "draft": "M59_DRAFT_9",
+   "editor_rc_planned": 0,
+   "sent_t": 3599286164900477,
+   "helper_pid": 1099420,
+   "helper_parent_is_codex": true,
+   "helper_seen_t": 3599286235600372,
+   "helper_gone_t": 3599289706121881,
+   "zombie_status": {
+    "code": 1,
+    "signal": null,
+    "raw": 256
+   },
+   "trace": [
+    {
+     "t": 3599286187744571,
+     "event": "start"
+    },
+    {
+     "t": 3599286189902606,
+     "event": "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }"
+    },
+    {
+     "t": 3599286190672984,
+     "event": "poll 4 2000"
+    },
+    {
+     "t": 3599286190701574,
+     "event": "polled 1"
+    },
+    {
+     "t": 3599286190728704,
+     "event": "send 53"
+    },
+    {
+     "t": 3599286190772685,
+     "event": "sent 53"
+    },
+    {
+     "t": 3599286190799938,
+     "event": "poll 1 2000"
+    },
+    {
+     "t": 3599288193129709,
+     "event": "polled 0"
+    },
+    {
+     "t": 3599288193370054,
+     "event": "armed None ArmedExit { notice: true, status: 1 }"
+    }
+   ],
+   "helper_life_from_start_s": 3.51837731,
+   "helper_life_from_branch_s": 3.516219275,
+   "helper_life_from_ctrl_g_s": 3.541221404,
+   "editor": [],
+   "notice_in_output": true,
+   "codex_error_line": "■ Failed to open editor: editor exited with status exit status: 1",
+   "codex_error_after_end": true,
+   "sent_off": 57821,
+   "end_off": 60789,
+   "done_off": 63688,
+   "composer_after": "M59_DRAFT_9"
+  },
+  {
+   "trial": 10,
+   "draft": "M59_DRAFT_10",
+   "editor_rc_planned": 0,
+   "sent_t": 3599292715130767,
+   "helper_pid": 1099490,
+   "helper_parent_is_codex": true,
+   "helper_seen_t": 3599292789811086,
+   "helper_gone_t": 3599296262972895,
+   "zombie_status": null,
+   "trace": [
+    {
+     "t": 3599292742832434,
+     "event": "start"
+    },
+    {
+     "t": 3599292745477686,
+     "event": "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }"
+    },
+    {
+     "t": 3599292746457659,
+     "event": "poll 4 2000"
+    },
+    {
+     "t": 3599292746500606,
+     "event": "polled 1"
+    },
+    {
+     "t": 3599292746540224,
+     "event": "send 53"
+    },
+    {
+     "t": 3599292746578975,
+     "event": "sent 53"
+    },
+    {
+     "t": 3599292746617383,
+     "event": "poll 1 2000"
+    },
+    {
+     "t": 3599294748807674,
+     "event": "polled 0"
+    },
+    {
+     "t": 3599294748968176,
+     "event": "armed None ArmedExit { notice: true, status: 1 }"
+    }
+   ],
+   "helper_life_from_start_s": 3.520140461,
+   "helper_life_from_branch_s": 3.517495209,
+   "helper_life_from_ctrl_g_s": 3.547842128,
+   "editor": [],
+   "notice_in_output": true,
+   "codex_error_line": "■ Failed to open editor: editor exited with status exit status: 1",
+   "codex_error_after_end": true,
+   "sent_off": 64652,
+   "end_off": 67692,
+   "done_off": 70651,
+   "composer_after": "M59_DRAFT_10"
+  }
+ ],
+ "env_names": [
+  "COLORTERM",
+  "HOME",
+  "LANG",
+  "PATH",
+  "PWD",
+  "TERM"
+ ],
+ "recorder_sha256": "49ccaf030dd113d37e8f2f405f6266422a85fd5b87ee619ffd1bc23a899f507e",
+ "editor_recorder_sha256": "1bb22be75acc1823a61dd808202a7dea6609ac44b40f5828d01a97024136fd81"
+}

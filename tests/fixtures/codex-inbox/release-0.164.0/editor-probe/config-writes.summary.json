@@ -1,0 +1,80 @@
+{
+ "release": "0.164.0",
+ "sha256": "b93f6811d3f653f0fb83be4050d857fb9abbb111dfa2ce160563327daff7f306",
+ "mode": "config-writes",
+ "error": null,
+ "size": [
+  50,
+  200
+ ],
+ "term": "xterm-256color",
+ "colorterm": "truecolor",
+ "env_names": [
+  "COLORTERM",
+  "HOME",
+  "LANG",
+  "PATH",
+  "PWD",
+  "TERM"
+ ],
+ "setup": "nollm: dummy key, loopback Responses server, bwrap --unshare-net, tmpfs /home /root /tmp /run/user",
+ "recorder_sha256": "9c1174ae9c58e0e03455e6cb90d7e6b23159a86c0da2076bbfc87d775721aceb",
+ "rows": [
+  {
+   "cell": "config-writes",
+   "launch": 1,
+   "changed_by_ready": false,
+   "changed_after_ready": true,
+   "mtime_after_ready_ms": 1800.329825,
+   "diff": "--- before\n+++ after\n@@ -15,0 +16,6 @@\n+[tui]\n+screen_reader_detection_done = true\n+\n+[tui.model_availability_nux]\n+\"gpt-6.1-sol\" = 1\n+\n"
+  },
+  {
+   "cell": "config-writes",
+   "launch": 2,
+   "changed_by_ready": false,
+   "changed_after_ready": true,
+   "mtime_after_ready_ms": 544.543645,
+   "diff": "--- before\n+++ after\n@@ -20 +20 @@\n-\"gpt-6.1-sol\" = 1\n+\"gpt-6.1-sol\" = 2\n"
+  },
+  {
+   "cell": "config-writes",
+   "launch": 3,
+   "changed_by_ready": false,
+   "changed_after_ready": true,
+   "mtime_after_ready_ms": 760.008776,
+   "diff": "--- before\n+++ after\n@@ -20 +20 @@\n-\"gpt-6.1-sol\" = 2\n+\"gpt-6.1-sol\" = 3\n"
+  },
+  {
+   "cell": "config-writes",
+   "launch": 4,
+   "changed_by_ready": false,
+   "changed_after_ready": true,
+   "mtime_after_ready_ms": 683.917062,
+   "diff": "--- before\n+++ after\n@@ -20 +20 @@\n-\"gpt-6.1-sol\" = 3\n+\"gpt-6.1-sol\" = 4\n"
+  },
+  {
+   "cell": "config-writes",
+   "launch": 5,
+   "changed_by_ready": false,
+   "changed_after_ready": false,
+   "mtime_after_ready_ms": null,
+   "diff": ""
+  },
+  {
+   "cell": "config-writes",
+   "launch": 6,
+   "changed_by_ready": false,
+   "changed_after_ready": false,
+   "mtime_after_ready_ms": null,
+   "diff": ""
+  },
+  {
+   "cell": "config-writes",
+   "launch": 7,
+   "changed_by_ready": false,
+   "changed_after_ready": false,
+   "mtime_after_ready_ms": null,
+   "diff": ""
+  }
+ ]
+}
