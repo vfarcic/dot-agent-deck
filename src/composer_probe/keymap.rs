@@ -44,10 +44,12 @@
 //! project files for the pane's cwd, and each `-c key=value`. The deck reads
 //! them before the spawn ([`CodexBaseline`]) and again at each check, each
 //! read compared with the last one accepted ([`CodexReads`]); any difference
-//! holds, except a rewrite of `config.toml` that changes only Codex's own
-//! start-up bookkeeping ([`CODEX_BOOKKEEPING`], [`codex_unchanged`]), and so
-//! does a bound agent that launched with other sources than the spawn's
-//! (the deck wrapper's own `-c` pair left out, [`CodexBaseline::bound`]). For the project files
+//! holds, except a rewrite of `config.toml` that only steps Codex's own
+//! start-up bookkeeping forward ([`CODEX_BOOKKEEPING`], [`codex_unchanged`]),
+//! and a comparison that holds as changed holds the rest of the generation,
+//! as Claude's does. A bound agent that launched with other sources than the spawn's
+//! holds too (the deck wrapper's own `-c` pair left out,
+//! [`CodexBaseline::bound`]). For the project files
 //! the deck reads every `.codex/config.toml` Codex's root and trust rules
 //! could pick ([`codex_project_files`]) and holds when one of them has a
 //! keymap ([`codex_projects_guard`]). Otherwise the sources are merged in the
@@ -650,9 +652,11 @@ pub fn codex_unchanged(before: &CodexRead, after: &CodexRead) -> Result<(), Hold
 /// once per home), and the startup tooltip's shown counts, a table of
 /// model slug to count (`tui/src/app/startup_prompts.rs`, raised on each of
 /// a home's first starts up to `MODEL_AVAILABILITY_NUX_MAX_SHOW_COUNT`, 4).
-/// In both pinned releases (`rust-v0.160.0`, `rust-v0.164.0`) neither has a
-/// reader outside that probe, that tooltip and the settings structs that
-/// carry them: nothing in the key handling or the keymap reads them.
+/// A `git grep` for either name in both pinned trees (`rust-v0.160.0`
+/// `a956835`, `rust-v0.164.0` `6aaac69`; checkouts outside this repository,
+/// not vendored here) found it only in the settings structs and the config
+/// schema, the config editor, that probe, that tooltip, a sample binary and
+/// tests: no hit in the keymap or the key-handling code.
 pub const CODEX_BOOKKEEPING: [&str; 2] = ["screen_reader_detection_done", "model_availability_nux"];
 
 /// The highest tooltip count Codex writes: it raises a model's count only

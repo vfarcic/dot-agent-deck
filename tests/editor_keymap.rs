@@ -1427,7 +1427,7 @@ fn probe_014_a_codex_generation_compares_with_its_last_accepted_read() {
     assert_eq!(reads.check(CODEX_ORDER), Ok(()), "not seen");
 }
 
-/// Scenario: Follow one Codex generation's checks while the user edits `config.toml` to move Ctrl+G, Codex's own start-up write then raises its tooltip count over the edit, and the user undoes the edit in a file that keeps Codex's new count. The edit holds as changed, Codex's write over it holds, and the undo, whose bookkeeping differs from the last accepted read while everything else matches it, still holds as changed, as does every later check of the generation: the first hold latches. A new generation on the restored file allows the probe.
+/// Scenario: Follow one Codex generation's checks while the user edits `config.toml` to move Ctrl+G, Codex's own start-up write then raises its tooltip count over the edit, and the user undoes the edit in a file that keeps Codex's new count. The edit holds as changed, Codex's write over it holds, and the undo, whose bookkeeping differs from the last accepted read while everything else matches it, still holds as changed, as does every later check of the generation: the first comparison that holds latches. A new generation on the restored file allows the probe.
 #[spec("inbox/probe/014")]
 #[test]
 fn probe_014_a_held_codex_generation_stays_held() {
