@@ -8,6 +8,7 @@ What to know:
 
 - After `/cd`, `/worktree` or `/resume` moves Codex into another project, close its pane and start Codex again before you rely on the doorbell: until then the deck checks with the first project's key settings, and if the new project gives `Ctrl+G` another action, the deck's check does that action instead.
 - A launcher that passes Codex its own `-c` options or a profile, a change to Codex's settings files while it runs, and a project whose `.codex/config.toml` sets key bindings leave the deck unable to check the box; the card then says `the deck can't check this agent's input box. Check its pane.` and a prompt hands the agent its messages.
+- When Codex's home (`~/.codex` or `CODEX_HOME`) is inside a folder Codex may write to, such as the project it works in or `/tmp`, the deck can't check the box: Codex shows `Failed to open editor` once for the deck's check and the card keeps saying `there may be an unsent draft`. Keep Codex's home outside the folders Codex works in.
 - Codex writes a few lines into its `config.toml` on its first starts in a new Codex home. The deck expects that; there is nothing to configure.
 - Codex started through `sh -c`, or on macOS, isn't checked: once you type into its pane, its messages wait until it restarts, as before. `dot-agent-deck config set doorbell.codex false` turns both the doorbell and the check off for Codex.
 - Every Codex start writes a `doorbell off … unknown_release` line to the deck log before the deck has read Codex's version; that line is normal.
