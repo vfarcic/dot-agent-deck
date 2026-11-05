@@ -118,7 +118,7 @@ fn probe_092_live_codex_164_ctrl_g_just_after_start() {
     eprintln!("STARTUP latest miss {last_miss:.2} s, earliest open {first_open:.2} s after ready");
 }
 
-/// Scenario: Launch the pinned Codex 0.164.0 seven times on one fresh `CODEX_HOME`, each left 8 s past its first ready composer: the first four each rewrite its `config.toml` after that composer, and the rest leave it as it was.
+/// Scenario: Launch the pinned Codex 0.164.0 seven times on one fresh `CODEX_HOME`, each left 8 s past its first ready composer: the first four each rewrite its `config.toml` (the second to fourth after that composer), and the rest leave it as it was.
 #[spec("inbox/probe/092")]
 #[test]
 fn probe_092_live_codex_164_config_writes_at_start() {

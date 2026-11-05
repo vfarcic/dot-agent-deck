@@ -42,7 +42,7 @@ fn probe_092_codex_164_ignores_ctrl_g_just_after_start() {
     );
 }
 
-/// Scenario: Read seven committed Codex 0.164.0 launches on one `CODEX_HOME`, each left 8 s past its first ready composer: the first four each rewrite Codex's own `config.toml` after that composer (the first adds `screen_reader_detection_done` and a model-availability notice count of 1, the next three raise it to 4), and the fifth to seventh leave it as it was.
+/// Scenario: Read seven committed Codex 0.164.0 launches on one `CODEX_HOME`, each left 8 s past its first ready composer: the first four each rewrite Codex's own `config.toml` (the first adds `screen_reader_detection_done` and a model-availability notice count of 1, the next three raise it to 4, each after its first ready composer), and the fifth to seventh leave it as it was.
 #[spec("inbox/probe/092")]
 #[test]
 fn probe_092_codex_164_rewrites_its_config_on_its_first_four_starts() {

@@ -855,11 +855,6 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 filter = 'test(/^probe_095_live_codex_164_/)'
 slow-timeout = { period = "60s", terminate-after = 6 }
 
-# The Codex twin of the A-20d-7 screen-freshness measurement, the same plan
-# as Claude's above.
-[[profile.default.overrides]]
-filter = 'test(probe_083_codex_164_idle_screen_freshness_refusal_rate)'
-slow-timeout = { period = "60s", terminate-after = 14 }
 
 # PRD #1666 part 3, Codex Go: Codex 0.164.0's `head_echo`
 # (`tests/e2e_codex_release_measure.rs`, lane 2). Each run is one harness deck

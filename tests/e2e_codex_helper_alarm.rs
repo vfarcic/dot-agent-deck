@@ -98,7 +98,7 @@ fn m59(cell: &str, armed: bool) -> Option<(PathBuf, Value)> {
     let socket = private.path().join("hook.sock");
     let _listener = UnixListener::bind(&socket).unwrap();
     let manifest = env!("CARGO_MANIFEST_DIR");
-    let mut recorder = std::process::Command::new("/usr/bin/python3")
+    let recorder = std::process::Command::new("/usr/bin/python3")
         .arg("-I")
         .arg(format!(
             "{manifest}/tests/support/codex_helper_alarm_measure.py"
@@ -115,14 +115,14 @@ fn m59(cell: &str, armed: bool) -> Option<(PathBuf, Value)> {
         .stdout(std::process::Stdio::null())
         .spawn()
         .unwrap();
+    let recorder = std::cell::RefCell::new(recorder);
+    let ended = || recorder.borrow_mut().try_wait().unwrap();
     let out = root.join("capture");
-    let started = std::cell::RefCell::new(&mut recorder);
     assert!(
         common::wait_until(Duration::from_secs(60), || out.join("codex.pid").exists()
-            || started.borrow_mut().try_wait().unwrap().is_some()),
+            || ended().is_some()),
         "the recorder did not start Codex"
     );
-    drop(started);
     let pid: u32 = std::fs::read_to_string(out.join("codex.pid"))
         .unwrap_or_else(|_| panic!("the recorder ended early: {}", root.display()))
         .trim()
@@ -132,12 +132,16 @@ fn m59(cell: &str, armed: bool) -> Option<(PathBuf, Value)> {
         .write_identity(GENERATION, &identity_of(pid))
         .unwrap();
     std::fs::write(out.join("identity.ok"), b"").unwrap();
-    let status = loop {
-        if let Some(status) = recorder.try_wait().unwrap() {
-            break status;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    };
+    let status = std::cell::RefCell::new(None);
+    assert!(
+        common::wait_until(Duration::from_secs(480), || {
+            *status.borrow_mut() = ended();
+            status.borrow().is_some()
+        }),
+        "the recorder did not finish: {}",
+        root.display()
+    );
+    let status = status.into_inner().unwrap();
     assert!(status.success(), "recorder: {status}; {}", root.display());
     let result: Value =
         serde_json::from_slice(&std::fs::read(out.join("result.json")).unwrap()).unwrap();

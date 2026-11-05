@@ -314,7 +314,7 @@ pub fn check_startup(dir: &Path) -> (f64, f64) {
 /// What Codex 0.164.0 writes to its own `config.toml` as it starts, on one
 /// `CODEX_HOME`: the first launch adds `[tui] screen_reader_detection_done`
 /// and a model-availability notice count, the next three raise the count,
-/// each after the first ready composer, and from the fifth nothing changes.
+/// each after its first ready composer, and from the fifth nothing changes.
 /// Returns each write's delay after the first ready composer, in ms.
 pub fn check_config_writes(dir: &Path) -> Vec<f64> {
     let s = summary(dir, "config-writes");
@@ -324,10 +324,14 @@ pub fn check_config_writes(dir: &Path) -> Vec<f64> {
     for (i, row) in launches.iter().enumerate() {
         let n = i + 1;
         assert_eq!(row["launch"], n as u64);
-        assert_eq!(
-            row["changed_by_ready"], false,
-            "launch {n}: written before the first ready composer"
-        );
+        // The first launch's writes landed after its first ready composer in
+        // one recording and partly before it in another; the later ones after.
+        if n > 1 {
+            assert_eq!(
+                row["changed_by_ready"], false,
+                "launch {n}: written before the first ready composer"
+            );
+        }
         let diff = row["diff"].as_str().unwrap();
         if n <= 4 {
             assert_eq!(row["changed_after_ready"], true, "launch {n}");
