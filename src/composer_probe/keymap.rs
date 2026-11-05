@@ -42,9 +42,14 @@
 //! **Codex** ([`CodexSources`], R6 §9.2, R5 §7.1) reads `$CODEX_HOME/config.toml`,
 //! the selected profile's `$CODEX_HOME/<name>.config.toml`, the trusted
 //! project files for the pane's cwd, and each `-c key=value`. The deck reads
-//! them before the spawn ([`CodexBaseline`]) and again after the first ready
-//! frame; any difference holds the generation, and so does a bound agent
-//! that launched with other sources than the spawn's. For the project files
+//! them before the spawn ([`CodexBaseline`]) and again at each check, each
+//! read compared with the last one accepted ([`CodexReads`]); any difference
+//! holds, except a rewrite of `config.toml` that only steps Codex's own
+//! start-up bookkeeping forward ([`CODEX_BOOKKEEPING`], [`codex_unchanged`]),
+//! and a comparison that holds as changed holds the rest of the generation,
+//! as Claude's does. A bound agent that launched with other sources than the spawn's
+//! holds too (the deck wrapper's own `-c` pair left out,
+//! [`CodexBaseline::bound`]). For the project files
 //! the deck reads every `.codex/config.toml` Codex's root and trust rules
 //! could pick ([`codex_project_files`]) and holds when one of them has a
 //! keymap ([`codex_projects_guard`]). Otherwise the sources are merged in the
@@ -578,9 +583,7 @@ pub fn codex_keymap(
     after: &CodexRead,
     precedence: &[KeymapSource],
 ) -> Result<(), Hold> {
-    if before != after {
-        return Err(Hold::Changed);
-    }
+    codex_unchanged(before, after)?;
     let present = [
         (
             KeymapSource::CodexConfig,
@@ -625,6 +628,144 @@ pub fn codex_keymap(
         }
     }
     codex_bindings(&merged)
+}
+
+/// Whether `after` is the same launch's sources as `before` (CX-10b), else
+/// [`Hold::Changed`]. Every source compares by its whole read (identity
+/// and bytes, [`read_source`]), except that `$CODEX_HOME/config.toml` may
+/// also differ by Codex's own bookkeeping ([`codex_config_unchanged`]).
+pub fn codex_unchanged(before: &CodexRead, after: &CodexRead) -> Result<(), Hold> {
+    if codex_config_unchanged(&before.config, &after.config)
+        && before.profile == after.profile
+        && before.projects == after.projects
+        && before.overrides == after.overrides
+    {
+        Ok(())
+    } else {
+        Err(Hold::Changed)
+    }
+}
+
+/// The keys Codex writes into its own `$CODEX_HOME/config.toml` as it
+/// starts, under `[tui]`, each with the only shape it writes: the one-time
+/// screen-reader probe's marker, a boolean (`tui/src/screen_reader.rs`,
+/// once per home), and the startup tooltip's shown counts, a table of
+/// model slug to count (`tui/src/app/startup_prompts.rs`, raised on each of
+/// a home's first starts up to `MODEL_AVAILABILITY_NUX_MAX_SHOW_COUNT`, 4).
+/// A `git grep` for either name in both pinned trees (`rust-v0.160.0`
+/// `a956835`, `rust-v0.164.0` `6aaac69`; checkouts outside this repository,
+/// not vendored here) found it only in the settings structs and the config
+/// schema, the config editor, that probe, that tooltip, a sample binary and
+/// tests: no hit in the keymap or the key-handling code.
+pub const CODEX_BOOKKEEPING: [&str; 2] = ["screen_reader_detection_done", "model_availability_nux"];
+
+/// The highest tooltip count Codex writes: it raises a model's count only
+/// while it is below `MODEL_AVAILABILITY_NUX_MAX_SHOW_COUNT`, 4, in both
+/// pinned releases (`tui/src/app/startup_prompts.rs`, `rust-v0.160.0` :242,
+/// `rust-v0.164.0` :246), and the cxkey measurement's counts stopped at 4.
+pub const CODEX_NUX_MAX_COUNT: i64 = 4;
+
+/// Whether `config.toml` read as `after` loads what it did as `before`:
+/// the same read, or (cxkey) a rewrite whose only difference is a step
+/// forward in Codex's own bookkeeping ([`CODEX_BOOKKEEPING`],
+/// [`codex_bookkeeping_forward`]). Both are parsed; everything but those
+/// keys, in those shapes, must be equal, so any other key, a bookkeeping
+/// key of another shape, an unreadable or unparsable read, a rewrite that
+/// leaves the bookkeeping as it was (a hand edit undone, a touch) and one
+/// that moves it in a way Codex doesn't all differ. An absent file loads
+/// as an empty one.
+fn codex_config_unchanged(before: &SourceRead, after: &SourceRead) -> bool {
+    if before == after {
+        return true;
+    }
+    match (codex_config_split(before), codex_config_split(after)) {
+        (Some((before, kept_before)), Some((after, kept_after))) => {
+            before == after && codex_bookkeeping_forward(&kept_before, &kept_after)
+        }
+        _ => false,
+    }
+}
+
+/// Whether the bookkeeping `after` is one Codex could have written over
+/// `before` (the revcxkey review's M1), as both pinned releases write it:
+/// the screen-reader marker set to `true` where it was absent or `false`
+/// (`tui/src/screen_reader.rs`, which writes only `true`), and tooltip counts
+/// that each stay or rise by exactly 1 to at most [`CODEX_NUX_MAX_COUNT`],
+/// an absent count reading as 0 (`tui/src/app/startup_prompts.rs`, which
+/// raises one model's count by 1 per start and rewrites the others as they
+/// were), so a new model's count is 1. Something must move, and no key may
+/// go: a marker or a count removed, a marker cleared, a count lowered,
+/// raised by more than 1 or past the maximum, or a new one other than 1 is
+/// not Codex's write.
+fn codex_bookkeeping_forward(before: &toml::Table, after: &toml::Table) -> bool {
+    let marker = |kept: &toml::Table| {
+        kept.get(CODEX_BOOKKEEPING[0])
+            .and_then(toml::Value::as_bool)
+    };
+    let (marker_was, marker_now) = (marker(before), marker(after));
+    let marker_ok = marker_was == marker_now
+        || (matches!(marker_was, None | Some(false)) && marker_now == Some(true));
+    // [`codex_config_split`] keeps a table only when every count is an
+    // integer, so `as_integer` below fails only for a key that isn't kept.
+    let counts = |kept: &toml::Table| {
+        kept.get(CODEX_BOOKKEEPING[1])
+            .and_then(toml::Value::as_table)
+            .cloned()
+    };
+    let (counts_was, counts_now) = (counts(before), counts(after));
+    let table_kept = counts_was.is_none() || counts_now.is_some();
+    let (was, now) = (
+        counts_was.unwrap_or_default(),
+        counts_now.unwrap_or_default(),
+    );
+    let counts_ok = was.keys().all(|model| now.contains_key(model))
+        && now.iter().all(|(model, count)| {
+            let Some(count) = count.as_integer() else {
+                return false;
+            };
+            match was.get(model).map(toml::Value::as_integer) {
+                None => count == 1,
+                Some(Some(prior)) => {
+                    count == prior || (count == prior + 1 && count <= CODEX_NUX_MAX_COUNT)
+                }
+                Some(None) => false,
+            }
+        });
+    let moved = marker_was != marker_now || was != now;
+    marker_ok && table_kept && counts_ok && moved
+}
+
+/// `config.toml` parsed, and the bookkeeping taken out of it: the rest and
+/// the bookkeeping. `None` when it can't be read or parsed.
+fn codex_config_split(read: &SourceRead) -> Option<(toml::Table, toml::Table)> {
+    let mut table: toml::Table = match read {
+        SourceRead::Absent => toml::Table::new(),
+        SourceRead::Present { contents, .. } => std::str::from_utf8(contents).ok()?.parse().ok()?,
+        SourceRead::Unreadable(_) => return None,
+    };
+    let mut kept = toml::Table::new();
+    if let Some(toml::Value::Table(tui)) = table.get_mut("tui") {
+        if matches!(tui.get(CODEX_BOOKKEEPING[0]), Some(toml::Value::Boolean(_))) {
+            kept.insert(
+                CODEX_BOOKKEEPING[0].into(),
+                tui.remove(CODEX_BOOKKEEPING[0])?,
+            );
+        }
+        if let Some(toml::Value::Table(counts)) = tui.get(CODEX_BOOKKEEPING[1])
+            && counts
+                .values()
+                .all(|count| count.as_integer().is_some_and(|n| u32::try_from(n).is_ok()))
+        {
+            kept.insert(
+                CODEX_BOOKKEEPING[1].into(),
+                tui.remove(CODEX_BOOKKEEPING[1])?,
+            );
+        }
+        if tui.is_empty() {
+            table.remove("tui");
+        }
+    }
+    Some((table, kept))
 }
 
 /// Where Codex keeps its home, from the agent's environment `env`:
@@ -756,21 +897,275 @@ impl CodexBaseline {
     /// The baseline against the launch the bound agent actually made, with
     /// `args` in `cwd`: the same sources, or [`Hold::Changed`] (a launcher
     /// that passed other flags, or started Codex in another directory).
+    ///
+    /// The bound launch may also be the baseline's with the deck's telemetry
+    /// shim's own `otel` overrides in front ([`without_shim_otel`], the
+    /// revcxkey review's M3): the baseline reads the deck's launch line,
+    /// which never passes through the shim, so only this side can carry
+    /// them, and they are left out only when what remains is the baseline's
+    /// launch.
     pub fn bound(&self, codex_home: &Path, args: &[OsString], cwd: &Path) -> Result<(), Hold> {
-        if codex_launch(codex_home, args, cwd)? == self.sources {
-            Ok(())
-        } else {
-            Err(Hold::Changed)
+        let args = without_embedded_pair(args);
+        if codex_sources(codex_home, args, cwd)? == self.sources {
+            return Ok(());
+        }
+        match without_shim_otel(args) {
+            Some(rest) if codex_sources(codex_home, rest, cwd)? == self.sources => Ok(()),
+            _ => Err(Hold::Changed),
         }
     }
 }
 
-/// [`CodexSources::from_launch`] with the project files for `cwd`.
+/// A Codex generation's key-binding sources over its life (A-20d-1b,
+/// cxkey): the sources the bound agent launched with, and the last read of
+/// them that was accepted, first the one before the spawn. Each check reads
+/// them again and compares with that last read ([`codex_unchanged`]). An
+/// accepted read becomes the last, so Codex's own bookkeeping write is
+/// accepted once, and a later rewrite that leaves the bookkeeping as it was
+/// (a hand edit undone, which Codex may have reloaded meanwhile) still holds
+/// as changed.
+///
+/// At most [`CODEX_REWRITES_PER_GENERATION`] bookkeeping rewrites are
+/// accepted per generation, each a step forward from the last accepted read
+/// ([`codex_bookkeeping_forward`]); a further one holds.
+///
+/// Reads are numbered as they begin, and only a read newer than the last one
+/// adopted is adopted ([`CodexReads::settle`]), so two checks that read
+/// concurrently and take the lock in the other order can't wind the last
+/// accepted read back.
+///
+/// The first comparison that fails latches (the revcxkey review's H1): it is
+/// returned by that check and every later one of the generation, whatever
+/// they read, as [`ClaudeKeymap::check`] holds. A held read is never adopted.
+/// Without the latch an edit Codex reloaded could be undone after Codex's own
+/// bookkeeping write landed over it, and the undone file, whose bookkeeping
+/// then differs from the last accepted read, would be accepted while Codex
+/// still ran the edit's binding.
+#[derive(Debug)]
+pub struct CodexReads {
+    sources: CodexSources,
+    /// The number the next read takes ([`CodexReads::read`]).
+    next: std::sync::atomic::AtomicU64,
+    state: std::sync::Mutex<CodexReadsState>,
+}
+
+#[derive(Debug)]
+struct CodexReadsState {
+    /// The last read adopted, first the one before the spawn.
+    last: CodexRead,
+    /// `last`'s number; the spawn's read is 0.
+    last_seq: u64,
+    /// The first comparison that failed, returned by every later check.
+    held: Option<Hold>,
+    /// How many bookkeeping rewrites this generation has accepted.
+    rewrites: u8,
+}
+
+/// The most bookkeeping rewrites of `config.toml` one Codex generation
+/// accepts (the revcxkey review's M1): the cxkey measurement saw at most
+/// two per start, the screen-reader marker and one tooltip count on a
+/// home's first start, one count on each of the next three. A further
+/// rewrite holds as changed, which can only refuse more.
+pub const CODEX_REWRITES_PER_GENERATION: u8 = 2;
+
+impl CodexReads {
+    /// A generation's reads from its spawn baseline.
+    pub fn new(baseline: &CodexBaseline) -> CodexReads {
+        CodexReads {
+            sources: baseline.sources.clone(),
+            next: std::sync::atomic::AtomicU64::new(1),
+            state: std::sync::Mutex::new(CodexReadsState {
+                last: baseline.read.clone(),
+                last_seq: 0,
+                held: None,
+                rewrites: 0,
+            }),
+        }
+    }
+
+    /// Reads the sources now and checks them against the last accepted read
+    /// (or the latched hold), the project files ([`codex_projects_guard`])
+    /// and the effective keymap in `precedence` ([`codex_keymap`]):
+    /// [`CodexReads::read`] then [`CodexReads::settle`]. The file I/O comes
+    /// before its own lock, which guards only the comparison: call it with
+    /// no lock held.
+    pub fn check(&self, precedence: &[KeymapSource]) -> Result<(), Hold> {
+        self.settle(self.read(), precedence)
+    }
+
+    /// Reads the sources now, numbered in the order the reads began. File
+    /// I/O: no lock held.
+    pub fn read(&self) -> CodexTicket {
+        // Numbered before the files are read, so a read that began later
+        // carries the higher number, whichever finishes first.
+        let seq = self.next.fetch_add(1, Ordering::SeqCst);
+        CodexTicket {
+            seq,
+            read: self.sources.read(),
+        }
+    }
+
+    /// Checks `ticket`'s read (the half of [`CodexReads::check`] after the
+    /// I/O). A read newer than the last one adopted is compared with it and,
+    /// when accepted, adopted. One older than that (the revcxkey review's
+    /// M2: the daemon's two callers, admission and the observer's re-read,
+    /// read outside the lock and may take it in the other order) is still
+    /// compared, but is never adopted, so the last accepted read can't wind
+    /// back to an earlier one: it must be a read the adopted one could have
+    /// followed, the same or a step back in Codex's bookkeeping alone
+    /// ([`codex_unchanged`] with the two swapped). A read that saw anything
+    /// else, an edit included, holds and latches like any other.
+    pub fn settle(&self, ticket: CodexTicket, precedence: &[KeymapSource]) -> Result<(), Hold> {
+        let CodexTicket { seq, read: now } = ticket;
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(hold) = state.held {
+                return Err(hold);
+            }
+            let fresh = seq > state.last_seq;
+            let compared = if fresh {
+                codex_unchanged(&state.last, &now).and_then(|()| {
+                    if state.last == now {
+                        Ok(())
+                    } else if state.rewrites < CODEX_REWRITES_PER_GENERATION {
+                        state.rewrites += 1;
+                        Ok(())
+                    } else {
+                        Err(Hold::Changed)
+                    }
+                })
+            } else {
+                codex_unchanged(&now, &state.last)
+            };
+            if let Err(hold) = compared {
+                state.held = Some(hold);
+                return Err(hold);
+            }
+            if fresh {
+                state.last = now.clone();
+                state.last_seq = seq;
+            }
+        }
+        // A-20d-1b: the project files are a superset of what Codex loads; a
+        // keymap in any of them holds.
+        codex_projects_guard(&now)?;
+        codex_keymap(&now, &now, precedence)
+    }
+}
+
+/// One read of a Codex generation's sources ([`CodexReads::read`]), numbered
+/// in the order the reads began.
+#[derive(Debug)]
+pub struct CodexTicket {
+    seq: u64,
+    read: CodexRead,
+}
+
+/// [`CodexSources::from_launch`] with the project files for `cwd`, for
+/// `args` less the deck's own embedded-mode pair ([`without_embedded_pair`]).
+/// The spawn's baseline and the bound agent's launch both come through here,
+/// so the pair is left out on both sides (A-20d-13).
 fn codex_launch(codex_home: &Path, args: &[OsString], cwd: &Path) -> Result<CodexSources, Hold> {
+    codex_sources(codex_home, without_embedded_pair(args), cwd)
+}
+
+/// [`CodexSources::from_launch`] with the project files for `cwd`, for
+/// `args` as given.
+fn codex_sources(codex_home: &Path, args: &[OsString], cwd: &Path) -> Result<CodexSources, Hold> {
     if codex_moves_cwd(args) {
         return Err(Hold::Unpinned);
     }
     CodexSources::from_launch(codex_home, args, codex_project_files(cwd, codex_home)?)
+}
+
+/// The keys the deck's telemetry shim sets on a Codex's command line, in
+/// the order it writes them (`crate::telemetry::launch::codex_args`).
+const SHIM_OTEL_KEYS: [&str; 2] = ["otel.trace_exporter", "otel.metrics_exporter"];
+
+/// `args` (after the deck's embedded-mode pair) without the telemetry
+/// shim's leading `otel` overrides, or `None` when they don't open with one
+/// (the revcxkey review's M3). With an OTLP endpoint configured, the shim
+/// the daemon puts first on every agent's `PATH` runs a Codex called by
+/// name with `-c otel.trace_exporter=…` and `-c otel.metrics_exporter=…`
+/// after the pair and before the user's own arguments, either of them
+/// left out when its signal has no endpoint (`crate::telemetry::shim`).
+///
+/// Only that position and shape is the shim's: `-c` (not another spelling)
+/// and the key, in that order, each at most once, whose value is exactly
+/// `{otlp-http={endpoint=<string>,protocol="binary"|"json"}}`; and the shim
+/// adds nothing when the user's own arguments override `otel`
+/// (`codex_overrides_otel`), so overrides followed by one are not left out.
+/// An `otel` override sets no key binding, so leaving out one the user
+/// wrote in the shim's shape at the front can't hide a rebinding.
+fn without_shim_otel(args: &[OsString]) -> Option<&[OsString]> {
+    let mut rest = args;
+    for key in SHIM_OTEL_KEYS {
+        if let [flag, value, after @ ..] = rest
+            && flag == "-c"
+            && value
+                .to_str()
+                .is_some_and(|value| shim_otel_value(key, value))
+        {
+            rest = after;
+        }
+    }
+    (rest.len() < args.len() && !crate::telemetry::launch::codex_overrides_otel(rest))
+        .then_some(rest)
+}
+
+/// Whether `arg` is `key=` followed by the exporter table the telemetry
+/// shim writes: `{otlp-http={endpoint=<string>,protocol="binary"|"json"}}`
+/// and nothing else.
+fn shim_otel_value(key: &str, arg: &str) -> bool {
+    let Some(value) = arg
+        .strip_prefix(key)
+        .and_then(|rest| rest.strip_prefix('='))
+    else {
+        return false;
+    };
+    let Ok(mut table) = format!("v = {value}").parse::<toml::Table>() else {
+        return false;
+    };
+    let Some(toml::Value::Table(exporter)) = table.remove("v") else {
+        return false;
+    };
+    let Some(toml::Value::Table(http)) = exporter.get("otlp-http") else {
+        return false;
+    };
+    exporter.len() == 1
+        && http.len() == 2
+        && http.get("endpoint").is_some_and(toml::Value::is_str)
+        && http
+            .get("protocol")
+            .and_then(toml::Value::as_str)
+            .is_some_and(|p| p == "binary" || p == "json")
+}
+
+/// `args` (after the program) without #2002's embedded-mode pair
+/// (`crate::wrap::CODEX_EMBEDDED_ARGS`) when they open with it, else
+/// unchanged. Below the deck's `wrap` a direct Codex's argv opens with the
+/// pair while the launch line the baseline reads may not carry it (the
+/// installation adds it only with the editor's variables), so keeping it
+/// would hold every wrapped Codex as changed.
+///
+/// Only one leading copy of exactly those two words is stripped. The wrapper
+/// (`wrap::launch_args`) and the installation (`Installation::command`) put
+/// the pair first, and only when the arguments don't already open with it,
+/// and the telemetry shim keeps it first, so a launch carries at most one
+/// deck pair and it is at the front, where its `-c` can't be another
+/// option's value. The same words anywhere else, a second leading copy,
+/// another spelling (`--config`, `-c=`) or another value were written by the
+/// user and stay sources. A user's own leading copy is indistinguishable
+/// from the deck's and is stripped too: it sets no key binding.
+fn without_embedded_pair(args: &[OsString]) -> &[OsString] {
+    if crate::wrap::opens_with_codex_embedded_args(args) {
+        &args[crate::wrap::CODEX_EMBEDDED_ARGS.len()..]
+    } else {
+        args
+    }
 }
 
 /// A generation's key-binding sources read before its spawn (A-20d-1b): what

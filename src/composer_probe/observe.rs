@@ -1439,8 +1439,7 @@ mod linux {
     enum KeymapEvidence {
         Claude(crate::composer_probe::keymap::ClaudeKeymap),
         Codex {
-            sources: crate::composer_probe::keymap::CodexSources,
-            before: Box<crate::composer_probe::keymap::CodexRead>,
+            reads: Box<crate::composer_probe::keymap::CodexReads>,
             precedence: &'static [crate::doorbell_activation::KeymapSource],
         },
         Held(crate::composer_probe::keymap::Hold),
@@ -1450,21 +1449,7 @@ mod linux {
         fn check(&self) -> Result<(), crate::composer_probe::keymap::Hold> {
             match self {
                 KeymapEvidence::Claude(keymap) => keymap.check(),
-                KeymapEvidence::Codex {
-                    sources,
-                    before,
-                    precedence,
-                } => {
-                    use crate::composer_probe::keymap;
-                    let after = sources.read();
-                    if **before != after {
-                        return Err(keymap::Hold::Changed);
-                    }
-                    // A-20d-1b: the project files are a superset of what
-                    // Codex loads; a keymap in any of them holds.
-                    keymap::codex_projects_guard(before)?;
-                    keymap::codex_keymap(before, &after, precedence)
-                }
+                KeymapEvidence::Codex { reads, precedence } => reads.check(precedence),
                 KeymapEvidence::Held(hold) => Err(*hold),
             }
         }
@@ -2544,8 +2529,7 @@ mod linux {
                 },
                 AgentType::Codex => match baseline.codex_bound(&env, args, cwd) {
                     Ok(codex) => KeymapEvidence::Codex {
-                        sources: codex.sources.clone(),
-                        before: Box::new(codex.read.clone()),
+                        reads: Box::new(keymap::CodexReads::new(codex)),
                         precedence: probe.keymap_sources,
                     },
                     Err(hold) => KeymapEvidence::Held(hold),

@@ -1173,3 +1173,722 @@ fn probe_014_the_bound_agents_environment_is_compared_with_the_spawns() {
         );
     }
 }
+
+/// Scenario: Take a Codex baseline from the deck's launch line, which carries no `-c shell_environment_policy.set={}` pair when the user sets neither `VISUAL` nor `EDITOR`, and compare it with the native the deck's wrapper started, whose argv opens with that pair (#2002). The two read as the same launch, and so does a launch line that carries the pair itself. A user's own `-c` that moves Ctrl+G still holds as changed, behind the pair or not; and the same two words anywhere but first, a second leading copy, another spelling of the flag or another value are the user's, so each still holds as changed.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_the_wrappers_embedded_pair_is_not_a_codex_source() {
+    use dot_agent_deck::composer_probe::keymap::CodexBaseline;
+    let dir = test_temp::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let cwd = dir.path().join("repo");
+    for d in [&home, &cwd] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    const C: &str = "-c";
+    const SET: &str = "shell_environment_policy.set={}";
+    let user = ["--model", "m", "-c", "model_reasoning_effort=low"];
+    let with = |front: &[&str], back: &[&str]| -> Vec<OsString> {
+        args(&[front, &user[..], back].concat())
+    };
+
+    // The deck's launch line without the pair; the wrapped native with it.
+    let plain = CodexBaseline::at_spawn(&home, &with(&[], &[]), &cwd).unwrap();
+    assert_eq!(
+        plain.bound(&home, &with(&[C, SET], &[]), &cwd),
+        Ok(()),
+        "the wrapper's leading pair"
+    );
+    assert_eq!(plain.bound(&home, &with(&[], &[]), &cwd), Ok(()));
+    // A launch line that already carries the pair (the installation adds it
+    // when it sets the editor's variables, and the wrapper then adds none).
+    let paired = CodexBaseline::at_spawn(&home, &with(&[C, SET], &[]), &cwd).unwrap();
+    assert_eq!(paired.sources, plain.sources, "the pair is not a source");
+    assert_eq!(paired.bound(&home, &with(&[C, SET], &[]), &cwd), Ok(()));
+    assert_eq!(paired.bound(&home, &with(&[], &[]), &cwd), Ok(()));
+
+    // A user's own keymap override still counts, behind the pair or not.
+    let rebind = ["-c", "tui.keymap.global.open_external_editor=\"f6\""];
+    for front in [&[C, SET][..], &[]] {
+        assert_eq!(
+            plain.bound(&home, &with(front, &rebind), &cwd),
+            Err(Hold::Changed),
+            "a user's keymap override behind {front:?}"
+        );
+    }
+    // Only one leading copy of exactly these two words is the deck's.
+    for (row, front, back) in [
+        ("the pair last", &[][..], &[C, SET][..]),
+        ("the pair second", &["--model", "x", C, SET][..], &[][..]),
+        ("two leading pairs", &[C, SET, C, SET][..], &[][..]),
+        (
+            "another value",
+            &[C, "shell_environment_policy.set={A=\"1\"}"][..],
+            &[][..],
+        ),
+        ("--config", &["--config", SET][..], &[][..]),
+        ("-c=", &["-c=shell_environment_policy.set={}"][..], &[][..]),
+        (
+            "attached",
+            &["-cshell_environment_policy.set={}"][..],
+            &[][..],
+        ),
+    ] {
+        assert_eq!(
+            plain.bound(&home, &with(front, back), &cwd),
+            Err(Hold::Changed),
+            "{row}"
+        );
+    }
+}
+
+/// Codex's `config.toml` as the deck's startup trust write leaves it.
+const TRUSTED: &str = "[projects.\"/w\"]\ntrust_level = \"trusted\"\n";
+
+/// `contents` written to `path` as Codex writes it: a new file renamed over
+/// the old one, so the inode and both times move.
+fn rewrite(path: &Path, contents: &str) {
+    std::thread::sleep(TICK);
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, contents).unwrap();
+    std::fs::rename(&tmp, path).unwrap();
+}
+
+/// Scenario: Read a Codex home's sources before its spawn, then rewrite `config.toml` the way real Codex 0.164.0 rewrote it on a fresh home's first five starts (measured): the screen-reader probe's `[tui] screen_reader_detection_done = true` once, then the startup tooltip's `[tui.model_availability_nux]` count raised from 1 to 4, each written to a new file renamed over the old. Each rewrite reads as the same sources as the read before it, as does a home that had no `config.toml` before Codex wrote one, so the probe is allowed instead of held as changed.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_codexs_own_startup_writes_are_not_a_change() {
+    let codex = Codex::new();
+    write(&codex.config(), TRUSTED);
+    let sources = codex.sources(&[]);
+    let before = sources.read();
+    let marker = format!("{TRUSTED}\n[tui]\nscreen_reader_detection_done = true\n");
+    rewrite(&codex.config(), &marker);
+    let mut last = sources.read();
+    assert_ne!(before, last, "the rewrite moved the file's identity");
+    assert_eq!(
+        codex_keymap(&before, &last, CODEX_ORDER),
+        Ok(()),
+        "the screen-reader marker"
+    );
+    for count in 1..=4 {
+        rewrite(
+            &codex.config(),
+            &format!("{marker}\n[tui.model_availability_nux]\n\"gpt-6.1-sol\" = {count}\n"),
+        );
+        let now = sources.read();
+        assert_eq!(
+            codex_keymap(&last, &now, CODEX_ORDER),
+            Ok(()),
+            "the tooltip's count at {count}"
+        );
+        last = now;
+    }
+
+    let fresh = Codex::new();
+    let sources = fresh.sources(&[]);
+    let before = sources.read();
+    assert_eq!(before.config, SourceRead::Absent);
+    rewrite(
+        &fresh.config(),
+        "[tui]\nscreen_reader_detection_done = true\n",
+    );
+    assert_eq!(
+        codex_keymap(&before, &sources.read(), CODEX_ORDER),
+        Ok(()),
+        "created by the marker alone"
+    );
+}
+
+/// Scenario: Read a Codex home's sources before its spawn, then rewrite `config.toml` with Codex's own bookkeeping changed and something else beside it. Every other key still holds as changed, and so does a bookkeeping key in a shape Codex doesn't write: Ctrl+G moved in `tui.keymap`, the profile or model selected, `tui.animations` (which the screen-reader probe can also write), the marker as a string, a count that isn't a non-negative 32-bit integer or a nested table of counts, and a file that no longer parses. A rewrite that changes nothing Codex loads and leaves the bookkeeping as it was (a hand edit undone, the same bytes rewritten) holds too, and only `config.toml` is read this way: the same bookkeeping written into the profile file holds.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_only_codexs_bookkeeping_is_left_out_of_the_comparison() {
+    let marker = format!("{TRUSTED}\n[tui]\nscreen_reader_detection_done = true\n");
+    for (row, contents) in [
+        (
+            "Ctrl+G moved",
+            format!("{marker}\n[tui.keymap.global]\nopen_external_editor = \"f6\"\n"),
+        ),
+        (
+            "a profile selected",
+            format!("profile = \"work\"\n{marker}"),
+        ),
+        ("the model", format!("model = \"o4\"\n{marker}")),
+        ("animations", format!("{marker}animations = false\n")),
+        (
+            "the marker as a string",
+            format!("{TRUSTED}\n[tui]\nscreen_reader_detection_done = \"yes\"\n"),
+        ),
+        (
+            "a negative count",
+            format!("{marker}\n[tui.model_availability_nux]\nm = -1\n"),
+        ),
+        (
+            "a count past u32",
+            format!("{marker}\n[tui.model_availability_nux]\nm = 4294967296\n"),
+        ),
+        (
+            "a count as a string",
+            format!("{marker}\n[tui.model_availability_nux]\nm = \"1\"\n"),
+        ),
+        (
+            "nested counts",
+            format!("{marker}\n[tui.model_availability_nux.m]\nn = 1\n"),
+        ),
+        ("unparsable", format!("{marker}\n[tui\n")),
+    ] {
+        let codex = Codex::new();
+        write(&codex.config(), TRUSTED);
+        let sources = codex.sources(&[]);
+        let before = sources.read();
+        rewrite(&codex.config(), &contents);
+        assert_eq!(
+            codex_keymap(&before, &sources.read(), CODEX_ORDER),
+            Err(Hold::Changed),
+            "{row}"
+        );
+    }
+
+    // A rewrite that leaves the bookkeeping as it was.
+    let codex = Codex::new();
+    write(&codex.config(), &marker);
+    let sources = codex.sources(&[]);
+    let before = sources.read();
+    rewrite(&codex.config(), &marker);
+    assert_eq!(
+        codex_keymap(&before, &sources.read(), CODEX_ORDER),
+        Err(Hold::Changed),
+        "the same bytes rewritten"
+    );
+
+    // The profile file is compared whole.
+    let codex = Codex::new();
+    write(&codex.profile(), "model = \"o3\"\n");
+    let sources = codex.sources(&["-p", "work"]);
+    let before = sources.read();
+    rewrite(
+        &codex.profile(),
+        "model = \"o3\"\n\n[tui]\nscreen_reader_detection_done = true\n",
+    );
+    assert_eq!(
+        codex_keymap(&before, &sources.read(), CODEX_ORDER),
+        Err(Hold::Changed),
+        "bookkeeping in the profile file"
+    );
+}
+
+/// Scenario: Follow one Codex generation's reads as the deck's observer does, each check comparing with the last read it accepted. Codex's own marker is accepted once and becomes that read; a hand edit that moves Ctrl+G then holds as changed, and so does undoing it afterwards, since Codex may have reloaded the edit (its `/cd` rebuilds the keymap from disk) and the undone file's bookkeeping is unchanged, and so does the undone file read again. The residual is pinned too: an edit made and undone between two checks across which Codex also raised its count is not seen.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_a_codex_generation_compares_with_its_last_accepted_read() {
+    use dot_agent_deck::composer_probe::keymap::{CodexBaseline, CodexReads};
+    let codex = Codex::new();
+    write(&codex.config(), TRUSTED);
+    let cwd = codex.dir.path().join("project");
+    let baseline = CodexBaseline::at_spawn(&codex.home(), &[], &cwd).unwrap();
+    let reads = CodexReads::new(&baseline);
+    assert_eq!(reads.check(CODEX_ORDER), Ok(()), "unchanged");
+
+    let marker = format!("{TRUSTED}\n[tui]\nscreen_reader_detection_done = true\n");
+    rewrite(&codex.config(), &marker);
+    assert_eq!(reads.check(CODEX_ORDER), Ok(()), "Codex's marker");
+    assert_eq!(reads.check(CODEX_ORDER), Ok(()), "read again");
+
+    rewrite(
+        &codex.config(),
+        &format!("{marker}\n[tui.keymap.global]\nopen_external_editor = \"f6\"\n"),
+    );
+    assert_eq!(reads.check(CODEX_ORDER), Err(Hold::Changed), "Ctrl+G moved");
+    rewrite(&codex.config(), &marker);
+    assert_eq!(
+        reads.check(CODEX_ORDER),
+        Err(Hold::Changed),
+        "the edit undone"
+    );
+    // A held read is not adopted: the undone file read again still holds.
+    assert_eq!(
+        reads.check(CODEX_ORDER),
+        Err(Hold::Changed),
+        "the undone file read again"
+    );
+
+    // The residual: undone within one window that Codex's own write also
+    // fell in.
+    let codex = Codex::new();
+    write(&codex.config(), TRUSTED);
+    let baseline = CodexBaseline::at_spawn(&codex.home(), &[], &cwd).unwrap();
+    let reads = CodexReads::new(&baseline);
+    rewrite(
+        &codex.config(),
+        &format!("{TRUSTED}\n[tui.keymap.global]\nopen_external_editor = \"f6\"\n"),
+    );
+    rewrite(&codex.config(), &marker);
+    assert_eq!(reads.check(CODEX_ORDER), Ok(()), "not seen");
+}
+
+/// Scenario: Follow one Codex generation's checks while the user edits `config.toml` to move Ctrl+G, Codex's own start-up write then raises its tooltip count over the edit, and the user undoes the edit in a file that keeps Codex's new count. The edit holds as changed, Codex's write over it holds, and the undo, whose bookkeeping differs from the last accepted read while everything else matches it, still holds as changed, as does every later check of the generation: the first comparison that holds latches. A new generation on the restored file allows the probe.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_a_held_codex_generation_stays_held() {
+    use dot_agent_deck::composer_probe::keymap::{CodexBaseline, CodexReads};
+    let codex = Codex::new();
+    write(&codex.config(), TRUSTED);
+    let cwd = codex.dir.path().join("project");
+    let baseline = CodexBaseline::at_spawn(&codex.home(), &[], &cwd).unwrap();
+    let reads = CodexReads::new(&baseline);
+
+    let marker = format!("{TRUSTED}\n[tui]\nscreen_reader_detection_done = true\n");
+    rewrite(&codex.config(), &marker);
+    assert_eq!(reads.check(CODEX_ORDER), Ok(()), "Codex's marker");
+
+    let rebind = "\n[tui.keymap.global]\nopen_external_editor = \"f6\"\n";
+    let count = "\n[tui.model_availability_nux]\n\"gpt-6.1-sol\" = 1\n";
+    rewrite(&codex.config(), &format!("{marker}{rebind}"));
+    assert_eq!(reads.check(CODEX_ORDER), Err(Hold::Changed), "Ctrl+G moved");
+    rewrite(&codex.config(), &format!("{marker}{rebind}{count}"));
+    assert_eq!(
+        reads.check(CODEX_ORDER),
+        Err(Hold::Changed),
+        "Codex's count written over the edit"
+    );
+    rewrite(&codex.config(), &format!("{marker}{count}"));
+    assert_eq!(
+        reads.check(CODEX_ORDER),
+        Err(Hold::Changed),
+        "the edit undone, keeping Codex's new count"
+    );
+    assert_eq!(reads.check(CODEX_ORDER), Err(Hold::Changed), "read again");
+
+    let next = CodexReads::new(&CodexBaseline::at_spawn(&codex.home(), &[], &cwd).unwrap());
+    assert_eq!(
+        next.check(CODEX_ORDER),
+        Ok(()),
+        "a new generation reads anew"
+    );
+}
+
+/// `config.toml` as the deck's trust write leaves it plus Codex's
+/// bookkeeping: the screen-reader marker written as `marker` (absent for
+/// `None`) and the tooltip counts `counts` (no table for `None`), each value
+/// written as given.
+fn bookkeeping(marker: Option<&str>, counts: Option<&[(&str, &str)]>) -> String {
+    let mut text = TRUSTED.to_string();
+    if let Some(marker) = marker {
+        text += &format!("\n[tui]\nscreen_reader_detection_done = {marker}\n");
+    }
+    if let Some(counts) = counts {
+        text += "\n[tui.model_availability_nux]\n";
+        for (model, count) in counts {
+            text += &format!("\"{model}\" = {count}\n");
+        }
+    }
+    text
+}
+
+/// Scenario: Rewrite a Codex home's `config.toml` from one bookkeeping state to another, as a new file renamed over the old, and compare the two reads. A step Codex makes is accepted: the screen-reader marker set to `true` where it was absent or `false`, a new model's tooltip count at 1, a count raised by 1 up to 4 beside another left as it was, and the marker and a first count in one rewrite. Any other move holds as changed: the marker cleared, removed or written `false`, a count lowered, raised by 2 or past 4, a new count at 0 or 2, a model's count removed, and the count table removed.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_only_a_step_forward_in_codexs_bookkeeping_is_accepted() {
+    let a = "gpt-6.1-sol";
+    let b = "gpt-6.2";
+    type Counts<'a> = Option<&'a [(&'a str, &'a str)]>;
+    /// A row: its name, the bookkeeping before (marker, counts) and after,
+    /// and what the comparison should say.
+    type Row<'a> = (
+        &'a str,
+        Option<&'a str>,
+        Counts<'a>,
+        Option<&'a str>,
+        Counts<'a>,
+        Result<(), Hold>,
+    );
+    let rows: &[Row] = &[
+        ("marker set", None, None, Some("true"), None, Ok(())),
+        (
+            "marker false to true",
+            Some("false"),
+            None,
+            Some("true"),
+            None,
+            Ok(()),
+        ),
+        (
+            "a new count at 1",
+            Some("true"),
+            None,
+            Some("true"),
+            Some(&[(a, "1")]),
+            Ok(()),
+        ),
+        (
+            "a count 1 to 2",
+            Some("true"),
+            Some(&[(a, "1")]),
+            Some("true"),
+            Some(&[(a, "2")]),
+            Ok(()),
+        ),
+        (
+            "a count 3 to 4 beside another kept",
+            Some("true"),
+            Some(&[(a, "3"), (b, "2")]),
+            Some("true"),
+            Some(&[(a, "4"), (b, "2")]),
+            Ok(()),
+        ),
+        (
+            "marker and a first count at once",
+            None,
+            None,
+            Some("true"),
+            Some(&[(a, "1")]),
+            Ok(()),
+        ),
+        (
+            "marker cleared",
+            Some("true"),
+            None,
+            Some("false"),
+            None,
+            Err(Hold::Changed),
+        ),
+        (
+            "marker removed",
+            Some("true"),
+            Some(&[(a, "1")]),
+            None,
+            Some(&[(a, "1")]),
+            Err(Hold::Changed),
+        ),
+        (
+            "marker written false",
+            None,
+            None,
+            Some("false"),
+            None,
+            Err(Hold::Changed),
+        ),
+        (
+            "a count lowered",
+            Some("true"),
+            Some(&[(a, "2")]),
+            Some("true"),
+            Some(&[(a, "1")]),
+            Err(Hold::Changed),
+        ),
+        (
+            "a count raised by 2",
+            Some("true"),
+            Some(&[(a, "1")]),
+            Some("true"),
+            Some(&[(a, "3")]),
+            Err(Hold::Changed),
+        ),
+        (
+            "a count past 4",
+            Some("true"),
+            Some(&[(a, "4")]),
+            Some("true"),
+            Some(&[(a, "5")]),
+            Err(Hold::Changed),
+        ),
+        (
+            "a new count at 0",
+            Some("true"),
+            None,
+            Some("true"),
+            Some(&[(a, "0")]),
+            Err(Hold::Changed),
+        ),
+        (
+            "a new count at 2",
+            Some("true"),
+            None,
+            Some("true"),
+            Some(&[(a, "2")]),
+            Err(Hold::Changed),
+        ),
+        (
+            "a model's count removed",
+            Some("true"),
+            Some(&[(a, "1"), (b, "1")]),
+            Some("true"),
+            Some(&[(a, "2")]),
+            Err(Hold::Changed),
+        ),
+        (
+            "the count table removed",
+            Some("true"),
+            Some(&[(a, "1")]),
+            Some("true"),
+            None,
+            Err(Hold::Changed),
+        ),
+        (
+            "an empty count table removed",
+            Some("true"),
+            Some(&[]),
+            Some("true"),
+            None,
+            Err(Hold::Changed),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (row, marker_was, counts_was, marker_now, counts_now, expected) in rows {
+        let codex = Codex::new();
+        write(&codex.config(), &bookkeeping(*marker_was, *counts_was));
+        let sources = codex.sources(&[]);
+        let before = sources.read();
+        rewrite(&codex.config(), &bookkeeping(*marker_now, *counts_now));
+        let got = codex_keymap(&before, &sources.read(), CODEX_ORDER);
+        if got != *expected {
+            wrong.push(format!("{row}: {got:?}, expected {expected:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Scenario: Follow one Codex generation's checks on a fresh home while `config.toml` is rewritten as Codex's first start rewrites it (the marker, then the first tooltip count) and then once more with the next count. The first two rewrites are accepted, reading the unchanged file again in between costs nothing, and the third holds as changed for the rest of the generation. A new generation, as Codex's next start would be, accepts that same count.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_a_codex_generation_accepts_at_most_two_bookkeeping_rewrites() {
+    use dot_agent_deck::composer_probe::keymap::{CodexBaseline, CodexReads};
+    let codex = Codex::new();
+    write(&codex.config(), TRUSTED);
+    let cwd = codex.dir.path().join("project");
+    let reads = CodexReads::new(&CodexBaseline::at_spawn(&codex.home(), &[], &cwd).unwrap());
+    let count = |n: &'static str| bookkeeping(Some("true"), Some(&[("gpt-6.1-sol", n)]));
+
+    rewrite(&codex.config(), &bookkeeping(Some("true"), None));
+    assert_eq!(reads.check(CODEX_ORDER), Ok(()), "the marker");
+    for _ in 0..3 {
+        assert_eq!(reads.check(CODEX_ORDER), Ok(()), "the marker read again");
+    }
+    rewrite(&codex.config(), &count("1"));
+    assert_eq!(reads.check(CODEX_ORDER), Ok(()), "the first count");
+    rewrite(&codex.config(), &count("2"));
+    assert_eq!(
+        reads.check(CODEX_ORDER),
+        Err(Hold::Changed),
+        "a third rewrite"
+    );
+    assert_eq!(reads.check(CODEX_ORDER), Err(Hold::Changed), "read again");
+
+    let codex = Codex::new();
+    write(&codex.config(), &count("1"));
+    let next = CodexReads::new(&CodexBaseline::at_spawn(&codex.home(), &[], &cwd).unwrap());
+    rewrite(&codex.config(), &count("2"));
+    assert_eq!(next.check(CODEX_ORDER), Ok(()), "the next start's count");
+}
+
+/// Scenario: Two checks of one Codex generation read `config.toml` on either side of Codex's own marker write and take the comparison's lock in the other order, as admission and the observer's re-read can: the later read settles first and is adopted, and the earlier one, compared afterwards, is accepted but not adopted, so the same marker rewritten again with nothing moved still holds as changed against the later read. A read that loses the race is still compared: one that saw an edit moving Ctrl+G, settled after the undo was accepted, holds and latches.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_a_codex_read_that_loses_the_race_is_not_adopted() {
+    use dot_agent_deck::composer_probe::keymap::{CodexBaseline, CodexReads};
+    let marker = bookkeeping(Some("true"), None);
+    let cwd = Path::new("/nonexistent-cxkey2-project");
+
+    let codex = Codex::new();
+    write(&codex.config(), TRUSTED);
+    let reads = CodexReads::new(&CodexBaseline::at_spawn(&codex.home(), &[], cwd).unwrap());
+    let early = reads.read();
+    rewrite(&codex.config(), &marker);
+    let late = reads.read();
+    assert_eq!(reads.settle(late, CODEX_ORDER), Ok(()), "the later read");
+    assert_eq!(
+        reads.settle(early, CODEX_ORDER),
+        Ok(()),
+        "the earlier read, settled second"
+    );
+    rewrite(&codex.config(), &marker);
+    assert_eq!(
+        reads.check(CODEX_ORDER),
+        Err(Hold::Changed),
+        "the marker rewritten with nothing moved, against the later read"
+    );
+
+    // The read that loses the race saw an edit.
+    let codex = Codex::new();
+    write(&codex.config(), TRUSTED);
+    let reads = CodexReads::new(&CodexBaseline::at_spawn(&codex.home(), &[], cwd).unwrap());
+    rewrite(
+        &codex.config(),
+        &format!("{TRUSTED}\n[tui.keymap.global]\nopen_external_editor = \"f6\"\n"),
+    );
+    let edited = reads.read();
+    rewrite(&codex.config(), &marker);
+    let undone = reads.read();
+    assert_eq!(
+        reads.settle(undone, CODEX_ORDER),
+        Ok(()),
+        "the undo with Codex's marker (the residual)"
+    );
+    assert_eq!(
+        reads.settle(edited, CODEX_ORDER),
+        Err(Hold::Changed),
+        "the earlier read that saw the edit"
+    );
+    assert_eq!(reads.check(CODEX_ORDER), Err(Hold::Changed), "latched");
+}
+
+/// Scenario: Take a Codex baseline from the deck's launch line, then compare it with the native the deck's telemetry shim started when an OTLP endpoint is configured: the wrapper's pair, the shim's own `-c otel.trace_exporter=…` and `-c otel.metrics_exporter=…` (produced here by the shim's own function), then the user's arguments. The two read as the same launch, for both exporters, the JSON protocol, either exporter alone, an endpoint that needs escaping, and without the pair. A user's `-c` that moves Ctrl+G behind the shim's overrides still holds as changed, and so does each `otel` override that isn't the shim's: another key, value or spelling, the shim's in the wrong order, twice, or behind a user's argument, and the shim's when the user's own arguments also override `otel` (the shim then adds nothing). A user's own `otel` override still counts as a source: on both sides it matches, on the baseline alone it holds.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_the_telemetry_shims_otel_overrides_are_not_a_codex_source() {
+    use dot_agent_deck::composer_probe::keymap::CodexBaseline;
+    use dot_agent_deck::telemetry::launch::codex_args;
+    let dir = test_temp::tempdir().unwrap();
+    let home = dir.path().join("codex-home");
+    let cwd = dir.path().join("repo");
+    for d in [&home, &cwd] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    const PAIR: [&str; 2] = ["-c", "shell_environment_policy.set={}"];
+    let user = ["--model", "m", "-c", "model_reasoning_effort=low"];
+    let env = |extra: &[(&str, &str)]| {
+        let mut env = std::collections::HashMap::new();
+        env.insert("CODEX_HOME".to_string(), home.display().to_string());
+        env.insert(
+            "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
+            "http://127.0.0.1:4318".to_string(),
+        );
+        for (k, v) in extra {
+            env.insert(k.to_string(), v.to_string());
+        }
+        env
+    };
+    // What the shim puts after the pair, from the shim's own function.
+    let shim = |extra: &[(&str, &str)]| -> Vec<String> {
+        codex_args(&args(&[&PAIR[..], &user[..]].concat()), &env(extra))
+    };
+    let native = |front: &[&str], added: &[String], back: &[&str]| -> Vec<OsString> {
+        let added: Vec<&str> = added.iter().map(String::as_str).collect();
+        args(&[front, &added[..], &user[..], back].concat())
+    };
+    let baseline = CodexBaseline::at_spawn(&home, &args(&user), &cwd).unwrap();
+
+    let both = shim(&[]);
+    assert_eq!(both.len(), 4, "the shim adds both exporters: {both:?}");
+    for (row, added, front) in [
+        ("both exporters", both.clone(), &PAIR[..]),
+        (
+            "the JSON protocol",
+            shim(&[("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json")]),
+            &PAIR[..],
+        ),
+        (
+            "traces alone",
+            shim(&[("OTEL_METRICS_EXPORTER", "none")]),
+            &PAIR[..],
+        ),
+        (
+            "metrics alone",
+            shim(&[("OTEL_TRACES_EXPORTER", "none")]),
+            &PAIR[..],
+        ),
+        (
+            "an endpoint that needs escaping",
+            shim(&[(
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                "http://127.0.0.1:4318/a\"b\\c",
+            )]),
+            &PAIR[..],
+        ),
+        ("without the pair", both.clone(), &[][..]),
+    ] {
+        assert!(!added.is_empty(), "{row}: the shim added nothing");
+        assert_eq!(
+            baseline.bound(&home, &native(front, &added, &[]), &cwd),
+            Ok(()),
+            "{row}"
+        );
+    }
+
+    let (trace, metrics) = (both[..2].to_vec(), both[2..].to_vec());
+    let value = |i: usize| both[i].clone();
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|a| a.to_string()).collect() };
+    let rebind = ["-c", "tui.keymap.global.open_external_editor=\"f6\""];
+    let user_otel = ["-c", "otel.exporter=\"none\""];
+    let mut wrong = Vec::new();
+    for (row, added, back) in [
+        ("a user's rebinding behind them", both.clone(), &rebind[..]),
+        (
+            "another key",
+            s(&[
+                "-c",
+                &value(1).replacen("otel.trace_exporter", "otel.exporter", 1),
+            ]),
+            &[][..],
+        ),
+        (
+            "another value",
+            s(&["-c", "otel.trace_exporter=\"none\""]),
+            &[][..],
+        ),
+        (
+            "another protocol",
+            s(&["-c", &value(1).replace("\"binary\"", "\"grpc\"")]),
+            &[][..],
+        ),
+        (
+            "another field",
+            s(&["-c", &value(1).replace("}}", ",headers={a=\"b\"}}}")]),
+            &[][..],
+        ),
+        ("--config", s(&["--config", &value(1)]), &[][..]),
+        ("-c=", s(&[&format!("-c={}", value(1))]), &[][..]),
+        (
+            "the wrong order",
+            [metrics.clone(), trace.clone()].concat(),
+            &[][..],
+        ),
+        ("twice", [trace.clone(), trace.clone()].concat(), &[][..]),
+    ] {
+        let got = baseline.bound(&home, &native(&PAIR, &added, back), &cwd);
+        if got != Err(Hold::Changed) {
+            wrong.push(format!("{row}: {got:?}"));
+        }
+    }
+    // Behind a user's argument rather than in front of them.
+    let behind = args(
+        &[
+            &PAIR[..],
+            &user[..2],
+            &both.iter().map(String::as_str).collect::<Vec<_>>(),
+            &user[2..],
+        ]
+        .concat(),
+    );
+    if baseline.bound(&home, &behind, &cwd) != Err(Hold::Changed) {
+        wrong.push("behind a user's argument".to_string());
+    }
+    // The user's own arguments override otel too, so the shim would have
+    // added nothing: the overrides in front are not the shim's.
+    let with_otel =
+        CodexBaseline::at_spawn(&home, &args(&[&user[..], &user_otel[..]].concat()), &cwd).unwrap();
+    if with_otel.bound(&home, &native(&PAIR, &both, &user_otel), &cwd) != Err(Hold::Changed) {
+        wrong.push("the user's own otel override too".to_string());
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+
+    // A user's own otel override on the launch line still counts.
+    let theirs = ["-c", "otel.exporter=\"none\""];
+    let own =
+        CodexBaseline::at_spawn(&home, &args(&[&theirs[..], &user[..]].concat()), &cwd).unwrap();
+    assert_eq!(
+        own.bound(
+            &home,
+            &args(&[&PAIR[..], &theirs[..], &user[..]].concat()),
+            &cwd
+        ),
+        Ok(()),
+        "on both sides"
+    );
+    assert_eq!(
+        own.bound(&home, &args(&[&PAIR[..], &user[..]].concat()), &cwd),
+        Err(Hold::Changed),
+        "on the baseline alone"
+    );
+}
