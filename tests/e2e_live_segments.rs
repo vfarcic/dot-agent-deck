@@ -251,20 +251,38 @@ fn probe_029_codex_requires_the_complete_matched_return() {
     // the scenario and, on a miss, print what the probe answered and what the
     // daemon and fixture saw.
     // Run 2: three fixtures at once per round, until 140 s have passed.
+    // A-20d-14 (PRD #1666 part 3, U4): after Q120b's settle wait, count the
+    // misses over the whole run instead of stopping at the first.
+    let misses = std::sync::atomic::AtomicU32::new(0);
     let begin = Instant::now();
     let mut round = 0;
     while begin.elapsed() < Duration::from_secs(140) {
         std::thread::scope(|s| {
             for lane in 0..3 {
-                s.spawn(move || probe_029_capture_once(round * 3 + lane));
+                let misses = &misses;
+                s.spawn(move || {
+                    if !probe_029_capture_once(round * 3 + lane) {
+                        misses.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
             }
         });
         round += 1;
     }
-    eprintln!("capture done: {} iterations", round * 3);
+    let misses = misses.into_inner();
+    eprintln!(
+        "A20D14 capture done: {} iterations, {misses} misses",
+        round * 3
+    );
+    assert_eq!(
+        misses,
+        0,
+        "A20D14 residual misses: {misses} of {}",
+        round * 3
+    );
 }
 
-fn probe_029_capture_once(i: u32) {
+fn probe_029_capture_once(i: u32) -> bool {
     let logdir = common::race_safe_tempdir();
     let log = logdir.path().join("deck.log");
     let log_s = log.to_str().unwrap().to_owned();
@@ -301,7 +319,7 @@ fn probe_029_capture_once(i: u32) {
         let logtext = fs::read_to_string(&log).unwrap_or_else(|e| format!("<no log: {e}>"));
         let tail: Vec<&str> = logtext.lines().rev().take(400).collect();
         let tail: Vec<&str> = tail.into_iter().rev().collect();
-        panic!(
+        eprintln!(
             "CAPTURED miss at iter {i}\nreply: {reply}\npost observer: {}\npost fence: {}\nepoch: {:?}\ninput: {:?}\ninputs: {}\nhelper-started: {}\nhelper-trace: {}\nhooks: {}\nhome files: {files:?}\nscreen:\n{}\nsnapshot: {}\n---- daemon log tail ({} lines total) ----\n{}",
             f.control_for(f.generation, "observer-status"),
             f.control_for(f.generation, "fence-status"),
@@ -316,6 +334,7 @@ fn probe_029_capture_once(i: u32) {
             logtext.lines().count(),
             tail.join("\n"),
         );
+        return false;
     }
     f.wait("helper-exited");
     let mut human = f.connect();
@@ -325,6 +344,7 @@ fn probe_029_capture_once(i: u32) {
     f.flag("resume-go");
     f.expect(b"\x07AFTER-CODEX-E1");
     f.stable(b"\x07AFTER-CODEX-E1");
+    true
 }
 
 /// Scenario: Make the Codex stand-in emit its re-enable before a witnessed, still-pending real terminal input flush, then type during that window. The mode transition must release no keys into the flush; after the flush and the composer's next redraw marker, every typed key must arrive once.
