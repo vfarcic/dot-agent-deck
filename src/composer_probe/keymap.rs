@@ -693,9 +693,10 @@ fn codex_config_unchanged(before: &SourceRead, after: &SourceRead) -> bool {
 /// that each stay or rise by exactly 1 to at most [`CODEX_NUX_MAX_COUNT`],
 /// an absent count reading as 0 (`tui/src/app/startup_prompts.rs`, which
 /// raises one model's count by 1 per start and rewrites the others as they
-/// were), so a new model's count is 1. Something must move, and no key may
-/// go: a marker or a count removed, a marker cleared, a count lowered,
-/// raised by more than 1 or past the maximum, or a new one other than 1 is
+/// were), so a new model's count is 1, and at most one count moves.
+/// Something must move, and no key may go: a marker or a count removed, a
+/// marker cleared, a count lowered, raised by more than 1 or past the
+/// maximum, a new one other than 1, or two counts moved in one rewrite is
 /// not Codex's write.
 fn codex_bookkeeping_forward(before: &toml::Table, after: &toml::Table) -> bool {
     let marker = |kept: &toml::Table| {
@@ -731,8 +732,16 @@ fn codex_bookkeeping_forward(before: &toml::Table, after: &toml::Table) -> bool 
                 Some(None) => false,
             }
         });
-    let moved = marker_was != marker_now || was != now;
-    marker_ok && table_kept && counts_ok && moved
+    // At most one count moves (the revcxkey2 review's NIT-4): each tooltip
+    // write raises one model's count (`prepare_startup_tooltip_override`,
+    // both pinned trees). A comparison spanning two such writes that moved
+    // different models' counts holds too, which fails closed.
+    let counts_moved = now
+        .iter()
+        .filter(|(model, count)| was.get(*model) != Some(*count))
+        .count();
+    let moved = marker_was != marker_now || counts_moved > 0;
+    marker_ok && table_kept && counts_ok && counts_moved <= 1 && moved
 }
 
 /// `config.toml` parsed, and the bookkeeping taken out of it: the rest and

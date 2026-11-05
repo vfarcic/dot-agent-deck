@@ -1486,7 +1486,7 @@ fn bookkeeping(marker: Option<&str>, counts: Option<&[(&str, &str)]>) -> String 
     text
 }
 
-/// Scenario: Rewrite a Codex home's `config.toml` from one bookkeeping state to another, as a new file renamed over the old, and compare the two reads. A step Codex makes is accepted: the screen-reader marker set to `true` where it was absent or `false`, a new model's tooltip count at 1, a count raised by 1 up to 4 beside another left as it was, and the marker and a first count in one rewrite. Any other move holds as changed: the marker cleared, removed or written `false`, a count lowered, raised by 2 or past 4, a new count at 0 or 2, a model's count removed, and the count table removed.
+/// Scenario: Rewrite a Codex home's `config.toml` from one bookkeeping state to another, as a new file renamed over the old, and compare the two reads. A step Codex makes is accepted: the screen-reader marker set to `true` where it was absent or `false`, a new model's tooltip count at 1, a count raised by 1 up to 4 beside another left as it was, and the marker and a first count in one rewrite. Any other move holds as changed: the marker cleared, removed or written `false`, a count lowered, raised by 2 or past 4, a new count at 0 or 2, a model's count removed, the count table removed, and two counts moved in one rewrite (two raised, a new one beside a raised one, two new ones).
 #[spec("inbox/probe/014")]
 #[test]
 fn probe_014_only_a_step_forward_in_codexs_bookkeeping_is_accepted() {
@@ -1631,6 +1631,30 @@ fn probe_014_only_a_step_forward_in_codexs_bookkeeping_is_accepted() {
             Some(&[]),
             Some("true"),
             None,
+            Err(Hold::Changed),
+        ),
+        (
+            "two counts raised in one rewrite",
+            Some("true"),
+            Some(&[(a, "1"), (b, "1")]),
+            Some("true"),
+            Some(&[(a, "2"), (b, "2")]),
+            Err(Hold::Changed),
+        ),
+        (
+            "a new count beside a raised one",
+            Some("true"),
+            Some(&[(a, "1")]),
+            Some("true"),
+            Some(&[(a, "2"), (b, "1")]),
+            Err(Hold::Changed),
+        ),
+        (
+            "two new counts in one rewrite",
+            None,
+            None,
+            Some("true"),
+            Some(&[(a, "1"), (b, "1")]),
             Err(Hold::Changed),
         ),
     ];
@@ -1797,7 +1821,7 @@ fn probe_014_a_codex_read_that_steps_its_bookkeeping_back_holds() {
     assert_eq!(reads.check(CODEX_ORDER), Err(Hold::Changed), "latched");
 }
 
-/// Scenario: Take a Codex baseline from the deck's launch line, then compare it with the native the deck's telemetry shim started when an OTLP endpoint is configured: the wrapper's pair, the shim's own `-c otel.trace_exporter=…` and `-c otel.metrics_exporter=…` (produced here by the shim's own function), then the user's arguments. The two read as the same launch, for both exporters, the JSON protocol, either exporter alone, an endpoint that needs escaping, and without the pair. A user's `-c` that moves Ctrl+G behind the shim's overrides still holds as changed, and so does each `otel` override that isn't the shim's: another key, value or spelling, the shim's in the wrong order, twice, or behind a user's argument, and the shim's when the user's own arguments also override `otel` (the shim then adds nothing). A user's own `otel` override still counts as a source: on both sides it matches, on the baseline alone it holds.
+/// Scenario: Take a Codex baseline from the deck's launch line, then compare it with the native the deck's telemetry shim started when an OTLP endpoint is configured: the wrapper's pair, the shim's own `-c otel.trace_exporter=…` and `-c otel.metrics_exporter=…` (produced here by the shim's own function), then the user's arguments; the two read as the same launch for both exporters, the JSON protocol, either exporter alone, an endpoint that needs escaping, and without the pair. A user's `-c` that moves Ctrl+G behind the shim's overrides still holds as changed, and so does each `otel` override that isn't the shim's: another key, value or spelling, the shim's in the wrong order, twice, or behind a user's argument, and the shim's when the user's own arguments also override `otel` (the shim then adds nothing). A user's own `otel` override still counts as a source: on both sides it matches, on the baseline alone it holds.
 #[spec("inbox/probe/014")]
 #[test]
 fn probe_014_the_telemetry_shims_otel_overrides_are_not_a_codex_source() {
