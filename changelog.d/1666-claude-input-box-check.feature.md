@@ -15,6 +15,6 @@ What to know:
 - The deck reads the box in Claude Code's `dark`, `light`, `dark-ansi`, `light-ansi` and `dark-daltonized` themes; with another theme it may not recognise the box, and then checks and types nothing.
 - If you set `TMPDIR` for Claude Code to a directory that other users could change (for example one created group-writable under a `umask 0002`), the deck reads the box as not empty and its card keeps saying `there may be an unsent draft. Send it or clear it.`; remove that write access with `chmod go-w`, or leave `TMPDIR` unset.
 - The deck keeps that helper under its state directory (`~/.local/state/dot-agent-deck` by default) or, failing that, under `$XDG_RUNTIME_DIR`, and only where no other user can change the directories on the way. If `~/.local` is group-writable (common under a `umask 0002`) and `XDG_RUNTIME_DIR` isn't set, no Claude Code is checked: run `chmod go-w ~/.local ~/.local/state` and restart the deck's daemon.
-- macOS and Codex aren't covered yet: there, once you type into the agent's pane, its messages wait until it restarts, as before.
+- macOS isn't covered yet: there, once you type into the agent's pane, its messages wait until it restarts, as before. Codex gets the same check on Linux (see the Codex entry).
 
 The TUI and the desktop app show the same card words. See [Orchestration → How the deck checks Claude Code's input box](https://agent-deck.devopstoolkit.ai/docs/orchestration.md#how-the-deck-checks-claude-codes-input-box).

@@ -36,13 +36,13 @@
 //! frontiers from, with the check that no other process holds its master
 //! ([`master_holders`], Linux). The daemon feeds the hook every byte an agent writes,
 //! moves the epoch at acceptance, and decides installation at
-//! every spawn, which installs nothing outside the `e2e` build's assumption
-//! until activation. For an installed generation it keeps the invocation
-//! records, settles the permission to arm, answers its helper and observes
-//! it. A probe on an `Armable` generation publishes a liability and closes a
-//! fence (Q35-20), and its segments release what the fence held; no
-//! production generation is `Armable` before activation, so in production
-//! only the `e2e` build's assumption reaches any of it. Whether a ring
+//! every spawn, for the classes `install::INSTALL_ROLLOUT` names (a direct
+//! Claude Code, a direct or launched Codex) and, in the `e2e` build, the
+//! classes its assumption adds. For an installed generation it keeps the
+//! invocation records, settles the permission to arm, answers its helper and
+//! observes it. A probe on an `Armable` generation publishes a liability and
+//! closes a fence (Q35-20), and its segments release what the fence held.
+//! Whether a ring
 //! follows a check still reads today's draft tracking until Q35-21. The
 //! planner reads the records' liability count, to cut a person's input while
 //! one is out.
@@ -109,8 +109,8 @@ pub enum InertCause {
     UnknownRelease,
     /// The deck has no facts for this agent (OpenCode, Pi, Devin).
     UnsupportedAgent,
-    /// The agent's facts have no verified `editor_probe` (Codex until its
-    /// activation).
+    /// The agent's facts have no verified `editor_probe` (no shipped
+    /// agent's since the Codex activation; a test's own facts can).
     NoEditorRecord,
     /// `A` was never bound.
     Unbound,

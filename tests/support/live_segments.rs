@@ -271,11 +271,12 @@ impl Fixture {
         through: Option<&'static str>,
     ) -> Self {
         let mut env = vec![("DOT_AGENT_DECK_DOORBELL_TICK_MS", "25")];
+        // Claude Code's alone: Codex's classes are in the shipped rollout
+        // since the Codex activation, and its generations are checked with
+        // Codex's measured facts (the assumption refuses a list naming a
+        // Codex release).
         if assumed {
-            env.push((
-                "DOT_AGENT_DECK_E2E_ASSUME_EDITOR_PROBE",
-                "claude@2.1.310,codex@0.164.0",
-            ));
+            env.push(("DOT_AGENT_DECK_E2E_ASSUME_EDITOR_PROBE", "claude@2.1.310"));
         }
         // Diagnosis (Q35-21): the daemon logs the probe's and the
         // doorbell's decisions, and a failing test prints them. A caller

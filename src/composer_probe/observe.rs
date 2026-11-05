@@ -93,9 +93,9 @@
 //! undeclared wrapper's `kind-G` is written with its `gen-G`. One
 //! settler at a time ([`SettleClaim`]) computes it, and only a settlement
 //! that moves it out of `Pending` publishes `A` with it, so `gen-G` is
-//! written once. Nothing in production publishes a liability: installation
-//! rolls out to no class until activation, and the only publisher is the
-//! `e2e` build's control verb ([`Seam::control`]).
+//! written once. In production, installation rolls out to the classes in
+//! [`super::install::INSTALL_ROLLOUT`] (a direct Claude Code since the Claude
+//! activation; a direct or launched Codex since the Codex activation).
 //!
 //! **Lock order.** No lock is held while a file is read or written:
 //! ```text
@@ -1092,6 +1092,19 @@ impl<P: Page> Seam<P> {
                 .and(Err(Refusal::NoRecord)),
         };
         self.sync();
+        // cxact: why an invocation's outcome is what it is (the record's
+        // settlement, the daemon's attribution and read); no path or text.
+        tracing::debug!(
+            target: "composer_probe",
+            ?decided,
+            recorded = ?recorded.as_ref().map(|r| match r {
+                Recorded::Kept { settlement, .. } => format!("kept {settlement:?}"),
+                other => format!("{other:?}"),
+            }),
+            attribution = ?evidence.map(|e| e.attribution),
+            ?read,
+            "editor helper invocation recorded"
+        );
         if decided != Decision::Armed {
             // ExternalEdit's first producer (PR U3-11): an invocation that
             // isn't the deck's may edit the box, and the epoch says so

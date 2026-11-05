@@ -72,11 +72,11 @@ Restart the TUI for a change to take effect.
 
 ## Turn the doorbell off for Claude Code or Codex
 
-The deck types a doorbell line into an idle Claude Code or Codex to tell it a message is waiting, and checks Claude Code's input box before it does ([Delivery in the TUI and desktop app](orchestration.md#delivery-in-the-tui-and-desktop-app)). It does that for every release of each agent. A pre-release build, one whose version carries a suffix such as `-beta.1` or `-alpha.1`, gets neither: the deck can't read its version, so that agent's messages arrive through its own wake-up and hooks or at your next prompt ([`unknown_release`](troubleshooting.md#a-card-says-waiting-for-the-agent-to-fetch-it-send-it-a-prompt)). If an agent update makes the doorbell misbehave, turn it off for that agent in `config.toml` on the daemon's host:
+The deck types a doorbell line into an idle Claude Code or Codex to tell it a message is waiting, and checks the agent's input box before it does where it can ([Delivery in the TUI and desktop app](orchestration.md#delivery-in-the-tui-and-desktop-app)). It does that for every release of each agent. A pre-release build, one whose version carries a suffix such as `-beta.1` or `-alpha.1`, gets neither: the deck can't read its version, so that agent's messages arrive through its own wake-up and hooks or at your next prompt ([`unknown_release`](troubleshooting.md#a-card-says-waiting-for-the-agent-to-fetch-it-send-it-a-prompt)). If an agent update makes the doorbell misbehave, turn it off for that agent in `config.toml` on the daemon's host:
 
 ```bash
 dot-agent-deck config set doorbell.claude false   # no doorbell or input-box check for Claude Code
-dot-agent-deck config set doorbell.codex false    # no doorbell for Codex
+dot-agent-deck config set doorbell.codex false    # no doorbell or input-box check for Codex
 ```
 
 Use the config key, and with the desktop app especially: the daemon reads the file each time it starts an agent, so the key works for a daemon that is already running and for one the app started.

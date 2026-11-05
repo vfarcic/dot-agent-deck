@@ -6,9 +6,11 @@
 //! class ([`pane_class`]) and the rollout, never a release: no basename,
 //! `PATH` lookup or version subprocess stands in for one, and the release a
 //! generation's header later reports decides only whether the deck may arm
-//! it ([`super::permission`]). The rollout is [`INSTALL_ROLLOUT`] (since
-//! the Claude activation, `Direct(Claude)`), plus, in the `e2e` build only, the classes of the agents
-//! the e2e assumption names ([`assumed_classes`]). That assumption is read
+//! it ([`super::permission`]). The rollout is [`INSTALL_ROLLOUT`]
+//! (`Direct(Claude)` since the Claude activation; `Direct(Codex)` and
+//! `Launcher(Codex)` since the Codex activation), plus, in the `e2e` build
+//! only, the classes of the agents the e2e assumption names
+//! ([`assumed_classes`], Claude Code's alone). That assumption is read
 //! once, at daemon start ([`capture_assumption`]), where an unknown entry
 //! refuses the whole list and the daemon goes on with no assumption, so no
 //! generation is installed or armed by it; nothing reads the variable again.
@@ -114,14 +116,22 @@ pub enum PaneClass {
 pub const SHELLS: &[&str] = &["bash", "zsh", "fish", "sh", "dash", "nu", "pwsh"];
 
 /// The classes installation has rolled out to. The Claude activation
-/// (Q35-28) added `Direct(Claude)` only. Q35-22 gave every other class its
-/// binding (the shared discovery, [`super::discovery`]) without rolling it
-/// out: `Launcher(Claude)` and `Wrapper` wait for their own rollout, and
-/// Codex's classes for Q35-29
-/// (`docs/develop/doorbell-admission.md`). Installation is Linux-only
-/// whatever this holds: [`at_spawn`] returns [`NotInstalled::Platform`]
-/// on any other host.
-pub const INSTALL_ROLLOUT: &[PaneClass] = &[PaneClass::Direct(ProbeAgent::Claude)];
+/// (Q35-28) added `Direct(Claude)` only; the Codex activation (Q35-29) added
+/// `Direct(Codex)` and `Launcher(Codex)`. Q35-22 gave every class its
+/// binding (the shared discovery, [`super::discovery`]); `Launcher(Claude)`
+/// and `Wrapper` wait for their own rollout
+/// (`docs/develop/doorbell-admission.md`). A launched Codex gets the helper
+/// but neither the export directory's preparation nor the shell tool's
+/// policy arguments, which only a direct Codex's own argv can take, and its
+/// key-binding baseline is read from the launcher's arguments: where the
+/// native's launch differs, the generation is held, never checked.
+/// Installation is Linux-only whatever this holds: [`at_spawn`] returns
+/// [`NotInstalled::Platform`] on any other host.
+pub const INSTALL_ROLLOUT: &[PaneClass] = &[
+    PaneClass::Direct(ProbeAgent::Claude),
+    PaneClass::Direct(ProbeAgent::Codex),
+    PaneClass::Launcher(ProbeAgent::Codex),
+];
 
 /// The class of a pane running `command`, its agent declared as `declared`.
 pub fn pane_class(command: Option<&str>, declared: Option<&AgentType>) -> PaneClass {
@@ -167,8 +177,10 @@ fn plain_argv(command: &str) -> bool {
         && !command.contains("$(")
 }
 
-/// The classes the e2e assumption's agents roll out to: those Q35-28 adds
-/// for Claude and Q35-29 for Codex.
+/// The classes the e2e assumption's agents roll out to: Claude Code's
+/// launcher and wrapper classes, which no activation has rolled out yet.
+/// Codex's are in [`INSTALL_ROLLOUT`] since the Codex activation, so the
+/// assumption names no Codex release and adds none.
 pub fn assumed_classes(assumed: &[(AgentType, Version, EditorProbe<'_>)]) -> Vec<PaneClass> {
     let mut classes = Vec::new();
     for (agent, _, _) in assumed {
@@ -178,11 +190,7 @@ pub fn assumed_classes(assumed: &[(AgentType, Version, EditorProbe<'_>)]) -> Vec
                 PaneClass::Launcher(ProbeAgent::Claude),
                 PaneClass::Wrapper,
             ],
-            Some(ProbeAgent::Codex) => &[
-                PaneClass::Direct(ProbeAgent::Codex),
-                PaneClass::Launcher(ProbeAgent::Codex),
-            ],
-            None => &[],
+            Some(ProbeAgent::Codex) | None => &[],
         };
         for class in more {
             if !classes.contains(class) {
