@@ -21,7 +21,10 @@
 //! the user's group, and the other-writable directory only to the one
 //! without it (every attempt is printed). Where Docker
 //! or the image isn't available, or `/` or `/var/tmp` isn't on an
-//! allow-listed filesystem, the test skips.
+//! allow-listed filesystem, the test prints `SKIP: [e2e]` and passes, and
+//! fails instead under `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`. CI's runners
+//! have no `ubuntu:24.04` image and the test never pulls one, so its PASS
+//! in CI is that skip.
 
 mod common;
 
