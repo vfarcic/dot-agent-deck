@@ -1732,3 +1732,163 @@ fn probe_014_a_codex_read_that_loses_the_race_is_not_adopted() {
     );
     assert_eq!(reads.check(CODEX_ORDER), Err(Hold::Changed), "latched");
 }
+
+/// Scenario: Take a Codex baseline from the deck's launch line, then compare it with the native the deck's telemetry shim started when an OTLP endpoint is configured: the wrapper's pair, the shim's own `-c otel.trace_exporter=…` and `-c otel.metrics_exporter=…` (produced here by the shim's own function), then the user's arguments. The two read as the same launch, for both exporters, the JSON protocol, either exporter alone, an endpoint that needs escaping, and without the pair. A user's `-c` that moves Ctrl+G behind the shim's overrides still holds as changed, and so does each `otel` override that isn't the shim's: another key, value or spelling, the shim's in the wrong order, twice, or behind a user's argument, and the shim's when the user's own arguments also override `otel` (the shim then adds nothing). A user's own `otel` override still counts as a source: on both sides it matches, on the baseline alone it holds.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_the_telemetry_shims_otel_overrides_are_not_a_codex_source() {
+    use dot_agent_deck::composer_probe::keymap::CodexBaseline;
+    use dot_agent_deck::telemetry::launch::codex_args;
+    let dir = test_temp::tempdir().unwrap();
+    let home = dir.path().join("codex-home");
+    let cwd = dir.path().join("repo");
+    for d in [&home, &cwd] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    const PAIR: [&str; 2] = ["-c", "shell_environment_policy.set={}"];
+    let user = ["--model", "m", "-c", "model_reasoning_effort=low"];
+    let env = |extra: &[(&str, &str)]| {
+        let mut env = std::collections::HashMap::new();
+        env.insert("CODEX_HOME".to_string(), home.display().to_string());
+        env.insert(
+            "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
+            "http://127.0.0.1:4318".to_string(),
+        );
+        for (k, v) in extra {
+            env.insert(k.to_string(), v.to_string());
+        }
+        env
+    };
+    // What the shim puts after the pair, from the shim's own function.
+    let shim = |extra: &[(&str, &str)]| -> Vec<String> {
+        codex_args(&args(&[&PAIR[..], &user[..]].concat()), &env(extra))
+    };
+    let native = |front: &[&str], added: &[String], back: &[&str]| -> Vec<OsString> {
+        let added: Vec<&str> = added.iter().map(String::as_str).collect();
+        args(&[front, &added[..], &user[..], back].concat())
+    };
+    let baseline = CodexBaseline::at_spawn(&home, &args(&user), &cwd).unwrap();
+
+    let both = shim(&[]);
+    assert_eq!(both.len(), 4, "the shim adds both exporters: {both:?}");
+    for (row, added, front) in [
+        ("both exporters", both.clone(), &PAIR[..]),
+        (
+            "the JSON protocol",
+            shim(&[("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json")]),
+            &PAIR[..],
+        ),
+        (
+            "traces alone",
+            shim(&[("OTEL_METRICS_EXPORTER", "none")]),
+            &PAIR[..],
+        ),
+        (
+            "metrics alone",
+            shim(&[("OTEL_TRACES_EXPORTER", "none")]),
+            &PAIR[..],
+        ),
+        (
+            "an endpoint that needs escaping",
+            shim(&[(
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                "http://127.0.0.1:4318/a\"b\\c",
+            )]),
+            &PAIR[..],
+        ),
+        ("without the pair", both.clone(), &[][..]),
+    ] {
+        assert!(!added.is_empty(), "{row}: the shim added nothing");
+        assert_eq!(
+            baseline.bound(&home, &native(front, &added, &[]), &cwd),
+            Ok(()),
+            "{row}"
+        );
+    }
+
+    let (trace, metrics) = (both[..2].to_vec(), both[2..].to_vec());
+    let value = |i: usize| both[i].clone();
+    let s = |v: &[&str]| -> Vec<String> { v.iter().map(|a| a.to_string()).collect() };
+    let rebind = ["-c", "tui.keymap.global.open_external_editor=\"f6\""];
+    let user_otel = ["-c", "otel.exporter=\"none\""];
+    let mut wrong = Vec::new();
+    for (row, added, back) in [
+        ("a user's rebinding behind them", both.clone(), &rebind[..]),
+        (
+            "another key",
+            s(&[
+                "-c",
+                &value(1).replacen("otel.trace_exporter", "otel.exporter", 1),
+            ]),
+            &[][..],
+        ),
+        (
+            "another value",
+            s(&["-c", "otel.trace_exporter=\"none\""]),
+            &[][..],
+        ),
+        (
+            "another protocol",
+            s(&["-c", &value(1).replace("\"binary\"", "\"grpc\"")]),
+            &[][..],
+        ),
+        (
+            "another field",
+            s(&["-c", &value(1).replace("}}", ",headers={a=\"b\"}}}")]),
+            &[][..],
+        ),
+        ("--config", s(&["--config", &value(1)]), &[][..]),
+        ("-c=", s(&[&format!("-c={}", value(1))]), &[][..]),
+        (
+            "the wrong order",
+            [metrics.clone(), trace.clone()].concat(),
+            &[][..],
+        ),
+        ("twice", [trace.clone(), trace.clone()].concat(), &[][..]),
+    ] {
+        let got = baseline.bound(&home, &native(&PAIR, &added, back), &cwd);
+        if got != Err(Hold::Changed) {
+            wrong.push(format!("{row}: {got:?}"));
+        }
+    }
+    // Behind a user's argument rather than in front of them.
+    let behind = args(
+        &[
+            &PAIR[..],
+            &user[..2],
+            &both.iter().map(String::as_str).collect::<Vec<_>>(),
+            &user[2..],
+        ]
+        .concat(),
+    );
+    if baseline.bound(&home, &behind, &cwd) != Err(Hold::Changed) {
+        wrong.push("behind a user's argument".to_string());
+    }
+    // The user's own arguments override otel too, so the shim would have
+    // added nothing: the overrides in front are not the shim's.
+    let with_otel =
+        CodexBaseline::at_spawn(&home, &args(&[&user[..], &user_otel[..]].concat()), &cwd).unwrap();
+    if with_otel.bound(&home, &native(&PAIR, &both, &user_otel), &cwd) != Err(Hold::Changed) {
+        wrong.push("the user's own otel override too".to_string());
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+
+    // A user's own otel override on the launch line still counts.
+    let theirs = ["-c", "otel.exporter=\"none\""];
+    let own =
+        CodexBaseline::at_spawn(&home, &args(&[&theirs[..], &user[..]].concat()), &cwd).unwrap();
+    assert_eq!(
+        own.bound(
+            &home,
+            &args(&[&PAIR[..], &theirs[..], &user[..]].concat()),
+            &cwd
+        ),
+        Ok(()),
+        "on both sides"
+    );
+    assert_eq!(
+        own.bound(&home, &args(&[&PAIR[..], &user[..]].concat()), &cwd),
+        Err(Hold::Changed),
+        "on the baseline alone"
+    );
+}

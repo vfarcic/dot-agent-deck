@@ -897,11 +897,21 @@ impl CodexBaseline {
     /// The baseline against the launch the bound agent actually made, with
     /// `args` in `cwd`: the same sources, or [`Hold::Changed`] (a launcher
     /// that passed other flags, or started Codex in another directory).
+    ///
+    /// The bound launch may also be the baseline's with the deck's telemetry
+    /// shim's own `otel` overrides in front ([`without_shim_otel`], the
+    /// revcxkey review's M3): the baseline reads the deck's launch line,
+    /// which never passes through the shim, so only this side can carry
+    /// them, and they are left out only when what remains is the baseline's
+    /// launch.
     pub fn bound(&self, codex_home: &Path, args: &[OsString], cwd: &Path) -> Result<(), Hold> {
-        if codex_launch(codex_home, args, cwd)? == self.sources {
-            Ok(())
-        } else {
-            Err(Hold::Changed)
+        let args = without_embedded_pair(args);
+        if codex_sources(codex_home, args, cwd)? == self.sources {
+            return Ok(());
+        }
+        match without_shim_otel(args) {
+            Some(rest) if codex_sources(codex_home, rest, cwd)? == self.sources => Ok(()),
+            _ => Err(Hold::Changed),
         }
     }
 }
@@ -1059,11 +1069,79 @@ pub struct CodexTicket {
 /// The spawn's baseline and the bound agent's launch both come through here,
 /// so the pair is left out on both sides (A-20d-13).
 fn codex_launch(codex_home: &Path, args: &[OsString], cwd: &Path) -> Result<CodexSources, Hold> {
-    let args = without_embedded_pair(args);
+    codex_sources(codex_home, without_embedded_pair(args), cwd)
+}
+
+/// [`CodexSources::from_launch`] with the project files for `cwd`, for
+/// `args` as given.
+fn codex_sources(codex_home: &Path, args: &[OsString], cwd: &Path) -> Result<CodexSources, Hold> {
     if codex_moves_cwd(args) {
         return Err(Hold::Unpinned);
     }
     CodexSources::from_launch(codex_home, args, codex_project_files(cwd, codex_home)?)
+}
+
+/// The keys the deck's telemetry shim sets on a Codex's command line, in
+/// the order it writes them (`crate::telemetry::launch::codex_args`).
+const SHIM_OTEL_KEYS: [&str; 2] = ["otel.trace_exporter", "otel.metrics_exporter"];
+
+/// `args` (after the deck's embedded-mode pair) without the telemetry
+/// shim's leading `otel` overrides, or `None` when they don't open with one
+/// (the revcxkey review's M3). With an OTLP endpoint configured, the shim
+/// the daemon puts first on every agent's `PATH` runs a Codex called by
+/// name with `-c otel.trace_exporter=…` and `-c otel.metrics_exporter=…`
+/// after the pair and before the user's own arguments, either of them
+/// left out when its signal has no endpoint (`crate::telemetry::shim`).
+///
+/// Only that position and shape is the shim's: `-c` (not another spelling)
+/// and the key, in that order, each at most once, whose value is exactly
+/// `{otlp-http={endpoint=<string>,protocol="binary"|"json"}}`; and the shim
+/// adds nothing when the user's own arguments override `otel`
+/// (`codex_overrides_otel`), so overrides followed by one are not left out.
+/// An `otel` override sets no key binding, so leaving out one the user
+/// wrote in the shim's shape at the front can't hide a rebinding.
+fn without_shim_otel(args: &[OsString]) -> Option<&[OsString]> {
+    let mut rest = args;
+    for key in SHIM_OTEL_KEYS {
+        if let [flag, value, after @ ..] = rest
+            && flag == "-c"
+            && value
+                .to_str()
+                .is_some_and(|value| shim_otel_value(key, value))
+        {
+            rest = after;
+        }
+    }
+    (rest.len() < args.len() && !crate::telemetry::launch::codex_overrides_otel(rest))
+        .then_some(rest)
+}
+
+/// Whether `arg` is `key=` followed by the exporter table the telemetry
+/// shim writes: `{otlp-http={endpoint=<string>,protocol="binary"|"json"}}`
+/// and nothing else.
+fn shim_otel_value(key: &str, arg: &str) -> bool {
+    let Some(value) = arg
+        .strip_prefix(key)
+        .and_then(|rest| rest.strip_prefix('='))
+    else {
+        return false;
+    };
+    let Ok(mut table) = format!("v = {value}").parse::<toml::Table>() else {
+        return false;
+    };
+    let Some(toml::Value::Table(exporter)) = table.remove("v") else {
+        return false;
+    };
+    let Some(toml::Value::Table(http)) = exporter.get("otlp-http") else {
+        return false;
+    };
+    exporter.len() == 1
+        && http.len() == 2
+        && http.get("endpoint").is_some_and(toml::Value::is_str)
+        && http
+            .get("protocol")
+            .and_then(toml::Value::as_str)
+            .is_some_and(|p| p == "binary" || p == "json")
 }
 
 /// `args` (after the program) without #2002's embedded-mode pair
