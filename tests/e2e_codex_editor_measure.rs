@@ -129,7 +129,7 @@ fn probe_092_live_codex_164_config_writes_at_start() {
     eprintln!("CONFIG-WRITES {delays:?} ms after the first ready composer");
 }
 
-/// Scenario: In one pinned Codex 0.164.0, send twelve wire forms of Ctrl+G, whole and split, from a draft, the slash popup, reverse search and the shortcuts overlay, then paste `PASTE`, a BEL and `TAIL` four times: Ctrl+G as BEL opens the editor from a draft, and the pasted BEL never reaches the export.
+/// Scenario: In one pinned Codex 0.164.0, send twelve wire forms of Ctrl+G, whole and split, from a draft, the slash popup, reverse search and the shortcuts overlay, then paste `PASTE`, a BEL and `TAIL` four times: Ctrl+G as BEL and as the CSI-u 103 implicit, press and repeat forms opens the editor from a draft, whole and split, and the pasted BEL never reaches the export.
 #[spec("inbox/probe/092")]
 #[test]
 fn probe_092_live_codex_164_ctrl_g_forms_and_pasted_bel() {

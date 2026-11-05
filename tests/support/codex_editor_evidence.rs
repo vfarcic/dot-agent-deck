@@ -646,7 +646,18 @@ pub fn check_forms(dir: &Path) -> Vec<(String, Vec<String>)> {
         }
     }
     let composer = &by_state.iter().find(|(s, _)| s == "composer").unwrap().1;
-    for form in ["bel", "bel/split", "u-103-implicit", "u-103-event1"] {
+    // BEL, and CSI-u 103 implicit, press (event 1) and repeat (event 2),
+    // each whole and split.
+    for form in [
+        "bel",
+        "bel/split",
+        "u-103-implicit",
+        "u-103-implicit/split",
+        "u-103-event1",
+        "u-103-event1/split",
+        "u-103-event2",
+        "u-103-event2/split",
+    ] {
         assert!(
             composer.contains(&form.to_string()),
             "{form} opens from a draft: {composer:?}"

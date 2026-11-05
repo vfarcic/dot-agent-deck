@@ -81,3 +81,4 @@ EditorProbe {
 - A real terminal editor, or a `VISUAL` with shell syntax beyond one quoted word.
 - A project root found by markers, a project file in an ancestor directory, or profile selection through `config.toml`'s `profile =`.
 - `keymap_loaded_at_start`, which stays `Absent` for Codex by design.
+- A Codex generation the deck can check end to end. Neither measured form gives a checkable generation (plain command: bound, held `Keymap(Changed)`; the pair typed into the command: `NotResolved`, `Inert(Unbound)`); the form the deck writes when `VISUAL` or `EDITOR` is set was not measured.

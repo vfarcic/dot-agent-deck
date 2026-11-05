@@ -50,7 +50,7 @@ fn probe_092_codex_164_rewrites_its_config_on_its_first_four_starts() {
     eprintln!("config.toml written {delays:?} ms after the first ready composer");
 }
 
-/// Scenario: Read the committed Codex 0.164.0 wire-form recording: from a draft, Ctrl+G as BEL and as the CSI-u 103 press and repeat opens the editor, whole and split; a bracketed paste holding a BEL opens nothing, and the next export holds `BASEPASTETAIL`, the BEL removed, in all four pastes.
+/// Scenario: Read the committed Codex 0.164.0 wire-form recording: from a draft, Ctrl+G as BEL and as the CSI-u 103 implicit, press and repeat forms opens the editor, whole and split; a bracketed paste holding a BEL opens nothing, and the next export holds `BASEPASTETAIL`, the BEL removed, in all four pastes.
 #[spec("inbox/probe/092")]
 #[test]
 fn probe_092_codex_164_ctrl_g_forms_and_pasted_bel() {
