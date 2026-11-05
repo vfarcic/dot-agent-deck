@@ -1,0 +1,1351 @@
+{
+ "release": "0.164.0",
+ "sha256": "b93f6811d3f653f0fb83be4050d857fb9abbb111dfa2ce160563327daff7f306",
+ "mode": "editor",
+ "error": null,
+ "size": [
+  50,
+  200
+ ],
+ "term": "xterm-256color",
+ "colorterm": "truecolor",
+ "env_names": [
+  "COLORTERM",
+  "HOME",
+  "LANG",
+  "PATH",
+  "PWD",
+  "TERM"
+ ],
+ "setup": "nollm: dummy key, loopback Responses server, bwrap --unshare-net, tmpfs /home /root /tmp /run/user",
+ "recorder_sha256": "1bb22be75acc1823a61dd808202a7dea6609ac44b40f5828d01a97024136fd81",
+ "rows": [
+  {
+   "cell": "visual",
+   "trial": 1,
+   "label": "visual-1",
+   "launch": "visual",
+   "draft": "CXM_DRAFT_1",
+   "opened": true,
+   "argv_tail": [
+    "visual tag",
+    "ROOT/home/.codex/editor/.tmpbLCsDh.md"
+   ],
+   "editor_ran": "visual tag",
+   "visual": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture 'visual tag'",
+   "editor": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture editor-ignored",
+   "isatty": [
+    true,
+    true,
+    true
+   ],
+   "export_rule": {
+    "last_argument": true,
+    "in_codex_editor_dir": true,
+    "name_shape": true,
+    "parent_mode": "0o775",
+    "path": "ROOT/home/.codex/editor/.tmpbLCsDh.md"
+   },
+   "export_had_draft": "CXM_DRAFT_1",
+   "rc": 0,
+   "composer_after": "CXM_EDITED_1",
+   "sent_off": 9610,
+   "start_off": 11771,
+   "exit_off": 11771,
+   "done_off": 13914,
+   "marks": [
+    {
+     "off": 9610,
+     "mark": "?2026h"
+    },
+    {
+     "off": 9646,
+     "mark": "?2026l"
+    },
+    {
+     "off": 9654,
+     "mark": "?2026h"
+    },
+    {
+     "off": 9770,
+     "mark": "?2026l"
+    },
+    {
+     "off": 9778,
+     "mark": "?2026h"
+    },
+    {
+     "off": 9859,
+     "mark": "?2004l"
+    },
+    {
+     "off": 11716,
+     "mark": "?2004l"
+    },
+    {
+     "off": 11743,
+     "mark": "?2026l"
+    },
+    {
+     "off": 11787,
+     "mark": "?2004h"
+    },
+    {
+     "off": 11925,
+     "mark": "?2026h"
+    },
+    {
+     "off": 13862,
+     "mark": "?2026l"
+    },
+    {
+     "off": 13870,
+     "mark": "?2026h"
+    },
+    {
+     "off": 13906,
+     "mark": "?2026l"
+    }
+   ]
+  },
+  {
+   "cell": "visual",
+   "trial": 2,
+   "label": "visual-2",
+   "launch": "visual",
+   "draft": "CXM_DRAFT_2",
+   "opened": true,
+   "argv_tail": [
+    "visual tag",
+    "ROOT/home/.codex/editor/.tmpl6x339.md"
+   ],
+   "editor_ran": "visual tag",
+   "visual": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture 'visual tag'",
+   "editor": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture editor-ignored",
+   "isatty": [
+    true,
+    true,
+    true
+   ],
+   "export_rule": {
+    "last_argument": true,
+    "in_codex_editor_dir": true,
+    "name_shape": true,
+    "parent_mode": "0o775",
+    "path": "ROOT/home/.codex/editor/.tmpl6x339.md"
+   },
+   "export_had_draft": "CXM_DRAFT_2",
+   "rc": 0,
+   "composer_after": "CXM_EDITED_2",
+   "sent_off": 16743,
+   "start_off": 18904,
+   "exit_off": 18904,
+   "done_off": 21003,
+   "marks": [
+    {
+     "off": 16743,
+     "mark": "?2026h"
+    },
+    {
+     "off": 16779,
+     "mark": "?2026l"
+    },
+    {
+     "off": 16787,
+     "mark": "?2026h"
+    },
+    {
+     "off": 16903,
+     "mark": "?2026l"
+    },
+    {
+     "off": 16911,
+     "mark": "?2026h"
+    },
+    {
+     "off": 16992,
+     "mark": "?2004l"
+    },
+    {
+     "off": 18849,
+     "mark": "?2004l"
+    },
+    {
+     "off": 18876,
+     "mark": "?2026l"
+    },
+    {
+     "off": 18920,
+     "mark": "?2004h"
+    },
+    {
+     "off": 19058,
+     "mark": "?2026h"
+    },
+    {
+     "off": 20995,
+     "mark": "?2026l"
+    }
+   ]
+  },
+  {
+   "cell": "visual",
+   "trial": 3,
+   "label": "visual-3",
+   "launch": "visual",
+   "draft": "CXM_DRAFT_3",
+   "opened": true,
+   "argv_tail": [
+    "visual tag",
+    "ROOT/home/.codex/editor/.tmpogA6bH.md"
+   ],
+   "editor_ran": "visual tag",
+   "visual": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture 'visual tag'",
+   "editor": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture editor-ignored",
+   "isatty": [
+    true,
+    true,
+    true
+   ],
+   "export_rule": {
+    "last_argument": true,
+    "in_codex_editor_dir": true,
+    "name_shape": true,
+    "parent_mode": "0o775",
+    "path": "ROOT/home/.codex/editor/.tmpogA6bH.md"
+   },
+   "export_had_draft": "CXM_DRAFT_3",
+   "rc": 0,
+   "composer_after": "CXM_EDITED_3",
+   "sent_off": 23789,
+   "start_off": 25950,
+   "exit_off": 25950,
+   "done_off": 28049,
+   "marks": [
+    {
+     "off": 23789,
+     "mark": "?2026h"
+    },
+    {
+     "off": 23825,
+     "mark": "?2026l"
+    },
+    {
+     "off": 23833,
+     "mark": "?2026h"
+    },
+    {
+     "off": 23949,
+     "mark": "?2026l"
+    },
+    {
+     "off": 23957,
+     "mark": "?2026h"
+    },
+    {
+     "off": 24038,
+     "mark": "?2004l"
+    },
+    {
+     "off": 25895,
+     "mark": "?2004l"
+    },
+    {
+     "off": 25922,
+     "mark": "?2026l"
+    },
+    {
+     "off": 25966,
+     "mark": "?2004h"
+    },
+    {
+     "off": 26104,
+     "mark": "?2026h"
+    },
+    {
+     "off": 28041,
+     "mark": "?2026l"
+    }
+   ]
+  },
+  {
+   "cell": "visual",
+   "trial": 4,
+   "label": "visual-4",
+   "launch": "visual",
+   "draft": "CXM_DRAFT_4",
+   "opened": true,
+   "argv_tail": [
+    "visual tag",
+    "ROOT/home/.codex/editor/.tmpqCL9Hq.md"
+   ],
+   "editor_ran": "visual tag",
+   "visual": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture 'visual tag'",
+   "editor": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture editor-ignored",
+   "isatty": [
+    true,
+    true,
+    true
+   ],
+   "export_rule": {
+    "last_argument": true,
+    "in_codex_editor_dir": true,
+    "name_shape": true,
+    "parent_mode": "0o775",
+    "path": "ROOT/home/.codex/editor/.tmpqCL9Hq.md"
+   },
+   "export_had_draft": "CXM_DRAFT_4",
+   "rc": 0,
+   "composer_after": "CXM_EDITED_4",
+   "sent_off": 30835,
+   "start_off": 32996,
+   "exit_off": 32996,
+   "done_off": 35095,
+   "marks": [
+    {
+     "off": 30835,
+     "mark": "?2026h"
+    },
+    {
+     "off": 30871,
+     "mark": "?2026l"
+    },
+    {
+     "off": 30879,
+     "mark": "?2026h"
+    },
+    {
+     "off": 30995,
+     "mark": "?2026l"
+    },
+    {
+     "off": 31003,
+     "mark": "?2026h"
+    },
+    {
+     "off": 31084,
+     "mark": "?2004l"
+    },
+    {
+     "off": 32941,
+     "mark": "?2004l"
+    },
+    {
+     "off": 32968,
+     "mark": "?2026l"
+    },
+    {
+     "off": 33012,
+     "mark": "?2004h"
+    },
+    {
+     "off": 33150,
+     "mark": "?2026h"
+    },
+    {
+     "off": 35087,
+     "mark": "?2026l"
+    }
+   ]
+  },
+  {
+   "cell": "visual",
+   "trial": 5,
+   "label": "visual-5",
+   "launch": "visual",
+   "draft": "CXM_DRAFT_5",
+   "opened": true,
+   "argv_tail": [
+    "visual tag",
+    "ROOT/home/.codex/editor/.tmpOKPgvc.md"
+   ],
+   "editor_ran": "visual tag",
+   "visual": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture 'visual tag'",
+   "editor": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture editor-ignored",
+   "isatty": [
+    true,
+    true,
+    true
+   ],
+   "export_rule": {
+    "last_argument": true,
+    "in_codex_editor_dir": true,
+    "name_shape": true,
+    "parent_mode": "0o775",
+    "path": "ROOT/home/.codex/editor/.tmpOKPgvc.md"
+   },
+   "export_had_draft": "CXM_DRAFT_5",
+   "rc": 0,
+   "composer_after": "CXM_EDITED_5",
+   "sent_off": 37881,
+   "start_off": 40042,
+   "exit_off": 40042,
+   "done_off": 42141,
+   "marks": [
+    {
+     "off": 37881,
+     "mark": "?2026h"
+    },
+    {
+     "off": 37917,
+     "mark": "?2026l"
+    },
+    {
+     "off": 37925,
+     "mark": "?2026h"
+    },
+    {
+     "off": 38041,
+     "mark": "?2026l"
+    },
+    {
+     "off": 38049,
+     "mark": "?2026h"
+    },
+    {
+     "off": 38130,
+     "mark": "?2004l"
+    },
+    {
+     "off": 39987,
+     "mark": "?2004l"
+    },
+    {
+     "off": 40014,
+     "mark": "?2026l"
+    },
+    {
+     "off": 40058,
+     "mark": "?2004h"
+    },
+    {
+     "off": 40196,
+     "mark": "?2026h"
+    },
+    {
+     "off": 42133,
+     "mark": "?2026l"
+    }
+   ]
+  },
+  {
+   "cell": "visual-rc37",
+   "label": "visual-rc37",
+   "launch": "visual",
+   "opened": true,
+   "argv_tail": [
+    "visual tag",
+    "ROOT/home/.codex/editor/.tmprdBPj2.md"
+   ],
+   "editor_ran": "visual tag",
+   "visual": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture 'visual tag'",
+   "editor": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture editor-ignored",
+   "isatty": [
+    true,
+    true,
+    true
+   ],
+   "rc": 37,
+   "composer_after": "CXM_DRAFT_RC",
+   "error_line": "■ Failed to open editor: editor exited with status exit status: 37",
+   "sent_off": 44972,
+   "start_off": 47134,
+   "exit_off": 47134,
+   "done_off": 49321,
+   "marks": [
+    {
+     "off": 44972,
+     "mark": "?2026h"
+    },
+    {
+     "off": 45008,
+     "mark": "?2026l"
+    },
+    {
+     "off": 45016,
+     "mark": "?2026h"
+    },
+    {
+     "off": 45132,
+     "mark": "?2026l"
+    },
+    {
+     "off": 45140,
+     "mark": "?2026h"
+    },
+    {
+     "off": 45221,
+     "mark": "?2004l"
+    },
+    {
+     "off": 47079,
+     "mark": "?2004l"
+    },
+    {
+     "off": 47106,
+     "mark": "?2026l"
+    },
+    {
+     "off": 47150,
+     "mark": "?2004h"
+    },
+    {
+     "off": 47288,
+     "mark": "?2026h"
+    },
+    {
+     "off": 49313,
+     "mark": "?2026l"
+    }
+   ]
+  },
+  {
+   "cell": "esc-empty",
+   "trial": 1,
+   "label": "esc-empty-1-1",
+   "launch": "visual",
+   "opened": true,
+   "argv_tail": [
+    "visual tag",
+    "ROOT/home/.codex/editor/.tmp6VGbjg.md"
+   ],
+   "editor_ran": "visual tag",
+   "visual": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture 'visual tag'",
+   "editor": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture editor-ignored",
+   "isatty": [
+    true,
+    true,
+    true
+   ],
+   "rc": 0,
+   "composer_after": "CXM_ESC_1_1",
+   "error_line": "■ Failed to open editor: editor exited with status exit status: 37",
+   "sent_off": 50370,
+   "start_off": 52619,
+   "exit_off": 52619,
+   "done_off": 54805,
+   "marks": [
+    {
+     "off": 50370,
+     "mark": "?2026h"
+    },
+    {
+     "off": 50406,
+     "mark": "?2026l"
+    },
+    {
+     "off": 50414,
+     "mark": "?2026h"
+    },
+    {
+     "off": 50530,
+     "mark": "?2026l"
+    },
+    {
+     "off": 50538,
+     "mark": "?2026h"
+    },
+    {
+     "off": 50619,
+     "mark": "?2004l"
+    },
+    {
+     "off": 52564,
+     "mark": "?2004l"
+    },
+    {
+     "off": 52591,
+     "mark": "?2026l"
+    },
+    {
+     "off": 52635,
+     "mark": "?2004h"
+    },
+    {
+     "off": 52773,
+     "mark": "?2026h"
+    },
+    {
+     "off": 54797,
+     "mark": "?2026l"
+    }
+   ]
+  },
+  {
+   "cell": "esc-empty-control",
+   "trial": 1,
+   "label": "esc-empty-0-1",
+   "launch": "visual",
+   "opened": true,
+   "argv_tail": [
+    "visual tag",
+    "ROOT/home/.codex/editor/.tmp4Q1U7h.md"
+   ],
+   "editor_ran": "visual tag",
+   "visual": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture 'visual tag'",
+   "editor": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture editor-ignored",
+   "isatty": [
+    true,
+    true,
+    true
+   ],
+   "rc": 0,
+   "composer_after": "CXM_ESC_0_1",
+   "error_line": "■ Failed to open editor: editor exited with status exit status: 37",
+   "sent_off": 55717,
+   "start_off": 57974,
+   "exit_off": 57974,
+   "done_off": 60160,
+   "marks": [
+    {
+     "off": 55717,
+     "mark": "?2026l"
+    },
+    {
+     "off": 55725,
+     "mark": "?2026h"
+    },
+    {
+     "off": 55761,
+     "mark": "?2026l"
+    },
+    {
+     "off": 55769,
+     "mark": "?2026h"
+    },
+    {
+     "off": 55885,
+     "mark": "?2026l"
+    },
+    {
+     "off": 55893,
+     "mark": "?2026h"
+    },
+    {
+     "off": 55974,
+     "mark": "?2004l"
+    },
+    {
+     "off": 57919,
+     "mark": "?2004l"
+    },
+    {
+     "off": 57946,
+     "mark": "?2026l"
+    },
+    {
+     "off": 57990,
+     "mark": "?2004h"
+    },
+    {
+     "off": 58128,
+     "mark": "?2026h"
+    },
+    {
+     "off": 60152,
+     "mark": "?2026l"
+    }
+   ]
+  },
+  {
+   "cell": "esc-empty",
+   "trial": 2,
+   "label": "esc-empty-1-2",
+   "launch": "visual",
+   "opened": true,
+   "argv_tail": [
+    "visual tag",
+    "ROOT/home/.codex/editor/.tmpsuHHMW.md"
+   ],
+   "editor_ran": "visual tag",
+   "visual": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture 'visual tag'",
+   "editor": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture editor-ignored",
+   "isatty": [
+    true,
+    true,
+    true
+   ],
+   "rc": 0,
+   "composer_after": "CXM_ESC_1_2",
+   "error_line": "■ Failed to open editor: editor exited with status exit status: 37",
+   "sent_off": 61209,
+   "start_off": 63458,
+   "exit_off": 63458,
+   "done_off": 65644,
+   "marks": [
+    {
+     "off": 61209,
+     "mark": "?2026h"
+    },
+    {
+     "off": 61245,
+     "mark": "?2026l"
+    },
+    {
+     "off": 61253,
+     "mark": "?2026h"
+    },
+    {
+     "off": 61369,
+     "mark": "?2026l"
+    },
+    {
+     "off": 61377,
+     "mark": "?2026h"
+    },
+    {
+     "off": 61458,
+     "mark": "?2004l"
+    },
+    {
+     "off": 63403,
+     "mark": "?2004l"
+    },
+    {
+     "off": 63430,
+     "mark": "?2026l"
+    },
+    {
+     "off": 63474,
+     "mark": "?2004h"
+    },
+    {
+     "off": 63612,
+     "mark": "?2026h"
+    },
+    {
+     "off": 65636,
+     "mark": "?2026l"
+    }
+   ]
+  },
+  {
+   "cell": "esc-empty-control",
+   "trial": 2,
+   "label": "esc-empty-0-2",
+   "launch": "visual",
+   "opened": true,
+   "argv_tail": [
+    "visual tag",
+    "ROOT/home/.codex/editor/.tmpmsCLK0.md"
+   ],
+   "editor_ran": "visual tag",
+   "visual": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture 'visual tag'",
+   "editor": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture editor-ignored",
+   "isatty": [
+    true,
+    true,
+    true
+   ],
+   "rc": 0,
+   "composer_after": "CXM_ESC_0_2",
+   "error_line": "■ Failed to open editor: editor exited with status exit status: 37",
+   "sent_off": 66607,
+   "start_off": 68856,
+   "exit_off": 68856,
+   "done_off": 71042,
+   "marks": [
+    {
+     "off": 66607,
+     "mark": "?2026h"
+    },
+    {
+     "off": 66643,
+     "mark": "?2026l"
+    },
+    {
+     "off": 66651,
+     "mark": "?2026h"
+    },
+    {
+     "off": 66767,
+     "mark": "?2026l"
+    },
+    {
+     "off": 66775,
+     "mark": "?2026h"
+    },
+    {
+     "off": 66856,
+     "mark": "?2004l"
+    },
+    {
+     "off": 68801,
+     "mark": "?2004l"
+    },
+    {
+     "off": 68828,
+     "mark": "?2026l"
+    },
+    {
+     "off": 68872,
+     "mark": "?2004h"
+    },
+    {
+     "off": 69010,
+     "mark": "?2026h"
+    },
+    {
+     "off": 71034,
+     "mark": "?2026l"
+    }
+   ]
+  },
+  {
+   "cell": "esc-empty",
+   "trial": 3,
+   "label": "esc-empty-1-3",
+   "launch": "visual",
+   "opened": true,
+   "argv_tail": [
+    "visual tag",
+    "ROOT/home/.codex/editor/.tmpdNd5NP.md"
+   ],
+   "editor_ran": "visual tag",
+   "visual": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture 'visual tag'",
+   "editor": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture editor-ignored",
+   "isatty": [
+    true,
+    true,
+    true
+   ],
+   "rc": 0,
+   "composer_after": "CXM_ESC_1_3",
+   "error_line": "■ Failed to open editor: editor exited with status exit status: 37",
+   "sent_off": 72091,
+   "start_off": 74340,
+   "exit_off": 74340,
+   "done_off": 76526,
+   "marks": [
+    {
+     "off": 72091,
+     "mark": "?2026h"
+    },
+    {
+     "off": 72127,
+     "mark": "?2026l"
+    },
+    {
+     "off": 72135,
+     "mark": "?2026h"
+    },
+    {
+     "off": 72251,
+     "mark": "?2026l"
+    },
+    {
+     "off": 72259,
+     "mark": "?2026h"
+    },
+    {
+     "off": 72340,
+     "mark": "?2004l"
+    },
+    {
+     "off": 74285,
+     "mark": "?2004l"
+    },
+    {
+     "off": 74312,
+     "mark": "?2026l"
+    },
+    {
+     "off": 74356,
+     "mark": "?2004h"
+    },
+    {
+     "off": 74494,
+     "mark": "?2026h"
+    },
+    {
+     "off": 76518,
+     "mark": "?2026l"
+    }
+   ]
+  },
+  {
+   "cell": "esc-empty-control",
+   "trial": 3,
+   "label": "esc-empty-0-3",
+   "launch": "visual",
+   "opened": true,
+   "argv_tail": [
+    "visual tag",
+    "ROOT/home/.codex/editor/.tmpCgWKIu.md"
+   ],
+   "editor_ran": "visual tag",
+   "visual": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture 'visual tag'",
+   "editor": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture editor-ignored",
+   "isatty": [
+    true,
+    true,
+    true
+   ],
+   "rc": 0,
+   "composer_after": "CXM_ESC_0_3",
+   "error_line": "■ Failed to open editor: editor exited with status exit status: 37",
+   "sent_off": 77489,
+   "start_off": 79738,
+   "exit_off": 79738,
+   "done_off": 81924,
+   "marks": [
+    {
+     "off": 77489,
+     "mark": "?2026h"
+    },
+    {
+     "off": 77525,
+     "mark": "?2026l"
+    },
+    {
+     "off": 77533,
+     "mark": "?2026h"
+    },
+    {
+     "off": 77649,
+     "mark": "?2026l"
+    },
+    {
+     "off": 77657,
+     "mark": "?2026h"
+    },
+    {
+     "off": 77738,
+     "mark": "?2004l"
+    },
+    {
+     "off": 79683,
+     "mark": "?2004l"
+    },
+    {
+     "off": 79710,
+     "mark": "?2026l"
+    },
+    {
+     "off": 79754,
+     "mark": "?2004h"
+    },
+    {
+     "off": 79892,
+     "mark": "?2026h"
+    },
+    {
+     "off": 81916,
+     "mark": "?2026l"
+    }
+   ]
+  },
+  {
+   "cell": "editor-only",
+   "trial": 1,
+   "label": "editor-only-1",
+   "launch": "editor-only",
+   "env": {
+    "EDITOR": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture editor"
+   },
+   "path_stubs": false,
+   "draft": "CXM_EDITOR_ONLY_1",
+   "opened": true,
+   "argv_tail": [
+    "editor",
+    "ROOT/home/.codex/editor/.tmpJmOdiy.md"
+   ],
+   "editor_ran": "editor",
+   "editor": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture editor",
+   "isatty": [
+    true,
+    true,
+    true
+   ],
+   "rc": 0,
+   "composer_after": "CXM_SEL_EDITED_1",
+   "sent_off": 9768,
+   "start_off": 11943,
+   "exit_off": 11943,
+   "done_off": 14046,
+   "marks": [
+    {
+     "off": 9768,
+     "mark": "?2026l"
+    },
+    {
+     "off": 9776,
+     "mark": "?2026h"
+    },
+    {
+     "off": 9812,
+     "mark": "?2026l"
+    },
+    {
+     "off": 9820,
+     "mark": "?2026h"
+    },
+    {
+     "off": 9936,
+     "mark": "?2026l"
+    },
+    {
+     "off": 9944,
+     "mark": "?2026h"
+    },
+    {
+     "off": 10025,
+     "mark": "?2004l"
+    },
+    {
+     "off": 11888,
+     "mark": "?2004l"
+    },
+    {
+     "off": 11915,
+     "mark": "?2026l"
+    },
+    {
+     "off": 11959,
+     "mark": "?2004h"
+    },
+    {
+     "off": 12097,
+     "mark": "?2026h"
+    },
+    {
+     "off": 14038,
+     "mark": "?2026l"
+    }
+   ]
+  },
+  {
+   "cell": "editor-only",
+   "trial": 2,
+   "label": "editor-only-2",
+   "launch": "editor-only",
+   "env": {
+    "EDITOR": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture editor"
+   },
+   "path_stubs": false,
+   "draft": "CXM_EDITOR_ONLY_2",
+   "opened": true,
+   "argv_tail": [
+    "editor",
+    "ROOT/home/.codex/editor/.tmpGz0LyA.md"
+   ],
+   "editor_ran": "editor",
+   "editor": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture editor",
+   "isatty": [
+    true,
+    true,
+    true
+   ],
+   "rc": 0,
+   "composer_after": "CXM_SEL_EDITED_2",
+   "sent_off": 16838,
+   "start_off": 19005,
+   "exit_off": 19005,
+   "done_off": 21152,
+   "marks": [
+    {
+     "off": 16838,
+     "mark": "?2026h"
+    },
+    {
+     "off": 16874,
+     "mark": "?2026l"
+    },
+    {
+     "off": 16882,
+     "mark": "?2026h"
+    },
+    {
+     "off": 16998,
+     "mark": "?2026l"
+    },
+    {
+     "off": 17006,
+     "mark": "?2026h"
+    },
+    {
+     "off": 17087,
+     "mark": "?2004l"
+    },
+    {
+     "off": 18950,
+     "mark": "?2004l"
+    },
+    {
+     "off": 18977,
+     "mark": "?2026l"
+    },
+    {
+     "off": 19021,
+     "mark": "?2004h"
+    },
+    {
+     "off": 19159,
+     "mark": "?2026h"
+    },
+    {
+     "off": 21100,
+     "mark": "?2026l"
+    },
+    {
+     "off": 21108,
+     "mark": "?2026h"
+    },
+    {
+     "off": 21144,
+     "mark": "?2026l"
+    }
+   ]
+  },
+  {
+   "cell": "visual-empty-editor-set",
+   "trial": 1,
+   "label": "visual-empty-editor-set-1",
+   "launch": "visual-empty-editor-set",
+   "env": {
+    "VISUAL": "",
+    "EDITOR": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture editor"
+   },
+   "path_stubs": false,
+   "draft": "CXM_VISUAL_EMPTY_EDITOR_SET_1",
+   "opened": false,
+   "composer_after": "CXM_VISUAL_EMPTY_EDITOR_SET_1",
+   "error_line": "■ Failed to open editor: editor command is empty",
+   "sent_off": 9682,
+   "done_off": 10142,
+   "marks": [
+    {
+     "off": 9682,
+     "mark": "?2026h"
+    },
+    {
+     "off": 9718,
+     "mark": "?2026l"
+    },
+    {
+     "off": 9726,
+     "mark": "?2026h"
+    },
+    {
+     "off": 9842,
+     "mark": "?2026l"
+    },
+    {
+     "off": 9850,
+     "mark": "?2026h"
+    },
+    {
+     "off": 10134,
+     "mark": "?2026l"
+    }
+   ]
+  },
+  {
+   "cell": "visual-empty-editor-set",
+   "trial": 2,
+   "label": "visual-empty-editor-set-2",
+   "launch": "visual-empty-editor-set",
+   "env": {
+    "VISUAL": "",
+    "EDITOR": "/usr/bin/python3 -I ROOT/recorder.py --editor ROOT/capture editor"
+   },
+   "path_stubs": false,
+   "draft": "CXM_VISUAL_EMPTY_EDITOR_SET_2",
+   "opened": false,
+   "composer_after": "CXM_VISUAL_EMPTY_EDITOR_SET_2",
+   "error_line": "■ Failed to open editor: editor command is empty",
+   "sent_off": 11124,
+   "done_off": 11584,
+   "marks": [
+    {
+     "off": 11124,
+     "mark": "?2026h"
+    },
+    {
+     "off": 11160,
+     "mark": "?2026l"
+    },
+    {
+     "off": 11168,
+     "mark": "?2026h"
+    },
+    {
+     "off": 11284,
+     "mark": "?2026l"
+    },
+    {
+     "off": 11292,
+     "mark": "?2026h"
+    },
+    {
+     "off": 11576,
+     "mark": "?2026l"
+    }
+   ]
+  },
+  {
+   "cell": "editor-empty",
+   "trial": 1,
+   "label": "editor-empty-1",
+   "launch": "editor-empty",
+   "env": {
+    "EDITOR": ""
+   },
+   "path_stubs": false,
+   "draft": "CXM_EDITOR_EMPTY_1",
+   "opened": false,
+   "composer_after": "CXM_EDITOR_EMPTY_1",
+   "error_line": "■ Failed to open editor: editor command is empty",
+   "sent_off": 9734,
+   "done_off": 10194,
+   "marks": [
+    {
+     "off": 9734,
+     "mark": "?2026h"
+    },
+    {
+     "off": 9770,
+     "mark": "?2026l"
+    },
+    {
+     "off": 9778,
+     "mark": "?2026h"
+    },
+    {
+     "off": 9894,
+     "mark": "?2026l"
+    },
+    {
+     "off": 9902,
+     "mark": "?2026h"
+    },
+    {
+     "off": 10186,
+     "mark": "?2026l"
+    }
+   ]
+  },
+  {
+   "cell": "editor-empty",
+   "trial": 2,
+   "label": "editor-empty-2",
+   "launch": "editor-empty",
+   "env": {
+    "EDITOR": ""
+   },
+   "path_stubs": false,
+   "draft": "CXM_EDITOR_EMPTY_2",
+   "opened": false,
+   "composer_after": "CXM_EDITOR_EMPTY_2",
+   "error_line": "■ Failed to open editor: editor command is empty",
+   "sent_off": 11164,
+   "done_off": 11624,
+   "marks": [
+    {
+     "off": 11164,
+     "mark": "?2026h"
+    },
+    {
+     "off": 11200,
+     "mark": "?2026l"
+    },
+    {
+     "off": 11208,
+     "mark": "?2026h"
+    },
+    {
+     "off": 11324,
+     "mark": "?2026l"
+    },
+    {
+     "off": 11332,
+     "mark": "?2026h"
+    },
+    {
+     "off": 11616,
+     "mark": "?2026l"
+    }
+   ]
+  },
+  {
+   "cell": "neither-path-stubs",
+   "trial": 1,
+   "label": "neither-path-stubs-1",
+   "launch": "neither-path-stubs",
+   "env": {},
+   "path_stubs": true,
+   "draft": "CXM_NEITHER_PATH_STUBS_1",
+   "opened": false,
+   "composer_after": "CXM_NEITHER_PATH_STUBS_1",
+   "error_line": "■ Cannot open external editor: set $VISUAL or $EDITOR before starting Codex.",
+   "sent_off": 9560,
+   "done_off": 10048,
+   "marks": [
+    {
+     "off": 9560,
+     "mark": "?2026h"
+    },
+    {
+     "off": 9596,
+     "mark": "?2026l"
+    },
+    {
+     "off": 9604,
+     "mark": "?2026h"
+    },
+    {
+     "off": 9720,
+     "mark": "?2026l"
+    },
+    {
+     "off": 9728,
+     "mark": "?2026h"
+    },
+    {
+     "off": 10040,
+     "mark": "?2026l"
+    }
+   ]
+  },
+  {
+   "cell": "neither-path-stubs",
+   "trial": 2,
+   "label": "neither-path-stubs-2",
+   "launch": "neither-path-stubs",
+   "env": {},
+   "path_stubs": true,
+   "draft": "CXM_NEITHER_PATH_STUBS_2",
+   "opened": false,
+   "composer_after": "CXM_NEITHER_PATH_STUBS_2",
+   "error_line": "■ Cannot open external editor: set $VISUAL or $EDITOR before starting Codex.",
+   "sent_off": 11024,
+   "done_off": 11512,
+   "marks": [
+    {
+     "off": 11024,
+     "mark": "?2026h"
+    },
+    {
+     "off": 11060,
+     "mark": "?2026l"
+    },
+    {
+     "off": 11068,
+     "mark": "?2026h"
+    },
+    {
+     "off": 11184,
+     "mark": "?2026l"
+    },
+    {
+     "off": 11192,
+     "mark": "?2026h"
+    },
+    {
+     "off": 11504,
+     "mark": "?2026l"
+    }
+   ]
+  }
+ ]
+}

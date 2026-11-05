@@ -31,12 +31,13 @@
 //! so every probe must be refused for the screen. Without it a zero would
 //! not show that the measurement can see a refusal.
 //!
-//! Codex is not measured here: a real Codex 0.164.0 under the deck's own
-//! `wrap` never becomes armable in the `e2e` build (its permission stays
-//! `Pending`), while the native stand-in does; real Codex binding is Q35-22's.
-//!
 //! The executable is `DAD_PROBE_FRESHNESS_BINARY` when set, else the host's
 //! `~/.local/share/claude/versions/<release>`.
+//!
+//! The Codex twin (U4, after the Q35-22 binding) runs the pinned native
+//! Codex 0.164.0 the same way, with no credential: a dummy key and a
+//! provider on a closed loopback port, which still draws its composer
+//! (nothing is submitted, so nothing asks the provider for a turn).
 //!
 //! `DAD_PROBE_FRESHNESS_OUT` names a file the summary is appended to as one
 //! JSON line; the summary is printed either way.
@@ -249,6 +250,7 @@ struct Run {
     agent: String,
     generation: u64,
     kind: &'static str,
+    release: String,
 }
 
 impl Run {
@@ -277,10 +279,20 @@ impl Run {
     }
 
     fn start(kind: &'static str, deck: common::TuiDeck, command: String) -> Self {
+        Self::start_as(kind, "claude_code", release(), deck, command)
+    }
+
+    fn start_as(
+        kind: &'static str,
+        agent_type: &str,
+        release: String,
+        deck: common::TuiDeck,
+        command: String,
+    ) -> Self {
         let reply = request(
             deck.attach_socket_path(),
             json!({"op":"start-agent", "command":command,
-            "agent_type":"claude_code",
+            "agent_type":agent_type,
             "cwd":deck.workdir(), "rows":40, "cols":140, "display_name":PANE,
             "env":[["DOT_AGENT_DECK_PANE_ID",PANE], ["DISABLE_AUTOUPDATER","1"]]}),
         );
@@ -292,6 +304,7 @@ impl Run {
             agent,
             generation,
             kind,
+            release,
         }
     }
 }
@@ -515,7 +528,7 @@ fn measure(run: Run) {
         conditions.push(tally);
     }
     let summary = json!({
-        "agent": run.kind, "release": release(),
+        "agent": run.kind, "release": run.release,
         // The deck build measured: the library this test links is built
         // from the same tree in the same cargo run as the binary it drives,
         // so a summary names the commit (and `-dirty`) its numbers belong to.
@@ -557,12 +570,13 @@ fn measure(run: Run) {
 }
 
 fn deck() -> common::TuiDeckBuilder {
+    deck_assuming(&format!("claude@{}", release()))
+}
+
+fn deck_assuming(assumed: &str) -> common::TuiDeckBuilder {
     common::TuiDeck::builder()
         .with_pty_size(180, 50)
-        .with_env(
-            "DOT_AGENT_DECK_E2E_ASSUME_EDITOR_PROBE",
-            format!("claude@{}", release()),
-        )
+        .with_env("DOT_AGENT_DECK_E2E_ASSUME_EDITOR_PROBE", assumed)
         .with_env("DOT_AGENT_DECK_E2E_PROBE_GATE", GATE)
         .with_env("DOT_AGENT_DECK_LOG", "probe-freshness.log")
         .with_env("RUST_LOG", "info,composer_probe=debug")
@@ -604,4 +618,118 @@ fn probe_083_claude_idle_screen_freshness_refusal_rate() {
         run.screen()
     );
     measure(run);
+}
+
+/// The pinned native Codex 0.164.0: `DOT_AGENT_DECK_CODEX_0_164_0`, else the
+/// package the earlier Codex units unpacked under `/var/tmp`.
+fn codex_release_binary() -> Result<PathBuf, String> {
+    let path = std::env::var_os("DOT_AGENT_DECK_CODEX_0_164_0")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(
+                "/var/tmp/dad-cxhe-codex-0.164.0/x64/package/vendor/x86_64-unknown-linux-musl/bin/codex",
+            )
+        });
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(format!(
+            "the pinned Codex 0.164.0 is not at {}: set DOT_AGENT_DECK_CODEX_0_164_0",
+            path.display()
+        ))
+    }
+}
+
+/// Scenario: Start the pinned Codex 0.164.0 in a deck pane with a dummy key and no reachable provider, leave it idle at its empty composer, record its output for a minute, then ask for probes one at a time exactly as the Claude Code run does: at the writer's own interval, held 100 ms and 1 s after the frame was read, and held 1 s while the test resizes the pane. The test reports how many probes the writer refused because the screen moved since its frame, and fails unless the resized probes are refused that way.
+#[spec("inbox/probe/083")]
+#[test]
+fn probe_083_codex_164_idle_screen_freshness_refusal_rate() {
+    let binary = match codex_release_binary() {
+        Ok(b) => b,
+        Err(why) => {
+            skip_unless!(Err(why));
+            return;
+        }
+    };
+    let deck = deck_assuming("codex@0.164.0").launch_with_fixture("minimal");
+    assert!(deck.wait_for_grid_string_within("No active agents", BUDGET));
+    // No credential: a dummy key, and a provider on a closed loopback port.
+    let codex_home = deck.home_dir().join(".codex");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    std::fs::write(
+        codex_home.join("auth.json"),
+        r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-nollm-dummy-00000000000000000000000000000000"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        codex_home.join("config.toml"),
+        format!(
+            "model = \"nollm-model\"\nmodel_provider = \"nollm\"\ncheck_for_update_on_startup = false\n\n\
+             [projects.\"{}\"]\ntrust_level = \"trusted\"\n\n\
+             [model_providers.nollm]\nname = \"nollm\"\nbase_url = \"http://127.0.0.1:9/v1\"\n\
+             wire_api = \"responses\"\nrequires_openai_auth = true\nrequest_max_retries = 0\n\
+             stream_max_retries = 0\n",
+            deck.workdir().display()
+        ),
+    )
+    .unwrap();
+    // The pane's class is read from its command's basename.
+    let bin = deck.home_dir().join("pinned");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::os::unix::fs::symlink(&binary, bin.join("codex")).unwrap();
+    trust_codex_hooks(&deck, &bin);
+    let command = format!("{}", bin.join("codex").display());
+    let run = Run::start_as("codex", "codex", "0.164.0".to_string(), deck, command);
+    assert!(
+        common::wait_until(BUDGET, || run.screen().contains("OpenAI Codex (v0.164.0)")),
+        "Codex 0.164.0 must start; {}",
+        run.screen()
+    );
+    measure(run);
+}
+
+/// The deck's Codex hooks installed and trusted in the HOME's `CODEX_HOME`
+/// before Codex starts (as `support/codex_inbox_live.rs`'s `prepare` does,
+/// with the pinned Codex first on the search path): otherwise the deck's own
+/// start-up trust write lands in `config.toml` after the spawn's keymap read,
+/// and the generation holds as `Keymap(Changed)` for its whole life (loc10).
+fn trust_codex_hooks(deck: &common::TuiDeck, pinned: &Path) {
+    let home = deck.home_dir().join(".codex");
+    let binary = common::contained_deck_binary();
+    let installed = deck.home_dir().join(".local/bin/dot-agent-deck");
+    std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    if !installed.exists() && std::fs::hard_link(binary, &installed).is_err() {
+        std::fs::copy(binary, &installed).unwrap();
+    }
+    let last = std::cell::RefCell::new(String::new());
+    let ready = common::wait_until(BUDGET, || {
+        let output = std::process::Command::new(binary)
+            .args(["hooks", "install", "--agent", "codex"])
+            .env_clear()
+            .env("HOME", deck.home_dir())
+            .env("CODEX_HOME", &home)
+            .env("XDG_CONFIG_HOME", deck.home_dir().join(".config"))
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}:/usr/bin:/bin",
+                    pinned.display(),
+                    installed.parent().unwrap().display()
+                ),
+            )
+            .env("DOT_AGENT_DECK_TEST_CONFIG_WRITE", "1")
+            .env("DOT_AGENT_DECK_TEST_CONFIG_ROOT", deck.workdir())
+            .current_dir(deck.workdir())
+            .output()
+            .unwrap();
+        *last.borrow_mut() = format!("{output:?}");
+        output.status.success()
+            && std::fs::read_to_string(home.join("config.toml"))
+                .is_ok_and(|config| config.matches("trusted_hash").count() >= 3)
+    });
+    assert!(
+        ready,
+        "the deck's Codex hooks must be trusted first; {}",
+        last.borrow()
+    );
 }
