@@ -25,7 +25,6 @@ ctor::declarative::ctor! {
 }
 
 const ENV: &[(&str, &str)] = &[
-    ("DOT_AGENT_DECK_E2E_ASSUME_CODEX_HEAD_ECHO", "0.164.0"),
     ("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "30000"),
     ("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "100"),
 ];

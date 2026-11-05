@@ -12,10 +12,9 @@
 //! (`Deck::idle`), where a real Codex sends its first only with its first
 //! prompt (028 has no such step); the hooks are trusted through a `codex
 //! app-server` stand-in, so the wrapper reports nothing from the screen's
-//! output (the untrusted-hooks path is not covered here); and until the
-//! release records carry 0.164.0's `head_echo` (the Q27 Go change) the daemon
-//! is asked to assume it (`DOT_AGENT_DECK_E2E_ASSUME_CODEX_HEAD_ECHO`, read
-//! only by the e2e build).
+//! output (the untrusted-hooks path is not covered here). The daemon reads
+//! 0.164.0's shipped release record, `head_echo` included, as production
+//! does: nothing assumes a measurement here.
 mod common;
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
@@ -99,7 +98,6 @@ impl Deck {
             ("CODEX_HOOK_LIST_RESPONSE", hooks.as_str()),
             ("DOT_AGENT_DECK_LOG", log.to_str().unwrap()),
             ("RUST_LOG", "doorbell=debug"),
-            ("DOT_AGENT_DECK_E2E_ASSUME_CODEX_HEAD_ECHO", MEASURED),
             // A held task shows its reason after two seconds, not two minutes.
             ("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "2000"),
         ]);

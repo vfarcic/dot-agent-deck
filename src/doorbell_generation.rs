@@ -19,8 +19,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::doorbell_activation::{
-    Activation, LatchedRelease, NoGo, ReleaseRecord, activation, assumed_codex_head_echo,
-    unrecorded_claude_releases, with_assumed_codex_head_echo, without_unrecorded_claude,
+    Activation, LatchedRelease, NoGo, ReleaseRecord, activation, unrecorded_claude_releases,
+    without_unrecorded_claude,
 };
 use crate::doorbell_txn::{AttemptCounter, AttemptRing, Latch, LatchCell, RingToken};
 use crate::event::AgentType;
@@ -40,10 +40,7 @@ pub fn generation_activation<'a>(
     let Some(agent) = agent.filter(|a| **a != AgentType::None) else {
         return Activation::NoGo(NoGo::UnmeasuredRelease);
     };
-    let records = with_assumed_codex_head_echo(
-        without_unrecorded_claude(records, &unrecorded_claude_releases()),
-        &assumed_codex_head_echo(),
-    );
+    let records = without_unrecorded_claude(records, &unrecorded_claude_releases());
     if !records.iter().any(|record| record.agent == *agent) {
         return Activation::NoGo(NoGo::UnmeasuredRelease);
     }
