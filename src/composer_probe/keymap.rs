@@ -1136,7 +1136,8 @@ const SHIM_OTEL_KEYS: [&str; 2] = ["otel.trace_exporter", "otel.metrics_exporter
 /// with `-c otel.trace_exporter=…` and `-c otel.metrics_exporter=…` after
 /// the pair and before the user's own arguments, only when
 /// `crate::telemetry::launch::codex_args`'s conditions hold, either of them
-/// left out when its signal has no endpoint (`crate::telemetry::shim`).
+/// left out when its signal has no endpoint or a protocol other than HTTP
+/// (`crate::telemetry::shim`).
 ///
 /// Only that position and shape is the shim's: `-c` (not another spelling)
 /// and the key, in that order, each at most once, whose value is exactly
@@ -1163,10 +1164,12 @@ fn without_shim_otel(args: &[OsString]) -> Option<&[OsString]> {
 
 /// Whether `arg` is `key=` followed by the exporter table the telemetry
 /// shim writes: `{otlp-http={endpoint=<string>,protocol="binary"|"json"}}`
-/// and nothing else. The value is parsed as the document `v = <value>`, and
-/// that document must hold `v` alone (the revcxkey2 review's NIT-1): a value
-/// that goes on past the table, with a newline and another key, is not the
-/// shim's.
+/// with no key or table after it. The value is parsed as the document
+/// `v = <value>`, and that document must hold `v` alone (the revcxkey2
+/// review's NIT-1): a value that goes on past the table, with a newline and
+/// another key, is not the shim's. What TOML ignores after the table (a
+/// comment, blanks, a newline) is accepted, which can carry no key binding
+/// (the revcxkey3 review's NIT-A).
 fn shim_otel_value(key: &str, arg: &str) -> bool {
     let Some(value) = arg
         .strip_prefix(key)
