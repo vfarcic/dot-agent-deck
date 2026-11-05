@@ -139,6 +139,11 @@ pub enum Hold {
     /// A source the release's record doesn't list, so its precedence isn't
     /// known.
     Unpinned,
+    /// The editor the agent's Ctrl+G would open, as the agent's own
+    /// environment selects it, isn't exactly the deck's helper
+    /// ([`editor_is_helper`], the revcxact review's HIGH-1): a probe would
+    /// open another editor in the person's pane.
+    Editor,
 }
 
 /// Reads `path`, following a symlink: absent, its identity and contents, or
@@ -1259,15 +1264,20 @@ impl KeymapBaseline {
 /// `HOME` and `CODEX_HOME`.
 pub const KEYMAP_ENV: [&str; 3] = ["HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME"];
 
+/// The variables an agent picks its external editor from
+/// ([`editor_is_helper`]).
+pub const EDITOR_ENV: [&str; 2] = ["VISUAL", "EDITOR"];
+
 /// A lookup over a process's own environment `environ`, as
-/// `/proc/<pid>/environ` lists it, for the variables in [`KEYMAP_ENV`]: the
-/// first value a name has, as `getenv` answers. A name in [`KEYMAP_ENV`]
-/// listed twice with different values holds as [`Hold::Unmeasured`]: which
-/// one the agent's runtime reads isn't measured.
+/// `/proc/<pid>/environ` lists it, for the variables in [`KEYMAP_ENV`] and
+/// [`EDITOR_ENV`]: the first value a name has, as `getenv` answers. A name
+/// in either listed twice with different values holds as
+/// [`Hold::Unmeasured`]: which one the agent's runtime reads isn't
+/// measured.
 pub fn environ_lookup(
     environ: &[(OsString, OsString)],
 ) -> Result<impl Fn(&str) -> Option<OsString> + '_, Hold> {
-    for name in KEYMAP_ENV {
+    for name in KEYMAP_ENV.into_iter().chain(EDITOR_ENV) {
         let mut values = environ.iter().filter(|(k, _)| k == name).map(|(_, v)| v);
         if let Some(first) = values.next()
             && values.any(|v| v != first)
@@ -1281,6 +1291,44 @@ pub fn environ_lookup(
             .find(|(k, _)| k == name)
             .map(|(_, v)| v.clone())
     })
+}
+
+/// Whether the editor a Codex's Ctrl+G opens, selected from its own
+/// environment `env` ([`environ_lookup`]) as Codex selects it, is exactly
+/// `helper` (the revcxact review's HIGH-1). The deck puts its helper in
+/// `VISUAL` and `EDITOR` only in the spawn's environment, and a shell's
+/// start-up file (zsh's `.zshenv` and fish's `config.fish` run for a `-c`
+/// command too, which the deck's Codex line is) or a launcher
+/// (`VISUAL=nvim codex`, `env VISUAL=… codex`, a wrapper script) can give
+/// Codex another. A probe would then open that editor in the person's pane,
+/// and a Codex check's held input is released only by the helper's return,
+/// so the pane would stay held until the agent is replaced.
+///
+/// Codex's selection (`EditorSelection::Codex`, M34, the 0.164.0
+/// evidence's `editor-probe/README.md`): a set `VISUAL`, else a set
+/// `EDITOR`; a set but empty one is an error, not a fall-through, and with
+/// neither set Codex opens nothing. The value is split in shell words as
+/// Codex splits it ([`super::helper::split_shell_words`]), and the words
+/// must be exactly one, byte for byte the helper's path. Anything else,
+/// an error or an unsplittable value included, holds as [`Hold::Editor`].
+///
+/// It reads the environment the agent was started with: a value the agent
+/// sets in its own process afterwards isn't seen.
+#[cfg(target_os = "linux")]
+pub fn codex_editor_is_helper(
+    env: impl Fn(&str) -> Option<OsString>,
+    helper: &Path,
+) -> Result<(), Hold> {
+    let value = env("VISUAL")
+        .or_else(|| env("EDITOR"))
+        .ok_or(Hold::Editor)?;
+    if value.is_empty() {
+        return Err(Hold::Editor);
+    }
+    match super::helper::split_shell_words(&value).as_deref() {
+        Some([only]) if only.as_os_str() == helper.as_os_str() => Ok(()),
+        _ => Err(Hold::Editor),
+    }
 }
 
 impl KeymapBaseline {

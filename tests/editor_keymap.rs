@@ -2027,3 +2027,154 @@ fn probe_014_a_shim_shaped_otel_override_with_another_key_after_it_holds() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Scenario: Build the environments a bound Codex can have been started with and ask whether the editor its Ctrl+G opens, chosen as Codex chooses it, is exactly the deck's helper (the revcxact review's HIGH-1). The helper in `VISUAL`, or in `EDITOR` with `VISUAL` unset, and a quoted helper are accepted; another editor in `VISUAL` (a shell start-up file's or a launcher's), an empty `VISUAL` over the helper in `EDITOR`, an empty `EDITOR`, neither, the helper with arguments, a path spelled differently and an unsplittable value are held, and a name listed twice with different values is unmeasured.
+#[cfg(target_os = "linux")]
+#[spec("inbox/probe/097")]
+#[test]
+fn probe_097_a_codex_whose_editor_is_not_the_helper_is_held() {
+    use dot_agent_deck::composer_probe::keymap::{codex_editor_is_helper, environ_lookup};
+    let helper = Path::new("/var/tmp/dad-instance/dot-agent-deck-editor");
+    let spaced = Path::new("/var/tmp/dad instance/dot-agent-deck-editor");
+    let h = helper.to_str().unwrap();
+    let check = |pairs: &[(&str, &str)], helper: &Path| {
+        let environ: Vec<(OsString, OsString)> = pairs
+            .iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+            .collect();
+        let env = environ_lookup(&environ)?;
+        codex_editor_is_helper(env, helper)
+    };
+    let quoted_single = format!("'{h}'");
+    let quoted_double = format!("\"{h}\"");
+    let with_args = format!("{h} --wait");
+    let doubled_slash = h.replace("/dot-agent-deck-editor", "//dot-agent-deck-editor");
+    let unterminated = format!("'{h}");
+    let commented = format!("#{h}");
+    let spaced_quoted = format!("'{}'", spaced.display());
+    let spaced_bare = spaced.display().to_string();
+
+    let mut wrong = Vec::new();
+    for (row, pairs, path, want) in [
+        (
+            "the helper in both",
+            vec![("VISUAL", h), ("EDITOR", h)],
+            helper,
+            Ok(()),
+        ),
+        (
+            "the helper in VISUAL alone",
+            vec![("VISUAL", h)],
+            helper,
+            Ok(()),
+        ),
+        (
+            "VISUAL unset, the helper in EDITOR",
+            vec![("EDITOR", h)],
+            helper,
+            Ok(()),
+        ),
+        (
+            "VISUAL unset, another EDITOR",
+            vec![("EDITOR", "vi")],
+            helper,
+            Err(Hold::Editor),
+        ),
+        (
+            "single-quoted helper",
+            vec![("VISUAL", quoted_single.as_str())],
+            helper,
+            Ok(()),
+        ),
+        (
+            "double-quoted helper",
+            vec![("VISUAL", quoted_double.as_str())],
+            helper,
+            Ok(()),
+        ),
+        (
+            "a path with a blank, quoted",
+            vec![("VISUAL", spaced_quoted.as_str())],
+            spaced,
+            Ok(()),
+        ),
+        (
+            "a path with a blank, bare: two words",
+            vec![("VISUAL", spaced_bare.as_str())],
+            spaced,
+            Err(Hold::Editor),
+        ),
+        (
+            "another editor in VISUAL over the helper in EDITOR",
+            vec![("VISUAL", "nvim"), ("EDITOR", h)],
+            helper,
+            Err(Hold::Editor),
+        ),
+        (
+            "a GUI editor in VISUAL",
+            vec![("VISUAL", "code --wait"), ("EDITOR", h)],
+            helper,
+            Err(Hold::Editor),
+        ),
+        (
+            "an empty VISUAL over the helper in EDITOR",
+            vec![("VISUAL", ""), ("EDITOR", h)],
+            helper,
+            Err(Hold::Editor),
+        ),
+        (
+            "an empty EDITOR, VISUAL unset",
+            vec![("EDITOR", "")],
+            helper,
+            Err(Hold::Editor),
+        ),
+        (
+            "neither set",
+            vec![("HOME", "/home/u")],
+            helper,
+            Err(Hold::Editor),
+        ),
+        (
+            "the helper with arguments",
+            vec![("VISUAL", with_args.as_str())],
+            helper,
+            Err(Hold::Editor),
+        ),
+        (
+            "the helper spelled with a doubled slash",
+            vec![("VISUAL", doubled_slash.as_str())],
+            helper,
+            Err(Hold::Editor),
+        ),
+        (
+            "an unterminated quote",
+            vec![("VISUAL", unterminated.as_str())],
+            helper,
+            Err(Hold::Editor),
+        ),
+        (
+            "a comment only",
+            vec![("VISUAL", commented.as_str())],
+            helper,
+            Err(Hold::Editor),
+        ),
+        (
+            "VISUAL twice, the second another editor",
+            vec![("VISUAL", h), ("VISUAL", "nvim")],
+            helper,
+            Err(Hold::Unmeasured),
+        ),
+        (
+            "EDITOR twice with one value",
+            vec![("EDITOR", h), ("EDITOR", h)],
+            helper,
+            Ok(()),
+        ),
+    ] {
+        let got = check(&pairs, path);
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}

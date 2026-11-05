@@ -1501,6 +1501,10 @@ mod linux {
         launch: Vec<OsString>,
         reader: InstanceReader,
         helper_id: FileId,
+        /// The helper's path, as the installation put it in the spawn's
+        /// `VISUAL` and `EDITOR`: what the bound agent's own selection must
+        /// name ([`crate::composer_probe::keymap::codex_editor_is_helper`]).
+        helper_path: std::path::PathBuf,
         latch: Box<dyn Fn(&AgentType) -> LatchedRelease + Send + Sync>,
         assumed: &'static [(AgentType, semver::Version, EditorProbe<'static>)],
         settling: SettleClaim,
@@ -2200,6 +2204,9 @@ mod linux {
             };
             let reader = InstanceReader::open(installation.instance_dir()).ok()?;
             let helper_id = installation.helper_id();
+            let helper_path = installation
+                .instance_dir()
+                .join(crate::composer_probe::instance::HELPER_NAME);
             let launch = installation.launch().to_vec();
             let keymap_baseline = installation.take_keymap_baseline();
             let export_hold = installation.take_export_hold();
@@ -2248,6 +2255,7 @@ mod linux {
                 launch,
                 reader,
                 helper_id,
+                helper_path,
                 latch: spawned.latch,
                 assumed: spawned.assumed,
                 settling: SettleClaim::default(),
@@ -2540,7 +2548,12 @@ mod linux {
                     }
                     Err(hold) => KeymapEvidence::Held(hold),
                 },
-                AgentType::Codex => match baseline.codex_bound(&env, args, cwd) {
+                // The revcxact review's HIGH-1: the editor its own
+                // environment selects must be the helper, or a probe would
+                // open another one in the person's pane.
+                AgentType::Codex => match baseline.codex_bound(&env, args, cwd).and_then(|codex| {
+                    keymap::codex_editor_is_helper(&env, &self.helper_path).map(|()| codex)
+                }) {
                     Ok(codex) => KeymapEvidence::Codex {
                         reads: Box::new(keymap::CodexReads::new(codex)),
                         precedence: probe.keymap_sources,

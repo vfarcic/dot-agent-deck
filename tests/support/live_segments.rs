@@ -966,6 +966,11 @@ impl Drop for RefusalWatch {
 }
 
 impl Fixture {
+    /// The daemon's log as written so far.
+    pub fn log_text(&self) -> String {
+        fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
     /// Diagnosis only (Q35-21): print the daemon log's probe and doorbell
     /// lines, so a red run says which check settled how and why a ring or
     /// a probe was or wasn't admitted. Asserts nothing.
