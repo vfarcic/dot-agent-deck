@@ -551,6 +551,17 @@ impl InstanceReader {
         write_identity_at(self.dir_fd.as_fd(), generation, identity)
     }
 
+    /// Write `kind-G` once, through this reader's directory: the daemon's
+    /// observer of an undeclared wrapper does it at `Armable`, before
+    /// `gen-G` (Q35-22).
+    pub fn write_kind(&self, generation: &str, agent: ProbeAgent) -> Result<(), SetupError> {
+        let name = generation_file("kind", generation)?;
+        create_file_at(self.dir_fd.as_fd(), &name, 0o400)
+            .map_err(exists_is_generation)?
+            .write_all(encode_kind(agent).as_bytes())?;
+        Ok(())
+    }
+
     /// `gen-G`: `None` when it is absent, unreadable or malformed.
     pub fn identity(&self, generation: &str) -> Option<Identity> {
         let name = generation_file("gen", generation).ok()?;

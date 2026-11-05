@@ -14526,6 +14526,9 @@ impl AgentPtyRegistry {
             let (env, cwd) = (&opts.env, opts.cwd);
             crate::inbox_hub::off_the_executor(|| {
                 installation.read_keymap_baseline(command, env, cwd);
+                // Q35-22 (Q102b): the agent executables, pinned now, from
+                // the PATH the child gets, before it exists.
+                installation.pin_natives(command, env);
             });
             installation
         });
@@ -18898,6 +18901,28 @@ impl AgentPtyRegistry {
                 agent.bus.adopt_profile(profile);
             }
             self.request_reprojection(pane_id_env, &id);
+            #[cfg(target_os = "linux")]
+            let observer = agent.composer.clone();
+            drop(inner);
+            #[cfg(target_os = "linux")]
+            self.learn_composer_agent(&id, observer, agent_type);
+        }
+    }
+
+    /// PRD #1666 part 3 (Q35-22): an undeclared wrapper's observer learns
+    /// the agent its own hooks reported, with the registry lock released,
+    /// and the segments that attached for it get their driver.
+    #[cfg(target_os = "linux")]
+    fn learn_composer_agent(
+        &self,
+        id: &str,
+        observer: Option<Arc<crate::composer_probe::observe::Observer>>,
+        agent_type: &AgentType,
+    ) {
+        if let Some(observer) = observer
+            && observer.learn(agent_type)
+        {
+            self.start_segment_driver(id);
         }
     }
 
@@ -18920,6 +18945,11 @@ impl AgentPtyRegistry {
                 agent.bus.adopt_profile(profile);
             }
             self.request_reprojection(pane_id_env, id);
+            #[cfg(target_os = "linux")]
+            let learned = (id.clone(), agent.composer.clone());
+            drop(inner);
+            #[cfg(target_os = "linux")]
+            self.learn_composer_agent(&learned.0, learned.1, agent_type);
         }
     }
 
