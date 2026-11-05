@@ -853,11 +853,27 @@ impl CodexBaseline {
 /// accepted read becomes the last, so Codex's own bookkeeping write is
 /// accepted once, and a later rewrite that leaves the bookkeeping as it was
 /// (a hand edit undone, which Codex may have reloaded meanwhile) still holds
-/// as changed. A read that holds is not kept.
+/// as changed.
+///
+/// The first comparison that fails latches (the revcxkey review's H1): it is
+/// returned by that check and every later one of the generation, whatever
+/// they read, as [`ClaudeKeymap::check`] holds. A held read is never adopted.
+/// Without the latch an edit Codex reloaded could be undone after Codex's own
+/// bookkeeping write landed over it, and the undone file, whose bookkeeping
+/// then differs from the last accepted read, would be accepted while Codex
+/// still ran the edit's binding.
 #[derive(Debug)]
 pub struct CodexReads {
     sources: CodexSources,
-    last: std::sync::Mutex<CodexRead>,
+    state: std::sync::Mutex<CodexReadsState>,
+}
+
+#[derive(Debug)]
+struct CodexReadsState {
+    /// The last read accepted, first the one before the spawn.
+    last: CodexRead,
+    /// The first comparison that failed, returned by every later check.
+    held: Option<Hold>,
 }
 
 impl CodexReads {
@@ -865,24 +881,33 @@ impl CodexReads {
     pub fn new(baseline: &CodexBaseline) -> CodexReads {
         CodexReads {
             sources: baseline.sources.clone(),
-            last: std::sync::Mutex::new(baseline.read.clone()),
+            state: std::sync::Mutex::new(CodexReadsState {
+                last: baseline.read.clone(),
+                held: None,
+            }),
         }
     }
 
-    /// Reads the sources now and checks them against the last accepted read,
-    /// the project files ([`codex_projects_guard`]) and the effective
-    /// keymap in `precedence` ([`codex_keymap`]). The file I/O comes before
-    /// its own lock, which guards only the comparison: call it with no lock
-    /// held.
+    /// Reads the sources now and checks them against the last accepted read
+    /// (or the latched hold), the project files ([`codex_projects_guard`])
+    /// and the effective keymap in `precedence` ([`codex_keymap`]). The file
+    /// I/O comes before its own lock, which guards only the comparison: call
+    /// it with no lock held.
     pub fn check(&self, precedence: &[KeymapSource]) -> Result<(), Hold> {
         let now = self.sources.read();
         {
-            let mut last = self
-                .last
+            let mut state = self
+                .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            codex_unchanged(&last, &now)?;
-            *last = now.clone();
+            if let Some(hold) = state.held {
+                return Err(hold);
+            }
+            if let Err(hold) = codex_unchanged(&state.last, &now) {
+                state.held = Some(hold);
+                return Err(hold);
+            }
+            state.last = now.clone();
         }
         // A-20d-1b: the project files are a superset of what Codex loads; a
         // keymap in any of them holds.

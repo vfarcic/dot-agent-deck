@@ -1379,7 +1379,7 @@ fn probe_014_only_codexs_bookkeeping_is_left_out_of_the_comparison() {
     );
 }
 
-/// Scenario: Follow one Codex generation's reads as the deck's observer does, each check comparing with the last read it accepted. Codex's own marker is accepted once and becomes that read; a hand edit that moves Ctrl+G then holds as changed, and so does undoing it afterwards, since Codex may have reloaded the edit (its `/cd` rebuilds the keymap from disk) and the undone file's bookkeeping is unchanged. The residual is pinned too: an edit made and undone between two checks across which Codex also raised its count is not seen.
+/// Scenario: Follow one Codex generation's reads as the deck's observer does, each check comparing with the last read it accepted. Codex's own marker is accepted once and becomes that read; a hand edit that moves Ctrl+G then holds as changed, and so does undoing it afterwards, since Codex may have reloaded the edit (its `/cd` rebuilds the keymap from disk) and the undone file's bookkeeping is unchanged, and so does the undone file read again. The residual is pinned too: an edit made and undone between two checks across which Codex also raised its count is not seen.
 #[spec("inbox/probe/014")]
 #[test]
 fn probe_014_a_codex_generation_compares_with_its_last_accepted_read() {
@@ -1407,6 +1407,12 @@ fn probe_014_a_codex_generation_compares_with_its_last_accepted_read() {
         Err(Hold::Changed),
         "the edit undone"
     );
+    // A held read is not adopted: the undone file read again still holds.
+    assert_eq!(
+        reads.check(CODEX_ORDER),
+        Err(Hold::Changed),
+        "the undone file read again"
+    );
 
     // The residual: undone within one window that Codex's own write also
     // fell in.
@@ -1420,4 +1426,45 @@ fn probe_014_a_codex_generation_compares_with_its_last_accepted_read() {
     );
     rewrite(&codex.config(), &marker);
     assert_eq!(reads.check(CODEX_ORDER), Ok(()), "not seen");
+}
+
+/// Scenario: Follow one Codex generation's checks while the user edits `config.toml` to move Ctrl+G, Codex's own start-up write then raises its tooltip count over the edit, and the user undoes the edit in a file that keeps Codex's new count. The edit holds as changed, Codex's write over it holds, and the undo, whose bookkeeping differs from the last accepted read while everything else matches it, still holds as changed, as does every later check of the generation: the first hold latches. A new generation on the restored file allows the probe.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_a_held_codex_generation_stays_held() {
+    use dot_agent_deck::composer_probe::keymap::{CodexBaseline, CodexReads};
+    let codex = Codex::new();
+    write(&codex.config(), TRUSTED);
+    let cwd = codex.dir.path().join("project");
+    let baseline = CodexBaseline::at_spawn(&codex.home(), &[], &cwd).unwrap();
+    let reads = CodexReads::new(&baseline);
+
+    let marker = format!("{TRUSTED}\n[tui]\nscreen_reader_detection_done = true\n");
+    rewrite(&codex.config(), &marker);
+    assert_eq!(reads.check(CODEX_ORDER), Ok(()), "Codex's marker");
+
+    let rebind = "\n[tui.keymap.global]\nopen_external_editor = \"f6\"\n";
+    let count = "\n[tui.model_availability_nux]\n\"gpt-6.1-sol\" = 1\n";
+    rewrite(&codex.config(), &format!("{marker}{rebind}"));
+    assert_eq!(reads.check(CODEX_ORDER), Err(Hold::Changed), "Ctrl+G moved");
+    rewrite(&codex.config(), &format!("{marker}{rebind}{count}"));
+    assert_eq!(
+        reads.check(CODEX_ORDER),
+        Err(Hold::Changed),
+        "Codex's count written over the edit"
+    );
+    rewrite(&codex.config(), &format!("{marker}{count}"));
+    assert_eq!(
+        reads.check(CODEX_ORDER),
+        Err(Hold::Changed),
+        "the edit undone, keeping Codex's new count"
+    );
+    assert_eq!(reads.check(CODEX_ORDER), Err(Hold::Changed), "read again");
+
+    let next = CodexReads::new(&CodexBaseline::at_spawn(&codex.home(), &[], &cwd).unwrap());
+    assert_eq!(
+        next.check(CODEX_ORDER),
+        Ok(()),
+        "a new generation reads anew"
+    );
 }
