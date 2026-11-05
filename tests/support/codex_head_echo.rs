@@ -2,9 +2,11 @@
 //! the way the deck reads its pane: every PTY read pushed, in order, through
 //! the deck's own evidence state for Codex's screen profile, and the screen
 //! after each read through the frame builder the doorbell's transaction
-//! reads. Whether the evidence state was Clean is recorded beside each
-//! reading: the transaction reads only Clean frames, and a fresh Codex at
-//! 24 × 80 draws no width witness before its first turn.
+//! reads. Every frame is built as the frame builder builds a Clean one, so
+//! the screen is read whatever the evidence state; whether that state was
+//! Clean is recorded beside each reading, and asserted separately: the
+//! transaction reads only Clean frames, and a fresh Codex at 24 × 80 draws no
+//! width witness before its first turn.
 //! The recorder only scheduled the writes with pyte; every reading here is the
 //! deck's.
 //!
@@ -108,7 +110,8 @@ pub struct Read {
     /// The deck's evidence state was Clean after this read (with no layout
     /// edge in a capture, its parser's screen is the screen read below).
     pub clean: bool,
-    /// The frame builder's reading of the screen after this read.
+    /// The frame builder's reading of the screen after this read, built as
+    /// a Clean frame is whether or not `clean` holds.
     pub frame: Option<Frame>,
     /// Which of the capture's lines the transcript shows as a user message.
     pub users: Vec<usize>,
@@ -183,11 +186,15 @@ fn holds_prefix(frame: &Frame, line: &str) -> bool {
     })
 }
 
+/// The composer is drawn and shows its placeholder or a prefix of `text`. A
+/// frame with no composer fails: an overlay that hides the composer is not
+/// one of the transaction's readings, whether or not it is a recognised
+/// dialog.
 fn placeholder_or_prefix(frame: &Frame, text: &str) -> bool {
     frame
         .composer
         .as_ref()
-        .is_none_or(|c| c.placeholder || text.starts_with(c.text.as_str()))
+        .is_some_and(|c| c.placeholder || text.starts_with(c.text.as_str()))
 }
 
 /// The last read that ends at or before `off`.
@@ -207,13 +214,15 @@ fn between(reads: &[Read], from: usize, to: usize) -> impl Iterator<Item = &Read
 #[derive(Debug, Clone)]
 pub struct Trial {
     pub n: usize,
-    /// Head write to the first Clean frame holding exactly the head.
+    /// Head write to the first frame holding exactly the head (read on that
+    /// frame whether or not the evidence state was Clean: see `clean`).
     pub head_echo_ms: f64,
-    /// Rest write to the first Clean frame holding exactly the whole line.
+    /// Rest write to the first frame holding exactly the whole line (as for
+    /// `head_echo_ms`).
     pub line_echo_ms: f64,
     /// The rest's write returning to the Enter.
     pub floor_ms: f64,
-    /// The Enter to the first Clean frame with the line as a transcript user
+    /// The Enter to the first frame with the line as a transcript user
     /// message and the composer no longer holding it.
     pub transcript_ms: f64,
     pub first_submit: bool,
@@ -248,7 +257,7 @@ pub fn staged_trials(capture: &Capture) -> Vec<Trial> {
         let (rest_sent, rest_done) = capture.sent(&format!("rest-{n}"));
         let (cr_sent, _) = capture.sent(&format!("cr-{n}"));
 
-        // Admitted: the last Clean frame before the head is the empty ready
+        // Admitted: the last frame before the head is the empty ready
         // composer with no dialog.
         let admission = last_at(&reads, at_trial);
         let f = admission.frame.as_ref().unwrap();
@@ -369,14 +378,19 @@ pub const NOT_OURS: &str = "(aaaaaa)";
 #[derive(Debug, Clone)]
 pub struct Control {
     pub name: String,
-    /// Write to the first Clean frame holding exactly the typed text.
+    /// Write to the first frame holding exactly the typed text (every
+    /// controls ring is at 50 × 200, read on frames built as Clean ones; the
+    /// evidence state is not checked here).
     pub echo_ms: Option<f64>,
     /// The strict recogniser's verdict on the frame the deletes were sent on.
     pub strict: Option<Result<usize, WithdrawalRefusal>>,
-    /// The deletes to the first Clean frame showing the placeholder.
+    /// The deletes to the first frame showing the placeholder.
     pub placeholder_ms: Option<f64>,
-    /// For an Enter-too-soon control: whether Codex submitted the line.
+    /// For an Enter control: whether Codex submitted the line.
     pub submitted: Option<bool>,
+    /// For an Enter-after-echo control: the rest's write returning to the
+    /// Enter.
+    pub enter_ms: Option<f64>,
 }
 
 /// The controls of a `controls` capture, each checked (panics otherwise).
@@ -418,6 +432,17 @@ pub fn controls(capture: &Capture) -> Vec<Control> {
                     assert!(f.dialog.is_none(), "{who}: a dialog {f:?}");
                 }
             }
+            // An Enter after the echo: the frame it was written on holds
+            // exactly the line, with the cursor after it.
+            let mut enter_ms = None;
+            if name.starts_with("enter-at-") {
+                let at_cr = capture.point(&format!("mark:cr:{name}"));
+                let f = last_at(&reads, at_cr).frame.as_ref().unwrap();
+                assert!(f.holds_exactly(text), "{who}: before the Enter {f:?}");
+                let (_, rest_done) = capture.sent(&format!("rest:{name}"));
+                let (cr_sent, _) = capture.sent(&format!("cr:{name}"));
+                enter_ms = Some((cr_sent - rest_done) as f64 / 1e6);
+            }
             // Kept: the composer still starts with the line, and the strict
             // recogniser's verdict on it is recorded (after a kept Enter the
             // deck would withdraw only text it can confirm).
@@ -440,6 +465,7 @@ pub fn controls(capture: &Capture) -> Vec<Control> {
                 strict,
                 placeholder_ms: None,
                 submitted: Some(submitted),
+                enter_ms,
             });
             continue;
         }
@@ -514,9 +540,110 @@ pub fn controls(capture: &Capture) -> Vec<Control> {
             strict: Some(strict),
             placeholder_ms: Some((placeholder - deletes_sent) as f64 / 1e6),
             submitted: None,
+            enter_ms: None,
         });
     }
+    // Codex's own record agrees with the screen: each Enter control's line
+    // is there once when the transcript showed it submitted and not at all
+    // when it was kept, and nothing else doorbell-shaped was submitted (no
+    // head, partial head, second stage or foreign line typed and deleted).
+    let rollout: Vec<&str> = capture.result["rollout_user_messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    for c in out.iter().filter(|c| c.submitted.is_some()) {
+        let text = entries
+            .iter()
+            .find(|e| e["control"] == c.name.as_str())
+            .unwrap()["text"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            rollout.iter().filter(|m| **m == text).count(),
+            usize::from(c.submitted == Some(true)),
+            "{} {}: Codex's own record",
+            capture.name,
+            c.name
+        );
+    }
+    let shaped = rollout
+        .iter()
+        .filter(|m| m.contains("dot-agent-deck: message"))
+        .count();
+    assert_eq!(
+        shaped,
+        out.iter().filter(|c| c.submitted == Some(true)).count(),
+        "{}: {rollout:?}",
+        capture.name
+    );
     out
+}
+
+/// The verdicts a `controls` capture must show (Q27), shared by the lane-2
+/// recording and the fast replay of the committed capture: six whole heads
+/// withdrawn with eight deletes; seven partial heads refused as no whole
+/// token; the second stage's head plus none, one (a space), ten and forty
+/// characters counted 8, refused as not owned text, 18 and 48; one foreign
+/// and one old-token line; three lines with the Enter in the same burst kept
+/// and refused as cursor elsewhere, and so not in Codex's record; and six
+/// Enters after the line's echo submitted, each once in Codex's record
+/// (`controls` checks the record and every reading behind these).
+pub fn checked_controls(capture: &Capture) -> Vec<Control> {
+    let controls = controls(capture);
+    let named = |prefix: &'static str| controls.iter().filter(move |c| c.name.starts_with(prefix));
+    assert_eq!(named("head-").count(), 6);
+    for c in named("head-") {
+        assert_eq!(c.strict, Some(Ok(TOKEN_HEAD_CHARS)), "{c:?}");
+    }
+    assert_eq!(named("partial-").count(), 7);
+    for c in named("partial-") {
+        assert_eq!(
+            c.strict,
+            Some(Err(WithdrawalRefusal::NoWholeToken)),
+            "{c:?}"
+        );
+    }
+    // The head and one byte of the rest, a space, draws as the head with the
+    // cursor a cell further on: nothing on screen shows the space, so the
+    // strict recogniser refuses it and the deck withdraws nothing.
+    let second: Vec<_> = named("second-").map(|c| c.strict).collect();
+    assert_eq!(
+        second,
+        [
+            Some(Ok(8)),
+            Some(Err(WithdrawalRefusal::NotOwnedText)),
+            Some(Ok(18)),
+            Some(Ok(48))
+        ]
+    );
+    assert_eq!(named("foreign").count(), 1);
+    assert_eq!(named("old-token").count(), 1);
+    // An Enter in the same burst as the line is kept with it, and what is
+    // kept is not the owned text with the cursor after it.
+    let burst: Vec<_> = controls
+        .iter()
+        .filter(|c| c.name.starts_with("enter-") && !c.name.starts_with("enter-at-"))
+        .collect();
+    assert_eq!(burst.len(), 3);
+    for c in burst {
+        assert_eq!(c.submitted, Some(false), "{c:?}");
+        assert_eq!(
+            c.strict,
+            Some(Err(WithdrawalRefusal::CursorElsewhere)),
+            "{c:?}"
+        );
+    }
+    // An Enter written after the line's exact echo submits it. The recorder
+    // asks for it 50, 100 or 120 ms after the rest, but never before the
+    // echo, so when it went is in `enter_ms`.
+    assert_eq!(named("enter-at-").count(), 6);
+    for c in named("enter-at-") {
+        assert_eq!(c.submitted, Some(true), "{c:?}");
+        assert!(c.enter_ms.is_some(), "{c:?}");
+    }
+    controls
 }
 
 /// min / median / max of `values`, in ms.

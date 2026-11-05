@@ -29,9 +29,12 @@ enum Hooks {
     /// The deck's hooks installed, every one switched off in Codex's own
     /// trust records: Codex runs none of them (the untrusted-hooks path).
     Off,
-    /// The deck's hooks installed with no trust recorded, and Codex started
-    /// through a launcher the wrapper cannot see into, so nothing trusts them
-    /// (the `devbox run codex-big` shape).
+    /// The deck's hooks installed in a Codex home of the run's own with no
+    /// trust recorded, and Codex started through a launcher (the `devbox run
+    /// codex-big` shape). The wrapper trusts nothing here because the
+    /// recorder runs it with no pane id; a production pane's wrapper attempts
+    /// the trust for such a launcher, fails to reach Codex's app-server, and
+    /// Codex starts with the hooks untrusted all the same.
     Untrusted,
 }
 
@@ -155,6 +158,15 @@ fn record(kind: &str, rows: u16, cols: u16, trials: usize, hooks: Hooks) -> Capt
         capture.result["error"],
         output.display()
     );
+    // The recorder hashed the running Codex process's own executable and
+    // refused any but the pinned one (it would have set `error`).
+    assert!(
+        capture.result["running_executables"]
+            .as_array()
+            .is_some_and(|r| !r.is_empty()),
+        "no running executable recorded: {}",
+        output.display()
+    );
     drop(deck);
     capture
 }
@@ -266,12 +278,13 @@ fn controls(rows: u16, cols: u16) {
     skip_unless!(common::check_codex_available());
     preflight();
     let capture = record("controls", rows, cols, 0, Hooks::Trusted);
-    for control in head_echo::controls(&capture) {
+    // The same verdicts the fast tier pins on the committed capture.
+    for control in head_echo::checked_controls(&capture) {
         eprintln!("{control:?}");
     }
 }
 
-/// Scenario: On real Codex 0.164.0 at 50 × 200 with trusted hooks, type six token heads alone and delete each with eight deletes; type the first one to seven characters of a head and delete them; type a head and then none, one, ten or forty characters of the rest and delete all of it; type a doorbell-shaped line with another token and an earlier attempt's line and delete them; and type three whole lines with the Enter straight after them. Read back through the deck's evidence state and screen profile, no write opens a dialog or submits anything but those Enters; each typed text is held exactly before its deletes, where the strict withdrawal recogniser counts the deletes for a whole head and refuses a partial one and another line, and every delete leaves the placeholder.
+/// Scenario: On real Codex 0.164.0 at 50 × 200 with trusted hooks, type six token heads alone and delete each with eight deletes; type the first one to seven characters of a head and delete them; type a head and then none, one, ten or forty characters of the rest and delete all of it; type a doorbell-shaped line with another token and an earlier attempt's line and delete them; type three whole lines with the Enter straight after them; and type six staged lines with the Enter asked for 50, 100 or 120 ms after the rest and written once the line has echoed. Read back through the deck's evidence state and screen profile, no write opens a dialog or submits anything but those Enters; each typed text is held exactly before its deletes, where the strict withdrawal recogniser counts the deletes for a whole head and refuses a partial one, a head plus a space and another line, and every delete leaves the placeholder; the three burst Enters are kept and refused for withdrawal, the six after the echo submit, and Codex's own record holds each submitted line once and nothing else doorbell-shaped.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_live_codex_164_head_echo_controls() {
