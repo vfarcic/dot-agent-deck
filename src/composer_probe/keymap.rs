@@ -765,12 +765,40 @@ impl CodexBaseline {
     }
 }
 
-/// [`CodexSources::from_launch`] with the project files for `cwd`.
+/// [`CodexSources::from_launch`] with the project files for `cwd`, for
+/// `args` less the deck's own embedded-mode pair ([`without_embedded_pair`]).
+/// The spawn's baseline and the bound agent's launch both come through here,
+/// so the pair is left out on both sides (A-20d-13).
 fn codex_launch(codex_home: &Path, args: &[OsString], cwd: &Path) -> Result<CodexSources, Hold> {
+    let args = without_embedded_pair(args);
     if codex_moves_cwd(args) {
         return Err(Hold::Unpinned);
     }
     CodexSources::from_launch(codex_home, args, codex_project_files(cwd, codex_home)?)
+}
+
+/// `args` (after the program) without #2002's embedded-mode pair
+/// (`crate::wrap::CODEX_EMBEDDED_ARGS`) when they open with it, else
+/// unchanged. Below the deck's `wrap` a direct Codex's argv opens with the
+/// pair while the launch line the baseline reads may not carry it (the
+/// installation adds it only with the editor's variables), so keeping it
+/// would hold every wrapped Codex as changed.
+///
+/// Only one leading copy of exactly those two words is stripped. The wrapper
+/// (`wrap::launch_args`) and the installation (`Installation::command`) put
+/// the pair first, and only when the arguments don't already open with it,
+/// and the telemetry shim keeps it first, so a launch carries at most one
+/// deck pair and it is at the front, where its `-c` can't be another
+/// option's value. The same words anywhere else, a second leading copy,
+/// another spelling (`--config`, `-c=`) or another value were written by the
+/// user and stay sources. A user's own leading copy is indistinguishable
+/// from the deck's and is stripped too: it sets no key binding.
+fn without_embedded_pair(args: &[OsString]) -> &[OsString] {
+    if crate::wrap::opens_with_codex_embedded_args(args) {
+        &args[crate::wrap::CODEX_EMBEDDED_ARGS.len()..]
+    } else {
+        args
+    }
 }
 
 /// A generation's key-binding sources read before its spawn (A-20d-1b): what

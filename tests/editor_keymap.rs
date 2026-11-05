@@ -1173,3 +1173,71 @@ fn probe_014_the_bound_agents_environment_is_compared_with_the_spawns() {
         );
     }
 }
+
+/// Scenario: Take a Codex baseline from the deck's launch line, which carries no `-c shell_environment_policy.set={}` pair when the user sets neither `VISUAL` nor `EDITOR`, and compare it with the native the deck's wrapper started, whose argv opens with that pair (#2002). The two read as the same launch, and so does a launch line that carries the pair itself. A user's own `-c` that moves Ctrl+G still holds as changed, behind the pair or not; and the same two words anywhere but first, a second leading copy, another spelling of the flag or another value are the user's, so each still holds as changed.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_the_wrappers_embedded_pair_is_not_a_codex_source() {
+    use dot_agent_deck::composer_probe::keymap::CodexBaseline;
+    let dir = test_temp::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let cwd = dir.path().join("repo");
+    for d in [&home, &cwd] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    const C: &str = "-c";
+    const SET: &str = "shell_environment_policy.set={}";
+    let user = ["--model", "m", "-c", "model_reasoning_effort=low"];
+    let with = |front: &[&str], back: &[&str]| -> Vec<OsString> {
+        args(&[front, &user[..], back].concat())
+    };
+
+    // The deck's launch line without the pair; the wrapped native with it.
+    let plain = CodexBaseline::at_spawn(&home, &with(&[], &[]), &cwd).unwrap();
+    assert_eq!(
+        plain.bound(&home, &with(&[C, SET], &[]), &cwd),
+        Ok(()),
+        "the wrapper's leading pair"
+    );
+    assert_eq!(plain.bound(&home, &with(&[], &[]), &cwd), Ok(()));
+    // A launch line that already carries the pair (the installation adds it
+    // when it sets the editor's variables, and the wrapper then adds none).
+    let paired = CodexBaseline::at_spawn(&home, &with(&[C, SET], &[]), &cwd).unwrap();
+    assert_eq!(paired.sources, plain.sources, "the pair is not a source");
+    assert_eq!(paired.bound(&home, &with(&[C, SET], &[]), &cwd), Ok(()));
+    assert_eq!(paired.bound(&home, &with(&[], &[]), &cwd), Ok(()));
+
+    // A user's own keymap override still counts, behind the pair or not.
+    let rebind = ["-c", "tui.keymap.global.open_external_editor=\"f6\""];
+    for front in [&[C, SET][..], &[]] {
+        assert_eq!(
+            plain.bound(&home, &with(front, &rebind), &cwd),
+            Err(Hold::Changed),
+            "a user's keymap override behind {front:?}"
+        );
+    }
+    // Only one leading copy of exactly these two words is the deck's.
+    for (row, front, back) in [
+        ("the pair last", &[][..], &[C, SET][..]),
+        ("the pair second", &["--model", "x", C, SET][..], &[][..]),
+        ("two leading pairs", &[C, SET, C, SET][..], &[][..]),
+        (
+            "another value",
+            &[C, "shell_environment_policy.set={A=\"1\"}"][..],
+            &[][..],
+        ),
+        ("--config", &["--config", SET][..], &[][..]),
+        ("-c=", &["-c=shell_environment_policy.set={}"][..], &[][..]),
+        (
+            "attached",
+            &["-cshell_environment_policy.set={}"][..],
+            &[][..],
+        ),
+    ] {
+        assert_eq!(
+            plain.bound(&home, &with(front, back), &cwd),
+            Err(Hold::Changed),
+            "{row}"
+        );
+    }
+}
