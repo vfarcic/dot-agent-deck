@@ -357,10 +357,11 @@ pub fn check_config_writes(dir: &Path) -> Vec<f64> {
 /// (by the deck's reading) is kept in every trial; LATE written while the
 /// editor runs is lost in every trial (the control that shows a loss is
 /// visible); and between the first `?2004l` and the `?2004h` no `?2026h`.
-/// Returns kept counts per arm.
-pub fn check_e1f(dir: &Path) -> Vec<(String, usize, usize)> {
+/// Returns kept counts per arm, and the E1-only arm's genuine trials.
+pub fn check_e1f(dir: &Path) -> E1f {
     let s = summary(dir, "e1f");
     let mut out = Vec::new();
+    let (mut lost, mut e1_only, mut e1_n) = (0, 0, 0);
     for arm in ["at-2004h", "at-2026h", "during-editor"] {
         let trials = rows(&s, "arm", arm);
         assert_eq!(trials.len(), 20, "{arm}");
@@ -392,6 +393,25 @@ pub fn check_e1f(dir: &Path) -> Vec<(String, usize, usize)> {
                 "at-2004h" => {
                     assert_eq!(row["enable_off"].as_u64(), Some(enable), "{row}");
                     assert!(late >= enable + 8, "{row}");
+                    // The recorder records `frame_off` only when the `?2026h`
+                    // had already arrived when it wrote LATE: that trial
+                    // released at E1F, not at E1 alone. Without it, LATE
+                    // went out before any byte of the deck's E1F frame.
+                    let before_frame = match row["frame_off"].as_u64() {
+                        Some(f) => {
+                            assert_eq!(f, frame, "{row}");
+                            late < f
+                        }
+                        None => {
+                            assert!(late <= frame, "frame unrecorded but read: {row}");
+                            true
+                        }
+                    };
+                    e1_n += 1;
+                    if before_frame {
+                        e1_only += 1;
+                        lost += usize::from(row["kept"] == false);
+                    }
                 }
                 "at-2026h" => {
                     assert_eq!(row["frame_off"].as_u64(), Some(frame), "{row}");
@@ -413,7 +433,22 @@ pub fn check_e1f(dir: &Path) -> Vec<(String, usize, usize)> {
         }
         out.push((arm.to_string(), kept, trials.len()));
     }
-    out
+    E1f {
+        arms: out,
+        e1_only: (lost, e1_only, e1_n),
+    }
+}
+
+/// What `check_e1f` counted.
+#[derive(Debug)]
+pub struct E1f {
+    /// `(arm, kept, n)` for each arm, every trial counted.
+    pub arms: Vec<(String, usize, usize)>,
+    /// The E1-only arm (`at-2004h`) as `(lost, e1_only, n)`: `e1_only` counts
+    /// the trials whose LATE was written before the deck's E1F `?2026h`, the
+    /// only ones that release at E1 alone, and `lost` those of them whose
+    /// LATE was not in the next export.
+    pub e1_only: (usize, usize, usize),
 }
 
 /// How Codex and the deck classify Ctrl+G for one launch's sources.

@@ -144,9 +144,12 @@ fn probe_092_live_codex_164_ctrl_g_forms_and_pasted_bel() {
 #[test]
 fn probe_093_live_codex_164_e1f_release_premise() {
     let Some(dir) = record("e1f") else { return };
-    for (arm, kept, n) in evidence::check_e1f(&dir) {
+    let counts = evidence::check_e1f(&dir);
+    for (arm, kept, n) in &counts.arms {
         eprintln!("E1F {arm}: LATE kept {kept}/{n}");
     }
+    let (lost, e1_only, n) = counts.e1_only;
+    eprintln!("E1F at-2004h before the frame: lost {lost}/{e1_only} of {n}");
 }
 
 /// Scenario: Launch the pinned Codex 0.164.0 once for each of nineteen key-binding source cases (M58's eight, the precedence of config, profile, project and `-c`, a symlinked profile and an untrusted project) and press Ctrl+G and F6 on a draft, then read the same files as the deck reads at spawn: the deck never treats a moved Ctrl+G as the editor, and its merge gives Codex's result wherever Codex started in a trusted folder.

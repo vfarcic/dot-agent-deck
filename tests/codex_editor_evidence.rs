@@ -59,7 +59,7 @@ fn probe_092_codex_164_ctrl_g_forms_and_pasted_bel() {
     }
 }
 
-/// Scenario: Replay both committed Codex 0.164.0 E1F recordings through the deck's return-marker reader: in each, twenty Ctrl+G presses per arm, with `LATE` typed at E1's `?2004h`, at the first `?2026h` after it (where the deck reads E1F), or while the editor runs. `LATE` typed at the deck's E1F is in the next export every time (40 of 40), typed during the editor it is lost every time, and no `?2026h` falls between Codex's disable and its enable; typed at E1's `?2004h` alone it was lost twice in the first run's twenty and never in the rerun's.
+/// Scenario: Replay both committed Codex 0.164.0 E1F recordings through the deck's return-marker reader: in each, twenty Ctrl+G presses per arm, with `LATE` typed at E1's `?2004h`, at the first `?2026h` after it (where the deck reads E1F), or while the editor runs. `LATE` typed at the deck's E1F is in the next export every time (40 of 40), typed during the editor it is lost every time, and no `?2026h` falls between Codex's disable and its enable; typed at E1's `?2004h` alone, before the deck's E1F frame, it was lost in 2 of the first run's 18 such trials (its other 2 wrote it after that frame) and in none of the rerun's 20.
 #[spec("inbox/probe/093")]
 #[test]
 fn probe_093_codex_164_e1f_release_premise() {
@@ -67,14 +67,18 @@ fn probe_093_codex_164_e1f_release_premise() {
     let first = evidence::check_e1f(&dir);
     let rerun = evidence::check_e1f(&dir.join("e1f-rerun"));
     for (run, arms) in [("first", &first), ("rerun", &rerun)] {
-        for (arm, kept, n) in arms.iter() {
+        for (arm, kept, n) in arms.arms.iter() {
             eprintln!("{run} {arm}: LATE kept {kept}/{n}");
         }
+        let (lost, e1_only, n) = arms.e1_only;
+        eprintln!("{run} at-2004h before the frame: lost {lost}/{e1_only} of {n}");
     }
     // The E1-only arm, as each committed run measured it: the race is the
-    // natural one (no stop inside Codex's flush), so only these counts.
-    assert_eq!(first[0], ("at-2004h".to_string(), 18, 20));
-    assert_eq!(rerun[0], ("at-2004h".to_string(), 20, 20));
+    // natural one (no stop inside Codex's flush), so only these counts. The
+    // first run's t01 and t13 wrote LATE after the deck's E1F `?2026h`, so
+    // they released at E1F, not at E1 alone, and are not counted.
+    assert_eq!(first.e1_only, (2, 18, 20));
+    assert_eq!(rerun.e1_only, (0, 20, 20));
 }
 
 /// Scenario: Rebuild each of the nineteen key-binding source cases a committed Codex 0.164.0 recording launched with, read them as the deck reads a Codex launch at spawn, and compare the deck's verdict with what Ctrl+G and F6 did in Codex: the deck never treats Ctrl+G as the editor where Codex moved it, its merge order (config, profile, project, `-c`) gives Codex's result in every case Codex started in a trusted folder, and it holds wherever a project file carries a keymap, including the untrusted folder whose file Codex ignores.
