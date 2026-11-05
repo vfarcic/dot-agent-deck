@@ -1110,10 +1110,13 @@ const SHIM_OTEL_KEYS: [&str; 2] = ["otel.trace_exporter", "otel.metrics_exporter
 
 /// `args` (after the deck's embedded-mode pair) without the telemetry
 /// shim's leading `otel` overrides, or `None` when they don't open with one
-/// (the revcxkey review's M3). With an OTLP endpoint configured, the shim
-/// the daemon puts first on every agent's `PATH` runs a Codex called by
-/// name with `-c otel.trace_exporter=…` and `-c otel.metrics_exporter=…`
-/// after the pair and before the user's own arguments, either of them
+/// (the revcxkey review's M3). With an OTLP endpoint configured, the daemon
+/// puts its shim first on the `PATH` of the agents it starts with a
+/// telemetry run, when their base environment has a `PATH`
+/// (`crate::telemetry::exporter`), and the shim runs a Codex called by name
+/// with `-c otel.trace_exporter=…` and `-c otel.metrics_exporter=…` after
+/// the pair and before the user's own arguments, only when
+/// `crate::telemetry::launch::codex_args`'s conditions hold, either of them
 /// left out when its signal has no endpoint (`crate::telemetry::shim`).
 ///
 /// Only that position and shape is the shim's: `-c` (not another spelling)
