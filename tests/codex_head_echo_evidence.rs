@@ -5,7 +5,7 @@
 mod head_echo;
 
 use dot_agent_deck::doorbell_activation::{
-    KeyEffect, Measurement, RELEASE_RECORDS, first_stage_bytes,
+    AGENT_FACTS, KeyEffect, Measurement, RECORDED_RELEASES, first_stage_bytes,
 };
 use dot_agent_deck::doorbell_screen::TOKEN_HEAD_CHARS;
 use dot_agent_deck::doorbell_txn::{ECHO_WAIT, TOKEN_ALPHABET};
@@ -247,19 +247,26 @@ fn doorbell_036_codex_164_head_echo_controls_capture() {
     }
 }
 
-/// Scenario: Over every Codex record the deck carries, check each measured dialog's key table: both parentheses and every token letter are classified there and classified inert, and every token head typed in the committed captures is made only of those bytes. A future table that makes a token byte commit, move or dismiss, or leaves one unmeasured, fails here.
+/// Scenario: Over Codex's facts and every recorded Codex release the deck carries, check each dialog's key table: both parentheses and every token letter are classified there and classified inert, and every token head typed in the committed captures is made only of those bytes. A future table that makes a token byte commit, move or dismiss, or leaves one unmeasured, fails here.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_codex_token_head_bytes_are_inert_in_every_dialog() {
     let first: Vec<u8> = first_stage_bytes().collect();
     assert_eq!(first.len(), 2 + TOKEN_ALPHABET.len());
     let mut checked = 0;
-    for record in RELEASE_RECORDS
+    let tables = RECORDED_RELEASES
         .iter()
-        .filter(|r| r.agent == AgentType::Codex)
-    {
-        let Measurement::Verified(dialogs) = record.key_effects else {
-            panic!("{}: key effects not verified", record.release);
+        .filter(|r| r.measured.agent == AgentType::Codex)
+        .map(|r| (r.release.to_string(), &r.measured))
+        .chain(
+            AGENT_FACTS
+                .iter()
+                .filter(|f| f.agent == AgentType::Codex)
+                .map(|f| ("facts".to_string(), f)),
+        );
+    for (release, facts) in tables {
+        let Measurement::Verified(dialogs) = facts.key_effects else {
+            panic!("{release}: key effects not verified");
         };
         for dialog in dialogs.iter() {
             for &byte in &first {
@@ -272,7 +279,7 @@ fn doorbell_036_codex_token_head_bytes_are_inert_in_every_dialog() {
                     effect,
                     Some(KeyEffect::Inert),
                     "Codex {} {}: {:?}",
-                    record.release,
+                    release,
                     dialog.dialog,
                     char::from(byte)
                 );

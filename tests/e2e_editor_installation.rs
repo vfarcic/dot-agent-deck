@@ -353,7 +353,7 @@ fn probe_033_a_shell_that_execs_an_agent_is_not_installed() {
     }
 }
 
-/// Scenario: Start the real daemon with malformed, duplicate, unknown and metadata-suffixed editor-probe assumption lists in separate sandboxes. Each daemon must report refusal through its real assumption reader at startup, before serving an attach endpoint; the test permits either rejecting startup or continuing with no assumptions.
+/// Scenario: Start the real daemon with malformed, duplicate, pre-release and metadata-suffixed editor-probe assumption lists in separate sandboxes. Each daemon must report refusal through its real assumption reader at startup, before serving an attach endpoint; the test permits either rejecting startup or continuing with no assumptions.
 #[spec("inbox/probe/033")]
 #[test]
 fn probe_033_invalid_assumptions_are_rejected_at_startup() {
@@ -361,7 +361,7 @@ fn probe_033_invalid_assumptions_are_rejected_at_startup() {
     for list in [
         "broken",
         "claude@2.1.310,claude@2.1.310",
-        "claude@99.0.0",
+        "claude@2.1.310-beta.1",
         "claude@2.1.310+metadata",
     ] {
         let root = common::race_safe_tempdir();

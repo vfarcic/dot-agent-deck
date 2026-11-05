@@ -30,6 +30,14 @@ pub const CONFIG_KEYS: &[(&str, &str)] = &[
     ),
     ("bell.on_error", "Bell on agent error (default: true)"),
     (
+        "doorbell.claude",
+        "Type the doorbell into Claude Code and check its input box (default: true)",
+    ),
+    (
+        "doorbell.codex",
+        "Type the doorbell into Codex (default: true)",
+    ),
+    (
         "host_metrics.disk_free_warn_percent",
         "Host disk shows a warning below this % free (default: 15)",
     ),
@@ -132,6 +140,35 @@ impl BellConfig {
     }
 }
 
+/// PRD #1666 part 3: the `[doorbell]` table, one switch per agent the deck
+/// types its doorbell line into. `false` turns the doorbell off for that
+/// agent: the deck types nothing into it and installs no input-box check, and
+/// its messages arrive by its hooks, native wake or `inbox fetch`. The daemon
+/// reads it when it starts an agent ([`crate::doorbell_switch`]), where
+/// `DOT_AGENT_DECK_DOORBELL_CLAUDE` / `DOT_AGENT_DECK_DOORBELL_CODEX` win over
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DoorbellConfig {
+    pub claude: bool,
+    pub codex: bool,
+}
+
+impl Default for DoorbellConfig {
+    fn default() -> Self {
+        Self {
+            claude: true,
+            codex: true,
+        }
+    }
+}
+
+impl DoorbellConfig {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Issue #519: the removed `[idle_art]` section is deliberately NOT declared
 /// here as an accepted-and-ignored field. `DashboardConfig` sets no
 /// `#[serde(deny_unknown_fields)]`, so serde drops unknown tables silently and
@@ -156,6 +193,11 @@ pub struct DashboardConfig {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub default_dir: String,
     pub bell: BellConfig,
+    /// PRD #1666 part 3: the per-agent doorbell switch ([`DoorbellConfig`]).
+    /// Not serialised while both are on, so a `config set` of another key
+    /// writes no `[doorbell]` table.
+    #[serde(skip_serializing_if = "DoorbellConfig::is_default")]
+    pub doorbell: DoorbellConfig,
     pub auto_config_prompt: bool,
     /// PRD #1258: the `[host_metrics]` table — the thresholds this deck's
     /// daemon judges its host's disk, memory and load by
@@ -202,6 +244,7 @@ impl Default for DashboardConfig {
             default_command: String::new(),
             default_dir: String::new(),
             bell: BellConfig::default(),
+            doorbell: DoorbellConfig::default(),
             auto_config_prompt: true,
             host_metrics: toml::Table::new(),
         }
@@ -333,6 +376,8 @@ impl DashboardConfig {
             "bell.on_waiting_for_input" => Ok(self.bell.on_waiting_for_input.to_string()),
             "bell.on_idle" => Ok(self.bell.on_idle.to_string()),
             "bell.on_error" => Ok(self.bell.on_error.to_string()),
+            "doorbell.claude" => Ok(self.doorbell.claude.to_string()),
+            "doorbell.codex" => Ok(self.doorbell.codex.to_string()),
             "auto_config_prompt" => Ok(self.auto_config_prompt.to_string()),
             _ => match host_metrics_key(key) {
                 // The value in effect, so a reader sees the default for an
@@ -384,6 +429,14 @@ impl DashboardConfig {
             }
             "bell.on_error" => {
                 self.bell.on_error = parse_bool(value)?;
+                Ok(())
+            }
+            "doorbell.claude" => {
+                self.doorbell.claude = parse_bool(value)?;
+                Ok(())
+            }
+            "doorbell.codex" => {
+                self.doorbell.codex = parse_bool(value)?;
                 Ok(())
             }
             "auto_config_prompt" => {

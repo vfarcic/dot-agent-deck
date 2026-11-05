@@ -1,7 +1,7 @@
 #![cfg(all(feature = "e2e", unix))]
 
 //! PRD #1666 part 3, Q27 and Q28 (`inbox/codex/027`, `inbox/codex/028`): the
-//! doorbell rung into a Codex generation the deck has measured, through the
+//! doorbell rung into a Codex generation on Codex's facts, through the
 //! real wrapper, writer, hook CLI and daemon, against a scripted Codex screen
 //! (`tests/support/codex_composer.py`) that draws the measured header,
 //! composer, transcript and dialogs. No Codex CLI, model or credential is
@@ -13,8 +13,8 @@
 //! prompt (028 has no such step); the hooks are trusted through a `codex
 //! app-server` stand-in, so the wrapper reports nothing from the screen's
 //! output (the untrusted-hooks path is not covered here). The daemon reads
-//! 0.164.0's shipped release record, `head_echo` included, as production
-//! does: nothing assumes a measurement here.
+//! Codex's shipped facts, `head_echo` included, as production does: nothing
+//! assumes a measurement here.
 mod common;
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
@@ -30,9 +30,9 @@ use std::time::Duration;
 
 /// The measured release.
 const MEASURED: &str = "0.164.0";
-/// The settle window the deck gives it: 0.164.0's slowest measured start-up
-/// dialog plus half.
-const MEASURED_SETTLE: Duration = Duration::from_millis(6030);
+/// The settle window the deck gives every Codex: the slowest start-up dialog
+/// recorded on any Codex release (4.461 s, on 0.160.0) plus half.
+const MEASURED_SETTLE: Duration = Duration::from_micros(6_691_500);
 /// Long enough for a fresh generation's settle window and its ring.
 const RING_WAIT: Duration = Duration::from_secs(40);
 
@@ -439,7 +439,7 @@ fn delivered(deck: &Deck, codex: &Codex, id: &str) -> String {
     codex.rung(id).unwrap()
 }
 
-/// Scenario: Start the scripted Codex screen drawing measured release 0.164.0 behind the real wrapper, report its own SessionStart and Stop, and queue a task. No byte reaches it before its settle window (the slowest measured start-up dialog plus half, 6.03 s after the anchor) has passed; then the deck types the token head `(xxxxxx)` alone, the rest of the line once the head is on screen, and one Enter, nothing else; Codex's own prompt hook hands the task over and it is acknowledged, and the record's WAKE names Codex's turn-end hand-over with nothing holding the doorbell.
+/// Scenario: Start the scripted Codex screen drawing measured release 0.164.0 behind the real wrapper, report its own SessionStart and Stop, and queue a task. No byte reaches it before its settle window (the slowest recorded start-up dialog plus half, 6.69 s after the anchor) has passed; then the deck types the token head `(xxxxxx)` alone, the rest of the line once the head is on screen, and one Enter, nothing else; Codex's own prompt hook hands the task over and it is acknowledged, and the record's WAKE names Codex's turn-end hand-over with nothing holding the doorbell.
 #[spec("inbox/codex/027")]
 #[test]
 fn codex_027_a_measured_codex_is_rung_in_two_stages_after_its_settle_window() {

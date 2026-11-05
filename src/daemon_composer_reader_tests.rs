@@ -50,7 +50,7 @@ const PANE: &str = "composer-reader-pane";
 /// observer passes.
 const SETTLE: Duration = Duration::from_secs(5);
 
-/// The release a bound deck's latch reports, which `RELEASE_RECORDS` holds
+/// The release a bound deck's latch reports, the one the e2e stand-ins draw
 /// for Claude.
 fn release() -> semver::Version {
     semver::Version::new(2, 1, 310)

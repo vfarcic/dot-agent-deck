@@ -107,7 +107,7 @@ mod inbox_view;
 mod checked_delegate {
     use super::{PINNED_MODEL, common, inbox, inbox_view};
     use dot_agent_deck::doorbell_activation::{
-        Activation, LatchedRelease, Measurement, RELEASE_RECORDS,
+        AGENT_FACTS, Activation, CLAUDE_FACTS, LatchedRelease, Measurement,
     };
     use dot_agent_deck::event::AgentType;
     use serde_json::{Value, json};
@@ -121,8 +121,8 @@ mod checked_delegate {
     pub const DRAFT: &str = "half-typed-draft-c4e9a1";
     const ORCHESTRATION: &str = "chain-smoke-002";
 
-    /// The worker's Claude Code: the installed `claude`, at a release this
-    /// build checks. Since the Claude activation (Q35-28) the production
+    /// The worker's Claude Code: the installed `claude`, at any release (the
+    /// deck checks every release on Claude Code's facts). Since the Claude activation (Q35-28) the production
     /// rollout installs `Direct(Claude)`, so no e2e assumption is set.
     pub struct Mode {
         release: String,
@@ -140,17 +140,13 @@ mod checked_delegate {
         };
         let go = matches!(
             dot_agent_deck::doorbell_activation::activation(
-                &RELEASE_RECORDS,
+                &AGENT_FACTS,
                 &AgentType::ClaudeCode,
                 &LatchedRelease::Known(version.clone()),
             ),
             Activation::Go { .. }
         );
-        go && RELEASE_RECORDS.iter().any(|r| {
-            r.agent == AgentType::ClaudeCode
-                && r.release == version
-                && matches!(r.editor_probe, Measurement::Verified(_))
-        })
+        go && matches!(CLAUDE_FACTS.editor_probe, Measurement::Verified(_))
     }
 
     fn installed_release() -> Result<String, String> {
@@ -181,8 +177,8 @@ mod checked_delegate {
             Ok(Mode { release })
         } else {
             Err(format!(
-                "Claude Code {release} is installed, and this build has no Go record with \
-                 a verified editor_probe for it"
+                "Claude Code {release} is installed, and this build's Claude Code facts are \
+                 not Go with a verified editor_probe"
             ))
         }
     }

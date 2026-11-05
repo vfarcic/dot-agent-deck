@@ -1,0 +1,7 @@
+## The doorbell works with every Claude Code and Codex version, and can be turned off per agent
+
+The deck types its doorbell into every version of Claude Code and Codex, and checks the input box of every Claude Code version it starts directly on Linux, so an agent that updates itself keeps getting its messages without a prompt.
+
+If an agent update makes the doorbell misbehave (the line lands in the wrong place, Enter isn't taken, or Claude Code's input box flickers or your editor opens on its own), turn it off for that agent until a deck release fixes it: `dot-agent-deck config set doorbell.claude false` or `dot-agent-deck config set doorbell.codex false`, or set `DOT_AGENT_DECK_DOORBELL_CLAUDE=0` or `DOT_AGENT_DECK_DOORBELL_CODEX=0` in the deck's environment. It applies to agents started after the change, in the TUI and the desktop app alike. With the doorbell off, the deck types nothing into that agent and doesn't check its input box; its messages arrive through its own wake-up and hooks or at your next prompt, and its card says `waiting for the agent to fetch it. Send it a prompt.` when nothing else delivers them.
+
+See [Orchestration → Turn the doorbell off for an agent](https://agent-deck.devopstoolkit.ai/docs/orchestration.md#turn-the-doorbell-off-for-an-agent) and [Troubleshooting → The doorbell misbehaves after an agent update](https://agent-deck.devopstoolkit.ai/docs/troubleshooting.md#the-doorbell-misbehaves-after-an-agent-update).

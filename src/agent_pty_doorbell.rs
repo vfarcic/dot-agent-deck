@@ -312,9 +312,7 @@ impl AgentPtyRegistry {
             generation.doorbell.standin_profile(),
         ) {
             if !crate::doorbell_screen::standin_running(generation.child_pid, binary) {
-                return Some(Err(
-                    crate::doorbell_activation::NoGo::UnmeasuredRelease.clause()
-                ));
+                return Some(Err(crate::doorbell_activation::NoGo::UnknownAgent.clause()));
             }
             return Some(Ok(Typing {
                 profile,
@@ -339,22 +337,31 @@ impl AgentPtyRegistry {
                 .unwrap_or(crate::doorbell_activation::LatchedRelease::Unseen);
             (latch, state.evidence.profile())
         };
-        Some(self.typing_for(hook_route, agent, latch, evidence_profile))
+        Some(self.typing_for(
+            hook_route,
+            agent,
+            latch,
+            evidence_profile,
+            generation.doorbell.switch(),
+        ))
     }
 
-    /// The verdict and its typing, from what the generation latched.
+    /// The verdict and its typing, from what the generation latched, under
+    /// the doorbell switch it was started with.
     fn typing_for(
         &self,
         hook_route: bool,
         agent: Option<AgentType>,
         latch: crate::doorbell_activation::LatchedRelease,
         evidence_profile: Option<&'static crate::doorbell_screen::ScreenProfile>,
+        switch: &crate::doorbell_switch::DoorbellSwitch,
     ) -> Result<Typing, &'static str> {
-        use crate::doorbell_activation::{Activation, RELEASE_RECORDS};
+        use crate::doorbell_activation::{AGENT_FACTS, Activation, facts_for};
         let verdict = crate::doorbell_generation::generation_activation(
-            &RELEASE_RECORDS,
+            &AGENT_FACTS,
             agent.as_ref(),
             &latch,
+            switch,
         );
         let released = match &latch {
             crate::doorbell_activation::LatchedRelease::Known(release) => Some(release.clone()),
@@ -368,13 +375,17 @@ impl AgentPtyRegistry {
             } => (*profile, *staged, *settle),
             Activation::NoGo(no_go) => return Err(no_go.clause()),
         };
-        let profile = crate::doorbell_screen::profile(profile_id)
+        // `Go` names the profile of the agent's own facts; the screen must
+        // be read under that profile too, which it is once the evidence has
+        // taken up the agent's type.
+        let Some(profile) = crate::doorbell_screen::profile(profile_id)
             .filter(|p| evidence_profile.is_some_and(|e| e.id == p.id))
-            .ok_or(crate::doorbell_activation::NoGo::UnmeasuredRelease.clause())?;
-        let record = RELEASE_RECORDS
-            .iter()
-            .find(|r| Some(&r.agent) == agent.as_ref() && Some(&r.release) == released.as_ref())
-            .ok_or(crate::doorbell_activation::NoGo::UnmeasuredRelease.clause())?;
+        else {
+            return Err(crate::doorbell_activation::NoGo::UnknownAgent.clause());
+        };
+        let Some(record) = agent.as_ref().and_then(|a| facts_for(&AGENT_FACTS, a)) else {
+            return Err(crate::doorbell_activation::NoGo::AgentNotSupported.clause());
+        };
         let verified = |m: bool| m;
         let caps = txn::Caps {
             delete_key: verified(record.delete_key.verified().is_some()),
@@ -1303,37 +1314,13 @@ impl AgentPtyRegistry {
                 });
         if refusal_changed && let Some(clause) = refused {
             // The line troubleshooting points at: why the deck types nothing
-            // into this generation, and the releases of its agent it would.
-            let measured: Vec<String> = generation
-                .agent
-                .as_ref()
-                .map(|agent| {
-                    crate::doorbell_activation::RELEASE_RECORDS
-                        .iter()
-                        .filter(|record| record.agent == *agent)
-                        .filter(|record| {
-                            matches!(
-                                crate::doorbell_activation::activation(
-                                    &crate::doorbell_activation::RELEASE_RECORDS,
-                                    agent,
-                                    &crate::doorbell_activation::LatchedRelease::Known(
-                                        record.release.clone()
-                                    ),
-                                ),
-                                crate::doorbell_activation::Activation::Go { .. }
-                            )
-                        })
-                        .map(|record| record.release.to_string())
-                        .collect()
-                })
-                .unwrap_or_default();
+            // into this generation.
             tracing::info!(
                 target: "doorbell",
                 pane_id,
                 agent_id,
                 agent = ?generation.agent,
                 clause,
-                measured = %measured.join(", "),
                 "doorbell off: the deck does not type into this agent"
             );
         }

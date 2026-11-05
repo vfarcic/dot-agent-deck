@@ -7499,8 +7499,8 @@ mod tests {
         };
         // (a) Refused, nothing armed: none, and no doorbell promised.
         let hub = fresh();
-        assert!(hub.set_typed_fallback("w", "wa", Some("unmeasured_release")));
-        assert!(!hub.set_typed_fallback("w", "wa", Some("unmeasured_release")));
+        assert!(hub.set_typed_fallback("w", "wa", Some("agent_not_supported")));
+        assert!(!hub.set_typed_fallback("w", "wa", Some("agent_not_supported")));
         delegate(&hub, "TASK-REFUSED");
         assert_eq!(hub.summary("w", "wa").wake, WakePath::None);
         hub.tick();
@@ -7517,7 +7517,7 @@ mod tests {
         // (c) Refused with a native waiter armed: native in both, and a
         // message goes to that waiter.
         let hub = Arc::new(fresh());
-        hub.set_typed_fallback("w", "wa", Some("unmeasured_release"));
+        hub.set_typed_fallback("w", "wa", Some("agent_not_supported"));
         let (mut waiter, armed) = OnceWaiter::open(&hub, "w", "wa", None).await;
         assert!(armed.registered.is_some());
         assert_eq!(hub.summary("w", "wa").wake, WakePath::Native);
@@ -7536,7 +7536,7 @@ mod tests {
         // (d) Refused with a turn-end announcement: turn-end, without the
         // idle doorbell's promise.
         let hub = fresh();
-        hub.set_typed_fallback("w", "wa", Some("unmeasured_release"));
+        hub.set_typed_fallback("w", "wa", Some("agent_not_supported"));
         hub.announce(
             "w",
             "wa",
@@ -7582,7 +7582,7 @@ mod tests {
         // (h) The generation exits: its entry goes; a successor with its own
         // refusal reads none, one with none reads doorbell.
         let hub = fresh();
-        hub.set_typed_fallback("w", "wa", Some("unmeasured_release"));
+        hub.set_typed_fallback("w", "wa", Some("agent_not_supported"));
         hub.agent_exited_as("w", "wa", ExitKind::Natural, None);
         hub.post_direct(Recipient::bound("w", "wb"), content("for wb"))
             .unwrap();

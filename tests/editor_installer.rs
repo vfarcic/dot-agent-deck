@@ -34,6 +34,7 @@ use dot_agent_deck::composer_probe::instance::{
 use dot_agent_deck::doorbell_activation::{
     EditorProbe, EditorSelection, ExportShape, Measurement, PasteToggles,
 };
+use dot_agent_deck::doorbell_switch::DoorbellSwitch;
 use dot_agent_deck::event::AgentType;
 use semver::Version;
 use spec::spec;
@@ -269,7 +270,7 @@ fn probe_064_the_rollout_decides_and_production_installs_only_a_direct_claude() 
         (None, NotInstalled::Shell),
     ] {
         assert_eq!(
-            at_spawn(command, None, "1", &[]).err(),
+            at_spawn(command, None, "1", &[], &DoorbellSwitch::default()).err(),
             Some(why),
             "{command:?}"
         );
@@ -296,6 +297,53 @@ fn probe_064_the_rollout_decides_and_production_installs_only_a_direct_claude() 
         assumed_classes(&[(AgentType::OpenCode, release, probe())]),
         []
     );
+}
+
+/// Scenario: Decide installation with the per-agent doorbell switch: with Claude Code's doorbell turned off a direct `claude` command is refused as turned off before anything is made, and so are a Claude launcher and an undeclared wrapper even under a rollout naming them; Codex's switch off refuses Codex's classes and leaves Claude's alone; a wrapper is refused while either switch is off; agents without a switch, shells and every class with both switches on are left to the rollout.
+#[spec("inbox/probe/064")]
+#[test]
+fn probe_064_a_turned_off_agent_is_never_installed() {
+    use dot_agent_deck::composer_probe::install::switched_on;
+    let claude_off = DoorbellSwitch {
+        claude: false,
+        codex: true,
+    };
+    let codex_off = DoorbellSwitch {
+        claude: true,
+        codex: false,
+    };
+    let on = DoorbellSwitch::default();
+    assert_eq!(
+        at_spawn(Some("claude"), None, "1", &[], &claude_off).err(),
+        Some(NotInstalled::TurnedOff)
+    );
+    let launcher_claude = PaneClass::Launcher(ProbeAgent::Claude);
+    let launcher_codex = PaneClass::Launcher(ProbeAgent::Codex);
+    for (class, switch, want) in [
+        (CLAUDE, claude_off, Err(NotInstalled::TurnedOff)),
+        (launcher_claude, claude_off, Err(NotInstalled::TurnedOff)),
+        (PaneClass::Wrapper, claude_off, Err(NotInstalled::TurnedOff)),
+        (CODEX, claude_off, Ok(())),
+        (CODEX, codex_off, Err(NotInstalled::TurnedOff)),
+        (launcher_codex, codex_off, Err(NotInstalled::TurnedOff)),
+        (PaneClass::Wrapper, codex_off, Err(NotInstalled::TurnedOff)),
+        (CLAUDE, codex_off, Ok(())),
+        (PaneClass::Unprobed, claude_off, Ok(())),
+        (PaneClass::Shell, claude_off, Ok(())),
+    ] {
+        assert_eq!(switched_on(class, &switch), want, "{class:?} {switch:?}");
+    }
+    for class in [
+        CLAUDE,
+        launcher_claude,
+        CODEX,
+        launcher_codex,
+        PaneClass::Wrapper,
+        PaneClass::Unprobed,
+        PaneClass::Shell,
+    ] {
+        assert_eq!(switched_on(class, &on), Ok(()), "{class:?}");
+    }
 }
 
 /// Scenario: Resolve the editor settings a spawn would have had: the spawn's own last value wins over the daemon's, an exported-empty value stays empty, a value set nowhere is unset, and a daemon value that isn't UTF-8 refuses. The helper's saved settings read back from an environment, unset staying unset.

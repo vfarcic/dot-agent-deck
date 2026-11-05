@@ -280,7 +280,7 @@ fn pi_020_live_the_deck_types_nothing_into_pi() {
     assert!(
         common::wait_until(BUDGET, || pi.log().lines().any(|line| line
             .contains("doorbell off")
-            && line.contains("unmeasured_release"))),
+            && line.contains("agent_not_supported"))),
         "the deck says it types nothing into Pi; {}",
         pi.evidence()
     );

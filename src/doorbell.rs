@@ -1331,7 +1331,7 @@ mod tests {
             paste_open: true,
             draft: true,
             unchecked: Some(WakeHold::NeedsFetch),
-            cannot_type: Some("unmeasured_release"),
+            cannot_type: Some("agent_not_supported"),
             unrecognised: true,
             not_taken: true,
             turns: 0,

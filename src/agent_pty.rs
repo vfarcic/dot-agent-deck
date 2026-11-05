@@ -14473,13 +14473,19 @@ impl AgentPtyRegistry {
         // (PRD #2050), so the helper's arguments are appended to the command
         // the pane actually runs. Off the executor: the first installed
         // spawn copies the daemon's binary into its instance.
-        let composer_install = crate::inbox_hub::off_the_executor(|| {
-            crate::composer_probe::install::at_spawn(
+        // PRD #1666 part 3: the per-agent doorbell switch, read from the
+        // deck's config now, so this generation keeps the value it started
+        // with; off, its agent gets no helper and no doorbell.
+        let (doorbell_switch, composer_install) = crate::inbox_hub::off_the_executor(|| {
+            let switch = crate::doorbell_switch::at_spawn();
+            let installation = crate::composer_probe::install::at_spawn(
                 opts.command,
                 opts.agent_type.as_ref(),
                 &preallocated_id,
                 &opts.env,
-            )
+                &switch,
+            );
+            (switch, installation)
         });
         let composer_install = match composer_install {
             Ok(installation) => {
@@ -14864,7 +14870,8 @@ impl AgentPtyRegistry {
             child_role == ChildRole::Wrapper,
             #[cfg(unix)]
             master.as_raw_fd(),
-        );
+        )
+        .with_switch(doorbell_switch);
         #[cfg(feature = "e2e")]
         let doorbell = doorbell.with_standin(standin);
         let doorbell = Arc::new(doorbell);
@@ -25111,7 +25118,7 @@ mod spawn_tests {
         assert_eq!(wakes(&registry), [WakePath::None, WakePath::Doorbell]);
         registry
             .inbox()
-            .set_typed_fallback("p", "2", Some("unmeasured_release"));
+            .set_typed_fallback("p", "2", Some("agent_not_supported"));
         assert_eq!(wakes(&registry), [WakePath::None, WakePath::None]);
         registry.inbox().set_typed_fallback("p", "2", None);
         assert_eq!(wakes(&registry), [WakePath::None, WakePath::Doorbell]);
@@ -26096,7 +26103,7 @@ mod spawn_tests {
     #[spec("inbox/doorbell/055")]
     #[test]
     fn doorbell_055_the_scanner_works_to_a_budget() {
-        use crate::doorbell_activation::{Activation, LatchedRelease, NoGo, RELEASE_RECORDS};
+        use crate::doorbell_activation::{AGENT_FACTS, Activation, LatchedRelease, NoGo};
         use crate::release_scanner::{ScanLatch, WindowClose, WorkLimit};
         let over = |bus: &AgentBus| bus.state.lock().unwrap().release.cost().over;
         let latched_for = |bus: &AgentBus| {
@@ -26117,7 +26124,7 @@ mod spawn_tests {
         assert_eq!(latched_for(&bus), LatchedRelease::ScannerBudget);
         assert_eq!(
             crate::doorbell_activation::activation(
-                &RELEASE_RECORDS,
+                &AGENT_FACTS,
                 &AgentType::Codex,
                 &latched_for(&bus),
             ),

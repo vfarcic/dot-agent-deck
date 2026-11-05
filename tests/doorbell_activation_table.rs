@@ -1,14 +1,16 @@
-//! `inbox/doorbell/053`: the activation table, rule by rule
+//! `inbox/doorbell/053`: the activation table, rule by rule, over one set of
+//! facts per agent, and the recorded releases as conformance tests
 //! (`src/doorbell_activation.rs`).
 use std::time::Duration;
 
 use dot_agent_deck::doorbell_activation::{
-    Activation, DialogKeys, EditorProbe, EditorSelection, ExportShape, FirstModal, KeyEffect,
-    KeymapSource, LatchedRelease, Measurement, NoGo, PasteToggles, RELEASE_RECORDS, ReleaseRecord,
-    SETTLE_CAP, activation, exact_verdict, first_stage_bytes, parse_unrecorded_claude_releases,
-    with_assumed_editor_probes, without_unrecorded_claude,
+    AGENT_FACTS, Activation, AgentFacts, CLAUDE_FACTS, CODEX_FACTS, DialogKeys, EditorProbe,
+    EditorSelection, ExportShape, FirstModal, KeyEffect, KeymapSource, LatchedRelease, Measurement,
+    NoGo, PasteToggles, RECORDED_RELEASES, RecordedRelease, SETTLE_CAP, activation, conformance,
+    editor_probe_for, facts_verdict, first_stage_bytes,
 };
 use dot_agent_deck::doorbell_generation::generation_activation;
+use dot_agent_deck::doorbell_switch::DoorbellSwitch;
 use dot_agent_deck::event::AgentType;
 use semver::Version;
 use spec::spec;
@@ -20,7 +22,7 @@ fn v(s: &str) -> Version {
     Version::parse(s).unwrap()
 }
 
-/// The keys a measured dialog classifies, all inert.
+/// The keys a known dialog classifies, all inert.
 const ALL_INERT: &[(u8, KeyEffect)] = &[
     (b'(', KeyEffect::Inert),
     (b')', KeyEffect::Inert),
@@ -34,10 +36,9 @@ const INERT_DIALOGS: &[DialogKeys<'static>] = &[DialogKeys {
     keys: ALL_INERT,
 }];
 
-fn complete(agent: AgentType, release: &str, first_modal_secs: u64) -> ReleaseRecord<'static> {
-    ReleaseRecord {
+fn complete(agent: AgentType, first_modal_secs: u64) -> AgentFacts<'static> {
+    AgentFacts {
         agent,
-        release: v(release),
         profile: "test-profile",
         ready_composer: Measurement::Verified(()),
         echo: Measurement::Verified(()),
@@ -59,11 +60,11 @@ fn complete(agent: AgentType, release: &str, first_modal_secs: u64) -> ReleaseRe
     }
 }
 
-/// A record whose echo measurement is unverified, with a verified timing.
-fn incomplete(agent: AgentType, release: &str, first_modal_secs: u64) -> ReleaseRecord<'static> {
-    ReleaseRecord {
+/// Facts whose echo is unverified, with a verified timing.
+fn incomplete(agent: AgentType, first_modal_secs: u64) -> AgentFacts<'static> {
+    AgentFacts {
         echo: Measurement::Unverified,
-        ..complete(agent, release, first_modal_secs)
+        ..complete(agent, first_modal_secs)
     }
 }
 
@@ -71,8 +72,8 @@ fn known(release: &str) -> LatchedRelease {
     LatchedRelease::Known(v(release))
 }
 
-fn verdict<'a>(records: &[ReleaseRecord<'a>], agent: &AgentType, release: &str) -> Activation<'a> {
-    activation(records, agent, &known(release))
+fn verdict<'a>(facts: &[AgentFacts<'a>], agent: &AgentType, release: &str) -> Activation<'a> {
+    activation(facts, agent, &known(release))
 }
 
 fn no_go(a: &Activation<'_>) -> Option<NoGo> {
@@ -99,26 +100,26 @@ enum State {
     Verified,
     Absent,
     Unverified,
-    Unraisable,
+    Failed,
 }
 
-fn set(record: &mut ReleaseRecord<'static>, field: usize, state: State) {
+fn set(facts: &mut AgentFacts<'static>, field: usize, state: State) {
     fn m<T: Copy>(state: State, value: T) -> Measurement<T> {
         match state {
             State::Verified => Measurement::Verified(value),
             State::Absent => Measurement::Absent,
             State::Unverified => Measurement::Unverified,
-            State::Unraisable => Measurement::Unraisable,
+            State::Failed => Measurement::Failed,
         }
     }
     match field {
-        0 => record.ready_composer = m(state, ()),
-        1 => record.echo = m(state, ()),
-        2 => record.submit_route = m(state, ()),
-        3 => record.layout = m(state, ()),
-        4 => record.key_effects = m(state, INERT_DIALOGS),
+        0 => facts.ready_composer = m(state, ()),
+        1 => facts.echo = m(state, ()),
+        2 => facts.submit_route = m(state, ()),
+        3 => facts.layout = m(state, ()),
+        4 => facts.key_effects = m(state, INERT_DIALOGS),
         5 => {
-            record.first_modal = m(
+            facts.first_modal = m(
                 state,
                 FirstModal::Slowest {
                     launches: 10,
@@ -126,14 +127,14 @@ fn set(record: &mut ReleaseRecord<'static>, field: usize, state: State) {
                 },
             )
         }
-        6 => record.input_mode = m(state, ()),
-        7 => record.release_recogniser = m(state, ()),
-        8 => record.parser_cost = m(state, ()),
+        6 => facts.input_mode = m(state, ()),
+        7 => facts.release_recogniser = m(state, ()),
+        8 => facts.parser_cost = m(state, ()),
         _ => unreachable!(),
     }
 }
 
-/// Scenario: Build a Codex record for every combination of its nine required measurements being verified, absent, unverified or unraisable, and ask the table about that exact release. It is Go exactly when all nine are verified; otherwise the first unmet one is named, and an unraisable one makes the release unmeasured.
+/// Scenario: Build Codex facts for every combination of their nine required facts being verified, absent, unverified or failed, and ask the table about a latched release. It is Go exactly when all nine are verified; otherwise the first unmet one is named, as missing_measurement when absent and unverified_measurement when unverified or failed.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_go_iff_every_required_measurement_is_verified() {
@@ -141,19 +142,19 @@ fn doorbell_053_go_iff_every_required_measurement_is_verified() {
         State::Verified,
         State::Absent,
         State::Unverified,
-        State::Unraisable,
+        State::Failed,
     ];
     let mut checked = 0;
     for combo in 0..4usize.pow(9) {
-        let mut record = complete(CODEX, "0.164.0", 2);
+        let mut facts = complete(CODEX, 2);
         let mut states = [State::Verified; 9];
         let mut n = combo;
         for (field, slot) in states.iter_mut().enumerate() {
             *slot = STATES[n % 4];
             n /= 4;
-            set(&mut record, field, *slot);
+            set(&mut facts, field, *slot);
         }
-        let got = verdict(std::slice::from_ref(&record), &CODEX, "0.164.0");
+        let got = verdict(std::slice::from_ref(&facts), &CODEX, "0.164.0");
         let first_unmet = states.iter().position(|s| !matches!(s, State::Verified));
         match first_unmet {
             None => assert!(
@@ -163,8 +164,9 @@ fn doorbell_053_go_iff_every_required_measurement_is_verified() {
             Some(field) => {
                 let want = match states[field] {
                     State::Absent => NoGo::MissingMeasurement(REQUIRED[field]),
-                    State::Unverified => NoGo::UnverifiedMeasurement(REQUIRED[field]),
-                    State::Unraisable => NoGo::UnmeasuredRelease,
+                    State::Unverified | State::Failed => {
+                        NoGo::UnverifiedMeasurement(REQUIRED[field])
+                    }
                     State::Verified => unreachable!(),
                 };
                 assert_eq!(no_go(&got), Some(want), "{states:?}");
@@ -173,22 +175,13 @@ fn doorbell_053_go_iff_every_required_measurement_is_verified() {
         checked += 1;
     }
     assert_eq!(checked, 4usize.pow(9));
-    // A failed measurement is unverified, never Go.
-    let failed = ReleaseRecord {
-        echo: Measurement::Failed,
-        ..complete(CODEX, "0.164.0", 2)
-    };
-    assert_eq!(
-        no_go(&verdict(&[failed], &CODEX, "0.164.0")),
-        Some(NoGo::UnverifiedMeasurement("echo"))
-    );
 }
 
-/// Scenario: Ask the table about generations whose header latched nothing, latched two releases, ran a scanner over its cell budget, or had its scanner dropped at its work budget, and about records whose capability-only fields are absent. The first four are held with their own clause; missing capabilities leave a complete record Go.
+/// Scenario: Ask the table about generations whose header latched nothing, latched two releases, ran a scanner over its cell budget, or had its scanner dropped at its work budget, and about facts whose capability-only fields are absent. The first four are held with their own clause; missing capabilities leave complete facts Go.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_unlatched_releases_and_capabilities() {
-    let records = [complete(CODEX, "0.164.0", 2)];
+    let facts = [complete(CODEX, 2)];
     for (latch, want) in [
         (LatchedRelease::Unseen, NoGo::UnknownRelease),
         (LatchedRelease::Conflict, NoGo::ReleaseConflict),
@@ -196,17 +189,17 @@ fn doorbell_053_unlatched_releases_and_capabilities() {
         (LatchedRelease::ScannerBudget, NoGo::ScannerBudget),
     ] {
         assert_eq!(
-            no_go(&activation(&records, &CODEX, &latch)),
+            no_go(&activation(&facts, &CODEX, &latch)),
             Some(want.clone())
         );
         assert_eq!(NoGo::UnknownRelease.clause(), "unknown_release");
     }
     assert_eq!(NoGo::ScannerBudget.clause(), "scanner_budget");
-    let bare = ReleaseRecord {
+    let bare = AgentFacts {
         placeholder_empty: Measurement::Absent,
         delete_key: Measurement::Absent,
         transcript_echo: Measurement::Absent,
-        ..complete(CODEX, "0.164.0", 2)
+        ..complete(CODEX, 2)
     };
     assert!(matches!(
         verdict(&[bare], &CODEX, "0.164.0"),
@@ -214,23 +207,20 @@ fn doorbell_053_unlatched_releases_and_capabilities() {
     ));
 }
 
-/// Scenario: Give complete records dialogs in which a token letter, parenthesis, later fixed-text byte or message-id digit commits, and a first-dialog time over the cap. The first two are held as first_stage_commits, later committing bytes require staging, and excessive timing is held as settle_over_cap; in a mixed table, each exact release retains its own settle window.
+/// Scenario: Give complete facts dialogs in which a token letter, parenthesis, later fixed-text byte or message-id digit commits, and a first-dialog time over the cap. The first two are held as first_stage_commits, later committing bytes require staging, and excessive timing is held as settle_over_cap; in a table with both agents, each agent keeps its own settle window.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_key_effects_and_own_settle() {
-    let records = [
-        complete(CODEX, "0.160.0", 16),
-        complete(CODEX, "0.164.0", 2),
-    ];
-    for (release, seconds) in [("0.160.0", 24), ("0.164.0", 3)] {
+    let facts = [complete(CODEX, 16), complete(CLAUDE, 2)];
+    for (agent, release, seconds) in [(CODEX, "0.160.0", 24), (CLAUDE, "2.1.310", 3)] {
         assert_eq!(
-            verdict(&records, &CODEX, release),
+            verdict(&facts, &agent, release),
             Activation::Go {
                 profile: "test-profile",
                 staged: false,
                 settle: Duration::from_secs(seconds),
             },
-            "{release} retains its own measured settle in a mixed table"
+            "{agent:?} keeps its own settle in a table with both agents"
         );
     }
     for key in *b"d()z" {
@@ -239,12 +229,12 @@ fn doorbell_053_key_effects_and_own_settle() {
             dialog: "update",
             keys: &keys,
         }];
-        let record = ReleaseRecord {
+        let facts = AgentFacts {
             key_effects: Measurement::Verified(&dialogs),
-            ..complete(CODEX, "0.164.0", 2)
+            ..complete(CODEX, 2)
         };
         assert_eq!(
-            no_go(&verdict(&[record], &CODEX, "0.164.0")),
+            no_go(&verdict(&[facts], &CODEX, "0.164.0")),
             Some(NoGo::FirstStageCommits {
                 dialog: "update".into(),
                 key
@@ -260,12 +250,12 @@ fn doorbell_053_key_effects_and_own_settle() {
         dialog: "trust",
         keys: PREFIX_COMMITS,
     }];
-    let record = ReleaseRecord {
+    let facts = AgentFacts {
         key_effects: Measurement::Verified(PREFIX),
-        ..complete(CODEX, "0.164.0", 2)
+        ..complete(CODEX, 2)
     };
     assert_eq!(
-        verdict(&[record], &CODEX, "0.164.0"),
+        verdict(&[facts], &CODEX, "0.164.0"),
         Activation::Go {
             profile: "test-profile",
             staged: true,
@@ -278,12 +268,12 @@ fn doorbell_053_key_effects_and_own_settle() {
         dialog: "update",
         keys: DIGIT_COMMITS,
     }];
-    let record = ReleaseRecord {
+    let facts = AgentFacts {
         key_effects: Measurement::Verified(DIGIT),
-        ..complete(CODEX, "0.164.0", 2)
+        ..complete(CODEX, 2)
     };
     assert_eq!(
-        verdict(&[record], &CODEX, "0.164.0"),
+        verdict(&[facts], &CODEX, "0.164.0"),
         Activation::Go {
             profile: "test-profile",
             staged: true,
@@ -291,7 +281,7 @@ fn doorbell_053_key_effects_and_own_settle() {
         }
     );
     assert_eq!(
-        verdict(&[complete(CODEX, "0.164.0", 2)], &CODEX, "0.164.0"),
+        verdict(&[complete(CODEX, 2)], &CODEX, "0.164.0"),
         Activation::Go {
             profile: "test-profile",
             staged: false,
@@ -300,24 +290,20 @@ fn doorbell_053_key_effects_and_own_settle() {
     );
     // 21 s + 50 % = 31.5 s, over the 30 s cap; 20 s + 50 % = 30 s is not.
     assert_eq!(
-        no_go(&verdict(
-            &[complete(CODEX, "0.164.0", 21)],
-            &CODEX,
-            "0.164.0"
-        )),
+        no_go(&verdict(&[complete(CODEX, 21)], &CODEX, "0.164.0")),
         Some(NoGo::SettleOverCap)
     );
     assert_eq!(
-        verdict(&[complete(CODEX, "0.164.0", 20)], &CODEX, "0.164.0"),
+        verdict(&[complete(CODEX, 20)], &CODEX, "0.164.0"),
         Activation::Go {
             profile: "test-profile",
             staged: false,
             settle: SETTLE_CAP,
         }
     );
-    let none = ReleaseRecord {
+    let none = AgentFacts {
         first_modal: Measurement::Verified(FirstModal::NoneObserved { launches: 10 }),
-        ..complete(CLAUDE, "2.1.310", 0)
+        ..complete(CLAUDE, 0)
     };
     assert_eq!(
         verdict(&[none], &CLAUDE, "2.1.310"),
@@ -329,249 +315,64 @@ fn doorbell_053_key_effects_and_own_settle() {
     );
 }
 
-/// Scenario: Put a measured Go Codex 0.164.0 beside newer minor and patch releases, a pre-release, another major and an older release. Every release without its own record is held as unmeasured_release, while an exact incomplete record keeps its own missing fact instead of borrowing an older Go.
+/// Scenario: Ask about Codex releases nobody measured, near and far from the recorded ones (newer minors at distance 1 to 5, patches, another major, an older release), with complete facts and with incomplete facts. Every latched release gets the agent's facts: Go with complete facts, the facts' own unmet requirement with incomplete ones; with no facts for Codex at all it is agent_not_supported.
 #[spec("inbox/doorbell/053")]
 #[test]
-fn doorbell_053_only_an_exact_record_admits() {
-    // An exact record decides, even incomplete, past an older complete one.
-    let records = [
-        complete(CODEX, "0.160.0", 2),
-        incomplete(CODEX, "0.164.0", 2),
-    ];
-    assert_eq!(
-        no_go(&verdict(&records, &CODEX, "0.164.0")),
-        Some(NoGo::UnverifiedMeasurement("echo"))
-    );
-    let records = [complete(CODEX, "0.164.0", 2)];
-    assert!(matches!(
-        verdict(&records, &CODEX, "0.164.0"),
-        Activation::Go { .. }
-    ));
-    assert_eq!(
-        no_go(&verdict(&records, &CODEX, "0.165.0-alpha.1")),
-        Some(NoGo::UnmeasuredRelease),
-        "a nearby newer pre-release"
-    );
-    for release in ["0.165.0", "0.168.9", "0.169.0", "0.164.1", "0.164.9"] {
-        let got = verdict(&records, &CODEX, release);
+fn doorbell_053_every_release_of_an_agent_gets_its_facts() {
+    let facts = [complete(CODEX, 2)];
+    for release in [
+        "0.164.0", "0.165.0", "0.168.9", "0.169.0", "0.164.1", "0.164.9", "1.0.0", "0.159.9",
+        "0.1.0",
+    ] {
         assert_eq!(
-            no_go(&got),
-            Some(NoGo::UnmeasuredRelease),
-            "{release} has no measurements of its own: {got:?}"
+            verdict(&facts, &CODEX, release),
+            Activation::Go {
+                profile: "test-profile",
+                staged: false,
+                settle: Duration::from_secs(3),
+            },
+            "{release} gets Codex's facts"
         );
     }
-    // A nearby incomplete record supplies no authority either.
-    let incomplete_source = [
-        complete(CODEX, "0.160.0", 2),
-        incomplete(CODEX, "0.163.0", 2),
-    ];
-    assert_eq!(
-        no_go(&verdict(&incomplete_source, &CODEX, "0.164.0")),
-        Some(NoGo::UnmeasuredRelease)
-    );
-    assert_eq!(
-        no_go(&verdict(&records, &CODEX, "1.0.0")),
-        Some(NoGo::UnmeasuredRelease),
-        "another major"
-    );
-    assert_eq!(
-        no_go(&verdict(&records, &CODEX, "0.159.9")),
-        Some(NoGo::UnmeasuredRelease),
-        "older than every record"
-    );
+    let facts = [incomplete(CODEX, 2)];
+    for release in ["0.164.0", "0.165.0", "1.0.0"] {
+        assert_eq!(
+            no_go(&verdict(&facts, &CODEX, release)),
+            Some(NoGo::UnverifiedMeasurement("echo")),
+            "{release}"
+        );
+    }
     assert_eq!(
         no_go(&verdict(&[], &CODEX, "0.164.0")),
-        Some(NoGo::UnmeasuredRelease),
-        "no records"
+        Some(NoGo::AgentNotSupported),
+        "no facts"
     );
+    assert_eq!(NoGo::AgentNotSupported.clause(), "agent_not_supported");
 }
 
-/// Scenario: Ask about Claude Code releases newer than a complete Claude Code record, including a patch release and a pre-release, and about agents with no record. Each is held as unmeasured_release, while the exact Claude Code release stays Go.
+/// Scenario: Ask about Claude Code releases nobody measured (a patch, a minor, a major, an older one) and about agents with no facts, in a table that has Claude Code's facts. Each Claude Code release gets Claude Code's facts and is Go; OpenCode, Pi and Devin are agent_not_supported whatever release they latch.
 #[spec("inbox/doorbell/053")]
 #[test]
-fn doorbell_053_claude_and_other_agents_need_their_own_record() {
-    let records = [complete(CLAUDE, "2.1.310", 0)];
-    for release in ["2.1.311", "2.2.0", "2.1.310-beta.1"] {
-        assert_eq!(
-            no_go(&verdict(&records, &CLAUDE, release)),
-            Some(NoGo::UnmeasuredRelease),
-            "{release}"
-        );
-    }
-    assert!(matches!(
-        verdict(&records, &CLAUDE, "2.1.310"),
-        Activation::Go { .. }
-    ));
-    for agent in [AgentType::OpenCode, AgentType::Pi, AgentType::Devin] {
-        assert_eq!(
-            no_go(&verdict(&records, &agent, "2.1.310")),
-            Some(NoGo::UnmeasuredRelease),
-            "{agent:?} has no record"
-        );
-    }
-}
-
-/// Scenario: Exclude Claude Code releases from the records the way the e2e build does: a complete one, an incomplete one, one with no record, and a malformed list. The excluded releases become unmeasured_release, the unrecorded name changes nothing, and the malformed list is refused whole.
-#[spec("inbox/doorbell/053")]
-#[test]
-fn doorbell_053_claude_record_exclusion() {
-    let records = [
-        complete(CLAUDE, "2.1.310", 0),
-        incomplete(CLAUDE, "2.1.300", 0),
-    ];
-    let excluded = parse_unrecorded_claude_releases("2.1.310, 2.1.300").unwrap();
-    let left = without_unrecorded_claude(&records, &excluded);
-    for release in ["2.1.310", "2.1.300"] {
-        assert_eq!(
-            no_go(&verdict(&left, &CLAUDE, release)),
-            Some(NoGo::UnmeasuredRelease),
-            "{release}"
-        );
-    }
-    let left = without_unrecorded_claude(
-        &records,
-        &parse_unrecorded_claude_releases("2.1.999").unwrap(),
-    );
-    assert_eq!(left, records.to_vec());
-    for malformed in [
-        "2.1.310,",
-        "2.1.310, claude:2.1.300",
-        "2.1",
-        "2.1.310-beta.1",
-        "2.1.310+build",
-        "v2.1.310",
-    ] {
+fn doorbell_053_claude_releases_get_claudes_facts_and_other_agents_none() {
+    let facts = [complete(CLAUDE, 0)];
+    for release in ["2.1.310", "2.1.311", "2.2.0", "3.0.0", "2.0.1"] {
         assert!(
-            parse_unrecorded_claude_releases(malformed).is_err(),
-            "{malformed:?} must refuse the whole list"
+            matches!(verdict(&facts, &CLAUDE, release), Activation::Go { .. }),
+            "{release}"
         );
     }
-    assert_eq!(parse_unrecorded_claude_releases("").unwrap(), vec![]);
-}
-
-/// Scenario: Build three Codex tables: an incomplete exact record, an incomplete record beside a newer unrecorded release, and a slow older record beside a newer unrecorded release. Ask each first with no exclusion and then with an exclusion list naming the same version strings. Every Codex verdict is unchanged.
-#[spec("inbox/doorbell/053")]
-#[test]
-fn doorbell_053_exclusion_never_reaches_codex() {
-    let names = parse_unrecorded_claude_releases("0.160.0,0.163.0,0.164.0").unwrap();
-    // (x) an incomplete exact record stays its own NoGo.
-    let x = [
-        complete(CODEX, "0.160.0", 2),
-        incomplete(CODEX, "0.164.0", 2),
-    ];
-    // (y) a newer release beside an incomplete record stays unmeasured.
-    let y = [
-        complete(CODEX, "0.160.0", 2),
-        incomplete(CODEX, "0.163.0", 2),
-    ];
-    // (z) a newer release beside a slow record stays unmeasured.
-    let z = [
-        complete(CODEX, "0.160.0", 16),
-        complete(CODEX, "0.164.0", 2),
-    ];
-    for (table, release, want) in [
-        (&x[..], "0.164.0", Some(NoGo::UnverifiedMeasurement("echo"))),
-        (&y[..], "0.164.0", Some(NoGo::UnmeasuredRelease)),
-        (&z[..], "0.165.0", Some(NoGo::UnmeasuredRelease)),
-    ] {
-        let intact = verdict(table, &CODEX, release);
-        assert_eq!(no_go(&intact), want);
-        let excluded = without_unrecorded_claude(table, &names);
-        assert_eq!(verdict(&excluded, &CODEX, release), intact, "{release}");
-    }
-}
-
-/// Scenario: Enumerate small record tables (Codex and Claude Code records on a few releases, each complete, incomplete or absent, fast or slow) against every live release in range and every exclusion list over those version strings. With any exclusion, every verdict equals the intact one or is NoGo, and no Codex verdict ever changes.
-#[spec("inbox/doorbell/053")]
-#[test]
-fn doorbell_053_exclusion_only_ever_disables() {
-    #[derive(Clone, Copy)]
-    enum R {
-        Absent,
-        Complete(u64),
-        Incomplete(u64),
-    }
-    let codex_releases = ["0.160.0", "0.163.0", "0.164.0"];
-    let claude_releases = ["2.1.300", "2.1.310"];
-    let codex_states = [
-        R::Absent,
-        R::Complete(2),
-        R::Complete(16),
-        R::Incomplete(2),
-        R::Incomplete(16),
-    ];
-    let claude_states = [R::Absent, R::Complete(0), R::Incomplete(0)];
-    let live: Vec<(AgentType, &str)> = [
-        "0.159.0", "0.160.0", "0.161.0", "0.163.0", "0.164.0", "0.165.0", "0.168.0", "0.169.0",
-        "1.0.0",
-    ]
-    .iter()
-    .map(|r| (CODEX, *r))
-    .chain(
-        ["2.1.299", "2.1.300", "2.1.305", "2.1.310", "2.1.311"]
-            .iter()
-            .map(|r| (CLAUDE, *r)),
-    )
-    .collect();
-    let names: Vec<&str> = codex_releases
-        .iter()
-        .chain(&claude_releases)
-        .copied()
-        .collect();
-    let mut tables = 0;
-    for codex in 0..codex_states.len().pow(3) {
-        for claude in 0..claude_states.len().pow(2) {
-            let mut records = Vec::new();
-            let mut n = codex;
-            for release in codex_releases {
-                match codex_states[n % codex_states.len()] {
-                    R::Absent => {}
-                    R::Complete(t) => records.push(complete(CODEX, release, t)),
-                    R::Incomplete(t) => records.push(incomplete(CODEX, release, t)),
-                }
-                n /= codex_states.len();
-            }
-            let mut n = claude;
-            for release in claude_releases {
-                match claude_states[n % claude_states.len()] {
-                    R::Absent => {}
-                    R::Complete(t) => records.push(complete(CLAUDE, release, t)),
-                    R::Incomplete(t) => records.push(incomplete(CLAUDE, release, t)),
-                }
-                n /= claude_states.len();
-            }
-            let intact: Vec<Activation<'_>> = live
-                .iter()
-                .map(|(agent, r)| verdict(&records, agent, r))
-                .collect();
-            for mask in 0..(1u32 << names.len()) {
-                let list: Vec<&str> = names
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| mask & (1 << i) != 0)
-                    .map(|(_, n)| *n)
-                    .collect();
-                let excluded = parse_unrecorded_claude_releases(&list.join(",")).unwrap();
-                let left = without_unrecorded_claude(&records, &excluded);
-                for ((agent, r), before) in live.iter().zip(&intact) {
-                    let after = verdict(&left, agent, r);
-                    if *agent == CODEX {
-                        assert_eq!(&after, before, "a Codex verdict changed: {r} {list:?}");
-                    } else {
-                        assert!(
-                            &after == before || matches!(after, Activation::NoGo(_)),
-                            "{r} {list:?}: {before:?} became {after:?}"
-                        );
-                    }
-                }
-            }
-            tables += 1;
+    for agent in [AgentType::OpenCode, AgentType::Pi, AgentType::Devin] {
+        for latch in [known("2.1.310"), LatchedRelease::Unseen] {
+            assert_eq!(
+                no_go(&activation(&facts, &agent, &latch)),
+                Some(NoGo::AgentNotSupported),
+                "{agent:?} has no facts"
+            );
         }
     }
-    assert_eq!(tables, 125 * 9);
 }
 
-/// Scenario: Give a staged record (a message-id digit commits in its dialog) each state of its head-echo measurement, and an unstaged record no head-echo measurement at all; then ask about a newer release beside a staged record, with and without its head echo. The staged record is Go only with its head echo verified, held as missing_measurement or unverified_measurement naming head_echo otherwise and unmeasured_release when unraisable; the unstaged record is Go without one; and the newer release is unmeasured_release either way.
+/// Scenario: Give staged facts (a message-id digit commits in a dialog) each state of the head-echo fact, and unstaged facts no head-echo fact at all. Staged facts are Go only with the head echo verified, held as missing_measurement or unverified_measurement naming head_echo otherwise; unstaged facts are Go without one; and every release of the agent reads the same.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_a_staged_line_needs_its_head_echo_measured() {
@@ -580,10 +381,10 @@ fn doorbell_053_a_staged_line_needs_its_head_echo_measured() {
         dialog: "update",
         keys: DIGIT_COMMITS,
     }];
-    let staged = |head_echo| ReleaseRecord {
+    let staged = |head_echo| AgentFacts {
         key_effects: Measurement::Verified(DIGIT),
         head_echo,
-        ..complete(CODEX, "0.164.0", 2)
+        ..complete(CODEX, 2)
     };
     for (head_echo, want) in [
         (
@@ -598,57 +399,55 @@ fn doorbell_053_a_staged_line_needs_its_head_echo_measured() {
             Measurement::Failed,
             Some(NoGo::UnverifiedMeasurement("head_echo")),
         ),
-        (Measurement::Unraisable, Some(NoGo::UnmeasuredRelease)),
         (Measurement::Verified(()), None),
     ] {
-        let got = verdict(&[staged(head_echo)], &CODEX, "0.164.0");
-        assert_eq!(no_go(&got), want, "{head_echo:?}");
-        if want.is_none() {
-            assert!(
-                matches!(got, Activation::Go { staged: true, .. }),
-                "{got:?}"
-            );
+        for release in ["0.164.0", "0.165.0"] {
+            let got = verdict(&[staged(head_echo)], &CODEX, release);
+            assert_eq!(no_go(&got), want, "{head_echo:?} {release}");
+            if want.is_none() {
+                assert!(
+                    matches!(got, Activation::Go { staged: true, .. }),
+                    "{got:?}"
+                );
+            }
         }
     }
     // Unstaged: the head is never typed alone, so nothing is needed.
-    let unstaged = ReleaseRecord {
+    let unstaged = AgentFacts {
         head_echo: Measurement::Absent,
-        ..complete(CODEX, "0.164.0", 2)
+        ..complete(CODEX, 2)
     };
     assert!(matches!(
         verdict(&[unstaged], &CODEX, "0.164.0"),
         Activation::Go { staged: false, .. }
     ));
-    // A newer release borrows nothing from a staged record, complete or not.
-    for head_echo in [Measurement::Absent, Measurement::Verified(())] {
-        let records = [staged(head_echo)];
-        assert_eq!(
-            no_go(&verdict(&records, &CODEX, "0.165.0")),
-            Some(NoGo::UnmeasuredRelease),
-            "{head_echo:?}"
-        );
-    }
 }
 
-/// Scenario: For every dialog of every release record the deck carries, now and in any later edit of the table, look up each byte the line's first stage can contain: both parentheses and every letter of the token alphabet. Each must be classified, and classified inert: a record in which one of them commits, moves, edits or dismisses, or is left unmeasured, fails this test.
+/// Scenario: For every dialog of the shipped facts and of every recorded release, now and in any later edit, look up each byte the line's first stage can contain: both parentheses and every letter of the token alphabet. Each must be classified, and classified inert: facts or a recorded release in which one of them commits, moves, edits or dismisses, or is left unmeasured, fail this test.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_every_recorded_dialog_leaves_the_token_head_inert() {
     let first_stage: Vec<u8> = first_stage_bytes().collect();
     assert_eq!(first_stage.len(), 18, "two parentheses and sixteen letters");
-    for record in &RELEASE_RECORDS {
-        let Measurement::Verified(dialogs) = record.key_effects else {
+    let tables = AGENT_FACTS
+        .iter()
+        .map(|f| (format!("{:?} facts", f.agent), f))
+        .chain(
+            RECORDED_RELEASES
+                .iter()
+                .map(|r| (format!("{:?} {}", r.measured.agent, r.release), &r.measured)),
+        );
+    for (who, facts) in tables {
+        let Measurement::Verified(dialogs) = facts.key_effects else {
             continue;
         };
         for dialog in dialogs {
             for key in &first_stage {
-                let effect = dialog.keys.iter().find(|(k, _)| k == key).map(|(_, e)| *e);
+                let effect = dialog.effect(*key);
                 assert_eq!(
                     effect,
                     Some(KeyEffect::Inert),
-                    "{:?} {} `{}`: {:?} in {}",
-                    record.agent,
-                    record.release,
+                    "{who} `{}`: {:?} in {}",
                     *key as char,
                     effect,
                     dialog.dialog
@@ -658,100 +457,209 @@ fn doorbell_053_every_recorded_dialog_leaves_the_token_head_inert() {
     }
 }
 
-/// Scenario: Ask the table about each release the deck carries a record for, as it ships. Claude Code 2.1.310, 2.1.312, 2.1.317 and 2.1.318 are Go, unstaged, 2.1.317 and 2.1.318 with their measured editor probes and the others with theirs absent, while 2.1.311 and 2.1.319 remain unmeasured; Codex 0.164.0, whose head echo is measured, is Go, staged, with its 6.03 s settle window, through the table and through a generation's verdict alike, while Codex 0.160.0, whose head echo is not measured, stays held as missing_measurement and 0.166.0, with no record, as unmeasured_release; and every record has its parser cost verified.
+/// Scenario: Ask the table about the facts as they ship, for releases that were recorded and releases nobody measured. Every Claude Code release (2.1.310, 2.1.311, 2.1.317, 2.1.318, 2.1.319, 2.2.0) is Go, unstaged, with no settle window, and the facts' editor probe is the one measured on 2.1.317 and 2.1.318; every Codex release (0.160.0, 0.164.0, 0.166.0, 0.200.1) is Go, staged, with the 6.69 s settle window from the slowest recorded first dialog, through the table and through a generation's verdict alike; and both agents' facts have their parser cost verified.
 #[spec("inbox/doorbell/053")]
 #[test]
-fn doorbell_053_the_shipped_records_verdicts() {
-    use dot_agent_deck::doorbell_activation::{
-        CLAUDE_2_1_317_EDITOR_PROBE, CLAUDE_2_1_318_EDITOR_PROBE,
+fn doorbell_053_the_shipped_facts_verdicts() {
+    assert_eq!(AGENT_FACTS.len(), 2);
+    assert_eq!(AGENT_FACTS[0], CLAUDE_FACTS);
+    assert_eq!(AGENT_FACTS[1], CODEX_FACTS);
+    for facts in &AGENT_FACTS {
+        assert!(matches!(facts.parser_cost, Measurement::Verified(())));
+    }
+    let claude = Activation::Go {
+        profile: "claude-code-2026-10",
+        staged: false,
+        settle: Duration::ZERO,
     };
-    for record in &RELEASE_RECORDS {
-        assert!(
-            matches!(record.parser_cost, Measurement::Verified(())),
-            "{:?} {}",
-            record.agent,
-            record.release
-        );
-        let verdict = exact_verdict(record);
-        match (&record.agent, record.release.to_string().as_str()) {
-            (AgentType::ClaudeCode, "2.1.310" | "2.1.312" | "2.1.317" | "2.1.318") => assert!(
-                matches!(verdict, Activation::Go { staged: false, .. }),
-                "{verdict:?}"
-            ),
-            (AgentType::Codex, "0.164.0") => assert_eq!(
-                verdict,
-                Activation::Go {
-                    profile: "codex-2026-10",
-                    staged: true,
-                    settle: Duration::from_millis(6030),
-                }
-            ),
-            (AgentType::Codex, "0.160.0") => assert_eq!(
-                verdict,
-                Activation::NoGo(NoGo::MissingMeasurement("head_echo"))
-            ),
-            other => panic!("a record this test does not know: {other:?}"),
-        }
-    }
-    for release in ["2.1.310", "2.1.312", "2.1.317", "2.1.318"] {
-        let record = RELEASE_RECORDS
-            .iter()
-            .find(|record| record.agent == CLAUDE && record.release == v(release))
-            .expect("measured Claude release record");
-        if release == "2.1.317" {
-            assert_eq!(
-                record.editor_probe,
-                Measurement::Verified(CLAUDE_2_1_317_EDITOR_PROBE)
-            );
-        } else if release == "2.1.318" {
-            assert_eq!(
-                record.editor_probe,
-                Measurement::Verified(CLAUDE_2_1_318_EDITOR_PROBE)
-            );
-        } else {
-            assert!(matches!(record.editor_probe, Measurement::Absent));
-        }
-        assert_eq!(
-            activation(
-                &RELEASE_RECORDS,
-                &CLAUDE,
-                &LatchedRelease::Known(v(release)),
-            ),
-            exact_verdict(record)
-        );
-    }
-    for release in ["2.1.311", "2.1.319"] {
-        assert_eq!(
-            verdict(&RELEASE_RECORDS, &CLAUDE, release),
-            Activation::NoGo(NoGo::UnmeasuredRelease)
-        );
-    }
-    // Codex: the production path a generation takes reads the same records.
-    for (release, expected) in [
+    let codex = Activation::Go {
+        profile: "codex-2026-10",
+        staged: true,
+        settle: Duration::from_micros(6_691_500),
+    };
+    assert_eq!(facts_verdict(&CLAUDE_FACTS), claude);
+    assert_eq!(facts_verdict(&CODEX_FACTS), codex);
+    let on = DoorbellSwitch::default();
+    for (agent, releases, want) in [
         (
-            "0.164.0",
-            Activation::Go {
-                profile: "codex-2026-10",
-                staged: true,
-                settle: Duration::from_millis(6030),
-            },
+            CLAUDE,
+            &[
+                "2.1.310", "2.1.311", "2.1.317", "2.1.318", "2.1.319", "2.2.0",
+            ][..],
+            &claude,
         ),
         (
-            "0.160.0",
-            Activation::NoGo(NoGo::MissingMeasurement("head_echo")),
+            CODEX,
+            &["0.160.0", "0.164.0", "0.166.0", "0.200.1"][..],
+            &codex,
         ),
-        ("0.166.0", Activation::NoGo(NoGo::UnmeasuredRelease)),
     ] {
-        assert_eq!(verdict(&RELEASE_RECORDS, &CODEX, release), expected);
+        for release in releases {
+            assert_eq!(&verdict(&AGENT_FACTS, &agent, release), want, "{release}");
+            assert_eq!(
+                &generation_activation(&AGENT_FACTS, Some(&agent), &known(release), &on),
+                want,
+                "{release}"
+            );
+        }
+    }
+    use dot_agent_deck::doorbell_activation::{
+        CLAUDE_2_1_317_EDITOR_PROBE, CLAUDE_2_1_318_EDITOR_PROBE, CLAUDE_EDITOR_PROBE,
+    };
+    assert_eq!(CLAUDE_EDITOR_PROBE, CLAUDE_2_1_317_EDITOR_PROBE);
+    assert_eq!(CLAUDE_EDITOR_PROBE, CLAUDE_2_1_318_EDITOR_PROBE);
+    assert_eq!(
+        CLAUDE_FACTS.editor_probe,
+        Measurement::Verified(CLAUDE_EDITOR_PROBE)
+    );
+    assert_eq!(CODEX_FACTS.editor_probe, Measurement::Absent);
+}
+
+/// Scenario: Check every recorded release (Claude Code 2.1.310, 2.1.312, 2.1.317, 2.1.318; Codex 0.160.0, 0.164.0) against its agent's shipped facts. Each conforms: nothing measured on it contradicts a fact, its dialogs and keys are all in the facts with the measured effect or a more cautious commit, and its slowest first dialog is no later than the facts'. The recorded set is the one this test knows, so a release added or dropped is noticed.
+#[spec("inbox/doorbell/053")]
+#[test]
+fn doorbell_053_every_recorded_release_conforms_to_its_agents_facts() {
+    let names: Vec<String> = RECORDED_RELEASES
+        .iter()
+        .map(|r| format!("{:?}@{}", r.measured.agent, r.release))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "Codex@0.164.0",
+            "Codex@0.160.0",
+            "ClaudeCode@2.1.310",
+            "ClaudeCode@2.1.312",
+            "ClaudeCode@2.1.317",
+            "ClaudeCode@2.1.318",
+        ]
+    );
+    for recorded in &RECORDED_RELEASES {
         assert_eq!(
-            generation_activation(&RELEASE_RECORDS, Some(&CODEX), &known(release)),
-            expected,
-            "{release}"
+            conformance(recorded, &AGENT_FACTS),
+            Ok(()),
+            "{:?} {}",
+            recorded.measured.agent,
+            recorded.release
         );
     }
 }
 
-/// Scenario: Read the editor record measured for Claude Code 2.1.317, the one activation sets on its record. It names Claude's export and editor selection, one paste-mode disable and one enable, the user's key-binding file as the only source, the bindings loaded at start, no inert candidate form, and the pasted BEL left absent; and giving it to 2.1.317's record makes that release armable once its root is bound, and changes the ring's verdict for no release.
+/// Scenario: Make one of the shipped facts wrong in each way a recorded release can show it: Codex's settle fact faster than 0.160.0's slowest first dialog, a key of Codex's update dialog that commits on the recorded releases called inert, folder trust's `2` taken from 0.164.0 (dismisses) where 0.160.0 commits, a dialog missing from the facts, the wrong profile, an editor probe different from the measured one, a recorded release whose echo failed. Each makes conformance fail for the release that contradicts it, and the shipped facts pass.
+#[spec("inbox/doorbell/053")]
+#[test]
+fn doorbell_053_conformance_fails_when_a_fact_is_wrong() {
+    let release = |agent: &AgentType, release: &str| -> &'static RecordedRelease<'static> {
+        RECORDED_RELEASES
+            .iter()
+            .find(|r| r.measured.agent == *agent && r.release == v(release))
+            .unwrap()
+    };
+    let codex_160 = release(&CODEX, "0.160.0");
+    let codex_164 = release(&CODEX, "0.164.0");
+    let claude_317 = release(&CLAUDE, "2.1.317");
+    let with_codex = |codex: AgentFacts<'static>| [CLAUDE_FACTS, codex];
+    // Faster than the slowest recorded first dialog (0.164.0's figure alone).
+    let fast = with_codex(AgentFacts {
+        first_modal: Measurement::Verified(FirstModal::Slowest {
+            launches: 36,
+            max: Duration::from_millis(4020),
+        }),
+        ..CODEX_FACTS
+    });
+    assert!(conformance(codex_160, &fast).is_err());
+    assert_eq!(conformance(codex_164, &fast), Ok(()));
+    // A committing key called inert.
+    let update_inert: Vec<(u8, KeyEffect)> = CODEX_FACTS.key_effects.verified().unwrap()[0]
+        .keys
+        .iter()
+        .map(|&(k, e)| {
+            if k == b'1' {
+                (k, KeyEffect::Inert)
+            } else {
+                (k, e)
+            }
+        })
+        .collect();
+    let update_inert: &'static [(u8, KeyEffect)] = update_inert.leak();
+    let mut dialogs = CODEX_FACTS.key_effects.verified().unwrap().to_vec();
+    dialogs[0] = DialogKeys {
+        dialog: "update",
+        keys: update_inert,
+    };
+    let dialogs: &'static [DialogKeys<'static>] = dialogs.leak();
+    let wrong_key = with_codex(AgentFacts {
+        key_effects: Measurement::Verified(dialogs),
+        ..CODEX_FACTS
+    });
+    assert!(conformance(codex_160, &wrong_key).is_err());
+    assert!(conformance(codex_164, &wrong_key).is_err());
+    // Folder trust from 0.164.0, where 0.160.0's `2` commits.
+    let trust_164 = codex_164.measured.key_effects.verified().unwrap()[1];
+    assert_eq!(trust_164.dialog, "trust");
+    let mut dialogs = CODEX_FACTS.key_effects.verified().unwrap().to_vec();
+    dialogs[1] = trust_164;
+    let dialogs: &'static [DialogKeys<'static>] = dialogs.leak();
+    let less_cautious = with_codex(AgentFacts {
+        key_effects: Measurement::Verified(dialogs),
+        ..CODEX_FACTS
+    });
+    assert!(conformance(codex_160, &less_cautious).is_err());
+    assert_eq!(conformance(codex_164, &less_cautious), Ok(()));
+    // A dialog missing from the facts.
+    let no_hooks = with_codex(AgentFacts {
+        key_effects: Measurement::Verified(&CODEX_FACTS.key_effects.verified().unwrap()[..2]),
+        ..CODEX_FACTS
+    });
+    assert!(conformance(codex_164, &no_hooks).is_err());
+    // The wrong profile.
+    let profile = with_codex(AgentFacts {
+        profile: "codex-2027-01",
+        ..CODEX_FACTS
+    });
+    assert!(conformance(codex_164, &profile).is_err());
+    // An editor probe different from the measured one.
+    let other_probe = EditorProbe {
+        paste_toggles: PasteToggles {
+            disables: 0,
+            enables: 0,
+        },
+        ..dot_agent_deck::doorbell_activation::CLAUDE_EDITOR_PROBE
+    };
+    let claude_wrong = [
+        AgentFacts {
+            editor_probe: Measurement::Verified(other_probe),
+            ..CLAUDE_FACTS
+        },
+        CODEX_FACTS,
+    ];
+    assert!(conformance(claude_317, &claude_wrong).is_err());
+    assert_eq!(
+        conformance(release(&CLAUDE, "2.1.310"), &claude_wrong),
+        Ok(()),
+        "2.1.310's editor probe was not measured"
+    );
+    // A recorded release whose echo failed contradicts the verified fact.
+    let failed = RecordedRelease {
+        release: v("0.170.0"),
+        measured: AgentFacts {
+            echo: Measurement::Failed,
+            ..codex_164.measured.clone()
+        },
+    };
+    assert!(conformance(&failed, &AGENT_FACTS).is_err());
+    // A release of an agent without facts.
+    let pi = RecordedRelease {
+        release: v("1.0.0"),
+        measured: AgentFacts {
+            agent: AgentType::Pi,
+            ..codex_164.measured.clone()
+        },
+    };
+    assert!(conformance(&pi, &AGENT_FACTS).is_err());
+}
+
+/// Scenario: Read the editor record measured for Claude Code 2.1.317. It names Claude's export and editor selection, one paste-mode disable and one enable, the user's key-binding file as the only source, the bindings loaded at start, no inert candidate form, and the pasted BEL left absent; it is the recorded release's measurement and Claude Code's editor-probe fact, so any latched Claude Code release, 2.1.317 or one nobody measured, is armable once its root is bound.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_the_measured_2_1_317_editor_record() {
@@ -772,21 +680,25 @@ fn doorbell_053_the_measured_2_1_317_editor_record() {
             pasted_bel_is_text: Measurement::Absent,
         }
     );
-    let records = with_assumed_editor_probes(
-        RELEASE_RECORDS.to_vec(),
-        &[(CLAUDE, v("2.1.317"), CLAUDE_2_1_317_EDITOR_PROBE)],
-    );
-    let header = LatchedRelease::Known(v("2.1.317"));
+    let recorded = RECORDED_RELEASES
+        .iter()
+        .find(|r| r.measured.agent == CLAUDE && r.release == v("2.1.317"))
+        .unwrap();
     assert_eq!(
-        permission(&records, &CLAUDE, Some(&header), Binding::Bound),
-        Permission::Armable
+        recorded.measured.editor_probe,
+        Measurement::Verified(CLAUDE_2_1_317_EDITOR_PROBE)
     );
-    for (with, shipped) in records.iter().zip(RELEASE_RECORDS.iter()) {
-        assert_eq!(exact_verdict(with), exact_verdict(shipped));
+    for release in ["2.1.317", "2.1.320"] {
+        let header = known(release);
+        assert_eq!(
+            permission(&AGENT_FACTS, &[], &CLAUDE, Some(&header), Binding::Bound),
+            Permission::Armable,
+            "{release}"
+        );
     }
 }
 
-/// Scenario: Read the editor record measured for Claude Code 2.1.318, the one activation sets on its record. It holds the same values as 2.1.317's: Claude's export and editor selection, one paste-mode disable and one enable, the user's key-binding file as the only source, the bindings loaded at start, no inert candidate form, and the pasted BEL left absent; and giving it to 2.1.318's record makes that release armable once its root is bound, and changes the ring's verdict for no release.
+/// Scenario: Read the editor record measured for Claude Code 2.1.318. It holds the same values as 2.1.317's: Claude's export and editor selection, one paste-mode disable and one enable, the user's key-binding file as the only source, the bindings loaded at start, no inert candidate form, and the pasted BEL left absent; it is the recorded release's measurement and equals Claude Code's editor-probe fact, so 2.1.318 is armable once its root is bound.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_the_measured_2_1_318_editor_record() {
@@ -810,21 +722,22 @@ fn doorbell_053_the_measured_2_1_318_editor_record() {
         }
     );
     assert_eq!(CLAUDE_2_1_318_EDITOR_PROBE, CLAUDE_2_1_317_EDITOR_PROBE);
-    let records = with_assumed_editor_probes(
-        RELEASE_RECORDS.to_vec(),
-        &[(CLAUDE, v("2.1.318"), CLAUDE_2_1_318_EDITOR_PROBE)],
-    );
-    let header = LatchedRelease::Known(v("2.1.318"));
+    let recorded = RECORDED_RELEASES
+        .iter()
+        .find(|r| r.measured.agent == CLAUDE && r.release == v("2.1.318"))
+        .unwrap();
     assert_eq!(
-        permission(&records, &CLAUDE, Some(&header), Binding::Bound),
+        recorded.measured.editor_probe,
+        Measurement::Verified(CLAUDE_2_1_318_EDITOR_PROBE)
+    );
+    let header = known("2.1.318");
+    assert_eq!(
+        permission(&AGENT_FACTS, &[], &CLAUDE, Some(&header), Binding::Bound),
         Permission::Armable
     );
-    for (with, shipped) in records.iter().zip(RELEASE_RECORDS.iter()) {
-        assert_eq!(exact_verdict(with), exact_verdict(shipped));
-    }
 }
 
-/// A verified editor record, as a measurement of one release would give it.
+/// A verified editor record, as a stand-in's would be.
 const PROBE: EditorProbe<'static> = EditorProbe {
     export: ExportShape::CodexEditorDir,
     selection: EditorSelection::Codex,
@@ -839,15 +752,14 @@ const PROBE: EditorProbe<'static> = EditorProbe {
 };
 
 /// Every state an editor record can be in.
-const EDITOR_STATES: [Measurement<EditorProbe<'static>>; 5] = [
+const EDITOR_STATES: [Measurement<EditorProbe<'static>>; 4] = [
     Measurement::Absent,
     Measurement::Unverified,
     Measurement::Failed,
-    Measurement::Unraisable,
     Measurement::Verified(PROBE),
 ];
 
-/// Scenario: Give each kind of record the table decides (Go, Go and staged, each required measurement absent, unverified or unraisable, a committing first-stage key, a settle over the cap, a staged one without its head echo) every editor-record state, and ask the table and the production path that applies the e2e assumptions about its release. Each verdict is the one the record has with no editor record: a missing one turns no Go off, and a verified one turns no NoGo on.
+/// Scenario: Give each kind of facts the table decides (Go, Go and staged, each required fact absent, unverified or failed, a committing first-stage key, a settle over the cap, staged without the head echo) every editor-record state, and ask the table and a generation's verdict about a latched release. Each verdict is the one the facts have with no editor record: a missing one turns no Go off, and a verified one turns no NoGo on.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_an_editor_record_decides_no_ring() {
@@ -859,50 +771,51 @@ fn doorbell_053_an_editor_record_decides_no_ring() {
         dialog: "update",
         keys: &[(b'1', KeyEffect::Commits)],
     }];
-    let mut records = vec![
-        complete(CODEX, "0.164.0", 2),
-        ReleaseRecord {
+    let mut all = vec![
+        complete(CODEX, 2),
+        AgentFacts {
             key_effects: Measurement::Verified(DIGIT_COMMITS),
-            ..complete(CODEX, "0.164.0", 2)
+            ..complete(CODEX, 2)
         },
-        ReleaseRecord {
+        AgentFacts {
             key_effects: Measurement::Verified(DIGIT_COMMITS),
             head_echo: Measurement::Absent,
-            ..complete(CODEX, "0.164.0", 2)
+            ..complete(CODEX, 2)
         },
-        ReleaseRecord {
+        AgentFacts {
             key_effects: Measurement::Verified(PAREN_COMMITS),
-            ..complete(CODEX, "0.164.0", 2)
+            ..complete(CODEX, 2)
         },
-        complete(CODEX, "0.164.0", 21),
-        complete(CLAUDE, "2.1.310", 0),
+        complete(CODEX, 21),
+        complete(CLAUDE, 0),
     ];
     for field in 0..REQUIRED.len() {
-        for state in [State::Absent, State::Unverified, State::Unraisable] {
-            let mut record = complete(CODEX, "0.164.0", 2);
-            set(&mut record, field, state);
-            records.push(record);
+        for state in [State::Absent, State::Unverified, State::Failed] {
+            let mut facts = complete(CODEX, 2);
+            set(&mut facts, field, state);
+            all.push(facts);
         }
     }
+    let on = DoorbellSwitch::default();
+    let release = known("0.170.0");
     let mut go = 0;
     let mut held = 0;
-    for base in &records {
-        let release = LatchedRelease::Known(base.release.clone());
-        let want = exact_verdict(base);
+    for base in &all {
+        let want = facts_verdict(base);
         match want {
             Activation::NoGo(_) => held += 1,
             _ => go += 1,
         }
         for editor in EDITOR_STATES {
-            let record = ReleaseRecord {
+            let facts = AgentFacts {
                 editor_probe: editor,
                 ..base.clone()
             };
-            assert_eq!(exact_verdict(&record), want, "{editor:?}");
-            let one = std::slice::from_ref(&record);
-            assert_eq!(activation(one, &record.agent, &release), want);
+            assert_eq!(facts_verdict(&facts), want, "{editor:?}");
+            let one = std::slice::from_ref(&facts);
+            assert_eq!(activation(one, &facts.agent, &release), want);
             assert_eq!(
-                generation_activation(one, Some(&record.agent), &release),
+                generation_activation(one, Some(&facts.agent), &release, &on),
                 want,
                 "{editor:?}"
             );
@@ -911,7 +824,7 @@ fn doorbell_053_an_editor_record_decides_no_ring() {
     assert_eq!((go, held), (3, 3 + 3 * REQUIRED.len()));
 }
 
-/// Scenario: Enumerate small record tables (Codex and Claude Code records on a few releases, each complete, incomplete or absent, fast or slow) and, for each, every assignment of a verified or missing editor record to its records, then ask the table about every live release in range, unrecorded ones included. Every verdict equals the one with no editor record anywhere.
+/// Scenario: Enumerate small facts tables (Codex and Claude Code each complete, incomplete, slow or absent) and, for each, every assignment of a verified or missing editor record to its facts, then ask the table about live releases of both agents. Every verdict equals the one with no editor record anywhere.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_editor_records_move_no_verdict_in_any_table() {
@@ -921,51 +834,39 @@ fn doorbell_053_editor_records_move_no_verdict_in_any_table() {
         Complete(u64),
         Incomplete(u64),
     }
-    let codex_releases = ["0.160.0", "0.163.0", "0.164.0"];
-    let claude_releases = ["2.1.300", "2.1.310"];
-    let states = [R::Absent, R::Complete(2), R::Complete(16), R::Incomplete(2)];
-    let live: Vec<(AgentType, &str)> = [
-        "0.159.0", "0.160.0", "0.161.0", "0.163.0", "0.164.0", "0.165.0", "0.168.0", "0.169.0",
-    ]
-    .iter()
-    .map(|r| (CODEX, *r))
-    .chain(
-        ["2.1.300", "2.1.305", "2.1.310"]
-            .iter()
-            .map(|r| (CLAUDE, *r)),
-    )
-    .collect();
+    let states = [R::Absent, R::Complete(2), R::Complete(21), R::Incomplete(2)];
+    let live: Vec<(AgentType, &str)> = ["0.159.0", "0.160.0", "0.164.0", "0.169.0"]
+        .iter()
+        .map(|r| (CODEX, *r))
+        .chain(["2.1.300", "2.1.310", "2.2.0"].iter().map(|r| (CLAUDE, *r)))
+        .collect();
     let mut tables = 0;
-    for table in 0..states.len().pow(5) {
-        let mut records = Vec::new();
+    for table in 0..states.len().pow(2) {
+        let mut facts = Vec::new();
         let mut n = table;
-        for (agent, release) in codex_releases
-            .iter()
-            .map(|r| (CODEX, *r))
-            .chain(claude_releases.iter().map(|r| (CLAUDE, *r)))
-        {
+        for agent in [CODEX, CLAUDE] {
             match states[n % states.len()] {
                 R::Absent => {}
-                R::Complete(t) => records.push(complete(agent, release, t)),
-                R::Incomplete(t) => records.push(incomplete(agent, release, t)),
+                R::Complete(t) => facts.push(complete(agent.clone(), t)),
+                R::Incomplete(t) => facts.push(incomplete(agent.clone(), t)),
             }
             n /= states.len();
         }
         let intact: Vec<Activation<'_>> = live
             .iter()
-            .map(|(agent, r)| verdict(&records, agent, r))
+            .map(|(agent, r)| verdict(&facts, agent, r))
             .collect();
-        for mask in 1..(1u32 << records.len()) {
-            let with: Vec<ReleaseRecord<'_>> = records
+        for mask in 1..(1u32 << facts.len()) {
+            let with: Vec<AgentFacts<'_>> = facts
                 .iter()
                 .enumerate()
-                .map(|(i, r)| ReleaseRecord {
+                .map(|(i, f)| AgentFacts {
                     editor_probe: if mask & (1 << i) != 0 {
                         Measurement::Verified(PROBE)
                     } else {
                         Measurement::Absent
                     },
-                    ..r.clone()
+                    ..f.clone()
                 })
                 .collect();
             for ((agent, r), before) in live.iter().zip(&intact) {
@@ -974,64 +875,37 @@ fn doorbell_053_editor_records_move_no_verdict_in_any_table() {
         }
         tables += 1;
     }
-    assert_eq!(tables, 4usize.pow(5));
+    assert_eq!(tables, 16);
 }
 
-/// Scenario: Ask about each record the deck ships, as shipped and with the e2e assumption giving every one of them a verified editor record. Every shipped record's editor record is absent except Claude Code 2.1.317's and 2.1.318's measured ones; the assumption changes that field and nothing else, adds no record, and leaves every verdict, Claude Code 2.1.310's Go, Codex 0.164.0's Go and Codex 0.160.0's missing_measurement, as it was.
+/// Scenario: Apply the e2e assumption, which gives the stand-ins' editor probe to exact agent@release pairs. A generation that latched a named release gets the assumed probe; another release of the same agent, and the other agent, keep their own facts' probe (Claude Code's measured one, Codex's absent); and no verdict of the ring moves, since the ring reads no editor probe.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_the_editor_probe_assumption_moves_no_shipped_verdict() {
-    use dot_agent_deck::doorbell_activation::{
-        CLAUDE_2_1_317_EDITOR_PROBE, CLAUDE_2_1_318_EDITOR_PROBE,
-    };
-    for record in &RELEASE_RECORDS {
-        let expected = if record.agent == CLAUDE && record.release == v("2.1.317") {
-            Measurement::Verified(CLAUDE_2_1_317_EDITOR_PROBE)
-        } else if record.agent == CLAUDE && record.release == v("2.1.318") {
-            Measurement::Verified(CLAUDE_2_1_318_EDITOR_PROBE)
-        } else {
-            Measurement::Absent
-        };
-        assert_eq!(record.editor_probe, expected, "{}", record.release);
-    }
-    let all: Vec<_> = RELEASE_RECORDS
-        .iter()
-        .map(|r| (r.agent.clone(), r.release.clone(), PROBE))
-        .chain(std::iter::once((CLAUDE, v("2.1.311"), PROBE)))
-        .collect();
-    let assumed = with_assumed_editor_probes(RELEASE_RECORDS.to_vec(), &all);
-    assert_eq!(assumed.len(), RELEASE_RECORDS.len(), "no record is added");
-    for (after, before) in assumed.iter().zip(&RELEASE_RECORDS) {
-        assert_eq!(after.editor_probe, Measurement::Verified(PROBE));
-        assert_eq!(
-            &ReleaseRecord {
-                editor_probe: before.editor_probe,
-                ..after.clone()
-            },
-            before
-        );
-        assert_eq!(exact_verdict(after), exact_verdict(before));
-        let release = LatchedRelease::Known(before.release.clone());
-        assert_eq!(
-            generation_activation(&assumed, Some(&before.agent), &release),
-            generation_activation(&RELEASE_RECORDS, Some(&before.agent), &release),
-        );
-    }
+    use dot_agent_deck::doorbell_activation::CLAUDE_EDITOR_PROBE;
+    let assumed = [(CLAUDE, v("2.1.310"), PROBE), (CODEX, v("0.164.0"), PROBE)];
     assert_eq!(
-        no_go(&generation_activation(
-            &assumed,
-            Some(&CLAUDE),
-            &known("2.1.311"),
-        )),
-        Some(NoGo::UnmeasuredRelease)
+        editor_probe_for(&AGENT_FACTS, &assumed, &CLAUDE, &v("2.1.310")),
+        Measurement::Verified(PROBE)
     );
-    // Naming one release changes only that record.
-    let one = with_assumed_editor_probes(RELEASE_RECORDS.to_vec(), &[(CODEX, v("0.160.0"), PROBE)]);
-    let verified: Vec<String> = one
-        .iter()
-        .zip(&RELEASE_RECORDS)
-        .filter(|(after, before)| after != before)
-        .map(|(r, _)| format!("{:?}@{}", r.agent, r.release))
-        .collect();
-    assert_eq!(verified, ["Codex@0.160.0"]);
+    assert_eq!(
+        editor_probe_for(&AGENT_FACTS, &assumed, &CLAUDE, &v("2.1.311")),
+        Measurement::Verified(CLAUDE_EDITOR_PROBE)
+    );
+    assert_eq!(
+        editor_probe_for(&AGENT_FACTS, &assumed, &CODEX, &v("0.164.0")),
+        Measurement::Verified(PROBE)
+    );
+    assert_eq!(
+        editor_probe_for(&AGENT_FACTS, &assumed, &CODEX, &v("0.165.0")),
+        Measurement::Absent
+    );
+    assert_eq!(
+        editor_probe_for(&AGENT_FACTS, &assumed, &AgentType::Pi, &v("2.1.310")),
+        Measurement::Absent
+    );
+    assert_eq!(
+        editor_probe_for(&AGENT_FACTS, &[], &CLAUDE, &v("2.1.310")),
+        Measurement::Verified(CLAUDE_EDITOR_PROBE)
+    );
 }

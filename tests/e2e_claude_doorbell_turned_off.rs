@@ -1,9 +1,11 @@
 #![cfg(all(feature = "e2e", unix))]
 
-//! PRD #1666 part 3, round 5-wake (`inbox/doorbell/056`): a Claude Code
-//! release the deck has not measured is held where the user can see it, and a
-//! prompt recovers it, in a PTY-attached deck with a scripted Claude Code
-//! screen. No agent executable or credential is used.
+//! PRD #1666 part 3 (`inbox/doorbell/056`): a Claude Code whose doorbell the
+//! user turned off (`doorbell.claude = false`) is held where the user can see
+//! it, and a prompt recovers it; with the switch back on, a Claude Code
+//! release nobody measured is rung on Claude Code's facts. In a PTY-attached
+//! deck with a scripted Claude Code screen. No agent executable or credential
+//! is used.
 
 mod common;
 #[path = "support/inbox_doorbell.rs"]
@@ -17,11 +19,23 @@ use serde_json::{Value, json};
 use spec::spec;
 use std::time::Duration;
 
-/// A release no record measures, and the one the deck has measured.
+/// A release nobody measured: the deck types into it on Claude Code's facts.
 const UNMEASURED: &str = "2.1.399";
-const MEASURED: &str = "2.1.310";
 const LOG: &str = "deck-056.log";
-const TASK: &str = "UNMEASURED-RELEASE-TASK-056: write nothing, this is a fixture";
+const TASK: &str = "TURNED-OFF-DOORBELL-TASK-056: write nothing, this is a fixture";
+
+/// Write the deck's `config.toml` with the Claude Code doorbell `on` or off,
+/// as `dot-agent-deck config set doorbell.claude <on>` would. The daemon reads
+/// it at each agent's start.
+fn set_claude_doorbell(deck: &TuiDeck, on: bool) {
+    let dir = deck.home_dir().join(".config/dot-agent-deck");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.toml"),
+        format!("[doorbell]\nclaude = {on}\n"),
+    )
+    .unwrap();
+}
 
 /// The command that runs the scripted Claude Code screen at `version` for
 /// pane `name`.
@@ -120,10 +134,10 @@ fn log(deck: &TuiDeck) -> String {
     std::fs::read_to_string(deck.workdir().join(LOG)).unwrap_or_default()
 }
 
-/// Scenario: In a PTY-attached deck, an orchestrator delegates a task to a scripted Claude Code worker whose start-up header names a release the deck has not measured; it is Idle at its empty composer with nothing armed. For longer than the stall window nothing is typed into it and no doorbell rings; the task stays queued, the worker's card on the screen and the agent record the desktop reads show the cannot_type words, `daemon status` shows WAKE none, and the orchestrator's overdue notice reads `Wake path: none` without promising the doorbell. The test then types a prompt into the worker's pane, as a user would: its prompt hook fetches the task, which is acknowledged, and the card clears. A second scripted worker drawing the measured release's header is the control: WAKE doorbell, one ring, and its task fetched.
+/// Scenario: In a PTY-attached deck whose config turns the Claude Code doorbell off, an orchestrator delegates a task to a scripted Claude Code worker whose start-up header names a release nobody measured; it is Idle at its empty composer with nothing armed. For longer than the stall window nothing is typed into it and no doorbell rings; the task stays queued, the worker's card on the screen and the agent record the desktop reads show the cannot_type words, `daemon status` shows WAKE none, the orchestrator's overdue notice reads `Wake path: none` without promising the doorbell, and the deck log's `doorbell off` line names turned_off. The test then types a prompt into the worker's pane, as a user would: its prompt hook fetches the task, which is acknowledged, and the card clears. With the switch turned back on, a second scripted worker drawing the same unmeasured release's header is rung on Claude Code's facts: WAKE doorbell, one ring, and its task fetched.
 #[spec("inbox/doorbell/056")]
 #[test]
-fn doorbell_056_an_unmeasured_claude_release_is_held_visibly_and_a_prompt_recovers_it() {
+fn doorbell_056_a_turned_off_claude_doorbell_is_held_visibly_and_a_prompt_recovers_it() {
     let deck = TuiDeck::builder()
         .with_pty_size(200, 50)
         .with_env("DOT_AGENT_DECK_DOORBELL_TICK_MS", "25")
@@ -134,6 +148,7 @@ fn doorbell_056_an_unmeasured_claude_release_is_held_visibly_and_a_prompt_recove
         .with_env("DOT_AGENT_DECK_LOG", LOG)
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
+    set_claude_doorbell(&deck, false);
     // The roles as the deck's config names them, each with the command its
     // pane runs.
     std::fs::write(
@@ -194,14 +209,19 @@ fn doorbell_056_an_unmeasured_claude_release_is_held_visibly_and_a_prompt_recove
     unchanged(&worker, Duration::from_millis(1500));
     assert!(
         bytes(&worker).is_empty(),
-        "nothing typed into the unmeasured release"
+        "nothing typed into the turned-off Claude Code"
     );
     assert!(!log(&deck).contains("doorbell rang"), "no doorbell rang");
     assert!(
-        log(&deck).lines().any(|line| line.contains("doorbell off")
-            && line.contains("unmeasured_release")
-            && line.contains(MEASURED)),
-        "the log names the cause and the measured releases: {}",
+        log(&deck)
+            .lines()
+            .any(|line| line.contains("doorbell off") && line.contains("turned_off")),
+        "the log names the cause: {}",
+        log(&deck)
+    );
+    assert!(
+        !log(&deck).contains("unmeasured"),
+        "no unmeasured-release wording reaches the log: {}",
         log(&deck)
     );
     state(&deck, &worker, &id, "queued");
@@ -217,18 +237,20 @@ fn doorbell_056_an_unmeasured_claude_release_is_held_visibly_and_a_prompt_recove
         record(&deck, &worker)
     );
 
-    // Control: the measured release is rung.
-    let control = claude(&deck, "measured-coder", MEASURED, json!({}));
+    // Switched back on, the same unmeasured release is rung on Claude Code's
+    // facts: the switch applies to agents started after the change.
+    set_claude_doorbell(&deck, true);
+    let control = claude(&deck, "unmeasured-coder", UNMEASURED, json!({}));
     status(&deck, &control, "session_start", "claude_code");
     status(&deck, &control, "idle", "claude_code");
     assert!(
         common::wait_until(WAIT, || status_wake(&deck, &control) == "doorbell"),
-        "the measured release's WAKE"
+        "the unmeasured release's WAKE"
     );
     let control_id = enqueue(&deck, &control, BODY);
     assert!(
         common::wait_until(WAIT, || rung_line(&control, &control_id).is_some()),
-        "the measured release is rung: {:?}",
+        "the unmeasured release is rung: {:?}",
         String::from_utf8_lossy(&bytes(&control))
     );
     state(&deck, &control, &control_id, "acknowledged");

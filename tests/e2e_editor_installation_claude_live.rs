@@ -5,19 +5,13 @@
 //! gate `inbox/probe/044`): Claude Code's Bash tool, in the foreground, in
 //! the background and in a subagent, sees the person's own `VISUAL` and
 //! `EDITOR` exactly, through the tool environment file the deck installs
-//! (`CLAUDE_ENV_FILE`), in each state they can be in at spawn; a release the
-//! deck hasn't measured the editor probe of is installed all the same and
-//! never checked; and a command the rollout doesn't cover isn't installed
-//! at all.
+//! (`CLAUDE_ENV_FILE`), in each state they can be in at spawn; a Claude Code
+//! whose doorbell the person turned off (`doorbell.claude = false`) is not
+//! installed and never checked; and a command the rollout doesn't cover isn't
+//! installed at all.
 //!
 //! Real interactive Claude Code (Haiku) in an installed pane
-//! (`support/claude_installed.rs`). No e2e editor-probe assumption. The
-//! unmeasured-release case runs the executable `DAD_PROBE_044_UNMEASURED_CLAUDE`
-//! names, which must be the pinned official 2.1.312 build (its sha256 is
-//! checked), and is otherwise `SKIP:`; the `e2e`
-//! build's `DOT_AGENT_DECK_E2E_UNRECORD_CLAUDE_RELEASES` can't stand in for
-//! one, since it removes a record from the ring's view only, not from the
-//! editor probe's permission.
+//! (`support/claude_installed.rs`). No e2e editor-probe assumption.
 mod common;
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
@@ -207,131 +201,49 @@ fn probe_044_live_tools_see_set_editor_settings() {
     tools_see_the_saved_editor(Saved::Set);
 }
 
-/// The official Claude Code 2.1.312 Linux x64 executable, as its record and
-/// the `tests/fixtures/claude-inbox/r5wake/claude-2.1.312-*` fixtures pin it:
-/// the `claude` binary in the `@anthropic-ai/claude-code-linux-x64@2.1.312`
-/// npm package (fetched with `npm pack` and unpacked). Its record verifies
-/// the ring and leaves `editor_probe` absent, so it is the unmeasured release
-/// this test runs; if a later activation verifies 2.1.312's editor probe,
-/// pin another release here.
-const UNMEASURED_CLAUDE_SHA256: &str =
-    "4f4178ce41d83e23341ebfbaecdbcf8ea6bf7baea0690025abe49eeec3a5d01d";
-
-/// The Claude Code executable whose release the deck has not measured the
-/// editor probe of: `DAD_PROBE_044_UNMEASURED_CLAUDE`, which must be the
-/// pinned build [`UNMEASURED_CLAUDE_SHA256`] names. Its release, or why the
-/// test cannot run.
-fn unmeasured_claude() -> Result<(std::path::PathBuf, String), String> {
-    use dot_agent_deck::doorbell_activation::{Measurement, RELEASE_RECORDS};
-    use sha2::{Digest, Sha256};
-    let path = std::env::var_os("DAD_PROBE_044_UNMEASURED_CLAUDE")
-        .map(std::path::PathBuf::from)
-        .ok_or("DAD_PROBE_044_UNMEASURED_CLAUDE names no Claude Code executable")?;
-    let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let sha256: String = Sha256::digest(&bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    if sha256 != UNMEASURED_CLAUDE_SHA256 {
-        return Err(format!(
-            "{} has sha256 {sha256}, not the pinned 2.1.312 build's {UNMEASURED_CLAUDE_SHA256}",
-            path.display()
-        ));
-    }
-    let out = std::process::Command::new(&path)
-        .arg("--version")
-        .current_dir(std::env::temp_dir())
-        .output()
-        .map_err(|e| format!("{} --version: {e}", path.display()))?;
-    let release = String::from_utf8_lossy(&out.stdout)
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    let version = semver::Version::parse(&release).map_err(|e| format!("{release:?}: {e}"))?;
-    let verified = RELEASE_RECORDS.iter().any(|r| {
-        r.agent == dot_agent_deck::event::AgentType::ClaudeCode
-            && r.release == version
-            && matches!(r.editor_probe, Measurement::Verified(_))
-    });
-    if verified {
-        return Err(format!(
-            "Claude Code {release}'s editor probe is verified: not an unmeasured release"
-        ));
-    }
-    Ok((path, release))
-}
-
-/// Scenario: Start real interactive Claude Code of a release whose editor probe the deck has not measured, through a plain claude command so the pane is installed, with the person's VISUAL and EDITOR set. The pane is installed all the same and its Bash tool sees the person's settings, but when the person leaves a draft and a task is queued, for twenty seconds the deck asks no check, types nothing and delivers nothing, and the card names the hold.
+/// Scenario: Start real interactive Claude Code through a plain claude command, in a deck whose Claude Code doorbell is turned off (`DOT_AGENT_DECK_DOORBELL_CLAUDE=0`), with the person's VISUAL and EDITOR set. The pane is not installed, so its Bash tool sees the person's settings as they are; when the person leaves a draft and a task is queued, for twenty seconds the deck asks no check, types nothing and delivers nothing, the `doorbell off` line names turned_off, and the card names the hold.
 #[spec("inbox/probe/044")]
 #[test]
-fn probe_044_live_an_unmeasured_release_is_installed_and_never_checked() {
-    // It runs its own binary, so the host's release needs no record.
+fn probe_044_live_a_turned_off_claude_is_not_installed_and_never_checked() {
     skip_unless!(installed::rollout_installs_claude());
-    let (binary, release) = match unmeasured_claude() {
-        Ok(found) => found,
-        Err(why) => {
-            skip_unless!(Err(why));
-            return;
-        }
-    };
-    eprintln!(
-        "unmeasured Claude Code release: {release} at {}",
-        binary.display()
-    );
-    // A `claude` of its own, so the pane's command is the Direct class.
-    let bin = common::harness_tempdir().unwrap();
-    std::os::unix::fs::symlink(&binary, bin.path().join("claude")).unwrap();
-    let command = CLAUDE.replacen(
-        "claude",
-        &bin.path().join("claude").display().to_string(),
-        1,
-    );
-    let claude = Installed::launch(&command, &Saved::Set.env());
+    let mut env = Saved::Set.env();
+    env.push((dot_agent_deck::doorbell_switch::CLAUDE_ENV, "0"));
+    let claude = Installed::launch(CLAUDE, &env);
     assert!(
         common::wait_until(BUDGET, || claude.listing()["armed"].as_u64().unwrap_or(0)
             > 0),
         "native SessionStart waiter must arm; {}",
         claude.evidence()
     );
-    claude.assert_installed();
-    let latched = format!("release={release}");
-    assert!(
-        common::wait_until(BUDGET, || claude
-            .log()
-            .lines()
-            .any(|l| l.contains("pane release") && l.contains(&latched))),
-        "the deck latched {release} from the header; {}",
-        claude.evidence()
+    assert_eq!(
+        claude.env("VISUAL").as_deref(),
+        Some("t042-visual --wait"),
+        "a turned-off Claude Code keeps the person's VISUAL"
     );
-    assert!(
-        common::wait_until(BUDGET, || claude
-            .log()
-            .lines()
-            .any(|l| l.contains("editor probe permission settled"))),
-        "the permission settles; {}",
-        claude.evidence()
+    assert_eq!(
+        claude.env("EDITOR").as_deref(),
+        Some("t042 editor's choice")
     );
-    let settled: Vec<String> = claude
-        .log()
-        .lines()
-        .filter(|l| l.contains("editor probe permission settled"))
-        .map(str::to_string)
-        .collect();
+    assert_eq!(
+        claude.env(dot_agent_deck::composer_probe::install::GENERATION_ENV),
+        None
+    );
+    assert_eq!(claude.env("CLAUDE_ENV_FILE"), None);
     assert!(
-        settled.iter().all(|l| !l.contains("Armable")),
-        "an unmeasured release is never armable: {settled:?}"
+        !claude.log().contains("editor helper installed"),
+        "nothing was installed; {}",
+        claude.evidence()
     );
     std::fs::write(claude.deck.workdir().join("envprobe.py"), ENVPROBE).unwrap();
     let seen = tool_run(
         &claude,
-        "Use the Bash tool to run exactly: python3 envprobe.py unmeasured-044 . Then reply DONE and end your turn.",
-        "envprobe-unmeasured-044.json",
+        "Use the Bash tool to run exactly: python3 envprobe.py turned-off-044 . Then reply DONE and end your turn.",
+        "envprobe-turned-off-044.json",
     );
     assert_eq!(
         seen,
         Saved::Set.expected(),
-        "an unmeasured release's tools still see the person's settings"
+        "a turned-off Claude Code's tools see the person's settings"
     );
     assert!(
         common::wait_until(BUDGET, || claude.listing()["armed"].as_u64().unwrap_or(0)
@@ -343,7 +255,7 @@ fn probe_044_live_an_unmeasured_release_is_installed_and_never_checked() {
     claude.deck.send_keys(b"draft-044");
     claude.expect_composer("draft-044");
     let since = claude.log().len();
-    let name = "unmeasured-044.txt";
+    let name = "turned-off-044.txt";
     let id = claude.post(&claude.directive(name));
     common::wait_until(Duration::from_secs(20), || {
         let message = claude.message(&id);
@@ -364,9 +276,17 @@ fn probe_044_live_an_unmeasured_release_is_installed_and_never_checked() {
         false
     });
     claude.expect_composer("draft-044");
+    assert!(
+        claude
+            .log()
+            .lines()
+            .any(|l| l.contains("doorbell off") && l.contains("turned_off")),
+        "the deck log names turned_off; {}",
+        claude.evidence()
+    );
     let hold = claude.record()["inbox"]["wake_hold"].clone();
     eprintln!(
-        "044 unmeasured {release}: installed, permission {settled:?}, tools see the person's settings, no check in 20 s, wake_hold={hold}"
+        "044 turned off: not installed, tools see the person's settings, no check in 20 s, wake_hold={hold}"
     );
     assert!(
         hold.is_string(),
