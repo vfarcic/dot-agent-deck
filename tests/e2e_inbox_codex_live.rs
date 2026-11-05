@@ -154,17 +154,21 @@ fn codex_011_live_busy_stop_hands_over_and_acks() {
     );
 }
 
-/// Scenario: Start interactive Codex with every one of the deck's hooks switched off, so none of them runs, and post a sentinel task while it is idle. The deck types nothing into Codex; the test asks Codex in its pane to run `dot-agent-deck inbox fetch`, and its model runs it inside its own sandbox, that fetch reaches the deck as a one-shot receiver (a sandbox that refuses the socket is UNVERIFIED, not a pass), the sentinel is written once, and the task is settled by its receipt with no hook having fetched.
+/// Scenario: Start interactive Codex with every one of the deck's hooks switched off, so none of them runs, type into its pane a prompt asking it to run `dot-agent-deck inbox fetch`, then post a sentinel task while it is idle. Because its box was typed into, the deck types nothing into Codex; on the prompt's Enter its model runs the fetch inside its own sandbox, that fetch reaches the deck as a one-shot receiver (a sandbox that refuses the socket is UNVERIFIED, not a pass), the sentinel is written once, and the task is settled by its receipt with no hook having fetched.
 #[spec("inbox/codex/022")]
 #[test]
 fn codex_022_live_untrusted_hooks_a_model_run_fetch_delivers_on_receipts() {
     skip_unless!(common::check_codex_available());
     let codex = Codex::with_hooks(false, false);
     let name = "codex-untrusted-4e1c90.txt";
-    let id = codex.post(name);
+    // The prompt is typed before the task is posted: a Codex box something
+    // was typed into is not rung until Codex restarts, so the no-ring
+    // assertion below rests on that rule rather than on the prompt beating
+    // the settle window.
     let mut input =
         codex.input("Run dot-agent-deck inbox fetch in the shell and do what the messages say.");
     codex.wait_screen("Run dot-agent-deck inbox fetch");
+    let id = codex.post(name);
     let fetched = || {
         codex
             .log()

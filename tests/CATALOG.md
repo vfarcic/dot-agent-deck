@@ -13108,8 +13108,8 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 
 ##### inbox/codex/022 — Real Codex with its hooks off delivers through a model-run fetch on receipts.
 - **Layer:** L2 real agent, lane 2 (`tests/e2e_inbox_codex_live.rs`), attached interactive PTY (PRD #1666 part 3, H4).
-- **Agent:** Codex 0.160.0, cheap model from `codex_test_model()`, `--sandbox workspace-write` with network access, every deck hook switched off in Codex's trust records, the build under test first on the pane's `PATH`.
-- **Asserts:** no doorbell rings; after the test asks Codex in its pane to run `dot-agent-deck inbox fetch`, Codex's model runs it in its own sandbox and that fetch reaches the deck as a hook receiver (`consumer=Cli` in the deck log; a fetch that never arrives fails as UNVERIFIED, not a pass); the sentinel is written once; the task is settled by its receipt; no deck hook fetched.
+- **Agent:** Codex 0.164.0, cheap model from `codex_test_model()`, `--sandbox workspace-write` with network access, every deck hook switched off in Codex's trust records, the build under test first on the pane's `PATH`.
+- **Asserts:** no doorbell rings, because the test types its prompt into the pane before posting the task and a Codex box something was typed into is not rung until Codex restarts; after the test submits that prompt asking Codex in its pane to run `dot-agent-deck inbox fetch`, Codex's model runs it in its own sandbox and that fetch reaches the deck as a hook receiver (`consumer=Cli` in the deck log; a fetch that never arrives fails as UNVERIFIED, not a pass); the sentinel is written once; the task is settled by its receipt; no deck hook fetched.
 - **Does not assert:** a spool write the sandbox denies (`inbox/codex/020`), or Codex showing a failing hook's stderr.
 - **Cost:** one cheap model turn.
 - **Platform coverage:** mac+linux.
