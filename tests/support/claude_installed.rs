@@ -62,6 +62,12 @@ pub fn checkable() -> Result<(), String> {
     }
     let release = installed_release()?;
     let version = semver::Version::parse(&release).map_err(|e| e.to_string())?;
+    if !version.pre.is_empty() {
+        return Err(format!(
+            "Claude Code {release} is a pre-release, whose start-up header the deck does not \
+             latch (`unknown_release`): the deck checks no box and types no doorbell"
+        ));
+    }
     if !matches!(CLAUDE_FACTS.editor_probe, Measurement::Verified(_)) {
         return Err(format!(
             "Claude Code's editor probe is {:?}, not verified: the deck checks no box",

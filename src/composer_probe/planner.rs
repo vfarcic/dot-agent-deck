@@ -380,8 +380,8 @@ impl PhysicalTracker {
     /// what was taken before stays as it was read. So input typed before the
     /// release latched was read strictly, and an `ESC [` then Ctrl+U typed
     /// before Claude Code drew its header holds the deck's lines until a key
-    /// ends the CSI, as for an unmeasured release: the conservative
-    /// direction, left so on purpose.
+    /// ends the CSI, as for every release but 2.1.310 and 2.1.312 (the strict
+    /// grammar): the conservative direction, left so on purpose.
     pub fn written_as(&mut self, written: &[u8], physical: &Physical, grammar: InputGrammar) {
         if written.is_empty() {
             return;
