@@ -7,7 +7,7 @@ mod head_echo;
 use dot_agent_deck::doorbell_activation::{
     KeyEffect, Measurement, RELEASE_RECORDS, first_stage_bytes,
 };
-use dot_agent_deck::doorbell_screen::{TOKEN_HEAD_CHARS, WithdrawalRefusal};
+use dot_agent_deck::doorbell_screen::TOKEN_HEAD_CHARS;
 use dot_agent_deck::doorbell_txn::{ECHO_WAIT, TOKEN_ALPHABET};
 use dot_agent_deck::event::AgentType;
 use dot_agent_deck::release_scanner::{HEADER_RECOGNISERS, ReleaseScanner, ScanLatch};
@@ -119,7 +119,7 @@ fn premise(capture: &Capture, hooks: Hooks) {
     }
 }
 
-/// Scenario: Replay every committed staged capture of real Codex 0.164.0 (twenty rings at 50 × 200 and ten at 24 × 80 with the deck's hooks trusted, ten at 50 × 200 with them switched off, ten at 50 × 200 through a launcher with them untrusted) through the deck's evidence state and Codex's screen profile. Each was taken on the pinned executable under the deck's wrapper and latches 0.164.0; on every ring the composer was the empty ready one at admission, showed only the placeholder or a prefix of the head, never a dialog, until it held exactly the head within the echo wait, then only prefixes of the line until it held exactly the whole line, exactly so just before the Enter sent at least 150 ms after the rest, and then showed the line as a transcript user message within the confirm wait, with Codex's own record holding exactly that prompt once. Every ring at 50 × 200 was read on Clean frames of the deck's evidence state, and at 24 × 80 every ring but each session's first, before which Codex draws no width witness.
+/// Scenario: Replay every committed staged capture of real Codex 0.164.0 (twenty rings at 50 × 200 and ten at 24 × 80 with the deck's hooks trusted, ten at 50 × 200 with them switched off, ten at 50 × 200 through a launcher with them untrusted) through the deck's evidence state and Codex's screen profile. Each was taken on the pinned executable under the deck's wrapper and latches 0.164.0; on every ring the composer was the empty ready one at admission, showed only the placeholder or a prefix of the head, never a dialog, until it held exactly the head within the echo wait, then only prefixes of the line until it held exactly the whole line, exactly so just before the Enter sent at least 150 ms after the rest, and then showed the line as a transcript user message within the confirm wait, with Codex's own record holding exactly that prompt once. Every ring at 50 × 200 was read on Clean frames of the deck's evidence state, and at 24 × 80 every ring but each session's first: a fresh Codex at that size draws no width witness, so no frame from its start to the first ring's Enter is Clean.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_codex_164_head_echo_staged_captures() {
@@ -158,6 +158,32 @@ fn doorbell_036_codex_164_head_echo_staged_captures() {
             assert!(
                 !trials[0].clean && trials[1..].iter().all(|t| t.clean),
                 "{stem}: {trials:?}"
+            );
+            // Not one Clean frame from Codex's start, through its settle
+            // window and the first ring, to that ring's Enter: a doorbell
+            // that waits for a Clean frame never admits a fresh Codex at
+            // 24 × 80 until something else has prompted it. In these two
+            // captures the first Clean frame came as the first turn ended
+            // (31.4 s and 6.4 s after its Enter; the turns ran 30.9 s and
+            // 6.3 s).
+            let reads = head_echo::replay(&capture, |_| Vec::new());
+            let first_cr = capture.point("mark:cr-1");
+            assert!(
+                reads.iter().filter(|r| r.end <= first_cr).all(|r| !r.clean),
+                "{stem}: a Clean frame before the first Enter"
+            );
+            let first_clean = reads.iter().find(|r| r.clean).expect("a Clean frame");
+            let cr_sent = capture.result["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["label"] == "cr-1")
+                .unwrap()["t"]
+                .as_u64()
+                .unwrap();
+            eprintln!(
+                "{stem}: first Clean frame {:.1} s after the first Enter",
+                (first_clean.t - cr_sent) as f64 / 1e9
             );
         }
         clean += trials.iter().filter(|t| t.clean).count();
@@ -201,60 +227,21 @@ fn doorbell_036_codex_164_head_echo_staged_captures() {
     );
 }
 
-/// Scenario: Replay the committed controls capture of real Codex 0.164.0 at 50 × 200. Six heads typed alone are each held exactly, the strict withdrawal recogniser counts eight deletes for each, and the placeholder returns after them; one to seven characters of a head are held exactly and refused as no whole token; a head and then none, one, ten or forty characters of the rest are held exactly and counted whole; another token's line and an earlier attempt's line are held as typed and never read as empty or as another head's; a head and one byte of the rest (a space) draws as the head alone and is refused; no write opened a dialog or submitted anything; three whole lines with the Enter in the same burst were each kept in the composer and refused for withdrawal; and six staged lines whose Enter came 50, 100 or 120 ms after the rest, once the line had echoed, were each submitted.
+/// Scenario: Replay the committed controls capture of real Codex 0.164.0 at 50 × 200. Six heads typed alone are each held exactly, the strict withdrawal recogniser counts eight deletes for each, and the placeholder returns after them; one to seven characters of a head are held exactly and refused as no whole token; a head and then none, one, ten or forty characters of the rest are held exactly and counted whole; another token's line and an earlier attempt's line are held as typed and never read as empty or as another head's; a head and one byte of the rest (a space) draws as the head alone and is refused; no write opened a dialog or submitted anything; three whole lines with the Enter in the same burst were each kept in the composer, refused for withdrawal and absent from Codex's own record; and six staged lines whose Enter was written once the line had echoed, 81.7 to 120.2 ms after the rest, were each submitted and are in Codex's record once, with nothing else doorbell-shaped there.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_codex_164_head_echo_controls_capture() {
     let capture = capture("controls");
     premise(&capture, Hooks::Trusted);
-    let controls = head_echo::controls(&capture);
-    let named = |prefix: &'static str| controls.iter().filter(move |c| c.name.starts_with(prefix));
-    assert_eq!(named("head-").count(), 6);
-    for c in named("head-") {
-        assert_eq!(c.strict, Some(Ok(TOKEN_HEAD_CHARS)), "{c:?}");
-    }
-    assert_eq!(named("partial-").count(), 7);
-    for c in named("partial-") {
-        assert_eq!(
-            c.strict,
-            Some(Err(WithdrawalRefusal::NoWholeToken)),
-            "{c:?}"
-        );
-    }
-    // The head and one byte of the rest, a space, draws as the head with the
-    // cursor a cell further on: nothing on screen shows the space, so the
-    // strict recogniser refuses it and the deck withdraws nothing.
-    let second: Vec<_> = named("second-").map(|c| c.strict).collect();
-    assert_eq!(
-        second,
-        [
-            Some(Ok(8)),
-            Some(Err(WithdrawalRefusal::NotOwnedText)),
-            Some(Ok(18)),
-            Some(Ok(48))
-        ]
-    );
-    assert_eq!(named("foreign").count() + named("old-token").count(), 2);
-    // An Enter in the same burst as the line is kept with it, and what is
-    // kept is not the owned text with the cursor after it; an Enter after the
-    // line's echo submits, even 50 ms after the rest was written.
-    let soon: Vec<_> = controls
-        .iter()
-        .filter(|c| c.name.starts_with("enter-") && !c.name.starts_with("enter-at-"))
-        .collect();
-    assert_eq!(soon.len(), 3);
-    for c in soon {
-        assert_eq!(c.submitted, Some(false), "{c:?}");
-        assert_eq!(
-            c.strict,
-            Some(Err(WithdrawalRefusal::CursorElsewhere)),
-            "{c:?}"
-        );
-    }
-    assert_eq!(named("enter-at-").count(), 6);
-    for c in named("enter-at-") {
-        assert_eq!(c.submitted, Some(true), "{c:?}");
-    }
+    let controls = head_echo::checked_controls(&capture);
+    // The margin the committed capture supports: the six Enters after the
+    // line's echo went 81.7 to 120.2 ms after the rest's write returned (the
+    // ones asked for at 50 ms waited for the echo), each submitted.
+    let enter: Vec<f64> = controls.iter().filter_map(|c| c.enter_ms).collect();
+    assert_eq!(enter.len(), 6);
+    let (min, _, max) = spread(&enter);
+    assert!((81.0..82.0).contains(&min), "{enter:?}");
+    assert!(max < 121.0, "{enter:?}");
     for c in &controls {
         eprintln!("{c:?}");
     }
@@ -300,4 +287,66 @@ fn doorbell_036_codex_token_head_bytes_are_inert_in_every_dialog() {
             assert!(head.iter().all(|b| first.contains(b)), "{stem}: {line}");
         }
     }
+}
+
+/// `python3 -I <script> <args>` from the checkout, with a cleared
+/// environment apart from `PATH`; panics with its output unless it exits 0.
+#[cfg(unix)]
+fn python_ok(script: &str, args: &[String]) {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let output = std::process::Command::new("python3")
+        .arg("-I")
+        .arg(format!("{root}/tests/support/{script}"))
+        .args(args)
+        .current_dir(root)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("the export checks require python3 on PATH");
+    assert!(
+        output.status.success(),
+        "{script} {args:?} failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Scenario: Run the unit checks of the head-echo export's deny scan, with no agent and no network. Text the committed captures draw passes; an owner or group column naming anyone but the allow-listed owner handle, an `id` listing, a `/home/` path, key, token, JWT, `org-`/`user-` id, secret-named field and email address are each refused, also with styling inside the word; with an empty allow-list the committed 24 × 80 capture's drawn `stat` rows are refused; and an export carrying one writes nothing.
+#[cfg(unix)]
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_codex_head_echo_export_deny_scan_checks() {
+    python_ok("codex_head_echo_export_checks.py", &[]);
+}
+
+/// Scenario: Run the head-echo export's deny scan (`--scan`) over every committed Codex 0.164.0 head-echo capture, the eleven `.bin`, `.json` and `.result.json` triples. None may contain a username other than the allow-listed owner handle in an owner, `id` or `USER=` position, a `/home/` path, or a key, token, JWT, `org-`/`user-` id, secret-named field or email address, so a re-recording that would commit one fails here.
+#[cfg(unix)]
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_codex_head_echo_committed_captures_pass_the_deny_scan() {
+    let stems: Vec<String> = STAGED
+        .iter()
+        .map(|&(stem, ..)| stem)
+        .chain(["controls"])
+        .map(|stem| format!("tests/fixtures/{DIR}/codex-0.164.0-head-echo-{stem}"))
+        .collect();
+    assert_eq!(stems.len(), 11);
+    // Every committed capture in the directory is one of these.
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/{DIR}"));
+    let on_disk = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".bin")
+        })
+        .count();
+    assert_eq!(on_disk, stems.len(), "{}", dir.display());
+    let mut args = vec!["--scan".to_string()];
+    args.extend(stems);
+    python_ok("codex_head_echo_export.py", &args);
 }

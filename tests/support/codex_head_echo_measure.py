@@ -83,6 +83,41 @@ def native_codex():
     return found, native.resolve(strict=True)
 
 
+def running_codex(root, pin):
+    """Every running descendant of `root` whose executable is named `codex`
+    (the native binary, behind the wrapper and any launcher), with the SHA-256
+    of the executable the process is running (`/proc/<pid>/exe`, so a file
+    replaced or resolved differently after the start is not what is hashed).
+    Fails unless there is at least one and each is the pinned executable."""
+    parents = {}
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / 'stat').read_text()
+        except OSError:
+            continue
+        # `pid (comm) state ppid …`: comm can hold spaces and parentheses.
+        parents[int(entry.name)] = int(stat[stat.rindex(')') + 2:].split()[1])
+    found, frontier = [], [root]
+    while frontier:
+        pid = frontier.pop()
+        for child in (c for c, parent in parents.items() if parent == pid):
+            frontier.append(child)
+            try:
+                exe = os.readlink('/proc/%d/exe' % child)
+            except OSError:
+                continue
+            if Path(exe.removesuffix(' (deleted)')).name != 'codex':
+                continue
+            with open('/proc/%d/exe' % child, 'rb') as running:
+                digest = hashlib.sha256(running.read()).hexdigest()
+            found.append({'pid': child, 'exe': exe, 'sha256': digest})
+    if not found or any(f['sha256'] != pin for f in found):
+        raise RuntimeError('running Codex is not the pinned executable: %s' % found)
+    return found
+
+
 class Recorder:
     def __init__(self, out, rows, cols):
         self.out, self.rows, self.cols = out, rows, cols
@@ -95,6 +130,7 @@ class Recorder:
         self.frames = {}
         self.fd = None
         self.launcher = False
+        self.child, self.pin, self.running = None, None, None
 
     # -- the PTY -----------------------------------------------------------
     def text(self):
@@ -417,6 +453,8 @@ class Recorder:
         if self.dialog():
             raise RuntimeError('a dialog at start-up: ' + self.text())
         self.snap('empty')
+        # The executable the composer belongs to, from the running process.
+        self.running = running_codex(self.child, self.pin)
         assert self.modes[-1]['bits'] == [False, False], self.modes
         # The deck's first ring waits out the release's settle window (6.03 s
         # for 0.164.0) from the generation's first empty ready frame.
@@ -554,16 +592,21 @@ def main():
     codex = ['--model', model, '--sandbox', 'workspace-write', '--ask-for-approval', 'never',
              '-c', 'model_reasoning_effort="low"']
     if kind.endswith('-launcher'):
-        # A launcher the wrapper cannot see into, as `devbox run codex-big`
-        # is: the wrapper installs and trusts nothing for it, and adds no
-        # embedded-mode pair.
+        # A launcher the wrapper cannot see into, the `devbox run codex-big`
+        # shape: the wrapper adds no embedded-mode pair for it. It installs
+        # and trusts nothing here only because this recorder removed the pane
+        # id (`src/wrap.rs`, `installs_hooks`); in a production pane it
+        # attempts the trust, which for `devbox run codex-big` fails to reach
+        # Codex's app-server, and Codex starts with the hooks untrusted all
+        # the same. This run's own Codex home has no trust records.
         argv = [deck, 'wrap', '--agent', 'codex', '--', 'sh', '-c', 'exec codex "$@"', 'sh'] + codex
         kind = kind[:-len('-launcher')]
     else:
         argv = [deck, 'wrap', '--agent', 'codex', '--', 'codex'] + codex
     meta = {'release': release, 'sha256': digest, 'launcher': str(launcher), 'executable': str(native),
             'argv': argv, 'model': model, 'codex_home': codex_home.name,
-            'recorder_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), 'term': 'xterm-256color', 'kind': kind,
+            'recorder_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), 'term': 'xterm-256color',
+            'colorterm': os.environ.get('COLORTERM'), 'kind': kind,
             'hooks_state': (codex_home / 'config.toml').read_text() if (codex_home / 'config.toml').exists()
             else None, 'load_start': load()}
     child, fd = pty.fork()
@@ -578,7 +621,7 @@ def main():
         for name in ('DOT_AGENT_DECK_PANE_ID', 'DOT_AGENT_DECK_AGENT_ID'):
             os.environ.pop(name, None)
         os.execv(deck, argv)
-    recorder.fd = fd
+    recorder.fd, recorder.child, recorder.pin = fd, child, digest
     error = None
     try:
         recorder.measure(kind, trials)
@@ -597,6 +640,7 @@ def main():
         os.close(fd)
         assert hashlib.sha256(native.read_bytes()).hexdigest() == digest, 'executable pin changed'
         meta['load_end'] = load()
+        meta['running_executables'] = recorder.running
         global DEBUG_OUT
         DEBUG_OUT = out
         meta['rollout_user_messages'], meta['rollout_files'] = rollout_user_messages(codex_home)
