@@ -695,7 +695,7 @@ fn status_032_a_close_after_a_natural_exit_keeps_how_it_ended() {
     registry.shutdown_all();
 }
 
-/// Scenario: A pane command exits with code 7 by itself, and a respawn removes it before the reader captures how it ended, held after the removal and before it terminates and reaps the old child. The capture must say the command exited with 7, not that it was replaced; a respawn of a running command, in the same pane, still reads as replaced.
+/// Scenario: A pane command exits with code 7 by itself, and a respawn removes it before the reader captures how it ended, held after the removal and before it terminates and reaps the old child. The capture must say the command exited with 7, not that it was replaced; a respawn of a running command, in the same pane, with its capture held until the respawn publishes even when publication is delayed beyond the capture bound, still reads as replaced.
 #[spec("inbox/status/032")]
 #[tokio::test(flavor = "multi_thread")]
 async fn status_032_a_respawn_after_a_natural_exit_keeps_how_it_ended() {
@@ -735,11 +735,31 @@ async fn status_032_a_respawn_after_a_natural_exit_keeps_how_it_ended() {
         }
     );
 
-    // Control: the running successor, respawned in turn, was replaced.
+    // Control: the running successor, respawned in turn, was replaced. Its
+    // capture is held until the respawn has published, as in the tests above:
+    // unheld, its bound runs from its EOF and a slow spawn outlasts it
+    // (`ReplacementPending`, seen on macOS CI). Publication is delayed past
+    // that bound on purpose, so the hold is what this half depends on.
+    let (capture_reached, release_capture) = hold_capture(&registry, &successor);
+    let (publish_reached, release_publish) = registry.pause_next_publish_for_test();
+    let delayed_publication = std::thread::spawn(move || {
+        capture_reached
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the successor's reader reached its capture");
+        publish_reached
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the successor's successor reached publication");
+        std::thread::sleep(TERMINATION_WAIT * 2);
+        release_publish.send(()).expect("release publication");
+    });
     let next = registry
         .respawn_agent_for_pane(pane, "sleep 30")
         .await
         .expect("respawn the running successor");
+    delayed_publication.join().expect("delayed publication");
+    release_capture
+        .send(())
+        .expect("release the capture after publication");
     assert_ne!(next, successor);
     let replaced = tokio::task::spawn_blocking({
         let registry = Arc::clone(&registry);
