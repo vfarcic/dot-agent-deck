@@ -1486,7 +1486,7 @@ fn bookkeeping(marker: Option<&str>, counts: Option<&[(&str, &str)]>) -> String 
     text
 }
 
-/// Scenario: Rewrite a Codex home's `config.toml` from one bookkeeping state to another, as a new file renamed over the old, and compare the two reads. A step Codex makes is accepted: the screen-reader marker set to `true` where it was absent or `false`, a new model's tooltip count at 1, a count raised by 1 up to 4 beside another left as it was, and the marker and a first count in one rewrite. Any other move holds as changed: the marker cleared, removed or written `false`, a count lowered, raised by 2 or past 4, a new count at 0 or 2, a model's count removed, and the count table removed.
+/// Scenario: Rewrite a Codex home's `config.toml` from one bookkeeping state to another, as a new file renamed over the old, and compare the two reads. A step Codex makes is accepted: the screen-reader marker set to `true` where it was absent or `false`, a new model's tooltip count at 1, a count raised by 1 up to 4 beside another left as it was, and the marker and a first count in one rewrite. Any other move holds as changed: the marker cleared, removed or written `false`, a count lowered, raised by 2 or past 4, a new count at 0 or 2, a model's count removed, the count table removed, and two counts moved in one rewrite (two raised, a new one beside a raised one, two new ones).
 #[spec("inbox/probe/014")]
 #[test]
 fn probe_014_only_a_step_forward_in_codexs_bookkeeping_is_accepted() {
@@ -1633,6 +1633,30 @@ fn probe_014_only_a_step_forward_in_codexs_bookkeeping_is_accepted() {
             None,
             Err(Hold::Changed),
         ),
+        (
+            "two counts raised in one rewrite",
+            Some("true"),
+            Some(&[(a, "1"), (b, "1")]),
+            Some("true"),
+            Some(&[(a, "2"), (b, "2")]),
+            Err(Hold::Changed),
+        ),
+        (
+            "a new count beside a raised one",
+            Some("true"),
+            Some(&[(a, "1")]),
+            Some("true"),
+            Some(&[(a, "2"), (b, "1")]),
+            Err(Hold::Changed),
+        ),
+        (
+            "two new counts in one rewrite",
+            None,
+            None,
+            Some("true"),
+            Some(&[(a, "1"), (b, "1")]),
+            Err(Hold::Changed),
+        ),
     ];
     let mut wrong = Vec::new();
     for (row, marker_was, counts_was, marker_now, counts_now, expected) in rows {
@@ -1733,7 +1757,71 @@ fn probe_014_a_codex_read_that_loses_the_race_is_not_adopted() {
     assert_eq!(reads.check(CODEX_ORDER), Err(Hold::Changed), "latched");
 }
 
-/// Scenario: Take a Codex baseline from the deck's launch line, then compare it with the native the deck's telemetry shim started when an OTLP endpoint is configured: the wrapper's pair, the shim's own `-c otel.trace_exporter=…` and `-c otel.metrics_exporter=…` (produced here by the shim's own function), then the user's arguments. The two read as the same launch, for both exporters, the JSON protocol, either exporter alone, an endpoint that needs escaping, and without the pair. A user's `-c` that moves Ctrl+G behind the shim's overrides still holds as changed, and so does each `otel` override that isn't the shim's: another key, value or spelling, the shim's in the wrong order, twice, or behind a user's argument, and the shim's when the user's own arguments also override `otel` (the shim then adds nothing). A user's own `otel` override still counts as a source: on both sides it matches, on the baseline alone it holds.
+/// Scenario: Two checks of one Codex generation begin their reads in one order and read `config.toml` in the other, as the revcxkey2 review's LOW-1 found: the read that began first finds Codex's marker and the one that began second finds the file before it. Settled in either order, both are accepted and the read with the marker is the one adopted, so the marker rewritten with nothing moved afterwards still holds as changed.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_codex_reads_that_finish_out_of_order_settle_in_either_order() {
+    use dot_agent_deck::composer_probe::keymap::{CodexBaseline, CodexReads};
+    let marker = bookkeeping(Some("true"), None);
+    let cwd = Path::new("/nonexistent-cxkey3-project");
+    let mut wrong = Vec::new();
+    for marker_first in [true, false] {
+        let codex = Codex::new();
+        write(&codex.config(), TRUSTED);
+        let reads = CodexReads::new(&CodexBaseline::at_spawn(&codex.home(), &[], cwd).unwrap());
+        let began_first = reads.start_read();
+        let began_second = reads.start_read();
+        let before = reads.finish_read(began_second);
+        rewrite(&codex.config(), &marker);
+        let with_marker = reads.finish_read(began_first);
+        let settled = if marker_first {
+            [
+                ("the marker", reads.settle(with_marker, CODEX_ORDER)),
+                ("the file before it", reads.settle(before, CODEX_ORDER)),
+            ]
+        } else {
+            [
+                ("the file before it", reads.settle(before, CODEX_ORDER)),
+                ("the marker", reads.settle(with_marker, CODEX_ORDER)),
+            ]
+        };
+        for (read, got) in settled {
+            if got != Ok(()) {
+                wrong.push(format!("marker first {marker_first}, {read}: {got:?}"));
+            }
+        }
+        rewrite(&codex.config(), &marker);
+        let got = reads.check(CODEX_ORDER);
+        if got != Err(Hold::Changed) {
+            wrong.push(format!(
+                "marker first {marker_first}, the marker rewritten with nothing moved: {got:?}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Scenario: Follow one Codex generation's checks while Codex writes its marker into `config.toml` and the user then saves a copy of the file from before that write, as an editor buffer opened earlier would. The marker is accepted, and the saved copy, read by a check that began after the marker was accepted, holds as changed: only a read already in flight when a later one was adopted may lag behind it.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_a_codex_read_that_steps_its_bookkeeping_back_holds() {
+    use dot_agent_deck::composer_probe::keymap::{CodexBaseline, CodexReads};
+    let codex = Codex::new();
+    write(&codex.config(), TRUSTED);
+    let cwd = Path::new("/nonexistent-cxkey3-project");
+    let reads = CodexReads::new(&CodexBaseline::at_spawn(&codex.home(), &[], cwd).unwrap());
+    rewrite(&codex.config(), &bookkeeping(Some("true"), None));
+    assert_eq!(reads.check(CODEX_ORDER), Ok(()), "Codex's marker");
+    rewrite(&codex.config(), TRUSTED);
+    assert_eq!(
+        reads.check(CODEX_ORDER),
+        Err(Hold::Changed),
+        "the file from before the marker saved again"
+    );
+    assert_eq!(reads.check(CODEX_ORDER), Err(Hold::Changed), "latched");
+}
+
+/// Scenario: Take a Codex baseline from the deck's launch line, then compare it with the native the deck's telemetry shim started when an OTLP endpoint is configured: the wrapper's pair, the shim's own `-c otel.trace_exporter=…` and `-c otel.metrics_exporter=…` (produced here by the shim's own function), then the user's arguments; the two read as the same launch for both exporters, the JSON protocol, either exporter alone, an endpoint that needs escaping, and without the pair. A user's `-c` that moves Ctrl+G behind the shim's overrides still holds as changed, and so does each `otel` override that isn't the shim's: another key, value or spelling, the shim's in the wrong order, twice, or behind a user's argument, and the shim's when the user's own arguments also override `otel` (the shim then adds nothing). A user's own `otel` override still counts as a source: on both sides it matches, on the baseline alone it holds.
 #[spec("inbox/probe/014")]
 #[test]
 fn probe_014_the_telemetry_shims_otel_overrides_are_not_a_codex_source() {
@@ -1891,4 +1979,51 @@ fn probe_014_the_telemetry_shims_otel_overrides_are_not_a_codex_source() {
         Err(Hold::Changed),
         "on the baseline alone"
     );
+}
+
+/// Scenario: Take a Codex baseline from the deck's launch line, then compare it with a bound native whose leading `-c otel.trace_exporter=…` carries the shim's exporter table followed by a second line setting another key, as the revcxkey2 review's probe did with `tui.keymap.global.open_external_editor="f6"`. Such a value is not the shim's, so the launch holds as changed, as it does with a non-`otel` key or another `otel` key after the table; the shim's own value, alone, still matches.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_a_shim_shaped_otel_override_with_another_key_after_it_holds() {
+    use dot_agent_deck::composer_probe::keymap::CodexBaseline;
+    use dot_agent_deck::telemetry::launch::codex_args;
+    let dir = test_temp::tempdir().unwrap();
+    let home = dir.path().join("codex-home");
+    let cwd = dir.path().join("repo");
+    for d in [&home, &cwd] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    const PAIR: [&str; 2] = ["-c", "shell_environment_policy.set={}"];
+    let mut env = std::collections::HashMap::new();
+    env.insert("CODEX_HOME".to_string(), home.display().to_string());
+    env.insert(
+        "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
+        "http://127.0.0.1:4318".to_string(),
+    );
+    env.insert("OTEL_METRICS_EXPORTER".to_string(), "none".to_string());
+    let shim = codex_args(&args(&PAIR), &env);
+    assert_eq!(shim.len(), 2, "the shim adds the trace exporter: {shim:?}");
+    assert!(shim[1].starts_with("otel.trace_exporter="), "{shim:?}");
+    let baseline = CodexBaseline::at_spawn(&home, &[], &cwd).unwrap();
+    let bound = |value: &str| baseline.bound(&home, &args(&[PAIR[0], PAIR[1], "-c", value]), &cwd);
+
+    assert_eq!(bound(&shim[1]), Ok(()), "the shim's own value");
+    let mut wrong = Vec::new();
+    for (row, after) in [
+        (
+            "a rebinding after the table",
+            "\ntui.keymap.global.open_external_editor=\"f6\"",
+        ),
+        ("another key after the table", "\nmodel=\"o4\""),
+        (
+            "another otel key after the table",
+            "\notel.exporter=\"none\"",
+        ),
+    ] {
+        let got = bound(&format!("{}{after}", shim[1]));
+        if got != Err(Hold::Changed) {
+            wrong.push(format!("{row}: {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
