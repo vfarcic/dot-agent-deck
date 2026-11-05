@@ -135,9 +135,11 @@ fn codex_001_touched_box_checked_then_delegate_delivered_once() {
     // pane, and there the deck held the fresh worker unchecked and unrung
     // (`Surface`, then `Layout`) until a first prompt, the deck not taking
     // its logo as a width witness (`codex_width_witness`, which refuses a
-    // width whose neighbour the pane has also had; that it had is inferred,
-    // not logged). At 200 the worker's pane is 130 columns and it passes
-    // (cxact, one run each).
+    // width whose neighbour the pane has also had). cxfix logged it: every
+    // refusal read `widths=Some((117, [116, 117]))`, and part 3's head
+    // before the Codex activation (`4b5e5f95`) refused its ring `Layout`
+    // with the same widths, so the limit is older than the activation. At
+    // 200 the worker's pane is 130 columns and it passes.
     let deck = common::TuiDeck::builder()
         .with_pty_size(200, 50)
         .with_imported_codex_credentials()

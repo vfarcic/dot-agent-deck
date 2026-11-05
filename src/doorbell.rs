@@ -1132,7 +1132,17 @@ async fn run_tick(
                     );
                 }
                 outcome => {
-                    debug!(pane_id = %pane, agent_id = %agent, ?outcome, "doorbell ring not admitted; nothing typed");
+                    // MEDIUM-2: a ring refused for its frame says which
+                    // widths the pane has had (Codex's width witness).
+                    let widths = matches!(
+                        outcome,
+                        RingOutcome::Txn(Outcome::NothingWritten(
+                            crate::doorbell_txn::NotTyped::Layout
+                        ))
+                    )
+                    .then(|| registry.evidence_widths(&agent))
+                    .flatten();
+                    debug!(pane_id = %pane, agent_id = %agent, ?outcome, ?widths, "doorbell ring not admitted; nothing typed");
                 }
             }
         });

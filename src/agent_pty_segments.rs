@@ -1252,11 +1252,16 @@ impl AgentPtyRegistry {
             surface,
         };
         if let Err(refusal) = h.observer.admits(&outside, now) {
+            // MEDIUM-2: the widths a `Surface` refusal's frame was judged
+            // at, so a missing width witness shows in the log.
+            let widths = (refusal == crate::composer_probe::admission::Refusal::Surface)
+                .then(|| h.bus.evidence_widths());
             tracing::debug!(
                 target: "composer_probe",
                 agent_id,
                 ?ask,
                 ?refusal,
+                ?widths,
                 "probe refused when scheduled"
             );
             if ask != ProbeAsk::Lapse {
@@ -1474,6 +1479,19 @@ impl AgentPtyRegistry {
                 .map(|agent| Arc::clone(agent.bus.input()))
         };
         input.is_some_and(|input| input.has_segments() && input.probe_retrying())
+    }
+
+    /// The revcxact review's MEDIUM-2: generation `agent_id`'s pane width
+    /// now and every width it has had, `None` with no such agent.
+    pub(crate) fn evidence_widths(&self, agent_id: &str) -> Option<(u16, Vec<u16>)> {
+        let bus = {
+            let inner = self.inner.lock();
+            inner
+                .agents
+                .get(agent_id)
+                .map(|agent| Arc::clone(&agent.bus))
+        };
+        bus.map(|bus| bus.evidence_widths())
     }
 
     /// PRD #1666 part 3 (Q35-27): why the deck refused generation

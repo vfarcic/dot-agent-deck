@@ -218,6 +218,12 @@ impl EvidenceState {
         self.status
     }
 
+    /// The width now and every width the terminal has had, ascending: what
+    /// a width witness reads ([`WidthsSeen`]), for a diagnosis line.
+    pub fn widths(&self) -> (u16, Vec<u16>) {
+        (self.cols, self.widths.list())
+    }
+
     pub fn layout_epoch(&self) -> u64 {
         self.layout_epoch
     }

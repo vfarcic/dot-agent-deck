@@ -335,8 +335,7 @@ pub struct WidthsSeen {
 
 impl std::fmt::Debug for WidthsSeen {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let widths: Vec<u16> = (0..=u16::MAX).filter(|&w| self.had(w)).collect();
-        f.debug_tuple("WidthsSeen").field(&widths).finish()
+        f.debug_tuple("WidthsSeen").field(&self.list()).finish()
     }
 }
 
@@ -358,6 +357,11 @@ impl WidthsSeen {
 
     pub fn had(&self, cols: u16) -> bool {
         self.bits[cols as usize / 64] & (1 << (cols % 64)) != 0
+    }
+
+    /// Every width recorded, ascending.
+    pub fn list(&self) -> Vec<u16> {
+        (0..=u16::MAX).filter(|&w| self.had(w)).collect()
     }
 }
 
