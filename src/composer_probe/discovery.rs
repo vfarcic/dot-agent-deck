@@ -36,8 +36,9 @@
 //! path to hold the pinned file still: a script replaced after the pin (an
 //! npm update, or any writer of that directory) refuses the native as an
 //! executable mismatch. That read is a refusal only; it never attests
-//! anything. Three things are left, each failing open only to a process
-//! that can already write the agent's installation as this user:
+//! anything. The pin compares file identities, and what it compares has
+//! three windows, each failing open only to a process that can already
+//! write the agent's installation as this user:
 //! - The path is read at validation, not when the interpreter opened the
 //!   script, so a file swapped in before the interpreter's read and swapped
 //!   back before validation isn't seen.
@@ -49,6 +50,13 @@
 //!   the script's choice at run time (npm's `codex.js` resolves a platform
 //!   package, which npm may hoist), so there is no spawn-time fact to pin it
 //!   to, and a writer of the package's directory can replace it.
+//!
+//! Code the attested processes load from elsewhere, or through their
+//! environment, is not compared at all: the modules `codex.js` requires
+//! before it spawns the native, and a preload such as
+//! `NODE_OPTIONS=--require …` on the interpreter (which the argv comparison
+//! never sees) or `LD_PRELOAD` on a native pin. That route needs write
+//! access to the pane's launcher or environment, not to the installation.
 //!
 //! **The walk** ([`find`]) goes down from the PTY child, breadth first and
 //! bounded, and takes the first process named as an agent (its `argv[0]`'s
@@ -140,6 +148,9 @@ pub enum Refusal {
     LeftParent,
     /// The candidate exited.
     Exited,
+    /// The candidate's identity (its executable's path, its installation)
+    /// couldn't be read while it was still running: nothing to publish.
+    NoIdentity,
     /// The candidate couldn't be held by its pidfd for a reason other than
     /// its exit (the errno, when there was one: `EMFILE`, say). The
     /// validation can't be bracketed, so it isn't run.
@@ -182,6 +193,9 @@ impl Refusal {
             }
             Refusal::LeftParent => "candidate left its parent".to_string(),
             Refusal::Exited => "candidate exited".to_string(),
+            Refusal::NoIdentity => {
+                "no identity: the candidate's executable or installation can't be read".to_string()
+            }
             Refusal::Unheld(Some(errno)) => format!("candidate not held: errno {errno}"),
             Refusal::Unheld(None) => "candidate not held".to_string(),
             Refusal::ForeignOwner => "foreign owner".to_string(),
@@ -250,18 +264,20 @@ fn set(pins: &mut Pins, agent: ProbeAgent, pin: Option<Pin>) {
 /// holding an executable file of that name that isn't a deck telemetry shim.
 /// A relative path, or a relative or empty `PATH` entry reached before a
 /// match, pins nothing: what it names depends on a directory the pin
-/// doesn't read. The file is opened once, and both its identity and its
-/// shebang are read from that open file ([`pin_opened`]), so a file swapped
-/// in at the path between the two reads can't pair its interpreter with
-/// another file's identity.
+/// doesn't read. When the file can be read, it is opened once, and both its
+/// identity and its shebang are read from that open file ([`pin_opened`]),
+/// so a file swapped in at the path between the two reads can't pair its
+/// interpreter with another file's identity. A file this user can't read is
+/// pinned by its path, with a second `stat`, and hosts nothing.
 pub fn pin_program(program: &OsStr, path: Option<&OsStr>) -> Option<Pin> {
     use std::os::unix::fs::OpenOptionsExt;
     let found = locate(program, path, true)?;
     // `O_NONBLOCK`: a FIFO swapped in after `locate` can't stall the spawn
-    // in `open` (it changes nothing for a regular file).
+    // in `open`; `O_NOCTTY`: a terminal swapped in can't become the daemon's
+    // controlling terminal. Neither changes anything for a regular file.
     match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NONBLOCK)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
         .open(&found)
     {
         Ok(file) => pin_opened(found, file, path),
@@ -668,7 +684,9 @@ pub fn validate(
 /// read before the poll and after it must both be the one validation
 /// accepted, so a candidate that `exec`s anything between validation's read
 /// and the poll's is refused as a mismatch, never published with an
-/// executable nothing compared with the pin. Returns `read`'s value.
+/// executable nothing compared with the pin. A `read` that gives nothing
+/// for a candidate the poll still finds running is [`Refusal::NoIdentity`],
+/// not an exit. Returns `read`'s value.
 #[allow(clippy::too_many_arguments)]
 pub fn validate_held<T>(
     procs: &mut impl Procs,
@@ -682,12 +700,12 @@ pub fn validate_held<T>(
 ) -> Result<T, Refusal> {
     let accepted = validate(procs, candidate, agent, pin, uid, reject_uid)?;
     still_accepted(procs, candidate, agent, &accepted)?;
-    let out = read(accepted.exe).ok_or(Refusal::Exited)?;
+    let out = read(accepted.exe);
     if exited() {
         return Err(Refusal::Exited);
     }
     still_accepted(procs, candidate, agent, &accepted)?;
-    Ok(out)
+    out.ok_or(Refusal::NoIdentity)
 }
 
 /// `candidate` read again: still there, and still running the executable
@@ -1215,6 +1233,51 @@ mod tests {
                 "an exec {when}"
             );
         }
+    }
+
+    /// Scenario: The identity of a validated candidate can't be read (its executable's path or its installation directory gone, as an npm update can leave it). While the candidate still runs, that is refused as "no identity", never as an exit; when the poll finds it gone, it is "candidate exited". Either way nothing is published.
+    #[spec("inbox/probe/035")]
+    #[test]
+    fn probe_035_an_unreadable_identity_is_not_an_exit() {
+        let pin = native_pin();
+        let mut t = Table::default();
+        t.add(10, 1, SH, "dash", &["sh", "-c", "launcher"]).add(
+            12,
+            10,
+            NATIVE,
+            "codex",
+            &["/opt/agent/codex"],
+        );
+        let c = find(&mut t, 10, 100, &walk(&pin)).unwrap();
+        let mut unread = |gone: bool| {
+            let read = |_: FileId| None::<FileId>;
+            validate_held(
+                &mut t,
+                &c,
+                ProbeAgent::Codex,
+                &pin,
+                UID,
+                false,
+                read,
+                || gone,
+            )
+        };
+        assert_eq!(
+            unread(false),
+            Err(Refusal::NoIdentity),
+            "alive: no identity"
+        );
+        assert_eq!(
+            unread(true),
+            Err(Refusal::Exited),
+            "gone at the poll: an exit"
+        );
+        assert!(
+            Refusal::NoIdentity.reason().starts_with("no identity: "),
+            "{}",
+            Refusal::NoIdentity.reason()
+        );
+        assert_ne!(Refusal::NoIdentity.reason(), Refusal::Exited.reason());
     }
 
     /// Scenario: A lookalike (another inode) is refused as an executable mismatch, but a lookalike that also exited, left its parent or belongs to another user is refused for that first: lifecycle and owner refusals come before the mismatch.

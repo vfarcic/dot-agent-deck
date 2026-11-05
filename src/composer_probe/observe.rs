@@ -2379,7 +2379,7 @@ mod linux {
 
         /// The `e2e` build's read-only `binding-status`: the permission as
         /// settled so far and discovery's refusal, if any. Settles nothing.
-        #[cfg(feature = "e2e")]
+        #[cfg(any(test, feature = "e2e"))]
         pub fn binding_status_for_e2e(&self) -> (Permission, Option<String>) {
             let permission = self.permission();
             let reason = self
