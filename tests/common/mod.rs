@@ -13910,9 +13910,29 @@ impl AttachInput {
     }
 }
 
+/// How long dropping an [`AttachInput`] waits for the daemon to end the
+/// connection after this client ended its writes, before closing it outright.
+#[cfg(unix)]
+const ATTACH_CLOSE_GRACE: Duration = Duration::from_secs(2);
+
 #[cfg(unix)]
 impl Drop for AttachInput {
     fn drop(&mut self) {
+        // The write half first: the daemon reads every frame this client
+        // sent, then the end of the stream, and ends the connection itself.
+        // Shutting both halves at once failed the daemon's own writes with
+        // `EPIPE` (its attach reply comes before it reads any input), and it
+        // then dropped the connection unread: a drop right after a `write`
+        // lost that write (PRD #1666 part 3, Q35-22: S-22's refusal checks
+        // type into the pane and drop the attach before asserting the echo).
+        // The drain thread reads until the daemon closes, within the grace.
+        let _ = self.stream.shutdown(std::net::Shutdown::Write);
+        let deadline = std::time::Instant::now() + ATTACH_CLOSE_GRACE;
+        while self.drain.as_ref().is_some_and(|d| !d.is_finished())
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         self.stop.store(true, Ordering::Relaxed);
         // Shutting the socket down, not just dropping this half, is what
         // closes it: the drain thread holds a clone of the same socket.

@@ -52,6 +52,8 @@ pub mod arm;
 #[cfg(target_os = "linux")]
 pub mod attest;
 pub mod classifier;
+#[cfg(target_os = "linux")]
+pub mod discovery;
 pub mod epoch;
 pub mod framing;
 pub mod frontier;

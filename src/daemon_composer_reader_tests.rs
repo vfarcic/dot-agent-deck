@@ -2002,7 +2002,7 @@ async fn probe_014_a_binding_changed_between_the_spawn_and_the_permission_holds(
     }
 }
 
-/// Scenario: Start a direct Codex generation whose export directory the deck refused before its spawn (a `~/.codex/editor` its group can write to, Q35-27). Its observer is inert for that reason from its start, so no check is ever armed; the doorbell's hold for its touched box is `cannot_check`, where another inert generation's is `cannot_type`; and the registry hands the doorbell the refused directory and its cause for the card. A generation with no such refusal has none.
+/// Scenario: Start a direct Codex generation whose export directory the deck refused before its spawn (a `~/.codex/editor` its group can write to, Q35-27). Its observer is inert for that reason from its start, and a settlement afterwards leaves it so, with no discovery run and nothing refused, so no check is ever armed; the doorbell's hold for its touched box is `cannot_check`, where another inert generation's is `cannot_type`; and the registry hands the doorbell the refused directory and its cause for the card. A generation with no such refusal has none.
 #[spec("inbox/probe/091")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn probe_091_a_refused_codex_export_directory_holds_its_generation_with_the_detail() {
@@ -2073,6 +2073,16 @@ async fn probe_091_a_refused_codex_export_directory_holds_its_generation_with_th
         "inert from its start"
     );
     assert_eq!(observer.export_hold(), Some(&detail));
+    // Q35-22's discovery settles only a pending generation: a settlement
+    // now neither moves the permission nor runs discovery, which, with no
+    // pin taken for this generation, would refuse it `executable not
+    // resolved`.
+    observer.settle();
+    assert_eq!(
+        observer.binding_status_for_e2e(),
+        (Permission::Inert(InertCause::ExportDirectory), None),
+        "a settlement leaves the export hold, and discovery never ran"
+    );
     assert_eq!(
         registry.doorbell_unchecked_hold(PANE, &id, Some(observer.permission())),
         WakeHold::CannotCheck

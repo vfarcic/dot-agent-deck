@@ -4044,6 +4044,11 @@ pub struct AttachResponse {
     #[cfg(feature = "e2e")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub composer_probe: Option<ComposerProbeStatus>,
+    /// PRD #1666 part 3 (Q35-22): the `e2e` build's
+    /// [`AttachRequest::E2eComposerControl`] answer to `binding-status`.
+    #[cfg(feature = "e2e")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer_binding: Option<ComposerBindingStatus>,
     /// PRD #1666 part 3 (Q105b.2): the `e2e` build's answer to the writer
     /// controls, `writer-hold`, `writer-go`, `writer-fault:…` and
     /// `writer-status`.
@@ -4885,6 +4890,19 @@ pub struct ComposerProbeStatus {
     pub reason: Option<String>,
 }
 
+/// PRD #1666 part 3 (Q35-22): a generation's binding, the `e2e` build's
+/// read-only `binding-status` answer: its permission as settled so far
+/// (`pending`, `armable` or `inert`) and why discovery refused its
+/// candidate, if it did. Reading it settles nothing.
+#[cfg(feature = "e2e")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerBindingStatus {
+    pub generation: u64,
+    pub permission: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 /// PRD #1666 part 3 (Q35-20a): a drain-frontier request, the `e2e` build's
 /// `frontier-enqueue` and `frontier-status` answer. `state` is `pending`,
 /// `taken` or `missing`; `offset` is set when it is `taken`.
@@ -4943,7 +4961,9 @@ async fn e2e_composer_control(
     {
         return e2e_composer_q105b_control(registry, pane_id, generation, operation);
     }
-    if matches!(operation, "epoch" | "observer-status") || operation.starts_with("probe-request") {
+    if matches!(operation, "epoch" | "observer-status" | "binding-status")
+        || operation.starts_with("probe-request")
+    {
         return e2e_composer_probe_control(registry, pane_id, generation, operation).await;
     }
     if !matches!(operation, "fence" | "release" | "fence-status") {
@@ -5200,6 +5220,30 @@ async fn e2e_composer_probe_control(
             }
         }
         "observer-status" => composer_observer_answer(registry, &agent),
+        #[cfg(not(target_os = "linux"))]
+        "binding-status" => AttachResponse::err("e2e-composer-control: no observer on that pane"),
+        #[cfg(target_os = "linux")]
+        "binding-status" => match registry.composer_observer(&agent) {
+            Some(observer) => {
+                use crate::composer_probe::Permission;
+                let (permission, reason) = observer.binding_status_for_e2e();
+                AttachResponse {
+                    ok: true,
+                    composer_binding: Some(ComposerBindingStatus {
+                        generation,
+                        permission: match permission {
+                            Permission::Pending => "pending",
+                            Permission::Armable => "armable",
+                            Permission::Inert(_) => "inert",
+                        }
+                        .to_string(),
+                        reason,
+                    }),
+                    ..Default::default()
+                }
+            }
+            None => AttachResponse::err("e2e-composer-control: no observer on that pane"),
+        },
         _ => {
             use crate::agent_pty::{ProbeAsk, ProbeOutcome};
             let ask = match operation {

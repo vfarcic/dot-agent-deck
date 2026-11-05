@@ -82,12 +82,15 @@
 //!
 //! **Permission** (plan §1.2, Q84). A generation is armable once its header
 //! latched an exact release with a verified `editor_probe` record and `A`
-//! is bound; then `gen-G` is written. `A` is bound only for a direct Claude,
-//! from the deck's own launch record ([`bound_agent`]): the PTY child the
-//! deck spawned, or the one child of the deck's own `sh -c`, running the
-//! agent's executable with the argv the launch gives it. A user's launcher
-//! script binds nothing (Q35-22 binds below a launcher; a direct Codex runs
-//! below the deck's wrapper, so its `A` isn't the PTY child either). One
+//! is bound; then `gen-G` is written. A direct Claude's `A` comes from the
+//! deck's own launch record ([`bound_agent`]): the PTY child the deck
+//! spawned, or the one child of the deck's own `sh -c`, running the agent's
+//! executable with the argv the launch gives it. Every other installed
+//! class's `A` (a direct Codex below the deck's wrapper, a launcher's agent,
+//! an undeclared wrapper's once its own hooks named its agent) is the native
+//! agent the shared discovery finds below the PTY child and validates
+//! against the executable pinned at spawn ([`super::discovery`], Q35-22); an
+//! undeclared wrapper's `kind-G` is written with its `gen-G`. One
 //! settler at a time ([`SettleClaim`]) computes it, and only a settlement
 //! that moves it out of `Pending` publishes `A` with it, so `gen-G` is
 //! written once. Nothing in production publishes a liability: installation
@@ -696,8 +699,8 @@ fn is_shell(program: &std::ffi::OsStr) -> bool {
 /// one child is `A` only when the PTY child is still the deck's shell, its
 /// executable and argv the launch's, and that child runs the program with
 /// the argv. Anything else, a user's launcher script among it (its process
-/// runs an interpreter, not the program's own executable), binds nothing:
-/// launchers are Q35-22's.
+/// runs an interpreter, not the program's own executable), binds nothing
+/// here: a launcher's `A` is discovered below it ([`super::discovery`]).
 pub fn bound_agent(
     launch: &[std::ffi::OsString],
     pty: &ProcFacts,
@@ -1313,6 +1316,7 @@ mod linux {
         self, Agent, Kernel, LinuxKernel, Pinned, Sighting, attribute, read_export,
     };
     use crate::composer_probe::classifier::{FileId, Identity, ProcView};
+    use crate::composer_probe::discovery::{self, Candidate, LinuxProcs, Pins, Refusal};
     use crate::composer_probe::epoch::GenerationInput;
     use crate::composer_probe::install::{Installation, PaneClass, ProbeAgent};
     use crate::composer_probe::instance::{GenerationFiles, InstanceReader, Kind};
@@ -1519,6 +1523,21 @@ mod linux {
         /// [`InertCause::ExportDirectory`] from its start, and the card
         /// names the directory and what to do.
         export_hold: Option<crate::inbox_display::HoldDetail>,
+        /// The agent executables pinned at spawn (Q35-22, Q102b), which
+        /// discovery compares every candidate with.
+        pins: Pins,
+        /// An undeclared wrapper's agent, as its own hooks first reported
+        /// it ([`Self::learn`]): a claim, which only selects the pin
+        /// discovery expects.
+        learned: std::sync::OnceLock<AgentType>,
+        /// That agent's kind once the generation settled `Armable` with it,
+        /// `kind-G` written: what the attestation then takes it to be.
+        learned_kind: std::sync::OnceLock<ProbeAgent>,
+        /// Why discovery refused this generation's candidate, once it did.
+        refusal: Mutex<Option<Refusal>>,
+        /// Whether the `e2e` build's discovery barrier was met once.
+        #[cfg(feature = "e2e")]
+        gated: std::sync::atomic::AtomicBool,
         /// A test's stand-in for the bound agent's environment
         /// ([`Installation::set_bound_environ_for_test`]).
         #[cfg(test)]
@@ -2048,6 +2067,91 @@ mod linux {
         })
     }
 
+    /// `A`'s identity file for `pid` (started at `start`, running `exe`):
+    /// its install root is its executable's directory, read now. With
+    /// `strip_deleted`, a deleted executable's basename is its name without
+    /// the ` (deleted)` Linux appends.
+    fn identity_of(pid: u32, start: u64, exe: FileId, strip_deleted: bool) -> Option<Identity> {
+        let link = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+        let root = link.parent()?.to_path_buf();
+        let root_meta = std::fs::metadata(&root).ok()?;
+        let mut basename = link.file_name()?.to_os_string();
+        if strip_deleted && let Some(name) = basename.as_bytes().strip_suffix(b" (deleted)") {
+            basename = OsStr::from_bytes(name).to_os_string();
+        }
+        Some(Identity {
+            pid,
+            start,
+            exe,
+            install_root: root,
+            install_root_id: FileId {
+                dev: root_meta.dev(),
+                ino: root_meta.ino(),
+            },
+            basename,
+        })
+    }
+
+    /// The `e2e` build's forced foreign-owner refusal
+    /// (`DOT_AGENT_DECK_E2E_DISCOVERY_REJECT_UID=1`, S-22's assumed
+    /// interface): it refuses at discovery's owner check and grants nothing.
+    /// A release build has none.
+    fn reject_uid_for_e2e() -> bool {
+        #[cfg(feature = "e2e")]
+        {
+            std::env::var_os("DOT_AGENT_DECK_E2E_DISCOVERY_REJECT_UID").is_some_and(|v| v == "1")
+        }
+        #[cfg(not(feature = "e2e"))]
+        {
+            false
+        }
+    }
+
+    /// How long the `e2e` build's discovery barrier waits for its release.
+    #[cfg(feature = "e2e")]
+    const DISCOVERY_GATE_WAIT: Duration = Duration::from_secs(15);
+
+    /// What the `e2e` build's discovery barrier did.
+    #[cfg(feature = "e2e")]
+    enum DiscoveryGate {
+        /// No barrier, or already met by this generation.
+        Off,
+        /// Released or expired: validation runs, and its completion is
+        /// written under this root.
+        Released(std::path::PathBuf),
+        /// The generation retired while it waited; its completion is written.
+        Retired,
+    }
+
+    /// The barrier's directory: `DOT_AGENT_DECK_E2E_DISCOVERY_GATE`, one
+    /// path component, under the daemon's `HOME`, with `phase` reading
+    /// `candidate`. Nothing outside that `HOME` is written.
+    #[cfg(feature = "e2e")]
+    fn discovery_gate_root() -> Option<std::path::PathBuf> {
+        let name = std::env::var_os("DOT_AGENT_DECK_E2E_DISCOVERY_GATE")?;
+        let one = std::path::Path::new(&name);
+        if one.components().count() != 1
+            || !matches!(
+                one.components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+        {
+            return None;
+        }
+        let root = std::path::Path::new(&std::env::var_os("HOME")?).join(one);
+        (std::fs::read_to_string(root.join("phase")).ok().as_deref() == Some("candidate"))
+            .then_some(root)
+    }
+
+    /// A barrier marker, written whole: to a temporary name, then renamed.
+    #[cfg(feature = "e2e")]
+    fn write_gate_marker(root: &std::path::Path, name: &str, value: &serde_json::Value) {
+        let temporary = root.join(format!(".{name}.tmp"));
+        if std::fs::write(&temporary, value.to_string()).is_ok() {
+            let _ = std::fs::rename(&temporary, root.join(name));
+        }
+    }
+
     /// A process's children, from every thread's `children` file.
     fn children(pid: u32) -> Vec<u32> {
         let mut found = Vec::new();
@@ -2101,6 +2205,7 @@ mod linux {
             let launch = installation.launch().to_vec();
             let keymap_baseline = installation.take_keymap_baseline();
             let export_hold = installation.take_export_hold();
+            let pins = installation.take_pins();
             #[cfg(test)]
             let bound_environ = installation.take_bound_environ_for_test();
             if !spawned
@@ -2159,6 +2264,12 @@ mod linux {
                 keymap: std::sync::OnceLock::new(),
                 keymap_baseline,
                 export_hold,
+                pins,
+                learned: std::sync::OnceLock::new(),
+                learned_kind: std::sync::OnceLock::new(),
+                refusal: Mutex::new(None),
+                #[cfg(feature = "e2e")]
+                gated: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(test)]
                 bound_environ,
                 #[cfg(test)]
@@ -2215,6 +2326,68 @@ mod linux {
             self.stopped
                 .store(true, std::sync::atomic::Ordering::Release);
             self.bell.ring();
+        }
+
+        /// The generation's agent: its class's, else the one its own hooks
+        /// first reported ([`Self::learn`]).
+        fn agent(&self) -> Option<AgentType> {
+            self.agent.clone().or_else(|| self.learned.get().cloned())
+        }
+
+        /// What the generation is to its helper's attestation: its class's
+        /// kind, or an undeclared wrapper's learned kind once `kind-G` holds
+        /// it.
+        fn kind(&self) -> Kind {
+            match (self.kind, self.learned_kind.get()) {
+                (Kind::Learned, Some(kind)) => Kind::Agent(*kind),
+                (kind, _) => kind,
+            }
+        }
+
+        /// Q35-22: an undeclared wrapper's agent, as its own hooks first
+        /// reported it (`AgentPtyRegistry::set_agent_type_for_generation`).
+        /// A claim, not authority: it selects which pin discovery expects,
+        /// and the segments that wait on that agent's return path are
+        /// attached for it, so a check can open once the generation is
+        /// `Armable`. Once per generation, and only for one whose class
+        /// names no agent. Whether segments were attached: the caller then
+        /// starts their driver.
+        pub fn learn(&self, agent: &AgentType) -> bool {
+            let segments = match ProbeAgent::of(agent) {
+                Some(ProbeAgent::Claude) => crate::composer_probe::segments::Agent::Claude,
+                Some(ProbeAgent::Codex) => crate::composer_probe::segments::Agent::Codex,
+                None => return false,
+            };
+            if self.agent.is_some() || self.learned.set(agent.clone()).is_err() {
+                return false;
+            }
+            let input = self.input();
+            let attached = input.attach_segments(self.generation, segments);
+            if attached {
+                let wake = Arc::clone(&self.bell);
+                input.recheck_keymap_at_settlement(Arc::new(move || wake.ring()));
+            }
+            tracing::debug!(
+                target: "composer_probe",
+                agent_id = %self.agent_id,
+                ?agent,
+                "editor probe learned the wrapper's agent"
+            );
+            self.bell.ring();
+            attached
+        }
+
+        /// The `e2e` build's read-only `binding-status`: the permission as
+        /// settled so far and discovery's refusal, if any. Settles nothing.
+        #[cfg(any(test, feature = "e2e"))]
+        pub fn binding_status_for_e2e(&self) -> (Permission, Option<String>) {
+            let permission = self.permission();
+            let reason = self
+                .refusal
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .map(|r| r.reason());
+            (permission, reason)
         }
 
         /// The generation's input, its records attached.
@@ -2528,7 +2701,7 @@ mod linux {
             let env = |name: &str| self.env_value(name);
             let agent = Agent {
                 identity: identity.as_ref(),
-                kind: self.kind,
+                kind: self.kind(),
                 env: &env,
                 // SAFETY: `getuid(2)` has no failure mode.
                 uid: unsafe { libc::getuid() },
@@ -2699,25 +2872,32 @@ mod linux {
             result
         }
 
+        /// `A` for generation's agent `agent`: a direct Claude's from the
+        /// deck's own launch record ([`Self::bind_direct`]); every other
+        /// installed class's through the shared discovery below the PTY
+        /// child ([`Self::discover`], Q35-22). `Err(None)` while there is
+        /// nothing to bind yet; `Err(Some(refusal))` when this generation's
+        /// `A` can never be bound.
+        fn bind(&self, agent: &AgentType) -> Result<Identity, Option<Refusal>> {
+            match self.class {
+                PaneClass::Direct(ProbeAgent::Claude) => self
+                    .bind_direct()
+                    .map_err(|exited| exited.then_some(Refusal::Exited)),
+                PaneClass::Direct(_) | PaneClass::Launcher(_) | PaneClass::Wrapper => {
+                    self.discover(agent)
+                }
+                PaneClass::Unprobed | PaneClass::Shell => Err(None),
+            }
+        }
+
         /// `A` for a direct Claude, from the deck's own launch record
         /// ([`bound_agent`], Q84): the PTY child, pinned by the pid and start
         /// ticks the deck spawned, or its one child when the deck's shell
         /// runs it; pinned, its facts read again after the pin and its
         /// family read from its executable. `Err(true)` when it, or the PTY
         /// child, exited.
-        fn bind(&self) -> Result<Identity, bool> {
-            let (pty_pid, pty_start) = match (self.class, self.child) {
-                (PaneClass::Direct(ProbeAgent::Claude), Some(child)) => child,
-                // Q89: the `e2e` build's assumption may bind a direct native
-                // Codex stand-in as `A`; production binds Codex below the
-                // deck's wrapper or a launcher only at Q35-22. A release
-                // build has no such arm at all (the audit's U3-9a).
-                #[cfg(feature = "e2e")]
-                (PaneClass::Direct(ProbeAgent::Codex), Some(child)) if !self.assumed.is_empty() => {
-                    child
-                }
-                _ => return Err(false),
-            };
+        fn bind_direct(&self) -> Result<Identity, bool> {
+            let (pty_pid, pty_start) = self.child.ok_or(false)?;
             let mut kernel = LinuxKernel::default();
             let pty_pin = attest::pin(
                 &mut kernel,
@@ -2751,17 +2931,6 @@ mod linux {
                     (pid, kernel.stat(pid).map_err(|_| false)?.start, facts)
                 }
             };
-            // Q89 (`e2e` only, compiled out of a release build): a direct
-            // Codex runs below the deck's own `wrap --agent codex --
-            // <program> <args>`; its `A` is the wrapper's one child running
-            // that program with those args.
-            #[cfg(feature = "e2e")]
-            let (pid, start, facts) = if matches!(self.class, PaneClass::Direct(ProbeAgent::Codex))
-            {
-                self.below_deck_wrapper(&mut kernel, pid, start, facts)?
-            } else {
-                (pid, start, facts)
-            };
             let pinned = attest::pin(
                 &mut kernel,
                 Sighting::Pid {
@@ -2774,20 +2943,7 @@ mod linux {
             if proc_facts(pid).as_ref() != Some(&facts) {
                 return Err(false);
             }
-            let exe = std::fs::read_link(format!("/proc/{pid}/exe")).map_err(|_| false)?;
-            let root = exe.parent().ok_or(false)?.to_path_buf();
-            let root_meta = std::fs::metadata(&root).map_err(|_| false)?;
-            let identity = Identity {
-                pid,
-                start,
-                exe: facts.exe,
-                install_root: root,
-                install_root_id: FileId {
-                    dev: root_meta.dev(),
-                    ino: root_meta.ino(),
-                },
-                basename: exe.file_name().ok_or(false)?.to_os_string(),
-            };
+            let identity = identity_of(pid, start, facts.exe, false).ok_or(false)?;
             // Read again after the pin is polled: the reads are `A`'s.
             if kernel.exited(pinned.pidfd()).unwrap_or(true) {
                 return Err(true);
@@ -2798,55 +2954,189 @@ mod linux {
             Ok(identity)
         }
 
-        /// Q89 (`e2e` only): when `pid` runs this daemon's own executable as
-        /// `wrap --agent codex -- <program> <args>`, the wrapper's one child
-        /// running `<program>`'s executable with exactly `<program> <args>`;
-        /// otherwise `pid` itself. Anything else below a wrapper binds
-        /// nothing (`Err(false)`): launchers are Q35-22's.
-        #[cfg(feature = "e2e")]
-        fn below_deck_wrapper(
+        /// Q35-22: `A` discovered below the PTY child ([`discovery`], Q31's
+        /// D1 standard, Q102b's pin at spawn), for `agent`, which a declared
+        /// pane's class names and an undeclared wrapper's hooks claimed: the
+        /// first process below the PTY child named as an agent, validated
+        /// against `agent`'s pin, held by its pidfd from before the
+        /// validation's reads and read again after them. A name that
+        /// resolved nothing at spawn is refused before any walk. The `e2e`
+        /// build's barrier ([`Self::discovery_gate`]) sits between finding
+        /// the candidate and validating it.
+        fn discover(&self, agent: &AgentType) -> Result<Identity, Option<Refusal>> {
+            let Some(expected) = ProbeAgent::of(agent) else {
+                return Err(None);
+            };
+            let Some(pin) = self.pins.of(expected) else {
+                return Err(Some(Refusal::NotResolved(expected)));
+            };
+            let Some((pty_pid, pty_start)) = self.child else {
+                return Err(None);
+            };
+            let mut kernel = LinuxKernel::default();
+            let pty_pin = attest::pin(
+                &mut kernel,
+                Sighting::Pid {
+                    pid: pty_pid,
+                    start: Some(pty_start),
+                },
+            )
+            .map_err(|why| (why == attest::Unpinned::Exited).then_some(Refusal::PaneExited))?;
+            let own_exe = std::fs::metadata("/proc/self/exe").ok().map(|m| FileId {
+                dev: m.dev(),
+                ino: m.ino(),
+            });
+            let walk = discovery::Walk { own_exe, pin };
+            let Some(candidate) = discovery::find(&mut LinuxProcs, pty_pid, pty_start, &walk)
+            else {
+                if kernel.exited(pty_pin.pidfd()).unwrap_or(true) {
+                    return Err(Some(Refusal::PaneExited));
+                }
+                return Err(None);
+            };
+            #[cfg(feature = "e2e")]
+            let gate = self.discovery_gate(&candidate);
+            #[cfg(feature = "e2e")]
+            if let DiscoveryGate::Retired = gate {
+                return Err(Some(Refusal::Retired));
+            }
+            let validated = if self.retired() {
+                Err(Refusal::Retired)
+            } else {
+                self.validate_candidate(&mut kernel, &candidate, expected, pin)
+            };
+            // The refusal is recorded before the barrier says the
+            // validation finished, so what it published is what it reports.
+            if let Err(refusal) = &validated {
+                self.refuse(*refusal);
+            }
+            #[cfg(feature = "e2e")]
+            if let DiscoveryGate::Released(root) = gate {
+                write_gate_marker(
+                    &root,
+                    &format!("{}.completed", self.generation),
+                    &serde_json::json!({
+                        "generation": self.generation,
+                        "pid": candidate.pid,
+                        "reason": validated.as_ref().err().map(Refusal::reason),
+                    }),
+                );
+            }
+            validated.map_err(Some)
+        }
+
+        /// [`discovery::validate_held`] for `candidate`, held by its pidfd
+        /// from before the reads: its identity when it is `A`, built from
+        /// the executable validation accepted, which the reads before and
+        /// after the poll must both still see.
+        fn validate_candidate(
             &self,
             kernel: &mut LinuxKernel,
-            pid: u32,
-            start: u64,
-            facts: ProcFacts,
-        ) -> Result<(u32, u64, ProcFacts), bool> {
-            let own = std::env::current_exe()
-                .ok()
-                .and_then(|exe| std::fs::metadata(exe).ok())
-                .map(|m| FileId {
-                    dev: m.dev(),
-                    ino: m.ino(),
-                });
-            let argv: Vec<&OsStr> = facts.argv.iter().map(OsString::as_os_str).collect();
-            let wrapped = match argv.as_slice() {
-                [_, wrap, flag, agent, dashes, rest @ ..]
-                    if *wrap == "wrap"
-                        && *flag == "--agent"
-                        && *agent == "codex"
-                        && *dashes == "--"
-                        && !rest.is_empty()
-                        && own == Some(facts.exe) =>
-                {
-                    rest.iter().map(|a| a.to_os_string()).collect::<Vec<_>>()
+            candidate: &Candidate,
+            expected: ProbeAgent,
+            pin: &discovery::Pin,
+        ) -> Result<Identity, Refusal> {
+            let pinned = attest::pin(
+                kernel,
+                Sighting::Pid {
+                    pid: candidate.pid,
+                    start: Some(candidate.start),
+                },
+            )
+            .map_err(Refusal::unpinned)?;
+            // SAFETY: `getuid(2)` has no failure mode.
+            let uid = unsafe { libc::getuid() };
+            discovery::validate_held(
+                &mut LinuxProcs,
+                candidate,
+                expected,
+                pin,
+                uid,
+                reject_uid_for_e2e(),
+                |exe| identity_of(candidate.pid, candidate.start, exe, true),
+                // Polled after the reads: they were `A`'s.
+                || kernel.exited(pinned.pidfd()).unwrap_or(true),
+            )
+        }
+
+        /// Whether the generation retired or its observer was stopped.
+        fn retired(&self) -> bool {
+            self.stopped.load(std::sync::atomic::Ordering::Acquire)
+                || self.lock().seam.input().retired()
+        }
+
+        /// Keep the binding's first refusal, and log it: a direct Claude's
+        /// comes from its launch record, which no discovery read.
+        fn refuse(&self, refusal: Refusal) {
+            let mut kept = self.refusal.lock().unwrap_or_else(|e| e.into_inner());
+            if kept.is_none() {
+                *kept = Some(refusal);
+                drop(kept);
+                if self.class == PaneClass::Direct(ProbeAgent::Claude) {
+                    tracing::info!(
+                        target: "composer_probe",
+                        agent_id = %self.agent_id,
+                        reason = %refusal.reason(),
+                        "editor probe's launch-record agent can't be bound"
+                    );
+                } else {
+                    tracing::info!(
+                        target: "composer_probe",
+                        agent_id = %self.agent_id,
+                        reason = %refusal.reason(),
+                        "editor probe discovery refused its candidate"
+                    );
                 }
-                _ => return Ok((pid, start, facts)),
-            };
-            let path = self.env_value("PATH");
-            let program = resolve_program(&wrapped[0], path.as_deref()).ok_or(false)?;
-            let below: Vec<(u32, ProcFacts)> = children(pid)
-                .into_iter()
-                .filter(|c| kernel.stat(*c).is_ok_and(|stat| stat.ppid == pid))
-                .filter_map(|c| Some((c, proc_facts(c)?)))
-                .collect();
-            let [(child, child_facts)] = below.as_slice() else {
-                return Err(false);
-            };
-            if child_facts.exe != program || child_facts.argv != wrapped {
-                return Err(false);
             }
-            let child_start = kernel.stat(*child).map_err(|_| false)?.start;
-            Ok((*child, child_start, child_facts.clone()))
+        }
+
+        /// The `e2e` build's candidate barrier (S-22's assumed interface):
+        /// with `DOT_AGENT_DECK_E2E_DISCOVERY_GATE` naming one path component
+        /// under the daemon's `HOME` and `<root>/phase` reading `candidate`,
+        /// the first candidate this generation's discovery finds is reported
+        /// in `<G>.arrived` before it is validated, and validation waits up
+        /// to [`DISCOVERY_GATE_WAIT`] for `<G>.release` (`<G>.timed-out` if
+        /// it never comes, then validates as usual). A retirement meanwhile
+        /// ends the wait at once with `<G>.completed` naming it, and
+        /// discovery publishes nothing. It grants nothing: validation runs
+        /// whatever the barrier did.
+        #[cfg(feature = "e2e")]
+        fn discovery_gate(&self, candidate: &Candidate) -> DiscoveryGate {
+            if self.gated.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                return DiscoveryGate::Off;
+            }
+            let Some(root) = discovery_gate_root() else {
+                return DiscoveryGate::Off;
+            };
+            let g = self.generation;
+            write_gate_marker(
+                &root,
+                &format!("{g}.arrived"),
+                &serde_json::json!({"generation": g, "pid": candidate.pid}),
+            );
+            let until = Instant::now() + DISCOVERY_GATE_WAIT;
+            loop {
+                if self.retired() {
+                    self.refuse(Refusal::Retired);
+                    write_gate_marker(
+                        &root,
+                        &format!("{g}.completed"),
+                        &serde_json::json!({
+                            "generation": g,
+                            "reason": Refusal::Retired.reason(),
+                        }),
+                    );
+                    return DiscoveryGate::Retired;
+                }
+                if root.join(format!("{g}.release")).exists() {
+                    return DiscoveryGate::Released(root);
+                }
+                if Instant::now() >= until {
+                    write_gate_marker(&root, &format!("{g}.timed-out"), &serde_json::json!({}));
+                    return DiscoveryGate::Released(root);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
 
         /// Plan §1.2's permission, once the header latched: with the e2e
@@ -2870,15 +3160,19 @@ mod linux {
                 return;
             }
             // A wrapper's agent isn't learned yet (Q35-22): pending.
-            let Some(agent) = self.agent.as_ref() else {
+            let Some(agent) = self.agent() else {
                 return;
             };
+            let agent = &agent;
             let latch = (self.latch)(agent);
             let header = (latch != LatchedRelease::Unseen).then_some(latch);
-            let (binding, identity) = match self.bind() {
+            let (binding, identity) = match self.bind(agent) {
                 Ok(identity) => (Binding::Bound, Some(identity)),
-                Err(true) => (Binding::Never, None),
-                Err(false) => (Binding::Waiting, None),
+                Err(Some(refusal)) => {
+                    self.refuse(refusal);
+                    (Binding::Never, None)
+                }
+                Err(None) => (Binding::Waiting, None),
             };
             let records = crate::doorbell_activation::with_assumed_editor_probes(
                 crate::doorbell_activation::RELEASE_RECORDS.to_vec(),
@@ -2886,6 +3180,24 @@ mod linux {
             );
             let mut permission =
                 crate::composer_probe::permission(&records, agent, header.as_ref(), binding);
+            // An undeclared wrapper's kind goes in `kind-G` before `gen-G`
+            // names its `A` (Q35-22: `kind = learned` to its agent's kind).
+            let learned_kind = (self.kind == Kind::Learned)
+                .then(|| ProbeAgent::of(agent))
+                .flatten();
+            if permission == Permission::Armable
+                && identity.is_some()
+                && let Some(kind) = learned_kind
+                && let Err(cause) = self.reader.write_kind(&self.name(), kind)
+            {
+                tracing::warn!(
+                    target: "composer_probe",
+                    agent_id = %self.agent_id,
+                    ?cause,
+                    "editor probe kind not written; the generation stays inert"
+                );
+                permission = Permission::Inert(InertCause::Unbound);
+            }
             if permission == Permission::Armable
                 && let Some(identity) = &identity
                 && let Err(cause) = self.reader.write_identity(&self.name(), identity)
@@ -2941,6 +3253,9 @@ mod linux {
                 let won = inner.seam.set_permission(permission);
                 if won && permission == Permission::Armable {
                     inner.watch.agent = identity;
+                    if let Some(kind) = learned_kind {
+                        let _ = self.learned_kind.set(kind);
+                    }
                 }
                 won
             };

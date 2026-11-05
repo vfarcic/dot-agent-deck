@@ -114,8 +114,10 @@ pub enum PaneClass {
 pub const SHELLS: &[&str] = &["bash", "zsh", "fish", "sh", "dash", "nu", "pwsh"];
 
 /// The classes installation has rolled out to. The Claude activation
-/// (Q35-28) added `Direct(Claude)` only; `Launcher(Claude)` and `Wrapper`
-/// come with Q35-22, and Codex's classes with Q35-29
+/// (Q35-28) added `Direct(Claude)` only. Q35-22 gave every other class its
+/// binding (the shared discovery, [`super::discovery`]) without rolling it
+/// out: `Launcher(Claude)` and `Wrapper` wait for their own rollout, and
+/// Codex's classes for Q35-29
 /// (`docs/develop/doorbell-admission.md`). Installation is Linux-only
 /// whatever this holds: [`at_spawn`] returns [`NotInstalled::Platform`]
 /// on any other host.
@@ -386,6 +388,10 @@ pub struct Installation {
     /// Q35-27: why Codex's export directory was refused before the spawn
     /// ([`prepare_codex_export`]), as the card shows it.
     export_hold: Option<crate::inbox_display::HoldDetail>,
+    /// The agent executables pinned at spawn (Q35-22, Q102b): what the
+    /// observer's discovery compares a candidate with.
+    #[cfg(target_os = "linux")]
+    pins: super::discovery::Pins,
     /// A test's stand-in for the bound agent's `/proc/<pid>/environ`
     /// (reva21 U1-1): the test binds `A` to its own process, whose
     /// environment is the test runner's, not the one the deck's spawn gave.
@@ -476,9 +482,48 @@ impl Installation {
         };
         let here = std::env::current_dir().unwrap_or_default();
         let cwd = spawn_start_dir(cwd, lookup, &here);
+        // Q35-22 (loc10's window): the daemon's own startup trust write may
+        // still be writing a Codex source; the baseline is read after it,
+        // since a write after the baseline refuses every check of the
+        // generation. Bounded: past it the baseline is read anyway.
+        if codex && !crate::codex_hooks_manage::await_startup_trust() {
+            tracing::info!(
+                target: "composer_probe",
+                "Codex's startup trust write outlasted its wait; the key-binding baseline is read now"
+            );
+        }
         self.keymap_baseline = Some(super::keymap::KeymapBaseline::at_spawn(
             claude, codex, lookup, &args, &cwd,
         ));
+    }
+
+    /// Pin, now, before the spawn (Q35-22, Q102b), the agent executables the
+    /// generation's class may run, from the `PATH` its PTY child gets: the
+    /// spawn's own over the daemon's ([`super::discovery::pin_at_spawn`]).
+    /// `command` is the command the pane will run. File I/O: call it off
+    /// the executor, with no lock held.
+    #[cfg(target_os = "linux")]
+    pub fn pin_natives(&mut self, command: Option<&str>, env: &[(String, String)]) {
+        let path = env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| OsString::from(v))
+            .or_else(|| std::env::var_os("PATH"));
+        self.pins = super::discovery::pin_at_spawn(self.class, command, path.as_deref());
+    }
+
+    /// The pins taken at spawn, taken by the observer.
+    #[cfg(target_os = "linux")]
+    pub fn take_pins(&mut self) -> super::discovery::Pins {
+        std::mem::take(&mut self.pins)
+    }
+
+    /// Set the pins the spawn path takes ([`Self::pin_natives`]), for a test
+    /// that builds an installation without spawning.
+    #[cfg(all(test, target_os = "linux"))]
+    pub fn set_pins(&mut self, pins: super::discovery::Pins) {
+        self.pins = pins;
     }
 
     /// Set the baseline the spawn path reads ([`Self::read_keymap_baseline`]),
@@ -647,6 +692,7 @@ pub fn install(
         launch: Vec::new(),
         keymap_baseline: None,
         export_hold: None,
+        pins: Default::default(),
         #[cfg(all(test, target_os = "linux"))]
         bound_environ: None,
     })
