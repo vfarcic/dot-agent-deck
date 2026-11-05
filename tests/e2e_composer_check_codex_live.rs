@@ -7,23 +7,17 @@
 //! Each test runs real interactive Codex in an installed `Direct(Codex)`
 //! pane (`support/codex_installed.rs`): the production doorbell tick decides
 //! when to check, writes the check's byte, and Codex runs the deck's helper
-//! as its editor. Until the Codex activation these run with the e2e
-//! editor-probe assumption, the seam, which `codex_installed::seam` drops by
-//! itself once the build activates Codex; every run prints which it used.
+//! as its editor. They run on the build's own Codex activation, with no e2e
+//! assumption, each in a fresh `CODEX_HOME` (Codex's first start there).
+//!
+//! **Codex is checked only over its placeholder, by design**: admission's
+//! surface conjunct for Codex is `placeholder_empty`, so a box showing text
+//! is refused and never checked. So `041`, unlike Claude's `040` (a check
+//! over a visible `BASE`), starts each trial from a box the person typed
+//! into and emptied, which Codex draws with its placeholder, and `043`
+//! holds a visible draft with nothing typed, then checks the emptied box.
 //!
 //! `041` needs no model turn (nothing is submitted); `043` delivers tasks.
-//!
-//! **Status (cxl2, 2026-11-05): written, not yet green.** Both are blocked
-//! in `src/` with the seam on: a wrapped Codex's checks are refused
-//! `Keymap(Changed)` for the generation's life, because the observer
-//! compares the bound native's argv, which carries the wrapper's #2002
-//! `-c shell_environment_policy.set={}` pair, with a spawn baseline that
-//! does not. Past that (a local, uncommitted bypass), `043`'s check of the
-//! emptied box ended `Uncertain` (armed, not consumed), which points at the
-//! stand-in editor probe the seam substitutes. `041` also needs its premise
-//! redesigned: Codex's box is checked only while Codex draws its placeholder
-//! (`surface_shows_composer`), so a check never starts over a visible
-//! `BASE`; the trials as written (from `040`) cannot reach their pause.
 #[path = "support/codex_installed.rs"]
 mod codex_installed;
 mod common;
@@ -171,10 +165,12 @@ fn unhex(hex: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// Each trial in a fresh installed pane: type `BASE`, queue a task so the
+/// Each trial in a fresh installed pane: type `BASE` and delete it, so the
+/// box is touched and Codex draws its placeholder again, queue a task so the
 /// deck checks the box, and while that check's helper is held at its pause
 /// type `EARLY`, Ctrl+G and `LATE` 250 ms apart. Every trial must end with
-/// the composer holding `BASEEARLYLATE`.
+/// the composer holding `EARLYLATE` and the task undelivered: the check read
+/// a box the person has typed into since, so it rings nothing.
 ///
 /// One trial per pane: the person's own editor, which their Ctrl+G opens,
 /// leaves the pane's writer scope open under the production `Hold` policy,
@@ -198,6 +194,8 @@ fn overlap_trials(path: Path041) {
         let mut person = codex.input();
         person.write("BASE");
         codex.expect_composer("BASE");
+        person.write("\x7f\x7f\x7f\x7f");
+        codex.expect_composer("");
         settle(&codex, &pauser);
         let trace_from = pauser.trace().len();
         let editor_runs = editor.runs().len();
@@ -222,7 +220,7 @@ fn overlap_trials(path: Path041) {
             "trial {trial}: the held helper must be let go"
         );
         let landed = common::wait_until(Duration::from_secs(30), || {
-            codex.composer().as_deref() == Some("BASEEARLYLATE")
+            codex.composer().as_deref() == Some("EARLYLATE")
         });
         let killed = pauser.disarm();
         let trace = pauser.trace()[trace_from..].to_string();
@@ -249,9 +247,21 @@ fn overlap_trials(path: Path041) {
             Some("Armed"),
             "trial {trial}: the held helper must be the deck's armed check; {row}"
         );
+        // Bounded: a ring the stale empty read let through gets three more
+        // seconds to show.
+        common::wait_until(Duration::from_secs(3), || {
+            assert_eq!(
+                codex.message(&id)["deliveries"],
+                0,
+                "trial {trial}: the task waits behind the box the person typed into; {row}; {}",
+                codex.evidence()
+            );
+            false
+        });
         assert_eq!(
-            message["deliveries"], 0,
-            "trial {trial}: the task waits behind the non-empty box; {row}"
+            codex.composer().as_deref(),
+            Some("EARLYLATE"),
+            "trial {trial}: nothing but the person's typing reached the box; {row}"
         );
         // The route, not only the box: Ctrl+G opened the person's editor once,
         // on the box as typed before it, and LATE reached that editor.
@@ -263,7 +273,7 @@ fn overlap_trials(path: Path041) {
         );
         assert_eq!(
             runs[0]["initial"].as_str().map(str::trim_end),
-            Some("BASEEARLY"),
+            Some("EARLY"),
             "trial {trial}: the editor opens on the box as typed before Ctrl+G; {row}"
         );
         assert_eq!(
@@ -272,12 +282,14 @@ fn overlap_trials(path: Path041) {
             "trial {trial}: LATE reaches the person's editor; {row}"
         );
         match path.exit {
+            // The box was empty when the check's byte reached Codex: what
+            // the person typed during the check was held behind it.
             Exit041::Mine => assert!(
                 killed.is_none()
                     && armed.len() == 1
-                    && armed[0].contains("Mine { read: NonEmpty }")
+                    && armed[0].contains("Mine { read: Empty }")
                     && armed[0].contains("notice: false"),
-                "trial {trial}: the held helper reports the box non-empty, with no notice; {row}"
+                "trial {trial}: the held helper reports the box it read empty, with no notice; {row}"
             ),
             Exit041::Notice => assert!(
                 killed.is_none() && armed.len() == 1 && armed[0].contains("notice: true"),
@@ -301,7 +313,6 @@ fn overlap_trials(path: Path041) {
         "path": path.name, "point": path.point, "hold_ms": path.hold.as_millis() as u64,
         "kill": path.kill, "trials": rows.len(), "exact": exact,
         "release": codex_installed::installed_release().ok(),
-        "seam": codex_installed::seam(),
     });
     eprintln!("041 summary {summary}");
     if let Ok(out) = std::env::var("DAD_PROBE_041_OUT") {
@@ -315,7 +326,7 @@ fn overlap_trials(path: Path041) {
     assert_eq!(
         exact,
         trials(),
-        "every trial must end with BASEEARLYLATE: {summary}; last row {}; {last_evidence}",
+        "every trial must end with EARLYLATE: {summary}; last row {}; {last_evidence}",
         rows.last().unwrap(),
     );
 }
@@ -336,7 +347,7 @@ fn settle(codex: &Installed, pauser: &Pauser) {
     );
 }
 
-/// Scenario: Type BASE into real interactive Codex in an installed pane and queue a task so the deck checks the box, then for each trial hold the check's own helper for one second just before its report to the deck, typing EARLY, Ctrl+G and LATE 250 ms apart while it is held. Every trial must end with exactly BASEEARLYLATE in the input box: the typing waits for the check, the helper reports the box non-empty, Ctrl+G then opens the person's own editor once, on BASEEARLY, and LATE reaches it.
+/// Scenario: Type BASE into real interactive Codex in an installed pane and delete it, so Codex shows its placeholder over a touched box, and queue a task so the deck checks the box; for each trial hold the check's own helper for one second just before its report to the deck, typing EARLY, Ctrl+G and LATE 250 ms apart while it is held. Every trial must end with exactly EARLYLATE in the input box and the task undelivered: the typing waits for the check, the helper reports the box it read empty, Ctrl+G then opens the person's own editor once, on EARLY, and LATE reaches it.
 #[spec("inbox/probe/041")]
 #[test]
 fn probe_041_live_delayed_report_keeps_overlapping_typing() {
@@ -349,7 +360,7 @@ fn probe_041_live_delayed_report_keeps_overlapping_typing() {
     });
 }
 
-/// Scenario: As the delayed case, but the check's helper is held for 2.5 seconds before its report, past its exchange's two-second bound, so the helper gives up on the deck and prints its notice. Every trial must still end with exactly BASEEARLYLATE in Codex's input box, the person's editor having opened once and read LATE.
+/// Scenario: As the delayed case, but the check's helper is held for 2.5 seconds before its report, past its exchange's two-second bound, so the helper gives up on the deck and prints its notice. Every trial must still end with exactly EARLYLATE in Codex's input box and the task undelivered, the person's editor having opened once and read LATE.
 #[spec("inbox/probe/041")]
 #[test]
 fn probe_041_live_failed_report_with_notice_keeps_overlapping_typing() {
@@ -362,7 +373,7 @@ fn probe_041_live_failed_report_with_notice_keeps_overlapping_typing() {
     });
 }
 
-/// Scenario: As the delayed case, but the check's helper is held for 11 seconds at its very start, before it reads anything, past the ten-second wait after which the deck counts the check's byte as unanswered. Every trial must still end with exactly BASEEARLYLATE in Codex's input box, the person's editor having opened once and read LATE, and the helper still reports the box it read non-empty.
+/// Scenario: As the delayed case, but the check's helper is held for 11 seconds at its very start, before it reads anything, past the ten-second wait after which the deck counts the check's byte as unanswered. Every trial must still end with exactly EARLYLATE in Codex's input box and the task undelivered, the person's editor having opened once and read LATE, and the helper still reports the box it read empty.
 #[spec("inbox/probe/041")]
 #[test]
 fn probe_041_live_late_helper_keeps_overlapping_typing() {
@@ -375,7 +386,7 @@ fn probe_041_live_late_helper_keeps_overlapping_typing() {
     });
 }
 
-/// Scenario: As the delayed case, but one second into the hold the check's helper is killed with SIGKILL by its captured pid, so it never reports. Every trial must still end with exactly BASEEARLYLATE in Codex's input box, the person's editor having opened once and read LATE.
+/// Scenario: As the delayed case, but one second into the hold the check's helper is killed with SIGKILL by its captured pid, so it never reports. Every trial must still end with exactly EARLYLATE in Codex's input box and the task undelivered, the person's editor having opened once and read LATE.
 #[spec("inbox/probe/041")]
 #[test]
 fn probe_041_live_killed_helper_keeps_overlapping_typing() {

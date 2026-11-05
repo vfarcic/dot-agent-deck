@@ -9,15 +9,20 @@
 //! from that Codex process's own environment, since no shell is there to
 //! record it.
 //!
-//! **The seam.** Until the Codex activation (Q35-29) puts `Direct(Codex)` in
-//! `INSTALL_ROLLOUT` and verifies Codex's `editor_probe`, these tests run
-//! with the e2e editor-probe assumption (`DOT_AGENT_DECK_E2E_ASSUME_EDITOR_PROBE`
-//! = `codex@<installed release>`), which stands in for both: it adds
-//! Codex's classes to the rollout and checks the generation with the e2e
-//! stand-ins' editor probe. [`seam`] decides: a build that activates Codex
-//! itself runs with no assumption, and nothing in a test has to change
-//! (`DAD_CODEX_SEAM=0` forces no assumption, so a build without the
-//! activation reports `SKIP:`; `=1` forces it). Every run prints which.
+//! **No seam.** The build itself checks a direct Codex's box since the
+//! Codex activation (Q35-29: `Direct(Codex)` in `INSTALL_ROLLOUT`, Codex's
+//! `editor_probe` verified), so nothing here sets the e2e editor-probe
+//! assumption, which no longer accepts a Codex release; [`checkable`] reports
+//! `SKIP:` on a build that does not.
+//!
+//! **A fresh `CODEX_HOME`, as a new user's.** Each deck's Codex home is new,
+//! so its pane is Codex's first start there, and Codex rewrites its own
+//! `config.toml` (a key-binding source) a few seconds after drawing its
+//! composer. The deck's key-binding guard accepts that bookkeeping step, so
+//! no warm-up start precedes the pane under test (the warm-up the first
+//! version of this harness made, `steady_codex_home`, is gone with the need
+//! for it, and with it the sandbox daemon and wrapper each warm-up start left
+//! behind).
 #![allow(dead_code)] // Each test file uses its own subset.
 
 use crate::common;
@@ -55,44 +60,20 @@ pub fn activated() -> bool {
         && matches!(CODEX_FACTS.editor_probe, Measurement::Verified(_))
 }
 
-/// The e2e editor-probe assumption these tests set, or `None` when they set
-/// none: none once the build activates Codex, unless `DAD_CODEX_SEAM=1`;
-/// none whatever the build when `DAD_CODEX_SEAM=0`.
-pub fn seam() -> Option<String> {
-    let forced = std::env::var("DAD_CODEX_SEAM").ok();
-    let on = match forced.as_deref() {
-        Some("0") => false,
-        Some("1") => true,
-        _ => !activated(),
-    };
-    on.then(|| format!("codex@{}", installed_release().unwrap_or_default()))
-}
-
 /// The preflight: real Codex runs here, its release is one the deck latches,
-/// Codex's facts ring it, and either this build checks a direct Codex's box
-/// or the seam stands in for that. Otherwise the reason, so the test reports
-/// `SKIP:` (UNVERIFIED under `DOT_AGENT_DECK_REQUIRE_REAL_E2E`).
+/// Codex's facts ring it, and this build checks a direct Codex's box.
+/// Otherwise the reason, so the test reports `SKIP:` (UNVERIFIED under
+/// `DOT_AGENT_DECK_REQUIRE_REAL_E2E`).
 pub fn checkable() -> Result<(), String> {
     common::check_codex_available()?;
     crate::live::codex_facts_admit_installed_release()?;
     let release = installed_release()?;
-    match seam() {
-        Some(assumed) => eprintln!(
-            "SEAM: Codex {release} runs with the e2e editor-probe assumption {assumed} \
-             (Codex's classes in the rollout, the stand-ins' editor probe): this build \
-             activates Codex: {}",
-            activated()
-        ),
-        None if activated() => {
-            eprintln!("Codex {release} runs with no assumption: this build activates Codex")
-        }
-        None => {
-            return Err(format!(
-                "this build does not check a direct Codex's box (Codex is not activated) and \
-                 DAD_CODEX_SEAM=0 refuses the assumption that stands in for it; Codex {release}"
-            ));
-        }
+    if !activated() {
+        return Err(format!(
+            "this build does not check a direct Codex's box (Codex is not activated); Codex {release}"
+        ));
     }
+    eprintln!("Codex {release}: this build checks a direct Codex's box, with no assumption");
     Ok(())
 }
 
@@ -108,19 +89,16 @@ pub struct Installed {
 }
 
 impl Installed {
-    /// A deck with the seam (when [`seam`] says so) and `extra` set for the
-    /// deck and its daemon, whose one pane runs [`command`] in the fixture's
-    /// working directory, with its own `CODEX_HOME` holding the deck's hooks
-    /// trusted and the directory trusted. Waits for the deck to latch the
-    /// installed release from the pane's own header and for Codex's composer.
+    /// A deck with `extra` set for the deck and its daemon, whose one pane
+    /// runs [`command`] in the fixture's working directory, with its own
+    /// fresh `CODEX_HOME` holding the deck's hooks trusted and the directory
+    /// trusted. Waits for the deck to latch the installed release from the
+    /// pane's own header and for Codex's composer.
     pub fn new(extra: &[(&str, &str)]) -> Self {
         let release = installed_release().expect("the installed release");
         let mut builder = common::TuiDeck::builder();
         for (key, value) in extra {
             builder = builder.with_env(*key, *value);
-        }
-        if let Some(assumed) = seam() {
-            builder = builder.with_env("DOT_AGENT_DECK_E2E_ASSUME_EDITOR_PROBE", &assumed);
         }
         let deck = builder
             .with_pty_size(180, 50)
@@ -142,7 +120,6 @@ impl Installed {
             deck.snapshot_grid()
         );
         crate::live::prepare(&deck);
-        steady_codex_home(&deck);
         let reply = start_pane(&deck);
         let agent = reply["id"].as_str().unwrap().to_string();
         let found = std::cell::RefCell::new(None);
@@ -390,70 +367,6 @@ fn start_pane(deck: &common::TuiDeck) -> Value {
     );
     assert_eq!(reply["ok"], true, "installed Codex spawn: {reply}");
     reply
-}
-
-/// The most warm-up starts [`steady_codex_home`] makes.
-const WARM_UP_STARTS: usize = 6;
-
-/// Bring the sandbox's fresh `CODEX_HOME` to a returning user's steady state
-/// before the pane under test starts. Codex 0.164.0 writes its own
-/// `config.toml` a few seconds into its first start in a fresh home (it
-/// records `[tui] screen_reader_detection_done` and a
-/// `[tui.model_availability_nux]` count, measured 2026-11-05), and that file
-/// is one of Codex's key-binding sources, so a generation that saw it change
-/// after its spawn has every check refused `Keymap(Changed)` for its life.
-/// A long-lived home has made those writes already; this one has not. So
-/// start Codex in the same home and stop it, until a start leaves
-/// `config.toml` byte for byte as it found it, at most [`WARM_UP_STARTS`]
-/// times; each start's change is printed. Measured under the deck on
-/// 2026-11-05: the `model_availability_nux` count rose by one on each of the
-/// first four starts and the fifth left the file alone.
-///
-/// **Known issue (cxl2, not yet diagnosed):** in one run every warm-up
-/// start's `stop-agent` left a sandbox daemon and its `wrap` behind (a new
-/// daemon per start), which the harness's 300 s backstop ends; this needs
-/// fixing before the step is relied on.
-pub fn steady_codex_home(deck: &common::TuiDeck) {
-    let cfg = deck.home_dir().join(".codex/config.toml");
-    for start in 1..=WARM_UP_STARTS {
-        let before = std::fs::read_to_string(&cfg).unwrap_or_default();
-        let reply = start_pane(deck);
-        let agent = reply["id"].as_str().unwrap().to_string();
-        let screen = || {
-            let raw = common::pane_snapshot_on(deck.attach_socket_path(), &agent);
-            let mut parser = dot_agent_deck::vt_grid::parser(40, 140, 0);
-            parser.process(&raw);
-            parser.screen().contents()
-        };
-        assert!(
-            common::wait_until(BUDGET, || screen().contains("? for shortcuts")),
-            "warm-up start {start}: Codex must draw its composer: {}",
-            screen()
-        );
-        // Codex's own writes came 3 s after its composer; wait twice that.
-        std::thread::sleep(Duration::from_secs(6));
-        let stopped = attach(deck, json!({"op":"stop-agent","id":agent}));
-        assert_eq!(stopped["ok"], true, "stop the warm-up start: {stopped}");
-        assert!(
-            common::wait_until(BUDGET, || {
-                attach(deck, json!({"op":"list-agents"}))["agent_records"]
-                    .as_array()
-                    .is_some_and(|rs| rs.iter().all(|r| r["id"] != agent.as_str()))
-            }),
-            "the warm-up start must end"
-        );
-        let after = std::fs::read_to_string(&cfg).unwrap_or_default();
-        if after == before {
-            eprintln!("Codex home steady after {} warm-up start(s)", start);
-            return;
-        }
-        let added: Vec<&str> = after.lines().filter(|l| !before.contains(*l)).collect();
-        eprintln!("Codex warm-up start {start} changed its config.toml: {added:?}");
-    }
-    panic!(
-        "Codex kept changing its config.toml over {WARM_UP_STARTS} starts: every check of a \
-         generation that sees it change is refused Keymap(Changed)"
-    );
 }
 
 /// [`Installed::composer`] on a screen.

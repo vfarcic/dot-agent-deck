@@ -5,13 +5,9 @@
 //! empty (PRD #1666 part 3, `chain-smoke/codex/001`, the Codex counterpart
 //! of `chain-smoke/claude/002`).
 //!
-//! Until the Codex activation this runs with the e2e editor-probe
-//! assumption, the seam (`support/codex_installed.rs`), which drops itself
-//! once the build activates Codex.
-//!
-//! **Status (cxl2, 2026-11-05): written, not yet run green**: blocked by the
-//! same `Keymap(Changed)` defect as `inbox/probe/043`
-//! (`tests/e2e_composer_check_codex_live.rs`).
+//! It runs on the build's own Codex activation, with no e2e assumption, in a
+//! fresh `CODEX_HOME`: the worker is Codex's first start there
+//! (`support/codex_installed.rs` says why no warm-up start comes first).
 
 #[path = "support/codex_installed.rs"]
 mod codex_installed;
@@ -134,13 +130,8 @@ fn codex_001_touched_box_checked_then_delegate_delivered_once() {
     use std::io::Write as _;
     skip_unless!(codex_installed::checkable());
     let release = codex_installed::installed_release().unwrap();
-    let seam = codex_installed::seam();
-    eprintln!("chain-smoke/codex/001: Codex {release}, assumption {seam:?}");
-    let mut builder = common::TuiDeck::builder();
-    if let Some(assumed) = &seam {
-        builder = builder.with_env("DOT_AGENT_DECK_E2E_ASSUME_EDITOR_PROBE", assumed);
-    }
-    let deck = builder
+    eprintln!("chain-smoke/codex/001: Codex {release}, no assumption");
+    let deck = common::TuiDeck::builder()
         .with_pty_size(180, 50)
         .with_imported_codex_credentials()
         .with_env("PATH", common::path_with_binary_dir())
@@ -154,9 +145,6 @@ fn codex_001_touched_box_checked_then_delegate_delivered_once() {
     // The deck's Codex hooks trusted in the sandbox's `CODEX_HOME`, as an
     // install the user ran earlier would have left them.
     live::prepare(&deck);
-    // A returning user's Codex home, which Codex itself no longer rewrites
-    // on start (`codex_installed::steady_codex_home`).
-    codex_installed::steady_codex_home(&deck);
 
     // A per-run line, so a stale file or a second append is visible.
     let nonce = format!(
@@ -335,7 +323,7 @@ fn codex_001_touched_box_checked_then_delegate_delivered_once() {
         evidence(&deck, &agent)
     );
     eprintln!(
-        "chain-smoke/codex/001 PASS: release={release} assumed={seam:?} task={} deliveries={} \
+        "chain-smoke/codex/001 PASS: release={release} task={} deliveries={} \
          cpr_answers={}\n{}{}",
         task.id,
         task.deliveries,
