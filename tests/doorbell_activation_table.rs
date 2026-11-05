@@ -545,10 +545,18 @@ fn doorbell_053_every_recorded_release_conforms_to_its_agents_facts() {
     }
 }
 
-/// Scenario: Make one of the shipped facts wrong in each way a recorded release can show it: Codex's settle fact faster than 0.160.0's slowest first dialog, a key of Codex's update dialog that commits on the recorded releases called inert, folder trust's `2` taken from 0.164.0 (dismisses) where 0.160.0 commits, a dialog missing from the facts, the wrong profile, an editor probe different from the measured one, a recorded release whose echo failed. Each makes conformance fail for the release that contradicts it, and the shipped facts pass.
+/// Scenario: Make one of the shipped facts wrong in each way a recorded release can show it: Codex's settle fact faster than 0.160.0's slowest first dialog, a key of Codex's update dialog that commits on the recorded releases called inert, folder trust's `2` taken from 0.164.0 (dismisses) where 0.160.0 commits, a dialog missing from the facts, a key of a recorded dialog missing from the facts, the wrong profile, an editor probe different from the measured one, a recorded release whose echo, key effects or first dialog failed, and an agent with no facts. Each makes conformance fail for the release that contradicts it, with the error naming that contradiction, and the shipped facts pass.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_conformance_fails_when_a_fact_is_wrong() {
+    // Fails for the reason the mutation set up, not for another one.
+    #[track_caller]
+    fn fails_with(result: Result<(), String>, reason: &str) {
+        match result {
+            Err(e) => assert!(e.contains(reason), "expected {reason:?}, got {e:?}"),
+            Ok(()) => panic!("expected {reason:?}, conformance passed"),
+        }
+    }
     let release = |agent: &AgentType, release: &str| -> &'static RecordedRelease<'static> {
         RECORDED_RELEASES
             .iter()
@@ -567,7 +575,7 @@ fn doorbell_053_conformance_fails_when_a_fact_is_wrong() {
         }),
         ..CODEX_FACTS
     });
-    assert!(conformance(codex_160, &fast).is_err());
+    fails_with(conformance(codex_160, &fast), "later than the facts'");
     assert_eq!(conformance(codex_164, &fast), Ok(()));
     // A committing key called inert.
     let update_inert: Vec<(u8, KeyEffect)> = CODEX_FACTS.key_effects.verified().unwrap()[0]
@@ -592,8 +600,14 @@ fn doorbell_053_conformance_fails_when_a_fact_is_wrong() {
         key_effects: Measurement::Verified(dialogs),
         ..CODEX_FACTS
     });
-    assert!(conformance(codex_160, &wrong_key).is_err());
-    assert!(conformance(codex_164, &wrong_key).is_err());
+    fails_with(
+        conformance(codex_160, &wrong_key),
+        "key 0x31 in update is Commits on this release, the facts say Inert",
+    );
+    fails_with(
+        conformance(codex_164, &wrong_key),
+        "key 0x31 in update is Commits on this release, the facts say Inert",
+    );
     // Folder trust from 0.164.0, where 0.160.0's `2` commits.
     let trust_164 = codex_164.measured.key_effects.verified().unwrap()[1];
     assert_eq!(trust_164.dialog, "trust");
@@ -604,20 +618,29 @@ fn doorbell_053_conformance_fails_when_a_fact_is_wrong() {
         key_effects: Measurement::Verified(dialogs),
         ..CODEX_FACTS
     });
-    assert!(conformance(codex_160, &less_cautious).is_err());
+    fails_with(
+        conformance(codex_160, &less_cautious),
+        "key 0x32 in trust is Commits on this release, the facts say Dismisses",
+    );
     assert_eq!(conformance(codex_164, &less_cautious), Ok(()));
     // A dialog missing from the facts.
     let no_hooks = with_codex(AgentFacts {
         key_effects: Measurement::Verified(&CODEX_FACTS.key_effects.verified().unwrap()[..2]),
         ..CODEX_FACTS
     });
-    assert!(conformance(codex_164, &no_hooks).is_err());
+    fails_with(
+        conformance(codex_164, &no_hooks),
+        "dialog hooks is not in the facts",
+    );
     // The wrong profile.
     let profile = with_codex(AgentFacts {
         profile: "codex-2027-01",
         ..CODEX_FACTS
     });
-    assert!(conformance(codex_164, &profile).is_err());
+    fails_with(
+        conformance(codex_164, &profile),
+        "measured with profile codex-2026-10, the facts name codex-2027-01",
+    );
     // An editor probe different from the measured one.
     let other_probe = EditorProbe {
         paste_toggles: PasteToggles {
@@ -633,7 +656,10 @@ fn doorbell_053_conformance_fails_when_a_fact_is_wrong() {
         },
         CODEX_FACTS,
     ];
-    assert!(conformance(claude_317, &claude_wrong).is_err());
+    fails_with(
+        conformance(claude_317, &claude_wrong),
+        "editor_probe measured",
+    );
     assert_eq!(
         conformance(release(&CLAUDE, "2.1.310"), &claude_wrong),
         Ok(()),
@@ -647,7 +673,10 @@ fn doorbell_053_conformance_fails_when_a_fact_is_wrong() {
             ..codex_164.measured.clone()
         },
     };
-    assert!(conformance(&failed, &AGENT_FACTS).is_err());
+    fails_with(
+        conformance(&failed, &AGENT_FACTS),
+        "echo failed on this release",
+    );
     // A release of an agent without facts.
     let pi = RecordedRelease {
         release: v("1.0.0"),
@@ -656,7 +685,52 @@ fn doorbell_053_conformance_fails_when_a_fact_is_wrong() {
             ..codex_164.measured.clone()
         },
     };
-    assert!(conformance(&pi, &AGENT_FACTS).is_err());
+    fails_with(conformance(&pi, &AGENT_FACTS), "the agent has no facts");
+    // A key a recorded release measured in a dialog, missing from the facts.
+    let update_short: Vec<(u8, KeyEffect)> = CODEX_FACTS.key_effects.verified().unwrap()[0]
+        .keys
+        .iter()
+        .copied()
+        .filter(|&(k, _)| k != b'1')
+        .collect();
+    let update_short: &'static [(u8, KeyEffect)] = update_short.leak();
+    let mut dialogs = CODEX_FACTS.key_effects.verified().unwrap().to_vec();
+    dialogs[0] = DialogKeys {
+        dialog: "update",
+        keys: update_short,
+    };
+    let dialogs: &'static [DialogKeys<'static>] = dialogs.leak();
+    let missing_key = with_codex(AgentFacts {
+        key_effects: Measurement::Verified(dialogs),
+        ..CODEX_FACTS
+    });
+    fails_with(
+        conformance(codex_164, &missing_key),
+        "key 0x31 in update is not in the facts",
+    );
+    // A recorded release whose key effects, or whose first dialog, failed.
+    let keys_failed = RecordedRelease {
+        release: v("0.170.0"),
+        measured: AgentFacts {
+            key_effects: Measurement::Failed,
+            ..codex_164.measured.clone()
+        },
+    };
+    fails_with(
+        conformance(&keys_failed, &AGENT_FACTS),
+        "key_effects failed on this release",
+    );
+    let first_modal_failed = RecordedRelease {
+        release: v("2.1.399"),
+        measured: AgentFacts {
+            first_modal: Measurement::Failed,
+            ..claude_317.measured.clone()
+        },
+    };
+    fails_with(
+        conformance(&first_modal_failed, &AGENT_FACTS),
+        "first_modal failed on this release",
+    );
 }
 
 /// Scenario: Read the editor record measured for Claude Code 2.1.317. It names Claude's export and editor selection, one paste-mode disable and one enable, the user's key-binding file as the only source, the bindings loaded at start, no inert candidate form, and the pasted BEL left absent; it is the recorded release's measurement and Claude Code's editor-probe fact, so any latched Claude Code release, 2.1.317 or one nobody measured, is armable once its root is bound.
