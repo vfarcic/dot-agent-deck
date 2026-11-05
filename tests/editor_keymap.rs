@@ -1956,3 +1956,50 @@ fn probe_014_the_telemetry_shims_otel_overrides_are_not_a_codex_source() {
         "on the baseline alone"
     );
 }
+
+/// Scenario: Take a Codex baseline from the deck's launch line, then compare it with a bound native whose leading `-c otel.trace_exporter=…` carries the shim's exporter table followed by a second line setting another key, as the revcxkey2 review's probe did with `tui.keymap.global.open_external_editor="f6"`. Such a value is not the shim's, so the launch holds as changed, as it does with a non-`otel` key or another `otel` key after the table; the shim's own value, alone, still matches.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_a_shim_shaped_otel_override_with_another_key_after_it_holds() {
+    use dot_agent_deck::composer_probe::keymap::CodexBaseline;
+    use dot_agent_deck::telemetry::launch::codex_args;
+    let dir = test_temp::tempdir().unwrap();
+    let home = dir.path().join("codex-home");
+    let cwd = dir.path().join("repo");
+    for d in [&home, &cwd] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    const PAIR: [&str; 2] = ["-c", "shell_environment_policy.set={}"];
+    let mut env = std::collections::HashMap::new();
+    env.insert("CODEX_HOME".to_string(), home.display().to_string());
+    env.insert(
+        "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
+        "http://127.0.0.1:4318".to_string(),
+    );
+    env.insert("OTEL_METRICS_EXPORTER".to_string(), "none".to_string());
+    let shim = codex_args(&args(&PAIR), &env);
+    assert_eq!(shim.len(), 2, "the shim adds the trace exporter: {shim:?}");
+    assert!(shim[1].starts_with("otel.trace_exporter="), "{shim:?}");
+    let baseline = CodexBaseline::at_spawn(&home, &[], &cwd).unwrap();
+    let bound = |value: &str| baseline.bound(&home, &args(&[PAIR[0], PAIR[1], "-c", value]), &cwd);
+
+    assert_eq!(bound(&shim[1]), Ok(()), "the shim's own value");
+    let mut wrong = Vec::new();
+    for (row, after) in [
+        (
+            "a rebinding after the table",
+            "\ntui.keymap.global.open_external_editor=\"f6\"",
+        ),
+        ("another key after the table", "\nmodel=\"o4\""),
+        (
+            "another otel key after the table",
+            "\notel.exporter=\"none\"",
+        ),
+    ] {
+        let got = bound(&format!("{}{after}", shim[1]));
+        if got != Err(Hold::Changed) {
+            wrong.push(format!("{row}: {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}

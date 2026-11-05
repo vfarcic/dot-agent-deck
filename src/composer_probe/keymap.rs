@@ -1141,7 +1141,10 @@ fn without_shim_otel(args: &[OsString]) -> Option<&[OsString]> {
 
 /// Whether `arg` is `key=` followed by the exporter table the telemetry
 /// shim writes: `{otlp-http={endpoint=<string>,protocol="binary"|"json"}}`
-/// and nothing else.
+/// and nothing else. The value is parsed as the document `v = <value>`, and
+/// that document must hold `v` alone (the revcxkey2 review's NIT-1): a value
+/// that goes on past the table, with a newline and another key, is not the
+/// shim's.
 fn shim_otel_value(key: &str, arg: &str) -> bool {
     let Some(value) = arg
         .strip_prefix(key)
@@ -1155,6 +1158,9 @@ fn shim_otel_value(key: &str, arg: &str) -> bool {
     let Some(toml::Value::Table(exporter)) = table.remove("v") else {
         return false;
     };
+    if !table.is_empty() {
+        return false;
+    }
     let Some(toml::Value::Table(http)) = exporter.get("otlp-http") else {
         return false;
     };
