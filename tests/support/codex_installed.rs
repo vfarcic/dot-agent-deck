@@ -15,6 +15,18 @@
 //! assumption, which no longer accepts a Codex release; [`checkable`] reports
 //! `SKIP:` on a build that does not.
 //!
+//! **A project folder that doesn't hold the Codex home, as a user's.** Codex
+//! 0.164.0 puts the file it hands an editor in the first of `$CODEX_HOME`,
+//! `~/.codex` and `<cwd>/.codex` that its own sandbox can't write to
+//! (`tui/src/external_editor.rs`, `editor_directory`), and the deck checks
+//! only `$CODEX_HOME/editor`. A user's `~/.codex` is outside the project
+//! Codex works in, so the first candidate wins. The harness's HOME is inside
+//! the fixture's working directory, where `workspace-write` lets Codex
+//! write, so every Codex here runs in [`project_dir`], a folder of that
+//! working directory that doesn't hold HOME, and the files it is asked to
+//! write go there. (A Codex home inside a folder its sandbox can write is a
+//! case the deck can't check today; `docs/develop/doorbell-admission.md`.)
+//!
 //! **A fresh `CODEX_HOME`, as a new user's.** Each deck's Codex home is new,
 //! so its pane is Codex's first start there, and Codex rewrites its own
 //! `config.toml` (a key-binding source) a few seconds after drawing its
@@ -34,6 +46,16 @@ use std::time::Duration;
 pub const BUDGET: Duration = Duration::from_secs(120);
 pub const PANE: &str = "codex-installed";
 pub const LOG: &str = "codex-installed.log";
+
+/// The folder every Codex here works in (module doc): `project` in the
+/// fixture's working directory, created on first use. It is inside the
+/// fixture's git repository, whose trust the harness records, and it doesn't
+/// hold the deck's HOME.
+pub fn project_dir(deck: &common::TuiDeck) -> PathBuf {
+    let dir = deck.workdir().join("project");
+    std::fs::create_dir_all(&dir).expect("the Codex project folder");
+    dir
+}
 
 /// The Codex command every installed pane runs: a plain argv (no quotes or
 /// operators a shell would read), the cheap test model, its workspace
@@ -317,13 +339,13 @@ impl Installed {
     pub fn directive(&self, name: &str) -> String {
         format!(
             "Run exactly this shell command once: printf '%s\\n' 'inbox-action-{name}' >> '{}'. Then reply DONE-{name} and end your turn. Do this once for this message id.",
-            self.deck.workdir().join(name).display()
+            project_dir(&self.deck).join(name).display()
         )
     }
 
     /// The task `id` was acted on once and acknowledged after one hand-over.
     pub fn done(&self, id: &str, name: &str) {
-        let path = self.deck.workdir().join(name);
+        let path = project_dir(&self.deck).join(name);
         assert!(
             common::wait_until(BUDGET, || std::fs::read_to_string(&path)
                 .is_ok_and(|text| text.ends_with('\n'))),
@@ -355,12 +377,12 @@ impl Installed {
 }
 
 /// Start [`command`] in `deck`'s one Codex pane: the agent declared, its own
-/// `CODEX_HOME` the sandbox's, the fixture's working directory.
+/// `CODEX_HOME` the sandbox's, in [`project_dir`].
 fn start_pane(deck: &common::TuiDeck) -> Value {
     let reply = attach(
         deck,
         json!({"op":"start-agent", "command":command(),
-        "agent_type":"codex", "cwd":deck.workdir(), "rows":40,"cols":140,
+        "agent_type":"codex", "cwd":project_dir(deck), "rows":40,"cols":140,
         "display_name":PANE, "env":[
             ["CODEX_HOME",deck.home_dir().join(".codex")],
             ["DOT_AGENT_DECK_PANE_ID",PANE]]}),

@@ -39,7 +39,7 @@ const ORCHESTRATION: &str = "chain-smoke-codex-001";
 /// plain `codex …` argv (the `Direct(Codex)` class).
 fn write_orchestration(deck: &common::TuiDeck, line: &str) {
     use std::os::unix::fs::PermissionsExt;
-    let dir = deck.workdir();
+    let dir = codex_installed::project_dir(deck);
     std::fs::write(
         dir.join(".dot-agent-deck.toml"),
         format!(
@@ -111,7 +111,7 @@ fn evidence(deck: &common::TuiDeck, agent: &str) -> String {
         ),
         pane_screen(deck, agent).screen().contents(),
         deck.snapshot_grid(),
-        std::fs::read_to_string(deck.workdir().join("delegate-cli.log")),
+        std::fs::read_to_string(codex_installed::project_dir(deck).join("delegate-cli.log")),
         installed::tail(
             &log(deck)
                 .lines()
@@ -131,8 +131,15 @@ fn codex_001_touched_box_checked_then_delegate_delivered_once() {
     skip_unless!(codex_installed::checkable());
     let release = codex_installed::installed_release().unwrap();
     eprintln!("chain-smoke/codex/001: Codex {release}, no assumption");
+    // 200 columns, not 180: at 180 the TUI gives the worker a 117-column
+    // pane, and there the deck held the fresh worker unchecked and unrung
+    // (`Surface`, then `Layout`) until a first prompt, the deck not taking
+    // its logo as a width witness (`codex_width_witness`, which refuses a
+    // width whose neighbour the pane has also had; that it had is inferred,
+    // not logged). At 200 the worker's pane is 130 columns and it passes
+    // (cxact, one run each).
     let deck = common::TuiDeck::builder()
-        .with_pty_size(180, 50)
+        .with_pty_size(200, 50)
         .with_imported_codex_credentials()
         .with_env("PATH", common::path_with_binary_dir())
         .with_env("DOT_AGENT_DECK_LOG", LOG)
@@ -156,7 +163,7 @@ fn codex_001_touched_box_checked_then_delegate_delivered_once() {
             .subsec_nanos()
     );
     let line = format!("chain-smoke-codex-001-{nonce}");
-    let sentinel = deck.workdir().join(SENTINEL);
+    let sentinel = codex_installed::project_dir(&deck).join(SENTINEL);
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -166,10 +173,20 @@ fn codex_001_touched_box_checked_then_delegate_delivered_once() {
         .unwrap();
     write_orchestration(&deck, &line);
 
-    // Open the orchestration from the TUI's new-pane form, then focus the
+    // Open the orchestration from the TUI's new-pane form, in the project
+    // folder (filter the picker to it, enter it, pick it), then focus the
     // worker (card 2) in pane-input mode.
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
+    // The filter keeps `..` first: end it, step down onto `project/`, open
+    // it (its listing is `..` alone; the title truncates the path, so the
+    // form's orchestration, read from that folder's config, is the proof).
+    deck.send_keys(b"/project");
+    deck.wait_for_string("project/");
+    deck.send_keys(b"\r");
+    deck.send_keys(b"j");
+    deck.send_keys(b"\r");
+    deck.wait_for_absence("project/");
     deck.send_keys(b" ");
     deck.wait_for_string("No mode");
     deck.send_keys(b"\x1b[C");
@@ -243,7 +260,7 @@ fn codex_001_touched_box_checked_then_delegate_delivered_once() {
     let touched_at = log(&deck).len();
 
     // The orchestrator delegates.
-    std::fs::write(deck.workdir().join("delegate-now"), "").unwrap();
+    std::fs::write(codex_installed::project_dir(&deck).join("delegate-now"), "").unwrap();
     assert!(
         common::wait_until(CHECK_BUDGET, || {
             std::fs::read_to_string(&sentinel).is_ok_and(|text| text.contains(&line))

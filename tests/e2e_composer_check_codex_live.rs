@@ -450,7 +450,11 @@ fn probe_043_live_a_touched_box_with_a_client_attached_is_checked_and_delivered(
         } else {
             person.write(empty_keys);
         }
-        let delivered = common::wait_until(BUDGET, || codex.deck.workdir().join(&name).exists());
+        let delivered = common::wait_until(BUDGET, || {
+            codex_installed::project_dir(&codex.deck)
+                .join(&name)
+                .exists()
+        });
         assert!(
             delivered,
             "{means}: the emptied box's check must lead to the task; helper trace:\n{}\n{}",
@@ -495,7 +499,11 @@ fn held_for(codex: &Installed, id: &str, name: &str, draft: &str, since: usize, 
             "{means}: the draft changed to {composer:?}; {}",
             codex.evidence()
         );
-        assert!(!codex.deck.workdir().join(name).exists());
+        assert!(
+            !codex_installed::project_dir(&codex.deck)
+                .join(name)
+                .exists()
+        );
         let log = codex.log();
         assert!(
             !log[since..].contains("doorbell rang"),
