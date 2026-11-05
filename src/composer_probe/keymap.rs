@@ -655,24 +655,80 @@ pub fn codex_unchanged(before: &CodexRead, after: &CodexRead) -> Result<(), Hold
 /// carry them: nothing in the key handling or the keymap reads them.
 pub const CODEX_BOOKKEEPING: [&str; 2] = ["screen_reader_detection_done", "model_availability_nux"];
 
+/// The highest tooltip count Codex writes: it raises a model's count only
+/// while it is below `MODEL_AVAILABILITY_NUX_MAX_SHOW_COUNT`, 4, in both
+/// pinned releases (`tui/src/app/startup_prompts.rs`, `rust-v0.160.0` :242,
+/// `rust-v0.164.0` :246), and the cxkey measurement's counts stopped at 4.
+pub const CODEX_NUX_MAX_COUNT: i64 = 4;
+
 /// Whether `config.toml` read as `after` loads what it did as `before`:
-/// the same read, or (cxkey) a rewrite whose only difference is in Codex's
-/// own bookkeeping ([`CODEX_BOOKKEEPING`]) and which does change it. Both
-/// are parsed; everything but those keys, in those shapes, must be equal,
-/// so any other key, a bookkeeping key of another shape, an unreadable or
-/// unparsable read, and a rewrite that leaves the bookkeeping as it was (a
-/// hand edit undone, a touch) all differ. An absent file loads as an empty
-/// one.
+/// the same read, or (cxkey) a rewrite whose only difference is a step
+/// forward in Codex's own bookkeeping ([`CODEX_BOOKKEEPING`],
+/// [`codex_bookkeeping_forward`]). Both are parsed; everything but those
+/// keys, in those shapes, must be equal, so any other key, a bookkeeping
+/// key of another shape, an unreadable or unparsable read, a rewrite that
+/// leaves the bookkeeping as it was (a hand edit undone, a touch) and one
+/// that moves it in a way Codex doesn't all differ. An absent file loads
+/// as an empty one.
 fn codex_config_unchanged(before: &SourceRead, after: &SourceRead) -> bool {
     if before == after {
         return true;
     }
     match (codex_config_split(before), codex_config_split(after)) {
         (Some((before, kept_before)), Some((after, kept_after))) => {
-            before == after && kept_before != kept_after
+            before == after && codex_bookkeeping_forward(&kept_before, &kept_after)
         }
         _ => false,
     }
+}
+
+/// Whether the bookkeeping `after` is one Codex could have written over
+/// `before` (the revcxkey review's M1), as both pinned releases write it:
+/// the screen-reader marker set to `true` where it was absent or `false`
+/// (`tui/src/screen_reader.rs`, which writes only `true`), and tooltip counts
+/// that each stay or rise by exactly 1 to at most [`CODEX_NUX_MAX_COUNT`],
+/// an absent count reading as 0 (`tui/src/app/startup_prompts.rs`, which
+/// raises one model's count by 1 per start and rewrites the others as they
+/// were), so a new model's count is 1. Something must move, and no key may
+/// go: a marker or a count removed, a marker cleared, a count lowered,
+/// raised by more than 1 or past the maximum, or a new one other than 1 is
+/// not Codex's write.
+fn codex_bookkeeping_forward(before: &toml::Table, after: &toml::Table) -> bool {
+    let marker = |kept: &toml::Table| {
+        kept.get(CODEX_BOOKKEEPING[0])
+            .and_then(toml::Value::as_bool)
+    };
+    let (marker_was, marker_now) = (marker(before), marker(after));
+    let marker_ok = marker_was == marker_now
+        || (matches!(marker_was, None | Some(false)) && marker_now == Some(true));
+    // [`codex_config_split`] keeps a table only when every count is an
+    // integer, so `as_integer` below fails only for a key that isn't kept.
+    let counts = |kept: &toml::Table| {
+        kept.get(CODEX_BOOKKEEPING[1])
+            .and_then(toml::Value::as_table)
+            .cloned()
+    };
+    let (counts_was, counts_now) = (counts(before), counts(after));
+    let table_kept = counts_was.is_none() || counts_now.is_some();
+    let (was, now) = (
+        counts_was.unwrap_or_default(),
+        counts_now.unwrap_or_default(),
+    );
+    let counts_ok = was.keys().all(|model| now.contains_key(model))
+        && now.iter().all(|(model, count)| {
+            let Some(count) = count.as_integer() else {
+                return false;
+            };
+            match was.get(model).map(toml::Value::as_integer) {
+                None => count == 1,
+                Some(Some(prior)) => {
+                    count == prior || (count == prior + 1 && count <= CODEX_NUX_MAX_COUNT)
+                }
+                Some(None) => false,
+            }
+        });
+    let moved = marker_was != marker_now || was != now;
+    marker_ok && table_kept && counts_ok && moved
 }
 
 /// `config.toml` parsed, and the bookkeeping taken out of it: the rest and
@@ -855,6 +911,10 @@ impl CodexBaseline {
 /// (a hand edit undone, which Codex may have reloaded meanwhile) still holds
 /// as changed.
 ///
+/// At most [`CODEX_REWRITES_PER_GENERATION`] bookkeeping rewrites are
+/// accepted per generation, each a step forward from the last accepted read
+/// ([`codex_bookkeeping_forward`]); a further one holds.
+///
 /// The first comparison that fails latches (the revcxkey review's H1): it is
 /// returned by that check and every later one of the generation, whatever
 /// they read, as [`ClaudeKeymap::check`] holds. A held read is never adopted.
@@ -874,7 +934,16 @@ struct CodexReadsState {
     last: CodexRead,
     /// The first comparison that failed, returned by every later check.
     held: Option<Hold>,
+    /// How many bookkeeping rewrites this generation has accepted.
+    rewrites: u8,
 }
+
+/// The most bookkeeping rewrites of `config.toml` one Codex generation
+/// accepts (the revcxkey review's M1): the cxkey measurement saw at most
+/// two per start, the screen-reader marker and one tooltip count on a
+/// home's first start, one count on each of the next three. A further
+/// rewrite holds as changed, which can only refuse more.
+pub const CODEX_REWRITES_PER_GENERATION: u8 = 2;
 
 impl CodexReads {
     /// A generation's reads from its spawn baseline.
@@ -884,6 +953,7 @@ impl CodexReads {
             state: std::sync::Mutex::new(CodexReadsState {
                 last: baseline.read.clone(),
                 held: None,
+                rewrites: 0,
             }),
         }
     }
@@ -903,7 +973,17 @@ impl CodexReads {
             if let Some(hold) = state.held {
                 return Err(hold);
             }
-            if let Err(hold) = codex_unchanged(&state.last, &now) {
+            let compared = codex_unchanged(&state.last, &now).and_then(|()| {
+                if state.last == now {
+                    Ok(())
+                } else if state.rewrites < CODEX_REWRITES_PER_GENERATION {
+                    state.rewrites += 1;
+                    Ok(())
+                } else {
+                    Err(Hold::Changed)
+                }
+            });
+            if let Err(hold) = compared {
                 state.held = Some(hold);
                 return Err(hold);
             }

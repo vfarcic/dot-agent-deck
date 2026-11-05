@@ -1254,7 +1254,7 @@ fn rewrite(path: &Path, contents: &str) {
     std::fs::rename(&tmp, path).unwrap();
 }
 
-/// Scenario: Read a Codex home's sources before its spawn, then rewrite `config.toml` the way real Codex 0.164.0 rewrote it on a fresh home's first five starts (measured): the screen-reader probe's `[tui] screen_reader_detection_done = true` once, then the startup tooltip's `[tui.model_availability_nux]` count raised from 1 to 4, each written to a new file renamed over the old. Each rewrite reads as the same sources as the spawn's, as does a home that had no `config.toml` before Codex wrote one, so the probe is allowed instead of held as changed.
+/// Scenario: Read a Codex home's sources before its spawn, then rewrite `config.toml` the way real Codex 0.164.0 rewrote it on a fresh home's first five starts (measured): the screen-reader probe's `[tui] screen_reader_detection_done = true` once, then the startup tooltip's `[tui.model_availability_nux]` count raised from 1 to 4, each written to a new file renamed over the old. Each rewrite reads as the same sources as the read before it, as does a home that had no `config.toml` before Codex wrote one, so the probe is allowed instead of held as changed.
 #[spec("inbox/probe/014")]
 #[test]
 fn probe_014_codexs_own_startup_writes_are_not_a_change() {
@@ -1264,13 +1264,10 @@ fn probe_014_codexs_own_startup_writes_are_not_a_change() {
     let before = sources.read();
     let marker = format!("{TRUSTED}\n[tui]\nscreen_reader_detection_done = true\n");
     rewrite(&codex.config(), &marker);
-    assert_ne!(
-        before,
-        sources.read(),
-        "the rewrite moved the file's identity"
-    );
+    let mut last = sources.read();
+    assert_ne!(before, last, "the rewrite moved the file's identity");
     assert_eq!(
-        codex_keymap(&before, &sources.read(), CODEX_ORDER),
+        codex_keymap(&before, &last, CODEX_ORDER),
         Ok(()),
         "the screen-reader marker"
     );
@@ -1279,11 +1276,13 @@ fn probe_014_codexs_own_startup_writes_are_not_a_change() {
             &codex.config(),
             &format!("{marker}\n[tui.model_availability_nux]\n\"gpt-6.1-sol\" = {count}\n"),
         );
+        let now = sources.read();
         assert_eq!(
-            codex_keymap(&before, &sources.read(), CODEX_ORDER),
+            codex_keymap(&last, &now, CODEX_ORDER),
             Ok(()),
             "the tooltip's count at {count}"
         );
+        last = now;
     }
 
     let fresh = Codex::new();
@@ -1467,4 +1466,218 @@ fn probe_014_a_held_codex_generation_stays_held() {
         Ok(()),
         "a new generation reads anew"
     );
+}
+
+/// `config.toml` as the deck's trust write leaves it plus Codex's
+/// bookkeeping: the screen-reader marker written as `marker` (absent for
+/// `None`) and the tooltip counts `counts` (no table for `None`), each value
+/// written as given.
+fn bookkeeping(marker: Option<&str>, counts: Option<&[(&str, &str)]>) -> String {
+    let mut text = TRUSTED.to_string();
+    if let Some(marker) = marker {
+        text += &format!("\n[tui]\nscreen_reader_detection_done = {marker}\n");
+    }
+    if let Some(counts) = counts {
+        text += "\n[tui.model_availability_nux]\n";
+        for (model, count) in counts {
+            text += &format!("\"{model}\" = {count}\n");
+        }
+    }
+    text
+}
+
+/// Scenario: Rewrite a Codex home's `config.toml` from one bookkeeping state to another, as a new file renamed over the old, and compare the two reads. A step Codex makes is accepted: the screen-reader marker set to `true` where it was absent or `false`, a new model's tooltip count at 1, a count raised by 1 up to 4 beside another left as it was, and the marker and a first count in one rewrite. Any other move holds as changed: the marker cleared, removed or written `false`, a count lowered, raised by 2 or past 4, a new count at 0 or 2, a model's count removed, and the count table removed.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_only_a_step_forward_in_codexs_bookkeeping_is_accepted() {
+    let a = "gpt-6.1-sol";
+    let b = "gpt-6.2";
+    type Counts<'a> = Option<&'a [(&'a str, &'a str)]>;
+    /// A row: its name, the bookkeeping before (marker, counts) and after,
+    /// and what the comparison should say.
+    type Row<'a> = (
+        &'a str,
+        Option<&'a str>,
+        Counts<'a>,
+        Option<&'a str>,
+        Counts<'a>,
+        Result<(), Hold>,
+    );
+    let rows: &[Row] = &[
+        ("marker set", None, None, Some("true"), None, Ok(())),
+        (
+            "marker false to true",
+            Some("false"),
+            None,
+            Some("true"),
+            None,
+            Ok(()),
+        ),
+        (
+            "a new count at 1",
+            Some("true"),
+            None,
+            Some("true"),
+            Some(&[(a, "1")]),
+            Ok(()),
+        ),
+        (
+            "a count 1 to 2",
+            Some("true"),
+            Some(&[(a, "1")]),
+            Some("true"),
+            Some(&[(a, "2")]),
+            Ok(()),
+        ),
+        (
+            "a count 3 to 4 beside another kept",
+            Some("true"),
+            Some(&[(a, "3"), (b, "2")]),
+            Some("true"),
+            Some(&[(a, "4"), (b, "2")]),
+            Ok(()),
+        ),
+        (
+            "marker and a first count at once",
+            None,
+            None,
+            Some("true"),
+            Some(&[(a, "1")]),
+            Ok(()),
+        ),
+        (
+            "marker cleared",
+            Some("true"),
+            None,
+            Some("false"),
+            None,
+            Err(Hold::Changed),
+        ),
+        (
+            "marker removed",
+            Some("true"),
+            Some(&[(a, "1")]),
+            None,
+            Some(&[(a, "1")]),
+            Err(Hold::Changed),
+        ),
+        (
+            "marker written false",
+            None,
+            None,
+            Some("false"),
+            None,
+            Err(Hold::Changed),
+        ),
+        (
+            "a count lowered",
+            Some("true"),
+            Some(&[(a, "2")]),
+            Some("true"),
+            Some(&[(a, "1")]),
+            Err(Hold::Changed),
+        ),
+        (
+            "a count raised by 2",
+            Some("true"),
+            Some(&[(a, "1")]),
+            Some("true"),
+            Some(&[(a, "3")]),
+            Err(Hold::Changed),
+        ),
+        (
+            "a count past 4",
+            Some("true"),
+            Some(&[(a, "4")]),
+            Some("true"),
+            Some(&[(a, "5")]),
+            Err(Hold::Changed),
+        ),
+        (
+            "a new count at 0",
+            Some("true"),
+            None,
+            Some("true"),
+            Some(&[(a, "0")]),
+            Err(Hold::Changed),
+        ),
+        (
+            "a new count at 2",
+            Some("true"),
+            None,
+            Some("true"),
+            Some(&[(a, "2")]),
+            Err(Hold::Changed),
+        ),
+        (
+            "a model's count removed",
+            Some("true"),
+            Some(&[(a, "1"), (b, "1")]),
+            Some("true"),
+            Some(&[(a, "2")]),
+            Err(Hold::Changed),
+        ),
+        (
+            "the count table removed",
+            Some("true"),
+            Some(&[(a, "1")]),
+            Some("true"),
+            None,
+            Err(Hold::Changed),
+        ),
+        (
+            "an empty count table removed",
+            Some("true"),
+            Some(&[]),
+            Some("true"),
+            None,
+            Err(Hold::Changed),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (row, marker_was, counts_was, marker_now, counts_now, expected) in rows {
+        let codex = Codex::new();
+        write(&codex.config(), &bookkeeping(*marker_was, *counts_was));
+        let sources = codex.sources(&[]);
+        let before = sources.read();
+        rewrite(&codex.config(), &bookkeeping(*marker_now, *counts_now));
+        let got = codex_keymap(&before, &sources.read(), CODEX_ORDER);
+        if got != *expected {
+            wrong.push(format!("{row}: {got:?}, expected {expected:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Scenario: Follow one Codex generation's checks on a fresh home while `config.toml` is rewritten as Codex's first start rewrites it (the marker, then the first tooltip count) and then once more with the next count. The first two rewrites are accepted, reading the unchanged file again in between costs nothing, and the third holds as changed for the rest of the generation. A new generation, as Codex's next start would be, accepts that same count.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_a_codex_generation_accepts_at_most_two_bookkeeping_rewrites() {
+    use dot_agent_deck::composer_probe::keymap::{CodexBaseline, CodexReads};
+    let codex = Codex::new();
+    write(&codex.config(), TRUSTED);
+    let cwd = codex.dir.path().join("project");
+    let reads = CodexReads::new(&CodexBaseline::at_spawn(&codex.home(), &[], &cwd).unwrap());
+    let count = |n: &'static str| bookkeeping(Some("true"), Some(&[("gpt-6.1-sol", n)]));
+
+    rewrite(&codex.config(), &bookkeeping(Some("true"), None));
+    assert_eq!(reads.check(CODEX_ORDER), Ok(()), "the marker");
+    for _ in 0..3 {
+        assert_eq!(reads.check(CODEX_ORDER), Ok(()), "the marker read again");
+    }
+    rewrite(&codex.config(), &count("1"));
+    assert_eq!(reads.check(CODEX_ORDER), Ok(()), "the first count");
+    rewrite(&codex.config(), &count("2"));
+    assert_eq!(
+        reads.check(CODEX_ORDER),
+        Err(Hold::Changed),
+        "a third rewrite"
+    );
+    assert_eq!(reads.check(CODEX_ORDER), Err(Hold::Changed), "read again");
+
+    let codex = Codex::new();
+    write(&codex.config(), &count("1"));
+    let next = CodexReads::new(&CodexBaseline::at_spawn(&codex.home(), &[], &cwd).unwrap());
+    rewrite(&codex.config(), &count("2"));
+    assert_eq!(next.check(CODEX_ORDER), Ok(()), "the next start's count");
 }
