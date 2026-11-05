@@ -626,14 +626,14 @@ On macOS the deck doesn't check the input box yet and leaves Claude Code's envir
 
 ### Turn the doorbell off for an agent
 
-The deck types the doorbell into every version of Claude Code and Codex, and checks Claude Code's input box, the same way. If an update to one of them makes the doorbell misbehave, for example the line lands somewhere it shouldn't, Enter isn't taken, or Claude Code's input box flickers or your editor opens on its own, turn the doorbell off for that agent until a deck release fixes it:
+The deck types the doorbell into every release of Claude Code and Codex, and checks Claude Code's input box, the same way. A pre-release build, whose version carries a suffix such as `-beta.1` or `-alpha.1`, gets neither, because the deck can't read its version: its card says `waiting for the agent to fetch it. Send it a prompt.` ([`unknown_release`](troubleshooting.md#a-card-says-waiting-for-the-agent-to-fetch-it-send-it-a-prompt)). If an update to one of them makes the doorbell misbehave, for example the line lands somewhere it shouldn't, Enter isn't taken, or Claude Code's input box flickers or your editor opens on its own, turn the doorbell off for that agent until a deck release fixes it:
 
 ```sh
 dot-agent-deck config set doorbell.claude false
 dot-agent-deck config set doorbell.codex false
 ```
 
-Or set `DOT_AGENT_DECK_DOORBELL_CLAUDE=0` or `DOT_AGENT_DECK_DOORBELL_CODEX=0` in the environment the deck starts in, which wins over the config file ([Configuration](configuration.md#turn-the-doorbell-off-for-claude-code-or-codex)). The setting applies to agents started after you change it, so restart the agent from the deck once it has taken its messages.
+The config key is the one to use, and the one that works with the desktop app: the daemon reads it each time it starts an agent. `DOT_AGENT_DECK_DOORBELL_CLAUDE=0` or `DOT_AGENT_DECK_DOORBELL_CODEX=0` wins over the config file, but only in the daemon's own environment when it starts: a daemon that is already running, or one the desktop app started after you opened it from the Dock, Finder or an application menu, never sees a variable you set in a shell ([Configuration](configuration.md#turn-the-doorbell-off-for-claude-code-or-codex)). The setting applies to agents started after you change it, so restart the agent from the deck once it has taken its messages.
 
 With the doorbell off for an agent, the deck types nothing into it and doesn't check its input box, and Claude Code gets your own `VISUAL` and `EDITOR`. Its messages still arrive through its own wake-up and hooks; when nothing else delivers them, the TUI card and the desktop tile say `waiting for the agent to fetch it. Send it a prompt.`, and a prompt you send it, in the TUI or the desktop app, hands it the messages at that turn. Set the key back to `true` to turn the doorbell on again. Please report what you saw, with the agent's version, so the deck can be fixed.
 
