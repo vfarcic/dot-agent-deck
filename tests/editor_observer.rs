@@ -397,7 +397,7 @@ fn probe_070_the_drain_reschedules_while_evidence_is_undrained() {
 fn probe_071_the_control_verb_is_bounded_and_idempotent() {
     for permission in [
         Permission::Pending,
-        Permission::Inert(InertCause::UnmeasuredRelease),
+        Permission::Inert(InertCause::UnsupportedAgent),
     ] {
         let mut s = seam(permission);
         assert_eq!(

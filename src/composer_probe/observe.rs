@@ -81,8 +81,8 @@
 //! load, or on an editor path, is never killed.
 //!
 //! **Permission** (plan §1.2, Q84). A generation is armable once its header
-//! latched an exact release with a verified `editor_probe` record and `A`
-//! is bound; then `gen-G` is written. A direct Claude's `A` comes from the
+//! latched a release, its agent's facts have a verified `editor_probe`, and
+//! `A` is bound; then `gen-G` is written. A direct Claude's `A` comes from the
 //! deck's own launch record ([`bound_agent`]): the PTY child the deck
 //! spawned, or the one child of the deck's own `sh -c`, running the agent's
 //! executable with the argv the launch gives it. Every other installed
@@ -3174,12 +3174,14 @@ mod linux {
                 }
                 Err(None) => (Binding::Waiting, None),
             };
-            let records = crate::doorbell_activation::with_assumed_editor_probes(
-                crate::doorbell_activation::RELEASE_RECORDS.to_vec(),
+            let facts = &crate::doorbell_activation::AGENT_FACTS;
+            let mut permission = crate::composer_probe::permission(
+                facts,
                 self.assumed,
+                agent,
+                header.as_ref(),
+                binding,
             );
-            let mut permission =
-                crate::composer_probe::permission(&records, agent, header.as_ref(), binding);
             // An undeclared wrapper's kind goes in `kind-G` before `gen-G`
             // names its `A` (Q35-22: `kind = learned` to its agent's kind).
             let learned_kind = (self.kind == Kind::Learned)
@@ -3216,13 +3218,13 @@ mod linux {
             // settlement compares a fresh read with.
             if permission == Permission::Armable
                 && let Some(LatchedRelease::Known(release)) = header.as_ref()
-                && let Some(probe) = records
-                    .iter()
-                    .find(|r| r.agent == *agent && r.release == *release)
-                    .and_then(|r| match r.editor_probe {
-                        crate::doorbell_activation::Measurement::Verified(probe) => Some(probe),
-                        _ => None,
-                    })
+                && let crate::doorbell_activation::Measurement::Verified(probe) =
+                    crate::doorbell_activation::editor_probe_for(
+                        facts,
+                        self.assumed,
+                        agent,
+                        release,
+                    )
             {
                 #[cfg(test)]
                 self.stamp_park

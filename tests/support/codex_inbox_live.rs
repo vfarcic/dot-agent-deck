@@ -83,38 +83,28 @@ pub fn installed_codex_release() -> Result<String, String> {
 }
 
 /// The preflight of a test that needs the doorbell typed into Codex: the
-/// installed release has a record the deck types into. Otherwise the reason,
-/// so the test reports `SKIP:` (UNVERIFIED under
-/// `DOT_AGENT_DECK_REQUIRE_REAL_E2E`).
+/// deck's Codex facts admit the installed release, as they admit every
+/// release (the facts are the agent's, not a release's), so this fails only
+/// when the facts themselves are not `Go`. Otherwise the reason, so the test
+/// reports `SKIP:` (UNVERIFIED under `DOT_AGENT_DECK_REQUIRE_REAL_E2E`).
 pub fn codex_release_measured() -> Result<(), String> {
     use dot_agent_deck::doorbell_activation::{
-        Activation, LatchedRelease, RELEASE_RECORDS, activation, measured_releases,
+        AGENT_FACTS, Activation, LatchedRelease, activation,
     };
     use dot_agent_deck::event::AgentType;
     let installed = installed_codex_release()?;
     eprintln!("Codex release under test: {installed}");
-    let go = |release: &semver::Version| {
-        matches!(
-            activation(
-                &RELEASE_RECORDS,
-                &AgentType::Codex,
-                &LatchedRelease::Known(release.clone()),
-            ),
-            Activation::Go { .. }
-        )
-    };
     let version = semver::Version::parse(&installed).map_err(|e| e.to_string())?;
-    if go(&version) {
-        Ok(())
-    } else {
-        let typed: Vec<String> = measured_releases(&RELEASE_RECORDS, &AgentType::Codex)
-            .into_iter()
-            .filter(|v| go(v))
-            .map(|v| v.to_string())
-            .collect();
-        Err(format!(
-            "Codex {installed} is installed, and the deck types the doorbell only into {typed:?}"
-        ))
+    match activation(
+        &AGENT_FACTS,
+        &AgentType::Codex,
+        &LatchedRelease::Known(version),
+    ) {
+        Activation::Go { .. } => Ok(()),
+        Activation::NoGo(no_go) => Err(format!(
+            "the deck's Codex facts are not Go ({}), so it types no doorbell into Codex {installed}",
+            no_go.clause()
+        )),
     }
 }
 

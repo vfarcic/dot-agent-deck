@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use dot_agent_deck::doorbell_activation::{
-    Activation, Measurement, NoGo, RELEASE_RECORDS, ReleaseRecord, exact_verdict,
+    AGENT_FACTS, Activation, AgentFacts, Measurement, NoGo, RECORDED_RELEASES, facts_verdict,
 };
 use dot_agent_deck::doorbell_screen::{
     CLAUDE_PROFILE, CODEX_PROFILE, ComposerText, Dialog, Grid, ScreenProfile, WidthsSeen,
@@ -1220,16 +1220,31 @@ fn doorbell_036_strict_withdrawal_refusals() {
     );
 }
 
-/// Scenario: Take each recorded Codex release's measured key effects and ask the table about a record whose every other measurement is verified, its head echo included. Every byte of the line's first stage, the token head `(xxxxxx)`, is inert in every dialog, so the release is Go and staged with a first stage of eight characters; the same record with a token letter made to commit in folder trust is first_stage_commits naming that dialog and key, and without its head echo it is missing_measurement.
+/// Scenario: Take each recorded Codex release's measured key effects, and Codex's facts' own, and ask the table about facts whose every other measurement is verified, its head echo included. Every byte of the line's first stage, the token head `(xxxxxx)`, is inert in every dialog, so the release is Go and staged with a first stage of eight characters; the same record with a token letter made to commit in folder trust is first_stage_commits naming that dialog and key, and without its head echo it is missing_measurement.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_go_no_go_over_measured_key_effects() {
     use dot_agent_deck::doorbell_activation::{DialogKeys, KeyEffect, first_stage_bytes};
-    for record in RELEASE_RECORDS
+    let tables = RECORDED_RELEASES
         .iter()
-        .filter(|r| r.agent == AgentType::Codex)
-    {
-        let Measurement::Verified(dialogs) = record.key_effects else {
+        .filter(|r| r.measured.agent == AgentType::Codex)
+        .map(|r| (r.release.to_string(), &r.measured))
+        .chain(
+            AGENT_FACTS
+                .iter()
+                .filter(|f| f.agent == AgentType::Codex)
+                .map(|f| ("Codex's facts".to_string(), f)),
+        );
+    for (release, record) in tables {
+        struct Named<'a> {
+            release: String,
+            facts: &'a AgentFacts<'static>,
+        }
+        let record = Named {
+            release,
+            facts: record,
+        };
+        let Measurement::Verified(dialogs) = record.facts.key_effects else {
             panic!("{}: key effects measured", record.release);
         };
         // Every key the line can contain, plus DEL and CR, in every dialog.
@@ -1248,7 +1263,7 @@ fn doorbell_036_go_no_go_over_measured_key_effects() {
                 );
             }
         }
-        let complete = |key_effects, head_echo| ReleaseRecord {
+        let complete = |key_effects, head_echo| AgentFacts {
             ready_composer: Measurement::Verified(()),
             echo: Measurement::Verified(()),
             submit_route: Measurement::Verified(()),
@@ -1258,12 +1273,12 @@ fn doorbell_036_go_no_go_over_measured_key_effects() {
             release_recogniser: Measurement::Verified(()),
             parser_cost: Measurement::Verified(()),
             head_echo,
-            ..record.clone()
+            ..record.facts.clone()
         };
         assert_eq!(first_stage_bytes().count(), TOKEN_HEAD_ALPHABET);
         assert!(
             matches!(
-                exact_verdict(&complete(
+                facts_verdict(&complete(
                     Measurement::Verified(dialogs),
                     Measurement::Verified(())
                 )),
@@ -1273,7 +1288,7 @@ fn doorbell_036_go_no_go_over_measured_key_effects() {
             record.release
         );
         assert_eq!(
-            exact_verdict(&complete(
+            facts_verdict(&complete(
                 Measurement::Verified(dialogs),
                 Measurement::Absent
             )),
@@ -1305,7 +1320,7 @@ fn doorbell_036_go_no_go_over_measured_key_effects() {
             })
             .collect();
         assert_eq!(
-            exact_verdict(&complete(
+            facts_verdict(&complete(
                 Measurement::Verified(&edited),
                 Measurement::Verified(())
             )),

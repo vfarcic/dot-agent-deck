@@ -433,15 +433,16 @@ fn installed_claude_release() -> Result<String, String> {
         .ok_or_else(|| format!("`claude --version` printed no release: {text:?}"))
 }
 
-/// Whether the deck types into Claude Code `release`: a complete record of
-/// its own activates it.
+/// Whether the deck types into Claude Code `release`: Claude Code's facts
+/// admit every latched release, so this is false only when the facts are not
+/// `Go`.
 #[cfg(target_os = "linux")]
 fn measured(release: &str) -> bool {
-    use dot_agent_deck::doorbell_activation::{Activation, LatchedRelease, RELEASE_RECORDS};
+    use dot_agent_deck::doorbell_activation::{AGENT_FACTS, Activation, LatchedRelease};
     semver::Version::parse(release).is_ok_and(|version| {
         matches!(
             dot_agent_deck::doorbell_activation::activation(
-                &RELEASE_RECORDS,
+                &AGENT_FACTS,
                 &dot_agent_deck::event::AgentType::ClaudeCode,
                 &LatchedRelease::Known(version),
             ),
@@ -450,19 +451,8 @@ fn measured(release: &str) -> bool {
     })
 }
 
-/// The Claude Code releases the deck has measured.
-#[cfg(target_os = "linux")]
-fn measured_releases() -> Vec<String> {
-    dot_agent_deck::doorbell_activation::RELEASE_RECORDS
-        .iter()
-        .filter(|record| record.agent == dot_agent_deck::event::AgentType::ClaudeCode)
-        .map(|record| record.release.to_string())
-        .filter(|release| measured(release))
-        .collect()
-}
-
-/// `inbox/claude/014`'s preflight: it runs only on a release the deck has
-/// measured, and is otherwise UNVERIFIED, never green.
+/// `inbox/claude/014`'s preflight: it runs only when the deck types into the
+/// installed release, and is otherwise UNVERIFIED, never green.
 #[cfg(target_os = "linux")]
 fn claude_release_measured() -> Result<(), String> {
     let installed = installed_claude_release()?;
@@ -471,14 +461,13 @@ fn claude_release_measured() -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "Claude Code {installed} is installed, and the deck has measured only {:?}: \
-             the doorbell does not type into it",
-            measured_releases()
+            "Claude Code {installed} is installed, and the deck's Claude Code facts are not Go: \
+             the doorbell does not type into it"
         ))
     }
 }
 
-/// Scenario: On a Claude Code release the deck has measured, capture the pid of the scratch pane's armed waiter and kill that process, then post a task after the waiter disconnects. The token-led doorbell must wake interactive Haiku, whose submit hook injects and acknowledges the task and shows an envelope label before the sentinel is written; on a release the deck has not measured the test reports SKIP naming both.
+/// Scenario: On the installed Claude Code release, capture the pid of the scratch pane's armed waiter and kill that process, then post a task after the waiter disconnects. The token-led doorbell must wake interactive Haiku, whose submit hook injects and acknowledges the task and shows an envelope label before the sentinel is written; if the deck's Claude Code facts are not Go the test reports SKIP saying so.
 #[spec("inbox/claude/014")]
 #[test]
 #[cfg(target_os = "linux")]
@@ -502,11 +491,11 @@ fn claude_014_live_killed_waiter_falls_back_to_injection() {
     );
 }
 
-/// Scenario: Run interactive Haiku in a deck that treats the installed Claude Code release as unmeasured, kill its scratch pane's armed waiter, and post a directive task naming a sentinel. The daemon's release line must name the installed release as latched and its `doorbell off` line must name unmeasured_release; for 20 seconds after that no doorbell rings or shows on the pane's screen or in its last prompt, the task stays queued, and the card shows the cannot_type words. The test then types a short prompt into the pane and presses Enter: the prompt hook hands Haiku the task, Haiku writes the sentinel, and the task is acknowledged.
+/// Scenario: Run interactive Haiku in a deck started with the Claude Code doorbell turned off (`DOT_AGENT_DECK_DOORBELL_CLAUDE=0`), kill its scratch pane's armed waiter, and post a directive task naming a sentinel. The daemon's release line must name the installed release as latched and its `doorbell off` line must name turned_off; for 20 seconds after that no doorbell rings or shows on the pane's screen or in its last prompt, the task stays queued, and the card shows the cannot_type words. The test then types a short prompt into the pane and presses Enter: the prompt hook hands Haiku the task, Haiku writes the sentinel, and the task is acknowledged.
 #[spec("inbox/claude/050")]
 #[test]
 #[cfg(target_os = "linux")]
-fn claude_050_live_unmeasured_release_is_held_and_a_prompt_delivers() {
+fn claude_050_live_turned_off_doorbell_is_held_and_a_prompt_delivers() {
     skip_unless!(common::check_claude_available());
     let release = match installed_claude_release() {
         Ok(release) => release,
@@ -518,10 +507,10 @@ fn claude_050_live_unmeasured_release_is_held_and_a_prompt_delivers() {
     eprintln!("Claude Code release under test: {release}");
     let claude = Claude::launch_with(
         &common::capability_export_command(&format!("exec {CLAUDE}")),
-        &[("DOT_AGENT_DECK_E2E_UNRECORD_CLAUDE_RELEASES", &release)],
+        &[(dot_agent_deck::doorbell_switch::CLAUDE_ENV, "0")],
     );
     // The cause is proved, not assumed: the installed release latched, and
-    // the doorbell held as unmeasured_release.
+    // the doorbell held as turned_off.
     let latched = format!("release={release}");
     let saw_latch = common::wait_until(BUDGET, || {
         claude
@@ -547,21 +536,18 @@ fn claude_050_live_unmeasured_release_is_held_and_a_prompt_delivers() {
         "the waiter must go; {}",
         claude.evidence()
     );
-    let name = "unmeasured-release-4d17b2.txt";
+    let name = "turned-off-doorbell-4d17b2.txt";
     let id = claude.post(&claude.directive(name));
-    let held = common::wait_until(BUDGET, || {
-        claude
-            .log()
-            .lines()
-            .any(|line| line.contains("doorbell off") && line.contains("unmeasured_release"))
-    });
-    if !held {
-        skip_unless!(Err(format!(
-            "no `doorbell off` line named unmeasured_release; {}",
-            claude.evidence()
-        )));
-        return;
-    }
+    assert!(
+        common::wait_until(BUDGET, || {
+            claude
+                .log()
+                .lines()
+                .any(|line| line.contains("doorbell off") && line.contains("turned_off"))
+        }),
+        "no `doorbell off` line named turned_off; {}",
+        claude.evidence()
+    );
     assert!(
         !common::wait_until(Duration::from_secs(20), || {
             claude.log().contains("doorbell rang") || claude.pane_grid().contains("waiting, run:")

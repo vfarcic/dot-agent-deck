@@ -221,6 +221,33 @@ pub enum NotInstalled {
     Platform,
     /// The helper couldn't be set up.
     HelperSetup(SetupError),
+    /// The user turned the doorbell off for the pane's agent
+    /// ([`crate::doorbell_switch`]); an undeclared wrapper, whose agent is not
+    /// known yet, while either agent's is off.
+    TurnedOff,
+}
+
+/// Whether `switch` leaves `class` installable: the class's agent's switch
+/// on, and for an undeclared wrapper, both.
+pub fn switched_on(
+    class: PaneClass,
+    switch: &crate::doorbell_switch::DoorbellSwitch,
+) -> Result<(), NotInstalled> {
+    let on = match class {
+        PaneClass::Direct(ProbeAgent::Claude) | PaneClass::Launcher(ProbeAgent::Claude) => {
+            switch.claude
+        }
+        PaneClass::Direct(ProbeAgent::Codex) | PaneClass::Launcher(ProbeAgent::Codex) => {
+            switch.codex
+        }
+        PaneClass::Wrapper => switch.claude && switch.codex,
+        PaneClass::Unprobed | PaneClass::Shell => true,
+    };
+    if on {
+        Ok(())
+    } else {
+        Err(NotInstalled::TurnedOff)
+    }
 }
 
 /// Whether `class` is installed under `rollout`.
@@ -893,18 +920,21 @@ fn daemon_instance() -> Result<&'static Instance, SetupError> {
 }
 
 /// The installation decision for a spawn of generation `generation` running
-/// `command`, declared as `declared`, with `env` its own variables: whether
-/// it is installed, and if so, everything it gets.
+/// `command`, declared as `declared`, with `env` its own variables, under the
+/// doorbell `switch` the daemon read for it: whether it is installed, and if
+/// so, everything it gets.
 pub fn at_spawn(
     command: Option<&str>,
     declared: Option<&AgentType>,
     generation: &str,
     env: &[(String, String)],
+    switch: &crate::doorbell_switch::DoorbellSwitch,
 ) -> Result<Installation, NotInstalled> {
     let class = pane_class(command, declared);
     let mut rollout = INSTALL_ROLLOUT.to_vec();
     rollout.extend(assumed_classes(captured_assumption()));
     eligible(class, &rollout)?;
+    switched_on(class, switch)?;
     #[cfg(target_os = "linux")]
     {
         let setup = || {

@@ -1,6 +1,7 @@
-//! `inbox/doorbell/053`: the composer probe's permission to arm, from a
-//! release's `editor_probe` record, and the e2e assumption that stands in for
-//! one (`src/composer_probe/mod.rs`, `src/doorbell_activation.rs`).
+//! `inbox/doorbell/053`: the composer probe's permission to arm, from the
+//! agent's `editor_probe` facts, and the e2e assumption that stands in for
+//! them on a named release (`src/composer_probe/mod.rs`,
+//! `src/doorbell_activation.rs`).
 #[cfg(all(not(feature = "e2e"), target_os = "linux"))]
 mod common;
 #[cfg(all(not(feature = "e2e"), target_os = "linux"))]
@@ -12,9 +13,9 @@ mod installation;
 
 use dot_agent_deck::composer_probe::{Binding, InertCause, Permission, permission};
 use dot_agent_deck::doorbell_activation::{
-    EditorProbe, EditorSelection, ExportShape, KeymapSource, LatchedRelease, Measurement,
-    PasteToggles, RELEASE_RECORDS, ReleaseRecord, assumed_editor_probes,
-    parse_assumed_editor_probes, with_assumed_editor_probes,
+    AGENT_FACTS, AgentFacts, CLAUDE_FACTS, CODEX_FACTS, EditorProbe, EditorSelection, ExportShape,
+    KeymapSource, LatchedRelease, Measurement, PasteToggles, RECORDED_RELEASES,
+    assumed_editor_probes, parse_assumed_editor_probes,
 };
 use dot_agent_deck::event::AgentType;
 use semver::Version;
@@ -40,17 +41,23 @@ const PROBE: EditorProbe<'static> = EditorProbe {
     pasted_bel_is_text: Measurement::Absent,
 };
 
-/// The shipped records with Claude Code 2.1.310's editor record verified.
-fn claude_verified() -> Vec<ReleaseRecord<'static>> {
-    with_assumed_editor_probes(RELEASE_RECORDS.to_vec(), &[(CLAUDE, v("2.1.310"), PROBE)])
+/// The shipped facts with Claude Code's editor probe set to `PROBE`.
+fn claude_verified() -> Vec<AgentFacts<'static>> {
+    vec![
+        AgentFacts {
+            editor_probe: Measurement::Verified(PROBE),
+            ..CLAUDE_FACTS
+        },
+        CODEX_FACTS,
+    ]
 }
 
-/// Scenario: Ask for the permission to arm on generations whose header has not arrived, latched nothing, latched two releases or had its scanner dropped, latched a release with a verified editor record, one whose record has none, and one with no record at all, each while the agent root is still being looked for, bound, or never to be bound. Only a verified exact record with the root bound is armable; a release that cannot permit, or a root never bound, settles the generation as inert at once, and anything else waits.
+/// Scenario: Ask for the permission to arm on Claude Code generations whose header has not arrived, latched nothing, latched two releases or had its scanner dropped, or latched a release (one recorded, a patch past it, an older one, a number from another agent's range), with Claude Code's editor-probe fact verified and in every other state, each while the agent root is still being looked for, bound, or never to be bound; and on agents with no facts or no verified editor probe. Any latched release with the fact verified and the root bound is armable; a header that latched nothing, a fact not verified, an agent with no facts, or a root never bound settles the generation as inert at once, and anything else waits.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_permission_needs_the_header_a_verified_record_and_the_root() {
     use Binding::{Bound, Never, Waiting};
-    use InertCause::{NoEditorRecord, Unbound, UnknownRelease, UnmeasuredRelease};
+    use InertCause::{NoEditorRecord, Unbound, UnknownRelease, UnsupportedAgent};
     use Permission::{Armable, Inert, Pending};
     let records = claude_verified();
     let known = |r: &str| Some(LatchedRelease::Known(v(r)));
@@ -77,86 +84,99 @@ fn doorbell_053_permission_needs_the_header_a_verified_record_and_the_root() {
             [Inert(UnknownRelease); 3],
         ),
         (
-            "verified record",
+            "a recorded release",
             known("2.1.310"),
             [Pending, Armable, Inert(Unbound)],
         ),
         (
-            "unmeasured, a patch past it",
+            "a patch past it",
             known("2.1.311"),
-            [Inert(UnmeasuredRelease); 3],
+            [Pending, Armable, Inert(Unbound)],
         ),
         (
-            "unmeasured, older",
+            "older",
             known("2.1.300"),
-            [Inert(UnmeasuredRelease); 3],
+            [Pending, Armable, Inert(Unbound)],
         ),
         (
-            "unmeasured, Codex's release number",
+            "Codex's release number",
             known("0.164.0"),
-            [Inert(UnmeasuredRelease); 3],
+            [Pending, Armable, Inert(Unbound)],
         ),
     ];
     for (name, header, want) in &cases {
         for (binding, want) in [Waiting, Bound, Never].into_iter().zip(want) {
             assert_eq!(
-                permission(&records, &CLAUDE, header.as_ref(), binding),
+                permission(&records, &[], &CLAUDE, header.as_ref(), binding),
                 *want,
                 "{name}, {binding:?}"
             );
         }
     }
-    // A record without a verified editor record, in every state but verified.
+    // Facts without a verified editor probe, in every state but verified.
     for editor in [
         Measurement::Absent,
         Measurement::Unverified,
         Measurement::Failed,
-        Measurement::Unraisable,
     ] {
         let records: Vec<_> = records
             .iter()
-            .map(|r| ReleaseRecord {
+            .map(|r| AgentFacts {
                 editor_probe: editor,
                 ..r.clone()
             })
             .collect();
         for binding in [Waiting, Bound, Never] {
-            assert_eq!(
-                permission(&records, &CLAUDE, known("2.1.310").as_ref(), binding),
-                Inert(NoEditorRecord),
-                "{editor:?} {binding:?}"
-            );
+            for release in ["2.1.310", "2.1.311"] {
+                assert_eq!(
+                    permission(&records, &[], &CLAUDE, known(release).as_ref(), binding),
+                    Inert(NoEditorRecord),
+                    "{editor:?} {binding:?} {release}"
+                );
+            }
         }
     }
-    // The record must be the generation's own agent's.
+    // The probe must be the generation's own agent's: Codex's facts have none.
     assert_eq!(
-        permission(&records, &CODEX, known("2.1.310").as_ref(), Bound),
-        Inert(UnmeasuredRelease)
+        permission(&records, &[], &CODEX, known("2.1.310").as_ref(), Bound),
+        Inert(NoEditorRecord)
     );
-    // An incomplete ring record decides nothing here: the editor record does.
+    // An agent with no facts.
+    for agent in [AgentType::OpenCode, AgentType::Pi, AgentType::Devin] {
+        assert_eq!(
+            permission(&records, &[], &agent, known("2.1.310").as_ref(), Bound),
+            Inert(UnsupportedAgent),
+            "{agent:?}"
+        );
+    }
+    // Incomplete ring facts decide nothing here: the editor probe does.
     let incomplete: Vec<_> = records
         .iter()
-        .map(|r| ReleaseRecord {
+        .map(|r| AgentFacts {
             echo: Measurement::Unverified,
             head_echo: Measurement::Absent,
             ..r.clone()
         })
         .collect();
     assert_eq!(
-        permission(&incomplete, &CLAUDE, known("2.1.310").as_ref(), Bound),
+        permission(&incomplete, &[], &CLAUDE, known("2.1.310").as_ref(), Bound),
         Armable
     );
 }
 
-/// Scenario: Ask for the permission to arm on every release the deck ships a record for, with the records as shipped and with no e2e assumption read. Only Claude Code 2.1.317 and 2.1.318, whose editor records the Claude activation verified, can arm: each waits while its root is looked for, is armable once the root is bound, and is inert when it is never bound. Every other release is inert for its missing editor record, however its root is bound.
+/// Scenario: Ask for the permission to arm on every recorded release and on releases nobody measured, with the facts as shipped and with no e2e assumption read. Every Claude Code release, whose editor probe the Claude activation verified, can arm: each waits while its root is looked for, is armable once the root is bound, and is inert when it is never bound. Every Codex release is inert for its missing editor probe, however its root is bound.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_only_the_activated_release_is_armable() {
     assert!(assumed_editor_probes().is_empty());
-    for record in &RELEASE_RECORDS {
-        let header = LatchedRelease::Known(record.release.clone());
-        let activated = record.agent == CLAUDE
-            && (record.release == v("2.1.317") || record.release == v("2.1.318"));
+    let releases: Vec<(AgentType, Version)> = RECORDED_RELEASES
+        .iter()
+        .map(|r| (r.measured.agent.clone(), r.release.clone()))
+        .chain([(CLAUDE, v("2.1.320")), (CODEX, v("0.170.0"))])
+        .collect();
+    for (agent, release) in &releases {
+        let header = LatchedRelease::Known(release.clone());
+        let activated = *agent == CLAUDE;
         for binding in [Binding::Waiting, Binding::Bound, Binding::Never] {
             let expected = match (activated, &binding) {
                 (false, _) => Permission::Inert(InertCause::NoEditorRecord),
@@ -165,17 +185,15 @@ fn doorbell_053_only_the_activated_release_is_armable() {
                 (true, Binding::Never) => Permission::Inert(InertCause::Unbound),
             };
             assert_eq!(
-                permission(&RELEASE_RECORDS, &record.agent, Some(&header), binding),
+                permission(&AGENT_FACTS, &[], agent, Some(&header), binding),
                 expected,
-                "{:?} {}",
-                record.agent,
-                record.release
+                "{agent:?} {release}"
             );
         }
     }
 }
 
-/// Scenario: Run this test again in separate subprocesses of a build without the e2e feature, with valid and malformed editor-probe assumption variables set. The production reader ignores both values: only Claude Code 2.1.317 and 2.1.318, whose editor records the Claude activation verified, can arm, and every other shipped release, those the variable names among them, stays unable to arm. On Linux, the actual production daemon also starts synthetic commands: a direct Claude Code gets the installation the activation rolled out (the deck's helper as its editor and a tool environment file), every other command keeps its original editor environment, whatever the variable names, and every complete argv survives unchanged.
+/// Scenario: Run this test again in separate subprocesses of a build without the e2e feature, with valid and malformed editor-probe assumption variables set. The production reader ignores both values: every Claude Code release can arm on Claude Code's verified editor-probe fact, and every Codex release, those the variable names among them, stays unable to arm. On Linux, the actual production daemon also starts synthetic commands: a direct Claude Code gets the installation the activation rolled out (the deck's helper as its editor and a tool environment file), every other command keeps its original editor environment, whatever the variable names, and every complete argv survives unchanged.
 #[spec("inbox/probe/012")]
 #[test]
 #[cfg(not(feature = "e2e"))]
@@ -188,26 +206,25 @@ fn probe_012_production_reader_ignores_set_editor_assumption() {
             assumed_editor_probes().is_empty(),
             "a set e2e variable must not supply production editor records"
         );
-        for record in &RELEASE_RECORDS {
-            let header = LatchedRelease::Known(record.release.clone());
-            let expected = if record.agent == CLAUDE
-                && (record.release == v("2.1.317") || record.release == v("2.1.318"))
-            {
+        for recorded in &RECORDED_RELEASES {
+            let agent = &recorded.measured.agent;
+            let header = LatchedRelease::Known(recorded.release.clone());
+            let expected = if *agent == CLAUDE {
                 Permission::Armable
             } else {
                 Permission::Inert(InertCause::NoEditorRecord)
             };
             assert_eq!(
                 permission(
-                    &RELEASE_RECORDS,
-                    &record.agent,
+                    &AGENT_FACTS,
+                    &assumed_editor_probes(),
+                    agent,
                     Some(&header),
                     Binding::Bound
                 ),
                 expected,
-                "{:?} {}: the production build's own records decide, not the variable",
-                record.agent,
-                record.release
+                "{agent:?} {}: the production build's own facts decide, not the variable",
+                recorded.release
             );
         }
         #[cfg(target_os = "linux")]
@@ -278,11 +295,11 @@ fn probe_012_production_reader_ignores_set_editor_assumption() {
     }
 }
 
-/// Scenario: Parse e2e assumption lists naming recorded `agent@release` entries, and lists with an entry that is unknown: another agent, the agent's serialized name, a release with no record, another agent's release, a pre-release or build, a missing agent or release, an empty entry, an entry named twice. A list of known entries gives exactly those pairs; any unknown entry refuses the whole list, also next to known ones.
+/// Scenario: Parse e2e assumption lists naming `agent@release` entries, a release nobody recorded and a number from another agent's range among them, and lists with an entry that is not one: another agent, the agent's serialized name, a pre-release or build, a missing agent or release, an empty entry, an entry named twice. A list of valid entries gives exactly those pairs; any other entry refuses the whole list, also next to valid ones.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_the_editor_probe_assumption_refuses_unknown_entries() {
-    let parse = |list: &str| parse_assumed_editor_probes(list, &RELEASE_RECORDS);
+    let parse = parse_assumed_editor_probes;
     assert_eq!(parse(""), Ok(Vec::new()));
     assert_eq!(parse("  "), Ok(Vec::new()));
     assert_eq!(
@@ -293,15 +310,18 @@ fn doorbell_053_the_editor_probe_assumption_refuses_unknown_entries() {
             (CODEX, v("0.160.0")),
         ])
     );
+    assert_eq!(
+        parse("claude@2.1.399,codex@2.1.310,claude@0.164.0"),
+        Ok(vec![
+            (CLAUDE, v("2.1.399")),
+            (CODEX, v("2.1.310")),
+            (CLAUDE, v("0.164.0")),
+        ])
+    );
     for unknown in [
         "opencode@2.1.310",
         "claude_code@2.1.310",
         "Claude@2.1.310",
-        "claude@2.1.311",
-        "claude@2.1.300",
-        "codex@0.165.0",
-        "codex@2.1.310",
-        "claude@0.164.0",
         "claude@2.1.310-beta.1",
         "claude@2.1.310+build",
         "claude@2.1",
@@ -319,15 +339,15 @@ fn doorbell_053_the_editor_probe_assumption_refuses_unknown_entries() {
     }
 }
 
-/// Scenario: Give Claude Code 2.1.310 the e2e assumption's verified editor record, then ask for the permission to arm on Claude Code generations whose header has not arrived, latched nothing, latched another release, or latched 2.1.310. The assumption supplies a record, never a release: only the generation that latched 2.1.310 itself, with its root bound, is armable.
+/// Scenario: Give Codex 0.164.0 the e2e assumption's verified editor probe (Codex's own facts have none), then ask for the permission to arm on Codex generations whose header has not arrived, latched nothing, latched another release, or latched 0.164.0. The assumption supplies a probe, never a release: only the generation that latched 0.164.0 itself, with its root bound, is armable; Claude Code keeps its own facts' probe.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_the_editor_probe_assumption_never_supplies_a_release() {
-    let named = parse_assumed_editor_probes("claude@2.1.310", &RELEASE_RECORDS).unwrap();
+    let named = parse_assumed_editor_probes("codex@0.164.0").unwrap();
     let assumed: Vec<_> = named.into_iter().map(|(a, r)| (a, r, PROBE)).collect();
-    let records = with_assumed_editor_probes(RELEASE_RECORDS.to_vec(), &assumed);
+    let facts = &AGENT_FACTS;
     assert_eq!(
-        permission(&records, &CLAUDE, None, Binding::Bound),
+        permission(facts, &assumed, &CODEX, None, Binding::Bound),
         Permission::Pending
     );
     for latch in [
@@ -337,42 +357,42 @@ fn doorbell_053_the_editor_probe_assumption_never_supplies_a_release() {
         LatchedRelease::ScannerBudget,
     ] {
         assert_eq!(
-            permission(&records, &CLAUDE, Some(&latch), Binding::Bound),
+            permission(facts, &assumed, &CODEX, Some(&latch), Binding::Bound),
             Permission::Inert(InertCause::UnknownRelease),
             "{latch:?}"
         );
     }
-    for other in ["2.1.311", "2.1.309", "3.0.0"] {
+    for other in ["0.165.0", "0.160.0", "1.0.0"] {
         assert_eq!(
             permission(
-                &records,
-                &CLAUDE,
+                facts,
+                &assumed,
+                &CODEX,
                 Some(&LatchedRelease::Known(v(other))),
                 Binding::Bound
             ),
-            Permission::Inert(InertCause::UnmeasuredRelease),
+            Permission::Inert(InertCause::NoEditorRecord),
             "{other}"
         );
     }
-    // The releases the assumption did not name keep their own record.
-    for codex in ["0.164.0", "0.160.0"] {
-        assert_eq!(
-            permission(
-                &records,
-                &CODEX,
-                Some(&LatchedRelease::Known(v(codex))),
-                Binding::Bound
-            ),
-            Permission::Inert(InertCause::NoEditorRecord)
-        );
-    }
-    let own = LatchedRelease::Known(v("2.1.310"));
+    // Claude Code is armable on its own facts, named or not.
     assert_eq!(
-        permission(&records, &CLAUDE, Some(&own), Binding::Waiting),
+        permission(
+            facts,
+            &assumed,
+            &CLAUDE,
+            Some(&LatchedRelease::Known(v("0.164.0"))),
+            Binding::Bound
+        ),
+        Permission::Armable
+    );
+    let own = LatchedRelease::Known(v("0.164.0"));
+    assert_eq!(
+        permission(facts, &assumed, &CODEX, Some(&own), Binding::Waiting),
         Permission::Pending
     );
     assert_eq!(
-        permission(&records, &CLAUDE, Some(&own), Binding::Bound),
+        permission(facts, &assumed, &CODEX, Some(&own), Binding::Bound),
         Permission::Armable
     );
 }

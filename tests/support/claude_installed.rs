@@ -42,14 +42,15 @@ pub fn installed_release() -> Result<String, String> {
         .ok_or_else(|| format!("`claude --version` printed no release: {text:?}"))
 }
 
-/// The preflight: this build installs `Direct(Claude)` panes, and the
-/// installed release has a record the doorbell types into whose editor probe
-/// is verified, so the deck checks its box. Otherwise the reason, so the
-/// test reports `SKIP:` (UNVERIFIED under `DOT_AGENT_DECK_REQUIRE_REAL_E2E`).
+/// The preflight: this build installs `Direct(Claude)` panes, and Claude
+/// Code's facts are ones the doorbell types into with a verified editor
+/// probe, so the deck checks the installed release's box whatever its
+/// version. Otherwise the reason, so the test reports `SKIP:` (UNVERIFIED
+/// under `DOT_AGENT_DECK_REQUIRE_REAL_E2E`).
 pub fn checkable() -> Result<(), String> {
     use dot_agent_deck::composer_probe::install::{INSTALL_ROLLOUT, PaneClass, ProbeAgent};
     use dot_agent_deck::doorbell_activation::{
-        Activation, LatchedRelease, Measurement, RELEASE_RECORDS, activation,
+        AGENT_FACTS, Activation, CLAUDE_FACTS, LatchedRelease, Measurement, activation,
     };
     use dot_agent_deck::event::AgentType;
     common::check_claude_available()?;
@@ -61,19 +62,15 @@ pub fn checkable() -> Result<(), String> {
     }
     let release = installed_release()?;
     let version = semver::Version::parse(&release).map_err(|e| e.to_string())?;
-    let record = RELEASE_RECORDS
-        .iter()
-        .find(|r| r.agent == AgentType::ClaudeCode && r.release == version)
-        .ok_or_else(|| format!("Claude Code {release} has no release record"))?;
-    if !matches!(record.editor_probe, Measurement::Verified(_)) {
+    if !matches!(CLAUDE_FACTS.editor_probe, Measurement::Verified(_)) {
         return Err(format!(
-            "Claude Code {release}'s editor probe is {:?}, not verified: the deck checks no box on it",
-            record.editor_probe
+            "Claude Code's editor probe is {:?}, not verified: the deck checks no box",
+            CLAUDE_FACTS.editor_probe
         ));
     }
     if !matches!(
         activation(
-            &RELEASE_RECORDS,
+            &AGENT_FACTS,
             &AgentType::ClaudeCode,
             &LatchedRelease::Known(version)
         ),
@@ -83,7 +80,7 @@ pub fn checkable() -> Result<(), String> {
             "the doorbell does not type into Claude Code {release}"
         ));
     }
-    eprintln!("Claude Code release under test: {release} (installed, editor probe verified)");
+    eprintln!("Claude Code release under test: {release} (installed, on Claude Code's facts)");
     Ok(())
 }
 

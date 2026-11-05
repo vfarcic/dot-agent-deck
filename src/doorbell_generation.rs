@@ -18,33 +18,29 @@
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::doorbell_activation::{
-    Activation, LatchedRelease, NoGo, ReleaseRecord, activation, unrecorded_claude_releases,
-    without_unrecorded_claude,
-};
+use crate::doorbell_activation::{Activation, AgentFacts, LatchedRelease, NoGo, activation};
+use crate::doorbell_switch::DoorbellSwitch;
 use crate::doorbell_txn::{AttemptCounter, AttemptRing, Latch, LatchCell, RingToken};
 use crate::event::AgentType;
 
 /// The verdict for a generation of `agent` whose header latched `latch`
-/// (plan §4.6): `records` with the e2e build's Claude Code exclusion applied,
-/// then the activation table. With no effective agent type there is no
-/// profile to type under, and an agent type no record measures is
-/// `unmeasured_release` whatever its start-up screen showed: the deck reads
-/// no release from a screen it has no record of, so `unknown_release` would
-/// send the user after a start-up screen that was never the cause.
+/// (plan §4.6), under the generation's doorbell `switch`: with no effective
+/// agent type yet there is no profile to type under (`unknown_agent`); an
+/// agent the user turned the doorbell off for is `turned_off` whatever its
+/// screen shows; otherwise the activation table over the agents' facts.
 pub fn generation_activation<'a>(
-    records: &[ReleaseRecord<'a>],
+    facts: &[AgentFacts<'a>],
     agent: Option<&AgentType>,
     latch: &LatchedRelease,
+    switch: &DoorbellSwitch,
 ) -> Activation<'a> {
     let Some(agent) = agent.filter(|a| **a != AgentType::None) else {
-        return Activation::NoGo(NoGo::UnmeasuredRelease);
+        return Activation::NoGo(NoGo::UnknownAgent);
     };
-    let records = without_unrecorded_claude(records, &unrecorded_claude_releases());
-    if !records.iter().any(|record| record.agent == *agent) {
-        return Activation::NoGo(NoGo::UnmeasuredRelease);
+    if !switch.allows(agent) {
+        return Activation::NoGo(NoGo::TurnedOff);
     }
-    activation(&records, agent, latch)
+    activation(facts, agent, latch)
 }
 
 /// The clause a verdict holds a generation with, `None` for `Go`.
@@ -86,6 +82,9 @@ pub struct GenerationDoorbell {
     /// evidence, the user's own clear) changed the cell: the registry asks
     /// for the generation's re-projection.
     on_moved: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// The per-agent doorbell switch as the daemon read it when it started
+    /// this generation ([`crate::doorbell_switch::at_spawn`]).
+    switch: DoorbellSwitch,
 }
 
 impl std::fmt::Debug for GenerationDoorbell {
@@ -115,7 +114,19 @@ impl GenerationDoorbell {
             #[cfg(feature = "e2e")]
             standin: None,
             on_moved: OnceLock::new(),
+            switch: DoorbellSwitch::default(),
         }
+    }
+
+    /// This generation with the doorbell switch the daemon read at its spawn.
+    pub fn with_switch(mut self, switch: DoorbellSwitch) -> Self {
+        self.switch = switch;
+        self
+    }
+
+    /// The doorbell switch this generation was started under.
+    pub fn switch(&self) -> &DoorbellSwitch {
+        &self.switch
     }
 
     /// Call `moved` whenever the hook arm's evidence or the user's own clear
@@ -483,53 +494,118 @@ mod tests {
 
     #[test]
     fn a_generation_with_no_agent_type_has_no_profile_to_type_under() {
-        let records = &crate::doorbell_activation::RELEASE_RECORDS;
+        let facts = &crate::doorbell_activation::AGENT_FACTS;
+        let on = DoorbellSwitch::default();
         let latch = LatchedRelease::Known(Version::new(2, 1, 310));
         assert_eq!(
-            refused_clause(&generation_activation(records, None, &latch)),
-            Some("unmeasured_release")
+            refused_clause(&generation_activation(facts, None, &latch, &on)),
+            Some("unknown_agent")
         );
         assert_eq!(
             refused_clause(&generation_activation(
-                records,
+                facts,
                 Some(&AgentType::None),
-                &latch
+                &latch,
+                &on
             )),
-            Some("unmeasured_release")
+            Some("unknown_agent")
         );
         assert_eq!(
             refused_clause(&generation_activation(
-                records,
+                facts,
                 Some(&AgentType::ClaudeCode),
-                &latch
+                &latch,
+                &on
             )),
             None
         );
     }
 
     #[test]
-    fn an_agent_type_no_record_measures_is_unmeasured_whatever_its_latch() {
-        let records = &crate::doorbell_activation::RELEASE_RECORDS;
+    fn an_agent_type_with_no_facts_is_not_supported_whatever_its_latch() {
+        let facts = &crate::doorbell_activation::AGENT_FACTS;
+        let on = DoorbellSwitch::default();
         for agent in [AgentType::OpenCode, AgentType::Pi, AgentType::Devin] {
             for latch in [
                 LatchedRelease::Unseen,
                 LatchedRelease::Known(Version::new(1, 0, 0)),
             ] {
                 assert_eq!(
-                    refused_clause(&generation_activation(records, Some(&agent), &latch)),
-                    Some("unmeasured_release"),
+                    refused_clause(&generation_activation(facts, Some(&agent), &latch, &on)),
+                    Some("agent_not_supported"),
                     "{agent:?} {latch:?}"
                 );
             }
         }
-        // An agent type with records still reads an unseen header as such.
+        // An agent type with facts still reads an unseen header as such.
         assert_eq!(
             refused_clause(&generation_activation(
-                records,
+                facts,
                 Some(&AgentType::ClaudeCode),
-                &LatchedRelease::Unseen
+                &LatchedRelease::Unseen,
+                &on
             )),
             Some("unknown_release")
         );
+    }
+
+    /// Scenario: Ask a generation's verdict for Claude Code and Codex at a latched release no one measured, with the doorbell switch on, with each agent's switch off, and with both off. On, both are Go; an agent's switch off makes that agent `turned_off` whatever its latch, an unseen header included, and leaves the other agent's verdict alone; agents without a switch keep their own verdicts.
+    #[spec::spec("inbox/doorbell/059")]
+    #[test]
+    fn doorbell_059_a_switched_off_agent_is_turned_off_whatever_its_latch() {
+        let facts = &crate::doorbell_activation::AGENT_FACTS;
+        let unmeasured = |agent: &AgentType| match agent {
+            AgentType::Codex => Version::new(0, 199, 3),
+            _ => Version::new(2, 9, 1),
+        };
+        for (switch, off) in [
+            (DoorbellSwitch::default(), vec![]),
+            (
+                DoorbellSwitch {
+                    claude: false,
+                    codex: true,
+                },
+                vec![AgentType::ClaudeCode],
+            ),
+            (
+                DoorbellSwitch {
+                    claude: true,
+                    codex: false,
+                },
+                vec![AgentType::Codex],
+            ),
+            (
+                DoorbellSwitch {
+                    claude: false,
+                    codex: false,
+                },
+                vec![AgentType::ClaudeCode, AgentType::Codex],
+            ),
+        ] {
+            for agent in [AgentType::ClaudeCode, AgentType::Codex] {
+                let known = LatchedRelease::Known(unmeasured(&agent));
+                let verdict = generation_activation(facts, Some(&agent), &known, &switch);
+                let unseen =
+                    generation_activation(facts, Some(&agent), &LatchedRelease::Unseen, &switch);
+                if off.contains(&agent) {
+                    assert_eq!(refused_clause(&verdict), Some("turned_off"), "{agent:?}");
+                    assert_eq!(refused_clause(&unseen), Some("turned_off"), "{agent:?}");
+                } else {
+                    assert_eq!(refused_clause(&verdict), None, "{agent:?} {switch:?}");
+                    assert_eq!(refused_clause(&unseen), Some("unknown_release"));
+                }
+            }
+            for agent in [AgentType::OpenCode, AgentType::Pi, AgentType::Devin] {
+                assert_eq!(
+                    refused_clause(&generation_activation(
+                        facts,
+                        Some(&agent),
+                        &LatchedRelease::Known(Version::new(1, 0, 0)),
+                        &switch
+                    )),
+                    Some("agent_not_supported")
+                );
+            }
+        }
     }
 }

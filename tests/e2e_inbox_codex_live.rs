@@ -9,12 +9,13 @@ use live::{BUDGET, Codex};
 use spec::spec;
 use std::time::Duration;
 
-/// Scenario: Leave interactive Codex idle in its deck pane, at a release the deck has measured (0.164.0), with nothing typed into it, and post a sentinel task. The deck types the doorbell line into Codex once and Codex takes it with no prompt from the test: Codex's real prompt hook hands the task over, Codex creates the sentinel and the task is settled by its receipt. On a Codex release the deck has not measured, the test reports SKIP naming both.
+/// Scenario: Leave interactive Codex idle in its deck pane, at whatever release is installed, with nothing typed into it, and post a sentinel task. The deck latches the installed release from its header and types the doorbell line into Codex once on Codex's facts, and Codex takes it with no prompt from the test: Codex's real prompt hook hands the task over, Codex creates the sentinel and the task is settled by its receipt.
 #[spec("inbox/codex/009")]
 #[test]
 fn codex_009_live_idle_measured_release_is_rung_and_delivers() {
     skip_unless!(common::check_codex_available());
     skip_unless!(live::codex_release_measured());
+    let installed = live::installed_codex_release().expect("the preflight read it");
     let codex = Codex::new(false);
     let name = "codex-idle-19cd36.txt";
     let id = codex.post(name);
@@ -22,8 +23,9 @@ fn codex_009_live_idle_measured_release_is_rung_and_delivers() {
     let log = codex.log();
     assert!(
         log.lines()
-            .any(|line| line.contains("pane release") && line.contains("release=0.164.0")),
-        "the deck latched the measured release; {}",
+            .any(|line| line.contains("pane release")
+                && line.contains(&format!("release={installed}"))),
+        "the deck latched the installed release; {}",
         codex.evidence()
     );
     let rang: Vec<&str> = log
@@ -41,10 +43,10 @@ fn codex_009_live_idle_measured_release_is_rung_and_delivers() {
         "one attempt, submitted; {}",
         codex.evidence()
     );
-    for clause in ["missing_measurement", "unmeasured_release"] {
+    for clause in ["missing_measurement", "turned_off"] {
         assert!(
             !log.contains(&format!("clause=\"{clause}\"")),
-            "the record admits 0.164.0: no {clause}; {}",
+            "Codex's facts admit {installed}: no {clause}; {}",
             codex.evidence()
         );
     }

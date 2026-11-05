@@ -43,7 +43,7 @@ use spec::spec;
 
 const G: u64 = 7;
 
-/// The release the latch reports, which `RELEASE_RECORDS` holds for Claude.
+/// The release the latch reports, the one the e2e stand-ins draw for Claude.
 fn release() -> Version {
     Version::new(2, 1, 310)
 }

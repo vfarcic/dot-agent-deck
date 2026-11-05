@@ -67,6 +67,7 @@ pub mod doorbell_activation;
 pub mod doorbell_generation;
 // PRD #1666 part 3 round 5-wake: an agent's screen read losslessly, and the measured recognisers.
 pub mod doorbell_screen;
+pub mod doorbell_switch;
 // PRD #1666 part 3 round 5-wake: the doorbell transaction as a pure model, inert until activation.
 pub mod doorbell_txn;
 // PRD #1589: the record of dispatched units the `close` verb is authorized from.

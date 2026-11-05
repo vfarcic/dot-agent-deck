@@ -96,7 +96,7 @@ fn probe_066_a_valid_assumption_is_read_and_captured_once() {
     }
 }
 
-/// Scenario: In a child process per list, set the variable to a malformed list, an entry named twice, a release with no record, another agent's release, a release with build metadata, and a known entry beside an unknown one. The real reader refuses each with its reason, and the startup capture assumes nothing, so no class rolls out.
+/// Scenario: In a child process per list, set the variable to a malformed list, an entry named twice, a release with build metadata, a pre-release, and a known entry beside an unknown agent. The real reader refuses each with its reason, and the startup capture assumes nothing, so no class rolls out.
 #[spec("inbox/probe/066")]
 #[test]
 fn probe_066_an_invalid_assumption_is_refused_by_the_reader() {
@@ -112,9 +112,8 @@ fn probe_066_an_invalid_assumption_is_refused_by_the_reader() {
     for list in [
         "broken",
         "claude@2.1.310,claude@2.1.310",
-        "claude@99.0.0",
-        "codex@2.1.310",
         "claude@2.1.310+metadata",
+        "codex@0.164.0-alpha.1",
         "claude@2.1.310,opencode@1.0.0",
     ] {
         in_child(name, Some(list), "refused");

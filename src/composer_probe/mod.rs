@@ -79,7 +79,7 @@ pub mod segments;
 #[cfg(test)]
 pub(crate) mod stamp_park;
 
-use crate::doorbell_activation::{LatchedRelease, Measurement, ReleaseRecord};
+use crate::doorbell_activation::{AgentFacts, EditorProbe, LatchedRelease, Measurement};
 use crate::event::AgentType;
 
 /// Where a generation's agent root `A` stands: bound, still being looked for,
@@ -96,7 +96,7 @@ pub enum Binding {
 pub enum Permission {
     /// The header or the binding is not known yet.
     Pending,
-    /// The release's `editor_probe` record is verified and `A` is bound.
+    /// The agent's `editor_probe` facts are verified and `A` is bound.
     Armable,
     /// Not for this generation's life.
     Inert(InertCause),
@@ -107,9 +107,10 @@ pub enum Permission {
 pub enum InertCause {
     /// The header latched no single release.
     UnknownRelease,
-    /// No record covers exactly this release. Nothing inherits a record.
-    UnmeasuredRelease,
-    /// The release's record has no verified `editor_probe`.
+    /// The deck has no facts for this agent (OpenCode, Pi, Devin).
+    UnsupportedAgent,
+    /// The agent's facts have no verified `editor_probe` (Codex until its
+    /// activation).
     NoEditorRecord,
     /// `A` was never bound.
     Unbound,
@@ -120,17 +121,19 @@ pub enum InertCause {
 
 /// The permission half of plan §1.2, asked when the generation's header
 /// arrives and when `A` is bound: `header` is `None` until the release
-/// window closes. The release comes only from `header`, and only an exact
-/// record with a verified `editor_probe` permits; a cause known from either
-/// input settles the generation as inert even while the other is pending.
+/// window closes. The header must latch a single release (any one: it is not
+/// compared with anything), and the agent's facts in `facts` must have a
+/// verified `editor_probe`, or `assumed` must name one for exactly that agent
+/// and release (the e2e stand-ins'); a cause known from either input settles
+/// the generation as inert even while the other is pending.
 ///
-/// This is the observer's permission, not the ring's. Both look a record up
-/// by the same agent and release, but permission needs none of the ring's
-/// measurements, and the ring's activation doesn't read `editor_probe`. The
-/// checks a later commit adds (the path, the keymap, the namespace, the
-/// liability cap) narrow `Armable` further.
+/// This is the observer's permission, not the ring's. Both read the agent's
+/// facts, but permission needs none of the ring's, and the ring's activation
+/// doesn't read `editor_probe`. The checks a later commit adds (the path, the
+/// keymap, the namespace, the liability cap) narrow `Armable` further.
 pub fn permission(
-    records: &[ReleaseRecord<'_>],
+    facts: &[AgentFacts<'_>],
+    assumed: &[(AgentType, semver::Version, EditorProbe<'_>)],
     agent: &AgentType,
     header: Option<&LatchedRelease>,
     binding: Binding,
@@ -139,13 +142,13 @@ pub fn permission(
         let LatchedRelease::Known(release) = header else {
             return Permission::Inert(InertCause::UnknownRelease);
         };
-        let Some(record) = records
-            .iter()
-            .find(|r| r.agent == *agent && r.release == *release)
-        else {
-            return Permission::Inert(InertCause::UnmeasuredRelease);
-        };
-        if !matches!(record.editor_probe, Measurement::Verified(_)) {
+        let probe = crate::doorbell_activation::editor_probe_for(facts, assumed, agent, release);
+        if crate::doorbell_activation::facts_for(facts, agent).is_none()
+            && !matches!(probe, Measurement::Verified(_))
+        {
+            return Permission::Inert(InertCause::UnsupportedAgent);
+        }
+        if !matches!(probe, Measurement::Verified(_)) {
             return Permission::Inert(InertCause::NoEditorRecord);
         }
     }

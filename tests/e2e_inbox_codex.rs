@@ -402,7 +402,7 @@ fn codex_005_an_empty_composer_gets_no_byte_before_or_after_its_first_hook() {
     state(&codex.daemon, &codex.pane, &id, "queued");
 }
 
-/// Scenario: Start the synthetic Codex at its empty composer, with no release header the deck can read, under a name the deck does not recognise and with no agent type, then let its own hooks report it as Codex and queue a task. The deck learns the type from the hooks: it logs `unmeasured_release` while the type is unknown and `unknown_release` once its hooks name Codex, so what holds it then is the missing release, not the absent spawn type. Zero bytes reach the pane, the task waits queued, and the agent's WAKE names its hooks' turn-end route, not the doorbell.
+/// Scenario: Start the synthetic Codex at its empty composer, with no release header the deck can read, under a name the deck does not recognise and with no agent type, then let its own hooks report it as Codex and queue a task. The deck learns the type from the hooks: it logs `unknown_agent` while the type is unknown and `unknown_release` once its hooks name Codex, so what holds it then is the missing release, not the absent spawn type. Zero bytes reach the pane, the task waits queued, and the agent's WAKE names its hooks' turn-end route, not the doorbell.
 #[spec("inbox/codex/024")]
 #[test]
 fn codex_024_a_pane_its_hooks_call_codex_gets_no_byte() {
@@ -429,7 +429,7 @@ fn codex_024_a_pane_its_hooks_call_codex_gets_no_byte() {
         "{:?}",
         codex.held_as()
     );
-    assert_eq!(codex.held_as(), ["unmeasured_release", "unknown_release"]);
+    assert_eq!(codex.held_as(), ["unknown_agent", "unknown_release"]);
     state(&codex.daemon, &codex.pane, &id, "queued");
     // Codex's own hooks take its messages at the end of its turns, and
     // that is the route WAKE names, not the doorbell.

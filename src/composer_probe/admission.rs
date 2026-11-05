@@ -325,7 +325,7 @@ mod tests {
         );
         for permission in [
             Permission::Pending,
-            Permission::Inert(InertCause::UnmeasuredRelease),
+            Permission::Inert(InertCause::UnsupportedAgent),
             Permission::Inert(InertCause::Unbound),
         ] {
             assert_eq!(
