@@ -1331,6 +1331,54 @@ pub fn codex_editor_is_helper(
     }
 }
 
+/// [`codex_editor_is_helper`] for Claude Code, with its selection
+/// (`EditorSelection::ClaudeCode`, M22, M23): a non-empty `VISUAL`, else a
+/// non-empty `EDITOR`, else the first of `code`, `vi` and `nano` on `PATH`,
+/// which is never the helper; the value split on literal spaces with empty
+/// words dropped. Exactly one word, byte for byte the helper's path, or
+/// [`Hold::Editor`].
+///
+/// A Claude Code pane whose command has arguments runs under `$SHELL -c`
+/// as a Codex line does, so a shell start-up file reaches it the same way.
+/// Where the person's typing is held behind an unmatched Claude probe, the
+/// lapse ([`super::query_ledger::T_TRIGGER`]) releases nothing (it only
+/// lets a retry replace a probe that holds nothing), so that pane is held
+/// until the agent restarts too. Claude Code also copies the `env` maps of
+/// its settings files into its own environment when it starts (seen in the
+/// 2.1.318 binary, not run): a `VISUAL` set there isn't in the environment
+/// this reads.
+#[cfg(target_os = "linux")]
+pub fn claude_editor_is_helper(
+    env: impl Fn(&str) -> Option<OsString>,
+    helper: &Path,
+) -> Result<(), Hold> {
+    let value = env("VISUAL")
+        .filter(|v| !v.is_empty())
+        .or_else(|| env("EDITOR").filter(|v| !v.is_empty()))
+        .ok_or(Hold::Editor)?;
+    match super::helper::split_spaces(&value).as_slice() {
+        [only] if only.as_os_str() == helper.as_os_str() => Ok(()),
+        _ => Err(Hold::Editor),
+    }
+}
+
+/// The editor check for an agent whose release's record selects its
+/// editor by `selection`: [`claude_editor_is_helper`] or
+/// [`codex_editor_is_helper`].
+#[cfg(target_os = "linux")]
+pub fn editor_is_helper(
+    selection: crate::doorbell_activation::EditorSelection,
+    env: impl Fn(&str) -> Option<OsString>,
+    helper: &Path,
+) -> Result<(), Hold> {
+    match selection {
+        crate::doorbell_activation::EditorSelection::ClaudeCode => {
+            claude_editor_is_helper(env, helper)
+        }
+        crate::doorbell_activation::EditorSelection::Codex => codex_editor_is_helper(env, helper),
+    }
+}
+
 impl KeymapBaseline {
     /// Claude Code's spawn read, when the bound agent's own environment `env`
     /// still names the file it was read from; [`Hold::Changed`] when it

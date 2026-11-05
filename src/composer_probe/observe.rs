@@ -1503,7 +1503,7 @@ mod linux {
         helper_id: FileId,
         /// The helper's path, as the installation put it in the spawn's
         /// `VISUAL` and `EDITOR`: what the bound agent's own selection must
-        /// name ([`crate::composer_probe::keymap::codex_editor_is_helper`]).
+        /// name ([`crate::composer_probe::keymap::editor_is_helper`]).
         helper_path: std::path::PathBuf,
         latch: Box<dyn Fn(&AgentType) -> LatchedRelease + Send + Sync>,
         assumed: &'static [(AgentType, semver::Version, EditorProbe<'static>)],
@@ -2538,7 +2538,14 @@ mod linux {
                 Err(hold) => return KeymapEvidence::Held(hold),
             };
             match agent {
-                AgentType::ClaudeCode => match baseline.claude_bound(&env) {
+                // The revcxact review's HIGH-1, for both agents: the editor
+                // its own environment selects, by its release's record, must
+                // be the helper, or a probe would open another one in the
+                // person's pane.
+                AgentType::ClaudeCode => match baseline.claude_bound(&env).and_then(|bound| {
+                    keymap::editor_is_helper(probe.selection, &env, &self.helper_path)
+                        .map(|()| bound)
+                }) {
                     Ok((path, read)) => {
                         KeymapEvidence::Claude(keymap::ClaudeKeymap::from_spawn_read(
                             path.to_path_buf(),
@@ -2548,11 +2555,9 @@ mod linux {
                     }
                     Err(hold) => KeymapEvidence::Held(hold),
                 },
-                // The revcxact review's HIGH-1: the editor its own
-                // environment selects must be the helper, or a probe would
-                // open another one in the person's pane.
                 AgentType::Codex => match baseline.codex_bound(&env, args, cwd).and_then(|codex| {
-                    keymap::codex_editor_is_helper(&env, &self.helper_path).map(|()| codex)
+                    keymap::editor_is_helper(probe.selection, &env, &self.helper_path)
+                        .map(|()| codex)
                 }) {
                     Ok(codex) => KeymapEvidence::Codex {
                         reads: Box::new(keymap::CodexReads::new(codex)),

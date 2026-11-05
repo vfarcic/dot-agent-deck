@@ -338,13 +338,19 @@ impl Deck {
             // the runner's: what the observer reads as the agent's is the
             // spawn's own, or the one the test names under the deck's
             // directory.
-            let environ: Vec<(std::ffi::OsString, std::ffi::OsString)> = match &agent_env {
+            let mut environ: Vec<(std::ffi::OsString, std::ffi::OsString)> = match &agent_env {
                 Some(agent_env) => agent_env
                     .iter()
                     .map(|(k, v)| (k.into(), dir.path().join(v).into_os_string()))
                     .collect(),
                 None => env.iter().map(|(k, v)| (k.into(), v.into())).collect(),
             };
+            // The installation's `VISUAL` and `EDITOR`, as a directly
+            // spawned agent inherits them: the editor its Ctrl+G opens is
+            // the helper (the revcxact review's HIGH-1).
+            for name in ["VISUAL", "EDITOR"] {
+                environ.push((name.into(), instance.helper().as_os_str().to_os_string()));
+            }
             installation.set_bound_environ_for_test(environ);
             Spawned {
                 agent_id: id.clone(),

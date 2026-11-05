@@ -2178,3 +2178,78 @@ fn probe_097_a_codex_whose_editor_is_not_the_helper_is_held() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Scenario: Build the environments a bound Claude Code can have been started with and ask whether the editor its Ctrl+G opens, chosen as Claude Code chooses it, is exactly the deck's helper (the revcxact review's HIGH-1, Claude half). The helper in `VISUAL`, in `EDITOR` under an unset or empty `VISUAL`, or with a trailing blank is accepted; another `VISUAL`, a quoted helper (Claude Code splits on spaces and keeps quotes), the helper with arguments, and neither set (Claude Code then falls back to an editor on `PATH`) are held.
+#[cfg(target_os = "linux")]
+#[spec("inbox/probe/097")]
+#[test]
+fn probe_097_a_claude_whose_editor_is_not_the_helper_is_held() {
+    use dot_agent_deck::composer_probe::keymap::{editor_is_helper, environ_lookup};
+    let helper = Path::new("/var/tmp/dad-instance/dot-agent-deck-editor");
+    let h = helper.to_str().unwrap();
+    let trailing = format!("{h} ");
+    let quoted = format!("'{h}'");
+    let with_args = format!("{h} -w");
+    let mut wrong = Vec::new();
+    for (row, pairs, want) in [
+        (
+            "the helper in both",
+            vec![("VISUAL", h), ("EDITOR", h)],
+            Ok(()),
+        ),
+        (
+            "VISUAL unset, the helper in EDITOR",
+            vec![("EDITOR", h)],
+            Ok(()),
+        ),
+        (
+            "an empty VISUAL falls through to EDITOR",
+            vec![("VISUAL", ""), ("EDITOR", h)],
+            Ok(()),
+        ),
+        (
+            "a trailing blank",
+            vec![("VISUAL", trailing.as_str())],
+            Ok(()),
+        ),
+        (
+            "another VISUAL",
+            vec![("VISUAL", "nvim"), ("EDITOR", h)],
+            Err(Hold::Editor),
+        ),
+        (
+            "a quoted helper",
+            vec![("VISUAL", quoted.as_str())],
+            Err(Hold::Editor),
+        ),
+        (
+            "the helper with arguments",
+            vec![("VISUAL", with_args.as_str())],
+            Err(Hold::Editor),
+        ),
+        (
+            "neither set: an editor on PATH",
+            vec![("HOME", "/home/u")],
+            Err(Hold::Editor),
+        ),
+        (
+            "both empty",
+            vec![("VISUAL", ""), ("EDITOR", "")],
+            Err(Hold::Editor),
+        ),
+    ] {
+        let environ: Vec<(OsString, OsString)> = pairs
+            .iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+            .collect();
+        let got = editor_is_helper(
+            EditorSelection::ClaudeCode,
+            environ_lookup(&environ).unwrap(),
+            helper,
+        );
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
