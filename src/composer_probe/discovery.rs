@@ -9,13 +9,14 @@
 //! two agent names, each pinned independently. A name resolves as a shell
 //! would find it on that `PATH`, passing over the deck's own telemetry shims
 //! (`crate::telemetry::shim::is_shim_file`), which `exec` the real program,
-//! and symlinks are followed to a kernel identity `(dev, ino)`. Nothing later
-//! looks a name up again: every check compares a process's
-//! `/proc/<pid>/exe` with the pinned pair, so a pane started before an agent
-//! update keeps its old inode, a wrapper that `exec`s a different inode after
-//! the pin is refused, and a pane spawned after the update pins the new one.
-//! A name that doesn't resolve stays unresolved: no candidate's claim stands
-//! in for it.
+//! and symlinks are followed to a kernel identity `(dev, ino)`, read from the
+//! file the pin opened (`fstat`), as its shebang is. Nothing later looks a
+//! name up again. A native candidate is checked by its `/proc/<pid>/exe`
+//! against the pinned pair, so a pane started before an agent update keeps
+//! its old inode, a wrapper that `exec`s a different inode after the pin is
+//! refused, and a pane spawned after the update pins the new one. A name
+//! that doesn't resolve stays unresolved: no candidate's claim stands in for
+//! it.
 //!
 //! **Interpreter-hosted entrypoints** (plan Q35-14b's npm decision): when the
 //! pinned file is a script whose shebang names an interpreter (npm Codex's
@@ -29,6 +30,26 @@
 //! script under another interpreter, isn't an entrypoint, and a native below
 //! it is refused as an executable mismatch.
 //!
+//! **What holds for the hosted route, and what doesn't.** The entrypoint's
+//! executable is the interpreter's, so it says nothing about which script
+//! the interpreter read. Validation therefore also requires the script's
+//! path to hold the pinned file still: a script replaced after the pin (an
+//! npm update, or any writer of that directory) refuses the native as an
+//! executable mismatch. That read is a refusal only; it never attests
+//! anything. Three things are left, each failing open only to a process
+//! that can already write the agent's installation as this user:
+//! - The path is read at validation, not when the interpreter opened the
+//!   script, so a file swapped in before the interpreter's read and swapped
+//!   back before validation isn't seen.
+//! - A pin is a file identity, not its content: a write into the pinned
+//!   file itself, keeping its inode, isn't seen. That holds for a native's
+//!   pin too.
+//! - The native below an attested entrypoint is attested by that parentage
+//!   alone: its own executable is compared with nothing. Where it lives is
+//!   the script's choice at run time (npm's `codex.js` resolves a platform
+//!   package, which npm may hoist), so there is no spawn-time fact to pin it
+//!   to, and a writer of the package's directory can replace it.
+//!
 //! **The walk** ([`find`]) goes down from the PTY child, breadth first and
 //! bounded, and takes the first process named as an agent (its `argv[0]`'s
 //! or its executable's basename is `claude` or `codex`). Below the deck's own
@@ -39,9 +60,12 @@
 //! and refuses, in this order, a candidate that exited, one that left the
 //! parent it was found under (or whose ancestry to the PTY child changed),
 //! one another user owns, and one whose executable is neither the pin nor a
-//! child of a still-attested entrypoint. Lifecycle and owner refusals come
-//! before an executable mismatch, and a kind claim only changes which pin is
-//! expected, never what attests the candidate.
+//! child of a still-attested entrypoint whose script path still holds the
+//! pinned file. Lifecycle and owner refusals come before an executable
+//! mismatch, and a kind claim only changes which pin is expected, never what
+//! attests the candidate. [`validate_held`] then reads the candidate again
+//! before and after the pidfd poll: both reads must see the executable
+//! validation accepted, which is the one the identity publishes.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -116,6 +140,10 @@ pub enum Refusal {
     LeftParent,
     /// The candidate exited.
     Exited,
+    /// The candidate couldn't be held by its pidfd for a reason other than
+    /// its exit (the errno, when there was one: `EMFILE`, say). The
+    /// validation can't be bracketed, so it isn't run.
+    Unheld(Option<i32>),
     /// Another user owns the candidate.
     ForeignOwner,
     /// The generation retired while discovery ran.
@@ -125,6 +153,23 @@ pub enum Refusal {
 }
 
 impl Refusal {
+    /// Why pinning the candidate by its pidfd failed, as a refusal: gone
+    /// (`ESRCH` from `pidfd_open`, no `/proc/<pid>/stat`, a start that moved,
+    /// or the pidfd reading exited) is [`Refusal::Exited`]; anything else,
+    /// such as a full descriptor table, is [`Refusal::Unheld`] with its
+    /// errno, never reported as an exit.
+    pub fn unpinned(why: super::attest::Unpinned) -> Refusal {
+        use super::attest::Unpinned;
+        match why {
+            Unpinned::Exited
+            | Unpinned::StartChanged
+            | Unpinned::Pidfd(Some(libc::ESRCH))
+            | Unpinned::Stat(Some(libc::ENOENT | libc::ESRCH)) => Refusal::Exited,
+            Unpinned::Pidfd(errno) | Unpinned::Stat(errno) => Refusal::Unheld(errno),
+            Unpinned::NoPeerPidfd => Refusal::Unheld(None),
+        }
+    }
+
     /// The reason in words: what the `e2e` build's `binding-status` and the
     /// log say.
     pub fn reason(&self) -> String {
@@ -137,6 +182,8 @@ impl Refusal {
             }
             Refusal::LeftParent => "candidate left its parent".to_string(),
             Refusal::Exited => "candidate exited".to_string(),
+            Refusal::Unheld(Some(errno)) => format!("candidate not held: errno {errno}"),
+            Refusal::Unheld(None) => "candidate not held".to_string(),
             Refusal::ForeignOwner => "foreign owner".to_string(),
             Refusal::Retired => "generation retired".to_string(),
             Refusal::PaneExited => "pane child exited".to_string(),
@@ -203,20 +250,50 @@ fn set(pins: &mut Pins, agent: ProbeAgent, pin: Option<Pin>) {
 /// holding an executable file of that name that isn't a deck telemetry shim.
 /// A relative path, or a relative or empty `PATH` entry reached before a
 /// match, pins nothing: what it names depends on a directory the pin
-/// doesn't read.
+/// doesn't read. The file is opened once, and both its identity and its
+/// shebang are read from that open file ([`pin_opened`]), so a file swapped
+/// in at the path between the two reads can't pair its interpreter with
+/// another file's identity.
 pub fn pin_program(program: &OsStr, path: Option<&OsStr>) -> Option<Pin> {
+    use std::os::unix::fs::OpenOptionsExt;
     let found = locate(program, path, true)?;
-    let exe = executable_id(&found)?;
-    let hosted = std::fs::File::open(&found)
+    // `O_NONBLOCK`: a FIFO swapped in after `locate` can't stall the spawn
+    // in `open` (it changes nothing for a regular file).
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&found)
+    {
+        Ok(file) => pin_opened(found, file, path),
+        // An executable this user can't read can't be a script its
+        // interpreter reads either: pinned by its path, hosting nothing.
+        Err(_) => Some(Pin {
+            exe: executable_id(&found)?,
+            path: found,
+            hosted: None,
+        }),
+    }
+}
+
+/// `found` pinned from `file`, opened from it: the identity is the open
+/// file's (`fstat`), and the shebang is read from the same file.
+fn pin_opened(found: PathBuf, file: std::fs::File, path: Option<&OsStr>) -> Option<Pin> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let meta = file
+        .metadata()
         .ok()
-        .and_then(|mut file| {
-            use std::io::Read;
-            let mut head = vec![0u8; SHEBANG_BYTES];
-            let n = file.read(&mut head).ok()?;
-            head.truncate(n);
-            Some(head)
-        })
-        .and_then(|head| hosted_by(&head, path));
+        .filter(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)?;
+    let exe = FileId {
+        dev: meta.dev(),
+        ino: meta.ino(),
+    };
+    let mut head = Vec::with_capacity(SHEBANG_BYTES);
+    let hosted = file
+        .take(SHEBANG_BYTES as u64)
+        .read_to_end(&mut head)
+        .ok()
+        .and_then(|_| hosted_by(&head, path));
     Some(Pin {
         path: found,
         exe,
@@ -340,6 +417,11 @@ impl Proc {
 pub trait Procs {
     fn read(&mut self, pid: u32) -> Option<Proc>;
     fn children(&mut self, pid: u32) -> Vec<u32>;
+    /// The executable regular file at `path` now, symlinks followed: what a
+    /// hosted pin's script path holds at validation.
+    fn file(&mut self, path: &Path) -> Option<FileId> {
+        executable_id(path)
+    }
 }
 
 /// A process the walk found named as an agent, with what it was found
@@ -506,9 +588,24 @@ pub enum Attested {
     BelowEntry,
 }
 
+/// What [`validate`] accepted: how the candidate is attested, and the
+/// executable it read while accepting it. Only that executable may be
+/// published ([`validate_held`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Accepted {
+    pub how: Attested,
+    pub exe: FileId,
+}
+
 /// Validate `candidate` against `pin` (the expected agent `agent`'s), the
 /// daemon's `uid`, with `reject_uid` the `e2e` build's forced foreign-owner
 /// refusal: read again, the refusals in the module doc's order.
+///
+/// Below an attested entrypoint the script's path must still hold the
+/// pinned file: one replaced after the pin (an npm update, or any writer of
+/// that directory) refuses the native as an executable mismatch. That
+/// check is a refusal only, never a lookup that could attest anything; what
+/// it can't see is named in the module doc.
 pub fn validate(
     procs: &mut impl Procs,
     candidate: &Candidate,
@@ -516,7 +613,7 @@ pub fn validate(
     pin: &Pin,
     uid: u32,
     reject_uid: bool,
-) -> Result<Attested, Refusal> {
+) -> Result<Accepted, Refusal> {
     let Some(proc) = procs
         .read(candidate.pid)
         .filter(|p| p.start == candidate.start && !p.gone())
@@ -538,8 +635,14 @@ pub fn validate(
     if reject_uid || proc.uid != Some(uid) {
         return Err(Refusal::ForeignOwner);
     }
-    if proc.exe == Some(pin.exe) {
-        return Ok(Attested::Pinned);
+    let Some(exe) = proc.exe else {
+        return Err(Refusal::Differs(agent));
+    };
+    if exe == pin.exe {
+        return Ok(Accepted {
+            how: Attested::Pinned,
+            exe,
+        });
     }
     if let (Some((pid, start, argv)), Some(hosted)) = (&candidate.entry, &pin.hosted)
         && let Some(entry) = procs.read(*pid)
@@ -549,10 +652,61 @@ pub fn validate(
         && entry.argv == *argv
         && entry.uid == Some(uid)
         && proc.ppid == *pid
+        && procs.file(&pin.path) == Some(pin.exe)
     {
-        return Ok(Attested::BelowEntry);
+        return Ok(Accepted {
+            how: Attested::BelowEntry,
+            exe,
+        });
     }
     Err(Refusal::Differs(agent))
+}
+
+/// [`validate`], then `candidate` read again around the pidfd poll that
+/// `exited` is: `read` takes what the identity needs (given the accepted
+/// executable) while the pidfd still holds the candidate. The executable
+/// read before the poll and after it must both be the one validation
+/// accepted, so a candidate that `exec`s anything between validation's read
+/// and the poll's is refused as a mismatch, never published with an
+/// executable nothing compared with the pin. Returns `read`'s value.
+#[allow(clippy::too_many_arguments)]
+pub fn validate_held<T>(
+    procs: &mut impl Procs,
+    candidate: &Candidate,
+    agent: ProbeAgent,
+    pin: &Pin,
+    uid: u32,
+    reject_uid: bool,
+    read: impl FnOnce(FileId) -> Option<T>,
+    exited: impl FnOnce() -> bool,
+) -> Result<T, Refusal> {
+    let accepted = validate(procs, candidate, agent, pin, uid, reject_uid)?;
+    still_accepted(procs, candidate, agent, &accepted)?;
+    let out = read(accepted.exe).ok_or(Refusal::Exited)?;
+    if exited() {
+        return Err(Refusal::Exited);
+    }
+    still_accepted(procs, candidate, agent, &accepted)?;
+    Ok(out)
+}
+
+/// `candidate` read again: still there, and still running the executable
+/// validation accepted.
+fn still_accepted(
+    procs: &mut impl Procs,
+    candidate: &Candidate,
+    agent: ProbeAgent,
+    accepted: &Accepted,
+) -> Result<(), Refusal> {
+    let proc = procs
+        .read(candidate.pid)
+        .filter(|p| p.start == candidate.start && !p.gone())
+        .ok_or(Refusal::Exited)?;
+    if proc.exe == Some(accepted.exe) {
+        Ok(())
+    } else {
+        Err(Refusal::Differs(agent))
+    }
 }
 
 /// `/proc` as a walk reads it.
@@ -659,6 +813,12 @@ mod tests {
     #[derive(Default)]
     struct Table {
         procs: HashMap<u32, Proc>,
+        /// A scripted `exec`: once `pid` has been read this many times, it
+        /// runs the executable given.
+        exec_after: Option<(u32, usize, FileId)>,
+        reads: HashMap<u32, usize>,
+        /// What a path holds; a path not listed is read from the disk.
+        files: HashMap<PathBuf, FileId>,
     }
 
     impl Table {
@@ -688,6 +848,15 @@ mod tests {
 
     impl Procs for Table {
         fn read(&mut self, pid: u32) -> Option<Proc> {
+            let reads = self.reads.entry(pid).or_default();
+            *reads += 1;
+            if let Some((execs, after, exe)) = self.exec_after
+                && execs == pid
+                && *reads > after
+                && let Some(proc) = self.procs.get_mut(&pid)
+            {
+                proc.exe = Some(exe);
+            }
             self.procs.get(&pid).cloned()
         }
         fn children(&mut self, pid: u32) -> Vec<u32> {
@@ -699,6 +868,12 @@ mod tests {
                 .collect();
             c.sort_unstable();
             c
+        }
+        fn file(&mut self, path: &Path) -> Option<FileId> {
+            self.files
+                .get(path)
+                .copied()
+                .or_else(|| executable_id(path))
         }
     }
 
@@ -761,7 +936,10 @@ mod tests {
         assert_eq!(c.chain, vec![(10, 100), (11, 110)]);
         assert_eq!(
             validate(&mut t, &c, ProbeAgent::Codex, &pin, UID, false),
-            Ok(Attested::Pinned)
+            Ok(Accepted {
+                how: Attested::Pinned,
+                exe: NATIVE
+            })
         );
     }
 
@@ -830,12 +1008,19 @@ mod tests {
                 ],
             )
             .add(12, 11, NATIVE, "codex", &["/n/codex", "--fixture"]);
+            t.files.insert(pin.path.clone(), SCRIPT);
             let c = find(&mut t, 10, 100, &walk(&pin)).expect("the native");
             assert_eq!(c.pid, 12);
             assert_eq!(c.entry.is_some(), ok, "{script}");
             let got = validate(&mut t, &c, ProbeAgent::Codex, &pin, UID, false);
             if ok {
-                assert_eq!(got, Ok(Attested::BelowEntry));
+                assert_eq!(
+                    got,
+                    Ok(Accepted {
+                        how: Attested::BelowEntry,
+                        exe: NATIVE
+                    })
+                );
             } else {
                 assert_eq!(got, Err(Refusal::Differs(ProbeAgent::Codex)));
             }
@@ -857,12 +1042,179 @@ mod tests {
         )
         .add(11, 10, PYTHON, "python3", &["python3", "/npm/bin/codex"])
         .add(12, 11, NATIVE, "codex", &["/n/codex"]);
+        t.files.insert(pin.path.clone(), SCRIPT);
         let c = find(&mut t, 10, 100, &walk(&pin)).unwrap();
+        assert!(
+            validate(&mut t, &c, ProbeAgent::Codex, &pin, UID, false).is_ok(),
+            "attested as found"
+        );
         t.procs.get_mut(&11).unwrap().exe = Some(COPY);
         assert_eq!(
             validate(&mut t, &c, ProbeAgent::Codex, &pin, UID, false),
             Err(Refusal::Differs(ProbeAgent::Codex))
         );
+    }
+
+    /// `body` written to `at`, executable.
+    fn write_executable(at: &Path, body: &[u8]) {
+        use std::os::unix::fs::PermissionsExt;
+        crate::test_isolation::write_script(at, body).unwrap();
+        std::fs::set_permissions(at, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// The wrapper, its entrypoint running `interp` with `script` as its
+    /// argument, and the native that entrypoint spawned.
+    fn hosted_table(interp: FileId, script: &str) -> Table {
+        let mut t = Table::default();
+        t.add(
+            10,
+            1,
+            OWN,
+            "dot-agent-deck",
+            &["deck", "wrap", "--agent", "codex", "--", "codex"],
+        )
+        .add(11, 10, interp, "node", &["node", script])
+        .add(12, 11, NATIVE, "codex", &["/n/codex"]);
+        t
+    }
+
+    /// Scenario: An npm-shaped Codex (a `#!/usr/bin/env node` script on the PATH, its interpreter beside it) is pinned at spawn, and its entrypoint and the native it spawns bind. Then npm replaces the script at the same path with a new file (a new inode) before validation: the same entrypoint and native are refused as an executable mismatch, as the native route refuses a wrapper that execs a replaced binary.
+    #[spec("inbox/probe/035")]
+    #[test]
+    fn probe_035_a_hosted_script_replaced_after_its_pin_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy("/bin/sh", dir.path().join("node")).unwrap();
+        let script = dir.path().join("codex");
+        write_executable(&script, b"#!/usr/bin/env node\n// codex.js 1\n");
+        let pin = pin_program(OsStr::new("codex"), Some(dir.path().as_os_str())).expect("pinned");
+        let interp = pin.hosted.as_ref().expect("an npm-shaped pin").interpreter;
+        let at = script.to_str().unwrap();
+        let mut t = hosted_table(interp, at);
+        let c = find(&mut t, 10, 100, &walk(&pin)).expect("the native");
+        assert!(
+            validate(&mut t, &c, ProbeAgent::Codex, &pin, UID, false).is_ok(),
+            "the pinned script's native binds"
+        );
+        let staged = dir.path().join("codex.staged");
+        write_executable(&staged, b"#!/usr/bin/env node\n// codex.js 2\n");
+        std::fs::rename(&staged, &script).unwrap();
+        let mut t = hosted_table(interp, at);
+        let c = find(&mut t, 10, 100, &walk(&pin)).expect("the native");
+        assert_eq!(
+            validate(&mut t, &c, ProbeAgent::Codex, &pin, UID, false).err(),
+            Some(Refusal::Differs(ProbeAgent::Codex)),
+            "the script at the pinned path was replaced after the pin"
+        );
+    }
+
+    /// Scenario: The pin opens an npm-shaped `#!/usr/bin/env node` script, and another script (`#!/usr/bin/env python3`) is renamed over its path before the pin reads the open file. The pin's identity and its interpreter both come from the file it opened, never one from each; and since the path no longer holds the pinned file, the entrypoint's native is refused at validation.
+    #[spec("inbox/probe/035")]
+    #[test]
+    fn probe_035_a_pin_reads_identity_and_shebang_from_one_open_file() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let id = |p: &Path| {
+            let m = std::fs::metadata(p).unwrap();
+            FileId {
+                dev: m.dev(),
+                ino: m.ino(),
+            }
+        };
+        let (node, python) = (dir.path().join("node"), dir.path().join("python3"));
+        std::fs::copy("/bin/sh", &node).unwrap();
+        std::fs::copy("/bin/sh", &python).unwrap();
+        let script = dir.path().join("codex");
+        write_executable(&script, b"#!/usr/bin/env node\n");
+        let opened_id = id(&script);
+        let opened = std::fs::File::open(&script).unwrap();
+        let staged = dir.path().join("codex.staged");
+        write_executable(&staged, b"#!/usr/bin/env python3\n");
+        std::fs::rename(&staged, &script).unwrap();
+        let pin = pin_opened(script.clone(), opened, Some(dir.path().as_os_str())).expect("pinned");
+        assert_eq!(pin.exe, opened_id, "the open file's identity");
+        assert_eq!(
+            pin.hosted.as_ref().map(|h| h.interpreter),
+            Some(id(&node)),
+            "the open file's interpreter, not the swapped-in file's"
+        );
+        let mut t = hosted_table(id(&node), script.to_str().unwrap());
+        let c = find(&mut t, 10, 100, &walk(&pin)).expect("the native");
+        assert_eq!(
+            validate(&mut t, &c, ProbeAgent::Codex, &pin, UID, false).err(),
+            Some(Refusal::Differs(ProbeAgent::Codex)),
+            "the path holds another file than the pinned one"
+        );
+    }
+
+    /// Scenario: Pinning a candidate by its pidfd fails. A failure that says the process is gone (exited, `ESRCH`, no stat, a moved start) is refused as "candidate exited"; any other (a full descriptor table, an unreadable stat) is refused as not held with its errno, never reported as an exit.
+    #[spec("inbox/probe/035")]
+    #[test]
+    fn probe_035_a_pidfd_failure_is_an_exit_only_when_the_process_is_gone() {
+        use super::super::attest::Unpinned;
+        for gone in [
+            Unpinned::Exited,
+            Unpinned::StartChanged,
+            Unpinned::Pidfd(Some(libc::ESRCH)),
+            Unpinned::Stat(Some(libc::ENOENT)),
+            Unpinned::Stat(Some(libc::ESRCH)),
+        ] {
+            assert_eq!(Refusal::unpinned(gone), Refusal::Exited, "{gone:?}");
+        }
+        for (held, errno) in [
+            (Unpinned::Pidfd(Some(libc::EMFILE)), Some(libc::EMFILE)),
+            (Unpinned::Pidfd(None), None),
+            (Unpinned::Stat(Some(libc::EACCES)), Some(libc::EACCES)),
+            (Unpinned::NoPeerPidfd, None),
+        ] {
+            let refusal = Refusal::unpinned(held);
+            assert_eq!(refusal, Refusal::Unheld(errno), "{held:?}");
+            assert!(!refusal.reason().contains("exited"), "{}", refusal.reason());
+        }
+        assert_eq!(
+            Refusal::Unheld(Some(libc::EMFILE)).reason(),
+            format!("candidate not held: errno {}", libc::EMFILE)
+        );
+    }
+
+    /// Scenario: A candidate validated against its pin `exec`s another binary right after validation reads it, before its identity is read again; another one `exec`s across the pidfd poll. Each is refused as an executable mismatch rather than published with an executable validation never compared with the pin.
+    #[spec("inbox/probe/035")]
+    #[test]
+    fn probe_035_the_published_executable_is_the_validated_one() {
+        let pin = native_pin();
+        let base = || {
+            let mut t = Table::default();
+            t.add(10, 1, SH, "dash", &["sh", "-c", "launcher"]).add(
+                12,
+                10,
+                NATIVE,
+                "codex",
+                &["/opt/agent/codex"],
+            );
+            t
+        };
+        let held = |t: &mut Table, c: &Candidate| {
+            validate_held(t, c, ProbeAgent::Codex, &pin, UID, false, Some, || false)
+        };
+        let mut t = base();
+        let c = find(&mut t, 10, 100, &walk(&pin)).unwrap();
+        assert_eq!(
+            held(&mut t, &c),
+            Ok(NATIVE),
+            "no exec: the pin is published"
+        );
+        // The candidate's reads from here: validation's, then the identity's
+        // read, then the read after the poll.
+        for (after, when) in [(1, "before the identity's read"), (2, "across the poll")] {
+            let mut t = base();
+            let c = find(&mut t, 10, 100, &walk(&pin)).unwrap();
+            t.reads.clear();
+            t.exec_after = Some((12, after, COPY));
+            assert_eq!(
+                held(&mut t, &c),
+                Err(Refusal::Differs(ProbeAgent::Codex)),
+                "an exec {when}"
+            );
+        }
     }
 
     /// Scenario: A lookalike (another inode) is refused as an executable mismatch, but a lookalike that also exited, left its parent or belongs to another user is refused for that first: lifecycle and owner refusals come before the mismatch.

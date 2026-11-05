@@ -3006,9 +3006,10 @@ mod linux {
             validated.map_err(Some)
         }
 
-        /// [`discovery::validate`] for `candidate`, held by its pidfd from
-        /// before the reads, its facts read again after them: its identity
-        /// when it is `A`.
+        /// [`discovery::validate_held`] for `candidate`, held by its pidfd
+        /// from before the reads: its identity when it is `A`, built from
+        /// the executable validation accepted, which the reads before and
+        /// after the poll must both still see.
         fn validate_candidate(
             &self,
             kernel: &mut LinuxKernel,
@@ -3023,28 +3024,20 @@ mod linux {
                     start: Some(candidate.start),
                 },
             )
-            .map_err(|_| Refusal::Exited)?;
+            .map_err(Refusal::unpinned)?;
             // SAFETY: `getuid(2)` has no failure mode.
             let uid = unsafe { libc::getuid() };
-            discovery::validate(
+            discovery::validate_held(
                 &mut LinuxProcs,
                 candidate,
                 expected,
                 pin,
                 uid,
                 reject_uid_for_e2e(),
-            )?;
-            let facts = proc_facts(candidate.pid).ok_or(Refusal::Exited)?;
-            let identity = identity_of(candidate.pid, candidate.start, facts.exe, true)
-                .ok_or(Refusal::Exited)?;
-            // Read again after the pin is polled: the reads were `A`'s.
-            if kernel.exited(pinned.pidfd()).unwrap_or(true) {
-                return Err(Refusal::Exited);
-            }
-            if exe_id(candidate.pid) != Some(identity.exe) {
-                return Err(Refusal::Differs(expected));
-            }
-            Ok(identity)
+                |exe| identity_of(candidate.pid, candidate.start, exe, true),
+                // Polled after the reads: they were `A`'s.
+                || kernel.exited(pinned.pidfd()).unwrap_or(true),
+            )
         }
 
         /// Whether the generation retired or its observer was stopped.
@@ -3053,18 +3046,28 @@ mod linux {
                 || self.lock().seam.input().retired()
         }
 
-        /// Keep discovery's first refusal, and log it.
+        /// Keep the binding's first refusal, and log it: a direct Claude's
+        /// comes from its launch record, which no discovery read.
         fn refuse(&self, refusal: Refusal) {
             let mut kept = self.refusal.lock().unwrap_or_else(|e| e.into_inner());
             if kept.is_none() {
                 *kept = Some(refusal);
                 drop(kept);
-                tracing::info!(
-                    target: "composer_probe",
-                    agent_id = %self.agent_id,
-                    reason = %refusal.reason(),
-                    "editor probe discovery refused its candidate"
-                );
+                if self.class == PaneClass::Direct(ProbeAgent::Claude) {
+                    tracing::info!(
+                        target: "composer_probe",
+                        agent_id = %self.agent_id,
+                        reason = %refusal.reason(),
+                        "editor probe's launch-record agent can't be bound"
+                    );
+                } else {
+                    tracing::info!(
+                        target: "composer_probe",
+                        agent_id = %self.agent_id,
+                        reason = %refusal.reason(),
+                        "editor probe discovery refused its candidate"
+                    );
+                }
             }
         }
 
