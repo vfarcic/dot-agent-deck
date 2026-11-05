@@ -1092,6 +1092,19 @@ impl<P: Page> Seam<P> {
                 .and(Err(Refusal::NoRecord)),
         };
         self.sync();
+        // cxact: why an invocation's outcome is what it is (the record's
+        // settlement, the daemon's attribution and read); no path or text.
+        tracing::debug!(
+            target: "composer_probe",
+            ?decided,
+            recorded = ?recorded.as_ref().map(|r| match r {
+                Recorded::Kept { settlement, .. } => format!("kept {settlement:?}"),
+                other => format!("{other:?}"),
+            }),
+            attribution = ?evidence.map(|e| e.attribution),
+            ?read,
+            "editor helper invocation recorded"
+        );
         if decided != Decision::Armed {
             // ExternalEdit's first producer (PR U3-11): an invocation that
             // isn't the deck's may edit the box, and the epoch says so
