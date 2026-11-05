@@ -10784,7 +10784,7 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Layer:** L2 real agent, lane 2 (`tests/e2e_composer_check_codex_live.rs`, Linux), as `041`: an installed `Direct(Codex)` pane on the build's own activation, a fresh `CODEX_HOME`. A test-owned client attached to the pane answers Codex's cursor position queries from its own terminal model, as the desktop app's terminal does (`codex_installed::CprAnswerer`); it stands in for a desktop and is not coverage of the desktop's own answers (C1).
 - **Agent:** real interactive Codex on `common::codex_test_model()`.
 - **Asserts:** two rounds (emptied by Backspace, then by Ctrl+U): a draft typed and a task queued, for three seconds the task stays queued with no delivery, the draft unchanged, no ring, and the deck types nothing; once emptied, a check is written, its empty read applied, then the doorbell rings and the task is acted on once and acknowledged after one hand-over.
-- **Does not assert:** the desktop's own cursor answers; CX-5h (a headless box after a resize, `docs/develop/doorbell-admission.md`); Codex 0.160.0.
+- **Does not assert:** the desktop's own cursor answers; CX-5h (a headless or TUI-only box after resizes; measured once on the activated build, `docs/develop/doorbell-admission.md`, the Codex activation's item 9); Codex 0.160.0.
 - **Platform coverage:** Linux.
 
 ##### inbox/probe/044 — Installing the helper into a real Claude Code pane leaves the person's tools their own editor, installs nothing into a Claude Code whose doorbell the person turned off and never checks it, and leaves other commands alone.
