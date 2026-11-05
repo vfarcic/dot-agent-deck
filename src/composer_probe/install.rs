@@ -121,8 +121,9 @@ pub const SHELLS: &[&str] = &["bash", "zsh", "fish", "sh", "dash", "nu", "pwsh"]
 /// binding (the shared discovery, [`super::discovery`]); `Launcher(Claude)`
 /// and `Wrapper` wait for their own rollout
 /// (`docs/develop/doorbell-admission.md`). A launched Codex gets the helper
-/// but neither the export directory's preparation nor the shell tool's
-/// policy arguments, which only a direct Codex's own argv can take, and its
+/// and the export directory's preparation ([`prepare_codex_export`]) but not
+/// the shell tool's policy arguments, which only a direct Codex's own argv
+/// can take, and its
 /// key-binding baseline is read from the launcher's arguments: where the
 /// native's launch differs, the generation is held, never checked.
 /// Installation is Linux-only whatever this holds: [`at_spawn`] returns
@@ -745,8 +746,15 @@ pub fn install(
 /// nothing is created. `Some` is a refusal of `editor` itself, as the card
 /// shows it, and the generation is held.
 ///
-/// Only a direct Codex: a launcher may give Codex another home, which the
-/// deck can't see before the spawn.
+/// A direct or a launched Codex (the revcxact review's MEDIUM-1). A launcher
+/// may give Codex another home, which the deck can't see before the spawn,
+/// but such a generation is never checked: its settlement compares the
+/// key-binding sources under the home the bound native's own environment
+/// names with the spawn's (`KeymapBaseline::codex_bound`), so another home
+/// holds `Keymap(Changed)`. What this prepares is then either the directory
+/// the checked Codex uses or an empty 0700 one nothing reads; without it, a
+/// launched Codex's first check made Codex create `editor` itself, 0775
+/// under a umask of 0002, which the path rule refuses.
 #[cfg(target_os = "linux")]
 pub fn prepare_codex_export(
     lookup: impl Fn(&str) -> Option<OsString>,
@@ -948,7 +956,10 @@ pub fn at_spawn(
         let setup = || {
             let originals = Originals::resolve(env, |name| std::env::var_os(name))?;
             let mut installation = install(daemon_instance()?, class, generation, &originals)?;
-            if class == PaneClass::Direct(ProbeAgent::Codex) {
+            if matches!(
+                class,
+                PaneClass::Direct(ProbeAgent::Codex) | PaneClass::Launcher(ProbeAgent::Codex)
+            ) {
                 installation.export_hold = prepare_codex_export(|name| {
                     env.iter()
                         .rev()
