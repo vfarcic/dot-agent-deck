@@ -10,9 +10,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use dot_agent_deck::composer_probe::path_rule::{
-    AclGrants, Cause, Entry, FsView, Kind, MAX_SYMLINK_HOPS, Op, Refusal, Remedy, Stat, Xattr,
-    acl_grants, verify_export,
+    AclGrants, Cause, Entry, FsView, Kind, MAX_SYMLINK_HOPS, MakeDir, Op, Prepared, Refusal,
+    Remedy, Stat, Xattr, acl_grants, prepare_codex_editor, verify_export,
 };
+use dot_agent_deck::inbox_display::HoldCause;
 use spec::spec;
 
 const ROOT: u32 = 0;
@@ -56,6 +57,10 @@ struct Node {
 struct Tree {
     nodes: Vec<Node>,
     root_fails: Option<i32>,
+    /// What the next `mkdirat` makes instead of a directory of the user's
+    /// with the mode asked: its shape, owner and mode (a same-uid swap, or a
+    /// filesystem that doesn't make what was asked).
+    makes: Option<(Shape, u32, u32)>,
 }
 
 impl Tree {
@@ -72,6 +77,7 @@ impl Tree {
                 stat_kind: None,
             }],
             root_fails: None,
+            makes: None,
         }
     }
 
@@ -170,6 +176,40 @@ impl Tree {
 const ENOENT: i32 = 2;
 const ENOTDIR: i32 = 20;
 const EIO: i32 = 5;
+const EEXIST: i32 = 17;
+const EACCES: i32 = 13;
+
+impl MakeDir for Tree {
+    fn make_dir(&mut self, dir: &usize, name: &OsStr, mode: u32) -> io::Result<()> {
+        self.failing(*dir, Op::MakeDir)?;
+        let Shape::Dir(children) = &self.nodes[*dir].shape else {
+            return Err(io::Error::from_raw_os_error(ENOTDIR));
+        };
+        if children.contains_key(name) {
+            return Err(io::Error::from_raw_os_error(EEXIST));
+        }
+        let (shape, uid, mode) =
+            self.makes
+                .take()
+                .unwrap_or((Shape::Dir(BTreeMap::new()), ME, mode));
+        self.nodes.push(Node {
+            shape,
+            mode,
+            uid,
+            nlink: 1,
+            fs: self.nodes[*dir].fs,
+            xattrs: BTreeMap::new(),
+            fail: None,
+            stat_kind: None,
+        });
+        let id = self.nodes.len() - 1;
+        let Shape::Dir(children) = &mut self.nodes[*dir].shape else {
+            unreachable!("checked above");
+        };
+        children.insert(name.to_owned(), id);
+        Ok(())
+    }
+}
 
 impl FsView for Tree {
     type Handle = usize;
@@ -1187,6 +1227,219 @@ fn probe_005_io_errors_refuse() {
 /// that refusal: the tests then check only that refusal, the positives print
 /// `SKIP-POSITIVE`, and what the walk does on an allowed filesystem past `/`
 /// is covered there by the scripted cases above alone (and M47n, run apart).
+fn prepare(tree: &mut Tree, home: &str) -> Result<Prepared, Refusal> {
+    prepare_codex_editor(tree, Path::new(home), ME)
+}
+
+/// The mode and owner of `path` in `tree`, or `None` when it doesn't exist.
+fn made(tree: &Tree, path: &str) -> Option<(u32, u32)> {
+    let mut node = 0;
+    for name in path.split('/').filter(|name| !name.is_empty()) {
+        let Shape::Dir(children) = &tree.nodes[node].shape else {
+            return None;
+        };
+        node = *children.get(OsStr::new(name))?;
+    }
+    Some((tree.nodes[node].mode, tree.nodes[node].uid))
+}
+
+/// Scenario: Prepare Codex's export directory on a scripted filesystem (option P): a 0700 `~/.codex` with no `editor` gets one, the user's and 0700, and the 0600 export Codex then writes in it passes the export rule; preparing again leaves it as it is; and a `CODEX_HOME` reached through the user's symlink gets its `editor` in the link's target.
+#[spec("inbox/probe/091")]
+#[test]
+fn probe_091_option_p_creates_editor_private_when_absent() {
+    let mut tree = Tree::standard();
+    tree.dir("/home/me/.codex", ME, 0o700);
+    assert_eq!(prepare(&mut tree, "/home/me/.codex"), Ok(Prepared::Created));
+    assert_eq!(made(&tree, "/home/me/.codex/editor"), Some((0o700, ME)));
+    let export = tree.file("/home/me/.codex/editor/.tmpAb12.md", ME, 0o600);
+    assert_eq!(
+        check(&tree, "/home/me/.codex/editor/.tmpAb12.md", ME),
+        Ok(export),
+        "M56b: Codex exports into the directory, and the rule reads it"
+    );
+    assert_eq!(
+        prepare(&mut tree, "/home/me/.codex"),
+        Ok(Prepared::Existing),
+        "the second spawn finds it"
+    );
+    assert_eq!(made(&tree, "/home/me/.codex/editor"), Some((0o700, ME)));
+
+    tree.dir("/home/me/codex-real", ME, 0o700);
+    tree.link("/home/me/codex-ln", ME, "codex-real");
+    assert_eq!(
+        prepare(&mut tree, "/home/me/codex-ln"),
+        Ok(Prepared::Created)
+    );
+    assert_eq!(made(&tree, "/home/me/codex-real/editor"), Some((0o700, ME)));
+
+    let mut passing = Tree::standard();
+    passing.dir("/home/me/.codex", ME, 0o700);
+    passing.dir("/home/me/.codex/editor", ME, 0o755);
+    assert_eq!(
+        prepare(&mut passing, "/home/me/.codex"),
+        Ok(Prepared::Existing)
+    );
+    assert_eq!(
+        made(&passing, "/home/me/.codex/editor"),
+        Some((0o755, ME)),
+        "an existing directory that passes is left as it is"
+    );
+}
+
+/// Scenario: Prepare Codex's export directory where it already exists and its group or others can write to it, as a umask of 002 makes it (option C). The deck holds it at `editor`, never changing its mode, with the `chmod` that removes exactly the write bits found; the card's words name the directory and `chmod g-w`.
+#[spec("inbox/probe/091")]
+#[test]
+fn probe_091_an_existing_writable_editor_is_held_untouched_with_its_chmod() {
+    for (mode, chmod) in [
+        (0o775, "g-w"),
+        (0o770, "g-w"),
+        (0o2775, "g-w"),
+        (0o757, "o-w"),
+        (0o777, "go-w"),
+    ] {
+        let mut tree = Tree::standard();
+        tree.dir("/home/me/.codex", ME, 0o700);
+        tree.dir("/home/me/.codex/editor", ME, mode);
+        let held = prepare(&mut tree, "/home/me/.codex").unwrap_err();
+        assert_eq!(
+            held,
+            refusal("/home/me/.codex/editor", Cause::Writable { mode, uid: ME }),
+            "{mode:o}"
+        );
+        assert_eq!(held.remedy(ME).chmod(), Some(chmod), "{mode:o}");
+        assert_eq!(
+            made(&tree, "/home/me/.codex/editor"),
+            Some((mode, ME)),
+            "{mode:o}: never touched"
+        );
+        let detail = held.hold_detail(ME);
+        assert_eq!(detail.cause, HoldCause::WritableDirectory, "{mode:o}");
+        assert_eq!(
+            detail.path_component.as_deref(),
+            Some("/home/me/.codex/editor")
+        );
+        let words = detail.words().expect("a cause this build knows");
+        assert!(
+            words.contains("\u{201c}/home/me/.codex/editor\u{201d}") && words.contains("chmod g-w"),
+            "{words}"
+        );
+    }
+}
+
+/// Scenario: Prepare Codex's export directory where its home is one another user could change, or isn't there. A group-writable `~/.codex`, a group-writable home above it, another account's `.codex`, and a `.codex` on NFS are each reported as a refused home at that component, not held here (the read refuses them as before), and nothing is created; a home that doesn't exist yet is left for Codex to make, nothing created; a relative home is refused.
+#[spec("inbox/probe/091")]
+#[test]
+fn probe_091_a_home_another_user_could_change_creates_nothing() {
+    let home_refused = |tree: &mut Tree| match prepare(tree, "/home/me/.codex") {
+        Ok(Prepared::HomeRefused(refusal)) => refusal,
+        other => panic!("a refused home: {other:?}"),
+    };
+    let mut tree = Tree::standard();
+    tree.dir("/home/me/.codex", ME, 0o775);
+    assert_eq!(
+        home_refused(&mut tree),
+        refusal(
+            "/home/me/.codex",
+            Cause::Writable {
+                mode: 0o775,
+                uid: ME
+            }
+        )
+    );
+    assert_eq!(
+        made(&tree, "/home/me/.codex/editor"),
+        None,
+        "nothing created"
+    );
+
+    let mut tree = Tree::new();
+    tree.dir("/home", ROOT, 0o755);
+    tree.dir("/home/me", ME, 0o775);
+    tree.dir("/home/me/.codex", ME, 0o700);
+    assert_eq!(home_refused(&mut tree).at, PathBuf::from("/home/me"));
+    assert_eq!(made(&tree, "/home/me/.codex/editor"), None);
+
+    let mut tree = Tree::standard();
+    tree.dir("/home/me/.codex", OTHER, 0o700);
+    let foreign = home_refused(&mut tree);
+    assert_eq!(foreign.cause, Cause::ForeignOwner { uid: OTHER });
+    assert_eq!(foreign.hold_detail(ME).cause, HoldCause::ForeignOwner);
+    assert_eq!(made(&tree, "/home/me/.codex/editor"), None);
+
+    let mut tree = Tree::standard();
+    tree.dir("/home/me/.codex", ME, 0o700);
+    tree.set_fs("/home/me/.codex", 0x6969);
+    let nfs = home_refused(&mut tree);
+    assert_eq!(nfs.cause, Cause::Filesystem { f_type: 0x6969 });
+    let detail = nfs.hold_detail(ME);
+    assert_eq!(
+        (detail.cause, detail.filesystem.as_deref()),
+        (HoldCause::Filesystem, Some("NFS"))
+    );
+    assert_eq!(made(&tree, "/home/me/.codex/editor"), None);
+
+    let mut tree = Tree::standard();
+    assert_eq!(
+        prepare(&mut tree, "/home/me/.codex"),
+        Ok(Prepared::HomeAbsent)
+    );
+    assert_eq!(
+        made(&tree, "/home/me/.codex"),
+        None,
+        "the deck makes no home"
+    );
+
+    assert_eq!(
+        prepare(&mut Tree::standard(), "home/me/.codex"),
+        Err(refusal("home/me/.codex", Cause::NotAbsolute))
+    );
+}
+
+/// Scenario: Prepare Codex's export directory where creating it doesn't leave the private directory asked for: the filesystem makes it 0750, another account's, or the name turns out to be the user's own symlink when it is opened; or `mkdirat` itself fails. Each is refused at `editor`, and only a directory of the user's at exactly 0700 is accepted.
+#[spec("inbox/probe/091")]
+#[test]
+fn probe_091_a_directory_not_made_private_is_refused() {
+    for (makes, cause) in [
+        (
+            (Shape::Dir(BTreeMap::new()), ME, 0o750),
+            Cause::NotPrivate {
+                mode: 0o750,
+                uid: ME,
+            },
+        ),
+        (
+            (Shape::Dir(BTreeMap::new()), OTHER, 0o700),
+            Cause::ForeignOwner { uid: OTHER },
+        ),
+        ((Shape::Link("/tmp".into()), ME, 0o777), Cause::Symlink),
+        ((Shape::File, ME, 0o700), Cause::NotADirectory),
+    ] {
+        let mut tree = Tree::standard();
+        tree.dir("/home/me/.codex", ME, 0o700);
+        tree.makes = Some(makes);
+        assert_eq!(
+            prepare(&mut tree, "/home/me/.codex"),
+            Err(refusal("/home/me/.codex/editor", cause))
+        );
+    }
+
+    let mut tree = Tree::standard();
+    tree.dir("/home/me/.codex", ME, 0o700);
+    tree.fail("/home/me/.codex", Op::MakeDir, EACCES);
+    let failed = prepare(&mut tree, "/home/me/.codex").unwrap_err();
+    assert_eq!(
+        failed,
+        refusal(
+            "/home/me/.codex/editor",
+            Cause::Io {
+                op: Op::MakeDir,
+                errno: Some(EACCES)
+            }
+        )
+    );
+    assert_eq!(failed.hold_detail(ME).cause, HoldCause::Io);
+}
+
 #[cfg(target_os = "linux")]
 mod real {
     use std::ffi::CString;
@@ -1197,7 +1450,8 @@ mod real {
     use std::path::Path;
 
     use dot_agent_deck::composer_probe::path_rule::{
-        ALLOWED_FILESYSTEMS, Cause, FsView as _, Op, Refusal, Remedy, Xattr, verify_export,
+        ALLOWED_FILESYSTEMS, Cause, FsView as _, Op, Prepared, Refusal, Remedy, Xattr,
+        prepare_codex_editor, verify_export,
     };
     use dot_agent_deck::platform::fsperm::fs_view::LinuxFsView;
     use spec::spec;
@@ -1603,5 +1857,85 @@ mod real {
             assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP), "{error}");
             assert_eq!(read, Xattr::Unsupported);
         }
+    }
+
+    /// `prepare_codex_editor` on the real filesystem under `umask` 002, the
+    /// umask restored after.
+    fn prepare_under_umask_002(home: &Path) -> Result<Prepared, Refusal> {
+        // SAFETY: `umask` has no preconditions; each nextest test is its own
+        // process, and the old mask is restored before returning.
+        let old = unsafe { libc::umask(0o002) };
+        let prepared = prepare_codex_editor(&mut LinuxFsView, home, uid());
+        // SAFETY: as above.
+        unsafe { libc::umask(old) };
+        prepared
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    /// Scenario: On the real filesystem, under a umask of 002: a private `CODEX_HOME` with no `editor` gets one at 0700, which a 0600 export in it then passes the rule from; one whose `editor` is already 0775 is held at it with the `chmod g-w` remedy and left at 0775; and a `CODEX_HOME` that doesn't exist is left alone, nothing created. On a host whose `/` or `/tmp` the rule refuses, each home is reported refused there, with nothing created or held.
+    #[spec("inbox/probe/091")]
+    #[test]
+    fn probe_091_real_option_p_under_umask_002() {
+        let dir = private_tmp();
+        let home = dir.path().join("codex-home");
+        fs::create_dir(&home).unwrap();
+        chmod(&home, 0o700);
+        let editor = home.join("editor");
+        match (prepare_under_umask_002(&home), host_refusal()) {
+            (Ok(Prepared::Created), None) => {
+                assert_eq!(mode(&editor), 0o700, "0700 whatever the umask");
+                let export = editor.join(".tmpAb12.md");
+                write(&export, 0o600);
+                expect_pass(&export, "the box\n");
+            }
+            (Ok(Prepared::HomeRefused(refusal)), Some(host)) => {
+                eprintln!(
+                    "SKIP-POSITIVE: this host's {} isn't allow-listed",
+                    host.at.display()
+                );
+                assert_eq!(refusal, host);
+                assert!(!editor.exists(), "nothing created past a refusal");
+            }
+            (seen, host) => panic!("{seen:?}, host refusal {host:?}"),
+        }
+
+        let shared = dir.path().join("codex-shared");
+        fs::create_dir(&shared).unwrap();
+        chmod(&shared, 0o700);
+        let shared_editor = shared.join("editor");
+        fs::create_dir(&shared_editor).unwrap();
+        chmod(&shared_editor, 0o775);
+        match host_refusal() {
+            None => {
+                let held = prepare_under_umask_002(&shared).unwrap_err();
+                assert_eq!(
+                    held,
+                    Refusal {
+                        at: shared_editor.clone(),
+                        cause: Cause::Writable {
+                            mode: 0o775,
+                            uid: uid()
+                        },
+                    }
+                );
+                assert_eq!(held.remedy(uid()).chmod(), Some("g-w"));
+            }
+            Some(host) => assert_eq!(
+                prepare_under_umask_002(&shared),
+                Ok(Prepared::HomeRefused(host))
+            ),
+        }
+        assert_eq!(mode(&shared_editor), 0o775, "never touched");
+
+        let missing = dir.path().join("missing-codex-home");
+        match (prepare_under_umask_002(&missing), host_refusal()) {
+            (Ok(Prepared::HomeAbsent), None) => {}
+            (Ok(Prepared::HomeRefused(refusal)), Some(host)) => assert_eq!(refusal, host),
+            (seen, host) => panic!("{seen:?}, host refusal {host:?}"),
+        }
+        assert!(!missing.exists(), "the deck makes no home for Codex");
     }
 }

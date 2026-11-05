@@ -1,7 +1,7 @@
 //! PRD #1666 part 3 (Q35-03): the Linux [`FsView`] the export path rule
 //! (`composer_probe::path_rule`) walks: `openat` without following, `fstat`,
-//! `fstatfs` and `fgetxattr`, every one on a descriptor the walk holds.
-//! Nothing in the daemon uses it yet.
+//! `fstatfs` and `fgetxattr`, every one on a descriptor the walk holds; and
+//! `mkdirat`, the one write option P makes (`path_rule::prepare_codex_editor`).
 
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::File;
@@ -10,7 +10,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 
-use crate::composer_probe::path_rule::{Entry, FsView, Kind, Stat, Xattr};
+use crate::composer_probe::path_rule::{Entry, FsView, Kind, MakeDir, Stat, Xattr};
 
 /// The buffer one `fgetxattr` reads into: Linux's own cap on a value
 /// (`XATTR_SIZE_MAX`), so one read gets any value, and `ERANGE` is an error,
@@ -163,6 +163,19 @@ impl FsView for LinuxFsView {
             }
             Err(_) => absent_or_error(io::Error::last_os_error()),
         }
+    }
+}
+
+impl MakeDir for LinuxFsView {
+    fn make_dir(&mut self, dir: &OwnedFd, name: &OsStr, mode: u32) -> io::Result<()> {
+        let name = c_name(name)?;
+        // SAFETY: `name` is NUL-terminated and outlives the call, and `dir`
+        // keeps the descriptor open. `mkdirat` follows no link in the last
+        // component and fails with `EEXIST` on anything already there.
+        if unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), mode as libc::mode_t) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 }
 

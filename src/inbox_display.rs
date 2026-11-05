@@ -680,7 +680,8 @@ impl WakeHold {
 /// cause, plus the refused path component and its filesystem's name as
 /// display text, for a client to escape and never run. Additive: an older
 /// client ignores it, and a cause this build does not know reads as
-/// [`HoldCause::Unknown`]. No deck sets it yet.
+/// [`HoldCause::Unknown`]. Set with `cannot_check` when the deck refused a
+/// Codex generation's export directory before its spawn (Q35-27).
 ///
 /// Both strings are cut to [`MAX_HOLD_DETAIL_CHARS`] as they are read, so a
 /// peer that sends more is bounded whichever constructor it bypassed.

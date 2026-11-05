@@ -383,6 +383,9 @@ pub struct Installation {
     /// (A-20d-1b): what the observer compares each later read with.
     #[cfg(target_os = "linux")]
     keymap_baseline: Option<super::keymap::KeymapBaseline>,
+    /// Q35-27: why Codex's export directory was refused before the spawn
+    /// ([`prepare_codex_export`]), as the card shows it.
+    export_hold: Option<crate::inbox_display::HoldDetail>,
     /// A test's stand-in for the bound agent's `/proc/<pid>/environ`
     /// (reva21 U1-1): the test binds `A` to its own process, whose
     /// environment is the test runner's, not the one the deck's spawn gave.
@@ -496,6 +499,25 @@ impl Installation {
     #[cfg(all(test, target_os = "linux"))]
     pub fn take_bound_environ_for_test(&mut self) -> Option<Vec<(OsString, OsString)>> {
         self.bound_environ.take()
+    }
+
+    /// Q35-27: why Codex's export directory was refused before the spawn
+    /// ([`prepare_codex_export`]); `None` when it wasn't, or when this class
+    /// doesn't prepare it.
+    pub fn export_hold(&self) -> Option<&crate::inbox_display::HoldDetail> {
+        self.export_hold.as_ref()
+    }
+
+    /// The refusal [`Self::export_hold`] reads, taken by the observer.
+    pub fn take_export_hold(&mut self) -> Option<crate::inbox_display::HoldDetail> {
+        self.export_hold.take()
+    }
+
+    /// Set [`Self::export_hold`], for a test that builds an installation
+    /// without spawning.
+    #[cfg(test)]
+    pub fn set_export_hold_for_test(&mut self, hold: crate::inbox_display::HoldDetail) {
+        self.export_hold = Some(hold);
     }
 
     /// The baseline read before the spawn, taken by the observer.
@@ -624,9 +646,128 @@ pub fn install(
         helper_id: instance.helper_id(),
         launch: Vec::new(),
         keymap_baseline: None,
+        export_hold: None,
         #[cfg(all(test, target_os = "linux"))]
         bound_environ: None,
     })
+}
+
+/// Option P with option C (Q35-27; R6 §6.6, core §6.2) for a direct Codex,
+/// before its spawn: Codex's export directory, `editor` in its home
+/// (`$CODEX_HOME`, else `$HOME/.codex`, as `lookup` gives the spawn's
+/// variables over the daemon's), created 0700 when absent, and checked by
+/// the export path rule when present. `None` when the rule passes it, when
+/// Codex's home doesn't exist yet (nothing is created then), or when the
+/// home can't be resolved as Codex would (`super::keymap::codex_home`): the
+/// export is then left to the rule when it is read; so it is, after a log
+/// line, when the rule refuses Codex's home or a directory above it, where
+/// nothing is created. `Some` is a refusal of `editor` itself, as the card
+/// shows it, and the generation is held.
+///
+/// Only a direct Codex: a launcher may give Codex another home, which the
+/// deck can't see before the spawn.
+#[cfg(target_os = "linux")]
+pub fn prepare_codex_export(
+    lookup: impl Fn(&str) -> Option<OsString>,
+) -> Option<crate::inbox_display::HoldDetail> {
+    let Some(home) = super::keymap::codex_home(&lookup) else {
+        tracing::info!(
+            target: "composer_probe",
+            "codex editor directory not prepared: codex home not resolved"
+        );
+        return None;
+    };
+    // PRD #1487: the one write into another program's configuration, so a
+    // test process that didn't isolate the agent's home writes nothing.
+    let dir = home.join(super::path_rule::CODEX_EDITOR_DIR);
+    if let Err(refused) = crate::config_write_guard::ensure_config_write_allowed(&dir) {
+        tracing::warn!(
+            target: "composer_probe",
+            dir = %dir.display(),
+            error = %refused,
+            "codex editor directory not prepared: the write isn't allowed here"
+        );
+        return None;
+    }
+    // SAFETY: getuid can't fail.
+    let uid = unsafe { libc::getuid() };
+    prepare_codex_export_at(
+        &mut crate::platform::fsperm::fs_view::LinuxFsView,
+        &home,
+        uid,
+    )
+}
+
+/// [`prepare_codex_export`] for Codex's home `home` through `view`, as user
+/// `uid`, logging what it found or did; a refusal's line names the
+/// directory and the exact remedy.
+pub fn prepare_codex_export_at<V: super::path_rule::MakeDir>(
+    view: &mut V,
+    home: &Path,
+    uid: u32,
+) -> Option<crate::inbox_display::HoldDetail> {
+    use super::path_rule::Prepared;
+    let dir = home.join(super::path_rule::CODEX_EDITOR_DIR);
+    match super::path_rule::prepare_codex_editor(view, home, uid) {
+        Ok(Prepared::Created) => {
+            tracing::info!(
+                target: "composer_probe",
+                dir = %dir.display(),
+                "codex editor directory created, mode 0700"
+            );
+            None
+        }
+        Ok(Prepared::Existing) => {
+            tracing::debug!(
+                target: "composer_probe",
+                dir = %dir.display(),
+                "codex editor directory passes"
+            );
+            None
+        }
+        Ok(Prepared::HomeAbsent) => {
+            tracing::info!(
+                target: "composer_probe",
+                home = %home.display(),
+                "codex editor directory not created: codex home doesn't exist yet"
+            );
+            None
+        }
+        Ok(Prepared::HomeRefused(refusal)) => {
+            tracing::warn!(
+                target: "composer_probe",
+                dir = %refusal.at.display(),
+                cause = ?refusal.cause,
+                remedy = %remedy_text(&refusal, uid),
+                "codex editor directory not created: codex home isn't one the check can read"
+            );
+            None
+        }
+        Err(refusal) => {
+            tracing::warn!(
+                target: "composer_probe",
+                dir = %refusal.at.display(),
+                cause = ?refusal.cause,
+                remedy = %remedy_text(&refusal, uid),
+                "codex editor directory held: the deck can't check this agent's input box"
+            );
+            Some(refusal.hold_detail(uid))
+        }
+    }
+}
+
+/// The log's remedy for `refusal`: the exact `chmod` for the user's own
+/// writable directory, then a restart; otherwise core §6.3's relocation.
+fn remedy_text(refusal: &super::path_rule::Refusal, uid: u32) -> String {
+    use super::path_rule::Remedy;
+    let remedy = refusal.remedy(uid);
+    match (remedy, remedy.chmod()) {
+        (Remedy::RemoveWrite { .. }, Some(mode)) => format!(
+            "chmod {mode} {}, then restart the agent",
+            shell_quote(&refusal.at.to_string_lossy())
+        ),
+        _ => crate::inbox_display::HOLD_REMEDY_RELOCATE.to_string(),
+    }
 }
 
 /// The directory a spawn's child starts in, as the PTY builder picks it
@@ -722,7 +863,17 @@ pub fn at_spawn(
     {
         let setup = || {
             let originals = Originals::resolve(env, |name| std::env::var_os(name))?;
-            install(daemon_instance()?, class, generation, &originals)
+            let mut installation = install(daemon_instance()?, class, generation, &originals)?;
+            if class == PaneClass::Direct(ProbeAgent::Codex) {
+                installation.export_hold = prepare_codex_export(|name| {
+                    env.iter()
+                        .rev()
+                        .find(|(k, _)| k == name)
+                        .map(|(_, v)| OsString::from(v))
+                        .or_else(|| std::env::var_os(name))
+                });
+            }
+            Ok(installation)
         };
         setup().map_err(NotInstalled::HelperSetup)
     }

@@ -1514,6 +1514,11 @@ mod linux {
         /// child existed (A-20d-1b). `None` (an installation no spawn path
         /// read for) gives no evidence: the keymap holds as unmeasured.
         keymap_baseline: Option<crate::composer_probe::keymap::KeymapBaseline>,
+        /// Q35-27: why the deck refused Codex's export directory before the
+        /// spawn ([`Installation::export_hold`]). With it the generation is
+        /// [`InertCause::ExportDirectory`] from its start, and the card
+        /// names the directory and what to do.
+        export_hold: Option<crate::inbox_display::HoldDetail>,
         /// A test's stand-in for the bound agent's environment
         /// ([`Installation::set_bound_environ_for_test`]).
         #[cfg(test)]
@@ -2095,6 +2100,7 @@ mod linux {
             let helper_id = installation.helper_id();
             let launch = installation.launch().to_vec();
             let keymap_baseline = installation.take_keymap_baseline();
+            let export_hold = installation.take_export_hold();
             #[cfg(test)]
             let bound_environ = installation.take_bound_environ_for_test();
             if !spawned
@@ -2122,6 +2128,12 @@ mod linux {
                     .input
                     .recheck_keymap_at_settlement(Arc::new(move || wake.ring()));
             }
+            let mut seam = Seam::new(generation, spawned.input, installation.into_files());
+            // Q35-27: a refused export directory refuses every read, so the
+            // generation is never armed; settled now, before any pass.
+            if export_hold.is_some() {
+                seam.set_permission(Permission::Inert(InertCause::ExportDirectory));
+            }
             let observer = Arc::new(Observer {
                 agent_id: spawned.agent_id,
                 generation,
@@ -2137,7 +2149,7 @@ mod linux {
                 assumed: spawned.assumed,
                 settling: SettleClaim::default(),
                 inner: Mutex::new(Inner {
-                    seam: Seam::new(generation, spawned.input, installation.into_files()),
+                    seam,
                     watch: Watch::default(),
                 }),
                 connections: Arc::new(Pool::new(CONNECTIONS_PER_GENERATION)),
@@ -2146,6 +2158,7 @@ mod linux {
                 stopped: std::sync::atomic::AtomicBool::new(false),
                 keymap: std::sync::OnceLock::new(),
                 keymap_baseline,
+                export_hold,
                 #[cfg(test)]
                 bound_environ,
                 #[cfg(test)]
@@ -2212,6 +2225,12 @@ mod linux {
         /// The generation's permission as settled so far.
         pub fn permission(&self) -> Permission {
             self.lock().seam.permission()
+        }
+
+        /// Q35-27: why the deck refused Codex's export directory before the
+        /// spawn, as the card shows it; `None` when it didn't.
+        pub fn export_hold(&self) -> Option<&crate::inbox_display::HoldDetail> {
+            self.export_hold.as_ref()
         }
 
         /// Probe admission at `now` with this generation's permission

@@ -968,7 +968,12 @@ async fn run_tick(
             };
             if let Some(shown) = slot.hold.observe(&hold, now, config.wake_stall_after) {
                 info!(pane_id = %pane, agent_id = %agent, hold = ?shown, ?hold, "doorbell hold");
-                hub.set_wake_hold(&pane, &agent, shown);
+                // Q35-27: a box the deck can't check because it refused the
+                // agent's export directory says which directory and why.
+                let detail = (shown == Some(crate::inbox_display::WakeHold::CannotCheck))
+                    .then(|| registry.doorbell_hold_detail(&pane, &agent))
+                    .flatten();
+                hub.set_wake_hold_with_detail(&pane, &agent, shown, detail);
             }
             if slot.busy {
                 continue;

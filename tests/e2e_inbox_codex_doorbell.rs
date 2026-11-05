@@ -24,6 +24,7 @@ use inbox::*;
 use serde_json::{Value, json};
 use spec::spec;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -84,6 +85,11 @@ struct Codex {
 
 impl Deck {
     fn new() -> Self {
+        Self::with(&[])
+    }
+
+    /// [`Self::new`] with `extra` in the daemon's environment after its own.
+    fn with(extra: &[(&str, &str)]) -> Self {
         let bin = common::harness_tempdir().unwrap();
         let script = bin.path().join("codex-composer.py");
         std::fs::write(
@@ -94,15 +100,24 @@ impl Deck {
         std::fs::write(&script, include_str!("support/codex_composer.py")).unwrap();
         let log = bin.path().join("deck.log");
         let hooks = hook_list_response();
-        let daemon = daemon_unbound(&[
-            ("PATH", path().as_str()),
-            ("CODEX_HOOK_LIST_RESPONSE", hooks.as_str()),
-            ("DOT_AGENT_DECK_LOG", log.to_str().unwrap()),
-            ("RUST_LOG", "doorbell=debug"),
-            ("DOT_AGENT_DECK_E2E_ASSUME_CODEX_HEAD_ECHO", MEASURED),
+        let mut env = vec![
+            ("PATH", path()),
+            ("CODEX_HOOK_LIST_RESPONSE", hooks),
+            ("DOT_AGENT_DECK_LOG", log.to_str().unwrap().to_string()),
+            ("RUST_LOG", "doorbell=debug".to_string()),
+            (
+                "DOT_AGENT_DECK_E2E_ASSUME_CODEX_HEAD_ECHO",
+                MEASURED.to_string(),
+            ),
             // A held task shows its reason after two seconds, not two minutes.
-            ("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "2000"),
-        ]);
+            (
+                "DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS",
+                "2000".to_string(),
+            ),
+        ];
+        env.extend(extra.iter().map(|&(k, v)| (k, v.to_string())));
+        let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let daemon = daemon_unbound(&env);
         Deck {
             daemon,
             log,
@@ -172,6 +187,69 @@ impl Deck {
             "display_name":name}),
         );
         assert_eq!(reply["ok"], true, "start the scripted Codex: {reply}");
+        let agent = reply["id"].as_str().unwrap().to_string();
+        let pid = base.with_extension("pid");
+        assert!(
+            common::wait_until(common::child_boot_budget(), || std::fs::read_to_string(
+                &pid
+            )
+            .is_ok_and(|text| text.parse::<u32>().is_ok())),
+            "the scripted Codex must start"
+        );
+        let token = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(common::recorded_hook_capability(&self.daemon.home, &agent))
+            .expect("the pane's capability");
+        let pane = Pane {
+            id: name.into(),
+            agent,
+            token,
+            pid: std::fs::read_to_string(&pid).unwrap().parse().unwrap(),
+            capture: base.with_extension("bytes"),
+            attach_socket: self.daemon.attach_socket.clone(),
+        };
+        Codex { pane, base }
+    }
+
+    /// The scripted Codex screen started as a direct Codex in pane `name`:
+    /// its command a plain argv whose first word is a `codex` of its own (a
+    /// shim that records the pane's capability, as
+    /// `common::capability_export_command` does, then runs the screen), so
+    /// the deck installs its helper under the e2e assumption and prepares
+    /// Codex's export directory in `$CODEX_HOME` first.
+    fn direct_codex(&self, name: &str, release: &str) -> Codex {
+        let bin = self.daemon.home.join(format!("bin-{name}"));
+        std::fs::create_dir(&bin).unwrap();
+        let shim = bin.join("codex");
+        let quote = |path: &Path| path.to_string_lossy().replace('\'', "'\\''");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\n(umask 077; printf '%s' \"$DOT_AGENT_DECK_PANE_CAPABILITY\" > \".test-capability-$DOT_AGENT_DECK_AGENT_ID\")\nexec python3 '{}' \"$@\"\n",
+                quote(&self.script)
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let base = self.daemon.home.join(name);
+        let command = format!(
+            "'{}' '{}' '{}' '{release}'",
+            quote(&shim),
+            quote(&base),
+            quote(Path::new(env!("CARGO_BIN_EXE_dot-agent-deck")))
+        );
+        let reply = attach(
+            &self.daemon,
+            json!({"op":"start-agent","command":command,"agent_type":"codex",
+            "cwd":self.daemon.home,"rows":40,"cols":140,
+            "env":[["DOT_AGENT_DECK_PANE_ID",name],["CODEX_HOME",self.daemon.home.join(".codex")],
+                ["PATH",path()]],
+            "display_name":name}),
+        );
+        assert_eq!(
+            reply["ok"], true,
+            "start the direct scripted Codex: {reply}"
+        );
         let agent = reply["id"].as_str().unwrap().to_string();
         let pid = base.with_extension("pid");
         assert!(
@@ -877,4 +955,168 @@ fn codex_028_a_small_fresh_codex_without_a_width_witness_is_held_visibly() {
         "no width witness",
     );
     holds(&deck, &codex, "awaiting_prompt");
+}
+
+/// The daemon's environment for Q35-27's tests: installation assumed for
+/// Codex 0.164.0, so a direct Codex gets the helper, and the composer probe's
+/// lines in the log.
+const PREPARED: &[(&str, &str)] = &[
+    ("DOT_AGENT_DECK_E2E_ASSUME_EDITOR_PROBE", "codex@0.164.0"),
+    ("RUST_LOG", "doorbell=debug,composer_probe=info"),
+];
+
+/// The first directory from `/` down to `dir` on a filesystem outside the
+/// export rule's allow-list, where the deck refuses whatever the test sets up
+/// below it: a container's overlayfs root, such as the RWX sandbox's. Read
+/// by `statfs(2)`, apart from the rule.
+fn host_filesystem_refusal(dir: &Path) -> Option<PathBuf> {
+    use dot_agent_deck::composer_probe::path_rule::ALLOWED_FILESYSTEMS;
+    use std::os::unix::ffi::OsStrExt;
+    let mut ancestors: Vec<&Path> = dir.ancestors().collect();
+    ancestors.reverse();
+    ancestors.into_iter().find_map(|at| {
+        let path = std::ffi::CString::new(at.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `statfs` is plain data, so all-zero is a valid value.
+        let mut info: libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: a NUL-terminated path and a writable `statfs`.
+        assert_eq!(unsafe { libc::statfs(path.as_ptr(), &mut info) }, 0);
+        // `f_type`'s width varies by architecture.
+        #[allow(clippy::unnecessary_cast)]
+        let f_type = info.f_type as u32;
+        (!ALLOWED_FILESYSTEMS
+            .iter()
+            .any(|&(allowed, _)| allowed == f_type))
+        .then(|| at.to_path_buf())
+    })
+}
+
+/// A private `$CODEX_HOME` for the daemon's panes.
+fn codex_home(deck: &Deck) -> PathBuf {
+    let home = deck.daemon.home.join(".codex");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+    home
+}
+
+/// The log's lines containing `needle`.
+fn log_lines(deck: &Deck, needle: &str) -> Vec<String> {
+    deck.log()
+        .lines()
+        .filter(|l| l.contains(needle))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The log's `codex editor directory held` lines.
+fn held_lines(deck: &Deck) -> Vec<String> {
+    log_lines(deck, "codex editor directory held")
+}
+
+/// On a host whose own filesystem the rule refuses: one line saying Codex's
+/// home wasn't prepared, naming that directory, and nothing held.
+fn assert_home_refused_on_host(deck: &Deck, host: &Path) {
+    eprintln!(
+        "SKIP-POSITIVE: this host's {} isn't allow-listed",
+        host.display()
+    );
+    let refused = log_lines(deck, "codex home isn't one the check can read");
+    assert_eq!(refused.len(), 1, "{}", deck.log());
+    assert!(
+        refused[0].contains(&format!("dir={} ", host.display())),
+        "{refused:?}"
+    );
+    assert!(held_lines(deck).is_empty(), "{}", deck.log());
+}
+
+/// Scenario: Start a direct Codex 0.164.0 stand-in, its helper installed, with `$CODEX_HOME` a private directory that has no `editor` in it. The deck creates `editor` before the agent starts, the user's and 0700, says so in its log, and holds nothing for it. On a host whose own filesystem the rule refuses (an overlayfs root), the deck instead logs that Codex's home wasn't prepared, naming that directory, and creates and holds nothing.
+#[spec("inbox/probe/091")]
+#[test]
+fn probe_091_a_direct_codex_gets_a_private_editor_directory() {
+    let deck = Deck::with(PREPARED);
+    let home = codex_home(&deck);
+    let codex = deck.direct_codex("codex-091-absent", MEASURED);
+    let editor = home.join("editor");
+    if let Some(host) = host_filesystem_refusal(&home) {
+        assert_home_refused_on_host(&deck, &host);
+        assert!(!editor.exists(), "nothing created past a refusal");
+        return;
+    }
+    let mode = std::fs::metadata(&editor)
+        .unwrap_or_else(|error| {
+            panic!(
+                "the deck created editor before the agent started: {error}\n{}",
+                deck.log()
+            )
+        })
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o7777, 0o700, "{mode:o}");
+    assert!(
+        deck.log()
+            .contains("codex editor directory created, mode 0700"),
+        "{}",
+        deck.log()
+    );
+    assert!(held_lines(&deck).is_empty(), "{}", deck.log());
+    assert!(
+        deck.record(&codex)["inbox"]["hold_detail"].is_null(),
+        "{}",
+        deck.record(&codex)
+    );
+}
+
+/// Scenario: Start a direct Codex 0.164.0 stand-in whose `$CODEX_HOME/editor` already exists at 0775, as a umask of 002 leaves it. The deck leaves the directory at 0775, logs the directory with the exact `chmod g-w` that fixes it, and, once something is typed into the agent's box and a task waits, holds the task with `cannot_check` and a detail naming that directory as one others can write to, which both clients show with the `chmod g-w` remedy; nothing is typed into the box. On a host whose own filesystem the rule refuses, the deck logs that Codex's home wasn't prepared, naming that directory, holds nothing and leaves `editor` at 0775.
+#[spec("inbox/probe/091")]
+#[test]
+fn probe_091_a_writable_editor_directory_is_held_with_its_path_and_chmod() {
+    let deck = Deck::with(PREPARED);
+    let home = codex_home(&deck);
+    let editor = home.join("editor");
+    std::fs::create_dir(&editor).unwrap();
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o775)).unwrap();
+    let codex = deck.direct_codex("codex-091-writable", MEASURED);
+    let never_touched = || {
+        assert_eq!(
+            std::fs::metadata(&editor).unwrap().permissions().mode() & 0o7777,
+            0o775,
+            "never touched"
+        );
+    };
+    if let Some(host) = host_filesystem_refusal(&home) {
+        assert_home_refused_on_host(&deck, &host);
+        never_touched();
+        return;
+    }
+    let held = held_lines(&deck);
+    assert_eq!(held.len(), 1, "{}", deck.log());
+    assert!(
+        held[0].contains(&format!("chmod g-w '{}'", editor.display())),
+        "the exact remedy: {held:?}"
+    );
+    never_touched();
+    deck.latched(&codex, MEASURED);
+    deck.idle(&codex);
+    let mut user = common::AttachInput::attach(&deck.daemon.attach_socket, &codex.pane.agent);
+    user.write("draft");
+    assert!(common::wait_until(WAIT, || codex.typed() == "draft"));
+    user.write("\x15");
+    assert!(common::wait_until(WAIT, || codex.typed() == "draft\x15"));
+    let id = enqueue(&deck.daemon, &codex.pane, BODY);
+    assert!(
+        common::wait_until(WAIT, || {
+            let inbox = &deck.record(&codex)["inbox"];
+            inbox["wake_hold"] == "cannot_check"
+                && inbox["hold_detail"]["cause"] == "writable_directory"
+                && inbox["hold_detail"]["path_component"] == editor.to_str().unwrap()
+        }),
+        "{}",
+        deck.record(&codex)
+    );
+    unchanged(&codex.pane, Duration::from_millis(600));
+    assert_eq!(
+        codex.typed(),
+        "draft\x15",
+        "nothing typed into the held box"
+    );
+    state(&deck.daemon, &codex.pane, &id, "queued");
 }
