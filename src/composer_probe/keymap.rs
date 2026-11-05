@@ -929,10 +929,19 @@ impl CodexBaseline {
 /// accepted per generation, each a step forward from the last accepted read
 /// ([`codex_bookkeeping_forward`]); a further one holds.
 ///
-/// Reads are numbered as they begin, and only a read newer than the last one
-/// adopted is adopted ([`CodexReads::settle`]), so two checks that read
-/// concurrently and take the lock in the other order can't wind the last
-/// accepted read back.
+/// Which way a read lies from the last accepted one is decided by content
+/// (the revcxkey2 review's LOW-1): Codex's bookkeeping only moves forward
+/// ([`codex_bookkeeping_forward`] requires a move, so no two different reads
+/// are each a step forward of the other). A read that is the same as the
+/// last accepted one, or a step forward of it, is adopted; one that lags
+/// behind it, a
+/// read that was in flight when a later one was adopted (the revcxkey
+/// review's M2: the daemon's two callers, admission and the observer's
+/// re-read, read outside the lock and may take it in either order), is
+/// accepted but never adopted, so the last accepted read can't wind back. A
+/// read may lag only when it began before the last adoption
+/// ([`CodexReads::start_read`]); one that began after it and still lags
+/// found the file itself stepped back, and holds.
 ///
 /// The first comparison that fails latches (the revcxkey review's H1): it is
 /// returned by that check and every later one of the generation, whatever
@@ -944,8 +953,6 @@ impl CodexBaseline {
 #[derive(Debug)]
 pub struct CodexReads {
     sources: CodexSources,
-    /// The number the next read takes ([`CodexReads::read`]).
-    next: std::sync::atomic::AtomicU64,
     state: std::sync::Mutex<CodexReadsState>,
 }
 
@@ -953,11 +960,10 @@ pub struct CodexReads {
 struct CodexReadsState {
     /// The last read adopted, first the one before the spawn.
     last: CodexRead,
-    /// `last`'s number; the spawn's read is 0.
-    last_seq: u64,
     /// The first comparison that failed, returned by every later check.
     held: Option<Hold>,
-    /// How many bookkeeping rewrites this generation has accepted.
+    /// How many bookkeeping rewrites this generation has accepted, which is
+    /// how many times `last` has changed.
     rewrites: u8,
 }
 
@@ -973,10 +979,8 @@ impl CodexReads {
     pub fn new(baseline: &CodexBaseline) -> CodexReads {
         CodexReads {
             sources: baseline.sources.clone(),
-            next: std::sync::atomic::AtomicU64::new(1),
             state: std::sync::Mutex::new(CodexReadsState {
                 last: baseline.read.clone(),
-                last_seq: 0,
                 held: None,
                 rewrites: 0,
             }),
@@ -993,60 +997,72 @@ impl CodexReads {
         self.settle(self.read(), precedence)
     }
 
-    /// Reads the sources now, numbered in the order the reads began. File
-    /// I/O: no lock held.
+    /// Reads the sources now: [`CodexReads::start_read`] then
+    /// [`CodexReads::finish_read`]. File I/O: no lock held.
     pub fn read(&self) -> CodexTicket {
-        // Numbered before the files are read, so a read that began later
-        // carries the higher number, whichever finishes first.
-        let seq = self.next.fetch_add(1, Ordering::SeqCst);
+        self.finish_read(self.start_read())
+    }
+
+    /// The half of [`CodexReads::read`] before the file I/O: notes how many
+    /// rewrites had been adopted when the read began, so a read that lags
+    /// behind the last accepted one can be told from a file that stepped
+    /// back ([`CodexReads::settle`]). It takes the comparison's lock only to
+    /// copy that count.
+    pub fn start_read(&self) -> CodexReadStart {
+        CodexReadStart {
+            adopted: self.lock().rewrites,
+        }
+    }
+
+    /// The half of [`CodexReads::read`] that reads the files. File I/O: no
+    /// lock held.
+    pub fn finish_read(&self, start: CodexReadStart) -> CodexTicket {
         CodexTicket {
-            seq,
+            adopted: start.adopted,
             read: self.sources.read(),
         }
     }
 
+    fn lock(&self) -> std::sync::MutexGuard<'_, CodexReadsState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Checks `ticket`'s read (the half of [`CodexReads::check`] after the
-    /// I/O). A read newer than the last one adopted is compared with it and,
-    /// when accepted, adopted. One older than that (the revcxkey review's
-    /// M2: the daemon's two callers, admission and the observer's re-read,
-    /// read outside the lock and may take it in the other order) is still
-    /// compared, but is never adopted, so the last accepted read can't wind
-    /// back to an earlier one: it must be a read the adopted one could have
-    /// followed, the same or a step back in Codex's bookkeeping alone
-    /// ([`codex_unchanged`] with the two swapped). A read that saw anything
-    /// else, an edit included, holds and latches like any other.
+    /// I/O). A read that is the same as the last accepted one, or a step
+    /// forward of it ([`codex_unchanged`]), is accepted and adopted, a step counting
+    /// against [`CODEX_REWRITES_PER_GENERATION`]. Else, a read that began
+    /// before a later one was adopted is accepted without being adopted when
+    /// the last accepted read is the same as it or a step forward of it in
+    /// Codex's bookkeeping alone ([`codex_unchanged`] with the two swapped).
+    /// Anything else, an edit included, holds and latches.
     pub fn settle(&self, ticket: CodexTicket, precedence: &[KeymapSource]) -> Result<(), Hold> {
-        let CodexTicket { seq, read: now } = ticket;
+        let CodexTicket { adopted, read: now } = ticket;
         {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut state = self.lock();
             if let Some(hold) = state.held {
                 return Err(hold);
             }
-            let fresh = seq > state.last_seq;
-            let compared = if fresh {
-                codex_unchanged(&state.last, &now).and_then(|()| {
-                    if state.last == now {
-                        Ok(())
-                    } else if state.rewrites < CODEX_REWRITES_PER_GENERATION {
-                        state.rewrites += 1;
+            let compared = match codex_unchanged(&state.last, &now) {
+                Ok(()) if state.last == now => Ok(()),
+                Ok(()) if state.rewrites < CODEX_REWRITES_PER_GENERATION => {
+                    state.rewrites += 1;
+                    state.last = now.clone();
+                    Ok(())
+                }
+                Ok(()) => Err(Hold::Changed),
+                Err(hold) => {
+                    if adopted < state.rewrites && codex_unchanged(&now, &state.last).is_ok() {
                         Ok(())
                     } else {
-                        Err(Hold::Changed)
+                        Err(hold)
                     }
-                })
-            } else {
-                codex_unchanged(&now, &state.last)
+                }
             };
             if let Err(hold) = compared {
                 state.held = Some(hold);
                 return Err(hold);
-            }
-            if fresh {
-                state.last = now.clone();
-                state.last_seq = seq;
             }
         }
         // A-20d-1b: the project files are a superset of what Codex loads; a
@@ -1056,12 +1072,19 @@ impl CodexReads {
     }
 }
 
-/// One read of a Codex generation's sources ([`CodexReads::read`]), numbered
-/// in the order the reads began.
+/// One read of a Codex generation's sources ([`CodexReads::read`]), with how
+/// many rewrites had been adopted when it began.
 #[derive(Debug)]
 pub struct CodexTicket {
-    seq: u64,
+    adopted: u8,
     read: CodexRead,
+}
+
+/// A read of a Codex generation's sources that has begun and not yet read
+/// the files ([`CodexReads::start_read`]).
+#[derive(Debug)]
+pub struct CodexReadStart {
+    adopted: u8,
 }
 
 /// [`CodexSources::from_launch`] with the project files for `cwd`, for

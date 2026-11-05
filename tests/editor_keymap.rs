@@ -1733,6 +1733,70 @@ fn probe_014_a_codex_read_that_loses_the_race_is_not_adopted() {
     assert_eq!(reads.check(CODEX_ORDER), Err(Hold::Changed), "latched");
 }
 
+/// Scenario: Two checks of one Codex generation begin their reads in one order and read `config.toml` in the other, as the revcxkey2 review's LOW-1 found: the read that began first finds Codex's marker and the one that began second finds the file before it. Settled in either order, both are accepted and the read with the marker is the one adopted, so the marker rewritten with nothing moved afterwards still holds as changed.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_codex_reads_that_finish_out_of_order_settle_in_either_order() {
+    use dot_agent_deck::composer_probe::keymap::{CodexBaseline, CodexReads};
+    let marker = bookkeeping(Some("true"), None);
+    let cwd = Path::new("/nonexistent-cxkey3-project");
+    let mut wrong = Vec::new();
+    for marker_first in [true, false] {
+        let codex = Codex::new();
+        write(&codex.config(), TRUSTED);
+        let reads = CodexReads::new(&CodexBaseline::at_spawn(&codex.home(), &[], cwd).unwrap());
+        let began_first = reads.start_read();
+        let began_second = reads.start_read();
+        let before = reads.finish_read(began_second);
+        rewrite(&codex.config(), &marker);
+        let with_marker = reads.finish_read(began_first);
+        let settled = if marker_first {
+            [
+                ("the marker", reads.settle(with_marker, CODEX_ORDER)),
+                ("the file before it", reads.settle(before, CODEX_ORDER)),
+            ]
+        } else {
+            [
+                ("the file before it", reads.settle(before, CODEX_ORDER)),
+                ("the marker", reads.settle(with_marker, CODEX_ORDER)),
+            ]
+        };
+        for (read, got) in settled {
+            if got != Ok(()) {
+                wrong.push(format!("marker first {marker_first}, {read}: {got:?}"));
+            }
+        }
+        rewrite(&codex.config(), &marker);
+        let got = reads.check(CODEX_ORDER);
+        if got != Err(Hold::Changed) {
+            wrong.push(format!(
+                "marker first {marker_first}, the marker rewritten with nothing moved: {got:?}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Scenario: Follow one Codex generation's checks while Codex writes its marker into `config.toml` and the user then saves a copy of the file from before that write, as an editor buffer opened earlier would. The marker is accepted, and the saved copy, read by a check that began after the marker was accepted, holds as changed: only a read already in flight when a later one was adopted may lag behind it.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_a_codex_read_that_steps_its_bookkeeping_back_holds() {
+    use dot_agent_deck::composer_probe::keymap::{CodexBaseline, CodexReads};
+    let codex = Codex::new();
+    write(&codex.config(), TRUSTED);
+    let cwd = Path::new("/nonexistent-cxkey3-project");
+    let reads = CodexReads::new(&CodexBaseline::at_spawn(&codex.home(), &[], cwd).unwrap());
+    rewrite(&codex.config(), &bookkeeping(Some("true"), None));
+    assert_eq!(reads.check(CODEX_ORDER), Ok(()), "Codex's marker");
+    rewrite(&codex.config(), TRUSTED);
+    assert_eq!(
+        reads.check(CODEX_ORDER),
+        Err(Hold::Changed),
+        "the file from before the marker saved again"
+    );
+    assert_eq!(reads.check(CODEX_ORDER), Err(Hold::Changed), "latched");
+}
+
 /// Scenario: Take a Codex baseline from the deck's launch line, then compare it with the native the deck's telemetry shim started when an OTLP endpoint is configured: the wrapper's pair, the shim's own `-c otel.trace_exporter=…` and `-c otel.metrics_exporter=…` (produced here by the shim's own function), then the user's arguments. The two read as the same launch, for both exporters, the JSON protocol, either exporter alone, an endpoint that needs escaping, and without the pair. A user's `-c` that moves Ctrl+G behind the shim's overrides still holds as changed, and so does each `otel` override that isn't the shim's: another key, value or spelling, the shim's in the wrong order, twice, or behind a user's argument, and the shim's when the user's own arguments also override `otel` (the shim then adds nothing). A user's own `otel` override still counts as a source: on both sides it matches, on the baseline alone it holds.
 #[spec("inbox/probe/014")]
 #[test]
