@@ -107,6 +107,9 @@ pub struct Fixture {
     codex_pane: Option<CodexPaneEnv>,
     launcher: Option<Launcher>,
     hosted: Option<Hosted>,
+    /// A program the pane's command runs the native fixture through
+    /// ([`Self::absent_through`]).
+    through: Option<&'static str>,
 }
 
 /// Test-owned launcher histories; these change processes, never daemon state.
@@ -218,16 +221,28 @@ impl Fixture {
     }
 
     pub fn with_env(kind: &'static str, extra: &[(&str, &str)]) -> Self {
-        Self::configured(kind, extra, true, None, None)
+        Self::configured(kind, extra, true, None, None, None)
     }
 
     /// Production Absent control: no editor-probe assumption or binding seam.
     pub fn absent(kind: &'static str, extra: &[(&str, &str)]) -> Self {
-        Self::configured(kind, extra, false, None, None)
+        Self::configured(kind, extra, false, None, None, None)
+    }
+
+    /// [`Self::absent`], with the pane's command running the native fixture
+    /// through `program` (e.g. `env`), so the deck classes the pane as a
+    /// launcher of its declared agent rather than the agent started directly.
+    /// None of [`Self::launcher`]'s discovery histories or seams apply.
+    pub fn absent_through(
+        kind: &'static str,
+        program: &'static str,
+        extra: &[(&str, &str)],
+    ) -> Self {
+        Self::configured(kind, extra, false, None, None, Some(program))
     }
 
     pub fn launcher(kind: &'static str, launcher: Launcher, extra: &[(&str, &str)]) -> Self {
-        Self::configured(kind, extra, true, Some(launcher), None)
+        Self::configured(kind, extra, true, Some(launcher), None, None)
     }
 
     /// An npm-shaped install (Q35-22's interpreter-hosted rule): the pane
@@ -244,7 +259,7 @@ impl Fixture {
             lookalike: false,
             pins: NativePins::Both,
         };
-        Self::configured(kind, extra, true, Some(launcher), Some(hosted))
+        Self::configured(kind, extra, true, Some(launcher), Some(hosted), None)
     }
 
     fn configured(
@@ -253,6 +268,7 @@ impl Fixture {
         assumed: bool,
         launcher: Option<Launcher>,
         hosted: Option<Hosted>,
+        through: Option<&'static str>,
     ) -> Self {
         let mut env = vec![("DOT_AGENT_DECK_DOORBELL_TICK_MS", "25")];
         if assumed {
@@ -454,6 +470,7 @@ impl Fixture {
             codex_pane: codex_pane_env,
             launcher,
             hosted,
+            through,
         };
         f.spawn("first", false);
         f
@@ -501,6 +518,8 @@ impl Fixture {
                 "{} --discovery-fixture",
                 quote(&self.exe.parent().unwrap().join("launcher"))
             )
+        } else if let Some(program) = self.through {
+            format!("{program} {} --live-segments-fixture", quote(&self.exe))
         } else {
             format!("{} --live-segments-fixture", quote(&self.exe))
         };

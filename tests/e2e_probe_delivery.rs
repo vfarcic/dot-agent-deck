@@ -675,6 +675,21 @@ fn probe_037_turned_off_claude_holds_with_cannot_type_until_a_prompt() {
     );
 }
 
+/// Scenario: Start Claude Code through a launcher (the pane runs it via `env`), so the deck installs no helper and can't check its box, with no native waiter. Type and delete text in its composer and queue mail: the daemon and attached TUI must show the needs-fetch hold, and further clearing must not authorize a check or a notice before a prompt fetches the message.
+#[spec("inbox/probe/037")]
+#[test]
+fn probe_037_launcher_claude_holds_with_needs_fetch_until_a_prompt() {
+    // Deliberately waiter-less, as the turned-off case above.
+    absent_holds(
+        Fixture::absent_through(
+            "claude",
+            "env",
+            &[("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "100")],
+        ),
+        "needs_fetch",
+    );
+}
+
 /// Scenario: Without an editor-probe or head-echo assumption, type and delete text in a measured Codex composer and queue mail. The daemon and attached TUI must retain the turn-end/prompt route's cannot-type explanation, with no check or notice; an actual user prompt can still fetch the message.
 #[spec("inbox/probe/037")]
 #[test]
@@ -685,7 +700,10 @@ fn probe_037_absent_codex_holds_with_its_prompt_route_reason() {
 fn absent(kind: &'static str, extra: &[(&str, &str)], reason: &str) {
     let mut env = vec![("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "100")];
     env.extend_from_slice(extra);
-    let f = Fixture::absent(kind, &env);
+    absent_holds(Fixture::absent(kind, &env), reason);
+}
+
+fn absent_holds(f: Fixture, reason: &str) {
     f.hook_event("session_start");
     f.hook_event("idle");
     let tui = attached(&f);
