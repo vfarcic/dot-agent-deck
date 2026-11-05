@@ -12,9 +12,9 @@
 #![cfg(target_os = "linux")]
 
 use std::ffi::OsString;
-use std::fs::{File, Permissions};
+use std::fs::{File, OpenOptions, Permissions};
 use std::os::fd::{FromRawFd, OwnedFd};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -270,11 +270,21 @@ impl Harness {
         self.started.iter_mut().find(|c| c.id() == pid).unwrap()
     }
 
+    /// Write `pid`'s marker as a helper creates one: exclusively and
+    /// 0600 by the `open(2)` that makes it, its mode then set on that
+    /// descriptor, never again by path. The observer applies a marker and
+    /// renames it `.seen` when a pass lists it, so the name can be
+    /// gone before a second call by path reaches it.
     fn marker(&self, pid: u32, decision: &str) {
         let name = format!("{pid}-{}-{decision}-0-0", start_of(pid));
         let path = self.inv().join(name);
-        std::fs::write(&path, b"").unwrap();
-        std::fs::set_permissions(&path, Permissions::from_mode(0o600)).unwrap();
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        file.set_permissions(Permissions::from_mode(0o600)).unwrap();
     }
 }
 
