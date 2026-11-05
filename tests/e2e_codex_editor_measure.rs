@@ -118,6 +118,17 @@ fn probe_092_live_codex_164_ctrl_g_just_after_start() {
     eprintln!("STARTUP latest miss {last_miss:.2} s, earliest open {first_open:.2} s after ready");
 }
 
+/// Scenario: Launch the pinned Codex 0.164.0 seven times on one fresh `CODEX_HOME`, each left 8 s past its first ready composer: the first four each rewrite its `config.toml` after that composer, and the rest leave it as it was.
+#[spec("inbox/probe/092")]
+#[test]
+fn probe_092_live_codex_164_config_writes_at_start() {
+    let Some(dir) = record("config-writes") else {
+        return;
+    };
+    let delays = evidence::check_config_writes(&dir);
+    eprintln!("CONFIG-WRITES {delays:?} ms after the first ready composer");
+}
+
 /// Scenario: In one pinned Codex 0.164.0, send twelve wire forms of Ctrl+G, whole and split, from a draft, the slash popup, reverse search and the shortcuts overlay, then paste `PASTE`, a BEL and `TAIL` four times: Ctrl+G as BEL opens the editor from a draft, and the pasted BEL never reaches the export.
 #[spec("inbox/probe/092")]
 #[test]

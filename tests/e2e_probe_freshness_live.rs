@@ -654,6 +654,10 @@ fn probe_083_codex_164_idle_screen_freshness_refusal_rate() {
     let deck = deck_assuming("codex@0.164.0").launch_with_fixture("minimal");
     assert!(deck.wait_for_grid_string_within("No active agents", BUDGET));
     // No credential: a dummy key, and a provider on a closed loopback port.
+    // The `[tui]` table is what Codex 0.164.0 leaves after its first four
+    // starts in a home (`inbox/probe/092`, config writes): without it this
+    // first start rewrites `config.toml` after its first ready composer, and
+    // the generation holds as `Keymap(Changed)` for its whole life.
     let codex_home = deck.home_dir().join(".codex");
     std::fs::create_dir_all(&codex_home).unwrap();
     std::fs::write(
@@ -668,7 +672,9 @@ fn probe_083_codex_164_idle_screen_freshness_refusal_rate() {
              [projects.\"{}\"]\ntrust_level = \"trusted\"\n\n\
              [model_providers.nollm]\nname = \"nollm\"\nbase_url = \"http://127.0.0.1:9/v1\"\n\
              wire_api = \"responses\"\nrequires_openai_auth = true\nrequest_max_retries = 0\n\
-             stream_max_retries = 0\n",
+             stream_max_retries = 0\n\n\
+             [tui]\nscreen_reader_detection_done = true\n\n\
+             [tui.model_availability_nux]\n\"gpt-6.1-sol\" = 4\n",
             deck.workdir().display()
         ),
     )
@@ -678,7 +684,15 @@ fn probe_083_codex_164_idle_screen_freshness_refusal_rate() {
     std::fs::create_dir_all(&bin).unwrap();
     std::os::unix::fs::symlink(&binary, bin.join("codex")).unwrap();
     trust_codex_hooks(&deck, &bin);
-    let command = format!("{}", bin.join("codex").display());
+    // `wrap`'s embedded-mode pair (#2002), given in the command: the
+    // key-binding baseline is read from the command, the bound agent's from
+    // its argv, which `wrap` gives the pair, and the two are compared whole,
+    // so without it every probe is refused `Keymap(Changed)` (U4's finding;
+    // `wrap` adds the pair only once).
+    let command = format!(
+        "{} -c shell_environment_policy.set={{}}",
+        bin.join("codex").display()
+    );
     let run = Run::start_as("codex", "codex", "0.164.0".to_string(), deck, command);
     assert!(
         common::wait_until(BUDGET, || run.screen().contains("OpenAI Codex (v0.164.0)")),

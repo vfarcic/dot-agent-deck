@@ -26,6 +26,8 @@ Modes:
            error line
   startup  when Ctrl+G starts to open the editor after Codex's first ready
            composer, ten launches
+  config-writes  what Codex writes to its own config.toml as it starts,
+           seven launches on one CODEX_HOME
   e1f      the E1F premise: LATE written at E1's ?2004h, at the first ?2026h
            after it, and while the editor runs, 20 trials each, and whether
            the next export holds it
@@ -573,6 +575,40 @@ class Recorder:
             finally:
                 s.close()
 
+    # ---- config writes -------------------------------------------------------
+
+    def run_config_writes(self, launches=7):
+        """What Codex writes to its own `config.toml` as it starts: seven
+        launches on one CODEX_HOME, each read until 8 s after its first
+        ready composer, with the file's contents and mtime before the
+        spawn, at the first ready composer, and at the end."""
+        import difflib
+        self.seed()
+        config = self.codex_home / 'config.toml'
+
+        def read():
+            st = config.stat()
+            return config.read_text(), st.st_mtime_ns
+
+        for n in range(1, launches + 1):
+            before, before_mtime = read()
+            s = Session(self, f'config-writes-{n}', {'VISUAL': self.editor_command('config')})
+            try:
+                if not s.wait(s.ready, 30):
+                    raise RuntimeError('no ready composer: ' + s.text())
+                ready_wall = time.time_ns()
+                at_ready, at_ready_mtime = read()
+                s.pump(8)
+                after, after_mtime = read()
+            finally:
+                s.close()
+            self.rows.append({
+                'cell': 'config-writes', 'launch': n,
+                'changed_by_ready': at_ready != before, 'changed_after_ready': after != at_ready,
+                'mtime_after_ready_ms': (after_mtime - ready_wall) / 1e6 if after_mtime != before_mtime else None,
+                'diff': ''.join(difflib.unified_diff(before.splitlines(True), after.splitlines(True),
+                                                     'before', 'after', n=0))})
+
     # ---- E1F --------------------------------------------------------------
 
     def run_e1f(self, trials=20):
@@ -818,7 +854,8 @@ def inner(mode, root, binary, release, digest, pyte_path):
     rec = Recorder(root, binary, release, digest)
     error = None
     try:
-        {'editor': rec.run_editor, 'startup': rec.run_startup, 'e1f': rec.run_e1f, 'keymap': rec.run_keymap,
+        {'editor': rec.run_editor, 'startup': rec.run_startup, 'config-writes': rec.run_config_writes,
+         'e1f': rec.run_e1f, 'keymap': rec.run_keymap,
          'forms': rec.run_forms}[mode]()
     except Exception as exc:
         import traceback

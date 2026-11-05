@@ -42,6 +42,14 @@ fn probe_092_codex_164_ignores_ctrl_g_just_after_start() {
     );
 }
 
+/// Scenario: Read seven committed Codex 0.164.0 launches on one `CODEX_HOME`, each left 8 s past its first ready composer: the first four each rewrite Codex's own `config.toml` after that composer (the first adds `screen_reader_detection_done` and a model-availability notice count of 1, the next three raise it to 4), and the fifth to seventh leave it as it was.
+#[spec("inbox/probe/092")]
+#[test]
+fn probe_092_codex_164_rewrites_its_config_on_its_first_four_starts() {
+    let delays = evidence::check_config_writes(&evidence::committed_dir());
+    eprintln!("config.toml written {delays:?} ms after the first ready composer");
+}
+
 /// Scenario: Read the committed Codex 0.164.0 wire-form recording: from a draft, Ctrl+G as BEL and as the CSI-u 103 press and repeat opens the editor, whole and split; a bracketed paste holding a BEL opens nothing, and the next export holds `BASEPASTETAIL`, the BEL removed, in all four pastes.
 #[spec("inbox/probe/092")]
 #[test]

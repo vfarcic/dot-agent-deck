@@ -52,7 +52,7 @@ def keep(row, mode):
             'composer_after': row['composer_after'], 'error_line': error_line(row['screen_after']),
             'sent_off': row['sent_off'], 'start_off': row.get('start_off'), 'exit_off': row.get('exit_off'),
             'done_off': row['done_off'], 'marks': row['marks']}.items() if v is not None}
-    if mode == 'startup':
+    if mode in ('startup', 'config-writes'):
         return row
     if mode == 'e1f':
         return {k: row[k] for k in ('arm', 'trial', 'launch', 'opened', 'sent_off', 'late_off', 'disable_off',

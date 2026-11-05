@@ -311,6 +311,44 @@ pub fn check_startup(dir: &Path) -> (f64, f64) {
     (last_miss, first_open)
 }
 
+/// What Codex 0.164.0 writes to its own `config.toml` as it starts, on one
+/// `CODEX_HOME`: the first launch adds `[tui] screen_reader_detection_done`
+/// and a model-availability notice count, the next three raise the count,
+/// each after the first ready composer, and from the fifth nothing changes.
+/// Returns each write's delay after the first ready composer, in ms.
+pub fn check_config_writes(dir: &Path) -> Vec<f64> {
+    let s = summary(dir, "config-writes");
+    let launches = s["rows"].as_array().unwrap();
+    assert_eq!(launches.len(), 7);
+    let mut delays = Vec::new();
+    for (i, row) in launches.iter().enumerate() {
+        let n = i + 1;
+        assert_eq!(row["launch"], n as u64);
+        assert_eq!(
+            row["changed_by_ready"], false,
+            "launch {n}: written before the first ready composer"
+        );
+        let diff = row["diff"].as_str().unwrap();
+        if n <= 4 {
+            assert_eq!(row["changed_after_ready"], true, "launch {n}");
+            assert!(
+                diff.contains(&format!("+\"gpt-6.1-sol\" = {n}")),
+                "launch {n}: {diff}"
+            );
+            assert_eq!(
+                diff.contains("+screen_reader_detection_done = true"),
+                n == 1,
+                "launch {n}: {diff}"
+            );
+            delays.push(row["mtime_after_ready_ms"].as_f64().unwrap());
+        } else {
+            assert_eq!(row["changed_after_ready"], false, "launch {n}: {diff}");
+            assert!(diff.is_empty(), "launch {n}: {diff}");
+        }
+    }
+    delays
+}
+
 /// The E1F premise: LATE written at the first `?2026h` after E1's `?2004h`
 /// (by the deck's reading) is kept in every trial; LATE written while the
 /// editor runs is lost in every trial (the control that shows a loss is
