@@ -761,6 +761,44 @@ fn probe_097_a_claude_whose_shell_leaves_visual_alone_is_checked_then_rung() {
     assert!(!f.log_text().contains("Keymap(Editor)"), "{}", f.log_text());
 }
 
+/// Scenario: Start a Codex stand-in whose `CODEX_HOME` is a `codex` folder inside the pane's working directory, where Codex's sandbox may write, type and delete text in its box and queue mail. The deck must type nothing, not even its check's Ctrl+G, and run no helper: the card and the attached TUI say `cannot_check`, the log names the `Keymap(CodexHome)` hold, and the mail waits. (Every other live Codex here uses the working directory's own `.codex`, the control.)
+#[spec("inbox/probe/098")]
+#[test]
+fn probe_098_a_codex_home_inside_the_working_directory_is_held_without_a_check() {
+    let f = live::Fixture::with_codex_home("codex", ENV, "codex");
+    f.hook_event("session_start");
+    f.hook_event("idle");
+    let tui = attached(&f);
+    touched_empty(&f);
+    let id = f.enqueue();
+    wait_hold(&f, "cannot_check");
+    let words: Value = serde_json::from_str(include_str!("fixtures/inbox-display.json")).unwrap();
+    let expected: String = words["wakeHolds"]["cannot_check"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .take(40)
+        .collect();
+    assert!(
+        common::wait_until(WAIT, || tui.snapshot_grid().contains(&expected)),
+        "{}",
+        tui.snapshot_grid()
+    );
+    assert!(
+        common::wait_until(WAIT, || f.log_text().contains("Keymap(CodexHome)")),
+        "the hold names Codex's home: {}",
+        f.log_text()
+    );
+    f.stable(b"x\x7f");
+    assert!(
+        !f.input().contains(&7),
+        "no check's Ctrl+G: {:?}",
+        f.input()
+    );
+    assert!(!f.path("helper-exited-1").exists(), "no helper ran");
+    assert!(mail_turns(&f, &id).is_empty());
+}
+
 /// Scenario: In a deck whose Claude Code doorbell is turned off (`DOT_AGENT_DECK_DOORBELL_CLAUDE=0`), so the Claude composer gets no helper and no check, type and delete text in it and queue mail. The daemon and attached TUI must show the cannot-type hold, and further clearing must not authorize a check or a notice before a prompt fetches the message.
 #[spec("inbox/probe/037")]
 #[test]

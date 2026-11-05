@@ -2253,3 +2253,121 @@ fn probe_097_a_claude_whose_editor_is_not_the_helper_is_held() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Scenario: Lay out Codex homes, working folders and temporary directories on disk and ask whether such a Codex can be checked at all (the user's ruling Q227b). A home outside the working folder, the working folder's own `.codex`, and a home reached through a symlink that lands outside are checkable; a home inside the working folder (or the folder itself), one whose symlink lands inside it, one under `$TMPDIR` or `/tmp`, and anything that can't be resolved (a missing home, an empty, relative or missing `TMPDIR`) are held `CodexHome`.
+#[spec("inbox/probe/098")]
+#[test]
+fn probe_098_a_codex_home_inside_a_folder_codex_may_write_is_held() {
+    use dot_agent_deck::composer_probe::keymap::codex_home_checkable;
+    use std::ffi::OsStr;
+    let dir = test_temp::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    if root.starts_with("/tmp") {
+        eprintln!(
+            "SKIP: the test's temp base {} is under /tmp",
+            root.display()
+        );
+        return;
+    }
+    let mk = |p: &Path| {
+        std::fs::create_dir_all(p).unwrap();
+        p.to_path_buf()
+    };
+    let project = mk(&root.join("project"));
+    let outside = mk(&root.join("home/.codex"));
+    let own = mk(&project.join(".codex"));
+    let nested = mk(&project.join("sub/.codex"));
+    let elsewhere = mk(&root.join("elsewhere"));
+    let tmp = mk(&root.join("tmp"));
+    let in_tmpdir = mk(&tmp.join("codex"));
+    let linked_out = root.join("link-out");
+    std::os::unix::fs::symlink(&elsewhere, &linked_out).unwrap();
+    let linked_in = root.join("link-in");
+    std::os::unix::fs::symlink(&nested, &linked_in).unwrap();
+    let project_link = root.join("project-link");
+    std::os::unix::fs::symlink(&project, &project_link).unwrap();
+    let in_slash_tmp = tempfile::tempdir_in("/tmp").unwrap();
+    let missing = root.join("missing");
+
+    let held = Err(Hold::CodexHome);
+    let mut wrong = Vec::new();
+    for (row, home, cwd, tmpdir, want) in [
+        (
+            "a home outside the project",
+            &outside,
+            &project,
+            None,
+            Ok(()),
+        ),
+        ("the project's own .codex", &own, &project, None, Ok(())),
+        (
+            "a symlinked home landing outside",
+            &linked_out,
+            &project,
+            None,
+            Ok(()),
+        ),
+        (
+            "a home outside, TMPDIR elsewhere",
+            &outside,
+            &project,
+            Some(tmp.as_os_str()),
+            Ok(()),
+        ),
+        ("a .codex below the project", &nested, &project, None, held),
+        ("the project itself", &project, &project, None, held),
+        (
+            "a symlinked home landing inside",
+            &linked_in,
+            &project,
+            None,
+            held,
+        ),
+        (
+            "the project through a symlinked cwd",
+            &nested,
+            &project_link,
+            None,
+            held,
+        ),
+        (
+            "a home under TMPDIR",
+            &in_tmpdir,
+            &project,
+            Some(tmp.as_os_str()),
+            held,
+        ),
+        ("a missing home", &missing, &project, None, held),
+        (
+            "an empty TMPDIR",
+            &outside,
+            &project,
+            Some(OsStr::new("")),
+            held,
+        ),
+        (
+            "a relative TMPDIR",
+            &outside,
+            &project,
+            Some(OsStr::new("tmp")),
+            held,
+        ),
+        (
+            "a missing TMPDIR",
+            &outside,
+            &project,
+            Some(missing.as_os_str()),
+            held,
+        ),
+    ] {
+        let got = codex_home_checkable(home, cwd, tmpdir);
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
+    }
+    let got = codex_home_checkable(in_slash_tmp.path(), &project, None);
+    if got != held {
+        wrong.push(format!("a home under /tmp: {got:?}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}

@@ -2555,10 +2555,21 @@ mod linux {
                     }
                     Err(hold) => KeymapEvidence::Held(hold),
                 },
-                AgentType::Codex => match baseline.codex_bound(&env, args, cwd).and_then(|codex| {
-                    keymap::editor_is_helper(probe.selection, &env, &self.helper_path)
-                        .map(|()| codex)
-                }) {
+                // Ruling Q227b: a Codex home inside a folder Codex may
+                // write to is held before any check.
+                AgentType::Codex => match baseline
+                    .codex_bound(&env, args, cwd)
+                    .and_then(|codex| {
+                        keymap::editor_is_helper(probe.selection, &env, &self.helper_path)
+                            .map(|()| codex)
+                    })
+                    .and_then(|codex| {
+                        let (Some(home), Some(cwd)) = (keymap::codex_home(&env), cwd) else {
+                            return Err(keymap::Hold::Unmeasured);
+                        };
+                        keymap::codex_home_checkable(&home, cwd, env("TMPDIR").as_deref())
+                            .map(|()| codex)
+                    }) {
                     Ok(codex) => KeymapEvidence::Codex {
                         reads: Box::new(keymap::CodexReads::new(codex)),
                         precedence: probe.keymap_sources,

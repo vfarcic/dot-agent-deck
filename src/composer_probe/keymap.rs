@@ -144,6 +144,11 @@ pub enum Hold {
     /// ([`editor_is_helper`], the revcxact review's HIGH-1): a probe would
     /// open another editor in the person's pane.
     Editor,
+    /// Codex's home lies inside a folder Codex's sandbox may write to (the
+    /// cwd, other than `<cwd>/.codex` itself, `/tmp` or `$TMPDIR`), or one
+    /// of those can't be resolved ([`codex_home_checkable`]): Codex would
+    /// write the box's file somewhere the deck doesn't read.
+    CodexHome,
 }
 
 /// Reads `path`, following a symlink: absent, its identity and contents, or
@@ -1329,6 +1334,54 @@ pub fn codex_editor_is_helper(
         Some([only]) if only.as_os_str() == helper.as_os_str() => Ok(()),
         _ => Err(Hold::Editor),
     }
+}
+
+/// Whether a Codex whose home is `home` (`$CODEX_HOME`, else `~/.codex`, as
+/// the bound native's own environment names it: [`codex_home`]), started in
+/// `cwd` with `tmpdir` its `TMPDIR`, can be checked at all (the user's
+/// ruling Q227b on the revcxact review's STOP-1 follow-up). Codex 0.164.0
+/// hands its editor a file in the first of `$CODEX_HOME`, `~/.codex` and
+/// `<cwd>/.codex` its own sandbox can't write, and the deck reads only
+/// `$CODEX_HOME/editor`. Under `workspace-write` the cwd, `/tmp` and
+/// `$TMPDIR` are writable, a project's own top-level `.codex` is kept
+/// read-only, so a home under any of them (other than `<cwd>/.codex`
+/// itself) sends the file elsewhere: the helper is refused the file's
+/// shape, exits 1, and Codex draws `Failed to open editor` at each check.
+/// This holds such a generation before any check, so no key is typed and
+/// no helper runs.
+///
+/// Paths are compared resolved (`canonicalize`, symlinks followed): a home
+/// reached through a symlink is judged where it lands. Any of them that
+/// can't be resolved, `TMPDIR` set but empty or relative included, holds.
+/// It accepts no new path: a home outside all three is still read only as
+/// `$CODEX_HOME/editor` by the export rule. What it doesn't see: Codex's
+/// `writable_roots`, `--add-dir` and sandbox mode (a home it holds can be
+/// one Codex's sandbox wouldn't write, under `read-only` or
+/// `danger-full-access`), which can only hold more or leave the case as it
+/// was.
+pub fn codex_home_checkable(
+    home: &Path,
+    cwd: &Path,
+    tmpdir: Option<&std::ffi::OsStr>,
+) -> Result<(), Hold> {
+    let resolve = |path: &Path| std::fs::canonicalize(path).map_err(|_| Hold::CodexHome);
+    let home = resolve(home)?;
+    let cwd = resolve(cwd)?;
+    if home.starts_with(&cwd) && home != cwd.join(".codex") {
+        return Err(Hold::CodexHome);
+    }
+    let mut temporary = vec![resolve(Path::new("/tmp"))?];
+    if let Some(tmpdir) = tmpdir {
+        let tmpdir = Path::new(tmpdir);
+        if !tmpdir.is_absolute() {
+            return Err(Hold::CodexHome);
+        }
+        temporary.push(resolve(tmpdir)?);
+    }
+    if temporary.iter().any(|dir| home.starts_with(dir)) {
+        return Err(Hold::CodexHome);
+    }
+    Ok(())
 }
 
 /// [`codex_editor_is_helper`] for Claude Code, with its selection

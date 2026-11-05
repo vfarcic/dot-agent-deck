@@ -10765,6 +10765,14 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** a real zsh or fish (neither is installed on the recording box; bash's `BASH_ENV` stands in for the start-up file); a value the agent sets in its own process after it started, which no environment read sees (Claude Code's settings `env`); a real Codex or Claude Code.
 - **Platform coverage:** Linux.
 
+##### inbox/probe/098 — The deck checks no Codex whose home lies inside a folder Codex's sandbox may write to: the working directory (other than its own `.codex`), `/tmp` or `$TMPDIR`.
+
+- **Layer:** L1 (`tests/editor_keymap.rs`, Linux): `codex_home_checkable` over directories, symlinks and temporary directories laid out on disk under the private test base (it prints `SKIP:` and returns when that base resolves under `/tmp`). L2 lane 1 (`tests/e2e_probe_delivery.rs`, Linux): the live-segments Codex stand-in with `CODEX_HOME` at `<cwd>/codex`, an attached TUI.
+- **Agent:** none (a native Codex stand-in).
+- **Asserts:** L1 (`probe_098_a_codex_home_inside_a_folder_codex_may_write_is_held`): a home outside the working directory, the working directory's own `.codex`, a symlinked home landing outside it, and a home outside with `TMPDIR` elsewhere are checkable; a `.codex` below the working directory, the working directory itself, a symlinked home landing inside it, a home inside it reached through a symlinked cwd, a home under `TMPDIR` or `/tmp`, a missing home, and an empty, relative or missing `TMPDIR` hold `CodexHome`. Lane 1 (`probe_098_a_codex_home_inside_the_working_directory_is_held_without_a_check`): a touched-and-cleared box and a queued task give `cannot_check` on the card and in the TUI, a `Keymap(CodexHome)` refusal in the log, no byte typed, no helper run and no notice; red before the pre-check (the check's Ctrl+G and a notice were typed). Every other live-segments Codex test, whose `CODEX_HOME` is the working directory's own `.codex`, is the control.
+- **Does not assert:** a real Codex's choice of export directory (`docs/develop/doorbell-admission.md`, the Codex activation's item 8); `writable_roots`, `--add-dir` or the sandbox mode, which the pre-check doesn't read.
+- **Platform coverage:** Linux.
+
 ##### inbox/probe/040 — A person's Ctrl+G during the deck's check of a real Claude Code input box loses none of their typing.
 
 - **Layer:** L2 real agent, lane 2 (`tests/e2e_composer_check_claude_live.rs`, Linux): the TUI harness, one fresh deck per trial, a plain `claude …` pane the build installs (`tests/support/claude_installed.rs`), and the production doorbell tick choosing and writing the check. No e2e editor-probe assumption; the helper's e2e pause seam (`DOT_AGENT_DECK_E2E_HELPER_PAUSE`, at `start` and `ready`) and trace are driven by a releaser thread that lets every pause go at once except the trial's target.
