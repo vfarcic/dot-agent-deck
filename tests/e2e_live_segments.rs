@@ -896,53 +896,139 @@ fn probe_049_failed_editor_outcomes_stay_held_under_production_hold() {
     }
 }
 
-/// Scenario: Queue a human Ctrl+G behind a returning check, pause its helper after a short-lived editor starts with an injected wait failure, and type a suffix while that helper is still alive. First witness that the suffix remains held, then drain the helper and return the composer: those undelivered bytes must remain held until generation replacement.
+/// Scenario: Queue a human Ctrl+G behind a returning check, pause its helper after a short-lived editor starts with an injected wait failure, and type a suffix while that helper is still alive. First witness that the suffix remains held, then drain the helper and return the composer: those undelivered bytes must remain held until generation replacement. A trial whose deck saw that editor running, and so released the suffix to it by design, is retried in a fresh deck, at most five times.
 #[spec("inbox/probe/049")]
 #[test]
 fn probe_049_wait_unknown_at_drain_retains_the_undelivered_suffix() {
-    let mut f = Fixture::start("claude");
-    f.flag("hold-return");
-    f.probe();
-    f.wait("helper-exited-1");
-    let pause = f.pause_helper();
-    f.setting("helper-pause-at", "post-editor");
-    f.flag("wait-unknown-2");
-    // The editor has no input reader and exits immediately. Unlike the
-    // observed-running-editor control above, no suffix belongs to it.
-    fs::copy("/bin/true", f.daemon.home.join("native/editor")).unwrap();
-    let mut human = f.connect();
-    human.write("\x07");
-    f.wait_held();
-    f.flag("resume-go-1");
-    f.wait("helper-started-2");
-    assert!(
-        common::wait_until(WAIT, || fs::read_to_string(f.path("helper-trace"))
-            .unwrap_or_default()
-            .contains("pause post-editor")),
-        "the second helper must pause after its wait failure"
+    // The scenario needs the short-lived editor never to be seen running.
+    // That's a race the editor usually wins. When the observer does see it,
+    // the segment is released to it by design (A-20d-6 option (a)) and the
+    // suffix goes to the pane, so that trial is retried in a fresh deck.
+    // It's retried only when the trial's log shows the observer saw the
+    // editor: a suffix delivered with no sighting is the defect this test
+    // guards, and it fails at once.
+    const ATTEMPTS: usize = 5;
+    const SUFFIX: &str = "STILL-HELD-AT-DRAIN";
+    let mut sighted = Vec::new();
+    for attempt in 1..=ATTEMPTS {
+        let logs = common::harness_tempdir().expect("attempt log dir");
+        let log = logs.path().join("deck.log");
+        let mut f = Fixture::with_env(
+            "claude",
+            &[("DOT_AGENT_DECK_LOG", log.to_str().expect("UTF-8 log path"))],
+        );
+        f.flag("hold-return");
+        f.probe();
+        f.wait("helper-exited-1");
+        let pause = f.pause_helper();
+        f.setting("helper-pause-at", "post-editor");
+        f.flag("wait-unknown-2");
+        // The editor has no input reader and exits immediately. Unlike the
+        // observed-running-editor control above, no suffix belongs to it.
+        fs::copy("/bin/true", f.daemon.home.join("native/editor")).unwrap();
+        let before = editor_sightings(&log).len();
+        let mut human = f.connect();
+        human.write("\x07");
+        f.wait_held();
+        f.flag("resume-go-1");
+        f.wait("helper-started-2");
+        assert!(
+            common::wait_until(WAIT, || fs::read_to_string(f.path("helper-trace"))
+                .unwrap_or_default()
+                .contains("pause post-editor")),
+            "the second helper must pause after its wait failure"
+        );
+        // The injected wait failure means the helper doesn't wait for the
+        // editor, so its pause doesn't show the editor has ended. The paused
+        // helper never reaps it, so wait for it to be a zombie: from then on
+        // it reads as exited, and nothing more can be released to it.
+        let helper = live::read_json(&f.path("helper-started"))["pid"]
+            .as_u64()
+            .expect("helper pid");
+        assert!(
+            common::wait_until(WAIT, || {
+                let children = child_states(helper);
+                !children.is_empty() && children.iter().all(|&s| s == 'Z')
+            }),
+            "the short-lived editor must have exited before the suffix; helper {helper}'s children {:?}",
+            child_states(helper)
+        );
+        // So whether the segment was released to the editor is settled: the
+        // suffix is either held or written to the pane. The paused helper
+        // keeps the agent from reading it, so the write shows as the composer
+        // epoch moving, not in the input.
+        let (epoch, _, _) = f.epoch();
+        human.write(SUFFIX);
+        assert!(
+            common::wait_until(WAIT, || f.held() || f.epoch().0 > epoch),
+            "person's keys must be accepted behind the live segment"
+        );
+        let held = f.held();
+        let seen = editor_sightings(&log).split_off(before);
+        eprintln!(
+            "attempt {attempt}: suffix {}, editor sightings {seen:?}",
+            if held { "held" } else { "written" }
+        );
+        if !held {
+            assert!(
+                !seen.is_empty(),
+                "the suffix was written to the pane with no editor seen running for its segment; epoch {:?}",
+                f.epoch()
+            );
+            sighted.push(format!("attempt {attempt}: {}", seen.join(" | ")));
+            continue;
+        }
+        f.expect(b"\x07\x07");
+        f.stable(b"\x07\x07");
+        assert!(
+            f.held(),
+            "the suffix must still be held before the helper exit drain"
+        );
+        f.remove("pause-helper");
+        pause.release();
+        f.wait("helper-exited-2");
+        let trace = fs::read_to_string(f.path("helper-trace")).unwrap();
+        assert!(trace.contains("wait-unknown 10"), "{trace}");
+        f.flag("resume-go-2");
+        f.wait("composer-return-2");
+        f.stable(b"\x07\x07");
+        assert!(
+            f.held(),
+            "WaitUnknown at drain must retain the undelivered suffix"
+        );
+        f.replace();
+        f.stable(b"");
+        return;
+    }
+    panic!(
+        "the short-lived editor was seen running in all {ATTEMPTS} trials, so none kept the premise: {sighted:#?}"
     );
-    human.write("STILL-HELD-AT-DRAIN");
-    f.wait_held();
-    f.expect(b"\x07\x07");
-    f.stable(b"\x07\x07");
-    assert!(
-        f.held(),
-        "the suffix must still be held before the helper exit drain"
-    );
-    f.remove("pause-helper");
-    pause.release();
-    f.wait("helper-exited-2");
-    let trace = fs::read_to_string(f.path("helper-trace")).unwrap();
-    assert!(trace.contains("wait-unknown 10"), "{trace}");
-    f.flag("resume-go-2");
-    f.wait("composer-return-2");
-    f.stable(b"\x07\x07");
-    assert!(
-        f.held(),
-        "WaitUnknown at drain must retain the undelivered suffix"
-    );
-    f.replace();
-    f.stable(b"");
+}
+
+/// The `/proc` states (`R`, `S`, `Z`, …) of `parent`'s child processes.
+fn child_states(parent: u64) -> Vec<char> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| fs::read_to_string(e.ok()?.path().join("stat")).ok())
+        .filter_map(|stat| {
+            // `pid (comm) state ppid …`; the name may hold spaces and parens.
+            let mut rest = stat.rsplit_once(')')?.1.split_whitespace();
+            let state = rest.next()?.chars().next()?;
+            (rest.next()?.parse::<u64>().ok()? == parent).then_some(state)
+        })
+        .collect()
+}
+
+/// The deck log's sightings of a user's editor, oldest first.
+fn editor_sightings(log: &std::path::Path) -> Vec<String> {
+    fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.contains("the user's editor runs"))
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Scenario: For Claude and Codex under Hold and test-selected Authority, queue a human editor trigger and suffix behind a real returning check, then fail the editor's spawn. Each retains the suffix through helper exit; Authority releases it once after the matching return, while Hold retains it through replacement.
