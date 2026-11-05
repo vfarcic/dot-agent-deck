@@ -437,7 +437,7 @@ fn installed_claude_release() -> Result<String, String> {
 /// admit every latched release, so this is false only when the facts are not
 /// `Go`.
 #[cfg(target_os = "linux")]
-fn measured(release: &str) -> bool {
+fn facts_admit(release: &str) -> bool {
     use dot_agent_deck::doorbell_activation::{AGENT_FACTS, Activation, LatchedRelease};
     semver::Version::parse(release).is_ok_and(|version| {
         matches!(
@@ -454,10 +454,16 @@ fn measured(release: &str) -> bool {
 /// `inbox/claude/014`'s preflight: it runs only when the deck types into the
 /// installed release, and is otherwise UNVERIFIED, never green.
 #[cfg(target_os = "linux")]
-fn claude_release_measured() -> Result<(), String> {
+fn claude_facts_admit_installed_release() -> Result<(), String> {
     let installed = installed_claude_release()?;
     eprintln!("Claude Code release under test: {installed}");
-    if measured(&installed) {
+    if semver::Version::parse(&installed).is_ok_and(|v| !v.pre.is_empty()) {
+        return Err(format!(
+            "Claude Code {installed} is a pre-release, whose start-up header the deck does not \
+             latch (`unknown_release`): the doorbell does not type into it"
+        ));
+    }
+    if facts_admit(&installed) {
         Ok(())
     } else {
         Err(format!(
@@ -473,7 +479,7 @@ fn claude_release_measured() -> Result<(), String> {
 #[cfg(target_os = "linux")]
 fn claude_014_live_killed_waiter_falls_back_to_injection() {
     skip_unless!(common::check_claude_available());
-    skip_unless!(claude_release_measured());
+    skip_unless!(claude_facts_admit_installed_release());
     let claude = Claude::new();
     kill_trial_waiter(&claude);
     let name = "doorbell-fallback-908c2a.txt";
@@ -590,7 +596,7 @@ fn claude_050_live_turned_off_doorbell_is_held_and_a_prompt_delivers() {
 #[cfg(target_os = "linux")]
 fn doorbell_039_live_typing_while_line_lands() {
     skip_unless!(common::check_claude_available());
-    skip_unless!(claude_release_measured());
+    skip_unless!(claude_facts_admit_installed_release());
     let claude = fallback_ready_with(
         Claude::launch_with(
             &common::capability_export_command(&format!("exec {CLAUDE}")),
@@ -770,8 +776,8 @@ fn empty_editor_fallback(label: &str, erase_draft: bool) {
 fn doorbell_010_live_left_opens_overview_and_the_line_is_not_typed_there() {
     skip_unless!(common::check_claude_available());
     // Its positive control is delivered by the doorbell, which types only
-    // into a release the deck has measured.
-    skip_unless!(claude_release_measured());
+    // while Claude Code's facts are Go and the installed release latches.
+    skip_unless!(claude_facts_admit_installed_release());
     // util-linux script records every input byte before relaying it to the
     // real interactive Claude PTY. No human keys follow Left, so any later
     // input is automatic, even if a partial token is erased between samples.

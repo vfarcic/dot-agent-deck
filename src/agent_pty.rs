@@ -8311,8 +8311,8 @@ pub struct AgentPtyRegistry {
     #[cfg(test)]
     ring_admission_seam: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Test seam: the first-ring settle window every typed generation gets
-    /// while set, in place of its release's (`inbox/doorbell/041`; no
-    /// measured release has one today).
+    /// while set, in place of the one its agent's facts give
+    /// (`inbox/doorbell/041`).
     #[cfg(test)]
     doorbell_settle_for_test: Mutex<Option<Duration>>,
     /// Test seam: re-projections wait between their reads and their hub
