@@ -48,6 +48,7 @@ def keep(row, mode):
             'editor_ran': start['argv'][3] if start else None,
             'visual': start.get('visual'), 'editor': start.get('editor'),
             'isatty': start.get('isatty'), 'export_rule': row.get('export_rule'),
+            'file_mode': start.get('file_mode'),
             'export_had_draft': row.get('export_had_draft'), 'rc': (row.get('exit') or {}).get('rc'),
             'composer_after': row['composer_after'], 'error_line': error_line(row['screen_after']),
             'sent_off': row['sent_off'], 'start_off': row.get('start_off'), 'exit_off': row.get('exit_off'),

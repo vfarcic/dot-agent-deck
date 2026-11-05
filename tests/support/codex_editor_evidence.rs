@@ -155,11 +155,24 @@ pub fn check_export_and_selection(dir: &Path) {
         assert_eq!(rule["last_argument"], true, "{row}");
         assert_eq!(rule["in_codex_editor_dir"], true, "{row}");
         assert_eq!(rule["name_shape"], true, "{row}");
+        assert_eq!(rule["parent_mode"], "0o775", "{row}");
         // The quoted word stayed one argument: shell words, not spaces.
         assert_eq!(row["editor_ran"], "visual tag", "{row}");
         assert_eq!(row["export_had_draft"], row["draft"], "{row}");
         let edited = row["draft"].as_str().unwrap().replace("DRAFT", "EDITED");
         assert_eq!(row["composer_after"], edited.as_str(), "reimported: {row}");
+    }
+    // Every export Codex wrote was 0600; the `editor/` directory it created
+    // under the recorder's umask 002 is 0775 (M56b), checked above.
+    let ran: Vec<_> = s["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["opened"] == true)
+        .collect();
+    assert_eq!(ran.len(), 14);
+    for row in ran {
+        assert_eq!(row["file_mode"], "0o600", "{row}");
     }
     let failed = rows(&s, "cell", "visual-rc37");
     assert_eq!(failed.len(), 1);

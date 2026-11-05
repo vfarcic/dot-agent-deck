@@ -17,7 +17,7 @@ mod evidence;
 #[path = "../src/test_temp.rs"]
 mod test_temp;
 
-/// Scenario: Read the committed Codex 0.164.0 editor recording, made with a stand-in editor in `VISUAL`/`EDITOR`, no credential and no network. Five Ctrl+G presses under `VISUAL` each hand the editor `$CODEX_HOME/editor/.tmpXXXXXX.md` holding the draft as its last argument, with the quoted word of `VISUAL` kept as one argument, and the rewritten file comes back into the box; `EDITOR` runs when `VISUAL` is unset; a set but empty one, or neither (even with `vi`, `nano` and `code` on `PATH`), opens nothing and draws its own error line; an editor exiting 37 keeps the draft and says so.
+/// Scenario: Read the committed Codex 0.164.0 editor recording, made with a stand-in editor in `VISUAL`/`EDITOR`, no credential and no network. Five Ctrl+G presses under `VISUAL` each hand the editor `$CODEX_HOME/editor/.tmpXXXXXX.md` holding the draft as its last argument, with the quoted word of `VISUAL` kept as one argument, and the rewritten file comes back into the box; every export is 0600, in the `editor/` directory Codex created 0775; `EDITOR` runs when `VISUAL` is unset; a set but empty one, or neither (even with `vi`, `nano` and `code` on `PATH`), opens nothing and draws its own error line; an editor exiting 37 keeps the draft and says so.
 #[spec("inbox/probe/092")]
 #[test]
 fn probe_092_codex_164_export_and_selection() {

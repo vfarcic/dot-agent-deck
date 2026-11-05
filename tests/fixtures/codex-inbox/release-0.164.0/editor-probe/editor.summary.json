@@ -46,6 +46,7 @@
     "parent_mode": "0o775",
     "path": "ROOT/home/.codex/editor/.tmpbLCsDh.md"
    },
+   "file_mode": "0o600",
    "export_had_draft": "CXM_DRAFT_1",
    "rc": 0,
    "composer_after": "CXM_EDITED_1",
@@ -134,6 +135,7 @@
     "parent_mode": "0o775",
     "path": "ROOT/home/.codex/editor/.tmpl6x339.md"
    },
+   "file_mode": "0o600",
    "export_had_draft": "CXM_DRAFT_2",
    "rc": 0,
    "composer_after": "CXM_EDITED_2",
@@ -214,6 +216,7 @@
     "parent_mode": "0o775",
     "path": "ROOT/home/.codex/editor/.tmpogA6bH.md"
    },
+   "file_mode": "0o600",
    "export_had_draft": "CXM_DRAFT_3",
    "rc": 0,
    "composer_after": "CXM_EDITED_3",
@@ -294,6 +297,7 @@
     "parent_mode": "0o775",
     "path": "ROOT/home/.codex/editor/.tmpqCL9Hq.md"
    },
+   "file_mode": "0o600",
    "export_had_draft": "CXM_DRAFT_4",
    "rc": 0,
    "composer_after": "CXM_EDITED_4",
@@ -374,6 +378,7 @@
     "parent_mode": "0o775",
     "path": "ROOT/home/.codex/editor/.tmpOKPgvc.md"
    },
+   "file_mode": "0o600",
    "export_had_draft": "CXM_DRAFT_5",
    "rc": 0,
    "composer_after": "CXM_EDITED_5",
@@ -445,6 +450,7 @@
     true,
     true
    ],
+   "file_mode": "0o600",
    "rc": 37,
    "composer_after": "CXM_DRAFT_RC",
    "error_line": "■ Failed to open editor: editor exited with status exit status: 37",
@@ -517,6 +523,7 @@
     true,
     true
    ],
+   "file_mode": "0o600",
    "rc": 0,
    "composer_after": "CXM_ESC_1_1",
    "error_line": "■ Failed to open editor: editor exited with status exit status: 37",
@@ -589,6 +596,7 @@
     true,
     true
    ],
+   "file_mode": "0o600",
    "rc": 0,
    "composer_after": "CXM_ESC_0_1",
    "error_line": "■ Failed to open editor: editor exited with status exit status: 37",
@@ -665,6 +673,7 @@
     true,
     true
    ],
+   "file_mode": "0o600",
    "rc": 0,
    "composer_after": "CXM_ESC_1_2",
    "error_line": "■ Failed to open editor: editor exited with status exit status: 37",
@@ -737,6 +746,7 @@
     true,
     true
    ],
+   "file_mode": "0o600",
    "rc": 0,
    "composer_after": "CXM_ESC_0_2",
    "error_line": "■ Failed to open editor: editor exited with status exit status: 37",
@@ -809,6 +819,7 @@
     true,
     true
    ],
+   "file_mode": "0o600",
    "rc": 0,
    "composer_after": "CXM_ESC_1_3",
    "error_line": "■ Failed to open editor: editor exited with status exit status: 37",
@@ -881,6 +892,7 @@
     true,
     true
    ],
+   "file_mode": "0o600",
    "rc": 0,
    "composer_after": "CXM_ESC_0_3",
    "error_line": "■ Failed to open editor: editor exited with status exit status: 37",
@@ -957,6 +969,7 @@
     true,
     true
    ],
+   "file_mode": "0o600",
    "rc": 0,
    "composer_after": "CXM_SEL_EDITED_1",
    "sent_off": 9768,
@@ -1036,6 +1049,7 @@
     true,
     true
    ],
+   "file_mode": "0o600",
    "rc": 0,
    "composer_after": "CXM_SEL_EDITED_2",
    "sent_off": 16838,
