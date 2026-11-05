@@ -670,6 +670,28 @@ fn doorbell_053_conformance_fails_when_a_fact_is_wrong() {
         Ok(()),
         "2.1.310's editor probe was not measured"
     );
+    // The same for Codex (the revcxact review's LOW-2): 0.164.0 measured
+    // its editor probe, 0.160.0 didn't.
+    let other_codex_probe = EditorProbe {
+        paste_toggles: PasteToggles {
+            disables: 0,
+            enables: 0,
+        },
+        ..dot_agent_deck::doorbell_activation::CODEX_EDITOR_PROBE
+    };
+    let codex_wrong = with_codex(AgentFacts {
+        editor_probe: Measurement::Verified(other_codex_probe),
+        ..CODEX_FACTS
+    });
+    fails_with(
+        conformance(codex_164, &codex_wrong),
+        "editor_probe measured",
+    );
+    assert_eq!(
+        conformance(codex_160, &codex_wrong),
+        Ok(()),
+        "0.160.0's editor probe was not measured"
+    );
     // A recorded release whose echo failed contradicts the verified fact.
     let failed = RecordedRelease {
         release: v("0.170.0"),
