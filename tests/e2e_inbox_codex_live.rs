@@ -43,13 +43,29 @@ fn codex_009_live_idle_installed_release_is_rung_and_delivers() {
         "one attempt, submitted; {}",
         codex.evidence()
     );
-    for clause in ["missing_measurement", "turned_off", "unknown_release"] {
+    for clause in ["missing_measurement", "turned_off"] {
         assert!(
             !log.contains(&format!("clause=\"{clause}\"")),
             "Codex's facts admit {installed}: no {clause}; {}",
             codex.evidence()
         );
     }
+    // Before the header latches, the generation's release is not known yet,
+    // so one `doorbell off … unknown_release` line at spawn is expected. Once
+    // the installed release has latched, nothing may hold it as unknown.
+    let after_latch = log
+        .lines()
+        .skip_while(|line| {
+            !(line.contains("pane release") && line.contains(&format!("release={installed}")))
+        })
+        .skip(1);
+    assert!(
+        !after_latch
+            .into_iter()
+            .any(|line| line.contains("clause=\"unknown_release\"")),
+        "Codex's facts admit {installed}: no unknown_release once it latched; {}",
+        codex.evidence()
+    );
     // The submitted line's prompt hook handed the task over.
     assert!(log.contains("DoorbellHook"), "{}", codex.evidence());
 }
