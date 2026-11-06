@@ -2503,7 +2503,7 @@ fn probe_099_claude_settings_env_naming_the_editor_holds() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// Scenario: Judge Claude Code settings documents that another parser could read differently from the deck (the revcxfix2 review's MEDIUM-1, the revcxfix3 review's LOW-A): a `__proto__` member at any depth, `VISUAL` or `EDITOR` as a member name anywhere in the document, a line comment ended by a lone carriage return, and a line comment holding a line or paragraph separator (where a JSON5 parser ends it) each hold `Editor`; a document with CRLF line endings and comments, `VISUAL` only inside a string value, and the separators inside a string or a block comment, pass.
+/// Scenario: Judge Claude Code settings documents that another parser could read differently from the deck (the revcxfix2 review's MEDIUM-1, the revcxfix3 review's LOW-A): a `__proto__` member at any depth, `VISUAL` or `EDITOR` as a member name anywhere in the document, either of them or a deck variable in `env` spelled with a JSON `\u` escape, a line comment ended by a lone carriage return, and a line comment holding a line or paragraph separator (where a JSON5 parser ends it) each hold `Editor`; a document with CRLF line endings and comments, `VISUAL` only inside a string value, and the separators inside a string or a block comment, pass.
 #[spec("inbox/probe/099")]
 #[test]
 fn probe_099_claude_settings_a_parser_could_read_differently_hold() {
@@ -2518,17 +2518,22 @@ fn probe_099_claude_settings_a_parser_could_read_differently_hold() {
         ),
         (
             "__proto__ spelled with an escape",
-            r#"{"__proto__": {"env": {"A": "1"}}}"#,
+            "{\"\\u005f_proto__\": {\"env\": {\"A\": \"1\"}}}",
             editor,
         ),
         (
             "VISUAL spelled with an escape, outside env",
-            r#"{"permissions": {"VISUAL": "vim"}}"#,
+            "{\"permissions\": {\"\\u0056ISUAL\": \"vim\"}}",
+            editor,
+        ),
+        (
+            "a deck variable spelled with an escape, in env",
+            "{\"env\": {\"\\u0044OT_AGENT_DECK_EDITOR_GEN\": \"1\"}}",
             editor,
         ),
         (
             "an escaped name that is neither",
-            r#"{"__proto_x": {"VISUALS": "vim"}, "env": {"A": "1"}}"#,
+            "{\"\\u005f_proto_x\": {\"\\u0056ISUALS\": \"vim\"}, \"env\": {\"\\u0044OT_AGENT_DECKS\": \"1\"}}",
             Ok(()),
         ),
         (
