@@ -139,6 +139,19 @@ pub enum Hold {
     /// A source the release's record doesn't list, so its precedence isn't
     /// known.
     Unpinned,
+    /// The editor the agent's Ctrl+G would open, as the agent's own
+    /// environment selects it, isn't exactly the deck's helper
+    /// ([`editor_is_helper`], the revcxact review's HIGH-1), or a file the
+    /// agent copies variables from into its environment as it starts names
+    /// the editor or can't be judged ([`claude_env_guard`],
+    /// [`codex_dotenv_guard`], the revcxfix review's MEDIUM-A and
+    /// MEDIUM-B): a probe would open another editor in the person's pane.
+    Editor,
+    /// Codex's home lies inside a folder Codex's sandbox may write to (the
+    /// cwd, other than `<cwd>/.codex` itself, `/tmp` or `$TMPDIR`), or one
+    /// of those can't be resolved ([`codex_home_checkable`]): Codex would
+    /// write the box's file somewhere the deck doesn't read.
+    CodexHome,
 }
 
 /// Reads `path`, following a symlink: absent, its identity and contents, or
@@ -153,19 +166,25 @@ pub enum Hold {
 /// filesystem can each block. Call it with no lock held, and don't treat it
 /// as deadline-bounded.
 pub fn read_source(path: &Path) -> SourceRead {
+    read_source_within(path, SOURCE_BYTES)
+}
+
+/// [`read_source`] with its own bound: a file larger than `max` bytes is
+/// [`Unreadable::TooLarge`].
+pub fn read_source_within(path: &Path, max: u64) -> SourceRead {
     #[cfg(unix)]
     {
-        read_unix(path)
+        read_unix(path, max)
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
+        let _ = (path, max);
         SourceRead::Unreadable(Unreadable::Platform)
     }
 }
 
 #[cfg(unix)]
-fn read_unix(path: &Path) -> SourceRead {
+fn read_unix(path: &Path, max: u64) -> SourceRead {
     use sha2::{Digest, Sha256};
     use std::io::{ErrorKind, Read};
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -199,7 +218,7 @@ fn read_unix(path: &Path) -> SourceRead {
     if !regular {
         return SourceRead::Unreadable(Unreadable::NotRegular);
     }
-    if size > SOURCE_BYTES {
+    if size > max {
         return SourceRead::Unreadable(Unreadable::TooLarge);
     }
     // One byte past the size `fstat` gave, so a file that grew is seen to.
@@ -466,6 +485,598 @@ const CTRL_G: &[&str] = &[
     "^g",
 ];
 
+/// The most bytes read from one file whose `env` Claude Code applies
+/// ([`claude_env_sources`]): Claude's own global config, `~/.claude.json`,
+/// keeps per-project state and grows past [`SOURCE_BYTES`] on a busy
+/// machine, and a larger one holds as [`Unreadable::TooLarge`].
+pub const CLAUDE_ENV_BYTES: u64 = 16 << 20;
+
+/// The most entries of Claude Code's managed drop-in directory read; more
+/// hold as [`Unreadable::TooLarge`].
+pub const CLAUDE_DROP_INS: usize = 64;
+
+/// One place Claude Code may copy an `env` map from into its own
+/// environment as it starts ([`claude_env_sources`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaudeEnvSource {
+    /// A settings or config file whose top-level `env` member Claude applies.
+    File(PathBuf),
+    /// A directory of `*.json` settings files (the managed drop-ins).
+    DropIns(PathBuf),
+}
+
+/// What one read of a [`ClaudeEnvSource`] found, as far as Claude's
+/// environment goes: the `env` member alone, so a rewrite that leaves it as
+/// it was (Claude rewrites `~/.claude.json` at every start, and writes
+/// `.claude/settings.local.json` when a permission is granted) reads the
+/// same.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvRead {
+    /// No file, or a document with no `env` member; for a directory, that it
+    /// was listed (its files follow as their own reads).
+    NoEnv,
+    /// The document's `env` member, as parsed.
+    Env(serde_json::Value),
+    /// A document a JSONC parser could read a different `env` from than
+    /// the deck does ([`claude_env_member`]): a member named `__proto__`, or
+    /// `VISUAL` or `EDITOR` in any case, at any depth, or a line comment
+    /// ended by a lone carriage return.
+    Suspect,
+    /// The file or directory exists but can't be read.
+    Unreadable(Unreadable),
+    /// The document isn't a JSON object once its comments are removed, or
+    /// names `env` twice.
+    Unparsable,
+}
+
+impl EnvRead {
+    /// Whether a later read may be a write caught half done (a torn or
+    /// moving file) rather than what the file now says.
+    fn transient(&self) -> bool {
+        matches!(
+            self,
+            EnvRead::Unparsable | EnvRead::Unreadable(Unreadable::Unstable)
+        )
+    }
+}
+
+/// One read of every [`ClaudeEnvSource`] of a launch, in source order, a
+/// drop-in directory's files after its own entry.
+pub type ClaudeEnvRead = Vec<(PathBuf, EnvRead)>;
+
+/// The files Claude Code copies an `env` map from into its own environment
+/// as it starts, for an agent whose environment is `env`, started in `cwd`
+/// (the revcxfix review's MEDIUM-A). Read from the pinned 2.1.318 binary's
+/// strings, and confirmed by running it in a sandbox HOME (a `VISUAL` in the
+/// user, project, local and global-config files each opened that editor on
+/// Ctrl+G, over an inherited `VISUAL`): the settings sources it applies in
+/// turn (`userSettings`, `projectSettings`, `localSettings`, `flagSettings`,
+/// `policySettings`) and its legacy global config's `env`.
+///
+/// - user settings: `$HOME/.claude/settings.json`, and
+///   `cowork_settings.json` beside it, which Claude reads instead under a
+///   switch of its own;
+/// - global config: `$HOME/.claude.json` and the `-custom-oauth`,
+///   `-staging-oauth` and `-local-oauth` names Claude gives it under other
+///   endpoints, and the legacy `$HOME/.claude/.config.json`;
+/// - project settings: `<cwd>/.claude/settings.json`;
+/// - local settings: `.claude/settings.local.json` in `cwd` and in the
+///   nearest ancestor holding a `.git` (Claude reads the git root's, and
+///   the cwd's as a legacy location);
+/// - managed settings: `/etc/claude-code/managed-settings.json` and the
+///   `*.json` files of `/etc/claude-code/managed-settings.d`, and the
+///   server-managed settings Claude caches in
+///   `$HOME/.claude/remote-settings.json`, a plain settings document (seen
+///   on 2.1.319, which rewrote it at each start for an account whose
+///   organisation sends settings).
+///
+/// The flag source is a launch argument ([`claude_args_move_settings`]).
+/// [`Hold::Unmeasured`] as [`claude_keybindings_path`] holds (a
+/// `CLAUDE_CONFIG_DIR`, or no absolute `HOME`), and for a relative `cwd`.
+pub fn claude_env_sources(
+    env: impl Fn(&str) -> Option<OsString>,
+    cwd: &Path,
+) -> Result<Vec<ClaudeEnvSource>, Hold> {
+    let keybindings = claude_keybindings_path(&env)?;
+    if !cwd.is_absolute() {
+        return Err(Hold::Unmeasured);
+    }
+    let config = keybindings
+        .parent()
+        .expect("keybindings.json is under the config directory");
+    let home = config.parent().expect("the config directory is under HOME");
+    let mut sources = vec![
+        ClaudeEnvSource::File(config.join("settings.json")),
+        ClaudeEnvSource::File(config.join("cowork_settings.json")),
+        ClaudeEnvSource::File(config.join(".config.json")),
+    ];
+    for suffix in ["", "-custom-oauth", "-staging-oauth", "-local-oauth"] {
+        sources.push(ClaudeEnvSource::File(
+            home.join(format!(".claude{suffix}.json")),
+        ));
+    }
+    sources.push(ClaudeEnvSource::File(cwd.join(".claude/settings.json")));
+    sources.push(ClaudeEnvSource::File(
+        cwd.join(".claude/settings.local.json"),
+    ));
+    if let Some(root) = cwd.ancestors().find(|dir| dir.join(".git").exists())
+        && root != cwd
+    {
+        sources.push(ClaudeEnvSource::File(
+            root.join(".claude/settings.local.json"),
+        ));
+    }
+    let managed = Path::new("/etc/claude-code");
+    sources.push(ClaudeEnvSource::File(managed.join("managed-settings.json")));
+    sources.push(ClaudeEnvSource::DropIns(managed.join("managed-settings.d")));
+    sources.push(ClaudeEnvSource::File(config.join("remote-settings.json")));
+    Ok(sources)
+}
+
+/// Whether a Claude Code launch's arguments (after the program) name a
+/// settings source the deck doesn't read: `--settings` (a file or inline
+/// JSON whose `env` Claude applies) or `--project-config-root` (which moves
+/// the project's settings), in their separate and `=` forms, anywhere.
+pub fn claude_args_move_settings(args: &[OsString]) -> bool {
+    args.iter().any(|arg| {
+        let arg = arg.to_string_lossy();
+        ["--settings", "--project-config-root"]
+            .iter()
+            .any(|flag| arg == *flag || arg.starts_with(&format!("{flag}=")))
+    })
+}
+
+/// Reads every source now, once. File I/O: no lock held.
+pub fn read_claude_env(sources: &[ClaudeEnvSource]) -> ClaudeEnvRead {
+    let mut reads = Vec::new();
+    for source in sources {
+        match source {
+            ClaudeEnvSource::File(path) => reads.push((path.clone(), claude_env_file(path))),
+            ClaudeEnvSource::DropIns(dir) => match std::fs::read_dir(dir) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    reads.push((dir.clone(), EnvRead::NoEnv));
+                }
+                Err(e) => reads.push((dir.clone(), EnvRead::Unreadable(Unreadable::Io(e.kind())))),
+                Ok(entries) => {
+                    let mut files = Vec::new();
+                    let mut failed = None;
+                    for entry in entries {
+                        match entry {
+                            Ok(entry) => {
+                                let path = entry.path();
+                                if path
+                                    .extension()
+                                    .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+                                {
+                                    files.push(path);
+                                }
+                            }
+                            Err(e) => failed = Some(EnvRead::Unreadable(Unreadable::Io(e.kind()))),
+                        }
+                    }
+                    if files.len() > CLAUDE_DROP_INS {
+                        failed = Some(EnvRead::Unreadable(Unreadable::TooLarge));
+                    }
+                    if let Some(failed) = failed {
+                        reads.push((dir.clone(), failed));
+                        continue;
+                    }
+                    files.sort();
+                    reads.push((dir.clone(), EnvRead::NoEnv));
+                    for path in files {
+                        let read = claude_env_file(&path);
+                        reads.push((path, read));
+                    }
+                }
+            },
+        }
+    }
+    reads
+}
+
+/// [`read_claude_env`] read again, up to twice more, 10 ms apart, while any
+/// file reads as a write caught half done: for the reads whose result
+/// stands for the whole generation (before the spawn, and at the
+/// settlement), since another Claude may be rewriting `~/.claude.json` as
+/// the deck reads it. File I/O and sleeps: no lock held, off the executor.
+pub fn read_claude_env_settled(sources: &[ClaudeEnvSource]) -> ClaudeEnvRead {
+    let mut read = read_claude_env(sources);
+    for _ in 0..2 {
+        if !read.iter().any(|(_, r)| r.transient()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        read = read_claude_env(sources);
+    }
+    read
+}
+
+fn claude_env_file(path: &Path) -> EnvRead {
+    match read_source_within(path, CLAUDE_ENV_BYTES) {
+        SourceRead::Absent => EnvRead::NoEnv,
+        SourceRead::Unreadable(why) => EnvRead::Unreadable(why),
+        SourceRead::Present { contents, .. } => claude_env_member(&contents),
+    }
+}
+
+/// The top-level `env` member of a Claude settings or config document,
+/// read after one leading UTF-8 byte-order mark and its `//` and `/* */`
+/// comments are removed. A document that is empty once they are, or only
+/// whitespace, has none ([`EnvRead::NoEnv`]): Claude Code 2.1.318 applies
+/// no `env` from an empty file, refuses a comment-only one as malformed and
+/// skips it, and applies the `env` of a document after a byte-order mark
+/// (the revcxfix2 review's NIT-2, measured in cxfix3's sandbox runs). It
+/// refuses comments altogether, so removing them only lets the deck see an
+/// `env` Claude would skip, which holds. A document that isn't a JSON
+/// object, or names `env` twice (which one Claude keeps isn't measured), is
+/// [`EnvRead::Unparsable`].
+///
+/// Which parser a Claude Code release uses for each of these files isn't
+/// pinned (2.1.318 read `~/.claude/settings.json` as strict JSON and applied
+/// no `env` from any of the forms below, measured in cxfix3's sandbox; the
+/// other files weren't run), so a document two parsers could read
+/// differently is [`EnvRead::Suspect`] (the revcxfix2 review's MEDIUM-1),
+/// whatever its `env` says:
+///
+/// - a member named `__proto__`, at any depth: serde reads it as an
+///   ordinary member, while a parser that builds its objects by assignment
+///   (`jsonc-parser`'s `parse` does) sets the object's prototype with it,
+///   so an `env` inside it becomes the document's `env`, and a `VISUAL`
+///   inside it one of `env`'s names;
+/// - a member named `VISUAL` or `EDITOR`, in any case, at any depth, the
+///   way `keybindings.json` is scanned: wherever a parser may put it, it
+///   holds;
+/// - a line comment ended by a carriage return that no line feed follows:
+///   `jsonc-parser` ends a `//` comment there, a parser that ends it only
+///   at a line feed reads on, and each reading can hide an `env` from the
+///   other (the second by a `/*` that only the first opens).
+pub fn claude_env_member(contents: &[u8]) -> EnvRead {
+    let contents = contents.strip_prefix(b"\xef\xbb\xbf").unwrap_or(contents);
+    let Some(cleaned) = without_json_comments(contents) else {
+        return EnvRead::Suspect;
+    };
+    if cleaned
+        .iter()
+        .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+    {
+        return EnvRead::NoEnv;
+    }
+    match serde_json::from_slice::<EnvMember>(&cleaned) {
+        Ok(EnvMember { suspect: true, .. }) => EnvRead::Suspect,
+        Ok(EnvMember {
+            env: Some(env),
+            suspect: false,
+        }) => EnvRead::Env(env),
+        Ok(EnvMember {
+            env: None,
+            suspect: false,
+        }) => EnvRead::NoEnv,
+        Err(_) => EnvRead::Unparsable,
+    }
+}
+
+/// Whether a member name is one [`claude_env_member`] holds on wherever it
+/// appears: `__proto__`, or `VISUAL` or `EDITOR` in any case.
+fn suspect_name(name: &str) -> bool {
+    name == "__proto__"
+        || EDITOR_ENV
+            .iter()
+            .any(|editor| name.eq_ignore_ascii_case(editor))
+}
+
+/// Whether any member name in `value`, at any depth, is a
+/// [`suspect_name`].
+fn names_suspect(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(members) => members
+            .iter()
+            .any(|(name, value)| suspect_name(name) || names_suspect(value)),
+        serde_json::Value::Array(items) => items.iter().any(names_suspect),
+        _ => false,
+    }
+}
+
+/// A document's `env` member, or none, and whether any member name in the
+/// document is a [`suspect_name`]; fails for a document that isn't an
+/// object or that names `env` twice.
+struct EnvMember {
+    env: Option<serde_json::Value>,
+    suspect: bool,
+}
+
+impl<'de> serde::Deserialize<'de> for EnvMember {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = EnvMember;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<EnvMember, A::Error> {
+                let mut env = None;
+                let mut suspect = false;
+                while let Some(name) = map.next_key::<String>()? {
+                    suspect |= suspect_name(&name);
+                    if name == "env" {
+                        if env.is_some() {
+                            return Err(serde::de::Error::custom("`env` repeats"));
+                        }
+                        let value = map.next_value::<serde_json::Value>()?;
+                        suspect |= names_suspect(&value);
+                        env = Some(value);
+                    } else {
+                        let NameScan(names) = map.next_value()?;
+                        suspect |= names;
+                    }
+                }
+                Ok(EnvMember { env, suspect })
+            }
+        }
+        deserializer.deserialize_map(Visitor)
+    }
+}
+
+/// One JSON value read straight from the document, kept only as whether
+/// any member name in it, at any depth, is a [`suspect_name`].
+struct NameScan(bool);
+
+impl<'de> serde::Deserialize<'de> for NameScan {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = NameScan;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON value")
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<NameScan, E> {
+                Ok(NameScan(false))
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<NameScan, E> {
+                Ok(NameScan(false))
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<NameScan, E> {
+                Ok(NameScan(false))
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<NameScan, E> {
+                Ok(NameScan(false))
+            }
+            fn visit_unit<E>(self) -> Result<NameScan, E> {
+                Ok(NameScan(false))
+            }
+            fn visit_str<E>(self, _: &str) -> Result<NameScan, E> {
+                Ok(NameScan(false))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<NameScan, A::Error> {
+                let mut suspect = false;
+                while let Some(NameScan(item)) = seq.next_element()? {
+                    suspect |= item;
+                }
+                Ok(NameScan(suspect))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<NameScan, A::Error> {
+                let mut suspect = false;
+                while let Some(name) = map.next_key::<String>()? {
+                    suspect |= suspect_name(&name);
+                    let NameScan(value) = map.next_value()?;
+                    suspect |= value;
+                }
+                Ok(NameScan(suspect))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+/// `contents` with its `//` line and `/* */` block comments turned into
+/// blanks (newlines kept), outside strings; `None` when a line comment is
+/// ended by a carriage return that no line feed follows, where JSONC
+/// parsers disagree on where the comment ends ([`claude_env_member`]).
+fn without_json_comments(contents: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(contents.len());
+    let mut i = 0;
+    let mut in_string = false;
+    while i < contents.len() {
+        let c = contents[i];
+        let next = contents.get(i + 1).copied();
+        if in_string {
+            out.push(c);
+            if c == b'\\'
+                && let Some(next) = next
+            {
+                out.push(next);
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_string = false;
+            }
+            i += 1;
+        } else if c == b'"' {
+            in_string = true;
+            out.push(c);
+            i += 1;
+        } else if c == b'/' && next == Some(b'/') {
+            while i < contents.len() && contents[i] != b'\n' {
+                if contents[i] == b'\r' && contents.get(i + 1) != Some(&b'\n') {
+                    return None;
+                }
+                out.push(b' ');
+                i += 1;
+            }
+        } else if c == b'/' && next == Some(b'*') {
+            out.extend_from_slice(b"  ");
+            i += 2;
+            while i < contents.len() && !(contents[i] == b'*' && contents.get(i + 1) == Some(&b'/'))
+            {
+                out.push(if contents[i] == b'\n' { b'\n' } else { b' ' });
+                i += 1;
+            }
+            if i < contents.len() {
+                out.extend_from_slice(b"  ");
+                i += 2;
+            }
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    Some(out)
+}
+
+/// Whether a read of Claude Code's `env` sources leaves its editor to the
+/// environment it was started with: every file absent, or without an `env`
+/// member, or with an `env` object none of whose names is, in any case,
+/// `VISUAL` or `EDITOR`. A name there would replace the helper the deck put
+/// in Claude's environment (Claude applies these over what it inherited),
+/// so it holds as [`Hold::Editor`]; so does anything the deck can't judge:
+/// a file that exists but can't be read or parsed, a document another
+/// parser could read differently ([`EnvRead::Suspect`]), an `env` that isn't
+/// an object, and a managed drop-in directory that can't be listed. An `env`
+/// naming one of [`CLAUDE_MOVING_ENV`] in any case holds as
+/// [`Hold::Unmeasured`], as the same variable in Claude's environment does
+/// ([`claude_keybindings_path`]).
+pub fn claude_env_guard(read: &ClaudeEnvRead) -> Result<(), Hold> {
+    for (_, env) in read {
+        match env {
+            EnvRead::NoEnv => {}
+            EnvRead::Env(serde_json::Value::Object(names)) => {
+                let named = |list: &[&str]| {
+                    names
+                        .keys()
+                        .any(|name| list.iter().any(|n| name.eq_ignore_ascii_case(n)))
+                };
+                if named(&EDITOR_ENV) {
+                    return Err(Hold::Editor);
+                }
+                if named(&CLAUDE_MOVING_ENV) {
+                    return Err(Hold::Unmeasured);
+                }
+            }
+            EnvRead::Env(_) | EnvRead::Suspect | EnvRead::Unreadable(_) | EnvRead::Unparsable => {
+                return Err(Hold::Editor);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The variables that, set in the `env` of a Claude Code settings file,
+/// can move where Claude reads its configuration (the revcxfix2 review's
+/// LOW-1): `CLAUDE_CONFIG_DIR`, which in the pinned 2.1.318 moved where
+/// `keybindings.json` was read from (a `Ctrl+E` bound to the editor in the
+/// named folder's file opened it, measured in cxfix3's sandbox), and `HOME`,
+/// which there didn't but is held as well.
+pub const CLAUDE_MOVING_ENV: [&str; 2] = ["HOME", "CLAUDE_CONFIG_DIR"];
+
+/// The variables that, set in Codex's `$CODEX_HOME/.env`, can move the home
+/// Codex reads its key bindings and keeps its editor folder in, or the
+/// folder [`codex_home_checkable`] judges (the revcxfix2 review's LOW-1):
+/// `HOME`, `CODEX_HOME` and `TMPDIR`. Not run on a real Codex.
+pub const CODEX_MOVING_ENV: [&str; 3] = ["HOME", "CODEX_HOME", "TMPDIR"];
+
+/// Claude Code's `env` sources as the spawn path read them, before the child
+/// existed (A-20d-1b's rule for `keybindings.json`, applied to them).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeEnvBaseline {
+    pub sources: Vec<ClaudeEnvSource>,
+    pub read: ClaudeEnvRead,
+}
+
+impl ClaudeEnvBaseline {
+    /// The sources for the spawn's environment `env` and working directory
+    /// `cwd`, read now ([`read_claude_env_settled`]). File I/O: no lock
+    /// held.
+    pub fn at_spawn(
+        env: impl Fn(&str) -> Option<OsString>,
+        cwd: &Path,
+    ) -> Result<ClaudeEnvBaseline, Hold> {
+        let sources = claude_env_sources(env, cwd)?;
+        let read = read_claude_env_settled(&sources);
+        Ok(ClaudeEnvBaseline { sources, read })
+    }
+
+    /// The settlement's judgement for the bound agent, with its own
+    /// environment `env`, arguments `args` (after the program; `None` when
+    /// they couldn't be read) and working directory `cwd`: the same sources
+    /// as the spawn's, else [`Hold::Changed`]; no settings source on its
+    /// arguments, else [`Hold::Editor`]; a read now that is the spawn's,
+    /// else [`Hold::Changed`]; and the spawn's read passing
+    /// [`claude_env_guard`]. File I/O and [`read_claude_env_settled`]'s
+    /// sleeps: no lock held.
+    pub fn bound(
+        &self,
+        env: impl Fn(&str) -> Option<OsString>,
+        args: Option<&[OsString]>,
+        cwd: Option<&Path>,
+    ) -> Result<(), Hold> {
+        let (Some(args), Some(cwd)) = (args, cwd) else {
+            return Err(Hold::Unmeasured);
+        };
+        if claude_env_sources(env, cwd)? != self.sources {
+            return Err(Hold::Changed);
+        }
+        if claude_args_move_settings(args) {
+            return Err(Hold::Editor);
+        }
+        if read_claude_env_settled(&self.sources) != self.read {
+            return Err(Hold::Changed);
+        }
+        claude_env_guard(&self.read)
+    }
+}
+
+/// Claude Code's `env` sources for one generation after its settlement: the
+/// spawn's read, which [`ClaudeEnv::check`] compares each later read with.
+#[derive(Debug)]
+pub struct ClaudeEnv {
+    sources: Vec<ClaudeEnvSource>,
+    at_spawn: ClaudeEnvRead,
+    changed: AtomicBool,
+}
+
+impl ClaudeEnv {
+    /// A generation's `env` sources from its spawn baseline, once
+    /// [`ClaudeEnvBaseline::bound`] passed.
+    pub fn new(baseline: &ClaudeEnvBaseline) -> ClaudeEnv {
+        ClaudeEnv {
+            sources: baseline.sources.clone(),
+            at_spawn: baseline.read.clone(),
+            changed: AtomicBool::new(false),
+        }
+    }
+
+    /// Reads the sources again, before an admission or at a settlement,
+    /// retrying a file that reads as a write caught half done
+    /// ([`read_claude_env_settled`]). A read that still differs from the
+    /// spawn's holds this check and every later one ([`Hold::Changed`]), as
+    /// [`ClaudeKeymap::check`] does, a file that still can't be parsed
+    /// included (the revcxfix2 review's LOW-2: a document Claude Code may
+    /// read and the deck can't, such as one with trailing commas, would
+    /// otherwise hold one check at a time and pass again once reverted).
+    /// What it can't see is a change undone before the next check reads it.
+    /// It does file I/O and the retries' sleeps: call it with no lock held,
+    /// off the executor.
+    pub fn check(&self) -> Result<(), Hold> {
+        if self.changed.load(Ordering::SeqCst) {
+            return Err(Hold::Changed);
+        }
+        if read_claude_env_settled(&self.sources) == self.at_spawn {
+            return claude_env_guard(&self.at_spawn);
+        }
+        self.changed.store(true, Ordering::SeqCst);
+        Err(Hold::Changed)
+    }
+}
+
 /// The sources one Codex launch reads its key bindings from (R6 §9.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexSources {
@@ -478,6 +1089,10 @@ pub struct CodexSources {
     pub projects: Vec<PathBuf>,
     /// Each `-c key=value`, in command-line order.
     pub overrides: Vec<String>,
+    /// `$CODEX_HOME/.env`, which Codex loads into its own environment as it
+    /// starts ([`codex_dotenv_guard`]): no key binding, but it can name the
+    /// editor.
+    pub dotenv: PathBuf,
 }
 
 impl CodexSources {
@@ -544,6 +1159,7 @@ impl CodexSources {
             profile,
             projects,
             overrides,
+            dotenv: codex_home.join(".env"),
         })
     }
 
@@ -555,6 +1171,7 @@ impl CodexSources {
             profile: self.profile.as_deref().map(read_source),
             projects: self.projects.iter().map(|p| read_source(p)).collect(),
             overrides: self.overrides.clone(),
+            dotenv: read_source(&self.dotenv),
         }
     }
 }
@@ -572,6 +1189,7 @@ pub struct CodexRead {
     pub profile: Option<SourceRead>,
     pub projects: Vec<SourceRead>,
     pub overrides: Vec<String>,
+    pub dotenv: SourceRead,
 }
 
 /// Whether Codex launched with these sources keeps Ctrl+G on the external
@@ -639,6 +1257,7 @@ pub fn codex_unchanged(before: &CodexRead, after: &CodexRead) -> Result<(), Hold
         && before.profile == after.profile
         && before.projects == after.projects
         && before.overrides == after.overrides
+        && before.dotenv == after.dotenv
     {
         Ok(())
     } else {
@@ -1126,7 +1745,8 @@ const SHIM_OTEL_KEYS: [&str; 2] = ["otel.trace_exporter", "otel.metrics_exporter
 /// with `-c otel.trace_exporter=…` and `-c otel.metrics_exporter=…` after
 /// the pair and before the user's own arguments, only when
 /// `crate::telemetry::launch::codex_args`'s conditions hold, either of them
-/// left out when its signal has no endpoint (`crate::telemetry::shim`).
+/// left out when its signal has no endpoint or a protocol other than HTTP
+/// (`crate::telemetry::shim`).
 ///
 /// Only that position and shape is the shim's: `-c` (not another spelling)
 /// and the key, in that order, each at most once, whose value is exactly
@@ -1153,10 +1773,12 @@ fn without_shim_otel(args: &[OsString]) -> Option<&[OsString]> {
 
 /// Whether `arg` is `key=` followed by the exporter table the telemetry
 /// shim writes: `{otlp-http={endpoint=<string>,protocol="binary"|"json"}}`
-/// and nothing else. The value is parsed as the document `v = <value>`, and
-/// that document must hold `v` alone (the revcxkey2 review's NIT-1): a value
-/// that goes on past the table, with a newline and another key, is not the
-/// shim's.
+/// with no key or table after it. The value is parsed as the document
+/// `v = <value>`, and that document must hold `v` alone (the revcxkey2
+/// review's NIT-1): a value that goes on past the table, with a newline and
+/// another key, is not the shim's. What TOML ignores after the table (a
+/// comment, blanks, a newline) is accepted, which can carry no key binding
+/// (the revcxkey3 review's NIT-A).
 fn shim_otel_value(key: &str, arg: &str) -> bool {
     let Some(value) = arg
         .strip_prefix(key)
@@ -1218,6 +1840,9 @@ fn without_embedded_pair(args: &[OsString]) -> &[OsString] {
 pub struct KeymapBaseline {
     /// Claude Code's `keybindings.json` and its read.
     pub claude: Result<(PathBuf, SourceRead), Hold>,
+    /// The files Claude Code copies an `env` map from, and their read (the
+    /// revcxfix review's MEDIUM-A).
+    pub claude_env: Result<ClaudeEnvBaseline, Hold>,
     pub codex: Result<CodexBaseline, Hold>,
 }
 
@@ -1243,6 +1868,11 @@ impl KeymapBaseline {
             } else {
                 Err(Hold::Unmeasured)
             },
+            claude_env: if claude {
+                ClaudeEnvBaseline::at_spawn(&env, cwd)
+            } else {
+                Err(Hold::Unmeasured)
+            },
             codex: if codex {
                 codex_home(&env)
                     .ok_or(Hold::Unmeasured)
@@ -1259,15 +1889,20 @@ impl KeymapBaseline {
 /// `HOME` and `CODEX_HOME`.
 pub const KEYMAP_ENV: [&str; 3] = ["HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME"];
 
+/// The variables an agent picks its external editor from
+/// ([`editor_is_helper`]).
+pub const EDITOR_ENV: [&str; 2] = ["VISUAL", "EDITOR"];
+
 /// A lookup over a process's own environment `environ`, as
-/// `/proc/<pid>/environ` lists it, for the variables in [`KEYMAP_ENV`]: the
-/// first value a name has, as `getenv` answers. A name in [`KEYMAP_ENV`]
-/// listed twice with different values holds as [`Hold::Unmeasured`]: which
-/// one the agent's runtime reads isn't measured.
+/// `/proc/<pid>/environ` lists it, for the variables in [`KEYMAP_ENV`] and
+/// [`EDITOR_ENV`]: the first value a name has, as `getenv` answers. A name
+/// in either listed twice with different values holds as
+/// [`Hold::Unmeasured`]: which one the agent's runtime reads isn't
+/// measured.
 pub fn environ_lookup(
     environ: &[(OsString, OsString)],
 ) -> Result<impl Fn(&str) -> Option<OsString> + '_, Hold> {
-    for name in KEYMAP_ENV {
+    for name in KEYMAP_ENV.into_iter().chain(EDITOR_ENV) {
         let mut values = environ.iter().filter(|(k, _)| k == name).map(|(_, v)| v);
         if let Some(first) = values.next()
             && values.any(|v| v != first)
@@ -1281,6 +1916,175 @@ pub fn environ_lookup(
             .find(|(k, _)| k == name)
             .map(|(_, v)| v.clone())
     })
+}
+
+/// Whether the editor a Codex's Ctrl+G opens, selected from its own
+/// environment `env` ([`environ_lookup`]) as Codex selects it, is exactly
+/// `helper` (the revcxact review's HIGH-1). The deck puts its helper in
+/// `VISUAL` and `EDITOR` only in the spawn's environment, and a shell's
+/// start-up file (zsh's `.zshenv` and fish's `config.fish` run for a `-c`
+/// command too, which the deck's Codex line is) or a launcher
+/// (`VISUAL=nvim codex`, `env VISUAL=… codex`, a wrapper script) can give
+/// Codex another. A probe would then open that editor in the person's pane,
+/// and a Codex check's held input is released only by the helper's return,
+/// so the pane would stay held until the agent is replaced.
+///
+/// Codex's selection (`EditorSelection::Codex`, M34, the 0.164.0
+/// evidence's `editor-probe/README.md`): a set `VISUAL`, else a set
+/// `EDITOR`; a set but empty one is an error, not a fall-through, and with
+/// neither set Codex opens nothing. The value is split in shell words as
+/// Codex splits it ([`super::helper::split_shell_words`]), and the words
+/// must be exactly one, byte for byte the helper's path. Anything else,
+/// an error or an unsplittable value included, holds as [`Hold::Editor`].
+///
+/// It reads the environment the agent was started with: a value the agent
+/// sets in its own process afterwards isn't seen.
+#[cfg(target_os = "linux")]
+pub fn codex_editor_is_helper(
+    env: impl Fn(&str) -> Option<OsString>,
+    helper: &Path,
+) -> Result<(), Hold> {
+    let value = env("VISUAL")
+        .or_else(|| env("EDITOR"))
+        .ok_or(Hold::Editor)?;
+    if value.is_empty() {
+        return Err(Hold::Editor);
+    }
+    match super::helper::split_shell_words(&value).as_deref() {
+        Some([only]) if only.as_os_str() == helper.as_os_str() => Ok(()),
+        _ => Err(Hold::Editor),
+    }
+}
+
+/// Whether `$CODEX_HOME/.env`, as read, leaves Codex's editor to the
+/// environment it was started with (the revcxfix review's MEDIUM-B). Codex
+/// 0.164.0 loads that file as it starts and sets its variables over the
+/// ones it inherited: run in a sandbox HOME with `VISUAL=<a recorder>` in
+/// it, Ctrl+G ran the recorder, also over an inherited `VISUAL` and in the
+/// `export` and quoted forms, and with `EDITOR=` alone; with no `.env` it
+/// drew its "Cannot open external editor" line. So an absent file passes,
+/// one that can't be read holds, and one that names the editor's variables
+/// holds as [`Hold::Editor`]. The test is a raw scan rather than a parse,
+/// so that every quoting, `export` and spacing form holds: any word of
+/// letters, digits and `_` that is `VISUAL` or `EDITOR` in any case, on any
+/// line, a comment's included, holds. A word that is exactly one of
+/// [`CODEX_MOVING_ENV`] holds as [`Hold::Unmeasured`]: matched in its case,
+/// as Codex sets it, so a value naming a folder under `/home` doesn't.
+pub fn codex_dotenv_guard(read: &SourceRead) -> Result<(), Hold> {
+    match read {
+        SourceRead::Absent => Ok(()),
+        SourceRead::Unreadable(_) => Err(Hold::Editor),
+        SourceRead::Present { contents, .. } => {
+            let words = || contents.split(|b| !(b.is_ascii_alphanumeric() || *b == b'_'));
+            let names_editor = words().any(|word| {
+                EDITOR_ENV
+                    .iter()
+                    .any(|name| word.eq_ignore_ascii_case(name.as_bytes()))
+            });
+            if names_editor {
+                return Err(Hold::Editor);
+            }
+            if words().any(|word| CODEX_MOVING_ENV.iter().any(|name| word == name.as_bytes())) {
+                return Err(Hold::Unmeasured);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Whether a Codex whose home is `home` (`$CODEX_HOME`, else `~/.codex`, as
+/// the bound native's own environment names it: [`codex_home`]), started in
+/// `cwd` with `tmpdir` its `TMPDIR`, can be checked at all (the user's
+/// ruling Q227b on the revcxact review's STOP-1 follow-up). Codex 0.164.0
+/// hands its editor a file in the first of `$CODEX_HOME`, `~/.codex` and
+/// `<cwd>/.codex` its own sandbox can't write, and the deck reads only
+/// `$CODEX_HOME/editor`. Under `workspace-write` the cwd, `/tmp` and
+/// `$TMPDIR` are writable, a project's own top-level `.codex` is kept
+/// read-only, so a home under any of them (other than `<cwd>/.codex`
+/// itself) sends the file elsewhere: the helper is refused the file's
+/// shape, exits 1, and Codex draws `Failed to open editor` at each check.
+/// This holds such a generation before any check, so no key is typed and
+/// no helper runs.
+///
+/// Paths are compared resolved (`canonicalize`, symlinks followed): a home
+/// reached through a symlink is judged where it lands. Any of them that
+/// can't be resolved, `TMPDIR` set but empty or relative included, holds.
+/// It accepts no new path: a home outside all three is still read only as
+/// `$CODEX_HOME/editor` by the export rule. What it doesn't see: Codex's
+/// `writable_roots`, `--add-dir` and sandbox mode (a home it holds can be
+/// one Codex's sandbox wouldn't write, under `read-only` or
+/// `danger-full-access`), which can only hold more or leave the case as it
+/// was.
+pub fn codex_home_checkable(
+    home: &Path,
+    cwd: &Path,
+    tmpdir: Option<&std::ffi::OsStr>,
+) -> Result<(), Hold> {
+    let resolve = |path: &Path| std::fs::canonicalize(path).map_err(|_| Hold::CodexHome);
+    let home = resolve(home)?;
+    let cwd = resolve(cwd)?;
+    if home.starts_with(&cwd) && home != cwd.join(".codex") {
+        return Err(Hold::CodexHome);
+    }
+    let mut temporary = vec![resolve(Path::new("/tmp"))?];
+    if let Some(tmpdir) = tmpdir {
+        let tmpdir = Path::new(tmpdir);
+        if !tmpdir.is_absolute() {
+            return Err(Hold::CodexHome);
+        }
+        temporary.push(resolve(tmpdir)?);
+    }
+    if temporary.iter().any(|dir| home.starts_with(dir)) {
+        return Err(Hold::CodexHome);
+    }
+    Ok(())
+}
+
+/// [`codex_editor_is_helper`] for Claude Code, with its selection
+/// (`EditorSelection::ClaudeCode`, M22, M23): a non-empty `VISUAL`, else a
+/// non-empty `EDITOR`, else the first of `code`, `vi` and `nano` on `PATH`,
+/// which is never the helper; the value split on literal spaces with empty
+/// words dropped. Exactly one word, byte for byte the helper's path, or
+/// [`Hold::Editor`].
+///
+/// A Claude Code pane whose command has arguments runs under `$SHELL -c`
+/// as a Codex line does, so a shell start-up file reaches it the same way.
+/// Where the person's typing is held behind an unmatched Claude probe, the
+/// lapse ([`super::query_ledger::T_TRIGGER`]) releases nothing (it only
+/// lets a retry replace a probe that holds nothing), so that pane is held
+/// until the agent restarts too. Claude Code also copies the `env` maps of
+/// its settings files into its own environment when it starts, which this
+/// environment read doesn't see: [`claude_env_guard`] holds those.
+#[cfg(target_os = "linux")]
+pub fn claude_editor_is_helper(
+    env: impl Fn(&str) -> Option<OsString>,
+    helper: &Path,
+) -> Result<(), Hold> {
+    let value = env("VISUAL")
+        .filter(|v| !v.is_empty())
+        .or_else(|| env("EDITOR").filter(|v| !v.is_empty()))
+        .ok_or(Hold::Editor)?;
+    match super::helper::split_spaces(&value).as_slice() {
+        [only] if only.as_os_str() == helper.as_os_str() => Ok(()),
+        _ => Err(Hold::Editor),
+    }
+}
+
+/// The editor check for an agent whose release's record selects its
+/// editor by `selection`: [`claude_editor_is_helper`] or
+/// [`codex_editor_is_helper`].
+#[cfg(target_os = "linux")]
+pub fn editor_is_helper(
+    selection: crate::doorbell_activation::EditorSelection,
+    env: impl Fn(&str) -> Option<OsString>,
+    helper: &Path,
+) -> Result<(), Hold> {
+    match selection {
+        crate::doorbell_activation::EditorSelection::ClaudeCode => {
+            claude_editor_is_helper(env, helper)
+        }
+        crate::doorbell_activation::EditorSelection::Codex => codex_editor_is_helper(env, helper),
+    }
 }
 
 impl KeymapBaseline {
@@ -1297,6 +2101,18 @@ impl KeymapBaseline {
             Ok(_) => Err(Hold::Changed),
             Err(hold) => Err(hold),
         }
+    }
+
+    /// Claude Code's `env` sources, judged for the bound agent
+    /// ([`ClaudeEnvBaseline::bound`]).
+    pub fn claude_env_bound(
+        &self,
+        env: impl Fn(&str) -> Option<OsString>,
+        args: Option<&[OsString]>,
+        cwd: Option<&Path>,
+    ) -> Result<&ClaudeEnvBaseline, Hold> {
+        let baseline = self.claude_env.as_ref().map_err(|hold| *hold)?;
+        baseline.bound(env, args, cwd).map(|()| baseline)
     }
 
     /// Codex's spawn baseline, when the bound agent launched with the same

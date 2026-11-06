@@ -110,7 +110,15 @@ pub struct Fixture {
     /// A program the pane's command runs the native fixture through
     /// ([`Self::absent_through`]).
     through: Option<&'static str>,
+    /// The pane's `CODEX_HOME`, under the daemon's HOME, which is also the
+    /// pane's working directory ([`DEFAULT_CODEX_HOME`]).
+    codex_home: &'static str,
 }
+
+/// The pane's Codex home: the working directory's own `.codex`, which Codex's
+/// sandbox keeps read-only, so the deck can check the box (ruling Q227b holds
+/// a home elsewhere inside the working directory).
+pub const DEFAULT_CODEX_HOME: &str = ".codex";
 
 /// Test-owned launcher histories; these change processes, never daemon state.
 #[derive(Clone, Copy)]
@@ -178,8 +186,7 @@ struct CodexPaneEnv {
 /// generation. That happens for a pane whose `CODEX_HOME` differs from the
 /// daemon's, or a Codex not on the daemon's `PATH` at startup (the daemon's
 /// startup install skips it). Named for Q35-22 / Q35-29.
-fn seed_codex_trust(daemon: &common::DaemonProc, pane: &CodexPaneEnv) {
-    let codex_home = daemon.home.join("codex");
+fn seed_codex_trust(daemon: &common::DaemonProc, pane: &CodexPaneEnv, codex_home: &Path) {
     let mut command = Command::new(common::contained_deck_binary());
     command
         .args(["hooks", "install", "--agent", "codex"])
@@ -187,7 +194,7 @@ fn seed_codex_trust(daemon: &common::DaemonProc, pane: &CodexPaneEnv) {
         .env_clear()
         .env("PATH", &pane.path)
         .env("HOME", &daemon.home)
-        .env("CODEX_HOME", &codex_home)
+        .env("CODEX_HOME", codex_home)
         .env("CODEX_HOOK_LIST_RESPONSE", &pane.hook_list);
     for (key, value) in common::config_containment_env() {
         command.env(key, value);
@@ -221,12 +228,43 @@ impl Fixture {
     }
 
     pub fn with_env(kind: &'static str, extra: &[(&str, &str)]) -> Self {
-        Self::configured(kind, extra, true, None, None, None)
+        Self::configured(kind, extra, true, None, None, None, DEFAULT_CODEX_HOME)
+    }
+
+    /// [`Self::with_env`] with the pane's `CODEX_HOME` at `codex_home` under
+    /// the daemon's HOME, the pane's working directory.
+    pub fn with_codex_home(
+        kind: &'static str,
+        extra: &[(&str, &str)],
+        codex_home: &'static str,
+    ) -> Self {
+        Self::configured(kind, extra, true, None, None, None, codex_home)
+    }
+
+    /// [`Self::with_env`] with `files` (paths relative to the daemon's HOME,
+    /// which is also the pane's HOME and working directory, and contents)
+    /// written before the first spawn, so the spawn's key-binding baseline
+    /// reads them.
+    pub fn with_home_files(
+        kind: &'static str,
+        extra: &[(&str, &str)],
+        files: &[(&str, &str)],
+    ) -> Self {
+        Self::seeded(
+            kind,
+            extra,
+            true,
+            None,
+            None,
+            None,
+            DEFAULT_CODEX_HOME,
+            files,
+        )
     }
 
     /// Production Absent control: no editor-probe assumption or binding seam.
     pub fn absent(kind: &'static str, extra: &[(&str, &str)]) -> Self {
-        Self::configured(kind, extra, false, None, None, None)
+        Self::configured(kind, extra, false, None, None, None, DEFAULT_CODEX_HOME)
     }
 
     /// [`Self::absent`], with the pane's command running the native fixture
@@ -238,11 +276,27 @@ impl Fixture {
         program: &'static str,
         extra: &[(&str, &str)],
     ) -> Self {
-        Self::configured(kind, extra, false, None, None, Some(program))
+        Self::configured(
+            kind,
+            extra,
+            false,
+            None,
+            None,
+            Some(program),
+            DEFAULT_CODEX_HOME,
+        )
     }
 
     pub fn launcher(kind: &'static str, launcher: Launcher, extra: &[(&str, &str)]) -> Self {
-        Self::configured(kind, extra, true, Some(launcher), None, None)
+        Self::configured(
+            kind,
+            extra,
+            true,
+            Some(launcher),
+            None,
+            None,
+            DEFAULT_CODEX_HOME,
+        )
     }
 
     /// An npm-shaped install (Q35-22's interpreter-hosted rule): the pane
@@ -259,7 +313,15 @@ impl Fixture {
             lookalike: false,
             pins: NativePins::Both,
         };
-        Self::configured(kind, extra, true, Some(launcher), Some(hosted), None)
+        Self::configured(
+            kind,
+            extra,
+            true,
+            Some(launcher),
+            Some(hosted),
+            None,
+            DEFAULT_CODEX_HOME,
+        )
     }
 
     fn configured(
@@ -269,13 +331,38 @@ impl Fixture {
         launcher: Option<Launcher>,
         hosted: Option<Hosted>,
         through: Option<&'static str>,
+        codex_home: &'static str,
+    ) -> Self {
+        Self::seeded(
+            kind,
+            extra,
+            assumed,
+            launcher,
+            hosted,
+            through,
+            codex_home,
+            &[],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn seeded(
+        kind: &'static str,
+        extra: &[(&str, &str)],
+        assumed: bool,
+        launcher: Option<Launcher>,
+        hosted: Option<Hosted>,
+        through: Option<&'static str>,
+        codex_home: &'static str,
+        files: &[(&str, &str)],
     ) -> Self {
         let mut env = vec![("DOT_AGENT_DECK_DOORBELL_TICK_MS", "25")];
+        // Claude Code's alone: Codex's classes are in the shipped rollout
+        // since the Codex activation, and its generations are checked with
+        // Codex's measured facts (the assumption refuses a list naming a
+        // Codex release).
         if assumed {
-            env.push((
-                "DOT_AGENT_DECK_E2E_ASSUME_EDITOR_PROBE",
-                "claude@2.1.310,codex@0.164.0",
-            ));
+            env.push(("DOT_AGENT_DECK_E2E_ASSUME_EDITOR_PROBE", "claude@2.1.310"));
         }
         // Diagnosis (Q35-21): the daemon logs the probe's and the
         // doorbell's decisions, and a failing test prints them. A caller
@@ -349,7 +436,7 @@ impl Fixture {
                 )),
                 hook_list: codex_hook_list_response(),
             };
-            seed_codex_trust(&daemon, &pane);
+            seed_codex_trust(&daemon, &pane, &daemon.home.join(codex_home));
             pane
         });
         let native = daemon.home.join("native");
@@ -471,7 +558,13 @@ impl Fixture {
             launcher,
             hosted,
             through,
+            codex_home,
         };
+        for (path, contents) in files {
+            let path = f.daemon.home.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, contents).unwrap();
+        }
         f.spawn("first", false);
         f
     }
@@ -501,7 +594,7 @@ impl Fixture {
             ["VISUAL", editor],
             ["EDITOR", editor],
             ["TMPDIR", self.daemon.home.join("tmp")],
-            ["CODEX_HOME", self.daemon.home.join("codex")]
+            ["CODEX_HOME", self.daemon.home.join(self.codex_home)]
         ]);
         if let Some(pane) = &self.codex_pane {
             let env = env.as_array_mut().unwrap();
@@ -965,6 +1058,11 @@ impl Drop for RefusalWatch {
 }
 
 impl Fixture {
+    /// The daemon's log as written so far.
+    pub fn log_text(&self) -> String {
+        fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
     /// Diagnosis only (Q35-21): print the daemon log's probe and doorbell
     /// lines, so a red run says which check settled how and why a ring or
     /// a probe was or wasn't admitted. Asserts nothing.

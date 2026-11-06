@@ -457,7 +457,7 @@ fn doorbell_053_every_recorded_dialog_leaves_the_token_head_inert() {
     }
 }
 
-/// Scenario: Ask the table about the facts as they ship, for releases that were recorded and releases nobody measured. Every Claude Code release (2.1.310, 2.1.311, 2.1.317, 2.1.318, 2.1.319, 2.2.0) is Go, unstaged, with no settle window, and the facts' editor probe is the one measured on 2.1.317 and 2.1.318; every Codex release (0.160.0, 0.164.0, 0.166.0, 0.200.1) is Go, staged, with the 6.69 s settle window from the slowest recorded first dialog, through the table and through a generation's verdict alike; and both agents' facts have their parser cost verified.
+/// Scenario: Ask the table about the facts as they ship, for releases that were recorded and releases nobody measured. Every Claude Code release (2.1.310, 2.1.311, 2.1.317, 2.1.318, 2.1.319, 2.2.0) is Go, unstaged, with no settle window, and the facts' editor probe is the one measured on 2.1.317 and 2.1.318; every Codex release (0.160.0, 0.164.0, 0.166.0, 0.200.1) is Go, staged, with the 6.69 s settle window from the slowest recorded first dialog, through the table and through a generation's verdict alike, and Codex's editor probe is the one measured on 0.164.0; and both agents' facts have their parser cost verified.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_the_shipped_facts_verdicts() {
@@ -512,7 +512,12 @@ fn doorbell_053_the_shipped_facts_verdicts() {
         CLAUDE_FACTS.editor_probe,
         Measurement::Verified(CLAUDE_EDITOR_PROBE)
     );
-    assert_eq!(CODEX_FACTS.editor_probe, Measurement::Absent);
+    use dot_agent_deck::doorbell_activation::{CODEX_0_164_0_EDITOR_PROBE, CODEX_EDITOR_PROBE};
+    assert_eq!(CODEX_EDITOR_PROBE, CODEX_0_164_0_EDITOR_PROBE);
+    assert_eq!(
+        CODEX_FACTS.editor_probe,
+        Measurement::Verified(CODEX_EDITOR_PROBE)
+    );
 }
 
 /// Scenario: Check every recorded release (Claude Code 2.1.310, 2.1.312, 2.1.317, 2.1.318; Codex 0.160.0, 0.164.0) against its agent's shipped facts. Each conforms: nothing measured on it contradicts a fact, its dialogs and keys are all in the facts with the measured effect or a more cautious commit, and its slowest first dialog is no later than the facts'. The recorded set is the one this test knows, so a release added or dropped is noticed.
@@ -545,7 +550,7 @@ fn doorbell_053_every_recorded_release_conforms_to_its_agents_facts() {
     }
 }
 
-/// Scenario: Make one of the shipped facts wrong in each way a recorded release can show it: Codex's settle fact faster than 0.160.0's slowest first dialog, a key of Codex's update dialog that commits on the recorded releases called inert, folder trust's `2` taken from 0.164.0 (dismisses) where 0.160.0 commits, a dialog missing from the facts, a key of a recorded dialog missing from the facts, the wrong profile, an editor probe different from the measured one, a recorded release whose echo, key effects or first dialog failed, and an agent with no facts. Each makes conformance fail for the release that contradicts it, with the error naming that contradiction, and the shipped facts pass.
+/// Scenario: Make one of the shipped facts wrong in each way a recorded release can show it: Codex's settle fact faster than 0.160.0's slowest first dialog, a key of Codex's update dialog that commits on the recorded releases called inert, folder trust's `2` taken from 0.164.0 (dismisses) where 0.160.0 commits, a dialog missing from the facts, a key of a recorded dialog missing from the facts, the wrong profile, an editor probe different from the measured one (for Codex, also its export shape or its editor selection alone), a recorded release whose echo, key effects or first dialog failed, and an agent with no facts. Each makes conformance fail for the release that contradicts it, with the error naming that contradiction, and the shipped facts pass.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_conformance_fails_when_a_fact_is_wrong() {
@@ -665,6 +670,64 @@ fn doorbell_053_conformance_fails_when_a_fact_is_wrong() {
         Ok(()),
         "2.1.310's editor probe was not measured"
     );
+    // The same for Codex (the revcxact review's LOW-2): 0.164.0 measured
+    // its editor probe, 0.160.0 didn't.
+    let other_codex_probe = EditorProbe {
+        paste_toggles: PasteToggles {
+            disables: 0,
+            enables: 0,
+        },
+        ..dot_agent_deck::doorbell_activation::CODEX_EDITOR_PROBE
+    };
+    let codex_wrong = with_codex(AgentFacts {
+        editor_probe: Measurement::Verified(other_codex_probe),
+        ..CODEX_FACTS
+    });
+    fails_with(
+        conformance(codex_164, &codex_wrong),
+        "editor_probe measured",
+    );
+    assert_eq!(
+        conformance(codex_160, &codex_wrong),
+        Ok(()),
+        "0.160.0's editor probe was not measured"
+    );
+    // Fields the deck reads at run time (the revcxfix review's NIT-2): the
+    // export's shape (where the attestation looks for the file) and the
+    // editor selection (the helper's choice and the settlement's editor
+    // check), each wrong alone.
+    for (field, probe) in [
+        (
+            "export",
+            EditorProbe {
+                export: ExportShape::ClaudeTmpdir,
+                ..dot_agent_deck::doorbell_activation::CODEX_EDITOR_PROBE
+            },
+        ),
+        (
+            "selection",
+            EditorProbe {
+                selection: EditorSelection::ClaudeCode,
+                ..dot_agent_deck::doorbell_activation::CODEX_EDITOR_PROBE
+            },
+        ),
+    ] {
+        let wrong = with_codex(AgentFacts {
+            editor_probe: Measurement::Verified(probe),
+            ..CODEX_FACTS
+        });
+        let got = conformance(codex_164, &wrong);
+        assert!(
+            got.as_ref()
+                .is_err_and(|e| e.contains("editor_probe measured")),
+            "a wrong Codex {field}: {got:?}"
+        );
+        assert_eq!(
+            conformance(codex_160, &wrong),
+            Ok(()),
+            "0.160.0's editor probe was not measured ({field})"
+        );
+    }
     // A recorded release whose echo failed contradicts the verified fact.
     let failed = RecordedRelease {
         release: v("0.170.0"),
@@ -811,6 +874,74 @@ fn doorbell_053_the_measured_2_1_318_editor_record() {
     );
 }
 
+/// Scenario: Read the editor record measured for Codex 0.164.0. It names Codex's `editor/` export and editor selection, two paste-mode disables and one enable, Codex's four key-binding sources in precedence order, no bindings-loaded-at-start premise, no inert candidate form, and the pasted BEL left absent; it is the recorded release's measurement and Codex's editor-probe fact, while 0.160.0's record has none, so 0.160.0, 0.164.0 and a release nobody measured are all armable once their root is bound, and nothing is armable before its header latches a release.
+#[spec("inbox/doorbell/053")]
+#[test]
+fn doorbell_053_the_measured_0_164_0_editor_record() {
+    use dot_agent_deck::composer_probe::{Binding, InertCause, Permission, permission};
+    use dot_agent_deck::doorbell_activation::CODEX_0_164_0_EDITOR_PROBE;
+    assert_eq!(
+        CODEX_0_164_0_EDITOR_PROBE,
+        EditorProbe {
+            export: ExportShape::CodexEditorDir,
+            selection: EditorSelection::Codex,
+            paste_toggles: PasteToggles {
+                disables: 2,
+                enables: 1,
+            },
+            keymap_sources: &[
+                KeymapSource::CodexConfig,
+                KeymapSource::CodexProfile,
+                KeymapSource::CodexProject,
+                KeymapSource::CodexOverride,
+            ],
+            keymap_loaded_at_start: Measurement::Absent,
+            inert_candidates: &[],
+            pasted_bel_is_text: Measurement::Absent,
+        }
+    );
+    let record = |release: &str| {
+        RECORDED_RELEASES
+            .iter()
+            .find(|r| r.measured.agent == CODEX && r.release == v(release))
+            .unwrap()
+            .measured
+            .editor_probe
+    };
+    assert_eq!(
+        record("0.164.0"),
+        Measurement::Verified(CODEX_0_164_0_EDITOR_PROBE)
+    );
+    assert_eq!(record("0.160.0"), Measurement::Absent);
+    for release in ["0.160.0", "0.164.0", "0.166.0"] {
+        let header = known(release);
+        assert_eq!(
+            permission(&AGENT_FACTS, &[], &CODEX, Some(&header), Binding::Bound),
+            Permission::Armable,
+            "{release}"
+        );
+        assert_eq!(
+            permission(&AGENT_FACTS, &[], &CODEX, Some(&header), Binding::Waiting),
+            Permission::Pending,
+            "{release}"
+        );
+    }
+    assert_eq!(
+        permission(&AGENT_FACTS, &[], &CODEX, None, Binding::Bound),
+        Permission::Pending
+    );
+    assert_eq!(
+        permission(
+            &AGENT_FACTS,
+            &[],
+            &CODEX,
+            Some(&LatchedRelease::Unseen),
+            Binding::Bound
+        ),
+        Permission::Inert(InertCause::UnknownRelease)
+    );
+}
+
 /// A verified editor record, as a stand-in's would be.
 const PROBE: EditorProbe<'static> = EditorProbe {
     export: ExportShape::CodexEditorDir,
@@ -952,12 +1083,12 @@ fn doorbell_053_editor_records_move_no_verdict_in_any_table() {
     assert_eq!(tables, 16);
 }
 
-/// Scenario: Apply the e2e assumption, which gives the stand-ins' editor probe to exact agent@release pairs. A generation that latched a named release gets the assumed probe; another release of the same agent, and the other agent, keep their own facts' probe (Claude Code's measured one, Codex's absent); and no verdict of the ring moves, since the ring reads no editor probe.
+/// Scenario: Apply the e2e assumption, which gives the stand-ins' editor probe to exact agent@release pairs (only Claude Code's since the Codex activation). A generation that latched a named release gets the assumed probe; another release of the same agent, and the other agent, keep their own facts' probe (Claude Code's measured one, Codex's measured one); and no verdict of the ring moves, since the ring reads no editor probe.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_the_editor_probe_assumption_moves_no_shipped_verdict() {
-    use dot_agent_deck::doorbell_activation::CLAUDE_EDITOR_PROBE;
-    let assumed = [(CLAUDE, v("2.1.310"), PROBE), (CODEX, v("0.164.0"), PROBE)];
+    use dot_agent_deck::doorbell_activation::{CLAUDE_EDITOR_PROBE, CODEX_EDITOR_PROBE};
+    let assumed = [(CLAUDE, v("2.1.310"), PROBE)];
     assert_eq!(
         editor_probe_for(&AGENT_FACTS, &assumed, &CLAUDE, &v("2.1.310")),
         Measurement::Verified(PROBE)
@@ -966,14 +1097,13 @@ fn doorbell_053_the_editor_probe_assumption_moves_no_shipped_verdict() {
         editor_probe_for(&AGENT_FACTS, &assumed, &CLAUDE, &v("2.1.311")),
         Measurement::Verified(CLAUDE_EDITOR_PROBE)
     );
-    assert_eq!(
-        editor_probe_for(&AGENT_FACTS, &assumed, &CODEX, &v("0.164.0")),
-        Measurement::Verified(PROBE)
-    );
-    assert_eq!(
-        editor_probe_for(&AGENT_FACTS, &assumed, &CODEX, &v("0.165.0")),
-        Measurement::Absent
-    );
+    for release in ["0.160.0", "0.164.0", "0.165.0"] {
+        assert_eq!(
+            editor_probe_for(&AGENT_FACTS, &assumed, &CODEX, &v(release)),
+            Measurement::Verified(CODEX_EDITOR_PROBE),
+            "{release}"
+        );
+    }
     assert_eq!(
         editor_probe_for(&AGENT_FACTS, &assumed, &AgentType::Pi, &v("2.1.310")),
         Measurement::Absent

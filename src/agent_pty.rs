@@ -2595,6 +2595,13 @@ impl AgentBus {
         }
     }
 
+    /// The pane's width now and every width it has had (the revcxact
+    /// review's MEDIUM-2: what Codex's width witness refused at), for a
+    /// diagnosis line. Widths only: no screen content.
+    pub fn evidence_widths(&self) -> (u16, Vec<u16>) {
+        self.state.lock().unwrap().evidence.widths()
+    }
+
     /// The evidence state's status, layout epoch and stream position.
     pub fn evidence(&self) -> (crate::evidence_state::EvidenceStatus, u64, u64) {
         let state = self.state.lock().unwrap();

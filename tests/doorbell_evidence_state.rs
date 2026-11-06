@@ -662,3 +662,15 @@ fn doorbell_044_claude_2_1_310_edges_end_clean_however_cut() {
         &CLAUDE_PROFILE,
     );
 }
+
+/// Scenario: Start a Codex generation's evidence state at 180 columns and resize its pane to 117, then 116, then 117 again, as an orchestration's split can (the revcxact review's MEDIUM-2). The widths the state reports for a diagnosis line are the current 117 and every width it has had, 116 and 117 among them, which is what refuses Codex's logo as a width witness.
+#[spec("inbox/doorbell/044")]
+#[test]
+fn doorbell_044_the_state_reports_every_width_its_pane_has_had() {
+    let mut state = EvidenceState::new(Some(&CODEX_PROFILE), 50, 180);
+    assert_eq!(state.widths(), (180, vec![180]));
+    for cols in [117, 116, 117] {
+        state.edge(EdgeReason::Resize, 50, cols);
+    }
+    assert_eq!(state.widths(), (117, vec![116, 117, 180]));
+}

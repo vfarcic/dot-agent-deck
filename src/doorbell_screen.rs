@@ -335,8 +335,7 @@ pub struct WidthsSeen {
 
 impl std::fmt::Debug for WidthsSeen {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let widths: Vec<u16> = (0..=u16::MAX).filter(|&w| self.had(w)).collect();
-        f.debug_tuple("WidthsSeen").field(&widths).finish()
+        f.debug_tuple("WidthsSeen").field(&self.list()).finish()
     }
 }
 
@@ -358,6 +357,11 @@ impl WidthsSeen {
 
     pub fn had(&self, cols: u16) -> bool {
         self.bits[cols as usize / 64] & (1 << (cols % 64)) != 0
+    }
+
+    /// Every width recorded, ascending.
+    pub fn list(&self) -> Vec<u16> {
+        (0..=u16::MAX).filter(|&w| self.had(w)).collect()
     }
 }
 
@@ -1125,13 +1129,15 @@ pub static STANDIN_CPR_PROFILE: ScreenProfile = ScreenProfile {
     },
 };
 
-/// The `editor_probe` record the e2e stand-ins follow, for each agent they
-/// stand in for: what an e2e run's assumption
+/// The `editor_probe` record the e2e stand-ins follow, for each agent an
+/// assumption may name: what an e2e run's assumption
 /// ([`crate::doorbell_activation::assumed_editor_probes`]) gives a recorded
 /// release in place of a measurement. It measures nothing: the inert
 /// candidate forms are empty and P-PASTE is absent, so a stand-in is checked
 /// only in the plain composer. Claude Code's stand-in has P-KB1 by
-/// construction, since it reads no key bindings; Codex has no such premise.
+/// construction, since it reads no key bindings. Codex has none since the
+/// Codex activation: every Codex generation is checked with Codex's measured
+/// facts.
 #[cfg(feature = "e2e")]
 pub fn standin_editor_probe(
     agent: &crate::event::AgentType,
@@ -1151,20 +1157,6 @@ pub fn standin_editor_probe(
             paste_toggles: ONE_EACH,
             keymap_sources: &[KeymapSource::ClaudeKeybindings],
             keymap_loaded_at_start: Measurement::Verified(()),
-            inert_candidates: &[],
-            pasted_bel_is_text: Measurement::Absent,
-        }),
-        AgentType::Codex => Some(EditorProbe {
-            export: ExportShape::CodexEditorDir,
-            selection: EditorSelection::Codex,
-            paste_toggles: ONE_EACH,
-            keymap_sources: &[
-                KeymapSource::CodexConfig,
-                KeymapSource::CodexProfile,
-                KeymapSource::CodexProject,
-                KeymapSource::CodexOverride,
-            ],
-            keymap_loaded_at_start: Measurement::Absent,
             inert_candidates: &[],
             pasted_bel_is_text: Measurement::Absent,
         }),

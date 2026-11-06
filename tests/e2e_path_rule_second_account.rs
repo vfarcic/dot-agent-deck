@@ -22,9 +22,10 @@
 //! without it (every attempt is printed). Where Docker
 //! or the image isn't available, or `/` or `/var/tmp` isn't on an
 //! allow-listed filesystem, the test prints `SKIP: [e2e]` and passes, and
-//! fails instead under `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`. CI's runners
-//! have no `ubuntu:24.04` image and the test never pulls one, so its PASS
-//! in CI is that skip.
+//! fails instead under `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`. The test never
+//! pulls the image, and this repo's CI gives it no Docker `ubuntu:24.04`
+//! image to start (RWX's tasks run on an Ubuntu 24.04 base, which is not
+//! that), so a PASS in CI is that skip.
 
 mod common;
 
@@ -237,6 +238,12 @@ fn preflight() -> Result<(), String> {
     if uid() == OTHER {
         return Err(format!("the test's own uid is {OTHER}"));
     }
+    // The container's other account has gid OTHER too: with the user's own
+    // primary gid equal to it, "its own group" would be the user's group,
+    // and the group-bit assertions would read a false red.
+    if gid() == OTHER {
+        return Err(format!("the test's own gid is {OTHER}"));
+    }
     Ok(())
 }
 
@@ -292,9 +299,11 @@ fn probe_096_the_export_rule_against_a_second_account() {
             );
         }
     }
-    // Each account gets exactly the bits that apply to it: the group bits
-    // only with the user's group, the other bits only without it. The hard
-    // link is refused for its second path, not for a bit either account has.
+    // For the group-writable directory and file, and the other-writable
+    // directory, the attempts that succeed are the ones whose bits apply:
+    // the group bits only with the user's group, the other bits only
+    // without it. The hard link is refused for its second path, not for a
+    // bit either account has.
     let gave = |name: &str, group: u32| {
         rows.iter()
             .find(|r| r.0 == name && r.1 == group)

@@ -312,15 +312,32 @@ impl Deck {
                 std::fs::create_dir_all(&claude).unwrap();
                 std::fs::write(claude.join("keybindings.json"), "{}").unwrap();
                 // What the spawn path reads before the child exists
-                // (A-20d-1b), with the agent's own `HOME`.
+                // (A-20d-1b), with the agent's own `HOME`, in the working
+                // directory the bound agent (this process) runs in: Claude
+                // Code's settings-file `env` sources are read from it, and
+                // another directory holds as changed (cxfix2 MEDIUM-A).
+                //
+                // Not hermetic (the revcxfix2 review's NIT-4): that working
+                // directory is the checkout, so the deck reads its committed
+                // `.claude/settings.json`, any untracked
+                // `.claude/settings.local.json`, and `/etc/claude-code`. A
+                // local file there that the deck holds on (an `env` naming
+                // `VISUAL`, `EDITOR`, `HOME` or `CLAUDE_CONFIG_DIR`, such a
+                // member name anywhere, a `__proto__`, or a document it
+                // can't parse) turns the tests that read the keymap red with
+                // `Keymap(Editor)` or `Keymap(Unmeasured)`: move it aside to
+                // run them. The bound agent's cwd is this process's own, and
+                // the managed path is fixed in the product, so a seam for
+                // either would be a production change made for a test.
                 let home_dir = dir.path().join("home");
+                let cwd = std::env::current_dir().unwrap();
                 installation.set_keymap_baseline(
                     crate::composer_probe::keymap::KeymapBaseline::at_spawn(
                         true,
                         false,
                         |name| (name == "HOME").then(|| home_dir.clone().into_os_string()),
                         &[],
-                        dir.path(),
+                        &cwd,
                     ),
                 );
             }
@@ -338,13 +355,19 @@ impl Deck {
             // the runner's: what the observer reads as the agent's is the
             // spawn's own, or the one the test names under the deck's
             // directory.
-            let environ: Vec<(std::ffi::OsString, std::ffi::OsString)> = match &agent_env {
+            let mut environ: Vec<(std::ffi::OsString, std::ffi::OsString)> = match &agent_env {
                 Some(agent_env) => agent_env
                     .iter()
                     .map(|(k, v)| (k.into(), dir.path().join(v).into_os_string()))
                     .collect(),
                 None => env.iter().map(|(k, v)| (k.into(), v.into())).collect(),
             };
+            // The installation's `VISUAL` and `EDITOR`, as a directly
+            // spawned agent inherits them: the editor its Ctrl+G opens is
+            // the helper (the revcxact review's HIGH-1).
+            for name in ["VISUAL", "EDITOR"] {
+                environ.push((name.into(), instance.helper().as_os_str().to_os_string()));
+            }
             installation.set_bound_environ_for_test(environ);
             Spawned {
                 agent_id: id.clone(),

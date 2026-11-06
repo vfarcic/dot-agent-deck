@@ -2522,6 +2522,39 @@ fn strip_hooks_from_claude_settings_jsonc_input_strips_hooks() {
 }
 
 #[test]
+fn host_claude_settings_lose_what_the_input_box_check_holds_on() {
+    // The revcxfix2 review's LOW-4: a host `settings.json` whose `env` sets
+    // `VISUAL` or `EDITOR` (or `HOME`/`CLAUDE_CONFIG_DIR`, or names either
+    // anywhere) would make the deck hold every lane-2 Claude probe test in
+    // the test HOME, which then times out and reads like a product
+    // regression. The copy drops them; what the deck reads of the copy must
+    // pass its own guard.
+    use dot_agent_deck::composer_probe::keymap::{claude_env_guard, claude_env_member};
+    let raw = r#"{
+        // a comment
+        "env": {"VISUAL": "nvim", "editor": "x", "HOME": "/h", "CLAUDE_CONFIG_DIR": "/c", "KEEP": "1"},
+        "mcpServers": {"m": {"env": {"EDITOR": "vim", "A": "1"}}},
+        "__proto__": {"env": {"VISUAL": "y"}},
+        "theme": "dark"
+    }"#;
+    let out = strip_hooks_from_claude_settings(raw).expect("parses");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+    assert_eq!(v["env"], serde_json::json!({"KEEP": "1"}), "{out}");
+    assert_eq!(
+        v["mcpServers"]["m"]["env"],
+        serde_json::json!({"A": "1"}),
+        "{out}"
+    );
+    assert!(v.get("__proto__").is_none(), "{out}");
+    assert_eq!(v["theme"], "dark");
+    let read = vec![(
+        std::path::PathBuf::from("settings.json"),
+        claude_env_member(out.as_bytes()),
+    )];
+    assert_eq!(claude_env_guard(&read), Ok(()), "{out}");
+}
+
+#[test]
 fn strip_hooks_from_claude_settings_truly_malformed_fails_closed() {
     // Garbage that isn't valid JSON even after comment stripping
     // is rejected with an Err — fail-CLOSED rather than letting

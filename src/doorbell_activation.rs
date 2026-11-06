@@ -587,9 +587,11 @@ pub fn conformance(recorded: &RecordedRelease<'_>, facts: &[AgentFacts<'_>]) -> 
 /// The variable the e2e build reads for [`assumed_editor_probes`].
 pub const ASSUME_EDITOR_PROBE_ENV: &str = "DOT_AGENT_DECK_E2E_ASSUME_EDITOR_PROBE";
 
-/// Parse a comma-separated list of exact `agent@release` entries (`claude`
-/// or `codex`, then a bare `MAJOR.MINOR.PATCH`). An entry that is not one
-/// refuses the whole list, as does an entry named twice. The result names
+/// Parse a comma-separated list of exact `agent@release` entries (`claude`,
+/// then a bare `MAJOR.MINOR.PATCH`). An entry that is not one refuses the
+/// whole list, as does an entry named twice; a `codex@…` entry is one that
+/// is not, since the Codex activation (Q35-29) gave every Codex release its
+/// measured probe and rolled Codex's classes out. The result names
 /// the releases a stand-in's header draws; it never carries a release a
 /// generation has not latched itself.
 pub fn parse_assumed_editor_probes(list: &str) -> Result<Vec<(AgentType, Version)>, String> {
@@ -603,7 +605,6 @@ pub fn parse_assumed_editor_probes(list: &str) -> Result<Vec<(AgentType, Version
         let (agent, release) = entry.split_once('@').ok_or_else(unknown)?;
         let agent = match agent {
             "claude" => AgentType::ClaudeCode,
-            "codex" => AgentType::Codex,
             _ => return Err(unknown()),
         };
         // A pre-release or build is refused: a header the scanner latches
@@ -731,12 +732,18 @@ pub const CLAUDE_FACTS: AgentFacts<'static> = AgentFacts {
     editor_probe: Measurement::Verified(CLAUDE_EDITOR_PROBE),
 };
 
+/// Codex's external-editor action, as measured on 0.164.0
+/// ([`CODEX_0_164_0_EDITOR_PROBE`]). 0.160.0's was never measured: it, and
+/// every release nobody recorded, gets this one by assumption (one set of
+/// facts per agent, `docs/develop/doorbell-admission.md`).
+pub const CODEX_EDITOR_PROBE: EditorProbe<'static> = CODEX_0_164_0_EDITOR_PROBE;
+
 /// Codex's facts, from its recorded releases (0.160.0 and 0.164.0): the line
 /// is staged (a digit of a message id answers the update dialog, `n` the
 /// folder-trust dialog), its head echo as measured on 0.164.0; the first
 /// ring's settle window from the slowest first dialog over both releases'
-/// 72 launches (4.461 s, on 0.160.0), so 6.69 s. No input-box check yet: the
-/// editor probe stays absent until Codex's activation.
+/// 72 launches (4.461 s, on 0.160.0), so 6.69 s; the editor probe as
+/// measured on 0.164.0 (the Codex activation, Q35-29).
 pub const CODEX_FACTS: AgentFacts<'static> = AgentFacts {
     agent: AgentType::Codex,
     profile: "codex-2026-10",
@@ -756,7 +763,7 @@ pub const CODEX_FACTS: AgentFacts<'static> = AgentFacts {
     placeholder_empty: Measurement::Verified(()),
     delete_key: Measurement::Verified(()),
     transcript_echo: Measurement::Verified(()),
-    editor_probe: Measurement::Absent,
+    editor_probe: Measurement::Verified(CODEX_EDITOR_PROBE),
 };
 
 /// The facts the doorbell's admission reads, one set per agent it types into.
@@ -1166,7 +1173,9 @@ pub static RECORDED_RELEASES: [RecordedRelease<'static>; 6] = [
             placeholder_empty: Measurement::Verified(()),
             delete_key: Measurement::Verified(()),
             transcript_echo: Measurement::Verified(()),
-            editor_probe: Measurement::Absent,
+            // Measured 2026-11-05 (U4): `CODEX_0_164_0_EDITOR_PROBE`'s doc
+            // says what, and what it does not cover.
+            editor_probe: Measurement::Verified(CODEX_0_164_0_EDITOR_PROBE),
         },
     },
     // Codex 0.160.0, the minimum `scripts/box/require-codex-version.sh`
@@ -1198,6 +1207,9 @@ pub static RECORDED_RELEASES: [RecordedRelease<'static>; 6] = [
             placeholder_empty: Measurement::Verified(()),
             delete_key: Measurement::Verified(()),
             transcript_echo: Measurement::Verified(()),
+            // Never measured, by decision (one set of facts per agent): a
+            // generation that latches 0.160.0 is checked with Codex's
+            // `editor_probe` fact, 0.164.0's, by assumption.
             editor_probe: Measurement::Absent,
         },
     },
@@ -1440,6 +1452,53 @@ pub const CLAUDE_2_1_318_EDITOR_PROBE: EditorProbe<'static> = EditorProbe {
     },
     keymap_sources: &[KeymapSource::ClaudeKeybindings],
     keymap_loaded_at_start: Measurement::Verified(()),
+    inert_candidates: &[],
+    pasted_bel_is_text: Measurement::Absent,
+};
+
+/// Codex 0.164.0's external-editor action as measured on 2026-11-05 (U4,
+/// `tests/fixtures/codex-inbox/release-0.164.0/editor-probe/`, replayed by
+/// `tests/codex_editor_evidence.rs`, `inbox/probe/092`–`094`): the native
+/// executable `b93f6811…` run directly at 50 × 200 with no credential and no
+/// network, as the deck's wrapper starts it. Each field is verified only as
+/// far as it was measured.
+///
+/// - `export`: 5/5 Ctrl+G presses under `VISUAL` ran the editor with
+///   `$CODEX_HOME/editor/.tmpXXXXXX.md` (mode 0600) as its last argument,
+///   holding the draft, and reimported the rewritten file.
+/// - `selection`: a set, non-empty `VISUAL` (split by shell words) before
+///   `EDITOR`; a set but empty one is an error, not a fall-through; with
+///   neither, an error line and no `PATH` fallback (2/2 each).
+/// - `paste_toggles`: two `?2004l` and then one `?2004h` in each of the 14
+///   invocations that ran the editor, through the deck's `ReturnMarkers`;
+///   none in the 6 that opened nothing.
+/// - `keymap_sources`: `config.toml`, the profile file, a trusted project's
+///   `.codex/config.toml`, then each `-c`, lowest first (M58r: the deck's
+///   merge equals Codex's in the 14 cases that started in a trusted folder,
+///   and never reads Ctrl+G as the editor where Codex moved it).
+/// - `keymap_loaded_at_start`: `Absent`: Codex has no P-KB1 premise.
+/// - `inert_candidates`: none, the M44e safe default.
+/// - `pasted_bel_is_text`: `Absent`: Codex removes a pasted BEL (4/4, read
+///   from the bytes the editor read).
+///
+/// It does NOT cover: another release (0.160.0 included), the npm launcher,
+/// 24 × 80, a real model login, a real terminal editor, a stop inside
+/// Codex's `tcflush` (the E1-only loss, 2 of 18, is sampled, not bounded;
+/// E1F kept 40/40 in the committed runs, measured idle only).
+pub const CODEX_0_164_0_EDITOR_PROBE: EditorProbe<'static> = EditorProbe {
+    export: ExportShape::CodexEditorDir,
+    selection: EditorSelection::Codex,
+    paste_toggles: PasteToggles {
+        disables: 2,
+        enables: 1,
+    },
+    keymap_sources: &[
+        KeymapSource::CodexConfig,
+        KeymapSource::CodexProfile,
+        KeymapSource::CodexProject,
+        KeymapSource::CodexOverride,
+    ],
+    keymap_loaded_at_start: Measurement::Absent,
     inert_candidates: &[],
     pasted_bel_is_text: Measurement::Absent,
 };

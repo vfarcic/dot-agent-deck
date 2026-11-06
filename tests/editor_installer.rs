@@ -244,14 +244,16 @@ fn probe() -> EditorProbe<'static> {
     }
 }
 
-/// Scenario: Decide eligibility from the rollout: production's rollout holds Claude Code's direct class alone, the Claude activation's, so that class is eligible, and every other class, the plain codex command among them, is not installed and the decision at a spawn says so without making anything; a shell is never installed, even under a rollout naming it; the assumption's agents roll out Claude's direct, launcher and wrapper classes and Codex's direct and launcher classes, each once.
+/// Scenario: Decide eligibility from the rollout: production's rollout holds Claude Code's direct class, the Claude activation's, and Codex's direct and launcher classes, the Codex activation's, so those are eligible, and every other class (Claude Code's launcher, an undeclared wrapper, an agent the probe doesn't cover) is not installed and the decision at a spawn says so without making anything; a shell is never installed, even under a rollout naming it; the assumption's Claude Code entries roll out Claude's direct, launcher and wrapper classes, each once, and a Codex entry, which the assumption no longer accepts, rolls out nothing.
 #[spec("inbox/probe/064")]
 #[test]
-fn probe_064_the_rollout_decides_and_production_installs_only_a_direct_claude() {
-    assert_eq!(INSTALL_ROLLOUT, [CLAUDE]);
-    assert_eq!(eligible(CLAUDE, INSTALL_ROLLOUT), Ok(()));
+fn probe_064_the_rollout_decides_and_production_installs_a_direct_claude_and_codex() {
+    let launched_codex = PaneClass::Launcher(ProbeAgent::Codex);
+    assert_eq!(INSTALL_ROLLOUT, [CLAUDE, CODEX, launched_codex]);
+    for class in [CLAUDE, CODEX, launched_codex] {
+        assert_eq!(eligible(class, INSTALL_ROLLOUT), Ok(()), "{class:?}");
+    }
     for class in [
-        CODEX,
         PaneClass::Launcher(ProbeAgent::Claude),
         PaneClass::Wrapper,
         PaneClass::Unprobed,
@@ -264,8 +266,9 @@ fn probe_064_the_rollout_decides_and_production_installs_only_a_direct_claude() 
         Err(NotInstalled::Shell)
     );
     for (command, why) in [
-        (Some("codex"), NotInstalled::Rollout),
+        (Some("npx claude"), NotInstalled::Rollout),
         (Some("my-wrapper"), NotInstalled::Rollout),
+        (Some("opencode"), NotInstalled::Rollout),
         (Some("bash"), NotInstalled::Shell),
         (None, NotInstalled::Shell),
     ] {
@@ -284,15 +287,14 @@ fn probe_064_the_rollout_decides_and_production_installs_only_a_direct_claude() 
         PaneClass::Launcher(ProbeAgent::Claude),
         PaneClass::Wrapper,
     ];
-    let codex_classes = [CODEX, PaneClass::Launcher(ProbeAgent::Codex)];
     assert_eq!(assumed_classes(&[]), []);
     assert_eq!(
         assumed_classes(std::slice::from_ref(&claude)),
         claude_classes
     );
-    assert_eq!(assumed_classes(std::slice::from_ref(&codex)), codex_classes);
+    assert_eq!(assumed_classes(std::slice::from_ref(&codex)), []);
     let both = assumed_classes(&[claude.clone(), codex.clone(), claude.clone()]);
-    assert_eq!(both, [&claude_classes[..], &codex_classes[..]].concat());
+    assert_eq!(both, claude_classes);
     assert_eq!(
         assumed_classes(&[(AgentType::OpenCode, release, probe())]),
         []

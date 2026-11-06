@@ -3,9 +3,10 @@
 //! release-0.164.0/editor-probe/`, its README says how it was recorded).
 //! Every check is in `support/codex_editor_evidence.rs`, which the lane-2
 //! recorder test (`tests/e2e_codex_editor_measure.rs`) runs over a fresh
-//! recording too. The proposed `editor_probe` is
-//! `PROPOSED_CODEX_0164_EDITOR_PROBE` there; nothing here wires it into the
-//! deck's facts.
+//! recording too. The `editor_probe` they check is the shipped one: Codex's
+//! fact and the 0.164.0 record's measurement, `CODEX_0_164_0_EDITOR_PROBE`
+//! (named `PROPOSED_CODEX_0164_EDITOR_PROBE` there, from before the Codex
+//! activation wired it).
 
 #![cfg(unix)]
 

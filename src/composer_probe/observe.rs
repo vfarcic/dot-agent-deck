@@ -93,9 +93,9 @@
 //! undeclared wrapper's `kind-G` is written with its `gen-G`. One
 //! settler at a time ([`SettleClaim`]) computes it, and only a settlement
 //! that moves it out of `Pending` publishes `A` with it, so `gen-G` is
-//! written once. Nothing in production publishes a liability: installation
-//! rolls out to no class until activation, and the only publisher is the
-//! `e2e` build's control verb ([`Seam::control`]).
+//! written once. In production, installation rolls out to the classes in
+//! [`super::install::INSTALL_ROLLOUT`] (a direct Claude Code since the Claude
+//! activation; a direct or launched Codex since the Codex activation).
 //!
 //! **Lock order.** No lock is held while a file is read or written:
 //! ```text
@@ -1092,6 +1092,19 @@ impl<P: Page> Seam<P> {
                 .and(Err(Refusal::NoRecord)),
         };
         self.sync();
+        // cxact: why an invocation's outcome is what it is (the record's
+        // settlement, the daemon's attribution and read); no path or text.
+        tracing::debug!(
+            target: "composer_probe",
+            ?decided,
+            recorded = ?recorded.as_ref().map(|r| match r {
+                Recorded::Kept { settlement, .. } => format!("kept {settlement:?}"),
+                other => format!("{other:?}"),
+            }),
+            attribution = ?evidence.map(|e| e.attribution),
+            ?read,
+            "editor helper invocation recorded"
+        );
         if decided != Decision::Armed {
             // ExternalEdit's first producer (PR U3-11): an invocation that
             // isn't the deck's may edit the box, and the epoch says so
@@ -1437,7 +1450,12 @@ mod linux {
     /// Q35-20 (O-20.7b): a generation's keymap sources as read before its
     /// spawn (A-20d-1b), which every later read is compared with.
     enum KeymapEvidence {
-        Claude(crate::composer_probe::keymap::ClaudeKeymap),
+        Claude {
+            keymap: crate::composer_probe::keymap::ClaudeKeymap,
+            /// The files Claude Code copies an `env` map from (the revcxfix
+            /// review's MEDIUM-A), read again at each check.
+            env: Box<crate::composer_probe::keymap::ClaudeEnv>,
+        },
         Codex {
             reads: Box<crate::composer_probe::keymap::CodexReads>,
             precedence: &'static [crate::doorbell_activation::KeymapSource],
@@ -1448,7 +1466,12 @@ mod linux {
     impl KeymapEvidence {
         fn check(&self) -> Result<(), crate::composer_probe::keymap::Hold> {
             match self {
-                KeymapEvidence::Claude(keymap) => keymap.check(),
+                KeymapEvidence::Claude { keymap, env } => {
+                    // Both are read at every check, so a change to either
+                    // latches even while the other holds.
+                    let env = env.check();
+                    keymap.check().and(env)
+                }
                 KeymapEvidence::Codex { reads, precedence } => reads.check(precedence),
                 KeymapEvidence::Held(hold) => Err(*hold),
             }
@@ -1488,6 +1511,10 @@ mod linux {
         launch: Vec<OsString>,
         reader: InstanceReader,
         helper_id: FileId,
+        /// The helper's path, as the installation put it in the spawn's
+        /// `VISUAL` and `EDITOR`: what the bound agent's own selection must
+        /// name ([`crate::composer_probe::keymap::editor_is_helper`]).
+        helper_path: std::path::PathBuf,
         latch: Box<dyn Fn(&AgentType) -> LatchedRelease + Send + Sync>,
         assumed: &'static [(AgentType, semver::Version, EditorProbe<'static>)],
         settling: SettleClaim,
@@ -2187,6 +2214,9 @@ mod linux {
             };
             let reader = InstanceReader::open(installation.instance_dir()).ok()?;
             let helper_id = installation.helper_id();
+            let helper_path = installation
+                .instance_dir()
+                .join(crate::composer_probe::instance::HELPER_NAME);
             let launch = installation.launch().to_vec();
             let keymap_baseline = installation.take_keymap_baseline();
             let export_hold = installation.take_export_hold();
@@ -2235,6 +2265,7 @@ mod linux {
                 launch,
                 reader,
                 helper_id,
+                helper_path,
                 latch: spawned.latch,
                 assumed: spawned.assumed,
                 settling: SettleClaim::default(),
@@ -2517,17 +2548,56 @@ mod linux {
                 Err(hold) => return KeymapEvidence::Held(hold),
             };
             match agent {
-                AgentType::ClaudeCode => match baseline.claude_bound(&env) {
-                    Ok((path, read)) => {
-                        KeymapEvidence::Claude(keymap::ClaudeKeymap::from_spawn_read(
+                // The revcxact review's HIGH-1, for both agents: the editor
+                // its own environment selects, by its release's record, must
+                // be the helper, or a probe would open another one in the
+                // person's pane.
+                // The revcxfix review's MEDIUM-A: Claude Code also copies
+                // the `env` maps of its settings files into its environment
+                // as it starts, which no environment read sees.
+                AgentType::ClaudeCode => match baseline
+                    .claude_bound(&env)
+                    .and_then(|bound| {
+                        keymap::editor_is_helper(probe.selection, &env, &self.helper_path)
+                            .map(|()| bound)
+                    })
+                    .and_then(|bound| {
+                        baseline
+                            .claude_env_bound(&env, args, cwd)
+                            .map(|settings| (bound, settings))
+                    }) {
+                    Ok(((path, read), settings)) => KeymapEvidence::Claude {
+                        keymap: keymap::ClaudeKeymap::from_spawn_read(
                             path.to_path_buf(),
                             read.clone(),
                             probe,
-                        ))
-                    }
+                        ),
+                        env: Box::new(keymap::ClaudeEnv::new(settings)),
+                    },
                     Err(hold) => KeymapEvidence::Held(hold),
                 },
-                AgentType::Codex => match baseline.codex_bound(&env, args, cwd) {
+                // Ruling Q227b: a Codex home inside a folder Codex may
+                // write to is held before any check.
+                AgentType::Codex => match baseline
+                    .codex_bound(&env, args, cwd)
+                    .and_then(|codex| {
+                        keymap::editor_is_helper(probe.selection, &env, &self.helper_path)
+                            .map(|()| codex)
+                    })
+                    // The revcxfix review's MEDIUM-B: Codex loads
+                    // `$CODEX_HOME/.env` over its environment as it starts;
+                    // its read before the spawn, which each check compares
+                    // the file with.
+                    .and_then(|codex| {
+                        keymap::codex_dotenv_guard(&codex.read.dotenv).map(|()| codex)
+                    })
+                    .and_then(|codex| {
+                        let (Some(home), Some(cwd)) = (keymap::codex_home(&env), cwd) else {
+                            return Err(keymap::Hold::Unmeasured);
+                        };
+                        keymap::codex_home_checkable(&home, cwd, env("TMPDIR").as_deref())
+                            .map(|()| codex)
+                    }) {
                     Ok(codex) => KeymapEvidence::Codex {
                         reads: Box::new(keymap::CodexReads::new(codex)),
                         precedence: probe.keymap_sources,

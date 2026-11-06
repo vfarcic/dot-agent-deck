@@ -662,6 +662,245 @@ fn probe_032_native_query_hazard_projects_cannot_check_on_the_card() {
     assert!(mail_turns(&f, &id).is_empty());
 }
 
+/// A deck whose panes' shell is bash with `BASH_ENV` naming a start-up file
+/// that runs `rc`, with a `kind` stand-in in a pane: bash reads it for a
+/// `-c` command, as zsh reads `.zshenv` and fish `config.fish`, and the deck
+/// runs a pane line with blanks, every Codex line and a Claude Code command
+/// with arguments, as `$SHELL -c` (the revcxact review's HIGH-1).
+fn with_shell_rc(kind: &'static str, rc: &str) -> (Fixture, tempfile::TempDir) {
+    let dir = common::harness_tempdir().expect("shell start-up file dir");
+    let file = dir.path().join("rc.sh");
+    fs::write(&file, rc).unwrap();
+    let file = file.to_str().unwrap().to_owned();
+    let mut env = ENV.to_vec();
+    env.extend([("SHELL", "/bin/bash"), ("BASH_ENV", file.as_str())]);
+    let f = Fixture::with_env(kind, &env);
+    f.hook_event("session_start");
+    f.hook_event("idle");
+    (f, dir)
+}
+
+/// Scenario: Start a Codex stand-in in a deck whose shell's start-up file exports another `VISUAL` (`/bin/true`), as a zsh user's `.zshenv` would, type and delete text in its box and queue mail. The deck must type nothing, not even its check's Ctrl+G, because the editor the agent's Ctrl+G opens isn't the deck's helper: the card and the attached TUI say `cannot_check`, the log names the `Keymap(Editor)` hold, and the mail waits.
+#[spec("inbox/probe/097")]
+#[test]
+fn probe_097_a_codex_whose_shell_sets_visual_is_held_without_a_check() {
+    let (f, _rc) = with_shell_rc("codex", "export VISUAL=/bin/true\n");
+    let tui = attached(&f);
+    touched_empty(&f);
+    let id = f.enqueue();
+    wait_hold(&f, "cannot_check");
+    let words: Value = serde_json::from_str(include_str!("fixtures/inbox-display.json")).unwrap();
+    let expected: String = words["wakeHolds"]["cannot_check"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .take(40)
+        .collect();
+    assert!(
+        common::wait_until(WAIT, || tui.snapshot_grid().contains(&expected)),
+        "{}",
+        tui.snapshot_grid()
+    );
+    assert!(
+        common::wait_until(WAIT, || f.log_text().contains("Keymap(Editor)")),
+        "the hold names the editor: {}",
+        f.log_text()
+    );
+    f.stable(b"x\x7f");
+    assert!(
+        !f.input().contains(&7),
+        "no check's Ctrl+G: {:?}",
+        f.input()
+    );
+    assert!(mail_turns(&f, &id).is_empty());
+}
+
+/// Scenario: The control for the test above: the same deck and Codex stand-in, the shell's start-up file exporting an unrelated variable instead. Typing and deleting text then queueing mail brings the deck's check, the box reads empty, and the notice is typed and handed over once.
+#[spec("inbox/probe/097")]
+#[test]
+fn probe_097_a_codex_whose_shell_leaves_visual_alone_is_checked_then_rung() {
+    let (f, _rc) = with_shell_rc("codex", "export DAD_UNRELATED=1\n");
+    touched_empty(&f);
+    let id = f.enqueue();
+    let line = delivered(&f, &id);
+    f.expect(format!("x\x7f\x07{line}\r").as_bytes());
+    assert!(!f.log_text().contains("Keymap(Editor)"), "{}", f.log_text());
+}
+
+/// Scenario: Start a Claude Code stand-in, whose pane command has arguments, in a deck whose shell's start-up file exports another `VISUAL` (`/bin/true`), type and delete text in its box and queue mail. The deck must type nothing, not even its check's Ctrl+G, because the editor Claude Code's Ctrl+G opens isn't the deck's helper: the card says `cannot_check`, the log names the `Keymap(Editor)` hold, and the mail waits.
+#[spec("inbox/probe/097")]
+#[test]
+fn probe_097_a_claude_whose_shell_sets_visual_is_held_without_a_check() {
+    let (f, _rc) = with_shell_rc("claude", "export VISUAL=/bin/true\n");
+    touched_empty(&f);
+    let id = f.enqueue();
+    wait_hold(&f, "cannot_check");
+    assert!(
+        common::wait_until(WAIT, || f.log_text().contains("Keymap(Editor)")),
+        "the hold names the editor: {}",
+        f.log_text()
+    );
+    f.stable(b"x\x7f");
+    assert!(
+        !f.input().contains(&7),
+        "no check's Ctrl+G: {:?}",
+        f.input()
+    );
+    assert!(mail_turns(&f, &id).is_empty());
+}
+
+/// Scenario: The Claude Code control: the same deck and stand-in with the start-up file exporting an unrelated variable. Typing and deleting text then queueing mail brings the deck's check, and the notice is typed and its mail fetched once.
+#[spec("inbox/probe/097")]
+#[test]
+fn probe_097_a_claude_whose_shell_leaves_visual_alone_is_checked_then_rung() {
+    let (f, _rc) = with_shell_rc("claude", "export DAD_UNRELATED=1\n");
+    touched_empty(&f);
+    let id = f.enqueue();
+    let line = delivered(&f, &id);
+    f.expect(format!("x\x7f\x07{line}\r").as_bytes());
+    assert!(!f.log_text().contains("Keymap(Editor)"), "{}", f.log_text());
+}
+
+/// Scenario: Start a Codex stand-in whose `CODEX_HOME` is a `codex` folder inside the pane's working directory, where Codex's sandbox may write, type and delete text in its box and queue mail. The deck must type nothing, not even its check's Ctrl+G, and run no helper: the card and the attached TUI say `cannot_check`, the log names the `Keymap(CodexHome)` hold, and the mail waits. (Every other live Codex here uses the working directory's own `.codex`, the control.)
+#[spec("inbox/probe/098")]
+#[test]
+fn probe_098_a_codex_home_inside_the_working_directory_is_held_without_a_check() {
+    let f = live::Fixture::with_codex_home("codex", ENV, "codex");
+    f.hook_event("session_start");
+    f.hook_event("idle");
+    let tui = attached(&f);
+    touched_empty(&f);
+    let id = f.enqueue();
+    wait_hold(&f, "cannot_check");
+    let words: Value = serde_json::from_str(include_str!("fixtures/inbox-display.json")).unwrap();
+    let expected: String = words["wakeHolds"]["cannot_check"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .take(40)
+        .collect();
+    assert!(
+        common::wait_until(WAIT, || tui.snapshot_grid().contains(&expected)),
+        "{}",
+        tui.snapshot_grid()
+    );
+    assert!(
+        common::wait_until(WAIT, || f.log_text().contains("Keymap(CodexHome)")),
+        "the hold names Codex's home: {}",
+        f.log_text()
+    );
+    f.stable(b"x\x7f");
+    assert!(
+        !f.input().contains(&7),
+        "no check's Ctrl+G: {:?}",
+        f.input()
+    );
+    assert!(!f.path("helper-exited-1").exists(), "no helper ran");
+    assert!(mail_turns(&f, &id).is_empty());
+}
+
+/// A stand-in of `kind` started with `files` written into its HOME (also its
+/// working directory) before the spawn, with its session started and idle.
+fn with_home_files(kind: &'static str, files: &[(&str, &str)]) -> Fixture {
+    let f = Fixture::with_home_files(kind, ENV, files);
+    f.hook_event("session_start");
+    f.hook_event("idle");
+    f
+}
+
+/// What the held tests below assert once mail is queued behind a touched and
+/// cleared box: `cannot_check` on the card (and, with `tui`, in an attached
+/// TUI), a `Keymap(Editor)` hold in the log, nothing typed (not even a
+/// check's Ctrl+G) and the mail still waiting. The Claude Code stand-in runs
+/// without a TUI, as `probe_097`'s does: the TUI's resize leaves its frame
+/// unreadable to admission (`Surface`), which would say `cannot_check`
+/// whatever the hold.
+fn held_for_the_editor(f: &Fixture, tui: bool) {
+    let tui = tui.then(|| attached(f));
+    touched_empty(f);
+    let id = f.enqueue();
+    wait_hold(f, "cannot_check");
+    if let Some(tui) = tui {
+        let words: Value =
+            serde_json::from_str(include_str!("fixtures/inbox-display.json")).unwrap();
+        let expected: String = words["wakeHolds"]["cannot_check"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .take(40)
+            .collect();
+        assert!(
+            common::wait_until(WAIT, || tui.snapshot_grid().contains(&expected)),
+            "{}",
+            tui.snapshot_grid()
+        );
+    }
+    assert!(
+        common::wait_until(WAIT, || f.log_text().contains("Keymap(Editor)")),
+        "the hold names the editor: {}",
+        f.log_text()
+    );
+    f.stable(b"x\x7f");
+    assert!(
+        !f.input().contains(&7),
+        "no check's Ctrl+G: {:?}",
+        f.input()
+    );
+    assert!(mail_turns(f, &id).is_empty());
+}
+
+/// Scenario: Start a Claude Code stand-in whose `~/.claude/settings.json` sets `VISUAL` in its `env` map, which Claude Code copies into its own environment as it starts, then type and delete text in its box and queue mail. The deck must type nothing, not even its check's Ctrl+G: the card says `cannot_check`, the log names the `Keymap(Editor)` hold, and the mail waits.
+#[spec("inbox/probe/099")]
+#[test]
+fn probe_099_a_claude_whose_settings_env_sets_visual_is_held_without_a_check() {
+    let f = with_home_files(
+        "claude",
+        &[(
+            ".claude/settings.json",
+            r#"{"env": {"VISUAL": "/bin/true"}}"#,
+        )],
+    );
+    held_for_the_editor(&f, false);
+}
+
+/// Scenario: The control for the test above: the same stand-in with a `~/.claude/settings.json` that has no `env` map, and a comment the deck reads past (Claude Code 2.1.318 itself refuses a commented file and skips it). Typing and deleting text then queueing mail brings the deck's check, and the notice is typed and its mail fetched once.
+#[spec("inbox/probe/099")]
+#[test]
+fn probe_099_a_claude_whose_settings_name_no_editor_is_checked_then_rung() {
+    let f = with_home_files(
+        "claude",
+        &[(
+            ".claude/settings.json",
+            "{\n  // a person's own note\n  \"permissions\": {\"allow\": []}\n}\n",
+        )],
+    );
+    touched_empty(&f);
+    let id = f.enqueue();
+    let line = delivered(&f, &id);
+    f.expect(format!("x\x7f\x07{line}\r").as_bytes());
+    assert!(!f.log_text().contains("Keymap(Editor)"), "{}", f.log_text());
+}
+
+/// Scenario: Start a Codex stand-in whose home's `.env` file sets `VISUAL`, which Codex loads into its own environment as it starts, then type and delete text in its box and queue mail. The deck must type nothing, not even its check's Ctrl+G: the card and the attached TUI say `cannot_check`, the log names the `Keymap(Editor)` hold, and the mail waits.
+#[spec("inbox/probe/100")]
+#[test]
+fn probe_100_a_codex_whose_home_env_file_sets_visual_is_held_without_a_check() {
+    let f = with_home_files("codex", &[(".codex/.env", "export VISUAL=/bin/true\n")]);
+    held_for_the_editor(&f, true);
+}
+
+/// Scenario: The control for the test above: the same Codex stand-in with a home `.env` file that sets only an unrelated variable. Typing and deleting text then queueing mail brings the deck's check, the box reads empty, and the notice is typed and handed over once.
+#[spec("inbox/probe/100")]
+#[test]
+fn probe_100_a_codex_whose_home_env_file_names_no_editor_is_checked_then_rung() {
+    let f = with_home_files("codex", &[(".codex/.env", "DAD_UNRELATED=1\n")]);
+    touched_empty(&f);
+    let id = f.enqueue();
+    let line = delivered(&f, &id);
+    f.expect(format!("x\x7f\x07{line}\r").as_bytes());
+    assert!(!f.log_text().contains("Keymap(Editor)"), "{}", f.log_text());
+}
+
 /// Scenario: In a deck whose Claude Code doorbell is turned off (`DOT_AGENT_DECK_DOORBELL_CLAUDE=0`), so the Claude composer gets no helper and no check, type and delete text in it and queue mail. The daemon and attached TUI must show the cannot-type hold, and further clearing must not authorize a check or a notice before a prompt fetches the message.
 #[spec("inbox/probe/037")]
 #[test]
@@ -690,11 +929,15 @@ fn probe_037_launcher_claude_holds_with_needs_fetch_until_a_prompt() {
     );
 }
 
-/// Scenario: Without an editor-probe or head-echo assumption, type and delete text in a measured Codex composer and queue mail. The daemon and attached TUI must retain the turn-end/prompt route's cannot-type explanation, with no check or notice; an actual user prompt can still fetch the message.
+/// Scenario: In a deck whose Codex doorbell is turned off (`DOT_AGENT_DECK_DOORBELL_CODEX=0`), so the Codex composer gets no helper and no check (since the Codex activation, that is what leaves a direct Codex unchecked), type and delete text in it and queue mail. The daemon and attached TUI must retain the turn-end/prompt route's cannot-type explanation, with no check or notice; an actual user prompt can still fetch the message.
 #[spec("inbox/probe/037")]
 #[test]
-fn probe_037_absent_codex_holds_with_its_prompt_route_reason() {
-    absent("codex", &[], "cannot_type");
+fn probe_037_turned_off_codex_holds_with_its_prompt_route_reason() {
+    absent(
+        "codex",
+        &[(dot_agent_deck::doorbell_switch::CODEX_ENV, "0")],
+        "cannot_type",
+    );
 }
 
 fn absent(kind: &'static str, extra: &[(&str, &str)], reason: &str) {

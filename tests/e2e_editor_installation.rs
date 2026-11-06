@@ -16,14 +16,16 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 const ASSUME: &str = "DOT_AGENT_DECK_E2E_ASSUME_EDITOR_PROBE";
-const ENTRIES: &str = "claude@2.1.310,codex@0.164.0";
+/// Claude Code's alone: Codex's classes are in the shipped rollout since the
+/// Codex activation, and the assumption refuses a list naming a Codex release.
+const ENTRIES: &str = "claude@2.1.310";
 
-/// Scenario: Start synthetic Codex, OpenCode, Pi and wrapper commands with installation disabled (a direct Claude is installed by the shipped rollout, so it is not among them), preserving unset, empty and nonempty editor values. Their startup reports must show the original environment and the original positional arguments, with no helper substituted.
+/// Scenario: Start synthetic OpenCode, Pi and wrapper commands with installation disabled (a direct Claude and a direct Codex are installed by the shipped rollout, so they are not among them), preserving unset, empty and nonempty editor values. Their startup reports must show the original environment and the original positional arguments, with no helper substituted.
 #[spec("inbox/probe/012")]
 #[test]
 fn probe_012_disabled_installation_preserves_spawn_environment_and_arguments() {
     let daemon = common::spawn_daemon_serve_with_env(None, "0", &[]);
-    for kind in ["codex", "opencode", "pi", "wrapper"] {
+    for kind in ["opencode", "pi", "wrapper"] {
         for (state, original) in [
             ("unset", None),
             ("empty", Some("")),
@@ -54,7 +56,7 @@ fn probe_012_disabled_installation_preserves_spawn_environment_and_arguments() {
     }
 }
 
-/// Scenario: Start the real daemon with installation disabled, a runtime directory of its own, and stale helper variables in its own environment, then start synthetic Codex, OpenCode, Pi, wrapper, launcher and shell commands (not a direct Claude, which the shipped rollout installs). No instance directory appears under the state or runtime directory at startup or after the spawns, no command inherits a variable under the helper's reserved prefix, and each keeps its own editor values and argv.
+/// Scenario: Start the real daemon with installation disabled, a runtime directory of its own, and stale helper variables in its own environment, then start synthetic OpenCode, Pi, wrapper, Claude launcher and shell commands (not a direct Claude or a direct Codex, which the shipped rollout installs). No instance directory appears under the state or runtime directory at startup or after the spawns, no command inherits a variable under the helper's reserved prefix, and each keeps its own editor values and argv.
 #[spec("inbox/probe/012")]
 #[test]
 fn probe_012_a_disabled_spawn_makes_no_files_and_inherits_no_helper_variable() {
@@ -80,7 +82,7 @@ fn probe_012_a_disabled_spawn_makes_no_files_and_inherits_no_helper_variable() {
     };
     no_instance("startup");
     let original = Some("user-editor --literal");
-    for kind in ["codex", "opencode", "pi", "wrapper", "launcher", "shell"] {
+    for kind in ["opencode", "pi", "wrapper", "launcher", "shell"] {
         let spawned = spawn(&daemon, kind, kind, "2.1.310", original, None, false);
         for name in ["VISUAL", "EDITOR"] {
             assert_eq!(
@@ -112,7 +114,7 @@ fn probe_012_a_disabled_spawn_makes_no_files_and_inherits_no_helper_variable() {
     no_instance("after the spawns");
 }
 
-/// Scenario: Enable installation for exact Claude and Codex releases, then start direct stand-ins whose headers report measured or unmeasured releases, plus declared and undeclared wrappers. Each command receives a private helper before producing its header, including the unmeasured release; the user's original editor state does not decide installation.
+/// Scenario: Enable installation for an exact Claude release (Codex is installed by the shipped rollout), then start direct stand-ins whose headers report measured or unmeasured releases, plus declared and undeclared wrappers. Each command receives a private helper before producing its header, including the unmeasured release; the user's original editor state does not decide installation.
 #[spec("inbox/probe/033")]
 #[test]
 fn probe_033_installation_precedes_the_header_for_direct_and_wrapper_commands() {
@@ -172,7 +174,7 @@ fn probe_033_installation_precedes_the_header_for_direct_and_wrapper_commands() 
     }
 }
 
-/// Scenario: Enable installation for Codex 0.164.0 and start a direct Codex stand-in whose editor value holds shell syntax, which sends the installed command through the wrapper's shell, where the wrapper adds no argument of its own. The argv it receives still opens with the deck's embedded-mode pair, once, then its own arguments, then the editor settings carrying the value literally.
+/// Scenario: Start a direct Codex stand-in, which the shipped rollout installs, whose editor value holds shell syntax, which sends the installed command through the wrapper's shell, where the wrapper adds no argument of its own. The argv it receives still opens with the deck's embedded-mode pair, once, then its own arguments, then the editor settings carrying the value literally.
 #[spec("inbox/probe/033")]
 #[test]
 fn probe_033_an_installed_codex_with_shell_syntax_in_its_editor_is_still_embedded() {
@@ -202,7 +204,7 @@ fn probe_033_an_installed_codex_with_shell_syntax_in_its_editor_is_still_embedde
     );
 }
 
-/// Scenario: Enable installation for Codex 0.164.0 and start a direct Codex stand-in with unset, exported-empty and nonempty editor settings. The argv it receives opens with the deck's embedded-mode pair, then carries its own arguments, then the installation's editor settings for the set values, so the empty table comes before the settings it would otherwise replace.
+/// Scenario: Start a direct Codex stand-in, which the shipped rollout installs, with unset, exported-empty and nonempty editor settings. The argv it receives opens with the deck's embedded-mode pair, then carries its own arguments, then the installation's editor settings for the set values, so the empty table comes before the settings it would otherwise replace.
 #[spec("inbox/probe/033")]
 #[test]
 fn probe_033_an_installed_codex_is_embedded_and_keeps_its_editor_settings() {

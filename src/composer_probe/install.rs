@@ -6,9 +6,11 @@
 //! class ([`pane_class`]) and the rollout, never a release: no basename,
 //! `PATH` lookup or version subprocess stands in for one, and the release a
 //! generation's header later reports decides only whether the deck may arm
-//! it ([`super::permission`]). The rollout is [`INSTALL_ROLLOUT`] (since
-//! the Claude activation, `Direct(Claude)`), plus, in the `e2e` build only, the classes of the agents
-//! the e2e assumption names ([`assumed_classes`]). That assumption is read
+//! it ([`super::permission`]). The rollout is [`INSTALL_ROLLOUT`]
+//! (`Direct(Claude)` since the Claude activation; `Direct(Codex)` and
+//! `Launcher(Codex)` since the Codex activation), plus, in the `e2e` build
+//! only, the classes of the agents the e2e assumption names
+//! ([`assumed_classes`], Claude Code's alone). That assumption is read
 //! once, at daemon start ([`capture_assumption`]), where an unknown entry
 //! refuses the whole list and the daemon goes on with no assumption, so no
 //! generation is installed or armed by it; nothing reads the variable again.
@@ -114,14 +116,23 @@ pub enum PaneClass {
 pub const SHELLS: &[&str] = &["bash", "zsh", "fish", "sh", "dash", "nu", "pwsh"];
 
 /// The classes installation has rolled out to. The Claude activation
-/// (Q35-28) added `Direct(Claude)` only. Q35-22 gave every other class its
-/// binding (the shared discovery, [`super::discovery`]) without rolling it
-/// out: `Launcher(Claude)` and `Wrapper` wait for their own rollout, and
-/// Codex's classes for Q35-29
-/// (`docs/develop/doorbell-admission.md`). Installation is Linux-only
-/// whatever this holds: [`at_spawn`] returns [`NotInstalled::Platform`]
-/// on any other host.
-pub const INSTALL_ROLLOUT: &[PaneClass] = &[PaneClass::Direct(ProbeAgent::Claude)];
+/// (Q35-28) added `Direct(Claude)` only; the Codex activation (Q35-29) added
+/// `Direct(Codex)` and `Launcher(Codex)`. Q35-22 gave every class its
+/// binding (the shared discovery, [`super::discovery`]); `Launcher(Claude)`
+/// and `Wrapper` wait for their own rollout
+/// (`docs/develop/doorbell-admission.md`). A launched Codex gets the helper
+/// and the export directory's preparation ([`prepare_codex_export`]) but not
+/// the shell tool's policy arguments, which only a direct Codex's own argv
+/// can take, and its
+/// key-binding baseline is read from the launcher's arguments: where the
+/// native's launch differs, the generation is held, never checked.
+/// Installation is Linux-only whatever this holds: [`at_spawn`] returns
+/// [`NotInstalled::Platform`] on any other host.
+pub const INSTALL_ROLLOUT: &[PaneClass] = &[
+    PaneClass::Direct(ProbeAgent::Claude),
+    PaneClass::Direct(ProbeAgent::Codex),
+    PaneClass::Launcher(ProbeAgent::Codex),
+];
 
 /// The class of a pane running `command`, its agent declared as `declared`.
 pub fn pane_class(command: Option<&str>, declared: Option<&AgentType>) -> PaneClass {
@@ -167,8 +178,10 @@ fn plain_argv(command: &str) -> bool {
         && !command.contains("$(")
 }
 
-/// The classes the e2e assumption's agents roll out to: those Q35-28 adds
-/// for Claude and Q35-29 for Codex.
+/// The classes the e2e assumption's agents roll out to: Claude Code's
+/// launcher and wrapper classes, which no activation has rolled out yet.
+/// Codex's are in [`INSTALL_ROLLOUT`] since the Codex activation, so the
+/// assumption names no Codex release and adds none.
 pub fn assumed_classes(assumed: &[(AgentType, Version, EditorProbe<'_>)]) -> Vec<PaneClass> {
     let mut classes = Vec::new();
     for (agent, _, _) in assumed {
@@ -178,11 +191,7 @@ pub fn assumed_classes(assumed: &[(AgentType, Version, EditorProbe<'_>)]) -> Vec
                 PaneClass::Launcher(ProbeAgent::Claude),
                 PaneClass::Wrapper,
             ],
-            Some(ProbeAgent::Codex) => &[
-                PaneClass::Direct(ProbeAgent::Codex),
-                PaneClass::Launcher(ProbeAgent::Codex),
-            ],
-            None => &[],
+            Some(ProbeAgent::Codex) | None => &[],
         };
         for class in more {
             if !classes.contains(class) {
@@ -737,8 +746,15 @@ pub fn install(
 /// nothing is created. `Some` is a refusal of `editor` itself, as the card
 /// shows it, and the generation is held.
 ///
-/// Only a direct Codex: a launcher may give Codex another home, which the
-/// deck can't see before the spawn.
+/// A direct or a launched Codex (the revcxact review's MEDIUM-1). A launcher
+/// may give Codex another home, which the deck can't see before the spawn,
+/// but such a generation is never checked: its settlement compares the
+/// key-binding sources under the home the bound native's own environment
+/// names with the spawn's (`KeymapBaseline::codex_bound`), so another home
+/// holds `Keymap(Changed)`. What this prepares is then either the directory
+/// the checked Codex uses or an empty 0700 one nothing reads; without it, a
+/// launched Codex's first check made Codex create `editor` itself, 0775
+/// under a umask of 0002, which the path rule refuses.
 #[cfg(target_os = "linux")]
 pub fn prepare_codex_export(
     lookup: impl Fn(&str) -> Option<OsString>,
@@ -940,7 +956,10 @@ pub fn at_spawn(
         let setup = || {
             let originals = Originals::resolve(env, |name| std::env::var_os(name))?;
             let mut installation = install(daemon_instance()?, class, generation, &originals)?;
-            if class == PaneClass::Direct(ProbeAgent::Codex) {
+            if matches!(
+                class,
+                PaneClass::Direct(ProbeAgent::Codex) | PaneClass::Launcher(ProbeAgent::Codex)
+            ) {
                 installation.export_hold = prepare_codex_export(|name| {
                     env.iter()
                         .rev()

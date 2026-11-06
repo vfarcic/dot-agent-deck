@@ -2027,3 +2027,957 @@ fn probe_014_a_shim_shaped_otel_override_with_another_key_after_it_holds() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Scenario: Build the environments a bound Codex can have been started with and ask whether the editor its Ctrl+G opens, chosen as Codex chooses it, is exactly the deck's helper (the revcxact review's HIGH-1). The helper in `VISUAL`, or in `EDITOR` with `VISUAL` unset, and a quoted helper are accepted; another editor in `VISUAL` (a shell start-up file's or a launcher's), an empty `VISUAL` over the helper in `EDITOR`, an empty `EDITOR`, neither, the helper with arguments, a path spelled differently and an unsplittable value are held, and a name listed twice with different values is unmeasured.
+#[cfg(target_os = "linux")]
+#[spec("inbox/probe/097")]
+#[test]
+fn probe_097_a_codex_whose_editor_is_not_the_helper_is_held() {
+    use dot_agent_deck::composer_probe::keymap::{codex_editor_is_helper, environ_lookup};
+    let helper = Path::new("/var/tmp/dad-instance/dot-agent-deck-editor");
+    let spaced = Path::new("/var/tmp/dad instance/dot-agent-deck-editor");
+    let h = helper.to_str().unwrap();
+    let check = |pairs: &[(&str, &str)], helper: &Path| {
+        let environ: Vec<(OsString, OsString)> = pairs
+            .iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+            .collect();
+        let env = environ_lookup(&environ)?;
+        codex_editor_is_helper(env, helper)
+    };
+    let quoted_single = format!("'{h}'");
+    let quoted_double = format!("\"{h}\"");
+    let with_args = format!("{h} --wait");
+    let doubled_slash = h.replace("/dot-agent-deck-editor", "//dot-agent-deck-editor");
+    let unterminated = format!("'{h}");
+    let commented = format!("#{h}");
+    let spaced_quoted = format!("'{}'", spaced.display());
+    let spaced_bare = spaced.display().to_string();
+
+    let mut wrong = Vec::new();
+    for (row, pairs, path, want) in [
+        (
+            "the helper in both",
+            vec![("VISUAL", h), ("EDITOR", h)],
+            helper,
+            Ok(()),
+        ),
+        (
+            "the helper in VISUAL alone",
+            vec![("VISUAL", h)],
+            helper,
+            Ok(()),
+        ),
+        (
+            "VISUAL unset, the helper in EDITOR",
+            vec![("EDITOR", h)],
+            helper,
+            Ok(()),
+        ),
+        (
+            "VISUAL unset, another EDITOR",
+            vec![("EDITOR", "vi")],
+            helper,
+            Err(Hold::Editor),
+        ),
+        (
+            "single-quoted helper",
+            vec![("VISUAL", quoted_single.as_str())],
+            helper,
+            Ok(()),
+        ),
+        (
+            "double-quoted helper",
+            vec![("VISUAL", quoted_double.as_str())],
+            helper,
+            Ok(()),
+        ),
+        (
+            "a path with a blank, quoted",
+            vec![("VISUAL", spaced_quoted.as_str())],
+            spaced,
+            Ok(()),
+        ),
+        (
+            "a path with a blank, bare: two words",
+            vec![("VISUAL", spaced_bare.as_str())],
+            spaced,
+            Err(Hold::Editor),
+        ),
+        (
+            "another editor in VISUAL over the helper in EDITOR",
+            vec![("VISUAL", "nvim"), ("EDITOR", h)],
+            helper,
+            Err(Hold::Editor),
+        ),
+        (
+            "a GUI editor in VISUAL",
+            vec![("VISUAL", "code --wait"), ("EDITOR", h)],
+            helper,
+            Err(Hold::Editor),
+        ),
+        (
+            "an empty VISUAL over the helper in EDITOR",
+            vec![("VISUAL", ""), ("EDITOR", h)],
+            helper,
+            Err(Hold::Editor),
+        ),
+        (
+            "an empty EDITOR, VISUAL unset",
+            vec![("EDITOR", "")],
+            helper,
+            Err(Hold::Editor),
+        ),
+        (
+            "neither set",
+            vec![("HOME", "/home/u")],
+            helper,
+            Err(Hold::Editor),
+        ),
+        (
+            "the helper with arguments",
+            vec![("VISUAL", with_args.as_str())],
+            helper,
+            Err(Hold::Editor),
+        ),
+        (
+            "the helper spelled with a doubled slash",
+            vec![("VISUAL", doubled_slash.as_str())],
+            helper,
+            Err(Hold::Editor),
+        ),
+        (
+            "an unterminated quote",
+            vec![("VISUAL", unterminated.as_str())],
+            helper,
+            Err(Hold::Editor),
+        ),
+        (
+            "a comment only",
+            vec![("VISUAL", commented.as_str())],
+            helper,
+            Err(Hold::Editor),
+        ),
+        (
+            "VISUAL twice, the second another editor",
+            vec![("VISUAL", h), ("VISUAL", "nvim")],
+            helper,
+            Err(Hold::Unmeasured),
+        ),
+        (
+            "EDITOR twice with one value",
+            vec![("EDITOR", h), ("EDITOR", h)],
+            helper,
+            Ok(()),
+        ),
+    ] {
+        let got = check(&pairs, path);
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Scenario: Build the environments a bound Claude Code can have been started with and ask whether the editor its Ctrl+G opens, chosen as Claude Code chooses it, is exactly the deck's helper (the revcxact review's HIGH-1, Claude half). The helper in `VISUAL`, in `EDITOR` under an unset or empty `VISUAL`, or with a trailing blank is accepted; another `VISUAL`, a quoted helper (Claude Code splits on spaces and keeps quotes), the helper with arguments, and neither set (Claude Code then falls back to an editor on `PATH`) are held.
+#[cfg(target_os = "linux")]
+#[spec("inbox/probe/097")]
+#[test]
+fn probe_097_a_claude_whose_editor_is_not_the_helper_is_held() {
+    use dot_agent_deck::composer_probe::keymap::{editor_is_helper, environ_lookup};
+    let helper = Path::new("/var/tmp/dad-instance/dot-agent-deck-editor");
+    let h = helper.to_str().unwrap();
+    let trailing = format!("{h} ");
+    let quoted = format!("'{h}'");
+    let with_args = format!("{h} -w");
+    let mut wrong = Vec::new();
+    for (row, pairs, want) in [
+        (
+            "the helper in both",
+            vec![("VISUAL", h), ("EDITOR", h)],
+            Ok(()),
+        ),
+        (
+            "VISUAL unset, the helper in EDITOR",
+            vec![("EDITOR", h)],
+            Ok(()),
+        ),
+        (
+            "an empty VISUAL falls through to EDITOR",
+            vec![("VISUAL", ""), ("EDITOR", h)],
+            Ok(()),
+        ),
+        (
+            "a trailing blank",
+            vec![("VISUAL", trailing.as_str())],
+            Ok(()),
+        ),
+        (
+            "another VISUAL",
+            vec![("VISUAL", "nvim"), ("EDITOR", h)],
+            Err(Hold::Editor),
+        ),
+        (
+            "a quoted helper",
+            vec![("VISUAL", quoted.as_str())],
+            Err(Hold::Editor),
+        ),
+        (
+            "the helper with arguments",
+            vec![("VISUAL", with_args.as_str())],
+            Err(Hold::Editor),
+        ),
+        (
+            "neither set: an editor on PATH",
+            vec![("HOME", "/home/u")],
+            Err(Hold::Editor),
+        ),
+        (
+            "both empty",
+            vec![("VISUAL", ""), ("EDITOR", "")],
+            Err(Hold::Editor),
+        ),
+    ] {
+        let environ: Vec<(OsString, OsString)> = pairs
+            .iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+            .collect();
+        let got = editor_is_helper(
+            EditorSelection::ClaudeCode,
+            environ_lookup(&environ).unwrap(),
+            helper,
+        );
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Scenario: Lay out Codex homes, working folders and temporary directories on disk and ask whether such a Codex can be checked at all (the user's ruling Q227b). A home outside the working folder, the working folder's own `.codex`, and a home reached through a symlink that lands outside are checkable; a home inside the working folder (or the folder itself), one whose symlink lands inside it, one under `$TMPDIR` or `/tmp`, and anything that can't be resolved (a missing home, an empty, relative or missing `TMPDIR`) are held `CodexHome`.
+#[spec("inbox/probe/098")]
+#[test]
+fn probe_098_a_codex_home_inside_a_folder_codex_may_write_is_held() {
+    use dot_agent_deck::composer_probe::keymap::codex_home_checkable;
+    use std::ffi::OsStr;
+    // Under the private base in `/var/tmp`, never `/tmp` (the revcxfix
+    // review's NIT-1): a base under `/tmp` is held by the `/tmp` rule
+    // whatever the row, which would make the passing rows fail, and skipping
+    // instead passed vacuously. `test_temp` names it `dad-unit-*`, which
+    // `cargo xtask clean-e2e-tmp` reaps after a SIGKILL (the revcxfix2
+    // review's NIT-3); where it falls back to the OS temp dir, the assert
+    // below fails the test rather than skipping.
+    let dir = test_temp::tempdir().expect("a temporary directory");
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    assert!(
+        !root.starts_with("/tmp"),
+        "the test's directory resolves under /tmp here ({}): this test can't run",
+        root.display()
+    );
+    let mk = |p: &Path| {
+        std::fs::create_dir_all(p).unwrap();
+        p.to_path_buf()
+    };
+    let project = mk(&root.join("project"));
+    let outside = mk(&root.join("home/.codex"));
+    let own = mk(&project.join(".codex"));
+    let nested = mk(&project.join("sub/.codex"));
+    let elsewhere = mk(&root.join("elsewhere"));
+    let tmp = mk(&root.join("tmp"));
+    let in_tmpdir = mk(&tmp.join("codex"));
+    let linked_out = root.join("link-out");
+    std::os::unix::fs::symlink(&elsewhere, &linked_out).unwrap();
+    let linked_in = root.join("link-in");
+    std::os::unix::fs::symlink(&nested, &linked_in).unwrap();
+    let project_link = root.join("project-link");
+    std::os::unix::fs::symlink(&project, &project_link).unwrap();
+    let in_slash_tmp = tempfile::Builder::new()
+        .prefix("dad-unit-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let missing = root.join("missing");
+
+    let held = Err(Hold::CodexHome);
+    let mut wrong = Vec::new();
+    for (row, home, cwd, tmpdir, want) in [
+        (
+            "a home outside the project",
+            &outside,
+            &project,
+            None,
+            Ok(()),
+        ),
+        ("the project's own .codex", &own, &project, None, Ok(())),
+        (
+            "a symlinked home landing outside",
+            &linked_out,
+            &project,
+            None,
+            Ok(()),
+        ),
+        (
+            "a home outside, TMPDIR elsewhere",
+            &outside,
+            &project,
+            Some(tmp.as_os_str()),
+            Ok(()),
+        ),
+        ("a .codex below the project", &nested, &project, None, held),
+        ("the project itself", &project, &project, None, held),
+        (
+            "a symlinked home landing inside",
+            &linked_in,
+            &project,
+            None,
+            held,
+        ),
+        (
+            "the project through a symlinked cwd",
+            &nested,
+            &project_link,
+            None,
+            held,
+        ),
+        (
+            "a home under TMPDIR",
+            &in_tmpdir,
+            &project,
+            Some(tmp.as_os_str()),
+            held,
+        ),
+        ("a missing home", &missing, &project, None, held),
+        (
+            "an empty TMPDIR",
+            &outside,
+            &project,
+            Some(OsStr::new("")),
+            held,
+        ),
+        (
+            "a relative TMPDIR",
+            &outside,
+            &project,
+            Some(OsStr::new("tmp")),
+            held,
+        ),
+        (
+            "a missing TMPDIR",
+            &outside,
+            &project,
+            Some(missing.as_os_str()),
+            held,
+        ),
+    ] {
+        let got = codex_home_checkable(home, cwd, tmpdir);
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
+    }
+    let got = codex_home_checkable(in_slash_tmp.path(), &project, None);
+    if got != held {
+        wrong.push(format!("a home under /tmp: {got:?}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Scenario: Parse Claude Code settings and config documents for their `env` map and judge them as the deck does before it checks a Claude Code's box (the revcxfix review's MEDIUM-A). An `env` naming `VISUAL` or `EDITOR` in any case, a document that isn't JSON or isn't an object, an `env` named twice and an `env` that isn't an object hold `Editor`, also after a leading byte-order mark; no `env`, an `env` with only other names, a `VISUAL` only in a comment or in another member's value, a document with comments, and an empty, whitespace-only or comment-only file pass.
+#[spec("inbox/probe/099")]
+#[test]
+fn probe_099_claude_settings_env_naming_the_editor_holds() {
+    use dot_agent_deck::composer_probe::keymap::{claude_env_guard, claude_env_member};
+    let editor = Err(Hold::Editor);
+    let mut wrong = Vec::new();
+    for (row, document, want) in [
+        ("VISUAL in env", r#"{"env": {"VISUAL": "nvim"}}"#, editor),
+        ("EDITOR in env", r#"{"env": {"EDITOR": "vim"}}"#, editor),
+        ("lower case", r#"{"env": {"visual": "nvim"}}"#, editor),
+        ("mixed case", r#"{"env": {"Editor": "vim"}}"#, editor),
+        (
+            "beside other names",
+            r#"{"model": "x", "env": {"A": "1", "VISUAL": ""}}"#,
+            editor,
+        ),
+        (
+            "env after a comment",
+            "{\n // note\n \"env\": {/* x */ \"VISUAL\": \"nvim\"}\n}",
+            editor,
+        ),
+        ("not JSON", "{\"env\": {\"VISUAL\": ", editor),
+        ("empty file", "", Ok(())),
+        ("whitespace only", " \n\t\r\n", Ok(())),
+        ("a line comment only", "// nothing set\n", Ok(())),
+        ("block comments only", "/* a */\n/* b\n */", Ok(())),
+        (
+            "a byte-order mark and no env",
+            "\u{feff}{\"model\": \"x\"}",
+            Ok(()),
+        ),
+        (
+            "a byte-order mark before VISUAL",
+            "\u{feff}{\"env\": {\"VISUAL\": \"nvim\"}}",
+            editor,
+        ),
+        ("a byte-order mark alone", "\u{feff}", Ok(())),
+        ("two byte-order marks", "\u{feff}\u{feff}{}", editor),
+        ("an array", r#"[{"env": {}}]"#, editor),
+        (
+            "env named twice",
+            r#"{"env": {"A": "1"}, "env": {"B": "2"}}"#,
+            editor,
+        ),
+        ("env not an object", r#"{"env": "VISUAL=nvim"}"#, editor),
+        ("no env", r#"{"permissions": {"allow": []}}"#, Ok(())),
+        ("an empty object", "{}", Ok(())),
+        (
+            "other names only",
+            r#"{"env": {"DAD_UNRELATED": "1", "MY_EDITOR": "x"}}"#,
+            Ok(()),
+        ),
+        (
+            "VISUAL only in a comment",
+            "{\n  // \"env\": {\"VISUAL\": \"nvim\"}\n  \"model\": \"x\"\n}",
+            Ok(()),
+        ),
+        (
+            "VISUAL only in another member's value",
+            r#"{"statusLine": {"command": "echo $VISUAL"}, "editorMode": "vim"}"#,
+            Ok(()),
+        ),
+        (
+            "a comment marker inside a string",
+            r#"{"model": "a//b/*c", "env": {"A": "1"}}"#,
+            Ok(()),
+        ),
+    ] {
+        let read = vec![(
+            PathBuf::from("settings.json"),
+            claude_env_member(document.as_bytes()),
+        )];
+        let got = claude_env_guard(&read);
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Scenario: Judge Claude Code settings documents that a JSONC parser building its objects by assignment could read differently from the deck (the revcxfix2 review's MEDIUM-1): a `__proto__` member at any depth, `VISUAL` or `EDITOR` as a member name anywhere in the document, and a line comment ended by a lone carriage return each hold `Editor`; a document with CRLF line endings and comments, and `VISUAL` only inside a string value, pass.
+#[spec("inbox/probe/099")]
+#[test]
+fn probe_099_claude_settings_a_parser_could_read_differently_hold() {
+    use dot_agent_deck::composer_probe::keymap::{claude_env_guard, claude_env_member};
+    let editor = Err(Hold::Editor);
+    let mut wrong = Vec::new();
+    for (row, document, want) in [
+        (
+            "env behind a top-level __proto__",
+            r#"{"__proto__": {"env": {"VISUAL": "vim"}}}"#,
+            editor,
+        ),
+        (
+            "__proto__ spelled with an escape",
+            r#"{"__proto__": {"env": {"VISUAL": "vim"}}}"#,
+            editor,
+        ),
+        (
+            "VISUAL behind __proto__ inside env",
+            r#"{"env": {"__proto__": {"VISUAL": "vim"}}}"#,
+            editor,
+        ),
+        (
+            "an empty __proto__ deep down",
+            r#"{"permissions": {"allow": [{"__proto__": {}}]}}"#,
+            editor,
+        ),
+        (
+            "VISUAL as a member name outside env",
+            r#"{"permissions": {"VISUAL": "vim"}}"#,
+            editor,
+        ),
+        (
+            "editor as a member name in an array's object",
+            r#"{"hooks": [{"x": {"editor": "vim"}}]}"#,
+            editor,
+        ),
+        (
+            "a line comment ended by a lone CR",
+            "{\"a\": 1 // c\r,\"env\": {\"VISUAL\": \"vim\"}\n}",
+            editor,
+        ),
+        (
+            "a lone CR then a block comment only a CR-ending parser opens",
+            "{\"a\": 1 // x\r/*\n,\"env\": {\"VISUAL\": \"vim\"} // */\n}",
+            editor,
+        ),
+        (
+            "CRLF line endings and comments",
+            "{\r\n  // note\r\n  \"model\": \"x\", /* y */\r\n  \"env\": {\"A\": \"1\"}\r\n}\r\n",
+            Ok(()),
+        ),
+        (
+            "VISUAL and __proto__ only in string values",
+            r#"{"statusLine": {"command": "echo $VISUAL __proto__"}, "x": ["EDITOR"]}"#,
+            Ok(()),
+        ),
+    ] {
+        let read = vec![(
+            PathBuf::from("settings.json"),
+            claude_env_member(document.as_bytes()),
+        )];
+        let got = claude_env_guard(&read);
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Scenario: Judge Claude Code settings documents whose `env` moves where Claude Code reads its configuration (the revcxfix2 review's LOW-1): `CLAUDE_CONFIG_DIR` (which, set there, moved where the pinned 2.1.318 read `keybindings.json` from, measured in a sandbox) and `HOME`, in any case, hold `Unmeasured`; names that only contain them, and a value naming a home folder, pass.
+#[spec("inbox/probe/099")]
+#[test]
+fn probe_099_claude_settings_env_moving_its_config_holds() {
+    use dot_agent_deck::composer_probe::keymap::{claude_env_guard, claude_env_member};
+    let moved = Err(Hold::Unmeasured);
+    let mut wrong = Vec::new();
+    for (row, document, want) in [
+        (
+            "CLAUDE_CONFIG_DIR",
+            r#"{"env": {"CLAUDE_CONFIG_DIR": "/x"}}"#,
+            moved,
+        ),
+        ("HOME", r#"{"env": {"A": "1", "HOME": "/x"}}"#, moved),
+        (
+            "lower case",
+            r#"{"env": {"claude_config_dir": "/x"}}"#,
+            moved,
+        ),
+        (
+            "names containing them",
+            r#"{"env": {"MY_HOME": "1", "HOMEDIR": "2", "CLAUDE_CONFIG_DIRS": "3"}}"#,
+            Ok(()),
+        ),
+        (
+            "a home folder as a value",
+            r#"{"env": {"A": "/home/u/HOME"}}"#,
+            Ok(()),
+        ),
+        (
+            "outside env",
+            r#"{"model": "x", "HOME": "/x", "CLAUDE_CONFIG_DIR": "/y"}"#,
+            Ok(()),
+        ),
+    ] {
+        let read = vec![(
+            PathBuf::from("settings.json"),
+            claude_env_member(document.as_bytes()),
+        )];
+        let got = claude_env_guard(&read);
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A Claude Code HOME and working directory, each under the private test
+/// base, for [`claude_env_sources`].
+struct ClaudeHome {
+    _dir: tempfile::TempDir,
+    home: PathBuf,
+    cwd: PathBuf,
+}
+
+impl ClaudeHome {
+    fn new() -> ClaudeHome {
+        let dir = test_temp::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let home = root.join("home");
+        let cwd = root.join("repo/sub");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+        std::fs::create_dir_all(root.join("repo/.git")).unwrap();
+        ClaudeHome {
+            _dir: dir,
+            home,
+            cwd,
+        }
+    }
+
+    fn env(&self) -> impl Fn(&str) -> Option<OsString> + '_ {
+        move |name| (name == "HOME").then(|| self.home.clone().into_os_string())
+    }
+
+    fn sources(&self) -> Vec<dot_agent_deck::composer_probe::keymap::ClaudeEnvSource> {
+        dot_agent_deck::composer_probe::keymap::claude_env_sources(self.env(), &self.cwd).unwrap()
+    }
+
+    fn judge(&self) -> Result<(), Hold> {
+        use dot_agent_deck::composer_probe::keymap::{claude_env_guard, read_claude_env};
+        claude_env_guard(&read_claude_env(&self.sources()))
+    }
+}
+
+/// Scenario: Lay out a Claude Code HOME and a working directory inside a git repository on disk, and put `{"env": {"VISUAL": …}}` in each file Claude Code copies an `env` map from, one at a time: the user's `settings.json` and `cowork_settings.json`, the cached server-managed `remote-settings.json`, `~/.claude.json` and its other-endpoint names, the legacy `~/.claude/.config.json`, the working directory's `.claude/settings.json` and `.claude/settings.local.json`, and the repository root's `.claude/settings.local.json`. Each holds `Editor`, and so do a file that can't be read, a directory where a file belongs, a file past the size bound and a symlink to a file naming `VISUAL`; with every file absent, or present with no `env` (server-managed settings as Claude Code caches them included), a dangling symlink included, the box can be checked.
+#[spec("inbox/probe/099")]
+#[test]
+fn probe_099_each_file_claude_takes_an_env_from_is_read() {
+    use dot_agent_deck::composer_probe::keymap::CLAUDE_ENV_BYTES;
+    use std::os::unix::fs::PermissionsExt;
+    let visual = r#"{"env": {"VISUAL": "/bin/true"}}"#;
+    let claude = ClaudeHome::new();
+    assert_eq!(claude.judge(), Ok(()), "every file absent");
+    let repo = claude.cwd.parent().unwrap().to_path_buf();
+    let mut wrong = Vec::new();
+    for path in [
+        claude.home.join(".claude/settings.json"),
+        claude.home.join(".claude/cowork_settings.json"),
+        claude.home.join(".claude/.config.json"),
+        claude.home.join(".claude/remote-settings.json"),
+        claude.home.join(".claude.json"),
+        claude.home.join(".claude-custom-oauth.json"),
+        claude.home.join(".claude-staging-oauth.json"),
+        claude.home.join(".claude-local-oauth.json"),
+        claude.cwd.join(".claude/settings.json"),
+        claude.cwd.join(".claude/settings.local.json"),
+        repo.join(".claude/settings.local.json"),
+    ] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write(&path, visual);
+        if claude.judge() != Err(Hold::Editor) {
+            wrong.push(format!("VISUAL in {} passed", path.display()));
+        }
+        write(&path, r#"{"env": {"DAD_UNRELATED": "1"}, "model": "x"}"#);
+        if claude.judge() != Ok(()) {
+            wrong.push(format!("no editor in {} held", path.display()));
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+    let settings = claude.home.join(".claude/settings.json");
+    let mut held = |row: &str, judge: Result<(), Hold>| {
+        if judge != Err(Hold::Editor) {
+            wrong.push(format!("{row}: {judge:?}"));
+        }
+    };
+    write(&settings, "{}");
+    std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&settings).is_err() {
+        held("an unreadable file", claude.judge());
+    }
+    std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::remove_file(&settings).unwrap();
+    std::fs::create_dir(&settings).unwrap();
+    held("a directory", claude.judge());
+    std::fs::remove_dir(&settings).unwrap();
+    std::fs::File::create(&settings)
+        .unwrap()
+        .set_len(CLAUDE_ENV_BYTES + 1)
+        .unwrap();
+    held("past the size bound", claude.judge());
+    std::fs::remove_file(&settings).unwrap();
+    let target = claude.home.join("elsewhere.json");
+    write(&target, visual);
+    std::os::unix::fs::symlink(&target, &settings).unwrap();
+    held("a symlink to a file naming VISUAL", claude.judge());
+    std::fs::remove_file(&target).unwrap();
+    let dangling = claude.judge();
+    std::fs::remove_file(&settings).unwrap();
+    // The server-managed settings as Claude Code 2.1.319 caches them, for an
+    // account whose organisation sends settings: a plain settings document,
+    // rewritten at each start. It is read like the others, not held.
+    let remote = claude.home.join(".claude/remote-settings.json");
+    write(
+        &remote,
+        r#"{"availableModels": ["a", "b"], "channelsEnabled": false, "enforceAvailableModels": false, "model": "a"}"#,
+    );
+    let server_managed = claude.judge();
+    std::fs::remove_file(&remote).unwrap();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    assert_eq!(
+        server_managed,
+        Ok(()),
+        "server-managed settings with no env"
+    );
+    assert_eq!(dangling, Ok(()), "a dangling symlink reads as absent");
+    assert_eq!(claude.judge(), Ok(()), "every file absent again");
+}
+
+/// Scenario: Read a directory of managed drop-in settings as the deck reads `/etc/claude-code/managed-settings.d`: a missing directory and `.json` files without an editor pass, a `.json` file naming `EDITOR` holds `Editor` while a non-`.json` file is not read, a directory that can't be listed holds, and more files than the bound hold.
+#[spec("inbox/probe/099")]
+#[test]
+fn probe_099_claude_managed_drop_ins_are_read() {
+    use dot_agent_deck::composer_probe::keymap::{
+        CLAUDE_DROP_INS, ClaudeEnvSource, claude_env_guard, read_claude_env,
+    };
+    use std::os::unix::fs::PermissionsExt;
+    let dir = test_temp::tempdir().unwrap();
+    let drop_ins = dir.path().join("managed-settings.d");
+    let judge = || {
+        claude_env_guard(&read_claude_env(&[ClaudeEnvSource::DropIns(
+            drop_ins.clone(),
+        )]))
+    };
+    assert_eq!(judge(), Ok(()), "no directory");
+    std::fs::create_dir(&drop_ins).unwrap();
+    write(&drop_ins.join("10-a.json"), r#"{"env": {"A": "1"}}"#);
+    write(&drop_ins.join("README"), r#"{"env": {"EDITOR": "vim"}}"#);
+    assert_eq!(judge(), Ok(()), "a non-.json file is not read");
+    write(&drop_ins.join("20-b.JSON"), r#"{"env": {"EDITOR": "vim"}}"#);
+    assert_eq!(judge(), Err(Hold::Editor), "a .json drop-in naming EDITOR");
+    std::fs::remove_file(drop_ins.join("20-b.JSON")).unwrap();
+    std::fs::set_permissions(&drop_ins, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let unlistable = std::fs::read_dir(&drop_ins).is_err();
+    let got = judge();
+    std::fs::set_permissions(&drop_ins, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if unlistable {
+        assert_eq!(got, Err(Hold::Editor), "a directory that can't be listed");
+    }
+    for n in 0..=CLAUDE_DROP_INS {
+        write(&drop_ins.join(format!("{n:03}.json")), "{}");
+    }
+    assert_eq!(judge(), Err(Hold::Editor), "more drop-ins than the bound");
+}
+
+/// Scenario: Ask where Claude Code takes `env` maps from for environments and launches the deck can't follow: a `CLAUDE_CONFIG_DIR`, no `HOME` and a relative working directory are `Unmeasured`; `--settings` and `--project-config-root`, separate or with `=`, are found on the launch's arguments, and other arguments are not.
+#[spec("inbox/probe/099")]
+#[test]
+fn probe_099_claude_env_sources_it_cannot_follow() {
+    use dot_agent_deck::composer_probe::keymap::{claude_args_move_settings, claude_env_sources};
+    let home = |name: &str| (name == "HOME").then(|| OsString::from("/home/u"));
+    let config_dir = |name: &str| match name {
+        "HOME" => Some(OsString::from("/home/u")),
+        "CLAUDE_CONFIG_DIR" => Some(OsString::from("/home/u/cfg")),
+        _ => None,
+    };
+    assert_eq!(
+        claude_env_sources(config_dir, Path::new("/w")).err(),
+        Some(Hold::Unmeasured)
+    );
+    assert_eq!(
+        claude_env_sources(|_: &str| None, Path::new("/w")).err(),
+        Some(Hold::Unmeasured)
+    );
+    assert_eq!(
+        claude_env_sources(home, Path::new("w")).err(),
+        Some(Hold::Unmeasured)
+    );
+    for (launch, want) in [
+        (&["--settings", "/x.json"][..], true),
+        (&["--model", "haiku", "--settings={}"][..], true),
+        (&["--project-config-root", "/p"][..], true),
+        (&["--project-config-root=/p"][..], true),
+        (&["--model", "haiku"][..], false),
+        (&["--setting-sources", "user"][..], false),
+        (&["--settingsx"][..], false),
+    ] {
+        assert_eq!(claude_args_move_settings(&args(launch)), want, "{launch:?}");
+    }
+}
+
+/// Scenario: Take a Claude Code's `env` sources before its spawn and judge them for the bound agent, then read them again as each check does. The same sources and reads pass; another working directory is `Changed`, `--settings` on its arguments `Editor` and unread arguments `Unmeasured`. After settlement a rewrite that leaves every `env` as it was (Claude Code rewrites `~/.claude.json` at each start) passes, and an `env` that changed, or a file that still can't be parsed after the check's retries (left half written, or with trailing commas), holds `Changed` for every later check, even once it is changed back.
+#[spec("inbox/probe/099")]
+#[test]
+fn probe_099_claude_env_is_compared_with_its_spawn_read() {
+    use dot_agent_deck::composer_probe::keymap::{ClaudeEnv, ClaudeEnvBaseline};
+    let claude = ClaudeHome::new();
+    let global = claude.home.join(".claude.json");
+    write(&global, r#"{"numStartups": 1, "env": {"A": "1"}}"#);
+    let baseline = ClaudeEnvBaseline::at_spawn(claude.env(), &claude.cwd).unwrap();
+    let none: &[OsString] = &[];
+    assert_eq!(
+        baseline.bound(claude.env(), Some(none), Some(&claude.cwd)),
+        Ok(())
+    );
+    let other = claude.cwd.parent().unwrap();
+    assert_eq!(
+        baseline.bound(claude.env(), Some(none), Some(other)),
+        Err(Hold::Changed)
+    );
+    assert_eq!(
+        baseline.bound(
+            claude.env(),
+            Some(&args(&["--settings", "/x"])),
+            Some(&claude.cwd)
+        ),
+        Err(Hold::Editor)
+    );
+    assert_eq!(
+        baseline.bound(claude.env(), None, Some(&claude.cwd)),
+        Err(Hold::Unmeasured)
+    );
+    write(&global, r#"{"numStartups": 1, "env": {"A": "2"}}"#);
+    assert_eq!(
+        baseline.bound(claude.env(), Some(none), Some(&claude.cwd)),
+        Err(Hold::Changed),
+        "changed between the spawn and the settlement"
+    );
+    write(&global, r#"{"numStartups": 1, "env": {"A": "1"}}"#);
+
+    let env = ClaudeEnv::new(&baseline);
+    assert_eq!(env.check(), Ok(()));
+    write(
+        &global,
+        r#"{"numStartups": 2, "tips": {"x": 1}, "env": {"A": "1"}}"#,
+    );
+    assert_eq!(env.check(), Ok(()), "a rewrite that keeps the env");
+    write(
+        &claude.cwd.join(".claude/settings.local.json"),
+        r#"{"permissions": {}}"#,
+    );
+    assert_eq!(env.check(), Ok(()), "a settings file with no env created");
+    write(
+        &global,
+        r#"{"numStartups": 3, "env": {"A": "1", "VISUAL": "nvim"}}"#,
+    );
+    assert_eq!(env.check(), Err(Hold::Changed));
+    write(&global, r#"{"numStartups": 3, "env": {"A": "1"}}"#);
+    assert_eq!(env.check(), Err(Hold::Changed), "the hold latches");
+
+    // A read that still can't be parsed after its retries is a change, not a
+    // write caught half done: a document Claude Code may read (trailing
+    // commas) and the deck can't would otherwise hold one check at a time,
+    // and pass again once reverted (the revcxfix2 review's LOW-2).
+    for (row, now) in [
+        ("still half written", r#"{"numStartups": 2, "env": {"#),
+        (
+            "trailing commas",
+            r#"{"env": {"A": "1", "VISUAL": "nvim",},}"#,
+        ),
+    ] {
+        write(&global, r#"{"numStartups": 1, "env": {"A": "1"}}"#);
+        let env = ClaudeEnv::new(&baseline);
+        assert_eq!(env.check(), Ok(()), "{row}: before");
+        write(&global, now);
+        assert_eq!(env.check(), Err(Hold::Changed), "{row}");
+        write(&global, r#"{"numStartups": 1, "env": {"A": "1"}}"#);
+        assert_eq!(env.check(), Err(Hold::Changed), "{row}: latched");
+    }
+}
+
+/// Scenario: Judge a Codex home's `.env` file as the deck does before it checks a Codex's box (the revcxfix review's MEDIUM-B): no file passes, and so do lines naming only other variables; `VISUAL` or `EDITOR` in any form Codex reads (plain, `export`, quoted, spaced, any case), even in a comment or beside non-UTF-8 bytes, holds `Editor`, as does a file that can't be read. `HOME`, `CODEX_HOME` or `TMPDIR` set there holds `Unmeasured`, a value naming a home folder doesn't. A `.env` created, changed or removed after the spawn's read holds `Changed`.
+#[spec("inbox/probe/100")]
+#[test]
+fn probe_100_a_codex_home_env_file_naming_the_editor_holds() {
+    use dot_agent_deck::composer_probe::keymap::{CodexBaseline, CodexReads, codex_dotenv_guard};
+    let mut wrong = Vec::new();
+    for (row, contents, want) in [
+        ("plain", &b"VISUAL=nvim\n"[..], Err(Hold::Editor)),
+        ("export", b"export VISUAL=/bin/true\n", Err(Hold::Editor)),
+        (
+            "spaced and quoted",
+            b"  export\tEDITOR = \"vim -f\"\n",
+            Err(Hold::Editor),
+        ),
+        ("single quotes", b"EDITOR='vim'", Err(Hold::Editor)),
+        ("lower case", b"visual=nvim\n", Err(Hold::Editor)),
+        (
+            "after other lines",
+            b"A=1\r\nB=2\r\nVISUAL=x\r\n",
+            Err(Hold::Editor),
+        ),
+        ("in a comment", b"# VISUAL=nvim\n", Err(Hold::Editor)),
+        (
+            "beside non-UTF-8 bytes",
+            b"\xff\xfe\nVISUAL=x\n",
+            Err(Hold::Editor),
+        ),
+        (
+            "other names",
+            b"OPENAI_API_KEY=sk\nMY_VISUAL=x\nEDITOR_X=1\n",
+            Ok(()),
+        ),
+        ("empty", b"", Ok(())),
+    ] {
+        let read = SourceRead::Present {
+            identity: dot_agent_deck::composer_probe::keymap::Identity {
+                dev: 0,
+                ino: 0,
+                size: contents.len() as u64,
+                mtime_ns: 0,
+                ctime_ns: 0,
+                hash: [0; 32],
+            },
+            contents: contents.to_vec(),
+        };
+        let got = codex_dotenv_guard(&read);
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    assert_eq!(codex_dotenv_guard(&SourceRead::Absent), Ok(()));
+    assert_eq!(
+        codex_dotenv_guard(&SourceRead::Unreadable(Unreadable::TooLarge)),
+        Err(Hold::Editor)
+    );
+
+    // The revcxfix2 review's LOW-1: a `.env` that moves the home Codex reads
+    // its key bindings from, or the folder its editor check reads, holds
+    // `Unmeasured`. Names are matched exactly, as Codex sets them, so a
+    // value naming a home folder doesn't hold.
+    for (row, contents, want) in [
+        ("HOME", &b"HOME=/x\n"[..], Err(Hold::Unmeasured)),
+        (
+            "CODEX_HOME",
+            b"export CODEX_HOME=/x\n",
+            Err(Hold::Unmeasured),
+        ),
+        ("TMPDIR", b"A=1\nTMPDIR = \"/x\"\n", Err(Hold::Unmeasured)),
+        (
+            "the editor first",
+            b"HOME=/x\nVISUAL=y\n",
+            Err(Hold::Editor),
+        ),
+        (
+            "a home folder as a value",
+            b"SSL_CERT_FILE=/home/u/c.pem\nMY_HOME=1\nCODEX_HOME_X=1\nhome=/x\n",
+            Ok(()),
+        ),
+    ] {
+        let read = SourceRead::Present {
+            identity: dot_agent_deck::composer_probe::keymap::Identity {
+                dev: 0,
+                ino: 0,
+                size: contents.len() as u64,
+                mtime_ns: 0,
+                ctime_ns: 0,
+                hash: [0; 32],
+            },
+            contents: contents.to_vec(),
+        };
+        let got = codex_dotenv_guard(&read);
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+
+    let codex = Codex::new();
+    let dotenv = codex.home().join(".env");
+    assert_eq!(
+        codex.sources(&[]).dotenv,
+        dotenv,
+        "the home's .env is a source"
+    );
+    let project = codex.dir.path().join("project");
+    for (row, before, after) in [
+        ("created", None, Some("A=1\n")),
+        ("changed", Some("A=1\n"), Some("A=2\n")),
+        ("removed", Some("A=1\n"), None),
+    ] {
+        match before {
+            Some(text) => write(&dotenv, text),
+            None => {
+                let _ = std::fs::remove_file(&dotenv);
+            }
+        }
+        let baseline = CodexBaseline::at_spawn(&codex.home(), &[], &project).unwrap();
+        let reads = CodexReads::new(&baseline);
+        assert_eq!(reads.check(CODEX_ORDER), Ok(()), "{row}: unchanged");
+        std::thread::sleep(TICK);
+        match after {
+            Some(text) => write(&dotenv, text),
+            None => std::fs::remove_file(&dotenv).unwrap(),
+        }
+        assert_eq!(reads.check(CODEX_ORDER), Err(Hold::Changed), "{row}");
+    }
+}

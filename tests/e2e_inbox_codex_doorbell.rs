@@ -213,6 +213,13 @@ impl Deck {
     /// the deck installs its helper under the e2e assumption and prepares
     /// Codex's export directory in `$CODEX_HOME` first.
     fn direct_codex(&self, name: &str, release: &str) -> Codex {
+        self.codex_through(name, release, "")
+    }
+
+    /// [`Self::direct_codex`] with `launcher` (words, ending in a blank)
+    /// before the shim on the pane's command, so the deck classes the pane
+    /// as a launcher of its declared Codex (`env '<shim>' …`).
+    fn codex_through(&self, name: &str, release: &str, launcher: &str) -> Codex {
         let bin = self.daemon.home.join(format!("bin-{name}"));
         std::fs::create_dir(&bin).unwrap();
         let shim = bin.join("codex");
@@ -228,7 +235,7 @@ impl Deck {
         std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).unwrap();
         let base = self.daemon.home.join(name);
         let command = format!(
-            "'{}' '{}' '{}' '{release}'",
+            "{launcher}'{}' '{}' '{}' '{release}'",
             quote(&shim),
             quote(&base),
             quote(Path::new(env!("CARGO_BIN_EXE_dot-agent-deck")))
@@ -564,7 +571,7 @@ fn codex_027_a_dialog_on_the_head_gets_nothing_more() {
     );
 }
 
-/// Scenario: Type a doorbell-shaped line naming another message into measured Codex 0.164.0's composer, as a user would, and queue a task: the deck adds no byte (no line, no Enter, no delete) through its settle window and well past it. Clearing the composer leaves a box no check can read, so the task stays held with its reason and nothing is typed; the user's own prompt hands it over. The deck's own old line typed back is `codex_027_the_decks_own_line_typed_back_gets_no_byte_and_the_next_ring_a_fresh_token`, where a check can read the box.
+/// Scenario: Type a doorbell-shaped line naming another message into measured Codex 0.164.0's composer, as a user would, and queue a task: the deck adds no byte (no line, no Enter, no delete) through its settle window and well past it. Clearing the composer leaves a box no check can read (the deck never finds a Codex process below this launched stand-in to check it with), so the task stays held, the card saying the box can't be checked, and nothing is typed; the user's own prompt hands it over. The deck's own old line typed back is `codex_027_the_decks_own_line_typed_back_gets_no_byte_and_the_next_ring_a_fresh_token`, where a check can read the box.
 #[spec("inbox/codex/027")]
 #[test]
 fn codex_027_a_doorbell_shaped_line_the_deck_did_not_type_gets_no_byte() {
@@ -587,13 +594,16 @@ fn codex_027_a_doorbell_shaped_line_the_deck_did_not_type_gets_no_byte() {
 
     // Q35-21 (Q128b rulings (ii) and (iv)): the cleared box is one no check
     // can read on this stand-in, so it holds with its reason and the
-    // prompt route delivers.
+    // prompt route delivers. Since the Codex activation a launched Codex is
+    // installed, and its permission waits for a native Codex below the
+    // pane, which this Python stand-in never shows: `cannot_check`
+    // (`cannot_type` before, when the launcher class was not rolled out).
     user.write("\x15");
     let cleared = format!("{foreign}\x15");
     assert!(common::wait_until(WAIT, || codex.typed() == cleared));
     assert!(
         common::wait_until(WAIT, || deck.record(&codex)["inbox"]["wake_hold"]
-            == "cannot_type"),
+            == "cannot_check"),
         "{}",
         deck.record(&codex)
     );
@@ -952,13 +962,10 @@ fn codex_028_a_small_fresh_codex_without_a_width_witness_is_held_visibly() {
     holds(&deck, &codex, "awaiting_prompt");
 }
 
-/// The daemon's environment for Q35-27's tests: installation assumed for
-/// Codex 0.164.0, so a direct Codex gets the helper, and the composer probe's
-/// lines in the log.
-const PREPARED: &[(&str, &str)] = &[
-    ("DOT_AGENT_DECK_E2E_ASSUME_EDITOR_PROBE", "codex@0.164.0"),
-    ("RUST_LOG", "doorbell=debug,composer_probe=info"),
-];
+/// The daemon's environment for Q35-27's tests: the composer probe's lines
+/// in the log. A direct Codex gets the helper from the shipped rollout since
+/// the Codex activation.
+const PREPARED: &[(&str, &str)] = &[("RUST_LOG", "doorbell=debug,composer_probe=info")];
 
 /// The first directory from `/` down to `dir` on a filesystem outside the
 /// export rule's allow-list, where the deck refuses whatever the test sets up
@@ -1058,6 +1065,38 @@ fn probe_091_a_direct_codex_gets_a_private_editor_directory() {
         "{}",
         deck.record(&codex)
     );
+}
+
+/// Scenario: Start a Codex 0.164.0 stand-in through a launcher (`env`), its helper installed, with `$CODEX_HOME` a private directory that has no `editor` in it. As for a direct Codex, the deck creates `editor` before the agent starts, the user's and 0700, and holds nothing for it, so Codex never creates it itself at a umask's 0775 (the revcxact review's MEDIUM-1). On a host whose own filesystem the rule refuses, the deck logs that Codex's home wasn't prepared and creates nothing.
+#[spec("inbox/probe/091")]
+#[test]
+fn probe_091_a_launched_codex_gets_a_private_editor_directory() {
+    let deck = Deck::with(PREPARED);
+    let home = codex_home(&deck);
+    let _codex = deck.codex_through("codex-091-launched", MEASURED, "env ");
+    let editor = home.join("editor");
+    if let Some(host) = host_filesystem_refusal(&home) {
+        assert_home_refused_on_host(&deck, &host);
+        assert!(!editor.exists(), "nothing created past a refusal");
+        return;
+    }
+    let mode = std::fs::metadata(&editor)
+        .unwrap_or_else(|error| {
+            panic!(
+                "the deck created editor before the launched agent started: {error}\n{}",
+                deck.log()
+            )
+        })
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o7777, 0o700, "{mode:o}");
+    assert!(
+        deck.log()
+            .contains("codex editor directory created, mode 0700"),
+        "{}",
+        deck.log()
+    );
+    assert!(held_lines(&deck).is_empty(), "{}", deck.log());
 }
 
 /// Scenario: Start a direct Codex 0.164.0 stand-in whose `$CODEX_HOME/editor` already exists at 0775, as a umask of 002 leaves it. The deck leaves the directory at 0775, logs the directory with the exact `chmod g-w` that fixes it, and, once something is typed into the agent's box and a task waits, holds the task with `cannot_check` and a detail naming that directory as one others can write to, which both clients show with the `chmod g-w` remedy; nothing is typed into the box. On a host whose own filesystem the rule refuses, the deck logs that Codex's home wasn't prepared, naming that directory, holds nothing and leaves `editor` at 0775.

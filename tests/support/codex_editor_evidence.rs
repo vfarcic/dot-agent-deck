@@ -18,44 +18,16 @@ use dot_agent_deck::composer_probe::keymap::{
     CodexBaseline, Hold, codex_keymap, codex_projects_guard,
 };
 use dot_agent_deck::composer_probe::segments::{Agent, Marker, ReturnMarkers, ReturnWatch, Seen};
-use dot_agent_deck::doorbell_activation::{
-    EditorProbe, EditorSelection, ExportShape, KeymapSource, Measurement, PasteToggles,
-};
+use dot_agent_deck::doorbell_activation::{EditorProbe, EditorSelection, ExportShape, Measurement};
 use serde_json::Value;
 
-/// The `editor_probe` Codex 0.164.0's evidence supports (U4's proposal).
-/// It is not wired into `CODEX_FACTS` or the 0.164.0 record: the activation
-/// unit (U7) does that, and `conformance` then compares the two.
-///
-/// - `export`: `$CODEX_HOME/editor/.tmpXXXXXX.md`, the editor's last
-///   argument, holding the draft; the rewritten file is reimported.
-/// - `selection`: a set, non-empty `VISUAL` (split by shell words) before
-///   `EDITOR`; a set but empty one is an error, not a fall-through; with
-///   neither, an error line and no `PATH` fallback.
-/// - `paste_toggles`: two `?2004l` and one `?2004h` per invocation.
-/// - `keymap_sources`: `config.toml`, then the profile file, then the
-///   trusted project's `.codex/config.toml`, then each `-c`, lowest first.
-/// - `keymap_loaded_at_start`: `Absent`, as for every Codex record (no P-KB1
-///   premise).
-/// - `inert_candidates`: none, the M44e safe default.
-/// - `pasted_bel_is_text`: `Absent`: Codex removes a pasted BEL.
-pub const PROPOSED_CODEX_0164_EDITOR_PROBE: EditorProbe<'static> = EditorProbe {
-    export: ExportShape::CodexEditorDir,
-    selection: EditorSelection::Codex,
-    paste_toggles: PasteToggles {
-        disables: 2,
-        enables: 1,
-    },
-    keymap_sources: &[
-        KeymapSource::CodexConfig,
-        KeymapSource::CodexProfile,
-        KeymapSource::CodexProject,
-        KeymapSource::CodexOverride,
-    ],
-    keymap_loaded_at_start: Measurement::Absent,
-    inert_candidates: &[],
-    pasted_bel_is_text: Measurement::Absent,
-};
+/// The `editor_probe` Codex 0.164.0's evidence supports: U4 proposed it, and
+/// the Codex activation (Q35-29) shipped it as the 0.164.0 record's
+/// measurement and Codex's fact (`CODEX_0_164_0_EDITOR_PROBE`, whose doc
+/// lists what each field rests on). The checks below read the shipped value,
+/// so a change to it is checked against this evidence.
+pub const PROPOSED_CODEX_0164_EDITOR_PROBE: EditorProbe<'static> =
+    dot_agent_deck::doorbell_activation::CODEX_0_164_0_EDITOR_PROBE;
 
 pub const RELEASE: &str = "0.164.0";
 pub const SHA256: &str = "b93f6811d3f653f0fb83be4050d857fb9abbb111dfa2ce160563327daff7f306";

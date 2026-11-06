@@ -882,6 +882,19 @@ slow-timeout = { period = "60s", terminate-after = 20 }
 filter = 'test(/^probe_04[24]_live_/)'
 slow-timeout = { period = "60s", terminate-after = 5 }
 
+# PRD #1666 part 3, Q35-29's lane-2 gates on a real installed Codex
+# (`tests/e2e_composer_check_codex_live.rs`, `tests/e2e_chain_smoke_codex.rs`):
+# `041` launches a fresh deck per trial as `040` does (Codex starts slower,
+# and the late-helper path holds each check 11 s); `043` and
+# `chain-smoke/codex/001` run one deck each, inside its daemon's 300 s cap.
+[[profile.default.overrides]]
+filter = 'test(/^probe_041_live_/)'
+slow-timeout = { period = "60s", terminate-after = 30 }
+
+[[profile.default.overrides]]
+filter = 'test(/^probe_043_live_/) | test(codex_001_touched_box_checked_then_delegate_delivered_once)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
 # The five `inbox/doorbell/010` live cases re-oracled to the installed pane's
 # checks (`tests/e2e_inbox_claude_live.rs`): each waits for a check before its
 # five-second hold, and the kept-draft case runs three decks in turn.
