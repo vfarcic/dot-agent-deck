@@ -230,6 +230,29 @@ where
     })
 }
 
+/// PRD #1666 part 3: what [`DashboardConfig::load_bounded_status`] found at
+/// the config path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigFile {
+    /// No file: [`BoundedLoad::config`] is the defaults, as intended.
+    Absent,
+    /// The file was read, and [`BoundedLoad::config`] is what it says.
+    Read,
+    /// There is a file, but it was not read (not a regular file, over
+    /// [`MAX_DASHBOARD_CONFIG_BYTES`], unreadable), is not valid TOML, or a
+    /// setting has the wrong type: [`BoundedLoad::config`] is the defaults,
+    /// which may not be what the user wrote.
+    Failed,
+}
+
+/// [`DashboardConfig::load_bounded_status`]'s result.
+#[derive(Debug, Clone)]
+pub struct BoundedLoad {
+    pub config: DashboardConfig,
+    pub warnings: Vec<String>,
+    pub file: ConfigFile,
+}
+
 /// The warning for a `host_metrics` in `config.toml` that is not a table.
 fn host_metrics_not_a_table(value: &toml::Value) -> String {
     format!(
@@ -316,27 +339,51 @@ impl DashboardConfig {
     }
 
     fn load_bounded_reporting_from(path: &Path) -> (Self, Vec<String>) {
+        let load = Self::load_bounded_status_from(path);
+        (load.config, load.warnings)
+    }
+
+    /// [`Self::load_bounded`], also saying whether there was a file and
+    /// whether it was read, for a caller that must not treat a broken file as
+    /// an absent one (PRD #1666 part 3: the doorbell switch, which a broken
+    /// file holds off rather than turning back on — see
+    /// [`crate::doorbell_switch::at_spawn`]). Logs its warnings, as
+    /// [`Self::load_bounded`] does.
+    pub fn load_bounded_status() -> BoundedLoad {
+        let load = Self::load_bounded_status_from(&config_path());
+        for warning in &load.warnings {
+            tracing::warn!("{warning}");
+        }
+        load
+    }
+
+    pub(crate) fn load_bounded_status_from(path: &Path) -> BoundedLoad {
+        let failed = |warning: String| BoundedLoad {
+            config: Self::default(),
+            warnings: vec![warning],
+            file: ConfigFile::Failed,
+        };
         let contents = match read_dashboard_config_bounded(path) {
-            Ok(None) => return (Self::default(), Vec::new()),
+            Ok(None) => {
+                return BoundedLoad {
+                    config: Self::default(),
+                    warnings: Vec::new(),
+                    file: ConfigFile::Absent,
+                };
+            }
             Ok(Some(contents)) => contents,
             Err(reason) => {
-                return (
-                    Self::default(),
-                    vec![format!(
-                        "config at {} not read ({reason}); using the defaults",
-                        path.display()
-                    )],
-                );
+                return failed(format!(
+                    "config at {} not read ({reason}); using the defaults",
+                    path.display()
+                ));
             }
         };
         let Ok(mut table) = contents.parse::<toml::Table>() else {
-            return (
-                Self::default(),
-                vec![format!(
-                    "invalid config at {}: malformed TOML; using the defaults",
-                    path.display()
-                )],
-            );
+            return failed(format!(
+                "invalid config at {}: malformed TOML; using the defaults",
+                path.display()
+            ));
         };
         let mut warnings = Vec::new();
         if let Some(value) = table.get("host_metrics").filter(|v| !v.is_table()) {
@@ -344,15 +391,16 @@ impl DashboardConfig {
             table.remove("host_metrics");
         }
         match toml::Value::Table(table).try_into() {
-            Ok(config) => (config, warnings),
+            Ok(config) => BoundedLoad {
+                config,
+                warnings,
+                file: ConfigFile::Read,
+            },
             // The error's `Display` is not used: it can quote the file.
-            Err(_) => (
-                Self::default(),
-                vec![format!(
-                    "invalid config at {}: a setting has the wrong type; using the defaults",
-                    path.display()
-                )],
-            ),
+            Err(_) => failed(format!(
+                "invalid config at {}: a setting has the wrong type; using the defaults",
+                path.display()
+            )),
         }
     }
 

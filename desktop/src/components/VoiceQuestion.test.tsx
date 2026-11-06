@@ -173,6 +173,26 @@ describe("answering an agent's question by voice", () => {
     expect(screen.queryByText(SENT.sentence)).toBeNull();
   });
 
+  /// Scenario: inbox/probe/018 — an answer is on its way when the agent re-registers the same question under a new revision and the daemon marks that new revision queued. The queued marker belongs to the newer revision, not the answer being sent, so the voice row does not say the answer is queued.
+  it("inbox/probe/018: a queued marker on a newer revision of the question is not this answer's", async () => {
+    const voice = microphone();
+    const { rt, sendVoiceAnswer } = runtime(voice, () => new Promise<AnswerOutcomeDto>(() => {}));
+    const view = render(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={composerPane()} selectedDeckId="local" />);
+    await turnOnVoice();
+    await speak(voice, "yes");
+    await waitOut(VOICE_DICTATION_SEND_MS);
+    expect(sendVoiceAnswer).toHaveBeenCalledTimes(1);
+    const held = { inputHeld: { generation: 9, cause: "checking", heldOps: 1, heldBytes: 1, sinceMs: 1 } };
+    const sameRevision = composerPane(held, true);
+    view.rerender(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={sameRevision} selectedDeckId="local" />);
+    await flush();
+    expect(screen.getByTestId("voice-question")).toHaveTextContent(words.queued);
+    const newerRevision = composerPane({ ...held, pendingQuestion: { ...PERMISSION, revision: 8, answerQueued: true } });
+    view.rerender(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={newerRevision} selectedDeckId="local" />);
+    await flush();
+    expect(screen.getByTestId("voice-question")).not.toHaveTextContent(words.queued);
+  });
+
   /// Scenario: question/answer/024 extends inbox/probe/018 through the real TypeScript Tauri bridge: the answer is queued, its command returns unconfirmed at 15 seconds, then a snapshot carries this panel's own settlement. The visible report changes to each physical outcome; partial or failed writes never read as a successful answer.
   it.each([
     ["written", /Allowed: touch x/], ["partial", /part|some/i],

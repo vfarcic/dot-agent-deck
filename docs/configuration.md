@@ -117,7 +117,7 @@ claude = true
 codex = true
 ```
 
-`config set` rewrites the whole file from the keys above, so comments and any other keys are removed. If the file does not parse, the TUI and `config` print `Invalid config at <path>: <error>` and use the defaults, and a `config set` then replaces the unparseable file with the defaults plus the key you set. Fix a parse error by hand before running `config set`.
+`config set` rewrites the whole file from the keys above, so comments and any other keys are removed. If the file does not parse, the TUI and `config` print `Invalid config at <path>: <error>` and use the defaults, and a `config set` then replaces the unparseable file with the defaults plus the key you set. Fix a parse error by hand before running `config set`. While the file can't be used, the daemon also holds the doorbell off for both Claude Code and Codex for the agents it starts, rather than turning it on by default ([`turned_off`](troubleshooting.md#a-card-says-waiting-for-the-agent-to-fetch-it-send-it-a-prompt)).
 
 ## Create a project configuration
 

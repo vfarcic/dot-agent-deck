@@ -4806,10 +4806,15 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     PRD #1666 part 3 (Q35, core §7): the daemon holds the answer being sent
     until it can write it — the question it answers says so — and why it
     holds, in the words the card uses. Queued is not answered: the outcome
-    still comes from the send, or from a settlement of its own token.
+    still comes from the send, or from a settlement of its own token. The
+    question is the one answered only at the answer's own revision, as
+    `questionLost` reads it: a queued marker on a newer registration of the
+    same id is not this answer's.
   */
   const questionQueued = questionForm?.sending === true && !questionForm.cancelling
-    && pane?.question?.id === questionForm.target.questionId && pane.question.answerQueued === true;
+    && pane?.question?.id === questionForm.target.questionId
+    && (questionForm.target.revision === undefined || pane.question.revision === questionForm.target.revision)
+    && pane.question.answerQueued === true;
   /*
     Without `inputDiscarded` on purpose (auditor U3-5): these words only say
     why the answer being sent is queued, and the typing an earlier agent

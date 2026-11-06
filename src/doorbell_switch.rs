@@ -12,7 +12,11 @@
 //! The daemon reads it once per agent it starts ([`at_spawn`]): installation
 //! of the input-box check is decided then
 //! (`crate::composer_probe::install::at_spawn`), and the generation keeps the
-//! value for its life, so a change applies to agents started after it. Off,
+//! value for its life, so a change applies to agents started after it. A
+//! `config.toml` that is there but cannot be used (malformed, a wrong-typed
+//! value, too large, unreadable) holds the doorbell off for both agents rather
+//! than falling back to the default of on: the file may be the one that turned
+//! an agent off, and the variables still win over it. Off,
 //! the generation's verdict is `turned_off` (`NoGo::TurnedOff`), whatever its
 //! screen shows; nothing else about delivery changes.
 
@@ -66,6 +70,28 @@ impl DoorbellSwitch {
             codex: read(CODEX_ENV, config.codex),
         }
     }
+
+    /// The switch from a read of the deck's `config.toml`
+    /// ([`crate::config::DashboardConfig::load_bounded_status`]) under `env`'s
+    /// overrides ([`Self::resolve`]). A file that is there but could not be
+    /// used holds the doorbell off for both agents: its defaults are on, and
+    /// the file may be the one that turned an agent off.
+    pub fn from_load(
+        load: &crate::config::BoundedLoad,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Self {
+        let held = crate::config::DoorbellConfig {
+            claude: false,
+            codex: false,
+        };
+        let file = match load.file {
+            crate::config::ConfigFile::Failed => &held,
+            crate::config::ConfigFile::Absent | crate::config::ConfigFile::Read => {
+                &load.config.doorbell
+            }
+        };
+        Self::resolve(file, env)
+    }
 }
 
 /// `1`/`true`/`on` → on, `0`/`false`/`off` → off, anything else → `None`.
@@ -79,11 +105,13 @@ pub fn parse_state(value: &str) -> Option<bool> {
 
 /// The switch for an agent the daemon is starting now: the deck's
 /// `config.toml`, read with the daemon's bounded reader, under the
-/// environment's overrides.
+/// environment's overrides. A file that is there but cannot be used holds both
+/// agents off ([`DoorbellSwitch::from_load`]); its warning is in the daemon's
+/// log.
 #[cfg(not(test))]
 pub fn at_spawn() -> DoorbellSwitch {
-    let config = crate::config::DashboardConfig::load_bounded();
-    DoorbellSwitch::resolve(&config.doorbell, |name| std::env::var(name).ok())
+    let load = crate::config::DashboardConfig::load_bounded_status();
+    DoorbellSwitch::from_load(&load, |name| std::env::var(name).ok())
 }
 
 /// Unit tests read neither the developer's `config.toml` nor their
@@ -151,6 +179,63 @@ mod tests {
             AgentType::Devin,
         ] {
             assert!(all_off.allows(&agent), "{agent:?}");
+        }
+    }
+
+    /// Scenario: Read the doorbell switch from a `config.toml` that is absent, valid, malformed, has a wrong-typed value, or is over the size limit. An absent file leaves both agents on and a valid one says what it says; a file that is there but can't be used holds the doorbell off for both agents rather than falling back to on, and a variable still wins over that.
+    #[spec("inbox/doorbell/060")]
+    #[test]
+    fn doorbell_060_a_config_that_cannot_be_used_holds_the_doorbell_off() {
+        use crate::config::{ConfigFile, DashboardConfig};
+        let dir = tempfile::tempdir().unwrap();
+        let none = |_: &str| None;
+        let off = DoorbellSwitch {
+            claude: false,
+            codex: false,
+        };
+
+        let absent = DashboardConfig::load_bounded_status_from(&dir.path().join("absent.toml"));
+        assert_eq!(absent.file, ConfigFile::Absent);
+        assert_eq!(
+            DoorbellSwitch::from_load(&absent, none),
+            DoorbellSwitch::default(),
+            "no file: the defaults, both on"
+        );
+
+        let valid = dir.path().join("valid.toml");
+        std::fs::write(&valid, "[doorbell]\ncodex = false\n").unwrap();
+        let load = DashboardConfig::load_bounded_status_from(&valid);
+        assert_eq!(load.file, ConfigFile::Read);
+        assert_eq!(
+            DoorbellSwitch::from_load(&load, none),
+            DoorbellSwitch {
+                claude: true,
+                codex: false
+            }
+        );
+
+        let oversize = "#".repeat(crate::config::MAX_DASHBOARD_CONFIG_BYTES as usize + 1);
+        for (name, contents) in [
+            ("malformed", "[doorbell\nclaude = false\n".to_string()),
+            ("wrong-typed", "[doorbell]\nclaude = \"no\"\n".to_string()),
+            ("wrong-typed-elsewhere", "default_command = 7\n".to_string()),
+            ("oversize", oversize),
+        ] {
+            let path = dir.path().join(format!("{name}.toml"));
+            std::fs::write(&path, contents).unwrap();
+            let load = DashboardConfig::load_bounded_status_from(&path);
+            assert_eq!(load.file, ConfigFile::Failed, "{name}");
+            assert_eq!(DoorbellSwitch::from_load(&load, none), off, "{name}");
+            let codex_on =
+                DoorbellSwitch::from_load(&load, |var| (var == CODEX_ENV).then(|| "1".to_string()));
+            assert_eq!(
+                codex_on,
+                DoorbellSwitch {
+                    claude: false,
+                    codex: true
+                },
+                "{name}: the variable still wins"
+            );
         }
     }
 }
