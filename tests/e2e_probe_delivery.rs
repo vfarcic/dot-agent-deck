@@ -881,6 +881,20 @@ fn probe_099_a_claude_whose_settings_name_no_editor_is_checked_then_rung() {
     assert!(!f.log_text().contains("Keymap(Editor)"), "{}", f.log_text());
 }
 
+/// Scenario: Start a Claude Code stand-in whose `~/.claude/settings.json` sets the deck's own `DOT_AGENT_DECK_EDITOR_GEN` in its `env` map, which Claude Code would copy into its environment and so point the deck's editor helper at a check that was never armed, then type and delete text in its box and queue mail. The deck must type nothing, not even its check's Ctrl+G: the card says `cannot_check`, the log names the `Keymap(Editor)` hold, and the mail waits.
+#[spec("inbox/probe/099")]
+#[test]
+fn probe_099_a_claude_whose_settings_env_sets_a_deck_variable_is_held_without_a_check() {
+    let f = with_home_files(
+        "claude",
+        &[(
+            ".claude/settings.json",
+            r#"{"env": {"DOT_AGENT_DECK_EDITOR_GEN": "1"}}"#,
+        )],
+    );
+    held_for_the_editor(&f, false);
+}
+
 /// Scenario: Start a Codex stand-in whose home's `.env` file sets `VISUAL`, which Codex loads into its own environment as it starts, then type and delete text in its box and queue mail. The deck must type nothing, not even its check's Ctrl+G: the card and the attached TUI say `cannot_check`, the log names the `Keymap(Editor)` hold, and the mail waits.
 #[spec("inbox/probe/100")]
 #[test]
@@ -899,6 +913,14 @@ fn probe_100_a_codex_whose_home_env_file_names_no_editor_is_checked_then_rung() 
     let line = delivered(&f, &id);
     f.expect(format!("x\x7f\x07{line}\r").as_bytes());
     assert!(!f.log_text().contains("Keymap(Editor)"), "{}", f.log_text());
+}
+
+/// Scenario: Start a Codex stand-in whose home's `.env` file sets the deck's own `DOT_AGENT_DECK_EDITOR_GEN`, which Codex would load into its environment and so point the deck's editor helper at a check that was never armed, then type and delete text in its box and queue mail. The deck must type nothing, not even its check's Ctrl+G: the card and the attached TUI say `cannot_check`, the log names the `Keymap(Editor)` hold, and the mail waits.
+#[spec("inbox/probe/100")]
+#[test]
+fn probe_100_a_codex_whose_home_env_file_sets_a_deck_variable_is_held_without_a_check() {
+    let f = with_home_files("codex", &[(".codex/.env", "DOT_AGENT_DECK_EDITOR_GEN=1\n")]);
+    held_for_the_editor(&f, true);
 }
 
 /// Scenario: In a deck whose Claude Code doorbell is turned off (`DOT_AGENT_DECK_DOORBELL_CLAUDE=0`), so the Claude composer gets no helper and no check, type and delete text in it and queue mail. The daemon and attached TUI must show the cannot-type hold, and further clearing must not authorize a check or a notice before a prompt fetches the message.

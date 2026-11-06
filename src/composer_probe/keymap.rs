@@ -935,9 +935,11 @@ fn without_json_comments(contents: &[u8]) -> Option<Vec<u8>> {
 /// Whether a read of Claude Code's `env` sources leaves its editor to the
 /// environment it was started with: every file absent, or without an `env`
 /// member, or with an `env` object none of whose names is, in any case,
-/// `VISUAL` or `EDITOR`. A name there would replace the helper the deck put
-/// in Claude's environment (Claude applies these over what it inherited),
-/// so it holds as [`Hold::Editor`]; so does anything the deck can't judge:
+/// `VISUAL` or `EDITOR`, or starts with [`DECK_ENV_PREFIX`]. A name there
+/// would replace the helper the deck put in Claude's environment, or the
+/// generation it gave the helper (Claude applies these over what it
+/// inherited), so it holds as [`Hold::Editor`]; so does anything the deck
+/// can't judge:
 /// a file that exists but can't be read or parsed, a document another
 /// parser could read differently ([`EnvRead::Suspect`]), an `env` that isn't
 /// an object, and a managed drop-in directory that can't be listed. An `env`
@@ -954,7 +956,11 @@ pub fn claude_env_guard(read: &ClaudeEnvRead) -> Result<(), Hold> {
                         .keys()
                         .any(|name| list.iter().any(|n| name.eq_ignore_ascii_case(n)))
                 };
-                if named(&EDITOR_ENV) {
+                if named(&EDITOR_ENV)
+                    || names
+                        .keys()
+                        .any(|name| names_deck_variable(name.as_bytes()))
+                {
                     return Err(Hold::Editor);
                 }
                 if named(&CLAUDE_MOVING_ENV) {
@@ -1893,6 +1899,26 @@ pub const KEYMAP_ENV: [&str; 3] = ["HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME"];
 /// ([`editor_is_helper`]).
 pub const EDITOR_ENV: [&str; 2] = ["VISUAL", "EDITOR"];
 
+/// The prefix of the deck's own variables, which a file an agent copies
+/// variables from as it starts (Claude Code's settings `env`, Codex's
+/// `$CODEX_HOME/.env`) must not set (the revcxfix3 review's NEW-1). The
+/// editor helper takes the check's generation from
+/// `DOT_AGENT_DECK_EDITOR_GEN` in its own environment, which it inherits
+/// from the agent; one set there names a generation the deck never armed,
+/// and the helper then opens the person's saved editor in the pane, as it
+/// does for their own Ctrl+G. The whole prefix holds rather than the
+/// helper's own `DOT_AGENT_DECK_EDITOR_`: the others (the pane, the
+/// sockets, the hooks' binary) wire the agent to the deck, and are set in
+/// the environment the deck or its agent starts from, where one set in
+/// these files would override them.
+pub const DECK_ENV_PREFIX: &str = "DOT_AGENT_DECK_";
+
+/// Whether `name` starts with [`DECK_ENV_PREFIX`], in any case.
+fn names_deck_variable(name: &[u8]) -> bool {
+    name.get(..DECK_ENV_PREFIX.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(DECK_ENV_PREFIX.as_bytes()))
+}
+
 /// A lookup over a process's own environment `environ`, as
 /// `/proc/<pid>/environ` lists it, for the variables in [`KEYMAP_ENV`] and
 /// [`EDITOR_ENV`]: the first value a name has, as `getenv` answers. A name
@@ -1967,9 +1993,13 @@ pub fn codex_editor_is_helper(
 /// holds as [`Hold::Editor`]. The test is a raw scan rather than a parse,
 /// so that every quoting, `export` and spacing form holds: any word of
 /// letters, digits and `_` that is `VISUAL` or `EDITOR` in any case, on any
-/// line, a comment's included, holds. A word that is exactly one of
-/// [`CODEX_MOVING_ENV`] holds as [`Hold::Unmeasured`]: matched in its case,
-/// as Codex sets it, so a value naming a folder under `/home` doesn't.
+/// line, a comment's included, holds, and so does a word that starts with
+/// [`DECK_ENV_PREFIX`], which Codex would set over the generation the deck
+/// gave its editor helper (the revcxfix3 review's NEW-1): matched in its
+/// case, as Codex sets it and the helper reads it. A word that is exactly
+/// one of [`CODEX_MOVING_ENV`] holds as [`Hold::Unmeasured`]: matched in
+/// its case, as Codex sets it, so a value naming a folder under `/home`
+/// doesn't.
 pub fn codex_dotenv_guard(read: &SourceRead) -> Result<(), Hold> {
     match read {
         SourceRead::Absent => Ok(()),
@@ -1980,6 +2010,7 @@ pub fn codex_dotenv_guard(read: &SourceRead) -> Result<(), Hold> {
                 EDITOR_ENV
                     .iter()
                     .any(|name| word.eq_ignore_ascii_case(name.as_bytes()))
+                    || word.starts_with(DECK_ENV_PREFIX.as_bytes())
             });
             if names_editor {
                 return Err(Hold::Editor);

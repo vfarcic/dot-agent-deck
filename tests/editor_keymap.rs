@@ -2579,6 +2579,67 @@ fn probe_099_claude_settings_env_moving_its_config_holds() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Scenario: Judge Claude Code settings documents whose `env` sets one of the deck's own variables (the revcxfix3 review's NEW-1): `DOT_AGENT_DECK_EDITOR_GEN`, which would point the deck's editor helper at a check that was never armed so that it opens the person's editor, or any other name starting with `DOT_AGENT_DECK_`, in any case, holds `Editor`, also beside a name that moves Claude's configuration; such a name only in a value, outside `env`, or with the prefix inside it, passes.
+#[spec("inbox/probe/099")]
+#[test]
+fn probe_099_claude_settings_env_naming_a_deck_variable_holds() {
+    use dot_agent_deck::composer_probe::keymap::{claude_env_guard, claude_env_member};
+    let editor = Err(Hold::Editor);
+    let mut wrong = Vec::new();
+    for (row, document, want) in [
+        (
+            "the helper's generation",
+            r#"{"env": {"DOT_AGENT_DECK_EDITOR_GEN": "1"}}"#,
+            editor,
+        ),
+        (
+            "the helper's saved editor",
+            r#"{"env": {"A": "1", "DOT_AGENT_DECK_EDITOR_USER_VISUAL": "vim"}}"#,
+            editor,
+        ),
+        (
+            "another deck variable",
+            r#"{"env": {"DOT_AGENT_DECK_PANE_ID": "3"}}"#,
+            editor,
+        ),
+        (
+            "lower case",
+            r#"{"env": {"dot_agent_deck_editor_gen": "1"}}"#,
+            editor,
+        ),
+        (
+            "beside a name that moves the configuration",
+            r#"{"env": {"HOME": "/x", "DOT_AGENT_DECK_EDITOR_GEN": "1"}}"#,
+            editor,
+        ),
+        (
+            "only in a value",
+            r#"{"env": {"A": "DOT_AGENT_DECK_EDITOR_GEN"}}"#,
+            Ok(()),
+        ),
+        (
+            "outside env",
+            r#"{"model": "x", "DOT_AGENT_DECK_EDITOR_GEN": "1"}"#,
+            Ok(()),
+        ),
+        (
+            "the prefix inside a name, or without its underscore",
+            r#"{"env": {"MY_DOT_AGENT_DECK_X": "1", "DOT_AGENT_DECK": "2"}}"#,
+            Ok(()),
+        ),
+    ] {
+        let read = vec![(
+            PathBuf::from("settings.json"),
+            claude_env_member(document.as_bytes()),
+        )];
+        let got = claude_env_guard(&read);
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// A Claude Code HOME and working directory, each under the private test
 /// base, for [`claude_env_sources`].
 struct ClaudeHome {
@@ -2980,4 +3041,58 @@ fn probe_100_a_codex_home_env_file_naming_the_editor_holds() {
         }
         assert_eq!(reads.check(CODEX_ORDER), Err(Hold::Changed), "{row}");
     }
+}
+
+/// Scenario: Judge a Codex home's `.env` file that sets one of the deck's own variables (the revcxfix3 review's NEW-1): `DOT_AGENT_DECK_EDITOR_GEN`, which would point the deck's editor helper at a check that was never armed so that it opens the person's editor, or any other word starting with `DOT_AGENT_DECK_`, in any form Codex reads and in a comment, holds `Editor`, also beside a name that moves Codex's home; the same name in lower case, which Codex would set as written and the helper doesn't read, and a word with the prefix inside it, pass.
+#[spec("inbox/probe/100")]
+#[test]
+fn probe_100_a_codex_home_env_file_naming_a_deck_variable_holds() {
+    use dot_agent_deck::composer_probe::keymap::codex_dotenv_guard;
+    let editor = Err(Hold::Editor);
+    let mut wrong = Vec::new();
+    for (row, contents, want) in [
+        (
+            "the helper's generation",
+            &b"DOT_AGENT_DECK_EDITOR_GEN=1\n"[..],
+            editor,
+        ),
+        (
+            "export, spaced and quoted",
+            b"  export\tDOT_AGENT_DECK_EDITOR_GEN = \"1\"\n",
+            editor,
+        ),
+        ("in a comment", b"# DOT_AGENT_DECK_EDITOR_GEN=1\n", editor),
+        (
+            "another deck variable",
+            b"A=1\r\nDOT_AGENT_DECK_SOCKET=/x\r\n",
+            editor,
+        ),
+        (
+            "beside a name that moves the home",
+            b"HOME=/x\nDOT_AGENT_DECK_EDITOR_GEN=1\n",
+            editor,
+        ),
+        (
+            "lower case, the prefix inside a word, or without its underscore",
+            b"dot_agent_deck_editor_gen=1\nMY_DOT_AGENT_DECK_X=1\nDOT_AGENT_DECK=1\n",
+            Ok(()),
+        ),
+    ] {
+        let read = SourceRead::Present {
+            identity: dot_agent_deck::composer_probe::keymap::Identity {
+                dev: 0,
+                ino: 0,
+                size: contents.len() as u64,
+                mtime_ns: 0,
+                ctime_ns: 0,
+                hash: [0; 32],
+            },
+            contents: contents.to_vec(),
+        };
+        let got = codex_dotenv_guard(&read);
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
