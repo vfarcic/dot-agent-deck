@@ -143,9 +143,9 @@ pub enum Hold {
     /// environment selects it, isn't exactly the deck's helper
     /// ([`editor_is_helper`], the revcxact review's HIGH-1), or a file the
     /// agent copies variables from into its environment as it starts names
-    /// the editor or can't be judged ([`claude_env_guard`], the revcxfix
-    /// review's MEDIUM-A): a probe would open another editor in the
-    /// person's pane.
+    /// the editor or can't be judged ([`claude_env_guard`],
+    /// [`codex_dotenv_guard`], the revcxfix review's MEDIUM-A and
+    /// MEDIUM-B): a probe would open another editor in the person's pane.
     Editor,
     /// Codex's home lies inside a folder Codex's sandbox may write to (the
     /// cwd, other than `<cwd>/.codex` itself, `/tmp` or `$TMPDIR`), or one
@@ -946,6 +946,10 @@ pub struct CodexSources {
     pub projects: Vec<PathBuf>,
     /// Each `-c key=value`, in command-line order.
     pub overrides: Vec<String>,
+    /// `$CODEX_HOME/.env`, which Codex loads into its own environment as it
+    /// starts ([`codex_dotenv_guard`]): no key binding, but it can name the
+    /// editor.
+    pub dotenv: PathBuf,
 }
 
 impl CodexSources {
@@ -1012,6 +1016,7 @@ impl CodexSources {
             profile,
             projects,
             overrides,
+            dotenv: codex_home.join(".env"),
         })
     }
 
@@ -1023,6 +1028,7 @@ impl CodexSources {
             profile: self.profile.as_deref().map(read_source),
             projects: self.projects.iter().map(|p| read_source(p)).collect(),
             overrides: self.overrides.clone(),
+            dotenv: read_source(&self.dotenv),
         }
     }
 }
@@ -1040,6 +1046,7 @@ pub struct CodexRead {
     pub profile: Option<SourceRead>,
     pub projects: Vec<SourceRead>,
     pub overrides: Vec<String>,
+    pub dotenv: SourceRead,
 }
 
 /// Whether Codex launched with these sources keeps Ctrl+G on the external
@@ -1107,6 +1114,7 @@ pub fn codex_unchanged(before: &CodexRead, after: &CodexRead) -> Result<(), Hold
         && before.profile == after.profile
         && before.projects == after.projects
         && before.overrides == after.overrides
+        && before.dotenv == after.dotenv
     {
         Ok(())
     } else {
@@ -1802,6 +1810,39 @@ pub fn codex_editor_is_helper(
     match super::helper::split_shell_words(&value).as_deref() {
         Some([only]) if only.as_os_str() == helper.as_os_str() => Ok(()),
         _ => Err(Hold::Editor),
+    }
+}
+
+/// Whether `$CODEX_HOME/.env`, as read, leaves Codex's editor to the
+/// environment it was started with (the revcxfix review's MEDIUM-B). Codex
+/// 0.164.0 loads that file as it starts and sets its variables over the
+/// ones it inherited: run in a sandbox HOME with `VISUAL=<a recorder>` in
+/// it, Ctrl+G ran the recorder, also over an inherited `VISUAL` and in the
+/// `export` and quoted forms, and with `EDITOR=` alone; with no `.env` it
+/// drew its "Cannot open external editor" line. So an absent file passes,
+/// one that can't be read holds, and one that names the editor's variables
+/// holds as [`Hold::Editor`]. The test is a raw scan rather than a parse,
+/// so that every quoting, `export` and spacing form holds: any word of
+/// letters, digits and `_` that is `VISUAL` or `EDITOR` in any case, on any
+/// line, a comment's included, holds.
+pub fn codex_dotenv_guard(read: &SourceRead) -> Result<(), Hold> {
+    match read {
+        SourceRead::Absent => Ok(()),
+        SourceRead::Unreadable(_) => Err(Hold::Editor),
+        SourceRead::Present { contents, .. } => {
+            let names_editor = contents
+                .split(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
+                .any(|word| {
+                    EDITOR_ENV
+                        .iter()
+                        .any(|name| word.eq_ignore_ascii_case(name.as_bytes()))
+                });
+            if names_editor {
+                Err(Hold::Editor)
+            } else {
+                Ok(())
+            }
+        }
     }
 }
 

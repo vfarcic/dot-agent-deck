@@ -881,6 +881,26 @@ fn probe_099_a_claude_whose_settings_name_no_editor_is_checked_then_rung() {
     assert!(!f.log_text().contains("Keymap(Editor)"), "{}", f.log_text());
 }
 
+/// Scenario: Start a Codex stand-in whose home's `.env` file sets `VISUAL`, which Codex loads into its own environment as it starts, then type and delete text in its box and queue mail. The deck must type nothing, not even its check's Ctrl+G: the card and the attached TUI say `cannot_check`, the log names the `Keymap(Editor)` hold, and the mail waits.
+#[spec("inbox/probe/100")]
+#[test]
+fn probe_100_a_codex_whose_home_env_file_sets_visual_is_held_without_a_check() {
+    let f = with_home_files("codex", &[(".codex/.env", "export VISUAL=/bin/true\n")]);
+    held_for_the_editor(&f, true);
+}
+
+/// Scenario: The control for the test above: the same Codex stand-in with a home `.env` file that sets only an unrelated variable. Typing and deleting text then queueing mail brings the deck's check, the box reads empty, and the notice is typed and handed over once.
+#[spec("inbox/probe/100")]
+#[test]
+fn probe_100_a_codex_whose_home_env_file_names_no_editor_is_checked_then_rung() {
+    let f = with_home_files("codex", &[(".codex/.env", "DAD_UNRELATED=1\n")]);
+    touched_empty(&f);
+    let id = f.enqueue();
+    let line = delivered(&f, &id);
+    f.expect(format!("x\x7f\x07{line}\r").as_bytes());
+    assert!(!f.log_text().contains("Keymap(Editor)"), "{}", f.log_text());
+}
+
 /// Scenario: In a deck whose Claude Code doorbell is turned off (`DOT_AGENT_DECK_DOORBELL_CLAUDE=0`), so the Claude composer gets no helper and no check, type and delete text in it and queue mail. The daemon and attached TUI must show the cannot-type hold, and further clearing must not authorize a check or a notice before a prompt fetches the message.
 #[spec("inbox/probe/037")]
 #[test]

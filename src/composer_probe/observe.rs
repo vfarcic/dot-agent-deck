@@ -2584,6 +2584,13 @@ mod linux {
                         keymap::editor_is_helper(probe.selection, &env, &self.helper_path)
                             .map(|()| codex)
                     })
+                    // The revcxfix review's MEDIUM-B: Codex loads
+                    // `$CODEX_HOME/.env` over its environment as it starts;
+                    // its read before the spawn, which each check compares
+                    // the file with.
+                    .and_then(|codex| {
+                        keymap::codex_dotenv_guard(&codex.read.dotenv).map(|()| codex)
+                    })
                     .and_then(|codex| {
                         let (Some(home), Some(cwd)) = (keymap::codex_home(&env), cwd) else {
                             return Err(keymap::Hold::Unmeasured);

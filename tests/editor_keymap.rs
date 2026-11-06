@@ -2683,3 +2683,91 @@ fn probe_099_claude_env_is_compared_with_its_spawn_read() {
     write(&global, r#"{"numStartups": 3, "env": {"A": "1"}}"#);
     assert_eq!(env.check(), Err(Hold::Changed), "the hold latches");
 }
+
+/// Scenario: Judge a Codex home's `.env` file as the deck does before it checks a Codex's box (the revcxfix review's MEDIUM-B): no file passes, and so do lines naming only other variables; `VISUAL` or `EDITOR` in any form Codex reads (plain, `export`, quoted, spaced, any case), even in a comment or beside non-UTF-8 bytes, holds `Editor`, as does a file that can't be read. A `.env` created, changed or removed after the spawn's read holds `Changed`.
+#[spec("inbox/probe/100")]
+#[test]
+fn probe_100_a_codex_home_env_file_naming_the_editor_holds() {
+    use dot_agent_deck::composer_probe::keymap::{CodexBaseline, CodexReads, codex_dotenv_guard};
+    let mut wrong = Vec::new();
+    for (row, contents, want) in [
+        ("plain", &b"VISUAL=nvim\n"[..], Err(Hold::Editor)),
+        ("export", b"export VISUAL=/bin/true\n", Err(Hold::Editor)),
+        (
+            "spaced and quoted",
+            b"  export\tEDITOR = \"vim -f\"\n",
+            Err(Hold::Editor),
+        ),
+        ("single quotes", b"EDITOR='vim'", Err(Hold::Editor)),
+        ("lower case", b"visual=nvim\n", Err(Hold::Editor)),
+        (
+            "after other lines",
+            b"A=1\r\nB=2\r\nVISUAL=x\r\n",
+            Err(Hold::Editor),
+        ),
+        ("in a comment", b"# VISUAL=nvim\n", Err(Hold::Editor)),
+        (
+            "beside non-UTF-8 bytes",
+            b"\xff\xfe\nVISUAL=x\n",
+            Err(Hold::Editor),
+        ),
+        (
+            "other names",
+            b"OPENAI_API_KEY=sk\nMY_VISUAL=x\nEDITOR_X=1\n",
+            Ok(()),
+        ),
+        ("empty", b"", Ok(())),
+    ] {
+        let read = SourceRead::Present {
+            identity: dot_agent_deck::composer_probe::keymap::Identity {
+                dev: 0,
+                ino: 0,
+                size: contents.len() as u64,
+                mtime_ns: 0,
+                ctime_ns: 0,
+                hash: [0; 32],
+            },
+            contents: contents.to_vec(),
+        };
+        let got = codex_dotenv_guard(&read);
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    assert_eq!(codex_dotenv_guard(&SourceRead::Absent), Ok(()));
+    assert_eq!(
+        codex_dotenv_guard(&SourceRead::Unreadable(Unreadable::TooLarge)),
+        Err(Hold::Editor)
+    );
+
+    let codex = Codex::new();
+    let dotenv = codex.home().join(".env");
+    assert_eq!(
+        codex.sources(&[]).dotenv,
+        dotenv,
+        "the home's .env is a source"
+    );
+    let project = codex.dir.path().join("project");
+    for (row, before, after) in [
+        ("created", None, Some("A=1\n")),
+        ("changed", Some("A=1\n"), Some("A=2\n")),
+        ("removed", Some("A=1\n"), None),
+    ] {
+        match before {
+            Some(text) => write(&dotenv, text),
+            None => {
+                let _ = std::fs::remove_file(&dotenv);
+            }
+        }
+        let baseline = CodexBaseline::at_spawn(&codex.home(), &[], &project).unwrap();
+        let reads = CodexReads::new(&baseline);
+        assert_eq!(reads.check(CODEX_ORDER), Ok(()), "{row}: unchanged");
+        std::thread::sleep(TICK);
+        match after {
+            Some(text) => write(&dotenv, text),
+            None => std::fs::remove_file(&dotenv).unwrap(),
+        }
+        assert_eq!(reads.check(CODEX_ORDER), Err(Hold::Changed), "{row}");
+    }
+}
