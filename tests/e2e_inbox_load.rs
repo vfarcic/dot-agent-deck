@@ -130,23 +130,31 @@ fn log_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 
 /// Whether the deck log written since the busy batch was posted shows the
 /// mid-turn hand-over of issue #2133: the first batch to a once-waiter
-/// carried exactly one message, and a later exact-commit report applied
-/// exactly one attempt. When busy 0 instead waits for the next Idle, the
-/// first batch carries it together with the rest, and this is false.
+/// carried exactly one message, and busy 0's own hand-over window, which runs
+/// from that batch line to the next once-waiter batch line (or the end of the
+/// log), holds exactly one exact-commit report, applying its one attempt.
+/// The commit line names no message, so the window is what ties the commit to
+/// busy 0: a commit after the next batch belongs to another hand-over. When
+/// busy 0 instead waits for the next Idle, the first batch carries it together
+/// with the rest, and this is false.
 fn handed_alone_mid_turn(log_since_busy: &str) -> bool {
+    const BATCH: &str = "inbox: a batch went to a once-waiter";
     let mut lines = log_since_busy.lines();
-    let Some(batch) = lines
-        .by_ref()
-        .find(|line| line.contains("inbox: a batch went to a once-waiter"))
-    else {
+    let Some(batch) = lines.by_ref().find(|line| line.contains(BATCH)) else {
         return false;
     };
-    log_field(batch, "count") == Some("1")
-        && lines.any(|line| {
-            line.contains("Received a prompt's exact commits")
-                && log_field(line, "attempts") == Some("1")
-                && log_field(line, "applied") == Some("1")
-        })
+    if log_field(batch, "count") != Some("1") {
+        return false;
+    }
+    let mut commits = lines
+        .take_while(|line| !line.contains(BATCH))
+        .filter(|line| line.contains("Received a prompt's exact commits"));
+    match (commits.next(), commits.next()) {
+        (Some(commit), None) => {
+            log_field(commit, "attempts") == Some("1") && log_field(commit, "applied") == Some("1")
+        }
+        _ => false,
+    }
 }
 
 /// The one message `load_001` may leave unacted (issue #2133): Claude busy
@@ -681,6 +689,37 @@ Received a prompt's exact commits pane_id=1 attempts=1 applied=0 degraded=false\
     let commit_first = "Received a prompt's exact commits pane_id=1 attempts=1 applied=1 degraded=false\n\
 inbox: a batch went to a once-waiter conn_id=7 count=1\n";
     assert!(!excused_unacted(&confirmed(), false, commit_first));
+}
+
+#[test]
+fn mid_turn_excuse_counts_only_a_commit_inside_busy_0s_own_hand_over() {
+    // Busy 0 handed alone, its commit never reported; the only applied
+    // single-attempt commit belongs to the NEXT once-waiter batch.
+    let unrelated = "inbox: a batch went to a once-waiter conn_id=7 count=1\n\
+inbox: a batch went to a once-waiter conn_id=8 count=1\n\
+Received a prompt's exact commits pane_id=1 attempts=1 applied=1 degraded=false\n";
+    assert!(!excused_unacted(&confirmed(), false, unrelated));
+    // The same with busy 0's own commit unapplied inside its window.
+    let own_unapplied = "inbox: a batch went to a once-waiter conn_id=7 count=1\n\
+Received a prompt's exact commits pane_id=1 attempts=1 applied=0 degraded=false\n\
+inbox: a batch went to a once-waiter conn_id=8 count=1\n\
+Received a prompt's exact commits pane_id=1 attempts=1 applied=1 degraded=false\n";
+    assert!(!excused_unacted(&confirmed(), false, own_unapplied));
+    // Two commits inside the window: not the one-message shape claimed.
+    let two = "inbox: a batch went to a once-waiter conn_id=7 count=1\n\
+Received a prompt's exact commits pane_id=1 attempts=1 applied=1 degraded=false\n\
+Received a prompt's exact commits pane_id=1 attempts=1 applied=1 degraded=false\n";
+    assert!(!excused_unacted(&confirmed(), false, two));
+    // The commit inside the window excuses, whatever follows the next batch,
+    // and with no next batch the window runs to the end of the log.
+    let inside = "inbox: a batch went to a once-waiter conn_id=7 count=1\n\
+Received a prompt's exact commits pane_id=1 attempts=1 applied=1 degraded=false\n\
+inbox: a batch went to a once-waiter conn_id=8 count=9\n\
+Received a prompt's exact commits pane_id=1 attempts=9 applied=9 degraded=false\n";
+    assert!(excused_unacted(&confirmed(), false, inside));
+    let to_the_end = "inbox: a batch went to a once-waiter conn_id=7 count=1\n\
+Received a prompt's exact commits pane_id=1 attempts=1 applied=1 degraded=false\n";
+    assert!(excused_unacted(&confirmed(), false, to_the_end));
 }
 
 #[test]
