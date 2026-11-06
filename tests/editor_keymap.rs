@@ -2376,7 +2376,7 @@ fn probe_098_a_codex_home_inside_a_folder_codex_may_write_is_held() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// Scenario: Parse Claude Code settings and config documents for their `env` map and judge them as the deck does before it checks a Claude Code's box (the revcxfix review's MEDIUM-A). An `env` naming `VISUAL` or `EDITOR` in any case, a document that isn't JSON or isn't an object, an `env` named twice and an `env` that isn't an object hold `Editor`; no `env`, an `env` with only other names, a `VISUAL` only in a comment or in another member's value, and a document with comments (Claude Code's settings are JSONC) pass.
+/// Scenario: Parse Claude Code settings and config documents for their `env` map and judge them as the deck does before it checks a Claude Code's box (the revcxfix review's MEDIUM-A). An `env` naming `VISUAL` or `EDITOR` in any case, a document that isn't JSON or isn't an object, an `env` named twice and an `env` that isn't an object hold `Editor`, also after a leading byte-order mark; no `env`, an `env` with only other names, a `VISUAL` only in a comment or in another member's value, a document with comments, and an empty, whitespace-only or comment-only file pass.
 #[spec("inbox/probe/099")]
 #[test]
 fn probe_099_claude_settings_env_naming_the_editor_holds() {
@@ -2399,7 +2399,22 @@ fn probe_099_claude_settings_env_naming_the_editor_holds() {
             editor,
         ),
         ("not JSON", "{\"env\": {\"VISUAL\": ", editor),
-        ("empty file", "", editor),
+        ("empty file", "", Ok(())),
+        ("whitespace only", " \n\t\r\n", Ok(())),
+        ("a line comment only", "// nothing set\n", Ok(())),
+        ("block comments only", "/* a */\n/* b\n */", Ok(())),
+        (
+            "a byte-order mark and no env",
+            "\u{feff}{\"model\": \"x\"}",
+            Ok(()),
+        ),
+        (
+            "a byte-order mark before VISUAL",
+            "\u{feff}{\"env\": {\"VISUAL\": \"nvim\"}}",
+            editor,
+        ),
+        ("a byte-order mark alone", "\u{feff}", Ok(())),
+        ("two byte-order marks", "\u{feff}\u{feff}{}", editor),
         ("an array", r#"[{"env": {}}]"#, editor),
         (
             "env named twice",

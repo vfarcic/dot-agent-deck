@@ -700,9 +700,15 @@ fn claude_env_file(path: &Path) -> EnvRead {
 }
 
 /// The top-level `env` member of a Claude settings or config document,
-/// read after its `//` and `/* */` comments are removed (Claude's settings
-/// files are JSONC). A document that isn't a JSON object, or names `env`
-/// twice (which one Claude keeps isn't measured), is
+/// read after one leading UTF-8 byte-order mark and its `//` and `/* */`
+/// comments are removed. A document that is empty once they are, or only
+/// whitespace, has none ([`EnvRead::NoEnv`]): Claude Code 2.1.318 applies
+/// no `env` from an empty file, refuses a comment-only one as malformed and
+/// skips it, and applies the `env` of a document after a byte-order mark
+/// (the revcxfix2 review's NIT-2, measured in cxfix3's sandbox runs). It
+/// refuses comments altogether, so removing them only lets the deck see an
+/// `env` Claude would skip, which holds. A document that isn't a JSON
+/// object, or names `env` twice (which one Claude keeps isn't measured), is
 /// [`EnvRead::Unparsable`].
 ///
 /// Which JSONC parser Claude Code uses isn't measured, so a document two
@@ -722,9 +728,16 @@ fn claude_env_file(path: &Path) -> EnvRead {
 ///   at a line feed reads on, and each reading can hide an `env` from the
 ///   other (the second by a `/*` that only the first opens).
 pub fn claude_env_member(contents: &[u8]) -> EnvRead {
+    let contents = contents.strip_prefix(b"\xef\xbb\xbf").unwrap_or(contents);
     let Some(cleaned) = without_json_comments(contents) else {
         return EnvRead::Suspect;
     };
+    if cleaned
+        .iter()
+        .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+    {
+        return EnvRead::NoEnv;
+    }
     match serde_json::from_slice::<EnvMember>(&cleaned) {
         Ok(EnvMember { suspect: true, .. }) => EnvRead::Suspect,
         Ok(EnvMember {
