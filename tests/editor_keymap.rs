@@ -2260,17 +2260,18 @@ fn probe_097_a_claude_whose_editor_is_not_the_helper_is_held() {
 fn probe_098_a_codex_home_inside_a_folder_codex_may_write_is_held() {
     use dot_agent_deck::composer_probe::keymap::codex_home_checkable;
     use std::ffi::OsStr;
-    // Under `/var/tmp`, never `/tmp` (the revcxfix review's NIT-1): a base
-    // under `/tmp` is held by the `/tmp` rule whatever the row, which would
-    // make the passing rows fail, and skipping instead passed vacuously.
-    let dir = tempfile::Builder::new()
-        .prefix("dad-probe-098-")
-        .tempdir_in("/var/tmp")
-        .expect("a temporary directory under /var/tmp");
+    // Under the private base in `/var/tmp`, never `/tmp` (the revcxfix
+    // review's NIT-1): a base under `/tmp` is held by the `/tmp` rule
+    // whatever the row, which would make the passing rows fail, and skipping
+    // instead passed vacuously. `test_temp` names it `dad-unit-*`, which
+    // `cargo xtask clean-e2e-tmp` reaps after a SIGKILL (the revcxfix2
+    // review's NIT-3); where it falls back to the OS temp dir, the assert
+    // below fails the test rather than skipping.
+    let dir = test_temp::tempdir().expect("a temporary directory");
     let root = std::fs::canonicalize(dir.path()).unwrap();
     assert!(
         !root.starts_with("/tmp"),
-        "/var/tmp resolves under /tmp here ({}): this test can't run",
+        "the test's directory resolves under /tmp here ({}): this test can't run",
         root.display()
     );
     let mk = |p: &Path| {
@@ -2290,7 +2291,10 @@ fn probe_098_a_codex_home_inside_a_folder_codex_may_write_is_held() {
     std::os::unix::fs::symlink(&nested, &linked_in).unwrap();
     let project_link = root.join("project-link");
     std::os::unix::fs::symlink(&project, &project_link).unwrap();
-    let in_slash_tmp = tempfile::tempdir_in("/tmp").unwrap();
+    let in_slash_tmp = tempfile::Builder::new()
+        .prefix("dad-unit-")
+        .tempdir_in("/tmp")
+        .unwrap();
     let missing = root.join("missing");
 
     let held = Err(Hold::CodexHome);
