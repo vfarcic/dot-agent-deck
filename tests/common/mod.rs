@@ -8577,7 +8577,9 @@ pub(crate) fn strip_hooks_from_claude_settings(raw: &str) -> std::io::Result<Str
 /// check holds a Claude Code on (`keymap::claude_env_member` and
 /// `claude_env_guard`, the revcxfix2 review's LOW-4): every member named
 /// `__proto__`, or `VISUAL` or `EDITOR` in any case, at any depth, and
-/// `HOME` and `CLAUDE_CONFIG_DIR`, in any case, from the top-level `env`.
+/// `HOME`, `CLAUDE_CONFIG_DIR` and every name starting with the deck's own
+/// `DOT_AGENT_DECK_` (the revcxfix3 review's NEW-1), in any case, from the
+/// top-level `env`.
 /// Left in, a developer whose own settings set an editor there would see
 /// every lane-2 Claude probe test held and timed out, which reads like a
 /// product regression; their own panes are held the same way, by design.
@@ -8599,10 +8601,14 @@ pub(crate) fn without_claude_check_holds(v: &mut serde_json::Value) {
     }
     deep(v);
     if let Some(env) = v.get_mut("env").and_then(|env| env.as_object_mut()) {
+        let deck = dot_agent_deck::composer_probe::keymap::DECK_ENV_PREFIX;
         env.retain(|name, _| {
             !["HOME", "CLAUDE_CONFIG_DIR"]
                 .iter()
                 .any(|moved| name.eq_ignore_ascii_case(moved))
+                && !name
+                    .get(..deck.len())
+                    .is_some_and(|start| start.eq_ignore_ascii_case(deck))
         });
     }
 }
