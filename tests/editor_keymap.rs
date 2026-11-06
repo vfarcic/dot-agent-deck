@@ -2684,7 +2684,7 @@ fn probe_099_claude_settings_env_moving_its_config_holds() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// Scenario: Judge Claude Code settings documents whose `env` sets one of the deck's own variables (the revcxfix3 review's NEW-1): `DOT_AGENT_DECK_EDITOR_GEN`, which would point the deck's editor helper at a check that was never armed so that it opens the person's editor, or any other name starting with `DOT_AGENT_DECK_`, in any case, holds `Editor`, also beside a name that moves Claude's configuration; such a name only in a value, outside `env`, or with the prefix inside it, passes.
+/// Scenario: Judge Claude Code settings documents whose `env` sets one of the deck's own variables (the revcxfix3 review's NEW-1): `DOT_AGENT_DECK_EDITOR_GEN`, which would point the deck's editor helper at a check that was never armed so that it opens the person's editor, or any other name starting with `DOT_AGENT_DECK_`, in any case, holds `Editor`, also beside a name that moves Claude's configuration, and so does such a member name anywhere else in the document (at the top, nested, under `ENV`, in an array's object: the revcxfix4 review's LOW-3); such a name only in a value (a hook's command included) or with the prefix inside it passes.
 #[spec("inbox/probe/099")]
 #[test]
 fn probe_099_claude_settings_env_naming_a_deck_variable_holds() {
@@ -2723,13 +2723,33 @@ fn probe_099_claude_settings_env_naming_a_deck_variable_holds() {
             Ok(()),
         ),
         (
-            "outside env",
+            "outside env, at the top",
             r#"{"model": "x", "DOT_AGENT_DECK_EDITOR_GEN": "1"}"#,
+            editor,
+        ),
+        (
+            "outside env, nested",
+            r#"{"permissions": {"DOT_AGENT_DECK_EDITOR_GEN": "1"}}"#,
+            editor,
+        ),
+        (
+            "under ENV beside an empty env",
+            r#"{"env": {}, "ENV": {"DOT_AGENT_DECK_EDITOR_GEN": "1"}}"#,
+            editor,
+        ),
+        (
+            "in an array's object",
+            r#"{"hooks": [{"x": {"dot_agent_deck_pane_id": "3"}}]}"#,
+            editor,
+        ),
+        (
+            "only in a hook command's value",
+            r#"{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "DOT_AGENT_DECK_PANE_ID=3 $DOT_AGENT_DECK_BIN hook"}]}]}}"#,
             Ok(()),
         ),
         (
             "the prefix inside a name, or without its underscore",
-            r#"{"env": {"MY_DOT_AGENT_DECK_X": "1", "DOT_AGENT_DECK": "2"}}"#,
+            r#"{"env": {"MY_DOT_AGENT_DECK_X": "1", "DOT_AGENT_DECK": "2"}, "x": {"MY_DOT_AGENT_DECK_Y": "3"}}"#,
             Ok(()),
         ),
     ] {

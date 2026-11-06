@@ -519,8 +519,9 @@ pub enum EnvRead {
     Env(serde_json::Value),
     /// A document in one of the forms [`claude_env_member`] lists, which
     /// another parser could read a different `env` from than the deck does:
-    /// a member named `__proto__`, or `VISUAL` or `EDITOR` in any case, at
-    /// any depth, a line comment ended by a lone carriage return, or one
+    /// a member named `__proto__`, `VISUAL` or `EDITOR` in any case, or one
+    /// starting with [`DECK_ENV_PREFIX`] in any case, at any depth, a line
+    /// comment ended by a lone carriage return, or one
     /// holding a line or paragraph separator. These are the forms found so
     /// far, not every way two parsers can differ.
     Suspect,
@@ -729,7 +730,11 @@ fn claude_env_file(path: &Path) -> EnvRead {
 ///   inside it one of `env`'s names;
 /// - a member named `VISUAL` or `EDITOR`, in any case, at any depth, the
 ///   way `keybindings.json` is scanned: wherever a parser may put it, it
-///   holds;
+///   holds; and so does a member whose name starts with
+///   [`DECK_ENV_PREFIX`], in any case, at any depth, which in `env` would
+///   set one of the deck's own variables (the revcxfix4 review's LOW-3: no
+///   parser is known to lift such a name into `env`, so this is defence in
+///   depth, like the editor names outside `env`);
 /// - a line comment ended by a carriage return that no line feed follows:
 ///   `jsonc-parser` ends a `//` comment there, a parser that ends it only
 ///   at a line feed reads on, and each reading can hide an `env` from the
@@ -766,12 +771,14 @@ pub fn claude_env_member(contents: &[u8]) -> EnvRead {
 }
 
 /// Whether a member name is one [`claude_env_member`] holds on wherever it
-/// appears: `__proto__`, or `VISUAL` or `EDITOR` in any case.
+/// appears: `__proto__`, `VISUAL` or `EDITOR` in any case, or a name
+/// starting with [`DECK_ENV_PREFIX`] in any case.
 fn suspect_name(name: &str) -> bool {
     name == "__proto__"
         || EDITOR_ENV
             .iter()
             .any(|editor| name.eq_ignore_ascii_case(editor))
+        || names_deck_variable(name.as_bytes())
 }
 
 /// Whether any member name in `value`, at any depth, is a
