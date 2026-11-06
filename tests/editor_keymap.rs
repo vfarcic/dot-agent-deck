@@ -2480,7 +2480,7 @@ impl ClaudeHome {
     }
 }
 
-/// Scenario: Lay out a Claude Code HOME and a working directory inside a git repository on disk, and put `{"env": {"VISUAL": …}}` in each file Claude Code copies an `env` map from, one at a time: the user's `settings.json` and `cowork_settings.json`, `~/.claude.json` and its other-endpoint names, the legacy `~/.claude/.config.json`, the working directory's `.claude/settings.json` and `.claude/settings.local.json`, and the repository root's `.claude/settings.local.json`. Each holds `Editor`, and so do a file that can't be read, a directory where a file belongs, a file past the size bound, a symlink to a file naming `VISUAL` and the cached server-managed settings present at all; with every file absent, or present with no `env`, a dangling symlink included, the box can be checked.
+/// Scenario: Lay out a Claude Code HOME and a working directory inside a git repository on disk, and put `{"env": {"VISUAL": …}}` in each file Claude Code copies an `env` map from, one at a time: the user's `settings.json` and `cowork_settings.json`, the cached server-managed `remote-settings.json`, `~/.claude.json` and its other-endpoint names, the legacy `~/.claude/.config.json`, the working directory's `.claude/settings.json` and `.claude/settings.local.json`, and the repository root's `.claude/settings.local.json`. Each holds `Editor`, and so do a file that can't be read, a directory where a file belongs, a file past the size bound and a symlink to a file naming `VISUAL`; with every file absent, or present with no `env` (server-managed settings as Claude Code caches them included), a dangling symlink included, the box can be checked.
 #[spec("inbox/probe/099")]
 #[test]
 fn probe_099_each_file_claude_takes_an_env_from_is_read() {
@@ -2495,6 +2495,7 @@ fn probe_099_each_file_claude_takes_an_env_from_is_read() {
         claude.home.join(".claude/settings.json"),
         claude.home.join(".claude/cowork_settings.json"),
         claude.home.join(".claude/.config.json"),
+        claude.home.join(".claude/remote-settings.json"),
         claude.home.join(".claude.json"),
         claude.home.join(".claude-custom-oauth.json"),
         claude.home.join(".claude-staging-oauth.json"),
@@ -2543,11 +2544,22 @@ fn probe_099_each_file_claude_takes_an_env_from_is_read() {
     std::fs::remove_file(&target).unwrap();
     let dangling = claude.judge();
     std::fs::remove_file(&settings).unwrap();
+    // The server-managed settings as Claude Code 2.1.319 caches them, for an
+    // account whose organisation sends settings: a plain settings document,
+    // rewritten at each start. It is read like the others, not held.
     let remote = claude.home.join(".claude/remote-settings.json");
-    write(&remote, "{}");
-    held("server-managed settings present", claude.judge());
+    write(
+        &remote,
+        r#"{"availableModels": ["a", "b"], "channelsEnabled": false, "enforceAvailableModels": false, "model": "a"}"#,
+    );
+    let server_managed = claude.judge();
     std::fs::remove_file(&remote).unwrap();
     assert!(wrong.is_empty(), "{wrong:#?}");
+    assert_eq!(
+        server_managed,
+        Ok(()),
+        "server-managed settings with no env"
+    );
     assert_eq!(dangling, Ok(()), "a dangling symlink reads as absent");
     assert_eq!(claude.judge(), Ok(()), "every file absent again");
 }

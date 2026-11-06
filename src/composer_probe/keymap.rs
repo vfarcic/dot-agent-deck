@@ -501,9 +501,6 @@ pub const CLAUDE_DROP_INS: usize = 64;
 pub enum ClaudeEnvSource {
     /// A settings or config file whose top-level `env` member Claude applies.
     File(PathBuf),
-    /// A file the deck can't judge by its contents (the cached server-managed
-    /// settings, whose stored form isn't recorded): present at all holds.
-    Opaque(PathBuf),
     /// A directory of `*.json` settings files (the managed drop-ins).
     DropIns(PathBuf),
 }
@@ -525,8 +522,6 @@ pub enum EnvRead {
     /// The document isn't a JSON object once its comments are removed, or
     /// names `env` twice.
     Unparsable,
-    /// An [`ClaudeEnvSource::Opaque`] file that exists.
-    Opaque,
 }
 
 impl EnvRead {
@@ -565,8 +560,10 @@ pub type ClaudeEnvRead = Vec<(PathBuf, EnvRead)>;
 ///   the cwd's as a legacy location);
 /// - managed settings: `/etc/claude-code/managed-settings.json` and the
 ///   `*.json` files of `/etc/claude-code/managed-settings.d`, and the
-///   cached server-managed settings, `$HOME/.claude/remote-settings.json`,
-///   which holds when present ([`ClaudeEnvSource::Opaque`]).
+///   server-managed settings Claude caches in
+///   `$HOME/.claude/remote-settings.json`, a plain settings document (seen
+///   on 2.1.319, which rewrote it at each start for an account whose
+///   organisation sends settings).
 ///
 /// The flag source is a launch argument ([`claude_args_move_settings`]).
 /// [`Hold::Unmeasured`] as [`claude_keybindings_path`] holds (a
@@ -607,7 +604,7 @@ pub fn claude_env_sources(
     let managed = Path::new("/etc/claude-code");
     sources.push(ClaudeEnvSource::File(managed.join("managed-settings.json")));
     sources.push(ClaudeEnvSource::DropIns(managed.join("managed-settings.d")));
-    sources.push(ClaudeEnvSource::Opaque(config.join("remote-settings.json")));
+    sources.push(ClaudeEnvSource::File(config.join("remote-settings.json")));
     Ok(sources)
 }
 
@@ -630,14 +627,6 @@ pub fn read_claude_env(sources: &[ClaudeEnvSource]) -> ClaudeEnvRead {
     for source in sources {
         match source {
             ClaudeEnvSource::File(path) => reads.push((path.clone(), claude_env_file(path))),
-            ClaudeEnvSource::Opaque(path) => {
-                let read = match read_source_within(path, CLAUDE_ENV_BYTES) {
-                    SourceRead::Absent => EnvRead::NoEnv,
-                    SourceRead::Present { .. } => EnvRead::Opaque,
-                    SourceRead::Unreadable(why) => EnvRead::Unreadable(why),
-                };
-                reads.push((path.clone(), read));
-            }
             ClaudeEnvSource::DropIns(dir) => match std::fs::read_dir(dir) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     reads.push((dir.clone(), EnvRead::NoEnv));
@@ -811,8 +800,7 @@ fn without_json_comments(contents: &[u8]) -> Vec<u8> {
 /// in Claude's environment (Claude applies these over what it inherited),
 /// so it holds as [`Hold::Editor`]; so does anything the deck can't judge:
 /// a file that exists but can't be read or parsed, an `env` that isn't an
-/// object, a managed drop-in directory that can't be listed, and the cached
-/// server-managed settings present at all.
+/// object, and a managed drop-in directory that can't be listed.
 pub fn claude_env_guard(read: &ClaudeEnvRead) -> Result<(), Hold> {
     for (_, env) in read {
         match env {
@@ -826,7 +814,7 @@ pub fn claude_env_guard(read: &ClaudeEnvRead) -> Result<(), Hold> {
                     return Err(Hold::Editor);
                 }
             }
-            EnvRead::Env(_) | EnvRead::Unreadable(_) | EnvRead::Unparsable | EnvRead::Opaque => {
+            EnvRead::Env(_) | EnvRead::Unreadable(_) | EnvRead::Unparsable => {
                 return Err(Hold::Editor);
             }
         }
