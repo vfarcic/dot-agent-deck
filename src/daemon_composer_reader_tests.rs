@@ -312,15 +312,19 @@ impl Deck {
                 std::fs::create_dir_all(&claude).unwrap();
                 std::fs::write(claude.join("keybindings.json"), "{}").unwrap();
                 // What the spawn path reads before the child exists
-                // (A-20d-1b), with the agent's own `HOME`.
+                // (A-20d-1b), with the agent's own `HOME`, in the working
+                // directory the bound agent (this process) runs in: Claude
+                // Code's settings-file `env` sources are read from it, and
+                // another directory holds as changed (cxfix2 MEDIUM-A).
                 let home_dir = dir.path().join("home");
+                let cwd = std::env::current_dir().unwrap();
                 installation.set_keymap_baseline(
                     crate::composer_probe::keymap::KeymapBaseline::at_spawn(
                         true,
                         false,
                         |name| (name == "HOME").then(|| home_dir.clone().into_os_string()),
                         &[],
-                        dir.path(),
+                        &cwd,
                     ),
                 );
             }
