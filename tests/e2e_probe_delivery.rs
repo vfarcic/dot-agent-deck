@@ -863,7 +863,7 @@ fn probe_099_a_claude_whose_settings_env_sets_visual_is_held_without_a_check() {
     held_for_the_editor(&f, false);
 }
 
-/// Scenario: The control for the test above: the same stand-in with a `~/.claude/settings.json` (comments included, as Claude Code allows) that has no `env` map. Typing and deleting text then queueing mail brings the deck's check, and the notice is typed and its mail fetched once.
+/// Scenario: The control for the test above: the same stand-in with a `~/.claude/settings.json` that has no `env` map, and a comment the deck reads past (Claude Code 2.1.318 itself refuses a commented file and skips it). Typing and deleting text then queueing mail brings the deck's check, and the notice is typed and its mail fetched once.
 #[spec("inbox/probe/099")]
 #[test]
 fn probe_099_a_claude_whose_settings_name_no_editor_is_checked_then_rung() {
