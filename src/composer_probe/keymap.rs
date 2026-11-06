@@ -517,10 +517,12 @@ pub enum EnvRead {
     NoEnv,
     /// The document's `env` member, as parsed.
     Env(serde_json::Value),
-    /// A document a JSONC parser could read a different `env` from than
-    /// the deck does ([`claude_env_member`]): a member named `__proto__`, or
-    /// `VISUAL` or `EDITOR` in any case, at any depth, or a line comment
-    /// ended by a lone carriage return.
+    /// A document in one of the forms [`claude_env_member`] lists, which
+    /// another parser could read a different `env` from than the deck does:
+    /// a member named `__proto__`, or `VISUAL` or `EDITOR` in any case, at
+    /// any depth, a line comment ended by a lone carriage return, or one
+    /// holding a line or paragraph separator. These are the forms found so
+    /// far, not every way two parsers can differ.
     Suspect,
     /// The file or directory exists but can't be read.
     Unreadable(Unreadable),
