@@ -2254,7 +2254,7 @@ fn probe_097_a_claude_whose_editor_is_not_the_helper_is_held() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// Scenario: Build the environments a bound agent can have been started with and ask whether the generation its editor helper would read from `DOT_AGENT_DECK_EDITOR_GEN` is the one the deck spawned it under (the revcxfix3 review's NEW-1, through the agent's own environment, as a shell's start-up file or a launcher could set it): the deck's generation passes; another one, an empty one, the same digits with a blank, and none at all hold `Editor`.
+/// Scenario: Build the environments a bound agent can have been started with and ask whether the generation its editor helper would read from `DOT_AGENT_DECK_EDITOR_GEN` is the one the deck spawned it under (the revcxfix3 review's NEW-1, through the agent's own environment, as a shell's start-up file or a launcher could set it): the deck's generation passes, also listed twice; another one, an empty one, the same digits with a blank, and none at all hold `Editor`; the variable listed twice with different values, in either order, holds `Unmeasured`, as a repeated `VISUAL` does.
 #[cfg(target_os = "linux")]
 #[spec("inbox/probe/097")]
 #[test]
@@ -2283,12 +2283,45 @@ fn probe_097_an_agent_whose_helper_reads_another_generation_is_held() {
             Err(Hold::Editor),
         ),
         ("none", vec![("HOME", "/home/u")], Err(Hold::Editor)),
+        (
+            "the deck's first, another after it",
+            vec![
+                ("DOT_AGENT_DECK_EDITOR_GEN", "17"),
+                ("DOT_AGENT_DECK_EDITOR_GEN", "999"),
+            ],
+            Err(Hold::Unmeasured),
+        ),
+        (
+            "another first, the deck's after it",
+            vec![
+                ("DOT_AGENT_DECK_EDITOR_GEN", "999"),
+                ("DOT_AGENT_DECK_EDITOR_GEN", "17"),
+            ],
+            Err(Hold::Unmeasured),
+        ),
+        (
+            "the deck's twice",
+            vec![
+                ("DOT_AGENT_DECK_EDITOR_GEN", "17"),
+                ("DOT_AGENT_DECK_EDITOR_GEN", "17"),
+            ],
+            Ok(()),
+        ),
+        (
+            "the deck's beside a repeated VISUAL",
+            vec![
+                ("DOT_AGENT_DECK_EDITOR_GEN", "17"),
+                ("VISUAL", "/helper"),
+                ("VISUAL", "nvim"),
+            ],
+            Err(Hold::Unmeasured),
+        ),
     ] {
         let environ: Vec<(OsString, OsString)> = pairs
             .iter()
             .map(|(k, v)| (OsString::from(k), OsString::from(v)))
             .collect();
-        let got = generation_is_own(environ_lookup(&environ).unwrap(), "17");
+        let got = environ_lookup(&environ).and_then(|env| generation_is_own(env, "17"));
         if got != want {
             wrong.push(format!("{row}: {got:?}, want {want:?}"));
         }
@@ -2503,7 +2536,7 @@ fn probe_099_claude_settings_env_naming_the_editor_holds() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// Scenario: Judge Claude Code settings documents that another parser could read differently from the deck (the revcxfix2 review's MEDIUM-1, the revcxfix3 review's LOW-A): a `__proto__` member at any depth, `VISUAL` or `EDITOR` as a member name anywhere in the document, a line comment ended by a lone carriage return, and a line comment holding a line or paragraph separator (where a JSON5 parser ends it) each hold `Editor`; a document with CRLF line endings and comments, `VISUAL` only inside a string value, and the separators inside a string or a block comment, pass.
+/// Scenario: Judge Claude Code settings documents that another parser could read differently from the deck (the revcxfix2 review's MEDIUM-1, the revcxfix3 review's LOW-A): a `__proto__` member at any depth, `VISUAL` or `EDITOR` as a member name anywhere in the document, either of them or a deck variable in `env` spelled with a JSON `\u` escape, a line comment ended by a lone carriage return, and a line comment holding a line or paragraph separator (where a JSON5 parser ends it) each hold `Editor`; a document with CRLF line endings and comments, `VISUAL` only inside a string value, and the separators inside a string or a block comment, pass.
 #[spec("inbox/probe/099")]
 #[test]
 fn probe_099_claude_settings_a_parser_could_read_differently_hold() {
@@ -2518,17 +2551,22 @@ fn probe_099_claude_settings_a_parser_could_read_differently_hold() {
         ),
         (
             "__proto__ spelled with an escape",
-            r#"{"__proto__": {"env": {"A": "1"}}}"#,
+            "{\"\\u005f_proto__\": {\"env\": {\"A\": \"1\"}}}",
             editor,
         ),
         (
             "VISUAL spelled with an escape, outside env",
-            r#"{"permissions": {"VISUAL": "vim"}}"#,
+            "{\"permissions\": {\"\\u0056ISUAL\": \"vim\"}}",
+            editor,
+        ),
+        (
+            "a deck variable spelled with an escape, in env",
+            "{\"env\": {\"\\u0044OT_AGENT_DECK_EDITOR_GEN\": \"1\"}}",
             editor,
         ),
         (
             "an escaped name that is neither",
-            r#"{"__proto_x": {"VISUALS": "vim"}, "env": {"A": "1"}}"#,
+            "{\"\\u005f_proto_x\": {\"\\u0056ISUALS\": \"vim\"}, \"env\": {\"\\u0044OT_AGENT_DECKS\": \"1\"}}",
             Ok(()),
         ),
         (
@@ -2646,7 +2684,7 @@ fn probe_099_claude_settings_env_moving_its_config_holds() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// Scenario: Judge Claude Code settings documents whose `env` sets one of the deck's own variables (the revcxfix3 review's NEW-1): `DOT_AGENT_DECK_EDITOR_GEN`, which would point the deck's editor helper at a check that was never armed so that it opens the person's editor, or any other name starting with `DOT_AGENT_DECK_`, in any case, holds `Editor`, also beside a name that moves Claude's configuration; such a name only in a value, outside `env`, or with the prefix inside it, passes.
+/// Scenario: Judge Claude Code settings documents whose `env` sets one of the deck's own variables (the revcxfix3 review's NEW-1): `DOT_AGENT_DECK_EDITOR_GEN`, which would point the deck's editor helper at a check that was never armed so that it opens the person's editor, or any other name starting with `DOT_AGENT_DECK_`, in any case, holds `Editor`, also beside a name that moves Claude's configuration, and so does such a member name anywhere else in the document (at the top, nested, under `ENV`, in an array's object: the revcxfix4 review's LOW-3); such a name only in a value (a hook's command included) or with the prefix inside it passes.
 #[spec("inbox/probe/099")]
 #[test]
 fn probe_099_claude_settings_env_naming_a_deck_variable_holds() {
@@ -2685,13 +2723,33 @@ fn probe_099_claude_settings_env_naming_a_deck_variable_holds() {
             Ok(()),
         ),
         (
-            "outside env",
+            "outside env, at the top",
             r#"{"model": "x", "DOT_AGENT_DECK_EDITOR_GEN": "1"}"#,
+            editor,
+        ),
+        (
+            "outside env, nested",
+            r#"{"permissions": {"DOT_AGENT_DECK_EDITOR_GEN": "1"}}"#,
+            editor,
+        ),
+        (
+            "under ENV beside an empty env",
+            r#"{"env": {}, "ENV": {"DOT_AGENT_DECK_EDITOR_GEN": "1"}}"#,
+            editor,
+        ),
+        (
+            "in an array's object",
+            r#"{"hooks": [{"x": {"dot_agent_deck_pane_id": "3"}}]}"#,
+            editor,
+        ),
+        (
+            "only in a hook command's value",
+            r#"{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "DOT_AGENT_DECK_PANE_ID=3 $DOT_AGENT_DECK_BIN hook"}]}]}}"#,
             Ok(()),
         ),
         (
             "the prefix inside a name, or without its underscore",
-            r#"{"env": {"MY_DOT_AGENT_DECK_X": "1", "DOT_AGENT_DECK": "2"}}"#,
+            r#"{"env": {"MY_DOT_AGENT_DECK_X": "1", "DOT_AGENT_DECK": "2"}, "x": {"MY_DOT_AGENT_DECK_Y": "3"}}"#,
             Ok(()),
         ),
     ] {

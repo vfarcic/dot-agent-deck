@@ -519,8 +519,9 @@ pub enum EnvRead {
     Env(serde_json::Value),
     /// A document in one of the forms [`claude_env_member`] lists, which
     /// another parser could read a different `env` from than the deck does:
-    /// a member named `__proto__`, or `VISUAL` or `EDITOR` in any case, at
-    /// any depth, a line comment ended by a lone carriage return, or one
+    /// a member named `__proto__`, `VISUAL` or `EDITOR` in any case, or one
+    /// starting with [`DECK_ENV_PREFIX`] in any case, at any depth, a line
+    /// comment ended by a lone carriage return, or one
     /// holding a line or paragraph separator. These are the forms found so
     /// far, not every way two parsers can differ.
     Suspect,
@@ -729,7 +730,11 @@ fn claude_env_file(path: &Path) -> EnvRead {
 ///   inside it one of `env`'s names;
 /// - a member named `VISUAL` or `EDITOR`, in any case, at any depth, the
 ///   way `keybindings.json` is scanned: wherever a parser may put it, it
-///   holds;
+///   holds; and so does a member whose name starts with
+///   [`DECK_ENV_PREFIX`], in any case, at any depth, which in `env` would
+///   set one of the deck's own variables (the revcxfix4 review's LOW-3: no
+///   parser is known to lift such a name into `env`, so this is defence in
+///   depth, like the editor names outside `env`);
 /// - a line comment ended by a carriage return that no line feed follows:
 ///   `jsonc-parser` ends a `//` comment there, a parser that ends it only
 ///   at a line feed reads on, and each reading can hide an `env` from the
@@ -739,7 +744,8 @@ fn claude_env_file(path: &Path) -> EnvRead {
 ///   feed doesn't, the same disagreement (the revcxfix3 review's LOW-A).
 ///   A `#` comment, a single-quoted string and an unterminated `/*` need
 ///   no rule of their own: the first two don't parse here and hold, and
-///   the last is a comment to the end of the document for every parser.
+///   after the last no parser reads an `env`: one that takes comments
+///   reads the rest as a comment, one that doesn't refuses the document.
 pub fn claude_env_member(contents: &[u8]) -> EnvRead {
     let contents = contents.strip_prefix(b"\xef\xbb\xbf").unwrap_or(contents);
     let Some(cleaned) = without_json_comments(contents) else {
@@ -766,12 +772,14 @@ pub fn claude_env_member(contents: &[u8]) -> EnvRead {
 }
 
 /// Whether a member name is one [`claude_env_member`] holds on wherever it
-/// appears: `__proto__`, or `VISUAL` or `EDITOR` in any case.
+/// appears: `__proto__`, `VISUAL` or `EDITOR` in any case, or a name
+/// starting with [`DECK_ENV_PREFIX`] in any case.
 fn suspect_name(name: &str) -> bool {
     name == "__proto__"
         || EDITOR_ENV
             .iter()
             .any(|editor| name.eq_ignore_ascii_case(editor))
+        || names_deck_variable(name.as_bytes())
 }
 
 /// Whether any member name in `value`, at any depth, is a
@@ -1940,14 +1948,22 @@ fn names_deck_variable(name: &[u8]) -> bool {
 
 /// A lookup over a process's own environment `environ`, as
 /// `/proc/<pid>/environ` lists it, for the variables in [`KEYMAP_ENV`] and
-/// [`EDITOR_ENV`]: the first value a name has, as `getenv` answers. A name
-/// in either listed twice with different values holds as
-/// [`Hold::Unmeasured`]: which one the agent's runtime reads isn't
-/// measured.
+/// [`EDITOR_ENV`] and the helper's generation
+/// ([`super::install::GENERATION_ENV`]): the first value a name has, as
+/// `getenv` answers. A name in any of them listed twice with different
+/// values holds as [`Hold::Unmeasured`]: which one the agent's runtime
+/// reads isn't measured, and for the generation the reader that matters is
+/// the helper, which an agent that rebuilds its editor's environment
+/// (Rust's `Command` does, keeping the last entry) can hand the other one
+/// (the revcxfix4 review's LOW-1).
 pub fn environ_lookup(
     environ: &[(OsString, OsString)],
 ) -> Result<impl Fn(&str) -> Option<OsString> + '_, Hold> {
-    for name in KEYMAP_ENV.into_iter().chain(EDITOR_ENV) {
+    for name in KEYMAP_ENV
+        .into_iter()
+        .chain(EDITOR_ENV)
+        .chain([super::install::GENERATION_ENV])
+    {
         let mut values = environ.iter().filter(|(k, _)| k == name).map(|(_, v)| v);
         if let Some(first) = values.next()
             && values.any(|v| v != first)
