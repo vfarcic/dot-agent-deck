@@ -937,18 +937,25 @@ fn without_json_comments(contents: &[u8]) -> Option<Vec<u8>> {
 /// so it holds as [`Hold::Editor`]; so does anything the deck can't judge:
 /// a file that exists but can't be read or parsed, a document another
 /// parser could read differently ([`EnvRead::Suspect`]), an `env` that isn't
-/// an object, and a managed drop-in directory that can't be listed.
+/// an object, and a managed drop-in directory that can't be listed. An `env`
+/// naming one of [`CLAUDE_MOVING_ENV`] in any case holds as
+/// [`Hold::Unmeasured`], as the same variable in Claude's environment does
+/// ([`claude_keybindings_path`]).
 pub fn claude_env_guard(read: &ClaudeEnvRead) -> Result<(), Hold> {
     for (_, env) in read {
         match env {
             EnvRead::NoEnv => {}
             EnvRead::Env(serde_json::Value::Object(names)) => {
-                if names.keys().any(|name| {
-                    EDITOR_ENV
-                        .iter()
-                        .any(|editor| name.eq_ignore_ascii_case(editor))
-                }) {
+                let named = |list: &[&str]| {
+                    names
+                        .keys()
+                        .any(|name| list.iter().any(|n| name.eq_ignore_ascii_case(n)))
+                };
+                if named(&EDITOR_ENV) {
                     return Err(Hold::Editor);
+                }
+                if named(&CLAUDE_MOVING_ENV) {
+                    return Err(Hold::Unmeasured);
                 }
             }
             EnvRead::Env(_) | EnvRead::Suspect | EnvRead::Unreadable(_) | EnvRead::Unparsable => {
@@ -958,6 +965,20 @@ pub fn claude_env_guard(read: &ClaudeEnvRead) -> Result<(), Hold> {
     }
     Ok(())
 }
+
+/// The variables that, set in the `env` of a Claude Code settings file,
+/// can move where Claude reads its configuration (the revcxfix2 review's
+/// LOW-1): `CLAUDE_CONFIG_DIR`, which in the pinned 2.1.318 moved where
+/// `keybindings.json` was read from (a `Ctrl+E` bound to the editor in the
+/// named folder's file opened it, measured in cxfix3's sandbox), and `HOME`,
+/// which there didn't but is held as well.
+pub const CLAUDE_MOVING_ENV: [&str; 2] = ["HOME", "CLAUDE_CONFIG_DIR"];
+
+/// The variables that, set in Codex's `$CODEX_HOME/.env`, can move the home
+/// Codex reads its key bindings and keeps its editor folder in, or the
+/// folder [`codex_home_checkable`] judges (the revcxfix2 review's LOW-1):
+/// `HOME`, `CODEX_HOME` and `TMPDIR`. Not run on a real Codex.
+pub const CODEX_MOVING_ENV: [&str; 3] = ["HOME", "CODEX_HOME", "TMPDIR"];
 
 /// Claude Code's `env` sources as the spawn path read them, before the child
 /// existed (A-20d-1b's rule for `keybindings.json`, applied to them).
@@ -1943,24 +1964,27 @@ pub fn codex_editor_is_helper(
 /// holds as [`Hold::Editor`]. The test is a raw scan rather than a parse,
 /// so that every quoting, `export` and spacing form holds: any word of
 /// letters, digits and `_` that is `VISUAL` or `EDITOR` in any case, on any
-/// line, a comment's included, holds.
+/// line, a comment's included, holds. A word that is exactly one of
+/// [`CODEX_MOVING_ENV`] holds as [`Hold::Unmeasured`]: matched in its case,
+/// as Codex sets it, so a value naming a folder under `/home` doesn't.
 pub fn codex_dotenv_guard(read: &SourceRead) -> Result<(), Hold> {
     match read {
         SourceRead::Absent => Ok(()),
         SourceRead::Unreadable(_) => Err(Hold::Editor),
         SourceRead::Present { contents, .. } => {
-            let names_editor = contents
-                .split(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
-                .any(|word| {
-                    EDITOR_ENV
-                        .iter()
-                        .any(|name| word.eq_ignore_ascii_case(name.as_bytes()))
-                });
+            let words = || contents.split(|b| !(b.is_ascii_alphanumeric() || *b == b'_'));
+            let names_editor = words().any(|word| {
+                EDITOR_ENV
+                    .iter()
+                    .any(|name| word.eq_ignore_ascii_case(name.as_bytes()))
+            });
             if names_editor {
-                Err(Hold::Editor)
-            } else {
-                Ok(())
+                return Err(Hold::Editor);
             }
+            if words().any(|word| CODEX_MOVING_ENV.iter().any(|name| word == name.as_bytes())) {
+                return Err(Hold::Unmeasured);
+            }
+            Ok(())
         }
     }
 }

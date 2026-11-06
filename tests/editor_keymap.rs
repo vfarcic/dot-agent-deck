@@ -2528,6 +2528,53 @@ fn probe_099_claude_settings_a_parser_could_read_differently_hold() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Scenario: Judge Claude Code settings documents whose `env` moves where Claude Code reads its configuration (the revcxfix2 review's LOW-1): `CLAUDE_CONFIG_DIR` (which, set there, moved where the pinned 2.1.318 read `keybindings.json` from, measured in a sandbox) and `HOME`, in any case, hold `Unmeasured`; names that only contain them, and a value naming a home folder, pass.
+#[spec("inbox/probe/099")]
+#[test]
+fn probe_099_claude_settings_env_moving_its_config_holds() {
+    use dot_agent_deck::composer_probe::keymap::{claude_env_guard, claude_env_member};
+    let moved = Err(Hold::Unmeasured);
+    let mut wrong = Vec::new();
+    for (row, document, want) in [
+        (
+            "CLAUDE_CONFIG_DIR",
+            r#"{"env": {"CLAUDE_CONFIG_DIR": "/x"}}"#,
+            moved,
+        ),
+        ("HOME", r#"{"env": {"A": "1", "HOME": "/x"}}"#, moved),
+        (
+            "lower case",
+            r#"{"env": {"claude_config_dir": "/x"}}"#,
+            moved,
+        ),
+        (
+            "names containing them",
+            r#"{"env": {"MY_HOME": "1", "HOMEDIR": "2", "CLAUDE_CONFIG_DIRS": "3"}}"#,
+            Ok(()),
+        ),
+        (
+            "a home folder as a value",
+            r#"{"env": {"A": "/home/u/HOME"}}"#,
+            Ok(()),
+        ),
+        (
+            "outside env",
+            r#"{"model": "x", "HOME": "/x", "CLAUDE_CONFIG_DIR": "/y"}"#,
+            Ok(()),
+        ),
+    ] {
+        let read = vec![(
+            PathBuf::from("settings.json"),
+            claude_env_member(document.as_bytes()),
+        )];
+        let got = claude_env_guard(&read);
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// A Claude Code HOME and working directory, each under the private test
 /// base, for [`claude_env_sources`].
 struct ClaudeHome {
@@ -2802,7 +2849,7 @@ fn probe_099_claude_env_is_compared_with_its_spawn_read() {
     }
 }
 
-/// Scenario: Judge a Codex home's `.env` file as the deck does before it checks a Codex's box (the revcxfix review's MEDIUM-B): no file passes, and so do lines naming only other variables; `VISUAL` or `EDITOR` in any form Codex reads (plain, `export`, quoted, spaced, any case), even in a comment or beside non-UTF-8 bytes, holds `Editor`, as does a file that can't be read. A `.env` created, changed or removed after the spawn's read holds `Changed`.
+/// Scenario: Judge a Codex home's `.env` file as the deck does before it checks a Codex's box (the revcxfix review's MEDIUM-B): no file passes, and so do lines naming only other variables; `VISUAL` or `EDITOR` in any form Codex reads (plain, `export`, quoted, spaced, any case), even in a comment or beside non-UTF-8 bytes, holds `Editor`, as does a file that can't be read. `HOME`, `CODEX_HOME` or `TMPDIR` set there holds `Unmeasured`, a value naming a home folder doesn't. A `.env` created, changed or removed after the spawn's read holds `Changed`.
 #[spec("inbox/probe/100")]
 #[test]
 fn probe_100_a_codex_home_env_file_naming_the_editor_holds() {
@@ -2858,6 +2905,47 @@ fn probe_100_a_codex_home_env_file_naming_the_editor_holds() {
         codex_dotenv_guard(&SourceRead::Unreadable(Unreadable::TooLarge)),
         Err(Hold::Editor)
     );
+
+    // The revcxfix2 review's LOW-1: a `.env` that moves the home Codex reads
+    // its key bindings from, or the folder its editor check reads, holds
+    // `Unmeasured`. Names are matched exactly, as Codex sets them, so a
+    // value naming a home folder doesn't hold.
+    for (row, contents, want) in [
+        ("HOME", &b"HOME=/x\n"[..], Err(Hold::Unmeasured)),
+        (
+            "CODEX_HOME",
+            b"export CODEX_HOME=/x\n",
+            Err(Hold::Unmeasured),
+        ),
+        ("TMPDIR", b"A=1\nTMPDIR = \"/x\"\n", Err(Hold::Unmeasured)),
+        (
+            "the editor first",
+            b"HOME=/x\nVISUAL=y\n",
+            Err(Hold::Editor),
+        ),
+        (
+            "a home folder as a value",
+            b"SSL_CERT_FILE=/home/u/c.pem\nMY_HOME=1\nCODEX_HOME_X=1\nhome=/x\n",
+            Ok(()),
+        ),
+    ] {
+        let read = SourceRead::Present {
+            identity: dot_agent_deck::composer_probe::keymap::Identity {
+                dev: 0,
+                ino: 0,
+                size: contents.len() as u64,
+                mtime_ns: 0,
+                ctime_ns: 0,
+                hash: [0; 32],
+            },
+            contents: contents.to_vec(),
+        };
+        let got = codex_dotenv_guard(&read);
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 
     let codex = Codex::new();
     let dotenv = codex.home().join(".env");
