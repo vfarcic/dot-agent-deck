@@ -2502,6 +2502,98 @@ pub(crate) mod tests {
         worker.join().unwrap();
     }
 
+    /// TEMPORARY probe (osh, never merged): on each platform, how often a std
+    /// reader blocked with no read timeout misses its peer's
+    /// `shutdown(SHUT_WR)`, against one that reads with a timeout and reads
+    /// again (the fixed cut-line test's reader). Prints the counts; fails
+    /// only if the re-reading reader ever misses EOF.
+    #[cfg(unix)]
+    #[test]
+    fn osh_probe_half_close_lost_wakeup() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, mpsc};
+
+        #[derive(Default, Debug)]
+        struct Tally {
+            rounds: u64,
+            missed: u64,
+            woken_by_close: u64,
+            leaked: u64,
+        }
+
+        fn round(timeout: Option<Duration>, spin: u32, tally: &mut Tally) {
+            let (mut ours, mut deck) = UnixStream::pair().unwrap();
+            deck.set_read_timeout(timeout).unwrap();
+            let got_line = Arc::new(AtomicBool::new(false));
+            let got = Arc::clone(&got_line);
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 64];
+                loop {
+                    match deck.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(_) => got.store(true, Ordering::SeqCst),
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                io::ErrorKind::WouldBlock
+                                    | io::ErrorKind::TimedOut
+                                    | io::ErrorKind::Interrupted
+                            ) => {}
+                        Err(e) => panic!("{e}"),
+                    }
+                }
+                let _ = tx.send(());
+            });
+            ours.write_all(b"line\n").unwrap();
+            // Land the half-close just as the reader goes back into `read`
+            // for more after taking the line.
+            let start = Instant::now();
+            while !got_line.load(Ordering::SeqCst) {
+                if start.elapsed() > Duration::from_secs(5) {
+                    panic!("the reader never took the line");
+                }
+                std::hint::spin_loop();
+            }
+            for _ in 0..spin {
+                std::hint::spin_loop();
+            }
+            ours.shutdown(std::net::Shutdown::Write).unwrap();
+            tally.rounds += 1;
+            if rx.recv_timeout(Duration::from_secs(1)).is_ok() {
+                return;
+            }
+            tally.missed += 1;
+            // A disconnect waits out the reader's lock dance, so it wakes a
+            // sleeper the shutdown missed.
+            drop(ours);
+            if rx.recv_timeout(Duration::from_secs(1)).is_ok() {
+                tally.woken_by_close += 1;
+            } else {
+                tally.leaked += 1;
+            }
+        }
+
+        let mut blocking = Tally::default();
+        let mut rereading = Tally::default();
+        let mut seed: u32 = 0x9e37_79b9;
+        let until = Instant::now() + Duration::from_secs(50);
+        while Instant::now() < until && blocking.missed < 20 && blocking.rounds < 500_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let spin = seed % 400;
+            round(None, spin, &mut blocking);
+            round(Some(Duration::from_millis(50)), spin, &mut rereading);
+        }
+        eprintln!(
+            "OSH-PROBE {}: blocking reader (no timeout) {blocking:?}; re-reading reader (50 ms timeout) {rereading:?}",
+            std::env::consts::OS
+        );
+        assert_eq!(rereading.missed, 0, "{rereading:?}");
+    }
     /// Scenario: Read the deck's once line through the one-shot's reader:
     /// a whole line, a complete JSON reply whose newline never came before
     /// the connection ended (also delivered in two reads), an empty

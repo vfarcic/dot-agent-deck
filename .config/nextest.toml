@@ -888,3 +888,8 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 [[profile.default.overrides]]
 filter = 'test(/^doorbell_010_live_(kept_draft|spaces_only|spaces_moved_back|blanks_enter|reviewer_sequence)/)'
 slow-timeout = { period = "60s", terminate-after = 5 }
+
+# TEMPORARY (osh probe branch, never merged): print the probe's counts.
+[[profile.default.overrides]]
+filter = 'test(=inbox_oneshot::tests::osh_probe_half_close_lost_wakeup)'
+success-output = "immediate"
