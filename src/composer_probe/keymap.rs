@@ -744,7 +744,8 @@ fn claude_env_file(path: &Path) -> EnvRead {
 ///   feed doesn't, the same disagreement (the revcxfix3 review's LOW-A).
 ///   A `#` comment, a single-quoted string and an unterminated `/*` need
 ///   no rule of their own: the first two don't parse here and hold, and
-///   the last is a comment to the end of the document for every parser.
+///   after the last no parser reads an `env`: one that takes comments
+///   reads the rest as a comment, one that doesn't refuses the document.
 pub fn claude_env_member(contents: &[u8]) -> EnvRead {
     let contents = contents.strip_prefix(b"\xef\xbb\xbf").unwrap_or(contents);
     let Some(cleaned) = without_json_comments(contents) else {
