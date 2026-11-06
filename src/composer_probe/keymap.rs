@@ -708,8 +708,10 @@ fn claude_env_file(path: &Path) -> EnvRead {
 /// no `env` from an empty file, refuses a comment-only one as malformed and
 /// skips it, and applies the `env` of a document after a byte-order mark
 /// (the revcxfix2 review's NIT-2, measured in cxfix3's sandbox runs). It
-/// refuses comments altogether, so removing them only lets the deck see an
-/// `env` Claude would skip, which holds. A document that isn't a JSON
+/// refuses comments altogether, so for 2.1.318 removing them only lets the
+/// deck see an `env` Claude skips with the whole file: that `env` holds if
+/// it names a variable [`claude_env_guard`] holds on, and otherwise passes,
+/// harmlessly, since Claude applies none of it. A document that isn't a JSON
 /// object, or names `env` twice (which one Claude keeps isn't measured), is
 /// [`EnvRead::Unparsable`].
 ///
