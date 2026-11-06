@@ -550,7 +550,7 @@ fn doorbell_053_every_recorded_release_conforms_to_its_agents_facts() {
     }
 }
 
-/// Scenario: Make one of the shipped facts wrong in each way a recorded release can show it: Codex's settle fact faster than 0.160.0's slowest first dialog, a key of Codex's update dialog that commits on the recorded releases called inert, folder trust's `2` taken from 0.164.0 (dismisses) where 0.160.0 commits, a dialog missing from the facts, a key of a recorded dialog missing from the facts, the wrong profile, an editor probe different from the measured one, a recorded release whose echo, key effects or first dialog failed, and an agent with no facts. Each makes conformance fail for the release that contradicts it, with the error naming that contradiction, and the shipped facts pass.
+/// Scenario: Make one of the shipped facts wrong in each way a recorded release can show it: Codex's settle fact faster than 0.160.0's slowest first dialog, a key of Codex's update dialog that commits on the recorded releases called inert, folder trust's `2` taken from 0.164.0 (dismisses) where 0.160.0 commits, a dialog missing from the facts, a key of a recorded dialog missing from the facts, the wrong profile, an editor probe different from the measured one (for Codex, also its export shape or its editor selection alone), a recorded release whose echo, key effects or first dialog failed, and an agent with no facts. Each makes conformance fail for the release that contradicts it, with the error naming that contradiction, and the shipped facts pass.
 #[spec("inbox/doorbell/053")]
 #[test]
 fn doorbell_053_conformance_fails_when_a_fact_is_wrong() {
@@ -692,6 +692,42 @@ fn doorbell_053_conformance_fails_when_a_fact_is_wrong() {
         Ok(()),
         "0.160.0's editor probe was not measured"
     );
+    // Fields the deck reads at run time (the revcxfix review's NIT-2): the
+    // export's shape (where the attestation looks for the file) and the
+    // editor selection (the helper's choice and the settlement's editor
+    // check), each wrong alone.
+    for (field, probe) in [
+        (
+            "export",
+            EditorProbe {
+                export: ExportShape::ClaudeTmpdir,
+                ..dot_agent_deck::doorbell_activation::CODEX_EDITOR_PROBE
+            },
+        ),
+        (
+            "selection",
+            EditorProbe {
+                selection: EditorSelection::ClaudeCode,
+                ..dot_agent_deck::doorbell_activation::CODEX_EDITOR_PROBE
+            },
+        ),
+    ] {
+        let wrong = with_codex(AgentFacts {
+            editor_probe: Measurement::Verified(probe),
+            ..CODEX_FACTS
+        });
+        let got = conformance(codex_164, &wrong);
+        assert!(
+            got.as_ref()
+                .is_err_and(|e| e.contains("editor_probe measured")),
+            "a wrong Codex {field}: {got:?}"
+        );
+        assert_eq!(
+            conformance(codex_160, &wrong),
+            Ok(()),
+            "0.160.0's editor probe was not measured ({field})"
+        );
+    }
     // A recorded release whose echo failed contradicts the verified fact.
     let failed = RecordedRelease {
         release: v("0.170.0"),
