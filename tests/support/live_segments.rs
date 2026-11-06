@@ -241,6 +241,27 @@ impl Fixture {
         Self::configured(kind, extra, true, None, None, None, codex_home)
     }
 
+    /// [`Self::with_env`] with `files` (paths relative to the daemon's HOME,
+    /// which is also the pane's HOME and working directory, and contents)
+    /// written before the first spawn, so the spawn's key-binding baseline
+    /// reads them.
+    pub fn with_home_files(
+        kind: &'static str,
+        extra: &[(&str, &str)],
+        files: &[(&str, &str)],
+    ) -> Self {
+        Self::seeded(
+            kind,
+            extra,
+            true,
+            None,
+            None,
+            None,
+            DEFAULT_CODEX_HOME,
+            files,
+        )
+    }
+
     /// Production Absent control: no editor-probe assumption or binding seam.
     pub fn absent(kind: &'static str, extra: &[(&str, &str)]) -> Self {
         Self::configured(kind, extra, false, None, None, None, DEFAULT_CODEX_HOME)
@@ -311,6 +332,29 @@ impl Fixture {
         hosted: Option<Hosted>,
         through: Option<&'static str>,
         codex_home: &'static str,
+    ) -> Self {
+        Self::seeded(
+            kind,
+            extra,
+            assumed,
+            launcher,
+            hosted,
+            through,
+            codex_home,
+            &[],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn seeded(
+        kind: &'static str,
+        extra: &[(&str, &str)],
+        assumed: bool,
+        launcher: Option<Launcher>,
+        hosted: Option<Hosted>,
+        through: Option<&'static str>,
+        codex_home: &'static str,
+        files: &[(&str, &str)],
     ) -> Self {
         let mut env = vec![("DOT_AGENT_DECK_DOORBELL_TICK_MS", "25")];
         // Claude Code's alone: Codex's classes are in the shipped rollout
@@ -516,6 +560,11 @@ impl Fixture {
             through,
             codex_home,
         };
+        for (path, contents) in files {
+            let path = f.daemon.home.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, contents).unwrap();
+        }
         f.spawn("first", false);
         f
     }

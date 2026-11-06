@@ -1450,7 +1450,12 @@ mod linux {
     /// Q35-20 (O-20.7b): a generation's keymap sources as read before its
     /// spawn (A-20d-1b), which every later read is compared with.
     enum KeymapEvidence {
-        Claude(crate::composer_probe::keymap::ClaudeKeymap),
+        Claude {
+            keymap: crate::composer_probe::keymap::ClaudeKeymap,
+            /// The files Claude Code copies an `env` map from (the revcxfix
+            /// review's MEDIUM-A), read again at each check.
+            env: Box<crate::composer_probe::keymap::ClaudeEnv>,
+        },
         Codex {
             reads: Box<crate::composer_probe::keymap::CodexReads>,
             precedence: &'static [crate::doorbell_activation::KeymapSource],
@@ -1461,7 +1466,12 @@ mod linux {
     impl KeymapEvidence {
         fn check(&self) -> Result<(), crate::composer_probe::keymap::Hold> {
             match self {
-                KeymapEvidence::Claude(keymap) => keymap.check(),
+                KeymapEvidence::Claude { keymap, env } => {
+                    // Both are read at every check, so a change to either
+                    // latches even while the other holds.
+                    let env = env.check();
+                    keymap.check().and(env)
+                }
                 KeymapEvidence::Codex { reads, precedence } => reads.check(precedence),
                 KeymapEvidence::Held(hold) => Err(*hold),
             }
@@ -2542,17 +2552,28 @@ mod linux {
                 // its own environment selects, by its release's record, must
                 // be the helper, or a probe would open another one in the
                 // person's pane.
-                AgentType::ClaudeCode => match baseline.claude_bound(&env).and_then(|bound| {
-                    keymap::editor_is_helper(probe.selection, &env, &self.helper_path)
-                        .map(|()| bound)
-                }) {
-                    Ok((path, read)) => {
-                        KeymapEvidence::Claude(keymap::ClaudeKeymap::from_spawn_read(
+                // The revcxfix review's MEDIUM-A: Claude Code also copies
+                // the `env` maps of its settings files into its environment
+                // as it starts, which no environment read sees.
+                AgentType::ClaudeCode => match baseline
+                    .claude_bound(&env)
+                    .and_then(|bound| {
+                        keymap::editor_is_helper(probe.selection, &env, &self.helper_path)
+                            .map(|()| bound)
+                    })
+                    .and_then(|bound| {
+                        baseline
+                            .claude_env_bound(&env, args, cwd)
+                            .map(|settings| (bound, settings))
+                    }) {
+                    Ok(((path, read), settings)) => KeymapEvidence::Claude {
+                        keymap: keymap::ClaudeKeymap::from_spawn_read(
                             path.to_path_buf(),
                             read.clone(),
                             probe,
-                        ))
-                    }
+                        ),
+                        env: Box::new(keymap::ClaudeEnv::new(settings)),
+                    },
                     Err(hold) => KeymapEvidence::Held(hold),
                 },
                 // Ruling Q227b: a Codex home inside a folder Codex may

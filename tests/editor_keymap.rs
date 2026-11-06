@@ -2371,3 +2371,315 @@ fn probe_098_a_codex_home_inside_a_folder_codex_may_write_is_held() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Scenario: Parse Claude Code settings and config documents for their `env` map and judge them as the deck does before it checks a Claude Code's box (the revcxfix review's MEDIUM-A). An `env` naming `VISUAL` or `EDITOR` in any case, a document that isn't JSON or isn't an object, an `env` named twice and an `env` that isn't an object hold `Editor`; no `env`, an `env` with only other names, a `VISUAL` only in a comment or in another member's value, and a document with comments (Claude Code's settings are JSONC) pass.
+#[spec("inbox/probe/099")]
+#[test]
+fn probe_099_claude_settings_env_naming_the_editor_holds() {
+    use dot_agent_deck::composer_probe::keymap::{claude_env_guard, claude_env_member};
+    let editor = Err(Hold::Editor);
+    let mut wrong = Vec::new();
+    for (row, document, want) in [
+        ("VISUAL in env", r#"{"env": {"VISUAL": "nvim"}}"#, editor),
+        ("EDITOR in env", r#"{"env": {"EDITOR": "vim"}}"#, editor),
+        ("lower case", r#"{"env": {"visual": "nvim"}}"#, editor),
+        ("mixed case", r#"{"env": {"Editor": "vim"}}"#, editor),
+        (
+            "beside other names",
+            r#"{"model": "x", "env": {"A": "1", "VISUAL": ""}}"#,
+            editor,
+        ),
+        (
+            "env after a comment",
+            "{\n // note\n \"env\": {/* x */ \"VISUAL\": \"nvim\"}\n}",
+            editor,
+        ),
+        ("not JSON", "{\"env\": {\"VISUAL\": ", editor),
+        ("empty file", "", editor),
+        ("an array", r#"[{"env": {}}]"#, editor),
+        (
+            "env named twice",
+            r#"{"env": {"A": "1"}, "env": {"B": "2"}}"#,
+            editor,
+        ),
+        ("env not an object", r#"{"env": "VISUAL=nvim"}"#, editor),
+        ("no env", r#"{"permissions": {"allow": []}}"#, Ok(())),
+        ("an empty object", "{}", Ok(())),
+        (
+            "other names only",
+            r#"{"env": {"DAD_UNRELATED": "1", "MY_EDITOR": "x"}}"#,
+            Ok(()),
+        ),
+        (
+            "VISUAL only in a comment",
+            "{\n  // \"env\": {\"VISUAL\": \"nvim\"}\n  \"model\": \"x\"\n}",
+            Ok(()),
+        ),
+        (
+            "VISUAL only in another member's value",
+            r#"{"statusLine": {"command": "echo $VISUAL"}, "editorMode": "vim"}"#,
+            Ok(()),
+        ),
+        (
+            "a comment marker inside a string",
+            r#"{"model": "a//b/*c", "env": {"A": "1"}}"#,
+            Ok(()),
+        ),
+    ] {
+        let read = vec![(
+            PathBuf::from("settings.json"),
+            claude_env_member(document.as_bytes()),
+        )];
+        let got = claude_env_guard(&read);
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A Claude Code HOME and working directory, each under the private test
+/// base, for [`claude_env_sources`].
+struct ClaudeHome {
+    _dir: tempfile::TempDir,
+    home: PathBuf,
+    cwd: PathBuf,
+}
+
+impl ClaudeHome {
+    fn new() -> ClaudeHome {
+        let dir = test_temp::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let home = root.join("home");
+        let cwd = root.join("repo/sub");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+        std::fs::create_dir_all(root.join("repo/.git")).unwrap();
+        ClaudeHome {
+            _dir: dir,
+            home,
+            cwd,
+        }
+    }
+
+    fn env(&self) -> impl Fn(&str) -> Option<OsString> + '_ {
+        move |name| (name == "HOME").then(|| self.home.clone().into_os_string())
+    }
+
+    fn sources(&self) -> Vec<dot_agent_deck::composer_probe::keymap::ClaudeEnvSource> {
+        dot_agent_deck::composer_probe::keymap::claude_env_sources(self.env(), &self.cwd).unwrap()
+    }
+
+    fn judge(&self) -> Result<(), Hold> {
+        use dot_agent_deck::composer_probe::keymap::{claude_env_guard, read_claude_env};
+        claude_env_guard(&read_claude_env(&self.sources()))
+    }
+}
+
+/// Scenario: Lay out a Claude Code HOME and a working directory inside a git repository on disk, and put `{"env": {"VISUAL": …}}` in each file Claude Code copies an `env` map from, one at a time: the user's `settings.json` and `cowork_settings.json`, `~/.claude.json` and its other-endpoint names, the legacy `~/.claude/.config.json`, the working directory's `.claude/settings.json` and `.claude/settings.local.json`, and the repository root's `.claude/settings.local.json`. Each holds `Editor`, and so do a file that can't be read, a directory where a file belongs, a file past the size bound, a symlink to a file naming `VISUAL` and the cached server-managed settings present at all; with every file absent, or present with no `env`, a dangling symlink included, the box can be checked.
+#[spec("inbox/probe/099")]
+#[test]
+fn probe_099_each_file_claude_takes_an_env_from_is_read() {
+    use dot_agent_deck::composer_probe::keymap::CLAUDE_ENV_BYTES;
+    use std::os::unix::fs::PermissionsExt;
+    let visual = r#"{"env": {"VISUAL": "/bin/true"}}"#;
+    let claude = ClaudeHome::new();
+    assert_eq!(claude.judge(), Ok(()), "every file absent");
+    let repo = claude.cwd.parent().unwrap().to_path_buf();
+    let mut wrong = Vec::new();
+    for path in [
+        claude.home.join(".claude/settings.json"),
+        claude.home.join(".claude/cowork_settings.json"),
+        claude.home.join(".claude/.config.json"),
+        claude.home.join(".claude.json"),
+        claude.home.join(".claude-custom-oauth.json"),
+        claude.home.join(".claude-staging-oauth.json"),
+        claude.home.join(".claude-local-oauth.json"),
+        claude.cwd.join(".claude/settings.json"),
+        claude.cwd.join(".claude/settings.local.json"),
+        repo.join(".claude/settings.local.json"),
+    ] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write(&path, visual);
+        if claude.judge() != Err(Hold::Editor) {
+            wrong.push(format!("VISUAL in {} passed", path.display()));
+        }
+        write(&path, r#"{"env": {"DAD_UNRELATED": "1"}, "model": "x"}"#);
+        if claude.judge() != Ok(()) {
+            wrong.push(format!("no editor in {} held", path.display()));
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+    let settings = claude.home.join(".claude/settings.json");
+    let mut held = |row: &str, judge: Result<(), Hold>| {
+        if judge != Err(Hold::Editor) {
+            wrong.push(format!("{row}: {judge:?}"));
+        }
+    };
+    write(&settings, "{}");
+    std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&settings).is_err() {
+        held("an unreadable file", claude.judge());
+    }
+    std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::remove_file(&settings).unwrap();
+    std::fs::create_dir(&settings).unwrap();
+    held("a directory", claude.judge());
+    std::fs::remove_dir(&settings).unwrap();
+    std::fs::File::create(&settings)
+        .unwrap()
+        .set_len(CLAUDE_ENV_BYTES + 1)
+        .unwrap();
+    held("past the size bound", claude.judge());
+    std::fs::remove_file(&settings).unwrap();
+    let target = claude.home.join("elsewhere.json");
+    write(&target, visual);
+    std::os::unix::fs::symlink(&target, &settings).unwrap();
+    held("a symlink to a file naming VISUAL", claude.judge());
+    std::fs::remove_file(&target).unwrap();
+    let dangling = claude.judge();
+    std::fs::remove_file(&settings).unwrap();
+    let remote = claude.home.join(".claude/remote-settings.json");
+    write(&remote, "{}");
+    held("server-managed settings present", claude.judge());
+    std::fs::remove_file(&remote).unwrap();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    assert_eq!(dangling, Ok(()), "a dangling symlink reads as absent");
+    assert_eq!(claude.judge(), Ok(()), "every file absent again");
+}
+
+/// Scenario: Read a directory of managed drop-in settings as the deck reads `/etc/claude-code/managed-settings.d`: a missing directory and `.json` files without an editor pass, a `.json` file naming `EDITOR` holds `Editor` while a non-`.json` file is not read, a directory that can't be listed holds, and more files than the bound hold.
+#[spec("inbox/probe/099")]
+#[test]
+fn probe_099_claude_managed_drop_ins_are_read() {
+    use dot_agent_deck::composer_probe::keymap::{
+        CLAUDE_DROP_INS, ClaudeEnvSource, claude_env_guard, read_claude_env,
+    };
+    use std::os::unix::fs::PermissionsExt;
+    let dir = test_temp::tempdir().unwrap();
+    let drop_ins = dir.path().join("managed-settings.d");
+    let judge = || {
+        claude_env_guard(&read_claude_env(&[ClaudeEnvSource::DropIns(
+            drop_ins.clone(),
+        )]))
+    };
+    assert_eq!(judge(), Ok(()), "no directory");
+    std::fs::create_dir(&drop_ins).unwrap();
+    write(&drop_ins.join("10-a.json"), r#"{"env": {"A": "1"}}"#);
+    write(&drop_ins.join("README"), r#"{"env": {"EDITOR": "vim"}}"#);
+    assert_eq!(judge(), Ok(()), "a non-.json file is not read");
+    write(&drop_ins.join("20-b.JSON"), r#"{"env": {"EDITOR": "vim"}}"#);
+    assert_eq!(judge(), Err(Hold::Editor), "a .json drop-in naming EDITOR");
+    std::fs::remove_file(drop_ins.join("20-b.JSON")).unwrap();
+    std::fs::set_permissions(&drop_ins, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let unlistable = std::fs::read_dir(&drop_ins).is_err();
+    let got = judge();
+    std::fs::set_permissions(&drop_ins, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if unlistable {
+        assert_eq!(got, Err(Hold::Editor), "a directory that can't be listed");
+    }
+    for n in 0..=CLAUDE_DROP_INS {
+        write(&drop_ins.join(format!("{n:03}.json")), "{}");
+    }
+    assert_eq!(judge(), Err(Hold::Editor), "more drop-ins than the bound");
+}
+
+/// Scenario: Ask where Claude Code takes `env` maps from for environments and launches the deck can't follow: a `CLAUDE_CONFIG_DIR`, no `HOME` and a relative working directory are `Unmeasured`; `--settings` and `--project-config-root`, separate or with `=`, are found on the launch's arguments, and other arguments are not.
+#[spec("inbox/probe/099")]
+#[test]
+fn probe_099_claude_env_sources_it_cannot_follow() {
+    use dot_agent_deck::composer_probe::keymap::{claude_args_move_settings, claude_env_sources};
+    let home = |name: &str| (name == "HOME").then(|| OsString::from("/home/u"));
+    let config_dir = |name: &str| match name {
+        "HOME" => Some(OsString::from("/home/u")),
+        "CLAUDE_CONFIG_DIR" => Some(OsString::from("/home/u/cfg")),
+        _ => None,
+    };
+    assert_eq!(
+        claude_env_sources(config_dir, Path::new("/w")).err(),
+        Some(Hold::Unmeasured)
+    );
+    assert_eq!(
+        claude_env_sources(|_: &str| None, Path::new("/w")).err(),
+        Some(Hold::Unmeasured)
+    );
+    assert_eq!(
+        claude_env_sources(home, Path::new("w")).err(),
+        Some(Hold::Unmeasured)
+    );
+    for (launch, want) in [
+        (&["--settings", "/x.json"][..], true),
+        (&["--model", "haiku", "--settings={}"][..], true),
+        (&["--project-config-root", "/p"][..], true),
+        (&["--project-config-root=/p"][..], true),
+        (&["--model", "haiku"][..], false),
+        (&["--setting-sources", "user"][..], false),
+        (&["--settingsx"][..], false),
+    ] {
+        assert_eq!(claude_args_move_settings(&args(launch)), want, "{launch:?}");
+    }
+}
+
+/// Scenario: Take a Claude Code's `env` sources before its spawn and judge them for the bound agent, then read them again as each check does. The same sources and reads pass; another working directory is `Changed`, `--settings` on its arguments `Editor` and unread arguments `Unmeasured`. After settlement a rewrite that leaves every `env` as it was (Claude Code rewrites `~/.claude.json` at each start) passes, a file caught half written holds that check alone, and an `env` that changed holds `Changed` for every later check, even once it is changed back.
+#[spec("inbox/probe/099")]
+#[test]
+fn probe_099_claude_env_is_compared_with_its_spawn_read() {
+    use dot_agent_deck::composer_probe::keymap::{ClaudeEnv, ClaudeEnvBaseline};
+    let claude = ClaudeHome::new();
+    let global = claude.home.join(".claude.json");
+    write(&global, r#"{"numStartups": 1, "env": {"A": "1"}}"#);
+    let baseline = ClaudeEnvBaseline::at_spawn(claude.env(), &claude.cwd).unwrap();
+    let none: &[OsString] = &[];
+    assert_eq!(
+        baseline.bound(claude.env(), Some(none), Some(&claude.cwd)),
+        Ok(())
+    );
+    let other = claude.cwd.parent().unwrap();
+    assert_eq!(
+        baseline.bound(claude.env(), Some(none), Some(other)),
+        Err(Hold::Changed)
+    );
+    assert_eq!(
+        baseline.bound(
+            claude.env(),
+            Some(&args(&["--settings", "/x"])),
+            Some(&claude.cwd)
+        ),
+        Err(Hold::Editor)
+    );
+    assert_eq!(
+        baseline.bound(claude.env(), None, Some(&claude.cwd)),
+        Err(Hold::Unmeasured)
+    );
+    write(&global, r#"{"numStartups": 1, "env": {"A": "2"}}"#);
+    assert_eq!(
+        baseline.bound(claude.env(), Some(none), Some(&claude.cwd)),
+        Err(Hold::Changed),
+        "changed between the spawn and the settlement"
+    );
+    write(&global, r#"{"numStartups": 1, "env": {"A": "1"}}"#);
+
+    let env = ClaudeEnv::new(&baseline);
+    assert_eq!(env.check(), Ok(()));
+    write(
+        &global,
+        r#"{"numStartups": 2, "tips": {"x": 1}, "env": {"A": "1"}}"#,
+    );
+    assert_eq!(env.check(), Ok(()), "a rewrite that keeps the env");
+    write(
+        &claude.cwd.join(".claude/settings.local.json"),
+        r#"{"permissions": {}}"#,
+    );
+    assert_eq!(env.check(), Ok(()), "a settings file with no env created");
+    write(&global, r#"{"numStartups": 2, "env": {"#);
+    assert_eq!(env.check(), Err(Hold::Unparsable), "caught half written");
+    write(&global, r#"{"numStartups": 3, "env": {"A": "1"}}"#);
+    assert_eq!(env.check(), Ok(()), "a half-written read doesn't latch");
+    write(
+        &global,
+        r#"{"numStartups": 3, "env": {"A": "1", "VISUAL": "nvim"}}"#,
+    );
+    assert_eq!(env.check(), Err(Hold::Changed));
+    write(&global, r#"{"numStartups": 3, "env": {"A": "1"}}"#);
+    assert_eq!(env.check(), Err(Hold::Changed), "the hold latches");
+}
