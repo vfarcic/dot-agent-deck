@@ -1253,8 +1253,10 @@ impl AgentPtyRegistry {
         };
         if let Err(refusal) = h.observer.admits(&outside, now) {
             // MEDIUM-2: the widths a `Surface` refusal's frame was judged
-            // at, so a missing width witness shows in the log.
-            let widths = (refusal == crate::composer_probe::admission::Refusal::Surface)
+            // at, so a missing width witness shows in the log; read only
+            // when the line is logged (the revcxfix review's NIT-3).
+            let widths = (tracing::enabled!(target: "composer_probe", tracing::Level::DEBUG)
+                && refusal == crate::composer_probe::admission::Refusal::Surface)
                 .then(|| h.bus.evidence_widths());
             tracing::debug!(
                 target: "composer_probe",
