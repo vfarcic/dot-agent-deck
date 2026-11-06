@@ -2260,15 +2260,19 @@ fn probe_097_a_claude_whose_editor_is_not_the_helper_is_held() {
 fn probe_098_a_codex_home_inside_a_folder_codex_may_write_is_held() {
     use dot_agent_deck::composer_probe::keymap::codex_home_checkable;
     use std::ffi::OsStr;
-    let dir = test_temp::tempdir().unwrap();
+    // Under `/var/tmp`, never `/tmp` (the revcxfix review's NIT-1): a base
+    // under `/tmp` is held by the `/tmp` rule whatever the row, which would
+    // make the passing rows fail, and skipping instead passed vacuously.
+    let dir = tempfile::Builder::new()
+        .prefix("dad-probe-098-")
+        .tempdir_in("/var/tmp")
+        .expect("a temporary directory under /var/tmp");
     let root = std::fs::canonicalize(dir.path()).unwrap();
-    if root.starts_with("/tmp") {
-        eprintln!(
-            "SKIP: the test's temp base {} is under /tmp",
-            root.display()
-        );
-        return;
-    }
+    assert!(
+        !root.starts_with("/tmp"),
+        "/var/tmp resolves under /tmp here ({}): this test can't run",
+        root.display()
+    );
     let mk = |p: &Path| {
         std::fs::create_dir_all(p).unwrap();
         p.to_path_buf()
