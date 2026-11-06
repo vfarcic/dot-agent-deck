@@ -401,13 +401,23 @@ fn exercise(deck: &TuiDeck, pane: &Pane, work: &Path, kind: &str, doorbell_only:
     delivered(deck, pane, work, &busy_ids, deadline, doorbell_only);
     idle(deck, pane, deadline);
     if kind == "claude_code" {
-        let before_clear = inbox::listing(deck, pane)["armed"].as_u64().unwrap_or(0);
+        // A clear's SessionStart arms a waiter that takes the place of the
+        // one before it, so the armed count stays at one (inbox/claude/013):
+        // count registrations in the deck's log rather than the live count.
+        let registered = || {
+            std::fs::read_to_string(deck.workdir().join("deck.log"))
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| {
+                    line.contains("receipt receiver registered") && line.contains("once_waiter")
+                })
+                .count()
+        };
+        let before_clear = registered();
         input.write("/clear\r");
         assert!(
-            common::wait_until(remaining(deadline), || inbox::listing(deck, pane)["armed"]
-                .as_u64()
-                .unwrap_or(0)
-                > before_clear),
+            common::wait_until(remaining(deadline), || registered() > before_clear
+                && inbox::listing(deck, pane)["armed"].as_u64().unwrap_or(0) > 0),
             "clear must arm another native waiter"
         );
         let clear_ids = batch(deck, pane, work, "clear", 5);
