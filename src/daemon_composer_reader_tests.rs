@@ -368,6 +368,12 @@ impl Deck {
             for name in ["VISUAL", "EDITOR"] {
                 environ.push((name.into(), instance.helper().as_os_str().to_os_string()));
             }
+            // And the generation the helper reads, as the spawn set it (the
+            // revcxfix3 review's NEW-1).
+            environ.push((
+                crate::composer_probe::install::GENERATION_ENV.into(),
+                generation.to_string().into(),
+            ));
             installation.set_bound_environ_for_test(environ);
             Spawned {
                 agent_id: id.clone(),

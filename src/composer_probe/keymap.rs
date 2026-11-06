@@ -517,10 +517,12 @@ pub enum EnvRead {
     NoEnv,
     /// The document's `env` member, as parsed.
     Env(serde_json::Value),
-    /// A document a JSONC parser could read a different `env` from than
-    /// the deck does ([`claude_env_member`]): a member named `__proto__`, or
-    /// `VISUAL` or `EDITOR` in any case, at any depth, or a line comment
-    /// ended by a lone carriage return.
+    /// A document in one of the forms [`claude_env_member`] lists, which
+    /// another parser could read a different `env` from than the deck does:
+    /// a member named `__proto__`, or `VISUAL` or `EDITOR` in any case, at
+    /// any depth, a line comment ended by a lone carriage return, or one
+    /// holding a line or paragraph separator. These are the forms found so
+    /// far, not every way two parsers can differ.
     Suspect,
     /// The file or directory exists but can't be read.
     Unreadable(Unreadable),
@@ -706,8 +708,10 @@ fn claude_env_file(path: &Path) -> EnvRead {
 /// no `env` from an empty file, refuses a comment-only one as malformed and
 /// skips it, and applies the `env` of a document after a byte-order mark
 /// (the revcxfix2 review's NIT-2, measured in cxfix3's sandbox runs). It
-/// refuses comments altogether, so removing them only lets the deck see an
-/// `env` Claude would skip, which holds. A document that isn't a JSON
+/// refuses comments altogether, so for 2.1.318 removing them only lets the
+/// deck see an `env` Claude skips with the whole file: that `env` holds if
+/// it names a variable [`claude_env_guard`] holds on, and otherwise passes,
+/// harmlessly, since Claude applies none of it. A document that isn't a JSON
 /// object, or names `env` twice (which one Claude keeps isn't measured), is
 /// [`EnvRead::Unparsable`].
 ///
@@ -729,7 +733,13 @@ fn claude_env_file(path: &Path) -> EnvRead {
 /// - a line comment ended by a carriage return that no line feed follows:
 ///   `jsonc-parser` ends a `//` comment there, a parser that ends it only
 ///   at a line feed reads on, and each reading can hide an `env` from the
-///   other (the second by a `/*` that only the first opens).
+///   other (the second by a `/*` that only the first opens);
+/// - a line comment holding a line or paragraph separator (U+2028,
+///   U+2029), where a JSON5 parser ends it and one that ends it at a line
+///   feed doesn't, the same disagreement (the revcxfix3 review's LOW-A).
+///   A `#` comment, a single-quoted string and an unterminated `/*` need
+///   no rule of their own: the first two don't parse here and hold, and
+///   the last is a comment to the end of the document for every parser.
 pub fn claude_env_member(contents: &[u8]) -> EnvRead {
     let contents = contents.strip_prefix(b"\xef\xbb\xbf").unwrap_or(contents);
     let Some(cleaned) = without_json_comments(contents) else {
@@ -878,8 +888,9 @@ impl<'de> serde::Deserialize<'de> for NameScan {
 
 /// `contents` with its `//` line and `/* */` block comments turned into
 /// blanks (newlines kept), outside strings; `None` when a line comment is
-/// ended by a carriage return that no line feed follows, where JSONC
-/// parsers disagree on where the comment ends ([`claude_env_member`]).
+/// ended by a carriage return that no line feed follows, or holds a line or
+/// paragraph separator (U+2028, U+2029), where JSONC and JSON5 parsers
+/// disagree on where the comment ends ([`claude_env_member`]).
 fn without_json_comments(contents: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(contents.len());
     let mut i = 0;
@@ -909,6 +920,14 @@ fn without_json_comments(contents: &[u8]) -> Option<Vec<u8>> {
                 if contents[i] == b'\r' && contents.get(i + 1) != Some(&b'\n') {
                     return None;
                 }
+                // U+2028 and U+2029, which end a line comment for a JSON5
+                // parser and not for one that ends it at a line feed (the
+                // revcxfix3 review's LOW-A).
+                if contents[i..].starts_with(b"\xe2\x80\xa8")
+                    || contents[i..].starts_with(b"\xe2\x80\xa9")
+                {
+                    return None;
+                }
                 out.push(b' ');
                 i += 1;
             }
@@ -935,9 +954,11 @@ fn without_json_comments(contents: &[u8]) -> Option<Vec<u8>> {
 /// Whether a read of Claude Code's `env` sources leaves its editor to the
 /// environment it was started with: every file absent, or without an `env`
 /// member, or with an `env` object none of whose names is, in any case,
-/// `VISUAL` or `EDITOR`. A name there would replace the helper the deck put
-/// in Claude's environment (Claude applies these over what it inherited),
-/// so it holds as [`Hold::Editor`]; so does anything the deck can't judge:
+/// `VISUAL` or `EDITOR`, or starts with [`DECK_ENV_PREFIX`]. A name there
+/// would replace the helper the deck put in Claude's environment, or the
+/// generation it gave the helper (Claude applies these over what it
+/// inherited), so it holds as [`Hold::Editor`]; so does anything the deck
+/// can't judge:
 /// a file that exists but can't be read or parsed, a document another
 /// parser could read differently ([`EnvRead::Suspect`]), an `env` that isn't
 /// an object, and a managed drop-in directory that can't be listed. An `env`
@@ -954,7 +975,11 @@ pub fn claude_env_guard(read: &ClaudeEnvRead) -> Result<(), Hold> {
                         .keys()
                         .any(|name| list.iter().any(|n| name.eq_ignore_ascii_case(n)))
                 };
-                if named(&EDITOR_ENV) {
+                if named(&EDITOR_ENV)
+                    || names
+                        .keys()
+                        .any(|name| names_deck_variable(name.as_bytes()))
+                {
                     return Err(Hold::Editor);
                 }
                 if named(&CLAUDE_MOVING_ENV) {
@@ -1893,6 +1918,26 @@ pub const KEYMAP_ENV: [&str; 3] = ["HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME"];
 /// ([`editor_is_helper`]).
 pub const EDITOR_ENV: [&str; 2] = ["VISUAL", "EDITOR"];
 
+/// The prefix of the deck's own variables, which a file an agent copies
+/// variables from as it starts (Claude Code's settings `env`, Codex's
+/// `$CODEX_HOME/.env`) must not set (the revcxfix3 review's NEW-1). The
+/// editor helper takes the check's generation from
+/// `DOT_AGENT_DECK_EDITOR_GEN` in its own environment, which it inherits
+/// from the agent; one set there names a generation the deck never armed,
+/// and the helper then opens the person's saved editor in the pane, as it
+/// does for their own Ctrl+G. The whole prefix holds rather than the
+/// helper's own `DOT_AGENT_DECK_EDITOR_`: the others (the pane, the
+/// sockets, the hooks' binary) wire the agent to the deck, and are set in
+/// the environment the deck or its agent starts from, where one set in
+/// these files would override them.
+pub const DECK_ENV_PREFIX: &str = "DOT_AGENT_DECK_";
+
+/// Whether `name` starts with [`DECK_ENV_PREFIX`], in any case.
+fn names_deck_variable(name: &[u8]) -> bool {
+    name.get(..DECK_ENV_PREFIX.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(DECK_ENV_PREFIX.as_bytes()))
+}
+
 /// A lookup over a process's own environment `environ`, as
 /// `/proc/<pid>/environ` lists it, for the variables in [`KEYMAP_ENV`] and
 /// [`EDITOR_ENV`]: the first value a name has, as `getenv` answers. A name
@@ -1967,9 +2012,13 @@ pub fn codex_editor_is_helper(
 /// holds as [`Hold::Editor`]. The test is a raw scan rather than a parse,
 /// so that every quoting, `export` and spacing form holds: any word of
 /// letters, digits and `_` that is `VISUAL` or `EDITOR` in any case, on any
-/// line, a comment's included, holds. A word that is exactly one of
-/// [`CODEX_MOVING_ENV`] holds as [`Hold::Unmeasured`]: matched in its case,
-/// as Codex sets it, so a value naming a folder under `/home` doesn't.
+/// line, a comment's included, holds, and so does a word that starts with
+/// [`DECK_ENV_PREFIX`], which Codex would set over the generation the deck
+/// gave its editor helper (the revcxfix3 review's NEW-1): matched in its
+/// case, as Codex sets it and the helper reads it. A word that is exactly
+/// one of [`CODEX_MOVING_ENV`] holds as [`Hold::Unmeasured`]: matched in
+/// its case, as Codex sets it, so a value naming a folder under `/home`
+/// doesn't.
 pub fn codex_dotenv_guard(read: &SourceRead) -> Result<(), Hold> {
     match read {
         SourceRead::Absent => Ok(()),
@@ -1980,6 +2029,7 @@ pub fn codex_dotenv_guard(read: &SourceRead) -> Result<(), Hold> {
                 EDITOR_ENV
                     .iter()
                     .any(|name| word.eq_ignore_ascii_case(name.as_bytes()))
+                    || word.starts_with(DECK_ENV_PREFIX.as_bytes())
             });
             if names_editor {
                 return Err(Hold::Editor);
@@ -2066,6 +2116,27 @@ pub fn claude_editor_is_helper(
         .ok_or(Hold::Editor)?;
     match super::helper::split_spaces(&value).as_slice() {
         [only] if only.as_os_str() == helper.as_os_str() => Ok(()),
+        _ => Err(Hold::Editor),
+    }
+}
+
+/// Whether the bound agent's own environment `env` gives its editor helper
+/// the generation the deck spawned it under, `generation`
+/// (`DOT_AGENT_DECK_EDITOR_GEN`, the revcxfix3 review's NEW-1 by another
+/// route). The helper takes its generation from the environment it
+/// inherits; one set again between the deck and the agent (a shell's
+/// start-up file, a launcher) names a generation the deck never armed, and
+/// the helper then opens the person's saved editor on the check's Ctrl+G.
+/// Any other value, or none, holds as [`Hold::Editor`]. Like
+/// [`claude_editor_is_helper`], it reads the environment the agent was
+/// started with: what Claude Code's settings `env` and Codex's `.env` set
+/// as they start is [`claude_env_guard`]'s and [`codex_dotenv_guard`]'s.
+pub fn generation_is_own(
+    env: impl Fn(&str) -> Option<OsString>,
+    generation: &str,
+) -> Result<(), Hold> {
+    match env(super::install::GENERATION_ENV) {
+        Some(value) if value == generation => Ok(()),
         _ => Err(Hold::Editor),
     }
 }

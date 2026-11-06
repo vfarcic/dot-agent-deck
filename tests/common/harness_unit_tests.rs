@@ -2525,14 +2525,15 @@ fn strip_hooks_from_claude_settings_jsonc_input_strips_hooks() {
 fn host_claude_settings_lose_what_the_input_box_check_holds_on() {
     // The revcxfix2 review's LOW-4: a host `settings.json` whose `env` sets
     // `VISUAL` or `EDITOR` (or `HOME`/`CLAUDE_CONFIG_DIR`, or names either
-    // anywhere) would make the deck hold every lane-2 Claude probe test in
+    // anywhere, or, the revcxfix3 review's NEW-1, a `DOT_AGENT_DECK_` name)
+    // would make the deck hold every lane-2 Claude probe test in
     // the test HOME, which then times out and reads like a product
     // regression. The copy drops them; what the deck reads of the copy must
     // pass its own guard.
     use dot_agent_deck::composer_probe::keymap::{claude_env_guard, claude_env_member};
     let raw = r#"{
         // a comment
-        "env": {"VISUAL": "nvim", "editor": "x", "HOME": "/h", "CLAUDE_CONFIG_DIR": "/c", "KEEP": "1"},
+        "env": {"VISUAL": "nvim", "editor": "x", "HOME": "/h", "CLAUDE_CONFIG_DIR": "/c", "DOT_AGENT_DECK_EDITOR_GEN": "1", "dot_agent_deck_pane_id": "p", "KEEP": "1"},
         "mcpServers": {"m": {"env": {"EDITOR": "vim", "A": "1"}}},
         "__proto__": {"env": {"VISUAL": "y"}},
         "theme": "dark"

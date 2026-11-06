@@ -2547,6 +2547,12 @@ mod linux {
                 Ok(env) => env,
                 Err(hold) => return KeymapEvidence::Held(hold),
             };
+            // The revcxfix3 review's NEW-1, through the agent's own
+            // environment: the helper its Ctrl+G opens reads the
+            // generation from there, so it must be this one.
+            if let Err(hold) = keymap::generation_is_own(&env, &self.name()) {
+                return KeymapEvidence::Held(hold);
+            }
             match agent {
                 // The revcxact review's HIGH-1, for both agents: the editor
                 // its own environment selects, by its release's record, must

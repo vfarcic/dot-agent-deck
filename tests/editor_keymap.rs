@@ -2254,6 +2254,48 @@ fn probe_097_a_claude_whose_editor_is_not_the_helper_is_held() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Scenario: Build the environments a bound agent can have been started with and ask whether the generation its editor helper would read from `DOT_AGENT_DECK_EDITOR_GEN` is the one the deck spawned it under (the revcxfix3 review's NEW-1, through the agent's own environment, as a shell's start-up file or a launcher could set it): the deck's generation passes; another one, an empty one, the same digits with a blank, and none at all hold `Editor`.
+#[cfg(target_os = "linux")]
+#[spec("inbox/probe/097")]
+#[test]
+fn probe_097_an_agent_whose_helper_reads_another_generation_is_held() {
+    use dot_agent_deck::composer_probe::keymap::{environ_lookup, generation_is_own};
+    let mut wrong = Vec::new();
+    for (row, pairs, want) in [
+        (
+            "the deck's generation",
+            vec![("DOT_AGENT_DECK_EDITOR_GEN", "17")],
+            Ok(()),
+        ),
+        (
+            "another generation",
+            vec![("DOT_AGENT_DECK_EDITOR_GEN", "1")],
+            Err(Hold::Editor),
+        ),
+        (
+            "an empty one",
+            vec![("DOT_AGENT_DECK_EDITOR_GEN", "")],
+            Err(Hold::Editor),
+        ),
+        (
+            "with a blank",
+            vec![("DOT_AGENT_DECK_EDITOR_GEN", "17 ")],
+            Err(Hold::Editor),
+        ),
+        ("none", vec![("HOME", "/home/u")], Err(Hold::Editor)),
+    ] {
+        let environ: Vec<(OsString, OsString)> = pairs
+            .iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+            .collect();
+        let got = generation_is_own(environ_lookup(&environ).unwrap(), "17");
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// Scenario: Lay out Codex homes, working folders and temporary directories on disk and ask whether such a Codex can be checked at all (the user's ruling Q227b). A home outside the working folder, the working folder's own `.codex`, and a home reached through a symlink that lands outside are checkable; a home inside the working folder (or the folder itself), one whose symlink lands inside it, one under `$TMPDIR` or `/tmp`, and anything that can't be resolved (a missing home, an empty, relative or missing `TMPDIR`) are held `CodexHome`.
 #[spec("inbox/probe/098")]
 #[test]
@@ -2461,7 +2503,7 @@ fn probe_099_claude_settings_env_naming_the_editor_holds() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// Scenario: Judge Claude Code settings documents that a JSONC parser building its objects by assignment could read differently from the deck (the revcxfix2 review's MEDIUM-1): a `__proto__` member at any depth, `VISUAL` or `EDITOR` as a member name anywhere in the document, and a line comment ended by a lone carriage return each hold `Editor`; a document with CRLF line endings and comments, and `VISUAL` only inside a string value, pass.
+/// Scenario: Judge Claude Code settings documents that another parser could read differently from the deck (the revcxfix2 review's MEDIUM-1, the revcxfix3 review's LOW-A): a `__proto__` member at any depth, `VISUAL` or `EDITOR` as a member name anywhere in the document, a line comment ended by a lone carriage return, and a line comment holding a line or paragraph separator (where a JSON5 parser ends it) each hold `Editor`; a document with CRLF line endings and comments, `VISUAL` only inside a string value, and the separators inside a string or a block comment, pass.
 #[spec("inbox/probe/099")]
 #[test]
 fn probe_099_claude_settings_a_parser_could_read_differently_hold() {
@@ -2476,8 +2518,18 @@ fn probe_099_claude_settings_a_parser_could_read_differently_hold() {
         ),
         (
             "__proto__ spelled with an escape",
-            r#"{"__proto__": {"env": {"VISUAL": "vim"}}}"#,
+            r#"{"__proto__": {"env": {"A": "1"}}}"#,
             editor,
+        ),
+        (
+            "VISUAL spelled with an escape, outside env",
+            r#"{"permissions": {"VISUAL": "vim"}}"#,
+            editor,
+        ),
+        (
+            "an escaped name that is neither",
+            r#"{"__proto_x": {"VISUALS": "vim"}, "env": {"A": "1"}}"#,
+            Ok(()),
         ),
         (
             "VISUAL behind __proto__ inside env",
@@ -2508,6 +2560,21 @@ fn probe_099_claude_settings_a_parser_could_read_differently_hold() {
             "a lone CR then a block comment only a CR-ending parser opens",
             "{\"a\": 1 // x\r/*\n,\"env\": {\"VISUAL\": \"vim\"} // */\n}",
             editor,
+        ),
+        (
+            "a line comment ended by a line separator",
+            "{\"a\": 1 // x\u{2028},\"env\": {\"VISUAL\": \"vim\"}\n}",
+            editor,
+        ),
+        (
+            "a line comment ended by a paragraph separator",
+            "{\"a\": 1 // x\u{2029},\"env\": {\"VISUAL\": \"vim\"}\n}",
+            editor,
+        ),
+        (
+            "line and paragraph separators in a string and a block comment",
+            "{\"model\": \"a\u{2028}b\u{2029}\", /* c\u{2028}d\u{2029} */ \"env\": {\"A\": \"1\"}}",
+            Ok(()),
         ),
         (
             "CRLF line endings and comments",
@@ -2564,6 +2631,67 @@ fn probe_099_claude_settings_env_moving_its_config_holds() {
         (
             "outside env",
             r#"{"model": "x", "HOME": "/x", "CLAUDE_CONFIG_DIR": "/y"}"#,
+            Ok(()),
+        ),
+    ] {
+        let read = vec![(
+            PathBuf::from("settings.json"),
+            claude_env_member(document.as_bytes()),
+        )];
+        let got = claude_env_guard(&read);
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Scenario: Judge Claude Code settings documents whose `env` sets one of the deck's own variables (the revcxfix3 review's NEW-1): `DOT_AGENT_DECK_EDITOR_GEN`, which would point the deck's editor helper at a check that was never armed so that it opens the person's editor, or any other name starting with `DOT_AGENT_DECK_`, in any case, holds `Editor`, also beside a name that moves Claude's configuration; such a name only in a value, outside `env`, or with the prefix inside it, passes.
+#[spec("inbox/probe/099")]
+#[test]
+fn probe_099_claude_settings_env_naming_a_deck_variable_holds() {
+    use dot_agent_deck::composer_probe::keymap::{claude_env_guard, claude_env_member};
+    let editor = Err(Hold::Editor);
+    let mut wrong = Vec::new();
+    for (row, document, want) in [
+        (
+            "the helper's generation",
+            r#"{"env": {"DOT_AGENT_DECK_EDITOR_GEN": "1"}}"#,
+            editor,
+        ),
+        (
+            "the helper's saved editor",
+            r#"{"env": {"A": "1", "DOT_AGENT_DECK_EDITOR_USER_VISUAL": "vim"}}"#,
+            editor,
+        ),
+        (
+            "another deck variable",
+            r#"{"env": {"DOT_AGENT_DECK_PANE_ID": "3"}}"#,
+            editor,
+        ),
+        (
+            "lower case",
+            r#"{"env": {"dot_agent_deck_editor_gen": "1"}}"#,
+            editor,
+        ),
+        (
+            "beside a name that moves the configuration",
+            r#"{"env": {"HOME": "/x", "DOT_AGENT_DECK_EDITOR_GEN": "1"}}"#,
+            editor,
+        ),
+        (
+            "only in a value",
+            r#"{"env": {"A": "DOT_AGENT_DECK_EDITOR_GEN"}}"#,
+            Ok(()),
+        ),
+        (
+            "outside env",
+            r#"{"model": "x", "DOT_AGENT_DECK_EDITOR_GEN": "1"}"#,
+            Ok(()),
+        ),
+        (
+            "the prefix inside a name, or without its underscore",
+            r#"{"env": {"MY_DOT_AGENT_DECK_X": "1", "DOT_AGENT_DECK": "2"}}"#,
             Ok(()),
         ),
     ] {
@@ -2980,4 +3108,58 @@ fn probe_100_a_codex_home_env_file_naming_the_editor_holds() {
         }
         assert_eq!(reads.check(CODEX_ORDER), Err(Hold::Changed), "{row}");
     }
+}
+
+/// Scenario: Judge a Codex home's `.env` file that sets one of the deck's own variables (the revcxfix3 review's NEW-1): `DOT_AGENT_DECK_EDITOR_GEN`, which would point the deck's editor helper at a check that was never armed so that it opens the person's editor, or any other word starting with `DOT_AGENT_DECK_`, in any form Codex reads and in a comment, holds `Editor`, also beside a name that moves Codex's home; the same name in lower case, which Codex would set as written and the helper doesn't read, and a word with the prefix inside it, pass.
+#[spec("inbox/probe/100")]
+#[test]
+fn probe_100_a_codex_home_env_file_naming_a_deck_variable_holds() {
+    use dot_agent_deck::composer_probe::keymap::codex_dotenv_guard;
+    let editor = Err(Hold::Editor);
+    let mut wrong = Vec::new();
+    for (row, contents, want) in [
+        (
+            "the helper's generation",
+            &b"DOT_AGENT_DECK_EDITOR_GEN=1\n"[..],
+            editor,
+        ),
+        (
+            "export, spaced and quoted",
+            b"  export\tDOT_AGENT_DECK_EDITOR_GEN = \"1\"\n",
+            editor,
+        ),
+        ("in a comment", b"# DOT_AGENT_DECK_EDITOR_GEN=1\n", editor),
+        (
+            "another deck variable",
+            b"A=1\r\nDOT_AGENT_DECK_SOCKET=/x\r\n",
+            editor,
+        ),
+        (
+            "beside a name that moves the home",
+            b"HOME=/x\nDOT_AGENT_DECK_EDITOR_GEN=1\n",
+            editor,
+        ),
+        (
+            "lower case, the prefix inside a word, or without its underscore",
+            b"dot_agent_deck_editor_gen=1\nMY_DOT_AGENT_DECK_X=1\nDOT_AGENT_DECK=1\n",
+            Ok(()),
+        ),
+    ] {
+        let read = SourceRead::Present {
+            identity: dot_agent_deck::composer_probe::keymap::Identity {
+                dev: 0,
+                ino: 0,
+                size: contents.len() as u64,
+                mtime_ns: 0,
+                ctime_ns: 0,
+                hash: [0; 32],
+            },
+            contents: contents.to_vec(),
+        };
+        let got = codex_dotenv_guard(&read);
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
