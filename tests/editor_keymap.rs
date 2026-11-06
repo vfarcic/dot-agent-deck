@@ -2518,8 +2518,18 @@ fn probe_099_claude_settings_a_parser_could_read_differently_hold() {
         ),
         (
             "__proto__ spelled with an escape",
-            r#"{"__proto__": {"env": {"VISUAL": "vim"}}}"#,
+            r#"{"__proto__": {"env": {"A": "1"}}}"#,
             editor,
+        ),
+        (
+            "VISUAL spelled with an escape, outside env",
+            r#"{"permissions": {"VISUAL": "vim"}}"#,
+            editor,
+        ),
+        (
+            "an escaped name that is neither",
+            r#"{"__proto_x": {"VISUALS": "vim"}, "env": {"A": "1"}}"#,
+            Ok(()),
         ),
         (
             "VISUAL behind __proto__ inside env",
