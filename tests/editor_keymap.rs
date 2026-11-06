@@ -2503,7 +2503,7 @@ fn probe_099_claude_settings_env_naming_the_editor_holds() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// Scenario: Judge Claude Code settings documents that a JSONC parser building its objects by assignment could read differently from the deck (the revcxfix2 review's MEDIUM-1): a `__proto__` member at any depth, `VISUAL` or `EDITOR` as a member name anywhere in the document, and a line comment ended by a lone carriage return each hold `Editor`; a document with CRLF line endings and comments, and `VISUAL` only inside a string value, pass.
+/// Scenario: Judge Claude Code settings documents that another parser could read differently from the deck (the revcxfix2 review's MEDIUM-1, the revcxfix3 review's LOW-A): a `__proto__` member at any depth, `VISUAL` or `EDITOR` as a member name anywhere in the document, a line comment ended by a lone carriage return, and a line comment holding a line or paragraph separator (where a JSON5 parser ends it) each hold `Editor`; a document with CRLF line endings and comments, `VISUAL` only inside a string value, and the separators inside a string or a block comment, pass.
 #[spec("inbox/probe/099")]
 #[test]
 fn probe_099_claude_settings_a_parser_could_read_differently_hold() {
@@ -2550,6 +2550,21 @@ fn probe_099_claude_settings_a_parser_could_read_differently_hold() {
             "a lone CR then a block comment only a CR-ending parser opens",
             "{\"a\": 1 // x\r/*\n,\"env\": {\"VISUAL\": \"vim\"} // */\n}",
             editor,
+        ),
+        (
+            "a line comment ended by a line separator",
+            "{\"a\": 1 // x\u{2028},\"env\": {\"VISUAL\": \"vim\"}\n}",
+            editor,
+        ),
+        (
+            "a line comment ended by a paragraph separator",
+            "{\"a\": 1 // x\u{2029},\"env\": {\"VISUAL\": \"vim\"}\n}",
+            editor,
+        ),
+        (
+            "line and paragraph separators in a string and a block comment",
+            "{\"model\": \"a\u{2028}b\u{2029}\", /* c\u{2028}d\u{2029} */ \"env\": {\"A\": \"1\"}}",
+            Ok(()),
         ),
         (
             "CRLF line endings and comments",

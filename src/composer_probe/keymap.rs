@@ -729,7 +729,13 @@ fn claude_env_file(path: &Path) -> EnvRead {
 /// - a line comment ended by a carriage return that no line feed follows:
 ///   `jsonc-parser` ends a `//` comment there, a parser that ends it only
 ///   at a line feed reads on, and each reading can hide an `env` from the
-///   other (the second by a `/*` that only the first opens).
+///   other (the second by a `/*` that only the first opens);
+/// - a line comment holding a line or paragraph separator (U+2028,
+///   U+2029), where a JSON5 parser ends it and one that ends it at a line
+///   feed doesn't, the same disagreement (the revcxfix3 review's LOW-A).
+///   A `#` comment, a single-quoted string and an unterminated `/*` need
+///   no rule of their own: the first two don't parse here and hold, and
+///   the last is a comment to the end of the document for every parser.
 pub fn claude_env_member(contents: &[u8]) -> EnvRead {
     let contents = contents.strip_prefix(b"\xef\xbb\xbf").unwrap_or(contents);
     let Some(cleaned) = without_json_comments(contents) else {
@@ -878,8 +884,9 @@ impl<'de> serde::Deserialize<'de> for NameScan {
 
 /// `contents` with its `//` line and `/* */` block comments turned into
 /// blanks (newlines kept), outside strings; `None` when a line comment is
-/// ended by a carriage return that no line feed follows, where JSONC
-/// parsers disagree on where the comment ends ([`claude_env_member`]).
+/// ended by a carriage return that no line feed follows, or holds a line or
+/// paragraph separator (U+2028, U+2029), where JSONC and JSON5 parsers
+/// disagree on where the comment ends ([`claude_env_member`]).
 fn without_json_comments(contents: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(contents.len());
     let mut i = 0;
@@ -907,6 +914,14 @@ fn without_json_comments(contents: &[u8]) -> Option<Vec<u8>> {
         } else if c == b'/' && next == Some(b'/') {
             while i < contents.len() && contents[i] != b'\n' {
                 if contents[i] == b'\r' && contents.get(i + 1) != Some(&b'\n') {
+                    return None;
+                }
+                // U+2028 and U+2029, which end a line comment for a JSON5
+                // parser and not for one that ends it at a line feed (the
+                // revcxfix3 review's LOW-A).
+                if contents[i..].starts_with(b"\xe2\x80\xa8")
+                    || contents[i..].starts_with(b"\xe2\x80\xa9")
+                {
                     return None;
                 }
                 out.push(b' ');
