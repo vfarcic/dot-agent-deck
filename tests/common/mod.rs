@@ -8279,8 +8279,16 @@ pub(crate) fn seed_claude_project_trust(
     // "Is this a project you created or one you trust?" prompt — which defaults
     // to "No", so it never times out on its own — for the full 120s, and the
     // cast reads as a product failure rather than a harness one.
+    //
+    // The host's document is re-based without what the deck's input-box check
+    // holds on ([`without_claude_check_holds`]); a test's own is left as the
+    // test wrote it.
     let mut cfg: serde_json::Value = read_claude_json_object(&test_cfg_path)
-        .or_else(|| read_claude_json_object(&host_home().join(".claude.json")))
+        .or_else(|| {
+            let mut host = read_claude_json_object(&host_home().join(".claude.json"))?;
+            without_claude_check_holds(&mut host);
+            Some(host)
+        })
         .unwrap_or_else(|| serde_json::json!({ "hasCompletedOnboarding": true }));
     if !cfg["projects"].is_object() {
         cfg["projects"] = serde_json::json!({});
@@ -8545,7 +8553,8 @@ pub fn seed_claude_worker_home(home: &Path, trust_paths: &[String]) -> std::io::
 /// through unchanged. A truly-malformed settings.json (still invalid
 /// after comment stripping) is now fail-CLOSED — we refuse to
 /// continue rather than risk shipping the host's hook commands into
-/// the test.
+/// the test. It also drops what the deck's input-box check holds on
+/// ([`without_claude_check_holds`]).
 pub(crate) fn strip_hooks_from_claude_settings(raw: &str) -> std::io::Result<String> {
     let cleaned = strip_jsonc_comments(raw);
     let mut v: serde_json::Value = serde_json::from_str(&cleaned).map_err(|e| {
@@ -8558,8 +8567,44 @@ pub(crate) fn strip_hooks_from_claude_settings(raw: &str) -> std::io::Result<Str
     if let Some(obj) = v.as_object_mut() {
         obj.remove("hooks");
     }
+    without_claude_check_holds(&mut v);
     serde_json::to_string_pretty(&v)
         .map_err(|e| std::io::Error::other(format!("serialize sanitized settings.json: {e}")))
+}
+
+/// Removes from a host Claude Code document (its `settings.json`, or the
+/// `~/.claude.json` a test HOME is re-based from) what the deck's input-box
+/// check holds a Claude Code on (`keymap::claude_env_member` and
+/// `claude_env_guard`, the revcxfix2 review's LOW-4): every member named
+/// `__proto__`, or `VISUAL` or `EDITOR` in any case, at any depth, and
+/// `HOME` and `CLAUDE_CONFIG_DIR`, in any case, from the top-level `env`.
+/// Left in, a developer whose own settings set an editor there would see
+/// every lane-2 Claude probe test held and timed out, which reads like a
+/// product regression; their own panes are held the same way, by design.
+pub(crate) fn without_claude_check_holds(v: &mut serde_json::Value) {
+    fn deep(v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::Object(members) => {
+                members.retain(|name, _| {
+                    name != "__proto__"
+                        && !["VISUAL", "EDITOR"]
+                            .iter()
+                            .any(|editor| name.eq_ignore_ascii_case(editor))
+                });
+                members.values_mut().for_each(deep);
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(deep),
+            _ => {}
+        }
+    }
+    deep(v);
+    if let Some(env) = v.get_mut("env").and_then(|env| env.as_object_mut()) {
+        env.retain(|name, _| {
+            !["HOME", "CLAUDE_CONFIG_DIR"]
+                .iter()
+                .any(|moved| name.eq_ignore_ascii_case(moved))
+        });
+    }
 }
 
 /// Strip `//` line comments and `/* … */` block comments from a
