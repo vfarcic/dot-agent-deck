@@ -316,6 +316,19 @@ impl Deck {
                 // directory the bound agent (this process) runs in: Claude
                 // Code's settings-file `env` sources are read from it, and
                 // another directory holds as changed (cxfix2 MEDIUM-A).
+                //
+                // Not hermetic (the revcxfix2 review's NIT-4): that working
+                // directory is the checkout, so the deck reads its committed
+                // `.claude/settings.json`, any untracked
+                // `.claude/settings.local.json`, and `/etc/claude-code`. A
+                // local file there that the deck holds on (an `env` naming
+                // `VISUAL`, `EDITOR`, `HOME` or `CLAUDE_CONFIG_DIR`, such a
+                // member name anywhere, a `__proto__`, or a document it
+                // can't parse) turns the tests that read the keymap red with
+                // `Keymap(Editor)` or `Keymap(Unmeasured)`: move it aside to
+                // run them. The bound agent's cwd is this process's own, and
+                // the managed path is fixed in the product, so a seam for
+                // either would be a production change made for a test.
                 let home_dir = dir.path().join("home");
                 let cwd = std::env::current_dir().unwrap();
                 installation.set_keymap_baseline(
