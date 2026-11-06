@@ -2101,6 +2101,27 @@ pub fn claude_editor_is_helper(
     }
 }
 
+/// Whether the bound agent's own environment `env` gives its editor helper
+/// the generation the deck spawned it under, `generation`
+/// (`DOT_AGENT_DECK_EDITOR_GEN`, the revcxfix3 review's NEW-1 by another
+/// route). The helper takes its generation from the environment it
+/// inherits; one set again between the deck and the agent (a shell's
+/// start-up file, a launcher) names a generation the deck never armed, and
+/// the helper then opens the person's saved editor on the check's Ctrl+G.
+/// Any other value, or none, holds as [`Hold::Editor`]. Like
+/// [`claude_editor_is_helper`], it reads the environment the agent was
+/// started with: what Claude Code's settings `env` and Codex's `.env` set
+/// as they start is [`claude_env_guard`]'s and [`codex_dotenv_guard`]'s.
+pub fn generation_is_own(
+    env: impl Fn(&str) -> Option<OsString>,
+    generation: &str,
+) -> Result<(), Hold> {
+    match env(super::install::GENERATION_ENV) {
+        Some(value) if value == generation => Ok(()),
+        _ => Err(Hold::Editor),
+    }
+}
+
 /// The editor check for an agent whose release's record selects its
 /// editor by `selection`: [`claude_editor_is_helper`] or
 /// [`codex_editor_is_helper`].

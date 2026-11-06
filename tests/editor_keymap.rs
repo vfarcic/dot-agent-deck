@@ -2254,6 +2254,48 @@ fn probe_097_a_claude_whose_editor_is_not_the_helper_is_held() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Scenario: Build the environments a bound agent can have been started with and ask whether the generation its editor helper would read from `DOT_AGENT_DECK_EDITOR_GEN` is the one the deck spawned it under (the revcxfix3 review's NEW-1, through the agent's own environment, as a shell's start-up file or a launcher could set it): the deck's generation passes; another one, an empty one, the same digits with a blank, and none at all hold `Editor`.
+#[cfg(target_os = "linux")]
+#[spec("inbox/probe/097")]
+#[test]
+fn probe_097_an_agent_whose_helper_reads_another_generation_is_held() {
+    use dot_agent_deck::composer_probe::keymap::{environ_lookup, generation_is_own};
+    let mut wrong = Vec::new();
+    for (row, pairs, want) in [
+        (
+            "the deck's generation",
+            vec![("DOT_AGENT_DECK_EDITOR_GEN", "17")],
+            Ok(()),
+        ),
+        (
+            "another generation",
+            vec![("DOT_AGENT_DECK_EDITOR_GEN", "1")],
+            Err(Hold::Editor),
+        ),
+        (
+            "an empty one",
+            vec![("DOT_AGENT_DECK_EDITOR_GEN", "")],
+            Err(Hold::Editor),
+        ),
+        (
+            "with a blank",
+            vec![("DOT_AGENT_DECK_EDITOR_GEN", "17 ")],
+            Err(Hold::Editor),
+        ),
+        ("none", vec![("HOME", "/home/u")], Err(Hold::Editor)),
+    ] {
+        let environ: Vec<(OsString, OsString)> = pairs
+            .iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+            .collect();
+        let got = generation_is_own(environ_lookup(&environ).unwrap(), "17");
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// Scenario: Lay out Codex homes, working folders and temporary directories on disk and ask whether such a Codex can be checked at all (the user's ruling Q227b). A home outside the working folder, the working folder's own `.codex`, and a home reached through a symlink that lands outside are checkable; a home inside the working folder (or the folder itself), one whose symlink lands inside it, one under `$TMPDIR` or `/tmp`, and anything that can't be resolved (a missing home, an empty, relative or missing `TMPDIR`) are held `CodexHome`.
 #[spec("inbox/probe/098")]
 #[test]

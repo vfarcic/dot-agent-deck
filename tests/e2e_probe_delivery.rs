@@ -761,6 +761,22 @@ fn probe_097_a_claude_whose_shell_leaves_visual_alone_is_checked_then_rung() {
     assert!(!f.log_text().contains("Keymap(Editor)"), "{}", f.log_text());
 }
 
+/// Scenario: Start a Codex stand-in in a deck whose shell's start-up file exports the deck's own `DOT_AGENT_DECK_EDITOR_GEN` with a generation the deck never armed, as a `.zshenv` could, type and delete text in its box and queue mail. The deck must type nothing, not even its check's Ctrl+G, because the helper the agent's Ctrl+G opens would read that generation, find no check armed and open the person's editor: the card and the attached TUI say `cannot_check`, the log names the `Keymap(Editor)` hold, and the mail waits.
+#[spec("inbox/probe/097")]
+#[test]
+fn probe_097_a_codex_whose_shell_sets_the_deck_generation_is_held_without_a_check() {
+    let (f, _rc) = with_shell_rc("codex", "export DOT_AGENT_DECK_EDITOR_GEN=999999\n");
+    held_for_the_editor(&f, true);
+}
+
+/// Scenario: The same for a Claude Code stand-in, whose pane command has arguments so that it starts through the shell: its start-up file exports `DOT_AGENT_DECK_EDITOR_GEN` with a generation the deck never armed. Typing and deleting text then queueing mail types nothing, not even the check's Ctrl+G: the card says `cannot_check`, the log names the `Keymap(Editor)` hold, and the mail waits.
+#[spec("inbox/probe/097")]
+#[test]
+fn probe_097_a_claude_whose_shell_sets_the_deck_generation_is_held_without_a_check() {
+    let (f, _rc) = with_shell_rc("claude", "export DOT_AGENT_DECK_EDITOR_GEN=999999\n");
+    held_for_the_editor(&f, false);
+}
+
 /// Scenario: Start a Codex stand-in whose `CODEX_HOME` is a `codex` folder inside the pane's working directory, where Codex's sandbox may write, type and delete text in its box and queue mail. The deck must type nothing, not even its check's Ctrl+G, and run no helper: the card and the attached TUI say `cannot_check`, the log names the `Keymap(CodexHome)` hold, and the mail waits. (Every other live Codex here uses the working directory's own `.codex`, the control.)
 #[spec("inbox/probe/098")]
 #[test]
