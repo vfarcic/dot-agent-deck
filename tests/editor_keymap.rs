@@ -2254,7 +2254,7 @@ fn probe_097_a_claude_whose_editor_is_not_the_helper_is_held() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// Scenario: Build the environments a bound agent can have been started with and ask whether the generation its editor helper would read from `DOT_AGENT_DECK_EDITOR_GEN` is the one the deck spawned it under (the revcxfix3 review's NEW-1, through the agent's own environment, as a shell's start-up file or a launcher could set it): the deck's generation passes; another one, an empty one, the same digits with a blank, and none at all hold `Editor`.
+/// Scenario: Build the environments a bound agent can have been started with and ask whether the generation its editor helper would read from `DOT_AGENT_DECK_EDITOR_GEN` is the one the deck spawned it under (the revcxfix3 review's NEW-1, through the agent's own environment, as a shell's start-up file or a launcher could set it): the deck's generation passes, also listed twice; another one, an empty one, the same digits with a blank, and none at all hold `Editor`; the variable listed twice with different values, in either order, holds `Unmeasured`, as a repeated `VISUAL` does.
 #[cfg(target_os = "linux")]
 #[spec("inbox/probe/097")]
 #[test]
@@ -2283,12 +2283,45 @@ fn probe_097_an_agent_whose_helper_reads_another_generation_is_held() {
             Err(Hold::Editor),
         ),
         ("none", vec![("HOME", "/home/u")], Err(Hold::Editor)),
+        (
+            "the deck's first, another after it",
+            vec![
+                ("DOT_AGENT_DECK_EDITOR_GEN", "17"),
+                ("DOT_AGENT_DECK_EDITOR_GEN", "999"),
+            ],
+            Err(Hold::Unmeasured),
+        ),
+        (
+            "another first, the deck's after it",
+            vec![
+                ("DOT_AGENT_DECK_EDITOR_GEN", "999"),
+                ("DOT_AGENT_DECK_EDITOR_GEN", "17"),
+            ],
+            Err(Hold::Unmeasured),
+        ),
+        (
+            "the deck's twice",
+            vec![
+                ("DOT_AGENT_DECK_EDITOR_GEN", "17"),
+                ("DOT_AGENT_DECK_EDITOR_GEN", "17"),
+            ],
+            Ok(()),
+        ),
+        (
+            "the deck's beside a repeated VISUAL",
+            vec![
+                ("DOT_AGENT_DECK_EDITOR_GEN", "17"),
+                ("VISUAL", "/helper"),
+                ("VISUAL", "nvim"),
+            ],
+            Err(Hold::Unmeasured),
+        ),
     ] {
         let environ: Vec<(OsString, OsString)> = pairs
             .iter()
             .map(|(k, v)| (OsString::from(k), OsString::from(v)))
             .collect();
-        let got = generation_is_own(environ_lookup(&environ).unwrap(), "17");
+        let got = environ_lookup(&environ).and_then(|env| generation_is_own(env, "17"));
         if got != want {
             wrong.push(format!("{row}: {got:?}, want {want:?}"));
         }

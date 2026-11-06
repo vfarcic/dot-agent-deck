@@ -1940,14 +1940,22 @@ fn names_deck_variable(name: &[u8]) -> bool {
 
 /// A lookup over a process's own environment `environ`, as
 /// `/proc/<pid>/environ` lists it, for the variables in [`KEYMAP_ENV`] and
-/// [`EDITOR_ENV`]: the first value a name has, as `getenv` answers. A name
-/// in either listed twice with different values holds as
-/// [`Hold::Unmeasured`]: which one the agent's runtime reads isn't
-/// measured.
+/// [`EDITOR_ENV`] and the helper's generation
+/// ([`super::install::GENERATION_ENV`]): the first value a name has, as
+/// `getenv` answers. A name in any of them listed twice with different
+/// values holds as [`Hold::Unmeasured`]: which one the agent's runtime
+/// reads isn't measured, and for the generation the reader that matters is
+/// the helper, which an agent that rebuilds its editor's environment
+/// (Rust's `Command` does, keeping the last entry) can hand the other one
+/// (the revcxfix4 review's LOW-1).
 pub fn environ_lookup(
     environ: &[(OsString, OsString)],
 ) -> Result<impl Fn(&str) -> Option<OsString> + '_, Hold> {
-    for name in KEYMAP_ENV.into_iter().chain(EDITOR_ENV) {
+    for name in KEYMAP_ENV
+        .into_iter()
+        .chain(EDITOR_ENV)
+        .chain([super::install::GENERATION_ENV])
+    {
         let mut values = environ.iter().filter(|(k, _)| k == name).map(|(_, v)| v);
         if let Some(first) = values.next()
             && values.any(|v| v != first)
