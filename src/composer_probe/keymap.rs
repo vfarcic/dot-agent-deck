@@ -517,6 +517,11 @@ pub enum EnvRead {
     NoEnv,
     /// The document's `env` member, as parsed.
     Env(serde_json::Value),
+    /// A document a JSONC parser could read a different `env` from than
+    /// the deck does ([`claude_env_member`]): a member named `__proto__`, or
+    /// `VISUAL` or `EDITOR` in any case, at any depth, or a line comment
+    /// ended by a lone carriage return.
+    Suspect,
     /// The file or directory exists but can't be read.
     Unreadable(Unreadable),
     /// The document isn't a JSON object once its comments are removed, or
@@ -696,21 +701,72 @@ fn claude_env_file(path: &Path) -> EnvRead {
 
 /// The top-level `env` member of a Claude settings or config document,
 /// read after its `//` and `/* */` comments are removed (Claude's settings
-/// files are JSONC): only that member is parsed, every other one skipped.
-/// A document that isn't a JSON object, or names `env` twice (which one
-/// Claude keeps isn't measured), is [`EnvRead::Unparsable`].
+/// files are JSONC). A document that isn't a JSON object, or names `env`
+/// twice (which one Claude keeps isn't measured), is
+/// [`EnvRead::Unparsable`].
+///
+/// Which JSONC parser Claude Code uses isn't measured, so a document two
+/// parsers could read differently is [`EnvRead::Suspect`] (the revcxfix2
+/// review's MEDIUM-1), whatever its `env` says:
+///
+/// - a member named `__proto__`, at any depth: serde reads it as an
+///   ordinary member, while a parser that builds its objects by assignment
+///   (`jsonc-parser`'s `parse` does) sets the object's prototype with it,
+///   so an `env` inside it becomes the document's `env`, and a `VISUAL`
+///   inside it one of `env`'s names;
+/// - a member named `VISUAL` or `EDITOR`, in any case, at any depth, the
+///   way `keybindings.json` is scanned: wherever a parser may put it, it
+///   holds;
+/// - a line comment ended by a carriage return that no line feed follows:
+///   `jsonc-parser` ends a `//` comment there, a parser that ends it only
+///   at a line feed reads on, and each reading can hide an `env` from the
+///   other (the second by a `/*` that only the first opens).
 pub fn claude_env_member(contents: &[u8]) -> EnvRead {
-    let cleaned = without_json_comments(contents);
+    let Some(cleaned) = without_json_comments(contents) else {
+        return EnvRead::Suspect;
+    };
     match serde_json::from_slice::<EnvMember>(&cleaned) {
-        Ok(EnvMember(Some(env))) => EnvRead::Env(env),
-        Ok(EnvMember(None)) => EnvRead::NoEnv,
+        Ok(EnvMember { suspect: true, .. }) => EnvRead::Suspect,
+        Ok(EnvMember {
+            env: Some(env),
+            suspect: false,
+        }) => EnvRead::Env(env),
+        Ok(EnvMember {
+            env: None,
+            suspect: false,
+        }) => EnvRead::NoEnv,
         Err(_) => EnvRead::Unparsable,
     }
 }
 
-/// A document's `env` member, or none; fails for a document that isn't an
+/// Whether a member name is one [`claude_env_member`] holds on wherever it
+/// appears: `__proto__`, or `VISUAL` or `EDITOR` in any case.
+fn suspect_name(name: &str) -> bool {
+    name == "__proto__"
+        || EDITOR_ENV
+            .iter()
+            .any(|editor| name.eq_ignore_ascii_case(editor))
+}
+
+/// Whether any member name in `value`, at any depth, is a
+/// [`suspect_name`].
+fn names_suspect(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(members) => members
+            .iter()
+            .any(|(name, value)| suspect_name(name) || names_suspect(value)),
+        serde_json::Value::Array(items) => items.iter().any(names_suspect),
+        _ => false,
+    }
+}
+
+/// A document's `env` member, or none, and whether any member name in the
+/// document is a [`suspect_name`]; fails for a document that isn't an
 /// object or that names `env` twice.
-struct EnvMember(Option<serde_json::Value>);
+struct EnvMember {
+    env: Option<serde_json::Value>,
+    suspect: bool,
+}
 
 impl<'de> serde::Deserialize<'de> for EnvMember {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -725,26 +781,90 @@ impl<'de> serde::Deserialize<'de> for EnvMember {
                 mut map: A,
             ) -> Result<EnvMember, A::Error> {
                 let mut env = None;
+                let mut suspect = false;
                 while let Some(name) = map.next_key::<String>()? {
+                    suspect |= suspect_name(&name);
                     if name == "env" {
                         if env.is_some() {
                             return Err(serde::de::Error::custom("`env` repeats"));
                         }
-                        env = Some(map.next_value::<serde_json::Value>()?);
+                        let value = map.next_value::<serde_json::Value>()?;
+                        suspect |= names_suspect(&value);
+                        env = Some(value);
                     } else {
-                        map.next_value::<serde::de::IgnoredAny>()?;
+                        let NameScan(names) = map.next_value()?;
+                        suspect |= names;
                     }
                 }
-                Ok(EnvMember(env))
+                Ok(EnvMember { env, suspect })
             }
         }
         deserializer.deserialize_map(Visitor)
     }
 }
 
+/// One JSON value read straight from the document, kept only as whether
+/// any member name in it, at any depth, is a [`suspect_name`].
+struct NameScan(bool);
+
+impl<'de> serde::Deserialize<'de> for NameScan {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = NameScan;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON value")
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<NameScan, E> {
+                Ok(NameScan(false))
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<NameScan, E> {
+                Ok(NameScan(false))
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<NameScan, E> {
+                Ok(NameScan(false))
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<NameScan, E> {
+                Ok(NameScan(false))
+            }
+            fn visit_unit<E>(self) -> Result<NameScan, E> {
+                Ok(NameScan(false))
+            }
+            fn visit_str<E>(self, _: &str) -> Result<NameScan, E> {
+                Ok(NameScan(false))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<NameScan, A::Error> {
+                let mut suspect = false;
+                while let Some(NameScan(item)) = seq.next_element()? {
+                    suspect |= item;
+                }
+                Ok(NameScan(suspect))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<NameScan, A::Error> {
+                let mut suspect = false;
+                while let Some(name) = map.next_key::<String>()? {
+                    suspect |= suspect_name(&name);
+                    let NameScan(value) = map.next_value()?;
+                    suspect |= value;
+                }
+                Ok(NameScan(suspect))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 /// `contents` with its `//` line and `/* */` block comments turned into
-/// blanks (newlines kept), outside strings.
-fn without_json_comments(contents: &[u8]) -> Vec<u8> {
+/// blanks (newlines kept), outside strings; `None` when a line comment is
+/// ended by a carriage return that no line feed follows, where JSONC
+/// parsers disagree on where the comment ends ([`claude_env_member`]).
+fn without_json_comments(contents: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(contents.len());
     let mut i = 0;
     let mut in_string = false;
@@ -770,6 +890,9 @@ fn without_json_comments(contents: &[u8]) -> Vec<u8> {
             i += 1;
         } else if c == b'/' && next == Some(b'/') {
             while i < contents.len() && contents[i] != b'\n' {
+                if contents[i] == b'\r' && contents.get(i + 1) != Some(&b'\n') {
+                    return None;
+                }
                 out.push(b' ');
                 i += 1;
             }
@@ -790,7 +913,7 @@ fn without_json_comments(contents: &[u8]) -> Vec<u8> {
             i += 1;
         }
     }
-    out
+    Some(out)
 }
 
 /// Whether a read of Claude Code's `env` sources leaves its editor to the
@@ -799,8 +922,9 @@ fn without_json_comments(contents: &[u8]) -> Vec<u8> {
 /// `VISUAL` or `EDITOR`. A name there would replace the helper the deck put
 /// in Claude's environment (Claude applies these over what it inherited),
 /// so it holds as [`Hold::Editor`]; so does anything the deck can't judge:
-/// a file that exists but can't be read or parsed, an `env` that isn't an
-/// object, and a managed drop-in directory that can't be listed.
+/// a file that exists but can't be read or parsed, a document another
+/// parser could read differently ([`EnvRead::Suspect`]), an `env` that isn't
+/// an object, and a managed drop-in directory that can't be listed.
 pub fn claude_env_guard(read: &ClaudeEnvRead) -> Result<(), Hold> {
     for (_, env) in read {
         match env {
@@ -814,7 +938,7 @@ pub fn claude_env_guard(read: &ClaudeEnvRead) -> Result<(), Hold> {
                     return Err(Hold::Editor);
                 }
             }
-            EnvRead::Env(_) | EnvRead::Unreadable(_) | EnvRead::Unparsable => {
+            EnvRead::Env(_) | EnvRead::Suspect | EnvRead::Unreadable(_) | EnvRead::Unparsable => {
                 return Err(Hold::Editor);
             }
         }

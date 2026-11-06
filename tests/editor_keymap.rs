@@ -2442,6 +2442,77 @@ fn probe_099_claude_settings_env_naming_the_editor_holds() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Scenario: Judge Claude Code settings documents that a JSONC parser building its objects by assignment could read differently from the deck (the revcxfix2 review's MEDIUM-1): a `__proto__` member at any depth, `VISUAL` or `EDITOR` as a member name anywhere in the document, and a line comment ended by a lone carriage return each hold `Editor`; a document with CRLF line endings and comments, and `VISUAL` only inside a string value, pass.
+#[spec("inbox/probe/099")]
+#[test]
+fn probe_099_claude_settings_a_parser_could_read_differently_hold() {
+    use dot_agent_deck::composer_probe::keymap::{claude_env_guard, claude_env_member};
+    let editor = Err(Hold::Editor);
+    let mut wrong = Vec::new();
+    for (row, document, want) in [
+        (
+            "env behind a top-level __proto__",
+            r#"{"__proto__": {"env": {"VISUAL": "vim"}}}"#,
+            editor,
+        ),
+        (
+            "__proto__ spelled with an escape",
+            r#"{"__proto__": {"env": {"VISUAL": "vim"}}}"#,
+            editor,
+        ),
+        (
+            "VISUAL behind __proto__ inside env",
+            r#"{"env": {"__proto__": {"VISUAL": "vim"}}}"#,
+            editor,
+        ),
+        (
+            "an empty __proto__ deep down",
+            r#"{"permissions": {"allow": [{"__proto__": {}}]}}"#,
+            editor,
+        ),
+        (
+            "VISUAL as a member name outside env",
+            r#"{"permissions": {"VISUAL": "vim"}}"#,
+            editor,
+        ),
+        (
+            "editor as a member name in an array's object",
+            r#"{"hooks": [{"x": {"editor": "vim"}}]}"#,
+            editor,
+        ),
+        (
+            "a line comment ended by a lone CR",
+            "{\"a\": 1 // c\r,\"env\": {\"VISUAL\": \"vim\"}\n}",
+            editor,
+        ),
+        (
+            "a lone CR then a block comment only a CR-ending parser opens",
+            "{\"a\": 1 // x\r/*\n,\"env\": {\"VISUAL\": \"vim\"} // */\n}",
+            editor,
+        ),
+        (
+            "CRLF line endings and comments",
+            "{\r\n  // note\r\n  \"model\": \"x\", /* y */\r\n  \"env\": {\"A\": \"1\"}\r\n}\r\n",
+            Ok(()),
+        ),
+        (
+            "VISUAL and __proto__ only in string values",
+            r#"{"statusLine": {"command": "echo $VISUAL __proto__"}, "x": ["EDITOR"]}"#,
+            Ok(()),
+        ),
+    ] {
+        let read = vec![(
+            PathBuf::from("settings.json"),
+            claude_env_member(document.as_bytes()),
+        )];
+        let got = claude_env_guard(&read);
+        if got != want {
+            wrong.push(format!("{row}: {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// A Claude Code HOME and working directory, each under the private test
 /// base, for [`claude_env_sources`].
 struct ClaudeHome {
