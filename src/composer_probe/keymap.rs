@@ -711,9 +711,12 @@ fn claude_env_file(path: &Path) -> EnvRead {
 /// object, or names `env` twice (which one Claude keeps isn't measured), is
 /// [`EnvRead::Unparsable`].
 ///
-/// Which JSONC parser Claude Code uses isn't measured, so a document two
-/// parsers could read differently is [`EnvRead::Suspect`] (the revcxfix2
-/// review's MEDIUM-1), whatever its `env` says:
+/// Which parser a Claude Code release uses for each of these files isn't
+/// pinned (2.1.318 read `~/.claude/settings.json` as strict JSON and applied
+/// no `env` from any of the forms below, measured in cxfix3's sandbox; the
+/// other files weren't run), so a document two parsers could read
+/// differently is [`EnvRead::Suspect`] (the revcxfix2 review's MEDIUM-1),
+/// whatever its `env` says:
 ///
 /// - a member named `__proto__`, at any depth: serde reads it as an
 ///   ordinary member, while a parser that builds its objects by assignment
